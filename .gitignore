@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+!.env.example
+data/
+*.session
+*.session-journal
+*.sqlite
+*.sqlite3
+*.db
+*.log
+stt-benchmark.csv
+.pytest_cache/
+.coverage
