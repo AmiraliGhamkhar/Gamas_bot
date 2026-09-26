@@ -2,10 +2,6 @@ Gamas Bot
 
 «Persian Telegram Lecture Notes Assistant — turn voice messages, audio, video, and PowerPoint presentations into structured Persian lecture notes.»
 
-""Python" (https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)" (https://www.python.org/)
-""Telegram" (https://img.shields.io/badge/Telegram-MTProto-26A5E4?logo=telegram&logoColor=white)" (https://telegram.org/)
-""SQLite" (https://img.shields.io/badge/Database-SQLite-003B57?logo=sqlite&logoColor=white)" (https://www.sqlite.org/)
-""FFmpeg" (https://img.shields.io/badge/Media-FFmpeg-007808?logo=ffmpeg&logoColor=white)" (https://ffmpeg.org/)
 
 Gamas Bot is a Python-based Telegram bot built with Telethon and MTProto for processing Persian lectures.
 
