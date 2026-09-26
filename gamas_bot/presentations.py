@@ -26,7 +26,7 @@ from .media import MediaToolError, merge_audio_tracks, probe_media, tool_availab
 logger = logging.getLogger(__name__)
 
 NATIVE_EXTENSIONS = {".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm"}
-LEGACY_EXTENSIONS = {".ppt", ".pps", ".ppsm5", ".pot", ".odp", ".otp"}
+LEGACY_EXTENSIONS = {".ppt", ".pps", ".pot", ".odp", ".otp"}
 PRESENTATION_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": "native",
     "application/vnd.openxmlformats-officedocument.presentationml.slideshow": "native",
