@@ -1,214 +1,602 @@
-# دستیار تلگرامی جزوه‌ساز فارسی
+Gamas Bot — Persian Telegram Lecture Notes Assistant
 
-ربات تلگرام مبتنی بر **Telethon و MTProto** برای دریافت پیام صوتی، فایل صوتی یا **فایل ارائهٔ PowerPoint**، پیاده‌سازی گفتار فارسی و آماده‌کردن جزوهٔ خوانا با تیتر، نکته‌های کلیدی و جدول‌های لازم. صداهای ضبط‌شده در اسلایدها استخراج، به ترتیب اسلاید ادغام و همراه متن اسلایدها به یک جزوه تبدیل می‌شوند. پردازش فایل‌های طولانی در کارهای پس‌زمینه انجام می‌شود تا پاسخ‌گویی ربات متوقف نشود.
+A Persian Telegram bot built with Telethon (MTProto) that converts voice messages, audio files, videos, and PowerPoint presentations into structured, readable lecture notes.
 
-## امکانات
+The bot uses Speechmatics as the primary STT engine, Deepgram as an optional fallback, and Gemini 2.5 Flash-Lite to generate structured notes.
 
-- دریافت پیام صوتی و فایل‌هایی مانند MP3، M4A، WAV، OGG و FLAC؛ دریافت از MTProto، بدون سقف ۲۰ مگابایتی دانلود Bot API.
-- دریافت **فایل تصویری** کلاس (MP4، MKV، MOV، AVI و…) و ویدیو نوت تلگرام؛ صدای فایل با ffmpeg جدا و پیاده‌سازی می‌شود.
-- **آماده‌سازی خودکار قالب‌های ناسازگار**: اگر قالب یا کُدک فایل صوتی برای سرویس STT مطمئن نباشد (مثل WMA یا AMR)، پیش از ارسال به مونو ۱۶ کیلوهرتز تبدیل می‌شود.
-- **استخراج صدا از فایل ارائه**: پشتیبانی از `pptx`، `pptm`، `ppsx` و فایل‌های قدیمی `ppt`، `pps` و `odp`؛ ادغام صداهای اسلایدها در یک فایل، استفاده از متن و یادداشت گویندهٔ اسلایدها و ساخت جزوهٔ اسلاید‌به‌اسلاید.
-- موتور اصلی Speechmatics و موتور جایگزین Deepgram؛ انتخاب موتور اصلی، غیرفعال‌کردن جایگزین و آستانهٔ اطمینان با متغیرهای محیطی.
-- ساخت جزوه با Gemini 2.5 Flash-Lite؛ هنگام خطای سرویس LLM متن خام هم از دست نمی‌رود.
-- ذخیرهٔ کاربران، فایل‌ها، وضعیت کار، متن خام، جزوه و گزارش پخش همگانی در SQLite با WAL.
-- پردازش هم‌زمان محدودشده، ثبت خطا، پاک‌کردن فایل موقت و ارسال خروجی‌های بلند در چند پیام.
-- دستورهای مدیریتی تلگرام: `/users`، `/stats`، `/broadcast <پیام>`، `/ban <شناسه>` و `/unban <شناسه>`.
+Features
 
-## پژوهش موتورهای تبدیل گفتار
+- Persian speech-to-text from Telegram voice messages and audio files.
+- Supports "MP3", "M4A", "WAV", "OGG", "FLAC", and other common formats.
+- Supports video files such as "MP4", "MKV", "MOV", and "AVI".
+- Extracts audio from videos using "ffmpeg".
+- Automatically converts unsupported audio formats/codecs to mono "16 kHz" audio.
+- PowerPoint support:
+  - "PPTX", "PPTM", "PPSX"
+  - Legacy "PPT", "PPS", "ODP"
+  - Extracts slide audio and optional video audio.
+  - Preserves slide order.
+  - Uses slide text and speaker notes.
+  - Generates slide-by-slide notes.
+- Speech-to-text engines:
+  - Speechmatics
+  - Deepgram Nova-3
+- Configurable primary/fallback STT engine.
+- Gemini-based note generation with raw transcript fallback.
+- Background processing for long-running jobs.
+- SQLite database with WAL mode.
+- User, job, transcript, notes, presentation, and broadcast tracking.
+- Temporary audio/video files are deleted after processing.
+- Long results are automatically split across multiple Telegram messages.
+- Admin commands:
+  - "/users"
+  - "/stats"
+  - "/broadcast <message>"
+  - "/ban <id>"
+  - "/unban <id>"
 
-**جمع‌بندی اجرایی:** Speechmatics به‌صورت پیش‌فرض موتور اصلی است و Deepgram در صورت شکست درخواست یا اطمینان کمتر از آستانه، امتحان می‌شود. هر دو API زبان فارسی را می‌پذیرند (کد `fa`). انتخاب نهایی کیفیت برای درس‌های فارسی باید با صدای واقعی کاربران انجام شود؛ کیفیت گفتار، لهجه، نویز، واژگان پزشکی/مهندسی و میکروفن نتیجه را تغییر می‌دهد.
+---
 
-| معیار | Speechmatics Batch | Deepgram Nova-3 |
-|---|---|---|
-| پشتیبانی فارسی | فارسی (`fa`) در مستندات/یادداشت انتشار Speechmatics آمده است. | فارسی (`fa`) در جدول زبان‌های مدل Nova-3 آمده است. |
-| دقت فارسی | دادهٔ عمومیِ هم‌شرایط و مستقلی که برتری یکی را برای فارسی دانشگاهی ثابت کند در این بررسی به دست نیامد؛ اینجا ادعای برتری نمی‌کنیم. | همان؛ باید با فایل‌های یکسان و متن مرجع ارزیابی شود. |
-| تأخیر | کار Batch پس‌زمینه‌ای است؛ ربات وضعیت کار را دوره‌ای بررسی می‌کند. مقدار واقعی به مدت فایل، صف و منطقهٔ API بستگی دارد. | API فایل ضبط‌شده پاسخ هم‌زمان می‌دهد و مستندات حداکثر زمان درخواست را ۱۰ دقیقه ذکر می‌کند؛ برای فایل خیلی طولانی مناسب‌بودنش را قبل از اتکا آزمایش کنید. |
-| سقف مستندشدهٔ مستقیم | ارسال فایل در بدنهٔ Batch SaaS باید **کمتر از ۱ GB** باشد؛ برای فایل بزرگ‌تر مستندات Fetch URL می‌خواهد. | فایل ضبط‌شده تا **۲ GB**؛ درخواست‌هایی که بیش از ۱۰ دقیقه طول بکشند ممکن است 504 بگیرند. |
-| قیمت درج‌شدهٔ رسمی | Batch Standard: **۰٫۲۴ دلار/ساعت**؛ Batch Melia 1: **۰٫۱۲۹ دلار/ساعت**. طرح جدید **۱۰۰ دلار اعتبار شروع، بدون کارت بانکی** ارائه می‌کند. قیمت ۳۱ ژوئیهٔ ۲۰۲۶ به‌روزرسانی شده است. | Nova-3 Multilingual ضبط‌شده: **۰٫۰۰۵۲ دلار/دقیقه** (حدود ۰٫۳۱۲ دلار/ساعت). شروع با **۲۰۰ دلار اعتبار**؛ قیمت صفحهٔ رسمی در زمان بررسی. |
-| نوع اعتبار رایگان | اعتبار شروع است، نه وعدهٔ سهمیهٔ ماهانهٔ دائمی؛ دسترسی پس از اتمام اعتبار ممکن است به افزودن روش پرداخت نیاز داشته باشد. | اعتبار شروع ۲۰۰ دلاری؛ صفحهٔ رسمی می‌گوید بدون حداقل خرید و بدون انقضا. شرایط حساب را هنگام ثبت‌نام دوباره بررسی کنید. |
+Architecture
 
-**محدودیت ارزیابی فعلی:** برای این مخزن فایل صوتی واقعیِ قابل‌انتشار، کلیدهای سرویس و متن مرجع در اختیار نبود؛ بنابراین نرخ خطای کلمه (WER)، برتری دقت و زمان پاسخ واقعی اندازه‌گیری نشده است. ارقام هزینه و پشتیبانی زبان از صفحات رسمی در **۲۵ سپتامبر ۲۰۲۶** بازبینی شده‌اند و امکان تغییر دارند. طرح اعتبار رایگان را سهمیهٔ دائمی فرض نکنید.
+Telegram
+   │
+   ▼
+Telethon / MTProto
+   │
+   ├── Audio / Voice ───────────────┐
+   ├── Video ──► FFmpeg ────────────┤
+   └── PowerPoint ─► Extract Media ─┤
+                                    ▼
+                              Audio Preparation
+                                    │
+                                    ▼
+                           Speech-to-Text Engine
+                         ┌──────────┴──────────┐
+                         │                     │
+                    Speechmatics          Deepgram
+                         │                     │
+                         └──────────┬──────────┘
+                                    ▼
+                              Raw Transcript
+                                    │
+                                    ▼
+                              Gemini 2.5 Flash-Lite
+                                    │
+                                    ▼
+                              Structured Notes
+                                    │
+                                    ▼
+                               Telegram Output
 
-برای ارزیابی عملی، حداقل چند نمونهٔ کوتاه و بلند از درس‌های پزشکی و مهندسی، صدای تمیز و پرنویز، و گویندگان/لهجه‌های مختلف را **با رضایت گوینده** آماده کنید. برای هر فایل متن مرجع دستی را در فایل هم‌نام با پسوند `.txt` کنار آن بگذارید؛ مثلاً `lecture.mp3.txt`. ابزار `scripts/benchmark_stt.py` هر نمونه را جداگانه با هر دو موتور و زبان `fa` اجرا می‌کند و CSV شامل زمان پاسخ، confidence و WER نرمال‌شدهٔ فارسی (یکسان‌سازی «ي/ی» و «ك/ک»، حذف نشانه‌گذاری) می‌سازد؛ متن پیاده‌سازی‌شده را در گزارش ذخیره نمی‌کند:
+---
 
-```bash
-python -m scripts.benchmark_stt samples/short.wav samples/lecture-long.mp3 --output results.csv
-```
+Requirements
 
-ابزار به هر دو کلید STT در `.env` نیاز دارد. هزینهٔ تقریبی را با نرخ روز ارائه‌دهندگان از مدت فایل‌ها جداگانه محاسبه کنید و خطای اصطلاحات تخصصی را نیز دستی بررسی کنید. در این پیاده‌سازی اگر موتور اصلی شکست بخورد یا confidence گزارش‌شده‌اش از `STT_MIN_CONFIDENCE` پایین‌تر باشد، موتور دوم فراخوانی می‌شود؛ چون confidence دو شرکت الزاماً کالیبره و قابل‌مقایسه نیست، این آستانه باید با همان دادهٔ اعتبارسنجی تنظیم شود.
+Software
 
-منابع رسمی:
+- Windows 10/11
+- Python 3.11+
+- FFmpeg + FFprobe
+- LibreOffice (only required for legacy "PPT", "PPS", and "ODP" files)
 
-- [Speechmatics قیمت‌گذاری](https://www.speechmatics.com/pricing) و [یادداشت انتشار Speechmatics (افزوده‌شدن Persian/fa)](https://docs.speechmatics.com/release-notes/batch-container-release-notes)
-- [راهنمای API دسته‌ای Speechmatics](https://docs.speechmatics.com/jobsapi) و [محدودیت‌های فایل Batch (۱ GB)](https://docs.speechmatics.com/speech-to-text/batch/limits)
-- [قیمت‌گذاری Deepgram](https://deepgram.com/pricing)
-- [مدل‌ها و زبان‌های Deepgram](https://developers.deepgram.com/docs/models-languages-overview) و [راهنمای فایل ضبط‌شده و محدودیت‌ها](https://developers.deepgram.com/docs/pre-recorded-audio)
+Install FFmpeg and LibreOffice using PowerShell.
 
-## ورودی‌های پشتیبانی‌شده
+Example with WinGet:
 
-| ورودی | رفتار |
-|---|---|
-| پیام صوتی و فایل صوتی | مستقیم به موتور STT می‌رود؛ فقط قالب‌های ناشناخته یا کُدک‌های ناسازگار با ffmpeg آماده‌سازی می‌شوند. |
-| فایل تصویری و ویدیو نوت | نخستین شاخهٔ صوتی با ffmpeg جدا و سپس پیاده‌سازی می‌شود. بدون ffmpeg، فایل تصویری پذیرفته نمی‌شود و ربات همین را اعلام می‌کند. |
-| فایل ارائهٔ PowerPoint | صداهای اسلایدها ادغام و همراه متن اسلایدها به جزوه تبدیل می‌شوند (بخش بعدی). |
-| هر فایل دیگر (PDF، عکس، آرشیو و…) | ربات پیام راهنما می‌فرستد و فهرست ورودی‌های مجاز را نشان می‌دهد؛ دیگر بی‌پاسخ رها نمی‌شود. |
-| متن ساده و پیام دارای پیش‌نمایش لینک | بی‌پاسخ می‌ماند تا گفت‌وگوی عادی مختل نشود. |
+winget install Gyan.FFmpeg
+winget install TheDocumentFoundation.LibreOffice
 
-فایل بدون شاخهٔ صوتی (مثل ویدیوی بی‌صدا یا GIF) پیش از مصرف سهمیهٔ STT شناسایی و به کاربر اعلام می‌شود. GIF متحرک اصلاً به‌عنوان درس در نظر گرفته نمی‌شود.
+Verify:
 
-### زبان پیاده‌سازی
+ffmpeg -version
+ffprobe -version
+soffice --version
 
-زبان موتورهای STT با `STT_LANGUAGE` تعیین می‌شود (پیش‌فرض `fa`؛ مقادیری مانند `en` یا `en-US` هم پذیرفته می‌شوند):
+If the executables are not available in "PATH", set their full paths in ".env".
 
-```dotenv
-STT_LANGUAGE=fa
-```
+---
 
-توجه: این متغیر فقط زبان **پیاده‌سازی گفتار** را عوض می‌کند. پرامپت ساخت جزوه همچنان خروجی فارسی می‌خواهد، بنابراین با صدای انگلیسی، جزوهٔ فارسیِ برگرفته از آن ساخته می‌شود.
+Telegram API Credentials
 
-## استخراج صدا از فایل ارائه (PowerPoint)
+Create a bot with @BotFather and obtain:
 
-فایل `pptx` یک بستهٔ ZIP استاندارد (OPC) است: صداهای ضبط‌شده در `ppt/media/` قرار دارند و هر اسلاید از طریق فایل `_rels` خود به آن‌ها اشاره می‌کند. مسیر پردازش چنین است:
+TELEGRAM_BOT_TOKEN
 
-1. **خواندن بسته** با کتابخانهٔ استاندارد پایتون؛ تعداد بخش‌ها، حجم بازشده و مسیرهای نامعتبر (`..` و مسیر مطلق) کنترل می‌شوند تا فایل مخرب پردازش نشود.
-2. **ترتیب اسلایدها** از `p:sldIdLst` داخل `ppt/presentation.xml` گرفته می‌شود، نه از نام فایل‌ها؛ بنابراین ترتیب صداها همان ترتیب نمایش ارائه است.
-3. **استخراج رسانه‌ها**: صدای هر اسلاید، و همچنین صدای ویدیوهای داخل اسلاید (در صورت فعال‌بودن) برداشته می‌شود. رسانهٔ تکراری یک بار و رسانهٔ بدون ارجاع در انتها می‌آید.
-4. **پالایش با ffprobe**: کلیپ بدون شاخهٔ صوتی و کلیپ کوتاه‌تر از `PPTX_MIN_CLIP_SECONDS` (مثل افکت صوتی اسلاید) کنار گذاشته می‌شود.
-5. **ادغام با ffmpeg**: همهٔ کلیپ‌ها به مونو ۱۶ کیلوهرتز تبدیل و با نیم‌ثانیه سکوت میان آن‌ها به یک فایل تبدیل می‌شوند. خروجی به‌صورت WAV بدون اتلاف ساخته می‌شود؛ اگر حجم تخمینی WAV از `PPTX_WAV_LIMIT_BYTES` بیشتر شود، به‌جای آن Opus مونو ساخته می‌شود تا آپلود به سرویس STT شدنی بماند.
-6. **پیاده‌سازی و ساخت جزوه**: فایل ادغام‌شده از همان مسیر Speechmatics/Deepgram عبور می‌کند و سپس متن اسلایدها + یادداشت گوینده + متن پیاده‌سازی‌شده با یک پرامپت ویژهٔ ارائه به Gemini می‌رود تا جزوه به ترتیب اسلایدها ساخته شود.
+Then create Telegram API credentials at:
 
-نکته‌های رفتاری:
+https://my.telegram.org
 
-- اگر ارائه **هیچ صدایی** نداشته باشد، جزوه فقط از متن و یادداشت اسلایدها ساخته می‌شود و ربات این موضوع را اعلام می‌کند.
-- اگر ارائه **فقط یک کلیپ صوتی** داشته باشد و ffmpeg نصب نباشد، همان فایل مستقیماً به موتور STT فرستاده می‌شود؛ برای چند کلیپ، ffmpeg الزامی است.
-- فایل‌های قدیمی `ppt`/`pps`/`odp` ابتدا با LibreOffice به `pptx` تبدیل می‌شوند. هر تبدیل با یک پروفایل موقت جداگانه اجرا می‌شود تا اجراهای هم‌زمان روی قفل LibreOffice به مشکل نخورند.
-- کلیپ‌های نادیده‌گرفته‌شده در پیام پایانی گزارش و در جدول `presentation_clips` ذخیره می‌شوند.
-- مجموع مدت صداها با `PPTX_MAX_TOTAL_DURATION_SECONDS` محدود می‌شود تا هزینهٔ STT کنترل‌شده بماند.
+You need:
 
-تنظیم‌های مربوط:
+TELEGRAM_API_ID
+TELEGRAM_API_HASH
 
-```dotenv
-PPTX_ENABLED=true
-PPTX_INCLUDE_SLIDE_TEXT=true
-PPTX_INCLUDE_VIDEO_AUDIO=true
-PPTX_LEGACY_ENABLED=true
-PPTX_MIN_CLIP_SECONDS=1.0
-PPTX_SILENCE_SECONDS=0.5
-PPTX_MAX_CLIPS=300
-PPTX_MAX_TOTAL_DURATION_SECONDS=21600
-PPTX_MAX_UNPACKED_BYTES=4000000000
-PPTX_WAV_LIMIT_BYTES=700000000
-FFMPEG_BIN=ffmpeg
-FFPROBE_BIN=ffprobe
-SOFFICE_BIN=soffice
-FFMPEG_TIMEOUT_SECONDS=3600
-SOFFICE_TIMEOUT_SECONDS=600
-```
+Telethon requires "api_id" and "api_hash" even when authenticating with a bot token.
 
-اگر ffmpeg یا LibreOffice در `PATH` نباشند، مسیر کامل اجرایی را در همین متغیرها بگذارید. برای غیرفعال‌کردن کامل این قابلیت `PPTX_ENABLED=false` کافی است.
+---
 
-## پیش‌نیازها
+API Keys
 
-- Python **3.11 یا جدیدتر** و یک VPS یا میزبان دارای پردازش پایتونِ پایدار و همیشه‌روشن.
-- **ffmpeg و ffprobe** برای جدا کردن صدای فایل‌های تصویری، آماده‌سازی قالب‌های ناسازگار و ادغام صداهای ارائه (بدون آن‌ها فقط فایل صوتی سالم و ارائهٔ تک‌کلیپی یا بدون صدا پردازش می‌شود).
-- **LibreOffice** (`soffice`) فقط اگر می‌خواهید فایل‌های قدیمی `ppt`/`pps`/`odp` هم پذیرفته شوند.
+At least one STT provider is required.
 
-```bash
-sudo apt update
-sudo apt install -y ffmpeg libreoffice-impress
-```
+Speechmatics
 
-- توکن ربات از [@BotFather](https://t.me/BotFather).
-- `api_id` و `api_hash` از [my.telegram.org](https://my.telegram.org)؛ Telethon حتی برای ورود با توکن ربات این دو مقدار را لازم دارد.
-- حداقل یک کلید STT: [Speechmatics](https://portal.speechmatics.com/) یا [Deepgram](https://console.deepgram.com/).
-- کلید Gemini از [Google AI Studio](https://aistudio.google.com/apikey) برای ساخت جزوه. اگر کلید Gemini نباشد یا سرویس خطا دهد، ربات متن خام را نگه می‌دارد و می‌فرستد.
+https://portal.speechmatics.com/
 
-این برنامه یک اتصال MTProto باز نگه می‌دارد؛ **برای هاست اشتراکی cPanel یا اجرای serverless/stateless مناسب نیست**.
+Deepgram
 
-## نصب و راه‌اندازی
+https://console.deepgram.com/
 
-```bash
+Gemini
+
+https://aistudio.google.com/apikey
+
+Gemini is optional. If it is unavailable, the raw transcript is still preserved and returned.
+
+---
+
+Installation — Windows PowerShell
+
+Clone the repository:
+
 git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git
 cd Gamas_bot
-python3.11 -m venv .venv
-source .venv/bin/activate
+
+Create a virtual environment:
+
+py -3.11 -m venv .venv
+
+Activate it:
+
+.\.venv\Scripts\Activate.ps1
+
+If PowerShell blocks script execution:
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+Then activate again:
+
+.\.venv\Scripts\Activate.ps1
+
+Install dependencies:
+
+python -m pip install --upgrade pip
 pip install -r requirements.txt
-cp .env.example .env
-```
 
-مقادیر `.env` را وارد کنید. `ADMIN_IDS` باید شناسهٔ عددی تلگرام مدیرها و با کاما جدا شده باشد. حداقل یکی از دو کلید STT لازم است؛ برای استفاده از جایگزینی دوگانه هر دو را وارد کنید. فایل `.env`، پایگاه داده، فایل نشست Telethon و فایل‌های موقت نباید در Git قرار بگیرند؛ `.gitignore` این مسیرها را نادیده می‌گیرد. برنامه در اجرا روی سیستم‌های دارای `umask` فایل‌های نشست و داده را با دسترسی محدود ایجاد می‌کند.
+Create the environment file:
 
-حداقل تنظیم لازم:
+Copy-Item .env.example .env
 
-```dotenv
-TELEGRAM_BOT_TOKEN=توکن_ربات
-TELEGRAM_API_ID=شناسه_عددی
-TELEGRAM_API_HASH=هش_تلگرام
-ADMIN_IDS=شناسه_مدیر
-SPEECHMATICS_API_KEY=کلید_سرویس
-DEEPGRAM_API_KEY=کلید_جایگزین
-GEMINI_API_KEY=کلید_گوگل
-```
+Edit ".env":
 
-در نخستین اجرا، پوشه‌های داده ساخته و جداول SQLite خودکار ایجاد می‌شوند:
+notepad .env
 
-```bash
-source .venv/bin/activate
-python -m gamas_bot
-```
+---
 
-برای تغییر مسیر پایگاه داده، نشست یا فایل‌های موقت، به‌ترتیب `DATABASE_PATH`، `TELEGRAM_SESSION_PATH` و `TEMP_DIR` را تنظیم کنید. فایل‌های موقت صوتی پس از پردازش پاک می‌شوند؛ فایل‌های خام صوتی به‌صورت دائمی ذخیره نمی‌شوند. متن‌های خام و جزوه در SQLite باقی می‌مانند.
+Minimal ".env"
 
-### تنظیم موتور STT
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_API_ID=12345678
+TELEGRAM_API_HASH=YOUR_API_HASH
+ADMIN_IDS=123456789
 
-```dotenv
+SPEECHMATICS_API_KEY=YOUR_SPEECHMATICS_KEY
+DEEPGRAM_API_KEY=YOUR_DEEPGRAM_KEY
+GEMINI_API_KEY=YOUR_GEMINI_KEY
+
+Only one STT key is required.
+
+---
+
+STT Configuration
+
 STT_PRIMARY=speechmatics
 STT_LANGUAGE=fa
 STT_FALLBACK_ENABLED=true
 STT_MIN_CONFIDENCE=0.65
+
 SPEECHMATICS_BASE_URL=https://eu1.asr.api.speechmatics.com/v2
 DEEPGRAM_MODEL=nova-3
-```
 
-`STT_PRIMARY` را روی `deepgram` بگذارید تا Deepgram اصلی شود. در تنظیم معمول، شکست یا confidence پایینِ موتور نخست موتور دیگر را فعال می‌کند. اگر confidence در پاسخ موجود نباشد، فقط شکست API موجب استفاده از جایگزین می‌شود. برای خاموش‌کردن جایگزین، `STT_FALLBACK_ENABLED=false` قرار دهید. برای فایل‌های بلند، Speechmatics انتخاب پیش‌فرض محافظه‌کارانه‌تری است؛ Deepgram در مستندات فعلی برای درخواست‌های فایل ضبط‌شده محدودیت زمان پاسخ دارد.
+Behavior
 
-سقف پیش‌فرض فایل ۲٬۰۰۰٬۰۰۰٬۰۰۰ بایت است (`MAX_FILE_SIZE_BYTES`). این سقف دریافت تلگرام/برنامه است، نه تضمین پذیرش فایل از سوی هر سرویس STT. از آنجا که Speechmatics Batch SaaS ارسال مستقیم فایل ۱ GB یا بزرگ‌تر را نمی‌پذیرد، این پیاده‌سازی چنین فایلی را مستقیماً به Deepgram می‌فرستد (و برای آن کلید Deepgram لازم است). با وجود سقف ۲ GB فایل Deepgram، درخواست ضبط‌شده ممکن است به‌علت حد زمان ۱۰ دقیقه‌ای سرویس ناموفق شود؛ در این حالت تقسیم/تبدیل فایل خودکار در برنامه وجود ندارد. فضای دیسک موقت کافی، پهنای باند و سهمیهٔ حساب ارائه‌دهنده نیز لازم‌اند. تعداد پردازش موازی با `MAX_CONCURRENT_JOBS` تنظیم می‌شود.
+If the primary engine fails, the fallback engine can be used.
 
-## دستورهای کاربر و مدیر
+A fallback can also be triggered when the primary engine reports confidence below:
 
-- کاربر: `/start` یا `/help` را بفرستد، سپس پیام صوتی، فایل صوتی، فایل تصویری یا فایل ارائهٔ PowerPoint را ارسال کند.
-- مدیر مجازشده با `ADMIN_IDS`: `/users` فهرست حداکثر ۵۰ کاربر اخیر؛ `/stats` آمار (شامل شمار فایل‌های تصویری، ارائه‌ها و کلیپ‌های استخراج‌شده)؛ `/broadcast متن پیام` پخش همگانی با فاصلهٔ زمانی بین گیرندگان؛ `/ban شناسه` و `/unban شناسه`.
-- شناسهٔ مدیر در هر اجرای دستور مدیریتی بررسی می‌شود. کاربران مسدود نمی‌توانند از ربات استفاده کنند.
+STT_MIN_CONFIDENCE=0.65
 
-## اجرای پایدار با systemd (VPS لینوکس)
+Set:
 
-نمونهٔ سرویس در `deploy/gamas-bot.service` است. نمونه فرض می‌کند برنامه در `/opt/gamas-bot` نصب شده و کاربر سیستم `bot` ساخته شده است. یک‌بار مسیرها/مالکیت را با سرور خود هماهنگ کنید:
+STT_PRIMARY=deepgram
 
-```bash
-sudo useradd --system --user-group --create-home --shell /usr/sbin/nologin bot
-sudo mkdir -p /opt/gamas-bot
-sudo chown -R bot:bot /opt/gamas-bot
-# سورس، .env و محیط مجازی را در /opt/gamas-bot قرار دهید.
-sudo chmod 600 /opt/gamas-bot/.env
-sudo cp deploy/gamas-bot.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now gamas-bot
-sudo systemctl status gamas-bot
-sudo journalctl -u gamas-bot -f
-```
+to make Deepgram the primary engine.
 
-systemd پس از خروج/خطا سرویس را دوباره اجرا می‌کند. برای توقف: `sudo systemctl stop gamas-bot`.
+Disable fallback:
 
-## پایگاه داده و مهاجرت
+STT_FALLBACK_ENABLED=false
 
-مهاجرت‌ها در پوشهٔ `migrations/` به ترتیب نام اجرا و در جدول `schema_migrations` ثبت می‌شوند؛ هر فایل فقط یک بار اعمال می‌شود. `001_initial.sql` طرح اولیه و `002_presentations.sql` ستون‌های `source_type`، `slide_count`، `clip_count` و `media_duration` به‌همراه جدول `presentation_clips` را اضافه می‌کند. پایگاه دادهٔ قبلی بدون نیاز به کار دستی به‌روزرسانی می‌شود. SQLite با WAL، کلید خارجی و busy timeout فعال می‌شود. هنگام خاموش‌شدن ناگهانی/راه‌اندازی دوباره، کارهای ناتمام به‌عنوان ناموفق علامت می‌خورند؛ فایل صوتی موقت پس از پایان اجرای قبلی قابل بازیابی نیست.
+"STT_LANGUAGE" controls speech recognition language only.
 
-## تست
+Example:
 
-```bash
+STT_LANGUAGE=fa
+
+---
+
+PowerPoint Processing
+
+PowerPoint files are processed in this order:
+
+Presentation
+   │
+   ├── Slide text
+   ├── Speaker notes
+   ├── Slide audio
+   └── Video audio
+          │
+          ▼
+      FFmpeg
+          │
+          ▼
+   Combined audio
+          │
+          ▼
+        STT
+          │
+          ▼
+   Slide-by-slide notes
+
+The bot preserves the actual presentation slide order.
+
+Supported formats:
+
+PPTX
+PPTM
+PPSX
+PPT
+PPS
+ODP
+
+Legacy formats are converted to "PPTX" using LibreOffice.
+
+Useful settings:
+
+PPTX_ENABLED=true
+PPTX_INCLUDE_SLIDE_TEXT=true
+PPTX_INCLUDE_VIDEO_AUDIO=true
+PPTX_LEGACY_ENABLED=true
+
+PPTX_MIN_CLIP_SECONDS=1.0
+PPTX_SILENCE_SECONDS=0.5
+PPTX_MAX_CLIPS=300
+PPTX_MAX_TOTAL_DURATION_SECONDS=21600
+
+PPTX_MAX_UNPACKED_BYTES=4000000000
+PPTX_WAV_LIMIT_BYTES=700000000
+
+FFMPEG_BIN=ffmpeg
+FFPROBE_BIN=ffprobe
+SOFFICE_BIN=soffice
+
+FFMPEG_TIMEOUT_SECONDS=3600
+SOFFICE_TIMEOUT_SECONDS=600
+
+Disable PowerPoint processing completely:
+
+PPTX_ENABLED=false
+
+Presentations without audio are still processed using slide text and speaker notes.
+
+---
+
+File Size and Processing Limits
+
+Default application limit:
+
+MAX_FILE_SIZE_BYTES=2000000000
+
+This is the bot/application limit and does not guarantee that every STT provider will accept the file.
+
+For example, Speechmatics Batch and Deepgram have different API limits and request behavior. Very large or very long recordings should be tested with the actual provider account before production use.
+
+Long jobs are processed in the background and do not block the Telegram event loop.
+
+Maximum concurrent jobs:
+
+MAX_CONCURRENT_JOBS=2
+
+Increase carefully according to CPU, RAM, disk, network bandwidth, and API limits.
+
+---
+
+Run the Bot
+
+Activate the environment:
+
+.\.venv\Scripts\Activate.ps1
+
+Start:
+
+python -m gamas_bot
+
+The first run creates the required data directories and SQLite tables automatically.
+
+---
+
+Database
+
+The bot uses SQLite with:
+
+- WAL mode
+- Foreign keys
+- Busy timeout
+- Versioned migrations
+
+Migration files are stored in:
+
+migrations/
+
+Current migrations include:
+
+001_initial.sql
+002_presentations.sql
+
+The database path can be changed with:
+
+DATABASE_PATH=...
+
+Other paths:
+
+TELEGRAM_SESSION_PATH=...
+TEMP_DIR=...
+
+Temporary media is deleted after processing.
+
+Transcripts and generated notes remain in the local SQLite database until manually deleted.
+
+---
+
+Testing
+
+Run the test suite:
+
 python -m unittest discover -s tests -v
-```
 
-## حریم خصوصی و هزینه
+For STT benchmarking:
 
-صدای کاربر برای تبدیل گفتار به سرویس STT انتخاب‌شده ارسال می‌شود و متن استخراج‌شده برای ساخت جزوه به Gemini فرستاده می‌شود (در صورت تنظیم کلید). در پردازش فایل ارائه، **متن اسلایدها و یادداشت گوینده نیز به Gemini ارسال می‌شود**؛ فایل ارائه و رسانه‌های استخراج‌شده پس از پایان کار از دیسک پاک می‌شوند و فقط فهرست کلیپ‌ها، متن پیاده‌سازی‌شده و جزوه در پایگاه محلی می‌مانند. مستندات Speechmatics برای Batch SaaS نگهداری دادهٔ سرویس را تا ۷ روز ذکر می‌کند؛ متن خام و جزوه در پایگاه محلی تا زمان حذف دستی باقی می‌مانند. پیش از راه‌اندازی عمومی، رضایت کاربران، سیاست نگهداری داده، حذف رکوردها، محل پردازش ارائه‌دهندگان و مقررات محلی را بررسی کنید. هزینهٔ STT و LLM ممکن است از اعتبار رایگان فراتر برود؛ مصرف و سقف مالی را در پنل ارائه‌دهندگان پایش کنید.
+python -m scripts.benchmark_stt samples\short.wav samples\lecture-long.mp3 --output results.csv
+
+For each sample, place the reference transcript next to the audio file:
+
+lecture.mp3
+lecture.mp3.txt
+
+The benchmark can compare Speechmatics and Deepgram using:
+
+- Response time
+- Reported confidence
+- Normalized Persian WER
+
+Persian normalization includes common character variants such as:
+
+ي → ی
+ك → ک
+
+The benchmark does not store the full transcription in the CSV report.
+
+---
+
+Telegram Commands
+
+Users
+
+/start
+/help
+
+Send one of the following:
+
+Voice message
+Audio file
+Video file
+PowerPoint presentation
+
+Admin
+
+/users
+/stats
+/broadcast <message>
+/ban <user_id>
+/unban <user_id>
+
+Only IDs listed in:
+
+ADMIN_IDS=123,456,789
+
+can execute administrative commands.
+
+---
+
+Input Handling
+
+Input| Behavior
+Voice message| Direct STT processing
+MP3/M4A/WAV/OGG/FLAC| STT processing
+MP4/MKV/MOV/AVI| Audio extracted with FFmpeg
+Video note| Audio extracted and transcribed
+PPTX/PPTM/PPSX| Slides + audio + notes
+PPT/PPS/ODP| Converted to PPTX first
+PDF/Image/ZIP/etc.| Rejected with usage instructions
+Plain text message| Ignored to avoid interfering with normal chat
+
+Files without an audio stream are detected before STT usage.
+
+GIF files are not treated as lecture videos.
+
+---
+
+Security
+
+The bot performs basic safety checks when unpacking PowerPoint files, including:
+
+- Path traversal protection
+- Absolute path rejection
+- Unpacked-size limits
+- Media reference validation
+
+Sensitive files should never be committed to Git.
+
+Do not commit:
+
+.env
+*.session
+*.db
+temporary files
+API keys
+
+The repository ".gitignore" should exclude them.
+
+---
+
+Privacy
+
+User audio is sent to the configured STT provider.
+
+If Gemini is enabled, the following may be sent to Gemini for note generation:
+
+- Raw transcript
+- Slide text
+- Speaker notes
+
+Presentation files and extracted temporary media are deleted after processing.
+
+The local SQLite database stores:
+
+- User information
+- Job status
+- Raw transcripts
+- Generated notes
+- Presentation metadata
+- Presentation clip information
+
+Review provider retention policies, user consent requirements, applicable regulations, and your own data-retention policy before public deployment.
+
+---
+
+STT Cost and Quality
+
+Speechmatics and Deepgram support Persian ("fa"), but transcription quality depends on:
+
+- Speaker
+- Accent
+- Microphone
+- Background noise
+- Recording quality
+- Domain-specific vocabulary
+- Audio length
+
+Do not assume one engine is universally more accurate for Persian academic lectures.
+
+For production evaluation, benchmark both engines using the same real recordings and manually verify technical terminology.
+
+---
+
+Production Notes
+
+This application maintains a persistent Telethon/MTProto connection.
+
+It is designed for:
+
+- Windows servers
+- VPS machines
+- Always-on Python processes
+
+It is not designed for:
+
+- Stateless serverless functions
+- Traditional shared hosting
+- cPanel-only deployments
+
+For Windows production, run the bot as a persistent background process using Windows Task Scheduler, NSSM, or another process supervisor rather than starting it manually.
+
+---
+
+Useful PowerShell Commands
+
+Check Python:
+
+python --version
+
+Check installed packages:
+
+pip list
+
+Update dependencies:
+
+pip install -r requirements.txt --upgrade
+
+Check FFmpeg:
+
+ffmpeg -version
+
+Check LibreOffice:
+
+soffice --version
+
+Stop the running bot:
+
+Ctrl + C
+
+---
+
+Project Structure
+
+Gamas_bot/
+│
+├── gamas_bot/
+│   ├── __main__.py
+│   └── ...
+│
+├── migrations/
+│   ├── 001_initial.sql
+│   └── 002_presentations.sql
+│
+├── scripts/
+│   └── benchmark_stt.py
+│
+├── tests/
+│
+├── deploy/
+│
+├── .env.example
+├── .gitignore
+├── requirements.txt
+└── README.md
+
+---
+
+License
+
+Add your project license here, for example:
+
+MIT License
+
+---
+
+Quick Start
+
+git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git
+cd Gamas_bot
+
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+
+pip install -r requirements.txt
+
+Copy-Item .env.example .env
+notepad .env
+
+python -m gamas_bot
+
+The bot is then ready to receive Persian audio, video, and PowerPoint lecture files through Telegram.
