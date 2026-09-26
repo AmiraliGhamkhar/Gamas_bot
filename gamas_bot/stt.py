@@ -26,7 +26,8 @@ class Transcript:
     confidence: float | None = None
 
 
-def _deepgram_key(settings: Settings, engine: str) -> str | None:
+def _provider_key(settings: Settings, engine: str) -> str | None:
+    """API key configured for the given STT engine, if any."""
     return settings.speechmatics_api_key if engine == "speechmatics" else settings.deepgram_api_key
 
 
@@ -198,7 +199,7 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
         order = ["deepgram"] if settings.deepgram_api_key else []
         if not order:
             raise STTError("برای فایل‌های یک گیگابایت یا بزرگ‌تر، کلید Deepgram لازم است.")
-    available = [name for name in order if _deepgram_key(settings, name)]
+    available = [name for name in order if _provider_key(settings, name)]
     if not available:
         raise STTError("هیچ کلید API برای سرویس تبدیل گفتار تنظیم نشده است.")
 

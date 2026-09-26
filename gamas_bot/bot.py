@@ -105,12 +105,22 @@ def markdown_to_telegram_html(text: str) -> str:
 
     def inline(value: str) -> str:
         value = html.escape(value, quote=False)
-        # Inline code first so its contents are not treated as Markdown.
-        value = re.sub(r"`([^`]+)`", r"<code>\1</code>", value)
+        # Stash inline code first so its contents are not treated as Markdown.
+        stashed: list[str] = []
+
+        def stash(match: re.Match) -> str:
+            stashed.append(match.group(1))
+            return f"\x00{len(stashed) - 1}\x00"
+
+        value = re.sub(r"`([^`]+)`", stash, value)
         value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
         value = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", value)
         value = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<i>\1</i>", value)
-        return value
+        return re.sub(
+            r"\x00(\d+)\x00",
+            lambda match: f"<code>{stashed[int(match.group(1))]}</code>",
+            value,
+        )
 
     for line in lines:
         stripped = line.strip()
@@ -118,7 +128,8 @@ def markdown_to_telegram_html(text: str) -> str:
             in_code = not in_code
             continue
         if in_code:
-            result.append(inline(line))
+            # Code lines are escaped verbatim; Markdown does not apply inside fences.
+            result.append(html.escape(line, quote=False))
             continue
         if "|" in stripped and stripped.startswith("|"):
             cells = [cell.strip() for cell in stripped.strip("|").split("|")]
@@ -426,8 +437,8 @@ class StudyBot:
                 await self._store_presentation_details(submission_id, content, prepared)
 
                 slide_note = f"{content.slide_count} اسلاید" if content.slide_count else "بدون متن اسلاید"
+                outline = slides_outline(content.slides)
                 if prepared is None:
-                    outline = slides_outline(content.slides)
                     if not outline.strip():
                         raise ValueError(
                             "در این فایل ارائه نه صدای قابل‌استفاده‌ای پیدا شد و نه متنی برای ساخت جزوه."
@@ -451,7 +462,6 @@ class StudyBot:
                     engine = result.engine
                     confidence = result.confidence
 
-                outline = slides_outline(content.slides)
                 try:
                     structured = await structure_presentation(
                         outline, transcript_text, self.settings
@@ -719,26 +729,27 @@ class StudyBot:
             sent = await self._broadcast(admin_id, args[1].strip())
             await event.respond(f"ارسال همگانی پایان یافت. پیام به {sent} کاربر رسید.")
 
+    async def _send_broadcast_pages(self, telegram_id: int, pages: list[str]) -> None:
+        for page_index, page in enumerate(pages):
+            if page_index:
+                await asyncio.sleep(1.05)
+            await self.client.send_message(telegram_id, page, parse_mode=None)
+
     async def _broadcast(self, admin_id: int, message: str) -> int:
         recipients = await self.db.user_ids(include_banned=False)
+        pages = split_message(message)
         sent = 0
         for index, telegram_id in enumerate(recipients):
             if index:
                 await asyncio.sleep(1.05)
             try:
-                for page_index, page in enumerate(split_message(message)):
-                    if page_index:
-                        await asyncio.sleep(1.05)
-                    await self.client.send_message(telegram_id, page, parse_mode=None)
+                await self._send_broadcast_pages(telegram_id, pages)
                 sent += 1
             except FloodWaitError as exc:
                 logger.warning("Telegram flood wait of %s seconds during broadcast", exc.seconds)
                 await asyncio.sleep(exc.seconds + 1)
                 try:
-                    for page_index, page in enumerate(split_message(message)):
-                        if page_index:
-                            await asyncio.sleep(1.05)
-                        await self.client.send_message(telegram_id, page, parse_mode=None)
+                    await self._send_broadcast_pages(telegram_id, pages)
                     sent += 1
                 except Exception:
                     logger.exception("Broadcast retry failed for user %s", telegram_id)
