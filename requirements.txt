@@ -1,4 +1,6 @@
-Telethon>=1.36,<2.0
-aiohttp>=3.10,<4.0
-aiosqlite>=0.20,<1.0
-python-dotenv>=1.0,<2.0
+Telethon>=1.45,<2.0
+aiohttp>=3.14,<4.0
+aiosqlite>=0.22,<1.0
+python-dotenv>=1.2,<2.0
+python-pptx>=1.0.2,<2.0
+lxml>=6.1,<7.0

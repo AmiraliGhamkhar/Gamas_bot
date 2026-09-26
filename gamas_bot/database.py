@@ -7,7 +7,7 @@ from typing import Any
 
 import aiosqlite
 
-MIGRATION_FILE = Path(__file__).resolve().parent.parent / "migrations" / "001_initial.sql"
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 
 
 def utc_now() -> str:
@@ -27,8 +27,7 @@ class Database:
         await self._conn.execute("PRAGMA journal_mode=WAL")
         await self._conn.execute("PRAGMA foreign_keys=ON")
         await self._conn.execute("PRAGMA busy_timeout=5000")
-        await self._conn.executescript(MIGRATION_FILE.read_text(encoding="utf-8"))
-        await self._conn.commit()
+        await self._apply_migrations()
         async with self._lock:
             await self._conn.execute(
                 "UPDATE audio_submissions SET status='failed', "
@@ -36,6 +35,26 @@ class Database:
                 "WHERE status IN ('pending', 'processing')"
             )
             await self._conn.commit()
+
+    async def _apply_migrations(self) -> None:
+        """Apply every migration file once, in filename order."""
+        db = self._db()
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS schema_migrations ("
+            "name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+        )
+        await db.commit()
+        cursor = await db.execute("SELECT name FROM schema_migrations")
+        applied = {str(row[0]) for row in await cursor.fetchall()}
+        for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            if migration.name in applied:
+                continue
+            await db.executescript(migration.read_text(encoding="utf-8"))
+            await db.execute(
+                "INSERT OR REPLACE INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                (migration.name, utc_now()),
+            )
+            await db.commit()
 
     async def close(self) -> None:
         if self._conn is not None:
@@ -87,17 +106,66 @@ class Database:
         duration: float | None,
         filename: str | None,
         mime_type: str | None,
+        source_type: str = "audio",
     ) -> int:
         async with self._lock:
             db = self._db()
             cursor = await db.execute(
                 "INSERT INTO audio_submissions "
-                "(user_id, file_id, duration, received_at, status, original_filename, mime_type) "
-                "VALUES (?, ?, ?, ?, 'pending', ?, ?)",
-                (user_id, file_id, duration, utc_now(), filename, mime_type),
+                "(user_id, file_id, duration, received_at, status, original_filename, "
+                "mime_type, source_type) "
+                "VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (user_id, file_id, duration, utc_now(), filename, mime_type, source_type),
             )
             await db.commit()
             return int(cursor.lastrowid)
+
+    async def save_presentation_details(
+        self,
+        submission_id: int,
+        slide_count: int,
+        clips: list[dict[str, Any]],
+        media_duration: float | None = None,
+    ) -> None:
+        """Store deck statistics and one row per extracted media clip."""
+        async with self._lock:
+            db = self._db()
+            await db.execute(
+                "UPDATE audio_submissions SET slide_count=?, clip_count=?, "
+                "media_duration=?, duration=COALESCE(?, duration) WHERE id=?",
+                (slide_count, len(clips), media_duration, media_duration, submission_id),
+            )
+            await db.execute(
+                "DELETE FROM presentation_clips WHERE submission_id=?", (submission_id,)
+            )
+            if clips:
+                await db.executemany(
+                    "INSERT INTO presentation_clips "
+                    "(submission_id, slide_number, part_name, kind, duration, included, skip_reason) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            submission_id,
+                            clip.get("slide_number"),
+                            str(clip.get("part_name", "")),
+                            str(clip.get("kind", "audio")),
+                            clip.get("duration"),
+                            int(bool(clip.get("included", True))),
+                            clip.get("skip_reason"),
+                        )
+                        for clip in clips
+                    ],
+                )
+            await db.commit()
+
+    async def presentation_clips(self, submission_id: int) -> list[dict[str, Any]]:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT slide_number, part_name, kind, duration, included, skip_reason "
+                "FROM presentation_clips WHERE submission_id=? ORDER BY id",
+                (submission_id,),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def set_submission_status(
         self, submission_id: int, status: str, error_message: str | None = None
@@ -157,6 +225,9 @@ class Database:
                 "(SELECT COUNT(*) FROM audio_submissions) AS submissions, "
                 "(SELECT COUNT(*) FROM audio_submissions WHERE status='done') AS done, "
                 "(SELECT COUNT(*) FROM audio_submissions WHERE status='failed') AS failed, "
+                "(SELECT COUNT(*) FROM audio_submissions WHERE source_type='pptx') AS presentations, "
+                "(SELECT COALESCE(SUM(clip_count), 0) FROM audio_submissions "
+                "WHERE source_type='pptx') AS presentation_clips, "
                 "(SELECT COUNT(DISTINCT user_id) FROM audio_submissions "
                 "WHERE datetime(substr(received_at, 1, 19)) >= datetime('now', '-30 days')) AS active_30d"
             )

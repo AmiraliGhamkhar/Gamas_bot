@@ -7,10 +7,11 @@ from unittest.mock import AsyncMock, patch
 
 from gamas_bot.bot import _utf16_length, markdown_to_telegram_html, split_message
 from gamas_bot.database import Database
-from gamas_bot.config import Settings
 from gamas_bot.stt import Transcript, _deepgram_transcript, _speechmatics_confidence, transcribe
 from gamas_bot.structuring import split_transcript
 from scripts.benchmark_stt import normalize_words, word_error_rate
+
+from support import make_settings
 
 
 class TextHelpersTests(unittest.TestCase):
@@ -69,11 +70,7 @@ class TextHelpersTests(unittest.TestCase):
 
 class STTRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def test_low_confidence_routes_to_fallback(self):
-        settings = Settings(
-            "token", 1, "hash", frozenset(), Path("db.sqlite"), Path("session"), Path("tmp"),
-            2**31, "speechmatics", True, 0.65, "sm-key", "https://example.test/v2",
-            "dg-key", "nova-3", None, "gemini-2.5-flash-lite", 2, 1, 100,
-        )
+        settings = make_settings(gemini_api_key=None)
         with tempfile.NamedTemporaryFile() as audio:
             with patch(
                 "gamas_bot.stt._speechmatics",
@@ -108,6 +105,7 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.set_submission_status(submission_id, "done")
         stats = await self.db.stats()
         self.assertEqual(stats["users"], 1)
+        self.assertEqual(stats["presentations"], 0)
         self.assertEqual(stats["submissions"], 1)
         self.assertEqual(stats["done"], 1)
         rows = await self.db.user_summaries()
@@ -116,6 +114,51 @@ class DatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await self.db.set_banned(987654, True))
         self.assertEqual(await self.db.user_ids(), [])
         self.assertFalse(await self.db.set_banned(111111, True))
+
+    async def test_presentation_details_are_stored_and_counted(self):
+        user = await self.db.upsert_user(222333, "presenter")
+        submission_id = await self.db.create_submission(
+            user["id"], "deck-file", None, "lecture.pptx", None, source_type="pptx"
+        )
+        await self.db.save_presentation_details(
+            submission_id,
+            slide_count=12,
+            clips=[
+                {
+                    "slide_number": 1,
+                    "part_name": "ppt/media/media1.m4a",
+                    "kind": "audio",
+                    "duration": 30.5,
+                    "included": True,
+                },
+                {
+                    "slide_number": None,
+                    "part_name": "ppt/media/media2.mp4",
+                    "kind": "video",
+                    "duration": None,
+                    "included": False,
+                    "skip_reason": "بدون شاخهٔ صوتی",
+                },
+            ],
+            media_duration=30.5,
+        )
+        clips = await self.db.presentation_clips(submission_id)
+        self.assertEqual(len(clips), 2)
+        self.assertEqual(clips[0]["included"], 1)
+        self.assertEqual(clips[1]["skip_reason"], "بدون شاخهٔ صوتی")
+        stats = await self.db.stats()
+        self.assertEqual(stats["presentations"], 1)
+        self.assertEqual(stats["presentation_clips"], 2)
+
+    async def test_migrations_are_applied_once(self):
+        await self.db.close()
+        await self.db.open()
+        async with self.db._lock:
+            cursor = await self.db._db().execute("SELECT name FROM schema_migrations ORDER BY name")
+            names = [row[0] for row in await cursor.fetchall()]
+        self.assertIn("001_initial.sql", names)
+        self.assertIn("002_presentations.sql", names)
+        self.assertEqual(len(names), len(set(names)))
 
     async def test_interrupted_jobs_are_marked_failed_on_reopen(self):
         user = await self.db.upsert_user(123, None)
