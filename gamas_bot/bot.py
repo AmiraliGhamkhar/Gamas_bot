@@ -4,22 +4,66 @@ import asyncio
 import html
 import logging
 import re
+import shutil
 import tempfile
 from pathlib import Path
 
 from telethon import TelegramClient, events
 from telethon.errors import FloodWaitError
+from telethon.tl.types import MessageMediaWebPage
 
 from .config import Settings
 from .database import Database
+from .media import (
+    MediaToolError,
+    convert_to_pptx,
+    extract_audio_track,
+    needs_transcode,
+    probe_media,
+    tool_available,
+)
+from .presentations import (
+    PresentationError,
+    classify_presentation,
+    load_presentation,
+    prepare_audio,
+    slides_outline,
+)
 from .stt import STTError, transcribe
-from .structuring import structure_transcript
+from .structuring import structure_presentation, structure_transcript
 
 logger = logging.getLogger(__name__)
 AUDIO_EXTENSIONS = {
-    ".aac", ".flac", ".m4a", ".mp3", ".oga", ".ogg", ".opus", ".wav", ".wma", ".webm"
+    ".aac", ".aif", ".aiff", ".amr", ".au", ".flac", ".m4a", ".m4b", ".mp3",
+    ".oga", ".ogg", ".opus", ".ra", ".wav", ".wma", ".webm",
+}
+VIDEO_EXTENSIONS = {
+    ".3gp", ".asf", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg",
+    ".mpg", ".ts", ".webm", ".wmv",
 }
 MESSAGE_CHUNK_SIZE = 3800
+USER_VISIBLE_ERRORS = (ValueError, PresentationError, MediaToolError)
+UNSUPPORTED_FILE_MESSAGE = (
+    "این فایل پشتیبانی نمی‌شود. 🤔\n\n"
+    "می‌توانید بفرستید:\n"
+    "• پیام صوتی یا فایل صوتی (MP3، M4A، WAV، OGG، FLAC و…)\n"
+    "• فایل تصویری کلاس (MP4، MKV، MOV و…) تا صدایش جدا شود\n"
+    "• فایل ارائهٔ PowerPoint (pptx، pptm، ppsx و ppt، pps، odp)\n\n"
+    "برای راهنمای کامل، /help را بفرستید."
+)
+
+
+def _format_duration(seconds: float | None) -> str:
+    if not seconds or seconds <= 0:
+        return "نامشخص"
+    total = int(round(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours} ساعت و {minutes} دقیقه"
+    if minutes:
+        return f"{minutes} دقیقه و {secs} ثانیه"
+    return f"{secs} ثانیه"
 
 
 def _utf16_length(text: str) -> int:
@@ -107,22 +151,61 @@ def markdown_to_telegram_html(text: str) -> str:
     return "\n".join(result).strip()
 
 
-def _audio_metadata(message) -> tuple[bool, str | None, str | None, float | None, str | None]:
+def _media_metadata(message) -> tuple[str | None, str | None, str | None, float | None, str | None]:
+    """Classify an incoming message as ('audio' | 'video' | None, name, mime, duration, id)."""
     file_obj = message.file
     filename = getattr(file_obj, "name", None)
     mime_type = getattr(file_obj, "mime_type", None)
     extension = Path(filename).suffix.lower() if filename else ""
-    is_voice = bool(message.voice)
-    is_audio = is_voice or bool(message.audio) or (
-        message.document is not None
-        and ((mime_type or "").lower().startswith("audio/") or extension in AUDIO_EXTENSIONS)
-    )
+    normalized_mime = (mime_type or "").lower()
+
+    kind: str | None = None
+    if message.voice or message.audio:
+        kind = "audio"
+    elif getattr(message, "gif", None):
+        # Animated GIFs are silent video/mp4; treating them as lectures is noise.
+        kind = None
+    elif getattr(message, "video_note", None) or getattr(message, "video", None):
+        kind = "video"
+    elif message.document is not None:
+        if normalized_mime.startswith("audio/"):
+            kind = "audio"
+        elif normalized_mime.startswith("video/"):
+            kind = "video"
+        elif extension in AUDIO_EXTENSIONS:
+            kind = "audio"
+        elif extension in VIDEO_EXTENSIONS:
+            kind = "video"
+    if kind is None:
+        return None, None, None, None, None
+
     duration = getattr(file_obj, "duration", None)
-    if duration is None and is_voice:
+    if duration is None and message.voice:
         duration = getattr(message.voice, "duration", None)
-    document = message.document
-    file_id = str(getattr(document, "id", None) or message.id)
-    return is_audio, filename, mime_type, float(duration) if duration else None, file_id
+    file_id = str(getattr(message.document, "id", None) or message.id)
+    return kind, filename, mime_type, float(duration) if duration else None, file_id
+
+
+def _is_unsupported_attachment(message) -> bool:
+    """True for a real file the bot cannot use — never for link previews or text."""
+    media = getattr(message, "media", None)
+    if media is None or isinstance(media, MessageMediaWebPage):
+        return False
+    return getattr(message, "document", None) is not None or getattr(message, "photo", None) is not None
+
+
+def _presentation_metadata(message) -> tuple[str | None, str | None, str | None, str | None]:
+    """Return (kind, filename, mime_type, file_id) for PowerPoint documents."""
+    if message.document is None or message.voice or message.audio:
+        return None, None, None, None
+    file_obj = message.file
+    filename = getattr(file_obj, "name", None)
+    mime_type = getattr(file_obj, "mime_type", None)
+    kind = classify_presentation(filename, mime_type)
+    if kind is None:
+        return None, None, None, None
+    file_id = str(getattr(message.document, "id", None) or message.id)
+    return kind, filename, mime_type, file_id
 
 
 class StudyBot:
@@ -195,6 +278,8 @@ class StudyBot:
                 "سلام! به دستیار جزوه‌ساز خوش آمدید. 🌱\n\n"
                 "پیام صوتی یا فایل صوتی کلاس را بفرستید؛ متن آن پیاده‌سازی و به جزوه‌ای مرتب "
                 "همراه با نکته‌های مهم تبدیل می‌شود. فایل‌های طولانی هم پذیرفته می‌شوند.\n\n"
+                "می‌توانید فایل ارائهٔ PowerPoint را هم بفرستید؛ صداهای ضبط‌شده در اسلایدها "
+                "استخراج و همراه متن اسلایدها به یک جزوه تبدیل می‌شوند. 📊\n\n"
                 "برای راهنما، دستور /help را بفرستید."
             )
             return
@@ -202,6 +287,11 @@ class StudyBot:
             await event.reply(
                 "راهنمای دستیار جزوه‌ساز 📚\n\n"
                 "• یک پیام صوتی یا فایل صوتی ارسال کنید.\n"
+                "• فایل تصویری هم پذیرفته می‌شود؛ صدای آن جدا و پیاده‌سازی می‌شود.\n"
+                "• یا فایل ارائه بفرستید: pptx، pptm، ppsx و فایل‌های قدیمی ppt، pps و odp.\n"
+                "• صداهای داخل اسلایدها به ترتیب اسلاید در یک فایل ادغام و پیاده‌سازی می‌شوند؛ "
+                "متن و یادداشت گویندهٔ اسلایدها هم در جزوه به کار می‌رود.\n"
+                "• اگر ارائه صدا نداشته باشد، جزوه فقط از متن اسلایدها ساخته می‌شود.\n"
                 "• پس از دریافت فایل، پردازش در پس‌زمینه انجام می‌شود و نتیجه برایتان می‌آید.\n"
                 "• فایل‌های صوتی رایج مانند MP3، M4A، WAV، OGG و FLAC پشتیبانی می‌شوند.\n\n"
                 "دستورهای مدیر: /users، /stats، /broadcast، /ban و /unban"
@@ -214,48 +304,269 @@ class StudyBot:
             await self._handle_admin_command(event, command, text)
             return
 
-        is_audio, filename, mime_type, duration, file_id = _audio_metadata(event.message)
-        if is_audio:
-            await self._accept_audio(event, user, filename, mime_type, duration, file_id)
+        media_kind, filename, mime_type, duration, file_id = _media_metadata(event.message)
+        if media_kind:
+            await self._accept_media(
+                event, user, media_kind, filename, mime_type, duration, file_id
+            )
+            return
 
-    async def _accept_audio(self, event, user, filename, mime_type, duration, file_id) -> None:
+        deck_kind, deck_name, deck_mime, deck_file_id = _presentation_metadata(event.message)
+        if deck_kind:
+            await self._accept_presentation(
+                event, user, deck_kind, deck_name, deck_mime, deck_file_id
+            )
+            return
+
+        if _is_unsupported_attachment(event.message):
+            await event.reply(UNSUPPORTED_FILE_MESSAGE)
+
+    async def _accept_media(
+        self, event, user, kind: str, filename, mime_type, duration, file_id
+    ) -> None:
         file_obj = event.message.file
         size = getattr(file_obj, "size", None)
         if size is not None and size > self.settings.max_file_size:
             await event.reply("حجم فایل از محدودیت فعلی ربات بیشتر است و امکان پردازش آن وجود ندارد.")
-            logger.warning("Rejected oversized audio from user %s: %s bytes", user["telegram_id"], size)
+            logger.warning(
+                "Rejected oversized %s from user %s: %s bytes", kind, user["telegram_id"], size
+            )
+            return
+        if kind == "video" and not tool_available(self.settings.ffmpeg_bin):
+            await event.reply(
+                "پردازش فایل تصویری روی این سرور فعال نیست؛ لطفاً فایل صوتی همان جلسه را بفرستید."
+            )
+            logger.warning("Video submission rejected because ffmpeg is unavailable")
             return
         submission_id = await self.db.create_submission(
-            user["id"], file_id, duration, filename, mime_type
+            user["id"], file_id, duration, filename, mime_type, source_type=kind
         )
         task = asyncio.create_task(
-            self._process_submission(event, submission_id, filename),
-            name=f"audio-submission-{submission_id}",
+            self._process_submission(event, submission_id, filename, kind),
+            name=f"{kind}-submission-{submission_id}",
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
-        await event.reply("فایل صوتی دریافت شد ✅\nپردازش و آماده‌سازی جزوه در پس‌زمینه آغاز شد؛ نتیجه را همین‌جا می‌فرستم.")
+        received = (
+            "فایل تصویری دریافت شد ✅\nابتدا صدای آن جدا می‌شود، سپس جزوه ساخته می‌شود."
+            if kind == "video"
+            else "فایل صوتی دریافت شد ✅"
+        )
+        await event.reply(
+            f"{received}\nپردازش در پس‌زمینه آغاز شد؛ نتیجه را همین‌جا می‌فرستم."
+        )
 
-    async def _process_submission(self, event, submission_id: int, filename: str | None) -> None:
-        temp_path: Path | None = None
+    async def _accept_presentation(
+        self, event, user, kind: str, filename, mime_type, file_id
+    ) -> None:
+        if not self.settings.presentation_enabled:
+            await event.reply("پردازش فایل‌های ارائه در حال حاضر غیرفعال است.")
+            return
+        if kind == "legacy" and not self.settings.presentation_legacy_enabled:
+            await event.reply(
+                "فقط فایل‌های PowerPoint با پسوند pptx پذیرفته می‌شوند. "
+                "لطفاً فایل را در PowerPoint با قالب pptx ذخیره کنید و دوباره بفرستید."
+            )
+            return
+        size = getattr(event.message.file, "size", None)
+        if size is not None and size > self.settings.max_file_size:
+            await event.reply("حجم فایل از محدودیت فعلی ربات بیشتر است و امکان پردازش آن وجود ندارد.")
+            logger.warning(
+                "Rejected oversized deck from user %s: %s bytes", user["telegram_id"], size
+            )
+            return
+        submission_id = await self.db.create_submission(
+            user["id"], file_id, None, filename, mime_type, source_type="pptx"
+        )
+        task = asyncio.create_task(
+            self._process_presentation(event, submission_id, filename, kind),
+            name=f"presentation-submission-{submission_id}",
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        await event.reply(
+            "فایل ارائه دریافت شد ✅\n"
+            "صداهای داخل اسلایدها استخراج و به یک فایل تبدیل می‌شوند، سپس جزوه ساخته می‌شود؛ "
+            "نتیجه را همین‌جا می‌فرستم."
+        )
+
+    async def _process_presentation(
+        self, event, submission_id: int, filename: str | None, kind: str
+    ) -> None:
+        workdir: Path | None = None
         try:
             async with self._job_semaphore:
                 await self.db.set_submission_status(submission_id, "processing")
-                suffix = Path(filename).suffix.lower() if filename else ".ogg"
+                self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+                workdir = Path(
+                    tempfile.mkdtemp(prefix=f"deck-{submission_id}-", dir=self.settings.temp_dir)
+                )
+                suffix = Path(filename).suffix.lower() if filename else ".pptx"
                 if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
-                    suffix = ".audio"
-                with tempfile.NamedTemporaryFile(
-                    prefix=f"submission-{submission_id}-", suffix=suffix,
-                    dir=self.settings.temp_dir, delete=False,
-                ) as temp_file:
-                    temp_path = Path(temp_file.name)
-                downloaded = await event.message.download_media(file=str(temp_path))
-                if not downloaded or not temp_path.exists():
+                    suffix = ".pptx" if kind == "native" else ".ppt"
+                deck_path = workdir / f"deck{suffix}"
+                downloaded = await event.message.download_media(file=str(deck_path))
+                if not downloaded or not deck_path.exists():
                     raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
-                actual_size = temp_path.stat().st_size
-                if actual_size > self.settings.max_file_size:
+                if deck_path.stat().st_size > self.settings.max_file_size:
                     raise ValueError("حجم فایل از محدودیت پردازش ربات بیشتر است.")
-                result = await transcribe(temp_path, self.settings)
+
+                if kind == "legacy":
+                    await event.respond(
+                        "فایل با قالب قدیمی PowerPoint ارسال شده است؛ ابتدا به pptx تبدیل می‌شود."
+                    )
+                    deck_path = await convert_to_pptx(
+                        deck_path, workdir / "converted", self.settings
+                    )
+
+                content = await load_presentation(
+                    deck_path, workdir / "media", self.settings
+                )
+                prepared = await prepare_audio(content, workdir, self.settings)
+                await self._store_presentation_details(submission_id, content, prepared)
+
+                slide_note = f"{content.slide_count} اسلاید" if content.slide_count else "بدون متن اسلاید"
+                if prepared is None:
+                    outline = slides_outline(content.slides)
+                    if not outline.strip():
+                        raise ValueError(
+                            "در این فایل ارائه نه صدای قابل‌استفاده‌ای پیدا شد و نه متنی برای ساخت جزوه."
+                        )
+                    await event.respond(
+                        f"صدایی در این ارائه پیدا نشد؛ جزوه فقط از متن اسلایدها ساخته می‌شود ({slide_note})."
+                    )
+                    transcript_text = ""
+                    engine = "slides-only"
+                    confidence = None
+                else:
+                    await event.respond(
+                        f"استخراج انجام شد: {slide_note} و {len(prepared.clips)} فایل صوتی "
+                        f"(مجموع {_format_duration(prepared.total_duration)}).\n"
+                        "اکنون پیاده‌سازی گفتار در حال انجام است."
+                    )
+                    if prepared.path.stat().st_size > self.settings.max_file_size:
+                        raise ValueError("حجم صدای ادغام‌شده از محدودیت پردازش ربات بیشتر است.")
+                    result = await transcribe(prepared.path, self.settings)
+                    transcript_text = result.text
+                    engine = result.engine
+                    confidence = result.confidence
+
+                outline = slides_outline(content.slides)
+                try:
+                    structured = await structure_presentation(
+                        outline, transcript_text, self.settings
+                    )
+                    notice = ""
+                except Exception:
+                    logger.exception("LLM structuring unavailable; returning raw material")
+                    structured = self._fallback_presentation_text(outline, transcript_text)
+                    notice = (
+                        "\n\nتوجه: مرتب‌سازی خودکار جزوه موقتاً انجام نشد؛ "
+                        "متن استخراج‌شده در ادامه آمده است."
+                    )
+                if prepared is not None and prepared.skipped:
+                    notice += "\n\nموارد نادیده‌گرفته‌شده: " + "؛ ".join(prepared.skipped[:10])
+
+                await self.db.save_transcription(
+                    submission_id, engine, transcript_text, structured
+                )
+                await self.db.set_submission_status(submission_id, "done")
+                confidence_note = (
+                    f" (اطمینان تقریبی موتور: {confidence:.0%})" if confidence is not None else ""
+                )
+                header = (
+                    "جزوهٔ ارائهٔ شما آماده است 📊\n"
+                    f"منبع: فایل PowerPoint | موتور تبدیل گفتار: {engine}{confidence_note}\n\n"
+                )
+                await self._send_long_message(event, header + structured + notice)
+        except asyncio.CancelledError:
+            await self.db.set_submission_status(
+                submission_id, "failed", "پردازش هنگام خاموش‌شدن متوقف شد"
+            )
+            raise
+        except Exception as exc:
+            logger.exception("Presentation submission %s failed", submission_id)
+            try:
+                await self.db.set_submission_status(submission_id, "failed", str(exc)[:1000])
+            except Exception:
+                logger.exception("Could not store submission failure")
+            try:
+                message = (
+                    str(exc)
+                    if isinstance(exc, USER_VISIBLE_ERRORS)
+                    else "متأسفانه پردازش فایل ارائه انجام نشد. لطفاً فایل را بررسی کنید و دوباره بفرستید."
+                )
+                await event.reply(message)
+            except Exception:
+                logger.exception("Could not notify the user about processing failure")
+        finally:
+            if workdir:
+                shutil.rmtree(workdir, ignore_errors=True)
+
+    async def _store_presentation_details(self, submission_id, content, prepared) -> None:
+        used = {clip.part_name: clip for clip in (prepared.clips if prepared else ())}
+        rows = [
+            {
+                "slide_number": clip.slide_number,
+                "part_name": clip.part_name,
+                "kind": clip.kind,
+                "duration": (used[clip.part_name].duration if clip.part_name in used else None),
+                "included": clip.part_name in used,
+                "skip_reason": None if clip.part_name in used else "در ادغام صدا استفاده نشد",
+            }
+            for clip in content.clips
+        ]
+        try:
+            await self.db.save_presentation_details(
+                submission_id,
+                content.slide_count,
+                rows,
+                prepared.total_duration if prepared else None,
+            )
+        except Exception:
+            logger.exception("Could not store presentation details for %s", submission_id)
+
+    @staticmethod
+    def _fallback_presentation_text(outline: str, transcript: str) -> str:
+        parts = []
+        if outline.strip():
+            parts.append("## متن اسلایدها\n\n" + outline.strip())
+        if transcript.strip():
+            parts.append("## متن پیاده‌سازی‌شدهٔ صدای ارائه\n\n" + transcript.strip())
+        return "\n\n".join(parts)
+
+    async def _process_submission(
+        self, event, submission_id: int, filename: str | None, kind: str = "audio"
+    ) -> None:
+        workdir: Path | None = None
+        try:
+            async with self._job_semaphore:
+                await self.db.set_submission_status(submission_id, "processing")
+                self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+                workdir = Path(
+                    tempfile.mkdtemp(
+                        prefix=f"submission-{submission_id}-", dir=self.settings.temp_dir
+                    )
+                )
+                suffix = Path(filename).suffix.lower() if filename else (
+                    ".mp4" if kind == "video" else ".ogg"
+                )
+                if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+                    suffix = ".media"
+                source_path = workdir / f"source{suffix}"
+                downloaded = await event.message.download_media(file=str(source_path))
+                if not downloaded or not source_path.exists():
+                    raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
+                if source_path.stat().st_size > self.settings.max_file_size:
+                    raise ValueError("حجم فایل از محدودیت پردازش ربات بیشتر است.")
+
+                audio_path = await self._ensure_transcribable(
+                    event, source_path, workdir, filename, kind
+                )
+                if audio_path.stat().st_size > self.settings.max_file_size:
+                    raise ValueError("حجم صدای استخراج‌شده از محدودیت پردازش ربات بیشتر است.")
+
+                result = await transcribe(audio_path, self.settings)
                 try:
                     structured = await structure_transcript(result.text, self.settings)
                 except Exception:
@@ -272,32 +583,73 @@ class StudyBot:
                     f" (اطمینان تقریبی موتور: {result.confidence:.0%})"
                     if result.confidence is not None else ""
                 )
-                header = f"جزوهٔ شما آماده است 📖\nموتور تبدیل گفتار: {result.engine}{confidence}\n\n"
+                source_note = "منبع: فایل تصویری | " if kind == "video" else ""
+                header = (
+                    "جزوهٔ شما آماده است 📖\n"
+                    f"{source_note}موتور تبدیل گفتار: {result.engine}{confidence}\n\n"
+                )
                 await self._send_long_message(event, header + structured + notice)
         except asyncio.CancelledError:
             await self.db.set_submission_status(submission_id, "failed", "پردازش هنگام خاموش‌شدن متوقف شد")
             raise
         except Exception as exc:
-            logger.exception("Audio submission %s failed", submission_id)
+            logger.exception("Media submission %s failed", submission_id)
             try:
                 await self.db.set_submission_status(submission_id, "failed", str(exc)[:1000])
             except Exception:
                 logger.exception("Could not store submission failure")
             try:
                 message = (
-                    "متأسفانه پردازش فایل انجام نشد. لطفاً کیفیت فایل را بررسی کنید و دوباره بفرستید."
-                    if not isinstance(exc, ValueError)
-                    else str(exc)
+                    str(exc)
+                    if isinstance(exc, USER_VISIBLE_ERRORS)
+                    else "متأسفانه پردازش فایل انجام نشد. لطفاً کیفیت فایل را بررسی کنید و دوباره بفرستید."
                 )
                 await event.reply(message)
             except Exception:
                 logger.exception("Could not notify the user about processing failure")
         finally:
-            if temp_path:
-                try:
-                    temp_path.unlink(missing_ok=True)
-                except OSError:
-                    logger.exception("Could not remove temporary audio file")
+            if workdir:
+                shutil.rmtree(workdir, ignore_errors=True)
+
+    async def _ensure_transcribable(
+        self, event, source_path: Path, workdir: Path, filename: str | None, kind: str
+    ) -> Path:
+        """Return a file the STT providers accept, transcoding only when needed."""
+        info = None
+        if tool_available(self.settings.ffprobe_bin):
+            try:
+                info = await probe_media(source_path, self.settings)
+            except MediaToolError as exc:
+                logger.warning("Probing the upload failed: %s", exc)
+        if info is not None and not info.has_audio:
+            raise ValueError(
+                "این فایل شاخهٔ صوتی ندارد؛ لطفاً فایلی با صدای ضبط‌شده بفرستید."
+            )
+        if kind == "video":
+            await event.respond("در حال جدا کردن صدای فایل تصویری…")
+            return await extract_audio_track(
+                source_path,
+                workdir,
+                self.settings,
+                total_duration=info.duration if info else None,
+                stem="extracted-audio",
+            )
+        if needs_transcode(filename, info):
+            if not tool_available(self.settings.ffmpeg_bin):
+                logger.warning(
+                    "Codec %s may be unsupported but ffmpeg is unavailable; uploading as is",
+                    info.audio_codec if info else "unknown",
+                )
+                return source_path
+            await event.respond("قالب این فایل صوتی برای پیاده‌سازی آماده‌سازی می‌شود…")
+            return await extract_audio_track(
+                source_path,
+                workdir,
+                self.settings,
+                total_duration=info.duration if info else None,
+                stem="normalised-audio",
+            )
+        return source_path
 
     async def _send_long_message(self, event, text: str) -> None:
         pages = split_message(text)
@@ -333,7 +685,10 @@ class StudyBot:
                 f"کاربران ثبت‌شده: {stats['users']}\n"
                 f"کاربران غیرمسدود: {stats['unbanned_users']}\n"
                 f"کاربران دارای ارسال در ۳۰ روز اخیر: {stats['active_30d']}\n"
-                f"کل فایل‌های صوتی: {stats['submissions']}\n"
+                f"کل فایل‌های دریافتی: {stats['submissions']}\n"
+                f"فایل‌های تصویری: {stats['videos']}\n"
+                f"فایل‌های ارائه (PowerPoint): {stats['presentations']}\n"
+                f"کلیپ‌های صوتی استخراج‌شده از ارائه‌ها: {stats['presentation_clips']}\n"
                 f"پردازش‌های موفق: {stats['done']}\n"
                 f"پردازش‌های ناموفق: {stats['failed']}"
             )

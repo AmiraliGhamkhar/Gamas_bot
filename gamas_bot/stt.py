@@ -59,14 +59,32 @@ async def _error_text(response: aiohttp.ClientResponse) -> str:
         return f"HTTP {response.status}"
 
 
+def speechmatics_config(settings: Settings) -> dict:
+    """Job configuration for the Speechmatics batch API."""
+    return {
+        "type": "transcription",
+        "transcription_config": {
+            "language": settings.stt_language,
+            "model": "standard",
+        },
+    }
+
+
+def deepgram_params(settings: Settings) -> dict[str, str]:
+    """Query parameters for the Deepgram pre-recorded API."""
+    return {
+        "model": settings.deepgram_model,
+        "language": settings.stt_language,
+        "smart_format": "true",
+        "punctuate": "true",
+    }
+
+
 async def _speechmatics(
     session: aiohttp.ClientSession, audio_path: Path, settings: Settings
 ) -> Transcript:
     assert settings.speechmatics_api_key
-    config = {
-        "type": "transcription",
-        "transcription_config": {"language": "fa", "model": "standard"},
-    }
+    config = speechmatics_config(settings)
     form = aiohttp.FormData()
     form.add_field("config", json.dumps(config), content_type="application/json")
     with audio_path.open("rb") as audio:
@@ -143,12 +161,7 @@ async def _deepgram(
     session: aiohttp.ClientSession, audio_path: Path, settings: Settings
 ) -> Transcript:
     assert settings.deepgram_api_key
-    params = {
-        "model": settings.deepgram_model,
-        "language": "fa",
-        "smart_format": "true",
-        "punctuate": "true",
-    }
+    params = deepgram_params(settings)
     with audio_path.open("rb") as audio:
         async with session.post(
             "https://api.deepgram.com/v1/listen",
