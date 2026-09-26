@@ -26,6 +26,7 @@ def make_settings(**overrides) -> Settings:
         temp_dir=Path("tmp"),
         max_file_size=2_000_000_000,
         stt_primary="speechmatics",
+        stt_language="fa",
         stt_fallback_enabled=True,
         stt_min_confidence=0.65,
         speechmatics_api_key="sm-key",

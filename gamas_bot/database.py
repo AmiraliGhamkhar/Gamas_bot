@@ -225,6 +225,7 @@ class Database:
                 "(SELECT COUNT(*) FROM audio_submissions) AS submissions, "
                 "(SELECT COUNT(*) FROM audio_submissions WHERE status='done') AS done, "
                 "(SELECT COUNT(*) FROM audio_submissions WHERE status='failed') AS failed, "
+                "(SELECT COUNT(*) FROM audio_submissions WHERE source_type='video') AS videos, "
                 "(SELECT COUNT(*) FROM audio_submissions WHERE source_type='pptx') AS presentations, "
                 "(SELECT COALESCE(SUM(clip_count), 0) FROM audio_submissions "
                 "WHERE source_type='pptx') AS presentation_clips, "

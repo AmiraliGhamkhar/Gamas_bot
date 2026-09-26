@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +28,7 @@ class Settings:
     temp_dir: Path
     max_file_size: int
     stt_primary: str
+    stt_language: str
     stt_fallback_enabled: bool
     stt_min_confidence: float
     speechmatics_api_key: str | None
@@ -72,6 +74,9 @@ class Settings:
         primary = os.getenv("STT_PRIMARY", "speechmatics").strip().lower()
         if primary not in {"speechmatics", "deepgram"}:
             raise ValueError("STT_PRIMARY فقط می‌تواند speechmatics یا deepgram باشد.")
+        language = (os.getenv("STT_LANGUAGE", "fa").strip() or "fa")
+        if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?", language):
+            raise ValueError("STT_LANGUAGE باید کد زبان معتبر مانند fa یا en-US باشد.")
         try:
             min_confidence = float(os.getenv("STT_MIN_CONFIDENCE", "0.65"))
             max_file_size = int(os.getenv("MAX_FILE_SIZE_BYTES", "2000000000"))
@@ -113,6 +118,7 @@ class Settings:
             temp_dir=Path(os.getenv("TEMP_DIR", "data/tmp")),
             max_file_size=max_file_size,
             stt_primary=primary,
+            stt_language=language,
             stt_fallback_enabled=_flag("STT_FALLBACK_ENABLED", True),
             stt_min_confidence=min_confidence,
             speechmatics_api_key=os.getenv("SPEECHMATICS_API_KEY") or None,

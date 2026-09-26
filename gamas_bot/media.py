@@ -201,6 +201,79 @@ async def merge_audio_tracks(
     return output
 
 
+# Codecs both STT providers accept directly, so the upload can skip ffmpeg.
+PASSTHROUGH_CODECS = {
+    "aac", "alac", "flac", "mp3", "opus", "pcm_s16le", "pcm_s16be", "vorbis",
+}
+PASSTHROUGH_EXTENSIONS = {
+    ".aac", ".flac", ".m4a", ".mp3", ".mp4", ".oga", ".ogg", ".opus", ".wav", ".webm",
+}
+
+
+def needs_transcode(filename: str | None, info: MediaInfo | None) -> bool:
+    """Decide whether a plain audio upload must be normalised before STT.
+
+    Without an ffprobe report nothing is known about the file, so the original
+    is kept and sent as-is, exactly like before this feature existed.
+    """
+    if info is None:
+        return False
+    if not info.has_audio:
+        return False
+    suffix = Path(filename).suffix.lower() if filename else ""
+    if suffix not in PASSTHROUGH_EXTENSIONS:
+        return True
+    return (info.audio_codec or "").lower() not in PASSTHROUGH_CODECS
+
+
+def build_transcode_command(
+    ffmpeg_bin: str,
+    source: Path,
+    output: Path,
+    *,
+    output_format: str = "wav",
+) -> list[str]:
+    """Build an ffmpeg call that takes the first audio track to mono PCM/Opus."""
+    rate = OPUS_SAMPLE_RATE if output_format == "opus" else WAV_SAMPLE_RATE
+    command = [
+        ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-i", str(source),
+        "-map", "0:a:0",
+        "-vn",
+    ]
+    if output_format == "opus":
+        command += ["-c:a", "libopus", "-b:a", "32k", "-application", "voip"]
+    else:
+        command += ["-c:a", "pcm_s16le"]
+    command += ["-ar", str(rate), "-ac", "1", str(output)]
+    return command
+
+
+async def extract_audio_track(
+    source: Path,
+    output_dir: Path,
+    settings: Settings,
+    *,
+    total_duration: float | None = None,
+    stem: str = "audio",
+) -> Path:
+    """Pull a single mono audio track out of any media file ffmpeg can read."""
+    if not tool_available(settings.ffmpeg_bin):
+        raise MediaToolError(
+            "برای پردازش این فایل، ffmpeg باید روی سرور نصب باشد."
+        )
+    output_format = choose_merge_format(total_duration, settings)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output = output_dir / merge_output_name(stem, output_format)
+    command = build_transcode_command(
+        settings.ffmpeg_bin, source, output, output_format=output_format
+    )
+    code, _, stderr = await run_command(command, settings.ffmpeg_timeout)
+    if code != 0 or not output.exists() or output.stat().st_size == 0:
+        raise MediaToolError(f"استخراج صدا از این فایل ناموفق بود: {stderr.strip()[:300]}")
+    return output
+
+
 def build_convert_command(
     soffice_bin: str, source: Path, out_dir: Path, profile_dir: Path
 ) -> list[str]:
