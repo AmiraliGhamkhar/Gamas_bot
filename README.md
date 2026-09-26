@@ -1,256 +1,57 @@
-Gamas Bot — Persian Telegram Lecture Notes Assistant
+Gamas Bot
 
-A Persian Telegram bot built with Telethon (MTProto) that converts voice messages, audio files, videos, and PowerPoint presentations into structured, readable lecture notes.
+«Persian Telegram Lecture Notes Assistant — turn voice messages, audio, video, and PowerPoint presentations into structured Persian lecture notes.»
 
-The bot uses Speechmatics as the primary STT engine, Deepgram as an optional fallback, and Gemini 2.5 Flash-Lite to generate structured notes.
+""Python" (https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)" (https://www.python.org/)
+""Telegram" (https://img.shields.io/badge/Telegram-MTProto-26A5E4?logo=telegram&logoColor=white)" (https://telegram.org/)
+""SQLite" (https://img.shields.io/badge/Database-SQLite-003B57?logo=sqlite&logoColor=white)" (https://www.sqlite.org/)
+""FFmpeg" (https://img.shields.io/badge/Media-FFmpeg-007808?logo=ffmpeg&logoColor=white)" (https://ffmpeg.org/)
+
+Gamas Bot is a Python-based Telegram bot built with Telethon and MTProto for processing Persian lectures.
+
+It accepts audio, voice messages, videos, and PowerPoint presentations, converts speech to text using Speechmatics or Deepgram, and optionally generates structured lecture notes using Gemini 2.5 Flash-Lite.
+
+---
 
 Features
 
-- Persian speech-to-text from Telegram voice messages and audio files.
-- Supports "MP3", "M4A", "WAV", "OGG", "FLAC", and other common formats.
-- Supports video files such as "MP4", "MKV", "MOV", and "AVI".
-- Extracts audio from videos using "ffmpeg".
-- Automatically converts unsupported audio formats/codecs to mono "16 kHz" audio.
-- PowerPoint support:
-  - "PPTX", "PPTM", "PPSX"
-  - Legacy "PPT", "PPS", "ODP"
-  - Extracts slide audio and optional video audio.
-  - Preserves slide order.
-  - Uses slide text and speaker notes.
-  - Generates slide-by-slide notes.
-- Speech-to-text engines:
-  - Speechmatics
-  - Deepgram Nova-3
-- Configurable primary/fallback STT engine.
-- Gemini-based note generation with raw transcript fallback.
-- Background processing for long-running jobs.
-- SQLite database with WAL mode.
-- User, job, transcript, notes, presentation, and broadcast tracking.
-- Temporary audio/video files are deleted after processing.
-- Long results are automatically split across multiple Telegram messages.
-- Admin commands:
-  - "/users"
-  - "/stats"
-  - "/broadcast <message>"
-  - "/ban <id>"
-  - "/unban <id>"
-
----
-
-Architecture
-
-Telegram
-   │
-   ▼
-Telethon / MTProto
-   │
-   ├── Audio / Voice ───────────────┐
-   ├── Video ──► FFmpeg ────────────┤
-   └── PowerPoint ─► Extract Media ─┤
-                                    ▼
-                              Audio Preparation
-                                    │
-                                    ▼
-                           Speech-to-Text Engine
-                         ┌──────────┴──────────┐
-                         │                     │
-                    Speechmatics          Deepgram
-                         │                     │
-                         └──────────┬──────────┘
-                                    ▼
-                              Raw Transcript
-                                    │
-                                    ▼
-                              Gemini 2.5 Flash-Lite
-                                    │
-                                    ▼
-                              Structured Notes
-                                    │
-                                    ▼
-                               Telegram Output
-
----
-
-Requirements
-
-Software
-
-- Windows 10/11
-- Python 3.11+
-- FFmpeg + FFprobe
-- LibreOffice (only required for legacy "PPT", "PPS", and "ODP" files)
-
-Install FFmpeg and LibreOffice using PowerShell.
-
-Example with WinGet:
-
-winget install Gyan.FFmpeg
-winget install TheDocumentFoundation.LibreOffice
-
-Verify:
-
-ffmpeg -version
-ffprobe -version
-soffice --version
-
-If the executables are not available in "PATH", set their full paths in ".env".
-
----
-
-Telegram API Credentials
-
-Create a bot with @BotFather and obtain:
-
-TELEGRAM_BOT_TOKEN
-
-Then create Telegram API credentials at:
-
-https://my.telegram.org
-
-You need:
-
-TELEGRAM_API_ID
-TELEGRAM_API_HASH
-
-Telethon requires "api_id" and "api_hash" even when authenticating with a bot token.
-
----
-
-API Keys
-
-At least one STT provider is required.
-
-Speechmatics
-
-https://portal.speechmatics.com/
-
-Deepgram
-
-https://console.deepgram.com/
-
-Gemini
-
-https://aistudio.google.com/apikey
-
-Gemini is optional. If it is unavailable, the raw transcript is still preserved and returned.
-
----
-
-Installation — Windows PowerShell
-
-Clone the repository:
-
-git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git
-cd Gamas_bot
-
-Create a virtual environment:
-
-py -3.11 -m venv .venv
-
-Activate it:
-
-.\.venv\Scripts\Activate.ps1
-
-If PowerShell blocks script execution:
-
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-
-Then activate again:
-
-.\.venv\Scripts\Activate.ps1
-
-Install dependencies:
-
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-
-Create the environment file:
-
-Copy-Item .env.example .env
-
-Edit ".env":
-
-notepad .env
-
----
-
-Minimal ".env"
-
-TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
-TELEGRAM_API_ID=12345678
-TELEGRAM_API_HASH=YOUR_API_HASH
-ADMIN_IDS=123456789
-
-SPEECHMATICS_API_KEY=YOUR_SPEECHMATICS_KEY
-DEEPGRAM_API_KEY=YOUR_DEEPGRAM_KEY
-GEMINI_API_KEY=YOUR_GEMINI_KEY
-
-Only one STT key is required.
-
----
-
-STT Configuration
-
-STT_PRIMARY=speechmatics
-STT_LANGUAGE=fa
-STT_FALLBACK_ENABLED=true
-STT_MIN_CONFIDENCE=0.65
-
-SPEECHMATICS_BASE_URL=https://eu1.asr.api.speechmatics.com/v2
-DEEPGRAM_MODEL=nova-3
-
-Behavior
-
-If the primary engine fails, the fallback engine can be used.
-
-A fallback can also be triggered when the primary engine reports confidence below:
-
-STT_MIN_CONFIDENCE=0.65
-
-Set:
-
-STT_PRIMARY=deepgram
-
-to make Deepgram the primary engine.
-
-Disable fallback:
-
-STT_FALLBACK_ENABLED=false
-
-"STT_LANGUAGE" controls speech recognition language only.
-
-Example:
-
-STT_LANGUAGE=fa
-
----
-
-PowerPoint Processing
-
-PowerPoint files are processed in this order:
-
-Presentation
-   │
-   ├── Slide text
-   ├── Speaker notes
-   ├── Slide audio
-   └── Video audio
-          │
-          ▼
-      FFmpeg
-          │
-          ▼
-   Combined audio
-          │
-          ▼
-        STT
-          │
-          ▼
-   Slide-by-slide notes
-
-The bot preserves the actual presentation slide order.
-
-Supported formats:
+- Persian speech-to-text ("fa")
+- Telegram voice messages and audio files
+- Video-to-text processing
+- PowerPoint lecture processing
+- Slide audio extraction and merging
+- Slide text and speaker-note extraction
+- Slide-by-slide lecture notes
+- Speechmatics + Deepgram STT
+- Configurable STT fallback
+- Gemini-powered note generation
+- Background processing for long jobs
+- SQLite + WAL
+- Automatic temporary-file cleanup
+- Long-message splitting for Telegram
+- Admin commands and user management
+- Windows-friendly PowerShell setup
+
+Supported audio
+
+MP3
+M4A
+WAV
+OGG
+FLAC
+WMA
+AMR
+and other FFmpeg-supported formats
+
+Supported video
+
+MP4
+MKV
+MOV
+AVI
+Telegram Video Notes
+
+Supported presentations
 
 PPTX
 PPTM
@@ -259,9 +60,271 @@ PPT
 PPS
 ODP
 
-Legacy formats are converted to "PPTX" using LibreOffice.
+---
 
-Useful settings:
+How It Works
+
+                    Telegram
+                       │
+                       ▼
+                Telethon / MTProto
+                       │
+          ┌────────────┼────────────┐
+          │            │            │
+        Audio        Video     PowerPoint
+          │            │            │
+          │         FFmpeg     Slide Parser
+          │            │            │
+          └────────────┼────────────┘
+                       ▼
+                Audio Preparation
+                       │
+                       ▼
+                 Speech-to-Text
+                 ┌─────┴─────┐
+                 │           │
+            Speechmatics   Deepgram
+                 │           │
+                 └─────┬─────┘
+                       ▼
+                 Raw Transcript
+                       │
+                       ▼
+             Gemini 2.5 Flash-Lite
+                       │
+                       ▼
+                Structured Notes
+                       │
+                       ▼
+                    Telegram
+
+---
+
+Requirements
+
+- Windows 10/11
+- Python 3.11+
+- FFmpeg
+- FFprobe
+- LibreOffice (only required for legacy PowerPoint formats)
+- Telegram Bot Token
+- Telegram API ID + API Hash
+- At least one STT API key
+- Gemini API key (optional)
+
+---
+
+Installation — Windows
+
+1. Install FFmpeg
+
+Using WinGet:
+
+winget install Gyan.FFmpeg
+
+Verify:
+
+ffmpeg -version
+ffprobe -version
+
+2. Install LibreOffice
+
+Only required for:
+
+PPT
+PPS
+ODP
+
+Install:
+
+winget install TheDocumentFoundation.LibreOffice
+
+Verify:
+
+soffice --version
+
+---
+
+3. Clone the Repository
+
+git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git
+cd Gamas_bot
+
+---
+
+4. Create a Virtual Environment
+
+py -3.11 -m venv .venv
+
+Activate it:
+
+.\.venv\Scripts\Activate.ps1
+
+If PowerShell blocks activation:
+
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+
+Then:
+
+.\.venv\Scripts\Activate.ps1
+
+---
+
+5. Install Dependencies
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+
+---
+
+6. Configure Environment Variables
+
+Create ".env":
+
+Copy-Item .env.example .env
+
+Open it:
+
+notepad .env
+
+Minimal configuration:
+
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_API_ID=YOUR_API_ID
+TELEGRAM_API_HASH=YOUR_API_HASH
+
+ADMIN_IDS=123456789
+
+SPEECHMATICS_API_KEY=YOUR_SPEECHMATICS_KEY
+DEEPGRAM_API_KEY=YOUR_DEEPGRAM_KEY
+
+GEMINI_API_KEY=YOUR_GEMINI_KEY
+
+At least one of the STT API keys is required.
+
+---
+
+Telegram Credentials
+
+Create your bot using @BotFather.
+
+You need:
+
+TELEGRAM_BOT_TOKEN=...
+
+Telethon also requires:
+
+TELEGRAM_API_ID=...
+TELEGRAM_API_HASH=...
+
+Get these from:
+
+https://my.telegram.org
+
+---
+
+API Providers
+
+Speechmatics
+
+Primary STT engine.
+
+https://portal.speechmatics.com/
+
+Deepgram
+
+Optional alternative/fallback STT engine.
+
+https://console.deepgram.com/
+
+Gemini
+
+Used to convert transcripts into structured lecture notes.
+
+https://aistudio.google.com/apikey
+
+Gemini is optional. If unavailable, the raw transcript is preserved.
+
+---
+
+STT Configuration
+
+Example:
+
+STT_PRIMARY=speechmatics
+STT_LANGUAGE=fa
+
+STT_FALLBACK_ENABLED=true
+STT_MIN_CONFIDENCE=0.65
+
+SPEECHMATICS_BASE_URL=https://eu1.asr.api.speechmatics.com/v2
+DEEPGRAM_MODEL=nova-3
+
+Primary engine
+
+Use Speechmatics:
+
+STT_PRIMARY=speechmatics
+
+Or Deepgram:
+
+STT_PRIMARY=deepgram
+
+Fallback
+
+Enable:
+
+STT_FALLBACK_ENABLED=true
+
+Disable:
+
+STT_FALLBACK_ENABLED=false
+
+When enabled, the secondary engine can be used if the primary request fails or reports confidence below:
+
+STT_MIN_CONFIDENCE=0.65
+
+«Confidence scores from different providers are not necessarily calibrated against each other. Tune this threshold using your own validation dataset.»
+
+---
+
+PowerPoint Processing
+
+PowerPoint files receive additional processing.
+
+                    PowerPoint
+                        │
+             ┌──────────┼──────────┐
+             ▼          ▼          ▼
+          Slides      Audio      Video
+           Text       Clips       Audio
+             │          │          │
+             │          └────┬─────┘
+             │               ▼
+             │             FFmpeg
+             │               │
+             └───────────────┤
+                             ▼
+                       Speech-to-Text
+                             │
+                             ▼
+                    Slide-by-slide notes
+
+The processor:
+
+1. Reads the actual presentation slide order.
+2. Extracts slide text.
+3. Extracts speaker notes.
+4. Finds referenced audio.
+5. Optionally extracts audio from embedded videos.
+6. Filters very short audio clips.
+7. Converts audio to mono 16 kHz.
+8. Adds short silence between clips.
+9. Sends the combined audio to STT.
+10. Combines transcript + slide content.
+11. Generates structured notes.
+
+PowerPoint configuration
 
 PPTX_ENABLED=true
 PPTX_INCLUDE_SLIDE_TEXT=true
@@ -270,9 +333,9 @@ PPTX_LEGACY_ENABLED=true
 
 PPTX_MIN_CLIP_SECONDS=1.0
 PPTX_SILENCE_SECONDS=0.5
+
 PPTX_MAX_CLIPS=300
 PPTX_MAX_TOTAL_DURATION_SECONDS=21600
-
 PPTX_MAX_UNPACKED_BYTES=4000000000
 PPTX_WAV_LIMIT_BYTES=700000000
 
@@ -283,126 +346,90 @@ SOFFICE_BIN=soffice
 FFMPEG_TIMEOUT_SECONDS=3600
 SOFFICE_TIMEOUT_SECONDS=600
 
-Disable PowerPoint processing completely:
+Disable PowerPoint support:
 
 PPTX_ENABLED=false
 
-Presentations without audio are still processed using slide text and speaker notes.
+Presentations without audio can still produce notes from slide text and speaker notes.
 
 ---
 
-File Size and Processing Limits
+Processing Limits
 
-Default application limit:
+Default application file limit:
 
 MAX_FILE_SIZE_BYTES=2000000000
 
-This is the bot/application limit and does not guarantee that every STT provider will accept the file.
+This is an application-level limit and does not guarantee that an STT provider accepts the file.
 
-For example, Speechmatics Batch and Deepgram have different API limits and request behavior. Very large or very long recordings should be tested with the actual provider account before production use.
+For very long recordings, provider-specific request limits still apply.
 
-Long jobs are processed in the background and do not block the Telegram event loop.
+The application does not automatically split arbitrary long audio files into smaller STT requests.
 
-Maximum concurrent jobs:
+Control concurrent processing with:
 
 MAX_CONCURRENT_JOBS=2
 
-Increase carefully according to CPU, RAM, disk, network bandwidth, and API limits.
+Increase this only after testing CPU, memory, disk, network, and API limits.
 
 ---
 
-Run the Bot
+Run
 
-Activate the environment:
+Activate the virtual environment:
 
 .\.venv\Scripts\Activate.ps1
 
-Start:
+Start the bot:
 
 python -m gamas_bot
 
-The first run creates the required data directories and SQLite tables automatically.
+The application automatically creates the required database and data directories on first startup.
 
 ---
 
 Database
 
-The bot uses SQLite with:
+Gamas Bot uses SQLite with:
 
 - WAL mode
 - Foreign keys
 - Busy timeout
 - Versioned migrations
 
-Migration files are stored in:
+Migration files:
 
 migrations/
+├── 001_initial.sql
+└── 002_presentations.sql
 
-Current migrations include:
-
-001_initial.sql
-002_presentations.sql
-
-The database path can be changed with:
+Configure paths with:
 
 DATABASE_PATH=...
-
-Other paths:
-
 TELEGRAM_SESSION_PATH=...
 TEMP_DIR=...
 
-Temporary media is deleted after processing.
+Temporary media is removed after processing.
 
-Transcripts and generated notes remain in the local SQLite database until manually deleted.
-
----
-
-Testing
-
-Run the test suite:
-
-python -m unittest discover -s tests -v
-
-For STT benchmarking:
-
-python -m scripts.benchmark_stt samples\short.wav samples\lecture-long.mp3 --output results.csv
-
-For each sample, place the reference transcript next to the audio file:
-
-lecture.mp3
-lecture.mp3.txt
-
-The benchmark can compare Speechmatics and Deepgram using:
-
-- Response time
-- Reported confidence
-- Normalized Persian WER
-
-Persian normalization includes common character variants such as:
-
-ي → ی
-ك → ک
-
-The benchmark does not store the full transcription in the CSV report.
+Transcripts and generated notes remain in SQLite until explicitly deleted.
 
 ---
 
-Telegram Commands
-
-Users
+User Commands
 
 /start
 /help
 
-Send one of the following:
+Users can then send:
 
 Voice message
 Audio file
 Video file
 PowerPoint presentation
 
-Admin
+---
+
+Admin Commands
 
 /users
 /stats
@@ -410,44 +437,84 @@ Admin
 /ban <user_id>
 /unban <user_id>
 
-Only IDs listed in:
+Administrators are defined with:
 
-ADMIN_IDS=123,456,789
+ADMIN_IDS=123456789,987654321
 
-can execute administrative commands.
+Only configured administrator IDs can execute administrative commands.
 
 ---
 
 Input Handling
 
-Input| Behavior
-Voice message| Direct STT processing
-MP3/M4A/WAV/OGG/FLAC| STT processing
-MP4/MKV/MOV/AVI| Audio extracted with FFmpeg
-Video note| Audio extracted and transcribed
+Input| Processing
+Telegram voice| Speech-to-text
+Audio file| Speech-to-text
+Video| Extract audio → STT
+Video Note| Extract audio → STT
 PPTX/PPTM/PPSX| Slides + audio + notes
-PPT/PPS/ODP| Converted to PPTX first
-PDF/Image/ZIP/etc.| Rejected with usage instructions
-Plain text message| Ignored to avoid interfering with normal chat
+PPT/PPS/ODP| LibreOffice → PPTX
+PDF/Image/ZIP| Rejected with instructions
+Plain text| Ignored
 
-Files without an audio stream are detected before STT usage.
+Files without an audio stream are detected before consuming STT resources.
 
 GIF files are not treated as lecture videos.
 
 ---
 
+Testing
+
+Run all tests:
+
+python -m unittest discover -s tests -v
+
+STT Benchmark
+
+Prepare samples:
+
+samples/
+├── short.wav
+├── short.wav.txt
+├── lecture-long.mp3
+└── lecture-long.mp3.txt
+
+Run:
+
+python -m scripts.benchmark_stt `
+    samples\short.wav `
+    samples\lecture-long.mp3 `
+    --output results.csv
+
+The benchmark can compare:
+
+- Response time
+- Provider confidence
+- Normalized Persian WER
+
+Persian normalization includes:
+
+ي → ی
+ك → ک
+
+The benchmark does not store full transcripts in the CSV report.
+
+---
+
 Security
 
-The bot performs basic safety checks when unpacking PowerPoint files, including:
+PowerPoint packages are validated before extraction.
+
+Checks include:
 
 - Path traversal protection
-- Absolute path rejection
+- Absolute-path rejection
 - Unpacked-size limits
 - Media reference validation
 
-Sensitive files should never be committed to Git.
+Never commit secrets or runtime data.
 
-Do not commit:
+The following should remain local:
 
 .env
 *.session
@@ -455,98 +522,54 @@ Do not commit:
 temporary files
 API keys
 
-The repository ".gitignore" should exclude them.
-
 ---
 
 Privacy
 
-User audio is sent to the configured STT provider.
+Audio is sent to the configured STT provider.
 
-If Gemini is enabled, the following may be sent to Gemini for note generation:
+If Gemini is enabled, the following may be sent for note generation:
 
-- Raw transcript
+- Transcript
 - Slide text
 - Speaker notes
 
-Presentation files and extracted temporary media are deleted after processing.
+Temporary presentation and media files are deleted after processing.
 
-The local SQLite database stores:
+The local database may contain:
 
 - User information
 - Job status
 - Raw transcripts
 - Generated notes
 - Presentation metadata
-- Presentation clip information
+- Presentation clip metadata
 
-Review provider retention policies, user consent requirements, applicable regulations, and your own data-retention policy before public deployment.
+Before production deployment, review:
+
+- Provider data-retention policies
+- User consent requirements
+- Applicable privacy regulations
+- Data residency
+- Your application's retention/deletion policy
 
 ---
 
-STT Cost and Quality
+STT Evaluation
 
-Speechmatics and Deepgram support Persian ("fa"), but transcription quality depends on:
+Speechmatics and Deepgram both support Persian, but real-world accuracy depends on:
 
-- Speaker
-- Accent
+- Recording quality
 - Microphone
 - Background noise
-- Recording quality
-- Domain-specific vocabulary
-- Audio length
+- Speaker
+- Accent
+- Technical vocabulary
+- Medical/engineering terminology
 
-Do not assume one engine is universally more accurate for Persian academic lectures.
+Do not assume that one provider is universally better for Persian academic lectures.
 
-For production evaluation, benchmark both engines using the same real recordings and manually verify technical terminology.
-
----
-
-Production Notes
-
-This application maintains a persistent Telethon/MTProto connection.
-
-It is designed for:
-
-- Windows servers
-- VPS machines
-- Always-on Python processes
-
-It is not designed for:
-
-- Stateless serverless functions
-- Traditional shared hosting
-- cPanel-only deployments
-
-For Windows production, run the bot as a persistent background process using Windows Task Scheduler, NSSM, or another process supervisor rather than starting it manually.
-
----
-
-Useful PowerShell Commands
-
-Check Python:
-
-python --version
-
-Check installed packages:
-
-pip list
-
-Update dependencies:
-
-pip install -r requirements.txt --upgrade
-
-Check FFmpeg:
-
-ffmpeg -version
-
-Check LibreOffice:
-
-soffice --version
-
-Stop the running bot:
-
-Ctrl + C
+For production evaluation, use the same recordings and manually verify domain-specific terminology.
 
 ---
 
@@ -576,11 +599,43 @@ Gamas_bot/
 
 ---
 
-License
+Windows Production
 
-Add your project license here, for example:
+Gamas Bot maintains a persistent Telethon/MTProto connection, so it should run as a persistent process.
 
-MIT License
+Recommended Windows options:
+
+- Windows Task Scheduler
+- NSSM
+- Dedicated Windows server
+- VPS with Windows
+
+It is not designed for stateless serverless environments or traditional shared hosting.
+
+---
+
+Useful PowerShell Commands
+
+Check Python
+
+python --version
+
+Check FFmpeg
+
+ffmpeg -version
+ffprobe -version
+
+Check LibreOffice
+
+soffice --version
+
+Update dependencies
+
+pip install -r requirements.txt --upgrade
+
+Stop the bot
+
+Ctrl + C
 
 ---
 
@@ -599,4 +654,23 @@ notepad .env
 
 python -m gamas_bot
 
-The bot is then ready to receive Persian audio, video, and PowerPoint lecture files through Telegram.
+Send a voice message, audio file, video, or PowerPoint presentation to your Telegram bot.
+
+---
+
+License
+
+Add your project license here.
+
+Example:
+
+MIT License
+
+---
+
+Author
+
+Amirali Ghamkhar
+
+GitHub:
+https://github.com/AmiraliGhamkhar
