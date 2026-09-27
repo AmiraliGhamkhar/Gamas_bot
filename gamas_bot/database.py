@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -14,6 +15,41 @@ logger = logging.getLogger(__name__)
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def split_sql_statements(script: str) -> list[str]:
+    """Split a migration file into statements, ignoring comments and strings."""
+    statements: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(script):
+        char = script[index]
+        pair = script[index : index + 2]
+        if quote is None and pair == "--":
+            end = script.find("\n", index)
+            index = len(script) if end == -1 else end
+            continue
+        if quote is None and pair == "/*":
+            end = script.find("*/", index + 2)
+            index = len(script) if end == -1 else end + 2
+            continue
+        if quote is not None and char == quote:
+            quote = None
+        elif quote is None and char in "'\"":
+            quote = char
+        if char == ";" and quote is None:
+            statement = "".join(current).strip()
+            if statement:
+                statements.append(statement)
+            current = []
+        else:
+            current.append(char)
+        index += 1
+    tail = "".join(current).strip()
+    if tail:
+        statements.append(tail)
+    return statements
 
 
 class Database:
@@ -60,7 +96,20 @@ class Database:
         for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
             if migration.name in applied:
                 continue
-            await db.executescript(migration.read_text(encoding="utf-8"))
+            for statement in split_sql_statements(migration.read_text(encoding="utf-8")):
+                try:
+                    await db.execute(statement)
+                except sqlite3.OperationalError as exc:
+                    # "ALTER TABLE ... ADD COLUMN" has no IF NOT EXISTS form, so a
+                    # migration interrupted halfway (or a database created before
+                    # the bookkeeping table existed) must not wedge every restart.
+                    if "duplicate column name" not in str(exc).lower():
+                        raise
+                    logger.warning(
+                        "Migration statement already applied name=%s detail=%s",
+                        migration.name,
+                        exc,
+                    )
             await db.execute(
                 "INSERT OR REPLACE INTO schema_migrations(name, applied_at) VALUES (?, ?)",
                 (migration.name, utc_now()),

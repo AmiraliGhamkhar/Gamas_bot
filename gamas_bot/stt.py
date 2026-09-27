@@ -193,6 +193,13 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
     order = [primary]
     if settings.stt_fallback_enabled:
         order.append(secondary)
+    elif not _provider_key(settings, primary):
+        # Fallback is off, but refusing every job because the *primary* engine
+        # has no key while the other one does would be pointless.
+        logger.warning(
+            "STT primary provider=%s has no API key; using %s instead", primary, secondary
+        )
+        order = [secondary]
     if audio_path.stat().st_size >= 1_000_000_000:
         # Speechmatics Batch SaaS rejects direct multipart uploads at 1 GB.
         # Deepgram supports direct pre-recorded uploads up to 2 GB.

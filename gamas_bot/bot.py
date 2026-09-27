@@ -44,6 +44,13 @@ VIDEO_EXTENSIONS = {
     ".mpg", ".ts", ".webm", ".wmv",
 }
 MESSAGE_CHUNK_SIZE = 3800
+# Telegram refuses messages whose *parsed* text is longer than 4096 UTF-16
+# code units. HTML tags do not count, but the renderer below can still grow the
+# visible text (table headers are repeated on every row), so the rendered page
+# is what has to be measured before sending.
+TELEGRAM_TEXT_LIMIT = 4096
+MIN_CHUNK_SIZE = 400
+TAG_PATTERN = re.compile(r"<[^>]+>")
 USER_VISIBLE_ERRORS = (ValueError, PresentationError)
 UNSUPPORTED_FILE_MESSAGE = (
     "این نوع فایل را نمی‌توانم پردازش کنم. 🤔\n\n"
@@ -160,6 +167,8 @@ def split_message(text: str, limit: int = MESSAGE_CHUNK_SIZE) -> list[str]:
             cut = text.rfind(" ", 0, safe_end)
         if cut < safe_end // 2:
             cut = safe_end
+        # A zero-width cut would loop forever on the same text.
+        cut = max(cut, 1)
         pages.append(text[:cut].strip())
         text = text[cut:].strip()
     if text:
@@ -167,11 +176,60 @@ def split_message(text: str, limit: int = MESSAGE_CHUNK_SIZE) -> list[str]:
     return pages or [""]
 
 
+def _plain_length(rendered: str) -> int:
+    """Length Telegram counts for an HTML message: tags off, entities decoded."""
+    return _utf16_length(html.unescape(TAG_PATTERN.sub("", rendered)))
+
+
+def _split_rendered(rendered: str, budget: int) -> list[str]:
+    """Split already rendered HTML on line boundaries, never inside a tag.
+
+    ``markdown_to_telegram_html`` renders every source line independently, so a
+    tag never spans a newline and cutting there keeps the markup valid.
+    """
+    pages: list[str] = []
+    current: list[str] = []
+    used = 0
+    for line in rendered.split("\n"):
+        length = _plain_length(line)
+        if length > budget:
+            if current:
+                pages.append("\n".join(current))
+                current, used = [], 0
+            # One oversized line: drop its markup so it can be cut anywhere.
+            plain = html.escape(html.unescape(TAG_PATTERN.sub("", line)), quote=False)
+            pages.extend(split_message(plain, budget))
+            continue
+        if current and used + length + 1 > budget:
+            pages.append("\n".join(current))
+            current, used = [line], length
+            continue
+        current.append(line)
+        used += length + 1
+    if current:
+        pages.append("\n".join(current))
+    return [page for page in pages if page.strip()]
+
+
+def render_pages(text: str, reserve: int = 64) -> list[str]:
+    """Render Markdown once, then paginate the HTML for Telegram.
+
+    Rendering before splitting matters: a table cut in half would otherwise
+    lose its header and the next page's first data row would be mistaken for
+    one. Paginating the rendered text also measures what Telegram counts,
+    because the renderer repeats table headers and can grow the text well past
+    the length of its Markdown source.
+    """
+    budget = max(MIN_CHUNK_SIZE, TELEGRAM_TEXT_LIMIT - reserve)
+    return _split_rendered(markdown_to_telegram_html(text), budget) or [""]
+
+
 def markdown_to_telegram_html(text: str) -> str:
     """Convert the small Markdown subset used by the LLM to Telegram-safe HTML."""
     lines = text.splitlines()
     result: list[str] = []
     table_header: list[str] | None = None
+    table_rows = 0
     in_code = False
 
     def inline(value: str) -> str:
@@ -184,17 +242,32 @@ def markdown_to_telegram_html(text: str) -> str:
             return f"\x00{len(stashed) - 1}\x00"
 
         value = re.sub(r"`([^`]+)`", stash, value)
-        value = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", value)
-        value = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<i>\1</i>", value)
-        value = re.sub(r"(?<!_)_([^_]+)_(?!_)", r"<i>\1</i>", value)
+        value = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"<b>\1</b>", value)
+        # Emphasis markers must hug their text and sit outside a word, so
+        # "2 * 3 * 4" and identifiers such as @a_b_c survive untouched.
+        value = re.sub(r"(?<![\w*])\*(?!\s)([^*]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", value)
+        value = re.sub(r"(?<![\w_])_(?!\s)([^_]+?)(?<!\s)_(?![\w_])", r"<i>\1</i>", value)
         return re.sub(
             r"\x00(\d+)\x00",
             lambda match: f"<code>{stashed[int(match.group(1))]}</code>",
             value,
         )
 
+    def flush_table() -> None:
+        """Emit a table header that never received a data row."""
+        nonlocal table_header, table_rows
+        if table_header is not None and not table_rows:
+            cells = [inline(cell) for cell in table_header if cell.strip()]
+            if cells:
+                result.append(" · ".join(f"<b>{cell}</b>" for cell in cells))
+        table_header = None
+        table_rows = 0
+
     for line in lines:
         stripped = line.strip()
+        in_table = not in_code and stripped.startswith("|") and "|" in stripped[1:]
+        if not in_table:
+            flush_table()
         if stripped.startswith("```"):
             in_code = not in_code
             continue
@@ -202,12 +275,14 @@ def markdown_to_telegram_html(text: str) -> str:
             # Code lines are escaped verbatim; Markdown does not apply inside fences.
             result.append(html.escape(line, quote=False))
             continue
-        if "|" in stripped and stripped.startswith("|"):
+        if in_table:
             cells = [cell.strip() for cell in stripped.strip("|").split("|")]
-            if cells and all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells):
+            # Markdown only requires one dash per separator cell (|--|-:|).
+            if cells and all(re.fullmatch(r":?-+:?", cell) for cell in cells):
                 continue
             if table_header is None:
                 table_header = cells
+                table_rows = 0
                 continue
             pairs = [
                 f"<b>{inline(table_header[index])}:</b> {inline(cell)}"
@@ -215,9 +290,8 @@ def markdown_to_telegram_html(text: str) -> str:
                 if cell and index < len(table_header)
             ]
             result.append(" · ".join(pairs) if pairs else inline(" | ".join(cells)))
+            table_rows += 1
             continue
-        if table_header is not None:
-            table_header = None
         heading = re.match(r"^\s{0,3}#{1,6}\s+(.*)$", line)
         if heading:
             result.append(f"<b>{inline(heading.group(1).strip())}</b>")
@@ -230,6 +304,7 @@ def markdown_to_telegram_html(text: str) -> str:
             result.append(inline(line.strip()))
             continue
         result.append(inline(line))
+    flush_table()
     return "\n".join(result).strip()
 
 
@@ -272,6 +347,9 @@ def _is_unsupported_attachment(message) -> bool:
     """True for a real file the bot cannot use — never for link previews or text."""
     media = getattr(message, "media", None)
     if media is None or isinstance(media, MessageMediaWebPage):
+        return False
+    if getattr(message, "sticker", None) is not None or getattr(message, "gif", None) is not None:
+        # Stickers and animations are conversational, not failed uploads.
         return False
     return getattr(message, "document", None) is not None or getattr(message, "photo", None) is not None
 
@@ -326,6 +404,7 @@ class StudyBot:
         self.settings.database_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self._clean_stale_workdirs()
         await self.db.open()
         self._register_handlers()
         await self.client.start(bot_token=self.settings.telegram_bot_token)
@@ -352,6 +431,22 @@ class StudyBot:
                 available,
                 required,
             )
+
+    def _clean_stale_workdirs(self) -> None:
+        """Delete job folders left behind by a crash or a hard restart.
+
+        No job can be running at startup, so anything matching the job prefixes
+        is garbage that would otherwise sit in ``data/tmp`` forever.
+        """
+        removed = 0
+        for prefix in ("submission-", "deck-"):
+            for leftover in self.settings.temp_dir.glob(f"{prefix}*"):
+                if not leftover.is_dir():
+                    continue
+                shutil.rmtree(leftover, ignore_errors=True)
+                removed += not leftover.exists()
+        if removed:
+            logger.info("Removed stale temporary job folders count=%s", removed)
 
     async def run(self) -> None:
         try:
@@ -680,7 +775,10 @@ class StudyBot:
                     deck_path, workdir / "media", self.settings
                 )
                 await progress.update(50, "دارم صداهای اسلایدها را آماده می‌کنم")
-                prepared = await prepare_audio(content, workdir, self.settings)
+                deck_skips: list[str] = []
+                prepared = await prepare_audio(
+                    content, workdir, self.settings, skipped_out=deck_skips
+                )
                 await self._store_presentation_details(submission_id, content, prepared)
 
                 slide_note = f"{content.slide_count} اسلاید" if content.slide_count else "بدون متن اسلاید"
@@ -731,8 +829,11 @@ class StudyBot:
                         "\n\nنکته: این بار نتوانستم متن را به شکل جزوه مرتب کنم؛ "
                         "متن استخراج‌شده را کامل فرستادم."
                     )
-                if prepared is not None and prepared.skipped:
-                    notice += "\n\nموارد نادیده‌گرفته‌شده: " + "؛ ".join(prepared.skipped[:10])
+                # Without a prepared track the reasons live on the deck itself;
+                # either way the user should learn what was left out.
+                skipped = prepared.skipped if prepared is not None else tuple(deck_skips)
+                if skipped:
+                    notice += "\n\nموارد نادیده‌گرفته‌شده: " + "؛ ".join(skipped[:10])
 
                 await progress.update(94, "جزوه آماده است؛ دارم نتیجه را نهایی می‌کنم")
                 await self.db.save_transcription(
@@ -962,7 +1063,9 @@ class StudyBot:
                 total_duration=info.duration if info else None,
                 stem="extracted-audio",
             )
-        if needs_transcode(filename, info):
+        # The stored copy carries the resolved suffix, so unnamed uploads such
+        # as Telegram voice notes (.ogg/opus) are no longer re-encoded blindly.
+        if needs_transcode(filename or source_path.name, info):
             if not tool_available(self.settings.ffmpeg_bin):
                 logger.warning(
                     "Codec %s may be unsupported but ffmpeg is unavailable; uploading as is",
@@ -980,13 +1083,12 @@ class StudyBot:
         return source_path
 
     async def _send_long_message(self, event, text: str) -> None:
-        pages = split_message(text)
-        for index, page in enumerate(pages, start=1):
+        pages = render_pages(text)
+        for index, rendered in enumerate(pages, start=1):
             if index > 1:
                 await asyncio.sleep(1.05)
             if len(pages) > 1:
-                page = f"بخش {index} از {len(pages)}\n\n" + page
-            rendered = markdown_to_telegram_html(page)
+                rendered = f"بخش {index} از {len(pages)}\n\n" + rendered
             buttons = main_menu(False) if index == len(pages) else None
             try:
                 await event.respond(rendered, parse_mode="html", buttons=buttons)

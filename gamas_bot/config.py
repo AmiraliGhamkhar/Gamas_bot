@@ -19,6 +19,16 @@ def _flag(name: str, default: bool) -> bool:
     return raw.strip().lower() in TRUTHY
 
 
+def _text(name: str, default: str) -> str:
+    """Environment value, falling back to the default when blank.
+
+    A commented-out or emptied line in ``.env`` must not turn into an empty
+    base URL, model name or file path.
+    """
+    raw = os.getenv(name)
+    return raw.strip() if raw and raw.strip() else default
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     telegram_bot_token: str
@@ -99,7 +109,7 @@ class Settings:
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
         try:
-            api_id = int(os.getenv("TELEGRAM_API_ID", "0"))
+            api_id = int(_text("TELEGRAM_API_ID", "0"))
             admins = frozenset(
                 int(item.strip())
                 for item in os.getenv("ADMIN_IDS", "").split(",")
@@ -108,14 +118,14 @@ class Settings:
         except ValueError as exc:
             raise ValueError("TELEGRAM_API_ID و ADMIN_IDS باید عددی باشند.") from exc
 
-        primary = os.getenv("STT_PRIMARY", "speechmatics").strip().lower()
+        primary = _text("STT_PRIMARY", "speechmatics").lower()
         if primary not in {"speechmatics", "deepgram"}:
             raise ValueError("STT_PRIMARY فقط می‌تواند speechmatics یا deepgram باشد.")
-        language = (os.getenv("STT_LANGUAGE", "fa").strip() or "fa")
+        language = _text("STT_LANGUAGE", "fa")
         if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?", language):
             raise ValueError("STT_LANGUAGE باید کد زبان معتبر مانند fa یا en-US باشد.")
 
-        note_provider = os.getenv("NOTE_API_PROVIDER", "gemini").strip().lower()
+        note_provider = _text("NOTE_API_PROVIDER", "gemini").lower()
         note_provider = {
             "openai": "openai_compatible",
             "openai-compatible": "openai_compatible",
@@ -146,16 +156,16 @@ class Settings:
         note_headers = tuple((key, value) for key, value in extra_headers_value.items())
 
         try:
-            min_confidence = float(os.getenv("STT_MIN_CONFIDENCE", "0.65"))
-            max_file_size = int(os.getenv("MAX_FILE_SIZE_BYTES", "2000000000"))
-            max_jobs = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
-            poll_interval = float(os.getenv("STT_POLL_INTERVAL_SECONDS", "5"))
-            job_timeout = int(os.getenv("STT_JOB_TIMEOUT_SECONDS", "21600"))
-            note_timeout = int(os.getenv("NOTE_API_TIMEOUT_SECONDS", "240"))
-            note_retries = int(os.getenv("NOTE_API_RETRIES", "2"))
-            note_max_tokens = int(os.getenv("NOTE_API_MAX_OUTPUT_TOKENS", "8192"))
-            log_max_bytes = int(os.getenv("LOG_MAX_BYTES", "10000000"))
-            log_backup_count = int(os.getenv("LOG_BACKUP_COUNT", "5"))
+            min_confidence = float(_text("STT_MIN_CONFIDENCE", "0.65"))
+            max_file_size = int(_text("MAX_FILE_SIZE_BYTES", "2000000000"))
+            max_jobs = int(_text("MAX_CONCURRENT_JOBS", "3"))
+            poll_interval = float(_text("STT_POLL_INTERVAL_SECONDS", "5"))
+            job_timeout = int(_text("STT_JOB_TIMEOUT_SECONDS", "21600"))
+            note_timeout = int(_text("NOTE_API_TIMEOUT_SECONDS", "240"))
+            note_retries = int(_text("NOTE_API_RETRIES", "2"))
+            note_max_tokens = int(_text("NOTE_API_MAX_OUTPUT_TOKENS", "8192"))
+            log_max_bytes = int(_text("LOG_MAX_BYTES", "10000000"))
+            log_backup_count = int(_text("LOG_BACKUP_COUNT", "5"))
         except ValueError as exc:
             raise ValueError("مقادیر عددی تنظیمات محیط معتبر نیستند.") from exc
         if not 0 <= min_confidence <= 1:
@@ -166,23 +176,23 @@ class Settings:
             raise ValueError("NOTE_API_RETRIES باید بین صفر تا ۱۰ باشد.")
         if log_max_bytes <= 0 or log_backup_count < 0:
             raise ValueError("تنظیمات چرخش فایل لاگ معتبر نیستند.")
-        log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+        log_level = _text("LOG_LEVEL", "INFO").upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("LOG_LEVEL باید DEBUG، INFO، WARNING، ERROR یا CRITICAL باشد.")
-        log_format = os.getenv("LOG_FORMAT", "text").strip().lower() or "text"
+        log_format = _text("LOG_FORMAT", "text").lower()
         if log_format not in {"text", "json"}:
             raise ValueError("LOG_FORMAT فقط می‌تواند text یا json باشد.")
         log_file_value = os.getenv("LOG_FILE", "").strip()
 
         try:
-            min_clip = float(os.getenv("PPTX_MIN_CLIP_SECONDS", "1.0"))
-            silence = float(os.getenv("PPTX_SILENCE_SECONDS", "0.5"))
-            max_clips = int(os.getenv("PPTX_MAX_CLIPS", "300"))
-            max_total_duration = int(os.getenv("PPTX_MAX_TOTAL_DURATION_SECONDS", "21600"))
-            max_unpacked = int(os.getenv("PPTX_MAX_UNPACKED_BYTES", "4000000000"))
-            wav_limit = int(os.getenv("PPTX_WAV_LIMIT_BYTES", "700000000"))
-            ffmpeg_timeout = int(os.getenv("FFMPEG_TIMEOUT_SECONDS", "3600"))
-            soffice_timeout = int(os.getenv("SOFFICE_TIMEOUT_SECONDS", "600"))
+            min_clip = float(_text("PPTX_MIN_CLIP_SECONDS", "1.0"))
+            silence = float(_text("PPTX_SILENCE_SECONDS", "0.5"))
+            max_clips = int(_text("PPTX_MAX_CLIPS", "300"))
+            max_total_duration = int(_text("PPTX_MAX_TOTAL_DURATION_SECONDS", "21600"))
+            max_unpacked = int(_text("PPTX_MAX_UNPACKED_BYTES", "4000000000"))
+            wav_limit = int(_text("PPTX_WAV_LIMIT_BYTES", "700000000"))
+            ffmpeg_timeout = int(_text("FFMPEG_TIMEOUT_SECONDS", "3600"))
+            soffice_timeout = int(_text("SOFFICE_TIMEOUT_SECONDS", "600"))
         except ValueError as exc:
             raise ValueError("مقادیر عددی مربوط به پردازش فایل ارائه معتبر نیستند.") from exc
         if min_clip < 0 or silence < 0:
@@ -197,22 +207,22 @@ class Settings:
             telegram_api_id=api_id,
             telegram_api_hash=api_hash,
             admin_ids=admins,
-            database_path=Path(os.getenv("DATABASE_PATH", "data/bot.sqlite3")),
-            session_path=Path(os.getenv("TELEGRAM_SESSION_PATH", "data/telegram_bot")),
-            temp_dir=Path(os.getenv("TEMP_DIR", "data/tmp")),
+            database_path=Path(_text("DATABASE_PATH", "data/bot.sqlite3")),
+            session_path=Path(_text("TELEGRAM_SESSION_PATH", "data/telegram_bot")),
+            temp_dir=Path(_text("TEMP_DIR", "data/tmp")),
             max_file_size=max_file_size,
             stt_primary=primary,
             stt_language=language,
             stt_fallback_enabled=_flag("STT_FALLBACK_ENABLED", True),
             stt_min_confidence=min_confidence,
-            speechmatics_api_key=os.getenv("SPEECHMATICS_API_KEY") or None,
-            speechmatics_base_url=os.getenv(
+            speechmatics_api_key=(os.getenv("SPEECHMATICS_API_KEY", "").strip() or None),
+            speechmatics_base_url=_text(
                 "SPEECHMATICS_BASE_URL", "https://eu1.asr.api.speechmatics.com/v2"
             ).rstrip("/"),
-            deepgram_api_key=os.getenv("DEEPGRAM_API_KEY") or None,
-            deepgram_model=os.getenv("DEEPGRAM_MODEL", "nova-3"),
-            gemini_api_key=os.getenv("GEMINI_API_KEY") or None,
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite"),
+            deepgram_api_key=(os.getenv("DEEPGRAM_API_KEY", "").strip() or None),
+            deepgram_model=_text("DEEPGRAM_MODEL", "nova-3"),
+            gemini_api_key=(os.getenv("GEMINI_API_KEY", "").strip() or None),
+            gemini_model=_text("GEMINI_MODEL", "gemini-2.5-flash-lite"),
             max_concurrent_jobs=max_jobs,
             stt_poll_interval=poll_interval,
             stt_job_timeout=job_timeout,
@@ -234,9 +244,9 @@ class Settings:
             presentation_max_total_duration=max_total_duration,
             presentation_max_unpacked_bytes=max_unpacked,
             presentation_wav_limit_bytes=wav_limit,
-            ffmpeg_bin=os.getenv("FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg",
-            ffprobe_bin=os.getenv("FFPROBE_BIN", "ffprobe").strip() or "ffprobe",
-            soffice_bin=os.getenv("SOFFICE_BIN", "soffice").strip() or "soffice",
+            ffmpeg_bin=_text("FFMPEG_BIN", "ffmpeg"),
+            ffprobe_bin=_text("FFPROBE_BIN", "ffprobe"),
+            soffice_bin=_text("SOFFICE_BIN", "soffice"),
             ffmpeg_timeout=ffmpeg_timeout,
             soffice_timeout=soffice_timeout,
             log_level=log_level,
