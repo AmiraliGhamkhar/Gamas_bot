@@ -284,11 +284,18 @@ def markdown_to_telegram_html(text: str) -> str:
                 table_header = cells
                 table_rows = 0
                 continue
-            pairs = [
-                f"<b>{inline(table_header[index])}:</b> {inline(cell)}"
-                for index, cell in enumerate(cells)
-                if cell and index < len(table_header)
-            ]
+            # A row may carry more cells than the header (malformed tables are
+            # common in generated Markdown). Extra cells keep their value so no
+            # content is ever dropped, and an empty header label is omitted
+            # instead of rendering a stray colon.
+            pairs = []
+            for index, cell in enumerate(cells):
+                if not cell:
+                    continue
+                label = table_header[index].strip() if index < len(table_header) else ""
+                pairs.append(
+                    f"<b>{inline(label)}:</b> {inline(cell)}" if label else inline(cell)
+                )
             result.append(" · ".join(pairs) if pairs else inline(" | ".join(cells)))
             table_rows += 1
             continue
@@ -564,7 +571,7 @@ class StudyBot:
             # The list can exceed Telegram's callback edit limit, so send it as
             # paginated messages and keep the current menu intact.
             await event.answer("فهرست کاربران ارسال شد.")
-            await self._send_long_message(event, text)
+            await self._send_long_message(event, text, is_admin=True)
             return
         action_prompts = {
             "admin:broadcast": ("broadcast", "پیامی را که می‌خواهید برای همه برود بفرستید."),
@@ -641,6 +648,12 @@ class StudyBot:
             await self._handle_admin_command(event, command, text)
             return
         pending_action = self._pending_admin_actions.get(telegram_id)
+        # A captioned upload is a file, not an answer to the admin prompt: the
+        # caption must never be broadcast (or read as a user id) while the file
+        # itself is silently dropped.
+        if is_admin and pending_action and getattr(event.message, "media", None) is not None:
+            self._pending_admin_actions.pop(telegram_id, None)
+            pending_action = None
         if is_admin and pending_action and text:
             await self._handle_pending_admin_input(
                 event, telegram_id, pending_action, text
@@ -691,7 +704,12 @@ class StudyBot:
         )
         task = asyncio.create_task(
             self._process_submission(
-                event, submission_id, filename, kind, progress=progress
+                event,
+                submission_id,
+                filename,
+                kind,
+                progress=progress,
+                is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
             ),
             name=f"{kind}-submission-{submission_id}",
         )
@@ -723,7 +741,12 @@ class StudyBot:
         )
         task = asyncio.create_task(
             self._process_presentation(
-                event, submission_id, filename, kind, progress=progress
+                event,
+                submission_id,
+                filename,
+                kind,
+                progress=progress,
+                is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
             ),
             name=f"presentation-submission-{submission_id}",
         )
@@ -737,6 +760,7 @@ class StudyBot:
         kind: str,
         *,
         progress: JobProgress | None = None,
+        is_admin: bool = False,
     ) -> None:
         workdir: Path | None = None
         progress = progress or JobProgress(event, submission_id=submission_id)
@@ -841,7 +865,7 @@ class StudyBot:
                 )
                 header = "جزوهٔ PowerPoint شما آماده است 📊\n\n"
                 await progress.update(97, "دارم جزوه را می‌فرستم")
-                await self._send_long_message(event, header + structured + notice)
+                await self._send_long_message(event, header + structured + notice, is_admin=is_admin)
                 await self.db.set_submission_status(submission_id, "done")
                 await progress.complete()
                 logger.info(
@@ -875,7 +899,7 @@ class StudyBot:
                 )
                 await event.reply(
                     f"{message}\n\nکد پیگیری: {reference}",
-                    buttons=main_menu(False),
+                    buttons=main_menu(is_admin),
                 )
             except Exception:
                 logger.exception(
@@ -927,6 +951,7 @@ class StudyBot:
         kind: str = "audio",
         *,
         progress: JobProgress | None = None,
+        is_admin: bool = False,
     ) -> None:
         workdir: Path | None = None
         progress = progress or JobProgress(event, submission_id=submission_id)
@@ -988,7 +1013,7 @@ class StudyBot:
                 )
                 header = "جزوهٔ شما آماده است 📖\n\n"
                 await progress.update(97, "دارم جزوه را می‌فرستم")
-                await self._send_long_message(event, header + structured + notice)
+                await self._send_long_message(event, header + structured + notice, is_admin=is_admin)
                 await self.db.set_submission_status(submission_id, "done")
                 await progress.complete()
                 logger.info(
@@ -1020,7 +1045,7 @@ class StudyBot:
                 )
                 await event.reply(
                     f"{message}\n\nکد پیگیری: {reference}",
-                    buttons=main_menu(False),
+                    buttons=main_menu(is_admin),
                 )
             except Exception:
                 logger.exception(
@@ -1082,14 +1107,14 @@ class StudyBot:
             )
         return source_path
 
-    async def _send_long_message(self, event, text: str) -> None:
+    async def _send_long_message(self, event, text: str, *, is_admin: bool = False) -> None:
         pages = render_pages(text)
         for index, rendered in enumerate(pages, start=1):
             if index > 1:
                 await asyncio.sleep(1.05)
             if len(pages) > 1:
                 rendered = f"بخش {index} از {len(pages)}\n\n" + rendered
-            buttons = main_menu(False) if index == len(pages) else None
+            buttons = main_menu(is_admin) if index == len(pages) else None
             try:
                 await event.respond(rendered, parse_mode="html", buttons=buttons)
             except FloodWaitError as exc:
@@ -1136,7 +1161,7 @@ class StudyBot:
         admin_id = int((await event.get_sender()).id)
         if command == "/users":
             users = await self.db.user_summaries(limit=50)
-            await self._send_long_message(event, self._users_text(users))
+            await self._send_long_message(event, self._users_text(users), is_admin=True)
             return
         if command == "/stats":
             stats = await self.db.stats()

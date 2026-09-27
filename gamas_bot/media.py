@@ -331,7 +331,12 @@ async def convert_to_pptx(source: Path, out_dir: Path, settings: Settings) -> Pa
     profile_dir = out_dir / f"lo-profile-{uuid.uuid4().hex[:8]}"
     profile_dir.mkdir(parents=True, exist_ok=True)
     command = build_convert_command(settings.soffice_bin, source, out_dir, profile_dir)
-    code, stdout, stderr = await run_command(command, settings.soffice_timeout)
+    try:
+        code, stdout, stderr = await run_command(command, settings.soffice_timeout)
+    finally:
+        # The throwaway profile must go even when the conversion fails or times
+        # out; LibreOffice profiles are large and accumulate in the temp dir.
+        shutil.rmtree(profile_dir, ignore_errors=True)
     converted = out_dir / f"{source.stem}.pptx"
     if not converted.exists():
         candidates = sorted(out_dir.glob("*.pptx"))
@@ -339,5 +344,4 @@ async def convert_to_pptx(source: Path, out_dir: Path, settings: Settings) -> Pa
     if code != 0 or not converted.exists():
         detail = (stderr or stdout).strip()[:300]
         raise MediaToolError(f"تبدیل فایل قدیمی PowerPoint ناموفق بود: {detail}")
-    shutil.rmtree(profile_dir, ignore_errors=True)
     return converted

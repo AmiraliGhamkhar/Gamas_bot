@@ -191,6 +191,9 @@ def _relationships(archive: zipfile.ZipFile, part_name: str) -> list[tuple[str, 
 def _slide_parts_in_order(archive: zipfile.ZipFile) -> list[str]:
     """Slide part names following the deck's own slide order."""
     payload = _read_member(archive, "ppt/presentation.xml", 20_000_000)
+    # Built once: ``namelist()`` rebuilds a list on every call, which turns the
+    # membership test below into a quadratic scan on large decks.
+    names = set(archive.namelist())
     rels = {
         rel_id: _resolve_target("ppt/presentation.xml", target)
         for rel_id, _type, target in _relationships(archive, "ppt/presentation.xml")
@@ -204,7 +207,7 @@ def _slide_parts_in_order(archive: zipfile.ZipFile) -> list[str]:
             raise PresentationError("ساختار XML فایل ارائه معتبر نیست.") from exc
         for node in root.iterfind(f".//{{{PML_NS}}}sldIdLst/{{{PML_NS}}}sldId"):
             target = rels.get(node.get(f"{{{OFFICE_REL_NS}}}id") or "")
-            if target and target in archive.namelist() and target not in ordered:
+            if target and target in names and target not in ordered:
                 ordered.append(target)
     if ordered:
         return ordered
@@ -214,7 +217,7 @@ def _slide_parts_in_order(archive: zipfile.ZipFile) -> list[str]:
         return (int(match.group(1)) if match else 1 << 30, name)
 
     return sorted(
-        (n for n in archive.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+        (n for n in names if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
         key=slide_index,
     )
 
