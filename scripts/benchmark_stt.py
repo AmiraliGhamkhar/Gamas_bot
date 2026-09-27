@@ -67,7 +67,11 @@ async def run(args: argparse.Namespace) -> None:
             run_settings = replace(settings, stt_primary=engine, stt_fallback_enabled=False)
             started = time.perf_counter()
             try:
+                if engine == "speechmatics" and audio.stat().st_size >= 1_000_000_000:
+                    raise ValueError("Speechmatics direct-upload limit exceeded; sample was not sent")
                 result = await transcribe(audio, run_settings)
+                if result.engine != engine:
+                    raise ValueError("Requested benchmark engine was not used")
                 elapsed = round(time.perf_counter() - started, 3)
                 rows.append({
                     "sample": audio.name,
@@ -98,11 +102,12 @@ async def run(args: argparse.Namespace) -> None:
         "sample", "engine", "status", "latency_seconds", "file_size_mb",
         "confidence", "wer", "reference_file", "error",
     ]
+    args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="", encoding="utf-8-sig") as output:
         writer = csv.DictWriter(output, fieldnames=fields)
         writer.writeheader()
         writer.writerows(rows)
-    print(f"نتایج {len(rows)} درخواست در {args.output} ذخیره شد؛ متن فایل‌ها ذخیره نشده است.")
+    print(f"نتایج {len(rows)} ارزیابی در {args.output} ذخیره شد؛ متن فایل‌ها ذخیره نشده است.")
 
 
 def main() -> None:

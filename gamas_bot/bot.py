@@ -149,6 +149,8 @@ def _utf16_length(text: str) -> int:
 
 
 def split_message(text: str, limit: int = MESSAGE_CHUNK_SIZE) -> list[str]:
+    if limit <= 0:
+        raise ValueError("Message limit must be positive")
     text = text.strip()
     pages: list[str] = []
     while _utf16_length(text) > limit:
@@ -197,8 +199,8 @@ def _split_rendered(rendered: str, budget: int) -> list[str]:
                 pages.append("\n".join(current))
                 current, used = [], 0
             # One oversized line: drop its markup so it can be cut anywhere.
-            plain = html.escape(html.unescape(TAG_PATTERN.sub("", line)), quote=False)
-            pages.extend(split_message(plain, budget))
+            plain = html.unescape(TAG_PATTERN.sub("", line))
+            pages.extend(html.escape(page, quote=False) for page in split_message(plain, budget))
             continue
         if current and used + length + 1 > budget:
             pages.append("\n".join(current))
@@ -226,7 +228,8 @@ def render_pages(text: str, reserve: int = 64) -> list[str]:
 
 def markdown_to_telegram_html(text: str) -> str:
     """Convert the small Markdown subset used by the LLM to Telegram-safe HTML."""
-    lines = text.splitlines()
+    # NUL is not valid Telegram text and must not impersonate our code placeholders.
+    lines = text.replace("\x00", "").splitlines()
     result: list[str] = []
     table_header: list[str] | None = None
     table_rows = 0
@@ -379,6 +382,8 @@ class StudyBot:
     def __init__(self, settings: Settings):
         self.settings = settings
         self.db = Database(settings.database_path)
+        # Telethon opens its SQLite session in the constructor, before start().
+        settings.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = TelegramClient(
             str(settings.session_path), settings.telegram_api_id, settings.telegram_api_hash,
         )
@@ -525,6 +530,11 @@ class StudyBot:
         if user["is_banned"] and not is_admin:
             await event.answer("دسترسی شما به ربات محدود شده است.", alert=True)
             return
+        if data.startswith("admin:") and not getattr(event, "is_private", True):
+            await event.answer("لطفاً پنل مدیریت را در گفت‌وگوی خصوصی ربات باز کنید.", alert=True)
+            return
+        if data.startswith("menu:") and getattr(event, "is_private", True):
+            self._pending_admin_actions.pop(telegram_id, None)
         if data == "menu:home":
             self._pending_admin_actions.pop(telegram_id, None)
             await self._edit_callback(event, WELCOME_TEXT, main_menu(is_admin))
@@ -638,23 +648,31 @@ class StudyBot:
             self._pending_admin_actions.pop(telegram_id, None)
             await event.reply(WELCOME_TEXT, buttons=main_menu(is_admin))
             return
-        if command == "/help":
+        if command in {"/help", "/cancel"}:
+            self._pending_admin_actions.pop(telegram_id, None)
             await event.reply(HELP_TEXT, buttons=back_menu(is_admin))
             return
         if command in {"/users", "/stats", "/broadcast", "/ban", "/unban"}:
             if not is_admin:
                 await event.reply("این دستور فقط برای مدیر ربات فعال است.")
                 return
+            if not getattr(event, "is_private", True):
+                await event.reply("دستورهای مدیریت فقط در گفت‌وگوی خصوصی ربات قابل استفاده‌اند.")
+                return
+            self._pending_admin_actions.pop(telegram_id, None)
             await self._handle_admin_command(event, command, text)
             return
-        pending_action = self._pending_admin_actions.get(telegram_id)
+        pending_action = (
+            self._pending_admin_actions.get(telegram_id)
+            if getattr(event, "is_private", True) else None
+        )
         # A captioned upload is a file, not an answer to the admin prompt: the
         # caption must never be broadcast (or read as a user id) while the file
         # itself is silently dropped.
         if is_admin and pending_action and getattr(event.message, "media", None) is not None:
             self._pending_admin_actions.pop(telegram_id, None)
             pending_action = None
-        if is_admin and pending_action and text:
+        if is_admin and pending_action and text and not command:
             await self._handle_pending_admin_input(
                 event, telegram_id, pending_action, text
             )
@@ -773,7 +791,9 @@ class StudyBot:
                 workdir = Path(
                     tempfile.mkdtemp(prefix=f"deck-{submission_id}-", dir=self.settings.temp_dir)
                 )
-                suffix = Path(filename).suffix.lower() if filename else ".pptx"
+                suffix = Path(filename).suffix.lower() if filename else (
+                    ".pptx" if kind == "native" else ".ppt"
+                )
                 if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
                     suffix = ".pptx" if kind == "native" else ".ppt"
                 deck_path = workdir / f"deck{suffix}"
@@ -1197,7 +1217,13 @@ class StudyBot:
         for page_index, page in enumerate(pages):
             if page_index:
                 await asyncio.sleep(1.05)
-            await self.client.send_message(telegram_id, page, parse_mode=None)
+            try:
+                await self.client.send_message(telegram_id, page, parse_mode=None)
+            except FloodWaitError as exc:
+                logger.warning("Telegram flood wait during broadcast seconds=%s", exc.seconds)
+                await asyncio.sleep(exc.seconds + 1)
+                # Retry this page, not every previously delivered page.
+                await self.client.send_message(telegram_id, page, parse_mode=None)
 
     async def _broadcast(self, admin_id: int, message: str) -> int:
         recipients = await self.db.user_ids(include_banned=False)
@@ -1209,14 +1235,6 @@ class StudyBot:
             try:
                 await self._send_broadcast_pages(telegram_id, pages)
                 sent += 1
-            except FloodWaitError as exc:
-                logger.warning("Telegram flood wait of %s seconds during broadcast", exc.seconds)
-                await asyncio.sleep(exc.seconds + 1)
-                try:
-                    await self._send_broadcast_pages(telegram_id, pages)
-                    sent += 1
-                except Exception:
-                    logger.exception("Broadcast retry failed for user %s", telegram_id)
             except Exception:
                 logger.exception("Broadcast failed for user %s", telegram_id)
         await self.db.add_broadcast(admin_id, message, sent)

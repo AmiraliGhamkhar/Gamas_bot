@@ -33,6 +33,8 @@ PRESENTATION_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.presentationml.template": "native",
     "application/vnd.ms-powerpoint.presentation.macroenabled.12": "native",
     "application/vnd.ms-powerpoint.slideshow.macroenabled.12": "native",
+    "application/vnd.ms-powerpoint.template.macroenabled.12": "native",
+    "application/vnd.oasis.opendocument.presentation-template": "legacy",
     "application/vnd.ms-powerpoint": "legacy",
     "application/mspowerpoint": "legacy",
     "application/powerpoint": "legacy",
@@ -103,10 +105,11 @@ class PresentationContent:
     slides: tuple[SlideText, ...]
     clips: tuple[MediaClip, ...]
     skipped: tuple[str, ...] = ()
+    total_slides: int | None = None
 
     @property
     def slide_count(self) -> int:
-        return len(self.slides)
+        return self.total_slides if self.total_slides is not None else len(self.slides)
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,7 +171,7 @@ def _read_member(archive: zipfile.ZipFile, name: str, limit: int) -> bytes | Non
 
 
 def _relationships(archive: zipfile.ZipFile, part_name: str) -> list[tuple[str, str, str]]:
-    """Return (type, target, target_mode) triples for a part's relationships."""
+    """Return (id, type, internal_target) triples; external targets are blank."""
     payload = _read_member(archive, _rels_part_for(part_name), 8_000_000)
     if not payload:
         return []
@@ -256,12 +259,30 @@ def _validate_archive(archive: zipfile.ZipFile, settings: Settings) -> None:
 def _extract_slide_text(path: Path) -> list[SlideText]:
     """Read titles, bullet text, tables and speaker notes with python-pptx."""
     try:
-        from pptx import Presentation  # imported lazily so media-only runs stay light
+        # Presentation() rejects slideshow/template main content types even
+        # though their slide structure is identical. Register the two missing
+        # macro-enabled variants and open the package directly (no macros run).
+        from pptx.opc.package import PartFactory
+        from pptx.package import Package
+        from pptx.parts.presentation import PresentationPart
     except ImportError:  # pragma: no cover - dependency is declared in requirements
         logger.warning("python-pptx is not installed; slide text will be skipped")
         return []
     try:
-        deck = Presentation(str(path))
+        main_types = {
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml",
+            "application/vnd.openxmlformats-officedocument.presentationml.slideshow.main+xml",
+            "application/vnd.openxmlformats-officedocument.presentationml.template.main+xml",
+            "application/vnd.ms-powerpoint.presentation.macroEnabled.main+xml",
+            "application/vnd.ms-powerpoint.slideshow.macroEnabled.main+xml",
+            "application/vnd.ms-powerpoint.template.macroEnabled.main+xml",
+        }
+        for content_type in main_types:
+            PartFactory.part_type_for.setdefault(content_type, PresentationPart)
+        main_part = Package.open(str(path)).main_document_part
+        if main_part.content_type not in main_types:
+            raise PresentationError("نوع فایل ارائه پشتیبانی نمی‌شود.")
+        deck = main_part.presentation
     except Exception:
         logger.exception("python-pptx could not open the deck; continuing without slide text")
         return []
@@ -363,14 +384,24 @@ def read_presentation(
             clips.append(MediaClip(order, slide_number, part_name, destination, kind))
 
     slides = _extract_slide_text(path) if settings.presentation_include_slide_text else []
-    return PresentationContent(tuple(slides), tuple(clips), tuple(skipped))
+    return PresentationContent(tuple(slides), tuple(clips), tuple(skipped), len(slide_parts))
 
 
 async def load_presentation(
     path: Path, media_dir: Path, settings: Settings
 ) -> PresentationContent:
     """Async wrapper so ZIP/XML work never blocks the Telethon event loop."""
-    return await asyncio.to_thread(read_presentation, path, media_dir, settings)
+    # Cancelling to_thread does not stop its worker. Join it before the caller
+    # removes the job directory, otherwise extraction can recreate private files.
+    worker = asyncio.create_task(asyncio.to_thread(read_presentation, path, media_dir, settings))
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        try:
+            await worker
+        except Exception:
+            logger.warning("Presentation extraction failed during shutdown", exc_info=True)
+        raise
 
 
 async def prepare_audio(
@@ -428,7 +459,7 @@ async def prepare_audio(
 
     durations = [clip.duration for clip in usable if clip.duration is not None]
     total_duration = sum(durations) if len(durations) == len(usable) else None
-    if total_duration is not None and total_duration > settings.presentation_max_total_duration:
+    if sum(durations) > settings.presentation_max_total_duration:
         raise PresentationError(
             "مجموع مدت صداهای این ارائه از سقف تعیین‌شدهٔ ربات بیشتر است."
         )
@@ -446,16 +477,19 @@ async def prepare_audio(
         [clip.path for clip in usable],
         workdir,
         settings,
-        total_duration=total_duration,
+        total_duration=(
+            total_duration + settings.presentation_silence_seconds * (len(usable) - 1)
+            if total_duration is not None else None
+        ),
         stem="presentation-audio",
     )
     return PreparedAudio(merged, tuple(usable), total_duration, True, tuple(skipped))
 
 
-def slides_outline(slides: tuple[SlideText, ...] | list[SlideText], limit: int = 20000) -> str:
-    """Render slide text as a compact Markdown outline for the LLM prompt."""
+def slides_outline(slides: tuple[SlideText, ...] | list[SlideText], limit: int | None = None) -> str:
+    """Render all slide material; an explicit limit is only for previews."""
     blocks = [slide.as_markdown() for slide in slides if not slide.is_empty]
     outline = "\n\n".join(blocks)
-    if len(outline) > limit:
+    if limit is not None and len(outline) > limit:
         outline = outline[:limit].rsplit("\n", 1)[0] + "\n\n(ادامهٔ متن اسلایدها کوتاه شد)"
     return outline
