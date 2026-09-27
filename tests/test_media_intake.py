@@ -190,7 +190,7 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         event, stt, submission_id = await self._run("lecture.mp4", "video")
         sent_path = Path(stt.await_args.args[0])
         self.assertTrue(sent_path.name.startswith("extracted-audio"))
-        self.assertTrue(any("جدا کردن صدای" in item for item in event.responses))
+        self.assertTrue(any("صدای ویدیو را جدا" in item for item in event.responses))
         self.assertTrue(any("جزوه" in item for item in event.responses))
         stats = await self.bot.db.stats()
         self.assertEqual(stats["videos"], 1)
@@ -209,7 +209,7 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
             "slides.mp4", "video", payload=fake_media_bytes(30.0, has_audio=False)
         )
         stt.assert_not_awaited()
-        self.assertTrue(any("شاخهٔ صوتی ندارد" in item for item in event.replies))
+        self.assertTrue(any("صدایی پیدا نکردم" in item for item in event.replies))
 
     async def test_temporary_files_are_cleaned_up(self):
         await self._run("lecture.mp4", "video")
@@ -226,7 +226,7 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         event = FakeEvent(self.root / "x")
         event.message.file = SimpleNamespace(size=100)
         await self.bot._accept_media(event, user, "video", "a.mp4", "video/mp4", None, "7")
-        self.assertTrue(any("فایل تصویری روی این سرور فعال نیست" in i for i in event.replies))
+        self.assertTrue(any("نمی‌توانم ویدیو را پردازش کنم" in i for i in event.replies))
         self.assertEqual((await self.bot.db.stats())["submissions"], 0)
 
 

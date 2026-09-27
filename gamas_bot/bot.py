@@ -8,12 +8,13 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from telethon import TelegramClient, events
-from telethon.errors import FloodWaitError
+from telethon import Button, TelegramClient, events
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.tl.types import MessageMediaWebPage
 
 from .config import Settings
 from .database import Database
+from .logging_config import log_job_id
 from .media import (
     MediaToolError,
     convert_to_pptx,
@@ -29,8 +30,9 @@ from .presentations import (
     prepare_audio,
     slides_outline,
 )
-from .stt import STTError, transcribe
-from .structuring import structure_presentation, structure_transcript
+from .progress import JobProgress
+from .stt import transcribe
+from .structuring import StructuringError, structure_presentation, structure_transcript
 
 logger = logging.getLogger(__name__)
 AUDIO_EXTENSIONS = {
@@ -42,15 +44,84 @@ VIDEO_EXTENSIONS = {
     ".mpg", ".ts", ".webm", ".wmv",
 }
 MESSAGE_CHUNK_SIZE = 3800
-USER_VISIBLE_ERRORS = (ValueError, PresentationError, MediaToolError)
+USER_VISIBLE_ERRORS = (ValueError, PresentationError)
 UNSUPPORTED_FILE_MESSAGE = (
-    "این فایل پشتیبانی نمی‌شود. 🤔\n\n"
-    "می‌توانید بفرستید:\n"
-    "• پیام صوتی یا فایل صوتی (MP3، M4A، WAV، OGG، FLAC و…)\n"
-    "• فایل تصویری کلاس (MP4، MKV، MOV و…) تا صدایش جدا شود\n"
-    "• فایل ارائهٔ PowerPoint (pptx، pptm، ppsx و ppt، pps، odp)\n\n"
-    "برای راهنمای کامل، /help را بفرستید."
+    "این نوع فایل را نمی‌توانم پردازش کنم. 🤔\n\n"
+    "یکی از این‌ها را بفرستید:\n"
+    "• پیام صوتی یا فایل صوتی\n"
+    "• ویدیوی کلاس\n"
+    "• فایل PowerPoint\n\n"
+    "فهرست دقیق پسوندها در بخش «قالب‌ها» است."
 )
+WELCOME_TEXT = (
+    "سلام! 👋\n\n"
+    "فایل صوتی، ویدیوی کلاس یا PowerPoint را بفرستید؛ من محتوایش را به یک جزوهٔ "
+    "مرتب تبدیل می‌کنم و روند کار را همین‌جا نشان می‌دهم.\n\n"
+    "برای شروع، فایل را بفرستید یا روی «ساخت جزوه» بزنید."
+)
+HELP_TEXT = (
+    "چطور جزوه بسازم؟ 📚\n\n"
+    "۱) فایل صوتی، ویدیو یا PowerPoint را بفرستید.\n"
+    "۲) پیشرفت کار را در همان پیام دنبال کنید.\n"
+    "۳) جزوه پس از آماده‌شدن همین‌جا ارسال می‌شود.\n\n"
+    "PowerPoint بدون صدا هم قابل استفاده است؛ در این حالت جزوه از متن و یادداشت "
+    "اسلایدها ساخته می‌شود. اگر ساخت جزوهٔ هوشمند موقتاً در دسترس نباشد، متن خام را "
+    "از دست نمی‌دهید و همان را تحویل می‌گیرید."
+)
+FORMATS_TEXT = (
+    "چه فایل‌هایی می‌توانم بفرستم؟ 🧰\n\n"
+    "• صوت: MP3، M4A، WAV، OGG، OPUS، FLAC، WMA و AMR\n"
+    "• ویدیو: MP4، MKV، MOV، AVI، WEBM و ویدیوی گرد تلگرام\n"
+    "• ارائه: PPTX، PPTM، PPSX، PPSM، POTX، POTM، PPT، PPS، POT، ODP و OTP\n\n"
+    "قالب‌های صوتی و ویدیویی دیگری که FFmpeg بخواند هم معمولاً قابل پردازش‌اند."
+)
+PRIVACY_TEXT = (
+    "حریم خصوصی 🔐\n\n"
+    "صدای فایل برای تبدیل به متن و متن به‌دست‌آمده برای ساخت جزوه به سرویس‌های ربات "
+    "فرستاده می‌شوند. فایل‌های موقت پس از پردازش حذف می‌شوند، اما متن و جزوه ممکن است "
+    "در پایگاه‌داده بمانند. لطفاً فایل خیلی حساس نفرستید."
+)
+
+
+def main_menu(is_admin: bool = False):
+    rows = [
+        [Button.inline("📎 ساخت جزوه", b"menu:create")],
+        [
+            Button.inline("📚 راهنما", b"menu:help"),
+            Button.inline("🧰 قالب‌ها", b"menu:formats"),
+        ],
+        [Button.inline("🔐 حریم خصوصی", b"menu:privacy")],
+    ]
+    if is_admin:
+        rows.append([Button.inline("⚙️ پنل مدیریت", b"admin:home")])
+    return rows
+
+
+def back_menu(is_admin: bool = False):
+    return [[Button.inline("↩️ بازگشت به منو", b"menu:home")]] + (
+        [[Button.inline("⚙️ پنل مدیریت", b"admin:home")]] if is_admin else []
+    )
+
+
+def admin_menu():
+    return [
+        [
+            Button.inline("📊 آمار", b"admin:stats"),
+            Button.inline("👥 کاربران", b"admin:users"),
+        ],
+        [
+            Button.inline("📣 پیام همگانی", b"admin:broadcast"),
+            Button.inline("🚫 مسدودسازی", b"admin:ban"),
+        ],
+        [
+            Button.inline("✅ رفع مسدودیت", b"admin:unban"),
+            Button.inline("↩️ منوی اصلی", b"menu:home"),
+        ],
+    ]
+
+
+def _error_reference(submission_id: int) -> str:
+    return f"GMS-{submission_id:06d}"
 
 
 def _format_duration(seconds: float | None) -> str:
@@ -229,6 +300,26 @@ class StudyBot:
         self.client.parse_mode = None
         self._tasks: set[asyncio.Task] = set()
         self._job_semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
+        self._pending_admin_actions: dict[int, str] = {}
+
+    def _track_task(self, task: asyncio.Task) -> None:
+        self._tasks.add(task)
+        task.add_done_callback(self._task_finished)
+
+    def _task_finished(self, task: asyncio.Task) -> None:
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            error = task.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logger.error(
+                "Background task escaped its error task=%s",
+                task.get_name(),
+                exc_info=(type(error), error, error.__traceback__),
+            )
 
     async def start(self) -> None:
         self.settings.validate_runtime()
@@ -239,7 +330,28 @@ class StudyBot:
         self._register_handlers()
         await self.client.start(bot_token=self.settings.telegram_bot_token)
         me = await self.client.get_me()
-        logger.info("Persian study assistant is online as @%s", me.username)
+        logger.info(
+            "Persian study assistant is online username=@%s note_provider=%s stt_primary=%s "
+            "max_concurrent_jobs=%s",
+            me.username,
+            self.settings.note_api_provider,
+            self.settings.stt_primary,
+            self.settings.max_concurrent_jobs,
+        )
+        for name, binary, required in (
+            ("ffmpeg", self.settings.ffmpeg_bin, True),
+            ("ffprobe", self.settings.ffprobe_bin, True),
+            ("LibreOffice", self.settings.soffice_bin, self.settings.presentation_legacy_enabled),
+        ):
+            available = tool_available(binary)
+            log = logger.info if available or not required else logger.warning
+            log(
+                "External dependency name=%s binary=%s available=%s required=%s",
+                name,
+                binary,
+                available,
+                required,
+            )
 
     async def run(self) -> None:
         try:
@@ -258,6 +370,19 @@ class StudyBot:
         await self.db.close()
 
     def _register_handlers(self) -> None:
+        @self.client.on(events.CallbackQuery())
+        async def handle_callback(event):
+            try:
+                await self._handle_callback(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Unhandled callback query failure")
+                try:
+                    await event.answer("خطایی رخ داد؛ دوباره تلاش کنید.", alert=True)
+                except Exception:
+                    logger.exception("Could not answer the failed callback")
+
         @self.client.on(events.NewMessage(incoming=True))
         async def handle_message(event):
             try:
@@ -267,9 +392,132 @@ class StudyBot:
             except Exception:
                 logger.exception("Unhandled incoming message failure")
                 try:
-                    await event.reply("متأسفانه خطایی رخ داد. لطفاً کمی بعد دوباره تلاش کنید.")
+                    await event.reply("یک مشکل پیش آمد. لطفاً چند لحظه دیگر دوباره امتحان کنید.")
                 except Exception:
                     logger.exception("Could not notify the user about a handler error")
+
+    async def _edit_callback(self, event, text: str, buttons=None) -> None:
+        try:
+            await event.answer()
+        except Exception:
+            logger.debug("Callback answer failed", exc_info=True)
+        try:
+            await event.edit(text, buttons=buttons, parse_mode=None)
+        except MessageNotModifiedError:
+            return
+        except Exception:
+            # Editing can fail when the originating message is old. A fresh
+            # response keeps the menu usable without losing the button flow.
+            logger.debug("Callback edit failed; sending a new message", exc_info=True)
+            await event.respond(text, buttons=buttons, parse_mode=None)
+
+    async def _handle_callback(self, event) -> None:
+        sender = await event.get_sender()
+        if not sender or getattr(sender, "bot", False):
+            return
+        telegram_id = int(sender.id)
+        user = await self.db.upsert_user(telegram_id, getattr(sender, "username", None))
+        is_admin = telegram_id in self.settings.admin_ids
+        data = bytes(event.data or b"").decode("utf-8", "replace")
+
+        if user["is_banned"] and not is_admin:
+            await event.answer("دسترسی شما به ربات محدود شده است.", alert=True)
+            return
+        if data == "menu:home":
+            self._pending_admin_actions.pop(telegram_id, None)
+            await self._edit_callback(event, WELCOME_TEXT, main_menu(is_admin))
+            return
+        if data == "menu:create":
+            await self._edit_callback(
+                event,
+                "فایلتان را بفرستید 📎\n\n"
+                "صوت، ویدیو یا PowerPoint فرقی ندارد؛ بعد از دریافت فایل، پیشرفت کار را "
+                "مرحله‌به‌مرحله می‌بینید.",
+                back_menu(is_admin),
+            )
+            return
+        if data == "menu:help":
+            await self._edit_callback(event, HELP_TEXT, back_menu(is_admin))
+            return
+        if data == "menu:formats":
+            await self._edit_callback(event, FORMATS_TEXT, back_menu(is_admin))
+            return
+        if data == "menu:privacy":
+            await self._edit_callback(event, PRIVACY_TEXT, back_menu(is_admin))
+            return
+
+        if not data.startswith("admin:"):
+            await event.answer("این دکمه معتبر نیست.", alert=True)
+            return
+        if not is_admin:
+            await event.answer("این بخش فقط برای مدیر ربات است.", alert=True)
+            return
+        if data == "admin:home":
+            self._pending_admin_actions.pop(telegram_id, None)
+            await self._edit_callback(event, "پنل مدیریت ربات ⚙️", admin_menu())
+            return
+        if data == "admin:stats":
+            stats = await self.db.stats()
+            text = self._stats_text(stats)
+            await self._edit_callback(
+                event, text, [[Button.inline("↩️ پنل مدیریت", b"admin:home")]]
+            )
+            return
+        if data == "admin:users":
+            users = await self.db.user_summaries(limit=50)
+            text = self._users_text(users)
+            # The list can exceed Telegram's callback edit limit, so send it as
+            # paginated messages and keep the current menu intact.
+            await event.answer("فهرست کاربران ارسال شد.")
+            await self._send_long_message(event, text)
+            return
+        action_prompts = {
+            "admin:broadcast": ("broadcast", "پیامی را که می‌خواهید برای همه برود بفرستید."),
+            "admin:ban": ("ban", "شناسهٔ عددی کاربر را بفرستید."),
+            "admin:unban": ("unban", "شناسهٔ عددی کاربر را بفرستید."),
+        }
+        if data in action_prompts:
+            action, prompt = action_prompts[data]
+            self._pending_admin_actions[telegram_id] = action
+            await self._edit_callback(
+                event,
+                prompt + "\n\nبرای انصراف دکمهٔ زیر را بزنید.",
+                [[Button.inline("لغو", b"admin:home")]],
+            )
+            return
+        await event.answer("این دکمه معتبر نیست.", alert=True)
+
+    async def _handle_pending_admin_input(
+        self, event, telegram_id: int, action: str, text: str
+    ) -> None:
+        if action == "broadcast":
+            if not text:
+                await event.reply("پیام خالی است؛ لطفاً متن را دوباره بفرستید.")
+                return
+            self._pending_admin_actions.pop(telegram_id, None)
+            status = await event.reply("دارم پیام را برای کاربران می‌فرستم…")
+            sent = await self._broadcast(telegram_id, text)
+            result = f"انجام شد؛ پیام به {sent} کاربر رسید."
+            if status is not None and callable(getattr(status, "edit", None)):
+                await status.edit(result, buttons=admin_menu())
+            else:
+                await event.respond(result, buttons=admin_menu())
+            return
+
+        if not text.lstrip("+").isdigit():
+            await event.reply("شناسه باید عددی باشد؛ لطفاً دوباره بفرستید.")
+            return
+        target_id = int(text)
+        if target_id in self.settings.admin_ids:
+            await event.reply("نمی‌توانید دسترسی مدیر ربات را تغییر دهید.")
+            return
+        self._pending_admin_actions.pop(telegram_id, None)
+        changed = await self.db.set_banned(target_id, action == "ban")
+        if not changed:
+            result = "این شناسه در فهرست کاربران ربات پیدا نشد."
+        else:
+            result = "کاربر مسدود شد." if action == "ban" else "مسدودیت کاربر برداشته شد."
+        await event.reply(result, buttons=admin_menu())
 
     async def _handle_message(self, event) -> None:
         sender = await event.get_sender()
@@ -285,34 +533,23 @@ class StudyBot:
             await event.reply("دسترسی شما به ربات محدود شده است.")
             return
         if command == "/start":
-            await event.reply(
-                "سلام! به دستیار جزوه‌ساز خوش آمدید. 🌱\n\n"
-                "پیام صوتی یا فایل صوتی کلاس را بفرستید؛ متن آن پیاده‌سازی و به جزوه‌ای مرتب "
-                "همراه با نکته‌های مهم تبدیل می‌شود. فایل‌های طولانی هم پذیرفته می‌شوند.\n\n"
-                "می‌توانید فایل ارائهٔ PowerPoint را هم بفرستید؛ صداهای ضبط‌شده در اسلایدها "
-                "استخراج و همراه متن اسلایدها به یک جزوه تبدیل می‌شوند. 📊\n\n"
-                "برای راهنما، دستور /help را بفرستید."
-            )
+            self._pending_admin_actions.pop(telegram_id, None)
+            await event.reply(WELCOME_TEXT, buttons=main_menu(is_admin))
             return
         if command == "/help":
-            await event.reply(
-                "راهنمای دستیار جزوه‌ساز 📚\n\n"
-                "• یک پیام صوتی یا فایل صوتی ارسال کنید.\n"
-                "• فایل تصویری هم پذیرفته می‌شود؛ صدای آن جدا و پیاده‌سازی می‌شود.\n"
-                "• یا فایل ارائه بفرستید: pptx، pptm، ppsx و فایل‌های قدیمی ppt، pps و odp.\n"
-                "• صداهای داخل اسلایدها به ترتیب اسلاید در یک فایل ادغام و پیاده‌سازی می‌شوند؛ "
-                "متن و یادداشت گویندهٔ اسلایدها هم در جزوه به کار می‌رود.\n"
-                "• اگر ارائه صدا نداشته باشد، جزوه فقط از متن اسلایدها ساخته می‌شود.\n"
-                "• پس از دریافت فایل، پردازش در پس‌زمینه انجام می‌شود و نتیجه برایتان می‌آید.\n"
-                "• فایل‌های صوتی رایج مانند MP3، M4A، WAV، OGG و FLAC پشتیبانی می‌شوند.\n\n"
-                "دستورهای مدیر: /users، /stats، /broadcast، /ban و /unban"
-            )
+            await event.reply(HELP_TEXT, buttons=back_menu(is_admin))
             return
         if command in {"/users", "/stats", "/broadcast", "/ban", "/unban"}:
             if not is_admin:
                 await event.reply("این دستور فقط برای مدیر ربات فعال است.")
                 return
             await self._handle_admin_command(event, command, text)
+            return
+        pending_action = self._pending_admin_actions.get(telegram_id)
+        if is_admin and pending_action and text:
+            await self._handle_pending_admin_input(
+                event, telegram_id, pending_action, text
+            )
             return
 
         media_kind, filename, mime_type, duration, file_id = _media_metadata(event.message)
@@ -330,7 +567,7 @@ class StudyBot:
             return
 
         if _is_unsupported_attachment(event.message):
-            await event.reply(UNSUPPORTED_FILE_MESSAGE)
+            await event.reply(UNSUPPORTED_FILE_MESSAGE, buttons=main_menu(is_admin))
 
     async def _accept_media(
         self, event, user, kind: str, filename, mime_type, duration, file_id
@@ -338,50 +575,47 @@ class StudyBot:
         file_obj = event.message.file
         size = getattr(file_obj, "size", None)
         if size is not None and size > self.settings.max_file_size:
-            await event.reply("حجم فایل از محدودیت فعلی ربات بیشتر است و امکان پردازش آن وجود ندارد.")
+            await event.reply("این فایل از سقف حجم ربات بزرگ‌تر است.")
             logger.warning(
                 "Rejected oversized %s from user %s: %s bytes", kind, user["telegram_id"], size
             )
             return
         if kind == "video" and not tool_available(self.settings.ffmpeg_bin):
             await event.reply(
-                "پردازش فایل تصویری روی این سرور فعال نیست؛ لطفاً فایل صوتی همان جلسه را بفرستید."
+                "فعلاً نمی‌توانم ویدیو را پردازش کنم. اگر می‌توانید، صدای آن را جدا بفرستید."
             )
             logger.warning("Video submission rejected because ffmpeg is unavailable")
             return
         submission_id = await self.db.create_submission(
             user["id"], file_id, duration, filename, mime_type, source_type=kind
         )
+        progress = await JobProgress.create(
+            event,
+            submission_id=submission_id,
+            stage="ویدیو رسید و در صف است" if kind == "video" else "فایل صوتی رسید و در صف است",
+        )
         task = asyncio.create_task(
-            self._process_submission(event, submission_id, filename, kind),
+            self._process_submission(
+                event, submission_id, filename, kind, progress=progress
+            ),
             name=f"{kind}-submission-{submission_id}",
         )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-        received = (
-            "فایل تصویری دریافت شد ✅\nابتدا صدای آن جدا می‌شود، سپس جزوه ساخته می‌شود."
-            if kind == "video"
-            else "فایل صوتی دریافت شد ✅"
-        )
-        await event.reply(
-            f"{received}\nپردازش در پس‌زمینه آغاز شد؛ نتیجه را همین‌جا می‌فرستم."
-        )
+        self._track_task(task)
 
     async def _accept_presentation(
         self, event, user, kind: str, filename, mime_type, file_id
     ) -> None:
         if not self.settings.presentation_enabled:
-            await event.reply("پردازش فایل‌های ارائه در حال حاضر غیرفعال است.")
+            await event.reply("فعلاً امکان ساخت جزوه از PowerPoint فعال نیست.")
             return
         if kind == "legacy" and not self.settings.presentation_legacy_enabled:
             await event.reply(
-                "فقط فایل‌های PowerPoint با پسوند pptx پذیرفته می‌شوند. "
-                "لطفاً فایل را در PowerPoint با قالب pptx ذخیره کنید و دوباره بفرستید."
+                "این فایل PowerPoint قدیمی است. لطفاً آن را با پسوند pptx ذخیره و دوباره ارسال کنید."
             )
             return
         size = getattr(event.message.file, "size", None)
         if size is not None and size > self.settings.max_file_size:
-            await event.reply("حجم فایل از محدودیت فعلی ربات بیشتر است و امکان پردازش آن وجود ندارد.")
+            await event.reply("این فایل از سقف حجم ربات بزرگ‌تر است.")
             logger.warning(
                 "Rejected oversized deck from user %s: %s bytes", user["telegram_id"], size
             )
@@ -389,24 +623,32 @@ class StudyBot:
         submission_id = await self.db.create_submission(
             user["id"], file_id, None, filename, mime_type, source_type="pptx"
         )
+        progress = await JobProgress.create(
+            event, submission_id=submission_id, stage="PowerPoint رسید و در صف است"
+        )
         task = asyncio.create_task(
-            self._process_presentation(event, submission_id, filename, kind),
+            self._process_presentation(
+                event, submission_id, filename, kind, progress=progress
+            ),
             name=f"presentation-submission-{submission_id}",
         )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-        await event.reply(
-            "فایل ارائه دریافت شد ✅\n"
-            "صداهای داخل اسلایدها استخراج و به یک فایل تبدیل می‌شوند، سپس جزوه ساخته می‌شود؛ "
-            "نتیجه را همین‌جا می‌فرستم."
-        )
+        self._track_task(task)
 
     async def _process_presentation(
-        self, event, submission_id: int, filename: str | None, kind: str
+        self,
+        event,
+        submission_id: int,
+        filename: str | None,
+        kind: str,
+        *,
+        progress: JobProgress | None = None,
     ) -> None:
         workdir: Path | None = None
+        progress = progress or JobProgress(event, submission_id=submission_id)
+        log_token = log_job_id.set(_error_reference(submission_id))
         try:
             async with self._job_semaphore:
+                await progress.update(5, "شروع کردم")
                 await self.db.set_submission_status(submission_id, "processing")
                 self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
                 workdir = Path(
@@ -416,23 +658,28 @@ class StudyBot:
                 if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
                     suffix = ".pptx" if kind == "native" else ".ppt"
                 deck_path = workdir / f"deck{suffix}"
+                await progress.update(10, "دارم فایل را از تلگرام می‌گیرم…")
                 downloaded = await event.message.download_media(file=str(deck_path))
                 if not downloaded or not deck_path.exists():
                     raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
                 if deck_path.stat().st_size > self.settings.max_file_size:
-                    raise ValueError("حجم فایل از محدودیت پردازش ربات بیشتر است.")
+                    raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
+                await progress.update(25, "فایل رسید؛ دارم بررسی‌اش می‌کنم")
 
                 if kind == "legacy":
-                    await event.respond(
-                        "فایل با قالب قدیمی PowerPoint ارسال شده است؛ ابتدا به pptx تبدیل می‌شود."
+                    await progress.update(
+                        32,
+                        "این فایل قدیمی است و اول به pptx تبدیل می‌شود",
                     )
                     deck_path = await convert_to_pptx(
                         deck_path, workdir / "converted", self.settings
                     )
 
+                await progress.update(40, "دارم متن و صدای اسلایدها را بیرون می‌کشم")
                 content = await load_presentation(
                     deck_path, workdir / "media", self.settings
                 )
+                await progress.update(50, "دارم صداهای اسلایدها را آماده می‌کنم")
                 prepared = await prepare_audio(content, workdir, self.settings)
                 await self._store_presentation_details(submission_id, content, prepared)
 
@@ -441,77 +688,103 @@ class StudyBot:
                 if prepared is None:
                     if not outline.strip():
                         raise ValueError(
-                            "در این فایل ارائه نه صدای قابل‌استفاده‌ای پیدا شد و نه متنی برای ساخت جزوه."
+                            "داخل این PowerPoint متن یا صدای قابل استفاده‌ای پیدا نکردم."
                         )
-                    await event.respond(
-                        f"صدایی در این ارائه پیدا نشد؛ جزوه فقط از متن اسلایدها ساخته می‌شود ({slide_note})."
+                    await progress.update(
+                        70,
+                        "صدایی در این ارائه پیدا نشد؛ جزوه را از متن اسلایدها می‌سازم",
+                        slide_note,
                     )
                     transcript_text = ""
                     engine = "slides-only"
-                    confidence = None
                 else:
-                    await event.respond(
-                        f"استخراج انجام شد: {slide_note} و {len(prepared.clips)} فایل صوتی "
-                        f"(مجموع {_format_duration(prepared.total_duration)}).\n"
-                        "اکنون پیاده‌سازی گفتار در حال انجام است."
+                    await progress.update(
+                        60,
+                        "صداها آماده شدند؛ دارم آن‌ها را به متن تبدیل می‌کنم",
+                        f"{slide_note}، {len(prepared.clips)} فایل صوتی، "
+                        f"مجموعاً {_format_duration(prepared.total_duration)}",
                     )
                     if prepared.path.stat().st_size > self.settings.max_file_size:
-                        raise ValueError("حجم صدای ادغام‌شده از محدودیت پردازش ربات بیشتر است.")
+                        raise ValueError("صدای این PowerPoint از سقف حجم ربات بزرگ‌تر است.")
                     result = await transcribe(prepared.path, self.settings)
+                    await progress.update(80, "متن صدا آماده شد")
                     transcript_text = result.text
                     engine = result.engine
-                    confidence = result.confidence
 
+                await progress.update(85, "دارم مطالب را به شکل جزوه مرتب می‌کنم")
                 try:
                     structured = await structure_presentation(
                         outline, transcript_text, self.settings
                     )
                     notice = ""
-                except Exception:
-                    logger.exception("LLM structuring unavailable; returning raw material")
+                except Exception as exc:
+                    if isinstance(exc, StructuringError):
+                        logger.warning(
+                            "Note structuring unavailable provider=%s; returning raw material: %s",
+                            self.settings.note_api_provider,
+                            exc,
+                        )
+                    else:
+                        logger.exception("Unexpected note structuring failure; returning raw material")
                     structured = self._fallback_presentation_text(outline, transcript_text)
                     notice = (
-                        "\n\nتوجه: مرتب‌سازی خودکار جزوه موقتاً انجام نشد؛ "
-                        "متن استخراج‌شده در ادامه آمده است."
+                        "\n\nنکته: این بار نتوانستم متن را به شکل جزوه مرتب کنم؛ "
+                        "متن استخراج‌شده را کامل فرستادم."
                     )
                 if prepared is not None and prepared.skipped:
                     notice += "\n\nموارد نادیده‌گرفته‌شده: " + "؛ ".join(prepared.skipped[:10])
 
+                await progress.update(94, "جزوه آماده است؛ دارم نتیجه را نهایی می‌کنم")
                 await self.db.save_transcription(
                     submission_id, engine, transcript_text, structured
                 )
-                await self.db.set_submission_status(submission_id, "done")
-                confidence_note = (
-                    f" (اطمینان تقریبی موتور: {confidence:.0%})" if confidence is not None else ""
-                )
-                header = (
-                    "جزوهٔ ارائهٔ شما آماده است 📊\n"
-                    f"منبع: فایل PowerPoint | موتور تبدیل گفتار: {engine}{confidence_note}\n\n"
-                )
+                header = "جزوهٔ PowerPoint شما آماده است 📊\n\n"
+                await progress.update(97, "دارم جزوه را می‌فرستم")
                 await self._send_long_message(event, header + structured + notice)
+                await self.db.set_submission_status(submission_id, "done")
+                await progress.complete()
+                logger.info(
+                    "Presentation submission completed submission_id=%s engine=%s slides=%s",
+                    submission_id,
+                    engine,
+                    content.slide_count,
+                )
         except asyncio.CancelledError:
             await self.db.set_submission_status(
                 submission_id, "failed", "پردازش هنگام خاموش‌شدن متوقف شد"
             )
             raise
         except Exception as exc:
-            logger.exception("Presentation submission %s failed", submission_id)
+            reference = _error_reference(submission_id)
+            logger.exception(
+                "Presentation submission failed submission_id=%s reference=%s",
+                submission_id,
+                reference,
+            )
             try:
                 await self.db.set_submission_status(submission_id, "failed", str(exc)[:1000])
             except Exception:
-                logger.exception("Could not store submission failure")
+                logger.exception("Could not store submission failure reference=%s", reference)
             try:
+                await progress.fail(reference)
                 message = (
                     str(exc)
                     if isinstance(exc, USER_VISIBLE_ERRORS)
-                    else "متأسفانه پردازش فایل ارائه انجام نشد. لطفاً فایل را بررسی کنید و دوباره بفرستید."
+                    else "متأسفم، نتوانستم این PowerPoint را پردازش کنم. لطفاً فایل را بررسی و دوباره ارسال کنید."
                 )
-                await event.reply(message)
+                await event.reply(
+                    f"{message}\n\nکد پیگیری: {reference}",
+                    buttons=main_menu(False),
+                )
             except Exception:
-                logger.exception("Could not notify the user about processing failure")
+                logger.exception(
+                    "Could not notify the user about processing failure reference=%s",
+                    reference,
+                )
         finally:
             if workdir:
                 shutil.rmtree(workdir, ignore_errors=True)
+            log_job_id.reset(log_token)
 
     async def _store_presentation_details(self, submission_id, content, prepared) -> None:
         used = {clip.part_name: clip for clip in (prepared.clips if prepared else ())}
@@ -546,11 +819,20 @@ class StudyBot:
         return "\n\n".join(parts)
 
     async def _process_submission(
-        self, event, submission_id: int, filename: str | None, kind: str = "audio"
+        self,
+        event,
+        submission_id: int,
+        filename: str | None,
+        kind: str = "audio",
+        *,
+        progress: JobProgress | None = None,
     ) -> None:
         workdir: Path | None = None
+        progress = progress or JobProgress(event, submission_id=submission_id)
+        log_token = log_job_id.set(_error_reference(submission_id))
         try:
             async with self._job_semaphore:
+                await progress.update(5, "شروع کردم")
                 await self.db.set_submission_status(submission_id, "processing")
                 self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
                 workdir = Path(
@@ -564,67 +846,103 @@ class StudyBot:
                 if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
                     suffix = ".media"
                 source_path = workdir / f"source{suffix}"
+                await progress.update(10, "دارم فایل را از تلگرام می‌گیرم…")
                 downloaded = await event.message.download_media(file=str(source_path))
                 if not downloaded or not source_path.exists():
                     raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
                 if source_path.stat().st_size > self.settings.max_file_size:
-                    raise ValueError("حجم فایل از محدودیت پردازش ربات بیشتر است.")
+                    raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
+                await progress.update(30, "فایل رسید؛ دارم صدا را بررسی می‌کنم")
 
                 audio_path = await self._ensure_transcribable(
-                    event, source_path, workdir, filename, kind
+                    event, source_path, workdir, filename, kind, progress=progress
                 )
                 if audio_path.stat().st_size > self.settings.max_file_size:
-                    raise ValueError("حجم صدای استخراج‌شده از محدودیت پردازش ربات بیشتر است.")
+                    raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
 
+                await progress.update(55, "دارم صدا را به متن تبدیل می‌کنم")
                 result = await transcribe(audio_path, self.settings)
+                await progress.update(80, "متن آماده شد؛ دارم آن را به شکل جزوه مرتب می‌کنم")
                 try:
                     structured = await structure_transcript(result.text, self.settings)
-                except Exception:
-                    logger.exception("LLM structuring unavailable; returning raw transcript")
+                except Exception as exc:
+                    if isinstance(exc, StructuringError):
+                        logger.warning(
+                            "Note structuring unavailable provider=%s; returning raw transcript: %s",
+                            self.settings.note_api_provider,
+                            exc,
+                        )
+                    else:
+                        logger.exception("Unexpected note structuring failure; returning raw transcript")
                     structured = "## متن پیاده‌سازی‌شده\n\n" + result.text
-                    notice = "\n\nتوجه: مرتب‌سازی خودکار جزوه موقتاً انجام نشد؛ متن پیاده‌سازی‌شده در ادامه آمده است."
+                    notice = (
+                        "\n\nنکته: این بار نتوانستم متن را به شکل جزوه مرتب کنم؛ "
+                        "متن کامل را فرستادم."
+                    )
                 else:
                     notice = ""
+                await progress.update(94, "جزوه آماده است؛ دارم نتیجه را نهایی می‌کنم")
                 await self.db.save_transcription(
                     submission_id, result.engine, result.text, structured
                 )
-                await self.db.set_submission_status(submission_id, "done")
-                confidence = (
-                    f" (اطمینان تقریبی موتور: {result.confidence:.0%})"
-                    if result.confidence is not None else ""
-                )
-                source_note = "منبع: فایل تصویری | " if kind == "video" else ""
-                header = (
-                    "جزوهٔ شما آماده است 📖\n"
-                    f"{source_note}موتور تبدیل گفتار: {result.engine}{confidence}\n\n"
-                )
+                header = "جزوهٔ شما آماده است 📖\n\n"
+                await progress.update(97, "دارم جزوه را می‌فرستم")
                 await self._send_long_message(event, header + structured + notice)
+                await self.db.set_submission_status(submission_id, "done")
+                await progress.complete()
+                logger.info(
+                    "Media submission completed submission_id=%s kind=%s engine=%s",
+                    submission_id,
+                    kind,
+                    result.engine,
+                )
         except asyncio.CancelledError:
             await self.db.set_submission_status(submission_id, "failed", "پردازش هنگام خاموش‌شدن متوقف شد")
             raise
         except Exception as exc:
-            logger.exception("Media submission %s failed", submission_id)
+            reference = _error_reference(submission_id)
+            logger.exception(
+                "Media submission failed submission_id=%s reference=%s",
+                submission_id,
+                reference,
+            )
             try:
                 await self.db.set_submission_status(submission_id, "failed", str(exc)[:1000])
             except Exception:
-                logger.exception("Could not store submission failure")
+                logger.exception("Could not store submission failure reference=%s", reference)
             try:
+                await progress.fail(reference)
                 message = (
                     str(exc)
                     if isinstance(exc, USER_VISIBLE_ERRORS)
-                    else "متأسفانه پردازش فایل انجام نشد. لطفاً کیفیت فایل را بررسی کنید و دوباره بفرستید."
+                    else "متأسفم، نتوانستم این فایل را پردازش کنم. لطفاً فایل را بررسی و دوباره ارسال کنید."
                 )
-                await event.reply(message)
+                await event.reply(
+                    f"{message}\n\nکد پیگیری: {reference}",
+                    buttons=main_menu(False),
+                )
             except Exception:
-                logger.exception("Could not notify the user about processing failure")
+                logger.exception(
+                    "Could not notify the user about processing failure reference=%s",
+                    reference,
+                )
         finally:
             if workdir:
                 shutil.rmtree(workdir, ignore_errors=True)
+            log_job_id.reset(log_token)
 
     async def _ensure_transcribable(
-        self, event, source_path: Path, workdir: Path, filename: str | None, kind: str
+        self,
+        event,
+        source_path: Path,
+        workdir: Path,
+        filename: str | None,
+        kind: str,
+        *,
+        progress: JobProgress | None = None,
     ) -> Path:
         """Return a file the STT providers accept, transcoding only when needed."""
+        progress = progress or JobProgress(event)
         info = None
         if tool_available(self.settings.ffprobe_bin):
             try:
@@ -633,10 +951,10 @@ class StudyBot:
                 logger.warning("Probing the upload failed: %s", exc)
         if info is not None and not info.has_audio:
             raise ValueError(
-                "این فایل شاخهٔ صوتی ندارد؛ لطفاً فایلی با صدای ضبط‌شده بفرستید."
+                "داخل این فایل صدایی پیدا نکردم. لطفاً نسخه‌ای را بفرستید که صدا داشته باشد."
             )
         if kind == "video":
-            await event.respond("در حال جدا کردن صدای فایل تصویری…")
+            await progress.update(40, "دارم صدای ویدیو را جدا می‌کنم…")
             return await extract_audio_track(
                 source_path,
                 workdir,
@@ -651,7 +969,7 @@ class StudyBot:
                     info.audio_codec if info else "unknown",
                 )
                 return source_path
-            await event.respond("قالب این فایل صوتی برای پیاده‌سازی آماده‌سازی می‌شود…")
+            await progress.update(40, "دارم فایل صوتی را برای تبدیل آماده می‌کنم…")
             return await extract_audio_track(
                 source_path,
                 workdir,
@@ -668,40 +986,59 @@ class StudyBot:
                 await asyncio.sleep(1.05)
             if len(pages) > 1:
                 page = f"بخش {index} از {len(pages)}\n\n" + page
-            await event.respond(markdown_to_telegram_html(page), parse_mode="html")
+            rendered = markdown_to_telegram_html(page)
+            buttons = main_menu(False) if index == len(pages) else None
+            try:
+                await event.respond(rendered, parse_mode="html", buttons=buttons)
+            except FloodWaitError as exc:
+                logger.warning(
+                    "Telegram flood wait while delivering result seconds=%s page=%s/%s",
+                    exc.seconds,
+                    index,
+                    len(pages),
+                )
+                await asyncio.sleep(exc.seconds + 1)
+                await event.respond(rendered, parse_mode="html", buttons=buttons)
+
+    @staticmethod
+    def _users_text(users: list[dict]) -> str:
+        if not users:
+            return "هنوز کاربری در ربات ثبت نشده است."
+        lines = ["فهرست کاربران (حداکثر ۵۰ کاربر اخیر):"]
+        for user in users:
+            name = f"@{user['username']}" if user["username"] else "بدون نام کاربری"
+            ban = " | مسدود" if user["is_banned"] else ""
+            joined = str(user["first_seen"])[:10]
+            lines.append(
+                f"• {name} | شناسه: {user['telegram_id']} | عضویت: {joined} | "
+                f"فایل‌ها: {user['submission_count']}{ban}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _stats_text(stats: dict) -> str:
+        return (
+            "آمار ربات 📊\n"
+            f"کاربران ثبت‌شده: {stats['users']}\n"
+            f"کاربران غیرمسدود: {stats['unbanned_users']}\n"
+            f"کاربران دارای ارسال در ۳۰ روز اخیر: {stats['active_30d']}\n"
+            f"کل فایل‌های دریافتی: {stats['submissions']}\n"
+            f"فایل‌های تصویری: {stats['videos']}\n"
+            f"فایل‌های ارائه (PowerPoint): {stats['presentations']}\n"
+            f"کلیپ‌های صوتی استخراج‌شده از ارائه‌ها: {stats['presentation_clips']}\n"
+            f"پردازش‌های موفق: {stats['done']}\n"
+            f"پردازش‌های ناموفق: {stats['failed']}"
+        )
 
     async def _handle_admin_command(self, event, command: str, text: str) -> None:
         admin_id = int((await event.get_sender()).id)
         if command == "/users":
             users = await self.db.user_summaries(limit=50)
-            if not users:
-                await event.reply("هنوز کاربری در ربات ثبت نشده است.")
-                return
-            lines = ["فهرست کاربران (حداکثر ۵۰ کاربر اخیر):"]
-            for user in users:
-                name = f"@{user['username']}" if user["username"] else "بدون نام کاربری"
-                ban = " | مسدود" if user["is_banned"] else ""
-                joined = str(user["first_seen"])[:10]
-                lines.append(
-                    f"• {name} | شناسه: {user['telegram_id']} | عضویت: {joined} | "
-                    f"فایل‌ها: {user['submission_count']}{ban}"
-                )
-            await self._send_long_message(event, "\n".join(lines))
+            await self._send_long_message(event, self._users_text(users))
             return
         if command == "/stats":
             stats = await self.db.stats()
-            await event.reply(
-                "آمار ربات 📊\n"
-                f"کاربران ثبت‌شده: {stats['users']}\n"
-                f"کاربران غیرمسدود: {stats['unbanned_users']}\n"
-                f"کاربران دارای ارسال در ۳۰ روز اخیر: {stats['active_30d']}\n"
-                f"کل فایل‌های دریافتی: {stats['submissions']}\n"
-                f"فایل‌های تصویری: {stats['videos']}\n"
-                f"فایل‌های ارائه (PowerPoint): {stats['presentations']}\n"
-                f"کلیپ‌های صوتی استخراج‌شده از ارائه‌ها: {stats['presentation_clips']}\n"
-                f"پردازش‌های موفق: {stats['done']}\n"
-                f"پردازش‌های ناموفق: {stats['failed']}"
-            )
+            await event.reply(self._stats_text(stats), buttons=admin_menu())
             return
         if command in {"/ban", "/unban"}:
             args = text.split(maxsplit=1)

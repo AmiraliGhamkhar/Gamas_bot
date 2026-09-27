@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -50,6 +51,9 @@ async def run_command(
 ) -> tuple[int, str, str]:
     """Run a command without a shell and return (returncode, stdout, stderr)."""
     stream = asyncio.subprocess.PIPE if capture_output else asyncio.subprocess.DEVNULL
+    started = time.monotonic()
+    tool = Path(command[0]).name
+    logger.info("External command started tool=%s timeout_seconds=%s", tool, timeout)
     try:
         process = await asyncio.create_subprocess_exec(
             *command,
@@ -66,13 +70,33 @@ async def run_command(
     except asyncio.TimeoutError as exc:
         process.kill()
         await process.wait()
+        logger.error(
+            "External command timed out tool=%s elapsed_seconds=%.3f timeout_seconds=%s",
+            tool,
+            time.monotonic() - started,
+            timeout,
+        )
         raise MediaToolError(f"زمان اجرای «{command[0]}» به پایان رسید.") from exc
     except asyncio.CancelledError:
         process.kill()
         await process.wait()
+        logger.info(
+            "External command cancelled tool=%s elapsed_seconds=%.3f",
+            tool,
+            time.monotonic() - started,
+        )
         raise
+    returncode = process.returncode or 0
+    elapsed = time.monotonic() - started
+    log = logger.info if returncode == 0 else logger.warning
+    log(
+        "External command finished tool=%s returncode=%s elapsed_seconds=%.3f",
+        tool,
+        returncode,
+        elapsed,
+    )
     return (
-        process.returncode or 0,
+        returncode,
         (stdout or b"").decode("utf-8", "replace"),
         (stderr or b"").decode("utf-8", "replace"),
     )

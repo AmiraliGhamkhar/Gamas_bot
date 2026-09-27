@@ -124,7 +124,7 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("یادآوری امتحان", outline)
         self.assertEqual(transcript, "متن پیاده‌سازی‌شده")
 
-        self.assertTrue(any("استخراج انجام شد" in item for item in event.responses))
+        self.assertTrue(any("صداها آماده شدند" in item for item in event.responses))
         self.assertTrue(any("۲ فایل صوتی" in item or "2 فایل صوتی" in item for item in event.responses))
         self.assertTrue(any("جزوهٔ نهایی" in item for item in event.responses))
 
@@ -156,7 +156,7 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_deck_is_reported_to_the_user(self):
         deck = build_deck(self.root / "empty.pptx", slides=[])
         event, submission_id = await self._run_job(deck)
-        self.assertTrue(any("نه صدای قابل‌استفاده" in item for item in event.replies))
+        self.assertTrue(any("متن یا صدای قابل استفاده‌ای پیدا نکردم" in item for item in event.replies))
         stats = await self.bot.db.stats()
         self.assertEqual(stats["failed"], 1)
 
@@ -202,7 +202,7 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
             event, submission_id = await self._run_job(deck)
         booklet = "\n".join(event.responses)
         self.assertIn("متن خام صدا", booklet)
-        self.assertIn("مرتب‌سازی خودکار جزوه موقتاً انجام نشد", booklet)
+        self.assertIn("نتوانستم متن را به شکل جزوه مرتب کنم", booklet)
         stats = await self.bot.db.stats()
         self.assertEqual(stats["done"], 1)
 
