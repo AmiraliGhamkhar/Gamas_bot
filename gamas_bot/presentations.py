@@ -219,6 +219,16 @@ def _slide_parts_in_order(archive: zipfile.ZipFile) -> list[str]:
     )
 
 
+def natural_key(name: str) -> tuple:
+    """Sort media2.m4a before media10.m4a instead of lexicographically."""
+    # The empty pieces are kept on purpose: re.split alternates text/number, so
+    # every tuple position keeps one type and comparisons stay well defined.
+    return tuple(
+        int(part) if part.isdigit() else part.lower()
+        for part in re.split(r"(\d+)", name)
+    )
+
+
 def _safe_media_filename(order: int, part_name: str) -> str:
     base = posixpath.basename(part_name) or "media"
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", base)[-64:].lstrip(".") or "media"
@@ -321,7 +331,7 @@ def read_presentation(
                 if resolved in names:
                     ordered_media.append((slide_number, resolved))
         # Media that no slide references (e.g. audio attached to a layout).
-        for name in sorted(names):
+        for name in sorted(names, key=natural_key):
             if name.startswith("ppt/media/") and media_kind(name):
                 ordered_media.append((None, name))
 
@@ -361,12 +371,23 @@ async def load_presentation(
 
 
 async def prepare_audio(
-    content: PresentationContent, workdir: Path, settings: Settings
+    content: PresentationContent,
+    workdir: Path,
+    settings: Settings,
+    *,
+    skipped_out: list[str] | None = None,
 ) -> PreparedAudio | None:
-    """Probe the extracted clips and merge them into one track for the STT stage."""
+    """Probe the extracted clips and merge them into one track for the STT stage.
+
+    ``skipped_out`` receives the skip reasons even when the deck ends up with no
+    usable audio at all, so the caller can still explain what was dropped.
+    """
+    skipped = list(content.skipped)
+    if skipped_out is not None:
+        skipped_out.clear()
+        skipped_out.extend(skipped)
     if not content.clips:
         return None
-    skipped = list(content.skipped)
     usable: list[MediaClip] = []
     can_probe = tool_available(settings.ffprobe_bin)
     if not can_probe:
@@ -395,7 +416,11 @@ async def prepare_audio(
             continue
         usable.append(replace(clip, duration=info.duration))
 
+    if skipped_out is not None:
+        skipped_out.clear()
+        skipped_out.extend(skipped)
     if not usable:
+        logger.info("No usable narration in the deck skipped=%s", len(skipped))
         return None
 
     durations = [clip.duration for clip in usable if clip.duration is not None]

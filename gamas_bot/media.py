@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import time
 import uuid
@@ -42,7 +43,7 @@ def tool_available(binary: str) -> bool:
         return False
     candidate = Path(binary)
     if candidate.is_absolute() or candidate.parent != Path("."):
-        return candidate.is_file()
+        return candidate.is_file() and os.access(candidate, os.X_OK)
     return shutil.which(binary) is not None
 
 
@@ -182,8 +183,10 @@ def build_merge_command(
         command += ["-i", str(item)]
     chains = []
     for index in range(len(inputs)):
+        # Pin the first audio track: "[i:a]" aborts ffmpeg when an input (for
+        # example an embedded video) carries more than one audio stream.
         chain = (
-            f"[{index}:a]aresample={rate}"
+            f"[{index}:a:0]aresample={rate}"
             ",aformat=sample_fmts=s16:channel_layouts=mono"
         )
         if silence_seconds > 0 and index < len(inputs) - 1:
