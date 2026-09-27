@@ -294,5 +294,92 @@ class StaleWorkdirTests(unittest.TestCase):
             )
 
 
+class TableCellPreservationTests(unittest.TestCase):
+    """A malformed table row must never lose a cell."""
+
+    def test_extra_cells_are_kept(self):
+        rendered = markdown_to_telegram_html(
+            "| نام | مقدار |\n|---|---|\n| الف | ب | ج |"
+        )
+        self.assertIn("ج", plain_text(rendered))
+
+    def test_empty_header_label_does_not_render_a_stray_colon(self):
+        rendered = markdown_to_telegram_html("|  | مقدار |\n|---|---|\n| الف | ب |")
+        self.assertNotIn("<b>:</b>", rendered)
+        self.assertIn("الف", plain_text(rendered))
+
+
+class AdminMenuTests(unittest.IsolatedAsyncioTestCase):
+    async def test_long_replies_keep_the_admin_button_for_admins(self):
+        seen: list = []
+
+        class Event:
+            async def respond(self, text, parse_mode=None, buttons=None):
+                seen.append(buttons)
+
+        bot = StudyBot.__new__(StudyBot)
+        with patch("gamas_bot.bot.asyncio.sleep", new=AsyncMock()):
+            await StudyBot._send_long_message(bot, Event(), "سلام", is_admin=True)
+            await StudyBot._send_long_message(bot, Event(), "سلام", is_admin=False)
+        def callbacks(rows):
+            return [button.type.data for row in rows for button in row]
+
+        admin_rows, user_rows = seen
+        self.assertIn(b"admin:home", callbacks(admin_rows))
+        self.assertNotIn(b"admin:home", callbacks(user_rows))
+
+
+class PendingAdminActionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_captioned_upload_is_not_read_as_an_admin_answer(self):
+        with tempfile.TemporaryDirectory() as folder:
+            settings = make_settings(
+                database_path=Path(folder) / "bot.sqlite3",
+                temp_dir=Path(folder) / "tmp",
+                admin_ids=frozenset({7}),
+            )
+            bot = StudyBot.__new__(StudyBot)
+            bot.settings = settings
+            bot.db = Database(settings.database_path)
+            bot._pending_admin_actions = {7: "broadcast"}
+            await bot.db.open()
+
+            accepted: list = []
+
+            async def accept_media(event, user, *args):
+                accepted.append(args[0])
+
+            bot._accept_media = accept_media
+            sender = SimpleNamespace(id=7, username="admin", bot=False)
+            message = SimpleNamespace(
+                voice=SimpleNamespace(duration=10),
+                audio=None,
+                video=None,
+                video_note=None,
+                gif=None,
+                document=SimpleNamespace(id=3),
+                photo=None,
+                media=object(),
+                id=1,
+                file=SimpleNamespace(
+                    name="lecture.ogg", mime_type="audio/ogg", size=10, duration=10
+                ),
+            )
+            event = SimpleNamespace(
+                raw_text="سلام",
+                message=message,
+                get_sender=AsyncMock(return_value=sender),
+                reply=AsyncMock(),
+                respond=AsyncMock(),
+            )
+            broadcast = AsyncMock(return_value=0)
+            bot._broadcast = broadcast
+            await bot._handle_message(event)
+            await bot.db.close()
+
+            broadcast.assert_not_awaited()
+            self.assertEqual(accepted, ["audio"])
+            self.assertEqual(bot._pending_admin_actions, {})
+
+
 if __name__ == "__main__":
     unittest.main()
