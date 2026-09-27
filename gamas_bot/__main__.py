@@ -17,6 +17,9 @@ async def main(settings: Settings) -> None:
 
 
 if __name__ == "__main__":
+    # Apply before file logging and Telethon can create sensitive files.
+    if hasattr(os, "umask"):
+        os.umask(0o077)
     configured = False
     try:
         settings = Settings.from_env()

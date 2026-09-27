@@ -34,6 +34,8 @@ PROMPT = """شما دستیار آموزشی فارسی هستید. متن پی�
 
 def split_transcript(text: str, max_chars: int = 22000) -> list[str]:
     """Split long transcripts near sentence boundaries to fit LLM context limits."""
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
     text = text.strip()
     if not text:
         return []
@@ -123,7 +125,9 @@ def _provider_request(
                 "maxOutputTokens": settings.note_api_max_output_tokens,
             },
         }
-        return url, extra_headers, payload, {"key": key}
+        headers = {"x-goog-api-key": key}
+        headers.update(extra_headers)
+        return url, headers, payload, {}
 
     if provider == "openai_compatible":
         base = settings.note_api_base_url or "https://api.openai.com/v1"
@@ -164,15 +168,21 @@ def _provider_response(payload: dict, provider: str) -> str:
     """Normalize supported provider responses to plain text."""
     try:
         if provider == "gemini":
+            if payload["candidates"][0].get("finishReason") == "MAX_TOKENS":
+                raise StructuringError("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
             parts = payload["candidates"][0]["content"]["parts"]
             text = "".join(str(part.get("text", "")) for part in parts)
         elif provider == "anthropic":
+            if payload.get("stop_reason") == "max_tokens":
+                raise StructuringError("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
             text = "".join(
                 str(part.get("text", ""))
                 for part in payload["content"]
                 if part.get("type") == "text"
             )
         else:
+            if payload["choices"][0].get("finish_reason") == "length":
+                raise StructuringError("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
             content = payload["choices"][0]["message"]["content"]
             if isinstance(content, list):
                 text = "".join(
@@ -242,7 +252,7 @@ async def _structure_chunk(
             if attempt + 1 >= attempts:
                 raise StructuringError(
                     f"ارتباط با سرویس تولید جزوه ({provider}) برقرار نشد."
-                ) from exc
+                ) from None
             delay = min(2 ** attempt, 15.0)
             logger.warning(
                 "Note API network failure provider=%s retry=%s/%s delay=%.1fs: %s",
@@ -301,17 +311,20 @@ async def structure_presentation(
     if settings.note_api_provider == "disabled":
         raise StructuringError("سرویس تولید جزوه غیرفعال است.")
 
-    # The outline is repeated in every chunk so each request keeps slide context;
-    # it is trimmed first so a long deck cannot crowd out the transcript.
-    outline_budget = max(0, max_chars // 2)
-    trimmed_outline = outline.strip()
-    if len(trimmed_outline) > outline_budget:
-        trimmed_outline = (
-            trimmed_outline[:outline_budget].rsplit("\n", 1)[0]
-            + "\n\n(ادامهٔ متن اسلایدها کوتاه شد)"
-        )
-    transcript_budget = max(2000, max_chars - len(trimmed_outline) - 500)
-    chunks = split_transcript(transcript, transcript_budget) or [""]
+    if max_chars < 1000:
+        raise ValueError("max_chars must be at least 1000 for presentation context")
+    outline = outline.strip()
+    if transcript.strip() and len(outline) <= max_chars // 2:
+        # Repeat a short outline as context for each narration chunk.
+        transcript_budget = max_chars - len(build_presentation_document(outline, "")) - 100
+        documents = [
+            build_presentation_document(outline, chunk)
+            for chunk in split_transcript(transcript, transcript_budget)
+        ]
+    else:
+        # Long decks (including slides-only decks) must not silently lose their
+        # final slides. Chunk the complete material instead of truncating it.
+        documents = split_transcript(build_presentation_document(outline, transcript), max_chars)
 
     timeout = aiohttp.ClientTimeout(
         total=settings.note_api_timeout,
@@ -320,18 +333,17 @@ async def structure_presentation(
     )
     outputs: list[str] = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for index, chunk in enumerate(chunks, start=1):
-            document = build_presentation_document(trimmed_outline, chunk)
+        for index, document in enumerate(documents, start=1):
             try:
                 result = await _structure_chunk(
                     document, settings, session, PRESENTATION_PROMPT
                 )
             except Exception:
                 logger.exception(
-                    "Presentation structuring failed for chunk %s/%s", index, len(chunks)
+                    "Presentation structuring failed for chunk %s/%s", index, len(documents)
                 )
                 raise
-            if len(chunks) > 1:
+            if len(documents) > 1:
                 result = f"## بخش {index}\n\n{result}"
             outputs.append(result)
     return "\n\n---\n\n".join(outputs)

@@ -10,8 +10,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import shutil
+import signal
 import time
 import uuid
 from dataclasses import dataclass
@@ -61,30 +63,41 @@ async def run_command(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=stream,
             stderr=stream,
+            start_new_session=(os.name == "posix"),
         )
     except FileNotFoundError as exc:
         raise MediaToolError(f"ابزار «{command[0]}» روی سرور نصب نیست.") from exc
     except OSError as exc:
         raise MediaToolError(f"اجرای «{command[0]}» ممکن نشد: {exc}") from exc
+    communication = asyncio.create_task(process.communicate())
+
+    async def terminate() -> None:
+        # soffice may be a launcher with child processes. Kill its process group
+        # on POSIX so children cannot outlive a cancelled/timed-out job.
+        try:
+            if os.name == "posix":
+                os.killpg(process.pid, signal.SIGKILL)
+            else:
+                process.kill()
+        except ProcessLookupError:
+            pass  # The process may have exited between the timeout and kill.
+        # Drain pipes too; wait() alone can hang on a full stdout/stderr pipe.
+        await communication
+
     try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+        stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=timeout)
     except asyncio.TimeoutError as exc:
-        process.kill()
-        await process.wait()
+        await terminate()
         logger.error(
             "External command timed out tool=%s elapsed_seconds=%.3f timeout_seconds=%s",
-            tool,
-            time.monotonic() - started,
-            timeout,
+            tool, time.monotonic() - started, timeout,
         )
         raise MediaToolError(f"زمان اجرای «{command[0]}» به پایان رسید.") from exc
     except asyncio.CancelledError:
-        process.kill()
-        await process.wait()
+        await terminate()
         logger.info(
             "External command cancelled tool=%s elapsed_seconds=%.3f",
-            tool,
-            time.monotonic() - started,
+            tool, time.monotonic() - started,
         )
         raise
     returncode = process.returncode or 0
@@ -112,6 +125,7 @@ def build_probe_command(ffprobe_bin: str, path: Path) -> list[str]:
         "json",
         "-show_format",
         "-show_streams",
+        "-protocol_whitelist", "file,pipe",
         str(path),
     ]
 
@@ -122,10 +136,16 @@ def parse_probe_output(payload: str) -> MediaInfo:
         data = json.loads(payload or "{}")
     except json.JSONDecodeError as exc:
         raise MediaToolError("خروجی ffprobe قابل‌خواندن نیست.") from exc
-    streams = data.get("streams") or []
+    if not isinstance(data, dict):
+        raise MediaToolError("ساختار خروجی ffprobe معتبر نیست.")
+    streams = data.get("streams", [])
+    file_format = data.get("format", {})
+    if (not isinstance(streams, list) or not all(isinstance(s, dict) for s in streams)
+            or not isinstance(file_format, dict)):
+        raise MediaToolError("ساختار خروجی ffprobe معتبر نیست.")
     audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
     duration: float | None = None
-    for source in ({k: v for k, v in (data.get("format") or {}).items()}, *audio_streams):
+    for source in (file_format, *audio_streams):
         raw = source.get("duration")
         if raw in (None, "", "N/A"):
             continue
@@ -133,7 +153,7 @@ def parse_probe_output(payload: str) -> MediaInfo:
             value = float(raw)
         except (TypeError, ValueError):
             continue
-        if value > 0:
+        if math.isfinite(value) and value > 0:
             duration = value
             break
     codec = audio_streams[0].get("codec_name") if audio_streams else None
@@ -180,14 +200,14 @@ def build_merge_command(
     rate = OPUS_SAMPLE_RATE if output_format == "opus" else WAV_SAMPLE_RATE
     command = [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
     for item in inputs:
-        command += ["-i", str(item)]
+        command += ["-protocol_whitelist", "file,pipe", "-i", str(item)]
     chains = []
     for index in range(len(inputs)):
         # Pin the first audio track: "[i:a]" aborts ffmpeg when an input (for
         # example an embedded video) carries more than one audio stream.
         chain = (
             f"[{index}:a:0]aresample={rate}"
-            ",aformat=sample_fmts=s16:channel_layouts=mono"
+            ",aformat=sample_fmts=s16:channel_layouts=mono,asetpts=PTS-STARTPTS"
         )
         if silence_seconds > 0 and index < len(inputs) - 1:
             chain += f",apad=pad_dur={silence_seconds:g}"
@@ -264,6 +284,7 @@ def build_transcode_command(
     rate = OPUS_SAMPLE_RATE if output_format == "opus" else WAV_SAMPLE_RATE
     command = [
         ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+        "-protocol_whitelist", "file,pipe",
         "-i", str(source),
         "-map", "0:a:0",
         "-vn",

@@ -14,3 +14,10 @@ data/
 stt-benchmark.csv
 .pytest_cache/
 .coverage
+
+# SQLite journals/sidecars are sensitive runtime data too.
+*.db-*
+*.sqlite-*
+*.sqlite3-*
+*.session-*
+.ruff_cache/

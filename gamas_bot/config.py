@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -168,6 +169,8 @@ class Settings:
             log_backup_count = int(_text("LOG_BACKUP_COUNT", "5"))
         except ValueError as exc:
             raise ValueError("مقادیر عددی تنظیمات محیط معتبر نیستند.") from exc
+        if not all(math.isfinite(value) for value in (min_confidence, poll_interval)):
+            raise ValueError("مقادیر اعشاری STT باید عدد متناهی باشند.")
         if not 0 <= min_confidence <= 1:
             raise ValueError("STT_MIN_CONFIDENCE باید بین صفر و یک باشد.")
         if min(max_file_size, max_jobs, poll_interval, job_timeout, note_timeout, note_max_tokens) <= 0:
@@ -195,6 +198,8 @@ class Settings:
             soffice_timeout = int(_text("SOFFICE_TIMEOUT_SECONDS", "600"))
         except ValueError as exc:
             raise ValueError("مقادیر عددی مربوط به پردازش فایل ارائه معتبر نیستند.") from exc
+        if not all(math.isfinite(value) for value in (min_clip, silence)):
+            raise ValueError("زمان‌های فایل ارائه باید عدد متناهی باشند.")
         if min_clip < 0 or silence < 0:
             raise ValueError("PPTX_MIN_CLIP_SECONDS و PPTX_SILENCE_SECONDS نمی‌توانند منفی باشند.")
         if min(max_clips, max_total_duration, max_unpacked, wav_limit) <= 0:

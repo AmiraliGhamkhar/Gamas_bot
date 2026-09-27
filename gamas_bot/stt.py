@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,7 +38,9 @@ def _speechmatics_confidence(payload: dict) -> float | None:
         alternatives = item.get("alternatives") or []
         if alternatives and alternatives[0].get("confidence") is not None:
             try:
-                values.append(float(alternatives[0]["confidence"]))
+                value = float(alternatives[0]["confidence"])
+                if math.isfinite(value) and 0 <= value <= 1:
+                    values.append(value)
             except (TypeError, ValueError):
                 pass
     return sum(values) / len(values) if values else None
@@ -48,16 +51,17 @@ def _deepgram_transcript(payload: dict) -> Transcript:
         alternative = payload["results"]["channels"][0]["alternatives"][0]
         text = alternative.get("transcript", "").strip()
         confidence = alternative.get("confidence")
-        return Transcript("deepgram", text, float(confidence) if confidence is not None else None)
-    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        confidence = float(confidence) if confidence is not None else None
+        if confidence is not None and (not math.isfinite(confidence) or not 0 <= confidence <= 1):
+            confidence = None
+        return Transcript("deepgram", text, confidence)
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError) as exc:
         raise STTError("ساختار پاسخ دیپ‌گرام قابل‌خواندن نیست.") from exc
 
 
-async def _error_text(response: aiohttp.ClientResponse) -> str:
-    try:
-        return (await response.text())[:700]
-    except Exception:
-        return f"HTTP {response.status}"
+def _http_error(stage: str, status: int) -> STTError:
+    # Provider/gateway error bodies may echo lecture content or credentials.
+    return STTError(f"{stage} failed (HTTP {status})")
 
 
 def speechmatics_config(settings: Settings) -> dict:
@@ -101,7 +105,7 @@ async def _speechmatics(
             data=form,
         ) as response:
             if response.status not in (200, 201, 202):
-                raise STTError(f"Speechmatics job submission failed ({response.status}): {await _error_text(response)}")
+                raise _http_error("Speechmatics job submission", response.status)
             payload = await response.json(content_type=None)
     job_id = payload.get("id")
     if not job_id:
@@ -116,7 +120,7 @@ async def _speechmatics(
             headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
         ) as response:
             if response.status != 200:
-                raise STTError(f"Speechmatics status failed ({response.status}): {await _error_text(response)}")
+                raise _http_error("Speechmatics status", response.status)
             status_data = await response.json(content_type=None)
         job = status_data.get("job", status_data)
         status = str(job.get("status", "")).lower()
@@ -132,7 +136,7 @@ async def _speechmatics(
         headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
     ) as response:
         if response.status != 200:
-            raise STTError(f"Speechmatics transcript retrieval failed ({response.status}): {await _error_text(response)}")
+            raise _http_error("Speechmatics transcript retrieval", response.status)
         result = await response.json(content_type=None)
     parts: list[str] = []
     for item in result.get("results", []):
@@ -174,7 +178,7 @@ async def _deepgram(
             data=audio,
         ) as response:
             if response.status != 200:
-                raise STTError(f"Deepgram request failed ({response.status}): {await _error_text(response)}")
+                raise _http_error("Deepgram request", response.status)
             payload = await response.json(content_type=None)
     transcript = _deepgram_transcript(payload)
     if not transcript.text:
@@ -226,7 +230,12 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
                 len(available),
             )
             try:
-                transcript = await providers[engine](session, audio_path, settings)
+                # Bound the whole provider attempt, including upload, polling
+                # and transcript download (socket read timeouts are not totals).
+                transcript = await asyncio.wait_for(
+                    providers[engine](session, audio_path, settings),
+                    timeout=settings.stt_job_timeout,
+                )
                 logger.info(
                     "STT attempt completed provider=%s elapsed_seconds=%.3f confidence=%s text_chars=%s",
                     engine,
@@ -249,14 +258,18 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception(
-                    "STT provider failed provider=%s elapsed_seconds=%.3f",
+                logger.warning(
+                    "STT provider failed provider=%s elapsed_seconds=%.3f error_type=%s",
                     engine,
                     time.monotonic() - started,
+                    type(exc).__name__,
                 )
-                failures.append(f"{engine}: {exc}")
+                # Unexpected client errors can contain URLs, keys or response
+                # fragments. Keep only our own sanitized errors and error types.
+                detail = str(exc) if isinstance(exc, STTError) else type(exc).__name__
+                failures.append(f"{engine}: {detail}")
                 if index == len(available) - 1 and not outcomes:
-                    raise STTError("؛ ".join(failures)) from exc
+                    raise STTError("؛ ".join(failures)) from None
         if not outcomes:
             raise STTError("؛ ".join(failures) or "تبدیل گفتار ناموفق بود.")
         # When both providers work, prefer the more confident result. If either

@@ -6,6 +6,8 @@ Gamas Bot is a Python-based Telegram bot built with [Telethon](https://github.co
 
 It accepts audio, voice messages, videos, and PowerPoint presentations, converts speech to text using **Speechmatics** or **Deepgram**, and optionally generates structured lecture notes using **Gemini, Anthropic, or any OpenAI-compatible API** (OpenAI, OpenRouter, Groq, Together, DeepSeek, Ollama, vLLM, and similar services).
 
+> Repository review and validation notes: [`docs/AUDIT.md`](docs/AUDIT.md).
+
 ---
 
 ## Features
@@ -286,7 +288,7 @@ NOTE_API_RETRIES=2
 NOTE_API_MAX_OUTPUT_TOKENS=8192
 ```
 
-Transient `429` and `5xx` responses and network failures are retried with bounded backoff. Prompts and transcript contents are not written to application logs.
+Transient `429` and `5xx` responses and network failures are retried with bounded backoff. Provider error bodies are not logged. Gemini authentication uses a header rather than a URL query parameter. If a provider explicitly reports an output-token limit, the incomplete note is rejected and the bot delivers the extracted source material instead. Increase `NOTE_API_MAX_OUTPUT_TOKENS` only within the selected model’s limits.
 
 ---
 
@@ -329,6 +331,18 @@ When enabled, the secondary engine is used if the primary request fails or repor
 STT_MIN_CONFIDENCE=0.65
 ```
 
+`STT_JOB_TIMEOUT_SECONDS` (default `21600`) bounds **each entire provider attempt**,
+including upload, polling and transcript download. A fallback attempt has its own
+budget; this is not a timeout for the whole Telegram job. Socket-level timeouts
+can fail earlier. A local timeout does not delete a Speechmatics job already
+submitted to the provider.
+
+If only the secondary provider has a key, it is used even with fallback disabled.
+Files of at least 1,000,000,000 bytes are routed to Deepgram and require its key;
+this size-routing rule also applies when fallback is disabled. Provider/model
+availability, language support, quotas and accepted upload sizes should be
+confirmed for your account before production use.
+
 > Confidence scores from different providers are not necessarily calibrated against each other. Tune this threshold using your own validation dataset.
 
 ---
@@ -365,7 +379,7 @@ The processor:
 4. Finds referenced audio.
 5. Optionally extracts audio from embedded videos.
 6. Filters very short audio clips.
-7. Converts audio to mono 16 kHz.
+7. Converts audio to mono 16 kHz PCM WAV, or 48 kHz Opus when the estimated WAV is too large.
 8. Adds a short silence between clips.
 9. Sends the combined audio to STT.
 10. Combines transcript + slide content.
@@ -402,6 +416,20 @@ PPTX_ENABLED=false
 ```
 
 Presentations without audio can still produce notes from slide text and speaker notes.
+Native slideshow/template variants (`ppsx`, `ppsm`, `potx`, `potm`) use the same
+slide reader; embedded macros are not executed by the native parser.
+
+All extracted slide text is retained for chunking and raw fallback, rather than
+silently cutting off the final slides of a long deck. A short outline is repeated
+with narration chunks; a long outline and narration are chunked as a complete
+document. There is no timestamp-to-slide alignment, so cross-chunk context and
+perfect slide-by-slide narration matching are not guaranteed. More material may
+mean more API requests and higher cost.
+
+Clip duration limits use available probe results. Unknown durations cannot be
+fully bounded in advance; install FFprobe and apply host disk/CPU/memory limits.
+Inserted silence is included in WAV-size estimation, but reported narration
+duration excludes that silence.
 
 ---
 
@@ -422,6 +450,10 @@ MAX_CONCURRENT_JOBS=3
 ```
 
 Increase this only after testing CPU, memory, disk, network, and API limits.
+This setting bounds active jobs, **not** the number of pending uploads. The queue
+is in memory and is not durable; after restart unfinished jobs are marked failed
+and must be resubmitted. Restrict access to trusted users until you add admission
+limits/rate limiting suitable for a public deployment.
 
 ---
 
@@ -444,7 +476,8 @@ Gamas Bot uses SQLite with:
 - WAL mode
 - Foreign keys
 - Busy timeout
-- Versioned migrations
+- Versioned, transactional migrations
+- Rollback of failed multi-statement writes
 
 Migration files:
 
@@ -487,7 +520,12 @@ Administrators are defined with:
 ADMIN_IDS=123456789,987654321
 ```
 
-Only configured administrator IDs can execute administrative commands.
+Only configured administrator IDs can execute administrative commands, and
+administrative commands/buttons are restricted to **private chats** with the bot.
+Group messages cannot answer a pending private broadcast prompt. Navigation to a
+user menu, `/start`, `/help`, or `/cancel` cancels a pending admin action; unknown
+slash commands are not broadcast as prompt answers. Non-administrative media
+handling remains available in chats where the bot receives messages.
 
 ---
 
@@ -504,7 +542,7 @@ Only configured administrator IDs can execute administrative commands.
 | PDF / image / ZIP | Rejected with instructions |
 | Plain text | Ignored |
 
-Files without an audio stream are detected before consuming STT resources. GIF files are not treated as lecture videos.
+When FFprobe is available and successfully reads the file, uploads without an audio stream are rejected before consuming STT resources. GIF files are not treated as lecture videos.
 
 ---
 
@@ -515,6 +553,26 @@ Run all tests:
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+The default suite uses temporary databases, synthetic presentation packages,
+mock provider responses and executable tool stubs; no API keys are needed.
+The real-media smoke tests run if `ffmpeg` is on `PATH`, or when
+`FFMPEG_TEST_BIN=/absolute/path/to/ffmpeg` is set. Otherwise those three tests
+are explicitly skipped. The stub-based suite targets Linux/POSIX; Windows
+application setup is documented but has not been validated by this CI matrix.
+
+CI (`.github/workflows/tests.yml`) runs the suite and critical static checks on
+Python 3.11, 3.12 and 3.13 on Linux. To reproduce additional checks locally:
+
+```bash
+python -m pip install ruff pip-audit
+python -m pip check
+ruff check gamas_bot scripts tests --select E9,F
+pip-audit -r requirements.txt
+```
+
+A passing dependency audit reports known advisories for the resolved versions;
+it is not a guarantee of security. Review dependency changes before upgrading.
 
 ### STT benchmark
 
@@ -543,7 +601,7 @@ The benchmark compares:
 - Provider confidence
 - Normalized Persian WER
 
-Persian normalization includes `ي → ی` and `ك → ک` (plus diacritics and punctuation removal). The benchmark does not store full transcripts in the CSV report.
+Persian normalization includes `ي → ی` and `ك → ک` (plus diacritics and punctuation removal). The benchmark does not store full transcripts in the CSV report. Samples at or above the Speechmatics direct-upload threshold are recorded as failed for that engine, not silently benchmarked through Deepgram under the wrong label. Output parent directories are created automatically.
 
 ---
 
@@ -555,6 +613,21 @@ PowerPoint packages are validated before extraction. Checks include:
 - Absolute-path rejection
 - Entry-count and unpacked-size limits
 - Media reference validation
+
+FFmpeg/FFprobe inputs are limited to local `file`/`pipe` protocols so uploaded
+playlists cannot fetch HTTP or other network URLs. This is **not** a complete
+sandbox: media parsers and LibreOffice still process untrusted bytes and may
+access local files readable by their service account. Use patched OS packages,
+a dedicated non-root account, filesystem/container isolation and resource limits.
+On POSIX, timed-out/cancelled external tools and their process group are killed;
+on Windows only the direct process is explicitly killed, so use a supervisor
+that cleans up child processes too.
+
+The unrelated Windows RDP workflow was removed because it used a hard-coded
+administrator password and disabled Network Level Authentication. Git history
+still contains that password: rotate it anywhere it was reused, terminate any
+old runner sessions, and review/revoke their Tailscale access as appropriate.
+GitHub Actions CI is not a production bot host.
 
 Never commit secrets or runtime data. The following should remain local:
 
@@ -635,8 +708,10 @@ Gamas_bot/
 ├── deploy/
 │   └── gamas-bot.service  # systemd unit for Linux
 ├── docs/
-│   └── DEPLOY_FA.md        # راهنمای فارسی استقرار و عیب‌یابی
+│   ├── DEPLOY_FA.md        # راهنمای فارسی استقرار و عیب‌یابی
+│   └── AUDIT.md            # review findings and validation limits
 │
+├── .github/workflows/tests.yml
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
@@ -692,7 +767,7 @@ If LibreOffice cannot be installed, use `PPTX_LEGACY_ENABLED=false`. Native PPTX
 #### 2. Create a locked-down service account and install the app
 
 ```bash
-sudo useradd --system --create-home --home-dir /opt/gamas-bot \
+sudo useradd --system --no-create-home --home-dir /opt/gamas-bot \
   --shell /usr/sbin/nologin bot
 
 sudo git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git /opt/gamas-bot
@@ -708,6 +783,10 @@ sudo chmod 600 /opt/gamas-bot/.env
 sudo nano /opt/gamas-bot/.env
 ```
 
+Use `--no-create-home`: `git clone` must create the checkout in a missing or
+empty directory, not a home directory already populated with shell skeleton files.
+For an existing installation, skip account/clone steps; do not overwrite its data.
+
 Test once as the service user before enabling systemd:
 
 ```bash
@@ -721,7 +800,9 @@ After the bot reports that it is online, stop this foreground test with `Ctrl+C`
 
 #### 3. Install and start the systemd service
 
-The provided unit assumes `/opt/gamas-bot`, stores LibreOffice/fontconfig cache under writable `data/`, writes application output to journald, and restricts filesystem access:
+The provided unit assumes `/opt/gamas-bot`, stores LibreOffice/fontconfig cache under writable `data/`, writes application output to journald, and uses `ProtectSystem=strict` with
+`data/` as its writable exception. Custom database, session, temporary-file and
+file-log paths must stay under that directory or be added to `ReadWritePaths`:
 
 ```bash
 sudo cp /opt/gamas-bot/deploy/gamas-bot.service /etc/systemd/system/gamas-bot.service
@@ -809,7 +890,7 @@ Install FFmpeg and LibreOffice with WinGet, use their full `.exe` paths in `.env
 
 ### Logging and error handling
 
-Default production logs go to stdout/journald and include provider attempts, durations, external-tool exit codes, job IDs, migrations, startup dependency checks, retry events, and tracebacks. Transcript/prompt contents and API keys are not intentionally logged. Users receive a stable reference such as `GMS-000123` on job failure; search it together with the submission ID in server logs.
+Default production logs go to stdout/journald and include provider attempts, durations, external-tool exit codes, job IDs, migrations, startup dependency checks, retry events, and local error tracebacks. STT failures retain sanitized status/type information instead of response bodies or raw client exception chains. Transcript/prompt contents and API keys are not intentionally logged. Users receive a stable reference such as `GMS-000123` on job failure; search it together with the submission ID in server logs.
 
 ```dotenv
 LOG_LEVEL=INFO                 # DEBUG, INFO, WARNING, ERROR, CRITICAL
@@ -872,7 +953,7 @@ Send a voice message, audio file, video, or PowerPoint presentation to your Tele
 
 ## License
 
-Add your project license here (for example, the MIT License).
+No license file is currently included. Contact the maintainer about permission to use, modify or redistribute the project; this README does not grant a license.
 
 ---
 
