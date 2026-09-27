@@ -3,37 +3,31 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import sys
 
 from .bot import StudyBot
 from .config import Settings
+from .logging_config import configure_logging, install_asyncio_exception_handler
 
 
-def configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-    logging.getLogger("telethon").setLevel(logging.WARNING)
-    logging.getLogger("aiohttp").setLevel(logging.WARNING)
-
-
-async def main() -> None:
+async def main(settings: Settings) -> None:
     if hasattr(os, "umask"):
         os.umask(0o077)
-    configure_logging()
-    try:
-        settings = Settings.from_env()
-        settings.validate_runtime()
-        await StudyBot(settings).run()
-    except (ValueError, OSError) as exc:
-        logging.getLogger(__name__).critical("Startup failed: %s", exc)
-        raise SystemExit(2) from exc
+    install_asyncio_exception_handler(asyncio.get_running_loop())
+    await StudyBot(settings).run()
 
 
 if __name__ == "__main__":
+    configured = False
     try:
-        asyncio.run(main())
+        settings = Settings.from_env()
+        configure_logging(settings)
+        configured = True
+        settings.validate_runtime()
+        asyncio.run(main(settings))
     except KeyboardInterrupt:
-        pass
+        logging.getLogger(__name__).info("Shutdown requested by operator")
+    except Exception as exc:
+        if not configured:
+            configure_logging()
+        logging.getLogger(__name__).critical("Startup or runtime failure", exc_info=True)
+        raise SystemExit(2) from exc

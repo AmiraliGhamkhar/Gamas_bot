@@ -4,7 +4,7 @@
 
 Gamas Bot is a Python-based Telegram bot built with [Telethon](https://github.com/LonamiWebs/Telethon) (MTProto) for processing Persian lectures.
 
-It accepts audio, voice messages, videos, and PowerPoint presentations, converts speech to text using **Speechmatics** or **Deepgram**, and optionally generates structured lecture notes using **Gemini 2.5 Flash-Lite**.
+It accepts audio, voice messages, videos, and PowerPoint presentations, converts speech to text using **Speechmatics** or **Deepgram**, and optionally generates structured lecture notes using **Gemini, Anthropic, or any OpenAI-compatible API** (OpenAI, OpenRouter, Groq, Together, DeepSeek, Ollama, vLLM, and similar services).
 
 ---
 
@@ -19,7 +19,9 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 - Slide-by-slide lecture notes
 - Speechmatics + Deepgram STT
 - Configurable STT fallback
-- Gemini-powered note generation
+- Provider-neutral note generation (Gemini, Anthropic, OpenAI-compatible APIs)
+- Inline glass-button menus for users and administrators
+- Per-job editable progress bars
 - Background processing for long jobs
 - SQLite + WAL
 - Automatic temporary-file cleanup
@@ -67,7 +69,8 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
              Raw Transcript
                    │
                    ▼
-         Gemini 2.5 Flash-Lite
+       Configured Note API
+  Gemini / Anthropic / OpenAI-compatible
                    │
                    ▼
             Structured Notes
@@ -87,7 +90,7 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 - Telegram bot token
 - Telegram API ID + API hash
 - At least one STT API key (Speechmatics or Deepgram)
-- Gemini API key (optional)
+- A note-generation API (Gemini, Anthropic, or OpenAI-compatible; optional)
 
 ---
 
@@ -169,10 +172,11 @@ ADMIN_IDS=123456789
 SPEECHMATICS_API_KEY=YOUR_SPEECHMATICS_KEY
 DEEPGRAM_API_KEY=YOUR_DEEPGRAM_KEY
 
+NOTE_API_PROVIDER=gemini
 GEMINI_API_KEY=YOUR_GEMINI_KEY
 ```
 
-At least one of the two STT API keys is required.
+At least one of the two STT API keys is required. The note API is optional; if it is disabled or unavailable, the bot returns the raw transcript/slide material instead.
 
 ---
 
@@ -215,13 +219,74 @@ TELEGRAM_API_HASH=...
 
 ## API Providers
 
+### Speech-to-text
+
 | Provider | Role | Console |
 |---|---|---|
 | Speechmatics | Primary STT engine (default) | <https://portal.speechmatics.com/> |
 | Deepgram | Alternative/fallback STT engine | <https://console.deepgram.com/> |
-| Gemini | Converts transcripts into structured lecture notes | <https://aistudio.google.com/apikey> |
 
-Gemini is optional. If unavailable, the raw transcript is preserved and delivered instead.
+### Note generation (provider-neutral)
+
+Choose one provider with `NOTE_API_PROVIDER`. Note generation is optional: if the provider is disabled, has no valid key, or temporarily fails, the raw transcript/slide material is still preserved and delivered.
+
+#### Gemini
+
+```dotenv
+NOTE_API_PROVIDER=gemini
+NOTE_API_KEY=...                 # or use the legacy GEMINI_API_KEY
+NOTE_API_MODEL=gemini-2.5-flash-lite
+# NOTE_API_BASE_URL=             # leave empty for Google's default endpoint
+```
+
+#### OpenAI-compatible APIs
+
+This mode works with any service implementing `POST /chat/completions`, including OpenAI, OpenRouter, Groq, Together, DeepSeek, local Ollama/vLLM gateways, and compatible private APIs:
+
+```dotenv
+NOTE_API_PROVIDER=openai_compatible
+NOTE_API_KEY=...
+NOTE_API_BASE_URL=https://api.openai.com/v1
+NOTE_API_MODEL=gpt-4o-mini
+```
+
+OpenRouter example:
+
+```dotenv
+NOTE_API_PROVIDER=openai_compatible
+NOTE_API_KEY=...
+NOTE_API_BASE_URL=https://openrouter.ai/api/v1
+NOTE_API_MODEL=openai/gpt-4o-mini
+NOTE_API_EXTRA_HEADERS_JSON='{"HTTP-Referer":"https://example.com","X-Title":"Gamas Bot"}'
+```
+
+A local endpoint can omit the key:
+
+```dotenv
+NOTE_API_PROVIDER=openai_compatible
+NOTE_API_KEY=
+NOTE_API_BASE_URL=http://127.0.0.1:11434/v1
+NOTE_API_MODEL=qwen2.5:7b
+```
+
+#### Anthropic
+
+```dotenv
+NOTE_API_PROVIDER=anthropic
+NOTE_API_KEY=...
+NOTE_API_MODEL=claude-3-5-haiku-latest
+# NOTE_API_BASE_URL=             # leave empty for Anthropic's default endpoint
+```
+
+Common controls:
+
+```dotenv
+NOTE_API_TIMEOUT_SECONDS=240
+NOTE_API_RETRIES=2
+NOTE_API_MAX_OUTPUT_TOKENS=8192
+```
+
+Transient `429` and `5xx` responses and network failures are retried with bounded backoff. Prompts and transcript contents are not written to application logs.
 
 ---
 
@@ -401,26 +466,20 @@ Temporary media is removed after processing. Transcripts and generated notes rem
 
 ---
 
-## Commands
+## Telegram interaction
 
-### User commands
+Users do not need to memorize commands. `/start` opens an inline button menu with:
 
-| Command | Description |
-|---|---|
-| `/start` | Welcome message |
-| `/help` | Usage guide |
+- **ساخت جزوه** — explains how to attach a file
+- **راهنما** — usage steps
+- **قالب‌ها** — supported file types
+- **حریم خصوصی** — what is sent to external providers
 
-Users can then send a voice message, audio file, video file, or PowerPoint presentation.
+Each accepted upload gets one status message that is edited through the queue, download, media preparation, STT, note-generation, save, and delivery stages. A text progress bar and percentage remain visible throughout the job.
 
-### Admin commands
+Administrators get an additional **پنل مدیریت** button. Statistics, user listing, broadcast, ban, and unban are all available through buttons; actions requiring text or a user ID prompt for the next message and provide a cancel button.
 
-| Command | Description |
-|---|---|
-| `/users` | List up to 50 most recent users |
-| `/stats` | Usage statistics |
-| `/broadcast <message>` | Send a message to all non-banned users |
-| `/ban <user_id>` | Ban a user |
-| `/unban <user_id>` | Unban a user |
+The old `/help`, `/users`, `/stats`, `/broadcast`, `/ban`, and `/unban` commands remain available for backward compatibility and automation, but they are no longer required for normal use.
 
 Administrators are defined with:
 
@@ -509,7 +568,7 @@ Never commit secrets or runtime data. The following should remain local:
 
 ## Privacy
 
-Audio is sent to the configured STT provider. If Gemini is enabled, the following may be sent for note generation:
+Audio is sent to the configured STT provider. If a note-generation API is enabled, the following may be sent to that configured provider:
 
 - Transcript
 - Slide text
@@ -559,7 +618,9 @@ Gamas_bot/
 │   ├── database.py        # SQLite (aiosqlite) + migrations
 │   ├── media.py           # ffmpeg / ffprobe / LibreOffice helpers
 │   ├── presentations.py   # PowerPoint parsing and audio extraction
-│   ├── structuring.py     # Gemini note generation
+│   ├── progress.py        # editable per-job Telegram progress bars
+│   ├── logging_config.py  # text/JSON logging and file rotation
+│   ├── structuring.py     # provider-neutral note generation
 │   └── stt.py             # Speechmatics / Deepgram clients
 │
 ├── migrations/
@@ -573,6 +634,8 @@ Gamas_bot/
 │
 ├── deploy/
 │   └── gamas-bot.service  # systemd unit for Linux
+├── docs/
+│   └── DEPLOY_FA.md        # راهنمای فارسی استقرار و عیب‌یابی
 │
 ├── .env.example
 ├── .gitignore
@@ -584,29 +647,190 @@ Gamas_bot/
 
 ## Production Deployment
 
-Gamas Bot maintains a persistent Telethon/MTProto connection, so it must run as a long-lived process. It is not designed for stateless serverless environments or traditional shared hosting.
+> راهنمای کامل فارسی نصب، FFmpeg، LibreOffice، systemd و عیب‌یابی: [`docs/DEPLOY_FA.md`](docs/DEPLOY_FA.md)
 
-### Linux (systemd)
+Gamas Bot maintains a persistent Telethon/MTProto connection and does not expose an HTTP port. It must run as a long-lived worker. A VPS, dedicated server, container worker, or PaaS **background worker** is suitable; stateless functions (Vercel/Netlify/Lambda), sleeping free tiers, and traditional shared hosting are not.
 
-A ready-made unit file is provided in `deploy/gamas-bot.service`. It assumes the project lives in `/opt/gamas-bot` with a virtual environment in `/opt/gamas-bot/.venv` and runs as the `bot` user:
+For the default 2 GB upload limit, plan disk space for the original file, extracted media, converted presentation, and SQLite database. Start with at least 2 vCPU, 4 GB RAM, and 10–20 GB free disk, set `MAX_CONCURRENT_JOBS=1`, observe usage, and only then increase concurrency.
+
+### Ubuntu/Debian: complete systemd setup
+
+#### 1. Install OS packages
 
 ```bash
-sudo useradd --system --home /opt/gamas-bot bot
-sudo cp deploy/gamas-bot.service /etc/systemd/system/
+sudo apt update
+sudo apt install -y \
+  python3 python3-venv python3-pip git ca-certificates \
+  ffmpeg libreoffice-core libreoffice-impress \
+  fonts-dejavu-core fonts-noto-core
+```
+
+- `ffmpeg` also provides `ffprobe` and should include the `libopus` encoder on Ubuntu/Debian.
+- `libreoffice-impress` is only needed for legacy `ppt`, `pps`, `pot`, `odp`, and `otp` files. Native `pptx` parsing does not require LibreOffice.
+- Font packages prevent missing-character/font-substitution problems during headless LibreOffice conversion. Install any fonts used by your presentations as well.
+
+Verify the exact executables and codecs:
+
+```bash
+command -v ffmpeg ffprobe soffice
+ffmpeg -hide_banner -version
+ffprobe -hide_banner -version
+ffmpeg -hide_banner -encoders | grep -E 'libopus|pcm_s16le'
+soffice --headless --version
+```
+
+If a host installs binaries outside `PATH`, put absolute paths in `.env`:
+
+```dotenv
+FFMPEG_BIN=/usr/bin/ffmpeg
+FFPROBE_BIN=/usr/bin/ffprobe
+SOFFICE_BIN=/usr/bin/soffice
+```
+
+If LibreOffice cannot be installed, use `PPTX_LEGACY_ENABLED=false`. Native PPTX files and normal audio/video continue to work. If FFmpeg cannot be installed, video extraction, unusual audio normalization, and multi-clip presentation merging will not work.
+
+#### 2. Create a locked-down service account and install the app
+
+```bash
+sudo useradd --system --create-home --home-dir /opt/gamas-bot \
+  --shell /usr/sbin/nologin bot
+
+sudo git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git /opt/gamas-bot
+sudo chown -R bot:bot /opt/gamas-bot
+
+sudo -u bot python3 -m venv /opt/gamas-bot/.venv
+sudo -u bot /opt/gamas-bot/.venv/bin/pip install --upgrade pip
+sudo -u bot /opt/gamas-bot/.venv/bin/pip install -r /opt/gamas-bot/requirements.txt
+sudo -u bot mkdir -p /opt/gamas-bot/data/tmp /opt/gamas-bot/data/.cache
+
+sudo -u bot cp /opt/gamas-bot/.env.example /opt/gamas-bot/.env
+sudo chmod 600 /opt/gamas-bot/.env
+sudo nano /opt/gamas-bot/.env
+```
+
+Test once as the service user before enabling systemd:
+
+```bash
+cd /opt/gamas-bot
+sudo -u bot env HOME=/opt/gamas-bot/data \
+  XDG_CACHE_HOME=/opt/gamas-bot/data/.cache \
+  /opt/gamas-bot/.venv/bin/python -m gamas_bot
+```
+
+After the bot reports that it is online, stop this foreground test with `Ctrl+C`.
+
+#### 3. Install and start the systemd service
+
+The provided unit assumes `/opt/gamas-bot`, stores LibreOffice/fontconfig cache under writable `data/`, writes application output to journald, and restricts filesystem access:
+
+```bash
+sudo cp /opt/gamas-bot/deploy/gamas-bot.service /etc/systemd/system/gamas-bot.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now gamas-bot
+sudo systemctl status gamas-bot --no-pager -l
 sudo journalctl -u gamas-bot -f
 ```
 
-Adjust `WorkingDirectory`, `EnvironmentFile`, `ExecStart`, and `User`/`Group` in the unit file if your paths differ.
+Useful operations:
 
-### Windows
+```bash
+sudo systemctl restart gamas-bot
+sudo systemctl stop gamas-bot
+sudo journalctl -u gamas-bot --since today --no-pager
+sudo journalctl -u gamas-bot -p warning..alert --since '1 hour ago'
+```
 
-Recommended options:
+When updating:
 
-- Windows Task Scheduler
-- [NSSM](https://nssm.cc/)
-- Dedicated Windows server or VPS
+```bash
+sudo systemctl stop gamas-bot
+sudo -u bot git -C /opt/gamas-bot pull --ff-only
+sudo -u bot /opt/gamas-bot/.venv/bin/pip install -r /opt/gamas-bot/requirements.txt --upgrade
+sudo systemctl start gamas-bot
+```
+
+Back up `data/bot.sqlite3` **together with its `-wal` and `-shm` files while the service is stopped**, plus `.env`. The Telegram session can be recreated but backing up `data/telegram_bot.session` avoids a new login/session handshake.
+
+### FFmpeg details and troubleshooting
+
+FFmpeg is used to inspect streams, extract the first audio track from video, normalize unsupported codecs, and concatenate presentation narration. The bot executes argument arrays without a shell and enforces `FFMPEG_TIMEOUT_SECONDS`.
+
+Common checks:
+
+```bash
+# Does the input actually contain audio?
+ffprobe -v error -show_streams -show_format -of json /path/to/input.mp4
+
+# Can the service user write temporary files and run FFmpeg?
+sudo -u bot touch /opt/gamas-bot/data/tmp/write-test
+sudo -u bot /usr/bin/ffmpeg -hide_banner -version
+
+# Check disk and inode exhaustion
+df -h /opt/gamas-bot/data
+df -i /opt/gamas-bot/data
+```
+
+`Unknown encoder 'libopus'` means the host has a restricted FFmpeg build. Install the distribution's full `ffmpeg` package or set a build that includes libopus. `Permission denied` generally means the executable path or `data/tmp` ownership is wrong. Increase `FFMPEG_TIMEOUT_SECONDS` only after checking CPU load, disk throughput, and corrupt input files.
+
+### LibreOffice details and troubleshooting
+
+LibreOffice is always invoked headlessly with a unique temporary user profile, so parallel conversions do not contend for one profile lock. The systemd unit still assigns a writable `HOME` and `XDG_CACHE_HOME` for fontconfig and LibreOffice caches.
+
+Test conversion with a real legacy file:
+
+```bash
+sudo -u bot env HOME=/opt/gamas-bot/data \
+  XDG_CACHE_HOME=/opt/gamas-bot/data/.cache \
+  timeout 60 /usr/bin/soffice --headless --convert-to pptx \
+  --outdir /opt/gamas-bot/data/tmp /path/to/sample.ppt
+```
+
+If `soffice --version` works interactively but fails under systemd, check the service user's write permissions, `HOME`, `XDG_CACHE_HOME`, fonts, and `journalctl`. Hanging conversions are killed after `SOFFICE_TIMEOUT_SECONDS`; do not disable the timeout. Minimal containers may also need `libreoffice-core`, `libreoffice-impress`, fontconfig, and at least one font package—not only the `soffice` launcher.
+
+### PaaS and containers
+
+Configure the process as a worker command:
+
+```text
+python -m gamas_bot
+```
+
+The image/build layer must install FFmpeg and LibreOffice; Python packages alone are insufficient. Mount a persistent volume at `/app/data` (or update `DATABASE_PATH`, `TELEGRAM_SESSION_PATH`, and `TEMP_DIR`). Do not run more than one replica against the same Telegram session or SQLite file. Local model URLs such as `127.0.0.1:11434` only work if that model server runs in the same container/VM; otherwise use its private network hostname.
+
+### Windows hosting
+
+Use a dedicated Windows server/VPS with one of:
+
+- Windows Task Scheduler (run whether the user is logged on or not)
+- [NSSM](https://nssm.cc/) as a Windows service wrapper
+- Another process supervisor that restarts failed workers
+
+Install FFmpeg and LibreOffice with WinGet, use their full `.exe` paths in `.env` if services have a different `PATH`, grant the service account modify permission on `data`, and redirect stdout/stderr or set `LOG_FILE=data/logs/bot.log`.
+
+### Logging and error handling
+
+Default production logs go to stdout/journald and include provider attempts, durations, external-tool exit codes, job IDs, migrations, startup dependency checks, retry events, and tracebacks. Transcript/prompt contents and API keys are not intentionally logged. Users receive a stable reference such as `GMS-000123` on job failure; search it together with the submission ID in server logs.
+
+```dotenv
+LOG_LEVEL=INFO                 # DEBUG, INFO, WARNING, ERROR, CRITICAL
+LOG_FORMAT=text                # text or one-JSON-object-per-line
+LOG_FILE=                      # empty for journald; or data/logs/bot.log
+LOG_MAX_BYTES=10000000
+LOG_BACKUP_COUNT=5
+```
+
+When `LOG_FILE` is set, Python performs size-based rotation internally. Do not configure a second `logrotate` rule for the same file. For central collection (Loki, ELK, Cloud Logging), prefer `LOG_FORMAT=json` and stdout.
+
+Troubleshooting sequence:
+
+1. `systemctl status gamas-bot -l`
+2. `journalctl -u gamas-bot -n 200 --no-pager`
+3. Verify `.env` ownership/mode and all three executable paths.
+4. Run the exact foreground test as the `bot` user.
+5. Check disk/RAM and API `401`, `403`, `429`, or `5xx` entries.
+6. Use the user's `GMS-...` reference to identify the failed submission.
+
+A `status=203/EXEC` systemd error means `ExecStart` is wrong or the virtual environment is missing. A SQLite `readonly database` error means the `bot` user cannot write `data/` (or `ReadWritePaths` does not match your customized path). Repeated API `429` errors require lower concurrency/rate, a larger provider quota, or a longer retry window—not a process restart.
 
 ---
 

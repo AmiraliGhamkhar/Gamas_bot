@@ -210,8 +210,23 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
     outcomes: list[Transcript] = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for index, engine in enumerate(available):
+            started = time.monotonic()
+            logger.info(
+                "STT attempt started provider=%s file_bytes=%s attempt=%s/%s",
+                engine,
+                audio_path.stat().st_size,
+                index + 1,
+                len(available),
+            )
             try:
                 transcript = await providers[engine](session, audio_path, settings)
+                logger.info(
+                    "STT attempt completed provider=%s elapsed_seconds=%.3f confidence=%s text_chars=%s",
+                    engine,
+                    time.monotonic() - started,
+                    transcript.confidence,
+                    len(transcript.text),
+                )
                 outcomes.append(transcript)
                 is_low = (
                     transcript.confidence is not None
@@ -227,7 +242,11 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.exception("STT provider %s failed", engine)
+                logger.exception(
+                    "STT provider failed provider=%s elapsed_seconds=%.3f",
+                    engine,
+                    time.monotonic() - started,
+                )
                 failures.append(f"{engine}: {exc}")
                 if index == len(available) - 1 and not outcomes:
                     raise STTError("؛ ".join(failures)) from exc

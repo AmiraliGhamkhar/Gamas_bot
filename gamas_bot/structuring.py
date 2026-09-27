@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import logging
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
 
@@ -67,47 +71,203 @@ PRESENTATION_PROMPT = """شما دستیار آموزشی فارسی هستید.
 """
 
 
-async def _structure_chunk(
-    chunk: str, settings: Settings, session: aiohttp.ClientSession, prompt: str = PROMPT
-) -> str:
-    assert settings.gemini_api_key
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{settings.gemini_model}:generateContent"
-    )
-    payload = {
-        "contents": [{"role": "user", "parts": [{"text": prompt + chunk}]}],
-        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
-    }
-    async with session.post(
-        url,
-        params={"key": settings.gemini_api_key},
-        json=payload,
-    ) as response:
-        if response.status != 200:
-            detail = (await response.text())[:600]
-            raise StructuringError(f"Gemini خطا داد ({response.status}): {detail}")
-        data = await response.json(content_type=None)
+RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
+
+
+def _endpoint(base_url: str, suffix: str) -> str:
+    """Append an API path without breaking an exact endpoint's query string."""
+    parsed = urlsplit(base_url)
+    base_path = parsed.path.rstrip("/")
+    suffix_path = "/" + suffix.strip("/")
+    path = base_path if base_path.endswith(suffix_path) else base_path + suffix_path
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
+def _retry_delay(response: aiohttp.ClientResponse, attempt: int) -> float:
+    """Respect Retry-After while keeping a bounded exponential fallback."""
+    raw = response.headers.get("Retry-After", "").strip()
+    if raw:
+        try:
+            return min(max(float(raw), 0.25), 30.0)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(raw)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=timezone.utc)
+                delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+                return min(max(delay, 0.25), 30.0)
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return min(2 ** attempt, 15.0)
+
+
+def _provider_request(
+    chunk: str, settings: Settings, prompt: str
+) -> tuple[str, dict[str, str], dict, dict[str, str]]:
+    """Build a request for Gemini, Anthropic, or an OpenAI-compatible endpoint."""
+    provider = settings.note_api_provider
+    key = settings.effective_note_api_key
+    model = settings.effective_note_model
+    extra_headers = dict(settings.note_api_extra_headers)
+    full_prompt = prompt + chunk
+
+    if provider == "gemini":
+        if not key:
+            raise StructuringError("کلید NOTE_API_KEY یا GEMINI_API_KEY تنظیم نشده است.")
+        base = settings.note_api_base_url or "https://generativelanguage.googleapis.com/v1beta"
+        url = _endpoint(base, f"models/{quote(model, safe='')}:generateContent")
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": settings.note_api_max_output_tokens,
+            },
+        }
+        return url, extra_headers, payload, {"key": key}
+
+    if provider == "openai_compatible":
+        base = settings.note_api_base_url or "https://api.openai.com/v1"
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        headers.update(extra_headers)
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": "پاسخ را دقیقاً طبق دستور کاربر تولید کن."},
+                {"role": "user", "content": full_prompt},
+            ],
+            "temperature": 0.2,
+            "max_tokens": settings.note_api_max_output_tokens,
+        }
+        return _endpoint(base, "chat/completions"), headers, payload, {}
+
+    if provider == "anthropic":
+        if not key:
+            raise StructuringError("برای Anthropic باید NOTE_API_KEY تنظیم شود.")
+        base = settings.note_api_base_url or "https://api.anthropic.com/v1"
+        headers = {
+            "x-api-key": key,
+            "anthropic-version": "2023-06-01",
+        }
+        headers.update(extra_headers)
+        payload = {
+            "model": model,
+            "max_tokens": settings.note_api_max_output_tokens,
+            "temperature": 0.2,
+            "messages": [{"role": "user", "content": full_prompt}],
+        }
+        return _endpoint(base, "messages"), headers, payload, {}
+
+    raise StructuringError("سرویس تولید جزوه غیرفعال است.")
+
+
+def _provider_response(payload: dict, provider: str) -> str:
+    """Normalize supported provider responses to plain text."""
     try:
-        text = "".join(
-            part.get("text", "")
-            for part in data["candidates"][0]["content"]["parts"]
-        ).strip()
-    except (KeyError, IndexError, TypeError) as exc:
-        raise StructuringError("پاسخ Gemini خالی یا نامعتبر است.") from exc
+        if provider == "gemini":
+            parts = payload["candidates"][0]["content"]["parts"]
+            text = "".join(str(part.get("text", "")) for part in parts)
+        elif provider == "anthropic":
+            text = "".join(
+                str(part.get("text", ""))
+                for part in payload["content"]
+                if part.get("type") == "text"
+            )
+        else:
+            content = payload["choices"][0]["message"]["content"]
+            if isinstance(content, list):
+                text = "".join(
+                    str(part.get("text", ""))
+                    for part in content
+                    if isinstance(part, dict)
+                )
+            else:
+                text = "" if content is None else str(content)
+    except (AttributeError, KeyError, IndexError, TypeError) as exc:
+        raise StructuringError("پاسخ سرویس تولید جزوه خالی یا نامعتبر است.") from exc
+    text = text.strip()
     if not text:
-        raise StructuringError("پاسخ Gemini خالی بود.")
+        raise StructuringError("پاسخ سرویس تولید جزوه خالی بود.")
     return text
 
 
+async def _structure_chunk(
+    chunk: str, settings: Settings, session: aiohttp.ClientSession, prompt: str = PROMPT
+) -> str:
+    url, headers, payload, params = _provider_request(chunk, settings, prompt)
+    provider = settings.note_api_provider
+    attempts = settings.note_api_retries + 1
+    for attempt in range(attempts):
+        try:
+            async with session.post(
+                url, headers=headers, params=params, json=payload
+            ) as response:
+                if (
+                    response.status in RETRYABLE_HTTP_STATUSES
+                    or 500 <= response.status < 600
+                ) and attempt + 1 < attempts:
+                    delay = _retry_delay(response, attempt)
+                    await response.read()
+                    logger.warning(
+                        "Note API transient failure provider=%s status=%s retry=%s/%s delay=%.1fs",
+                        provider,
+                        response.status,
+                        attempt + 1,
+                        settings.note_api_retries,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                if response.status < 200 or response.status >= 300:
+                    # Do not log response bodies: some gateways echo portions of
+                    # the prompt. A status and provider request ID are enough to
+                    # correlate the failure without exposing lecture content.
+                    await response.read()
+                    request_id = (
+                        response.headers.get("x-request-id")
+                        or response.headers.get("request-id")
+                        or "unknown"
+                    )
+                    logger.error(
+                        "Note API request failed provider=%s status=%s request_id=%s",
+                        provider,
+                        response.status,
+                        request_id,
+                    )
+                    raise StructuringError(
+                        f"سرویس {provider} خطای HTTP {response.status} داد."
+                    )
+                data = await response.json(content_type=None)
+                return _provider_response(data, provider)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt + 1 >= attempts:
+                raise StructuringError(
+                    f"ارتباط با سرویس تولید جزوه ({provider}) برقرار نشد."
+                ) from exc
+            delay = min(2 ** attempt, 15.0)
+            logger.warning(
+                "Note API network failure provider=%s retry=%s/%s delay=%.1fs: %s",
+                provider,
+                attempt + 1,
+                settings.note_api_retries,
+                delay,
+                type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
+    raise StructuringError("سرویس تولید جزوه پاسخی برنگرداند.")
+
+
 async def structure_transcript(text: str, settings: Settings) -> str:
-    """Provider-isolated LLM entry point; currently uses Gemini 2.5 Flash-Lite."""
+    """Turn a transcript into notes with the configured provider."""
     if not text.strip():
         raise StructuringError("متن پیاده‌سازی‌شده خالی است.")
-    if not settings.gemini_api_key:
-        raise StructuringError("کلید GEMINI_API_KEY تنظیم نشده است.")
+    if settings.note_api_provider == "disabled":
+        raise StructuringError("سرویس تولید جزوه غیرفعال است.")
     chunks = split_transcript(text)
-    timeout = aiohttp.ClientTimeout(total=240, connect=30, sock_read=180)
+    timeout = aiohttp.ClientTimeout(
+        total=settings.note_api_timeout,
+        connect=min(30, settings.note_api_timeout),
+        sock_read=settings.note_api_timeout,
+    )
     outputs: list[str] = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for index, chunk in enumerate(chunks, start=1):
@@ -138,8 +298,8 @@ async def structure_presentation(
     """Build a slide-ordered booklet from slide text plus narration transcript."""
     if not outline.strip() and not transcript.strip():
         raise StructuringError("محتوای قابل‌استفاده‌ای از فایل ارائه به دست نیامد.")
-    if not settings.gemini_api_key:
-        raise StructuringError("کلید GEMINI_API_KEY تنظیم نشده است.")
+    if settings.note_api_provider == "disabled":
+        raise StructuringError("سرویس تولید جزوه غیرفعال است.")
 
     # The outline is repeated in every chunk so each request keeps slide context;
     # it is trimmed first so a long deck cannot crowd out the transcript.
@@ -153,7 +313,11 @@ async def structure_presentation(
     transcript_budget = max(2000, max_chars - len(trimmed_outline) - 500)
     chunks = split_transcript(transcript, transcript_budget) or [""]
 
-    timeout = aiohttp.ClientTimeout(total=240, connect=30, sock_read=180)
+    timeout = aiohttp.ClientTimeout(
+        total=settings.note_api_timeout,
+        connect=min(30, settings.note_api_timeout),
+        sock_read=settings.note_api_timeout,
+    )
     outputs: list[str] = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
         for index, chunk in enumerate(chunks, start=1):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from typing import Any
 import aiosqlite
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
+logger = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
@@ -29,12 +31,21 @@ class Database:
         await self._conn.execute("PRAGMA busy_timeout=5000")
         await self._apply_migrations()
         async with self._lock:
+            cursor = await self._conn.execute(
+                "SELECT COUNT(*) FROM audio_submissions WHERE status IN ('pending', 'processing')"
+            )
+            interrupted = int((await cursor.fetchone())[0])
             await self._conn.execute(
                 "UPDATE audio_submissions SET status='failed', "
                 "error_message='پردازش با راه‌اندازی مجدد متوقف شد' "
                 "WHERE status IN ('pending', 'processing')"
             )
             await self._conn.commit()
+        logger.info(
+            "Database opened path=%s interrupted_jobs_marked_failed=%s",
+            self.path,
+            interrupted,
+        )
 
     async def _apply_migrations(self) -> None:
         """Apply every migration file once, in filename order."""
@@ -55,6 +66,7 @@ class Database:
                 (migration.name, utc_now()),
             )
             await db.commit()
+            logger.info("Database migration applied name=%s", migration.name)
 
     async def close(self) -> None:
         if self._conn is not None:

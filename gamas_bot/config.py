@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -40,6 +42,17 @@ class Settings:
     max_concurrent_jobs: int
     stt_poll_interval: float
     stt_job_timeout: int
+    # The historical Gemini fields remain for backwards compatibility.  New
+    # installations can select Gemini, Anthropic, or any OpenAI-compatible API
+    # through the provider-neutral NOTE_API_* settings below.
+    note_api_provider: str = "gemini"
+    note_api_key: str | None = None
+    note_api_base_url: str | None = None
+    note_api_model: str | None = None
+    note_api_extra_headers: tuple[tuple[str, str], ...] = ()
+    note_api_timeout: int = 240
+    note_api_retries: int = 2
+    note_api_max_output_tokens: int = 8192
     presentation_enabled: bool = True
     presentation_include_slide_text: bool = True
     presentation_include_video_audio: bool = True
@@ -55,6 +68,30 @@ class Settings:
     soffice_bin: str = "soffice"
     ffmpeg_timeout: int = 3600
     soffice_timeout: int = 600
+    log_level: str = "INFO"
+    log_format: str = "text"
+    log_file: Path | None = None
+    log_max_bytes: int = 10_000_000
+    log_backup_count: int = 5
+
+    @property
+    def effective_note_api_key(self) -> str | None:
+        """Return the provider-neutral key, falling back to the legacy Gemini key."""
+        if self.note_api_key:
+            return self.note_api_key
+        if self.note_api_provider == "gemini":
+            return self.gemini_api_key
+        return None
+
+    @property
+    def effective_note_model(self) -> str:
+        if self.note_api_model:
+            return self.note_api_model
+        if self.note_api_provider == "gemini":
+            return self.gemini_model
+        if self.note_api_provider == "anthropic":
+            return "claude-3-5-haiku-latest"
+        return "gpt-4o-mini"
 
     @classmethod
     def from_env(cls, env_file: str | Path = ".env") -> "Settings":
@@ -77,18 +114,65 @@ class Settings:
         language = (os.getenv("STT_LANGUAGE", "fa").strip() or "fa")
         if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?", language):
             raise ValueError("STT_LANGUAGE باید کد زبان معتبر مانند fa یا en-US باشد.")
+
+        note_provider = os.getenv("NOTE_API_PROVIDER", "gemini").strip().lower()
+        note_provider = {
+            "openai": "openai_compatible",
+            "openai-compatible": "openai_compatible",
+            "custom": "openai_compatible",
+            "none": "disabled",
+            "off": "disabled",
+        }.get(note_provider, note_provider)
+        if note_provider not in {"gemini", "openai_compatible", "anthropic", "disabled"}:
+            raise ValueError(
+                "NOTE_API_PROVIDER باید یکی از gemini، openai_compatible، anthropic یا disabled باشد."
+            )
+        note_base_url = os.getenv("NOTE_API_BASE_URL", "").strip() or None
+        if note_base_url:
+            parsed_url = urlparse(note_base_url)
+            if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
+                raise ValueError("NOTE_API_BASE_URL باید یک نشانی کامل http یا https باشد.")
+        try:
+            extra_headers_value = json.loads(
+                os.getenv("NOTE_API_EXTRA_HEADERS_JSON", "{}").strip() or "{}"
+            )
+        except json.JSONDecodeError as exc:
+            raise ValueError("NOTE_API_EXTRA_HEADERS_JSON باید یک JSON object معتبر باشد.") from exc
+        if not isinstance(extra_headers_value, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in extra_headers_value.items()
+        ):
+            raise ValueError("NOTE_API_EXTRA_HEADERS_JSON فقط باید شامل کلید و مقدار متنی باشد.")
+        note_headers = tuple((key, value) for key, value in extra_headers_value.items())
+
         try:
             min_confidence = float(os.getenv("STT_MIN_CONFIDENCE", "0.65"))
             max_file_size = int(os.getenv("MAX_FILE_SIZE_BYTES", "2000000000"))
             max_jobs = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
             poll_interval = float(os.getenv("STT_POLL_INTERVAL_SECONDS", "5"))
             job_timeout = int(os.getenv("STT_JOB_TIMEOUT_SECONDS", "21600"))
+            note_timeout = int(os.getenv("NOTE_API_TIMEOUT_SECONDS", "240"))
+            note_retries = int(os.getenv("NOTE_API_RETRIES", "2"))
+            note_max_tokens = int(os.getenv("NOTE_API_MAX_OUTPUT_TOKENS", "8192"))
+            log_max_bytes = int(os.getenv("LOG_MAX_BYTES", "10000000"))
+            log_backup_count = int(os.getenv("LOG_BACKUP_COUNT", "5"))
         except ValueError as exc:
             raise ValueError("مقادیر عددی تنظیمات محیط معتبر نیستند.") from exc
         if not 0 <= min_confidence <= 1:
             raise ValueError("STT_MIN_CONFIDENCE باید بین صفر و یک باشد.")
-        if min(max_file_size, max_jobs, poll_interval, job_timeout) <= 0:
+        if min(max_file_size, max_jobs, poll_interval, job_timeout, note_timeout, note_max_tokens) <= 0:
             raise ValueError("اندازه فایل، هم‌زمانی و زمان‌های انتظار باید مثبت باشند.")
+        if note_retries < 0 or note_retries > 10:
+            raise ValueError("NOTE_API_RETRIES باید بین صفر تا ۱۰ باشد.")
+        if log_max_bytes <= 0 or log_backup_count < 0:
+            raise ValueError("تنظیمات چرخش فایل لاگ معتبر نیستند.")
+        log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+        if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
+            raise ValueError("LOG_LEVEL باید DEBUG، INFO، WARNING، ERROR یا CRITICAL باشد.")
+        log_format = os.getenv("LOG_FORMAT", "text").strip().lower() or "text"
+        if log_format not in {"text", "json"}:
+            raise ValueError("LOG_FORMAT فقط می‌تواند text یا json باشد.")
+        log_file_value = os.getenv("LOG_FILE", "").strip()
 
         try:
             min_clip = float(os.getenv("PPTX_MIN_CLIP_SECONDS", "1.0"))
@@ -132,6 +216,14 @@ class Settings:
             max_concurrent_jobs=max_jobs,
             stt_poll_interval=poll_interval,
             stt_job_timeout=job_timeout,
+            note_api_provider=note_provider,
+            note_api_key=(os.getenv("NOTE_API_KEY", "").strip() or None),
+            note_api_base_url=note_base_url,
+            note_api_model=(os.getenv("NOTE_API_MODEL", "").strip() or None),
+            note_api_extra_headers=note_headers,
+            note_api_timeout=note_timeout,
+            note_api_retries=note_retries,
+            note_api_max_output_tokens=note_max_tokens,
             presentation_enabled=_flag("PPTX_ENABLED", True),
             presentation_include_slide_text=_flag("PPTX_INCLUDE_SLIDE_TEXT", True),
             presentation_include_video_audio=_flag("PPTX_INCLUDE_VIDEO_AUDIO", True),
@@ -147,6 +239,11 @@ class Settings:
             soffice_bin=os.getenv("SOFFICE_BIN", "soffice").strip() or "soffice",
             ffmpeg_timeout=ffmpeg_timeout,
             soffice_timeout=soffice_timeout,
+            log_level=log_level,
+            log_format=log_format,
+            log_file=Path(log_file_value) if log_file_value else None,
+            log_max_bytes=log_max_bytes,
+            log_backup_count=log_backup_count,
         )
 
     def validate_runtime(self) -> None:
