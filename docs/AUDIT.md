@@ -1,5 +1,21 @@
 # Repository review — 2026-09-28 (accuracy-first pipeline hardening)
 
+## Follow-up verification — 2026-09-28
+
+A post-review pass over the current checkout found and fixed one issue in the
+Speechmatics result path: after downloading and logging the complete `json-v2`
+transcript, `_speechmatics()` made a second identical request and parsed that
+response instead. It now parses the already-downloaded payload once, uses that
+same payload for confidence metrics, and rejects malformed top-level response
+shapes with a sanitized provider error. The regression test asserts exactly one
+transcript download per completed job.
+
+Validation on this checkout: `python -m unittest discover -s tests -v` — **220
+passed**; `ruff check gamas_bot scripts tests --select E9,F`,
+`python -m pip check`, `compileall`, and `git diff --check` pass. These counts
+are current for this follow-up; the historical result figures in the sections
+below describe their original review snapshots.
+
 ## Scope and result
 
 Focused re-audit of the **transcription → note-generation** path (`stt.py`,

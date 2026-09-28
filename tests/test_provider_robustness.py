@@ -348,7 +348,7 @@ class STTMetricsLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_speechmatics_polling_and_job_lifecycle_are_logged(self):
         from gamas_bot.stt import _speechmatics
 
-        polls = {"count": 0}
+        polls = {"count": 0, "transcript_downloads": 0}
 
         class FakeResponse:
             def __init__(self, status, payload):
@@ -371,6 +371,7 @@ class STTMetricsLoggingTests(unittest.IsolatedAsyncioTestCase):
 
             def get(self, url, **_kwargs):
                 if "/transcript" in url:
+                    polls["transcript_downloads"] += 1
                     return FakeResponse(
                         200,
                         {
@@ -392,6 +393,7 @@ class STTMetricsLoggingTests(unittest.IsolatedAsyncioTestCase):
         ) as logs:
             transcript = await _speechmatics(FakeSession(), Path(audio.name), settings)
         self.assertEqual(transcript.text, "سلام")
+        self.assertEqual(polls["transcript_downloads"], 1)
         joined = "\n".join(logs.output)
         self.assertIn("Speechmatics job submitted", joined)
         self.assertIn("job_id=job-123", joined)
