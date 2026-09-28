@@ -4,7 +4,7 @@
 
 Gamas Bot is a Python-based Telegram bot built with [Telethon](https://github.com/LonamiWebs/Telethon) (MTProto) for processing Persian lectures.
 
-It accepts audio, voice messages, videos, and PowerPoint presentations, converts speech to text using **Speechmatics** or **Deepgram**, and optionally generates structured lecture notes using **Gemini, Anthropic, or any OpenAI-compatible API** (OpenAI, OpenRouter, Groq, Together, DeepSeek, Ollama, vLLM, and similar services).
+It accepts audio, voice messages, videos, and PowerPoint presentations, converts speech to text using **Speechmatics**, **Deepgram**, or an optional **OpenAI-compatible STT endpoint**, and optionally generates structured lecture notes using **Gemini, Anthropic, or any OpenAI-compatible API** (OpenAI, OpenRouter, Groq, Together, DeepSeek, Ollama, vLLM, and similar services).
 
 > Repository review and validation notes: [`docs/AUDIT.md`](docs/AUDIT.md).
 
@@ -19,8 +19,8 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 - Slide audio extraction and merging
 - Slide text and speaker-note extraction
 - Slide-by-slide lecture notes
-- Speechmatics + Deepgram STT
-- Configurable STT fallback
+- Speechmatics + Deepgram STT, plus optional OpenAI-compatible STT
+- Configurable STT fallback and per-provider upload-size routing
 - Provider-neutral note generation (Gemini, Anthropic, OpenAI-compatible APIs)
 - Inline glass-button menus for users and administrators
 - Per-job editable progress bars
@@ -90,7 +90,7 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 - Python 3.11+
 - Telegram bot token
 - Telegram API ID + API hash
-- At least one STT API key (Speechmatics or Deepgram)
+- At least one STT credential (Speechmatics key, Deepgram key, or an OpenAI-compatible STT endpoint)
 - A note-generation API (Gemini, Anthropic, or OpenAI-compatible; optional)
 
 No system media or office software is required: stream probing, audio
@@ -201,6 +201,12 @@ TELEGRAM_API_HASH=...
 |---|---|---|
 | Speechmatics | Primary STT engine (default) | <https://portal.speechmatics.com/> |
 | Deepgram | Alternative/fallback STT engine | <https://console.deepgram.com/> |
+| OpenAI-compatible STT | Optional engine (`POST /audio/transcriptions`): OpenAI, Groq, or a local vLLM/Ollama gateway | your endpoint |
+
+The note-generation and STT layers are both provider-extensible: each STT
+engine is one entry in a registry with an availability check and its
+direct-upload size cap, so a future engine can join the fallback chain without
+rewriting the pipeline.
 
 ### Note generation (provider-neutral)
 
@@ -262,7 +268,7 @@ NOTE_API_RETRIES=2
 NOTE_API_MAX_OUTPUT_TOKENS=8192
 ```
 
-Transient `429` and `5xx` responses and network failures are retried with bounded backoff. Provider error bodies are not logged. Gemini authentication uses a header rather than a URL query parameter. If a provider explicitly reports an output-token limit, the incomplete note is rejected and the bot delivers the extracted source material instead. Increase `NOTE_API_MAX_OUTPUT_TOKENS` only within the selected model’s limits.
+Transient `429` and `5xx` responses and network failures are retried with bounded backoff. Raw provider error bodies are never logged, but on a failed request the bot parses the provider's structured error metadata (Gemini `error.status`/`details[].reason`, OpenAI `error.type`/`code`, and the bounded error message) and logs it with the key redacted — so a Gemini `HTTP 400` such as `API_KEY_INVALID` is visible and fixable in the logs without exposing keys or lecture content. Gemini authentication uses a header rather than a URL query parameter, and a `models/`-prefixed model name is accepted and normalized. Responses blocked by provider safety filters are reported with their block reason. If a provider explicitly reports an output-token limit, the incomplete note is rejected and the bot delivers the extracted source material instead. Increase `NOTE_API_MAX_OUTPUT_TOKENS` only within the selected model’s limits.
 
 ---
 
@@ -278,7 +284,29 @@ STT_FALLBACK_ENABLED=true
 STT_MIN_CONFIDENCE=0.65
 
 SPEECHMATICS_BASE_URL=https://eu1.asr.api.speechmatics.com/v2
+SPEECHMATICS_MODEL=enhanced
+# Optional custom dictionary for drug names / technical terms (comma separated)
+SPEECHMATICS_ADDITIONAL_VOCAB=
+
 DEEPGRAM_MODEL=nova-3
+```
+
+The pipeline is accuracy-first: `SPEECHMATICS_MODEL=enhanced` is the default
+because Speechmatics documents it as the highest-accuracy tier; set `standard`
+only if your account lacks the enhanced tier or throughput matters more.
+`SPEECHMATICS_ADDITIONAL_VOCAB` feeds the provider's native custom dictionary
+(up to 20,000 terms) — useful for Persian lectures full of English drug names
+and technical vocabulary; it is a Speechmatics feature, not an LLM layer.
+
+An optional third STT engine works with any OpenAI-compatible
+`POST /audio/transcriptions` endpoint (OpenAI, Groq, or a self-hosted
+vLLM/Ollama gateway), as a primary or a fallback:
+
+```dotenv
+STT_OPENAI_BASE_URL=https://api.openai.com/v1   # empty = engine disabled
+STT_OPENAI_API_KEY=                             # optional for local endpoints
+STT_OPENAI_MODEL=whisper-1
+STT_OPENAI_MAX_UPLOAD_BYTES=25000000
 ```
 
 ### Primary engine
@@ -311,11 +339,15 @@ budget; this is not a timeout for the whole Telegram job. Socket-level timeouts
 can fail earlier. A local timeout does not delete a Speechmatics job already
 submitted to the provider.
 
-If only the secondary provider has a key, it is used even with fallback disabled.
-Files of at least 1,000,000,000 bytes are routed to Deepgram and require its key;
-this size-routing rule also applies when fallback is disabled. Provider/model
-availability, language support, quotas and accepted upload sizes should be
-confirmed for your account before production use.
+If only a non-primary provider is configured, it is used even with fallback
+disabled. Every engine has a direct-upload size cap (Speechmatics 1 GB,
+Deepgram 2 GB, OpenAI-compatible STT `STT_OPENAI_MAX_UPLOAD_BYTES`): files at
+or above a provider's cap are routed to another configured engine that accepts
+them, and the job fails fast with a clear message when no engine can take the
+file. Audio is never split into chunks for STT, because chunking loses word
+context at every boundary. Provider/model availability, language support,
+quotas and accepted upload sizes should be confirmed for your account before
+production use.
 
 > Confidence scores from different providers are not necessarily calibrated against each other. Tune this threshold using your own validation dataset.
 
@@ -578,13 +610,16 @@ python -m scripts.benchmark_stt `
     --output results.csv
 ```
 
-The benchmark compares:
+The benchmark runs every **configured** engine (Speechmatics, Deepgram, and an
+OpenAI-compatible endpoint when `STT_OPENAI_BASE_URL` is set) on the same files
+and compares:
 
 - Response time
-- Provider confidence
+- Provider confidence (where reported)
 - Normalized Persian WER
+- Per-sample success/failure status, so failure rate can be derived
 
-Persian normalization includes `ي → ی` and `ك → ک` (plus diacritics and punctuation removal). The benchmark does not store full transcripts in the CSV report. Samples at or above the Speechmatics direct-upload threshold are recorded as failed for that engine, not silently benchmarked through Deepgram under the wrong label. Output parent directories are created automatically.
+Persian normalization includes `ي → ی` and `ك → ک` (plus diacritics and punctuation removal). The benchmark does not store full transcripts in the CSV report. Samples at or above an engine's direct-upload threshold are recorded as failed for that engine, not silently benchmarked through another provider under the wrong label. Output parent directories are created automatically.
 
 ---
 

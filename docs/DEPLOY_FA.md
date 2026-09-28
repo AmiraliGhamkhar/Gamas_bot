@@ -179,6 +179,36 @@ NOTE_API_EXTRA_HEADERS_JSON='{"HTTP-Referer":"https://example.com","X-Title":"Ga
 
 خطاهای شبکه و پاسخ‌های `429` و `5xx` با Backoff محدود Retry می‌شوند. با وجود شکست API ساخت جزوه، متن استخراج‌شده از بین نمی‌رود و به‌عنوان خروجی جایگزین ارسال می‌شود.
 
+### عیب‌یابی خطای HTTP 400 (مثلاً Gemini)
+
+در صورت شکست، بدنهٔ خام پاسخ سرویس لاگ نمی‌شود، اما اطلاعات ساخت‌یافتهٔ خطا (مانند `INVALID_ARGUMENT` و کد `API_KEY_INVALID` در خطای معروف «API key not valid» گوگل، یا `authentication_error`/`invalid_api_key` در سرویس‌های سازگار با OpenAI) با حذف کلید از متن، در لاگ ثبت می‌شود:
+
+```bash
+sudo journalctl -u gamas-bot -n 200 --no-pager | grep 'Note API request failed'
+```
+
+رایج‌ترین علت‌های HTTP 400 در Gemini: اشتباه بودن یا خالی بودن کلید (`API_KEY_INVALID` — گوگل به‌جای 401، کد 400 برمی‌گرداند)، محدودیت Referrer روی کلید، فعال نبودن Generative Language API در پروژه، یا سقف توکن خروجی نامعتبر برای مدل انتخابی. نوشتن `NOTE_API_MODEL=gemini-2.5-flash-lite` کافی است؛ پیشوند `models/` هم پذیرفته و خودکار اصلاح می‌شود.
+
+### موتورهای STT
+
+علاوه بر Speechmatics و Deepgram می‌توانید یک endpoint سازگار با OpenAI (`POST /audio/transcriptions`) را به‌عنوان موتور اصلی یا جایگزین فعال کنید:
+
+```dotenv
+STT_PRIMARY=speechmatics           # یا deepgram یا openai_compatible
+STT_OPENAI_BASE_URL=https://api.groq.com/openai/v1
+STT_OPENAI_API_KEY=...
+STT_OPENAI_MODEL=whisper-large-v3
+```
+
+Speechmatics به‌صورت پیش‌فرض با مدل `enhanced` (بالاترین دقت سرویس) کار می‌کند:
+
+```dotenv
+SPEECHMATICS_MODEL=enhanced
+SPEECHMATICS_ADDITIONAL_VOCAB=Metformin, Insulin, MRI, HbA1c
+```
+
+اگر حساب شما سطح enhanced را نداشته باشد، ثبت Job رد می‌شود؛ با موتور جایگزین کار ادامه می‌یابد و می‌توانید مدل را به `standard` برگردانید. فایل‌های بزرگ‌تر از سقف آپلود مستقیم یک موتور (۱GB برای Speechmatics، ‌۲GB برای Deepgram، `STT_OPENAI_MAX_UPLOAD_BYTES` برای سرویس سازگار) به موتور پیکربندی‌شدهٔ بعدی سپرده می‌شوند؛ فایل صوتی برای STT تکه تکه نمی‌شود تا دقت کلمات در مرز قطعه‌ها افت نکند.
+
 ## لاگینگ و پیگیری خطا
 
 تنظیمات پیشنهادی systemd:
@@ -193,7 +223,7 @@ LOG_BACKUP_COUNT=5
 
 با `LOG_FILE=` خالی، لاگ‌ها در journald قرار می‌گیرند. برای Loki/ELK/Cloud Logging می‌توانید `LOG_FORMAT=json` را انتخاب کنید. اگر `LOG_FILE=data/logs/bot.log` تنظیم شود، خود برنامه فایل را بر اساس حجم Rotate می‌کند و نیازی به logrotate جداگانه نیست.
 
-لاگ‌ها شامل شماره Job، زمان سرویس‌های STT، وضعیت و Request ID سرویس ساخت جزوه، زمان و Exit Code ابزارهای خارجی، Migrationهای دیتابیس و Stack Trace هستند. بدنهٔ پاسخ خطای سرویس‌ها لاگ نمی‌شود؛ خطای STT با نوع خطا یا وضعیت HTTP ثبت می‌شود. کلید Gemini در Header ارسال می‌شود، نه Query نشانی. کلید API، Prompt و متن جزوه عمداً لاگ نمی‌شوند؛ با این حال دسترسی به لاگ‌ها و فایل‌های داده را محدود نگه دارید.
+لاگ‌ها شامل شماره Job، زمان سرویس‌های STT، وضعیت و Request ID سرویس ساخت جزوه، زمان و Exit Code ابزارهای خارجی، Migrationهای دیتابیس و Stack Trace هستند. بدنهٔ خام پاسخ خطای سرویس‌ها لاگ نمی‌شود، اما اطلاعات ساخت‌یافتهٔ خطای سرویس ساخت جزوه (وضعیت/نوع خطا، کد علت و پیام محدودشدهٔ سرویس) با حذف کلید API ثبت می‌شود تا خطاهایی مانند HTTP 400 قابل‌عیب‌یابی باشند. خطای STT با نوع خطا یا وضعیت HTTP ثبت می‌شود. کلید Gemini در Header ارسال می‌شود، نه Query نشانی. کلید API، Prompt و متن جزوه عمداً لاگ نمی‌شوند؛ با این حال دسترسی به لاگ‌ها و فایل‌های داده را محدود نگه دارید.
 
 در خطای پردازش، کاربر کدی مانند `GMS-000123` دریافت می‌کند. این کد همان Submission ID قابل جست‌وجو در لاگ است:
 

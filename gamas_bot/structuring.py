@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -15,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 class StructuringError(RuntimeError):
     pass
+
+
+ERROR_DETAIL_LIMIT = 180
 
 
 PROMPT = """شما دستیار آموزشی فارسی هستید. متن پیاده‌سازی‌شده از یک کلاس یا فایل صوتی را به جزوه‌ای دقیق، خوانا و مناسب مرور تبدیل کنید.
@@ -103,6 +108,54 @@ def _retry_delay(response: aiohttp.ClientResponse, attempt: int) -> float:
     return min(2 ** attempt, 15.0)
 
 
+def _sanitize_error_text(value: object, key: str | None) -> str:
+    """Bound and redact a provider-supplied string so it is safe to log.
+
+    Only printable text survives, lengths are capped, and the configured API
+    key is blanked if a gateway ever echoes it back.
+    """
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value)).strip()
+    if key and key in text:
+        text = text.replace(key, "***")
+    return text[:ERROR_DETAIL_LIMIT]
+
+
+def _extract_error_detail(raw_body: bytes | None, key: str | None) -> str | None:
+    """Return the provider's structured diagnosis from an error body, or None.
+
+    Only well-known metadata fields are extracted (status/type/code, the
+    provider's own message, and per-detail ``reason`` codes), because all of
+    the supported APIs shape errors as ``{"error": {...}}`` (Gemini's
+    google.rpc shape, OpenAI-compatible, Anthropic). Raw bodies are never
+    returned: gateways may answer with HTML pages or echo request fragments,
+    so anything the parser does not recognise simply stays out of the logs.
+    """
+    if not raw_body:
+        return None
+    try:
+        payload = json.loads(raw_body.decode("utf-8", "replace"))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or not isinstance(payload.get("error"), dict):
+        return None
+    error = payload["error"]
+    parts: list[str] = []
+    for field in ("status", "type", "code", "message"):
+        value = error.get(field)
+        if isinstance(value, str) and value.strip():
+            sanitized = _sanitize_error_text(value, key)
+            if sanitized not in parts:
+                parts.append(sanitized)
+    details = error.get("details")
+    if isinstance(details, list):
+        for item in details[:3]:
+            if isinstance(item, dict) and isinstance(item.get("reason"), str):
+                reason = _sanitize_error_text(item["reason"], key)
+                if reason and reason not in parts:
+                    parts.append(reason)
+    return "; ".join(parts) or None
+
+
 def _provider_request(
     chunk: str, settings: Settings, prompt: str
 ) -> tuple[str, dict[str, str], dict, dict[str, str]]:
@@ -117,7 +170,10 @@ def _provider_request(
         if not key:
             raise StructuringError("کلید NOTE_API_KEY یا GEMINI_API_KEY تنظیم نشده است.")
         base = settings.note_api_base_url or "https://generativelanguage.googleapis.com/v1beta"
-        url = _endpoint(base, f"models/{quote(model, safe='')}:generateContent")
+        # Accepting the documented "models/<name>" spelling prevents the
+        # .../models/models%2F... URL that Google rejects with HTTP 400.
+        model_id = quote(model.strip().removeprefix("models/"), safe="")
+        url = _endpoint(base, f"models/{model_id}:generateContent")
         payload = {
             "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
             "generationConfig": {
@@ -168,9 +224,18 @@ def _provider_response(payload: dict, provider: str) -> str:
     """Normalize supported provider responses to plain text."""
     try:
         if provider == "gemini":
-            if payload["candidates"][0].get("finishReason") == "MAX_TOKENS":
+            candidates = payload.get("candidates")
+            if not candidates:
+                # Safety-blocked or empty answers return no candidates; the
+                # blockReason enum makes such failures diagnosable.
+                feedback = payload.get("promptFeedback")
+                if isinstance(feedback, dict) and isinstance(feedback.get("blockReason"), str):
+                    reason = _sanitize_error_text(feedback["blockReason"], None)
+                    raise StructuringError(f"پاسخ سرویس تولید جزوه مسدود شد ({reason}).")
+                raise StructuringError("پاسخ سرویس تولید جزوه خالی یا نامعتبر است.")
+            if candidates[0].get("finishReason") == "MAX_TOKENS":
                 raise StructuringError("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
-            parts = payload["candidates"][0]["content"]["parts"]
+            parts = candidates[0]["content"]["parts"]
             text = "".join(str(part.get("text", "")) for part in parts)
         elif provider == "anthropic":
             if payload.get("stop_reason") == "max_tokens":
@@ -228,24 +293,29 @@ async def _structure_chunk(
                     await asyncio.sleep(delay)
                     continue
                 if response.status < 200 or response.status >= 300:
-                    # Do not log response bodies: some gateways echo portions of
-                    # the prompt. A status and provider request ID are enough to
-                    # correlate the failure without exposing lecture content.
-                    await response.read()
+                    # Never log raw response bodies: gateways may echo fragments
+                    # of the prompt or lecture text. Only the provider's
+                    # structured error metadata is extracted and logged — enough
+                    # to diagnose a Gemini HTTP 400 (e.g. API_KEY_INVALID)
+                    # without exposing content or the API key.
+                    body = await response.read()
+                    detail = _extract_error_detail(body, settings.effective_note_api_key)
                     request_id = (
                         response.headers.get("x-request-id")
                         or response.headers.get("request-id")
                         or "unknown"
                     )
                     logger.error(
-                        "Note API request failed provider=%s status=%s request_id=%s",
+                        "Note API request failed provider=%s status=%s request_id=%s detail=%s",
                         provider,
                         response.status,
                         request_id,
+                        detail or "not provided",
                     )
-                    raise StructuringError(
-                        f"سرویس {provider} خطای HTTP {response.status} داد."
-                    )
+                    message = f"سرویس {provider} خطای HTTP {response.status} داد."
+                    if detail:
+                        message += f" ({detail})"
+                    raise StructuringError(message)
                 data = await response.json(content_type=None)
                 return _provider_response(data, provider)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
