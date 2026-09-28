@@ -1,7 +1,7 @@
 """Coverage for direct audio/video uploads, normalisation and unsupported files."""
-
 from __future__ import annotations
 
+import os
 import shutil
 import tempfile
 import unittest
@@ -15,11 +15,10 @@ from gamas_bot.bot import (
     _is_unsupported_attachment,
     _media_metadata,
 )
-from gamas_bot.media import MediaInfo, build_transcode_command, needs_transcode
+from gamas_bot.media import MediaInfo, build_extract_command, needs_transcode
 from gamas_bot.stt import Transcript, deepgram_params, speechmatics_config
 
-from support import fake_media_bytes, make_settings, stub_tools
-
+from support import make_settings, video_bytes, wav_bytes
 
 def fake_message(
     filename=None,
@@ -90,21 +89,18 @@ class TranscodeDecisionTests(unittest.TestCase):
         self.assertFalse(needs_transcode("a.wma", None))
         self.assertFalse(needs_transcode(None, MediaInfo(False, None, None)))
 
-    def test_transcode_command_takes_the_first_audio_track(self):
-        command = build_transcode_command(
-            "ffmpeg", Path("in.mkv"), Path("out.wav"), output_format="wav"
+    def test_extract_command_takes_the_first_audio_track(self):
+        command = build_extract_command(
+            Path("in.mkv"), Path("out.wav"), output_format="wav"
         )
-        self.assertIn("-vn", command)
-        self.assertEqual(command[command.index("-map") + 1], "0:a:0")
-        self.assertIn("pcm_s16le", command)
-        self.assertEqual(command[command.index("-ar") + 1], "16000")
-        self.assertEqual(command[-1], "out.wav")
+        self.assertIn("gamas_bot.media_worker", command)
+        self.assertEqual(command[command.index("--format") + 1], "wav")
+        self.assertEqual(command[-2:], ["--", "in.mkv"])
 
-        opus = build_transcode_command(
-            "ffmpeg", Path("in.mkv"), Path("out.ogg"), output_format="opus"
+        opus = build_extract_command(
+            Path("in.mkv"), Path("out.ogg"), output_format="opus"
         )
-        self.assertIn("libopus", opus)
-        self.assertEqual(opus[opus.index("-ar") + 1], "48000")
+        self.assertEqual(opus[opus.index("--format") + 1], "opus")
 
 
 class LanguageSettingTests(unittest.TestCase):
@@ -155,12 +151,10 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.tools = stub_tools(self.root / "bin")
         self.settings = make_settings(
             database_path=self.root / "bot.sqlite3",
             session_path=self.root / "session",
             temp_dir=self.root / "tmp",
-            **self.tools,
         )
         self.bot = StudyBot(self.settings)
         await self.bot.db.open()
@@ -171,7 +165,9 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
 
     async def _run(self, name: str, kind: str, payload: bytes | None = None):
         source = self.root / name
-        source.write_bytes(payload if payload is not None else fake_media_bytes(45.0))
+        if payload is None:
+            payload = wav_bytes(45.0)
+        source.write_bytes(payload)
         user = await self.bot.db.upsert_user(101, "student")
         submission_id = await self.bot.db.create_submission(
             user["id"], "f1", None, name, None, source_type=kind
@@ -187,7 +183,9 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         return event, stt, submission_id
 
     async def test_video_upload_is_converted_before_transcription(self):
-        event, stt, submission_id = await self._run("lecture.mp4", "video")
+        event, stt, submission_id = await self._run(
+            "lecture.mp4", "video", video_bytes(duration=2.0, with_audio=True)
+        )
         sent_path = Path(stt.await_args.args[0])
         self.assertTrue(sent_path.name.startswith("extracted-audio"))
         self.assertTrue(any("صدای ویدیو را جدا" in item for item in event.responses))
@@ -206,28 +204,25 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_file_without_audio_track_is_rejected(self):
         event, stt, _ = await self._run(
-            "slides.mp4", "video", payload=fake_media_bytes(30.0, has_audio=False)
+            "slides.mp4", "video", video_bytes(duration=1.0, with_audio=False)
         )
         stt.assert_not_awaited()
         self.assertTrue(any("صدایی پیدا نکردم" in item for item in event.replies))
 
     async def test_temporary_files_are_cleaned_up(self):
-        await self._run("lecture.mp4", "video")
+        await self._run("lecture.mp4", "video", video_bytes(duration=1.0))
         self.assertEqual(list(self.settings.temp_dir.glob("submission-*")), [])
 
-    async def test_video_is_refused_when_ffmpeg_is_missing(self):
-        self.bot.settings = make_settings(
-            database_path=self.settings.database_path,
-            temp_dir=self.settings.temp_dir,
-            ffprobe_bin=self.tools["ffprobe_bin"],
-            ffmpeg_bin=str(self.root / "no-ffmpeg"),
-        )
-        user = await self.bot.db.upsert_user(102, None)
-        event = FakeEvent(self.root / "x")
-        event.message.file = SimpleNamespace(size=100)
-        await self.bot._accept_media(event, user, "video", "a.mp4", "video/mp4", None, "7")
-        self.assertTrue(any("نمی‌توانم ویدیو را پردازش کنم" in i for i in event.replies))
-        self.assertEqual((await self.bot.db.stats())["submissions"], 0)
+    async def test_video_processing_needs_no_system_media_binaries(self):
+        # cPanel/shared hosts have no ffmpeg on PATH: the worker only needs the
+        # interpreter, so an empty PATH must not change behaviour.
+        with patch.dict(os.environ, {"PATH": "/nonexistent-bin-dir"}):
+            event, stt, _ = await self._run(
+                "lecture.mp4", "video", video_bytes(duration=1.0, with_audio=True)
+            )
+        self.assertTrue(any("جزوه" in item for item in event.responses))
+        stt.assert_awaited()
+        self.assertEqual((await self.bot.db.stats())["done"], 1)
 
 
 class UnsupportedFileTests(unittest.IsolatedAsyncioTestCase):

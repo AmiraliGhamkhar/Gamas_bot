@@ -13,7 +13,9 @@ Group=bot
 WorkingDirectory=/opt/gamas-bot
 EnvironmentFile=/opt/gamas-bot/.env
 Environment=PYTHONUNBUFFERED=1
-# LibreOffice/fontconfig need a writable home/cache even in headless mode.
+# No system office/media binaries are used; media work runs in Python child
+# processes. A writable HOME keeps Python cache paths valid for a home-less
+# system account.
 Environment=HOME=/opt/gamas-bot/data
 Environment=XDG_CACHE_HOME=/opt/gamas-bot/data/.cache
 ExecStart=/opt/gamas-bot/.venv/bin/python -m gamas_bot

@@ -5,6 +5,7 @@ import asyncio
 import html
 import json
 import sqlite3
+import sys
 import tempfile
 import threading
 import unittest
@@ -63,13 +64,18 @@ class ProbeTests(unittest.TestCase):
     def test_nonfinite_duration_is_not_accepted(self):
         for duration in ("nan", "inf", "-inf"):
             info = parse_probe_output(json.dumps({
-                "format": {"duration": duration},
-                "streams": [{"codec_type": "audio", "duration": "12.5"}],
+                "has_audio": True, "duration": duration, "audio_codec": "aac",
             }))
-            self.assertEqual(info.duration, 12.5)
+            self.assertIsNone(info.duration)
 
-    def test_malformed_json_shape_is_reported_as_media_error(self):
-        for payload in ("[]", "null", '{"streams":[null]}', '{"format": []}'):
+    def test_duration_must_be_a_number_or_null(self):
+        info = parse_probe_output(json.dumps({"has_audio": True, "duration": 12.5}))
+        self.assertEqual(info.duration, 12.5)
+        info = parse_probe_output('{"has_audio": true, "duration": null}')
+        self.assertIsNone(info.duration)
+
+    def test_malformed_shape_is_reported_as_media_error(self):
+        for payload in ("[]", "null", '{"has_audio": "yes"}', '{"has_audio": 1}'):
             with self.subTest(payload=payload), self.assertRaises(MediaToolError):
                 parse_probe_output(payload)
 
@@ -301,16 +307,25 @@ class ExtraSafetyTests(unittest.TestCase):
         self.assertEqual(params, {})
         self.assertNotIn("gemini-key", url)
 
-    def test_probe_and_conversion_commands_disallow_network_protocols(self):
-        from gamas_bot.media import build_probe_command, build_merge_command, build_transcode_command
+    def test_no_runtime_path_invokes_system_media_binaries(self):
+        from gamas_bot.media import build_probe_command, build_merge_command, build_extract_command
+        from gamas_bot.media_worker import INPUT_PROTOCOL_OPTIONS
+
         commands = [
-            build_probe_command("ffprobe", Path("in.mp3")),
-            build_transcode_command("ffmpeg", Path("in.mp3"), Path("out.wav")),
-            build_merge_command("ffmpeg", [Path("a.wav"), Path("b.wav")], Path("out.wav")),
+            build_probe_command(Path("in.mp3")),
+            build_extract_command(Path("in.mp3"), Path("out.wav")),
+            build_merge_command([Path("a.wav"), Path("b.wav")], Path("out.wav")),
         ]
         for command in commands:
-            self.assertIn("-protocol_whitelist", command)
-            self.assertEqual(command[command.index("-protocol_whitelist") + 1], "file,pipe")
+            # Commands run the in-repo Python worker, never ffmpeg/ffprobe/soffice.
+            self.assertEqual(command[0], sys.executable)
+            self.assertIn("gamas_bot.media_worker", command)
+            for argument in command:
+                self.assertNotIn(
+                    Path(argument).name.lower(), {"ffmpeg", "ffprobe", "soffice"}
+                )
+        # The worker applies this whitelist to every media input it opens.
+        self.assertEqual(INPUT_PROTOCOL_OPTIONS, {"protocol_whitelist": "file,pipe"})
 
     def test_sql_splitter_keeps_trigger_statements_together(self):
         script = """
@@ -389,9 +404,9 @@ class PresentationDurationTests(unittest.IsolatedAsyncioTestCase):
             MediaClip(1, 1, "one.wav", Path("one.wav"), "audio"),
             MediaClip(2, 2, "two.wav", Path("two.wav"), "audio"),
         ))
-        with patch("gamas_bot.presentations.tool_available", return_value=True), patch(
-            "gamas_bot.presentations.probe_media", new=AsyncMock(return_value=MediaInfo(True, 1, "pcm_s16le"))
-        ), patch("gamas_bot.presentations.merge_audio_tracks", new=AsyncMock(return_value=Path("out.wav"))) as merge:
+        with patch("gamas_bot.presentations.probe_media", new=AsyncMock(return_value=MediaInfo(True, 1, "pcm_s16le"))), patch(
+            "gamas_bot.presentations.merge_audio_tracks", new=AsyncMock(return_value=Path("out.wav"))
+        ) as merge:
             result = await prepare_audio(content, Path("out"), make_settings())
         self.assertEqual(result.total_duration, 2)
         self.assertEqual(merge.await_args.kwargs["total_duration"], 2.5)
@@ -404,7 +419,5 @@ class PresentationDurationTests(unittest.IsolatedAsyncioTestCase):
             MediaClip(1, 1, "one.wav", Path("one.wav"), "audio"),
             MediaClip(2, 2, "two.wav", Path("two.wav"), "audio"),
         ))
-        with patch("gamas_bot.presentations.tool_available", return_value=True), patch(
-            "gamas_bot.presentations.probe_media", new=AsyncMock(side_effect=[MediaInfo(True, 100), MediaInfo(True, None)])
-        ), self.assertRaises(PresentationError):
+        with patch("gamas_bot.presentations.probe_media", new=AsyncMock(side_effect=[MediaInfo(True, 100), MediaInfo(True, None)])), self.assertRaises(PresentationError):
             await prepare_audio(content, Path("out"), make_settings(presentation_max_total_duration=50))

@@ -20,27 +20,19 @@
 ```bash
 sudo apt update
 sudo apt install -y \
-  python3 python3-venv python3-pip git ca-certificates \
-  ffmpeg libreoffice-core libreoffice-impress \
-  fonts-dejavu-core fonts-noto-core
+  python3 python3-venv python3-pip git ca-certificates
 ```
 
-بررسی نصب:
+هیچ بستهٔ فریم‌ورک دفتری یا رسانه‌ای لازم نیست: دستورهای `ffmpeg`، `ffprobe` و
+`soffice` اصلاً اجرا نمی‌شوند. کتابخانه‌های FFmpeg داخل بستهٔ `av` (PyAV) روی
+`pip install` نصب می‌شوند و تبدیل فایل‌های قدیمی `ppt` با بستهٔ خالص پایتونی
+`ppt2pptx` انجام می‌گیرد.
+
+بررسی نصب پس از مرحلهٔ نصب وابستگی‌ها:
 
 ```bash
-command -v ffmpeg ffprobe soffice
-ffmpeg -hide_banner -version
-ffprobe -hide_banner -version
-ffmpeg -hide_banner -encoders | grep -E 'libopus|pcm_s16le'
-soffice --headless --version
-```
-
-اگر مسیر ابزارها متفاوت است، مسیر کامل را در `.env` قرار دهید:
-
-```dotenv
-FFMPEG_BIN=/usr/bin/ffmpeg
-FFPROBE_BIN=/usr/bin/ffprobe
-SOFFICE_BIN=/usr/bin/soffice
+cd /opt/gamas-bot
+.venv/bin/python -m gamas_bot.media_worker check
 ```
 
 ### ۲. ساخت کاربر سرویس و نصب پروژه
@@ -105,9 +97,10 @@ sudo journalctl -u gamas-bot -p warning..alert --since '1 hour ago'
 
 Unit از `ProtectSystem=strict` استفاده می‌کند و فقط مسیر `data/` برای نوشتن باز است. مسیرهای سفارشی دیتابیس، Session، فایل موقت و `LOG_FILE` باید زیر همین مسیر باشند یا به `ReadWritePaths` اضافه شوند.
 
-## FFmpeg دقیقاً چه کاری انجام می‌دهد؟
+## پردازش رسانه دقیقاً چه کاری انجام می‌دهد؟
 
-ربات از FFmpeg/FFprobe برای این موارد استفاده می‌کند:
+ربات پردازش صدا و تصویر را داخل خود پایتون انجام می‌دهد (فرزند پایتونی
+`python -m gamas_bot.media_worker` با کتابخانهٔ PyAV):
 
 1. تشخیص وجود Track صوتی و مدت فایل؛
 2. جدا کردن صدا از ویدیو؛
@@ -115,11 +108,12 @@ Unit از `ProtectSystem=strict` استفاده می‌کند و فقط مسیر
 4. ادغام صدای چند اسلاید؛
 5. یکسان‌سازی Sample Rate و کانال صوتی.
 
-فرمان‌ها بدون Shell اجرا می‌شوند و با `FFMPEG_TIMEOUT_SECONDS` محدود هستند. برای عیب‌یابی یک فایل:
+دستورها بدون Shell اجرا می‌شوند و با `MEDIA_TIMEOUT_SECONDS` محدود هستند.
+برای عیب‌یابی یک فایل:
 
 ```bash
-ffprobe -v error -show_streams -show_format -of json /path/to/input.mp4
-sudo -u bot /usr/bin/ffmpeg -hide_banner -version
+cd /opt/gamas-bot
+sudo -u bot .venv/bin/python -m gamas_bot.media_worker probe -- /path/to/input.mp4
 sudo -u bot touch /opt/gamas-bot/data/tmp/write-test
 df -h /opt/gamas-bot/data
 df -i /opt/gamas-bot/data
@@ -127,33 +121,29 @@ df -i /opt/gamas-bot/data
 
 خطاهای رایج:
 
-- `Unknown encoder 'libopus'`: نسخه محدود FFmpeg نصب شده؛ پکیج کامل توزیع را نصب کنید.
-- `Permission denied`: مالکیت `data/tmp` یا مسیر باینری اشتباه است.
+- `media dependencies are missing`: بستهٔ `av` در venv نصب نیست؛
+  `pip install -r requirements.txt` را با کاربر سرویس اجرا کنید.
+- `Permission denied`: مالکیت `data/tmp` اشتباه است.
 - `No space left on device`: هم فضای دیسک و هم inodeها را بررسی کنید.
 - Timeout مکرر: قبل از افزایش Timeout، CPU، سرعت دیسک و سالم بودن فایل ورودی را بررسی کنید.
 
-## LibreOffice دقیقاً چه زمانی لازم است؟
+## تبدیل PowerPoint قدیمی چگونه انجام می‌شود؟
 
-برای `pptx` جدید نیازی به LibreOffice نیست. فقط فایل‌های قدیمی `ppt`، `pps`، `pot`، `odp` و `otp` ابتدا با LibreOffice به `pptx` تبدیل می‌شوند.
+برای `pptx` جدید هیچ تبدیلی لازم نیست. فایل‌های قدیمی `ppt`، `pps` و `pot` با
+بستهٔ `ppt2pptx` (کاملاً درون پایتون، بدون دفتر یا باینری سیستمی) به `pptx`
+تبدیل می‌شوند. زمان تبدیل با `PPT_CONVERT_TIMEOUT_SECONDS` محدود است و حداکثر
+حجم ورودی همان `MAX_FILE_SIZE_BYTES` است.
 
-ربات LibreOffice را به‌صورت Headless و با Profile موقت اختصاصی اجرا می‌کند تا تبدیل‌های هم‌زمان قفل یکدیگر را نگیرند. با این حال، LibreOffice و fontconfig به `HOME` و Cache قابل‌نوشتن نیاز دارند؛ این متغیرها در unit آماده تنظیم شده‌اند.
+ویژگی‌های قدیمی که قابل انتقال نیستند (انیمیشن، پخش صدا/ویدیوی جاسازی‌شده و
+برخی شیءهای OLE) به‌صورت هشدارهای ساخت‌یافته در لاگ ثبت می‌شوند و صورت ظاهری
+جایگزین نمایش داده می‌شود.
 
-تست تبدیل واقعی:
-
-```bash
-sudo -u bot env HOME=/opt/gamas-bot/data \
-  XDG_CACHE_HOME=/opt/gamas-bot/data/.cache \
-  timeout 60 /usr/bin/soffice --headless --convert-to pptx \
-  --outdir /opt/gamas-bot/data/tmp /path/to/sample.ppt
-```
-
-اگر LibreOffice روی هاست قابل نصب نیست:
+فرمت‌های `odp` و `otp` پشتیبانی نمی‌شوند و ربات با پیام روشن می‌خواهد فایل با
+پسوند `pptx` ذخیره شود. برای غیرفعال کردن کل مسیر تبدیل قدیمی:
 
 ```dotenv
 PPTX_LEGACY_ENABLED=false
 ```
-
-در این حالت فایل‌های صوتی، ویدیویی و `pptx` جدید همچنان کار می‌کنند. برای نمایش درست متن فارسی، فونت‌های فارسی مورد استفاده فایل‌های ارائه را نیز روی سرور نصب کنید.
 
 ## تنظیم API ساخت جزوه
 
@@ -216,7 +206,7 @@ sudo journalctl -u gamas-bot --since today | grep 'GMS-000123'
 1. `systemctl status gamas-bot -l`
 2. `journalctl -u gamas-bot -n 200 --no-pager`
 3. بررسی مالکیت `.env` و پوشه `data`
-4. بررسی مسیرهای `ffmpeg`، `ffprobe` و `soffice`
+4. بررسی نصب بسته‌های Python با `media_worker check`
 5. اجرای Foreground با کاربر `bot`
 6. بررسی فضای دیسک، RAM و خطاهای `401`، `403`، `429` و `5xx`
 
@@ -255,7 +245,7 @@ sudo systemctl start gamas-bot
 
 ## امنیت ابزارها و Workflow
 
-FFmpeg و FFprobe فقط از Protocolهای محلی `file` و `pipe` استفاده می‌کنند تا Playlist ارسالی نشانی شبکه را واکشی نکند. این محدودیت Sandbox کامل نیست؛ دسترسی به فایل‌های محلی همچنان تابع مجوز کاربر سرویس است. بسته‌های سیستم را به‌روز نگه دارید و محدودیت دیسک، حافظه و CPU و جداسازی فایل‌سیستم را اعمال کنید. در Linux، Timeout و Cancel گروه پردازش ابزار را هم متوقف می‌کند؛ در Windows برای پاک‌سازی فرایندهای فرزند از Supervisor مناسب استفاده کنید.
+کارگر رسانه فقط از Protocolهای محلی `file` و `pipe` استفاده می‌کند تا Playlist ارسالی نشانی شبکه را واکشی نکند. این محدودیت Sandbox کامل نیست؛ دسترسی به فایل‌های محلی همچنان تابع مجوز کاربر سرویس است. بستهٔ Python خود را به‌روز نگه دارید (`av` و `ppt2pptx`) و محدودیت دیسک، حافظه و CPU و جداسازی فایل‌سیستم را اعمال کنید. در Linux، Timeout و Cancel گروه پردازش کارگر رسانه را هم متوقف می‌کند؛ در Windows برای پاک‌سازی فرایندهای فرزند از Supervisor مناسب استفاده کنید.
 
 Workflow نامرتبط RDP حذف شده، چون گذرواژهٔ ثابت مدیر و تنظیم غیرفعال‌سازی NLA داشت. گذرواژه در تاریخچهٔ Git باقی است؛ اگر جایی دوباره استفاده شده آن را عوض کنید، Runnerهای قدیمی را متوقف کنید و دسترسی Tailscale آن‌ها را بررسی کنید. GitHub Actions جای هاست دائمی ربات نیست.
 
@@ -268,6 +258,6 @@ python -m unittest discover -s tests -v
 python -m pip check
 ```
 
-آزمون‌های شبکهٔ Telegram و APIهای پولی Mock هستند و کلید لازم ندارند. سه آزمون واقعی FFmpeg با نصب ابزار یا تنظیم `FFMPEG_TEST_BIN` اجرا می‌شوند؛ در نبود ابزار Skip می‌شوند. CI لینوکسی Pythonهای ۳.۱۱، ۳.۱۲ و ۳.۱۳ را بررسی می‌کند؛ اجرای واقعی Windows و LibreOffice باید روی هاست مقصد تأیید شود.
+آزمون‌های شبکهٔ Telegram و APIهای پولی Mock هستند و کلید لازم ندارند. آزمون‌های رسانه‌ای واقعی با خود بستهٔ `av` اجرا می‌شوند و به هیچ باینری سیستمی نیاز ندارند؛ نصب `ffmpeg` لازم نیست. CI لینوکسی Pythonهای ۳.۱۱، ۳.۱۲ و ۳.۱۳ را بررسی می‌کند؛ اجرای واقعی Windows باید روی هاست مقصد تأیید شود.
 
 گزارش بازبینی و محدودیت‌های تأیید: [AUDIT.md](AUDIT.md).
