@@ -49,15 +49,24 @@ class STTProvider:
 
 def _speechmatics_confidence(payload: dict) -> float | None:
     values = []
-    for item in payload.get("results", []):
+    results = payload.get("results", [])
+    if not isinstance(results, (list, tuple)):
+        return None
+    for item in results:
+        if not isinstance(item, dict):
+            continue
         alternatives = item.get("alternatives") or []
-        if alternatives and alternatives[0].get("confidence") is not None:
-            try:
-                value = float(alternatives[0]["confidence"])
-                if math.isfinite(value) and 0 <= value <= 1:
-                    values.append(value)
-            except (TypeError, ValueError):
-                pass
+        if not isinstance(alternatives, (list, tuple)) or not alternatives:
+            continue
+        alternative = alternatives[0]
+        if not isinstance(alternative, dict) or alternative.get("confidence") is None:
+            continue
+        try:
+            value = float(alternative["confidence"])
+            if math.isfinite(value) and 0 <= value <= 1:
+                values.append(value)
+        except (TypeError, ValueError):
+            pass
     return sum(values) / len(values) if values else None
 
 
@@ -216,28 +225,30 @@ async def _speechmatics(
         if response.status != 200:
             raise _http_error("Speechmatics transcript retrieval", response.status)
         result = await response.json(content_type=None)
+    if not isinstance(result, dict):
+        raise STTError("Speechmatics پاسخ متن را با ساختار قابل‌خواندن برنگرداند.")
+    results = result.get("results", [])
+    if not isinstance(results, (list, tuple)):
+        raise STTError("Speechmatics پاسخ متن را با ساختار قابل‌خواندن برنگرداند.")
     logger.info(
         "Speechmatics transcript downloaded job_id=%s download_elapsed_seconds=%.3f result_items=%s",
         job_id,
         time.monotonic() - transcript_started,
-        len(result.get("results", [])) if isinstance(result, dict) else -1,
+        len(results),
     )
 
-    async with session.get(
-        f"{settings.speechmatics_base_url}/jobs/{quote(str(job_id), safe='')}/transcript",
-        params={"format": "json-v2"},
-        headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
-    ) as response:
-        if response.status != 200:
-            raise _http_error("Speechmatics transcript retrieval", response.status)
-        result = await response.json(content_type=None)
     parts: list[str] = []
-    for item in result.get("results", []):
+    for item in results:
+        if not isinstance(item, dict):
+            continue
         item_type = item.get("type")
         alternatives = item.get("alternatives") or []
-        if item_type not in {"word", "punctuation"} or not alternatives:
+        if item_type not in {"word", "punctuation"} or not isinstance(alternatives, (list, tuple)) or not alternatives:
             continue
-        content = str(alternatives[0].get("content", ""))
+        alternative = alternatives[0]
+        if not isinstance(alternative, dict):
+            continue
+        content = str(alternative.get("content", ""))
         if item_type == "punctuation" and parts:
             parts[-1] += content
         elif content:
@@ -245,15 +256,22 @@ async def _speechmatics(
     text = " ".join(parts).strip()
     if not text:
         # Some API response versions expose the text in results without a type.
-        text = " ".join(
-            str(item.get("alternatives", [{}])[0].get("content", ""))
-            for item in result.get("results", [])
-            if item.get("alternatives")
-        ).strip()
+        fallback_parts = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            alternatives = item.get("alternatives") or []
+            if not isinstance(alternatives, (list, tuple)) or not alternatives:
+                continue
+            alternative = alternatives[0]
+            if isinstance(alternative, dict) and alternative.get("content"):
+                fallback_parts.append(str(alternative["content"]))
+        text = " ".join(fallback_parts).strip()
     if not text:
         raise STTError("Speechmatics متن قابل‌استفاده‌ای تولید نکرد.")
-    _log_transcript_stats("speechmatics", text, _speechmatics_confidence(result))
-    return Transcript("speechmatics", text, _speechmatics_confidence(result))
+    confidence = _speechmatics_confidence(result)
+    _log_transcript_stats("speechmatics", text, confidence)
+    return Transcript("speechmatics", text, confidence)
 
 
 async def _deepgram(
