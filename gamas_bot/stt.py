@@ -79,6 +79,24 @@ def _http_error(stage: str, status: int) -> STTError:
     return STTError(f"{stage} failed (HTTP {status})")
 
 
+def _transcript_metrics(text: str) -> tuple[int, int]:
+    """(characters, words) for logging — never the transcript content itself."""
+    return len(text), len(text.split())
+
+
+def _log_transcript_stats(engine: str, text: str, confidence: float | None, **extra: object) -> None:
+    """Log transcript size/quality metrics without any transcript content."""
+    chars, words = _transcript_metrics(text)
+    logger.info(
+        "STT transcript stats engine=%s text_chars=%s text_words=%s confidence=%s%s",
+        engine,
+        chars,
+        words,
+        f"{confidence:.3f}" if confidence is not None else "unavailable",
+        "".join(f" {key}={value}" for key, value in extra.items()),
+    )
+
+
 def speechmatics_config(settings: Settings) -> dict:
     """Job configuration for the Speechmatics batch API.
 
@@ -116,6 +134,7 @@ async def _speechmatics(
     session: aiohttp.ClientSession, audio_path: Path, settings: Settings
 ) -> Transcript:
     assert settings.speechmatics_api_key
+    started_at = time.monotonic()
     config = speechmatics_config(settings)
     form = aiohttp.FormData()
     form.add_field("config", json.dumps(config), content_type="application/json")
@@ -137,11 +156,22 @@ async def _speechmatics(
     job_id = payload.get("id")
     if not job_id:
         raise STTError("Speechmatics شناسهٔ پردازش را برنگرداند.")
+    upload_elapsed = time.monotonic() - started_at
+    logger.info(
+        "Speechmatics job submitted job_id=%s upload_elapsed_seconds=%.3f",
+        job_id,
+        upload_elapsed,
+    )
 
     deadline = time.monotonic() + settings.stt_job_timeout
+    polls = 0
     while True:
         if time.monotonic() >= deadline:
+            logger.warning(
+                "Speechmatics job timed out job_id=%s polls=%s", job_id, polls
+            )
             raise STTError("زمان پردازش Speechmatics به پایان رسید.")
+        polls += 1
         async with session.get(
             f"{settings.speechmatics_base_url}/jobs/{quote(str(job_id), safe='')}",
             headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
@@ -151,11 +181,47 @@ async def _speechmatics(
             status_data = await response.json(content_type=None)
         job = status_data.get("job", status_data)
         status = str(job.get("status", "")).lower()
+        logger.debug(
+            "Speechmatics job poll job_id=%s poll=%s status=%s elapsed_seconds=%.1f",
+            job_id,
+            polls,
+            status,
+            time.monotonic() - started_at,
+        )
         if status == "done":
             break
         if status in {"rejected", "failed", "deleted", "expired"}:
+            logger.warning(
+                "Speechmatics job ended unsuccessfully job_id=%s polls=%s final_status=%s elapsed_seconds=%.1f",
+                job_id,
+                polls,
+                status,
+                time.monotonic() - started_at,
+            )
             raise STTError(f"Speechmatics کار را با وضعیت {status} پایان داد.")
         await asyncio.sleep(min(settings.stt_poll_interval, max(0.1, deadline - time.monotonic())))
+    logger.info(
+        "Speechmatics job finished job_id=%s polls=%s elapsed_seconds=%.1f",
+        job_id,
+        polls,
+        time.monotonic() - started_at,
+    )
+
+    transcript_started = time.monotonic()
+    async with session.get(
+        f"{settings.speechmatics_base_url}/jobs/{quote(str(job_id), safe='')}/transcript",
+        params={"format": "json-v2"},
+        headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
+    ) as response:
+        if response.status != 200:
+            raise _http_error("Speechmatics transcript retrieval", response.status)
+        result = await response.json(content_type=None)
+    logger.info(
+        "Speechmatics transcript downloaded job_id=%s download_elapsed_seconds=%.3f result_items=%s",
+        job_id,
+        time.monotonic() - transcript_started,
+        len(result.get("results", [])) if isinstance(result, dict) else -1,
+    )
 
     async with session.get(
         f"{settings.speechmatics_base_url}/jobs/{quote(str(job_id), safe='')}/transcript",
@@ -186,6 +252,7 @@ async def _speechmatics(
         ).strip()
     if not text:
         raise STTError("Speechmatics متن قابل‌استفاده‌ای تولید نکرد.")
+    _log_transcript_stats("speechmatics", text, _speechmatics_confidence(result))
     return Transcript("speechmatics", text, _speechmatics_confidence(result))
 
 
@@ -193,6 +260,7 @@ async def _deepgram(
     session: aiohttp.ClientSession, audio_path: Path, settings: Settings
 ) -> Transcript:
     assert settings.deepgram_api_key
+    started_at = time.monotonic()
     params = deepgram_params(settings)
     with audio_path.open("rb") as audio:
         async with session.post(
@@ -207,9 +275,16 @@ async def _deepgram(
             if response.status != 200:
                 raise _http_error("Deepgram request", response.status)
             payload = await response.json(content_type=None)
+    logger.info(
+        "Deepgram request completed model=%s upload_bytes=%s elapsed_seconds=%.3f",
+        settings.deepgram_model,
+        audio_path.stat().st_size,
+        time.monotonic() - started_at,
+    )
     transcript = _deepgram_transcript(payload)
     if not transcript.text:
         raise STTError("Deepgram متن قابل‌استفاده‌ای تولید نکرد.")
+    _log_transcript_stats("deepgram", transcript.text, transcript.confidence)
     return transcript
 
 
@@ -228,6 +303,7 @@ async def _openai_compatible_stt(
 ) -> Transcript:
     """POST to an OpenAI-compatible STT endpoint (OpenAI, Groq, vLLM, ...)."""
     assert settings.stt_openai_base_url
+    started_at = time.monotonic()
     form = aiohttp.FormData()
     form.add_field("model", settings.stt_openai_model)
     form.add_field("language", settings.stt_language)
@@ -251,7 +327,15 @@ async def _openai_compatible_stt(
             if response.status != 200:
                 raise _http_error("OpenAI-compatible STT request", response.status)
             payload = await response.json(content_type=None)
-    return _openai_transcript(payload)
+    logger.info(
+        "OpenAI-compatible STT request completed model=%s upload_bytes=%s elapsed_seconds=%.3f",
+        settings.stt_openai_model,
+        audio_path.stat().st_size,
+        time.monotonic() - started_at,
+    )
+    transcript = _openai_transcript(payload)
+    _log_transcript_stats("openai_compatible", transcript.text, transcript.confidence)
+    return transcript
 
 
 def _openai_stt_availability(settings: Settings) -> str | None:
@@ -313,6 +397,14 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
     # every boundary. Files at/above a provider's direct-upload limit are
     # routed to another configured engine that accepts them.
     file_size = audio_path.stat().st_size
+    job_started = time.monotonic()
+    logger.info(
+        "STT job started file_bytes=%s primary=%s fallback_enabled=%s candidate_engines=%s",
+        file_size,
+        primary,
+        settings.stt_fallback_enabled,
+        configured,
+    )
     usable: list[str] = []
     oversized: list[str] = []
     for name in configured:
@@ -358,12 +450,18 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
                     STT_PROVIDERS[engine].attempt(session, audio_path, settings),
                     timeout=settings.stt_job_timeout,
                 )
+                chars, words = _transcript_metrics(transcript.text)
                 logger.info(
-                    "STT attempt completed provider=%s elapsed_seconds=%.3f confidence=%s text_chars=%s",
+                    "STT attempt completed provider=%s elapsed_seconds=%.3f confidence=%s text_chars=%s text_words=%s attempt=%s/%s",
                     engine,
                     time.monotonic() - started,
-                    transcript.confidence,
-                    len(transcript.text),
+                    f"{transcript.confidence:.3f}"
+                    if transcript.confidence is not None
+                    else "unavailable",
+                    chars,
+                    words,
+                    index + 1,
+                    len(usable),
                 )
                 outcomes.append(transcript)
                 is_low = (
@@ -373,22 +471,26 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
                 if not is_low or index == len(usable) - 1:
                     break
                 logger.warning(
-                    "Low STT confidence from %s (%.3f); trying fallback",
+                    "Low STT confidence from %s (%.3f < threshold %.3f); trying fallback",
                     engine,
                     transcript.confidence,
+                    settings.stt_min_confidence,
                 )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                logger.warning(
-                    "STT provider failed provider=%s elapsed_seconds=%.3f error_type=%s",
-                    engine,
-                    time.monotonic() - started,
-                    type(exc).__name__,
-                )
                 # Unexpected client errors can contain URLs, keys or response
                 # fragments. Keep only our own sanitized errors and error types.
                 detail = str(exc) if isinstance(exc, STTError) else type(exc).__name__
+                logger.warning(
+                    "STT provider failed provider=%s elapsed_seconds=%.3f error_type=%s detail=%s attempt=%s/%s",
+                    engine,
+                    time.monotonic() - started,
+                    type(exc).__name__,
+                    detail,
+                    index + 1,
+                    len(usable),
+                )
                 failures.append(f"{engine}: {detail}")
                 if index == len(usable) - 1 and not outcomes:
                     raise STTError("؛ ".join(failures)) from None
@@ -397,7 +499,21 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
         # When both providers work, prefer the more confident result. If either
         # omits confidence, the later (fallback) result is preferred after a low score.
         if len(outcomes) == 1:
-            return outcomes[0]
-        if outcomes[0].confidence is not None and outcomes[1].confidence is not None:
-            return max(outcomes, key=lambda item: item.confidence)
-        return outcomes[-1]
+            selected = outcomes[0]
+        elif outcomes[0].confidence is not None and outcomes[1].confidence is not None:
+            selected = max(outcomes, key=lambda item: item.confidence)
+        else:
+            selected = outcomes[-1]
+        chars, words = _transcript_metrics(selected.text)
+        logger.info(
+            "STT job finished engine=%s confidence=%s text_chars=%s text_words=%s outcomes=%s total_elapsed_seconds=%.3f",
+            selected.engine,
+            f"{selected.confidence:.3f}"
+            if selected.confidence is not None
+            else "unavailable",
+            chars,
+            words,
+            [outcome.engine for outcome in outcomes],
+            time.monotonic() - job_started,
+        )
+        return selected

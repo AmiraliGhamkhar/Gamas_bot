@@ -80,6 +80,15 @@ class Settings:
     note_api_timeout: int = 240
     note_api_retries: int = 2
     note_api_max_output_tokens: int = 8192
+    # Opt-in response_format={"type":"json_object"} for OpenAI-compatible note
+    # providers. Not every gateway implements it, so the strict system prompt
+    # is the default and this only tightens providers that support JSON mode.
+    note_api_json_mode: bool = False
+    # Complex-script font used inside the generated Word document (Tahoma is
+    # present everywhere; set B Nazanin/Vazirmatn when the audience has it).
+    docx_font: str = "Tahoma"
+    # The playful progress bar; when disabled only real stage updates are sent.
+    progress_animation: bool = True
     presentation_enabled: bool = True
     presentation_include_slide_text: bool = True
     presentation_include_video_audio: bool = True
@@ -297,6 +306,9 @@ class Settings:
             note_api_timeout=note_timeout,
             note_api_retries=note_retries,
             note_api_max_output_tokens=note_max_tokens,
+            note_api_json_mode=_flag("NOTE_API_JSON_MODE", False),
+            docx_font=_text("DOCX_FONT", "Tahoma"),
+            progress_animation=_flag("PROGRESS_ANIMATION_ENABLED", True),
             presentation_enabled=_flag("PPTX_ENABLED", True),
             presentation_include_slide_text=_flag("PPTX_INCLUDE_SLIDE_TEXT", True),
             presentation_include_video_audio=_flag("PPTX_INCLUDE_VIDEO_AUDIO", True),

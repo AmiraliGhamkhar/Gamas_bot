@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,8 +16,16 @@ from gamas_bot.bot import (
 )
 from gamas_bot.media import MediaInfo, build_extract_command, needs_transcode
 from gamas_bot.stt import Transcript, deepgram_params, speechmatics_config
+from gamas_bot.structuring import parse_structured_notes
 
-from support import make_settings, video_bytes, wav_bytes
+from support import (
+    FakeJobEvent,
+    docx_text,
+    make_settings,
+    sample_notes_json,
+    video_bytes,
+    wav_bytes,
+)
 
 def fake_message(
     filename=None,
@@ -129,22 +136,8 @@ class LanguageSettingTests(unittest.TestCase):
                     Settings.from_env(env)
 
 
-class FakeEvent:
-    def __init__(self, source: Path):
-        self.source = source
-        self.replies: list[str] = []
-        self.responses: list[str] = []
-        self.message = SimpleNamespace(download_media=self._download)
-
-    async def _download(self, file: str) -> str:
-        shutil.copyfile(self.source, file)
-        return file
-
-    async def reply(self, text: str, **_kwargs) -> None:
-        self.replies.append(text)
-
-    async def respond(self, text: str, **_kwargs) -> None:
-        self.responses.append(text)
+class FakeEvent(FakeJobEvent):
+    """Telethon event double that also records sent document files."""
 
 
 class MediaJobTests(unittest.IsolatedAsyncioTestCase):
@@ -177,7 +170,8 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
             "gamas_bot.bot.transcribe",
             new=AsyncMock(return_value=Transcript("deepgram", "متن درس", 0.9)),
         ) as stt, patch(
-            "gamas_bot.bot.structure_transcript", new=AsyncMock(return_value="# جزوه")
+            "gamas_bot.bot.structure_transcript",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
         ):
             await self.bot._process_submission(event, submission_id, name, kind)
         return event, stt, submission_id
@@ -189,10 +183,19 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         sent_path = Path(stt.await_args.args[0])
         self.assertTrue(sent_path.name.startswith("extracted-audio"))
         self.assertTrue(any("صدای ویدیو را جدا" in item for item in event.responses))
-        self.assertTrue(any("جزوه" in item for item in event.responses))
+        self._assert_documents_delivered(event, "متن درس")
         stats = await self.bot.db.stats()
         self.assertEqual(stats["videos"], 1)
         self.assertEqual(stats["done"], 1)
+
+    def _assert_documents_delivered(self, event: FakeEvent, raw_transcript: str) -> None:
+        """A Word document plus the raw-text file are the deliverables."""
+        self.assertEqual(len(event.files), 2)
+        self.assertTrue(any(path.endswith(".docx") for path in event.file_paths))
+        self.assertTrue(any(path.endswith(".txt") for path in event.file_paths))
+        self.assertIn("جزوهٔ آزمایشی", docx_text(event.file_bytes(".docx")))
+        self.assertIn(raw_transcript, event.file_bytes(".txt").decode("utf-8"))
+        self.assertTrue(any("جزوه" in caption for caption, _path in event.files))
 
     async def test_unusual_audio_codec_is_normalised(self):
         _event, stt, _ = await self._run("voice.wma", "audio")
@@ -220,7 +223,7 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
             event, stt, _ = await self._run(
                 "lecture.mp4", "video", video_bytes(duration=1.0, with_audio=True)
             )
-        self.assertTrue(any("جزوه" in item for item in event.responses))
+        self._assert_documents_delivered(event, "متن درس")
         stt.assert_awaited()
         self.assertEqual((await self.bot.db.stats())["done"], 1)
 

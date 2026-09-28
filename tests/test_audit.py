@@ -20,7 +20,7 @@ from gamas_bot.media import MediaToolError, parse_probe_output
 from gamas_bot.presentations import SlideText, load_presentation, slides_outline
 from gamas_bot.stt import Transcript, transcribe
 from gamas_bot.structuring import StructuringError, _provider_response, structure_presentation
-from support import make_settings
+from support import make_settings, sample_notes_json
 
 
 class StartupTests(unittest.IsolatedAsyncioTestCase):
@@ -137,7 +137,7 @@ class PresentationPreservationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_long_slide_only_outline_is_fully_sent_to_note_api(self):
         outline = "first " * 4000 + "LAST_SLIDE_MARKER"
-        with patch("gamas_bot.structuring._structure_chunk", new=AsyncMock(return_value="notes")) as chunker:
+        with patch("gamas_bot.structuring._structure_chunk", new=AsyncMock(return_value=sample_notes_json())) as chunker:
             await structure_presentation(outline, "", make_settings(), max_chars=4000)
         documents = [call.args[0] for call in chunker.await_args_list]
         self.assertIn("LAST_SLIDE_MARKER", "".join(documents))
@@ -146,7 +146,7 @@ class PresentationPreservationTests(unittest.IsolatedAsyncioTestCase):
     async def test_long_outline_and_audio_both_reach_note_api(self):
         outline = "slide " * 2000 + "LAST_SLIDE_MARKER"
         transcript = "audio " * 2000 + "LAST_AUDIO_MARKER"
-        with patch("gamas_bot.structuring._structure_chunk", new=AsyncMock(return_value="notes")) as chunker:
+        with patch("gamas_bot.structuring._structure_chunk", new=AsyncMock(return_value=sample_notes_json())) as chunker:
             await structure_presentation(outline, transcript, make_settings(), max_chars=4000)
         documents = [call.args[0] for call in chunker.await_args_list]
         self.assertIn("LAST_SLIDE_MARKER", "".join(documents))

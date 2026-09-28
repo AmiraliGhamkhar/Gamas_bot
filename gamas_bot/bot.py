@@ -6,6 +6,7 @@ import logging
 import re
 import shutil
 import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from telethon import Button, TelegramClient, events
@@ -14,6 +15,15 @@ from telethon.tl.types import MessageMediaWebPage
 
 from .config import Settings
 from .database import Database
+from .docx_export import (
+    DocumentMeta,
+    build_notes_docx,
+    build_plain_docx,
+    build_raw_text_document,
+    notes_docx_filename,
+    plain_docx_filename,
+    raw_text_filename,
+)
 from .logging_config import log_job_id
 from .media import (
     MediaToolError,
@@ -32,7 +42,12 @@ from .presentations import (
 )
 from .progress import JobProgress
 from .stt import transcribe
-from .structuring import StructuringError, structure_presentation, structure_transcript
+from .structuring import (
+    StructuredNotes,
+    StructuringError,
+    structure_presentation,
+    structure_transcript,
+)
 
 logger = logging.getLogger(__name__)
 AUDIO_EXTENSIONS = {
@@ -75,10 +90,11 @@ HELP_TEXT = (
     "چطور جزوه بسازم؟ 📚\n\n"
     "۱) فایل صوتی، ویدیو یا PowerPoint را بفرستید.\n"
     "۲) پیشرفت کار را در همان پیام دنبال کنید.\n"
-    "۳) جزوه پس از آماده‌شدن همین‌جا ارسال می‌شود.\n\n"
+    "۳) جزوه به شکل یک فایل Word مرتب (راست‌به‌چپ) به‌همراه متن خام پیاده‌شده "
+    "ارسال می‌شود.\n\n"
     "PowerPoint بدون صدا هم قابل استفاده است؛ در این حالت جزوه از متن و یادداشت "
     "اسلایدها ساخته می‌شود. اگر ساخت جزوهٔ هوشمند موقتاً در دسترس نباشد، متن خام را "
-    "از دست نمی‌دهید و همان را تحویل می‌گیرید."
+    "از دست نمی‌دهید و همان را در قالب فایل تحویل می‌گیرید."
 )
 FORMATS_TEXT = (
     "چه فایل‌هایی می‌توانم بفرستم؟ 🧰\n\n"
@@ -711,7 +727,8 @@ class StudyBot:
         progress = await JobProgress.create(
             event,
             submission_id=submission_id,
-            stage="ویدیو رسید و در صف است" if kind == "video" else "فایل صوتی رسید و در صف است",
+            stage="🎬 ویدیو رسید و در صف است" if kind == "video" else "🎧 فایل صوتی رسید و در صف است",
+            animate=self.settings.progress_animation,
         )
         task = asyncio.create_task(
             self._process_submission(
@@ -752,7 +769,10 @@ class StudyBot:
             user["id"], file_id, None, filename, mime_type, source_type="pptx"
         )
         progress = await JobProgress.create(
-            event, submission_id=submission_id, stage="PowerPoint رسید و در صف است"
+            event,
+            submission_id=submission_id,
+            stage="📊 PowerPoint رسید و در صف است",
+            animate=self.settings.progress_animation,
         )
         task = asyncio.create_task(
             self._process_presentation(
@@ -782,7 +802,7 @@ class StudyBot:
         log_token = log_job_id.set(_error_reference(submission_id))
         try:
             async with self._job_semaphore:
-                await progress.update(5, "شروع کردم")
+                await progress.update(5, "🚀 شروع کردم")
                 await self.db.set_submission_status(submission_id, "processing")
                 self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
                 workdir = Path(
@@ -794,28 +814,28 @@ class StudyBot:
                 if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
                     suffix = ".pptx" if kind == "native" else ".ppt"
                 deck_path = workdir / f"deck{suffix}"
-                await progress.update(10, "دارم فایل را از تلگرام می‌گیرم…")
+                await progress.update(10, "📥 دارم فایل را از تلگرام می‌گیرم…")
                 downloaded = await event.message.download_media(file=str(deck_path))
                 if not downloaded or not deck_path.exists():
                     raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
                 if deck_path.stat().st_size > self.settings.max_file_size:
                     raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
-                await progress.update(25, "فایل رسید؛ دارم بررسی‌اش می‌کنم")
+                await progress.update(25, "🔍 فایل رسید؛ دارم بررسی‌اش می‌کنم")
 
                 if kind == "legacy":
                     await progress.update(
                         32,
-                        "این فایل قدیمی است و اول به pptx تبدیل می‌شود",
+                        "♻️ این فایل قدیمی است و اول به pptx تبدیل می‌شود",
                     )
                     deck_path = await convert_to_pptx(
                         deck_path, workdir / "converted", self.settings
                     )
 
-                await progress.update(40, "دارم متن و صدای اسلایدها را بیرون می‌کشم")
+                await progress.update(40, "🗂️ دارم متن و صدای اسلایدها را بیرون می‌کشم")
                 content = await load_presentation(
                     deck_path, workdir / "media", self.settings
                 )
-                await progress.update(50, "دارم صداهای اسلایدها را آماده می‌کنم")
+                await progress.update(50, "🎚️ دارم صداهای اسلایدها را آماده می‌کنم")
                 deck_skips: list[str] = []
                 prepared = await prepare_audio(
                     content, workdir, self.settings, skipped_out=deck_skips
@@ -831,7 +851,7 @@ class StudyBot:
                         )
                     await progress.update(
                         70,
-                        "صدایی در این ارائه پیدا نشد؛ جزوه را از متن اسلایدها می‌سازم",
+                        "📝 صدایی در این ارائه پیدا نشد؛ جزوه را از متن اسلایدها می‌سازم",
                         slide_note,
                     )
                     transcript_text = ""
@@ -839,20 +859,21 @@ class StudyBot:
                 else:
                     await progress.update(
                         60,
-                        "صداها آماده شدند؛ دارم آن‌ها را به متن تبدیل می‌کنم",
+                        "🎙️ صداها آماده شدند؛ دارم آن‌ها را به متن تبدیل می‌کنم",
                         f"{slide_note}، {len(prepared.clips)} فایل صوتی، "
                         f"مجموعاً {_format_duration(prepared.total_duration)}",
                     )
                     if prepared.path.stat().st_size > self.settings.max_file_size:
                         raise ValueError("صدای این PowerPoint از سقف حجم ربات بزرگ‌تر است.")
                     result = await transcribe(prepared.path, self.settings)
-                    await progress.update(80, "متن صدا آماده شد")
+                    await progress.update(80, "✍️ متن صدا آماده شد")
                     transcript_text = result.text
                     engine = result.engine
 
-                await progress.update(85, "دارم مطالب را به شکل جزوه مرتب می‌کنم")
+                await progress.update(85, "📚 دارم مطالب را به شکل جزوه مرتب می‌کنم")
+                notes: StructuredNotes | None = None
                 try:
-                    structured = await structure_presentation(
+                    notes = await structure_presentation(
                         outline, transcript_text, self.settings
                     )
                     notice = ""
@@ -865,10 +886,9 @@ class StudyBot:
                         )
                     else:
                         logger.exception("Unexpected note structuring failure; returning raw material")
-                    structured = self._fallback_presentation_text(outline, transcript_text)
                     notice = (
-                        "\n\nنکته: این بار نتوانستم متن را به شکل جزوه مرتب کنم؛ "
-                        "متن استخراج‌شده را کامل فرستادم."
+                        "\n\nنکته: این بار نتوانستم متن را به شکل جزوهٔ ساختارمند دربیاورم؛ "
+                        "همان مطالب خام را در قالب فایل فرستادم."
                     )
                 # Without a prepared track the reasons live on the deck itself;
                 # either way the user should learn what was left out.
@@ -876,13 +896,34 @@ class StudyBot:
                 if skipped:
                     notice += "\n\nموارد نادیده‌گرفته‌شده: " + "؛ ".join(skipped[:10])
 
-                await progress.update(94, "جزوه آماده است؛ دارم نتیجه را نهایی می‌کنم")
+                await progress.update(94, "📑 جزوه آماده است؛ دارم نتیجه را نهایی می‌کنم")
                 await self.db.save_transcription(
-                    submission_id, engine, transcript_text, structured
+                    submission_id,
+                    engine,
+                    transcript_text,
+                    notes.to_json() if notes is not None else self._fallback_presentation_text(outline, transcript_text),
                 )
-                header = "جزوهٔ PowerPoint شما آماده است 📊\n\n"
-                await progress.update(97, "دارم جزوه را می‌فرستم")
-                await self._send_long_message(event, header + structured + notice, is_admin=is_admin)
+                await progress.update(97, "📤 دارم جزوه را می‌فرستم")
+                await self._deliver_result_documents(
+                    event,
+                    workdir,
+                    notes=notes,
+                    plain_text=self._fallback_presentation_text(outline, transcript_text),
+                    plain_title="جزوهٔ PowerPoint",
+                    reference=_error_reference(submission_id),
+                    source_name=filename,
+                    engine=None if engine == "slides-only" else engine,
+                    raw_sections=(
+                        [("متن اسلایدها", outline)] if outline.strip() else []
+                    )
+                    + (
+                        [("متن پیاده‌سازی‌شدهٔ صدای ارائه", transcript_text)]
+                        if transcript_text.strip()
+                        else []
+                    ),
+                    notice=notice,
+                    is_admin=is_admin,
+                )
                 await self.db.set_submission_status(submission_id, "done")
                 await progress.complete()
                 logger.info(
@@ -924,6 +965,7 @@ class StudyBot:
                     reference,
                 )
         finally:
+            await progress.aclose()
             if workdir:
                 shutil.rmtree(workdir, ignore_errors=True)
             log_job_id.reset(log_token)
@@ -975,7 +1017,7 @@ class StudyBot:
         log_token = log_job_id.set(_error_reference(submission_id))
         try:
             async with self._job_semaphore:
-                await progress.update(5, "شروع کردم")
+                await progress.update(5, "🚀 شروع کردم")
                 await self.db.set_submission_status(submission_id, "processing")
                 self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
                 workdir = Path(
@@ -989,13 +1031,13 @@ class StudyBot:
                 if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
                     suffix = ".media"
                 source_path = workdir / f"source{suffix}"
-                await progress.update(10, "دارم فایل را از تلگرام می‌گیرم…")
+                await progress.update(10, "📥 دارم فایل را از تلگرام می‌گیرم…")
                 downloaded = await event.message.download_media(file=str(source_path))
                 if not downloaded or not source_path.exists():
                     raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
                 if source_path.stat().st_size > self.settings.max_file_size:
                     raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
-                await progress.update(30, "فایل رسید؛ دارم صدا را بررسی می‌کنم")
+                await progress.update(30, "🔍 فایل رسید؛ دارم صدا را بررسی می‌کنم")
 
                 audio_path = await self._ensure_transcribable(
                     event, source_path, workdir, filename, kind, progress=progress
@@ -1003,11 +1045,12 @@ class StudyBot:
                 if audio_path.stat().st_size > self.settings.max_file_size:
                     raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
 
-                await progress.update(55, "دارم صدا را به متن تبدیل می‌کنم")
+                await progress.update(55, "🎙️ دارم صدا را به متن تبدیل می‌کنم")
                 result = await transcribe(audio_path, self.settings)
-                await progress.update(80, "متن آماده شد؛ دارم آن را به شکل جزوه مرتب می‌کنم")
+                await progress.update(80, "✍️ متن آماده شد؛ دارم آن را به شکل جزوه مرتب می‌کنم")
+                notes: StructuredNotes | None = None
                 try:
-                    structured = await structure_transcript(result.text, self.settings)
+                    notes = await structure_transcript(result.text, self.settings)
                 except Exception as exc:
                     if isinstance(exc, StructuringError):
                         logger.warning(
@@ -1017,20 +1060,33 @@ class StudyBot:
                         )
                     else:
                         logger.exception("Unexpected note structuring failure; returning raw transcript")
-                    structured = "## متن پیاده‌سازی‌شده\n\n" + result.text
                     notice = (
-                        "\n\nنکته: این بار نتوانستم متن را به شکل جزوه مرتب کنم؛ "
-                        "متن کامل را فرستادم."
+                        "\n\nنکته: این بار نتوانستم متن را به شکل جزوهٔ ساختارمند دربیاورم؛ "
+                        "همان متن خام را در قالب فایل فرستادم."
                     )
                 else:
                     notice = ""
-                await progress.update(94, "جزوه آماده است؛ دارم نتیجه را نهایی می‌کنم")
+                await progress.update(94, "📑 جزوه آماده است؛ دارم نتیجه را نهایی می‌کنم")
                 await self.db.save_transcription(
-                    submission_id, result.engine, result.text, structured
+                    submission_id,
+                    result.engine,
+                    result.text,
+                    notes.to_json() if notes is not None else "## متن پیاده‌سازی‌شده\n\n" + result.text,
                 )
-                header = "جزوهٔ شما آماده است 📖\n\n"
-                await progress.update(97, "دارم جزوه را می‌فرستم")
-                await self._send_long_message(event, header + structured + notice, is_admin=is_admin)
+                await progress.update(97, "📤 دارم جزوه را می‌فرستم")
+                await self._deliver_result_documents(
+                    event,
+                    workdir,
+                    notes=notes,
+                    plain_text="## متن پیاده‌سازی‌شده\n\n" + result.text,
+                    plain_title="جزوهٔ کلاس",
+                    reference=_error_reference(submission_id),
+                    source_name=filename,
+                    engine=result.engine,
+                    raw_sections=[("متن پیاده‌سازی‌شده", result.text)],
+                    notice=notice,
+                    is_admin=is_admin,
+                )
                 await self.db.set_submission_status(submission_id, "done")
                 await progress.complete()
                 logger.info(
@@ -1070,6 +1126,7 @@ class StudyBot:
                     reference,
                 )
         finally:
+            await progress.aclose()
             if workdir:
                 shutil.rmtree(workdir, ignore_errors=True)
             log_job_id.reset(log_token)
@@ -1096,7 +1153,7 @@ class StudyBot:
                 "داخل این فایل صدایی پیدا نکردم. لطفاً نسخه‌ای را بفرستید که صدا داشته باشد."
             )
         if kind == "video":
-            await progress.update(40, "دارم صدای ویدیو را جدا می‌کنم…")
+            await progress.update(40, "🎚️ دارم صدای ویدیو را جدا می‌کنم…")
             return await extract_audio_track(
                 source_path,
                 workdir,
@@ -1107,7 +1164,7 @@ class StudyBot:
         # The stored copy carries the resolved suffix, so unnamed uploads such
         # as Telegram voice notes (.ogg/opus) are no longer re-encoded blindly.
         if needs_transcode(filename or source_path.name, info):
-            await progress.update(40, "دارم فایل صوتی را برای تبدیل آماده می‌کنم…")
+            await progress.update(40, "🎚️ دارم فایل صوتی را برای تبدیل آماده می‌کنم…")
             return await extract_audio_track(
                 source_path,
                 workdir,
@@ -1136,6 +1193,99 @@ class StudyBot:
                 )
                 await asyncio.sleep(exc.seconds + 1)
                 await event.respond(rendered, parse_mode="html", buttons=buttons)
+
+    async def _send_document(
+        self, event, path: Path, caption: str, *, buttons=None
+    ) -> None:
+        """Send one file as a Telegram document, surviving flood waits."""
+        try:
+            await event.reply(caption, file=str(path), force_document=True, buttons=buttons)
+        except FloodWaitError as exc:
+            logger.warning(
+                "Telegram flood wait while sending document seconds=%s file=%s",
+                exc.seconds,
+                path.name,
+            )
+            await asyncio.sleep(exc.seconds + 1)
+            await event.reply(caption, file=str(path), force_document=True, buttons=buttons)
+
+    async def _deliver_result_documents(
+        self,
+        event,
+        workdir: Path,
+        *,
+        notes: StructuredNotes | None,
+        plain_text: str,
+        plain_title: str,
+        reference: str,
+        source_name: str | None,
+        engine: str | None,
+        raw_sections: list[tuple[str, str]],
+        notice: str,
+        is_admin: bool = False,
+    ) -> None:
+        """Deliver the polished RTL Word document plus the raw-text file.
+
+        The Word document is the primary deliverable. When it cannot be
+        generated (for example a broken python-docx installation) the notes
+        fall back to an in-chat text message so no content is ever lost; the
+        raw-text file is always sent.
+        """
+        meta = DocumentMeta(
+            reference=reference,
+            source_name=source_name,
+            engine=engine,
+            created_at=datetime.now(),
+        )
+        docx_path: Path | None = None
+        docx_title = plain_title
+        if notes is not None:
+            docx_title = notes.display_title
+            try:
+                docx_bytes = build_notes_docx(
+                    notes, font=self.settings.docx_font, meta=meta
+                )
+                docx_path = workdir / notes_docx_filename(notes, reference)
+                docx_path.write_bytes(docx_bytes)
+            except Exception:
+                logger.exception(
+                    "Word document generation failed; falling back to a chat message reference=%s",
+                    reference,
+                )
+                docx_path = None
+        else:
+            try:
+                docx_bytes = build_plain_docx(
+                    plain_title, plain_text, font=self.settings.docx_font, meta=meta
+                )
+                docx_path = workdir / plain_docx_filename(plain_title, reference)
+                docx_path.write_bytes(docx_bytes)
+            except Exception:
+                logger.exception(
+                    "Plain Word document generation failed; falling back to a chat message reference=%s",
+                    reference,
+                )
+                docx_path = None
+
+        if docx_path is not None:
+            caption = f"📖 جزوهٔ «{docx_title}» — فایل Word" + notice
+            # Telegram captions are capped at 1024 characters.
+            caption = caption[:1000]
+            await self._send_document(
+                event, docx_path, caption, buttons=main_menu(is_admin)
+            )
+        else:
+            body = (notes.to_markdown() if notes is not None else plain_text) + notice
+            await self._send_long_message(event, body, is_admin=is_admin)
+
+        txt_path = workdir / raw_text_filename(reference)
+        txt_path.write_text(
+            build_raw_text_document(
+                title=f"متن خام — {docx_title}", sections=raw_sections, meta=meta
+            ),
+            encoding="utf-8",
+        )
+        await self._send_document(event, txt_path, "📄 متن خام پیاده‌سازی‌شده.")
 
     @staticmethod
     def _users_text(users: list[dict]) -> str:

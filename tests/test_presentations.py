@@ -35,6 +35,7 @@ from support import (
     VIDEO_REL,
     build_deck,
     make_settings,
+    sample_notes_json,
     video_bytes,
     wav_bytes,
 )
@@ -416,7 +417,8 @@ class PresentationStructuringTests(unittest.IsolatedAsyncioTestCase):
         outline = "### اسلاید 1 — مقدمه"
         transcript = "این یک جملهٔ فارسی برای آزمون است. " * 400
         with patch(
-            "gamas_bot.structuring._structure_chunk", new=AsyncMock(return_value="جزوه")
+            "gamas_bot.structuring._structure_chunk",
+            new=AsyncMock(return_value=sample_notes_json()),
         ) as chunker:
             result = await structure_presentation(
                 outline, transcript, make_settings(), max_chars=4000
@@ -425,14 +427,16 @@ class PresentationStructuringTests(unittest.IsolatedAsyncioTestCase):
         for call in chunker.await_args_list:
             self.assertIn(outline, call.args[0])
             self.assertIn("محتوای ارائه", call.args[3])
-        self.assertIn("## بخش 1", result)
+        # Every chunk returned one section; they merge in chunk order.
+        self.assertEqual(len(result.sections), chunker.await_count)
 
     async def test_slide_only_decks_still_produce_a_booklet(self):
         with patch(
-            "gamas_bot.structuring._structure_chunk", new=AsyncMock(return_value="جزوه")
+            "gamas_bot.structuring._structure_chunk",
+            new=AsyncMock(return_value=sample_notes_json("جزوهٔ اسلایدها")),
         ) as chunker:
             result = await structure_presentation("### اسلاید 1", "", make_settings())
-        self.assertEqual(result, "جزوه")
+        self.assertEqual(result.title, "جزوهٔ اسلایدها")
         self.assertEqual(chunker.await_count, 1)
 
     async def test_empty_input_is_rejected(self):
