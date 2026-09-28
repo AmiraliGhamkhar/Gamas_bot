@@ -12,7 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 
 from gamas_bot.config import Settings
-from gamas_bot.stt import transcribe
+from gamas_bot.stt import STT_PROVIDERS, transcribe
 
 PERSIAN_NORMALIZATION = str.maketrans({"ي": "ی", "ى": "ی", "ك": "ک", "ۀ": "ه", "ة": "ه"})
 
@@ -46,15 +46,13 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
 
 async def run(args: argparse.Namespace) -> None:
     settings = Settings.from_env()
-    engines = ["speechmatics", "deepgram"]
-    missing = [
-        name for name, key in (
-            ("speechmatics", settings.speechmatics_api_key),
-            ("deepgram", settings.deepgram_api_key),
-        ) if not key
+    # Compare every STT engine that is actually configured (Speechmatics,
+    # Deepgram, and any OpenAI-compatible endpoint), in registry order.
+    engines = [
+        name for name, provider in STT_PROVIDERS.items() if provider.availability(settings)
     ]
-    if missing:
-        raise SystemExit("برای مقایسهٔ دو موتور، کلید این سرویس‌ها لازم است: " + ", ".join(missing))
+    if not engines:
+        raise SystemExit("هیچ سرویس STT پیکربندی نشده است؛ مقایسه‌ای برای انجام نیست.")
     rows: list[dict[str, str | float]] = []
     logging.basicConfig(level=logging.WARNING)
     for audio in args.audio:
@@ -67,8 +65,10 @@ async def run(args: argparse.Namespace) -> None:
             run_settings = replace(settings, stt_primary=engine, stt_fallback_enabled=False)
             started = time.perf_counter()
             try:
-                if engine == "speechmatics" and audio.stat().st_size >= 1_000_000_000:
-                    raise ValueError("Speechmatics direct-upload limit exceeded; sample was not sent")
+                if audio.stat().st_size >= STT_PROVIDERS[engine].max_upload(run_settings):
+                    raise ValueError(
+                        f"{engine} direct-upload limit exceeded; sample was not sent"
+                    )
                 result = await transcribe(audio, run_settings)
                 if result.engine != engine:
                     raise ValueError("Requested benchmark engine was not used")

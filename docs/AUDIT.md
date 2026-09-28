@@ -1,3 +1,58 @@
+# Repository review — 2026-09-28 (accuracy-first pipeline hardening)
+
+## Scope and result
+
+Focused re-audit of the **transcription → note-generation** path (`stt.py`,
+`structuring.py`, `config.py`, `bot.py` orchestration, `benchmark_stt.py`) with
+accuracy as the primary constraint and no behaviour changes to the working
+media/presentation/database pipeline. **Result: 190 tests pass** (up from
+164); no paid provider calls were made.
+
+## Root-cause findings and fixes
+
+| Problem | Root cause | Fix | Files |
+|---|---|---|---|
+| Gemini `HTTP 400` was undiagnosable in production. | Google answers bad/restricted keys and bad request fields with `400 INVALID_ARGUMENT` (e.g. `details[].reason: API_KEY_INVALID`), never 401, while `_structure_chunk` read and **discarded** the error body and logged only `status=400 request_id=unknown` (Google does not send `x-request-id`). | Parse the error body defensively and log only the provider's **structured metadata** (`status/type/code`, bounded `message`, `details[].reason`) with the configured key redacted and control characters stripped; attach the same sanitized detail to the raised `StructuringError`. Raw bodies are still never logged. | `structuring.py` |
+| `NOTE_API_MODEL=models/gemini-…` produced `…/models/models%2F…:generateContent` → guaranteed `400`. | Model name was URL-quoted verbatim into the path. | Strip a leading `models/` prefix before quoting. | `structuring.py` |
+| Gemini safety-blocked responses surfaced as "empty/invalid response". | `candidates[0]` indexing raised `IndexError` before `promptFeedback.blockReason` was read — a real possibility for medical lecture content. | Missing candidates now raise with the sanitized `blockReason`; the raw-material fallback still applies. | `structuring.py` |
+| Speechmatics ran the **throughput** tier (`"model": "standard"`) for an accuracy-first Persian bot. | Hardcoded tier; Speechmatics documents `enhanced` as its highest-accuracy model and supports a native 20k-term custom dictionary. | `SPEECHMATICS_MODEL` (default `enhanced`) and `SPEECHMATICS_ADDITIONAL_VOCAB` (native `additional_vocab`; no LLM layer). A contract without the enhanced tier rejects submission and the existing fallback keeps jobs recoverable. | `stt.py`, `config.py` |
+| STT catalogue not extensible (two hardcoded names, ad-hoc 1 GB special case). | Provider list, key checks, size routing inline in `transcribe()`/`_provider_key()`/validation/benchmark. | Small frozen `STTProvider` registry `(availability, attempt, max_upload)`; new optional `openai_compatible` STT engine (OpenAI/Groq `whisper`, local vLLM/Ollama gateways via `POST /audio/transcriptions`); per-engine size caps generalize the 1 GB rule. Default two-provider behaviour, fallback chain and guard rails are unchanged. | `stt.py`, `config.py`, `scripts/benchmark_stt.py` |
+
+## Deliberately not changed (accuracy constraints)
+
+- **No audio chunking for STT.** Files are attempted whole per engine and, above
+  a provider's direct-upload cap, routed to another configured engine.
+  Chunking would lose word context at every boundary; Speechmatics/Deepgram
+  batch APIs accept multi-hour files natively. This is now enforced in one
+  place (`STTProvider.max_upload`) instead of an inline 1 GB branch.
+- Note-generation chunking stays **sequential** at sentence boundaries with
+  chronological `بخش N` joining; long decks keep the complete outline
+  behaviours from the previous review.
+- Raw-transcript safety net in `bot.py` (structuring failure ⇒ full raw
+  transcript/outline delivered and stored) is untouched and re-verified by a
+  new bot-level regression test covering a Gemini `HTTP 400`.
+- No embeddings/RAG/normalization layer; prompts forbid inventing facts.
+
+## Tests added (`tests/test_provider_robustness.py`, 26 tests)
+
+Gemini/`400` handling (sanitized `API_KEY_INVALID` visible, key redaction,
+HTML-body suppression, non-retry), OpenAI-compatible note errors + `429`
+retry, `models/` normalization, safety `blockReason`, STT provider
+switching/fallback chain incl. `openai_compatible`, sparse-file size routing
+(1 GB skip, >all-caps fail-fast), OpenAI STT request shape/privacy, Speechmatics
+enhanced + vocab config, config validation, chunk ordering/completeness on
+mixed Persian-English medical text (numbers, `Metformin`, `HbA1c`),
+benchmark three-engine coverage, and raw-transcript delivery/storage after a
+note-generation `HTTP 400`.
+
+## Validation
+
+`python -m unittest discover -s tests`: **190 passed** (0 failures, 0 skips).
+`ruff check gamas_bot scripts tests --select E9,F`: passed.
+`python -m pip check`, `compileall`: passed.
+
+---
+
 # Repository review — 2026-09-28: system media/office dependencies removed
 
 ## Scope and result

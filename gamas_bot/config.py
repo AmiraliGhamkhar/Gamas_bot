@@ -53,6 +53,22 @@ class Settings:
     max_concurrent_jobs: int
     stt_poll_interval: float
     stt_job_timeout: int
+    # Accuracy-first Speechmatics tier: "enhanced" is the provider's highest
+    # accuracy model; "standard" only exists for throughput-bound deployments.
+    speechmatics_model: str = "enhanced"
+    # Optional custom dictionary (native Speechmatics additional_vocab) for
+    # drug names and English technical terms; empty disables it.
+    speechmatics_additional_vocab: tuple[str, ...] = ()
+    # Optional OpenAI-compatible STT endpoint (POST /audio/transcriptions) such
+    # as OpenAI whisper-1, Groq whisper-large-v3, or a local vLLM/Ollama
+    # gateway. Unset base URL means the provider is not configured. The key is
+    # optional for local endpoints. Files at/above stt_openai_max_upload are
+    # routed to another configured engine instead of being chunked, because
+    # splitting audio would hurt boundary accuracy.
+    stt_openai_base_url: str | None = None
+    stt_openai_api_key: str | None = None
+    stt_openai_model: str = "whisper-1"
+    stt_openai_max_upload: int = 25_000_000
     # The historical Gemini fields remain for backwards compatibility.  New
     # installations can select Gemini, Anthropic, or any OpenAI-compatible API
     # through the provider-neutral NOTE_API_* settings below.
@@ -121,11 +137,33 @@ class Settings:
             raise ValueError("TELEGRAM_API_ID و ADMIN_IDS باید عددی باشند.") from exc
 
         primary = _text("STT_PRIMARY", "speechmatics").lower()
-        if primary not in {"speechmatics", "deepgram"}:
-            raise ValueError("STT_PRIMARY فقط می‌تواند speechmatics یا deepgram باشد.")
+        if primary not in {"speechmatics", "deepgram", "openai_compatible"}:
+            raise ValueError(
+                "STT_PRIMARY فقط می‌تواند speechmatics، deepgram یا openai_compatible باشد."
+            )
         language = _text("STT_LANGUAGE", "fa")
         if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?", language):
             raise ValueError("STT_LANGUAGE باید کد زبان معتبر مانند fa یا en-US باشد.")
+
+        speechmatics_model = _text("SPEECHMATICS_MODEL", "enhanced").lower()
+        if speechmatics_model not in {"standard", "enhanced"}:
+            raise ValueError("SPEECHMATICS_MODEL فقط می‌تواند standard یا enhanced باشد.")
+        vocab_terms: list[str] = []
+        seen_terms: set[str] = set()
+        for term in re.split(r"[,،؛\n]+", os.getenv("SPEECHMATICS_ADDITIONAL_VOCAB", "")):
+            term = term.strip()
+            if term and term.casefold() not in seen_terms:
+                seen_terms.add(term.casefold())
+                vocab_terms.append(term)
+        if len(vocab_terms) > 20_000:
+            raise ValueError(
+                "تعداد اصطلاح‌های SPEECHMATICS_ADDITIONAL_VOCAB از سقف سرویس (۲۰ هزار) بیشتر است."
+            )
+        stt_openai_base = os.getenv("STT_OPENAI_BASE_URL", "").strip() or None
+        if stt_openai_base:
+            parsed_stt_url = urlparse(stt_openai_base)
+            if parsed_stt_url.scheme not in {"http", "https"} or not parsed_stt_url.netloc:
+                raise ValueError("STT_OPENAI_BASE_URL باید یک نشانی کامل http یا https باشد.")
 
         note_provider = _text("NOTE_API_PROVIDER", "gemini").lower()
         note_provider = {
@@ -166,6 +204,7 @@ class Settings:
             note_timeout = int(_text("NOTE_API_TIMEOUT_SECONDS", "240"))
             note_retries = int(_text("NOTE_API_RETRIES", "2"))
             note_max_tokens = int(_text("NOTE_API_MAX_OUTPUT_TOKENS", "8192"))
+            stt_openai_max = int(_text("STT_OPENAI_MAX_UPLOAD_BYTES", "25000000"))
             log_max_bytes = int(_text("LOG_MAX_BYTES", "10000000"))
             log_backup_count = int(_text("LOG_BACKUP_COUNT", "5"))
         except ValueError as exc:
@@ -178,6 +217,8 @@ class Settings:
             raise ValueError("اندازه فایل، هم‌زمانی و زمان‌های انتظار باید مثبت باشند.")
         if note_retries < 0 or note_retries > 10:
             raise ValueError("NOTE_API_RETRIES باید بین صفر تا ۱۰ باشد.")
+        if stt_openai_max <= 0:
+            raise ValueError("STT_OPENAI_MAX_UPLOAD_BYTES باید مثبت باشد.")
         if log_max_bytes <= 0 or log_backup_count < 0:
             raise ValueError("تنظیمات چرخش فایل لاگ معتبر نیستند.")
         log_level = _text("LOG_LEVEL", "INFO").upper()
@@ -242,6 +283,12 @@ class Settings:
             max_concurrent_jobs=max_jobs,
             stt_poll_interval=poll_interval,
             stt_job_timeout=job_timeout,
+            speechmatics_model=speechmatics_model,
+            speechmatics_additional_vocab=tuple(vocab_terms),
+            stt_openai_base_url=stt_openai_base.rstrip("/") if stt_openai_base else None,
+            stt_openai_api_key=(os.getenv("STT_OPENAI_API_KEY", "").strip() or None),
+            stt_openai_model=_text("STT_OPENAI_MODEL", "whisper-1"),
+            stt_openai_max_upload=stt_openai_max,
             note_api_provider=note_provider,
             note_api_key=(os.getenv("NOTE_API_KEY", "").strip() or None),
             note_api_base_url=note_base_url,
@@ -279,5 +326,11 @@ class Settings:
             missing.append("TELEGRAM_API_HASH")
         if missing:
             raise ValueError("متغیرهای ضروری تنظیم نشده‌اند: " + ", ".join(missing))
-        if not self.speechmatics_api_key and not self.deepgram_api_key:
-            raise ValueError("حداقل یکی از SPEECHMATICS_API_KEY یا DEEPGRAM_API_KEY لازم است.")
+        if (
+            not self.speechmatics_api_key
+            and not self.deepgram_api_key
+            and not self.stt_openai_base_url
+        ):
+            raise ValueError(
+                "حداقل یکی از SPEECHMATICS_API_KEY، DEEPGRAM_API_KEY یا STT_OPENAI_BASE_URL لازم است."
+            )

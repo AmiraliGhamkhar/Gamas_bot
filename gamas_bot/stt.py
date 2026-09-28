@@ -5,6 +5,7 @@ import json
 import logging
 import math
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
@@ -12,6 +13,7 @@ from urllib.parse import quote
 import aiohttp
 
 from .config import Settings
+from .structuring import _endpoint
 
 logger = logging.getLogger(__name__)
 
@@ -27,9 +29,22 @@ class Transcript:
     confidence: float | None = None
 
 
-def _provider_key(settings: Settings, engine: str) -> str | None:
-    """API key configured for the given STT engine, if any."""
-    return settings.speechmatics_api_key if engine == "speechmatics" else settings.deepgram_api_key
+@dataclass(frozen=True, slots=True)
+class STTProvider:
+    """One speech-to-text engine and the metadata the router needs.
+
+    ``availability`` returns a truthy marker only when the engine is actually
+    configured (an API key, or a base URL for keyless local gateways).
+    ``attempt`` runs one bounded provider attempt. ``max_upload`` is the
+    largest file the engine accepts in a single request: larger files are
+    routed to another configured engine instead of being split, because
+    chunked audio loses word context at every boundary.
+    """
+
+    availability: Callable[[Settings], str | None]
+    attempt: Callable[[aiohttp.ClientSession, Path, Settings], Awaitable[Transcript]]
+    label: str
+    max_upload: Callable[[Settings], int]
 
 
 def _speechmatics_confidence(payload: dict) -> float | None:
@@ -65,13 +80,25 @@ def _http_error(stage: str, status: int) -> STTError:
 
 
 def speechmatics_config(settings: Settings) -> dict:
-    """Job configuration for the Speechmatics batch API."""
+    """Job configuration for the Speechmatics batch API.
+
+    ``model`` defaults to ``enhanced`` — Speechmatics documents it as the
+    highest-accuracy tier (``standard`` only prioritises throughput), and this
+    pipeline is accuracy-first. ``additional_vocab`` is the provider's native
+    custom-dictionary feature: exact terms for drug names and English
+    technical vocabulary, with no LLM or post-processing layer involved.
+    """
+    transcription_config: dict[str, object] = {
+        "language": settings.stt_language,
+        "model": settings.speechmatics_model,
+    }
+    if settings.speechmatics_additional_vocab:
+        transcription_config["additional_vocab"] = [
+            {"content": term} for term in settings.speechmatics_additional_vocab
+        ]
     return {
         "type": "transcription",
-        "transcription_config": {
-            "language": settings.stt_language,
-            "model": "standard",
-        },
+        "transcription_config": transcription_config,
     }
 
 
@@ -186,33 +213,128 @@ async def _deepgram(
     return transcript
 
 
+def _openai_transcript(payload: object) -> Transcript:
+    """Normalize an OpenAI-compatible /audio/transcriptions response."""
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise STTError("سرویس تبدیل گفتار سازگار با OpenAI متن قابل‌استفاده‌ای تولید نکرد.")
+    # Whisper-style APIs return no per-word confidence, so the router treats
+    # this engine like any other un-scored provider.
+    return Transcript("openai_compatible", text.strip(), None)
+
+
+async def _openai_compatible_stt(
+    session: aiohttp.ClientSession, audio_path: Path, settings: Settings
+) -> Transcript:
+    """POST to an OpenAI-compatible STT endpoint (OpenAI, Groq, vLLM, ...)."""
+    assert settings.stt_openai_base_url
+    form = aiohttp.FormData()
+    form.add_field("model", settings.stt_openai_model)
+    form.add_field("language", settings.stt_language)
+    with audio_path.open("rb") as audio:
+        form.add_field(
+            "file",
+            audio,
+            filename=audio_path.name,
+            content_type="application/octet-stream",
+        )
+        headers = (
+            {"Authorization": f"Bearer {settings.stt_openai_api_key}"}
+            if settings.stt_openai_api_key
+            else {}
+        )
+        async with session.post(
+            _endpoint(settings.stt_openai_base_url, "audio/transcriptions"),
+            headers=headers,
+            data=form,
+        ) as response:
+            if response.status != 200:
+                raise _http_error("OpenAI-compatible STT request", response.status)
+            payload = await response.json(content_type=None)
+    return _openai_transcript(payload)
+
+
+def _openai_stt_availability(settings: Settings) -> str | None:
+    """A base URL (key optional, e.g. a local vLLM gateway) makes it usable."""
+    return "configured" if settings.stt_openai_base_url else None
+
+
+# Provider registry. Order matters: it defines both the fallback chain and
+# the benchmark order. The lambdas resolve the module-level callables lazily
+# so tests can keep patching gamas_bot.stt._<provider>.
+STT_PROVIDERS: dict[str, STTProvider] = {
+    "speechmatics": STTProvider(
+        availability=lambda settings: settings.speechmatics_api_key,
+        attempt=lambda session, audio, settings: _speechmatics(session, audio, settings),
+        label="Speechmatics",
+        # Speechmatics Batch SaaS rejects direct multipart uploads at 1 GB.
+        max_upload=lambda settings: 1_000_000_000,
+    ),
+    "deepgram": STTProvider(
+        availability=lambda settings: settings.deepgram_api_key,
+        attempt=lambda session, audio, settings: _deepgram(session, audio, settings),
+        label="Deepgram",
+        # Deepgram supports direct pre-recorded uploads up to 2 GB.
+        max_upload=lambda settings: 2_000_000_000,
+    ),
+    "openai_compatible": STTProvider(
+        availability=_openai_stt_availability,
+        attempt=lambda session, audio, settings: _openai_compatible_stt(
+            session, audio, settings
+        ),
+        label="OpenAI-compatible STT",
+        # Whisper-style gateways reject large requests (e.g. 25 MB), so the cap
+        # is configurable; local servers can raise it.
+        max_upload=lambda settings: settings.stt_openai_max_upload,
+    ),
+}
+
+
 async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
     """Transcribe with the configured primary provider and optional fallback."""
-    providers = {
-        "speechmatics": _speechmatics,
-        "deepgram": _deepgram,
-    }
     primary = settings.stt_primary
-    secondary = "deepgram" if primary == "speechmatics" else "speechmatics"
     order = [primary]
     if settings.stt_fallback_enabled:
-        order.append(secondary)
-    elif not _provider_key(settings, primary):
+        order += [name for name in STT_PROVIDERS if name != primary]
+    elif not STT_PROVIDERS[primary].availability(settings):
         # Fallback is off, but refusing every job because the *primary* engine
-        # has no key while the other one does would be pointless.
+        # is not configured while another one is would be pointless.
+        others = [name for name in STT_PROVIDERS if name != primary]
         logger.warning(
-            "STT primary provider=%s has no API key; using %s instead", primary, secondary
+            "STT primary provider=%s is not configured; using another configured engine",
+            primary,
         )
-        order = [secondary]
-    if audio_path.stat().st_size >= 1_000_000_000:
-        # Speechmatics Batch SaaS rejects direct multipart uploads at 1 GB.
-        # Deepgram supports direct pre-recorded uploads up to 2 GB.
-        order = ["deepgram"] if settings.deepgram_api_key else []
-        if not order:
-            raise STTError("برای فایل‌های یک گیگابایت یا بزرگ‌تر، کلید Deepgram لازم است.")
-    available = [name for name in order if _provider_key(settings, name)]
-    if not available:
-        raise STTError("هیچ کلید API برای سرویس تبدیل گفتار تنظیم نشده است.")
+        order = others
+    configured = [name for name in order if STT_PROVIDERS[name].availability(settings)]
+    if not configured:
+        raise STTError("هیچ کلید یا نشانی API برای سرویس تبدیل گفتار تنظیم نشده است.")
+
+    # Whole-file transcription only: chunking audio would cost word context at
+    # every boundary. Files at/above a provider's direct-upload limit are
+    # routed to another configured engine that accepts them.
+    file_size = audio_path.stat().st_size
+    usable: list[str] = []
+    oversized: list[str] = []
+    for name in configured:
+        (oversized if file_size >= STT_PROVIDERS[name].max_upload(settings) else usable).append(
+            name
+        )
+    if not usable:
+        limits = "، ".join(
+            f"{STT_PROVIDERS[name].label}:تا حد {STT_PROVIDERS[name].max_upload(settings) / 1_000_000_000:g} گیگابایت"
+            for name in configured
+        )
+        raise STTError(
+            "حجم فایل از سقف آپلود مستقیم همهٔ سرویس‌های پیکربندی‌شده بیشتر است "
+            f"({limits}). فایل کوچک‌تری بفرستید یا سرویس دیگری را فعال کنید."
+        )
+    if oversized:
+        logger.info(
+            "STT providers skipped for size file_bytes=%s skipped=%s remaining=%s",
+            file_size,
+            oversized,
+            usable,
+        )
 
     timeout = aiohttp.ClientTimeout(
         total=None, connect=45, sock_read=min(max(settings.stt_job_timeout, 120), 660)
@@ -220,20 +342,20 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
     failures: list[str] = []
     outcomes: list[Transcript] = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for index, engine in enumerate(available):
+        for index, engine in enumerate(usable):
             started = time.monotonic()
             logger.info(
                 "STT attempt started provider=%s file_bytes=%s attempt=%s/%s",
                 engine,
                 audio_path.stat().st_size,
                 index + 1,
-                len(available),
+                len(usable),
             )
             try:
                 # Bound the whole provider attempt, including upload, polling
                 # and transcript download (socket read timeouts are not totals).
                 transcript = await asyncio.wait_for(
-                    providers[engine](session, audio_path, settings),
+                    STT_PROVIDERS[engine].attempt(session, audio_path, settings),
                     timeout=settings.stt_job_timeout,
                 )
                 logger.info(
@@ -248,7 +370,7 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
                     transcript.confidence is not None
                     and transcript.confidence < settings.stt_min_confidence
                 )
-                if not is_low or index == len(available) - 1:
+                if not is_low or index == len(usable) - 1:
                     break
                 logger.warning(
                     "Low STT confidence from %s (%.3f); trying fallback",
@@ -268,7 +390,7 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
                 # fragments. Keep only our own sanitized errors and error types.
                 detail = str(exc) if isinstance(exc, STTError) else type(exc).__name__
                 failures.append(f"{engine}: {detail}")
-                if index == len(available) - 1 and not outcomes:
+                if index == len(usable) - 1 and not outcomes:
                     raise STTError("؛ ".join(failures)) from None
         if not outcomes:
             raise STTError("؛ ".join(failures) or "تبدیل گفتار ناموفق بود.")
