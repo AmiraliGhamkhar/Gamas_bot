@@ -8,11 +8,13 @@ stub binaries — every fixture the suite probes/merges must actually decode.
 from __future__ import annotations
 
 import io
+import shutil
 import tempfile
 import wave
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from gamas_bot.config import Settings
 
@@ -23,6 +25,100 @@ RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 # The committed legacy-deck fixtures come from the MIT-licensed ppt2pptx test
 # corpus (https://github.com/HuiTurn/ppt2pptx); see tests/fixtures/README.md.
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
+
+
+class FakeJobEvent:
+    """Minimal Telethon event double that also records sent document files.
+
+    File payloads are snapshotted at send time because the job's temporary
+    directory is removed right after delivery.
+    """
+
+    def __init__(self, source: Path | None = None):
+        self.source = source
+        self.replies: list[str] = []
+        self.responses: list[str] = []
+        self.files: list[tuple[str, str]] = []
+        self.file_payloads: list[tuple[str, bytes]] = []
+        if source is not None:
+            self.message = SimpleNamespace(download_media=self._download)
+
+    async def _download(self, file: str) -> str:
+        shutil.copyfile(self.source, file)
+        return file
+
+    async def reply(self, text: str = "", *, file=None, **_kwargs) -> None:
+        if file is not None:
+            path = str(file)
+            try:
+                payload = Path(path).read_bytes()
+            except OSError:
+                payload = b""
+            self.files.append((text, path))
+            self.file_payloads.append((path, payload))
+        else:
+            self.replies.append(text)
+
+    async def respond(self, text: str = "", **_kwargs) -> None:
+        self.responses.append(text)
+
+    @property
+    def file_paths(self) -> list[str]:
+        return [path for _caption, path in self.files]
+
+    def file_bytes(self, suffix: str) -> bytes:
+        """Content of the first sent file whose name ends with ``suffix``."""
+        for path, payload in self.file_payloads:
+            if path.endswith(suffix):
+                return payload
+        raise AssertionError(f"no sent file ends with {suffix!r}: {self.file_paths}")
+
+
+def sample_notes_json(title: str = "جزوهٔ آزمایشی") -> str:
+    """A valid strict-JSON note answer, as the note API is now required to emit."""
+    return (
+        "{"
+        f'"title": "{title}",'
+        '"summary": "خلاصهٔ آزمایشی",'
+        '"sections": [{'
+        '"heading": "بخش نخست",'
+        '"paragraphs": ["متن بخش نخست"],'
+        '"bullets": ["نکتهٔ یک"],'
+        '"key_points": ["نکتهٔ کلیدی"],'
+        '"callouts": [{"kind": "نکته", "text": "یادآوری تست"}]'
+        "}],"
+        '"key_points": ["نکتهٔ کلیدی کل"],'
+        '"glossary": [{"term": "HbA1c", "definition": "هموگلوبین گلیکوزیله"}]'
+        "}"
+    )
+
+
+class FakeSessionContext:
+    """Stand-in for aiohttp.ClientSession used as an async context manager."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+def fake_session_factory(**_kwargs):
+    return FakeSessionContext()
+
+
+def docx_text(docx_bytes: bytes) -> str:
+    """All paragraph and table text of a generated Word document."""
+    import io
+
+    import docx as docx_library
+
+    document = docx_library.Document(io.BytesIO(docx_bytes))
+    parts = [paragraph.text for paragraph in document.paragraphs]
+    for table in document.tables:
+        for row in table.rows:
+            parts.append(" | ".join(cell.text for cell in row.cells))
+    return "\n".join(parts)
 
 
 def make_settings(**overrides) -> Settings:

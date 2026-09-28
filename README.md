@@ -21,13 +21,17 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 - Slide-by-slide lecture notes
 - Speechmatics + Deepgram STT, plus optional OpenAI-compatible STT
 - Configurable STT fallback and per-provider upload-size routing
-- Provider-neutral note generation (Gemini, Anthropic, OpenAI-compatible APIs)
+- Detailed, privacy-safe STT metrics logging (attempts, timings, polls, confidence, word counts — never transcript text)
+- Provider-neutral note generation (Gemini, Anthropic, OpenAI-compatible APIs) behind a strict JSON-only system prompt with validation and a bounded repair pass
+- Polished right-to-left Word (.docx) deliverable: complex-script fonts, shaded summary/callout boxes, RTL tables, Persian (Jalali) date header, page-number footer
+- Raw-transcript companion `.txt` file sent alongside every result
+- Playful animated progress bar: rocket-head bar, cycling spinner frames, stage emoji and a celebration on completion
 - Inline glass-button menus for users and administrators
 - Per-job editable progress bars
 - Background processing for long jobs
 - SQLite + WAL
 - Automatic temporary-file cleanup
-- Long-message splitting for Telegram
+- Long-message splitting for Telegram (fallback path when document generation fails)
 - Admin commands and user management
 - Windows-friendly PowerShell setup and a Linux systemd unit
 
@@ -74,9 +78,13 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
                    ▼
        Configured Note API
   Gemini / Anthropic / OpenAI-compatible
+  (strict JSON system prompt)
                    │
                    ▼
-            Structured Notes
+     Validated structured notes
+                   │
+                   ▼
+   RTL Word (.docx) + raw-text (.txt)
                    │
                    ▼
                 Telegram
@@ -96,8 +104,10 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 No system media or office software is required: stream probing, audio
 extraction/merging and legacy `.ppt` conversion run inside Python through the
 [`av`](https://pyav.org/) (PyAV) and [`ppt2pptx`](https://github.com/HuiTurn/ppt2pptx)
-packages. The FFmpeg *libraries* ship inside the `av` wheel — no `ffmpeg`,
-`ffprobe` or `soffice` binary is ever executed.
+packages, and Word documents are written by the pure-Python
+[`python-docx`](https://python-docx.readthedocs.io/) package. The FFmpeg
+*libraries* ship inside the `av` wheel — no `ffmpeg`, `ffprobe` or `soffice`
+binary is ever executed.
 
 ---
 
@@ -266,9 +276,79 @@ Common controls:
 NOTE_API_TIMEOUT_SECONDS=240
 NOTE_API_RETRIES=2
 NOTE_API_MAX_OUTPUT_TOKENS=8192
+# Only for openai_compatible providers that implement response_format:
+NOTE_API_JSON_MODE=false
 ```
 
+#### Strict JSON structured output
+
+The note API is driven by a strict system prompt (sent as the OpenAI
+`system` message, the Anthropic `system` field, or Gemini's
+`systemInstruction` plus native `responseMimeType: application/json`).
+The model must answer with a single JSON object:
+
+```json
+{
+  "title": "…",
+  "summary": "…",
+  "sections": [
+    {
+      "heading": "…",
+      "paragraphs": ["…"],
+      "bullets": ["…"],
+      "key_points": ["…"],
+      "table": {"headers": ["…"], "rows": [["…"]]},
+      "callouts": [{"kind": "نکته | هشدار | یادآوری", "text": "…"}]
+    }
+  ],
+  "key_points": ["…"],
+  "glossary": [{"term": "…", "definition": "…"}]
+}
+```
+
+The answer is validated and normalised in code: fenced code blocks,
+surrounding prose and trailing commas are repaired; unknown fields and
+empty sections are dropped; callout kinds are normalised. An invalid
+answer triggers exactly one bounded repair pass before the job falls
+back to delivering the raw material. Long transcripts are chunked as
+before and the per-chunk JSON notes are merged in order.
+
+`NOTE_API_JSON_MODE=true` additionally sends
+`response_format: {"type": "json_object"}` to OpenAI-compatible
+gateways — it is opt-in because not every compatible service implements
+it (Gemini's native JSON mode is always enabled).
+
 Transient `429` and `5xx` responses and network failures are retried with bounded backoff. Raw provider error bodies are never logged, but on a failed request the bot parses the provider's structured error metadata (Gemini `error.status`/`details[].reason`, OpenAI `error.type`/`code`, and the bounded error message) and logs it with the key redacted — so a Gemini `HTTP 400` such as `API_KEY_INVALID` is visible and fixable in the logs without exposing keys or lecture content. Gemini authentication uses a header rather than a URL query parameter, and a `models/`-prefixed model name is accepted and normalized. Responses blocked by provider safety filters are reported with their block reason. If a provider explicitly reports an output-token limit, the incomplete note is rejected and the bot delivers the extracted source material instead. Increase `NOTE_API_MAX_OUTPUT_TOKENS` only within the selected model’s limits.
+
+---
+
+## Deliverables: Word document + raw text
+
+Every finished job is delivered as **two documents** instead of a long
+chat message:
+
+1. **`جزوه - <title> - GMS-XXXXXX.docx`** — a polished right-to-left Word
+   document generated with [python-docx](https://python-docx.readthedocs.io/):
+   - RTL paragraphs (`w:bidi`), RTL runs and complex-script fonts
+   - A title block with the Persian (Jalali) date, source filename, STT
+     engine and tracking reference
+   - Shaded summary box, per-section key-point boxes, colour-coded
+     callouts (نکته / هشدار / یادآوری) and RTL tables with a coloured
+     header row
+   - Page-number footers and document metadata
+   - Font configurable with `DOCX_FONT` (default `Tahoma`, which is
+     present everywhere; set `B Nazanin`, `Vazirmatn`, … when your
+     audience has them)
+2. **`متن خام - GMS-XXXXXX.txt`** — the raw extracted texts (the
+   transcript, and for presentations the slide text as well) with a
+   small metadata header, exactly as produced by the pipeline.
+
+If the note API is unavailable, the Word document is still generated
+from the raw material (headings/bullets preserved) and a notice is
+attached to its caption. If Word generation itself fails (for example a
+broken python-docx installation), the notes fall back to the old
+in-chat text message so content is never lost — the `.txt` file is
+always sent.
 
 ---
 
@@ -518,7 +598,7 @@ Users do not need to memorize commands. `/start` opens an inline button menu wit
 - **قالب‌ها** — supported file types
 - **حریم خصوصی** — what is sent to external providers
 
-Each accepted upload gets one status message that is edited through the queue, download, media preparation, STT, note-generation, save, and delivery stages. A text progress bar and percentage remain visible throughout the job.
+Each accepted upload gets one status message that is edited through the queue, download, media preparation, STT, note-generation, save, and delivery stages. The progress bar is animated: a 🚀 rides the fill edge, a braille spinner cycles on every frame, a stage emoji tells the story (📥 → ⬇️ → 🎚️ → 🎙️ → 📝 → 📖 → 📤), and completion gets a 🎉. While a single stage runs for a long time (STT can take hours), a background ticker keeps re-editing the message with the next spinner frame — every ~5 seconds by default, backing off automatically on Telegram flood waits, and capped so a job can never leak animation edits. Disable the ticker with `PROGRESS_ANIMATION_ENABLED=false`.
 
 Administrators get an additional **پنل مدیریت** button. Statistics, user listing, broadcast, ban, and unban are all available through buttons; actions requiring text or a user ID prompt for the next message and provide a cancel button.
 
@@ -708,12 +788,13 @@ Gamas_bot/
 │   ├── bot.py             # Telethon handlers, job orchestration
 │   ├── config.py          # environment-driven settings
 │   ├── database.py        # SQLite (aiosqlite) + migrations
+│   ├── docx_export.py     # RTL Word document + raw-text exporters
 │   ├── media.py           # PyAV/ppt2pptx worker helpers (no external binaries)
 │   ├── media_worker.py    # child process: probe/extract/merge/convert
 │   ├── presentations.py   # PowerPoint parsing and audio extraction
-│   ├── progress.py        # editable per-job Telegram progress bars
+│   ├── progress.py        # animated per-job Telegram progress bars
 │   ├── logging_config.py  # text/JSON logging and file rotation
-│   ├── structuring.py     # provider-neutral note generation
+│   ├── structuring.py     # strict-JSON note generation (provider-neutral)
 │   └── stt.py             # Speechmatics / Deepgram clients
 │
 ├── migrations/
@@ -931,7 +1012,7 @@ installation is required; the `av` and `ppt2pptx` wheels provide everything.
 
 ### Logging and error handling
 
-Default production logs go to stdout/journald and include provider attempts, durations, external-tool exit codes, job IDs, migrations, startup dependency checks, retry events, and local error tracebacks. STT failures retain sanitized status/type information instead of response bodies or raw client exception chains. Transcript/prompt contents and API keys are not intentionally logged. Users receive a stable reference such as `GMS-000123` on job failure; search it together with the submission ID in server logs.
+Default production logs go to stdout/journald and include provider attempts, durations, external-tool exit codes, job IDs, migrations, startup dependency checks, retry events, and local error tracebacks. STT logging is metric-rich but content-free: job start with the routing decision (primary, fallback flag, candidate engines), per-attempt start/completion with elapsed time, confidence, character and word counts, Speechmatics job submission/poll/completion lifecycle (job ID, poll count, per-poll status at DEBUG), transcript-download timings, low-confidence threshold decisions, sanitized failure details, and the final engine-selection summary with the total elapsed time. Transcript/prompt contents and API keys are never logged. Users receive a stable reference such as `GMS-000123` on job failure; search it together with the submission ID in server logs.
 
 ```dotenv
 LOG_LEVEL=INFO                 # DEBUG, INFO, WARNING, ERROR, CRITICAL

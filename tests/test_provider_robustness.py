@@ -8,7 +8,7 @@ raw-transcript preservation when note generation fails.
 
 from __future__ import annotations
 
-import html
+
 import json
 import tempfile
 import unittest
@@ -29,7 +29,7 @@ from gamas_bot.structuring import (
 )
 from scripts.benchmark_stt import normalize_words
 
-from support import make_settings, wav_bytes
+from support import FakeJobEvent, docx_text, make_settings, sample_notes_json, wav_bytes
 
 
 class _FakeResponse:
@@ -178,7 +178,7 @@ class GeminiHttp400Tests(unittest.IsolatedAsyncioTestCase):
             note_api_base_url="https://api.example.test/v1",
             note_api_model="model",
         )
-        ok = {"choices": [{"message": {"content": "جزوهٔ آماده"}}]}
+        ok = {"choices": [{"message": {"content": sample_notes_json()}}]}
         session = _FakeSession([
             _FakeResponse(429, {"error": {"message": "quota"}}, headers={"Retry-After": "0"}),
             _FakeResponse(200, ok),
@@ -187,7 +187,7 @@ class GeminiHttp400Tests(unittest.IsolatedAsyncioTestCase):
             "gamas_bot.structuring.aiohttp.ClientSession", lambda **kwargs: session
         ), patch("gamas_bot.structuring.asyncio.sleep", new=AsyncMock()):
             result = await structure_transcript("متن درس", settings)
-        self.assertEqual(result, "جزوهٔ آماده")
+        self.assertEqual(result.title, "جزوهٔ آزمایشی")
         self.assertEqual(len(session.calls), 2)
 
     def test_error_detail_is_bounded_and_control_free(self):
@@ -301,6 +301,119 @@ class STTRoutingExtensionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.engine, "deepgram")
 
 
+class STTMetricsLoggingTests(unittest.IsolatedAsyncioTestCase):
+    """The extra STT logging must be metric-rich but content-free."""
+
+    async def test_successful_attempt_logs_metrics_without_transcript_text(self):
+        transcript_text = "این یک متن آزمایشی برای سنجش لاگ‌هاست"
+        with tempfile.NamedTemporaryFile() as audio:
+            with patch(
+                "gamas_bot.stt._speechmatics",
+                new=AsyncMock(return_value=Transcript("speechmatics", transcript_text, 0.87)),
+            ), self.assertLogs("gamas_bot.stt", level="INFO") as logs:
+                result = await transcribe(Path(audio.name), make_settings(stt_fallback_enabled=False))
+        self.assertEqual(result.engine, "speechmatics")
+        joined = "\n".join(logs.output)
+        self.assertIn("STT job started", joined)
+        self.assertIn("candidate_engines=['speechmatics']", joined)
+        self.assertIn("STT attempt completed", joined)
+        self.assertIn("confidence=0.870", joined)
+        self.assertIn(f"text_chars={len(transcript_text)}", joined)
+        self.assertIn(f"text_words={len(transcript_text.split())}", joined)
+        self.assertIn("STT job finished", joined)
+        self.assertIn("engine=speechmatics", joined)
+        self.assertIn("total_elapsed_seconds=", joined)
+        # Metrics only: the transcript itself must never be logged.
+        self.assertNotIn(transcript_text, joined)
+
+    async def test_failure_logs_sanitized_detail_and_low_confidence_logs_threshold(self):
+        with tempfile.NamedTemporaryFile() as audio:
+            with patch(
+                "gamas_bot.stt._speechmatics",
+                new=AsyncMock(return_value=Transcript("speechmatics", "متن کم‌اعتماد", 0.30)),
+            ), patch(
+                "gamas_bot.stt._deepgram",
+                new=AsyncMock(side_effect=STTError("سرویس پاسخ نداد")),
+            ), self.assertLogs("gamas_bot.stt", level="WARNING") as logs:
+                result = await transcribe(Path(audio.name), make_settings())
+        self.assertEqual(result.engine, "speechmatics")
+        joined = "\n".join(logs.output)
+        self.assertIn("Low STT confidence", joined)
+        self.assertIn("threshold 0.650", joined)
+        self.assertIn("STT provider failed", joined)
+        self.assertIn("provider=deepgram", joined)
+        self.assertIn("detail=سرویس پاسخ نداد", joined)
+        self.assertIn("error_type=STTError", joined)
+
+    async def test_speechmatics_polling_and_job_lifecycle_are_logged(self):
+        from gamas_bot.stt import _speechmatics
+
+        polls = {"count": 0}
+
+        class FakeResponse:
+            def __init__(self, status, payload):
+                self.status = status
+                self._payload = payload
+
+            async def json(self, content_type=None):
+                return self._payload
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+
+        class FakeSession:
+            def post(self, url, **_kwargs):
+                # Job submission: the first poll flips the job to "done".
+                return FakeResponse(200, {"id": "job-123", "job": {"status": "running"}})
+
+            def get(self, url, **_kwargs):
+                if "/transcript" in url:
+                    return FakeResponse(
+                        200,
+                        {
+                            "results": [
+                                {
+                                    "type": "word",
+                                    "alternatives": [{"content": "سلام", "confidence": 0.9}],
+                                }
+                            ]
+                        },
+                    )
+                polls["count"] += 1
+                status = "done" if polls["count"] >= 1 else "running"
+                return FakeResponse(200, {"job": {"status": status}})
+
+        settings = make_settings(stt_poll_interval=0.01)
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio, self.assertLogs(
+            "gamas_bot.stt", level="DEBUG"
+        ) as logs:
+            transcript = await _speechmatics(FakeSession(), Path(audio.name), settings)
+        self.assertEqual(transcript.text, "سلام")
+        joined = "\n".join(logs.output)
+        self.assertIn("Speechmatics job submitted", joined)
+        self.assertIn("job_id=job-123", joined)
+        self.assertIn("upload_elapsed_seconds=", joined)
+        self.assertIn("Speechmatics job poll", joined)
+        self.assertIn("status=done", joined)
+        self.assertIn("Speechmatics job finished", joined)
+        self.assertIn("Speechmatics transcript downloaded", joined)
+        self.assertIn("result_items=", joined)
+
+
+class _SessionCtx:
+    def __init__(self, inner):
+        self._inner = inner
+
+    async def __aenter__(self):
+        return self._inner
+
+    async def __aexit__(self, *exc):
+        return False
+
+
 class OpenAIStTShapeTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_targets_audio_transcriptions_with_bearer(self):
         from gamas_bot.stt import _openai_compatible_stt
@@ -379,9 +492,17 @@ class ChunkOrderAndCoverageTests(unittest.IsolatedAsyncioTestCase):
         chunks = [f"جملهٔ {index} از درس." for index in range(1, 6)]
         seen: list[str] = []
 
-        async def fake_chunk(chunk, settings, session, prompt=None):
+        async def fake_chunk(chunk, settings, session, prompt=None, **_kwargs):
             seen.append(chunk)
-            return f"محتوای {chunk.split()[1]}"
+            return json.dumps(
+                {
+                    "title": "جزوه",
+                    "sections": [
+                        {"heading": f"بخش {chunk.split()[1]}", "paragraphs": [chunk]}
+                    ],
+                },
+                ensure_ascii=False,
+            )
 
         with patch(
             "gamas_bot.structuring.split_transcript", return_value=chunks
@@ -392,10 +513,13 @@ class ChunkOrderAndCoverageTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await structure_transcript("متن طولانی", make_settings())
         self.assertEqual(seen, chunks)
-        self.assertIn("## بخش 1", result)
-        self.assertIn("## بخش 5", result)
-        positions = [result.index(f"## بخش {index}") for index in range(1, 6)]
-        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(
+            [section.heading for section in result.sections],
+            [f"بخش {index}" for index in range(1, 6)],
+        )
+        self.assertEqual(
+            [section.paragraphs[0] for section in result.sections], chunks
+        )
 
     def test_mixed_medical_text_survives_chunking_complete_and_ordered(self):
         sentence = (
@@ -478,26 +602,6 @@ class SettingsExtensionTests(unittest.TestCase):
             settings.validate_runtime()
 
 
-class FakeMediaEvent:
-    def __init__(self, source: Path):
-        self.source = source
-        self.replies: list[str] = []
-        self.responses: list[str] = []
-        self.message = SimpleNamespace(download_media=self._download)
-
-    async def _download(self, file: str) -> str:
-        import shutil
-
-        shutil.copyfile(self.source, file)
-        return file
-
-    async def reply(self, text: str, **_kwargs) -> None:
-        self.replies.append(text)
-
-    async def respond(self, text: str, **_kwargs) -> None:
-        self.responses.append(text)
-
-
 class TranscriptPreservationTests(unittest.IsolatedAsyncioTestCase):
     async def test_gemini_failure_still_delivers_and_stores_the_raw_transcript(self):
         full_text = (
@@ -520,7 +624,7 @@ class TranscriptPreservationTests(unittest.IsolatedAsyncioTestCase):
                 submission_id = await bot.db.create_submission(
                     user["id"], "f1", None, "class.mp3", None, source_type="audio"
                 )
-                event = FakeMediaEvent(source)
+                event = FakeJobEvent(source)
                 with patch(
                     "gamas_bot.bot.transcribe",
                     new=AsyncMock(return_value=Transcript("deepgram", full_text, 0.93)),
@@ -534,9 +638,13 @@ class TranscriptPreservationTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     await bot._process_submission(event, submission_id, "class.mp3", "audio")
                 stt.assert_awaited_once()
-                delivered = html.unescape("\n".join(event.responses))
-                self.assertIn(full_text, delivered)
-                self.assertIn("نتوانستم متن را به شکل جزوه مرتب کنم", delivered)
+                # The transcript is delivered as files (plain Word + raw text)
+                # and the notice explains the degraded result.
+                self.assertEqual(len(event.files), 2)
+                self.assertIn(full_text, event.file_bytes(".txt").decode("utf-8"))
+                self.assertIn(full_text, docx_text(event.file_bytes(".docx")))
+                captions = "\n".join(caption for caption, _path in event.files)
+                self.assertIn("نتوانستم متن را به شکل جزوهٔ ساختارمند دربیاورم", captions)
                 # The successful transcript must remain available in storage too.
                 async with bot.db._lock:
                     cursor = await bot.db._db().execute(

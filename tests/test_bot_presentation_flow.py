@@ -13,34 +13,22 @@ from gamas_bot.bot import (
     _presentation_metadata,
 )
 from gamas_bot.stt import Transcript
+from gamas_bot.structuring import parse_structured_notes
 
 from support import (
     AUDIO_REL,
     FIXTURES_DIR,
+    FakeJobEvent,
     build_deck,
+    docx_text,
     make_settings,
+    sample_notes_json,
     wav_bytes,
 )
 
 
-class FakeEvent:
-    """Minimal stand-in for a Telethon NewMessage event."""
-
-    def __init__(self, source: Path):
-        self.source = source
-        self.replies: list[str] = []
-        self.responses: list[str] = []
-        self.message = SimpleNamespace(download_media=self._download)
-
-    async def _download(self, file: str) -> str:
-        shutil.copyfile(self.source, file)
-        return file
-
-    async def reply(self, text: str, **_kwargs) -> None:
-        self.replies.append(text)
-
-    async def respond(self, text: str, **_kwargs) -> None:
-        self.responses.append(text)
+class FakeEvent(FakeJobEvent):
+    """Minimal stand-in for a Telethon NewMessage event, with file capture."""
 
 
 def fake_document(filename: str | None, mime_type: str | None, size: int = 1024):
@@ -123,7 +111,8 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
             "gamas_bot.bot.transcribe",
             new=AsyncMock(return_value=Transcript("deepgram", "متن پیاده‌سازی‌شده", 0.93)),
         ) as stt, patch(
-            "gamas_bot.bot.structure_presentation", new=AsyncMock(return_value="# جزوهٔ نهایی")
+            "gamas_bot.bot.structure_presentation",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json("جزوهٔ نهایی"))),
         ) as structuring:
             event, submission_id = await self._run_job(deck)
 
@@ -135,7 +124,16 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(any("صداها آماده شدند" in item for item in event.responses))
         self.assertTrue(any("۲ فایل صوتی" in item or "2 فایل صوتی" in item for item in event.responses))
-        self.assertTrue(any("جزوهٔ نهایی" in item for item in event.responses))
+        # The deliverables are documents now: a polished RTL Word file plus
+        # the raw-text companion, both sent with captions.
+        self.assertEqual(len(event.files), 2)
+        self.assertTrue(any(path.endswith(".docx") for path in event.file_paths))
+        self.assertTrue(any(path.endswith(".txt") for path in event.file_paths))
+        self.assertIn("جزوهٔ نهایی", docx_text(event.file_bytes(".docx")))
+        self.assertIn("متن بخش نخست", docx_text(event.file_bytes(".docx")))
+        raw_text = event.file_bytes(".txt").decode("utf-8")
+        self.assertIn("متن پیاده‌سازی‌شدهٔ صدای ارائه", raw_text)
+        self.assertIn("متن اسلایدها", raw_text)
 
         clips = await self.bot.db.presentation_clips(submission_id)
         self.assertEqual(len(clips), 2)
@@ -152,13 +150,19 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
             slides=[{"title": "فقط متن", "bullets": ["نکتهٔ مهم"]}],
         )
         with patch("gamas_bot.bot.transcribe", new=AsyncMock()) as stt, patch(
-            "gamas_bot.bot.structure_presentation", new=AsyncMock(return_value="جزوهٔ متنی")
+            "gamas_bot.bot.structure_presentation",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
         ) as structuring:
             event, submission_id = await self._run_job(deck)
 
         stt.assert_not_awaited()
         structuring.assert_awaited_once()
         self.assertTrue(any("صدایی در این ارائه پیدا نشد" in item for item in event.responses))
+        self.assertEqual(len(event.files), 2)
+        self.assertTrue(any(path.endswith(".docx") for path in event.file_paths))
+        raw_text = event.file_bytes(".txt").decode("utf-8")
+        self.assertIn("متن اسلایدها", raw_text)
+        self.assertNotIn("متن پیاده‌سازی‌شدهٔ صدای ارائه", raw_text)
         stats = await self.bot.db.stats()
         self.assertEqual(stats["done"], 1)
 
@@ -175,11 +179,12 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
         legacy = self.root / "legacy.ppt"
         shutil.copyfile(FIXTURES_DIR / "visual_minimal.ppt", legacy)
         with patch("gamas_bot.bot.transcribe", new=AsyncMock()) as stt, patch(
-            "gamas_bot.bot.structure_presentation", new=AsyncMock(return_value="جزوه")
+            "gamas_bot.bot.structure_presentation",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
         ) as structuring:
             event, _ = await self._run_job(legacy, kind="legacy")
         self.assertTrue(any("تبدیل می‌شود" in item for item in event.responses))
-        self.assertTrue(any("جزوه" in item for item in event.responses))
+        self.assertTrue(any("جزوه" in caption for caption, _path in event.files))
         stt.assert_not_awaited()
         structuring.assert_awaited_once()
         outline = structuring.await_args.args[0]
@@ -219,9 +224,12 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(side_effect=RuntimeError("gemini down")),
         ):
             event, submission_id = await self._run_job(deck)
-        booklet = "\n".join(event.responses)
-        self.assertIn("متن خام صدا", booklet)
-        self.assertIn("نتوانستم متن را به شکل جزوه مرتب کنم", booklet)
+        captions = "\n".join(caption for caption, _path in event.files)
+        self.assertIn("نتوانستم متن را به شکل جزوهٔ ساختارمند دربیاورم", captions)
+        # The raw material still reaches the user: plain Word doc + txt file.
+        self.assertEqual(len(event.files), 2)
+        self.assertIn("متن خام صدا", event.file_bytes(".txt").decode("utf-8"))
+        self.assertIn("متن خام صدا", docx_text(event.file_bytes(".docx")))
         stats = await self.bot.db.stats()
         self.assertEqual(stats["done"], 1)
 
@@ -231,7 +239,8 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
             slides=[{"title": "عنوان", "media": [("a.wav", wav_bytes(15.0), AUDIO_REL)]}],
         )
         with patch("gamas_bot.bot.transcribe", new=AsyncMock(return_value=Transcript("deepgram", "متن", 0.7))), patch(
-            "gamas_bot.bot.structure_presentation", new=AsyncMock(return_value="جزوه")
+            "gamas_bot.bot.structure_presentation",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
         ):
             await self._run_job(deck)
         self.assertEqual(list(self.settings.temp_dir.glob("deck-*")), [])
