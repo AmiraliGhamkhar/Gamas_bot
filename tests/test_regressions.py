@@ -25,7 +25,7 @@ from gamas_bot.media import build_merge_command, needs_transcode, MediaInfo
 from gamas_bot.presentations import natural_key, prepare_audio, read_presentation
 from gamas_bot.stt import Transcript, transcribe
 
-from support import AUDIO_REL, build_deck, fake_media_bytes, make_settings, stub_tools
+from support import AUDIO_REL, build_deck, make_settings, wav_bytes
 
 
 def plain_text(rendered: str) -> str:
@@ -133,13 +133,13 @@ class TranscodeDecisionTests(unittest.TestCase):
 
 
 class MergeCommandTests(unittest.TestCase):
-    def test_merge_pins_the_first_audio_stream_of_every_input(self):
+    def test_merge_command_passes_every_input_to_the_worker(self):
         command = build_merge_command(
-            "ffmpeg", [Path("a.mp4"), Path("b.m4a")], Path("out.wav")
+            [Path("a.mp4"), Path("b.m4a")], Path("out.wav")
         )
-        graph = command[command.index("-filter_complex") + 1]
-        self.assertIn("[0:a:0]", graph)
-        self.assertIn("[1:a:0]", graph)
+        self.assertIn("gamas_bot.media_worker", command)
+        self.assertEqual(command[command.index("--") + 1:], ["a.mp4", "b.m4a"])
+        self.assertEqual(command[command.index("--silence") + 1], "0.5")
 
 
 class MediaOrderingTests(unittest.TestCase):
@@ -231,16 +231,16 @@ class PreparedAudioReportingTests(unittest.IsolatedAsyncioTestCase):
     async def test_skip_reasons_survive_when_no_clip_is_usable(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
-            settings = make_settings(**stub_tools(root / "bin"))
             deck = build_deck(
                 root / "deck.pptx",
                 slides=[
                     {
                         "title": "یک",
-                        "media": [("a.m4a", fake_media_bytes(0.1), AUDIO_REL)],
+                        "media": [("a.wav", wav_bytes(0.1), AUDIO_REL)],
                     }
                 ],
             )
+            settings = make_settings()
             content = read_presentation(deck, root / "media", settings)
             reasons: list[str] = []
             prepared = await prepare_audio(

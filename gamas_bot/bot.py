@@ -17,11 +17,11 @@ from .database import Database
 from .logging_config import log_job_id
 from .media import (
     MediaToolError,
+    check_media_worker,
     convert_to_pptx,
     extract_audio_track,
     needs_transcode,
     probe_media,
-    tool_available,
 )
 from .presentations import (
     PresentationError,
@@ -60,6 +60,11 @@ UNSUPPORTED_FILE_MESSAGE = (
     "• فایل PowerPoint\n\n"
     "فهرست دقیق پسوندها در بخش «قالب‌ها» است."
 )
+UNSUPPORTED_PRESENTATION_MESSAGE = (
+    "فایل‌های ODP/OTP پشتیبانی نمی‌شوند. ♻️\n\n"
+    "لطفاً ارائه را در برنامهٔ PowerPoint (یا LibreOffice) با پسوند pptx ذخیره "
+    "و دوباره ارسال کنید."
+)
 WELCOME_TEXT = (
     "سلام! 👋\n\n"
     "فایل صوتی، ویدیوی کلاس یا PowerPoint را بفرستید؛ من محتوایش را به یک جزوهٔ "
@@ -79,8 +84,9 @@ FORMATS_TEXT = (
     "چه فایل‌هایی می‌توانم بفرستم؟ 🧰\n\n"
     "• صوت: MP3، M4A، WAV، OGG، OPUS، FLAC، WMA و AMR\n"
     "• ویدیو: MP4، MKV، MOV، AVI، WEBM و ویدیوی گرد تلگرام\n"
-    "• ارائه: PPTX، PPTM، PPSX، PPSM، POTX، POTM، PPT، PPS، POT، ODP و OTP\n\n"
-    "قالب‌های صوتی و ویدیویی دیگری که FFmpeg بخواند هم معمولاً قابل پردازش‌اند."
+    "• ارائه: PPTX، PPTM، PPSX، PPSM، POTX، POTM، PPT، PPS، POT\n\n"
+    "قالب‌های صوتی و ویدیویی رایج دیگر هم معمولاً قابل پردازش‌اند. فایل‌های "
+    "ODP/OTP پشتیبانی نمی‌شوند؛ آن‌ها را با پسوند pptx ذخیره کنید."
 )
 PRIVACY_TEXT = (
     "حریم خصوصی 🔐\n\n"
@@ -429,20 +435,13 @@ class StudyBot:
             self.settings.stt_primary,
             self.settings.max_concurrent_jobs,
         )
-        for name, binary, required in (
-            ("ffmpeg", self.settings.ffmpeg_bin, True),
-            ("ffprobe", self.settings.ffprobe_bin, True),
-            ("LibreOffice", self.settings.soffice_bin, self.settings.presentation_legacy_enabled),
-        ):
-            available = tool_available(binary)
-            log = logger.info if available or not required else logger.warning
-            log(
-                "External dependency name=%s binary=%s available=%s required=%s",
-                name,
-                binary,
-                available,
-                required,
-            )
+        try:
+            summary = await check_media_worker()
+            logger.info("Media worker ready %s", summary)
+        except MediaToolError as exc:
+            # Non-fatal, like the old binary checks: media jobs will fail with
+            # an explicit error until the Python dependencies are repaired.
+            logger.warning("Media worker self-check failed: %s", exc)
 
     def _clean_stale_workdirs(self) -> None:
         """Delete job folders left behind by a crash or a hard restart.
@@ -706,12 +705,6 @@ class StudyBot:
                 "Rejected oversized %s from user %s: %s bytes", kind, user["telegram_id"], size
             )
             return
-        if kind == "video" and not tool_available(self.settings.ffmpeg_bin):
-            await event.reply(
-                "فعلاً نمی‌توانم ویدیو را پردازش کنم. اگر می‌توانید، صدای آن را جدا بفرستید."
-            )
-            logger.warning("Video submission rejected because ffmpeg is unavailable")
-            return
         submission_id = await self.db.create_submission(
             user["id"], file_id, duration, filename, mime_type, source_type=kind
         )
@@ -738,6 +731,10 @@ class StudyBot:
     ) -> None:
         if not self.settings.presentation_enabled:
             await event.reply("فعلاً امکان ساخت جزوه از PowerPoint فعال نیست.")
+            return
+        if kind == "unsupported":
+            await event.reply(UNSUPPORTED_PRESENTATION_MESSAGE)
+            logger.info("Rejected unsupported presentation format filename=%s", filename)
             return
         if kind == "legacy" and not self.settings.presentation_legacy_enabled:
             await event.reply(
@@ -1090,11 +1087,10 @@ class StudyBot:
         """Return a file the STT providers accept, transcoding only when needed."""
         progress = progress or JobProgress(event)
         info = None
-        if tool_available(self.settings.ffprobe_bin):
-            try:
-                info = await probe_media(source_path, self.settings)
-            except MediaToolError as exc:
-                logger.warning("Probing the upload failed: %s", exc)
+        try:
+            info = await probe_media(source_path, self.settings)
+        except MediaToolError as exc:
+            logger.warning("Probing the upload failed: %s", exc)
         if info is not None and not info.has_audio:
             raise ValueError(
                 "داخل این فایل صدایی پیدا نکردم. لطفاً نسخه‌ای را بفرستید که صدا داشته باشد."
@@ -1111,12 +1107,6 @@ class StudyBot:
         # The stored copy carries the resolved suffix, so unnamed uploads such
         # as Telegram voice notes (.ogg/opus) are no longer re-encoded blindly.
         if needs_transcode(filename or source_path.name, info):
-            if not tool_available(self.settings.ffmpeg_bin):
-                logger.warning(
-                    "Codec %s may be unsupported but ffmpeg is unavailable; uploading as is",
-                    info.audio_codec if info else "unknown",
-                )
-                return source_path
             await progress.update(40, "دارم فایل صوتی را برای تبدیل آماده می‌کنم…")
             return await extract_audio_track(
                 source_path,

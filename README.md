@@ -35,10 +35,11 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 
 | Type | Formats |
 |---|---|
-| Audio | MP3, M4A, WAV, OGG, FLAC, WMA, AMR and other FFmpeg-supported formats |
+| Audio | MP3, M4A, WAV, OGG, FLAC, WMA, AMR and other formats PyAV's bundled FFmpeg libraries can read |
 | Video | MP4, MKV, MOV, AVI, Telegram video notes |
 | Presentations (native) | PPTX, PPTM, PPSX, PPSM, POTX, POTM |
-| Presentations (legacy, via LibreOffice) | PPT, PPS, POT, ODP, OTP |
+| Presentations (legacy, converted in-process) | PPT, PPS, POT |
+| Presentations (rejected with instructions) | ODP, OTP — re-save as PPTX first |
 
 ---
 
@@ -54,7 +55,7 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
       │            │            │
     Audio        Video     PowerPoint
       │            │            │
-      │         FFmpeg     Slide Parser
+      │        PyAV Worker   Slide Parser
       │            │            │
       └────────────┼────────────┘
                    ▼
@@ -87,54 +88,29 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 
 - Windows 10/11 or Linux
 - Python 3.11+
-- FFmpeg + FFprobe
-- LibreOffice (only required for legacy presentation formats)
 - Telegram bot token
 - Telegram API ID + API hash
 - At least one STT API key (Speechmatics or Deepgram)
 - A note-generation API (Gemini, Anthropic, or OpenAI-compatible; optional)
 
+No system media or office software is required: stream probing, audio
+extraction/merging and legacy `.ppt` conversion run inside Python through the
+[`av`](https://pyav.org/) (PyAV) and [`ppt2pptx`](https://github.com/HuiTurn/ppt2pptx)
+packages. The FFmpeg *libraries* ship inside the `av` wheel — no `ffmpeg`,
+`ffprobe` or `soffice` binary is ever executed.
+
 ---
 
 ## Installation — Windows
 
-### 1. Install FFmpeg
-
-Using WinGet:
-
-```powershell
-winget install Gyan.FFmpeg
-```
-
-Verify:
-
-```powershell
-ffmpeg -version
-ffprobe -version
-```
-
-### 2. Install LibreOffice
-
-Only required for legacy formats (PPT, PPS, POT, ODP, OTP):
-
-```powershell
-winget install TheDocumentFoundation.LibreOffice
-```
-
-Verify:
-
-```powershell
-soffice --version
-```
-
-### 3. Clone the repository
+### 1. Clone the repository
 
 ```powershell
 git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git
 cd Gamas_bot
 ```
 
-### 4. Create a virtual environment
+### 2. Create a virtual environment
 
 ```powershell
 py -3.11 -m venv .venv
@@ -148,14 +124,14 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 5. Install dependencies
+### 3. Install dependencies
 
 ```powershell
 python -m pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 6. Configure environment variables
+### 4. Configure environment variables
 
 ```powershell
 Copy-Item .env.example .env
@@ -185,8 +161,6 @@ At least one of the two STT API keys is required. The note API is optional; if i
 ## Installation — Linux
 
 ```bash
-sudo apt install ffmpeg libreoffice-impress   # or your distribution's equivalents
-
 git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git
 cd Gamas_bot
 
@@ -361,8 +335,8 @@ PowerPoint files receive additional processing:
          │          │          │
          │          └────┬─────┘
          │               ▼
-         │             FFmpeg
-         │               │
+         │          PyAV Worker
+         │            (audio)
          └───────────────┤
                          ▼
                    Speech-to-Text
@@ -401,13 +375,17 @@ PPTX_MAX_TOTAL_DURATION_SECONDS=21600
 PPTX_MAX_UNPACKED_BYTES=4000000000
 PPTX_WAV_LIMIT_BYTES=700000000
 
-FFMPEG_BIN=ffmpeg
-FFPROBE_BIN=ffprobe
-SOFFICE_BIN=soffice
-
-FFMPEG_TIMEOUT_SECONDS=3600
-SOFFICE_TIMEOUT_SECONDS=600
+# Timeout for one media operation (probe/extract/merge), seconds
+MEDIA_TIMEOUT_SECONDS=3600
+# Timeout for one legacy .ppt → .pptx conversion, seconds
+PPT_CONVERT_TIMEOUT_SECONDS=600
 ```
+
+The legacy variable names `FFMPEG_TIMEOUT_SECONDS` and
+`SOFFICE_TIMEOUT_SECONDS` are still honoured as fallbacks when the new names
+are absent, so existing `.env` files keep working. The obsolete
+`FFMPEG_BIN`/`FFPROBE_BIN`/`SOFFICE_BIN` settings no longer exist and are
+silently ignored.
 
 Disable PowerPoint support entirely:
 
@@ -427,7 +405,7 @@ perfect slide-by-slide narration matching are not guaranteed. More material may
 mean more API requests and higher cost.
 
 Clip duration limits use available probe results. Unknown durations cannot be
-fully bounded in advance; install FFprobe and apply host disk/CPU/memory limits.
+fully bounded in advance; apply host disk/CPU/memory limits.
 Inserted silence is included in WAV-size estimation, but reported narration
 duration excludes that silence.
 
@@ -538,11 +516,14 @@ handling remains available in chats where the bot receives messages.
 | Video | Extract audio → STT |
 | Video note | Extract audio → STT |
 | PPTX / PPTM / PPSX / PPSM / POTX / POTM | Slides + audio + notes |
-| PPT / PPS / POT / ODP / OTP | LibreOffice → PPTX → same pipeline |
+| PPT / PPS / POT | ppt2pptx → PPTX → same pipeline |
+| ODP / OTP | Rejected with instructions to re-save as PPTX |
 | PDF / image / ZIP | Rejected with instructions |
 | Plain text | Ignored |
 
-When FFprobe is available and successfully reads the file, uploads without an audio stream are rejected before consuming STT resources. GIF files are not treated as lecture videos.
+When the probe successfully reads the file, uploads without an audio stream are
+rejected before consuming STT resources. GIF files are not treated as lecture
+videos.
 
 ---
 
@@ -555,11 +536,13 @@ python -m unittest discover -s tests -v
 ```
 
 The default suite uses temporary databases, synthetic presentation packages,
-mock provider responses and executable tool stubs; no API keys are needed.
-The real-media smoke tests run if `ffmpeg` is on `PATH`, or when
-`FFMPEG_TEST_BIN=/absolute/path/to/ffmpeg` is set. Otherwise those three tests
-are explicitly skipped. The stub-based suite targets Linux/POSIX; Windows
-application setup is documented but has not been validated by this CI matrix.
+real generated media files (WAV/MP3/MP4 via PyAV), mock provider responses and
+committed legacy `.ppt` fixtures; no API keys and no system media binaries are
+needed. Media smoke tests run the actual in-repo worker on every platform, so
+probing, extraction, merging, Opus/WAV output, protocol-whitelist enforcement
+and legacy conversion are always exercised. The suite targets Linux/POSIX;
+Windows application setup is documented but has not been validated by this CI
+matrix.
 
 CI (`.github/workflows/tests.yml`) runs the suite and critical static checks on
 Python 3.11, 3.12 and 3.13 on Linux. To reproduce additional checks locally:
@@ -614,14 +597,15 @@ PowerPoint packages are validated before extraction. Checks include:
 - Entry-count and unpacked-size limits
 - Media reference validation
 
-FFmpeg/FFprobe inputs are limited to local `file`/`pipe` protocols so uploaded
-playlists cannot fetch HTTP or other network URLs. This is **not** a complete
-sandbox: media parsers and LibreOffice still process untrusted bytes and may
-access local files readable by their service account. Use patched OS packages,
-a dedicated non-root account, filesystem/container isolation and resource limits.
-On POSIX, timed-out/cancelled external tools and their process group are killed;
-on Windows only the direct process is explicitly killed, so use a supervisor
-that cleans up child processes too.
+Media-worker inputs are opened with the local `file`/`pipe` protocol whitelist
+so uploaded playlists cannot fetch HTTP or other network URLs. This is **not** a
+complete sandbox: the media libraries and legacy-conversion parser still
+process untrusted bytes and may access local files readable by their service
+account. Keep `av`/`ppt2pptx` updated, use a dedicated non-root account,
+filesystem/container isolation and resource limits. On POSIX, timed-out or
+cancelled worker processes and their process group are killed; on Windows only
+the direct process is explicitly killed, so use a supervisor that cleans up
+child processes too.
 
 The unrelated Windows RDP workflow was removed because it used a hard-coded
 administrator password and disabled Network Level Authentication. Git history
@@ -689,7 +673,8 @@ Gamas_bot/
 │   ├── bot.py             # Telethon handlers, job orchestration
 │   ├── config.py          # environment-driven settings
 │   ├── database.py        # SQLite (aiosqlite) + migrations
-│   ├── media.py           # ffmpeg / ffprobe / LibreOffice helpers
+│   ├── media.py           # PyAV/ppt2pptx worker helpers (no external binaries)
+│   ├── media_worker.py    # child process: probe/extract/merge/convert
 │   ├── presentations.py   # PowerPoint parsing and audio extraction
 │   ├── progress.py        # editable per-job Telegram progress bars
 │   ├── logging_config.py  # text/JSON logging and file rotation
@@ -722,7 +707,7 @@ Gamas_bot/
 
 ## Production Deployment
 
-> راهنمای کامل فارسی نصب، FFmpeg، LibreOffice، systemd و عیب‌یابی: [`docs/DEPLOY_FA.md`](docs/DEPLOY_FA.md)
+> راهنمای کامل فارسی نصب، استقرار، systemd و عیب‌یابی: [`docs/DEPLOY_FA.md`](docs/DEPLOY_FA.md)
 
 Gamas Bot maintains a persistent Telethon/MTProto connection and does not expose an HTTP port. It must run as a long-lived worker. A VPS, dedicated server, container worker, or PaaS **background worker** is suitable; stateless functions (Vercel/Netlify/Lambda), sleeping free tiers, and traditional shared hosting are not.
 
@@ -735,34 +720,32 @@ For the default 2 GB upload limit, plan disk space for the original file, extrac
 ```bash
 sudo apt update
 sudo apt install -y \
-  python3 python3-venv python3-pip git ca-certificates \
-  ffmpeg libreoffice-core libreoffice-impress \
-  fonts-dejavu-core fonts-noto-core
+  python3 python3-venv python3-pip git ca-certificates
 ```
 
-- `ffmpeg` also provides `ffprobe` and should include the `libopus` encoder on Ubuntu/Debian.
-- `libreoffice-impress` is only needed for legacy `ppt`, `pps`, `pot`, `odp`, and `otp` files. Native `pptx` parsing does not require LibreOffice.
-- Font packages prevent missing-character/font-substitution problems during headless LibreOffice conversion. Install any fonts used by your presentations as well.
+No media or office packages are needed: `ffmpeg`, `ffprobe` and `soffice` are
+never invoked. Their FFmpeg *libraries* are bundled inside the `av` wheel that
+`pip install -r requirements.txt` pulls in, and legacy `.ppt` conversion uses
+the pure-Python `ppt2pptx` package.
 
-Verify the exact executables and codecs:
+Verify the Python environment (after the dependencies are installed in step 2)
+instead of external binaries:
 
 ```bash
-command -v ffmpeg ffprobe soffice
-ffmpeg -hide_banner -version
-ffprobe -hide_banner -version
-ffmpeg -hide_banner -encoders | grep -E 'libopus|pcm_s16le'
-soffice --headless --version
+cd /opt/gamas-bot
+.venv/bin/python -c "import av, ppt2pptx; print(av.__version__)"
+# or run the bot's built-in self-check:
+.venv/bin/python -m gamas_bot.media_worker check
 ```
 
-If a host installs binaries outside `PATH`, put absolute paths in `.env`:
+If legacy conversion should be refused outright (for example on very small
+hosts), disable it:
 
 ```dotenv
-FFMPEG_BIN=/usr/bin/ffmpeg
-FFPROBE_BIN=/usr/bin/ffprobe
-SOFFICE_BIN=/usr/bin/soffice
+PPTX_LEGACY_ENABLED=false
 ```
 
-If LibreOffice cannot be installed, use `PPTX_LEGACY_ENABLED=false`. Native PPTX files and normal audio/video continue to work. If FFmpeg cannot be installed, video extraction, unusual audio normalization, and multi-clip presentation merging will not work.
+Native PPTX files, audio and video continue to work either way.
 
 #### 2. Create a locked-down service account and install the app
 
@@ -800,7 +783,7 @@ After the bot reports that it is online, stop this foreground test with `Ctrl+C`
 
 #### 3. Install and start the systemd service
 
-The provided unit assumes `/opt/gamas-bot`, stores LibreOffice/fontconfig cache under writable `data/`, writes application output to journald, and uses `ProtectSystem=strict` with
+The provided unit assumes `/opt/gamas-bot`, points `HOME`/`XDG_CACHE_HOME` at writable `data/`, writes application output to journald, and uses `ProtectSystem=strict` with
 `data/` as its writable exception. Custom database, session, temporary-file and
 file-log paths must stay under that directory or be added to `ReadWritePaths`:
 
@@ -832,41 +815,62 @@ sudo systemctl start gamas-bot
 
 Back up `data/bot.sqlite3` **together with its `-wal` and `-shm` files while the service is stopped**, plus `.env`. The Telegram session can be recreated but backing up `data/telegram_bot.session` avoids a new login/session handshake.
 
-### FFmpeg details and troubleshooting
+### Media worker details and troubleshooting
 
-FFmpeg is used to inspect streams, extract the first audio track from video, normalize unsupported codecs, and concatenate presentation narration. The bot executes argument arrays without a shell and enforces `FFMPEG_TIMEOUT_SECONDS`.
+The bot inspects streams, extracts the first audio track from video, normalizes
+unsupported codecs and concatenates presentation narration inside a dedicated
+Python child process (`python -m gamas_bot.media_worker`) backed by PyAV. The
+parent executes argument arrays without a shell and enforces
+`MEDIA_TIMEOUT_SECONDS`; a timed-out or cancelled worker and its process group
+are killed.
 
 Common checks:
 
 ```bash
-# Does the input actually contain audio?
-ffprobe -v error -show_streams -show_format -of json /path/to/input.mp4
+# Are the media packages installed in the venv?
+/opt/gamas-bot/.venv/bin/python -m gamas_bot.media_worker check
 
-# Can the service user write temporary files and run FFmpeg?
+# Does the input actually contain audio?
+/opt/gamas-bot/.venv/bin/python -m gamas_bot.media_worker probe -- /path/to/input.mp4
+
+# Can the service user write temporary files?
 sudo -u bot touch /opt/gamas-bot/data/tmp/write-test
-sudo -u bot /usr/bin/ffmpeg -hide_banner -version
 
 # Check disk and inode exhaustion
 df -h /opt/gamas-bot/data
 df -i /opt/gamas-bot/data
 ```
 
-`Unknown encoder 'libopus'` means the host has a restricted FFmpeg build. Install the distribution's full `ffmpeg` package or set a build that includes libopus. `Permission denied` generally means the executable path or `data/tmp` ownership is wrong. Increase `FFMPEG_TIMEOUT_SECONDS` only after checking CPU load, disk throughput, and corrupt input files.
+`media dependencies are missing (run: pip install -r requirements.txt)` means
+the `av` wheel was not installed (or the venv is wrong) — reinstall the
+requirements inside the service venv. `Permission denied` generally means
+`data/tmp` ownership is wrong. Increase `MEDIA_TIMEOUT_SECONDS` only after
+checking CPU load, disk throughput, and corrupt input files.
 
-### LibreOffice details and troubleshooting
+### Legacy presentation conversion details
 
-LibreOffice is always invoked headlessly with a unique temporary user profile, so parallel conversions do not contend for one profile lock. The systemd unit still assigns a writable `HOME` and `XDG_CACHE_HOME` for fontconfig and LibreOffice caches.
+Legacy `.ppt`/`.pps`/`.pot` decks are converted to `.pptx` in-process by the
+`ppt2pptx` package — there is no office suite on the host. Conversions are
+bounded by `PPT_CONVERT_TIMEOUT_SECONDS` and by the same
+`MAX_FILE_SIZE_BYTES` limit as every other upload. Lossy legacy features that
+cannot be carried over (animations, embedded media playback, some OLE objects)
+are reported as structured warnings in the logs instead of being silently
+dropped.
+
+`ODP`/`OTP` decks are deliberately rejected with an explanatory message; no
+verified pure-Python converter exists for them, so users are asked to re-save
+the deck as `.pptx`.
 
 Test conversion with a real legacy file:
 
 ```bash
 sudo -u bot env HOME=/opt/gamas-bot/data \
   XDG_CACHE_HOME=/opt/gamas-bot/data/.cache \
-  timeout 60 /usr/bin/soffice --headless --convert-to pptx \
-  --outdir /opt/gamas-bot/data/tmp /path/to/sample.ppt
+  /opt/gamas-bot/.venv/bin/python -m gamas_bot.media_worker convert \
+  --output /opt/gamas-bot/data/tmp/sample.pptx \
+  --max-input-bytes 2000000000 \
+  -- /path/to/sample.ppt
 ```
-
-If `soffice --version` works interactively but fails under systemd, check the service user's write permissions, `HOME`, `XDG_CACHE_HOME`, fonts, and `journalctl`. Hanging conversions are killed after `SOFFICE_TIMEOUT_SECONDS`; do not disable the timeout. Minimal containers may also need `libreoffice-core`, `libreoffice-impress`, fontconfig, and at least one font package—not only the `soffice` launcher.
 
 ### PaaS and containers
 
@@ -876,7 +880,7 @@ Configure the process as a worker command:
 python -m gamas_bot
 ```
 
-The image/build layer must install FFmpeg and LibreOffice; Python packages alone are insufficient. Mount a persistent volume at `/app/data` (or update `DATABASE_PATH`, `TELEGRAM_SESSION_PATH`, and `TEMP_DIR`). Do not run more than one replica against the same Telegram session or SQLite file. Local model URLs such as `127.0.0.1:11434` only work if that model server runs in the same container/VM; otherwise use its private network hostname.
+The image/build layer only needs a compatible Python — `pip install -r requirements.txt` pulls in every media dependency. Mount a persistent volume at `/app/data` (or update `DATABASE_PATH`, `TELEGRAM_SESSION_PATH`, and `TEMP_DIR`). Do not run more than one replica against the same Telegram session or SQLite file. Local model URLs such as `127.0.0.1:11434` only work if that model server runs in the same container/VM; otherwise use its private network hostname.
 
 ### Windows hosting
 
@@ -886,7 +890,9 @@ Use a dedicated Windows server/VPS with one of:
 - [NSSM](https://nssm.cc/) as a Windows service wrapper
 - Another process supervisor that restarts failed workers
 
-Install FFmpeg and LibreOffice with WinGet, use their full `.exe` paths in `.env` if services have a different `PATH`, grant the service account modify permission on `data`, and redirect stdout/stderr or set `LOG_FILE=data/logs/bot.log`.
+Grant the service account modify permission on `data`, and redirect
+stdout/stderr or set `LOG_FILE=data/logs/bot.log`. No media/office software
+installation is required; the `av` and `ppt2pptx` wheels provide everything.
 
 ### Logging and error handling
 
@@ -906,7 +912,7 @@ Troubleshooting sequence:
 
 1. `systemctl status gamas-bot -l`
 2. `journalctl -u gamas-bot -n 200 --no-pager`
-3. Verify `.env` ownership/mode and all three executable paths.
+3. Verify `.env` ownership/mode and the `data/` write permissions.
 4. Run the exact foreground test as the `bot` user.
 5. Check disk/RAM and API `401`, `403`, `429`, or `5xx` entries.
 6. Use the user's `GMS-...` reference to identify the failed submission.
@@ -919,9 +925,7 @@ A `status=203/EXEC` systemd error means `ExecStart` is wrong or the virtual envi
 
 ```bash
 python --version       # check Python
-ffmpeg -version        # check FFmpeg
-ffprobe -version
-soffice --version      # check LibreOffice
+python -m gamas_bot.media_worker check   # verify the media stack
 
 pip install -r requirements.txt --upgrade   # update dependencies
 ```

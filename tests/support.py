@@ -1,9 +1,15 @@
-"""Shared helpers for the test-suite: settings factory, deck builder, tool stubs."""
+"""Shared helpers for the test-suite: settings factory, deck builder, media.
+
+Media payloads are *real* files (generated with the standard library and PyAV)
+because the bot now processes media through the PyAV-based worker instead of
+stub binaries — every fixture the suite probes/merges must actually decode.
+"""
 
 from __future__ import annotations
 
-import os
-import shutil
+import io
+import tempfile
+import wave
 import zipfile
 from dataclasses import replace
 from pathlib import Path
@@ -13,6 +19,10 @@ from gamas_bot.config import Settings
 AUDIO_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/audio"
 VIDEO_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/video"
 RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+# The committed legacy-deck fixtures come from the MIT-licensed ppt2pptx test
+# corpus (https://github.com/HuiTurn/ppt2pptx); see tests/fixtures/README.md.
+FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
 def make_settings(**overrides) -> Settings:
@@ -42,11 +52,100 @@ def make_settings(**overrides) -> Settings:
     return replace(base, **overrides) if overrides else base
 
 
-def fake_media_bytes(duration: float | None = 5.0, has_audio: bool = True) -> bytes:
-    """Payload the stub ffprobe below can interpret as a media file."""
-    marker = f"DUR={duration}" if duration is not None else "DUR=none"
-    audio = "AUDIO=1" if has_audio else "AUDIO=0"
-    return f"FAKE-MEDIA {marker} {audio}\n".encode("utf-8")
+def wav_bytes(
+    duration: float, *, rate: int = 16000, channels: int = 1
+) -> bytes:
+    """A real PCM WAV file of exactly ``duration`` seconds (digital silence)."""
+    frames = int(round(duration * rate))
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as audio:
+        audio.setnchannels(channels)
+        audio.setsampwidth(2)
+        audio.setframerate(rate)
+        audio.writeframes(b"\0\0" * frames * channels)
+    return buffer.getvalue()
+
+
+def video_bytes(
+    *, duration: float = 1.0, with_audio: bool = True, rate: int = 15
+) -> bytes:
+    """A real MP4 (H.264, optionally AAC) built with the bundled encoders."""
+    import av
+
+    from fractions import Fraction
+
+    width, height = 64, 48
+    with tempfile.TemporaryDirectory() as folder:
+        target = Path(folder) / "clip.mp4"
+        with av.open(str(target), "w") as container:
+            video = container.add_stream("libx264", rate=rate)
+            video.width = width
+            video.height = height
+            video.pix_fmt = "yuv420p"
+            audio = None
+            if with_audio:
+                audio = container.add_stream("aac", rate=44100)
+                audio.layout = "stereo"
+            total = max(1, int(round(duration * rate)))
+            for index in range(total):
+                frame = av.VideoFrame(width, height, "yuv420p")
+                for plane in frame.planes:
+                    view = memoryview(plane)
+                    view[: len(view)] = bytes([(index * 8) % 255]) * len(view)
+                frame.pts = index
+                frame.time_base = Fraction(1, rate)
+                for packet in video.encode(frame):
+                    container.mux(packet)
+                if audio is not None:
+                    samples = 44100 // rate
+                    audio_frame = av.AudioFrame(
+                        format="s16", layout="stereo", samples=samples
+                    )
+                    audio_frame.sample_rate = 44100
+                    audio_frame.time_base = Fraction(1, 44100)
+                    audio_frame.pts = index * samples
+                    for plane in audio_frame.planes:
+                        view = memoryview(plane)
+                        view[: len(view)] = b"\0" * len(view)
+                    for packet in audio.encode(audio_frame):
+                        container.mux(packet)
+            for packet in video.encode(None):
+                container.mux(packet)
+            if audio is not None:
+                for packet in audio.encode(None):
+                    container.mux(packet)
+        return target.read_bytes()
+
+
+def mp3_bytes(duration: float, *, rate: int = 16000) -> bytes:
+    """A real MP3 file produced by the bundled libmp3lame encoder."""
+    import av
+
+    from fractions import Fraction
+
+    with tempfile.TemporaryDirectory() as folder:
+        target = Path(folder) / "audio.mp3"
+        with av.open(str(target), "w") as container:
+            stream = container.add_stream("mp3", rate=rate)
+            stream.layout = "mono"
+            chunk = rate // 10
+            total = int(round(duration * rate))
+            sent = 0
+            while sent < total:
+                samples = min(chunk, total - sent)
+                frame = av.AudioFrame(format="s16", layout="mono", samples=samples)
+                frame.sample_rate = rate
+                frame.time_base = Fraction(1, rate)
+                frame.pts = sent
+                for plane in frame.planes:
+                    view = memoryview(plane)
+                    view[: len(view)] = b"\0" * len(view)
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+                sent += samples
+            for packet in stream.encode(None):
+                container.mux(packet)
+        return target.read_bytes()
 
 
 def build_deck(
@@ -128,58 +227,3 @@ def build_deck(
         for name, payload in members.items():
             archive.writestr(name, payload)
     return path
-
-
-FFPROBE_STUB = """#!/usr/bin/env python3
-import json, pathlib, re, sys
-
-path = pathlib.Path(sys.argv[-1])
-text = path.read_bytes().decode("utf-8", "replace")
-has_audio = "AUDIO=0" not in text
-match = re.search(r"DUR=([0-9.]+)", text)
-duration = match.group(1) if match else None
-streams = [{"codec_type": "audio", "codec_name": "aac"}] if has_audio else []
-report = {"streams": streams, "format": {"duration": duration} if duration else {}}
-print(json.dumps(report))
-"""
-
-FFMPEG_STUB = """#!/usr/bin/env python3
-import pathlib, sys
-
-args = sys.argv[1:]
-inputs = [args[i + 1] for i, value in enumerate(args) if value == "-i"]
-output = pathlib.Path(args[-1])
-output.write_text("MERGED\\n" + "\\n".join(inputs), encoding="utf-8")
-pathlib.Path(str(output) + ".argv").write_text("\\n".join(args), encoding="utf-8")
-"""
-
-SOFFICE_STUB = """#!/usr/bin/env python3
-import pathlib, shutil, sys
-
-args = sys.argv[1:]
-out_dir = pathlib.Path(args[args.index("--outdir") + 1])
-source = pathlib.Path(args[-1])
-out_dir.mkdir(parents=True, exist_ok=True)
-shutil.copyfile(source, out_dir / (source.stem + ".pptx"))
-"""
-
-
-def install_stub(directory: Path, name: str, script: str) -> str:
-    """Write an executable stub binary and return its path."""
-    directory.mkdir(parents=True, exist_ok=True)
-    target = directory / name
-    target.write_text(script, encoding="utf-8")
-    target.chmod(0o755)
-    return str(target)
-
-
-def stub_tools(directory: Path) -> dict[str, str]:
-    return {
-        "ffprobe_bin": install_stub(directory, "ffprobe", FFPROBE_STUB),
-        "ffmpeg_bin": install_stub(directory, "ffmpeg", FFMPEG_STUB),
-        "soffice_bin": install_stub(directory, "soffice", SOFFICE_STUB),
-    }
-
-
-def real_tool_missing(binary: str) -> bool:
-    return shutil.which(binary) is None and not os.path.isfile(binary)

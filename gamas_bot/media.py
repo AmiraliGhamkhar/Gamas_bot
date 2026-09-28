@@ -1,8 +1,12 @@
-"""ffmpeg / ffprobe / LibreOffice helpers used by the presentation pipeline.
+"""Media helpers used by the upload and presentation pipelines.
 
-Every external command is built by a pure function so the argument lists stay
-unit-testable, and executed through one async subprocess wrapper that always
-enforces a timeout and never runs through a shell.
+No system ``ffmpeg``/``ffprobe``/``soffice`` binaries are involved: every
+operation runs in a dedicated child process (``python -m gamas_bot.media_worker``)
+backed by the PyAV and ppt2pptx Python packages.  Each command is built by a
+pure function so the argument lists stay unit-testable, and executed through
+one async subprocess wrapper that always enforces a timeout, never runs through
+a shell, and kills the whole process group on POSIX when a job times out or is
+cancelled — the same process-safety guarantees the old external tools had.
 """
 
 from __future__ import annotations
@@ -12,10 +16,9 @@ import json
 import logging
 import math
 import os
-import shutil
 import signal
+import sys
 import time
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +29,9 @@ logger = logging.getLogger(__name__)
 WAV_BYTES_PER_SECOND = 32000  # 16 kHz, mono, signed 16-bit PCM.
 OPUS_SAMPLE_RATE = 48000
 WAV_SAMPLE_RATE = 16000
+
+WORKER_MODULE = "gamas_bot.media_worker"
+CHECK_TIMEOUT_SECONDS = 60
 
 
 class MediaToolError(RuntimeError):
@@ -39,23 +45,41 @@ class MediaInfo:
     audio_codec: str | None = None
 
 
-def tool_available(binary: str) -> bool:
-    """True when the binary can be resolved on PATH or as an explicit path."""
-    if not binary:
-        return False
-    candidate = Path(binary)
-    if candidate.is_absolute() or candidate.parent != Path("."):
-        return candidate.is_file() and os.access(candidate, os.X_OK)
-    return shutil.which(binary) is not None
+def worker_command(*args: str) -> list[str]:
+    """Argument vector for one media-worker invocation (never a shell string)."""
+    return [sys.executable, "-m", WORKER_MODULE, *args]
+
+
+def worker_env() -> dict[str, str]:
+    """Environment additions that let the worker import the package anywhere.
+
+    The worker is started with ``python -m gamas_bot.media_worker`` from the
+    bot's working directory; prepending the package's parent directory keeps
+    that import working even when the bot itself was launched from elsewhere
+    with the package already importable.
+    """
+    package_parent = str(Path(__file__).resolve().parent.parent)
+    existing = os.environ.get("PYTHONPATH")
+    value = (
+        package_parent
+        if not existing
+        else package_parent + os.pathsep + existing
+    )
+    return {"PYTHONPATH": value}
 
 
 async def run_command(
-    command: list[str], timeout: int, *, capture_output: bool = True
+    command: list[str],
+    timeout: int,
+    *,
+    capture_output: bool = True,
+    label: str | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Run a command without a shell and return (returncode, stdout, stderr)."""
     stream = asyncio.subprocess.PIPE if capture_output else asyncio.subprocess.DEVNULL
     started = time.monotonic()
-    tool = Path(command[0]).name
+    tool = label or Path(command[0]).name
     logger.info("External command started tool=%s timeout_seconds=%s", tool, timeout)
     try:
         process = await asyncio.create_subprocess_exec(
@@ -63,6 +87,7 @@ async def run_command(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=stream,
             stderr=stream,
+            env=({**os.environ, **env} if env else None),
             start_new_session=(os.name == "posix"),
         )
     except FileNotFoundError as exc:
@@ -72,8 +97,8 @@ async def run_command(
     communication = asyncio.create_task(process.communicate())
 
     async def terminate() -> None:
-        # soffice may be a launcher with child processes. Kill its process group
-        # on POSIX so children cannot outlive a cancelled/timed-out job.
+        # A worker may still be spinning up. Kill its process group on POSIX so
+        # nothing outlives a cancelled/timed-out job.
         try:
             if os.name == "posix":
                 os.killpg(process.pid, signal.SIGKILL)
@@ -92,7 +117,7 @@ async def run_command(
             "External command timed out tool=%s elapsed_seconds=%.3f timeout_seconds=%s",
             tool, time.monotonic() - started, timeout,
         )
-        raise MediaToolError(f"زمان اجرای «{command[0]}» به پایان رسید.") from exc
+        raise MediaToolError(f"زمان اجرای «{tool}» به پایان رسید.") from exc
     except asyncio.CancelledError:
         await terminate()
         logger.info(
@@ -105,9 +130,7 @@ async def run_command(
     log = logger.info if returncode == 0 else logger.warning
     log(
         "External command finished tool=%s returncode=%s elapsed_seconds=%.3f",
-        tool,
-        returncode,
-        elapsed,
+        tool, returncode, elapsed,
     )
     return (
         returncode,
@@ -116,55 +139,51 @@ async def run_command(
     )
 
 
-def build_probe_command(ffprobe_bin: str, path: Path) -> list[str]:
-    return [
-        ffprobe_bin,
-        "-v",
-        "error",
-        "-print_format",
-        "json",
-        "-show_format",
-        "-show_streams",
-        "-protocol_whitelist", "file,pipe",
-        str(path),
-    ]
+def build_probe_command(path: Path) -> list[str]:
+    return worker_command("probe", "--", str(path))
 
 
 def parse_probe_output(payload: str) -> MediaInfo:
-    """Read the ffprobe JSON report into a MediaInfo record."""
+    """Read the worker's JSON report into a MediaInfo record.
+
+    The worker reports ``duration`` already resolved from the container and
+    stream headers; this parser keeps the old ffprobe-era defences: malformed
+    structure is an error, while individual unusable values (non-numeric,
+    non-finite, non-positive durations) degrade to ``None`` instead of failing
+    the whole file.
+    """
     try:
         data = json.loads(payload or "{}")
     except json.JSONDecodeError as exc:
-        raise MediaToolError("خروجی ffprobe قابل‌خواندن نیست.") from exc
+        raise MediaToolError("خروجی بررسی رسانه قابل‌خواندن نیست.") from exc
     if not isinstance(data, dict):
-        raise MediaToolError("ساختار خروجی ffprobe معتبر نیست.")
-    streams = data.get("streams", [])
-    file_format = data.get("format", {})
-    if (not isinstance(streams, list) or not all(isinstance(s, dict) for s in streams)
-            or not isinstance(file_format, dict)):
-        raise MediaToolError("ساختار خروجی ffprobe معتبر نیست.")
-    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+        raise MediaToolError("ساختار خروجی بررسی رسانه معتبر نیست.")
+    has_audio = data.get("has_audio", False)
+    if not isinstance(has_audio, bool):
+        raise MediaToolError("ساختار خروجی بررسی رسانه معتبر نیست.")
     duration: float | None = None
-    for source in (file_format, *audio_streams):
-        raw = source.get("duration")
-        if raw in (None, "", "N/A"):
-            continue
+    raw_duration = data.get("duration")
+    if raw_duration is not None and not isinstance(raw_duration, bool):
         try:
-            value = float(raw)
+            value = float(raw_duration)
         except (TypeError, ValueError):
-            continue
+            value = math.nan
         if math.isfinite(value) and value > 0:
             duration = value
-            break
-    codec = audio_streams[0].get("codec_name") if audio_streams else None
-    return MediaInfo(bool(audio_streams), duration, codec)
+    raw_codec = data.get("audio_codec")
+    codec = raw_codec if isinstance(raw_codec, str) and raw_codec else None
+    return MediaInfo(has_audio, duration, codec)
 
 
 async def probe_media(path: Path, settings: Settings) -> MediaInfo:
-    command = build_probe_command(settings.ffprobe_bin, path)
-    code, stdout, stderr = await run_command(command, settings.ffmpeg_timeout)
+    code, stdout, stderr = await run_command(
+        build_probe_command(path),
+        settings.media_timeout,
+        label="media_worker:probe",
+        env=worker_env(),
+    )
     if code != 0:
-        raise MediaToolError(f"ffprobe فایل را نپذیرفت: {stderr.strip()[:300]}")
+        raise MediaToolError(f"بررسی فایل رسانه ناموفق بود: {stderr.strip()[:300]}")
     return parse_probe_output(stdout)
 
 
@@ -182,44 +201,28 @@ def merge_output_name(stem: str, output_format: str) -> str:
 
 
 def build_merge_command(
-    ffmpeg_bin: str,
     inputs: list[Path],
     output: Path,
     *,
     output_format: str = "wav",
     silence_seconds: float = 0.5,
 ) -> list[str]:
-    """Build an ffmpeg call that concatenates the audio tracks of every input.
+    """Build the worker call that concatenates the audio tracks of every input.
 
-    Each input is resampled to a common mono layout first, because the concat
-    filter refuses streams whose sample rate or channel layout differ. A short
-    silence is padded between clips so neighbouring slides do not run together.
+    Each input is resampled to a common mono layout first (the worker pins the
+    first audio track of each file), and a short silence is padded between
+    clips so neighbouring slides do not run together.
     """
     if not inputs:
         raise MediaToolError("فهرست ورودی برای ادغام صدا خالی است.")
-    rate = OPUS_SAMPLE_RATE if output_format == "opus" else WAV_SAMPLE_RATE
-    command = [ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y"]
-    for item in inputs:
-        command += ["-protocol_whitelist", "file,pipe", "-i", str(item)]
-    chains = []
-    for index in range(len(inputs)):
-        # Pin the first audio track: "[i:a]" aborts ffmpeg when an input (for
-        # example an embedded video) carries more than one audio stream.
-        chain = (
-            f"[{index}:a:0]aresample={rate}"
-            ",aformat=sample_fmts=s16:channel_layouts=mono,asetpts=PTS-STARTPTS"
-        )
-        if silence_seconds > 0 and index < len(inputs) - 1:
-            chain += f",apad=pad_dur={silence_seconds:g}"
-        chains.append(chain + f"[a{index}]")
-    labels = "".join(f"[a{index}]" for index in range(len(inputs)))
-    graph = ";".join(chains) + f";{labels}concat=n={len(inputs)}:v=0:a=1[out]"
-    command += ["-filter_complex", graph, "-map", "[out]", "-vn"]
-    if output_format == "opus":
-        command += ["-c:a", "libopus", "-b:a", "32k", "-application", "voip"]
-    else:
-        command += ["-c:a", "pcm_s16le"]
-    command += ["-ar", str(rate), "-ac", "1", str(output)]
+    command = worker_command(
+        "merge",
+        "--output", str(output),
+        "--format", output_format,
+        "--silence", f"{silence_seconds:g}",
+        "--",
+    )
+    command.extend(str(item) for item in inputs)
     return command
 
 
@@ -236,19 +239,23 @@ async def merge_audio_tracks(
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / merge_output_name(stem, output_format)
     command = build_merge_command(
-        settings.ffmpeg_bin,
         inputs,
         output,
         output_format=output_format,
         silence_seconds=settings.presentation_silence_seconds,
     )
-    code, _, stderr = await run_command(command, settings.ffmpeg_timeout)
+    code, _, stderr = await run_command(
+        command,
+        settings.media_timeout,
+        label="media_worker:merge",
+        env=worker_env(),
+    )
     if code != 0 or not output.exists() or output.stat().st_size == 0:
         raise MediaToolError(f"ادغام صداهای ارائه ناموفق بود: {stderr.strip()[:300]}")
     return output
 
 
-# Codecs both STT providers accept directly, so the upload can skip ffmpeg.
+# Codecs both STT providers accept directly, so the upload can skip transcoding.
 PASSTHROUGH_CODECS = {
     "aac", "alac", "flac", "mp3", "opus", "pcm_s16le", "pcm_s16be", "vorbis",
 }
@@ -260,8 +267,8 @@ PASSTHROUGH_EXTENSIONS = {
 def needs_transcode(filename: str | None, info: MediaInfo | None) -> bool:
     """Decide whether a plain audio upload must be normalised before STT.
 
-    Without an ffprobe report nothing is known about the file, so the original
-    is kept and sent as-is, exactly like before this feature existed.
+    Without a probe report nothing is known about the file, so the original is
+    kept and sent as-is.
     """
     if info is None:
         return False
@@ -273,28 +280,20 @@ def needs_transcode(filename: str | None, info: MediaInfo | None) -> bool:
     return (info.audio_codec or "").lower() not in PASSTHROUGH_CODECS
 
 
-def build_transcode_command(
-    ffmpeg_bin: str,
+def build_extract_command(
     source: Path,
     output: Path,
     *,
     output_format: str = "wav",
 ) -> list[str]:
-    """Build an ffmpeg call that takes the first audio track to mono PCM/Opus."""
-    rate = OPUS_SAMPLE_RATE if output_format == "opus" else WAV_SAMPLE_RATE
-    command = [
-        ffmpeg_bin, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-        "-protocol_whitelist", "file,pipe",
-        "-i", str(source),
-        "-map", "0:a:0",
-        "-vn",
-    ]
-    if output_format == "opus":
-        command += ["-c:a", "libopus", "-b:a", "32k", "-application", "voip"]
-    else:
-        command += ["-c:a", "pcm_s16le"]
-    command += ["-ar", str(rate), "-ac", "1", str(output)]
-    return command
+    """Build the worker call that takes the first audio track to mono PCM/Opus."""
+    return worker_command(
+        "extract",
+        "--output", str(output),
+        "--format", output_format,
+        "--",
+        str(source),
+    )
 
 
 async def extract_audio_track(
@@ -305,64 +304,77 @@ async def extract_audio_track(
     total_duration: float | None = None,
     stem: str = "audio",
 ) -> Path:
-    """Pull a single mono audio track out of any media file ffmpeg can read."""
-    if not tool_available(settings.ffmpeg_bin):
-        raise MediaToolError(
-            "برای پردازش این فایل، ffmpeg باید روی سرور نصب باشد."
-        )
+    """Pull a single mono audio track out of any media file PyAV can read."""
     output_format = choose_merge_format(total_duration, settings)
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / merge_output_name(stem, output_format)
-    command = build_transcode_command(
-        settings.ffmpeg_bin, source, output, output_format=output_format
+    command = build_extract_command(source, output, output_format=output_format)
+    code, _, stderr = await run_command(
+        command,
+        settings.media_timeout,
+        label="media_worker:extract",
+        env=worker_env(),
     )
-    code, _, stderr = await run_command(command, settings.ffmpeg_timeout)
     if code != 0 or not output.exists() or output.stat().st_size == 0:
         raise MediaToolError(f"استخراج صدا از این فایل ناموفق بود: {stderr.strip()[:300]}")
     return output
 
 
 def build_convert_command(
-    soffice_bin: str, source: Path, out_dir: Path, profile_dir: Path
+    source: Path, output: Path, *, max_input_bytes: int
 ) -> list[str]:
-    """Build the LibreOffice call that converts a legacy deck to .pptx."""
-    return [
-        soffice_bin,
-        "--headless",
-        "--norestore",
-        "--invisible",
-        "--nolockcheck",
-        f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
-        "--convert-to",
-        "pptx",
-        "--outdir",
-        str(out_dir),
+    """Build the worker call that converts a legacy deck to .pptx via ppt2pptx."""
+    return worker_command(
+        "convert",
+        "--output", str(output),
+        "--max-input-bytes", str(max_input_bytes),
+        "--",
         str(source),
-    ]
+    )
 
 
 async def convert_to_pptx(source: Path, out_dir: Path, settings: Settings) -> Path:
-    """Convert .ppt/.pps/.odp decks to .pptx through LibreOffice."""
-    if not tool_available(settings.soffice_bin):
+    """Convert a legacy .ppt/.pps/.pot deck to .pptx with the ppt2pptx package.
+
+    ODP/OTP decks are refused with an explicit message: no verified pure-Python
+    converter exists for them, and pretending otherwise would silently drop
+    content.
+    """
+    if source.suffix.lower() in {".odp", ".otp"}:
         raise MediaToolError(
-            "برای فایل‌های قدیمی PowerPoint، LibreOffice روی سرور لازم است."
+            "فرمت ODP/OTP پشتیبانی نمی‌شود؛ لطفاً ارائه را با پسوند pptx ذخیره و "
+            "دوباره ارسال کنید."
         )
     out_dir.mkdir(parents=True, exist_ok=True)
-    # A private profile keeps parallel conversions from fighting over one lock.
-    profile_dir = out_dir / f"lo-profile-{uuid.uuid4().hex[:8]}"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    command = build_convert_command(settings.soffice_bin, source, out_dir, profile_dir)
-    try:
-        code, stdout, stderr = await run_command(command, settings.soffice_timeout)
-    finally:
-        # The throwaway profile must go even when the conversion fails or times
-        # out; LibreOffice profiles are large and accumulate in the temp dir.
-        shutil.rmtree(profile_dir, ignore_errors=True)
     converted = out_dir / f"{source.stem}.pptx"
-    if not converted.exists():
-        candidates = sorted(out_dir.glob("*.pptx"))
-        converted = candidates[0] if candidates else converted
-    if code != 0 or not converted.exists():
+    command = build_convert_command(
+        source, converted, max_input_bytes=settings.max_file_size
+    )
+    code, stdout, stderr = await run_command(
+        command,
+        settings.convert_timeout,
+        label="media_worker:convert",
+        env=worker_env(),
+    )
+    if code != 0 or not converted.exists() or converted.stat().st_size == 0:
         detail = (stderr or stdout).strip()[:300]
         raise MediaToolError(f"تبدیل فایل قدیمی PowerPoint ناموفق بود: {detail}")
+    summary = stdout.strip()
+    if summary:
+        logger.info("Legacy deck converted output=%s summary=%s", converted.name, summary)
     return converted
+
+
+async def check_media_worker() -> str:
+    """Run the worker's dependency self-check; returns its JSON summary."""
+    code, stdout, stderr = await run_command(
+        worker_command("check"),
+        CHECK_TIMEOUT_SECONDS,
+        label="media_worker:check",
+        env=worker_env(),
+    )
+    if code != 0:
+        raise MediaToolError(
+            f"بررسی زیرساخت رسانه ناموفق بود: {(stderr or stdout).strip()[:300]}"
+        )
+    return stdout.strip()

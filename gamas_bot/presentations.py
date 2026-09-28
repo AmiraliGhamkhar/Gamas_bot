@@ -21,12 +21,15 @@ from pathlib import Path, PurePosixPath
 from lxml import etree
 
 from .config import Settings
-from .media import MediaToolError, merge_audio_tracks, probe_media, tool_available
+from .media import MediaToolError, merge_audio_tracks, probe_media
 
 logger = logging.getLogger(__name__)
 
 NATIVE_EXTENSIONS = {".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm"}
-LEGACY_EXTENSIONS = {".ppt", ".pps", ".pot", ".odp", ".otp"}
+LEGACY_EXTENSIONS = {".ppt", ".pps", ".pot"}
+# ODP/OTP have no verified pure-Python converter with acceptable fidelity, so
+# they are classified as explicitly unsupported instead of pretending they work.
+UNSUPPORTED_EXTENSIONS = {".odp", ".otp"}
 PRESENTATION_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.presentationml.presentation": "native",
     "application/vnd.openxmlformats-officedocument.presentationml.slideshow": "native",
@@ -34,11 +37,11 @@ PRESENTATION_MIME_TYPES = {
     "application/vnd.ms-powerpoint.presentation.macroenabled.12": "native",
     "application/vnd.ms-powerpoint.slideshow.macroenabled.12": "native",
     "application/vnd.ms-powerpoint.template.macroenabled.12": "native",
-    "application/vnd.oasis.opendocument.presentation-template": "legacy",
+    "application/vnd.oasis.opendocument.presentation-template": "unsupported",
     "application/vnd.ms-powerpoint": "legacy",
     "application/mspowerpoint": "legacy",
     "application/powerpoint": "legacy",
-    "application/vnd.oasis.opendocument.presentation": "legacy",
+    "application/vnd.oasis.opendocument.presentation": "unsupported",
 }
 
 AUDIO_MEDIA_EXTENSIONS = {
@@ -122,12 +125,14 @@ class PreparedAudio:
 
 
 def classify_presentation(filename: str | None, mime_type: str | None) -> str | None:
-    """Return 'native', 'legacy' or None for the given Telegram document."""
+    """Return 'native', 'legacy', 'unsupported' or None for a Telegram document."""
     suffix = Path(filename).suffix.lower() if filename else ""
     if suffix in NATIVE_EXTENSIONS:
         return "native"
     if suffix in LEGACY_EXTENSIONS:
         return "legacy"
+    if suffix in UNSUPPORTED_EXTENSIONS:
+        return "unsupported"
     normalized = (mime_type or "").split(";")[0].strip().lower()
     return PRESENTATION_MIME_TYPES.get(normalized)
 
@@ -423,16 +428,7 @@ async def prepare_audio(
     if not content.clips:
         return None
     usable: list[MediaClip] = []
-    can_probe = tool_available(settings.ffprobe_bin)
-    if not can_probe:
-        logger.warning("ffprobe is unavailable; clip filtering falls back to extensions")
     for clip in content.clips:
-        if not can_probe:
-            if clip.kind == "video":
-                skipped.append(f"{clip.label}: بدون ffprobe نمی‌توان صدای ویدیو را بررسی کرد")
-                continue
-            usable.append(clip)
-            continue
         try:
             info = await probe_media(clip.path, settings)
         except MediaToolError as exc:
@@ -462,15 +458,6 @@ async def prepare_audio(
     if sum(durations) > settings.presentation_max_total_duration:
         raise PresentationError(
             "مجموع مدت صداهای این ارائه از سقف تعیین‌شدهٔ ربات بیشتر است."
-        )
-
-    if len(usable) == 1 and usable[0].kind == "audio" and not tool_available(settings.ffmpeg_bin):
-        # A single narration track needs no ffmpeg; send it to the STT engine as is.
-        clip = usable[0]
-        return PreparedAudio(clip.path, (clip,), clip.duration, False, tuple(skipped))
-    if not tool_available(settings.ffmpeg_bin):
-        raise PresentationError(
-            "برای ادغام صداهای این ارائه، ffmpeg باید روی سرور نصب باشد."
         )
 
     merged = await merge_audio_tracks(

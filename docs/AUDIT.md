@@ -1,3 +1,132 @@
+# Repository review — 2026-09-28: system media/office dependencies removed
+
+## Scope and result
+
+Full re-audit of every tracked file (application modules, SQL migrations,
+tests, benchmark script, `.env.example`, systemd unit, GitHub workflow, README
+and Persian deployment guide), followed by replacement of the external
+**FFmpeg / FFprobe / LibreOffice** runtime dependencies with Python packages.
+
+Goal: the bot must run on hosts that have no `ffmpeg`, `ffprobe` or `soffice`
+binary installed (cPanel, locked-down containers, minimal VPS images), while
+preserving formats, security limits, timeouts, cleanup and error handling.
+
+**Result: 164 tests pass** (up from 141) with no system media binaries present
+on the machine, `pip check` and `ruff check gamas_bot scripts tests --select E9,F`
+are clean. No live Telegram or paid provider requests were made.
+
+## What replaced the binaries
+
+| Old dependency | Replacement | Why this option |
+|---|---|---|
+| `ffprobe` stream probing | **PyAV** (`av` wheel) inside `gamas_bot/media_worker.py` | Verified API: `av.open(..., options={"protocol_whitelist": "file,pipe"})`, `container.duration`/`stream.duration` reporting, `Codec.canonical_name` (equals ffprobe's `codec_name`, e.g. `mp3` not `mp3float`). |
+| `ffmpeg` audio extraction/transcode | **PyAV** decode → `AudioResampler` (s16/mono, 16 kHz or 48 kHz) → `pcm_s16le` WAV or `libopus` 32 kbit/s Opus in Ogg | Verified encoders ship in the wheel (`pcm_s16le`, `libopus`, `libmp3lame`, `libx264`, …); `codec_context.options = {"application": "voip"}` reaches `avcodec_open2` exactly like the old `-application voip` flag. |
+| `ffmpeg` multi-clip merging | **PyAV** per-input resamplers + zero-sample padding between clips | Mirrors the old `aresample`/`apad=pad_dur`/`concat` graph: mono, target rate, 0.5 s (`PPTX_SILENCE_SECONDS`) between clips, none after the last. |
+| `soffice` legacy `.ppt → .pptx` | **ppt2pptx** (pure Python, MS-PPT/CFB parser) | Mandated equivalent; converts `.ppt`/`.pps`/`.pot` (extension-agnostic), never executes macros, respects input-size limits, reports lossy features as structured warnings. |
+| ODP/OTP via LibreOffice | **Explicit rejection** with a user-facing message asking for `.pptx` | No verified pure-Python ODP→PPTX converter with acceptable fidelity exists; a clean unsupported-format error is better than a fake conversion. |
+
+`pymediainfo` was evaluated and rejected: although recent wheels bundle the
+native library, PyAV alone covers probing *and* transcoding with one
+dependency, and its FFmpeg libraries are the same code family the previous
+commands used, which keeps format coverage closest to the old behaviour.
+`pydub`/`moviepy` were not used because they still shell out to FFmpeg.
+
+## Architecture: a supervised Python worker
+
+All media operations run in a dedicated child process,
+`python -m gamas_bot.media_worker`, started through the existing
+`media.run_command` wrapper:
+
+- **No runtime path invokes `ffmpeg`, `ffprobe` or `soffice`** — every command
+  vector starts with `sys.executable -m gamas_bot.media_worker`
+  (regression-tested in `test_media_runtime.py`, `test_audit.py`).
+- Timeouts (`MEDIA_TIMEOUT_SECONDS`, `PPT_CONVERT_TIMEOUT_SECONDS`),
+  cancellation, POSIX process-group kill, pipe draining, non-shell execution
+  and bounded stderr reporting are unchanged.
+- A native crash or hang inside the media libraries takes down only the
+  worker, not the bot — the isolation property the old subprocess tools gave.
+- Each input is opened with the `file,pipe` protocol whitelist, so a disguised
+  playlist still cannot fetch network URLs
+  (`test_network_playlist_is_rejected_without_fetching_url` asserts the
+  refusal message).
+- FFmpeg-level error records are routed to the worker's stderr head so the
+  first 300 characters the parent reports contain the real cause (e.g.
+  `Protocol 'http' not on whitelist 'file,pipe'!`).
+
+## Configuration changes
+
+- Removed: `FFMPEG_BIN`, `FFPROBE_BIN`, `SOFFICE_BIN`, `SOFFICE_TIMEOUT_SECONDS`.
+- Added: `MEDIA_TIMEOUT_SECONDS` (default 3600) and
+  `PPT_CONVERT_TIMEOUT_SECONDS` (default 600).
+- Backward compatible: `FFMPEG_TIMEOUT_SECONDS` and `SOFFICE_TIMEOUT_SECONDS`
+  are still read as fallbacks, and leftover `*_BIN` lines in existing `.env`
+  files are silently ignored (verified by tests in this review).
+- Startup now runs `media_worker check` (reports installed `av`/`ppt2pptx`
+  versions) instead of probing binaries on `PATH`.
+
+## Format support and fidelity notes
+
+- Audio/video coverage follows the FFmpeg libraries bundled in the `av` wheel:
+  MP3, M4A/AAC, WAV, OGG/Opus/Vorbis, FLAC, WMA, AMR, MP4/MKV/MOV/AVI/WebM,
+  etc. `PASSTHROUGH_CODECS` still matches ffprobe-era canonical names, so
+  normal uploads are still not re-encoded.
+- Output behaviour is unchanged: mono 16 kHz PCM WAV, or 48 kHz Opus
+  (32 kbit/s, voip) when the WAV-size estimate would exceed
+  `PPTX_WAV_LIMIT_BYTES`/`MAX_FILE_SIZE_BYTES`.
+- Legacy PPT conversion keeps slide text, speaker notes, slide order and
+  macros-not-executed behaviour, with ZIP/packaging safety enforced by
+  `ppt2pptx` limits plus the bot's own `MAX_FILE_SIZE_BYTES` check.
+  ppt2pptx documents lossy legacy features (embedded media playback,
+  animations, some OLE objects) as structured warnings; they are logged, not
+  silently dropped. Embedded narration media inside old `.ppt` files is no
+  longer carried into the converted `.pptx` (LibreOffice used to copy it);
+  this is an accepted, documented limitation of the mandated `ppt2pptx`
+  approach, covered by `test_embedded_media_deck_converts_with_diagnostics`.
+- ODP/OTP are classified as `unsupported` and rejected at submission time
+  with an explanatory message; `PPTX_LEGACY_ENABLED=false` still disables
+  PPT/PPS/POT conversion entirely.
+
+## Tests added or reworked
+
+- Real-media smoke tests no longer skip: probing (WAV/MP3/MP4 with and
+  without audio), extraction to WAV/Opus, merging with resample + silence
+  math, corrupt-input errors, bounded error messages, worker timeout kill,
+  protocol-whitelist refusal, and the worker dependency self-check all run
+  on every CI job without installing anything.
+- `PPT → PPTX` coverage uses committed real PowerPoint 97–2003 fixtures
+  (`tests/fixtures/*.ppt`, MIT, from the ppt2pptx corpus) for `.ppt`, `.pps`
+  and `.pot`, plus garbage-input failure and explicit ODP rejection.
+- Native PPTX variants, ZIP safety limits, clip limits, duration caps,
+  cancellation/cleanup and security restrictions keep their previous tests,
+  now backed by real generated media instead of stub binaries.
+- A regression test runs a full video job with `PATH` pointing at a
+  non-existent directory, proving no system binaries are needed.
+- CI no longer installs `ffmpeg` via apt.
+
+## Validation performed
+
+Environment: Linux, Python **3.11.2**, no `ffmpeg`/`ffprobe`/`soffice`
+binaries on the host, `av` **18.1.0**, `ppt2pptx` **0.4.2**.
+
+- `python -m unittest discover -s tests`: **164 passed**, 0 skipped.
+- `python -m pip check`: no broken requirements.
+- `ruff check gamas_bot scripts tests --select E9,F`: passed.
+- `python -m compileall -q gamas_bot scripts tests`: passed.
+- Worker CLI exercised directly (`check`, `probe`, `extract`, `merge`,
+  `convert`) including the HTTP-playlist whitelist refusal.
+
+## Remaining limitations
+
+- The media worker is still native code parsing untrusted bytes; it is
+  process-isolated and protocol-restricted but not a sandbox. Keep `av`
+  updated and apply host resource limits.
+- ppt2pptx fidelity on exotic legacy decks is bounded by its documented
+  feature set (see its README); warnings are logged for omitted content.
+- Windows/macOS application execution is documented but validated only on
+  Linux CI, as before.
+
+---
+
 # Repository review — 2026-09-27
 
 ## Scope and result
@@ -43,14 +172,16 @@ without evidence of a dependency problem.
 
 ## Validation performed
 
-Environment: Linux, Python **3.11.2**, FFmpeg **7.0.2-static**.
+Environment: Linux, Python **3.11.2** (historical run, before the 2026-09-28
+dependency removal above).
 
-- `python -m unittest discover -s tests -v`: **141 passed**, no skips when
-  `FFMPEG_TEST_BIN` points to the smoke-test binary.
-- Real FFmpeg checks: concatenate/resample clips and inserted silence; WAV/Opus
-  conversion; reject a network playlist without fetching its URL.
+- `python -m unittest discover -s tests -v`: **141 passed** at that time, no
+  skips when the optional smoke-test FFmpeg binary was provided.
+- Real FFmpeg checks (now superseded by the always-on PyAV worker tests):
+  concatenate/resample clips and inserted silence; WAV/Opus conversion;
+  reject a network playlist without fetching its URL.
 - Real subprocess checks: timeout with output pipes, cancellation, and POSIX
-  launcher-child cleanup.
+  launcher-child cleanup (retained, still passing).
 - Synthetic package/SQLite tests: presentation variants, complete long outlines,
   rollback after invalid data, migration rollback/replay and parser boundaries.
 - Mock provider/Telegram tests: timeout fallback, private admin isolation,
@@ -62,12 +193,11 @@ Environment: Linux, Python **3.11.2**, FFmpeg **7.0.2-static**.
   requirements at review time. This is not a guarantee about unknown issues.
 - `git diff --check`: passed.
 
-FFmpeg was supplied locally by an optional `imageio-ffmpeg` development install
-because OS package installation was unavailable in this sandbox. It is not a
-new application dependency. Normally install FFmpeg/FFprobe from your OS packages;
-CI installs them that way. Real-media tests skip explicitly if no FFmpeg binary
-is available. The new cloud CI matrix has not yet run in GitHub; only Python
-3.11 was executed locally.
+At that time FFmpeg was supplied locally by an optional `imageio-ffmpeg`
+development install because OS package installation was unavailable in this
+sandbox; it was not an application dependency. Since the 2026-09-28 review
+above, **no FFmpeg/FFprobe binary is used or expected anywhere** — neither for
+the application nor for the tests — and CI installs none.
 
 ## Deployment actions
 
@@ -85,12 +215,12 @@ is available. The new cloud CI matrix has not yet run in GitHub; only Python
    it was reused. Removing the workflow does not erase Git history or rotate
    external credentials.
 
-## Remaining limitations and unverified behavior
+## Remaining limitations and unverified behavior (2026-09-27 state)
 
 - Live Telegram authentication/upload/delivery, provider API compatibility and
-  billing, real LibreOffice conversion, Windows execution, and actual systemd
-  startup require validation on the target host. FFprobe was exercised through
-  stubs/parser tests, not a real local FFprobe executable.
+  billing, Windows execution, and actual systemd startup require validation on
+  the target host. FFprobe was then exercised through stubs/parser tests; the
+  2026-09-28 review replaced it entirely with real PyAV-backed probe tests.
 - `MAX_CONCURRENT_JOBS` limits active work, not queue length or per-user usage.
   Pending tasks live in memory. Public deployments need admission/rate limits
   and resource controls; interrupted jobs require resubmission.
@@ -99,8 +229,9 @@ is available. The new cloud CI matrix has not yet run in GitHub; only Python
   checked after conversion. Set host disk, memory and CPU limits.
 - Protocol restrictions and the service unit are not a full parser sandbox.
   Untrusted documents may still access local files readable by the service
-  account; isolate workers and keep native tools patched. The unit needs network
-  access for Telegram/STT, so it does not isolate LibreOffice from the network.
+  account; isolate workers and keep native libraries patched. The unit needs
+  network access for Telegram/STT, so it does not isolate the media worker
+  from the network (the worker itself only whitelists local protocols).
 - Long decks are chunked without precise narration-to-slide timestamps. Retaining
   all input does not guarantee an LLM preserves every fact or cross-chunk context.
 - A local STT timeout does not cancel/delete a remote Speechmatics job. Review

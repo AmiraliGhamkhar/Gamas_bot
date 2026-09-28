@@ -74,11 +74,12 @@ class Settings:
     presentation_max_total_duration: int = 21600
     presentation_max_unpacked_bytes: int = 4_000_000_000
     presentation_wav_limit_bytes: int = 700_000_000
-    ffmpeg_bin: str = "ffmpeg"
-    ffprobe_bin: str = "ffprobe"
-    soffice_bin: str = "soffice"
-    ffmpeg_timeout: int = 3600
-    soffice_timeout: int = 600
+    # The media pipeline runs in a Python child process (PyAV / ppt2pptx), so
+    # no FFMPEG_BIN / FFPROBE_BIN / SOFFICE_BIN settings exist any more.  The
+    # legacy FFMPEG_TIMEOUT_SECONDS and SOFFICE_TIMEOUT_SECONDS variables are
+    # still honoured as fallbacks for the two timeouts below.
+    media_timeout: int = 3600
+    convert_timeout: int = 600
     log_level: str = "INFO"
     log_format: str = "text"
     log_file: Path | None = None
@@ -187,6 +188,16 @@ class Settings:
             raise ValueError("LOG_FORMAT فقط می‌تواند text یا json باشد.")
         log_file_value = os.getenv("LOG_FILE", "").strip()
 
+        # Timeouts keep their historical environment variables as fallbacks so
+        # existing .env files continue to work unchanged.
+        media_timeout_raw = (
+            _text("MEDIA_TIMEOUT_SECONDS", "")
+            or _text("FFMPEG_TIMEOUT_SECONDS", "3600")
+        )
+        convert_timeout_raw = (
+            _text("PPT_CONVERT_TIMEOUT_SECONDS", "")
+            or _text("SOFFICE_TIMEOUT_SECONDS", "600")
+        )
         try:
             min_clip = float(_text("PPTX_MIN_CLIP_SECONDS", "1.0"))
             silence = float(_text("PPTX_SILENCE_SECONDS", "0.5"))
@@ -194,8 +205,8 @@ class Settings:
             max_total_duration = int(_text("PPTX_MAX_TOTAL_DURATION_SECONDS", "21600"))
             max_unpacked = int(_text("PPTX_MAX_UNPACKED_BYTES", "4000000000"))
             wav_limit = int(_text("PPTX_WAV_LIMIT_BYTES", "700000000"))
-            ffmpeg_timeout = int(_text("FFMPEG_TIMEOUT_SECONDS", "3600"))
-            soffice_timeout = int(_text("SOFFICE_TIMEOUT_SECONDS", "600"))
+            media_timeout = int(media_timeout_raw)
+            convert_timeout = int(convert_timeout_raw)
         except ValueError as exc:
             raise ValueError("مقادیر عددی مربوط به پردازش فایل ارائه معتبر نیستند.") from exc
         if not all(math.isfinite(value) for value in (min_clip, silence)):
@@ -204,8 +215,8 @@ class Settings:
             raise ValueError("PPTX_MIN_CLIP_SECONDS و PPTX_SILENCE_SECONDS نمی‌توانند منفی باشند.")
         if min(max_clips, max_total_duration, max_unpacked, wav_limit) <= 0:
             raise ValueError("محدودیت‌های عددی فایل ارائه باید مثبت باشند.")
-        if min(ffmpeg_timeout, soffice_timeout) <= 0:
-            raise ValueError("زمان‌های انتظار ffmpeg و soffice باید مثبت باشند.")
+        if min(media_timeout, convert_timeout) <= 0:
+            raise ValueError("زمان‌های انتظار پردازش رسانه و تبدیل ارائه باید مثبت باشند.")
 
         return cls(
             telegram_bot_token=token,
@@ -249,11 +260,8 @@ class Settings:
             presentation_max_total_duration=max_total_duration,
             presentation_max_unpacked_bytes=max_unpacked,
             presentation_wav_limit_bytes=wav_limit,
-            ffmpeg_bin=_text("FFMPEG_BIN", "ffmpeg"),
-            ffprobe_bin=_text("FFPROBE_BIN", "ffprobe"),
-            soffice_bin=_text("SOFFICE_BIN", "soffice"),
-            ffmpeg_timeout=ffmpeg_timeout,
-            soffice_timeout=soffice_timeout,
+            media_timeout=media_timeout,
+            convert_timeout=convert_timeout,
             log_level=log_level,
             log_format=log_format,
             log_file=Path(log_file_value) if log_file_value else None,

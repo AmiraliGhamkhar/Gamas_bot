@@ -7,10 +7,20 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from gamas_bot.bot import StudyBot, _presentation_metadata
+from gamas_bot.bot import (
+    UNSUPPORTED_PRESENTATION_MESSAGE,
+    StudyBot,
+    _presentation_metadata,
+)
 from gamas_bot.stt import Transcript
 
-from support import AUDIO_REL, build_deck, fake_media_bytes, make_settings, stub_tools
+from support import (
+    AUDIO_REL,
+    FIXTURES_DIR,
+    build_deck,
+    make_settings,
+    wav_bytes,
+)
 
 
 class FakeEvent:
@@ -57,6 +67,7 @@ class PresentationDetectionTests(unittest.TestCase):
         self.assertTrue(mime.endswith("presentationml.presentation"))
 
         self.assertEqual(_presentation_metadata(fake_document("old.ppt", None))[0], "legacy")
+        self.assertEqual(_presentation_metadata(fake_document("deck.odp", None))[0], "unsupported")
         self.assertIsNone(_presentation_metadata(fake_document("song.mp3", "audio/mpeg"))[0])
         self.assertIsNone(_presentation_metadata(fake_document("notes.pdf", "application/pdf"))[0])
 
@@ -70,12 +81,10 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.tools = stub_tools(self.root / "bin")
         self.settings = make_settings(
             database_path=self.root / "bot.sqlite3",
             session_path=self.root / "session",
             temp_dir=self.root / "tmp",
-            **self.tools,
         )
         self.bot = StudyBot(self.settings)
         await self.bot.db.open()
@@ -101,12 +110,12 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
                     "title": "مقدمه",
                     "bullets": ["تعریف اول"],
                     "notes": "یادآوری امتحان",
-                    "media": [("a.m4a", fake_media_bytes(40.0), AUDIO_REL)],
+                    "media": [("a.wav", wav_bytes(40.0), AUDIO_REL)],
                 },
                 {
                     "title": "ادامه",
                     "bullets": ["تعریف دوم"],
-                    "media": [("b.wav", fake_media_bytes(20.0), AUDIO_REL)],
+                    "media": [("b.wav", wav_bytes(20.0), AUDIO_REL)],
                 },
             ],
         )
@@ -161,36 +170,46 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stats["failed"], 1)
 
     async def test_legacy_deck_is_converted_before_processing(self):
-        deck = build_deck(
-            self.root / "legacy.ppt",
-            slides=[{"title": "قدیمی", "media": [("a.m4a", fake_media_bytes(25.0), AUDIO_REL)]}],
-        )
-        with patch(
-            "gamas_bot.bot.transcribe",
-            new=AsyncMock(return_value=Transcript("speechmatics", "متن", 0.8)),
-        ), patch(
+        # A real PowerPoint 97–2003 binary goes through ppt2pptx first; it has
+        # no narration, so the booklet is built from its slide text.
+        legacy = self.root / "legacy.ppt"
+        shutil.copyfile(FIXTURES_DIR / "visual_minimal.ppt", legacy)
+        with patch("gamas_bot.bot.transcribe", new=AsyncMock()) as stt, patch(
             "gamas_bot.bot.structure_presentation", new=AsyncMock(return_value="جزوه")
-        ):
-            event, _ = await self._run_job(deck, kind="legacy")
+        ) as structuring:
+            event, _ = await self._run_job(legacy, kind="legacy")
         self.assertTrue(any("تبدیل می‌شود" in item for item in event.responses))
         self.assertTrue(any("جزوه" in item for item in event.responses))
+        stt.assert_not_awaited()
+        structuring.assert_awaited_once()
+        outline = structuring.await_args.args[0]
+        self.assertIn("اسلاید", outline)
 
     async def test_legacy_deck_is_rejected_when_disabled(self):
         self.bot.settings = make_settings(
             database_path=self.settings.database_path,
             temp_dir=self.settings.temp_dir,
             presentation_legacy_enabled=False,
-            **self.tools,
         )
         event = FakeEvent(self.root / "missing.ppt")
         user = await self.bot.db.upsert_user(556, None)
         await self.bot._accept_presentation(event, user, "legacy", "old.ppt", None, "9")
         self.assertTrue(any("pptx" in item for item in event.replies))
 
+    async def test_odp_deck_is_rejected_with_a_clear_message(self):
+        event = FakeEvent(self.root / "deck.odp")
+        user = await self.bot.db.upsert_user(557, None)
+        await self.bot._accept_presentation(
+            event, user, "unsupported", "deck.odp", None, "10"
+        )
+        self.assertEqual(event.replies, [UNSUPPORTED_PRESENTATION_MESSAGE])
+        stats = await self.bot.db.stats()
+        self.assertEqual(stats["submissions"], 0)
+
     async def test_structuring_failure_still_returns_the_material(self):
         deck = build_deck(
             self.root / "fallback.pptx",
-            slides=[{"title": "عنوان", "media": [("a.m4a", fake_media_bytes(15.0), AUDIO_REL)]}],
+            slides=[{"title": "عنوان", "media": [("a.wav", wav_bytes(15.0), AUDIO_REL)]}],
         )
         with patch(
             "gamas_bot.bot.transcribe",
@@ -209,12 +228,11 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
     async def test_temporary_files_are_cleaned_up(self):
         deck = build_deck(
             self.root / "cleanup.pptx",
-            slides=[{"title": "عنوان", "media": [("a.m4a", fake_media_bytes(15.0), AUDIO_REL)]}],
+            slides=[{"title": "عنوان", "media": [("a.wav", wav_bytes(15.0), AUDIO_REL)]}],
         )
-        with patch(
-            "gamas_bot.bot.transcribe",
-            new=AsyncMock(return_value=Transcript("deepgram", "متن", 0.7)),
-        ), patch("gamas_bot.bot.structure_presentation", new=AsyncMock(return_value="جزوه")):
+        with patch("gamas_bot.bot.transcribe", new=AsyncMock(return_value=Transcript("deepgram", "متن", 0.7))), patch(
+            "gamas_bot.bot.structure_presentation", new=AsyncMock(return_value="جزوه")
+        ):
             await self._run_job(deck)
         self.assertEqual(list(self.settings.temp_dir.glob("deck-*")), [])
 
