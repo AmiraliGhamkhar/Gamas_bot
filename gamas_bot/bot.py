@@ -304,13 +304,30 @@ def markdown_to_telegram_html(text: str) -> str:
             value,
         )
 
+    def strong(value: str) -> str:
+        """Wrap already-rendered inline HTML in <b> without nesting a bold tag.
+
+        Telegram rejects the *whole* message when the same formatting tag
+        appears inside itself ("<b><b>x</b></b>"), so a heading or table header
+        that is itself bold ("# **title**") must not gain a second <b>.
+        """
+        if "<b>" in value or "</b>" in value:
+            return value
+        return f"<b>{value}</b>"
+
+    def strong_label(value: str, suffix: str = ":") -> str:
+        """``strong(value)`` keeping ``suffix`` inside the bold run when possible."""
+        if "<b>" in value or "</b>" in value:
+            return value + suffix
+        return f"<b>{value}{suffix}</b>"
+
     def flush_table() -> None:
         """Emit a table header that never received a data row."""
         nonlocal table_header, table_rows
         if table_header is not None and not table_rows:
             cells = [inline(cell) for cell in table_header if cell.strip()]
             if cells:
-                result.append(" · ".join(f"<b>{cell}</b>" for cell in cells))
+                result.append(" · ".join(strong(cell) for cell in cells))
         table_header = None
         table_rows = 0
 
@@ -345,14 +362,14 @@ def markdown_to_telegram_html(text: str) -> str:
                     continue
                 label = table_header[index].strip() if index < len(table_header) else ""
                 pairs.append(
-                    f"<b>{inline(label)}:</b> {inline(cell)}" if label else inline(cell)
+                    f"{strong_label(inline(label))} {inline(cell)}" if label else inline(cell)
                 )
             result.append(" · ".join(pairs) if pairs else inline(" | ".join(cells)))
             table_rows += 1
             continue
         heading = re.match(r"^\s{0,3}#{1,6}\s+(.*)$", line)
         if heading:
-            result.append(f"<b>{inline(heading.group(1).strip())}</b>")
+            result.append(strong(inline(heading.group(1).strip())))
             continue
         if re.match(r"^\s*[-*+]\s+", line):
             item = re.sub(r"^\s*[-*+]\s+", "", line)

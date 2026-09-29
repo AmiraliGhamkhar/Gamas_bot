@@ -1,3 +1,56 @@
+# Repository review — 2026-09-29 (Telegram rendering + Word booklet polish)
+
+## Scope and result
+
+A focused pass over the two user-visible deliverables — the Telegram message
+renderer and the generated `.docx` booklet — after the cPanel audit below. Every
+tracked module, both migrations, the tests and the docs were re-read for
+consistency. **265 tests pass** (249 existing + 16 new). No live Telegram login
+or paid provider call was made.
+
+## Bugs found and fixed
+
+| # | Area | Problem (reproduced) | Fix |
+|---|---|---|---|
+| 1 | Frontend (Telegram) | A heading or table header that was **itself bold** (`# **عنوان**`) was wrapped in a second `<b>`, emitting `<b><b>…</b></b>`. Telegram rejects a same-nested tag by failing the **entire message** ("can't parse entities"), so the whole booklet was lost — not just the heading. Reproduced on 5 distinct inputs. | New `strong()` / `strong_label()` helpers add a bold wrapper only when the already-rendered inline HTML contains no `<b>`, so a self-bold heading stays `<b>عنوان</b>`. Plain headers keep the previous `<b>a:</b>` output byte-for-byte. |
+| 2 | Frontend (Telegram) | `progress_bar()` rounded 96–99% up to a **full** fill, then appended the emoji past the fixed width: the bar became 13 visible cells instead of 12 and visibly jumped in width mid-animation. | Clamp the fill to `width - 1` when a head emoji is used. The bar is now exactly `width` cells for every percentage, width and head combination (regression-tested across all of them). |
+| 3 | Word document | `w:bidiVisual` was **appended** to `w:tblPr`, landing after `w:tblLook`. `CT_TblPr` is order-sensitive, so the generated file was schema-invalid and Word could report it as needing repair. | Insert `w:bidiVisual` before the first following element (`w:tblW`/`w:tblLook`/…), matching the schema. A test asserts the resulting order. |
+| 4 | Word document | Truncating a long note title at 50 characters could leave a **trailing space or dot**, producing filenames like `جزوه - عنوان  - GMS-000001.docx` with a doubled separator and a near-empty extension. | `sanitize_filename_part()` re-strips ` ` and `.` after truncation. |
+
+## Word booklet improvements
+
+Beyond the fixes above, the booklet now reads properly across page breaks:
+
+* **Repeating table headers** — `w:tblHeader` on the first row plus
+  `w:cantSplit`, so a long comparison table keeps its column headings on every
+  page instead of losing them after the first break.
+* **Keep-with-next on headings** — every section heading, the summary heading
+  and each "key points" box label carry `w:keepNext` + `w:keepLines`, so a
+  heading can no longer be stranded alone at the foot of a page.
+
+A new `WordLayoutTests` suite parses the produced `word/*.xml` parts and asserts
+that `w:pPr`, `w:rPr`, `w:tblPr` and `w:trPr` children all follow the
+`CT_PPrBase` / `CT_TblPrBase` / `CT_TrPrBase` sequences — the ordering class of
+bug above cannot regress unnoticed.
+
+## Not changed (deliberate)
+
+* No table of contents or page-number field rework beyond what already exists;
+  the footer PAGE field is correct and adding a TOC would require Word to
+  refresh fields on open.
+* Document structure, shading palette, fonts and the raw-text companion file
+  are unchanged, so existing output stays comparable.
+
+## Validation
+
+`python -m unittest discover -s tests`: **265 passed** (0 failures, 0 skips).
+`ruff check gamas_bot scripts tests passenger_wsgi.py --select E9,F`,
+`compileall` and `pip check` pass. The generated document reopens cleanly in
+python-docx and every `word/*.xml` part was verified against the OOXML element
+sequences.
+
+---
+
 # Repository review — 2026-09-29 (full-stack audit + cPanel deployability)
 
 ## Scope and headline

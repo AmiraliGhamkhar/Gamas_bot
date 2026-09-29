@@ -67,7 +67,9 @@ def sanitize_filename_part(value: str, *, max_chars: int = MAX_FILENAME_TITLE_CH
     """Turn arbitrary text (note titles, filenames) into a safe filename part."""
     cleaned = UNSAFE_FILENAME_CHARS.sub(" ", value).strip(" .")
     cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned[:max_chars]
+    # Truncating can expose a trailing space or dot ("title …" -> "title "), which
+    # Telegram and desktop file managers strip or turn into a confusing extension.
+    return cleaned[:max_chars].strip(" .")
 
 
 def gregorian_to_jalali(gy: int, gm: int, gd: int) -> tuple[int, int, int]:
@@ -155,6 +157,49 @@ def _insert_ppr_child(p_pr, element, successors: tuple[str, ...]) -> None:
             found.addprevious(element)
             return
     p_pr.append(element)
+
+
+#: Elements that must follow ``w:keepNext``/``w:keepLines`` inside ``w:pPr``
+#: (CT_PPrBase order). OOXML is order-sensitive and Word rejects a document
+#: whose paragraph properties are out of sequence.
+PPR_SUCCESSORS = (
+    "w:pageBreakBefore", "w:framePr", "w:widowControl", "w:numPr",
+    "w:suppressLineNumbers", "w:pBdr", "w:shd", "w:tabs", "w:suppressAutoHyphens",
+    "w:kinsoku", "w:wordWrap", "w:overflowPunct", "w:topLinePunct", "w:autoSpaceDE",
+    "w:autoSpaceDN", "w:bidi", "w:adjustRightInd", "w:snapToGrid", "w:spacing",
+    "w:ind", "w:contextualSpacing", "w:mirrorIndents", "w:suppressOverlap",
+    "w:jc", "w:textDirection", "w:textAlignment", "w:textboxTightWrap",
+    "w:outlineLvl", "w:divId", "w:cnfStyle", "w:rPr", "w:sectPr",
+)
+
+
+def _keep_with_next(paragraph, *, keep_lines: bool = True) -> None:
+    """Stop Word from leaving a heading (or its first line) alone at a page foot."""
+    p_pr = paragraph._p.get_or_add_pPr()
+    _remove_ppr_child(p_pr, "w:keepNext")
+    _insert_ppr_child(
+        p_pr, OxmlElement("w:keepNext"), ("w:keepLines",) + PPR_SUCCESSORS
+    )
+    if keep_lines:
+        _remove_ppr_child(p_pr, "w:keepLines")
+        _insert_ppr_child(p_pr, OxmlElement("w:keepLines"), PPR_SUCCESSORS)
+
+
+def _repeat_table_header(row) -> None:
+    """Mark a table row as a header that repeats on every page.
+
+    Without ``w:tblHeader`` a table split across pages loses its column
+    headings on the second and later pages, which makes wide Persian tables
+    unreadable.
+    """
+    tr_pr = row._tr.get_or_add_trPr()
+    for found in tr_pr.findall(qn("w:tblHeader")):
+        tr_pr.remove(found)
+    header = OxmlElement("w:tblHeader")
+    header.set(qn("w:val"), "true")
+    tr_pr.append(header)
+    cant_split = OxmlElement("w:cantSplit")
+    tr_pr.insert(0, cant_split)
 
 
 def _remove_ppr_child(p_pr, tag: str) -> None:
@@ -343,7 +388,7 @@ def _add_title_block(document, title: str, meta: DocumentMeta, *, font: str) -> 
 
 
 def _add_heading(document, text: str, *, font: str, size: float = 14, space_before: float = 14) -> None:
-    _add_rtl_paragraph(
+    paragraph = _add_rtl_paragraph(
         document,
         text,
         font=font,
@@ -354,6 +399,8 @@ def _add_heading(document, text: str, *, font: str, size: float = 14, space_befo
         space_after=6,
         space_before=space_before,
     )
+    # A heading alone at the foot of a page reads as a broken booklet.
+    _keep_with_next(paragraph)
 
 
 def _add_boxed_lines(
@@ -366,7 +413,7 @@ def _add_boxed_lines(
     marker: str = "✦",
 ) -> None:
     """A shaded, bordered box of marked lines with a bold label."""
-    _add_rtl_paragraph(
+    label_paragraph = _add_rtl_paragraph(
         document,
         label,
         font=font,
@@ -375,6 +422,7 @@ def _add_boxed_lines(
         align=WD_ALIGN_PARAGRAPH.RIGHT,
         space_after=2,
     )
+    _keep_with_next(label_paragraph)
     for index, line in enumerate(lines):
         paragraph = _add_rtl_paragraph(
             document,
@@ -395,9 +443,24 @@ def _add_table(document, table_data, *, font: str) -> None:
     table = document.add_table(rows=len(rows) + 1, cols=len(headers))
     table.style = "Table Grid"
     # RTL column order: the first logical column renders on the right.
+    # CT_TblPr is order-sensitive and w:bidiVisual must precede w:tblW/w:tblLook;
+    # appending it last produces a document Word reports as needing repair.
     tbl_pr = table._tbl.tblPr
+    _remove_ppr_child(tbl_pr, "w:bidiVisual")
     bidi_visual = OxmlElement("w:bidiVisual")
-    tbl_pr.append(bidi_visual)
+    anchor = None
+    for tag in ("w:tblStyleRowBandSize", "w:tblStyleColBandSize", "w:tblW", "w:jc",
+                "w:tblCellSpacing", "w:tblInd", "w:tblBorders", "w:shd",
+                "w:tblLayout", "w:tblCellMar", "w:tblLook", "w:tblCaption",
+                "w:tblDescription"):
+        found = tbl_pr.find(qn(tag))
+        if found is not None:
+            anchor = found
+            break
+    if anchor is not None:
+        anchor.addprevious(bidi_visual)
+    else:
+        tbl_pr.append(bidi_visual)
 
     for column, header in enumerate(headers):
         cell = table.cell(0, column)
@@ -416,6 +479,8 @@ def _add_table(document, table_data, *, font: str) -> None:
         shd.set(qn("w:val"), "clear")
         shd.set(qn("w:fill"), ACCENT_HEX)
         tc_pr.append(shd)
+    # Keep the column headings visible on every page of a long table.
+    _repeat_table_header(table.rows[0])
     for row_index, row in enumerate(rows, start=1):
         for column, value in enumerate(row):
             cell = table.cell(row_index, column)
