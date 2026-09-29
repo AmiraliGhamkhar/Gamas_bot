@@ -29,6 +29,6 @@ jobs:
       - name: Check dependency consistency and critical Python errors
         run: |
           python -m pip check
-          ruff check gamas_bot scripts tests --select E9,F
+          ruff check gamas_bot scripts tests passenger_wsgi.py --select E9,F
       - name: Run offline regression tests
         run: python -m unittest discover -s tests -v

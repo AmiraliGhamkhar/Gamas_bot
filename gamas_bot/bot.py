@@ -248,6 +248,26 @@ def render_pages(text: str, reserve: int = 64) -> list[str]:
     return _split_rendered(markdown_to_telegram_html(text), budget) or [""]
 
 
+def _emphasis_is_nested(value: str) -> bool:
+    """True when every <b>/<i> tag closes in the reverse order it opened."""
+    stack: list[str] = []
+    for tag in re.findall(r"</?[bi]>", value):
+        if not tag.startswith("</"):
+            stack.append(tag[1])
+        elif not stack or stack.pop() != tag[2]:
+            return False
+    return not stack
+
+
+def _parse_user_id(value: str) -> int | None:
+    """A Telegram user id typed by an admin (ASCII or Persian digits), else None."""
+    value = value.strip().lstrip("+")
+    # isdecimal() rejects characters such as "²" that isdigit() accepts but int() cannot read.
+    if not value.isdecimal() or len(value) > 15:
+        return None
+    return int(value)
+
+
 def markdown_to_telegram_html(text: str) -> str:
     """Convert the small Markdown subset used by the LLM to Telegram-safe HTML."""
     # NUL is not valid Telegram text and must not impersonate our code placeholders.
@@ -267,11 +287,17 @@ def markdown_to_telegram_html(text: str) -> str:
             return f"\x00{len(stashed) - 1}\x00"
 
         value = re.sub(r"`([^`]+)`", stash, value)
+        plain = value
         value = re.sub(r"\*\*(?!\s)(.+?)(?<!\s)\*\*", r"<b>\1</b>", value)
         # Emphasis markers must hug their text and sit outside a word, so
         # "2 * 3 * 4" and identifiers such as @a_b_c survive untouched.
         value = re.sub(r"(?<![\w*])\*(?!\s)([^*]+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", value)
         value = re.sub(r"(?<![\w_])_(?!\s)([^_]+?)(?<!\s)_(?![\w_])", r"<i>\1</i>", value)
+        if not _emphasis_is_nested(value):
+            # Crossed markers such as "**a *b** c*" would yield <b><i></b></i>,
+            # which Telegram rejects as a whole ("can't parse entities").
+            # Showing the markers literally beats losing the message.
+            value = plain
         return re.sub(
             r"\x00(\d+)\x00",
             lambda match: f"<code>{stashed[int(match.group(1))]}</code>",
@@ -408,6 +434,7 @@ class StudyBot:
         settings.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = TelegramClient(
             str(settings.session_path), settings.telegram_api_id, settings.telegram_api_hash,
+            proxy=settings.telegram_proxy,
         )
         self.client.parse_mode = None
         self._tasks: set[asyncio.Task] = set()
@@ -631,10 +658,10 @@ class StudyBot:
                 await event.respond(result, buttons=admin_menu())
             return
 
-        if not text.lstrip("+").isdigit():
+        target_id = _parse_user_id(text)
+        if target_id is None:
             await event.reply("شناسه باید عددی باشد؛ لطفاً دوباره بفرستید.")
             return
-        target_id = int(text)
         if target_id in self.settings.admin_ids:
             await event.reply("نمی‌توانید دسترسی مدیر ربات را تغییر دهید.")
             return
@@ -1329,10 +1356,10 @@ class StudyBot:
             return
         if command in {"/ban", "/unban"}:
             args = text.split(maxsplit=1)
-            if len(args) != 2 or not args[1].strip().lstrip("+").isdigit():
+            target_id = _parse_user_id(args[1]) if len(args) == 2 else None
+            if target_id is None:
                 await event.reply(f"روش استفاده: {command} شناسه_عددی_کاربر")
                 return
-            target_id = int(args[1].strip())
             if target_id in self.settings.admin_ids:
                 await event.reply("امکان مسدودسازی یا رفع مسدودیت مدیران از این دستور وجود ندارد.")
                 return
