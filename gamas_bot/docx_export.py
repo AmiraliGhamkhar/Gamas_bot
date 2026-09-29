@@ -40,8 +40,17 @@ JALALI_MONTHS = (
     "مهر", "آبان", "آذر", "دی", "بهمن", "اسفند",
 )
 
-UNSAFE_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\r\n\t]+')
+UNSAFE_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]+')
+# Characters XML 1.0 (and therefore Word) cannot store. python-docx raises
+# ValueError on them, which used to cost the user the whole Word document.
+XML_INVALID_CHARS = re.compile("[\x00-\x08\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
+SOFT_BREAK_CHARS = re.compile("[\x0b\x0c]")
 MAX_FILENAME_TITLE_CHARS = 50
+
+
+def xml_safe(text: str) -> str:
+    """Drop XML-illegal characters; PowerPoint soft line breaks (VT) become spaces."""
+    return XML_INVALID_CHARS.sub("", SOFT_BREAK_CHARS.sub(" ", text))
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +255,7 @@ def _fill_paragraph(
     paragraph.paragraph_format.space_after = Pt(space_after)
     paragraph.paragraph_format.space_before = Pt(space_before)
     paragraph.paragraph_format.line_spacing = line_spacing
+    text = xml_safe(text)
     if text:
         run = paragraph.add_run(text)
         _style_run(run, font=font, size=size, bold=bold, color=color, italic=italic)
@@ -287,7 +297,7 @@ def _setup_document(meta: DocumentMeta, title: str, *, font: str) -> tuple[Docum
     normal_r_fonts = normal_r_pr.get_or_add_rFonts()
     normal_r_fonts.set(qn("w:cs"), font)
 
-    document.core_properties.title = title
+    document.core_properties.title = xml_safe(title)
     document.core_properties.author = "Gamas Bot"
     document.core_properties.comments = meta.reference
     _add_page_number_footer(section, font=font)
@@ -482,9 +492,9 @@ def build_notes_docx(notes: StructuredNotes, *, font: str = DEFAULT_FONT, meta: 
             paragraph = _add_rtl_paragraph(
                 document, "", font=font, space_after=4
             )
-            term_run = paragraph.add_run(f"{entry.term}: ")
+            term_run = paragraph.add_run(xml_safe(f"{entry.term}: "))
             _style_run(term_run, font=font, size=11, bold=True, color=ACCENT)
-            definition_run = paragraph.add_run(entry.definition)
+            definition_run = paragraph.add_run(xml_safe(entry.definition))
             _style_run(definition_run, font=font, size=11)
 
     buffer = io.BytesIO()

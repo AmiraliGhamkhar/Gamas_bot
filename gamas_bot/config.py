@@ -6,11 +6,19 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 
 TRUTHY = {"1", "true", "yes", "on"}
+
+# Relative paths in the configuration (``.env``, ``data/...``) are anchored to
+# the project directory, never to the process's working directory.  Cron jobs,
+# Passenger and ``su -c`` all start processes in ``$HOME`` or ``/``, where a
+# working-directory-relative ``data/`` would silently create a second, empty
+# database and Telegram session.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROXY_SCHEMES = {"socks5": "socks5", "socks5h": "socks5", "socks4": "socks4", "http": "http"}
 
 
 def _flag(name: str, default: bool) -> bool:
@@ -28,6 +36,44 @@ def _text(name: str, default: str) -> str:
     """
     raw = os.getenv(name)
     return raw.strip() if raw and raw.strip() else default
+
+
+def _anchor(value: str) -> Path:
+    """``~`` expanded; relative paths anchored to the project directory."""
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+
+def _path(name: str, default: str) -> Path:
+    return _anchor(_text(name, default))
+
+
+def _default_env_file() -> Path:
+    """``.env`` from the working directory if present, else from the project root."""
+    local = Path(".env")
+    return local if local.is_file() else PROJECT_ROOT / ".env"
+
+
+def parse_proxy(value: str) -> tuple:
+    """Turn ``socks5://user:pass@host:1080`` into a Telethon proxy tuple."""
+    parsed = urlparse(value)
+    scheme = PROXY_SCHEMES.get(parsed.scheme.lower())
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if scheme is None or not parsed.hostname or not port:
+        raise ValueError(
+            "TELEGRAM_PROXY باید مانند socks5://host:port یا http://user:pass@host:port باشد."
+        )
+    return (
+        scheme,
+        parsed.hostname,
+        port,
+        True,
+        unquote(parsed.username) if parsed.username else None,
+        unquote(parsed.password) if parsed.password else None,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,6 +156,14 @@ class Settings:
     log_file: Path | None = None
     log_max_bytes: int = 10_000_000
     log_backup_count: int = 5
+    # Optional Telethon proxy tuple (type, host, port, rdns, user, password)
+    # for hosts that cannot reach Telegram's MTProto servers directly.
+    telegram_proxy: tuple | None = None
+
+    @property
+    def lock_path(self) -> Path:
+        """Advisory lock guarding the Telegram session against a second instance."""
+        return self.session_path.with_name(self.session_path.name + ".lock")
 
     @property
     def effective_note_api_key(self) -> str | None:
@@ -131,8 +185,8 @@ class Settings:
         return "gpt-4o-mini"
 
     @classmethod
-    def from_env(cls, env_file: str | Path = ".env") -> "Settings":
-        load_dotenv(env_file, override=False)
+    def from_env(cls, env_file: str | Path | None = None) -> "Settings":
+        load_dotenv(env_file if env_file is not None else _default_env_file(), override=False)
         token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         api_hash = os.getenv("TELEGRAM_API_HASH", "").strip()
         try:
@@ -237,6 +291,8 @@ class Settings:
         if log_format not in {"text", "json"}:
             raise ValueError("LOG_FORMAT فقط می‌تواند text یا json باشد.")
         log_file_value = os.getenv("LOG_FILE", "").strip()
+        proxy_value = os.getenv("TELEGRAM_PROXY", "").strip()
+        telegram_proxy = parse_proxy(proxy_value) if proxy_value else None
 
         # Timeouts keep their historical environment variables as fallbacks so
         # existing .env files continue to work unchanged.
@@ -273,9 +329,9 @@ class Settings:
             telegram_api_id=api_id,
             telegram_api_hash=api_hash,
             admin_ids=admins,
-            database_path=Path(_text("DATABASE_PATH", "data/bot.sqlite3")),
-            session_path=Path(_text("TELEGRAM_SESSION_PATH", "data/telegram_bot")),
-            temp_dir=Path(_text("TEMP_DIR", "data/tmp")),
+            database_path=_path("DATABASE_PATH", "data/bot.sqlite3"),
+            session_path=_path("TELEGRAM_SESSION_PATH", "data/telegram_bot"),
+            temp_dir=_path("TEMP_DIR", "data/tmp"),
             max_file_size=max_file_size,
             stt_primary=primary,
             stt_language=language,
@@ -323,9 +379,10 @@ class Settings:
             convert_timeout=convert_timeout,
             log_level=log_level,
             log_format=log_format,
-            log_file=Path(log_file_value) if log_file_value else None,
+            log_file=_anchor(log_file_value) if log_file_value else None,
             log_max_bytes=log_max_bytes,
             log_backup_count=log_backup_count,
+            telegram_proxy=telegram_proxy,
         )
 
     def validate_runtime(self) -> None:

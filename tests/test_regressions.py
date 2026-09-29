@@ -19,7 +19,7 @@ from gamas_bot.bot import (
     render_pages,
     split_message,
 )
-from gamas_bot.config import Settings
+from gamas_bot.config import PROJECT_ROOT, Settings
 from gamas_bot.database import Database, split_sql_statements
 from gamas_bot.media import build_merge_command, needs_transcode, MediaInfo
 from gamas_bot.presentations import natural_key, prepare_audio, read_presentation
@@ -172,7 +172,8 @@ class SettingsRobustnessTests(unittest.TestCase):
         )
         self.assertEqual(settings.deepgram_model, "nova-3")
         self.assertEqual(settings.gemini_model, "gemini-2.5-flash-lite")
-        self.assertEqual(settings.database_path, Path("data/bot.sqlite3"))
+        # Relative defaults are anchored to the project, not to the cwd (cron/Passenger).
+        self.assertEqual(settings.database_path, PROJECT_ROOT / "data" / "bot.sqlite3")
         self.assertEqual(settings.max_concurrent_jobs, 3)
         self.assertEqual(settings.stt_primary, "speechmatics")
         self.assertEqual(settings.log_level, "INFO")

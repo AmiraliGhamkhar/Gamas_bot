@@ -788,6 +788,8 @@ Gamas_bot/
 │   ├── bot.py             # Telethon handlers, job orchestration
 │   ├── config.py          # environment-driven settings
 │   ├── database.py        # SQLite (aiosqlite) + migrations
+│   ├── instance_lock.py   # single-instance file lock (crash-safe)
+│   ├── launcher.py        # "start the bot if it is not running" for cron/Passenger
 │   ├── docx_export.py     # RTL Word document + raw-text exporters
 │   ├── media.py           # PyAV/ppt2pptx worker helpers (no external binaries)
 │   ├── media_worker.py    # child process: probe/extract/merge/convert
@@ -802,7 +804,11 @@ Gamas_bot/
 │   └── 002_presentations.sql
 │
 ├── scripts/
-│   └── benchmark_stt.py
+│   ├── benchmark_stt.py
+│   ├── cpanel_preflight.py # host self-check for cPanel/shared hosting
+│   └── ensure_running.py   # cron entry point
+│
+├── passenger_wsgi.py      # optional cPanel "Setup Python App" status endpoint
 │
 ├── tests/
 │
@@ -810,6 +816,7 @@ Gamas_bot/
 │   └── gamas-bot.service  # systemd unit for Linux
 ├── docs/
 │   ├── DEPLOY_FA.md        # راهنمای فارسی استقرار و عیب‌یابی
+│   ├── DEPLOY_CPANEL.md    # cPanel / shared-hosting deployment
 │   └── AUDIT.md            # review findings and validation limits
 │
 ├── .github/workflows/tests.yml
@@ -824,8 +831,10 @@ Gamas_bot/
 ## Production Deployment
 
 > راهنمای کامل فارسی نصب، استقرار، systemd و عیب‌یابی: [`docs/DEPLOY_FA.md`](docs/DEPLOY_FA.md)
+>
+> **cPanel / shared hosting:** [`docs/DEPLOY_CPANEL.md`](docs/DEPLOY_CPANEL.md) — cron watchdog, optional Passenger status URL and a host preflight (`python scripts/cpanel_preflight.py`). It works only on plans that allow long-running background processes.
 
-Gamas Bot maintains a persistent Telethon/MTProto connection and does not expose an HTTP port. It must run as a long-lived worker. A VPS, dedicated server, container worker, or PaaS **background worker** is suitable; stateless functions (Vercel/Netlify/Lambda), sleeping free tiers, and traditional shared hosting are not.
+Gamas Bot maintains a persistent Telethon/MTProto connection and does not expose an HTTP port. It must run as a long-lived worker. A VPS, dedicated server, container worker, or PaaS **background worker** is suitable; stateless functions (Vercel/Netlify/Lambda), sleeping free tiers, and traditional shared hosting are not — except cPanel plans that pass the checklist in [`docs/DEPLOY_CPANEL.md`](docs/DEPLOY_CPANEL.md).
 
 For the default 2 GB upload limit, plan disk space for the original file, extracted media, converted presentation, and SQLite database. Start with at least 2 vCPU, 4 GB RAM, and 10–20 GB free disk, set `MAX_CONCURRENT_JOBS=1`, observe usage, and only then increase concurrency.
 

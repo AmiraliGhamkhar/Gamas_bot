@@ -1,3 +1,79 @@
+# Repository review — 2026-09-29 (full-stack audit + cPanel deployability)
+
+## Scope and headline
+
+Every tracked file was reviewed: all `gamas_bot/` modules, both SQL migrations,
+`scripts/`, the tests, CI, the systemd unit, `.env.example`, README and the
+Persian deployment guide. Baseline on entry: 220 tests green, `ruff` (E9,F) and
+`pip check` clean.
+
+* **There is no website and no frontend.** The project is a Telethon (MTProto)
+  Telegram bot: one long-lived outbound connection, no HTTP server, no HTML/JS.
+  The "frontend" is the Telegram chat UI (inline-button menus, progress
+  messages, the generated `.docx`/`.txt` files). Those were audited as such.
+* **cPanel is a poor natural fit** (it launches web requests, not permanent
+  workers) and the previous docs declared shared hosting unsupported. It can
+  work on plans that allow long-running processes, so this review added the
+  missing pieces (below) and an honest checklist rather than pretending it is a
+  standard web deploy.
+* The **database layer is sound**: idempotent, transactional migrations with
+  bookkeeping, `foreign_keys=ON`, WAL, serialised writes, crash-orphaned
+  `pending/processing` rows are marked `failed` at start-up. No schema defect
+  was found.
+
+## Bugs found and fixed
+
+| # | Area | Problem (reproduced) | Fix |
+|---|---|---|---|
+| 1 | Deploy / backend | `.env`, `data/bot.sqlite3`, the Telegram session and `data/tmp` were resolved from the **current working directory**. Cron, Passenger and `su -c` start in `$HOME` or `/`, silently creating a second empty database and a new Telegram login. | Relative paths and the default `.env` are anchored to the project directory (`config.PROJECT_ROOT`); `~` is expanded. |
+| 2 | Deploy / backend | **No single-instance protection**, although the docs warn that two copies corrupt the session and the start-up cleanup deletes the other copy's live job folders. Any watchdog makes duplicates likely. | `instance_lock.py`: kernel `flock` on `<session>.lock`, released by the OS on any exit (tested with `kill -9`). A second process exits with code 3. |
+| 3 | Backend | `SIGTERM` (what cPanel, `kill` and `pkill` send) killed the process **without** cleanup: no job status update, no Telegram disconnect. Only `SIGINT` was graceful. | `SIGTERM` now cancels the main task → same graceful shutdown as Ctrl+C. |
+| 4 | Backend / output | Any XML-illegal character (NUL, `\x01`…`\x08`, VT `\x0b` from PowerPoint soft line breaks, lone surrogates) in a note, slide or transcript made python-docx raise `ValueError`, so the user **lost the Word deliverable** and got only a chat fallback. Filenames could contain control characters too. | `xml_safe()` applied at every text/run/property write; filename sanitiser strips all control characters. |
+| 5 | Frontend (Telegram) | Crossed emphasis such as `**a *b** c*` rendered `<b><i></b></i>`; Telegram rejects the **entire** message ("can't parse entities"). Reproduced in 191 of 30 000 fuzzed inputs. | Improperly nested emphasis falls back to literal text; fuzz now 0/30 000. |
+| 6 | Frontend (Telegram) | Admin `/ban ²` (superscript digit) passed `str.isdigit()` but crashed `int()`; absurdly long numbers overflowed SQLite. | `_parse_user_id()` (decimal only, ≤15 digits, Persian digits accepted). |
+| 7 | Deploy | Hosts that block Telegram's MTProto ports had no workaround. | Optional `TELEGRAM_PROXY` (`socks5://`, `socks4://`, `http://`); `python-socks[asyncio]` added to requirements. |
+
+## Added for cPanel
+
+* `docs/DEPLOY_CPANEL.md` — host checklist, Python-App/venv setup, cron,
+  operations and troubleshooting.
+* `scripts/cpanel_preflight.py` — checks Python version, glibc (PyAV/lxml wheels
+  need ≥ 2.28), packages, project-inside-`public_html`, `.env` permissions,
+  writable dirs and free disk, `flock` support, outbound reachability of
+  Telegram and each configured provider, and the media worker.
+* `gamas_bot/launcher.py` + `scripts/ensure_running.py` — cron watchdog: cheap
+  lock check, spawn throttling (45 s), detached start, default rotating log file.
+* `passenger_wsgi.py` — optional "Setup Python App" entry point: JSON status
+  only (`running` / `starting` / `error`), serves only `/` and `/health`, and
+  doubles as a second watchdog when polled by an uptime monitor.
+
+## Not changed / remaining risks (need the maintainer's decision or a real host)
+
+* **Not verified on a live cPanel account.** Whether the host kills long-running
+  processes, exposes Python 3.11+, or allows outbound 443 to Telegram can only be
+  proven with the preflight on the target plan.
+* STT and note-API calls (`aiohttp`) do **not** use `TELEGRAM_PROXY` or
+  `HTTP(S)_PROXY`; those hosts must be directly reachable. `trust_env` was left
+  off deliberately (it would also route a local Ollama/vLLM gateway via a proxy).
+* No per-user rate limit or queue bound; pending jobs live in memory and are lost
+  on restart (users must resend). Public bots need admission control.
+* SQLite keeps transcripts and notes indefinitely (no retention policy).
+* `ruff --select ASYNC240` flags a few blocking `Path.stat()/open()` calls inside
+  async STT functions; they are short local-disk calls and were left alone.
+* Prior-review limitations below (Windows unverified, remote Speechmatics jobs not
+  cancelled on local timeout, no license file) still apply.
+
+## Validation
+
+`python -m unittest discover -s tests`: **249 passed** (220 existing + 29 new in
+`tests/test_cpanel_deploy.py`). `ruff check gamas_bot scripts tests passenger_wsgi.py
+--select E9,F` and `pip check` pass. Live checks: launcher started a detached
+bot from a foreign working directory and created all state under the project
+directory; a second bot exited with code 3; the preflight ran green on Linux
+(glibc 2.36). No live Telegram login or paid provider call was made.
+
+---
+
 # Repository review — 2026-09-28 (accuracy-first pipeline hardening)
 
 ## Follow-up verification — 2026-09-28

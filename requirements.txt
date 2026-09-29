@@ -7,3 +7,4 @@ lxml>=6.1,<7.0
 av>=16.0,<19.0
 ppt2pptx>=0.4.2,<0.5
 python-docx>=1.1,<2.0
+python-socks[asyncio]>=2.4,<3.0
