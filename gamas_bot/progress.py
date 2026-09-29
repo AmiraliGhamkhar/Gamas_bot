@@ -75,6 +75,10 @@ def progress_bar(percent: int, width: int = BAR_WIDTH, head: str = DEFAULT_HEAD)
         return "█" * width
     filled = round(value * width / 100)
     if head:
+        # The emoji occupies one cell, so the fill must leave room for it.
+        # Without this clamp, 96-99% rounded up to a full bar and pushed the
+        # emoji past the fixed width (13 visible cells instead of 12).
+        filled = min(filled, width - 1)
         return "█" * filled + head + "░" * (width - filled - 1)
     return "█" * filled + "░" * (width - filled)
 

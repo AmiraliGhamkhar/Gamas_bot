@@ -23,6 +23,7 @@ from gamas_bot.config import PROJECT_ROOT, Settings
 from gamas_bot.database import Database, split_sql_statements
 from gamas_bot.media import build_merge_command, needs_transcode, MediaInfo
 from gamas_bot.presentations import natural_key, prepare_audio, read_presentation
+from gamas_bot.progress import BAR_WIDTH, progress_bar
 from gamas_bot.stt import Transcript, transcribe
 
 from support import AUDIO_REL, build_deck, make_settings, wav_bytes
@@ -380,6 +381,78 @@ class PendingAdminActionTests(unittest.IsolatedAsyncioTestCase):
             broadcast.assert_not_awaited()
             self.assertEqual(accepted, ["audio"])
             self.assertEqual(bot._pending_admin_actions, {})
+
+
+class NestedEntityRenderingTests(unittest.TestCase):
+    """Telegram rejects a whole message when a tag appears inside itself.
+
+    A heading or table header that is itself bold ("# **عنوان**") used to be
+    wrapped in a second <b>, producing "<b><b>…</b></b>", which Telegram answers
+    with "can't parse entities" — losing the entire booklet message.
+    """
+
+    NESTING = ("<b><b>", "</b></b>", "<i><i>", "</i></i>")
+
+    def assert_no_nested_tags(self, rendered: str) -> None:
+        for pattern in self.NESTING:
+            self.assertNotIn(pattern, rendered, f"nested entity {pattern!r} in {rendered!r}")
+
+    def test_bold_heading_is_not_double_wrapped(self):
+        rendered = markdown_to_telegram_html("# **عنوان**")
+        self.assert_no_nested_tags(rendered)
+        self.assertIn("<b>عنوان</b>", rendered)
+
+    def test_italic_heading_stays_a_single_bold_wrapper(self):
+        rendered = markdown_to_telegram_html("# *سلام*")
+        self.assert_no_nested_tags(rendered)
+        self.assertEqual(rendered, "<b><i>سلام</i></b>")
+
+    def test_bold_table_header_is_not_double_wrapped(self):
+        rendered = markdown_to_telegram_html("| **A** | B |\n|---|---|\n| ۱ | ۲ |")
+        self.assert_no_nested_tags(rendered)
+        self.assertIn("<b>A</b>", rendered)
+
+    def test_bold_table_header_without_rows_is_not_double_wrapped(self):
+        rendered = markdown_to_telegram_html("| **A** | B |\n|---|---|")
+        self.assert_no_nested_tags(rendered)
+
+    def test_plain_table_headers_keep_the_bold_colon_format(self):
+        rendered = markdown_to_telegram_html("| a | b |\n|---|---|\n| 1 | 2 |")
+        self.assertEqual(rendered, "<b>a:</b> 1 · <b>b:</b> 2")
+
+    def test_generated_notes_never_contain_nested_entities(self):
+        # The exact shape structuring.to_markdown() produces for a titled note.
+        rendered = markdown_to_telegram_html(
+            "# جزوه\n\n**خلاصه**\n\n## بخش ۱\n- مورد **مهم**\n"
+            "| **دارو** | دوز |\n|---|---|\n| **Metformin** | ۵۰۰ |"
+        )
+        self.assert_no_nested_tags(rendered)
+
+    def test_rendered_pages_never_contain_nested_entities(self):
+        source = "# **عنوان**\n\n## **بخش**\n\n| **الف** | **ب** |\n|---|---|\n| **۱** | ۲ |"
+        for page in render_pages(source):
+            self.assert_no_nested_tags(page)
+
+
+class ProgressBarWidthTests(unittest.TestCase):
+    """The bar is a fixed-width element next to the percentage."""
+
+    def test_bar_never_exceeds_its_declared_width(self):
+        for percent in range(-5, 105):
+            for width in (4, 8, 12, 20):
+                for head in ("🚀", "", "🛑"):
+                    with self.subTest(percent=percent, width=width, head=head):
+                        self.assertEqual(
+                            len(progress_bar(percent, width, head)),
+                            width,
+                        )
+
+    def test_near_complete_bars_keep_room_for_the_emoji(self):
+        # 96-99% used to round the fill to a full bar and push the emoji past
+        # the fixed width, visibly widening the bar mid-animation.
+        for percent in (96, 97, 98, 99):
+            self.assertIn("🚀", progress_bar(percent))
+            self.assertEqual(len(progress_bar(percent)), BAR_WIDTH)
 
 
 if __name__ == "__main__":
