@@ -146,12 +146,23 @@ class PathAndProxyConfigTests(unittest.TestCase):
             self.assertTrue(str(path).startswith(str(PROJECT_ROOT)), path)
 
     def test_absolute_and_home_paths_are_respected(self):
+        # Pin HOME for the whole assertion: with the environment cleared,
+        # Path.expanduser() falls back to the passwd entry, which can differ
+        # from the caller's HOME (e.g. containers running as root with a
+        # non-root HOME), making this test fail spuriously.
+        home = os.environ.get("HOME") or str(Path.home())
         with patch.dict(
-            os.environ, _env(DATABASE_PATH="/srv/x/db.sqlite3", TEMP_DIR="~/gamas-tmp"), clear=True
+            os.environ,
+            _env(
+                DATABASE_PATH="/srv/x/db.sqlite3",
+                TEMP_DIR="~/gamas-tmp",
+                HOME=home,
+            ),
+            clear=True,
         ):
             settings = Settings.from_env("/nonexistent")
         self.assertEqual(settings.database_path, Path("/srv/x/db.sqlite3"))
-        self.assertEqual(settings.temp_dir, Path("~/gamas-tmp").expanduser())
+        self.assertEqual(settings.temp_dir, Path(home) / "gamas-tmp")
 
     def test_env_file_is_found_via_project_root_when_cwd_has_none(self):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as cwd:
