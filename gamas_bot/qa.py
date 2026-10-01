@@ -1,10 +1,11 @@
 """Deterministic content-preservation QA for generated lecture notes.
 
 The checker compares the *text of the merged notes* against the source chunks
-with cheap regular-expression matching — no embeddings, no second LLM pass.
-Its job is to make information loss *visible and loggable*, never to rewrite
-content: the notes are returned unchanged, and the report is attached to the
-job log so a misbehaving prompt or model shows up in operations.
+with cheap regular-expression matching plus the content-unit layer in
+:mod:`gamas_bot.units` — no embeddings and no vector store. Its job is to make
+information loss *visible and loggable*, never to rewrite content: the notes
+are returned unchanged, and the report is attached to the job log so a
+misbehaving prompt or model shows up in operations.
 
 What it detects:
 
@@ -12,7 +13,19 @@ What it detects:
   from the notes (5 mg, 50 mg, 500 mg, 5 mL, 0.5 mL, SpO2 95%, BP 120/80,
   HR 80 bpm, mmHg, mg/dL, mcg, μg, kg/m², °C, %, ...);
 * English technical/medical terms (length >= 3 letters) that disappeared;
-* per-chunk section coverage (a chunk producing no section at all).
+* per-chunk section coverage (a chunk producing no section at all);
+* **semantic completeness** — the fraction of the source's educational
+  content units (definitions, examples, procedures, warnings, comparisons,
+  explanations) that survived. Signal-level checks alone are blind to the
+  worst failure mode: a document can keep every number and term while
+  deleting the explanation that made them meaningful;
+* length/compression facts, reported as evidence and deliberately *not*
+  treated as a failure on their own, because a lecture can legitimately be
+  tightened a long way without losing information.
+
+Note: a repair pass (a second, targeted provider call) exists in
+:mod:`gamas_bot.structuring` and is gated on this report. It is off by default
+when coverage is healthy, so the normal path is one call per chunk.
 
 It never invents or restores information, and it never blocks delivery: the
 worst outcome is a WARNING line in the log with a bounded count of findings.
@@ -40,10 +53,15 @@ MAX_REPORTED_FINDINGS = 8
 #: on unambiguous information loss.
 #:
 #: ``MIN_COVERAGE`` is the fraction of source numbers+terms that must survive.
-#: ``MIN_RATIO`` is the smallest acceptable notes/source character ratio; below
-#: it the model summarised instead of compiling. Ratios are meaningless on a
-#: short source, so the minimum length gate is ``MIN_RATIO_SOURCE_CHARS``.
+#: ``MIN_SEMANTIC_COVERAGE`` is the fraction of educational *content units*
+#: (definitions, examples, procedures, …) that must survive; this is the
+#: signal that a whole explanation was deleted rather than a number.
+#: ``MIN_RATIO`` is the smallest acceptable notes/source character ratio. A
+#: low ratio is only *evidence*, never a failure by itself — see
+#: :attr:`NoteQAReport.compression_is_concerning`, which additionally requires
+#: poor semantic coverage before it complains.
 MIN_COVERAGE = 0.75
+MIN_SEMANTIC_COVERAGE = 0.70
 MIN_RATIO = 0.10
 MIN_RATIO_SOURCE_CHARS = 1000
 
@@ -167,6 +185,11 @@ class NoteQAReport:
     source_chars: int = 0
     total_chunks: int = 0
     covered_chunks: int = 0
+    # Semantic completeness, computed by gamas_bot.units.
+    total_units: int = 0
+    covered_units: int = 0
+    #: Unit types of the expected-but-missing content units (bounded, for logs).
+    missing_unit_types: tuple[str, ...] = ()
 
     @property
     def has_findings(self) -> bool:
@@ -198,15 +221,46 @@ class NoteQAReport:
         return self.covered_chunks / self.total_chunks
 
     @property
+    def semantic_coverage(self) -> float:
+        """Fraction of the source's educational content units that survived.
+
+        1.0 when the source exposed no comparable unit, so a short or purely
+        conversational lecture is never scored as zero.
+        """
+        if self.total_units <= 0:
+            return 1.0
+        return self.covered_units / self.total_units
+
+    @property
+    def missing_units_count(self) -> int:
+        """How many expected content units were not preserved."""
+        return max(self.total_units - self.covered_units, 0)
+
+    @property
+    def compression_is_concerning(self) -> bool:
+        """True when the notes are *both* very short and semantically poor.
+
+        Compression alone is not a defect: removing filler and speech
+        artifacts legitimately shrinks a transcript a long way. Only when the
+        content units are also missing is the length actually evidence of
+        loss. This is why the ratio is never a standalone failure condition.
+        """
+        if self.source_chars < MIN_RATIO_SOURCE_CHARS:
+            return False
+        if not 0 < self.compression_ratio < MIN_RATIO:
+            return False
+        return self.semantic_coverage < MIN_SEMANTIC_COVERAGE
+
+    @property
     def needs_repair(self) -> bool:
         """True when the notes look degraded enough to justify a second pass.
 
-        This deliberately reacts only to *unambiguous information loss* — a
-        missing number/unit, or a coverage below the floor — and not to length
-        alone, because a short source cannot distinguish "compiled" from
-        "summarised". Compression is reported as a finding, but gating the
-        repair on it produced the opposite of the intended behaviour (the most
-        heavily compressed notes were the ones that never triggered it).
+        Reacts only to *unambiguous information loss*: a missing number/unit,
+        a signal coverage below the floor, or educational content units
+        (definitions, examples, procedures) that did not survive. Length is
+        deliberately not a trigger on its own — a short source cannot
+        distinguish "compiled" from "summarised", and gating on it previously
+        meant the most over-compressed notes were the ones that never fired.
 
         A very short source never triggers the pass at all.
         """
@@ -214,7 +268,9 @@ class NoteQAReport:
             return False
         if self.missing_numbers:
             return True
-        return self.coverage < MIN_COVERAGE
+        if self.coverage < MIN_COVERAGE:
+            return True
+        return self.semantic_coverage < MIN_SEMANTIC_COVERAGE
 
 
 def _normalize_digits(value: str) -> str:
@@ -356,6 +412,16 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         else:
             covered_chunks += 1
 
+    # Semantic completeness: the fraction of educational content units
+    # (definitions, examples, procedures, warnings, comparisons, explanations)
+    # that survived. This is the check that catches a deleted explanation even
+    # when every number and term survived.
+    from .units import extract_all_units, semantic_coverage
+
+    units = extract_all_units(source_chunks)
+    expected_units = [unit for unit in units if unit.is_expectation]
+    _, missing_units = semantic_coverage(units, rendered)
+
     report = NoteQAReport(
         source_numbers=len(source_numbers),
         preserved_numbers=len(source_numbers - missing_numbers),
@@ -368,6 +434,11 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         source_chars=source_chars,
         total_chunks=signal_chunks,
         covered_chunks=covered_chunks,
+        total_units=len(expected_units),
+        covered_units=len(expected_units) - len(missing_units),
+        missing_unit_types=tuple(
+            sorted({unit.type for unit in missing_units})[:MAX_REPORTED_FINDINGS]
+        ),
     )
 
     findings: list[str] = []
@@ -384,12 +455,15 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
             "chunks with no preserved signal: "
             + ", ".join(str(index) for index in report.uncovered_chunks)
         )
-    if (
-        report.source_chars >= MIN_RATIO_SOURCE_CHARS
-        and 0 < report.compression_ratio < MIN_RATIO
-    ):
+    if report.missing_units_count:
         findings.append(
-            f"aggressive compression: notes are {report.compression_ratio:.1%} of the source"
+            f"missing educational content: {report.missing_units_count} unit(s) of type "
+            + ",".join(report.missing_unit_types)
+        )
+    if report.compression_is_concerning:
+        findings.append(
+            f"aggressive compression: notes are {report.compression_ratio:.1%} of the source "
+            f"with only {report.semantic_coverage:.0%} of content units preserved"
         )
     # ``findings`` is the last field, so build the report once at the end
     # instead of constructing it twice.
@@ -397,12 +471,15 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
 
     logger.info(
         "Note QA mode=%s source_chars=%s notes_chars=%s ratio=%.3f coverage=%.2f "
-        "chunk_coverage=%.2f numbers=%s/%s terms=%s/%s",
+        "semantic=%.2f units=%s/%s chunk_coverage=%.2f numbers=%s/%s terms=%s/%s",
         getattr(notes, "note_mode", "?"),
         report.source_chars,
         report.notes_text_chars,
         report.compression_ratio,
         report.coverage,
+        report.semantic_coverage,
+        report.covered_units,
+        report.total_units,
         report.chunk_coverage,
         report.preserved_numbers,
         report.source_numbers,

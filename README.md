@@ -358,16 +358,30 @@ blood-pressure pairs and English technical terms in the notes against
 the source chunks and logs any gaps — the notes themselves are never
 silently rewritten, and nothing is ever invented to fill a gap.
 
+Signal-level checks alone are blind to the worst kind of loss: a document
+can keep every number and term while deleting the explanation that made
+them meaningful. A **semantic-completeness** layer therefore segments the
+source into educational *content units* — definitions, examples,
+procedures, warnings, comparisons, conclusions, formulas, explanations —
+and reports the fraction that survived. It is deterministic (cue phrases,
+structural markers and a content-word fingerprint), with no embeddings and
+no vector store.
+
 The QA report also measures source length, notes length, the compression
-ratio, per-chunk coverage and the overall signal-coverage fraction, and
-it is the input to the **optional repair pass**: only when real
+ratio and per-chunk coverage. **Compression on its own is never a
+failure**: tightening a transcript is legitimate. A low ratio is only
+reported as a problem when the content units were lost as well.
+
+That report is the input to the **optional repair pass**: only when real
 information loss is detected does the bot make one extra, targeted
-provider call that re-reads the same source and restores the missing
-signals under an explicit “invent nothing” instruction. The repaired
-notes are accepted only when they are measurably better (higher
-coverage, or more of the lecture preserved at equal coverage); otherwise
-the original is kept. Set `NOTE_REPAIR_ENABLED=false` to guarantee
-exactly one provider call per chunk.
+provider call. The repair receives the same source, the existing notes, the
+missing signals and the missing content units, under an explicit
+“restore, do not lengthen, invent nothing” instruction. It is accepted
+only when it measurably improves quality — semantic coverage first, then
+signal coverage, and only then how much of the lecture was preserved — and
+a repair that trades one for a regression in another is rejected. Set
+`NOTE_REPAIR_ENABLED=false` to guarantee exactly one provider call per
+chunk.
 
 Before rendering, all text passes through a deterministic Persian
 normalization stage: the Arabic `ك`/`ي`/`ى`/`ة` that a second keyboard or
@@ -732,11 +746,20 @@ matrix.
 ### Note-quality benchmark
 
 `python -m scripts.benchmark_notes` runs the committed fixture transcripts
-through chunking, QA and the DOCX renderer and prints a provider-free,
-reproducible table (per-fixture source length, chunk count, preserved numbers
-and terms, uncovered chunks, compression ratio, and DOCX structure counts).
-Use `--json` for machine-readable output. It makes note quality measurable
-before and after a change instead of only asserting "the tests pass".
+through chunking, the content-unit/QA layer and the DOCX renderer and prints
+a provider-free, reproducible table: per-fixture source length, chunk count,
+compression ratio, **signal coverage**, **semantic coverage**, unit counts,
+whether a repair would be triggered, and DOCX structure counts. Use `--json`
+for machine-readable output.
+
+Add `--live` to also call the provider configured by `NOTE_API_PROVIDER`
+(through the project's own provider abstraction — no vendor is hard-coded)
+and score the real answer, which is how a prompt change is compared before
+and after. Add `--human-out FILE` to emit a 1–5 reviewer rubric in JSON
+(completeness, accuracy, organization, readability, terminology,
+faithfulness) for cases where the automated metrics are not sufficient.
+
+It makes note quality measurable instead of only asserting "the tests pass".
 
 
 
