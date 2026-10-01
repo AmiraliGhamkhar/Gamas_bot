@@ -99,6 +99,36 @@ _JSON_RULES = (
 )
 
 
+#: Sent as ``reminder`` on the optional repair pass. It names the exact
+#: signals QA found missing so the model can *re-read the source and restore
+#: them* — it is explicitly forbidden from adding anything that is not in the
+#: source, so a repair can raise coverage but never hallucinate.
+REPAIR_REMINDER = (
+    "\n\nهشدار کیفیت: جزوهٔ تولیدشده بخشی از اطلاعات مهم متن ورودی را از دست داده است. "
+    "متن ورودی را دوباره به‌دقت بخوانید و هر عدد، واحد، دوز، درصد، اصطلاح انگلیسی، "
+    "تعریف، مثال، مرحله و فرمولی را که در جزوهٔ قبلی جا افتاده بود عیناً بازگردانید. "
+    "فقط و فقط اطلاعاتی را بنویسید که در همین متن ورودی آمده است؛ چیزی حدس نزنید و "
+    "هیچ مثال، فرمول، مرجع یا نتیجه‌ای از خودتان اضافه نکنید. ترتیب منطقی متن را حفظ کنید. "
+    "خروجی همچنان فقط و فقط یک شیء JSON معتبر با همان ساختار قبلی است."
+)
+
+
+def build_repair_prompt(document: str, missing: tuple[str, ...], findings: tuple[str, ...]) -> str:
+    """A targeted second-pass prompt naming what QA found missing.
+
+    The second call is *not* a re-summarisation: it gets the same source text
+    plus the exact missing signals, and the reminder forbids invention. That
+    keeps the repair a restoration step rather than a new generation pass.
+    """
+    detail = "، ".join(missing) if missing else "موارد اعلام‌شده در گزارش کیفیت"
+    return (
+        f"{document}\n\n"
+        f"### گزارش کیفیت خودکار\n"
+        f"این سیگنال‌ها در جزوهٔ قبلی غایب بودند و باید عیناً از متن بالا بازگردانده شوند: {detail}\n"
+        f"اگر موردی در متن بالا وجود ندارد، آن را نسازید و فقط همان‌قدر که در متن هست بنویسید."
+    )
+
+
 def build_system_prompt(mode: str = "full") -> str:
     """The Persian system prompt for one note mode (lecture-to-notes compiler)."""
     mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
@@ -979,11 +1009,15 @@ async def _structured_notes_for(
     *,
     system_prompt: str = SYSTEM_PROMPT,
     label: str = "chunk",
+    reminder: str = "",
 ) -> StructuredNotes:
     """One LLM answer parsed as strict JSON, with a single bounded repair pass."""
     started = asyncio.get_running_loop().time()
     try:
-        raw = await _structure_chunk(document, settings, session, prompt, system_prompt=system_prompt)
+        raw = await _structure_chunk(
+            document, settings, session, prompt, system_prompt=system_prompt,
+            reminder=reminder,
+        )
     except Exception as exc:
         if isinstance(exc, StructuringError):
             logger.warning(
@@ -1092,19 +1126,106 @@ async def structure_transcript(
                     label=f"chunk {index}/{len(chunks)}",
                 )
             )
-    merged = merge_structured_notes(notes)
-    merged_qa = run_note_qa(merged, chunks)
-    logger.info(
-        "Note QA completed mode=%s chunks=%s findings=%s numbers=%s/%s terms=%s/%s",
-        merged.note_mode,
-        len(chunks),
-        len(merged_qa.findings),
-        merged_qa.preserved_numbers,
-        merged_qa.source_numbers,
-        merged_qa.preserved_terms,
-        merged_qa.source_terms,
+        # The optional repair pass reuses this session, so it must run while
+        # the session is still open.
+        return await _repair_notes_if_needed(
+            merge_structured_notes(notes),
+            chunks,
+            settings,
+            session,
+            note_mode=note_mode,
+            system_prompt=system_prompt,
+            prompt=TRANSCRIPT_PROMPT,
+            label="transcript",
+        )
+
+
+async def _repair_notes_if_needed(
+    merged: StructuredNotes,
+    source_chunks: list[str],
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    *,
+    note_mode: str,
+    system_prompt: str,
+    prompt: str,
+    label: str,
+    max_chars: int = TRANSCRIPT_CHUNK_CHARS,
+) -> StructuredNotes:
+    """Optional second pass, fired only when deterministic QA says it is needed.
+
+    The normal path is exactly one provider call per chunk. This runs solely
+    when :attr:`NoteQAReport.needs_repair` is true (missing numbers, low
+    coverage, or compression far below a compiled lecture) and it is
+    configurable via ``NOTE_REPAIR_ENABLED``.
+
+    Safety rules, because a repair that invents content is worse than no repair:
+
+    * the repaired notes are only accepted when their QA is *not worse* than the
+      original's — measured by coverage, then by compression ratio;
+    * the prompt is the same source text plus the missing signals, with an
+      explicit instruction not to invent anything;
+    * on any provider error the original notes are returned unchanged;
+    * the repair obeys the same per-request character budget as the first pass,
+      so it can never turn a long lecture into one oversized request.
+    """
+    report = run_note_qa(merged, source_chunks)
+    if not settings.note_repair_enabled or not report.needs_repair:
+        return merged
+
+    missing = tuple(report.missing_numbers) + tuple(report.missing_terms)
+    logger.warning(
+        "Note QA triggered the repair pass %s coverage=%.2f ratio=%.3f missing=%s",
+        label,
+        report.coverage,
+        report.compression_ratio,
+        ",".join(missing[:6]) or "-",
     )
-    return merged
+    try:
+        # The repair re-reads the same source, so it must obey the same chunk
+        # size budget as the first pass; otherwise a long lecture would be sent
+        # as one oversized request and be rejected for exceeding the context.
+        # ``build_repair_prompt`` prepends the QA report, so it is reserved here.
+        budget = max_chars - _CHUNK_PREFIX_RESERVE - len(REPAIR_REMINDER)
+        sources = split_transcript("\n\n".join(source_chunks), max_chars=budget)
+        repaired_notes = [
+            await _structured_notes_for(
+                build_repair_prompt(source, missing, report.findings),
+                settings,
+                session,
+                prompt,
+                system_prompt=system_prompt,
+                label=f"{label} (repair {index}/{len(sources)})",
+                reminder=REPAIR_REMINDER,
+            )
+            for index, source in enumerate(sources, start=1)
+        ]
+        repaired = merge_structured_notes(repaired_notes)
+    except Exception:
+        logger.exception("Note repair pass failed; keeping the original notes")
+        return merged
+
+    repaired_report = run_note_qa(repaired, source_chunks)
+    improved = repaired_report.coverage > report.coverage
+    if not improved and repaired_report.coverage == report.coverage:
+        # Equal coverage: prefer the version that preserved more of the lecture.
+        improved = repaired_report.compression_ratio > report.compression_ratio
+    if not improved:
+        logger.warning(
+            "Note repair pass did not improve coverage (%.2f -> %.2f); keeping the original",
+            report.coverage,
+            repaired_report.coverage,
+        )
+        return merged
+    logger.info(
+        "Note repair pass improved coverage %.2f -> %.2f ratio %.3f -> %.3f",
+        report.coverage,
+        repaired_report.coverage,
+        report.compression_ratio,
+        repaired_report.compression_ratio,
+    )
+    # Keep the original title/mode: the repair regenerates structure, not identity.
+    return replace(repaired, title=repaired.title or merged.title, note_mode=note_mode)
 
 
 async def structure_presentation(
@@ -1160,16 +1281,14 @@ async def structure_presentation(
                     label=f"presentation chunk {index}/{len(documents)}",
                 )
             )
-    merged = merge_structured_notes(notes)
-    merged_qa = run_note_qa(merged, documents)
-    logger.info(
-        "Note QA completed mode=%s chunks=%s findings=%s numbers=%s/%s terms=%s/%s",
-        merged.note_mode,
-        len(documents),
-        len(merged_qa.findings),
-        merged_qa.preserved_numbers,
-        merged_qa.source_numbers,
-        merged_qa.preserved_terms,
-        merged_qa.source_terms,
-    )
-    return merged
+        return await _repair_notes_if_needed(
+            merge_structured_notes(notes),
+            documents,
+            settings,
+            session,
+            note_mode=note_mode,
+            system_prompt=system_prompt,
+            prompt=PRESENTATION_PROMPT,
+            label="presentation",
+            max_chars=max_chars,
+        )
