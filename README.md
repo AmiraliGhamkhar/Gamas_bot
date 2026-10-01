@@ -278,6 +278,9 @@ NOTE_API_RETRIES=2
 NOTE_API_MAX_OUTPUT_TOKENS=8192
 # Only for openai_compatible providers that implement response_format:
 NOTE_API_JSON_MODE=false
+# Note-generation mode: full (default; preserves explanations, examples and
+# procedures), standard (balanced) or summary (intentionally concise):
+NOTE_MODE=full
 ```
 
 #### Strict JSON structured output
@@ -296,6 +299,10 @@ The model must answer with a single JSON object:
       "heading": "…",
       "paragraphs": ["…"],
       "bullets": ["…"],
+      "definitions": [{"term": "…", "term_en": "…", "definition": "…"}],
+      "examples": ["…"],
+      "steps": ["…"],
+      "formulas": ["…"],
       "key_points": ["…"],
       "table": {"headers": ["…"], "rows": [["…"]]},
       "callouts": [{"kind": "نکته | هشدار | یادآوری", "text": "…"}]
@@ -310,8 +317,16 @@ The answer is validated and normalised in code: fenced code blocks,
 surrounding prose and trailing commas are repaired; unknown fields and
 empty sections are dropped; callout kinds are normalised. An invalid
 answer triggers exactly one bounded repair pass before the job falls
-back to delivering the raw material. Long transcripts are chunked as
-before and the per-chunk JSON notes are merged in order.
+back to delivering the raw material. Long transcripts are chunked at
+paragraph (then sentence) boundaries so definitions, procedures and
+worked examples are never cut mid-unit; every chunk carries a short
+positional context line instead of duplicated overlapping text, and the
+per-chunk JSON notes are merged additively in order (only exact
+duplicate strings are deduplicated). After merging, a deterministic
+coverage check compares numbers with units, percentages, dosages,
+blood-pressure pairs and English technical terms in the notes against
+the source chunks and logs any gaps — the notes themselves are never
+silently rewritten, and nothing is ever invented to fill a gap.
 
 `NOTE_API_JSON_MODE=true` additionally sends
 `response_format: {"type": "json_object"}` to OpenAI-compatible
@@ -329,16 +344,25 @@ chat message:
 
 1. **`جزوه - <title> - GMS-XXXXXX.docx`** — a polished right-to-left Word
    document generated with [python-docx](https://python-docx.readthedocs.io/):
-   - RTL paragraphs (`w:bidi`), RTL runs and complex-script fonts
-   - A title block with the Persian (Jalali) date, source filename, STT
-     engine and tracking reference
-   - Shaded summary box, per-section key-point boxes, colour-coded
-     callouts (نکته / هشدار / یادآوری) and RTL tables with a coloured
-     header row
-   - Page-number footers and document metadata
-   - Font configurable with `DOCX_FONT` (default `Tahoma`, which is
-     present everywhere; set `B Nazanin`, `Vazirmatn`, … when your
-     audience has them)
+   - RTL paragraphs (`w:bidi`) with **per-direction runs**: Persian text
+     and embedded English terms (drug names, units, URLs, numbers such as
+     `500 mg` or `120/80`) each keep their own direction and font, which
+     is how Word itself models mixed Persian/English text
+   - A title block with the Persian (Jalali) date, note-mode label, source
+     filename, STT engine and tracking reference
+   - Shaded summary box, definition rows, numbered procedure steps,
+     verbatim formula lines, per-section key-point boxes, colour-coded
+     callouts (نکته / هشدار / یادآوری) and RTL tables with a coloured,
+     page-repeating header row
+   - The glossary renders as a proper RTL table (اصطلاح / توضیح)
+   - A running page header (document title + brand), page-number footers
+     and document metadata
+   - Fonts configurable per role: `DOCX_FONT` (default `Tahoma`, present
+     everywhere) plus optional `DOCX_FONT_BODY`, `DOCX_FONT_HEADING`,
+     `DOCX_FONT_LATIN` and `DOCX_FONT_FALLBACK`. The fallback is declared
+     in the document's font table (`w:altName`) so readers without the
+     primary Persian face substitute it gracefully; fonts are *not*
+     embedded in the file.
 2. **`متن خام - GMS-XXXXXX.txt`** — the raw extracted texts (the
    transcript, and for presentations the slide text as well) with a
    small metadata header, exactly as produced by the pipeline.
@@ -655,6 +679,17 @@ probing, extraction, merging, Opus/WAV output, protocol-whitelist enforcement
 and legacy conversion are always exercised. The suite targets Linux/POSIX;
 Windows application setup is documented but has not been validated by this CI
 matrix.
+
+### Note-quality benchmark
+
+`tests/fixtures/notes/` ships a six-fixture corpus (medical, HCI/university,
+computer science, Persian-only, Persian+English code-switching, and a PowerPoint
+slide outline). Each transcript is paired with a hand-written reference document
+and the coverage floor declared in `corpus.json`.
+`tests/test_note_evaluation.py` runs the corpus through chunking, the QA layer,
+merging and DOCX rendering and asserts those floors — with no network, provider
+or model call, so a prompt or schema change cannot silently regress output
+quality. See `tests/fixtures/notes/README.md` for details.
 
 CI (`.github/workflows/tests.yml`) runs the suite and critical static checks on
 Python 3.11, 3.12 and 3.13 on Linux. To reproduce additional checks locally:

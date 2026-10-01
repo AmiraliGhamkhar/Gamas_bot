@@ -4,14 +4,16 @@ import asyncio
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
 
-from .config import Settings
+from .config import NOTE_MODES, Settings, resolve_note_mode
+from .progress import to_persian_digits
+from .qa import run_note_qa
 
 logger = logging.getLogger(__name__)
 
@@ -27,79 +29,128 @@ MAX_TITLE_CHARS = 200
 MAX_TEXT_CHARS = 20000
 
 
-SYSTEM_PROMPT = """شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما متن پیاده‌سازی‌شدهٔ خام یک کلاس درسی است و خروجی شما یک جزوهٔ ساختارمند فارسی است.
+# ---------------------------------------------------------------------------
+# Note modes: how much compression the note generator applies.
+# (NOTE_MODES and resolve_note_mode live in config.py; re-exported here so
+# callers of structuring keep one import surface.)
+# ---------------------------------------------------------------------------
 
-قواعد خروجی — مطلق‌اند و استثنا ندارند:
-۱) پاسخ فقط و فقط یک شیء JSON معتبر است. هیچ متن، عنوان، توضیح، علامت نقل‌قول بلوکی یا خنده‌کد (code fence) قبل یا بعد از آن ننویسید.
-۲) ساختار دقیق JSON این است:
-{
-  "title": "عنوان کوتاه جزوه",
-  "summary": "خلاصهٔ دو تا چهار جمله‌ای محتوا",
-  "sections": [
-    {
-      "heading": "عنوان بخش",
-      "paragraphs": ["پاراگراف توضیحی"],
-      "bullets": ["مورد فهرستی"],
-      "key_points": ["نکتهٔ کلیدی همین بخش"],
-      "table": {"headers": ["ستون ۱", "ستون ۲"], "rows": [["مقدار", "مقدار"]]},
-      "callouts": [{"kind": "نکته", "text": "متن برجسته"}]
-    }
-  ],
-  "key_points": ["نکته‌های کلیدی کل جزوه"],
-  "glossary": [{"term": "اصطلاح", "definition": "تعریف کوتاه"}]
+
+#: Per-mode writing rules. ``full`` (the default) compiles a lecture into
+#: notes while preserving explanations, examples and procedures; ``summary``
+#: is the only intentionally concise mode.
+MODE_RULES = {
+    "full": (
+        "- حالت خروجی: FULL. شما «مترجم جزوه‌نویس» هستید، نه خلاصه‌ساز. مطلبی را که گوینده برای یادگیری لازم می‌داند حذف نکنید.\n"
+        "- هر تعریف، توضیح، دلیل، مکانیزم، مثال، روند گام‌به‌گام و مقایسه را کامل بیاورید؛ جزوه باید جایگزین قابل‌اتکای حضار در کلاس باشد.\n"
+        "- تکرارهایی که برای تأکید یا روشن‌شدن موضوع به‌کار رفته‌اند را نگه دارید؛ فقط تکرارهای سرهم و عین‌هم را یک بار بنویسید.\n"
+        "- توضیح‌های مفصل گوینده را در همان بخشِ موضوعی، چند پاراگراف کامل بنویسید؛ یک توضیح چندجمله‌ای را به یک خط خلاصه فشرده نکنید.\n"
+    ),
+    "standard": (
+        "- حالت خروجی: STANDARD. میان حفظ کامل مطالب و روانی جزوه تعادل برقرار کنید؛ توضیح‌های اصلی و مثال‌های مهم را نگه دارید و فقط پرگویی‌های آشکار را حذف کنید.\n"
+    ),
+    "summary": (
+        "- حالت خروجی: SUMMARY. جزوهٔ کوتاه و فشرده بنویسید؛ فقط موضوع‌های اصلی، تعریف‌های کلیدی و اعداد مهم را بیاورید. مثال‌های فرعی و توضیح‌های طولانی را مختصر کنید.\n"
+    ),
 }
-۳) هر کلید اختیاری است؛ اگر محتوایی برایش ندارید آن را حذف کنید یا آرایه/رشتهٔ خالی بدهید. کلید تازه‌ای از خودتان نسازید.
-۴) «sections» را خالی نگذارید؛ دست‌کم یک بخش با عنوان معنادار و محتوای واقعی بسازید.
-۵) در callouts مقدار kind فقط یکی از این سه باشد: «نکته»، «هشدار» یا «یادآوری».
-۶) JSON باید بدون خطا قابل خواندن باشد: از نقل‌قول دوگانه استفاده کنید، کامای اضافه نگذارید و خط جدید داخل رشته‌ها را با \\n بنویسید.
 
-قواعد محتوا:
-- فقط بر پایهٔ متن داده‌شده بنویسید؛ اطلاعات، فرمول، تعریف یا نتیجهٔ تازه نسازید. اگر بخشی نامفهوم است، آن را حدس نزنید.
-- نکته‌های کلیدی، یادآوری‌ها و هشدارهای مهم را در callouts یا key_points جداگانه برجسته کنید.
-- مطالب را با عنوان‌های بخش کوتاه و گویا مرتب کنید.
-- اگر چند مورد قابل مقایسه یا دسته‌بندی وجود دارد، از table استفاده کنید؛ جدول را بی‌دلیل به کار نبرید.
-- برای فرمول‌ها و اصطلاح‌های تخصصی، صورت اصلی را حفظ کنید و متن را به فارسی روان بنویسید.
-- اگر متن ناقص یا تکراری است، مفهوم موجود را مرتب کنید و چیزی به آن نیفزایید.
-"""
+#: Shared content rules — the preservation contract every mode inherits.
+_CONTENT_RULES = (
+    "\nقواعد حفظ محتوا — مهم‌ترین بخش دستور است:\n"
+    "- فقط بر پایهٔ متن داده‌شده بنویسید؛ اطلاعات، فرمول، تعریف یا نتیجهٔ تازه نسازید. اگر بخشی نامفهوم است، آن را حدس نزنید و همان‌قدر که فهمیده‌اید بنویسید.\n"
+    "- هیچ عدد، واحد، درصدمقدار، دوز دارو، مقدار آزمایشگاهی یا علامت اختصاری را حذف یا تغییر ندهید؛ صورت دقیق آن‌ها را عیناً بیاورید.\n"
+    "- اصطلاح‌های تخصصی و عبارت‌های انگلیسی (نام دارو، دستگاه، مفهوم علمی و مخفف‌ها) را به همان شکل انگلیسی و بدون ترجمهٔ اجباری داخل متن فارسی حفظ کنید؛ ترجمهٔ فارسی رایج را می‌توانید در پرانتز بیاورید.\n"
+    "- تعریف‌ها را در آرایهٔ definitions بیاورید (term، term_en اختیاری، definition)؛ مثال‌ها را در examples؛ روند یا دستورالعمل گام‌به‌گام را در steps؛ فرمول‌ها و معادله‌ها را با صورت دقیق‌شان در formulas بنویسید.\n"
+    "- توضیح‌های مهم گوینده را به‌جای یک خط کوتاه، پاراگراف کامل بنویسید؛ جزوه باید درس را بدون شنیدن صدا قابل فهم کند.\n"
+    "- نکته‌های کلیدی، یادآوری‌ها و هشدارهای مهم را در callouts یا key_points جداگانه برجسته کنید.\n"
+    "- مطالب را با عنوان‌های بخش کوتاه و گویا مرتب کنید و ترتیب منطقی متن اصلی را نگه دارید.\n"
+    "- اگر چند مورد قابل مقایسه یا دسته‌بندی وجود دارد، از table استفاده کنید؛ جدول را بی‌دلیل به کار نبرید.\n"
+    "- فقط حذف‌های مجاز: پرگویی بی‌محتوا، اصطلاح‌های گفتاری تصادفی، نویزِ پیاده‌سازی صدا و تکرار عین‌هم. هیچ توضیح آموزشی را به‌خاطر کوتاهی حذف نکنید.\n"
+)
+
+_JSON_RULES = (
+    "\nقواعد خروجی — مطلق‌اند و استثنا ندارند:\n"
+    "۱) پاسخ فقط و فقط یک شیء JSON معتبر است. هیچ متن، عنوان، توضیح، علامت نقل‌قول بلوکی یا خنده‌کد (code fence) قبل یا بعد از آن ننویسید.\n"
+    "۲) ساختار دقیق JSON این است:\n"
+    "{\n"
+    "  \"title\": \"عنوان کوتاه جزوه\",\n"
+    "  \"summary\": \"خلاصهٔ چند جمله‌ایِ موضوع و هدف جزوه\",\n"
+    "  \"sections\": [\n"
+    "    {\n"
+    "      \"heading\": \"عنوان بخش\",\n"
+    "      \"paragraphs\": [\"پاراگراف توضیحی\"],\n"
+    "      \"bullets\": [\"مورد فهرستی\"],\n"
+    "      \"definitions\": [{\"term\": \"اصطلاح\", \"term_en\": \"English term\", \"definition\": \"تعریف کامل\"}],\n"
+    "      \"examples\": [\"مثال کامل همراه با توضیح\"],\n"
+    "      \"steps\": [\"گام ۱ …\", \"گام ۲ …\"],\n"
+    "      \"formulas\": [\"صورت دقیق فرمول\"],\n"
+    "      \"key_points\": [\"نکتهٔ کلیدی همین بخش\"],\n"
+    "      \"table\": {\"headers\": [\"ستون ۱\", \"ستون ۲\"], \"rows\": [[\"مقدار\", \"مقدار\"]]},\n"
+    "      \"callouts\": [{\"kind\": \"نکته\", \"text\": \"متن برجسته\"}]\n"
+    "    }\n"
+    "  ],\n"
+    "  \"key_points\": [\"نکته‌های کلیدی کل جزوه\"],\n"
+    "  \"glossary\": [{\"term\": \"اصطلاح\", \"definition\": \"تعریف کوتاه\"}]\n"
+    "}\n"
+    "۳) هر کلید اختیاری است؛ اگر محتوایی برایش ندارید آن را حذف کنید یا آرایه/رشتهٔ خالی بدهید. کلید تازه‌ای از خودتان نسازید.\n"
+    "۴) «sections» را خالی نگذارید؛ دست‌کم یک بخش با عنوان معنادار و محتوای واقعی بسازید.\n"
+    "۵) در callouts مقدار kind فقط یکی از این سه باشد: «نکته»، «هشدار» یا «یادآوری».\n"
+    "۶) JSON باید بدون خطا قابل خواندن باشد: از نقل‌قول دوگانه استفاده کنید، کامای اضافه نگذارید و خط جدید داخل رشته‌ها را با \\n بنویسید.\n"
+)
+
+
+def build_system_prompt(mode: str = "full") -> str:
+    """The Persian system prompt for one note mode (lecture-to-notes compiler)."""
+    mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
+    return (
+        "شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما متن پیاده‌سازی‌شدهٔ خام یک کلاس درسی است "
+        "و خروجی شما یک جزوهٔ ساختارمند و کامل فارسی است؛ رفتار شما باید مانند «مترجم جزوه‌نویس" 
+        "» باشد که محتوای درس را منظم و کامل نگه می‌دارد، نه خلاصه‌سازی که حذف می‌کند.\n\n"
+        + _JSON_RULES
+        + "\n\nقواعد محتوا:\n"
+        + mode_rule
+        + _CONTENT_RULES
+    )
+
+
+SYSTEM_PROMPT = build_system_prompt("full")
 
 #: The user-message wrapper for a raw lecture transcript.
 TRANSCRIPT_PROMPT = "متن پیاده‌سازی‌شدهٔ خام:\n\n"
 
 
-PRESENTATION_SYSTEM_PROMPT = """شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما محتوای یک فایل ارائهٔ درسی (PowerPoint) است — شامل متن اسلایدها، یادداشت‌های گوینده و متن پیاده‌سازی‌شدهٔ صدای ضبط‌شدهٔ همان ارائه — و خروجی شما یک جزوهٔ ساختارمند فارسی است.
+_PRESENTATION_CONTENT_RULES = (
+    "\nقواعد ویژهٔ ارائه:\n"
+    "- ورودی شامل متن اسلایدها (با شمارهٔ اسلاید و یادداشت گوینده) و متن پیاده‌سازی‌شدهٔ صدای ارائه است.\n"
+    "- ترتیب بخش‌ها را از ترتیب اسلایدها بگیرید و توضیح‌های صوتی هر اسلاید را زیر همان موضوع ادغام کنید.\n"
+    "- اگر صدا مطلبی فراتر از متن اسلاید دارد، آن را به‌عنوان توضیح کامل‌کننده بیاورید؛ اسلاید و صدا هر دو را پوشش دهید، نه فقط یکی را.\n"
+    "- یادداشت گویندهٔ هر اسلاید جزو محتوای آموزشی است؛ آن را حذف نکنید.\n"
+    "- تعریف‌ها را در definitions، مثال‌ها را در examples، روند گام‌به‌گام را در steps و فرمول‌ها را در formulas هر بخش بیاورید.\n"
+    "- نکته‌های کلیدی، یادآوری‌ها و هشدارهای مهم گوینده را در callouts یا key_points جداگانه برجسته کنید.\n"
+    "- اگر چند مورد قابل مقایسه یا دسته‌بندی وجود دارد، از table استفاده کنید؛ جدول را بی‌دلیل به کار نبرید.\n"
+    "- برای فرمول‌ها و اصطلاح‌های تخصصی، صورت اصلی را حفظ کنید و متن را به فارسی روان بنویسید.\n"
+)
 
-قواعد خروجی — مطلق‌اند و استثنا ندارند:
-۱) پاسخ فقط و فقط یک شیء JSON معتبر است. هیچ متن، عنوان، توضیح یا خنده‌کد (code fence) قبل یا بعد از آن ننویسید.
-۲) ساختار دقیق JSON این است:
-{
-  "title": "عنوان کوتاه جزوه",
-  "summary": "خلاصهٔ دو تا چهار جمله‌ای محتوا",
-  "sections": [
-    {
-      "heading": "عنوان بخش",
-      "paragraphs": ["پاراگراف توضیحی"],
-      "bullets": ["مورد فهرستی"],
-      "key_points": ["نکتهٔ کلیدی همین بخش"],
-      "table": {"headers": ["ستون ۱", "ستون ۲"], "rows": [["مقدار", "مقدار"]]},
-      "callouts": [{"kind": "نکته", "text": "متن برجسته"}]
-    }
-  ],
-  "key_points": ["نکته‌های کلیدی کل جزوه"],
-  "glossary": [{"term": "اصطلاح", "definition": "تعریف کوتاه"}]
-}
-۳) هر کلید اختیاری است؛ اگر محتوایی برایش ندارید آن را حذف کنید یا آرایه/رشتهٔ خالی بدهید. کلید تازه‌ای از خودتان نسازید.
-۴) «sections» را خالی نگذارید؛ دست‌کم یک بخش با عنوان معنادار و محتوای واقعی بسازید.
-۵) در callouts مقدار kind فقط یکی از این سه باشد: «نکته»، «هشدار» یا «یادآوری».
-۶) JSON باید بدون خطا قابل خواندن باشد: از نقل‌قول دوگانه استفاده کنید، کامای اضافه نگذارید و خط جدید داخل رشته‌ها را با \\n بنویسید.
 
-قواعد محتوا:
-- فقط بر پایهٔ مطالب داده‌شده بنویسید؛ اطلاعات، فرمول، تعریف یا نتیجهٔ تازه نسازید. اگر بخشی نامفهوم است، آن را حدس نزنید.
-- ترتیب بخش‌ها را از ترتیب اسلایدها بگیرید و توضیح‌های صوتی را زیر همان موضوع اسلاید ادغام کنید.
-- اگر صدا مطلبی فراتر از متن اسلاید دارد، آن را به‌عنوان توضیح کامل‌کننده بیاورید؛ مطالب تکراری را یک بار بنویسید.
-- نکته‌های کلیدی، یادآوری‌ها و هشدارهای مهم گوینده را در callouts یا key_points جداگانه برجسته کنید.
-- اگر چند مورد قابل مقایسه یا دسته‌بندی وجود دارد، از table استفاده کنید؛ جدول را بی‌دلیل به کار نبرید.
-- برای فرمول‌ها و اصطلاح‌های تخصصی، صورت اصلی را حفظ کنید و متن را به فارسی روان بنویسید.
-"""
+def build_presentation_system_prompt(mode: str = "full") -> str:
+    """The Persian system prompt for presentation material in one note mode."""
+    mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
+    return (
+        "شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما محتوای یک فایل ارائهٔ درسی (PowerPoint) است — "
+        "شامل متن اسلایدها، یادداشت‌های گوینده و متن پیاده‌سازی‌شدهٔ صدای ضبط‌شدهٔ همان ارائه — و خروجی شما "
+        "یک جزوهٔ ساختارمند و کامل فارسی است؛ رفتار شما باید مانند «مترجم جزوه‌نویس» باشد که محتوای درس را "
+        "منظم و کامل نگه می‌دارد، نه خلاصه‌سازی که حذف می‌کند.\n"
+        + _JSON_RULES
+        + "\n\nقواعد محتوا:\n"
+        + mode_rule
+        + _PRESENTATION_CONTENT_RULES
+        + "\n- فقط بر پایهٔ مطالب داده‌شده بنویسید؛ اطلاعات، فرمول، تعریف یا نتیجهٔ تازه نسازید. اگر بخشی نامفهوم است، آن را حدس نزنید.\n"
+        + "- هیچ عدد، واحد، درصدمقدار، دوز دارو یا علامت اختصاری را حذف یا تغییر ندهید؛ اصطلاح‌های انگلیسی را بدون ترجمهٔ اجباری حفظ کنید.\n"
+        + "- اگر متن ناقص یا تکراری است، مفهوم موجود را مرتب کنید و چیزی به آن نیفزایید.\n"
+    )
+
+
+PRESENTATION_SYSTEM_PROMPT = build_presentation_system_prompt("full")
 
 #: The user-message wrapper for combined slide text and narration.
 PRESENTATION_PROMPT = "محتوای ارائه:\n\n"
@@ -175,10 +226,33 @@ class NoteTable:
 
 
 @dataclass(frozen=True, slots=True)
+class NoteDefinition:
+    """One term definition inside a section (glossary entries are separate)."""
+
+    term: str
+    definition: str
+    term_en: str = ""
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "NoteDefinition | None":
+        if not isinstance(payload, dict):
+            return None
+        term = _bounded_text(payload.get("term"), MAX_TITLE_CHARS)
+        definition = _bounded_text(payload.get("definition"))
+        if not term or not definition:
+            return None
+        return cls(term, definition, _bounded_text(payload.get("term_en"), MAX_TITLE_CHARS))
+
+
+@dataclass(frozen=True, slots=True)
 class NoteSection:
     heading: str
     paragraphs: tuple[str, ...] = ()
     bullets: tuple[str, ...] = ()
+    definitions: tuple[NoteDefinition, ...] = ()
+    examples: tuple[str, ...] = ()
+    steps: tuple[str, ...] = ()
+    formulas: tuple[str, ...] = ()
     key_points: tuple[str, ...] = ()
     table: NoteTable | None = None
     callouts: tuple[NoteCallout, ...] = ()
@@ -188,6 +262,10 @@ class NoteSection:
         return bool(
             self.paragraphs
             or self.bullets
+            or self.definitions
+            or self.examples
+            or self.steps
+            or self.formulas
             or self.key_points
             or self.table is not None
             or self.callouts
@@ -203,10 +281,17 @@ class NoteSection:
         callouts = tuple(
             filter(None, (NoteCallout.from_payload(item) for item in payload.get("callouts") or []))
         )
+        definitions = tuple(
+            filter(None, (NoteDefinition.from_payload(item) for item in payload.get("definitions") or []))
+        )
         section = cls(
             heading=heading,
             paragraphs=tuple(_string_list(payload.get("paragraphs"))),
             bullets=tuple(_string_list(payload.get("bullets"))),
+            definitions=definitions,
+            examples=tuple(_string_list(payload.get("examples"))),
+            steps=tuple(_string_list(payload.get("steps"))),
+            formulas=tuple(_string_list(payload.get("formulas"))),
             key_points=tuple(_string_list(payload.get("key_points"))),
             table=NoteTable.from_payload(payload.get("table")),
             callouts=callouts,
@@ -230,13 +315,19 @@ class GlossaryEntry:
 
 @dataclass(frozen=True, slots=True)
 class StructuredNotes:
-    """The validated note structure the LLM must produce as strict JSON."""
+    """The validated note structure the LLM must produce as strict JSON.
+
+    ``note_mode`` records the compression mode the notes were generated with
+    so the DOCX exporter can label the deliverable and QA can judge
+    coverage expectations (``full`` expects near-complete preservation).
+    """
 
     title: str = ""
     summary: str = ""
     sections: tuple[NoteSection, ...] = ()
     key_points: tuple[str, ...] = ()
     glossary: tuple[GlossaryEntry, ...] = ()
+    note_mode: str = "full"
 
     @property
     def display_title(self) -> str:
@@ -255,6 +346,17 @@ class StructuredNotes:
                     "heading": section.heading,
                     "paragraphs": list(section.paragraphs),
                     "bullets": list(section.bullets),
+                    "definitions": [
+                        {
+                            "term": definition.term,
+                            "term_en": definition.term_en,
+                            "definition": definition.definition,
+                        }
+                        for definition in section.definitions
+                    ],
+                    "examples": list(section.examples),
+                    "steps": list(section.steps),
+                    "formulas": list(section.formulas),
                     "key_points": list(section.key_points),
                     "table": (
                         {
@@ -289,7 +391,26 @@ class StructuredNotes:
         for section in self.sections:
             parts.append(f"## {section.heading}")
             parts.extend(section.paragraphs)
+            if section.definitions:
+                parts.append("**تعریف‌ها**")
+                parts.extend(
+                    f"- **{entry.term}**"
+                    + (f" ({entry.term_en})" if entry.term_en else "")
+                    + f": {entry.definition}"
+                    for entry in section.definitions
+                )
             parts.extend(f"- {bullet}" for bullet in section.bullets)
+            if section.examples:
+                parts.append("**مثال‌ها**")
+                parts.extend(f"- {example}" for example in section.examples)
+            if section.steps:
+                parts.append("**مراحل انجام**")
+                parts.extend(
+                    f"{index}. {step}" for index, step in enumerate(section.steps, start=1)
+                )
+            if section.formulas:
+                parts.append("**فرمول‌ها**")
+                parts.extend(f"- {formula}" for formula in section.formulas)
             if section.key_points:
                 parts.append("**نکته‌های کلیدی این بخش**")
                 parts.extend(f"- {point}" for point in section.key_points)
@@ -346,7 +467,13 @@ class StructuredNotes:
 
 
 def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
-    """Combine per-chunk notes into one document, preserving order."""
+    """Combine per-chunk notes into one document, preserving order.
+
+    Merging is purely additive: every section survives in chunk order and
+    nothing is re-summarised. Only *exact* duplicate strings (the same bullet,
+    key point or glossary entry repeated verbatim across chunks — usually a
+    boundary sentence that overlapped) are deduplicated; paraphrases are kept.
+    """
     if not notes:
         raise StructuringError("پاسخ سرویس تولید جزوه خالی بود.")
     if len(notes) == 1:
@@ -354,13 +481,68 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
     merged = StructuredNotes(
         title=notes[0].title,
         summary=next((item.summary for item in notes if item.summary), ""),
-        sections=tuple(section for item in notes for section in item.sections),
-        key_points=tuple(point for item in notes for point in item.key_points),
-        glossary=tuple(entry for item in notes for entry in item.glossary),
+        sections=_dedupe_section_bullets(
+            [section for item in notes for section in item.sections]
+        ),
+        key_points=_dedupe_exact(notes, lambda item: item.key_points),
+        glossary=_dedupe_glossary(notes),
+        note_mode=next(
+            (item.note_mode for item in notes if item.note_mode in NOTE_MODES), "full"
+        ),
     )
     if not merged.has_content:
         raise StructuringError("ساختار جزوهٔ دریافتی خالی بود.")
     return merged
+
+
+def _dedupe_exact(notes: list[StructuredNotes], getter) -> tuple[str, ...]:
+    """Keep every string in order; drop only exact duplicates across chunks."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for item in notes:
+        for value in getter(item):
+            if value not in seen:
+                seen.add(value)
+                result.append(value)
+    return tuple(result)
+
+
+def _dedupe_section_bullets(sections: list[NoteSection]) -> tuple[NoteSection, ...]:
+    """Drop verbatim-repeated bullets across chunks, keeping first position.
+
+    Models routinely repeat the sentence that straddles a chunk boundary as a
+    bullet in both neighbouring sections.  Only exact matches collapse;
+    paraphrases and every other block (definitions, steps, examples, tables)
+    are left untouched so no information is lost.
+    """
+    seen: set[str] = set()
+    result: list[NoteSection] = []
+    for section in sections:
+        bullets: list[str] = []
+        for bullet in section.bullets:
+            if bullet in seen:
+                continue
+            seen.add(bullet)
+            bullets.append(bullet)
+        result.append(replace(section, bullets=tuple(bullets)))
+    return tuple(result)
+
+
+def _dedupe_glossary(notes: list[StructuredNotes]) -> tuple[GlossaryEntry, ...]:
+    """Merge glossary entries by term, keeping the first (longest) definition."""
+    by_term: dict[str, GlossaryEntry] = {}
+    order: list[str] = []
+    for item in notes:
+        for entry in item.glossary:
+            key = entry.term.casefold()
+            if key not in by_term:
+                by_term[key] = entry
+                order.append(key)
+            else:
+                existing = by_term[key]
+                if len(entry.definition) > len(existing.definition):
+                    by_term[key] = GlossaryEntry(existing.term, entry.definition)
+    return tuple(by_term[term] for term in order)
 
 
 def extract_json_object(text: str) -> str:
@@ -401,29 +583,100 @@ def parse_structured_notes(text: str) -> StructuredNotes:
 
 
 def split_transcript(text: str, max_chars: int = 22000) -> list[str]:
-    """Split long transcripts near sentence boundaries to fit LLM context limits."""
+    """Split a transcript into coherent, model-sized chunks.
+
+    The transcript is first divided at paragraph breaks (blank lines) so a
+    definition, procedure or worked example is never cut mid-unit. Oversized
+    paragraphs are then split at sentence boundaries (Persian and Latin
+    terminators), and only as a last resort at a word boundary.
+
+    No text is ever dropped or reordered: the concatenation of the returned
+    chunks equals the normalised input (token-for-token).
+    """
     if max_chars <= 0:
         raise ValueError("max_chars must be positive")
     text = text.strip()
     if not text:
         return []
+
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", text) if part.strip()]
+    if not paragraphs:
+        paragraphs = [text]
+
+    chunks: list[str] = []
+    current: list[str] = []
+    current_len = 0
+
+    def flush() -> None:
+        nonlocal current, current_len
+        if current:
+            chunks.append("\n\n".join(current))
+            current, current_len = [], 0
+
+    for paragraph in paragraphs:
+        # Oversized paragraphs are sentence-split and packed like paragraphs.
+        pieces = [paragraph]
+        if len(paragraph) > max_chars:
+            pieces = _split_long_paragraph(paragraph, max_chars)
+        for piece in pieces:
+            extra = len(piece) + (2 if current else 0)
+            if current and current_len + extra > max_chars:
+                flush()
+                extra = len(piece)
+            current.append(piece)
+            current_len += extra
+    flush()
+    return chunks
+
+
+def _sentence_spans(paragraph: str) -> list[tuple[int, int]]:
+    """Spans of consecutive sentences; terminators stay inside their sentence.
+
+    A dot between digits ("7.2", "1.000") is a decimal/thousands separator,
+    never a sentence boundary — splitting there would corrupt numeric values.
+    """
+    terminator = re.compile(r"(?:[!?؟…]+|؛|(?<!\d)\.(?!\d))[»\)\]”\"']*")
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in terminator.finditer(paragraph):
+        end = match.end()
+        if end <= start:
+            continue  # a zero-length match can never terminate a sentence
+        spans.append((start, end))
+        start = end
+    if start < len(paragraph):
+        spans.append((start, len(paragraph)))
+    return spans
+
+
+def _split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
+    """Cut an oversized paragraph at sentence, then word, boundaries.
+
+    Sentence pieces are packed greedily so a piece never exceeds ``max_chars``
+    and adjacent sentences stay together whenever they fit.
+    """
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
     pieces: list[str] = []
-    while len(text) > max_chars:
-        boundary = max(
-            text.rfind(mark, 0, max_chars)
-            for mark in (". ", "؟", "!", "؟ ", "؛", "\n")
-        )
-        if boundary < max_chars // 2:
-            boundary = text.rfind(" ", 0, max_chars)
-        if boundary < max_chars // 2:
-            boundary = max_chars
+    for sentence_start, sentence_end in _sentence_spans(paragraph):
+        sentence = paragraph[sentence_start:sentence_end].strip()
+        while len(sentence) > max_chars:
+            window = sentence[:max_chars]
+            cut = window.rfind(" ")
+            if cut < max_chars // 2:
+                cut = max_chars  # a single monster word: hard cut, no loss
+            pieces.append(sentence[:cut].strip())
+            sentence = sentence[cut:].strip()
+        if sentence:
+            pieces.append(sentence)
+    # Greedy packing: merge neighbours while the pair still fits.
+    packed: list[str] = []
+    for piece in pieces:
+        if packed and len(packed[-1]) + len(piece) + 1 <= max_chars:
+            packed[-1] = packed[-1] + " " + piece
         else:
-            boundary += 1
-        pieces.append(text[:boundary].strip())
-        text = text[boundary:].strip()
-    if text:
-        pieces.append(text)
-    return pieces
+            packed.append(piece)
+    return packed or [paragraph[:max_chars]]
 
 
 def build_presentation_document(outline: str, transcript: str) -> str:
@@ -776,13 +1029,51 @@ async def _structured_notes_for(
     return notes
 
 
-async def structure_transcript(text: str, settings: Settings) -> StructuredNotes:
+def _chunk_prefix(index: int, total: int) -> str:
+    """Positional context prepended to every chunk sent to the model.
+
+    Unlike an overlapping-text window, this carries only position metadata, so
+    it can never cause the same sentence to be noted twice; it tells the model
+    the chunk is a middle (or final) part of one continuing lecture.
+    """
+    if total <= 1:
+        return ""
+    if index == 1:
+        return (
+            f"[بخش {to_persian_digits(index)} از {to_persian_digits(total)} این درس — "
+            "ادامهٔ درس در بخش بعدی می‌آید]\n\n"
+        )
+    if index == total:
+        return (
+            f"[بخش {to_persian_digits(index)} از {to_persian_digits(total)} این درس — "
+            "این آخرین بخش درس است]\n\n"
+        )
+    return (
+        f"[بخش {to_persian_digits(index)} از {to_persian_digits(total)} این درس — "
+        "این بخش ادامهٔ بخش قبل است و ادامهٔ آن در بخش بعد می‌آید]\n\n"
+    )
+
+
+#: Worst-case length of the positional chunk prefix. Chunk budgets are
+#: reduced by this reserve so the *complete* model input (prefix + material)
+#: stays within the intended context budget.
+_CHUNK_PREFIX_RESERVE = 200
+
+#: Default transcript chunk budget fed to the note model.
+TRANSCRIPT_CHUNK_CHARS = 22000
+
+
+async def structure_transcript(
+    text: str, settings: Settings, mode: str = "full"
+) -> StructuredNotes:
     """Turn a transcript into structured notes with the configured provider."""
     if not text.strip():
         raise StructuringError("متن پیاده‌سازی‌شده خالی است.")
     if settings.note_api_provider == "disabled":
         raise StructuringError("سرویس تولید جزوه غیرفعال است.")
-    chunks = split_transcript(text)
+    note_mode = resolve_note_mode(mode)
+    system_prompt = build_system_prompt(note_mode)
+    chunks = split_transcript(text, max_chars=TRANSCRIPT_CHUNK_CHARS - _CHUNK_PREFIX_RESERVE)
     timeout = aiohttp.ClientTimeout(
         total=settings.note_api_timeout,
         connect=min(30, settings.note_api_timeout),
@@ -793,31 +1084,52 @@ async def structure_transcript(text: str, settings: Settings) -> StructuredNotes
         for index, chunk in enumerate(chunks, start=1):
             notes.append(
                 await _structured_notes_for(
-                    chunk,
+                    _chunk_prefix(index, len(chunks)) + chunk,
                     settings,
                     session,
                     TRANSCRIPT_PROMPT,
+                    system_prompt=system_prompt,
                     label=f"chunk {index}/{len(chunks)}",
                 )
             )
-    return merge_structured_notes(notes)
+    merged = merge_structured_notes(notes)
+    merged_qa = run_note_qa(merged, chunks)
+    logger.info(
+        "Note QA completed mode=%s chunks=%s findings=%s numbers=%s/%s terms=%s/%s",
+        merged.note_mode,
+        len(chunks),
+        len(merged_qa.findings),
+        merged_qa.preserved_numbers,
+        merged_qa.source_numbers,
+        merged_qa.preserved_terms,
+        merged_qa.source_terms,
+    )
+    return merged
 
 
 async def structure_presentation(
-    outline: str, transcript: str, settings: Settings, max_chars: int = 22000
+    outline: str,
+    transcript: str,
+    settings: Settings,
+    max_chars: int = 22000,
+    mode: str = "full",
 ) -> StructuredNotes:
     """Build a slide-ordered booklet from slide text plus narration transcript."""
     if not outline.strip() and not transcript.strip():
         raise StructuringError("محتوای قابل‌استفاده‌ای از فایل ارائه به دست نیامد.")
     if settings.note_api_provider == "disabled":
         raise StructuringError("سرویس تولید جزوه غیرفعال است.")
+    note_mode = resolve_note_mode(mode)
+    system_prompt = build_presentation_system_prompt(note_mode)
 
     if max_chars < 1000:
         raise ValueError("max_chars must be at least 1000 for presentation context")
     outline = outline.strip()
     if transcript.strip() and len(outline) <= max_chars // 2:
         # Repeat a short outline as context for each narration chunk.
-        transcript_budget = max_chars - len(build_presentation_document(outline, "")) - 100
+        transcript_budget = (
+            max_chars - len(build_presentation_document(outline, "")) - 100 - _CHUNK_PREFIX_RESERVE
+        )
         documents = [
             build_presentation_document(outline, chunk)
             for chunk in split_transcript(transcript, transcript_budget)
@@ -825,7 +1137,10 @@ async def structure_presentation(
     else:
         # Long decks (including slides-only decks) must not silently lose their
         # final slides. Chunk the complete material instead of truncating it.
-        documents = split_transcript(build_presentation_document(outline, transcript), max_chars)
+        documents = split_transcript(
+            build_presentation_document(outline, transcript),
+            max_chars=max_chars - _CHUNK_PREFIX_RESERVE,
+        )
 
     timeout = aiohttp.ClientTimeout(
         total=settings.note_api_timeout,
@@ -837,12 +1152,24 @@ async def structure_presentation(
         for index, document in enumerate(documents, start=1):
             notes.append(
                 await _structured_notes_for(
-                    document,
+                    _chunk_prefix(index, len(documents)) + document,
                     settings,
                     session,
                     PRESENTATION_PROMPT,
-                    system_prompt=PRESENTATION_SYSTEM_PROMPT,
+                    system_prompt=system_prompt,
                     label=f"presentation chunk {index}/{len(documents)}",
                 )
             )
-    return merge_structured_notes(notes)
+    merged = merge_structured_notes(notes)
+    merged_qa = run_note_qa(merged, documents)
+    logger.info(
+        "Note QA completed mode=%s chunks=%s findings=%s numbers=%s/%s terms=%s/%s",
+        merged.note_mode,
+        len(documents),
+        len(merged_qa.findings),
+        merged_qa.preserved_numbers,
+        merged_qa.source_numbers,
+        merged_qa.preserved_terms,
+        merged_qa.source_terms,
+    )
+    return merged

@@ -496,11 +496,12 @@ class ChunkOrderAndCoverageTests(unittest.IsolatedAsyncioTestCase):
 
         async def fake_chunk(chunk, settings, session, prompt=None, **_kwargs):
             seen.append(chunk)
+            body = chunk.split("]\n\n", 1)[-1]  # drop the positional prefix
             return json.dumps(
                 {
                     "title": "جزوه",
                     "sections": [
-                        {"heading": f"بخش {chunk.split()[1]}", "paragraphs": [chunk]}
+                        {"heading": f"بخش {body.split()[1]}", "paragraphs": [body]}
                     ],
                 },
                 ensure_ascii=False,
@@ -514,13 +515,18 @@ class ChunkOrderAndCoverageTests(unittest.IsolatedAsyncioTestCase):
             "gamas_bot.structuring.aiohttp.ClientSession", lambda **kwargs: _FakeSession([])
         ):
             result = await structure_transcript("متن طولانی", make_settings())
-        self.assertEqual(seen, chunks)
+        # Chunks carry a positional context prefix; the transcript itself must
+        # still arrive in order, exactly once each.
+        prefix = "[بخش ۱ از ۵ این درس — ادامهٔ درس در بخش بعدی می‌آید]\n\n"
+        self.assertEqual(seen[0], prefix + chunks[0])
+        self.assertTrue(all(chunk in item for chunk, item in zip(chunks, seen)))
         self.assertEqual(
             [section.heading for section in result.sections],
             [f"بخش {index}" for index in range(1, 6)],
         )
         self.assertEqual(
-            [section.paragraphs[0] for section in result.sections], chunks
+            [section.paragraphs[0].split("]\n\n", 1)[-1] for section in result.sections],
+            chunks,
         )
 
     def test_mixed_medical_text_survives_chunking_complete_and_ordered(self):

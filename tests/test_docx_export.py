@@ -83,7 +83,7 @@ class NotesDocxTests(unittest.TestCase):
         self.assertIn("• شروع با دوز کم", text)
         self.assertIn("هشدار: در AKI قطع شود", text)
         self.assertIn("یادآوری: پایش HbA1c هر سه ماه", text)
-        self.assertIn("HbA1c: هموگلوبین گلیکوزیله", text)
+        self.assertIn("HbA1c | هموگلوبین گلیکوزیله", text)  # glossary is a table now
         self.assertIn("دارو | دوز روزانه", text)
         self.assertIn("Metformin | 500-2000 mg", text)
         self.assertIn("کد پیگیری: GMS-000123", text)
@@ -258,7 +258,9 @@ class WordLayoutTests(unittest.TestCase):
             body = archive.read("word/document.xml").decode("utf-8")
         first_row = body[body.index("<w:tr>"):body.index("</w:tr>")]
         self.assertIn("<w:tblHeader", first_row)
-        self.assertEqual(body.count("<w:tblHeader"), 1)
+        # One repeating header per table: the content table plus the glossary
+        # table that every titled note now renders.
+        self.assertEqual(body.count("<w:tblHeader"), 2)
 
     def test_headings_stay_with_their_first_body_line(self):
         notes = parse_structured_notes(FULL_NOTES_JSON)

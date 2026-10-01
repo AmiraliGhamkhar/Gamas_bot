@@ -1,0 +1,59 @@
+{
+  "description": "Deterministic note-quality benchmark corpus. Each entry pairs a source transcript with a hand-written reference document (the shape a good model answer should take) and the minimum content-preservation coverage the QA layer must observe between them. Coverage is measured by gamas_bot.qa.run_note_qa; no network, provider or model call is involved.",
+  "fixtures": [
+    {
+      "id": "01_medical_endocrinology",
+      "kind": "medical",
+      "transcript": "01_medical_endocrinology.txt",
+      "reference": "references/01_medical_endocrinology.json",
+      "min_number_coverage": 1.0,
+      "min_term_coverage": 1.0,
+      "notes": "Persian+English clinical lecture: dosages, mg/mL/kg/mmHg, HbA1c, BP pair, eGFR, AKI."
+    },
+    {
+      "id": "02_hit_university",
+      "kind": "hit",
+      "transcript": "02_hit_university.txt",
+      "reference": "references/02_hit_university.json",
+      "min_number_coverage": 1.0,
+      "min_term_coverage": 1.0,
+      "notes": "Persian-dominant HCI lecture with English terminology (WIMP, Fitts, Nielsen heuristics)."
+    },
+    {
+      "id": "03_cs_algorithms",
+      "kind": "cs",
+      "transcript": "03_cs_algorithms.txt",
+      "reference": "references/03_cs_algorithms.json",
+      "min_number_coverage": 1.0,
+      "min_term_coverage": 1.0,
+      "notes": "Persian algorithms lecture: big-O, merge sort, hashing, numeric comparison at n=1000."
+    },
+    {
+      "id": "04_persian_only_literature",
+      "kind": "persian_only",
+      "transcript": "04_persian_only_literature.txt",
+      "reference": "references/04_persian_only_literature.json",
+      "min_number_coverage": 1.0,
+      "min_term_coverage": 1.0,
+      "notes": "Fully Persian humanities lecture. The QA layer must report zero signals instead of inventing gaps."
+    },
+    {
+      "id": "05_code_switching_tech",
+      "kind": "persian_english",
+      "transcript": "05_code_switching_tech.txt",
+      "reference": "references/05_code_switching_tech.json",
+      "min_number_coverage": 1.0,
+      "min_term_coverage": 0.8,
+      "notes": "Heavy code-switching. Spoken code yields phonetic tokens ('equals', 'string') that a good note legitimately rewrites, so term coverage is a threshold rather than 100%."
+    },
+    {
+      "id": "06_pptx_slide_outline",
+      "kind": "pptx",
+      "transcript": "06_pptx_slide_outline.txt",
+      "reference": "references/06_pptx_slide_outline.json",
+      "min_number_coverage": 1.0,
+      "min_term_coverage": 1.0,
+      "notes": "Presentation slides_outline() text: slide headings, bullets and speaker notes."
+    }
+  ]
+}
