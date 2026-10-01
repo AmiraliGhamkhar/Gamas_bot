@@ -23,6 +23,7 @@ from .docx_export import (
     notes_docx_filename,
     plain_docx_filename,
     raw_text_filename,
+    resolve_fonts,
 )
 from .logging_config import log_job_id
 from .media import (
@@ -918,7 +919,7 @@ class StudyBot:
                 notes: StructuredNotes | None = None
                 try:
                     notes = await structure_presentation(
-                        outline, transcript_text, self.settings
+                        outline, transcript_text, self.settings, mode=self.settings.note_mode
                     )
                     notice = ""
                 except Exception as exc:
@@ -1094,7 +1095,9 @@ class StudyBot:
                 await progress.update(80, "✍️ متن آماده شد؛ دارم آن را به شکل جزوه مرتب می‌کنم")
                 notes: StructuredNotes | None = None
                 try:
-                    notes = await structure_transcript(result.text, self.settings)
+                    notes = await structure_transcript(
+                        result.text, self.settings, mode=self.settings.note_mode
+                    )
                 except Exception as exc:
                     if isinstance(exc, StructuringError):
                         logger.warning(
@@ -1287,7 +1290,7 @@ class StudyBot:
             docx_title = notes.display_title
             try:
                 docx_bytes = build_notes_docx(
-                    notes, font=self.settings.docx_font, meta=meta
+                    notes, fonts=resolve_fonts(self.settings.docx_fonts), meta=meta
                 )
                 docx_path = workdir / notes_docx_filename(notes, reference)
                 docx_path.write_bytes(docx_bytes)
@@ -1300,7 +1303,10 @@ class StudyBot:
         else:
             try:
                 docx_bytes = build_plain_docx(
-                    plain_title, plain_text, font=self.settings.docx_font, meta=meta
+                    plain_title,
+                    plain_text,
+                    fonts=resolve_fonts(self.settings.docx_fonts),
+                    meta=meta,
                 )
                 docx_path = workdir / plain_docx_filename(plain_title, reference)
                 docx_path.write_bytes(docx_bytes)

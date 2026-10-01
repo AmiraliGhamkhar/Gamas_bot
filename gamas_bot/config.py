@@ -12,6 +12,17 @@ from dotenv import load_dotenv
 
 TRUTHY = {"1", "true", "yes", "on"}
 
+# Note-generation compression modes. ``full`` (the default) preserves detail;
+# only ``summary`` intentionally compresses. Defined here so the environment
+# parser does not need to import the (heavier) structuring module.
+NOTE_MODES = ("full", "standard", "summary")
+
+
+def resolve_note_mode(mode: str | None) -> str:
+    """Normalise a configured/selected mode; unknown values fall back to full."""
+    value = (mode or "").strip().lower()
+    return value if value in NOTE_MODES else "full"
+
 # Relative paths in the configuration (``.env``, ``data/...``) are anchored to
 # the project directory, never to the process's working directory.  Cron jobs,
 # Passenger and ``su -c`` all start processes in ``$HOME`` or ``/``, where a
@@ -133,6 +144,15 @@ class Settings:
     # Complex-script font used inside the generated Word document (Tahoma is
     # present everywhere; set B Nazanin/Vazirmatn when the audience has it).
     docx_font: str = "Tahoma"
+    # Per-role document faces. ``fallback`` is advertised in word/fontTable.xml
+    # (w:altName) so readers without the Persian face substitute it gracefully.
+    docx_font_body: str = ""
+    docx_font_heading: str = ""
+    docx_font_latin: str = ""
+    docx_font_fallback: str = "Tahoma"
+    # Note-generation compression mode: full (default), standard or summary.
+    # Only ``summary`` intentionally compresses; ``full`` preserves detail.
+    note_mode: str = "full"
     # The playful progress bar; when disabled only real stage updates are sent.
     progress_animation: bool = True
     presentation_enabled: bool = True
@@ -164,6 +184,16 @@ class Settings:
     def lock_path(self) -> Path:
         """Advisory lock guarding the Telegram session against a second instance."""
         return self.session_path.with_name(self.session_path.name + ".lock")
+
+    @property
+    def docx_fonts(self) -> dict:
+        """Per-role document faces; blanks defer to DOCX_FONT/defaults."""
+        return {
+            "body": self.docx_font_body or self.docx_font,
+            "heading": self.docx_font_heading or self.docx_font,
+            "latin": self.docx_font_latin or self.docx_font,
+            "fallback": self.docx_font_fallback or self.docx_font,
+        }
 
     @property
     def effective_note_api_key(self) -> str | None:
@@ -364,6 +394,11 @@ class Settings:
             note_api_max_output_tokens=note_max_tokens,
             note_api_json_mode=_flag("NOTE_API_JSON_MODE", False),
             docx_font=_text("DOCX_FONT", "Tahoma"),
+            docx_font_body=_text("DOCX_FONT_BODY", ""),
+            docx_font_heading=_text("DOCX_FONT_HEADING", ""),
+            docx_font_latin=_text("DOCX_FONT_LATIN", ""),
+            docx_font_fallback=_text("DOCX_FONT_FALLBACK", "Tahoma"),
+            note_mode=resolve_note_mode(_text("NOTE_MODE", "full")),
             progress_animation=_flag("PROGRESS_ANIMATION_ENABLED", True),
             presentation_enabled=_flag("PPTX_ENABLED", True),
             presentation_include_slide_text=_flag("PPTX_INCLUDE_SLIDE_TEXT", True),

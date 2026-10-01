@@ -8,3 +8,8 @@ conversion path with real PowerPoint 97–2003 binary files:
 - `visual_minimal.ppt` — smallest real deck with normal slide content.
 - `visual_video.ppt` — contains embedded media, so the conversion report's
   lossy-feature diagnostics (`MEDIA_ACTION_OMITTED`) are covered.
+
+`notes/` holds the note-quality benchmark corpus: six Persian lecture
+transcripts paired with hand-written reference documents and the content-
+preservation floors declared in `notes/corpus.json`. See
+`notes/README.md`; it is driven by `tests/test_note_evaluation.py`.

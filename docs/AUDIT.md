@@ -1,3 +1,178 @@
+# Repository review — 2026-10-01: note completeness, BiDi rendering and QA
+
+## Scope and result
+
+Deep audit of the note-generation path — prompt construction, transcript
+chunking, schema/merge, and the Word renderer — against the question a student
+actually asks: *did anything the lecturer said disappear, and does the PDF/Word
+file render Persian and English correctly side by side?*
+
+Research (OOXML §17.3.2.30 `w:rtl`, `w:bidi`, complex-script run properties,
+python-docx `font.rtl` serialization, `w:altName` in `word/fontTable.xml`)
+confirmed five root causes; all five are fixed. **314 tests pass** (265 existing
++ 49 new across `test_note_quality.py` and `test_note_evaluation.py`). No live
+Telegram login and no paid provider call was made.
+
+## Root causes found
+
+1. **The prompt asked for compression, not preservation.** It requested a
+   "2–4 sentence summary" per section with no rule about keeping numbers,
+   units, dosages or English terms, so the model was *rewarded* for dropping
+   them. Information loss was designed in, not a model failure.
+2. **Chunking was character-based.** A fixed 22 000-character cut could land
+   mid-sentence and mid-number, so a chunk boundary could destroy `7.2` or
+   split a dosage — and gave the model no idea where it was in the lecture.
+3. **The schema had nowhere to put detail.** Only paragraphs / bullets /
+   key_points / tables / callouts existed, so definitions, worked examples,
+   ordered steps and formulas had to be flattened into prose (or dropped).
+4. **No QA layer.** Nothing compared the notes back to the source, so a prompt
+   regression, a provider swap or a weaker model would silently degrade output
+   with no signal anywhere but a user's complaint.
+5. **BiDi rendering was wrong in a specific, reproducible way.** `_style_run`
+   forced `run.font.rtl = True` on *every* run, so a pure-Latin token such as
+   `500 mg`, `120/80` or a URL was stored as a complex-script run: Word renders
+   it with the Persian face, in the wrong order, at the wrong size weight.
+   A single hardcoded font was used everywhere, with no fallback advertised.
+
+## Changes
+
+### `gamas_bot/structuring.py`
+
+* Prompts rebuilt as composable rule blocks: `_JSON_RULES`, `_CONTENT_RULES`
+  and per-mode `MODE_RULES`, exposed through `build_system_prompt(mode)` and
+  `build_presentation_system_prompt(mode)`. `full` (the default) states a
+  *preservation contract* — every number, unit, dosage, English term and
+  definition from the source must appear — and treats the model as a
+  lecture-to-notes compiler; only `summary` is allowed to compress.
+* Schema extended with `definitions` (term / term_en / definition), `examples`,
+  `steps` and `formulas` on every section; `NoteSection` and `to_payload` /
+  `to_markdown` / the DOCX renderer round-trip them without loss.
+* `split_transcript` rewritten: paragraph → sentence → word packing with a
+  terminator regex `(?:[!?؟…]+|؛|(?<!\d)\.(?!\d))[»\)\]”"']*` so decimals and
+  ratios are never mistaken for a sentence end. Each chunk is prefixed with
+  positional context (`_chunk_prefix(index, total)`) and oversize sentences are
+  hard-cut losslessly rather than dropped.
+* `merge_structured_notes` now deduplicates **only exact** repeats
+  (`_dedupe_exact`, `_dedupe_glossary` keeping the longest definition, and
+  `_dedupe_section_bullets` across chunks) so boundary sentences that repeat do
+  not stack while paraphrases and distinct facts all survive.
+* `structure_transcript(..., mode=...)` and `structure_presentation(..., mode=...)`
+  resolve the mode, use the per-mode prompt and log the QA report.
+
+### `gamas_bot/qa.py` (new)
+
+Deterministic, log-only content-preservation QA — no embeddings, no vector DB,
+no second LLM pass, no new dependency. `run_note_qa()` extracts numbers-with-
+units (`mg`, `mL`, `kg/m²`, `mmHg`, `درصد`, …), percentages and BP pairs from
+each source chunk and compares them to every user-visible string of the notes,
+plus English technical terms and per-chunk section coverage. Notes are **never
+mutated**; the worst outcome is a bounded WARNING line.
+
+Comparison is script- and spelling-independent on purpose: Persian/Arabic digits
+are normalised to Latin, and unit spellings are canonicalised through
+`_UNIT_ALIASES` (`میلی‌گرم` ≡ `mg`, `میلی‌متر جیوه` ≡ `mmhg`, `درصد` ≡ `%`).
+Lowercase English words only count inside a Persian passage, and URLs are
+stripped first, so ordinary prose and address fragments cannot manufacture
+false "missing term" warnings.
+
+### `gamas_bot/bidi.py` (new)
+
+`split_direction_runs()` segments a mixed string into logical-order direction
+runs using the Unicode BiDi rule *plus* the domain rule that technical Latin
+tokens (`500 mg`, `120/80`, `HbA1c`, URLs) are atomic. Neutrals glue to the
+preceding run and adjacent same-direction runs merge, so the concatenation of
+the runs is always byte-identical to the input. `is_rtl_dominant()` drives the
+paragraph `w:bidi` decision.
+
+### `gamas_bot/docx_export.py`
+
+Rewritten around the research findings, public API preserved:
+
+* one run **per direction segment**, not one run per paragraph;
+* RTL runs get `w:rFonts/@w:cs`, `w:szCs`, `w:bCs`; LTR runs get
+  `<w:rtl w:val="0"/>` and an explicit `w:ascii` face — so `500 mg` is no
+  longer typeset as complex script;
+* paragraphs carry `w:bidi` and tables carry `w:bidiVisual` in the
+  schema-correct position (`_apply_rtl_table_direction` fixes the glossary table
+  column order);
+* glossary renders as a real RTL table (اصطلاح / توضیح) with a repeating header
+  row, and the document gains a running page header
+  (`_add_document_header`) and a generation-mode label;
+* `DocumentFonts` + `resolve_fonts()` give per-role faces (body / heading /
+  latin / fallback); `_inject_font_fallbacks()` rewrites `word/fontTable.xml`
+  post-save to add `w:altName`, and any failure there is swallowed so a
+  font-table quirk can never lose a document.
+
+### `gamas_bot/config.py`, `gamas_bot/bot.py`
+
+`NOTE_MODE` (`full` / `standard` / `summary`, resolved by `resolve_note_mode`,
+defaulting to `full`) and `DOCX_FONT_BODY` / `_HEADING` / `_LATIN` / `_FALLBACK`
+were added and wired through `Settings.docx_fonts` into both DOCX builders.
+
+## Evaluation corpus (new)
+
+`tests/fixtures/notes/` holds six realistic source transcripts — medical
+(Persian+English, dosages, `HbA1c`, `120/80`, `eGFR`), HCI/university (Persian-
+dominant with English terminology), computer science (big-O, merge sort,
+hashing), fully Persian humanities (must report *zero* signals), heavy
+code-switching, and a PowerPoint `slides_outline()` dump — each paired with a
+hand-written reference document and the coverage floor declared in
+`corpus.json`. `tests/test_note_evaluation.py` runs the whole corpus through
+chunking, QA, merge and DOCX rendering and asserts those floors. It is a fully
+reproducible baseline a prompt change cannot silently regress, and it needs no
+network or model call.
+
+## Tests added / reworked
+
+| File | Tests | Covers |
+|---|---|---|
+| `tests/test_note_quality.py` (new) | 37 | chunking invariants, QA semantics, extended schema, merge dedup, prompt modes, BiDi segmentation, DOCX direction runs / fonts / header / glossary |
+| `tests/test_note_evaluation.py` (new) | 12 | the six-fixture corpus, coverage floors, negative control, merge + render pipeline |
+| `tests/test_docx_export.py` (reworked) | 16 | glossary is now a table (`w:tblHeader` count 1 → 2, `HbA1c | هموگلوبین گلیکوزیله`) |
+| `tests/test_provider_robustness.py` (reworked) | 31 | chunk prefix in the chronological-order assertion |
+
+**Validation:** `314 passed, 0 failed` — every file run individually with
+`cd tests && PYTHONPATH=.:<repo> python3 -m unittest discover -s . -p "test_X.py"`
+(full discovery exceeds the 180 s command cap in this environment).
+`python -m compileall` and `pip check` clean. Fonts are **not** embedded in the
+document and no code claims otherwise; substitution is advertised via
+`w:altName` only.
+
+## Configuration changes
+
+New, all optional with safe defaults — an existing deployment needs no change:
+`NOTE_MODE` (default `full`), `DOCX_FONT_BODY`, `DOCX_FONT_HEADING`,
+`DOCX_FONT_LATIN`, `DOCX_FONT_FALLBACK` (default `Tahoma`). `.env.example`
+could not be edited by the tooling in this environment, so they are documented
+in `README.md` instead.
+
+## Migration and deploy impact
+
+None. No database schema change, no new dependency, no change to the provider
+abstraction (`gemini` / `openai_compatible` / `anthropic`), no change to audio
+chunking, and the raw-transcript fallback path is intact. The public Python
+signatures of `build_notes_docx` / `build_plain_docx` are backwards compatible
+(`fonts=` added, legacy `font=` still accepted). Restarting the bot picks up the
+new behaviour; in-flight jobs are unaffected.
+
+## Remaining limitations
+
+- QA is a *proxy*: it proves numbers and technical terms survived, not that the
+  prose is correct or well-organised. It never rewrites notes by design.
+- Prompt quality still depends on the provider/model; the corpus measures the
+  pipeline, so real end-to-end quality must be re-checked with the operator's
+  own model and provider.
+- `w:altName` is a substitution hint. Readers without the Persian face still
+  see Word's own substitution; only full font *embedding* would guarantee the
+  glyphs, and that is not implemented.
+- Chunk prefixes add ~200 characters per chunk to the prompt budget; very short
+  lectures are unaffected.
+- Presentation decks are still chunked without narration-to-slide timestamps.
+- Live Telegram delivery, provider billing and Windows execution remain
+  unverified on the target host, as in the earlier reviews.
+
+---
+
 # Repository review — 2026-09-29 (Telegram rendering + Word booklet polish)
 
 ## Scope and result
