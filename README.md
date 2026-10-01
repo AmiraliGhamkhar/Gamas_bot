@@ -281,7 +281,37 @@ NOTE_API_JSON_MODE=false
 # Note-generation mode: full (default; preserves explanations, examples and
 # procedures), standard (balanced) or summary (intentionally concise):
 NOTE_MODE=full
+# Optional second provider pass. It runs ONLY when the deterministic QA pass
+# detects real information loss (missing numbers/units/terms, low coverage or
+# compression far below a compiled lecture). The repaired notes are accepted
+# only when they are measurably better, and the repair prompt forbids inventing
+# content. Set to false to guarantee exactly one provider call per chunk:
+NOTE_REPAIR_ENABLED=true
 ```
+
+#### Document fonts
+
+Fonts are chosen with a named profile; an explicit `DOCX_FONT_*` variable
+overrides the profile for that one role.
+
+```dotenv
+# persian_modern (default) | traditional | legacy
+DOCX_FONT_PROFILE=persian_modern
+#   persian_modern : body/heading/latin Vazirmatn, fallback Tahoma
+#   traditional    : body/heading B Nazanin, latin Times New Roman, fallback Tahoma
+#   legacy         : every role Tahoma (behaviour before profiles existed)
+# DOCX_FONT_BODY=Vazirmatn
+# DOCX_FONT_HEADING=Vazirmatn
+# DOCX_FONT_LATIN=Vazirmatn
+# DOCX_FONT_FALLBACK=Tahoma
+```
+
+In the generated file, Persian runs carry the face in the `w:cs` (complex
+script) slot together with `w:szCs`/`w:bCs`, while Latin runs carry `w:ascii`
+/`w:hAnsi` and an explicit `w:rtl w:val="0"`. That is what keeps `500 mg`,
+`120/80` and `HbA1c` in a Latin face instead of typesetting them as complex
+script. **Fonts are not embedded** — the configured fallback is declared with
+`w:altName` so a reader without the primary face substitutes it gracefully.
 
 #### Strict JSON structured output
 
@@ -328,6 +358,24 @@ blood-pressure pairs and English technical terms in the notes against
 the source chunks and logs any gaps — the notes themselves are never
 silently rewritten, and nothing is ever invented to fill a gap.
 
+The QA report also measures source length, notes length, the compression
+ratio, per-chunk coverage and the overall signal-coverage fraction, and
+it is the input to the **optional repair pass**: only when real
+information loss is detected does the bot make one extra, targeted
+provider call that re-reads the same source and restores the missing
+signals under an explicit “invent nothing” instruction. The repaired
+notes are accepted only when they are measurably better (higher
+coverage, or more of the lecture preserved at equal coverage); otherwise
+the original is kept. Set `NOTE_REPAIR_ENABLED=false` to guarantee
+exactly one provider call per chunk.
+
+Before rendering, all text passes through a deterministic Persian
+normalization stage: the Arabic `ك`/`ي`/`ى`/`ة` that a second keyboard or
+an STT engine emits are folded to their Persian forms, per the IANA
+fa-IR Persian Language Table. ZWNJ (`می‌شود`), Latin technical tokens,
+formulas, URLs, e-mails and digit values are left byte-for-byte intact,
+and the transformation is idempotent.
+
 `NOTE_API_JSON_MODE=true` additionally sends
 `response_format: {"type": "json_object"}` to OpenAI-compatible
 gateways — it is opt-in because not every compatible service implements
@@ -357,12 +405,13 @@ chat message:
    - The glossary renders as a proper RTL table (اصطلاح / توضیح)
    - A running page header (document title + brand), page-number footers
      and document metadata
-   - Fonts configurable per role: `DOCX_FONT` (default `Tahoma`, present
-     everywhere) plus optional `DOCX_FONT_BODY`, `DOCX_FONT_HEADING`,
-     `DOCX_FONT_LATIN` and `DOCX_FONT_FALLBACK`. The fallback is declared
-     in the document's font table (`w:altName`) so readers without the
-     primary Persian face substitute it gracefully; fonts are *not*
-     embedded in the file.
+   - Fonts selected by the `DOCX_FONT_PROFILE` profile (`persian_modern`
+     with Vazirmatn, `traditional` with B Nazanin, `legacy` for the
+     historic single-font behaviour), with per-role overrides
+     `DOCX_FONT`, `DOCX_FONT_BODY`, `DOCX_FONT_HEADING`, `DOCX_FONT_LATIN`
+     and `DOCX_FONT_FALLBACK`. The fallback is declared in the document's
+     font table (`w:altName`) so readers without the primary Persian face
+     substitute it gracefully; fonts are *not* embedded in the file.
 2. **`متن خام - GMS-XXXXXX.txt`** — the raw extracted texts (the
    transcript, and for presentations the slide text as well) with a
    small metadata header, exactly as produced by the pipeline.
@@ -681,6 +730,15 @@ Windows application setup is documented but has not been validated by this CI
 matrix.
 
 ### Note-quality benchmark
+
+`python -m scripts.benchmark_notes` runs the committed fixture transcripts
+through chunking, QA and the DOCX renderer and prints a provider-free,
+reproducible table (per-fixture source length, chunk count, preserved numbers
+and terms, uncovered chunks, compression ratio, and DOCX structure counts).
+Use `--json` for machine-readable output. It makes note quality measurable
+before and after a change instead of only asserting "the tests pass".
+
+
 
 `tests/fixtures/notes/` ships a six-fixture corpus (medical, HCI/university,
 computer science, Persian-only, Persian+English code-switching, and a PowerPoint

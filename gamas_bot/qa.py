@@ -22,16 +22,30 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # structural import only; avoids an import cycle at runtime
     from .structuring import StructuredNotes
 
+from .textnorm import normalize_digits
+
 logger = logging.getLogger(__name__)
 
 #: How many findings are listed per category in one log record.
 MAX_REPORTED_FINDINGS = 8
+
+#: Thresholds for the optional repair pass and for the "aggressive compression"
+#: finding. The repair pass costs an extra provider call, so it must fire only
+#: on unambiguous information loss.
+#:
+#: ``MIN_COVERAGE`` is the fraction of source numbers+terms that must survive.
+#: ``MIN_RATIO`` is the smallest acceptable notes/source character ratio; below
+#: it the model summarised instead of compiling. Ratios are meaningless on a
+#: short source, so the minimum length gate is ``MIN_RATIO_SOURCE_CHARS``.
+MIN_COVERAGE = 0.75
+MIN_RATIO = 0.10
+MIN_RATIO_SOURCE_CHARS = 1000
 
 # ---------------------------------------------------------------------------
 # Extraction patterns
@@ -149,16 +163,67 @@ class NoteQAReport:
     uncovered_chunks: tuple[int, ...] = ()
     notes_text_chars: int = 0
     findings: tuple[str, ...] = field(default_factory=tuple)
+    # Length / compression facts (added for measurable before/after checks).
+    source_chars: int = 0
+    total_chunks: int = 0
+    covered_chunks: int = 0
 
     @property
     def has_findings(self) -> bool:
         return bool(self.findings or self.uncovered_chunks)
 
+    @property
+    def compression_ratio(self) -> float:
+        """Notes characters per source character (0.0 for an empty source)."""
+        if self.source_chars <= 0:
+            return 0.0
+        return self.notes_text_chars / self.source_chars
+
+    @property
+    def coverage(self) -> float:
+        """Fraction of the source's numbers+terms that survived into the notes."""
+        total = self.source_numbers + self.source_terms
+        if not total:
+            # Nothing measurable to compare (a Persian-only humanities lecture):
+            # coverage is defined as complete rather than unknown.
+            return 1.0
+        kept = self.preserved_numbers + self.preserved_terms
+        return kept / total
+
+    @property
+    def chunk_coverage(self) -> float:
+        """Fraction of signal-bearing chunks that kept any of their signal."""
+        if not self.total_chunks:
+            return 1.0
+        return self.covered_chunks / self.total_chunks
+
+    @property
+    def needs_repair(self) -> bool:
+        """True when the notes look degraded enough to justify a second pass.
+
+        This deliberately reacts only to *unambiguous information loss* — a
+        missing number/unit, or a coverage below the floor — and not to length
+        alone, because a short source cannot distinguish "compiled" from
+        "summarised". Compression is reported as a finding, but gating the
+        repair on it produced the opposite of the intended behaviour (the most
+        heavily compressed notes were the ones that never triggered it).
+
+        A very short source never triggers the pass at all.
+        """
+        if self.source_chars < MIN_RATIO_SOURCE_CHARS:
+            return False
+        if self.missing_numbers:
+            return True
+        return self.coverage < MIN_COVERAGE
+
 
 def _normalize_digits(value: str) -> str:
-    """Persian/Arabic digits -> Latin so comparisons are script-independent."""
-    table = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
-    return value.translate(table)
+    """Persian/Arabic digits -> Latin so comparisons are script-independent.
+
+    Delegates to :mod:`gamas_bot.textnorm` so there is exactly one digit table
+    in the codebase; QA must agree with the renderer on what ``۵۰۰`` means.
+    """
+    return normalize_digits(value)
 
 
 def _canon_number(value: str) -> str:
@@ -263,14 +328,19 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
     uncovered: list[int] = []
     source_numbers: set[str] = set()
     source_terms: set[str] = set()
+    source_chars = 0
+    signal_chunks = 0
+    covered_chunks = 0
 
     for index, chunk in enumerate(source_chunks, start=1):
+        source_chars += len(chunk)
         chunk_numbers = _extract_numbers(chunk)
         chunk_terms = _extract_terms(chunk)
         source_numbers |= chunk_numbers
         source_terms |= chunk_terms
         if not chunk_numbers and not chunk_terms:
             continue
+        signal_chunks += 1
         missing_here_numbers = chunk_numbers - rendered_numbers
         missing_here_terms = {
             term for term in chunk_terms if term.casefold() not in rendered_terms_folded
@@ -283,6 +353,8 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
             not chunk_terms or missing_here_terms == chunk_terms
         ):
             uncovered.append(index)
+        else:
+            covered_chunks += 1
 
     report = NoteQAReport(
         source_numbers=len(source_numbers),
@@ -293,6 +365,9 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         missing_terms=tuple(sorted(missing_terms)[:MAX_REPORTED_FINDINGS]),
         uncovered_chunks=tuple(uncovered[:MAX_REPORTED_FINDINGS]),
         notes_text_chars=len(rendered),
+        source_chars=source_chars,
+        total_chunks=signal_chunks,
+        covered_chunks=covered_chunks,
     )
 
     findings: list[str] = []
@@ -309,23 +384,34 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
             "chunks with no preserved signal: "
             + ", ".join(str(index) for index in report.uncovered_chunks)
         )
-    report = NoteQAReport(
-        source_numbers=report.source_numbers,
-        preserved_numbers=report.preserved_numbers,
-        source_terms=report.source_terms,
-        preserved_terms=report.preserved_terms,
-        missing_numbers=report.missing_numbers,
-        missing_terms=report.missing_terms,
-        uncovered_chunks=report.uncovered_chunks,
-        notes_text_chars=report.notes_text_chars,
-        findings=tuple(findings),
-    )
+    if (
+        report.source_chars >= MIN_RATIO_SOURCE_CHARS
+        and 0 < report.compression_ratio < MIN_RATIO
+    ):
+        findings.append(
+            f"aggressive compression: notes are {report.compression_ratio:.1%} of the source"
+        )
+    # ``findings`` is the last field, so build the report once at the end
+    # instead of constructing it twice.
+    report = replace(report, findings=tuple(findings))
 
+    logger.info(
+        "Note QA mode=%s source_chars=%s notes_chars=%s ratio=%.3f coverage=%.2f "
+        "chunk_coverage=%.2f numbers=%s/%s terms=%s/%s",
+        getattr(notes, "note_mode", "?"),
+        report.source_chars,
+        report.notes_text_chars,
+        report.compression_ratio,
+        report.coverage,
+        report.chunk_coverage,
+        report.preserved_numbers,
+        report.source_numbers,
+        report.preserved_terms,
+        report.source_terms,
+    )
     if report.has_findings:
         logger.warning(
             "Note QA coverage gaps (informational; notes delivered unchanged): %s",
             " | ".join(findings),
         )
-    else:
-        logger.info("Note QA coverage complete: no gaps detected")
     return report

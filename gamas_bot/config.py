@@ -17,6 +17,35 @@ TRUTHY = {"1", "true", "yes", "on"}
 # parser does not need to import the (heavier) structuring module.
 NOTE_MODES = ("full", "standard", "summary")
 
+#: Named font profiles so an operator picks a coherent set with one variable
+#: instead of four. ``persian_modern`` uses Vazirmatn (the common modern
+#: Persian open font); ``traditional`` uses B Nazanin, the long-established
+#: academic Persian face. Individual DOCX_FONT_* variables always win over the
+#: profile, so a profile is only a default. Fonts are referenced by name and
+#: advertised via w:altName for substitution; they are NOT embedded in the file.
+FONT_PROFILES = {
+    "persian_modern": {
+        "body": "Vazirmatn",
+        "heading": "Vazirmatn",
+        "latin": "Vazirmatn",
+        "fallback": "Tahoma",
+    },
+    "traditional": {
+        "body": "B Nazanin",
+        "heading": "B Nazanin",
+        "latin": "Times New Roman",
+        "fallback": "Tahoma",
+    },
+    # Historic single-font behaviour: every role uses one face.
+    "legacy": {"body": "Tahoma", "heading": "Tahoma", "latin": "Tahoma", "fallback": "Tahoma"},
+}
+
+
+def resolve_font_profile(name: str | None) -> dict:
+    """Return the four font roles for a named profile (unknown -> persian_modern)."""
+    key = (name or "").strip().lower()
+    return dict(FONT_PROFILES.get(key, FONT_PROFILES["persian_modern"]))
+
 
 def resolve_note_mode(mode: str | None) -> str:
     """Normalise a configured/selected mode; unknown values fall back to full."""
@@ -146,13 +175,20 @@ class Settings:
     docx_font: str = "Tahoma"
     # Per-role document faces. ``fallback`` is advertised in word/fontTable.xml
     # (w:altName) so readers without the Persian face substitute it gracefully.
+    # A blank per-role value defers to the named profile (see FONT_PROFILES).
     docx_font_body: str = ""
     docx_font_heading: str = ""
     docx_font_latin: str = ""
     docx_font_fallback: str = "Tahoma"
+    docx_font_profile: str = "persian_modern"
     # Note-generation compression mode: full (default), standard or summary.
     # Only ``summary`` intentionally compresses; ``full`` preserves detail.
     note_mode: str = "full"
+    # Optional second provider pass, used ONLY when deterministic QA shows the
+    # notes lost numbers/terms or were compressed far below a compiled lecture.
+    # Disabled by setting NOTE_REPAIR_ENABLED=false; the normal path is always
+    # a single call.
+    note_repair_enabled: bool = True
     # The playful progress bar; when disabled only real stage updates are sent.
     progress_animation: bool = True
     presentation_enabled: bool = True
@@ -187,12 +223,19 @@ class Settings:
 
     @property
     def docx_fonts(self) -> dict:
-        """Per-role document faces; blanks defer to DOCX_FONT/defaults."""
+        """Per-role document faces.
+
+        Resolution order per role: the explicit ``DOCX_FONT_*`` variable, then
+        the named profile (``DOCX_FONT_PROFILE``), then the legacy single
+        ``DOCX_FONT``. An operator who sets one variable keeps it, so this
+        stays backward compatible with existing deployments.
+        """
+        profile = resolve_font_profile(self.docx_font_profile)
         return {
-            "body": self.docx_font_body or self.docx_font,
-            "heading": self.docx_font_heading or self.docx_font,
-            "latin": self.docx_font_latin or self.docx_font,
-            "fallback": self.docx_font_fallback or self.docx_font,
+            "body": self.docx_font_body or profile["body"] or self.docx_font,
+            "heading": self.docx_font_heading or profile["heading"] or self.docx_font,
+            "latin": self.docx_font_latin or profile["latin"] or self.docx_font,
+            "fallback": self.docx_font_fallback or profile["fallback"] or self.docx_font,
         }
 
     @property
@@ -397,8 +440,11 @@ class Settings:
             docx_font_body=_text("DOCX_FONT_BODY", ""),
             docx_font_heading=_text("DOCX_FONT_HEADING", ""),
             docx_font_latin=_text("DOCX_FONT_LATIN", ""),
-            docx_font_fallback=_text("DOCX_FONT_FALLBACK", "Tahoma"),
+            # Blank defers to the profile's fallback (Tahoma in every profile).
+            docx_font_fallback=_text("DOCX_FONT_FALLBACK", ""),
+            docx_font_profile=_text("DOCX_FONT_PROFILE", "persian_modern"),
             note_mode=resolve_note_mode(_text("NOTE_MODE", "full")),
+            note_repair_enabled=_flag("NOTE_REPAIR_ENABLED", True),
             progress_animation=_flag("PROGRESS_ANIMATION_ENABLED", True),
             presentation_enabled=_flag("PPTX_ENABLED", True),
             presentation_include_slide_text=_flag("PPTX_INCLUDE_SLIDE_TEXT", True),

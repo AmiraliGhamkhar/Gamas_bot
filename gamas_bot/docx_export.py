@@ -27,6 +27,7 @@ from docx.shared import Cm, Pt, RGBColor
 from .bidi import TextRun, split_direction_runs
 from .progress import to_persian_digits
 from .structuring import NoteSection, StructuredNotes
+from .textnorm import normalize_display
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,22 @@ PAGE_HEADER_TEXT = "جزوهٔ درسی — Gamas Bot"
 
 
 def xml_safe(text: str) -> str:
-    """Drop XML-illegal characters; PowerPoint soft line breaks (VT) become spaces."""
-    return XML_INVALID_CHARS.sub("", SOFT_BREAK_CHARS.sub(" ", text))
+    """Prepare text for storage in a .docx part.
+
+    Three deterministic steps, in this order:
+
+    1. PowerPoint soft line breaks (VT/FF) become ordinary spaces — they are
+       legal in a transcript but would break a Word paragraph;
+    2. characters XML 1.0 cannot store are dropped, because python-docx raises
+       ``ValueError`` on them and that used to cost the user the whole document;
+    3. Persian letter/whitespace normalization folds the Arabic KAF/YEH that a
+       second keyboard or an STT engine emits to their Persian equivalents
+       (IANA fa-IR table), so one document is not a mix of two alphabets.
+
+    Normalization is idempotent and never touches ZWNJ, Latin text, formulas,
+    URLs or digit values — see :mod:`gamas_bot.textnorm`.
+    """
+    return normalize_display(XML_INVALID_CHARS.sub("", SOFT_BREAK_CHARS.sub(" ", text)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -315,7 +330,15 @@ def _style_run(
 def _add_directional_text(paragraph, text: str, *, fonts: DocumentFonts, size: float,
                           bold: bool = False, color: RGBColor | None = None,
                           italic: bool = False, rtl_bold: bool | None = None) -> None:
-    """Append ``text`` to ``paragraph`` as one run per direction segment."""
+    """Append ``text`` to ``paragraph`` as one run per direction segment.
+
+    This is the single funnel for every run in a document body, so the text is
+    passed through :func:`xml_safe` here (XML-illegal characters removed,
+    Persian letter variants folded). Doing it here rather than in each caller
+    means a block added by a new code path cannot reintroduce mixed alphabets
+    or characters Word would reject.
+    """
+    text = xml_safe(text)
     runs: list[TextRun] = split_direction_runs(text)
     if not runs:
         return
