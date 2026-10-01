@@ -13,7 +13,7 @@ import aiohttp
 
 from .config import NOTE_MODES, Settings, resolve_note_mode
 from .progress import to_persian_digits
-from .qa import run_note_qa
+from .qa import notes_text, run_note_qa
 
 logger = logging.getLogger(__name__)
 
@@ -104,29 +104,61 @@ _JSON_RULES = (
 #: them* — it is explicitly forbidden from adding anything that is not in the
 #: source, so a repair can raise coverage but never hallucinate.
 REPAIR_REMINDER = (
-    "\n\nهشدار کیفیت: جزوهٔ تولیدشده بخشی از اطلاعات مهم متن ورودی را از دست داده است. "
-    "متن ورودی را دوباره به‌دقت بخوانید و هر عدد، واحد، دوز، درصد، اصطلاح انگلیسی، "
-    "تعریف، مثال، مرحله و فرمولی را که در جزوهٔ قبلی جا افتاده بود عیناً بازگردانید. "
+    "\n\nهشدار کیفیت: بخشی از اطلاعات مهم متن ورودی در جزوه نیامده است. "
+    "کار شما «طولانی‌تر کردن» جزوه نیست؛ کار شما بازگرداندن همان مطالب گم‌شده "
+    "است، در حالی که هر چیزی که درست نوشته شده عیناً حفظ شود. "
+    "متن ورودی را دوباره به‌دقت بخوانید و هر تعریف، توضیح، مثال، مرحله، مقایسه، "
+    "هشدار، استثنا، فرمول، عدد، واحد، دوز، درصد و اصطلاح انگلیسی‌ای را که جا افتاده "
+    "بود با همان معنا و همان اصطلاح بازگردانید. "
     "فقط و فقط اطلاعاتی را بنویسید که در همین متن ورودی آمده است؛ چیزی حدس نزنید و "
     "هیچ مثال، فرمول، مرجع یا نتیجه‌ای از خودتان اضافه نکنید. ترتیب منطقی متن را حفظ کنید. "
     "خروجی همچنان فقط و فقط یک شیء JSON معتبر با همان ساختار قبلی است."
 )
 
 
-def build_repair_prompt(document: str, missing: tuple[str, ...], findings: tuple[str, ...]) -> str:
+def build_repair_prompt(
+    document: str,
+    missing: tuple[str, ...],
+    findings: tuple[str, ...],
+    existing: str = "",
+    missing_units: tuple[str, ...] = (),
+) -> str:
     """A targeted second-pass prompt naming what QA found missing.
 
-    The second call is *not* a re-summarisation: it gets the same source text
-    plus the exact missing signals, and the reminder forbids invention. That
-    keeps the repair a restoration step rather than a new generation pass.
+    The second call is *not* a re-summarisation and is explicitly **not** a
+    request to "make the notes longer". It receives:
+
+    * the same source text, so every restoration is grounded in the lecture;
+    * the existing notes, so correct material is preserved rather than
+      regenerated (a blind rewrite could drop something that was already right);
+    * the exact missing signals and the missing educational units.
+
+    The reminder forbids invention, so a repair can only raise coverage, never
+    fabricate content.
     """
-    detail = "، ".join(missing) if missing else "موارد اعلام‌شده در گزارش کیفیت"
-    return (
-        f"{document}\n\n"
-        f"### گزارش کیفیت خودکار\n"
-        f"این سیگنال‌ها در جزوهٔ قبلی غایب بودند و باید عیناً از متن بالا بازگردانده شوند: {detail}\n"
-        f"اگر موردی در متن بالا وجود ندارد، آن را نسازید و فقط همان‌قدر که در متن هست بنویسید."
+    parts = [document]
+    if existing:
+        parts.append(
+            "### جزوهٔ تولیدشده در تلاش قبلی (درست است؛ آن را حفظ کنید)\n" + existing
+        )
+    if missing:
+        parts.append(
+            "### گزارش کیفیت خودکار — سیگنال‌های غایب\n"
+            "این سیگنال‌ها باید عیناً از متن بالا بازگردانده شوند: "
+            + "، ".join(missing)
+        )
+    if missing_units:
+        parts.append(
+            "### گزارش کیفیت خودکار — مطالب آموزشی غایب\n"
+            "این بخش‌ها از متن بالا در جزوه نیامده‌اند و باید با همان معنا بازگردانده شوند:\n"
+            + "\n".join(f"- {unit}" for unit in missing_units)
+        )
+    if not missing and not missing_units:
+        parts.append("### گزارش کیفیت خودکار\nموارد اعلام‌شده بازگردانده نشدند.")
+    parts.append(
+        "اگر موردی در متن بالا وجود ندارد، آن را نسازید و فقط همان‌قدر که در متن هست بنویسید."
     )
+    return "\n\n".join(parts)
 
 
 def build_system_prompt(mode: str = "full") -> str:
@@ -1096,6 +1128,10 @@ _CHUNK_PREFIX_RESERVE = 200
 #: Default transcript chunk budget fed to the note model.
 TRANSCRIPT_CHUNK_CHARS = 22000
 
+#: Upper bound on how many missing educational units are named in one repair
+#: prompt, so the QA framing stays small relative to the source text.
+MAX_UNITS_IN_REPAIR_PROMPT = 8
+
 
 async def structure_transcript(
     text: str, settings: Settings, mode: str = "full"
@@ -1140,6 +1176,29 @@ async def structure_transcript(
         )
 
 
+def _repair_is_better(before, after) -> tuple[bool, str]:
+    """Did the repaired notes measurably improve on the original?
+
+    Returns ``(accepted, reason)``. The comparison is lexicographic over the
+    measures that reflect information loss, and every branch also requires the
+    other measures not to regress, so a repair cannot trade a real gain in
+    semantic coverage for a real loss of numbers.
+    """
+    if after.semantic_coverage > before.semantic_coverage:
+        if after.coverage < before.coverage or after.missing_numbers > before.missing_numbers:
+            return False, "semantic coverage rose but signal coverage regressed"
+        return True, "semantic coverage restored"
+    if after.semantic_coverage < before.semantic_coverage:
+        return False, "semantic coverage regressed"
+    if after.coverage > before.coverage:
+        return True, "signal coverage restored"
+    if after.coverage < before.coverage:
+        return False, "signal coverage regressed"
+    if after.compression_ratio > before.compression_ratio:
+        return True, "more of the lecture preserved at equal coverage"
+    return False, "no measurable improvement"
+
+
 async def _repair_notes_if_needed(
     merged: StructuredNotes,
     source_chunks: list[str],
@@ -1162,35 +1221,75 @@ async def _repair_notes_if_needed(
     Safety rules, because a repair that invents content is worse than no repair:
 
     * the repaired notes are only accepted when their QA is *not worse* than the
-      original's — measured by coverage, then by compression ratio;
-    * the prompt is the same source text plus the missing signals, with an
-      explicit instruction not to invent anything;
+      original's — measured by semantic coverage first, then signal coverage,
+      then how much of the lecture was preserved;
+    * the prompt is the same source text plus the existing notes and the missing
+      signals/units, with an explicit instruction to restore rather than to
+      lengthen, and never to invent anything;
     * on any provider error the original notes are returned unchanged;
-    * the repair obeys the same per-request character budget as the first pass,
-      so it can never turn a long lecture into one oversized request.
+    * the repair reuses the first pass's documents, so it can never turn a long
+      lecture into one oversized request.
     """
     report = run_note_qa(merged, source_chunks)
     if not settings.note_repair_enabled or not report.needs_repair:
         return merged
 
     missing = tuple(report.missing_numbers) + tuple(report.missing_terms)
+    # The educational units that did not survive. Their *text* is what the model
+    # must restore, so the prompt can point at a deleted explanation instead of
+    # only at a missing number.
+    from .units import extract_all_units, semantic_coverage
+
+    _, missing_units = semantic_coverage(extract_all_units(source_chunks), notes_text(merged))
+    unit_types = sorted({unit.type for unit in missing_units})
     logger.warning(
-        "Note QA triggered the repair pass %s coverage=%.2f ratio=%.3f missing=%s",
+        "Note QA triggered the repair pass %s coverage=%.2f semantic=%.2f ratio=%.3f "
+        "missing_signals=%s missing_units=%s",
         label,
         report.coverage,
+        report.semantic_coverage,
         report.compression_ratio,
         ",".join(missing[:6]) or "-",
+        ",".join(unit_types) or "-",
     )
     try:
-        # The repair re-reads the same source, so it must obey the same chunk
-        # size budget as the first pass; otherwise a long lecture would be sent
-        # as one oversized request and be rejected for exceeding the context.
-        # ``build_repair_prompt`` prepends the QA report, so it is reserved here.
-        budget = max_chars - _CHUNK_PREFIX_RESERVE - len(REPAIR_REMINDER)
-        sources = split_transcript("\n\n".join(source_chunks), max_chars=budget)
+        # The repair re-reads the *same documents* the first pass used, with the
+        # same boundaries. Re-joining and re-splitting them would be actively
+        # harmful: a presentation document carries the slide outline as
+        # context, and splitting it can send a repair request with no slide
+        # text at all. The only added cost is the bounded repair framing.
+        framing = len(
+            build_repair_prompt(
+                "", missing, report.findings, notes_text(merged), ()
+            )
+        ) + len(REPAIR_REMINDER)
+        if any(len(document) + framing > max_chars for document in source_chunks):
+            logger.info(
+                "Note repair skipped %s: documents plus repair framing exceed the "
+                "request budget of %s characters",
+                label,
+                max_chars,
+            )
+            return merged
+        sources = list(source_chunks)
+        # The units relevant to one document only, so each repair request points
+        # at what is missing from *that* part of the lecture.
+        all_units = extract_all_units(source_chunks)
+        _, all_missing = semantic_coverage(all_units, notes_text(merged))
+        by_chunk: dict[int, list[str]] = {}
+        for unit in all_missing:
+            by_chunk.setdefault(unit.source_chunk, []).append(unit.text[:200])
         repaired_notes = [
             await _structured_notes_for(
-                build_repair_prompt(source, missing, report.findings),
+                build_repair_prompt(
+                    source,
+                    missing,
+                    report.findings,
+                    existing=notes_text(merged),
+                    missing_units=tuple(
+                        by_chunk.get(index, [])[:MAX_UNITS_IN_REPAIR_PROMPT]
+                    ),
+                ),
                 settings,
                 session,
                 prompt,
@@ -1206,19 +1305,30 @@ async def _repair_notes_if_needed(
         return merged
 
     repaired_report = run_note_qa(repaired, source_chunks)
-    improved = repaired_report.coverage > report.coverage
-    if not improved and repaired_report.coverage == report.coverage:
-        # Equal coverage: prefer the version that preserved more of the lecture.
-        improved = repaired_report.compression_ratio > report.compression_ratio
+    # Quality is compared in the order that reflects what actually matters:
+    # did the repair restore educational *content*? Semantic coverage leads,
+    # then signal coverage, and only when both tie do we prefer the version
+    # that preserved more of the lecture. A repair that improves one measure
+    # while regressing another is rejected, so a blind rewrite can never be
+    # accepted just because it got longer.
+    improved, reason = _repair_is_better(report, repaired_report)
     if not improved:
         logger.warning(
-            "Note repair pass did not improve coverage (%.2f -> %.2f); keeping the original",
+            "Note repair pass rejected (%s); keeping the original "
+            "semantic=%.2f->%.2f coverage=%.2f->%.2f",
+            reason,
+            report.semantic_coverage,
+            repaired_report.semantic_coverage,
             report.coverage,
             repaired_report.coverage,
         )
         return merged
     logger.info(
-        "Note repair pass improved coverage %.2f -> %.2f ratio %.3f -> %.3f",
+        "Note repair pass improved (%s) semantic %.2f -> %.2f coverage %.2f -> %.2f "
+        "ratio %.3f -> %.3f",
+        reason,
+        report.semantic_coverage,
+        repaired_report.semantic_coverage,
         report.coverage,
         repaired_report.coverage,
         report.compression_ratio,

@@ -166,13 +166,26 @@ class QAMetricTests(unittest.TestCase):
         return run_note_qa(notes, [source])
 
     def test_healthy_notes_need_no_repair(self):
+        # A genuinely faithful booklet: it keeps the numbers *and* the
+        # explanation that gives them meaning. Keeping only "500 mg / HbA1c"
+        # while deleting the sentence around them is precisely the loss the
+        # semantic-coverage metric exists to catch, so it must not pass here.
         source = ("جلسه درباره دیابت بود. دوز 500 mg است. HbA1c زیر 7 درصد. " * 40)
         notes = StructuredNotes(
             title="د",
-            sections=(NoteSection(heading="ب", paragraphs=("500 mg و HbA1c و 7%",)),),
+            sections=(
+                NoteSection(
+                    heading="ب",
+                    paragraphs=(
+                        "جلسه دربارهٔ دیابت بود. دوز متفورمین 500 mg است و "
+                        "شاخص HbA1c زیر 7 درصد قرار می‌گیرد.",
+                    ),
+                ),
+            ),
         )
         report = self._report(notes, source)
         self.assertEqual(report.coverage, 1.0)
+        self.assertEqual(report.semantic_coverage, 1.0)
         self.assertFalse(report.needs_repair)
 
     def test_missing_numbers_lower_coverage_and_trigger_repair(self):
@@ -286,13 +299,21 @@ class RepairPassTests(unittest.IsolatedAsyncioTestCase):
         "summary": "s",
         "sections": [{"heading": "م", "paragraphs": ["یک خلاصهٔ کوتاه."]}],
     }
+    # A faithful booklet: it restates every content unit of the source, keeping
+    # the numbers *and* the explanation they belong to. A payload that kept
+    # only the numbers — or that reworded a claim into a vaguer one — would be
+    # (correctly) treated as degraded and would trigger the repair pass, so the
+    # "healthy" fixtures here must be genuinely faithful.
     RICH = {
         "title": "د",
         "summary": "s",
         "sections": [
             {
                 "heading": "د",
-                "paragraphs": ["متفورمین 500 mg. HbA1c زیر 7%. فشار 120/80. نبض 80 bpm."],
+                "paragraphs": [
+                    "در این جلسه دربارهٔ دیابت بود. دوز متفورمین 500 mg است. "
+                    "HbA1c باید زیر 7% باشد. فشار خون 120/80 و نبض 80 bpm است."
+                ],
             }
         ],
     }

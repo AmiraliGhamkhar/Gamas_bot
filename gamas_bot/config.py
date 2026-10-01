@@ -18,16 +18,29 @@ TRUTHY = {"1", "true", "yes", "on"}
 NOTE_MODES = ("full", "standard", "summary")
 
 #: Named font profiles so an operator picks a coherent set with one variable
-#: instead of four. ``persian_modern`` uses Vazirmatn (the common modern
-#: Persian open font); ``traditional`` uses B Nazanin, the long-established
-#: academic Persian face. Individual DOCX_FONT_* variables always win over the
-#: profile, so a profile is only a default. Fonts are referenced by name and
-#: advertised via w:altName for substitution; they are NOT embedded in the file.
+#: instead of four.
+#:
+#: ``body``/``heading`` are the *Persian* faces and are written into the OOXML
+#: complex-script slot (``w:cs``). ``latin`` is a separate face for embedded
+#: English and is written into ``w:ascii``/``w:hAnsi``.
+#:
+#: The two are deliberately different. Vazirmatn does contain Latin glyphs, but
+#: its Latin is a *derived* set merged from Roboto by the font's build script
+#: (rastikerdar/vazirmatn), so using it as both roles makes the English in a
+#: Persian paragraph visually indistinguishable from the Persian and gives no
+#: typographic separation. A dedicated Latin face renders `HbA1c` and
+#: `Type 2 Diabetes` as English, which is the whole point of a mixed-script
+#: document.
+#:
+#: Individual DOCX_FONT_* variables always win over the profile, so a profile is
+#: only a default. Fonts are referenced by name and advertised via w:altName for
+#: substitution; they are NOT embedded in the file.
 FONT_PROFILES = {
     "persian_modern": {
         "body": "Vazirmatn",
         "heading": "Vazirmatn",
-        "latin": "Vazirmatn",
+        # Modern Word default Latin face; pairs well with Vazirmatn's x-height.
+        "latin": "Aptos",
         "fallback": "Tahoma",
     },
     "traditional": {
@@ -36,8 +49,17 @@ FONT_PROFILES = {
         "latin": "Times New Roman",
         "fallback": "Tahoma",
     },
-    # Historic single-font behaviour: every role uses one face.
+    # Single-face behaviour: every role uses one face, so mixed runs are
+    # visually identical. Kept for byte-comparable output with old documents.
     "legacy": {"body": "Tahoma", "heading": "Tahoma", "latin": "Tahoma", "fallback": "Tahoma"},
+    # Latin in a humanist face that ships with most systems; useful where
+    # Aptos (a recent Microsoft face) may not be installed.
+    "persian_modern_alt": {
+        "body": "Vazirmatn",
+        "heading": "Vazirmatn",
+        "latin": "Calibri",
+        "fallback": "Tahoma",
+    },
 }
 
 
