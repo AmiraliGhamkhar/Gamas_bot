@@ -209,6 +209,33 @@ class QAMetricTests(unittest.TestCase):
         self.assertGreater(report.compression_ratio, 0.0)
         self.assertEqual(report.chunk_coverage, 1.0)
 
+    def test_a_chunk_of_only_terms_is_judged_on_its_terms(self):
+        """A chunk carrying no numbers must not be "covered" by its numbers.
+
+        Regression: the check required every number *and* every term to be
+        missing, so a term-only chunk whose terms were all dropped reported
+        ``chunk_coverage == 1.0`` while ``missing_terms`` listed the loss.
+        """
+        source = "در این جلسه درباره Metformin و Glibenclamide و Insulin صحبت می‌کنیم و نحوهٔ تجویز را توضیح می‌دهیم."
+        notes = StructuredNotes(
+            title="د",
+            sections=(NoteSection(heading="ب", paragraphs=("موضوع دیگری مطرح شد.",)),),
+        )
+        report = self._report(notes, source)
+        self.assertIn("Metformin", report.missing_terms)
+        self.assertEqual(report.uncovered_chunks, (1,))
+        self.assertEqual(report.chunk_coverage, 0.0)
+
+    def test_a_chunk_keeping_one_signal_is_still_covered(self):
+        source = "درس درباره Metformin و Glibenclamide و دوز 500 mg است."
+        notes = StructuredNotes(
+            title="د",
+            sections=(NoteSection(heading="ب", paragraphs=("دوز 500 mg",)),),
+        )
+        report = self._report(notes, source)
+        self.assertEqual(report.uncovered_chunks, ())
+        self.assertEqual(report.chunk_coverage, 1.0)
+
     def test_empty_source_defines_coverage_as_complete(self):
         report = run_note_qa(StructuredNotes(title="t"), [""])
         self.assertEqual(report.coverage, 1.0)

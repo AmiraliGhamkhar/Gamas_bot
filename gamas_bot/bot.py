@@ -517,7 +517,8 @@ class StudyBot:
                 if not leftover.is_dir():
                     continue
                 shutil.rmtree(leftover, ignore_errors=True)
-                removed += not leftover.exists()
+                if not leftover.exists():
+                    removed += 1
         if removed:
             logger.info("Removed stale temporary job folders count=%s", removed)
 

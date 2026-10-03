@@ -430,12 +430,14 @@ All media operations run in a dedicated child process,
 
 ## Configuration changes
 
-- Removed: `FFMPEG_BIN`, `FFPROBE_BIN`, `SOFFICE_BIN`, `SOFFICE_TIMEOUT_SECONDS`.
+- Removed: `FFMPEG_BIN`, `FFPROBE_BIN`, `SOFFICE_BIN` (legacy `*_BIN` lines
+  left in an existing `.env` are silently ignored).
 - Added: `MEDIA_TIMEOUT_SECONDS` (default 3600) and
   `PPT_CONVERT_TIMEOUT_SECONDS` (default 600).
-- Backward compatible: `FFMPEG_TIMEOUT_SECONDS` and `SOFFICE_TIMEOUT_SECONDS`
-  are still read as fallbacks, and leftover `*_BIN` lines in existing `.env`
-  files are silently ignored (verified by tests in this review).
+- Backward compatible: the old `FFMPEG_TIMEOUT_SECONDS` and
+  `SOFFICE_TIMEOUT_SECONDS` are still read as *fallbacks* for the two new
+  variables, so an existing `.env` keeps working unchanged (verified by tests
+  in this review). They are deprecated, not removed.
 - Startup now runs `media_worker check` (reports installed `av`/`ppt2pptx`
   versions) instead of probing binaries on `PATH`.
 
@@ -699,3 +701,94 @@ provider, so their gain is asserted through the acceptance gates, not through a
 token-level comparison; a compilation that loses measured content is rejected,
 which bounds the downside but cannot prove a readability improvement without a
 human reviewer (`--human-out`).
+
+---
+
+## Audit — 2026-10-03 (repo-wide consistency review)
+
+Scope: every file in the repository read end to end (21 `gamas_bot/` modules,
+21 test modules, 6 scripts, 4 docs, migrations, deploy unit, workflows), then
+each discrepancy cross-checked against a *measured* run rather than a reading
+of the source. Baseline before any change: 488 tests pass, `ruff check
+--select E9,F` clean, `pip check` clean, `scripts/validate_docx.py` PASSED.
+
+### Bugs fixed
+
+| # | file | defect | fix |
+| --- | --- | --- | --- |
+| B1 | `gamas_bot/qa.py` (`run_note_qa`) | `uncovered_chunks` / `chunk_coverage` contradicted their own contract. The rule was "every number *and* every term missing", but a chunk with **no numbers** satisfies "every number missing" vacuously, so a term-only chunk whose terms were all dropped reported `chunk_coverage == 1.0` while `missing_terms` listed the loss. | A signal the chunk does not carry is vacuously "all absent"; a chunk is uncovered when each signal it *does* carry is missing. |
+| B2 | `gamas_bot/units.py` (`_CUES_WEAK`) | The weak comparison cue was `"اما "` with a trailing space. `_contains` enforces a word boundary *after* the cue, and the character after the space is a letter, so the cue could never match — the branch was dead (measured: `False` for every sample sentence). | Cue is now `"اما"` (plus `"ولی"`), with a comment recording why the padding must not come back. |
+| B3 | `gamas_bot/docx_export.py` (`resolve_fonts`) | The docstring promised the prefixed keys (`body_font`, `latin_font`, …) but only the plain ones were read: `resolve_fonts({"body_font": "X Serif"})` measured `body='Tahoma'`. | `_font_role_value` accepts either spelling; a blank alias no longer shadows a real value. |
+| B4 | `gamas_bot/docx_export.py` (`_enable_bidi`) | `bidi.is_rtl_dominant` exists, is unit-tested, and both module docstrings say it decides the paragraph direction — but every paragraph was forced to `w:bidi`, including formula and URL lines. The helper was dead in production. | The decision now lives in `_add_directional_text` (the single funnel every run passes through): a paragraph with any strong RTL character becomes RTL, a Latin-only line keeps Word's LTR default. A paragraph created empty and filled later (the cover title) still turns RTL. |
+| B5 | `gamas_bot/docx_export.py` (`ALLOWED_BORDER_STYLES`) | `thick` — a valid `ST_Border` line style — was missing from the allow-list, so a configured `thick` frame silently became `single`. | `thick` added; the constant now documents that the whole ECMA-376 line-style set is accepted. |
+| B6 | `gamas_bot/presentations.py` (`prepare_audio`) | The total-duration bound was checked against `sum(durations)` (only clips that were measured) instead of `total_duration` (the complete sum when it is known). | Checked against the best estimate available. |
+| B7 | `gamas_bot/structuring.py` | `TOPIC_BREAK_MIN_FILL` was defined *after* `split_transcript`, which uses it. | Moved above its first use. |
+| B8 | `gamas_bot/structuring.py` | Prompt typo `درصدمقدار` ("percentamount") in two preservation rules. | `درصد،` |
+| B9 | `gamas_bot/bot.py` | `removed += not leftover.exists()` added booleans to an `int`. | Explicit `if not leftover.exists(): removed += 1`. |
+| B10 | `requirements.txt` | `Pillow` is imported directly by `scripts/render_docx_pages.py` but was only an incidental dependency of `python-pptx`. | Declared explicitly. |
+
+### Documentation corrected (no behaviour change)
+
+* **`DOCX_TOC_LEVELS`**: README advertised `1-1 … 1-9`; the validator accepts
+  only `1`, `1-1`, `1-2`, `1-3`. README now lists the real set.
+* **TOC rule**: README said "three or more sections". The real rule is two
+  independent signals — `DOCX_TOC_MIN_SECTIONS` (default 4) **or** 2400+
+  characters of body text (`docx_export.TOC_MIN_BODY_CHARS`).
+* **TOC field**: README quoted `TOC \o "1-2"`; the default is `1-1`.
+* **`DOCX_PAGE_BORDER_STYLE`**: `thinSingle` was listed but is not a valid
+  `ST_Border` value; replaced with `thick` and the real constraint.
+* **Font profiles**: `persian_modern` uses **Aptos** for Latin (not Vazirmatn),
+  and the undocumented `persian_modern_alt` (Vazirmatn + Calibri) is now
+  listed. The example no longer sets `DOCX_FONT_LATIN=Vazirmatn`.
+* **`GMS-XXXXXX`**: the README never said it *is* the submission ID
+  zero-padded to six digits, and the logging section implied they were two
+  different identifiers. Both now state the equivalence (matching
+  `docs/DEPLOY_FA.md`).
+* **Project structure**: 5 modules and 3 scripts were missing from the tree
+  (`bidi`, `textnorm`, `qa`, `units`, `editorial`, `benchmark_notes`,
+  `render_docx_pages`, `validate_docx`), as was `docs/QUALITY_REPORT.md`.
+* **Lint command**: the local `ruff` line omitted `passenger_wsgi.py`, which CI
+  does check.
+* **Video formats**: `WEBM` was missing from the supported-formats table.
+* **Undocumented settings** now in the README: `TELEGRAM_PROXY`,
+  `STT_POLL_INTERVAL_SECONDS`, and the `GEMINI_MODEL` / `GEMINI_API_KEY`
+  legacy fallback.
+* **`config.py`**: the `DOCX_TOC_LEVELS` comment claimed an invalid value falls
+  back; the code raises. Comment corrected (and the README's "none of them can
+  make generation fail" claim qualified).
+* **`docs/AUDIT.md` (2026-09-2x entry)**: listed `SOFFICE_TIMEOUT_SECONDS`
+  under "Removed" and, three lines later, under "Backward compatible". The
+  code honours it as a *fallback* for `PPT_CONVERT_TIMEOUT_SECONDS`; entry
+  corrected.
+
+### Candidates examined and rejected
+
+* `STT_OPENAI_MAX_UPLOAD_BYTES` / `NOTE_API_TIMEOUT_SECONDS` naming — every
+  reference (`.env.example`, README, `config.py`, callers) agrees.
+* `_process_submission`'s `notice` — bound on both the success and the failure
+  path; never unbound.
+* `build_plain_docx`'s heading mapping `#`/`##` → Heading 1 looks like an
+  off-by-one, but `##` *is* the top level the pipeline emits, so promoting it
+  to Heading 1 is what keeps the fallback booklet's TOC non-empty. Only the
+  misleading comment was corrected.
+* `jalali_date` — spot-checked against leap years (1403, 1404) and the
+  1378/1404 decade boundaries; correct.
+* The QA "coverage vs. terms" gap and the `اما ` probe were both confirmed as
+  *independent* gates before B1/B2, and re-confirmed after.
+
+### After
+
+| check | result |
+| --- | --- |
+| `python -m unittest discover -s tests` | **493 pass** (488 + 5 new regression tests) |
+| `ruff check gamas_bot scripts tests passenger_wsgi.py --select E9,F` | clean |
+| `pip check` | clean |
+| `gamas_bot.media_worker check` | `{"av": "18.1.0", "ppt2pptx": "0.4.2"}` |
+| `scripts/validate_docx.py --out … --render` | PASSED, 3 pages rendered, no layout warnings |
+| `scripts/benchmark_notes.py` | signal 1.0, semantic 1.0, ratio 1.007 — unchanged |
+
+New regression tests: chunk coverage judged on the signals a chunk carries
+(`test_fidelity_upgrade.py`), reachable weak cues (`test_semantic_coverage.py`),
+prefixed font keys (`test_note_quality.py`), and paragraph base direction for
+Latin-only vs. Persian paragraphs and for a paragraph filled after creation
+(`test_mixed_script_typography.py`).

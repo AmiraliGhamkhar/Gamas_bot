@@ -533,6 +533,19 @@ class DocxRenderingTests(unittest.TestCase):
         self.assertIn("متن", text)
         self.assertNotIn("حالت تولید", text)
 
+    def test_resolve_fonts_accepts_the_prefixed_spellings(self):
+        """``body_font``/``latin_font`` are the aliases config.py passes in.
+
+        Regression: only the unprefixed keys were read, so the spellings
+        ``resolve_fonts``' own docstring advertised silently fell back to the
+        default face.
+        """
+        fonts = resolve_fonts({"body_font": "X Serif", "latin_font": "Y Sans"})
+        self.assertEqual(fonts.body, "X Serif")
+        self.assertEqual(fonts.latin, "Y Sans")
+        # A blank alias must not shadow a real value.
+        self.assertEqual(resolve_fonts({"body": "Real", "body_font": "  "}).body, "Real")
+
     def test_resolve_fonts_backfills_missing_roles(self):
         fonts = resolve_fonts({"body": "Vazirmatn"})
         self.assertEqual(fonts.body, "Vazirmatn")

@@ -59,7 +59,7 @@ MODE_RULES = {
 _CONTENT_RULES = (
     "\nقواعد حفظ محتوا — مهم‌ترین بخش دستور است:\n"
     "- فقط بر پایهٔ متن داده‌شده بنویسید؛ اطلاعات، فرمول، تعریف یا نتیجهٔ تازه نسازید. اگر بخشی نامفهوم است، آن را حدس نزنید و همان‌قدر که فهمیده‌اید بنویسید.\n"
-    "- هیچ عدد، واحد، درصدمقدار، دوز دارو، مقدار آزمایشگاهی یا علامت اختصاری را حذف یا تغییر ندهید؛ صورت دقیق آن‌ها را عیناً بیاورید.\n"
+    "- هیچ عدد، واحد، درصد، دوز دارو، مقدار آزمایشگاهی یا علامت اختصاری را حذف یا تغییر ندهید؛ صورت دقیق آن‌ها را عیناً بیاورید.\n"
     "- اصطلاح‌های تخصصی و عبارت‌های انگلیسی (نام دارو، دستگاه، مفهوم علمی و مخفف‌ها) را به همان شکل انگلیسی و بدون ترجمهٔ اجباری داخل متن فارسی حفظ کنید؛ ترجمهٔ فارسی رایج را می‌توانید در پرانتز بیاورید.\n"
     "- تعریف‌ها را در آرایهٔ definitions بیاورید (term، term_en اختیاری، definition)؛ مثال‌ها را در examples؛ روند یا دستورالعمل گام‌به‌گام را در steps؛ فرمول‌ها و معادله‌ها را با صورت دقیق‌شان در formulas بنویسید.\n"
     "- توضیح‌های مهم گوینده را به‌جای یک خط کوتاه، پاراگراف کامل بنویسید؛ جزوه باید درس را بدون شنیدن صدا قابل فهم کند.\n"
@@ -278,7 +278,7 @@ def build_presentation_system_prompt(mode: str = "full", *, context_block: str =
         + _SEMANTIC_RULES
         + _PRESENTATION_CONTENT_RULES
         + "\n- فقط بر پایهٔ مطالب داده‌شده بنویسید؛ اطلاعات، فرمول، تعریف یا نتیجهٔ تازه نسازید. اگر بخشی نامفهوم است، آن را حدس نزنید.\n"
-        + "- هیچ عدد، واحد، درصدمقدار، دوز دارو یا علامت اختصاری را حذف یا تغییر ندهید؛ اصطلاح‌های انگلیسی را بدون ترجمهٔ اجباری حفظ کنید.\n"
+        + "- هیچ عدد، واحد، درصد، دوز دارو یا علامت اختصاری را حذف یا تغییر ندهید؛ اصطلاح‌های انگلیسی را بدون ترجمهٔ اجباری حفظ کنید.\n"
         + "- اگر متن ناقص یا تکراری است، مفهوم موجود را مرتب کنید و چیزی به آن نیفزایید.\n"
         + _STYLE_RULES
         + _TRANSITION_RULES
@@ -1028,6 +1028,12 @@ def parse_structured_notes(text: str) -> StructuredNotes:
 # ---------------------------------------------------------------------------
 
 
+#: A chunk must be at least this full before a topic cue may end it early. Below
+#: it the remaining budget is simply too large to waste: an early break there
+#: would produce a short, unbalanced part.
+TOPIC_BREAK_MIN_FILL = 0.6
+
+
 def split_transcript(text: str, max_chars: int = 22000) -> list[str]:
     """Split a transcript into coherent, model-sized chunks.
 
@@ -1086,11 +1092,6 @@ def split_transcript(text: str, max_chars: int = 22000) -> list[str]:
     flush()
     return chunks
 
-
-#: A chunk must be at least this full before a topic cue may end it early. Below
-#: it the remaining budget is simply too large to waste: an early break there
-#: would produce a short, unbalanced part.
-TOPIC_BREAK_MIN_FILL = 0.6
 
 #: Paragraph openings that reliably mark a new topic in the material this
 #: project processes: the slide/heading markers of a presentation outline, and

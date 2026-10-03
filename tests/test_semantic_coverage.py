@@ -61,6 +61,14 @@ class ClassificationTests(unittest.TestCase):
             _classify("در نتیجه تشخیص زودهنگام انجام می‌شود."), "conclusion"
         )
 
+    def test_weak_cues_are_reachable(self):
+        # Regression: the weak comparison cue was written as "اما " with a
+        # trailing space, but ``_contains`` enforces a word boundary after the
+        # cue, so the space made it unmatchable and the branch was dead.
+        for text in ("اما این روش همیشه جواب نمی‌دهد.", "ولی این روش هزینه دارد."):
+            with self.subTest(text=text):
+                self.assertEqual(_classify(text), "comparison")
+
     def test_contains_respects_word_boundaries(self):
         # "گام" is a real step cue, but it occurs only *inside* the compound
         # "زودهنگام", which must not match.
