@@ -344,6 +344,17 @@ script) slot together with `w:szCs`/`w:bCs`, while Latin runs carry `w:ascii`
 `120/80` and `HbA1c` in a Latin face instead of typesetting them as complex
 script. **Fonts are not embedded** — the configured fallback is declared with
 `w:altName` so a reader without the primary face substitutes it gracefully.
+Per-role faces accept both spellings (`DOCX_FONT_BODY`/`DOCX_BODY_FONT`,
+`DOCX_FONT_HEADING`/`DOCX_HEADING_FONT`, `DOCX_FONT_LATIN`/`DOCX_LATIN_FONT`,
+`DOCX_FONT_FALLBACK`/`DOCX_FALLBACK_FONT`); a blank value always means "use the
+profile".
+
+The file is written with `w:updateFields`, so Word builds the table of contents
+and refreshes the page numbers **when the document is opened**. Tables are
+locked to declared widths (`w:tblGrid` + `w:tblLayout type="fixed"` + `w:tblW`),
+the summary and key-point boxes are single continuous panels rather than a stack
+of framed rows, and a section heading that already numbers itself («۱. …»,
+«بخش ۲: …») is never numbered twice.
 
 #### Strict JSON structured output
 
@@ -420,14 +431,18 @@ vector store and no agent framework:
    failure here is non-fatal — the pipeline simply continues without it. A
    single-part lecture never pays for this call.
 2. **Shared context per chunk.** Every chunk prompt receives that outline,
-   the position of the part (“بخش ۲ از ۵”), the terminology to keep and a
+   the position of the part (“بخش ۲ از ۵”), the terminology to keep, the
+   *headings the previous part already wrote* (with the instruction to reuse
+   the exact wording when its first section continues that topic), and a
    short window of the *end of the previous* and the *start of the next*
    chunk, marked explicitly as context that must not be noted again. Chunks
    are never overlapped; the positional prefix and this context block are
    metadata, not duplicated text.
 3. **Additive merge.** `merge_structured_notes` keeps the chunk order and
    joins adjacent sections that carry the same logical heading (a section
-   that a boundary split in two), de-duplicates verbatim paragraphs, bullets,
+   that a boundary split in two — recognised in either position of the
+   continuation marker, «ادامهٔ مقدمه» or «مقدمه (ادامه)»), de-duplicates
+   verbatim paragraphs, bullets,
    definitions, callouts and table rows, unions the summaries and raises the
    second differing table into labelled bullets rather than dropping it. It
    never drops *distinct* content on mere similarity.
@@ -447,10 +462,14 @@ behaviour; single-part lectures behave exactly as before either way.
 
 The same deterministic QA layer also reports *structural* diagnostics —
 repeated section headings, duplicated paragraphs/bullets, empty or very
-short sections, bullet-only sections, a summary that repeats the body —
-through `qa.analyze_structure()`. These are observational: they are logged
-and benchmarked, they never delete content and they never trigger a repair
-(only real information loss does).
+short sections, bullet-only sections, sections with no prose paragraph,
+headings written as sentences, a summary that repeats the body, and adjacent
+sections that describe one split topic — through `qa.analyze_structure()`.
+These are observational: they are logged and benchmarked, they never delete
+content and they never trigger a repair (only real information loss does).
+The same topic test is shared with the merge (`qa.heading_topic_key`,
+`qa.headings_share_a_topic`), so the diagnostic and the merger can never
+disagree about what "one topic" means.
 
 That report is the input to the **optional repair pass**: only when real
 information loss is detected does the bot make one extra, targeted

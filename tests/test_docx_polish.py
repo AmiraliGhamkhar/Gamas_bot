@@ -271,6 +271,15 @@ class DirectionAndResourceTests(DocxTestCase):
             data = self.build(long_notes_json(), design=design)
         self.assertIn("<w:drawing", self.document_xml(data))
 
+    def test_fields_are_refreshed_when_the_document_is_opened(self):
+        """The TOC and the page numbers must be live without pressing F9."""
+        settings_xml = self.part(self.build(long_notes_json()), "word/settings.xml")
+        self.assertIn("updateFields", settings_xml)
+        self.assertIn('w:val="true"', settings_xml)
+        # CT_Settings is a sequence: updateFields must not precede w:zoom.
+        self.assertLess(settings_xml.index("<w:zoom"), settings_xml.index("w:updateFields"))
+        self.assertLess(settings_xml.index("w:updateFields"), settings_xml.index("<w:compat"))
+
     def test_resolve_design_defaults_and_invalid_values(self):
         default = resolve_design()
         self.assertTrue(default.cover_enabled and default.toc_enabled)
@@ -289,6 +298,85 @@ class DirectionAndResourceTests(DocxTestCase):
         self.assertEqual(broken.border_size, 96)
         self.assertEqual(broken.border_space, 0)
         self.assertFalse(broken.cover_enabled)
+
+
+class BookletLayoutTests(DocxTestCase):
+    """Layout details that make the file a designed booklet, not a text dump."""
+
+    def test_section_headings_are_numbered_exactly_once(self):
+        notes = parse_structured_notes(
+            '{"title": "ج", "sections": ['
+            '{"heading": "مقدمه", "paragraphs": ["توضیح مقدمه."]},'
+            '{"heading": "۱. مفاهیم پایه", "paragraphs": ["توضیح مفاهیم."]},'
+            '{"heading": "بخش ۳: نتیجه", "paragraphs": ["توضیح نتیجه."]}]}'
+        )
+        text = docx_text(build_notes_docx(notes, meta=META))
+        self.assertIn("۱. مقدمه", text)
+        self.assertIn("۱. مفاهیم پایه", text)   # the model's own number is kept
+        self.assertNotIn("۲. ۱.", text)
+        self.assertIn("بخش ۳: نتیجه", text)     # «بخش ۳» is not renumbered
+        self.assertNotIn("۳. بخش ۳", text)
+
+    def test_key_point_box_is_one_continuous_panel(self):
+        payload = build_notes_docx(
+            parse_structured_notes(
+                '{"title": "ج", "sections": [{"heading": "ب", "paragraphs": ["توضیح."], '
+                '"key_points": ["نکتهٔ یک", "نکتهٔ دو", "نکتهٔ سه"]}]}'
+            ),
+            meta=META,
+        )
+        root = ET.fromstring(self.document_xml(payload))
+        boxed: list[set[str]] = []
+        for paragraph in root.iter(f"{W}p"):
+            borders = paragraph.find(f"{W}pPr/{W}pBdr")
+            if borders is None:
+                continue
+            text = "".join(node.text or "" for node in paragraph.iter(f"{W}t"))
+            if "نکتهٔ" in text:
+                boxed.append({edge.tag.split("}")[1] for edge in borders})
+        self.assertEqual(len(boxed), 3, "the three key points must be boxed")
+        # One continuous panel: the top edge only on the first line, the bottom
+        # edge only on the last, sides on all three.
+        self.assertEqual([edge for edge in ("top",) if edge in boxed[0]], ["top"])
+        self.assertNotIn("top", boxed[1])
+        self.assertNotIn("top", boxed[2])
+        self.assertIn("bottom", boxed[2])
+        self.assertNotIn("bottom", boxed[0])
+        for edges in boxed:
+            self.assertEqual(edges & {"left", "right"}, {"left", "right"})
+
+    def test_tables_use_a_fixed_layout_with_real_widths(self):
+        payload = self.build(long_notes_json())
+        xml = self.document_xml(payload)
+        self.assertIn('<w:tblLayout w:type="fixed"/>', xml)
+        self.assertNotIn('<w:tblLayout w:type="autofit"/>', xml)
+        # A declared total width and per-column grid widths exist.
+        self.assertIn("<w:tblW ", xml)
+        self.assertIn("<w:gridCol ", xml)
+
+    def test_two_column_tables_give_the_label_less_room_than_the_value(self):
+        from gamas_bot.docx_export import TABLE_CONTENT_WIDTH_CM, _table_column_widths
+
+        label, value = _table_column_widths(2)
+        self.assertLess(label, value)
+        self.assertAlmostEqual(label + value, TABLE_CONTENT_WIDTH_CM, places=2)
+        equal = _table_column_widths(3)
+        self.assertEqual(len(equal), 3)
+        self.assertAlmostEqual(sum(equal), TABLE_CONTENT_WIDTH_CM, places=1)
+
+    def test_definition_terms_are_real_heading_3_paragraphs(self):
+        root = ET.fromstring(self.document_xml(self.build(long_notes_json())))
+        styles = set()
+        for paragraph in root.iter(f"{W}p"):
+            style = paragraph.find(f"{W}pPr/{W}pStyle")
+            if style is not None:
+                styles.add(style.get(f"{W}val", ""))
+        # The hierarchy is applied with real styles, deepest level included.
+        self.assertIn("Heading1", styles)
+        self.assertIn("Heading2", styles)
+        self.assertIn("Heading3", styles)
+        # Never a styled Normal paragraph pretending to be a heading.
+        self.assertNotIn("Normal", {name for name in styles if name.startswith("Heading")})
 
 
 if __name__ == "__main__":

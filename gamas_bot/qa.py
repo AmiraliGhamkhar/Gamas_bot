@@ -55,6 +55,35 @@ MAX_REPORTED_FINDINGS = 8
 MIN_SECTION_CHARS = 120
 #: A section that is only a list is "fragmented prose" at this many bullets.
 MIN_BULLETS_FOR_FRAGMENT = 3
+#: A heading longer than this, or one that ends with sentence punctuation, is
+#: not a heading in the academic sense: it is a sentence that was promoted.
+MAX_HEADING_CHARS = 80
+#: Minimum number of shared content words before two headings can be judged to
+#: describe one topic. Two shared words is the smallest honest signal; below it
+#: ("مقدمه" vs "نتیجه") any match is coincidence.
+MIN_SHARED_TOPIC_WORDS = 2
+
+#: Continuation markers. Lecture notes of a split topic are titled in practice
+#: as «ادامهٔ …» / «(ادامه)» / «… — continued», and a merge that does not
+#: recognise them prints one topic as two sections.
+_CONTINUATION_PREFIX = re.compile(
+    r"^(?:\(?\s*(?:ادامه|دنباله|تکمله|بخش\s+(?:بعد|دوم|۲|2)|part\s*(?:2|ii)|cont(?:inued)?)\s*\)?"
+    r"[\s.:،\-—»]*)+",
+    re.IGNORECASE,
+)
+_CONTINUATION_SUFFIX = re.compile(
+    r"[\s(«\[:،\-—]*(?:ادامه|دنباله|تکمله|بخش\s+بعد|continued|cont\.?|part\s+(?:2|ii))[\s)»\]:،\-—.]*$",
+    re.IGNORECASE,
+)
+
+#: Function words that carry no topical identity inside a heading.
+_HEADING_STOPWORDS = frozenset(
+    {
+        "و", "در", "به", "از", "با", "بر", "برای", "که", "این", "آن", "های",
+        "ها", "یک", "یا", "تا", "را", "هم", "می", "شود", "است", "the", "of",
+        "and", "a", "an", "to", "in", "on", "for", "with", "part", "section",
+    }
+)
 
 #: Thresholds for the optional repair pass and for the "aggressive compression"
 #: finding. The repair pass costs an extra provider call, so it must fire only
@@ -196,6 +225,13 @@ class NoteStructureReport:
     repeated_headings: int = 0
     duplicate_key_points: int = 0
     repeated_summary_sentences: int = 0
+    #: Adjacent sections whose headings describe one topic: the signature of a
+    #: lecture topic that a chunk boundary (or a model) split in two.
+    split_topics: int = 0
+    #: Sections with content but no prose paragraph — everything was bulleted.
+    sections_without_paragraphs: int = 0
+    #: Headings that are sentences rather than labels (too long / punctuated).
+    sentence_headings: int = 0
     findings: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -206,6 +242,103 @@ class NoteStructureReport:
 def _compare_key(value: str) -> str:
     """Whitespace/Persian-variant-insensitive identity for duplicate detection."""
     return re.sub(r"\s+", " ", normalize_for_compare(value)).strip()
+
+
+def heading_topic_key(heading: str) -> str:
+    """Topic identity of a heading, with continuation markers removed.
+
+    «مقدمه», «ادامهٔ مقدمه», «مقدمه (ادامه)» and «مقدمه — continued» are the
+    same topic written four ways. Both the merge (:mod:`gamas_bot.structuring`)
+    and the diagnostics below need exactly one definition of that identity, so
+    it lives here and is imported, never re-implemented.
+    """
+    key = _compare_key(heading)
+    if not key:
+        return ""
+    previous = None
+    while previous != key:
+        previous = key
+        key = _CONTINUATION_PREFIX.sub("", key)
+        key = _CONTINUATION_SUFFIX.sub("", key)
+        key = key.strip(" .:،-—»«()[]")
+    return key
+
+
+def heading_topic_words(heading: str) -> frozenset[str]:
+    """Content words of a heading, for the conservative topic comparison.
+
+    Numbers are *kept*: «صورت اول» and «صورت دوم», or «مرحله ۱» and «مرحله ۲»,
+    are different sections whose only difference is a digit, and dropping the
+    digit would make them look identical.
+    """
+    key = heading_topic_key(heading) or _compare_key(heading)
+    words = re.findall(r"[^\W_]+", key, re.UNICODE)
+    return frozenset(
+        word
+        for word in words
+        if word not in _HEADING_STOPWORDS and (len(word) > 1 or word.isdigit())
+    )
+
+
+def headings_share_a_topic(first: str, second: str, *, minimum: int = MIN_SHARED_TOPIC_WORDS) -> bool:
+    """Do two headings clearly describe one topic?
+
+    Deliberately conservative, because both callers may act on a ``True``:
+
+    * the same topic identity (continuation markers removed) is enough;
+    * identical content-word sets are enough (word order only);
+    * otherwise one heading's words must *contain* the other's and share at
+      least ``minimum`` words — «نرمال‌سازی و صورت سوم» contains «نرمال‌سازی»,
+      while «کلید خارجی» and «ایندکس» share nothing and never match.
+    """
+    key_a = heading_topic_key(first)
+    key_b = heading_topic_key(second)
+    if key_a and key_a == key_b:
+        return True
+    words_a = heading_topic_words(first)
+    words_b = heading_topic_words(second)
+    if not words_a or not words_b:
+        return False
+    if words_a == words_b:
+        return True
+    shared = words_a & words_b
+    if len(shared) < minimum:
+        return False
+    return words_a <= words_b or words_b <= words_a
+
+
+def headings_overlap(first: str, second: str, *, threshold: float = 0.5) -> bool:
+    """A looser topic test, used *only* across a chunk boundary.
+
+    A chunk boundary is the one place where a model provably splits a single
+    topic: its last section and the next part's first section are almost never
+    two different subjects. The threshold is a Jaccard ratio over content
+    words, still requiring two shared words, so a boundary can merge a split
+    topic but never two unrelated ones («کلید و رابطه» vs «ایندکس» is 0.0).
+    """
+    words_a = heading_topic_words(first)
+    words_b = heading_topic_words(second)
+    if not words_a or not words_b:
+        return False
+    shared = words_a & words_b
+    if len(shared) < MIN_SHARED_TOPIC_WORDS:
+        return False
+    union = words_a | words_b
+    return len(shared) / len(union) >= threshold
+
+
+def _heading_looks_like_a_sentence(heading: str) -> bool:
+    """A heading is a label; a full sentence with a terminator is not."""
+    text = _compare_key(heading)
+    if not text:
+        return False
+    if len(text) > MAX_HEADING_CHARS:
+        return True
+    return text.rstrip().endswith((".", "؟", "?", "!", "…"))
+
+
+def _section_paragraphs(section) -> int:
+    return len(getattr(section, "paragraphs", ()) or ())
 
 
 def _sections_of(notes) -> list:
@@ -245,11 +378,15 @@ def analyze_structure(notes) -> NoteStructureReport:
     duplicate_bullets = 0
     repeated_headings = 0
     duplicate_key_points = 0
+    split_topics = 0
+    sections_without_paragraphs = 0
+    sentence_headings = 0
 
     seen_headings: set[str] = set()
     seen_paragraphs: set[str] = set()
     seen_bullets: set[str] = set()
     seen_points: set[str] = set()
+    previous_heading = ""
 
     for section in sections:
         if not section.has_content:
@@ -268,11 +405,24 @@ def analyze_structure(notes) -> NoteStructureReport:
         )
         if not section.paragraphs and not prose_blocks and len(section.bullets) >= MIN_BULLETS_FOR_FRAGMENT:
             bullet_only += 1
+        if not _section_paragraphs(section):
+            sections_without_paragraphs += 1
+        if _heading_looks_like_a_sentence(section.heading):
+            sentence_headings += 1
         heading_key = _compare_key(section.heading)
         if heading_key:
             if heading_key in seen_headings:
                 repeated_headings += 1
             seen_headings.add(heading_key)
+        # A split topic is measured on the *topic identity*, so an exact repeat
+        # is not double-counted: the heading was already reported as repeated.
+        if (
+            previous_heading
+            and headings_share_a_topic(previous_heading, section.heading)
+            and _compare_key(previous_heading) != _compare_key(section.heading)
+        ):
+            split_topics += 1
+        previous_heading = section.heading
         for paragraph in section.paragraphs:
             key = _compare_key(paragraph)
             if key in seen_paragraphs:
@@ -316,6 +466,10 @@ def analyze_structure(notes) -> NoteStructureReport:
     findings: list[str] = []
     if repeated_headings:
         findings.append(f"repeated section headings: {repeated_headings}")
+    if split_topics:
+        findings.append(
+            f"adjacent sections about one split topic: {split_topics}"
+        )
     if duplicate_paragraphs:
         findings.append(f"duplicate paragraphs: {duplicate_paragraphs}")
     if duplicate_bullets:
@@ -326,8 +480,14 @@ def analyze_structure(notes) -> NoteStructureReport:
         findings.append(f"empty sections: {empty_sections}")
     if short_sections:
         findings.append(f"very short sections: {short_sections}")
+    if sections_without_paragraphs:
+        findings.append(
+            f"sections without a prose paragraph: {sections_without_paragraphs}"
+        )
     if bullet_only:
         findings.append(f"fragmented sections (bullet-only): {bullet_only}")
+    if sentence_headings:
+        findings.append(f"headings written as sentences: {sentence_headings}")
     if repeated_summary:
         findings.append(
             f"summary sentences repeated from the body: {repeated_summary}"
@@ -343,6 +503,9 @@ def analyze_structure(notes) -> NoteStructureReport:
         repeated_headings=repeated_headings,
         duplicate_key_points=duplicate_key_points,
         repeated_summary_sentences=repeated_summary,
+        split_topics=split_topics,
+        sections_without_paragraphs=sections_without_paragraphs,
+        sentence_headings=sentence_headings,
         findings=tuple(findings),
     )
 

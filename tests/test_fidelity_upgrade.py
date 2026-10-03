@@ -285,6 +285,40 @@ class FontProfileTests(unittest.TestCase):
         for name, profile in FONT_PROFILES.items():
             self.assertTrue(profile["fallback"], name)
 
+    def test_both_font_role_spellings_are_accepted(self):
+        """``DOCX_FONT_BODY`` and ``DOCX_BODY_FONT`` name the same setting."""
+        from unittest.mock import patch
+
+        from gamas_bot.config import Settings
+
+        base = dict(
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_API_ID="1",
+            TELEGRAM_API_HASH="h",
+            # Clear any ambient value so the test is deterministic.
+            DOCX_FONT_BODY="",
+            DOCX_FONT_HEADING="",
+            DOCX_FONT_LATIN="",
+            DOCX_FONT_FALLBACK="",
+        )
+        with patch.dict(
+            "os.environ",
+            {**base, "DOCX_BODY_FONT": "AliasBody", "DOCX_HEADING_FONT": "AliasHead"},
+            clear=False,
+        ):
+            fonts = Settings.from_env().docx_fonts
+        self.assertEqual(fonts["body"], "AliasBody")
+        self.assertEqual(fonts["heading"], "AliasHead")
+        self.assertEqual(fonts["latin"], "Aptos")  # profile default, untouched
+
+        with patch.dict(
+            "os.environ",
+            {**base, "DOCX_BODY_FONT": "AliasBody", "DOCX_FONT_BODY": "Canonical"},
+            clear=False,
+        ):
+            fonts = Settings.from_env().docx_fonts
+        self.assertEqual(fonts["body"], "Canonical")
+
 
 class RepairPassTests(unittest.IsolatedAsyncioTestCase):
     """The repair is a targeted restoration, never a second summarisation."""

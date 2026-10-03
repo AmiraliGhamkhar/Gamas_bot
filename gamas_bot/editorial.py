@@ -191,6 +191,7 @@ def build_context_block(
     total: int,
     previous_tail: str = "",
     next_head: str = "",
+    previous_headings: tuple[str, ...] = (),
 ) -> str:
     """The global-context block injected into one chunk's system prompt.
 
@@ -198,6 +199,13 @@ def build_context_block(
     and how the neighbours end and begin, without asking it to note any of that
     text again. The wording says so explicitly, so the same sentence cannot be
     summarized twice.
+
+    ``previous_headings`` are the *already written* section headings of the
+    part before this one. They are the cheapest possible defence against a
+    topic being printed twice: the model is told the exact wording in use and
+    asked to reuse it when its first section continues that topic. The merge
+    recognises the same situation deterministically, so this only makes the
+    common case produce the right heading in the first place.
     """
     lines: list[str] = [
         "### زمینهٔ کلی درس (فقط برای هماهنگی — این متن را دوباره جزوه نکنید)",
@@ -215,6 +223,14 @@ def build_context_block(
     lines.append(
         f"جایگاه این بخش: بخش {_persian_number(index)} از {_persian_number(total)} درس."
     )
+    if previous_headings:
+        listed = "، ".join(f"«{heading}»" for heading in previous_headings)
+        lines.append(f"عنوان‌های بخش پیشین که همین حالا نوشته شده‌اند: {listed}")
+        lines.append(
+            "اگر موضوع این بخش ادامهٔ همان موضوع است، عیناً همان عنوان را برای بخش خود "
+            "به کار ببرید (کلمهٔ «ادامه» یا عنوان تازه اضافه نکنید) تا در جزوهٔ نهایی یک "
+            "بخش یکپارچه شود؛ فقط اگر موضوع واقعاً تازه است عنوان تازه بسازید."
+        )
     if previous_tail:
         lines.append("چند جملهٔ پایانی بخش پیشین (فقط برای پیوند): … " + previous_tail.strip())
     if next_head:
@@ -222,7 +238,13 @@ def build_context_block(
     return "\n".join(lines)
 
 
-def context_block_for(context: LectureContext, documents: list[str], index: int) -> str:
+def context_block_for(
+    context: LectureContext,
+    documents: list[str],
+    index: int,
+    *,
+    previous_headings: tuple[str, ...] = (),
+) -> str:
     """Convenience wrapper: the context block for part ``index`` (1-based).
 
     The neighbour windows are read from the neighbouring parts themselves, so
@@ -240,6 +262,7 @@ def context_block_for(context: LectureContext, documents: list[str], index: int)
         total=len(documents),
         previous_tail=previous_tail,
         next_head=next_head,
+        previous_headings=previous_headings,
     )
 
 
@@ -257,6 +280,9 @@ CHUNKED_CONTENT_RULES = (
     "- شما فقط همین بخش را می‌نویسید؛ بخش‌های دیگر را ویرایشگران دیگر می‌نویسند. "
     "فهرست موضوع‌های بالا نقشهٔ راه است، نه متنی که باید بازنویسی شود.\n"
     "- مقدمه، معرفی و جمع‌بندی کل درس را دوباره ننویسید؛ مستقیم سر موضوع همین بخش بروید.\n"
+    "- اگر این بخش وسط یک موضوعِ نیمه‌تمام شروع می‌شود (متن با ادامهٔ توضیح قبلی آغاز شده)، "
+    "اولین بخش خود را با عیناً همان عنوان بخش پیشین بنویسید — نه عنوان تازه و نه عنوان با "
+    "کلمهٔ «ادامه» — چون جزوهٔ نهایی این دو را یک بخش می‌داند.\n"
     "- کلیدهای «summary» و «key_points» و «glossary» سطح کل درس را فقط زمانی پر کنید که درس تک‌بخشی است؛ "
     "در درس چندبخشی، نکته‌های کلیدی را در «key_points» همان بخش بگذارید و بقیه را خالی بگذارید.\n"
     "- اگر همین بخش موضوع تازه‌ای را شروع می‌کند، عنوان بخش را از «موضوع‌های درس» بردارید تا با بقیهٔ جزوه یکی باشد.\n"
@@ -273,8 +299,12 @@ COMPILE_SYSTEM_PROMPT = (
     "خروجی شما یک جزوهٔ واحد و روان است، نه خلاصه‌ای از جزوه.\n\n"
     "کار شما:\n"
     "- بخش‌هایی که به یک موضوع واحد تعلق دارند را در یک بخش منسجم ادغام کنید؛ ترتیب منطقی متن را نگه دارید.\n"
+    "- عنوان بخش‌ها را از «موضوع‌های درس» بردارید و برای هر موضوع، دقیقاً یک بخش بسازید: اگر محتوای یک "
+    "موضوع زیر دو عنوان متفاوت پخش شده، آن‌ها را زیر عنوان همان موضوع جمع کنید. عنوان تازه‌ای که در "
+    "«موضوع‌های درس» نیست، فقط برای موضوعی به کار ببرید که واقعاً در جزوه هست و در فهرست نیامده است.\n"
     "- تکرارهای عینی و تیترهای تکراری را یک‌بار بنویسید، ولی هیچ توضیح، تعریف، مثال، مرحله، مقایسه، هشدار، "
-    "استثنا، فرمول، عدد، واحد، تاریخ یا اصطلاح تازه‌ای را به‌خاطر کوتاه‌شدن حذف نکنید.\n"
+    "استثنا، فرمول، عدد، واحد، تاریخ یا اصطلاح تازه‌ای را به‌خاطر کوتاه‌شدن حذف نکنید. دو جمله که یک "
+    "مفهوم را با کلمات متفاوت می‌گویند، تکرار عینی نیستند و هر دو می‌مانند؛ فقط تکرار لفظ‌به‌لفظ را یکی کنید.\n"
     "- گذارهای طبیعی را فقط بر پایهٔ روابطی که در متن هست بازسازی کنید (زیرا، بنابراین، در مقابل، برای نمونه، "
     "نخست/سپس/در پایان). ادعای تازه نسازید.\n"
     "- به‌جای جمله‌های بریده‌بریده و فهرست‌های بی‌جا، پاراگراف‌های کامل و روان بنویسید؛ فهرست را فقط برای "
@@ -377,8 +407,12 @@ def build_compile_document(context: LectureContext, notes: StructuredNotes) -> s
     parts.append(
         "### دستور\n"
         "این بخش‌ها را به یک جزوهٔ واحد و روان تبدیل کنید. هیچ مطلبی را حذف نکنید؛ "
-        "فقط تکرارها را یک‌بار بنویسید، بخش‌های هم‌موضوع را ادغام کنید، گذارها را درست کنید و "
-        "یکدستی اصطلاح‌ها را برقرار کنید. خروجی فقط JSON با همان ساختار است."
+        "فقط تکرارهای لفظ‌به‌لفظ را یک‌بار بنویسید، بخش‌های هم‌موضوع را ادغام کنید، گذارها را درست کنید و "
+        "یکدستی اصطلاح‌ها را برقرار کنید.\n"
+        "- ترتیب موضوع‌های درس را نگه دارید؛ هر موضوع یک بار و در جای خودش بیاید.\n"
+        "- اگر جمله‌ای از بخش‌ها بریده یا ناقص است، آن را با همان اطلاعاتِ همین جزوه کامل و روان کنید؛ "
+        "هیچ اطلاع تازه‌ای از خودتان اضافه نکنید.\n"
+        "- خروجی فقط JSON با همان ساختار است و «sections» هرگز خالی نمی‌شود."
     )
     return "\n\n".join(parts)
 

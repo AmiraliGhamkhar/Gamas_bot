@@ -13,7 +13,7 @@ import aiohttp
 
 from .config import NOTE_MODES, Settings, resolve_note_mode
 from .progress import to_persian_digits
-from .qa import notes_text, run_note_qa
+from .qa import heading_topic_key, headings_overlap, headings_share_a_topic, notes_text, run_note_qa
 from .textnorm import normalize_for_compare
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ MAX_TEXT_CHARS = 20000
 #: is the only intentionally concise mode.
 MODE_RULES = {
     "full": (
-        "- حالت خروجی: FULL. شما «مترجم جزوه‌نویس» هستید، نه خلاصه‌ساز. مطلبی را که گوینده برای یادگیری لازم می‌داند حذف نکنید.\n"
+        "- حالت خروجی: FULL. شما «گردآورندهٔ جزوهٔ درس» هستید، نه خلاصه‌ساز. مطلبی را که گوینده برای یادگیری لازم می‌داند حذف نکنید.\n"
         "- هر تعریف، توضیح، دلیل، مکانیزم، مثال، روند گام‌به‌گام و مقایسه را کامل بیاورید؛ جزوه باید جایگزین قابل‌اتکای حضار در کلاس باشد.\n"
         "- تکرارهایی که برای تأکید یا روشن‌شدن موضوع به‌کار رفته‌اند را نگه دارید؛ فقط تکرارهای سرهم و عین‌هم را یک بار بنویسید.\n"
         "- توضیح‌های مفصل گوینده را در همان بخشِ موضوعی، چند پاراگراف کامل بنویسید؛ یک توضیح چندجمله‌ای را به یک خط خلاصه فشرده نکنید.\n"
@@ -69,15 +69,35 @@ _CONTENT_RULES = (
     "- فقط حذف‌های مجاز: پرگویی بی‌محتوا، اصطلاح‌های گفتاری تصادفی، نویزِ پیاده‌سازی صدا و تکرار عین‌هم. هیچ توضیح آموزشی را به‌خاطر کوتاهی حذف نکنید.\n"
 )
 
+#: The semantic contract: *what* must survive. The enumerated list is the
+#: definition of an "educational unit"; the allowed/forbidden lists make the
+#: deletion policy unambiguous, so a model cannot read "compile" as "shorten".
+_SEMANTIC_RULES = (
+    "\nقرارداد معنایی — چه چیزی باید در جزوه حاضر باشد:\n"
+    "- شما ویرایشگر جزوه هستید، نه خلاصه‌ساز: هر واحد آموزشی که در متن منبع آمده باید در جزوه هم بیاید. "
+    "واحد آموزشی یعنی: تعریف، توضیح، مکانیزم و چرایی، مثال، مثال نقض، روند گام‌به‌گام، مقایسه، "
+    "هشدار، استثنا، فرمول، عدد و اندازه‌گیری، تاریخ، نام‌های خاص، اصطلاح انگلیسی، مخفف، و نتیجه‌ای "
+    "که گوینده صریحاً بیان کرده است.\n"
+    "- فقط این چهار چیز را می‌توانید حذف کنید: پرگویی و مکث، گفت‌وگوی حاشیه‌ای بی‌محتوا، نویزِ آشکار "
+    "پیاده‌سازی صدا، و تکرار عیناً لفظ‌به‌لفظ.\n"
+    "- این‌ها را هرگز حذف نکنید: توضیح آموزشی، مثال، زمینه‌ای که گفته برای فهم آن لازم است، جزئیات "
+    "عددی، اصطلاح تخصصی؛ و هرگز یک توضیح چندجمله‌ای را فقط برای کوتاه‌شدن جزوه با یک جملهٔ کوتاه "
+    "جایگزین نکنید.\n"
+    "- اگر نکته‌ای را با کلمات خودتان می‌نویسید، باید دقیقاً همان معنا و همان روابط متن اصلی باشد؛ "
+    "هیچ ادعا، آمار، مرجع یا توصیهٔ تازه‌ای اضافه نکنید.\n"
+)
+
 #: How the compiled lecture must *read*. The rules are the difference between
 #: a pile of summarized sentences and a handout a professor would hand out.
 _STYLE_RULES = (
     "\nقواعد نگارش (لحن جزوهٔ یک استاد):\n"
-    "- مفهوم را معرفی کنید، بعد توضیح دهید، بعد مثال/مرحله بیاورید و در پایان — فقط اگر گوینده گفته — "
+    "- مفهوم را معرفی کنید، اگر گوینده دلیل یا ضرورتش را گفته همان را توضیح دهید، بعد مکانیزم و "
+    "جزئیات را بیاورید، بعد پیوند آن را با مفهوم پیشین نشان دهید و در پایان — فقط اگر گوینده گفته — "
     "یک نتیجهٔ کوتاه بنویسید.\n"
+    "- هر بخش باید در همان جملهٔ اول بگوید موضوعش چیست و چگونه به مطلب قبلی وصل می‌شود؛ شروع بخش‌ها "
+    "را قالبی و یکسان تکرار نکنید.\n"
     "- توضیح‌ها را در پاراگراف کامل و روان بنویسید؛ هر جمله را به یک بولت تبدیل نکنید. "
     "بولت را فقط برای فهرست‌های واقعی (اقلام هم‌رده، مراحل، ویژگی‌ها) به کار ببرید.\n"
-    "- هر بخش را با جمله‌ای شروع کنید که موضوع همان بخش است؛ از شروع‌های قالبی و یکسان در همهٔ بخش‌ها پرهیز کنید.\n"
     "- عبارت‌های کلیشه‌ای مثل «نکتهٔ مهم»، «در ادامه»، «همان‌طور که گفته شد» را بی‌دلیل تکرار نکنید؛ "
     "فقط وقتی خواندن را روان‌تر می‌کنند به کار ببرید.\n"
     "- جزئیات را ناگهانی و بی‌مقدمه نیاورید؛ اگر گوینده اول دلیل یا زمینه را گفته، همان ترتیب را حفظ کنید.\n"
@@ -91,8 +111,11 @@ _STYLE_RULES = (
 #: and temporal links the lecturer actually made.
 _TRANSITION_RULES = (
     "\nقواعد پیوند و انسجام:\n"
-    "- روابط متن را حفظ کنید: علت و معلول (چون، زیرا، بنابراین)، تضاد (اما، در مقابل)، "
-    "مثال (برای نمونه)، ترتیب زمانی (اول، سپس، در پایان).\n"
+    "- روابط متن را با همان کلمات ربط منبع حفظ کنید: علت و معلول (چون، زیرا، بنابراین، در نتیجه)، "
+    "تضاد (اما، در مقابل، برخلاف)، مثال (برای نمونه، برای مثال)، ترتیب زمانی (نخست، اول، سپس، "
+    "در پایان).\n"
+    "- اگر دو مفهوم پشت‌سرهم به یک موضوع واحد تعلق دارند، آن‌ها را در یک بخش با یک گذر طبیعی بنویسید؛ "
+    "اگر گوینده به موضوع تازه‌ای رفته، بخش تازه بسازید و دو موضوع بی‌ربط را در یک بخش قاطی نکنید.\n"
     "- ترتیب موضوع‌ها را جابه‌جا نکنید و از خودتان گذار تازه نسازید.\n"
     "- اگر موضوعی ادامهٔ موضوع قبلی است، پیوند را با یک جملهٔ کوتاه نشان دهید؛ اگر موضوع تازه است، "
     "بخش تازه بسازید و دو موضوع را در یک بخش قاطی نکنید.\n"
@@ -206,12 +229,13 @@ def build_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
     """
     mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
     prompt = (
-        "شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما متن پیاده‌سازی‌شدهٔ خام یک کلاس درسی است "
-        "و خروجی شما یک جزوهٔ ساختارمند و کامل فارسی است؛ رفتار شما باید مانند «مترجم جزوه‌نویس" 
-        "» باشد که محتوای درس را منظم و کامل نگه می‌دارد، نه خلاصه‌سازی که حذف می‌کند.\n\n"
+        "شما دستیار آموزشی فارسی «گاماس» هستید و نقش شما «گردآورندهٔ جزوهٔ درس» است، نه خلاصه‌ساز. "
+        "ورودی شما متن پیاده‌سازی‌شدهٔ خام یک کلاس درسی است و خروجی شما باید یک جزوهٔ ساختارمند، کامل و "
+        "روان فارسی باشد که دانشجو بتواند جای شنیدن صدا، آن را بخواند و درس را بفهمد.\n\n"
         + _JSON_RULES
         + "\n\nقواعد محتوا:\n"
         + mode_rule
+        + _SEMANTIC_RULES
         + _CONTENT_RULES
         + _STYLE_RULES
         + _TRANSITION_RULES
@@ -246,11 +270,12 @@ def build_presentation_system_prompt(mode: str = "full", *, context_block: str =
     prompt = (
         "شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما محتوای یک فایل ارائهٔ درسی (PowerPoint) است — "
         "شامل متن اسلایدها، یادداشت‌های گوینده و متن پیاده‌سازی‌شدهٔ صدای ضبط‌شدهٔ همان ارائه — و خروجی شما "
-        "یک جزوهٔ ساختارمند و کامل فارسی است؛ رفتار شما باید مانند «مترجم جزوه‌نویس» باشد که محتوای درس را "
-        "منظم و کامل نگه می‌دارد، نه خلاصه‌سازی که حذف می‌کند.\n"
+        "یک جزوهٔ ساختارمند و کامل فارسی است؛ نقش شما «گردآورندهٔ جزوهٔ درس» است که محتوای ارائه را منظم و "
+        "کامل نگه می‌دارد، نه خلاصه‌سازی که حذف می‌کند.\n"
         + _JSON_RULES
         + "\n\nقواعد محتوا:\n"
         + mode_rule
+        + _SEMANTIC_RULES
         + _PRESENTATION_CONTENT_RULES
         + "\n- فقط بر پایهٔ مطالب داده‌شده بنویسید؛ اطلاعات، فرمول، تعریف یا نتیجهٔ تازه نسازید. اگر بخشی نامفهوم است، آن را حدس نزنید.\n"
         + "- هیچ عدد، واحد، درصدمقدار، دوز دارو یا علامت اختصاری را حذف یا تغییر ندهید؛ اصطلاح‌های انگلیسی را بدون ترجمهٔ اجباری حفظ کنید.\n"
@@ -668,13 +693,13 @@ def _dedupe_callouts(callouts: tuple[NoteCallout, ...]) -> tuple[NoteCallout, ..
 def _section_key(heading: str) -> str:
     """Heading identity used to recognise one logical section across chunks.
 
-    A trailing continuation marker ("ادامه"، "(ادامه)") is part of the *same*
-    heading, so two adjacent sections that a model titled that way merge back
-    into one instead of appearing twice in the booklet.
+    A continuation marker before or after the topic ("ادامهٔ مقدمه"،
+    "مقدمه (ادامه)") belongs to the *same* heading, so two adjacent sections a
+    model titled that way merge back into one instead of being printed twice.
+    The rule itself lives in :func:`gamas_bot.qa.heading_topic_key` so the merge
+    and the QA diagnostics can never disagree about what "the same topic" means.
     """
-    key = _compare_key(heading)
-    key = re.sub(r"[\s(\[«]*(?:ادامه|دنباله|بخش بعد|part|continued)[\s)\]»:.:،-]*$", "", key)
-    return key.strip(" .:،-—")
+    return heading_topic_key(heading)
 
 
 def _dedupe_table_rows(rows: list[list[str]]) -> list[list[str]]:
@@ -783,18 +808,29 @@ def _block_keys(section: NoteSection) -> tuple[str, ...]:
     return tuple(key for key in keys if not key.endswith("|"))
 
 
-def _merge_sections(sections: list[NoteSection]) -> tuple[NoteSection, ...]:
+def _merge_sections(
+    sections: list[NoteSection],
+    *,
+    chunk_starts: frozenset[int] = frozenset(),
+) -> tuple[NoteSection, ...]:
     """Merge sections additively, in order, with conservative de-duplication.
 
     * verbatim repeats of a paragraph or bullet (the classic chunk-boundary
       accident) collapse to their first occurrence;
-    * *adjacent* sections whose headings are the same topic merge into one;
+    * *adjacent* sections whose headings are the same topic merge into one —
+      both inside a chunk and, with a slightly looser topic test, across a
+      chunk boundary, where a model provably splits one topic in two;
     * a section whose *every* block was already seen verbatim in an earlier
       section is dropped — it is a restatement of something the booklet
       already says, and keeping it would print the same heading twice with
       duplicate definitions/callouts while its prose had already collapsed;
     * everything else — paraphrases, neighbouring explanations, different
       examples — is preserved exactly as the model wrote it.
+
+    ``chunk_starts`` holds the indices at which a new chunk's sections begin.
+    A section boundary that is *also* a chunk boundary gets the looser topic
+    test, because that is the position where the lecture was cut; two sections
+    in the middle of one chunk must clear the stricter test.
     """
     merged: list[NoteSection] = []
     # Paragraphs and bullets are de-duplicated *document-wide*: the same
@@ -805,7 +841,7 @@ def _merge_sections(sections: list[NoteSection]) -> tuple[NoteSection, ...]:
     # same example can legitimately illustrate two different sections.
     seen_text: set[str] = set()
     seen_blocks: set[str] = set()
-    for section in sections:
+    for position, section in enumerate(sections):
         paragraphs = _dedupe_by_key(section.paragraphs, _compare_key)
         bullets = _dedupe_by_key(section.bullets, _compare_key)
         paragraphs = tuple(
@@ -837,11 +873,31 @@ def _merge_sections(sections: list[NoteSection]) -> tuple[NoteSection, ...]:
             )
             continue
         seen_blocks.update(keys)
-        if merged and _section_key(merged[-1].heading) and _section_key(merged[-1].heading) == _section_key(cleaned.heading):
+        if merged and _same_logical_section(
+            merged[-1], cleaned, across_chunk=position in chunk_starts
+        ):
             merged[-1] = _combine_sections(merged[-1], cleaned)
         else:
             merged.append(cleaned)
     return tuple(merged)
+
+
+def _same_logical_section(
+    first: NoteSection, second: NoteSection, *, across_chunk: bool
+) -> bool:
+    """Do two adjacent sections belong to one logical section of the lecture?
+
+    Conservative by construction: the stricter heading-identity test applies
+    inside a chunk, and only at a chunk boundary — never repeated headings in
+    general — is the looser topic-overlap test allowed. The test decides a
+    *heading structure* question only; both sections' content is preserved
+    either way (see :func:`_combine_sections`).
+    """
+    if not _section_key(first.heading) and not _section_key(second.heading):
+        return False
+    if headings_share_a_topic(first.heading, second.heading):
+        return True
+    return across_chunk and headings_overlap(first.heading, second.heading)
 
 
 def _merge_summaries(notes: list[StructuredNotes], *, limit: int = 1200) -> str:
@@ -883,10 +939,20 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
         raise StructuringError("پاسخ سرویس تولید جزوه خالی بود.")
     if len(notes) == 1:
         return notes[0]
+    # Where each chunk's sections start, so the section merger knows which
+    # adjacency is a chunk boundary (see _same_logical_section).
+    chunk_starts: set[int] = set()
+    cursor = 0
+    for item in notes[:-1]:
+        cursor += len(item.sections)
+        chunk_starts.add(cursor)
     merged = StructuredNotes(
         title=next((item.title for item in notes if item.title), ""),
         summary=_merge_summaries(notes),
-        sections=_merge_sections([section for item in notes for section in item.sections]),
+        sections=_merge_sections(
+            [section for item in notes for section in item.sections],
+            chunk_starts=frozenset(chunk_starts),
+        ),
         key_points=_dedupe_by_key(
             [point for item in notes for point in item.key_points], _compare_key
         ),
@@ -998,7 +1064,19 @@ def split_transcript(text: str, max_chars: int = 22000) -> list[str]:
         pieces = [paragraph]
         if len(paragraph) > max_chars:
             pieces = _split_long_paragraph(paragraph, max_chars)
-        for piece in pieces:
+        for piece_index, piece in enumerate(pieces):
+            # Prefer a *topic* boundary over the character budget: when the
+            # chunk is already mostly full and the next paragraph opens a new
+            # topic (a slide heading, a lecture transition), the chunk ends
+            # here. It is exactly the same text in the same order — only the
+            # cut moves a little earlier, to the nearest meaningful boundary.
+            if (
+                piece_index == 0
+                and current
+                and current_len >= max_chars * TOPIC_BREAK_MIN_FILL
+                and _starts_a_topic(piece)
+            ):
+                flush()
             extra = len(piece) + (2 if current else 0)
             if current and current_len + extra > max_chars:
                 flush()
@@ -1007,6 +1085,31 @@ def split_transcript(text: str, max_chars: int = 22000) -> list[str]:
             current_len += extra
     flush()
     return chunks
+
+
+#: A chunk must be at least this full before a topic cue may end it early. Below
+#: it the remaining budget is simply too large to waste: an early break there
+#: would produce a short, unbalanced part.
+TOPIC_BREAK_MIN_FILL = 0.6
+
+#: Paragraph openings that reliably mark a new topic in the material this
+#: project processes: the slide/heading markers of a presentation outline, and
+#: the transitions a lecturer actually says out loud.
+_TOPIC_START = re.compile(
+    r"^\s*(?:#{1,6}\s+\S"                                   # `### اسلاید ۳ — …`
+    r"|(?:اسلاید|slide)\s*[\d۰-۹]"                          # «اسلاید ۱۲»
+    r"|(?:بخش|فصل|موضوع|مبحث|بحث|قسمت)\s*(?:بعد|جدید|دوم|سوم|چهارم|پنجم)"
+    r"|(?:حالا|اکنون|خب|بسیار خوب)?\s*(?:می‌رسیم|میرسیم|می‌رویم|میرویم|برویم)\s+"
+    r"(?:سراغ|به)\b"
+    r"|(?:نکته|موضوع)\s*(?:بعدی|آخر|پایانی)"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _starts_a_topic(paragraph: str) -> bool:
+    """Does this paragraph open a new topic (a safe early cut point)?"""
+    return bool(_TOPIC_START.match(paragraph))
 
 
 def _sentence_spans(paragraph: str) -> list[tuple[int, int]]:
@@ -1518,13 +1621,34 @@ async def _lecture_context(
     return context
 
 
-def _context_block_for(context, documents: list[str], index: int) -> str:
-    """The global-context block for part ``index`` of ``documents``."""
-    if context is None:
-        return ""
-    from .editorial import context_block_for
+#: How many already-written headings of the previous part are shown to the
+#: next part. One is usually enough (the last section); three tolerates a model
+#: that ended its part with a short closing section.
+MAX_PREVIOUS_HEADINGS = 3
 
-    return context_block_for(context, documents, index)
+
+def _previous_headings(notes: list[StructuredNotes]) -> tuple[str, ...]:
+    """The tail headings of the part that was just written, if any."""
+    if not notes:
+        return ()
+    headings = [section.heading.strip() for section in notes[-1].sections if section.heading.strip()]
+    return tuple(headings[-MAX_PREVIOUS_HEADINGS:])
+
+
+def _context_block_for(
+    context, documents: list[str], index: int, previous_headings: tuple[str, ...] = ()
+) -> str:
+    """The global-context block for part ``index`` of ``documents``."""
+    if context is None and not previous_headings:
+        return ""
+    from .editorial import LectureContext, context_block_for
+
+    return context_block_for(
+        context if context is not None else LectureContext(),
+        documents,
+        index,
+        previous_headings=previous_headings,
+    )
 
 
 async def _compile_final(
@@ -1659,7 +1783,10 @@ async def structure_transcript(
                     session,
                     TRANSCRIPT_PROMPT,
                     system_prompt=build_system_prompt(
-                        note_mode, context_block=_context_block_for(context, chunks, index)
+                        note_mode,
+                        context_block=_context_block_for(
+                            context, chunks, index, _previous_headings(notes)
+                        ),
                     ),
                     label=f"chunk {index}/{len(chunks)}",
                 )
@@ -1916,7 +2043,9 @@ async def structure_presentation(
                     PRESENTATION_PROMPT,
                     system_prompt=build_presentation_system_prompt(
                         note_mode,
-                        context_block=_context_block_for(context, documents, index),
+                        context_block=_context_block_for(
+                            context, documents, index, _previous_headings(notes)
+                        ),
                     ),
                     label=f"presentation chunk {index}/{len(documents)}",
                 )

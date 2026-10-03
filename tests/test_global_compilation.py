@@ -204,6 +204,15 @@ class GlobalContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
         # the compilation was accepted: its summary replaced the merged one
         self.assertEqual(result.summary, "خلاصهٔ ویرایش‌شده")
 
+    async def test_pipeline_hands_the_previous_headings_to_the_next_part(self):
+        """The already-written headings ride along into the next part's prompt."""
+        provider = FakeNoteProvider()
+        await self._run(self._two_part_text(), provider)
+        calls = provider.chunk_calls()
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("عنوان‌های بخش پیشین", calls[0]["system_prompt"])
+        self.assertIn("عنوان‌های بخش پیشین", calls[1]["system_prompt"])
+
     async def test_compilation_that_drops_content_is_rejected(self):
         parts = self._two_part_text()
         provider = FakeNoteProvider(
@@ -228,7 +237,13 @@ class GlobalContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
         result = await self._run(parts, provider)
         self.assertEqual(provider.prompts().count(OUTLINE_PROMPT), 1)
         for call in provider.chunk_calls():
-            self.assertNotIn("زمینهٔ کلی درس", call["system_prompt"])
+            # The topic map is gone (no title, no topic list, no terminology)…
+            self.assertNotIn("عنوان درس:", call["system_prompt"])
+            self.assertNotIn("موضوع‌های درس به ترتیب", call["system_prompt"])
+            self.assertNotIn("اصطلاح‌های کلیدی درس", call["system_prompt"])
+        # …but the *positional* context that needs no model call survives, so
+        # part two still knows which section the previous part ended with.
+        self.assertIn("عنوان‌های بخش پیشین", provider.chunk_calls()[1]["system_prompt"])
         self.assertEqual(len(result.sections[0].paragraphs), 2)
         # the compilation still ran, without the topic map
         self.assertEqual(provider.prompts().count(COMPILE_PROMPT), 1)
@@ -257,7 +272,8 @@ class GlobalContextIntegrationTests(unittest.IsolatedAsyncioTestCase):
         provider = FakeNoteProvider(outline="متأسفم، نمی‌توانم.")
         result = await self._run(self._two_part_text(), provider)
         for call in provider.chunk_calls():
-            self.assertNotIn("زمینهٔ کلی درس", call["system_prompt"])
+            self.assertNotIn("موضوع‌های درس به ترتیب", call["system_prompt"])
+            self.assertNotIn("اصطلاح‌های کلیدی درس", call["system_prompt"])
         self.assertTrue(result.sections)
 
 
@@ -330,6 +346,24 @@ class MergeCoherenceTests(unittest.TestCase):
 
 class PromptAndDocumentTests(unittest.TestCase):
     """The pure parts of the layer: context block, payload, acceptance gate."""
+
+    def test_context_block_carries_the_previous_part_headings(self):
+        """A split topic must be able to reuse the heading already written."""
+        block = build_context_block(
+            LectureContext(title="درس", topics=("موضوع الف", "موضوع ب")),
+            index=2,
+            total=2,
+            previous_headings=("موضوع الف",),
+        )
+        self.assertIn("عنوان‌های بخش پیشین", block)
+        self.assertIn("«موضوع الف»", block)
+        # The rule the model needs: reuse the exact wording, no «ادامه» suffix.
+        self.assertIn("عیناً همان عنوان", block)
+        self.assertIn("ادامه", block)
+
+    def test_context_block_without_previous_headings_stays_quiet(self):
+        block = build_context_block(LectureContext(title="درس"), index=1, total=2)
+        self.assertNotIn("عنوان‌های بخش پیشین", block)
 
     def test_context_block_states_position_and_neighbours(self):
         context = LectureContext(
