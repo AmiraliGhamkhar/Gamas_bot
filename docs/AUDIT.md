@@ -628,3 +628,74 @@ the application nor for the tests — and CI installs none.
   operational/security review and changes described above.
 - `README.md`, `docs/DEPLOY_FA.md`: updated setup, timeout semantics, private
   administration, chunking/fallback behavior, testing and security limitations.
+
+---
+
+# Follow-up — 2026-10-03: global coherence and the booklet document
+
+Second audit round, same repository and the same question ("did anything the
+lecturer said disappear, and is the delivered file a *booklet*?"), but with the
+lens on the two weaknesses the first round left open:
+
+* every chunk was still written as an independent mini-lecture, so a long
+  lecture produced duplicated introductions, drifting terminology and repeated
+  "key points" with no global outline and no editorial pass;
+* and the Word file, while correct and RTL, was a text dump: no cover, no
+  heading hierarchy, a fake "page border" drawn as a bordered empty paragraph,
+  no automatic table of contents, and no way to *look* at the result offline.
+
+## What changed
+
+* `gamas_bot/editorial.py` (new, provider-free): `LectureContext`, outline
+  document/parsing, the per-chunk context block (position + neighbours + rules
+  that keep a chunk from behaving like a whole lecture), the compact note
+  payload, the compile document and the deterministic acceptance gate.
+* `gamas_bot/structuring.py`: `structure_transcript` / `structure_presentation`
+  now run orientation (multi-part only, failure non-fatal) → per-chunk prompt
+  with global context → additive merge → optional source-grounded repair → one
+  controlled editorial compilation, accepted only when QA does not regress.
+  `merge_structured_notes` was rewritten: adjacent same-topic sections join,
+  verbatim paragraphs/bullets collapse document-wide, a section that only
+  restates an earlier one verbatim is dropped, a second differing table becomes
+  labelled bullets, summaries are unioned (never replaced).
+* `gamas_bot/qa.py`: `NoteStructureReport` + `analyze_structure()` — repeated
+  headings, duplicate paragraphs/bullets/key points, empty/very short sections,
+  bullet-only sections, summary sentences repeated from the body. Observational
+  only: it never deletes content and never triggers a repair.
+* `gamas_bot/docx_export.py`: cover page (God line, Gamas mark with typographic
+  fallback, verbatim quotation) in its own section; real section-level
+  `w:pgBorders`; live `PAGE` field footer; running header; real Heading 1/2/3 +
+  Title/Subtitle/Quote/Definition/Example/Note/Warning/Table-text styles;
+  automatic TOC for long documents; white-on-accent table headers; cover-less
+  documents open with a title block and no longer start with a blank page.
+* `gamas_bot/config.py` + `.env.example`: `NOTE_GLOBAL_CONTEXT_ENABLED` and the
+  `DOCX_*` design keys (cover, TOC, border style/colour/width/space, footer
+  brand, optional local logo).
+* `scripts/render_docx_pages.py` (new): offline page renderer (Pillow) used for
+  visual validation, with blank-page / overflow / orphan-heading detection.
+  `scripts/validate_docx.py --render` now falls back to it instead of skipping
+  visual validation, and its order check no longer misreads nested `w:sectPr`.
+* `scripts/benchmark_notes.py`: reports document facts (cover, heading styles,
+  page borders, TOC, PAGE field), a merge-duplication probe and a
+  realistic long-document probe.
+
+## Measured before/after (deterministic, no provider call)
+
+| measure | before | after |
+| --- | --- | --- |
+| tests | 395 pass | **441 pass** |
+| full-mode system prompt | 3 414 chars, no style/transition rules | 5 040 chars (+ rules, still no compression ask) |
+| fixture signal coverage / semantic coverage | 1.0 / 1.0 | 1.0 / 1.0 (no regression) |
+| `merge(reference ×2)` — sections / duplicate blocks | 8 / 7 duplicates (50 %) | 4 / **0 duplicates** |
+| 6-fixture DOCX: cover / page border / PAGE field | 0 / 0 / 6 | **6 / 6 / 6** |
+| long booklet (30 sections): heading styles, TOC | none, none | Heading 1–3 (68 headings), automatic TOC |
+| duplicate rate over the whole reference corpus | not measured (no diagnostics) | 0.0000 (128 blocks) |
+
+## Known limits
+
+The measures above are deterministic and offline. The two *model* passes
+(orientation and compilation) can only be scored with `--live` and a configured
+provider, so their gain is asserted through the acceptance gates, not through a
+token-level comparison; a compilation that loses measured content is rejected,
+which bounds the downside but cannot prove a readability improvement without a
+human reviewer (`--human-out`).

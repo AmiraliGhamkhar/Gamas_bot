@@ -211,6 +211,23 @@ class Settings:
     # Disabled by setting NOTE_REPAIR_ENABLED=false; the normal path is always
     # a single call.
     note_repair_enabled: bool = True
+    # Global-context layer for multi-part lectures: one cheap outline call, a
+    # shared context block in every part, and one controlled editorial
+    # compilation at the end. Single-part lectures always stay one call.
+    # NOTE_GLOBAL_CONTEXT_ENABLED=false restores the chunk-only behaviour.
+    note_global_context_enabled: bool = True
+    # --- Word document design (cover / TOC / page frame / footer brand) ---
+    docx_cover_enabled: bool = True
+    docx_toc_enabled: bool = True
+    docx_page_border_enabled: bool = True
+    docx_page_border_style: str = "single"
+    docx_page_border_color: str = "BFCEE4"
+    docx_page_border_size: int = 8
+    docx_page_border_space: int = 24
+    docx_show_footer_brand: bool = True
+    # Optional local logo. Empty means "use the typographic Gamas mark"; no
+    # image is ever fetched at generation time and a missing file never fails.
+    docx_logo_path: str = ""
     # The playful progress bar; when disabled only real stage updates are sent.
     progress_animation: bool = True
     presentation_enabled: bool = True
@@ -258,6 +275,21 @@ class Settings:
             "heading": self.docx_font_heading or profile["heading"] or self.docx_font,
             "latin": self.docx_font_latin or profile["latin"] or self.docx_font,
             "fallback": self.docx_font_fallback or profile["fallback"] or self.docx_font,
+        }
+
+    @property
+    def docx_design(self) -> dict:
+        """Document-design options (see :func:`gamas_bot.docx_export.resolve_design`)."""
+        return {
+            "cover_enabled": self.docx_cover_enabled,
+            "toc_enabled": self.docx_toc_enabled,
+            "page_border_enabled": self.docx_page_border_enabled,
+            "border_style": self.docx_page_border_style,
+            "border_color": self.docx_page_border_color,
+            "border_size": self.docx_page_border_size,
+            "border_space": self.docx_page_border_space,
+            "footer_brand": self.docx_show_footer_brand,
+            "logo_path": self.docx_logo_path,
         }
 
     @property
@@ -385,6 +417,26 @@ class Settings:
         log_format = _text("LOG_FORMAT", "text").lower()
         if log_format not in {"text", "json"}:
             raise ValueError("LOG_FORMAT فقط می‌تواند text یا json باشد.")
+        docx_border_color = _text("DOCX_PAGE_BORDER_COLOR", "BFCEE4").lstrip("#").upper()
+        if not re.fullmatch(r"[0-9A-F]{6}", docx_border_color):
+            raise ValueError(
+                "DOCX_PAGE_BORDER_COLOR باید یک رنگ هگز شش‌رقمی باشد؛ مثل BFCEE4."
+            )
+        # An unknown style silently falls back to a plain line (see
+        # resolve_design); the numbers below are strict, because a wrong value
+        # would produce an invalid w:pgBorders element.
+        docx_border_style = _text("DOCX_PAGE_BORDER_STYLE", "single")
+        try:
+            docx_border_size = int(_text("DOCX_PAGE_BORDER_WIDTH", "8"))
+            docx_border_space = int(_text("DOCX_PAGE_BORDER_SPACE", "24"))
+        except ValueError as exc:
+            raise ValueError(
+                "DOCX_PAGE_BORDER_WIDTH و DOCX_PAGE_BORDER_SPACE باید عددی باشند."
+            ) from exc
+        if not 2 <= docx_border_size <= 96:
+            raise ValueError("DOCX_PAGE_BORDER_WIDTH باید بین ۲ و ۹۶ باشد (هشتم نقطه).")
+        if not 0 <= docx_border_space <= 31:
+            raise ValueError("DOCX_PAGE_BORDER_SPACE باید بین ۰ و ۳۱ نقطه باشد.")
         log_file_value = os.getenv("LOG_FILE", "").strip()
         proxy_value = os.getenv("TELEGRAM_PROXY", "").strip()
         telegram_proxy = parse_proxy(proxy_value) if proxy_value else None
@@ -467,6 +519,16 @@ class Settings:
             docx_font_profile=_text("DOCX_FONT_PROFILE", "persian_modern"),
             note_mode=resolve_note_mode(_text("NOTE_MODE", "full")),
             note_repair_enabled=_flag("NOTE_REPAIR_ENABLED", True),
+            note_global_context_enabled=_flag("NOTE_GLOBAL_CONTEXT_ENABLED", True),
+            docx_cover_enabled=_flag("DOCX_COVER_ENABLED", True),
+            docx_toc_enabled=_flag("DOCX_TOC_ENABLED", True),
+            docx_page_border_enabled=_flag("DOCX_PAGE_BORDER_ENABLED", True),
+            docx_page_border_style=docx_border_style,
+            docx_page_border_color=docx_border_color,
+            docx_page_border_size=docx_border_size,
+            docx_page_border_space=docx_border_space,
+            docx_show_footer_brand=_flag("DOCX_SHOW_FOOTER_BRAND", True),
+            docx_logo_path=_text("DOCX_LOGO_PATH", ""),
             progress_animation=_flag("PROGRESS_ANIMATION_ENABLED", True),
             presentation_enabled=_flag("PPTX_ENABLED", True),
             presentation_include_slide_text=_flag("PPTX_INCLUDE_SLIDE_TEXT", True),

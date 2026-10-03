@@ -84,9 +84,20 @@ def _load_fixtures() -> list[tuple[str, str]]:
 
 
 def _docx_facts(payload: bytes) -> dict:
-    """Structural facts parsed back out of the produced .docx."""
+    """Structural facts parsed back out of the produced .docx.
+
+    These are the *document* half of the benchmark: a booklet is only finished
+    when it has a cover, a real heading hierarchy, a live page-number field and
+    (for long documents) an automatic table of contents.
+    """
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         xml = archive.read("word/document.xml").decode("utf-8")
+        footers = "".join(
+            archive.read(name).decode("utf-8")
+            for name in archive.namelist()
+            if name.startswith("word/footer")
+        )
+    heading_styles = re.findall(r'w:pStyle w:val="Heading([1-9])"', xml)
     return {
         "paragraphs": len(re.findall(r"<w:p\b.*?</w:p>", xml, re.S)),
         "runs": len(re.findall(r"<w:r>", xml)),
@@ -96,6 +107,105 @@ def _docx_facts(payload: bytes) -> dict:
         "tables": xml.count("<w:tbl>"),
         "rtl_tables": xml.count("bidiVisual"),
         "repeat_headers": xml.count("w:tblHeader"),
+        # --- design facts (cover / styles / frame / TOC / page numbers) ---
+        "paragraph_styles": len(re.findall(r"<w:pStyle ", xml)),
+        "heading_paragraphs": len(heading_styles),
+        "max_heading_level": max((int(level) for level in heading_styles), default=0),
+        "page_borders": xml.count("<w:pgBorders"),
+        "cover": "به نام خدا" in xml,
+        "cover_quote": "دانش اگر در ثریا باشد" in xml,
+        "toc": 'TOC \\o' in xml,
+        "tables_of_contents": xml.count("TOC \\o"),
+        "page_field": "PAGE" in footers,
+        "footer_brand": "Gamas Bot" in footers,
+    }
+
+
+def _structure_facts(notes: StructuredNotes) -> dict:
+    """The deterministic structural diagnostics, as plain JSON-friendly data."""
+    report = qa.analyze_structure(notes)
+    return {
+        "sections": report.total_sections,
+        "duplicate_paragraphs": report.duplicate_paragraphs,
+        "duplicate_bullets": report.duplicate_bullets,
+        "repeated_headings": report.repeated_headings,
+        "empty_sections": report.empty_sections,
+        "short_sections": report.short_sections,
+        "bullet_only_sections": report.bullet_only_sections,
+        "findings": list(report.findings),
+    }
+
+
+def _document_probe(fonts) -> dict:
+    """Render one realistic multi-section booklet and report its design facts.
+
+    The per-fixture documents are single-section (one chunk each), so they can
+    never show a table of contents or a heading hierarchy. This probe merges
+    every reference note into one booklet, exactly as a full lecture would be
+    delivered, and measures the document-level features there.
+    """
+    references = FIXTURES / "references"
+    if not references.is_dir():
+        return {}
+    from gamas_bot.structuring import merge_structured_notes, parse_structured_notes
+
+    notes = []
+    for path in sorted(references.glob("*.json")):
+        try:
+            notes.append(parse_structured_notes(path.read_text(encoding="utf-8")))
+        except Exception:
+            continue
+    if not notes:
+        return {}
+    booklet = merge_structured_notes(notes)
+    payload = build_notes_docx(
+        booklet, meta=DocumentMeta(reference="BENCH-DOC"), fonts=fonts
+    )
+    return {
+        "sections": len(booklet.sections),
+        "docx": _docx_facts(payload),
+        "structure": _structure_facts(booklet),
+    }
+
+
+def _merge_probe() -> dict:
+    """How much of a naive merge is verbatim repetition?
+
+    Every reference note document is merged with *itself* — the worst case a
+    chunk boundary can produce — and the structural diagnostics measure how
+    much repetition survives. A correct merge collapses it; a merge that only
+    concatenates reports the same duplicate rate as the input.
+    """
+    references = FIXTURES / "references"
+    if not references.is_dir():
+        return {}
+    from gamas_bot.structuring import merge_structured_notes, parse_structured_notes
+
+    total_sections = 0
+    total_duplicates = 0
+    total_paragraphs = 0
+    total_merged_sections = 0
+    for path in sorted(references.glob("*.json")):
+        try:
+            notes = parse_structured_notes(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        merged = merge_structured_notes([notes, notes])
+        structure = qa.analyze_structure(merged)
+        total_sections += len(notes.sections) * 2
+        total_merged_sections += len(merged.sections)
+        total_duplicates += structure.duplicate_paragraphs + structure.duplicate_bullets
+        total_paragraphs += sum(
+            len(section.paragraphs) + len(section.bullets) for section in notes.sections
+        ) * 2
+    if not total_paragraphs:
+        return {}
+    return {
+        "input_sections": total_sections,
+        "merged_sections": total_merged_sections,
+        "duplicate_rate": round(total_duplicates / total_paragraphs, 4),
+        "duplicate_blocks": total_duplicates,
+        "blocks": total_paragraphs,
     }
 
 
@@ -161,6 +271,7 @@ def run(mode: str = "full", live: bool = False) -> dict:
             fonts=settings_fonts,
         )
         entry["docx"] = _docx_facts(payload)
+        entry["structure"] = _structure_facts(StructuredNotes(title=name, sections=sections))
 
         # The deterministic ceiling: source scored against itself.
         entry["deterministic"] = _score(source, chunks, source)
@@ -171,6 +282,8 @@ def run(mode: str = "full", live: bool = False) -> dict:
         fixtures_report.append(entry)
 
     report["fixtures"] = fixtures_report
+    report["merge_probe"] = _merge_probe()
+    report["document_probe"] = _document_probe(settings_fonts)
     det = [f["deterministic"] for f in fixtures_report]
     if det:
         report["summary"] = {
@@ -184,7 +297,34 @@ def run(mode: str = "full", live: bool = False) -> dict:
                 sum(d["semantic_coverage"] for d in det) / len(det), 3
             ),
             "fixtures_needing_repair": sum(1 for d in det if d["needs_repair"]),
+            "mean_docx_paragraphs": round(
+                sum(f["docx"]["paragraphs"] for f in fixtures_report)
+                / max(len(fixtures_report), 1),
+                1,
+            ),
+            "documents_with_cover": sum(1 for f in fixtures_report if f["docx"]["cover"]),
+            "documents_with_page_border": sum(
+                1 for f in fixtures_report if f["docx"]["page_borders"]
+            ),
+            "documents_with_page_field": sum(
+                1 for f in fixtures_report if f["docx"]["page_field"]
+            ),
+            "documents_with_toc": sum(1 for f in fixtures_report if f["docx"]["toc"]),
+            "mean_heading_paragraphs": round(
+                sum(f["docx"]["heading_paragraphs"] for f in fixtures_report)
+                / max(len(fixtures_report), 1),
+                1,
+            ),
         }
+    if report["merge_probe"]:
+        report["summary"]["merge_duplicate_rate"] = report["merge_probe"]["duplicate_rate"]
+    probe = report.get("document_probe") or {}
+    if probe:
+        probe_docx = probe["docx"]
+        report["summary"]["long_document_toc"] = probe_docx["toc"]
+        report["summary"]["long_document_heading_levels"] = probe_docx[
+            "max_heading_level"
+        ]
     return report
 
 

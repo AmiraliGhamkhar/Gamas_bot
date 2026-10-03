@@ -421,14 +421,22 @@ class PresentationStructuringTests(unittest.IsolatedAsyncioTestCase):
             new=AsyncMock(return_value=sample_notes_json()),
         ) as chunker:
             result = await structure_presentation(
-                outline, transcript, make_settings(), max_chars=4000
+                outline,
+                transcript,
+                make_settings(note_global_context_enabled=False),
+                max_chars=4000,
             )
         self.assertGreater(chunker.await_count, 1)
         for call in chunker.await_args_list:
             self.assertIn(outline, call.args[0])
             self.assertIn("محتوای ارائه", call.args[3])
-        # Every chunk returned one section; they merge in chunk order.
-        self.assertEqual(len(result.sections), chunker.await_count)
+        # Every chunk returned the same single section; adjacent sections with
+        # one logical heading now join into a single section instead of
+        # stacking once per chunk, and the content itself is kept exactly once.
+        self.assertEqual(len(result.sections), 1)
+        self.assertEqual(result.sections[0].paragraphs, ("متن بخش نخست",))
+        self.assertEqual(result.sections[0].bullets, ("نکتهٔ یک",))
+        self.assertEqual(len(result.sections[0].callouts), 1)
 
     async def test_slide_only_decks_still_produce_a_booklet(self):
         with patch(

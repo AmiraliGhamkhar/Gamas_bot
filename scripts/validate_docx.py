@@ -7,9 +7,12 @@ renderer's job (Word/LibreOffice), not python-docx's. Anything this script
 reports as "ok" is a statement about the file's structure, never about how it
 looks.
 
-A visual check requires an office renderer. If LibreOffice (``soffice``) is
-available the script says so and can render a PDF; if it is not, it says that
-explicitly rather than implying validation happened.
+A visual check uses LibreOffice (``soffice``) when it is installed. When it is
+not, ``--render`` falls back to :mod:`scripts.render_docx_pages`, the offline
+Pillow renderer, which draws every page (cover, page frame, header/footer,
+heading hierarchy, tables, breaks) and reports blank pages, overflow and orphan
+headings. Either way the script never implies that a check happened when it did
+not.
 
 Usage::
 
@@ -117,13 +120,24 @@ def _sample_notes() -> StructuredNotes:
 
 
 def _check_order(xml: str, tag: str, order: tuple[str, ...]) -> list[str]:
-    """Return a list of ordering violations for one property element."""
+    """Return a list of ordering violations for one property element.
+
+    Only *direct* children count: a ``<w:sectPr>`` nested inside a ``<w:pPr>``
+    has its own child order (``w:bidi`` legitimately follows ``w:pgBorders``
+    there), so scanning the raw text and treating every nested tag as a child of
+    the outer element produces false positives. The document is parsed instead.
+    """
+    from lxml import etree
+
     problems: list[str] = []
     rank = {name: index for index, name in enumerate(order)}
-    for match in re.finditer(rf"<w:{tag}>(.*?)</w:{tag}>", xml, re.S):
+    root = etree.fromstring(xml.encode("utf-8"))
+    for element in root.iter(f"{{{W}}}{tag}"):
         seen = -1
-        for child in re.finditer(r"<w:(\w+)[ />]", match.group(1)):
-            name = child.group(1)
+        for child in element:
+            if not isinstance(child.tag, str) or not child.tag.startswith(f"{{{W}}}"):
+                continue
+            name = child.tag.rsplit("}", 1)[1]
             if name not in rank:
                 continue
             if rank[name] < seen:
@@ -202,14 +216,37 @@ def validate(payload: bytes, *, expect_tables: bool = True) -> dict:
 
 
 def _render_status(out_dir: Path, sample: Path) -> str:
-    """Honest reporting about *visual* validation."""
+    """Honest reporting about *visual* validation.
+
+    LibreOffice is used when it exists. Otherwise the offline page renderer
+    (`scripts.render_docx_pages`) draws the real layout with Pillow — cover,
+    page frame, header/footer, heading hierarchy, tables, page breaks — and
+    reports the defects it can detect (blank pages, overflow, orphan headings),
+    so "visual validation" is never silently skipped.
+    """
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
-        return (
-            "NOT PERFORMED - no office renderer (soffice/libreoffice) available. "
-            "Structural checks above say nothing about visual layout, glyph "
-            "shaping, font substitution or pagination."
-        )
+        try:
+            from scripts.render_docx_pages import render
+        except Exception as exc:  # pragma: no cover - environment dependent
+            return (
+                f"NOT PERFORMED - no office renderer and the offline renderer is "
+                f"unavailable ({type(exc).__name__}: {exc})."
+            )
+        pages_dir = out_dir / "pages"
+        pages_dir.mkdir(parents=True, exist_ok=True)
+        facts = render(sample, pages_dir, out_dir / "contact-sheet.png")
+        lines = [
+            "rendered offline with scripts.render_docx_pages "
+            f"({len(facts['pages'])} pages) -> {pages_dir}"
+        ]
+        if facts["warnings"]:
+            lines.append("layout warnings:")
+            lines.extend(f"  ! {warning}" for warning in facts["warnings"])
+        else:
+            lines.append("no layout warnings (no blank page, no overflow, no orphan heading)")
+        lines.append("Inspect the page images by eye; a renderer cannot judge content.")
+        return "\n".join(lines)
     with tempfile.TemporaryDirectory() as work:
         try:
             subprocess.run(
@@ -234,7 +271,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--render",
         action="store_true",
-        help="attempt a real PDF render with LibreOffice, if present",
+        help=(
+            "render the pages for visual inspection: LibreOffice when present, "
+            "otherwise the offline Pillow renderer (scripts/render_docx_pages.py)"
+        ),
     )
     args = parser.parse_args(argv)
 

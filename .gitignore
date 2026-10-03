@@ -21,3 +21,6 @@ stt-benchmark.csv
 *.sqlite3-*
 *.session-*
 .ruff_cache/
+
+# Rendered page images from scripts/render_docx_pages.py (visual inspection only)
+.render/
