@@ -25,6 +25,8 @@ from gamas_bot.docx_export import (
     DocxDesign,
     DocumentMeta,
     build_notes_docx,
+    build_plain_docx,
+    cover_meta_lines,
     resolve_design,
 )
 from gamas_bot.structuring import parse_structured_notes
@@ -40,7 +42,7 @@ META = DocumentMeta(
 
 
 def long_notes_json() -> str:
-    """Four sections, so the automatic TOC (>= 3 sections) is generated."""
+    """Four sections, so the automatic TOC (>= 4 sections) is generated."""
     sections = []
     for index in range(1, 5):
         sections.append(
@@ -118,6 +120,42 @@ class CoverPageTests(DocxTestCase):
         self.assertIn("GMS-000123", text)
         self.assertIn("حالت تولید: کامل", text)
         self.assertIn("۱۴۰۵", text)  # Jalali date on the cover
+
+    def test_cover_metadata_is_split_into_labelled_lines(self):
+        lines = cover_meta_lines(META, mode_label="حالت تولید: کامل")
+        # One fact per line keeps a label next to its value; a single long
+        # «… • … • …» line wraps and strands the tracking reference alone.
+        self.assertEqual(len(lines), 3)
+        self.assertIn("حالت تولید: کامل", lines[0])
+        self.assertIn("منبع:", lines[1])
+        self.assertIn("تاریخ:", lines[1])
+        self.assertIn("کد پیگیری: GMS-000123", lines[2])
+        self.assertIn("موتور تبدیل گفتار: deepgram", lines[2])
+        # every line is short enough to stay on one line of the cover
+        self.assertTrue(all(len(line) < 90 for line in lines), lines)
+        # without a mode label the block is still two lines, never empty
+        self.assertEqual(len(cover_meta_lines(META)), 2)
+
+    def test_cover_quotation_keeps_its_place_with_a_long_title(self):
+        def spacers(notes_json: str) -> int:
+            paragraphs = self.paragraphs(self.build(notes_json))
+            empties = 0
+            for paragraph in paragraphs:
+                text = "".join(node.text or "" for node in paragraph.iter(f"{W}t"))
+                if COVER_QUOTE in text:
+                    return empties
+                if not text.strip():
+                    empties += 1
+            raise AssertionError("the quotation paragraph was not found")
+
+        short_title = long_notes_json()
+        long_title = short_title.replace(
+            "جزوهٔ آزمون", "جزوهٔ آزمون جامع فیزیولوژی و فارماکولوژی بالینی برای دانشجویان"
+        )
+        # A wrapped title takes space away from the flexible gap, so the quote
+        # stays in the same band of the page instead of sliding off the bottom.
+        self.assertLess(spacers(long_title), spacers(short_title))
+        self.assertGreaterEqual(spacers(long_title), 5)
 
 
 class PageBorderTests(DocxTestCase):
@@ -220,9 +258,27 @@ class TocTests(DocxTestCase):
     def test_toc_field_is_generated_for_long_documents(self):
         data = self.build(long_notes_json())
         xml = self.document_xml(data)
-        self.assertIn('TOC \\o "1-2" \\h \\z \\u', xml)
+        # Level 1 by default: the block labels («تعریف‌ها»، «مثال‌ها») are real
+        # Heading 2s that would repeat once per section in a 1-2 TOC and bury
+        # the lecture's own topics.
+        self.assertIn('TOC \\o "1-1" \\h \\z \\u', xml)
         self.assertIn('w:dirty="true"', xml)
         self.assertIn("فهرست مطالب", docx_text(data))
+
+    def test_toc_levels_are_configurable(self):
+        data = self.build(long_notes_json(), design=resolve_design({"toc_levels": "1-2"}))
+        self.assertIn('TOC \\o "1-2"', self.document_xml(data))
+
+    def test_toc_min_sections_is_configurable(self):
+        short = (
+            '{"title": "کوتاه", "sections": [{"heading": "الف", "paragraphs": ["متن"]}, '
+            '{"heading": "ب", "paragraphs": ["متن دو"]}, {"heading": "پ", "paragraphs": ["متن سه"]}]}'
+        )
+        # Three short sections are not a booklet worth a table of contents…
+        self.assertNotIn("TOC", self.document_xml(self.build(short)))
+        # …unless the operator lowers the threshold.
+        data = self.build(short, design=resolve_design({"toc_min_sections": 3}))
+        self.assertIn("TOC \\o", self.document_xml(data))
 
     def test_toc_is_skipped_for_short_documents(self):
         short = (
@@ -235,6 +291,21 @@ class TocTests(DocxTestCase):
         data = self.build(long_notes_json(), design=resolve_design({"toc_enabled": False}))
         self.assertNotIn("TOC \\o", self.document_xml(data))
         self.assertNotIn("فهرست مطالب", docx_text(data))
+
+    def test_raw_text_document_gets_a_toc_only_when_it_has_headings(self):
+        body = "جملهٔ توضیحی دربارهٔ درس. " * 200
+        without_headings = build_plain_docx(
+            "متن خام", body, meta=META, design=resolve_design()
+        )
+        # long but unstructured material would leave an empty TOC page
+        self.assertNotIn("TOC \\o", self.document_xml(without_headings))
+        with_headings = build_plain_docx(
+            "متن خام",
+            "# بخش نخست\n" + body + "\n## بخش دوم\n" + body,
+            meta=META,
+            design=resolve_design(),
+        )
+        self.assertIn('TOC \\o "1-1"', self.document_xml(with_headings))
 
 
 class DirectionAndResourceTests(DocxTestCase):
@@ -298,6 +369,15 @@ class DirectionAndResourceTests(DocxTestCase):
         self.assertEqual(broken.border_size, 96)
         self.assertEqual(broken.border_space, 0)
         self.assertFalse(broken.cover_enabled)
+        # TOC settings are validated too: only real level ranges and a sane
+        # section count are accepted, anything else falls back to the default.
+        self.assertEqual(resolve_design({"toc_levels": "9-9"}).toc_levels, "1-1")
+        self.assertEqual(resolve_design({"toc_levels": "1-2"}).toc_levels, "1-2")
+        # 0/"" are not a threshold, so they fall back to the default; a huge
+        # number is clamped rather than disabling the TOC entirely.
+        self.assertEqual(resolve_design({"toc_min_sections": 0}).toc_min_sections, 4)
+        self.assertEqual(resolve_design({"toc_min_sections": "x"}).toc_min_sections, 4)
+        self.assertEqual(resolve_design({"toc_min_sections": 500}).toc_min_sections, 200)
 
 
 class BookletLayoutTests(DocxTestCase):

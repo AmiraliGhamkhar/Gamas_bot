@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from .structuring import StructuredNotes  # noqa: F401  (typing only)
 
@@ -39,12 +39,28 @@ from .structuring import StructuredNotes  # noqa: F401  (typing only)
 OUTLINE_CHUNK_HEAD_CHARS = 220
 OUTLINE_CHUNK_TAIL_CHARS = 80
 
+#: The smallest per-part slice the orientation digest will use. Below this a
+#: part's opening is too clipped to state its topic, so the digest is allowed to
+#: exceed its budget slightly rather than drop parts of the lecture.
+OUTLINE_CHUNK_MIN_CHARS = 90
+
 #: Hard bound on the orientation document, so one huge lecture cannot turn the
 #: cheapest call into an expensive one.
 OUTLINE_DOCUMENT_MAX_CHARS = 12000
 
-#: Neighbour window handed to a chunk as *context only* (never to be re-noted).
+#: The neighbour window handed to a chunk as *context only*. It is a pair of
+#: short sentences so a boundary sentence can be continued rather than
+#: restarted; it is never long enough to be noted again.
 NEIGHBOUR_CONTEXT_CHARS = 260
+
+#: Relation markers a lecturer uses when a sentence is *connected* to what came
+#: before. A chunk that opens mid-topic almost always starts with one of these,
+#: and a chunk whose last sentence is unfinished has no terminator at all.
+_CONTINUATION_OPENERS = re.compile(
+    r"^\s*(?:و|که|اما|ولی|بنابراین|در\s+نتیجه|همچنین|چون|زیرا|اگر|پس|در\s+ادامه|حال)"
+    r"[\s،,:؛]"
+)
+_TERMINATOR_TAIL = re.compile(r"[.!?؟…][»\)\]”\"']*\s*$")
 
 #: Bounds on what is kept from the orientation answer.
 MAX_OUTLINE_TOPICS = 40
@@ -67,6 +83,62 @@ class LectureContext:
     @property
     def is_empty(self) -> bool:
         return not (self.title or self.topics or self.terminology)
+
+    def topic_for(self, index: int, total: int) -> str:
+        """The topic of part ``index`` (1-based) of ``total``, or ``""``.
+
+        The orientation prompt asks for exactly one topic per part, in the
+        order of the parts, so a list of the right length is a positional map.
+        A list of a different length is a global topic list only — using it
+        positionally would label a part with someone else's subject, so the
+        safe answer there is "no per-part topic".
+        """
+        if total <= 0 or len(self.topics) != total:
+            return ""
+        if 1 <= index <= total:
+            return self.topics[index - 1]
+        return ""
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkContinuity:
+    """Deterministic facts about how one part sits inside the lecture.
+
+    Both flags are derived from the part's own text, so they cost nothing and
+    can never be wrong about the *source* (only about the punctuation the STT
+    engine produced, which is why they are only reported when the part actually
+    contains sentence terminators).
+    """
+
+    starts_mid_topic: bool = False
+    ends_mid_topic: bool = False
+
+    @property
+    def is_clean(self) -> bool:
+        return not (self.starts_mid_topic or self.ends_mid_topic)
+
+
+def chunk_continuity(text: str, *, index: int, total: int) -> ChunkContinuity:
+    """Does this part open/close in the middle of a topic?
+
+    A part opens mid-topic when its first sentence is a continuation fragment
+    ("و …", "که …", "بنابراین …") and closes mid-topic when its last sentence
+    has no terminator — the two situations in which a part must *link* instead
+    of introducing its subject. Both tests are skipped for a part of text with
+    no sentence terminators at all (an unpunctuated STT transcript), where they
+    would fire on every part and the hint would become noise.
+    """
+    stripped = (text or "").strip()
+    if not stripped or not re.search(r"[.!?؟…]", stripped):
+        # Punctuation-free material (common with raw STT output): neither hint
+        # can be distinguished from an ordinary part, so neither is reported.
+        return ChunkContinuity()
+    first_line = stripped.splitlines()[0].strip()
+    starts_mid_topic = bool(index > 1 and first_line and _CONTINUATION_OPENERS.match(first_line))
+    ends_mid_topic = bool(total > 1 and index < total and not _TERMINATOR_TAIL.search(stripped))
+    return ChunkContinuity(
+        starts_mid_topic=starts_mid_topic, ends_mid_topic=ends_mid_topic
+    )
 
 
 #: The orientation answer is deliberately tiny and strictly sourced: it may
@@ -91,24 +163,36 @@ OUTLINE_SYSTEM_PROMPT = (
 def build_outline_document(chunks: list[str], *, max_chars: int = OUTLINE_DOCUMENT_MAX_CHARS) -> str:
     """A compact digest of a whole lecture: the opening of every chunk.
 
-    The digest is deterministic and small (bounded by ``max_chars``), so the
-    orientation call is cheap even for a multi-hour lecture and never needs the
-    full transcript again.
+    Every part must be represented, because the orientation answer is read
+    positionally (one topic per part). A fixed per-part slice with a whole
+    document truncation would silently drop the last parts of a long lecture —
+    exactly the parts whose topics the outline is supposed to provide — so the
+    per-part allowance shrinks with the number of parts and the total stays
+    inside ``max_chars`` whenever the floor allows it.
     """
-    parts: list[str] = []
-    for index, chunk in enumerate(chunks, start=1):
-        text = chunk.strip()
-        if not text:
-            continue
-        head = text[:OUTLINE_CHUNK_HEAD_CHARS]
-        tail = text[-OUTLINE_CHUNK_TAIL_CHARS:] if len(text) > OUTLINE_CHUNK_HEAD_CHARS * 2 else ""
-        entry = f"### بخش {index}\n{head}"
+    parts = [body.strip() for body in chunks if body and body.strip()]
+    if not parts:
+        return ""
+    labels = [f"### بخش {index}\n" for index in range(1, len(parts) + 1)]
+    overhead = sum(len(label) for label in labels) + 4 * (len(parts) - 1)
+    available = max(max_chars - overhead, OUTLINE_CHUNK_MIN_CHARS * len(parts))
+    per_part = max(OUTLINE_CHUNK_MIN_CHARS, min(OUTLINE_CHUNK_HEAD_CHARS, available // len(parts)))
+    entries: list[str] = []
+    for label, body in zip(labels, parts):
+        head = body[:per_part]
+        tail = ""
+        if len(body) > per_part * 2:
+            tail = body[-OUTLINE_CHUNK_TAIL_CHARS:]
+        entry = label + head
         if tail:
             entry += f" … {tail}"
-        parts.append(entry)
-    document = "\n\n".join(parts)
-    if len(document) > max_chars:
-        document = document[:max_chars]
+        entries.append(entry)
+    document = "\n\n".join(entries)
+    if len(document) > max_chars and per_part > OUTLINE_CHUNK_MIN_CHARS:
+        # Only reachable when the tails pushed the digest over the budget: drop
+        # the tails (the heads carry the topics) before dropping any part.
+        entries = [entry.split(" … ")[0] for entry in entries]
+        document = "\n\n".join(entries)
     return document
 
 
@@ -192,13 +276,15 @@ def build_context_block(
     previous_tail: str = "",
     next_head: str = "",
     previous_headings: tuple[str, ...] = (),
+    topic: str = "",
+    continuity: ChunkContinuity | None = None,
 ) -> str:
     """The global-context block injected into one chunk's system prompt.
 
-    This is context, not payload: it tells the model where it is in the lecture
-    and how the neighbours end and begin, without asking it to note any of that
-    text again. The wording says so explicitly, so the same sentence cannot be
-    summarized twice.
+    This is context, not payload: it tells the model where it is in the lecture,
+    which topic this part covers, and how the neighbours end and begin, without
+    asking it to note any of that text again. The wording says so explicitly, so
+    the same sentence cannot be summarized twice.
 
     ``previous_headings`` are the *already written* section headings of the
     part before this one. They are the cheapest possible defence against a
@@ -206,7 +292,17 @@ def build_context_block(
     asked to reuse it when its first section continues that topic. The merge
     recognises the same situation deterministically, so this only makes the
     common case produce the right heading in the first place.
+
+    ``topic`` is the topic this part is responsible for, and ``continuity``
+    carries the two deterministic boundary facts (this part opens mid-topic /
+    ends mid-topic) that decide whether it should link instead of introducing
+    its subject. Both come from the outline and from the part's own text.
     """
+    if not topic:
+        # The block already knows the position and the topic list, so it can
+        # answer "what is this part about?" itself whenever the outline maps
+        # one topic per part. A caller may still override it explicitly.
+        topic = context.topic_for(index, total)
     lines: list[str] = [
         "### زمینهٔ کلی درس (فقط برای هماهنگی — این متن را دوباره جزوه نکنید)",
     ]
@@ -214,8 +310,8 @@ def build_context_block(
         lines.append(f"عنوان درس: {context.title}")
     if context.topics:
         numbered = "، ".join(
-            f"({_persian_number(position)}) {topic}"
-            for position, topic in enumerate(context.topics, start=1)
+            f"({_persian_number(position)}) {item}"
+            for position, item in enumerate(context.topics, start=1)
         )
         lines.append("موضوع‌های درس به ترتیب: " + numbered)
     if context.terminology:
@@ -223,6 +319,11 @@ def build_context_block(
     lines.append(
         f"جایگاه این بخش: بخش {_persian_number(index)} از {_persian_number(total)} درس."
     )
+    if topic:
+        lines.append(
+            f"موضوع همین بخش: «{topic}» — فقط همین موضوع را بنویسید و عنوان بخش‌های "
+            "خود را از این موضوع بردارید."
+        )
     if previous_headings:
         listed = "، ".join(f"«{heading}»" for heading in previous_headings)
         lines.append(f"عنوان‌های بخش پیشین که همین حالا نوشته شده‌اند: {listed}")
@@ -235,6 +336,18 @@ def build_context_block(
         lines.append("چند جملهٔ پایانی بخش پیشین (فقط برای پیوند): … " + previous_tail.strip())
     if next_head:
         lines.append("چند جملهٔ آغاز بخش بعدی (فقط برای پیوند): " + next_head.strip() + " …")
+    if continuity is not None:
+        if continuity.starts_mid_topic:
+            lines.append(
+                "این بخش از میانهٔ موضوع پیشین ادامه می‌یابد: با همان موضوع و همان اصطلاح‌ها "
+                "ادامه دهید و مقدمهٔ تازه‌ای برای کل درس ننویسید."
+            )
+        if continuity.ends_mid_topic:
+            lines.append(
+                "این بخش در میانهٔ یک موضوع تمام می‌شود (متن پایان‌یافته نیست): توضیح را "
+                "نیمه‌کاره رها نکنید و جملهٔ آخر را طوری بنویسید که به ادامهٔ همین موضوع "
+                "در بخش بعدی وصل شود، بدون افزودن مطلب تازه."
+            )
     return "\n".join(lines)
 
 
@@ -248,7 +361,8 @@ def context_block_for(
     """Convenience wrapper: the context block for part ``index`` (1-based).
 
     The neighbour windows are read from the neighbouring parts themselves, so
-    a boundary sentence can be continued rather than restarted.
+    a boundary sentence can be continued rather than restarted, and the two
+    continuity flags are derived from this part's own text.
     """
     previous_tail = ""
     next_head = ""
@@ -256,13 +370,17 @@ def context_block_for(
         previous_tail = documents[index - 2].strip()[-NEIGHBOUR_CONTEXT_CHARS:].strip()
     if index < len(documents):
         next_head = documents[index].strip()[:NEIGHBOUR_CONTEXT_CHARS].strip()
+    total = len(documents)
+    current = documents[index - 1] if 0 < index <= len(documents) else ""
     return build_context_block(
         context,
         index=index,
-        total=len(documents),
+        total=total,
         previous_tail=previous_tail,
         next_head=next_head,
         previous_headings=previous_headings,
+        topic=context.topic_for(index, total),
+        continuity=chunk_continuity(current, index=index, total=total),
     )
 
 
@@ -279,6 +397,8 @@ CHUNKED_CONTENT_RULES = (
     "\nقواعد نوشتن یک «بخش» از یک درس بلند:\n"
     "- شما فقط همین بخش را می‌نویسید؛ بخش‌های دیگر را ویرایشگران دیگر می‌نویسند. "
     "فهرست موضوع‌های بالا نقشهٔ راه است، نه متنی که باید بازنویسی شود.\n"
+    "- خط «موضوع همین بخش» از همان فهرست برداشته شده و مسئولیت همین بخش است: آن موضوع را "
+    "کامل پوشش دهید و موضوع‌های بخش‌های دیگر را در جزوهٔ خود تکرار نکنید.\n"
     "- مقدمه، معرفی و جمع‌بندی کل درس را دوباره ننویسید؛ مستقیم سر موضوع همین بخش بروید.\n"
     "- اگر این بخش وسط یک موضوعِ نیمه‌تمام شروع می‌شود (متن با ادامهٔ توضیح قبلی آغاز شده)، "
     "اولین بخش خود را با عیناً همان عنوان بخش پیشین بنویسید — نه عنوان تازه و نه عنوان با "
@@ -398,23 +518,89 @@ def compact_notes_json(notes: StructuredNotes) -> str:
     return json.dumps(compact_notes_payload(notes), ensure_ascii=False)
 
 
-def build_compile_document(context: LectureContext, notes: StructuredNotes) -> str:
-    """The final editorial pass input: global outline + the merged notes."""
-    parts: list[str] = []
+def build_compile_document(
+    context: LectureContext,
+    notes: StructuredNotes,
+    *,
+    part: int = 1,
+    parts: int = 1,
+) -> str:
+    """The final editorial pass input: global outline + the merged notes.
+
+    ``part``/``parts`` describe a *segmented* compilation: a booklet too large
+    for one request is compiled in consecutive slices, and each slice must know
+    that it is a slice. Without that, every slice would write a whole-lecture
+    summary and whole-lecture key points from a fragment of the material — the
+    exact opposite of a coherent document. Each slice writes the summary and
+    key points of its own part only; the merge unions them back in order.
+    """
+    parts_list: list[str] = []
     if not context.is_empty:
-        parts.append("### زمینهٔ کلی درس\n" + _outline_lines(context))
-    parts.append("### جزوهٔ فعلی (ساختهٔ بخش‌های جداگانه)\n" + compact_notes_json(notes))
-    parts.append(
+        parts_list.append("### زمینهٔ کلی درس\n" + _outline_lines(context))
+    parts_list.append("### جزوهٔ فعلی (ساختهٔ بخش‌های جداگانه)\n" + compact_notes_json(notes))
+    scope = ""
+    if parts > 1:
+        scope = (
+            f"- این جزوه {_persian_number(len(notes.sections))} بخش از بخش‌های جزوه است: "
+            f"بخش {_persian_number(part)} از {_persian_number(parts)} یک پردازش نهایی. "
+            "«summary» و «key_points» را فقط برای همین بخش‌ها بنویسید (نه برای کل درس) و "
+            "«glossary» را خالی بگذارید یا فقط اصطلاح‌های همین بخش‌ها را بیاورید.\n"
+            "- فقط روی همین بخش‌ها کار کنید؛ بخش‌های دیگر همین جزوه را بازنویسی نکنید و "
+            "نسخهٔ تازه‌ای برای آن‌ها نسازید.\n"
+        )
+    parts_list.append(
         "### دستور\n"
-        "این بخش‌ها را به یک جزوهٔ واحد و روان تبدیل کنید. هیچ مطلبی را حذف نکنید؛ "
+        "این بخش‌ها را به یک متن واحد و روان تبدیل کنید. هیچ مطلبی را حذف نکنید؛ "
         "فقط تکرارهای لفظ‌به‌لفظ را یک‌بار بنویسید، بخش‌های هم‌موضوع را ادغام کنید، گذارها را درست کنید و "
         "یکدستی اصطلاح‌ها را برقرار کنید.\n"
         "- ترتیب موضوع‌های درس را نگه دارید؛ هر موضوع یک بار و در جای خودش بیاید.\n"
         "- اگر جمله‌ای از بخش‌ها بریده یا ناقص است، آن را با همان اطلاعاتِ همین جزوه کامل و روان کنید؛ "
         "هیچ اطلاع تازه‌ای از خودتان اضافه نکنید.\n"
-        "- خروجی فقط JSON با همان ساختار است و «sections» هرگز خالی نمی‌شود."
+        + scope
+        + "- خروجی فقط JSON با همان ساختار است و «sections» هرگز خالی نمی‌شود."
     )
-    return "\n\n".join(parts)
+    return "\n\n".join(parts_list)
+
+
+def split_for_compilation(
+    notes: StructuredNotes, *, budget: int, overhead: int
+) -> list[StructuredNotes]:
+    """Consecutive slices of the notes that each fit one compilation request.
+
+    The final editorial pass is what turns per-part drafts into one document, so
+    skipping it for a long booklet — the previous behaviour, which delivered the
+    plain merge — is exactly the case that needs it most. Slicing keeps every
+    request inside ``budget`` while preserving the order of the lecture, and a
+    slice is only ever taken at a section boundary, so no section is ever split
+    across two compilations.
+
+    Returns ``[notes]`` when the whole booklet already fits, so the caller keeps
+    exactly one code path.
+    """
+    sections = list(notes.sections)
+    if not sections:
+        return [notes]
+    #: Per-request overhead: the system prompt, the outline and the instruction
+    #: block are sent once per call, not once per section.
+    allowance = max(budget - overhead, 1000)
+    groups: list[list] = []
+    current: list = []
+    current_size = 0
+    for section in sections:
+        size = len(compact_notes_json(_with_sections(notes, (section,))))
+        if current and current_size + size > allowance:
+            groups.append(current)
+            current, current_size = [], 0
+        current.append(section)
+        current_size += size
+    if current:
+        groups.append(current)
+    return [_with_sections(notes, tuple(group)) for group in groups] or [notes]
+
+
+def _with_sections(notes: StructuredNotes, sections: tuple) -> StructuredNotes:
+    """A copy of ``notes`` carrying only ``sections`` (used for slicing)."""
+    return replace(notes, sections=tuple(sections))
 
 
 def _outline_lines(context: LectureContext) -> str:

@@ -1558,9 +1558,16 @@ MAX_UNITS_IN_REPAIR_PROMPT = 8
 OUTLINE_MIN_CHUNKS = 2
 #: A merge below this size is not worth an editorial call.
 COMPILE_MIN_NOTES_CHARS = 400
-#: Hard bound on the final compilation request. Above it the merged notes are
-#: delivered unchanged rather than re-sent as one oversized request.
+#: Hard bound on the final compilation request. A booklet above it is compiled in
+#: consecutive slices rather than re-sent as one oversized request.
 COMPILE_MAX_CHARS = 48000
+#: Upper bound on how many slices the compilation may cost. Beyond it the merged
+#: notes are delivered unchanged instead of turning a booklet into an unbounded
+#: chain of provider calls.
+COMPILE_MAX_SLICES = 6
+#: Characters reserved per compilation request for the outline and instruction
+#: blocks (the system prompt length is measured exactly).
+COMPILE_PROMPT_OVERHEAD = 2500
 #: User-message wrapper for the orientation call.
 OUTLINE_PROMPT = "آغاز بخش‌های پیاپی این درس:\n\n"
 #: User-message wrapper for the final editorial call.
@@ -1638,7 +1645,12 @@ def _previous_headings(notes: list[StructuredNotes]) -> tuple[str, ...]:
 def _context_block_for(
     context, documents: list[str], index: int, previous_headings: tuple[str, ...] = ()
 ) -> str:
-    """The global-context block for part ``index`` of ``documents``."""
+    """The global-context block for part ``index`` of ``documents``.
+
+    A part with no outline still gets a context block when the previous part's
+    headings are known: position, neighbour sentences and the heading wording to
+    reuse are useful even without the orientation pass.
+    """
     if context is None and not previous_headings:
         return ""
     from .editorial import LectureContext, context_block_for
@@ -1660,26 +1672,31 @@ async def _compile_final(
     *,
     note_mode: str,
     label: str,
-    budget: int = COMPILE_MAX_CHARS,
+    budget: int | None = None,
 ) -> StructuredNotes:
-    """One controlled editorial pass over the merged notes.
+    """The controlled editorial pass over the merged notes.
 
     Its job is global coherence — merge logically related fragments, remove
     accidental duplication, repair transitions, unify terminology — never
-    summarisation. The result is accepted only when the deterministic QA
-    measures do not regress and the booklet keeps almost all of its text, so a
+    summarisation. Every slice is accepted only when the deterministic QA
+    measures do not regress and the slice keeps almost all of its text, so a
     compilation can improve the reading experience but can never quietly drop
-    content. On any provider error the merged notes are returned unchanged.
+    content. On any provider error the merged notes for that slice are kept.
 
     Its input is the whole booklet, so its budget is the global compilation
-    bound rather than one chunk's budget; for a booklet larger than that bound
-    the pass is skipped and the (already improved) merge is delivered.
+    bound rather than one chunk's budget. A booklet larger than that bound is
+    compiled in consecutive slices (each one labelled as a part, so no slice
+    writes a whole-lecture summary from a fragment) instead of being skipped —
+    a long lecture is exactly the document that needs this pass most. The number
+    of slices is bounded so a pathological booklet cannot turn into a long chain
+    of provider calls; beyond that bound the merged notes are delivered.
     """
     from .editorial import (
         COMPILE_SYSTEM_PROMPT,
         LectureContext,
         build_compile_document,
         compile_is_better,
+        split_for_compilation,
     )
 
     if not settings.note_global_context_enabled or len(documents) < OUTLINE_MIN_CHUNKS:
@@ -1687,65 +1704,105 @@ async def _compile_final(
     before_text = notes_text(merged)
     if len(before_text) < COMPILE_MIN_NOTES_CHARS:
         return merged
+    # Resolved at call time (not as a default argument) so the bound is one
+    # place and a test or a future setting can move it.
+    budget = COMPILE_MAX_CHARS if budget is None else budget
     budget = min(COMPILE_MAX_CHARS, max(budget, COMPILE_MIN_NOTES_CHARS))
-    # A missing outline only removes the topic map; the compilation itself is
-    # still worth doing, because it is the pass that produces one coherent
-    # document out of the per-chunk drafts.
-    document = build_compile_document(context or LectureContext(), merged)
-    if len(document) > budget:
+    # The system prompt and the instruction block are sent once per slice, so
+    # they are reserved up front and never charged to the notes.
+    groups = split_for_compilation(
+        merged, budget=budget, overhead=len(COMPILE_SYSTEM_PROMPT) + COMPILE_PROMPT_OVERHEAD
+    )
+    if len(groups) > COMPILE_MAX_SLICES:
         logger.info(
-            "Final editorial pass skipped %s: %s characters of notes exceed the %s budget",
+            "Final editorial pass skipped %s: %s characters of notes need %s slices, "
+            "more than the %s allowed",
             label,
-            len(document),
-            budget,
+            len(before_text),
+            len(groups),
+            COMPILE_MAX_SLICES,
         )
         return merged
-    before_report = run_note_qa(merged, documents)
-    try:
-        compiled = await _structured_notes_for(
-            document,
-            settings,
-            session,
-            COMPILE_PROMPT,
-            system_prompt=COMPILE_SYSTEM_PROMPT,
-            label=f"{label} final compilation",
+
+    kept: list[StructuredNotes] = []
+    accepted_any = False
+    for position, group in enumerate(groups, start=1):
+        # A missing outline only removes the topic map; the compilation itself
+        # is still worth doing, because it is the pass that produces one
+        # coherent document out of the per-chunk drafts.
+        document = build_compile_document(
+            context or LectureContext(), group, part=position, parts=len(groups)
         )
-    except Exception as exc:
-        logger.warning(
-            "Final editorial pass failed (%s: %s); keeping the merged notes",
-            type(exc).__name__,
-            exc if isinstance(exc, StructuringError) else "unexpected error",
+        slice_label = (
+            f"{label} final compilation"
+            if len(groups) == 1
+            else f"{label} final compilation {position}/{len(groups)}"
         )
-        return merged
-    after_text = notes_text(compiled)
-    after_report = run_note_qa(compiled, documents)
-    accepted, reason = compile_is_better(
-        before_report,
-        after_report,
-        before_chars=len(before_text),
-        after_chars=len(after_text),
-    )
-    if not accepted:
-        logger.warning(
-            "Final editorial pass rejected (%s) coverage=%.2f->%.2f semantic=%.2f->%.2f; "
-            "keeping the merged notes",
+        if len(document) > budget:
+            kept.append(group)
+            continue
+        before_slice = run_note_qa(group, documents)
+        try:
+            compiled = await _structured_notes_for(
+                document,
+                settings,
+                session,
+                COMPILE_PROMPT,
+                system_prompt=COMPILE_SYSTEM_PROMPT,
+                label=slice_label,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Final editorial pass failed for %s (%s: %s); keeping its merged notes",
+                slice_label,
+                type(exc).__name__,
+                exc if isinstance(exc, StructuringError) else "unexpected error",
+            )
+            kept.append(group)
+            continue
+        after_text = notes_text(compiled)
+        after_slice = run_note_qa(compiled, documents)
+        accepted, reason = compile_is_better(
+            before_slice,
+            after_slice,
+            before_chars=len(notes_text(group)),
+            after_chars=len(after_text),
+        )
+        if not accepted:
+            logger.warning(
+                "Final editorial pass rejected %s (%s) coverage=%.2f->%.2f "
+                "semantic=%.2f->%.2f; keeping its merged notes",
+                slice_label,
+                reason,
+                before_slice.coverage,
+                after_slice.coverage,
+                before_slice.semantic_coverage,
+                after_slice.semantic_coverage,
+            )
+            kept.append(group)
+            continue
+        accepted_any = True
+        logger.info(
+            "Final editorial pass accepted %s (%s) sections=%s->%s chars=%s->%s",
+            slice_label,
             reason,
-            before_report.coverage,
-            after_report.coverage,
-            before_report.semantic_coverage,
-            after_report.semantic_coverage,
+            len(group.sections),
+            len(compiled.sections),
+            len(notes_text(group)),
+            len(after_text),
         )
+        kept.append(compiled)
+
+    if not accepted_any:
         return merged
-    logger.info(
-        "Final editorial pass accepted %s (%s) sections=%s->%s chars=%s->%s",
-        label,
-        reason,
-        len(merged.sections),
-        len(compiled.sections),
-        len(before_text),
-        len(after_text),
-    )
-    return replace(compiled, title=compiled.title or merged.title, note_mode=note_mode)
+    if len(kept) == 1:
+        result = kept[0]
+    else:
+        # Additive, order-preserving merge of the compiled slices: the same
+        # conservative merge the pipeline already trusts, so two slices cannot
+        # print one topic twice or reorder the lecture.
+        result = merge_structured_notes(kept)
+    return replace(result, title=result.title or merged.title, note_mode=note_mode)
 
 
 async def structure_transcript(
@@ -1805,6 +1862,7 @@ async def structure_transcript(
             system_prompt_for=lambda index, total: build_system_prompt(
                 note_mode, context_block=_context_block_for(context, chunks, index)
             ),
+            originals=notes,
         )
         return await _compile_final(
             merged,
@@ -1826,7 +1884,13 @@ def _repair_is_better(before, after) -> tuple[bool, str]:
     semantic coverage for a real loss of numbers.
     """
     if after.semantic_coverage > before.semantic_coverage:
-        if after.coverage < before.coverage or after.missing_numbers > before.missing_numbers:
+        # ``missing_numbers`` is a tuple of *values*, so it must be compared by
+        # length: comparing the tuples compares the strings element-wise, which
+        # rejected correct repairs whose new missing values happened to sort
+        # higher than the old ones.
+        if after.coverage < before.coverage or len(after.missing_numbers) > len(
+            before.missing_numbers
+        ):
             return False, "semantic coverage rose but signal coverage regressed"
         return True, "semantic coverage restored"
     if after.semantic_coverage < before.semantic_coverage:
@@ -1838,6 +1902,46 @@ def _repair_is_better(before, after) -> tuple[bool, str]:
     if after.compression_ratio > before.compression_ratio:
         return True, "more of the lecture preserved at equal coverage"
     return False, "no measurable improvement"
+
+
+def _chunk_quality(draft: StructuredNotes, source: str) -> tuple[float, float, int]:
+    """``(semantic coverage, signal coverage, missing numbers)`` for one part.
+
+    Used to accept a *targeted* repair part by part: the repair only ever
+    replaces the draft it improves.
+    """
+    from .units import extract_all_units, semantic_coverage
+
+    report = run_note_qa(draft, [source])
+    semantic, _ = semantic_coverage(extract_all_units([source]), notes_text(draft))
+    return semantic, report.coverage, len(report.missing_numbers)
+
+
+def _choose_repaired_draft(
+    original: StructuredNotes, candidate: StructuredNotes, source: str
+) -> StructuredNotes:
+    """Keep a repaired part only when it measurably improves on its own draft.
+
+    A repair pass regenerates parts that were fine in order to restore the ones
+    that were not. Accepting the whole answer because it improved *on average*
+    is how a targeted repair silently becomes a rewrite, so each part is judged
+    against its own draft with the same ordering the document-level gate uses:
+    restored educational content first, then numbers/terms, and ties keep the
+    draft that already existed.
+    """
+    if not candidate.has_content:
+        return original
+    before_semantic, before_coverage, before_missing = _chunk_quality(original, source)
+    after_semantic, after_coverage, after_missing = _chunk_quality(candidate, source)
+    if after_semantic > before_semantic:
+        if after_coverage < before_coverage or after_missing > before_missing:
+            return original
+        return candidate
+    if after_semantic < before_semantic:
+        return original
+    if after_coverage > before_coverage and after_missing <= before_missing:
+        return candidate
+    return original
 
 
 async def _repair_notes_if_needed(
@@ -1852,6 +1956,7 @@ async def _repair_notes_if_needed(
     label: str,
     max_chars: int = TRANSCRIPT_CHUNK_CHARS,
     system_prompt_for=None,
+    originals: list[StructuredNotes] | None = None,
 ) -> StructuredNotes:
     """Optional second pass, fired only when deterministic QA says it is needed.
 
@@ -1931,25 +2036,27 @@ async def _repair_notes_if_needed(
                 if system_prompt_for is None
                 else system_prompt_for(index, len(sources))
             )
-            repaired_notes.append(
-                await _structured_notes_for(
-                    build_repair_prompt(
-                        source,
-                        missing,
-                        report.findings,
-                        existing=notes_text(merged),
-                        missing_units=tuple(
-                            by_chunk.get(index, [])[:MAX_UNITS_IN_REPAIR_PROMPT]
-                        ),
+            candidate = await _structured_notes_for(
+                build_repair_prompt(
+                    source,
+                    missing,
+                    report.findings,
+                    existing=notes_text(merged),
+                    missing_units=tuple(
+                        by_chunk.get(index, [])[:MAX_UNITS_IN_REPAIR_PROMPT]
                     ),
-                    settings,
-                    session,
-                    prompt,
-                    system_prompt=chunk_prompt,
-                    label=f"{label} (repair {index}/{len(sources)})",
-                    reminder=REPAIR_REMINDER,
-                )
+                ),
+                settings,
+                session,
+                prompt,
+                system_prompt=chunk_prompt,
+                label=f"{label} (repair {index}/{len(sources)})",
+                reminder=REPAIR_REMINDER,
             )
+            # Targeted repair: a part that was already right is kept as it was.
+            if originals is not None and index <= len(originals):
+                candidate = _choose_repaired_draft(originals[index - 1], candidate, source)
+            repaired_notes.append(candidate)
         repaired = merge_structured_notes(repaired_notes)
     except Exception:
         logger.exception("Note repair pass failed; keeping the original notes")
@@ -2063,6 +2170,7 @@ async def structure_presentation(
             system_prompt_for=lambda index, total: build_presentation_system_prompt(
                 note_mode, context_block=_context_block_for(context, documents, index)
             ),
+            originals=notes,
         )
         return await _compile_final(
             merged,

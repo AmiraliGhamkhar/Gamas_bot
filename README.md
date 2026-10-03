@@ -325,6 +325,8 @@ DOCX_COVER_ENABLED=true
 # Automatic Word table of contents built from the Heading 1/2 styles; it is
 # generated only for documents with at least three sections:
 DOCX_TOC_ENABLED=true
+DOCX_TOC_LEVELS=1-1               # heading levels included in the TOC (1-1 ... 1-9)
+DOCX_TOC_MIN_SECTIONS=4          # only add a TOC from this many sections upward
 # Real page border (w:pgBorders) written into every section:
 DOCX_PAGE_BORDER_ENABLED=true
 DOCX_PAGE_BORDER_STYLE=single     # single | double | thick | thinSingle | dotted | dashed

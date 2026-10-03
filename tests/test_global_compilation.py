@@ -443,5 +443,199 @@ class PromptAndDocumentTests(unittest.TestCase):
         self.assertIn("signal coverage", reason)
 
 
+class PartContextTests(unittest.TestCase):
+    """What a part is told about *itself* (topic, boundaries), not just the map."""
+
+    def test_topic_is_read_positionally_only_when_the_count_matches(self):
+        context = LectureContext(title="درس", topics=("الف", "ب"))
+        self.assertEqual(context.topic_for(1, 2), "الف")
+        self.assertEqual(context.topic_for(2, 2), "ب")
+        # A topic list of the wrong length is a map, not a per-part answer:
+        # labelling part 2 with part 1's topic would be worse than silence.
+        self.assertEqual(LectureContext(topics=("الف",)).topic_for(1, 2), "")
+        self.assertEqual(LectureContext(topics=("الف", "ب", "پ")).topic_for(2, 2), "")
+
+    def test_context_block_states_the_parts_own_topic(self):
+        block = build_context_block(
+            LectureContext(title="درس", topics=("الف", "ب")), index=2, total=2
+        )
+        self.assertIn("موضوع همین بخش", block)
+        self.assertIn("«ب»", block)
+
+    def test_continuity_flags_are_derived_from_the_part_itself(self):
+        from gamas_bot.editorial import chunk_continuity
+
+        # Opens with a continuation connector and stops without a terminator
+        # (the earlier sentence proves the material *is* punctuated, so the
+        # unfinished ending is real and not an artifact of raw STT output).
+        mixed = chunk_continuity(
+            "و ادامهٔ همان بحث قبلی را پی می‌گیریم. سپس به نکتهٔ تازه‌ای می‌رسیم",
+            index=2,
+            total=3,
+        )
+        self.assertTrue(mixed.starts_mid_topic)
+        self.assertTrue(mixed.ends_mid_topic)
+        # Punctuation-free material (raw STT) must not produce noise.
+        silent = chunk_continuity("و ادامهٔ بحث بدون هیچ نشانه‌گذاری", index=2, total=3)
+        self.assertTrue(silent.is_clean)
+        # The first part cannot be a continuation, the last one cannot be cut.
+        first = chunk_continuity("و این هم آغاز درس است. و ادامه دارد", index=1, total=3)
+        self.assertFalse(first.starts_mid_topic)
+        self.assertTrue(first.ends_mid_topic)
+        last = chunk_continuity("و این هم پایان درس است", index=3, total=3)
+        self.assertFalse(last.ends_mid_topic)
+
+    def test_context_block_asks_the_part_to_link_when_it_is_cut(self):
+        from gamas_bot.editorial import ChunkContinuity
+
+        block = build_context_block(
+            LectureContext(topics=("الف", "ب")),
+            index=2,
+            total=2,
+            continuity=ChunkContinuity(starts_mid_topic=True, ends_mid_topic=False),
+        )
+        self.assertIn("میانهٔ موضوع پیشین", block)
+
+
+class OutlineDigestTests(unittest.TestCase):
+    """The orientation call must see every part, not only the first ones."""
+
+    def test_every_part_is_represented_under_a_tight_budget(self):
+        from gamas_bot.editorial import build_outline_document
+
+        chunks = [f"بخش {index} دربارهٔ موضوع شمارهٔ {index} صحبت می‌کند. " * 20 for index in range(1, 41)]
+        document = build_outline_document(chunks, max_chars=12000)
+        for index in range(1, 41):
+            self.assertIn(f"### بخش {index}", document)
+        self.assertLessEqual(len(document), 12000 + 41)  # only the labels may overflow
+
+    def test_a_short_digest_keeps_the_full_opening_and_a_tail(self):
+        from gamas_bot.editorial import build_outline_document
+
+        document = build_outline_document(["الف" * 2000], max_chars=12000)
+        self.assertTrue(document.startswith("### بخش 1"))
+        self.assertIn("…", document)
+
+
+class SegmentedCompilationTests(unittest.IsolatedAsyncioTestCase):
+    """A booklet too large for one request is compiled in labelled slices."""
+
+    class ManySectionProvider(FakeNoteProvider):
+        """A double that answers every part with its own distinct section.
+
+        Distinct headings matter here: identical ones would be *correctly*
+        merged into a single section, and a one-section booklet legitimately
+        needs one compilation slice.
+        """
+
+        def __call__(self, chunk, settings, session, prompt=None, *, system_prompt="",
+                     reminder="", **kwargs):
+            if prompt in (OUTLINE_PROMPT, COMPILE_PROMPT):
+                return super().__call__(
+                    chunk,
+                    settings,
+                    session,
+                    prompt,
+                    system_prompt=system_prompt,
+                    reminder=reminder,
+                )
+            match = re.search(r"بخش\s+([\d\u06f0-\u06f9]+)\s+از", chunk)
+            index = match.group(1) if match else "?"
+            body = PREFIX_RE.sub("", chunk)
+            return notes_json(body[:1200], heading=f"موضوع {index}")
+
+    def _provider(self, **kwargs):
+        return self.ManySectionProvider(**kwargs)
+
+    async def _run(self, text, provider, **overrides):
+        settings = make_settings(**overrides)
+        with patch("gamas_bot.structuring._structure_chunk", side_effect=provider), patch(
+            "gamas_bot.structuring.TRANSCRIPT_CHUNK_CHARS", CHUNK_BUDGET
+        ), patch("gamas_bot.structuring.aiohttp.ClientSession", fake_session_factory):
+            return await structure_transcript(text, settings)
+
+    def _many_section_text(self) -> str:
+        return "\n".join(
+            f"پاراگراف شمارهٔ {index} دربارهٔ موضوع {index} با توضیح کافی برای آزمون. " * 12
+            for index in range(1, 4)
+        )
+
+    async def test_an_oversized_booklet_is_compiled_in_slices_not_skipped(self):
+        provider = self._provider()
+        with patch("gamas_bot.structuring.COMPILE_MAX_CHARS", 4000), patch(
+            "gamas_bot.structuring.COMPILE_PROMPT_OVERHEAD", 200
+        ), patch("gamas_bot.structuring.COMPILE_MIN_NOTES_CHARS", 100):
+            result = await self._run(self._many_section_text(), provider)
+        compiles = [call for call in provider.calls if call["prompt"] == COMPILE_PROMPT]
+        self.assertGreater(len(compiles), 1)
+        # Every slice is told that it is a slice, so no slice writes a
+        # whole-lecture summary from a fragment of the lecture.
+        for call in compiles:
+            self.assertIn("پردازش نهایی", call["document"])
+        self.assertTrue(result.sections)
+
+    async def test_too_many_slices_fall_back_to_the_merge(self):
+        provider = self._provider()
+        with patch("gamas_bot.structuring.COMPILE_MAX_CHARS", 4000), patch(
+            "gamas_bot.structuring.COMPILE_PROMPT_OVERHEAD", 200
+        ), patch("gamas_bot.structuring.COMPILE_MAX_SLICES", 1), patch(
+            "gamas_bot.structuring.COMPILE_MIN_NOTES_CHARS", 100
+        ):
+            await self._run(self._many_section_text(), provider)
+        self.assertEqual(
+            [call for call in provider.calls if call["prompt"] == COMPILE_PROMPT], []
+        )
+
+
+class TargetedRepairTests(unittest.IsolatedAsyncioTestCase):
+    """The repair pass restores what is missing and leaves the rest alone."""
+
+    class RepairProvider(FakeNoteProvider):
+        """A double whose first pass loses numbers and whose repair hurts part 2."""
+
+        def __init__(self):
+            super().__init__()
+            self.repairs: list[str] = []
+
+        def __call__(self, chunk, settings, session, prompt=None, *, system_prompt="",
+                     reminder="", **kwargs):
+            body = PREFIX_RE.sub("", chunk)
+            if prompt == OUTLINE_PROMPT:
+                return super().__call__(
+                    chunk, settings, session, prompt, system_prompt=system_prompt
+                )
+            if reminder:  # the repair pass
+                self.repairs.append(body)
+                if "۵۰۰" in body or "دوز" in body:
+                    return notes_json("دوز دارو ۵۰۰ mg است.", heading="دارو")
+                return notes_json("چیزی برای گفتن نیست.", heading="دارو")
+            self.calls.append(
+                {"prompt": prompt, "system_prompt": system_prompt, "document": chunk}
+            )
+            return notes_json("دارو تجویز می‌شود.", heading="دارو")
+
+    async def test_a_damaged_repair_slice_never_replaces_its_own_draft(self):
+        # Long enough to clear the "a very short source never triggers a
+        # repair" floor, and split into two parts by the chunk budget.
+        first = "دوز دارو ۵۰۰ mg است و باید روزانه مصرف شود. " * 25
+        second = "فشار خون ۱۲۰/۸۰ mmHg اندازه‌گیری شد و طبیعی بود. " * 25
+        text = first + "\n" + second
+        provider = self.RepairProvider()
+        settings = make_settings()
+        with patch("gamas_bot.structuring._structure_chunk", side_effect=provider), patch(
+            "gamas_bot.structuring.TRANSCRIPT_CHUNK_CHARS", CHUNK_BUDGET
+        ), patch("gamas_bot.structuring.aiohttp.ClientSession", fake_session_factory):
+            result = await structure_transcript(text, settings)
+        self.assertTrue(provider.repairs)  # the repair really ran
+        bodies = [paragraph for section in result.sections for paragraph in section.paragraphs]
+        # Part 1 was restored…
+        self.assertIn("دوز دارو ۵۰۰ mg است.", bodies)
+        # …and part 2 kept its own draft instead of the damaged replacement.
+        self.assertIn("دارو تجویز می‌شود.", bodies)
+        self.assertNotIn("چیزی برای گفتن نیست.", bodies)
+
+
+
+
 if __name__ == "__main__":
     unittest.main()

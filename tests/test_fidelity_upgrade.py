@@ -281,6 +281,48 @@ class FontProfileTests(unittest.TestCase):
         settings = make_settings(docx_font_profile="traditional", docx_font_body="Custom")
         self.assertEqual(settings.docx_fonts["body"], "Custom")
 
+    def test_documented_docx_switches_all_reach_the_design(self):
+        """Every documented DOCX_* switch reaches the renderer's design object."""
+        from unittest.mock import patch
+
+        from gamas_bot.config import Settings
+
+        base = dict(
+            TELEGRAM_BOT_TOKEN="t",
+            TELEGRAM_API_ID="1",
+            TELEGRAM_API_HASH="h",
+            DOCX_COVER_ENABLED="false",
+            DOCX_TOC_ENABLED="true",
+            DOCX_TOC_LEVELS="1-2",
+            DOCX_TOC_MIN_SECTIONS="7",
+            DOCX_PAGE_BORDER_ENABLED="true",
+            DOCX_PAGE_BORDER_STYLE="double",
+            DOCX_PAGE_BORDER_COLOR="112233",
+            DOCX_PAGE_BORDER_WIDTH="12",
+            DOCX_PAGE_BORDER_SPACE="18",
+            DOCX_SHOW_FOOTER_BRAND="false",
+            DOCX_BODY_FONT="BodyFont",
+            DOCX_HEADING_FONT="HeadFont",
+            DOCX_LATIN_FONT="LatinFont",
+            DOCX_FALLBACK_FONT="FallbackFont",
+        )
+        with patch.dict("os.environ", base, clear=False):
+            settings = Settings.from_env()
+        design = settings.docx_design
+        self.assertFalse(design["cover_enabled"])
+        self.assertEqual(design["toc_levels"], "1-2")
+        self.assertEqual(design["toc_min_sections"], 7)
+        self.assertEqual(design["border_style"], "double")
+        self.assertEqual(design["border_color"], "112233")
+        self.assertEqual(design["border_size"], 12)
+        self.assertEqual(design["border_space"], 18)
+        self.assertFalse(design["footer_brand"])
+        fonts = settings.docx_fonts
+        self.assertEqual(fonts["body"], "BodyFont")
+        self.assertEqual(fonts["heading"], "HeadFont")
+        self.assertEqual(fonts["latin"], "LatinFont")
+        self.assertEqual(fonts["fallback"], "FallbackFont")
+
     def test_every_profile_declares_a_fallback(self):
         for name, profile in FONT_PROFILES.items():
             self.assertTrue(profile["fallback"], name)
