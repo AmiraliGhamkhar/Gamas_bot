@@ -11,7 +11,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
 
-from .config import NOTE_MODES, Settings, resolve_note_mode
+from .config import NOTE_MODES, RESERVED_HEADER_NAMES, Settings, resolve_note_mode
 from .progress import to_persian_digits
 from .qa import heading_topic_key, headings_overlap, headings_share_a_topic, notes_text, run_note_qa
 from .textnorm import normalize_for_compare
@@ -1180,6 +1180,43 @@ def build_presentation_document(outline: str, transcript: str) -> str:
 
 RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504}
 
+# ---------------------------------------------------------------------------
+# Anthropic request construction
+# ---------------------------------------------------------------------------
+# Sampling parameters are model-specific on the Anthropic Messages API:
+#   * ``temperature`` and ``top_p`` must never be sent together, and ``top_k``
+#     is not supported by the current generations at all, so this client only
+#     ever sends ``temperature``;
+#   * models from the Opus 4.7 generation onward reject *any* non-default
+#     sampling value (a 400 invalid_request_error), so the parameter is
+#     omitted for them and prompting carries the determinism contract instead.
+# https://platform.claude.com/docs/en/about-claude/model-deprecations
+_ANTHROPIC_MODEL_VERSION_PATTERN = re.compile(r"claude-([a-z]+)-(\d+)(?:-(\d+))?")
+_ANTHROPIC_SAMPLING_MAX_VERSION = (4, 6)
+#: Deterministic sampling for providers/models that accept it.
+NOTE_TEMPERATURE = 0.2
+
+
+def anthropic_supports_temperature(model: str) -> bool:
+    """Whether ``model`` accepts a non-default ``temperature``.
+
+    ``claude-haiku-4-5``/``claude-haiku-4-5-20251001`` do; ``claude-opus-4-7``
+    and later do not. An unparsable name (a proxy, an alias without a version,
+    or a model newer than this table) is treated as *unsupported*, because
+    omitting a sampling hint only loses a tie-breaker while sending one to a
+    model that rejects it fails the whole request.
+    """
+    match = _ANTHROPIC_MODEL_VERSION_PATTERN.match((model or "").strip().lower())
+    if not match:
+        return False
+    version = (int(match.group(2)), int(match.group(3) or 0))
+    return version <= _ANTHROPIC_SAMPLING_MAX_VERSION
+
+
+def anthropic_sampling_params(model: str) -> dict[str, float]:
+    """Sampling parameters for one Anthropic model (possibly none)."""
+    return {"temperature": NOTE_TEMPERATURE} if anthropic_supports_temperature(model) else {}
+
 
 def _endpoint(base_url: str, suffix: str) -> str:
     """Append an API path without breaking an exact endpoint's query string."""
@@ -1266,7 +1303,17 @@ def _provider_request(
     provider = settings.note_api_provider
     key = settings.effective_note_api_key
     model = settings.effective_note_model
-    extra_headers = dict(settings.note_api_extra_headers)
+    # Authentication headers are reserved: a user-supplied header may never
+    # override (or forge) the credential the provider layer builds below.
+    # config.sanitize_extra_headers() already drops them at parse time; this
+    # second filter protects programmatically built Settings objects too.
+    extra_headers = {
+        name: value
+        for name, value in settings.note_api_extra_headers
+        if name.lower() not in RESERVED_HEADER_NAMES
+    }
+    if len(extra_headers) != len(settings.note_api_extra_headers):
+        logger.warning("Ignored reserved authentication header(s) for provider=%s", provider)
     full_prompt = prompt + chunk
 
     if provider == "gemini":
@@ -1281,7 +1328,7 @@ def _provider_request(
             "contents": [{"role": "user", "parts": [{"text": full_prompt}]}],
             "systemInstruction": {"parts": [{"text": system_prompt}]},
             "generationConfig": {
-                "temperature": 0.2,
+                "temperature": NOTE_TEMPERATURE,
                 "maxOutputTokens": settings.note_api_max_output_tokens,
                 # Native JSON mode keeps Gemini from wrapping the answer in prose.
                 "responseMimeType": "application/json",
@@ -1301,7 +1348,7 @@ def _provider_request(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": full_prompt},
             ],
-            "temperature": 0.2,
+            "temperature": NOTE_TEMPERATURE,
             "max_tokens": settings.note_api_max_output_tokens,
         }
         if settings.note_api_json_mode:
@@ -1322,10 +1369,12 @@ def _provider_request(
         payload = {
             "model": model,
             "max_tokens": settings.note_api_max_output_tokens,
-            "temperature": 0.2,
             "system": system_prompt,
             "messages": [{"role": "user", "content": full_prompt}],
         }
+        # Only a parameter the selected model actually accepts is sent;
+        # ``top_p``/``top_k`` are never sent to Anthropic at all.
+        payload.update(anthropic_sampling_params(model))
         return _endpoint(base, "messages"), headers, payload, {}
 
     raise StructuringError("سرویس تولید جزوه غیرفعال است.")
@@ -1369,7 +1418,18 @@ def _provider_response(payload: dict, provider: str) -> str:
             else:
                 text = "" if content is None else str(content)
     except (AttributeError, KeyError, IndexError, TypeError) as exc:
-        raise StructuringError("پاسخ سرویس تولید جزوه خالی یا نامعتبر است.") from exc
+        # A malformed answer is a contract violation, not a "KeyError". The
+        # provider name and the failing field type are enough to diagnose it
+        # without logging the answer itself (it carries lecture content).
+        logger.warning(
+            "Note provider returned an unexpected response schema provider=%s error=%s",
+            provider,
+            type(exc).__name__,
+        )
+        raise StructuringError(
+            "پاسخ سرویس تولید جزوه با قرارداد انتظار ما سازگار نبود "
+            "(ساختار پاسخ غیرمنتظره بود)."
+        ) from exc
     text = text.strip()
     if not text:
         raise StructuringError("پاسخ سرویس تولید جزوه خالی بود.")

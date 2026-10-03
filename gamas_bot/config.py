@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import re
@@ -10,12 +11,69 @@ from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
+
 TRUTHY = {"1", "true", "yes", "on"}
 
 # Note-generation compression modes. ``full`` (the default) preserves detail;
 # only ``summary`` intentionally compresses. Defined here so the environment
 # parser does not need to import the (heavier) structuring module.
 NOTE_MODES = ("full", "standard", "summary")
+
+# ---------------------------------------------------------------------------
+# Speechmatics (Batch API) contract
+# ---------------------------------------------------------------------------
+# ``model`` is the field the current Batch API documents; ``operating_point``
+# is the *deprecated* alias it keeps for backward compatibility (older
+# self-hosted batch containers only understand that spelling).
+#   https://docs.speechmatics.com/speech-to-text/batch/input
+SPEECHMATICS_MODEL_FIELDS = ("model", "operating_point", "both")
+SPEECHMATICS_MODEL_FIELD = "model"
+
+# Documented model values for the Batch API
+# (https://docs.speechmatics.com/speech-to-text/models):
+#   enhanced / standard : one language (or one bilingual pack) per job,
+#                         custom dictionary and confidence scores supported.
+#   melia-1 / oak-1     : multilingual models that switch language on their
+#                         own. Batch only. They reject ``language: auto``
+#                         (use ``multi``, optionally with ``language_hints``)
+#                         and do not support the custom dictionary or
+#                         confidence scores.
+SPEECHMATICS_OPERATING_POINTS = ("standard", "enhanced", "melia-1", "oak-1")
+SPEECHMATICS_MULTILINGUAL_MODELS = frozenset({"melia-1", "oak-1"})
+
+# ``additional_vocab`` (custom dictionary) limits
+# (https://docs.speechmatics.com/speech-to-text/features/custom-dictionary):
+#   1_000    - the largest dictionary the provider recommends for one job.
+#   20_000   - the hard cap: SaaS on Cloud *rejects* a job above it.
+SPEECHMATICS_VOCAB_RECOMMENDED_LIMIT = 1_000
+SPEECHMATICS_VOCAB_HARD_LIMIT = 20_000
+
+# ---------------------------------------------------------------------------
+# Note providers
+# ---------------------------------------------------------------------------
+# Current Anthropic model ids, verified against
+# https://platform.claude.com/docs/en/about-claude/model-deprecations
+# (``claude-3-5-haiku-*`` was retired on 2026-02-19).
+DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5"
+DEFAULT_OPENAI_COMPATIBLE_MODEL = "gpt-4o-mini"
+
+# Reserved request headers. A user-supplied ``NOTE_API_EXTRA_HEADERS_JSON``
+# must never be able to replace (or forge) provider credentials, so these
+# names are dropped from the extra headers with a warning.
+RESERVED_HEADER_NAMES = frozenset(
+    {"authorization", "proxy-authorization", "x-api-key", "api-key", "x-goog-api-key"}
+)
+# RFC 7230 token: everything a header name may legally contain.
+HEADER_NAME_PATTERN = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+
+# ``STT_LANGUAGE`` accepts a BCP-47-ish code (``fa``, ``en-US``), one of the
+# Speechmatics bilingual packs (``ar_en``, ``cmn_en_ms_ta``), or one of these
+# reserved keywords. How each keyword is interpreted is decided per provider in
+# ``gamas_bot.stt.normalize_language_for_provider`` — they are *requests*, not
+# provider parameters.
+STT_LANGUAGE_KEYWORDS = frozenset({"auto", "multi"})
+STT_LANGUAGE_PATTERN = re.compile(r"[A-Za-z]{2,3}(?:[_-][A-Za-z0-9]{2,8})*")
 
 #: Named font profiles so an operator picks a coherent set with one variable
 #: instead of four.
@@ -110,6 +168,48 @@ def _path(name: str, default: str) -> Path:
     return _anchor(_text(name, default))
 
 
+def _is_supported_stt_language(value: str) -> bool:
+    """True for a BCP-47-ish code, a Speechmatics pack, or a reserved keyword.
+
+    The shape is validated here; whether a provider can actually honour the
+    value is decided at the provider boundary (see
+    ``gamas_bot.stt.normalize_language_for_provider``), because ``auto`` and
+    ``multi`` mean different things to different engines.
+    """
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if stripped.lower() in STT_LANGUAGE_KEYWORDS:
+        return True
+    return bool(STT_LANGUAGE_PATTERN.fullmatch(stripped))
+
+
+def sanitize_extra_headers(headers: dict) -> tuple[tuple[str, str], ...]:
+    """Drop reserved/invalid ``NOTE_API_EXTRA_HEADERS_JSON`` entries.
+
+    Authentication belongs to the provider layer: a deployment that pastes an
+    ``Authorization`` or ``x-api-key`` header into the extra-headers JSON would
+    otherwise silently override (or forge) the configured credential. Such
+    entries are dropped with a warning instead of failing the whole startup.
+    """
+    cleaned: list[tuple[str, str]] = []
+    for key, value in headers.items():
+        name = key.strip()
+        if name.lower() in RESERVED_HEADER_NAMES:
+            logger.warning(
+                "Ignoring reserved header from NOTE_API_EXTRA_HEADERS_JSON name=%s", name
+            )
+            continue
+        if not HEADER_NAME_PATTERN.fullmatch(name) or any(
+            character in value for character in "\r\n\x00"
+        ):
+            raise ValueError(
+                f"هدر سفارشی «{name}» در NOTE_API_EXTRA_HEADERS_JSON نامعتبر است."
+            )
+        cleaned.append((name, value))
+    return tuple(cleaned)
+
+
 def _default_env_file() -> Path:
     """``.env`` from the working directory if present, else from the project root."""
     local = Path(".env")
@@ -161,12 +261,30 @@ class Settings:
     max_concurrent_jobs: int
     stt_poll_interval: float
     stt_job_timeout: int
-    # Accuracy-first Speechmatics tier: "enhanced" is the provider's highest
-    # accuracy model; "standard" only exists for throughput-bound deployments.
-    speechmatics_model: str = "enhanced"
+    # Accuracy-first Speechmatics model: "enhanced" is the provider's highest
+    # accuracy model; "standard" only exists for throughput-bound deployments
+    # and "melia-1"/"oak-1" are the multilingual code-switching models.
+    speechmatics_operating_point: str = "enhanced"
+    # Which JSON field carries the selection above. "model" is what the
+    # current Batch API documents; "operating_point" (the deprecated alias) and
+    # "both" exist for older self-hosted batch containers.
+    speechmatics_model_field: str = SPEECHMATICS_MODEL_FIELD
     # Optional custom dictionary (native Speechmatics additional_vocab) for
     # drug names and English technical terms; empty disables it.
     speechmatics_additional_vocab: tuple[str, ...] = ()
+    # Largest custom dictionary sent in one job. The provider recommends at
+    # most 1000 entries per job and rejects a job above 20000; when the
+    # configured vocabulary is longer, the first ``n`` entries are used (the
+    # configured order *is* the priority order).
+    speechmatics_vocab_max_items: int = SPEECHMATICS_VOCAB_RECOMMENDED_LIMIT
+    # Bounded transient-failure retries for one provider attempt.
+    stt_max_attempts: int = 3
+    stt_retry_base_delay: float = 2.0
+    stt_retry_max_delay: float = 30.0
+    # Bounded pending work: at most this many accepted jobs wait for a free
+    # worker. Anything beyond it is rejected with back-pressure instead of
+    # growing an unbounded in-memory backlog.
+    max_pending_jobs: int = 8
     # Optional OpenAI-compatible STT endpoint (POST /audio/transcriptions) such
     # as OpenAI whisper-1, Groq whisper-large-v3, or a local vLLM/Ollama
     # gateway. Unset base URL means the provider is not configured. The key is
@@ -265,6 +383,26 @@ class Settings:
         return self.session_path.with_name(self.session_path.name + ".lock")
 
     @property
+    def speechmatics_model(self) -> str:
+        """Legacy alias for :attr:`speechmatics_operating_point`.
+
+        The provider calls the selection ``model`` (``operating_point`` is the
+        deprecated spelling of the same field), so older code, docs and tests
+        still read this name. Both names always return the same value.
+        """
+        return self.speechmatics_operating_point
+
+    @property
+    def speechmatics_vocab_supported(self) -> bool:
+        """Whether the selected model accepts ``additional_vocab``.
+
+        The multilingual models (``melia-1``/``oak-1``) do not support the
+        custom dictionary, so a configured vocabulary must be dropped instead
+        of being sent in an invalid request.
+        """
+        return self.speechmatics_operating_point not in SPEECHMATICS_MULTILINGUAL_MODELS
+
+    @property
     def docx_fonts(self) -> dict:
         """Per-role document faces.
 
@@ -314,8 +452,8 @@ class Settings:
         if self.note_api_provider == "gemini":
             return self.gemini_model
         if self.note_api_provider == "anthropic":
-            return "claude-3-5-haiku-latest"
-        return "gpt-4o-mini"
+            return DEFAULT_ANTHROPIC_MODEL
+        return DEFAULT_OPENAI_COMPATIBLE_MODEL
 
     @classmethod
     def from_env(cls, env_file: str | Path | None = None) -> "Settings":
@@ -337,13 +475,31 @@ class Settings:
             raise ValueError(
                 "STT_PRIMARY فقط می‌تواند speechmatics، deepgram یا openai_compatible باشد."
             )
-        language = _text("STT_LANGUAGE", "fa")
-        if not re.fullmatch(r"[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?", language):
-            raise ValueError("STT_LANGUAGE باید کد زبان معتبر مانند fa یا en-US باشد.")
+        language = _text("STT_LANGUAGE", "fa").strip()
+        if not _is_supported_stt_language(language):
+            raise ValueError(
+                "STT_LANGUAGE باید کد زبان معتبر مانند fa یا en-US، یا یکی از "
+                "کلیدواژه‌های auto و multi باشد."
+            )
 
-        speechmatics_model = _text("SPEECHMATICS_MODEL", "enhanced").lower()
-        if speechmatics_model not in {"standard", "enhanced"}:
-            raise ValueError("SPEECHMATICS_MODEL فقط می‌تواند standard یا enhanced باشد.")
+        # SPEECHMATICS_OPERATING_POINT is the canonical name (the provider
+        # calls the selection the "model"/operating point); the historical
+        # SPEECHMATICS_MODEL variable still works and wins only when the new
+        # one is empty.
+        speechmatics_operating_point = (
+            _text("SPEECHMATICS_OPERATING_POINT", "") or _text("SPEECHMATICS_MODEL", "enhanced")
+        ).lower()
+        if speechmatics_operating_point not in SPEECHMATICS_OPERATING_POINTS:
+            raise ValueError(
+                "SPEECHMATICS_OPERATING_POINT فقط می‌تواند یکی از "
+                + "، ".join(SPEECHMATICS_OPERATING_POINTS)
+                + " باشد."
+            )
+        speechmatics_model_field = _text("SPEECHMATICS_MODEL_FIELD", SPEECHMATICS_MODEL_FIELD).lower()
+        if speechmatics_model_field not in SPEECHMATICS_MODEL_FIELDS:
+            raise ValueError(
+                "SPEECHMATICS_MODEL_FIELD فقط می‌تواند model، operating_point یا both باشد."
+            )
         vocab_terms: list[str] = []
         seen_terms: set[str] = set()
         for term in re.split(r"[,،؛\n]+", os.getenv("SPEECHMATICS_ADDITIONAL_VOCAB", "")):
@@ -351,15 +507,22 @@ class Settings:
             if term and term.casefold() not in seen_terms:
                 seen_terms.add(term.casefold())
                 vocab_terms.append(term)
-        if len(vocab_terms) > 20_000:
+        if len(vocab_terms) > SPEECHMATICS_VOCAB_HARD_LIMIT:
             raise ValueError(
-                "تعداد اصطلاح‌های SPEECHMATICS_ADDITIONAL_VOCAB از سقف سرویس (۲۰ هزار) بیشتر است."
+                "تعداد اصطلاح‌های SPEECHMATICS_ADDITIONAL_VOCAB از سقف سخت سرویس "
+                f"({SPEECHMATICS_VOCAB_HARD_LIMIT}) بیشتر است."
             )
         stt_openai_base = os.getenv("STT_OPENAI_BASE_URL", "").strip() or None
         if stt_openai_base:
             parsed_stt_url = urlparse(stt_openai_base)
             if parsed_stt_url.scheme not in {"http", "https"} or not parsed_stt_url.netloc:
                 raise ValueError("STT_OPENAI_BASE_URL باید یک نشانی کامل http یا https باشد.")
+        speechmatics_base = _text(
+            "SPEECHMATICS_BASE_URL", "https://eu1.asr.api.speechmatics.com/v2"
+        ).rstrip("/")
+        parsed_speechmatics = urlparse(speechmatics_base)
+        if parsed_speechmatics.scheme not in {"http", "https"} or not parsed_speechmatics.netloc:
+            raise ValueError("SPEECHMATICS_BASE_URL باید یک نشانی کامل http یا https باشد.")
 
         note_provider = _text("NOTE_API_PROVIDER", "gemini").lower()
         note_provider = {
@@ -389,7 +552,9 @@ class Settings:
             for key, value in extra_headers_value.items()
         ):
             raise ValueError("NOTE_API_EXTRA_HEADERS_JSON فقط باید شامل کلید و مقدار متنی باشد.")
-        note_headers = tuple((key, value) for key, value in extra_headers_value.items())
+        # Authentication headers are reserved: an operator-supplied header must
+        # never be able to override the provider's own credential.
+        note_headers = sanitize_extra_headers(extra_headers_value)
 
         try:
             min_confidence = float(_text("STT_MIN_CONFIDENCE", "0.65"))
@@ -403,6 +568,13 @@ class Settings:
             stt_openai_max = int(_text("STT_OPENAI_MAX_UPLOAD_BYTES", "25000000"))
             log_max_bytes = int(_text("LOG_MAX_BYTES", "10000000"))
             log_backup_count = int(_text("LOG_BACKUP_COUNT", "5"))
+            pending_jobs = int(_text("MAX_PENDING_JOBS", "8"))
+            stt_attempts = int(_text("STT_MAX_ATTEMPTS", "3"))
+            vocab_max_items = int(
+                _text("SPEECHMATICS_VOCAB_MAX_ITEMS", str(SPEECHMATICS_VOCAB_RECOMMENDED_LIMIT))
+            )
+            retry_base_delay = float(_text("STT_RETRY_BASE_DELAY_SECONDS", "2"))
+            retry_max_delay = float(_text("STT_RETRY_MAX_DELAY_SECONDS", "30"))
         except ValueError as exc:
             raise ValueError("مقادیر عددی تنظیمات محیط معتبر نیستند.") from exc
         if not all(math.isfinite(value) for value in (min_confidence, poll_interval)):
@@ -411,6 +583,22 @@ class Settings:
             raise ValueError("STT_MIN_CONFIDENCE باید بین صفر و یک باشد.")
         if min(max_file_size, max_jobs, poll_interval, job_timeout, note_timeout, note_max_tokens) <= 0:
             raise ValueError("اندازه فایل، هم‌زمانی و زمان‌های انتظار باید مثبت باشند.")
+        if pending_jobs <= 0:
+            raise ValueError("MAX_PENDING_JOBS باید مثبت باشد.")
+        if not 1 <= stt_attempts <= 5:
+            raise ValueError("STT_MAX_ATTEMPTS باید بین ۱ و ۵ باشد.")
+        if not 1 <= vocab_max_items <= SPEECHMATICS_VOCAB_HARD_LIMIT:
+            raise ValueError(
+                f"SPEECHMATICS_VOCAB_MAX_ITEMS باید بین ۱ و {SPEECHMATICS_VOCAB_HARD_LIMIT} باشد."
+            )
+        if not all(
+            math.isfinite(value) and value > 0 for value in (retry_base_delay, retry_max_delay)
+        ):
+            raise ValueError("زمان‌های بازگشت مجدد STT باید عدد مثبت و متناهی باشند.")
+        if retry_base_delay > retry_max_delay:
+            raise ValueError(
+                "STT_RETRY_BASE_DELAY_SECONDS نمی‌تواند از STT_RETRY_MAX_DELAY_SECONDS بزرگ‌تر باشد."
+            )
         if note_retries < 0 or note_retries > 10:
             raise ValueError("NOTE_API_RETRIES باید بین صفر تا ۱۰ باشد.")
         if stt_openai_max <= 0:
@@ -505,9 +693,7 @@ class Settings:
             stt_fallback_enabled=_flag("STT_FALLBACK_ENABLED", True),
             stt_min_confidence=min_confidence,
             speechmatics_api_key=(os.getenv("SPEECHMATICS_API_KEY", "").strip() or None),
-            speechmatics_base_url=_text(
-                "SPEECHMATICS_BASE_URL", "https://eu1.asr.api.speechmatics.com/v2"
-            ).rstrip("/"),
+            speechmatics_base_url=speechmatics_base,
             deepgram_api_key=(os.getenv("DEEPGRAM_API_KEY", "").strip() or None),
             deepgram_model=_text("DEEPGRAM_MODEL", "nova-3"),
             gemini_api_key=(os.getenv("GEMINI_API_KEY", "").strip() or None),
@@ -515,8 +701,14 @@ class Settings:
             max_concurrent_jobs=max_jobs,
             stt_poll_interval=poll_interval,
             stt_job_timeout=job_timeout,
-            speechmatics_model=speechmatics_model,
+            speechmatics_operating_point=speechmatics_operating_point,
+            speechmatics_model_field=speechmatics_model_field,
             speechmatics_additional_vocab=tuple(vocab_terms),
+            speechmatics_vocab_max_items=vocab_max_items,
+            stt_max_attempts=stt_attempts,
+            stt_retry_base_delay=retry_base_delay,
+            stt_retry_max_delay=retry_max_delay,
+            max_pending_jobs=pending_jobs,
             stt_openai_base_url=stt_openai_base.rstrip("/") if stt_openai_base else None,
             stt_openai_api_key=(os.getenv("STT_OPENAI_API_KEY", "").strip() or None),
             stt_openai_model=_text("STT_OPENAI_MODEL", "whisper-1"),

@@ -34,7 +34,10 @@ Also know:
   reach it, set `TELEGRAM_PROXY` (SOCKS5/HTTP). **Only Telegram traffic uses the
   proxy** — the Speechmatics/Deepgram/note-API calls go out directly, so those
   hosts must be reachable from the server.
-* Use `MAX_CONCURRENT_JOBS=1` on shared hosting.
+* Use `MAX_CONCURRENT_JOBS=1` on shared hosting, and keep the pending queue
+  small (`MAX_PENDING_JOBS=2`): at most `MAX_CONCURRENT_JOBS` jobs run and
+  at most `MAX_PENDING_JOBS` wait; anything beyond that is rejected with a
+  "bot is busy" message instead of piling up in memory.
 
 ## 2. Upload the code
 
@@ -90,6 +93,7 @@ one STT key, and (optionally) the note-API key. Recommended for shared hosting:
 
 ```dotenv
 MAX_CONCURRENT_JOBS=1
+MAX_PENDING_JOBS=2
 PROGRESS_ANIMATION_ENABLED=false   # fewer Telegram edits, less CPU
 # TELEGRAM_PROXY=socks5://user:pass@proxy.example.com:1080
 ```
@@ -183,7 +187,8 @@ The database is created and migrated automatically on first start.
   stop without an error. Lower `MAX_CONCURRENT_JOBS`, disable
   `PROGRESS_ANIMATION_ENABLED`, ask the host to raise CPU/`nproc` limits — or move
   to a VPS. Cron will keep restarting it, but jobs running at that moment are
-  lost (they are marked `failed` and the user must resend).
+  lost (they are marked `failed` and the user must resend), and jobs still
+  waiting in the queue are rejected with an explanation at shutdown.
 * **`status: starting` forever.** Read `data/logs/launcher.err` and
   `data/logs/bot.log`; the usual causes are a wrong token/API id/hash or blocked
   Telegram access.

@@ -1,25 +1,97 @@
+"""Speech-to-text routing for Speechmatics, Deepgram and OpenAI-compatible APIs.
+
+The module keeps three concerns strictly apart, because the providers do not
+agree on any of them:
+
+* **request shape** — each provider gets its own serializer (``model`` for
+  Speechmatics, query parameters for Deepgram, multipart form fields for
+  OpenAI-compatible gateways);
+* **language semantics** — ``fa``, ``en-US``, ``auto`` and ``multi`` mean
+  different things to different engines, so the requested language is
+  translated per provider by :func:`normalize_language_for_provider`;
+* **failure semantics** — :class:`STTTransientError` marks a failure that is
+  worth retrying (429/5xx/network), while a plain :class:`STTError` is
+  permanent and moves straight on to the next configured engine.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 import aiohttp
 
-from .config import Settings
+from .config import SPEECHMATICS_MULTILINGUAL_MODELS, Settings
 from .structuring import _endpoint
 
 logger = logging.getLogger(__name__)
 
 
 class STTError(RuntimeError):
-    pass
+    """A transcription failure that is safe to report and not worth retrying."""
+
+
+class STTConfigurationError(STTError):
+    """The requested combination is invalid for the provider's API.
+
+    Raised before any HTTP request is made: retrying or falling back to
+    another engine cannot fix an unsupported language/model pair, and the same
+    configuration error would simply be reproduced.
+    """
+
+
+class STTTransientError(STTError):
+    """A temporary provider failure (429/5xx/timeouts) worth another attempt."""
+
+    def __init__(self, message: str, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+#: HTTP statuses a well-behaved provider uses for *temporary* trouble.
+#: Everything else in the 4xx range is a request we must not repeat as-is.
+RETRYABLE_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504})
+
+#: Speechmatics result types the transcript builder understands. Unknown types
+#: (e.g. ``entity`` objects) are skipped rather than silently mis-rendered.
+_SPEECHMATICS_TOKEN_TYPES = frozenset({"word", "punctuation"})
+
+#: Punctuation attachment: Speechmatics reports which side a mark belongs to.
+#: A missing or unrecognised value degrades to ``previous`` — the historical
+#: behaviour, and the only safe default for RTL text.
+_PUNCTUATION_ATTACH_PREVIOUS = "previous"
+_PUNCTUATION_ATTACH_NEXT = "next"
+_PUNCTUATION_ATTACH_BOTH = "both"
+
+#: Deepgram models that accept ``language=multi``. The multilingual set is
+#: *smaller* than each model's monolingual coverage: for Nova-3 it is
+#: en, es, fr, de, hi, ru, pt, ja, it and nl — Persian is not part of it.
+#: https://developers.deepgram.com/docs/models-languages-overview
+DEEPGRAM_MULTILINGUAL_MODELS = frozenset(
+    {"nova-2", "nova-3", "nova-2-general", "nova-3-general", "flux-general-multi"}
+)
+DEEPGRAM_MULTILINGUAL_LANGUAGES = (
+    "en",
+    "es",
+    "fr",
+    "de",
+    "hi",
+    "ru",
+    "pt",
+    "ja",
+    "it",
+    "nl",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,6 +117,199 @@ class STTProvider:
     attempt: Callable[[aiohttp.ClientSession, Path, Settings], Awaitable[Transcript]]
     label: str
     max_upload: Callable[[Settings], int]
+
+
+def _is_keyword(language: str, keyword: str) -> bool:
+    return language.strip().lower() == keyword
+
+
+def _is_speechmatics_pack(language: str) -> bool:
+    """True for a Speechmatics bilingual/multilingual pack (``ar_en``, ...).
+
+    Packs are a Speechmatics concept: every other provider expects one language
+    (or its own multilingual mode), so a pack must not be forwarded to them.
+    https://docs.speechmatics.com/speech-to-text/languages
+    """
+    return bool(re.fullmatch(r"[a-z]{2,3}(?:_[a-z]{2,3}){1,3}", language.strip().lower()))
+
+
+def normalize_language_for_provider(
+    provider: str, language: str, *, model: str | None = None
+) -> str | None:
+    """Translate the requested ``STT_LANGUAGE`` into one provider's parameter.
+
+    Returns the value to send, or ``None`` when the provider should be left to
+    detect the language itself (the parameter is then omitted).
+
+    The four concepts the configuration can express are deliberately kept
+    apart: an explicit language, ``auto`` (automatic language *detection*),
+    ``multi`` (a multilingual model that switches language by itself) and the
+    provider's own parameter. They are not interchangeable, so an unsupported
+    combination raises :class:`STTConfigurationError` instead of being sent and
+    silently mis-transcribed.
+    """
+    requested = (language or "").strip()
+    if not requested:
+        raise STTConfigurationError("زبان تبدیل گفتار (STT_LANGUAGE) تنظیم نشده است.")
+    selected_model = (model or "").strip().lower()
+
+    if provider == "speechmatics":
+        multilingual = selected_model in SPEECHMATICS_MULTILINGUAL_MODELS
+        if _is_keyword(requested, "auto"):
+            # Language Identification: Batch SaaS, enhanced/standard only.
+            # melia-1/oak-1 reject `auto` and use `multi` instead.
+            if multilingual:
+                raise STTConfigurationError(
+                    "مدل چندزبانهٔ Speechmatics مقدار auto را نمی‌پذیرد؛ "
+                    "STT_LANGUAGE را روی multi بگذارید."
+                )
+            return "auto"
+        if _is_keyword(requested, "multi"):
+            if not multilingual:
+                raise STTConfigurationError(
+                    "مقدار multi فقط برای مدل‌های چندزبانهٔ Speechmatics "
+                    "(melia-1 یا oak-1) معتبر است."
+                )
+            return "multi"
+        if _is_speechmatics_pack(requested) and multilingual:
+            # Multilingual models do not take a pack: they use `multi` and,
+            # optionally, language_hints.
+            raise STTConfigurationError(
+                "مدل‌های چندزبانهٔ Speechmatics بستهٔ زبانی نمی‌پذیرند؛ "
+                "STT_LANGUAGE را روی multi بگذارید."
+            )
+        return requested
+
+    if provider == "deepgram":
+        # Deepgram has no `language=auto`: detection is the separate
+        # `detect_language` flag, and its supported set does not include
+        # Persian, so `auto` is refused rather than silently mis-detected.
+        if _is_keyword(requested, "auto"):
+            raise STTConfigurationError(
+                "دیپ‌گرام مقدار auto برای زبان ندارد؛ یک کد مشخص (مثل fa یا en) "
+                "یا multi برای مدل‌های چندزبانه انتخاب کنید."
+            )
+        if _is_keyword(requested, "multi"):
+            if selected_model and selected_model not in DEEPGRAM_MULTILINGUAL_MODELS:
+                raise STTConfigurationError(
+                    f"مدل {selected_model} دیپ‌گرام حالت چندزبانه (multi) ندارد."
+                )
+            logger.warning(
+                "Deepgram multilingual mode language=multi model=%s covers only %s; "
+                "languages outside that set (including Persian/fa) are not transcribed "
+                "in this mode",
+                selected_model or "default",
+                ", ".join(DEEPGRAM_MULTILINGUAL_LANGUAGES),
+            )
+            return "multi"
+        if _is_speechmatics_pack(requested):
+            raise STTConfigurationError(
+                f"بستهٔ زبانی {requested} فقط برای Speechmatics تعریف شده است؛ "
+                "برای دیپ‌گرام یک کد زبان مشخص (مثل fa یا en) انتخاب کنید."
+            )
+        # A specific language restricts recognition to it: speech in any other
+        # language is not transcribed (Deepgram "language" documentation).
+        return requested
+
+    if provider == "openai_compatible":
+        if _is_keyword(requested, "auto"):
+            # Whisper-style APIs auto-detect when the field is absent; there is
+            # no `auto` value in the schema.
+            return None
+        if _is_keyword(requested, "multi"):
+            raise STTConfigurationError(
+                "مقدار multi برای سرویس‌های سازگار با OpenAI تعریف نشده است؛ "
+                "برای تشخیص خودکار زبان از auto استفاده کنید."
+            )
+        if _is_speechmatics_pack(requested):
+            raise STTConfigurationError(
+                f"بستهٔ زبانی {requested} فقط برای Speechmatics تعریف شده است؛ "
+                "برای این سرویس یک کد زبان مشخص (مثل fa یا en) انتخاب کنید."
+            )
+        return requested
+
+    raise STTConfigurationError(f"سرویس تبدیل گفتار ناشناخته است: {provider}")
+
+
+def speechmatics_vocab(settings: Settings) -> list[dict[str, str]]:
+    """The ``additional_vocab`` payload for one job, bounded by the provider.
+
+    The provider documents 1000 words/phrases per job as the recommended
+    maximum and *rejects* a job above 20000 entries. The configured order is
+    the priority order, so an oversized dictionary keeps its highest-value
+    prefix (drug names and English medical terms first) instead of an
+    arbitrary subset. Nothing is re-ranked here: choosing the order is the
+    operator's job, silently inventing one is not.
+    """
+    terms = settings.speechmatics_additional_vocab
+    if not terms or not settings.speechmatics_vocab_supported:
+        return []
+    limit = max(1, settings.speechmatics_vocab_max_items)
+    selected = list(terms[:limit])
+    if len(terms) > len(selected):
+        logger.warning(
+            "Speechmatics custom dictionary truncated terms=%s sent=%s limit=%s",
+            len(terms),
+            len(selected),
+            limit,
+        )
+    return [{"content": term} for term in selected]
+
+
+def speechmatics_config(settings: Settings) -> dict:
+    """Job configuration for the Speechmatics batch API.
+
+    The provider's documented field for the model selection is ``model``
+    (``enhanced`` — the highest-accuracy tier this accuracy-first pipeline
+    defaults to — ``standard``, ``melia-1`` or ``oak-1``). ``operating_point``
+    is the *deprecated* spelling of the same field, kept only for older
+    self-hosted containers; ``SPEECHMATICS_MODEL_FIELD`` selects it when a
+    deployment needs it, and ``both`` sends the two spellings together.
+
+    ``additional_vocab`` is the provider's native custom dictionary: exact
+    terms for drug names and English technical vocabulary, with no LLM or
+    post-processing layer involved. It is only sent to models that support it.
+    """
+    model = settings.speechmatics_operating_point
+    language = normalize_language_for_provider(
+        "speechmatics", settings.stt_language, model=model
+    )
+    transcription_config: dict[str, object] = {"language": language}
+    # One canonical field by default; the deprecated alias only on request.
+    field = settings.speechmatics_model_field
+    if field in {"model", "both"}:
+        transcription_config["model"] = model
+    if field in {"operating_point", "both"}:
+        transcription_config["operating_point"] = model
+    vocab = speechmatics_vocab(settings)
+    if vocab:
+        transcription_config["additional_vocab"] = vocab
+    return {
+        "type": "transcription",
+        "transcription_config": transcription_config,
+    }
+
+
+def deepgram_params(settings: Settings) -> dict[str, str]:
+    """Query parameters for the Deepgram pre-recorded API.
+
+    ``language=fa`` (the default) asks for *Persian only*: Deepgram does not
+    transcribe speech in another language while a specific language is set, so
+    this is monolingual Persian recognition, not Persian+English
+    code-switching. ``language=multi`` is accepted only for models that
+    document a multilingual mode, and that mode does not cover Persian.
+    """
+    language = normalize_language_for_provider(
+        "deepgram", settings.stt_language, model=settings.deepgram_model
+    )
+    params = {
+        "model": settings.deepgram_model,
+        "smart_format": "true",
+        "punctuate": "true",
+    }
+    if language:
+        params["language"] = language
+    return params
 
 
 def _speechmatics_confidence(payload: dict) -> float | None:
@@ -83,9 +348,43 @@ def _deepgram_transcript(payload: dict) -> Transcript:
         raise STTError("ساختار پاسخ دیپ‌گرام قابل‌خواندن نیست.") from exc
 
 
-def _http_error(stage: str, status: int) -> STTError:
-    # Provider/gateway error bodies may echo lecture content or credentials.
-    return STTError(f"{stage} failed (HTTP {status})")
+def _retry_after_seconds(response: aiohttp.ClientResponse | None) -> float | None:
+    """Parse ``Retry-After`` (seconds or HTTP date) when the provider sends it."""
+    if response is None:
+        return None
+    raw = (response.headers or {}).get("Retry-After", "").strip()
+    if not raw:
+        return None
+    try:
+        return max(float(raw), 0.0)
+    except ValueError:
+        pass
+    try:
+        retry_at = parsedate_to_datetime(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if retry_at is None:
+        return None
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
+    return max(delay, 0.0)
+
+
+def _http_error(
+    stage: str,
+    status: int,
+    response: aiohttp.ClientResponse | None = None,
+) -> STTError:
+    """Turn an HTTP status into a retryable or permanent STT error.
+
+    Provider/gateway error bodies may echo lecture content or credentials, so
+    only the status (and a sanitized stage name) is reported.
+    """
+    message = f"{stage} failed (HTTP {status})"
+    if status in RETRYABLE_HTTP_STATUSES:
+        return STTTransientError(message, retry_after=_retry_after_seconds(response))
+    return STTError(message)
 
 
 def _transcript_metrics(text: str) -> tuple[int, int]:
@@ -106,37 +405,69 @@ def _log_transcript_stats(engine: str, text: str, confidence: float | None, **ex
     )
 
 
-def speechmatics_config(settings: Settings) -> dict:
-    """Job configuration for the Speechmatics batch API.
+def _speechmatics_text(results: object) -> str:
+    """Join a json-v2 ``results`` array into readable text.
 
-    ``model`` defaults to ``enhanced`` — Speechmatics documents it as the
-    highest-accuracy tier (``standard`` only prioritises throughput), and this
-    pipeline is accuracy-first. ``additional_vocab`` is the provider's native
-    custom-dictionary feature: exact terms for drug names and English
-    technical vocabulary, with no LLM or post-processing layer involved.
+    Punctuation carries an ``attaches_to`` marker (``previous``, ``next`` or
+    ``both``) that says *which* token the mark belongs to. Appending every
+    mark to the previous word — the historical behaviour — produced
+    ``« سلام .`` in RTL text whenever Speechmatics reported ``next``, so the
+    marker is honoured:
+
+    * ``previous`` (and any missing/unknown value) closes the previous token;
+    * ``next`` is buffered and prefixed to the following token;
+    * ``both`` closes the previous token *and* opens the next one.
+
+    Tokens are joined with a single ASCII space and nothing else is inserted,
+    so no bidi control characters or zero-width marks are introduced.
     """
-    transcription_config: dict[str, object] = {
-        "language": settings.stt_language,
-        "model": settings.speechmatics_model,
-    }
-    if settings.speechmatics_additional_vocab:
-        transcription_config["additional_vocab"] = [
-            {"content": term} for term in settings.speechmatics_additional_vocab
-        ]
-    return {
-        "type": "transcription",
-        "transcription_config": transcription_config,
-    }
-
-
-def deepgram_params(settings: Settings) -> dict[str, str]:
-    """Query parameters for the Deepgram pre-recorded API."""
-    return {
-        "model": settings.deepgram_model,
-        "language": settings.stt_language,
-        "smart_format": "true",
-        "punctuate": "true",
-    }
+    if not isinstance(results, (list, tuple)):
+        return ""
+    tokens: list[str] = []
+    pending: list[str] = []  # marks that open the next token
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        alternatives = item.get("alternatives") or []
+        if (
+            item_type not in _SPEECHMATICS_TOKEN_TYPES
+            or not isinstance(alternatives, (list, tuple))
+            or not alternatives
+        ):
+            continue
+        alternative = alternatives[0]
+        if not isinstance(alternative, dict):
+            continue
+        content = str(alternative.get("content", ""))
+        if not content:
+            continue
+        if item_type == "punctuation":
+            attachment = str(alternative.get("attaches_to") or "").strip().lower()
+            if attachment == _PUNCTUATION_ATTACH_NEXT:
+                pending.append(content)
+            elif attachment == _PUNCTUATION_ATTACH_BOTH:
+                if tokens:
+                    tokens[-1] += content
+                pending.append(content)
+            else:
+                # ``previous`` plus the unknown/missing case: closing the
+                # previous token is the only safe default for RTL text.
+                if tokens:
+                    tokens[-1] += content
+                else:
+                    pending.append(content)
+            continue
+        tokens.append("".join(pending) + content)
+        pending.clear()
+    if pending:
+        # Trailing marks with no token left to open.
+        trailing = "".join(pending)
+        if tokens:
+            tokens[-1] += trailing
+        else:
+            tokens.append(trailing)
+    return " ".join(token for token in tokens if token).strip()
 
 
 async def _speechmatics(
@@ -160,7 +491,7 @@ async def _speechmatics(
             data=form,
         ) as response:
             if response.status not in (200, 201, 202):
-                raise _http_error("Speechmatics job submission", response.status)
+                raise _http_error("Speechmatics job submission", response.status, response)
             payload = await response.json(content_type=None)
     job_id = payload.get("id")
     if not job_id:
@@ -186,7 +517,7 @@ async def _speechmatics(
             headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
         ) as response:
             if response.status != 200:
-                raise _http_error("Speechmatics status", response.status)
+                raise _http_error("Speechmatics status", response.status, response)
             status_data = await response.json(content_type=None)
         job = status_data.get("job", status_data)
         status = str(job.get("status", "")).lower()
@@ -223,7 +554,9 @@ async def _speechmatics(
         headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
     ) as response:
         if response.status != 200:
-            raise _http_error("Speechmatics transcript retrieval", response.status)
+            raise _http_error(
+                "Speechmatics transcript retrieval", response.status, response
+            )
         result = await response.json(content_type=None)
     if not isinstance(result, dict):
         raise STTError("Speechmatics پاسخ متن را با ساختار قابل‌خواندن برنگرداند.")
@@ -237,23 +570,7 @@ async def _speechmatics(
         len(results),
     )
 
-    parts: list[str] = []
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        item_type = item.get("type")
-        alternatives = item.get("alternatives") or []
-        if item_type not in {"word", "punctuation"} or not isinstance(alternatives, (list, tuple)) or not alternatives:
-            continue
-        alternative = alternatives[0]
-        if not isinstance(alternative, dict):
-            continue
-        content = str(alternative.get("content", ""))
-        if item_type == "punctuation" and parts:
-            parts[-1] += content
-        elif content:
-            parts.append(content)
-    text = " ".join(parts).strip()
+    text = _speechmatics_text(results)
     if not text:
         # Some API response versions expose the text in results without a type.
         fallback_parts = []
@@ -291,7 +608,7 @@ async def _deepgram(
             data=audio,
         ) as response:
             if response.status != 200:
-                raise _http_error("Deepgram request", response.status)
+                raise _http_error("Deepgram request", response.status, response)
             payload = await response.json(content_type=None)
     logger.info(
         "Deepgram request completed model=%s upload_bytes=%s elapsed_seconds=%.3f",
@@ -307,10 +624,24 @@ async def _deepgram(
 
 
 def _openai_transcript(payload: object) -> Transcript:
-    """Normalize an OpenAI-compatible /audio/transcriptions response."""
-    text = payload.get("text") if isinstance(payload, dict) else None
+    """Normalize an OpenAI-compatible /audio/transcriptions response.
+
+    "OpenAI-compatible" here means exactly one documented shape —
+    ``{"text": "..."}`` — not every server that borrows the route. A response
+    without a usable ``text`` field is a schema mismatch and is reported as
+    one instead of surfacing a ``KeyError`` from deep inside the parser.
+    """
+    if not isinstance(payload, dict):
+        raise STTError(
+            "سرویس تبدیل گفتار سازگار با OpenAI پاسخی با ساختار غیرمنتظره فرستاد "
+            "(یک JSON object با فیلد text لازم است)."
+        )
+    text = payload.get("text")
     if not isinstance(text, str) or not text.strip():
-        raise STTError("سرویس تبدیل گفتار سازگار با OpenAI متن قابل‌استفاده‌ای تولید نکرد.")
+        raise STTError(
+            "سرویس تبدیل گفتار سازگار با OpenAI متن قابل‌استفاده‌ای تولید نکرد "
+            "(فیلد text خالی یا از نوع نامعتبر بود)."
+        )
     # Whisper-style APIs return no per-word confidence, so the router treats
     # this engine like any other un-scored provider.
     return Transcript("openai_compatible", text.strip(), None)
@@ -322,9 +653,13 @@ async def _openai_compatible_stt(
     """POST to an OpenAI-compatible STT endpoint (OpenAI, Groq, vLLM, ...)."""
     assert settings.stt_openai_base_url
     started_at = time.monotonic()
+    # ``auto`` is not an OpenAI schema value: the field is omitted so the
+    # gateway detects the language itself (see normalize_language_for_provider).
+    language = normalize_language_for_provider("openai_compatible", settings.stt_language)
     form = aiohttp.FormData()
     form.add_field("model", settings.stt_openai_model)
-    form.add_field("language", settings.stt_language)
+    if language:
+        form.add_field("language", language)
     with audio_path.open("rb") as audio:
         form.add_field(
             "file",
@@ -343,7 +678,7 @@ async def _openai_compatible_stt(
             data=form,
         ) as response:
             if response.status != 200:
-                raise _http_error("OpenAI-compatible STT request", response.status)
+                raise _http_error("OpenAI-compatible STT request", response.status, response)
             payload = await response.json(content_type=None)
     logger.info(
         "OpenAI-compatible STT request completed model=%s upload_bytes=%s elapsed_seconds=%.3f",
@@ -392,8 +727,82 @@ STT_PROVIDERS: dict[str, STTProvider] = {
 }
 
 
+def _retry_delay_seconds(attempt: int, settings: Settings, retry_after: float | None) -> float:
+    """Bounded exponential backoff, honouring a provider's ``Retry-After``."""
+    if retry_after is not None:
+        return min(max(retry_after, 0.0), settings.stt_retry_max_delay)
+    return min(
+        settings.stt_retry_base_delay * (2 ** max(0, attempt - 1)),
+        settings.stt_retry_max_delay,
+    )
+
+
+async def _attempt_with_retries(
+    engine: str,
+    session: aiohttp.ClientSession,
+    audio_path: Path,
+    settings: Settings,
+) -> Transcript:
+    """Run one provider attempt, retrying only *transient* failures.
+
+    Retryable: HTTP 408/425/429/5xx, connection resets, socket and total
+    timeouts. Not retryable: authentication (401/403), malformed or
+    unsupported requests (400/415/422), unsupported configuration, and any
+    provider answer we cannot parse — repeating those only burns quota. The
+    attempt count and the delay are both bounded, so a dead provider cannot
+    turn into an infinite loop.
+    """
+    attempts = max(1, settings.stt_max_attempts)
+    provider = STT_PROVIDERS[engine]
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.wait_for(
+                provider.attempt(session, audio_path, settings),
+                timeout=settings.stt_job_timeout,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            # Network-level failure: transient unless this was the last try.
+            if attempt >= attempts:
+                raise STTTransientError(
+                    f"{engine} failed after {attempts} attempt(s): {type(exc).__name__}"
+                ) from exc
+            detail, retry_after = type(exc).__name__, None
+        except STTTransientError as exc:
+            if attempt >= attempts:
+                raise
+            detail, retry_after = str(exc), exc.retry_after
+        except STTError:
+            # Permanent provider/request/configuration error: never repeated.
+            raise
+        delay = _retry_delay_seconds(attempt, settings, retry_after)
+        logger.warning(
+            "STT transient failure provider=%s attempt=%s/%s reason=%s retrying_in=%.1fs",
+            engine,
+            attempt,
+            attempts,
+            detail,
+            delay,
+        )
+        await asyncio.sleep(delay)
+    raise STTError(f"{engine} produced no transcript after {attempts} attempt(s)")
+
+
 async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
-    """Transcribe with the configured primary provider and optional fallback."""
+    """Transcribe with the configured primary provider and optional fallback.
+
+    Failure handling is deterministic and ordered:
+
+    1. one engine is retried for transient failures (see
+       :func:`_attempt_with_retries`);
+    2. a permanent error (bad key, unsupported language/model, unparsable
+       answer) skips straight to the next configured engine — a configuration
+       problem is not fixed by asking a different provider the same question,
+       but the operator's provider order is still respected;
+    3. a transcript below ``stt_min_confidence`` also moves to the next engine,
+       and the most confident result wins.
+    """
     primary = settings.stt_primary
     order = [primary]
     if settings.stt_fallback_enabled:
@@ -464,9 +873,10 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
             try:
                 # Bound the whole provider attempt, including upload, polling
                 # and transcript download (socket read timeouts are not totals).
-                transcript = await asyncio.wait_for(
-                    STT_PROVIDERS[engine].attempt(session, audio_path, settings),
-                    timeout=settings.stt_job_timeout,
+                # Transient failures (429/5xx/network/timeout) are retried with
+                # bounded exponential backoff before the engine is given up on.
+                transcript = await _attempt_with_retries(
+                    engine, session, audio_path, settings
                 )
                 chars, words = _transcript_metrics(transcript.text)
                 logger.info(
@@ -500,15 +910,26 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
                 # Unexpected client errors can contain URLs, keys or response
                 # fragments. Keep only our own sanitized errors and error types.
                 detail = str(exc) if isinstance(exc, STTError) else type(exc).__name__
-                logger.warning(
-                    "STT provider failed provider=%s elapsed_seconds=%.3f error_type=%s detail=%s attempt=%s/%s",
-                    engine,
-                    time.monotonic() - started,
-                    type(exc).__name__,
-                    detail,
-                    index + 1,
-                    len(usable),
-                )
+                if isinstance(exc, STTConfigurationError):
+                    # The request was never valid for *this* engine. Another
+                    # provider may still accept the same configuration (e.g.
+                    # Speechmatics supports language=auto, Deepgram does not),
+                    # so the operator's provider order is still honoured.
+                    logger.warning(
+                        "STT provider rejected the configuration provider=%s detail=%s",
+                        engine,
+                        detail,
+                    )
+                else:
+                    logger.warning(
+                        "STT provider failed provider=%s elapsed_seconds=%.3f error_type=%s detail=%s attempt=%s/%s",
+                        engine,
+                        time.monotonic() - started,
+                        type(exc).__name__,
+                        detail,
+                        index + 1,
+                        len(usable),
+                    )
                 failures.append(f"{engine}: {detail}")
                 if index == len(usable) - 1 and not outcomes:
                     raise STTError("؛ ".join(failures)) from None

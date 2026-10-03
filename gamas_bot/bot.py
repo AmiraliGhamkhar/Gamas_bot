@@ -6,8 +6,11 @@ import logging
 import re
 import shutil
 import tempfile
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
@@ -43,7 +46,7 @@ from .presentations import (
     slides_outline,
 )
 from .progress import JobProgress
-from .stt import transcribe
+from .stt import STTConfigurationError, transcribe
 from .structuring import (
     StructuredNotes,
     StructuringError,
@@ -68,7 +71,10 @@ MESSAGE_CHUNK_SIZE = 3800
 TELEGRAM_TEXT_LIMIT = 4096
 MIN_CHUNK_SIZE = 400
 TAG_PATTERN = re.compile(r"<[^>]+>")
-USER_VISIBLE_ERRORS = (ValueError, PresentationError)
+# A configuration error (unsupported language/model for the selected engine)
+# is actionable for the operator, so it is reported verbatim. Transient provider
+# failures are not: the tracking reference is what the user needs for those.
+USER_VISIBLE_ERRORS = (ValueError, PresentationError, STTConfigurationError)
 UNSUPPORTED_FILE_MESSAGE = (
     "این نوع فایل را نمی‌توانم پردازش کنم. 🤔\n\n"
     "یکی از این‌ها را بفرستید:\n"
@@ -445,6 +451,22 @@ def _presentation_metadata(message) -> tuple[str | None, str | None, str | None,
     return kind, filename, mime_type, file_id
 
 
+@dataclass(frozen=True)
+class QueuedJob:
+    """One accepted upload waiting for (or running in) a worker.
+
+    ``run`` is a factory, not a coroutine, so a job can be queued, cancelled or
+    rejected without ever being started.
+    """
+
+    submission_id: int
+    kind: str
+    run: Callable[[], Awaitable[None]]
+    event: Any = None
+    progress: Any = None
+    is_admin: bool = False
+
+
 class StudyBot:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -457,8 +479,118 @@ class StudyBot:
         )
         self.client.parse_mode = None
         self._tasks: set[asyncio.Task] = set()
+        # Second, defensive bound on *active* jobs: the worker pool already
+        # limits concurrency, and this keeps the same guarantee for a job that
+        # is ever started outside a worker.
         self._job_semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
+        # Bounded pending work: a semaphore alone only limits *active* jobs,
+        # so a burst of uploads could otherwise pile up thousands of waiting
+        # tasks in memory. ``MAX_PENDING_JOBS`` bounds the queue itself and a
+        # fixed pool of workers drains it; anything beyond the capacity is
+        # rejected with back-pressure instead of being accepted and forgotten.
+        self._queue: asyncio.Queue[QueuedJob] | None = None
+        self._workers: list[asyncio.Task] = []
         self._pending_admin_actions: dict[int, str] = {}
+
+    # -- job queue ---------------------------------------------------------
+
+    def _job_queue(self) -> asyncio.Queue:
+        if self._queue is None:
+            self._queue = asyncio.Queue(maxsize=self.settings.max_pending_jobs)
+        return self._queue
+
+    def _ensure_workers(self) -> None:
+        """Start the fixed worker pool once (idempotent)."""
+        if self._workers:
+            return
+        count = max(1, self.settings.max_concurrent_jobs)
+        for index in range(count):
+            self._workers.append(
+                asyncio.create_task(self._worker(index), name=f"job-worker-{index}")
+            )
+        logger.info(
+            "Job workers started workers=%s max_pending_jobs=%s",
+            count,
+            self.settings.max_pending_jobs,
+        )
+
+    async def _worker(self, index: int) -> None:
+        """Run queued jobs until cancelled; one job at a time."""
+        queue = self._job_queue()
+        while True:
+            job = await queue.get()
+            try:
+                await job.run()
+            except asyncio.CancelledError:
+                # Shutdown: the job coroutine records its own state.
+                raise
+            except Exception:
+                # A worker must never die because one job misbehaved.
+                logger.exception(
+                    "Unhandled job failure submission_id=%s worker=%s",
+                    job.submission_id,
+                    index,
+                )
+            finally:
+                queue.task_done()
+
+    def _enqueue(self, job: QueuedJob) -> bool:
+        """Accept a job into the bounded queue; False when it is full."""
+        self._ensure_workers()
+        try:
+            self._job_queue().put_nowait(job)
+            return True
+        except asyncio.QueueFull:
+            logger.warning(
+                "Job queue is full submission_id=%s capacity=%s; rejecting with back-pressure",
+                job.submission_id,
+                self.settings.max_pending_jobs,
+            )
+            return False
+
+    async def _reject_job(self, job: QueuedJob, reason: str) -> None:
+        """Fail a job that will never run (queue overflow or shutdown)."""
+        reference = _error_reference(job.submission_id)
+        try:
+            await self.db.set_submission_status(job.submission_id, "failed", reason)
+        except Exception:
+            logger.exception(
+                "Could not store rejected job state reference=%s", reference
+            )
+        if job.progress is not None:
+            try:
+                await job.progress.fail(reference)
+            except Exception:
+                logger.debug("Progress report failed for rejected job", exc_info=True)
+            try:
+                await job.progress.aclose()
+            except Exception:
+                logger.debug("Closing progress failed for rejected job", exc_info=True)
+        if job.event is not None:
+            try:
+                await job.event.reply(
+                    f"{reason}\n\nکد پیگیری: {reference}",
+                    buttons=main_menu(job.is_admin),
+                )
+            except Exception:
+                logger.exception(
+                    "Could not notify the user about a rejected job reference=%s",
+                    reference,
+                )
+
+    async def _drain_queue(self, reason: str) -> None:
+        """Reject everything still waiting when the bot shuts down."""
+        if self._queue is None:
+            return
+        while True:
+            try:
+                job = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await self._reject_job(job, reason)
+            finally:
+                self._queue.task_done()
 
     def _track_task(self, task: asyncio.Task) -> None:
         self._tasks.add(task)
@@ -525,15 +657,25 @@ class StudyBot:
     async def run(self) -> None:
         try:
             await self.start()
+            self._ensure_workers()
             await self.client.run_until_disconnected()
         finally:
             await self.shutdown()
 
     async def shutdown(self) -> None:
+        # Order matters: stop accepting work first, then stop the workers, so a
+        # job is either fully recorded as failed or fully processed — never
+        # silently dropped with a "processing" row left behind.
+        await self._drain_queue("ربات خاموش شد و این کار از صف خارج شد")
         if self._tasks:
             for task in self._tasks:
                 task.cancel()
             await asyncio.gather(*self._tasks, return_exceptions=True)
+        for worker in self._workers:
+            worker.cancel()
+        if self._workers:
+            await asyncio.gather(*self._workers, return_exceptions=True)
+            self._workers = []
         if self.client.is_connected():
             await self.client.disconnect()
         await self.db.close()
@@ -777,8 +919,10 @@ class StudyBot:
             stage="🎬 ویدیو رسید و در صف است" if kind == "video" else "🎧 فایل صوتی رسید و در صف است",
             animate=self.settings.progress_animation,
         )
-        task = asyncio.create_task(
-            self._process_submission(
+        job = QueuedJob(
+            submission_id=submission_id,
+            kind=kind,
+            run=lambda: self._process_submission(
                 event,
                 submission_id,
                 filename,
@@ -786,9 +930,16 @@ class StudyBot:
                 progress=progress,
                 is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
             ),
-            name=f"{kind}-submission-{submission_id}",
+            event=event,
+            progress=progress,
+            is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
         )
-        self._track_task(task)
+        if not self._enqueue(job):
+            await self._reject_job(
+                job,
+                "ربات هم‌اکنون چند کار دیگر را انجام می‌دهد و ظرفیت صف پر است؛ "
+                "چند دقیقه دیگر دوباره این فایل را بفرستید.",
+            )
 
     async def _accept_presentation(
         self, event, user, kind: str, filename, mime_type, file_id
@@ -821,8 +972,10 @@ class StudyBot:
             stage="📊 PowerPoint رسید و در صف است",
             animate=self.settings.progress_animation,
         )
-        task = asyncio.create_task(
-            self._process_presentation(
+        job = QueuedJob(
+            submission_id=submission_id,
+            kind="pptx",
+            run=lambda: self._process_presentation(
                 event,
                 submission_id,
                 filename,
@@ -830,9 +983,16 @@ class StudyBot:
                 progress=progress,
                 is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
             ),
-            name=f"presentation-submission-{submission_id}",
+            event=event,
+            progress=progress,
+            is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
         )
-        self._track_task(task)
+        if not self._enqueue(job):
+            await self._reject_job(
+                job,
+                "ربات هم‌اکنون چند کار دیگر را انجام می‌دهد و ظرفیت صف پر است؛ "
+                "چند دقیقه دیگر دوباره این فایل را بفرستید.",
+            )
 
     async def _process_presentation(
         self,

@@ -567,17 +567,27 @@ class SettingsExtensionTests(unittest.TestCase):
             with patch.dict("os.environ", {}, clear=True):
                 return Settings.from_env(env)
 
-    def test_speechmatics_model_accepts_tier_names_only(self):
+    def test_speechmatics_model_accepts_documented_batch_models_only(self):
         base = (
             "TELEGRAM_BOT_TOKEN=t\nTELEGRAM_API_ID=1\nTELEGRAM_API_HASH=h\n"
             "DEEPGRAM_API_KEY=d\n"
         )
         settings = self._from_env(base + "SPEECHMATICS_MODEL=standard\n")
+        self.assertEqual(settings.speechmatics_operating_point, "standard")
+        # The legacy name keeps working and stays in sync with the new one.
         self.assertEqual(settings.speechmatics_model, "standard")
-        settings = self._from_env(base)
-        self.assertEqual(settings.speechmatics_model, "enhanced")
+        self.assertEqual(self._from_env(base).speechmatics_operating_point, "enhanced")
+        # The multilingual batch models are documented values too.
+        for value in ("melia-1", "oak-1"):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self._from_env(
+                        base + f"SPEECHMATICS_OPERATING_POINT={value}\n"
+                    ).speechmatics_operating_point,
+                    value,
+                )
         with self.assertRaises(ValueError):
-            self._from_env(base + "SPEECHMATICS_MODEL=melia-1\n")
+            self._from_env(base + "SPEECHMATICS_OPERATING_POINT=ultra\n")
 
     def test_additional_vocab_is_split_and_deduplicated(self):
         settings = self._from_env(
