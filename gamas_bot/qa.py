@@ -76,6 +76,37 @@ _CONTINUATION_SUFFIX = re.compile(
     re.IGNORECASE,
 )
 
+#: The heading :meth:`gamas_bot.structuring.NoteSection.from_payload` generates
+#: when a model returns content *without* a heading. Seeing it in a finished
+#: booklet means the provider dropped a heading, which is a structural defect
+#: worth reporting (it is not something the merge can invent back).
+_PLACEHOLDER_HEADING = re.compile(r"^\s*(?:بخش|فصل|قسمت)\s*[\d۰-۹]+\s*$")
+
+#: Relations a lecturer uses to link a paragraph to what came before it. A
+#: section that opens with none of them and reuses no vocabulary from the
+#: previous section opens a subject of its own: reported, never rewritten.
+_RELATION_MARKERS = re.compile(
+    r"(?:چون|زیرا|بنابراین|در\s+نتیجه|از\s+این\s+رو|به\s+همین\s+دلیل|به\s+این\s+ترتیب|"
+    r"اما|ولی|در\s+مقابل|برخلاف|با\s+این\s+حال|"
+    r"برای\s+نمونه|برای\s+مثال|به\s+عنوان\s+مثال|مانند|"
+    r"نخست|نخستین|اول|سپس|پس\s+از\s+آن|در\s+پایان|در\s+نهایت|"
+    r"همچنین|در\s+ادامه|همان\s+طور\s+که|"
+    r"because|therefore|however|in\s+contrast|for\s+example|first|then|finally)",
+    re.IGNORECASE,
+)
+
+#: Words that carry no topical identity when two paragraphs are compared, so
+#: sharing them cannot count as "this opening links to what came before".
+_LINK_STOPWORDS = frozenset(
+    {
+        "است", "هست", "هستند", "شود", "شوند", "شد", "شده", "بود", "بوده", "باشند",
+        "نیز", "را", "مورد", "حال", "طور", "بسیار", "خوب", "کم", "زیاد", "دیگر",
+        "روی", "بین", "زیر", "کار", "بخش", "درس", "متن", "کند", "کنیم", "دارد",
+        "دارند", "دهیم", "گیرد", "می", "های", "این", "آن", "یک", "هم",
+        "the", "and", "for", "with", "that", "this", "are", "was", "were", "its",
+    }
+)
+
 #: Function words that carry no topical identity inside a heading.
 _HEADING_STOPWORDS = frozenset(
     {
@@ -232,6 +263,13 @@ class NoteStructureReport:
     sections_without_paragraphs: int = 0
     #: Headings that are sentences rather than labels (too long / punctuated).
     sentence_headings: int = 0
+    #: Sections whose heading is the placeholder the parser generates when the
+    #: model returned content without a heading ("بخش ۳").
+    untitled_sections: int = 0
+    #: Sections (after the first) whose opening paragraph carries no relation
+    #: to what came before. A weak style signal: a section may legitimately
+    #: start a subject of its own.
+    abrupt_sections: int = 0
     findings: tuple[str, ...] = field(default_factory=tuple)
 
     @property
@@ -327,6 +365,36 @@ def headings_overlap(first: str, second: str, *, threshold: float = 0.5) -> bool
     return len(shared) / len(union) >= threshold
 
 
+#: Tokenizer for the link test: Unicode letters only (Persian and Latin alike),
+#: at least three characters. ZWNJ is removed first so «جمع‌بندی» is one word
+#: rather than two halves.
+_WORD = re.compile(r"[^\W\d_]{3,}", re.UNICODE)
+_ZWNJ = re.compile(r"[\u200c\u200d]")
+
+
+def _content_words(text: str) -> frozenset[str]:
+    """Topical words of a text: no function words, no short tokens."""
+    cleaned = _ZWNJ.sub("", text or "")
+    return frozenset(
+        word.casefold()
+        for word in _WORD.findall(cleaned)
+        if word.casefold() not in _LINK_STOPWORDS
+    )
+
+
+def _opens_with_a_link(paragraph: str, previous_text: str) -> bool:
+    """Does this opening paragraph connect to the text before it?
+
+    Two honest ways to connect: a relation word («چون»، «اما»، «برای نمونه»), or
+    shared vocabulary with the previous section. A section that does neither may
+    be a legitimate new subject — which is why this is a *reported* diagnostic
+    and never a reason to change a single word.
+    """
+    if _RELATION_MARKERS.search(paragraph or ""):
+        return True
+    return bool(_content_words(paragraph) & _content_words(previous_text))
+
+
 def _heading_looks_like_a_sentence(heading: str) -> bool:
     """A heading is a label; a full sentence with a terminator is not."""
     text = _compare_key(heading)
@@ -381,12 +449,15 @@ def analyze_structure(notes) -> NoteStructureReport:
     split_topics = 0
     sections_without_paragraphs = 0
     sentence_headings = 0
+    untitled_sections = 0
+    abrupt_sections = 0
 
     seen_headings: set[str] = set()
     seen_paragraphs: set[str] = set()
     seen_bullets: set[str] = set()
     seen_points: set[str] = set()
     previous_heading = ""
+    previous_body = ""
 
     for section in sections:
         if not section.has_content:
@@ -409,6 +480,11 @@ def analyze_structure(notes) -> NoteStructureReport:
             sections_without_paragraphs += 1
         if _heading_looks_like_a_sentence(section.heading):
             sentence_headings += 1
+        if _PLACEHOLDER_HEADING.match(section.heading or ""):
+            untitled_sections += 1
+        if previous_body and section.paragraphs:
+            if not _opens_with_a_link(section.paragraphs[0], previous_body):
+                abrupt_sections += 1
         heading_key = _compare_key(section.heading)
         if heading_key:
             if heading_key in seen_headings:
@@ -423,6 +499,7 @@ def analyze_structure(notes) -> NoteStructureReport:
         ):
             split_topics += 1
         previous_heading = section.heading
+        previous_body = visible
         for paragraph in section.paragraphs:
             key = _compare_key(paragraph)
             if key in seen_paragraphs:
@@ -488,6 +565,12 @@ def analyze_structure(notes) -> NoteStructureReport:
         findings.append(f"fragmented sections (bullet-only): {bullet_only}")
     if sentence_headings:
         findings.append(f"headings written as sentences: {sentence_headings}")
+    if untitled_sections:
+        findings.append(f"sections the model left untitled: {untitled_sections}")
+    if abrupt_sections:
+        findings.append(
+            f"sections that open without a link to the previous one: {abrupt_sections}"
+        )
     if repeated_summary:
         findings.append(
             f"summary sentences repeated from the body: {repeated_summary}"
@@ -506,6 +589,8 @@ def analyze_structure(notes) -> NoteStructureReport:
         split_topics=split_topics,
         sections_without_paragraphs=sections_without_paragraphs,
         sentence_headings=sentence_headings,
+        untitled_sections=untitled_sections,
+        abrupt_sections=abrupt_sections,
         findings=tuple(findings),
     )
 

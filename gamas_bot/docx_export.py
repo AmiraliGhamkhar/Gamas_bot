@@ -109,10 +109,21 @@ CALLOUT_STYLE_BY_KIND = {"هشدار": WARNING_STYLE, "یادآوری": NOTE_STY
 HEADING_SIZES = {1: 15.0, 2: 12.5, 3: 11.5}
 HEADING_SPACING = {1: (14, 6), 2: (10, 4), 3: (8, 3)}
 
-#: A table of contents needs a document with enough structure to browse; below
-#: this many sections the cover plus a short body is short enough to read
-#: without one.
-TOC_MIN_SECTIONS = 3
+#: A table of contents needs a document with enough structure to browse. A short
+#: note is read in one sitting, and a TOC in front of it costs a page and adds a
+#: page of whitespace; a long one is unusable without it. Two independent
+#: signals are used, because either can be right on its own: enough peer
+#: headings to navigate, or enough body text to need navigation.
+TOC_MIN_SECTIONS = 4
+TOC_MIN_BODY_CHARS = 2400
+
+#: Heading levels included in the table of contents. Level 1 only by default:
+#: the document's own block labels («تعریفها»، «مثالها»، «مقایسه و دستهبندی»)
+#: are real Heading 2s and repeat in every section, so a 1-2 TOC would be
+#: dominated by a handful of repeated labels instead of the lecture's topics.
+#: ``DOCX_TOC_LEVELS`` restores subtopics on request.
+TOC_LEVELS = "1-1"
+ALLOWED_TOC_LEVELS = frozenset({"1", "1-1", "1-2", "1-3"})
 
 #: Auto-detected optional logo, used when DOCX_LOGO_PATH is not configured.
 #: Fonts and images are never downloaded at generation time.
@@ -212,6 +223,8 @@ class DocxDesign:
 
     cover_enabled: bool = True
     toc_enabled: bool = True
+    toc_levels: str = TOC_LEVELS
+    toc_min_sections: int = TOC_MIN_SECTIONS
     page_border_enabled: bool = True
     border_style: str = "single"
     border_color: str = DEFAULT_BORDER_COLOR
@@ -270,9 +283,18 @@ def resolve_design(design_config: dict | None = None) -> DocxDesign:
         space = int(config.get("border_space") or DEFAULT_BORDER_SPACE)
     except (TypeError, ValueError):
         space = DEFAULT_BORDER_SPACE
+    toc_levels = str(config.get("toc_levels") or TOC_LEVELS).strip() or TOC_LEVELS
+    if toc_levels not in ALLOWED_TOC_LEVELS:
+        toc_levels = TOC_LEVELS
+    try:
+        toc_min_sections = int(config.get("toc_min_sections") or TOC_MIN_SECTIONS)
+    except (TypeError, ValueError):
+        toc_min_sections = TOC_MIN_SECTIONS
     return DocxDesign(
         cover_enabled=_as_flag(config.get("cover_enabled"), True),
         toc_enabled=_as_flag(config.get("toc_enabled"), True),
+        toc_levels=toc_levels,
+        toc_min_sections=min(max(toc_min_sections, 1), 200),
         page_border_enabled=_as_flag(config.get("page_border_enabled"), True),
         border_style=style,
         border_color=color,
@@ -1024,6 +1046,51 @@ def _new_document(meta: DocumentMeta, title: str) -> Document:
     return document
 
 
+def cover_meta_lines(meta: DocumentMeta, *, mode_label: str = "") -> list[str]:
+    """The cover's metadata, pre-split into short balanced lines.
+
+    One long ``… • … • …`` line wraps unpredictably in a centred RTL paragraph
+    and can leave a tracking reference stranded on a line of its own. Splitting
+    the same facts into two short, self-contained lines keeps every label next
+    to its value on the cover, while :func:`_meta_line` keeps the single-line
+    form for the raw ``.txt`` companion file (unchanged behaviour there).
+    """
+    created = meta.created_at or datetime.now()
+    lines: list[str] = []
+    if mode_label:
+        lines.append(mode_label)
+    date_source = f"تاریخ: {jalali_date(created)}"
+    if meta.source_name:
+        date_source += f"  •  منبع: {sanitize_filename_part(meta.source_name, max_chars=40)}"
+    lines.append(date_source)
+    engine_reference = f"کد پیگیری: {meta.reference}"
+    if meta.engine:
+        engine_reference = f"موتور تبدیل گفتار: {meta.engine}  •  {engine_reference}"
+    lines.append(engine_reference)
+    return lines
+
+
+def _wrap_estimate(text: str, chars_per_line: int) -> list[str]:
+    """Rough word-wrap of ``text`` for layout *estimation* only.
+
+    Word does the real wrapping; this exists so the cover can adapt its spacer
+    count to a longer title or a longer metadata block without a layout engine.
+    """
+    words = (text or "").split()
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip()
+        if current and len(candidate) > chars_per_line:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    if current or not lines:
+        lines.append(current)
+    return lines
+
+
 def _meta_line(meta: DocumentMeta) -> str:
     created = meta.created_at or datetime.now()
     parts = [f"تاریخ: {jalali_date(created)}"]
@@ -1056,6 +1123,14 @@ def _add_rule(
     paragraph.paragraph_format.right_indent = Cm(right_indent)
     paragraph.paragraph_format.left_indent = Cm(right_indent)
     _shade_paragraph(paragraph, fill)
+
+
+def _add_body_section(document, *, design: DocxDesign):
+    """Start the body section (A4, page frame) after the cover page."""
+    section = document.add_section(WD_SECTION.NEW_PAGE)
+    _configure_section(section)
+    apply_page_border(section, design)
+    return section
 
 
 def _add_brand_mark(document, *, fonts: DocumentFonts, design: DocxDesign) -> None:
@@ -1109,21 +1184,31 @@ def _add_cover_page(
         space_after=6, line_spacing=1.15, style=TITLE_STYLE,
     )
     _add_directional_text(title_paragraph, title, fonts=heading_fonts, size=24, bold=True, color=ACCENT)
-    if mode_label:
+    _keep_with_next(title_paragraph)
+    # The mode label and the metadata are separate short lines (see
+    # cover_meta_lines): a single wrapped line strands the tracking reference.
+    meta_lines = cover_meta_lines(meta, mode_label=mode_label)
+    for position, line in enumerate(meta_lines):
         _add_rtl_paragraph(
-            document, mode_label, fonts=fonts, size=10.5, color=ACCENT,
-            align=WD_ALIGN_PARAGRAPH.CENTER, space_after=2, line_spacing=1.0,
+            document,
+            line,
+            fonts=fonts,
+            size=10.5 if position == 0 and mode_label else 9.5,
+            color=ACCENT if position == 0 and mode_label else MUTED,
+            align=WD_ALIGN_PARAGRAPH.CENTER,
+            space_after=2,
+            line_spacing=1.2,
         )
-    _add_rtl_paragraph(
-        document, _meta_line(meta), fonts=fonts, size=9.5, color=MUTED,
-        align=WD_ALIGN_PARAGRAPH.CENTER, space_after=2, line_spacing=1.2,
-    )
     _add_rule(document, fonts=fonts, fill=RULE_FILL, space_after=14)
 
     # Flexible space so the quotation sits quietly in the lower third of the
     # page (fixed spacer paragraphs: Word has no "flexible space" that survives
     # a font substitution, so the offset is deliberately conservative).
-    for _ in range(9):
+    # A longer title and a longer metadata block push the quotation down, so
+    # they give back one spacer line each — the cover keeps the same balance
+    # whatever the job metadata looks like.
+    extra_lines = max(0, len(_wrap_estimate(title, 48)) - 1) + max(0, len(meta_lines) - 2)
+    for _ in range(max(5, 12 - extra_lines)):
         _add_rtl_paragraph(
             document, "", fonts=fonts, size=11, space_after=12, line_spacing=1.0
         )
@@ -1144,16 +1229,18 @@ def _add_body_title_block(
     meta: DocumentMeta,
     *,
     fonts: DocumentFonts,
+    design: DocxDesign | None = None,
     mode_label: str = "",
 ) -> None:
     """The title block of a cover-less document.
 
     Without the cover page nothing else in the file states what the booklet is
     called, so the first page opens with the title, the mode and the same
-    metadata line the cover would have shown.
+    metadata line the cover would have shown. The design is passed through so a
+    configured local logo is still used when the cover is switched off.
     """
     heading_fonts = _heading_fonts(fonts)
-    _add_brand_mark(document, fonts=fonts, design=DocxDesign())
+    _add_brand_mark(document, fonts=fonts, design=design or DocxDesign())
     paragraph = _add_rtl_paragraph(
         document, "", fonts=heading_fonts, align=WD_ALIGN_PARAGRAPH.CENTER,
         space_after=6, line_spacing=1.15, style=TITLE_STYLE,
@@ -1171,7 +1258,45 @@ def _add_body_title_block(
     _add_rule(document, fonts=fonts, space_after=14)
 
 
-def _add_toc(document, *, fonts: DocumentFonts, levels: str = "1-2") -> None:
+def _sections_chars(sections) -> int:
+    """Approximate visible length of a set of note sections.
+
+    Used only to decide whether a document is long enough to need a table of
+    contents, so an approximate count of every visible string is enough.
+    """
+    total = 0
+    for section in sections or ():
+        total += len(section.heading or "")
+        total += sum(len(value) for value in section.paragraphs)
+        total += sum(len(value) for value in section.bullets)
+        total += sum(len(entry.term) + len(entry.definition) for entry in section.definitions)
+        total += sum(len(value) for value in section.examples)
+        total += sum(len(value) for value in section.steps)
+        total += sum(len(value) for value in section.formulas)
+        total += sum(len(value) for value in section.key_points)
+        for callout in section.callouts:
+            total += len(callout.text)
+        if section.table is not None:
+            total += sum(len(header) for header in section.table.headers)
+            total += sum(len(cell) for row in section.table.rows for cell in row)
+    return total
+
+
+def toc_is_worth_it(body_chars: int, sections: int, design: DocxDesign) -> bool:
+    """Should this document carry a table of contents?
+
+    Two independent signals, because either can be right alone: a booklet with
+    many peer sections needs a map even if the sections are short, and a long
+    booklet needs one even if it has few headings. A short note is read in one
+    sitting, and a TOC placed in front of it costs a page of the reader's
+    attention for nothing.
+    """
+    if not design.toc_enabled:
+        return False
+    return sections >= design.toc_min_sections or body_chars >= TOC_MIN_BODY_CHARS
+
+
+def _add_toc(document, *, fonts: DocumentFonts, levels: str = TOC_LEVELS) -> None:
     """An automatic Word table of contents built from the heading styles.
 
     The field is marked ``w:dirty`` so Word offers to build it on open; until
@@ -1654,9 +1779,7 @@ def build_notes_docx(
         )
         # The cover is a section of its own: no running header, no page number,
         # and the body restarts at page one behind a page break.
-        body_section = document.add_section(WD_SECTION.NEW_PAGE)
-        _configure_section(body_section)
-        apply_page_border(body_section, style)
+        body_section = _add_body_section(document, design=style)
     else:
         # Without a cover the first page *is* body content. Adding a section
         # break here would silently create a blank leading page.
@@ -1666,14 +1789,15 @@ def build_notes_docx(
             notes.display_title,
             meta,
             fonts=resolved,
+            design=style,
             mode_label=MODE_LABELS.get(notes.note_mode, ""),
         )
     _set_section_page_numbering(body_section, start=1)
     _add_document_header(body_section, fonts=resolved, title=notes.display_title)
     _add_page_number_footer(body_section, fonts=resolved, design=style)
 
-    if style.toc_enabled and len(notes.sections) >= TOC_MIN_SECTIONS:
-        _add_toc(document, fonts=resolved)
+    if toc_is_worth_it(_sections_chars(notes.sections), len(notes.sections), style):
+        _add_toc(document, fonts=resolved, levels=style.toc_levels)
         _add_page_break(document)
 
     if notes.learning_objectives:
@@ -1760,15 +1884,25 @@ def build_plain_docx(
     apply_page_border(first_section, style)
     if style.cover_enabled:
         _add_cover_page(document, title, meta, fonts=resolved, design=style)
-        body_section = document.add_section(WD_SECTION.NEW_PAGE)
-        _configure_section(body_section)
-        apply_page_border(body_section, style)
+        body_section = _add_body_section(document, design=style)
     else:
         body_section = first_section
-        _add_body_title_block(document, title, meta, fonts=resolved)
+        _add_body_title_block(document, title, meta, fonts=resolved, design=style)
     _set_section_page_numbering(body_section, start=1)
     _add_document_header(body_section, fonts=resolved, title=title)
     _add_page_number_footer(body_section, fonts=resolved, design=style)
+
+    # Raw material is rendered as Markdown headings, so the same "long enough
+    # to browse?" rule applies: a fallback booklet earns a table of contents
+    # exactly when the notes path would have produced one. A raw text with no
+    # (or a single) heading would produce an empty TOC page, so it never gets
+    # one whatever its length.
+    markdown_headings = sum(
+        1 for line in text.splitlines() if re.match(r"^\s{0,3}#{1,6}\s+\S", line)
+    )
+    if markdown_headings >= 2 and toc_is_worth_it(len(text), markdown_headings, style):
+        _add_toc(document, fonts=resolved, levels=style.toc_levels)
+        _add_page_break(document)
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip()

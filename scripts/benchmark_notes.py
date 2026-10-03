@@ -142,6 +142,10 @@ def _structure_facts(notes: StructuredNotes) -> dict:
         "empty_sections": report.empty_sections,
         "short_sections": report.short_sections,
         "bullet_only_sections": report.bullet_only_sections,
+        "sections_without_paragraphs": report.sections_without_paragraphs,
+        "split_topics": report.split_topics,
+        "untitled_sections": report.untitled_sections,
+        "abrupt_sections": report.abrupt_sections,
         "findings": list(report.findings),
     }
 
@@ -233,6 +237,46 @@ def _prompt_facts(mode: str) -> dict:
         "names_educational_units": "واحد آموزشی یعنی" in prompt,
         "forbids_one_line_replacement": "جایگزین نکنید" in prompt,
         "keeps_transitions": "در نتیجه" in prompt and "برای نمونه" in prompt,
+    }
+
+
+def _chunk_context_facts() -> dict:
+    """The per-part context block: topic, position, neighbours, continuity."""
+    from gamas_bot.editorial import (
+        LectureContext,
+        build_context_block,
+        chunk_continuity,
+        context_block_for,
+    )
+
+    context = LectureContext(title="درس آزمون", topics=("الف", "ب"), terminology=("Metformin",))
+    documents = [
+        "نخستین جملهٔ درس دربارهٔ الف است. و ادامهٔ همین موضوع را پی می‌گیریم",
+        "بنابراین ادامهٔ همان موضوع الف را با مثال بررسی می‌کنیم.",
+    ]
+    block = context_block_for(context, documents, 2)
+    continued = chunk_continuity(documents[1], index=2, total=2)
+    unfinished = chunk_continuity(
+        "نخستین جمله. و اما پیامدهای بعدی این فرایند", index=1, total=2
+    )
+    raw_stt = chunk_continuity("متن بدون نقطه پایانی که همچنان ادامه دارد", index=2, total=3)
+    return {
+        "has_context": bool(block),
+        "states_own_topic": "موضوع همین بخش" in block,
+        "topic_matches_part": context.topic_for(2, 2) == "ب",
+        "topic_with_wrong_count_is_ignored": context.topic_for(1, 3) == "",
+        "signals_continuation": bool(continued.starts_mid_topic),
+        "signals_unfinished_part": bool(unfinished.ends_mid_topic),
+        "punctuation_free_text_stays_silent": not (
+            raw_stt.starts_mid_topic or raw_stt.ends_mid_topic
+        ),
+        "context_chars": len(block),
+        "compile_without_context": len(
+            context_block_for(LectureContext(), documents, 1)
+        ),
+        "silent_for_single_part": build_context_block(context, index=1, total=1)
+        .count("موضوع همین بخش")
+        == 0,
     }
 
 
@@ -440,6 +484,7 @@ def run(mode: str = "full", live: bool = False) -> dict:
 
     report["fixtures"] = fixtures_report
     report["merge_probe"] = _merge_probe()
+    report["chunk_context"] = _chunk_context_facts()
     report["continuation_probe"] = _continuation_probe()
     report["long_lecture_probe"] = _long_lecture_probe()
     report["document_probe"] = _document_probe(settings_fonts)
@@ -480,6 +525,17 @@ def run(mode: str = "full", live: bool = False) -> dict:
         }
     if report["merge_probe"]:
         report["summary"]["merge_duplicate_rate"] = report["merge_probe"]["duplicate_rate"]
+    context_facts = report.get("chunk_context") or {}
+    if context_facts:
+        report["summary"]["parts_know_their_own_topic"] = context_facts[
+            "states_own_topic"
+        ]
+        report["summary"]["parts_get_the_lecture_context"] = context_facts["has_context"]
+        report["summary"]["parts_get_continuity_hints"] = (
+            context_facts["signals_continuation"]
+            and context_facts["signals_unfinished_part"]
+            and context_facts["punctuation_free_text_stays_silent"]
+        )
     probe = report.get("continuation_probe") or {}
     if probe:
         report["summary"]["continuation_joins_correct"] = probe["correct_joins"]
@@ -627,6 +683,42 @@ def main(argv: list[str] | None = None) -> int:
                     f"ratio={live['compression_ratio']} signal={live['signal_coverage']} "
                     f"semantic={live['semantic_coverage']} units={live['units']}"
                 )
+    probe = report.get("document_probe") or {}
+    if probe:
+        structure = probe.get("structure") or {}
+        docx = probe.get("docx") or {}
+        print(
+            "long document: sections={sections} headings={headings} toc={toc} "
+            "page_border={border} page_field={page_field}".format(
+                sections=probe.get("sections"),
+                headings=docx.get("heading_paragraphs"),
+                toc=docx.get("toc"),
+                border=bool(docx.get("page_borders")),
+                page_field=docx.get("page_field"),
+            )
+        )
+        print(
+            "structure: repeated_headings={repeated} split_topics={split} "
+            "untitled={untitled} abrupt_openings={abrupt} duplicate_paragraphs={dupes}".format(
+                repeated=structure.get("repeated_headings"),
+                split=structure.get("split_topics"),
+                untitled=structure.get("untitled_sections"),
+                abrupt=structure.get("abrupt_sections"),
+                dupes=structure.get("duplicate_paragraphs"),
+            )
+        )
+    context_facts = report.get("chunk_context") or {}
+    if context_facts:
+        print(
+            "part context: own_topic={topic} continuation={cont} unfinished={cut} "
+            "silent_on_raw_stt={raw} chars={chars}".format(
+                topic=context_facts["states_own_topic"],
+                cont=context_facts["signals_continuation"],
+                cut=context_facts["signals_unfinished_part"],
+                raw=context_facts["punctuation_free_text_stays_silent"],
+                chars=context_facts["context_chars"],
+            )
+        )
     print(
         "\nNote: a low compression_ratio alone is NOT a failure — read it together "
         "with semantic coverage. A ratio below "

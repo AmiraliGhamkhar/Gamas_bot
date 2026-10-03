@@ -219,6 +219,10 @@ class Settings:
     # --- Word document design (cover / TOC / page frame / footer brand) ---
     docx_cover_enabled: bool = True
     docx_toc_enabled: bool = True
+    #: Heading levels in the automatic table of contents ("1-1" = topics only).
+    docx_toc_levels: str = "1-1"
+    #: Section count from which a document earns a table of contents.
+    docx_toc_min_sections: int = 4
     docx_page_border_enabled: bool = True
     docx_page_border_style: str = "single"
     docx_page_border_color: str = "BFCEE4"
@@ -283,6 +287,8 @@ class Settings:
         return {
             "cover_enabled": self.docx_cover_enabled,
             "toc_enabled": self.docx_toc_enabled,
+            "toc_levels": self.docx_toc_levels,
+            "toc_min_sections": self.docx_toc_min_sections,
             "page_border_enabled": self.docx_page_border_enabled,
             "border_style": self.docx_page_border_style,
             "border_color": self.docx_page_border_color,
@@ -437,6 +443,17 @@ class Settings:
             raise ValueError("DOCX_PAGE_BORDER_WIDTH باید بین ۲ و ۹۶ باشد (هشتم نقطه).")
         if not 0 <= docx_border_space <= 31:
             raise ValueError("DOCX_PAGE_BORDER_SPACE باید بین ۰ و ۳۱ نقطه باشد.")
+        # The TOC levels must be a level range Word understands; anything else
+        # falls back to level 1 rather than producing a field Word rejects.
+        docx_toc_levels = _text("DOCX_TOC_LEVELS", "1-1").replace("–", "-").replace(" ", "")
+        if docx_toc_levels not in {"1", "1-1", "1-2", "1-3"}:
+            raise ValueError("DOCX_TOC_LEVELS باید یکی از 1، 1-1، 1-2 یا 1-3 باشد.")
+        try:
+            docx_toc_min_sections = int(_text("DOCX_TOC_MIN_SECTIONS", "4"))
+        except ValueError as exc:
+            raise ValueError("DOCX_TOC_MIN_SECTIONS باید عددی باشد.") from exc
+        if not 1 <= docx_toc_min_sections <= 200:
+            raise ValueError("DOCX_TOC_MIN_SECTIONS باید بین ۱ و ۲۰۰ باشد.")
         log_file_value = os.getenv("LOG_FILE", "").strip()
         proxy_value = os.getenv("TELEGRAM_PROXY", "").strip()
         telegram_proxy = parse_proxy(proxy_value) if proxy_value else None
@@ -527,6 +544,8 @@ class Settings:
             note_global_context_enabled=_flag("NOTE_GLOBAL_CONTEXT_ENABLED", True),
             docx_cover_enabled=_flag("DOCX_COVER_ENABLED", True),
             docx_toc_enabled=_flag("DOCX_TOC_ENABLED", True),
+            docx_toc_levels=docx_toc_levels,
+            docx_toc_min_sections=docx_toc_min_sections,
             docx_page_border_enabled=_flag("DOCX_PAGE_BORDER_ENABLED", True),
             docx_page_border_style=docx_border_style,
             docx_page_border_color=docx_border_color,

@@ -677,6 +677,54 @@ class CoherenceDiagnosticsTests(unittest.TestCase):
         self.assertEqual(report.sections_without_paragraphs, 1)
         self.assertTrue(any("headings written as sentences" in item for item in report.findings))
 
+    def test_untitled_and_abrupt_sections_are_reported(self):
+        from gamas_bot.qa import analyze_structure
+
+        report = analyze_structure(
+            StructuredNotes(
+                title="درس",
+                sections=(
+                    NoteSection(
+                        heading="مقدمه",
+                        paragraphs=("این بخش دربارهٔ قلب و شش‌ها در بدن انسان است. " * 3,),
+                    ),
+                    # The parser writes «بخش ۲» when a model returns content
+                    # without a heading, and this opening shares no vocabulary
+                    # with the previous section and carries no relation word.
+                    NoteSection(
+                        heading="بخش ۲",
+                        paragraphs=("گلوکز ناشتا با آزمایش سنجیده می‌شود. " * 3,),
+                    ),
+                ),
+            )
+        )
+        self.assertEqual(report.untitled_sections, 1)
+        self.assertEqual(report.abrupt_sections, 1)
+        self.assertTrue(
+            any("left untitled" in item for item in report.findings), report.findings
+        )
+        self.assertTrue(
+            any("without a link to the previous" in item for item in report.findings),
+            report.findings,
+        )
+
+    def test_a_linked_section_is_not_reported_as_abrupt(self):
+        from gamas_bot.qa import analyze_structure
+
+        report = analyze_structure(
+            StructuredNotes(
+                title="درس",
+                sections=(
+                    NoteSection(heading="مقدمه", paragraphs=("مقدمه‌ای دربارهٔ قلب و گردش خون. " * 3,)),
+                    NoteSection(
+                        heading="ادامه",
+                        paragraphs=("بنابراین گردش خون به اکسیژن رسانی بافت‌ها کمک می‌کند. " * 3,),
+                    ),
+                ),
+            )
+        )
+        self.assertEqual(report.abrupt_sections, 0)
+
     def test_a_clean_document_reports_nothing(self):
         from gamas_bot.qa import analyze_structure
 
@@ -689,8 +737,11 @@ class CoherenceDiagnosticsTests(unittest.TestCase):
                         paragraphs=("توضیح کامل و کافی دربارهٔ مقدمه و هدف درس در این بخش آمده است. " * 3,),
                     ),
                     NoteSection(
+                        # The second section opens with a relation word, so it
+                        # is linked: a clean booklet is clean for every
+                        # diagnostic, including the transition one.
                         heading="نتیجه",
-                        paragraphs=("جمع‌بندی این بخش با اشاره به نتیجهٔ اصلی درس نوشته شده است. " * 3,),
+                        paragraphs=("در پایان، جمع‌بندی این بخش با اشاره به نتیجهٔ اصلی نوشته شده است. " * 3,),
                     ),
                 ),
             )
