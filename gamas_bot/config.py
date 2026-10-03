@@ -428,7 +428,7 @@ class Settings:
             raise ValueError(
                 "DOCX_PAGE_BORDER_COLOR باید یک رنگ هگز شش‌رقمی باشد؛ مثل BFCEE4."
             )
-        # An unknown style silently falls back to a plain line (see
+        # An unknown style silently falls back to the default single line (see
         # resolve_design); the numbers below are strict, because a wrong value
         # would produce an invalid w:pgBorders element.
         docx_border_style = _text("DOCX_PAGE_BORDER_STYLE", "single")
@@ -443,8 +443,11 @@ class Settings:
             raise ValueError("DOCX_PAGE_BORDER_WIDTH باید بین ۲ و ۹۶ باشد (هشتم نقطه).")
         if not 0 <= docx_border_space <= 31:
             raise ValueError("DOCX_PAGE_BORDER_SPACE باید بین ۰ و ۳۱ نقطه باشد.")
-        # The TOC levels must be a level range Word understands; anything else
-        # falls back to level 1 rather than producing a field Word rejects.
+        # The TOC levels must be a level range Word understands. Unlike the
+        # border *style* (which can fall back to a plain line), a typo here is
+        # rejected at startup: silently building a different TOC than the one
+        # that was configured is worse than a clear error. ``resolve_design()``
+        # stays permissive for programmatic callers and falls back to level 1.
         docx_toc_levels = _text("DOCX_TOC_LEVELS", "1-1").replace("–", "-").replace(" ", "")
         if docx_toc_levels not in {"1", "1-1", "1-2", "1-3"}:
             raise ValueError("DOCX_TOC_LEVELS باید یکی از 1، 1-1، 1-2 یا 1-3 باشد.")

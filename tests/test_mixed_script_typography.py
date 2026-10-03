@@ -163,11 +163,34 @@ class DocxTypographyTests(unittest.TestCase):
         xml = self._xml("شاخص HbA1c مهم است.")
         self.assertIn('<w:bidi w:val="1"/>', xml)
 
-    def test_latin_only_paragraph_is_not_forced_rtl(self):
-        xml = self._xml("The diagnosis is based on HbA1c.")
-        self.assertFalse(is_rtl_dominant("The diagnosis is based on HbA1c."))
-        # It still gets runs; the point is that its base direction is not Persian.
-        self.assertIn("HbA1c", xml)
+    def test_paragraph_direction_follows_its_own_content(self):
+        """A Latin-only line keeps Word's LTR base direction.
+
+        Regression: every paragraph was once forced to ``w:bidi``, which
+        misresolved the neutrals and the paragraph mark of formulas, URL lists
+        and other Latin-only lines -- the reason :func:`is_rtl_dominant`
+        exists at all.
+        """
+        text = "The diagnosis is based on HbA1c."
+        self.assertFalse(is_rtl_dominant(text))
+        self.assertNotIn('<w:bidi w:val="1"/>', self._paragraph(text))
+        # The Persian counterpart of the same paragraph shape is RTL.
+        self.assertIn('<w:bidi w:val="1"/>', self._paragraph("تشخیص بر پایهٔ HbA1c است."))
+
+    def test_a_paragraph_filled_after_creation_still_turns_rtl(self):
+        """The cover title is created empty, then filled with Persian."""
+        # A Latin-only line typed into a Persian document stays LTR...
+        self.assertNotIn('<w:bidi w:val="1"/>', self._paragraph("F = ma"))
+        # ...and a Persian one turns RTL even though the paragraph existed first.
+        self.assertIn('<w:bidi w:val="1"/>', self._paragraph("فرمول به این شکل است F = ma"))
+
+    def _paragraph(self, text: str) -> str:
+        """The ``<w:p>`` element that carries exactly this text."""
+        for paragraph in re.findall(r"<w:p\b.*?</w:p>", self._xml(text), re.S):
+            visible = "".join(re.findall(r"<w:t[^>]*>(.*?)</w:t>", paragraph, re.S))
+            if visible == text:
+                return paragraph
+        self.fail(f"no paragraph rendered {text!r} verbatim")
 
     def test_no_run_text_is_reversed(self):
         text = "شاخص HbA1c برای تشخیص دیابت استفاده می‌شود."

@@ -133,10 +133,14 @@ _CUES_STRONG: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 #: Last-resort cues. These are common enough in ordinary prose that they only
 #: type a sentence when nothing stronger matched.
+#:
+#: The cues carry no padding: :func:`_contains` already enforces word
+#: boundaries, so a trailing space would make a cue unmatchable (the character
+#: after the space is a letter, which the boundary lookahead rejects).
 _CUES_WEAK: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("conclusion", ("پس", "نتیجه", "in short")),
     ("procedure", ("سپس", "then we", "then")),
-    ("comparison", ("اما ", "however")),
+    ("comparison", ("اما", "ولی", "however")),
 )
 
 #: Sentence terminators for both scripts. A dot between digits is a decimal, so

@@ -40,7 +40,7 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 | Type | Formats |
 |---|---|
 | Audio | MP3, M4A, WAV, OGG, FLAC, WMA, AMR and other formats PyAV's bundled FFmpeg libraries can read |
-| Video | MP4, MKV, MOV, AVI, Telegram video notes |
+| Video | MP4, MKV, MOV, AVI, WEBM, Telegram video notes |
 | Presentations (native) | PPTX, PPTM, PPSX, PPSM, POTX, POTM |
 | Presentations (legacy, converted in-process) | PPT, PPS, POT |
 | Presentations (rejected with instructions) | ODP, OTP — re-save as PPTX first |
@@ -201,6 +201,14 @@ TELEGRAM_API_ID=...
 TELEGRAM_API_HASH=...
 ```
 
+On a network that blocks Telegram, route the MTProto connection through a
+proxy (`socks5://host:port`, `http://user:pass@host:port`, ...). Empty means
+a direct connection:
+
+```dotenv
+TELEGRAM_PROXY=
+```
+
 ---
 
 ## API Providers
@@ -230,6 +238,10 @@ NOTE_API_KEY=...                 # or use the legacy GEMINI_API_KEY
 NOTE_API_MODEL=gemini-2.5-flash-lite
 # NOTE_API_BASE_URL=             # leave empty for Google's default endpoint
 ```
+
+`GEMINI_MODEL` (and the legacy `GEMINI_API_KEY`) are still read as fallbacks
+for `NOTE_API_MODEL`/`NOTE_API_KEY` when the provider is `gemini`, so an older
+`.env` keeps working.
 
 #### OpenAI-compatible APIs
 
@@ -300,36 +312,47 @@ Fonts are chosen with a named profile; an explicit `DOCX_FONT_*` variable
 overrides the profile for that one role.
 
 ```dotenv
-# persian_modern (default) | traditional | legacy
+# persian_modern (default) | persian_modern_alt | traditional | legacy
 DOCX_FONT_PROFILE=persian_modern
-#   persian_modern : body/heading/latin Vazirmatn, fallback Tahoma
-#   traditional    : body/heading B Nazanin, latin Times New Roman, fallback Tahoma
-#   legacy         : every role Tahoma (behaviour before profiles existed)
-# DOCX_FONT_BODY=Vazirmatn
-# DOCX_FONT_HEADING=Vazirmatn
-# DOCX_FONT_LATIN=Vazirmatn
-# DOCX_FONT_FALLBACK=Tahoma
+#   persian_modern     : body/heading Vazirmatn, latin Aptos, fallback Tahoma
+#   persian_modern_alt : body/heading Vazirmatn, latin Calibri, fallback Tahoma
+#                        (when Aptos, a recent Microsoft face, is unavailable)
+#   traditional        : body/heading B Nazanin, latin Times New Roman, fallback Tahoma
+#   legacy             : every role Tahoma (behaviour before profiles existed)
+# Per-role overrides win over the profile. The *_FONT spelling is accepted too:
+# DOCX_FONT_BODY=Vazirmatn      # (alias: DOCX_BODY_FONT)
+# DOCX_FONT_HEADING=Vazirmatn   # (alias: DOCX_HEADING_FONT)
+# DOCX_FONT_LATIN=Aptos         # (alias: DOCX_LATIN_FONT)
+# DOCX_FONT_FALLBACK=Tahoma     # (alias: DOCX_FALLBACK_FONT)
 ```
 
 #### Document design
 
 The cover, the automatic table of contents and the page frame are
-configurable; all of them have safe defaults and none of them can make
-generation fail.
+configurable; all of them have safe defaults. A malformed value is rejected
+at startup with a clear Persian message rather than producing a broken
+document; an unknown *border style* is the one exception and falls back to
+`single`, because any valid line is a usable frame.
 
 ```dotenv
 # Cover page with «به نام خدا», the Gamas mark and the quotation. Disabling it
 # removes the cover entirely (the first body page then opens with the title
 # block) instead of leaving a blank first page:
 DOCX_COVER_ENABLED=true
-# Automatic Word table of contents built from the Heading 1/2 styles; it is
-# generated only for documents with at least three sections:
+# Automatic Word table of contents built from the Heading 1/2 styles. It is
+# added when either signal is met: at least DOCX_TOC_MIN_SECTIONS sections, or
+# at least 2400 characters of body text (a long booklet needs a map even when
+# it has few headings). A short note is read in one sitting, and a TOC in
+# front of it only costs a page of the reader's attention:
 DOCX_TOC_ENABLED=true
-DOCX_TOC_LEVELS=1-1               # heading levels included in the TOC (1-1 ... 1-9)
+DOCX_TOC_LEVELS=1-1               # 1 | 1-1 | 1-2 | 1-3 (Word's own syntax)
 DOCX_TOC_MIN_SECTIONS=4          # only add a TOC from this many sections upward
 # Real page border (w:pgBorders) written into every section:
 DOCX_PAGE_BORDER_ENABLED=true
-DOCX_PAGE_BORDER_STYLE=single     # single | double | thick | thinSingle | dotted | dashed
+DOCX_PAGE_BORDER_STYLE=single     # single | double | thick | dotted | dashed
+                                  # (the full ECMA-376 ST_Border set is
+                                  #  accepted; anything unknown falls back to
+                                  #  single)
 DOCX_PAGE_BORDER_COLOR=BFCEE4
 DOCX_PAGE_BORDER_WIDTH=8          # eighths of a point (2-96)
 DOCX_PAGE_BORDER_SPACE=24         # points from the page edge (0-31)
@@ -512,9 +535,11 @@ chat message:
      a typographic wordmark — a missing image is never an error), the title,
      the mode label, the Persian (Jalali) date/source/engine/reference line
      and the Gamas quotation, verbatim
-   - An **automatic Word table of contents** (`TOC \o "1-2" \h \z \u`,
-     marked dirty so Word offers to build it) for documents with three or
-     more sections — never a hand-typed list, and skipped for short notes
+   - An **automatic Word table of contents** (`TOC \o "1-1" \h \z \u`,
+     marked dirty so Word offers to build it) for documents that earn one —
+     at least `DOCX_TOC_MIN_SECTIONS` sections (4 by default) or 2400+
+     characters of body text — never a hand-typed list, and skipped for
+     short notes
    - **Real page-wide borders**: `w:pgBorders` in every section's properties
      (`w:offsetFrom="page"`), not an empty bordered paragraph
    - **Real Word heading styles**: sections use `Heading 1` and their
@@ -537,15 +562,20 @@ chat message:
      **real Word `PAGE` field** ("Gamas Bot — صفحه <n>"); the cover carries
      neither, and body numbering restarts at ۱
    - Fonts selected by the `DOCX_FONT_PROFILE` profile (`persian_modern`
-     with Vazirmatn, `traditional` with B Nazanin, `legacy` for the
-     historic single-font behaviour), with per-role overrides
-     `DOCX_FONT`, `DOCX_FONT_BODY`, `DOCX_FONT_HEADING`, `DOCX_FONT_LATIN`
-     and `DOCX_FONT_FALLBACK`. The fallback is declared in the document's
-     font table (`w:altName`) so readers without the primary Persian face
-     substitute it gracefully; fonts are *not* embedded in the file.
+     with Vazirmatn + Aptos, `persian_modern_alt` with Vazirmatn + Calibri,
+     `traditional` with B Nazanin, `legacy` for the historic single-font
+     behaviour), with per-role overrides `DOCX_FONT`, `DOCX_FONT_BODY`,
+     `DOCX_FONT_HEADING`, `DOCX_FONT_LATIN` and `DOCX_FONT_FALLBACK`. The
+     fallback is declared in the document's font table (`w:altName`) so
+     readers without the primary Persian face substitute it gracefully;
+     fonts are *not* embedded in the file.
 2. **`متن خام - GMS-XXXXXX.txt`** — the raw extracted texts (the
    transcript, and for presentations the slide text as well) with a
    small metadata header, exactly as produced by the pipeline.
+
+`GMS-XXXXXX` is the submission ID zero-padded to six digits, so
+`GMS-000123` is submission `123`; it is the same string that appears in the
+server logs and in the document's tracking-reference line.
 
 If the note API is unavailable, the Word document is still generated
 from the raw material (headings/bullets preserved) and a notice is
@@ -632,6 +662,12 @@ file. Audio is never split into chunks for STT, because chunking loses word
 context at every boundary. Provider/model availability, language support,
 quotas and accepted upload sizes should be confirmed for your account before
 production use.
+
+Speechmatics jobs are polled for completion on this interval, in seconds:
+
+```dotenv
+STT_POLL_INTERVAL_SECONDS=5
+```
 
 > Confidence scores from different providers are not necessarily calibrated against each other. Tune this threshold using your own validation dataset.
 
@@ -897,8 +933,6 @@ counts and ink coverage, writes a contact sheet for a quick overview, and
 overflowing the bottom margin and heading-only page breaks ("orphan
 headings"). Use it whenever the DOCX changes — "it opens" is not a check.
 
-
-
 `tests/fixtures/notes/` ships a six-fixture corpus (medical, HCI/university,
 computer science, Persian-only, Persian+English code-switching, and a PowerPoint
 slide outline). Each transcript is paired with a hand-written reference document
@@ -914,7 +948,7 @@ Python 3.11, 3.12 and 3.13 on Linux. To reproduce additional checks locally:
 ```bash
 python -m pip install ruff pip-audit
 python -m pip check
-ruff check gamas_bot scripts tests --select E9,F
+ruff check gamas_bot scripts tests passenger_wsgi.py --select E9,F
 pip-audit -r requirements.txt
 ```
 
@@ -1043,6 +1077,11 @@ Gamas_bot/
 │   ├── instance_lock.py   # single-instance file lock (crash-safe)
 │   ├── launcher.py        # "start the bot if it is not running" for cron/Passenger
 │   ├── docx_export.py     # RTL Word document + raw-text exporters
+│   ├── bidi.py            # direction analysis and per-direction run splitting
+│   ├── textnorm.py        # Persian/Arabic normalisation for comparison
+│   ├── qa.py              # fidelity metrics (numbers, terms, semantic units)
+│   ├── units.py           # educational content-unit extraction/classification
+│   ├── editorial.py       # global coherence: dedupe and cross-references
 │   ├── media.py           # PyAV/ppt2pptx worker helpers (no external binaries)
 │   ├── media_worker.py    # child process: probe/extract/merge/convert
 │   ├── presentations.py   # PowerPoint parsing and audio extraction
@@ -1056,9 +1095,12 @@ Gamas_bot/
 │   └── 002_presentations.sql
 │
 ├── scripts/
-│   ├── benchmark_stt.py
-│   ├── cpanel_preflight.py # host self-check for cPanel/shared hosting
-│   └── ensure_running.py   # cron entry point
+│   ├── benchmark_notes.py   # note-fidelity benchmark over tests/fixtures/notes
+│   ├── benchmark_stt.py     # STT provider comparison
+│   ├── cpanel_preflight.py  # host self-check for cPanel/shared hosting
+│   ├── ensure_running.py    # cron entry point
+│   ├── render_docx_pages.py # rasterises docx pages for visual comparison
+│   └── validate_docx.py     # structural + visual .docx validation
 │
 ├── passenger_wsgi.py      # optional cPanel "Setup Python App" status endpoint
 │
@@ -1069,6 +1111,7 @@ Gamas_bot/
 ├── docs/
 │   ├── DEPLOY_FA.md        # راهنمای فارسی استقرار و عیب‌یابی
 │   ├── DEPLOY_CPANEL.md    # cPanel / shared-hosting deployment
+│   ├── QUALITY_REPORT.md   # fidelity benchmark history
 │   └── AUDIT.md            # review findings and validation limits
 │
 ├── .github/workflows/tests.yml
@@ -1273,7 +1316,7 @@ installation is required; the `av` and `ppt2pptx` wheels provide everything.
 
 ### Logging and error handling
 
-Default production logs go to stdout/journald and include provider attempts, durations, external-tool exit codes, job IDs, migrations, startup dependency checks, retry events, and local error tracebacks. STT logging is metric-rich but content-free: job start with the routing decision (primary, fallback flag, candidate engines), per-attempt start/completion with elapsed time, confidence, character and word counts, Speechmatics job submission/poll/completion lifecycle (job ID, poll count, per-poll status at DEBUG), transcript-download timings, low-confidence threshold decisions, sanitized failure details, and the final engine-selection summary with the total elapsed time. Transcript/prompt contents and API keys are never logged. Users receive a stable reference such as `GMS-000123` on job failure; search it together with the submission ID in server logs.
+Default production logs go to stdout/journald and include provider attempts, durations, external-tool exit codes, job IDs, migrations, startup dependency checks, retry events, and local error tracebacks. STT logging is metric-rich but content-free: job start with the routing decision (primary, fallback flag, candidate engines), per-attempt start/completion with elapsed time, confidence, character and word counts, Speechmatics job submission/poll/completion lifecycle (job ID, poll count, per-poll status at DEBUG), transcript-download timings, low-confidence threshold decisions, sanitized failure details, and the final engine-selection summary with the total elapsed time. Transcript/prompt contents and API keys are never logged. Users receive a stable reference such as `GMS-000123` on job failure: it *is* the submission ID, zero-padded to six digits, so `GMS-000123` is submission `123` — search for either form in the server logs.
 
 ```dotenv
 LOG_LEVEL=INFO                 # DEBUG, INFO, WARNING, ERROR, CRITICAL

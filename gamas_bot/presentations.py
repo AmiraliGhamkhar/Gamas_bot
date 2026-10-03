@@ -455,7 +455,11 @@ async def prepare_audio(
 
     durations = [clip.duration for clip in usable if clip.duration is not None]
     total_duration = sum(durations) if len(durations) == len(usable) else None
-    if sum(durations) > settings.presentation_max_total_duration:
+    # The bound is checked against the best estimate available: the complete
+    # total when every clip was measured, otherwise the measured part (an
+    # unmeasurable clip cannot make the estimate smaller).
+    known_duration = total_duration if total_duration is not None else sum(durations)
+    if known_duration > settings.presentation_max_total_duration:
         raise PresentationError(
             "مجموع مدت صداهای این ارائه از سقف تعیین‌شدهٔ ربات بیشتر است."
         )

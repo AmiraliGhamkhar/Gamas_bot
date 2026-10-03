@@ -834,10 +834,12 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         missing_numbers |= missing_here_numbers
         missing_terms |= missing_here_terms
         # A chunk whose every number *and* term is absent from the notes is
-        # likely under-covered (or genuinely filler); report it once.
-        if chunk_numbers and missing_here_numbers == chunk_numbers and (
-            not chunk_terms or missing_here_terms == chunk_terms
-        ):
+        # likely under-covered (or genuinely filler); report it once. A signal
+        # the chunk does not carry is vacuously "all absent", so a chunk of
+        # only terms is judged on its terms alone.
+        numbers_all_missing = not chunk_numbers or missing_here_numbers == chunk_numbers
+        terms_all_missing = not chunk_terms or missing_here_terms == chunk_terms
+        if numbers_all_missing and terms_all_missing:
             uncovered.append(index)
         else:
             covered_chunks += 1

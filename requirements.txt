@@ -8,3 +8,8 @@ av>=16.0,<19.0
 ppt2pptx>=0.4.2,<0.5
 python-docx>=1.1,<2.0
 python-socks[asyncio]>=2.4,<3.0
+# Pillow is a direct dependency: scripts/render_docx_pages.py imports it to
+# rasterise the .docx pages the fidelity tool compares with the Telegram
+# screenshots. python-pptx also pulls it in, so declaring it makes the
+# requirement explicit rather than incidental.
+Pillow>=10.0,<13.0

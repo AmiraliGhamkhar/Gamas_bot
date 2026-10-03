@@ -45,7 +45,7 @@ from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 from lxml import etree
 
-from .bidi import TextRun, split_direction_runs
+from .bidi import TextRun, is_rtl_dominant, split_direction_runs
 from .config import PROJECT_ROOT
 from .progress import to_persian_digits
 from .structuring import NoteSection, StructuredNotes
@@ -81,9 +81,14 @@ BRAND_SUBTITLE = "Gamas Bot"
 DEFAULT_BORDER_COLOR = "BFCEE4"
 DEFAULT_BORDER_SIZE = 8  # eighths of a point -> 1 pt
 DEFAULT_BORDER_SPACE = 24  # points from the page edge (0-31)
+#: The complete ECMA-376 ``ST_Border`` line-style enumeration (the "border
+#: art" values -- ``apples``, ``archedScallops``, ... -- are deliberately
+#: excluded: they are decorations, not the frame this document draws). Anything
+#: outside this set is rejected by Word, so an unknown configured value falls
+#: back to ``single`` rather than producing a file that needs repair.
 ALLOWED_BORDER_STYLES = frozenset(
     {
-        "single", "double", "dotted", "dashed", "dotDash", "dotDotDash",
+        "single", "thick", "double", "dotted", "dashed", "dotDash", "dotDotDash",
         "triple", "thinThickSmallGap", "thickThinSmallGap",
         "thickThickThinSmallGap", "thinThickMediumGap", "thickThinMediumGap",
         "thickThickThinMediumGap", "thinThickLargeGap", "thickThinLargeGap",
@@ -200,12 +205,30 @@ class DocumentFonts:
     fallback: str
 
 
+def _font_role_value(config: dict, role: str) -> str:
+    """The configured face for one role, accepting the prefixed spelling too.
+
+    ``{"body": ...}`` is the canonical spelling; ``{"body_font": ...}`` is the
+    alias :mod:`gamas_bot.config` uses for environment-derived values. Both
+    must resolve to the same role or a documented spelling silently falls back
+    to the default face.
+    """
+    for key in (role, f"{role}_font"):
+        value = config.get(key)
+        if value is not None:
+            text = str(value).strip()
+            if text:
+                return text
+    return ""
+
+
 def resolve_fonts(font_config: dict | None = None, *, font: str | None = None) -> DocumentFonts:
     """Normalise a font configuration into a complete role set.
 
     ``font=`` keeps the historical single-font API working: it fills every
-    role with one face. Keys may also be prefixed (``body_font``, ...), which
-    is how :mod:`gamas_bot.config` passes environment values.
+    role with one face. Each role may be given either plain (``body``) or
+    prefixed (``body_font``); both spellings are accepted so a caller that
+    passes environment-derived values under either name behaves identically.
     """
     config = dict(font_config or {})
     if font is not None:
@@ -213,7 +236,9 @@ def resolve_fonts(font_config: dict | None = None, *, font: str | None = None) -
         config.setdefault("heading", font)
         config.setdefault("latin", font)
         config.setdefault("fallback", font)
-    resolved = {role: (config.get(role) or "").strip() or DEFAULT_FONT_CONFIG[role] for role in FONT_ROLES}
+    resolved = {
+        role: _font_role_value(config, role) or DEFAULT_FONT_CONFIG[role] for role in FONT_ROLES
+    }
     return DocumentFonts(**resolved)
 
 
@@ -360,17 +385,30 @@ def jalali_date(now: datetime) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _enable_bidi(paragraph) -> None:
-    """Mark the paragraph as right-to-left (``w:bidi``)."""
+def _enable_bidi(paragraph, *, rtl: bool = True) -> None:
+    """Set the paragraph's base direction (``w:bidi``).
+
+    ``rtl=False`` removes an existing ``w:bidi`` instead of writing one: a
+    paragraph with no strong RTL character is left to Word's default
+    left-to-right base direction. Forcing Persian onto a Latin-only line (a
+    formula, a URL list) misresolves its neutral characters and its paragraph
+    mark while adding nothing, because every run already carries its own
+    direction (``w:rtl``).
+    """
     p_pr = paragraph._p.get_or_add_pPr()
-    if p_pr.find(qn("w:bidi")) is None:
+    existing = p_pr.find(qn("w:bidi"))
+    if not rtl:
+        if existing is not None:
+            p_pr.remove(existing)
+        return
+    if existing is None:
         _insert_ppr_child(
             p_pr,
             OxmlElement("w:bidi"),
             ("w:adjustRightInd", "w:snapToGrid", "w:spacing", "w:ind", "w:jc", "w:rPr", "w:sectPr"),
         )
-    bidi = p_pr.find(qn("w:bidi"))
-    bidi.set(qn("w:val"), "1")
+        existing = p_pr.find(qn("w:bidi"))
+    existing.set(qn("w:val"), "1")
 
 
 def _shade_paragraph(paragraph, fill: str) -> None:
@@ -549,6 +587,12 @@ def _add_directional_text(paragraph, text: str, *, fonts: DocumentFonts, size: f
     runs: list[TextRun] = split_direction_runs(text)
     if not runs:
         return
+    # The paragraph's base direction follows the runs it is given, because a
+    # paragraph can be created empty and filled later (the cover title block):
+    # any strong RTL character makes the whole paragraph RTL, while a
+    # Latin-only line keeps Word's left-to-right default.
+    if is_rtl_dominant(text):
+        _enable_bidi(paragraph, rtl=True)
     for run in runs:
         styled = paragraph.add_run(run.text)
         if run.rtl:
@@ -638,11 +682,13 @@ def _fill_paragraph(
 ) -> object:
     """Apply RTL styling to an existing (possibly pre-created) paragraph."""
     paragraph.alignment = align
-    _enable_bidi(paragraph)
+    # The base direction is decided in ``_add_directional_text``, the single
+    # funnel every run passes through: any strong RTL character makes the
+    # paragraph RTL, a Latin-only line keeps Word's LTR default.
+    text = xml_safe(text)
     paragraph.paragraph_format.space_after = Pt(space_after)
     paragraph.paragraph_format.space_before = Pt(space_before)
     paragraph.paragraph_format.line_spacing = line_spacing
-    text = xml_safe(text)
     if text:
         _add_directional_text(
             paragraph, text, fonts=fonts, size=size, bold=bold, color=color, italic=italic
@@ -742,7 +788,6 @@ def _add_page_number_footer(section, *, fonts: DocumentFonts, design: DocxDesign
     for run in list(paragraph.runs):
         run._r.getparent().remove(run._r)
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _enable_bidi(paragraph)
     paragraph.paragraph_format.space_before = Pt(2)
     paragraph.paragraph_format.space_after = Pt(0)
     if design.footer_brand:
@@ -789,11 +834,11 @@ def _add_document_header(section, *, fonts: DocumentFonts, title: str) -> None:
     for run in list(paragraph.runs):
         run._r.getparent().remove(run._r)
     paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _enable_bidi(paragraph)
+    header_text = f"{xml_safe(title)} | {PAGE_HEADER_TEXT}"
     paragraph.paragraph_format.space_after = Pt(2)
     _add_directional_text(
         paragraph,
-        f"{xml_safe(title)} | {PAGE_HEADER_TEXT}",
+        header_text,
         fonts=fonts,
         size=8.5,
         color=MUTED,
@@ -1871,8 +1916,8 @@ def build_plain_docx(
 ) -> bytes:
     """Polished RTL Word document built from raw/fallback material.
 
-    Understands the light Markdown the pipeline itself emits (``#`` headings,
-    ``-`` bullets, ``## بخش n`` part headers); everything else is a paragraph.
+    Understands the light Markdown the pipeline itself emits (``#``/``##``
+    headings, ``-`` bullets); everything else is a paragraph.
     """
     resolved = fonts or resolve_fonts(font=font)
     style = design or DocxDesign()
@@ -1910,7 +1955,11 @@ def build_plain_docx(
             continue
         heading = re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", line)
         if heading:
-            # ``#``/``##``/``###`` map onto real Heading 1-3 styles.
+            # ``##`` is the top level the pipeline actually emits (the raw
+            # material it passes here starts at ``## متن پیاده‌سازی‌شده``), so
+            # ``#`` and ``##`` both become Heading 1: promoting ``##`` to
+            # Heading 1 keeps the fallback booklet's TOC non-empty. Deeper
+            # levels shift down one step and clamp at Heading 3.
             level = min(max(len(heading.group(1)) - 1, 1), 3)
             _add_heading(document, heading.group(2).strip(), fonts=resolved, level=level)
             continue
