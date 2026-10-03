@@ -287,6 +287,11 @@ NOTE_MODE=full
 # only when they are measurably better, and the repair prompt forbids inventing
 # content. Set to false to guarantee exactly one provider call per chunk:
 NOTE_REPAIR_ENABLED=true
+# Global-context layer for long lectures: one cheap outline call, that outline
+# in every chunk prompt (plus neighbour windows) and one editorial compilation
+# pass at the end. Set to false to restore the previous chunk-only behaviour;
+# single-part lectures always take exactly one call per chunk.
+NOTE_GLOBAL_CONTEXT_ENABLED=true
 ```
 
 #### Document fonts
@@ -304,6 +309,33 @@ DOCX_FONT_PROFILE=persian_modern
 # DOCX_FONT_HEADING=Vazirmatn
 # DOCX_FONT_LATIN=Vazirmatn
 # DOCX_FONT_FALLBACK=Tahoma
+```
+
+#### Document design
+
+The cover, the automatic table of contents and the page frame are
+configurable; all of them have safe defaults and none of them can make
+generation fail.
+
+```dotenv
+# Cover page with «به نام خدا», the Gamas mark and the quotation. Disabling it
+# removes the cover entirely (the first body page then opens with the title
+# block) instead of leaving a blank first page:
+DOCX_COVER_ENABLED=true
+# Automatic Word table of contents built from the Heading 1/2 styles; it is
+# generated only for documents with at least three sections:
+DOCX_TOC_ENABLED=true
+# Real page border (w:pgBorders) written into every section:
+DOCX_PAGE_BORDER_ENABLED=true
+DOCX_PAGE_BORDER_STYLE=single     # single | double | thick | thinSingle | dotted | dashed
+DOCX_PAGE_BORDER_COLOR=BFCEE4
+DOCX_PAGE_BORDER_WIDTH=8          # eighths of a point (2-96)
+DOCX_PAGE_BORDER_SPACE=24         # points from the page edge (0-31)
+# The footer always carries a real PAGE field; this only toggles the brand:
+DOCX_SHOW_FOOTER_BRAND=true
+# Optional local logo. Empty means the typographic GAMAS wordmark; generation
+# never downloads an image and never fails when the file is missing:
+DOCX_LOGO_PATH=
 ```
 
 In the generated file, Persian runs carry the face in the `w:cs` (complex
@@ -372,6 +404,54 @@ ratio and per-chunk coverage. **Compression on its own is never a
 failure**: tightening a transcript is legitimate. A low ratio is only
 reported as a problem when the content units were lost as well.
 
+### Global coherence across chunks
+
+Writing every chunk in isolation is what makes a long lecture affordable —
+and it is also why a naive pipeline produces a pile of independently written
+mini-documents: duplicated introductions, drifting terminology, repeated
+“key points” and an outline that is just the concatenation of chunk
+headings. A small, provider-free layer fixes that (`gamas_bot/editorial.py`
+plus the pipeline in `gamas_bot/structuring.py`); it uses no embeddings, no
+vector store and no agent framework:
+
+1. **Orientation call (long lectures only).** One cheap request reads the
+   *beginning* of every chunk (bounded at 12 000 characters) and returns a
+   strict-JSON outline: title, ordered topic list and key terminology. A
+   failure here is non-fatal — the pipeline simply continues without it. A
+   single-part lecture never pays for this call.
+2. **Shared context per chunk.** Every chunk prompt receives that outline,
+   the position of the part (“بخش ۲ از ۵”), the terminology to keep and a
+   short window of the *end of the previous* and the *start of the next*
+   chunk, marked explicitly as context that must not be noted again. Chunks
+   are never overlapped; the positional prefix and this context block are
+   metadata, not duplicated text.
+3. **Additive merge.** `merge_structured_notes` keeps the chunk order and
+   joins adjacent sections that carry the same logical heading (a section
+   that a boundary split in two), de-duplicates verbatim paragraphs, bullets,
+   definitions, callouts and table rows, unions the summaries and raises the
+   second differing table into labelled bullets rather than dropping it. It
+   never drops *distinct* content on mere similarity.
+4. **One controlled editorial compilation.** The merged notes are handed to
+   the model once, together with the outline, under a compiler contract:
+   merge same-subject fragments, remove accidental duplication, repair
+   transitions **only** from relations already in the text, unify terminology
+   and keep every definition, example, step, formula, number, unit and term.
+   The result is accepted only when deterministic QA measures do not regress
+   (semantic coverage, then signal coverage, then how much text was kept at
+   ≥ 85 %) — otherwise the merged notes are delivered unchanged.
+
+Set `NOTE_GLOBAL_CONTEXT_ENABLED=false` to restore the previous chunk-only
+behaviour; single-part lectures behave exactly as before either way.
+
+### QA diagnostics and the repair pass
+
+The same deterministic QA layer also reports *structural* diagnostics —
+repeated section headings, duplicated paragraphs/bullets, empty or very
+short sections, bullet-only sections, a summary that repeats the body —
+through `qa.analyze_structure()`. These are observational: they are logged
+and benchmarked, they never delete content and they never trigger a repair
+(only real information loss does).
+
 That report is the input to the **optional repair pass**: only when real
 information loss is detected does the bot make one extra, targeted
 provider call. The repair receives the same source, the existing notes, the
@@ -406,6 +486,21 @@ chat message:
 
 1. **`جزوه - <title> - GMS-XXXXXX.docx`** — a polished right-to-left Word
    document generated with [python-docx](https://python-docx.readthedocs.io/):
+   - A **cover page** section of its own: «به نام خدا», the Gamas mark (a
+     local logo when `DOCX_LOGO_PATH`/`assets/gamas_logo.*` exists, otherwise
+     a typographic wordmark — a missing image is never an error), the title,
+     the mode label, the Persian (Jalali) date/source/engine/reference line
+     and the Gamas quotation, verbatim
+   - An **automatic Word table of contents** (`TOC \o "1-2" \h \z \u`,
+     marked dirty so Word offers to build it) for documents with three or
+     more sections — never a hand-typed list, and skipped for short notes
+   - **Real page-wide borders**: `w:pgBorders` in every section's properties
+     (`w:offsetFrom="page"`), not an empty bordered paragraph
+   - **Real Word heading styles**: sections use `Heading 1` and their
+     sub-blocks `Heading 2`/`Heading 3`, so the navigation pane, the
+     automatic TOC and the outline all work; `Title`, `Subtitle`, `Quote`,
+     `Definition`, `Example`, `Note`, `Warning` and `Table text` styles are
+     created when the template does not ship them
    - RTL paragraphs (`w:bidi`) with **per-direction runs**: Persian text
      and embedded English terms (drug names, units, URLs, numbers such as
      `500 mg` or `120/80`) each keep their own direction and font, which
@@ -417,8 +512,9 @@ chat message:
      callouts (نکته / هشدار / یادآوری) and RTL tables with a coloured,
      page-repeating header row
    - The glossary renders as a proper RTL table (اصطلاح / توضیح)
-   - A running page header (document title + brand), page-number footers
-     and document metadata
+   - A running page header (document title + brand) and a footer with a
+     **real Word `PAGE` field** ("Gamas Bot — صفحه <n>"); the cover carries
+     neither, and body numbering restarts at ۱
    - Fonts selected by the `DOCX_FONT_PROFILE` profile (`persian_modern`
      with Vazirmatn, `traditional` with B Nazanin, `legacy` for the
      historic single-font behaviour), with per-role overrides
@@ -760,6 +856,25 @@ and after. Add `--human-out FILE` to emit a 1–5 reviewer rubric in JSON
 faithfulness) for cases where the automated metrics are not sufficient.
 
 It makes note quality measurable instead of only asserting "the tests pass".
+
+### Visual page inspection (offline)
+
+No Word/LibreOffice/PDF tool is needed to *look* at the produced document:
+
+```bash
+python -m scripts.render_docx_pages booklet.docx --out pages/ --sheet sheet.png
+```
+
+`scripts/render_docx_pages.py` reads `document.xml`, `styles.xml`, the
+styles' effective sizes and the header/footer parts, wraps the text with
+Pillow and shapes Persian when `arabic-reshaper` + `python-bidi` are
+installed (mixed lines are bidi-reordered as a whole, so `500 mg`, URLs and
+`Gamas Bot — صفحه ۳` stay intact; without them the layout is still rendered,
+only the Persian glyphs are unshaped). Pages are painted at 100 dpi. It reports per-page block
+counts and ink coverage, writes a contact sheet for a quick overview, and
+**fails loudly** on layout defects it can detect: blank pages, content
+overflowing the bottom margin and heading-only page breaks ("orphan
+headings"). Use it whenever the DOCX changes — "it opens" is not a check.
 
 
 
