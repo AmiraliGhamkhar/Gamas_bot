@@ -168,8 +168,15 @@ NOTE_API_MODEL=gpt-4o-mini
 # Anthropic
 NOTE_API_PROVIDER=anthropic
 NOTE_API_KEY=...
-NOTE_API_MODEL=claude-3-5-haiku-latest
+NOTE_API_MODEL=claude-haiku-4-5
 ```
+
+مدل‌های خانوادهٔ `claude-3-5-haiku` در ۲۰۲۶-۰۲-۱۹ بازنشسته شدند و دیگر پاسخ
+نمی‌دهند؛ `claude-haiku-4-5` مدل Haiku جاری است (شناسهٔ پین‌شده:
+`claude-haiku-4-5-20251001`). پارامترهای نمونه‌برداری برای هر مدل ساخته می‌شوند:
+فقط `temperature` فرستاده می‌شود و برای نسل‌هایی که مقدار غیرپیش‌فرض را رد
+می‌کنند (Opus 4.7 به بعد) حذف می‌شود؛ `top_p`/`top_k` هرگز به Anthropic
+فرستاده نمی‌شوند.
 
 برای OpenRouter، Groq، Together، DeepSeek، Ollama یا vLLM فقط Base URL و Model را عوض کنید. اگر از هدر سفارشی زیر systemd استفاده می‌کنید، JSON را کامل داخل تک‌کوتیشن قرار دهید:
 
@@ -205,9 +212,23 @@ STT_OPENAI_MODEL=whisper-large-v3
 Speechmatics به‌صورت پیش‌فرض با مدل `enhanced` (بالاترین دقت سرویس) کار می‌کند:
 
 ```dotenv
-SPEECHMATICS_MODEL=enhanced
+SPEECHMATICS_OPERATING_POINT=enhanced
 SPEECHMATICS_ADDITIONAL_VOCAB=Metformin, Insulin, MRI, HbA1c
+SPEECHMATICS_VOCAB_MAX_ITEMS=1000
 ```
+
+اسم این تنظیم همان «مدل/operating point» سرویس است؛ فیلدی که در JSON فرستاده
+می‌شود `model` است (نام منسوخ `operating_point` فقط با
+`SPEECHMATICS_MODEL_FIELD=operating_point` برای کانتینرهای batch قدیمی). نام
+قدیمی `SPEECHMATICS_MODEL` همچنان خوانده می‌شود. مقادار معتبر: `standard`،
+`enhanced`، `melia-1` و `oak-1` (دو مدل آخر چندزبانه‌اند، با `STT_LANGUAGE=multi`
+کار می‌کنند و confidence و فرهنگ اصطلاحات نمی‌دهند).
+
+فرهنگ اصطلاحات (custom dictionary) سقف دارد: سرویس برای هر Job حداکثر ۱۰۰۰
+مدخل را توصیه می‌کند و بالای ۲۰۰۰۰ مدخل کار را رد می‌کند؛ بنابراین فقط
+`SPEECHMATICS_VOCAB_MAX_ITEMS` مدخل اول (به همان ترتیبی که نوشته‌اید، یعنی
+مهم‌ترین‌ها اول) فرستاده می‌شود و باقی در لاگ گزارش می‌شود. واژگان بزرگ‌تر از
+سقف سخت هنگام راه‌اندازی خطا می‌دهند، نه وسط کار.
 
 اگر حساب شما سطح enhanced را نداشته باشد، ثبت Job رد می‌شود؛ با موتور جایگزین کار ادامه می‌یابد و می‌توانید مدل را به `standard` برگردانید. فایل‌های بزرگ‌تر از سقف آپلود مستقیم یک موتور (۱GB برای Speechmatics، ‌۲GB برای Deepgram، `STT_OPENAI_MAX_UPLOAD_BYTES` برای سرویس سازگار) به موتور پیکربندی‌شدهٔ بعدی سپرده می‌شوند؛ فایل صوتی برای STT تکه تکه نمی‌شود تا دقت کلمات در مرز قطعه‌ها افت نکند.
 

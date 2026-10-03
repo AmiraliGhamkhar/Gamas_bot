@@ -167,7 +167,35 @@ def check_settings() -> tuple[list[Result], object | None]:
                 "to 1-2 GB; start with 1.",
             )
         )
+    results.extend(check_stt_queue(settings))
     return results, settings
+
+
+def check_stt_queue(settings) -> list[Result]:
+    """Warn about a queue or a custom dictionary that will not fit one job."""
+    results: list[Result] = []
+    if settings.max_pending_jobs > 4 * max(1, settings.max_concurrent_jobs):
+        results.append(
+            Result(
+                "WARN",
+                "MAX_PENDING_JOBS",
+                f"{settings.max_pending_jobs} waiting jobs for {settings.max_concurrent_jobs} "
+                "worker(s): uploads beyond that are rejected with back-pressure.",
+            )
+        )
+    terms = len(settings.speechmatics_additional_vocab)
+    if terms and terms > settings.speechmatics_vocab_max_items:
+        results.append(
+            Result(
+                "WARN",
+                "SPEECHMATICS_ADDITIONAL_VOCAB",
+                f"{terms} terms configured but only the first "
+                f"{settings.speechmatics_vocab_max_items} are sent per job; raise "
+                "SPEECHMATICS_VOCAB_MAX_ITEMS (1000 recommended, 20000 hard cap) or "
+                "reorder the terms so the most valuable ones come first.",
+            )
+        )
+    return results
 
 
 def tcp_reachable(host: str, port: int, timeout: float = 6.0) -> str | None:

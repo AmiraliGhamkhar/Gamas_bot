@@ -278,9 +278,16 @@ NOTE_API_MODEL=qwen2.5:7b
 ```dotenv
 NOTE_API_PROVIDER=anthropic
 NOTE_API_KEY=...
-NOTE_API_MODEL=claude-3-5-haiku-latest
+NOTE_API_MODEL=claude-haiku-4-5
 # NOTE_API_BASE_URL=             # leave empty for Anthropic's default endpoint
 ```
+
+`claude-haiku-4-5` is the current Haiku-class model (`claude-3-5-haiku-*` was
+retired on 2026-02-19). Any currently supported id works, including a pinned
+snapshot such as `claude-haiku-4-5-20251001`. Sampling parameters are built
+per model: only `temperature` is ever sent, and it is omitted for the
+generations that reject non-default sampling values (Opus 4.7 and later) —
+`top_p`/`top_k` are never sent to Anthropic.
 
 Common controls:
 
@@ -596,21 +603,43 @@ STT_LANGUAGE=fa
 
 STT_FALLBACK_ENABLED=true
 STT_MIN_CONFIDENCE=0.65
+# Bounded retries for transient provider failures (429/5xx/network/timeouts)
+STT_MAX_ATTEMPTS=3
+STT_RETRY_BASE_DELAY_SECONDS=2
+STT_RETRY_MAX_DELAY_SECONDS=30
 
 SPEECHMATICS_BASE_URL=https://eu1.asr.api.speechmatics.com/v2
-SPEECHMATICS_MODEL=enhanced
-# Optional custom dictionary for drug names / technical terms (comma separated)
+SPEECHMATICS_OPERATING_POINT=enhanced
+# Optional custom dictionary for drug names / technical terms (comma separated).
+# The writing order is the priority order.
 SPEECHMATICS_ADDITIONAL_VOCAB=
+SPEECHMATICS_VOCAB_MAX_ITEMS=1000
 
 DEEPGRAM_MODEL=nova-3
 ```
 
-The pipeline is accuracy-first: `SPEECHMATICS_MODEL=enhanced` is the default
-because Speechmatics documents it as the highest-accuracy tier; set `standard`
-only if your account lacks the enhanced tier or throughput matters more.
-`SPEECHMATICS_ADDITIONAL_VOCAB` feeds the provider's native custom dictionary
-(up to 20,000 terms) — useful for Persian lectures full of English drug names
-and technical vocabulary; it is a Speechmatics feature, not an LLM layer.
+The pipeline is accuracy-first: `SPEECHMATICS_OPERATING_POINT=enhanced` is the
+default because Speechmatics documents it as the highest-accuracy model; set
+`standard` only if your account lacks the enhanced tier or throughput matters
+more. The variable is the provider's model selection (the API field is `model`;
+`operating_point` is the deprecated spelling, which you can send instead with
+`SPEECHMATICS_MODEL_FIELD=operating_point` when talking to an older self-hosted
+batch container). The legacy `SPEECHMATICS_MODEL` name is still read when the
+new variable is empty.
+
+Documented Speechmatics batch models: `standard`, `enhanced`, `melia-1`
+(multilingual, switches language by itself) and `oak-1` (multilingual
+healthcare). `melia-1`/`oak-1` need `STT_LANGUAGE=multi` — they reject `auto` —
+and return neither confidence scores nor custom-dictionary support.
+
+`SPEECHMATICS_ADDITIONAL_VOCAB` feeds the provider's native custom dictionary —
+useful for Persian lectures full of English drug names and technical
+vocabulary; it is a Speechmatics feature, not an LLM layer. Speechmatics
+recommends at most **1000** words/phrases per job and rejects a job above
+**20000**, so at most `SPEECHMATICS_VOCAB_MAX_ITEMS` entries (default 1000) are
+sent, in the order you listed them: put the highest-value terms first. A
+dictionary larger than the hard cap is a configuration error at start-up
+instead of a rejected job later.
 
 An optional third STT engine works with any OpenAI-compatible
 `POST /audio/transcriptions` endpoint (OpenAI, Groq, or a self-hosted
@@ -634,6 +663,62 @@ or
 ```dotenv
 STT_PRIMARY=deepgram
 ```
+
+or
+
+```dotenv
+STT_PRIMARY=openai_compatible
+```
+
+### Language behaviour (provider-specific)
+
+`STT_LANGUAGE` is a *request*, not a provider parameter: the bot translates it
+per engine in `gamas_bot.stt.normalize_language_for_provider()` before a request
+is built, and an unsupported combination fails fast with a configuration error
+instead of being sent and silently mis-transcribed.
+
+| Value | Speechmatics (`standard`/`enhanced`) | Speechmatics (`melia-1`/`oak-1`) | Deepgram (`nova-2`/`nova-3`) | OpenAI-compatible |
+| --- | --- | --- | --- | --- |
+| `fa`, `en`, `en-US`, … | selected language | forwarded (undocumented; `multi` is what Speechmatics documents) | **only** that language | ISO-639-1 code |
+| bilingual pack (`ar_en`, …) | selected pack | rejected (use `multi`) | rejected | rejected |
+| `auto` | Language Identification (batch SaaS) | **rejected** (use `multi`) | **rejected** (no `auto`; Deepgram's `detect_language` does not cover Persian) | field omitted → the gateway detects |
+| `multi` | **rejected** (multilingual models only) | multilingual, switches by itself | multilingual mode (nova-2/nova-3) | **rejected** |
+
+> Bilingual packs (`ar_en`, `cmn_en_ms_ta`, …) are a **Speechmatics-only**
+> concept: another provider would have to guess what `ar_en` means, so the bot
+> rejects the combination instead of forwarding the string.
+>
+> **No automatic Persian↔English code-switching on Deepgram Nova-3.** Setting a
+> specific language makes Deepgram transcribe only that language, and Nova-3's
+> `multi` mode covers English, Spanish, French, German, Hindi, Russian,
+> Portuguese, Japanese, Italian and Dutch — **Persian is not in that set**. For
+> Persian+English lectures, use Speechmatics `enhanced` with `STT_LANGUAGE=fa`
+> (English medical terms still transcribe as part of Persian speech) or the
+> `melia-1` multilingual model with `STT_LANGUAGE=multi`.
+
+### Retries
+
+Transient provider failures are retried before the engine is given up on:
+HTTP `408/425/429/5xx`, connection resets, socket errors and attempt timeouts.
+Authentication (`401/403`), malformed or unsupported requests (`400/415/422`),
+unsupported language/model combinations and unparsable answers are **not**
+retried — they are permanent for that engine, so the bot moves on to the next
+configured provider.
+
+```dotenv
+STT_MAX_ATTEMPTS=3                 # 1-5 attempts per engine
+STT_RETRY_BASE_DELAY_SECONDS=2     # exponential back-off base
+STT_RETRY_MAX_DELAY_SECONDS=30     # and its hard ceiling
+```
+
+A provider's `Retry-After` header wins over the computed delay (still capped by
+`STT_RETRY_MAX_DELAY_SECONDS`). Retries are never infinite, cancellation always
+propagates, and every retry is logged with the provider and the reason.
+
+`STT_JOB_TIMEOUT` bounds **one attempt** (upload + polling + download), so the
+worst-case wall-clock for one engine is `STT_MAX_ATTEMPTS × STT_JOB_TIMEOUT` plus
+the delays between attempts. Keep `STT_MAX_ATTEMPTS=1` on a shared host where a
+single upload should never run longer than the timeout.
 
 ### Fallback
 
@@ -773,17 +858,31 @@ MAX_FILE_SIZE_BYTES=2000000000
 
 This is an application-level limit and does not guarantee that an STT provider accepts the file. For very long recordings, provider-specific request limits still apply. The application does not automatically split arbitrary long audio files into smaller STT requests.
 
-Control concurrent processing with (default `3`):
+Control concurrency and pending work with:
 
 ```dotenv
-MAX_CONCURRENT_JOBS=3
+MAX_CONCURRENT_JOBS=3   # fixed pool of worker tasks (active jobs)
+MAX_PENDING_JOBS=8      # bounded in-memory queue of waiting jobs
 ```
 
-Increase this only after testing CPU, memory, disk, network, and API limits.
-This setting bounds active jobs, **not** the number of pending uploads. The queue
-is in memory and is not durable; after restart unfinished jobs are marked failed
-and must be resubmitted. Restrict access to trusted users until you add admission
-limits/rate limiting suitable for a public deployment.
+`MAX_CONCURRENT_JOBS` worker tasks drain a bounded `asyncio.Queue`, so both
+halves of the pipeline are bounded: at most `MAX_CONCURRENT_JOBS` jobs run and
+at most `MAX_PENDING_JOBS` wait. Anything beyond that total is **rejected with
+back-pressure** — the user gets a clear "the bot is busy, resend shortly"
+message and the submission is recorded as `failed`, instead of an unbounded
+in-memory backlog of waiting tasks. Shutdown drains the queue the same way and
+cancels the workers, so no job is silently dropped and no task leaks.
+
+Increase these only after testing CPU, memory, disk, network, and API limits.
+The queue is in memory and is not durable; after a restart, unfinished jobs are
+marked failed and must be resubmitted (the single-instance lock guarantees that
+no other process owns those rows). Restrict access to trusted users until you
+add admission limits/rate limiting suitable for a public deployment.
+
+Job states in `audio_submissions.status`: `pending` (accepted, not started) →
+`processing` (a worker owns it) → `done` or `failed`. A job is only ever left in
+`processing` by a hard crash; the next start-up marks it `failed` with
+«پردازش با راه‌اندازی مجدد متوقف شد».
 
 ---
 
@@ -1022,6 +1121,53 @@ Never commit secrets or runtime data. The following should remain local:
 - Temporary files
 - API keys
 
+Provider credentials can never be overridden by configuration:
+`NOTE_API_EXTRA_HEADERS_JSON` drops the reserved header names
+(`Authorization`, `Proxy-Authorization`, `x-api-key`, `api-key`,
+`x-goog-api-key`) with a warning, and invalid header names/values are rejected
+at start-up. Error messages and logs carry only sanitized provider metadata —
+never keys, error bodies or internal filesystem paths.
+
+---
+
+## Known limitations
+
+These are real, current constraints. They are documented rather than papered
+over with misleading configuration names.
+
+**Provider capabilities**
+
+- **Deepgram has no automatic Persian↔English transcription.** With
+  `language=fa` Deepgram transcribes Persian only; Nova-3's `multi` mode covers
+  10 languages and Persian is not one of them. The bot refuses `language=auto`
+  for Deepgram and warns loudly when `multi` is selected.
+- **Speechmatics `standard`/`enhanced` transcribe one language (or one
+  bilingual pack) per job.** `language=auto` uses their Language
+  Identification (batch SaaS, needs ~60 s of speech); the multilingual
+  `melia-1`/`oak-1` models use `language=multi` and return no confidence scores
+  and no custom-dictionary support.
+- **Custom dictionary size.** Speechmatics recommends at most 1000
+  words/phrases per job (hard rejection above 20000). The bot sends the first
+  `SPEECHMATICS_VOCAB_MAX_ITEMS` entries in the order you wrote them; a longer
+  dictionary is truncated deterministically (and logged), never re-ranked.
+- **"OpenAI-compatible" means a specific contract**, not every server that
+  borrows the route: `POST /audio/transcriptions` returning `{"text": "..."}`
+  for STT, and `POST /chat/completions` returning
+  `{"choices":[{"message":{"content": "..."}}]}` for notes. Anything else is
+  reported as "unexpected response schema" instead of a `KeyError`.
+
+**Architecture**
+
+- Single instance only: one Telegram session and one SQLite file. The
+  instance lock enforces it, and start-up recovery marks interrupted jobs
+  failed under that guarantee. Do not run two replicas against the same
+  `data/`.
+- The job queue lives in memory. A restart loses waiting jobs (they are marked
+  failed) — use `MAX_PENDING_JOBS` to keep that loss small and bounded.
+- Narration extracted from a deck is merged into one track in slide order, so
+  per-slide speaker/narration alignment is **not** guaranteed; the notes are
+  compiled from the full narration plus the slide text.
+
 ---
 
 ## Privacy
@@ -1052,7 +1198,10 @@ Before production deployment, review:
 
 ## STT Evaluation
 
-Speechmatics and Deepgram both support Persian, but real-world accuracy depends on:
+Speechmatics (`enhanced`, `fa`) and Deepgram (`nova-3`, `fa`) both transcribe
+Persian; neither gives you automatic Persian+English code-switching on those
+settings — see [Language behaviour](#language-behaviour-provider-specific).
+Real-world accuracy depends on:
 
 - Recording quality and microphone
 - Background noise
@@ -1088,7 +1237,7 @@ Gamas_bot/
 │   ├── progress.py        # animated per-job Telegram progress bars
 │   ├── logging_config.py  # text/JSON logging and file rotation
 │   ├── structuring.py     # strict-JSON note generation (provider-neutral)
-│   └── stt.py             # Speechmatics / Deepgram clients
+│   └── stt.py             # provider contracts: Speechmatics / Deepgram / OpenAI-compatible
 │
 ├── migrations/
 │   ├── 001_initial.sql
