@@ -14,6 +14,7 @@ import aiohttp
 from .config import NOTE_MODES, Settings, resolve_note_mode
 from .progress import to_persian_digits
 from .qa import notes_text, run_note_qa
+from .textnorm import normalize_for_compare
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,35 @@ _CONTENT_RULES = (
     "- فقط حذف‌های مجاز: پرگویی بی‌محتوا، اصطلاح‌های گفتاری تصادفی، نویزِ پیاده‌سازی صدا و تکرار عین‌هم. هیچ توضیح آموزشی را به‌خاطر کوتاهی حذف نکنید.\n"
 )
 
+#: How the compiled lecture must *read*. The rules are the difference between
+#: a pile of summarized sentences and a handout a professor would hand out.
+_STYLE_RULES = (
+    "\nقواعد نگارش (لحن جزوهٔ یک استاد):\n"
+    "- مفهوم را معرفی کنید، بعد توضیح دهید، بعد مثال/مرحله بیاورید و در پایان — فقط اگر گوینده گفته — "
+    "یک نتیجهٔ کوتاه بنویسید.\n"
+    "- توضیح‌ها را در پاراگراف کامل و روان بنویسید؛ هر جمله را به یک بولت تبدیل نکنید. "
+    "بولت را فقط برای فهرست‌های واقعی (اقلام هم‌رده، مراحل، ویژگی‌ها) به کار ببرید.\n"
+    "- هر بخش را با جمله‌ای شروع کنید که موضوع همان بخش است؛ از شروع‌های قالبی و یکسان در همهٔ بخش‌ها پرهیز کنید.\n"
+    "- عبارت‌های کلیشه‌ای مثل «نکتهٔ مهم»، «در ادامه»، «همان‌طور که گفته شد» را بی‌دلیل تکرار نکنید؛ "
+    "فقط وقتی خواندن را روان‌تر می‌کنند به کار ببرید.\n"
+    "- جزئیات را ناگهانی و بی‌مقدمه نیاورید؛ اگر گوینده اول دلیل یا زمینه را گفته، همان ترتیب را حفظ کنید.\n"
+    "- ادعای علمی، آمار، مرجع، توصیهٔ درمانی یا مثال تازه از خود اضافه نکنید؛ هرچه در متن نیست، نوشته نمی‌شود.\n"
+    "- اگر بخشی از متن مبهم یا ناقص است، همان ابهام را حفظ کنید؛ معنای احتمالی را حدس نزنید و آن را "
+    "«بهتر» یا «منطقی‌تر» بازنویسی نکنید.\n"
+    "- اصطلاح تخصصی و انگلیسی را داخل جملهٔ فارسی به همان صورت اصلی بنویسید.\n"
+)
+
+#: The relationship-preservation contract: a coherent booklet keeps the causal
+#: and temporal links the lecturer actually made.
+_TRANSITION_RULES = (
+    "\nقواعد پیوند و انسجام:\n"
+    "- روابط متن را حفظ کنید: علت و معلول (چون، زیرا، بنابراین)، تضاد (اما، در مقابل)، "
+    "مثال (برای نمونه)، ترتیب زمانی (اول، سپس، در پایان).\n"
+    "- ترتیب موضوع‌ها را جابه‌جا نکنید و از خودتان گذار تازه نسازید.\n"
+    "- اگر موضوعی ادامهٔ موضوع قبلی است، پیوند را با یک جملهٔ کوتاه نشان دهید؛ اگر موضوع تازه است، "
+    "بخش تازه بسازید و دو موضوع را در یک بخش قاطی نکنید.\n"
+)
+
 _JSON_RULES = (
     "\nقواعد خروجی — مطلق‌اند و استثنا ندارند:\n"
     "۱) پاسخ فقط و فقط یک شیء JSON معتبر است. هیچ متن، عنوان، توضیح، علامت نقل‌قول بلوکی یا خنده‌کد (code fence) قبل یا بعد از آن ننویسید.\n"
@@ -75,6 +105,7 @@ _JSON_RULES = (
     "{\n"
     "  \"title\": \"عنوان کوتاه جزوه\",\n"
     "  \"summary\": \"خلاصهٔ چند جمله‌ایِ موضوع و هدف جزوه\",\n"
+    "  \"learning_objectives\": [\"هدف یادگیری برگرفته از متن (اختیاری)\"],\n"
     "  \"sections\": [\n"
     "    {\n"
     "      \"heading\": \"عنوان بخش\",\n"
@@ -90,9 +121,12 @@ _JSON_RULES = (
     "    }\n"
     "  ],\n"
     "  \"key_points\": [\"نکته‌های کلیدی کل جزوه\"],\n"
+    "  \"review_questions\": [\"پرسش مرور برگرفته از متن (اختیاری)\"],\n"
     "  \"glossary\": [{\"term\": \"اصطلاح\", \"definition\": \"تعریف کوتاه\"}]\n"
     "}\n"
     "۳) هر کلید اختیاری است؛ اگر محتوایی برایش ندارید آن را حذف کنید یا آرایه/رشتهٔ خالی بدهید. کلید تازه‌ای از خودتان نسازید.\n"
+    "۳-۱) «learning_objectives» و «review_questions» را فقط وقتی بنویسید که خودِ متن صریحاً پشتوانهٔ آن‌ها باشد؛ "
+    "هدف یا پرسشی که در متن نیست، نسازید.\n"
     "۴) «sections» را خالی نگذارید؛ دست‌کم یک بخش با عنوان معنادار و محتوای واقعی بسازید.\n"
     "۵) در callouts مقدار kind فقط یکی از این سه باشد: «نکته»، «هشدار» یا «یادآوری».\n"
     "۶) JSON باید بدون خطا قابل خواندن باشد: از نقل‌قول دوگانه استفاده کنید، کامای اضافه نگذارید و خط جدید داخل رشته‌ها را با \\n بنویسید.\n"
@@ -161,10 +195,17 @@ def build_repair_prompt(
     return "\n\n".join(parts)
 
 
-def build_system_prompt(mode: str = "full") -> str:
-    """The Persian system prompt for one note mode (lecture-to-notes compiler)."""
+def build_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
+    """The Persian system prompt for one note mode (lecture-to-notes compiler).
+
+    ``context_block`` carries the lecture's global orientation (title, ordered
+    topics, key terminology, position of this part, neighbour sentences) when a
+    long lecture is written chunk by chunk, plus the rules that stop a chunk
+    from behaving like a lecture of its own. It is empty for a single-part
+    lecture, which keeps the classic one-call prompt byte-compatible.
+    """
     mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
-    return (
+    prompt = (
         "شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما متن پیاده‌سازی‌شدهٔ خام یک کلاس درسی است "
         "و خروجی شما یک جزوهٔ ساختارمند و کامل فارسی است؛ رفتار شما باید مانند «مترجم جزوه‌نویس" 
         "» باشد که محتوای درس را منظم و کامل نگه می‌دارد، نه خلاصه‌سازی که حذف می‌کند.\n\n"
@@ -172,7 +213,12 @@ def build_system_prompt(mode: str = "full") -> str:
         + "\n\nقواعد محتوا:\n"
         + mode_rule
         + _CONTENT_RULES
+        + _STYLE_RULES
+        + _TRANSITION_RULES
     )
+    if context_block:
+        prompt += "\n\n" + _chunked_content_rules() + "\n" + context_block
+    return prompt
 
 
 SYSTEM_PROMPT = build_system_prompt("full")
@@ -194,10 +240,10 @@ _PRESENTATION_CONTENT_RULES = (
 )
 
 
-def build_presentation_system_prompt(mode: str = "full") -> str:
+def build_presentation_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
     """The Persian system prompt for presentation material in one note mode."""
     mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
-    return (
+    prompt = (
         "شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما محتوای یک فایل ارائهٔ درسی (PowerPoint) است — "
         "شامل متن اسلایدها، یادداشت‌های گوینده و متن پیاده‌سازی‌شدهٔ صدای ضبط‌شدهٔ همان ارائه — و خروجی شما "
         "یک جزوهٔ ساختارمند و کامل فارسی است؛ رفتار شما باید مانند «مترجم جزوه‌نویس» باشد که محتوای درس را "
@@ -209,10 +255,22 @@ def build_presentation_system_prompt(mode: str = "full") -> str:
         + "\n- فقط بر پایهٔ مطالب داده‌شده بنویسید؛ اطلاعات، فرمول، تعریف یا نتیجهٔ تازه نسازید. اگر بخشی نامفهوم است، آن را حدس نزنید.\n"
         + "- هیچ عدد، واحد، درصدمقدار، دوز دارو یا علامت اختصاری را حذف یا تغییر ندهید؛ اصطلاح‌های انگلیسی را بدون ترجمهٔ اجباری حفظ کنید.\n"
         + "- اگر متن ناقص یا تکراری است، مفهوم موجود را مرتب کنید و چیزی به آن نیفزایید.\n"
+        + _STYLE_RULES
+        + _TRANSITION_RULES
     )
+    if context_block:
+        prompt += "\n\n" + _chunked_content_rules() + "\n" + context_block
+    return prompt
 
 
 PRESENTATION_SYSTEM_PROMPT = build_presentation_system_prompt("full")
+
+
+def _chunked_content_rules() -> str:
+    """The part-of-a-long-lecture contract, imported lazily to avoid a cycle."""
+    from .editorial import CHUNKED_CONTENT_RULES
+
+    return CHUNKED_CONTENT_RULES
 
 #: The user-message wrapper for combined slide text and narration.
 PRESENTATION_PROMPT = "محتوای ارائه:\n\n"
@@ -390,6 +448,11 @@ class StructuredNotes:
     key_points: tuple[str, ...] = ()
     glossary: tuple[GlossaryEntry, ...] = ()
     note_mode: str = "full"
+    #: Optional, source-supported study aids. They are only ever generated when
+    #: the lecture itself states the objectives/questions, and nothing is
+    #: invented to fill them (see the prompt's schema rules).
+    learning_objectives: tuple[str, ...] = ()
+    review_questions: tuple[str, ...] = ()
 
     @property
     def display_title(self) -> str:
@@ -397,12 +460,20 @@ class StructuredNotes:
 
     @property
     def has_content(self) -> bool:
-        return bool(self.summary or self.sections or self.key_points or self.glossary)
+        return bool(
+            self.summary
+            or self.sections
+            or self.key_points
+            or self.glossary
+            or self.learning_objectives
+            or self.review_questions
+        )
 
     def to_payload(self) -> dict:
         return {
             "title": self.title,
             "summary": self.summary,
+            "learning_objectives": list(self.learning_objectives),
             "sections": [
                 {
                     "heading": section.heading,
@@ -436,6 +507,7 @@ class StructuredNotes:
                 for section in self.sections
             ],
             "key_points": list(self.key_points),
+            "review_questions": list(self.review_questions),
             "glossary": [
                 {"term": entry.term, "definition": entry.definition}
                 for entry in self.glossary
@@ -450,6 +522,9 @@ class StructuredNotes:
         parts: list[str] = [f"# {self.display_title}"]
         if self.summary:
             parts.append(f"**{self.summary}**")
+        if self.learning_objectives:
+            parts.append("**اهداف یادگیری**")
+            parts.extend(f"- {objective}" for objective in self.learning_objectives)
         for section in self.sections:
             parts.append(f"## {section.heading}")
             parts.extend(section.paragraphs)
@@ -488,6 +563,12 @@ class StructuredNotes:
         if self.key_points:
             parts.append("## نکته‌های کلیدی")
             parts.extend(f"- {point}" for point in self.key_points)
+        if self.review_questions:
+            parts.append("## پرسش‌های مرور")
+            parts.extend(
+                f"{index}. {question}"
+                for index, question in enumerate(self.review_questions, start=1)
+            )
         if self.glossary:
             parts.append("## واژه‌نامه")
             parts.extend(f"- **{entry.term}:** {entry.definition}" for entry in self.glossary)
@@ -522,34 +603,302 @@ class StructuredNotes:
             sections=sections,
             key_points=tuple(_string_list(payload.get("key_points"))),
             glossary=glossary,
+            learning_objectives=tuple(_string_list(payload.get("learning_objectives"))),
+            review_questions=tuple(_string_list(payload.get("review_questions"))),
         )
         if not notes.has_content:
             raise StructuringError("ساختار جزوهٔ دریافتی خالی بود.")
         return notes
 
 
+def _compare_key(value: str) -> str:
+    """Comparison key for deterministic duplicate detection.
+
+    Two blocks that differ only in whitespace, Arabic/Persian letter variants
+    or trailing punctuation are the same block; a paraphrase is not, and is
+    never removed. This is the only similarity rule the merger uses.
+    """
+    return re.sub(r"\s+", " ", normalize_for_compare(value)).strip()
+
+
+def _dedupe_by_key(values, key) -> tuple[str, ...]:
+    """Keep every block in order, dropping only same-key repeats."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        identity = key(value)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(value)
+    return tuple(result)
+
+
+def _dedupe_definitions(definitions: tuple[NoteDefinition, ...]) -> tuple[NoteDefinition, ...]:
+    """One entry per term, keeping the longest definition seen."""
+    by_term: dict[str, NoteDefinition] = {}
+    order: list[str] = []
+    for entry in definitions:
+        term_key = _compare_key(entry.term)
+        if not term_key:
+            continue
+        existing = by_term.get(term_key)
+        if existing is None:
+            by_term[term_key] = entry
+            order.append(term_key)
+        elif len(entry.definition) > len(existing.definition):
+            by_term[term_key] = entry
+    return tuple(by_term[term] for term in order)
+
+
+def _dedupe_callouts(callouts: tuple[NoteCallout, ...]) -> tuple[NoteCallout, ...]:
+    seen: set[tuple[str, str]] = set()
+    result: list[NoteCallout] = []
+    for callout in callouts:
+        identity = (callout.kind, _compare_key(callout.text))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(callout)
+    return tuple(result)
+
+
+def _section_key(heading: str) -> str:
+    """Heading identity used to recognise one logical section across chunks.
+
+    A trailing continuation marker ("ادامه"، "(ادامه)") is part of the *same*
+    heading, so two adjacent sections that a model titled that way merge back
+    into one instead of appearing twice in the booklet.
+    """
+    key = _compare_key(heading)
+    key = re.sub(r"[\s(\[«]*(?:ادامه|دنباله|بخش بعد|part|continued)[\s)\]»:.:،-]*$", "", key)
+    return key.strip(" .:،-—")
+
+
+def _dedupe_table_rows(rows: list[list[str]]) -> list[list[str]]:
+    seen: set[tuple[str, ...]] = set()
+    result: list[list[str]] = []
+    for row in rows:
+        identity = tuple(_compare_key(cell) for cell in row)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(row)
+    return result
+
+
+def _table_rows_as_bullets(table: NoteTable) -> tuple[str, ...]:
+    """Render an incompatible second table as readable bullets (no data loss).
+
+    A section carries at most one table. When two same-heading sections each
+    bring their own *different* table, keeping one would silently drop the
+    other, so the second is folded into labelled bullets instead.
+    """
+    headers = table.headers
+    bullets: list[str] = []
+    for row in table.rows:
+        pairs = [
+            f"{header}: {value}"
+            for header, value in zip(headers, row)
+            if value.strip()
+        ]
+        if pairs:
+            bullets.append("؛ ".join(pairs))
+    return tuple(bullets)
+
+
+def _combine_sections(first: NoteSection, second: NoteSection) -> NoteSection:
+    """Join two sections that belong to one logical topic, in order."""
+    if first.table is None:
+        table = second.table
+        extra_bullets: tuple[str, ...] = ()
+    elif second.table is None:
+        table = first.table
+        extra_bullets = ()
+    elif [_compare_key(header) for header in first.table.headers] == [
+        _compare_key(header) for header in second.table.headers
+    ]:
+        table = NoteTable(
+            list(first.table.headers),
+            _dedupe_table_rows(
+                [list(row) for row in first.table.rows] + [list(row) for row in second.table.rows]
+            ),
+        )
+        extra_bullets = ()
+    else:
+        table = first.table
+        extra_bullets = _table_rows_as_bullets(second.table)
+    return replace(
+        first,
+        # Re-deduplicate across the two halves: a paragraph that both chunks
+        # noted (a boundary sentence) must not survive twice in one section.
+        paragraphs=_dedupe_by_key(first.paragraphs + second.paragraphs, _compare_key),
+        bullets=_dedupe_by_key(first.bullets + second.bullets + extra_bullets, _compare_key),
+        definitions=_dedupe_definitions(first.definitions + second.definitions),
+        examples=_dedupe_by_key(first.examples + second.examples, _compare_key),
+        steps=_dedupe_by_key(first.steps + second.steps, _compare_key),
+        formulas=_dedupe_by_key(first.formulas + second.formulas, _compare_key),
+        key_points=_dedupe_by_key(first.key_points + second.key_points, _compare_key),
+        callouts=_dedupe_callouts(first.callouts + second.callouts),
+        table=table,
+    )
+
+
+def _definition_keys(definitions) -> tuple[str, ...]:
+    """Identity of every definition, used for cross-section redundancy checks."""
+    return tuple(
+        f"{_compare_key(entry.term)}|{_compare_key(entry.definition)}"
+        for entry in definitions
+        if _compare_key(entry.term)
+    )
+
+
+def _callout_keys(callouts) -> tuple[str, ...]:
+    return tuple(f"{callout.kind}|{_compare_key(callout.text)}" for callout in callouts)
+
+
+def _table_keys(table) -> tuple[str, ...]:
+    if table is None:
+        return ()
+    headers = "|".join(_compare_key(header) for header in table.headers)
+    return tuple(
+        headers + "||" + "|".join(_compare_key(cell) for cell in row) for row in table.rows
+    )
+
+
+def _block_keys(section: NoteSection) -> tuple[str, ...]:
+    """Identity of *every* block of a section, for the redundancy test below."""
+    keys: list[str] = []
+    keys.extend("p|" + _compare_key(value) for value in section.paragraphs if value)
+    keys.extend("b|" + _compare_key(value) for value in section.bullets if value)
+    keys.extend("d|" + key for key in _definition_keys(section.definitions))
+    keys.extend("e|" + _compare_key(value) for value in section.examples if value)
+    keys.extend("s|" + _compare_key(value) for value in section.steps if value)
+    keys.extend("f|" + _compare_key(value) for value in section.formulas if value)
+    keys.extend("k|" + _compare_key(value) for value in section.key_points if value)
+    keys.extend("c|" + key for key in _callout_keys(section.callouts))
+    keys.extend("t|" + key for key in _table_keys(section.table))
+    return tuple(key for key in keys if not key.endswith("|"))
+
+
+def _merge_sections(sections: list[NoteSection]) -> tuple[NoteSection, ...]:
+    """Merge sections additively, in order, with conservative de-duplication.
+
+    * verbatim repeats of a paragraph or bullet (the classic chunk-boundary
+      accident) collapse to their first occurrence;
+    * *adjacent* sections whose headings are the same topic merge into one;
+    * a section whose *every* block was already seen verbatim in an earlier
+      section is dropped — it is a restatement of something the booklet
+      already says, and keeping it would print the same heading twice with
+      duplicate definitions/callouts while its prose had already collapsed;
+    * everything else — paraphrases, neighbouring explanations, different
+      examples — is preserved exactly as the model wrote it.
+    """
+    merged: list[NoteSection] = []
+    # Paragraphs and bullets are de-duplicated *document-wide*: the same
+    # sentence noted by two neighbouring chunks is the classic boundary
+    # accident and must not appear twice in the booklet. The other block types
+    # are only used (``seen_blocks``) to decide whether a whole section is a
+    # verbatim restatement; inside a kept section they stay scoped, because the
+    # same example can legitimately illustrate two different sections.
+    seen_text: set[str] = set()
+    seen_blocks: set[str] = set()
+    for section in sections:
+        paragraphs = _dedupe_by_key(section.paragraphs, _compare_key)
+        bullets = _dedupe_by_key(section.bullets, _compare_key)
+        paragraphs = tuple(
+            value for value in paragraphs if _compare_key(value) not in seen_text
+        )
+        bullets = tuple(value for value in bullets if _compare_key(value) not in seen_text)
+        seen_text.update(_compare_key(value) for value in paragraphs)
+        seen_text.update(_compare_key(value) for value in bullets)
+        cleaned = replace(
+            section,
+            paragraphs=paragraphs,
+            bullets=bullets,
+            definitions=_dedupe_definitions(section.definitions),
+            examples=_dedupe_by_key(section.examples, _compare_key),
+            steps=_dedupe_by_key(section.steps, _compare_key),
+            formulas=_dedupe_by_key(section.formulas, _compare_key),
+            key_points=_dedupe_by_key(section.key_points, _compare_key),
+            callouts=_dedupe_callouts(section.callouts),
+        )
+        if not cleaned.has_content:
+            continue
+        keys = _block_keys(cleaned)
+        if keys and seen_blocks and all(key in seen_blocks for key in keys):
+            # Nothing new: this section repeats an earlier one verbatim.
+            logger.debug(
+                "Merge dropped a restated section %r (%s duplicate blocks)",
+                cleaned.heading,
+                len(keys),
+            )
+            continue
+        seen_blocks.update(keys)
+        if merged and _section_key(merged[-1].heading) and _section_key(merged[-1].heading) == _section_key(cleaned.heading):
+            merged[-1] = _combine_sections(merged[-1], cleaned)
+        else:
+            merged.append(cleaned)
+    return tuple(merged)
+
+
+def _merge_summaries(notes: list[StructuredNotes], *, limit: int = 1200) -> str:
+    """Join the distinct sentences of every chunk summary, in order.
+
+    The document-level summary is the compiler's job; this is the safe
+    fallback when the compiler is disabled or unavailable. Taking only the
+    first chunk's summary — the previous behaviour — silently discarded what
+    every later part of the lecture was about.
+    """
+    parts: list[str] = []
+    seen: set[str] = set()
+    for item in notes:
+        for sentence in _sentence_spans(item.summary) if item.summary else ():
+            text = item.summary[sentence[0] : sentence[1]].strip()
+            if not text:
+                continue
+            identity = _compare_key(text)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            parts.append(text)
+    joined = " ".join(parts)
+    return joined[:limit].rstrip()
+
+
 def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
     """Combine per-chunk notes into one document, preserving order.
 
-    Merging is purely additive: every section survives in chunk order and
-    nothing is re-summarised. Only *exact* duplicate strings (the same bullet,
-    key point or glossary entry repeated verbatim across chunks — usually a
-    boundary sentence that overlapped) are deduplicated; paraphrases are kept.
+    Merging is additive: every *distinct* block survives in chunk order and
+    nothing is re-summarised. De-duplication is deterministic and conservative —
+    only blocks that are the same modulo whitespace/letter variants collapse
+    (the boundary sentence two neighbouring chunks both noted, a heading a
+    model repeated), and adjacent sections that clearly describe one topic are
+    joined into one section so the booklet does not read as a stack of
+    independently titled fragments.
     """
     if not notes:
         raise StructuringError("پاسخ سرویس تولید جزوه خالی بود.")
     if len(notes) == 1:
         return notes[0]
     merged = StructuredNotes(
-        title=notes[0].title,
-        summary=next((item.summary for item in notes if item.summary), ""),
-        sections=_dedupe_section_bullets(
-            [section for item in notes for section in item.sections]
+        title=next((item.title for item in notes if item.title), ""),
+        summary=_merge_summaries(notes),
+        sections=_merge_sections([section for item in notes for section in item.sections]),
+        key_points=_dedupe_by_key(
+            [point for item in notes for point in item.key_points], _compare_key
         ),
-        key_points=_dedupe_exact(notes, lambda item: item.key_points),
         glossary=_dedupe_glossary(notes),
         note_mode=next(
             (item.note_mode for item in notes if item.note_mode in NOTE_MODES), "full"
+        ),
+        learning_objectives=_dedupe_by_key(
+            [item for note in notes for item in note.learning_objectives], _compare_key
+        ),
+        review_questions=_dedupe_by_key(
+            [item for note in notes for item in note.review_questions], _compare_key
         ),
     )
     if not merged.has_content:
@@ -557,54 +906,23 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
     return merged
 
 
-def _dedupe_exact(notes: list[StructuredNotes], getter) -> tuple[str, ...]:
-    """Keep every string in order; drop only exact duplicates across chunks."""
-    seen: set[str] = set()
-    result: list[str] = []
-    for item in notes:
-        for value in getter(item):
-            if value not in seen:
-                seen.add(value)
-                result.append(value)
-    return tuple(result)
-
-
-def _dedupe_section_bullets(sections: list[NoteSection]) -> tuple[NoteSection, ...]:
-    """Drop verbatim-repeated bullets across chunks, keeping first position.
-
-    Models routinely repeat the sentence that straddles a chunk boundary as a
-    bullet in both neighbouring sections.  Only exact matches collapse;
-    paraphrases and every other block (definitions, steps, examples, tables)
-    are left untouched so no information is lost.
-    """
-    seen: set[str] = set()
-    result: list[NoteSection] = []
-    for section in sections:
-        bullets: list[str] = []
-        for bullet in section.bullets:
-            if bullet in seen:
-                continue
-            seen.add(bullet)
-            bullets.append(bullet)
-        result.append(replace(section, bullets=tuple(bullets)))
-    return tuple(result)
-
-
 def _dedupe_glossary(notes: list[StructuredNotes]) -> tuple[GlossaryEntry, ...]:
     """Merge glossary entries by term, keeping the first (longest) definition."""
     by_term: dict[str, GlossaryEntry] = {}
-    order: list[str] = []
+    term_order: list[str] = []
     for item in notes:
         for entry in item.glossary:
-            key = entry.term.casefold()
+            key = _compare_key(entry.term)
+            if not key:
+                continue
             if key not in by_term:
                 by_term[key] = entry
-                order.append(key)
+                term_order.append(key)
             else:
                 existing = by_term[key]
                 if len(entry.definition) > len(existing.definition):
                     by_term[key] = GlossaryEntry(existing.term, entry.definition)
-    return tuple(by_term[term] for term in order)
+    return tuple(by_term[term] for term in term_order)
 
 
 def extract_json_object(text: str) -> str:
@@ -1132,17 +1450,196 @@ TRANSCRIPT_CHUNK_CHARS = 22000
 #: prompt, so the QA framing stays small relative to the source text.
 MAX_UNITS_IN_REPAIR_PROMPT = 8
 
+#: Global-context tuning. Both passes exist only for multi-part lectures, so a
+#: short lecture keeps the historical "one provider call" behaviour.
+OUTLINE_MIN_CHUNKS = 2
+#: A merge below this size is not worth an editorial call.
+COMPILE_MIN_NOTES_CHARS = 400
+#: Hard bound on the final compilation request. Above it the merged notes are
+#: delivered unchanged rather than re-sent as one oversized request.
+COMPILE_MAX_CHARS = 48000
+#: User-message wrapper for the orientation call.
+OUTLINE_PROMPT = "آغاز بخش‌های پیاپی این درس:\n\n"
+#: User-message wrapper for the final editorial call.
+COMPILE_PROMPT = "زمینهٔ درس و جزوهٔ فعلی:\n\n"
+
+
+async def _lecture_context(
+    documents: list[str],
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    *,
+    budget: int,
+    label: str,
+):
+    """One cheap orientation call for a multi-part lecture.
+
+    The whole lecture is represented by the *beginning* of every part, so the
+    call is small and bounded. Any failure is non-fatal: the pipeline continues
+    without global context, exactly as it did before this layer existed.
+    """
+    from .editorial import (
+        OUTLINE_CHUNK_HEAD_CHARS,
+        OUTLINE_DOCUMENT_MAX_CHARS,
+        OUTLINE_SYSTEM_PROMPT,
+        build_outline_document,
+        parse_outline,
+    )
+
+    if len(documents) < OUTLINE_MIN_CHUNKS or not settings.note_global_context_enabled:
+        return None
+    digest_budget = min(OUTLINE_DOCUMENT_MAX_CHARS, max(600, budget - 400))
+    document = build_outline_document(documents, max_chars=digest_budget)
+    if not document.strip():
+        return None
+    try:
+        raw = await _structure_chunk(
+            document, settings, session, OUTLINE_PROMPT, system_prompt=OUTLINE_SYSTEM_PROMPT
+        )
+        context = parse_outline(raw)
+    except Exception as exc:
+        logger.warning(
+            "Lecture outline pass failed (%s: %s); continuing without global context",
+            type(exc).__name__,
+            exc if isinstance(exc, StructuringError) else "unexpected error",
+        )
+        return None
+    if context is None:
+        logger.info("Lecture outline pass returned nothing usable; continuing without it")
+        return None
+    logger.info(
+        "Lecture outline ready %s parts=%s topics=%s terminology=%s window=%s",
+        label,
+        len(documents),
+        len(context.topics),
+        len(context.terminology),
+        OUTLINE_CHUNK_HEAD_CHARS,
+    )
+    return context
+
+
+def _context_block_for(context, documents: list[str], index: int) -> str:
+    """The global-context block for part ``index`` of ``documents``."""
+    if context is None:
+        return ""
+    from .editorial import context_block_for
+
+    return context_block_for(context, documents, index)
+
+
+async def _compile_final(
+    merged: StructuredNotes,
+    context,
+    documents: list[str],
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    *,
+    note_mode: str,
+    label: str,
+    budget: int = COMPILE_MAX_CHARS,
+) -> StructuredNotes:
+    """One controlled editorial pass over the merged notes.
+
+    Its job is global coherence — merge logically related fragments, remove
+    accidental duplication, repair transitions, unify terminology — never
+    summarisation. The result is accepted only when the deterministic QA
+    measures do not regress and the booklet keeps almost all of its text, so a
+    compilation can improve the reading experience but can never quietly drop
+    content. On any provider error the merged notes are returned unchanged.
+
+    Its input is the whole booklet, so its budget is the global compilation
+    bound rather than one chunk's budget; for a booklet larger than that bound
+    the pass is skipped and the (already improved) merge is delivered.
+    """
+    from .editorial import (
+        COMPILE_SYSTEM_PROMPT,
+        LectureContext,
+        build_compile_document,
+        compile_is_better,
+    )
+
+    if not settings.note_global_context_enabled or len(documents) < OUTLINE_MIN_CHUNKS:
+        return merged
+    before_text = notes_text(merged)
+    if len(before_text) < COMPILE_MIN_NOTES_CHARS:
+        return merged
+    budget = min(COMPILE_MAX_CHARS, max(budget, COMPILE_MIN_NOTES_CHARS))
+    # A missing outline only removes the topic map; the compilation itself is
+    # still worth doing, because it is the pass that produces one coherent
+    # document out of the per-chunk drafts.
+    document = build_compile_document(context or LectureContext(), merged)
+    if len(document) > budget:
+        logger.info(
+            "Final editorial pass skipped %s: %s characters of notes exceed the %s budget",
+            label,
+            len(document),
+            budget,
+        )
+        return merged
+    before_report = run_note_qa(merged, documents)
+    try:
+        compiled = await _structured_notes_for(
+            document,
+            settings,
+            session,
+            COMPILE_PROMPT,
+            system_prompt=COMPILE_SYSTEM_PROMPT,
+            label=f"{label} final compilation",
+        )
+    except Exception as exc:
+        logger.warning(
+            "Final editorial pass failed (%s: %s); keeping the merged notes",
+            type(exc).__name__,
+            exc if isinstance(exc, StructuringError) else "unexpected error",
+        )
+        return merged
+    after_text = notes_text(compiled)
+    after_report = run_note_qa(compiled, documents)
+    accepted, reason = compile_is_better(
+        before_report,
+        after_report,
+        before_chars=len(before_text),
+        after_chars=len(after_text),
+    )
+    if not accepted:
+        logger.warning(
+            "Final editorial pass rejected (%s) coverage=%.2f->%.2f semantic=%.2f->%.2f; "
+            "keeping the merged notes",
+            reason,
+            before_report.coverage,
+            after_report.coverage,
+            before_report.semantic_coverage,
+            after_report.semantic_coverage,
+        )
+        return merged
+    logger.info(
+        "Final editorial pass accepted %s (%s) sections=%s->%s chars=%s->%s",
+        label,
+        reason,
+        len(merged.sections),
+        len(compiled.sections),
+        len(before_text),
+        len(after_text),
+    )
+    return replace(compiled, title=compiled.title or merged.title, note_mode=note_mode)
+
 
 async def structure_transcript(
     text: str, settings: Settings, mode: str = "full"
 ) -> StructuredNotes:
-    """Turn a transcript into structured notes with the configured provider."""
+    """Turn a transcript into structured notes with the configured provider.
+
+    Pipeline: chunk losslessly -> (multi-part only) one orientation call for the
+    whole lecture -> one strict-JSON call per part, each carrying the global
+    context and its neighbours -> additive merge -> optional source-grounded
+    repair when QA sees real loss -> one editorial compilation pass, accepted
+    only when no measured content is lost.
+    """
     if not text.strip():
         raise StructuringError("متن پیاده‌سازی‌شده خالی است.")
     if settings.note_api_provider == "disabled":
         raise StructuringError("سرویس تولید جزوه غیرفعال است.")
     note_mode = resolve_note_mode(mode)
-    system_prompt = build_system_prompt(note_mode)
     chunks = split_transcript(text, max_chars=TRANSCRIPT_CHUNK_CHARS - _CHUNK_PREFIX_RESERVE)
     timeout = aiohttp.ClientTimeout(
         total=settings.note_api_timeout,
@@ -1151,6 +1648,9 @@ async def structure_transcript(
     )
     notes: list[StructuredNotes] = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        context = await _lecture_context(
+            chunks, settings, session, budget=TRANSCRIPT_CHUNK_CHARS, label="transcript"
+        )
         for index, chunk in enumerate(chunks, start=1):
             notes.append(
                 await _structured_notes_for(
@@ -1158,20 +1658,34 @@ async def structure_transcript(
                     settings,
                     session,
                     TRANSCRIPT_PROMPT,
-                    system_prompt=system_prompt,
+                    system_prompt=build_system_prompt(
+                        note_mode, context_block=_context_block_for(context, chunks, index)
+                    ),
                     label=f"chunk {index}/{len(chunks)}",
                 )
             )
         # The optional repair pass reuses this session, so it must run while
         # the session is still open.
-        return await _repair_notes_if_needed(
+        merged = await _repair_notes_if_needed(
             merge_structured_notes(notes),
             chunks,
             settings,
             session,
             note_mode=note_mode,
-            system_prompt=system_prompt,
+            system_prompt=build_system_prompt(note_mode),
             prompt=TRANSCRIPT_PROMPT,
+            label="transcript",
+            system_prompt_for=lambda index, total: build_system_prompt(
+                note_mode, context_block=_context_block_for(context, chunks, index)
+            ),
+        )
+        return await _compile_final(
+            merged,
+            context,
+            chunks,
+            settings,
+            session,
+            note_mode=note_mode,
             label="transcript",
         )
 
@@ -1210,6 +1724,7 @@ async def _repair_notes_if_needed(
     prompt: str,
     label: str,
     max_chars: int = TRANSCRIPT_CHUNK_CHARS,
+    system_prompt_for=None,
 ) -> StructuredNotes:
     """Optional second pass, fired only when deterministic QA says it is needed.
 
@@ -1228,7 +1743,10 @@ async def _repair_notes_if_needed(
       lengthen, and never to invent anything;
     * on any provider error the original notes are returned unchanged;
     * the repair reuses the first pass's documents, so it can never turn a long
-      lecture into one oversized request.
+      lecture into one oversized request;
+    * ``system_prompt_for`` lets the repair carry the same global lecture
+      context the first pass had, so a restored section keeps its terminology
+      and does not reintroduce the whole lecture.
     """
     report = run_note_qa(merged, source_chunks)
     if not settings.note_repair_enabled or not report.needs_repair:
@@ -1279,26 +1797,32 @@ async def _repair_notes_if_needed(
         by_chunk: dict[int, list[str]] = {}
         for unit in all_missing:
             by_chunk.setdefault(unit.source_chunk, []).append(unit.text[:200])
-        repaired_notes = [
-            await _structured_notes_for(
-                build_repair_prompt(
-                    source,
-                    missing,
-                    report.findings,
-                    existing=notes_text(merged),
-                    missing_units=tuple(
-                        by_chunk.get(index, [])[:MAX_UNITS_IN_REPAIR_PROMPT]
-                    ),
-                ),
-                settings,
-                session,
-                prompt,
-                system_prompt=system_prompt,
-                label=f"{label} (repair {index}/{len(sources)})",
-                reminder=REPAIR_REMINDER,
+        repaired_notes = []
+        for index, source in enumerate(sources, start=1):
+            chunk_prompt = (
+                system_prompt
+                if system_prompt_for is None
+                else system_prompt_for(index, len(sources))
             )
-            for index, source in enumerate(sources, start=1)
-        ]
+            repaired_notes.append(
+                await _structured_notes_for(
+                    build_repair_prompt(
+                        source,
+                        missing,
+                        report.findings,
+                        existing=notes_text(merged),
+                        missing_units=tuple(
+                            by_chunk.get(index, [])[:MAX_UNITS_IN_REPAIR_PROMPT]
+                        ),
+                    ),
+                    settings,
+                    session,
+                    prompt,
+                    system_prompt=chunk_prompt,
+                    label=f"{label} (repair {index}/{len(sources)})",
+                    reminder=REPAIR_REMINDER,
+                )
+            )
         repaired = merge_structured_notes(repaired_notes)
     except Exception:
         logger.exception("Note repair pass failed; keeping the original notes")
@@ -1380,6 +1904,9 @@ async def structure_presentation(
     )
     notes: list[StructuredNotes] = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
+        context = await _lecture_context(
+            documents, settings, session, budget=max_chars, label="presentation"
+        )
         for index, document in enumerate(documents, start=1):
             notes.append(
                 await _structured_notes_for(
@@ -1387,11 +1914,14 @@ async def structure_presentation(
                     settings,
                     session,
                     PRESENTATION_PROMPT,
-                    system_prompt=system_prompt,
+                    system_prompt=build_presentation_system_prompt(
+                        note_mode,
+                        context_block=_context_block_for(context, documents, index),
+                    ),
                     label=f"presentation chunk {index}/{len(documents)}",
                 )
             )
-        return await _repair_notes_if_needed(
+        merged = await _repair_notes_if_needed(
             merge_structured_notes(notes),
             documents,
             settings,
@@ -1401,4 +1931,16 @@ async def structure_presentation(
             prompt=PRESENTATION_PROMPT,
             label="presentation",
             max_chars=max_chars,
+            system_prompt_for=lambda index, total: build_presentation_system_prompt(
+                note_mode, context_block=_context_block_for(context, documents, index)
+            ),
+        )
+        return await _compile_final(
+            merged,
+            context,
+            documents,
+            settings,
+            session,
+            note_mode=note_mode,
+            label="presentation",
         )

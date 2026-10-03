@@ -23,6 +23,7 @@ from .docx_export import (
     notes_docx_filename,
     plain_docx_filename,
     raw_text_filename,
+    resolve_design,
     resolve_fonts,
 )
 from .logging_config import log_job_id
@@ -1290,7 +1291,10 @@ class StudyBot:
             docx_title = notes.display_title
             try:
                 docx_bytes = build_notes_docx(
-                    notes, fonts=resolve_fonts(self.settings.docx_fonts), meta=meta
+                    notes,
+                    fonts=resolve_fonts(self.settings.docx_fonts),
+                    design=resolve_design(self.settings.docx_design),
+                    meta=meta,
                 )
                 docx_path = workdir / notes_docx_filename(notes, reference)
                 docx_path.write_bytes(docx_bytes)
@@ -1306,6 +1310,7 @@ class StudyBot:
                     plain_title,
                     plain_text,
                     fonts=resolve_fonts(self.settings.docx_fonts),
+                    design=resolve_design(self.settings.docx_design),
                     meta=meta,
                 )
                 docx_path = workdir / plain_docx_filename(plain_title, reference)

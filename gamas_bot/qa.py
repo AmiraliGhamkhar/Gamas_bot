@@ -41,12 +41,20 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:  # structural import only; avoids an import cycle at runtime
     from .structuring import StructuredNotes
 
-from .textnorm import normalize_digits
+from .textnorm import normalize_digits, normalize_for_compare
 
 logger = logging.getLogger(__name__)
 
 #: How many findings are listed per category in one log record.
 MAX_REPORTED_FINDINGS = 8
+
+#: Structural diagnostics. They are *observational*: a repeated heading or a
+#: bullet-only section is reported, never silently rewritten or deleted, and
+#: they never gate delivery. Repair still reacts only to real content loss.
+#: A section shorter than this (visible characters) is "excessively short".
+MIN_SECTION_CHARS = 120
+#: A section that is only a list is "fragmented prose" at this many bullets.
+MIN_BULLETS_FOR_FRAGMENT = 3
 
 #: Thresholds for the optional repair pass and for the "aggressive compression"
 #: finding. The repair pass costs an extra provider call, so it must fire only
@@ -169,6 +177,177 @@ class SourceSignal:
 
 
 @dataclass(frozen=True, slots=True)
+class NoteStructureReport:
+    """Deterministic structure/coherence diagnostics for one note document.
+
+    Everything here is a *signal for the operator* (log line, benchmark
+    column): duplicates, repeated headings, empty or fragmentary sections and
+    a summary that repeats the body. Nothing in this report deletes content —
+    the conservative merge in :mod:`gamas_bot.structuring` owns the only
+    automatic de-duplication, and it removes verbatim repeats only.
+    """
+
+    total_sections: int = 0
+    empty_sections: int = 0
+    short_sections: int = 0
+    bullet_only_sections: int = 0
+    duplicate_paragraphs: int = 0
+    duplicate_bullets: int = 0
+    repeated_headings: int = 0
+    duplicate_key_points: int = 0
+    repeated_summary_sentences: int = 0
+    findings: tuple[str, ...] = field(default_factory=tuple)
+
+    @property
+    def is_clean(self) -> bool:
+        return not self.findings
+
+
+def _compare_key(value: str) -> str:
+    """Whitespace/Persian-variant-insensitive identity for duplicate detection."""
+    return re.sub(r"\s+", " ", normalize_for_compare(value)).strip()
+
+
+def _sections_of(notes) -> list:
+    sections = getattr(notes, "sections", ())
+    return list(sections) if sections else []
+
+
+def section_text(section) -> str:
+    """Every user-visible string of one section, joined."""
+    parts: list[str] = [section.heading]
+    parts.extend(section.paragraphs)
+    parts.extend(section.bullets)
+    for definition in section.definitions:
+        parts.append(definition.term)
+        parts.append(definition.term_en)
+        parts.append(definition.definition)
+    parts.extend(section.examples)
+    parts.extend(section.steps)
+    parts.extend(section.formulas)
+    parts.extend(section.key_points)
+    if section.table is not None:
+        parts.extend(section.table.headers)
+        for row in section.table.rows:
+            parts.extend(row)
+    for callout in section.callouts:
+        parts.append(callout.text)
+    return "\n".join(part for part in parts if part)
+
+
+def analyze_structure(notes) -> NoteStructureReport:
+    """Count structural defects (duplicates, stubs, fragmentation, repeats)."""
+    sections = _sections_of(notes)
+    empty_sections = 0
+    short_sections = 0
+    bullet_only = 0
+    duplicate_paragraphs = 0
+    duplicate_bullets = 0
+    repeated_headings = 0
+    duplicate_key_points = 0
+
+    seen_headings: set[str] = set()
+    seen_paragraphs: set[str] = set()
+    seen_bullets: set[str] = set()
+    seen_points: set[str] = set()
+
+    for section in sections:
+        if not section.has_content:
+            empty_sections += 1
+            continue
+        visible = section_text(section)
+        body_length = len(visible) - len(section.heading)
+        if body_length < MIN_SECTION_CHARS:
+            short_sections += 1
+        prose_blocks = (
+            len(section.paragraphs)
+            + len(section.definitions)
+            + len(section.examples)
+            + len(section.steps)
+            + len(section.formulas)
+        )
+        if not section.paragraphs and not prose_blocks and len(section.bullets) >= MIN_BULLETS_FOR_FRAGMENT:
+            bullet_only += 1
+        heading_key = _compare_key(section.heading)
+        if heading_key:
+            if heading_key in seen_headings:
+                repeated_headings += 1
+            seen_headings.add(heading_key)
+        for paragraph in section.paragraphs:
+            key = _compare_key(paragraph)
+            if key in seen_paragraphs:
+                duplicate_paragraphs += 1
+            seen_paragraphs.add(key)
+        for bullet in section.bullets:
+            key = _compare_key(bullet)
+            if key in seen_bullets:
+                duplicate_bullets += 1
+            seen_bullets.add(key)
+        for point in section.key_points:
+            key = _compare_key(point)
+            if key in seen_points:
+                duplicate_key_points += 1
+            seen_points.add(key)
+
+    for point in getattr(notes, "key_points", ()) or ():
+        key = _compare_key(point)
+        if key in seen_points:
+            duplicate_key_points += 1
+        seen_points.add(key)
+
+    # A document-level summary that repeats its own sentences, or that repeats
+    # a paragraph of the body, is the classic symptom of "each chunk wrote its
+    # own summary" and is worth reporting.
+    summary = getattr(notes, "summary", "") or ""
+    body_keys = seen_paragraphs | seen_bullets
+    repeated_summary = 0
+    summary_seen: set[str] = set()
+    if summary:
+        from .units import split_sentences
+
+        for sentence in split_sentences(summary):
+            key = _compare_key(sentence)
+            if not key:
+                continue
+            if key in summary_seen or key in body_keys:
+                repeated_summary += 1
+            summary_seen.add(key)
+
+    findings: list[str] = []
+    if repeated_headings:
+        findings.append(f"repeated section headings: {repeated_headings}")
+    if duplicate_paragraphs:
+        findings.append(f"duplicate paragraphs: {duplicate_paragraphs}")
+    if duplicate_bullets:
+        findings.append(f"duplicate bullets: {duplicate_bullets}")
+    if duplicate_key_points:
+        findings.append(f"duplicate key points: {duplicate_key_points}")
+    if empty_sections:
+        findings.append(f"empty sections: {empty_sections}")
+    if short_sections:
+        findings.append(f"very short sections: {short_sections}")
+    if bullet_only:
+        findings.append(f"fragmented sections (bullet-only): {bullet_only}")
+    if repeated_summary:
+        findings.append(
+            f"summary sentences repeated from the body: {repeated_summary}"
+        )
+
+    return NoteStructureReport(
+        total_sections=len(sections),
+        empty_sections=empty_sections,
+        short_sections=short_sections,
+        bullet_only_sections=bullet_only,
+        duplicate_paragraphs=duplicate_paragraphs,
+        duplicate_bullets=duplicate_bullets,
+        repeated_headings=repeated_headings,
+        duplicate_key_points=duplicate_key_points,
+        repeated_summary_sentences=repeated_summary,
+        findings=tuple(findings),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class NoteQAReport:
     """Deterministic coverage report; findings are informational only."""
 
@@ -190,6 +369,9 @@ class NoteQAReport:
     covered_units: int = 0
     #: Unit types of the expected-but-missing content units (bounded, for logs).
     missing_unit_types: tuple[str, ...] = ()
+    #: Deterministic structure/coherence diagnostics (duplicates, repeated
+    #: headings, stub sections, a summary that repeats the body, ...).
+    structure: NoteStructureReport = field(default_factory=NoteStructureReport)
 
     @property
     def has_findings(self) -> bool:
@@ -422,6 +604,13 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
     expected_units = [unit for unit in units if unit.is_expectation]
     _, missing_units = semantic_coverage(units, rendered)
 
+    # Structural diagnostics are *separate* from the content findings above:
+    # a repeated heading or a stub section is worth reporting and benchmarking
+    # (it tells the operator whether merge/compilation did their job) but it is
+    # never a reason to run a repair pass, because there is no content to
+    # restore and rewriting for style is not an option.
+    structure = analyze_structure(notes)
+
     report = NoteQAReport(
         source_numbers=len(source_numbers),
         preserved_numbers=len(source_numbers - missing_numbers),
@@ -439,6 +628,7 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         missing_unit_types=tuple(
             sorted({unit.type for unit in missing_units})[:MAX_REPORTED_FINDINGS]
         ),
+        structure=structure,
     )
 
     findings: list[str] = []
@@ -490,5 +680,10 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         logger.warning(
             "Note QA coverage gaps (informational; notes delivered unchanged): %s",
             " | ".join(findings),
+        )
+    if not structure.is_clean:
+        logger.warning(
+            "Note QA structure diagnostics (informational; content untouched): %s",
+            " | ".join(structure.findings),
         )
     return report

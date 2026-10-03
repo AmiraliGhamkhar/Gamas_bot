@@ -154,15 +154,35 @@ class PipelineBenchmarkTests(unittest.TestCase):
             with self.subTest(fixture=entry["id"]):
                 notes = load_reference(entry)
                 merged = merge_structured_notes([notes, notes])
-                # Merging is additive: both chunk results keep their sections.
-                self.assertEqual(len(merged.sections), 2 * len(notes.sections))
-                # ...while verbatim repeats collapse instead of stacking.
+                # Merging is additive: every distinct block of both chunk
+                # results survives, so nothing a chunk produced is lost.
                 self.assertEqual(merged.key_points, notes.key_points)
                 self.assertEqual(merged.glossary, notes.glossary)
-                for index, section in enumerate(notes.sections):
-                    self.assertEqual(
-                        merged.sections[index].bullets, section.bullets
-                    )
+                merged_headings = [section.heading for section in merged.sections]
+                for section in notes.sections:
+                    self.assertIn(section.heading, merged_headings)
+                    for block in section.paragraphs + section.bullets:
+                        self.assertIn(
+                            block,
+                            [
+                                value
+                                for candidate in merged.sections
+                                for value in candidate.paragraphs + candidate.bullets
+                            ],
+                            f"{entry['id']}: merge dropped {block!r}",
+                        )
+                # ...while verbatim repeats collapse instead of stacking, and
+                # adjacent sections that carry the same logical heading (the
+                # same chunk boundary noted twice) join into one section.
+                headings = [section.heading for section in notes.sections] * 2
+                adjacent_repeats = sum(
+                    1
+                    for first, second in zip(headings, headings[1:])
+                    if first == second
+                )
+                self.assertLessEqual(
+                    len(merged.sections), len(headings) - adjacent_repeats
+                )
 
     def test_every_reference_renders_to_a_readable_document(self):
         for entry in ENTRIES:

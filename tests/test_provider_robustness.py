@@ -514,7 +514,12 @@ class ChunkOrderAndCoverageTests(unittest.IsolatedAsyncioTestCase):
         ), patch(
             "gamas_bot.structuring.aiohttp.ClientSession", lambda **kwargs: _FakeSession([])
         ):
-            result = await structure_transcript("متن طولانی", make_settings())
+            # Chunk order is what this test pins, so the two global-context
+            # passes (orientation + final compilation) are switched off; they
+            # are covered by tests/test_global_compilation.py.
+            result = await structure_transcript(
+                "متن طولانی", make_settings(note_global_context_enabled=False)
+            )
         # Chunks carry a positional context prefix; the transcript itself must
         # still arrive in order, exactly once each.
         prefix = "[بخش ۱ از ۵ این درس — ادامهٔ درس در بخش بعدی می‌آید]\n\n"
