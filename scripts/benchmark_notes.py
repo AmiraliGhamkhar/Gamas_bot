@@ -97,6 +97,11 @@ def _docx_facts(payload: bytes) -> dict:
             for name in archive.namelist()
             if name.startswith("word/footer")
         )
+        settings = (
+            archive.read("word/settings.xml").decode("utf-8")
+            if "word/settings.xml" in archive.namelist()
+            else ""
+        )
     heading_styles = re.findall(r'w:pStyle w:val="Heading([1-9])"', xml)
     return {
         "paragraphs": len(re.findall(r"<w:p\b.*?</w:p>", xml, re.S)),
@@ -118,6 +123,11 @@ def _docx_facts(payload: bytes) -> dict:
         "tables_of_contents": xml.count("TOC \\o"),
         "page_field": "PAGE" in footers,
         "footer_brand": "Gamas Bot" in footers,
+        # --- layout facts: fields refresh on open, tables are fixed-width ---
+        "update_fields": 'w:updateFields w:val="true"' in settings,
+        "fixed_tables": xml.count('<w:tblLayout w:type="fixed"/>'),
+        "grid_columns": xml.count("<w:gridCol "),
+        "keep_lines": xml.count("<w:keepLines/>"),
     }
 
 
@@ -218,6 +228,153 @@ def _prompt_facts(mode: str) -> dict:
         "forbids_inventing": "نسازید" in prompt,
         "protects_numbers": "هیچ عدد" in prompt,
         "old_compression_ask": "2 تا 4" in prompt,
+        # The semantic contract: the enumerated educational units and the
+        # explicit "these may never be deleted" list.
+        "names_educational_units": "واحد آموزشی یعنی" in prompt,
+        "forbids_one_line_replacement": "جایگزین نکنید" in prompt,
+        "keeps_transitions": "در نتیجه" in prompt and "برای نمونه" in prompt,
+    }
+
+
+#: Heading pairs used by the continuation probe: the first two are one topic a
+#: model titled two ways around a chunk boundary; the last four are different
+#: sections that must never be fused.
+_CONTINUATION_CASES = (
+    ("leading continuation marker", "مقدمه و طرح مسئله", "ادامهٔ مقدمه و طرح مسئله", True),
+    ("same topic, shorter wording", "کلید، رابطه و صورت‌بندی جدول", "کلید و رابطه", True),
+    ("trailing continuation marker", "نرمال‌سازی", "نرمال‌سازی (ادامه)", True),
+    ("two different sections", "ایندکس و کارایی", "نرمال‌سازی", False),
+    ("numbered siblings", "صورت اول", "صورت دوم", False),
+    ("different subjects, shared verb", "تعریف سیستم", "مثال سیستم", False),
+)
+
+
+def _continuation_probe() -> dict:
+    """Does the merge reunite a topic that a chunk boundary split in two?
+
+    The lecture is one topic written by two neighbouring chunks; the merge is
+    the only thing that can turn those two sections back into one. Each case is
+    a pair of one-section drafts, exactly the shape ``merge_structured_notes``
+    receives from ``structure_transcript``.
+    """
+    from gamas_bot.structuring import merge_structured_notes, parse_structured_notes
+
+    def draft(heading: str) -> StructuredNotes:
+        return parse_structured_notes(
+            json.dumps(
+                {
+                    "title": "درس آزمون",
+                    "sections": [
+                        {
+                            "heading": heading,
+                            "paragraphs": [f"توضیح کامل و کافی درباره {heading} برای آزمون."],
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    cases = []
+    joined_expected = 0
+    joined_actual = 0
+    for label, first, second, should_join in _CONTINUATION_CASES:
+        merged = merge_structured_notes([draft(first), draft(second)])
+        joined = len(merged.sections) == 1
+        joined_expected += 1 if should_join else 0
+        joined_actual += 1 if (joined and should_join) else 0
+        cases.append(
+            {
+                "case": label,
+                "first": first,
+                "second": second,
+                "should_join": should_join,
+                "joined": joined,
+                "correct": joined == should_join,
+                # Both halves' prose always survives; only the heading changes.
+                "paragraphs_kept": sum(len(section.paragraphs) for section in merged.sections),
+            }
+        )
+    return {
+        "cases": cases,
+        "expected_joins": joined_expected,
+        "correct_joins": joined_actual,
+        "wrong_joins": sum(1 for case in cases if not case["should_join"] and case["joined"]),
+        "missed_joins": sum(1 for case in cases if case["should_join"] and not case["joined"]),
+        "prose_losses": sum(1 for case in cases if case["paragraphs_kept"] != 2),
+    }
+
+
+def _long_lecture_probe() -> dict:
+    """A realistic long lecture, chunked and merged with a faithful draft writer.
+
+    The drafts stand in for a good model: one section per source paragraph
+    group, and — this is the point of the probe — the first section after a
+    chunk boundary is titled «ادامهٔ <previous heading>», which is what models
+    actually write when the cut lands mid-topic. The merge must reunite those
+    two sections; a booklet that shows the same topic twice under two headings
+    is the coherence defect the probe measures.
+    """
+    from gamas_bot.qa import analyze_structure
+    from gamas_bot.structuring import merge_structured_notes, parse_structured_notes
+
+    fixtures = _load_fixtures()
+    if not fixtures:
+        return {}
+    # A lecture of realistic length. Every fixture is re-read several times, and
+    # each pass is worded as a new pass ("مرور ۲: …") so the probe measures the
+    # *merge*, not the deterministic verbatim-duplicate collapse that the same
+    # sentence repeated unchanged would (correctly) trigger.
+    budget = TRANSCRIPT_CHUNK_CHARS - _CHUNK_PREFIX_RESERVE
+    paragraphs: list[str] = []
+    for cycle in range(1, 7):
+        for _name, text in fixtures:
+            for paragraph in re.split(r"\n\s*\n", text):
+                paragraph = paragraph.strip()
+                if paragraph:
+                    paragraphs.append(f"مرور {cycle}: {paragraph}")
+    lecture = "\n\n".join(paragraphs)
+    chunks = split_transcript(lecture, max_chars=budget)
+
+    drafts: list[StructuredNotes] = []
+    for chunk in chunks:
+        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", chunk) if part.strip()]
+        grouped = [paragraphs[index : index + 4] for index in range(0, len(paragraphs), 4)]
+        sections = [
+            {
+                "heading": (
+                    "ادامهٔ " + drafts[-1].sections[-1].heading
+                    if index == 0 and drafts and drafts[-1].sections
+                    else group[0][:60]
+                ),
+                "paragraphs": group,
+            }
+            for index, group in enumerate(grouped)
+        ]
+        payload = json.dumps(
+            {"title": "درس بلند", "sections": sections}, ensure_ascii=False
+        )
+        drafts.append(parse_structured_notes(payload))
+
+    drafted_sections = [section for draft in drafts for section in draft.sections]
+    before = analyze_structure(
+        StructuredNotes(title="درس بلند", sections=tuple(drafted_sections))
+    )
+    merged = merge_structured_notes(drafts)
+    after = analyze_structure(merged)
+    return {
+        "source_chars": len(lecture),
+        "chunks": len(chunks),
+        "sections_drafted": len(drafted_sections),
+        "sections_merged": len(merged.sections),
+        "boundaries": max(len(chunks) - 1, 0),
+        "split_topics_before_merge": before.split_topics,
+        "split_topics_after_merge": after.split_topics,
+        "duplicate_blocks_after_merge": (
+            after.duplicate_paragraphs + after.duplicate_bullets
+        ),
+        "repeated_headings_after_merge": after.repeated_headings,
+        "boundaries_reunited": before.split_topics - after.split_topics,
     }
 
 
@@ -283,6 +440,8 @@ def run(mode: str = "full", live: bool = False) -> dict:
 
     report["fixtures"] = fixtures_report
     report["merge_probe"] = _merge_probe()
+    report["continuation_probe"] = _continuation_probe()
+    report["long_lecture_probe"] = _long_lecture_probe()
     report["document_probe"] = _document_probe(settings_fonts)
     det = [f["deterministic"] for f in fixtures_report]
     if det:
@@ -315,9 +474,29 @@ def run(mode: str = "full", live: bool = False) -> dict:
                 / max(len(fixtures_report), 1),
                 1,
             ),
+            "documents_with_update_fields": sum(
+                1 for f in fixtures_report if f["docx"]["update_fields"]
+            ),
         }
     if report["merge_probe"]:
         report["summary"]["merge_duplicate_rate"] = report["merge_probe"]["duplicate_rate"]
+    probe = report.get("continuation_probe") or {}
+    if probe:
+        report["summary"]["continuation_joins_correct"] = probe["correct_joins"]
+        report["summary"]["continuation_joins_expected"] = probe["expected_joins"]
+        report["summary"]["continuation_wrong_joins"] = probe["wrong_joins"]
+        report["summary"]["continuation_prose_losses"] = probe["prose_losses"]
+    lecture = report.get("long_lecture_probe") or {}
+    if lecture:
+        report["summary"]["long_lecture_chunks"] = lecture["chunks"]
+        report["summary"]["long_lecture_sections_drafted"] = lecture["sections_drafted"]
+        report["summary"]["long_lecture_sections_merged"] = lecture["sections_merged"]
+        report["summary"]["long_lecture_split_topics_after_merge"] = lecture[
+            "split_topics_after_merge"
+        ]
+        report["summary"]["long_lecture_duplicate_blocks"] = lecture[
+            "duplicate_blocks_after_merge"
+        ]
     probe = report.get("document_probe") or {}
     if probe:
         probe_docx = probe["docx"]

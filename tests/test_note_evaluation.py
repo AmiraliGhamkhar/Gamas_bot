@@ -203,5 +203,51 @@ class PipelineBenchmarkTests(unittest.TestCase):
         self.assertIn('<w:rtl w:val="0"/>', body)
 
 
+class CoherenceBenchmarkTests(unittest.TestCase):
+    """The benchmark's coherence probes stay meaningful (they gate CI)."""
+
+    def test_continuation_probe_joins_split_topics_and_nothing_else(self):
+        from scripts.benchmark_notes import _continuation_probe
+
+        probe = _continuation_probe()
+        self.assertEqual(probe["expected_joins"], 3)
+        self.assertEqual(probe["correct_joins"], probe["expected_joins"])
+        self.assertEqual(probe["wrong_joins"], 0)
+        # A merge changes headings, never prose.
+        self.assertEqual(probe["prose_losses"], 0)
+
+    def test_long_lecture_probe_reunites_every_boundary(self):
+        from scripts.benchmark_notes import _long_lecture_probe
+
+        probe = _long_lecture_probe()
+        self.assertGreaterEqual(probe["chunks"], 2, "the probe must actually split")
+        self.assertEqual(probe["boundaries_reunited"], probe["boundaries"])
+        self.assertEqual(probe["split_topics_after_merge"], 0)
+        self.assertEqual(probe["duplicate_blocks_after_merge"], 0)
+        # Joining sections must not delete content either.
+        self.assertLessEqual(probe["sections_merged"], probe["sections_drafted"])
+        self.assertGreater(probe["sections_merged"], probe["sections_drafted"] // 2)
+
+    def test_chunking_a_long_lecture_is_lossless_and_ordered(self):
+        from scripts.benchmark_notes import _long_lecture_probe  # noqa: F401  (import check)
+        from gamas_bot.structuring import (
+            TRANSCRIPT_CHUNK_CHARS,
+            _CHUNK_PREFIX_RESERVE,
+            split_transcript,
+        )
+
+        text = "\n\n".join(
+            f"پاراگراف {index} با توضیح کامل مفهوم و مثال عددی {index} mg است. " * 4
+            for index in range(400)
+        )
+        chunks = split_transcript(
+            text, max_chars=TRANSCRIPT_CHUNK_CHARS - _CHUNK_PREFIX_RESERVE
+        )
+        self.assertGreater(len(chunks), 1)
+        # Lossless in the sense the splitter promises: the same tokens, in the
+        # same order, with only the paragraph whitespace normalised.
+        self.assertEqual(" ".join(chunks).split(), text.split())
+
+
 if __name__ == "__main__":
     unittest.main()

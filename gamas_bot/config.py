@@ -511,11 +511,16 @@ class Settings:
             note_api_max_output_tokens=note_max_tokens,
             note_api_json_mode=_flag("NOTE_API_JSON_MODE", False),
             docx_font=_text("DOCX_FONT", "Tahoma"),
-            docx_font_body=_text("DOCX_FONT_BODY", ""),
-            docx_font_heading=_text("DOCX_FONT_HEADING", ""),
-            docx_font_latin=_text("DOCX_FONT_LATIN", ""),
+            # ``DOCX_FONT_*`` is the canonical spelling; the symmetrical
+            # ``DOCX_<ROLE>_FONT`` form is accepted as an alias so a deployment
+            # written against either name behaves identically. Blank means
+            # "use the profile" (see FONT_PROFILES).
+            docx_font_body=_text("DOCX_FONT_BODY", "") or _text("DOCX_BODY_FONT", ""),
+            docx_font_heading=_text("DOCX_FONT_HEADING", "") or _text("DOCX_HEADING_FONT", ""),
+            docx_font_latin=_text("DOCX_FONT_LATIN", "") or _text("DOCX_LATIN_FONT", ""),
             # Blank defers to the profile's fallback (Tahoma in every profile).
-            docx_font_fallback=_text("DOCX_FONT_FALLBACK", ""),
+            docx_font_fallback=_text("DOCX_FONT_FALLBACK", "")
+            or _text("DOCX_FALLBACK_FONT", ""),
             docx_font_profile=_text("DOCX_FONT_PROFILE", "persian_modern"),
             note_mode=resolve_note_mode(_text("NOTE_MODE", "full")),
             note_repair_enabled=_flag("NOTE_REPAIR_ENABLED", True),

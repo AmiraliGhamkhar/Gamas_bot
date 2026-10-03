@@ -43,6 +43,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
+from lxml import etree
 
 from .bidi import TextRun, split_direction_runs
 from .config import PROJECT_ROOT
@@ -363,10 +364,22 @@ def _shade_paragraph(paragraph, fill: str) -> None:
 
 def _paragraph_borders(paragraph, color: str, *, size: str = "6") -> None:
     """Draw a full box border around a paragraph (callout/summary boxes)."""
+    _paragraph_border_edges(paragraph, color, size=size, edges=("top", "left", "bottom", "right"))
+
+
+def _paragraph_border_edges(
+    paragraph, color: str, *, size: str = "6", edges: tuple[str, ...]
+) -> None:
+    """Draw the requested edges of a paragraph box.
+
+    Used for the *continuous* boxes (key points, summary lists): only the first
+    line carries the top edge and only the last one the bottom edge, so a run
+    of shaded lines reads as one box instead of a stack of framed rows.
+    """
     p_pr = paragraph._p.get_or_add_pPr()
     _remove_ppr_child(p_pr, "w:pBdr")
     borders = OxmlElement("w:pBdr")
-    for edge in ("top", "left", "bottom", "right"):
+    for edge in edges:
         element = OxmlElement(f"w:{edge}")
         element.set(qn("w:val"), "single")
         element.set(qn("w:sz"), size)
@@ -374,6 +387,13 @@ def _paragraph_borders(paragraph, color: str, *, size: str = "6") -> None:
         element.set(qn("w:color"), color)
         borders.append(element)
     _insert_ppr_child(p_pr, borders, ("w:shd",) + PPR_SUCCESSORS)
+
+
+def _keep_lines(paragraph) -> None:
+    """Keep an important block (callout, definition, box) on one page."""
+    p_pr = paragraph._p.get_or_add_pPr()
+    _remove_ppr_child(p_pr, "w:keepLines")
+    _insert_ppr_child(p_pr, OxmlElement("w:keepLines"), PPR_SUCCESSORS)
 
 
 def _insert_ppr_child(p_pr, element, successors: tuple[str, ...]) -> None:
@@ -903,6 +923,35 @@ def _apply_document_defaults(document, fonts: DocumentFonts) -> None:
     _configure_styles(document, fonts)
 
 
+def _rewrite_docx_part(docx_bytes: bytes, part_name: str, transform) -> bytes:
+    """Apply ``transform`` to one existing XML part of a saved package.
+
+    Both post-save tweaks (font fallbacks, field refresh) need the same
+    "read the package, edit one part, write it back" step. A missing part and
+    any error leave the document byte-identical: these are refinements, and no
+    refinement is allowed to cost a user the file.
+    """
+    try:
+        buffer = io.BytesIO(docx_bytes)
+        with zipfile.ZipFile(buffer) as archive:
+            members = {name: archive.read(name) for name in archive.namelist()}
+        if part_name not in members:
+            return docx_bytes
+        root = etree.fromstring(members[part_name])
+        transform(root)
+        members[part_name] = etree.tostring(
+            root, xml_declaration=True, encoding="UTF-8", standalone=True
+        )
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, payload in members.items():
+                archive.writestr(name, payload)
+        return out.getvalue()
+    except Exception:
+        logger.debug("Rewriting %s failed", part_name, exc_info=True)
+        return docx_bytes
+
+
 def _inject_font_fallbacks(docx_bytes: bytes, fonts: DocumentFonts) -> bytes:
     """Declare w:altName fallbacks for every used font in word/fontTable.xml.
 
@@ -911,16 +960,7 @@ def _inject_font_fallbacks(docx_bytes: bytes, fonts: DocumentFonts) -> bytes:
     arbitrary system font. This is metadata only — it never changes layout
     when the primary font is present and no fonts are embedded in the file.
     """
-    try:
-        buffer = io.BytesIO(docx_bytes)
-        with zipfile.ZipFile(buffer) as archive:
-            names = archive.namelist()
-            if "word/fontTable.xml" not in names:
-                return docx_bytes
-            members = {name: archive.read(name) for name in names}
-        from lxml import etree
-
-        root = etree.fromstring(members["word/fontTable.xml"])
+    def transform(root) -> None:
         fonts_by_name = {el.get(qn("w:name")): el for el in root.findall(qn("w:font"))}
         wanted = [(fonts.body, fonts.fallback), (fonts.heading, fonts.fallback), (fonts.latin, fonts.fallback)]
         for name, fallback in wanted:
@@ -937,18 +977,43 @@ def _inject_font_fallbacks(docx_bytes: bytes, fonts: DocumentFonts) -> bytes:
                 element.remove(found)
             alt = etree.SubElement(element, qn("w:altName"))
             alt.set(qn("w:val"), fallback)
-        members["word/fontTable.xml"] = etree.tostring(
-            root, xml_declaration=True, encoding="UTF-8", standalone=True
-        )
-        out = io.BytesIO()
-        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
-            for name, payload in members.items():
-                archive.writestr(name, payload)
-        return out.getvalue()
-    except Exception:
-        # The fallback table is a nicety; never lose the document over it.
-        logger.debug("fontTable fallback injection failed", exc_info=True)
-        return docx_bytes
+
+    return _rewrite_docx_part(docx_bytes, "word/fontTable.xml", transform)
+
+
+def _enable_update_fields(docx_bytes: bytes) -> bytes:
+    """Ask Word to refresh fields (TOC, PAGE) when the document is opened.
+
+    Without ``w:updateFields`` the table of contents stays at its placeholder
+    until the reader presses F9, and a field that is never refreshed is how a
+    booklet ends up with a visible «فهرست مطالب» and no entries. Word and
+    LibreOffice both honour the flag; readers that ignore it simply show the
+    placeholder, which is exactly today's behaviour.
+    """
+    def transform(root) -> None:
+        for found in root.findall(qn("w:updateFields")):
+            root.remove(found)
+        element = OxmlElement("w:updateFields")
+        element.set(qn("w:val"), "true")
+        # CT_Settings is a sequence: ``w:updateFields`` must follow
+        # ``w:characterSpacingControl``/``w:savePreviewPicture`` and precede
+        # ``w:hdrShapeDefaults``/``w:footnotePr``/``w:compat``/``w:rsids``.
+        anchor = None
+        for tag in (
+            "w:hdrShapeDefaults", "w:footnotePr", "w:endnotePr", "w:compat",
+            "w:docVars", "w:rsids", "w:mathPr", "w:themeFontLang",
+            "w:clrSchemeMapping", "w:shapeDefaults", "w:decimalSymbol",
+            "w:listSeparator",
+        ):
+            anchor = root.find(qn(tag))
+            if anchor is not None:
+                break
+        if anchor is not None:
+            anchor.addprevious(element)
+        else:
+            root.append(element)
+
+    return _rewrite_docx_part(docx_bytes, "word/settings.xml", transform)
 
 
 def _new_document(meta: DocumentMeta, title: str) -> Document:
@@ -1196,7 +1261,14 @@ def _add_boxed_lines(
     level: int = 2,
     style: str = NOTE_STYLE,
 ) -> None:
-    """A shaded, bordered box of marked lines with a bold label."""
+    """A shaded, bordered box of marked lines with a bold label.
+
+    The box is *continuous*: the first line draws the top edge, the last one
+    the bottom edge, and every line draws the sides, so the block reads as one
+    panel instead of a stack of separately framed rows. Only the first line is
+    kept with the next one, so a box never leaves its label behind at the foot
+    of a page.
+    """
     if label:
         _add_heading(document, label, fonts=fonts, level=level, space_before=8, space_after=3)
     for index, line in enumerate(lines):
@@ -1211,7 +1283,13 @@ def _add_boxed_lines(
         )
         paragraph.paragraph_format.right_indent = Cm(0.35)
         _shade_paragraph(paragraph, fill)
-        _paragraph_borders(paragraph, fill)
+        edges = ["left", "right"]
+        if index == 0:
+            edges.insert(0, "top")
+        if index == len(lines) - 1:
+            edges.append("bottom")
+        _paragraph_border_edges(paragraph, fill, edges=tuple(edges))
+        _keep_lines(paragraph)
 
 
 def _apply_rtl_table_direction(table) -> None:
@@ -1239,7 +1317,13 @@ def _apply_rtl_table_direction(table) -> None:
 
 
 def _set_table_widths(table, widths_cm: list[float]) -> None:
-    """Give every column a fixed, sensible width (header and body cells alike)."""
+    """Give every column a fixed, sensible width (header and body cells alike).
+
+    ``w:tblLayout type="fixed"`` is what makes those widths authoritative:
+    with Word's default autofit, a long Persian cell silently re-flows the
+    columns and the declared layout is lost. The total is written to ``w:tblW``
+    as well, so the table is exactly as wide as its margin-to-margin content.
+    """
     for column_index, width in enumerate(widths_cm):
         if width <= 0:
             continue
@@ -1249,6 +1333,48 @@ def _set_table_widths(table, widths_cm: list[float]) -> None:
             except IndexError:  # pragma: no cover - defensive
                 continue
             cell.width = Cm(width)
+    # ``cell.width`` writes ``w:tcW`` only; ``w:tblGrid`` stays at python-docx's
+    # equal default and a reader that trusts the grid (LibreOffice, most
+    # converters, the repository's own page renderer) would show equal columns.
+    # Both must agree for a *fixed* layout to mean anything.
+    grid = table._tbl.find(qn("w:tblGrid"))
+    if grid is not None:
+        columns = grid.findall(qn("w:gridCol"))
+        for column_index, column in enumerate(columns):
+            if column_index >= len(widths_cm) or widths_cm[column_index] <= 0:
+                continue
+            column.set(qn("w:w"), str(_cm_to_twips(widths_cm[column_index])))
+    _make_table_layout_fixed(table, sum(width for width in widths_cm if width > 0))
+
+
+def _cm_to_twips(value_cm: float) -> int:
+    """Centimetres to twentieths of a point, the unit ``w:tblGrid`` uses."""
+    return int(round(value_cm * 567))
+
+
+def _make_table_layout_fixed(table, total_cm: float) -> None:
+    """Fix the table layout and its total width.
+
+    ``table.autofit = False`` writes ``w:tblLayout w:type="fixed"`` through
+    python-docx (which owns the schema-correct insertion point); the declared
+    total is then written to ``w:tblW``.
+    """
+    table.autofit = False
+    tbl_pr = table._tbl.tblPr
+    if total_cm > 0:
+        _remove_ppr_child(tbl_pr, "w:tblW")
+        width = OxmlElement("w:tblW")
+        width.set(qn("w:w"), str(_cm_to_twips(total_cm)))
+        width.set(qn("w:type"), "dxa")
+        _insert_ppr_child(
+            tbl_pr,
+            width,
+            (
+                "w:jc", "w:tblCellSpacing", "w:tblInd", "w:tblBorders", "w:shd",
+                "w:tblLayout", "w:tblCellMar", "w:tblLook", "w:tblCaption",
+                "w:tblDescription",
+            ),
+        )
 
 
 def _shade_cell(cell, fill: str) -> None:
@@ -1266,7 +1392,6 @@ def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
     rows = table_data.rows
     table = document.add_table(rows=len(rows) + 1, cols=len(headers))
     table.style = "Table Grid"
-    table.autofit = True
     _apply_rtl_table_direction(table)
 
     for column, header in enumerate(headers):
@@ -1305,9 +1430,28 @@ def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
             except KeyError:  # pragma: no cover - defensive
                 pass
     if headers:
-        width = 17.0 / max(len(headers), 1)
-        _set_table_widths(table, [width] * len(headers))
+        _set_table_widths(table, _table_column_widths(len(headers)))
     _add_rtl_paragraph(document, "", fonts=fonts, size=4, space_after=6, line_spacing=1.0)
+
+
+#: Content width inside the A4 margins (21 cm - 2 x 2.2 cm).
+TABLE_CONTENT_WIDTH_CM = 16.6
+
+
+def _table_column_widths(columns: int, *, total_cm: float = TABLE_CONTENT_WIDTH_CM) -> list[float]:
+    """Column widths for a Persian note table.
+
+    A two-column table in these notes is almost always «برچسب | توضیح», so the
+    label column gets a third less room than the explanation; three or more
+    comparable columns share the width equally. Every table is then locked to
+    these widths (see :func:`_set_table_widths`), so a long cell cannot re-flow
+    the whole table.
+    """
+    if columns <= 0:
+        return []
+    if columns == 2:
+        return [round(total_cm * 0.42, 2), round(total_cm * 0.58, 2)]
+    return [round(total_cm / columns, 2)] * columns
 
 
 def _add_callout(document, callout, *, fonts: DocumentFonts) -> None:
@@ -1325,6 +1469,10 @@ def _add_callout(document, callout, *, fonts: DocumentFonts) -> None:
     )
     _shade_paragraph(paragraph, fill)
     _paragraph_borders(paragraph, fill)
+    # A warning split across a page boundary is exactly the note a reader can
+    # lose. Word keeps the whole paragraph together (and ignores the rule when
+    # the paragraph is longer than a page, so this can never break the layout).
+    _keep_lines(paragraph)
 
 
 def _add_definitions(document, section: NoteSection, *, fonts: DocumentFonts) -> None:
@@ -1416,8 +1564,27 @@ def _add_bullets(document, bullets: tuple[str, ...], *, fonts: DocumentFonts) ->
         paragraph.paragraph_format.right_indent = Cm(0.35)
 
 
+#: A heading that already enumerates itself: «۱» / «۱.» / «(۱)» / «بخش ۲» / «فصل 3 -».
+_HEADING_SELF_NUMBER = re.compile(
+    r"^\s*(?:[\(\[]?\s*(?:\d{1,2}|[۰-۹]{1,2})\s*[\)\].\-–—:،]\s*"
+    r"|(?:بخش|فصل|قسمت|بند|بخشِ)\s*(?:\d{1,2}|[۰-۹]{1,2})\b)",
+)
+
+
+def _numbered_heading(index: int, heading: str) -> str:
+    """Prefix the booklet's section number — unless the heading has one.
+
+    A model that already writes «۱. مقدمه» or «بخش ۲: نرمال‌سازی» must not be
+    rendered as «۱. ۱. مقدمه»; the heading is used verbatim in that case.
+    """
+    text = heading.strip()
+    if _HEADING_SELF_NUMBER.match(text):
+        return text
+    return f"{to_persian_digits(index)}. {text}"
+
+
 def _add_section(document, index: int, section: NoteSection, *, fonts: DocumentFonts) -> None:
-    _add_heading(document, f"{to_persian_digits(index)}. {section.heading}", fonts=fonts, level=1)
+    _add_heading(document, _numbered_heading(index, section.heading), fonts=fonts, level=1)
     for paragraph_text in section.paragraphs:
         _add_rtl_paragraph(document, paragraph_text, fonts=fonts)
     _add_definitions(document, section, fonts=fonts)
@@ -1564,12 +1731,14 @@ def build_notes_docx(
                 definition_cell.paragraphs[0], entry.definition, fonts=resolved,
                 size=10.5, align=WD_ALIGN_PARAGRAPH.RIGHT, space_after=0,
             )
-        _set_table_widths(glossary_table, [4.6, 12.4])
+        # A term is short and its explanation is long: the glossary keeps its
+        # own narrower first column, matched to the same content width.
+        _set_table_widths(glossary_table, [4.6, TABLE_CONTENT_WIDTH_CM - 4.6])
         _add_rtl_paragraph(document, "", fonts=resolved, size=4, space_after=6, line_spacing=1.0)
 
     buffer = io.BytesIO()
     document.save(buffer)
-    return _inject_font_fallbacks(buffer.getvalue(), resolved)
+    return _enable_update_fields(_inject_font_fallbacks(buffer.getvalue(), resolved))
 
 
 def build_plain_docx(
@@ -1621,7 +1790,7 @@ def build_plain_docx(
         _add_rtl_paragraph(document, line.strip(), fonts=resolved)
     buffer = io.BytesIO()
     document.save(buffer)
-    return _inject_font_fallbacks(buffer.getvalue(), resolved)
+    return _enable_update_fields(_inject_font_fallbacks(buffer.getvalue(), resolved))
 
 
 def build_raw_text_document(

@@ -26,6 +26,8 @@ from gamas_bot.docx_export import (
 )
 from gamas_bot.qa import run_note_qa
 from gamas_bot.structuring import (
+    NoteSection,
+    StructuredNotes,
     build_presentation_system_prompt,
     build_system_prompt,
     merge_structured_notes,
@@ -87,6 +89,53 @@ class ChunkingTests(unittest.TestCase):
         chunks = split_transcript(text, max_chars=200)
         # Greedy packing: chunks are near the budget, not single sentences.
         self.assertTrue(all(len(chunk) > 100 for chunk in chunks[:-1]))
+
+    def test_a_topic_cue_ends_a_mostly_full_chunk(self):
+        """A slide heading or a lecture transition is a better cut than a budget."""
+        paragraph = "توضیح کامل مفهوم با مثال عددی 500 mg و توضیح بیشتر. " * 6
+        cue = "## اسلاید ۹ — ایندکس\n- ساختار کمکی برای جست‌وجوی سریع"
+        text = "\n\n".join([paragraph, paragraph, cue, paragraph])
+        chunks = split_transcript(text, max_chars=1000)
+        self.assertEqual(len(chunks), 2)
+        self.assertTrue(chunks[1].lstrip().startswith("## اسلاید"))
+        self.assertEqual(" ".join(chunks).split(), text.split())
+
+    def test_a_topic_cue_is_ignored_while_the_chunk_is_still_short(self):
+        """The fill gate keeps chunks balanced instead of cue-chasing."""
+        paragraph = "توضیح کامل مفهوم با مثال عددی 500 mg. " * 3
+        cue = "## اسلاید ۹ — ایندکس"
+        text = "\n\n".join([paragraph, cue, paragraph])
+        chunks = split_transcript(text, max_chars=1000)
+        self.assertEqual(len(chunks), 1, "a 25%-full chunk must not break early")
+
+    def test_cue_free_material_still_packs_to_the_budget(self):
+        """Without a semantic cue nothing changes: greedy packing to the budget."""
+        paragraph = "توضیح کامل مفهوم با مثال عددی 500 mg و توضیح بیشتر. " * 6
+        text = "\n\n".join([paragraph, paragraph, paragraph])
+        chunks = split_transcript(text, max_chars=1000)
+        self.assertGreater(
+            len(chunks[0]), 900, "an ordinary transcript must still fill its chunk"
+        )
+        self.assertEqual(" ".join(chunks).split(), text.split())
+
+    def test_topic_cue_detection_covers_slides_and_transitions_only(self):
+        from gamas_bot.structuring import _starts_a_topic
+
+        for cue in (
+            "### اسلاید ۳ — مدل دادهٔ رابطه‌ای",
+            "## متن اسلایدها",
+            "اسلاید ۱۲",
+            "بخش بعدی دربارهٔ ایندکس است.",
+            "حالا می‌رسیم به نرمال‌سازی.",
+            "خب برویم سراغ ایندکس.",
+        ):
+            self.assertTrue(_starts_a_topic(cue), cue)
+        for ordinary in (
+            "این پاراگراف موضوع تازه‌ای را شروع نمی‌کند و ادامهٔ بحث قبلی است.",
+            "۱۲۰/۸۰ میلی‌متر جیوه و نبض ۸۰ ثبت شد.",
+            "در نتیجه سرعت جست‌وجو بهبود می‌یابد.",
+        ):
+            self.assertFalse(_starts_a_topic(ordinary), ordinary)
 
     def test_empty_and_tiny_inputs(self):
         self.assertEqual(split_transcript(""), [])
@@ -502,6 +551,178 @@ class DocxRenderingTests(unittest.TestCase):
         data = build_notes_docx(notes, fonts=fonts, meta=META)
         # The document still opens and contains all its content.
         self.assertIn("جزوهٔ آزمایشی", docx_text(data))
+
+
+# ---------------------------------------------------------------------------
+# Global coherence: one lecture, not a stack of independent summaries
+# ---------------------------------------------------------------------------
+
+
+def _note_doc(heading: str, *paragraphs: str):
+    """A one-section draft, the shape one chunk's answer arrives in."""
+    return parse_structured_notes(
+        json.dumps(
+            {
+                "title": "درس",
+                "sections": [
+                    {"heading": heading, "paragraphs": list(paragraphs) or ["توضیح."]}
+                ],
+            },
+            ensure_ascii=False,
+        )
+    )
+
+
+class MergeCoherenceTests(unittest.TestCase):
+    """A topic split by a chunk boundary must become one section again."""
+
+    def test_leading_continuation_marker_is_the_same_topic(self):
+        merged = merge_structured_notes(
+            [
+                _note_doc("مقدمه و طرح مسئله", "پاراگراف نخست."),
+                _note_doc("ادامهٔ مقدمه و طرح مسئله", "پاراگراف دوم."),
+            ]
+        )
+        self.assertEqual([section.heading for section in merged.sections], ["مقدمه و طرح مسئله"])
+        self.assertEqual(merged.sections[0].paragraphs, ("پاراگراف نخست.", "پاراگراف دوم."))
+
+    def test_trailing_and_parenthesised_markers_are_the_same_topic(self):
+        for first, second in (
+            ("نرمال‌سازی", "نرمال‌سازی (ادامه)"),
+            ("Introduction", "Introduction — continued"),
+            ("کلید و رابطه", "کلید، رابطه و صورت‌بندی جدول"),
+        ):
+            merged = merge_structured_notes([_note_doc(first, "الف"), _note_doc(second, "ب")])
+            self.assertEqual(len(merged.sections), 1, (first, second))
+
+    def test_unrelated_neighbours_are_never_fused(self):
+        merged = merge_structured_notes(
+            [_note_doc("ایندکس و کارایی", "الف"), _note_doc("نرمال‌سازی", "ب")]
+        )
+        self.assertEqual(
+            [section.heading for section in merged.sections],
+            ["ایندکس و کارایی", "نرمال‌سازی"],
+        )
+
+    def test_sibling_sections_that_differ_by_a_number_stay_separate(self):
+        merged = merge_structured_notes(
+            [_note_doc("صورت اول", "الف"), _note_doc("صورت دوم", "ب")]
+        )
+        self.assertEqual(len(merged.sections), 2)
+        merged = merge_structured_notes([_note_doc("مرحله ۱", "الف"), _note_doc("مرحله ۲", "ب")])
+        self.assertEqual(len(merged.sections), 2)
+
+    def test_joining_never_drops_prose(self):
+        merged = merge_structured_notes(
+            [
+                _note_doc("مقدمه", "یک."),
+                _note_doc("ادامهٔ مقدمه", "دو.", "سه."),
+                _note_doc("نتیجه", "چهار."),
+            ]
+        )
+        paragraphs = [text for section in merged.sections for text in section.paragraphs]
+        self.assertEqual(paragraphs, ["یک.", "دو.", "سه.", "چهار."])
+
+    def test_looser_topic_test_applies_only_at_a_chunk_boundary(self):
+        # Inside one chunk the stricter test decides: overlapping (but not
+        # identical) headings are two sections, not one.
+        from gamas_bot.structuring import _merge_sections
+
+        sections = [
+            NoteSection(heading="مقدمه و طرح مسئله", paragraphs=("الف",)),
+            NoteSection(heading="طرح مسئله و مثال‌ها", paragraphs=("ب",)),
+        ]
+        inside = _merge_sections(list(sections))
+        self.assertEqual(len(inside), 2)
+        # Across a boundary the same pair is one topic a model split.
+        across = _merge_sections(list(sections), chunk_starts=frozenset({1}))
+        self.assertEqual(len(across), 1)
+        self.assertEqual(across[0].paragraphs, ("الف", "ب"))
+
+
+class CoherenceDiagnosticsTests(unittest.TestCase):
+    """The QA layer must make the remaining coherence defects measurable."""
+
+    def test_split_topic_is_reported(self):
+        from gamas_bot.qa import analyze_structure
+
+        report = analyze_structure(
+            StructuredNotes(
+                title="درس",
+                sections=(
+                    NoteSection(heading="نرمال‌سازی", paragraphs=("توضیح الف",)),
+                    NoteSection(heading="ادامهٔ نرمال‌سازی", paragraphs=("توضیح ب",)),
+                ),
+            )
+        )
+        self.assertEqual(report.split_topics, 1)
+        self.assertIn("adjacent sections about one split topic: 1", report.findings)
+
+    def test_sentence_headings_and_bullet_only_sections_are_reported(self):
+        from gamas_bot.qa import analyze_structure
+
+        report = analyze_structure(
+            StructuredNotes(
+                title="درس",
+                sections=(
+                    NoteSection(
+                        heading="این عنوان در واقع یک جملهٔ کامل است که نباید عنوان باشد و خیلی هم طولانی است.",
+                        paragraphs=("توضیح",),
+                    ),
+                    NoteSection(heading="فهرست", bullets=("یک", "دو", "سه")),
+                ),
+            )
+        )
+        self.assertEqual(report.sentence_headings, 1)
+        self.assertEqual(report.sections_without_paragraphs, 1)
+        self.assertTrue(any("headings written as sentences" in item for item in report.findings))
+
+    def test_a_clean_document_reports_nothing(self):
+        from gamas_bot.qa import analyze_structure
+
+        report = analyze_structure(
+            StructuredNotes(
+                title="درس",
+                sections=(
+                    NoteSection(
+                        heading="مقدمه",
+                        paragraphs=("توضیح کامل و کافی دربارهٔ مقدمه و هدف درس در این بخش آمده است. " * 3,),
+                    ),
+                    NoteSection(
+                        heading="نتیجه",
+                        paragraphs=("جمع‌بندی این بخش با اشاره به نتیجهٔ اصلی درس نوشته شده است. " * 3,),
+                    ),
+                ),
+            )
+        )
+        self.assertTrue(report.is_clean, report.findings)
+
+
+class SemanticContractPromptTests(unittest.TestCase):
+    """The FULL prompt must state the deletion policy that FULL means."""
+
+    def test_educational_units_are_enumerated(self):
+        prompt = build_system_prompt("full")
+        self.assertIn("واحد آموزشی یعنی", prompt)
+        for unit in ("تعریف", "مثال نقض", "هشدار", "استثنا", "فرمول", "اصطلاح انگلیسی"):
+            self.assertIn(unit, prompt)
+
+    def test_deletion_policy_is_explicit(self):
+        prompt = build_system_prompt("full")
+        self.assertIn("فقط این چهار چیز را می‌توانید حذف کنید", prompt)
+        self.assertIn("جایگزین نکنید", prompt)  # no one-line replacement
+        self.assertIn("قرارداد معنایی", prompt)
+
+    def test_professor_style_and_transition_rules_are_present(self):
+        prompt = build_system_prompt("full")
+        self.assertIn("پیوند آن را با مفهوم پیشین", prompt)
+        self.assertIn("در نتیجه", prompt)
+        self.assertIn("برای نمونه", prompt)
+
+    def test_presentation_prompt_inherits_the_semantic_contract(self):
+        prompt = build_presentation_system_prompt("full")
+        self.assertIn("واحد آموزشی یعنی", prompt)
+        self.assertIn("قرارداد معنایی", prompt)
 
 
 if __name__ == "__main__":
