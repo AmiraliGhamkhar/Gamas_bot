@@ -341,7 +341,13 @@ def resolve_design(design_config: dict | None = None) -> DocxDesign:
 
 @dataclass(frozen=True, slots=True)
 class DocumentMeta:
-    """Job metadata rendered into the document header and the raw text file."""
+    """Job metadata for internal use: logging, database, debugging, file management.
+
+    This metadata is NOT automatically rendered as visible text in student-facing
+    documents. Only educational content (title, sections, notes, summaries, etc.)
+    appears in the generated DOCX. Internal fields like engine, source_name, and
+    reference remain available to the application but do not leak into the document.
+    """
 
     reference: str
     source_name: str | None = None
@@ -1321,26 +1327,21 @@ def _new_document(meta: DocumentMeta, title: str) -> Document:
 
 
 def cover_meta_lines(meta: DocumentMeta, *, mode_label: str = "") -> list[str]:
-    """The cover's metadata, pre-split into short balanced lines.
+    """The cover's user-facing metadata, pre-split into short balanced lines.
 
-    One long ``… • … • …`` line wraps unpredictably in a centred RTL paragraph
-    and can leave a tracking reference stranded on a line of its own. Splitting
-    the same facts into two short, self-contained lines keeps every label next
-    to its value on the cover, while :func:`_meta_line` keeps the single-line
-    form for the raw ``.txt`` companion file (unchanged behaviour there).
+    Only educational/document-level information appears here. Internal backend
+    metadata (engine, source_name, reference/ID) is NOT shown to students.
+
+    The date is shown as it's useful educational context for when the document
+    was prepared. The mode label (e.g., production mode) is also shown as it's
+    relevant to the student's understanding of the document type.
     """
     created = meta.created_at or datetime.now()
     lines: list[str] = []
     if mode_label:
         lines.append(mode_label)
-    date_source = f"تاریخ: {jalali_date(created)}"
-    if meta.source_name:
-        date_source += f"  •  منبع: {sanitize_filename_part(meta.source_name, max_chars=40)}"
-    lines.append(date_source)
-    engine_reference = f"کد پیگیری: {meta.reference}"
-    if meta.engine:
-        engine_reference = f"موتور تبدیل گفتار: {meta.engine}  •  {engine_reference}"
-    lines.append(engine_reference)
+    # Only show the date - this is useful educational context
+    lines.append(f"تاریخ: {jalali_date(created)}")
     return lines
 
 
@@ -1366,14 +1367,13 @@ def _wrap_estimate(text: str, chars_per_line: int) -> list[str]:
 
 
 def _meta_line(meta: DocumentMeta) -> str:
+    """A single line of user-facing metadata for the body title block.
+
+    Internal backend metadata (engine, source_name, reference) is NOT included.
+    Only the document preparation date is shown as educational context.
+    """
     created = meta.created_at or datetime.now()
-    parts = [f"تاریخ: {jalali_date(created)}"]
-    if meta.source_name:
-        parts.append(f"منبع: {sanitize_filename_part(meta.source_name, max_chars=40)}")
-    if meta.engine:
-        parts.append(f"موتور تبدیل گفتار: {meta.engine}")
-    parts.append(f"کد پیگیری: {meta.reference}")
-    return " • ".join(parts)
+    return f"تاریخ: {jalali_date(created)}"
 
 
 # ---------------------------------------------------------------------------
@@ -2222,9 +2222,13 @@ def build_plain_docx(
 def build_raw_text_document(
     *, title: str, sections: list[tuple[str, str]], meta: DocumentMeta
 ) -> str:
-    """The companion .txt file: labelled raw texts exactly as extracted."""
+    """The companion .txt file: labelled raw texts exactly as extracted.
+
+    Internal backend metadata (engine, source_name, reference/ID) is NOT included.
+    Only the document title and preparation date appear as educational context.
+    """
     created = meta.created_at or datetime.now()
-    lines = [title, "=" * 48, _meta_line(meta), "زمان تهیه: " + created.strftime("%Y-%m-%d %H:%M")]
+    lines = [title, "=" * 48, f"تاریخ تهیه: {created.strftime('%Y-%m-%d %H:%M')}"]
     for heading, body in sections:
         content = body.strip()
         if not content:
