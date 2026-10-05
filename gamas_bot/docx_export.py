@@ -19,6 +19,15 @@ Layout rules that matter and are implemented here:
   so Persian runs get ``w:cs`` complex-script faces and Latin tokens keep
   ``w:ascii``/``w:hAnsi`` with ``w:rtl`` set to zero. Logical order is never
   reversed in the file.
+* **Direction lives in the styles, not only on the paragraphs.** Marking every
+  paragraph ``w:bidi`` and every Persian run ``w:rtl`` is not enough: Word
+  derives the direction of the content *it* generates -- an automatic table of
+  contents, a newly typed paragraph, pasted text -- from the style definitions
+  and from ``w:docDefaults``. Those are configured RTL here (``_style_direction``,
+  ``_configure_document_defaults``, ``_configure_toc_entry_styles``), and every
+  paragraph mark carries its own ``w:rtl`` so an empty line and the caret are
+  RTL too. A document that is RTL only where it was written still behaves LTR
+  everywhere the reader touches it.
 * **Fonts are referenced, never embedded.** ``word/fontTable.xml`` advertises
   the configured fallback through ``w:altName`` so a reader without the
   Persian face substitutes gracefully.
@@ -402,13 +411,28 @@ def _enable_bidi(paragraph, *, rtl: bool = True) -> None:
             p_pr.remove(existing)
         return
     if existing is None:
-        _insert_ppr_child(
-            p_pr,
-            OxmlElement("w:bidi"),
-            ("w:adjustRightInd", "w:snapToGrid", "w:spacing", "w:ind", "w:jc", "w:rPr", "w:sectPr"),
-        )
+        _insert_ppr_child(p_pr, OxmlElement("w:bidi"), PPR_AFTER_BIDI)
         existing = p_pr.find(qn("w:bidi"))
     existing.set(qn("w:val"), "1")
+
+
+def _set_paragraph_mark_direction(paragraph, *, rtl: bool) -> None:
+    """Set the *paragraph mark's* own direction (``w:pPr/w:rPr/w:rtl``).
+
+    The mark is a real run as far as Word is concerned: it decides the base
+    direction of an empty paragraph, where the caret sits in an empty line, and
+    which side a trailing space hangs on. A document whose marks stay LTR looks
+    RTL while you read it but behaves LTR while you type into it, and a shaded
+    empty spacer paragraph inherits the wrong gutter side.
+    """
+    p_pr = paragraph._p.get_or_add_pPr()
+    r_pr = p_pr.find(qn("w:rPr"))
+    if r_pr is None:
+        # ``w:rPr`` is the last child of ``w:pPr`` except for ``w:sectPr``.
+        r_pr = OxmlElement("w:rPr")
+        _insert_ppr_child(p_pr, r_pr, ("w:sectPr", "w:pPrChange"))
+        r_pr = p_pr.find(qn("w:rPr"))
+    _set_rpr_rtl(r_pr, rtl=rtl)
 
 
 def _shade_paragraph(paragraph, fill: str) -> None:
@@ -454,6 +478,19 @@ def _keep_lines(paragraph) -> None:
     p_pr = paragraph._p.get_or_add_pPr()
     _remove_ppr_child(p_pr, "w:keepLines")
     _insert_ppr_child(p_pr, OxmlElement("w:keepLines"), PPR_SUCCESSORS)
+
+
+#: Children that must follow ``w:bidi`` inside ``w:pPr``. Distinct from
+#: :data:`PPR_SUCCESSORS`, which lists what follows the *early* properties
+#: (``w:keepNext``/``w:shd``/``w:pBdr``): ``w:bidi`` sits after all of those, so
+#: inserting it before ``w:pBdr`` produces an out-of-sequence ``w:pPr`` that Word
+#: reports as needing repair.
+PPR_AFTER_BIDI = (
+    "w:adjustRightInd", "w:snapToGrid", "w:spacing", "w:ind", "w:contextualSpacing",
+    "w:mirrorIndents", "w:suppressOverlap", "w:jc", "w:textDirection",
+    "w:textAlignment", "w:textboxTightWrap", "w:outlineLvl", "w:divId", "w:cnfStyle",
+    "w:rPr", "w:sectPr", "w:pPrChange",
+)
 
 
 def _insert_ppr_child(p_pr, element, successors: tuple[str, ...]) -> None:
@@ -517,6 +554,44 @@ def _remove_ppr_child(p_pr, tag: str) -> None:
 def _remove_rpr_child(r_pr, tag: str) -> None:
     for found in r_pr.findall(qn(tag)):
         r_pr.remove(found)
+
+
+#: ``w:rPr`` child order (CT_RPr). ``w:rtl`` and ``w:szCs`` are order-sensitive:
+#: appending them past ``w:lang``/``w:cs`` produces a file Word reports as
+#: needing repair, and it silently drops the complex-script size.
+RPR_ORDER = (
+    "w:rStyle", "w:rFonts", "w:b", "w:bCs", "w:i", "w:iCs", "w:caps", "w:smallCaps",
+    "w:strike", "w:dstrike", "w:outline", "w:shadow", "w:emboss", "w:imprint",
+    "w:noProof", "w:snapToGrid", "w:vanish", "w:webHidden", "w:color", "w:spacing",
+    "w:w", "w:kern", "w:position", "w:sz", "w:szCs", "w:highlight", "w:u", "w:effect",
+    "w:bdr", "w:shd", "w:fitText", "w:vertAlign", "w:rtl", "w:cs", "w:em", "w:lang",
+    "w:eastAsianLayout", "w:specVanish", "w:oMath",
+)
+
+
+def _insert_rpr_child(r_pr, element, tag: str) -> None:
+    """Insert an ``w:rPr`` child at its schema position (OOXML is order-sensitive)."""
+    try:
+        position = RPR_ORDER.index(tag)
+    except ValueError:  # pragma: no cover - defensive
+        r_pr.append(element)
+        return
+    for successor in RPR_ORDER[position + 1:]:
+        found = r_pr.find(qn(successor))
+        if found is not None:
+            found.addprevious(element)
+            return
+    r_pr.append(element)
+
+
+def _set_rpr_rtl(r_pr, *, rtl: bool) -> None:
+    """Set or clear ``w:rtl`` on a run-properties element (schema-ordered)."""
+    for found in r_pr.findall(qn("w:rtl")):
+        r_pr.remove(found)
+    element = OxmlElement("w:rtl")
+    if not rtl:
+        element.set(qn("w:val"), "0")
+    _insert_rpr_child(r_pr, element, "w:rtl")
 
 
 def _style_run(
@@ -593,6 +668,7 @@ def _add_directional_text(paragraph, text: str, *, fonts: DocumentFonts, size: f
     # Latin-only line keeps Word's left-to-right default.
     if is_rtl_dominant(text):
         _enable_bidi(paragraph, rtl=True)
+        _set_paragraph_mark_direction(paragraph, rtl=True)
     for run in runs:
         styled = paragraph.add_run(run.text)
         if run.rtl:
@@ -693,6 +769,12 @@ def _fill_paragraph(
         _add_directional_text(
             paragraph, text, fonts=fonts, size=size, bold=bold, color=color, italic=italic
         )
+    else:
+        # An empty paragraph still has a mark, and this document is Persian: a
+        # spacer, a rule or a page break left LTR is invisible in the XML but
+        # puts the caret and the shaded block on the wrong side.
+        _enable_bidi(paragraph, rtl=True)
+        _set_paragraph_mark_direction(paragraph, rtl=True)
     return paragraph
 
 
@@ -773,6 +855,24 @@ def _configure_section(section) -> None:
     section.header_distance = Cm(1.2)
     section.footer_distance = Cm(1.2)
     _set_section_rtl(section)
+    _set_section_rtl_gutter(section)
+
+
+def _set_section_rtl_gutter(section) -> None:
+    """Put the binding gutter on the right (``w:rtlGutter`` in ``w:sectPr``).
+
+    Paired with ``w:bidi``: a right-to-left section still reserves its gutter on
+    the left unless this is set, which puts the binding edge on the wrong side of
+    a printed booklet.
+    """
+    sect_pr = section._sectPr
+    for found in sect_pr.findall(qn("w:rtlGutter")):
+        sect_pr.remove(found)
+    element = OxmlElement("w:rtlGutter")
+    element.set(qn("w:val"), "1")
+    _insert_sectpr_child(
+        sect_pr, element, ("w:docGrid", "w:printerSettings", "w:sectPrChange")
+    )
 
 
 def _add_page_number_footer(section, *, fonts: DocumentFonts, design: DocxDesign) -> None:
@@ -855,6 +955,22 @@ def _add_document_header(section, *, fonts: DocumentFonts, title: str) -> None:
     _insert_ppr_child(p_pr, borders, ("w:shd",) + PPR_SUCCESSORS)
 
 
+def _configure_header_footer_styles(document) -> None:
+    """Mark the ``Header``/``Footer`` styles RTL.
+
+    Both parts are centred, so the paragraph mark-up is enough on its own, but
+    the styles carry a left-to-right tab set: any future header content that
+    uses a tab (a date on one side, the title on the other) would land mirrored
+    unless the style itself is RTL.
+    """
+    for name in ("Header", "Footer"):
+        try:
+            style = document.styles[name]
+        except KeyError:  # pragma: no cover - the default template has both
+            continue
+        _style_direction(style)
+
+
 # ---------------------------------------------------------------------------
 # Styles
 # ---------------------------------------------------------------------------
@@ -889,6 +1005,71 @@ def _style_complex_face(style, fonts: DocumentFonts, *, size: float | None = Non
             col.set(qn("w:val"), f"{color}")
 
 
+def _style_direction(style, *, rtl: bool = True) -> None:
+    """Mark a *style definition* itself as RTL (``w:bidi`` + ``w:rtl``).
+
+    Direction on a paragraph/run is not enough: Word derives the direction of
+    anything it generates itself from the style, not from the runs it copied.
+    That is precisely why an automatic table of contents came out left-aligned
+    in an otherwise RTL document -- the ``TOC 1``/``TOC 2`` entries are written
+    by Word into fresh paragraphs that never pass through
+    :func:`_add_directional_text`.
+    """
+    p_pr = style.element.get_or_add_pPr()
+    for found in p_pr.findall(qn("w:bidi")):
+        p_pr.remove(found)
+    bidi = OxmlElement("w:bidi")
+    if not rtl:
+        bidi.set(qn("w:val"), "0")
+    _insert_ppr_child(p_pr, bidi, PPR_AFTER_BIDI)
+    _set_rpr_rtl(style.element.get_or_add_rPr(), rtl=rtl)
+
+
+def _configure_document_defaults(document, fonts: DocumentFonts) -> None:
+    """Make the document's own defaults a Persian, right-to-left context.
+
+    ``w:docDefaults`` is what a reader gets for a paragraph or run that no style
+    and no direct formatting covers -- and what Word falls back to when it
+    synthesises content. Without ``w:bidi``/``w:rtl`` here the document declares
+    itself left-to-right, so the table of contents, a newly typed paragraph and
+    any pasted text all arrive LTR no matter how the body is marked up.
+    """
+    doc_defaults = document.styles.element.find(qn("w:docDefaults"))
+    if doc_defaults is None:  # pragma: no cover - the default template has one
+        return
+    p_pr_default = doc_defaults.find(qn("w:pPrDefault"))
+    if p_pr_default is not None:
+        p_pr = p_pr_default.find(qn("w:pPr"))
+        if p_pr is None:
+            p_pr = OxmlElement("w:pPr")
+            p_pr_default.insert(0, p_pr)
+        for found in p_pr.findall(qn("w:bidi")):
+            p_pr.remove(found)
+        _insert_ppr_child(p_pr, OxmlElement("w:bidi"), PPR_AFTER_BIDI)
+    r_pr_default = doc_defaults.find(qn("w:rPrDefault"))
+    if r_pr_default is not None:
+        r_pr = r_pr_default.find(qn("w:rPr"))
+        if r_pr is None:
+            r_pr = OxmlElement("w:rPr")
+            r_pr_default.insert(0, r_pr)
+        r_fonts = r_pr.find(qn("w:rFonts"))
+        if r_fonts is None:
+            r_fonts = OxmlElement("w:rFonts")
+            _insert_rpr_child(r_pr, r_fonts, "w:rFonts")
+        r_fonts.set(qn("w:cs"), fonts.body)
+        r_fonts.set(qn("w:ascii"), fonts.latin)
+        r_fonts.set(qn("w:hAnsi"), fonts.latin)
+        # The complex-script language decides which spelling rules and which
+        # font Word picks for Persian; the template's inherited ``ar-SA`` is
+        # Arabic and would shape Persian text with the wrong locale.
+        lang = r_pr.find(qn("w:lang"))
+        if lang is None:
+            lang = OxmlElement("w:lang")
+            _insert_rpr_child(r_pr, lang, "w:lang")
+        lang.set(qn("w:bidi"), "fa-IR")
+        _set_rpr_rtl(r_pr, rtl=True)
+
+
 def _ensure_paragraph_style(document, name: str, base: str = "Normal"):
     """Return a paragraph style, creating it when the template lacks it."""
     try:
@@ -905,10 +1086,12 @@ def _ensure_paragraph_style(document, name: str, base: str = "Normal"):
 
 def _configure_styles(document, fonts: DocumentFonts) -> None:
     """Define the document's real Word styles (headings included)."""
+    _configure_document_defaults(document, fonts)
     normal = document.styles["Normal"]
     normal.font.name = fonts.latin
     normal.font.size = Pt(11)
     _style_complex_face(normal, fonts, size=11)
+    _style_direction(normal)
     normal.paragraph_format.space_after = Pt(6)
     normal.paragraph_format.line_spacing = 1.15
     normal.paragraph_format.widow_control = True
@@ -927,6 +1110,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
         style.font.bold = True
         style.font.color.rgb = ACCENT
         _style_complex_face(style, DocumentFonts(face, face, fonts.latin, fonts.fallback), size=size)
+        _style_direction(style)
         paragraph_format = style.paragraph_format
         paragraph_format.space_before = Pt(before)
         paragraph_format.space_after = Pt(after)
@@ -944,6 +1128,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
         style.font.bold = name == TITLE_STYLE
         style.font.color.rgb = color
         _style_complex_face(style, fonts, size=size)
+        _style_direction(style)
         style.paragraph_format.space_before = Pt(before)
         style.paragraph_format.space_after = Pt(after)
         style.paragraph_format.line_spacing = 1.1
@@ -961,6 +1146,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
         style.font.size = Pt(size)
         style.font.bold = False
         _style_complex_face(style, fonts, size=size)
+        _style_direction(style)
         style.paragraph_format.space_before = Pt(before)
         style.paragraph_format.space_after = Pt(after)
         style.paragraph_format.line_spacing = 1.15
@@ -971,6 +1157,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
     quote.font.size = Pt(11.5)
     quote.font.italic = False
     _style_complex_face(quote, fonts, size=11.5)
+    _style_direction(quote)
     quote.paragraph_format.space_before = Pt(6)
     quote.paragraph_format.space_after = Pt(6)
     quote.paragraph_format.line_spacing = 1.2
@@ -981,8 +1168,50 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
     toc_heading.font.bold = True
     toc_heading.font.color.rgb = ACCENT
     _style_complex_face(toc_heading, fonts, size=16)
+    _style_direction(toc_heading)
     toc_heading.paragraph_format.space_before = Pt(0)
     toc_heading.paragraph_format.space_after = Pt(12)
+
+    _configure_toc_entry_styles(document, fonts)
+
+
+#: Style names Word writes its generated table-of-contents entries into. They
+#: are absent from python-docx's default template, so Word invents them on the
+#: first F9 -- as left-to-right styles, because nothing in the document told it
+#: otherwise. Defining them here is what makes the built TOC right-to-left.
+TOC_ENTRY_STYLES = ("TOC 1", "TOC 2", "TOC 3")
+
+
+def _configure_toc_entry_styles(document, fonts: DocumentFonts) -> None:
+    """Define RTL ``TOC 1``/``TOC 2``/``TOC 3`` styles for the generated TOC."""
+    for level, name in enumerate(TOC_ENTRY_STYLES, start=1):
+        style = _ensure_paragraph_style(document, name)
+        style.font.name = fonts.latin
+        style.font.size = Pt(11)
+        style.font.bold = False
+        _style_complex_face(style, fonts, size=11)
+        _style_direction(style)
+        # A TOC entry is right-aligned with a dot leader running to the page
+        # number on the left; Word's own default is a left-aligned leader, which
+        # is the visible symptom of a non-RTL table of contents.
+        paragraph_format = style.paragraph_format
+        paragraph_format.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        paragraph_format.space_before = Pt(4 if level == 1 else 0)
+        paragraph_format.space_after = Pt(0)
+        paragraph_format.line_spacing = 1.15
+        paragraph_format.left_indent = Cm(0.5 * (level - 1))
+        p_pr = style.element.get_or_add_pPr()
+        for found in p_pr.findall(qn("w:tabs")):
+            p_pr.remove(found)
+        tabs = OxmlElement("w:tabs")
+        tab = OxmlElement("w:tab")
+        tab.set(qn("w:val"), "right")
+        tab.set(qn("w:leader"), "dot")
+        tab.set(qn("w:pos"), str(_cm_to_twips(TABLE_CONTENT_WIDTH_CM)))
+        tabs.append(tab)
+        # ``w:tabs`` precedes ``w:bidi``, so insert it before the bidi that
+        # ``_style_direction`` already wrote as well as before its successors.
+        _insert_ppr_child(p_pr, tabs, ("w:bidi",) + PPR_AFTER_BIDI)
 
 
 def _apply_document_defaults(document, fonts: DocumentFonts) -> None:
@@ -1175,6 +1404,14 @@ def _add_body_section(document, *, design: DocxDesign):
     section = document.add_section(WD_SECTION.NEW_PAGE)
     _configure_section(section)
     apply_page_border(section, design)
+    # ``add_section`` leaves behind the paragraph that carries the break. It is
+    # a real, empty paragraph with a visible height on the page, so its mark
+    # needs the same direction as every other paragraph in the document.
+    break_paragraph = document.paragraphs[-1]._p
+    p_pr = break_paragraph.find(qn("w:pPr"))
+    if p_pr is not None and p_pr.find(qn("w:sectPr")) is not None:
+        _enable_bidi(document.paragraphs[-1], rtl=True)
+        _set_paragraph_mark_direction(document.paragraphs[-1], rtl=True)
     return section
 
 
@@ -1359,6 +1596,11 @@ def _add_toc(document, *, fonts: DocumentFonts, levels: str = TOC_LEVELS) -> Non
     )
     run = field_paragraph.add_run()
     _style_run(run, font=fonts.body, size=11)
+    # The field itself carries no text, so the direction has to be declared here:
+    # this paragraph is where Word expands the TOC, and its base direction
+    # decides which side the entries and their page numbers are laid out on.
+    _enable_bidi(field_paragraph, rtl=True)
+    _set_paragraph_mark_direction(field_paragraph, rtl=True)
     begin = OxmlElement("w:fldChar")
     begin.set(qn("w:fldCharType"), "begin")
     begin.set(qn("w:dirty"), "true")
@@ -1840,6 +2082,7 @@ def build_notes_docx(
     _set_section_page_numbering(body_section, start=1)
     _add_document_header(body_section, fonts=resolved, title=notes.display_title)
     _add_page_number_footer(body_section, fonts=resolved, design=style)
+    _configure_header_footer_styles(document)
 
     if toc_is_worth_it(_sections_chars(notes.sections), len(notes.sections), style):
         _add_toc(document, fonts=resolved, levels=style.toc_levels)
