@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import io
+import re
 import unittest
 import zipfile
 from datetime import datetime
 
+from gamas_bot.bidi import is_rtl_dominant
 from gamas_bot.docx_export import (
     DocumentMeta,
     build_notes_docx,
@@ -17,6 +19,7 @@ from gamas_bot.docx_export import (
     notes_docx_filename,
     plain_docx_filename,
     raw_text_filename,
+    resolve_design,
     sanitize_filename_part,
 )
 from gamas_bot.structuring import parse_structured_notes
@@ -287,6 +290,116 @@ class FilenameTruncationTests(unittest.TestCase):
         filename = plain_docx_filename(title, "GMS-000001")
         self.assertNotIn("  ", filename)
         self.assertTrue(filename.endswith(" - GMS-000001.docx"))
+
+
+class StyleLayerDirectionTests(unittest.TestCase):
+    """Direction must live in the styles, not only on the rendered paragraphs.
+
+    Regression: every paragraph carried ``w:bidi`` and every Persian run
+    ``w:rtl``, yet the document still behaved left-to-right in the places that
+    matter -- an automatic table of contents, a newly typed paragraph and a
+    pasted block all arrived LTR. Word derives the direction of content *it*
+    generates from the style definitions and from ``w:docDefaults``, none of
+    which declared a direction, so the body was RTL while everything around it
+    was not.
+    """
+
+    def _parts(self, data: bytes) -> dict[str, str]:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            return {
+                name: archive.read(name).decode("utf-8")
+                for name in archive.namelist()
+                if name.endswith(".xml")
+            }
+
+    def _document(self) -> dict[str, str]:
+        notes = parse_structured_notes(FULL_NOTES_JSON)
+        return self._parts(build_notes_docx(notes, meta=META))
+
+    def test_document_defaults_declare_an_rtl_persian_context(self):
+        styles = self._document()["word/styles.xml"]
+        doc_defaults = re.search(r"<w:docDefaults>.*?</w:docDefaults>", styles, re.S)
+        self.assertIsNotNone(doc_defaults, "the template must keep its docDefaults")
+        defaults = doc_defaults.group(0)
+        # The paragraph default is what a paragraph no style covers inherits.
+        p_pr_default = re.search(r"<w:pPrDefault>.*?</w:pPrDefault>", defaults, re.S)
+        self.assertIsNotNone(p_pr_default)
+        self.assertIn("<w:bidi/>", p_pr_default.group(0))
+        # The run default: complex-script face, RTL runs, Persian locale.
+        r_pr_default = re.search(r"<w:rPrDefault>.*?</w:rPrDefault>", defaults, re.S)
+        self.assertIsNotNone(r_pr_default)
+        self.assertIn("<w:rtl/>", r_pr_default.group(0))
+        self.assertIn('w:bidi="fa-IR"', r_pr_default.group(0))
+        # The template ships ``ar-SA``; Arabic locale shapes Persian wrongly.
+        self.assertNotIn('w:bidi="ar-SA"', defaults)
+
+    def test_every_configured_style_is_marked_rtl(self):
+        styles = self._document()["word/styles.xml"]
+        for style_id in (
+            "Normal", "Heading1", "Heading2", "Heading3", "Title", "Subtitle",
+            "Quote", "Definition", "Example", "Note", "Warning", "Tabletext",
+            "TOCHeading", "Header", "Footer",
+        ):
+            match = re.search(
+                r'<w:style [^>]*w:styleId="%s".*?</w:style>' % style_id, styles, re.S
+            )
+            self.assertIsNotNone(match, f"missing style {style_id}")
+            style = match.group(0)
+            self.assertIn("<w:bidi/>", style, f"{style_id} paragraph direction")
+            self.assertIn("<w:rtl/>", style, f"{style_id} run direction")
+
+    def test_generated_table_of_contents_uses_rtl_entry_styles(self):
+        """Word writes TOC entries itself, into styles it would invent as LTR."""
+        styles = self._document()["word/styles.xml"]
+        for style_id in ("TOC1", "TOC2", "TOC3"):
+            match = re.search(
+                r'<w:style [^>]*w:styleId="%s".*?</w:style>' % style_id, styles, re.S
+            )
+            self.assertIsNotNone(match, f"missing {style_id}")
+            style = match.group(0)
+            self.assertIn("<w:bidi/>", style)
+            self.assertIn("<w:rtl/>", style)
+            # Right-aligned with a dot leader, so the page number lands on the
+            # left of the Persian entry instead of hanging off the right edge.
+            self.assertIn('<w:jc w:val="right"/>', style)
+            self.assertIn('w:leader="dot"', style)
+
+    def test_toc_entry_styles_survive_when_the_toc_is_disabled(self):
+        # They are document-level definitions: Word still needs them if the
+        # reader inserts their own table of contents later.
+        notes = parse_structured_notes(FULL_NOTES_JSON)
+        data = build_notes_docx(notes, meta=META, design=resolve_design({"toc_enabled": False}))
+        self.assertIn('w:styleId="TOC1"', self._parts(data)["word/styles.xml"])
+
+    def test_paragraph_marks_are_rtl_so_the_document_types_rtl(self):
+        """The paragraph mark decides the caret and the empty-paragraph side."""
+        parts = self._document()
+        body = parts["word/document.xml"]
+        marks = re.findall(r"<w:pPr>(?:(?!</w:pPr>).)*?</w:pPr>", body, re.S)
+        rtl_marks = [m for m in marks if "<w:rPr><w:rtl/></w:rPr>" in m]
+        self.assertTrue(rtl_marks, "no paragraph mark carries w:rtl")
+        # The empty spacer/rule paragraphs have no runs at all, so their mark
+        # is the only thing that can make them RTL.
+        empty = [
+            m for m in re.findall(r"<w:p\b(?:(?!</w:p>).)*</w:p>", body, re.S)
+            if not re.search(r"<w:t[ >]", m)
+        ]
+        self.assertTrue(empty, "expected the cover's empty spacer paragraphs")
+        for paragraph in empty:
+            self.assertIn("<w:rtl/>", paragraph)
+        # Header and footer are separate parts and need the same treatment.
+        for name, xml in parts.items():
+            if name.startswith(("word/header", "word/footer")):
+                self.assertIn("<w:bidi", xml)
+
+    def test_section_marks_the_gutter_as_right_to_left(self):
+        body = self._document()["word/document.xml"]
+        self.assertIn("<w:rtlGutter", body)
+
+    def test_latin_only_lines_stay_ltr_after_the_style_change(self):
+        """Making the styles RTL must not force Persian onto Latin-only lines."""
+        self.assertFalse(is_rtl_dominant("F = ma"))
+        self.assertTrue(is_rtl_dominant("تشخیص بر پایهٔ HbA1c است."))
 
 
 if __name__ == "__main__":
