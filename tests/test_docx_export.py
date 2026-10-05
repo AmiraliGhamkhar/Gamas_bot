@@ -89,7 +89,15 @@ class NotesDocxTests(unittest.TestCase):
         self.assertIn("HbA1c | هموگلوبین گلیکوزیله", text)  # glossary is a table now
         self.assertIn("دارو | دوز روزانه", text)
         self.assertIn("Metformin | 500-2000 mg", text)
-        self.assertIn("کد پیگیری: GMS-000123", text)
+        # Internal backend metadata MUST NOT appear in the student document
+        self.assertNotIn("موتور تبدیل گفتار", text)
+        self.assertNotIn("speechmatics", text)
+        self.assertNotIn("deepgram", text)
+        self.assertNotIn("کد پیگیری", text)
+        self.assertNotIn("GMS-000123", text)
+        self.assertNotIn("backend", text.lower())
+        self.assertNotIn("provider", text.lower())
+        # Date is shown as educational context
         self.assertIn("۶ مهر ۱۴۰۵", text)
 
     def test_document_is_genuinely_rtl(self):
@@ -155,7 +163,12 @@ class RawTextDocumentTests(unittest.TestCase):
         self.assertIn("متن پیاده‌سازی‌شده", content)
         self.assertIn("این متن خام است.", content)
         self.assertIn("### اسلاید ۱", content)
-        self.assertIn("GMS-000123", content)
+        # Internal backend metadata MUST NOT appear in raw text
+        self.assertNotIn("GMS-000123", content)
+        self.assertNotIn("موتور تبدیل گفتار", content)
+        self.assertNotIn("deepgram", content)
+        self.assertNotIn("lecture.mp3", content)
+        # Date is shown as educational context
         self.assertIn("2026-09-28 10:30", content)
 
     def test_empty_sections_are_skipped(self):
@@ -166,6 +179,72 @@ class RawTextDocumentTests(unittest.TestCase):
         )
         self.assertNotIn("خالی", content)
         self.assertIn("محتوا", content)
+
+
+class MetadataLeakageTests(unittest.TestCase):
+    """Backend/internal metadata must NOT appear in student-facing documents.
+
+    The architectural boundary is:
+        internal metadata (engine, provider, submission_id, reference, etc.)
+            -> application internals (logs, database, debugging)
+        visible educational content (title, sections, notes, summaries, etc.)
+            -> DOCX renderer / raw text file
+
+    Student-facing DOCX and raw text files must never expose:
+    - STT provider/engine name (speechmatics, deepgram, etc.)
+    - backend/provider name
+    - submission/job IDs or tracking codes
+    - internal filenames
+    - debug information
+    """
+
+    def test_notes_docx_does_not_expose_engine(self):
+        """The STT engine name must not appear in the notes document."""
+        notes = parse_structured_notes(FULL_NOTES_JSON)
+        data = build_notes_docx(notes, meta=META)
+        text = docx_text(data)
+        # Engine names from any provider
+        for engine in ("speechmatics", "deepgram", "gemini", "openai", "whisper"):
+            self.assertNotIn(engine, text.lower(), f"engine '{engine}' leaked into notes docx")
+        self.assertNotIn("موتور تبدیل گفتار", text)
+
+    def test_notes_docx_does_not_expose_reference_id(self):
+        """The submission tracking reference must not appear in the notes document."""
+        notes = parse_structured_notes(FULL_NOTES_JSON)
+        data = build_notes_docx(notes, meta=META)
+        text = docx_text(data)
+        self.assertNotIn("GMS-000123", text)
+        self.assertNotIn("کد پیگیری", text)
+
+    def test_notes_docx_does_not_expose_source_filename(self):
+        """The original source filename must not appear in the notes document."""
+        notes = parse_structured_notes(FULL_NOTES_JSON)
+        data = build_notes_docx(notes, meta=META)
+        text = docx_text(data)
+        self.assertNotIn("lecture.mp3", text)
+        self.assertNotIn("source", text.lower())
+
+    def test_plain_docx_does_not_expose_backend_metadata(self):
+        """Plain/fallback DOCX must also not expose internal metadata."""
+        body = "# متن\n\nمضمون خام"
+        data = build_plain_docx("جزوهٔ خام", body, meta=META)
+        text = docx_text(data)
+        self.assertNotIn("GMS-000123", text)
+        self.assertNotIn("موتور تبدیل گفتار", text)
+        self.assertNotIn("deepgram", text.lower())
+        self.assertNotIn("lecture.mp3", text)
+
+    def test_raw_text_does_not_expose_backend_metadata(self):
+        """Raw text companion file must not expose internal metadata."""
+        content = build_raw_text_document(
+            title="متن خام",
+            sections=[("بخش", "مضمون")],
+            meta=META,
+        )
+        self.assertNotIn("GMS-000123", content)
+        self.assertNotIn("موتور تبدیل گفتار", content)
+        self.assertNotIn("deepgram", content.lower())
+        self.assertNotIn("lecture.mp3", content)
 
 
 class WordLayoutTests(unittest.TestCase):

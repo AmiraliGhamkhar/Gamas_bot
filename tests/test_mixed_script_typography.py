@@ -247,5 +247,134 @@ class NormalizationSafetyTests(unittest.TestCase):
         self.assertEqual(once, normalize_display(once))
 
 
+class RtlTableAndListTests(unittest.TestCase):
+    """Test RTL behavior in tables and lists specifically."""
+
+    def test_table_with_mixed_persian_english_content(self):
+        """Table containing Persian, English, numbers, and medical abbreviations.
+        
+        Note: build_plain_docx does not support markdown tables, so this test
+        verifies that the notes builder (which does support tables) renders
+        mixed content correctly without reversal.
+        """
+        from gamas_bot.docx_export import build_notes_docx, DocumentMeta, resolve_fonts
+        from datetime import datetime
+        from gamas_bot.structuring import StructuredNotes, NoteSection, NoteTable
+
+        meta = DocumentMeta(
+            reference="GMS-000123",
+            source_name="test.mp3",
+            engine="deepgram",
+            created_at=datetime(2026, 9, 28, 10, 30),
+        )
+        # Create notes with a table
+        notes = StructuredNotes(
+            title="اطلاعات بیمار",
+            sections=(
+                NoteSection(
+                    heading="اطلاعات بیمار",
+                    paragraphs=("بیمار ۵۸ ساله مراجعه کرد.",),
+                    table=NoteTable(
+                        headers=["نام بیمار", "سن", "تشخیص", "BP"],
+                        rows=[
+                            ["علی رضایی", "58", "Unstable Angina", "145/90 mmHg"],
+                            ["فاطمه احمدی", "62", "Type 2 Diabetes", "120/80 mmHg"],
+                        ],
+                    ),
+                ),
+            ),
+        )
+        data = build_notes_docx(notes, meta=meta, fonts=resolve_fonts())
+        import io
+        import docx as docx_library
+        document = docx_library.Document(io.BytesIO(data))
+        # Verify table exists and has correct content
+        self.assertTrue(document.tables)
+        table = document.tables[0]
+        self.assertEqual(len(table.rows), 3)  # header + 2 data rows
+        # Header row
+        header_cells = [cell.text for cell in table.rows[0].cells]
+        self.assertIn("نام بیمار", header_cells)
+        self.assertIn("BP", header_cells)
+        # Data rows preserve content without reversal
+        row1_cells = [cell.text for cell in table.rows[1].cells]
+        self.assertIn("علی رضایی", row1_cells)
+        self.assertIn("145/90 mmHg", row1_cells)
+        self.assertIn("Unstable Angina", row1_cells)
+        # Verify numbers and English terms are NOT reversed
+        # Combine all cell texts and verify the full row content
+        row1_text = " | ".join(cell.text for cell in table.rows[1].cells)
+        self.assertIn("145/90", row1_text)
+        self.assertIn("علی رضایی", row1_text)
+
+    def test_list_items_render_correctly_rtl(self):
+        """Bulleted list items should render RTL correctly."""
+        from gamas_bot.docx_export import build_plain_docx, DocumentMeta
+        from datetime import datetime
+
+        meta = DocumentMeta(
+            reference="GMS-000123",
+            source_name="test.mp3",
+            engine="deepgram",
+            created_at=datetime(2026, 9, 28, 10, 30),
+        )
+        body = """# نکات مهم
+
+- نکته اول: مصرف داروهای کاهنده قند
+- نکته دوم: پایش HbA1c هر سه ماه
+- نکته سوم: Controlling BP below 140/90"""
+        data = build_plain_docx("جزوه نکات", body, meta=meta)
+        import io
+        import docx as docx_library
+        document = docx_library.Document(io.BytesIO(data))
+        text = "\n".join(p.text for p in document.paragraphs)
+        # Verify list items are present and not reversed
+        self.assertIn("نکته اول", text)
+        self.assertIn("نکته دوم", text)
+        self.assertIn("نکته سوم", text)
+        self.assertIn("HbA1c", text)
+        self.assertIn("140/90", text)
+        # Verify English terms are not reversed
+        self.assertNotIn("c140/90", text)  # Would indicate reversal
+
+    def test_long_mixed_paragraph_persian_medical_content(self):
+        """Realistic Persian nursing/medical content with English terminology."""
+        from gamas_bot.docx_export import build_plain_docx, DocumentMeta
+        from datetime import datetime
+
+        meta = DocumentMeta(
+            reference="GMS-000123",
+            source_name="test.mp3",
+            engine="deepgram",
+            created_at=datetime(2026, 9, 28, 10, 30),
+        )
+        body = """# ارزیابی بالینی
+
+بیمار ۵۸ ساله با chest pain مراجعه کرد. تشخیص اولیه: Unstable Angina.
+BP: 145/90 mmHg، SpO2: 96%، PR: 88 bpm.
+بررسی MRI و HbA1c نشان‌دهنده نیاز به درمان فوریه.
+IV Line 20G قرار داده شد. پایش بر اساس Braden Scale و Morse Fall Scale انجام شود."""
+        data = build_plain_docx("جزوه ارزیابی", body, meta=meta)
+        import io
+        import docx as docx_library
+        document = docx_library.Document(io.BytesIO(data))
+        text = "\n".join(p.text for p in document.paragraphs)
+        # Verify content is preserved
+        self.assertIn("۵۸ ساله", text)
+        self.assertIn("chest pain", text)
+        self.assertIn("Unstable Angina", text)
+        self.assertIn("145/90 mmHg", text)
+        self.assertIn("SpO2: 96%", text)
+        self.assertIn("PR: 88 bpm", text)
+        self.assertIn("MRI", text)
+        self.assertIn("HbA1c", text)
+        self.assertIn("IV Line 20G", text)
+        self.assertIn("Braden Scale", text)
+        self.assertIn("Morse Fall Scale", text)
+        # Verify no reversal of English terms or numbers
+        self.assertNotIn("90/145", text)  # Would indicate BP reversal
+        self.assertNotIn("20G IV", text)  # Would indicate reversal
+
+
 if __name__ == "__main__":
     unittest.main()
