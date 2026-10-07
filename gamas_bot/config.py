@@ -23,10 +23,21 @@ CANONICAL_PAYMENT_CARD_HOLDER = "امیرعلی غمخوار"
 CANONICAL_PAYMENT_BANK = "بانک پاسارگاد"
 
 # Canonical prepaid tariff. These are the confirmed business values; the
-# environment may override them (FREE_PLAN_HOURS, PLAN_25_*, PLAN_50_*), but a
-# deployment that sets nothing bills exactly the promised plans. Accounting is
-# always done in integer seconds, never in floating-point hours.
+# environment may override them (FREE_PLAN_HOURS, PLAN_5_*, PLAN_10_*,
+# PLAN_20_*, PLAN_25_*, PLAN_50_*), but a deployment that sets nothing bills
+# exactly the promised plans. Accounting is always done in integer seconds,
+# never in floating-point hours. ``test_billing`` pins every value here against
+# :data:`gamas_bot.billing.PAID_PLAN_SPECS` so the two can never drift.
 CANONICAL_FREE_PLAN_HOURS = 1
+CANONICAL_PLAN_5_HOURS = 5
+CANONICAL_PLAN_5_PRICE_TOMAN = 50_000
+CANONICAL_PLAN_5_VALIDITY_DAYS = 30
+CANONICAL_PLAN_10_HOURS = 10
+CANONICAL_PLAN_10_PRICE_TOMAN = 75_000
+CANONICAL_PLAN_10_VALIDITY_DAYS = 30
+CANONICAL_PLAN_20_HOURS = 20
+CANONICAL_PLAN_20_PRICE_TOMAN = 130_000
+CANONICAL_PLAN_20_VALIDITY_DAYS = 30
 CANONICAL_PLAN_25_HOURS = 25
 CANONICAL_PLAN_25_PRICE_TOMAN = 150_000
 CANONICAL_PLAN_25_VALIDITY_DAYS = 30
@@ -35,8 +46,19 @@ CANONICAL_PLAN_50_PRICE_TOMAN = 250_000
 CANONICAL_PLAN_50_VALIDITY_DAYS = 30
 
 #: Environment variable name -> resolved settings attribute for the tariff.
+#: The attribute spelling matches the dataclass field exactly, and the names are
+#: the ``{prefix}_{suffix}`` form of ``billing.PAID_PLAN_SPECS``.
 PLAN_ENV_FIELDS = (
     ("FREE_PLAN_HOURS", "free_plan_hours", CANONICAL_FREE_PLAN_HOURS),
+    ("PLAN_5_HOURS", "plan_5_hours", CANONICAL_PLAN_5_HOURS),
+    ("PLAN_5_PRICE_TOMAN", "plan_5_price_toman", CANONICAL_PLAN_5_PRICE_TOMAN),
+    ("PLAN_5_VALIDITY_DAYS", "plan_5_validity_days", CANONICAL_PLAN_5_VALIDITY_DAYS),
+    ("PLAN_10_HOURS", "plan_10_hours", CANONICAL_PLAN_10_HOURS),
+    ("PLAN_10_PRICE_TOMAN", "plan_10_price_toman", CANONICAL_PLAN_10_PRICE_TOMAN),
+    ("PLAN_10_VALIDITY_DAYS", "plan_10_validity_days", CANONICAL_PLAN_10_VALIDITY_DAYS),
+    ("PLAN_20_HOURS", "plan_20_hours", CANONICAL_PLAN_20_HOURS),
+    ("PLAN_20_PRICE_TOMAN", "plan_20_price_toman", CANONICAL_PLAN_20_PRICE_TOMAN),
+    ("PLAN_20_VALIDITY_DAYS", "plan_20_validity_days", CANONICAL_PLAN_20_VALIDITY_DAYS),
     ("PLAN_25_HOURS", "plan_25_hours", CANONICAL_PLAN_25_HOURS),
     ("PLAN_25_PRICE_TOMAN", "plan_25_price_toman", CANONICAL_PLAN_25_PRICE_TOMAN),
     ("PLAN_25_VALIDITY_DAYS", "plan_25_validity_days", CANONICAL_PLAN_25_VALIDITY_DAYS),
@@ -421,6 +443,15 @@ class Settings:
     payment_bank_name: str = CANONICAL_PAYMENT_BANK
     # Resolved tariff (defaults are the canonical business values).
     free_plan_hours: int = CANONICAL_FREE_PLAN_HOURS
+    plan_5_hours: int = CANONICAL_PLAN_5_HOURS
+    plan_5_price_toman: int = CANONICAL_PLAN_5_PRICE_TOMAN
+    plan_5_validity_days: int = CANONICAL_PLAN_5_VALIDITY_DAYS
+    plan_10_hours: int = CANONICAL_PLAN_10_HOURS
+    plan_10_price_toman: int = CANONICAL_PLAN_10_PRICE_TOMAN
+    plan_10_validity_days: int = CANONICAL_PLAN_10_VALIDITY_DAYS
+    plan_20_hours: int = CANONICAL_PLAN_20_HOURS
+    plan_20_price_toman: int = CANONICAL_PLAN_20_PRICE_TOMAN
+    plan_20_validity_days: int = CANONICAL_PLAN_20_VALIDITY_DAYS
     plan_25_hours: int = CANONICAL_PLAN_25_HOURS
     plan_25_price_toman: int = CANONICAL_PLAN_25_PRICE_TOMAN
     plan_25_validity_days: int = CANONICAL_PLAN_25_VALIDITY_DAYS
@@ -873,13 +904,9 @@ class Settings:
                 "PAYMENT_CARD_HOLDER", CANONICAL_PAYMENT_CARD_HOLDER
             ),
             payment_bank_name=_text("PAYMENT_BANK_NAME", CANONICAL_PAYMENT_BANK),
-            free_plan_hours=plan_values["free_plan_hours"],
-            plan_25_hours=plan_values["plan_25_hours"],
-            plan_25_price_toman=plan_values["plan_25_price_toman"],
-            plan_25_validity_days=plan_values["plan_25_validity_days"],
-            plan_50_hours=plan_values["plan_50_hours"],
-            plan_50_price_toman=plan_values["plan_50_price_toman"],
-            plan_50_validity_days=plan_values["plan_50_validity_days"],
+            # Every tariff value comes straight from the validated mapping, so a
+            # new plan only has to be described once in PLAN_ENV_FIELDS.
+            **{name: plan_values[name] for _env, name, _default in PLAN_ENV_FIELDS},
             receipt_dir=_path("RECEIPT_DIR", "data/receipts"),
             receipt_retention_days=receipt_retention_days,
             max_receipt_size_bytes=max_receipt_size,

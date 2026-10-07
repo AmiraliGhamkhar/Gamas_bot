@@ -19,8 +19,15 @@ from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.tl.types import MessageMediaWebPage
 
 from .config import Settings
-from .database import Database, clean_human_text
-from .billing import format_duration, format_toman, plan_catalog
+from .database import Database, UNLIMITED_REVOKED_REASON, clean_human_text
+from .billing import (
+    MAX_PLAN_HOURS,
+    MAX_PLAN_VALIDITY_DAYS,
+    format_duration,
+    format_toman,
+    format_validity,
+    plan_catalog,
+)
 from .docx_export import (
     DocxPaginationError,
     DocumentMeta,
@@ -188,6 +195,10 @@ def admin_menu():
             Button.inline("⏱ اعتبار کاربران", b"admin:credits"),
         ],
         [
+            Button.inline("🧾 طرح‌های فروش", b"admin:plans"),
+            Button.inline("⭐ کاربران ویژه", b"admin:special"),
+        ],
+        [
             Button.inline("🩺 وضعیت سرویس‌ها", b"admin:health"),
             Button.inline("🔑 API Keys", b"admin:credentials"),
         ],
@@ -336,6 +347,51 @@ def _parse_user_id(value: str) -> int | None:
     if not value.isdecimal() or len(value) > 15:
         return None
     return int(value)
+
+
+#: A plan field the administrator leaves unchanged in the edit prompt.
+PLAN_FIELD_PLACEHOLDERS = frozenset({"", "-", "—", "_"})
+
+SPECIAL_USER_PROMPT = (
+    "شناسهٔ عددی کاربر و دلیل را با قالب «شناسه | دلیل» بفرستید؛ مثال:\n"
+    "`123456789 | همکار پشتیبانی`\n\n"
+    "این کاربر از این پس بدون کسر اعتبار از ربات استفاده می‌کند و همهٔ "
+    "پردازش‌هایش در گزارش مدیر ثبت می‌شود."
+)
+
+PLAN_NEW_PROMPT = (
+    "طرح جدید را با قالب «کد | نام | ساعت | قیمت | روز اعتبار» بفرستید؛ مثال:\n"
+    "`promo_3h | ۳ ساعت ویژه | 3 | 35000 | 30`\n\n"
+    "• کد: با حرف لاتین شروع شود و فقط حروف کوچک، رقم و _ داشته باشد.\n"
+    "• قیمت به تومان و بزرگ‌تر از صفر است.\n"
+    "• برای طرح بدون انقضا در بخش روز اعتبار `0` بفرستید."
+)
+
+
+def _plan_field(value: str) -> str | None:
+    """One plan-input field; ``None`` when the administrator left it unchanged."""
+    cleaned = value.strip()
+    return None if cleaned in PLAN_FIELD_PLACEHOLDERS else cleaned
+
+
+def _plan_number(value: str) -> int | None:
+    """A non-negative plan number (``0`` is meaningful: no expiry)."""
+    cleaned = value.strip()
+    if not cleaned.isdecimal() or len(cleaned) > 12:
+        return None
+    return int(cleaned)
+
+
+def _plan_edit_prompt(plan: dict) -> str:
+    return (
+        f"ویرایش طرح {plan['code']} — {plan['name']}\n"
+        f"مقدار فعلی: {format_duration(plan['included_seconds'])}، "
+        f"{format_toman(plan['price_toman'])}، {format_validity(plan['validity_days'])}\n\n"
+        "قالب: «قیمت | ساعت | روز اعتبار | نام»\n"
+        "هر فیلد را برای تغییر بفرستید و برای بی‌تغییر `-` بگذارید. مثال:\n"
+        "`60000 | - | 60 | -`\n"
+        "برای طرح بدون انقضا در بخش روز اعتبار `0` بفرستید."
+    )
 
 
 def markdown_to_telegram_html(text: str) -> str:
@@ -713,7 +769,7 @@ class StudyBot:
         self._clean_stale_workdirs()
         await self.db.open()
         await self.db.sync_plan_catalog(
-            [plan.as_record() for plan in plan_catalog()]
+            [plan.as_record() for plan in plan_catalog(self.settings.plan_values)]
         )
         self._ensure_secure_receipt_directory()
         await self._cleanup_expired_receipts()
@@ -889,11 +945,18 @@ class StudyBot:
             for item in entitlements
             if item["source"] != "free_lifetime"
         )
-        lines = [
-            "⏱ اعتبار من",
-            f"قابل استفاده: {format_duration(balance['available_seconds'])}",
-            f"رایگان: {format_duration(free_seconds)} | خریداری‌شده: {format_duration(paid_seconds)}",
-        ]
+        lines = ["⏱ اعتبار من"]
+        if await self.db.is_unlimited_user(user_id):
+            lines.append(
+                "♾️ وضعیت: کاربر ویژه — استفادهٔ نامحدود و بدون کسر اعتبار"
+            )
+        lines.extend(
+            [
+                f"قابل استفاده: {format_duration(balance['available_seconds'])}",
+                f"رایگان: {format_duration(free_seconds)} | "
+                f"خریداری‌شده: {format_duration(paid_seconds)}",
+            ]
+        )
         if entitlements:
             lines.append("\nاعتبارهای فعال:")
             for entitlement in entitlements:
@@ -921,7 +984,7 @@ class StudyBot:
         for plan in plans:
             lines.append(
                 f"• {plan['name']} — {format_duration(plan['included_seconds'])}، "
-                f"{format_toman(plan['price_toman'])}، {plan['validity_days']} روز"
+                f"{format_toman(plan['price_toman'])}، {format_validity(plan['validity_days'])}"
             )
             buttons.append(
                 [
@@ -1413,6 +1476,16 @@ class StudyBot:
             f"موجودی قابل استفاده: {format_duration(overview['available_seconds'])}",
             f"سهم رایگان: {format_duration(overview['free_seconds'])} | "
             f"سهم خریداری‌شده: {format_duration(overview['paid_seconds'])}",
+            (
+                "♾️ کاربر ویژه (نامحدود)"
+                + (
+                    f" — دلیل: {overview['unlimited_reason']}"
+                    if overview.get("unlimited_reason")
+                    else ""
+                )
+                if overview.get("is_unlimited")
+                else "وضعیت ویژه: ندارد"
+            ),
             f"ارسال‌ها: {overview['submissions']['total']} "
             f"(موفق {overview['submissions']['done']} / ناموفق {overview['submissions']['failed']})",
         ]
@@ -1476,6 +1549,93 @@ class StudyBot:
             [Button.inline("↩️ پنل مدیریت", b"admin:home")],
         ]
         await self._edit_callback(event, self._admin_credit_text(overview), buttons)
+
+    @staticmethod
+    def _special_users_text(users: list[dict]) -> str:
+        if not users:
+            return (
+                "⭐ کاربران ویژه\n\n"
+                "هنوز کاربری در این فهرست نیست.\n"
+                "کاربران ویژه بدون کسر اعتبار از ربات استفاده می‌کنند."
+            )
+        lines = [
+            "⭐ کاربران ویژه (استفادهٔ نامحدود)",
+            f"تعداد: {len(users)}",
+            "",
+        ]
+        for user in users:
+            name = f"@{user['username']}" if user["username"] else "بدون نام کاربری"
+            ban = " | مسدود" if user["is_banned"] else ""
+            reason = f" | دلیل: {user['unlimited_reason']}" if user["unlimited_reason"] else ""
+            lines.append(
+                f"• {name} | شناسه: {user['telegram_id']} | "
+                f"پردازش‌های ویژه: {user['unbilled_jobs']}{ban}{reason}"
+            )
+        lines.append("")
+        if len(users) > 12:
+            lines.append(
+                "برای حذف کاربران بیشتر از دکمه‌ها، از دستور "
+                "`/unlimited شناسه off دلیل` استفاده کنید."
+            )
+        lines.append(
+            "این فهرست فقط برای مدیران است و هر تغییر آن در گزارش مدیر ثبت می‌شود. "
+            "مدیران به‌صورت خودکار در این فهرست نیستند."
+        )
+        return "\n".join(lines)
+
+    async def _show_special_users(self, event) -> None:
+        users = await self.db.unlimited_users(limit=30)
+        buttons = [[Button.inline("➕ افزودن کاربر ویژه", b"admin:special:add")]]
+        for user in users[:12]:
+            buttons.append(
+                [
+                    Button.inline(
+                        f"❌ حذف {user['telegram_id']}",
+                        f"admin:special:remove:{int(user['telegram_id'])}",
+                    )
+                ]
+            )
+        buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
+        await self._edit_callback(event, self._special_users_text(users), buttons)
+
+    @staticmethod
+    def _plan_admin_line(plan: dict) -> str:
+        status = "فعال" if plan["enabled"] else "غیرفعال"
+        price = "رایگان" if plan["is_free"] else format_toman(plan["price_toman"])
+        origin = " | ساختهٔ مدیر" if plan["is_custom"] else ""
+        return (
+            f"• {plan['code']} — {plan['name']} — {format_duration(plan['included_seconds'])} — "
+            f"{price} — {format_validity(plan['validity_days'])} — {status}{origin}"
+        )
+
+    async def _show_admin_plans(self, event) -> None:
+        plans = await self.db.list_plans(include_disabled=True)
+        lines = [
+            "🧾 مدیریت طرح‌های فروش",
+            f"تعداد طرح‌ها: {len(plans)}",
+            "",
+            *[self._plan_admin_line(plan) for plan in plans],
+            "",
+            "طرح‌های پیش‌فرض با هر راه‌اندازی از تنظیمات به‌روز می‌شوند؛ به‌محض ویرایش یا "
+            "غیرفعال‌سازی، اختیار آن طرح به این پنل منتقل می‌شود و دیگر بازنویسی نمی‌شود. "
+            "طرح غیرفعال برای خریداران نمایش داده نمی‌شود.",
+        ]
+        buttons = [[Button.inline("➕ طرح جدید", b"admin:plan:new")]]
+        for plan in plans:
+            if plan["is_free"]:
+                continue
+            row = [
+                Button.inline(
+                    "⛔️ غیرفعال کن" if plan["enabled"] else "✅ فعال کن",
+                    f"admin:plan:toggle:{plan['id']}",
+                ),
+                Button.inline("✏️ ویرایش", f"admin:plan:edit:{plan['id']}"),
+            ]
+            if plan["is_custom"]:
+                row.append(Button.inline("🗑 حذف", f"admin:plan:delete:{plan['id']}"))
+            buttons.append(row)
+        buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
+        await self._edit_callback(event, "\n".join(lines), buttons)
 
     async def _begin_credential_add(self, event, admin_id: int, service: str) -> None:
         if not self.credential_manager.encryption_configured:
@@ -1595,6 +1755,103 @@ class StudyBot:
                 await event.answer("شمارهٔ درخواست معتبر نیست.", alert=True)
                 return
             await self._payment_callback(event, telegram_id, parts[2], payment_id)
+            return
+        if data == "admin:special":
+            self._pending_admin_actions.pop(telegram_id, None)
+            await self._show_special_users(event)
+            return
+        if data == "admin:special:add":
+            self._pending_admin_actions[telegram_id] = "special_add"
+            await self._edit_callback(
+                event, SPECIAL_USER_PROMPT, [[Button.inline("لغو", b"admin:special")]]
+            )
+            return
+        if data.startswith("admin:special:remove:"):
+            self._pending_admin_actions.pop(telegram_id, None)
+            try:
+                target_id = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                await event.answer("شناسهٔ کاربر معتبر نیست.", alert=True)
+                return
+            result = await self.db.set_user_unlimited(
+                target_id, False, telegram_id, UNLIMITED_REVOKED_REASON
+            )
+            if result is None:
+                await event.answer("این شناسه در پایگاه‌داده پیدا نشد.", alert=True)
+                return
+            await event.answer(
+                "از فهرست کاربران ویژه حذف شد."
+                if result["changed"]
+                else "این کاربر از قبل در فهرست نبود."
+            )
+            await self._show_special_users(event)
+            return
+        if data == "admin:plans":
+            self._pending_admin_actions.pop(telegram_id, None)
+            await self._show_admin_plans(event)
+            return
+        if data == "admin:plan:new":
+            self._pending_admin_actions[telegram_id] = "plan_new"
+            await self._edit_callback(
+                event, PLAN_NEW_PROMPT, [[Button.inline("لغو", b"admin:plans")]]
+            )
+            return
+        if data.startswith("admin:plan:edit:"):
+            self._pending_admin_actions.pop(telegram_id, None)
+            try:
+                plan_id = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                await event.answer("شناسهٔ طرح معتبر نیست.", alert=True)
+                return
+            plan = await self.db.get_plan(plan_id)
+            if plan is None:
+                await event.answer("این طرح پیدا نشد.", alert=True)
+                return
+            if plan["is_free"]:
+                await event.answer("طرح رایگان از این پنل ویرایش نمی‌شود.", alert=True)
+                return
+            self._pending_admin_actions[telegram_id] = f"plan_edit:{plan_id}"
+            await self._edit_callback(
+                event, _plan_edit_prompt(plan), [[Button.inline("لغو", b"admin:plans")]]
+            )
+            return
+        if data.startswith("admin:plan:toggle:"):
+            self._pending_admin_actions.pop(telegram_id, None)
+            try:
+                plan_id = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                await event.answer("شناسهٔ طرح معتبر نیست.", alert=True)
+                return
+            plan = await self.db.get_plan(plan_id)
+            if plan is None:
+                await event.answer("این طرح پیدا نشد.", alert=True)
+                return
+            try:
+                changed = await self.db.set_plan_enabled(
+                    plan_id, not plan["enabled"], telegram_id
+                )
+            except ValueError as exc:
+                await event.answer(str(exc), alert=True)
+                return
+            await event.answer(
+                "وضعیت طرح تغییر کرد." if changed else "وضعیت طرح تغییری نکرد."
+            )
+            await self._show_admin_plans(event)
+            return
+        if data.startswith("admin:plan:delete:"):
+            self._pending_admin_actions.pop(telegram_id, None)
+            try:
+                plan_id = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                await event.answer("شناسهٔ طرح معتبر نیست.", alert=True)
+                return
+            try:
+                changed = await self.db.delete_plan(plan_id, telegram_id)
+            except ValueError as exc:
+                await event.answer(str(exc), alert=True)
+                return
+            await event.answer("طرح حذف شد." if changed else "این طرح پیدا نشد.")
+            await self._show_admin_plans(event)
             return
         if data == "admin:audit":
             await self._show_admin_audit(event)
@@ -1774,6 +2031,156 @@ class StudyBot:
                 "و در گزارش مدیر ثبت شد.",
                 buttons=[
                     [Button.inline("🔄 وضعیت کاربر", f"admin:credits:{target_id}")],
+                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
+                ],
+            )
+            return
+
+        if action == "special_add":
+            self._pending_admin_actions.pop(telegram_id, None)
+            parts = [part.strip() for part in text.split("|", 1)]
+            target_id = _parse_user_id(parts[0]) if parts and parts[0] else None
+            reason = parts[1][:500] if len(parts) > 1 else ""
+            if target_id is None or not reason:
+                await event.reply(
+                    "قالب درست: «شناسه | دلیل» — مثال: 123456789 | همکار پشتیبانی",
+                    buttons=admin_menu(),
+                )
+                return
+            try:
+                result = await self.db.set_user_unlimited(
+                    target_id, True, telegram_id, reason
+                )
+            except ValueError as exc:
+                await event.reply(str(exc), buttons=admin_menu())
+                return
+            if result is None:
+                await event.reply(
+                    "این شناسه در فهرست کاربران ربات پیدا نشد.", buttons=admin_menu()
+                )
+                return
+            summary = (
+                f"کاربر {target_id} به فهرست کاربران ویژه اضافه شد و از این پس "
+                "بدون کسر اعتبار از ربات استفاده می‌کند."
+                if result["changed"]
+                else f"کاربر {target_id} از قبل کاربر ویژه بود؛ تغییری لازم نبود."
+            )
+            await event.reply(
+                summary,
+                buttons=[
+                    [Button.inline("⭐ فهرست کاربران ویژه", b"admin:special")],
+                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
+                ],
+            )
+            return
+
+        if action == "plan_new":
+            self._pending_admin_actions.pop(telegram_id, None)
+            parts = [part.strip() for part in text.split("|")]
+            if len(parts) != 5:
+                await event.reply(
+                    "قالب درست: «کد | نام | ساعت | قیمت | روز اعتبار» — پنج بخش با | جدا شود.",
+                    buttons=admin_menu(),
+                )
+                return
+            code, name, hours_raw, price_raw, days_raw = parts
+            hours = _plan_number(hours_raw)
+            price = _plan_number(price_raw)
+            days = _plan_number(days_raw)
+            if not hours or not price or days is None:
+                await event.reply(
+                    "ساعت، قیمت و روز اعتبار باید عدد باشند (برای بدون انقضا: 0).",
+                    buttons=admin_menu(),
+                )
+                return
+            try:
+                plan = await self.db.create_plan(
+                    code=code,
+                    name=name,
+                    hours=hours,
+                    price_toman=price,
+                    validity_days=None if days == 0 else days,
+                    admin_id=telegram_id,
+                )
+            except ValueError as exc:
+                await event.reply(str(exc), buttons=admin_menu())
+                return
+            await event.reply(
+                f"طرح «{plan['name']}» با کد {plan['code']} ساخته شد و از همین حالا "
+                f"برای خریداران نمایش داده می‌شود ({format_toman(plan['price_toman'])}، "
+                f"{format_validity(plan['validity_days'])}).",
+                buttons=[
+                    [Button.inline("🧾 فهرست طرح‌ها", b"admin:plans")],
+                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
+                ],
+            )
+            return
+
+        if action.startswith("plan_edit:"):
+            self._pending_admin_actions.pop(telegram_id, None)
+            try:
+                plan_id = int(action.split(":", 1)[1])
+            except (ValueError, IndexError):
+                await event.reply("درخواست ویرایش طرح معتبر نیست.", buttons=admin_menu())
+                return
+            parts = [part.strip() for part in text.split("|")]
+            if len(parts) != 4:
+                await event.reply(
+                    "قالب درست: «قیمت | ساعت | روز اعتبار | نام» — چهار بخش با | جدا شود.",
+                    buttons=admin_menu(),
+                )
+                return
+            changes: dict[str, Any] = {}
+            price_raw, hours_raw, days_raw, name_raw = parts
+            if (price_value := _plan_field(price_raw)) is not None:
+                price = _plan_number(price_value)
+                if not price:
+                    await event.reply("قیمت باید عددی بزرگ‌تر از صفر باشد.", buttons=admin_menu())
+                    return
+                changes["price_toman"] = price
+            if (hours_value := _plan_field(hours_raw)) is not None:
+                hours = _plan_number(hours_value)
+                if not hours or hours > MAX_PLAN_HOURS:
+                    await event.reply(
+                        f"ساعت باید عددی بین ۱ و {MAX_PLAN_HOURS} باشد.", buttons=admin_menu()
+                    )
+                    return
+                changes["hours"] = hours
+            if (days_value := _plan_field(days_raw)) is not None:
+                days = _plan_number(days_value)
+                if days is None or (days and days > MAX_PLAN_VALIDITY_DAYS):
+                    await event.reply(
+                        "روز اعتبار باید عددی بین ۱ و "
+                        f"{MAX_PLAN_VALIDITY_DAYS} باشد یا 0 برای بدون انقضا.",
+                        buttons=admin_menu(),
+                    )
+                    return
+                changes["validity_days"] = None if days == 0 else days
+            if (name_value := _plan_field(name_raw)) is not None:
+                changes["name"] = name_value
+            if not changes:
+                await event.reply(
+                    "هیچ فیلدی برای تغییر مشخص نشده است؛ برای هر فیلد یا مقدار جدید "
+                    "یا `-` بفرستید.",
+                    buttons=admin_menu(),
+                )
+                return
+            try:
+                plan = await self.db.update_plan(plan_id, changes, telegram_id)
+            except ValueError as exc:
+                await event.reply(str(exc), buttons=admin_menu())
+                return
+            if plan is None:
+                await event.reply("این طرح پیدا نشد.", buttons=admin_menu())
+                return
+            await event.reply(
+                f"طرح {plan['code']} به‌روزرسانی شد: {plan['name']} — "
+                f"{format_duration(plan['included_seconds'])} — "
+                f"{format_toman(plan['price_toman'])} — "
+                f"{format_validity(plan['validity_days'])}. "
+                "این طرح دیگر با تنظیمات .env بازنویسی نمی‌شود.",
+                buttons=[
+                    [Button.inline("🧾 فهرست طرح‌ها", b"admin:plans")],
                     [Button.inline("↩️ پنل مدیریت", b"admin:home")],
                 ],
             )
@@ -2002,7 +2409,10 @@ class StudyBot:
                     buttons=main_menu(is_admin),
                 )
             return
-        if command in {"/users", "/stats", "/broadcast", "/ban", "/unban", "/payments", "/credit", "/audit"}:
+        if command in {
+            "/users", "/stats", "/broadcast", "/ban", "/unban", "/payments", "/credit",
+            "/audit", "/unlimited",
+        }:
             if not is_admin:
                 await event.reply("این دستور فقط برای مدیر ربات فعال است.")
                 return
@@ -2104,6 +2514,15 @@ class StudyBot:
             raise InsufficientBalanceError(
                 int(reservation.get("available_seconds", 0)), seconds
             )
+        if reservation.get("unlimited"):
+            # A special user is never billed: the database recorded the job for
+            # the audit trail, and there is nothing to finalize or refund.
+            logger.info(
+                "Unlimited submission accepted submission_id=%s seconds=%s",
+                submission_id,
+                seconds,
+            )
+            return None
         return seconds
 
     async def _release_submission_usage(self, submission_id: int, reason: str) -> bool:
@@ -2812,10 +3231,11 @@ class StudyBot:
         for user in users:
             name = f"@{user['username']}" if user["username"] else "بدون نام کاربری"
             ban = " | مسدود" if user["is_banned"] else ""
+            special = " | ⭐ ویژه (نامحدود)" if user.get("is_unlimited") else ""
             joined = str(user["first_seen"])[:10]
             lines.append(
                 f"• {name} | شناسه: {user['telegram_id']} | عضویت: {joined} | "
-                f"فایل‌ها: {user['submission_count']}{ban}"
+                f"فایل‌ها: {user['submission_count']}{ban}{special}"
             )
         return "\n".join(lines)
 
@@ -2825,6 +3245,7 @@ class StudyBot:
             "آمار ربات 📊\n"
             f"کاربران ثبت‌شده: {stats['users']}\n"
             f"کاربران غیرمسدود: {stats['unbanned_users']}\n"
+            f"کاربران ویژه (نامحدود): {stats.get('unlimited_users', 0)}\n"
             f"کاربران دارای ارسال در ۳۰ روز اخیر: {stats['active_30d']}\n"
             f"کل فایل‌های دریافتی: {stats['submissions']}\n"
             f"فایل‌های تصویری: {stats['videos']}\n"
@@ -2868,6 +3289,44 @@ class StudyBot:
                 return
             await event.reply(
                 f"{format_duration(credit['seconds'])} اعتبار به کاربر {target_id} افزوده شد و ثبت حسابرسی شد.",
+                buttons=admin_menu(),
+            )
+            return
+        if command == "/unlimited":
+            args = text.split(maxsplit=3)
+            target_id = _parse_user_id(args[1]) if len(args) > 1 else None
+            flag_word = args[2].strip().lower() if len(args) > 2 else ""
+            reason = args[3].strip() if len(args) > 3 else ""
+            if target_id is None or flag_word not in {"on", "off", "روشن", "خاموش"} or not reason:
+                await event.reply(
+                    "روش استفاده: /unlimited شناسه_کاربر on|off دلیل\n"
+                    "مثال: /unlimited 123456789 on همکار پشتیبانی"
+                )
+                return
+            unlimited = flag_word in {"on", "روشن"}
+            try:
+                result = await self.db.set_user_unlimited(
+                    target_id, unlimited, admin_id, reason
+                )
+            except ValueError as exc:
+                await event.reply(str(exc))
+                return
+            if result is None:
+                await event.reply("این کاربر در پایگاه‌داده پیدا نشد.")
+                return
+            if not result["changed"]:
+                await event.reply(
+                    f"کاربر {target_id} از قبل "
+                    + ("کاربر ویژه بود." if unlimited else "کاربر عادی بود.")
+                )
+                return
+            await event.reply(
+                f"کاربر {target_id} "
+                + (
+                    "به فهرست کاربران ویژه اضافه شد؛ استفادهٔ او دیگر اعتبار کم نمی‌کند."
+                    if unlimited
+                    else "از فهرست کاربران ویژه حذف شد؛ از این پس اعتبارش کسر می‌شود."
+                ),
                 buttons=admin_menu(),
             )
             return

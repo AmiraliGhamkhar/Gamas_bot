@@ -116,7 +116,17 @@ PROGRESS_ANIMATION_ENABLED=false   # fewer Telegram edits, less CPU
 # DOCX_PAGINATION_RENDERER_BIN=/usr/bin/soffice  # if not on PATH
 # TELEGRAM_PROXY=socks5://user:pass@proxy.example.com:1080
 # --- canonical tariff (defaults shown; change only if the business changes) ---
+# Plans an admin creates/edits from "🧾 طرح‌های فروش" are never overwritten.
 # FREE_PLAN_HOURS=1
+# PLAN_5_HOURS=5
+# PLAN_5_PRICE_TOMAN=50000
+# PLAN_5_VALIDITY_DAYS=30
+# PLAN_10_HOURS=10
+# PLAN_10_PRICE_TOMAN=75000
+# PLAN_10_VALIDITY_DAYS=30
+# PLAN_20_HOURS=20
+# PLAN_20_PRICE_TOMAN=130000
+# PLAN_20_VALIDITY_DAYS=30
 # PLAN_25_HOURS=25
 # PLAN_25_PRICE_TOMAN=150000
 # PLAN_25_VALIDITY_DAYS=30
