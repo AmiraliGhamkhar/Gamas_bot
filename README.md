@@ -24,7 +24,9 @@ It accepts audio, voice messages, videos, and PowerPoint presentations, converts
 - Detailed, privacy-safe STT metrics logging (attempts, timings, polls, confidence, word counts — never transcript text)
 - Provider-neutral note generation (Gemini, Anthropic, OpenAI-compatible APIs) behind a strict JSON-only system prompt with validation and a bounded repair pass
 - Polished right-to-left Word (.docx) deliverable: document/style/paragraph/run/table/header/footer BiDi, complex-script fonts, shaded callouts, and a static linked TOC with actual rendered page numbers
-- Prepaid, integer-second billing: one lifetime free hour, two 30-day plans, safe reservations/refunds, private receipt review and admin audit
+- Prepaid, integer-second billing: one lifetime free hour, five 30-day plans (5/10/20/25/50 hours), safe reservations/refunds, private receipt review and admin audit
+- Special (unlimited) users: administrators grant/revoke a no-billing flag, still recorded in the usage ledger
+- In-bot selling-plan panel: create, edit, disable/enable and delete purchasable plans; administrator decisions survive restarts
 - Admin-only provider-key management with Fernet encryption at rest, masked credential panels, 429 cooldown/rotation and bounded retries
 - Raw-transcript companion `.txt` file sent alongside every result
 - Playful animated progress bar: rocket-head bar, cycling spinner frames, stage emoji and a celebration on completion
@@ -960,9 +962,9 @@ Users do not need to memorize commands. `/start` opens an inline button menu wit
 
 Each accepted upload gets one status message that is edited through the queue, download, media preparation, STT, note-generation, save, and delivery stages. The progress bar is animated: a 🚀 rides the fill edge, a braille spinner cycles on every frame, a stage emoji tells the story (📥 → ⬇️ → 🎚️ → 🎙️ → 📝 → 📖 → 📤), and completion gets a 🎉. While a single stage runs for a long time (STT can take hours), a background ticker keeps re-editing the message with the next spinner frame — every ~5 seconds by default, backing off automatically on Telegram flood waits, and capped so a job can never leak animation edits. Disable the ticker with `PROGRESS_ANIMATION_ENABLED=false`.
 
-Administrators get an additional **پنل مدیریت** button. Statistics, user listing, broadcast, ban/unban, pending payments, provider credentials and audit are available there. The payment and provider-key screens are admin-only and private; the provider panel shows the last recorded response, not a live health check.
+Administrators get an additional **پنل مدیریت** button. Statistics, user listing, broadcast, ban/unban, pending payments, special (unlimited) users, the selling-plan panel, provider credentials and audit are available there. The payment, plan, special-user and provider-key screens are admin-only and private; the provider panel shows the last recorded response, not a live health check.
 
-The `/help`, `/users`, `/stats`, `/broadcast`, `/ban`, `/unban`, `/payments`, `/credit` and `/audit` commands remain available for authorized administrators. Billing and payment commands are described below.
+The `/help`, `/users`, `/stats`, `/broadcast`, `/ban`, `/unban`, `/payments`, `/credit`, `/unlimited` and `/audit` commands remain available for authorized administrators. Billing and payment commands are described below.
 
 Administrators are defined with:
 
@@ -986,16 +988,29 @@ The canonical catalog is seeded into SQLite from `gamas_bot/billing.py`:
 | Plan code | Entitlement | Included time | Price | Validity |
 |---|---|---:|---:|---:|
 | `free_1h` | Free, once per user | 3,600 seconds (1 hour) | Free | Lifetime; `/start` never renews it |
+| `paid_5h_30d` | 5-hour plan | 18,000 seconds | 50,000 Toman | 30 days from approval |
+| `paid_10h_30d` | 10-hour plan | 36,000 seconds | 75,000 Toman | 30 days from approval |
+| `paid_20h_30d` | 20-hour plan | 72,000 seconds | 130,000 Toman | 30 days from approval |
 | `paid_25h_30d` | 25-hour plan | 90,000 seconds | 150,000 Toman | 30 days from approval |
 | `paid_50h_30d` | 50-hour plan | 180,000 seconds | 250,000 Toman | 30 days from approval |
 
 The tariff is configurable, but with the canonical defaults above when nothing is
-set. All seven values live in one place (`.env` → `Settings.plan_values` →
+set. All sixteen values live in one place (`.env` → `Settings.plan_values` →
 `billing.plan_catalog()` → the SQLite `plans` rows), so no handler carries a
-price or a duration of its own:
+price or a duration of its own, and `test_billing` pins the configuration
+against `billing.PAID_PLAN_SPECS` so the two can never drift:
 
 ```dotenv
 FREE_PLAN_HOURS=1
+PLAN_5_HOURS=5
+PLAN_5_PRICE_TOMAN=50000
+PLAN_5_VALIDITY_DAYS=30
+PLAN_10_HOURS=10
+PLAN_10_PRICE_TOMAN=75000
+PLAN_10_VALIDITY_DAYS=30
+PLAN_20_HOURS=20
+PLAN_20_PRICE_TOMAN=130000
+PLAN_20_VALIDITY_DAYS=30
 PLAN_25_HOURS=25
 PLAN_25_PRICE_TOMAN=150000
 PLAN_25_VALIDITY_DAYS=30
@@ -1067,6 +1082,46 @@ administrator id and writes an audit entry; the same action is refused for
 another administrator's account. `/audit` shows payment actions and the usage
 ledger. All of these are restricted to configured administrator IDs and private
 chats.
+
+### ⭐ Special (unlimited) users
+
+**⭐ کاربران ویژه** (or `/unlimited TELEGRAM_USER_ID on|off REASON`) keeps a
+chosen list of users who use the bot **without their credit ever being
+touched** — useful for staff, reviewers and the operator's own test account:
+
+- the flag lives on the user row (`users.is_unlimited`) and every grant or
+  revocation requires a reason and writes an audit entry;
+- a special user's job is still recorded (a `usage_reservations` row plus a
+  `usage_ledger` entry marked `Unlimited special user`), so the admin screens
+  show exactly what was processed unbilled — but no entitlement is reserved,
+  finalized or refunded, and an empty balance can never block the job;
+- revoking the flag restores ordinary billing from the next job onwards;
+  already-processed media is never retro-charged;
+- administrators are **not** special automatically: the panel can list them as
+  special users explicitly, and the flag can be removed at any time.
+
+### 🧾 Selling-plan panel
+
+**🧾 طرح‌های فروش** manages the purchasable catalogue from inside the bot:
+
+- **➕ طرح جدید** takes `code | name | hours | price | validity_days` (use `0`
+  for a plan without expiry) and the plan is instantly offered to buyers;
+- **✏️ ویرایش** takes `price | hours | validity_days | name` where `-` leaves a
+  field unchanged and `0` removes the expiry;
+- **⛔️ غیرفعال کن / ✅ فعال کن** hides a plan from buyers without deleting its
+  history, and **🗑 حذف** removes an administrator-created plan that no payment
+  or entitlement refers to;
+- codes are validated (`[a-z][a-z0-9_]{1,39}`), prices must be positive integers
+  in Toman, hours are capped at 1000 and validity at 3650 days;
+- every change is audited (`plan_created`, `plan_updated`, `plan_enabled`,
+  `plan_disabled`, `plan_deleted`).
+
+Administrator-created or administrator-edited plans are marked `is_custom` in
+SQLite: the canonical catalogue sync that runs on every start neither
+overwrites such a row nor touches the `enabled` flag of an existing row, so an
+operator decision survives restarts. The free plan cannot be disabled, edited
+or deleted (new registrations depend on it), and default plans can only be
+disabled, not deleted.
 
 ## Provider credentials and rate limits
 

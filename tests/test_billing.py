@@ -62,24 +62,97 @@ class BillingDatabaseTests(unittest.IsolatedAsyncioTestCase):
         records = {row.code: row for row in plan_catalog()}
         # Canonical plan codes are part of the contract (see the migration that
         # renames the legacy code), so they are asserted literally here.
-        self.assertEqual(set(records), {FREE_PLAN_CODE, "paid_25h_30d", "paid_50h_30d"})
+        self.assertEqual(
+            set(records),
+            {
+                FREE_PLAN_CODE,
+                "paid_5h_30d",
+                "paid_10h_30d",
+                "paid_20h_30d",
+                "paid_25h_30d",
+                "paid_50h_30d",
+            },
+        )
         self.assertEqual(FREE_PLAN_CODE, "free_1h")
         self.assertEqual(LEGACY_FREE_PLAN_CODE, "free_lifetime_1h")
         self.assertEqual(records["free_1h"].included_seconds, 3_600)
         self.assertEqual(records["free_1h"].price_toman, 0)
         self.assertIsNone(records["free_1h"].validity_days)
         self.assertTrue(records["free_1h"].is_free)
+        # Short plans: 5h/50,000, 10h/75,000 and 20h/130,000 Toman.
+        self.assertEqual(records["paid_5h_30d"].included_seconds, 18_000)
+        self.assertEqual(records["paid_5h_30d"].price_toman, 50_000)
+        self.assertEqual(records["paid_5h_30d"].validity_days, 30)
+        self.assertEqual(records["paid_10h_30d"].included_seconds, 36_000)
+        self.assertEqual(records["paid_10h_30d"].price_toman, 75_000)
+        self.assertEqual(records["paid_10h_30d"].validity_days, 30)
+        self.assertEqual(records["paid_20h_30d"].included_seconds, 72_000)
+        self.assertEqual(records["paid_20h_30d"].price_toman, 130_000)
+        self.assertEqual(records["paid_20h_30d"].validity_days, 30)
         self.assertEqual(records["paid_25h_30d"].included_seconds, 90_000)
         self.assertEqual(records["paid_25h_30d"].price_toman, 150_000)
         self.assertEqual(records["paid_25h_30d"].validity_days, 30)
         self.assertEqual(records["paid_50h_30d"].included_seconds, 180_000)
         self.assertEqual(records["paid_50h_30d"].price_toman, 250_000)
         self.assertEqual(records["paid_50h_30d"].validity_days, 30)
+        # The plans are offered cheapest first, and the free grant stays first.
+        self.assertEqual(
+            [records[code].sort_order for code in (
+                "free_1h", "paid_5h_30d", "paid_10h_30d", "paid_20h_30d",
+                "paid_25h_30d", "paid_50h_30d",
+            )],
+            [0, 1, 2, 3, 4, 5],
+        )
         # The stored catalogue agrees with the Python one after sync.
         stored = {row["code"]: row for row in await self.db.list_plans()}
         self.assertEqual(stored["free_1h"]["included_seconds"], 3_600)
+        self.assertEqual(stored["paid_5h_30d"]["price_toman"], 50_000)
+        self.assertEqual(stored["paid_10h_30d"]["included_seconds"], 36_000)
+        self.assertEqual(stored["paid_20h_30d"]["price_toman"], 130_000)
         self.assertEqual(stored["paid_25h_30d"]["price_toman"], 150_000)
         self.assertEqual(stored["paid_50h_30d"]["price_toman"], 250_000)
+        # The purchasable screen shows every paid plan, cheapest first.
+        purchasable = await self.db.list_plans(paid_only=True)
+        self.assertEqual(
+            [row["code"] for row in purchasable],
+            ["paid_5h_30d", "paid_10h_30d", "paid_20h_30d", "paid_25h_30d", "paid_50h_30d"],
+        )
+
+    def test_billing_catalogue_constants_match_the_specs_and_the_config(self):
+        """The seconds constants, the specs and ``config`` can never drift."""
+        from gamas_bot import config
+        from gamas_bot.billing import (
+            PLAN_5_SECONDS,
+            PLAN_10_SECONDS,
+            PLAN_20_SECONDS,
+            PAID_PLAN_SPECS,
+            SECONDS_PER_HOUR,
+        )
+
+        self.assertEqual(
+            [PLAN_5_SECONDS, PLAN_10_SECONDS, PLAN_20_SECONDS, PLAN_25_SECONDS, PLAN_50_SECONDS],
+            [spec.seconds for spec in PAID_PLAN_SPECS],
+        )
+        for spec in PAID_PLAN_SPECS:
+            self.assertEqual(spec.seconds, spec.hours * SECONDS_PER_HOUR)
+            self.assertEqual(
+                getattr(config, f"CANONICAL_{spec.env_prefix}_HOURS"), spec.hours
+            )
+            self.assertEqual(
+                getattr(config, f"CANONICAL_{spec.env_prefix}_PRICE_TOMAN"), spec.price_toman
+            )
+            self.assertEqual(
+                getattr(config, f"CANONICAL_{spec.env_prefix}_VALIDITY_DAYS"),
+                spec.validity_days,
+            )
+        # Every spec is configured in exactly three environment fields.
+        for spec in PAID_PLAN_SPECS:
+            for suffix in spec.value_suffixes:
+                self.assertIn(
+                    (f"{spec.env_prefix}_{suffix.upper()}", f"{spec.key}_{suffix}"),
+                    [(env, name) for env, name, _default in config.PLAN_ENV_FIELDS],
+                )
+        self.assertEqual(config.CANONICAL_FREE_PLAN_HOURS, 1)
 
     async def test_legacy_free_plan_code_is_renamed_and_never_granted_twice(self):
         """A database seeded by migration 003 keeps one entitlement after 004."""
@@ -192,6 +265,15 @@ class BillingDatabaseTests(unittest.IsolatedAsyncioTestCase):
             settings.plan_values,
             {
                 "free_plan_hours": 1,
+                "plan_5_hours": 5,
+                "plan_5_price_toman": 50_000,
+                "plan_5_validity_days": 30,
+                "plan_10_hours": 10,
+                "plan_10_price_toman": 75_000,
+                "plan_10_validity_days": 30,
+                "plan_20_hours": 20,
+                "plan_20_price_toman": 130_000,
+                "plan_20_validity_days": 30,
                 "plan_25_hours": 25,
                 "plan_25_price_toman": 150_000,
                 "plan_25_validity_days": 30,
@@ -199,6 +281,12 @@ class BillingDatabaseTests(unittest.IsolatedAsyncioTestCase):
                 "plan_50_price_toman": 250_000,
                 "plan_50_validity_days": 30,
             },
+        )
+        # The resolved mapping feeds the catalogue directly, so the UI promise
+        # and the database rows always describe the same five plans.
+        self.assertEqual(
+            {plan.code for plan in plan_catalog(settings.plan_values)},
+            {plan.code for plan in plan_catalog()},
         )
 
     def test_no_handler_hard_codes_the_card_number_or_the_prices(self):
@@ -208,7 +296,9 @@ class BillingDatabaseTests(unittest.IsolatedAsyncioTestCase):
         source = pathlib.Path(bot_module.__file__).read_text(encoding="utf-8")
         self.assertNotIn("5022291332906625", source.replace("_", ""))
         self.assertNotIn("5022 2913 3290 6625", source)
-        for literal in ("150000", "250000", "90000", "180000"):
+        for literal in (
+            "50000", "75000", "130000", "150000", "250000", "90000", "180000",
+        ):
             self.assertNotIn(literal, source)
 
     async def test_plan_values_override_seeds_the_database_and_the_ui(self):

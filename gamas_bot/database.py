@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -12,10 +13,25 @@ from typing import Any
 
 import aiosqlite
 
-from .billing import FREE_PLAN_CODE, LEGACY_FREE_PLAN_CODE
+from .billing import (
+    FREE_PLAN_CODE,
+    LEGACY_FREE_PLAN_CODE,
+    MAX_PLAN_HOURS,
+    MAX_PLAN_PRICE_TOMAN,
+    MAX_PLAN_VALIDITY_DAYS,
+    PLAN_CODE_PATTERN,
+    SECONDS_PER_HOUR,
+)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 logger = logging.getLogger(__name__)
+
+#: Reason recorded on every reservation/ledger row a special user produces; the
+#: billing engine never touches an entitlement for these accounts.
+UNLIMITED_USAGE_REASON = "Unlimited special user"
+#: Audit reason used when an administrator removes the special flag from a user.
+UNLIMITED_REVOKED_REASON = "Special-user access removed"
+_PLAN_CODE_RE = re.compile(PLAN_CODE_PATTERN)
 
 
 def utc_now() -> str:
@@ -350,6 +366,95 @@ class Database:
                 )
             return changed
 
+    @staticmethod
+    async def _user_is_unlimited_in_transaction(
+        db: aiosqlite.Connection, user_id: int
+    ) -> bool:
+        cursor = await db.execute(
+            "SELECT is_unlimited FROM users WHERE id=?", (int(user_id),)
+        )
+        row = await cursor.fetchone()
+        return bool(row and int(row["is_unlimited"]))
+
+    async def is_unlimited_user(self, user_id: int) -> bool:
+        """True when the account is a special user that is never billed."""
+        async with self._lock:
+            return await self._user_is_unlimited_in_transaction(self._db(), int(user_id))
+
+    async def set_user_unlimited(
+        self,
+        telegram_id: int,
+        unlimited: bool,
+        admin_id: int,
+        reason: str,
+    ) -> dict[str, Any] | None:
+        """Grant or revoke the unlimited flag; every change is audited.
+
+        Returns ``None`` when the user does not exist, otherwise the new state
+        with ``changed=False`` when it already matched the request.
+        """
+        reason = clean_human_text(reason) or ""
+        if not reason:
+            raise ValueError("برای تغییر وضعیت کاربر ویژه، ثبت دلیل الزامی است.")
+        now = utc_now()
+        flag = int(bool(unlimited))
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT id, is_unlimited FROM users WHERE telegram_id=?",
+                (int(telegram_id),),
+            )
+            user = await cursor.fetchone()
+            if not user:
+                return None
+            if int(user["is_unlimited"]) == flag:
+                return {
+                    "telegram_id": int(telegram_id),
+                    "is_unlimited": bool(flag),
+                    "changed": False,
+                    "reason": reason,
+                }
+            await db.execute(
+                "UPDATE users SET is_unlimited=?, unlimited_reason=?, unlimited_granted_by=?, "
+                "unlimited_granted_at=? WHERE id=?",
+                (
+                    flag,
+                    reason if flag else None,
+                    int(admin_id) if flag else None,
+                    now if flag else None,
+                    int(user["id"]),
+                ),
+            )
+            await self._insert_audit(
+                db,
+                admin_id,
+                "special_user_granted" if flag else "special_user_revoked",
+                "user",
+                str(telegram_id),
+                {"reason": reason},
+            )
+            return {
+                "telegram_id": int(telegram_id),
+                "is_unlimited": bool(flag),
+                "changed": True,
+                "reason": reason,
+            }
+
+    async def unlimited_users(self, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Every special user, newest grant first, with their media usage count."""
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT u.telegram_id, u.username, u.is_banned, u.unlimited_reason, "
+                "u.unlimited_granted_at, "
+                "(SELECT COUNT(*) FROM audio_submissions s WHERE s.user_id=u.id) "
+                "AS submission_count, "
+                "(SELECT COUNT(*) FROM usage_reservations r WHERE r.user_id=u.id "
+                "AND r.reason=?) AS unbilled_jobs "
+                "FROM users u WHERE u.is_unlimited=1 "
+                "ORDER BY u.unlimited_granted_at DESC, u.id DESC LIMIT ?",
+                (UNLIMITED_USAGE_REASON, max(1, min(limit, 200))),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
     async def create_submission(
         self,
         user_id: int,
@@ -456,7 +561,7 @@ class Database:
         async with self._lock:
             cursor = await self._db().execute(
                 "SELECT u.telegram_id, u.username, u.first_seen, u.is_banned, "
-                "COUNT(s.id) AS submission_count FROM users u "
+                "u.is_unlimited, COUNT(s.id) AS submission_count FROM users u "
                 "LEFT JOIN audio_submissions s ON s.user_id=u.id "
                 "GROUP BY u.id ORDER BY u.first_seen DESC LIMIT ?",
                 (limit,),
@@ -476,6 +581,7 @@ class Database:
             cursor = await self._db().execute(
                 "SELECT (SELECT COUNT(*) FROM users) AS users, "
                 "(SELECT COUNT(*) FROM users WHERE is_banned=0) AS unbanned_users, "
+                "(SELECT COUNT(*) FROM users WHERE is_unlimited=1) AS unlimited_users, "
                 "(SELECT COUNT(*) FROM audio_submissions) AS submissions, "
                 "(SELECT COUNT(*) FROM audio_submissions WHERE status='done') AS done, "
                 "(SELECT COUNT(*) FROM audio_submissions WHERE status='failed') AS failed, "
@@ -508,7 +614,13 @@ class Database:
             )
 
     async def sync_plan_catalog(self, plans: list[dict[str, Any]] | tuple[dict[str, Any], ...]) -> None:
-        """Upsert the canonical catalogue; existing entitlements are immutable snapshots."""
+        """Upsert the canonical catalogue; existing entitlements are immutable snapshots.
+
+        Rows an administrator created or edited from the plan panel are marked
+        ``is_custom`` and are never overwritten, and the ``enabled`` flag of an
+        existing row is always preserved: disabling a plan (or taking ownership
+        of its price) is an operator decision that must survive a restart.
+        """
         now = utc_now()
         async with self._transaction(immediate=True) as db:
             for plan in plans:
@@ -524,7 +636,8 @@ class Database:
                     "ON CONFLICT(code) DO UPDATE SET name=excluded.name, "
                     "included_seconds=excluded.included_seconds, price_toman=excluded.price_toman, "
                     "validity_days=excluded.validity_days, is_free=excluded.is_free, "
-                    "sort_order=excluded.sort_order, enabled=1, updated_at=excluded.updated_at",
+                    "sort_order=excluded.sort_order, updated_at=excluded.updated_at "
+                    "WHERE plans.is_custom = 0",
                     (
                         str(plan["code"]), str(plan["name"]), seconds, price,
                         int(validity) if validity is not None else None,
@@ -533,14 +646,212 @@ class Database:
                     ),
                 )
 
-    async def list_plans(self, *, paid_only: bool = False) -> list[dict[str, Any]]:
-        query = "SELECT * FROM plans WHERE enabled=1"
+    async def list_plans(
+        self, *, paid_only: bool = False, include_disabled: bool = False
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM plans WHERE 1=1"
+        if not include_disabled:
+            query += " AND enabled=1"
         if paid_only:
             query += " AND is_free=0"
         query += " ORDER BY sort_order, id"
         async with self._lock:
             cursor = await self._db().execute(query)
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_plan(self, plan_id: int) -> dict[str, Any] | None:
+        async with self._lock:
+            cursor = await self._db().execute("SELECT * FROM plans WHERE id=?", (plan_id,))
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    @staticmethod
+    def _validate_plan_values(
+        *, name: str | None, included_seconds: int, price_toman: int, validity_days: int | None
+    ) -> tuple[str | None, int, int, int | None]:
+        """Validate one plan tariff; raises ``ValueError`` with Persian copy."""
+        cleaned_name = clean_human_text(name, limit=60) if name is not None else None
+        if name is not None and not cleaned_name:
+            raise ValueError("نام طرح نمی‌تواند خالی باشد.")
+        seconds = int(included_seconds)
+        price = int(price_toman)
+        validity = None if validity_days is None else int(validity_days)
+        if seconds <= 0 or seconds % SECONDS_PER_HOUR:
+            raise ValueError("مدت طرح باید تعداد صحیحی از ساعت باشد.")
+        if not 1 <= seconds // SECONDS_PER_HOUR <= MAX_PLAN_HOURS:
+            raise ValueError(f"مدت طرح باید بین ۱ و {MAX_PLAN_HOURS} ساعت باشد.")
+        if not 1 <= price <= MAX_PLAN_PRICE_TOMAN:
+            raise ValueError(f"قیمت طرح باید بین ۱ و {MAX_PLAN_PRICE_TOMAN} تومان باشد.")
+        if validity is not None and not 1 <= validity <= MAX_PLAN_VALIDITY_DAYS:
+            raise ValueError(
+                f"اعتبار طرح باید بین ۱ و {MAX_PLAN_VALIDITY_DAYS} روز باشد (۰ برای بدون انقضا)."
+            )
+        return cleaned_name, seconds, price, validity
+
+    async def create_plan(
+        self,
+        *,
+        code: str,
+        name: str,
+        hours: int,
+        price_toman: int,
+        validity_days: int | None,
+        admin_id: int,
+    ) -> dict[str, Any]:
+        """Create an administrator-owned plan; it is never sold twice for a code."""
+        cleaned_code = clean_human_text(code, limit=40) or ""
+        cleaned_code = cleaned_code.strip().lower()
+        if not _PLAN_CODE_RE.fullmatch(cleaned_code):
+            raise ValueError(
+                "کد طرح باید با حرف لاتین شروع شود و فقط شامل حروف کوچک، رقم و _ باشد."
+            )
+        cleaned_name, seconds, price, validity = self._validate_plan_values(
+            name=name,
+            included_seconds=int(hours) * SECONDS_PER_HOUR,
+            price_toman=price_toman,
+            validity_days=validity_days,
+        )
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute("SELECT id FROM plans WHERE code=?", (cleaned_code,))
+            if await cursor.fetchone():
+                raise ValueError("طرحی با این کد از قبل وجود دارد؛ کد دیگری انتخاب کنید.")
+            cursor = await db.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM plans")
+            sort_order = int((await cursor.fetchone())[0])
+            cursor = await db.execute(
+                "INSERT INTO plans(code, name, included_seconds, price_toman, validity_days, "
+                "is_free, sort_order, enabled, is_custom, created_by_admin_id, "
+                "updated_by_admin_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, 0, ?, 1, 1, ?, ?, ?, ?)",
+                (cleaned_code, cleaned_name, seconds, price, validity, sort_order,
+                 admin_id, admin_id, now, now),
+            )
+            plan_id = int(cursor.lastrowid)
+            await self._insert_audit(
+                db, admin_id, "plan_created", "plan", str(plan_id),
+                {
+                    "code": cleaned_code,
+                    "included_seconds": seconds,
+                    "price_toman": price,
+                    "validity_days": validity,
+                },
+            )
+            return {
+                "id": plan_id,
+                "code": cleaned_code,
+                "name": cleaned_name,
+                "included_seconds": seconds,
+                "price_toman": price,
+                "validity_days": validity,
+                "sort_order": sort_order,
+                "is_custom": 1,
+                "enabled": 1,
+            }
+
+    async def update_plan(
+        self, plan_id: int, changes: dict[str, Any], admin_id: int
+    ) -> dict[str, Any] | None:
+        """Apply an administrator edit; the row becomes administrator-owned."""
+        unknown = set(changes) - {"name", "hours", "price_toman", "validity_days"}
+        if unknown or not changes:
+            raise ValueError("فیلدهای ویرایش طرح معتبر نیستند.")
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute("SELECT * FROM plans WHERE id=?", (int(plan_id),))
+            row = await cursor.fetchone()
+            if not row:
+                return None
+            if int(row["is_free"]):
+                raise ValueError("طرح رایگان از این پنل قابل ویرایش نیست.")
+            hours = (
+                int(changes["hours"])
+                if "hours" in changes
+                else int(row["included_seconds"]) // SECONDS_PER_HOUR
+            )
+            validity = (
+                changes["validity_days"] if "validity_days" in changes else row["validity_days"]
+            )
+            name = changes["name"] if "name" in changes else str(row["name"])
+            price = int(changes["price_toman"]) if "price_toman" in changes else int(row["price_toman"])
+            cleaned_name, seconds, price, validity = self._validate_plan_values(
+                name=name,
+                included_seconds=hours * SECONDS_PER_HOUR,
+                price_toman=price,
+                validity_days=None if validity is None else int(validity),
+            )
+            await db.execute(
+                "UPDATE plans SET name=?, included_seconds=?, price_toman=?, validity_days=?, "
+                "is_custom=1, updated_by_admin_id=?, updated_at=? WHERE id=?",
+                (cleaned_name, seconds, price, validity, admin_id, now, int(plan_id)),
+            )
+            await self._insert_audit(
+                db, admin_id, "plan_updated", "plan", str(plan_id),
+                {
+                    "code": str(row["code"]),
+                    "included_seconds": seconds,
+                    "price_toman": price,
+                    "validity_days": validity,
+                },
+            )
+            cursor = await db.execute("SELECT * FROM plans WHERE id=?", (int(plan_id),))
+            return dict(await cursor.fetchone())
+
+    async def set_plan_enabled(self, plan_id: int, enabled: bool, admin_id: int) -> bool:
+        """Enable/disable a plan. The free plan must stay available for signup."""
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT code, is_free, enabled FROM plans WHERE id=?", (int(plan_id),)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            if int(row["is_free"]) and not enabled:
+                raise ValueError(
+                    "طرح رایگان را نمی‌توان غیرفعال کرد؛ ثبت‌نام کاربران جدید به آن وابسته است."
+                )
+            if int(row["enabled"]) == int(bool(enabled)):
+                return False
+            await db.execute(
+                "UPDATE plans SET enabled=?, is_custom=1, updated_by_admin_id=?, updated_at=? "
+                "WHERE id=?",
+                (int(bool(enabled)), admin_id, now, int(plan_id)),
+            )
+            await self._insert_audit(
+                db, admin_id, "plan_enabled" if enabled else "plan_disabled", "plan",
+                str(plan_id), {"code": str(row["code"])},
+            )
+            return True
+
+    async def delete_plan(self, plan_id: int, admin_id: int) -> bool:
+        """Delete an administrator-created plan that no accounting row refers to."""
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT code, is_free, is_custom FROM plans WHERE id=?", (int(plan_id),)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            if int(row["is_free"]):
+                raise ValueError("طرح رایگان قابل حذف نیست.")
+            if not int(row["is_custom"]):
+                raise ValueError(
+                    "طرح‌های پیش‌فرض قابل حذف نیستند؛ برای حذف آن‌ها را غیرفعال کنید "
+                    "(با راه‌اندازی مجدد برمی‌گردند)."
+                )
+            for table in ("entitlements", "payment_requests"):
+                cursor = await db.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE plan_id=?", (int(plan_id),)
+                )
+                if int((await cursor.fetchone())[0]):
+                    raise ValueError(
+                        "این طرح سابقهٔ خرید یا اعتبار دارد و حذف نمی‌شود؛ آن را غیرفعال کنید."
+                    )
+            await db.execute("DELETE FROM plans WHERE id=?", (int(plan_id),))
+            await self._insert_audit(
+                db, admin_id, "plan_deleted", "plan", str(plan_id), {"code": str(row["code"])}
+            )
+            return True
 
     async def _expire_entitlements_in_transaction(
         self, db: aiosqlite.Connection, user_id: int, now: str
@@ -874,8 +1185,68 @@ class Database:
             )
             return {"telegram_id": telegram_id, "seconds": seconds, "entitlement_id": entitlement_id}
 
+    async def _reserve_unlimited_in_transaction(
+        self,
+        db: aiosqlite.Connection,
+        user_id: int,
+        submission_id: int,
+        seconds: int,
+        now: str,
+    ) -> dict[str, Any]:
+        """Record a special user's media without touching any entitlement.
+
+        The row is written as already consumed because nothing is billed and
+        therefore nothing can be refunded. It is idempotent by ``submission_id``
+        exactly like the billed path, and it always answers ``ok`` so a special
+        user can never be blocked by the balance check.
+        """
+        cursor = await db.execute(
+            "SELECT id, required_seconds, reserved_seconds, status FROM usage_reservations "
+            "WHERE submission_id=?",
+            (submission_id,),
+        )
+        existing = await cursor.fetchone()
+        if existing:
+            return {
+                "ok": True,
+                "unlimited": True,
+                "reservation_id": int(existing["id"]),
+                "required_seconds": int(existing["required_seconds"]),
+                "reserved_seconds": int(existing["reserved_seconds"]),
+                "existing": True,
+            }
+        cursor = await db.execute(
+            "INSERT INTO usage_reservations "
+            "(submission_id, user_id, required_seconds, reserved_seconds, consumed_seconds, "
+            "status, reason, created_at, finalized_at) "
+            "VALUES (?, ?, ?, 0, ?, 'consumed', ?, ?, ?)",
+            (submission_id, user_id, seconds, seconds, UNLIMITED_USAGE_REASON, now, now),
+        )
+        reservation_id = int(cursor.lastrowid)
+        await db.execute(
+            "INSERT INTO usage_ledger "
+            "(reservation_id, submission_id, user_id, event_type, requested_seconds, "
+            "consumed_seconds, reason, created_at) "
+            "VALUES (?, ?, ?, 'consume', ?, ?, ?, ?)",
+            (reservation_id, submission_id, user_id, seconds, seconds,
+             UNLIMITED_USAGE_REASON, now),
+        )
+        return {
+            "ok": True,
+            "unlimited": True,
+            "reservation_id": reservation_id,
+            "required_seconds": seconds,
+            "reserved_seconds": 0,
+            "existing": False,
+        }
+
     async def reserve_usage(self, user_id: int, submission_id: int, seconds: int) -> dict[str, Any]:
-        """Reserve earliest-expiring credits under a SQLite IMMEDIATE transaction."""
+        """Reserve earliest-expiring credits under a SQLite IMMEDIATE transaction.
+
+        A special (unlimited) user is never billed: their media is recorded in
+        the same tables for the audit trail, but no entitlement is touched and
+        the answer always carries ``unlimited=True``.
+        """
         seconds = int(seconds)
         if seconds <= 0:
             raise ValueError("Reserved seconds must be positive")
@@ -887,6 +1258,10 @@ class Database:
             submission = await cursor.fetchone()
             if not submission or int(submission["user_id"]) != user_id:
                 raise ValueError("Submission does not belong to this user")
+            if await self._user_is_unlimited_in_transaction(db, user_id):
+                return await self._reserve_unlimited_in_transaction(
+                    db, user_id, submission_id, seconds, now
+                )
             cursor = await db.execute(
                 "SELECT id, required_seconds, reserved_seconds, status FROM usage_reservations "
                 "WHERE submission_id=?",
@@ -1079,8 +1454,8 @@ class Database:
         now = utc_now()
         async with self._transaction(immediate=True) as db:
             cursor = await db.execute(
-                "SELECT id, telegram_id, username, is_banned, first_seen FROM users "
-                "WHERE telegram_id=?",
+                "SELECT id, telegram_id, username, is_banned, first_seen, is_unlimited, "
+                "unlimited_reason, unlimited_granted_at FROM users WHERE telegram_id=?",
                 (telegram_id,),
             )
             user = await cursor.fetchone()
@@ -1126,6 +1501,9 @@ class Database:
                 "telegram_id": int(user["telegram_id"]),
                 "username": user["username"],
                 "is_banned": bool(user["is_banned"]),
+                "is_unlimited": bool(user["is_unlimited"]),
+                "unlimited_reason": user["unlimited_reason"],
+                "unlimited_granted_at": user["unlimited_granted_at"],
                 "first_seen": user["first_seen"],
                 "available_seconds": free_seconds + paid_seconds,
                 "free_seconds": free_seconds,
