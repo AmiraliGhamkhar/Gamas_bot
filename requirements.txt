@@ -13,6 +13,12 @@ python-socks[asyncio]>=2.4,<3.0
 # screenshots. python-pptx also pulls it in, so declaring it makes the
 # requirement explicit rather than incidental.
 Pillow>=10.0,<13.0
+# The offline page renderer (scripts/render_docx_pages.py, also used by
+# `python -m scripts.validate_docx --render`) pre-shapes Persian with
+# arabic-reshaper and reorders mixed lines with python-bidi before painting;
+# without them Persian pages render as disconnected letters.
+arabic-reshaper>=3.0,<4.0
+python-bidi>=0.6,<0.7
 # Fernet-encrypted provider credentials and actual rendered-PDF TOC pagination.
 cryptography>=44.0,<47.0
 pypdf>=5.0,<7.0

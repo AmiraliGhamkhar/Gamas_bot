@@ -283,6 +283,37 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reservation["released_seconds"], 3)
         self.assertEqual((await self.bot.db.user_balance(int(user["id"])))["available_seconds"], 3_600)
 
+    async def test_insufficient_balance_rejects_the_job_before_stt(self):
+        """No STT/LLM call and no charge when the balance cannot cover the media."""
+        source = self.root / "no-credit.wav"
+        source.write_bytes(wav_bytes(2.2))
+        user = await self.bot.db.upsert_user(105, "student")
+        # Drain the lifetime free hour on a different submission first.
+        drain = await self.bot.db.create_submission(
+            int(user["id"]), "drain", 3_600, "drain.wav", "audio/wav"
+        )
+        self.assertTrue((await self.bot.db.reserve_usage(int(user["id"]), drain, 3_600))["ok"])
+        submission_id = await self.bot.db.create_submission(
+            int(user["id"]), "no-credit", 2.2, source.name, "audio/wav", source_type="audio"
+        )
+        event = FakeEvent(source)
+        with patch("gamas_bot.bot.transcribe", new=AsyncMock()) as stt, patch(
+            "gamas_bot.bot.structure_transcript", new=AsyncMock()
+        ) as structure:
+            await self.bot._process_submission(event, submission_id, source.name, "audio")
+        stt.assert_not_awaited()
+        structure.assert_not_awaited()
+        reservation = await self.bot.db.usage_reservation(submission_id)
+        self.assertEqual(reservation["status"], "insufficient")
+        self.assertEqual(reservation["reserved_seconds"], 0)
+        replies = "\n".join(event.replies)
+        self.assertIn("اعتبار زمانی شما کافی نیست", replies)
+        self.assertIn("کد پیگیری", replies)
+        # The rejected job charged nothing and the drained hour is untouched.
+        self.assertEqual(
+            (await self.bot.db.user_balance(int(user["id"])))["available_seconds"], 0
+        )
+
     async def test_video_upload_is_converted_before_transcription(self):
         event, stt, submission_id = await self._run(
             "lecture.mp4", "video", video_bytes(duration=2.0, with_audio=True)
