@@ -54,7 +54,7 @@ by eye.
 ## 4. Static table of contents with no F9 — **verified as structure; page numbers NOT validated as rendered**
 
 Page 1 is the cover, page 2 is the topic list, page 3+ are the notes. Verified by
-`tests/test_docx_layout_requirements.py` (10 tests): the heading paragraph, the
+`tests/test_docx_layout_requirements.py` (9 tests): the heading paragraph, the
 borderless RTL two-column table, unique internal bookmarks shared with the body
 headings, one `w:hyperlink w:anchor` per row, Persian-digit page numbers, no
 `w:instrText`, no `TOC \o` field and no `updateFields` anywhere; the footer keeps
