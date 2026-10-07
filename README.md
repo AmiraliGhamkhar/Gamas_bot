@@ -983,11 +983,26 @@ handling remains available in chats where the bot receives messages.
 
 The canonical catalog is seeded into SQLite from `gamas_bot/billing.py`:
 
-| Entitlement | Included time | Price | Validity |
-|---|---:|---:|---:|
-| Free, once per user | 3,600 seconds (1 hour) | Free | Lifetime; `/start` never renews it |
-| 25-hour plan | 90,000 seconds | 150,000 Toman | 30 days from approval |
-| 50-hour plan | 180,000 seconds | 250,000 Toman | 30 days from approval |
+| Plan code | Entitlement | Included time | Price | Validity |
+|---|---|---:|---:|---:|
+| `free_1h` | Free, once per user | 3,600 seconds (1 hour) | Free | Lifetime; `/start` never renews it |
+| `paid_25h_30d` | 25-hour plan | 90,000 seconds | 150,000 Toman | 30 days from approval |
+| `paid_50h_30d` | 50-hour plan | 180,000 seconds | 250,000 Toman | 30 days from approval |
+
+The tariff is configurable, but with the canonical defaults above when nothing is
+set. All seven values live in one place (`.env` → `Settings.plan_values` →
+`billing.plan_catalog()` → the SQLite `plans` rows), so no handler carries a
+price or a duration of its own:
+
+```dotenv
+FREE_PLAN_HOURS=1
+PLAN_25_HOURS=25
+PLAN_25_PRICE_TOMAN=150000
+PLAN_25_VALIDITY_DAYS=30
+PLAN_50_HOURS=50
+PLAN_50_PRICE_TOMAN=250000
+PLAN_50_VALIDITY_DAYS=30
+```
 
 Active paid entitlements are cumulative. Usage consumes the entitlement expiring
 soonest first; all accounting and the audit ledger use integer seconds. Before
@@ -997,28 +1012,61 @@ failure or another processing failure releases the reservation. Reservations are
 concurrency-safe, so competing jobs cannot spend the same seconds or overspend.
 The displayed balance is available time, not the uncommitted reservation.
 
-Users can use the private **خرید اعتبار** and **موجودی** menu buttons, or:
+Users can use the private **💳 خرید اشتراک** and **⏱ اعتبار من** menu buttons, or:
 
-- `/balance` — available seconds and each entitlement's expiry
+- `/balance` — total usable credit split into free/paid, plus each active
+  entitlement's expiry
 - `/buy` — choose a paid plan
 - `/history` — payment request history
 - `/cancelpayment` — cancel an intent that is still waiting for a receipt
 
-Payment is manual card-to-card. The bot displays the canonical Pasargad card
-details from `.env`, accepts a JPEG/PNG/WebP receipt in the private chat, and
-sends the private receipt to configured administrators. **Uploading a receipt
-does not grant credit.** A human administrator verifies the transfer and
-explicitly approves or rejects it. Approval is transactional and idempotent;
-rejection grants nothing and records the reason. No bank/card verification is
-automated. Receipt images are kept outside the web root in `RECEIPT_DIR` with
-owner-only permissions, kept while awaiting human review, and removed after
-`RECEIPT_RETENTION_DAYS` (90 days by default) measured from approval/rejection;
-do not expose this directory or put it under `public_html`.
+The balance screen shows free remaining, paid remaining, the total usable
+credit and the expiry date of every active entitlement. When a job is rejected
+for insufficient credit, the bot states the available duration and the required
+duration side by side, and offers the purchase button.
 
-Administrators can review receipts from **پرداخت‌های در انتظار** or `/payments`.
-`/credit TELEGRAM_USER_ID SECONDS REASON` adds an auditable manual adjustment;
-`/audit` includes payment/admin actions and the usage ledger. These actions are
-restricted to configured administrator IDs and private chats.
+Payment is manual card-to-card. The bot displays the canonical Pasargad card
+details (16 digits normalised once at configuration time and grouped by a single
+formatter in `gamas_bot/config.py`), accepts a JPEG/PNG/WebP receipt in the
+private chat, and sends the private receipt to configured administrators.
+
+**Uploading a receipt does not grant credit.** A human administrator verifies
+the transfer and explicitly approves or rejects it. **No bank/card verification
+is automated — approval is a manual administrative decision by design.**
+Approval runs as one SQLite transaction (verify pending → mark approved → create
+exactly one entitlement → link the payment → record admin and review time), so a
+double click or two simultaneous approvals can only grant once. Rejection grants
+nothing, stores the optional reason, notifies the user and lets the user submit a
+new request.
+
+Receipt handling is deliberately narrow:
+
+- only an image (photo, `image/*` document, or a `.jpg/.jpeg/.png/.webp`
+  document) is treated as a receipt; a lecture audio/video/PowerPoint upload is
+  never diverted from the normal pipeline by an open payment;
+- receipts are kept outside the web root in `RECEIPT_DIR` with owner-only
+  permissions (`700`/`600`), stored under a server-generated random name — the
+  user's filename is never used as a storage path — and checked for size,
+  MIME type, extension and magic bytes;
+- they stay while awaiting human review, and are removed after
+  `RECEIPT_RETENTION_DAYS` (90 days by default) measured from **review**, not
+  from submission; the Telegram `file_id` is retained as a fallback reference.
+  Do not expose `RECEIPT_DIR` or place it under `public_html`.
+
+Administrators manage payments from **💳 پرداخت‌ها** or `/payments`:
+pending/approved/rejected lists, the pending detail (payment id, user id,
+username, plan, amount, submission time and the private receipt image) and the
+**✅ تایید** / **❌ رد** buttons.
+
+**⏱ اعتبار کاربران** (or `/credit TELEGRAM_USER_ID`) opens a read-only credit
+screen for one user: total/free/paid balance, active entitlements with expiry,
+submission counters and the recent usage ledger. A manual adjustment
+(**➕ افزودن اعتبار دستی** or `/credit TELEGRAM_USER_ID SECONDS REASON`) always
+requires an explicit integer seconds amount *and* a reason, records the
+administrator id and writes an audit entry; the same action is refused for
+another administrator's account. `/audit` shows payment actions and the usage
+ledger. All of these are restricted to configured administrator IDs and private
+chats.
 
 ## Provider credentials and rate limits
 
@@ -1033,16 +1081,44 @@ logs):
 
 Keep the master key stable and back it up separately with restricted access. If
 it is lost, stored encrypted API keys cannot be decrypted. In a private admin
-chat, **کلیدهای سرویس** can add, enable, disable or delete credentials; secrets
-are encrypted at rest and the panel shows only a mask/last four characters and
-last observed status. It does not send test requests or claim live provider
-health. When adding a key, the bot only stores it after it successfully deletes
-the private message containing the secret.
+chat, **🔑 API Keys** manages the pool per subsystem (STT → Speechmatics /
+Deepgram / OpenAI-compatible; notes → Gemini / Anthropic / OpenAI-compatible):
+add (label + key + optional base URL/model), enable, disable, delete, reorder
+(`▲`/`▼`, deterministic dense priorities) and **🧪 test** one key. Secrets are
+encrypted at rest; every panel shows only a mask/last four characters. When
+adding a key, the bot only stores it after it successfully deletes the private
+message containing the secret.
 
-On HTTP 429, managed credentials honor `Retry-After`, are cooled down, and
-rotate to another eligible key; HTTP 401/403 quarantines that key. Invalid
-request errors (400/415/422) do not cause key rotation. Transient retries are
-bounded, and secrets are masked in logs and panels.
+### Provider health (`🩺 وضعیت سرویس‌ها`)
+
+The health panel is manual and cached (5 minutes) — it is never run per Telegram
+event. Each check is a **free, read-only probe** (job list, project list, model
+list); no transcription job is submitted and no model content is generated. A
+provider whose deployment cannot be probed safely is reported as *configured*
+with an explicit note instead of a fabricated status.
+
+States: `healthy`, `degraded`, `rate_limited`, `authentication_failed`,
+`unavailable`, `disabled`, `not_configured`, `configured`. The panel shows the
+provider, credential label, status, HTTP status, latency, check time, a
+sanitized error and the remaining cooldown. **Only the masked tail of a key is
+ever displayed, and secrets never reach the panel, the audit log or the logs.**
+
+A probe feeds the same rotation state as live traffic: HTTP 429 cools the
+credential down (honouring `Retry-After`), HTTP 401/403 quarantines it, and a
+success clears both.
+
+### Credential rotation
+
+Redis-backed rotation is not used: the pool lives in SQLite and is selected
+deterministically — enabled, not quarantined, cooldown expired, ordered by
+priority then id (bounded to five candidates per call). On HTTP 429 the key is
+marked `rate_limited`, the cooldown is persisted, and the next healthy key is
+tried; the same rate-limited key is never retried in a loop. On HTTP 401/403 the
+key is quarantined and rotation continues. Invalid requests (400/415/422) never
+cause rotation — they are reported as-is. 5xx/network failures retry within the
+bounded budget and then rotate. All secrets stay masked in logs and panels, and
+the audit log records key add/enable/disable/delete/priority/test events with a
+label and masked tail only.
 
 ---
 
@@ -1102,6 +1178,25 @@ and after. Add `--human-out FILE` to emit a 1–5 reviewer rubric in JSON
 faithfulness) for cases where the automated metrics are not sufficient.
 
 It makes note quality measurable instead of only asserting "the tests pass".
+
+### Real-DOCX validation corpus
+
+Beyond the unit tests, real documents are generated and inspected. `tests/test_docx_layout_requirements.py`
+pins the page-layout contract (page 1 cover, page 2 topic list with measured page
+numbers, page 3+ notes, unique bookmarks, clickable links, no `TOC` field, no
+`updateFields`, no F9 text), and a sample corpus covers Persian-only,
+Persian+English medical terminology, numeric/unit-heavy text, URLs and e-mail
+addresses, and 4/10/22-topic documents. Render them and look at the pages:
+
+```bash
+python -m scripts.validate_docx --out build/ --render
+python -m scripts.render_docx_pages build/notes.docx --out pages/ --sheet sheet.png
+```
+
+Remember what the offline renderer is: a layout aid, not Word. It proves the
+*structure* of every page (cover composition, topic list content, body start,
+RTL blocks, tables, header/footer) — not real Word pagination, which still
+requires LibreOffice plus `pypdf` on the delivery host.
 
 ### Visual page inspection (offline)
 

@@ -19,7 +19,7 @@ from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.tl.types import MessageMediaWebPage
 
 from .config import Settings
-from .database import Database
+from .database import Database, clean_human_text
 from .billing import format_duration, format_toman, plan_catalog
 from .docx_export import (
     DocxPaginationError,
@@ -56,6 +56,7 @@ from .provider_credentials import (
     ProviderCredentialManager,
     use_provider_credentials,
 )
+from .provider_health import ProviderHealthChecker, cooldown_remaining_seconds
 from .stt import STTConfigurationError, transcribe
 from .structuring import (
     StructuredNotes,
@@ -102,7 +103,7 @@ class InsufficientBalanceError(ValueError):
             "اعتبار زمانی شما کافی نیست. "
             f"موجود: {format_duration(self.available_seconds)}؛ "
             f"موردنیاز: {format_duration(self.required_seconds)}. "
-            "از منوی «خرید اعتبار» یکی از طرح‌ها را انتخاب کنید."
+            "از منوی «💳 خرید اشتراک» یکی از طرح‌ها را انتخاب کنید."
         )
 
 
@@ -161,8 +162,8 @@ def main_menu(is_admin: bool = False):
         ],
         [Button.inline("🔐 حریم خصوصی", b"menu:privacy")],
         [
-            Button.inline("💳 خرید اعتبار", b"billing:plans"),
-            Button.inline("💰 موجودی", b"billing:balance"),
+            Button.inline("💳 خرید اشتراک", b"billing:plans"),
+            Button.inline("⏱ اعتبار من", b"billing:balance"),
         ],
     ]
     if is_admin:
@@ -183,8 +184,12 @@ def admin_menu():
             Button.inline("👥 کاربران", b"admin:users"),
         ],
         [
-            Button.inline("💳 پرداخت‌های در انتظار", b"admin:payments"),
-            Button.inline("🔐 کلیدهای سرویس", b"admin:credentials"),
+            Button.inline("💳 پرداخت‌ها", b"admin:payments"),
+            Button.inline("⏱ اعتبار کاربران", b"admin:credits"),
+        ],
+        [
+            Button.inline("🩺 وضعیت سرویس‌ها", b"admin:health"),
+            Button.inline("🔑 API Keys", b"admin:credentials"),
         ],
         [
             Button.inline("📜 گزارش مدیر", b"admin:audit"),
@@ -448,6 +453,29 @@ def markdown_to_telegram_html(text: str) -> str:
     return "\n".join(result).strip()
 
 
+#: Image types accepted as a card-to-card receipt.
+RECEIPT_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+
+
+def _is_receipt_image(message, mime_type: str | None = None) -> bool:
+    """Whether an attachment is a receipt image rather than a lecture file.
+
+    Only images can be receipts, so a lecture audio/video/PowerPoint upload is
+    never diverted from the normal pipeline just because a payment is open.
+    """
+    if getattr(message, "photo", None) is not None:
+        return True
+    document = getattr(message, "document", None)
+    if document is None:
+        return False
+    file_obj = getattr(message, "file", None)
+    mime = (mime_type or getattr(file_obj, "mime_type", None) or "").lower()
+    if mime.startswith("image/"):
+        return True
+    name = getattr(file_obj, "name", None) or ""
+    return Path(name).suffix.lower() in RECEIPT_IMAGE_EXTENSIONS
+
+
 def _media_metadata(message) -> tuple[str | None, str | None, str | None, float | None, str | None]:
     """Classify an incoming message as ('audio' | 'video' | None, name, mime, duration, id)."""
     file_obj = message.file
@@ -529,6 +557,11 @@ class StudyBot:
         self.settings = settings
         self.db = Database(settings.database_path)
         self.credential_manager = ProviderCredentialManager(self.db, settings)
+        # Health checks are manual and cached: opening the panel must never
+        # hammer a provider, and a redraw must never call the network again.
+        self.provider_health = ProviderHealthChecker(
+            self.db, settings, self.credential_manager
+        )
         self._receipt_cleanup_task: asyncio.Task | None = None
         self._receipt_root: Path | None = None
         self._pending_credential_setup: dict[int, dict[str, str | None]] = {}
@@ -845,13 +878,25 @@ class StudyBot:
 
     async def _billing_balance_text(self, user_id: int) -> str:
         balance = await self.db.user_balance(user_id)
+        entitlements = balance["entitlements"]
+        free_seconds = sum(
+            int(item["remaining_seconds"])
+            for item in entitlements
+            if item["source"] == "free_lifetime"
+        )
+        paid_seconds = sum(
+            int(item["remaining_seconds"])
+            for item in entitlements
+            if item["source"] != "free_lifetime"
+        )
         lines = [
-            "موجودی اعتبار ⏱️",
+            "⏱ اعتبار من",
             f"قابل استفاده: {format_duration(balance['available_seconds'])}",
+            f"رایگان: {format_duration(free_seconds)} | خریداری‌شده: {format_duration(paid_seconds)}",
         ]
-        if balance["entitlements"]:
+        if entitlements:
             lines.append("\nاعتبارهای فعال:")
-            for entitlement in balance["entitlements"]:
+            for entitlement in entitlements:
                 expiry = (
                     "بدون انقضا"
                     if not entitlement["expires_at"]
@@ -862,7 +907,9 @@ class StudyBot:
                     f"{format_duration(entitlement['remaining_seconds'])} ({expiry})"
                 )
         else:
-            lines.append("اعتبار فعالی ندارید؛ از دکمهٔ خرید اعتبار برای انتخاب طرح استفاده کنید.")
+            lines.append(
+                "اعتبار فعالی ندارید؛ با «💳 خرید اشتراک» یکی از طرح‌ها را انتخاب کنید."
+            )
         return "\n".join(lines)
 
     async def _billing_plans(self) -> tuple[str, list]:
@@ -900,9 +947,14 @@ class StudyBot:
             )
             await event.reply(text, buttons=main_menu())
             return
+        validity = request.get("validity_days")
+        validity_line = (
+            f"اعتبار طرح: {validity} روز از زمان تأیید\n" if validity else ""
+        )
         text = (
             f"طرح انتخاب‌شده: {request['plan_name']}\n"
             f"زمان: {format_duration(request['included_seconds'])}\n"
+            f"{validity_line}"
             f"مبلغ: {format_toman(request['amount_toman'])}\n\n"
             "مبلغ را کارت‌به‌کارت کنید و تصویر رسید را در همین گفت‌وگوی خصوصی بفرستید. "
             "ارسال رسید به‌تنهایی اعتبار ایجاد نمی‌کند؛ اعتبار فقط پس از تأیید دستی مدیر افزوده می‌شود.\n\n"
@@ -922,7 +974,7 @@ class StudyBot:
     def _safe_receipt_path(self, raw_path: str | None) -> Path | None:
         if not raw_path:
             return None
-        root = self._receipt_root or self.settings.receipt_dir.resolve()
+        root = getattr(self, "_receipt_root", None) or self.settings.receipt_dir.resolve()
         path = Path(raw_path).resolve()
         try:
             path.relative_to(root)
@@ -930,29 +982,37 @@ class StudyBot:
             return None
         return path
 
-    async def _handle_receipt_upload(self, event, user: dict, payment: dict) -> None:
-        if not getattr(event, "is_private", True):
-            await event.reply("برای امنیت، رسید را فقط در گفت‌وگوی خصوصی ربات بفرستید.")
-            return
+    async def _handle_receipt_upload(self, event, user: dict, payment: dict) -> bool:
+        """Treat an incoming image as a payment receipt.
+
+        Returns ``True`` when the message was a receipt attempt (handled here,
+        never queued as media) and ``False`` when it is an ordinary lecture file
+        that must continue through the normal media pipeline.
+        """
         message = event.message
         file_obj = getattr(message, "file", None)
         mime = (getattr(file_obj, "mime_type", None) or "").lower()
         is_photo = getattr(message, "photo", None) is not None
+        if is_photo and not mime:
+            mime = "image/jpeg"
+        if not _is_receipt_image(message, mime):
+            return False
+        if not getattr(event, "is_private", True):
+            await event.reply("برای امنیت، رسید را فقط در گفت‌وگوی خصوصی ربات بفرستید.")
+            return True
         extension_by_mime = {
             "image/jpeg": ".jpg",
             "image/png": ".png",
             "image/webp": ".webp",
         }
-        if is_photo and not mime:
-            mime = "image/jpeg"
         extension = extension_by_mime.get(mime)
         if extension is None:
             await event.reply("رسید باید تصویر JPEG، PNG یا WebP باشد.")
-            return
+            return True
         size = getattr(file_obj, "size", None)
         if size is not None and size > self.settings.max_receipt_size_bytes:
             await event.reply("حجم تصویر رسید از سقف مجاز بیشتر است.")
-            return
+            return True
 
         root = self._receipt_root or self._ensure_secure_receipt_directory()
         path = root / f"receipt-{secrets.token_hex(16)}{extension}"
@@ -978,6 +1038,7 @@ class StudyBot:
                 int(user["id"]),
                 str(path),
                 int(message.id),
+                receipt_file_id=getattr(file_obj, "id", None),
             )
             if not accepted:
                 raise ValueError("درخواست پرداخت دیگر منتظر رسید نیست؛ /balance را بررسی کنید.")
@@ -988,7 +1049,7 @@ class StudyBot:
             else:
                 logger.warning("Private receipt upload failed payment_id=%s", payment["id"])
                 await event.reply("ذخیرهٔ امن رسید انجام نشد؛ لطفاً بعداً دوباره تلاش کنید.")
-            return
+            return True
 
         self._pending_admin_actions.pop(int(user["telegram_id"]), None)
         await event.reply(
@@ -997,6 +1058,7 @@ class StudyBot:
             buttons=main_menu(int(user["telegram_id"]) in self.settings.admin_ids),
         )
         await self._notify_admins_of_payment(int(payment["id"]), path)
+        return True
 
     async def _notify_admins_of_payment(self, payment_id: int, receipt_path: Path) -> None:
         detail = await self.db.payment_detail(payment_id)
@@ -1105,7 +1167,7 @@ class StudyBot:
             await self._edit_callback(
                 event,
                 f"پرداخت {payment_id} تأیید شد و اعتبار به‌صورت اتمیک افزوده شد.",
-                [[Button.inline("پرداخت‌های در انتظار", b"admin:payments")]],
+                [[Button.inline("💳 پرداخت‌ها", b"admin:payments")]],
             )
             return
         if action == "reject":
@@ -1186,11 +1248,98 @@ class StudyBot:
     def _masked_key(secret: str | None) -> str:
         return "تنظیم نشده" if not secret else "••••••••" + secret[-4:]
 
+    async def _show_provider_health(self, event, *, force: bool = False) -> None:
+        """Admin-only provider health panel (manual, cached, secret-free)."""
+        try:
+            results = await self.provider_health.check_all(force=force)
+        except Exception:
+            logger.exception("Provider health check failed")
+            await self._edit_callback(
+                event,
+                "بررسی سلامت سرویس‌ها با خطا روبه‌رو شد؛ هیچ کلیدی نمایش داده نشد.",
+                [[Button.inline("🔄 تلاش دوباره", b"admin:health:refresh")],
+                 [Button.inline("↩️ پنل مدیریت", b"admin:home")]],
+            )
+            return
+        lines = ["🩺 وضعیت سرویس‌ها", "این صفحه فقط با درخواست شما بررسی می‌شود و نتیجه‌ها موقتاً ذخیره می‌شوند."]
+        if not results:
+            lines.append("هنوز سرویسی تنظیم نشده است.")
+        current_group = None
+        buttons: list = []
+        for result in results:
+            group = ("STT" if result.service == "stt" else "جزوه") + f" / {result.provider}"
+            if group != current_group:
+                lines.append(f"\n{group}:")
+                current_group = group
+            parts = [f"• {result.label} ({result.masked}) — {result.status_fa}"]
+            if result.http_status is not None:
+                parts.append(f"HTTP {result.http_status}")
+            if result.latency_ms is not None:
+                parts.append(f"{result.latency_ms}ms")
+            if result.cached:
+                parts.append("نتیجهٔ ذخیره‌شده")
+            if result.checked_at:
+                parts.append(f"بررسی {result.checked_at[11:19]}")
+            remaining = cooldown_remaining_seconds(result.cooldown_until)
+            if remaining:
+                parts.append(f"cooldown {remaining}s")
+            if result.detail:
+                parts.append(result.detail)
+            lines.append(" | ".join(parts))
+            if result.credential_id is not None:
+                buttons.append(
+                    [
+                        Button.inline(
+                            f"🧪 تست {result.label} ({result.masked})",
+                            f"admin:health:test:{result.credential_id}",
+                        )
+                    ]
+                )
+        buttons.append([Button.inline("🔄 بررسی همه", b"admin:health:refresh")])
+        buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
+        await self._edit_callback(event, "\n".join(lines), buttons)
+
+    async def _test_credential_health(self, event, credential_id: int, admin_id: int) -> None:
+        try:
+            result = await self.provider_health.test_credential(credential_id)
+        except CredentialStoreError:
+            await event.answer("کلید پیدا نشد یا قابل رمزگشایی نیست.", alert=True)
+            return
+        except Exception:
+            logger.exception("Credential test failed credential=%s", credential_id)
+            await event.answer("تست کلید با خطا روبه‌رو شد.", alert=True)
+            return
+        # Audit the action, never the key: the masked tail and status only.
+        try:
+            await self.db.add_audit_entry(
+                admin_id,
+                "provider_credential_tested",
+                "provider_credential",
+                str(credential_id),
+                {"status": result.status, "http_status": result.http_status, "masked": result.masked},
+            )
+        except Exception:
+            logger.warning("Could not write credential-test audit entry credential=%s", credential_id)
+        detail = f"\n{result.detail}" if result.detail else ""
+        http = f" | HTTP {result.http_status}" if result.http_status is not None else ""
+        latency = f" | {result.latency_ms}ms" if result.latency_ms is not None else ""
+        await self._edit_callback(
+            event,
+            f"🧪 نتیجهٔ تست کلید #{credential_id} ({result.masked})\n"
+            f"سرویس: {result.service}/{result.provider}\n"
+            f"وضعیت: {result.status_fa}{http}{latency}{detail}",
+            [
+                [Button.inline("🔄 بررسی همه", b"admin:health:refresh")],
+                [Button.inline("🔑 API Keys", b"admin:credentials")],
+            ],
+        )
+
     async def _show_provider_credentials(self, event) -> None:
         summaries = await self.credential_manager.list_summaries()
         lines = [
-            "کلیدها و آخرین پاسخ providerها 🔐",
-            "این صفحه فقط آخرین پاسخ ثبت‌شده را نشان می‌دهد؛ health check زنده اجرا نمی‌شود.",
+            "کلیدها و آخرین پاسخ providerها 🔑",
+            "برای بررسی زندهٔ سرویس‌ها از «🩺 وضعیت سرویس‌ها» استفاده کنید؛ "
+            "این صفحه وضعیت ثبت‌شده را نشان می‌دهد.",
             "Master key رمزگذاری: "
             + ("تنظیم شده" if self.credential_manager.encryption_configured else "تنظیم نشده"),
             "\nکلیدهای محیطی:",
@@ -1238,6 +1387,13 @@ class StudyBot:
                         Button.inline("حذف", f"admin:credential:delete:{item['id']}"),
                     ]
                 )
+                buttons.append(
+                    [
+                        Button.inline("▲ بالاتر", f"admin:credential:up:{item['id']}"),
+                        Button.inline("▼ پایین‌تر", f"admin:credential:down:{item['id']}"),
+                        Button.inline("🧪 تست", f"admin:health:test:{item['id']}"),
+                    ]
+                )
         buttons.extend(
             [
                 [
@@ -1248,6 +1404,78 @@ class StudyBot:
             ]
         )
         await self._edit_callback(event, "\n".join(lines), buttons)
+
+    @staticmethod
+    def _admin_credit_text(overview: dict) -> str:
+        lines = [
+            f"⏱ اعتبار کاربر {overview['telegram_id']}"
+            + (f" (@{overview['username']})" if overview["username"] else ""),
+            f"موجودی قابل استفاده: {format_duration(overview['available_seconds'])}",
+            f"سهم رایگان: {format_duration(overview['free_seconds'])} | "
+            f"سهم خریداری‌شده: {format_duration(overview['paid_seconds'])}",
+            f"ارسال‌ها: {overview['submissions']['total']} "
+            f"(موفق {overview['submissions']['done']} / ناموفق {overview['submissions']['failed']})",
+        ]
+        entitlements = overview["entitlements"]
+        if entitlements:
+            lines.append("\nاعتبارها (جدیدترین):")
+            statuses_fa = {
+                "active": "فعال",
+                "expired": "منقضی",
+                "revoked": "لغوشده",
+            }
+            for item in entitlements[:10]:
+                expiry = (
+                    "بدون انقضا"
+                    if not item["expires_at"]
+                    else f"تا {str(item['expires_at'])[:10]}"
+                )
+                lines.append(
+                    f"• #{item['id']} {item['plan_name']} — "
+                    f"{format_duration(item['remaining_seconds'])} از "
+                    f"{format_duration(item['granted_seconds'])} — {expiry} — "
+                    f"{statuses_fa.get(item['status'], item['status'])} ({item['source']})"
+                )
+        else:
+            lines.append("\nاعتباری ثبت نشده است.")
+        usage = overview["usage"]
+        if usage:
+            lines.append("\nآخرین رویدادهای مصرف (ثانیه):")
+            for item in usage[:8]:
+                quantities = []
+                for label, key in (
+                    ("درخواست", "requested_seconds"),
+                    ("رزرو", "reserved_seconds"),
+                    ("مصرف", "consumed_seconds"),
+                    ("آزادسازی", "released_seconds"),
+                ):
+                    value = item.get(key)
+                    if value is not None and int(value):
+                        quantities.append(f"{label} {int(value)}")
+                reason = f" — {item['reason']}" if item.get("reason") else ""
+                lines.append(
+                    f"• {str(item['created_at'])[:19]} {item['event_type']}: "
+                    + ("، ".join(quantities) or "بدون مقدار")
+                    + reason
+                )
+        return "\n".join(lines)
+
+    async def _show_user_credit(self, event, telegram_id: int) -> None:
+        overview = await self.db.admin_user_credit_overview(telegram_id)
+        if overview is None:
+            await self._edit_callback(
+                event,
+                "این شناسه در پایگاه‌داده پیدا نشد.",
+                [[Button.inline("↩️ اعتبار کاربران", b"admin:credits"),
+                  Button.inline("پنل مدیریت", b"admin:home")]],
+            )
+            return
+        buttons = [
+            [Button.inline("➕ افزودن اعتبار دستی", f"admin:credit:add:{telegram_id}")],
+            [Button.inline("🔄 به‌روزرسانی", f"admin:credits:{telegram_id}")],
+            [Button.inline("↩️ پنل مدیریت", b"admin:home")],
+        ]
+        await self._edit_callback(event, self._admin_credit_text(overview), buttons)
 
     async def _begin_credential_add(self, event, admin_id: int, service: str) -> None:
         if not self.credential_manager.encryption_configured:
@@ -1318,7 +1546,10 @@ class StudyBot:
                 await self._edit_callback(
                     event,
                     await self._billing_balance_text(int(user["id"])),
-                    [[Button.inline("💳 خرید اعتبار", b"billing:plans")], [Button.inline("↩️ منو", b"menu:home")]],
+                    [
+                        [Button.inline("💳 خرید اشتراک", b"billing:plans")],
+                        [Button.inline("↩️ منو", b"menu:home")],
+                    ],
                 )
                 return
             if data == "billing:plans":
@@ -1371,6 +1602,46 @@ class StudyBot:
         if data == "admin:credentials":
             await self._show_provider_credentials(event)
             return
+        if data == "admin:health":
+            await self._show_provider_health(event)
+            return
+        if data == "admin:health:refresh":
+            await event.answer("در حال بررسی سرویس‌ها…")
+            await self._show_provider_health(event, force=True)
+            return
+        if data.startswith("admin:health:test:"):
+            try:
+                credential_id = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                await event.answer("شناسهٔ کلید معتبر نیست.", alert=True)
+                return
+            await event.answer("در حال تست کلید…")
+            await self._test_credential_health(event, credential_id, telegram_id)
+            return
+        if data.startswith("admin:credit:add:"):
+            try:
+                target_id = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                await event.answer("شناسهٔ کاربر معتبر نیست.", alert=True)
+                return
+            self._pending_admin_actions[telegram_id] = f"credit_add:{target_id}"
+            await self._edit_callback(
+                event,
+                "مقدار اعتبار را به‌صورت «ثانیه | دلیل» بفرستید؛ مثال:\n"
+                "`3600 | جبران قطعی سرویس`\n"
+                "اعتبار فقط با دلیل ثبت می‌شود و در گزارش مدیر می‌آید.\n"
+                "برای انصراف دکمهٔ زیر را بزنید.",
+                [[Button.inline("لغو", b"admin:home")]],
+            )
+            return
+        if data.startswith("admin:credits:"):
+            try:
+                target_id = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                await event.answer("شناسهٔ کاربر معتبر نیست.", alert=True)
+                return
+            await self._show_user_credit(event, target_id)
+            return
         if data.startswith("admin:credential:add:"):
             service = data.rsplit(":", 1)[-1]
             if service not in PROVIDER_CHOICES:
@@ -1380,7 +1651,7 @@ class StudyBot:
             return
         if data.startswith("admin:credential:"):
             parts = data.split(":")
-            if len(parts) != 4 or parts[2] not in {"enable", "disable", "delete"}:
+            if len(parts) != 4 or parts[2] not in {"enable", "disable", "delete", "up", "down"}:
                 await event.answer("عملیات کلید معتبر نیست.", alert=True)
                 return
             try:
@@ -1392,8 +1663,14 @@ class StudyBot:
                 changed = await self.credential_manager.enable(credential_id, telegram_id)
             elif parts[2] == "disable":
                 changed = await self.credential_manager.disable(credential_id, telegram_id)
+            elif parts[2] in {"up", "down"}:
+                changed = await self.credential_manager.reorder(
+                    credential_id, parts[2], telegram_id
+                )
             else:
                 changed = await self.credential_manager.delete(credential_id, telegram_id)
+            if changed:
+                self.provider_health.invalidate()
             await self._edit_callback(
                 event,
                 "تغییر ذخیره شد." if changed else "کلید پیدا نشد یا تغییر نکرد.",
@@ -1423,6 +1700,10 @@ class StudyBot:
             "admin:broadcast": ("broadcast", "پیامی را که می‌خواهید برای همه برود بفرستید."),
             "admin:ban": ("ban", "شناسهٔ عددی کاربر را بفرستید."),
             "admin:unban": ("unban", "شناسهٔ عددی کاربر را بفرستید."),
+            "admin:credits": (
+                "credits_lookup",
+                "شناسهٔ عددی کاربر را بفرستید تا اعتبار، طرح‌های فعال و سابقهٔ مصرفش را ببینید.",
+            ),
         }
         if data in action_prompts:
             action, prompt = action_prompts[data]
@@ -1438,8 +1719,68 @@ class StudyBot:
     async def _handle_pending_admin_input(
         self, event, telegram_id: int, action: str, text: str
     ) -> None:
+        if action == "credits_lookup":
+            target_id = _parse_user_id(text.strip())
+            self._pending_admin_actions.pop(telegram_id, None)
+            if target_id is None:
+                await event.reply("شناسهٔ عددی معتبر نیست.", buttons=admin_menu())
+                return
+            overview = await self.db.admin_user_credit_overview(target_id)
+            if overview is None:
+                await event.reply("این شناسه در پایگاه‌داده پیدا نشد.", buttons=admin_menu())
+                return
+            await event.reply(
+                self._admin_credit_text(overview),
+                buttons=[
+                    [Button.inline("➕ افزودن اعتبار دستی", f"admin:credit:add:{target_id}")],
+                    [Button.inline("🔄 به‌روزرسانی", f"admin:credits:{target_id}")],
+                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
+                ],
+            )
+            return
+
+        if action.startswith("credit_add:"):
+            self._pending_admin_actions.pop(telegram_id, None)
+            try:
+                target_id = int(action.split(":", 1)[1])
+            except (ValueError, IndexError):
+                await event.reply("درخواست افزودن اعتبار معتبر نیست.", buttons=admin_menu())
+                return
+            parts = [part.strip() for part in text.split("|", 1)]
+            seconds = _parse_user_id(parts[0]) if parts and parts[0] else None
+            reason = parts[1][:500] if len(parts) > 1 else ""
+            if not seconds or not reason:
+                await event.reply(
+                    "قالب درست: «ثانیه | دلیل» — مثال: 3600 | جبران قطعی سرویس",
+                    buttons=admin_menu(),
+                )
+                return
+            if target_id in self.settings.admin_ids:
+                await event.reply(
+                    "برای ایمنی، اعتبار مدیریتی به مدیر دیگری افزوده نمی‌شود.",
+                    buttons=admin_menu(),
+                )
+                return
+            try:
+                credit = await self.db.add_admin_credit(target_id, seconds, telegram_id, reason)
+            except ValueError as exc:
+                await event.reply(str(exc), buttons=admin_menu())
+                return
+            if credit is None:
+                await event.reply("این کاربر در پایگاه‌داده پیدا نشد.", buttons=admin_menu())
+                return
+            await event.reply(
+                f"{format_duration(credit['seconds'])} اعتبار به کاربر {target_id} افزوده شد "
+                "و در گزارش مدیر ثبت شد.",
+                buttons=[
+                    [Button.inline("🔄 وضعیت کاربر", f"admin:credits:{target_id}")],
+                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
+                ],
+            )
+            return
+
         if action.startswith("payment_reject:"):
-            reason = "".join(character for character in text if character.isprintable()).strip()[:500]
+            reason = clean_human_text(text) or ""
             if not reason:
                 await event.reply("دلیل رد نمی‌تواند خالی باشد؛ دوباره بفرستید.")
                 return
@@ -1536,6 +1877,8 @@ class StudyBot:
                 )
                 await event.respond("ذخیرهٔ امن کلید انجام نشد؛ تنظیمات و نام برچسب را بررسی کنید.", buttons=admin_menu())
             else:
+                # A new key changes the pool; never show stale cached health.
+                self.provider_health.invalidate()
                 await event.respond(
                     f"کلید #{credential_id} با رمزگذاری ذخیره شد؛ فقط چهار رقم پایانی در پنل نمایش داده می‌شود.",
                     buttons=admin_menu(),
@@ -1689,10 +2032,22 @@ class StudyBot:
             getattr(event.message, "photo", None) is not None
             or getattr(event.message, "document", None) is not None
         ):
+            # Payment state is read from SQLite, never from in-memory state, so a
+            # restart cannot turn a receipt into a transcription job.
             awaiting = await self.db.get_awaiting_payment(int(user["id"]))
             if awaiting:
-                await self._handle_receipt_upload(event, user, awaiting)
-                return
+                if await self._handle_receipt_upload(event, user, awaiting):
+                    return
+            elif _is_receipt_image(event.message):
+                pending = await self.db.current_payment_request(int(user["id"]))
+                if pending and pending["status"] == "pending":
+                    await event.reply(
+                        f"رسید درخواست پرداخت #{pending['id']} پیش‌تر ثبت شده و در انتظار "
+                        "بررسی دستی مدیر است؛ تا آن زمان اعتباری افزوده نمی‌شود. "
+                        "اگر می‌خواهید رسید دیگری بفرستید، ابتدا درخواست را لغو کنید.",
+                        buttons=main_menu(is_admin),
+                    )
+                    return
 
         media_kind, filename, mime_type, duration, file_id = _media_metadata(event.message)
         if media_kind:

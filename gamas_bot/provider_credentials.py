@@ -345,6 +345,34 @@ class ProviderCredentialManager:
     async def list_summaries(self) -> list[dict]:
         return await self.db.provider_credential_summaries()
 
+    async def credential_for_test(self, credential_id: int) -> ProviderCredential:
+        """Decrypt exactly one stored credential for an explicit admin action.
+
+        Unlike :meth:`candidates` this ignores cooldown, quarantine and the
+        ``enabled`` flag: an administrator asking to test a key must get a real
+        answer for that key. The returned object keeps the secret out of its
+        ``repr`` (``ProviderCredential.secret`` is ``repr=False``).
+        """
+        record = await self.db.provider_credential_record(int(credential_id))
+        if not record:
+            raise CredentialStoreError("کلید انتخاب‌شده پیدا نشد.")
+        secret = self._decrypt(str(record["secret_ciphertext"]))
+        return ProviderCredential(
+            id=int(record["id"]),
+            service=str(record["service"]),
+            provider=str(record["provider"]),
+            label=str(record["label"]),
+            secret=secret,
+            last4=str(record["secret_last4"]),
+            base_url=record.get("base_url"),
+            model=record.get("model"),
+            source="database",
+        )
+
+    async def reorder(self, credential_id: int, direction: str, admin_id: int) -> bool:
+        """Deterministic priority change inside one provider pool."""
+        return await self.db.reorder_provider_credential(int(credential_id), direction, int(admin_id))
+
     async def enable(self, credential_id: int, admin_id: int) -> bool:
         return await self.db.set_provider_credential_enabled(credential_id, True, admin_id)
 
