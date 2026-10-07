@@ -39,7 +39,7 @@ if __package__ in (None, ""):  # allow "python scripts/benchmark_notes.py"
 
 from gamas_bot import qa
 from gamas_bot.config import resolve_note_mode
-from gamas_bot.docx_export import DocumentMeta, build_notes_docx, resolve_fonts
+from gamas_bot.docx_export import DocumentMeta, build_notes_docx, resolve_design, resolve_fonts
 from gamas_bot.structuring import (
     TRANSCRIPT_CHUNK_CHARS,
     _CHUNK_PREFIX_RESERVE,
@@ -87,8 +87,10 @@ def _docx_facts(payload: bytes) -> dict:
     """Structural facts parsed back out of the produced .docx.
 
     These are the *document* half of the benchmark: a booklet is only finished
-    when it has a cover, a real heading hierarchy, a live page-number field and
-    (for long documents) an automatic table of contents.
+    when it has a cover, a real heading hierarchy and a live page-number
+    field. This offline benchmark disables the static TOC because exact page
+    mapping intentionally requires the production LibreOffice/PDF renderer;
+    static-TOC behaviour is covered by dedicated tests.
     """
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         xml = archive.read("word/document.xml").decode("utf-8")
@@ -119,8 +121,9 @@ def _docx_facts(payload: bytes) -> dict:
         "page_borders": xml.count("<w:pgBorders"),
         "cover": "به نام خدا" in xml,
         "cover_quote": "دانش اگر در ثریا باشد" in xml,
-        "toc": 'TOC \\o' in xml,
-        "tables_of_contents": xml.count("TOC \\o"),
+        "toc": 'w:anchor="GamasHeading' in xml,
+        "toc_entries": xml.count('w:anchor="GamasHeading'),
+        "toc_field": 'TOC \\o' in xml or "w:instrText" in xml,
         "page_field": "PAGE" in footers,
         "footer_brand": "Gamas Bot" in footers,
         # --- layout facts: fields refresh on open, tables are fixed-width ---
@@ -173,7 +176,10 @@ def _document_probe(fonts) -> dict:
         return {}
     booklet = merge_structured_notes(notes)
     payload = build_notes_docx(
-        booklet, meta=DocumentMeta(reference="BENCH-DOC"), fonts=fonts
+        booklet,
+        meta=DocumentMeta(reference="BENCH-DOC"),
+        fonts=fonts,
+        design=resolve_design({"toc_enabled": False}),
     )
     return {
         "sections": len(booklet.sections),
@@ -470,6 +476,7 @@ def run(mode: str = "full", live: bool = False) -> dict:
             StructuredNotes(title=name, sections=sections),
             meta=DocumentMeta(reference="BENCH"),
             fonts=settings_fonts,
+            design=resolve_design({"toc_enabled": False}),
         )
         entry["docx"] = _docx_facts(payload)
         entry["structure"] = _structure_facts(StructuredNotes(title=name, sections=sections))

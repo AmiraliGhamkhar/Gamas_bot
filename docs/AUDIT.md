@@ -13,6 +13,19 @@ confirmed five root causes; all five are fixed. **314 tests pass** (265 existing
 + 49 new across `test_note_quality.py` and `test_note_evaluation.py`). No live
 Telegram login and no paid provider call was made.
 
+## Current follow-up — 2026-10-07
+
+This document contains dated audit snapshots; the historical results and test
+counts below are not the validation status of the current branch. The current
+implementation adds canonical prepaid entitlements, transaction-safe integer-
+second reservations/refunds and ledger audit; private manual receipt approval;
+Fernet-encrypted provider credentials; and a static DOCX TOC whose page numbers
+must come from a real LibreOffice/PDF render. It fails closed when exact mapping
+is unavailable. The current environment does not have LibreOffice, so actual
+rendered-page accuracy, internal PDF link destinations and visual DOCX output
+have **not** been validated here. See the current README and deployment guides
+for configuration; report only the test runs performed for this revision.
+
 ## Root causes found
 
 1. **The prompt asked for compression, not preservation.** It requested a
@@ -413,9 +426,11 @@ All media operations run in a dedicated child process,
 `python -m gamas_bot.media_worker`, started through the existing
 `media.run_command` wrapper:
 
-- **No runtime path invokes `ffmpeg`, `ffprobe` or `soffice`** — every command
-  vector starts with `sys.executable -m gamas_bot.media_worker`
-  (regression-tested in `test_media_runtime.py`, `test_audit.py`).
+- **No media-runtime path invokes `ffmpeg`, `ffprobe` or `soffice`** — every
+  media command vector starts with `sys.executable -m gamas_bot.media_worker`
+  (regression-tested in `test_media_runtime.py`, `test_audit.py`). The current
+  DOCX renderer separately uses `soffice` for exact static-TOC pagination when
+  an eligible long document has the TOC enabled.
 - Timeouts (`MEDIA_TIMEOUT_SECONDS`, `PPT_CONVERT_TIMEOUT_SECONDS`),
   cancellation, POSIX process-group kill, pipe draining, non-shell execution
   and bounded stderr reporting are unchanged.

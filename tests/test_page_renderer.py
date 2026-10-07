@@ -72,7 +72,7 @@ LONG_NOTES = (
 class RendererTests(unittest.TestCase):
     def build_docx(self) -> bytes:
         notes = parse_structured_notes(LONG_NOTES)
-        return build_notes_docx(notes, meta=META, design=resolve_design())
+        return build_notes_docx(notes, meta=META, design=resolve_design({"toc_enabled": False}))
 
     def render(self, data: bytes, **kwargs) -> dict:
         with TemporaryDirectory() as folder:
@@ -187,12 +187,34 @@ class ValidatorOrderingTests(unittest.TestCase):
         from scripts.validate_docx import validate
 
         notes = parse_structured_notes(LONG_NOTES)
-        payload = build_notes_docx(notes, meta=META, design=resolve_design())
+        payload = build_notes_docx(notes, meta=META, design=resolve_design({"toc_enabled": False}))
         results = validate(payload, expect_tables=True)
         self.assertTrue(results["element_ordering_valid"], results["ordering_violations"])
         self.assertTrue(results["page_number_field"])
         self.assertTrue(results["reopens_with_python_docx"])
         self.assertTrue(results["no_unresolved_placeholders"])
+
+
+class ValidateRenderStatusTests(unittest.TestCase):
+    def test_real_office_pdf_is_copied_out_of_its_temporary_directory(self):
+        from scripts.validate_docx import _render_status
+
+        with TemporaryDirectory() as folder:
+            output = Path(folder)
+            sample = output / "notes.docx"
+            sample.write_bytes(b"mock docx")
+
+            def fake_soffice(command, **_kwargs):
+                temporary_output = Path(command[command.index("--outdir") + 1])
+                (temporary_output / "notes.pdf").write_bytes(b"%PDF-mock")
+
+            with patch("scripts.validate_docx.shutil.which", return_value="/usr/bin/soffice"), patch(
+                "scripts.validate_docx.subprocess.run", side_effect=fake_soffice
+            ):
+                message = _render_status(output, sample)
+
+            self.assertIn("rendered with /usr/bin/soffice", message)
+            self.assertEqual((output / "notes.pdf").read_bytes(), b"%PDF-mock")
 
 
 if __name__ == "__main__":

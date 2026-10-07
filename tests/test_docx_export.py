@@ -375,12 +375,10 @@ class StyleLayerDirectionTests(unittest.TestCase):
     """Direction must live in the styles, not only on the rendered paragraphs.
 
     Regression: every paragraph carried ``w:bidi`` and every Persian run
-    ``w:rtl``, yet the document still behaved left-to-right in the places that
-    matter -- an automatic table of contents, a newly typed paragraph and a
-    pasted block all arrived LTR. Word derives the direction of content *it*
-    generates from the style definitions and from ``w:docDefaults``, none of
-    which declared a direction, so the body was RTL while everything around it
-    was not.
+    ``w:rtl``, yet style-generated content and newly typed or pasted paragraphs
+    still inherited a left-to-right context. Word derives direction from style
+    definitions and ``w:docDefaults``, so the body was RTL while its defaults
+    and surrounding content were not.
     """
 
     def _parts(self, data: bytes) -> dict[str, str]:
@@ -427,8 +425,8 @@ class StyleLayerDirectionTests(unittest.TestCase):
             self.assertIn("<w:bidi/>", style, f"{style_id} paragraph direction")
             self.assertIn("<w:rtl/>", style, f"{style_id} run direction")
 
-    def test_generated_table_of_contents_uses_rtl_entry_styles(self):
-        """Word writes TOC entries itself, into styles it would invent as LTR."""
+    def test_static_table_of_contents_entry_styles_are_rtl(self):
+        """Static TOC paragraphs need explicit RTL styles as well as RTL runs."""
         styles = self._document()["word/styles.xml"]
         for style_id in ("TOC1", "TOC2", "TOC3"):
             match = re.search(

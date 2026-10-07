@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -13,6 +14,7 @@ import aiohttp
 
 from .config import NOTE_MODES, RESERVED_HEADER_NAMES, Settings, resolve_note_mode
 from .progress import to_persian_digits
+from .provider_credentials import current_provider_credentials
 from .qa import heading_topic_key, headings_overlap, headings_share_a_topic, notes_text, run_note_qa
 from .textnorm import normalize_for_compare
 
@@ -21,6 +23,21 @@ logger = logging.getLogger(__name__)
 
 class StructuringError(RuntimeError):
     pass
+
+
+class ProviderHTTPError(StructuringError):
+    """HTTP result retained for safe credential cooldown/quarantine decisions."""
+
+    def __init__(
+        self, message: str, *, status: int, retry_after_seconds: float | None = None
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.retry_after_seconds = retry_after_seconds
+
+
+class ProviderTransientError(StructuringError):
+    """Network failure after the configured bounded retry budget."""
 
 
 ERROR_DETAIL_LIMIT = 180
@@ -1227,21 +1244,32 @@ def _endpoint(base_url: str, suffix: str) -> str:
     return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
 
 
+def _retry_after_seconds(headers) -> float | None:
+    """Parse Retry-After for durable cooldowns, bounded to seven days."""
+    raw = str(headers.get("Retry-After", "")).strip()
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+        if math.isfinite(seconds):
+            return min(max(seconds, 0.0), 604_800.0)
+    except (TypeError, ValueError):
+        pass
+    try:
+        retry_at = parsedate_to_datetime(raw)
+        if retry_at.tzinfo is None:
+            retry_at = retry_at.replace(tzinfo=timezone.utc)
+        seconds = (retry_at - datetime.now(timezone.utc)).total_seconds()
+        return min(max(seconds, 0.0), 604_800.0)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _retry_delay(response: aiohttp.ClientResponse, attempt: int) -> float:
-    """Respect Retry-After while keeping a bounded exponential fallback."""
-    raw = response.headers.get("Retry-After", "").strip()
-    if raw:
-        try:
-            return min(max(float(raw), 0.25), 30.0)
-        except ValueError:
-            try:
-                retry_at = parsedate_to_datetime(raw)
-                if retry_at.tzinfo is None:
-                    retry_at = retry_at.replace(tzinfo=timezone.utc)
-                delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
-                return min(max(delay, 0.25), 30.0)
-            except (TypeError, ValueError, OverflowError):
-                pass
+    """Respect Retry-After while keeping request retries bounded."""
+    requested = _retry_after_seconds(response.headers)
+    if requested is not None:
+        return min(max(requested, 0.25), 30.0)
     return min(2 ** attempt, 15.0)
 
 
@@ -1436,7 +1464,7 @@ def _provider_response(payload: dict, provider: str) -> str:
     return text
 
 
-async def _structure_chunk(
+async def _structure_chunk_once(
     chunk: str,
     settings: Settings,
     session: aiohttp.ClientSession,
@@ -1444,6 +1472,7 @@ async def _structure_chunk(
     *,
     system_prompt: str = SYSTEM_PROMPT,
     reminder: str = "",
+    retry_rate_limit: bool = True,
 ) -> str:
     url, headers, payload, params = _provider_request(
         chunk + reminder, settings, prompt, system_prompt
@@ -1456,9 +1485,13 @@ async def _structure_chunk(
                 url, headers=headers, params=params, json=payload
             ) as response:
                 if (
-                    response.status in RETRYABLE_HTTP_STATUSES
-                    or 500 <= response.status < 600
-                ) and attempt + 1 < attempts:
+                    (response.status != 429 or retry_rate_limit)
+                    and (
+                        response.status in RETRYABLE_HTTP_STATUSES
+                        or 500 <= response.status < 600
+                    )
+                    and attempt + 1 < attempts
+                ):
                     delay = _retry_delay(response, attempt)
                     await response.read()
                     logger.warning(
@@ -1494,12 +1527,16 @@ async def _structure_chunk(
                     message = f"سرویس {provider} خطای HTTP {response.status} داد."
                     if detail:
                         message += f" ({detail})"
-                    raise StructuringError(message)
+                    raise ProviderHTTPError(
+                        message,
+                        status=response.status,
+                        retry_after_seconds=_retry_after_seconds(response.headers),
+                    )
                 data = await response.json(content_type=None)
                 return _provider_response(data, provider)
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if attempt + 1 >= attempts:
-                raise StructuringError(
+                raise ProviderTransientError(
                     f"ارتباط با سرویس تولید جزوه ({provider}) برقرار نشد."
                 ) from None
             delay = min(2 ** attempt, 15.0)
@@ -1513,6 +1550,108 @@ async def _structure_chunk(
             )
             await asyncio.sleep(delay)
     raise StructuringError("سرویس تولید جزوه پاسخی برنگرداند.")
+
+
+async def _structure_chunk(
+    chunk: str,
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    prompt: str = TRANSCRIPT_PROMPT,
+    *,
+    system_prompt: str = SYSTEM_PROMPT,
+    reminder: str = "",
+) -> str:
+    """Use the configured provider and rotate bounded credential candidates."""
+    manager = current_provider_credentials()
+    if manager is None:
+        return await _structure_chunk_once(
+            chunk, settings, session, prompt,
+            system_prompt=system_prompt, reminder=reminder,
+        )
+
+    provider = settings.note_api_provider
+    pool = await manager.candidates(
+        "notes",
+        provider,
+        fallback_secret=settings.effective_note_api_key,
+        fallback_base_url=settings.note_api_base_url,
+        fallback_model=settings.effective_note_model,
+    )
+    if not pool:
+        raise StructuringError("هیچ کلید فعالی برای سرویس تولید جزوه در دسترس نیست.")
+
+    last_error: Exception | None = None
+    for credential in pool:
+        request_settings = (
+            manager.apply_to_settings(settings, credential) if credential is not None else settings
+        )
+        try:
+            result = await _structure_chunk_once(
+                chunk, request_settings, session, prompt,
+                system_prompt=system_prompt,
+                reminder=reminder,
+                retry_rate_limit=False,
+            )
+            if credential is not None:
+                await manager.record_result(credential, result="success")
+            return result
+        except asyncio.CancelledError:
+            raise
+        except ProviderHTTPError as exc:
+            last_error = exc
+            if exc.status in {401, 403}:
+                if credential is None:
+                    raise
+                await manager.record_result(
+                    credential,
+                    result="quarantined",
+                    status_code=exc.status,
+                    safe_error=f"HTTP {exc.status}",
+                )
+                continue
+            if exc.status == 429:
+                if credential is None:
+                    raise
+                await manager.record_result(
+                    credential,
+                    result="cooldown",
+                    status_code=exc.status,
+                    retry_after_seconds=exc.retry_after_seconds,
+                    safe_error="HTTP 429",
+                )
+                continue
+            if exc.status in RETRYABLE_HTTP_STATUSES or 500 <= exc.status < 600:
+                if credential is not None:
+                    await manager.record_result(
+                        credential,
+                        result="error",
+                        status_code=exc.status,
+                        safe_error=f"HTTP {exc.status}",
+                    )
+                    continue
+                raise
+            if credential is not None:
+                await manager.record_result(
+                    credential,
+                    result="invalid_request",
+                    status_code=exc.status,
+                    safe_error=f"HTTP {exc.status}",
+                )
+            # Request errors (400/415/422, etc.) are not fixed by rotation.
+            raise
+        except ProviderTransientError as exc:
+            last_error = exc
+            if credential is not None:
+                await manager.record_result(
+                    credential,
+                    result="error",
+                    safe_error="transient network failure",
+                )
+                continue
+            raise
+    if last_error is not None:
+        raise last_error
+    raise StructuringError("هیچ کلید فعالی برای سرویس تولید جزوه در دسترس نیست.")
 
 
 async def _structured_notes_for(

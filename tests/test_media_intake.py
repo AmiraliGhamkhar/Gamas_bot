@@ -1,6 +1,7 @@
 """Coverage for direct audio/video uploads, normalisation and unsupported files."""
 from __future__ import annotations
 
+import asyncio
 import os
 import tempfile
 import unittest
@@ -14,8 +15,9 @@ from gamas_bot.bot import (
     _is_unsupported_attachment,
     _media_metadata,
 )
+from gamas_bot.docx_export import DocxPaginationError
 from gamas_bot.media import MediaInfo, build_extract_command, needs_transcode
-from gamas_bot.stt import Transcript, deepgram_params, speechmatics_config
+from gamas_bot.stt import STTError, Transcript, deepgram_params, speechmatics_config
 from gamas_bot.structuring import parse_structured_notes
 
 from support import (
@@ -175,6 +177,111 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         ):
             await self.bot._process_submission(event, submission_id, name, kind)
         return event, stt, submission_id
+
+    async def test_successful_stt_finalizes_actual_integer_media_seconds(self):
+        _event, stt, submission_id = await self._run(
+            "exact.wav", "audio", payload=wav_bytes(2.2)
+        )
+        stt.assert_awaited_once()
+        reservation = await self.bot.db.usage_reservation(submission_id)
+        self.assertEqual(reservation["status"], "consumed")
+        self.assertEqual(reservation["required_seconds"], 3)
+        self.assertEqual(reservation["consumed_seconds"], 3)
+        user_id = await self.bot.db.submission_user_id(submission_id)
+        self.assertEqual((await self.bot.db.user_balance(user_id))["available_seconds"], 3_597)
+
+    async def test_docx_pagination_failure_after_stt_releases_reserved_seconds(self):
+        source = self.root / "pagination-failure.wav"
+        source.write_bytes(wav_bytes(2.2))
+        user = await self.bot.db.upsert_user(104, "student")
+        submission_id = await self.bot.db.create_submission(
+            int(user["id"]), "pagination-failure", 2.2, source.name,
+            "audio/wav", source_type="audio",
+        )
+        event = FakeEvent(source)
+        with patch(
+            "gamas_bot.bot.transcribe",
+            new=AsyncMock(return_value=Transcript("deepgram", "متن درس", 0.9)),
+        ) as stt, patch(
+            "gamas_bot.bot.structure_transcript",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
+        ), patch.object(
+            self.bot,
+            "_deliver_result_documents",
+            new=AsyncMock(side_effect=DocxPaginationError("صفحه‌بندی واقعی در دسترس نیست")),
+        ):
+            await self.bot._process_submission(event, submission_id, source.name, "audio")
+
+        stt.assert_awaited_once()
+        reservation = await self.bot.db.usage_reservation(submission_id)
+        self.assertEqual(reservation["status"], "released")
+        self.assertEqual(reservation["released_seconds"], 3)
+        self.assertEqual((await self.bot.db.user_balance(int(user["id"])))["available_seconds"], 3_600)
+        self.assertTrue(any("صفحه‌بندی واقعی در دسترس نیست" in reply for reply in event.replies))
+
+    async def test_delivery_cancellation_after_stt_releases_reserved_seconds(self):
+        source = self.root / "delivery-cancelled.wav"
+        source.write_bytes(wav_bytes(2.2))
+        user = await self.bot.db.upsert_user(105, "student")
+        submission_id = await self.bot.db.create_submission(
+            int(user["id"]), "delivery-cancelled", 2.2, source.name,
+            "audio/wav", source_type="audio",
+        )
+        event = FakeEvent(source)
+        with patch(
+            "gamas_bot.bot.transcribe",
+            new=AsyncMock(return_value=Transcript("deepgram", "متن درس", 0.9)),
+        ) as stt, patch(
+            "gamas_bot.bot.structure_transcript",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
+        ), patch.object(
+            self.bot,
+            "_deliver_result_documents",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ):
+            with self.assertRaises(asyncio.CancelledError):
+                await self.bot._process_submission(event, submission_id, source.name, "audio")
+
+        stt.assert_awaited_once()
+        reservation = await self.bot.db.usage_reservation(submission_id)
+        self.assertEqual(reservation["status"], "released")
+        self.assertEqual(reservation["released_seconds"], 3)
+        self.assertEqual((await self.bot.db.user_balance(int(user["id"])))["available_seconds"], 3_600)
+
+    async def test_stt_failure_releases_reserved_seconds(self):
+        source = self.root / "failure.wav"
+        source.write_bytes(wav_bytes(2.2))
+        user = await self.bot.db.upsert_user(102, "student")
+        submission_id = await self.bot.db.create_submission(
+            int(user["id"]), "failure", 2.2, source.name, "audio/wav", source_type="audio"
+        )
+        event = FakeEvent(source)
+        with patch("gamas_bot.bot.transcribe", new=AsyncMock(side_effect=STTError("temporary"))) as stt:
+            await self.bot._process_submission(event, submission_id, source.name, "audio")
+        stt.assert_awaited_once()
+        reservation = await self.bot.db.usage_reservation(submission_id)
+        self.assertEqual(reservation["status"], "released")
+        self.assertEqual(reservation["released_seconds"], 3)
+        self.assertEqual((await self.bot.db.user_balance(int(user["id"])))["available_seconds"], 3_600)
+
+    async def test_stt_cancellation_releases_reserved_seconds(self):
+        source = self.root / "cancelled.wav"
+        source.write_bytes(wav_bytes(2.2))
+        user = await self.bot.db.upsert_user(103, "student")
+        submission_id = await self.bot.db.create_submission(
+            int(user["id"]), "cancelled", 2.2, source.name, "audio/wav", source_type="audio"
+        )
+        event = FakeEvent(source)
+        with patch(
+            "gamas_bot.bot.transcribe", new=AsyncMock(side_effect=asyncio.CancelledError)
+        ) as stt:
+            with self.assertRaises(asyncio.CancelledError):
+                await self.bot._process_submission(event, submission_id, source.name, "audio")
+        stt.assert_awaited_once()
+        reservation = await self.bot.db.usage_reservation(submission_id)
+        self.assertEqual(reservation["status"], "released")
+        self.assertEqual(reservation["released_seconds"], 3)
+        self.assertEqual((await self.bot.db.user_balance(int(user["id"])))["available_seconds"], 3_600)
 
     async def test_video_upload_is_converted_before_transcription(self):
         event, stt, submission_id = await self._run(

@@ -1,17 +1,18 @@
 """RTL Persian Word (.docx) and raw-text exporters for finished jobs.
 
 The Word document is the polished deliverable of the bot: a real cover page, a
-section-level page border (``w:pgBorders``), a table of contents built from
-actual Word heading styles, a subtle running header, a footer with a real
-``PAGE`` field, and right-to-left body text where embedded English keeps its
-own direction and font.
+section-level page border (``w:pgBorders``), a static linked table of contents
+built from actual Word heading styles and rendered PDF destinations, a subtle
+running header, a footer with a real ``PAGE`` field, and right-to-left body text
+where embedded English keeps its own direction and font.
 
 Layout rules that matter and are implemented here:
 
 * **Heading styles are real styles.** Section headings use ``Heading 1``,
   sub-blocks use ``Heading 2`` and definition terms use ``Heading 3``, so the
-  Navigation Pane, an automatic table of contents and document restructuring
-  all work. A styled ``Normal`` paragraph is never used as a heading.
+  Navigation Pane, the application's static linked TOC and document
+  restructuring all work. A styled ``Normal`` paragraph is never used as a
+  heading.
 * **The page frame is a page frame.** ``w:pgBorders`` is written into each
   section's ``w:sectPr``; the previous implementation drew a bordered empty
   paragraph, which is a paragraph border and not a page frame.
@@ -19,11 +20,10 @@ Layout rules that matter and are implemented here:
   so Persian runs get ``w:cs`` complex-script faces and Latin tokens keep
   ``w:ascii``/``w:hAnsi`` with ``w:rtl`` set to zero. Logical order is never
   reversed in the file.
-* **Direction lives in the styles, not only on the paragraphs.** Marking every
-  paragraph ``w:bidi`` and every Persian run ``w:rtl`` is not enough: Word
-  derives the direction of the content *it* generates -- an automatic table of
-  contents, a newly typed paragraph, pasted text -- from the style definitions
-  and from ``w:docDefaults``. Those are configured RTL here (``_style_direction``,
+* **Direction lives in defaults, styles and paragraphs.** Marking written
+  paragraphs ``w:bidi`` and Persian runs ``w:rtl`` is not enough: Word derives
+  unstyled and style-generated content from ``w:docDefaults`` and the style
+  definitions. Those are configured RTL here (``_style_direction``,
   ``_configure_document_defaults``, ``_configure_toc_entry_styles``), and every
   paragraph mark carries its own ``w:rtl`` so an empty line and the caret are
   RTL too. A document that is RTL only where it was written still behaves LTR
@@ -39,9 +39,14 @@ API was unavailable and only raw material could be delivered.
 from __future__ import annotations
 
 import io
+import itertools
 import logging
 import re
+import shutil
+import subprocess
+import tempfile
 import zipfile
+from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -52,6 +57,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
+from docx.text.run import Run
 from lxml import etree
 
 from .bidi import TextRun, is_rtl_dominant, split_direction_runs
@@ -61,6 +67,13 @@ from .structuring import NoteSection, StructuredNotes
 from .textnorm import normalize_display
 
 logger = logging.getLogger(__name__)
+
+
+class DocxPaginationError(RuntimeError):
+    """Exact static-TOC page mapping could not be produced safely."""
+
+
+_BOOKMARK_IDS = itertools.count(1)
 
 ACCENT = RGBColor(0x1F, 0x38, 0x64)
 ACCENT_HEX = "1F3864"
@@ -266,6 +279,8 @@ class DocxDesign:
     border_space: int = DEFAULT_BORDER_SPACE
     footer_brand: bool = True
     logo_path: str = ""
+    pagination_timeout_seconds: int = 120
+    pagination_renderer_bin: str | None = None
 
     @property
     def logo_file(self):
@@ -324,6 +339,10 @@ def resolve_design(design_config: dict | None = None) -> DocxDesign:
         toc_min_sections = int(config.get("toc_min_sections") or TOC_MIN_SECTIONS)
     except (TypeError, ValueError):
         toc_min_sections = TOC_MIN_SECTIONS
+    try:
+        pagination_timeout = int(config.get("pagination_timeout_seconds") or 120)
+    except (TypeError, ValueError):
+        pagination_timeout = 120
     return DocxDesign(
         cover_enabled=_as_flag(config.get("cover_enabled"), True),
         toc_enabled=_as_flag(config.get("toc_enabled"), True),
@@ -336,6 +355,10 @@ def resolve_design(design_config: dict | None = None) -> DocxDesign:
         border_space=min(max(space, 0), 31),
         footer_brand=_as_flag(config.get("footer_brand"), True),
         logo_path=str(config.get("logo_path") or "").strip(),
+        pagination_timeout_seconds=min(max(pagination_timeout, 1), 900),
+        pagination_renderer_bin=(
+            str(config.get("pagination_renderer_bin") or "").strip() or None
+        ),
     )
 
 
@@ -884,9 +907,9 @@ def _set_section_rtl_gutter(section) -> None:
 def _add_page_number_footer(section, *, fonts: DocumentFonts, design: DocxDesign) -> None:
     """A professional footer: optional brand plus a real ``PAGE`` field.
 
-    The page number is a Word field (``w:fldChar``/``w:instrText``), never a
-    hardcoded integer, so it stays correct after pages are added, the table of
-    contents is refreshed, or the section count changes.
+    The footer page number is a Word field (``w:fldChar``/``w:instrText``),
+    never a hardcoded integer, so it stays correct when document pagination or
+    the section count changes. The TOC page numbers are separate static text.
     """
     footer = section.footer
     footer.is_linked_to_previous = False
@@ -909,7 +932,7 @@ def _add_page_number_footer(section, *, fonts: DocumentFonts, design: DocxDesign
 
 def _add_field(paragraph, instruction: str, *, fonts: DocumentFonts, size: float,
                color: RGBColor | None = None, placeholder: str = "") -> None:
-    """Append a Word field (page number, table of contents, ...) to a paragraph."""
+    """Append a Word field, used for the live footer page number."""
     run = paragraph.add_run()
     _style_run(run, font=fonts.body, size=size, color=color)
     begin = OxmlElement("w:fldChar")
@@ -1015,11 +1038,10 @@ def _style_direction(style, *, rtl: bool = True) -> None:
     """Mark a *style definition* itself as RTL (``w:bidi`` + ``w:rtl``).
 
     Direction on a paragraph/run is not enough: Word derives the direction of
-    anything it generates itself from the style, not from the runs it copied.
-    That is precisely why an automatic table of contents came out left-aligned
-    in an otherwise RTL document -- the ``TOC 1``/``TOC 2`` entries are written
-    by Word into fresh paragraphs that never pass through
-    :func:`_add_directional_text`.
+    style-generated content from the style, not from the runs it copied. The
+    application's static TOC rows also rely on the ``TOC 1``/``TOC 2`` styles,
+    so those styles must be RTL even though their text is explicitly written
+    by :func:`_add_directional_text`.
     """
     p_pr = style.element.get_or_add_pPr()
     for found in p_pr.findall(qn("w:bidi")):
@@ -1102,8 +1124,8 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
     normal.paragraph_format.line_spacing = 1.15
     normal.paragraph_format.widow_control = True
 
-    # Real heading styles: Word's Navigation Pane, automatic TOC and
-    # "restructure the document" features all depend on these, not on looks.
+    # Real heading styles power Word's Navigation Pane and outline, and provide
+    # the actual bookmarks used to build the application's static TOC.
     heading_specs = (
         (HEADING_STYLES[1], fonts.heading, HEADING_SIZES[1], 14, 6),
         (HEADING_STYLES[2], fonts.heading, HEADING_SIZES[2], 10, 4),
@@ -1181,15 +1203,14 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
     _configure_toc_entry_styles(document, fonts)
 
 
-#: Style names Word writes its generated table-of-contents entries into. They
-#: are absent from python-docx's default template, so Word invents them on the
-#: first F9 -- as left-to-right styles, because nothing in the document told it
-#: otherwise. Defining them here is what makes the built TOC right-to-left.
+#: Custom paragraph styles used by the application's static TOC rows. They are
+#: absent from python-docx's default template, so define their RTL properties
+#: explicitly rather than relying on Word's generated/default styles.
 TOC_ENTRY_STYLES = ("TOC 1", "TOC 2", "TOC 3")
 
 
 def _configure_toc_entry_styles(document, fonts: DocumentFonts) -> None:
-    """Define RTL ``TOC 1``/``TOC 2``/``TOC 3`` styles for the generated TOC."""
+    """Define RTL ``TOC 1``/``TOC 2``/``TOC 3`` styles for static TOC rows."""
     for level, name in enumerate(TOC_ENTRY_STYLES, start=1):
         style = _ensure_paragraph_style(document, name)
         style.font.name = fonts.latin
@@ -1228,7 +1249,7 @@ def _apply_document_defaults(document, fonts: DocumentFonts) -> None:
 def _rewrite_docx_part(docx_bytes: bytes, part_name: str, transform) -> bytes:
     """Apply ``transform`` to one existing XML part of a saved package.
 
-    Both post-save tweaks (font fallbacks, field refresh) need the same
+    The font-fallback post-save tweak uses the same
     "read the package, edit one part, write it back" step. A missing part and
     any error leave the document byte-identical: these are refinements, and no
     refinement is allowed to cost a user the file.
@@ -1281,41 +1302,6 @@ def _inject_font_fallbacks(docx_bytes: bytes, fonts: DocumentFonts) -> bytes:
             alt.set(qn("w:val"), fallback)
 
     return _rewrite_docx_part(docx_bytes, "word/fontTable.xml", transform)
-
-
-def _enable_update_fields(docx_bytes: bytes) -> bytes:
-    """Ask Word to refresh fields (TOC, PAGE) when the document is opened.
-
-    Without ``w:updateFields`` the table of contents stays at its placeholder
-    until the reader presses F9, and a field that is never refreshed is how a
-    booklet ends up with a visible «فهرست مطالب» and no entries. Word and
-    LibreOffice both honour the flag; readers that ignore it simply show the
-    placeholder, which is exactly today's behaviour.
-    """
-    def transform(root) -> None:
-        for found in root.findall(qn("w:updateFields")):
-            root.remove(found)
-        element = OxmlElement("w:updateFields")
-        element.set(qn("w:val"), "true")
-        # CT_Settings is a sequence: ``w:updateFields`` must follow
-        # ``w:characterSpacingControl``/``w:savePreviewPicture`` and precede
-        # ``w:hdrShapeDefaults``/``w:footnotePr``/``w:compat``/``w:rsids``.
-        anchor = None
-        for tag in (
-            "w:hdrShapeDefaults", "w:footnotePr", "w:endnotePr", "w:compat",
-            "w:docVars", "w:rsids", "w:mathPr", "w:themeFontLang",
-            "w:clrSchemeMapping", "w:shapeDefaults", "w:decimalSymbol",
-            "w:listSeparator",
-        ):
-            anchor = root.find(qn(tag))
-            if anchor is not None:
-                break
-        if anchor is not None:
-            anchor.addprevious(element)
-        else:
-            root.append(element)
-
-    return _rewrite_docx_part(docx_bytes, "word/settings.xml", transform)
 
 
 def _new_document(meta: DocumentMeta, title: str) -> Document:
@@ -1578,49 +1564,384 @@ def toc_is_worth_it(body_chars: int, sections: int, design: DocxDesign) -> bool:
     return sections >= design.toc_min_sections or body_chars >= TOC_MIN_BODY_CHARS
 
 
-def _add_toc(document, *, fonts: DocumentFonts, levels: str = TOC_LEVELS) -> None:
-    """An automatic Word table of contents built from the heading styles.
+def _add_static_toc_skeleton(document, *, fonts: DocumentFonts):
+    """Insert the page-two TOC container before the body content.
 
-    The field is marked ``w:dirty`` so Word offers to build it on open; until
-    then the placeholder text explains how to refresh it. It is never a
-    hand-typed list.
+    Entries are populated after the body has been assembled, when their unique
+    bookmarks are known. Page numbers start as fixed-width plain text so the
+    first real renderer pass can discover each hyperlink's destination.
     """
     paragraph = _add_rtl_paragraph(
-        document, "", fonts=fonts, align=WD_ALIGN_PARAGRAPH.RIGHT,
-        space_after=8, line_spacing=1.0, style="TOC Heading",
+        document,
+        "",
+        fonts=fonts,
+        align=WD_ALIGN_PARAGRAPH.RIGHT,
+        space_after=8,
+        line_spacing=1.0,
+        style="TOC Heading",
     )
-    _add_directional_text(paragraph, "فهرست مطالب", fonts=_heading_fonts(fonts), size=16, bold=True, color=ACCENT)
-
-    field_paragraph = _add_rtl_paragraph(
-        document, "", fonts=fonts, align=WD_ALIGN_PARAGRAPH.RIGHT, space_after=6,
+    _add_directional_text(
+        paragraph,
+        "فهرست مطالب",
+        fonts=_heading_fonts(fonts),
+        size=16,
+        bold=True,
+        color=ACCENT,
     )
-    run = field_paragraph.add_run()
-    _style_run(run, font=fonts.body, size=11)
-    # The field itself carries no text, so the direction has to be declared here:
-    # this paragraph is where Word expands the TOC, and its base direction
-    # decides which side the entries and their page numbers are laid out on.
-    _enable_bidi(field_paragraph, rtl=True)
-    _set_paragraph_mark_direction(field_paragraph, rtl=True)
-    begin = OxmlElement("w:fldChar")
-    begin.set(qn("w:fldCharType"), "begin")
-    begin.set(qn("w:dirty"), "true")
-    instruction = OxmlElement("w:instrText")
-    instruction.set(qn("xml:space"), "preserve")
-    instruction.text = f' TOC \\o "{levels}" \\h \\z \\u '
-    separate = OxmlElement("w:fldChar")
-    separate.set(qn("w:fldCharType"), "separate")
-    placeholder = OxmlElement("w:t")
-    placeholder.set(qn("xml:space"), "preserve")
-    placeholder.text = "برای ساخت فهرست، در Word کلید F9 را بزنید (به‌روزرسانی فیلدها)."
-    end = OxmlElement("w:fldChar")
-    end.set(qn("w:fldCharType"), "end")
-    for element in (begin, instruction, separate, placeholder, end):
-        run._r.append(element)
+    table = document.add_table(rows=0, cols=2)
+    table.style = "Table Grid"
+    _apply_rtl_table_direction(table)
+    _set_table_widths(table, [TABLE_CONTENT_WIDTH_CM - 1.4, 1.4])
+    borders = OxmlElement("w:tblBorders")
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        edge = OxmlElement(f"w:{side}")
+        edge.set(qn("w:val"), "nil")
+        borders.append(edge)
+    _insert_ppr_child(
+        table._tbl.tblPr,
+        borders,
+        ("w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription"),
+    )
+    _make_table_layout_fixed(table, TABLE_CONTENT_WIDTH_CM)
+    return table
 
+
+def _add_directional_hyperlink(
+    paragraph,
+    text: str,
+    anchor: str,
+    *,
+    fonts: DocumentFonts,
+    size: float,
+) -> None:
+    """Append an internal, accessible hyperlink without losing bidi runs."""
+    clean = xml_safe(text)
+    hyperlink = OxmlElement("w:hyperlink")
+    hyperlink.set(qn("w:anchor"), anchor)
+    hyperlink.set(qn("w:history"), "1")
+    # The tooltip survives in readers that support it and also makes the target
+    # diagnosable in an exported PDF without exposing any private metadata.
+    hyperlink.set(qn("w:tooltip"), anchor)
+    if is_rtl_dominant(clean):
+        _enable_bidi(paragraph, rtl=True)
+        _set_paragraph_mark_direction(paragraph, rtl=True)
+    for segment in split_direction_runs(clean):
+        run = Run(OxmlElement("w:r"), paragraph)
+        run.text = segment.text
+        _style_run(
+            run,
+            font=fonts.body if segment.rtl else fonts.latin,
+            size=size,
+            color=ACCENT,
+            rtl=segment.rtl,
+        )
+        run.font.underline = True
+        hyperlink.append(run._r)
+    paragraph._p.append(hyperlink)
+
+
+def _fill_static_toc(
+    document,
+    table,
+    *,
+    fonts: DocumentFonts,
+    levels: str,
+) -> list[dict[str, str | int]]:
+    """Fill the TOC from actual bookmarked Heading paragraphs."""
+    try:
+        maximum_level = int(levels.split("-")[-1])
+    except (ValueError, AttributeError):
+        maximum_level = 1
+    entries: list[dict[str, str | int]] = []
+    for paragraph in document.paragraphs:
+        match = re.fullmatch(r"Heading ([1-3])", paragraph.style.name or "")
+        if not match:
+            continue
+        level = int(match.group(1))
+        if level > maximum_level:
+            continue
+        bookmark = paragraph._p.find(qn("w:bookmarkStart"))
+        if bookmark is None or not bookmark.get(qn("w:name")):
+            raise DocxPaginationError("یکی از عنوان‌های فهرست نشانک داخلی معتبر ندارد.")
+        title = paragraph.text.strip()
+        if not title:
+            continue
+        entries.append({"anchor": bookmark.get(qn("w:name")), "title": title, "level": level})
+    if not entries:
+        raise DocxPaginationError("برای ساخت فهرست ایستا، هیچ عنوانی با نشانک داخلی پیدا نشد.")
+
+    for entry in entries:
+        row = table.add_row()
+        row._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
+        title_cell, page_cell = row.cells
+        title_paragraph = title_cell.paragraphs[0]
+        title_paragraph.style = document.styles[f"TOC {entry['level']}"]
+        title_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        title_paragraph.paragraph_format.space_before = Pt(0)
+        title_paragraph.paragraph_format.space_after = Pt(0)
+        title_paragraph.paragraph_format.line_spacing = 1.0
+        title_paragraph.paragraph_format.right_indent = Cm(0.45 * (int(entry["level"]) - 1))
+        _add_directional_hyperlink(
+            title_paragraph,
+            str(entry["title"]),
+            str(entry["anchor"]),
+            fonts=fonts,
+            size=10.5,
+        )
+        page_paragraph = page_cell.paragraphs[0]
+        page_paragraph.style = document.styles[f"TOC {entry['level']}"]
+        page_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        page_paragraph.paragraph_format.space_before = Pt(0)
+        page_paragraph.paragraph_format.space_after = Pt(0)
+        page_paragraph.paragraph_format.line_spacing = 1.0
+        _add_directional_text(page_paragraph, "00000", fonts=fonts, size=10.5, color=MUTED)
+    return entries
+
+
+def _set_static_toc_page_numbers(table, pages: list[int], *, fonts: DocumentFonts) -> None:
+    if len(table.rows) != len(pages):
+        raise DocxPaginationError("تعداد پیوندهای فهرست پس از صفحه‌بندی تغییر کرد؛ سند ارسال نشد.")
+    for row, page in zip(table.rows, pages):
+        paragraph = row.cells[1].paragraphs[0]
+        for child in list(paragraph._p):
+            if child.tag != qn("w:pPr"):
+                paragraph._p.remove(child)
+        _add_directional_text(
+            paragraph,
+            to_persian_digits(str(page)),
+            fonts=fonts,
+            size=10.5,
+            color=MUTED,
+        )
+def _save_document_bytes(document, fonts: DocumentFonts) -> bytes:
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return _inject_font_fallbacks(buffer.getvalue(), fonts)
+
+
+def _destination_page_number(reader, destination) -> int | None:
+    """Resolve a PDF link destination to its one-based physical page number."""
+    if destination is None:
+        return None
+    try:
+        from pypdf.generic import Destination, IndirectObject
+    except Exception:
+        return None
+    if isinstance(destination, (str, bytes)):
+        name = destination.decode("utf-8", "replace") if isinstance(destination, bytes) else destination
+        destination = reader.named_destinations.get(name.lstrip("#/"))
+    if isinstance(destination, Destination):
+        page_index = reader.get_destination_page_number(destination)
+        return page_index + 1 if page_index is not None else None
+    try:
+        first = destination[0]
+    except (TypeError, IndexError, KeyError):
+        return None
+    if isinstance(first, IndirectObject):
+        try:
+            page_index = reader.get_page_number(first.get_object())
+            return page_index + 1 if page_index is not None else None
+        except Exception:
+            return None
+    try:
+        page_index = reader.get_page_number(first)
+        return page_index + 1 if page_index is not None else None
+    except Exception:
+        return None
+
+
+def _rendered_toc_page_numbers(
+    docx_bytes: bytes,
+    entries: list[dict[str, str | int]],
+    *,
+    timeout_seconds: int,
+    renderer_bin: str | None = None,
+) -> list[int]:
+    """Render through LibreOffice and resolve every TOC link from its PDF target.
+
+    This intentionally has no Pillow/layout-estimate fallback. A missing
+    renderer, PDF reader, TOC link, or ambiguous link map is a hard failure:
+    page numbers are never guessed.
+    """
+    renderer = renderer_bin or shutil.which("soffice") or shutil.which("libreoffice")
+    if not renderer:
+        raise DocxPaginationError(
+            "فهرست ایستا به شمارهٔ صفحهٔ واقعی نیاز دارد؛ LibreOffice (soffice) در سرور پیدا نشد."
+        )
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        raise DocxPaginationError(
+            "برای تعیین صفحهٔ واقعی فهرست ایستا، بستهٔ pypdf نصب نیست."
+        ) from None
+
+    with tempfile.TemporaryDirectory(prefix="gamas-docx-pagination-") as temporary:
+        root = Path(temporary)
+        source = root / "document.docx"
+        source.write_bytes(docx_bytes)
+        profile = root / "libreoffice-profile"
+        profile.mkdir(mode=0o700)
+        command = [
+            renderer,
+            f"-env:UserInstallation={profile.as_uri()}",
+            "--headless",
+            "--convert-to",
+            "pdf:writer_pdf_Export",
+            "--outdir",
+            str(root),
+            str(source),
+        ]
+        try:
+            completed = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=max(1, min(int(timeout_seconds), 900)),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            raise DocxPaginationError(
+                "LibreOffice نتوانست صفحه‌بندی دقیق سند را در مهلت تنظیم‌شده انجام دهد."
+            ) from None
+        pdf_path = root / "document.pdf"
+        if completed.returncode != 0 or not pdf_path.is_file() or pdf_path.stat().st_size == 0:
+            # Renderer output is intentionally not surfaced: it may contain
+            # excerpts of user-provided document text.
+            raise DocxPaginationError("خروجی PDF صفحه‌بندی دقیق سند تولید نشد.")
+        try:
+            reader = PdfReader(str(pdf_path), strict=True)
+            if len(reader.pages) < 2:
+                raise ValueError("Rendered document has no second page")
+            page = reader.pages[1]
+            annotations = page.get("/Annots") or []
+            links: list[tuple[float, str | None, int]] = []
+            for reference in annotations:
+                annotation = reference.get_object()
+                if str(annotation.get("/Subtype")) != "/Link":
+                    continue
+                destination = annotation.get("/Dest")
+                action = annotation.get("/A")
+                if destination is None and action is not None:
+                    action = action.get_object()
+                    if str(action.get("/S")) == "/GoTo":
+                        destination = action.get("/D")
+                page_number = _destination_page_number(reader, destination)
+                rectangle = annotation.get("/Rect")
+                if page_number is None or rectangle is None:
+                    continue
+                top = float(rectangle[3])
+                tooltip = annotation.get("/Contents")
+                tooltip_text = str(tooltip) if tooltip is not None else None
+                links.append((top, tooltip_text, page_number))
+        except DocxPaginationError:
+            raise
+        except Exception:
+            raise DocxPaginationError(
+                "پیوندهای داخلی فهرست از PDF صفحه‌بندی‌شده قابل خواندن نبودند."
+            ) from None
+
+    expected = len(entries)
+    if len(links) != expected:
+        raise DocxPaginationError(
+            "فهرست در یک صفحهٔ قابل نگاشت جا نشد یا LibreOffice همهٔ پیوندهای آن را حفظ نکرد."
+        )
+
+    # If the renderer preserves the OOXML tooltip in PDF annotations, use that
+    # unique bookmark name directly. Otherwise the one-link-per-row geometry on
+    # the single TOC page gives an unambiguous visual order.
+    by_tooltip = {tooltip: page for _top, tooltip, page in links if tooltip}
+    anchors = [str(entry["anchor"]) for entry in entries]
+    if all(anchor in by_tooltip for anchor in anchors):
+        pages = [by_tooltip[anchor] for anchor in anchors]
+        if any(page < 3 for page in pages):
+            raise DocxPaginationError("یکی از فهرست‌پیوندها به جایگاه بدنهٔ سند نرسید.")
+        return pages
+    links.sort(key=lambda item: item[0], reverse=True)
+    pages = [item[2] for item in links]
+    if any(page < 3 for page in pages):
+        raise DocxPaginationError("یکی از فهرست‌پیوندها به جایگاه بدنهٔ سند نرسید.")
+    return pages
+
+
+def _finish_static_toc(
+    document,
+    toc_table,
+    entries: list[dict[str, str | int]],
+    *,
+    fonts: DocumentFonts,
+    design: DocxDesign,
+) -> bytes:
+    """Render, map, fill, and verify static TOC numbers until they are stable."""
+    if toc_table is None:
+        return _save_document_bytes(document, fonts)
+    payload = _save_document_bytes(document, fonts)
+    previous: list[int] | None = None
+    for _attempt in range(3):
+        pages = _rendered_toc_page_numbers(
+            payload,
+            entries,
+            timeout_seconds=design.pagination_timeout_seconds,
+            renderer_bin=design.pagination_renderer_bin,
+        )
+        _set_static_toc_page_numbers(toc_table, pages, fonts=fonts)
+        payload = _save_document_bytes(document, fonts)
+        if pages == previous:
+            # One more render has confirmed the literal page numbers did not
+            # move the headings they describe.
+            verified = _rendered_toc_page_numbers(
+                payload,
+                entries,
+                timeout_seconds=design.pagination_timeout_seconds,
+                renderer_bin=design.pagination_renderer_bin,
+            )
+            if verified == pages:
+                return payload
+        previous = pages
+    # A final rendered pass is required even when the first iteration's values
+    # were already stable; no output is returned based only on an estimate.
+    verified = _rendered_toc_page_numbers(
+        payload,
+        entries,
+        timeout_seconds=design.pagination_timeout_seconds,
+        renderer_bin=design.pagination_renderer_bin,
+    )
+    if verified == previous:
+        return payload
+    _set_static_toc_page_numbers(toc_table, verified, fonts=fonts)
+    payload = _save_document_bytes(document, fonts)
+    final = _rendered_toc_page_numbers(
+        payload,
+        entries,
+        timeout_seconds=design.pagination_timeout_seconds,
+        renderer_bin=design.pagination_renderer_bin,
+    )
+    if final != verified:
+        raise DocxPaginationError(
+            "شماره‌های فهرست پس از صفحه‌بندی نهایی پایدار نماندند؛ سند ارسال نشد."
+        )
+    return payload
 
 # ---------------------------------------------------------------------------
 # Body blocks
 # ---------------------------------------------------------------------------
+
+
+def _add_bookmark(paragraph) -> str:
+    """Attach a unique internal bookmark to a body heading."""
+    number = next(_BOOKMARK_IDS)
+    name = f"GamasHeading{number}"
+    start = OxmlElement("w:bookmarkStart")
+    start.set(qn("w:id"), str(number))
+    start.set(qn("w:name"), name)
+    end = OxmlElement("w:bookmarkEnd")
+    end.set(qn("w:id"), str(number))
+    p_pr = paragraph._p.find(qn("w:pPr"))
+    if p_pr is not None:
+        p_pr.addnext(start)
+    else:
+        paragraph._p.insert(0, start)
+    paragraph._p.append(end)
+    return name
 
 
 def _add_heading(
@@ -1659,6 +1980,7 @@ def _add_heading(
     )
     # A heading alone at the foot of a page reads as a broken booklet.
     _keep_with_next(paragraph)
+    _add_bookmark(paragraph)
     return paragraph
 
 
@@ -2051,6 +2373,8 @@ def build_notes_docx(
     style = design or DocxDesign()
     document = _new_document(meta, notes.display_title)
     _configure_styles(document, resolved)
+    toc_needed = toc_is_worth_it(_sections_chars(notes.sections), len(notes.sections), style)
+    toc_table = None
 
     first_section = document.sections[0]
     _configure_section(first_section)
@@ -2079,13 +2403,19 @@ def build_notes_docx(
             design=style,
             mode_label=MODE_LABELS.get(notes.note_mode, ""),
         )
-    _set_section_page_numbering(body_section, start=1)
+        if toc_needed:
+            # Without a designed cover, the title block is page one and the
+            # static TOC still occupies page two before body page three.
+            _add_page_break(document)
+    _set_section_page_numbering(
+        body_section, start=2 if toc_needed and style.cover_enabled else 1
+    )
     _add_document_header(body_section, fonts=resolved, title=notes.display_title)
     _add_page_number_footer(body_section, fonts=resolved, design=style)
     _configure_header_footer_styles(document)
 
-    if toc_is_worth_it(_sections_chars(notes.sections), len(notes.sections), style):
-        _add_toc(document, fonts=resolved, levels=style.toc_levels)
+    if toc_needed:
+        toc_table = _add_static_toc_skeleton(document, fonts=resolved)
         _add_page_break(document)
 
     if notes.learning_objectives:
@@ -2148,9 +2478,18 @@ def build_notes_docx(
         _set_table_widths(glossary_table, [4.6, TABLE_CONTENT_WIDTH_CM - 4.6])
         _add_rtl_paragraph(document, "", fonts=resolved, size=4, space_after=6, line_spacing=1.0)
 
-    buffer = io.BytesIO()
-    document.save(buffer)
-    return _enable_update_fields(_inject_font_fallbacks(buffer.getvalue(), resolved))
+    toc_entries = (
+        _fill_static_toc(document, toc_table, fonts=resolved, levels=style.toc_levels)
+        if toc_table is not None
+        else []
+    )
+    return _finish_static_toc(
+        document,
+        toc_table,
+        toc_entries,
+        fonts=resolved,
+        design=style,
+    )
 
 
 def build_plain_docx(
@@ -2166,6 +2505,13 @@ def build_plain_docx(
     style = design or DocxDesign()
     document = _new_document(meta, title)
     _configure_styles(document, resolved)
+    markdown_headings = sum(
+        1 for line in text.splitlines() if re.match(r"^\s{0,3}#{1,6}\s+\S", line)
+    )
+    toc_needed = markdown_headings >= 2 and toc_is_worth_it(
+        len(text), markdown_headings, style
+    )
+    toc_table = None
 
     first_section = document.sections[0]
     _configure_section(first_section)
@@ -2176,20 +2522,18 @@ def build_plain_docx(
     else:
         body_section = first_section
         _add_body_title_block(document, title, meta, fonts=resolved, design=style)
-    _set_section_page_numbering(body_section, start=1)
+        if toc_needed:
+            _add_page_break(document)
+    _set_section_page_numbering(
+        body_section, start=2 if toc_needed and style.cover_enabled else 1
+    )
     _add_document_header(body_section, fonts=resolved, title=title)
     _add_page_number_footer(body_section, fonts=resolved, design=style)
 
-    # Raw material is rendered as Markdown headings, so the same "long enough
-    # to browse?" rule applies: a fallback booklet earns a table of contents
-    # exactly when the notes path would have produced one. A raw text with no
-    # (or a single) heading would produce an empty TOC page, so it never gets
-    # one whatever its length.
-    markdown_headings = sum(
-        1 for line in text.splitlines() if re.match(r"^\s{0,3}#{1,6}\s+\S", line)
-    )
-    if markdown_headings >= 2 and toc_is_worth_it(len(text), markdown_headings, style):
-        _add_toc(document, fonts=resolved, levels=style.toc_levels)
+    # Raw material's heading-derived TOC uses the same static, rendered-page
+    # mapping as the structured-notes path.
+    if toc_needed:
+        toc_table = _add_static_toc_skeleton(document, fonts=resolved)
         _add_page_break(document)
 
     for raw_line in text.splitlines():
@@ -2214,9 +2558,18 @@ def build_plain_docx(
             paragraph.paragraph_format.right_indent = Cm(0.35)
             continue
         _add_rtl_paragraph(document, line.strip(), fonts=resolved)
-    buffer = io.BytesIO()
-    document.save(buffer)
-    return _enable_update_fields(_inject_font_fallbacks(buffer.getvalue(), resolved))
+    toc_entries = (
+        _fill_static_toc(document, toc_table, fonts=resolved, levels=style.toc_levels)
+        if toc_table is not None
+        else []
+    )
+    return _finish_static_toc(
+        document,
+        toc_table,
+        toc_entries,
+        fonts=resolved,
+        design=style,
+    )
 
 
 def build_raw_text_document(

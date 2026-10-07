@@ -13,3 +13,6 @@ python-socks[asyncio]>=2.4,<3.0
 # screenshots. python-pptx also pulls it in, so declaring it makes the
 # requirement explicit rather than incidental.
 Pillow>=10.0,<13.0
+# Fernet-encrypted provider credentials and actual rendered-PDF TOC pagination.
+cryptography>=44.0,<47.0
+pypdf>=5.0,<7.0

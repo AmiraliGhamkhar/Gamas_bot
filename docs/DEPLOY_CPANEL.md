@@ -20,6 +20,7 @@
 | Terminal/SSH access | install packages, run the preflight | cPanel → *Terminal* |
 | **Cron Jobs** | restarts the bot when the host kills it | cPanel → *Cron Jobs* |
 | Python **3.11+** (*Setup Python App* or CloudLinux alt-python) | code base requirement | `python3.11 --version` |
+| LibreOffice `soffice` + Python `pypdf` (unless TOC is explicitly disabled) | exact page mapping for the static TOC on eligible long DOCX files | preflight checks `soffice`; `pypdf` is installed by `requirements.txt` |
 | glibc **2.28+** (CloudLinux/AlmaLinux/Rocky **8+**) | `av` (PyAV) and `lxml` ship manylinux wheels that need it; on CloudLinux 7 they cannot be installed | preflight prints it |
 | Outbound TCP **443** to Telegram and your STT / note-API hosts | MTProto and the provider APIs | preflight tests it |
 | Background processes allowed for more than a few minutes | the bot is a long-running process; some hosts kill anything over a CPU/time budget (CloudLinux LVE, "entry/nproc" limits) | watch `data/logs/bot.log` after step 8 |
@@ -29,7 +30,9 @@ Also know:
 
 * **Application code and data must live outside `public_html`.** `.env`,
   `data/bot.sqlite3` and the Telegram session must never be downloadable.
-  The preflight fails when the project is inside a web root.
+  The preflight fails when the project is inside a web root. On POSIX, the bot
+  also sets the SQLite database and live `-wal`/`-shm` files to mode `600`; keep
+  backups restricted and encrypted.
 * Telegram is filtered in some countries/data-centres. If the preflight cannot
   reach it, set `TELEGRAM_PROXY` (SOCKS5/HTTP). **Only Telegram traffic uses the
   proxy** — the Speechmatics/Deepgram/note-API calls go out directly, so those
@@ -89,12 +92,27 @@ nano .env
 ```
 
 Minimum: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ADMIN_IDS`,
-one STT key, and (optionally) the note-API key. Recommended for shared hosting:
+one STT key, and (optionally) the note-API key. `.env.example` contains the
+single canonical card-to-card destination and the canonical plans; do not copy
+card details into application code. Before enabling admin-managed API keys,
+generate a Fernet master key and put it in the owner-only `.env` file (never in
+SQLite or source control):
+
+```bash
+.venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Keep the key stable and back it up securely; losing it makes encrypted provider
+keys unreadable. Recommended for shared hosting:
 
 ```dotenv
 MAX_CONCURRENT_JOBS=1
 MAX_PENDING_JOBS=2
 PROGRESS_ANIMATION_ENABLED=false   # fewer Telegram edits, less CPU
+# RECEIPT_DIR=data/receipts       # outside the web root; directory 700/files 600
+# RECEIPT_RETENTION_DAYS=90
+# DOCX_TOC_ENABLED=true           # needs the LibreOffice renderer for long docs
+# DOCX_PAGINATION_RENDERER_BIN=/usr/bin/soffice  # if not on PATH
 # TELEGRAM_PROXY=socks5://user:pass@proxy.example.com:1080
 ```
 
@@ -117,6 +135,9 @@ Fix every `FAIL`. Typical messages:
 | `cannot open outbound TCP 443 to Telegram` | ask the host to allow it, or set `TELEGRAM_PROXY` |
 | `Speechmatics/Deepgram/Note API … unreachable` | outbound firewall/DNS; the app does not proxy these |
 | `file locking is not enforced` | data directory is on a filesystem without `flock`; point `TELEGRAM_SESSION_PATH`, `DATABASE_PATH`, `TEMP_DIR` to a local disk |
+| `DOCX pagination renderer` fails | install/use `soffice` and confirm `pypdf` is installed, or explicitly set `DOCX_TOC_ENABLED=false` (no TOC will be generated) |
+| `Provider credential encryption` fails | set a valid Fernet key in `PROVIDER_CREDENTIALS_ENCRYPTION_KEY`; never print or log it |
+| `Private receipt directory` fails | move `RECEIPT_DIR` outside the web root and ensure owner-only permissions are supported |
 | `Media worker` fails | `pip install -r requirements.txt` did not finish |
 
 ## 6. First run in the foreground
@@ -175,10 +196,21 @@ The cPanel *Restart* button restarts only this status app, **not** the bot.
 | Stop it permanently | remove the cron line, then the `pkill` above |
 | Update | `cd ~/gamas_bot && git pull && pip install -r requirements.txt`, then restart |
 | Logs | `data/logs/bot.log` (rotated, 10 MB × 5). Set `LOG_FILE` in `.env` to choose another path |
-| Backup | `data/bot.sqlite3` (plus `-wal`/`-shm` while running) and `data/telegram_bot.session`. Stop the bot or use `sqlite3 data/bot.sqlite3 ".backup backup.sqlite3"` |
+| Backup | `.env` (especially the stable provider encryption master key), `data/bot.sqlite3` (plus `-wal`/`-shm` while running), `data/telegram_bot.session`, and `data/receipts/`. Stop the bot or use `sqlite3 data/bot.sqlite3 ".backup backup.sqlite3"`; encrypt and restrict backup access |
 | Disk cleanup | `data/tmp` is emptied automatically at start-up and after each job |
 
-The database is created and migrated automatically on first start.
+The database is created and migrated automatically on first start. Receipt images
+are private payment records; the bot stores them under `RECEIPT_DIR` with
+owner-only permissions and keeps them until manual review. After approval or
+rejection, it removes them after `RECEIPT_RETENTION_DAYS` (90 days by default,
+measured from the review time). Configure backups and retention according to your
+legal obligations.
+
+Billing is paid by manual card-to-card transfer. The bot does not verify a bank
+transaction: an administrator must inspect the private receipt and approve or
+reject it from the **پرداخت‌های در انتظار** panel or `/payments`. Uploading a
+receipt grants no credit. `/credit TELEGRAM_USER_ID SECONDS REASON` is the
+separate auditable admin adjustment.
 
 ## 10. Troubleshooting
 
@@ -192,6 +224,10 @@ The database is created and migrated automatically on first start.
 * **`status: starting` forever.** Read `data/logs/launcher.err` and
   `data/logs/bot.log`; the usual causes are a wrong token/API id/hash or blocked
   Telegram access.
+* **A long DOCX fails with a pagination-renderer error.** The static TOC uses
+  rendered page destinations, so install `soffice` (or set
+  `DOCX_PAGINATION_RENDERER_BIN`) and install `pypdf`. No page number is guessed.
+  Alternatively, explicitly disable `DOCX_TOC_ENABLED` to omit the TOC.
 * **Every upload fails immediately.** Check `df -h ~` and `df -i ~` (disk and
   inodes) and the `data/tmp` permissions.
 * **Two replies to every message.** Two bots share a token from *different

@@ -32,6 +32,7 @@ from urllib.parse import quote
 import aiohttp
 
 from .config import SPEECHMATICS_MULTILINGUAL_MODELS, Settings
+from .provider_credentials import ProviderCredentialManager
 from .structuring import _endpoint
 
 logger = logging.getLogger(__name__)
@@ -53,9 +54,28 @@ class STTConfigurationError(STTError):
 class STTTransientError(STTError):
     """A temporary provider failure (429/5xx/timeouts) worth another attempt."""
 
-    def __init__(self, message: str, retry_after: float | None = None) -> None:
+    def __init__(
+        self, message: str, retry_after: float | None = None, *, status: int | None = None
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
+        self.status = status
+
+
+class STTAuthenticationError(STTError):
+    """401/403 response; the affected credential is quarantined and rotated."""
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+class STTRequestError(STTError):
+    """Permanent invalid-request response; it must not rotate credentials."""
+
+    def __init__(self, message: str, *, status: int) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 #: HTTP statuses a well-behaved provider uses for *temporary* trouble.
@@ -356,7 +376,9 @@ def _retry_after_seconds(response: aiohttp.ClientResponse | None) -> float | Non
     if not raw:
         return None
     try:
-        return max(float(raw), 0.0)
+        seconds = float(raw)
+        if math.isfinite(seconds):
+            return min(max(seconds, 0.0), 604_800.0)
     except ValueError:
         pass
     try:
@@ -368,7 +390,7 @@ def _retry_after_seconds(response: aiohttp.ClientResponse | None) -> float | Non
     if retry_at.tzinfo is None:
         retry_at = retry_at.replace(tzinfo=timezone.utc)
     delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
-    return max(delay, 0.0)
+    return min(max(delay, 0.0), 604_800.0)
 
 
 def _http_error(
@@ -383,8 +405,12 @@ def _http_error(
     """
     message = f"{stage} failed (HTTP {status})"
     if status in RETRYABLE_HTTP_STATUSES:
-        return STTTransientError(message, retry_after=_retry_after_seconds(response))
-    return STTError(message)
+        return STTTransientError(
+            message, retry_after=_retry_after_seconds(response), status=status
+        )
+    if status in {401, 403}:
+        return STTAuthenticationError(message, status=status)
+    return STTRequestError(message, status=status)
 
 
 def _transcript_metrics(text: str) -> tuple[int, int]:
@@ -742,6 +768,8 @@ async def _attempt_with_retries(
     session: aiohttp.ClientSession,
     audio_path: Path,
     settings: Settings,
+    *,
+    retry_rate_limit: bool = True,
 ) -> Transcript:
     """Run one provider attempt, retrying only *transient* failures.
 
@@ -770,7 +798,11 @@ async def _attempt_with_retries(
                 ) from exc
             detail, retry_after = type(exc).__name__, None
         except STTTransientError as exc:
-            if attempt >= attempts:
+            # In managed multi-key mode, a 429 cools down this credential and
+            # ``transcribe`` immediately rotates to the next one. With legacy
+            # environment settings (no credential manager), bounded retry is
+            # the only recovery path and still observes Retry-After.
+            if (exc.status == 429 and not retry_rate_limit) or attempt >= attempts:
                 raise
             detail, retry_after = str(exc), exc.retry_after
         except STTError:
@@ -789,34 +821,60 @@ async def _attempt_with_retries(
     raise STTError(f"{engine} produced no transcript after {attempts} attempt(s)")
 
 
-async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
-    """Transcribe with the configured primary provider and optional fallback.
+async def transcribe(
+    audio_path: Path,
+    settings: Settings,
+    *,
+    credentials: ProviderCredentialManager | None = None,
+) -> Transcript:
+    """Transcribe with provider fallback and bounded per-key rotation.
 
-    Failure handling is deterministic and ordered:
-
-    1. one engine is retried for transient failures (see
-       :func:`_attempt_with_retries`);
-    2. a permanent error (bad key, unsupported language/model, unparsable
-       answer) skips straight to the next configured engine — a configuration
-       problem is not fixed by asking a different provider the same question,
-       but the operator's provider order is still respected;
-    3. a transcript below ``stt_min_confidence`` also moves to the next engine,
-       and the most confident result wins.
+    Existing static environment keys remain supported. When a credential
+    manager is provided, enabled encrypted keys are tried in priority order;
+    429s cool down and rotate, 401/403 quarantine and rotate, and malformed
+    requests are never retried with another key. Provider and transcript
+    quality fallback behavior remains unchanged.
     """
     primary = settings.stt_primary
-    order = [primary]
+    provider_order = [primary] + [name for name in STT_PROVIDERS if name != primary]
+
+    key_pools: dict[str, list] = {}
+    for name in provider_order:
+        if credentials is None:
+            key_pools[name] = [None] if STT_PROVIDERS[name].availability(settings) else []
+            continue
+        fallback_secret = None
+        fallback_base_url = None
+        fallback_model = None
+        if name == "speechmatics":
+            fallback_secret = settings.speechmatics_api_key
+            fallback_base_url = settings.speechmatics_base_url
+        elif name == "deepgram":
+            fallback_secret = settings.deepgram_api_key
+        elif name == "openai_compatible":
+            fallback_secret = settings.stt_openai_api_key
+            fallback_base_url = settings.stt_openai_base_url
+            fallback_model = settings.stt_openai_model
+        key_pools[name] = await credentials.candidates(
+            "stt",
+            name,
+            fallback_secret=fallback_secret,
+            fallback_base_url=fallback_base_url,
+            fallback_model=fallback_model,
+        )
     if settings.stt_fallback_enabled:
-        order += [name for name in STT_PROVIDERS if name != primary]
-    elif not STT_PROVIDERS[primary].availability(settings):
-        # Fallback is off, but refusing every job because the *primary* engine
-        # is not configured while another one is would be pointless.
-        others = [name for name in STT_PROVIDERS if name != primary]
+        order = provider_order
+    elif key_pools.get(primary):
+        order = [primary]
+    else:
+        # Retain legacy fallback to another configured engine when the
+        # selected primary has no available environment or stored key.
+        order = [name for name in provider_order if name != primary]
         logger.warning(
             "STT primary provider=%s is not configured; using another configured engine",
             primary,
         )
-        order = others
-    configured = [name for name in order if STT_PROVIDERS[name].availability(settings)]
+    configured = [name for name in order if key_pools.get(name)]
     if not configured:
         raise STTError("هیچ کلید یا نشانی API برای سرویس تبدیل گفتار تنظیم نشده است.")
 
@@ -871,13 +929,85 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
                 len(usable),
             )
             try:
-                # Bound the whole provider attempt, including upload, polling
-                # and transcript download (socket read timeouts are not totals).
-                # Transient failures (429/5xx/network/timeout) are retried with
-                # bounded exponential backoff before the engine is given up on.
-                transcript = await _attempt_with_retries(
-                    engine, session, audio_path, settings
-                )
+                transcript = None
+                last_key_error: Exception | None = None
+                pool = key_pools[engine]
+                for credential in pool:
+                    request_settings = (
+                        credentials.apply_to_settings(settings, credential)
+                        if credentials is not None and credential is not None
+                        else settings
+                    )
+                    try:
+                        # Bound the whole provider attempt, including upload,
+                        # polling, and transcript download.
+                        transcript = await _attempt_with_retries(
+                            engine,
+                            session,
+                            audio_path,
+                            request_settings,
+                            retry_rate_limit=credentials is None,
+                        )
+                        if credentials is not None and credential is not None:
+                            await credentials.record_result(credential, result="success")
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except STTAuthenticationError as exc:
+                        last_key_error = exc
+                        if credentials is not None and credential is not None:
+                            await credentials.record_result(
+                                credential,
+                                result="quarantined",
+                                status_code=exc.status,
+                                safe_error=f"HTTP {exc.status}",
+                            )
+                        continue
+                    except STTTransientError as exc:
+                        last_key_error = exc
+                        if credentials is not None and credential is not None:
+                            await credentials.record_result(
+                                credential,
+                                result="cooldown" if exc.status == 429 else "error",
+                                status_code=exc.status,
+                                retry_after_seconds=exc.retry_after,
+                                safe_error=(
+                                    f"HTTP {exc.status}" if exc.status else "transient provider failure"
+                                ),
+                            )
+                        continue
+                    except STTRequestError as exc:
+                        if credentials is not None and credential is not None:
+                            await credentials.record_result(
+                                credential,
+                                result="invalid_request",
+                                status_code=exc.status,
+                                safe_error=f"HTTP {exc.status}",
+                            )
+                        # 400/415/422 (and other non-auth permanent HTTP
+                        # responses) are properties of the request, not key.
+                        raise
+                    except STTError as exc:
+                        if credentials is not None and credential is not None:
+                            await credentials.record_result(
+                                credential,
+                                result="error",
+                                safe_error=type(exc).__name__,
+                            )
+                        raise
+                    except Exception as exc:
+                        if credentials is not None and credential is not None:
+                            await credentials.record_result(
+                                credential,
+                                result="error",
+                                safe_error=type(exc).__name__,
+                            )
+                        raise
+                if transcript is None:
+                    if last_key_error is not None:
+                        raise last_key_error
+                    raise STTError(f"{engine} has no available credential")
+
                 chars, words = _transcript_metrics(transcript.text)
                 logger.info(
                     "STT attempt completed provider=%s elapsed_seconds=%.3f confidence=%s text_chars=%s text_words=%s attempt=%s/%s",
@@ -911,10 +1041,6 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
                 # fragments. Keep only our own sanitized errors and error types.
                 detail = str(exc) if isinstance(exc, STTError) else type(exc).__name__
                 if isinstance(exc, STTConfigurationError):
-                    # The request was never valid for *this* engine. Another
-                    # provider may still accept the same configuration (e.g.
-                    # Speechmatics supports language=auto, Deepgram does not),
-                    # so the operator's provider order is still honoured.
                     logger.warning(
                         "STT provider rejected the configuration provider=%s detail=%s",
                         engine,
@@ -936,7 +1062,7 @@ async def transcribe(audio_path: Path, settings: Settings) -> Transcript:
         if not outcomes:
             raise STTError("؛ ".join(failures) or "تبدیل گفتار ناموفق بود.")
         # When both providers work, prefer the more confident result. If either
-        # omits confidence, the later (fallback) result is preferred after a low score.
+        # omits confidence, the later fallback result is preferred after a low score.
         if len(outcomes) == 1:
             selected = outcomes[0]
         elif outcomes[0].confidence is not None and outcomes[1].confidence is not None:
