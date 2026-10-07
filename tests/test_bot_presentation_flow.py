@@ -12,6 +12,7 @@ from gamas_bot.bot import (
     StudyBot,
     _presentation_metadata,
 )
+from gamas_bot.docx_export import DocxPaginationError
 from gamas_bot.stt import Transcript
 from gamas_bot.structuring import parse_structured_notes
 
@@ -139,10 +140,42 @@ class PresentationJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(clips), 2)
         self.assertTrue(all(clip["included"] == 1 for clip in clips))
         self.assertEqual([clip["slide_number"] for clip in clips], [1, 2])
+        reservation = await self.bot.db.usage_reservation(submission_id)
+        self.assertEqual(reservation["status"], "consumed")
+        self.assertGreater(reservation["consumed_seconds"], 0)
         stats = await self.bot.db.stats()
         self.assertEqual(stats["presentations"], 1)
         self.assertEqual(stats["presentation_clips"], 2)
         self.assertEqual(stats["done"], 1)
+
+    async def test_docx_pagination_failure_after_stt_releases_presentation_usage(self):
+        deck = build_deck(
+            self.root / "pagination-failure.pptx",
+            slides=[
+                {"title": "عنوان", "media": [("a.wav", wav_bytes(2.2), AUDIO_REL)]}
+            ],
+        )
+        with patch(
+            "gamas_bot.bot.transcribe",
+            new=AsyncMock(return_value=Transcript("deepgram", "متن درس", 0.9)),
+        ) as stt, patch(
+            "gamas_bot.bot.structure_presentation",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
+        ), patch.object(
+            self.bot,
+            "_deliver_result_documents",
+            new=AsyncMock(side_effect=DocxPaginationError("صفحه‌بندی واقعی در دسترس نیست")),
+        ):
+            event, submission_id = await self._run_job(deck)
+
+        stt.assert_awaited_once()
+        reservation = await self.bot.db.usage_reservation(submission_id)
+        self.assertEqual(reservation["status"], "released")
+        self.assertEqual(reservation["released_seconds"], 3)
+        user_id = await self.bot.db.submission_user_id(submission_id)
+        self.assertEqual((await self.bot.db.user_balance(user_id))["available_seconds"], 3_600)
+        self.assertTrue(any("صفحه‌بندی واقعی در دسترس نیست" in reply for reply in event.replies))
+        self.assertEqual((await self.bot.db.stats())["failed"], 1)
 
     async def test_deck_without_audio_falls_back_to_slide_text(self):
         deck = build_deck(

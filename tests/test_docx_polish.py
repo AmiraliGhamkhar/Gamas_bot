@@ -2,9 +2,9 @@
 
 These pin the parts of the Word output that make it a *booklet* rather than a
 text dump: the cover page (with the exact brand and quotation), the real
-section-level page frame (``w:pgBorders`` inside ``w:sectPr``), the automatic
-table of contents, real Heading 1/2/3 styles, and the footer's live ``PAGE``
-field. Each of them is a user-visible contract, so each is asserted on the
+section-level page frame (``w:pgBorders`` inside ``w:sectPr``), the static
+linked table of contents, real Heading 1/2/3 styles, and the footer's live
+``PAGE`` field. Each of them is a user-visible contract, so each is asserted on the
 generated XML rather than on python-docx's object model.
 """
 
@@ -14,15 +14,18 @@ import io
 import unittest
 import xml.etree.ElementTree as ET
 import zipfile
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from support import docx_text
 
 from gamas_bot.docx_export import (
     COVER_QUOTE,
     DocxDesign,
+    DocxPaginationError,
     DocumentMeta,
     build_notes_docx,
     build_plain_docx,
@@ -42,7 +45,7 @@ META = DocumentMeta(
 
 
 def long_notes_json() -> str:
-    """Four sections, so the automatic TOC (>= 4 sections) is generated."""
+    """Four sections, so the static TOC threshold (>= 4) is met."""
     sections = []
     for index in range(1, 5):
         sections.append(
@@ -70,9 +73,29 @@ class DocxTestCase(unittest.TestCase):
         *,
         design: DocxDesign | None = None,
         meta: DocumentMeta = META,
+        enable_toc: bool = False,
     ) -> bytes:
         notes = parse_structured_notes(notes_json)
-        return build_notes_docx(notes, meta=meta, design=design or resolve_design())
+        resolved = design or resolve_design()
+        # Layout/style tests should not require an office suite. TOC tests opt
+        # in and either use explicit page-map fixtures or assert a hard failure.
+        resolved = replace(resolved, toc_enabled=bool(enable_toc))
+        return build_notes_docx(notes, meta=meta, design=resolved)
+
+    def build_with_page_mapping(
+        self,
+        notes_json: str,
+        *,
+        design: DocxDesign | None = None,
+        meta: DocumentMeta = META,
+    ) -> bytes:
+        resolved = replace(design or resolve_design(), toc_enabled=True)
+
+        def pages(_payload, entries, **_kwargs):
+            return list(range(3, 3 + len(entries)))
+
+        with patch("gamas_bot.docx_export._rendered_toc_page_numbers", side_effect=pages):
+            return self.build(notes_json, design=resolved, meta=meta, enable_toc=True)
 
     def part(self, data: bytes, name: str) -> str:
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -117,24 +140,22 @@ class CoverPageTests(DocxTestCase):
 
     def test_cover_shows_mode_label_and_jalali_date(self):
         text = docx_text(self.build(long_notes_json()))
-        self.assertIn("GMS-000123", text)
+        self.assertNotIn("GMS-000123", text)  # tracking IDs stay out of student-visible content
         self.assertIn("حالت تولید: کامل", text)
         self.assertIn("۱۴۰۵", text)  # Jalali date on the cover
 
     def test_cover_metadata_is_split_into_labelled_lines(self):
         lines = cover_meta_lines(META, mode_label="حالت تولید: کامل")
-        # One fact per line keeps a label next to its value; a single long
-        # «… • … • …» line wraps and strands the tracking reference alone.
-        self.assertEqual(len(lines), 3)
+        # Student-facing metadata deliberately excludes source names, provider
+        # identities and internal tracking references.
+        self.assertEqual(len(lines), 2)
         self.assertIn("حالت تولید: کامل", lines[0])
-        self.assertIn("منبع:", lines[1])
         self.assertIn("تاریخ:", lines[1])
-        self.assertIn("کد پیگیری: GMS-000123", lines[2])
-        self.assertIn("موتور تبدیل گفتار: deepgram", lines[2])
-        # every line is short enough to stay on one line of the cover
+        self.assertNotIn("GMS-000123", " ".join(lines))
+        self.assertNotIn("deepgram", " ".join(lines))
+        self.assertNotIn("lecture.mp3", " ".join(lines))
         self.assertTrue(all(len(line) < 90 for line in lines), lines)
-        # without a mode label the block is still two lines, never empty
-        self.assertEqual(len(cover_meta_lines(META)), 2)
+        self.assertEqual(len(cover_meta_lines(META)), 1)
 
     def test_cover_quotation_keeps_its_place_with_a_long_title(self):
         def spacers(notes_json: str) -> int:
@@ -255,57 +276,170 @@ class HeadingStyleTests(DocxTestCase):
 
 
 class TocTests(DocxTestCase):
-    def test_toc_field_is_generated_for_long_documents(self):
-        data = self.build(long_notes_json())
+    def test_toc_is_static_plain_text_with_unique_clickable_bookmarks(self):
+        data = self.build_with_page_mapping(long_notes_json())
         xml = self.document_xml(data)
-        # Level 1 by default: the block labels («تعریف‌ها»، «مثال‌ها») are real
-        # Heading 2s that would repeat once per section in a 1-2 TOC and bury
-        # the lecture's own topics.
-        self.assertIn('TOC \\o "1-1" \\h \\z \\u', xml)
-        self.assertIn('w:dirty="true"', xml)
+        root = ET.fromstring(xml)
         self.assertIn("فهرست مطالب", docx_text(data))
+        self.assertNotIn("TOC \\o", xml)
+        self.assertNotIn("w:instrText", xml)
+        self.assertNotIn("w:fldChar", xml)
+        self.assertNotIn("w:dirty", xml)
+
+        bookmarks = [
+            item.get(f"{W}name")
+            for item in root.iter(f"{W}bookmarkStart")
+            if item.get(f"{W}name")
+        ]
+        links = [
+            item.get(f"{W}anchor")
+            for item in root.iter(f"{W}hyperlink")
+            if item.get(f"{W}anchor")
+        ]
+        self.assertGreaterEqual(len(links), 4)
+        self.assertEqual(len(links), len(set(links)))
+        self.assertEqual(len(bookmarks), len(set(bookmarks)))
+        self.assertTrue(set(links).issubset(set(bookmarks)))
+        text = docx_text(data)
+        self.assertIn("۳", text)  # supplied rendered page mapping is ordinary text
+        self.assertIn("۴", text)
+
+    def test_toc_page_map_unavailability_fails_explicitly(self):
+        with patch("gamas_bot.docx_export.shutil.which", return_value=None):
+            with self.assertRaises(DocxPaginationError):
+                self.build(long_notes_json(), enable_toc=True)
+
+    def test_tooltip_mapped_toc_targets_must_start_after_page_two(self):
+        from gamas_bot.docx_export import _rendered_toc_page_numbers
+
+        class PageMarker:
+            def __init__(self, index: int):
+                self.index = index
+
+        class LinkReference:
+            def __init__(self, anchor: str, target: PageMarker):
+                self.anchor = anchor
+                self.target = target
+
+            def get_object(self):
+                return {
+                    "/Subtype": "/Link",
+                    "/Dest": [self.target],
+                    "/Rect": [0, 0, 1, 1],
+                    "/Contents": self.anchor,
+                }
+
+        targets = [PageMarker(1), PageMarker(2)]
+
+        class FakeReader:
+            pages = [object(), {"/Annots": [
+                LinkReference("toc-a", targets[0]),
+                LinkReference("toc-b", targets[1]),
+            ]}, object()]
+
+            @staticmethod
+            def get_page_number(page):
+                return page.index
+
+        def fake_render(command, **_kwargs):
+            output_dir = Path(command[command.index("--outdir") + 1])
+            (output_dir / "document.pdf").write_bytes(b"mock rendered PDF")
+            return type("Completed", (), {"returncode": 0})()
+
+        with patch("gamas_bot.docx_export.shutil.which", return_value="/usr/bin/soffice"), patch(
+            "gamas_bot.docx_export.subprocess.run", side_effect=fake_render
+        ), patch("pypdf.PdfReader", return_value=FakeReader()):
+            with self.assertRaises(DocxPaginationError):
+                _rendered_toc_page_numbers(
+                    b"mock DOCX",
+                    [{"anchor": "toc-a"}, {"anchor": "toc-b"}],
+                    timeout_seconds=10,
+                )
 
     def test_toc_levels_are_configurable(self):
-        data = self.build(long_notes_json(), design=resolve_design({"toc_levels": "1-2"}))
-        self.assertIn('TOC \\o "1-2"', self.document_xml(data))
+        default = self.build_with_page_mapping(long_notes_json())
+        level_two = self.build_with_page_mapping(
+            long_notes_json(), design=resolve_design({"toc_levels": "1-2"})
+        )
+        default_xml = self.document_xml(default)
+        level_two_xml = self.document_xml(level_two)
+        self.assertGreater(level_two_xml.count("w:anchor="), default_xml.count("w:anchor="))
+        self.assertIn("تعریف‌ها", docx_text(level_two))
 
     def test_toc_min_sections_is_configurable(self):
         short = (
             '{"title": "کوتاه", "sections": [{"heading": "الف", "paragraphs": ["متن"]}, '
             '{"heading": "ب", "paragraphs": ["متن دو"]}, {"heading": "پ", "paragraphs": ["متن سه"]}]}'
         )
-        # Three short sections are not a booklet worth a table of contents…
-        self.assertNotIn("TOC", self.document_xml(self.build(short)))
-        # …unless the operator lowers the threshold.
-        data = self.build(short, design=resolve_design({"toc_min_sections": 3}))
-        self.assertIn("TOC \\o", self.document_xml(data))
+        self.assertNotIn("فهرست مطالب", docx_text(self.build(short)))
+        data = self.build_with_page_mapping(
+            short, design=resolve_design({"toc_min_sections": 3})
+        )
+        self.assertIn("فهرست مطالب", docx_text(data))
 
     def test_toc_is_skipped_for_short_documents(self):
         short = (
             '{"title": "کوتاه", "sections": [{"heading": "الف", "paragraphs": ["متن"]}, '
             '{"heading": "ب", "paragraphs": ["متن دو"]}]}'
         )
-        self.assertNotIn("TOC", self.document_xml(self.build(short)))
+        self.assertNotIn("فهرست مطالب", docx_text(self.build(short)))
 
     def test_toc_can_be_disabled(self):
         data = self.build(long_notes_json(), design=resolve_design({"toc_enabled": False}))
-        self.assertNotIn("TOC \\o", self.document_xml(data))
+        self.assertNotIn("w:anchor=", self.document_xml(data))
         self.assertNotIn("فهرست مطالب", docx_text(data))
 
-    def test_raw_text_document_gets_a_toc_only_when_it_has_headings(self):
+    def test_raw_text_document_gets_a_static_toc_only_when_it_has_headings(self):
         body = "جملهٔ توضیحی دربارهٔ درس. " * 200
-        without_headings = build_plain_docx(
-            "متن خام", body, meta=META, design=resolve_design()
-        )
-        # long but unstructured material would leave an empty TOC page
-        self.assertNotIn("TOC \\o", self.document_xml(without_headings))
-        with_headings = build_plain_docx(
-            "متن خام",
-            "# بخش نخست\n" + body + "\n## بخش دوم\n" + body,
-            meta=META,
-            design=resolve_design(),
-        )
-        self.assertIn('TOC \\o "1-1"', self.document_xml(with_headings))
+        design = resolve_design({"toc_enabled": False})
+        without_headings = build_plain_docx("متن خام", body, meta=META, design=design)
+        self.assertNotIn("فهرست مطالب", self.document_xml(without_headings))
+
+        content = "# بخش نخست\n" + body + "\n## بخش دوم\n" + body
+        with patch(
+            "gamas_bot.docx_export._rendered_toc_page_numbers",
+            side_effect=lambda _payload, entries, **_kwargs: list(range(3, 3 + len(entries))),
+        ):
+            with_headings = build_plain_docx(
+                "متن خام", content, meta=META, design=resolve_design()
+            )
+        body_xml = self.document_xml(with_headings)
+        self.assertIn("فهرست مطالب", body_xml)
+        self.assertNotIn("TOC \\o", body_xml)
+        self.assertNotIn("w:instrText", body_xml)
+
+    def test_real_rendered_page_map_when_libreoffice_is_installed(self):
+        import shutil
+
+        try:
+            import pypdf  # noqa: F401
+        except ImportError:
+            self.skipTest("pypdf is not installed")
+
+        if not (shutil.which("soffice") or shutil.which("libreoffice")):
+            self.skipTest("LibreOffice is not installed; page mapping is covered by the explicit-failure test")
+        data = self.build(long_notes_json(), enable_toc=True)
+        root = ET.fromstring(self.document_xml(data))
+        anchors = [
+            item.get(f"{W}anchor")
+            for item in root.iter(f"{W}hyperlink")
+            if item.get(f"{W}anchor")
+        ]
+        entries = [{"anchor": anchor} for anchor in anchors]
+        from gamas_bot.docx_export import _rendered_toc_page_numbers
+
+        pages = _rendered_toc_page_numbers(data, entries, timeout_seconds=120)
+        self.assertTrue(pages)
+        self.assertTrue(all(page >= 3 for page in pages))
+        # The rendered numbers must be the literal page-cell text, not a field.
+        toc_table = root.find(f"{W}body/{W}tbl")
+        self.assertIsNotNone(toc_table)
+        page_cells = [row.findall(f"{W}tc")[1] for row in toc_table.findall(f"{W}tr")]
+        visible_numbers = [
+            "".join(node.text or "" for node in cell.iter(f"{W}t"))
+            for cell in page_cells
+        ]
+        self.assertEqual(len(visible_numbers), len(pages))
 
 
 class DirectionAndResourceTests(DocxTestCase):
@@ -342,14 +476,12 @@ class DirectionAndResourceTests(DocxTestCase):
             data = self.build(long_notes_json(), design=design)
         self.assertIn("<w:drawing", self.document_xml(data))
 
-    def test_fields_are_refreshed_when_the_document_is_opened(self):
-        """The TOC and the page numbers must be live without pressing F9."""
+    def test_static_toc_never_requests_field_refresh_on_open(self):
         settings_xml = self.part(self.build(long_notes_json()), "word/settings.xml")
-        self.assertIn("updateFields", settings_xml)
-        self.assertIn('w:val="true"', settings_xml)
-        # CT_Settings is a sequence: updateFields must not precede w:zoom.
-        self.assertLess(settings_xml.index("<w:zoom"), settings_xml.index("w:updateFields"))
-        self.assertLess(settings_xml.index("w:updateFields"), settings_xml.index("<w:compat"))
+        document_xml = self.document_xml(self.build(long_notes_json()))
+        self.assertNotIn("updateFields", settings_xml)
+        self.assertNotIn("w:instrText", document_xml)
+        self.assertNotIn("TOC \\o", document_xml)
 
     def test_resolve_design_defaults_and_invalid_values(self):
         default = resolve_design()

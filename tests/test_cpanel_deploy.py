@@ -370,6 +370,51 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(pf.check_lock_support(Path(tmp)).level, "PASS")
             self.assertIn(pf.check_directory("d", Path(tmp) / "new").level, {"PASS", "WARN"})
 
+    def test_static_toc_preflight_requires_a_working_renderer_or_explicit_opt_out(self):
+        from types import SimpleNamespace
+
+        from scripts import cpanel_preflight as pf
+
+        settings = SimpleNamespace(
+            docx_toc_enabled=True,
+            docx_pagination_renderer_bin=None,
+        )
+        with patch.object(pf.shutil, "which", return_value=None):
+            self.assertEqual(pf.check_docx_pagination(settings).level, "FAIL")
+        settings.docx_toc_enabled = False
+        self.assertEqual(pf.check_docx_pagination(settings).level, "PASS")
+
+    def test_provider_master_key_preflight_never_prints_the_secret(self):
+        from types import SimpleNamespace
+
+        from cryptography.fernet import Fernet
+
+        from scripts import cpanel_preflight as pf
+
+        key = Fernet.generate_key().decode("ascii")
+        result = pf.check_credential_encryption(
+            SimpleNamespace(provider_credentials_encryption_key=key)
+        )
+        self.assertEqual(result.level, "PASS")
+        self.assertNotIn(key, result.detail)
+        invalid = pf.check_credential_encryption(
+            SimpleNamespace(provider_credentials_encryption_key="not-a-key")
+        )
+        self.assertEqual(invalid.level, "FAIL")
+        self.assertNotIn("not-a-key", invalid.detail)
+
+    def test_receipts_must_live_in_private_non_web_directory(self):
+        from scripts import cpanel_preflight as pf
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = pf.check_private_receipt_directory(Path(tmp) / "receipts")
+            self.assertEqual(result.level, "PASS")
+            self.assertEqual((Path(tmp) / "receipts").stat().st_mode & 0o777, 0o700)
+            self.assertEqual(
+                pf.check_private_receipt_directory(Path(tmp) / "public_html" / "receipts").level,
+                "FAIL",
+            )
+
     def test_unreachable_telegram_is_a_failure(self):
         from scripts import cpanel_preflight as pf
 

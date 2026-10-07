@@ -25,7 +25,7 @@ import zipfile
 from dataclasses import replace
 from pathlib import Path
 
-from gamas_bot.docx_export import DocumentMeta, build_notes_docx
+from gamas_bot.docx_export import DocumentMeta, build_notes_docx, resolve_design
 from gamas_bot.qa import run_note_qa
 from gamas_bot.structuring import merge_structured_notes, parse_structured_notes, split_transcript
 
@@ -188,7 +188,7 @@ class PipelineBenchmarkTests(unittest.TestCase):
         for entry in ENTRIES:
             with self.subTest(fixture=entry["id"]):
                 notes = load_reference(entry)
-                text = docx_text(build_notes_docx(notes, meta=META))
+                text = docx_text(build_notes_docx(notes, meta=META, design=resolve_design({"toc_enabled": False})))
                 self.assertIn(notes.title, text)
                 self.assertIn(notes.summary, text)
                 self.assertGreater(len(text), 400)
@@ -196,7 +196,7 @@ class PipelineBenchmarkTests(unittest.TestCase):
     def test_mixed_script_documents_keep_both_directions(self):
         entry = next(e for e in ENTRIES if e["kind"] == "medical")
         notes = load_reference(entry)
-        data = build_notes_docx(notes, meta=META)
+        data = build_notes_docx(notes, meta=META, design=resolve_design({"toc_enabled": False}))
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             body = archive.read("word/document.xml").decode("utf-8")
         self.assertIn("<w:rtl/>", body)

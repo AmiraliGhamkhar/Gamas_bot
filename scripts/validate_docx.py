@@ -247,6 +247,8 @@ def _render_status(out_dir: Path, sample: Path) -> str:
             lines.append("no layout warnings (no blank page, no overflow, no orphan heading)")
         lines.append("Inspect the page images by eye; a renderer cannot judge content.")
         return "\n".join(lines)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pdf_destination = out_dir / sample.with_suffix(".pdf").name
     with tempfile.TemporaryDirectory() as work:
         try:
             subprocess.run(
@@ -257,11 +259,16 @@ def _render_status(out_dir: Path, sample: Path) -> str:
             )
         except Exception as exc:  # pragma: no cover - environment dependent
             return f"ATTEMPTED BUT FAILED - {type(exc).__name__}: {exc}"
-    produced = list(out_dir.glob("*.pdf")) or list(Path(work).glob("*.pdf"))
+        rendered_pdf = Path(work) / sample.with_suffix(".pdf").name
+        if not rendered_pdf.is_file():
+            return f"ATTEMPTED BUT FAILED - {soffice} produced no PDF."
+        try:
+            shutil.copy2(rendered_pdf, pdf_destination)
+        except OSError as exc:
+            return f"ATTEMPTED BUT FAILED - could not save rendered PDF ({type(exc).__name__})."
     return (
-        f"rendered with {soffice}"
-        + (f" -> {produced[0]}" if produced else " (no pdf found)")
-        + ". Inspect the pages by eye; this script cannot judge layout."
+        f"rendered with {soffice} -> {pdf_destination}. "
+        "Inspect the pages by eye; this script cannot judge layout."
     )
 
 

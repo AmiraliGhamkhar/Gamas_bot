@@ -31,7 +31,7 @@ MIN_FREE_BYTES = 3 * 1024**3
 TELEGRAM_PROBES = (("149.154.167.51", 443), ("149.154.175.53", 443))
 REQUIRED_PACKAGES = (
     "Telethon", "aiohttp", "aiosqlite", "python-dotenv", "python-pptx",
-    "lxml", "av", "ppt2pptx", "python-docx",
+    "lxml", "av", "ppt2pptx", "python-docx", "cryptography", "pypdf",
 )
 
 
@@ -89,6 +89,86 @@ def check_packages() -> list[Result]:
     except ImportError:
         results.append(Result("WARN", "package python-socks", "needed only when TELEGRAM_PROXY is set"))
     return results
+
+
+def check_docx_pagination(settings) -> Result:
+    """Check the renderer required to print real page numbers in a static TOC."""
+    if not settings.docx_toc_enabled:
+        return Result("PASS", "DOCX pagination renderer", "TOC disabled; no renderer required")
+    configured = settings.docx_pagination_renderer_bin
+    if configured:
+        renderer = Path(configured).expanduser()
+        if not renderer.is_file() or not os.access(renderer, os.X_OK):
+            return Result(
+                "FAIL", "DOCX pagination renderer",
+                "DOCX_PAGINATION_RENDERER_BIN is not an executable file; install LibreOffice "
+                "or point it to soffice.",
+            )
+        renderer_path = str(renderer)
+    else:
+        renderer_path = shutil.which("soffice") or shutil.which("libreoffice")
+        if not renderer_path:
+            return Result(
+                "FAIL", "DOCX pagination renderer",
+                "LibreOffice (soffice/libreoffice) is required for exact static-TOC page "
+                "mapping. Install it or set DOCX_TOC_ENABLED=false; no page numbers are guessed.",
+            )
+    try:
+        importlib.import_module("pypdf")
+    except ImportError:
+        return Result(
+            "FAIL", "DOCX pagination renderer",
+            "pypdf is required to map rendered TOC links to PDF pages; run pip install -r requirements.txt.",
+        )
+    return Result("PASS", "DOCX pagination renderer", renderer_path)
+
+
+def check_credential_encryption(settings) -> Result:
+    """Validate the environment-only Fernet key without ever printing it."""
+    key = settings.provider_credentials_encryption_key
+    if not key:
+        return Result(
+            "WARN", "Provider credential encryption",
+            "PROVIDER_CREDENTIALS_ENCRYPTION_KEY is unset; admin-managed database keys are disabled.",
+        )
+    try:
+        from cryptography.fernet import Fernet
+
+        Fernet(key.encode("ascii"))
+    except Exception:  # noqa: BLE001 - never disclose secret values
+        return Result(
+            "FAIL", "Provider credential encryption",
+            "PROVIDER_CREDENTIALS_ENCRYPTION_KEY is not a valid Fernet key; generate one with the documented command.",
+        )
+    return Result("PASS", "Provider credential encryption", "valid environment-only key configured")
+
+
+def check_private_receipt_directory(directory: Path) -> Result:
+    """Ensure receipt files cannot be served from a web root or read by others."""
+    path = directory.resolve()
+    web_roots = {"public_html", "www", "htdocs", "httpdocs"}
+    if any(part.lower() in web_roots for part in path.parts):
+        return Result(
+            "FAIL", "Private receipt directory",
+            f"{path} is inside a web document root; choose a private path outside it.",
+        )
+    try:
+        path.mkdir(parents=True, exist_ok=True, mode=0o700)
+        path.chmod(0o700)
+        probe = path / ".preflight-private-test"
+        descriptor = os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(descriptor)
+        file_mode = probe.stat().st_mode & 0o777
+        probe.unlink()
+        directory_mode = path.stat().st_mode & 0o777
+        if directory_mode != 0o700 or file_mode != 0o600:
+            return Result(
+                "FAIL", "Private receipt directory",
+                "the filesystem did not enforce owner-only directory/file permissions.",
+            )
+    except OSError as exc:
+        return Result("FAIL", "Private receipt directory", f"{path} is not securely writable: {exc}")
+    return Result("PASS", "Private receipt directory", f"{path} (directory 700, files 600)")
 
 
 def check_location(root: Path = ROOT) -> Result:
@@ -168,6 +248,8 @@ def check_settings() -> tuple[list[Result], object | None]:
             )
         )
     results.extend(check_stt_queue(settings))
+    results.append(check_docx_pagination(settings))
+    results.append(check_credential_encryption(settings))
     return results, settings
 
 
@@ -276,6 +358,7 @@ def run_all(*, network: bool = True) -> list[Result]:
     if settings is not None:
         results.append(check_directory("Data directory", settings.session_path.parent))
         results.append(check_directory("Temp directory", settings.temp_dir))
+        results.append(check_private_receipt_directory(settings.receipt_dir))
         results.append(check_lock_support(settings.session_path.parent))
     if network:
         results += check_network(settings)

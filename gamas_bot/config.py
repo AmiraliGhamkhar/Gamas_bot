@@ -5,7 +5,7 @@ import logging
 import math
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -14,6 +14,13 @@ from dotenv import load_dotenv
 logger = logging.getLogger(__name__)
 
 TRUTHY = {"1", "true", "yes", "on"}
+
+# Canonical card-to-card payment destination. Environment settings may override
+# these values for an operator-managed account, but the bot/UI never hard-code
+# payment details elsewhere.
+CANONICAL_PAYMENT_CARD = "5022291332906625"
+CANONICAL_PAYMENT_CARD_HOLDER = "امیرعلی غمخوار"
+CANONICAL_PAYMENT_BANK = "بانک پاسارگاد"
 
 # Note-generation compression modes. ``full`` (the default) preserves detail;
 # only ``summary`` intentionally compresses. Defined here so the environment
@@ -240,9 +247,9 @@ def parse_proxy(value: str) -> tuple:
 
 @dataclass(frozen=True, slots=True)
 class Settings:
-    telegram_bot_token: str
+    telegram_bot_token: str = field(repr=False)
     telegram_api_id: int
-    telegram_api_hash: str
+    telegram_api_hash: str = field(repr=False)
     admin_ids: frozenset[int]
     database_path: Path
     session_path: Path
@@ -252,11 +259,11 @@ class Settings:
     stt_language: str
     stt_fallback_enabled: bool
     stt_min_confidence: float
-    speechmatics_api_key: str | None
+    speechmatics_api_key: str | None = field(repr=False)
     speechmatics_base_url: str
-    deepgram_api_key: str | None
+    deepgram_api_key: str | None = field(repr=False)
     deepgram_model: str
-    gemini_api_key: str | None
+    gemini_api_key: str | None = field(repr=False)
     gemini_model: str
     max_concurrent_jobs: int
     stt_poll_interval: float
@@ -292,17 +299,17 @@ class Settings:
     # routed to another configured engine instead of being chunked, because
     # splitting audio would hurt boundary accuracy.
     stt_openai_base_url: str | None = None
-    stt_openai_api_key: str | None = None
+    stt_openai_api_key: str | None = field(default=None, repr=False)
     stt_openai_model: str = "whisper-1"
     stt_openai_max_upload: int = 25_000_000
     # The historical Gemini fields remain for backwards compatibility.  New
     # installations can select Gemini, Anthropic, or any OpenAI-compatible API
     # through the provider-neutral NOTE_API_* settings below.
     note_api_provider: str = "gemini"
-    note_api_key: str | None = None
+    note_api_key: str | None = field(default=None, repr=False)
     note_api_base_url: str | None = None
     note_api_model: str | None = None
-    note_api_extra_headers: tuple[tuple[str, str], ...] = ()
+    note_api_extra_headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
     note_api_timeout: int = 240
     note_api_retries: int = 2
     note_api_max_output_tokens: int = 8192
@@ -337,7 +344,7 @@ class Settings:
     # --- Word document design (cover / TOC / page frame / footer brand) ---
     docx_cover_enabled: bool = True
     docx_toc_enabled: bool = True
-    #: Heading levels in the automatic table of contents ("1-1" = topics only).
+    #: Heading levels in the static table of contents ("1-1" = topics only).
     docx_toc_levels: str = "1-1"
     #: Section count from which a document earns a table of contents.
     docx_toc_min_sections: int = 4
@@ -375,7 +382,18 @@ class Settings:
     log_backup_count: int = 5
     # Optional Telethon proxy tuple (type, host, port, rdns, user, password)
     # for hosts that cannot reach Telegram's MTProto servers directly.
-    telegram_proxy: tuple | None = None
+    telegram_proxy: tuple | None = field(default=None, repr=False)
+    payment_card_number: str = CANONICAL_PAYMENT_CARD
+    payment_card_holder: str = CANONICAL_PAYMENT_CARD_HOLDER
+    payment_bank_name: str = CANONICAL_PAYMENT_BANK
+    receipt_dir: Path = Path("data/receipts")
+    receipt_retention_days: int = 90
+    max_receipt_size_bytes: int = 5_000_000
+    # Fernet key is environment-only; database rows contain ciphertext only.
+    provider_credentials_encryption_key: str | None = field(default=None, repr=False)
+    # Exact TOC pagination uses LibreOffice + pypdf; no guessed fallback exists.
+    docx_pagination_timeout_seconds: int = 120
+    docx_pagination_renderer_bin: str | None = None
 
     @property
     def lock_path(self) -> Path:
@@ -434,7 +452,17 @@ class Settings:
             "border_space": self.docx_page_border_space,
             "footer_brand": self.docx_show_footer_brand,
             "logo_path": self.docx_logo_path,
+            "pagination_timeout_seconds": self.docx_pagination_timeout_seconds,
+            "pagination_renderer_bin": self.docx_pagination_renderer_bin,
         }
+
+    @property
+    def payment_card_display(self) -> str:
+        """Grouped presentation-only form of the normalized card number."""
+        return " ".join(
+            self.payment_card_number[index:index + 4]
+            for index in range(0, len(self.payment_card_number), 4)
+        )
 
     @property
     def effective_note_api_key(self) -> str | None:
@@ -575,8 +603,17 @@ class Settings:
             )
             retry_base_delay = float(_text("STT_RETRY_BASE_DELAY_SECONDS", "2"))
             retry_max_delay = float(_text("STT_RETRY_MAX_DELAY_SECONDS", "30"))
+            receipt_retention_days = int(_text("RECEIPT_RETENTION_DAYS", "90"))
+            max_receipt_size = int(_text("MAX_PAYMENT_RECEIPT_BYTES", "5000000"))
+            docx_pagination_timeout = int(_text("DOCX_PAGINATION_TIMEOUT_SECONDS", "120"))
         except ValueError as exc:
             raise ValueError("مقادیر عددی تنظیمات محیط معتبر نیستند.") from exc
+        raw_card = _text("PAYMENT_CARD_NUMBER", CANONICAL_PAYMENT_CARD)
+        if not re.fullmatch(r"[0-9][0-9 -]*", raw_card):
+            raise ValueError("PAYMENT_CARD_NUMBER باید فقط شامل رقم، فاصله یا خط تیره باشد.")
+        payment_card_number = re.sub(r"[ -]", "", raw_card)
+        if len(payment_card_number) != 16:
+            raise ValueError("PAYMENT_CARD_NUMBER باید دقیقاً ۱۶ رقم داشته باشد.")
         if not all(math.isfinite(value) for value in (min_confidence, poll_interval)):
             raise ValueError("مقادیر اعشاری STT باید عدد متناهی باشند.")
         if not 0 <= min_confidence <= 1:
@@ -603,6 +640,11 @@ class Settings:
             raise ValueError("NOTE_API_RETRIES باید بین صفر تا ۱۰ باشد.")
         if stt_openai_max <= 0:
             raise ValueError("STT_OPENAI_MAX_UPLOAD_BYTES باید مثبت باشد.")
+        if min(
+            max_receipt_size,
+            docx_pagination_timeout,
+        ) <= 0 or receipt_retention_days < 0:
+            raise ValueError("تنظیمات طرح‌های اعتبار، رسید یا صفحه‌بندی باید معتبر باشند.")
         if log_max_bytes <= 0 or log_backup_count < 0:
             raise ValueError("تنظیمات چرخش فایل لاگ معتبر نیستند.")
         log_level = _text("LOG_LEVEL", "INFO").upper()
@@ -767,6 +809,21 @@ class Settings:
             log_max_bytes=log_max_bytes,
             log_backup_count=log_backup_count,
             telegram_proxy=telegram_proxy,
+            payment_card_number=payment_card_number,
+            payment_card_holder=_text(
+                "PAYMENT_CARD_HOLDER", CANONICAL_PAYMENT_CARD_HOLDER
+            ),
+            payment_bank_name=_text("PAYMENT_BANK_NAME", CANONICAL_PAYMENT_BANK),
+            receipt_dir=_path("RECEIPT_DIR", "data/receipts"),
+            receipt_retention_days=receipt_retention_days,
+            max_receipt_size_bytes=max_receipt_size,
+            provider_credentials_encryption_key=(
+                os.getenv("PROVIDER_CREDENTIALS_ENCRYPTION_KEY", "").strip() or None
+            ),
+            docx_pagination_timeout_seconds=docx_pagination_timeout,
+            docx_pagination_renderer_bin=(
+                _text("DOCX_PAGINATION_RENDERER_BIN", "").strip() or None
+            ),
         )
 
     def validate_runtime(self) -> None:
@@ -783,6 +840,7 @@ class Settings:
             not self.speechmatics_api_key
             and not self.deepgram_api_key
             and not self.stt_openai_base_url
+            and not self.provider_credentials_encryption_key
         ):
             raise ValueError(
                 "حداقل یکی از SPEECHMATICS_API_KEY، DEEPGRAM_API_KEY یا STT_OPENAI_BASE_URL لازم است."

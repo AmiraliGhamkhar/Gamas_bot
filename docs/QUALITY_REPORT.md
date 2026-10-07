@@ -7,6 +7,18 @@ booklet; no model provider credentials were available in this environment, so
 the two *model* passes are bounded by their deterministic acceptance gates
 rather than scored live.
 
+> **Historical report.** The findings and measurements below describe the earlier
+> note-quality/DOCX revision on branch `arena/01a10267-gamas-bot`; they are not
+> a statement of the current production state. Since that audit, the dynamic Word
+> TOC was replaced by a static ordinary-text TOC with PDF-destination mapping,
+> unique bookmarks and fail-closed pagination; billing, private receipt review,
+> provider-key encryption and their migrations/tests were also added. The current
+> operational requirements are in [`README.md`](../README.md) and
+> [`DEPLOY_CPANEL.md`](DEPLOY_CPANEL.md). LibreOffice is not installed in the
+> present validation environment, so real Word/LibreOffice page mapping and
+> visual DOCX validation remain unverified; mocked page-map tests do not prove
+> real pagination.
+
 ---
 
 ## A. Root causes found in the audit
