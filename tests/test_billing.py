@@ -7,6 +7,7 @@ import sqlite3
 import stat
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gamas_bot.billing import (
@@ -422,6 +423,113 @@ class BillingDatabaseTests(unittest.IsolatedAsyncioTestCase):
         ledger = await self.db.usage_ledger(int(user["id"]))
         self.assertTrue(any(row["event_type"] == "denied" for row in ledger))
         self.assertEqual((await self.db.user_balance(int(user["id"]))) ["available_seconds"], FREE_PLAN_SECONDS)
+
+    async def test_paid_entitlement_expires_exactly_after_the_plan_validity(self):
+        """A paid entitlement expires starts_at + validity_days (30 days)."""
+        user = await self._new_user()
+        for plan_code, seconds in (("paid_25h_30d", PLAN_25_SECONDS), ("paid_50h_30d", PLAN_50_SECONDS)):
+            with self.subTest(plan_code=plan_code):
+                request = await self._request_with_receipt(int(user["id"]), plan_code)
+                approval = await self.db.approve_payment(int(request["id"]), admin_id=700)
+                self.assertIsNotNone(approval)
+                self.assertEqual(approval["granted_seconds"], seconds)
+                entitlement = next(
+                    row
+                    for row in (await self.db.user_balance(int(user["id"])))["entitlements"]
+                    if row["source"] == "payment" and row["plan_code"] == plan_code
+                )
+                starts = datetime.fromisoformat(entitlement["starts_at"])
+                expires = datetime.fromisoformat(entitlement["expires_at"])
+                self.assertEqual(expires - starts, timedelta(days=30))
+                self.assertEqual(
+                    expires.astimezone(timezone.utc).date(),
+                    (starts.astimezone(timezone.utc) + timedelta(days=30)).date(),
+                )
+
+    async def test_approved_payment_creates_exactly_one_entitlement(self):
+        """One approval grants exactly one entitlement, even when clicked twice."""
+        user = await self._new_user()
+        request = await self._request_with_receipt(int(user["id"]), "paid_25h_30d")
+        payment_id = int(request["id"])
+        self.assertIsNotNone(await self.db.approve_payment(payment_id, admin_id=700))
+        # A concurrent/stale second approval is refused and grants nothing.
+        self.assertIsNone(await self.db.approve_payment(payment_id, admin_id=701))
+        cursor = await self.db._db().execute(
+            "SELECT COUNT(*) FROM entitlements WHERE payment_id=?", (payment_id,)
+        )
+        self.assertEqual((await cursor.fetchone())[0], 1)
+        cursor = await self.db._db().execute(
+            "SELECT COUNT(*) FROM usage_ledger WHERE event_type='grant' AND reason LIKE ?",
+            (f"Approved payment {payment_id}%",),
+        )
+        self.assertEqual((await cursor.fetchone())[0], 1)
+        balance = await self.db.user_balance(int(user["id"]))
+        self.assertEqual(balance["available_seconds"], FREE_PLAN_SECONDS + PLAN_25_SECONDS)
+
+    async def test_cancelled_job_releases_the_full_reservation(self):
+        """A cancelled job returns every reserved second exactly once."""
+        user = await self._new_user()
+        submission = await self.db.create_submission(
+            int(user["id"]), "cancel", 900, "c.wav", "audio/wav"
+        )
+        reservation = await self.db.reserve_usage(int(user["id"]), submission, 900)
+        self.assertTrue(reservation["ok"])
+        self.assertEqual(
+            (await self.db.user_balance(int(user["id"])))["available_seconds"],
+            FREE_PLAN_SECONDS - 900,
+        )
+        released = await self.db.release_usage(submission, "لغو شد توسط کاربر")
+        self.assertEqual(released, 900)
+        record = await self.db.usage_reservation(submission)
+        self.assertEqual(record["status"], "released")
+        self.assertEqual(record["released_seconds"], 900)
+        self.assertEqual(record["consumed_seconds"], 0)
+        # Cancelling twice must not pay the user twice.
+        self.assertEqual(await self.db.release_usage(submission, "تکرار لغو"), 0)
+        self.assertEqual(
+            (await self.db.user_balance(int(user["id"])))["available_seconds"],
+            FREE_PLAN_SECONDS,
+        )
+        ledger = await self.db.usage_ledger(int(user["id"]))
+        releases = [row for row in ledger if row["event_type"] == "release"]
+        self.assertEqual(len(releases), 1)
+        self.assertEqual(releases[0]["released_seconds"], 900)
+
+    async def test_duplicate_reservation_is_impossible(self):
+        """Re-reserving the same submission never charges the user twice."""
+        user = await self._new_user()
+        submission = await self.db.create_submission(
+            int(user["id"]), "dup", 1_000, "d.wav", "audio/wav"
+        )
+        first = await self.db.reserve_usage(int(user["id"]), submission, 1_000)
+        self.assertTrue(first["ok"])
+        self.assertFalse(first["existing"])
+        # A retry of the same job with the same duration is idempotent.
+        retry = await self.db.reserve_usage(int(user["id"]), submission, 1_000)
+        self.assertTrue(retry["ok"])
+        self.assertTrue(retry["existing"])
+        self.assertEqual(retry["reservation_id"], first["reservation_id"])
+        self.assertEqual(
+            (await self.db.user_balance(int(user["id"])))["available_seconds"],
+            FREE_PLAN_SECONDS - 1_000,
+        )
+        # A different duration on the same submission is refused, not re-charged.
+        conflicting = await self.db.reserve_usage(int(user["id"]), submission, 2_000)
+        self.assertFalse(conflicting["ok"])
+        self.assertEqual(conflicting["reason"], "already_finalized")
+        self.assertEqual(
+            (await self.db.user_balance(int(user["id"])))["available_seconds"],
+            FREE_PLAN_SECONDS - 1_000,
+        )
+        cursor = await self.db._db().execute(
+            "SELECT COUNT(*) FROM usage_reservations WHERE submission_id=?", (submission,)
+        )
+        self.assertEqual((await cursor.fetchone())[0], 1)
+        cursor = await self.db._db().execute(
+            "SELECT COUNT(*) FROM usage_ledger WHERE event_type='reserve' AND submission_id=?",
+            (submission,),
+        )
+        self.assertEqual((await cursor.fetchone())[0], 1)
 
     async def test_two_database_connections_cannot_reserve_the_same_credit_twice(self):
         user = await self._new_user()
