@@ -1,4 +1,20 @@
-# Repository review — 2026-10-01: note completeness, BiDi rendering and QA
+# Audit history (superseded)
+
+These reports were written while the billing, provider-security and RTL-DOCX
+work landed. They are kept for traceability — the reasoning behind decisions
+that are still visible in the code — but they are **historical**: individual
+claims, scores and file inventories in them may no longer match the current
+implementation. The current architecture, configuration and behaviour are
+described in `ARCHITECTURE.md`, `CONFIGURATION.md` and the other canonical
+pages indexed in `docs/README.md`, and are enforced by the test suite rather
+than by prose.
+
+Where a historical report contradicts the code, the code and its tests win.
+
+
+---
+
+## Deep audit (2026-09) (`AUDIT.md`, removed)
 
 ## Scope and result
 
@@ -838,3 +854,840 @@ New regression tests: chunk coverage judged on the signals a chunk carries
 prefixed font keys (`test_note_quality.py`), and paragraph base direction for
 Latin-only vs. Persian paragraphs and for a paragraph filled after creation
 (`test_mixed_script_typography.py`).
+
+---
+
+## Quality report (2026-09) (`QUALITY_REPORT.md`, removed)
+
+Second audit round on `AmiraliGhamkhar/Gamas_bot`. Baseline commit `39cfdc5`,
+branch `arena/01a10267-gamas-bot`. Everything below was measured on the local
+repository (deterministic, provider-free) plus visual inspection of a rendered
+booklet; no model provider credentials were available in this environment, so
+the two *model* passes are bounded by their deterministic acceptance gates
+rather than scored live.
+
+> **Historical report.** The findings and measurements below describe the earlier
+> note-quality/DOCX revision on branch `arena/01a10267-gamas-bot`; they are not
+> a statement of the current production state. Since that audit, the dynamic Word
+> TOC was replaced by a static ordinary-text TOC with PDF-destination mapping,
+> unique bookmarks and fail-closed pagination; billing, private receipt review,
+> provider-key encryption and their migrations/tests were also added. The current
+> operational requirements are in [`README.md`](../README.md) and
+> [`DEPLOY_CPANEL.md`](DEPLOY_CPANEL.md). LibreOffice is not installed in the
+> present validation environment, so real Word/LibreOffice page mapping and
+> visual DOCX validation remain unverified; mocked page-map tests do not prove
+> real pagination.
+
+---
+
+## A. Root causes found in the audit
+
+1. **A part did not know what it was about.** `build_context_block` told a chunk
+   its position and the lecture's topic list, but never which topic *that part*
+   owns. Every chunk therefore introduced itself as a summary of the whole
+   lecture, and the merge had to repair that afterwards.
+2. **A part did not know how it sat in the lecture.** Nothing distinguished a
+   part that opens mid-topic (so it must link, not introduce) from one that
+   starts a topic; nothing distinguished a part that ends mid-explanation from
+   one that finishes a subject. The prompt's advice was therefore generic.
+3. **One oversized final pass was skipped.** The single global editorial pass —
+   the only step that produces a coherent document out of per-part drafts — was
+   *skipped* whenever the merged notes exceeded `COMPILE_MAX_CHARS`. The longest
+   lecture, exactly the one that needs it, was delivered as the raw merge.
+4. **The repair pass could silently rewrite good parts.** Acceptance was decided
+   on the merged document's averages, so a repair that fixed one part and
+   damaged another was accepted; and `_repair_is_better` compared the *values*
+   of the missing-number tuple element-wise, rejecting correct repairs whose new
+   missing values sorted higher.
+5. **The orientation digest silently dropped the tail of a long lecture.** A
+   fixed per-part slice plus a whole-document truncation meant the last parts —
+   whose topics the digest exists to provide — were cut off, and the positional
+   topic map then mismatched the parts.
+6. **Quality diagnostics were blind to whole-explanation loss and to structure.**
+   Number/term coverage caught dosage corruption but not a deleted explanation;
+   there was no measure of untitled sections, abrupt section openings, split
+   topics or fragment-only prose.
+7. **The DOCX's navigation layer was either missing or unhelpful.** A TOC was
+   written for any document from three sections up — including short notes where
+   it costs a page — and with `\o "1-2"` it was dominated by block labels
+   («تعریف‌ها»، «مثال‌ها») that repeat in every section. Long documents that had
+   no headings at all could still earn an empty TOC page. The cover's metadata
+   was a single long `•`-joined line that wrapped and stranded the tracking
+   reference.
+
+## B. Files changed
+
+| file | change |
+| --- | --- |
+| `gamas_bot/editorial.py` | per-part topic ownership, continuity flags, budget-aware outline digest, segmented compile document, section-boundary slicing |
+| `gamas_bot/structuring.py` | multi-slice final compilation, per-part repair acceptance, missing-number comparison fix, context block without an outline |
+| `gamas_bot/qa.py` | untitled-section and abrupt-opening diagnostics (content-free words, relation markers) |
+| `gamas_bot/docx_export.py` | TOC policy (levels + two-signal threshold), cover metadata lines, adaptive cover spacing, body-section helper, logo passthrough |
+| `gamas_bot/config.py` | `DOCX_TOC_LEVELS`, `DOCX_TOC_MIN_SECTIONS` |
+| `.env.example`, `README.md` | document the two new settings |
+| `scripts/benchmark_notes.py` | new structure fields, part-context probe, richer console summary |
+| `tests/test_global_compilation.py` | part-context, outline-digest, segmented-compilation and targeted-repair tests |
+| `tests/test_note_quality.py` | coherency-diagnostic tests |
+| `tests/test_docx_polish.py` | TOC levels/threshold, cover metadata/spacing, raw-text TOC tests |
+| `tests/test_fidelity_upgrade.py` | every documented `DOCX_*` switch reaches the design object |
+
+## C. Architectural changes (smallest change that fixes the root cause)
+
+**Per-part topic ownership.** `LectureContext.topic_for(index, total)` maps the
+outline's positional topic list onto a part — and returns `""` when the list
+length does not match the part count, because a global topic list used
+positionally would label a part with someone else's subject. `build_context_block`
+now states «موضوع همین بخش» and `CHUNKED_CONTENT_RULES` says that line is this
+part's responsibility; parts no longer repeat their neighbours' subjects.
+
+**Continuity flags without an extra model call.** `chunk_continuity()` derives two
+facts from the part's own text: it opens mid-topic (first line is a continuation
+fragment: «و …»، «بنابراین …») and it ends mid-topic (no sentence terminator).
+Both flags are suppressed for punctuation-free material (raw STT), where they
+would fire on every part and become noise. The context block turns each flag
+into one linking instruction. No overlap was introduced: the merge and the
+context block proved sufficient.
+
+**Budget-aware outline digest.** `build_outline_document` now lowers the per-part
+slice as the part count grows, keeps the total inside the budget whenever the
+floor allows, and drops only the optional tails — never a part — if the digest
+would still overflow. The orientation answer therefore always covers every part
+positionally.
+
+**Segmented final compilation.** `split_for_compilation()` cuts the merged notes
+at section boundaries into consecutive slices that each fit one request
+(`COMPILE_MAX_CHARS` minus the measured system prompt and a reserved overhead).
+`build_compile_document(..., part=, parts=)` tells each slice it is a slice, so a
+slice writes the summary, key points and glossary for *its own* sections instead
+of a whole-lecture summary from a fragment. Each slice is accepted on its own
+deterministic QA gate; accepted slices are merged with the existing conservative
+merge, which unions summaries, key points, glossary, objectives and questions and
+keeps the lecture's order. The slice count is bounded (`COMPILE_MAX_SLICES = 6`);
+beyond it the merged notes are delivered unchanged, exactly as before.
+
+**Targeted repair.** `_choose_repaired_draft()` judges every repaired part against
+its own draft, with the same ordering as the document gate and "no measurable
+improvement → keep what exists" ties. A repair that fixes one part can no longer
+overwrite a part that was already right.
+
+**Diagnostics that detect but never rewrite.** `qa.py` now counts untitled
+sections (placeholder headings like «بخش ۲») and abrupt section openings: a
+non-first section that neither opens with a relation marker
+(چون/بنابراین/اما/برای مثال/…) nor shares a content word with the previous
+section's body. Word matching strips ZWNJ and uses a Unicode letter tokenizer, so
+Persian is measured correctly.
+
+## D. DOCX improvements
+
+* **TOC policy with two independent signals.** A TOC is written when the document
+  has enough peer sections *or* enough body text
+  (`TOC_MIN_SECTIONS = 4`, `TOC_MIN_BODY_CHARS = 2400`), and never when the notes
+  path has no sections — and never for a raw-text document with fewer than two
+  Markdown headings, which would have rendered an empty TOC page. Default
+  `\o "1-1"`: block labels are real Heading 2s that repeat in every section, so a
+  `1-2` TOC buried the lecture's own topics. `DOCX_TOC_LEVELS` (validated against
+  `1`, `1-1`, `1-2`, `1-3`) and `DOCX_TOC_MIN_SECTIONS` expose both.
+* **Cover metadata as labelled lines.** `cover_meta_lines()` splits the date,
+  source, engine and tracking reference into two or three short self-contained
+  lines, so every label stays next to its value; the raw-text companion file
+  keeps the single-line form.
+* **Adaptive cover balance.** The flexible gap above the quotation now shrinks by
+  one line for each extra title line (`_wrap_estimate`) and for a longer metadata
+  block, bounded at five lines, so the quotation keeps its place on the page for
+  any job metadata.
+* **One body-section helper.** `_add_body_section()` creates the A4 body section
+  and applies the section-level `w:pgBorders`; `build_notes_docx`,
+  `build_plain_docx` and the cover-less title block all use it, and a configured
+  local logo now also appears in the cover-less document.
+
+Unchanged by design: real Word `PAGE` field footer, subtle running header, real
+Heading 1–3 styles, the directional-run (RTL/LTR) strategy, table header
+repetition, keep-with-next headings, no remote assets, no dynamic font download,
+no failure on a missing logo.
+
+## E. Prompt and quality improvements
+
+* The chunk prompt now names the part's own topic and marks it as that part's
+  responsibility, and — through the context block — says whether the part starts
+  mid-topic or ends unfinished, with the linking instruction for each case.
+* `CHUNKED_CONTENT_RULES` states that the outline topics are a map, not text to
+  rewrite, and that a part must not repeat its neighbours' subjects.
+* The compilation instruction now covers slices coherently (summary/key points
+  scoped to the slice, glossary optional) and keeps the "no content deletion,
+  only verbatim duplicate repetition" contract intact.
+* Full-mode prompt measured at 6 256 characters with preservation, no-invention,
+  number protection and transition-keeping all present, and no compression ask.
+
+## F. Tests executed and results
+
+```
+BEFORE  python -m unittest discover -s tests     ->  Ran 471 tests in 24.275s   OK
+AFTER   python -m unittest discover -s tests -v  ->  Ran 488 tests in 25.613s   OK
+```
+
+New coverage: part context states the part's own topic and ignores a mis-sized
+topic list; the outline digest labels every part under a tight budget; an
+oversized booklet is compiled in labelled slices and too many slices fall back to
+the merge; a damaged repair slice never replaces its own draft; untitled and
+abrupt sections are reported (and a linked section is not); TOC levels and
+threshold are configurable; the cover's metadata is split into labelled lines and
+its quotation keeps its place with a long title; a raw-text document gets a TOC
+only when it has headings; every documented `DOCX_*` switch reaches the design.
+
+Visual validation (mandatory, and repeated after the last edit):
+
+```
+PYTHONPATH=. python out/mkbooklet.py            # 31 fixture sections -> 50 901 B DOCX
+python -m scripts.render_docx_pages out/booklet_after.docx \
+       --out out/pages_final --json out/facts_final.json
+-> pages=13 sections=2 warnings=0, ok=true, page 826x1169 px
+```
+
+All 13 pages were inspected (cover, TOC, 11 body pages): «به نام خدا»، GAMAS /
+Gamas Bot, title, mode, date/source/engine/tracking lines, the verbatim quotation
+panel; running header «Gamas Bot — جزوه درسی | …», footer «Gamas Bot — صفحه n»
+(cover unnumbered, body restarts at ۱), section-level page frame on every page,
+sections ۱…۳۱ with shaded key-point panels, ◆ definition lists, warning/tip
+callouts, formulas, numbered steps and tables whose shaded header row repeats on
+the continuation pages; Latin terms inside Persian sentences stay LTR-correct
+(`HbA1c`, `eGFR`, `SELECT`, `O(n log n)`); no blank page, no clipping, no orphan
+heading, no bottom-margin overflow.
+
+## G. Benchmark — BEFORE vs AFTER (deterministic, provider-free)
+
+| measure | BEFORE (`39cfdc5`) | AFTER |
+| --- | --- | --- |
+| unit tests | 471 pass | **488 pass** |
+| full-mode prompt chars | 6 256 | 6 256 (preservation/no-invention true) |
+| fixture compression / signal / semantic | 1.007 / 1.0 / 1.0 | 1.007 / 1.0 / 1.0 |
+| fixtures needing repair | 0 | 0 |
+| merge probe (60 → 30 sections, 128 blocks) | 0.0 duplicate rate | 0.0 duplicate rate |
+| continuation probe joins | 3/3 correct | 3/3 correct, 0 wrong, 0 prose losses |
+| long lecture (61 660 chars) | 3 chunks, 83 → 81 sections, 0 split topics | 3 chunks, 83 → 81 sections, 0 split topics, 0 duplicate blocks |
+| long-document DOCX facts | cover, TOC, PAGE field, page borders, Heading 1–3 | same, TOC now `1-1` |
+| document structure diagnostics | not measured | 30 sections, 0 split topics, 0 untitled, 0 duplicate paragraphs, 1 repeated heading, 2 abrupt openings (real: two fixtures share «جمع‌بندی») |
+| part context (new) | not measured | own topic known, context 526 chars, continuation/unfinished hints emitted, silent on punctuation-free STT |
+| renderer | 11 pages, 0 warnings | 13 pages, 0 warnings, every page inspected |
+
+A shorter document is not treated as an improvement anywhere: compression is read
+together with semantic and signal coverage, and the booklet is longer than the
+earlier one because the segmented compilation now always runs.
+
+## H. Remaining limitations
+
+* The two *model* passes (orientation, compilation) cannot be scored live without
+  provider credentials; their downside is bounded by the deterministic
+  acceptance gates, but a readability gain from real output still needs a human
+  reviewer (`--human-out`).
+* Continuity flags depend on the punctuation the STT engine produced; on
+  punctuation-free transcripts they stay silent by design rather than guessing a
+  boundary.
+* The compile slice count is bounded (6). A pathological booklet above that bound
+  is delivered as the deterministic merge, which is the previous behaviour, not a
+  regression.
+* The offline renderer does not evaluate Word fields, so the TOC page renders as
+  the heading plus the update hint; the real `TOC \o` field is asserted on the
+  document XML instead.
+* `Sections that open without a link to the previous one` can fire on a genuinely
+  new subject; it is a diagnostic only, never a repair trigger.
+
+## I. Changes intentionally NOT made
+
+* **No automatic chunk overlap.** The global context (topic, neighbours, previous
+  headings, continuity flags) plus the merge and the compilation were sufficient;
+  overlap would duplicate boundary material into the merge.
+* **No vector store, embeddings, RAG or agent framework**, no new provider, no new
+  dependency.
+* **No destructive QA filters.** The new diagnostics detect; only strong evidence
+  of information loss (coverage) or a measurable structural defect (acceptance
+  gates) can trigger a targeted repair.
+* **No full regeneration on repair**, and no second rewrite pass: the repair is
+  still one optional pass, now judged part by part.
+* **No schema expansion** beyond what the renderer consumes: `learning_objectives`
+  and `review_questions` already existed and remain the only optional fields.
+* **No change to Telegram, STT, media, database or deployment code** — the audit
+  confirmed the delivery path builds `DocumentMeta` and falls back to a plain
+  document on any renderer failure, which is the required behaviour.
+
+---
+
+## Production report (2026-09) (`PRODUCTION_REPORT.md`, removed)
+
+Branch `arena/59eaae07-gamas-bot`, based on `main` (`cea2e61`). Every statement
+below is either **verified** with a command run in this environment, or marked
+**not verified** with the reason. Nothing here claims a rendered page number, a
+live provider health result or a bank verification that was not actually
+produced. The full-suite count quoted is the last run of this revision:
+
+```
+$ .venv/bin/python -m pytest tests/ -q
+673 passed, 1 skipped, 1620 subtests passed in 44.96s
+$ .venv/bin/ruff check gamas_bot scripts tests passenger_wsgi.py --select E9,F
+All checks passed!
+```
+
+---
+
+## 1. Exact plans, exactly as specified — **verified**
+
+One canonical catalogue in `gamas_bot/billing.py`, seeded into SQLite, read by
+every screen:
+
+| Plan code | Included time | Price | Validity |
+|---|---:|---:|---:|
+| `free_1h` | 3,600 s (1 hour) | free | lifetime, once per user, `/start` never renews |
+| `paid_25h_30d` | 90,000 s | 150,000 Toman | 30 days from approval |
+| `paid_50h_30d` | 180,000 s | 250,000 Toman | 30 days from approval |
+
+Paid entitlements are cumulative; consumption takes the entitlement that expires
+soonest first. Evidence: `tests/test_billing.py` (17 tests), including the
+legacy-code migration, restart idempotence, the configured-tariff seed, and the
+check that no handler hard-codes a price or the card number.
+
+## 2. Canonical card-to-card configuration in one place — **verified**
+
+`CANONICAL_PAYMENT_CARD = "5022291332906625"`, holder «امیرعلی غمخوار», bank
+«بانک پاسارگاد» live only in `gamas_bot/config.py`, are overridable from the
+environment, and are grouped by the single `format_payment_card()` helper
+(`5022 2913 3290 6625`). `tests/test_billing.py` asserts both the values and
+that `bot.py` contains none of them.
+
+## 3. True Persian RTL DOCX — **verified structurally, visually inspected offline**
+
+`docDefaults`/styles/paragraph marks/runs carry BiDi, Persian runs carry the
+complex-script slots (`w:cs` + `w:szCs` + `w:bCs`), Latin runs carry an explicit
+`w:rtl w:val="0"`, and mixed lines are ordered logically. `python -m
+scripts.validate_docx` reports 0 structural failures for both sample documents,
+including `rtl_paragraphs_present`, `ltr_runs_marked`,
+`complex_script_faces_set` and `element_ordering_valid`. Five real documents
+(Persian-only, Persian+English medical, 22 topics, numeric/unit-heavy,
+URLs/e-mail) were rendered with the repository's offline renderer and inspected
+by eye.
+
+## 4. Static table of contents with no F9 — **verified as structure; page numbers NOT validated as rendered**
+
+Page 1 is the cover, page 2 is the topic list, page 3+ are the notes. Verified by
+`tests/test_docx_layout_requirements.py` (9 tests): the heading paragraph, the
+borderless RTL two-column table, unique internal bookmarks shared with the body
+headings, one `w:hyperlink w:anchor` per row, Persian-digit page numbers, no
+`w:instrText`, no `TOC \o` field and no `updateFields` anywhere; the footer keeps
+a real `PAGE` field. `DOCX_TOC_LEVELS` defaults to `1-1`. Content-based heading
+matching, so long and duplicate titles are handled.
+
+**Not verified in this environment:** the numbers the offline renderer drew came
+from an injected page map (`_rendered_toc_page_numbers` was mocked), and the
+offline renderer is not Word or LibreOffice. Real rendered pagination, Word
+hyperlink navigation and PDF-destination mapping require LibreOffice + `pypdf`
+on the delivery host. When exact mapping is unavailable the DOCX is **not**
+delivered with guessed numbers — `DocxPaginationError` fails closed, and
+`tests/test_bot_presentation_flow.py` covers that path.
+
+## 5. Integer-second entitlement/usage-ledger architecture — **verified**
+
+`plans`, `entitlements` and `usage_ledger` tables with
+reserve → consume/release, all inside SQLite transactions; grants are
+idempotent, the balance can never go negative, and concurrent jobs cannot spend
+the same seconds. Evidence: `tests/test_billing.py`,
+`tests/test_regressions.py`, and the reservation-release tests in the
+presentation flow.
+
+## 6. Manual receipt + admin approve/reject — **verified; manual by design**
+
+`tests/test_payment_flow.py` (17 tests + 11 subtests) covers: a payment stays
+pending until a human decision; approval notifies the user once and is
+idempotent (a second approval grants nothing); rejection stores a sanitized
+reason and grants nothing; the receipt path is recorded with its `file_id`; the
+user can submit a new request afterwards; a second image while pending is
+refused with the request id instead of being queued as media.
+
+**Approval is a manual administrative decision by design.** The bot performs no
+bank, card or transfer verification and does not claim to. It displays the
+canonical card, stores the private receipt for a human to inspect, and records
+who decided and when. Receipts live outside the web root in `RECEIPT_DIR`
+(700/600), under server-generated names, and are deleted after
+`RECEIPT_RETENTION_DAYS` counted from review.
+
+## 7. Encrypted multi-key credentials with rotation rules — **verified**
+
+Keys are Fernet-encrypted in SQLite, masked everywhere (`••••••••1234`), with 429
+→ `Retry-After` cooldown + rotation, 401/403 → quarantine, 400/415/422 → no
+rotation, and bounded retries for 5xx/network failures. Evidence:
+`tests/test_provider_credentials.py` (14 tests + 3 subtests), including
+"secrets never reach the logs" and "all keys exhausted produces a clean,
+secret-free error".
+
+## 8. Administrator panels — **verified (rendered text and callbacks asserted)**
+
+| Panel | Entry point | Tests |
+|---|---|---|
+| 💳 پرداخت‌ها (payments) | `admin:payments`, `/payments` | payment listing/detail/approve/reject |
+| 🩺 وضعیت سرویس‌ها (health) | `admin:health`, `admin:health:refresh` | status text, cached badge, per-key test button |
+| 🔑 API Keys (credentials) | `admin:credentials` | add/enable/disable/delete/reorder/test, mask only |
+| ⏱ اعتبار کاربران (user credits) | `admin:credits`, `admin:credit:add:<id>` | balance split, entitlements, ledger, adjustment |
+
+Every one of them was rendered in a local harness with an admin account and an
+empty database, and the exact text and buttons are asserted by tests. Nothing
+above required a Telegram connection.
+
+## 9. Telegram UX menus — **verified**
+
+The main menu, admin menu and every submenu carry the section-40 labels; the
+full set is asserted through the callbacks in `tests/test_payment_flow.py` and
+`tests/test_provider_health.py`. Insufficient-credit messages state available vs
+required duration and offer 💳 خرید اشتراک.
+
+## 10. Security audit — **verified where a test exists**
+
+* **IDOR / callback spoofing:** receipts and every admin action are refused for a
+  non-admin sender and in group chats (`test_a_non_admin_cannot_open_a_receipt_or_a_payment`,
+  `test_group_chat_cannot_reach_the_admin_payment_panel`).
+* **Path traversal:** `_safe_receipt_path` refuses `/etc/passwd`, a file outside
+  the receipt root and `../` escapes (`test_receipt_paths_outside_private_storage_are_refused`).
+* **Secret/receipt leakage:** masking asserted in panels, audit entries and logs;
+  no receipt path is exposed on the user-facing screens.
+* **Duplicate approval / quota races:** transactional single-transaction approval
+  and reservation tests in `test_billing.py` and `test_payment_flow.py`.
+* **Prompt/injection and prompt-injection of admin input:** rejection reasons and
+  notes pass through `clean_human_text()` (ZWNJ/ZWJ preserved, control
+  characters dropped).
+
+## 11. Regression tests from §47 — **verified for the areas below**
+
+The new regression module set is `tests/test_payment_flow.py`,
+`tests/test_provider_health.py`, `tests/test_provider_credentials.py`
+(extended), `tests/test_billing.py` (extended) and
+`tests/test_docx_layout_requirements.py`; the whole suite passes
+(673 passed, 1 skipped, 1,620 subtests).
+
+| Regression area | Where it is covered |
+|---|---|
+| free grant is once-per-user and not renewed by `/start` | `test_billing.py` |
+| legacy `free_lifetime_1h` → `free_1h` migration, no double grant | `test_billing.py` |
+| paid plans, cumulative balance, earliest expiry consumed first | `test_billing.py` |
+| concurrent reservation cannot overspend or create a negative balance | `test_billing.py`, `test_regressions.py` |
+| release on cancellation/STT failure/pagination failure | `test_bot_presentation_flow.py`, `test_billing.py` |
+| receipt intake, pending state across restart, duplicate approval | `test_payment_flow.py` |
+| a lecture file is never swallowed by an open payment | `test_payment_flow.py` |
+| rejection grants nothing and sanitizes the reason (ZWNJ kept) | `test_payment_flow.py`, `test_audit.py` |
+| receipt privacy: admin-only, path-traversal-proof, group chats refused | `test_payment_flow.py` |
+| 429 cooldown + rotation, 401/403 quarantine, 400/422 no rotation | `test_provider_credentials.py` |
+| all keys exhausted → clean secret-free error; success clears state | `test_provider_credentials.py` |
+| no secret in logs, panels or audit entries | `test_provider_credentials.py`, `test_provider_health.py` |
+| health states, cache, cost-safe probes, concurrency, masking | `test_provider_health.py` |
+| DOCX page layout contract and static TOC (no F9 / no `TOC` field) | `test_docx_layout_requirements.py` |
+| RTL/LTR runs, tables, header/footer, element ordering | `test_docx_polish.py`, `test_docx_export.py`, `scripts/validate_docx.py` |
+
+The brief's 60 items were **not** enumerated one-by-one against a checklist in
+this report; the rows above are the areas this revision added or re-verified. No
+existing test was removed or weakened (the only assertion change replaced an
+over-strict expectation of exactly one cache invalidation with the correct
+single production call).
+
+## 12. Real DOCX validation — **partly verified**
+
+`scripts/validate_docx.py` passed with 0 structural failures; the corpus was
+rendered with `scripts/render_docx_pages.py` (no blank page, no overflow, no
+orphan heading, in any sample). The offline renderer needed one real fix found
+during this audit: it read only direct `w:r` children, so every hyperlinked TOC
+row rendered blank — after the fix the topic list shows its titles and page
+numbers. **Not verified:** real Word/LibreOffice rendering. LibreOffice is not
+installed in this environment (`curl` reaches the network but `apt-get` cannot
+resolve `libreoffice-writer`).
+
+## 13. cPanel compatibility — **preserved, verified by inspection and preflight**
+
+No Docker, no Redis, no external database, no new daemon, no root requirement.
+SQLite (WAL) plus `RECEIPT_DIR` on disk; migrations run automatically at
+startup, are transactional and idempotent — verified by applying migration 004
+to a pre-004 database, restarting three times, and confirming the same balance
+and no duplicated plan, entitlement or ledger row. `scripts/cpanel_preflight.py`
+runs; the only FAIL in this sandbox is the intentionally absent `.env`.
+
+## 14. Documentation updated — **verified**
+
+`README.md` (plan table + plan keys, purchase/balance/credit/health/key
+management, credential rotation, validation corpus), `.env.example` (seven plan
+keys, receipt retention wording), `docs/DEPLOY_CPANEL.md` (state-on-disk table,
+panels, retention), `docs/DEPLOY_FA.md` (menus, adjustments, health panel,
+rotation) and `docs/AUDIT.md` (revision log with findings 1–11 and what was and
+was not validated).
+
+## 15. No unverified claims — **the rule applied to this report**
+
+* No page-number accuracy is claimed: the numbers inspected came from an
+  injected page map and the offline renderer, never from a real office render.
+* No live provider health result is claimed: every probe test injects its HTTP
+  response; no provider was contacted and no probe was executed against a real
+  endpoint.
+* Payment verification is stated everywhere as manual-administrator-by-design.
+* No Telegram login, no paid STT/LLM request and no bank interaction happened
+  while producing this revision.
+
+## 16. Health checks are cost-safe and leak nothing — **verified**
+
+Probes only call read-only list endpoints (Speechmatics jobs, Deepgram projects,
+Gemini/Anthropic/OpenAI-compatible models). No transcription job is submitted
+and no model content is generated; a deployment that cannot be probed safely is
+reported as *configured* with a note (`probe_supported=False`). The panel is
+manual and cached for 5 minutes, so it is never executed per Telegram event, and
+probe results run concurrently to keep the panel responsive. Provider error text
+reaches the screen only through `sanitize_detail()`; only the masked tail of a
+key is ever shown, and a test asserts no key material appears in the panel text.
+
+## 17. Minimum-change rule — **honoured**
+
+No working subsystem was rewritten. The DOCX author, STT layer, structuring
+layer and MediaWorker are untouched apart from the one renderer fix in
+`scripts/render_docx_pages.py`. Existing modules gained additive functions
+(`clean_human_text`, `add_audit_entry`, `admin_user_credit_overview`,
+`credential_for_test`, `reorder`); no existing behaviour was replaced, no
+working test was deleted, and the single assertion that was relaxed was
+over-strict rather than protective (it demanded exactly one cache invalidation
+where the correct design performs one production call, now asserted as such).
+
+## 18. Remaining, explicitly open — **not verified, do not claim otherwise**
+
+| Item | Status | What closes it |
+|---|---|---|
+| Real rendered page numbers / Word pagination / hyperlink navigation | not verified | install LibreOffice + `pypdf` on the host, run a long document through the pipeline, inspect the delivered PDF/DOCX |
+| `soffice`-based visual validation | not verified | same |
+| Live provider health check and live rotation under a real 429 | not verified | run the panel once against a real provider account |
+| Live Telegram flows (menus, receipt upload, approval notification) | not verified | a manual smoke test on the deployment host |
+| Real bank transfer approval | manual by design | an administrator verifies the transfer and approves |
+
+---
+
+## Final report (2026-09) (`FINAL_REPORT.md`, removed)
+
+Branch `arena/1f5ae9d9-gamas-bot`, based on `main` (`faeb8cd`, "Production
+hardening: plans, receipts, provider health, TOC validation (#27)"). This report
+covers the full-repository audit of that revision and the changes made on top
+of it. Every claim below is either backed by a command run in this environment
+or marked **not performed**. Payment verification is **manual admin approval by
+design**; no automatic gateway exists and none is claimed.
+
+Verification commands (this session, this sandbox):
+
+```
+$ .venv/bin/python -m pytest tests/ -q
+678 passed, 1 skipped, 1622 subtests passed
+$ .venv/bin/python -m unittest discover -s tests
+OK (skipped=1)
+$ .venv/bin/ruff check gamas_bot scripts tests passenger_wsgi.py --select E9,F
+All checks passed!
+$ .venv/bin/python -m compileall -q gamas_bot scripts tests passenger_wsgi.py   # ok
+$ .venv/bin/python -m pip check                                              # no broken requirements
+$ .venv/bin/python -m scripts.validate_docx --out … --render                 # PASSED, offline render
+$ .venv/bin/python /tmp/docx_validation/run_validation.py                     # PASSED, 0 failures
+```
+
+---
+
+## 1. Files changed (this session)
+
+| File | Change |
+|---|---|
+| `requirements.txt` | Declared `arabic-reshaper` and `python-bidi` — the offline page renderer (`scripts/render_docx_pages.py`, also used by `scripts.validate_docx --render`) imports both to shape Persian and reorder mixed lines; they were missing, so Persian pages rendered as disconnected letters. |
+| `tests/test_billing.py` | +4 regression tests: paid entitlement expires exactly `starts_at + 30 days` (§47 #26); one approval creates exactly one entitlement even when clicked twice (#37); a cancelled job releases the full reservation exactly once (#33); a duplicate reservation is impossible — same-duration retry is idempotent, conflicting duration refused, balance charged once (#34). |
+| `tests/test_media_intake.py` | +1 pipeline test: insufficient balance rejects the job **before** STT/LLM — neither `transcribe` nor `structure_transcript` is awaited, the reservation is recorded `insufficient` with 0 reserved seconds, the user gets the available/required message with a tracking code, and nothing is charged (§47 #29 at the bot level, §18). |
+| `docs/FINAL_REPORT.md` | This report. |
+
+No production code needed changes: the audit (§1 of the task) found the
+billing/payment/credential/DOCX implementation from `faeb8cd` complete against
+§0–§53 except the items above. Everything else below describes the audited
+system as it stands.
+
+## 2. Migrations added
+
+None this session. Existing, audited and idempotent:
+
+- `migrations/001_initial.sql` — users, submissions, transcriptions, broadcasts.
+- `migrations/002_presentations.sql` — presentation columns + `presentation_clips`.
+- `migrations/003_billing_and_credentials.sql` — `plans` (seeded `free_lifetime_1h`,
+  `paid_25h_30d`, `paid_50h_30d`), `payment_requests`, `entitlements`
+  (unique partial index: one `free_lifetime` per user), `usage_reservations`,
+  `usage_ledger`, `admin_audit_log`, `provider_credentials` (ciphertext only),
+  plus the one-time migration granting existing users their single free hour.
+- `migrations/004_production_hardening.sql` — renames the legacy free-plan code
+  to `free_1h` (guarded, never duplicates), adds `receipt_file_id`/`admin_note`,
+  and the indexes the payment/credential/health panels query.
+
+The runner (`Database._apply_migrations`) applies files in name order inside a
+transaction, records them in `schema_migrations`, tolerates interrupted
+`ALTER TABLE` replays, and is covered by
+`test_migrations_can_be_replayed_on_an_existing_schema` and
+`test_restarting_the_database_reapplies_nothing_twice`.
+
+## 3. DOCX root cause and exact fix (RTL)
+
+Root cause class: paragraph alignment alone cannot make a document RTL — Word
+derives direction from `w:docDefaults`, style `w:pPr`, paragraph `w:bidi`,
+paragraph-mark `w:rPr/w:rtl`, and run `w:rPr/w:rtl` + complex-script slots.
+The fix (already in `faeb8cd`, audited line-by-line this session) lives in
+`gamas_bot/docx_export.py` and `gamas_bot/bidi.py`:
+
+- `w:docDefaults` run/paragraph defaults carry the Persian language and RTL
+  base direction (`_configure_document_defaults`).
+- Styles `Normal`, `Title`, `Subtitle`, `Heading 1–3`, table/callout/quote/TOC
+  styles are marked RTL (`_configure_styles`, `_configure_toc_entry_styles`).
+- Persian-dominant paragraphs get `w:bidi` + right alignment + `w:rtl` on the
+  paragraph mark (`_enable_bidi`, `_set_paragraph_mark_direction`).
+- Runs are split by `bidi.split_direction_runs`: RTL segments get `w:rtl`,
+  `w:cs`, `w:szCs` and the Persian face; Latin/technical segments are explicitly
+  LTR (`<w:rtl w:val="0"/>`) with `w:ascii`/`w:hAnsi` and the Latin face.
+  Logical order is never reversed manually.
+- Tables get `w:bidiVisual` (RTL visual column order), RTL cell paragraphs,
+  repeating header rows (`w:tblHeader`), and schema-ordered `w:tblPr` children
+  (`scripts/validate_docx.py` re-checks `pPr`/`rPr`/`tblPr`/`trPr` ordering).
+- Header and footer are RTL too; the footer keeps a real `PAGE` field
+  (`w:fldChar` + `w:instrText PAGE`), which is the only field left in the file.
+- Section marks set `w:rtlGutter`; fonts are per-role (Persian body/heading,
+  Latin, fallback advertised via `w:altName`), never embedded.
+
+## 4. Static TOC implementation
+
+The Word TOC field (`w:fldChar`/`w:instrText TOC`/F9 placeholder/
+`w:updateFields`) is gone. `build_notes_docx` now:
+
+1. writes a skeleton TOC table (`_add_static_toc_skeleton`) with fixed-width
+   placeholder page numbers, followed by an explicit page break;
+2. fills it from the real bookmarked headings (`_fill_static_toc`), honouring
+   `DOCX_TOC_LEVELS` (default `1-1`) and `DOCX_TOC_MIN_SECTIONS`;
+3. renders the document and maps every entry to a real page
+   (`_rendered_toc_page_numbers`), fills the numbers
+   (`_set_static_toc_page_numbers`), and re-renders until the numbers are stable
+   (`_finish_static_toc`, up to 3 iterations + final verification render).
+
+No `w:fldChar`, no `TOC` instruction, no `w:updateFields`, and no user-visible
+F9 instruction remains — asserted by tests and re-verified on real generated
+files this session.
+
+## 5. Page-number calculation method
+
+Production: LibreOffice (`soffice --headless --convert-to pdf`) + `pypdf`.
+Every TOC hyperlink's PDF link destination is resolved to its physical page;
+if the renderer is missing, the PDF is unusable, the link count differs from
+the entry count, or a target lands before page 3, generation **fails
+explicitly** (`DocxPaginationError`) — page numbers are never guessed. This
+failure path was exercised live this session: with no `soffice` in the sandbox,
+`build_notes_docx` on a TOC-worthy document raised
+`DocxPaginationError("…LibreOffice (soffice) در سرور پیدا نشد.")`.
+
+Sandbox validation: LibreOffice cannot be installed here (no root, no package
+mirror). For §48 the measurement pass was substituted with an oracle built on
+the repository's own offline renderer (`scripts/render_docx_pages.py`), which
+performs a real page layout of the .docx. Each TOC number written into a
+validated document therefore comes from a real rendered layout, and was then
+**cross-checked against an independent render of the final document**: every
+number in the TOC equals the physical page where that heading actually starts.
+This is a validation-harness substitution only; production code still requires
+LibreOffice and still fails explicitly without it.
+
+## 6. Bookmark/hyperlink implementation
+
+- Every body heading gets a unique bookmark `GamasHeading{n}`
+  (`_add_bookmark`) — valid OOXML name, unique by counter, so duplicate topic
+  titles still get unique anchors.
+- Each TOC row's title cell is a `w:hyperlink w:anchor="GamasHeading{n}"` with
+  `w:history="1"` and a tooltip; runs inside keep their bidi segmentation.
+- Verified on real files: bookmarks unique and name-valid, every anchor
+  resolves to a `w:bookmarkStart`, hyperlink count equals TOC row count.
+
+## 7. Billing schema
+
+Integer seconds everywhere; no float hours in accounting. `plans`
+(id/code/name/included_seconds/validity_days/price_toman/enabled/sort_order),
+`entitlements` (granted/remaining seconds, `starts_at`, `expires_at`, status
+`active|expired|revoked|exhausted`, `source` `free_lifetime|payment|admin_credit`,
+`payment_id`, `granted_by_admin_id`), `usage_reservations`, `usage_ledger`
+(event types `reserve|consume|release|denied|grant|adjustment`), plus the
+unique partial index `idx_entitlement_free_once_per_user`. The canonical
+catalogue lives in `gamas_bot/billing.py::plan_catalog`, is upserted by
+`Database.sync_plan_catalog` at startup, and is overridable only through the
+seven `FREE_PLAN_HOURS`/`PLAN_*` environment variables resolved in
+`gamas_bot/config.py`.
+
+## 8. Reservation/usage logic
+
+`Database.reserve_usage` runs in a `BEGIN IMMEDIATE` transaction: it verifies
+submission ownership, expires stale entitlements, sums available seconds,
+refuses with an audited `denied` ledger row when the balance is short, and
+otherwise allocates from the earliest-expiring active entitlement first
+(free/lifetime entitlements last). `finalize_usage` consumes the actual media
+seconds and refunds the unused remainder per entitlement; `release_usage`
+returns the full reservation. All three are idempotent and guarded by
+`WHERE status='reserved'`, so retries, restarts
+(`_recover_interrupted_submissions` releases reservations of jobs that cannot
+survive a restart) and double-clicks cannot double-charge or lose credit.
+Cross-process safety is tested with two `Database` connections racing on one
+balance (`test_two_database_connections_cannot_reserve_the_same_credit_twice`).
+
+## 9. Payment workflow
+
+`💳 خرید اشتراک` → plan picker → instructions showing plan, hours, validity,
+price, and the canonical card (`5022 2913 3290 6625` / امیرعلی غمخوار /
+بانک پاسارگاد — normalized to digits in config, grouped by the single
+`format_payment_card` helper) → "رسید پرداخت را به‌صورت تصویر ارسال کنید".
+An image (JPEG/PNG/WebP, magic-byte checked, ≤ `MAX_PAYMENT_RECEIPT_BYTES`,
+stored under `RECEIPT_DIR` — outside the web root, dir `700`/file `600`,
+random hex name, never the user's filename) creates a `pending`
+`payment_requests` row. **No credit is granted at submission time.** Receipts
+never enter the STT/PPT pipeline (image-with-open-payment is intercepted first;
+tests `test_receipt_image_with_an_open_payment_is_never_a_media_job` etc.).
+Old receipts are deleted only after the configurable retention measured from
+admin review.
+
+## 10. Admin workflow
+
+Admin-only, private-chat-only panels: `💳 پرداخت‌ها` (pending list → detail with
+the private receipt → `✅ تایید` / `❌ رد`), `⏱ اعتبار کاربران` (per-user
+free/paid/total, entitlements with expiry, usage history, manual `seconds |
+reason` adjustment with audit), `🩺 وضعیت سرویس‌ها` (manual, 5-minute cache,
+cheap read-only probes; states configured/healthy/degraded/rate_limited/
+authentication_failed/unavailable/disabled/not_configured; masked credentials,
+sanitized errors, cooldown display), `🔑 API Keys` (add → metadata → secret
+message deleted before storage; enable/disable/delete/reorder/test), `📜 گزارش
+مدیر` (audit log), plus stats/users/broadcast/ban/unban. Every payment decision,
+credential change and adjustment writes an `admin_audit_log` row without
+secrets or receipt contents.
+
+## 11. Credential architecture
+
+`gamas_bot/provider_credentials.py::ProviderCredentialManager` pools
+per-(service, provider) keys from `provider_credentials` (Fernet ciphertext at
+rest; the master key is env-only via `PROVIDER_CREDENTIALS_ENCRYPTION_KEY` and
+never touches SQLite), ordered by `priority, id`, skipping quarantined and
+cooling-down keys, with the legacy environment key as a trailing fallback.
+`gamas_bot/provider_health.py` runs the manual probes and feeds the same
+rotation state. Both STT (`gamas_bot/stt.py`) and notes
+(`gamas_bot/structuring.py`) obtain credentials through the manager via
+`current_provider_credentials()` / `use_provider_credentials()` and report
+results through `record_result`.
+
+## 12. 429 rotation logic
+
+On HTTP 429: the credential is marked `cooldown` with `cooldown_until` from
+`Retry-After` (bounded 1 s … 7 days, default 30 s), excluded from selection
+until it expires, and the next healthy credential is tried — the same key is
+not hammered. On 401/403 the credential is `quarantined` (excluded until an
+admin re-enables it). On 400/415/422 the request is treated as invalid and the
+credential is **not** rotated. 5xx/network errors get bounded exponential
+retries (`STT_MAX_ATTEMPTS`, `STT_RETRY_*`; note API `NOTE_API_RETRIES`), then
+rotation/provider fallback. Success clears cooldown/quarantine. All-credentials
+exhausted returns a clean, secret-free error. Tests:
+`test_429_cools_down_the_first_key_and_rotates_to_the_next`,
+`test_401_quarantines_the_first_key_and_rotates_to_the_next`,
+`test_bad_request_does_not_rotate_credentials`,
+`test_retry_after_header_is_honoured_and_bounded`,
+`test_retries_are_bounded_by_the_configuration`,
+`test_provider_secrets_never_reach_the_logs`, and more in
+`tests/test_provider_credentials.py`, `tests/test_provider_health.py`,
+`tests/test_provider_robustness.py`, `tests/test_provider_contracts.py`.
+
+## 13. Security changes (audit result)
+
+No new holes found; the existing controls were verified by test and inspection:
+admin callbacks require `is_admin` and private chat; `billing:*` callbacks are
+private-only and ownership-checked in SQL (`cancel_payment_intent`,
+`submit_payment_receipt` both scope `WHERE user_id=?`); payment actions are
+whitelisted; receipt paths are re-resolved and confined to the private root
+(`_safe_receipt_path`); receipt bytes are never logged; API keys are
+Fernet-encrypted, masked (`••••…last4`) in every UI/audit/log path, and
+rejected from labels/URLs/notes that contain key fragments; settings `repr`
+hides secrets; SQL is parameterized throughout; the audit log truncates and
+never stores secrets. New this session: the insufficient-balance path is
+covered end-to-end at the pipeline level (no STT call, no charge).
+
+## 14. cPanel impact
+
+None. No new daemon, no Redis, no Docker, no external DB, no root requirement.
+SQLite + WAL with owner-only modes, receipts under `RECEIPT_DIR` outside the
+web root, migrations applied automatically at startup, the env-supplied
+encryption master key, and the existing `passenger_wsgi.py`/launcher/systemd
+paths are unchanged. `scripts/cpanel_preflight.py` and
+`tests/test_cpanel_deploy.py` pass. Restart persistence is tested
+(`test_payment_and_entitlement_state_survive_a_restart`).
+
+## 15. Tests executed
+
+- `python -m pytest tests/ -q` → **678 passed, 1 skipped, 1623 subtests**
+  (673 before this session; +5 new tests: 4 billing + 1 pipeline).
+- `python -m unittest discover -s tests` → **OK** (CI entry point).
+- `ruff check … --select E9,F`, `compileall`, `pip check` → **clean**.
+
+## 16. Test results
+
+All green. The §47 list is covered as follows (test names in
+`tests/test_billing.py`, `tests/test_payment_flow.py`,
+`tests/test_provider_credentials.py`, `tests/test_provider_health.py`,
+`tests/test_docx_export.py`, `tests/test_docx_layout_requirements.py`,
+`tests/test_docx_polish.py`, `tests/test_media_intake.py`,
+`tests/test_provider_robustness.py`, `tests/test_provider_contracts.py`):
+DOCX #1–#20 ✓ (RTL doc/styles/paragraphs/runs/tables/glossary/header/footer,
+static TOC, real titles+numbers, no F9, no `w:fldChar`, TOC page 2, body page
+3, unique bookmarks, resolving hyperlinks, duplicate titles, reopen, schema
+order). Billing #21–#38 ✓ (incl. this session's #26/#33/#34/#37 and the
+pre-existing #21–#25, #27–#32, #35, #36, #38). Payments #39–#47 ✓.
+Provider credentials #48–#60 ✓ (multi-key, encryption, masking, no log leaks,
+429 cooldown + Retry-After, rotation, 401/403 quarantine, 400/422 no-rotate,
+bounded 5xx/network, recovery on success, exhausted-pool error, admin-only
+health panel).
+
+## 17. Real DOCX validation results
+
+Performed this session with the repository's own tooling
+(`scripts/validate_docx.py`, `scripts/render_docx_pages.py`):
+
+- `python -m scripts.validate_docx --out … --render` → **PASSED**, offline
+  render, "no layout warnings (no blank page, no overflow, no orphan heading)".
+  (This command previously degraded Persian because `arabic-reshaper`/
+  `python-bidi` were undeclared; fixed in `requirements.txt`.)
+- Four real sample documents generated and validated end-to-end:
+  - `persian_only_4topics` — 4 pages, TOC 6 rows, numbers [3,3,3,3,3,4]
+  - `mixed_medical_10topics` — Persian+English medical (HbA1c, eGFR,
+    Metformin 500 mg, 120/80 mmHg, mg/dL, %, URLs, emails, Cyrillic/CJK
+    stress text), 5 pages, TOC 14 rows
+  - `long_22topics` — 22 topics, long titles, duplicated titles, 7 pages,
+    TOC 24 rows, numbers [3…7]
+  - `numerical_tables` — numeric tables, ranges, formulas, URLs, dates,
+    3 pages, TOC 5 rows
+- For every document: structural validation ok; XML checks ok (no TOC field, no
+  F9 text, no `updateFields`, footer `PAGE` field intact, bookmarks unique/
+  valid, hyperlinks resolve and match TOC rows, docDefaults/Normal/headings/
+  tables/header/footer RTL, Latin runs explicitly LTR, complex-script fonts);
+  real render with **zero layout warnings**; **page 1 = cover only, page 2 =
+  static TOC, page 3 = first body heading**; and every TOC page number equals
+  the physical page where that heading starts in an independent render of the
+  final file.
+- Pages 1–3 of the mixed-medical and long documents were **visually inspected**
+  (rendered PNGs): RTL cover with brand/quote, RTL TOC with page numbers in
+  the left column, mixed-script titles and paragraphs in correct logical
+  order, RTL tables with the first logical column on the right, centered LTR
+  formulas, header/footer with the page field, page frame — all correct.
+- Explicit-failure path verified live: without a renderer, a TOC document is
+  **not** produced (raises `DocxPaginationError`).
+
+Honesty note: these page numbers come from the repository's offline renderer
+used as the measurement oracle, because LibreOffice is not installable in this
+sandbox. In production the numbers come from LibreOffice itself, and without it
+the document is not delivered at all. Word's own pagination may differ from
+any renderer by a line; the numbers are correct for a real rendered layout, not
+guaranteed pixel-identical to Microsoft Word.
+
+## 18. Remaining limitations
+
+1. **LibreOffice absent in this sandbox** — production TOC pagination was
+   verified only through its explicit-failure path plus the offline-renderer
+   oracle; a deployment run with real `soffice` has not been executed here.
+2. **No live provider health check was executed** — no real API keys exist in
+   this environment; health/rotation behaviour is verified with scripted HTTP
+   fakes only.
+3. **Payment verification is manual by design** — card-to-card receipt review
+   by an administrator; there is no automatic gateway and none is claimed.
+4. The offline renderer is a layout approximation (DejaVu faces, approximate
+   justification, no tab leaders drawn); it is used for validation, not as a
+   Word clone. Missing-glyph boxes for CJK in the sandbox renders are a font
+   limitation of the renderer, not a document defect.
+5. The 1 skipped test is a pre-existing POSIX/Windows-conditional skip
+   (unchanged from `main`).
+
