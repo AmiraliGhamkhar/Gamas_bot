@@ -118,36 +118,39 @@ def _paragraph_runs(paragraph) -> tuple[list[dict], bool]:
     """Runs of one paragraph: text plus the effective formatting of each run."""
     runs: list[dict] = []
     page_break = False
-    for child in paragraph:
-        if child.tag == _q("r"):
-            r_pr = child.find(_q("rPr"))
-            text_parts: list[str] = []
-            for node in child:
-                if node.tag == _q("t"):
-                    text_parts.append(node.text or "")
-                elif node.tag == _q("tab"):
-                    text_parts.append("\t")
-                elif node.tag == _q("br"):
-                    if node.get(f"{{{W}}}type") == "page":
-                        page_break = True
-                    else:
-                        text_parts.append("\n")
-            text = "".join(text_parts)
-            if not text:
-                continue
-            size = None
-            if r_pr is not None and r_pr.find(_q("sz")) is not None:
-                size = int(r_pr.find(_q("sz")).get(f"{{{W}}}val", 0) or 0) / 2.0
-            bold = r_pr is not None and r_pr.find(_q("b")) is not None
-            rtl = r_pr is not None and r_pr.find(_q("rtl")) is not None
-            color = _hex_color(_val(r_pr.find(_q("color"))) if r_pr is not None else None)
-            font_name = ""
-            if r_pr is not None and r_pr.find(_q("rFonts")) is not None:
-                font_name = r_pr.find(_q("rFonts")).get(f"{{{W}}}ascii", "") or ""
-            runs.append(
-                {"text": text, "size": size, "bold": bold, "rtl": rtl,
-                 "color": color, "font": font_name}
-            )
+    # ``paragraph.iter`` (not a direct-child loop): a run may sit inside
+    # ``w:hyperlink`` — every clickable TOC row does — and a renderer that skips
+    # those shows an empty topic list, which is exactly the kind of regression
+    # this tool exists to catch.
+    for child in paragraph.iter(_q("r")):
+        r_pr = child.find(_q("rPr"))
+        text_parts: list[str] = []
+        for node in child:
+            if node.tag == _q("t"):
+                text_parts.append(node.text or "")
+            elif node.tag == _q("tab"):
+                text_parts.append("\t")
+            elif node.tag == _q("br"):
+                if node.get(f"{{{W}}}type") == "page":
+                    page_break = True
+                else:
+                    text_parts.append("\n")
+        text = "".join(text_parts)
+        if not text:
+            continue
+        size = None
+        if r_pr is not None and r_pr.find(_q("sz")) is not None:
+            size = int(r_pr.find(_q("sz")).get(f"{{{W}}}val", 0) or 0) / 2.0
+        bold = r_pr is not None and r_pr.find(_q("b")) is not None
+        rtl = r_pr is not None and r_pr.find(_q("rtl")) is not None
+        color = _hex_color(_val(r_pr.find(_q("color"))) if r_pr is not None else None)
+        font_name = ""
+        if r_pr is not None and r_pr.find(_q("rFonts")) is not None:
+            font_name = r_pr.find(_q("rFonts")).get(f"{{{W}}}ascii", "") or ""
+        runs.append(
+            {"text": text, "size": size, "bold": bold, "rtl": rtl,
+             "color": color, "font": font_name}
+        )
     return runs, page_break
 
 

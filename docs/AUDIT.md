@@ -26,6 +26,36 @@ rendered-page accuracy, internal PDF link destinations and visual DOCX output
 have **not** been validated here. See the current README and deployment guides
 for configuration; report only the test runs performed for this revision.
 
+### Revision log — 2026-10-07 (audit findings and fixes)
+
+A second audit pass over the whole tree (bot handlers, database, STT, LLM,
+DOCX/BiDi, providers, migrations, tests, docs) found and fixed the following.
+Everything is minimum-change: no module was rewritten and no existing test was
+removed or weakened.
+
+| # | Finding (audit) | Fix |
+|---|---|---|
+| 1 | The **free plan code did not match the canonical contract**: the catalogue and migration seeded `free_lifetime_1h` while the requirement names `free_1h`. | `free_1h` is now the canonical code in `billing.py`; `migration 004` renames the legacy row in place (keeping its foreign keys) and the database resolves the free plan under either spelling, so a pre-004 database neither loses nor duplicates its one free hour. Regression test: `test_legacy_free_plan_code_is_renamed_and_never_granted_twice`. |
+| 2 | The tariff was hard-coded and had **no canonical configuration keys** (`FREE_PLAN_HOURS`, `PLAN_25_*`, `PLAN_50_*`). | Added `CANONICAL_*` values plus the seven `PLAN_ENV_FIELDS` keys in `config.py`, validated at startup, exposed as `Settings.plan_values`, and consumed by `billing.plan_catalog(values)` → SQLite seed → UI. One source of truth, no numbers in handlers. |
+| 3 | `payment_requests` had **no `admin_note`/`receipt_file_id`**: the requirement asks for both, and losing the local receipt under retention left no reference. | Migration 004 adds both columns; `submit_payment_receipt`, `approve_payment` and `reject_payment` write them; `payment_detail` and rejection sanitization use the same printable-text cleaner. |
+| 4 | Rejection sanitization stripped the Persian **zero-width non-joiner**, corrupting reasons like «هم‌خوانی». | `database.clean_human_text()` keeps ZWNJ/ZWJ while removing control characters; used by rejection, manual credit and admin notes. Test: `test_rejection_reason_is_sanitized_before_storage`. |
+| 5 | Admin menus/UX were missing the required entries: **🩺 وضعیت سرویس‌ها**, **⏱ اعتبار کاربران**, **⏱ اعتبار من**, **💳 خرید اشتراک**. | Menus renamed/extended to the approved Persian labels; the admin credit screen (`admin:credits*`) and the manual adjustment flow (`credit_add:<id>`) were added. |
+| 6 | The credential panel explicitly stated it performed **no live health check**, and there was no `provider_health` module at all. | New `gamas_bot/provider_health.py`: manual, cached (300 s), free read-only probes (Speechmatics job list, Deepgram project list, Gemini/Anthropic/OpenAI-compatible model list) with the full required status vocabulary, safe fallback for unprobeable deployments, sanitized errors, and cooldown/quarantine state shared with live traffic. `admin:health`/`admin:health:refresh`/`admin:health:test:<id>`. |
+| 7 | There was **no credential reorder and no per-key manual test**, both required by the admin API-key flow. | `ProviderCredentialManager.credential_for_test()` + `reorder()` with dense deterministic priorities and an audit entry per move; **▲/▼** and **🧪 تست** buttons. |
+| 8 | A second image sent while a receipt was **pending** fell through to the media pipeline. | Payment state (level-triggered, read from SQLite) now answers explicitly with the pending request id, and only images can be receipts (`_is_receipt_image`). A lecture audio/video/PowerPoint upload keeps going to the normal pipeline. Tests: `test_payment_flow.py`. |
+| 9 | The offline page renderer read only direct `w:r` children, so **every hyperlinked TOC row rendered blank** — a tool that would have hidden a TOC regression. | `_paragraph_runs` iterates `paragraph.iter(w:r)`. Verified visually: page 2 now shows titles + page numbers. |
+| 10 | Migration/index coverage was thinner than required (no payment-review, cooldown/enabled, entitlement-status or audit-target indexes). | Migration 004 adds those indexes alongside the column additions. |
+| 11 | `add_admin_credit` attributed a manual grant to the free plan row, and the code depended on the legacy plan code. | Manual credit resolves the canonical free plan row via `_free_plan_row()` (either spelling). |
+
+**Verification performed for this revision (nothing beyond it is claimed):**
+
+* full suite `python -m pytest tests/ -q` → **665 passed, 1 skipped, 1609 subtests passed** (44.7 s);
+* `python -m compileall gamas_bot scripts tests` clean; `scripts/cpanel_preflight.py` runs (the only FAIL is the absent `.env` in this sandbox, as expected);
+* `python -m scripts.validate_docx` → 0 structural failures for both sample documents (RTL defaults/styles/paragraph marks/LTR runs, RTL tables, repeating headers, running header, real `PAGE` footer field, element ordering, clean reopen);
+* five real sample documents (Persian-only, Persian+English medical, 22 topics, numeric/units, links/emails) rendered with the repository's offline Pillow renderer: page 1 = cover, page 2 = topic list with titles and page numbers, page 3+ = notes, no blank/overflow/orphan warnings;
+* **LibreOffice is not installed here**, so real Word pagination, the PDF-destination page map, hyperlink navigation in Word, and visual output in Word/LibreOffice remain unverified in this environment. Page numbers in this environment came from the injected page-map fixture and the offline renderer, never claimed as real pagination;
+* no Telegram login, no paid provider request and no live provider health check was executed (all provider tests use injected responses).
+
 ## Root causes found
 
 1. **The prompt asked for compression, not preservation.** It requested a

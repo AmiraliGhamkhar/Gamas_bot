@@ -110,11 +110,34 @@ MAX_CONCURRENT_JOBS=1
 MAX_PENDING_JOBS=2
 PROGRESS_ANIMATION_ENABLED=false   # fewer Telegram edits, less CPU
 # RECEIPT_DIR=data/receipts       # outside the web root; directory 700/files 600
-# RECEIPT_RETENTION_DAYS=90
+# RECEIPT_RETENTION_DAYS=90       # counted from the admin review, not submission
+# MAX_PAYMENT_RECEIPT_BYTES=5000000
 # DOCX_TOC_ENABLED=true           # needs the LibreOffice renderer for long docs
 # DOCX_PAGINATION_RENDERER_BIN=/usr/bin/soffice  # if not on PATH
 # TELEGRAM_PROXY=socks5://user:pass@proxy.example.com:1080
+# --- canonical tariff (defaults shown; change only if the business changes) ---
+# FREE_PLAN_HOURS=1
+# PLAN_25_HOURS=25
+# PLAN_25_PRICE_TOMAN=150000
+# PLAN_25_VALIDITY_DAYS=30
+# PLAN_50_HOURS=50
+# PLAN_50_PRICE_TOMAN=250000
+# PLAN_50_VALIDITY_DAYS=30
 ```
+
+Everything the bot must not lose is on disk under the project directory and
+survives a restart, a cPanel "Stop/Start" and a watchdog-restart cycle:
+
+| State | Location | Notes |
+|---|---|---|
+| Billing (plans, entitlements, usage ledger, payments, admin audit) | `data/bot.sqlite3` (WAL) | mode `600`; the migration runner applies `migrations/*.sql` automatically at startup |
+| Pending/approved payments and their status | same database | a restart cannot lose an approval or re-open a decided request |
+| Receipt images | `RECEIPT_DIR` (default `data/receipts`) | directory `700`, files `600`, outside `public_html` |
+| Encrypted provider keys | `provider_credentials` table | ciphertext only; the Fernet master key stays in `.env` (never in SQLite) |
+
+No Redis, no Docker, no external database, no extra daemon and no root access is
+required. Migrations run inside the normal startup path, so the launcher,
+Passenger entry point and cron watchdog all keep working unchanged.
 
 Relative paths (`data/...`) and `.env` are resolved from the **project
 directory**, not from the shell's current directory, so cron and Passenger see the
@@ -208,9 +231,13 @@ legal obligations.
 
 Billing is paid by manual card-to-card transfer. The bot does not verify a bank
 transaction: an administrator must inspect the private receipt and approve or
-reject it from the **پرداخت‌های در انتظار** panel or `/payments`. Uploading a
-receipt grants no credit. `/credit TELEGRAM_USER_ID SECONDS REASON` is the
-separate auditable admin adjustment.
+reject it from the **💳 پرداخت‌ها** panel or `/payments`. Uploading a receipt
+grants no credit. The **⏱ اعتبار کاربران** screen shows one user's balance,
+active entitlements with expiry and recent usage; a manual adjustment there (or
+`/credit TELEGRAM_USER_ID SECONDS REASON`) always requires a reason and is
+audited. Provider health (**🩺 وضعیت سرویس‌ها**) and key management
+(**🔑 API Keys**) run only when an administrator opens them, so they add no
+per-message cost on shared hosting.
 
 ## 10. Troubleshooting
 
