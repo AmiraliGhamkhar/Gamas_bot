@@ -151,6 +151,16 @@ def _paragraph_runs(paragraph) -> tuple[list[dict], bool]:
     return runs, page_break
 
 
+_MIRRORED_JC = {"left": "right", "right": "left", "start": "right", "end": "left"}
+
+
+def _is_bidi(p_pr) -> bool:
+    """Is this paragraph-properties element right-to-left (``w:bidi`` on)?"""
+    if p_pr is None or p_pr.find(_q("bidi")) is None:
+        return False
+    return _val(p_pr.find(_q("bidi"))) not in ("0", "false", "off")
+
+
 def _paragraph(node, styles: dict) -> dict:
     p_pr = node.find(_q("pPr"))
     style_name = ""
@@ -167,6 +177,18 @@ def _paragraph(node, styles: dict) -> dict:
         ind = p_pr.find(_q("ind"))
         for key in ("left", "right", "hanging"):
             indent[key] = int(ind.get(f"{{{W}}}{key}", 0) or 0)
+    # In a bidi paragraph jc and ind left/right are *logical* (ECMA-376
+    # 17.3.1.12/17.3.1.13): "left" is the start edge, i.e. the visual right.
+    # This painter works in physical coordinates, so translate them here.
+    bidi = _is_bidi(p_pr) if p_pr is not None and p_pr.find(_q("bidi")) is not None else bool(
+        effective.get("bidi")
+    )
+    if bidi:
+        alignment = _MIRRORED_JC.get(alignment, alignment)
+        indent["left"], indent["right"] = indent["right"], indent["left"]
+    style_align = effective.get("align")
+    if bidi and alignment is None:
+        style_align = _MIRRORED_JC.get(style_align, style_align)
     runs, page_break = _paragraph_runs(node)
     return {
         "kind": "p",
@@ -178,7 +200,7 @@ def _paragraph(node, styles: dict) -> dict:
         "style_color": effective.get("color"),
         "style_space_before": effective.get("before", 0),
         "style_space_after": effective.get("after", 0),
-        "align": alignment or effective.get("align"),
+        "align": alignment or style_align,
         "spacing": _spacing(p_pr),
         "shade": shade,
         "bordered": bordered,
@@ -247,6 +269,7 @@ def _styles_from(styles_xml: bytes) -> dict:
                     "before": _spacing(p_pr)["before"],
                     "after": _spacing(p_pr)["after"],
                     "align": _val(p_pr.find(_q("jc"))),
+                    "bidi": _is_bidi(p_pr),
                 }
             )
         # styleId and the display name are both valid references

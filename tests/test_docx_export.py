@@ -436,9 +436,12 @@ class StyleLayerDirectionTests(unittest.TestCase):
             style = match.group(0)
             self.assertIn("<w:bidi/>", style)
             self.assertIn("<w:rtl/>", style)
-            # Right-aligned with a dot leader, so the page number lands on the
-            # left of the Persian entry instead of hanging off the right edge.
-            self.assertIn('<w:jc w:val="right"/>', style)
+            # Start-aligned (visual right) with a dot leader, so the page
+            # number lands on the left of the Persian entry. In a bidi
+            # paragraph jc is logical (ECMA-376 17.3.1.13): "left" is the start
+            # edge, and a physical "right" would hang the entry on the left.
+            self.assertIn('<w:jc w:val="left"/>', style)
+            self.assertNotIn('<w:jc w:val="right"/>', style)
             self.assertIn('w:leader="dot"', style)
 
     def test_toc_entry_styles_survive_when_the_toc_is_disabled(self):

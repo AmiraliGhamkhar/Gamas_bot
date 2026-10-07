@@ -53,6 +53,7 @@ from datetime import datetime
 from docx import Document
 from docx.enum.section import WD_SECTION
 from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -426,9 +427,9 @@ def jalali_date(now: datetime) -> str:
 def _enable_bidi(paragraph, *, rtl: bool = True) -> None:
     """Set the paragraph's base direction (``w:bidi``).
 
-    ``rtl=False`` removes an existing ``w:bidi`` instead of writing one: a
-    paragraph with no strong RTL character is left to Word's default
-    left-to-right base direction. Forcing Persian onto a Latin-only line (a
+    ``rtl=False`` writes ``w:bidi w:val="0"``: a paragraph with no strong RTL
+    character gets an explicit left-to-right base direction (the document
+    defaults are RTL, so omitting the element would inherit RTL). Forcing Persian onto a Latin-only line (a
     formula, a URL list) misresolves its neutral characters and its paragraph
     mark while adding nothing, because every run already carries its own
     direction (``w:rtl``).
@@ -436,8 +437,12 @@ def _enable_bidi(paragraph, *, rtl: bool = True) -> None:
     p_pr = paragraph._p.get_or_add_pPr()
     existing = p_pr.find(qn("w:bidi"))
     if not rtl:
-        if existing is not None:
-            p_pr.remove(existing)
+        # ``w:docDefaults`` declares the document RTL, so merely removing
+        # ``w:bidi`` would *inherit* RTL. An LTR line needs an explicit off.
+        if existing is None:
+            _insert_ppr_child(p_pr, OxmlElement("w:bidi"), PPR_AFTER_BIDI)
+            existing = p_pr.find(qn("w:bidi"))
+        existing.set(qn("w:val"), "0")
         return
     if existing is None:
         _insert_ppr_child(p_pr, OxmlElement("w:bidi"), PPR_AFTER_BIDI)
@@ -1564,6 +1569,9 @@ def toc_is_worth_it(body_chars: int, sections: int, design: DocxDesign) -> bool:
     return sections >= design.toc_min_sections or body_chars >= TOC_MIN_BODY_CHARS
 
 
+TOC_TITLE = "فهرست مطالب"
+
+
 def _add_static_toc_skeleton(document, *, fonts: DocumentFonts):
     """Insert the page-two TOC container before the body content.
 
@@ -1582,7 +1590,7 @@ def _add_static_toc_skeleton(document, *, fonts: DocumentFonts):
     )
     _add_directional_text(
         paragraph,
-        "فهرست مطالب",
+        TOC_TITLE,
         fonts=_heading_fonts(fonts),
         size=16,
         bold=True,
@@ -1591,7 +1599,7 @@ def _add_static_toc_skeleton(document, *, fonts: DocumentFonts):
     table = document.add_table(rows=0, cols=2)
     table.style = "Table Grid"
     _apply_rtl_table_direction(table)
-    _set_table_widths(table, [TABLE_CONTENT_WIDTH_CM - 1.4, 1.4])
+    _set_table_widths(table, [TABLE_CONTENT_WIDTH_CM - TOC_PAGE_COLUMN_CM, TOC_PAGE_COLUMN_CM])
     borders = OxmlElement("w:tblBorders")
     for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
         edge = OxmlElement(f"w:{side}")
@@ -1613,8 +1621,14 @@ def _add_directional_hyperlink(
     *,
     fonts: DocumentFonts,
     size: float,
+    bold: bool = False,
+    underline: bool = False,
 ) -> None:
-    """Append an internal, accessible hyperlink without losing bidi runs."""
+    """Append an internal, accessible hyperlink without losing bidi runs.
+
+    TOC rows are not underlined (the dot leader already reads as a link row);
+    the hyperlink itself is what makes the title clickable.
+    """
     clean = xml_safe(text)
     hyperlink = OxmlElement("w:hyperlink")
     hyperlink.set(qn("w:anchor"), anchor)
@@ -1632,10 +1646,11 @@ def _add_directional_hyperlink(
             run,
             font=fonts.body if segment.rtl else fonts.latin,
             size=size,
+            bold=bold,
             color=ACCENT,
             rtl=segment.rtl,
         )
-        run.font.underline = True
+        run.font.underline = bool(underline)
         hyperlink.append(run._r)
     paragraph._p.append(hyperlink)
 
@@ -1670,53 +1685,289 @@ def _fill_static_toc(
     if not entries:
         raise DocxPaginationError("برای ساخت فهرست ایستا، هیچ عنوانی با نشانک داخلی پیدا نشد.")
 
+    title_width_twips = _cm_to_twips(TABLE_CONTENT_WIDTH_CM - TOC_PAGE_COLUMN_CM)
+    # Default cell margins are 108 twips per side; stop the leader just short.
+    leader_stop = max(_cm_to_twips(2.0), title_width_twips - 2 * 108 - 30)
     for entry in entries:
         row = table.add_row()
         row._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
         title_cell, page_cell = row.cells
+        level = int(entry["level"])
         title_paragraph = title_cell.paragraphs[0]
-        title_paragraph.style = document.styles[f"TOC {entry['level']}"]
+        title_paragraph.style = document.styles[f"TOC {level}"]
         title_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-        title_paragraph.paragraph_format.space_before = Pt(0)
-        title_paragraph.paragraph_format.space_after = Pt(0)
+        title_paragraph.paragraph_format.space_before = Pt(TOC_ROW_SPACE_PT)
+        title_paragraph.paragraph_format.space_after = Pt(TOC_ROW_SPACE_PT)
         title_paragraph.paragraph_format.line_spacing = 1.0
-        title_paragraph.paragraph_format.right_indent = Cm(0.45 * (int(entry["level"]) - 1))
+        title_paragraph.paragraph_format.right_indent = Cm(0.45 * (level - 1))
+        _set_toc_leader_tab(title_paragraph, leader_stop)
         _add_directional_hyperlink(
             title_paragraph,
             str(entry["title"]),
             str(entry["anchor"]),
             fonts=fonts,
-            size=10.5,
+            size=TOC_FONT_SIZE[level],
+            bold=level == 1,
         )
+        # The dot leader runs from the end of the title to the page column.
+        # A tab with nothing after it gets no leader fill in LibreOffice, so a
+        # zero-width space closes the run (verified on real renders).
+        leader_run = title_paragraph.add_run()
+        leader_run._r.append(OxmlElement("w:tab"))
+        leader_run._r.append(_text_element(TOC_LEADER_TERMINATOR))
+        _style_run(leader_run, font=fonts.body, size=TOC_FONT_SIZE[level], color=MUTED, rtl=True)
+        # A wrapped title ends (with its leader) on its last line: keep the
+        # page number level with that line, not with the first one.
+        page_cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.BOTTOM
         page_paragraph = page_cell.paragraphs[0]
-        page_paragraph.style = document.styles[f"TOC {entry['level']}"]
-        page_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        page_paragraph.paragraph_format.space_before = Pt(0)
-        page_paragraph.paragraph_format.space_after = Pt(0)
+        page_paragraph.style = document.styles[f"TOC {level}"]
+        page_paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        page_paragraph.paragraph_format.space_before = Pt(TOC_ROW_SPACE_PT)
+        page_paragraph.paragraph_format.space_after = Pt(TOC_ROW_SPACE_PT)
         page_paragraph.paragraph_format.line_spacing = 1.0
-        _add_directional_text(page_paragraph, "00000", fonts=fonts, size=10.5, color=MUTED)
+        _write_toc_page_number(page_paragraph, TOC_PAGE_PLACEHOLDER, entry, fonts=fonts)
     return entries
 
 
-def _set_static_toc_page_numbers(table, pages: list[int], *, fonts: DocumentFonts) -> None:
-    if len(table.rows) != len(pages):
+#: Width of the page-number column and the static TOC typography.
+TOC_PAGE_COLUMN_CM = 1.4
+TOC_ROW_SPACE_PT = 2.5
+TOC_FONT_SIZE = {1: 11.0, 2: 10.0, 3: 9.5}
+#: Wide enough for the largest page number so pass 1 never lays out narrower
+#: than the final document. It is never delivered: every row is replaced by a
+#: measured page number or generation fails.
+TOC_PAGE_PLACEHOLDER = "000"
+
+
+TOC_LEADER_TERMINATOR = "\u200b"
+
+
+def _text_element(text: str):
+    element = OxmlElement("w:t")
+    element.text = text
+    return element
+
+
+def _set_toc_leader_tab(paragraph, position_twips: int) -> None:
+    """A dot-leader tab stop at the far (left) end of the title cell."""
+    p_pr = paragraph._p.get_or_add_pPr()
+    _remove_ppr_child(p_pr, "w:tabs")
+    tabs = OxmlElement("w:tabs")
+    # Clear the style's full-width tab: it lies outside this narrower cell.
+    clear = OxmlElement("w:tab")
+    clear.set(qn("w:val"), "clear")
+    clear.set(qn("w:pos"), str(_cm_to_twips(TABLE_CONTENT_WIDTH_CM)))
+    tabs.append(clear)
+    tab = OxmlElement("w:tab")
+    # In a bidi paragraph "right" is the logical end (visual left) stop: the
+    # leader fills from the title's end up to the page-number column.
+    tab.set(qn("w:val"), "right")
+    tab.set(qn("w:leader"), "dot")
+    tab.set(qn("w:pos"), str(int(position_twips)))
+    tabs.append(tab)
+    _insert_ppr_child(p_pr, tabs, ("w:suppressAutoHyphens", "w:kinsoku", "w:wordWrap",
+                                   "w:overflowPunct", "w:topLinePunct", "w:autoSpaceDE",
+                                   "w:autoSpaceDN", "w:bidi") + PPR_AFTER_BIDI)
+
+
+def _write_toc_page_number(paragraph, text: str, entry, *, fonts: DocumentFonts) -> None:
+    """Replace a TOC page cell with a clickable, literal page number."""
+    for child in list(paragraph._p):
+        if child.tag != qn("w:pPr"):
+            paragraph._p.remove(child)
+    level = int(entry["level"])
+    _add_directional_hyperlink(
+        paragraph,
+        text,
+        str(entry["anchor"]),
+        fonts=fonts,
+        size=TOC_FONT_SIZE[level],
+        bold=level == 1,
+        underline=False,
+    )
+
+
+def _set_static_toc_page_numbers(
+    table, pages: list[int], entries, *, fonts: DocumentFonts
+) -> None:
+    if len(table.rows) != len(pages) or len(entries) != len(pages):
         raise DocxPaginationError("تعداد پیوندهای فهرست پس از صفحه‌بندی تغییر کرد؛ سند ارسال نشد.")
-    for row, page in zip(table.rows, pages):
-        paragraph = row.cells[1].paragraphs[0]
-        for child in list(paragraph._p):
-            if child.tag != qn("w:pPr"):
-                paragraph._p.remove(child)
-        _add_directional_text(
-            paragraph,
-            to_persian_digits(str(page)),
-            fonts=fonts,
-            size=10.5,
-            color=MUTED,
+    for row, page, entry in zip(table.rows, pages, entries):
+        _write_toc_page_number(
+            row.cells[1].paragraphs[0], to_persian_digits(str(page)), entry, fonts=fonts
         )
+
+
 def _save_document_bytes(document, fonts: DocumentFonts) -> bytes:
     buffer = io.BytesIO()
     document.save(buffer)
-    return _inject_font_fallbacks(buffer.getvalue(), fonts)
+    payload = normalize_bidi_alignment(buffer.getvalue())
+    return _inject_font_fallbacks(payload, fonts)
+
+
+_FALSE_VALUES = frozenset({"0", "false", "off"})
+_JC_MIRROR = {"left": "right", "right": "left"}
+_IND_MIRROR = (("w:left", "w:right"), ("w:leftChars", "w:rightChars"))
+
+
+def _mirror_indentation(p_pr) -> None:
+    """Swap visual left/right indents into the logical sides of an RTL paragraph."""
+    if p_pr is None:
+        return
+    ind = p_pr.find(qn("w:ind"))
+    if ind is None:
+        return
+    for first, second in _IND_MIRROR:
+        a, b = ind.get(qn(first)), ind.get(qn(second))
+        for name, value in ((first, b), (second, a)):
+            if value is None:
+                ind.attrib.pop(qn(name), None)
+            else:
+                ind.set(qn(name), value)
+#: ``w:pPr`` children that follow ``w:jc`` (CT_PPrBase / CT_PPr order).
+PPR_AFTER_JC = (
+    "w:textDirection", "w:textAlignment", "w:textboxTightWrap", "w:outlineLvl",
+    "w:divId", "w:cnfStyle", "w:rPr", "w:sectPr", "w:pPrChange",
+)
+
+
+def _on_off(element) -> bool | None:
+    if element is None:
+        return None
+    return (element.get(qn("w:val")) or "1").lower() not in _FALSE_VALUES
+
+
+def normalize_bidi_alignment(docx_bytes: bytes) -> bytes:
+    """Write every ``w:jc``/``w:ind`` left/right as Word renders it visually.
+
+    The builder code expresses alignment *visually* (``RIGHT`` = flush to the
+    right page edge). In a ``w:bidi`` paragraph, Word ([MS-OI29500] jc) and
+    LibreOffice interpret ``left``/``right`` *logically* (``left`` = leading
+    edge = the right side of an RTL line), so a Persian heading written with
+    ``jc="right"`` was rendered flush-left. A real LibreOffice render of the
+    old output showed exactly that for headings, TOC rows, bullets and table
+    cells.
+
+    This pass resolves each paragraph's effective direction (own ``w:bidi`` ->
+    style chain -> ``w:docDefaults``) and its authored visual alignment (own
+    ``w:jc`` -> style chain), then writes an explicit, direction-correct
+    ``w:jc`` on the paragraph. Styles are mirrored the same way so newly
+    typed paragraphs also align correctly. It runs on the serialized package,
+    once per save, so the in-memory document is never double-mirrored.
+    Paragraph indents (``w:ind`` left/right) have the same logical semantics
+    in RTL paragraphs and are mirrored with the same rule; otherwise a hanging
+    numbered step pushes its number into the right margin.
+    """
+    try:
+        source = io.BytesIO(docx_bytes)
+        with zipfile.ZipFile(source) as archive:
+            members = {name: archive.read(name) for name in archive.namelist()}
+        if "word/styles.xml" not in members:
+            return docx_bytes
+        styles_root = etree.fromstring(members["word/styles.xml"])
+        default_bidi = False
+        doc_defaults = styles_root.find(qn("w:docDefaults"))
+        if doc_defaults is not None:
+            found = doc_defaults.find(f"{qn('w:pPrDefault')}/{qn('w:pPr')}/{qn('w:bidi')}")
+            default_bidi = bool(_on_off(found))
+        styles: dict[str, etree._Element] = {}
+        default_paragraph_style = None
+        for style in styles_root.findall(qn("w:style")):
+            if style.get(qn("w:type")) != "paragraph":
+                continue
+            style_id = style.get(qn("w:styleId"))
+            styles[style_id] = style
+            if (style.get(qn("w:default")) or "").lower() in {"1", "true", "on"}:
+                default_paragraph_style = style_id
+
+        def chain(style_id):
+            seen = set()
+            while style_id and style_id in styles and style_id not in seen:
+                seen.add(style_id)
+                yield styles[style_id]
+                based = styles[style_id].find(qn("w:basedOn"))
+                style_id = based.get(qn("w:val")) if based is not None else None
+
+        authored_jc: dict[str, str | None] = {}
+        style_bidi: dict[str, bool] = {}
+        for style_id in styles:
+            jc_value = None
+            bidi_value = None
+            for item in chain(style_id):
+                p_pr = item.find(qn("w:pPr"))
+                if p_pr is None:
+                    continue
+                if jc_value is None and p_pr.find(qn("w:jc")) is not None:
+                    jc_value = p_pr.find(qn("w:jc")).get(qn("w:val"))
+                if bidi_value is None:
+                    bidi_value = _on_off(p_pr.find(qn("w:bidi")))
+            authored_jc[style_id] = jc_value
+            style_bidi[style_id] = default_bidi if bidi_value is None else bidi_value
+
+        for style_id, style in styles.items():
+            p_pr = style.find(qn("w:pPr"))
+            jc = p_pr.find(qn("w:jc")) if p_pr is not None else None
+            if jc is not None and style_bidi[style_id] and jc.get(qn("w:val")) in _JC_MIRROR:
+                jc.set(qn("w:val"), _JC_MIRROR[jc.get(qn("w:val"))])
+            if style_bidi[style_id]:
+                _mirror_indentation(p_pr)
+
+        def fix_part(root) -> None:
+            for paragraph in root.iter(qn("w:p")):
+                p_pr = paragraph.find(qn("w:pPr"))
+                style_id = None
+                if p_pr is not None and p_pr.find(qn("w:pStyle")) is not None:
+                    style_id = p_pr.find(qn("w:pStyle")).get(qn("w:val"))
+                if style_id not in styles:
+                    style_id = default_paragraph_style
+                own_bidi = _on_off(p_pr.find(qn("w:bidi"))) if p_pr is not None else None
+                rtl = (
+                    own_bidi if own_bidi is not None
+                    else style_bidi.get(style_id, default_bidi) if style_id else default_bidi
+                )
+                if rtl:
+                    _mirror_indentation(p_pr)
+                own_jc = p_pr.find(qn("w:jc")) if p_pr is not None else None
+                visual = (
+                    own_jc.get(qn("w:val")) if own_jc is not None
+                    else authored_jc.get(style_id) if style_id else None
+                )
+                if visual not in _JC_MIRROR:
+                    continue
+                logical = _JC_MIRROR[visual] if rtl else visual
+                if own_jc is None:
+                    if p_pr is None:
+                        p_pr = etree.Element(qn("w:pPr"))
+                        paragraph.insert(0, p_pr)
+                    own_jc = etree.Element(qn("w:jc"))
+                    for tag in PPR_AFTER_JC:
+                        successor = p_pr.find(qn(tag))
+                        if successor is not None:
+                            successor.addprevious(own_jc)
+                            break
+                    else:
+                        p_pr.append(own_jc)
+                own_jc.set(qn("w:val"), logical)
+
+        def serialize(root) -> bytes:
+            return etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+
+        members["word/styles.xml"] = serialize(styles_root)
+        for name in list(members):
+            if name == "word/document.xml" or re.fullmatch(r"word/(header|footer)\d*\.xml", name):
+                root = etree.fromstring(members[name])
+                fix_part(root)
+                members[name] = serialize(root)
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, payload in members.items():
+                archive.writestr(name, payload)
+        return out.getvalue()
+    except Exception:
+        # Direction is part of the deliverable's correctness: never ship a
+        # silently half-mirrored file.
+        logger.exception("RTL alignment normalization failed")
+        raise
 
 
 def _destination_page_number(reader, destination) -> int | None:
@@ -1750,6 +2001,68 @@ def _destination_page_number(reader, destination) -> int | None:
         return None
 
 
+_TITLE_IGNORABLE = re.compile("[\\s\u200b-\u200f\u202a-\u202e\u2066-\u2069\u00ad\ufeff]+")
+_DIGIT_MAP = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def _title_key(value: str) -> str:
+    """Compare heading titles across DOCX text and PDF outline strings."""
+    import unicodedata
+
+    text = unicodedata.normalize("NFKC", str(value or "")).translate(_DIGIT_MAP)
+    text = text.replace("ي", "ی").replace("ك", "ک")
+    return _TITLE_IGNORABLE.sub("", text).casefold()
+
+
+def _flatten_outline(reader, items, depth: int = 0, out=None) -> list[tuple[int, str, int | None]]:
+    out = [] if out is None else out
+    for item in items or []:
+        if isinstance(item, list):
+            _flatten_outline(reader, item, depth + 1, out)
+            continue
+        try:
+            page_index = reader.get_destination_page_number(item)
+        except Exception:
+            page_index = None
+        out.append((depth, str(item.get("/Title") or ""), None if page_index is None else page_index + 1))
+    return out
+
+
+def _render_pdf(docx_bytes: bytes, root: Path, *, renderer: str, timeout_seconds: int) -> Path:
+    source = root / "document.docx"
+    source.write_bytes(docx_bytes)
+    profile = root / "libreoffice-profile"
+    profile.mkdir(mode=0o700)
+    command = [
+        renderer,
+        f"-env:UserInstallation={profile.as_uri()}",
+        "--headless",
+        "--convert-to",
+        "pdf:writer_pdf_Export",
+        "--outdir",
+        str(root),
+        str(source),
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(1, min(int(timeout_seconds), 900)),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        raise DocxPaginationError(
+            "LibreOffice نتوانست صفحه‌بندی دقیق سند را در مهلت تنظیم‌شده انجام دهد."
+        ) from None
+    pdf_path = root / "document.pdf"
+    if completed.returncode != 0 or not pdf_path.is_file() or pdf_path.stat().st_size == 0:
+        # Renderer output is intentionally not surfaced: it may contain
+        # excerpts of user-provided document text.
+        raise DocxPaginationError("خروجی PDF صفحه‌بندی دقیق سند تولید نشد.")
+    return pdf_path
+
+
 def _rendered_toc_page_numbers(
     docx_bytes: bytes,
     entries: list[dict[str, str | int]],
@@ -1757,11 +2070,19 @@ def _rendered_toc_page_numbers(
     timeout_seconds: int,
     renderer_bin: str | None = None,
 ) -> list[int]:
-    """Render through LibreOffice and resolve every TOC link from its PDF target.
+    """Render through LibreOffice and read each TOC heading's *actual* page.
 
-    This intentionally has no Pillow/layout-estimate fallback. A missing
-    renderer, PDF reader, TOC link, or ambiguous link map is a hard failure:
-    page numbers are never guessed.
+    The page of a heading is taken from the rendered PDF's document outline,
+    which LibreOffice builds from the very Heading paragraphs the TOC lists
+    (one outline item per heading, in document order, each with a resolved
+    page destination). Every TOC entry must match the next outline item with
+    the same normalized title; when the renderer also emits link annotations
+    for the TOC hyperlinks, their destinations must agree as well.
+
+    There is intentionally no estimate fallback. A missing renderer or PDF
+    reader, a missing/ambiguous outline item, a TOC that does not start on
+    page 2, or a heading before page 3 is a hard failure: page numbers are
+    never guessed.
     """
     renderer = renderer_bin or shutil.which("soffice") or shutil.which("libreoffice")
     if not renderer:
@@ -1777,89 +2098,68 @@ def _rendered_toc_page_numbers(
 
     with tempfile.TemporaryDirectory(prefix="gamas-docx-pagination-") as temporary:
         root = Path(temporary)
-        source = root / "document.docx"
-        source.write_bytes(docx_bytes)
-        profile = root / "libreoffice-profile"
-        profile.mkdir(mode=0o700)
-        command = [
-            renderer,
-            f"-env:UserInstallation={profile.as_uri()}",
-            "--headless",
-            "--convert-to",
-            "pdf:writer_pdf_Export",
-            "--outdir",
-            str(root),
-            str(source),
-        ]
+        pdf_path = _render_pdf(
+            docx_bytes, root, renderer=renderer, timeout_seconds=timeout_seconds
+        )
         try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=max(1, min(int(timeout_seconds), 900)),
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            raise DocxPaginationError(
-                "LibreOffice نتوانست صفحه‌بندی دقیق سند را در مهلت تنظیم‌شده انجام دهد."
-            ) from None
-        pdf_path = root / "document.pdf"
-        if completed.returncode != 0 or not pdf_path.is_file() or pdf_path.stat().st_size == 0:
-            # Renderer output is intentionally not surfaced: it may contain
-            # excerpts of user-provided document text.
-            raise DocxPaginationError("خروجی PDF صفحه‌بندی دقیق سند تولید نشد.")
-        try:
-            reader = PdfReader(str(pdf_path), strict=True)
-            if len(reader.pages) < 2:
-                raise ValueError("Rendered document has no second page")
-            page = reader.pages[1]
-            annotations = page.get("/Annots") or []
-            links: list[tuple[float, str | None, int]] = []
-            for reference in annotations:
-                annotation = reference.get_object()
-                if str(annotation.get("/Subtype")) != "/Link":
-                    continue
-                destination = annotation.get("/Dest")
-                action = annotation.get("/A")
-                if destination is None and action is not None:
-                    action = action.get_object()
-                    if str(action.get("/S")) == "/GoTo":
-                        destination = action.get("/D")
-                page_number = _destination_page_number(reader, destination)
-                rectangle = annotation.get("/Rect")
-                if page_number is None or rectangle is None:
-                    continue
-                top = float(rectangle[3])
-                tooltip = annotation.get("/Contents")
-                tooltip_text = str(tooltip) if tooltip is not None else None
-                links.append((top, tooltip_text, page_number))
-        except DocxPaginationError:
-            raise
+            reader = PdfReader(str(pdf_path), strict=False)
+            page_count = len(reader.pages)
+            if page_count < 3:
+                raise ValueError("Rendered document has no body page")
+            outline = _flatten_outline(reader, reader.outline)
+            toc_page_text = _title_key(reader.pages[1].extract_text() or "")
+            first_page_text = _title_key(reader.pages[0].extract_text() or "")
+            link_pages: dict[str, set[int]] = {}
+            for index, page in enumerate(reader.pages[1:], start=2):
+                for reference in page.get("/Annots") or []:
+                    annotation = reference.get_object()
+                    if str(annotation.get("/Subtype")) != "/Link":
+                        continue
+                    destination = annotation.get("/Dest")
+                    action = annotation.get("/A")
+                    if destination is None and action is not None:
+                        action = action.get_object()
+                        if str(action.get("/S")) == "/GoTo":
+                            destination = action.get("/D")
+                    target = _destination_page_number(reader, destination)
+                    tooltip = annotation.get("/Contents")
+                    if target is not None and tooltip is not None:
+                        link_pages.setdefault(str(tooltip), set()).add(target)
         except Exception:
             raise DocxPaginationError(
-                "پیوندهای داخلی فهرست از PDF صفحه‌بندی‌شده قابل خواندن نبودند."
+                "ساختار صفحه‌بندی PDF (outline عنوان‌ها) قابل خواندن نبود."
             ) from None
 
-    expected = len(entries)
-    if len(links) != expected:
-        raise DocxPaginationError(
-            "فهرست در یک صفحهٔ قابل نگاشت جا نشد یا LibreOffice همهٔ پیوندهای آن را حفظ نکرد."
-        )
-
-    # If the renderer preserves the OOXML tooltip in PDF annotations, use that
-    # unique bookmark name directly. Otherwise the one-link-per-row geometry on
-    # the single TOC page gives an unambiguous visual order.
-    by_tooltip = {tooltip: page for _top, tooltip, page in links if tooltip}
-    anchors = [str(entry["anchor"]) for entry in entries]
-    if all(anchor in by_tooltip for anchor in anchors):
-        pages = [by_tooltip[anchor] for anchor in anchors]
-        if any(page < 3 for page in pages):
-            raise DocxPaginationError("یکی از فهرست‌پیوندها به جایگاه بدنهٔ سند نرسید.")
-        return pages
-    links.sort(key=lambda item: item[0], reverse=True)
-    pages = [item[2] for item in links]
-    if any(page < 3 for page in pages):
-        raise DocxPaginationError("یکی از فهرست‌پیوندها به جایگاه بدنهٔ سند نرسید.")
+    toc_key = _title_key(TOC_TITLE)
+    # PDF text extraction may emit RTL text in visual order; accept both.
+    toc_keys = (toc_key, toc_key[::-1])
+    if not any(key in toc_page_text for key in toc_keys) or any(
+        key in first_page_text for key in toc_keys
+    ):
+        raise DocxPaginationError("فهرست مطالب دقیقاً از صفحهٔ ۲ شروع نشد؛ سند ارسال نشد.")
+    pages: list[int] = []
+    cursor = 0
+    for entry in entries:
+        wanted = _title_key(str(entry["title"]))
+        found = None
+        while cursor < len(outline):
+            _depth, title, page = outline[cursor]
+            cursor += 1
+            if _title_key(title) == wanted:
+                found = page
+                break
+        if found is None:
+            raise DocxPaginationError(
+                "جایگاه یکی از عنوان‌های فهرست در PDF صفحه‌بندی‌شده پیدا نشد؛ شمارهٔ صفحه حدس زده نمی‌شود."
+            )
+        if found < 3 or found > page_count:
+            raise DocxPaginationError("یکی از عنوان‌ها پیش از صفحهٔ ۳ یا خارج از سند قرار گرفت.")
+        expected_links = link_pages.get(str(entry["anchor"]))
+        if expected_links and expected_links != {found}:
+            raise DocxPaginationError("پیوند فهرست و جایگاه عنوان در PDF با هم سازگار نیستند.")
+        pages.append(found)
+    if pages != sorted(pages):
+        raise DocxPaginationError("ترتیب صفحه‌های فهرست با ترتیب عنوان‌ها سازگار نیست.")
     return pages
 
 
@@ -1871,65 +2171,66 @@ def _finish_static_toc(
     fonts: DocumentFonts,
     design: DocxDesign,
 ) -> bytes:
-    """Render, map, fill, and verify static TOC numbers until they are stable."""
+    """Render, measure, write and re-verify static TOC page numbers.
+
+    Pass 1 renders the document with fixed-width placeholders, pass 2 writes
+    the measured numbers as ordinary text, and a verification render must
+    reproduce exactly the same numbers (writing them can, in principle, move
+    content). Up to three corrections are attempted; an unstable result is a
+    hard failure rather than a document with wrong numbers.
+    """
     if toc_table is None:
         return _save_document_bytes(document, fonts)
     payload = _save_document_bytes(document, fonts)
-    previous: list[int] | None = None
-    for _attempt in range(3):
-        pages = _rendered_toc_page_numbers(
-            payload,
+
+    def measure(data: bytes) -> list[int]:
+        return _rendered_toc_page_numbers(
+            data,
             entries,
             timeout_seconds=design.pagination_timeout_seconds,
             renderer_bin=design.pagination_renderer_bin,
         )
-        _set_static_toc_page_numbers(toc_table, pages, fonts=fonts)
+
+    pages = measure(payload)
+    for _attempt in range(3):
+        _set_static_toc_page_numbers(toc_table, pages, entries, fonts=fonts)
         payload = _save_document_bytes(document, fonts)
-        if pages == previous:
-            # One more render has confirmed the literal page numbers did not
-            # move the headings they describe.
-            verified = _rendered_toc_page_numbers(
-                payload,
-                entries,
-                timeout_seconds=design.pagination_timeout_seconds,
-                renderer_bin=design.pagination_renderer_bin,
-            )
-            if verified == pages:
-                return payload
-        previous = pages
-    # A final rendered pass is required even when the first iteration's values
-    # were already stable; no output is returned based only on an estimate.
-    verified = _rendered_toc_page_numbers(
-        payload,
-        entries,
-        timeout_seconds=design.pagination_timeout_seconds,
-        renderer_bin=design.pagination_renderer_bin,
+        verified = measure(payload)
+        if verified == pages:
+            return payload
+        pages = verified
+    raise DocxPaginationError(
+        "شماره‌های فهرست پس از صفحه‌بندی نهایی پایدار نماندند؛ سند ارسال نشد."
     )
-    if verified == previous:
-        return payload
-    _set_static_toc_page_numbers(toc_table, verified, fonts=fonts)
-    payload = _save_document_bytes(document, fonts)
-    final = _rendered_toc_page_numbers(
-        payload,
-        entries,
-        timeout_seconds=design.pagination_timeout_seconds,
-        renderer_bin=design.pagination_renderer_bin,
-    )
-    if final != verified:
-        raise DocxPaginationError(
-            "شماره‌های فهرست پس از صفحه‌بندی نهایی پایدار نماندند؛ سند ارسال نشد."
-        )
-    return payload
 
 # ---------------------------------------------------------------------------
 # Body blocks
 # ---------------------------------------------------------------------------
 
 
+#: Bookmark names must start with a letter/underscore, contain only
+#: letters/digits/underscores and be at most 40 characters (ECMA-376
+#: §17.13.6.2). A leading underscore keeps them out of Word's visible
+#: bookmark list, like Word's own ``_Toc`` bookmarks.
+BOOKMARK_PREFIX = "_GamasH"
+BOOKMARK_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,39}$")
+
+
 def _add_bookmark(paragraph) -> str:
-    """Attach a unique internal bookmark to a body heading."""
+    """Attach a unique internal bookmark to a body heading.
+
+    Names are generated from a per-document sequence -- never from the heading
+    text -- so duplicate titles still get unique anchors and no user text can
+    produce an invalid or colliding OOXML name. ``w:id`` values come from a
+    process-wide counter so they are unique within every document part.
+    """
+    part = paragraph.part
+    sequence = getattr(part, "_gamas_bookmark_sequence", 0) + 1
+    part._gamas_bookmark_sequence = sequence
     number = next(_BOOKMARK_IDS)
-    name = f"GamasHeading{number}"
+    name = f"{BOOKMARK_PREFIX}{sequence}"
+    if not BOOKMARK_NAME_RE.match(name):  # pragma: no cover - defensive
+        raise DocxPaginationError("نام نشانک داخلی نامعتبر ساخته شد.")
     start = OxmlElement("w:bookmarkStart")
     start.set(qn("w:id"), str(number))
     start.set(qn("w:name"), name)

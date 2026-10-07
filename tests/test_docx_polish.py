@@ -291,11 +291,20 @@ class TocTests(DocxTestCase):
             for item in root.iter(f"{W}bookmarkStart")
             if item.get(f"{W}name")
         ]
-        links = [
-            item.get(f"{W}anchor")
-            for item in root.iter(f"{W}hyperlink")
-            if item.get(f"{W}anchor")
-        ]
+        toc_table = next(child for child in root.find(f"{W}body") if child.tag == f"{W}tbl")
+        links = []
+        for row in toc_table.iter(f"{W}tr"):
+            title_cell, page_cell = row.findall(f"{W}tc")
+            title_links = [h.get(f"{W}anchor") for h in title_cell.iter(f"{W}hyperlink")]
+            page_links = [h.get(f"{W}anchor") for h in page_cell.iter(f"{W}hyperlink")]
+            # Both the title and its page number are clickable, to one target.
+            self.assertEqual(len(title_links), 1)
+            self.assertEqual(page_links, title_links)
+            links.extend(title_links)
+        all_links = {
+            item.get(f"{W}anchor") for item in root.iter(f"{W}hyperlink") if item.get(f"{W}anchor")
+        }
+        self.assertEqual(all_links, set(links))
         self.assertGreaterEqual(len(links), 4)
         self.assertEqual(len(links), len(set(links)))
         self.assertEqual(len(bookmarks), len(set(bookmarks)))
@@ -420,26 +429,33 @@ class TocTests(DocxTestCase):
             self.skipTest("LibreOffice is not installed; page mapping is covered by the explicit-failure test")
         data = self.build(long_notes_json(), enable_toc=True)
         root = ET.fromstring(self.document_xml(data))
-        anchors = [
-            item.get(f"{W}anchor")
-            for item in root.iter(f"{W}hyperlink")
-            if item.get(f"{W}anchor")
-        ]
-        entries = [{"anchor": anchor} for anchor in anchors]
-        from gamas_bot.docx_export import _rendered_toc_page_numbers
-
-        pages = _rendered_toc_page_numbers(data, entries, timeout_seconds=120)
-        self.assertTrue(pages)
-        self.assertTrue(all(page >= 3 for page in pages))
-        # The rendered numbers must be the literal page-cell text, not a field.
         toc_table = root.find(f"{W}body/{W}tbl")
         self.assertIsNotNone(toc_table)
-        page_cells = [row.findall(f"{W}tc")[1] for row in toc_table.findall(f"{W}tr")]
-        visible_numbers = [
-            "".join(node.text or "" for node in cell.iter(f"{W}t"))
-            for cell in page_cells
-        ]
-        self.assertEqual(len(visible_numbers), len(pages))
+        entries, visible_numbers = [], []
+        for row in toc_table.findall(f"{W}tr"):
+            title_cell, page_cell = row.findall(f"{W}tc")
+            link = title_cell.find(f".//{W}hyperlink")
+            entries.append({
+                "anchor": link.get(f"{W}anchor"),
+                "title": "".join(node.text or "" for node in link.iter(f"{W}t")),
+            })
+            # The rendered numbers must be the literal page-cell text, not a field.
+            visible_numbers.append(
+                "".join(node.text or "" for node in page_cell.iter(f"{W}t"))
+            )
+        bookmarks = {
+            item.get(f"{W}name") for item in root.iter(f"{W}bookmarkStart")
+        }
+        self.assertTrue({entry["anchor"] for entry in entries} <= bookmarks)
+        from gamas_bot.docx_export import _rendered_toc_page_numbers
+
+        # Independent second render of the *delivered* file.
+        pages = _rendered_toc_page_numbers(data, entries, timeout_seconds=300)
+        self.assertTrue(pages)
+        self.assertTrue(all(page >= 3 for page in pages))
+        self.assertEqual(pages, sorted(pages))
+        persian = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+        self.assertEqual(visible_numbers, [str(page).translate(persian) for page in pages])
 
 
 class DirectionAndResourceTests(DocxTestCase):
