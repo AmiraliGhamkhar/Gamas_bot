@@ -252,7 +252,7 @@ class RtlTableAndListTests(unittest.TestCase):
 
     def test_table_with_mixed_persian_english_content(self):
         """Table containing Persian, English, numbers, and medical abbreviations.
-        
+
         Note: build_plain_docx does not support markdown tables, so this test
         verifies that the notes builder (which does support tables) renders
         mixed content correctly without reversal.

@@ -324,7 +324,7 @@ def _section_props(sect_pr, relationships: dict, relationship_texts: dict) -> di
 
 def _header_footer_texts(zf: zipfile.ZipFile, relationships: dict) -> dict[str, str]:
     texts: dict[str, str] = {}
-    for rid, target in relationships.items():
+    for target in relationships.values():
         if not (target.startswith("header") or target.startswith("footer")):
             continue
         path = f"word/{target}"
@@ -633,7 +633,7 @@ def _draw_page_border(page: Page, page_size: tuple[int, int], borders: dict) -> 
         int(space * DPI / 72.0) + width,
         int(space * DPI / 72.0) + height,
     ]
-    for edge_name, edge in edges.items():
+    for edge in edges.values():
         color = edge["color"]
         line_width = max(int(round(edge["size"] / 8.0 * DPI / 72.0)), 1)
         if edge["val"] == "double":

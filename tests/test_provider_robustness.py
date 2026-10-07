@@ -524,7 +524,7 @@ class ChunkOrderAndCoverageTests(unittest.IsolatedAsyncioTestCase):
         # still arrive in order, exactly once each.
         prefix = "[بخش ۱ از ۵ این درس — ادامهٔ درس در بخش بعدی می‌آید]\n\n"
         self.assertEqual(seen[0], prefix + chunks[0])
-        self.assertTrue(all(chunk in item for chunk, item in zip(chunks, seen)))
+        self.assertTrue(all(chunk in item for chunk, item in zip(chunks, seen, strict=True)))
         self.assertEqual(
             [section.heading for section in result.sections],
             [f"بخش {index}" for index in range(1, 6)],

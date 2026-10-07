@@ -222,7 +222,7 @@ _TERM_STOPWORDS = frozenset(
         "by", "an", "or", "we", "he", "do", "does", "did", "done", "get",
         "got", "make", "made", "take", "taken", "see", "seen", "well", "way",
         "part", "like", "just", "now", "even", "here", "still", "much",
-        "many", "each", "every", "next", "last", "first", "second", "third",
+        "many", "every", "next", "last", "first", "second", "third",
     }
 )
 

@@ -314,25 +314,25 @@ class FontProfileTests(unittest.TestCase):
 
         from gamas_bot.config import Settings
 
-        base = dict(
-            TELEGRAM_BOT_TOKEN="t",
-            TELEGRAM_API_ID="1",
-            TELEGRAM_API_HASH="h",
-            DOCX_COVER_ENABLED="false",
-            DOCX_TOC_ENABLED="true",
-            DOCX_TOC_LEVELS="1-2",
-            DOCX_TOC_MIN_SECTIONS="7",
-            DOCX_PAGE_BORDER_ENABLED="true",
-            DOCX_PAGE_BORDER_STYLE="double",
-            DOCX_PAGE_BORDER_COLOR="112233",
-            DOCX_PAGE_BORDER_WIDTH="12",
-            DOCX_PAGE_BORDER_SPACE="18",
-            DOCX_SHOW_FOOTER_BRAND="false",
-            DOCX_BODY_FONT="BodyFont",
-            DOCX_HEADING_FONT="HeadFont",
-            DOCX_LATIN_FONT="LatinFont",
-            DOCX_FALLBACK_FONT="FallbackFont",
-        )
+        base = {
+            "TELEGRAM_BOT_TOKEN": "t",
+            "TELEGRAM_API_ID": "1",
+            "TELEGRAM_API_HASH": "h",
+            "DOCX_COVER_ENABLED": "false",
+            "DOCX_TOC_ENABLED": "true",
+            "DOCX_TOC_LEVELS": "1-2",
+            "DOCX_TOC_MIN_SECTIONS": "7",
+            "DOCX_PAGE_BORDER_ENABLED": "true",
+            "DOCX_PAGE_BORDER_STYLE": "double",
+            "DOCX_PAGE_BORDER_COLOR": "112233",
+            "DOCX_PAGE_BORDER_WIDTH": "12",
+            "DOCX_PAGE_BORDER_SPACE": "18",
+            "DOCX_SHOW_FOOTER_BRAND": "false",
+            "DOCX_BODY_FONT": "BodyFont",
+            "DOCX_HEADING_FONT": "HeadFont",
+            "DOCX_LATIN_FONT": "LatinFont",
+            "DOCX_FALLBACK_FONT": "FallbackFont",
+        }
         with patch.dict("os.environ", base, clear=False):
             settings = Settings.from_env()
         design = settings.docx_design
@@ -360,16 +360,16 @@ class FontProfileTests(unittest.TestCase):
 
         from gamas_bot.config import Settings
 
-        base = dict(
-            TELEGRAM_BOT_TOKEN="t",
-            TELEGRAM_API_ID="1",
-            TELEGRAM_API_HASH="h",
+        base = {
+            "TELEGRAM_BOT_TOKEN": "t",
+            "TELEGRAM_API_ID": "1",
+            "TELEGRAM_API_HASH": "h",
             # Clear any ambient value so the test is deterministic.
-            DOCX_FONT_BODY="",
-            DOCX_FONT_HEADING="",
-            DOCX_FONT_LATIN="",
-            DOCX_FONT_FALLBACK="",
-        )
+            "DOCX_FONT_BODY": "",
+            "DOCX_FONT_HEADING": "",
+            "DOCX_FONT_LATIN": "",
+            "DOCX_FONT_FALLBACK": "",
+        }
         with patch.dict(
             "os.environ",
             {**base, "DOCX_BODY_FONT": "AliasBody", "DOCX_HEADING_FONT": "AliasHead"},

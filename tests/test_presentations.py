@@ -27,7 +27,11 @@ from gamas_bot.presentations import (
     read_presentation,
     slides_outline,
 )
-from gamas_bot.structuring import build_presentation_document, structure_presentation
+from gamas_bot.structuring import (
+    StructuringError,
+    build_presentation_document,
+    structure_presentation,
+)
 
 from support import (
     AUDIO_REL,
@@ -448,7 +452,7 @@ class PresentationStructuringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(chunker.await_count, 1)
 
     async def test_empty_input_is_rejected(self):
-        with self.assertRaises(Exception):
+        with self.assertRaises(StructuringError):
             await structure_presentation("", "", make_settings())
 
 

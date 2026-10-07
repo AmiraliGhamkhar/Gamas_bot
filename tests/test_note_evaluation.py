@@ -177,7 +177,7 @@ class PipelineBenchmarkTests(unittest.TestCase):
                 headings = [section.heading for section in notes.sections] * 2
                 adjacent_repeats = sum(
                     1
-                    for first, second in zip(headings, headings[1:])
+                    for first, second in zip(headings, headings[1:], strict=False)
                     if first == second
                 )
                 self.assertLessEqual(
