@@ -1,0 +1,110 @@
+# Canonical project definition for Gamas Bot.
+#
+# ``[project].dependencies`` below is the single source of truth for runtime
+# requirements. ``requirements.txt`` is generated from it by
+# ``python -m scripts.sync_requirements`` so a cPanel/Passenger deployment that
+# still runs ``pip install -r requirements.txt`` cannot drift from the
+# canonical list; ``tests/test_dependency_consistency.py`` fails the build when
+# they disagree.
+#
+# This project is an *application*: it is deployed in place (Passenger/wsgi or
+# systemd) rather than installed from an index, which is why the runtime
+# dependencies are pinned with bounded ranges instead of exact versions.
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gamas-bot"
+version = "2.0.0"
+description = "Persian study-note bot: lecture audio/video/PowerPoint -> structured RTL Word booklet"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    # Telegram transport.
+    "Telethon>=1.45,<2.0",
+    "python-socks[asyncio]>=2.4,<3.0",
+    # Async HTTP (provider calls) and async SQLite.
+    "aiohttp>=3.14,<4.0",
+    "aiosqlite>=0.22,<1.0",
+    "python-dotenv>=1.2,<2.0",
+    # Media: PyAV ships its own FFmpeg libraries, so no system ffmpeg/ffprobe
+    # binary is involved. python-pptx/python-docx read Office packages, and
+    # ppt2pptx converts legacy .ppt in-process.
+    "av>=16.0,<19.0",
+    "python-pptx>=1.0.2,<2.0",
+    "python-docx>=1.1,<2.0",
+    "ppt2pptx>=0.4.2,<0.5",
+    # XML rewriting of OOXML parts.
+    "lxml>=6.1,<7.0",
+    # Rasterising rendered pages for the offline fidelity tool
+    # (scripts/render_docx_pages.py). Pillow is also pulled in by python-pptx;
+    # declaring it makes the requirement explicit rather than incidental.
+    "Pillow>=10.0,<13.0",
+    # Persian shaping/bidi for the offline page renderer: without them the
+    # rendered pages show disconnected letters.
+    "arabic-reshaper>=3.0,<4.0",
+    "python-bidi>=0.6,<0.7",
+    # Fernet-encrypted provider credentials + rendered-PDF TOC pagination.
+    "cryptography>=44.0,<47.0",
+    "pypdf>=5.0,<7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.6",
+    "pytest>=8.0",
+    "mypy>=1.11",
+]
+
+[project.scripts]
+gamas-bot = "gamas_bot.__main__:main"
+
+[tool.setuptools]
+packages = ["gamas_bot"]
+
+[tool.ruff]
+target-version = "py311"
+# The project's own convention is ~100 columns; long Persian strings and
+# inline documentation occasionally run past it, so the limit is a guide for
+# new code rather than a hard gate (E501 is not in the selected rule set).
+line-length = 120
+extend-exclude = [".venv", ".render"]
+
+[tool.ruff.lint]
+# Real errors and probable bugs only. Formatting is deliberately not
+# enforced with `ruff format` in CI: the existing code is hand-wrapped for
+# readability and a wholesale reformat would bury every functional change.
+select = ["E4", "E7", "E9", "F", "W", "B", "C4"]
+ignore = [
+    # Subprocess calls always use a fixed argument vector with shell=False;
+    # the security posture is asserted by tests/test_audit.py instead.
+    "S",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+# Incremental typing gate. These modules are fully annotated and stay clean;
+# the list grows as the rest of the package is annotated rather than being
+# silenced with a blanket ignore.
+files = [
+    "gamas_bot/__init__.py",
+    "gamas_bot/bidi.py",
+    "gamas_bot/billing.py",
+    "gamas_bot/config.py",
+    "gamas_bot/instance_lock.py",
+    "gamas_bot/launcher.py",
+    "gamas_bot/logging_config.py",
+    "gamas_bot/media.py",
+    "gamas_bot/media_worker.py",
+    "gamas_bot/progress.py",
+    "gamas_bot/telegram_text.py",
+    "gamas_bot/textnorm.py",
+]
+ignore_missing_imports = true
+warn_unused_ignores = true
