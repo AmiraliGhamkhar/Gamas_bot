@@ -11,7 +11,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -25,14 +25,47 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -r requirements.txt ruff pytest
-      - name: Check dependency consistency and critical Python errors
+          python -m pip install -r requirements.txt
+      - name: Install development tools
+        run: python -m pip install "ruff>=0.6" "pytest>=8" "mypy>=1.11"
+      - name: Dependency consistency
         run: |
           python -m pip check
-          ruff check gamas_bot scripts tests passenger_wsgi.py --select E9,F
+          python -m scripts.sync_requirements --check
+      - name: Lint
+        run: ruff check .
+      - name: Type check (incremental gate)
+        run: python -m mypy
       - name: Byte-compile every module
         run: python -m compileall -q gamas_bot scripts tests passenger_wsgi.py
+      - name: Migration integrity (fresh database)
+        run: |
+          python - <<'PY'
+          import tempfile, asyncio
+          from pathlib import Path
+          from gamas_bot.database import MIGRATIONS_DIR, Database
+
+          async def main() -> None:
+              with tempfile.TemporaryDirectory() as tmp:
+                  db = Database(Path(tmp) / "ci.sqlite3")
+                  await db.open()
+                  applied = await db._db().execute("SELECT name FROM schema_migrations ORDER BY name")
+                  names = [row[0] for row in await applied.fetchall()]
+                  expected = sorted(p.name for p in MIGRATIONS_DIR.glob("*.sql"))
+                  assert names == expected, f"{names} != {expected}"
+                  await db.close()
+                  print(f"applied {len(names)} migrations")
+
+          asyncio.run(main())
+          PY
       - name: Run offline regression tests
         run: python -m pytest -q
       - name: Run the same suite through unittest (CI entry point used by deployments)
         run: python -m unittest discover -s tests -v
+      - name: Offline benchmark smoke test
+        run: python -m scripts.benchmark_notes --json > /dev/null
+      - name: Dependency security audit (advisory)
+        continue-on-error: true
+        run: |
+          python -m pip install pip-audit
+          python -m pip-audit -r requirements.txt

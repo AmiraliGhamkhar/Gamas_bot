@@ -24,3 +24,6 @@ stt-benchmark.csv
 
 # Rendered page images from scripts/render_docx_pages.py (visual inspection only)
 .render/
+
+# Static type checker cache (mypy)
+.mypy_cache/

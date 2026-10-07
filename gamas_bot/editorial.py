@@ -178,7 +178,7 @@ def build_outline_document(chunks: list[str], *, max_chars: int = OUTLINE_DOCUME
     available = max(max_chars - overhead, OUTLINE_CHUNK_MIN_CHARS * len(parts))
     per_part = max(OUTLINE_CHUNK_MIN_CHARS, min(OUTLINE_CHUNK_HEAD_CHARS, available // len(parts)))
     entries: list[str] = []
-    for label, body in zip(labels, parts):
+    for label, body in zip(labels, parts, strict=True):
         head = body[:per_part]
         tail = ""
         if len(body) > per_part * 2:

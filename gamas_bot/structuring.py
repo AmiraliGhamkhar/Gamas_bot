@@ -743,7 +743,7 @@ def _table_rows_as_bullets(table: NoteTable) -> tuple[str, ...]:
     for row in table.rows:
         pairs = [
             f"{header}: {value}"
-            for header, value in zip(headers, row)
+            for header, value in zip(headers, row, strict=False)
             if value.strip()
         ]
         if pairs:

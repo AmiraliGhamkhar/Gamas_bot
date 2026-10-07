@@ -73,7 +73,24 @@ class DocxPaginationError(RuntimeError):
     """Exact static-TOC page mapping could not be produced safely."""
 
 
-_BOOKMARK_IDS = itertools.count(1)
+class DocxPaginationUnavailable(DocxPaginationError):
+    """No DOCX layout engine (renderer + PDF reader) is available.
+
+    Kept separate from :class:`DocxPaginationError` on purpose: a missing
+    renderer is an *environment* condition, while a renderer that produced an
+    ambiguous or unstable link map is a *content* condition. Only the first may
+    be degraded to a link-only table of contents -- page numbers are still
+    never guessed.
+    """
+
+
+#: Attribute holding this document's own bookmark counter. It used to be a
+#: module-global ``itertools.count``, which made bookmark names depend on how
+#: many documents the process had already produced: output was not reproducible
+#: and the name of the first heading in one user's booklet revealed that user's
+#: position in the server's job sequence. Each document now numbers its own
+#: bookmarks from 1.
+_BOOKMARK_COUNTER_ATTRIBUTE = "_gamas_bookmark_ids"
 
 ACCENT = RGBColor(0x1F, 0x38, 0x64)
 ACCENT_HEX = "1F3864"
@@ -152,6 +169,14 @@ TOC_MIN_BODY_CHARS = 2400
 TOC_LEVELS = "1-1"
 ALLOWED_TOC_LEVELS = frozenset({"1", "1-1", "1-2", "1-3"})
 
+#: Static-TOC page-number policy. ``auto`` keeps exact, renderer-verified page
+#: numbers when LibreOffice/PDF tooling is present and degrades to a link-only
+#: topic list when it is not; ``required`` restores the strict behaviour that
+#: fails rather than emit an unnumbered TOC; ``off`` skips the renderer
+#: entirely, which is the Python-only deployment mode.
+TOC_PAGE_NUMBER_MODES = ("auto", "required", "off")
+TOC_PAGE_NUMBER_MODE = "auto"
+
 #: Auto-detected optional logo, used when DOCX_LOGO_PATH is not configured.
 #: Fonts and images are never downloaded at generation time.
 LOGO_CANDIDATES = ("assets/gamas_logo.png", "assets/gamas_logo.jpg")
@@ -179,6 +204,14 @@ UNSAFE_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]+')
 XML_INVALID_CHARS = re.compile("[\x00-\x08\x0e-\x1f\ud800-\udfff\ufffe\uffff]")
 SOFT_BREAK_CHARS = re.compile("[\x0b\x0c]")
 MAX_FILENAME_TITLE_CHARS = 50
+
+#: Fixed modification time for every member of a produced ``.docx`` package.
+#: python-docx stamps the package with the wall clock on save, so two runs over
+#: identical content produced byte-different files. The final post-processing
+#: rewrite (see :func:`_rewrite_docx_part`) normalises the timestamps, which
+#: makes document generation a pure function of its inputs: artifacts are
+#: reproducible and comparable by hash. Readers ignore member timestamps.
+DOCX_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 
 #: Footer/header caption added next to the page number.
 PAGE_HEADER_TEXT = "جزوهٔ درسی — Gamas Bot"
@@ -215,6 +248,59 @@ def xml_safe(text: str) -> str:
     URLs or digit values — see :mod:`gamas_bot.textnorm`.
     """
     return normalize_display(XML_INVALID_CHARS.sub("", SOFT_BREAK_CHARS.sub(" ", text)))
+
+
+#: python-docx resolves a paragraph style to its *id* by scanning **every**
+#: style in the document (``Styles.default`` -> ``CT_Styles.default_for``) and it
+#: repeats that scan on **every** ``paragraph.style = ...`` assignment -- a
+#: booklet assigns hundreds of styles, so the same O(#styles) walk runs hundreds
+#: of times (profiled at ~25% of the document build). The style set is complete
+#: before the first body paragraph is written (``_configure_styles`` and
+#: ``_configure_toc_entry_styles`` run first and nothing adds a style later), so
+#: the resolved id is memoized per document object.
+_STYLE_ID_ATTRIBUTE = "_gamas_style_ids"
+#: A style name the document does not define. Cached so repeated misses stay
+#: cheap; distinct from ``None``, which is python-docx's "this is the default
+#: style" answer and must clear ``w:pStyle``.
+_STYLE_MISSING = object()
+
+
+def _apply_paragraph_style(paragraph, document, style_name: str) -> None:
+    """Assign a real Word style, memoizing python-docx's O(#styles) lookup.
+
+    Reproduces the public setter's *final* step -- writing (or clearing)
+    ``w:pStyle`` with the resolved id. Anything unexpected falls back to the
+    public API, so the produced document is identical either way; only the
+    repeated style scan is avoided.
+    """
+    cache = getattr(document, _STYLE_ID_ATTRIBUTE, None)
+    if cache is None:
+        cache = {}
+        try:
+            object.__setattr__(document, _STYLE_ID_ATTRIBUTE, cache)
+        except (AttributeError, TypeError):  # pragma: no cover - defensive
+            paragraph.style = style_name
+            return
+    if style_name not in cache:
+        try:
+            style = document.styles[style_name]
+        except KeyError:
+            # A style the document does not define is skipped, exactly as the
+            # previous try/except did (the caller keeps its default look).
+            cache[style_name] = _STYLE_MISSING
+            logger.debug("Unknown Word style %s; falling back to the default", style_name)
+        else:
+            try:
+                cache[style_name] = document.part.get_style_id(style, WD_STYLE_TYPE.PARAGRAPH)
+            except (AttributeError, ValueError):  # pragma: no cover - defensive
+                # Something unexpected about this python-docx version: take the
+                # public path for this assignment instead of dropping the style.
+                paragraph.style = style_name
+                return
+    style_id = cache[style_name]
+    if style_id is _STYLE_MISSING:
+        return
+    paragraph._p.style = style_id
 
 
 @dataclass(frozen=True, slots=True)
@@ -281,6 +367,12 @@ class DocxDesign:
     logo_path: str = ""
     pagination_timeout_seconds: int = 120
     pagination_renderer_bin: str | None = None
+    #: How the static TOC gets its page numbers (see :data:`TOC_PAGE_NUMBER_MODES`):
+    #: ``auto`` uses the renderer when one is installed and falls back to a
+    #: link-only topic list when it is not; ``required`` refuses to emit a
+    #: document whose TOC lacks verified numbers; ``off`` never invokes a
+    #: renderer at all (the pure-Python deployment).
+    toc_page_numbers: str = "auto"
 
     @property
     def logo_file(self):
@@ -343,6 +435,9 @@ def resolve_design(design_config: dict | None = None) -> DocxDesign:
         pagination_timeout = int(config.get("pagination_timeout_seconds") or 120)
     except (TypeError, ValueError):
         pagination_timeout = 120
+    toc_page_numbers = str(config.get("toc_page_numbers") or TOC_PAGE_NUMBER_MODE).strip().lower()
+    if toc_page_numbers not in TOC_PAGE_NUMBER_MODES:
+        toc_page_numbers = TOC_PAGE_NUMBER_MODE
     return DocxDesign(
         cover_enabled=_as_flag(config.get("cover_enabled"), True),
         toc_enabled=_as_flag(config.get("toc_enabled"), True),
@@ -359,6 +454,7 @@ def resolve_design(design_config: dict | None = None) -> DocxDesign:
         pagination_renderer_bin=(
             str(config.get("pagination_renderer_bin") or "").strip() or None
         ),
+        toc_page_numbers=toc_page_numbers,
     )
 
 
@@ -752,10 +848,7 @@ def _add_rtl_paragraph(
 ) -> object:
     paragraph = container.add_paragraph()
     if style:
-        try:
-            paragraph.style = container.styles[style] if hasattr(container, "styles") else style
-        except KeyError:  # pragma: no cover - defensive: unknown style name
-            logger.debug("Unknown Word style %s; falling back to the default", style)
+        _apply_paragraph_style(paragraph, container, style)
     return _fill_paragraph(
         paragraph,
         text,
@@ -1257,18 +1350,24 @@ def _rewrite_docx_part(docx_bytes: bytes, part_name: str, transform) -> bytes:
     try:
         buffer = io.BytesIO(docx_bytes)
         with zipfile.ZipFile(buffer) as archive:
-            members = {name: archive.read(name) for name in archive.namelist()}
+            # The original ``ZipInfo`` is carried through, so every member keeps
+            # its own compression type and modification time. Re-creating the
+            # entries from bare names would stamp the package with the wall
+            # clock and make two runs over the same content differ byte-for-byte.
+            members = {info.filename: (info, archive.read(info.filename)) for info in archive.infolist()}
         if part_name not in members:
             return docx_bytes
-        root = etree.fromstring(members[part_name])
+        root = etree.fromstring(members[part_name][1])
         transform(root)
-        members[part_name] = etree.tostring(
-            root, xml_declaration=True, encoding="UTF-8", standalone=True
+        members[part_name] = (
+            members[part_name][0],
+            etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True),
         )
         out = io.BytesIO()
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as archive:
-            for name, payload in members.items():
-                archive.writestr(name, payload)
+            for info, payload in members.values():
+                info.date_time = DOCX_ZIP_TIMESTAMP
+                archive.writestr(info, payload)
         return out.getvalue()
     except Exception:
         logger.debug("Rewriting %s failed", part_name, exc_info=True)
@@ -1675,7 +1774,7 @@ def _fill_static_toc(
         row._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
         title_cell, page_cell = row.cells
         title_paragraph = title_cell.paragraphs[0]
-        title_paragraph.style = document.styles[f"TOC {entry['level']}"]
+        _apply_paragraph_style(title_paragraph, document, f"TOC {entry['level']}")
         title_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
         title_paragraph.paragraph_format.space_before = Pt(0)
         title_paragraph.paragraph_format.space_after = Pt(0)
@@ -1689,7 +1788,7 @@ def _fill_static_toc(
             size=10.5,
         )
         page_paragraph = page_cell.paragraphs[0]
-        page_paragraph.style = document.styles[f"TOC {entry['level']}"]
+        _apply_paragraph_style(page_paragraph, document, f"TOC {entry['level']}")
         page_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
         page_paragraph.paragraph_format.space_before = Pt(0)
         page_paragraph.paragraph_format.space_after = Pt(0)
@@ -1698,10 +1797,19 @@ def _fill_static_toc(
     return entries
 
 
+def _clear_static_toc_page_cells(table) -> None:
+    """Empty every page-number cell (link-only TOC, never a guessed number)."""
+    for row in table.rows:
+        paragraph = row.cells[1].paragraphs[0]
+        for child in list(paragraph._p):
+            if child.tag != qn("w:pPr"):
+                paragraph._p.remove(child)
+
+
 def _set_static_toc_page_numbers(table, pages: list[int], *, fonts: DocumentFonts) -> None:
     if len(table.rows) != len(pages):
         raise DocxPaginationError("تعداد پیوندهای فهرست پس از صفحه‌بندی تغییر کرد؛ سند ارسال نشد.")
-    for row, page in zip(table.rows, pages):
+    for row, page in zip(table.rows, pages, strict=True):
         paragraph = row.cells[1].paragraphs[0]
         for child in list(paragraph._p):
             if child.tag != qn("w:pPr"):
@@ -1713,10 +1821,22 @@ def _set_static_toc_page_numbers(table, pages: list[int], *, fonts: DocumentFont
             size=10.5,
             color=MUTED,
         )
-def _save_document_bytes(document, fonts: DocumentFonts) -> bytes:
+def _save_document_payload(document) -> bytes:
+    """Serialise the document exactly as python-docx wrote it.
+
+    Intermediate saves during static-TOC pagination use this: rewriting the
+    whole package to inject font fallbacks costs a full decompress/recompress
+    of every part, and the fallback is layout-neutral, so it is applied once to
+    the final payload instead (see :func:`_save_document_bytes`).
+    """
     buffer = io.BytesIO()
     document.save(buffer)
-    return _inject_font_fallbacks(buffer.getvalue(), fonts)
+    return buffer.getvalue()
+
+
+def _save_document_bytes(document, fonts: DocumentFonts) -> bytes:
+    """Serialise the document with the (layout-neutral) font fallbacks applied."""
+    return _inject_font_fallbacks(_save_document_payload(document), fonts)
 
 
 def _destination_page_number(reader, destination) -> int | None:
@@ -1765,13 +1885,13 @@ def _rendered_toc_page_numbers(
     """
     renderer = renderer_bin or shutil.which("soffice") or shutil.which("libreoffice")
     if not renderer:
-        raise DocxPaginationError(
+        raise DocxPaginationUnavailable(
             "فهرست ایستا به شمارهٔ صفحهٔ واقعی نیاز دارد؛ LibreOffice (soffice) در سرور پیدا نشد."
         )
     try:
         from pypdf import PdfReader
     except Exception:
-        raise DocxPaginationError(
+        raise DocxPaginationUnavailable(
             "برای تعیین صفحهٔ واقعی فهرست ایستا، بستهٔ pypdf نصب نیست."
         ) from None
 
@@ -1871,64 +1991,88 @@ def _finish_static_toc(
     fonts: DocumentFonts,
     design: DocxDesign,
 ) -> bytes:
-    """Render, map, fill, and verify static TOC numbers until they are stable."""
+    """Resolve the static TOC page numbers when the design asks for them.
+
+    Policy (``DOCX_TOC_PAGE_NUMBERS``):
+
+    * ``off`` -- never invokes a renderer. The topic list keeps its internal
+      hyperlinks and its page cells stay empty: a truthful Python-only design
+      that never shows a page number it did not measure.
+    * ``auto`` -- exact, renderer-verified numbers when the renderer and PDF
+      reader are installed; otherwise the same link-only list as ``off``.
+    * ``required`` -- like ``auto``, but a missing/unusable renderer fails
+      instead of degrading (the historical behaviour).
+
+    Even in ``auto``/``required`` a number is only ever written after a render
+    *of the document that already contains it* confirms it. Instability, an
+    ambiguous link map, or a link onto the cover/TOC pages is always a hard
+    failure -- the one thing that never happens is a guessed page number.
+
+    The font-fallback rewrite is layout-neutral, so it is applied once to the
+    returned payload instead of on every intermediate save.
+    """
     if toc_table is None:
         return _save_document_bytes(document, fonts)
-    payload = _save_document_bytes(document, fonts)
-    previous: list[int] | None = None
-    for _attempt in range(3):
+    if design.toc_page_numbers == "off":
+        _clear_static_toc_page_cells(toc_table)
+        return _save_document_bytes(document, fonts)
+
+    payload = _save_document_payload(document)
+    try:
         pages = _rendered_toc_page_numbers(
             payload,
             entries,
             timeout_seconds=design.pagination_timeout_seconds,
             renderer_bin=design.pagination_renderer_bin,
         )
-        _set_static_toc_page_numbers(toc_table, pages, fonts=fonts)
-        payload = _save_document_bytes(document, fonts)
-        if pages == previous:
-            # One more render has confirmed the literal page numbers did not
-            # move the headings they describe.
-            verified = _rendered_toc_page_numbers(
-                payload,
-                entries,
-                timeout_seconds=design.pagination_timeout_seconds,
-                renderer_bin=design.pagination_renderer_bin,
-            )
-            if verified == pages:
-                return payload
-        previous = pages
-    # A final rendered pass is required even when the first iteration's values
-    # were already stable; no output is returned based only on an estimate.
-    verified = _rendered_toc_page_numbers(
-        payload,
-        entries,
-        timeout_seconds=design.pagination_timeout_seconds,
-        renderer_bin=design.pagination_renderer_bin,
-    )
-    if verified == previous:
-        return payload
-    _set_static_toc_page_numbers(toc_table, verified, fonts=fonts)
-    payload = _save_document_bytes(document, fonts)
-    final = _rendered_toc_page_numbers(
-        payload,
-        entries,
-        timeout_seconds=design.pagination_timeout_seconds,
-        renderer_bin=design.pagination_renderer_bin,
-    )
-    if final != verified:
-        raise DocxPaginationError(
-            "شماره‌های فهرست پس از صفحه‌بندی نهایی پایدار نماندند؛ سند ارسال نشد."
+    except DocxPaginationUnavailable:
+        if design.toc_page_numbers == "required":
+            raise
+        logger.warning(
+            "DOCX static-TOC page numbers unavailable (no renderer/PDF reader); "
+            "delivering a link-only table of contents"
         )
-    return payload
+        _clear_static_toc_page_cells(toc_table)
+        return _save_document_bytes(document, fonts)
+
+    # At most two corrective passes: each iteration writes the numbers it just
+    # measured, re-renders, and only accepts the payload whose re-render
+    # reproduced them. Bounded to three renders in total.
+    for _attempt in range(2):
+        _set_static_toc_page_numbers(toc_table, pages, fonts=fonts)
+        payload = _save_document_payload(document)
+        verified = _rendered_toc_page_numbers(
+            payload,
+            entries,
+            timeout_seconds=design.pagination_timeout_seconds,
+            renderer_bin=design.pagination_renderer_bin,
+        )
+        if verified == pages:
+            return _inject_font_fallbacks(payload, fonts)
+        pages = verified
+    raise DocxPaginationError(
+        "شماره‌های فهرست پس از صفحه‌بندی نهایی پایدار نماندند؛ سند ارسال نشد."
+    )
 
 # ---------------------------------------------------------------------------
 # Body blocks
 # ---------------------------------------------------------------------------
 
 
-def _add_bookmark(paragraph) -> str:
-    """Attach a unique internal bookmark to a body heading."""
-    number = next(_BOOKMARK_IDS)
+def _add_bookmark(paragraph, document) -> str:
+    """Attach a unique internal bookmark to a body heading.
+
+    The counter lives on the document, so identical content always yields the
+    same bookmark names and no identifier carries over from another user's job.
+    """
+    counter = getattr(document, _BOOKMARK_COUNTER_ATTRIBUTE, None)
+    if counter is None:
+        counter = itertools.count(1)
+        try:
+            object.__setattr__(document, _BOOKMARK_COUNTER_ATTRIBUTE, counter)
+        except (AttributeError, TypeError):  # pragma: no cover - defensive
+            counter = itertools.count(1)
+    number = next(counter)
     name = f"GamasHeading{number}"
     start = OxmlElement("w:bookmarkStart")
     start.set(qn("w:id"), str(number))
@@ -1963,10 +2107,7 @@ def _add_heading(
     resolved_size = size if size is not None else HEADING_SIZES[level]
     heading_fonts = _heading_fonts(fonts)
     paragraph = container.add_paragraph()
-    try:
-        paragraph.style = container.styles[HEADING_STYLES[level]]
-    except (KeyError, AttributeError):  # pragma: no cover - defensive
-        logger.debug("Heading %s style unavailable", level)
+    _apply_paragraph_style(paragraph, container, HEADING_STYLES[level])
     _fill_paragraph(
         paragraph,
         text,
@@ -1980,7 +2121,7 @@ def _add_heading(
     )
     # A heading alone at the foot of a page reads as a broken booklet.
     _keep_with_next(paragraph)
-    _add_bookmark(paragraph)
+    _add_bookmark(paragraph, container)
     return paragraph
 
 
@@ -2140,10 +2281,7 @@ def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
             align=WD_ALIGN_PARAGRAPH.CENTER,
             space_after=0,
         )
-        try:
-            paragraph.style = document.styles[TABLE_TEXT_STYLE]
-        except KeyError:  # pragma: no cover - defensive
-            pass
+        _apply_paragraph_style(paragraph, document, TABLE_TEXT_STYLE)
         _shade_paragraph(paragraph, ACCENT_HEX)
         _shade_cell(cell, ACCENT_HEX)
     # Keep the column headings visible on every page of a long table.
@@ -2159,10 +2297,7 @@ def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
                 align=WD_ALIGN_PARAGRAPH.RIGHT,
                 space_after=0,
             )
-            try:
-                paragraph.style = document.styles[TABLE_TEXT_STYLE]
-            except KeyError:  # pragma: no cover - defensive
-                pass
+            _apply_paragraph_style(paragraph, document, TABLE_TEXT_STYLE)
     if headers:
         _set_table_widths(table, _table_column_widths(len(headers)))
     _add_rtl_paragraph(document, "", fonts=fonts, size=4, space_after=6, line_spacing=1.0)
@@ -2456,10 +2591,7 @@ def build_notes_docx(
                 bold=True, color=ON_ACCENT,
                 align=WD_ALIGN_PARAGRAPH.CENTER, space_after=0,
             )
-            try:
-                paragraph.style = document.styles[TABLE_TEXT_STYLE]
-            except KeyError:  # pragma: no cover - defensive
-                pass
+            _apply_paragraph_style(paragraph, document, TABLE_TEXT_STYLE)
             _shade_paragraph(paragraph, ACCENT_HEX)
             _shade_cell(cell, ACCENT_HEX)
         for row_index, entry in enumerate(notes.glossary, start=1):

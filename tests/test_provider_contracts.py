@@ -594,7 +594,7 @@ class STTRetryPolicyTests(unittest.IsolatedAsyncioTestCase):
         session = _ScriptedSession(responses)
         settings = self._settings(**overrides)
         with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
-            with patch("gamas_bot.stt.aiohttp.ClientSession", lambda **kwargs: session):
+            with patch("gamas_bot.stt.aiohttp.ClientSession", lambda _session=session, **kwargs: _session):
                 try:
                     result = await transcribe(Path(audio.name), settings)
                 except STTError as exc:
@@ -627,7 +627,7 @@ class STTRetryPolicyTests(unittest.IsolatedAsyncioTestCase):
         )
         settings = self._settings()
         with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
-            with patch("gamas_bot.stt.aiohttp.ClientSession", lambda **kwargs: session):
+            with patch("gamas_bot.stt.aiohttp.ClientSession", lambda _session=session, **kwargs: _session):
                 result = await transcribe(Path(audio.name), settings)
         self.assertEqual(result.text, "سلام")
         self.assertEqual(len(session.requests), 2)
@@ -647,7 +647,7 @@ class STTRetryPolicyTests(unittest.IsolatedAsyncioTestCase):
                 with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
                     with patch(
                         "gamas_bot.stt._deepgram", new=AsyncMock(side_effect=[error, Transcript("deepgram", "ok", 1.0)])
-                    ), patch("gamas_bot.stt.aiohttp.ClientSession", lambda **kwargs: session):
+                    ), patch("gamas_bot.stt.aiohttp.ClientSession", lambda _session=session, **kwargs: _session):
                         result = await transcribe(Path(audio.name), settings)
                 self.assertEqual(result.text, "ok")
 
@@ -672,7 +672,7 @@ class STTRetryPolicyTests(unittest.IsolatedAsyncioTestCase):
             with patch("gamas_bot.stt._deepgram", new=slow), patch(
                 "gamas_bot.stt._speechmatics",
                 new=AsyncMock(return_value=Transcript("speechmatics", "fallback", 1.0)),
-            ), patch("gamas_bot.stt.aiohttp.ClientSession", lambda **kwargs: session):
+            ), patch("gamas_bot.stt.aiohttp.ClientSession", lambda _session=session, **kwargs: _session):
                 result = await transcribe(Path(audio.name), settings)
         self.assertEqual(result.engine, "speechmatics")
         self.assertEqual(len(calls), settings.stt_max_attempts)
