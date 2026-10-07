@@ -518,7 +518,8 @@ class Database:
         self, db: aiosqlite.Connection, user_id: int, now: str
     ) -> None:
         cursor = await db.execute(
-            "SELECT id, remaining_seconds FROM entitlements WHERE user_id=? AND status='active' "
+            "SELECT id, remaining_seconds FROM entitlements WHERE user_id=? "
+            "AND status IN ('active', 'exhausted') "
             "AND expires_at IS NOT NULL AND datetime(expires_at)<=datetime(?)",
             (user_id, now),
         )
@@ -527,14 +528,14 @@ class Database:
             entitlement_id = int(row["id"])
             cursor = await db.execute(
                 "UPDATE entitlements SET status='expired', updated_at=? "
-                "WHERE id=? AND status='active'",
+                "WHERE id=? AND status IN ('active', 'exhausted')",
                 (now, entitlement_id),
             )
             if cursor.rowcount and int(row["remaining_seconds"]):
                 await db.execute(
                     "INSERT INTO usage_ledger "
                     "(entitlement_id, user_id, event_type, released_seconds, reason, created_at) "
-                    "SELECT id, user_id, 'adjustment', remaining_seconds, "
+                    "SELECT id, user_id, 'expiration', remaining_seconds, "
                     "'Paid entitlement expired', ? FROM entitlements WHERE id=?",
                     (now, entitlement_id),
                 )
@@ -559,7 +560,7 @@ class Database:
                 "SELECT e.id, e.granted_seconds, e.remaining_seconds, e.starts_at, e.expires_at, "
                 "e.source, e.status, p.code AS plan_code, p.name AS plan_name "
                 "FROM entitlements e JOIN plans p ON p.id=e.plan_id WHERE e.user_id=? "
-                "AND e.status='active' AND datetime(e.starts_at)<=datetime(?) "
+                "AND e.status IN ('active', 'exhausted') AND datetime(e.starts_at)<=datetime(?) "
                 "AND (e.expires_at IS NULL OR datetime(e.expires_at)>datetime(?)) "
                 "ORDER BY CASE WHEN e.expires_at IS NULL THEN 1 ELSE 0 END, e.expires_at, e.id",
                 (user_id, now, now),
@@ -761,9 +762,8 @@ class Database:
             }
 
     async def reject_payment(self, payment_id: int, admin_id: int, reason: str) -> bool:
-        reason = "".join(character for character in reason if character.isprintable()).strip()[:500]
-        if not reason:
-            raise ValueError("A rejection reason is required")
+        # The reason is optional; when given it is shown to the user and audited.
+        reason = "".join(character for character in (reason or "") if character.isprintable()).strip()[:500]
         now = utc_now()
         async with self._transaction(immediate=True) as db:
             cursor = await db.execute(
@@ -776,7 +776,7 @@ class Database:
             cursor = await db.execute(
                 "UPDATE payment_requests SET status='rejected', rejection_reason=?, reviewed_at=?, "
                 "reviewer_telegram_id=?, updated_at=? WHERE id=? AND status='pending'",
-                (reason, now, admin_id, now, payment_id),
+                (reason or None, now, admin_id, now, payment_id),
             )
             if cursor.rowcount != 1:
                 return False
@@ -1155,7 +1155,8 @@ class Database:
             cursor = await self._db().execute(
                 "SELECT id, service, provider, label, secret_last4, base_url, model, priority, "
                 "enabled, quarantined_at, cooldown_until, last_status_code, last_success_at, "
-                "last_failure_at, last_used_at, last_error, created_at "
+                "last_failure_at, last_used_at, last_error, created_at, health_state, "
+                "health_checked_at, health_latency_ms, health_detail "
                 "FROM provider_credentials ORDER BY service, provider, priority, id"
             )
             return [dict(row) for row in await cursor.fetchall()]
@@ -1233,6 +1234,153 @@ class Database:
                 db, admin_id, "provider_credential_deleted", "provider_credential", str(credential_id),
                 {"service": row["service"], "provider": row["provider"], "label": row["label"],
                  "masked": f"••••{row['secret_last4']}"},
+            )
+            return True
+
+    PAYMENT_LIST_STATUSES = ("pending", "approved", "rejected")
+
+    async def list_payments(
+        self, status: str, *, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Admin payment list for one review status (newest reviews first)."""
+        if status not in self.PAYMENT_LIST_STATUSES:
+            raise ValueError("Unknown payment status")
+        if status == "pending":
+            return await self.list_pending_payments(limit=limit, offset=offset)
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT pr.id, pr.amount_toman, pr.status, pr.created_at, pr.reviewed_at, "
+                "pr.reviewer_telegram_id, pr.rejection_reason, u.telegram_id, u.username, "
+                "p.code AS plan_code, p.name AS plan_name FROM payment_requests pr "
+                "JOIN users u ON u.id=pr.user_id JOIN plans p ON p.id=pr.plan_id "
+                "WHERE pr.status=? ORDER BY pr.reviewed_at DESC, pr.id DESC LIMIT ? OFFSET ?",
+                (status, max(1, min(limit, 50)), max(0, offset)),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def payment_status_counts(self) -> dict[str, int]:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT status, COUNT(*) FROM payment_requests GROUP BY status"
+            )
+            counts = {str(row[0]): int(row[1]) for row in await cursor.fetchall()}
+        return {status: counts.get(status, 0) for status in self.PAYMENT_LIST_STATUSES}
+
+    async def admin_debit(
+        self, telegram_id: int, seconds: int, admin_id: int, reason: str
+    ) -> dict[str, Any] | None:
+        """Manually remove credit, earliest-expiring first; never below zero.
+
+        Returns ``None`` for an unknown user and ``{"ok": False, ...}`` when the
+        user has fewer available seconds than requested (nothing is changed).
+        """
+        seconds = int(seconds)
+        reason = "".join(character for character in reason if character.isprintable()).strip()[:500]
+        if seconds <= 0 or seconds > 10_000_000 or not reason:
+            raise ValueError("Debit seconds or audit reason is invalid")
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute("SELECT id FROM users WHERE telegram_id=?", (telegram_id,))
+            user = await cursor.fetchone()
+            if not user:
+                return None
+            user_id = int(user["id"])
+            await self._expire_entitlements_in_transaction(db, user_id, now)
+            available = await self._available_seconds_in_transaction(db, user_id, now)
+            if available < seconds:
+                return {"ok": False, "available_seconds": available, "required_seconds": seconds}
+            cursor = await db.execute(
+                "SELECT id, remaining_seconds FROM entitlements WHERE user_id=? AND status='active' "
+                "AND datetime(starts_at)<=datetime(?) "
+                "AND (expires_at IS NULL OR datetime(expires_at)>datetime(?)) "
+                "AND remaining_seconds>0 "
+                "ORDER BY CASE WHEN expires_at IS NULL THEN 1 ELSE 0 END, expires_at, id",
+                (user_id, now, now),
+            )
+            remaining = seconds
+            for entitlement in await cursor.fetchall():
+                if remaining <= 0:
+                    break
+                take = min(remaining, int(entitlement["remaining_seconds"]))
+                update = await db.execute(
+                    "UPDATE entitlements SET remaining_seconds=remaining_seconds-?, updated_at=? "
+                    "WHERE id=? AND status='active' AND remaining_seconds>=?",
+                    (take, now, int(entitlement["id"]), take),
+                )
+                if update.rowcount != 1:
+                    raise RuntimeError("Entitlement changed while debiting")
+                await db.execute(
+                    "INSERT INTO usage_ledger (entitlement_id, user_id, event_type, consumed_seconds, "
+                    "available_seconds, admin_telegram_id, reason, created_at) "
+                    "VALUES (?, ?, 'debit', ?, ?, ?, ?, ?)",
+                    (int(entitlement["id"]), user_id, take, available - seconds, admin_id, reason, now),
+                )
+                remaining -= take
+            if remaining:
+                raise RuntimeError("Balance changed while debiting")
+            await self._insert_audit(
+                db, admin_id, "credit_debited", "user", str(telegram_id),
+                {"seconds": seconds, "reason": reason, "available_after": available - seconds},
+            )
+            return {"ok": True, "telegram_id": telegram_id, "seconds": seconds,
+                    "available_seconds": available - seconds}
+
+    async def record_provider_health(
+        self,
+        credential_id: int,
+        *,
+        state: str,
+        latency_ms: int | None,
+        status_code: int | None,
+        detail: str | None,
+        admin_id: int,
+    ) -> None:
+        """Cache a manual health check result; the audit entry has no secret."""
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "UPDATE provider_credentials SET health_state=?, health_checked_at=?, "
+                "health_latency_ms=?, health_detail=?, last_status_code=COALESCE(?, last_status_code) "
+                "WHERE id=?",
+                (state, now, latency_ms, (detail or "")[:300] or None, status_code, credential_id),
+            )
+            await self._insert_audit(
+                db, admin_id, "provider_credential_tested", "provider_credential", str(credential_id),
+                {"state": state, "status_code": status_code, "latency_ms": latency_ms},
+            )
+
+    async def move_provider_credential(self, credential_id: int, direction: int, admin_id: int) -> bool:
+        """Swap priority with the neighbouring key of the same service/provider."""
+        if direction not in (-1, 1):
+            raise ValueError("direction must be -1 or 1")
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT id, service, provider FROM provider_credentials WHERE id=?", (credential_id,)
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            cursor = await db.execute(
+                "SELECT id FROM provider_credentials WHERE service=? AND provider=? ORDER BY priority, id",
+                (row["service"], row["provider"]),
+            )
+            ordered = [int(item["id"]) for item in await cursor.fetchall()]
+            index = ordered.index(credential_id)
+            target = index + direction
+            if not 0 <= target < len(ordered):
+                return False
+            ordered[index], ordered[target] = ordered[target], ordered[index]
+            # Rewrite dense, deterministic priorities (10, 20, ...).
+            for position, item_id in enumerate(ordered, start=1):
+                await db.execute(
+                    "UPDATE provider_credentials SET priority=?, updated_by_admin_id=?, updated_at=? "
+                    "WHERE id=?",
+                    (position * 10, admin_id, now, item_id),
+                )
+            await self._insert_audit(
+                db, admin_id, "provider_credential_reordered", "provider_credential",
+                str(credential_id), {"direction": "up" if direction < 0 else "down"},
             )
             return True
 

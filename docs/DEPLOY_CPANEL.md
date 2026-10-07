@@ -208,9 +208,18 @@ legal obligations.
 
 Billing is paid by manual card-to-card transfer. The bot does not verify a bank
 transaction: an administrator must inspect the private receipt and approve or
-reject it from the **پرداخت‌های در انتظار** panel or `/payments`. Uploading a
-receipt grants no credit. `/credit TELEGRAM_USER_ID SECONDS REASON` is the
-separate auditable admin adjustment.
+reject it from the **💳 پرداخت‌ها** panel or `/payments`. Uploading a
+receipt grants no credit. **⏱ اعتبار کاربران** (or
+`/credit TELEGRAM_USER_ID SECONDS REASON`) is the separate auditable admin
+adjustment. Plan sizes and prices come from `FREE_PLAN_HOURS` and
+`PLAN_25_*` / `PLAN_50_*` in `.env` (whole numbers only).
+
+Migrations run automatically at start-up (no shell step). Migration `004`
+rebuilds the `entitlements` and `usage_ledger` tables inside one transaction to
+add the `exhausted` state and `expiration`/`debit` events; take the usual SQLite
+backup before upgrading. **🩺 وضعیت سرویس‌ها** performs only free read-only
+provider requests, so it is safe on metered accounts. No Redis, Docker or root
+access is required.
 
 ## 10. Troubleshooting
 

@@ -29,11 +29,46 @@ class ProviderHTTPError(StructuringError):
     """HTTP result retained for safe credential cooldown/quarantine decisions."""
 
     def __init__(
-        self, message: str, *, status: int, retry_after_seconds: float | None = None
+        self,
+        message: str,
+        *,
+        status: int,
+        retry_after_seconds: float | None = None,
+        auth_failed: bool = False,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.retry_after_seconds = retry_after_seconds
+        # True for 401/403 and for providers that report a bad key as a 400
+        # (Gemini: INVALID_ARGUMENT / reason API_KEY_INVALID).
+        self.auth_failed = auth_failed or status in {401, 403}
+
+
+INVALID_KEY_REASONS = frozenset({"API_KEY_INVALID", "API_KEY_EXPIRED", "API_KEY_SERVICE_BLOCKED"})
+
+
+def is_invalid_key_error(status: int, raw_body: bytes | None) -> bool:
+    """Is this HTTP 400 really an authentication failure of the API key?
+
+    Gemini answers an invalid/expired key with HTTP 400 and a google.rpc
+    ``ErrorInfo`` whose ``reason`` is ``API_KEY_INVALID``. Rotating away from
+    (and quarantining) such a key is correct; a genuine malformed request is
+    not, so only these structured reasons qualify.
+    """
+    if status != 400 or not raw_body:
+        return False
+    try:
+        payload = json.loads(raw_body.decode("utf-8", "replace"))
+    except (ValueError, TypeError):
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return False
+    for item in error.get("details") or []:
+        if isinstance(item, dict) and str(item.get("reason", "")).upper() in INVALID_KEY_REASONS:
+            return True
+    message = str(error.get("message", "")).casefold()
+    return "api key not valid" in message or "api key expired" in message
 
 
 class ProviderTransientError(StructuringError):
@@ -1531,6 +1566,7 @@ async def _structure_chunk_once(
                         message,
                         status=response.status,
                         retry_after_seconds=_retry_after_seconds(response.headers),
+                        auth_failed=is_invalid_key_error(response.status, body),
                     )
                 data = await response.json(content_type=None)
                 return _provider_response(data, provider)
@@ -1599,14 +1635,17 @@ async def _structure_chunk(
             raise
         except ProviderHTTPError as exc:
             last_error = exc
-            if exc.status in {401, 403}:
+            if exc.auth_failed:
                 if credential is None:
                     raise
                 await manager.record_result(
                     credential,
                     result="quarantined",
                     status_code=exc.status,
-                    safe_error=f"HTTP {exc.status}",
+                    safe_error=(
+                        f"HTTP {exc.status}" if exc.status in {401, 403}
+                        else f"HTTP {exc.status} API_KEY_INVALID"
+                    ),
                 )
                 continue
             if exc.status == 429:

@@ -981,7 +981,11 @@ handling remains available in chats where the bot receives messages.
 
 ## Usage billing and card-to-card payments
 
-The canonical catalog is seeded into SQLite from `gamas_bot/billing.py`:
+The catalog is seeded idempotently into SQLite on every start from
+`gamas_bot/billing.py`, sized by the environment (`FREE_PLAN_HOURS`,
+`PLAN_25_HOURS` / `PLAN_25_PRICE_TOMAN` / `PLAN_25_VALIDITY_DAYS` and the same
+`PLAN_50_*`; whole numbers only — fractional hours are rejected at startup).
+Defaults:
 
 | Entitlement | Included time | Price | Validity |
 |---|---:|---:|---:|
@@ -996,8 +1000,18 @@ transaction. The successful job finalizes the charge; cancellation, STT/provider
 failure or another processing failure releases the reservation. Reservations are
 concurrency-safe, so competing jobs cannot spend the same seconds or overspend.
 The displayed balance is available time, not the uncommitted reservation.
+When Telegram already reports a duration longer than the balance, the file is
+refused before it is downloaded, showing available vs. required time and a
+**💳 خرید اشتراک** button; the authoritative check is still the atomic
+reservation on the probed duration.
 
-Users can use the private **خرید اعتبار** and **موجودی** menu buttons, or:
+Entitlement states are `active`, `exhausted` (drained to zero; it becomes
+`active` again if a released reservation returns seconds), `expired` and
+`revoked`. The ledger records `grant`, `reserve`, `consume`, `release`,
+`denied`, `expiration`, `debit` and `adjustment` events.
+
+Users can use the private **⏱ اعتبار من** (free / subscription / total time and
+each active plan's expiry) and **💳 خرید اشتراک** menu buttons, or:
 
 - `/balance` — available seconds and each entitlement's expiry
 - `/buy` — choose a paid plan
@@ -1005,18 +1019,26 @@ Users can use the private **خرید اعتبار** and **موجودی** menu bu
 - `/cancelpayment` — cancel an intent that is still waiting for a receipt
 
 Payment is manual card-to-card. The bot displays the canonical Pasargad card
-details from `.env`, accepts a JPEG/PNG/WebP receipt in the private chat, and
+details from `.env` (card shown as `5022 2913 3290 6625`), asks «رسید پرداخت را
+به صورت تصویر ارسال کنید.», accepts a JPEG/PNG/WebP receipt in the private chat
+(only image uploads are treated as receipts — audio, video and PowerPoint files
+still go to the lecture pipeline and receipts never reach STT), and
 sends the private receipt to configured administrators. **Uploading a receipt
 does not grant credit.** A human administrator verifies the transfer and
-explicitly approves or rejects it. Approval is transactional and idempotent;
-rejection grants nothing and records the reason. No bank/card verification is
+explicitly approves (✅ تایید) or rejects (❌ رد) it. Approval is
+transactional and idempotent; rejection grants nothing, takes an optional
+reason that is sent to the user, and the user may submit a new request. No bank/card verification is
 automated. Receipt images are kept outside the web root in `RECEIPT_DIR` with
 owner-only permissions, kept while awaiting human review, and removed after
 `RECEIPT_RETENTION_DAYS` (90 days by default) measured from approval/rejection;
 do not expose this directory or put it under `public_html`.
 
-Administrators can review receipts from **پرداخت‌های در انتظار** or `/payments`.
-`/credit TELEGRAM_USER_ID SECONDS REASON` adds an auditable manual adjustment;
+Administrators review receipts from **💳 پرداخت‌ها** (lists by status:
+pending / approved / rejected) or `/payments`. **⏱ اعتبار کاربران** looks up a
+user by Telegram ID, shows the balance and recent ledger history, and offers
+➕/➖ manual adjustments that require integer seconds and a reason; a debit
+never takes a balance below zero and every adjustment is audited.
+`/credit TELEGRAM_USER_ID SECONDS REASON` adds an auditable manual credit;
 `/audit` includes payment/admin actions and the usage ledger. These actions are
 restricted to configured administrator IDs and private chats.
 
@@ -1033,14 +1055,23 @@ logs):
 
 Keep the master key stable and back it up separately with restricted access. If
 it is lost, stored encrypted API keys cannot be decrypted. In a private admin
-chat, **کلیدهای سرویس** can add, enable, disable or delete credentials; secrets
-are encrypted at rest and the panel shows only a mask/last four characters and
-last observed status. It does not send test requests or claim live provider
-health. When adding a key, the bot only stores it after it successfully deletes
-the private message containing the secret.
+chat, **🔑 API Keys** can add, enable, disable, delete, reorder (⬆️/⬇️ =
+rotation priority) and test (🧪) credentials; secrets are encrypted at rest and
+shown only as `••••••••1234`. When adding a key, the bot only stores it after it
+successfully deletes the private message containing the secret.
+
+**🩺 وضعیت سرویس‌ها** runs a manual health check of every configured STT
+(Speechmatics, Deepgram, OpenAI-compatible) and LLM (Gemini, Anthropic,
+OpenAI-compatible) key. Each check is one free, read-only listing request
+(`/jobs?limit=1`, `/v1/projects`, `/models`) — never an audio job or a
+generation — and results are cached for 60 seconds. It reports
+healthy / degraded / rate_limited / authentication_failed / unavailable /
+disabled / not_configured / configured, with HTTP code, latency, check time,
+Retry-After, a sanitized provider reason and any cooldown/quarantine.
 
 On HTTP 429, managed credentials honor `Retry-After`, are cooled down, and
-rotate to another eligible key; HTTP 401/403 quarantines that key. Invalid
+rotate to another eligible key (the same key is not retried); HTTP 401/403 —
+and Gemini's HTTP 400 `API_KEY_INVALID` — quarantines that key. Other invalid
 request errors (400/415/422) do not cause key rotation. Transient retries are
 bounded, and secrets are masked in logs and panels.
 
@@ -1126,6 +1157,23 @@ counts and ink coverage, writes a contact sheet for a quick overview, and
 **fails loudly** on layout defects it can detect: blank pages, content
 overflowing the bottom margin and heading-only page breaks ("orphan
 headings"). Use it whenever the DOCX changes — "it opens" is not a check.
+In right-to-left paragraphs it reads `w:jc` / `w:ind` left/right as the logical
+start/end sides (ECMA-376), exactly as Word and LibreOffice do.
+
+On a host **with** LibreOffice, validate the static TOC against real renders:
+
+```bash
+python -m scripts.validate_docx_toc --out .render/toc   # --renderer /path/to/soffice
+```
+
+It builds Persian-only, mixed medical, table/formula/URL, 4/10/22-topic,
+long-title and duplicate-title booklets through the production pipeline, then
+re-renders each delivered `.docx` independently and fails unless page 1 is the
+cover, page 2 the TOC and page 3 the first heading, every visible TOC number
+equals the heading's rendered page (read from the PDF outline), every TOC link
+targets an existing bookmark on the right heading, and no TOC field or
+`updateFields` exists. With `pypdfium2` installed it also writes PNGs of pages
+1–3 for visual inspection (`.render/` is git-ignored).
 
 `tests/fixtures/notes/` ships a six-fixture corpus (medical, HCI/university,
 computer science, Persian-only, Persian+English code-switching, and a PowerPoint
@@ -1353,7 +1401,8 @@ Gamas_bot/
 │   ├── cpanel_preflight.py  # host self-check for cPanel/shared hosting
 │   ├── ensure_running.py    # cron entry point
 │   ├── render_docx_pages.py # rasterises docx pages for visual comparison
-│   └── validate_docx.py     # structural + visual .docx validation
+│   ├── validate_docx.py     # structural + visual .docx validation
+│   └── validate_docx_toc.py # real-render static-TOC page/link validation
 │
 ├── passenger_wsgi.py      # optional cPanel "Setup Python App" status endpoint
 │

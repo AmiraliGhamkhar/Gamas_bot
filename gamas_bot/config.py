@@ -386,6 +386,14 @@ class Settings:
     payment_card_number: str = CANONICAL_PAYMENT_CARD
     payment_card_holder: str = CANONICAL_PAYMENT_CARD_HOLDER
     payment_bank_name: str = CANONICAL_PAYMENT_BANK
+    # Plan catalogue (whole hours / Toman / days; accounting is in integer seconds).
+    free_plan_hours: int = 1
+    plan_25_hours: int = 25
+    plan_25_price_toman: int = 150_000
+    plan_25_validity_days: int = 30
+    plan_50_hours: int = 50
+    plan_50_price_toman: int = 250_000
+    plan_50_validity_days: int = 30
     receipt_dir: Path = Path("data/receipts")
     receipt_retention_days: int = 90
     max_receipt_size_bytes: int = 5_000_000
@@ -606,8 +614,29 @@ class Settings:
             receipt_retention_days = int(_text("RECEIPT_RETENTION_DAYS", "90"))
             max_receipt_size = int(_text("MAX_PAYMENT_RECEIPT_BYTES", "5000000"))
             docx_pagination_timeout = int(_text("DOCX_PAGINATION_TIMEOUT_SECONDS", "120"))
+            # int() rejects "1.5": plan sizes are whole hours, never floating time.
+            plan_values = {
+                name: int(_text(name.upper(), str(default)))
+                for name, default in (
+                    ("free_plan_hours", 1),
+                    ("plan_25_hours", 25),
+                    ("plan_25_price_toman", 150_000),
+                    ("plan_25_validity_days", 30),
+                    ("plan_50_hours", 50),
+                    ("plan_50_price_toman", 250_000),
+                    ("plan_50_validity_days", 30),
+                )
+            }
         except ValueError as exc:
             raise ValueError("مقادیر عددی تنظیمات محیط معتبر نیستند.") from exc
+        if min(plan_values.values()) <= 0 or max(
+            plan_values["free_plan_hours"], plan_values["plan_25_hours"], plan_values["plan_50_hours"]
+        ) > 10_000 or max(
+            plan_values["plan_25_validity_days"], plan_values["plan_50_validity_days"]
+        ) > 3_650:
+            raise ValueError(
+                "FREE_PLAN_HOURS و PLAN_25_*/PLAN_50_* باید عدد صحیح مثبت و در بازهٔ معقول باشند."
+            )
         raw_card = _text("PAYMENT_CARD_NUMBER", CANONICAL_PAYMENT_CARD)
         if not re.fullmatch(r"[0-9][0-9 -]*", raw_card):
             raise ValueError("PAYMENT_CARD_NUMBER باید فقط شامل رقم، فاصله یا خط تیره باشد.")
@@ -810,6 +839,7 @@ class Settings:
             log_backup_count=log_backup_count,
             telegram_proxy=telegram_proxy,
             payment_card_number=payment_card_number,
+            **plan_values,
             payment_card_holder=_text(
                 "PAYMENT_CARD_HOLDER", CANONICAL_PAYMENT_CARD_HOLDER
             ),

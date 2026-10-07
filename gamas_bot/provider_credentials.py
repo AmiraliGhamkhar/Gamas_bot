@@ -342,6 +342,30 @@ class ProviderCredentialManager:
         else:
             state["last_failure_at"] = now
 
+    async def credential_for_check(self, credential_id: int) -> tuple[ProviderCredential, bool] | None:
+        """Decrypt one stored key for a manual health check: (credential, enabled).
+
+        The plaintext only lives in the returned object for the duration of the
+        check; it is never logged, cached by value or shown (only ``masked``).
+        """
+        row = await self.db.provider_credential_record(credential_id)
+        if not row:
+            return None
+        credential = ProviderCredential(
+            id=int(row["id"]),
+            service=str(row["service"]),
+            provider=str(row["provider"]),
+            label=str(row["label"]),
+            secret=self._decrypt(str(row["secret_ciphertext"])),
+            last4=str(row["secret_last4"]),
+            base_url=row.get("base_url"),
+            model=row.get("model"),
+        )
+        return credential, bool(row["enabled"])
+
+    async def move(self, credential_id: int, direction: int, admin_id: int) -> bool:
+        return await self.db.move_provider_credential(credential_id, direction, admin_id)
+
     async def list_summaries(self) -> list[dict]:
         return await self.db.provider_credential_summaries()
 
