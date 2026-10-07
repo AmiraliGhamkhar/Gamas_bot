@@ -342,6 +342,60 @@ class ProviderCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(summaries[first]["cooldown_until"])
         self.assertIsNotNone(summaries[second]["last_success_at"])
 
+    async def test_all_keys_exhausted_returns_a_clean_secret_free_error(self):
+        first, second = await self._add_stt_keys()
+        # Both keys hit 429: they cool down and are excluded from rotation.
+        for credential_id in (first, second):
+            record = await self.manager.credential_for_test(credential_id)
+            await self.manager.record_result(
+                record, result="cooldown", status_code=429, retry_after_seconds=600
+            )
+        self.assertEqual(await self.manager.candidates("stt", "deepgram"), [])
+        with tempfile.NamedTemporaryFile() as audio:
+            audio.write(b"a")
+            audio.flush()
+            with self.assertRaises(STTError) as raised:
+                await transcribe(Path(audio.name), self.settings, credentials=self.manager)
+        message = str(raised.exception)
+        self.assertIn("تنظیم نشده", message)
+        self.assertNotIn("dg-secret", message)
+        self.assertNotIn("1234", message)
+        self.assertNotIn("5678", message)
+
+    async def test_a_successful_request_restores_healthy_state(self):
+        first, _second = await self._add_stt_keys()
+        record = await self.manager.credential_for_test(first)
+        await self.manager.record_result(
+            record, result="cooldown", status_code=429, retry_after_seconds=600
+        )
+        summaries = {row["id"]: row for row in await self.manager.list_summaries()}
+        self.assertIsNotNone(summaries[first]["cooldown_until"])
+        await self.manager.record_result(record, result="success", status_code=200)
+        summaries = {row["id"]: row for row in await self.manager.list_summaries()}
+        self.assertIsNone(summaries[first]["cooldown_until"])
+        self.assertIsNone(summaries[first]["quarantined_at"])
+        self.assertIsNotNone(summaries[first]["last_success_at"])
+        self.assertIsNotNone((await self.manager.candidates("stt", "deepgram"))[0].id)
+
+    async def test_provider_secrets_never_reach_the_logs(self):
+        import logging
+
+        first, _second = await self._add_stt_keys()
+        record = await self.manager.credential_for_test(first)
+        with self.assertLogs("gamas_bot", level="DEBUG") as captured:
+            await self.manager.record_result(
+                record, result="cooldown", status_code=429, retry_after_seconds=60
+            )
+            await self.manager.record_result(
+                record, result="quarantined", status_code=401
+            )
+            logger = logging.getLogger("gamas_bot.provider_credentials")
+            logger.warning("credential status changed id=%s", first)
+        rendered = "\n".join(entry.getMessage() for entry in captured.records)
+        for secret in ("dg-secret-primary-1234", "dg-secret-backup-5678"):
+            self.assertNotIn(secret, rendered)
+            self.assertNotIn(secret[-12:], rendered)
+
     async def test_provider_key_requires_environment_master_key_before_storage(self):
         no_key = ProviderCredentialManager(
             self.db,
