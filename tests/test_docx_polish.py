@@ -304,10 +304,58 @@ class TocTests(DocxTestCase):
         self.assertIn("۳", text)  # supplied rendered page mapping is ordinary text
         self.assertIn("۴", text)
 
-    def test_toc_page_map_unavailability_fails_explicitly(self):
+    def test_toc_without_renderer_degrades_to_a_link_only_policy(self):
+        """DOCX_TOC_PAGE_NUMBERS=auto must not fail a job when soffice is absent.
+
+        The topic list keeps its internal hyperlinks and its page cells are
+        empty: the document is delivered, and no page number is ever invented.
+        """
+        with patch("gamas_bot.docx_export.shutil.which", return_value=None):
+            data = self.build(long_notes_json(), enable_toc=True)
+        xml = self.document_xml(data)
+        self.assertIn("فهرست مطالب", docx_text(data))
+        root = ET.fromstring(xml)
+        links = [item.get(f"{W}anchor") for item in root.iter(f"{W}hyperlink") if item.get(f"{W}anchor")]
+        self.assertGreaterEqual(len(links), 4)
+        # No rendered page number leaked into the page-number column.
+        table = root.find(f"{W}body/{W}tbl")
+        self.assertIsNotNone(table)
+        page_cells = [row.findall(f"{W}tc")[1] for row in table.findall(f"{W}tr")]
+        visible_numbers = [
+            "".join(node.text or "" for node in cell.iter(f"{W}t"))
+            for cell in page_cells
+        ]
+        self.assertTrue(all(number == "" for number in visible_numbers))
+
+    def test_toc_page_numbers_required_fails_explicitly(self):
         with patch("gamas_bot.docx_export.shutil.which", return_value=None):
             with self.assertRaises(DocxPaginationError):
-                self.build(long_notes_json(), enable_toc=True)
+                self.build(
+                    long_notes_json(),
+                    design=resolve_design({"toc_page_numbers": "required"}),
+                    enable_toc=True,
+                )
+
+    def test_toc_page_numbers_off_never_invokes_a_renderer(self):
+        design = resolve_design({"toc_page_numbers": "off", "toc_enabled": True})
+        with patch(
+            "gamas_bot.docx_export._rendered_toc_page_numbers",
+            side_effect=AssertionError("the off policy must never render"),
+        ):
+            data = self.build(long_notes_json(), design=design, enable_toc=True)
+        root = ET.fromstring(self.document_xml(data))
+        self.assertIn("فهرست مطالب", docx_text(data))
+        # Hyperlinks still navigate; the page-number column is empty.
+        links = [item.get(f"{W}anchor") for item in root.iter(f"{W}hyperlink") if item.get(f"{W}anchor")]
+        self.assertGreaterEqual(len(links), 4)
+        table = root.find(f"{W}body/{W}tbl")
+        page_cells = [row.findall(f"{W}tc")[1] for row in table.findall(f"{W}tr")]
+        self.assertTrue(
+            all(
+                "".join(node.text or "" for node in cell.iter(f"{W}t")) == ""
+                for cell in page_cells
+            )
+        )
 
     def test_tooltip_mapped_toc_targets_must_start_after_page_two(self):
         from gamas_bot.docx_export import _rendered_toc_page_numbers
@@ -355,6 +403,54 @@ class TocTests(DocxTestCase):
                     [{"anchor": "toc-a"}, {"anchor": "toc-b"}],
                     timeout_seconds=10,
                 )
+
+    def test_stable_page_numbers_need_only_two_renderer_passes(self):
+        """The pagination loop must be bounded, not iterative-until-lucky.
+
+        Each pass is a full LibreOffice conversion on the production server, so
+        a stable document (the overwhelmingly common case) must cost exactly
+        two: one to measure, one to confirm the written numbers did not move.
+        """
+        calls = []
+
+        def pages(_payload, entries, **_kwargs):
+            calls.append(len(entries))
+            return list(range(3, 3 + len(entries)))
+
+        notes = parse_structured_notes(long_notes_json())
+        with patch("gamas_bot.docx_export._rendered_toc_page_numbers", side_effect=pages):
+            build_notes_docx(
+                notes, meta=META, design=replace(resolve_design(), toc_enabled=True)
+            )
+        self.assertEqual(len(calls), 2)
+
+    def test_unstable_page_numbers_fail_after_a_bounded_number_of_passes(self):
+        """A renderer that never agrees must not loop forever."""
+        calls = []
+
+        def drifting(_payload, entries, **_kwargs):
+            calls.append(len(entries))
+            return [3 + len(calls) + index for index in range(len(entries))]
+
+        notes = parse_structured_notes(long_notes_json())
+        with patch("gamas_bot.docx_export._rendered_toc_page_numbers", side_effect=drifting):
+            with self.assertRaises(DocxPaginationError):
+                build_notes_docx(
+                    notes, meta=META, design=replace(resolve_design(), toc_enabled=True)
+                )
+        self.assertLessEqual(len(calls), 3)
+
+    def test_document_generation_is_byte_reproducible(self):
+        """Same inputs -> same bytes, so artifacts are comparable and cacheable.
+
+        python-docx stamps every package member with the wall clock on save;
+        the final post-processing pass normalises those timestamps.
+        """
+        notes = parse_structured_notes(long_notes_json())
+        design = replace(resolve_design(), toc_enabled=False)
+        first = build_notes_docx(notes, meta=META, design=design)
+        second = build_notes_docx(notes, meta=META, design=design)
+        self.assertEqual(first, second)
 
     def test_toc_levels_are_configurable(self):
         default = self.build_with_page_mapping(long_notes_json())

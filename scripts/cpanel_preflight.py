@@ -92,9 +92,29 @@ def check_packages() -> list[Result]:
 
 
 def check_docx_pagination(settings) -> Result:
-    """Check the renderer required to print real page numbers in a static TOC."""
+    """Check the renderer that prints real page numbers in a static TOC.
+
+    The severity follows ``DOCX_TOC_PAGE_NUMBERS``: with ``off`` no renderer is
+    needed at all, with ``auto`` (the default) a missing renderer only degrades
+    the TOC to a link-only topic list, and with ``required`` the renderer is a
+    hard requirement because the document is not produced without it.
+    """
+    policy = getattr(settings, "docx_toc_page_numbers", "auto")
     if not settings.docx_toc_enabled:
         return Result("PASS", "DOCX pagination renderer", "TOC disabled; no renderer required")
+    if policy == "off":
+        return Result(
+            "PASS", "DOCX pagination renderer",
+            "DOCX_TOC_PAGE_NUMBERS=off; the TOC is delivered without page numbers.",
+        )
+    missing_level = "FAIL" if policy == "required" else "WARN"
+    missing_detail = (
+        "DOCX_TOC_PAGE_NUMBERS=required needs a renderer for exact static-TOC page mapping. "
+        "Install LibreOffice (soffice/libreoffice) or switch to auto/off."
+        if policy == "required"
+        else "No renderer found; the static TOC will be delivered with internal links and no "
+        "page numbers (never a guessed number). Install LibreOffice for exact numbers."
+    )
     configured = settings.docx_pagination_renderer_bin
     if configured:
         renderer = Path(configured).expanduser()
@@ -108,11 +128,7 @@ def check_docx_pagination(settings) -> Result:
     else:
         renderer_path = shutil.which("soffice") or shutil.which("libreoffice")
         if not renderer_path:
-            return Result(
-                "FAIL", "DOCX pagination renderer",
-                "LibreOffice (soffice/libreoffice) is required for exact static-TOC page "
-                "mapping. Install it or set DOCX_TOC_ENABLED=false; no page numbers are guessed.",
-            )
+            return Result(missing_level, "DOCX pagination renderer", missing_detail)
     try:
         importlib.import_module("pypdf")
     except ImportError:

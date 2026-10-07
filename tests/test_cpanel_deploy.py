@@ -370,7 +370,7 @@ class PreflightTests(unittest.TestCase):
             self.assertEqual(pf.check_lock_support(Path(tmp)).level, "PASS")
             self.assertIn(pf.check_directory("d", Path(tmp) / "new").level, {"PASS", "WARN"})
 
-    def test_static_toc_preflight_requires_a_working_renderer_or_explicit_opt_out(self):
+    def test_static_toc_preflight_follows_the_page_number_policy(self):
         from types import SimpleNamespace
 
         from scripts import cpanel_preflight as pf
@@ -378,9 +378,16 @@ class PreflightTests(unittest.TestCase):
         settings = SimpleNamespace(
             docx_toc_enabled=True,
             docx_pagination_renderer_bin=None,
+            docx_toc_page_numbers="auto",
         )
         with patch.object(pf.shutil, "which", return_value=None):
+            # auto degrades to a link-only TOC; it is a warning, not a failure.
+            self.assertEqual(pf.check_docx_pagination(settings).level, "WARN")
+            settings.docx_toc_page_numbers = "required"
             self.assertEqual(pf.check_docx_pagination(settings).level, "FAIL")
+            settings.docx_toc_page_numbers = "off"
+            self.assertEqual(pf.check_docx_pagination(settings).level, "PASS")
+            settings.docx_toc_page_numbers = "auto"
         settings.docx_toc_enabled = False
         self.assertEqual(pf.check_docx_pagination(settings).level, "PASS")
 

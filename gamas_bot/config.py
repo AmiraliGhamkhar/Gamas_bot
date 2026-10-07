@@ -463,9 +463,13 @@ class Settings:
     max_receipt_size_bytes: int = 5_000_000
     # Fernet key is environment-only; database rows contain ciphertext only.
     provider_credentials_encryption_key: str | None = field(default=None, repr=False)
-    # Exact TOC pagination uses LibreOffice + pypdf; no guessed fallback exists.
+    # Exact TOC pagination uses LibreOffice + pypdf; no guessed page number
+    # exists in any mode. ``auto`` (default) uses the renderer when installed
+    # and degrades to a link-only topic list when it is not; ``required`` fails
+    # instead of degrading; ``off`` never invokes a renderer at all.
     docx_pagination_timeout_seconds: int = 120
     docx_pagination_renderer_bin: str | None = None
+    docx_toc_page_numbers: str = "auto"
 
     @property
     def lock_path(self) -> Path:
@@ -526,6 +530,7 @@ class Settings:
             "logo_path": self.docx_logo_path,
             "pagination_timeout_seconds": self.docx_pagination_timeout_seconds,
             "pagination_renderer_bin": self.docx_pagination_renderer_bin,
+            "toc_page_numbers": self.docx_toc_page_numbers,
         }
 
     @property
@@ -775,6 +780,15 @@ class Settings:
             docx_toc_min_sections = int(_text("DOCX_TOC_MIN_SECTIONS", "4"))
         except ValueError as exc:
             raise ValueError("DOCX_TOC_MIN_SECTIONS باید عددی باشد.") from exc
+        # Unlike the border style (which silently falls back to a plain line), a
+        # typo here is rejected at startup: the page-number policy decides
+        # whether a document may be delivered at all, so silently choosing a
+        # different one would be worse than a clear error.
+        docx_toc_page_numbers = _text("DOCX_TOC_PAGE_NUMBERS", "auto").strip().lower()
+        if docx_toc_page_numbers not in {"auto", "required", "off"}:
+            raise ValueError(
+                "DOCX_TOC_PAGE_NUMBERS باید یکی از auto، required یا off باشد."
+            )
         if not 1 <= docx_toc_min_sections <= 200:
             raise ValueError("DOCX_TOC_MIN_SECTIONS باید بین ۱ و ۲۰۰ باشد.")
         log_file_value = os.getenv("LOG_FILE", "").strip()
@@ -917,6 +931,7 @@ class Settings:
             docx_pagination_renderer_bin=(
                 _text("DOCX_PAGINATION_RENDERER_BIN", "").strip() or None
             ),
+            docx_toc_page_numbers=docx_toc_page_numbers,
         )
 
     def validate_runtime(self) -> None:
