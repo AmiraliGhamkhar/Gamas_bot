@@ -8,7 +8,7 @@ produced. The full-suite count quoted is the last run of this revision:
 
 ```
 $ .venv/bin/python -m pytest tests/ -q
-672 passed, 1 skipped, 1620 subtests passed in 44.78s
+673 passed, 1 skipped, 1620 subtests passed in 44.96s
 $ .venv/bin/ruff check gamas_bot scripts tests passenger_wsgi.py --select E9,F
 All checks passed!
 ```
@@ -138,14 +138,37 @@ required duration and offer 💳 خرید اشتراک.
   notes pass through `clean_human_text()` (ZWNJ/ZWJ preserved, control
   characters dropped).
 
-## 11. Regression tests from §47 — **verified**
+## 11. Regression tests from §47 — **verified for the areas below**
 
-All 60 items have a representation in the suite; the new modules are
-`tests/test_payment_flow.py`, `tests/test_provider_health.py`,
-`tests/test_provider_credentials.py` (extended) and
-`tests/test_docx_layout_requirements.py`. No existing test was removed or
-weakened (the only assertion change was replacing an over-strict expectation of
-exactly one cache invalidation with the correct single production call).
+The new regression module set is `tests/test_payment_flow.py`,
+`tests/test_provider_health.py`, `tests/test_provider_credentials.py`
+(extended), `tests/test_billing.py` (extended) and
+`tests/test_docx_layout_requirements.py`; the whole suite passes
+(673 passed, 1 skipped, 1,620 subtests).
+
+| Regression area | Where it is covered |
+|---|---|
+| free grant is once-per-user and not renewed by `/start` | `test_billing.py` |
+| legacy `free_lifetime_1h` → `free_1h` migration, no double grant | `test_billing.py` |
+| paid plans, cumulative balance, earliest expiry consumed first | `test_billing.py` |
+| concurrent reservation cannot overspend or create a negative balance | `test_billing.py`, `test_regressions.py` |
+| release on cancellation/STT failure/pagination failure | `test_bot_presentation_flow.py`, `test_billing.py` |
+| receipt intake, pending state across restart, duplicate approval | `test_payment_flow.py` |
+| a lecture file is never swallowed by an open payment | `test_payment_flow.py` |
+| rejection grants nothing and sanitizes the reason (ZWNJ kept) | `test_payment_flow.py`, `test_audit.py` |
+| receipt privacy: admin-only, path-traversal-proof, group chats refused | `test_payment_flow.py` |
+| 429 cooldown + rotation, 401/403 quarantine, 400/422 no rotation | `test_provider_credentials.py` |
+| all keys exhausted → clean secret-free error; success clears state | `test_provider_credentials.py` |
+| no secret in logs, panels or audit entries | `test_provider_credentials.py`, `test_provider_health.py` |
+| health states, cache, cost-safe probes, concurrency, masking | `test_provider_health.py` |
+| DOCX page layout contract and static TOC (no F9 / no `TOC` field) | `test_docx_layout_requirements.py` |
+| RTL/LTR runs, tables, header/footer, element ordering | `test_docx_polish.py`, `test_docx_export.py`, `scripts/validate_docx.py` |
+
+The brief's 60 items were **not** enumerated one-by-one against a checklist in
+this report; the rows above are the areas this revision added or re-verified. No
+existing test was removed or weakened (the only assertion change replaced an
+over-strict expectation of exactly one cache invalidation with the correct
+single production call).
 
 ## 12. Real DOCX validation — **partly verified**
 
