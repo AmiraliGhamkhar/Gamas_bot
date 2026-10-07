@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import pathlib
 import sqlite3
 import stat
 import tempfile
@@ -9,7 +10,9 @@ import unittest
 from pathlib import Path
 
 from gamas_bot.billing import (
+    FREE_PLAN_CODE,
     FREE_PLAN_SECONDS,
+    LEGACY_FREE_PLAN_CODE,
     PLAN_25_SECONDS,
     PLAN_50_SECONDS,
     plan_catalog,
@@ -56,13 +59,187 @@ class BillingDatabaseTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalog_uses_the_canonical_integer_seconds_and_prices(self):
         records = {row.code: row for row in plan_catalog()}
-        self.assertEqual(records["free_lifetime_1h"].included_seconds, 3_600)
+        # Canonical plan codes are part of the contract (see the migration that
+        # renames the legacy code), so they are asserted literally here.
+        self.assertEqual(set(records), {FREE_PLAN_CODE, "paid_25h_30d", "paid_50h_30d"})
+        self.assertEqual(FREE_PLAN_CODE, "free_1h")
+        self.assertEqual(LEGACY_FREE_PLAN_CODE, "free_lifetime_1h")
+        self.assertEqual(records["free_1h"].included_seconds, 3_600)
+        self.assertEqual(records["free_1h"].price_toman, 0)
+        self.assertIsNone(records["free_1h"].validity_days)
+        self.assertTrue(records["free_1h"].is_free)
         self.assertEqual(records["paid_25h_30d"].included_seconds, 90_000)
         self.assertEqual(records["paid_25h_30d"].price_toman, 150_000)
         self.assertEqual(records["paid_25h_30d"].validity_days, 30)
         self.assertEqual(records["paid_50h_30d"].included_seconds, 180_000)
         self.assertEqual(records["paid_50h_30d"].price_toman, 250_000)
         self.assertEqual(records["paid_50h_30d"].validity_days, 30)
+        # The stored catalogue agrees with the Python one after sync.
+        stored = {row["code"]: row for row in await self.db.list_plans()}
+        self.assertEqual(stored["free_1h"]["included_seconds"], 3_600)
+        self.assertEqual(stored["paid_25h_30d"]["price_toman"], 150_000)
+        self.assertEqual(stored["paid_50h_30d"]["price_toman"], 250_000)
+
+    async def test_legacy_free_plan_code_is_renamed_and_never_granted_twice(self):
+        """A database seeded by migration 003 keeps one entitlement after 004."""
+        await self.db.close()
+        legacy_path = self.root / "legacy-free-code.sqlite3"
+        migrations_root = Path(__file__).resolve().parents[1] / "migrations"
+
+        def apply(connection, migration_name: str) -> None:
+            for statement in split_sql_statements(
+                (migrations_root / migration_name).read_text(encoding="utf-8")
+            ):
+                connection.execute(statement)
+
+        legacy = sqlite3.connect(legacy_path)
+        try:
+            apply(legacy, "001_initial.sql")
+            apply(legacy, "002_presentations.sql")
+            legacy.execute(
+                "INSERT INTO users(telegram_id, username, first_seen) VALUES (?, ?, ?)",
+                (505, "legacy", "2026-02-02T00:00:00+00:00"),
+            )
+            # 003 is the pre-004 deployment: it seeds the legacy plan code and
+            # grants the one-time free hour to the user that already exists.
+            apply(legacy, "003_billing_and_credentials.sql")
+            legacy.commit()
+            codes = {row[0] for row in legacy.execute("SELECT code FROM plans")}
+            self.assertIn(LEGACY_FREE_PLAN_CODE, codes)
+            self.assertNotIn(FREE_PLAN_CODE, codes)
+            entitlements = legacy.execute("SELECT COUNT(*) FROM entitlements").fetchone()[0]
+            self.assertEqual(entitlements, 1)
+        finally:
+            legacy.close()
+
+        upgraded = Database(legacy_path)
+        await upgraded.open()
+        try:
+            await upgraded.sync_plan_catalog(canonical_plan_records())
+            cursor = await upgraded._db().execute("SELECT code FROM plans ORDER BY id")
+            codes = [row["code"] for row in await cursor.fetchall()]
+            self.assertIn("free_1h", codes)
+            self.assertNotIn("free_lifetime_1h", codes)
+            user = await upgraded.get_user(505)
+            balance = await upgraded.user_balance(int(user["id"]))
+            # Renaming must not duplicate or drop the existing free hour.
+            self.assertEqual(balance["available_seconds"], FREE_PLAN_SECONDS)
+            self.assertEqual(len(balance["entitlements"]), 1)
+            await upgraded.upsert_user(505, "legacy")
+            self.assertEqual(
+                (await upgraded.user_balance(int(user["id"])))["available_seconds"],
+                FREE_PLAN_SECONDS,
+            )
+            grants = [
+                row
+                for row in await upgraded.usage_ledger(int(user["id"]))
+                if row["event_type"] == "grant"
+            ]
+            self.assertEqual(len(grants), 1)
+        finally:
+            await upgraded.close()
+            self.db = Database(self.root / "billing.sqlite3")
+            await self.db.open()
+            await self.db.sync_plan_catalog(canonical_plan_records())
+
+    async def test_restarting_the_database_reapplies_nothing_twice(self):
+        """Every migration is idempotent: a restart cannot duplicate a plan or a grant."""
+        user = await self._new_user(303)
+        before = await self.db.user_balance(int(user["id"]))
+        plans_before = await self.db.list_plans()
+        ledger_before = await self.db.usage_ledger(int(user["id"]))
+
+        for _ in range(3):
+            await self.db.close()
+            reopened = Database(self.root / "billing.sqlite3")
+            await reopened.open()
+            await reopened.sync_plan_catalog(canonical_plan_records())
+            self.db = reopened
+            balance = await self.db.user_balance(int(user["id"]))
+            self.assertEqual(balance["available_seconds"], before["available_seconds"])
+            self.assertEqual(len(balance["entitlements"]), len(before["entitlements"]))
+            self.assertEqual(
+                [row["code"] for row in await self.db.list_plans()],
+                [row["code"] for row in plans_before],
+            )
+            self.assertEqual(
+                len(await self.db.usage_ledger(int(user["id"]))), len(ledger_before)
+            )
+
+    def test_canonical_payment_card_is_configured_once_and_formatted_by_one_helper(self):
+        from gamas_bot.config import (
+            CANONICAL_PAYMENT_BANK,
+            CANONICAL_PAYMENT_CARD,
+            CANONICAL_PAYMENT_CARD_HOLDER,
+            Settings,
+            format_payment_card,
+        )
+
+        self.assertEqual(CANONICAL_PAYMENT_CARD, "5022291332906625")
+        self.assertEqual(CANONICAL_PAYMENT_CARD_HOLDER, "امیرعلی غمخوار")
+        self.assertEqual(CANONICAL_PAYMENT_BANK, "بانک پاسارگاد")
+        # One canonical formatter: digits only in storage, grouped for display.
+        self.assertEqual(format_payment_card(CANONICAL_PAYMENT_CARD), "5022 2913 3290 6625")
+        self.assertEqual(format_payment_card("5022-2913-3290-6625"), "5022 2913 3290 6625")
+        settings = Settings.from_env(self.root / "does-not-exist.env")
+        self.assertEqual(settings.payment_card_number, CANONICAL_PAYMENT_CARD)
+        self.assertEqual(settings.payment_card_display, "5022 2913 3290 6625")
+        self.assertEqual(settings.payment_card_holder, CANONICAL_PAYMENT_CARD_HOLDER)
+        self.assertEqual(settings.payment_bank_name, CANONICAL_PAYMENT_BANK)
+        # The tariff is canonical too, and every value is an integer second/day amount.
+        self.assertEqual(
+            settings.plan_values,
+            {
+                "free_plan_hours": 1,
+                "plan_25_hours": 25,
+                "plan_25_price_toman": 150_000,
+                "plan_25_validity_days": 30,
+                "plan_50_hours": 50,
+                "plan_50_price_toman": 250_000,
+                "plan_50_validity_days": 30,
+            },
+        )
+
+    def test_no_handler_hard_codes_the_card_number_or_the_prices(self):
+        """The values must live in configuration, not be scattered in the bot."""
+        import gamas_bot.bot as bot_module
+
+        source = pathlib.Path(bot_module.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("5022291332906625", source.replace("_", ""))
+        self.assertNotIn("5022 2913 3290 6625", source)
+        for literal in ("150000", "250000", "90000", "180000"):
+            self.assertNotIn(literal, source)
+
+    async def test_plan_values_override_seeds_the_database_and_the_ui(self):
+        from gamas_bot.billing import plan_catalog
+
+        overridden = plan_catalog(
+            {
+                "free_plan_hours": 2,
+                "plan_25_hours": 10,
+                "plan_25_price_toman": 90_000,
+                "plan_25_validity_days": 7,
+                "plan_50_hours": 40,
+                "plan_50_price_toman": 300_000,
+                "plan_50_validity_days": 60,
+            }
+        )
+        records = {plan.code: plan for plan in overridden}
+        self.assertEqual(records["free_1h"].included_seconds, 7_200)
+        self.assertEqual(records["paid_25h_30d"].included_seconds, 36_000)
+        self.assertEqual(records["paid_25h_30d"].price_toman, 90_000)
+        self.assertEqual(records["paid_25h_30d"].validity_days, 7)
+        self.assertEqual(records["paid_50h_30d"].included_seconds, 144_000)
+        self.assertEqual(records["paid_50h_30d"].validity_days, 60)
+        await self.db.sync_plan_catalog([plan.as_record() for plan in overridden])
+        stored = {row["code"]: row for row in await self.db.list_plans()}
+        self.assertEqual(stored["paid_25h_30d"]["price_toman"], 90_000)
+        self.assertEqual(stored["paid_50h_30d"]["included_seconds"], 144_000)
+        # A grant reads the row, so the entitlement matches the configured tariff.
+        user = await self._new_user(404)
+        balance = await self.db.user_balance(int(user["id"]))
+        self.assertEqual(balance["available_seconds"], 7_200)
+        await self.db.sync_plan_catalog(canonical_plan_records())
 
     async def test_zero_second_reservations_are_rejected(self):
         user = await self._new_user()

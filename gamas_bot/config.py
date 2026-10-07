@@ -22,6 +22,39 @@ CANONICAL_PAYMENT_CARD = "5022291332906625"
 CANONICAL_PAYMENT_CARD_HOLDER = "امیرعلی غمخوار"
 CANONICAL_PAYMENT_BANK = "بانک پاسارگاد"
 
+# Canonical prepaid tariff. These are the confirmed business values; the
+# environment may override them (FREE_PLAN_HOURS, PLAN_25_*, PLAN_50_*), but a
+# deployment that sets nothing bills exactly the promised plans. Accounting is
+# always done in integer seconds, never in floating-point hours.
+CANONICAL_FREE_PLAN_HOURS = 1
+CANONICAL_PLAN_25_HOURS = 25
+CANONICAL_PLAN_25_PRICE_TOMAN = 150_000
+CANONICAL_PLAN_25_VALIDITY_DAYS = 30
+CANONICAL_PLAN_50_HOURS = 50
+CANONICAL_PLAN_50_PRICE_TOMAN = 250_000
+CANONICAL_PLAN_50_VALIDITY_DAYS = 30
+
+#: Environment variable name -> resolved settings attribute for the tariff.
+PLAN_ENV_FIELDS = (
+    ("FREE_PLAN_HOURS", "free_plan_hours", CANONICAL_FREE_PLAN_HOURS),
+    ("PLAN_25_HOURS", "plan_25_hours", CANONICAL_PLAN_25_HOURS),
+    ("PLAN_25_PRICE_TOMAN", "plan_25_price_toman", CANONICAL_PLAN_25_PRICE_TOMAN),
+    ("PLAN_25_VALIDITY_DAYS", "plan_25_validity_days", CANONICAL_PLAN_25_VALIDITY_DAYS),
+    ("PLAN_50_HOURS", "plan_50_hours", CANONICAL_PLAN_50_HOURS),
+    ("PLAN_50_PRICE_TOMAN", "plan_50_price_toman", CANONICAL_PLAN_50_PRICE_TOMAN),
+    ("PLAN_50_VALIDITY_DAYS", "plan_50_validity_days", CANONICAL_PLAN_50_VALIDITY_DAYS),
+)
+
+
+def format_payment_card(number: str) -> str:
+    """The single display helper for the stored card number.
+
+    The value is normalised to digits once at configuration time; grouping is a
+    presentation concern and must never change the stored number.
+    """
+    digits = re.sub(r"\D", "", str(number))
+    return " ".join(digits[index:index + 4] for index in range(0, len(digits), 4))
+
 # Note-generation compression modes. ``full`` (the default) preserves detail;
 # only ``summary`` intentionally compresses. Defined here so the environment
 # parser does not need to import the (heavier) structuring module.
@@ -386,6 +419,14 @@ class Settings:
     payment_card_number: str = CANONICAL_PAYMENT_CARD
     payment_card_holder: str = CANONICAL_PAYMENT_CARD_HOLDER
     payment_bank_name: str = CANONICAL_PAYMENT_BANK
+    # Resolved tariff (defaults are the canonical business values).
+    free_plan_hours: int = CANONICAL_FREE_PLAN_HOURS
+    plan_25_hours: int = CANONICAL_PLAN_25_HOURS
+    plan_25_price_toman: int = CANONICAL_PLAN_25_PRICE_TOMAN
+    plan_25_validity_days: int = CANONICAL_PLAN_25_VALIDITY_DAYS
+    plan_50_hours: int = CANONICAL_PLAN_50_HOURS
+    plan_50_price_toman: int = CANONICAL_PLAN_50_PRICE_TOMAN
+    plan_50_validity_days: int = CANONICAL_PLAN_50_VALIDITY_DAYS
     receipt_dir: Path = Path("data/receipts")
     receipt_retention_days: int = 90
     max_receipt_size_bytes: int = 5_000_000
@@ -459,10 +500,12 @@ class Settings:
     @property
     def payment_card_display(self) -> str:
         """Grouped presentation-only form of the normalized card number."""
-        return " ".join(
-            self.payment_card_number[index:index + 4]
-            for index in range(0, len(self.payment_card_number), 4)
-        )
+        return format_payment_card(self.payment_card_number)
+
+    @property
+    def plan_values(self) -> dict[str, int]:
+        """Resolved tariff passed to :func:`gamas_bot.billing.plan_catalog`."""
+        return {name: int(getattr(self, name)) for _env, name, _default in PLAN_ENV_FIELDS}
 
     @property
     def effective_note_api_key(self) -> str | None:
@@ -606,6 +649,10 @@ class Settings:
             receipt_retention_days = int(_text("RECEIPT_RETENTION_DAYS", "90"))
             max_receipt_size = int(_text("MAX_PAYMENT_RECEIPT_BYTES", "5000000"))
             docx_pagination_timeout = int(_text("DOCX_PAGINATION_TIMEOUT_SECONDS", "120"))
+            plan_values = {
+                name: int(_text(env_name, str(default)))
+                for env_name, name, default in PLAN_ENV_FIELDS
+            }
         except ValueError as exc:
             raise ValueError("مقادیر عددی تنظیمات محیط معتبر نیستند.") from exc
         raw_card = _text("PAYMENT_CARD_NUMBER", CANONICAL_PAYMENT_CARD)
@@ -645,6 +692,18 @@ class Settings:
             docx_pagination_timeout,
         ) <= 0 or receipt_retention_days < 0:
             raise ValueError("تنظیمات طرح‌های اعتبار، رسید یا صفحه‌بندی باید معتبر باشند.")
+        for env_name, name, _default in PLAN_ENV_FIELDS:
+            value = plan_values[name]
+            if name.endswith("_hours"):
+                limit = 1_000
+            elif name.endswith("_days"):
+                limit = 3_650
+            else:  # price
+                limit = 1_000_000_000
+            if not 1 <= value <= limit:
+                raise ValueError(
+                    f"{env_name} باید عددی بین ۱ و {limit} باشد."
+                )
         if log_max_bytes <= 0 or log_backup_count < 0:
             raise ValueError("تنظیمات چرخش فایل لاگ معتبر نیستند.")
         log_level = _text("LOG_LEVEL", "INFO").upper()
@@ -814,6 +873,13 @@ class Settings:
                 "PAYMENT_CARD_HOLDER", CANONICAL_PAYMENT_CARD_HOLDER
             ),
             payment_bank_name=_text("PAYMENT_BANK_NAME", CANONICAL_PAYMENT_BANK),
+            free_plan_hours=plan_values["free_plan_hours"],
+            plan_25_hours=plan_values["plan_25_hours"],
+            plan_25_price_toman=plan_values["plan_25_price_toman"],
+            plan_25_validity_days=plan_values["plan_25_validity_days"],
+            plan_50_hours=plan_values["plan_50_hours"],
+            plan_50_price_toman=plan_values["plan_50_price_toman"],
+            plan_50_validity_days=plan_values["plan_50_validity_days"],
             receipt_dir=_path("RECEIPT_DIR", "data/receipts"),
             receipt_retention_days=receipt_retention_days,
             max_receipt_size_bytes=max_receipt_size,

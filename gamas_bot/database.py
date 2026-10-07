@@ -12,12 +12,33 @@ from typing import Any
 
 import aiosqlite
 
+from .billing import FREE_PLAN_CODE, LEGACY_FREE_PLAN_CODE
+
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 logger = logging.getLogger(__name__)
 
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+#: Persian text relies on the zero-width non-joiner/joiner: they are format
+#: characters (``str.isprintable()`` is False) but stripping them would turn
+#: "هم‌خوانی" into "همخوانی". Only genuinely unwanted control characters go.
+_PERSIAN_FORMAT_CHARACTERS = frozenset({"\u200c", "\u200d"})
+
+
+def clean_human_text(value: str | None, *, limit: int = 500) -> str | None:
+    """Strip control/non-printable characters while keeping Persian formatting."""
+    if value is None:
+        return None
+    cleaned = "".join(
+        character
+        for character in str(value)
+        if character.isprintable() or character in _PERSIAN_FORMAT_CHARACTERS
+    ).strip()
+    cleaned = cleaned[:limit]
+    return cleaned or None
 
 
 def split_sql_statements(script: str) -> list[str]:
@@ -256,13 +277,20 @@ class Database:
             cursor = await db.execute("SELECT * FROM users WHERE id=?", (user_id,))
             return dict(await cursor.fetchone())
 
+    @staticmethod
+    async def _free_plan_row(db: aiosqlite.Connection) -> Any:
+        """Resolve the lifetime free plan under either canonical code spelling."""
+        cursor = await db.execute(
+            "SELECT id, included_seconds FROM plans WHERE code IN (?, ?) AND enabled=1 "
+            "ORDER BY CASE WHEN code=? THEN 0 ELSE 1 END, id LIMIT 1",
+            (FREE_PLAN_CODE, LEGACY_FREE_PLAN_CODE, FREE_PLAN_CODE),
+        )
+        return await cursor.fetchone()
+
     async def _grant_free_entitlement_in_transaction(
         self, db: aiosqlite.Connection, user_id: int, now: str
     ) -> None:
-        cursor = await db.execute(
-            "SELECT id, included_seconds FROM plans WHERE code='free_lifetime_1h' AND enabled=1"
-        )
-        plan = await cursor.fetchone()
+        plan = await self._free_plan_row(db)
         if not plan:
             raise RuntimeError("Canonical lifetime free plan is missing")
         await db.execute(
@@ -642,15 +670,21 @@ class Database:
             return cursor.rowcount == 1
 
     async def submit_payment_receipt(
-        self, payment_id: int, user_id: int, receipt_path: str, message_id: int
+        self,
+        payment_id: int,
+        user_id: int,
+        receipt_path: str,
+        message_id: int,
+        *,
+        receipt_file_id: str | None = None,
     ) -> bool:
         now = utc_now()
         async with self._transaction(immediate=True) as db:
             cursor = await db.execute(
                 "UPDATE payment_requests SET status='pending', receipt_path=?, "
-                "receipt_message_id=?, receipt_submitted_at=?, updated_at=? "
+                "receipt_message_id=?, receipt_file_id=?, receipt_submitted_at=?, updated_at=? "
                 "WHERE id=? AND user_id=? AND status='awaiting_receipt'",
-                (receipt_path, message_id, now, now, payment_id, user_id),
+                (receipt_path, message_id, receipt_file_id, now, now, payment_id, user_id),
             )
             return cursor.rowcount == 1
 
@@ -671,8 +705,9 @@ class Database:
         async with self._lock:
             cursor = await self._db().execute(
                 "SELECT pr.id, pr.amount_toman, pr.status, pr.created_at, pr.receipt_submitted_at, "
-                "pr.receipt_path, pr.receipt_message_id, pr.reviewed_at, pr.reviewer_telegram_id, "
-                "pr.rejection_reason, u.id AS user_id, u.telegram_id, u.username, "
+                "pr.receipt_path, pr.receipt_message_id, pr.receipt_file_id, pr.reviewed_at, "
+                "pr.reviewer_telegram_id, pr.rejection_reason, pr.admin_note, "
+                "u.id AS user_id, u.telegram_id, u.username, "
                 "p.code AS plan_code, p.name AS plan_name, p.included_seconds, p.validity_days "
                 "FROM payment_requests pr JOIN users u ON u.id=pr.user_id "
                 "JOIN plans p ON p.id=pr.plan_id WHERE pr.id=?",
@@ -692,10 +727,13 @@ class Database:
             )
             return [dict(row) for row in await cursor.fetchall()]
 
-    async def approve_payment(self, payment_id: int, admin_id: int) -> dict[str, Any] | None:
+    async def approve_payment(
+        self, payment_id: int, admin_id: int, *, admin_note: str | None = None
+    ) -> dict[str, Any] | None:
         """Atomically approve once and grant the plan snapshot exactly once."""
         now_dt = datetime.now(timezone.utc).replace(microsecond=0)
         now = now_dt.isoformat()
+        note = self._clean_note(admin_note)
         async with self._transaction(immediate=True) as db:
             cursor = await db.execute(
                 "SELECT pr.id, pr.user_id, pr.amount_toman, pr.status, u.telegram_id, "
@@ -710,8 +748,9 @@ class Database:
                 return None
             cursor = await db.execute(
                 "UPDATE payment_requests SET status='approved', reviewed_at=?, "
-                "reviewer_telegram_id=?, updated_at=? WHERE id=? AND status='pending'",
-                (now, admin_id, now, payment_id),
+                "reviewer_telegram_id=?, admin_note=?, updated_at=? "
+                "WHERE id=? AND status='pending'",
+                (now, admin_id, note, now, payment_id),
             )
             if cursor.rowcount != 1:
                 return None
@@ -760,10 +799,18 @@ class Database:
                 "expires_at": expires,
             }
 
-    async def reject_payment(self, payment_id: int, admin_id: int, reason: str) -> bool:
-        reason = "".join(character for character in reason if character.isprintable()).strip()[:500]
+    @staticmethod
+    def _clean_note(note: str | None) -> str | None:
+        """Sanitize an administrator note; it is stored, never trusted as markup."""
+        return clean_human_text(note)
+
+    async def reject_payment(
+        self, payment_id: int, admin_id: int, reason: str, *, admin_note: str | None = None
+    ) -> bool:
+        reason = self._clean_note(reason) or ""
         if not reason:
             raise ValueError("A rejection reason is required")
+        note = self._clean_note(admin_note) or reason
         now = utc_now()
         async with self._transaction(immediate=True) as db:
             cursor = await db.execute(
@@ -775,8 +822,8 @@ class Database:
                 return False
             cursor = await db.execute(
                 "UPDATE payment_requests SET status='rejected', rejection_reason=?, reviewed_at=?, "
-                "reviewer_telegram_id=?, updated_at=? WHERE id=? AND status='pending'",
-                (reason, now, admin_id, now, payment_id),
+                "reviewer_telegram_id=?, admin_note=?, updated_at=? WHERE id=? AND status='pending'",
+                (reason, now, admin_id, note, now, payment_id),
             )
             if cursor.rowcount != 1:
                 return False
@@ -794,7 +841,7 @@ class Database:
         self, telegram_id: int, seconds: int, admin_id: int, reason: str
     ) -> dict[str, Any] | None:
         seconds = int(seconds)
-        reason = "".join(character for character in reason if character.isprintable()).strip()[:500]
+        reason = clean_human_text(reason) or ""
         if seconds <= 0 or seconds > 10_000_000 or not reason:
             raise ValueError("Credit seconds or audit reason is invalid")
         now = utc_now()
@@ -804,10 +851,7 @@ class Database:
             if not user:
                 return None
             user_id = int(user["id"])
-            cursor = await db.execute(
-                "SELECT id FROM plans WHERE code='free_lifetime_1h'"
-            )
-            plan = await cursor.fetchone()
+            plan = await self._free_plan_row(db)
             if not plan:
                 raise RuntimeError("Canonical plan catalogue is missing")
             cursor = await db.execute(
@@ -1003,7 +1047,7 @@ class Database:
             return True
 
     async def release_usage(self, submission_id: int, reason: str) -> int:
-        reason = "".join(character for character in reason if character.isprintable()).strip()[:500]
+        reason = clean_human_text(reason) or ""
         async with self._transaction(immediate=True) as db:
             return await self._release_reservation_in_transaction(db, submission_id, reason or "Processing failed")
 
@@ -1024,6 +1068,72 @@ class Database:
                 (user_id, max(1, min(limit, 200))),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def admin_user_credit_overview(self, telegram_id: int) -> dict[str, Any] | None:
+        """Everything the admin credit screen shows for one user.
+
+        Read-only and index-backed: the free/paid split comes from the same
+        entitlement rows the reservation engine consumes, so the screen can
+        never disagree with billing.
+        """
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT id, telegram_id, username, is_banned, first_seen FROM users "
+                "WHERE telegram_id=?",
+                (telegram_id,),
+            )
+            user = await cursor.fetchone()
+            if not user:
+                return None
+            user_id = int(user["id"])
+            await self._expire_entitlements_in_transaction(db, user_id, now)
+            cursor = await db.execute(
+                "SELECT e.id, e.granted_seconds, e.remaining_seconds, e.starts_at, e.expires_at, "
+                "e.status, e.source, p.code AS plan_code, p.name AS plan_name "
+                "FROM entitlements e JOIN plans p ON p.id=e.plan_id WHERE e.user_id=? "
+                "ORDER BY e.id DESC LIMIT 50",
+                (user_id,),
+            )
+            entitlements = [dict(row) for row in await cursor.fetchall()]
+            free_seconds = sum(
+                int(row["remaining_seconds"])
+                for row in entitlements
+                if row["status"] == "active" and row["source"] == "free_lifetime"
+            )
+            paid_seconds = sum(
+                int(row["remaining_seconds"])
+                for row in entitlements
+                if row["status"] == "active" and row["source"] != "free_lifetime"
+            )
+            cursor = await db.execute(
+                "SELECT l.id, l.event_type, l.submission_id, l.reserved_seconds, "
+                "l.consumed_seconds, l.released_seconds, l.requested_seconds, l.reason, "
+                "l.created_at FROM usage_ledger l WHERE l.user_id=? ORDER BY l.id DESC LIMIT 15",
+                (user_id,),
+            )
+            usage = [dict(row) for row in await cursor.fetchall()]
+            cursor = await db.execute(
+                "SELECT COUNT(*) AS total, "
+                "SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done, "
+                "SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) AS failed "
+                "FROM audio_submissions WHERE user_id=?",
+                (user_id,),
+            )
+            submissions = dict(await cursor.fetchone())
+            return {
+                "user_id": user_id,
+                "telegram_id": int(user["telegram_id"]),
+                "username": user["username"],
+                "is_banned": bool(user["is_banned"]),
+                "first_seen": user["first_seen"],
+                "available_seconds": free_seconds + paid_seconds,
+                "free_seconds": free_seconds,
+                "paid_seconds": paid_seconds,
+                "entitlements": entitlements,
+                "usage": usage,
+                "submissions": {key: int(value or 0) for key, value in submissions.items()},
+            }
 
     async def admin_audit(self, *, limit: int = 30) -> list[dict[str, Any]]:
         async with self._lock:
@@ -1233,6 +1343,76 @@ class Database:
                 db, admin_id, "provider_credential_deleted", "provider_credential", str(credential_id),
                 {"service": row["service"], "provider": row["provider"], "label": row["label"],
                  "masked": f"••••{row['secret_last4']}"},
+            )
+            return True
+
+    async def add_audit_entry(
+        self,
+        admin_id: int,
+        action: str,
+        target_type: str,
+        target_id: str | None,
+        details: dict[str, Any] | None = None,
+    ) -> int:
+        """Public, secret-free audit insert for administrative actions."""
+        async with self._transaction(immediate=True) as db:
+            await self._insert_audit(
+                db, admin_id, action, target_type, target_id, details or {}
+            )
+            cursor = await db.execute("SELECT last_insert_rowid() AS id")
+            return int((await cursor.fetchone())["id"])
+
+    async def reorder_provider_credential(
+        self, credential_id: int, direction: str, admin_id: int
+    ) -> bool:
+        """Move one credential up/down inside its own provider pool.
+
+        Priorities are renumbered densely (10, 20, 30, ...) in one transaction so
+        selection order stays deterministic even when several keys share the
+        default priority. Credentials from other providers are untouched.
+        """
+        if direction not in {"up", "down"}:
+            raise ValueError("Unsupported credential reorder direction")
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT id, service, provider, label, priority FROM provider_credentials "
+                "WHERE id=?",
+                (credential_id,),
+            )
+            target = await cursor.fetchone()
+            if not target:
+                return False
+            cursor = await db.execute(
+                "SELECT id FROM provider_credentials WHERE service=? AND provider=? "
+                "ORDER BY priority, id",
+                (target["service"], target["provider"]),
+            )
+            ordered = [int(row["id"]) for row in await cursor.fetchall()]
+            try:
+                index = ordered.index(int(credential_id))
+            except ValueError:  # pragma: no cover - the row exists by construction
+                return False
+            swap_with = index - 1 if direction == "up" else index + 1
+            if swap_with < 0 or swap_with >= len(ordered):
+                return False
+            ordered[index], ordered[swap_with] = ordered[swap_with], ordered[index]
+            for position, item_id in enumerate(ordered, start=1):
+                await db.execute(
+                    "UPDATE provider_credentials SET priority=?, updated_by_admin_id=?, updated_at=? "
+                    "WHERE id=?",
+                    (position * 10, admin_id, now, item_id),
+                )
+            await self._insert_audit(
+                db, admin_id, "provider_credential_priority", "provider_credential",
+                str(credential_id),
+                {
+                    "service": str(target["service"]),
+                    "provider": str(target["provider"]),
+                    "label": str(target["label"]),
+                    "direction": direction,
+                    "position": swap_with + 1,
+                },
             )
             return True
 
