@@ -103,6 +103,80 @@ class InstanceLockTests(unittest.TestCase):
         self.assertIn("Not starting", done.stdout + done.stderr)
 
 
+class SelfCheckCommandTests(unittest.TestCase):
+    """``python -m gamas_bot --check``: documented, offline, side-effect free."""
+
+    def _run_check(self, env: dict[str, str]):
+        return subprocess.run(
+            [sys.executable, "-m", "gamas_bot", "--check"],
+            cwd=PROJECT_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    def test_reports_missing_configuration_with_exit_code_2(self):
+        # Empty strings win over any project .env (load_dotenv does not
+        # override), so this is deterministic even on a configured machine.
+        env = {
+            **os.environ,
+            "TELEGRAM_BOT_TOKEN": "",
+            "TELEGRAM_API_ID": "",
+            "TELEGRAM_API_HASH": "",
+            "ADMIN_IDS": "",
+            "SPEECHMATICS_API_KEY": "",
+            "DEEPGRAM_API_KEY": "",
+            "STT_OPENAI_BASE_URL": "",
+            "PROVIDER_CREDENTIALS_ENCRYPTION_KEY": "",
+        }
+        done = self._run_check(env)
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertIn("FAIL configuration", done.stdout)
+        self.assertNotIn("PASS media worker", done.stdout)
+
+    def test_valid_configuration_passes_without_creating_any_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            state = Path(folder)
+            env = _env(
+                TELEGRAM_BOT_TOKEN="123:TEST",
+                TELEGRAM_API_ID="1",
+                TELEGRAM_API_HASH="0123456789abcdef0123456789abcdef",
+                ADMIN_IDS="1",
+                DEEPGRAM_API_KEY="key",
+                TELEGRAM_SESSION_PATH=str(state / "session"),
+                DATABASE_PATH=str(state / "db.sqlite3"),
+                TEMP_DIR=str(state / "tmp"),
+            )
+            done = self._run_check(env)
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            self.assertIn("PASS configuration", done.stdout)
+            self.assertIn("PASS dependencies", done.stdout)
+            self.assertIn("PASS media worker", done.stdout)
+            # No database, no session, no lock, no temp work: the check never
+            # mutates state, so it is safe while a healthy bot is running.
+            self.assertEqual(
+                list(state.iterdir()), [],
+                "--check must not create database, session, lock or temp files",
+            )
+            # The check never starts (or refuses to start) the bot itself.
+            self.assertNotIn("Not starting", done.stdout + done.stderr)
+            self.assertNotIn("Persian study assistant is online", done.stdout)
+
+    def test_check_is_never_confused_with_a_start_request(self):
+        # ``--check`` must exit before the instance lock: running it twice
+        # concurrently against a free lock is not a lock conflict (exit 3).
+        env = _env(
+            TELEGRAM_SESSION_PATH=str(Path(tempfile.gettempdir()) / "gamas-check-session"),
+            DATABASE_PATH=str(Path(tempfile.gettempdir()) / "gamas-check.sqlite3"),
+            TEMP_DIR=str(Path(tempfile.gettempdir()) / "gamas-check-tmp"),
+        )
+        first = self._run_check(env)
+        second = self._run_check(env)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+
+
 class GracefulShutdownTests(unittest.IsolatedAsyncioTestCase):
     async def test_sigterm_runs_the_same_shutdown_path_as_ctrl_c(self):
         import asyncio

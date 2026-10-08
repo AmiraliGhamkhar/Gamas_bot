@@ -5,7 +5,7 @@
 ```bash
 python -m compileall -q gamas_bot scripts tests passenger_wsgi.py
 ruff check .                      # config in pyproject.toml
-python -m pytest -q               # 726 tests, ~55 s, no network
+python -m pytest -q               # 743 tests, ~52 s, no network
 python -m pip check
 python -m scripts.sync_requirements --check
 ```
@@ -31,6 +31,7 @@ dedicated files:
 | Note quality, coverage, QA | `test_note_quality.py`, `test_semantic_coverage.py`, `test_note_evaluation.py` |
 | DOCX layout, RTL, TOC, pagination | `test_docx_export.py`, `test_docx_polish.py`, `test_docx_layout_requirements.py`, `test_mixed_script_typography.py` |
 | Offline page renderer | `test_page_renderer.py` |
+| DOCX hot-path equivalence (byte-identical fast paths) | `test_docx_run_styling.py` |
 | Configuration and dependency drift | `test_config_consistency.py`, `test_dependency_consistency.py` |
 | Deployment (cPanel, launcher, lock) | `test_cpanel_deploy.py` |
 
@@ -40,6 +41,7 @@ dedicated files:
 python -m scripts.benchmark_notes            # deterministic, offline, ~2 s
 python -m scripts.benchmark_notes --live     # calls the configured note provider
 python -m scripts.benchmark_stt audio.mp3    # per-provider STT latency
+python -m scripts.benchmark_queue            # bounded-queue load, 1..50 jobs, ~4 s
 python -m scripts.validate_docx --render     # DOCX structure + offline pages
 ```
 
@@ -51,6 +53,13 @@ ratio is never a failure by itself — it is read together with coverage.
 The offline DOCX benchmark deliberately runs with the static TOC disabled
 because exact page mapping needs the production renderer; static-TOC behaviour
 is covered by its own tests with a stubbed page map.
+
+`benchmark_queue` drives the real `StudyBot` queue (bounded queue, worker pool,
+job semaphore, SQLite status writes) with synthetic jobs and reports acceptance
+vs back-pressure rejection, queue-wait and latency percentiles, throughput and
+RSS per scenario. At the default capacity (3 workers + 8 pending) a burst of
+25 or 50 uploads accepts 11 and rejects the rest with an explicit message —
+that is the capacity model working, not a failure.
 
 ## Conventions
 

@@ -143,6 +143,13 @@ def build_probe_command(path: Path) -> list[str]:
     return worker_command("probe", "--", str(path))
 
 
+def build_probe_many_command(paths: list[Path]) -> list[str]:
+    """One worker invocation that probes every clip of a deck in one process."""
+    if not paths:
+        raise MediaToolError("فهرست فایل برای بررسی رسانه خالی است.")
+    return worker_command("probe", "--", *(str(path) for path in paths))
+
+
 def parse_probe_output(payload: str) -> MediaInfo:
     """Read the worker's JSON report into a MediaInfo record.
 
@@ -175,6 +182,39 @@ def parse_probe_output(payload: str) -> MediaInfo:
     return MediaInfo(has_audio, duration, codec)
 
 
+def parse_probe_list_output(payload: str, paths: list[Path]) -> dict[str, MediaInfo]:
+    """Read the worker's multi-file JSON report into ``{path: MediaInfo}``.
+
+    Entries the worker could not probe carry ``error`` instead of a report;
+    they are logged (with the bounded worker message, never file content) and
+    omitted from the result, which is how one broken clip becomes a per-clip
+    skip reason instead of a failed deck.  A structurally invalid report is an
+    error so the caller can fall back to isolated single-file probes.
+    """
+    try:
+        data = json.loads(payload or "[]")
+    except json.JSONDecodeError as exc:
+        raise MediaToolError("خروجی بررسی رسانه قابل‌خواندن نیست.") from exc
+    if not isinstance(data, list):
+        raise MediaToolError("ساختار خروجی بررسی رسانه معتبر نیست.")
+    expected = {str(path) for path in paths}
+    result: dict[str, MediaInfo] = {}
+    for item in data:
+        if not isinstance(item, dict):
+            raise MediaToolError("ساختار خروجی بررسی رسانه معتبر نیست.")
+        raw_path = str(item.get("path", ""))
+        if raw_path not in expected:
+            raise MediaToolError("ساختار خروجی بررسی رسانه معتبر نیست.")
+        if "error" in item:
+            logger.warning("Media probe failed path=%s detail=%s", raw_path, item["error"])
+            continue
+        try:
+            result[raw_path] = parse_probe_output(json.dumps(item))
+        except MediaToolError as exc:
+            logger.warning("Media probe report unusable path=%s detail=%s", raw_path, exc)
+    return result
+
+
 async def probe_media(path: Path, settings: Settings) -> MediaInfo:
     code, stdout, stderr = await run_command(
         build_probe_command(path),
@@ -185,6 +225,53 @@ async def probe_media(path: Path, settings: Settings) -> MediaInfo:
     if code != 0:
         raise MediaToolError(f"بررسی فایل رسانه ناموفق بود: {stderr.strip()[:300]}")
     return parse_probe_output(stdout)
+
+
+async def probe_media_many(paths: list[Path], settings: Settings) -> dict[str, MediaInfo]:
+    """Probe several media files, keyed by their path string.
+
+    Probing N clips one process each paid the interpreter + PyAV import for
+    every clip (~100 ms on the reference VM, ~90% of which is startup).  One
+    worker process for the whole deck cuts that phase to roughly a tenth.
+
+    Never raises for an individual file: files that cannot be probed are
+    logged and omitted, exactly like a per-clip :class:`MediaToolError` did.
+    If the batched run itself fails (worker crash, timeout, unparseable
+    output), the files are re-probed with one isolated process each, so a
+    native crash on one clip can never lose the probes of the others.
+    """
+    if not paths:
+        return {}
+    if len(paths) == 1:
+        try:
+            return {str(paths[0]): await probe_media(paths[0], settings)}
+        except MediaToolError as exc:
+            logger.warning("Media probe failed path=%s detail=%s", paths[0], exc)
+            return {}
+    code, stdout, stderr = await run_command(
+        build_probe_many_command(paths),
+        settings.media_timeout,
+        label="media_worker:probe_many",
+        env=worker_env(),
+    )
+    if code == 0:
+        try:
+            return parse_probe_list_output(stdout, paths)
+        except MediaToolError:
+            logger.warning("Batched probe report was unusable; retrying files individually")
+    else:
+        logger.warning(
+            "Batched probe failed; retrying files individually returncode=%s detail=%s",
+            code,
+            (stderr or "").strip()[:300],
+        )
+    result: dict[str, MediaInfo] = {}
+    for path in paths:
+        try:
+            result[str(path)] = await probe_media(path, settings)
+        except MediaToolError as exc:
+            logger.warning("Media probe failed path=%s detail=%s", path, exc)
+    return result
 
 
 def choose_merge_format(total_duration: float | None, settings: Settings) -> str:

@@ -18,6 +18,27 @@
 * **Two duplicate stop-word entries** (`each` in `qa.py`, `را` in `units.py`)
   removed.
 * Documentation links pointing at reports that no longer exist.
+* **systemd docs disagreed with the shipped unit.** `OPERATIONS.md` advised
+  `Restart=on-failure` while `deploy/gamas-bot.service` sets `Restart=always`,
+  and the README/OPERATIONS pointers to "the full unit" were circular. Both
+  pages now describe the unit that actually ships.
+* **`cryptography` was capped below its security fixes.** The declared range
+  `<47.0` made every fixed release uninstallable while `pip-audit` reported 7
+  advisories in the resolvable version (PYSEC-2026-3552/3553/3554 and
+  GHSA-537c-gmf6-5ccf, fixed in 48.0.1/49.0.0/50.0.0). The range is now
+  `>=50.0.0,<51.0` (resolves to 50.0.2, `pip-audit` reports no known
+  vulnerabilities); the Fernet credential path is covered by
+  `tests/test_provider_credentials.py`.
+* **`python -m gamas_bot --check` existed only in the documentation.** The
+  README, `OPERATIONS.md` and `TROUBLESHOOTING.md` told operators to run it as
+  a configuration/dependency self-check, but the entry point had no argument
+  parsing, so the flag was ignored and the bot *started* instead — the exact
+  opposite of a diagnostic. It now runs an offline PASS/FAIL check
+  (configuration, runtime-importable dependencies, media worker) with exit
+  codes 0/2 and never touches Telegram, the database or the instance lock;
+  `tests/test_cpanel_deploy.py` pins all of that, and
+  `tests/test_dependency_consistency.py` fails when a new runtime dependency
+  is neither checked nor explicitly excluded.
 
 ### Changed
 
@@ -35,6 +56,10 @@
   under `auto` and a failure under `required`.
 * Lint configuration (`ruff`) and pytest configuration moved into
   `pyproject.toml`; the selected rule set is `E4,E7,E9,F,W,B,C4` and it is clean.
+* Presentation clips are probed through `media.probe_media_many` instead of one
+  `probe_media` call per clip. The two `PresentationDurationTests` in
+  `tests/test_audit.py` now patch that seam with the same per-clip reports;
+  their assertions are unchanged.
 
 ### Performance
 
@@ -59,6 +84,30 @@ most of the remaining saving and produces byte-identical output (verified by
 hashing `word/document.xml`, `word/styles.xml` and `word/fontTable.xml` against
 the previous implementation).
 
+A second performance pass used the same methodology (median of 5 runs, same
+30-section document with tables/callouts/glossary, static TOC enabled, output
+compared member-by-member by SHA-256 before and after):
+
+| Metric | Before | After | Change |
+| --- | --- | --- | --- |
+| DOCX build | 2727 ms | 1406 ms | −48% |
+| Clip probing, 40-clip deck (`prepare_audio`, incl. merge) | 4344 ms | 390 ms | −91% |
+| Worker processes per 40-clip deck probe | 40 | 1 | −97% |
+
+* The DOCX win writes each fresh run's `w:rPr` directly instead of through six
+  python-docx property setters (each performs schema-order tree scans), and
+  resolves the static TOC's heading styles from the raw `w:pStyle` id instead
+  of `paragraph.style` per paragraph. `tests/test_docx_run_styling.py` proves
+  both fast paths emit exactly the XML the reference paths emit for every
+  combination of direction, weight, style, colour, size and font role, and the
+  whole golden corpus (the six note fixtures, a synthetic 30-section booklet,
+  a plain document and the raw-text deliverable) hashes identically.
+* The probing win is `probe_media_many`: one worker process per deck instead
+  of one per clip — about 90% of a single probe's wall time was interpreter +
+  PyAV import. A clip that cannot be probed becomes a per-file error entry
+  (same skip reason, same order as before), and a failed batch falls back to
+  isolated per-file probes so a native crash on one clip cannot lose the rest.
+
 ### Added
 
 * `tests/test_config_consistency.py` — configuration/documentation/implementation
@@ -67,3 +116,12 @@ the previous implementation).
   drift detection.
 * Regression tests for the TOC page-number policy, the bounded render loop and
   byte-reproducible document generation.
+* `scripts/benchmark_queue.py` — offline load benchmark for the bounded job
+  queue (1/3/5/10/25/50 simultaneous uploads: acceptance vs back-pressure,
+  queue-wait and latency percentiles, throughput, RSS); wired into CI as a
+  smoke test.
+* `tests/test_docx_run_styling.py` — byte-level equivalence of the optimized
+  DOCX hot paths with the python-docx setter reference, plus the heading-level
+  resolver against the public `paragraph.style.name` scan.
+* Batched-probe coverage in `tests/test_media_runtime.py`: one worker process
+  for a whole deck, per-file failure isolation, and both fallback paths.

@@ -26,11 +26,21 @@ bot → media.py → asyncio.create_subprocess_exec(sys.executable, "-m", "gamas
 inside the wheel. Probing, audio extraction, resampling and multi-clip merging
 all happen through the library API.
 
+A presentation's clips are probed as a batch: one worker process walks the
+whole deck, because ~90% of a single probe's wall time was interpreter + PyAV
+import paid once per clip (measured on the reference VM: ~106 ms per clip
+sequentially vs ~9 ms inside an already-started worker; a 40-clip deck probes
+in ~0.1 s instead of ~4.3 s). A clip that cannot be probed becomes an `error`
+entry in that process's report — one broken file never hides the others — and
+if the batch itself fails (crash, timeout, unparseable output), the files are
+re-probed with one isolated process each, exactly like before.
+
 ## Operations
 
 | Operation | Used for |
 | --- | --- |
 | `probe_media` | duration, whether a stream carries audio (billing depends on the duration) |
+| `probe_media_many` | probing every clip of a deck in **one** worker process |
 | `extract_audio_track` | video → audio, and any audio that must be normalised before STT |
 | `merge` | concatenating per-slide narration clips from a presentation |
 | `check_media_worker` | startup self-check that the worker imports and runs |

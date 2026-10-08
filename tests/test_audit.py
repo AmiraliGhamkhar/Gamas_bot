@@ -404,7 +404,15 @@ class PresentationDurationTests(unittest.IsolatedAsyncioTestCase):
             MediaClip(1, 1, "one.wav", Path("one.wav"), "audio"),
             MediaClip(2, 2, "two.wav", Path("two.wav"), "audio"),
         ))
-        with patch("gamas_bot.presentations.probe_media", new=AsyncMock(return_value=MediaInfo(True, 1, "pcm_s16le"))), patch(
+        # The probe seam is the batched probe_media_many: every clip resolves
+        # to a 1 s report, exactly like the old per-clip mock returned.
+        with patch(
+            "gamas_bot.presentations.probe_media_many",
+            new=AsyncMock(return_value={
+                "one.wav": MediaInfo(True, 1, "pcm_s16le"),
+                "two.wav": MediaInfo(True, 1, "pcm_s16le"),
+            }),
+        ), patch(
             "gamas_bot.presentations.merge_audio_tracks", new=AsyncMock(return_value=Path("out.wav"))
         ) as merge:
             result = await prepare_audio(content, Path("out"), make_settings())
@@ -419,5 +427,11 @@ class PresentationDurationTests(unittest.IsolatedAsyncioTestCase):
             MediaClip(1, 1, "one.wav", Path("one.wav"), "audio"),
             MediaClip(2, 2, "two.wav", Path("two.wav"), "audio"),
         ))
-        with patch("gamas_bot.presentations.probe_media", new=AsyncMock(side_effect=[MediaInfo(True, 100), MediaInfo(True, None)])), self.assertRaises(PresentationError):
+        with patch(
+            "gamas_bot.presentations.probe_media_many",
+            new=AsyncMock(return_value={
+                "one.wav": MediaInfo(True, 100),
+                "two.wav": MediaInfo(True, None),
+            }),
+        ), self.assertRaises(PresentationError):
             await prepare_audio(content, Path("out"), make_settings(presentation_max_total_duration=50))

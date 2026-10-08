@@ -36,8 +36,9 @@ counts below are not the validation status of the current branch. The current
 implementation adds canonical prepaid entitlements, transaction-safe integer-
 second reservations/refunds and ledger audit; private manual receipt approval;
 Fernet-encrypted provider credentials; and a static DOCX TOC whose page numbers
-must come from a real LibreOffice/PDF render. It fails closed when exact mapping
-is unavailable. The current environment does not have LibreOffice, so actual
+come from a real LibreOffice/PDF render. Under the default
+`DOCX_TOC_PAGE_NUMBERS=auto` a missing renderer degrades to a link-only topic
+list (never a guessed number); `required` fails closed instead. The current environment does not have LibreOffice, so actual
 rendered-page accuracy, internal PDF link destinations and visual DOCX output
 have **not** been validated here. See the current README and deployment guides
 for configuration; report only the test runs performed for this revision.

@@ -15,5 +15,5 @@ lxml>=6.1,<7.0
 Pillow>=10.0,<13.0
 arabic-reshaper>=3.0,<4.0
 python-bidi>=0.6,<0.7
-cryptography>=44.0,<47.0
+cryptography>=50.0.0,<51.0
 pypdf>=5.0,<7.0

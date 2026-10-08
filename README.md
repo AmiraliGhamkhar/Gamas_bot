@@ -146,8 +146,10 @@ See [`docs/TESTING.md`](docs/TESTING.md). CI runs the suite on Python 3.11,
 
 * **cPanel / Passenger** — [`docs/DEPLOY_CPANEL.md`](docs/DEPLOY_CPANEL.md) and
   [`docs/DEPLOY_FA.md`](docs/DEPLOY_FA.md).
-* **systemd** — a unit template is in `deploy/gamas-bot.service`; the full unit
-  and verification steps are in [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+* **systemd** — install `deploy/gamas-bot.service` (hardened unit:
+  `Restart=always`, `UMask=0077`, `ProtectSystem=strict`);
+  [`docs/OPERATIONS.md`](docs/OPERATIONS.md) explains the unit and the
+  start/stop/health workflow.
 * An advisory lock on the Telegram session path guarantees a single polling
   instance even if a watchdog starts a second copy.
 
