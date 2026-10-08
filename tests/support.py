@@ -213,6 +213,60 @@ def video_bytes(
         return target.read_bytes()
 
 
+def webm_bytes(
+    *, duration: float = 1.0, with_audio: bool = True, rate: int = 15
+) -> bytes:
+    """A real WebM screen recording (VP9, optionally Opus) built with PyAV."""
+    import av
+
+    from fractions import Fraction
+    from av.audio.frame import AudioFrame
+
+    width, height = 64, 48
+    with tempfile.TemporaryDirectory() as folder:
+        target = Path(folder) / "clip.webm"
+        with av.open(str(target), "w", format="webm") as container:
+            video = container.add_stream("libvpx-vp9", rate=rate)
+            video.width = width
+            video.height = height
+            video.pix_fmt = "yuv420p"
+            audio = container.add_stream("libopus", rate=48000) if with_audio else None
+            if audio is not None:
+                audio.layout = "mono"
+
+            total = max(1, int(round(duration * rate)))
+            samples = 48000 // rate
+            for index in range(total):
+                frame = av.VideoFrame(width, height, "yuv420p")
+                for plane, value in zip(frame.planes, (32 + index % 16, 128, 128), strict=True):
+                    view = memoryview(plane)
+                    view[: len(view)] = bytes([value]) * len(view)
+                frame.pts = index
+                frame.time_base = Fraction(1, rate)
+                for packet in video.encode(frame):
+                    container.mux(packet)
+
+                if audio is not None:
+                    audio_frame = AudioFrame(
+                        format="s16", layout="mono", samples=samples
+                    )
+                    audio_frame.sample_rate = 48000
+                    audio_frame.time_base = Fraction(1, 48000)
+                    audio_frame.pts = index * samples
+                    for plane in audio_frame.planes:
+                        view = memoryview(plane)
+                        view[: len(view)] = b"\0" * len(view)
+                    for packet in audio.encode(audio_frame):
+                        container.mux(packet)
+
+            for packet in video.encode(None):
+                container.mux(packet)
+            if audio is not None:
+                for packet in audio.encode(None):
+                    container.mux(packet)
+        return target.read_bytes()
+
+
 def mp3_bytes(duration: float, *, rate: int = 16000) -> bytes:
     """A real MP3 file produced by the bundled libmp3lame encoder."""
     import av

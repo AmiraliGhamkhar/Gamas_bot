@@ -27,6 +27,12 @@
   lecture as well as the booklet. The transcript is sent first and the failure
   is still raised afterwards, so the job is recorded as failed with its
   tracking reference and no content is lost.
+* **MIME-less or generic-MIME `.webm` screen recordings now use video extraction.**
+  `.webm` is listed as both an audio and video extension, and the old audio-first
+  fallback sent an ambiguous upload to STT with its video stream still inside.
+  The extension fallback now prefers video, which extracts only the audio track
+  before transcription. A real VP9/Opus WebM is covered through the extraction
+  and transcription-delivery path.
 * **Bookmark identifiers leaked a document's position in the job sequence.**
   They came from a process-global counter that never reset, so the first heading
   of one user's booklet was named after how many documents the server had

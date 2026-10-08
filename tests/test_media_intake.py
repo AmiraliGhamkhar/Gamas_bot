@@ -27,6 +27,7 @@ from support import (
     sample_notes_json,
     video_bytes,
     wav_bytes,
+    webm_bytes,
 )
 
 def fake_message(
@@ -70,6 +71,24 @@ class MediaDetectionTests(unittest.TestCase):
         self.assertEqual(_media_metadata(fake_message(video_note=True))[0], "video")
         self.assertEqual(_media_metadata(fake_message("lecture.mp4", "video/mp4"))[0], "video")
         self.assertEqual(_media_metadata(fake_message("lecture.mkv", None))[0], "video")
+        self.assertEqual(_media_metadata(fake_message("rec.webm", "video/webm"))[0], "video")
+
+    def test_ambiguous_webm_without_mime_goes_through_audio_extraction(self):
+        """.webm is the one extension in both sets, so it must not be sent raw.
+
+        The video path always extracts the audio track; the audio path can pass
+        the container through untouched, which for a screen recording means
+        uploading video bytes to the speech engine and risking its
+        direct-upload limit (i.e. no booklet at all).
+        """
+        for mime in (None, "application/octet-stream"):
+            with self.subTest(mime=mime):
+                self.assertEqual(
+                    _media_metadata(fake_message("rec.webm", mime))[0], "video"
+                )
+        # A plain audio container keeps its cheap path.
+        self.assertEqual(_media_metadata(fake_message("song.opus", None))[0], "audio")
+        self.assertEqual(_media_metadata(fake_message("song.mp3", None))[0], "audio")
 
     def test_silent_gifs_and_other_files_are_not_media(self):
         self.assertIsNone(_media_metadata(fake_message("anim.mp4", "video/mp4", gif=True))[0])
@@ -366,6 +385,16 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         stats = await self.bot.db.stats()
         self.assertEqual(stats["videos"], 1)
         self.assertEqual(stats["done"], 1)
+
+    async def test_webm_screen_recording_is_extracted_before_transcription(self):
+        """A real VP9/Opus WebM must take the extraction path, not raw upload."""
+        event, stt, _submission_id = await self._run(
+            "rec.webm", "video", webm_bytes(duration=1.0, with_audio=True)
+        )
+        sent_path = Path(stt.await_args.args[0])
+        self.assertTrue(sent_path.name.startswith("extracted-audio"))
+        self.assertEqual(sent_path.suffix, ".wav")
+        self._assert_documents_delivered(event, "متن درس")
 
     def _assert_documents_delivered(self, event: FakeEvent, raw_transcript: str) -> None:
         """A Word document plus the raw-text file are the deliverables."""

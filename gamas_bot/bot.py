@@ -345,10 +345,16 @@ def _media_metadata(message) -> tuple[str | None, str | None, str | None, float 
             kind = "audio"
         elif normalized_mime.startswith("video/"):
             kind = "video"
+        elif extension in VIDEO_EXTENSIONS:
+            # Before AUDIO_EXTENSIONS on purpose: ``.webm`` belongs to both, and
+            # only the video path always extracts the audio track. Treating a
+            # .webm screen recording as plain audio sent its whole container —
+            # video bytes included — to the speech engine, where a large enough
+            # file exceeds the direct-upload limit and the user gets no booklet
+            # at all. An audio-only .webm takes the same path harmlessly.
+            kind = "video"
         elif extension in AUDIO_EXTENSIONS:
             kind = "audio"
-        elif extension in VIDEO_EXTENSIONS:
-            kind = "video"
     if kind is None:
         return None, None, None, None, None
 
