@@ -54,6 +54,10 @@ re-probed with one isolated process each, exactly like before.
   stale `submission-*`/`deck-*` directories from a crash are removed at startup.
 * `needs_transcode()` only re-encodes when the container/codec is one the STT
   providers do not accept, so a normal upload is not re-encoded blindly.
+* A `.webm` document with missing or generic MIME metadata is treated as video
+  (the suffix is shared with audio), so the audio track is extracted before STT
+  instead of sending a screen recording's video stream to the speech service.
+  Explicit `audio/*` MIME types continue to use the audio-upload path.
 
 ## Verifying the no-binary claim
 

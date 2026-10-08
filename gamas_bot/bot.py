@@ -345,10 +345,16 @@ def _media_metadata(message) -> tuple[str | None, str | None, str | None, float 
             kind = "audio"
         elif normalized_mime.startswith("video/"):
             kind = "video"
+        elif extension in VIDEO_EXTENSIONS:
+            # Before AUDIO_EXTENSIONS on purpose: ``.webm`` belongs to both, and
+            # only the video path always extracts the audio track. Treating a
+            # .webm screen recording as plain audio sent its whole container —
+            # video bytes included — to the speech engine, where a large enough
+            # file exceeds the direct-upload limit and the user gets no booklet
+            # at all. An audio-only .webm takes the same path harmlessly.
+            kind = "video"
         elif extension in AUDIO_EXTENSIONS:
             kind = "audio"
-        elif extension in VIDEO_EXTENSIONS:
-            kind = "video"
     if kind is None:
         return None, None, None, None, None
 
@@ -2954,6 +2960,10 @@ class StudyBot:
         )
         docx_path: Path | None = None
         docx_title = plain_title
+        # A pagination failure is re-raised so the job is recorded as failed and
+        # the user is told why, but only *after* the transcript has gone out: a
+        # layout decision must never cost a user the lecture they paid for.
+        pagination_error: BaseException | None = None
         if notes is not None:
             docx_title = notes.display_title
             try:
@@ -2966,8 +2976,8 @@ class StudyBot:
                 )
                 docx_path = workdir / notes_docx_filename(notes, reference)
                 docx_path.write_bytes(docx_bytes)
-            except DocxPaginationError:
-                raise
+            except DocxPaginationError as exc:
+                pagination_error = exc
             except Exception:
                 logger.exception(
                     "Word document generation failed; falling back to a chat message reference=%s",
@@ -2986,8 +2996,8 @@ class StudyBot:
                 )
                 docx_path = workdir / plain_docx_filename(plain_title, reference)
                 docx_path.write_bytes(docx_bytes)
-            except DocxPaginationError:
-                raise
+            except DocxPaginationError as exc:
+                pagination_error = exc
             except Exception:
                 logger.exception(
                     "Plain Word document generation failed; falling back to a chat message reference=%s",
@@ -3002,10 +3012,12 @@ class StudyBot:
             await self._send_document(
                 event, docx_path, caption, buttons=main_menu(is_admin)
             )
-        else:
+        elif pagination_error is None:
             body = (notes.to_markdown() if notes is not None else plain_text) + notice
             await self._send_long_message(event, body, is_admin=is_admin)
 
+        # The raw transcript is the one deliverable that never depends on the
+        # Word document, so it is always sent — see the docstring above.
         txt_path = workdir / raw_text_filename(reference)
         txt_path.write_text(
             build_raw_text_document(
@@ -3014,6 +3026,9 @@ class StudyBot:
             encoding="utf-8",
         )
         await self._send_document(event, txt_path, "📄 متن خام پیاده‌سازی‌شده.")
+
+        if pagination_error is not None:
+            raise pagination_error
 
     @staticmethod
     def _users_text(users: list[dict]) -> str:

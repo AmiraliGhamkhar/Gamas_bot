@@ -27,6 +27,7 @@ from support import (
     sample_notes_json,
     video_bytes,
     wav_bytes,
+    webm_bytes,
 )
 
 def fake_message(
@@ -70,6 +71,24 @@ class MediaDetectionTests(unittest.TestCase):
         self.assertEqual(_media_metadata(fake_message(video_note=True))[0], "video")
         self.assertEqual(_media_metadata(fake_message("lecture.mp4", "video/mp4"))[0], "video")
         self.assertEqual(_media_metadata(fake_message("lecture.mkv", None))[0], "video")
+        self.assertEqual(_media_metadata(fake_message("rec.webm", "video/webm"))[0], "video")
+
+    def test_ambiguous_webm_without_mime_goes_through_audio_extraction(self):
+        """.webm is the one extension in both sets, so it must not be sent raw.
+
+        The video path always extracts the audio track; the audio path can pass
+        the container through untouched, which for a screen recording means
+        uploading video bytes to the speech engine and risking its
+        direct-upload limit (i.e. no booklet at all).
+        """
+        for mime in (None, "application/octet-stream"):
+            with self.subTest(mime=mime):
+                self.assertEqual(
+                    _media_metadata(fake_message("rec.webm", mime))[0], "video"
+                )
+        # A plain audio container keeps its cheap path.
+        self.assertEqual(_media_metadata(fake_message("song.opus", None))[0], "audio")
+        self.assertEqual(_media_metadata(fake_message("song.mp3", None))[0], "audio")
 
     def test_silent_gifs_and_other_files_are_not_media(self):
         self.assertIsNone(_media_metadata(fake_message("anim.mp4", "video/mp4", gif=True))[0])
@@ -219,6 +238,47 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.bot.db.user_balance(int(user["id"])))["available_seconds"], 3_600)
         self.assertTrue(any("صفحه‌بندی واقعی در دسترس نیست" in reply for reply in event.replies))
 
+    async def test_pagination_failure_still_delivers_the_transcript(self):
+        """A lost layout must never cost the user the transcript they paid for.
+
+        ``_deliver_result_documents`` promises the raw-text file is *always*
+        sent. Raising out of the Word-document build used to skip it, so a
+        pagination failure discarded the lecture as well as the booklet.
+        """
+        source = self.root / "transcript-survives.wav"
+        source.write_bytes(wav_bytes(2.2))
+        user = await self.bot.db.upsert_user(106, "student")
+        submission_id = await self.bot.db.create_submission(
+            int(user["id"]), "transcript-survives", 2.2, source.name,
+            "audio/wav", source_type="audio",
+        )
+        event = FakeEvent(source)
+        with patch(
+            "gamas_bot.bot.transcribe",
+            new=AsyncMock(return_value=Transcript("deepgram", "متن درس دربارهٔ موضوع", 0.9)),
+        ), patch(
+            "gamas_bot.bot.structure_transcript",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
+        ), patch(
+            "gamas_bot.bot.build_notes_docx",
+            side_effect=DocxPaginationError("صفحه‌بندی واقعی در دسترس نیست"),
+        ):
+            await self.bot._process_submission(event, submission_id, source.name, "audio")
+
+        delivered = [path for _caption, path in event.files]
+        self.assertTrue(
+            any(path.endswith(".txt") for path in delivered),
+            f"the transcript must still be delivered, got {delivered}",
+        )
+        self.assertFalse(
+            any(path.endswith(".docx") for path in delivered),
+            "no Word document may be delivered when pagination failed",
+        )
+        # The job is still recorded as failed and the user is told why.
+        self.assertTrue(
+            any("صفحه‌بندی واقعی در دسترس نیست" in reply for reply in event.replies)
+        )
+
     async def test_delivery_cancellation_after_stt_releases_reserved_seconds(self):
         source = self.root / "delivery-cancelled.wav"
         source.write_bytes(wav_bytes(2.2))
@@ -325,6 +385,16 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         stats = await self.bot.db.stats()
         self.assertEqual(stats["videos"], 1)
         self.assertEqual(stats["done"], 1)
+
+    async def test_webm_screen_recording_is_extracted_before_transcription(self):
+        """A real VP9/Opus WebM must take the extraction path, not raw upload."""
+        event, stt, _submission_id = await self._run(
+            "rec.webm", "video", webm_bytes(duration=1.0, with_audio=True)
+        )
+        sent_path = Path(stt.await_args.args[0])
+        self.assertTrue(sent_path.name.startswith("extracted-audio"))
+        self.assertEqual(sent_path.suffix, ".wav")
+        self._assert_documents_delivered(event, "متن درس")
 
     def _assert_documents_delivered(self, event: FakeEvent, raw_transcript: str) -> None:
         """A Word document plus the raw-text file are the deliverables."""

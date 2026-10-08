@@ -10,6 +10,29 @@
   `DOCX_TOC_PAGE_NUMBERS` policy (`auto` | `required` | `off`, default `auto`)
   delivers a link-only topic list instead, still never printing an unmeasured
   page number.
+* **An empty static table of contents no longer discards the booklet.**
+  `build_plain_docx` decided whether a document earned a topic list by counting
+  *every* Markdown heading, but the list itself only collects headings at or
+  above `DOCX_TOC_LEVELS` — so raw material whose headings were all `###` or
+  deeper requested a TOC page that was then filtered down to nothing. The empty
+  list was a hard `DocxPaginationError`, which the delivery path re-raised: the
+  user lost the Word booklet *and* the transcript. The decision now counts only
+  the headings the list will actually contain, an empty list drops the topic
+  page instead of failing, and a heading with no usable bookmark is skipped
+  rather than aborting the build. Documents that already built successfully are
+  unchanged byte-for-byte.
+* **The raw transcript is now always delivered.** `_deliver_result_documents`
+  documented that the `.txt` file "is always sent", but a `DocxPaginationError`
+  propagated before it was written, so a pagination failure cost the user the
+  lecture as well as the booklet. The transcript is sent first and the failure
+  is still raised afterwards, so the job is recorded as failed with its
+  tracking reference and no content is lost.
+* **MIME-less or generic-MIME `.webm` screen recordings now use video extraction.**
+  `.webm` is listed as both an audio and video extension, and the old audio-first
+  fallback sent an ambiguous upload to STT with its video stream still inside.
+  The extension fallback now prefers video, which extracts only the audio track
+  before transcription. A real VP9/Opus WebM is covered through the extraction
+  and transcription-delivery path.
 * **Bookmark identifiers leaked a document's position in the job sequence.**
   They came from a process-global counter that never reset, so the first heading
   of one user's booklet was named after how many documents the server had
