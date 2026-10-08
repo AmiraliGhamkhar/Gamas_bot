@@ -47,8 +47,11 @@ dependencies = [
     # rendered pages show disconnected letters.
     "arabic-reshaper>=3.0,<4.0",
     "python-bidi>=0.6,<0.7",
-    # Fernet-encrypted provider credentials + rendered-PDF TOC pagination.
-    "cryptography>=44.0,<47.0",
+    # Fernet-encrypted provider credentials. The floor is the first release
+    # that contains every published fix (pip-audit reported 7 advisories in
+    # <50, including GHSA-537c-gmf6-5ccf); deployments must not resolve below
+    # it. pypdf is the rendered-PDF TOC page reader.
+    "cryptography>=50.0.0,<51.0",
     "pypdf>=5.0,<7.0",
 ]
 

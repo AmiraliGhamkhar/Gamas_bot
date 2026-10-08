@@ -21,7 +21,7 @@ from pathlib import Path, PurePosixPath
 from lxml import etree
 
 from .config import Settings
-from .media import MediaToolError, merge_audio_tracks, probe_media
+from .media import merge_audio_tracks, probe_media_many
 
 logger = logging.getLogger(__name__)
 
@@ -427,12 +427,16 @@ async def prepare_audio(
         skipped_out.extend(skipped)
     if not content.clips:
         return None
+    # One worker process probes the whole deck (see ``media.probe_media_many``):
+    # probing each clip in its own process paid the interpreter + PyAV import
+    # per clip (~0.1 s on the reference VM, ~90% startup). Files that cannot
+    # be probed are simply absent from the mapping, so each becomes its own
+    # skip reason exactly like the per-clip MediaToolError did, in clip order.
+    probes = await probe_media_many([clip.path for clip in content.clips], settings)
     usable: list[MediaClip] = []
     for clip in content.clips:
-        try:
-            info = await probe_media(clip.path, settings)
-        except MediaToolError as exc:
-            logger.warning("Probing %s failed: %s", clip.part_name, exc)
+        info = probes.get(str(clip.path))
+        if info is None:
             skipped.append(f"{clip.label}: بررسی فایل ناموفق بود")
             continue
         if not info.has_audio:

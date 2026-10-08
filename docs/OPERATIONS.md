@@ -2,9 +2,13 @@
 
 ## Starting and stopping
 
-* **systemd**: a unit is provided in `deploy/gamas-bot.service`. Use
-  `Restart=on-failure`, a dedicated user, and the project directory as
-  `WorkingDirectory`; see `DEPLOY_CPANEL.md` and `README.md` for the full unit.
+* **systemd**: the full unit is `deploy/gamas-bot.service` (a dedicated
+  `bot` user, `WorkingDirectory=/opt/gamas-bot`, `Restart=always` with a 5 s
+  `RestartSec`, `UMask=0077` and a `ProtectSystem=strict` sandbox that only
+  writes under `data/`). Install it with
+  `sudo cp deploy/gamas-bot.service /etc/systemd/system/` and adjust the paths
+  if your layout differs; `DEPLOY_FA.md` walks through the same unit step by
+  step.
 * **cPanel / Passenger**: `passenger_wsgi.py` starts the bot in-process and
   `gamas_bot/launcher.py` (plus `scripts/ensure_running.py`) keeps exactly one
   instance alive; `gamas_bot/instance_lock.py` is the advisory lock that makes a

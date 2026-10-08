@@ -88,6 +88,15 @@ document that never stabilises fails after three instead of looping.
   document on every assignment. The resolved id is memoized per document, which
   removes about a quarter of the document build's CPU. Output is unchanged
   byte-for-byte.
+* Every run's `w:rPr` is written directly for fresh runs instead of going
+  through six python-docx property setters (each of which performs several
+  schema-order tree scans), and the static TOC resolves heading styles from the
+  raw `w:pStyle` id instead of resolving `paragraph.style` per paragraph.
+  Together these halve a full booklet build (2727 ms → 1406 ms on a 30-section
+  document, median of 5) with byte-identical output;
+  `tests/test_docx_run_styling.py` proves the fast paths emit exactly the XML
+  the setter-based paths do for every combination of direction, weight, style,
+  colour, size and font role.
 
 ## Fonts and images
 

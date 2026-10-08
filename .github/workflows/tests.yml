@@ -64,6 +64,8 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Offline benchmark smoke test
         run: python -m scripts.benchmark_notes --json > /dev/null
+      - name: Queue load benchmark smoke test (back-pressure must hold)
+        run: python -m scripts.benchmark_queue --json > /dev/null
       - name: Dependency security audit (advisory)
         continue-on-error: true
         run: |

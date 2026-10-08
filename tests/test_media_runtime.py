@@ -15,15 +15,22 @@ import unittest
 import wave
 from pathlib import Path
 
+from unittest.mock import AsyncMock, patch
+
+from gamas_bot import media as media_module
 from gamas_bot.media import (
+    MediaInfo,
     MediaToolError,
     build_extract_command,
     build_merge_command,
     build_probe_command,
+    build_probe_many_command,
     check_media_worker,
     extract_audio_track,
     merge_audio_tracks,
+    parse_probe_list_output,
     probe_media,
+    probe_media_many,
     run_command,
     worker_command,
 )
@@ -148,6 +155,106 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         # A missing path must fail like the old ffprobe call did.
         with self.assertRaises(MediaToolError):
             await probe_media(Path("/nonexistent/missing.wav"), make_settings())
+
+
+class ProbeManyTests(unittest.IsolatedAsyncioTestCase):
+    """Batched deck probing: one worker process, per-file failure isolation."""
+
+    def test_command_carries_every_path(self):
+        paths = [Path("/tmp/a.wav"), Path("/tmp/b.wav")]
+        command = build_probe_many_command(paths)
+        self.assertEqual(command[1:3], ["-m", "gamas_bot.media_worker"])
+        self.assertEqual(command[3:], ["probe", "--", "/tmp/a.wav", "/tmp/b.wav"])
+
+    def test_empty_path_list_is_rejected(self):
+        with self.assertRaises(MediaToolError):
+            build_probe_many_command([])
+
+    def test_parse_maps_paths_and_skips_error_entries(self):
+        paths = [Path("a.wav"), Path("b.wav")]
+        payload = json.dumps([
+            {"path": "a.wav", "has_audio": True, "duration": 1.5,
+             "audio_codec": "pcm_s16le"},
+            {"path": "b.wav", "error": "ValueError: no audio track"},
+        ])
+        result = parse_probe_list_output(payload, paths)
+        self.assertEqual(set(result), {"a.wav"})
+        self.assertAlmostEqual(result["a.wav"].duration or 0, 1.5)
+        self.assertTrue(result["a.wav"].has_audio)
+
+    def test_parse_rejects_foreign_or_malformed_reports(self):
+        with self.assertRaises(MediaToolError):
+            parse_probe_list_output("definitely not json", [Path("a.wav")])
+        with self.assertRaises(MediaToolError):
+            parse_probe_list_output(json.dumps({"path": "a.wav"}), [Path("a.wav")])
+        with self.assertRaises(MediaToolError):
+            # A path the caller never asked for must not poison the mapping.
+            parse_probe_list_output(
+                json.dumps([{"path": "other.wav", "has_audio": True}]),
+                [Path("a.wav")],
+            )
+
+    async def test_batched_probe_runs_one_worker_for_the_whole_deck(self):
+        with tempfile.TemporaryDirectory() as folder:
+            good_one = Path(folder) / "a.wav"
+            good_one.write_bytes(wav_bytes(2.0))
+            good_two = Path(folder) / "b.wav"
+            good_two.write_bytes(wav_bytes(3.0))
+            broken = Path(folder) / "bad.wav"
+            broken.write_bytes(b"definitely not media data" * 10)
+
+            calls = 0
+            original = media_module.run_command
+
+            async def counting(command, timeout, **kwargs):
+                nonlocal calls
+                calls += 1
+                return await original(command, timeout, **kwargs)
+
+            with patch("gamas_bot.media.run_command", side_effect=counting):
+                result = await probe_media_many(
+                    [good_one, good_two, broken], make_settings()
+                )
+
+            self.assertEqual(calls, 1, "the deck must be probed in one worker process")
+            self.assertEqual(set(result), {str(good_one), str(good_two)})
+            self.assertAlmostEqual(result[str(good_one)].duration or 0, 2.0, places=2)
+            self.assertAlmostEqual(result[str(good_two)].duration or 0, 3.0, places=2)
+
+    async def test_single_path_delegates_to_the_isolated_probe(self):
+        with patch(
+            "gamas_bot.media.probe_media",
+            new=AsyncMock(return_value=MediaInfo(True, 7.0, "pcm_s16le")),
+        ) as single:
+            result = await probe_media_many([Path("only.wav")], make_settings())
+        single.assert_awaited_once()
+        self.assertEqual(result["only.wav"].duration, 7.0)
+
+    async def test_failed_batch_falls_back_to_isolated_probes(self):
+        paths = [Path("x/a.wav"), Path("x/b.wav")]
+        with patch(
+            "gamas_bot.media.run_command",
+            new=AsyncMock(return_value=(1, "", "worker crashed")),
+        ), patch(
+            "gamas_bot.media.probe_media",
+            new=AsyncMock(return_value=MediaInfo(True, 2.0, "pcm_s16le")),
+        ) as single:
+            result = await probe_media_many(paths, make_settings())
+        self.assertEqual(single.await_count, 2, "fallback must probe each file alone")
+        self.assertEqual(set(result), {"x/a.wav", "x/b.wav"})
+
+    async def test_unparseable_batch_report_falls_back_to_isolated_probes(self):
+        paths = [Path("x/a.wav"), Path("x/b.wav")]
+        with patch(
+            "gamas_bot.media.run_command",
+            new=AsyncMock(return_value=(0, "garbage", "")),
+        ), patch(
+            "gamas_bot.media.probe_media",
+            new=AsyncMock(return_value=MediaInfo(True, 2.0, "pcm_s16le")),
+        ) as single:
+            result = await probe_media_many(paths, make_settings())
+        self.assertEqual(single.await_count, 2)
+        self.assertEqual(set(result), {"x/a.wav", "x/b.wav"})
 
 
 class RealMediaWorkerTests(unittest.IsolatedAsyncioTestCase):

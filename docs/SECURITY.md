@@ -52,6 +52,13 @@ receipt contents are never logged.
 **Single instance.** An advisory lock on the Telegram session path prevents two
 processes from polling the same bot account.
 
+**Dependency security.** CI runs `pip-audit` against `requirements.txt` as an
+advisory gate, and every runtime dependency is bounded by a range in
+`pyproject.toml`. Where an advisory exists, the lower bound is the first
+release that contains *every* published fix, so a deployment cannot resolve a
+known-vulnerable version: `cryptography` is floored at `50.0.0` for exactly
+that reason (7 advisories below it, fixed in 48.0.1/49.0.0/50.0.0).
+
 ## Reporting
 
 Report a vulnerability privately to the maintainer listed in `README.md`. Do not

@@ -217,8 +217,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=PROG)
     commands = parser.add_subparsers(dest="command", required=True)
 
-    probe = commands.add_parser("probe", help="probe one media file")
-    probe.add_argument("path")
+    probe = commands.add_parser(
+        "probe",
+        help="probe one media file (or several in a single process)",
+    )
+    probe.add_argument("path", nargs="+")
 
     extract = commands.add_parser("extract", help="extract one audio track")
     extract.add_argument("--output", required=True)
@@ -260,7 +263,26 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     try:
         if args.command == "probe":
-            print(json.dumps(_probe(Path(args.path))))
+            if len(args.path) == 1:
+                # Single-file output stays a bare object for compatibility.
+                print(json.dumps(_probe(Path(args.path[0]))))
+            else:
+                # One process amortises the interpreter + PyAV import over the
+                # whole deck (measured: ~100 ms per file vs ~9 ms once loaded).
+                # A file that cannot be probed becomes an error entry instead
+                # of failing the batch, so one broken clip does not hide the
+                # probes of every other clip.
+                results = []
+                for raw in args.path:
+                    try:
+                        entry = {"path": raw, **_probe(Path(raw))}
+                    except Exception as exc:  # noqa: BLE001 - per-file isolation
+                        entry = {
+                            "path": raw,
+                            "error": f"{type(exc).__name__}: {exc}"[:300],
+                        }
+                    results.append(entry)
+                print(json.dumps(results))
         elif args.command == "extract":
             rate = OPUS_SAMPLE_RATE if args.format == "opus" else WAV_SAMPLE_RATE
             _transcode(

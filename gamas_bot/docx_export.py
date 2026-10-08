@@ -719,6 +719,76 @@ def _set_rpr_rtl(r_pr, *, rtl: bool) -> None:
     _insert_rpr_child(r_pr, element, "w:rtl")
 
 
+def _style_fresh_run(
+    element,
+    *,
+    font: str,
+    size: float,
+    bold: bool,
+    color: RGBColor | None,
+    italic: bool,
+    rtl: bool,
+) -> None:
+    """Write ``w:rPr`` for a brand-new run with a single pass over the tree.
+
+    This is the hot path of the document build: a booklet styles thousands of
+    runs, and going through the generic python-docx property setters costs
+    several schema-order child scans *per property* (profiled at roughly half
+    of the whole build).  A fresh ``w:r`` carries no ``w:rPr``, so the final
+    element order is fixed and can be written directly:
+
+    ``rFonts, b, [bCs], i, [color], sz, [szCs], [u], rtl``
+
+    The output is byte-identical to the setter-based path (see
+    ``_style_run``); ``tests/test_docx_run_styling.py`` asserts the two paths
+    produce the same XML for every combination of direction, weight, style,
+    colour and font role.  Runs that already carry ``w:rPr`` never reach here.
+    """
+    r_pr = element.get_or_add_rPr()
+    r_fonts = OxmlElement("w:rFonts")
+    r_fonts.set(qn("w:ascii"), font)
+    r_fonts.set(qn("w:hAnsi"), font)
+    # Complex-script face: always for RTL runs (this is what renders Persian);
+    # for LTR runs only when the face differs from the configured Latin default,
+    # so Latin readers fall back to a sane face without any text reversing.
+    if rtl or font != DEFAULT_FONT_CONFIG["latin"]:
+        r_fonts.set(qn("w:cs"), font)
+    r_pr.append(r_fonts)
+
+    b = OxmlElement("w:b")
+    if not bold:
+        b.set(qn("w:val"), "0")
+    r_pr.append(b)
+    if rtl and bold:
+        b_cs = OxmlElement("w:bCs")
+        b_cs.set(qn("w:val"), "1")
+        r_pr.append(b_cs)
+
+    i = OxmlElement("w:i")
+    if not italic:
+        i.set(qn("w:val"), "0")
+    r_pr.append(i)
+
+    if color is not None:
+        color_element = OxmlElement("w:color")
+        color_element.set(qn("w:val"), str(color))
+        r_pr.append(color_element)
+
+    half_points = str(int(size * 2))
+    sz = OxmlElement("w:sz")
+    sz.set(qn("w:val"), half_points)
+    r_pr.append(sz)
+    if rtl:
+        sz_cs = OxmlElement("w:szCs")
+        sz_cs.set(qn("w:val"), half_points)
+        r_pr.append(sz_cs)
+
+    direction = OxmlElement("w:rtl")
+    if not rtl:
+        direction.set(qn("w:val"), "0")
+    r_pr.append(direction)
+
+
 def _style_run(
     run,
     *,
@@ -735,7 +805,19 @@ def _style_run(
     and fills the ``w:cs`` font slot; ``rtl=False`` explicitly marks the run
     LTR (``w:rtl w:val="0"``) so embedded English keeps Latin rendering, and
     fills the ``w:ascii``/``w:hAnsi`` slots instead.
+
+    A run the caller just created has no ``w:rPr`` yet, so the fixed-order
+    fast path in :func:`_style_fresh_run` writes it directly (same bytes, far
+    fewer tree scans).  If a run already carries run properties — nothing in
+    the build does this today, but a future caller might — the generic
+    setter-based path below keeps its semantics unchanged.
     """
+    if run._r.find(qn("w:rPr")) is None:
+        _style_fresh_run(
+            run._r, font=font, size=size, bold=bold, color=color,
+            italic=italic, rtl=rtl,
+        )
+        return
     run.font.name = font  # w:ascii + w:hAnsi
     run.font.size = Pt(size)
     run.font.bold = bold
@@ -1739,6 +1821,52 @@ def _add_directional_hyperlink(
     paragraph._p.append(hyperlink)
 
 
+#: Style *name* -> heading level for the TOC scan (``"Heading 2"`` -> 2).
+_HEADING_STYLE_PATTERN = re.compile(r"Heading ([1-3])")
+
+
+def _heading_level_resolver(document):
+    """Return ``resolver(paragraph) -> heading level | None`` for the TOC scan.
+
+    Reading ``paragraph.style`` resolves the id through python-docx's style
+    table *per paragraph* — an O(#styles) walk repeated for every body
+    paragraph of the document (profiled at ~0.5 s on a full booklet).  The
+    style set is fixed before the TOC is filled, so one pass over the styles
+    plus the paragraph's raw ``w:pStyle`` id answers the same question in
+    constant time.
+
+    The resolution mirrors ``paragraph.style`` exactly: a known paragraph
+    style uses its own name; no style, an unknown id, or an id of another
+    style type all resolve to the document's default paragraph style.
+    ``tests/test_docx_run_styling.py`` asserts the resolver agrees with the
+    public ``paragraph.style.name`` scan for every paragraph shape the build
+    produces.
+    """
+    levels: dict[str, int] = {}
+    paragraph_ids: set[str] = set()
+    for style in document.styles:
+        if style.type != WD_STYLE_TYPE.PARAGRAPH:
+            continue
+        paragraph_ids.add(style.style_id)
+        match = _HEADING_STYLE_PATTERN.fullmatch(style.name or "")
+        if match:
+            levels[style.style_id] = int(match.group(1))
+    default_match = _HEADING_STYLE_PATTERN.fullmatch(
+        document.styles.default(WD_STYLE_TYPE.PARAGRAPH).name or ""
+    )
+    default_level = int(default_match.group(1)) if default_match else None
+
+    def resolver(paragraph) -> int | None:
+        raw_style_id = paragraph._p.style
+        if raw_style_id in levels:
+            return levels[raw_style_id]
+        if raw_style_id is None or raw_style_id not in paragraph_ids:
+            return default_level
+        return None
+
+    return resolver
+
+
 def _fill_static_toc(
     document,
     table,
@@ -1751,13 +1879,11 @@ def _fill_static_toc(
         maximum_level = int(levels.split("-")[-1])
     except (ValueError, AttributeError):
         maximum_level = 1
+    heading_level = _heading_level_resolver(document)
     entries: list[dict[str, str | int]] = []
     for paragraph in document.paragraphs:
-        match = re.fullmatch(r"Heading ([1-3])", paragraph.style.name or "")
-        if not match:
-            continue
-        level = int(match.group(1))
-        if level > maximum_level:
+        level = heading_level(paragraph)
+        if level is None or level > maximum_level:
             continue
         bookmark = paragraph._p.find(qn("w:bookmarkStart"))
         if bookmark is None or not bookmark.get(qn("w:name")):
