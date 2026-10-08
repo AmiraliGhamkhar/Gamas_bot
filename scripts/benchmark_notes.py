@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import io
+import os
 import json
 import re
 import sys
@@ -428,6 +429,82 @@ def _long_lecture_probe() -> dict:
     }
 
 
+def _router_report() -> dict:
+    """Print the router's live plan (legs, budgets, skips) without any traffic.
+
+    Uses the real environment configuration (same .env as production) against a
+    throwaway database, so it is safe to run in CI or locally for diagnostics.
+    """
+    import asyncio
+    import tempfile
+    from pathlib import Path as _Path
+
+    os.environ.setdefault("AI_ROUTING_ENABLED", "1")
+
+    async def _collect() -> dict:
+        from gamas_bot.ai.models import ModelRegistry
+        from gamas_bot.ai.profiles import profile_for
+        from gamas_bot.ai.routing import ProviderRouter
+        from gamas_bot.ai.tokens import chunk_char_budget
+        from gamas_bot.ai.usage import AIUsageTracker
+        from gamas_bot.config import Settings
+        from gamas_bot.database import Database
+        from gamas_bot.provider_credentials import ProviderCredentialManager
+
+        try:
+            settings = Settings.from_env()
+        except Exception as exc:
+            return {"error": f"configuration: {exc}"}
+        tmp = tempfile.TemporaryDirectory()
+        root = _Path(tmp.name)
+        db = Database(root / "bench.sqlite3")
+        await db.open()
+        try:
+            manager = ProviderCredentialManager(db, settings)
+            router = ProviderRouter(
+                db, settings, manager, AIUsageTracker(db), ModelRegistry(db, settings)
+            )
+            await router.ensure_seeded()
+            plan = await router.plan()
+            legs = []
+            from gamas_bot.ai.models import default_model_for, fallback_free_model
+
+            for leg in plan.legs:
+                profile = profile_for(leg.canonical)
+                legs.append(
+                    {
+                        "provider": leg.provider,
+                        "canonical": leg.canonical,
+                        "model": leg.model
+                        or fallback_free_model(leg.canonical)
+                        or default_model_for(leg.canonical),
+                        "free_only": leg.free_only,
+                        "chunk_token_budget": profile.chunk_token_budget,
+                        "chunk_char_budget": chunk_char_budget(
+                            profile.chunk_token_budget, char_cap=profile.chunk_char_cap
+                        ),
+                        "max_output_tokens": profile.max_output_tokens,
+                    }
+                )
+            return {
+                "free_only": settings.ai_free_only,
+                "allow_paid_fallback": settings.ai_allow_paid_fallback,
+                "outline_enabled": plan.outline_enabled,
+                "repair_enabled": plan.repair_enabled,
+                "compile_enabled": plan.compile_enabled,
+                "legs": legs,
+                "skipped": [
+                    {"provider": provider, "reason": reason}
+                    for provider, reason in plan.skipped
+                ],
+            }
+        finally:
+            await db.close()
+            tmp.cleanup()
+
+    return asyncio.run(_collect())
+
+
 def _score(source: str, chunks: list[str], notes_text: str) -> dict:
     """All coverage measures for one (source, notes) pair."""
     notes = StructuredNotes(
@@ -637,9 +714,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--human-out", metavar="PATH", help="write a human-review rubric as JSON"
     )
+    parser.add_argument(
+        "--router",
+        action="store_true",
+        help=(
+            "add a platform routing report: the planned free-first failover "
+            "chain with per-leg token/char budgets (no network calls)"
+        ),
+    )
     args = parser.parse_args(argv)
 
     report = run(args.mode, live=args.live)
+    if args.router:
+        report["router"] = _router_report()
     if args.human_out:
         Path(args.human_out).write_text(
             json.dumps(human_review_form(report), ensure_ascii=False, indent=2),
@@ -726,6 +813,25 @@ def main(argv: list[str] | None = None) -> int:
                 chars=context_facts["context_chars"],
             )
         )
+    router = report.get("router") or {}
+    if router:
+        if "error" in router:
+            print(f"\nrouter: ERROR {router['error']}")
+        else:
+            print(
+                "\nrouter: free_only={free_only} paid_fallback={allow_paid_fallback} "
+                "outline={outline_enabled} repair={repair_enabled} compile={compile_enabled}".format(
+                    **router
+                )
+            )
+            for index, leg in enumerate(router["legs"], start=1):
+                print(
+                    "  {index}. {provider} [{model}] free_only={free_only} "
+                    "chunk={chunk_token_budget}tok/{chunk_char_budget}ch "
+                    "max_out={max_output_tokens}".format(index=index, **leg)
+                )
+            for skip in router["skipped"]:
+                print(f"  - {skip['provider']}: {skip['reason']}")
     print(
         "\nNote: a low compression_ratio alone is NOT a failure — read it together "
         "with semantic coverage. A ratio below "

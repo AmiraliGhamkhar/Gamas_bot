@@ -1552,6 +1552,83 @@ async def _structure_chunk_once(
     raise StructuringError("سرویس تولید جزوه پاسخی برنگرداند.")
 
 
+def _task_kwargs(settings: Settings, task: str) -> dict:
+    """Only route-aware runs thread the task label; the legacy call signature
+    stays exactly as deployed before the platform upgrade."""
+    if _current_job_session() is not None and getattr(settings, "ai_routing_enabled", True):
+        return {"task": task}
+    return {}
+
+
+def _current_job_session():
+    """The bound AI-platform job session, if a provider router drives this run.
+
+    Imported lazily: ``gamas_bot.ai.routing`` imports this module, so a top-level
+    import would be circular. When no session is bound the legacy code path below
+    runs byte-for-byte as before.
+    """
+    try:
+        from .ai.routing import current_job_session
+    except ImportError:  # pragma: no cover - defensive
+        return None
+    return current_job_session()
+
+
+async def _emit_lifecycle(event: str, **fields) -> None:
+    """Structured lifecycle event through the bound router (spec §30)."""
+    job = _current_job_session()
+    if job is None:
+        return
+    try:
+        await job.router.tracker.event(
+            event, service="notes", job_id=job.job_id, **fields
+        )
+    except Exception:
+        logger.debug("Could not emit lifecycle event %s", event)
+
+
+def _pass_allowed(kind: str) -> bool:
+    """Extra-pass policy: outline/repair/final compilation per provider profile."""
+    job = _current_job_session()
+    if job is None:
+        return True
+    return {
+        "outline": job.outline_enabled,
+        "repair": job.repair_enabled,
+        "compile": job.compile_enabled,
+    }.get(kind, True)
+
+
+def note_chunk_chars(settings: Settings) -> int:
+    """Effective per-chunk character budget.
+
+    The provider router converts its per-provider *token* budget to a safe
+    character budget (token-aware chunking). Without a router the historical
+    22,000-character budget is used unchanged.
+    """
+    job = _current_job_session()
+    if job is None or not getattr(settings, "ai_routing_enabled", False):
+        return TRANSCRIPT_CHUNK_CHARS - _CHUNK_PREFIX_RESERVE
+    return max(1000, int(job.chunk_chars()) - _CHUNK_PREFIX_RESERVE)
+
+
+def note_compile_chars(settings: Settings) -> int:
+    """Effective final-compilation request budget (characters)."""
+    job = _current_job_session()
+    if job is None or not getattr(settings, "ai_routing_enabled", False):
+        return COMPILE_MAX_CHARS
+    from .ai import tokens as _token_budget
+
+    profile = job.plan.profile
+    budget = _token_budget.chunk_char_budget(
+        profile.compile_token_budget,
+        char_cap=COMPILE_MAX_CHARS,
+        overhead_tokens=0,
+        safety_margin=float(getattr(settings, "ai_quota_safety_margin", 0.15)),
+    )
+    return min(COMPILE_MAX_CHARS, max(budget, COMPILE_MIN_NOTES_CHARS))
+
+
 async def _structure_chunk(
     chunk: str,
     settings: Settings,
@@ -1560,8 +1637,23 @@ async def _structure_chunk(
     *,
     system_prompt: str = SYSTEM_PROMPT,
     reminder: str = "",
+    task: str = "chunk_structuring",
 ) -> str:
-    """Use the configured provider and rotate bounded credential candidates."""
+    """Use the configured provider and rotate bounded credential candidates.
+
+    With a bound AI-platform job session the call goes through the provider
+    router (provider failover + credential rotation + usage accounting);
+    otherwise the historical single-provider credential rotation runs.
+    """
+    job = _current_job_session()
+    if job is not None and getattr(settings, "ai_routing_enabled", True):
+        return await job.generate(
+            request_type=task,
+            task=task,
+            system_prompt=system_prompt,
+            user_text=prompt + chunk + reminder,
+            session=session,
+        )
     manager = current_provider_credentials()
     if manager is None:
         return await _structure_chunk_once(
@@ -1663,13 +1755,14 @@ async def _structured_notes_for(
     system_prompt: str = SYSTEM_PROMPT,
     label: str = "chunk",
     reminder: str = "",
+    task: str = "chunk_structuring",
 ) -> StructuredNotes:
     """One LLM answer parsed as strict JSON, with a single bounded repair pass."""
     started = asyncio.get_running_loop().time()
     try:
         raw = await _structure_chunk(
             document, settings, session, prompt, system_prompt=system_prompt,
-            reminder=reminder,
+            reminder=reminder, **_task_kwargs(settings, task),
         )
     except Exception as exc:
         if isinstance(exc, StructuringError):
@@ -1688,6 +1781,7 @@ async def _structured_notes_for(
         logger.warning(
             "Note API answer failed JSON validation (%s); requesting one repair pass", exc
         )
+        await _emit_lifecycle("note_json_validation_failed", request_type=task)
         raw = await _structure_chunk(
             document,
             settings,
@@ -1695,6 +1789,7 @@ async def _structured_notes_for(
             prompt,
             system_prompt=system_prompt,
             reminder=JSON_REMINDER,
+            **_task_kwargs(settings, task),
         )
         try:
             notes = parse_structured_notes(raw)
@@ -1796,7 +1891,11 @@ async def _lecture_context(
         parse_outline,
     )
 
-    if len(documents) < OUTLINE_MIN_CHUNKS or not settings.note_global_context_enabled:
+    if (
+        len(documents) < OUTLINE_MIN_CHUNKS
+        or not settings.note_global_context_enabled
+        or not _pass_allowed("outline")
+    ):
         return None
     digest_budget = min(OUTLINE_DOCUMENT_MAX_CHARS, max(600, budget - 400))
     document = build_outline_document(documents, max_chars=digest_budget)
@@ -1804,7 +1903,8 @@ async def _lecture_context(
         return None
     try:
         raw = await _structure_chunk(
-            document, settings, session, OUTLINE_PROMPT, system_prompt=OUTLINE_SYSTEM_PROMPT
+            document, settings, session, OUTLINE_PROMPT,
+            system_prompt=OUTLINE_SYSTEM_PROMPT, **_task_kwargs(settings, "outline"),
         )
         context = parse_outline(raw)
     except Exception as exc:
@@ -1899,14 +1999,18 @@ async def _compile_final(
         split_for_compilation,
     )
 
-    if not settings.note_global_context_enabled or len(documents) < OUTLINE_MIN_CHUNKS:
+    if (
+        not settings.note_global_context_enabled
+        or not _pass_allowed("compile")
+        or len(documents) < OUTLINE_MIN_CHUNKS
+    ):
         return merged
     before_text = notes_text(merged)
     if len(before_text) < COMPILE_MIN_NOTES_CHARS:
         return merged
     # Resolved at call time (not as a default argument) so the bound is one
     # place and a test or a future setting can move it.
-    budget = COMPILE_MAX_CHARS if budget is None else budget
+    budget = note_compile_chars(settings) if budget is None else budget
     budget = min(COMPILE_MAX_CHARS, max(budget, COMPILE_MIN_NOTES_CHARS))
     # The system prompt and the instruction block are sent once per slice, so
     # they are reserved up front and never charged to the notes.
@@ -1926,6 +2030,7 @@ async def _compile_final(
 
     kept: list[StructuredNotes] = []
     accepted_any = False
+    await _emit_lifecycle("note_compile_started", chunk_total=len(groups))
     for position, group in enumerate(groups, start=1):
         # A missing outline only removes the topic map; the compilation itself
         # is still worth doing, because it is the pass that produces one
@@ -1950,6 +2055,7 @@ async def _compile_final(
                 COMPILE_PROMPT,
                 system_prompt=COMPILE_SYSTEM_PROMPT,
                 label=slice_label,
+                task="final_compilation",
             )
         except Exception as exc:
             logger.warning(
@@ -1979,9 +2085,11 @@ async def _compile_final(
                 before_slice.semantic_coverage,
                 after_slice.semantic_coverage,
             )
+            await _emit_lifecycle("note_compile_rejected", detail=reason)
             kept.append(group)
             continue
         accepted_any = True
+        await _emit_lifecycle("note_compile_accepted")
         logger.info(
             "Final editorial pass accepted %s (%s) sections=%s->%s chars=%s->%s",
             slice_label,
@@ -2021,7 +2129,8 @@ async def structure_transcript(
     if settings.note_api_provider == "disabled":
         raise StructuringError("سرویس تولید جزوه غیرفعال است.")
     note_mode = resolve_note_mode(mode)
-    chunks = split_transcript(text, max_chars=TRANSCRIPT_CHUNK_CHARS - _CHUNK_PREFIX_RESERVE)
+    chunk_budget = note_chunk_chars(settings)
+    chunks = split_transcript(text, max_chars=chunk_budget)
     timeout = aiohttp.ClientTimeout(
         total=settings.note_api_timeout,
         connect=min(30, settings.note_api_timeout),
@@ -2030,7 +2139,8 @@ async def structure_transcript(
     notes: list[StructuredNotes] = []
     async with aiohttp.ClientSession(timeout=timeout) as session:
         context = await _lecture_context(
-            chunks, settings, session, budget=TRANSCRIPT_CHUNK_CHARS, label="transcript"
+            chunks, settings, session,
+            budget=chunk_budget + _CHUNK_PREFIX_RESERVE, label="transcript",
         )
         for index, chunk in enumerate(chunks, start=1):
             notes.append(
@@ -2059,6 +2169,14 @@ async def structure_transcript(
             system_prompt=build_system_prompt(note_mode),
             prompt=TRANSCRIPT_PROMPT,
             label="transcript",
+            # Legacy bound: the repair framing check historically used the
+            # constant default (22 000), not the (possibly patched) splitter
+            # budget. The router path uses its own token-derived budget.
+            max_chars=(
+                chunk_budget + _CHUNK_PREFIX_RESERVE
+                if _current_job_session() is not None
+                else 22000
+            ),
             system_prompt_for=lambda index, total: build_system_prompt(
                 note_mode, context_block=_context_block_for(context, chunks, index)
             ),
@@ -2181,7 +2299,11 @@ async def _repair_notes_if_needed(
       and does not reintroduce the whole lecture.
     """
     report = run_note_qa(merged, source_chunks)
-    if not settings.note_repair_enabled or not report.needs_repair:
+    if (
+        not settings.note_repair_enabled
+        or not _pass_allowed("repair")
+        or not report.needs_repair
+    ):
         return merged
 
     missing = tuple(report.missing_numbers) + tuple(report.missing_terms)
@@ -2201,6 +2323,12 @@ async def _repair_notes_if_needed(
         report.compression_ratio,
         ",".join(missing[:6]) or "-",
         ",".join(unit_types) or "-",
+    )
+    await _emit_lifecycle(
+        "note_repair_started",
+        qa_coverage=round(report.coverage, 3),
+        qa_semantic_coverage=round(report.semantic_coverage, 3),
+        qa_compression_ratio=round(report.compression_ratio, 4),
     )
     try:
         # The repair re-reads the *same documents* the first pass used, with the
@@ -2252,6 +2380,7 @@ async def _repair_notes_if_needed(
                 system_prompt=chunk_prompt,
                 label=f"{label} (repair {index}/{len(sources)})",
                 reminder=REPAIR_REMINDER,
+                task="repair",
             )
             # Targeted repair: a part that was already right is kept as it was.
             if originals is not None and index <= len(originals):
@@ -2280,6 +2409,7 @@ async def _repair_notes_if_needed(
             report.coverage,
             repaired_report.coverage,
         )
+        await _emit_lifecycle("note_repair_rejected", detail=reason)
         return merged
     logger.info(
         "Note repair pass improved (%s) semantic %.2f -> %.2f coverage %.2f -> %.2f "
@@ -2291,6 +2421,12 @@ async def _repair_notes_if_needed(
         repaired_report.coverage,
         report.compression_ratio,
         repaired_report.compression_ratio,
+    )
+    await _emit_lifecycle(
+        "note_repair_accepted",
+        qa_coverage=round(repaired_report.coverage, 3),
+        qa_semantic_coverage=round(repaired_report.semantic_coverage, 3),
+        qa_compression_ratio=round(repaired_report.compression_ratio, 4),
     )
     # Keep the original title/mode: the repair regenerates structure, not identity.
     return replace(repaired, title=repaired.title or merged.title, note_mode=note_mode)
@@ -2310,6 +2446,10 @@ async def structure_presentation(
         raise StructuringError("سرویس تولید جزوه غیرفعال است.")
     note_mode = resolve_note_mode(mode)
     system_prompt = build_presentation_system_prompt(note_mode)
+
+    if _current_job_session() is not None:
+        # The router's per-provider token budget shrinks the classic cap.
+        max_chars = max(1000, min(max_chars, note_chunk_chars(settings)))
 
     if max_chars < 1000:
         raise ValueError("max_chars must be at least 1000 for presentation context")

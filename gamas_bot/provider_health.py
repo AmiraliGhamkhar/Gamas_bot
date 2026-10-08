@@ -38,6 +38,14 @@ from .provider_credentials import (
 )
 from .structuring import _endpoint
 
+
+def _resolve_canonical(provider: str, base_url: str | None) -> str:
+    try:
+        from .ai.registry import resolve_canonical
+    except ImportError:  # pragma: no cover - defensive
+        return provider
+    return resolve_canonical(provider, base_url)
+
 logger = logging.getLogger(__name__)
 
 #: Vocabulary shared by the panel, the tests and the audit log.
@@ -107,6 +115,9 @@ class HealthResult:
     detail: str | None = None
     cached: bool = False
     probe_supported: bool = True
+    #: "read_only" for the free model-list probes; "generation" only for the
+    #: explicit billable test button (spec §37).
+    check_type: str = "read_only"
 
     @property
     def usable(self) -> bool:
@@ -224,7 +235,10 @@ def build_probe(service: str, provider: str, credential: ProviderCredential, set
             DEEPGRAM_PROBE_URL,
             {"Authorization": f"Token {key}"} if key else {},
         )
-    if provider in {"openai_compatible", "gemini", "anthropic"}:
+    if provider in {"openai_compatible", "gemini", "anthropic"} and (
+        service == "stt"
+        or _resolve_canonical(provider, base_url or settings.note_api_base_url) == provider
+    ):
         if not base_url:
             base_url = {
                 "gemini": settings.note_api_base_url or GEMINI_PROBE_BASE,
@@ -246,6 +260,22 @@ def build_probe(service: str, provider: str, credential: ProviderCredential, set
         elif key:
             headers["Authorization"] = f"Bearer {key}"
         return Probe("GET", _endpoint(base_url, "models"), headers)
+    if service == "notes":
+        # Provider-platform adapters own the probe for the new slugs.
+        try:
+            from .ai.adapters import adapter_for
+
+            adapter = adapter_for(_resolve_canonical(provider, base_url), settings)
+            base = base_url or adapter.default_base_url()
+            if not base:
+                return Probe("GET", "", {}, unsupported_reason="بدون Base URL/حساب")
+            request = adapter.discovery_request(base, key)
+            if request is None:
+                return Probe("GET", "", {}, unsupported_reason="بدون بررسی سبک")
+            method, url, headers = request
+            return Probe(method, url, headers)
+        except Exception:
+            return Probe("GET", "", {}, unsupported_reason="بدون بررسی سبک")
     return Probe("GET", "", {}, unsupported_reason="بدون بررسی سبک")
 
 
@@ -332,10 +362,18 @@ class ProviderHealthChecker:
             key = settings.deepgram_api_key
         elif service == "stt" and provider == "openai_compatible":
             key, base = settings.stt_openai_api_key, settings.stt_openai_base_url
-        elif service == "notes" and provider in {"gemini", "anthropic", "openai_compatible"}:
+        elif service == "notes":
+            # Any slug (legacy or provider-platform) backed by the env config.
             if settings.note_api_provider != provider:
                 return None
             key, base = settings.effective_note_api_key, settings.note_api_base_url
+            if not base:
+                try:
+                    from .ai.registry import registry_info
+
+                    base = registry_info(provider).base_url
+                except ImportError:  # pragma: no cover - defensive
+                    base = None
         else:
             return None
         if not key and not (provider == "openai_compatible" and base):

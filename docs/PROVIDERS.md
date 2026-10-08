@@ -32,21 +32,44 @@ Whole-file transcription only: no chunking in the STT layer.
 
 ## Note generation
 
-`NOTE_API_PROVIDER` selects `gemini`, `anthropic`, `openai_compatible` or
-`disabled`. The layer is provider-neutral: base URL, model, timeout, retries and
-extra headers are configuration, not code.
+Note generation runs on the **Gamas AI Provider Platform**
+(`gamas_bot/ai/`, see [docs/AI_PROVIDERS.md](AI_PROVIDERS.md) for the full
+reference): a 15-provider registry (`gemini`, `nara`, `groq`, `openrouter`,
+`mistral`, `sambanova`, `zai`, `nvidia`, `cloudflare`, `huggingface`,
+`alibaba`, `cohere`, `cerebras`, `openai_compatible`, `anthropic`) with
+capability-aware JSON strategies, provider-level failover and credential
+rotation. Free-tier is the default: `AI_FREE_ONLY=true` blocks non-free
+providers; `AI_ALLOW_PAID_FALLBACK` (default `false`) can append paid legs
+strictly **after** every free leg.
 
-* `NOTE_API_JSON_MODE` opts into `response_format={"type":"json_object"}` for
-  gateways that implement it; the strict system prompt remains the default.
+Backward compatibility is preserved byte-for-byte:
+
+* `NOTE_API_PROVIDER=openai_compatible` + `NOTE_API_BASE_URL=https://router.bynara.id/v1`
+  (the production NaraRouter deployment) keeps working unchanged — the legacy
+  provider is seeded as route leg 0.
+* `NOTE_API_PROVIDER=gemini` keeps using the native `generateContent`
+  payload; with modern capability discovery the platform additionally sends a
+  cleaned `responseSchema` for reliable structured output.
+* `NOTE_API_JSON_MODE=1` keeps injecting `response_format: json_object`.
+* `AI_ROUTING_ENABLED=false` turns the whole router off and restores the exact
+  legacy single-provider path.
+
+The single-provider legacy knobs stay authoritative in legacy mode:
+`NOTE_API_BASE_URL`, `NOTE_API_MODEL`, `NOTE_API_TIMEOUT_SECONDS`,
+`NOTE_API_RETRIES`, `NOTE_API_MAX_OUTPUT_TOKENS`,
+`NOTE_API_EXTRA_HEADERS_JSON` (auth headers are still stripped with a warning).
+
 * `NOTE_MODE` (`full`/`standard`/`summary`) is the only intentional compression.
 * `NOTE_REPAIR_ENABLED` adds a second pass **only** when the deterministic QA
   gate detects real loss; the repaired notes are accepted only when measurably
-  better.
+  better. In routing mode the primary provider's profile decides
+  outline/repair/compile enablement.
 * `NOTE_GLOBAL_CONTEXT_ENABLED` adds the outline/compilation layer for
   multi-part lectures. Single-part lectures still cost one call per chunk.
-* Authentication headers in `NOTE_API_EXTRA_HEADERS_JSON` are dropped with a
-  warning: an operator-supplied header must never be able to override a
-  provider credential.
+* Chunk sizing is token-aware: the active provider's profile budget
+  (see `gamas_bot/ai/profiles.py`) converts to a character budget via
+  `ai/tokens.py`; `note_chunk_chars()` caps it at the legacy ceiling when no
+  router context is bound.
 
 ## Provider health
 
