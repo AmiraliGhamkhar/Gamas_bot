@@ -504,6 +504,46 @@ class TocTests(DocxTestCase):
         self.assertNotIn("TOC \\o", body_xml)
         self.assertNotIn("w:instrText", body_xml)
 
+    def test_only_deep_markdown_headings_still_produce_a_document(self):
+        """A TOC must never be built from headings it would then filter out.
+
+        ``build_plain_docx`` used to count *every* Markdown heading when
+        deciding whether the document earned a topic list, while the list
+        itself only collects headings at or above ``DOCX_TOC_LEVELS``. Raw
+        material whose headings are all ``###`` or deeper therefore requested
+        an empty TOC page, and the empty list was a hard ``DocxPaginationError``
+        that discarded the whole booklet (and the transcript with it).
+        """
+        body = "جملهٔ توضیحی دربارهٔ درس. " * 200
+        deep_only = "".join(f"### بخش {index}\n\n{body}\n\n" for index in range(1, 4))
+        data = build_plain_docx("متن خام", deep_only, meta=META, design=resolve_design())
+        body_xml = self.document_xml(data)
+        # No topic-list page at all, and no orphaned TOC heading or page break.
+        self.assertNotIn("فهرست مطالب", body_xml)
+        self.assertNotIn('w:type="page"', body_xml)
+        # The content itself is still there.
+        text = docx_text(data)
+        for index in range(1, 4):
+            self.assertIn(f"بخش {index}", text)
+
+    def test_deep_markdown_headings_join_the_toc_when_levels_allow_it(self):
+        """The same document earns a topic list under ``DOCX_TOC_LEVELS=1-3``."""
+        body = "جملهٔ توضیحی دربارهٔ درس. " * 200
+        deep_only = "".join(f"### بخش {index}\n\n{body}\n\n" for index in range(1, 4))
+        design = resolve_design({"toc_levels": "1-3", "toc_min_sections": 3})
+        with patch(
+            "gamas_bot.docx_export._rendered_toc_page_numbers",
+            side_effect=lambda _payload, entries, **_kwargs: list(range(3, 3 + len(entries))),
+        ):
+            data = build_plain_docx("متن خام", deep_only, meta=META, design=design)
+        body_xml = self.document_xml(data)
+        self.assertIn("فهرست مطالب", body_xml)
+        anchors = [
+            item.get(f"{W}anchor") for item in ET.fromstring(body_xml).iter(f"{W}hyperlink")
+            if item.get(f"{W}anchor")
+        ]
+        self.assertEqual(len(anchors), 3)
+
     def test_real_rendered_page_map_when_libreoffice_is_installed(self):
         import shutil
 

@@ -71,6 +71,12 @@ Page numbers come from an actual layout pass:
 Ambiguity, an unstable map, or a link that points at the cover/TOC page is
 always a hard failure — a page number that was not measured is never printed.
 
+A TOC is only ever built from headings the list will actually contain, so the
+level filter (`DOCX_TOC_LEVELS`) and the decision to have a topic list can never
+disagree. If nothing qualifies, the topic page is dropped and the document is
+delivered without one; an empty "فهرست مطالب" over an empty table is never
+emitted, and it is never a reason to lose the booklet.
+
 The render loop is bounded: a stable document costs exactly two renders, and a
 document that never stabilises fails after three instead of looping.
 

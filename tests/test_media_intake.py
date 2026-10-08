@@ -219,6 +219,47 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.bot.db.user_balance(int(user["id"])))["available_seconds"], 3_600)
         self.assertTrue(any("صفحه‌بندی واقعی در دسترس نیست" in reply for reply in event.replies))
 
+    async def test_pagination_failure_still_delivers_the_transcript(self):
+        """A lost layout must never cost the user the transcript they paid for.
+
+        ``_deliver_result_documents`` promises the raw-text file is *always*
+        sent. Raising out of the Word-document build used to skip it, so a
+        pagination failure discarded the lecture as well as the booklet.
+        """
+        source = self.root / "transcript-survives.wav"
+        source.write_bytes(wav_bytes(2.2))
+        user = await self.bot.db.upsert_user(106, "student")
+        submission_id = await self.bot.db.create_submission(
+            int(user["id"]), "transcript-survives", 2.2, source.name,
+            "audio/wav", source_type="audio",
+        )
+        event = FakeEvent(source)
+        with patch(
+            "gamas_bot.bot.transcribe",
+            new=AsyncMock(return_value=Transcript("deepgram", "متن درس دربارهٔ موضوع", 0.9)),
+        ), patch(
+            "gamas_bot.bot.structure_transcript",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
+        ), patch(
+            "gamas_bot.bot.build_notes_docx",
+            side_effect=DocxPaginationError("صفحه‌بندی واقعی در دسترس نیست"),
+        ):
+            await self.bot._process_submission(event, submission_id, source.name, "audio")
+
+        delivered = [path for _caption, path in event.files]
+        self.assertTrue(
+            any(path.endswith(".txt") for path in delivered),
+            f"the transcript must still be delivered, got {delivered}",
+        )
+        self.assertFalse(
+            any(path.endswith(".docx") for path in delivered),
+            "no Word document may be delivered when pagination failed",
+        )
+        # The job is still recorded as failed and the user is told why.
+        self.assertTrue(
+            any("صفحه‌بندی واقعی در دسترس نیست" in reply for reply in event.replies)
+        )
+
     async def test_delivery_cancellation_after_stt_releases_reserved_seconds(self):
         source = self.root / "delivery-cancelled.wav"
         source.write_bytes(wav_bytes(2.2))

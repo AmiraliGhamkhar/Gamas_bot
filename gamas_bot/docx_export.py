@@ -907,10 +907,15 @@ def _heading_fonts(fonts: DocumentFonts) -> DocumentFonts:
     )
 
 
-def _add_page_break(container) -> None:
-    """Start a new page (a break, not a section break)."""
+def _add_page_break(container):
+    """Start a new page (a break, not a section break).
+
+    Returns the break paragraph so a caller that may have to undo the break
+    (an unwanted table-of-contents page) can remove exactly that element.
+    """
     paragraph = container.add_paragraph()
     paragraph.add_run().add_break(WD_BREAK.PAGE)
+    return paragraph
 
 
 def _add_rtl_paragraph(
@@ -1751,6 +1756,10 @@ def _add_static_toc_skeleton(document, *, fonts: DocumentFonts):
     Entries are populated after the body has been assembled, when their unique
     bookmarks are known. Page numbers start as fixed-width plain text so the
     first real renderer pass can discover each hyperlink's destination.
+
+    The container owns its page break, so the whole page — heading, table and
+    break — can be lifted back out if no heading ever qualifies for it
+    (see :func:`_remove_static_toc`).
     """
     paragraph = _add_rtl_paragraph(
         document,
@@ -1784,7 +1793,30 @@ def _add_static_toc_skeleton(document, *, fonts: DocumentFonts):
         ("w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook", "w:tblCaption", "w:tblDescription"),
     )
     _make_table_layout_fixed(table, TABLE_CONTENT_WIDTH_CM)
+    break_paragraph = _add_page_break(document)
+    # Every element of the TOC page, so :func:`_remove_static_toc` can drop it
+    # as a unit. Stored as ``w:p``/``w:tbl`` elements on the table object,
+    # which no part of the OOXML schema or python-docx reads back.
+    table._gamas_toc_heading = paragraph._p
+    table._gamas_toc_break = break_paragraph._p
     return table
+
+
+def _remove_static_toc(document, table) -> None:
+    """Lift an unwanted TOC page back out of the body.
+
+    Used when the topic list ended up empty: the page would otherwise be a
+    heading over an empty table, and the body would start one page later than
+    the page numbering assumed.
+    """
+    for element in (
+        getattr(table, "_gamas_toc_break", None),
+        table._tbl,
+        getattr(table, "_gamas_toc_heading", None),
+    ):
+        parent = element.getparent() if element is not None else None
+        if parent is not None:
+            parent.remove(element)
 
 
 def _add_directional_hyperlink(
@@ -1867,6 +1899,30 @@ def _heading_level_resolver(document):
     return resolver
 
 
+def _toc_maximum_level(levels: str) -> int:
+    """Deepest Word heading level the static TOC collects (``"1-2"`` -> 2).
+
+    Shared by the TOC *decision* and the TOC *fill* so the two can never
+    disagree about which headings a document's topic list will contain.
+    """
+    try:
+        return int(str(levels).split("-")[-1])
+    except (ValueError, AttributeError, IndexError):
+        return 1
+
+
+def _markdown_heading_level(match) -> int:
+    """Map a Markdown heading match to the Word level it becomes.
+
+    ``##`` is the top level the pipeline actually emits (the raw material the
+    fallback path renders starts at ``## متن پیاده‌سازی‌شده``), so ``#`` and
+    ``##`` both become Heading 1. Deeper levels shift down one step and clamp
+    at Heading 3 — which puts ``###`` and below *outside* the default
+    ``DOCX_TOC_LEVELS=1-1`` topic list.
+    """
+    return min(max(len(match.group(1)) - 1, 1), 3)
+
+
 def _fill_static_toc(
     document,
     table,
@@ -1874,11 +1930,15 @@ def _fill_static_toc(
     fonts: DocumentFonts,
     levels: str,
 ) -> list[dict[str, str | int]]:
-    """Fill the TOC from actual bookmarked Heading paragraphs."""
-    try:
-        maximum_level = int(levels.split("-")[-1])
-    except (ValueError, AttributeError):
-        maximum_level = 1
+    """Fill the TOC from actual bookmarked Heading paragraphs.
+
+    Returns an empty list when no heading qualifies. That is a *layout*
+    outcome, not a pagination failure: an empty topic list is dropped by
+    :func:`_finish_static_toc`, and the document is still delivered. Raising
+    here used to discard the whole booklet — and with it the transcript — for
+    a document that simply had nothing to put on a TOC page.
+    """
+    maximum_level = _toc_maximum_level(levels)
     heading_level = _heading_level_resolver(document)
     entries: list[dict[str, str | int]] = []
     for paragraph in document.paragraphs:
@@ -1887,13 +1947,17 @@ def _fill_static_toc(
             continue
         bookmark = paragraph._p.find(qn("w:bookmarkStart"))
         if bookmark is None or not bookmark.get(qn("w:name")):
-            raise DocxPaginationError("یکی از عنوان‌های فهرست نشانک داخلی معتبر ندارد.")
+            # Unlinkable and therefore useless as a TOC row. Skipping it keeps
+            # the document; a missing bookmark is never worth a lost booklet.
+            logger.warning("Skipping a TOC heading without a usable internal bookmark")
+            continue
         title = paragraph.text.strip()
         if not title:
             continue
         entries.append({"anchor": bookmark.get(qn("w:name")), "title": title, "level": level})
     if not entries:
-        raise DocxPaginationError("برای ساخت فهرست ایستا، هیچ عنوانی با نشانک داخلی پیدا نشد.")
+        logger.info("No heading qualified for the static TOC; dropping the topic-list page")
+        return entries
 
     for entry in entries:
         row = table.add_row()
@@ -2138,6 +2202,12 @@ def _finish_static_toc(
     returned payload instead of on every intermediate save.
     """
     if toc_table is None:
+        return _save_document_bytes(document, fonts)
+    if not entries:
+        # Nothing qualified for the topic list. Dropping the page is the one
+        # outcome that both keeps the document and prints no page number that
+        # was never measured.
+        _remove_static_toc(document, toc_table)
         return _save_document_bytes(document, fonts)
     if design.toc_page_numbers == "off":
         _clear_static_toc_page_cells(toc_table)
@@ -2676,8 +2746,8 @@ def build_notes_docx(
     _configure_header_footer_styles(document)
 
     if toc_needed:
+        # The skeleton owns its own page break so the page can be dropped whole.
         toc_table = _add_static_toc_skeleton(document, fonts=resolved)
-        _add_page_break(document)
 
     if notes.learning_objectives:
         _add_heading(document, "اهداف یادگیری", fonts=resolved, level=1, space_before=0)
@@ -2763,11 +2833,26 @@ def build_plain_docx(
     style = design or DocxDesign()
     document = _new_document(meta, title)
     _configure_styles(document, resolved)
-    markdown_headings = sum(
-        1 for line in text.splitlines() if re.match(r"^\s{0,3}#{1,6}\s+\S", line)
+    heading_matches = [
+        match
+        for match in (
+            re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", raw_line.rstrip())
+            for raw_line in text.splitlines()
+        )
+        if match is not None
+    ]
+    # Only headings the topic list will actually contain may earn one. Counting
+    # every Markdown heading used to be enough to build the TOC page for a
+    # document whose headings were all ``###`` or deeper: those become Heading
+    # 2/3, which ``DOCX_TOC_LEVELS=1-1`` excludes, so the page came out empty
+    # and the whole document was discarded instead.
+    toc_headings = sum(
+        1
+        for match in heading_matches
+        if _markdown_heading_level(match) <= _toc_maximum_level(style.toc_levels)
     )
-    toc_needed = markdown_headings >= 2 and toc_is_worth_it(
-        len(text), markdown_headings, style
+    toc_needed = toc_headings >= 2 and toc_is_worth_it(
+        len(text), len(heading_matches), style
     )
     toc_table = None
 
@@ -2791,8 +2876,8 @@ def build_plain_docx(
     # Raw material's heading-derived TOC uses the same static, rendered-page
     # mapping as the structured-notes path.
     if toc_needed:
+        # The skeleton owns its own page break so the page can be dropped whole.
         toc_table = _add_static_toc_skeleton(document, fonts=resolved)
-        _add_page_break(document)
 
     for raw_line in text.splitlines():
         line = raw_line.rstrip()
@@ -2800,12 +2885,10 @@ def build_plain_docx(
             continue
         heading = re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", line)
         if heading:
-            # ``##`` is the top level the pipeline actually emits (the raw
-            # material it passes here starts at ``## متن پیاده‌سازی‌شده``), so
-            # ``#`` and ``##`` both become Heading 1: promoting ``##`` to
-            # Heading 1 keeps the fallback booklet's TOC non-empty. Deeper
-            # levels shift down one step and clamp at Heading 3.
-            level = min(max(len(heading.group(1)) - 1, 1), 3)
+            # See :func:`_markdown_heading_level` — the same mapping the TOC
+            # decision uses, so a heading is never counted as TOC-worthy here
+            # and then filtered out of the topic list there.
+            level = _markdown_heading_level(heading)
             _add_heading(document, heading.group(2).strip(), fonts=resolved, level=level)
             continue
         bullet = re.match(r"^\s*[-*+]\s+(.*)$", line)
