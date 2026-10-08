@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import unittest
 
-from gamas_bot.ai import adapters, models, tokens
+from gamas_bot.ai import models, tokens
 from gamas_bot.ai.adapters import (
     FAIL_AUTH,
     FAIL_BILLING,

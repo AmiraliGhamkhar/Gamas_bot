@@ -265,7 +265,7 @@ def build_probe(service: str, provider: str, credential: ProviderCredential, set
         try:
             from .ai.adapters import adapter_for
 
-            adapter = adapter_for(resolve_canonical(provider, base_url), settings)
+            adapter = adapter_for(_resolve_canonical(provider, base_url), settings)
             base = base_url or adapter.default_base_url()
             if not base:
                 return Probe("GET", "", {}, unsupported_reason="بدون Base URL/حساب")

@@ -16,10 +16,8 @@ from pathlib import Path
 
 from cryptography.fernet import Fernet
 
-from gamas_bot.ai import adapters as ai_adapters
 from gamas_bot.ai.models import (
     FREE_PROMOTIONAL,
-    ModelCapabilities,
     ModelInfo,
     ModelRegistry,
 )
@@ -31,7 +29,6 @@ from gamas_bot.ai.registry import (
     resolve_canonical,
 )
 from gamas_bot.ai.routing import (
-    AllProvidersFailedError,
     NoteJobSession,
     ProviderRouter,
     RouteLeg,
@@ -43,7 +40,6 @@ from gamas_bot.config import Settings
 from gamas_bot.database import Database
 from gamas_bot.provider_credentials import ProviderCredentialManager
 from gamas_bot.structuring import (
-    ProviderHTTPError,
     StructuringError,
     _structure_chunk,
     note_chunk_chars,
@@ -432,7 +428,7 @@ class FailoverRotationTests(PlatformCase):
         bad = await self.manager.add_credential(
             service="notes", provider="groq", label="bad", secret="gsk-bad-1111", admin_id=1
         )
-        good = await self.manager.add_credential(
+        await self.manager.add_credential(
             service="notes", provider="groq", label="good", secret="gsk-good-2222", admin_id=1
         )
         await self._route(["groq"])
@@ -538,7 +534,7 @@ class FailoverRotationTests(PlatformCase):
 
     async def test_historical_deployment_replays_legacy_credential_pool(self):
         # NOTE_API_PROVIDER=openai_compatible + Nara base + key (no stored keys).
-        job = await self._session_plan()
+        await self._session_plan()
         leg = RouteLeg(provider="nara", canonical="nara")
         pool = await self.router.credentials_for(leg)
         self.assertEqual(len(pool), 1)

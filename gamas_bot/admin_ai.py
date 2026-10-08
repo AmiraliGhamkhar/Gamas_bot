@@ -764,7 +764,6 @@ class AIPanels:
         if slug not in PROVIDER_REGISTRY:
             await event.answer("ارائه‌دهندهٔ نامعتبر.", alert=True)
             return
-        info = registry_info(slug)
         profile = profile_for(slug)
         adapter = adapter_for(slug, self.bot.settings)
         base_url = self.bot.provider_router._base_url_for_slug(slug) or adapter.default_base_url()

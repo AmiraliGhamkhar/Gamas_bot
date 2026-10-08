@@ -26,15 +26,14 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 def _settings(**kw):
     """Settings with an OpenAI-compatible note provider (the legacy baseline)."""
-    from dataclasses import replace
 
-    base = dict(
-        note_api_provider="openai_compatible",
-        note_api_base_url="https://router.bynara.id/v1",
-        note_api_model="agnes-3-flash",
-        note_api_key="sk-legacy-key",
-        note_api_max_output_tokens=4096,
-    )
+    base = {
+        "note_api_provider": "openai_compatible",
+        "note_api_base_url": "https://router.bynara.id/v1",
+        "note_api_model": "agnes-3-flash",
+        "note_api_key": "sk-legacy-key",
+        "note_api_max_output_tokens": 4096,
+    }
     base.update(kw)
     return make_settings(**base)
 

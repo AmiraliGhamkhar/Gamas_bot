@@ -71,13 +71,6 @@ from .presentations import (
 from .progress import JobProgress
 from .admin_ai import AIPanels, handle_ai_callback
 from .ai.models import ModelRegistry
-from .ai.registry import (
-    PROVIDER_REGISTRY,
-    ProviderClass,
-    registry_info,
-    resolve_canonical,
-    free_class_fa,
-)
 from .ai.routing import (
     NoteJobSession,
     ProviderRouter,

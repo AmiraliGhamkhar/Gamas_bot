@@ -43,18 +43,15 @@ from . import tokens as token_budget
 from .adapters import (
     FAIL_AUTH,
     FAIL_BAD_REQUEST,
-    FAIL_BILLING,
     FAIL_CONTRACT,
     FAIL_MODEL,
     FAIL_QUOTA,
     FAIL_RATE_LIMITED,
-    FAIL_SERVER,
     FAIL_TRANSIENT,
     NoteAdapter,
     NoteFailure,
     NoteResponse,
     RequestContext,
-    STRATEGY_JSON_OBJECT,
     STRATEGY_PROMPT,
     adapter_for,
     resolve_json_strategy,
@@ -62,7 +59,6 @@ from .adapters import (
 from .models import FREE_PROMOTIONAL, ModelInfo, ModelRegistry, PAID, fallback_free_model
 from .profiles import NoteProviderProfile, profile_for
 from .registry import (
-    LEGACY_NOTE_SLUGS,
     ProviderClass,
     classification_of,
     free_only_generation_allowed,
@@ -313,7 +309,9 @@ class ProviderRouter:
         # administrators cannot accidentally promote paid traffic above
         # free providers by reordering routes.
         if free_only_mode:
-            eligible = [l for l in eligible if l.free_only] + [l for l in eligible if not l.free_only]
+            eligible = [lg for lg in eligible if lg.free_only] + [
+                lg for lg in eligible if not lg.free_only
+            ]
         profile = (
             profile_for(eligible[0].canonical)
             if eligible
@@ -732,13 +730,13 @@ class ProviderRouter:
                 )
             try:
                 request = adapter.build(request_ctx, credential.secret)
-            except StructuringError:
+            except StructuringError as exc:
                 raise NoteFailure(
                     category=FAIL_CONTRACT,
                     provider=ctx.canonical,
                     model=ctx.model,
                     message="request build failed (configuration)",
-                )
+                ) from exc
             status = None
             try:
                 timeout = aiohttp.ClientTimeout(
@@ -772,7 +770,7 @@ class ProviderRouter:
                                 http_status=status,
                                 retryable=False,
                                 message=str(exc)[:120],
-                            )
+                            ) from exc
                         await self._record_attempt(
                             ctx=request_ctx, credential=credential, result="success",
                             latency_ms=latency_ms, http_status=status,

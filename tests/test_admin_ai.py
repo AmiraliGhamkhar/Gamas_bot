@@ -99,7 +99,7 @@ class AIPanelCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_home_panel_shows_free_only_state(self):
         self._mock_bot_rendering()
-        event = await self._callback("admin:ai")
+        await self._callback("admin:ai")
         self.assertIn("FREE_ONLY", self.last_text)
         buttons = self.bot._edit_callback.call_args.args[2]
         flat = [b for row in buttons for b in row]
