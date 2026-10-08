@@ -20,9 +20,19 @@ from .database import Database
 
 logger = logging.getLogger(__name__)
 
+#: Note-provider credential pools. The legacy three stay; the rest are the
+#: provider-platform registry slugs (kept in sync by tests).
+NOTE_PROVIDER_CHOICES = frozenset(
+    {
+        "gemini", "anthropic", "openai_compatible",
+        "nara", "groq", "openrouter", "mistral", "sambanova", "zai",
+        "nvidia", "cloudflare", "huggingface", "alibaba", "cohere", "cerebras",
+    }
+)
+
 PROVIDER_CHOICES = {
     "stt": frozenset({"speechmatics", "deepgram", "openai_compatible"}),
-    "notes": frozenset({"gemini", "anthropic", "openai_compatible"}),
+    "notes": NOTE_PROVIDER_CHOICES,
 }
 
 

@@ -120,6 +120,14 @@ SPEECHMATICS_VOCAB_HARD_LIMIT = 20_000
 DEFAULT_ANTHROPIC_MODEL = "claude-haiku-4-5"
 DEFAULT_OPENAI_COMPATIBLE_MODEL = "gpt-4o-mini"
 
+#: Every slug accepted by NOTE_API_PROVIDER. The legacy four stay first;
+#: the rest are the provider-platform registry slugs (gamas_bot.ai.registry).
+AI_NOTE_PROVIDER_CHOICES = (
+    "gemini", "openai_compatible", "anthropic", "disabled",
+    "nara", "groq", "openrouter", "mistral", "sambanova", "zai",
+    "nvidia", "cloudflare", "huggingface", "alibaba", "cohere", "cerebras",
+)
+
 # Reserved request headers. A user-supplied ``NOTE_API_EXTRA_HEADERS_JSON``
 # must never be able to replace (or forge) provider credentials, so these
 # names are dropped from the extra headers with a warning.
@@ -371,7 +379,29 @@ class Settings:
     # Opt-in response_format={"type":"json_object"} for OpenAI-compatible note
     # providers. Not every gateway implements it, so the strict system prompt
     # is the default and this only tightens providers that support JSON mode.
+    # Capability resolution (gamas_bot.ai) takes precedence for providers whose
+    # models advertise a structured-output feature.
     note_api_json_mode: bool = False
+    # --- AI provider platform (see docs/AI_PROVIDERS.md) ---
+    # FREE_ONLY: never intentionally route to paid models/plans; stop instead.
+    ai_free_only: bool = True
+    # Explicit administrator opt-in for paid fallback when free capacity fails.
+    ai_allow_paid_fallback: bool = False
+    # Platform routing/failover. False reproduces the legacy single-provider
+    # note client byte-for-byte.
+    ai_routing_enabled: bool = True
+    # Provider model-catalog cache TTL (seconds).
+    ai_provider_sync_ttl: int = 86400
+    # Optional comma-separated note route override (canonical slugs).
+    ai_default_note_route: str = ""
+    # Maximum number of *additional* providers tried after the first leg.
+    ai_max_provider_failovers: int = 3
+    # -1 = use each provider profile's own retry budget.
+    ai_max_generation_retries: int = -1
+    # Multiplicative margin kept between token estimates and provider budgets.
+    ai_quota_safety_margin: float = 0.15
+    # Cloudflare Workers AI account id (account-scoped endpoint builder).
+    cloudflare_account_id: str = ""
     # Complex-script font used inside the generated Word document (Tahoma is
     # present everywhere; set B Nazanin/Vazirmatn when the audience has it).
     docx_font: str = "Tahoma"
@@ -639,9 +669,9 @@ class Settings:
             "none": "disabled",
             "off": "disabled",
         }.get(note_provider, note_provider)
-        if note_provider not in {"gemini", "openai_compatible", "anthropic", "disabled"}:
+        if note_provider not in AI_NOTE_PROVIDER_CHOICES:
             raise ValueError(
-                "NOTE_API_PROVIDER باید یکی از gemini، openai_compatible، anthropic یا disabled باشد."
+                "NOTE_API_PROVIDER نامعتبر است؛ یکی از: " + "، ".join(AI_NOTE_PROVIDER_CHOICES)
             )
         note_base_url = os.getenv("NOTE_API_BASE_URL", "").strip() or None
         if note_base_url:
@@ -685,6 +715,10 @@ class Settings:
             receipt_retention_days = int(_text("RECEIPT_RETENTION_DAYS", "90"))
             max_receipt_size = int(_text("MAX_PAYMENT_RECEIPT_BYTES", "5000000"))
             docx_pagination_timeout = int(_text("DOCX_PAGINATION_TIMEOUT_SECONDS", "120"))
+            ai_provider_sync_ttl = int(_text("AI_PROVIDER_SYNC_TTL", "86400"))
+            ai_max_provider_failovers = int(_text("AI_MAX_PROVIDER_FAILOVERS", "3"))
+            ai_max_generation_retries = int(_text("AI_MAX_GENERATION_RETRIES", "-1"))
+            ai_quota_safety_margin = float(_text("AI_QUOTA_SAFETY_MARGIN", "0.15"))
             plan_values = {
                 name: int(_text(env_name, str(default)))
                 for env_name, name, default in PLAN_ENV_FIELDS
@@ -742,6 +776,14 @@ class Settings:
                 )
         if log_max_bytes <= 0 or log_backup_count < 0:
             raise ValueError("تنظیمات چرخش فایل لاگ معتبر نیستند.")
+        if ai_provider_sync_ttl < 60:
+            raise ValueError("AI_PROVIDER_SYNC_TTL باید دست‌کم ۶۰ ثانیه باشد.")
+        if not 0 <= ai_max_provider_failovers <= 10:
+            raise ValueError("AI_MAX_PROVIDER_FAILOVERS باید بین ۰ و ۱۰ باشد.")
+        if not -1 <= ai_max_generation_retries <= 10:
+            raise ValueError("AI_MAX_GENERATION_RETRIES باید بین -۱ و ۱۰ باشد.")
+        if not math.isfinite(ai_quota_safety_margin) or not 0 <= ai_quota_safety_margin <= 0.5:
+            raise ValueError("AI_QUOTA_SAFETY_MARGIN باید عددی بین ۰ و ۰٫۵ باشد.")
         log_level = _text("LOG_LEVEL", "INFO").upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("LOG_LEVEL باید DEBUG، INFO، WARNING، ERROR یا CRITICAL باشد.")
@@ -932,6 +974,15 @@ class Settings:
                 _text("DOCX_PAGINATION_RENDERER_BIN", "").strip() or None
             ),
             docx_toc_page_numbers=docx_toc_page_numbers,
+            ai_free_only=_flag("AI_FREE_ONLY", True),
+            ai_allow_paid_fallback=_flag("AI_ALLOW_PAID_FALLBACK", False),
+            ai_routing_enabled=_flag("AI_ROUTING_ENABLED", True),
+            ai_provider_sync_ttl=ai_provider_sync_ttl,
+            ai_default_note_route=_text("AI_DEFAULT_NOTE_ROUTE", ""),
+            ai_max_provider_failovers=ai_max_provider_failovers,
+            ai_max_generation_retries=ai_max_generation_retries,
+            ai_quota_safety_margin=ai_quota_safety_margin,
+            cloudflare_account_id=_text("CLOUDFLARE_ACCOUNT_ID", ""),
         )
 
     def validate_runtime(self) -> None:

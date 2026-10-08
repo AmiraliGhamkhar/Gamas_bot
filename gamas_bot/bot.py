@@ -8,6 +8,7 @@ import secrets
 import shutil
 import tempfile
 from collections.abc import Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -68,6 +69,21 @@ from .presentations import (
     slides_outline,
 )
 from .progress import JobProgress
+from .admin_ai import AIPanels, handle_ai_callback
+from .ai.models import ModelRegistry
+from .ai.registry import (
+    PROVIDER_REGISTRY,
+    ProviderClass,
+    registry_info,
+    resolve_canonical,
+    free_class_fa,
+)
+from .ai.routing import (
+    NoteJobSession,
+    ProviderRouter,
+    job_session_scope,
+)
+from .ai.usage import AIUsageTracker
 from .provider_credentials import (
     CredentialStoreError,
     PROVIDER_CHOICES,
@@ -201,6 +217,10 @@ def admin_menu():
         [
             Button.inline("🩺 وضعیت سرویس‌ها", b"admin:health"),
             Button.inline("🔑 API Keys", b"admin:credentials"),
+        ],
+        [
+            Button.inline("🤖 پلتفرم AI", b"admin:ai"),
+            Button.inline("🧭 مسیرها", b"admin:ai:rt"),
         ],
         [
             Button.inline("📜 گزارش مدیر", b"admin:audit"),
@@ -416,6 +436,16 @@ class StudyBot:
         self.provider_health = ProviderHealthChecker(
             self.db, settings, self.credential_manager
         )
+        # AI provider platform: routing/failover, model registry, usage ledger.
+        self.ai_tracker = AIUsageTracker(self.db)
+        self.model_registry = ModelRegistry(self.db, settings)
+        self.provider_router = ProviderRouter(
+            self.db, settings, self.credential_manager, self.ai_tracker, self.model_registry
+        )
+        # Telegram admin panels for the AI provider platform (providers, keys,
+        # routes, usage, models, logs, dry-run). Kept in its own module to keep
+        # bot.py focused on the job pipeline.
+        self.ai_panels = AIPanels(self)
         self._receipt_cleanup_task: asyncio.Task | None = None
         self._receipt_root: Path | None = None
         self._pending_credential_setup: dict[int, dict[str, str | None]] = {}
@@ -439,6 +469,40 @@ class StudyBot:
         self._queue: asyncio.Queue[QueuedJob] | None = None
         self._workers: list[asyncio.Task] = []
         self._pending_admin_actions: dict[int, str] = {}
+
+    # -- AI provider platform ------------------------------------------------
+
+    @asynccontextmanager
+    async def _note_job_scope(self, submission_id: int):
+        """Bind credentials + (optionally) the provider router for one note job.
+
+        With AI_ROUTING_ENABLED=false (or no usable route) this degrades to the
+        historical single-provider credential-rotation context — the legacy
+        pipeline then runs byte-for-byte as before.
+        """
+        if (
+            not getattr(self.settings, "ai_routing_enabled", True)
+            or self.settings.note_api_provider == "disabled"
+        ):
+            with use_provider_credentials(self.credential_manager):
+                yield
+            return
+        try:
+            plan = await self.provider_router.plan()
+        except Exception:
+            logger.warning("AI route planning failed; using the legacy provider path")
+            with use_provider_credentials(self.credential_manager):
+                yield
+            return
+        session = NoteJobSession(
+            self.provider_router,
+            plan,
+            self.settings,
+            job_id=_error_reference(submission_id),
+            submission_id=submission_id,
+        )
+        with use_provider_credentials(self.credential_manager), job_session_scope(session):
+            yield
 
     # -- job queue ---------------------------------------------------------
 
@@ -569,6 +633,10 @@ class StudyBot:
         await self.db.sync_plan_catalog(
             [plan.as_record() for plan in plan_catalog(self.settings.plan_values)]
         )
+        try:
+            await self.provider_router.ensure_seeded()
+        except Exception:
+            logger.warning("AI provider route seeding failed; routing falls back to defaults")
         self._ensure_secure_receipt_directory()
         await self._cleanup_expired_receipts()
         self._register_handlers()
@@ -1657,6 +1725,9 @@ class StudyBot:
         if data == "admin:credentials":
             await self._show_provider_credentials(event)
             return
+        if data.startswith("admin:ai"):
+            await handle_ai_callback(self, event, data)
+            return
         if data == "admin:health":
             await self._show_provider_health(event)
             return
@@ -1774,6 +1845,9 @@ class StudyBot:
     async def _handle_pending_admin_input(
         self, event, telegram_id: int, action: str, text: str
     ) -> None:
+        if action == "aikey_label":
+            await self.ai_panels.handle_wizard_label(event, text)
+            return
         if action == "credits_lookup":
             target_id = _parse_user_id(text.strip())
             self._pending_admin_actions.pop(telegram_id, None)
@@ -2144,6 +2218,7 @@ class StudyBot:
             pending_action.startswith("credential_")
             or pending_action.startswith("credential_meta:")
             or pending_action.startswith("payment_reject:")
+            or pending_action == "aikey_label"
         ):
             if command == "/cancel":
                 self._pending_admin_actions.pop(telegram_id, None)
@@ -2531,7 +2606,7 @@ class StudyBot:
                 await progress.update(85, "📚 دارم مطالب را به شکل جزوه مرتب می‌کنم")
                 notes: StructuredNotes | None = None
                 try:
-                    with use_provider_credentials(self.credential_manager):
+                    async with self._note_job_scope(submission_id):
                         notes = await structure_presentation(
                             outline, transcript_text, self.settings, mode=self.settings.note_mode
                         )
@@ -2747,7 +2822,7 @@ class StudyBot:
                 await progress.update(80, "✍️ متن آماده شد؛ دارم آن را به شکل جزوه مرتب می‌کنم")
                 notes: StructuredNotes | None = None
                 try:
-                    with use_provider_credentials(self.credential_manager):
+                    async with self._note_job_scope(submission_id):
                         notes = await structure_transcript(
                             result.text, self.settings, mode=self.settings.note_mode
                         )

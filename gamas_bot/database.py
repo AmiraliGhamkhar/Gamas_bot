@@ -1663,8 +1663,8 @@ class Database:
             if result == "success":
                 await db.execute(
                     "UPDATE provider_credentials SET last_status_code=?, last_success_at=?, "
-                    "last_used_at=?, last_error=NULL, cooldown_until=NULL, quarantined_at=NULL, updated_at=? "
-                    "WHERE id=?",
+                    "last_used_at=?, last_error=NULL, cooldown_until=NULL, quarantined_at=NULL, "
+                    "failure_streak=0, updated_at=? WHERE id=?",
                     (status_code, now, now, now, credential_id),
                 )
             elif result == "cooldown":
@@ -1673,19 +1673,21 @@ class Database:
                 until = (now_dt + timedelta(seconds=delay)).isoformat()
                 await db.execute(
                     "UPDATE provider_credentials SET last_status_code=?, last_failure_at=?, "
-                    "last_used_at=?, last_error=?, cooldown_until=?, updated_at=? WHERE id=?",
+                    "last_used_at=?, last_error=?, cooldown_until=?, failure_streak=failure_streak+1, "
+                    "updated_at=? WHERE id=?",
                     (status_code, now, now, safe_error or f"HTTP {status_code}", until, now, credential_id),
                 )
             elif result == "quarantined":
                 await db.execute(
                     "UPDATE provider_credentials SET last_status_code=?, last_failure_at=?, "
-                    "last_used_at=?, last_error=?, quarantined_at=?, updated_at=? WHERE id=?",
+                    "last_used_at=?, last_error=?, quarantined_at=?, failure_streak=failure_streak+1, "
+                    "updated_at=? WHERE id=?",
                     (status_code, now, now, safe_error or f"HTTP {status_code}", now, now, credential_id),
                 )
             else:
                 await db.execute(
                     "UPDATE provider_credentials SET last_status_code=?, last_failure_at=?, "
-                    "last_used_at=?, last_error=?, updated_at=? WHERE id=?",
+                    "last_used_at=?, last_error=?, failure_streak=failure_streak+1, updated_at=? WHERE id=?",
                     (status_code, now, now, safe_error, now, credential_id),
                 )
 
@@ -1812,3 +1814,431 @@ class Database:
                 (utc_now(), payment_id, receipt_path),
             )
             return cursor.rowcount == 1
+
+    # ------------------------------------------------------------------
+    # AI provider platform: models, routes, usage, quota, events
+    # ------------------------------------------------------------------
+
+    async def ai_models_list(
+        self, provider: str, *, include_unavailable: bool = False
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM ai_models WHERE provider=?"
+        params: tuple = (provider,)
+        if not include_unavailable:
+            query += " AND available=1"
+        query += " ORDER BY deprecated, id"
+        async with self._lock:
+            cursor = await self._db().execute(query, params)
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def ai_model_get(self, provider: str, model: str) -> dict[str, Any] | None:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM ai_models WHERE provider=? AND model=?", (provider, model)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def ai_model_latest_sync(self, provider: str) -> str | None:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT MAX(source_last_verified_at) FROM ai_models WHERE provider=? AND "
+                "source LIKE 'live%'",
+                (provider,),
+            )
+            row = await cursor.fetchone()
+            return str(row[0]) if row and row[0] else None
+
+    async def ai_models_upsert_discovery(self, provider: str, rows: list[dict[str, Any]]) -> dict:
+        """Persist a live catalog snapshot; vanished models become unavailable."""
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            seen: list[str] = []
+            for row in rows:
+                seen.append(str(row["model"]))
+                await db.execute(
+                    "INSERT INTO ai_models (provider, model, display_name, context_window, "
+                    "max_output_tokens, capabilities_json, free_status, free_until, "
+                    "commercial_use_allowed, region_restriction, deprecated, deprecation_date, "
+                    "available, source, source_last_verified_at, quality_score, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(provider, model) DO UPDATE SET "
+                    "display_name=excluded.display_name, "
+                    "context_window=CASE WHEN excluded.context_window>0 THEN excluded.context_window "
+                    "  ELSE ai_models.context_window END, "
+                    "max_output_tokens=CASE WHEN excluded.max_output_tokens>0 "
+                    "  THEN excluded.max_output_tokens ELSE ai_models.max_output_tokens END, "
+                    "capabilities_json=excluded.capabilities_json, "
+                    "free_status=excluded.free_status, free_until=excluded.free_until, "
+                    "available=1, deprecated=0, "
+                    "source=excluded.source, source_last_verified_at=excluded.source_last_verified_at, "
+                    "updated_at=excluded.updated_at",
+                    (
+                        provider, row["model"], row.get("display_name") or "",
+                        int(row.get("context_window") or 0), int(row.get("max_output_tokens") or 0),
+                        row.get("capabilities_json") or "{}", row.get("free_status") or "unknown",
+                        row.get("free_until"), int(row.get("commercial_use_allowed", 1)),
+                        row.get("region_restriction") or "", int(row.get("deprecated", 0)),
+                        row.get("deprecation_date"), int(row.get("available", 1)),
+                        row.get("source") or "live", row.get("source_last_verified_at") or now,
+                        row.get("quality_score"), now, now,
+                    ),
+                )
+            # Anything live-tracked but absent from this snapshot is unavailable now.
+            cursor = await db.execute(
+                "SELECT model FROM ai_models WHERE provider=? AND available=1 AND source LIKE 'live%'",
+                (provider,),
+            )
+            existing = {str(r["model"]) for r in await cursor.fetchall()}
+            deactivated = 0
+            for stale_model in sorted(existing - set(seen)):
+                await db.execute(
+                    "UPDATE ai_models SET available=0, updated_at=? WHERE provider=? AND model=?",
+                    (now, provider, stale_model),
+                )
+                deactivated += 1
+            return {"synced": len(rows), "deactivated": deactivated}
+
+    async def ai_models_get_by_id(self, row_id: int) -> dict[str, Any] | None:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM ai_models WHERE id=?", (int(row_id),)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def ai_models_set_deprecated(self, provider: str, model: str, *, date: str | None) -> None:
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "UPDATE ai_models SET deprecated=1, deprecation_date=?, updated_at=? "
+                "WHERE provider=? AND model=?",
+                (date, utc_now(), provider, model),
+            )
+
+    async def ai_model_set_quality(self, provider: str, model: str, score: float) -> None:
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "UPDATE ai_models SET quality_score=?, last_benchmarked_at=?, updated_at=? "
+                "WHERE provider=? AND model=?",
+                (float(score), utc_now(), utc_now(), provider, model),
+            )
+
+    # -- provider settings ---------------------------------------------------
+
+    async def ai_provider_settings_get(self, provider: str) -> dict[str, Any] | None:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM ai_provider_settings WHERE provider=?", (provider,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def ai_provider_settings_all(self) -> dict[str, dict[str, Any]]:
+        async with self._lock:
+            cursor = await self._db().execute("SELECT * FROM ai_provider_settings")
+            return {str(row["provider"]): dict(row) for row in await cursor.fetchall()}
+
+    async def ai_provider_settings_upsert(
+        self, provider: str, *, admin_id: int | None = None, **fields
+    ) -> None:
+        allowed = {"enabled", "free_only_blocked", "experimental_unlocked", "plan_label", "notes"}
+        columns = [name for name in fields if name in allowed]
+        if not columns:
+            return
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "INSERT INTO ai_provider_settings (provider, updated_by_admin_id, updated_at) "
+                "VALUES (?, ?, ?) ON CONFLICT(provider) DO NOTHING",
+                (provider, admin_id, now),
+            )
+            assignments = ", ".join(f"{name}=?" for name in columns)
+            await db.execute(
+                f"UPDATE ai_provider_settings SET {assignments}, updated_by_admin_id=?, updated_at=? "
+                "WHERE provider=?",
+                tuple(int(fields[name]) if isinstance(fields[name], bool) else fields[name] for name in columns)
+                + (admin_id, now, provider),
+            )
+
+    # -- routes ----------------------------------------------------------------
+
+    async def ai_routes_list(self, service: str, task_type: str) -> list[dict[str, Any]]:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM ai_provider_routes WHERE service=? AND task_type=? "
+                "ORDER BY route_index, id",
+                (service, task_type),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def ai_routes_replace(
+        self, service: str, task_type: str, providers: list[dict[str, Any]], admin_id: int | None
+    ) -> None:
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "DELETE FROM ai_provider_routes WHERE service=? AND task_type=?",
+                (service, task_type),
+            )
+            for index, entry in enumerate(providers):
+                await db.execute(
+                    "INSERT INTO ai_provider_routes (service, task_type, route_index, provider, "
+                    "enabled, free_only, model, updated_by_admin_id, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        service, task_type, index, str(entry["provider"]),
+                        int(entry.get("enabled", 1)), int(entry.get("free_only", 1)),
+                        entry.get("model"), admin_id, now,
+                    ),
+                )
+            if admin_id is not None:
+                await self._insert_audit(
+                    db, int(admin_id), "ai_route_updated", "ai_provider_routes",
+                    f"{service}/{task_type}",
+                    {"order": [str(e["provider"]) for e in providers]},
+                )
+
+    async def ai_route_enabled(self, service: str, task_type: str, provider: str) -> bool | None:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT enabled FROM ai_provider_routes WHERE service=? AND task_type=? AND provider=?",
+                (service, task_type, provider),
+            )
+            row = await cursor.fetchone()
+            return None if row is None else bool(row[0])
+
+    # -- usage ledger & rollups -------------------------------------------------
+
+    async def ai_usage_insert(self, record: dict[str, Any]) -> int:
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "INSERT INTO ai_usage_records (created_at, finished_at, service, provider, canonical, "
+                "credential_id, credential_label, model, request_type, route_position, attempt, "
+                "job_id, submission_id, latency_ms, http_status, estimated_input_tokens, "
+                "actual_input_tokens, actual_output_tokens, total_tokens, finish_reason, "
+                "retry_after_seconds, quota_headers_json, json_strategy, result, error_class, "
+                "free_class, request_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.get("created_at") or utc_now(), record.get("finished_at") or utc_now(),
+                    str(record.get("service") or "notes"), str(record.get("provider") or ""),
+                    str(record.get("canonical") or record.get("provider") or ""),
+                    record.get("credential_id"), record.get("credential_label"),
+                    record.get("model"), record.get("request_type"),
+                    int(record.get("route_position") or 0), int(record.get("attempt") or 1),
+                    record.get("job_id"), record.get("submission_id"),
+                    int(record.get("latency_ms") or 0), record.get("http_status"),
+                    record.get("estimated_input_tokens"), record.get("actual_input_tokens"),
+                    record.get("actual_output_tokens"), record.get("total_tokens"),
+                    record.get("finish_reason"), record.get("retry_after_seconds"),
+                    record.get("quota_headers_json"), record.get("json_strategy"),
+                    str(record.get("result") or "unknown"), record.get("error_class"),
+                    record.get("free_class") or "unknown", record.get("request_id"),
+                ),
+            )
+            row_id = int(cursor.lastrowid)
+            # Same-transaction daily rollup keeps aggregates consistent.
+            day = (record.get("created_at") or utc_now())[:10]
+            provider = str(record.get("provider") or "")
+            model = str(record.get("model") or "")
+            result = str(record.get("result") or "")
+            error_class = str(record.get("error_class") or "")
+            await db.execute(
+                "INSERT INTO ai_usage_daily (day, provider, model, requests, successes, failures, "
+                "rate_limit_hits, server_errors, client_errors, fallbacks, input_tokens, "
+                "output_tokens, latency_ms_total, paid_block_events) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(day, provider, model) DO UPDATE SET "
+                "requests=requests+1, successes=successes+?, failures=failures+?, "
+                "rate_limit_hits=rate_limit_hits+?, server_errors=server_errors+?, "
+                "client_errors=client_errors+?, fallbacks=fallbacks+?, "
+                "input_tokens=input_tokens+?, output_tokens=output_tokens+?, "
+                "latency_ms_total=latency_ms_total+?, paid_block_events=paid_block_events+?",
+                (
+                    day, provider, model,
+                    1 if result == "success" else 0, 1 if result == "failure" else 0,
+                    1 if error_class in {"rate_limited", "quota_exhausted"} else 0,
+                    1 if error_class in {"server", "transient"} else 0,
+                    1 if error_class in {"auth", "bad_request", "model_unavailable", "billing_required"} else 0,
+                    1 if int(record.get("route_position") or 0) > 0 else 0,
+                    int(record.get("actual_input_tokens") or 0),
+                    int(record.get("actual_output_tokens") or 0),
+                    int(record.get("latency_ms") or 0),
+                    1 if error_class == "billing_required" else 0,
+                    1 if result == "success" else 0, 1 if result == "failure" else 0,
+                    1 if error_class in {"rate_limited", "quota_exhausted"} else 0,
+                    1 if error_class in {"server", "transient"} else 0,
+                    1 if error_class in {"auth", "bad_request", "model_unavailable", "billing_required"} else 0,
+                    1 if int(record.get("route_position") or 0) > 0 else 0,
+                    int(record.get("actual_input_tokens") or 0),
+                    int(record.get("actual_output_tokens") or 0),
+                    int(record.get("latency_ms") or 0),
+                    1 if error_class == "billing_required" else 0,
+                ),
+            )
+            return row_id
+
+    async def ai_usage_today_count(self, provider: str, *, day: str | None = None) -> int:
+        day = day or utc_now()[:10]
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT COALESCE(SUM(requests),0) FROM ai_usage_daily WHERE day=? AND provider=?",
+                (day, provider),
+            )
+            row = await cursor.fetchone()
+            return int(row[0] or 0)
+
+    async def ai_usage_summary(self, *, days: int = 7) -> list[dict[str, Any]]:
+        cutoff = utc_now()[:10]
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT day, provider, model, requests, successes, failures, rate_limit_hits, "
+                "server_errors, fallbacks, input_tokens, output_tokens, latency_ms_total, "
+                "paid_block_events FROM ai_usage_daily WHERE day >= date(?, ?) "
+                "ORDER BY day DESC, provider",
+                (cutoff, f"-{max(1, int(days))} days"),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def ai_usage_recent(
+        self, *, limit: int = 20, provider: str | None = None, failures_only: bool = False
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM ai_usage_records WHERE 1=1"
+        params: list = []
+        if provider:
+            query += " AND provider=?"
+            params.append(provider)
+        if failures_only:
+            query += " AND result='failure'"
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        async with self._lock:
+            cursor = await self._db().execute(query, tuple(params))
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def ai_usage_metrics(self, *, days: int = 1) -> dict[str, Any]:
+        cutoff = utc_now()[:10]
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT COUNT(*) AS n, SUM(CASE WHEN result='success' THEN 1 ELSE 0 END) AS ok, "
+                "SUM(CASE WHEN result='failure' THEN 1 ELSE 0 END) AS bad, "
+                "SUM(CASE WHEN error_class IN ('rate_limited','quota_exhausted') THEN 1 ELSE 0 END) AS rl, "
+                "SUM(CASE WHEN error_class IN ('server','transient') THEN 1 ELSE 0 END) AS srv, "
+                "SUM(actual_input_tokens), SUM(actual_output_tokens), SUM(total_tokens), "
+                "SUM(latency_ms), SUM(CASE WHEN route_position>0 THEN 1 ELSE 0 END) AS fb "
+                "FROM ai_usage_records WHERE created_at >= datetime(?, ?)",
+                (f"{cutoff}T00:00:00", f"-{max(1, int(days))} days"),
+            )
+            row = await cursor.fetchone()
+            keys = ["requests", "successes", "failures", "rate_limited", "server_errors",
+                    "input_tokens", "output_tokens", "total_tokens", "latency_ms_total", "fallbacks"]
+            return {k: int(row[i] or 0) for i, k in enumerate(keys)}
+
+    async def ai_usage_latency_p95(self, *, days: int = 1) -> int:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT latency_ms FROM ai_usage_records WHERE latency_ms IS NOT NULL "
+                "AND created_at >= datetime(?, ?) ORDER BY latency_ms",
+                (utc_now(), f"-{max(1, int(days)) * 24} hours"),
+            )
+            values = [int(r[0]) for r in await cursor.fetchall() if r[0] is not None]
+        if not values:
+            return 0
+        index = min(len(values) - 1, int(len(values) * 0.95))
+        return values[index]
+
+    # -- quota snapshots ---------------------------------------------------------
+
+    async def ai_quota_upsert(
+        self,
+        provider: str,
+        credential_id: int | None,
+        model: str,
+        window: str,
+        remaining: str | None,
+        reset_at: str | None,
+        *,
+        source: str = "headers",
+    ) -> None:
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "INSERT INTO ai_quota_snapshots (provider, credential_id, model, window, remaining, "
+                "reset_at, observed_at, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(provider, credential_id, model, window) DO UPDATE SET "
+                "remaining=excluded.remaining, reset_at=excluded.reset_at, "
+                "observed_at=excluded.observed_at, source=excluded.source",
+                (provider, credential_id, model or "", window, remaining, reset_at, utc_now(), source),
+            )
+
+    async def ai_usage_daily_delete_provider_day(
+        self, provider: str, *, day: str | None = None
+    ) -> int:
+        """Operator reset of one provider's daily counters (quota gates)."""
+        day = day or utc_now()[:10]
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "DELETE FROM ai_usage_daily WHERE provider=? AND day=?", (provider, day)
+            )
+        return int(cursor.rowcount or 0)
+
+    async def ai_usage_daily_delete_model(
+        self, provider: str, model: str, *, day: str | None = None
+    ) -> int:
+        day = day or utc_now()[:10]
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "DELETE FROM ai_usage_daily WHERE provider=? AND model=? AND day=?",
+                (provider, model, day),
+            )
+        return int(cursor.rowcount or 0)
+
+    async def ai_quota_latest(self, provider: str) -> list[dict[str, Any]]:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM ai_quota_snapshots WHERE provider=? ORDER BY observed_at DESC LIMIT 20",
+                (provider,),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    # -- event log (admin Logs panel) ----------------------------------------------
+
+    async def ai_event_insert(self, event: dict[str, Any], *, prune_to: int = 2000) -> None:
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "INSERT INTO ai_events (created_at, level, event, service, provider, canonical, "
+                "model, request_type, route_position, http_status, latency_ms, error_class, "
+                "detail, job_id, check_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    event.get("created_at") or utc_now(), str(event.get("level") or "info"),
+                    str(event.get("event") or ""), str(event.get("service") or "notes"),
+                    event.get("provider"), event.get("canonical"), event.get("model"),
+                    event.get("request_type"), event.get("route_position"),
+                    event.get("http_status"), event.get("latency_ms"),
+                    event.get("error_class"), (event.get("detail") or "")[:400],
+                    event.get("job_id"), event.get("check_type"),
+                ),
+            )
+            if prune_to:
+                await db.execute(
+                    "DELETE FROM ai_events WHERE id NOT IN "
+                    "(SELECT id FROM ai_events ORDER BY id DESC LIMIT ?)",
+                    (int(prune_to),),
+                )
+
+    async def ai_events_list(
+        self, *, limit: int = 30, provider: str | None = None, event: str | None = None
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM ai_events WHERE 1=1"
+        params: list = []
+        if provider:
+            query += " AND provider=?"
+            params.append(provider)
+        if event:
+            query += " AND event=?"
+            params.append(event)
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
+        async with self._lock:
+            cursor = await self._db().execute(query, tuple(params))
+            return [dict(row) for row in await cursor.fetchall()]
+

@@ -31,6 +31,29 @@ python -m scripts.validate_docx --render    # DOCX structure + offline pages
 secret-free). The `📜 گزارش مدیر` panel shows the admin audit log and the usage
 ledger.
 
+### AI provider platform operations
+
+* `🤖 پلتفرم AI` in the admin panel (`admin:ai`) manages the multi-provider
+  note generation layer: provider cards, key wizard (key message is deleted
+  before storage), route order, usage counters, model catalog, structured
+  event log, and a secret-free **dry-run** request preview.
+* Free-tier safety is the default: `AI_FREE_ONLY=true` never routes to paid
+  providers — blocked attempts are logged as `billing_blocked`/quota events,
+  never silently charged. `AI_ALLOW_PAID_FALLBACK=true` appends paid legs
+  **after** all free legs only.
+* Quota incidents: 429 responses put the credential in cooldown and the
+  router fails over to the next leg; the operator can reset a provider's
+  daily counters from `پلتفرم AI → مصرف → بازنشانی شمارندهٔ امروز`.
+* Model catalogs sync from the providers' `/models` endpoints with a TTL
+  (`AI_PROVIDER_SYNC_TTL`, default 24 h), manual trigger available per
+  provider. Disappeared models are deactivated, never deleted.
+* Every 429/5xx is logged with provider, model, status, attempt, latency,
+  retry delay, route position and credential label — actionable without
+  secrets. See [docs/AI_PROVIDERS.md](AI_PROVIDERS.md).
+* Benchmark: `python -m scripts.benchmark_notes --router` prints the planned
+  failover chain with per-leg token/character budgets (no network calls);
+  `--live` still scores the configured provider's real output.
+
 ## Logs
 
 `LOG_FORMAT=json` emits one structured object per line with a job identifier.
