@@ -56,6 +56,20 @@ class NoteProviderProfile:
     requests_per_minute: int = 0
     tokens_per_minute: int = 0
     policy: RequestPolicy = RequestPolicy()
+    #: Non-token metering (spec §17). Some providers meter inference in their
+    #: own unit (Cloudflare Workers AI bills "Neurons", covering tokens, image
+    #: tiles, audio minutes and generation steps alike) and never return that
+    #: unit in an API response, so Gamas estimates it locally to protect the
+    #: documented daily inclusion. ``""`` means the provider meters in tokens.
+    metering_unit: str = ""
+    #: Conservative units per 1,000 tokens. Deliberately an *over*-estimate:
+    #: under-counting would let a job silently cross the free allocation, while
+    #: over-counting only makes Gamas fail over earlier than strictly needed.
+    #: 0 = not applicable (token-metered provider).
+    metering_units_per_1k_tokens: float = 0.0
+    #: Included units per day for a free account. Last-reviewed hint; the admin
+    #: can correct the per-deployment value in ``ai_provider_settings``.
+    included_units_per_day: int = 0
 
     def with_policy(self, policy: RequestPolicy) -> "NoteProviderProfile":
         from dataclasses import replace
@@ -137,6 +151,13 @@ DEFAULT_PROFILES: dict[str, NoteProviderProfile] = {
         chunk_token_budget=4000,
         max_output_tokens=8000,
     ),
+    # Workers AI meters Neurons, not tokens, and its OpenAI-compatible endpoint
+    # returns token usage only. The daily inclusion (10,000 Neurons/day, last
+    # verified 2026-10-09) is shared across every modality and is plan scoped,
+    # so Gamas estimates neuron spend conservatively and stops before it.
+    # 25 Neurons/1K tokens is the top of the observed range for large text
+    # models and is therefore an over-estimate for smaller ones; it is a
+    # reviewed hint, not a provider-published per-model rate.
     "cloudflare": NoteProviderProfile(
         provider="cloudflare",
         chunk_token_budget=1800,
@@ -145,6 +166,9 @@ DEFAULT_PROFILES: dict[str, NoteProviderProfile] = {
         outline_enabled=False,
         repair_enabled=False,
         final_compile_enabled=False,
+        metering_unit="neurons",
+        metering_units_per_1k_tokens=25.0,
+        included_units_per_day=10_000,
     ),
     "huggingface": NoteProviderProfile(
         provider="huggingface",

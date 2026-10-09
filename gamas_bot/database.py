@@ -2047,8 +2047,9 @@ class Database:
                     "INSERT INTO ai_models (provider, model, display_name, context_window, "
                     "max_output_tokens, capabilities_json, free_status, free_until, "
                     "commercial_use_allowed, region_restriction, deprecated, deprecation_date, "
-                    "available, source, source_last_verified_at, quality_score, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "available, free_endpoint, source, source_last_verified_at, quality_score, "
+                    "created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(provider, model) DO UPDATE SET "
                     "display_name=excluded.display_name, "
                     "context_window=CASE WHEN excluded.context_window>0 THEN excluded.context_window "
@@ -2058,6 +2059,8 @@ class Database:
                     "capabilities_json=excluded.capabilities_json, "
                     "free_status=excluded.free_status, free_until=excluded.free_until, "
                     "available=1, deprecated=0, "
+                    "free_endpoint=CASE WHEN excluded.free_endpoint=1 THEN 1 "
+                    "  ELSE ai_models.free_endpoint END, "
                     "source=excluded.source, source_last_verified_at=excluded.source_last_verified_at, "
                     "updated_at=excluded.updated_at",
                     (
@@ -2067,6 +2070,7 @@ class Database:
                         row.get("free_until"), int(row.get("commercial_use_allowed", 1)),
                         row.get("region_restriction") or "", int(row.get("deprecated", 0)),
                         row.get("deprecation_date"), int(row.get("available", 1)),
+                        int(row.get("free_endpoint", 0)),
                         row.get("source") or "live", row.get("source_last_verified_at") or now,
                         row.get("quality_score"), now, now,
                     ),
@@ -2102,6 +2106,39 @@ class Database:
                 (date, utc_now(), provider, model),
             )
 
+    async def ai_model_set_requires_paid_billing(
+        self, provider: str, model: str, *, required: bool
+    ) -> None:
+        """Mark a model as needing a billable plan (spec §17).
+
+        Some catalogs (Cloudflare Workers AI in particular) list frontier
+        models that cannot run on the free allocation at all. Flagging them
+        here makes FREE_ONLY reject the model instead of discovering the
+        restriction through a 402/429 after the quota is already spent.
+        """
+        import json as _json
+
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT capabilities_json FROM ai_models WHERE provider=? AND model=?",
+                (provider, model),
+            )
+            row = await cursor.fetchone()
+            current: dict = {}
+            if row and row[0]:
+                try:
+                    loaded = _json.loads(row[0])
+                    if isinstance(loaded, dict):
+                        current = loaded
+                except (ValueError, TypeError):
+                    current = {}
+            current["requires_paid_billing"] = bool(required)
+            await db.execute(
+                "UPDATE ai_models SET capabilities_json=?, updated_at=? "
+                "WHERE provider=? AND model=?",
+                (_json.dumps(current, sort_keys=True), utc_now(), provider, model),
+            )
+
     async def ai_model_set_quality(self, provider: str, model: str, score: float) -> None:
         async with self._transaction(immediate=True) as db:
             await db.execute(
@@ -2128,7 +2165,24 @@ class Database:
     async def ai_provider_settings_upsert(
         self, provider: str, *, admin_id: int | None = None, **fields
     ) -> None:
-        allowed = {"enabled", "free_only_blocked", "experimental_unlocked", "plan_label", "notes"}
+        allowed = {
+            "enabled",
+            "free_only_blocked",
+            "experimental_unlocked",
+            "plan_label",
+            "notes",
+            # migration 008: account entitlement, extra-pass overrides,
+            # non-token metering budget and region/quota metadata.
+            "account_entitlement_attested_at",
+            "account_entitlement_attested_by_admin_id",
+            "outline_enabled",
+            "repair_enabled",
+            "final_compile_enabled",
+            "neuron_budget_daily",
+            "region",
+            "deployment_scope",
+            "quota_expires_at",
+        }
         columns = [name for name in fields if name in allowed]
         if not columns:
             return
@@ -2204,8 +2258,8 @@ class Database:
                 "job_id, submission_id, latency_ms, http_status, estimated_input_tokens, "
                 "estimated_output_tokens, actual_input_tokens, actual_output_tokens, total_tokens, "
                 "finish_reason, retry_after_seconds, quota_headers_json, json_strategy, result, "
-                "error_class, free_class, request_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "error_class, free_class, request_id, neurons_estimated) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.get("created_at") or utc_now(), record.get("finished_at") or utc_now(),
                     str(record.get("service") or "notes"), str(record.get("provider") or ""),
@@ -2222,6 +2276,7 @@ class Database:
                     record.get("quota_headers_json"), record.get("json_strategy"),
                     str(record.get("result") or "unknown"), record.get("error_class"),
                     record.get("free_class") or "unknown", record.get("request_id"),
+                    record.get("neurons_estimated"),
                 ),
             )
             row_id = int(cursor.lastrowid)
@@ -2234,14 +2289,15 @@ class Database:
             await db.execute(
                 "INSERT INTO ai_usage_daily (day, provider, model, requests, successes, failures, "
                 "rate_limit_hits, server_errors, client_errors, fallbacks, input_tokens, "
-                "output_tokens, latency_ms_total, paid_block_events) "
-                "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "output_tokens, latency_ms_total, paid_block_events, neurons_estimated) "
+                "VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(day, provider, model) DO UPDATE SET "
                 "requests=requests+1, successes=successes+?, failures=failures+?, "
                 "rate_limit_hits=rate_limit_hits+?, server_errors=server_errors+?, "
                 "client_errors=client_errors+?, fallbacks=fallbacks+?, "
                 "input_tokens=input_tokens+?, output_tokens=output_tokens+?, "
-                "latency_ms_total=latency_ms_total+?, paid_block_events=paid_block_events+?",
+                "latency_ms_total=latency_ms_total+?, paid_block_events=paid_block_events+?, "
+                "neurons_estimated=neurons_estimated+?",
                 (
                     day, provider, model,
                     1 if result == "success" else 0, 1 if result == "failure" else 0,
@@ -2253,6 +2309,7 @@ class Database:
                     int(record.get("actual_output_tokens") or 0),
                     int(record.get("latency_ms") or 0),
                     1 if error_class == "billing_required" else 0,
+                    int(record.get("neurons_estimated") or 0),
                     1 if result == "success" else 0, 1 if result == "failure" else 0,
                     1 if error_class in {"rate_limited", "quota_exhausted"} else 0,
                     1 if error_class in {"server", "transient"} else 0,
@@ -2262,6 +2319,7 @@ class Database:
                     int(record.get("actual_output_tokens") or 0),
                     int(record.get("latency_ms") or 0),
                     1 if error_class == "billing_required" else 0,
+                    int(record.get("neurons_estimated") or 0),
                 ),
             )
             return row_id
@@ -2310,6 +2368,24 @@ class Database:
                 "SELECT COALESCE(SUM(COALESCE(NULLIF(actual_input_tokens,0), estimated_input_tokens,0) "
                 "+ COALESCE(NULLIF(actual_output_tokens,0), estimated_output_tokens,0)),0) "
                 "FROM ai_usage_records WHERE COALESCE(NULLIF(canonical,''),provider)=? "
+                "AND created_at>=? AND created_at<?",
+                (canonical, f"{day}T00:00:00", f"{next_day}T00:00:00"),
+            )
+            row = await cursor.fetchone()
+            return int(row[0] or 0)
+
+    async def ai_usage_today_units(self, canonical: str, *, day: str | None = None) -> int:
+        """Estimated provider units (e.g. Neurons) consumed today.
+
+        Only rows that carry an estimate are counted, so a token-metered
+        provider reads zero and never trips the unit guard.
+        """
+        day = day or utc_now()[:10]
+        next_day = (datetime.fromisoformat(day) + timedelta(days=1)).date().isoformat()
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT COALESCE(SUM(neurons_estimated),0) FROM ai_usage_records "
+                "WHERE COALESCE(NULLIF(canonical,''),provider)=? "
                 "AND created_at>=? AND created_at<?",
                 (canonical, f"{day}T00:00:00", f"{next_day}T00:00:00"),
             )
@@ -2523,8 +2599,23 @@ class Database:
                 )
 
     async def ai_events_list(
-        self, *, limit: int = 30, provider: str | None = None, event: str | None = None
+        self,
+        *,
+        limit: int = 30,
+        provider: str | None = None,
+        event: str | None = None,
+        model: str | None = None,
+        request_type: str | None = None,
+        error_class: str | None = None,
+        job_id: str | None = None,
+        since: str | None = None,
+        http_status: int | None = None,
     ) -> list[dict[str, Any]]:
+        """Structured-log query for the admin Logs panel (spec §35).
+
+        Every filter is metadata-only: the table never stores prompts,
+        transcripts, model output or secrets, so no filter can surface them.
+        """
         query = "SELECT * FROM ai_events WHERE 1=1"
         params: list = []
         if provider:
@@ -2533,6 +2624,30 @@ class Database:
         if event:
             query += " AND event=?"
             params.append(event)
+        if model:
+            query += " AND model=?"
+            params.append(model)
+        if request_type:
+            query += " AND request_type=?"
+            params.append(request_type)
+        if error_class:
+            query += " AND error_class=?"
+            params.append(error_class)
+        if job_id:
+            query += " AND job_id=?"
+            params.append(job_id)
+        if since:
+            query += " AND created_at>=?"
+            params.append(since)
+        if http_status is not None:
+            # Status-class filter: 400 -> 4xx, 502 -> that exact status.
+            if http_status < 100:
+                low, high = http_status * 100, http_status * 100 + 99
+                query += " AND http_status>=? AND http_status<=?"
+                params.extend([low, high])
+            else:
+                query += " AND http_status=?"
+                params.append(http_status)
         query += " ORDER BY id DESC LIMIT ?"
         params.append(max(1, int(limit)))
         async with self._lock:

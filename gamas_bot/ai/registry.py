@@ -94,6 +94,18 @@ class ProviderInfo:
     model_discovery: bool = True
     #: Must an admin explicitly enable this provider before any routing?
     requires_explicit_enable: bool = False
+    #: The provider publishes rate limits but no documented no-charge production
+    #: entitlement, so free eligibility is a property of the *account*, which
+    #: Gamas cannot read from documentation. FREE_ONLY routing stays blocked
+    #: until an administrator attests this deployment's account (see
+    #: ``account_entitlement_attested_at`` in ``ai_provider_settings``).
+    requires_account_verification: bool = False
+    #: Metering unit when the provider does not bill in tokens
+    #: (e.g. Cloudflare Workers AI "Neurons"). Empty = tokens.
+    metering_unit: str = ""
+    #: Included units per day for a free account when the provider documents one.
+    #: 0 = not published / not applicable. Last-reviewed hint only.
+    included_units_per_day: int = 0
     #: Region/API restriction note (empty = none).
     region_restriction: str = ""
     #: Show as "experimental" in the admin panel and never auto-route.
@@ -177,6 +189,11 @@ _GROQ = ProviderInfo(
     generation_allowed_in_free_only=False,
     quota_can_become_paid=True,
     exposes_quota_headers=True,
+    # Groq's official rate-limit page states that the published table is the
+    # base limit set for the Developer plan; it does not document a no-charge
+    # production entitlement. The account's billing state is therefore a fact
+    # only the operator can attest, so FREE_ONLY stays blocked until then.
+    requires_account_verification=True,
 )
 
 _OPENROUTER = ProviderInfo(
@@ -329,6 +346,11 @@ _CLOUDFLARE = ProviderInfo(
     generation_allowed_in_free_only=True,
     quota_can_become_paid=True,
     exposes_quota_headers=False,
+    # Workers AI meters every modality in Neurons, not tokens, and the OpenAI
+    # compatible endpoint does not return a neuron count. Gamas estimates
+    # neuron spend locally so the documented daily inclusion can be protected.
+    metering_unit="neurons",
+    included_units_per_day=10_000,
 )
 
 _HUGGINGFACE = ProviderInfo(

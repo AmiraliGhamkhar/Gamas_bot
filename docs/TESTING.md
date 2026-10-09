@@ -5,14 +5,14 @@
 ```bash
 python -m compileall -q gamas_bot scripts tests passenger_wsgi.py
 ruff check .                      # config in pyproject.toml
-python -m pytest -q               # latest local run: 867 passed, 1 skipped, 1,786 subtests, ~90 s
+python -m pytest -q               # latest local run: 923 passed, 1 skipped, 1,786 subtests, ~90 s
 python -m pip check
 python -m scripts.sync_requirements --check
 ```
 
 `.github/workflows/tests.yml` runs the suite on Python 3.11, 3.12 and 3.13,
 through both `pytest` and `unittest discover` (the entry point deployments use).
-The latest local `unittest discover -s tests` run executed 868 tests with one
+The latest local `unittest discover -s tests` run executed 924 tests with one
 skip and passed. Counts are snapshots; update them when the suite changes.
 
 ## What the suite is organised around
@@ -28,6 +28,7 @@ dedicated files:
 | Presentations and legacy `.ppt` | `test_presentations.py`, `test_bot_presentation_flow.py` |
 | STT providers, retries, fallback | `test_provider_contracts.py`, `test_provider_robustness.py` |
 | AI provider registry, routing, quota guards, legacy compatibility, secret hygiene | `test_ai_platform.py`, `test_ai_schema_compat.py` |
+| Account entitlement, extra-pass overrides, Neuron metering, NVIDIA endpoint lifecycle, log filters, admin panels | `test_provider_platform_gaps.py` |
 | Per-provider request/response contracts | `test_provider_adapters.py` |
 | Provider credentials and health | `test_provider_credentials.py`, `test_provider_health.py` |
 | Telegram AI administration and billing attestation | `test_admin_ai.py` |
@@ -55,6 +56,7 @@ python -m scripts.benchmark_notes --live                # calls configured AI pr
 python -m scripts.benchmark_stt audio.mp3                # per-provider STT latency
 python -m scripts.benchmark_queue                       # bounded-queue load, 1..50 jobs
 python -m scripts.validate_docx --render                 # structure + offline page render
+python -m scripts.validate_provider_platform   # offline AI platform validation, no API key
 ```
 
 `benchmark_notes` reports compression ratio, number/term signal coverage and
@@ -64,6 +66,17 @@ ratio is never a failure by itself—it is read together with coverage. The
 `--router` profile is an offline dry-run of the free-first route, skip reasons,
 and per-provider chunk/output budgets. Only `--live` makes provider calls; do
 not run it without explicit billable-test approval and an attested key.
+
+`validate_provider_platform` is the AI-platform counterpart of `validate_docx`:
+it drives the real `structure_transcript` pipeline against scripted provider
+responses and asserts the promises that matter before free-tier traffic is
+trusted — the legacy NaraRouter configuration still produces notes with the
+unchanged 22,000-character budget, a restrictive free provider gets a smaller
+token-derived chunk budget, a hard 429 fails over to the next provider and is
+accounted, `AI_FREE_ONLY` refuses a provider with an unverified account
+entitlement or an unverified model, paid legs stay last, backend diagnostics
+are scrubbed from student notes, and no secret or transcript reaches the log.
+Exit code is non-zero on any failed check.
 
 The offline DOCX benchmark deliberately runs with the static TOC disabled
 because exact page mapping needs the production renderer; static-TOC behaviour

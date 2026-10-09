@@ -8,6 +8,8 @@ here ever renders raw keys, prompts or transcripts.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import aiohttp
 from telethon import Button
 
@@ -29,10 +31,18 @@ from .ai.registry import (
 from .ai.sync import sync_provider_catalog
 from .ai.tokens import estimate_tokens
 from .ai.usage import sanitize_text
+from .database import utc_now
 from .provider_health import cooldown_remaining_seconds
 
 SERVICE = "notes"
 TASK = "chunk_structuring"
+
+#: Extra-pass override columns and their Persian labels (spec §26).
+_PASS_COLUMNS = {
+    "outline_enabled": "طرح کلی",
+    "repair_enabled": "تعمیر",
+    "final_compile_enabled": "تلفیق نهایی",
+}
 
 _CLASS_FA = {
     ProviderClass.PERMANENT_FREE: "رایگان دائمی",
@@ -64,6 +74,23 @@ def _fmt_int(value) -> str:
         return f"{int(value):,}".replace(",", "/")
     except Exception:
         return str(value)
+
+
+def _requires_paid_billing(row: dict) -> bool:
+    """Read the ``requires_paid_billing`` capability from a catalog row.
+
+    The column is a JSON blob, so the panel degrades to "not billable" when a
+    row predates the capability or carries malformed JSON — never to a guess.
+    """
+    caps = row.get("capabilities") or row.get("capabilities_json") or {}
+    if isinstance(caps, str):
+        import json as _json
+
+        try:
+            caps = _json.loads(caps)
+        except ValueError:
+            return False
+    return bool((caps or {}).get("requires_paid_billing"))
 
 
 class AIPanels:
@@ -111,6 +138,10 @@ class AIPanels:
             [
                 Button.inline("📈 نمای مسیر و بودجه", b"admin:ai:plan"),
                 Button.inline("🏆 ارزیابی", b"admin:ai:bm"),
+            ],
+            [
+                Button.inline("🩺 سلامت", b"admin:ai:he"),
+                Button.inline("⚙️ تنظیمات", b"admin:ai:st"),
             ],
             [
                 Button.inline("🔑 کلیدها (قدیمی)", b"admin:credentials"),
@@ -185,6 +216,60 @@ class AIPanels:
                 f"• حسابگر روزانه: {used} مصرف‌شده | {remaining} باقی‌مانده"
                 f" (سقف پیش‌فرض {limit}) | بازنشانی ۰۰:۰۰ UTC"
             )
+        # Non-token metering (spec §17): Cloudflare bills Neurons and never
+        # returns them, so the daily inclusion is guarded from an estimate.
+        unit_lines: list[str] = []
+        if profile.metering_unit:
+            budget = await self.bot.provider_router._unit_budget(slug, profile)
+            try:
+                used_units = await db.ai_usage_today_units(slug)
+            except Exception:
+                used_units = 0
+            unit_lines.append(
+                f"• {profile.metering_unit}: برآورد امروز {_fmt_int(used_units)}"
+                + (f" از {_fmt_int(budget)}" if budget else "")
+                + " (برآورد محافظه‌کارانه)"
+            )
+        # Catalog-derived plan view (spec §10/§12): what the last sync saw.
+        catalog_lines: list[str] = []
+        try:
+            catalog = await db.ai_models_list(slug, include_unavailable=False)
+        except Exception:
+            catalog = []
+        if catalog:
+            free_models = [
+                row
+                for row in catalog
+                if str(row.get("free_status")) in {"free_permanent", "free_plan"}
+            ]
+            verified = str(catalog[0].get("source_last_verified_at") or "")[:16]
+            catalog_lines.append(
+                f"• کاتالوگ: {len(catalog)} مدل | رایگانِ احراز‌شده: {len(free_models)}"
+            )
+            if free_models:
+                catalog_lines.append(f"• مدل رایگان فعلی: {free_models[0]['model']}")
+                # OpenRouter/Nara IDs carry the upstream provider as a prefix.
+                upstream = str(free_models[0]["model"]).split("/", 1)[0]
+                if "/" in str(free_models[0]["model"]) and upstream != free_models[0]["model"]:
+                    catalog_lines.append(f"• ارائه‌دهندهٔ پشت مدل: {upstream}")
+            if verified:
+                catalog_lines.append(f"• آخرین تأیید کاتالوگ: {verified}")
+        # Extra-pass policy with its origin (spec §26). Computed for *this*
+        # provider, independently of which provider currently leads the route,
+        # so the panel never shows another provider's policy.
+        pass_lines: list[str] = []
+        for column, fa in (
+            ("outline_enabled", "طرح کلی"),
+            ("repair_enabled", "تعمیر"),
+            ("final_compile_enabled", "تلفیق نهایی"),
+        ):
+            default = getattr(profile, column, True)
+            override = stored.get(column)
+            enabled = default if override is None else bool(override)
+            pass_lines.append(
+                f"• {fa}: {'روشن ✅' if enabled else 'خاموش ❌'}"
+                f" ({'تنظیم مدیر' if override is not None else 'پیش‌فرض ارائه‌دهنده'})"
+            )
         lines = [
             f"{info.display_name}",
             "",
@@ -207,6 +292,33 @@ class AIPanels:
             lines.append("")
             lines.append("سهمیهٔ رصدشده (آخرین تصویر):")
             lines.extend(quota_lines)
+        if unit_lines:
+            lines.append("")
+            lines.append(f"مصرف برآوردی {profile.metering_unit}:")
+            lines.extend(unit_lines)
+        if catalog_lines:
+            lines.append("")
+            lines.append("کاتالوگ زنده (spec §10/§12):")
+            lines.extend(catalog_lines)
+        if pass_lines:
+            lines.append("")
+            lines.append("فراخوان‌های اضافی (هر کدام سهمیه مصرف می‌کنند):")
+            lines.extend(pass_lines)
+        if info.requires_account_verification:
+            attested = bool(stored.get("account_entitlement_attested_at")) and (
+                stored.get("account_entitlement_attested_by_admin_id") is not None
+            )
+            lines.append("")
+            lines.append("⚠️ استحقاق حساب:")
+            if attested:
+                lines.append(
+                    f"• تأییدشده توسط مدیر {stored.get('account_entitlement_attested_by_admin_id')}"
+                    f" در {str(stored.get('account_entitlement_attested_at'))[:16]}"
+                )
+                lines.append("• این ارائه‌دهنده در مسیر FREE_ONLY شرکت می‌کند.")
+            else:
+                lines.append("• مستندات این ارائه‌دهنده استحقاق رایگان حساب را اثبات نمی‌کند.")
+                lines.append("• تا زمان تأیید مدیر، در FREE_ONLY مسیردهی نمی‌شود.")
         buttons = [
             [
                 Button.inline(
@@ -228,6 +340,36 @@ class AIPanels:
                     )
                 ]
             )
+        if info.requires_account_verification:
+            attested = bool(stored.get("account_entitlement_attested_at")) and (
+                stored.get("account_entitlement_attested_by_admin_id") is not None
+            )
+            buttons.append(
+                [
+                    Button.inline(
+                        "🧾 لغو تأیید استحقاق" if attested else "🧾 تأیید استحقاق حساب",
+                        f"admin:ai:patt:{slug}".encode("ascii"),
+                    )
+                ]
+            )
+        # Extra-pass overrides (spec §26): one row of three toggles.
+        pass_row: list = []
+        for column, fa in (
+            ("outline_enabled", "طرح‌کلی"),
+            ("repair_enabled", "تعمیر"),
+            ("final_compile_enabled", "تلفیق"),
+        ):
+            default = getattr(profile, column, True)
+            override = stored.get(column)
+            enabled = default if override is None else bool(override)
+            mark = "✅" if enabled else "❌"
+            pass_row.append(
+                Button.inline(
+                    f"{mark} {fa}",
+                    f"admin:ai:ppass:{column}:{slug}".encode("ascii"),
+                )
+            )
+        buttons.append(pass_row)
         buttons.extend(
             [
                 [
@@ -269,6 +411,87 @@ class AIPanels:
             details={"value": new_value},
         )
         await event.answer(f"{label} {'روشن' if new_value else 'خاموش'} شد.")
+        await self.show_provider_detail(event, slug)
+
+    async def _toggle_account_entitlement(self, event, slug: str) -> None:
+        """Attest or revoke this deployment's free-account entitlement.
+
+        Only meaningful for providers whose free eligibility is a property of
+        the account rather than of published documentation. The attestation is
+        an administrator statement, is audited, and is revocable; it does not
+        relax the per-key billing attestation or the model-level gates.
+        """
+        if slug not in PROVIDER_REGISTRY:
+            await event.answer("ارائه‌دهندهٔ نامعتبر.", alert=True)
+            return
+        if not registry_info(slug).requires_account_verification:
+            await event.answer("این ارائه‌دهنده نیازی به تأیید حساب ندارد.", alert=True)
+            return
+        db = self.bot.db
+        stored = (await db.ai_provider_settings_get(slug)) or {}
+        attested = bool(stored.get("account_entitlement_attested_at")) and (
+            stored.get("account_entitlement_attested_by_admin_id") is not None
+        )
+        admin_id = int((await event.get_sender()).id)
+        if attested:
+            await db.ai_provider_settings_upsert(
+                slug,
+                admin_id=admin_id,
+                account_entitlement_attested_at=None,
+                account_entitlement_attested_by_admin_id=None,
+            )
+        else:
+            await db.ai_provider_settings_upsert(
+                slug,
+                admin_id=admin_id,
+                account_entitlement_attested_at=utc_now(),
+                account_entitlement_attested_by_admin_id=admin_id,
+            )
+        self.bot.provider_router.invalidate_cache()
+        await db.add_audit_entry(
+            admin_id=admin_id,
+            action="ai_provider_account_entitlement_revoked"
+            if attested
+            else "ai_provider_account_entitlement_attested",
+            target_type="ai_provider",
+            target_id=slug,
+            details={"attested": not attested},
+        )
+        await event.answer(
+            "تأیید استحقاق لغو شد." if attested else "استحقاق حساب تأیید شد.", alert=True
+        )
+        await self.show_provider_detail(event, slug)
+
+    async def _toggle_pass(self, event, column: str, slug: str) -> None:
+        """Cycle one extra-pass override: inherit -> on -> off -> inherit."""
+        if slug not in PROVIDER_REGISTRY or column not in _PASS_COLUMNS:
+            await event.answer("درخواست نامعتبر.", alert=True)
+            return
+        db = self.bot.db
+        stored = (await db.ai_provider_settings_get(slug)) or {}
+        current = stored.get(column)
+        profile = profile_for(slug)
+        default = bool(getattr(profile, column, True))
+        # None (inherit) -> explicit opposite of the default -> explicit default
+        # -> back to inherit, so an admin can always return to "profile decides".
+        if current is None:
+            new_value = 0 if default else 1
+        elif bool(current) == default:
+            new_value = None
+        else:
+            new_value = 1 if default else 0
+        admin_id = int((await event.get_sender()).id)
+        await db.ai_provider_settings_upsert(slug, admin_id=admin_id, **{column: new_value})
+        self.bot.provider_router.invalidate_cache()
+        await db.add_audit_entry(
+            admin_id=admin_id,
+            action=f"ai_provider_{column}",
+            target_type="ai_provider",
+            target_id=slug,
+            details={"value": new_value},
+        )
+        label = {None: "پیش‌فرض", 1: "روشن", 0: "خاموش"}.get(new_value, "پیش‌فرض")
+        await event.answer(f"{_PASS_COLUMNS[column]}: {label}")
         await self.show_provider_detail(event, slug)
 
     # ----------------------------------------------------------------- keys
@@ -1027,20 +1250,59 @@ class AIPanels:
                 status.append("منسوخ")
             if not row.get("available", 1):
                 status.append("حذف‌شده از کاتالوگ")
+            if _requires_paid_billing(row):
+                status.append("نیازمند صورتحساب 💳")
             free_status = str(row.get("free_status") or "unknown")
             lines.append(
                 f"• #{row['id']} {row['model']} — {free_status}"
                 + (" (" + ", ".join(status) + ")" if status else "")
             )
             if not row.get("deprecated") and row.get("available", 1):
+                paid_billing = _requires_paid_billing(row)
                 buttons.append(
                     [
                         Button.inline(
-                            f"🗂 علامت‌گذاری منسوخ #{row['id']}",
+                            f"🗂 منسوخ #{row['id']}",
                             f"admin:ai:mdep:{row['id']}".encode("ascii"),
-                        )
+                        ),
+                        Button.inline(
+                            f"{'💳' if paid_billing else '🆓'} پولی #{row['id']}",
+                            f"admin:ai:mpaid:{row['id']}".encode("ascii"),
+                        ),
                     ]
                 )
+        # Replacement suggestions for dead models (spec §16): a route pointing
+        # at a withdrawn NVIDIA endpoint should offer a live alternative
+        # instead of silently failing over at request time.
+        from .ai.models import suggest_replacement
+
+        try:
+            live_catalog = await self.bot.provider_router.models.cached(slug)
+        except Exception:
+            live_catalog = []
+        for row in models[:14]:
+            if not (row.get("deprecated") or not row.get("available", 1)):
+                continue
+            replacement = suggest_replacement(live_catalog, str(row["model"]))
+            if replacement is None:
+                continue
+            lines.append(
+                f"  ↳ جایگزین پیشنهادی: {replacement.model_id}"
+                + (" (Free Endpoint)" if replacement.free_endpoint else "")
+            )
+        stored = (await db.ai_provider_settings_get(slug)) or {}
+        region_bits = [
+            f"{fa}: {stored[key]}"
+            for key, fa in (
+                ("region", "منطقه"),
+                ("deployment_scope", "محدودهٔ استقرار"),
+                ("quota_expires_at", "انقضای سهمیه"),
+            )
+            if stored.get(key)
+        ]
+        if region_bits:
+            lines.append("")
+            lines.append("محدودیت منطقه‌ای: " + " | ".join(region_bits))
         buttons.extend(
             [
                 [Button.inline("🔄 همگام‌سازی مدل‌ها", f"admin:ai:mdsync:{slug}".encode("ascii"))],
@@ -1074,6 +1336,44 @@ class AIPanels:
         await event.answer("مدل منسوخ علامت‌گذاری شد؛ از مسیر کنار گذاشته می‌شود.")
         await self.show_models(event, record["provider"])
 
+    async def _mark_paid_billing(self, event, model_id_text: str) -> None:
+        """Toggle whether a model needs a billable plan (spec §17).
+
+        Cloudflare and similar catalogs list frontier models that cannot run on
+        the free allocation. Marking one here makes FREE_ONLY reject it up
+        front instead of burning the daily quota discovering that the hard way.
+        """
+        try:
+            model_row_id = int(model_id_text)
+        except ValueError:
+            await event.answer("شناسهٔ مدل نامعتبر.", alert=True)
+            return
+        db = self.bot.db
+        record = await db.ai_models_get_by_id(model_row_id)
+        if not record:
+            await event.answer("مدل پیدا نشد.", alert=True)
+            return
+        new_value = not _requires_paid_billing(record)
+        admin_id = int((await event.get_sender()).id)
+        await db.ai_model_set_requires_paid_billing(
+            record["provider"], record["model"], required=new_value
+        )
+        await db.add_audit_entry(
+            admin_id=admin_id,
+            action="ai_model_requires_paid_billing",
+            target_type="ai_model",
+            target_id=str(model_row_id),
+            details={
+                "provider": record["provider"],
+                "model": record["model"],
+                "value": new_value,
+            },
+        )
+        await event.answer(
+            "مدل نیازمند صورتحساب شد." if new_value else "علامت صورتحساب برداشته شد."
+        )
+        await self.show_models(event, record["provider"])
+
     async def _sync_models(self, event, slug: str) -> None:
         if slug not in PROVIDER_REGISTRY:
             await event.answer("ارائه‌دهندهٔ نامعتبر.", alert=True)
@@ -1104,15 +1404,49 @@ class AIPanels:
 
     # ----------------------------------------------------------------- logs
     async def show_logs(
-        self, event, slug: str | None = None, event_name: str | None = None
+        self,
+        event,
+        slug: str | None = None,
+        event_name: str | None = None,
+        *,
+        status_class: int | None = None,
+        error_class: str | None = None,
+        job_id: str | None = None,
+        days: int = 0,
     ) -> None:
+        """Spec §35: logs filterable by provider/status/date/error type.
+
+        The panel never renders prompt text, transcripts, model output or
+        secrets — ``ai_events`` stores metadata only, by construction.
+        """
         db = self.bot.db
-        events = await db.ai_events_list(limit=14, provider=slug, event=event_name)
+        since = None
+        if days:
+            since = (
+                datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
+            ).isoformat(timespec="seconds")
+        events = await db.ai_events_list(
+            limit=14,
+            provider=slug,
+            event=event_name,
+            error_class=error_class,
+            job_id=job_id,
+            since=since,
+            http_status=status_class,
+        )
         title = "🧾 آخرین رویدادهای AI"
         if slug:
             title += f" — {slug}"
         if event_name:
             title += f" [{event_name}]"
+        if status_class:
+            title += f" | {status_class}xx" if status_class < 100 else f" | HTTP {status_class}"
+        if error_class:
+            title += f" | خطا: {error_class}"
+        if job_id:
+            title += f" | کار {job_id}"
+        if days:
+            title += f" | {days} روز"
         lines = [title, ""]
         if not events:
             lines.append("رویدادی با این فیلتر ثبت نشده است.")
@@ -1140,8 +1474,131 @@ class AIPanels:
                 Button.inline("Fallback", b"admin:ai:lgfilter:fb"),
                 Button.inline("429/Quota", b"admin:ai:lgfilter:rl"),
             ],
+            [
+                Button.inline("4xx", b"admin:ai:lgf:st4"),
+                Button.inline("5xx", b"admin:ai:lgf:st5"),
+                Button.inline("امروز", b"admin:ai:lgf:d1"),
+                Button.inline("۷ روز", b"admin:ai:lgf:d7"),
+            ],
+            [
+                Button.inline("⏱ تلاش مجدد", b"admin:ai:lgfilter:retry"),
+                Button.inline("🔁 تعمیر JSON", b"admin:ai:lgfilter:json"),
+            ],
             [Button.inline("↩️ پلتفرم AI", b"admin:ai")],
         ]
+        await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
+    async def _log_filter(self, event, token: str) -> None:
+        """Apply one compact log filter token (``st4``, ``st5``, ``d1``, …)."""
+        if token == "st4":
+            await self.show_logs(event, status_class=4)
+        elif token == "st5":
+            await self.show_logs(event, status_class=5)
+        elif token == "d1":
+            await self.show_logs(event, days=1)
+        elif token == "d7":
+            await self.show_logs(event, days=7)
+        else:
+            await self.show_logs(event)
+
+    # ---------------------------------------------------------------- health
+    async def show_health(self, event) -> None:
+        """Spec §35/§37: cheap, read-only health with explicit capability state.
+
+        Opening this panel never submits a generation request. It reuses the
+        existing cached read-only probes (model/catalog endpoints) and only
+        reports what the last probe already knew; an actual completion is only
+        sent by the separate per-key "test request" action, which is logged
+        with ``check_type='generation'``.
+        """
+        checker = getattr(self.bot, "health_checker", None)
+        results = []
+        if checker is not None:
+            try:
+                results = list(checker.cached())
+            except Exception:
+                results = []
+        lines = ["🩺 سلامت ارائه‌دهنده‌ها", ""]
+        if not results:
+            lines.append("هنوز نتیجهٔ بررسی‌ای در حافظه نیست.")
+            lines.append("بررسی‌ها فقط هنگام باز شدن پنل قدیمی سلامت یا تست دستی اجرا می‌شوند.")
+        for result in results[:12]:
+            if str(getattr(result, "service", "")) != SERVICE:
+                continue
+            http = f"HTTP {result.http_status}" if result.http_status else "HTTP —"
+            latency = f"{result.latency_ms}ms" if result.latency_ms else "—"
+            checked = str(result.checked_at or "")[:16] or "—"
+            lines.append(
+                f"• {result.provider} / {result.label or '—'}: {result.status_fa} ({http}, {latency})"
+            )
+            lines.append(f"  آخرین بررسی: {checked} | نوع: {result.check_type}")
+        lines.append("")
+        lines.append("🟢 سالم | 🟡 کاهش کیفیت | 🔴 محدود/خطا | ⛔ غیرفعال یا نیازمند صورتحساب")
+        lines.append("بررسی خودکار فقط خواندنی (read_only) است و هیچ تولیدی ارسال نمی‌کند.")
+        buttons = [
+            [Button.inline("🔄 بررسی تازه (فقط خواندنی)", b"admin:ai:herefresh")],
+            [Button.inline("↩️ پلتفرم AI", b"admin:ai")],
+        ]
+        await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
+    async def _health_refresh(self, event) -> None:
+        """Run the cached read-only probes once and redraw the panel."""
+        checker = getattr(self.bot, "health_checker", None)
+        if checker is None:
+            await event.answer("بررسی‌گر سلامت در دسترس نیست.", alert=True)
+            return
+        await event.answer("در حال بررسی فقط‌خواندنی…")
+        try:
+            results = await checker.check_all(force=True)
+        except Exception:
+            results = []
+        await self.bot.db.ai_event_insert(
+            {
+                "level": "info",
+                "event": "provider_health_checked",
+                "service": SERVICE,
+                "check_type": "read_only",
+                "detail": f"probes={len(results)}",
+            }
+        )
+        await self.show_health(event)
+
+    # -------------------------------------------------------------- settings
+    async def show_settings(self, event) -> None:
+        """Spec §35/§41: deployment switches, all read-only here by design."""
+        settings = self.bot.settings
+        lines = [
+            "⚙️ تنظیمات پلتفرم هوش مصنوعی",
+            "",
+            f"FREE_ONLY: {'روشن ✅' if settings.ai_free_only else 'خاموش ⛔'}",
+            f"Fallback پولی: {'روشن ⚠️' if settings.ai_allow_paid_fallback else 'خاموش ✅'}",
+            f"موتور مسیریاب: {'فعال' if settings.ai_routing_enabled else 'غیرفعال (legacy)'}",
+            f"حداکثر failover ارائه‌دهنده: {int(getattr(settings, 'ai_max_provider_failovers', 3))}",
+            f"حداکثر تلاش مجدد: {int(getattr(settings, 'ai_max_generation_retries', -1))}",
+            f"TTL همگام‌سازی کاتالوگ: {int(getattr(settings, 'ai_provider_sync_ttl', 86400))} ثانیه",
+            f"ضریب ایمنی سهمیه: {getattr(settings, 'ai_quota_safety_margin', 0.15)}",
+            "",
+            "این گزینه‌ها در سطح استقرار هستند و فقط با متغیرهای محیطی سرور تغییر می‌کنند؛",
+            "تغییر ناگهانی آن‌ها از پنل می‌تواند از سقف رایگان عبور کند.",
+        ]
+        stored = await self.bot.db.ai_provider_settings_all()
+        overrides = {k: v for k, v in (stored or {}).items() if v}
+        if overrides:
+            lines.append("")
+            lines.append("لغوهای ثبت‌شدهٔ مدیر:")
+            for slug, row in list(overrides.items())[:8]:
+                flags = []
+                if row.get("enabled") == 0:
+                    flags.append("غیرفعال")
+                if row.get("free_only_blocked"):
+                    flags.append("بلاک رایگان")
+                if row.get("experimental_unlocked"):
+                    flags.append("قفل آزمایشی باز")
+                if row.get("account_entitlement_attested_at"):
+                    flags.append("استحقاق تأییدشده")
+                if flags:
+                    lines.append(f"• {slug}: " + "، ".join(flags))
+        buttons = [[Button.inline("↩️ پلتفرم AI", b"admin:ai")]]
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
 
     # ------------------------------------------------------------- dry-run
@@ -1314,6 +1771,18 @@ async def handle_ai_callback(bot, event, data: str) -> None:
         await ui._toggle_provider(event, arg1, "free_only_blocked", "بلاک رایگان‌سازی")
     elif action == "pxun" and arg1:
         await ui._toggle_provider(event, arg1, "experimental_unlocked", "قفل آزمایشی")
+    elif action == "patt" and arg1:
+        await ui._toggle_account_entitlement(event, arg1)
+    elif action == "ppass" and arg1 and arg2:
+        await ui._toggle_pass(event, arg1, arg2)
+    elif action == "he":
+        await ui.show_health(event)
+    elif action == "herefresh":
+        await ui._health_refresh(event)
+    elif action == "st":
+        await ui.show_settings(event)
+    elif action == "lgf" and arg1:
+        await ui._log_filter(event, arg1)
     elif action == "ky" and arg1:
         await ui.show_provider_keys(event, arg1)
     elif action == "kstate" and arg1 and arg2:
@@ -1359,7 +1828,13 @@ async def handle_ai_callback(bot, event, data: str) -> None:
     elif action == "bm":
         await ui.show_benchmarks(event)
     elif action == "lgfilter" and arg1:
-        event_filter = {"err": "note_request_failed", "fb": "note_request_fallback", "rl": "provider_rate_limited"}.get(arg1)
+        event_filter = {
+            "err": "note_request_failed",
+            "fb": "note_request_fallback",
+            "rl": "provider_rate_limited",
+            "retry": "note_request_retry",
+            "json": "note_json_validation_failed",
+        }.get(arg1)
         await ui.show_logs(event, event_name=event_filter)
     elif action == "us" and arg1:
         try:
@@ -1377,6 +1852,8 @@ async def handle_ai_callback(bot, event, data: str) -> None:
         await ui.show_models(event)
     elif action == "mdep" and arg1:
         await ui._mark_deprecated(event, arg1)
+    elif action == "mpaid" and arg1:
+        await ui._mark_paid_billing(event, arg1)
     elif action == "mdsync" and arg1:
         await ui._sync_models(event, arg1)
     elif action == "lg" and arg1:

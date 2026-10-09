@@ -37,12 +37,80 @@ Provider plan and capability statements below were reviewed against provider-own
 
 The experimental providers HF, Alibaba, Cohere, and Cerebras remain registered for discovery, admin visibility, or benchmarking as appropriate; they are not silently inserted into a production FREE_ONLY route. NVIDIA is held out even when experimental settings are unlocked because the reviewed hosted terms are development-only and commercial-prohibited.
 
+## Account-entitlement attestation
+
+Some providers publish rate limits but **no documented no-charge production
+entitlement**. Groq is the current example: its official rate-limit page states
+that the published table is the base limit set for the *Developer* plan and
+does not describe a free tier. Whether a given account can be used at no charge
+is therefore a fact about that account, which Gamas cannot read from
+documentation.
+
+Those providers carry `requires_account_verification` in the registry and are
+blocked from `AI_FREE_ONLY` routes until an administrator attests them:
+
+**AI → provider → 🧾 تأیید استحقاق حساب**
+
+The attestation is stored per provider (`account_entitlement_attested_at` and
+`account_entitlement_attested_by_admin_id`) and is audited and revocable. It
+widens *which models may be considered* — models whose free status is
+undocumented rather than known-paid — and **never** relaxes:
+
+* the per-key billing attestation (a key must still be attested `free`),
+* terms-of-use, deprecation, region or `requires_paid_billing` gates,
+* the local request/token/unit quota ledger.
+
+Without both attestation fields the provider is skipped with
+`account_entitlement_unverified`, which is visible in the plan panel. This is
+the conservative default and it is intentional:Groq's official documentation
+does not establish free eligibility, so Gamas will not assert it on its own.
+
+## Extra-pass overrides
+
+The outline, QA-repair and final-compilation calls each cost free-tier quota on
+top of the chunk calls, so restrictive free providers default them off (Groq,
+OpenRouter, Cloudflare, Cohere, Cerebras). An administrator can override the
+default per provider:
+
+**AI → provider → ✅/❌ طرح‌کلی / تعمیر / تلفیق**
+
+The toggle cycles **inherit → explicit → inherit**, so an override can always
+be removed. The panel shows whether the current value came from the provider
+profile or from an administrator. `PlannedRoute.pass_state()` reports the same
+origin, and `NoteJobSession` proxies it, so every call site that can spend
+quota sees the same decision.
+
+## Non-token metering (Cloudflare Neurons)
+
+Cloudflare Workers AI meters inference in **Neurons**, not tokens, and its
+OpenAI-compatible endpoint returns token usage only — no neuron count. Gamas
+therefore estimates neuron spend locally so the documented daily inclusion
+(10,000 Neurons/day, last verified 2026-10-09) can be protected:
+
+* the estimate uses a deliberately **over**-estimated rate
+  (25 Neurons per 1,000 tokens) — over-counting only makes Gamas fail over to
+  the next free provider early, whereas under-counting would let a job walk
+  past the allocation and onto a billable plan;
+* actual token usage from the provider is used when it is reported, otherwise
+  the pre-flight estimate plus the reserved output budget is charged;
+* the running total for the UTC day is shown under **AI → provider**, labelled
+  as an estimate;
+* when the estimated total reaches the budget, `AI_FREE_ONLY` stops routing to
+  Cloudflare and uses the next eligible free provider;
+* the per-deployment budget is configurable (`neuron_budget_daily` in
+  `ai_provider_settings`) because the included allocation is plan scoped.
+
+Models that cannot run on the free allocation at all are flagged
+`requires_paid_billing` from the Models panel (💳), which makes `FREE_ONLY`
+reject them up front instead of discovering it after the quota is spent.
+
 ## Model capability and discovery policy
 
 `gamas_bot/ai/models.py` keeps reviewed static seeds, a live SQLite catalog, and conservative fallback metadata. Exact reviewed capabilities and other seed facts fill gaps when a generic catalog omits them; a live non-unknown free-status fact and current availability/deprecation data may supersede a seed. Thus an incomplete `unknown` catalog row cannot erase a reviewed status, while new paid/expired/unavailable evidence still blocks routing. Discovery does not infer model capabilities from a provider-wide default or arbitrary marketplace JSON. Unknown models support only the common chat request and prompt-enforced JSON; they do not receive schema, image/audio, reasoning, or tool flags by name pattern unless a reviewed exact rule supports it.
 
 Provider-specific notes:
 
+* NVIDIA "Free Endpoint" availability is a live capability, not a guarantee. Discovery records `free_endpoint` per model; a sync that omits it does not clear a previously observed value, and a model that disappears from the catalog is marked unavailable (never deleted, so historical usage stays attributable). The Models panel suggests a live replacement for any deprecated or withdrawn model, preferring a free endpoint, then a non-deprecated model, then the largest context window.
 * Gemini native schema support is advertised only for reviewed Gemini model IDs.
 * Groq strict schema support is exact-model only (`openai/gpt-oss-20b`, `openai/gpt-oss-120b`, and `qwen/qwen3.8-27b`; the guard model has best-effort behavior). Groq eligibility remains account-unverified.
 * Cerebras constrained decoding is limited by its model and availability tier; it is not generalized to the provider.
@@ -81,9 +149,21 @@ No encrypted secret is rewritten or exposed. Existing usage rows, audit records,
 
 ## Admin and operations
 
-The Telegram AI panel covers provider policy, encrypted keys, billing attestations, routing order, health tests, read-only catalog sync, quota/usage summaries, redacted logs, dry-run request shape, and benchmark results. Health/catalog probes are read-only; the separate generation-test path is explicitly billable and must never be mistaken for a health probe. Local usage counters cannot be manually reset from the admin UI because doing so could bypass a provider’s daily cap.
+The Telegram AI panel covers provider policy and account entitlement, encrypted keys, billing attestations, routing order and extra-pass overrides, health, read-only catalog sync, quota/usage summaries (including estimated Neuron spend), redacted logs with status/date/error filters, dry-run request shape, and benchmark results.
+
+* **🩺 سلامت** — last known probe state per credential (status, HTTP, latency, last checked, `read_only` vs `generation`). Opening the panel never submits a generation request; the explicit refresh re-runs the read-only probes and logs a `provider_health_checked` event with `check_type=read_only`. Only the per-key "test request" action sends a real completion, logged with `check_type=generation`.
+* **⚙️ تنظیمات** — the deployment switches (`AI_FREE_ONLY`, `AI_ALLOW_PAID_FALLBACK`, routing, sync TTL, failover and retry budgets, quota safety margin) and every provider-level override currently stored. They are read-only here on purpose: flipping a free-only guard casually is exactly how a deployment crosses a provider's daily cap.
+* **🧾 لاگ‌ها** — filterable by provider, event type, HTTP status class (4xx/5xx), error class, job id and date (today / 7 days). Every stored field is metadata: `ai_events` never contains prompts, transcripts, model output or secrets.
+
+Health/catalog probes are read-only; the separate generation-test path is explicitly billable and must never be mistaken for a health probe. Local usage counters cannot be manually reset from the admin UI because doing so could bypass a provider’s daily cap.
+
+`python -m scripts.validate_provider_platform` runs an offline end-to-end validation of the platform (legacy NaraRouter compatibility, provider-aware chunk budgets, provider-level failover on a 429, the FREE_ONLY and paid-fallback gates, backend-metadata scrubbing and secret hygiene) against scripted provider responses. It needs no API key.
 
 Start-up checks, backups, deployment, and incident response are in [OPERATIONS.md](OPERATIONS.md). Key encryption, log redaction, note scrubbing, and student-data protections are in [SECURITY.md](SECURITY.md). The required test/benchmark commands are in [TESTING.md](TESTING.md).
+
+## Migrations
+
+* `008_provider_entitlement_and_pass_policy.sql` — account-entitlement attestation fields, per-provider extra-pass overrides, the Neuron budget and rollup columns, region/deployment-scope/quota-expiry metadata, and the NVIDIA `free_endpoint` column. Forward-only; the attestation fields are reset to `NULL` so nothing that was never reviewed is silently trusted.
 
 ## Known limitations / not verified
 
@@ -94,3 +174,6 @@ Start-up checks, backups, deployment, and incident response are in [OPERATIONS.m
 * Cloudflare Model Search provides catalog IDs, not the model capability/free-pricing facts needed for automatic FREE_ONLY selection.
 * A `free` key attestation is an operator statement, not cryptographic proof. The provider could change its terms or the account billing state after attestation; re-review provider account settings and official links regularly.
 * Provider catalogs and quotas can change after the 2026-10-09 review; automatic discovery cannot prove commercial rights, deprecation policy, or account-level billing state.
+* Groq’s official rate-limit page documents Developer-plan base limits and no free tier, so free eligibility cannot be established from documentation. It is reachable only through the explicit account-entitlement attestation above, and even then a model with an undocumented free status is used on an administrator’s assertion rather than on published evidence.
+* Cloudflare Neurons are estimated, not measured: the provider does not return a neuron count, so the daily-inclusion guard uses a deliberately pessimistic conversion. Treat the panel figure as an upper bound.
+* An account-entitlement attestation is an operator statement, not cryptographic proof. The provider may change its terms or the account's billing state afterwards; re-review provider account settings and the official links regularly.

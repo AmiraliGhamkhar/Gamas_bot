@@ -102,6 +102,10 @@ class ModelInfo:
     deprecated: bool = False
     deprecation_date: str | None = None
     available: bool = True
+    #: NVIDIA build.nvidia.com advertises some models through a "Free Endpoint".
+    #: That is a live capability, not a permanent guarantee: it can be withdrawn
+    #: or deprecated per model, so it is recorded per sync and re-checked.
+    free_endpoint: bool = False
     source: str = "static_seed"      # static_seed | live:<endpoint> | admin
     source_last_verified_at: str | None = None
     quality_score: float | None = None
@@ -603,6 +607,7 @@ class ModelRegistry:
             deprecated=bool(row.get("deprecated", 0)),
             deprecation_date=row.get("deprecation_date"),
             available=bool(row.get("available", 1)),
+            free_endpoint=bool(row.get("free_endpoint", 0)),
             source=str(row.get("source") or "static_seed"),
             source_last_verified_at=row.get("source_last_verified_at"),
             quality_score=row.get("quality_score"),
@@ -625,10 +630,51 @@ class ModelRegistry:
             "deprecated": 1 if info.deprecated else 0,
             "deprecation_date": info.deprecation_date,
             "available": 1 if info.available else 0,
+            "free_endpoint": 1 if info.free_endpoint else 0,
             "source": info.source,
             "source_last_verified_at": info.source_last_verified_at,
             "quality_score": info.quality_score,
         }
+
+
+#: Ranking used when suggesting a replacement for a deprecated/unavailable
+#: model (spec §16). Free and verified beats unknown beats paid.
+_FREE_RANK = {
+    FREE_PERMANENT: 0,
+    FREE_PLAN: 1,
+    FREE_PROMOTIONAL: 2,
+    FREE_UNKNOWN: 3,
+    PAID: 4,
+}
+
+
+def suggest_replacement(
+    catalog: list[ModelInfo], model_id: str
+) -> ModelInfo | None:
+    """Suggest a live model to replace a deprecated or withdrawn one.
+
+    NVIDIA's hosted catalog rotates: endpoints are withdrawn and models are
+    deprecated independently of Gamas. Rather than leaving an administrator
+    with a dead route, the best still-available alternative on the same
+    provider is offered — preferring an equivalent free endpoint, then a
+    non-deprecated model, then the largest context window as a tie-breaker.
+    """
+    candidates = [
+        info
+        for info in catalog
+        if info.model_id != model_id and info.available and not info.deprecated
+    ]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda info: (
+            0 if info.free_endpoint else 1,
+            _FREE_RANK.get(info.free_status, 3),
+            -int(info.context_window or 0),
+            info.model_id,
+        )
+    )
+    return candidates[0]
 
 
 def monotonic() -> float:

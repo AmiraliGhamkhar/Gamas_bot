@@ -57,7 +57,14 @@ from .adapters import (
     adapter_for,
     resolve_json_strategy,
 )
-from .models import FREE_PROMOTIONAL, ModelInfo, ModelRegistry, PAID, fallback_free_model
+from .models import (
+    FREE_PROMOTIONAL,
+    FREE_UNKNOWN,
+    ModelInfo,
+    ModelRegistry,
+    PAID,
+    fallback_free_model,
+)
 from .profiles import NoteProviderProfile, profile_for
 from .registry import (
     ProviderClass,
@@ -92,12 +99,25 @@ _SEED_FROM_ENV_SLUGS = {"gemini", "openai_compatible", "anthropic"}
 #: Error message texts must stay user-facing Persian and content-free.
 _ALL_FAILED_FA = "هیچ‌کدام از سرویس‌های تولید جزوه پاسخ مناسبی نداد."
 
+#: ``PlannedRoute`` pass key -> ``ai_provider_settings`` column (spec §26).
+_PASS_OVERRIDE_COLUMNS = {
+    "outline": "outline_enabled",
+    "repair": "repair_enabled",
+    "final_compile": "final_compile_enabled",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class RouteLeg:
     provider: str          # credential-pool slug
     canonical: str
     model: str | None = None
+    #: The deployment's account for this provider is attested no-charge by an
+    #: administrator (only ever set for ``requires_account_verification``
+    #: providers). It widens *which models* may be considered — models whose
+    #: free status is undocumented rather than paid — and never relaxes the
+    #: per-key billing attestation, terms, deprecation or quota gates.
+    account_verified: bool = False
     free_only: bool = True
     index: int = 0
 
@@ -109,22 +129,48 @@ class PlannedRoute:
     legs: list[RouteLeg]
     profile: NoteProviderProfile
     skipped: list[tuple[str, str]] = field(default_factory=list)
+    #: Per-provider administrator overrides for the extra pipeline passes
+    #: (spec §26). ``None`` means "inherit the provider profile default"; every
+    #: pass that runs costs free-tier quota on top of the chunk calls, which is
+    #: why the default for restrictive free providers is OFF.
+    pass_overrides: dict[str, bool | None] = field(default_factory=dict)
 
     @property
     def primary(self) -> RouteLeg | None:
         return self.legs[0] if self.legs else None
 
+    def _pass(self, key: str, default: bool) -> bool:
+        value = self.pass_overrides.get(key)
+        return default if value is None else bool(value)
+
     @property
     def outline_enabled(self) -> bool:
-        return self.profile.outline_enabled
+        return self._pass("outline", self.profile.outline_enabled)
 
     @property
     def repair_enabled(self) -> bool:
-        return self.profile.repair_enabled
+        return self._pass("repair", self.profile.repair_enabled)
 
     @property
     def compile_enabled(self) -> bool:
-        return self.profile.final_compile_enabled
+        return self._pass("final_compile", self.profile.final_compile_enabled)
+
+    def pass_state(self) -> dict[str, tuple[bool, str]]:
+        """Effective pass policy with its origin, for the admin panel."""
+        return {
+            "outline": (
+                self.outline_enabled,
+                "admin" if self.pass_overrides.get("outline") is not None else "profile",
+            ),
+            "repair": (
+                self.repair_enabled,
+                "admin" if self.pass_overrides.get("repair") is not None else "profile",
+            ),
+            "final_compile": (
+                self.compile_enabled,
+                "admin" if self.pass_overrides.get("final_compile") is not None else "profile",
+            ),
+        }
 
 
 class AllProvidersFailedError(StructuringError):
@@ -306,8 +352,25 @@ class ProviderRouter:
                 if not free_only_generation_allowed(
                     leg.canonical, admin_enabled=bool(stored.get("experimental_unlocked"))
                 ):
-                    skipped.append((leg.canonical, "not_free_eligible"))
-                    continue
+                    # A provider whose free entitlement is a property of the
+                    # account (not of its documentation) is reachable only after
+                    # an administrator attests this deployment's account. The
+                    # attestation is per provider and revocable, and it never
+                    # relaxes the per-key billing attestation or the model gate.
+                    if info.requires_account_verification and self._account_entitlement_attested(
+                        stored
+                    ):
+                        leg = replace(leg, account_verified=True)
+                    else:
+                        skipped.append(
+                            (
+                                leg.canonical,
+                                "account_entitlement_unverified"
+                                if info.requires_account_verification
+                                else "not_free_eligible",
+                            )
+                        )
+                        continue
                 if await self._daily_quota_exhausted(leg.canonical):
                     skipped.append((leg.canonical, "quota_exhausted"))
                     continue
@@ -329,7 +392,38 @@ class ProviderRouter:
             if eligible
             else profile_for(legs[0].canonical if legs else "openai_compatible")
         )
-        return PlannedRoute(legs=eligible, profile=profile, skipped=skipped)
+        primary_slug = (
+            eligible[0].canonical
+            if eligible
+            else (legs[0].canonical if legs else "openai_compatible")
+        )
+        primary_settings = settings.get(primary_slug) or {}
+        pass_overrides = {
+            key: (
+                None
+                if primary_settings.get(column) is None
+                else bool(primary_settings.get(column))
+            )
+            for key, column in _PASS_OVERRIDE_COLUMNS.items()
+        }
+        return PlannedRoute(
+            legs=eligible,
+            profile=profile,
+            skipped=skipped,
+            pass_overrides=pass_overrides,
+        )
+
+    @staticmethod
+    def _account_entitlement_attested(stored: dict) -> bool:
+        """True when an admin attested this deployment's account as no-charge.
+
+        The attestation is only meaningful with both metadata fields present,
+        mirroring the credential billing-attestation rule: a bare timestamp or
+        a bare admin id is not evidence.
+        """
+        return bool(stored.get("account_entitlement_attested_at")) and (
+            stored.get("account_entitlement_attested_by_admin_id") is not None
+        )
 
     async def _daily_quota_exhausted(self, canonical: str) -> bool:
         # A live entitlement probe (OpenRouter GET /api/v1/key) is the
@@ -358,7 +452,54 @@ class ProviderRouter:
             tokens = await self.tracker.today_token_count(canonical)
             if tokens >= profile.daily_token_limit:
                 return True
+        if await self._metered_units_exhausted(canonical, profile):
+            return True
         return False
+
+    async def _metered_units_exhausted(
+        self, canonical: str, profile: NoteProviderProfile
+    ) -> bool:
+        """Non-token daily inclusion (e.g. Cloudflare Neurons) already spent.
+
+        The allocated units are shared by every modality and, on a billable
+        plan, exceeding them is chargeable — so FREE_ONLY stops first and lets
+        the next free provider serve the job. A ledger read failure fails
+        closed, exactly like the request/token ledgers.
+        """
+        budget = await self._unit_budget(canonical, profile)
+        if not budget:
+            return False
+        try:
+            used = await self.db.ai_usage_today_units(canonical)
+        except Exception:
+            logger.warning("Could not read metered unit ledger provider=%s", canonical)
+            return True
+        if used >= budget:
+            await self.tracker.event(
+                "provider_quota_warning",
+                service="notes",
+                provider=canonical,
+                request_type=TASK_CHUNK,
+                detail=f"estimated {profile.metering_unit} today={used} budget={budget}",
+            )
+            return True
+        return False
+
+    async def _unit_budget(self, canonical: str, profile: NoteProviderProfile) -> int:
+        """Daily unit budget from admin override, then the reviewed default."""
+        if not profile.metering_unit:
+            return 0
+        try:
+            stored = (await self.provider_settings()).get(canonical) or {}
+        except Exception:
+            stored = {}
+        override = stored.get("neuron_budget_daily")
+        if override is not None:
+            try:
+                return max(0, int(override))
+            except (TypeError, ValueError):
+                pass
+        return int(registry_info(canonical).included_units_per_day or profile.included_units_per_day)
 
     # -- credential targets -----------------------------------------------------
 
@@ -466,7 +607,7 @@ class ProviderRouter:
         for candidate in catalog:
             if candidate.deprecated or not candidate.available:
                 continue
-            if leg.free_only and not candidate.free_only_eligible():
+            if leg.free_only and not self._model_free_ok(leg, candidate):
                 continue
             return candidate.model_id
         model = self._default_model(leg.canonical)
@@ -751,6 +892,20 @@ class ProviderRouter:
         result["model"] = model_id
         return result
 
+    @staticmethod
+    def _model_free_ok(leg: RouteLeg, info: ModelInfo) -> bool:
+        """Model-level free gate for a leg (spec §3).
+
+        An administrator-attested account (``leg.account_verified``) is the
+        documented evidence for providers whose free entitlement is a property
+        of the account rather than of a published plan. It lets models with an
+        *undocumented* free status be considered; a model that is known paid,
+        expired, deprecated, terms-restricted or billable stays blocked.
+        """
+        if info.free_now():
+            return True
+        return bool(leg.account_verified) and info.free_status == FREE_UNKNOWN
+
     def _model_blocked(self, leg: RouteLeg, info: ModelInfo) -> str | None:
         # Route-level free legs must remain genuinely free even when the
         # deployment-wide mode is relaxed for separately-marked paid legs.
@@ -761,11 +916,13 @@ class ProviderRouter:
             return "model requires paid billing (FREE_ONLY)"
         if not info.commercial_use_allowed:
             return "model terms disallow this use"
-        if free_only and not info.free_now():
+        if free_only and not self._model_free_ok(leg, info):
             if info.free_status == FREE_PROMOTIONAL:
                 return "promotional free period expired or unverified"
             if info.free_status == PAID:
                 return "model is paid (FREE_ONLY)"
+            if leg.account_verified:
+                return "model free eligibility unverified (FREE_ONLY)"
             return "model free eligibility unknown (FREE_ONLY)"
         return None
 
@@ -1179,6 +1336,7 @@ class ProviderRouter:
             "request_id": self._safe_request_id(
                 parsed.request_id if parsed else "", credential.secret
             ),
+            "neurons_estimated": self._estimated_units(ctx, usage, estimated_tokens),
         }
         if parsed is not None and parsed.quota_headers:
             import json as _json
@@ -1187,6 +1345,27 @@ class ProviderRouter:
                 self._safe_quota_headers(parsed.quota_headers, credential.secret), sort_keys=True
             )[:500]
         await self.tracker.record(row)
+
+    @staticmethod
+    def _estimated_units(ctx: RequestContext, usage, estimated_tokens: int) -> int | None:
+        """Estimated provider units (Neurons) for a non-token-metered provider.
+
+        Actual usage wins when the provider reports it; otherwise the
+        conservative pre-flight input estimate plus the reserved output budget
+        is used, so a request that never returned usage still cannot hide its
+        share of the daily allocation.
+        """
+        profile = profile_for(ctx.canonical)
+        if not profile.metering_unit or profile.metering_units_per_1k_tokens <= 0:
+            return None
+        input_tokens = usage.input_tokens if usage and usage.input_tokens else estimated_tokens
+        output_tokens = usage.output_tokens if usage and usage.output_tokens else ctx.max_output_tokens
+        return token_budget.estimate_metered_units(
+            metering_unit=profile.metering_unit,
+            units_per_1k_tokens=profile.metering_units_per_1k_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        )
 
     @staticmethod
     def _safe_finish_reason(value: str, secret: str) -> str:
@@ -1333,6 +1512,26 @@ class NoteJobSession:
             overhead_tokens=0,
             safety_margin=margin,
         )
+
+    # -- extra-pass policy -----------------------------------------------------
+
+    @property
+    def outline_enabled(self) -> bool:
+        """Extra-pass policy as ``structuring._pass_allowed`` reads it.
+
+        These proxy the planned route so the administrator override (spec §26)
+        reaches every call site that can spend free-tier quota, not only the
+        router internals.
+        """
+        return self.plan.outline_enabled
+
+    @property
+    def repair_enabled(self) -> bool:
+        return self.plan.repair_enabled
+
+    @property
+    def compile_enabled(self) -> bool:
+        return self.plan.compile_enabled
 
     # -- generation -----------------------------------------------------------
 
