@@ -8,6 +8,7 @@ here ever renders raw keys, prompts or transcripts.
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
 import aiohttp
@@ -777,7 +778,6 @@ class AIPanels:
             await event.answer("کلید پیدا نشد.", alert=True)
             await self.show_all_keys(event)
             return
-        slug = _canonical_of(record)
         masked = self.bot._masked_key(record.get("secret_last4"))
         state = "فعال ✅" if record.get("enabled") else "غیرفعال ⛔"
         if record.get("quarantined_at"):

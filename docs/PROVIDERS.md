@@ -13,6 +13,12 @@ actually ran** — a fallback never reports itself as the primary.
 | Deepgram | `DEEPGRAM_MODEL` (default `nova-3`) |
 | OpenAI-compatible | `STT_OPENAI_BASE_URL` + model, for OpenAI/Groq/self-hosted gateways |
 
+The native platform adds Groq, Gemini Transcribe and registry-backed adapters
+for AssemblyAI, Gladia, Google Cloud STT, IBM Watson, and experimental Azure,
+AWS, Soniox and ElevenLabs. Free-only policy, trial allowlist, quota budgets,
+the quality gate, and evidence levels are documented in
+[STT_PROVIDERS.md](STT_PROVIDERS.md). The legacy three behave as described here.
+
 Behaviour:
 
 * **One session per job** with explicit connect/read timeouts, so a job reuses

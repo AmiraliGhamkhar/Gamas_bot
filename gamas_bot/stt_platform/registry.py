@@ -30,7 +30,7 @@ provider headers and quota endpoints always win at runtime.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 #: Date the classifications/limits below were last cross-checked against the
@@ -166,6 +166,11 @@ class STTProviderInfo:
     #: "whole_file_only" (default) or "emergency_only"; chunking is never
     #: silently enabled (spec §7).
     chunking_policy: str
+    #: How the free-tier facts were checked: ``official_docs``,
+    #: ``official_pricing_partial``, ``official_blog``, ``search_snippet``,
+    #: ``generic_gateway`` or ``unverified``. Only the first three count as
+    #: official evidence; ``last_verified_at`` is set only for them.
+    evidence: str = "unverified"
 
     @property
     def classification(self) -> STTProviderClass:
@@ -200,11 +205,11 @@ _SPEECHMATICS = STTProviderInfo(
     max_file_size=1_000_000_000,
     max_audio_duration=None,
     max_concurrency=10,
-    rate_limits="Free plan: 480 minutes/month (batch+realtime); Pro: 10 file jobs/second (verified 2026-10-09)",
-    free_type=STTProviderClass.FREE_MONTHLY.value,
-    free_limit="480 minutes/month recurring free plan (not a one-time credit)",
-    free_reset="monthly",
-    trial_expiration="",
+    rate_limits="Free (self-serve): 10 pre-recorded files/second, 2 real-time sessions on Free; pricing page lists 50 for Start-free sign-ups",
+    free_type=STTProviderClass.FREE_CREDIT.value,
+    free_limit="$100 one-time credit grant for new sign-ups, no card required (Speechmatics plans docs); pre-2026-08-01 accounts: one-time $25",
+    free_reset="none (one-time grant, not recurring)",
+    trial_expiration="Free plan stops at zero credit balance unless a payment card is added (Pro plan)",
     commercial_use=True,
     region_restrictions="",
     data_retention="See Speechmatics data-security documentation; enterprise options offer no-training deployments.",
@@ -247,7 +252,7 @@ _DEEPGRAM = STTProviderInfo(
     max_file_size=2_000_000_000,
     max_audio_duration=None,
     max_concurrency=50,
-    rate_limits="No published free-tier RPM; usage billed per minute after the starter credit (verified 2026-10-09)",
+    rate_limits="No published free-tier RPM; usage billed per minute after the starter credit (see evidence)",
     free_type=STTProviderClass.FREE_CREDIT.value,
     free_limit="$200 one-time starter credit, no card, no expiration; then pay-as-you-go",
     free_reset="one_time",
@@ -295,7 +300,7 @@ _GROQ = STTProviderInfo(
     max_audio_duration=None,
     max_concurrency=5,
     rate_limits=(
-        "Free plan (verified 2026-10-09): whisper-large-v3/-turbo 20 RPM, 2,000 requests/day, "
+        "Free plan (see evidence): whisper-large-v3/-turbo 20 RPM, 2,000 requests/day, "
         "7,200 audio-seconds/hour, 28,800 audio-seconds/day; 25 MB max upload; "
         "10-second minimum billing per request"
     ),
@@ -354,7 +359,7 @@ _GEMINI_TRANSCRIBE = STTProviderInfo(
     max_concurrency=5,
     rate_limits=(
         "Gemini API free tier is free of charge per model with per-minute/day quotas "
-        "(read live from responses); paid tier ~$0.005/min blended (verified 2026-10-09)"
+        "(read live from responses); paid tier ~$0.005/min blended (see evidence)"
     ),
     free_type=STTProviderClass.FREE_ALLOCATION.value,
     free_limit="Gemini API free tier (no billing linked): free of charge, rate-limited per model",
@@ -452,7 +457,7 @@ _ASSEMBLYAI = STTProviderInfo(
     max_file_size=2_200_000_000,
     max_audio_duration=None,
     max_concurrency=5,
-    rate_limits="Free accounts: 5 concurrent pre-recorded transcriptions, 5 new streams/minute (verified 2026-10-09)",
+    rate_limits="Free accounts: 5 concurrent pre-recorded transcriptions, 5 new streams/minute (see evidence)",
     free_type=STTProviderClass.FREE_CREDIT.value,
     free_limit="$50 one-time credit for new accounts, no card, does not expire; then pay-as-you-go",
     free_reset="one_time",
@@ -461,7 +466,7 @@ _ASSEMBLYAI = STTProviderInfo(
     region_restrictions="",
     data_retention=(
         "Training on transcripts is opt-in for paid accounts; free-tier users cannot "
-        "opt out (documented on the AssemblyAI pricing page, verified 2026-10-09)."
+        "opt out (documented on the AssemblyAI pricing page, see evidence)."
     ),
     official_docs_url="https://www.assemblyai.com/docs",
     pricing_url="https://www.assemblyai.com/pricing",
@@ -502,7 +507,7 @@ _GLADIA = STTProviderInfo(
     max_file_size=1_400_000_000,
     max_audio_duration=None,
     max_concurrency=10,
-    rate_limits="Concurrency and rate limits are plan-scoped; free plan: 10 hours/month (verified 2026-10-09)",
+    rate_limits="Concurrency and rate limits are plan-scoped; free plan: 10 hours/month (see evidence)",
     free_type=STTProviderClass.FREE_MONTHLY.value,
     free_limit="Free plan 10 hours/month plus a one-time €50 credit grant (no expiry)",
     free_reset="monthly (10 h) + one_time (€50 credit)",
@@ -514,7 +519,7 @@ _GLADIA = STTProviderInfo(
     pricing_url="https://www.gladia.io/pricing",
     last_verified_at=VERIFIED_AT,
     enabled=True,
-    persian_batch=True,
+    persian_batch=False,
     supports_diarization=True,
     max_speakers=32,
     supports_word_timestamps=True,
@@ -549,7 +554,7 @@ _GOOGLE_CLOUD_STT = STTProviderInfo(
     max_file_size=10_000_000,
     max_audio_duration=28800,
     max_concurrency=100,
-    rate_limits="Free tier: 60 minutes/month (V1); paid per 15 seconds (verified 2026-10-09)",
+    rate_limits="Free tier: 60 minutes/month (V1); paid per 15 seconds (see evidence)",
     free_type=STTProviderClass.FREE_MONTHLY.value,
     free_limit="60 minutes/month free (Speech-to-Text V1); V2 free allocation is not documented",
     free_reset="monthly",
@@ -602,7 +607,7 @@ _IBM_WATSON_STT = STTProviderInfo(
     max_file_size=100_000_000,
     max_audio_duration=None,
     max_concurrency=100,
-    rate_limits="Lite plan: 500 minutes/month; services deleted after 30 days of inactivity (verified 2026-10-09)",
+    rate_limits="Lite plan: 500 minutes/month; services deleted after 30 days of inactivity (see evidence)",
     free_type=STTProviderClass.FREE_MONTHLY.value,
     free_limit="Lite plan: 500 minutes/month at no cost; customization requires a paid plan",
     free_reset="monthly",
@@ -649,7 +654,7 @@ _AWS_TRANSCRIBE = STTProviderInfo(
     max_file_size=2_000_000_000,
     max_audio_duration=14400,
     max_concurrency=100,
-    rate_limits="Free tier: 60 minutes/month for the first 12 months (new accounts); 15-second minimum billing (verified 2026-10-09)",
+    rate_limits="Free tier: 60 minutes/month for the first 12 months (new accounts); 15-second minimum billing (see evidence)",
     free_type=STTProviderClass.PROMOTIONAL_FREE.value,
     free_limit="60 minutes/month for the first 12 months after account creation (standard transcription only)",
     free_reset="monthly for 12 months",
@@ -660,7 +665,7 @@ _AWS_TRANSCRIBE = STTProviderInfo(
     official_docs_url="https://docs.aws.amazon.com/transcribe/",
     pricing_url="https://aws.amazon.com/transcribe/pricing/",
     last_verified_at=VERIFIED_AT,
-    enabled=True,
+    enabled=False,
     persian_batch=False,
     supports_diarization=True,
     max_speakers=30,
@@ -696,10 +701,10 @@ _AZURE_SPEECH = STTProviderInfo(
     max_file_size=500_000_000,
     max_audio_duration=36000,
     max_concurrency=20,
-    rate_limits="F0: 5 audio hours/month REAL-TIME only — the official pricing page states batch is NOT supported on F0 (verified 2026-10-09)",
-    free_type=STTProviderClass.FREE_MONTHLY.value,
-    free_limit="F0: 5 audio hours/month realtime standard STT; batch transcription requires paid S0",
-    free_reset="monthly (realtime only)",
+    rate_limits="F0: 5 audio hours/month, real-time standard STT only; batch transcription is not available on F0 (third-party summaries of Microsoft limits; re-verify before enabling)",
+    free_type=STTProviderClass.PAID_ONLY.value,
+    free_limit="F0 (free): 5 audio hours/month real-time only. File batch transcription requires paid S0, so Gamas file jobs are paid-only",
+    free_reset="monthly (F0 real-time only)",
     trial_expiration="",
     commercial_use=True,
     region_restrictions="Regional endpoints; F0 batch is unavailable — do not route batch files to F0.",
@@ -707,7 +712,7 @@ _AZURE_SPEECH = STTProviderInfo(
     official_docs_url="https://learn.microsoft.com/azure/ai-services/speech-service/",
     pricing_url="https://azure.microsoft.com/en-us/pricing/details/speech/",
     last_verified_at=VERIFIED_AT,
-    enabled=True,
+    enabled=False,
     persian_batch=True,
     supports_diarization=True,
     max_speakers=2,
@@ -748,7 +753,7 @@ _SONIOX = STTProviderInfo(
     max_file_size=1_000_000_000,
     max_audio_duration=None,
     max_concurrency=20,
-    rate_limits="Pay-as-you-go token metering (~$0.10/hour async); no published free API quota (verified 2026-10-09)",
+    rate_limits="Pay-as-you-go token metering (~$0.10/hour async); no published free API quota (see evidence)",
     free_type=STTProviderClass.PAID_ONLY.value,
     free_limit=(
         "No new-account free API credits: Soniox discontinued free API credits for new "
@@ -799,7 +804,7 @@ _ELEVENLABS_SCRIBE = STTProviderInfo(
     max_file_size=3_000_000_000,
     max_audio_duration=36000,
     max_concurrency=20,
-    rate_limits="Free plan: 10,000 credits/month shared across TTS/STT/agents (~30 min STT at 330 credits/min); attribution required (verified 2026-10-09)",
+    rate_limits="Free plan: 10,000 credits/month shared across TTS/STT/agents (~30 min STT at 330 credits/min); attribution required (see evidence)",
     free_type=STTProviderClass.FREE_MONTHLY.value,
     free_limit="Free plan 10,000 credits/month shared across products; ~30 minutes of Scribe API per month",
     free_reset="monthly",
@@ -808,13 +813,13 @@ _ELEVENLABS_SCRIBE = STTProviderInfo(
     region_restrictions="",
     data_retention=(
         "The free plan requires ElevenLabs attribution and does not include a "
-        "commercial license (official pricing page, verified 2026-10-09)."
+        "commercial license (pricing-page snippet; re-verify before commercial use)."
     ),
     official_docs_url="https://elevenlabs.io/docs/capabilities/speech-to-text",
     pricing_url="https://elevenlabs.io/pricing",
     last_verified_at=VERIFIED_AT,
     enabled=False,
-    persian_batch=True,
+    persian_batch=False,
     supports_diarization=True,
     max_speakers=32,
     supports_word_timestamps=True,
@@ -839,8 +844,39 @@ _ELEVENLABS_SCRIBE = STTProviderInfo(
 #: so Gamas (a commercial product) must not route production traffic there on
 #: the free plan. The provider stays disabled until a paid plan is configured.
 
+_OFFICIAL_EVIDENCE = frozenset({"official_docs", "official_pricing_partial", "official_blog"})
+
+#: Per-provider evidence level, reviewed on VERIFIED_AT. Providers absent here
+#: are ``unverified``: their facts came from search snippets or were not
+#: checked, so they must not be routed on the strength of those facts.
+PROVIDER_EVIDENCE: dict[str, str] = {
+    "gemini_transcribe": "official_docs",
+    "groq": "official_docs",
+    "deepgram": "official_docs",
+    "speechmatics": "official_pricing_partial",
+    "assemblyai": "official_pricing_partial",
+    "soniox": "official_blog",
+    "openai_compatible": "generic_gateway",
+    "gladia": "search_snippet",
+    "google_cloud_stt": "search_snippet",
+    "ibm_watson_stt": "search_snippet",
+    "aws_transcribe": "search_snippet",
+    "azure_speech": "search_snippet",
+    "elevenlabs_scribe": "search_snippet",
+}
+
+
+def _with_evidence(info: STTProviderInfo) -> STTProviderInfo:
+    evidence = PROVIDER_EVIDENCE.get(info.provider_slug, "unverified")
+    return replace(
+        info,
+        evidence=evidence,
+        last_verified_at=VERIFIED_AT if evidence in _OFFICIAL_EVIDENCE else "unverified",
+    )
+
+
 STT_PROVIDER_REGISTRY: dict[str, STTProviderInfo] = {
-    info.provider_slug: info
+    info.provider_slug: _with_evidence(info)
     for info in (
         _SPEECHMATICS,
         _DEEPGRAM,

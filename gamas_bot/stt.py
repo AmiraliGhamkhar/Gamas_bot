@@ -23,16 +23,42 @@ import math
 import re
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import aiohttp
 
 from .config import SPEECHMATICS_MULTILINGUAL_MODELS, Settings
 from .provider_credentials import ProviderCredentialManager
+from .stt_platform.adapters import (
+    AdapterOptions,
+    NativeSTTAdapter,
+    ProviderSTTError,
+    STTErrorCategory,
+    get_audio_duration_seconds,
+    resolve_language,
+    vocabulary_hints,
+)
+from .stt_platform.events import STTEventLogger
+from .stt_platform.models import Transcript as PlatformTranscript
+from .stt_platform.models import VocabularyHints
+from .stt_platform.policy import SttPolicy
+from .stt_platform.profiles import ProviderConcurrencyRegistry
+from .stt_platform.quality import TranscriptQualityGate, hard_quality_failures
+from .stt_platform.quota import STTQuotaTracker
+from .stt_platform.registry import LEGACY_STT_PROVIDERS, STT_PROVIDER_REGISTRY
+from .stt_platform.router import (
+    CandidateFacts,
+    RoutePlan,
+    SttRequirements,
+    plan_route,
+    resolve_route,
+)
 from .structuring import _endpoint
 
 logger = logging.getLogger(__name__)
@@ -821,212 +847,653 @@ async def _attempt_with_retries(
     raise STTError(f"{engine} produced no transcript after {attempts} attempt(s)")
 
 
+# ---------------------------------------------------------------------------
+# Gamas Speech Platform integration.
+#
+# Everything above is the legacy request code, kept intact. Below: native
+# adapters are registered in STT_PROVIDERS, routing is planned by the pure
+# router, each candidate runs under per-provider concurrency and quota
+# reservations, and the quality gate can reject a transcript. Events and usage
+# are best-effort and can never break a transcription.
+# ---------------------------------------------------------------------------
+
+#: The request-scoped quota tracker is passed to native adapters through a
+#: context variable, so the legacy ``_attempt_with_retries`` signature is kept.
+_QUOTA_TRACKER: ContextVar[STTQuotaTracker | None] = ContextVar(
+    "gamas_stt_quota_tracker", default=None
+)
+#: Per-provider semaphores, recreated when the running event loop changes.
+_PROVIDER_SLOTS: dict[str, tuple[asyncio.AbstractEventLoop, asyncio.Semaphore]] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class _AdminState:
+    enabled: bool = True
+    billing_state: str = ""
+
+
+def _native_model_label(provider: str, settings: Settings) -> str:
+    configured = settings.stt_model(provider)
+    if configured:
+        return str(configured)
+    info = STT_PROVIDER_REGISTRY.get(provider)
+    return info.default_model if info else ""
+
+
+def _native_options(settings: Settings, provider: str) -> AdapterOptions:
+    info = STT_PROVIDER_REGISTRY[provider]
+    diarization = bool(settings.stt_request_diarization) and info.supports_diarization
+    word_timestamps = bool(settings.stt_request_word_timestamps) and info.supports_word_timestamps
+    # Gemini cannot combine custom vocabulary with diarization or timestamps.
+    vocabulary_allowed = info.vocabulary_supported and not (
+        provider == "gemini_transcribe" and (diarization or word_timestamps)
+    )
+    return AdapterOptions(
+        diarization=diarization,
+        word_timestamps=word_timestamps,
+        smart_transcription=bool(getattr(settings, "stt_smart_transcription", False))
+        and info.supports_smart_formatting,
+        vocabulary=vocabulary_hints(settings) if vocabulary_allowed else VocabularyHints(),
+    )
+
+
+def _legacy_error(exc: ProviderSTTError) -> STTError:
+    """Map a normalized adapter error onto the legacy rotation/failover classes."""
+    category = exc.category
+    status = exc.http_status
+    message = str(exc)
+    if category in {
+        STTErrorCategory.AUTHENTICATION,
+        STTErrorCategory.PERMISSION,
+        STTErrorCategory.BILLING_REQUIRED,
+    }:
+        return STTAuthenticationError(message, status=status or 401)
+    if category in {STTErrorCategory.RATE_LIMITED, STTErrorCategory.QUOTA_EXHAUSTED}:
+        return STTTransientError(message, exc.retry_after, status=status or 429)
+    if category in {
+        STTErrorCategory.SERVER_ERROR,
+        STTErrorCategory.PROVIDER_TIMEOUT,
+        STTErrorCategory.NETWORK_FAILURE,
+    }:
+        return STTTransientError(message, exc.retry_after, status=status)
+    if category in {
+        STTErrorCategory.FILE_TOO_LARGE,
+        STTErrorCategory.DURATION_TOO_LONG,
+        STTErrorCategory.FORMAT_UNSUPPORTED,
+        STTErrorCategory.LANGUAGE_UNSUPPORTED,
+        STTErrorCategory.INVALID_REQUEST,
+    }:
+        return STTRequestError(message, status=status or 400)
+    # Schema errors, unknown failures and unimplemented models: permanent for
+    # this request, never rotated, and the next provider is tried.
+    return STTError(message)
+
+
+def _legacy_transcript(platform: Any) -> Transcript:
+    """Convert the rich platform transcript to the shape ``bot.py`` consumes.
+
+    A provider confidence is passed on only when the platform marked it
+    comparable across providers; otherwise it is unavailable, never guessed.
+    """
+    normalized = platform.normalized_confidence
+    normalized = normalized() if callable(normalized) else normalized
+    comparable = bool(getattr(normalized, "comparable", False))
+    confidence = platform.confidence if comparable else None
+    return Transcript(
+        engine=str(platform.provider or platform.engine),
+        text=str(platform.text or ""),
+        confidence=confidence,
+    )
+
+
+async def _native_attempt(
+    provider: str,
+    session: aiohttp.ClientSession,
+    audio_path: Path,
+    settings: Settings,
+) -> Transcript:
+    adapter = NativeSTTAdapter(provider)
+    try:
+        platform = await adapter.transcribe(
+            session,
+            audio_path,
+            settings,
+            options=_native_options(settings, provider),
+            quota_tracker=_QUOTA_TRACKER.get(),
+        )
+    except ProviderSTTError as exc:
+        raise _legacy_error(exc) from None
+    return _legacy_transcript(platform)
+
+
+def _native_provider(slug: str) -> STTProvider:
+    info = STT_PROVIDER_REGISTRY[slug]
+    return STTProvider(
+        availability=lambda settings, _slug=slug: settings.stt_api_key(_slug),
+        attempt=lambda session, audio, settings, _slug=slug: _native_attempt(
+            _slug, session, audio, settings
+        ),
+        label=info.display_name,
+        # The registry records the provider's direct-upload limit.
+        max_upload=lambda settings, _slug=slug: STT_PROVIDER_REGISTRY[_slug].max_file_size,
+    )
+
+
+for _slug in STT_PROVIDER_REGISTRY:
+    STT_PROVIDERS.setdefault(_slug, _native_provider(_slug))
+
+
+def _quota_units(quota_type: str, duration_seconds: float | None) -> float | None:
+    """Units one job consumes for a budget row, or ``None`` when unknown."""
+    if quota_type in {"rpm", "rpd", "requests", "requests_per_minute"}:
+        return 1.0
+    if duration_seconds is None or duration_seconds <= 0:
+        return None
+    if quota_type.startswith("audio_seconds"):
+        return float(duration_seconds)
+    if quota_type.startswith("minutes"):
+        return float(duration_seconds) / 60.0
+    return None
+
+
+async def _reserve_quota(
+    db: Any,
+    provider: str,
+    credential_id: int | None,
+    duration_seconds: float | None,
+    settings: Settings,
+    submission_id: int | None,
+) -> tuple[list[int], str | None]:
+    """Reserve every applicable budget row. Returns (reservation ids, denial).
+
+    No budget rows means no admin-maintained budget exists, so nothing is
+    reserved and the candidate stays eligible. Budget rows that cannot be
+    reserved (exhausted, stale, unknown units) deny the candidate.
+    """
+    if db is None:
+        return [], None
+    try:
+        budgets = await db.stt_quota_budgets(provider)
+    except Exception:
+        return [], "store_unavailable"
+    rows = [row for row in budgets if row.get("credential_id") in (None, credential_id)]
+    if not rows:
+        return [], None
+    reserved: list[int] = []
+    for row in rows:
+        units = _quota_units(str(row.get("quota_type") or ""), duration_seconds)
+        if units is None:
+            await _finalize_reservations(db, reserved, commit=False)
+            return [], "units_unknown"
+        reservation_id, _remaining, status = await db.stt_quota_reserve(
+            provider,
+            str(row.get("account_scope") or ""),
+            str(row.get("quota_type") or ""),
+            needed=units,
+            safety_margin=float(getattr(settings, "stt_quota_safety_margin", 0.10)),
+            submission_id=submission_id,
+            credential_id=credential_id,
+        )
+        if status != "available" or reservation_id is None:
+            await _finalize_reservations(db, reserved, commit=False)
+            return [], status
+        reserved.append(reservation_id)
+    return reserved, None
+
+
+async def _finalize_reservations(db: Any, reservation_ids: list[int], *, commit: bool) -> None:
+    if db is None:
+        return
+    for reservation_id in reservation_ids:
+        try:
+            await db.stt_quota_reservation_finalize(reservation_id, commit=commit)
+        except Exception:
+            logger.warning("STT quota reservation finalize failed reservation=%s", reservation_id)
+
+
+async def _record_usage(db: Any, **record: Any) -> None:
+    """Best-effort usage row; accounting must never break transcription."""
+    if db is None:
+        return
+    try:
+        await db.stt_usage_record(
+            {"created_at": datetime.now(timezone.utc).isoformat(), **record}
+        )
+    except Exception:
+        logger.debug("STT usage record skipped provider=%s", record.get("provider"))
+
+
+def _error_category(exc: BaseException) -> str:
+    if isinstance(exc, STTAuthenticationError):
+        return "authentication"
+    if isinstance(exc, STTTransientError):
+        if exc.status == 429:
+            return "rate_limited"
+        return "network_failure" if exc.status is None else "server_error"
+    if isinstance(exc, (STTRequestError, STTConfigurationError)):
+        return "invalid_request"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "provider_timeout"
+    if isinstance(exc, aiohttp.ClientError):
+        return "network_failure"
+    return "unknown"
+
+
+def _quality_rejections(transcript: Transcript, settings: Settings, duration: float | None) -> tuple[str, ...]:
+    """Hard quality failures only; soft signals stay warnings in the gate."""
+    gate = TranscriptQualityGate(settings)
+    if not gate.enabled:
+        return ()
+    platform_view = PlatformTranscript(
+        engine=transcript.engine,
+        text=transcript.text,
+        confidence=transcript.confidence,
+        provider=transcript.engine,
+    )
+    verdict = gate.evaluate(
+        platform_view,
+        # Ratio checks are meaningful only for longer audio.
+        audio_duration_seconds=duration if duration is not None and duration >= 30 else None,
+        expected_language=settings.stt_language,
+    )
+    return hard_quality_failures(verdict.reasons, text_length=len(transcript.text or ""))
+
+
+def _language_error(provider: str, settings: Settings) -> str | None:
+    requested = settings.stt_language
+    try:
+        if provider in LEGACY_STT_PROVIDERS:
+            normalize_language_for_provider(provider, requested)
+        else:
+            resolve_language(provider, requested, model=_native_model_label(provider, settings))
+    except (STTError, ProviderSTTError, ValueError):
+        return "language_unsupported"
+    return None
+
+
+async def _credential_pool(
+    provider: str,
+    settings: Settings,
+    credentials: ProviderCredentialManager | None,
+) -> list:
+    if credentials is None:
+        return [None] if STT_PROVIDERS[provider].availability(settings) else []
+    if provider == "speechmatics":
+        fallback = (settings.speechmatics_api_key, settings.speechmatics_base_url, None)
+    elif provider == "deepgram":
+        fallback = (settings.deepgram_api_key, None, None)
+    elif provider == "openai_compatible":
+        fallback = (settings.stt_openai_api_key, settings.stt_openai_base_url, settings.stt_openai_model)
+    else:
+        fallback = (settings.stt_api_key(provider), settings.stt_base_url(provider), settings.stt_model(provider))
+    return await credentials.candidates(
+        "stt",
+        provider,
+        fallback_secret=fallback[0],
+        fallback_base_url=fallback[1],
+        fallback_model=fallback[2],
+    )
+
+
+async def _provider_admin_state(db: Any, provider: str) -> _AdminState:
+    if db is None:
+        return _AdminState()
+    try:
+        row = await db.stt_provider_settings_get(provider)
+    except Exception:
+        logger.debug("STT provider settings unavailable provider=%s", provider)
+        return _AdminState()
+    if not row:
+        return _AdminState()
+    return _AdminState(
+        enabled=bool(row.get("enabled", 1)),
+        billing_state=str(row.get("billing_state") or ""),
+    )
+
+
+def _provider_slot(provider: str, settings: Settings) -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    entry = _PROVIDER_SLOTS.get(provider)
+    if entry is None or entry[0] is not loop:
+        limit = ProviderConcurrencyRegistry(settings).limit(provider)
+        entry = (loop, asyncio.Semaphore(max(1, int(limit))))
+        _PROVIDER_SLOTS[provider] = entry
+    return entry[1]
+
+
+def _no_route_error(plan: RoutePlan, settings: Settings, file_size: int) -> STTError:
+    configured = [item for item in plan.decisions if "not_configured" not in item.reasons]
+    if not configured:
+        return STTError("هیچ کلید یا نشانی API برای سرویس تبدیل گفتار تنظیم نشده است.")
+    if all("file_too_large" in item.reasons for item in configured):
+        limits = "، ".join(
+            f"{STT_PROVIDERS[item.provider].label}:تا حد "
+            f"{STT_PROVIDERS[item.provider].max_upload(settings) / 1_000_000_000:g} گیگابایت"
+            for item in configured
+        )
+        return STTError(
+            "حجم فایل از سقف آپلود مستقیم همهٔ سرویس‌های پیکربندی‌شده بیشتر است "
+            f"({limits}). فایل کوچک‌تری بفرستید یا سرویس دیگری را فعال کنید."
+        )
+    summary = "؛ ".join(
+        f"{item.provider}: {', '.join(item.reasons)}" for item in plan.decisions if item.reasons
+    )
+    logger.warning("STT route has no eligible provider file_bytes=%s summary=%s", file_size, summary)
+    return STTError(
+        "هیچ سرویس تبدیل گفتار مجاز و مناسبی برای این فایل در مسیر فعلی پیدا نشد "
+        f"({summary})."
+    )
+
+
+async def _attempt_provider(
+    provider: str,
+    session: aiohttp.ClientSession,
+    audio_path: Path,
+    settings: Settings,
+    pool: list,
+    *,
+    credentials: ProviderCredentialManager | None,
+    db: Any,
+    events: STTEventLogger,
+    submission_id: int | None,
+    job_ref: str,
+    duration: float | None,
+    file_size: int,
+    route_position: int,
+    attempt: int,
+) -> Transcript:
+    """Run the credential pool for one provider, rotating on key-level errors."""
+    transcript: Transcript | None = None
+    last_key_error: Exception | None = None
+    model = _native_model_label(provider, settings)
+    for credential in pool:
+        request_settings = (
+            credentials.apply_to_settings(settings, credential)
+            if credentials is not None and credential is not None
+            else settings
+        )
+        credential_id = credential.id if credential is not None else None
+        reservation_ids, denial = await _reserve_quota(
+            db, provider, credential_id, duration, settings, submission_id
+        )
+        if denial is not None:
+            last_key_error = STTError(f"{provider} quota budget unavailable ({denial})")
+            await events.emit(
+                "stt_quota_exhausted" if denial in {"exhausted", "insufficient"} else "stt_quota_warning",
+                provider=provider,
+                model=model,
+                job_id=job_ref,
+                submission_id=submission_id,
+                credential_id=credential_id,
+                route_position=route_position,
+                attempt=attempt,
+                error_category="quota_exhausted",
+                detail=denial,
+            )
+            continue
+        committed = False
+        call_started = time.monotonic()
+        try:
+            # Bound the whole provider attempt, including upload, polling, and
+            # transcript download.
+            transcript = await _attempt_with_retries(
+                provider,
+                session,
+                audio_path,
+                request_settings,
+                retry_rate_limit=credentials is None,
+            )
+            committed = True
+            if credentials is not None and credential is not None:
+                await credentials.record_result(credential, result="success")
+            await _record_usage(
+                db,
+                submission_id=submission_id,
+                job_id=job_ref,
+                provider=provider,
+                model=model,
+                credential_id=credential_id,
+                route_position=route_position,
+                attempt=attempt,
+                result="success",
+                audio_bytes=file_size,
+                audio_duration_seconds=duration,
+                latency_ms=int((time.monotonic() - call_started) * 1000),
+                quota_type=None,
+                quota_units=None,
+            )
+            break
+        except asyncio.CancelledError:
+            raise
+        except STTAuthenticationError as exc:
+            last_key_error = exc
+            if credentials is not None and credential is not None:
+                await credentials.record_result(
+                    credential, result="quarantined", status_code=exc.status, safe_error=f"HTTP {exc.status}"
+                )
+            continue
+        except STTTransientError as exc:
+            last_key_error = exc
+            if credentials is not None and credential is not None:
+                await credentials.record_result(
+                    credential,
+                    result="cooldown" if exc.status == 429 else "error",
+                    status_code=exc.status,
+                    retry_after_seconds=exc.retry_after,
+                    safe_error=f"HTTP {exc.status}" if exc.status else "transient provider failure",
+                )
+            continue
+        except STTRequestError as exc:
+            if credentials is not None and credential is not None:
+                await credentials.record_result(
+                    credential, result="invalid_request", status_code=exc.status, safe_error=f"HTTP {exc.status}"
+                )
+            # 400/415/422 are properties of the request, not of the key.
+            raise
+        except STTError as exc:
+            if credentials is not None and credential is not None:
+                await credentials.record_result(credential, result="error", safe_error=type(exc).__name__)
+            raise
+        except Exception as exc:
+            if credentials is not None and credential is not None:
+                await credentials.record_result(credential, result="error", safe_error=type(exc).__name__)
+            raise
+        finally:
+            await _finalize_reservations(db, reservation_ids, commit=committed)
+    if transcript is None:
+        if last_key_error is not None:
+            raise last_key_error
+        raise STTError(f"{provider} has no available credential")
+    return transcript
+
+
 async def transcribe(
     audio_path: Path,
     settings: Settings,
     *,
     credentials: ProviderCredentialManager | None = None,
+    submission_id: int | None = None,
+    job_id: str = "",
 ) -> Transcript:
-    """Transcribe with provider fallback and bounded per-key rotation.
+    """Transcribe with planned provider routing, fallback and key rotation.
 
-    Existing static environment keys remain supported. When a credential
-    manager is provided, enabled encrypted keys are tried in priority order;
-    429s cool down and rotate, 401/403 quarantine and rotate, and malformed
-    requests are never retried with another key. Provider and transcript
-    quality fallback behavior remains unchanged.
+    Whole-file only: files at/above a provider's direct-upload limit are routed
+    to another eligible engine instead of being split. The route, free/trial
+    policy, quota reservations and quality gate are applied per candidate, and
+    the legacy confidence rule picks between results exactly as before.
     """
-    primary = settings.stt_primary
-    provider_order = [primary] + [name for name in STT_PROVIDERS if name != primary]
-
-    key_pools: dict[str, list] = {}
-    for name in provider_order:
-        if credentials is None:
-            key_pools[name] = [None] if STT_PROVIDERS[name].availability(settings) else []
-            continue
-        fallback_secret = None
-        fallback_base_url = None
-        fallback_model = None
-        if name == "speechmatics":
-            fallback_secret = settings.speechmatics_api_key
-            fallback_base_url = settings.speechmatics_base_url
-        elif name == "deepgram":
-            fallback_secret = settings.deepgram_api_key
-        elif name == "openai_compatible":
-            fallback_secret = settings.stt_openai_api_key
-            fallback_base_url = settings.stt_openai_base_url
-            fallback_model = settings.stt_openai_model
-        key_pools[name] = await credentials.candidates(
-            "stt",
-            name,
-            fallback_secret=fallback_secret,
-            fallback_base_url=fallback_base_url,
-            fallback_model=fallback_model,
-        )
-    if settings.stt_fallback_enabled:
-        order = provider_order
-    elif key_pools.get(primary):
-        order = [primary]
-    else:
-        # Retain legacy fallback to another configured engine when the
-        # selected primary has no available environment or stored key.
-        order = [name for name in provider_order if name != primary]
-        logger.warning(
-            "STT primary provider=%s is not configured; using another configured engine",
-            primary,
-        )
-    configured = [name for name in order if key_pools.get(name)]
-    if not configured:
-        raise STTError("هیچ کلید یا نشانی API برای سرویس تبدیل گفتار تنظیم نشده است.")
-
-    # Whole-file transcription only: chunking audio would cost word context at
-    # every boundary. Files at/above a provider's direct-upload limit are
-    # routed to another configured engine that accepts them.
+    db = getattr(credentials, "db", None)
+    events = STTEventLogger(db)
+    job_ref = str(job_id or submission_id or "")[:120]
     file_size = audio_path.stat().st_size
+    duration = await asyncio.to_thread(get_audio_duration_seconds, audio_path)
+    token = _QUOTA_TRACKER.set(STTQuotaTracker(db, settings))
+    try:
+        return await _transcribe_routed(
+            audio_path,
+            settings,
+            credentials=credentials,
+            db=db,
+            events=events,
+            job_ref=job_ref,
+            submission_id=submission_id,
+            file_size=file_size,
+            duration=duration,
+        )
+    finally:
+        _QUOTA_TRACKER.reset(token)
+
+
+async def _transcribe_routed(
+    audio_path: Path,
+    settings: Settings,
+    *,
+    credentials: ProviderCredentialManager | None,
+    db: Any,
+    events: STTEventLogger,
+    job_ref: str,
+    submission_id: int | None,
+    file_size: int,
+    duration: float | None,
+) -> Transcript:
     job_started = time.monotonic()
-    logger.info(
-        "STT job started file_bytes=%s primary=%s fallback_enabled=%s candidate_engines=%s",
-        file_size,
-        primary,
-        settings.stt_fallback_enabled,
-        configured,
+    req = SttRequirements.for_job(
+        language=settings.stt_language,
+        file_bytes=file_size,
+        duration_seconds=duration,
+        diarization=bool(settings.stt_request_diarization),
+        word_timestamps=bool(settings.stt_request_word_timestamps),
+        vocabulary_terms=len(vocabulary_hints(settings).terms),
     )
-    usable: list[str] = []
-    oversized: list[str] = []
-    for name in configured:
-        (oversized if file_size >= STT_PROVIDERS[name].max_upload(settings) else usable).append(
-            name
+    facts: dict[str, CandidateFacts] = {}
+    key_pools: dict[str, list] = {}
+    for name in resolve_route(settings):
+        if name not in STT_PROVIDERS:
+            continue
+        key_pools[name] = await _credential_pool(name, settings, credentials)
+        admin = await _provider_admin_state(db, name)
+        facts[name] = CandidateFacts(
+            has_credential=bool(key_pools[name]),
+            admin_enabled=admin.enabled,
+            billing_state=admin.billing_state,
+            max_upload=STT_PROVIDERS[name].max_upload(settings),
+            language_error=_language_error(name, settings),
         )
-    if not usable:
-        limits = "، ".join(
-            f"{STT_PROVIDERS[name].label}:تا حد {STT_PROVIDERS[name].max_upload(settings) / 1_000_000_000:g} گیگابایت"
-            for name in configured
-        )
-        raise STTError(
-            "حجم فایل از سقف آپلود مستقیم همهٔ سرویس‌های پیکربندی‌شده بیشتر است "
-            f"({limits}). فایل کوچک‌تری بفرستید یا سرویس دیگری را فعال کنید."
-        )
-    if oversized:
+    plan = plan_route(settings, req, facts, policy=SttPolicy.from_settings(settings))
+    for decision in plan.decisions:
         logger.info(
-            "STT providers skipped for size file_bytes=%s skipped=%s remaining=%s",
-            file_size,
-            oversized,
-            usable,
+            "STT route decision %s",
+            " ".join(f"{key}={value}" for key, value in decision.as_log_fields().items()),
         )
+    if not plan.execution:
+        raise _no_route_error(plan, settings, file_size)
 
     timeout = aiohttp.ClientTimeout(
         total=None, connect=45, sock_read=min(max(settings.stt_job_timeout, 120), 660)
     )
+    logger.info(
+        "STT job started file_bytes=%s primary=%s fallback_enabled=%s candidate_engines=%s",
+        file_size,
+        settings.stt_primary,
+        settings.stt_fallback_enabled,
+        list(plan.execution),
+    )
     failures: list[str] = []
     outcomes: list[Transcript] = []
+    last = len(plan.execution) - 1
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        for index, engine in enumerate(usable):
+        for index, engine in enumerate(plan.execution):
             started = time.monotonic()
+            position = plan.route.index(engine) if engine in plan.route else 0
+            model = _native_model_label(engine, settings)
             logger.info(
                 "STT attempt started provider=%s file_bytes=%s attempt=%s/%s",
                 engine,
-                audio_path.stat().st_size,
+                file_size,
                 index + 1,
-                len(usable),
+                len(plan.execution),
+            )
+            await events.emit(
+                "stt_request_started",
+                provider=engine,
+                model=model,
+                job_id=job_ref,
+                submission_id=submission_id,
+                route_position=position,
+                attempt=index + 1,
+                audio_bytes=file_size,
+                audio_duration_seconds=duration,
             )
             try:
-                transcript = None
-                last_key_error: Exception | None = None
-                pool = key_pools[engine]
-                for credential in pool:
-                    request_settings = (
-                        credentials.apply_to_settings(settings, credential)
-                        if credentials is not None and credential is not None
-                        else settings
+                async with _provider_slot(engine, settings):
+                    transcript = await _attempt_provider(
+                        engine,
+                        session,
+                        audio_path,
+                        settings,
+                        key_pools.get(engine) or [],
+                        credentials=credentials,
+                        db=db,
+                        events=events,
+                        submission_id=submission_id,
+                        job_ref=job_ref,
+                        duration=duration,
+                        file_size=file_size,
+                        route_position=position,
+                        attempt=index + 1,
                     )
-                    try:
-                        # Bound the whole provider attempt, including upload,
-                        # polling, and transcript download.
-                        transcript = await _attempt_with_retries(
-                            engine,
-                            session,
-                            audio_path,
-                            request_settings,
-                            retry_rate_limit=credentials is None,
-                        )
-                        if credentials is not None and credential is not None:
-                            await credentials.record_result(credential, result="success")
-                        break
-                    except asyncio.CancelledError:
-                        raise
-                    except STTAuthenticationError as exc:
-                        last_key_error = exc
-                        if credentials is not None and credential is not None:
-                            await credentials.record_result(
-                                credential,
-                                result="quarantined",
-                                status_code=exc.status,
-                                safe_error=f"HTTP {exc.status}",
-                            )
-                        continue
-                    except STTTransientError as exc:
-                        last_key_error = exc
-                        if credentials is not None and credential is not None:
-                            await credentials.record_result(
-                                credential,
-                                result="cooldown" if exc.status == 429 else "error",
-                                status_code=exc.status,
-                                retry_after_seconds=exc.retry_after,
-                                safe_error=(
-                                    f"HTTP {exc.status}" if exc.status else "transient provider failure"
-                                ),
-                            )
-                        continue
-                    except STTRequestError as exc:
-                        if credentials is not None and credential is not None:
-                            await credentials.record_result(
-                                credential,
-                                result="invalid_request",
-                                status_code=exc.status,
-                                safe_error=f"HTTP {exc.status}",
-                            )
-                        # 400/415/422 (and other non-auth permanent HTTP
-                        # responses) are properties of the request, not key.
-                        raise
-                    except STTError as exc:
-                        if credentials is not None and credential is not None:
-                            await credentials.record_result(
-                                credential,
-                                result="error",
-                                safe_error=type(exc).__name__,
-                            )
-                        raise
-                    except Exception as exc:
-                        if credentials is not None and credential is not None:
-                            await credentials.record_result(
-                                credential,
-                                result="error",
-                                safe_error=type(exc).__name__,
-                            )
-                        raise
-                if transcript is None:
-                    if last_key_error is not None:
-                        raise last_key_error
-                    raise STTError(f"{engine} has no available credential")
-
                 chars, words = _transcript_metrics(transcript.text)
                 logger.info(
                     "STT attempt completed provider=%s elapsed_seconds=%.3f confidence=%s text_chars=%s text_words=%s attempt=%s/%s",
                     engine,
                     time.monotonic() - started,
-                    f"{transcript.confidence:.3f}"
-                    if transcript.confidence is not None
-                    else "unavailable",
+                    f"{transcript.confidence:.3f}" if transcript.confidence is not None else "unavailable",
                     chars,
                     words,
                     index + 1,
-                    len(usable),
+                    len(plan.execution),
+                )
+                rejected = _quality_rejections(transcript, settings, duration)
+                if rejected:
+                    codes = ",".join(reason.split(":", 1)[0] for reason in rejected)
+                    logger.warning("STT quality gate rejected provider=%s reasons=%s", engine, codes)
+                    await events.emit(
+                        "stt_quality_rejected",
+                        provider=engine,
+                        model=model,
+                        job_id=job_ref,
+                        submission_id=submission_id,
+                        route_position=position,
+                        attempt=index + 1,
+                        error_category="quality_failure",
+                        detail=codes[:200],
+                    )
+                    failures.append(f"{engine}: quality check rejected the transcript ({codes})")
+                    if index < last:
+                        await events.emit(
+                            "stt_provider_fallback",
+                            provider=engine,
+                            next_provider=plan.execution[index + 1],
+                            fallback_reason="quality_failure",
+                            job_id=job_ref,
+                        )
+                    continue
+                await events.emit(
+                    "stt_request_succeeded",
+                    provider=engine,
+                    model=model,
+                    job_id=job_ref,
+                    submission_id=submission_id,
+                    route_position=position,
+                    attempt=index + 1,
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                    confidence=transcript.confidence,
+                    word_count=words,
+                    character_count=chars,
                 )
                 outcomes.append(transcript)
-                is_low = (
-                    transcript.confidence is not None
-                    and transcript.confidence < settings.stt_min_confidence
-                )
-                if not is_low or index == len(usable) - 1:
+                is_low = transcript.confidence is not None and transcript.confidence < settings.stt_min_confidence
+                if not is_low or index == last:
                     break
                 logger.warning(
                     "Low STT confidence from %s (%.3f < threshold %.3f); trying fallback",
@@ -1041,11 +1508,7 @@ async def transcribe(
                 # fragments. Keep only our own sanitized errors and error types.
                 detail = str(exc) if isinstance(exc, STTError) else type(exc).__name__
                 if isinstance(exc, STTConfigurationError):
-                    logger.warning(
-                        "STT provider rejected the configuration provider=%s detail=%s",
-                        engine,
-                        detail,
-                    )
+                    logger.warning("STT provider rejected the configuration provider=%s detail=%s", engine, detail)
                 else:
                     logger.warning(
                         "STT provider failed provider=%s elapsed_seconds=%.3f error_type=%s detail=%s attempt=%s/%s",
@@ -1054,10 +1517,47 @@ async def transcribe(
                         type(exc).__name__,
                         detail,
                         index + 1,
-                        len(usable),
+                        len(plan.execution),
                     )
+                category = _error_category(exc)
                 failures.append(f"{engine}: {detail}")
-                if index == len(usable) - 1 and not outcomes:
+                await events.emit(
+                    "stt_request_failed",
+                    provider=engine,
+                    model=model,
+                    job_id=job_ref,
+                    submission_id=submission_id,
+                    route_position=position,
+                    attempt=index + 1,
+                    error_category=category,
+                    http_status=getattr(exc, "status", None),
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                )
+                await _record_usage(
+                    db,
+                    submission_id=submission_id,
+                    job_id=job_ref,
+                    provider=engine,
+                    model=model,
+                    credential_id=None,
+                    route_position=position,
+                    attempt=index + 1,
+                    result="failure",
+                    audio_bytes=file_size,
+                    audio_duration_seconds=duration,
+                    latency_ms=int((time.monotonic() - started) * 1000),
+                    http_status=getattr(exc, "status", None),
+                    error_category=category,
+                )
+                if index < last:
+                    await events.emit(
+                        "stt_provider_fallback",
+                        provider=engine,
+                        next_provider=plan.execution[index + 1],
+                        fallback_reason=category,
+                        job_id=job_ref,
+                    )
+                if index == last and not outcomes:
                     raise STTError("؛ ".join(failures)) from None
         if not outcomes:
             raise STTError("؛ ".join(failures) or "تبدیل گفتار ناموفق بود.")
@@ -1073,9 +1573,7 @@ async def transcribe(
         logger.info(
             "STT job finished engine=%s confidence=%s text_chars=%s text_words=%s outcomes=%s total_elapsed_seconds=%.3f",
             selected.engine,
-            f"{selected.confidence:.3f}"
-            if selected.confidence is not None
-            else "unavailable",
+            f"{selected.confidence:.3f}" if selected.confidence is not None else "unavailable",
             chars,
             words,
             [outcome.engine for outcome in outcomes],

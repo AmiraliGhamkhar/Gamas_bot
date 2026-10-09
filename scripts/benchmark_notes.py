@@ -806,7 +806,7 @@ def run_benchmark_profiles(mode: str = "full") -> dict:
         budget = chunk_char_budget(profile.chunk_token_budget, char_cap=profile.chunk_char_cap)
         fixture_scores = []
         total_chunks = 0
-        for name, source in fixtures:
+        for _name, source in fixtures:
             chunks = split_transcript(source, max_chars=budget)
             total_chunks += len(chunks)
             score = _score(source, chunks, source)

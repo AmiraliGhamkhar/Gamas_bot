@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import math
 import re
-import unicodedata
 from dataclasses import dataclass
 
 from .models import Transcript
@@ -52,6 +51,9 @@ _DIGIT_RANGE = re.compile(r"[0-9\u06F0-\u06F9]")
 
 #: A token repeated this many times in a row is a provider loop (spec §55).
 _MAX_REPEATED_TOKEN_RUN = 12
+#: Persian script-share check: applies only with enough letters to judge.
+_LANGUAGE_MIN_LETTERS = 200
+_LANGUAGE_MIN_PERSIAN_SHARE = 0.20
 
 #: Plausible speech density bounds (characters per audio second, non-whitespace).
 _MIN_CHARS_PER_SECOND = 1.0
@@ -204,12 +206,14 @@ def _language_plausible(transcript: Transcript, expected_language: str | None) -
         return None
     text = transcript.text or ""
     letters = sum(1 for char in text if char.isalpha())
-    if not letters:
-        return "no_letters_for_language_check"
+    if letters < _LANGUAGE_MIN_LETTERS:
+        # Too little text to judge the script mix reliably; never reject on it.
+        return None
     persian = len(_PERSIAN_RANGE.findall(text))
-    # Code-switched lectures keep a substantial Persian share; a transcript
-    # that is overwhelmingly Latin for a fa job is a language mismatch.
-    if persian / letters < 0.30:
+    # Code-switched lectures (Persian with English terms) keep a clear Persian
+    # share. Only a transcript that is almost entirely non-Persian letters for
+    # a fa job is treated as a language mismatch.
+    if persian / letters < _LANGUAGE_MIN_PERSIAN_SHARE:
         return "language_mismatch"
     return None
 
@@ -295,3 +299,36 @@ class TranscriptQualityGate:
             warnings.append("low_unicode_ratio")
 
         return QualityVerdict(not reasons, tuple(reasons), tuple(warnings), signals)
+
+
+#: Reason prefixes that make a transcript unusable and justify trying the next
+#: provider. Confidence is handled by the legacy confidence rule in ``stt.py``;
+#: repetition and short-text ratios are advisory warnings, because quiet or
+#: music-heavy lectures are legitimate.
+_HARD_REASON_PREFIXES = (
+    "empty_transcript",
+    "embedded_provider_error",
+    "embedded_json_error_payload",
+    "massive_repeated_sequence",
+    "no_alphanumeric_content",
+    "language_mismatch",
+    "too_much_text_for_duration",
+)
+
+
+#: Error-marker words ("api key", "authorization") also occur in genuine
+#: lectures about software. They reject only short texts, where a leaked
+#: provider error payload is the realistic explanation.
+_ERROR_MARKER_MAX_CHARS = 400
+
+
+def hard_quality_failures(reasons, *, text_length: int = 0) -> tuple[str, ...]:
+    """Subset of gate reasons that must reject a transcript."""
+    hard: list[str] = []
+    for reason in reasons:
+        text = str(reason)
+        if text.startswith("embedded_") and text_length > _ERROR_MARKER_MAX_CHARS:
+            continue
+        if any(text.startswith(prefix) for prefix in _HARD_REASON_PREFIXES):
+            hard.append(text)
+    return tuple(hard)
