@@ -505,6 +505,39 @@ def _router_report() -> dict:
     return asyncio.run(_collect())
 
 
+def gamas_quality_score(
+    *,
+    semantic_coverage: float,
+    factual_preservation: float,
+    json_reliability: float = 1.0,
+    structural_quality: float = 1.0,
+    terminology_preservation: float = 1.0,
+    latency_score: float = 1.0,
+    reliability: float = 1.0,
+) -> float:
+    """Spec §44: Gamas quality score (0.0 to 100.0).
+
+    Weights:
+      40% semantic / content coverage
+      20% factual preservation (numbers + units)
+      15% JSON / schema reliability
+      10% structural quality (headings, hierarchy, sections)
+       5% terminology preservation
+       5% latency score (bounded)
+       5% reliability (success rate)
+    """
+    score = (
+        0.40 * min(max(float(semantic_coverage), 0.0), 1.0)
+        + 0.20 * min(max(float(factual_preservation), 0.0), 1.0)
+        + 0.15 * min(max(float(json_reliability), 0.0), 1.0)
+        + 0.10 * min(max(float(structural_quality), 0.0), 1.0)
+        + 0.05 * min(max(float(terminology_preservation), 0.0), 1.0)
+        + 0.05 * min(max(float(latency_score), 0.0), 1.0)
+        + 0.05 * min(max(float(reliability), 0.0), 1.0)
+    )
+    return round(score * 100.0, 2)
+
+
 def _score(source: str, chunks: list[str], notes_text: str) -> dict:
     """All coverage measures for one (source, notes) pair."""
     notes = StructuredNotes(
@@ -513,10 +546,25 @@ def _score(source: str, chunks: list[str], notes_text: str) -> dict:
     report = qa.run_note_qa(notes, chunks)
     units = extract_all_units(chunks)
     semantic, missing = semantic_coverage(units, notes_text)
+    unit_total = report.total_units or 1
+    factual = report.covered_units / unit_total
+    terms_covered = 1.0 if not report.missing_terms else max(
+        0.0, 1.0 - (len(report.missing_terms) / max(len(report.missing_terms) + 5, 1))
+    )
+    quality = gamas_quality_score(
+        semantic_coverage=semantic,
+        factual_preservation=factual,
+        json_reliability=1.0,
+        structural_quality=0.5 if report.needs_repair else 1.0,
+        terminology_preservation=terms_covered,
+        latency_score=1.0,
+        reliability=1.0,
+    )
     return {
         "compression_ratio": round(report.compression_ratio, 3),
         "signal_coverage": round(report.coverage, 3),
         "semantic_coverage": round(semantic, 3),
+        "gamas_quality_score": quality,
         "units": f"{report.covered_units}/{report.total_units}",
         "missing_unit_types": sorted({unit.type for unit in missing}),
         "chunk_coverage": round(report.chunk_coverage, 3),
@@ -772,10 +820,12 @@ def main(argv: list[str] | None = None) -> int:
             if "error" in live:
                 print(f"    live: ERROR {live['error']}")
             else:
+                score_str = f" quality_score={live.get('gamas_quality_score', '—')}"
                 print(
                     f"    live: {live['provider']}/{live['model']} "
                     f"ratio={live['compression_ratio']} signal={live['signal_coverage']} "
                     f"semantic={live['semantic_coverage']} units={live['units']}"
+                    + score_str
                 )
     probe = report.get("document_probe") or {}
     if probe:

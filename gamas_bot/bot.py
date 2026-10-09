@@ -1841,6 +1841,91 @@ class StudyBot:
         if action == "aikey_label":
             await self.ai_panels.handle_wizard_label(event, text)
             return
+
+        if action.startswith("aikey_replace:"):
+            # Spec §34: replace secret without ever exposing old or new key.
+            # Message is deleted BEFORE persistence; if deletion fails, abort.
+            try:
+                key_id = int(action.split(":", 1)[1])
+            except ValueError:
+                self._pending_admin_actions.pop(telegram_id, None)
+                await event.reply("شناسهٔ کلید نامعتبر.", buttons=admin_menu())
+                return
+            new_secret = text.strip()
+            if not new_secret:
+                self._pending_admin_actions.pop(telegram_id, None)
+                await event.reply("کلید خالی پذیرفته نمی‌شود.", buttons=admin_menu())
+                return
+            try:
+                delete_message = getattr(event.message, "delete", None)
+                if not callable(delete_message):
+                    raise RuntimeError("message deletion unavailable")
+                await delete_message()
+            except Exception:
+                self._pending_admin_actions.pop(telegram_id, None)
+                await event.respond(
+                    "پیام کلید حذف نشد؛ کلید تغییر نکرد. آن را دستی پاک کنید و دوباره تلاش نمایید.",
+                    buttons=admin_menu(),
+                )
+                return
+            self._pending_admin_actions.pop(telegram_id, None)
+            try:
+                changed = await self.credential_manager.replace_secret(
+                    key_id, new_secret=new_secret, admin_id=telegram_id
+                )
+            except CredentialStoreError as exc:
+                await event.respond(str(exc), buttons=admin_menu())
+                return
+            finally:
+                new_secret = ""
+            if changed:
+                self.provider_health.invalidate()
+                await event.respond(
+                    f"کلید #{key_id} با موفقیت تعویض و رمزنگاری شد (فقط ۴ رقم پایانی نمایش داده می‌شود).",
+                    buttons=admin_menu(),
+                )
+            else:
+                await event.respond("کلید پیدا نشد یا تغییر نکرد.", buttons=admin_menu())
+            return
+
+        if action.startswith("aikey_edit:"):
+            # Spec §34: edit label / model / base_url.
+            self._pending_admin_actions.pop(telegram_id, None)
+            parts = action.split(":")
+            field_name = parts[1] if len(parts) > 1 else ""
+            try:
+                key_id = int(parts[2]) if len(parts) > 2 else -1
+            except ValueError:
+                await event.reply("شناسهٔ کلید نامعتبر.", buttons=admin_menu())
+                return
+            val = text.strip()
+            val_clean = None if val in {"-", "—", ""} else val
+            try:
+                if field_name == "label":
+                    changed = await self.credential_manager.update_metadata(
+                        key_id, label=val, admin_id=telegram_id
+                    )
+                elif field_name == "model":
+                    changed = await self.credential_manager.update_metadata(
+                        key_id, model=val_clean, admin_id=telegram_id
+                    )
+                elif field_name == "base":
+                    changed = await self.credential_manager.update_metadata(
+                        key_id, base_url=val_clean, admin_id=telegram_id
+                    )
+                else:
+                    changed = False
+            except CredentialStoreError as exc:
+                await event.reply(str(exc), buttons=admin_menu())
+                return
+            if changed:
+                self.provider_health.invalidate()
+                await event.reply(
+                    f"مشخصات کلید #{key_id} به‌روزرسانی شد.", buttons=admin_menu()
+                )
+            else:
+                await event.reply("کلید پیدا نشد یا تغییر نکرد.", buttons=admin_menu())
+            return
         if action == "credits_lookup":
             target_id = _parse_user_id(text.strip())
             self._pending_admin_actions.pop(telegram_id, None)
@@ -2139,6 +2224,9 @@ class StudyBot:
                     admin_id=telegram_id,
                     base_url=metadata.get("base_url"),
                     model=metadata.get("model"),
+                    enabled=bool(metadata.get("enabled", True)),
+                    free_only=metadata.get("free_only"),
+                    paid_allowed=metadata.get("paid_allowed"),
                 )
             except CredentialStoreError as exc:
                 await event.respond(str(exc), buttons=admin_menu())
@@ -2151,10 +2239,21 @@ class StudyBot:
             else:
                 # A new key changes the pool; never show stale cached health.
                 self.provider_health.invalidate()
-                await event.respond(
-                    f"کلید #{credential_id} با رمزگذاری ذخیره شد؛ فقط چهار رقم پایانی در پنل نمایش داده می‌شود.",
-                    buttons=admin_menu(),
-                )
+                if metadata.get("via_wizard"):
+                    # Spec §33 steps 7-9: non-destructive credential test,
+                    # capability/quota report card, and an activation choice.
+                    await self.ai_panels.wizard_finish_report(
+                        event,
+                        credential_id=credential_id,
+                        slug=str(metadata["provider"]),
+                        label=str(metadata["label"]),
+                        model=metadata.get("model"),
+                    )
+                else:
+                    await event.respond(
+                        f"کلید #{credential_id} با رمزگذاری ذخیره شد؛ فقط چهار رقم پایانی در پنل نمایش داده می‌شود.",
+                        buttons=admin_menu(),
+                    )
             finally:
                 secret = ""
             return
@@ -2211,7 +2310,7 @@ class StudyBot:
             pending_action.startswith("credential_")
             or pending_action.startswith("credential_meta:")
             or pending_action.startswith("payment_reject:")
-            or pending_action == "aikey_label"
+            or pending_action.startswith("aikey_")
         ):
             if command == "/cancel":
                 self._pending_admin_actions.pop(telegram_id, None)

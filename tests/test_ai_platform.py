@@ -37,7 +37,7 @@ from gamas_bot.ai.routing import (
 from gamas_bot.ai.sync import sync_provider_catalog
 from gamas_bot.ai.usage import AIUsageTracker, sanitize_text
 from gamas_bot.config import Settings
-from gamas_bot.database import Database
+from gamas_bot.database import Database, utc_now
 from gamas_bot.provider_credentials import ProviderCredentialManager
 from gamas_bot.structuring import (
     StructuringError,
@@ -358,7 +358,8 @@ class RoutingPlanTests(PlatformCase):
         self.assertNotIn("alibaba", [leg.canonical for leg in plan.legs])
 
     async def test_openrouter_daily_ledger_blocks_when_exhausted(self):
-        day = "2026-10-08"
+        # The ledger is keyed by the *current* UTC day; never hard-code a date.
+        day = utc_now()[:10]
         for index in range(50):
             await self.db.ai_usage_insert(
                 {
@@ -683,6 +684,88 @@ class FreeOnlySafetyTests(PlatformCase):
                 system_prompt="S", user_text="U", session=session,
             )
         self.assertEqual(session.requests, [])
+
+    async def test_backend_artifacts_scrubbed_from_student_notes(self):
+        # Spec §46: provider metadata, API keys, and HTTP plumbing must NEVER
+        # appear in student-facing structured notes.
+        from gamas_bot.structuring import parse_structured_notes
+        raw_payload = json.dumps(
+            {
+                "title": "مقدمه بر یادگیری ماشین — Groq API powered",
+                "summary": "این یادگیری ماشین است. کلید من sk-nry-abc123456789 است. HTTP 502 Bad Gateway.",
+                "learning_objectives": ["یادگیری مفهوم"],
+                "sections": [
+                    {
+                        "heading": "بخش ۱",
+                        "paragraphs": [
+                            "I am an AI assistant and here is the lesson.",
+                            "شناسه درخواست chatcmpl-xyz123456789 و job GMS-000042.",
+                            "متن اصلی درس دربارهٔ گرادیان کاهشی.",
+                        ],
+                        "bullets": [], "definitions": [], "examples": [],
+                        "steps": [], "formulas": [], "key_points": [], "callouts": [],
+                    }
+                ],
+                "key_points": [], "review_questions": [], "glossary": [],
+            }
+        )
+        notes = parse_structured_notes(raw_payload)
+        self.assertGreater(notes.backend_artifacts, 0)
+        self.assertNotIn("Groq API", notes.title)
+        self.assertNotIn("sk-nry", notes.summary)
+        self.assertNotIn("HTTP 502", notes.summary)
+        body = " ".join(notes.sections[0].paragraphs)
+        self.assertNotIn("AI assistant", body)
+        self.assertNotIn("chatcmpl", body)
+        self.assertNotIn("GMS-", body)
+        self.assertIn("گرادیان کاهشی", body)
+
+    async def test_live_quota_probe_updates_snapshot_and_blocks_routing(self):
+        # Spec §12/§29: live entitlement probe via key_info endpoint gives the
+        # authoritative free-daily counter.
+        from gamas_bot.ai.sync import probe_provider_quota
+        await self.manager.add_credential(
+            service="notes", provider="openrouter", label="o1",
+            secret="sk-or-test-key-1111", admin_id=1,
+        )
+        fake_payload = {
+            "data": {
+                "label": "o1",
+                "is_free_tier": True,
+                "free_model_daily_requests": {"used": 50, "limit": 50, "remaining": 0},
+            }
+        }
+        async def fake_get(url, headers, timeout):
+            return 200, {}, json.dumps(fake_payload).encode("utf-8")
+        result = await probe_provider_quota(self.router, "openrouter", session_get=fake_get)
+        self.assertTrue(result.ok)
+        self.assertEqual(result.remaining, 0)
+        # Snapshot is now in SQLite; router.plan() should skip openrouter.
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "openrouter", "enabled": 1, "free_only": 1},
+             {"provider": "nara", "enabled": 1, "free_only": 1}],
+            admin_id=None,
+        )
+        plan = await self.router.plan()
+        reasons = dict(plan.skipped)
+        self.assertEqual(reasons.get("openrouter"), "quota_exhausted")
+        self.assertEqual([leg.canonical for leg in plan.legs], ["nara"])
+
+    async def test_key_level_billing_flags_gate_free_vs_paid_legs(self):
+        # Spec §32/§34: a key marked free_only=0 is paid and cannot serve a FREE_ONLY leg.
+        await self.manager.add_credential(
+            service="notes", provider="groq", label="paid-key",
+            secret="gsk-paid-key-2222", admin_id=1, free_only=False,
+        )
+        leg = RouteLeg(provider="groq", canonical="groq", free_only=True)
+        pool = await self.router.credentials_for(leg)
+        self.assertEqual(pool, [])
+        # But if the leg is paid-allowed (AI_ALLOW_PAID_FALLBACK=true), it becomes eligible.
+        paid_leg = RouteLeg(provider="groq", canonical="groq", free_only=False)
+        pool_paid = await self.router.credentials_for(paid_leg)
+        self.assertEqual(len(pool_paid), 1)
+        self.assertEqual(pool_paid[0].label, "paid-key")
 
 
 if __name__ == "__main__":

@@ -331,9 +331,149 @@ JSON_REMINDER = (
 VALID_CALLOUT_KINDS = ("نکته", "هشدار", "یادآوری")
 
 
+# ---------------------------------------------------------------------------
+# Backend-artifact scrubbing (spec §46)
+#
+# A model occasionally echoes backend plumbing into its answer: provider
+# self-references ("powered by …"), API-key fragments, request/job ids, HTTP
+# diagnostics, JSON-schema commentary or "as an AI assistant" disclaimers.
+# None of that may ever reach a student-facing note. Every model-supplied
+# string funnels through ``_bounded_text``, so the scrubber runs there — once,
+# for every field of every pipeline stage (chunk, repair, compilation).
+# ---------------------------------------------------------------------------
+
+#: Provider/backend names that are only legitimate as *self-references*.
+_BACKEND_NAMES = (
+    "Gemini", "Google AI", "Groq", "OpenRouter", "Mistral", "SambaNova",
+    "NVIDIA", "Cloudflare", "Hugging Face", "HuggingFace", "Alibaba",
+    "Cohere", "Cerebras", "Anthropic", "OpenAI", "Deepgram", "Speechmatics",
+    "Whisper", "NaraRouter", "Z.AI", "z.ai",
+)
+_BACKEND_NAME_ALT = "|".join(re.escape(name) for name in _BACKEND_NAMES)
+
+#: Well-known API-key prefixes (never legitimate inside a study note).
+_KEY_PREFIX = re.compile(
+    r"\b(?:sk|sk-nry|sk-ant|AIza|ghp|gho|github_pat|hf|xox[baprs])[_-][A-Za-z0-9_-]{8,}\b"
+    r"|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b"
+)
+
+#: Request/job identifiers that must never reach a document.
+_REQUEST_ID = re.compile(
+    r"\b(?:GMS-\d+|chatcmpl-[A-Za-z0-9]{6,}|req_[A-Za-z0-9]{6,}|resp_[A-Za-z0-9]{6,}"
+    r"|cmpl-[A-Za-z0-9]{6,}|msg_[A-Za-z0-9]{6,}|sess-[A-Za-z0-9]{6,})\b"
+    r"|\bx-request-id\s*[:=]\s*\S+",
+    re.IGNORECASE,
+)
+
+#: Key assignment fragments ("api_key=…", "Authorization: Bearer …").
+_KEY_ASSIGNMENT = re.compile(
+    r"\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|authorization)\b\s*[\"']?\s*[:=]\s*[\"']?[^\s\"']{6,}",
+    re.IGNORECASE,
+)
+
+#: Provider self-reference phrases ("powered by Groq", "… Gemini API …",
+#: «ساخته‌شده توسط …», «… سرویس …»).
+_SELF_REFERENCE = re.compile(
+    r"\b(?:powered|generated|created|provided|developed|served|hosted)\s+by\s+(?:"
+    + _BACKEND_NAME_ALT + r")\b[\w\s.-]{0,24}"
+    r"|\b(?:" + _BACKEND_NAME_ALT + r")\s+(?:API|api|model|endpoint|service|provider|LLM|engine|servers?)\b"
+    r"|(?:ساخته|تولید|ارائه|آماده)\s*شده\s*(?:توسط|با)\s+(?:" + _BACKEND_NAME_ALT + r")\b"
+    r"|(?:توسط|با)\s+(?:" + _BACKEND_NAME_ALT + r")\s+(?:API|api|سرویس)\b",
+    re.IGNORECASE,
+)
+
+#: "As an AI assistant"-class disclaimers (EN + FA).
+_AI_DISCLAIMER = re.compile(
+    r"(?:as an?\s+AI(?:\s+(?:assistant|language\s+model|model|chatbot|bot))?"
+    r"|I['’]?m\s+(?:just\s+)?an?\s+AI(?:\s+(?:assistant|language\s+model|model))?"
+    r"|I\s+am\s+(?:just\s+)?an?\s+AI(?:\s+(?:assistant|language\s+model|model))?"
+    r"|من\s+یک\s+هوش\s+مصنوعی\s*(?:هستم|نیستم)?"
+    r"|من\s+یک\s+مدل\s+زبانی\s+(?:هستم| نیستم| نیستم)?"
+    r"|به[‌\s]-?عنوان\s+یک\s+(?:هوش\s+مصنوعی|مدل\s+زبانی)"
+    r"|به[‌\s]عنوان\s+دستیار\s+هوش\s+مصنوعی)"
+    r"[.,،؛]?",
+)
+
+#: Prompt/schema meta phrases that indicate prompt or schema leakage.
+_META_PHRASE = re.compile(
+    r"\b(?:system\s+prompt|instruction\s+prompt|prompt\s+template"
+    r"|response[_-]?format|json[_-]?schema|json[_-]?object\s+mode"
+    r"|additionalProperties|prompt[_-]?tokens|completion[_-]?tokens|total[_-]?tokens"
+    r"|finish[_-]?reason|x-ratelimit[\w-]*)\b\s*[:=]?\s*[\"']?[^\s\"',}]{0,40}",
+    re.IGNORECASE,
+)
+
+#: A line is treated as a backend diagnostic only when it clusters at least
+#: two diagnostic markers — a networking lecture legitimately contains
+#: "HTTP 404" once, but "HTTP 502 … retry-after … quota" is plumbing.
+_DIAGNOSTIC_TOKEN = re.compile(
+    r"HTTP\s*/?\s*\d{3}\b|status[_ ]?code|retry[- ]?after|rate[- ]?limit|quota"
+    r"|too many requests|billing|overloaded|server error|internal error"
+    r"|\b429\b|\b500\b|\b502\b|\b503\b|\b504\b|\b408\b",
+    re.IGNORECASE,
+)
+
+_REDACTION = "•••"
+
+
+#: Explicit status phrasing ("HTTP 502", "status_code=503", "429 Too Many
+#: Requests"). A bare number ("429 students") is legitimate lecture content
+#: and survives.
+_STATUS_PHRASE = re.compile(
+    r"(?:HTTP\s*/?\s*|status(?:_|\s)?code\s*[:=]?\s*|error\s*(?:code)?\s*[:=]?\s*|code\s*[:=]?\s*)"
+    r"(?:429|500|502|503|504|408)\b"
+    r"(?:\s+(?:Too Many Requests|Bad Gateway|Service Unavailable|Gateway Timeout|Request Timeout|Internal Server Error))?",
+    re.IGNORECASE,
+)
+
+
+def _scrub_line(line: str) -> tuple[str, int]:
+    """Scrub one line; returns (clean_line, hit_count)."""
+    hits = 0
+    for pattern in (_KEY_PREFIX, _REQUEST_ID, _KEY_ASSIGNMENT, _SELF_REFERENCE, _AI_DISCLAIMER, _META_PHRASE):
+        line, count = pattern.subn(_REDACTION, line)
+        hits += count
+    markers = len(_DIAGNOSTIC_TOKEN.findall(line))
+    if markers >= 2:
+        # Diagnostic cluster: the whole line is backend plumbing.
+        return "", hits + markers
+    scrubbed, count = _STATUS_PHRASE.subn(_REDACTION, line)
+    return scrubbed, hits + count
+
+
+def scrub_backend_artifacts(text: str) -> str:
+    """Remove backend plumbing a model may have echoed into its answer.
+
+    Conservative by design: bare provider names survive (a networking lecture
+    may legitimately mention Cloudflare or NVIDIA); only *self-references*,
+    key/id-shaped tokens, diagnostic clusters and meta phrases are removed.
+    """
+    if not text:
+        return text
+    cleaned_lines: list[str] = []
+    for line in str(text).splitlines():
+        cleaned, _ = _scrub_line(line)
+        cleaned_lines.append(cleaned)
+    cleaned = "\n".join(cleaned_lines)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned.strip()
+
+
+def count_backend_artifacts(text: str) -> int:
+    """How many backend-artifact patterns the raw model answer contained."""
+    if not text:
+        return 0
+    total = 0
+    for line in str(text).splitlines():
+        _, hits = _scrub_line(line)
+        total += hits
+    return total
+
+
 def _bounded_text(value: object, limit: int = MAX_TEXT_CHARS) -> str:
-    """Model-supplied value as a bounded, stripped string."""
-    return str(value if value is not None else "").strip()[:limit]
+    """Model-supplied value as a bounded, stripped, backend-scrubbed string."""
+    return scrub_backend_artifacts(str(value if value is not None else ""))[:limit]
 
 
 def _string_list(value: object) -> list[str]:
@@ -495,6 +635,10 @@ class StructuredNotes:
     #: invented to fill them (see the prompt's schema rules).
     learning_objectives: tuple[str, ...] = ()
     review_questions: tuple[str, ...] = ()
+    #: How many backend-artifact patterns (provider self-references, key/id
+    #: fragments, diagnostics) were scrubbed from the raw model answer. Zero
+    #: for a clean answer; >0 is reported through the lifecycle event log.
+    backend_artifacts: int = 0
 
     @property
     def display_title(self) -> str:
@@ -1036,8 +1180,18 @@ def _load_json_payload(text: str) -> dict:
 
 
 def parse_structured_notes(text: str) -> StructuredNotes:
-    """Parse a model answer into validated structured notes."""
-    return StructuredNotes.from_payload(_load_json_payload(text))
+    """Parse a model answer into validated structured notes.
+
+    Backend artifacts (provider self-references, key/id fragments, HTTP
+    diagnostics, schema commentary) are scrubbed from every string field
+    while parsing; the raw-answer hit count rides on the result so the
+    pipeline can report it (spec §46).
+    """
+    notes = StructuredNotes.from_payload(_load_json_payload(text))
+    hits = count_backend_artifacts(text)
+    if hits:
+        return replace(notes, backend_artifacts=hits)
+    return notes
 
 
 # ---------------------------------------------------------------------------
@@ -1798,6 +1952,14 @@ async def _structured_notes_for(
             raise StructuringError(
                 "پاسخ سرویس تولید جزوه پس از تلاش مجدد همچنان JSON معتبر نبود."
             ) from exc
+    if notes.backend_artifacts:
+        # spec §46: backend plumbing must never reach the published notes; the
+        # scrubber already removed it, this event makes the attempt observable.
+        await _emit_lifecycle(
+            "note_backend_artifacts_scrubbed",
+            request_type=task,
+            detail=f"scrubbed {notes.backend_artifacts} backend artifact(s)",
+        )
     logger.info(
         "Note structuring completed %s elapsed_seconds=%.1f sections=%s key_points=%s "
         "glossary=%s title_chars=%s",

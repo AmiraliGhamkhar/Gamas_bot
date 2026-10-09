@@ -51,6 +51,11 @@ class ProviderCredential:
     base_url: str | None = None
     model: str | None = None
     source: str = "database"
+    #: Admin billing flags (None = unmarked/unknown): a key explicitly marked
+    #: free_only=0 is a paid key and never serves FREE_ONLY legs; a key
+    #: explicitly marked paid_allowed=0 never serves paid-fallback legs.
+    free_only: int | None = None
+    paid_allowed: int | None = None
 
     @property
     def masked(self) -> str:
@@ -153,6 +158,9 @@ class ProviderCredentialManager:
         base_url: str | None = None,
         model: str | None = None,
         priority: int = 100,
+        enabled: bool = True,
+        free_only: bool | None = None,
+        paid_allowed: bool | None = None,
     ) -> int:
         service = service.strip().lower()
         provider = provider.strip().lower()
@@ -198,7 +206,79 @@ class ProviderCredentialManager:
             model=clean_model,
             priority=max(-1000, min(int(priority), 1000)),
             admin_id=admin_id,
+            enabled=enabled,
+            free_only=free_only,
+            paid_allowed=paid_allowed,
         )
+
+    async def replace_secret(self, credential_id: int, new_secret: str, admin_id: int) -> bool:
+        """Rotate one key's secret. Old and new values are never displayed."""
+        record = await self.db.provider_credential_record(int(credential_id))
+        if not record:
+            raise CredentialStoreError("کلید انتخاب‌شده پیدا نشد.")
+        ciphertext, last4 = self.encrypt_secret(new_secret)
+        changed = await self.db.replace_provider_credential_secret(
+            int(credential_id), ciphertext=ciphertext, last4=last4, admin_id=int(admin_id)
+        )
+        if changed:
+            self._environment_state.pop(
+                (str(record["service"]), str(record["provider"])), None
+            )
+        return changed
+
+    async def update_metadata(
+        self,
+        credential_id: int,
+        *,
+        label: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        admin_id: int,
+    ) -> bool:
+        """Edit label/base URL/model with the same validation as add."""
+        clean_base = (base_url or "").strip() or None
+        if clean_base:
+            parsed = urlparse(clean_base)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise CredentialStoreError("Base URL باید یک نشانی کامل http یا https باشد.")
+            if parsed.username or parsed.password or parsed.query or parsed.fragment:
+                raise CredentialStoreError(
+                    "Base URL نباید نام‌کاربری، رمز، query یا fragment داشته باشد."
+                )
+        clean_model = (model or "").strip() or None
+        if clean_model and len(clean_model) > 120:
+            raise CredentialStoreError("نام مدل بیش‌ازحد بلند است.")
+        clean_label = " ".join(label.split()) if label is not None else None
+        if clean_label is not None and (not clean_label or len(clean_label) > 80):
+            raise CredentialStoreError("نام نمایشی کلید معتبر نیست.")
+        try:
+            return await self.db.update_provider_credential_metadata(
+                int(credential_id),
+                label=clean_label,
+                base_url=clean_base,
+                model=clean_model,
+                admin_id=int(admin_id),
+            )
+        except ValueError as exc:
+            raise CredentialStoreError(str(exc)) from None
+
+    async def set_billing_flags(
+        self,
+        credential_id: int,
+        *,
+        free_only: bool | None = None,
+        paid_allowed: bool | None = None,
+        admin_id: int,
+    ) -> bool:
+        return await self.db.set_provider_credential_billing_flags(
+            int(credential_id),
+            free_only=free_only,
+            paid_allowed=paid_allowed,
+            admin_id=int(admin_id),
+        )
+
+    async def set_primary(self, credential_id: int, admin_id: int) -> bool:
+        return await self.db.set_provider_credential_primary(int(credential_id), int(admin_id))
 
     async def candidates(
         self,
@@ -245,6 +325,8 @@ class ProviderCredentialManager:
                     last4=str(row["secret_last4"]),
                     base_url=row.get("base_url"),
                     model=row.get("model"),
+                    free_only=row.get("free_only"),
+                    paid_allowed=row.get("paid_allowed"),
                 )
             )
         allow_keyless = False
@@ -377,6 +459,8 @@ class ProviderCredentialManager:
             base_url=record.get("base_url"),
             model=record.get("model"),
             source="database",
+            free_only=record.get("free_only"),
+            paid_allowed=record.get("paid_allowed"),
         )
 
     async def reorder(self, credential_id: int, direction: str, admin_id: int) -> bool:
