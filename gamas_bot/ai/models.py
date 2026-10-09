@@ -210,11 +210,21 @@ STATIC_SEEDS: dict[str, list[ModelInfo]] = {
             context_window=131_072, max_output_tokens=32_768,
             free_status=FREE_PLAN,
         ),
+        # Free tier 30 RPM / 1K RPD / 8K TPM (verified 2026-10-09). Groq's model
+        # doc recommends reasoning_effort="none" (instruct mode) for efficient
+        # general-purpose work — note structuring is exactly that, and thinking
+        # would burn the 8K TPM free budget.
         _seed(
-            "groq", "llama-3.3-70b-versatile",
-            ModelCapabilities(supports_json_object=True, supports_tools=True),
-            display_name="Llama 3.3 70B",
-            context_window=131_072, max_output_tokens=32_768,
+            "groq", "qwen/qwen3.8-27b",
+            ModelCapabilities(
+                supports_json_object=True, supports_json_schema=True,
+                supports_strict_json_schema=True, supports_reasoning=True,
+                supports_reasoning_effort=True, supports_tools=True,
+                supports_image=True,
+                recommended_reasoning_effort="none",
+            ),
+            display_name="Qwen 3.8 27B",
+            context_window=131_072, max_output_tokens=16_384,
             free_status=FREE_PLAN,
         ),
     ],
@@ -245,11 +255,19 @@ STATIC_SEEDS: dict[str, list[ModelInfo]] = {
         ),
     ],
     "zai": [
+        # Both models are listed as permanently Free on the Z.AI pricing page
+        # (verified 2026-10-09); live discovery supersedes this seed.
         _seed(
             "zai", "glm-4.5-flash",
             ModelCapabilities(supports_json_object=True, supports_reasoning=True),
             display_name="GLM 4.5 Flash",
             context_window=131_072, max_output_tokens=16_384,
+            free_status=FREE_PERMANENT,
+        ),
+        _seed(
+            "zai", "glm-4.7-flash",
+            ModelCapabilities(supports_json_object=True, supports_reasoning=True),
+            display_name="GLM 4.7 Flash",
             free_status=FREE_PERMANENT,
         ),
     ],
@@ -361,12 +379,16 @@ def infer_capabilities(provider: str, model_id: str) -> ModelCapabilities:
     if provider == "openrouter":
         return ModelCapabilities(supports_json_object=False)
     if provider == "groq":
-        oss = "gpt-oss" in lowered or lowered.startswith("openai/")
+        # Groq strict structured outputs (verified 2026-10-09): the GPT-OSS
+        # family and qwen/qwen3.8-27b. Other models get JSON object mode only.
+        oss = "gpt-oss" in lowered or lowered.startswith("openai/") or "qwen3" in lowered
         return ModelCapabilities(
             supports_json_object=True,
             supports_json_schema=oss,
             supports_strict_json_schema=oss,
             supports_reasoning_effort=oss,
+            supports_image="qwen3" in lowered,
+            recommended_reasoning_effort="none" if "qwen3" in lowered else "",
         )
     if provider in {"zai", "cerebras"}:
         return ModelCapabilities(supports_json_object=True, supports_reasoning="thinking" in lowered)

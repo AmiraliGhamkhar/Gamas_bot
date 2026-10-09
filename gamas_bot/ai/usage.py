@@ -35,6 +35,7 @@ EVENTS = (
     "note_request_failed",
     "note_request_fallback",
     "note_json_validation_failed",
+    "note_backend_artifacts_scrubbed",
     "note_repair_started",
     "note_repair_accepted",
     "note_repair_rejected",
@@ -161,22 +162,56 @@ class AIUsageTracker:
         *,
         source: str = "headers",
     ) -> None:
-        """Persist allowlisted rate-limit headers as the latest quota hint."""
+        """Persist allowlisted rate-limit headers as the latest quota hint.
+
+        Providers disagree on header semantics: Groq's ``x-ratelimit-*-requests``
+        always refers to the *daily* request limit, while SambaNova ships
+        separate per-minute and per-day (``-day`` suffix) headers. When the
+        day-window header exists we therefore prefer the ``-day`` variants so
+        the stored "remaining" matches the stored window.
+        """
         if not self.enabled or not headers:
             return
         remaining = None
         reset_at = None
+        limit = None
         window = "day" if "x-ratelimit-limit-requests-day" in headers else "minute"
-        for key in ("x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens"):
+        if window == "day":
+            remaining_keys = (
+                "x-ratelimit-remaining-requests-day",
+                "x-ratelimit-remaining-requests",
+                "x-ratelimit-remaining-tokens-day",
+                "x-ratelimit-remaining-tokens",
+            )
+            reset_keys = (
+                "x-ratelimit-reset-requests-day",
+                "x-ratelimit-reset-requests",
+                "x-ratelimit-reset-tokens-day",
+                "x-ratelimit-reset-tokens",
+            )
+            limit_keys = ("x-ratelimit-limit-requests-day", "x-ratelimit-limit-requests")
+        else:
+            remaining_keys = ("x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens")
+            reset_keys = ("x-ratelimit-reset-requests", "x-ratelimit-reset-tokens")
+            limit_keys = ("x-ratelimit-limit-requests", "x-ratelimit-limit-tokens")
+        for key in remaining_keys:
             if key in headers:
                 remaining = f"{key}={headers[key]}"
                 break
-        for key in ("x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+        for key in reset_keys:
             if key in headers:
                 reset_at = f"{key}={headers[key]}"
                 break
-        if remaining is None and reset_at is None:
+        for key in limit_keys:
+            if key in headers:
+                limit = f"{key}={headers[key]}"
+                break
+        if remaining is None and reset_at is None and limit is None:
             return
+        if limit and remaining:
+            remaining = f"{remaining} of {limit}"
+        elif limit:
+            remaining = limit
         try:
             await self.db.ai_quota_upsert(
                 provider, credential_id, model, window, remaining, reset_at, source=source

@@ -141,8 +141,10 @@ _NARA = ProviderInfo(
     data_use_policy="Third-party gateway; prompts transit the router. Review its terms.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Free plan models are listed by GET /v1/models on the free key; quota is "
-        "account-plan dependent and discovered, never assumed."
+        "Free plan models are listed by GET /v1/models on the free key (the "
+        "endpoint returns exactly the aliases the account's plan entitles; the "
+        "public /api/plans endpoint lists tiers). Quota is account-plan "
+        "dependent and discovered, never assumed."
     ),
     generation_allowed_in_free_only=True,
     quota_can_become_paid=True,
@@ -162,8 +164,10 @@ _GROQ = ProviderInfo(
     data_use_policy="See Groq privacy policy; API traffic policy per GroqCloud terms.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Free tier: per-model RPM/TPM/RPD limits (e.g. 30 RPM / 1K RPD class for "
-        "hosted OSS models). Read live from x-ratelimit-* response headers."
+        "Free tier (last verified 2026-10-09): per-model limits, e.g. "
+        "openai/gpt-oss-120b, openai/gpt-oss-20b and qwen/qwen3.8-27b at "
+        "30 RPM / 1K RPD / 8K TPM / 200K TPD. Live values are read from the "
+        "x-ratelimit-* response headers on every call."
     ),
     generation_allowed_in_free_only=True,
     quota_can_become_paid=False,
@@ -185,9 +189,12 @@ _OPENROUTER = ProviderInfo(
     ),
     commercial_use_allowed=True,
     free_tier_policy=(
-        ':free model variants plus the openrouter/free router; free accounts are '
-        "limited (20 RPM, ~50 requests/day for free models) — a local ledger is "
-        "kept because failed calls may still consume quota."
+        "Models with the :free suffix plus the openrouter/free router. Free "
+        "accounts (last verified 2026-10-09): 20 RPM and 50 requests/day; "
+        "accounts with >= $10 purchased credits get 1000 requests/day. "
+        "GET /api/v1/key exposes free_model_daily_requests {used, limit, "
+        "remaining}; a local ledger is kept because failed calls may still "
+        "consume quota."
     ),
     generation_allowed_in_free_only=True,
     quota_can_become_paid=False,
@@ -206,8 +213,10 @@ _MISTRAL = ProviderInfo(
     data_use_policy="See Mistral terms of service for API data retention.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Experiment/free tier with usage limits read from the account; the exact "
-        "limit is not hard-coded and is observed at runtime."
+        "Free mode (last verified 2026-10-09): API keys work with included "
+        "monthly usage inside the per-model limits on the Admin Panel Limits "
+        "page; pay-as-you-go only extends usage beyond it. The exact limit is "
+        "not hard-coded and is observed at runtime."
     ),
     generation_allowed_in_free_only=True,
     quota_can_become_paid=False,
@@ -226,7 +235,10 @@ _SAMBANOVA = ProviderInfo(
     data_use_policy="See SambaNova cloud terms.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Free tier per model with model-specific limits; multiple API keys are "
+        "Free tier = no payment method on the account (last verified "
+        "2026-10-09): e.g. Meta-Llama-3.3-70B-Instruct at 20 RPM / 20 RPD / "
+        "200K TPD; the Developer tier (payment method linked) raises these. "
+        "Limits are per model — never assumed equal. Multiple API keys are "
         "supported by the provider and by Gamas rotation."
     ),
     generation_allowed_in_free_only=True,
@@ -246,9 +258,10 @@ _ZAI = ProviderInfo(
     data_use_policy="See Z.AI terms.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Mixed catalog: some models are permanently free, others promotional-free "
-        "with an end date. Gamas records free_type (permanent|promotional|paid) "
-        "and free_until per model and stops using promotional models after expiry."
+        "Mixed catalog (last verified 2026-10-09): GLM-4.5-Flash and "
+        "GLM-4.7-Flash are listed as permanently Free; most other models are "
+        "paid. Gamas records free_type (permanent|promotional|paid) and "
+        "free_until per model and stops using promotional models after expiry."
     ),
     generation_allowed_in_free_only=True,
     quota_can_become_paid=False,
@@ -267,8 +280,9 @@ _NVIDIA = ProviderInfo(
     data_use_policy="See NVIDIA build terms; demo endpoints may log traffic.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        'Endpoints marked "Free Endpoint" in the live catalog; availability and '
-        "deprecation are model-level live facts, synced from GET /v1/models."
+        'Endpoints listed in the live catalog at https://integrate.api.nvidia.com/v1/models '
+        "(last verified 2026-10-09); availability and deprecation are "
+        "model-level live facts, synced on demand — never assumed permanent."
     ),
     generation_allowed_in_free_only=True,
     quota_can_become_paid=False,
@@ -287,8 +301,10 @@ _CLOUDFLARE = ProviderInfo(
     data_use_policy="See Cloudflare Workers AI terms; REST API via account token.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "10,000 neurons/day free allocation per account. Some models require "
-        "paid billing — each model carries requires_paid_billing and FREE_ONLY "
+        "10,000 Neurons/day free allocation per account (last verified "
+        "2026-10-09); the allocation resets daily at 00:00 UTC and usage above "
+        "it bills at $0.011 per 1,000 Neurons. Some models require paid "
+        "billing — each model carries requires_paid_billing and FREE_ONLY "
         "rejects those."
     ),
     generation_allowed_in_free_only=True,
@@ -299,7 +315,11 @@ _CLOUDFLARE = ProviderInfo(
 _HUGGINGFACE = ProviderInfo(
     slug="huggingface",
     display_name="Hugging Face Inference Providers",
-    classification=ProviderClass.FREE_PLAN,
+    # Current official pricing (verified 2026-10-09): free HF users receive NO
+    # monthly inference credit — usage requires purchased credits or a paid
+    # PRO/Team/Enterprise subscription ($2/seat monthly credits). There is no
+    # free tier, so this is paid-only capacity that stays experimental.
+    classification=ProviderClass.PAID_ONLY,
     protocol=PROTOCOL_OPENAI,
     base_url="https://router.huggingface.co/v1",
     auth_style=AuthStyle.BEARER,
@@ -308,8 +328,11 @@ _HUGGINGFACE = ProviderInfo(
     data_use_policy="Traffic is served by the selected third-party provider; see HF terms.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Small monthly free inference credit per account — experimental/testing "
-        "capacity only, never a primary provider. Credit usage is tracked."
+        "No free tier for free accounts (last verified 2026-10-09): Inference "
+        "Providers usage is pay-as-you-go on purchased credits; PRO/Team/Ent "
+        "subscriptions include $2/seat monthly credits. Kept experimental for "
+        "testing/benchmarks/emergency fallback only — never a primary "
+        "provider, and FREE_ONLY never routes here."
     ),
     generation_allowed_in_free_only=False,  # explicit admin opt-in
     quota_can_become_paid=True,
@@ -329,8 +352,10 @@ _ALIBABA = ProviderInfo(
     data_use_policy="See Alibaba Cloud Model Studio terms (regional).",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Free quota is region/model/account dependent with an expiry. Disabled "
-        "for global free routing by default; admins opt in per deployment."
+        "Free quota is region/model/account dependent with an expiry "
+        "(help.aliyun.com/en/model-studio/new-free-quota). Disabled for global "
+        "free routing by default; admins opt in per deployment after explicit "
+        "confirmation."
     ),
     generation_allowed_in_free_only=False,
     quota_can_become_paid=False,
@@ -351,8 +376,10 @@ _COHERE = ProviderInfo(
     data_use_policy="Trial keys: see Cohere trial API terms.",
     commercial_use_allowed=False,
     free_tier_policy=(
-        "Trial keys are rate-limited evaluation credentials; NOT production or "
-        "commercial credentials. Kept for evaluation/benchmarks only."
+        "Trial keys are evaluation keys (last verified 2026-10-09): free but "
+        "limited to 1,000 API calls/month and 20 req/min per model. NOT "
+        "production or commercial credentials. Kept for evaluation/benchmarks "
+        "only."
     ),
     generation_allowed_in_free_only=False,
     quota_can_become_paid=False,
@@ -372,8 +399,11 @@ _CEREBRAS = ProviderInfo(
     data_use_policy="See Cerebras terms.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Time-limited free-trial credit (e.g. $5 class). After exhaustion the "
-        "account needs billing — modelled as trial_only, used for benchmarks."
+        "Free Trial (last verified 2026-10-09): $5 in credits that expire 30 "
+        "days after grant, require a verified payment method, and cover the "
+        "shared catalog (e.g. gpt-oss-120b, qwen-3.8-27b at 5 RPM / 30K "
+        "uncached TPM). There is NO permanently free tier — modelled as "
+        "trial_only, used for benchmarks/evaluation only."
     ),
     generation_allowed_in_free_only=False,
     quota_can_become_paid=False,

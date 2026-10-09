@@ -202,6 +202,80 @@ class AIPanelCase(unittest.IsolatedAsyncioTestCase):
         models = await self.db.ai_models_list("groq")
         self.assertEqual(models[0]["deprecated"], 1)
 
+    async def test_key_action_replace_secret(self):
+        self._mock_bot_rendering()
+        key_id = await self.bot.credential_manager.add_credential(
+            service="notes", provider="groq", label="g1", secret="gsk-initial-1111", admin_id=7
+        )
+        # Initiating replace sets the pending action.
+        await self._callback(f"admin:ai:kstate:repl:{key_id}")
+        self.assertEqual(self.bot._pending_admin_actions[7], f"aikey_replace:{key_id}")
+        # Message with the new secret is delivered and deleted.
+        secret_event = _message_event(7, "gsk-rotated-2222")
+        await self.bot._handle_pending_admin_input(
+            secret_event, 7, f"aikey_replace:{key_id}", "gsk-rotated-2222"
+        )
+        secret_event.message.delete.assert_awaited()
+        summaries = await self.bot.credential_manager.list_summaries()
+        self.assertEqual(summaries[0]["secret_last4"], "2222")
+
+    async def test_key_action_edit_metadata(self):
+        self._mock_bot_rendering()
+        key_id = await self.bot.credential_manager.add_credential(
+            service="notes", provider="groq", label="g1", secret="gsk-initial-1111", admin_id=7
+        )
+        event = _message_event(7, "برچسب ویرایش‌شده")
+        await self.bot._handle_pending_admin_input(
+            event, 7, f"aikey_edit:label:{key_id}", "برچسب ویرایش‌شده"
+        )
+        summaries = await self.bot.credential_manager.list_summaries()
+        self.assertEqual(summaries[0]["label"], "برچسب ویرایش‌شده")
+
+    async def test_key_action_billing_flags(self):
+        self._mock_bot_rendering()
+        key_id = await self.bot.credential_manager.add_credential(
+            service="notes", provider="groq", label="g1", secret="gsk-initial-1111", admin_id=7
+        )
+        # Toggling free-only on an unmarked key sets it to 0 (paid).
+        await self._callback(f"admin:ai:kstate:free:{key_id}")
+        record = await self.db.provider_credential_record(key_id)
+        self.assertEqual(record["free_only"], 0)
+        # Next toggle sets it to 1 (free-only).
+        await self._callback(f"admin:ai:kstate:free:{key_id}")
+        record = await self.db.provider_credential_record(key_id)
+        self.assertEqual(record["free_only"], 1)
+
+    async def test_key_action_two_step_delete(self):
+        self._mock_bot_rendering()
+        key_id = await self.bot.credential_manager.add_credential(
+            service="notes", provider="groq", label="g1", secret="gsk-initial-1111", admin_id=7
+        )
+        # del1 asks for confirmation without deleting.
+        await self._callback(f"admin:ai:kstate:del1:{key_id}")
+        summaries = await self.bot.credential_manager.list_summaries()
+        self.assertEqual(len(summaries), 1)
+        self.assertIn("مطمئن هستید", self.last_text)
+        # del2 actually deletes.
+        await self._callback(f"admin:ai:kstate:del2:{key_id}")
+        summaries = await self.bot.credential_manager.list_summaries()
+        self.assertEqual(len(summaries), 0)
+
+    async def test_benchmarks_panel(self):
+        self._mock_bot_rendering()
+        # Seed the model row first so ai_model_set_quality finds a row to UPDATE.
+        await self.bot.model_registry.apply_discovery(
+            "groq",
+            [
+                __import__("gamas_bot.ai.models", fromlist=["ModelInfo"]).ModelInfo(
+                    provider="groq", model_id="openai/gpt-oss-120b", source="live"
+                )
+            ],
+        )
+        await self.db.ai_model_set_quality("groq", "openai/gpt-oss-120b", 88.5)
+        await self._callback("admin:ai:bm")
+        self.assertIn("Gamas Quality Score", self.last_text)
+        self.assertIn("88.5", self.last_text)
+
     async def test_dry_run_panel_never_shows_secret_or_prompt(self):
         self._mock_bot_rendering()
         await self._callback("admin:ai:dry:gemini")

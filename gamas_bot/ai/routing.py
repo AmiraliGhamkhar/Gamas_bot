@@ -320,6 +320,23 @@ class ProviderRouter:
         return PlannedRoute(legs=eligible, profile=profile, skipped=skipped)
 
     async def _daily_quota_exhausted(self, canonical: str) -> bool:
+        # A live entitlement probe (OpenRouter GET /api/v1/key) is the
+        # authoritative counter and wins over the conservative static default
+        # — e.g. an account with purchased credits gets 1000/day, not 50.
+        try:
+            live = await self.db.ai_quota_live_remaining(canonical)
+        except Exception:
+            live = None
+        if live is not None:
+            if live <= 0:
+                await self.tracker.event(
+                    "provider_quota_warning",
+                    service="notes",
+                    provider=canonical,
+                    request_type=TASK_CHUNK,
+                    detail=f"live free-daily remaining={live}",
+                )
+            return live <= 0
         profile = profile_for(canonical)
         if not profile.daily_request_limit:
             return False
@@ -380,11 +397,30 @@ class ProviderRouter:
                     continue
                 if resolve_canonical(pool, candidate.base_url) != leg.canonical:
                     continue
+                if not self._credential_allowed_for_leg(leg, candidate):
+                    continue
                 seen_ids.add(key)
                 found.append(candidate)
                 if len(found) >= 5:
                     return found
         return found
+
+    @staticmethod
+    def _credential_allowed_for_leg(leg: RouteLeg, credential: ProviderCredential) -> bool:
+        """Admin billing flags on a key gate which legs it may serve.
+
+        * FREE_ONLY leg: a key explicitly marked paid (``free_only=0``) is
+          skipped — the admin stated this key bills money.
+        * paid-fallback leg (only reachable with AI_ALLOW_PAID_FALLBACK): a
+          key explicitly marked ``paid_allowed=0`` is skipped.
+        Unmarked keys (NULL) are allowed everywhere, preserving the legacy
+        behaviour for existing deployments.
+        """
+        if leg.free_only and credential.free_only == 0:
+            return False
+        if not leg.free_only and credential.paid_allowed == 0:
+            return False
+        return True
 
     def _model_for(self, leg: RouteLeg, credential: ProviderCredential, profile: NoteProviderProfile) -> str:
         if leg.model:

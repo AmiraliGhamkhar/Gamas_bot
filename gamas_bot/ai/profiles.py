@@ -112,10 +112,16 @@ DEFAULT_PROFILES: dict[str, NoteProviderProfile] = {
         chunk_token_budget=5000,
         max_output_tokens=8192,
     ),
+    # Free tier (no payment method, verified 2026-10-09): 20 RPM / 20 RPD /
+    # 200K TPD for Meta-Llama-3.3-70B-Instruct — model-specific, so the hints
+    # stay conservative; live x-ratelimit-* headers refine them at runtime.
     "sambanova": NoteProviderProfile(
         provider="sambanova",
         chunk_token_budget=4000,
         max_output_tokens=8192,
+        requests_per_minute=20,
+        daily_request_limit=20,
+        policy=RequestPolicy(max_retries=1),
     ),
     "zai": NoteProviderProfile(
         provider="zai",

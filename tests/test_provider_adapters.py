@@ -152,8 +152,14 @@ class GroqContractTests(unittest.TestCase):
         )
         request = self.adapter.build(ctx, "k")
         self.assertEqual(request.json_body.get("reasoning_effort"), "none")
-        llama = models.STATIC_SEEDS["groq"][2]
-        ctx = make_ctx("groq", llama.model_id, model_info=llama, reasoning_policy="none")
+        # A model whose capabilities do not advertise reasoning_effort never
+        # receives the parameter, whatever the policy asks for.
+        plain = ModelInfo(
+            provider="groq",
+            model_id="some-plain-model",
+            capabilities=ModelCapabilities(supports_reasoning_effort=False),
+        )
+        ctx = make_ctx("groq", plain.model_id, model_info=plain, reasoning_policy="none")
         request = self.adapter.build(ctx, "k")
         self.assertNotIn("reasoning_effort", request.json_body)
 
@@ -162,6 +168,28 @@ class GroqContractTests(unittest.TestCase):
         ctx = make_ctx("groq", seed.model_id, model_info=seed)
         request = self.adapter.build(ctx, "k")
         self.assertFalse(request.json_body.get("stream"))
+
+    def test_qwen38_seed_uses_strict_schema_and_recommended_effort(self):
+        # Verified against console.groq.com/docs (2026-10-09): qwen/qwen3.8-27b
+        # supports strict structured outputs and documents instruct mode
+        # (reasoning_effort="none") for general-purpose work.
+        seed = next(m for m in models.STATIC_SEEDS["groq"] if m.model_id == "qwen/qwen3.8-27b")
+        self.assertTrue(seed.capabilities.supports_strict_json_schema)
+        self.assertEqual(seed.capabilities.recommended_reasoning_effort, "none")
+        ctx = make_ctx(
+            "groq", seed.model_id, model_info=seed, json_strategy=STRATEGY_STRICT_SCHEMA
+        )
+        request = self.adapter.build(ctx, "k")
+        self.assertEqual(request.json_body["response_format"]["json_schema"]["strict"], True)
+        # model_default policy picks up the documented recommendation.
+        self.assertEqual(request.json_body.get("reasoning_effort"), "none")
+
+    def test_zai_permanent_free_seeds(self):
+        # docs.z.ai pricing (verified 2026-10-09): GLM-4.5-Flash and
+        # GLM-4.7-Flash are listed as permanently Free.
+        ids = {m.model_id: m.free_status for m in models.STATIC_SEEDS["zai"]}
+        self.assertEqual(ids.get("glm-4.5-flash"), models.FREE_PERMANENT)
+        self.assertEqual(ids.get("glm-4.7-flash"), models.FREE_PERMANENT)
 
     def test_rate_limit_headers_captured_allowlist(self):
         captured = quota_headers(

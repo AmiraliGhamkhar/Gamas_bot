@@ -496,6 +496,23 @@ class OpenRouterAdapter(OpenAICompatibleAdapter):
         request.headers.setdefault("X-Title", "Gamas Study Bot")
         return request
 
+    def key_info_request(self, base_url: str, secret: str) -> tuple[str, str, dict[str, str]] | None:
+        """Read-only entitlement probe: GET /api/v1/key.
+
+        The response carries ``free_model_daily_requests {used, limit,
+        remaining}`` and ``is_free_tier`` — the authoritative free-ledger
+        state for the account (verified against openrouter.ai/docs
+        2026-10-09). Successful chat responses carry no X-RateLimit headers,
+        so this endpoint is the only live source for the daily counter.
+        """
+        if not base_url:
+            return None
+        return (
+            "GET",
+            _endpoint(base_url.rstrip("/"), "key"),
+            self.auth_headers(secret),
+        )
+
     def map_error(self, status, raw_body, headers, *, model, key):
         failure = super().map_error(status, raw_body, headers, model=model, key=key)
         lowered = (failure.message or "").lower()

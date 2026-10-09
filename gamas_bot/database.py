@@ -1592,15 +1592,23 @@ class Database:
         model: str | None,
         priority: int,
         admin_id: int,
+        enabled: bool = True,
+        free_only: bool | None = None,
+        paid_allowed: bool | None = None,
+        key_type: str = "api_key",
     ) -> int:
         now = utc_now()
         async with self._transaction(immediate=True) as db:
             cursor = await db.execute(
                 "INSERT INTO provider_credentials "
                 "(service, provider, label, secret_ciphertext, secret_last4, base_url, model, "
-                "priority, created_by_admin_id, updated_by_admin_id, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "priority, enabled, key_type, free_only, paid_allowed, "
+                "created_by_admin_id, updated_by_admin_id, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (service, provider, label, ciphertext, last4, base_url, model, int(priority),
+                 int(enabled), key_type,
+                 None if free_only is None else int(free_only),
+                 None if paid_allowed is None else int(paid_allowed),
                  admin_id, admin_id, now, now),
             )
             credential_id = int(cursor.lastrowid)
@@ -1609,6 +1617,143 @@ class Database:
                 {"service": service, "provider": provider, "label": label, "masked": f"••••{last4}"},
             )
             return credential_id
+
+    async def replace_provider_credential_secret(
+        self, credential_id: int, *, ciphertext: str, last4: str, admin_id: int
+    ) -> bool:
+        """Rotate one credential's secret; audit keeps only the masked form."""
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT label, secret_last4 FROM provider_credentials WHERE id=?",
+                (credential_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            await db.execute(
+                "UPDATE provider_credentials SET secret_ciphertext=?, secret_last4=?, "
+                "quarantined_at=NULL, cooldown_until=NULL, failure_streak=0, last_error=NULL, "
+                "updated_by_admin_id=?, updated_at=? WHERE id=?",
+                (ciphertext, last4, admin_id, now, credential_id),
+            )
+            await self._insert_audit(
+                db, admin_id, "provider_credential_secret_replaced", "provider_credential",
+                str(credential_id),
+                {"label": row["label"], "masked": f"••••{last4}"},
+            )
+            return True
+
+    async def update_provider_credential_metadata(
+        self,
+        credential_id: int,
+        *,
+        label: str | None = None,
+        base_url: str | None = None,
+        model: str | None = None,
+        admin_id: int,
+    ) -> bool:
+        """Edit label/base URL/model of one credential (validated like add)."""
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT service, provider, label, base_url, model FROM provider_credentials WHERE id=?",
+                (credential_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            new_label = row["label"] if label is None else label
+            new_base = row["base_url"] if base_url is None else (base_url or None)
+            new_model = row["model"] if model is None else (model or None)
+            if not str(new_label).strip():
+                raise ValueError("label must not be empty")
+            await db.execute(
+                "UPDATE provider_credentials SET label=?, base_url=?, model=?, "
+                "updated_by_admin_id=?, updated_at=? WHERE id=?",
+                (new_label, new_base, new_model, admin_id, now, credential_id),
+            )
+            await self._insert_audit(
+                db, admin_id, "provider_credential_metadata", "provider_credential",
+                str(credential_id),
+                {
+                    "service": row["service"], "provider": row["provider"],
+                    "label": new_label, "base_url": new_base, "model": new_model,
+                },
+            )
+            return True
+
+    async def set_provider_credential_billing_flags(
+        self,
+        credential_id: int,
+        *,
+        free_only: bool | None = None,
+        paid_allowed: bool | None = None,
+        admin_id: int,
+    ) -> bool:
+        """Mark a key free-only / paid-allowed (NULL = unmarked/unknown)."""
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT service, provider, label, free_only, paid_allowed "
+                "FROM provider_credentials WHERE id=?",
+                (credential_id,),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            new_free = row["free_only"] if free_only is None else int(free_only)
+            new_paid = row["paid_allowed"] if paid_allowed is None else int(paid_allowed)
+            await db.execute(
+                "UPDATE provider_credentials SET free_only=?, paid_allowed=?, "
+                "updated_by_admin_id=?, updated_at=? WHERE id=?",
+                (new_free, new_paid, admin_id, now, credential_id),
+            )
+            await self._insert_audit(
+                db, admin_id, "provider_credential_billing_flags", "provider_credential",
+                str(credential_id),
+                {
+                    "service": row["service"], "provider": row["provider"],
+                    "label": row["label"], "free_only": new_free, "paid_allowed": new_paid,
+                },
+            )
+            return True
+
+    async def set_provider_credential_primary(self, credential_id: int, admin_id: int) -> bool:
+        """Make one credential the first (priority 10) of its own pool."""
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT id, service, provider, label FROM provider_credentials WHERE id=?",
+                (credential_id,),
+            )
+            target = await cursor.fetchone()
+            if not target:
+                return False
+            cursor = await db.execute(
+                "SELECT id FROM provider_credentials WHERE service=? AND provider=? "
+                "ORDER BY priority, id",
+                (target["service"], target["provider"]),
+            )
+            ordered = [int(r["id"]) for r in await cursor.fetchall()]
+            if int(credential_id) in ordered:
+                ordered.remove(int(credential_id))
+            ordered.insert(0, int(credential_id))
+            for position, item_id in enumerate(ordered, start=1):
+                await db.execute(
+                    "UPDATE provider_credentials SET priority=?, updated_by_admin_id=?, "
+                    "updated_at=? WHERE id=?",
+                    (position * 10, admin_id, now, item_id),
+                )
+            await self._insert_audit(
+                db, admin_id, "provider_credential_primary", "provider_credential",
+                str(credential_id),
+                {
+                    "service": str(target["service"]), "provider": str(target["provider"]),
+                    "label": str(target["label"]),
+                },
+            )
+            return True
 
     async def provider_credential_records(
         self, service: str, provider: str
@@ -1643,7 +1788,9 @@ class Database:
             cursor = await self._db().execute(
                 "SELECT id, service, provider, label, secret_last4, base_url, model, priority, "
                 "enabled, quarantined_at, cooldown_until, last_status_code, last_success_at, "
-                "last_failure_at, last_used_at, last_error, created_at "
+                "last_failure_at, last_used_at, last_error, created_at, "
+                "key_type, free_only, paid_allowed, billing_state, expires_at, notes, "
+                "failure_streak, last_quota_json "
                 "FROM provider_credentials ORDER BY service, provider, priority, id"
             )
             return [dict(row) for row in await cursor.fetchall()]
@@ -2101,19 +2248,61 @@ class Database:
             return [dict(row) for row in await cursor.fetchall()]
 
     async def ai_usage_recent(
-        self, *, limit: int = 20, provider: str | None = None, failures_only: bool = False
+        self,
+        *,
+        limit: int = 20,
+        provider: str | None = None,
+        failures_only: bool = False,
+        credential_id: int | None = None,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM ai_usage_records WHERE 1=1"
         params: list = []
         if provider:
             query += " AND provider=?"
             params.append(provider)
+        if credential_id is not None:
+            query += " AND credential_id=?"
+            params.append(int(credential_id))
         if failures_only:
             query += " AND result='failure'"
         query += " ORDER BY id DESC LIMIT ?"
         params.append(max(1, int(limit)))
         async with self._lock:
             cursor = await self._db().execute(query, tuple(params))
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def ai_event_metrics(self, *, days: int = 1) -> dict[str, int]:
+        """Event counts grouped by name (repair/compile/quota observability)."""
+        cutoff = utc_now()[:10]
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT event, COUNT(*) AS n FROM ai_events "
+                "WHERE created_at >= datetime(?, ?) GROUP BY event",
+                (f"{cutoff}T00:00:00", f"-{max(1, int(days))} days"),
+            )
+            return {str(row["event"]): int(row["n"] or 0) for row in await cursor.fetchall()}
+
+    async def ai_quota_latest_all(self, *, limit: int = 30) -> list[dict[str, Any]]:
+        """Latest quota snapshot per provider (usage panel)."""
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT q.* FROM ai_quota_snapshots q "
+                "JOIN (SELECT provider, MAX(observed_at) AS mx FROM ai_quota_snapshots "
+                "GROUP BY provider) latest ON latest.provider=q.provider "
+                "AND latest.mx=q.observed_at ORDER BY q.provider LIMIT ?",
+                (max(1, int(limit)),),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def ai_model_benchmark_scores(self, *, limit: int = 12) -> list[dict[str, Any]]:
+        """Models with a stored Gamas quality score (benchmark panel)."""
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT provider, model, display_name, quality_score, last_benchmarked_at, "
+                "free_status, available FROM ai_models "
+                "WHERE quality_score IS NOT NULL ORDER BY quality_score DESC LIMIT ?",
+                (max(1, int(limit)),),
+            )
             return [dict(row) for row in await cursor.fetchall()]
 
     async def ai_usage_metrics(self, *, days: int = 1) -> dict[str, Any]:
@@ -2199,6 +2388,33 @@ class Database:
                 (provider,),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def ai_quota_live_remaining(self, provider: str) -> int | None:
+        """Remaining free-daily requests from a *today's* entitlement probe.
+
+        Only ``source='key_endpoint'`` snapshots (e.g. OpenRouter
+        ``GET /api/v1/key``) are authoritative enough to gate routing; header
+        snapshots carry opaque per-provider semantics and are display-only.
+        Returns ``None`` when no fresh probe exists.
+        """
+        today = utc_now()[:10]
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT remaining, observed_at FROM ai_quota_snapshots "
+                "WHERE provider=? AND source='key_endpoint' AND window='day' "
+                "ORDER BY observed_at DESC LIMIT 1",
+                (provider,),
+            )
+            row = await cursor.fetchone()
+        if not row:
+            return None
+        observed = str(row["observed_at"] or "")
+        if observed[:10] != today:
+            return None
+        match = re.search(r"remaining=(\d+)", str(row["remaining"] or ""))
+        if not match:
+            return None
+        return int(match.group(1))
 
     # -- event log (admin Logs panel) ----------------------------------------------
 
