@@ -38,6 +38,8 @@ def _env_names_read_by_config() -> set[str]:
         r'_path\(\s*"([A-Z0-9_]+)"',
         # PLAN_ENV_FIELDS entries: ("FREE_PLAN_HOURS", "free_plan_hours", 1)
         r'\(\s*"([A-Z0-9_]+)",\s*"[a-z0-9_]+",',
+        # Data-driven environment settings, e.g. ("groq", "STT_GROQ_CONCURRENCY", 1).
+        r'\(\s*"[a-z0-9_]+",\s*"([A-Z][A-Z0-9_]+)",\s*\d+\s*\)',
     ):
         names.update(re.findall(pattern, source))
     assert names, "no environment variables found in config.py; the parser is broken"

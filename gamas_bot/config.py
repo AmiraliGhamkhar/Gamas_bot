@@ -11,6 +11,8 @@ from urllib.parse import unquote, urlparse
 
 from dotenv import load_dotenv
 
+from .stt_platform.registry import STT_PROVIDER_CHOICES
+
 logger = logging.getLogger(__name__)
 
 TRUTHY = {"1", "true", "yes", "on"}
@@ -365,6 +367,40 @@ class Settings:
     stt_openai_api_key: str | None = field(default=None, repr=False)
     stt_openai_model: str = "whisper-1"
     stt_openai_max_upload: int = 25_000_000
+    # --- Gamas Speech Platform policy (all existing STT_* variables stay valid) ---
+    # Free-only is fail-closed for unverified paid/credit/trial routes. Legacy
+    # explicit STT_PRIMARY choices remain usable as configured; automatic
+    # trial/credit routing requires STT_ALLOW_TRIAL_PROVIDERS.
+    stt_free_only: bool = True
+    stt_allow_trial_providers: bool = False
+    stt_allow_paid_fallback: bool = False
+    stt_quota_safety_margin: float = 0.10
+    stt_provider_sync_ttl: int = 86400
+    stt_max_provider_failovers: int = 4
+    stt_quality_gate_enabled: bool = True
+    # Optional comma-separated route override (provider slugs, registry-backed).
+    # Blank retains the legacy Speechmatics -> Deepgram -> OpenAI-compatible
+    # order; new providers can be enabled without editing Python.
+    stt_default_route: str = ""
+    # Optional request features. Off by default (word-level timestamps and
+    # diarization may reduce accuracy, increase response size/cost, or lower
+    # provider duration caps).
+    stt_request_diarization: bool = False
+    stt_request_word_timestamps: bool = False
+    stt_smart_transcription: bool = False
+    stt_vocabulary_terms: tuple[str, ...] = ()
+    # Per-provider credentials/configuration from environment. API keys are
+    # repr-hidden; DB-managed credentials continue to use Fernet ciphertext.
+    stt_provider_api_keys: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    stt_provider_models: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    stt_provider_base_urls: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    stt_provider_regions: tuple[tuple[str, str], ...] = ()
+    stt_provider_concurrency: tuple[tuple[str, int], ...] = ()
+    stt_provider_max_uploads: tuple[tuple[str, int], ...] = ()
+    stt_aws_s3_bucket: str = ""
+    stt_aws_access_key_id: str = field(default="", repr=False)
+    stt_aws_secret_access_key: str = field(default="", repr=False)
+    stt_aws_session_token: str = field(default="", repr=False)
     # The historical Gemini fields remain for backwards compatibility.  New
     # installations can select Gemini, Anthropic, or any OpenAI-compatible API
     # through the provider-neutral NOTE_API_* settings below.
@@ -501,6 +537,20 @@ class Settings:
     docx_pagination_renderer_bin: str | None = None
     docx_toc_page_numbers: str = "auto"
 
+    def stt_api_key(self, provider: str) -> str | None:
+        """Environment-backed API key for one native STT provider."""
+        return dict(self.stt_provider_api_keys).get(provider)
+
+    def stt_model(self, provider: str) -> str | None:
+        """Configured native model, or None for the provider-registry default."""
+        return dict(self.stt_provider_models).get(provider)
+
+    def stt_base_url(self, provider: str) -> str | None:
+        return dict(self.stt_provider_base_urls).get(provider)
+
+    def stt_region(self, provider: str) -> str | None:
+        return dict(self.stt_provider_regions).get(provider)
+
     @property
     def lock_path(self) -> Path:
         """Advisory lock guarding the Telegram session against a second instance."""
@@ -608,9 +658,9 @@ class Settings:
             raise ValueError("TELEGRAM_API_ID و ADMIN_IDS باید عددی باشند.") from exc
 
         primary = _text("STT_PRIMARY", "speechmatics").lower()
-        if primary not in {"speechmatics", "deepgram", "openai_compatible"}:
+        if primary not in STT_PROVIDER_CHOICES:
             raise ValueError(
-                "STT_PRIMARY فقط می‌تواند speechmatics، deepgram یا openai_compatible باشد."
+                "STT_PRIMARY باید یک شناسهٔ provider ثبت‌شده در Gamas Speech Platform باشد."
             )
         language = _text("STT_LANGUAGE", "fa").strip()
         if not _is_supported_stt_language(language):
@@ -719,6 +769,9 @@ class Settings:
             ai_max_provider_failovers = int(_text("AI_MAX_PROVIDER_FAILOVERS", "3"))
             ai_max_generation_retries = int(_text("AI_MAX_GENERATION_RETRIES", "-1"))
             ai_quota_safety_margin = float(_text("AI_QUOTA_SAFETY_MARGIN", "0.15"))
+            stt_quota_safety_margin = float(_text("STT_QUOTA_SAFETY_MARGIN", "0.10"))
+            stt_provider_sync_ttl = int(_text("STT_PROVIDER_SYNC_TTL_SECONDS", "86400"))
+            stt_max_provider_failovers = int(_text("STT_MAX_PROVIDER_FAILOVERS", "4"))
             plan_values = {
                 name: int(_text(env_name, str(default)))
                 for env_name, name, default in PLAN_ENV_FIELDS
@@ -784,6 +837,12 @@ class Settings:
             raise ValueError("AI_MAX_GENERATION_RETRIES باید بین -۱ و ۱۰ باشد.")
         if not math.isfinite(ai_quota_safety_margin) or not 0 <= ai_quota_safety_margin <= 0.5:
             raise ValueError("AI_QUOTA_SAFETY_MARGIN باید عددی بین ۰ و ۰٫۵ باشد.")
+        if not math.isfinite(stt_quota_safety_margin) or not 0 <= stt_quota_safety_margin <= 0.5:
+            raise ValueError("STT_QUOTA_SAFETY_MARGIN باید عددی بین ۰ و ۰٫۵ باشد.")
+        if stt_provider_sync_ttl < 60:
+            raise ValueError("STT_PROVIDER_SYNC_TTL_SECONDS باید دست‌کم ۶۰ ثانیه باشد.")
+        if not 0 <= stt_max_provider_failovers <= 12:
+            raise ValueError("STT_MAX_PROVIDER_FAILOVERS باید بین ۰ و ۱۲ باشد.")
         log_level = _text("LOG_LEVEL", "INFO").upper()
         if log_level not in {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}:
             raise ValueError("LOG_LEVEL باید DEBUG، INFO، WARNING، ERROR یا CRITICAL باشد.")
@@ -867,6 +926,78 @@ class Settings:
         if min(media_timeout, convert_timeout) <= 0:
             raise ValueError("زمان‌های انتظار پردازش رسانه و تبدیل ارائه باید مثبت باشند.")
 
+        # The native provider adapter configuration is data-driven. Credentials
+        # stay environment-only or Fernet-encrypted in provider_credentials.
+        api_key_map = {
+            "groq": _text("GROQ_API_KEY", ""),
+            "gemini_transcribe": _text("GEMINI_STT_API_KEY", "") or os.getenv("GEMINI_API_KEY", "").strip(),
+            "assemblyai": _text("ASSEMBLYAI_API_KEY", ""),
+            "gladia": _text("GLADIA_API_KEY", ""),
+            "google_cloud_stt": _text("GOOGLE_CLOUD_STT_API_KEY", ""),
+            "ibm_watson_stt": _text("IBM_WATSON_STT_API_KEY", ""),
+            "azure_speech": _text("AZURE_SPEECH_API_KEY", ""),
+            "soniox": _text("SONIOX_API_KEY", ""),
+            "elevenlabs_scribe": _text("ELEVENLABS_API_KEY", ""),
+        }
+        model_map = {
+            "groq": _text("GROQ_STT_MODEL", "whisper-large-v3"),
+            "gemini_transcribe": _text("GEMINI_STT_MODEL", "gemini-3.5-transcribe"),
+            "assemblyai": _text("ASSEMBLYAI_STT_MODEL", "universal-2"),
+            "gladia": _text("GLADIA_STT_MODEL", "solaria-1"),
+            "google_cloud_stt": _text("GOOGLE_CLOUD_STT_MODEL", "latest_long"),
+            "ibm_watson_stt": _text("IBM_WATSON_STT_MODEL", ""),
+            "azure_speech": _text("AZURE_SPEECH_STT_MODEL", ""),
+            "soniox": _text("SONIOX_STT_MODEL", "stt-async-v5"),
+            "elevenlabs_scribe": _text("ELEVENLABS_STT_MODEL", "scribe_v2"),
+            "aws_transcribe": _text("AWS_TRANSCRIBE_STT_MODEL", "standard"),
+        }
+        region_map = {
+            "ibm_watson_stt": _text("IBM_WATSON_STT_REGION", "us-south"),
+            "google_cloud_stt": _text("GOOGLE_CLOUD_STT_REGION", "global"),
+            "aws_transcribe": _text("AWS_TRANSCRIBE_REGION", ""),
+            "azure_speech": _text("AZURE_SPEECH_REGION", ""),
+        }
+        base_map = {
+            "groq": _text("GROQ_STT_BASE_URL", "https://api.groq.com/openai/v1"),
+            "gemini_transcribe": _text("GEMINI_STT_BASE_URL", "https://generativelanguage.googleapis.com/v1beta"),
+            "assemblyai": _text("ASSEMBLYAI_STT_BASE_URL", "https://api.assemblyai.com/v2"),
+            "gladia": _text("GLADIA_STT_BASE_URL", "https://api.gladia.io/v2"),
+            "google_cloud_stt": _text("GOOGLE_CLOUD_STT_BASE_URL", "https://speech.googleapis.com/v1"),
+            "ibm_watson_stt": _text("IBM_WATSON_STT_BASE_URL", "https://api.{region}.speech-to-text.watson.cloud.ibm.com"),
+            "azure_speech": _text("AZURE_SPEECH_BASE_URL", "https://{region}.api.cognitive.microsoft.com"),
+            "soniox": _text("SONIOX_STT_BASE_URL", "https://api.soniox.com"),
+            "elevenlabs_scribe": _text("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1"),
+        }
+        # AWS requires a paired access key, secret access key, and a caller-owned
+        # S3 bucket; store both AWS secrets as a JSON string for the encrypted
+        # credential vault (not as plaintext database fields).
+        aws_access = os.getenv("AWS_TRANSCRIBE_ACCESS_KEY_ID", "").strip()
+        aws_secret = os.getenv("AWS_TRANSCRIBE_SECRET_ACCESS_KEY", "").strip()
+        aws_session = os.getenv("AWS_TRANSCRIBE_SESSION_TOKEN", "").strip()
+        aws_key_json = ""
+        if aws_access and aws_secret:
+            aws_key_json = json.dumps({"access_key_id": aws_access, "secret_access_key": aws_secret,
+                                       "session_token": aws_session}, separators=(",", ":"))
+            api_key_map["aws_transcribe"] = aws_key_json
+        route_value = _text("STT_DEFAULT_ROUTE", "")
+        stt_route = tuple(item.strip().lower() for item in route_value.split(",") if item.strip())
+        invalid_route = [item for item in stt_route if item not in STT_PROVIDER_CHOICES]
+        if invalid_route:
+            raise ValueError("STT_DEFAULT_ROUTE دارای provider ناشناخته است: " + ", ".join(invalid_route))
+        vocabulary_terms = []
+        seen_vocab = set()
+        for term in re.split(r"[,،؛\n]+", os.getenv("STT_VOCABULARY_HINTS", "")):
+            term = term.strip()
+            if term and term.casefold() not in seen_vocab:
+                seen_vocab.add(term.casefold())
+                vocabulary_terms.append(term)
+        try:
+            groq_upload_max = int(_text("GROQ_STT_MAX_UPLOAD_BYTES", "25000000"))
+        except ValueError as exc:
+            raise ValueError("GROQ_STT_MAX_UPLOAD_BYTES باید عددی باشد.") from exc
+        if groq_upload_max <= 0:
+            raise ValueError("GROQ_STT_MAX_UPLOAD_BYTES باید مثبت باشد.")
+
         return cls(
             telegram_bot_token=token,
             telegram_api_id=api_id,
@@ -901,6 +1032,45 @@ class Settings:
             stt_openai_api_key=(os.getenv("STT_OPENAI_API_KEY", "").strip() or None),
             stt_openai_model=_text("STT_OPENAI_MODEL", "whisper-1"),
             stt_openai_max_upload=stt_openai_max,
+            stt_free_only=_flag("STT_FREE_ONLY", True),
+            stt_allow_trial_providers=_flag("STT_ALLOW_TRIAL_PROVIDERS", False),
+            stt_allow_paid_fallback=_flag("STT_ALLOW_PAID_FALLBACK", False),
+            stt_quota_safety_margin=stt_quota_safety_margin,
+            stt_provider_sync_ttl=stt_provider_sync_ttl,
+            stt_max_provider_failovers=stt_max_provider_failovers,
+            stt_quality_gate_enabled=_flag("STT_QUALITY_GATE_ENABLED", True),
+            stt_default_route=",".join(stt_route),
+            stt_request_diarization=_flag("STT_REQUEST_DIARIZATION", False),
+            stt_request_word_timestamps=_flag("STT_REQUEST_WORD_TIMESTAMPS", False),
+            stt_smart_transcription=_flag("STT_SMART_TRANSCRIPTION", False),
+            stt_vocabulary_terms=tuple(vocabulary_terms),
+            stt_provider_api_keys=tuple((slug, value) for slug, value in api_key_map.items() if value),
+            stt_provider_models=tuple((slug, value) for slug, value in model_map.items() if value),
+            stt_provider_base_urls=tuple((slug, value.rstrip("/")) for slug, value in base_map.items() if value),
+            stt_provider_regions=tuple((slug, value) for slug, value in region_map.items() if value),
+            stt_provider_concurrency=tuple(
+                (slug, max(1, int(_text(env_name, str(default)))))
+                for slug, env_name, default in (
+                    ("speechmatics", "STT_SPEECHMATICS_CONCURRENCY", 2),
+                    ("deepgram", "STT_DEEPGRAM_CONCURRENCY", 2),
+                    ("openai_compatible", "STT_OPENAI_COMPATIBLE_CONCURRENCY", 2),
+                    ("groq", "STT_GROQ_CONCURRENCY", 1),
+                    ("gemini_transcribe", "STT_GEMINI_CONCURRENCY", 2),
+                    ("assemblyai", "STT_ASSEMBLYAI_CONCURRENCY", 2),
+                    ("gladia", "STT_GLADIA_CONCURRENCY", 2),
+                    ("google_cloud_stt", "STT_GOOGLE_CLOUD_CONCURRENCY", 2),
+                    ("ibm_watson_stt", "STT_IBM_CONCURRENCY", 2),
+                    ("azure_speech", "STT_AZURE_CONCURRENCY", 2),
+                    ("soniox", "STT_SONIOX_CONCURRENCY", 2),
+                    ("elevenlabs_scribe", "STT_ELEVENLABS_CONCURRENCY", 2),
+                    ("aws_transcribe", "STT_AWS_TRANSCRIBE_CONCURRENCY", 1),
+                )
+            ),
+            stt_provider_max_uploads=(("groq", groq_upload_max),),
+            stt_aws_s3_bucket=_text("AWS_TRANSCRIBE_S3_BUCKET", ""),
+            stt_aws_access_key_id=aws_access,
+            stt_aws_secret_access_key=aws_secret,
+            stt_aws_session_token=aws_session,
             note_api_provider=note_provider,
             note_api_key=(os.getenv("NOTE_API_KEY", "").strip() or None),
             note_api_base_url=note_base_url,
