@@ -172,7 +172,7 @@ class AIPanelCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summaries[0]["provider"], "groq")
         self.assertEqual(summaries[0]["secret_last4"], "9999")
 
-    async def test_usage_panel_and_reset(self):
+    async def test_usage_panel_blocks_unsafe_manual_reset(self):
         self._mock_bot_rendering()
         for _ in range(3):
             await self.db.ai_usage_insert(
@@ -181,9 +181,12 @@ class AIPanelCase(unittest.IsolatedAsyncioTestCase):
             )
         await self._callback("admin:ai:us")
         self.assertIn("groq", self.last_text)
+        self.assertIn("reset دستی", self.last_text)
         await self._callback("admin:ai:usrst:groq")
         count = await self.db.ai_usage_today_count("groq")
-        self.assertEqual(count, 0)
+        self.assertEqual(count, 3)
+        audit = await self.db.audit_entries(limit=10)
+        self.assertTrue(any(row["action"] == "ai_usage_reset_blocked" for row in audit))
 
     async def test_models_panel_marks_deprecated(self):
         self._mock_bot_rendering()
@@ -231,19 +234,30 @@ class AIPanelCase(unittest.IsolatedAsyncioTestCase):
         summaries = await self.bot.credential_manager.list_summaries()
         self.assertEqual(summaries[0]["label"], "برچسب ویرایش‌شده")
 
-    async def test_key_action_billing_flags(self):
+    async def test_key_action_requires_explicit_billing_attestation(self):
         self._mock_bot_rendering()
         key_id = await self.bot.credential_manager.add_credential(
             service="notes", provider="groq", label="g1", secret="gsk-initial-1111", admin_id=7
         )
-        # Toggling free-only on an unmarked key sets it to 0 (paid).
-        await self._callback(f"admin:ai:kstate:free:{key_id}")
         record = await self.db.provider_credential_record(key_id)
-        self.assertEqual(record["free_only"], 0)
-        # Next toggle sets it to 1 (free-only).
-        await self._callback(f"admin:ai:kstate:free:{key_id}")
+        self.assertEqual(record["billing_state"], "unknown")
+        # FREE attestation asks for confirmation that no paid overage is possible.
+        await self._callback(f"admin:ai:kstate:attest_free:{key_id}")
+        self.assertIn("سقف سخت $0", self.last_text)
         record = await self.db.provider_credential_record(key_id)
+        self.assertEqual(record["billing_state"], "unknown")
+        await self._callback(f"admin:ai:kstate:attest_free_confirm:{key_id}")
+        record = await self.db.provider_credential_record(key_id)
+        self.assertEqual(record["billing_state"], "free")
         self.assertEqual(record["free_only"], 1)
+        self.assertEqual(record["paid_allowed"], 0)
+        self.assertTrue(record["billing_attested_at"])
+        self.assertEqual(record["billing_attested_by_admin_id"], 7)
+        # Clearing is immediate and fail-closed.
+        await self._callback(f"admin:ai:kstate:attest_clear:{key_id}")
+        record = await self.db.provider_credential_record(key_id)
+        self.assertEqual(record["billing_state"], "unknown")
+        self.assertIsNone(record["billing_attested_at"])
 
     async def test_key_action_two_step_delete(self):
         self._mock_bot_rendering()

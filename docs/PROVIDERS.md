@@ -40,24 +40,40 @@ reference): a 15-provider registry (`gemini`, `nara`, `groq`, `openrouter`,
 capability-aware JSON strategies, provider-level failover and credential
 rotation. Free-tier is the default: `AI_FREE_ONLY=true` blocks non-free
 providers; `AI_ALLOW_PAID_FALLBACK` (default `false`) can append paid legs
-strictly **after** every free leg.
+strictly **after** every free leg. Z.AI’s selected GLM models are listed Free
+in its pricing table, but Terms §III.06 restrict specified education-related
+decision-making and services requiring educational qualifications or
+professional review. This is not a blanket ban on all educational use; Gamas
+conservatively blocks student-note routes pending scope clarification, regardless
+of model price or key billing attestation.
 
-Backward compatibility is preserved byte-for-byte:
+Backward compatibility is preserved at the configuration and pipeline
+boundary:
 
 * `NOTE_API_PROVIDER=openai_compatible` + `NOTE_API_BASE_URL=https://router.bynara.id/v1`
-  (the production NaraRouter deployment) keeps working unchanged — the legacy
-  provider is seeded as route leg 0.
-* `NOTE_API_PROVIDER=gemini` keeps using the native `generateContent`
-  payload; with modern capability discovery the platform additionally sends a
-  cleaned `responseSchema` for reliable structured output.
-* `NOTE_API_JSON_MODE=1` keeps injecting `response_format: json_object`.
-* `AI_ROUTING_ENABLED=false` turns the whole router off and restores the exact
-  legacy single-provider path.
+  (the production NaraRouter deployment) is still resolved as NaraRouter and
+  remains seeded first; `NOTE_API_MODEL=agnes-3-flash` is preserved. Migration
+  007 deliberately does **not** claim that model is free: the currently
+  published Nara Free-plan list names `agnes-2.5-flash`, not `agnes-3-flash`.
+  Existing environment keys stay configured and work for read-only checks, but
+  generation requires copying the same secret into the encrypted vault and
+  explicitly attesting its billing state.
+* `NOTE_API_PROVIDER=gemini` keeps using the native `generateContent` adapter;
+  only exact reviewed model capabilities enable a Gemini `responseSchema`.
+* `NOTE_API_JSON_MODE=1` remains supported for the legacy generic
+  OpenAI-compatible route. It does not override a provider/model’s verified
+  strategy or leak JSON-object mode to NaraRouter.
+* `AI_ROUTING_ENABLED=false` bypasses the new router and retains the legacy
+  single-provider code path, subject to that path’s existing deployment settings.
 
 The single-provider legacy knobs stay authoritative in legacy mode:
 `NOTE_API_BASE_URL`, `NOTE_API_MODEL`, `NOTE_API_TIMEOUT_SECONDS`,
 `NOTE_API_RETRIES`, `NOTE_API_MAX_OUTPUT_TOKENS`,
 `NOTE_API_EXTRA_HEADERS_JSON` (auth headers are still stripped with a warning).
+When routing is enabled, timeout/retry/output values remain upper bounds on
+provider-specific profiles; they may tighten, but never inflate, a provider
+budget. The full billing-attestation and model-eligibility rules are in
+[AI_PROVIDERS.md](AI_PROVIDERS.md).
 
 * `NOTE_MODE` (`full`/`standard`/`summary`) is the only intentional compression.
 * `NOTE_REPAIR_ENABLED` adds a second pass **only** when the deterministic QA

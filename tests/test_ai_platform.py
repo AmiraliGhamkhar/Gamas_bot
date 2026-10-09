@@ -9,15 +9,20 @@ region / commercial-use restrictions, and legacy backward compatibility.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from cryptography.fernet import Fernet
 
 from gamas_bot.ai.models import (
     FREE_PROMOTIONAL,
+    PAID,
+    STATIC_SEEDS,
+    ModelCapabilities,
     ModelInfo,
     ModelRegistry,
 )
@@ -83,7 +88,7 @@ class _ScriptedSession:
         self.rules.append((host, list(responses)))
 
     def post(self, url, headers=None, params=None, json=None, timeout=None, data=None):
-        self.requests.append({"url": url, "headers": headers, "json": json})
+        self.requests.append({"url": url, "headers": headers, "json": json, "timeout": timeout})
         for host, responses in self.rules:
             if host in url and responses:
                 response = responses.pop(0) if len(responses) > 1 else responses[0]
@@ -153,12 +158,13 @@ class RegistryClassificationTests(unittest.TestCase):
     def test_free_only_eligibility_matrix(self):
         self.assertTrue(free_only_generation_allowed("gemini"))
         self.assertTrue(free_only_generation_allowed("nara"))
-        self.assertTrue(free_only_generation_allowed("groq"))
+        self.assertFalse(free_only_generation_allowed("groq"))
         self.assertTrue(free_only_generation_allowed("openrouter"))
         self.assertFalse(free_only_generation_allowed("cohere"))
         self.assertFalse(free_only_generation_allowed("cerebras"))
         self.assertFalse(free_only_generation_allowed("alibaba"))
         self.assertFalse(free_only_generation_allowed("anthropic"))
+        self.assertFalse(free_only_generation_allowed("zai"))
         self.assertFalse(free_only_generation_allowed("openai_compatible"))
 
     def test_url_classification(self):
@@ -181,9 +187,10 @@ class RegistryClassificationTests(unittest.TestCase):
             self.assertEqual(resolve_canonical("openai_compatible", url), canonical, url)
 
     def test_classification_labels(self):
-        self.assertEqual(registry_info("cloudflare").classification, ProviderClass.PERMANENT_FREE)
-        self.assertEqual(registry_info("zai").classification, ProviderClass.PROMOTIONAL_FREE)
-        self.assertEqual(registry_info("nvidia").classification, ProviderClass.PROMOTIONAL_FREE)
+        self.assertEqual(registry_info("cloudflare").classification, ProviderClass.FREE_PLAN)
+        self.assertEqual(registry_info("groq").classification, ProviderClass.ACCOUNT_UNVERIFIED)
+        self.assertEqual(registry_info("zai").classification, ProviderClass.FREE_PLAN)
+        self.assertEqual(registry_info("nvidia").classification, ProviderClass.TRIAL_ONLY)
         self.assertEqual(registry_info("cohere").classification, ProviderClass.TRIAL_ONLY)
         self.assertEqual(registry_info("alibaba").classification, ProviderClass.REGION_RESTRICTED)
 
@@ -267,7 +274,39 @@ class ModelRegistryTests(PlatformCase):
         static = await self.models.resolve("gemini", "gemini-2.5-flash")
         self.assertEqual(static.source, "static_seed")
         unknown = await self.models.resolve("nara", "totally-new-model")
-        self.assertEqual(unknown.free_status, "free_plan")  # account-level free plan
+        self.assertEqual(unknown.free_status, "unknown")  # account-level plan is not model evidence
+
+    async def test_reviewed_seed_facts_survive_incomplete_live_catalog_rows(self):
+        seed = next(
+            model for model in STATIC_SEEDS["gemini"]
+            if model.model_id == "gemini-2.5-flash"
+        )
+        await self.models.apply_discovery(
+            "gemini",
+            [
+                ModelInfo(
+                    provider="gemini", model_id=seed.model_id,
+                    capabilities=ModelCapabilities(), free_status="unknown", source="live:test",
+                )
+            ],
+        )
+        resolved = await self.models.resolve("gemini", seed.model_id)
+        stored = await self.db.ai_model_get("gemini", seed.model_id)
+        self.assertEqual(resolved.free_status, seed.free_status)
+        self.assertEqual(resolved.capabilities, seed.capabilities)
+        self.assertEqual(stored["free_status"], seed.free_status)
+        self.assertEqual(
+            ModelCapabilities.from_json(stored["capabilities_json"]), seed.capabilities
+        )
+
+        # A later, explicit live paid fact is not hidden by the static seed.
+        await self.models.apply_discovery(
+            "gemini",
+            [ModelInfo(provider="gemini", model_id=seed.model_id, free_status=PAID, source="live:test")],
+        )
+        resolved = await self.models.resolve("gemini", seed.model_id)
+        self.assertEqual(resolved.free_status, PAID)
+        self.assertEqual(resolved.capabilities, seed.capabilities)
 
     async def test_promotional_expiry_blocks_model(self):
         from datetime import datetime, timedelta, timezone
@@ -281,17 +320,83 @@ class ModelRegistryTests(PlatformCase):
 
     async def test_sync_uses_adapter_and_records_event(self):
         async def fake_fetch(url, headers, timeout):
-            return 200, {}, json.dumps(
-                {"data": [{"id": "agnes-3-flash"}, {"id": "agnes-3-pro"}]}
-            ).encode("utf-8")
+            if url.endswith("/api/plans"):
+                payload = {"data": [{"code": "free", "is_active": True,
+                                    "models": ["agnes-2.5-flash"]},
+                                   {"code": "freemium", "is_active": True,
+                                    "models": ["agnes-3-flash"]}]}
+            else:
+                payload = {"data": [{"id": "agnes-2.5-flash"}, {"id": "agnes-3-flash"}]}
+            return 200, {}, json.dumps(payload).encode("utf-8")
 
         result = await sync_provider_catalog(self.router, "nara", session_get=fake_fetch, force=True)
         self.assertTrue(result.ok)
         self.assertEqual(result.synced, 2)
+        free_model = await self.models.resolve("nara", "agnes-2.5-flash")
+        paid_model = await self.models.resolve("nara", "agnes-3-flash")
+        self.assertEqual(free_model.free_status, "free_plan")
+        self.assertEqual(paid_model.free_status, "paid")
         events = await self.db.ai_events_list(event="provider_sync")
         self.assertTrue(events)
         second = await sync_provider_catalog(self.router, "nara", session_get=fake_fetch)
         self.assertTrue(second.cached)
+
+
+class CatalogSyncSafetyTests(PlatformCase):
+    async def test_cloudflare_pages_and_failed_sync_preserve_existing_catalog(self):
+        from gamas_bot.ai.adapters import adapter_for
+
+        self.settings = replace(self.settings, cloudflare_account_id="acc-123")
+        self.manager.settings = self.settings
+        self.models.settings = self.settings
+        self.router = ProviderRouter(
+            self.db, self.settings, self.manager, self.tracker, self.models
+        )
+        key_id = await self.manager.add_credential(
+            service="notes", provider="cloudflare", label="cf", secret="cf-token-0001", admin_id=1
+        )
+        # Read-only catalog discovery is allowed with an un-attested key; it
+        # does not authorize any generation or change the key billing state.
+        await self.models.apply_discovery(
+            "cloudflare", [ModelInfo(provider="cloudflare", model_id="old-model", source="live:test")]
+        )
+        adapter = adapter_for("cloudflare", self.settings)
+        adapter.discovery_page_size = 2
+        adapter.max_discovery_pages = 3
+
+        def body(ids):
+            return json.dumps({"success": True, "result": {"data": [{"id": item} for item in ids]}}).encode()
+
+        async def failed_fetch(url, headers, timeout):
+            if "page=1" in url:
+                return 200, {}, body(["model-a", "model-b"])
+            return 503, {}, b"provider diagnostic containing cf-token-0001"
+
+        failed = await sync_provider_catalog(
+            self.router, "cloudflare", adapter=adapter, session_get=failed_fetch, force=True
+        )
+        self.assertFalse(failed.ok)
+        prior = await self.db.ai_model_get("cloudflare", "old-model")
+        self.assertTrue(prior["available"])
+        self.assertEqual((await self.db.provider_credential_record(key_id))["billing_state"], "unknown")
+
+        async def successful_fetch(url, headers, timeout):
+            if "page=1" in url:
+                return 200, {}, body(["model-a", "model-b"])
+            return 200, {}, body(["model-c"])
+
+        result = await sync_provider_catalog(
+            self.router, "cloudflare", adapter=adapter, session_get=successful_fetch, force=True
+        )
+        self.assertTrue(result.ok)
+        self.assertEqual(result.synced, 3)
+        self.assertEqual(result.deactivated, 1)
+        models = await self.db.ai_models_list("cloudflare", include_unavailable=True)
+        by_id = {item["model"]: item for item in models}
+        self.assertFalse(by_id["old-model"]["available"])
+        self.assertEqual(by_id["model-a"]["free_status"], "unknown")
+        events = await self.db.ai_events_list(event="provider_sync")
+        self.assertNotIn("cf-token-0001", repr(events))
 
 
 class RoutingPlanTests(PlatformCase):
@@ -380,40 +485,70 @@ class RoutingPlanTests(PlatformCase):
 
 
 class FailoverRotationTests(PlatformCase):
+    async def _paid_compatible_mode(self):
+        # Groq is deliberately not classified free. These tests exercise
+        # request failover under an explicitly relaxed test deployment.
+        self.settings = replace(self.settings, ai_free_only=False)
+        self.manager.settings = self.settings
+        self.models.settings = self.settings
+        self.router = ProviderRouter(
+            self.db, self.settings, self.manager, self.tracker, self.models
+        )
+
     async def _route(self, providers):
         await self.db.ai_routes_replace(
             "notes", "chunk_structuring",
-            [{"provider": p, "enabled": 1, "free_only": 1} for p in providers],
+            [
+                {"provider": p, "enabled": 1, "free_only": 0 if p == "groq" else 1}
+                for p in providers
+            ],
             admin_id=None,
         )
 
+    async def _add_paid_groq(self, label="g1", secret="gsk-paid-key-0001"):
+        credential_id = await self.manager.add_credential(
+            service="notes", provider="groq", label=label,
+            secret=secret, admin_id=1,
+        )
+        await self.manager.set_billing_attestation(credential_id, "paid", 1)
+        return credential_id
+
+    async def _add_free_gemini(self, label="gemini", secret="AIza-free-test-1234"):
+        credential_id = await self.manager.add_credential(
+            service="notes", provider="gemini", label=label,
+            secret=secret, admin_id=1,
+        )
+        await self.manager.set_billing_attestation(credential_id, "free", 1)
+        return credential_id
+
     async def test_provider_level_failover_after_429_with_no_credentials(self):
-        await self._route(["groq", "nara"])
+        await self._paid_compatible_mode()
+        await self._route(["groq", "gemini"])
+        await self._add_free_gemini()
         session = _ScriptedSession()
         job = await self._session_plan()
-        # groq has no credential -> leg fails -> nara succeeds via env key.
-        session.add("router.bynara.id", _Response(200, _notes_payload("{\"title\": \"ت\"}")))
+        # Groq has no credential; the attested Gemini leg succeeds.
+        session.add("generativelanguage.googleapis.com", _Response(200, _gemini_payload("{\"title\": \"ت\"}")))
         text = await job.generate(
             request_type="chunk_structuring", task="chunk_structuring",
             system_prompt="S", user_text="U", session=session,
         )
         self.assertEqual(text, "{\"title\": \"ت\"}")
-        self.assertGreaterEqual(job.fallbacks, 1)
+        self.assertEqual(job.fallbacks, 1)
         rows = await self.db.ai_usage_recent(limit=10)
-        self.assertTrue(any(r["provider"] == "nara" and r["result"] == "success" for r in rows))
+        self.assertTrue(any(row["provider"] == "gemini" and row["result"] == "success" for row in rows))
 
-    async def test_quota_failover_groq_429_then_nara(self):
-        groq_id = await self.manager.add_credential(
-            service="notes", provider="groq", label="g1",
-            secret="gsk-test-key-0001", admin_id=1,
-        )
-        await self._route(["groq", "nara"])
+    async def test_quota_failover_groq_429_then_gemini(self):
+        await self._paid_compatible_mode()
+        groq_id = await self._add_paid_groq(secret="gsk-test-key-0001")
+        await self._add_free_gemini()
+        await self._route(["groq", "gemini"])
         session = _ScriptedSession()
         session.add(
             "api.groq.com",
             _Response(429, {"error": {"message": "rate limited"}}, {"Retry-After": "30"}),
         )
-        session.add("router.bynara.id", _Response(200, _notes_payload("OK")))
+        session.add("generativelanguage.googleapis.com", _Response(200, _gemini_payload("OK")))
         job = await self._session_plan()
         text = await job.generate(
             request_type="chunk_structuring", task="chunk_structuring",
@@ -426,12 +561,9 @@ class FailoverRotationTests(PlatformCase):
         self.assertTrue(events)
 
     async def test_401_quarantines_credential_and_rotates(self):
-        bad = await self.manager.add_credential(
-            service="notes", provider="groq", label="bad", secret="gsk-bad-1111", admin_id=1
-        )
-        await self.manager.add_credential(
-            service="notes", provider="groq", label="good", secret="gsk-good-2222", admin_id=1
-        )
+        await self._paid_compatible_mode()
+        bad = await self._add_paid_groq(label="bad", secret="gsk-bad-1111")
+        await self._add_paid_groq(label="good", secret="gsk-good-2222")
         await self._route(["groq"])
         session = _ScriptedSession()
         session.add(
@@ -451,10 +583,10 @@ class FailoverRotationTests(PlatformCase):
         self.assertTrue(events)
 
     async def test_502_is_retried_before_failover(self):
-        await self.manager.add_credential(
-            service="notes", provider="groq", label="g1", secret="gsk-key-3333", admin_id=1
-        )
-        await self._route(["groq", "nara"])
+        await self._paid_compatible_mode()
+        await self._add_paid_groq(secret="gsk-key-3333")
+        await self._route(["groq", "gemini"])
+        await self._add_free_gemini()
         session = _ScriptedSession()
         session.add(
             "api.groq.com",
@@ -470,9 +602,8 @@ class FailoverRotationTests(PlatformCase):
         self.assertEqual(job.fallbacks, 0)
 
     async def test_400_schema_rejection_downgrades_once(self):
-        await self.manager.add_credential(
-            service="notes", provider="groq", label="g1", secret="gsk-key-4444", admin_id=1
-        )
+        await self._paid_compatible_mode()
+        await self._add_paid_groq(secret="gsk-key-4444")
         await self._route(["groq"])
         session = _ScriptedSession()
         session.add(
@@ -490,9 +621,8 @@ class FailoverRotationTests(PlatformCase):
         self.assertNotIn("response_format", second)
 
     async def test_all_providers_fail_raises_content_free_error(self):
-        await self.manager.add_credential(
-            service="notes", provider="groq", label="g1", secret="gsk-secret-5555", admin_id=1
-        )
+        await self._paid_compatible_mode()
+        await self._add_paid_groq(secret="gsk-secret-5555")
         await self._route(["groq"])
         session = _ScriptedSession()
         session.add(
@@ -517,7 +647,15 @@ class FailoverRotationTests(PlatformCase):
             gemini_api_key="AIza-env",
             ai_free_only=True,
         )
-        await self._route(["gemini"])
+        credential_id = await self.manager.add_credential(
+            service="notes", provider="gemini", label="attested env copy",
+            secret="AIza-env", admin_id=1,
+        )
+        await self.manager.set_billing_attestation(credential_id, "free", 1)
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "gemini", "enabled": 1, "free_only": 1}], admin_id=None,
+        )
         router = ProviderRouter(self.db, settings, self.manager, self.tracker, self.models)
         plan = await router.plan()
         job = NoteJobSession(router, plan, settings)
@@ -533,16 +671,135 @@ class FailoverRotationTests(PlatformCase):
         config = request["json"]["generationConfig"]
         self.assertIn("responseSchema", config)
 
-    async def test_historical_deployment_replays_legacy_credential_pool(self):
-        # NOTE_API_PROVIDER=openai_compatible + Nara base + key (no stored keys).
-        await self._session_plan()
+    async def test_historical_deployment_preserves_but_does_not_auto_attest_env_key(self):
+        # NOTE_API_PROVIDER=openai_compatible + Nara base + legacy key remains
+        # configured and discoverable, but it is not silently marked free.
         leg = RouteLeg(provider="nara", canonical="nara")
-        pool = await self.router.credentials_for(leg)
-        self.assertEqual(len(pool), 1)
-        self.assertEqual(pool[0].secret, "sk-nara-env-1234")
+        generation_pool = await self.router.credentials_for(leg)
+        self.assertEqual(generation_pool, [])
+        discovery_pool = await self.router.credentials_for(leg, for_generation=False)
+        self.assertEqual(len(discovery_pool), 1)
+        self.assertEqual(discovery_pool[0].secret, "sk-nara-env-1234")
+
+
+class LegacyNoteSettingCompatibilityTests(PlatformCase):
+    async def test_note_api_timeout_retries_and_output_remain_safety_caps(self):
+        settings = replace(
+            self.settings,
+            note_api_provider="gemini",
+            note_api_key=None,
+            note_api_base_url=None,
+            note_api_model=None,
+            gemini_api_key="AIza-test",
+            note_api_timeout=12,
+            note_api_retries=0,
+            note_api_max_output_tokens=321,
+        )
+        self.manager.settings = settings
+        router = ProviderRouter(self.db, settings, self.manager, self.tracker, self.models)
+        key_id = await self.manager.add_credential(
+            service="notes", provider="gemini", label="gemini", secret="AIza-test", admin_id=1
+        )
+        await self.manager.set_billing_attestation(key_id, "free", 1)
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "gemini", "enabled": 1, "free_only": 1}], admin_id=None,
+        )
+        plan = await router.plan()
+        job = NoteJobSession(router, plan, settings)
+        session = _ScriptedSession()
+        session.add(
+            "generativelanguage.googleapis.com",
+            _Response(502, {"error": {"message": "temporary"}}),
+            _Response(200, _gemini_payload("OK")),
+        )
+        with self.assertRaises(StructuringError):
+            await job.generate(
+                request_type="chunk_structuring", task="chunk_structuring",
+                system_prompt="S", user_text="U", session=session,
+            )
+        self.assertEqual(len(session.requests), 1)  # NOTE_API_RETRIES=0 caps retries
+        request = session.requests[0]
+        self.assertEqual(request["timeout"].total, 12)
+        self.assertEqual(request["json"]["generationConfig"]["maxOutputTokens"], 321)
 
 
 class QuotaAccountingTests(PlatformCase):
+    async def test_provider_rpm_and_daily_token_caps_fail_closed(self):
+        from gamas_bot.ai.profiles import profile_for
+
+        for _index in range(15):
+            await self.db.ai_usage_insert(
+                {
+                    "provider": "nara", "model": "agnes-2.5-flash",
+                    "request_type": "chunk_structuring", "result": "success",
+                    "estimated_input_tokens": 100,
+                }
+            )
+        reason = await self.router._local_request_budget_reason(
+            profile_for("nara"), "nara", estimated_input_tokens=100,
+            output_token_budget=100,
+        )
+        self.assertIn("requests-per-minute", reason)
+
+        await self.db.ai_usage_insert(
+            {
+                "provider": "sambanova", "model": "Meta-Llama-3.3-70B-Instruct",
+                "request_type": "chunk_structuring", "result": "success",
+                "estimated_input_tokens": 192_000,
+            }
+        )
+        reason = await self.router._local_request_budget_reason(
+            profile_for("sambanova"), "sambanova", estimated_input_tokens=200,
+            output_token_budget=8192,
+        )
+        self.assertIn("daily token budget", reason)
+        self.assertFalse(await self.router._daily_quota_exhausted("sambanova"))
+        await self.db.ai_usage_insert(
+            {
+                "provider": "sambanova", "model": "Meta-Llama-3.3-70B-Instruct",
+                "request_type": "chunk_structuring", "result": "failure",
+                "estimated_input_tokens": 8_000,
+            }
+        )
+        self.assertTrue(await self.router._daily_quota_exhausted("sambanova"))
+
+    async def test_inflight_requests_are_reserved_atomically(self):
+        from dataclasses import replace
+        from gamas_bot.ai.profiles import profile_for
+
+        profile = replace(profile_for("nara"), requests_per_minute=1)
+        results = await asyncio.gather(
+            *(
+                self.router._reserve_local_request_budget(
+                    profile, "nara", estimated_input_tokens=100, output_token_budget=100
+                )
+                for _ in range(2)
+            )
+        )
+        allowed = [(reason, token) for reason, token in results if token is not None]
+        blocked = [reason for reason, token in results if token is None and reason]
+        self.assertEqual(len(allowed), 1)
+        self.assertEqual(len(blocked), 1)
+        self.assertIn("requests-per-minute", blocked[0])
+        await self.router._release_local_request_budget(allowed[0][1])
+
+    async def test_quota_ledgers_group_legacy_gateway_rows_by_canonical_provider(self):
+        await self.db.ai_usage_insert(
+            {
+                "provider": "openai_compatible", "canonical": "nara",
+                "model": "agnes-3-flash", "request_type": "chunk_structuring",
+                "result": "success", "estimated_input_tokens": 320,
+                "estimated_output_tokens": 80,
+            }
+        )
+        self.assertEqual(await self.tracker.today_request_count("nara"), 1)
+        self.assertEqual(await self.tracker.today_token_count("nara"), 400)
+        self.assertEqual(
+            await self.tracker.window_stats("nara", seconds=60),
+            {"requests": 1, "tokens": 400},
+        )
+
     async def test_usage_rows_and_daily_rollup(self):
         await self.db.ai_usage_insert(
             {
@@ -576,6 +833,25 @@ class QuotaAccountingTests(PlatformCase):
         )
         self.assertNotIn("gsk-supersecret999", cleaned)
         self.assertIn("gateway", cleaned)
+
+    async def test_provider_diagnostics_are_allowlisted_before_storage(self):
+        self.assertEqual(self.router._safe_finish_reason("STOP", "sk-secret-key"), "stop")
+        self.assertEqual(
+            self.router._safe_finish_reason("transcript says sk-secret-key", "sk-secret-key"),
+            "",
+        )
+        safe_headers = self.router._safe_quota_headers(
+            {
+                "x-ratelimit-remaining-requests": "17",
+                "x-ratelimit-reset-requests": "2s",
+                "x-ratelimit-limit-tokens": "transcript sk-secret-key",
+                "x-request-id": "chatcmpl-safe-123",
+            },
+            "sk-secret-key",
+        )
+        self.assertEqual(safe_headers["x-ratelimit-remaining-requests"], "17")
+        self.assertNotIn("x-ratelimit-limit-tokens", safe_headers)
+        self.assertNotIn("sk-secret-key", json.dumps(safe_headers))
 
     async def test_usage_rows_never_contain_prompt_or_answers(self):
         await self.db.ai_usage_insert(
@@ -616,6 +892,14 @@ class ChunkBudgetIntegrationTests(PlatformCase):
             [{"provider": "nara", "enabled": 1, "free_only": 1}],
             admin_id=None,
         )
+        credential_id = await self.manager.add_credential(
+            service="notes", provider="nara", label="nara-free",
+            secret="sk-nara-free-0001", model="agnes-2.5-flash", admin_id=1,
+        )
+        await self.manager.set_billing_attestation(credential_id, "free", 1)
+        await self.models.apply_discovery(
+            "nara", [ModelInfo(provider="nara", model_id="agnes-2.5-flash", free_status="free_plan")]
+        )
         job = await self._session_plan()
         session = _ScriptedSession()
         session.add("router.bynara.id", _Response(200, _notes_payload("ROUTED")))
@@ -644,6 +928,23 @@ class ChunkBudgetIntegrationTests(PlatformCase):
         )
         plan = await self.router.plan()
         self.assertTrue(plan.outline_enabled)
+
+
+class ProviderTermsSafetyTests(PlatformCase):
+    async def test_zai_education_restrictions_block_routes_even_with_free_model_and_key(self):
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "zai", "enabled": 1, "free_only": 1, "model": "glm-4.5-flash"}],
+            admin_id=None,
+        )
+        credential_id = await self.manager.add_credential(
+            service="notes", provider="zai", label="zai-free",
+            secret="sk-zai-free-1234", model="glm-4.5-flash", admin_id=1,
+        )
+        await self.manager.set_billing_attestation(credential_id, "free", 1)
+        plan = await self.router.plan()
+        self.assertFalse(any(leg.canonical == "zai" for leg in plan.legs))
+        self.assertIn(("zai", "terms_of_use_blocked"), plan.skipped)
 
 
 class FreeOnlySafetyTests(PlatformCase):
@@ -752,20 +1053,28 @@ class FreeOnlySafetyTests(PlatformCase):
         self.assertEqual(reasons.get("openrouter"), "quota_exhausted")
         self.assertEqual([leg.canonical for leg in plan.legs], ["nara"])
 
-    async def test_key_level_billing_flags_gate_free_vs_paid_legs(self):
-        # Spec §32/§34: a key marked free_only=0 is paid and cannot serve a FREE_ONLY leg.
-        await self.manager.add_credential(
+    async def test_billing_attestation_gates_free_vs_paid_legs(self):
+        key_id = await self.manager.add_credential(
             service="notes", provider="groq", label="paid-key",
             secret="gsk-paid-key-2222", admin_id=1, free_only=False,
         )
         leg = RouteLeg(provider="groq", canonical="groq", free_only=True)
-        pool = await self.router.credentials_for(leg)
-        self.assertEqual(pool, [])
-        # But if the leg is paid-allowed (AI_ALLOW_PAID_FALLBACK=true), it becomes eligible.
+        self.assertEqual(await self.router.credentials_for(leg), [])
+        # A stale legacy value without auditable attestation metadata is not
+        # sufficient evidence to authorize a free-generation lane.
+        async with self.db._transaction(immediate=True) as conn:
+            await conn.execute(
+                "UPDATE provider_credentials SET billing_state='free' WHERE id=?", (key_id,)
+            )
+        self.assertEqual(await self.router.credentials_for(leg), [])
+        await self.manager.set_billing_attestation(key_id, "paid", 1)
+        self.assertEqual(await self.router.credentials_for(leg), [])
         paid_leg = RouteLeg(provider="groq", canonical="groq", free_only=False)
         pool_paid = await self.router.credentials_for(paid_leg)
         self.assertEqual(len(pool_paid), 1)
         self.assertEqual(pool_paid[0].label, "paid-key")
+        await self.manager.set_billing_attestation(key_id, "unknown", 1)
+        self.assertEqual(await self.router.credentials_for(paid_leg), [])
 
 
 if __name__ == "__main__":

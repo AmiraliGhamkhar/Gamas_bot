@@ -1602,13 +1602,13 @@ class Database:
             cursor = await db.execute(
                 "INSERT INTO provider_credentials "
                 "(service, provider, label, secret_ciphertext, secret_last4, base_url, model, "
-                "priority, enabled, key_type, free_only, paid_allowed, "
+                "priority, enabled, key_type, free_only, paid_allowed, billing_state, "
                 "created_by_admin_id, updated_by_admin_id, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (service, provider, label, ciphertext, last4, base_url, model, int(priority),
                  int(enabled), key_type,
                  None if free_only is None else int(free_only),
-                 None if paid_allowed is None else int(paid_allowed),
+                 None if paid_allowed is None else int(paid_allowed), "unknown",
                  admin_id, admin_id, now, now),
             )
             credential_id = int(cursor.lastrowid)
@@ -1719,6 +1719,46 @@ class Database:
             )
             return True
 
+    async def set_provider_credential_billing_attestation(
+        self, credential_id: int, *, state: str, admin_id: int
+    ) -> bool:
+        """Auditable account-level billing attestation for a single key."""
+        if state not in {"unknown", "free", "paid"}:
+            raise ValueError("billing state must be unknown, free, or paid")
+        now = utc_now()
+        attested_at = None if state == "unknown" else now
+        attested_by = None if state == "unknown" else int(admin_id)
+        free_only = 1 if state == "free" else (0 if state == "paid" else None)
+        paid_allowed = 0 if state == "free" else (1 if state == "paid" else None)
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT service, provider, label, billing_state FROM provider_credentials WHERE id=?",
+                (int(credential_id),),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            await db.execute(
+                "UPDATE provider_credentials SET billing_state=?, billing_attested_at=?, "
+                "billing_attested_by_admin_id=?, free_only=?, paid_allowed=?, "
+                "updated_by_admin_id=?, updated_at=? WHERE id=?",
+                (state, attested_at, attested_by, free_only, paid_allowed,
+                 int(admin_id), now, int(credential_id)),
+            )
+            await self._insert_audit(
+                db, int(admin_id), "provider_credential_billing_attestation",
+                "provider_credential", str(credential_id),
+                {
+                    "service": str(row["service"]),
+                    "provider": str(row["provider"]),
+                    "label": str(row["label"]),
+                    "previous_state": row["billing_state"] or "unknown",
+                    "billing_state": state,
+                    "attested_at": attested_at,
+                },
+            )
+            return True
+
     async def set_provider_credential_primary(self, credential_id: int, admin_id: int) -> bool:
         """Make one credential the first (priority 10) of its own pool."""
         now = utc_now()
@@ -1789,8 +1829,8 @@ class Database:
                 "SELECT id, service, provider, label, secret_last4, base_url, model, priority, "
                 "enabled, quarantined_at, cooldown_until, last_status_code, last_success_at, "
                 "last_failure_at, last_used_at, last_error, created_at, "
-                "key_type, free_only, paid_allowed, billing_state, expires_at, notes, "
-                "failure_streak, last_quota_json "
+                "key_type, free_only, paid_allowed, billing_state, billing_attested_at, "
+                "billing_attested_by_admin_id, expires_at, notes, failure_streak, last_quota_json "
                 "FROM provider_credentials ORDER BY service, provider, priority, id"
             )
             return [dict(row) for row in await cursor.fetchall()]
@@ -2162,10 +2202,10 @@ class Database:
                 "INSERT INTO ai_usage_records (created_at, finished_at, service, provider, canonical, "
                 "credential_id, credential_label, model, request_type, route_position, attempt, "
                 "job_id, submission_id, latency_ms, http_status, estimated_input_tokens, "
-                "actual_input_tokens, actual_output_tokens, total_tokens, finish_reason, "
-                "retry_after_seconds, quota_headers_json, json_strategy, result, error_class, "
-                "free_class, request_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "estimated_output_tokens, actual_input_tokens, actual_output_tokens, total_tokens, "
+                "finish_reason, retry_after_seconds, quota_headers_json, json_strategy, result, "
+                "error_class, free_class, request_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     record.get("created_at") or utc_now(), record.get("finished_at") or utc_now(),
                     str(record.get("service") or "notes"), str(record.get("provider") or ""),
@@ -2175,8 +2215,9 @@ class Database:
                     int(record.get("route_position") or 0), int(record.get("attempt") or 1),
                     record.get("job_id"), record.get("submission_id"),
                     int(record.get("latency_ms") or 0), record.get("http_status"),
-                    record.get("estimated_input_tokens"), record.get("actual_input_tokens"),
-                    record.get("actual_output_tokens"), record.get("total_tokens"),
+                    record.get("estimated_input_tokens"), record.get("estimated_output_tokens"),
+                    record.get("actual_input_tokens"), record.get("actual_output_tokens"),
+                    record.get("total_tokens"),
                     record.get("finish_reason"), record.get("retry_after_seconds"),
                     record.get("quota_headers_json"), record.get("json_strategy"),
                     str(record.get("result") or "unknown"), record.get("error_class"),
@@ -2231,6 +2272,46 @@ class Database:
             cursor = await self._db().execute(
                 "SELECT COALESCE(SUM(requests),0) FROM ai_usage_daily WHERE day=? AND provider=?",
                 (day, provider),
+            )
+            row = await cursor.fetchone()
+            return int(row[0] or 0)
+
+    async def ai_usage_window_stats(self, canonical: str, since: str) -> dict[str, int]:
+        """Requests/tokens for a canonical provider (including legacy aliases)."""
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT COUNT(*), "
+                "COALESCE(SUM(COALESCE(NULLIF(actual_input_tokens,0), estimated_input_tokens,0) "
+                "+ COALESCE(NULLIF(actual_output_tokens,0), estimated_output_tokens,0)),0) "
+                "FROM ai_usage_records WHERE COALESCE(NULLIF(canonical,''),provider)=? "
+                "AND created_at>=?",
+                (canonical, since),
+            )
+            row = await cursor.fetchone()
+            return {"requests": int(row[0] or 0), "tokens": int(row[1] or 0)}
+
+    async def ai_usage_today_canonical_count(self, canonical: str, *, day: str | None = None) -> int:
+        day = day or utc_now()[:10]
+        next_day = (datetime.fromisoformat(day) + timedelta(days=1)).date().isoformat()
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT COUNT(*) FROM ai_usage_records "
+                "WHERE COALESCE(NULLIF(canonical,''),provider)=? AND created_at>=? AND created_at<?",
+                (canonical, f"{day}T00:00:00", f"{next_day}T00:00:00"),
+            )
+            row = await cursor.fetchone()
+            return int(row[0] or 0)
+
+    async def ai_usage_today_token_count(self, canonical: str, *, day: str | None = None) -> int:
+        day = day or utc_now()[:10]
+        next_day = (datetime.fromisoformat(day) + timedelta(days=1)).date().isoformat()
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT COALESCE(SUM(COALESCE(NULLIF(actual_input_tokens,0), estimated_input_tokens,0) "
+                "+ COALESCE(NULLIF(actual_output_tokens,0), estimated_output_tokens,0)),0) "
+                "FROM ai_usage_records WHERE COALESCE(NULLIF(canonical,''),provider)=? "
+                "AND created_at>=? AND created_at<?",
+                (canonical, f"{day}T00:00:00", f"{next_day}T00:00:00"),
             )
             row = await cursor.fetchone()
             return int(row[0] or 0)

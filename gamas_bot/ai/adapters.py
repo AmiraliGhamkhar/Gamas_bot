@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlsplit, urlunsplit
 
 from ..config import RESERVED_HEADER_NAMES, Settings
 from ..structuring import (
@@ -189,6 +189,7 @@ class NoteFailure(Exception):
     quota_exhausted: bool = False
     credential_invalid: bool = False
     model_unavailable: bool = False
+    local_budget_blocked: bool = False
     message: str = ""
 
     def __str__(self) -> str:  # never raise with content
@@ -342,12 +343,14 @@ class NoteAdapter:
 
     # -- discovery ----------------------------------------------------------
 
-    def discovery_request(self, base_url: str, secret: str) -> tuple[str, str, dict[str, str]] | None:
+    def discovery_request(
+        self, base_url: str, secret: str, *, page: int = 1
+    ) -> tuple[str, str, dict[str, str]] | None:
         if not self.supports_discovery or not base_url:
             return None
         return ("GET", _endpoint(base_url.rstrip("/"), "models"), self.auth_headers(secret))
 
-    def parse_discovery(self, payload) -> list[ModelInfo]:
+    def parse_discovery(self, payload, **_kwargs) -> list[ModelInfo]:
         return parse_discovery(self.canonical, payload)
 
     # -- probes -------------------------------------------------------------
@@ -450,9 +453,72 @@ class OpenAICompatibleAdapter(NoteAdapter):
 
 
 class NaraAdapter(OpenAICompatibleAdapter):
-    """NaraRouter: prompt-enforced JSON unless the model is verified capable."""
+    """NaraRouter with account catalog + explicit public Free-plan evidence."""
 
     canonical = "nara"
+    FREE_PLAN_URL = "https://router.bynara.id/api/plans"
+
+    def public_plan_request(self) -> tuple[str, str, dict[str, str]]:
+        """Public, read-only tier/model catalog; it does not use an API key."""
+        return ("GET", self.FREE_PLAN_URL, {})
+
+    @staticmethod
+    def plan_model_statuses(payload) -> dict[str, str] | None:
+        """Map public plan model IDs to free/paid only when the plan is explicit.
+
+        A missing/malformed Free plan returns ``None`` so the adapter leaves
+        every account-discovered model as unknown rather than inferring from a
+        zero price field.
+        """
+        from .models import FREE_PLAN, PAID
+
+        plans = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(plans, list):
+            return None
+        active_free = [
+            item for item in plans
+            if isinstance(item, dict)
+            and str(item.get("code", "")).strip().casefold() == "free"
+            and item.get("is_active") is True
+            and isinstance(item.get("models"), list)
+        ]
+        if not active_free:
+            return None
+        free_models = {
+            str(model).strip().casefold()
+            for plan in active_free
+            for model in plan["models"]
+            if isinstance(model, str) and model.strip()
+        }
+        paid_models = {
+            str(model).strip().casefold()
+            for plan in plans
+            if isinstance(plan, dict)
+            and str(plan.get("code", "")).strip().casefold() != "free"
+            and plan.get("is_active") is True
+            and isinstance(plan.get("models"), list)
+            for model in plan["models"]
+            if isinstance(model, str) and model.strip()
+        }
+        statuses = dict.fromkeys(free_models, FREE_PLAN)
+        statuses.update(dict.fromkeys(paid_models - free_models, PAID))
+        return statuses
+
+    def parse_discovery(self, payload, *, plan_model_statuses=None) -> list[ModelInfo]:
+        from dataclasses import replace
+
+        from .models import FREE_UNKNOWN
+
+        discovered = super().parse_discovery(payload)
+        statuses = plan_model_statuses or {}
+        return [
+            replace(
+                item,
+                free_status=statuses.get(item.model_id.casefold(), FREE_UNKNOWN),
+                source="live:/v1/models+api/plans" if plan_model_statuses is not None else "live:/v1/models",
+            )
+            for item in discovered
+        ]
 
 
 class GroqAdapter(OpenAICompatibleAdapter):
@@ -553,6 +619,8 @@ class NvidiaAdapter(OpenAICompatibleAdapter):
 
 class CloudflareAdapter(OpenAICompatibleAdapter):
     canonical = "cloudflare"
+    discovery_page_size = 100
+    max_discovery_pages = 20
 
     def default_base_url(self) -> str:
         # Account-scoped; a missing account id is a configuration error.
@@ -563,6 +631,72 @@ class CloudflareAdapter(OpenAICompatibleAdapter):
                 f"{quote(account_id.strip(), safe='')}/ai/v1"
             )
         return ""
+
+    def _account_model_search_url(self, base_url: str, *, page: int) -> str | None:
+        parsed = urlsplit(base_url)
+        parts = [part for part in parsed.path.split("/") if part]
+        account_id = ""
+        if "accounts" in parts:
+            index = parts.index("accounts")
+            if index + 1 < len(parts):
+                account_id = parts[index + 1]
+        account_id = account_id or (getattr(self.settings, "cloudflare_account_id", "") or "").strip()
+        if not account_id or not parsed.scheme or not parsed.netloc:
+            return None
+        path = f"/client/v4/accounts/{quote(account_id, safe='')}/ai/models/search"
+        query = urlencode({"page": max(1, int(page)), "per_page": self.discovery_page_size, "format": "openrouter"})
+        return urlunsplit((parsed.scheme, parsed.netloc, path, query, ""))
+
+    def discovery_request(self, base_url, secret, *, page: int = 1):
+        url = self._account_model_search_url(base_url, page=page)
+        if not url:
+            return None
+        return ("GET", url, self.auth_headers(secret))
+
+    @staticmethod
+    def _model_search_entries(payload):
+        if not isinstance(payload, dict) or payload.get("success") is False:
+            return None
+        entries = payload.get("data")
+        if entries is None:
+            entries = payload.get("result")
+        if isinstance(entries, dict):
+            entries = entries.get("data")
+        return entries if isinstance(entries, list) else None
+
+    def discovery_page_count(self, payload) -> int | None:
+        entries = self._model_search_entries(payload)
+        return len(entries) if entries is not None else None
+
+    def parse_discovery(self, payload, **_kwargs) -> list[ModelInfo]:
+        from datetime import datetime, timezone
+
+        from .models import FREE_UNKNOWN, ModelCapabilities
+
+        entries = self._model_search_entries(payload)
+        if entries is None:
+            raise ValueError("invalid Cloudflare Model Search page")
+        now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        discovered = []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError("malformed Cloudflare model entry")
+            model_id = entry.get("id")
+            if not isinstance(model_id, str) or not model_id.strip():
+                raise ValueError("Cloudflare model entry has no documented id")
+            # Model Search's OpenRouter format is used only for stable IDs.
+            # Pricing, capabilities, and FREE_ONLY status are not inferred.
+            discovered.append(
+                ModelInfo(
+                    provider=self.canonical,
+                    model_id=model_id.strip(),
+                    capabilities=ModelCapabilities(),
+                    free_status=FREE_UNKNOWN,
+                    source="live:/accounts/{account_id}/ai/models/search?format=openrouter",
+                    source_last_verified_at=now,
+                )
+            )
+        return discovered
 
     def build(self, ctx: RequestContext, secret: str) -> NoteRequest:
         if not self.base_url_for(ctx):
@@ -585,7 +719,7 @@ class AlibabaAdapter(OpenAICompatibleAdapter):
 class CohereAdapter(OpenAICompatibleAdapter):
     canonical = "cohere"
 
-    def discovery_request(self, base_url, secret):
+    def discovery_request(self, base_url, secret, *, page: int = 1):
         # The compatibility endpoint has no model list; the native v1 API has.
         return (
             "GET",
@@ -593,7 +727,7 @@ class CohereAdapter(OpenAICompatibleAdapter):
             self.auth_headers(secret),
         )
 
-    def parse_discovery(self, payload):
+    def parse_discovery(self, payload, **_kwargs):
         results = []
         entries = payload.get("models") if isinstance(payload, dict) else None
         from datetime import datetime, timezone
@@ -718,7 +852,7 @@ class GeminiNativeAdapter(NoteAdapter):
             failure = _replace_failure(failure, billing_required=True, category=FAIL_BILLING)
         return failure
 
-    def discovery_request(self, base_url, secret):
+    def discovery_request(self, base_url, secret, *, page: int = 1):
         return (
             "GET",
             _endpoint(base_url.rstrip("/"), "models"),

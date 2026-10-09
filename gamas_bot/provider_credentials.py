@@ -56,6 +56,9 @@ class ProviderCredential:
     #: explicitly marked paid_allowed=0 never serves paid-fallback legs.
     free_only: int | None = None
     paid_allowed: int | None = None
+    billing_state: str = "unknown"
+    billing_attested_at: str | None = None
+    billing_attested_by_admin_id: int | None = None
 
     @property
     def masked(self) -> str:
@@ -277,6 +280,14 @@ class ProviderCredentialManager:
             admin_id=int(admin_id),
         )
 
+    async def set_billing_attestation(
+        self, credential_id: int, state: str, admin_id: int
+    ) -> bool:
+        """Record explicit free-no-overage or paid-use authorization."""
+        return await self.db.set_provider_credential_billing_attestation(
+            int(credential_id), state=state, admin_id=int(admin_id)
+        )
+
     async def set_primary(self, credential_id: int, admin_id: int) -> bool:
         return await self.db.set_provider_credential_primary(int(credential_id), int(admin_id))
 
@@ -327,6 +338,9 @@ class ProviderCredentialManager:
                     model=row.get("model"),
                     free_only=row.get("free_only"),
                     paid_allowed=row.get("paid_allowed"),
+                    billing_state=str(row.get("billing_state") or "unknown"),
+                    billing_attested_at=row.get("billing_attested_at"),
+                    billing_attested_by_admin_id=row.get("billing_attested_by_admin_id"),
                 )
             )
         allow_keyless = False
@@ -461,6 +475,9 @@ class ProviderCredentialManager:
             source="database",
             free_only=record.get("free_only"),
             paid_allowed=record.get("paid_allowed"),
+            billing_state=str(record.get("billing_state") or "unknown"),
+            billing_attested_at=record.get("billing_attested_at"),
+            billing_attested_by_admin_id=record.get("billing_attested_by_admin_id"),
         )
 
     async def reorder(self, credential_id: int, direction: str, admin_id: int) -> bool:

@@ -69,7 +69,12 @@ async def sync_provider_catalog(
     force: bool = False,
     check_type: str = "read_only",
 ) -> SyncResult:
-    """Sync one provider's model catalog (idempotent, TTL-guarded)."""
+    """Sync one provider catalog without letting a bad response erase good data.
+
+    Read-only discovery credentials deliberately bypass generation billing
+    eligibility. They can inspect an account catalog before an administrator
+    has attested the key for generation.
+    """
     models: ModelRegistry = router.models
     tracker: AIUsageTracker = router.tracker
     adapter = adapter or adapter_for(canonical, router.settings)
@@ -85,7 +90,6 @@ async def sync_provider_catalog(
     if not base_url:
         return SyncResult(provider=canonical, ok=False, detail="no base URL")
 
-    synced_at = None
     try:
         synced_at = await router.db.ai_model_latest_sync(canonical)
     except Exception:
@@ -94,72 +98,201 @@ async def sync_provider_catalog(
         rows = await models.cached(canonical)
         return SyncResult(provider=canonical, ok=True, synced=len(rows), cached=True)
 
-    # Best credential: first usable stored key, else the environment fallback.
+    # Catalog probes need read-only credentials even when the key is not yet
+    # marked free/paid. This path never authorizes a generation request.
     credential = None
     try:
         from .routing import RouteLeg
 
-        pool = await router.credentials_for(RouteLeg(provider=canonical, canonical=canonical))
+        pool = await router.credentials_for(
+            RouteLeg(provider=canonical, canonical=canonical), for_generation=False
+        )
         credential = pool[0] if pool else None
     except Exception:
         credential = None
-    secret = credential.secret if credential else ""
-    secret = secret or ""
-    try:
-        request = adapter.discovery_request(base_url, secret)
-    except Exception:
-        request = None
-    if request is None:
-        return SyncResult(provider=canonical, ok=False, detail="discovery unsupported")
+    secret = (credential.secret if credential else "") or ""
+    fetcher = session_get or _fetch
 
-    method, url, headers = request
-    started = time.perf_counter()
-    try:
-        fetcher = session_get or _fetch
-        status, resp_headers, body = await fetcher(url, dict(headers), DEFAULT_SYNC_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError:
-        return SyncResult(provider=canonical, ok=False, detail="timeout")
-    except aiohttp.ClientError as exc:
-        return SyncResult(
-            provider=canonical, ok=False, detail=sanitize_text(type(exc).__name__, (secret,))
-        )
-    latency_ms = int((time.perf_counter() - started) * 1000)
-    if status in {401, 403}:
-        result = SyncResult(
-            provider=canonical, ok=False, http_status=status, latency_ms=latency_ms,
-            detail="authentication failed",
-        )
-    elif status == 429:
-        result = SyncResult(
-            provider=canonical, ok=False, http_status=status, latency_ms=latency_ms,
-            detail=f"rate limited (retry-after={_retry_after_seconds(resp_headers)})",
-        )
-    elif status != 200:
-        result = SyncResult(
-            provider=canonical, ok=False, http_status=status, latency_ms=latency_ms,
-            detail=f"HTTP {status}",
-        )
-    else:
+    # Nara's account model endpoint does not itself encode the public Free plan.
+    # Fetch the documented public plans endpoint independently; failure means
+    # the catalog can still refresh, but every model's free status remains
+    # unknown until the plan evidence is available.
+    plan_model_statuses = None
+    plan_warning = ""
+    plan_request = getattr(adapter, "public_plan_request", None)
+    plan_parser = getattr(adapter, "plan_model_statuses", None)
+    if callable(plan_request) and callable(plan_parser):
+        try:
+            method, plan_url, plan_headers = plan_request()
+            if method != "GET":
+                raise ValueError("read-only plan discovery must use GET")
+            plan_status, _plan_headers, plan_body = await fetcher(
+                plan_url, dict(plan_headers), DEFAULT_SYNC_TIMEOUT_SECONDS
+            )
+            if plan_status == 200:
+                import json
+
+                plan_payload = json.loads(plan_body.decode("utf-8", "replace"))
+                plan_model_statuses = plan_parser(plan_payload)
+            if plan_status != 200 or plan_model_statuses is None:
+                plan_warning = "public plan unavailable; free eligibility unknown"
+        except (asyncio.TimeoutError, aiohttp.ClientError, ValueError, TypeError):
+            plan_warning = "public plan unavailable; free eligibility unknown"
+        except Exception as exc:
+            plan_warning = f"public plan unavailable ({type(exc).__name__}); free eligibility unknown"
+
+    discovered_by_id: dict[str, object] = {}
+    page_count = 1
+    page_size = 0
+    if hasattr(adapter, "discovery_page_count"):
+        page_count = max(1, int(getattr(adapter, "max_discovery_pages", 20)))
+        page_size = max(1, int(getattr(adapter, "discovery_page_size", 100)))
+
+    final_status = None
+    total_latency_ms = 0
+    completed = False
+    result: SyncResult | None = None
+    for page in range(1, page_count + 1):
+        try:
+            request = adapter.discovery_request(base_url, secret, page=page)
+        except Exception:
+            request = None
+        if request is None:
+            return SyncResult(provider=canonical, ok=False, detail="discovery unsupported")
+        method, url, headers = request
+        if method != "GET":
+            return SyncResult(provider=canonical, ok=False, detail="discovery method is not read-only")
+        started = time.perf_counter()
+        try:
+            status, resp_headers, body = await fetcher(
+                url, dict(headers), DEFAULT_SYNC_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            result = SyncResult(provider=canonical, ok=False, detail="timeout")
+            break
+        except aiohttp.ClientError as exc:
+            result = SyncResult(
+                provider=canonical, ok=False,
+                detail=sanitize_text(type(exc).__name__, (secret,)),
+            )
+            break
+        except Exception as exc:
+            result = SyncResult(
+                provider=canonical, ok=False,
+                detail=f"discovery transport failed ({type(exc).__name__})",
+            )
+            break
+
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        total_latency_ms += latency_ms
+        final_status = status
+        if status in {401, 403}:
+            result = SyncResult(
+                provider=canonical, ok=False, http_status=status,
+                latency_ms=total_latency_ms, detail="authentication failed",
+            )
+            break
+        if status == 429:
+            result = SyncResult(
+                provider=canonical, ok=False, http_status=status,
+                latency_ms=total_latency_ms,
+                detail=f"rate limited (retry-after={_retry_after_seconds(resp_headers)})",
+            )
+            break
+        if status != 200:
+            result = SyncResult(
+                provider=canonical, ok=False, http_status=status,
+                latency_ms=total_latency_ms, detail=f"HTTP {status}",
+            )
+            break
+
         import json
 
         try:
             payload = json.loads(body.decode("utf-8", "replace"))
-        except (ValueError, UnicodeError):
+            if page_count > 1:
+                count = adapter.discovery_page_count(payload)
+                if count is None:
+                    raise ValueError("malformed paginated catalog")
+                # An empty first page is never accepted as a fresh catalog.
+                # An empty later page is a valid terminator after a full page.
+                if count == 0:
+                    if page == 1:
+                        raise ValueError("empty catalog")
+                    completed = True
+                    break
+            parsed_page = adapter.parse_discovery(
+                payload, plan_model_statuses=plan_model_statuses
+            ) if plan_model_statuses is not None else adapter.parse_discovery(payload)
+            if not isinstance(parsed_page, list):
+                raise ValueError("catalog parser returned a non-list")
+            if page_count > 1 and count and not parsed_page:
+                raise ValueError("catalog page contains no valid model IDs")
+            for model_info in parsed_page:
+                model_id = getattr(model_info, "model_id", None)
+                if not isinstance(model_id, str) or not model_id.strip():
+                    raise ValueError("catalog parser returned an invalid model")
+                discovered_by_id[model_id] = model_info
+            if page_count == 1 or count < page_size:
+                completed = True
+                break
+            if page == page_count:
+                # The response may be truncated; do not deactivate any prior
+                # model unless every page has been fetched successfully.
+                raise ValueError("catalog pagination limit reached")
+        except (ValueError, TypeError, UnicodeError):
             result = SyncResult(
-                provider=canonical, ok=False, http_status=status, latency_ms=latency_ms,
-                detail="invalid catalog payload",
+                provider=canonical, ok=False, http_status=status,
+                latency_ms=total_latency_ms, detail="invalid, empty, or incomplete catalog",
+            )
+            break
+        except Exception as exc:
+            # A buggy/changed upstream shape is a failed sync, never an empty
+            # snapshot that marks every known model unavailable.
+            result = SyncResult(
+                provider=canonical, ok=False, http_status=status,
+                latency_ms=total_latency_ms,
+                detail=f"catalog parser failed ({type(exc).__name__})",
+            )
+            break
+    else:
+        result = SyncResult(
+            provider=canonical, ok=False, http_status=final_status,
+            latency_ms=total_latency_ms, detail="catalog pagination limit reached",
+        )
+
+    if not completed and result is None:
+        result = SyncResult(
+            provider=canonical, ok=False, http_status=final_status,
+            latency_ms=total_latency_ms, detail="incomplete catalog",
+        )
+    if completed:
+        discovered = list(discovered_by_id.values())
+        if not discovered:
+            result = SyncResult(
+                provider=canonical, ok=False, http_status=final_status,
+                latency_ms=total_latency_ms, detail="empty catalog; existing catalog preserved",
             )
         else:
-            discovered = adapter.parse_discovery(payload)
-            stats = await models.apply_discovery(canonical, discovered)
-            result = SyncResult(
-                provider=canonical,
-                ok=True,
-                synced=stats.get("synced", 0),
-                deactivated=stats.get("deactivated", 0),
-                http_status=status,
-                latency_ms=latency_ms,
-            )
+            try:
+                stats = await models.apply_discovery(canonical, discovered)
+            except Exception as exc:
+                result = SyncResult(
+                    provider=canonical, ok=False, http_status=final_status,
+                    latency_ms=total_latency_ms,
+                    detail=f"catalog persistence failed ({type(exc).__name__})",
+                )
+            else:
+                result = SyncResult(
+                    provider=canonical,
+                    ok=True,
+                    synced=stats.get("synced", 0),
+                    deactivated=stats.get("deactivated", 0),
+                    http_status=final_status,
+                    latency_ms=total_latency_ms,
+                    detail=plan_warning,
+                )
+    assert result is not None
     await tracker.event(
         "provider_sync",
         service="notes",
@@ -248,7 +381,9 @@ async def probe_provider_quota(
     try:
         from .routing import RouteLeg
 
-        pool = await router.credentials_for(RouteLeg(provider=canonical, canonical=canonical))
+        pool = await router.credentials_for(
+            RouteLeg(provider=canonical, canonical=canonical), for_generation=False
+        )
         credential = pool[0] if pool else None
     except Exception:
         credential = None

@@ -40,9 +40,9 @@ _CLASS_FA = {
     ProviderClass.PROMOTIONAL_FREE: "رایگان تبلیغاتی (موقت)",
     ProviderClass.TRIAL_ONLY: "فقط آزمایشی (trial)",
     ProviderClass.PAID_ONLY: "فقط پولی",
-    ProviderClass.REGION_RESTRICTED: "محلودیت منطقه",
-    ProviderClass.UNAVAILABLE: "نامعتبر/نافع",
-    ProviderClass.PAID_ONLY: "فقط پولی",
+    ProviderClass.REGION_RESTRICTED: "محدودیت منطقه",
+    ProviderClass.UNAVAILABLE: "در دسترس نیست",
+    ProviderClass.ACCOUNT_UNVERIFIED: "استحقاق حساب تأییدنشده",
 }
 
 
@@ -284,9 +284,16 @@ class AIPanels:
             and (item["provider"] == slug or _canonical_of(item) == slug)
         ]
         lines = [f"🔑 کلیدهای {info.display_name}", ""]
+        lines.append(
+            "کلیدهای محیطی قدیمی (از جمله NOTE_API_*) حفظ می‌شوند، اما تا ثبت نسخهٔ "
+            "رمزشده در این خزانه و attestation صریح، برای تولید یادداشت قابل‌استفاده نیستند."
+        )
+        lines.append(
+            "FREE یعنی مدیر تأیید می‌کند overage پولی با خاموش‌بودن billing یا سقف سخت $0 ناممکن است."
+        )
         buttons: list[list] = []
         if not rows:
-            lines.append("کلیدی ثبت نشده است؛ از «افزودن کلید» شروع کنید.")
+            lines.append("کلید خزانه‌ای ثبت نشده است؛ برای فعال‌سازی امن از «افزودن کلید» شروع کنید.")
         for item in rows:
             state = "فعال" if item["enabled"] else "غیرفعال"
             if item["quarantined_at"]:
@@ -294,18 +301,21 @@ class AIPanels:
             elif cooldown_remaining_seconds(item.get("cooldown_until")) > 0:
                 state = "cooldown"
             last = f" | HTTP {item['last_status_code']}" if item["last_status_code"] else ""
-            flags = []
-            if item.get("free_only") == 1:
-                flags.append("🆓 فقط-رایگان")
-            elif item.get("free_only") == 0:
-                flags.append("💳 پولی")
-            if item.get("paid_allowed") == 1:
-                flags.append("💳 مجاز پولی")
-            flag_text = (" [" + " | ".join(flags) + "]") if flags else ""
+            billing_state = str(item.get("billing_state") or "unknown").lower()
+            billing_labels = {
+                "free": "🔒 FREE, no paid overage (attested)",
+                "paid": "💳 paid use authorized (attested)",
+                "unknown": "⚠️ billing not attested — generation blocked",
+            }
+            billing_text = billing_labels.get(billing_state, "⚠️ billing state unknown")
+            attested_at = item.get("billing_attested_at")
+            if attested_at:
+                billing_text += f" | attested {attested_at[:10]}"
             model_text = f" | مدل: {item['model']}" if item.get("model") else ""
             lines.append(
                 f"• #{item['id']} {item['label']} "
-                f"{self.bot._masked_key(item['secret_last4'])} — {state}{last}{flag_text}{model_text}"
+                f"{self.bot._masked_key(item['secret_last4'])} — {state}{last}"
+                f" | {billing_text}{model_text}"
             )
             key_id = item["id"]
             toggle = "disable" if item["enabled"] else "enable"
@@ -334,12 +344,23 @@ class AIPanels:
                     Button.inline("🌐 Base URL", f"admin:ai:kstate:edit:base:{key_id}".encode("ascii")),
                 ]
             )
-            free_mark = "✅" if item.get("free_only") == 1 else "🆓"
-            paid_mark = "✅" if item.get("paid_allowed") == 1 else "💳"
+            billing_state = str(item.get("billing_state") or "unknown").lower()
+            free_mark = "✅" if billing_state == "free" else "🔒"
+            paid_mark = "✅" if billing_state == "paid" else "💳"
             buttons.append(
                 [
-                    Button.inline(f"{free_mark} فقط-رایگان", f"admin:ai:kstate:free:{key_id}".encode("ascii")),
-                    Button.inline(f"{paid_mark} مجاز پولی", f"admin:ai:kstate:paid:{key_id}".encode("ascii")),
+                    Button.inline(
+                        f"{free_mark} attest FREE/no-overage",
+                        f"admin:ai:kstate:attest_free:{key_id}".encode("ascii"),
+                    ),
+                    Button.inline(
+                        f"{paid_mark} attest paid",
+                        f"admin:ai:kstate:attest_paid:{key_id}".encode("ascii"),
+                    ),
+                    Button.inline(
+                        "🛑 clear attestation",
+                        f"admin:ai:kstate:attest_clear:{key_id}".encode("ascii"),
+                    ),
                     Button.inline("🔄 تعویض کلید", f"admin:ai:kstate:repl:{key_id}".encode("ascii")),
                     Button.inline("📊 مصرف", f"admin:ai:kstate:usage:{key_id}".encode("ascii")),
                 ]
@@ -370,17 +391,40 @@ class AIPanels:
             changed = await manager.reorder(key_id, action, admin_id)
         elif action == "primary":
             changed = await manager.set_primary(key_id, admin_id)
-        elif action == "free":
-            # Toggle the free-only mark: 1 -> NULL (unmarked) -> 0 (paid) -> 1.
-            record = await self.bot.db.provider_credential_record(key_id)
-            current = record.get("free_only") if record else None
-            new_value = {1: None, None: 0, 0: 1}[current]
-            changed = await manager.set_billing_flags(key_id, free_only=new_value, admin_id=admin_id)
-        elif action == "paid":
-            record = await self.bot.db.provider_credential_record(key_id)
-            current = record.get("paid_allowed") if record else None
-            new_value = {1: None, None: 0, 0: 1}[current]
-            changed = await manager.set_billing_flags(key_id, paid_allowed=new_value, admin_id=admin_id)
+        elif action in {"attest_free", "attest_paid"}:
+            state = "free" if action == "attest_free" else "paid"
+            if state == "free":
+                warning = (
+                    "تأیید می‌کنید این حساب برای این کلید واقعاً رایگان است و "
+                    "هر نوع overage پولی غیرفعال یا با سقف سخت $0 مسدود شده؟"
+                )
+            else:
+                warning = (
+                    "تأیید می‌کنید استفادهٔ پولی از این کلید مجاز است؟ این فقط "
+                    "مجوز کلید است؛ fallback پولی همچنان با تنظیم سرور خاموش می‌ماند."
+                )
+            confirm_action = f"attest_{state}_confirm"
+            await event.answer("تأیید billing لازم است.", alert=True)
+            await self.bot._edit_callback(
+                event,
+                warning,
+                [[
+                    Button.inline("✅ تأیید", f"admin:ai:kstate:{confirm_action}:{key_id}".encode("ascii")),
+                    Button.inline("انصراف", f"admin:ai:ky:{slug}".encode("ascii")),
+                ]],
+            )
+            return
+        elif action in {"attest_free_confirm", "attest_paid_confirm", "attest_clear"}:
+            new_state = {
+                "attest_free_confirm": "free",
+                "attest_paid_confirm": "paid",
+                "attest_clear": "unknown",
+            }[action]
+            changed = await manager.set_billing_attestation(key_id, new_state, admin_id)
+        elif action in {"free", "paid"}:
+            # Legacy callback compatibility: nullable flags never count as an
+            # account billing attestation, so these actions only clear safely.
+            changed = await manager.set_billing_attestation(key_id, "unknown", admin_id)
         elif action == "del1":
             # Two-step delete: the first press only asks for confirmation.
             await event.answer("⚠️ حذف کلید قطعی است؛ تأیید کنید.", alert=True)
@@ -905,6 +949,7 @@ class AIPanels:
             agg["out_tok"] += int(row["output_tokens"] or 0)
         if not totals:
             lines.append("هنوز مصرفی در این بازه ثبت نشده است.")
+        lines.append("شمارنده‌های محلی سهمیه خودکار با پنجرهٔ UTC جلو می‌روند؛ reset دستی برای جلوگیری از عبور از سقف حذف شده است.")
         for provider, agg in sorted(totals.items()):
             lines.append(
                 f"• {provider}: {_fmt_int(agg['requests'])} req"
@@ -913,14 +958,7 @@ class AIPanels:
                 f" | {_fmt_int(agg['in_tok'] + agg['out_tok'])} tok"
                 + (f" | بلاک پولی ⚠️ {_fmt_int(agg['paid'])}" if agg["paid"] else "")
             )
-            buttons.append(
-                [
-                    Button.inline(
-                        f"🔄 بازنشانی امروز {provider[:16]}",
-                        f"admin:ai:usrst:{provider}".encode("ascii", "ignore")[:64],
-                    )
-                ]
-            )
+
         if quotas:
             lines.append("")
             lines.append("آخرین تصویر سهمیهٔ ارائه‌دهنده‌ها:")
@@ -940,16 +978,16 @@ class AIPanels:
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
 
     async def _usage_reset(self, event, provider: str) -> None:
+        """Legacy callback is intentionally fail-closed; resets could overspend."""
         admin_id = int((await event.get_sender()).id)
-        deleted = await self.bot.db.ai_usage_daily_delete_provider_day(provider)
         await self.bot.db.add_audit_entry(
             admin_id=admin_id,
-            action="ai_usage_reset",
+            action="ai_usage_reset_blocked",
             target_type="ai_provider",
             target_id=provider,
-            details={"rows": deleted},
+            details={"reason": "manual reset could bypass provider quota"},
         )
-        await event.answer(f"شمارندهٔ امروز {provider} بازنشانی شد ({deleted} ردیف).")
+        await event.answer("بازنشانی دستی سهمیه غیرفعال است؛ پنجرهٔ UTC یا reset رسمی provider را صبر کنید.", alert=True)
         await self.show_usage(event)
 
     # --------------------------------------------------------------- models

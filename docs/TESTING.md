@@ -5,13 +5,15 @@
 ```bash
 python -m compileall -q gamas_bot scripts tests passenger_wsgi.py
 ruff check .                      # config in pyproject.toml
-python -m pytest -q               # 743 tests, ~52 s, no network
+python -m pytest -q               # latest local run: 867 passed, 1 skipped, 1,786 subtests, ~90 s
 python -m pip check
 python -m scripts.sync_requirements --check
 ```
 
-`.github/workflows/tests.yml` runs the same suite on Python 3.11, 3.12 and 3.13,
+`.github/workflows/tests.yml` runs the suite on Python 3.11, 3.12 and 3.13,
 through both `pytest` and `unittest discover` (the entry point deployments use).
+The latest local `unittest discover -s tests` run executed 868 tests with one
+skip and passed. Counts are snapshots; update them when the suite changes.
 
 ## What the suite is organised around
 
@@ -23,10 +25,12 @@ dedicated files:
 | Telegram rendering and splitting | `test_core.py`, `test_audit.py` |
 | Job queue, back-pressure, shutdown | `test_job_queue.py` |
 | Media intake and cancellation | `test_media_intake.py`, `test_media_runtime.py` |
-| Media worker without system binaries | `test_media_runtime.py` (asserts no `ffmpeg`/`ffprobe`/`soffice` is ever executed) |
 | Presentations and legacy `.ppt` | `test_presentations.py`, `test_bot_presentation_flow.py` |
 | STT providers, retries, fallback | `test_provider_contracts.py`, `test_provider_robustness.py` |
+| AI provider registry, routing, quota guards, legacy compatibility, secret hygiene | `test_ai_platform.py`, `test_ai_schema_compat.py` |
+| Per-provider request/response contracts | `test_provider_adapters.py` |
 | Provider credentials and health | `test_provider_credentials.py`, `test_provider_health.py` |
+| Telegram AI administration and billing attestation | `test_admin_ai.py` |
 | Billing, payments, special users | `test_billing.py`, `test_payment_flow.py`, `test_special_users_and_plan_panel.py` |
 | Note quality, coverage, QA | `test_note_quality.py`, `test_semantic_coverage.py`, `test_note_evaluation.py` |
 | DOCX layout, RTL, TOC, pagination | `test_docx_export.py`, `test_docx_polish.py`, `test_docx_layout_requirements.py`, `test_mixed_script_typography.py` |
@@ -35,31 +39,45 @@ dedicated files:
 | Configuration and dependency drift | `test_config_consistency.py`, `test_dependency_consistency.py` |
 | Deployment (cPanel, launcher, lock) | `test_cpanel_deploy.py` |
 
-## Benchmarks
+Provider tests use mock sessions and synthetic credentials; the suite never
+calls a real AI provider and CI contains no API keys. The adapter contract tests
+cover provider request shapes, auth headers, model-specific structured-output
+strategies, normalized errors, and quota-header handling. Platform tests cover
+live-catalog failure safety, per-key billing attestations, free-model filtering,
+legacy `NOTE_API_*` caps, and in-flight local quota reservations.
+
+## Benchmarks and manual visual checks
 
 ```bash
-python -m scripts.benchmark_notes            # deterministic, offline, ~2 s
-python -m scripts.benchmark_notes --live     # calls the configured note provider
-python -m scripts.benchmark_stt audio.mp3    # per-provider STT latency
-python -m scripts.benchmark_queue            # bounded-queue load, 1..50 jobs, ~4 s
-python -m scripts.validate_docx --render     # DOCX structure + offline pages
+python -m scripts.benchmark_notes --mode standard --json --router
+python -m scripts.benchmark_notes --mode full            # deterministic, offline
+python -m scripts.benchmark_notes --live                # calls configured AI provider
+python -m scripts.benchmark_stt audio.mp3                # per-provider STT latency
+python -m scripts.benchmark_queue                       # bounded-queue load, 1..50 jobs
+python -m scripts.validate_docx --render                 # structure + offline page render
 ```
 
 `benchmark_notes` reports compression ratio, number/term signal coverage and
 **semantic coverage** per fixture. Semantic coverage is the measure that catches
 a deleted explanation; a number/term check alone cannot. A low compression
-ratio is never a failure by itself — it is read together with coverage.
+ratio is never a failure by itself—it is read together with coverage. The
+`--router` profile is an offline dry-run of the free-first route, skip reasons,
+and per-provider chunk/output budgets. Only `--live` makes provider calls; do
+not run it without explicit billable-test approval and an attested key.
 
 The offline DOCX benchmark deliberately runs with the static TOC disabled
 because exact page mapping needs the production renderer; static-TOC behaviour
-is covered by its own tests with a stubbed page map.
+is covered by its own tests with a stubbed page map. The DOCX validator creates
+sample files under a temporary directory by default. Its rendered pages can be
+opened and inspected manually; automated RTL assertions remain in the DOCX
+layout tests.
 
 `benchmark_queue` drives the real `StudyBot` queue (bounded queue, worker pool,
 job semaphore, SQLite status writes) with synthetic jobs and reports acceptance
 vs back-pressure rejection, queue-wait and latency percentiles, throughput and
 RSS per scenario. At the default capacity (3 workers + 8 pending) a burst of
-25 or 50 uploads accepts 11 and rejects the rest with an explicit message —
-that is the capacity model working, not a failure.
+25 or 50 uploads accepts 11 and rejects the rest with an explicit message—that
+is the capacity model working, not a failure.
 
 ## Conventions
 

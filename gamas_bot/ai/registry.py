@@ -5,7 +5,7 @@ The registry answers three questions:
 1. **What is this provider?** — slug, display name, protocol, base URL,
    authentication style, documentation anchors.
 2. **May Gamas use it in FREE-ONLY mode?** — an explicit classification
-   (:class:`ProviderClass`) plus free-tier/commercial-use policy notes. A
+   (:class:`ProviderClass`) plus free-tier/provider-terms policy notes. A
    provider is *never* classified free because a marketing page shows "$0";
    the classification is reviewed metadata (see per-entry ``last_reviewed``)
    and administrators can override it per deployment (``ai_provider_settings``).
@@ -37,6 +37,7 @@ class ProviderClass(str, Enum):
     PAID_ONLY = "paid_only"
     UNAVAILABLE = "unavailable"
     REGION_RESTRICTED = "region_restricted"
+    ACCOUNT_UNVERIFIED = "account_unverified"
 
 
 class AuthStyle(str, Enum):
@@ -76,7 +77,8 @@ class ProviderInfo:
     pricing_url: str
     #: One-paragraph plain-text data-use summary ("privacy" page anchor).
     data_use_policy: str
-    #: Whether commercial/production use is allowed by the provider's terms.
+    #: Broad provider-terms gate for Gamas production use; false also covers
+    #: scoped education/professional-review restrictions, not only commercial use.
     commercial_use_allowed: bool
     #: Free-tier description for the admin panel (numbers = last-reviewed hint).
     free_tier_policy: str
@@ -141,10 +143,11 @@ _NARA = ProviderInfo(
     data_use_policy="Third-party gateway; prompts transit the router. Review its terms.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Free plan models are listed by GET /v1/models on the free key (the "
-        "endpoint returns exactly the aliases the account's plan entitles; the "
-        "public /api/plans endpoint lists tiers). Quota is account-plan "
-        "dependent and discovered, never assumed."
+        "The account model list is combined with the public GET /api/plans "
+        "catalog (Free currently lists agnes-2.5-flash, not agnes-3-flash; "
+        "verified 2026-10-09). Only the intersection with the active Free "
+        "plan is tagged free; account billing state and overage safeguards are "
+        "still explicitly attested per key."
     ),
     generation_allowed_in_free_only=True,
     quota_can_become_paid=True,
@@ -155,7 +158,9 @@ _NARA = ProviderInfo(
 _GROQ = ProviderInfo(
     slug="groq",
     display_name="Groq",
-    classification=ProviderClass.FREE_PLAN,
+    # The current official rate-limit page is explicitly the Developer-plan
+    # baseline. It does not establish a no-charge production entitlement.
+    classification=ProviderClass.ACCOUNT_UNVERIFIED,
     protocol=PROTOCOL_OPENAI,
     base_url="https://api.groq.com/openai/v1",
     auth_style=AuthStyle.BEARER,
@@ -164,13 +169,13 @@ _GROQ = ProviderInfo(
     data_use_policy="See Groq privacy policy; API traffic policy per GroqCloud terms.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Free tier (last verified 2026-10-09): per-model limits, e.g. "
-        "openai/gpt-oss-120b, openai/gpt-oss-20b and qwen/qwen3.8-27b at "
-        "30 RPM / 1K RPD / 8K TPM / 200K TPD. Live values are read from the "
-        "x-ratelimit-* response headers on every call."
+        "The published rate-limit table (last verified 2026-10-09) is the "
+        "Developer-plan baseline, not proof of free eligibility. FREE_ONLY "
+        "routing stays disabled until an official no-charge production plan is "
+        "documented. Response x-ratelimit-* headers are still observed."
     ),
-    generation_allowed_in_free_only=True,
-    quota_can_become_paid=False,
+    generation_allowed_in_free_only=False,
+    quota_can_become_paid=True,
     exposes_quota_headers=True,
 )
 
@@ -219,7 +224,7 @@ _MISTRAL = ProviderInfo(
         "not hard-coded and is observed at runtime."
     ),
     generation_allowed_in_free_only=True,
-    quota_can_become_paid=False,
+    quota_can_become_paid=True,
     exposes_quota_headers=True,
 )
 
@@ -242,28 +247,37 @@ _SAMBANOVA = ProviderInfo(
         "supported by the provider and by Gamas rotation."
     ),
     generation_allowed_in_free_only=True,
-    quota_can_become_paid=False,
+    quota_can_become_paid=True,
     exposes_quota_headers=True,
 )
 
 _ZAI = ProviderInfo(
     slug="zai",
     display_name="Z.AI (GLM)",
-    classification=ProviderClass.PROMOTIONAL_FREE,
+    classification=ProviderClass.FREE_PLAN,
     protocol=PROTOCOL_OPENAI,
     base_url="https://api.z.ai/api/paas/v4",
     auth_style=AuthStyle.BEARER,
     docs_url="https://docs.z.ai",
     pricing_url="https://docs.z.ai/guides/overview/pricing",
-    data_use_policy="See Z.AI terms.",
-    commercial_use_allowed=True,
-    free_tier_policy=(
-        "Mixed catalog (last verified 2026-10-09): GLM-4.5-Flash and "
-        "GLM-4.7-Flash are listed as permanently Free; most other models are "
-        "paid. Gamas records free_type (permanent|promotional|paid) and "
-        "free_until per model and stops using promotional models after expiry."
+    data_use_policy=(
+        "Terms III.06(a) restrict some education-related decision-making and "
+        "III.06(b) restricts services requiring educational qualifications or "
+        "professional review. Gamas conservatively blocks student-note prompts "
+        "pending clarification. See https://docs.z.ai/legal-agreement/terms-of-use."
     ),
-    generation_allowed_in_free_only=True,
+    # The Terms do not state a blanket ban on every educational use. Their
+    # education/professional-review restrictions create enough ambiguity for
+    # Gamas student notes that this provider stays blocked pending review.
+    commercial_use_allowed=False,
+    free_tier_policy=(
+        "Mixed catalog (last verified 2026-10-09): the pricing table lists "
+        "GLM-4.5-Flash and GLM-4.7-Flash as Free; most other models are paid. "
+        "Gamas marks only these reviewed IDs as FREE_PLAN. Student-note use "
+        "remains conservatively blocked pending review of education-related "
+        "restrictions in Terms III.06."
+    ),
+    generation_allowed_in_free_only=False,
     quota_can_become_paid=False,
     exposes_quota_headers=False,
 )
@@ -271,28 +285,33 @@ _ZAI = ProviderInfo(
 _NVIDIA = ProviderInfo(
     slug="nvidia",
     display_name="NVIDIA NIM / build.nvidia.com",
-    classification=ProviderClass.PROMOTIONAL_FREE,
+    # The hosted Developer Program endpoints are for prototyping/development;
+    # production NIM use needs NVIDIA AI Enterprise licensing.
+    classification=ProviderClass.TRIAL_ONLY,
     protocol=PROTOCOL_OPENAI,
     base_url="https://integrate.api.nvidia.com/v1",
     auth_style=AuthStyle.BEARER,
     docs_url="https://build.nvidia.com/docs",
     pricing_url="https://build.nvidia.com",
     data_use_policy="See NVIDIA build terms; demo endpoints may log traffic.",
-    commercial_use_allowed=True,
+    commercial_use_allowed=False,
     free_tier_policy=(
-        'Endpoints listed in the live catalog at https://integrate.api.nvidia.com/v1/models '
-        "(last verified 2026-10-09); availability and deprecation are "
-        "model-level live facts, synced on demand — never assumed permanent."
+        "Hosted Developer endpoints are for prototyping/development only; "
+        "production NIM requires NVIDIA AI Enterprise licensing. Kept out of "
+        "production routes, including paid fallback."
     ),
-    generation_allowed_in_free_only=True,
+    generation_allowed_in_free_only=False,
     quota_can_become_paid=False,
     exposes_quota_headers=False,
+    experimental_only=True,
 )
 
 _CLOUDFLARE = ProviderInfo(
     slug="cloudflare",
     display_name="Cloudflare Workers AI",
-    classification=ProviderClass.PERMANENT_FREE,
+    # The included daily allocation is plan/account scoped; Workers Paid can
+    # incur charges beyond it, so this is not unconditionally permanent-free.
+    classification=ProviderClass.FREE_PLAN,
     protocol=PROTOCOL_OPENAI,
     base_url=None,  # account-scoped: built from the account ID
     auth_style=AuthStyle.BEARER,
@@ -301,14 +320,14 @@ _CLOUDFLARE = ProviderInfo(
     data_use_policy="See Cloudflare Workers AI terms; REST API via account token.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "10,000 Neurons/day free allocation per account (last verified "
-        "2026-10-09); the allocation resets daily at 00:00 UTC and usage above "
-        "it bills at $0.011 per 1,000 Neurons. Some models require paid "
-        "billing — each model carries requires_paid_billing and FREE_ONLY "
-        "rejects those."
+        "10,000 Neurons/day account allocation (last verified 2026-10-09); "
+        "Workers Paid can bill usage above it. Model Search does not document "
+        "free-pricing/capability fields, so discovered models remain unknown "
+        "until explicitly verified. FREE_ONLY needs current account and "
+        "overage-safeguard attestation."
     ),
     generation_allowed_in_free_only=True,
-    quota_can_become_paid=False,
+    quota_can_become_paid=True,
     exposes_quota_headers=False,
 )
 
@@ -552,6 +571,7 @@ _CLASS_FA = {
     ProviderClass.PAID_ONLY: "فقط پولی",
     ProviderClass.UNAVAILABLE: "در دسترس نیست",
     ProviderClass.REGION_RESTRICTED: "محدود به منطقه",
+    ProviderClass.ACCOUNT_UNVERIFIED: "استحقاق حساب تأییدنشده",
 }
 
 #: Admin-panel status vocabulary (spec §51).

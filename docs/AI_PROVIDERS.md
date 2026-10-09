@@ -1,168 +1,96 @@
 # Gamas AI Provider Platform
 
-این سند مرجع پلتفرم چندارائه‌دهندهٔ تولید جزوه است: معماری، وضعیت رایگان‌ها،
-تنظیمات، مسیریابی/failover، پنل مدیریت، راه‌اندازی و محدودیت‌های شناخته‌شده.
+This is the operational reference for the existing multi-provider note pipeline. It preserves the canonical structured-note schema and the current transcript/chunk/QA/repair/merge/DOCX/PPTX, billing, Telegram, encrypted-key, health, and deployment paths. Provider routing is an additional layer; it does not replace the note pipeline.
 
-> همهٔ مقادیر عددیِ سهمیه‌ای که در این فایل می‌بینید **«last verified»** هستند و
-> با زمان ممکن است عوض شوند. منبع صحیح همیشه مستندات رسمی ارائه‌دهنده است؛
-> ستون «Docs URL» هر ارائه‌دهنده در پنل ربات نیز همین لینک را نشان می‌دهد.
+Provider plan and capability statements below were reviewed against provider-owned documentation on **2026-10-09**. Quotas and terms can change: the URLs in the registry are the source of truth. A `$0` price or a provider-wide “free” label is not enough to enable a model under `AI_FREE_ONLY`.
 
-## قانون‌های سخت (غیر قابل مذاکره)
+## Hard safety rules
 
-1. **FREE_ONLY پیش‌فرض روشن است** (`AI_FREE_ONLY=true`). در این حالت هیچ
-   ترافیکی به مدل/ارائه‌دهندهٔ پولی نمی‌رود؛ اگر مسیر رایگان نباشد، «بلاک»
-   ثبت و خطای خوانا به کاربر داده می‌شود.
-2. **Fallback پولی فقط opt-in** (`AI_ALLOW_PAID_FALLBACK=false` پیش‌فرض) و
-   همیشه **آخرِ** زنجیره است؛ ترتیب مسیر نمی‌تواند آن را جلوتر بیاندازد.
-3. هیچ ترافیک عادی‌ای به ارائه‌دهنده‌های trial-only/region-restricted/
-   commercial-prohibited نمی‌رود؛ این‌ها stateهای صریح‌اند که مدیر باید به‌
-   آگاهی باز کند (قفل آزمایشی).
-4. API keyها، هدرهای Authorization، متن سخنرانی، system prompt و خروجی خام
-   مدل‌ها **هرگز** در لاگ، پنل، پیام کاربر یا فایل جزوه ظاهر نمی‌شوند.
-5. مدل‌های منسوخ/منقضی‌شده خودکار از مسیر حذف می‌شوند؛ «بازنشانی سهمیه» برای
-   رفع قفل روزانه وجود دارد ولی خطای ۵xx پشت‌سرهم بدون توقف ادامه نمی‌یابد.
+1. Defaults are `AI_FREE_ONLY=true` and `AI_ALLOW_PAID_FALLBACK=false`. A paid route is never a fallback unless paid fallback is enabled, its route is deliberately marked paid, and the selected key is explicitly attested `paid`.
+2. New and migrated credentials start with `billing_state=unknown`. Unknown keys cannot generate. Read-only catalog/health checks may use them. A key marked `free` is an administrator assertion that billing is disabled or a provider-side hard `$0` cap prevents paid overage. A key marked `paid` is explicit paid-use authorization. Clear the attestation to block generation again.
+3. Key attestation does not establish that an individual model is free. FREE_ONLY additionally requires a known, active, non-deprecated model with compatible terms and output support. Unknown is blocked.
+4. Restricted-use, trial-only, and region-restricted providers are not silently routed. NVIDIA hosted Developer endpoints, Cohere Trial API, and Cerebras trial credits remain blocked from production note routes. Z.AI’s Terms do not ban every educational use, but restrict specified education-related decisions and services requiring educational qualifications or professional review; Gamas conservatively blocks student-note generation pending scope clarification, despite selected models being listed Free.
+5. Credential rotation is inside a provider leg; provider failover is the next layer. Retries, local RPM/TPM/daily caps, provider rate headers, and quota probes all participate in the decision.
+6. Logs and student files never contain API keys, credentials/ciphertext, prompts, transcripts, raw model output, provider diagnostic bodies, or backend IDs. Provider-supplied error messages are bounded and secret-redacted before they can reach structured logs.
 
-## ارائه‌دهنده‌ها و وضعیت رایگان (handbook، «آخرین بررسی ۲۰۲۶‑۱۰»)
+## Provider registry and current evidence
 
-| slug | نام | کلاس | آیا در FREE_ONLY؟ | سهمیهٔ حدودی (last verified) | Trial/منطقه |
-|-----|-----|------|------------------|------------------------------|--------------|
-| `gemini` | Google Gemini (AI Studio) | رایگان با پلن | ✅ | ۲۵۰ req/day (15 RPM, flash-lite متفاوت) | — |
-| `nara` | NaraRouter | رایگان با پلن | ✅ | مدیریت‌شده توسط Nara (هر کلید) | — |
-| `groq` | Groq | رایگان با پلن | ✅ | ~1k req/day، 30 RPM، 8k/16k TPM | — |
-| `openrouter` | OpenRouter | رایگان با پلن | ✅ | ۵۰ req/day برای مدل‌های `:free` | — |
-| `mistral` | Mistral La Plateforme | رایگان با پلن | ✅ | experiment tier (RPS کم) | — |
-| `sambanova` | SambaNova Cloud | رایگان با پلن | ✅ | free tier محدود | — |
-| `zai` | z.ai GLM | تبلیغاتی | ✅ | اعتبار رایگان موقت + مدل‌های flash رایگان | اعتبار منقضی می‌شود |
-| `nvidia` | NVIDIA NIM | تبلیغاتی | ✅ | اعتبار اولیهٔ رایگان (۱۰۰۰ token/req محدود) | منقضی می‌شود |
-| `cloudflare` | Cloudflare Workers AI | رایگان دائمی | ✅ | ۱۰۰۰۰ neuron/day | نیاز به Account ID |
-| `huggingface` | HF Inference Providers | رایگان با پلن | ✅ | اعتبار ماهانهٔ کوچک | — |
-| `alibaba` | Alibaba Model Studio | محدودیت منطقه | ❌ (با بازکردن قفل + fallback پولی) | quota ناحیه‌ای | region-restricted |
-| `cohere` | Cohere | trial-only | ❌ | Trial key محدود | تولید تجاری ممنوع |
-| `cerebras` | Cerebras | نامعتبر/آزمایشی | ❌ | — | وضعیت نامشخص |
-| `openai_compatible` | درگاه سازگار با OpenAI | عمومی | با fallback | بسته به درگاه | — |
-| `anthropic` | Anthropic | فقط پولی | ❌ (با fallback) | — | — |
+“Generation eligibility” is a provider-level gate; the model and per-key billing gates still apply.
 
-ارائه‌دهنده‌های `gemini`، `nara`، `groq`، `openrouter` و... در registry با
-`Adapters` اختصاصی پیاده‌سازی شده‌اند؛ بقیه روی `OpenAICompatAdapter` سوارند.
-پروتکل‌های `gemini_native`، `gemini_openai_compatible`، `anthropic` و
-`openai_compatible` پشتیبانی می‌شوند.
+| Provider | Registry class | FREE_ONLY status | Model / quota evidence and limitations |
+|---|---|---|---|
+| Google Gemini API / AI Studio (`gemini`) | Free plan | Provider can be considered; exact model, live quota, and key attestation still required | Model-specific free-tier/rate limits; response quota headers are observed. See [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) and [API docs](https://ai.google.dev/gemini-api/docs). |
+| NaraRouter (`nara`) | Free plan | Only the intersection of the account `/v1/models` list and the active public Free-plan model list | Current public `GET https://router.bynara.id/api/plans` Free plan lists `agnes-2.5-flash` (7,000,000 tokens/day, 15 RPM); it does **not** list legacy `agnes-3-flash`. The latter remains honored when configured, but is never silently called free. If the public plan fetch is unavailable, discovered models remain free-status `unknown`. See [Nara docs](https://router.bynara.id/docs), [plans](https://router.bynara.id/api/plans). |
+| Groq (`groq`) | Account entitlement unverified | **Blocked** in FREE_ONLY | Its published rate-limit table is a Developer-plan baseline, not proof of a no-charge production entitlement. Account and model eligibility are not inferred from that table. Exact strict-schema support is model-specific; see [Structured Outputs](https://console.groq.com/docs/structured-outputs) and [rate limits](https://console.groq.com/docs/rate-limits). |
+| OpenRouter (`openrouter`) | Free plan | `:free` models and the documented `openrouter/free` router only | The key endpoint provides free daily usage (`used`, `limit`, `remaining`); Gamas observes it and also maintains a conservative ledger. Public free accounts: 20 RPM and 50 requests/day; accounts with at least $10 purchased credits may receive a 1,000/day free-model limit. See [OpenRouter docs](https://openrouter.ai/docs). |
+| Mistral La Plateforme (`mistral`) | Free mode exists | **No seeded model is currently FREE_ONLY-eligible** | Free mode can be activated without a card, but included usage is limited and pay-as-you-go can extend it. The `mistral-small-latest` playground/example does not prove that a specific account/model has a no-overage free entitlement; live models remain `unknown` until explicit model-level evidence exists. JSON-object mode is distinct from schema enforcement. See [Free mode](https://docs.mistral.ai/getting-started/quickstarts/studio/activate-and-generate-api-key), [JSON mode](https://docs.mistral.ai/capabilities/structured_output/json_mode), [structured output](https://docs.mistral.ai/capabilities/structured_output/custom). |
+| SambaNova Cloud (`sambanova`) | Free plan | Only explicitly reviewed model seeds + key billing attestation | The reviewed free-tier example `Meta-Llama-3.3-70B-Instruct` is listed at 20 RPM / 20 RPD / 200K TPD on the no-payment-method tier. Limits differ by model. Other discovered IDs stay free-status `unknown`; runtime rate-limit headers refine the local ledger. See [rate limits](https://docs.sambanova.ai/docs/en/models/rate-limits). |
+| Z.AI GLM (`zai`) | Free plan, mixed catalog | **Conservatively blocked from all Gamas note routes** | Pricing lists `glm-4.5-flash` and `glm-4.7-flash` as Free. The [Terms of Use §III.06](https://docs.z.ai/legal-agreement/terms-of-use) restrict education-related decision-making that may materially affect rights/well-being, plus services requiring educational qualifications or professional review; this is not a blanket ban on every educational use. Because Gamas generates student learning notes without integrated educator review, the provider remains blocked pending scope clarification. Price or key attestation does not override the terms gate. JSON mode and reasoning controls remain model-specific for future policy review. See [pricing](https://docs.z.ai/guides/overview/pricing), [structured output](https://docs.z.ai/guides/capabilities/struct-output), [thinking](https://docs.z.ai/guides/capabilities/thinking). |
+| NVIDIA NIM / `build.nvidia.com` (`nvidia`) | Trial-only | **Blocked**, including paid fallback | Hosted Developer Program endpoints are for prototyping/development; production NIM requires the applicable NVIDIA AI Enterprise license. Commercial use is prohibited by this registry entry. See [NVIDIA Build docs](https://build.nvidia.com/docs). |
+| Cloudflare Workers AI (`cloudflare`) | Account/plan based | **Blocked for models whose free entitlement is unknown** | Free accounts include 10,000 Neurons/day; Workers Paid usage above included allowance can be billable. The account-scoped [Model Search API](https://developers.cloudflare.com/api/resources/ai/subresources/models/methods/list/) supports pagination and OpenRouter-format IDs, but does not document per-model free price/capability fields. Discovery therefore records IDs only; capabilities and free status remain unknown unless reviewed. `CLOUDFLARE_ACCOUNT_ID` is required. |
+| Hugging Face Inference Providers (`huggingface`) | Paid only / experimental | **Blocked** | Free HF users have no monthly inference credit; use requires purchased credits or a paid subscription. Experimental and not a primary/free route. See [pricing](https://huggingface.co/docs/inference-providers/pricing). |
+| Alibaba Cloud Model Studio (`alibaba`) | Region restricted | Not auto-routed; explicit deployment unlock and model/account review required | Quotas are region, account, model, and expiry dependent. No global free entitlement is assumed. See [Model Studio docs](https://help.aliyun.com/en/model-studio) and [pricing](https://help.aliyun.com/en/model-studio/model-pricing). |
+| Cohere Trial API (`cohere`) | Trial-only | **Blocked** | Trial credentials are for evaluation, not production/commercial note generation. See [Cohere docs](https://docs.cohere.com/docs/rate-limits) and the provider terms. |
+| Cerebras (`cerebras`) | Trial-only | **Blocked** | A time-limited trial credit/payment-method requirement is not a free production plan. Kept for evaluation/benchmarks only. Structured-output support is per model/tier; see [structured outputs](https://inference-docs.cerebras.ai/capabilities/structured-outputs), [rate limits](https://inference-docs.cerebras.ai/support/rate-limits). |
+| Anthropic (`anthropic`) | Paid only | Blocked unless an explicit paid route is configured | Kept for backward compatibility. See [pricing](https://platform.claude.com/docs/en/about-claude/pricing). |
+| Generic OpenAI-compatible (`openai_compatible`) | Paid / unknown gateway | Blocked as free unless hostname resolves to a reviewed provider | The canonical resolver preserves gateway deployments such as the current NaraRouter base URL. The configured `NOTE_API_MODEL` is preserved but is not granted free status by aliasing. |
 
-## معماری به‌اختصار
+The experimental providers HF, Alibaba, Cohere, and Cerebras remain registered for discovery, admin visibility, or benchmarking as appropriate; they are not silently inserted into a production FREE_ONLY route. NVIDIA is held out even when experimental settings are unlocked because the reviewed hosted terms are development-only and commercial-prohibited.
 
-```
-gamas_bot/ai/
-  registry.py   – ProviderInfo ثابت: کلاس، پروتکل، URL مستندات/قیمت، سیاست داده،
-                  محدودیت منطقه، aliasها (نرمال‌سازی slug از hostname/base URL)
-  models.py     – ModelRegistry: کش مدل‌ها در DB + STATIC_SEEDS + free-status
-  schema.py     – نکتهٔ واحد ساخت Note schema + نسخهٔ سازگار با Gemini
-  adapters.py   – NoteAdapter + زیرکلاس‌ها; build()/parse()/map_error()
-                  دسته‌بندی خطاها: auth/quota/rate/billing/model/content-blocked…
-  profiles.py   – RequestPolicy: بودجهٔ توکن چانک، retry، timeout، reasoning…
-  tokens.py     – تخمین توکن و تبدیل بودجهٔ توکن→نویسه برای chunker
-  routing.py    – ProviderRouter: plan(FREE_FIRST→PAID_LAST)+RouteLeg+NoteJobSession
-  usage.py      – AIUsageTracker: ai_usage_records/daily/quota snapshots/events
-  sync.py       – کشف از endpointهای «models» + به‌روزرسانی کش (TTL-guarded)
-  admin_ai.py   – پنل ادمین تلگرام (admin:ai:*)
-```
+## Model capability and discovery policy
 
-جریان داده: `bot._process_job` → `NoteJobSession` → `structure_*` →
-`_structured_notes_for/_structure_chunk` → اگر routing فعال باشد از طریق
-`ProviderRouter`، وگرنه مسیر legacy دقیقاً مثل قبل (byte-compatible).
+`gamas_bot/ai/models.py` keeps reviewed static seeds, a live SQLite catalog, and conservative fallback metadata. Exact reviewed capabilities and other seed facts fill gaps when a generic catalog omits them; a live non-unknown free-status fact and current availability/deprecation data may supersede a seed. Thus an incomplete `unknown` catalog row cannot erase a reviewed status, while new paid/expired/unavailable evidence still blocks routing. Discovery does not infer model capabilities from a provider-wide default or arbitrary marketplace JSON. Unknown models support only the common chat request and prompt-enforced JSON; they do not receive schema, image/audio, reasoning, or tool flags by name pattern unless a reviewed exact rule supports it.
 
-## استراتژی JSON capability-aware
+Provider-specific notes:
 
-به‌ترتیب اولویت: `strict_json_schema` → `json_schema` → `gemini_schema`
-(responseSchema native) → `gemini_mime` (responseMimeType) → `json_object`
-(= NOTE_API_JSON_MODE قدیمی) → `prompt`. انتخاب بر اساس capabilityهای
-مدل کش‌شده است و روی HTTP 400 «response_format unsupported» فقط **یک‌بار**
-به prompt JSON تنزل می‌یابد و سپس failover طبیعی ادامه می‌یابد.
+* Gemini native schema support is advertised only for reviewed Gemini model IDs.
+* Groq strict schema support is exact-model only (`openai/gpt-oss-20b`, `openai/gpt-oss-120b`, and `qwen/qwen3.8-27b`; the guard model has best-effort behavior). Groq eligibility remains account-unverified.
+* Cerebras constrained decoding is limited by its model and availability tier; it is not generalized to the provider.
+* Mistral JSON-object mode is not JSON Schema. Its public examples are not an account-level free entitlement.
+* Nara plan discovery marks only the intersection of the active public Free plan and that account’s authenticated model list. Unknown plan data never replaces a previous valid catalog.
+* Cloudflare pagination is bounded. A failed, empty, malformed, or truncated refresh leaves the last valid catalog intact; its Model Search response is not treated as billing or capability evidence.
 
-## تنظیمات
+Generation strategy is selected from the exact model capability record: strict JSON Schema → JSON Schema → Gemini native schema/MIME → JSON object → prompt-enforced JSON. An explicit provider rejection can trigger one supported downgrade; the canonical Gamas note schema, output parser, QA/repair, and note-scrubbing rules remain authoritative.
 
-| متغیر | پیش‌فرض | معنا |
-|------|--------|------|
-| `AI_FREE_ONLY` | `true` | تولید فقط روی لایهٔ رایگان |
-| `AI_ALLOW_PAID_FALLBACK` | `false` | fallback پولی opt-in (پایان زنجیره) |
-| `AI_ROUTING_ENABLED` | `true` | موتور مسیریاب جدید؛ با `false` رفتار کاملاً قدیمی |
-| `AI_PROVIDER_SYNC_TTL` | `86400` | TTL کشف مدل (ثانیه) |
-| `AI_DEFAULT_NOTE_ROUTE` | `""` | مسیر پیش‌فرض جدای از seed env (فرمت slug1,slug2,...) |
-| `AI_MAX_PROVIDER_FAILOVERS` | `3` | سقف hop بین ارائه‌دهنده‌ها در یک تلاش |
-| `AI_MAX_GENERATION_RETRIES` | `-1` (auto) | سقف retry داخل هر ارائه‌دهنده |
-| `AI_QUOTA_SAFETY_MARGIN` | `0.15` | حاشیهٔ امن شمارش روزانه (۰ تا ۰٫۴۹) |
-| `CLOUDFLARE_ACCOUNT_ID` | – | برای ساخت base URL Workers AI |
+## Request budgets and legacy compatibility
 
-سازگاری: `NOTE_API_*`/`GEMINI_API_KEY` به‌همان معنای قبل؛ seed مسیر با
-ارائه‌دهندهٔ env اول ساخته می‌شود، بنابراین deployment فعلی NaraRouter بدون هیچ
-تغییری کار می‌کند (آزمایش `LegacyPayloadFreezeTests::test_nararouter_shape_preserved`).
+`gamas_bot/ai/profiles.py` holds conservative per-provider chunk/token/output budgets, local RPM/TPM/daily caps, retry counts, and pipeline-pass policy. Provider-supplied rate/quota headers refine the ledger. Retry caps are bounded by the provider profile and `AI_MAX_GENERATION_RETRIES`; failed attempts count against local budgets. Before each attempt, the router projects input plus the full output-token cap against RPM/TPM/daily ledgers and atomically reserves that budget across in-flight workers in the bot process; recorded usage is committed before the reservation is released. This is a conservative local guard, not a replacement for the provider's own cap or the required no-overage billing attestation. A quota-ledger read failure fails closed.
 
-## مهاجرت‌ها
+All existing `NOTE_API_*` options remain parsed and operational. `NOTE_API_TIMEOUT`, `NOTE_API_RETRIES`, and `NOTE_API_MAX_OUTPUT_TOKENS` are upper bounds on the profile budget (they may reduce, never inflate, a provider-specific safety limit). `NOTE_API_PROVIDER`, `NOTE_API_KEY`, `NOTE_API_BASE_URL`, `NOTE_API_MODEL`, `NOTE_API_EXTRA_HEADERS_JSON`, and `NOTE_API_JSON_MODE` remain intact. In particular, the existing `NOTE_API_PROVIDER=openai_compatible` + Nara base URL + `agnes-3-flash` stays configured as-is; that model is not silently relabeled free.
 
-`migrations/006_ai_provider_platform.sql` (forward-only و idempotent):
-جداول `ai_models`، `ai_provider_settings`، `ai_provider_routes`،
-`ai_usage_records`، `ai_usage_daily`، `ai_quota_snapshots`، `ai_events` و
-افزودن ستون‌های `key_type/free_only_mode/failure_streak/last_error_class`
-به `provider_credentials`. اعمال خودکار در `Database.open`.
+## Credential billing attestation
 
-## پنل مدیریت تلگرام
+Migration `007_provider_billing_attestations.sql` adds `billing_attested_at` and `billing_attested_by_admin_id`, resets every pre-existing credential to `unknown`, and clears any unaudited legacy flags. A generation lane requires the state plus both attestation metadata fields. The encrypted secret and existing audit log are reused.
 
-`⚙️ پنل مدیریت → 🤖 پلتفرم AI`:
+In **AI → provider → keys**, the admin may attest:
 
-* **ارائه‌دهنده‌ها**: کارت هر ارائه‌دهنده با کلاس (🟢🟡🟠🔴⛔)، سیاست داده،
-  لینک Docs/Pricing (نمایش URL به مدیر مجاز است)، فعال/غیرفعال، بلاک
-  رایگان‌سازی، قفل آزمایشی، تعداد کلید.
-* **کلیدها (راهنما)**: انتخاب ارائه‌دهنده → مدل (دکمه/سفارشی) → برچسب →
-  کلید (پیام حذف می‌شود) → ذخیرهٔ رمزنگاری‌شده → تست. کارت کلید:
-  فعال/غیرفعال، reorder، حذف، تست مستقیم.
-* **مسیرها**: ترتیب failover با ▲▼، فعال/غیرفعال، ❌، ➕ افزودن پایانی.
-* **مصرف**: مجموع ۷روز/ارائه‌دهنده + «بازنشانی شمارندهٔ امروز» (reset quota).
-* **مدل‌ها**: کشف/کش هر ارائه‌دهنده + علامت‌گذاری «منسوخ».
-* **لاگ‌ها**: رویدادهای ساختاری (kind/provider/model/http/latency/error_class)
-  بدون secret و بدون محتوا.
-* **Dry-run**: نمایش ساختار درخواست (آدرس، استراتژی JSON، تخمین توکن)
-  **بدون ارسال** — با کلید جایگذاری؛ بدون محتوای خام.
-* **نمای مسیر و بودجه**: chain مؤثر با بودجهٔ توکن/نویسه هر leg.
+* **FREE/no-overage** only after confirming billing is disabled or a provider-side hard `$0` spend cap makes any charge impossible. A free quota by itself is not that safeguard.
+* **Paid** only after explicitly authorizing billable requests. This does not turn on `AI_ALLOW_PAID_FALLBACK`; that remains a deployment-level opt-in and paid route order remains last.
+* **Clear** to return to `unknown` and block generation.
 
-## راه‌اندازی از صفر (جزوه)
+Environment-backed legacy keys remain configured, and may be used for read-only discovery/health, but are not auto-attested. To generate safely from one, add the same secret to the encrypted key vault and attest it; the existing `NOTE_API_*` values are not rewritten. Telegram key messages are deleted before storage; if message deletion fails, storage is refused. Audit and UI only show labels, billing state, attestation timestamp, and a masked suffix.
 
-۱) env پایه را بچینید (هیچ کلید note لازم نیست اگر از پنل اضافه می‌کنید)
-۲) در تلگرام: پنل مدیریت → پلتفرم AI → ارائه‌دهندهٔ موردنظر → «افزودن کلید»
-۳) اگر `AI_FREE_ONLY=true` است کافی‌است یک کلید `gemini`/`nara`/`groq`/...
-   بگذارید؛ با ۲ تا ۳ کلید، failover رایگان پوشش داده می‌شود.
-۴) `python -m gamas_bot --check` و پنل‌های «وضعیت سرویس‌ها»/«نمای مسیر و بودجه» را برای راستی‌آزمایی ببینید.
+## SQLite migrations
 
-## Health/Probe
+Migrations are forward-only and applied in filename order by `Database.open`:
 
-بررسی‌های جدید adapter-driven هستند: هر adapter `discovery_request()` ارائه
-می‌دهد (ارزان‌ترین read-only endpoint؛ Cloudflare با `CLOUDFLARE_ACCOUNT_ID`
-بدون hardcode). `check_type` = `read_only|generation` در رویدادها ذخیره
-می‌شود؛ تست مستقیم کلید از پنل همان `🧪 تست` است.
+* `006_ai_provider_platform.sql`: model catalog, provider settings/routes, usage and quota ledger, structured events, and additive credential metadata.
+* `007_provider_billing_attestations.sql`: additive billing attestation/output-estimate fields, canonical usage index, and fail-closed reset of all existing credentials to `unknown`.
 
-## لاگ/رویداد
+No encrypted secret is rewritten or exposed. Existing usage rows, audit records, routes, note schema, and historical models are retained.
 
-هر 429/5xx با provider/model/status/attempt/latency/retry-delay/route-position/
-credential-label ثبت می‌شود. کلیدها در `sanitize_text` (substrings ≥8 نویسه)
-حذف می‌شوند؛ جزوهٔ نهایی هرگز شامل دیباگ/آیدی/خطای ارائه‌دهنده نیست.
+## Admin and operations
 
-## محدودیت‌های شناخته‌شده
+The Telegram AI panel covers provider policy, encrypted keys, billing attestations, routing order, health tests, read-only catalog sync, quota/usage summaries, redacted logs, dry-run request shape, and benchmark results. Health/catalog probes are read-only; the separate generation-test path is explicitly billable and must never be mistaken for a health probe. Local usage counters cannot be manually reset from the admin UI because doing so could bypass a provider’s daily cap.
 
-1. **وضعیت رایگان ثابت است** (registry last-reviewed): تغییرات روز ارائه‌دهنده
-   تا بعد از بروزرسانی registry در پنل «pending verification» دیده می‌شود.
-2. سهمیه‌های دقیق بعضی ارائه‌دهنده‌ها (mistral, sambanova, nvidia) فقط از
-   هدر زمان‌واقعی خوانده می‌شوند؛ بدون پاسخ در دسترس «حدس» ثبت نمی‌کنیم.
-3. `AI_ALLOW_PAID_FALLBACK=true` فقط opt-in مدیر است؛ به‌طور خودکار به انتهای زنجیره اضافه نمی‌شود و هرگز خودبه‌خود روشن نمی‌شود.
-4. `AI_MAX_PROVIDER_FAILOVERS` hop سخت است؛ بیشتر از آن خطای خوانا به جای
-   ping-pong برگردانده می‌شود.
-5. Sync مدل‌ها نیاز به HTTP از سرور دارد؛ در cPanel بدون شبکهٔ بیرونی،
-   کش ثابت (static seeds) استفاده می‌شود.
-6. Anthropic «به‌عنوان» ارائه‌دهندهٔ اصلی route نمی‌شود (فقط پولی) مگر با
-   fallback — فعلاً برای پارس/سازگاری باقی‌مانده.
+Start-up checks, backups, deployment, and incident response are in [OPERATIONS.md](OPERATIONS.md). Key encryption, log redaction, note scrubbing, and student-data protections are in [SECURITY.md](SECURITY.md). The required test/benchmark commands are in [TESTING.md](TESTING.md).
 
-## دستورهای راستی‌آزمایی
+## Known limitations / not verified
 
-```bash
-.venv/bin/python -m pytest tests/test_ai_platform.py tests/test_provider_adapters.py \
-    tests/test_ai_schema_compat.py tests/test_admin_ai.py -q
-.venv/bin/python scripts/benchmark_notes.py --mode summary --router
-```
-
-هرگز کلید واقعی در گزارش/لاگ/PR قرار نمی‌گیرد.
+* No real provider API key or account was used in CI. Per-account billing, exact provider quota state, regional eligibility, and overage settings cannot be verified by Gamas; an administrator must attest them.
+* Groq’s Developer-plan limits do not establish a free production entitlement. Groq stays disabled in FREE_ONLY.
+* Nara’s active Free-plan catalog currently lists `agnes-2.5-flash`, not legacy `agnes-3-flash`; account model access must still agree with the public plan result.
+* Mistral’s model-specific included usage and billable overage behavior are not represented by the Free-mode activation page; `mistral-small-latest` remains model-status unknown.
+* Cloudflare Model Search provides catalog IDs, not the model capability/free-pricing facts needed for automatic FREE_ONLY selection.
+* A `free` key attestation is an operator statement, not cryptographic proof. The provider could change its terms or the account billing state after attestation; re-review provider account settings and official links regularly.
+* Provider catalogs and quotas can change after the 2026-10-09 review; automatic discovery cannot prove commercial rights, deprecation policy, or account-level billing state.

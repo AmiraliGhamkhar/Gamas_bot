@@ -243,5 +243,12 @@ class MigrationKeysTests(unittest.TestCase):
             self.assertIn(column, sql)
 
 
+    def test_migration_007_adds_forward_only_billing_attestations(self):
+        sql = (ROOT / "migrations" / "007_provider_billing_attestations.sql").read_text(encoding="utf-8")
+        self.assertIn("ALTER TABLE provider_credentials ADD COLUMN billing_attested_at TEXT", sql)
+        self.assertIn("billing_attested_by_admin_id INTEGER", sql)
+        self.assertIn("SET billing_state='unknown'", sql)
+
+
 if __name__ == "__main__":
     unittest.main()
