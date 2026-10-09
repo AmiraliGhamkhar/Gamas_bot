@@ -399,6 +399,40 @@ class GeminiContractTests(unittest.TestCase):
         )
         self.assertEqual(request.headers["Authorization"], "Bearer AIza")
 
+    def test_gemini_three_reasoning_effort_is_model_capability_gated(self):
+        model = models.STATIC_SEEDS["gemini"][0]
+        ctx = make_ctx("gemini", model.model_id, model_info=model, reasoning_policy="high")
+        request = self.adapter.build(ctx, "AIza-key")
+        self.assertEqual(
+            request.json_body["generationConfig"]["thinkingConfig"],
+            {"thinkingLevel": "HIGH"},
+        )
+        self.assertNotIn("temperature", request.json_body["generationConfig"])
+
+
+class SambaNovaFreeCatalogTests(unittest.TestCase):
+    def test_only_documented_free_production_models_are_seeded(self):
+        ids = {model.model_id for model in models.STATIC_SEEDS["sambanova"]}
+        self.assertEqual(
+            ids,
+            {"DeepSeek-V3.1", "Meta-Llama-3.3-70B-Instruct", "gpt-oss-120b"},
+        )
+        self.assertTrue(all(model.free_status == models.FREE_PLAN for model in models.STATIC_SEEDS["sambanova"]))
+        self.assertNotIn("DeepSeek-V3.2", ids)
+        self.assertNotIn("gemma-4-31B-it", ids)
+
+    def test_structured_output_is_per_model(self):
+        adapter = adapter_for("sambanova", make_settings())
+        seeds = {model.model_id: model for model in models.STATIC_SEEDS["sambanova"]}
+        self.assertEqual(
+            resolve_json_strategy(adapter, seeds["DeepSeek-V3.1"]), "json_schema"
+        )
+        self.assertEqual(
+            resolve_json_strategy(adapter, seeds["Meta-Llama-3.3-70B-Instruct"]),
+            STRATEGY_JSON_OBJECT,
+        )
+        self.assertFalse(seeds["Meta-Llama-3.3-70B-Instruct"].capabilities.supports_json_schema)
+
 
 class LegacyParityTests(unittest.TestCase):
     """Byte-parity with the pre-platform payloads for the legacy providers."""
@@ -490,13 +524,27 @@ class CloudflareContractTests(unittest.TestCase):
         self.assertEqual(headers["Authorization"], "Bearer cf-token")
         payload = {
             "success": True,
-            "result": {"data": [{"id": "@cf/verified-id", "pricing": {"neuron": 0},
-                                  "architecture": {"input_modalities": ["text", "image"]}}]},
+            "result": {"data": [{
+                "id": "@cf/verified-id",
+                "pricing": {"neuron": 0},  # $0 is deliberately not the free evidence
+                "architecture": {"input_modalities": ["text", "image"]},
+                "supported_parameters": ["response_format", "structured_outputs", "tools", "temperature", "top_p"],
+                "context_length": 131072,
+                "top_provider": {"max_completion_tokens": 8192},
+            }]},
         }
         discovered = adapter.parse_discovery(payload)
         self.assertEqual([item.model_id for item in discovered], ["@cf/verified-id"])
         self.assertEqual(discovered[0].free_status, models.FREE_UNKNOWN)
-        self.assertFalse(discovered[0].capabilities.supports_image)
+        self.assertTrue(discovered[0].capabilities.supports_image)
+        self.assertTrue(discovered[0].capabilities.supports_json_schema)
+        self.assertFalse(discovered[0].capabilities.supports_strict_json_schema)
+        self.assertEqual(discovered[0].context_window, 131072)
+        paid = adapter.parse_discovery({"success": True, "result": {"data": [
+            {"id": "@cf/moonshotai/kimi-k2.6", "pricing": {"neuron": 0}}
+        ]}})[0]
+        self.assertEqual(paid.free_status, models.PAID)
+        self.assertTrue(paid.capabilities.requires_paid_billing)
 
     def test_requires_paid_billing_models_blocked_in_free_only(self):
         info = ModelInfo(
@@ -529,7 +577,8 @@ class CohereCerebrasContractTests(unittest.TestCase):
         info = registry_info("alibaba")
         self.assertEqual(info.classification, ProviderClass.REGION_RESTRICTED)
         self.assertTrue(info.requires_explicit_enable)
-        self.assertFalse(info.generation_allowed_in_free_only)
+        self.assertTrue(info.requires_account_verification)
+        self.assertTrue(info.generation_allowed_in_free_only)
 
 
 class ZaiFreeTypeTests(unittest.TestCase):

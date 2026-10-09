@@ -2058,7 +2058,9 @@ class Database:
                     "  THEN excluded.max_output_tokens ELSE ai_models.max_output_tokens END, "
                     "capabilities_json=excluded.capabilities_json, "
                     "free_status=excluded.free_status, free_until=excluded.free_until, "
-                    "available=1, deprecated=0, "
+                    "available=1, "
+                    "deprecated=MAX(ai_models.deprecated, excluded.deprecated), "
+                    "deprecation_date=COALESCE(ai_models.deprecation_date, excluded.deprecation_date), "
                     "free_endpoint=CASE WHEN excluded.free_endpoint=1 THEN 1 "
                     "  ELSE ai_models.free_endpoint END, "
                     "source=excluded.source, source_last_verified_at=excluded.source_last_verified_at, "
@@ -2088,6 +2090,11 @@ class Database:
                     (now, provider, stale_model),
                 )
                 deactivated += 1
+            await db.execute(
+                "UPDATE ai_provider_registry SET last_catalog_sync_at=?, updated_at=? "
+                "WHERE provider=?",
+                (now, now, provider),
+            )
             return {"synced": len(rows), "deactivated": deactivated}
 
     async def ai_models_get_by_id(self, row_id: int) -> dict[str, Any] | None:
@@ -2147,6 +2154,59 @@ class Database:
                 (float(score), utc_now(), utc_now(), provider, model),
             )
 
+    # -- provider registry ---------------------------------------------------
+
+    async def ai_provider_registry_sync(self, rows: list[dict[str, Any]]) -> int:
+        """Upsert reviewed, secret-free provider metadata from the code registry.
+
+        Last-sync timestamps are deliberately excluded from conflict updates;
+        catalog/quota writers update those only after a successful observation.
+        """
+        columns = (
+            "provider", "display_name", "classification", "protocol", "base_url",
+            "auth_style", "docs_url", "pricing_url", "data_use_policy",
+            "commercial_use_allowed", "free_tier_policy", "supported_services_json",
+            "generation_allowed_in_free_only", "quota_can_become_paid",
+            "exposes_quota_headers", "model_discovery", "requires_explicit_enable",
+            "requires_account_verification", "metering_unit", "included_units_per_day",
+            "region_restriction", "experimental_only", "aliases_json", "last_reviewed",
+        )
+        if not rows:
+            return 0
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            for row in rows:
+                values = [row.get(column) for column in columns]
+                await db.execute(
+                    "INSERT INTO ai_provider_registry ("
+                    + ", ".join(columns)
+                    + ", updated_at) VALUES ("
+                    + ", ".join("?" for _ in range(len(columns) + 1))
+                    + ") ON CONFLICT(provider) DO UPDATE SET "
+                    + ", ".join(
+                        f"{column}=excluded.{column}"
+                        for column in columns if column != "provider"
+                    )
+                    + ", updated_at=excluded.updated_at",
+                    (*values, now),
+                )
+        return len(rows)
+
+    async def ai_provider_registry_get(self, provider: str) -> dict[str, Any] | None:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM ai_provider_registry WHERE provider=?", (provider,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def ai_provider_registry_list(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM ai_provider_registry ORDER BY display_name, provider"
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
     # -- provider settings ---------------------------------------------------
 
     async def ai_provider_settings_get(self, provider: str) -> dict[str, Any] | None:
@@ -2182,6 +2242,16 @@ class Database:
             "region",
             "deployment_scope",
             "quota_expires_at",
+            # migration 011: Alibaba's provider service scope (distinct from Gamas production).
+            "service_deployment_scope",
+            # migration 010: nullable profile overrides (NULL = inherit defaults).
+            "chunk_token_budget",
+            "chunk_char_cap",
+            "max_output_tokens",
+            "compile_token_budget",
+            "max_concurrency",
+            "max_retries",
+            "timeout_seconds",
         }
         columns = [name for name in fields if name in allowed]
         if not columns:
@@ -2236,7 +2306,18 @@ class Database:
                 await self._insert_audit(
                     db, int(admin_id), "ai_route_updated", "ai_provider_routes",
                     f"{service}/{task_type}",
-                    {"order": [str(e["provider"]) for e in providers]},
+                    {
+                        "order": [str(e["provider"]) for e in providers],
+                        "routes": [
+                            {
+                                "provider": str(entry["provider"]),
+                                "enabled": bool(entry.get("enabled", 1)),
+                                "free_only": bool(entry.get("free_only", 1)),
+                                "model": str(entry.get("model") or "")[:160],
+                            }
+                            for entry in providers
+                        ],
+                    },
                 )
 
     async def ai_route_enabled(self, service: str, task_type: str, provider: str) -> bool | None:
@@ -2514,6 +2595,12 @@ class Database:
                 "remaining=excluded.remaining, reset_at=excluded.reset_at, "
                 "observed_at=excluded.observed_at, source=excluded.source",
                 (provider, credential_id, model or "", window, remaining, reset_at, utc_now(), source),
+            )
+            observed_at = utc_now()
+            await db.execute(
+                "UPDATE ai_provider_registry SET last_quota_sync_at=?, updated_at=? "
+                "WHERE provider=?",
+                (observed_at, observed_at, provider),
             )
 
     async def ai_usage_daily_delete_provider_day(

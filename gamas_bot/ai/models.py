@@ -158,6 +158,36 @@ def _seed(slug: str, model_id: str, caps: ModelCapabilities, **kwargs) -> ModelI
 
 STATIC_SEEDS: dict[str, list[ModelInfo]] = {
     "gemini": [
+        # Current stable Gemini model (verified 2026-10-09): the official
+        # model card lists GenerateContent support, structured outputs, a
+        # 1,048,576-token input window and 65,536 output-token limit. Free-tier
+        # price still requires the key's separate no-overage attestation.
+        _seed(
+            "gemini", "gemini-3.8-flash",
+            ModelCapabilities(
+                supports_json_object=True, supports_json_schema=True,
+                supports_strict_json_schema=True, supports_reasoning=True,
+                supports_reasoning_effort=True, supports_tools=True,
+                supports_image=True, supports_audio=True, supports_pdf=True,
+                supports_temperature=False, supports_system_message=True,
+            ),
+            display_name="Gemini 3.8 Flash",
+            context_window=1_048_576, max_output_tokens=65_536,
+            free_status=FREE_PLAN,
+        ),
+        _seed(
+            "gemini", "gemini-3.5-flash-lite",
+            ModelCapabilities(
+                supports_json_object=True, supports_json_schema=True,
+                supports_strict_json_schema=True, supports_reasoning=True,
+                supports_reasoning_effort=True, supports_tools=True,
+                supports_image=True, supports_audio=True, supports_pdf=True,
+                supports_temperature=False, supports_system_message=True,
+            ),
+            display_name="Gemini 3.5 Flash-Lite",
+            context_window=1_048_576, max_output_tokens=65_536,
+            free_status=FREE_PLAN,
+        ),
         _seed(
             "gemini", "gemini-2.5-flash",
             ModelCapabilities(
@@ -196,6 +226,37 @@ STATIC_SEEDS: dict[str, list[ModelInfo]] = {
         ),
     ],
     "nara": [],  # catalog is account-plan specific; always discovered live
+    "sambanova": [
+        # Official 2026-10-09 rate-limit docs list these exact production
+        # model IDs on both the Free and Developer tiers. Free-tier capacity is
+        # 20 RPM / 20 RPD / 200K TPD per model; preview models are deliberately
+        # not seeded as production-eligible.
+        _seed(
+            "sambanova", "DeepSeek-V3.1",
+            ModelCapabilities(
+                supports_json_object=True, supports_json_schema=True,
+                supports_system_message=True,
+            ),
+            display_name="DeepSeek V3.1",
+            free_status=FREE_PLAN,
+        ),
+        _seed(
+            "sambanova", "Meta-Llama-3.3-70B-Instruct",
+            ModelCapabilities(
+                supports_json_object=True, supports_system_message=True,
+            ),
+            display_name="Llama 3.3 70B Instruct",
+            free_status=FREE_PLAN,
+        ),
+        _seed(
+            "sambanova", "gpt-oss-120b",
+            ModelCapabilities(
+                supports_json_object=True, supports_system_message=True,
+            ),
+            display_name="GPT OSS 120B",
+            free_status=FREE_PLAN,
+        ),
+    ],
     "groq": [
         _seed(
             "groq", "openai/gpt-oss-120b",
@@ -259,14 +320,6 @@ STATIC_SEEDS: dict[str, list[ModelInfo]] = {
             free_status=FREE_UNKNOWN,
         ),
     ],
-    "sambanova": [
-        _seed(
-            "sambanova", "Meta-Llama-3.3-70B-Instruct",
-            ModelCapabilities(),
-            display_name="Llama 3.3 70B Instruct",
-            free_status=FREE_PLAN,
-        ),
-    ],
     "zai": [
         # The official pricing table lists both model IDs as Free (verified
         # 2026-10-09); retain them as reviewed FREE_PLAN entries, not a claim
@@ -286,15 +339,9 @@ STATIC_SEEDS: dict[str, list[ModelInfo]] = {
         ),
     ],
     "nvidia": [],  # catalog + "Free Endpoint" availability are live facts
-    "cloudflare": [
-        _seed(
-            "cloudflare", "@cf/meta/llama-3.1-8b-instruct",
-            ModelCapabilities(),
-            display_name="Llama 3.1 8B Instruct",
-            # Model Search does not provide a documented per-model free status.
-            free_status=FREE_UNKNOWN,
-        ),
-    ],
+    # Workers AI is account-scoped; never select a stale static model. Require
+    # the current account's Model Search snapshot before routing.
+    "cloudflare": [],
     "huggingface": [],
     "alibaba": [
         _seed(

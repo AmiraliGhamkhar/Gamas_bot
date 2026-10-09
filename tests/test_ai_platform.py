@@ -394,6 +394,8 @@ class CatalogSyncSafetyTests(PlatformCase):
         models = await self.db.ai_models_list("cloudflare", include_unavailable=True)
         by_id = {item["model"]: item for item in models}
         self.assertFalse(by_id["old-model"]["available"])
+        # Account-catalog presence proves access, not free pricing. Unknown
+        # models require the separate account no-overage attestation.
         self.assertEqual(by_id["model-a"]["free_status"], "unknown")
         events = await self.db.ai_events_list(event="provider_sync")
         self.assertNotIn("cf-token-0001", repr(events))
@@ -488,7 +490,9 @@ class FailoverRotationTests(PlatformCase):
     async def _paid_compatible_mode(self):
         # Groq is deliberately not classified free. These tests exercise
         # request failover under an explicitly relaxed test deployment.
-        self.settings = replace(self.settings, ai_free_only=False)
+        self.settings = replace(
+            self.settings, ai_free_only=False, ai_allow_paid_fallback=True
+        )
         self.manager.settings = self.settings
         self.models.settings = self.settings
         self.router = ProviderRouter(
@@ -499,7 +503,7 @@ class FailoverRotationTests(PlatformCase):
         await self.db.ai_routes_replace(
             "notes", "chunk_structuring",
             [
-                {"provider": p, "enabled": 1, "free_only": 0 if p == "groq" else 1}
+                {"provider": p, "enabled": 1, "free_only": 0}
                 for p in providers
             ],
             admin_id=None,
@@ -513,18 +517,18 @@ class FailoverRotationTests(PlatformCase):
         await self.manager.set_billing_attestation(credential_id, "paid", 1)
         return credential_id
 
-    async def _add_free_gemini(self, label="gemini", secret="AIza-free-test-1234"):
+    async def _add_paid_gemini(self, label="gemini", secret="AIza-test-paid-1234"):
         credential_id = await self.manager.add_credential(
             service="notes", provider="gemini", label=label,
             secret=secret, admin_id=1,
         )
-        await self.manager.set_billing_attestation(credential_id, "free", 1)
+        await self.manager.set_billing_attestation(credential_id, "paid", 1)
         return credential_id
 
     async def test_provider_level_failover_after_429_with_no_credentials(self):
         await self._paid_compatible_mode()
         await self._route(["groq", "gemini"])
-        await self._add_free_gemini()
+        await self._add_paid_gemini()
         session = _ScriptedSession()
         job = await self._session_plan()
         # Groq has no credential; the attested Gemini leg succeeds.
@@ -541,7 +545,7 @@ class FailoverRotationTests(PlatformCase):
     async def test_quota_failover_groq_429_then_gemini(self):
         await self._paid_compatible_mode()
         groq_id = await self._add_paid_groq(secret="gsk-test-key-0001")
-        await self._add_free_gemini()
+        await self._add_paid_gemini()
         await self._route(["groq", "gemini"])
         session = _ScriptedSession()
         session.add(
@@ -586,7 +590,7 @@ class FailoverRotationTests(PlatformCase):
         await self._paid_compatible_mode()
         await self._add_paid_groq(secret="gsk-key-3333")
         await self._route(["groq", "gemini"])
-        await self._add_free_gemini()
+        await self._add_paid_gemini()
         session = _ScriptedSession()
         session.add(
             "api.groq.com",

@@ -345,18 +345,27 @@ async def validate_groq_token_budget(root: Path) -> None:
         check("groq-eligible-after-attestation", groq_leg is not None)
         if groq_leg is None:
             return
+        from gamas_bot.ai.profiles import profile_for
+
         groq_session = NoteJobSession(
             h.router,
-            replace(plan, legs=[groq_leg], profile=__import__(
-                "gamas_bot.ai.profiles", fromlist=["profile_for"]
-            ).profile_for("groq")),
+            replace(plan, legs=[groq_leg], profile=profile_for("groq")),
             settings,
             job_id="GMS-900002",
         )
         with job_session_scope(groq_session):
             groq_chars = note_chunk_chars(settings)
-        legacy_session = NoteJobSession(h.router, plan, settings, job_id="GMS-900003")
-        with job_session_scope(legacy_session):
+        nara_leg = next((leg for leg in plan.legs if leg.canonical == "nara"), None)
+        if nara_leg is None:
+            check("nara-budget-baseline-present", False, "Nara route leg missing")
+            return
+        nara_session = NoteJobSession(
+            h.router,
+            replace(plan, legs=[nara_leg], profile=profile_for("nara")),
+            settings,
+            job_id="GMS-900003",
+        )
+        with job_session_scope(nara_session):
             nara_chars = note_chunk_chars(settings)
         check(
             "groq-chunks-are-smaller",
@@ -371,10 +380,17 @@ async def validate_provider_failover(root: Path) -> None:
     async with Harness(root, settings) as h:
         await _attest_key(h, "groq", "sk-groq-validate-0001", "qwen/qwen3.8-27b", label="groq-free")
         await _attest_key(h, "nara", "sk-nara-1234", "agnes-3-flash")
-        # What a real catalog sync does: mark the account's Nara model free.
+        # What a successful account catalog sync does: make the exact
+        # configured model IDs available. Nara's public-plan intersection
+        # supplies FREE_PLAN; Groq's account-scoped entitlement attestation
+        # handles its otherwise-unknown account pricing status.
         await h.models.apply_discovery(
             "nara",
             [ModelInfo(provider="nara", model_id="agnes-3-flash", free_status=FREE_PLAN, source=_LIVE)],
+        )
+        await h.models.apply_discovery(
+            "groq",
+            [ModelInfo(provider="groq", model_id="qwen/qwen3.8-27b", source=_LIVE)],
         )
         await h.db.ai_provider_settings_upsert(
             "groq",

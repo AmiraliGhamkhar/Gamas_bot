@@ -27,6 +27,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -67,10 +68,12 @@ from .models import (
 )
 from .profiles import NoteProviderProfile, profile_for
 from .registry import (
+    PROVIDER_REGISTRY,
     ProviderClass,
     classification_of,
     free_only_generation_allowed,
     registry_info,
+    region_service_scope_free_allowed,
     resolve_canonical,
 )
 from .usage import AIUsageTracker, sanitize_text
@@ -118,6 +121,11 @@ class RouteLeg:
     #: free status is undocumented rather than paid — and never relaxes the
     #: per-key billing attestation, terms, deprecation or quota gates.
     account_verified: bool = False
+    #: Provider/account promotional allocation expiry (e.g. Alibaba regional
+    #: quota); never substitutes for an explicit model-level expiry.
+    account_quota_expires_at: str | None = None
+    account_region: str | None = None
+    account_service_scope: str | None = None
     free_only: bool = True
     index: int = 0
 
@@ -186,6 +194,49 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc).replace(microsecond=0)
 
 
+class _ProviderConcurrencyLimiter:
+    """Resizable, provider-scoped concurrent request limiter."""
+
+    def __init__(self) -> None:
+        self._condition = asyncio.Condition()
+        self._active = 0
+        self._limit = 1
+
+    def slot(self, limit: int):
+        # Use a native async context-manager object rather than
+        # @asynccontextmanager: NoteFailure is an immutable dataclass exception,
+        # and contextlib's generator wrapper tries to re-assign its traceback
+        # while propagating it (which masks the provider failure on Python 3.11).
+        return _ProviderConcurrencySlot(self, limit)
+
+
+class _ProviderConcurrencySlot:
+    def __init__(self, limiter: _ProviderConcurrencyLimiter, limit: int) -> None:
+        self._limiter = limiter
+        self._limit = max(1, min(32, int(limit)))
+        self._entered = False
+
+    async def __aenter__(self):
+        async with self._limiter._condition:
+            self._limiter._limit = self._limit
+            await self._limiter._condition.wait_for(
+                lambda: self._limiter._active < self._limiter._limit
+            )
+            self._limiter._active += 1
+            self._entered = True
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        if self._entered:
+            async with self._limiter._condition:
+                self._limiter._active = max(0, self._limiter._active - 1)
+                self._entered = False
+                self._limiter._condition.notify_all()
+        # Returning False preserves the original provider exception and does
+        # not mutate it (important for frozen dataclass-based NoteFailure).
+        return False
+
+
 class ProviderRouter:
     """Resolves routes, filters FREE_ONLY, executes with failover."""
 
@@ -208,6 +259,42 @@ class ProviderRouter:
         self._budget_lock = asyncio.Lock()
         self._budget_reservations: dict[int, tuple[str, datetime, int]] = {}
         self._budget_reservation_id = 0
+        self._provider_limiters: dict[str, _ProviderConcurrencyLimiter] = {}
+
+    @staticmethod
+    def _profile_with_settings(profile: NoteProviderProfile, stored: dict) -> NoteProviderProfile:
+        """Apply validated deployment overrides to a reviewed profile."""
+        bounds = {
+            "chunk_token_budget": (256, 1_000_000),
+            "chunk_char_cap": (1_000, 2_000_000),
+            "max_output_tokens": (256, 131_072),
+            "compile_token_budget": (512, 1_000_000),
+            "max_concurrency": (1, 32),
+            "max_retries": (0, 10),
+            "timeout_seconds": (10, 600),
+        }
+        changes: dict[str, int] = {}
+        policy_changes: dict[str, int] = {}
+        for name, (minimum, maximum) in bounds.items():
+            raw = stored.get(name)
+            if raw is None:
+                continue
+            try:
+                value = int(raw)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not minimum <= value <= maximum:
+                continue
+            if name in {"max_retries", "timeout_seconds"}:
+                policy_changes[name] = value
+            else:
+                changes[name] = value
+        if policy_changes:
+            changes["policy"] = replace(profile.policy, **policy_changes)
+        return replace(profile, **changes) if changes else profile
+
+    def _provider_limiter(self, canonical: str) -> _ProviderConcurrencyLimiter:
+        return self._provider_limiters.setdefault(canonical, _ProviderConcurrencyLimiter())
 
     # -- configuration ------------------------------------------------------
 
@@ -223,7 +310,10 @@ class ProviderRouter:
         self._provider_settings_cache = None
 
     async def ensure_seeded(self) -> None:
-        """Seed route rows once. Never overwrites an admin-configured route."""
+        """Persist reviewed metadata and seed routes without overwriting admins."""
+        await self.db.ai_provider_registry_sync(
+            [info.as_registry_row() for info in PROVIDER_REGISTRY.values()]
+        )
         for task in ROUTE_TASKS:
             existing = await self._safe_routes("notes", task)
             if existing is not None and existing:
@@ -317,7 +407,6 @@ class ProviderRouter:
         """Eligible legs after FREE_ONLY/quota/admin filtering."""
         settings = await self.provider_settings()
         legs = await self.route(task)
-        free_only_mode = bool(getattr(self.settings, "ai_free_only", True))
         allow_paid = bool(getattr(self.settings, "ai_allow_paid_fallback", False))
         skipped: list[tuple[str, str]] = []
         eligible: list[RouteLeg] = []
@@ -336,68 +425,116 @@ class ProviderRouter:
             if info.requires_explicit_enable and not stored.get("experimental_unlocked"):
                 skipped.append((leg.canonical, "region_restricted_locked"))
                 continue
+            if info.classification is ProviderClass.REGION_RESTRICTED:
+                if (
+                    not stored.get("region")
+                    or not stored.get("deployment_scope")
+                    or not stored.get("service_deployment_scope")
+                ):
+                    skipped.append((leg.canonical, "region_metadata_unverified"))
+                    continue
+                if (
+                    leg.free_only
+                    and not region_service_scope_free_allowed(
+                        leg.canonical, stored.get("region"), stored.get("service_deployment_scope")
+                    )
+                ):
+                    skipped.append((leg.canonical, "region_scope_ineligible"))
+                    continue
+                if leg.free_only and not self._future_timestamp(stored.get("quota_expires_at")):
+                    skipped.append((leg.canonical, "free_quota_expiry_unverified"))
+                    continue
+                # Region is part of the API key/endpoint contract, even on an
+                # explicitly paid leg. The quota expiry is used only by the
+                # free-eligibility gate below.
+                leg = replace(
+                    leg,
+                    account_quota_expires_at=(
+                        str(stored.get("quota_expires_at"))
+                        if stored.get("quota_expires_at") else None
+                    ),
+                    account_region=str(stored.get("region")),
+                    account_service_scope=str(stored.get("service_deployment_scope")),
+                )
             if stored.get("enabled") == 0:
                 skipped.append((leg.canonical, "disabled"))
                 continue
             if info.classification in {ProviderClass.UNAVAILABLE}:
                 skipped.append((leg.canonical, "unavailable"))
                 continue
-            if free_only_mode and leg.free_only:
+            if leg.free_only:
+                # A route explicitly marked free remains subject to all free
+                # entitlement/model/key gates even when AI_FREE_ONLY is turned
+                # off for the deployment.
                 trial = info.classification is ProviderClass.TRIAL_ONLY
                 paid = info.classification is ProviderClass.PAID_ONLY
                 blocked_flag = bool(stored.get("free_only_blocked"))
                 if trial or paid or blocked_flag:
                     skipped.append((leg.canonical, "billing_blocked"))
                     continue
-                if not free_only_generation_allowed(
-                    leg.canonical, admin_enabled=bool(stored.get("experimental_unlocked"))
-                ):
-                    # A provider whose free entitlement is a property of the
-                    # account (not of its documentation) is reachable only after
-                    # an administrator attests this deployment's account. The
-                    # attestation is per provider and revocable, and it never
-                    # relaxes the per-key billing attestation or the model gate.
-                    if info.requires_account_verification and self._account_entitlement_attested(
-                        stored
-                    ):
-                        leg = replace(leg, account_verified=True)
-                    else:
-                        skipped.append(
-                            (
-                                leg.canonical,
-                                "account_entitlement_unverified"
-                                if info.requires_account_verification
-                                else "not_free_eligible",
-                            )
-                        )
+                if info.requires_account_verification:
+                    # The account's plan/overage state is not exposed by a
+                    # documented read-only endpoint for these providers. Keep
+                    # this explicit, audited, deployment-scoped and revocable;
+                    # it never replaces the per-key billing attestation.
+                    if not self._account_entitlement_attested(stored):
+                        skipped.append((leg.canonical, "account_entitlement_unverified"))
                         continue
+                    leg = replace(
+                        leg,
+                        account_verified=True,
+                        account_quota_expires_at=(
+                            str(stored.get("quota_expires_at"))
+                            if stored.get("quota_expires_at") else None
+                        ),
+                        account_region=(str(stored.get("region")) if stored.get("region") else None),
+                        account_service_scope=(
+                            str(stored.get("service_deployment_scope"))
+                            if stored.get("service_deployment_scope") else None
+                        ),
+                    )
+                if not free_only_generation_allowed(
+                    leg.canonical,
+                    admin_enabled=bool(stored.get("experimental_unlocked")) or leg.account_verified,
+                ):
+                    skipped.append((leg.canonical, "not_free_eligible"))
+                    continue
                 if await self._daily_quota_exhausted(leg.canonical):
                     skipped.append((leg.canonical, "quota_exhausted"))
                     continue
-            elif free_only_mode and not leg.free_only and not allow_paid:
+            elif not allow_paid:
                 skipped.append((leg.canonical, "paid_fallback_disabled"))
                 continue
             eligible.append(leg)
-        # Paid-fallback legs are strictly a last resort: every free leg is
-        # tried before any paid one (stable partition keeps route order
-        # inside each class). This is an invariant over the whole plan, so
-        # administrators cannot accidentally promote paid traffic above
-        # free providers by reordering routes.
-        if free_only_mode:
-            eligible = [lg for lg in eligible if lg.free_only] + [
-                lg for lg in eligible if not lg.free_only
-            ]
-        profile = (
-            profile_for(eligible[0].canonical)
-            if eligible
-            else profile_for(legs[0].canonical if legs else "openai_compatible")
-        )
+        # Paid legs are strictly a last resort whenever they are permitted:
+        # every free leg is tried first (stable partition preserves order
+        # inside each class), even if AI_FREE_ONLY is disabled.
+        eligible = [lg for lg in eligible if lg.free_only] + [
+            lg for lg in eligible if not lg.free_only
+        ]
         primary_slug = (
             eligible[0].canonical
             if eligible
             else (legs[0].canonical if legs else "openai_compatible")
         )
         primary_settings = settings.get(primary_slug) or {}
+        profile = self._profile_with_settings(profile_for(primary_slug), primary_settings)
+        if eligible:
+            # Chunking is performed once before provider failover. Use the
+            # narrowest configured budget among route legs so a fallback with
+            # a smaller free-tier window cannot inherit oversized chunks.
+            route_profiles = [
+                self._profile_with_settings(
+                    profile_for(item.canonical), settings.get(item.canonical) or {}
+                )
+                for item in eligible
+            ]
+            profile = replace(
+                profile,
+                chunk_token_budget=min(item.chunk_token_budget for item in route_profiles),
+                chunk_char_cap=min(item.chunk_char_cap for item in route_profiles),
+                compile_token_budget=min(item.compile_token_budget for item in route_profiles),
+            )
         pass_overrides = {
             key: (
                 None
@@ -412,6 +549,43 @@ class ProviderRouter:
             skipped=skipped,
             pass_overrides=pass_overrides,
         )
+
+    @staticmethod
+    def _future_timestamp(value: object) -> bool:
+        """True only for a valid, timezone-aware future quota expiry."""
+        if not value:
+            return False
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                return False
+            return parsed.astimezone(timezone.utc) > _utc_now()
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    @staticmethod
+    def _alibaba_endpoint_matches_region(
+        region: str | None, service_scope: str | None, base_url: str | None
+    ) -> bool:
+        """Reject a free Alibaba request sent to a different region endpoint."""
+        if not region_service_scope_free_allowed("alibaba", region, service_scope):
+            return False
+        parsed = urlparse(str(base_url or ""))
+        if parsed.scheme.lower() != "https" or not parsed.hostname:
+            return False
+        host = parsed.hostname.casefold().rstrip(".")
+        normalized_region = str(region or "").strip().casefold()
+        if normalized_region == "cn-beijing":
+            return (
+                host == "dashscope.aliyuncs.com"
+                or host.endswith(".cn-beijing.maas.aliyuncs.com")
+            )
+        if normalized_region == "ap-southeast-1":
+            return (
+                host == "dashscope-intl.aliyuncs.com"
+                or host.endswith(".ap-southeast-1.maas.aliyuncs.com")
+            )
+        return False
 
     @staticmethod
     def _account_entitlement_attested(stored: dict) -> bool:
@@ -605,7 +779,7 @@ class ProviderRouter:
         except Exception:
             catalog = []
         for candidate in catalog:
-            if candidate.deprecated or not candidate.available:
+            if candidate.deprecated or not candidate.available or not candidate.capabilities.supports_text:
                 continue
             if leg.free_only and not self._model_free_ok(leg, candidate):
                 continue
@@ -644,7 +818,8 @@ class ProviderRouter:
         failure_log: list[NoteFailure],
     ) -> NoteResponse:
         """Run one leg over its credential pool; raise on leg failure."""
-        profile = profile_for(leg.canonical)
+        stored_settings = (await self.provider_settings()).get(leg.canonical) or {}
+        profile = self._profile_with_settings(profile_for(leg.canonical), stored_settings)
         adapter = adapter_for(leg.canonical, self.settings)
         base_url = self._base_url_for(leg)
         if task == TASK_HEALTH:
@@ -681,7 +856,16 @@ class ProviderRouter:
                 failure_log.append(last_failure)
                 continue
             model_info = await self.models.resolve(leg.canonical, model)
+            request_base_url = credential.base_url or base_url
             blocked = self._model_blocked(leg, model_info)
+            if (
+                blocked is None
+                and leg.canonical == "alibaba"
+                and not self._alibaba_endpoint_matches_region(
+                    leg.account_region, leg.account_service_scope, request_base_url
+                )
+            ):
+                blocked = "Alibaba endpoint does not match the attested free-quota region"
             if blocked:
                 await self.tracker.event(
                     "provider_model_unavailable",
@@ -710,7 +894,7 @@ class ProviderRouter:
                 request_type=task,
                 provider=leg.provider,
                 canonical=leg.canonical,
-                base_url=credential.base_url or base_url,
+                base_url=request_base_url,
                 model=model,
                 system_prompt=system_prompt,
                 user_text=user_text,
@@ -727,7 +911,7 @@ class ProviderRouter:
                 route_position=position,
             )
             try:
-                response = await self._execute_with_retries(
+                response = await self._execute_with_provider_limit(
                     adapter=adapter, ctx=ctx, credential=credential,
                     profile=profile, session=session, position=position,
                 )
@@ -738,7 +922,7 @@ class ProviderRouter:
                 ctx = replace(ctx, json_strategy=STRATEGY_PROMPT
                               if adapter.protocol != "gemini_native" else "gemini_mime")
                 try:
-                    response = await self._execute_with_retries(
+                    response = await self._execute_with_provider_limit(
                         adapter=adapter, ctx=ctx, credential=credential,
                         profile=profile, session=session, position=position,
                     )
@@ -904,7 +1088,24 @@ class ProviderRouter:
         """
         if info.free_now():
             return True
-        return bool(leg.account_verified) and info.free_status == FREE_UNKNOWN
+        if not leg.account_verified:
+            return False
+        if info.free_status == FREE_UNKNOWN:
+            return True
+        # Alibaba's documented free quota can be promotional and regional.
+        # An admin must record the exact future quota expiry as well as the
+        # region/deployment and account attestation before this path can apply.
+        if info.free_status == FREE_PROMOTIONAL and not info.free_until:
+            try:
+                expiry = datetime.fromisoformat(
+                    str(leg.account_quota_expires_at or "").replace("Z", "+00:00")
+                )
+                if expiry.tzinfo is None:
+                    return False
+                return expiry.astimezone(timezone.utc) > _utc_now()
+            except (TypeError, ValueError, OverflowError):
+                return False
+        return False
 
     def _model_blocked(self, leg: RouteLeg, info: ModelInfo) -> str | None:
         # Route-level free legs must remain genuinely free even when the
@@ -912,10 +1113,18 @@ class ProviderRouter:
         free_only = leg.free_only
         if info.deprecated or not info.available:
             return "model unavailable/deprecated"
+        if not info.capabilities.supports_text:
+            return "model does not support text generation"
         if info.capabilities.requires_paid_billing and free_only:
             return "model requires paid billing (FREE_ONLY)"
         if not info.commercial_use_allowed:
             return "model terms disallow this use"
+        if (
+            free_only
+            and registry_info(leg.canonical).requires_account_verification
+            and not str(info.source or "").startswith("live:")
+        ):
+            return "model availability requires a live catalog sync"
         if free_only and not self._model_free_ok(leg, info):
             if info.free_status == FREE_PROMOTIONAL:
                 return "promotional free period expired or unverified"
@@ -942,6 +1151,13 @@ class ProviderRouter:
         if resolve_canonical(env_provider, self.settings.note_api_base_url) == canonical:
             if self.settings.note_api_base_url:
                 return self.settings.note_api_base_url
+        if canonical == "alibaba":
+            stored = (self._provider_settings_cache or {}).get("alibaba") or {}
+            if str(stored.get("region") or "").strip().casefold() == "ap-southeast-1":
+                # The documented DashScope regional domain accepts Singapore
+                # API keys; workspace-specific Singapore endpoints are also
+                # accepted and can be set on an individual credential.
+                return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
         base_url = registry_info(canonical).base_url or ""
         if not base_url:
             try:
@@ -1054,6 +1270,27 @@ class ProviderRouter:
             return
         async with self._budget_lock:
             self._budget_reservations.pop(reservation_id, None)
+
+    async def _execute_with_provider_limit(
+        self,
+        *,
+        adapter: NoteAdapter,
+        ctx: RequestContext,
+        credential: ProviderCredential,
+        profile: NoteProviderProfile,
+        session,
+        position: int,
+    ) -> NoteResponse:
+        limiter = self._provider_limiter(ctx.canonical)
+        async with limiter.slot(profile.max_concurrency):
+            return await self._execute_with_retries(
+                adapter=adapter,
+                ctx=ctx,
+                credential=credential,
+                profile=profile,
+                session=session,
+                position=position,
+            )
 
     async def _execute_with_retries(
         self,

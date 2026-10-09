@@ -150,6 +150,99 @@ class AIPanelCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[-1]["provider"], "mistral")
         self.assertEqual(rows[-1]["free_only"], 1)
 
+    async def test_task_specific_routes_and_model_selection(self):
+        self._mock_bot_rendering()
+        await self.db.ai_routes_replace(
+            "notes", "outline",
+            [
+                {"provider": "sambanova", "enabled": 1, "free_only": 1},
+                {"provider": "gemini", "enabled": 1, "free_only": 1},
+            ],
+            admin_id=7,
+        )
+        await self._callback("admin:ai:rt:outline")
+        self.assertIn("طرح کلی", self.last_text)
+        await self._callback("admin:ai:rmodel:outline:0")
+        self.assertIn("DeepSeek-V3.1", self.last_text)
+        await self._callback("admin:ai:rsetmodel:outline:0:0")
+        outline = await self.db.ai_routes_list("notes", "outline")
+        chunk = await self.db.ai_routes_list("notes", "chunk_structuring")
+        self.assertEqual(outline[0]["model"], "DeepSeek-V3.1")
+        self.assertNotEqual([row["provider"] for row in outline], [row["provider"] for row in chunk])
+
+    async def test_profile_override_changes_effective_policy(self):
+        self._mock_bot_rendering()
+        await self._callback("admin:ai:ppol:groq:max_concurrency:up")
+        await self._callback("admin:ai:ppol:groq:chunk_char_cap:up")
+        stored = await self.db.ai_provider_settings_get("groq")
+        self.assertEqual(stored["max_concurrency"], 2)
+        self.assertEqual(stored["chunk_char_cap"], 10000)
+        effective = self.bot.provider_router._profile_with_settings(
+            __import__("gamas_bot.ai.profiles", fromlist=["profile_for"]).profile_for("groq"),
+            stored,
+        )
+        self.assertEqual(effective.max_concurrency, 2)
+        audit = await self.db.audit_entries(limit=10)
+        self.assertTrue(any(row["action"] == "ai_provider_profile_override" for row in audit))
+
+    async def test_key_wizard_report_prompts_billing_attestation(self):
+        from types import SimpleNamespace
+
+        self._mock_bot_rendering()
+        key_id = await self.bot.credential_manager.add_credential(
+            service="notes", provider="groq", label="g1", secret="gsk-report-secret-4321",
+            admin_id=7, model="openai/gpt-oss-120b", enabled=False,
+        )
+        self.bot.provider_health.test_credential = AsyncMock(
+            return_value=SimpleNamespace(
+                http_status=200, latency_ms=12, status_fa="OK", check_type="models",
+                detail="", masked="••••4321",
+            )
+        )
+        event = _message_event(7, "")
+        await self.bot.ai_panels.wizard_finish_report(
+            event, credential_id=key_id, slug="groq", label="g1",
+            model="openai/gpt-oss-120b",
+        )
+        event.respond.assert_awaited()
+        report = event.respond.call_args.args[0]
+        self.assertIn("صورتحساب", report)
+        self.assertIn("attestation", report.lower())
+        self.assertNotIn("gsk-report-secret-4321", report)
+        buttons = event.respond.call_args.kwargs["buttons"]
+        callback_data = [button.type.data.decode("ascii") for row in buttons for button in row]
+        self.assertIn(f"admin:ai:kstate:attest_free:{key_id}", callback_data)
+        self.assertNotIn(f"admin:ai:kact:{key_id}", callback_data)
+
+    async def test_region_metadata_requires_production_future_expiry(self):
+        from datetime import datetime, timedelta, timezone
+
+        action = "aiprovider_meta:alibaba"
+        good_expiry = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        event = _message_event(7, "")
+        await self.bot._handle_pending_admin_input(
+            event, 7, action,
+            f"cn-beijing | china_mainland | production | {good_expiry}"
+        )
+        row = await self.db.ai_provider_settings_get("alibaba")
+        self.assertEqual(row["region"], "cn-beijing")
+        self.assertEqual(row["deployment_scope"], "production")
+        self.assertEqual(row["service_deployment_scope"], "china_mainland")
+        self.assertTrue(row["quota_expires_at"])
+        self.assertIn("Free Quota Only", event.reply.call_args.args[0])
+
+    async def test_region_metadata_rejects_unreviewed_free_region_scope(self):
+        from datetime import datetime, timedelta, timezone
+
+        expiry = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+        event = _message_event(7, "")
+        await self.bot._handle_pending_admin_input(
+            event, 7, "aiprovider_meta:alibaba",
+            f"us-east-1 | international | production | {expiry}",
+        )
+        self.assertIsNone(await self.db.ai_provider_settings_get("alibaba"))
+        self.assertIn("FREE_ONLY", event.reply.call_args.args[0])
+
     async def test_key_wizard_secret_flow_saves_credential(self):
         self._mock_bot_rendering()
         await self._callback("admin:ai:kadd:groq")
@@ -233,6 +326,17 @@ class AIPanelCase(unittest.IsolatedAsyncioTestCase):
         )
         summaries = await self.bot.credential_manager.list_summaries()
         self.assertEqual(summaries[0]["label"], "برچسب ویرایش‌شده")
+
+    async def test_unknown_billing_state_cannot_enable_key(self):
+        self._mock_bot_rendering()
+        key_id = await self.bot.credential_manager.add_credential(
+            service="notes", provider="groq", label="g1", secret="gsk-disabled-4321",
+            admin_id=7, enabled=False,
+        )
+        event = await self._callback(f"admin:ai:kact:{key_id}")
+        record = await self.db.provider_credential_record(key_id)
+        self.assertEqual(record["enabled"], 0)
+        event.answer.assert_awaited()
 
     async def test_key_action_requires_explicit_billing_attestation(self):
         self._mock_bot_rendering()
