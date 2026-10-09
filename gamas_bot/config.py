@@ -374,6 +374,9 @@ class Settings:
     stt_free_only: bool = True
     stt_allow_trial_providers: bool = False
     stt_allow_paid_fallback: bool = False
+    #: Trial-class providers (one-time credit, promotional, trial) that may be
+    #: routed while STT_FREE_ONLY is on, without the global opt-in.
+    stt_trial_allowlist: tuple[str, ...] = ("speechmatics", "deepgram")
     stt_quota_safety_margin: float = 0.10
     stt_provider_sync_ttl: int = 86400
     stt_max_provider_failovers: int = 4
@@ -984,6 +987,16 @@ class Settings:
         invalid_route = [item for item in stt_route if item not in STT_PROVIDER_CHOICES]
         if invalid_route:
             raise ValueError("STT_DEFAULT_ROUTE دارای provider ناشناخته است: " + ", ".join(invalid_route))
+        trial_allowlist = tuple(
+            dict.fromkeys(
+                item.strip().lower()
+                for item in _text("STT_TRIAL_ALLOWLIST", "speechmatics,deepgram").split(",")
+                if item.strip()
+            )
+        )
+        invalid_trial = [item for item in trial_allowlist if item not in STT_PROVIDER_CHOICES]
+        if invalid_trial:
+            raise ValueError("STT_TRIAL_ALLOWLIST دارای provider ناشناخته است: " + ", ".join(invalid_trial))
         vocabulary_terms = []
         seen_vocab = set()
         for term in re.split(r"[,،؛\n]+", os.getenv("STT_VOCABULARY_HINTS", "")):
@@ -1035,6 +1048,7 @@ class Settings:
             stt_free_only=_flag("STT_FREE_ONLY", True),
             stt_allow_trial_providers=_flag("STT_ALLOW_TRIAL_PROVIDERS", False),
             stt_allow_paid_fallback=_flag("STT_ALLOW_PAID_FALLBACK", False),
+            stt_trial_allowlist=trial_allowlist,
             stt_quota_safety_margin=stt_quota_safety_margin,
             stt_provider_sync_ttl=stt_provider_sync_ttl,
             stt_max_provider_failovers=stt_max_provider_failovers,

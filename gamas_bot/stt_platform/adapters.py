@@ -32,8 +32,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
-import hmac
 import json
 import logging
 import math
@@ -44,13 +42,13 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 
 import aiohttp
 
 from .models import Transcript, TranscriptSegment, TranscriptWord, VocabularyHints
-from .quota import QuotaObservation, parse_groq_headers, parse_rate_limit_reset
-from .registry import STT_PROVIDER_REGISTRY, STTProtocol, stt_registry_info
+from .quota import QuotaObservation, parse_groq_headers
+from .registry import STT_PROVIDER_REGISTRY, STTProtocol
 
 logger = logging.getLogger(__name__)
 
@@ -995,7 +993,6 @@ class NativeSTTAdapter(STTProviderAdapter):
         if duration and info.max_audio_duration and duration > info.max_audio_duration:
             raise ProviderSTTError(STTErrorCategory.DURATION_TOO_LONG, False, 400, None, None,
                                    self.provider, model, "Audio duration exceeds the provider request limit.")
-        started = time.monotonic()
         if self.provider == "groq":
             result, headers, status, req_id = await self._groq(session, audio_path, settings, key, model, options)
         elif self.provider == "gemini_transcribe":
@@ -1091,8 +1088,11 @@ class NativeSTTAdapter(STTProviderAdapter):
     async def _gemini(self, session, audio_path, settings, key, model, options):
         mime = _mime_type(audio_path)
         size = audio_path.stat().st_size
-        upload_url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={quote(key, safe='')}"
+        upload_url = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+        # The key travels only in a header: a URL query string leaks into proxy
+        # and access logs and into exception reprs.
         start_headers = {
+            "x-goog-api-key": key,
             "X-Goog-Upload-Protocol": "resumable",
             "X-Goog-Upload-Command": "start",
             "X-Goog-Upload-Header-Content-Length": str(size),
@@ -1148,7 +1148,6 @@ class NativeSTTAdapter(STTProviderAdapter):
                             pass
                         _raise_http("gemini_transcribe", model, response.status, response.headers, body)
                     file_info = await response.json(content_type=None)
-                    upload_headers = dict(response.headers)
                     upload_req_id = _request_id(response.headers) or start_request_id
             file_obj = file_info.get("file", file_info) if isinstance(file_info, dict) else {}
             file_uri = file_obj.get("uri") if isinstance(file_obj, dict) else None
@@ -1405,7 +1404,8 @@ class NativeSTTAdapter(STTProviderAdapter):
         if key.startswith("ya29.") or key.count(".") >= 2:
             headers["Authorization"] = f"Bearer {key}"
         else:
-            url += ("&" if "?" in url else "?") + "key=" + quote(key, safe="")
+            # API keys go in a header, not the URL (Google: "x-goog-api-key").
+            headers["x-goog-api-key"] = key
         operation, response_headers, status, req_id = await self._send_json(
             session, "POST", url, headers=headers, json_body=body,
             provider="google_cloud_stt", model=model,
@@ -1418,8 +1418,6 @@ class NativeSTTAdapter(STTProviderAdapter):
                                    "Google Cloud did not return an operation name.")
         deadline = time.monotonic() + int(getattr(settings, "stt_job_timeout", 3600))
         poll_url = f"https://speech.googleapis.com/v1/operations/{quote(str(name), safe='/')}"
-        if "key=" in url:
-            poll_url += "?key=" + quote(key, safe="")
         while not operation.get("done"):
             if time.monotonic() >= deadline:
                 raise ProviderSTTError(STTErrorCategory.PROVIDER_TIMEOUT, True, None, None,

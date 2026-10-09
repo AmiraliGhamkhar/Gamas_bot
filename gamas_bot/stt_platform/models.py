@@ -339,7 +339,7 @@ STATIC_STT_MODELS: dict[str, list[STTModelInfo]] = {
               max_duration_seconds=36000, quality_score=0.82),
     ],
     "soniox": [
-        _seed("soniox", "stt-async-v3", display_name="STT async v3",
+        _seed("soniox", "stt-async-v5", display_name="STT async v5",
               persian_supported=True, free_status="paid",
               feature_support=("confidence", "word_timestamps", "diarization", "custom_context"),
               quality_score=0.84),

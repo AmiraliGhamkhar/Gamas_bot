@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from .config import Settings
 from .database import Database
+from .stt_platform.registry import STT_PROVIDER_CHOICES
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +31,38 @@ NOTE_PROVIDER_CHOICES = frozenset(
     }
 )
 
+#: Legacy STT providers keep their historical settings fields; every other
+#: registry provider is stored through the generic native mapping below.
+LEGACY_STT_CREDENTIAL_PROVIDERS = frozenset({"speechmatics", "deepgram", "openai_compatible"})
+
 PROVIDER_CHOICES = {
-    "stt": frozenset({"speechmatics", "deepgram", "openai_compatible"}),
+    "stt": STT_PROVIDER_CHOICES,
     "notes": NOTE_PROVIDER_CHOICES,
 }
+
+
+def _upsert_pair(pairs: tuple, key: str, value: str) -> tuple:
+    """Replace one ``(slug, value)`` entry in a config tuple, keeping the rest."""
+    merged = dict(pairs)
+    merged[key] = value
+    return tuple(sorted(merged.items()))
+
+
+def _apply_native_stt(settings: Settings, credential: "ProviderCredential") -> Settings:
+    updates: dict[str, object] = {
+        "stt_provider_api_keys": _upsert_pair(
+            settings.stt_provider_api_keys, credential.provider, credential.secret
+        ),
+    }
+    if credential.model:
+        updates["stt_provider_models"] = _upsert_pair(
+            settings.stt_provider_models, credential.provider, credential.model
+        )
+    if credential.base_url:
+        updates["stt_provider_base_urls"] = _upsert_pair(
+            settings.stt_provider_base_urls, credential.provider, credential.base_url.rstrip("/")
+        )
+    return replace(settings, **updates)
 
 
 class CredentialStoreError(RuntimeError):
@@ -403,6 +432,8 @@ class ProviderCredentialManager:
                     stt_openai_base_url=credential.base_url or settings.stt_openai_base_url,
                     stt_openai_model=credential.model or settings.stt_openai_model,
                 )
+            if credential.provider in STT_PROVIDER_CHOICES:
+                return _apply_native_stt(settings, credential)
         if credential.service == "notes":
             return replace(
                 settings,

@@ -2750,7 +2750,10 @@ class StudyBot:
                     reservation_active = billable_seconds is not None
                     try:
                         result = await transcribe(
-                            prepared.path, self.settings, credentials=self.credential_manager
+                            prepared.path,
+                            self.settings,
+                            credentials=self.credential_manager,
+                            submission_id=submission_id,
                         )
                     except BaseException:
                         if reservation_active and await self._release_submission_usage(
@@ -2970,7 +2973,10 @@ class StudyBot:
                 await progress.update(55, "🎙️ دارم صدا را به متن تبدیل می‌کنم")
                 try:
                     result = await transcribe(
-                        audio_path, self.settings, credentials=self.credential_manager
+                        audio_path,
+                        self.settings,
+                        credentials=self.credential_manager,
+                        submission_id=submission_id,
                     )
                 except BaseException:
                     if reservation_active and await self._release_submission_usage(
