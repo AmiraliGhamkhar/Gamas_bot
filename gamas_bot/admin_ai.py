@@ -520,7 +520,8 @@ class AIPanels:
         for item in rows:
             state = "فعال" if item["enabled"] else "غیرفعال"
             if item["quarantined_at"]:
-                state = "قرنطینه (401/403)"
+                reason = item.get("quarantine_reason") or "401/403"
+                state = f"قرنطینه ({reason})"
             elif cooldown_remaining_seconds(item.get("cooldown_until")) > 0:
                 state = "cooldown"
             last = f" | HTTP {item['last_status_code']}" if item["last_status_code"] else ""

@@ -206,8 +206,9 @@ _OPENROUTER = ProviderInfo(
     docs_url="https://openrouter.ai/docs",
     pricing_url="https://openrouter.ai/docs",
     data_use_policy=(
-        "Gateway over third-party backends; prompt data handling depends on the "
-        "upstream provider selected per model. Review model pages."
+        "Gateway over third-party backends. Gamas sends provider.data_collection="
+        "\"deny\" on every request, so only upstream backends that do not store or "
+        "train on prompts are eligible; otherwise the request fails closed."
     ),
     commercial_use_allowed=True,
     free_tier_policy=(

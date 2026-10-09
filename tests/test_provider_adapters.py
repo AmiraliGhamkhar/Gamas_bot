@@ -267,6 +267,21 @@ class OpenRouterContractTests(unittest.TestCase):
         self.assertEqual(request.json_body.get("usage"), {"include": True})
         self.assertEqual(request.headers.get("X-Title"), "Gamas Study Bot")
 
+    def test_data_collection_denied_on_every_request(self):
+        # Lecture transcripts must never reach backends that may store/train.
+        plain = self.adapter.build(make_ctx("openrouter", "vendor/x:free"), "sk-or")
+        self.assertEqual(plain.json_body["provider"], {"data_collection": "deny"})
+        self.assertNotIn("require_parameters", plain.json_body["provider"])
+
+    def test_structured_output_requires_parameter_support(self):
+        ctx = make_ctx("openrouter", "vendor/x:free", json_strategy=STRATEGY_JSON_OBJECT)
+        request = self.adapter.build(ctx, "sk-or")
+        self.assertIn("response_format", request.json_body)
+        self.assertEqual(
+            request.json_body["provider"],
+            {"data_collection": "deny", "require_parameters": True},
+        )
+
     def test_free_quota_exhaustion_classified(self):
         failure = self.adapter.map_error(
             429, b'{"error":{"message":"Rate limit exceeded: free-models-per-day","code":429}}',

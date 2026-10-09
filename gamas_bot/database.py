@@ -1633,7 +1633,7 @@ class Database:
                 return False
             await db.execute(
                 "UPDATE provider_credentials SET secret_ciphertext=?, secret_last4=?, "
-                "quarantined_at=NULL, cooldown_until=NULL, failure_streak=0, last_error=NULL, "
+                "quarantined_at=NULL, quarantine_reason=NULL, cooldown_until=NULL, failure_streak=0, last_error=NULL, "
                 "updated_by_admin_id=?, updated_at=? WHERE id=?",
                 (ciphertext, last4, admin_id, now, credential_id),
             )
@@ -1827,7 +1827,7 @@ class Database:
         async with self._lock:
             cursor = await self._db().execute(
                 "SELECT id, service, provider, label, secret_last4, base_url, model, priority, "
-                "enabled, quarantined_at, cooldown_until, last_status_code, last_success_at, "
+                "enabled, quarantined_at, quarantine_reason, cooldown_until, last_status_code, last_success_at, "
                 "last_failure_at, last_used_at, last_error, created_at, "
                 "key_type, free_only, paid_allowed, billing_state, billing_attested_at, "
                 "billing_attested_by_admin_id, expires_at, notes, failure_streak, last_quota_json "
@@ -1850,7 +1850,7 @@ class Database:
             if result == "success":
                 await db.execute(
                     "UPDATE provider_credentials SET last_status_code=?, last_success_at=?, "
-                    "last_used_at=?, last_error=NULL, cooldown_until=NULL, quarantined_at=NULL, "
+                    "last_used_at=?, last_error=NULL, cooldown_until=NULL, quarantined_at=NULL, quarantine_reason=NULL, "
                     "failure_streak=0, updated_at=? WHERE id=?",
                     (status_code, now, now, now, credential_id),
                 )
@@ -1867,9 +1867,9 @@ class Database:
             elif result == "quarantined":
                 await db.execute(
                     "UPDATE provider_credentials SET last_status_code=?, last_failure_at=?, "
-                    "last_used_at=?, last_error=?, quarantined_at=?, failure_streak=failure_streak+1, "
+                    "last_used_at=?, last_error=?, quarantined_at=?, quarantine_reason=?, failure_streak=failure_streak+1, "
                     "updated_at=? WHERE id=?",
-                    (status_code, now, now, safe_error or f"HTTP {status_code}", now, now, credential_id),
+                    (status_code, now, now, safe_error or f"HTTP {status_code}", now, f"http_{int(status_code or 0)}", now, credential_id),
                 )
             else:
                 await db.execute(
@@ -1884,7 +1884,7 @@ class Database:
         now = utc_now()
         async with self._transaction(immediate=True) as db:
             cursor = await db.execute(
-                "UPDATE provider_credentials SET enabled=?, quarantined_at=NULL, cooldown_until=NULL, "
+                "UPDATE provider_credentials SET enabled=?, quarantined_at=NULL, quarantine_reason=NULL, cooldown_until=NULL, "
                 "updated_by_admin_id=?, updated_at=? WHERE id=?",
                 (int(enabled), admin_id, now, credential_id),
             )

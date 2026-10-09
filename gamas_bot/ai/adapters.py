@@ -560,6 +560,17 @@ class OpenRouterAdapter(OpenAICompatibleAdapter):
         # OpenRouter documents app-attribution headers; they carry no data.
         request.headers.setdefault("HTTP-Referer", "https://github.com/AmiraliGhamkhar/Gamas_bot")
         request.headers.setdefault("X-Title", "Gamas Study Bot")
+        # Student transcripts must not reach upstream backends that may store or
+        # train on prompts (OpenRouter provider-selection docs, verified
+        # 2026-10-09: provider.data_collection="deny"). With no compliant
+        # backend the request fails closed and failover moves to the next leg.
+        provider_prefs: dict = {"data_collection": "deny"}
+        # Only route to backends that honour every parameter we send, so a
+        # structured-output request is never silently served without its schema.
+        if isinstance(request.json_body, dict) and "response_format" in request.json_body:
+            provider_prefs["require_parameters"] = True
+        if isinstance(request.json_body, dict):
+            request.json_body["provider"] = provider_prefs
         return request
 
     def key_info_request(self, base_url: str, secret: str) -> tuple[str, str, dict[str, str]] | None:

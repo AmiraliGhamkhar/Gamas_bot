@@ -275,6 +275,19 @@ class ProviderCredentialTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summaries[first]["last_status_code"], 401)
         self.assertIsNotNone(summaries[second]["last_success_at"])
 
+    async def test_quarantine_records_reason_and_success_clears_it(self):
+        first, second = await self._add_stt_keys()
+        await self.db.record_provider_credential_result(
+            first, status_code=401, result="quarantined", safe_error="invalid key"
+        )
+        summaries = {row["id"]: row for row in await self.manager.list_summaries()}
+        self.assertEqual(summaries[first]["quarantine_reason"], "http_401")
+        self.assertIsNotNone(summaries[first]["quarantined_at"])
+        await self.db.record_provider_credential_result(first, status_code=200, result="success")
+        summaries = {row["id"]: row for row in await self.manager.list_summaries()}
+        self.assertIsNone(summaries[first]["quarantine_reason"])
+        self.assertIsNone(summaries[first]["quarantined_at"])
+
     async def test_bad_request_does_not_rotate_credentials(self):
         first, second = await self._add_stt_keys()
         seen: list[str | None] = []
