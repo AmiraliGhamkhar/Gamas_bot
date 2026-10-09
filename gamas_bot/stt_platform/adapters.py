@@ -1404,7 +1404,8 @@ class NativeSTTAdapter(STTProviderAdapter):
         if key.startswith("ya29.") or key.count(".") >= 2:
             headers["Authorization"] = f"Bearer {key}"
         else:
-            url += ("&" if "?" in url else "?") + "key=" + quote(key, safe="")
+            # API keys go in a header, not the URL (Google: "x-goog-api-key").
+            headers["x-goog-api-key"] = key
         operation, response_headers, status, req_id = await self._send_json(
             session, "POST", url, headers=headers, json_body=body,
             provider="google_cloud_stt", model=model,
@@ -1417,8 +1418,6 @@ class NativeSTTAdapter(STTProviderAdapter):
                                    "Google Cloud did not return an operation name.")
         deadline = time.monotonic() + int(getattr(settings, "stt_job_timeout", 3600))
         poll_url = f"https://speech.googleapis.com/v1/operations/{quote(str(name), safe='/')}"
-        if "key=" in url:
-            poll_url += "?key=" + quote(key, safe="")
         while not operation.get("done"):
             if time.monotonic() >= deadline:
                 raise ProviderSTTError(STTErrorCategory.PROVIDER_TIMEOUT, True, None, None,

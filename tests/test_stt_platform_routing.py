@@ -305,6 +305,32 @@ class NativeAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(secret, url)
         self.assertEqual(headers.get("x-goog-api-key"), secret)
 
+    async def test_google_cloud_sends_key_in_header_and_never_in_url(self):
+        secret = "AIza-google-test-secret"
+        settings = make_settings(
+            stt_language="fa",
+            stt_provider_api_keys=(("google_cloud_stt", secret),),
+        )
+        calls: list[tuple[str, dict]] = []
+
+        class _Session:
+            def request(self, method, url, **kwargs):
+                calls.append((url, kwargs.get("headers") or {}))
+                raise aiohttp.ClientError("stop after capture")
+
+        with tempfile.NamedTemporaryFile(suffix=".wav") as audio:
+            audio.write(b"RIFF" + b"\x00" * 64)
+            audio.flush()
+            with self.assertRaises(ProviderSTTError):
+                await NativeSTTAdapter("google_cloud_stt").transcribe(
+                    _Session(), Path(audio.name), settings
+                )
+        self.assertTrue(calls)
+        url, headers = calls[0]
+        self.assertNotIn("key=", url)
+        self.assertNotIn(secret, url)
+        self.assertEqual(headers.get("x-goog-api-key"), secret)
+
     def test_native_credentials_are_applied_to_request_settings(self):
         credential = ProviderCredential(
             id=1,

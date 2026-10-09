@@ -71,7 +71,7 @@ is set only for those. The other providers are `unverified` or
 | Deepgram (`deepgram`) | `official_docs` | $200 one-time credit, no card, pay-as-you-go afterwards | 504 for requests over 10 min (Nova) or 20 min (Whisper). Persian is supported in batch Nova-3. |
 | Speechmatics (`speechmatics`) | `official_pricing_partial` | $100 one-time credit (pre-2026-08-01 accounts: $25), no card | Pauses at zero balance without a card. |
 | AssemblyAI (`assemblyai`) | `official_pricing_partial` | $50 one-time credit | Expiry sources disagree. Persian is not in every model's language list. |
-| Soniox (`soniox`) | `official_blog` | Free API credits discontinued for new sign-ups (2025-10-27) | `paid_only`. `.env.example` lists `stt-async-v5`; the registry lists `stt-async-v3`. Unresolved, see below. |
+| Soniox (`soniox`) | `official_blog` | Free API credits discontinued for new sign-ups (2025-10-27) | `paid_only`. Default model `stt-async-v5` (current per the Soniox changelog; `stt-async-v3` was retired 2026-02-28). |
 | Gladia, Google Cloud STT, IBM Watson, AWS Transcribe, Azure Speech, ElevenLabs Scribe | `search_snippet` | Gladia 10 h/month + €50; Google 60 min/month (V1); IBM Lite 500 min/month; AWS 60 min/month for 12 months; Azure F0 5 h/month realtime-only; ElevenLabs 10,000 shared credits | Not verified against the official pages. Azure, AWS and ElevenLabs are disabled. Gladia and ElevenLabs are not Persian-capable in the registry. |
 | OpenAI-compatible (`openai_compatible`) | `generic_gateway` | Depends on the gateway | Operator-supplied endpoint. |
 
@@ -139,9 +139,9 @@ a low confidence triggers the next provider, and the more confident outcome wins
 ## Privacy and data use
 
 * Keys are stored as Fernet ciphertext only. Keys travel in request headers,
-  never in URLs. Gemini's Files API upload was changed in this increment from a
-  `?key=` query parameter to `x-goog-api-key`. Google Cloud STT still sends its key
-  as a query parameter; see [Not done](#not-done).
+  never in URLs. Gemini and Google Cloud STT both send the key as
+  `x-goog-api-key`, per Google's guidance to avoid the `key=` query parameter. This
+  was changed in this increment and has not been exercised against the live APIs.
 * Events and usage rows carry codes, provider names, sizes, timings and HTTP
   status only. Transcripts, audio and raw provider responses are never logged.
 * A free tier may let the provider use the content to improve its products. For
@@ -170,10 +170,8 @@ a low confidence triggers the next provider, and the more confident outcome wins
   evidence column, route pinning with policy), but no measured WER or latency
   has been recorded, so no provider is ranked.
 * AWS Transcribe, Azure Speech, Soniox and ElevenLabs remain scaffolds, disabled.
-* Google Cloud STT still sends its API key as a query parameter, and the
-  Gemini `interactions` path has not been exercised against the live API.
-* `SONIOX_STT_MODEL` in `.env.example` (`stt-async-v5`) disagrees with the
-  registry (`stt-async-v3`). Confirm the current model in the official docs.
+* The `x-goog-api-key` header for Gemini and Google Cloud STT, and the Gemini
+  `interactions` path, have not been exercised against the live APIs.
 * Speechmatics, AssemblyAI, Gladia, Google, IBM, Azure, AWS, ElevenLabs and
   Soniox free-tier facts beyond the evidence column are not re-verified here.
 * Emergency chunking is not implemented. Whole-file transcription only.
