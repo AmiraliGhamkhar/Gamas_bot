@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -2747,3 +2748,515 @@ class Database:
             cursor = await self._db().execute(query, tuple(params))
             return [dict(row) for row in await cursor.fetchall()]
 
+
+    # -- Gamas Speech Platform --------------------------------------------------
+
+    async def stt_registry_sync(self, providers: list[dict[str, Any]]) -> None:
+        """Persist a snapshot of the reviewed code registry (never credentials)."""
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            for item in providers:
+                provider = str(item.get("provider") or "").strip().lower()
+                if not provider:
+                    continue
+                metadata = item.get("metadata") or {}
+                await db.execute(
+                    "INSERT INTO stt_provider_registry "
+                    "(provider, display_name, protocol, classification, persian_batch, enabled, "
+                    "metadata_json, last_verified_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(provider) DO UPDATE SET display_name=excluded.display_name, "
+                    "protocol=excluded.protocol, classification=excluded.classification, "
+                    "persian_batch=excluded.persian_batch, enabled=excluded.enabled, "
+                    "metadata_json=excluded.metadata_json, last_verified_at=excluded.last_verified_at, "
+                    "updated_at=excluded.updated_at",
+                    (
+                        provider, str(item.get("display_name") or provider)[:120],
+                        str(item.get("protocol") or "")[:80],
+                        str(item.get("classification") or "unsupported")[:40],
+                        int(bool(item.get("persian_batch"))), int(bool(item.get("enabled", True))),
+                        json.dumps(metadata, ensure_ascii=False, sort_keys=True, separators=(",", ":"))[:16000],
+                        str(item.get("last_verified_at") or now)[:40], now,
+                    ),
+                )
+
+    async def stt_registry_list(self) -> list[dict[str, Any]]:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM stt_provider_registry ORDER BY provider"
+            )
+            result = []
+            for row in await cursor.fetchall():
+                item = dict(row)
+                try:
+                    item["metadata"] = json.loads(item.pop("metadata_json") or "{}")
+                except (TypeError, ValueError):
+                    item["metadata"] = {}
+                result.append(item)
+            return result
+
+    async def stt_provider_settings_all(self) -> dict[str, dict[str, Any]]:
+        async with self._lock:
+            cursor = await self._db().execute("SELECT * FROM stt_provider_settings")
+            return {str(row["provider"]): dict(row) for row in await cursor.fetchall()}
+
+    async def stt_provider_settings_get(self, provider: str) -> dict[str, Any] | None:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM stt_provider_settings WHERE provider=?", (provider,)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def stt_provider_settings_upsert(
+        self,
+        provider: str,
+        *,
+        enabled: bool | None = None,
+        billing_state: str | None = None,
+        admin_id: int | None = None,
+    ) -> None:
+        if billing_state is not None and billing_state not in {"unknown", "free", "paid"}:
+            raise ValueError("billing_state must be unknown, free, or paid")
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT enabled, billing_state, billing_attested_at, billing_attested_by_admin_id "
+                "FROM stt_provider_settings WHERE provider=?", (provider,)
+            )
+            row = await cursor.fetchone()
+            old_enabled = int(row["enabled"]) if row else 1
+            old_billing = str(row["billing_state"] or "unknown") if row else "unknown"
+            old_attested_at = row["billing_attested_at"] if row else None
+            old_attested_by = row["billing_attested_by_admin_id"] if row else None
+            new_enabled = old_enabled if enabled is None else int(bool(enabled))
+            new_billing = old_billing if billing_state is None else billing_state
+            attested_at = old_attested_at
+            attested_by = old_attested_by
+            if billing_state is not None:
+                attested_at = None if billing_state == "unknown" else now
+                attested_by = None if billing_state == "unknown" else admin_id
+            await db.execute(
+                "INSERT INTO stt_provider_settings "
+                "(provider, enabled, billing_state, billing_attested_at, "
+                "billing_attested_by_admin_id, updated_by_admin_id, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(provider) DO UPDATE SET "
+                "enabled=excluded.enabled, billing_state=excluded.billing_state, "
+                "billing_attested_at=excluded.billing_attested_at, "
+                "billing_attested_by_admin_id=excluded.billing_attested_by_admin_id, "
+                "updated_by_admin_id=excluded.updated_by_admin_id, updated_at=excluded.updated_at",
+                (provider, new_enabled, new_billing, attested_at, attested_by, admin_id, now),
+            )
+            if admin_id is not None:
+                await self._insert_audit(
+                    db, int(admin_id), "stt_provider_settings", "stt_provider", provider,
+                    {"enabled": new_enabled, "billing_state": new_billing,
+                     "billing_attested_at": attested_at},
+                )
+
+    async def stt_routes_list(self, *, enabled_only: bool = False) -> list[dict[str, Any]]:
+        query = "SELECT * FROM stt_routes"
+        if enabled_only:
+            query += " WHERE enabled=1"
+        query += " ORDER BY position, provider"
+        async with self._lock:
+            cursor = await self._db().execute(query)
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def stt_routes_replace(self, routes: list[dict[str, Any]], *, admin_id: int | None = None) -> None:
+        """Replace only STT route metadata; provider credentials are untouched."""
+        now = utc_now()
+        normalized: list[tuple[str, int, int, str | None]] = []
+        seen: set[str] = set()
+        for index, route in enumerate(routes):
+            provider = str(route.get("provider") or "").strip().lower()
+            if not provider or provider in seen:
+                raise ValueError("STT route providers must be unique and non-empty")
+            seen.add(provider)
+            position = max(0, int(route.get("position", index)))
+            model = str(route.get("model_override") or "").strip() or None
+            normalized.append((provider, position, int(bool(route.get("enabled", True))), model))
+        positions = [item[1] for item in normalized]
+        if len(positions) != len(set(positions)):
+            raise ValueError("STT route positions must be unique")
+        async with self._transaction(immediate=True) as db:
+            await db.execute("DELETE FROM stt_routes")
+            for provider, position, enabled, model in normalized:
+                await db.execute(
+                    "INSERT INTO stt_routes "
+                    "(provider, position, enabled, model_override, updated_by_admin_id, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (provider, position, enabled, model, admin_id, now),
+                )
+            if admin_id is not None:
+                await self._insert_audit(
+                    db, int(admin_id), "stt_routes_replaced", "stt_routes", None,
+                    {"providers": [item[0] for item in sorted(normalized, key=lambda row: row[1])]},
+                )
+
+    async def stt_route_toggle(self, provider: str, *, admin_id: int) -> bool:
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute("SELECT enabled FROM stt_routes WHERE provider=?", (provider,))
+            row = await cursor.fetchone()
+            if not row:
+                return False
+            enabled = 0 if int(row["enabled"]) else 1
+            await db.execute(
+                "UPDATE stt_routes SET enabled=?, updated_by_admin_id=?, updated_at=? WHERE provider=?",
+                (enabled, admin_id, now, provider),
+            )
+            await self._insert_audit(
+                db, admin_id, "stt_route_toggled", "stt_route", provider, {"enabled": enabled}
+            )
+            return True
+
+    async def stt_models_upsert(self, models: list[dict[str, Any]]) -> None:
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            for row in models:
+                await db.execute(
+                    "INSERT INTO stt_model_registry "
+                    "(provider, model, display_name, status, language_support_json, persian_supported, "
+                    "feature_support_json, free_status, max_duration_seconds, max_file_size, quality_score, "
+                    "deprecated, deprecation_date, available, source, last_verified, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(provider, model) DO UPDATE SET display_name=excluded.display_name, "
+                    "status=excluded.status, language_support_json=excluded.language_support_json, "
+                    "persian_supported=excluded.persian_supported, feature_support_json=excluded.feature_support_json, "
+                    "free_status=excluded.free_status, max_duration_seconds=excluded.max_duration_seconds, "
+                    "max_file_size=excluded.max_file_size, quality_score=excluded.quality_score, "
+                    "deprecated=excluded.deprecated, deprecation_date=excluded.deprecation_date, "
+                    "available=excluded.available, source=excluded.source, last_verified=excluded.last_verified, "
+                    "updated_at=excluded.updated_at",
+                    (
+                        str(row.get("provider") or ""), str(row.get("model") or ""),
+                        str(row.get("display_name") or "")[:150], str(row.get("status") or "available"),
+                        str(row.get("language_support_json") or "[]")[:4000], int(bool(row.get("persian_supported"))),
+                        str(row.get("feature_support_json") or "[]")[:4000], str(row.get("free_status") or "unknown")[:40],
+                        row.get("max_duration_seconds"), row.get("max_file_size"), row.get("quality_score"),
+                        int(bool(row.get("deprecated"))), row.get("deprecation_date"),
+                        int(bool(row.get("available", True))), str(row.get("source") or "static_seed")[:160],
+                        row.get("last_verified"), now,
+                    ),
+                )
+
+    async def stt_models_list(self, provider: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM stt_model_registry"
+        params: tuple = ()
+        if provider:
+            query += " WHERE provider=?"
+            params = (provider,)
+        query += " ORDER BY provider, model"
+        async with self._lock:
+            cursor = await self._db().execute(query, params)
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def stt_model_get(self, provider: str, model: str) -> dict[str, Any] | None:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM stt_model_registry WHERE provider=? AND model=?", (provider, model)
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def stt_models_upsert_discovery(self, provider: str, models: list[dict[str, Any]]) -> dict[str, int]:
+        if not models:
+            return {"synced": 0, "deactivated": 0}
+        before = {str(row.get("model")) for row in await self.stt_models_list(provider)}
+        await self.stt_models_upsert(models)
+        current = {str(row.get("model")) for row in models}
+        deactivated = 0
+        if before - current:
+            async with self._transaction(immediate=True) as db:
+                cursor = await db.execute(
+                    "UPDATE stt_model_registry SET available=0, status='unavailable', updated_at=? "
+                    "WHERE provider=? AND source LIKE 'live:%' AND model NOT IN (" +
+                    ",".join("?" for _ in current) + ")",
+                    (utc_now(), provider, *sorted(current)),
+                )
+                deactivated = int(cursor.rowcount or 0)
+        return {"synced": len(models), "deactivated": deactivated}
+
+    async def stt_quota_upsert(self, observation: dict[str, Any]) -> None:
+        now = utc_now()
+        provider = str(observation.get("provider") or "")[:80]
+        account_scope = str(observation.get("account_scope") or "provider")[:120]
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "INSERT INTO stt_quota_snapshots "
+                "(provider, account_scope, credential_id, model, quota_type, quota_limit, used, remaining, "
+                "reset_at, source, observed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(provider, account_scope, model, quota_type) DO UPDATE SET "
+                "credential_id=excluded.credential_id, quota_limit=excluded.quota_limit, used=excluded.used, "
+                "remaining=excluded.remaining, reset_at=excluded.reset_at, source=excluded.source, "
+                "observed_at=excluded.observed_at, updated_at=excluded.updated_at",
+                (
+                    provider, account_scope, observation.get("credential_id"),
+                    str(observation.get("model") or "")[:120], str(observation.get("quota_type") or "")[:80],
+                    observation.get("limit"), observation.get("used"), observation.get("remaining"),
+                    observation.get("reset_at"), str(observation.get("source") or "unknown")[:60],
+                    str(observation.get("observed_at") or now)[:50], now,
+                ),
+            )
+
+    async def stt_quota_latest(
+        self, provider: str, quota_type: str | None = None, *, account_scope: str | None = None
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM stt_quota_snapshots WHERE provider=?"
+        params: list[Any] = [provider]
+        if quota_type:
+            query += " AND quota_type=?"
+            params.append(quota_type)
+        if account_scope:
+            query += " AND account_scope=?"
+            params.append(account_scope)
+        query += " ORDER BY observed_at DESC, id DESC LIMIT 20"
+        async with self._lock:
+            cursor = await self._db().execute(query, tuple(params))
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def stt_quota_set_budget(
+        self,
+        provider: str,
+        account_scope: str,
+        quota_type: str,
+        *,
+        limit: float,
+        remaining: float,
+        reset_at: str | None,
+        admin_id: int,
+        credential_id: int | None = None,
+    ) -> None:
+        limit_value, remaining_value = float(limit), float(remaining)
+        if not (math.isfinite(limit_value) and math.isfinite(remaining_value)):
+            raise ValueError("STT quota values must be finite")
+        if limit_value < 0 or remaining_value < 0 or remaining_value > limit_value:
+            raise ValueError("STT quota remaining must be between zero and the limit")
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "INSERT INTO stt_quota_budgets "
+                "(provider, account_scope, credential_id, quota_type, quota_limit, remaining, reset_at, "
+                "source, updated_by_admin_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'admin_attestation', ?, ?) "
+                "ON CONFLICT(provider, account_scope, quota_type) DO UPDATE SET "
+                "credential_id=excluded.credential_id, quota_limit=excluded.quota_limit, "
+                "remaining=excluded.remaining, reset_at=excluded.reset_at, source='admin_attestation', "
+                "updated_by_admin_id=excluded.updated_by_admin_id, updated_at=excluded.updated_at",
+                (provider, account_scope, credential_id, quota_type, limit_value, remaining_value,
+                 reset_at, admin_id, now),
+            )
+            await db.execute(
+                "INSERT INTO stt_quota_snapshots "
+                "(provider, account_scope, credential_id, model, quota_type, quota_limit, used, remaining, "
+                "reset_at, source, observed_at, updated_at) VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, "
+                "'admin_attestation', ?, ?) ON CONFLICT(provider, account_scope, model, quota_type) "
+                "DO UPDATE SET credential_id=excluded.credential_id, quota_limit=excluded.quota_limit, "
+                "used=excluded.used, remaining=excluded.remaining, reset_at=excluded.reset_at, "
+                "source=excluded.source, observed_at=excluded.observed_at, updated_at=excluded.updated_at",
+                (provider, account_scope, credential_id, quota_type, limit_value,
+                 limit_value - remaining_value, remaining_value, reset_at, now, now),
+            )
+            await self._insert_audit(
+                db, admin_id, "stt_quota_budget_set", "stt_quota_budget", f"{provider}:{account_scope}",
+                {"quota_type": quota_type, "limit": limit_value, "remaining": remaining_value,
+                 "reset_at": reset_at, "credential_id": credential_id},
+            )
+
+    async def stt_quota_budgets(self, provider: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM stt_quota_budgets"
+        params: tuple = ()
+        if provider:
+            query += " WHERE provider=?"
+            params = (provider,)
+        query += " ORDER BY provider, account_scope, quota_type"
+        async with self._lock:
+            cursor = await self._db().execute(query, params)
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def stt_quota_budget_get(
+        self, provider: str, account_scope: str, quota_type: str
+    ) -> dict[str, Any] | None:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM stt_quota_budgets WHERE provider=? AND account_scope=? AND quota_type=?",
+                (provider, account_scope, quota_type),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+    async def stt_quota_reserve(
+        self,
+        provider: str,
+        account_scope: str,
+        quota_type: str,
+        *,
+        needed: float,
+        safety_margin: float,
+        submission_id: int | None = None,
+        credential_id: int | None = None,
+    ) -> tuple[int | None, float | None, str]:
+        """Atomically reserve budget units; unknown/stale budgets fail closed."""
+        try:
+            amount = float(needed)
+            margin = min(max(float(safety_margin), 0.0), 0.5)
+        except (TypeError, ValueError):
+            return None, None, "unknown"
+        if not math.isfinite(amount) or amount <= 0:
+            return None, None, "unknown"
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT * FROM stt_quota_budgets WHERE provider=? AND account_scope=? AND quota_type=?",
+                (provider, account_scope, quota_type),
+            )
+            budget = await cursor.fetchone()
+            if not budget:
+                return None, None, "unknown"
+            reset_at = budget["reset_at"]
+            if reset_at:
+                try:
+                    reset = datetime.fromisoformat(str(reset_at).replace("Z", "+00:00"))
+                    if reset.tzinfo is None:
+                        reset = reset.replace(tzinfo=timezone.utc)
+                    if reset.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+                        return None, float(budget["remaining"]), "stale"
+                except (ValueError, TypeError, OverflowError):
+                    return None, float(budget["remaining"]), "stale"
+            remaining = float(budget["remaining"])
+            reserve_floor = float(budget["quota_limit"]) * margin
+            safe_remaining = max(0.0, remaining - reserve_floor)
+            if safe_remaining <= 0:
+                return None, safe_remaining, "exhausted"
+            if amount > safe_remaining:
+                return None, safe_remaining, "insufficient"
+            new_remaining = max(0.0, remaining - amount)
+            await db.execute(
+                "UPDATE stt_quota_budgets SET remaining=?, updated_at=? "
+                "WHERE provider=? AND account_scope=? AND quota_type=?",
+                (new_remaining, now, provider, account_scope, quota_type),
+            )
+            cursor = await db.execute(
+                "INSERT INTO stt_quota_reservations "
+                "(provider, account_scope, credential_id, submission_id, quota_type, reserved_units, status, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'reserved', ?)",
+                (provider, account_scope, credential_id, submission_id, quota_type, amount, now),
+            )
+            return int(cursor.lastrowid), safe_remaining - amount, "available"
+
+    async def stt_quota_reservation_finalize(self, reservation_id: int | None, *, commit: bool) -> None:
+        if reservation_id is None:
+            return
+        now = utc_now()
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT * FROM stt_quota_reservations WHERE id=?", (reservation_id,)
+            )
+            row = await cursor.fetchone()
+            if not row or row["status"] != "reserved":
+                return
+            if commit:
+                status = "committed"
+            else:
+                status = "released"
+                await db.execute(
+                    "UPDATE stt_quota_budgets SET remaining=MIN(quota_limit, remaining + ?), updated_at=? "
+                    "WHERE provider=? AND account_scope=? AND quota_type=?",
+                    (float(row["reserved_units"]), now, row["provider"], row["account_scope"], row["quota_type"]),
+                )
+            await db.execute(
+                "UPDATE stt_quota_reservations SET status=?, finalized_at=? WHERE id=?",
+                (status, now, reservation_id),
+            )
+
+    async def stt_usage_record(self, record: dict[str, Any]) -> int:
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "INSERT INTO stt_usage_records "
+                "(submission_id, job_id, provider, model, credential_id, route_position, attempt, result, "
+                "audio_bytes, audio_duration_seconds, latency_ms, http_status, error_category, request_id, "
+                "quota_type, quota_units, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    record.get("submission_id"), str(record.get("job_id") or "")[:120],
+                    str(record.get("provider") or "")[:80], str(record.get("model") or "")[:120],
+                    record.get("credential_id"), max(0, int(record.get("route_position") or 0)),
+                    max(1, int(record.get("attempt") or 1)), str(record.get("result") or "failure"),
+                    record.get("audio_bytes"), record.get("audio_duration_seconds"), record.get("latency_ms"),
+                    record.get("http_status"), str(record.get("error_category") or "")[:80],
+                    str(record.get("request_id") or "")[:128] or None,
+                    str(record.get("quota_type") or "")[:80] or None, record.get("quota_units"),
+                    str(record.get("created_at") or utc_now())[:50],
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    async def stt_usage_recent(
+        self, *, limit: int = 30, provider: str | None = None, failures_only: bool = False
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM stt_usage_records WHERE 1=1"
+        params: list[Any] = []
+        if provider:
+            query += " AND provider=?"
+            params.append(provider)
+        if failures_only:
+            query += " AND result='failure'"
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 200)))
+        async with self._lock:
+            cursor = await self._db().execute(query, tuple(params))
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def stt_usage_summary(self, *, days: int = 7) -> list[dict[str, Any]]:
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT provider, model, COUNT(*) AS requests, "
+                "SUM(CASE WHEN result='success' THEN 1 ELSE 0 END) AS successes, "
+                "SUM(CASE WHEN result='failure' THEN 1 ELSE 0 END) AS failures, "
+                "SUM(CASE WHEN result='fallback' THEN 1 ELSE 0 END) AS fallbacks, "
+                "SUM(audio_duration_seconds) AS audio_seconds, AVG(latency_ms) AS mean_latency_ms "
+                "FROM stt_usage_records WHERE created_at>=datetime(?, ?) "
+                "GROUP BY provider, model ORDER BY requests DESC, provider",
+                (utc_now(), f"-{max(1, int(days))} days"),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def stt_provider_event_insert(self, event: dict[str, Any], *, prune_to: int = 5000) -> None:
+        async with self._transaction(immediate=True) as db:
+            await db.execute(
+                "INSERT INTO stt_provider_events "
+                "(event, provider, model, credential_id, job_id, http_status, latency_ms, error_category, "
+                "level, fields_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(event.get("event") or "")[:80], str(event.get("provider") or "")[:80],
+                    str(event.get("model") or "")[:120], event.get("credential_id"),
+                    str(event.get("job_id") or "")[:120], event.get("http_status"), event.get("latency_ms"),
+                    str(event.get("error_category") or "")[:80], str(event.get("level") or "info"),
+                    str(event.get("fields_json") or "{}")[:12000],
+                    str(event.get("created_at") or utc_now())[:50],
+                ),
+            )
+            if prune_to:
+                await db.execute(
+                    "DELETE FROM stt_provider_events WHERE id NOT IN "
+                    "(SELECT id FROM stt_provider_events ORDER BY id DESC LIMIT ?)",
+                    (int(prune_to),),
+                )
+
+    async def stt_events_list(
+        self, *, limit: int = 50, provider: str | None = None, event: str | None = None,
+        failures_only: bool = False,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM stt_provider_events WHERE 1=1"
+        params: list[Any] = []
+        if provider:
+            query += " AND provider=?"
+            params.append(provider)
+        if event:
+            query += " AND event=?"
+            params.append(event)
+        if failures_only:
+            query += " AND level IN ('warning','error')"
+        query += " ORDER BY id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 200)))
+        async with self._lock:
+            cursor = await self._db().execute(query, tuple(params))
+            return [dict(row) for row in await cursor.fetchall()]
