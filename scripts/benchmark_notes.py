@@ -538,12 +538,18 @@ def gamas_quality_score(
     return round(score * 100.0, 2)
 
 
-def _score(source: str, chunks: list[str], notes_text: str) -> dict:
-    """All coverage measures for one (source, notes) pair."""
-    notes = StructuredNotes(
+def _score(
+    source: str,
+    chunks: list[str],
+    notes_text: str,
+    notes_obj: StructuredNotes | None = None,
+) -> dict:
+    """All coverage measures and 16 quality signals for one (source, notes) pair."""
+    notes = notes_obj or StructuredNotes(
         title="benchmark", sections=(NoteSection(heading="s", paragraphs=(notes_text,)),)
     )
     report = qa.run_note_qa(notes, chunks)
+    structure = qa.analyze_structure(notes)
     units = extract_all_units(chunks)
     semantic, missing = semantic_coverage(units, notes_text)
     unit_total = report.total_units or 1
@@ -561,22 +567,51 @@ def _score(source: str, chunks: list[str], notes_text: str) -> dict:
         reliability=1.0,
     )
     return {
+        # The 16 core signals:
         "compression_ratio": round(report.compression_ratio, 3),
         "signal_coverage": round(report.coverage, 3),
         "semantic_coverage": round(semantic, 3),
-        "gamas_quality_score": quality,
-        "units": f"{report.covered_units}/{report.total_units}",
-        "missing_unit_types": sorted({unit.type for unit in missing}),
+        "factual_preservation": round(factual, 3),
         "chunk_coverage": round(report.chunk_coverage, 3),
-        "missing_numbers": list(report.missing_numbers[:5]),
-        "missing_terms": list(report.missing_terms[:5]),
+        "terminology_preservation": round(terms_covered, 3),
+        "gamas_quality_score": quality,
         "needs_repair": report.needs_repair,
         "severe_compression": report.compression_is_concerning,
+        "sections": structure.total_sections,
+        "duplicate_paragraphs": structure.duplicate_paragraphs,
+        "duplicate_bullets": structure.duplicate_bullets,
+        "repeated_headings": structure.repeated_headings,
+        "split_topics": structure.split_topics,
+        "untitled_sections": structure.untitled_sections,
+        "abrupt_sections": structure.abrupt_sections,
+        # Diagnostics & details:
+        "units": f"{report.covered_units}/{report.total_units}",
+        "missing_unit_types": sorted({unit.type for unit in missing}),
+        "missing_numbers": list(report.missing_numbers[:5]),
+        "missing_terms": list(report.missing_terms[:5]),
     }
 
 
-def run(mode: str = "full", live: bool = False) -> dict:
+def run(mode: str = "full", live: bool = False, profile_slug: str | None = None) -> dict:
     settings_fonts = resolve_fonts({})
+    chunk_limit = TRANSCRIPT_CHUNK_CHARS - _CHUNK_PREFIX_RESERVE
+    profile_info = None
+    if profile_slug:
+        from gamas_bot.ai.profiles import profile_for
+        from gamas_bot.ai.tokens import chunk_char_budget
+
+        profile = profile_for(profile_slug)
+        chunk_limit = chunk_char_budget(
+            profile.chunk_token_budget, char_cap=profile.chunk_char_cap
+        )
+        profile_info = {
+            "slug": profile_slug,
+            "chunk_token_budget": profile.chunk_token_budget,
+            "chunk_char_cap": profile.chunk_char_cap,
+            "effective_chunk_limit": chunk_limit,
+            "max_output_tokens": profile.max_output_tokens,
+        }
+
     report: dict = {
         "mode": resolve_note_mode(mode),
         "prompt": _prompt_facts(mode),
@@ -584,11 +619,12 @@ def run(mode: str = "full", live: bool = False) -> dict:
             "live=false measures the pipeline; use --live to score real model output"
         ),
     }
+    if profile_info:
+        report["profile"] = profile_info
+
     fixtures_report = []
     for name, source in _load_fixtures():
-        chunks = split_transcript(
-            source, max_chars=TRANSCRIPT_CHUNK_CHARS - _CHUNK_PREFIX_RESERVE
-        )
+        chunks = split_transcript(source, max_chars=chunk_limit)
         entry: dict = {"name": name, "source_chars": len(source), "chunks": len(chunks)}
 
         # The DOCX renderer is always exercised on the real text, without a
@@ -597,17 +633,18 @@ def run(mode: str = "full", live: bool = False) -> dict:
             NoteSection(heading=f"بخش {index}", paragraphs=(chunk,))
             for index, chunk in enumerate(chunks, start=1)
         )
+        doc_notes = StructuredNotes(title=name, sections=sections)
         payload = build_notes_docx(
-            StructuredNotes(title=name, sections=sections),
+            doc_notes,
             meta=DocumentMeta(reference="BENCH"),
             fonts=settings_fonts,
             design=resolve_design({"toc_enabled": False}),
         )
         entry["docx"] = _docx_facts(payload)
-        entry["structure"] = _structure_facts(StructuredNotes(title=name, sections=sections))
+        entry["structure"] = _structure_facts(doc_notes)
 
         # The deterministic ceiling: source scored against itself.
-        entry["deterministic"] = _score(source, chunks, source)
+        entry["deterministic"] = _score(source, chunks, source, notes_obj=doc_notes)
 
         if live:
             entry["live"] = _run_live(name, source, chunks)
@@ -632,7 +669,27 @@ def run(mode: str = "full", live: bool = False) -> dict:
             "mean_semantic_coverage": round(
                 sum(d["semantic_coverage"] for d in det) / len(det), 3
             ),
+            "mean_factual_preservation": round(
+                sum(d["factual_preservation"] for d in det) / len(det), 3
+            ),
+            "mean_chunk_coverage": round(
+                sum(d["chunk_coverage"] for d in det) / len(det), 3
+            ),
+            "mean_terminology_preservation": round(
+                sum(d["terminology_preservation"] for d in det) / len(det), 3
+            ),
+            "mean_gamas_quality_score": round(
+                sum(d["gamas_quality_score"] for d in det) / len(det), 2
+            ),
             "fixtures_needing_repair": sum(1 for d in det if d["needs_repair"]),
+            "fixtures_severe_compression": sum(1 for d in det if d["severe_compression"]),
+            "total_sections": sum(d["sections"] for d in det),
+            "total_duplicate_paragraphs": sum(d["duplicate_paragraphs"] for d in det),
+            "total_duplicate_bullets": sum(d["duplicate_bullets"] for d in det),
+            "total_repeated_headings": sum(d["repeated_headings"] for d in det),
+            "total_split_topics": sum(d["split_topics"] for d in det),
+            "total_untitled_sections": sum(d["untitled_sections"] for d in det),
+            "total_abrupt_sections": sum(d["abrupt_sections"] for d in det),
             "mean_docx_paragraphs": round(
                 sum(f["docx"]["paragraphs"] for f in fixtures_report)
                 / max(len(fixtures_report), 1),
@@ -730,6 +787,101 @@ def _run_live(name: str, source: str, chunks: list[str]) -> dict:
     }
 
 
+def run_benchmark_profiles(mode: str = "full") -> dict:
+    """Benchmark all supported provider profiles in sequence."""
+    from gamas_bot.ai.models import default_model_for, fallback_free_model
+    from gamas_bot.ai.profiles import profile_for
+    from gamas_bot.ai.registry import PROVIDER_REGISTRY, registry_info
+    from gamas_bot.ai.tokens import chunk_char_budget
+
+    profiles_report = {}
+    note_providers = [
+        slug for slug, info in PROVIDER_REGISTRY.items()
+        if "notes" in info.supported_services
+    ]
+    fixtures = _load_fixtures()
+    for slug in note_providers:
+        profile = profile_for(slug)
+        info = registry_info(slug)
+        budget = chunk_char_budget(profile.chunk_token_budget, char_cap=profile.chunk_char_cap)
+        fixture_scores = []
+        total_chunks = 0
+        for name, source in fixtures:
+            chunks = split_transcript(source, max_chars=budget)
+            total_chunks += len(chunks)
+            score = _score(source, chunks, source)
+            fixture_scores.append(score)
+
+        mean_quality = round(
+            sum(s["gamas_quality_score"] for s in fixture_scores) / max(len(fixture_scores), 1), 2
+        )
+        mean_semantic = round(
+            sum(s["semantic_coverage"] for s in fixture_scores) / max(len(fixture_scores), 1), 3
+        )
+        mean_signal = round(
+            sum(s["signal_coverage"] for s in fixture_scores) / max(len(fixture_scores), 1), 3
+        )
+        mean_factual = round(
+            sum(s["factual_preservation"] for s in fixture_scores) / max(len(fixture_scores), 1), 3
+        )
+        model = fallback_free_model(slug) or default_model_for(slug)
+        profiles_report[slug] = {
+            "display_name": info.display_name,
+            "classification": info.classification.value,
+            "default_model": model,
+            "chunk_token_budget": profile.chunk_token_budget,
+            "chunk_char_cap": profile.chunk_char_cap,
+            "effective_chunk_budget_chars": budget,
+            "max_output_tokens": profile.max_output_tokens,
+            "timeout_seconds": profile.policy.timeout_seconds,
+            "max_retries": profile.policy.max_retries,
+            "max_concurrency": profile.max_concurrency,
+            "mean_gamas_quality_score": mean_quality,
+            "mean_semantic_coverage": mean_semantic,
+            "mean_signal_coverage": mean_signal,
+            "mean_factual_preservation": mean_factual,
+            "total_chunks_across_fixtures": total_chunks,
+        }
+    return profiles_report
+
+
+def record_benchmark_to_db(report: dict, profile_slug: str | None = None) -> None:
+    """Record quality score(s) into ai_models table."""
+    from gamas_bot.ai.models import default_model_for, fallback_free_model
+    from gamas_bot.config import Settings
+    from gamas_bot.database import Database
+
+    async def _record() -> None:
+        try:
+            settings = Settings.from_env()
+        except Exception:
+            return
+        db = Database(settings.database_path)
+        await db.open()
+        try:
+            if "profiles" in report:
+                for slug, pdata in report["profiles"].items():
+                    model = pdata.get("default_model") or default_model_for(slug)
+                    score = pdata.get("mean_gamas_quality_score", 0.0)
+                    if model:
+                        await db.ai_model_set_quality(slug, model, score)
+            elif profile_slug:
+                model = fallback_free_model(profile_slug) or default_model_for(profile_slug)
+                score = report.get("summary", {}).get("mean_gamas_quality_score", 0.0)
+                if model:
+                    await db.ai_model_set_quality(profile_slug, model, score)
+            else:
+                provider = settings.note_api_provider
+                model = settings.effective_note_model
+                score = report.get("summary", {}).get("mean_gamas_quality_score", 0.0)
+                if provider and model:
+                    await db.ai_model_set_quality(provider, model, score)
+        finally:
+            await db.close()
+
+    asyncio.run(_record())
+
+
 def human_review_form(report: dict) -> dict:
     """A machine-readable rubric for a human reviewer to fill in 1-5."""
     return {
@@ -760,6 +912,26 @@ def main(argv: list[str] | None = None) -> int:
         help="also call the configured note provider and score real output",
     )
     parser.add_argument(
+        "--profile",
+        metavar="SLUG",
+        help="benchmark against a specific provider profile (e.g. gemini, groq, mistral)",
+    )
+    parser.add_argument(
+        "--benchmark-profiles",
+        action="store_true",
+        help="evaluate and compare all supported note provider profiles",
+    )
+    parser.add_argument(
+        "--save-results",
+        metavar="PATH",
+        help="save benchmark results JSON to file path",
+    )
+    parser.add_argument(
+        "--record-db",
+        action="store_true",
+        help="record benchmark quality scores into the database",
+    )
+    parser.add_argument(
         "--human-out", metavar="PATH", help="write a human-review rubric as JSON"
     )
     parser.add_argument(
@@ -772,9 +944,25 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    report = run(args.mode, live=args.live)
+    if args.benchmark_profiles:
+        report = {"mode": args.mode, "profiles": run_benchmark_profiles(args.mode)}
+    else:
+        report = run(args.mode, live=args.live, profile_slug=args.profile)
+
     if args.router:
         report["router"] = _router_report()
+
+    if args.record_db:
+        record_benchmark_to_db(report, profile_slug=args.profile)
+
+    if args.save_results:
+        out_path = Path(args.save_results)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        print(f"benchmark results saved to {out_path}")
+
     if args.human_out:
         Path(args.human_out).write_text(
             json.dumps(human_review_form(report), ensure_ascii=False, indent=2),
@@ -786,7 +974,24 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, ensure_ascii=False, indent=2))
         return 0
 
+    if args.benchmark_profiles:
+        print("Supported Provider Profiles Benchmark:")
+        print(f"{'provider':<18}{'model':<26}{'budget':>8}{'quality':>9}{'semantic':>10}{'signal':>9}")
+        print("-" * 80)
+        for slug, pdata in report["profiles"].items():
+            print(
+                f"{slug:<18}{str(pdata['default_model'])[:25]:<26}"
+                f"{pdata['effective_chunk_budget_chars']:>8}"
+                f"{pdata['mean_gamas_quality_score']:>9.1f}"
+                f"{pdata['mean_semantic_coverage']:>10.3f}"
+                f"{pdata['mean_signal_coverage']:>9.3f}"
+            )
+        return 0
+
     print(f"mode={report['mode']}")
+    if report.get("profile"):
+        p = report["profile"]
+        print(f"profile: slug={p['slug']} chunk_tokens={p['chunk_token_budget']} limit_chars={p['effective_chunk_limit']}")
     summary = report.get("summary", {})
     if summary:
         print(
