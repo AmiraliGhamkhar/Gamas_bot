@@ -52,6 +52,7 @@ class NoteProviderProfile:
     max_concurrency: int = 1
     #: Static request-economy hints for free tiers (0 = unknown/unbounded).
     daily_request_limit: int = 0
+    daily_token_limit: int = 0
     requests_per_minute: int = 0
     tokens_per_minute: int = 0
     policy: RequestPolicy = RequestPolicy()
@@ -78,9 +79,11 @@ DEFAULT_PROFILES: dict[str, NoteProviderProfile] = {
         chunk_token_budget=6000,
         chunk_char_cap=TRANSCRIPT_CHUNK_CHARS,
         max_output_tokens=8192,
+        requests_per_minute=15,
+        daily_token_limit=7_000_000,
     ),
-    # Free tier: small budgets, strict schema where supported, no extra passes
-    # unless an admin opts in.
+    # The Developer-plan limit table is not proof of free eligibility. Keep
+    # conservative per-model budgets and no extra passes by default.
     "groq": NoteProviderProfile(
         provider="groq",
         chunk_token_budget=2400,
@@ -121,6 +124,7 @@ DEFAULT_PROFILES: dict[str, NoteProviderProfile] = {
         max_output_tokens=8192,
         requests_per_minute=20,
         daily_request_limit=20,
+        daily_token_limit=200_000,
         policy=RequestPolicy(max_retries=1),
     ),
     "zai": NoteProviderProfile(

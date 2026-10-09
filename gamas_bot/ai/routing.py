@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import logging
+import re
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -156,6 +157,11 @@ class ProviderRouter:
         self.tracker = tracker
         self.models = model_registry
         self._provider_settings_cache: dict | None = None
+        # In-flight requests count against local RPM/TPM/daily caps so
+        # concurrent queue workers cannot all pass the same stale snapshot.
+        self._budget_lock = asyncio.Lock()
+        self._budget_reservations: dict[int, tuple[str, datetime, int]] = {}
+        self._budget_reservation_id = 0
 
     # -- configuration ------------------------------------------------------
 
@@ -272,6 +278,12 @@ class ProviderRouter:
         for leg in legs:
             info = registry_info(leg.canonical)
             stored = settings.get(leg.canonical, {})
+            if info.classification is ProviderClass.TRIAL_ONLY:
+                skipped.append((leg.canonical, "trial_only_blocked"))
+                continue
+            if not info.commercial_use_allowed:
+                skipped.append((leg.canonical, "terms_of_use_blocked"))
+                continue
             if info.experimental_only and not stored.get("experimental_unlocked"):
                 skipped.append((leg.canonical, "experimental_locked"))
                 continue
@@ -338,20 +350,27 @@ class ProviderRouter:
                 )
             return live <= 0
         profile = profile_for(canonical)
-        if not profile.daily_request_limit:
-            return False
-        try:
+        if profile.daily_request_limit:
             used = await self.tracker.today_request_count(canonical)
-        except Exception:
-            return False
-        if used >= profile.daily_request_limit:
-            return True
+            if used >= profile.daily_request_limit:
+                return True
+        if profile.daily_token_limit:
+            tokens = await self.tracker.today_token_count(canonical)
+            if tokens >= profile.daily_token_limit:
+                return True
         return False
 
     # -- credential targets -----------------------------------------------------
 
-    async def credentials_for(self, leg: RouteLeg) -> list[ProviderCredential]:
-        """Ready credentials for a leg: exact pool, legacy host match, env fallback."""
+    async def credentials_for(
+        self, leg: RouteLeg, *, for_generation: bool = True
+    ) -> list[ProviderCredential]:
+        """Ready credentials for a leg; discovery can request read-only access.
+
+        Generation always requires an explicit per-key billing attestation.
+        Credential rotation stays inside this method; provider failover remains
+        the outer route loop.
+        """
         found: list[ProviderCredential] = []
         seen_ids: set[tuple] = set()
         pools: list[str] = [leg.provider]
@@ -397,7 +416,7 @@ class ProviderRouter:
                     continue
                 if resolve_canonical(pool, candidate.base_url) != leg.canonical:
                     continue
-                if not self._credential_allowed_for_leg(leg, candidate):
+                if for_generation and not self._credential_allowed_for_leg(leg, candidate):
                     continue
                 seen_ids.add(key)
                 found.append(candidate)
@@ -407,22 +426,24 @@ class ProviderRouter:
 
     @staticmethod
     def _credential_allowed_for_leg(leg: RouteLeg, credential: ProviderCredential) -> bool:
-        """Admin billing flags on a key gate which legs it may serve.
+        """Fail closed unless an admin attested the key for this billing lane.
 
-        * FREE_ONLY leg: a key explicitly marked paid (``free_only=0``) is
-          skipped — the admin stated this key bills money.
-        * paid-fallback leg (only reachable with AI_ALLOW_PAID_FALLBACK): a
-          key explicitly marked ``paid_allowed=0`` is skipped.
-        Unmarked keys (NULL) are allowed everywhere, preserving the legacy
-        behaviour for existing deployments.
+        ``free`` means the account is configured so usage beyond any included
+        allocation cannot be charged (e.g. billing disabled or a hard $0 cap).
+        ``paid`` is explicit paid-use authorization and is only reachable on a
+        paid route leg; global policy still controls when that leg is attempted.
+        Legacy nullable flags alone never constitute billing evidence.
         """
-        if leg.free_only and credential.free_only == 0:
+        state = (credential.billing_state or "unknown").strip().lower()
+        if not credential.billing_attested_at or credential.billing_attested_by_admin_id is None:
             return False
-        if not leg.free_only and credential.paid_allowed == 0:
-            return False
-        return True
+        if leg.free_only:
+            return state == "free"
+        return state == "paid"
 
-    def _model_for(self, leg: RouteLeg, credential: ProviderCredential, profile: NoteProviderProfile) -> str:
+    async def _model_for(
+        self, leg: RouteLeg, credential: ProviderCredential, profile: NoteProviderProfile
+    ) -> str | None:
         if leg.model:
             return leg.model
         if credential.model:
@@ -432,20 +453,38 @@ class ProviderRouter:
             env_model = self.settings.effective_note_model
             if env_model and env_model != "gpt-4o-mini":
                 return env_model
-        return fallback_free_model(leg.canonical) or self._default_model(leg.canonical)
+        known_free = fallback_free_model(leg.canonical)
+        if known_free:
+            return known_free
+        # Dynamic catalogs (notably Nara's plan-specific list) may be used only
+        # after a successful sync. Select an actually listed model, preferring
+        # a known-free candidate on a free leg; never invent a gateway model ID.
+        try:
+            catalog = await self.models.cached(leg.canonical)
+        except Exception:
+            catalog = []
+        for candidate in catalog:
+            if candidate.deprecated or not candidate.available:
+                continue
+            if leg.free_only and not candidate.free_only_eligible():
+                continue
+            return candidate.model_id
+        model = self._default_model(leg.canonical)
+        if model:
+            return model
+        return None
 
     @staticmethod
-    def _default_model(canonical: str) -> str:
+    def _default_model(canonical: str) -> str | None:
         from .models import default_model_for
 
         model = default_model_for(canonical)
         if model:
             return model
         return {
-            "gemini": "gemini-2.5-flash",
             "openai_compatible": "gpt-4o-mini",
             "anthropic": "claude-haiku-4-5",
-        }.get(canonical, "gpt-4o-mini")
+        }.get(canonical)
 
     # -- execution ---------------------------------------------------------------
 
@@ -492,7 +531,14 @@ class ProviderRouter:
         last_failure: NoteFailure | None = None
         downgraded = False
         for credential in pool:
-            model = self._model_for(leg, credential, profile)
+            model = await self._model_for(leg, credential, profile)
+            if not model:
+                last_failure = NoteFailure(
+                    category=FAIL_MODEL, provider=leg.canonical, model="",
+                    model_unavailable=True, message="no verified model in the discovered catalog",
+                )
+                failure_log.append(last_failure)
+                continue
             model_info = await self.models.resolve(leg.canonical, model)
             blocked = self._model_blocked(leg, model_info)
             if blocked:
@@ -557,8 +603,30 @@ class ProviderRouter:
                     )
                     return response
                 except NoteFailure as exc:
+                    if exc.local_budget_blocked:
+                        failure_log.append(exc)
+                        await self.tracker.event(
+                            "provider_quota_blocked", service="notes", provider=leg.provider,
+                            canonical=leg.canonical, model=model, request_type=task,
+                            route_position=position, job_id=job_id, detail=exc.message,
+                        )
+                        raise _LegFailed(exc) from None
                     last_failure = exc
             except NoteFailure as exc:
+                if exc.local_budget_blocked:
+                    failure_log.append(exc)
+                    await self.tracker.event(
+                        "provider_quota_blocked",
+                        service="notes",
+                        provider=leg.provider,
+                        canonical=leg.canonical,
+                        model=model,
+                        request_type=task,
+                        route_position=position,
+                        job_id=job_id,
+                        detail=exc.message,
+                    )
+                    raise _LegFailed(exc) from None
                 last_failure = exc
             assert last_failure is not None
             failure_log.append(last_failure)
@@ -586,7 +654,9 @@ class ProviderRouter:
         adapter = adapter_for(canonical, self.settings)
         profile = profile_for(canonical)
         leg = RouteLeg(provider=credential.provider, canonical=canonical, model=model)
-        model_id = model or self._model_for(leg, credential, profile)
+        model_id = model or await self._model_for(leg, credential, profile)
+        if not model_id:
+            return {"ok": False, "error_class": FAIL_MODEL, "detail": "no verified model", "latency_ms": 0}
         model_info = await self.models.resolve(canonical, model_id)
         strategy = "prompt"
         ctx = RequestContext(
@@ -624,8 +694,10 @@ class ProviderRouter:
                         )
                         result.update(
                             ok=True,
-                            request_id=parsed.request_id,
-                            finish_reason=parsed.finish_reason,
+                            request_id=self._safe_request_id(parsed.request_id, credential.secret),
+                            finish_reason=self._safe_finish_reason(
+                                parsed.finish_reason, credential.secret
+                            ),
                             input_tokens=parsed.usage.input_tokens,
                             output_tokens=parsed.usage.output_tokens,
                         )
@@ -636,7 +708,7 @@ class ProviderRouter:
                             key=credential.secret or None,
                         )
                         result["error_class"] = failure.category
-                        result["detail"] = sanitize_text(failure.message, (credential.secret,))
+                        result["detail"] = failure.category
         except Exception as exc:
             result["error_class"] = type(exc).__name__
             result["detail"] = sanitize_text(type(exc).__name__, (credential.secret,))
@@ -680,18 +752,21 @@ class ProviderRouter:
         return result
 
     def _model_blocked(self, leg: RouteLeg, info: ModelInfo) -> str | None:
-        free_only = bool(getattr(self.settings, "ai_free_only", True)) and leg.free_only
+        # Route-level free legs must remain genuinely free even when the
+        # deployment-wide mode is relaxed for separately-marked paid legs.
+        free_only = leg.free_only
         if info.deprecated or not info.available:
             return "model unavailable/deprecated"
         if info.capabilities.requires_paid_billing and free_only:
             return "model requires paid billing (FREE_ONLY)"
         if not info.commercial_use_allowed:
             return "model terms disallow this use"
-        if free_only:
+        if free_only and not info.free_now():
+            if info.free_status == FREE_PROMOTIONAL:
+                return "promotional free period expired or unverified"
             if info.free_status == PAID:
                 return "model is paid (FREE_ONLY)"
-            if info.free_status == FREE_PROMOTIONAL and not info.free_now():
-                return "promotional free period expired"
+            return "model free eligibility unknown (FREE_ONLY)"
         return None
 
     def _strategy_for(self, adapter: NoteAdapter, model_info: ModelInfo, leg: RouteLeg) -> str:
@@ -710,7 +785,13 @@ class ProviderRouter:
         if resolve_canonical(env_provider, self.settings.note_api_base_url) == canonical:
             if self.settings.note_api_base_url:
                 return self.settings.note_api_base_url
-        return registry_info(canonical).base_url or ""
+        base_url = registry_info(canonical).base_url or ""
+        if not base_url:
+            try:
+                base_url = adapter_for(canonical, self.settings).default_base_url()
+            except Exception:
+                base_url = ""
+        return base_url
 
     @staticmethod
     def _temperature_for(profile: NoteProviderProfile) -> float | None:
@@ -718,12 +799,104 @@ class ProviderRouter:
             return None
         return 0.2
 
-    @staticmethod
-    def _output_budget(profile: NoteProviderProfile, model: ModelInfo) -> int:
+    def _output_budget(self, profile: NoteProviderProfile, model: ModelInfo) -> int:
         budget = profile.max_output_tokens
         if model.max_output_tokens:
             budget = min(budget, model.max_output_tokens)
-        return budget
+        legacy_budget = int(getattr(self.settings, "note_api_max_output_tokens", budget) or budget)
+        return min(budget, max(1, legacy_budget))
+
+    async def _local_request_budget_reason(
+        self,
+        profile: NoteProviderProfile,
+        canonical: str,
+        *,
+        estimated_input_tokens: int,
+        output_token_budget: int,
+    ) -> str:
+        """Check projected usage, including all in-flight requests in this bot.
+
+        Output is reserved at its configured maximum, not the average. This is
+        intentionally conservative: a known provider daily limit must not be
+        crossed just because several queue workers started together.
+        """
+        if not any((
+            profile.requests_per_minute,
+            profile.tokens_per_minute,
+            profile.daily_request_limit,
+            profile.daily_token_limit,
+        )):
+            return ""
+        now = datetime.now(timezone.utc)
+        minute_floor = now.timestamp() - 60
+        day = now.date()
+        pending = [
+            (created_at, tokens)
+            for provider, created_at, tokens in self._budget_reservations.values()
+            if provider == canonical and created_at.date() == day
+        ]
+        pending_minute = [
+            (created_at, tokens)
+            for created_at, tokens in pending
+            if created_at.timestamp() >= minute_floor
+        ]
+        stats = await self.tracker.window_stats(canonical, seconds=60)
+        projected_requests = stats["requests"] + len(pending_minute)
+        if profile.requests_per_minute and projected_requests >= profile.requests_per_minute:
+            return "local provider requests-per-minute budget reached"
+        request_tokens = max(0, int(estimated_input_tokens)) + max(0, int(output_token_budget))
+        projected_minute_tokens = stats["tokens"] + sum(tokens for _, tokens in pending_minute) + request_tokens
+        if profile.tokens_per_minute and projected_minute_tokens > profile.tokens_per_minute:
+            return "local provider tokens-per-minute budget reached"
+        if profile.daily_request_limit:
+            used_requests = await self.tracker.today_request_count(canonical)
+            if used_requests + len(pending) >= profile.daily_request_limit:
+                return "local provider daily request budget reached"
+        if profile.daily_token_limit:
+            used_tokens = await self.tracker.today_token_count(canonical)
+            projected_daily_tokens = used_tokens + sum(tokens for _, tokens in pending) + request_tokens
+            if projected_daily_tokens > profile.daily_token_limit:
+                return "local provider daily token budget reached"
+        return ""
+
+    async def _reserve_local_request_budget(
+        self,
+        profile: NoteProviderProfile,
+        canonical: str,
+        *,
+        estimated_input_tokens: int,
+        output_token_budget: int,
+    ) -> tuple[str, int | None]:
+        """Atomically claim a local budget slot before sending a provider call."""
+        async with self._budget_lock:
+            reason = await self._local_request_budget_reason(
+                profile,
+                canonical,
+                estimated_input_tokens=estimated_input_tokens,
+                output_token_budget=output_token_budget,
+            )
+            if reason:
+                return reason, None
+            if not any((
+                profile.requests_per_minute,
+                profile.tokens_per_minute,
+                profile.daily_request_limit,
+                profile.daily_token_limit,
+            )):
+                return "", None
+            self._budget_reservation_id += 1
+            reservation_id = self._budget_reservation_id
+            reserved_tokens = max(0, int(estimated_input_tokens)) + max(0, int(output_token_budget))
+            self._budget_reservations[reservation_id] = (
+                canonical, datetime.now(timezone.utc), reserved_tokens
+            )
+            return "", reservation_id
+
+    async def _release_local_request_budget(self, reservation_id: int | None) -> None:
+        if reservation_id is None:
+            return
+        async with self._budget_lock:
+            self._budget_reservations.pop(reservation_id, None)
 
     async def _execute_with_retries(
         self,
@@ -737,6 +910,11 @@ class ProviderRouter:
     ) -> NoteResponse:
         policy = profile.policy
         retries = policy.max_retries
+        # The legacy NOTE_API_RETRIES knob remains an upper bound when the
+        # router is active; it can reduce, never inflate, a provider profile.
+        legacy_retry_cap = getattr(self.settings, "note_api_retries", None)
+        if legacy_retry_cap is not None:
+            retries = min(retries, max(0, int(legacy_retry_cap)))
         override = getattr(self.settings, "ai_max_generation_retries", -1)
         if override is not None and int(override) >= 0:
             retries = min(retries, int(override))
@@ -773,12 +951,30 @@ class ProviderRouter:
                     model=ctx.model,
                     message="request build failed (configuration)",
                 ) from exc
+            local_reason, reservation_id = await self._reserve_local_request_budget(
+                profile,
+                ctx.canonical,
+                estimated_input_tokens=estimated,
+                output_token_budget=ctx.max_output_tokens,
+            )
+            if local_reason:
+                raise NoteFailure(
+                    category=FAIL_RATE_LIMITED,
+                    provider=ctx.canonical,
+                    model=ctx.model,
+                    quota_exhausted=True,
+                    local_budget_blocked=True,
+                    message=local_reason,
+                )
             status = None
             try:
+                profile_timeout = max(1, int(policy.timeout_seconds))
+                legacy_timeout = max(1, int(getattr(self.settings, "note_api_timeout", profile_timeout)))
+                timeout_seconds = min(profile_timeout, legacy_timeout)
                 timeout = aiohttp.ClientTimeout(
-                    total=policy.timeout_seconds,
-                    connect=min(30, policy.timeout_seconds),
-                    sock_read=policy.timeout_seconds,
+                    total=timeout_seconds,
+                    connect=min(30, timeout_seconds),
+                    sock_read=timeout_seconds,
                 )
                 async with session.post(
                     request.url,
@@ -805,7 +1001,7 @@ class ProviderRouter:
                                 model=ctx.model,
                                 http_status=status,
                                 retryable=False,
-                                message=str(exc)[:120],
+                                message="provider response did not match the expected contract",
                             ) from exc
                         await self._record_attempt(
                             ctx=request_ctx, credential=credential, result="success",
@@ -829,8 +1025,11 @@ class ProviderRouter:
                             json_strategy=ctx.json_strategy,
                             job_id=ctx.job_id,
                         )
+                        safe_quota = self._safe_quota_headers(
+                            parsed.quota_headers, credential.secret
+                        )
                         await self.tracker.quota_snapshot(
-                            ctx.canonical, credential.id, ctx.model, parsed.quota_headers
+                            ctx.canonical, credential.id, ctx.model, safe_quota
                         )
                         return parsed
                     raw = await response.read()
@@ -869,7 +1068,7 @@ class ProviderRouter:
                             http_status=status,
                             latency_ms=latency_ms,
                             error_class=failure.category,
-                            detail=failure.message,
+                            detail=failure.category,
                             job_id=ctx.job_id,
                         )
                         await asyncio.sleep(delay)
@@ -912,6 +1111,8 @@ class ProviderRouter:
                     continue
                 last = failure
                 break
+            finally:
+                await self._release_local_request_budget(reservation_id)
         assert last is not None
         raise last
 
@@ -960,23 +1161,73 @@ class ProviderRouter:
             "latency_ms": latency_ms,
             "http_status": http_status,
             "estimated_input_tokens": estimated_tokens,
+            # This conservative fallback keeps per-model quota guards useful
+            # when a provider omits usage metadata; display rollups remain actual-only.
+            "estimated_output_tokens": ctx.max_output_tokens if parsed is not None else 0,
             "actual_input_tokens": usage.input_tokens if usage else None,
             "actual_output_tokens": usage.output_tokens if usage else None,
             "total_tokens": usage.total_tokens if usage else None,
-            "finish_reason": parsed.finish_reason if parsed else "",
+            "finish_reason": self._safe_finish_reason(
+                parsed.finish_reason, credential.secret
+            ) if parsed else "",
             "retry_after_seconds": failure.retry_after if failure else None,
             "quota_headers_json": None,
             "json_strategy": ctx.json_strategy,
             "result": result,
             "error_class": failure.category if failure else None,
             "free_class": self._free_class(ctx),
-            "request_id": (parsed.request_id if parsed else "")[:64],
+            "request_id": self._safe_request_id(
+                parsed.request_id if parsed else "", credential.secret
+            ),
         }
         if parsed is not None and parsed.quota_headers:
             import json as _json
 
-            row["quota_headers_json"] = _json.dumps(parsed.quota_headers, sort_keys=True)[:500]
+            row["quota_headers_json"] = _json.dumps(
+                self._safe_quota_headers(parsed.quota_headers, credential.secret), sort_keys=True
+            )[:500]
         await self.tracker.record(row)
+
+    @staticmethod
+    def _safe_finish_reason(value: str, secret: str) -> str:
+        """Keep only standardized finish enums; discard provider free text."""
+        cleaned = sanitize_text(value, (secret,), limit=40).strip().lower()
+        allowed = {
+            "stop", "length", "content_filter", "tool_calls", "function_call",
+            "end_turn", "max_tokens", "stop_sequence", "safety", "other",
+            "complete", "completed", "eos", "stop_reason", "recitation",
+            "malformed_function_call", "prohibited_content", "blocklist", "spii",
+        }
+        return cleaned if cleaned in allowed else ""
+
+    @staticmethod
+    def _safe_request_id(value: str, secret: str) -> str:
+        cleaned = sanitize_text(value, (secret,), limit=64)
+        return cleaned if re.fullmatch(r"[A-Za-z0-9._:/-]{1,64}", cleaned) else ""
+
+    @staticmethod
+    def _safe_quota_headers(headers: dict[str, str], secret: str) -> dict[str, str]:
+        """Persist only bounded, structured quota values; drop free-form data."""
+        safe: dict[str, str] = {}
+        for name, value in (headers or {}).items():
+            key = str(name).lower()
+            if not (
+                key.startswith("x-ratelimit-")
+                or key in {"retry-after", "x-ep-token-remaining", "x-request-id"}
+            ):
+                continue
+            cleaned = sanitize_text(value, (secret,), limit=100)
+            if key == "x-request-id":
+                if re.fullmatch(r"[A-Za-z0-9._:/-]{1,64}", cleaned):
+                    safe[key] = cleaned
+            elif re.fullmatch(
+                r"(?:\d+(?:\.\d+)?(?:\s*(?:ms|s|sec|secs|m|min|h|d))?"
+                r"(?:;\s*w=\d+)?|\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z?)",
+                cleaned,
+                flags=re.IGNORECASE,
+            ):
+                safe[key] = cleaned
+        return safe
 
     def _free_class(self, ctx: RequestContext) -> str:
         classification = classification_of(ctx.canonical)

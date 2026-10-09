@@ -46,7 +46,7 @@ canonical spellings. The canonical name always wins when both are set.
 | Job queue | `MAX_CONCURRENT_JOBS`, `MAX_PENDING_JOBS`, `PROGRESS_ANIMATION_ENABLED` |
 | STT | `STT_PRIMARY`, `STT_LANGUAGE`, `STT_FALLBACK_ENABLED`, `STT_MIN_CONFIDENCE`, `STT_MAX_ATTEMPTS`, `STT_RETRY_*`, `STT_JOB_TIMEOUT_SECONDS`, `STT_POLL_INTERVAL_SECONDS`, `SPEECHMATICS_*`, `DEEPGRAM_*`, `STT_OPENAI_*` |
 | Notes | `NOTE_API_PROVIDER`, `NOTE_API_KEY`, `NOTE_API_BASE_URL`, `NOTE_API_MODEL`, `NOTE_API_TIMEOUT_SECONDS`, `NOTE_API_RETRIES`, `NOTE_API_MAX_OUTPUT_TOKENS`, `NOTE_API_JSON_MODE`, `NOTE_API_EXTRA_HEADERS_JSON`, `NOTE_MODE`, `NOTE_REPAIR_ENABLED`, `NOTE_GLOBAL_CONTEXT_ENABLED` |
-| AI provider platform | `AI_FREE_ONLY` (default `true`), `AI_ALLOW_PAID_FALLBACK` (default `false`), `AI_ROUTING_ENABLED` (default `true`), `AI_PROVIDER_SYNC_TTL`, `AI_DEFAULT_NOTE_ROUTE`, `AI_MAX_PROVIDER_FAILOVERS`, `AI_MAX_GENERATION_RETRIES` (`-1` = auto), `AI_QUOTA_SAFETY_MARGIN`, `CLOUDFLARE_ACCOUNT_ID` — full reference in [docs/AI_PROVIDERS.md](AI_PROVIDERS.md) |
+| AI provider platform | `AI_FREE_ONLY` (default `true`), `AI_ALLOW_PAID_FALLBACK` (default `false`), `AI_ROUTING_ENABLED` (default `true`), `AI_PROVIDER_SYNC_TTL`, `AI_DEFAULT_NOTE_ROUTE`, `AI_MAX_PROVIDER_FAILOVERS`, `AI_MAX_GENERATION_RETRIES` (`-1` = auto), `AI_QUOTA_SAFETY_MARGIN`, `CLOUDFLARE_ACCOUNT_ID` — full reference in [AI_PROVIDERS.md](AI_PROVIDERS.md) |
 | Word document | `DOCX_FONT_PROFILE`, `DOCX_FONT_*`, `DOCX_COVER_ENABLED`, `DOCX_TOC_*`, `DOCX_TOC_PAGE_NUMBERS`, `DOCX_PAGE_BORDER_*`, `DOCX_SHOW_FOOTER_BRAND`, `DOCX_LOGO_PATH`, `DOCX_PAGINATION_*` |
 | PowerPoint | `PPTX_ENABLED`, `PPTX_LEGACY_ENABLED`, `PPTX_INCLUDE_*`, `PPTX_MIN_CLIP_SECONDS`, `PPTX_SILENCE_SECONDS`, `PPTX_MAX_*`, `MEDIA_TIMEOUT_SECONDS`, `PPT_CONVERT_TIMEOUT_SECONDS` |
 | Billing | `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME`, `FREE_PLAN_HOURS`, `PLAN_5_*`, `PLAN_10_*`, `PLAN_20_*`, `PLAN_25_*`, `PLAN_50_*`, `RECEIPT_DIR`, `RECEIPT_RETENTION_DAYS`, `MAX_PAYMENT_RECEIPT_BYTES`, `PROVIDER_CREDENTIALS_ENCRYPTION_KEY` |
@@ -55,6 +55,14 @@ canonical spellings. The canonical name always wins when both are set.
 Exact names, defaults and Persian explanations live in `.env.example`; the
 values above are the ones this page mentions by name so that a reader can find
 them quickly.
+
+Routing retains the existing `NOTE_API_*` contract. `NOTE_API_TIMEOUT_SECONDS`,
+`NOTE_API_RETRIES`, and `NOTE_API_MAX_OUTPUT_TOKENS` remain upper bounds on
+provider-specific request profiles; they can tighten but cannot increase those
+limits. The provider/key/base URL/model/extra-header settings continue to feed
+the current provider adapter. Provider billing attestations are per encrypted
+credential in SQLite (not environment variables); old environment keys stay
+configured but are not auto-attested for generation after migration 007.
 
 ## The static table of contents
 

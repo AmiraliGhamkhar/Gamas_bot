@@ -5,17 +5,18 @@ tiers, in preference order:
 
 1. **Live discovery** — the provider's official model listing, synced on demand
    and cached in the ``ai_models`` table (TTL: ``settings.ai_provider_sync_ttl``).
-2. **Static seeds** — conservative per-model metadata used only when discovery
-   is unavailable. Seeds are marked ``source="static_seed"`` and never claim a
+2. **Static seeds** — exact reviewed per-model capability/free facts fill gaps
+   that generic discovery cannot verify. Live non-unknown free evidence and
+   availability/deprecation facts remain current. Seeds do not claim a live
    verification date.
 3. **Conservative defaults** — when nothing is known a model is treated as
    text-only prompt-JSON, unknown-free, with no vendor parameters beyond the
    OpenAI core.
 
-"Free" is never inferred from a "$0" price page. A model earns a free status
-only from explicit per-model metadata: OpenRouter's documented ``:free`` suffix,
-a free-plan provider whose *plan* is account-level free, or a recorded
-permanent/promotional free entry with an expiry.
+"Free" is never inferred from a "$0" price page or provider-wide class. A model
+earns a free status only from explicit model-level evidence: OpenRouter's
+``:free`` convention, an intersection with an authoritative plan model list
+(Nara), or a reviewed per-model permanent/promotional entitlement.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ import time
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
-from .registry import ProviderClass, registry_info
+
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +114,11 @@ class ModelInfo:
         """Whether the model is usable *today* under a free plan."""
         if self.free_status not in {FREE_PERMANENT, FREE_PLAN, FREE_PROMOTIONAL}:
             return False
-        if self.free_status == FREE_PROMOTIONAL and self.free_until:
+        if self.free_status == FREE_PROMOTIONAL:
+            # A promotion with no authoritative expiry is not an evergreen
+            # entitlement. Unknown validity must fail closed in FREE_ONLY.
+            if not self.free_until:
+                return False
             reference = at or datetime.now(timezone.utc)
             try:
                 until = datetime.fromisoformat(str(self.free_until).replace("Z", "+00:00"))
@@ -139,7 +144,7 @@ class ModelInfo:
 
 
 # ---------------------------------------------------------------------------
-# Static seeds — conservative; live discovery supersedes them.
+# Static seeds — exact reviewed facts fill fields generic live catalogs omit.
 # ---------------------------------------------------------------------------
 
 
@@ -197,7 +202,9 @@ STATIC_SEEDS: dict[str, list[ModelInfo]] = {
             ),
             display_name="GPT OSS 120B",
             context_window=131_072, max_output_tokens=32_768,
-            free_status=FREE_PLAN,
+            # Groq's verified rate-limit table is for Developer plan, not an
+            # explicitly no-charge production entitlement.
+            free_status=FREE_UNKNOWN,
         ),
         _seed(
             "groq", "openai/gpt-oss-20b",
@@ -208,12 +215,11 @@ STATIC_SEEDS: dict[str, list[ModelInfo]] = {
             ),
             display_name="GPT OSS 20B",
             context_window=131_072, max_output_tokens=32_768,
-            free_status=FREE_PLAN,
+            free_status=FREE_UNKNOWN,
         ),
-        # Free tier 30 RPM / 1K RPD / 8K TPM (verified 2026-10-09). Groq's model
-        # doc recommends reasoning_effort="none" (instruct mode) for efficient
-        # general-purpose work — note structuring is exactly that, and thinking
-        # would burn the 8K TPM free budget.
+        # The exact Qwen ID is documented by Groq for structured outputs and
+        # recommends reasoning_effort="none" for efficient instruction mode.
+        # This is capability evidence only, not evidence of free-plan eligibility.
         _seed(
             "groq", "qwen/qwen3.8-27b",
             ModelCapabilities(
@@ -225,7 +231,7 @@ STATIC_SEEDS: dict[str, list[ModelInfo]] = {
             ),
             display_name="Qwen 3.8 27B",
             context_window=131_072, max_output_tokens=16_384,
-            free_status=FREE_PLAN,
+            free_status=FREE_UNKNOWN,
         ),
     ],
     "openrouter": [
@@ -239,46 +245,50 @@ STATIC_SEEDS: dict[str, list[ModelInfo]] = {
     "mistral": [
         _seed(
             "mistral", "mistral-small-latest",
-            ModelCapabilities(supports_json_object=True, supports_json_schema=True),
+            # JSON-object mode is documented for this chat API/model family;
+            # schema mode remains disabled until this exact model is verified.
+            ModelCapabilities(supports_json_object=True),
             display_name="Mistral Small",
             context_window=131_072, max_output_tokens=8_192,
-            free_status=FREE_PLAN,
+            # Free mode exists, but docs do not establish per-model free
+            # entitlement or overage behavior for this exact ID.
+            free_status=FREE_UNKNOWN,
         ),
     ],
     "sambanova": [
         _seed(
             "sambanova", "Meta-Llama-3.3-70B-Instruct",
-            ModelCapabilities(supports_json_object=True),
+            ModelCapabilities(),
             display_name="Llama 3.3 70B Instruct",
-            context_window=131_072, max_output_tokens=8_192,
             free_status=FREE_PLAN,
         ),
     ],
     "zai": [
-        # Both models are listed as permanently Free on the Z.AI pricing page
-        # (verified 2026-10-09); live discovery supersedes this seed.
+        # The official pricing table lists both model IDs as Free (verified
+        # 2026-10-09); retain them as reviewed FREE_PLAN entries, not a claim
+        # that every account has access or cannot incur overage.
         _seed(
             "zai", "glm-4.5-flash",
             ModelCapabilities(supports_json_object=True, supports_reasoning=True),
             display_name="GLM 4.5 Flash",
             context_window=131_072, max_output_tokens=16_384,
-            free_status=FREE_PERMANENT,
+            free_status=FREE_PLAN,
         ),
         _seed(
             "zai", "glm-4.7-flash",
             ModelCapabilities(supports_json_object=True, supports_reasoning=True),
             display_name="GLM 4.7 Flash",
-            free_status=FREE_PERMANENT,
+            free_status=FREE_PLAN,
         ),
     ],
     "nvidia": [],  # catalog + "Free Endpoint" availability are live facts
     "cloudflare": [
         _seed(
             "cloudflare", "@cf/meta/llama-3.1-8b-instruct",
-            ModelCapabilities(supports_json_object=True),
+            ModelCapabilities(),
             display_name="Llama 3.1 8B Instruct",
-            context_window=131_072, max_output_tokens=8_192,
-            free_status=FREE_PLAN,
+            # Model Search does not provide a documented per-model free status.
+            free_status=FREE_UNKNOWN,
         ),
     ],
     "huggingface": [],
@@ -358,47 +368,70 @@ def infer_openrouter_free(model_id: str) -> bool:
 
 
 def infer_capabilities(provider: str, model_id: str) -> ModelCapabilities:
-    """Provider-consistent capability inference for a *live-discovered* model.
+    """Conservative per-model capabilities for a *live-discovered* model.
 
-    Conservative by design: only features that are safe to send without the
-    provider rejecting the request are enabled. A static seed for the same
-    model id always wins (it was reviewed), then family-name heuristics.
+    Exact static seeds win. Heuristics below are intentionally narrow and are
+    backed by provider model tables; an unknown model gets only the OpenAI core
+    request and prompt-enforced JSON.
     """
     for seed in STATIC_SEEDS.get(provider, []):
         if seed.model_id == model_id:
             return seed.capabilities
-    lowered = model_id.lower()
-    caps = ModelCapabilities()
+    lowered = model_id.strip().lower()
     if provider == "gemini":
-        return ModelCapabilities(
-            supports_json_object=True, supports_json_schema=True,
-            supports_strict_json_schema=True, supports_image=True,
-            supports_audio=True, supports_pdf=True, supports_tools=True,
-            supports_reasoning="thinking" in lowered or "2.5" in lowered or "3" in lowered,
-        )
+        # The currently verified 2.5 models are explicit seeds. New/future IDs
+        # stay conservative until their own generateContent docs are reviewed.
+        return ModelCapabilities()
     if provider == "openrouter":
-        return ModelCapabilities(supports_json_object=False)
+        # Capability support is model-specific; the marketplace catalog does
+        # not prove JSON/schema support for every upstream model.
+        return ModelCapabilities()
     if provider == "groq":
-        # Groq strict structured outputs (verified 2026-10-09): the GPT-OSS
-        # family and qwen/qwen3.8-27b. Other models get JSON object mode only.
-        oss = "gpt-oss" in lowered or lowered.startswith("openai/") or "qwen3" in lowered
+        strict_models = {
+            "openai/gpt-oss-20b",
+            "openai/gpt-oss-120b",
+            "qwen/qwen3.8-27b",
+        }
+        strict = lowered in strict_models
         return ModelCapabilities(
             supports_json_object=True,
-            supports_json_schema=oss,
-            supports_strict_json_schema=oss,
-            supports_reasoning_effort=oss,
-            supports_image="qwen3" in lowered,
-            recommended_reasoning_effort="none" if "qwen3" in lowered else "",
+            supports_json_schema=strict,
+            supports_strict_json_schema=strict,
+            supports_reasoning_effort=strict,
+            supports_image=lowered == "qwen/qwen3.8-27b",
+            recommended_reasoning_effort="none" if lowered == "qwen/qwen3.8-27b" else "",
         )
-    if provider in {"zai", "cerebras"}:
-        return ModelCapabilities(supports_json_object=True, supports_reasoning="thinking" in lowered)
+    if provider == "zai":
+        # Z.AI's structured-output guide documents JSON-object mode for named
+        # GLM families; JSON Schema is not implied for every GLM model.
+        family_has_json = any(
+            token in lowered for token in ("glm-4.5", "glm-4.6", "glm-4.7")
+        )
+        return ModelCapabilities(
+            supports_json_object=family_has_json,
+            supports_reasoning="thinking" in lowered or "glm-4.5" in lowered
+            or "glm-4.6" in lowered or "glm-4.7" in lowered,
+        )
+    if provider == "cerebras":
+        strict_models = {
+            "gpt-oss-120b",
+            "qwen-3.8-27b",
+            "kimi-k2.7-code",
+        }
+        strict = lowered in strict_models
+        return ModelCapabilities(
+            supports_json_object=strict,
+            supports_json_schema=strict,
+            supports_strict_json_schema=strict,
+            supports_tools=strict,
+            supports_reasoning="gpt-oss" in lowered or "qwen" in lowered,
+        )
     if provider == "mistral":
-        return ModelCapabilities(supports_json_object=True, supports_json_schema=True)
-    if provider in {"sambanova", "cloudflare", "alibaba", "huggingface", "nvidia"}:
-        return ModelCapabilities(supports_json_object=False)
-    if provider == "cohere":
-        return ModelCapabilities(supports_json_object=True)
-    return caps
+        # Model-specific JSON support is populated only by reviewed seeds.
+        return ModelCapabilities()
+    if provider in {"sambanova", "cloudflare", "alibaba", "huggingface", "nvidia", "cohere"}:
+        return ModelCapabilities()
+    return ModelCapabilities()
 
 
 def infer_free_status(provider: str, model_id: str) -> str:
@@ -408,13 +441,9 @@ def infer_free_status(provider: str, model_id: str) -> str:
             return seed.free_status
     if provider == "openrouter":
         return FREE_PLAN if infer_openrouter_free(model_id) or model_id == "openrouter/free" else PAID
-    info = registry_info(provider)
-    # A genuinely free provider plan makes every model it lists free-plan
-    # capacity; trial/promotional providers require per-model facts.
-    if info.classification is ProviderClass.FREE_PLAN:
-        return FREE_PLAN
-    if info.classification is ProviderClass.PERMANENT_FREE:
-        return FREE_PLAN
+    # Provider-wide plan classification does not prove that this specific
+    # model is included. Explicit static provider-plan model lists above and
+    # live plan-aware adapters (Nara) are the only non-OpenRouter sources.
     return FREE_UNKNOWN
 
 
@@ -430,7 +459,6 @@ def parse_discovery(provider: str, payload) -> list[ModelInfo]:
             methods = entry.get("supportedGenerationMethods") or []
             if "generateContent" not in methods:
                 continue
-            thinking = "2.5" in name or "3" in name
             caps = infer_capabilities("gemini", name)
             results.append(
                 ModelInfo(
@@ -439,10 +467,7 @@ def parse_discovery(provider: str, payload) -> list[ModelInfo]:
                     display_name=str(entry.get("displayName") or name),
                     context_window=int(entry.get("inputTokenLimit") or 0),
                     max_output_tokens=int(entry.get("outputTokenLimit") or 0),
-                    capabilities=replace(
-                        caps,
-                        supports_reasoning=caps.supports_reasoning or thinking,
-                    ),
+                    capabilities=caps,
                     free_status=infer_free_status("gemini", name),
                     source="live:/v1beta/models",
                     source_last_verified_at=now,
@@ -487,7 +512,7 @@ class ModelRegistry:
         return static_models(provider)
 
     async def resolve(self, provider: str, model_id: str) -> ModelInfo:
-        """Best-known metadata for one model (DB → static seed → conservative)."""
+        """Best-known metadata for a model (live, reviewed-seed overlay, defaults)."""
         row = await self.db.ai_model_get(provider, model_id)
         if row:
             return self._row_to_info(row)
@@ -523,15 +548,48 @@ class ModelRegistry:
         """
         if not discovered:
             return {"synced": 0, "deactivated": 0}
+        reviewed = [self._apply_reviewed_seed(info) for info in discovered]
         stats = await self.db.ai_models_upsert_discovery(
             provider,
-            [self._info_to_row(info) for info in discovered],
+            [self._info_to_row(info) for info in reviewed],
         )
         return stats
 
     @staticmethod
+    def _apply_reviewed_seed(info: ModelInfo) -> ModelInfo:
+        """Keep exact reviewed facts when a live catalog omits those fields.
+
+        Live non-unknown free-status evidence may supersede a seed (for
+        example, an exact paid/free variant); `unknown` may not erase a reviewed
+        status. Capabilities remain the exact model-reviewed contract because
+        generic catalogs generally do not describe request-feature support.
+        """
+        seed = next(
+            (item for item in STATIC_SEEDS.get(info.provider, ()) if item.model_id == info.model_id),
+            None,
+        )
+        if seed is None:
+            return info
+        free_status = info.free_status
+        free_until = info.free_until
+        if free_status == FREE_UNKNOWN and seed.free_status != FREE_UNKNOWN:
+            free_status = seed.free_status
+            free_until = seed.free_until
+        return replace(
+            info,
+            display_name=info.display_name or seed.display_name,
+            context_window=info.context_window or seed.context_window,
+            max_output_tokens=info.max_output_tokens or seed.max_output_tokens,
+            capabilities=seed.capabilities,
+            free_status=free_status,
+            free_until=free_until,
+            commercial_use_allowed=info.commercial_use_allowed and seed.commercial_use_allowed,
+            region_restriction=info.region_restriction or seed.region_restriction,
+        )
+
+    @staticmethod
     def _row_to_info(row: dict) -> ModelInfo:
-        return ModelInfo(
+        info = ModelInfo(
             provider=str(row["provider"]),
             model_id=str(row["model"]),
             display_name=str(row.get("display_name") or ""),
@@ -549,6 +607,7 @@ class ModelRegistry:
             source_last_verified_at=row.get("source_last_verified_at"),
             quality_score=row.get("quality_score"),
         )
+        return ModelRegistry._apply_reviewed_seed(info)
 
     @staticmethod
     def _info_to_row(info: ModelInfo) -> dict:

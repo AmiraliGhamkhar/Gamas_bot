@@ -22,7 +22,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Iterable
 
 logger = logging.getLogger("gamas_bot.ai")
@@ -43,6 +43,7 @@ EVENTS = (
     "note_compile_accepted",
     "note_compile_rejected",
     "provider_quota_warning",
+    "provider_quota_blocked",
     "provider_rate_limited",
     "provider_billing_blocked",
     "provider_model_unavailable",
@@ -221,13 +222,35 @@ class AIUsageTracker:
 
     # -- panels -----------------------------------------------------------------
 
+    async def today_token_count(self, provider: str) -> int:
+        if not self.enabled:
+            return 2**63 - 1
+        try:
+            return await self.db.ai_usage_today_token_count(provider)
+        except Exception:
+            return 2**63 - 1
+
+    async def window_stats(self, provider: str, *, seconds: int) -> dict[str, int]:
+        if not self.enabled:
+            return {"requests": 2**31 - 1, "tokens": 2**63 - 1}
+        since = (datetime.now(timezone.utc) - timedelta(seconds=max(1, int(seconds))))
+        try:
+            return await self.db.ai_usage_window_stats(provider, since.isoformat())
+        except Exception:
+            # Failure to read a quota ledger must not create a permit to spend
+            # on providers with explicit local caps.
+            return {"requests": 2**31 - 1, "tokens": 2**63 - 1}
+
     async def today_request_count(self, provider: str) -> int:
         if not self.enabled:
-            return 0
+            return 2**31 - 1
         try:
+            canonical_count = getattr(self.db, "ai_usage_today_canonical_count", None)
+            if callable(canonical_count):
+                return await canonical_count(provider)
             return await self.db.ai_usage_today_count(provider)
         except Exception:
-            return 0
+            return 2**31 - 1
 
 
 class NullTracker(AIUsageTracker):

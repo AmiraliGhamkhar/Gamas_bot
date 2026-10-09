@@ -115,6 +115,22 @@ class NaraRouterContractTests(unittest.TestCase):
         self.assertEqual(request[1], "https://router.bynara.id/v1/models")
         self.assertEqual(request[2]["Authorization"], "Bearer sk-x")
 
+    def test_public_plan_is_the_only_free_model_evidence(self):
+        plans = {
+            "data": [
+                {"code": "free", "is_active": True, "models": ["agnes-2.5-flash"]},
+                {"code": "freemium", "is_active": True,
+                 "models": ["agnes-2.5-flash", "agnes-3-flash"]},
+            ]
+        }
+        statuses = self.adapter.plan_model_statuses(plans)
+        self.assertEqual(statuses["agnes-2.5-flash"], models.FREE_PLAN)
+        self.assertEqual(statuses["agnes-3-flash"], models.PAID)
+        account_models = {"data": [{"id": "agnes-2.5-flash"}, {"id": "agnes-3-flash"}]}
+        discovered = self.adapter.parse_discovery(account_models, plan_model_statuses=statuses)
+        self.assertEqual([model.free_status for model in discovered], [models.FREE_PLAN, models.PAID])
+        self.assertEqual(self.adapter.plan_model_statuses({"data": []}), None)
+
     def test_secret_never_in_request_repr(self):
         request = self.adapter.build(make_ctx("nara", "agnes-3-flash"), "sk-nara-secret-1234")
         self.assertNotIn("sk-nara-secret-1234", repr(request))
@@ -169,6 +185,12 @@ class GroqContractTests(unittest.TestCase):
         request = self.adapter.build(ctx, "k")
         self.assertFalse(request.json_body.get("stream"))
 
+    def test_guard_model_stays_json_object_only_without_exact_schema_evidence(self):
+        caps = models.infer_capabilities("groq", "openai/gpt-oss-safeguard-20b")
+        self.assertTrue(caps.supports_json_object)
+        self.assertFalse(caps.supports_json_schema)
+        self.assertFalse(caps.supports_strict_json_schema)
+
     def test_qwen38_seed_uses_strict_schema_and_recommended_effort(self):
         # Verified against console.groq.com/docs (2026-10-09): qwen/qwen3.8-27b
         # supports strict structured outputs and documents instruct mode
@@ -184,12 +206,12 @@ class GroqContractTests(unittest.TestCase):
         # model_default policy picks up the documented recommendation.
         self.assertEqual(request.json_body.get("reasoning_effort"), "none")
 
-    def test_zai_permanent_free_seeds(self):
-        # docs.z.ai pricing (verified 2026-10-09): GLM-4.5-Flash and
-        # GLM-4.7-Flash are listed as permanently Free.
+    def test_zai_free_plan_seeds_require_key_attestation(self):
+        # docs.z.ai pricing (verified 2026-10-09) lists both as Free; account
+        # access and no-overage billing still require the credential attestation.
         ids = {m.model_id: m.free_status for m in models.STATIC_SEEDS["zai"]}
-        self.assertEqual(ids.get("glm-4.5-flash"), models.FREE_PERMANENT)
-        self.assertEqual(ids.get("glm-4.7-flash"), models.FREE_PERMANENT)
+        self.assertEqual(ids.get("glm-4.5-flash"), models.FREE_PLAN)
+        self.assertEqual(ids.get("glm-4.7-flash"), models.FREE_PLAN)
 
     def test_rate_limit_headers_captured_allowlist(self):
         captured = quota_headers(
@@ -264,6 +286,22 @@ class OpenRouterContractTests(unittest.TestCase):
 class GeminiContractTests(unittest.TestCase):
     def setUp(self):
         self.adapter = adapter_for("gemini", make_settings())
+
+    def test_discovery_does_not_infer_reasoning_from_model_name(self):
+        found = models.parse_discovery(
+            "gemini",
+            {
+                "models": [
+                    {
+                        "name": "models/gemini-3-flash-preview",
+                        "supportedGenerationMethods": ["generateContent"],
+                    }
+                ]
+            },
+        )
+        self.assertEqual(len(found), 1)
+        self.assertFalse(found[0].capabilities.supports_reasoning)
+        self.assertFalse(found[0].capabilities.supports_json_schema)
 
     def test_native_generate_content_shape(self):
         seed = models.STATIC_SEEDS["gemini"][0]
@@ -440,6 +478,26 @@ class CloudflareContractTests(unittest.TestCase):
         with self.assertRaises(StructuringError):
             adapter.build(ctx, "cf-token")
 
+    def test_model_search_is_account_scoped_paginated_and_conservative(self):
+        settings = make_settings(cloudflare_account_id="acc-123")
+        adapter = adapter_for("cloudflare", settings)
+        base = adapter.default_base_url()
+        method, url, headers = adapter.discovery_request(base, "cf-token", page=2)
+        self.assertEqual(method, "GET")
+        self.assertIn("/client/v4/accounts/acc-123/ai/models/search", url)
+        self.assertIn("page=2", url)
+        self.assertIn("format=openrouter", url)
+        self.assertEqual(headers["Authorization"], "Bearer cf-token")
+        payload = {
+            "success": True,
+            "result": {"data": [{"id": "@cf/verified-id", "pricing": {"neuron": 0},
+                                  "architecture": {"input_modalities": ["text", "image"]}}]},
+        }
+        discovered = adapter.parse_discovery(payload)
+        self.assertEqual([item.model_id for item in discovered], ["@cf/verified-id"])
+        self.assertEqual(discovered[0].free_status, models.FREE_UNKNOWN)
+        self.assertFalse(discovered[0].capabilities.supports_image)
+
     def test_requires_paid_billing_models_blocked_in_free_only(self):
         info = ModelInfo(
             provider="cloudflare",
@@ -475,9 +533,9 @@ class CohereCerebrasContractTests(unittest.TestCase):
 
 
 class ZaiFreeTypeTests(unittest.TestCase):
-    def test_permanent_free_seed(self):
+    def test_free_plan_seed(self):
         seed = models.STATIC_SEEDS["zai"][0]
-        self.assertEqual(seed.free_status, models.FREE_PERMANENT)
+        self.assertEqual(seed.free_status, models.FREE_PLAN)
         self.assertTrue(seed.free_now())
 
     def test_promotional_free_expiry_respected(self):

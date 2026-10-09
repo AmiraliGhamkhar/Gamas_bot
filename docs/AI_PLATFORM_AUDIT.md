@@ -89,7 +89,7 @@ Additives only; the pieces above stay in place unless listed here.
 * `gamas_bot/ai/` — the provider platform package:
   * `registry.py` — provider registry: classification (`permanent_free`,
     `free_plan`, `promotional_free`, `trial_only`, `paid_only`,
-    `unavailable`, `region_restricted`), protocol, base URL, auth style,
+    `unavailable`, `region_restricted`, `account_unverified`), protocol, base URL, auth style,
     docs/pricing URLs, free-tier policy, data-use policy; URL→provider
     resolution so a legacy `NOTE_API_BASE_URL=https://router.bynara.id/v1`
     deployment is classified as NaraRouter without any config change.
@@ -110,7 +110,11 @@ Additives only; the pieces above stay in place unless listed here.
   * `routing.py` — task-aware routing + provider-level failover on top of
     the existing credential-level rotation; free-only safety; route order
     stored in SQLite (admin-editable), seeded from environment for backward
-    compatibility.
+    compatibility. Current Z.AI pricing lists selected GLM models as Free, but
+    Terms §III.06 restrict specified education-related decision-making and
+    services requiring educational qualifications or professional review. The
+    wording is not a blanket ban on all educational use; Gamas conservatively
+    blocks student-note routes pending scope clarification.
   * `tokens.py` — provider-aware token budget estimation (character预算
     fallback kept) and automatic chunk shrinking.
   * `usage.py` — per-request usage ledger, daily aggregates, quota
@@ -120,10 +124,13 @@ Additives only; the pieces above stay in place unless listed here.
   `ai_models`, `ai_provider_routes`, `ai_provider_settings`,
   `ai_usage_records`, `ai_usage_daily`, `ai_quota_snapshots`, `ai_events` +
   non-destructive `provider_credentials` column additions.
+* `migrations/007_provider_billing_attestations.sql` — additive billing
+  attestation owner/timestamp columns and fail-closed reset of all existing
+  credentials to `unknown`.
 * `gamas_bot/bot.py` — upgraded admin panel: provider/model/routing/usage
   panels, step-by-step key-add wizard, key actions (replace secret, edit
-  metadata, free-only/paid flags, delete-with-confirmation), dry-run request
-  view, generation-test vs read-only distinction.
+  metadata, explicit free-no-overage/paid billing attestations, delete with
+  confirmation), dry-run request view, generation-test vs read-only distinction.
 * `scripts/benchmark_notes.py` — provider-profile benchmarking keeping the
   deterministic CI gate untouched.
 * Configuration: `AI_FREE_ONLY` (default true), `AI_ALLOW_PAID_FALLBACK`
@@ -139,8 +146,11 @@ Additives only; the pieces above stay in place unless listed here.
 * An existing NaraRouter deployment
   (`NOTE_API_PROVIDER=openai_compatible`,
   `NOTE_API_BASE_URL=https://router.bynara.id/v1`,
-  `NOTE_API_MODEL=agnes-3-flash`) resolves to the NaraRouter adapter and the
-  Nara credential pool with **no configuration change**.
+  `NOTE_API_MODEL=agnes-3-flash`) keeps those settings unchanged and resolves to
+  the NaraRouter adapter. After migration 007, an environment key is not
+  auto-attested for generation; the same secret must be stored encrypted and
+  explicitly attested. `agnes-3-flash` is not claimed free because it is absent
+  from the currently published Nara Free-plan list.
 * `NOTE_API_JSON_MODE` keeps working as the generic fallback json-object
   switch; capability-aware strategies take precedence only for providers whose
   models advertise the feature.
