@@ -30,6 +30,14 @@ total unpacked size, and a path check that rejects absolute paths and `..`
 components. No macro is ever executed; the macro-enabled content types are
 opened only to read slide structure.
 
+**AI provider accounting is metadata-only.** `ai_usage_records`,
+`ai_usage_daily`, `ai_quota_snapshots` and `ai_events` store provider, model,
+status, latency, token/unit estimates, quota headers from a strict allowlist and
+an error class — never a prompt, a transcript, a model answer, a response body
+or a key. Estimated Cloudflare Neuron spend is a number derived from token
+counts, not provider content. The Telegram logs panel exposes the same fields
+and no others.
+
 **Credentials.** Provider keys stored in the database are Fernet ciphertext
 under `PROVIDER_CREDENTIALS_ENCRYPTION_KEY`, which is environment-only. The
 admin panels show a masked tail and never the value. A key message in Telegram

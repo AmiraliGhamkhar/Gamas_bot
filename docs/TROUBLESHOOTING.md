@@ -51,6 +51,33 @@ a bug worth reporting with the submission id.
 The worker is a child process that uses PyAV; a broken `av` wheel is reported
 there rather than surfacing later as a mysterious media error.
 
+## The notes provider says "no suitable response"
+
+Everything failed, or nothing was eligible. Open **AI → 📈 نمای مسیر و بودجه**:
+every provider that was skipped is listed with the reason.
+
+| Reason | Meaning | What to do |
+| --- | --- | --- |
+| `account_entitlement_unverified` | The provider publishes no free tier, so Gamas will not assert one (Groq today) | Attest the account under **AI → provider → 🧾 تأیید استحقاق حساب** if you have verified the account is no-charge, or remove it from the route |
+| `model free eligibility unknown (FREE_ONLY)` | The model's free status is not documented | Sync the catalog; if the account really includes it, attest the key `free`. Gamas will not spend quota to find out |
+| `not_free_eligible` / `billing_blocked` | The provider is paid-only or trial-only | Remove it from the free route, or enable paid fallback deliberately |
+| `terms_of_use_blocked` | Provider terms prohibit this use (Z.AI today) | Do not route; the price or a key attestation does not override terms |
+| `quota_exhausted` | The local daily ledger says the free budget is spent | Wait for the UTC reset, or add another free provider to the route |
+| `no eligible credential` | No key is attested for this billing lane | Attest the key `free` (or `paid` on a paid leg) under **AI → provider → کلیدها** |
+
+Run `python -m scripts.validate_provider_platform` to confirm the routing,
+failover and secret-hygiene behaviour offline before changing production
+configuration.
+
+## Cloudflare fails immediately even though it is enabled
+
+Check the estimated Neuron figure under **AI → provider → Cloudflare**. Workers
+AI meters Neurons, not tokens, and does not return a neuron count, so Gamas
+guards the daily inclusion from a pessimistic estimate. If the estimate has
+reached the configured budget, `AI_FREE_ONLY` stops routing there and uses the
+next free provider. Lower `neuron_budget_daily` only if you have measured your
+account's real allocation.
+
 ## Where to look first
 
 | Symptom | Start here |

@@ -133,6 +133,50 @@ compared member-by-member by SHA-256 before and after):
 
 ### Added
 
+* **Account-entitlement attestation.** Providers that publish rate limits but no
+  documented no-charge entitlement (Groq) are now explicit, opt-in states
+  instead of being silently treated as free: they stay out of `AI_FREE_ONLY`
+  routes until an administrator attests the deployment's account under
+  **AI → provider → 🧾 تأیید استحقاق حساب**. The attestation is audited,
+  revocable, and never relaxes the per-key billing attestation, terms,
+  deprecation or quota gates.
+* **Per-provider extra-pass overrides.** The outline, QA-repair and
+  final-compilation calls each spend free-tier quota; they can now be turned on
+  or off per provider from the admin panel, with the origin (profile vs admin)
+  shown and reported through `PlannedRoute.pass_state()`.
+* **Non-token metering for Cloudflare Workers AI.** Neurons are estimated
+  locally (pessimistically, never under-counted) and guarded against the
+  documented daily inclusion; the running estimate is visible in the admin
+  panel, and models that cannot run on the free allocation can be flagged
+  `requires_paid_billing` so `FREE_ONLY` rejects them up front.
+* **NVIDIA endpoint lifecycle.** Discovery records `free_endpoint` per model,
+  withdrawn models are marked unavailable rather than deleted, and the Models
+  panel suggests a live replacement for any deprecated or withdrawn model.
+* **🩺 سلامت and ⚙️ تنظیمات AI panels**, plus status-class, error-class, job-id
+  and date filters on the logs panel. The health panel is read-only by
+  construction; only the explicit test action sends a billable request.
+* `scripts/validate_provider_platform.py` — offline end-to-end validation of the
+  platform (legacy NaraRouter compatibility, provider-aware chunk budgets,
+  provider-level failover on 429, FREE_ONLY and paid-fallback gates,
+  backend-metadata scrubbing, secret hygiene). No API key required.
+* `tests/test_provider_platform_gaps.py` — coverage for account entitlement,
+  extra-pass overrides, Neuron metering, NVIDIA endpoint lifecycle, log filters
+  and the new admin panels.
+* `migrations/008_provider_entitlement_and_pass_policy.sql` — forward-only
+  schema additions for all of the above.
+
+### Fixed
+
+* **`NoteJobSession` now exposes the extra-pass policy.** `structuring._pass_allowed`
+  reads `job.outline_enabled` / `repair_enabled` / `compile_enabled`, but the
+  session never defined them, so the repair and final-compilation gates raised
+  `AttributeError` on any routed run that reached them. The session now proxies
+  the planned route, so an administrator override reaches every call site.
+* **Provider settings columns added by migration 008 were silently dropped.**
+  `ai_provider_settings_upsert` filtered against a fixed allowlist, so the new
+  entitlement, extra-pass, Neuron-budget and region fields could not be stored.
+  The allowlist now covers them.
+
 * `tests/test_config_consistency.py` — configuration/documentation/implementation
   drift detection.
 * `tests/test_dependency_consistency.py` — `pyproject.toml` ↔ `requirements.txt`

@@ -115,8 +115,7 @@ Additives only; the pieces above stay in place unless listed here.
     services requiring educational qualifications or professional review. The
     wording is not a blanket ban on all educational use; Gamas conservatively
     blocks student-note routes pending scope clarification.
-  * `tokens.py` — provider-aware token budget estimation (character预算
-    fallback kept) and automatic chunk shrinking.
+  * `tokens.py` — provider-aware token budget estimation (the character fallback is kept) and automatic chunk shrinking.
   * `usage.py` — per-request usage ledger, daily aggregates, quota
     snapshots, structured lifecycle events (`note_request_started`, …) with
     mandatory metadata fields and a secrets sanitizer.

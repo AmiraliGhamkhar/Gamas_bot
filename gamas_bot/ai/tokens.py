@@ -70,3 +70,30 @@ def chunk_char_budget(
 def fits_budget(system_prompt: str, user_text: str, token_budget: int, *, safety_margin: float = 0.15) -> bool:
     usable = token_budget * (1.0 - min(max(float(safety_margin), 0.0), 0.5))
     return estimate_tokens(system_prompt) + estimate_tokens(user_text) <= usable
+
+
+def estimate_metered_units(
+    *,
+    metering_unit: str,
+    units_per_1k_tokens: float,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> int | None:
+    """Estimated provider units consumed by one request (spec §17).
+
+    Providers that do not meter in tokens (Cloudflare Workers AI bills
+    "Neurons") also do not return that unit in their API response, so the
+    daily free inclusion can only be protected from an *estimate*. Gamas keeps
+    the estimate deliberately pessimistic: over-counting makes it fail over to
+    the next free provider early, under-counting would silently let a job walk
+    past the allocation and onto a billable plan.
+
+    Returns ``None`` for token-metered providers, where the token ledger itself
+    is authoritative and no conversion is needed.
+    """
+    if not metering_unit or units_per_1k_tokens <= 0:
+        return None
+    tokens = max(0, int(input_tokens or 0)) + max(0, int(output_tokens or 0))
+    if tokens <= 0:
+        return 0
+    return max(1, math.ceil(tokens / 1000.0 * float(units_per_1k_tokens)))

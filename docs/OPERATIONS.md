@@ -70,6 +70,22 @@ be presented as a health check.
   and redacted error classes only. Prompts, transcripts, raw outputs, provider
   response bodies, and secrets are not logged or placed in student notes.
   See [SECURITY.md](SECURITY.md) and [AI_PROVIDERS.md](AI_PROVIDERS.md).
+* Providers whose free entitlement is a property of the account rather than of
+  published documentation (Groq today) stay out of `AI_FREE_ONLY` routes until an
+  administrator attests them under **AI → provider → 🧾 تأیید استحقاق حساب**.
+  The attestation is per deployment, audited and revocable, and it never
+  replaces the per-key billing attestation.
+* Cloudflare Workers AI is metered in Neurons, which the API does not return.
+  Gamas estimates spend pessimistically and stops before the configured daily
+  budget; the estimate is visible under **AI → provider**. Adjust
+  `neuron_budget_daily` only against a measured allocation.
+* Extra pipeline passes (outline, QA repair, final compilation) each spend
+  free-tier quota. Restrictive free providers default them off; override per
+  provider under **AI → provider → ✅/❌ طرح‌کلی / تعمیر / تلفیق** when the extra
+  quality is worth the quota.
+* Offline end-to-end platform validation (no API key required):
+  `.venv/bin/python -m scripts.validate_provider_platform`. Run it after any
+  change to the registry, profiles, routing or migrations.
 * Offline route and profile report (no API calls):
   `.venv/bin/python -m scripts.benchmark_notes --router`.
   Deterministic note/DOCX benchmark (offline):
