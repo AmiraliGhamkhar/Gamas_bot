@@ -581,6 +581,107 @@ class CohereCerebrasContractTests(unittest.TestCase):
         self.assertTrue(info.generation_allowed_in_free_only)
 
 
+class MistralContractTests(unittest.TestCase):
+    """Mistral: OpenAI-compatible chat completions endpoint and parsing."""
+
+    def setUp(self):
+        self.adapter = adapter_for("mistral", make_settings())
+
+    def test_mistral_build_url_and_auth(self):
+        ctx = make_ctx("mistral", "mistral-small-latest")
+        request = self.adapter.build(ctx, "mis-secret-key")
+        self.assertEqual(request.url, "https://api.mistral.ai/v1/chat/completions")
+        self.assertEqual(request.headers["Authorization"], "Bearer mis-secret-key")
+        self.assertEqual(request.json_body["model"], "mistral-small-latest")
+
+    def test_mistral_parse_success(self):
+        raw = {
+            "id": "chatcmpl-mistral-123",
+            "choices": [
+                {
+                    "message": {"role": "assistant", "content": '{"title":"T","sections":[]}'},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 20, "total_tokens": 70},
+        }
+        resp = self.adapter.parse(raw, http_status=200, headers={}, latency_ms=100)
+        self.assertEqual(resp.text, '{"title":"T","sections":[]}')
+        self.assertEqual(resp.finish_reason, "stop")
+        self.assertEqual(resp.usage.input_tokens, 50)
+        self.assertEqual(resp.usage.output_tokens, 20)
+        self.assertEqual(resp.request_id, "chatcmpl-mistral-123")
+
+    def test_mistral_error_mapping(self):
+        fail_401 = self.adapter.map_error(
+            401, b'{"message":"Unauthorized"}', {}, model="mistral-small-latest", key="mis-key"
+        )
+        self.assertEqual(fail_401.category, FAIL_AUTH)
+        self.assertTrue(fail_401.credential_invalid)
+
+        fail_429 = self.adapter.map_error(
+            429, b'{"message":"Rate limit exceeded"}', {"Retry-After": "12"},
+            model="mistral-small-latest", key="mis-key"
+        )
+        self.assertEqual(fail_429.category, FAIL_RATE_LIMITED)
+        self.assertTrue(fail_429.retryable)
+        self.assertEqual(fail_429.retry_after, 12.0)
+
+
+class NvidiaContractTests(unittest.TestCase):
+    """NVIDIA NIM: Integrate catalog, Bearer auth, OpenAI format."""
+
+    def setUp(self):
+        self.adapter = adapter_for("nvidia", make_settings())
+
+    def test_nvidia_build_url_and_auth(self):
+        ctx = make_ctx("nvidia", "meta/llama-3.3-70b-instruct")
+        request = self.adapter.build(ctx, "nvapi-secret-key")
+        self.assertEqual(request.url, "https://integrate.api.nvidia.com/v1/chat/completions")
+        self.assertEqual(request.headers["Authorization"], "Bearer nvapi-secret-key")
+        self.assertEqual(request.json_body["model"], "meta/llama-3.3-70b-instruct")
+
+    def test_nvidia_classification(self):
+        info = registry_info("nvidia")
+        self.assertEqual(info.classification, ProviderClass.TRIAL_ONLY)
+
+    def test_nvidia_parse_response(self):
+        raw = {
+            "id": "nv-req-1",
+            "choices": [{"message": {"role": "assistant", "content": '{"ok":true}'}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 15, "completion_tokens": 5, "total_tokens": 20},
+        }
+        resp = self.adapter.parse(raw, http_status=200, headers={}, latency_ms=80)
+        self.assertEqual(resp.text, '{"ok":true}')
+        self.assertEqual(resp.usage.input_tokens, 15)
+
+
+class HuggingFaceContractTests(unittest.TestCase):
+    """Hugging Face: Router endpoint, Bearer auth, OpenAI format."""
+
+    def setUp(self):
+        self.adapter = adapter_for("huggingface", make_settings())
+
+    def test_huggingface_build_url_and_auth(self):
+        ctx = make_ctx("huggingface", "Qwen/Qwen2.5-72B-Instruct")
+        request = self.adapter.build(ctx, "hf_secret_token")
+        self.assertEqual(request.url, "https://router.huggingface.co/v1/chat/completions")
+        self.assertEqual(request.headers["Authorization"], "Bearer hf_secret_token")
+        self.assertEqual(request.json_body["model"], "Qwen/Qwen2.5-72B-Instruct")
+
+    def test_huggingface_classification(self):
+        info = registry_info("huggingface")
+        self.assertEqual(info.classification, ProviderClass.PAID_ONLY)
+        self.assertTrue(info.experimental_only)
+
+    def test_huggingface_error_mapping(self):
+        fail_403 = self.adapter.map_error(
+            403, b'{"error":"Forbidden"}', {}, model="Qwen/Qwen2.5-72B-Instruct", key="hf_token"
+        )
+        self.assertEqual(fail_403.category, FAIL_AUTH)
+        self.assertTrue(fail_403.credential_invalid)
+
+
 class ZaiFreeTypeTests(unittest.TestCase):
     def test_free_plan_seed(self):
         seed = models.STATIC_SEEDS["zai"][0]

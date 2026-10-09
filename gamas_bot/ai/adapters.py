@@ -171,6 +171,10 @@ class NoteResponse:
     quota_headers: dict[str, str] = field(default_factory=dict)
 
 
+#: Spec §49 alias for normalized successful answer.
+ProviderResponse = NoteResponse
+
+
 @dataclass(frozen=True, slots=True)
 class NoteFailure(Exception):
     """Normalized failure with a safe, content-free message.
@@ -195,6 +199,10 @@ class NoteFailure(Exception):
     def __str__(self) -> str:  # never raise with content
         status = f"HTTP {self.http_status}" if self.http_status else self.category
         return f"{status}: {self.message}" if self.message else status
+
+
+#: Spec §49 alias for normalized failure.
+ProviderFailure = NoteFailure
 
 
 def quota_headers(headers) -> dict[str, str]:
@@ -1101,3 +1109,21 @@ def _int_or_none(value) -> int | None:
     except (TypeError, ValueError):
         return None
     return number if number >= 0 else None
+
+
+def build_note_request(
+    profile: object,
+    ctx: RequestContext,
+    secret: str = "",
+    *,
+    settings: Settings | None = None,
+) -> NoteRequest:
+    """Spec §8: Dispatch to provider-specific payload builder.
+
+    Dispatches to the provider adapter's build method without forcing every
+    provider through one generic payload builder.
+    """
+    provider_slug = getattr(profile, "provider", str(profile))
+    adapter = adapter_for(provider_slug, settings)
+    return adapter.build(ctx, secret)
+

@@ -2148,11 +2148,17 @@ class Database:
 
     async def ai_model_set_quality(self, provider: str, model: str, score: float) -> None:
         async with self._transaction(immediate=True) as db:
-            await db.execute(
+            cursor = await db.execute(
                 "UPDATE ai_models SET quality_score=?, last_benchmarked_at=?, updated_at=? "
                 "WHERE provider=? AND model=?",
                 (float(score), utc_now(), utc_now(), provider, model),
             )
+            if cursor.rowcount == 0:
+                await db.execute(
+                    "INSERT INTO ai_models (provider, model, display_name, free_status, quality_score, last_benchmarked_at, updated_at, created_at) "
+                    "VALUES (?, ?, ?, 'free_plan', ?, ?, ?, ?)",
+                    (provider, model, model, float(score), utc_now(), utc_now(), utc_now()),
+                )
 
     # -- provider registry ---------------------------------------------------
 

@@ -467,6 +467,95 @@ class ProviderHealthChecker:
             self._credential_result(credential), force=force, credential=credential
         )
 
+    async def test_credential_generation(self, credential_id: int) -> HealthResult:
+        """Explicit, billable generation test for one credential (spec §37).
+
+        Distinct from read-only health checks: executes an actual completion
+        request with a minimal token budget and records check_type='generation_test'
+        in the event log.
+        """
+        credential = await self.credentials.credential_for_test(credential_id)
+        self.invalidate()
+        canonical = _resolve_canonical(credential.provider, credential.base_url)
+        started = time.perf_counter()
+        status_code: int | None = None
+        status = "unavailable"
+        detail: str | None = None
+        retry_after: float | None = None
+        try:
+            if credential.service == "notes":
+                from .ai.adapters import RequestContext, adapter_for
+                from .ai.models import ModelCapabilities, ModelInfo
+
+                adapter = adapter_for(canonical, self.settings)
+                base = credential.base_url or adapter.default_base_url() or ""
+                model = credential.model or "default"
+                ctx = RequestContext(
+                    service="notes",
+                    request_type="health_test",
+                    provider=credential.provider,
+                    canonical=canonical,
+                    base_url=base,
+                    model=model,
+                    system_prompt="",
+                    user_text="سلام",
+                    max_output_tokens=8,
+                    model_info=ModelInfo(provider=canonical, model_id=model, capabilities=ModelCapabilities()),
+                    json_strategy="prompt",
+                )
+                req = adapter.build(ctx, credential.secret)
+                timeout = aiohttp.ClientTimeout(total=self.timeout_seconds)
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(req.url, headers=req.headers, json=req.json_body) as response:
+                        status_code = int(response.status)
+                        retry_after = parse_retry_after(response.headers.get("Retry-After"))
+                        status = classify_status(status_code)
+                        if 200 <= status_code < 300:
+                            status = "healthy"
+                            detail = "تست تولید با موفقیت انجام شد."
+                        else:
+                            detail = f"خطای HTTP {status_code}"
+            else:
+                return await self.test_credential(credential_id, force=True)
+        except Exception as exc:
+            detail = sanitize_detail(type(exc).__name__, (credential.secret,))
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        outcome = HealthResult(
+            service=credential.service,
+            provider=credential.provider,
+            credential_id=credential.id,
+            source=credential.source,
+            label=credential.label,
+            masked=credential.masked,
+            status=status,
+            http_status=status_code,
+            latency_ms=latency_ms,
+            checked_at=_iso(_utc_now()),
+            detail=detail,
+            check_type="generation_test",
+        )
+        await self._apply_rotation_state(credential, outcome, retry_after)
+        try:
+            await self.db.ai_event_insert(
+                {
+                    "level": "info" if status == "healthy" else "warning",
+                    "event": "provider_health_tested",
+                    "service": credential.service,
+                    "provider": credential.provider,
+                    "canonical": canonical,
+                    "model": credential.model or "",
+                    "request_type": "health_test",
+                    "http_status": status_code,
+                    "latency_ms": latency_ms,
+                    "error_class": status if status != "healthy" else None,
+                    "detail": detail or "",
+                    "check_type": "generation_test",
+                }
+            )
+        except Exception:
+            pass
+        return outcome
+
     async def _probe(
         self,
         result: HealthResult,

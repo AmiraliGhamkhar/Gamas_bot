@@ -1319,6 +1319,10 @@ class StudyBot:
         buttons.extend(
             [
                 [
+                    Button.inline("➕ افزودن با راهنما (Wizard)", b"admin:ai:wiz"),
+                    Button.inline("🔑 پنل جامع کلیدها", b"admin:ai:keys"),
+                ],
+                [
                     Button.inline("افزودن کلید STT", b"admin:credential:add:stt"),
                     Button.inline("افزودن کلید جزوه", b"admin:credential:add:notes"),
                 ],
@@ -1505,18 +1509,7 @@ class StudyBot:
                 [[Button.inline("↩️ پنل مدیریت", b"admin:credentials")]],
             )
             return
-        providers = ", ".join(sorted(PROVIDER_CHOICES[service]))
-        self._pending_admin_actions[admin_id] = f"credential_meta:{service}"
-        self._pending_credential_setup.pop(admin_id, None)
-        await self._edit_callback(
-            event,
-            "ابتدا metadata را با قالب زیر بفرستید (با | جدا شود):\n"
-            f"provider | label | base_url اختیاری | model اختیاری\n"
-            f"providerهای مجاز: {providers}\n\n"
-            "بعداً کلید را جداگانه می‌فرستید؛ پیام کلید پس از دریافت حذف می‌شود. "
-            "فقط در گفت‌وگوی خصوصی ادامه دهید.",
-            [[Button.inline("لغو", b"admin:credentials")]],
-        )
+        await self.ai_panels.begin_wizard(event, service=service)
 
     async def _handle_callback(self, event) -> None:
         sender = await event.get_sender()

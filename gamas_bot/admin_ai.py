@@ -175,26 +175,26 @@ class AIPanels:
         buttons = [
             [
                 Button.inline("📡 ارائه‌دهنده‌ها", b"admin:ai:pv"),
+                Button.inline("🔑 کلیدهای API", b"admin:ai:keys"),
+            ],
+            [
+                Button.inline("🧬 مدل‌ها", b"admin:ai:md"),
                 Button.inline("🧭 مسیرها", b"admin:ai:rt"),
             ],
             [
                 Button.inline("📊 مصرف", b"admin:ai:us"),
-                Button.inline("🧬 مدل‌ها", b"admin:ai:md"),
+                Button.inline("🩺 سلامت", b"admin:ai:he"),
             ],
             [
                 Button.inline("🧾 لاگ‌ها", b"admin:ai:lg"),
+                Button.inline("🏆 ارزیابی", b"admin:ai:bm"),
+            ],
+            [
+                Button.inline("⚙️ تنظیمات", b"admin:ai:st"),
                 Button.inline("🧪 Dry-run", b"admin:ai:dry"),
             ],
             [
                 Button.inline("📈 نمای مسیر و بودجه", b"admin:ai:plan"),
-                Button.inline("🏆 ارزیابی", b"admin:ai:bm"),
-            ],
-            [
-                Button.inline("🩺 سلامت", b"admin:ai:he"),
-                Button.inline("⚙️ تنظیمات", b"admin:ai:st"),
-            ],
-            [
-                Button.inline("🔑 کلیدها (قدیمی)", b"admin:credentials"),
                 Button.inline("↩️ پنل مدیریت", b"admin:home"),
             ],
         ]
@@ -284,6 +284,8 @@ class AIPanels:
             )
         # Catalog-derived plan view (spec §10/§12): what the last sync saw.
         catalog_lines: list[str] = []
+        free_models: list[dict] = []
+        verified = ""
         try:
             catalog = await db.ai_models_list(slug, include_unavailable=False)
         except Exception:
@@ -335,8 +337,27 @@ class AIPanels:
                 f"• {fa}: {'روشن ✅' if enabled else 'خاموش ❌'}"
                 f" ({'تنظیم مدیر' if override is not None else 'پیش‌فرض ارائه‌دهنده'})"
             )
+        active_keys_count = len([k for k in key_rows if k.get("enabled")])
+        current_model = (
+            stored.get("model")
+            or (free_models[0]["model"] if free_models else default_model_for(slug) or "خودکار")
+        )
+        last_sync = verified or (
+            str(registry_row.get("last_catalog_sync_at"))[:16]
+            if registry_row and registry_row.get("last_catalog_sync_at")
+            else "—"
+        )
         lines = [
-            f"{info.display_name}",
+            f"📡 ارائه‌دهنده (Provider): {info.display_name} ({slug})",
+            "",
+            f"• پلن (Plan): {_CLASS_FA.get(info.classification, info.classification.value)}",
+            f"• وضعیت (Status): {'فعال ✅' if enabled else 'غیرفعال ⛔'}",
+            f"• رایگان/پولی (Free/Paid): {'مجاز در FREE_ONLY 🆓' if info.generation_allowed_in_free_only else 'پولی / نیازمند تأیید 💳'}",
+            f"• کلیدهای فعال (Active keys): {active_keys_count} از {len(key_rows)}",
+            f"• مدل جاری (Current model): {current_model}",
+            f"• نرخ مجاز (RPM): {profile.requests_per_minute or 'نامحدود / بدون سقف رسمی'}",
+            f"• سقف توکن در دقیقه (TPM): {profile.tokens_per_minute or 'نامحدود / بدون سقف رسمی'}",
+            f"• آخرین همگام‌سازی (Last sync): {last_sync}",
             "",
             f"دسته: {_CLASS_FA.get(info.classification, 'سازگار با OpenAI')}",
             f"پلن رایگان: {info.free_tier_policy}",
@@ -701,6 +722,146 @@ class AIPanels:
         await self.show_provider_detail(event, slug)
 
     # ----------------------------------------------------------------- keys
+    async def show_all_keys(self, event, filter_service: str | None = None) -> None:
+        """Spec §35 API Keys panel: provider / label / model / masked key / status / priority."""
+        items = await self.bot.credential_manager.list_summaries()
+        if filter_service and filter_service in {"notes", "stt"}:
+            items = [item for item in items if item.get("service") == filter_service]
+        lines = [
+            "🔑 پنل کلیدهای API (API Keys Panel)",
+            "",
+            "قالب: provider / label / model / masked key / status / priority",
+            "",
+        ]
+        if not items:
+            lines.append("هنوز کلیدی در پایگاه‌داده ثبت نشده است.")
+            lines.append("برای ثبت امن از دکمهٔ «➕ افزودن کلید (Wizard)» استفاده کنید.")
+        buttons: list[list] = []
+        for index, item in enumerate(items, start=1):
+            provider = str(item.get("provider") or "-")
+            label = str(item.get("label") or "-")
+            model = str(item.get("model") or "پیش‌فرض")
+            masked = self.bot._masked_key(item.get("secret_last4"))
+            state = "فعال" if item.get("enabled") else "غیرفعال"
+            if item.get("quarantined_at"):
+                state = "قرنطینه"
+            elif cooldown_remaining_seconds(item.get("cooldown_until")) > 0:
+                state = "cooldown"
+            billing = str(item.get("billing_state") or "unknown")
+            billing_tag = {"free": "FREE", "paid": "PAID"}.get(billing, "نامشخص")
+            priority = f"اولویت {index}"
+            lines.append(
+                f"• #{item['id']} {provider} / {label} / {model} / {masked} / {state} ({billing_tag}) / {priority}"
+            )
+            key_id = item["id"]
+            buttons.append([
+                Button.inline(f"⚙️ #{key_id} {label[:16]}", f"admin:ai:kview:{key_id}".encode("ascii")),
+                Button.inline("🧪 تست", f"admin:ai:keytest:{key_id}".encode("ascii")),
+                Button.inline("⛔" if item.get("enabled") else "✅", f"admin:ai:kstate:{'disable' if item.get('enabled') else 'enable'}:{key_id}".encode("ascii")),
+            ])
+        buttons.extend([
+            [
+                Button.inline("➕ افزودن کلید (Wizard)", b"admin:ai:wiz"),
+                Button.inline("همه", b"admin:ai:keys"),
+                Button.inline("📝 جزوه", b"admin:ai:keys:notes"),
+                Button.inline("🎙 STT", b"admin:ai:keys:stt"),
+            ],
+            [Button.inline("↩️ پلتفرم AI", b"admin:ai")],
+        ])
+        await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
+    async def show_key_detail(self, event, key_id: int) -> None:
+        """Spec §34 Key actions and detailed status card."""
+        record = await self.bot.db.provider_credential_record(key_id)
+        if not record:
+            await event.answer("کلید پیدا نشد.", alert=True)
+            await self.show_all_keys(event)
+            return
+        slug = _canonical_of(record)
+        masked = self.bot._masked_key(record.get("secret_last4"))
+        state = "فعال ✅" if record.get("enabled") else "غیرفعال ⛔"
+        if record.get("quarantined_at"):
+            state = "قرنطینه (401/403) 🔴"
+        elif cooldown_remaining_seconds(record.get("cooldown_until")) > 0:
+            state = "cooldown ⏳"
+        billing_state = str(record.get("billing_state") or "unknown").lower()
+        billing_text = {
+            "free": "🔒 FREE (no paid overage attested)",
+            "paid": "💳 Paid use authorized (attested)",
+            "unknown": "⚠️ وضعیت نامشخص — تولید مسدود است",
+        }.get(billing_state, billing_state)
+        lines = [
+            f"🔑 مدیریت کلید #{key_id} — {record.get('provider')}",
+            "",
+            f"• سرویس: {record.get('service')} | ارائه‌دهنده: {record.get('provider')}",
+            f"• برچسب: {record.get('label')}",
+            f"• کلید: {masked} (فقط ۴ رقم پایانی نمایش داده می‌شود)",
+            f"• مدل: {record.get('model') or 'پیش‌فرض خودکار'}",
+            f"• Base URL: {record.get('base_url') or 'پیش‌فرض'}",
+            f"• وضعیت: {state}",
+            f"• صورتحساب: {billing_text}",
+            f"• آخرین HTTP: {record.get('last_status_code') or '—'}",
+            f"• آخرین استفاده: {str(record.get('last_used_at') or '—')[:19]}",
+            f"• توالی شکست: {record.get('failure_streak') or 0}",
+        ]
+        if record.get("billing_attested_at"):
+            lines.append(f"• تأیید صورتحساب: مدیر {record.get('billing_attested_by_admin_id')} در {str(record.get('billing_attested_at'))[:16]}")
+        toggle = "disable" if record.get("enabled") else "enable"
+        buttons = [
+            [
+                Button.inline(f"{'غیرفعال' if toggle == 'disable' else 'فعال'}", f"admin:ai:kstate:{toggle}:{key_id}".encode("ascii")),
+                Button.inline("⭐ اصلی", f"admin:ai:kstate:primary:{key_id}".encode("ascii")),
+                Button.inline("▲", f"admin:ai:kstate:up:{key_id}".encode("ascii")),
+                Button.inline("▼", f"admin:ai:kstate:down:{key_id}".encode("ascii")),
+            ],
+            [
+                Button.inline("🧪 تست سریع", f"admin:ai:keytest:{key_id}".encode("ascii")),
+                Button.inline("⚡ تست تولید", f"admin:ai:kstate:gen:{key_id}".encode("ascii")),
+                Button.inline("🩺 سلامت", f"admin:ai:kstate:health:{key_id}".encode("ascii")),
+            ],
+            [
+                Button.inline("📊 مصرف", f"admin:ai:kstate:usage:{key_id}".encode("ascii")),
+                Button.inline("⚠️ شکست‌ها", f"admin:ai:kstate:fails:{key_id}".encode("ascii")),
+                Button.inline("🔄 تعویض کلید", f"admin:ai:kstate:repl:{key_id}".encode("ascii")),
+            ],
+            [
+                Button.inline("✏️ برچسب", f"admin:ai:kstate:edit:label:{key_id}".encode("ascii")),
+                Button.inline("🧬 مدل", f"admin:ai:kstate:edit:model:{key_id}".encode("ascii")),
+                Button.inline("🌐 Base URL", f"admin:ai:kstate:edit:base:{key_id}".encode("ascii")),
+            ],
+            [
+                Button.inline("🔒 attest FREE", f"admin:ai:kstate:attest_free:{key_id}".encode("ascii")),
+                Button.inline("💳 attest Paid", f"admin:ai:kstate:attest_paid:{key_id}".encode("ascii")),
+                Button.inline("🛑 clear", f"admin:ai:kstate:attest_clear:{key_id}".encode("ascii")),
+            ],
+            [
+                Button.inline("❌ حذف کلید", f"admin:ai:kstate:del1:{key_id}".encode("ascii")),
+                Button.inline("↩️ بازگشت به کلیدها", b"admin:ai:keys"),
+            ],
+        ]
+        await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
+    async def _key_failures(self, event, key_id: int, slug: str) -> None:
+        """Recent failures for one key (metadata only, spec §34)."""
+        failures = await self.bot.db.ai_usage_recent(
+            limit=12, credential_id=key_id, failures_only=True
+        )
+        lines = [f"⚠️ شکست‌های اخیر کلید #{key_id}", ""]
+        if not failures:
+            lines.append("شکست ثبت‌شده‌ای برای این کلید وجود ندارد.")
+        for row in failures:
+            lines.append(
+                f"• {str(row['created_at'])[5:16]} {row['request_type'] or '-'}"
+                + (f" HTTP {row['http_status']}" if row.get("http_status") else "")
+                + (f" | {row['error_class']}" if row.get("error_class") else "")
+                + (f" | {row['latency_ms']}ms" if row.get("latency_ms") else "")
+            )
+        buttons = [
+            [Button.inline("⚙️ مدیریت کلید", f"admin:ai:kview:{key_id}".encode("ascii"))],
+            [Button.inline("↩️ کلیدها", b"admin:ai:keys")],
+        ]
+        await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
     async def show_provider_keys(self, event, slug: str) -> None:
         if slug not in PROVIDER_REGISTRY:
             await event.answer("ارائه‌دهندهٔ نامعتبر.", alert=True)
@@ -926,6 +1087,32 @@ class AIPanels:
         elif action == "health":
             await self._key_health(event, key_id, slug)
             return
+        elif action == "gen":
+            await event.answer("در حال اجرای تست تولید…")
+            result = await self.bot.provider_health.test_credential_generation(key_id)
+            lines = [
+                f"⚡ تست تولید کلید #{key_id} ({result.label})",
+                "",
+                f"ارائه‌دهنده: {result.provider}",
+                f"وضعیت: {result.status_fa}",
+                f"HTTP: {result.http_status or '—'} | تأخیر: {result.latency_ms or '—'}ms",
+                f"نوع بررسی: {result.check_type}",
+                f"کلید: {result.masked} (فقط ۴ رقم آخر نمایش داده می‌شود)",
+            ]
+            if result.detail:
+                lines.append(f"جزئیات: {sanitize_text(result.detail)[:200]}")
+            await self.bot._edit_callback(
+                event,
+                "\n".join(lines),
+                [
+                    [Button.inline("⚙️ مدیریت کلید", f"admin:ai:kview:{key_id}".encode("ascii"))],
+                    [Button.inline("↩️ کلیدها", f"admin:ai:ky:{slug}".encode("ascii"))],
+                ],
+            )
+            return
+        elif action == "fails":
+            await self._key_failures(event, key_id, slug)
+            return
         elif action == "usage":
             await self._key_usage(event, key_id, slug)
             return
@@ -1008,6 +1195,183 @@ class AIPanels:
             available,
             key=lambda item: (rank.get(item.free_status, 2), item.model_id.casefold()),
         )[:8]
+
+    async def begin_wizard(self, event, service: str | None = None, slug: str | None = None) -> None:
+        """Interactive 9-step API key wizard (spec §33)."""
+        bot = self.bot
+        if not bot.credential_manager.encryption_configured:
+            await self.bot._edit_callback(
+                event,
+                "ابتدا PROVIDER_CREDENTIALS_ENCRYPTION_KEY را در سرور تنظیم کنید؛ "
+                "بدون آن کلید جدید ذخیره نمی‌شود.",
+                [[Button.inline("↩️ کلیدها", b"admin:ai:keys")]],
+            )
+            return
+
+        # STEP 1: Select service (Notes vs STT)
+        if not service:
+            lines = [
+                "🧭 راهنمای افزودن کلید (مرحله ۱ از ۹ — انتخاب سرویس)",
+                "",
+                "سرویس مورد نظر را برای این کلید انتخاب کنید:",
+            ]
+            buttons = [
+                [Button.inline("📝 تولید جزوه (Notes)", b"admin:ai:wiz:srv:notes")],
+                [Button.inline("🎙 تبدیل گفتار به متن (STT)", b"admin:ai:wiz:srv:stt")],
+                [Button.inline("لغو", b"admin:ai:keys")],
+            ]
+            await self.bot._edit_callback(event, "\n".join(lines), buttons)
+            return
+
+        # STEP 2: Select provider from supported registry
+        if not slug:
+            if service == "stt":
+                lines = [
+                    "🧭 راهنمای افزودن کلید (مرحله ۲ از ۹ — انتخاب ارائه‌دهنده)",
+                    "",
+                    "ارائه‌دهندهٔ تبدیل گفتار به متن (STT) را انتخاب کنید:",
+                ]
+                buttons = [
+                    [Button.inline("Speechmatics", b"admin:ai:wiz:pv:stt:speechmatics")],
+                    [Button.inline("Deepgram", b"admin:ai:wiz:pv:stt:deepgram")],
+                    [Button.inline("OpenAI Compatible (Whisper)", b"admin:ai:wiz:pv:stt:openai_compatible")],
+                    [Button.inline("↩️ مرحله قبل", b"admin:ai:wiz")],
+                ]
+            else:
+                lines = [
+                    "🧭 راهنمای افزودن کلید (مرحله ۲ از ۹ — انتخاب ارائه‌دهنده)",
+                    "",
+                    "ارائه‌دهندهٔ تولید جزوه (Notes) را انتخاب کنید:",
+                ]
+                note_providers = [
+                    ("gemini", "Google Gemini"),
+                    ("nara", "NaraRouter"),
+                    ("groq", "Groq"),
+                    ("openrouter", "OpenRouter"),
+                    ("mistral", "Mistral"),
+                    ("sambanova", "SambaNova"),
+                    ("zai", "Z.AI"),
+                    ("cloudflare", "Cloudflare"),
+                    ("nvidia", "NVIDIA NIM"),
+                    ("huggingface", "Hugging Face"),
+                    ("alibaba", "Alibaba"),
+                    ("cohere", "Cohere"),
+                    ("cerebras", "Cerebras"),
+                    ("openai_compatible", "OpenAI Compatible"),
+                ]
+                buttons = []
+                for i in range(0, len(note_providers), 2):
+                    row = [
+                        Button.inline(name, f"admin:ai:wiz:pv:notes:{p_slug}".encode("ascii"))
+                        for p_slug, name in note_providers[i : i + 2]
+                    ]
+                    buttons.append(row)
+                buttons.append([Button.inline("↩️ مرحله قبل", b"admin:ai:wiz")])
+            await self.bot._edit_callback(event, "\n".join(lines), buttons)
+            return
+
+        # STEP 3 & 4: Automatically load base URL, protocol, auth style, and pick model
+        if service == "stt":
+            stt_info = {
+                "speechmatics": ("https://api.speechmatics.com/v2", "REST", "Bearer", "سهمیه استاندارد"),
+                "deepgram": ("https://api.deepgram.com/v1", "REST", "Token", "سهمیه اشتراک/اعتبار"),
+                "openai_compatible": (
+                    bot.settings.stt_openai_base_url or "https://api.openai.com/v1",
+                    "OpenAI Audio",
+                    "Bearer",
+                    "متغیر بر اساس سرویس‌دهنده",
+                ),
+            }.get(slug, ("", "REST", "Bearer", "نامشخص"))
+            stt_models = {
+                "deepgram": ["nova-3", "nova-2"],
+                "speechmatics": ["default"],
+                "openai_compatible": [bot.settings.stt_openai_model or "whisper-1"],
+            }.get(slug, ["default"])
+
+            lines = [
+                f"🧭 راهنمای افزودن کلید (مرحله ۳ و ۴ از ۹) — {slug}",
+                "",
+                f"پروتکل: {stt_info[1]} | احراز هویت: {stt_info[2]}",
+                f"Base URL پیش‌فرض: {stt_info[0]}",
+                f"وضعیت پلن: {stt_info[3]}",
+                "",
+                "اکنون مدل پیش‌فرض این کلید را انتخاب کنید:",
+            ]
+            buttons = []
+            for m in stt_models:
+                buttons.append([Button.inline(f"🎯 {m}", f"admin:ai:wiz:mdl:stt:{slug}:{m}".encode("ascii"))])
+            buttons.append([Button.inline("مدل سفارشی / پیش‌فرض", f"admin:ai:wiz:mdl:stt:{slug}:custom".encode("ascii"))])
+            buttons.append([Button.inline("↩️ مرحله قبل", f"admin:ai:wiz:srv:{service}".encode("ascii"))])
+            await self.bot._edit_callback(event, "\n".join(lines), buttons)
+            return
+
+        # Notes service:
+        info = registry_info(slug)
+        choices = await self._wizard_model_choices(slug)
+        lines = [
+            f"🧭 راهنمای افزودن کلید (مرحله ۳ و ۴ از ۹) — {info.display_name}",
+            "",
+            f"۱) ساخت کلید: {info.docs_url}",
+            f"۲) پروتکل: {info.protocol} | احراز هویت: {info.auth_style.value}",
+            f"۳) Base URL پیش‌فرض: {info.base_url or 'وابسته به حساب'}",
+            f"۴) طبقه‌بندی رایگان: {_CLASS_FA.get(info.classification, info.classification.value)}",
+            f"توضیح پلن: {info.free_tier_policy[:160]}…",
+            "",
+            "مدل پیش‌فرض این کلید را انتخاب کنید:",
+        ]
+        buttons = []
+        for index, m in enumerate(choices[:8]):
+            free_mark = {
+                FREE_PERMANENT: "🆓",
+                FREE_PLAN: "🆓",
+                FREE_PROMOTIONAL: "⏳",
+                PAID: "💳",
+            }.get(m.free_status, "❔")
+            label = f"{free_mark} {m.model_id[:26]}"
+            buttons.append([Button.inline(label, f"admin:ai:wiz:mdl:notes:{slug}:{index}".encode("ascii"))])
+        buttons.append([Button.inline("مدل سفارشی / بدون مدل", f"admin:ai:wiz:mdl:notes:{slug}:custom".encode("ascii"))])
+        buttons.append([Button.inline("↩️ مرحله قبل", f"admin:ai:wiz:srv:{service}".encode("ascii"))])
+        await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
+    async def wizard_pick_model_step(self, event, service: str, slug: str, choice: str) -> None:
+        admin_id = int((await event.get_sender()).id)
+        model = None
+        base_url = None
+        if service == "stt":
+            if choice != "custom":
+                model = choice
+            base_url = {
+                "speechmatics": self.bot.settings.speechmatics_base_url,
+                "openai_compatible": self.bot.settings.stt_openai_base_url,
+            }.get(slug)
+        else:
+            if slug in PROVIDER_REGISTRY:
+                base_url = registry_info(slug).base_url
+            if choice != "custom":
+                choices = await self._wizard_model_choices(slug)
+                try:
+                    model = choices[int(choice)].model_id
+                except (ValueError, IndexError):
+                    model = None
+        bot = self.bot
+        bot._pending_credential_setup[admin_id] = {
+            "service": service,
+            "provider": slug,
+            "base_url": base_url,
+            "model": model,
+            "enabled": False,
+            "via_wizard": True,
+        }
+        bot._pending_admin_actions[admin_id] = "aikey_label"
+        await self.bot._edit_callback(
+            event,
+            f"🧭 نام‌گذاری کلید (مرحله ۵ از ۹)\n\n"
+            f"سرویس: {service} | ارائه‌دهنده: {slug}\n"
+            + (f"مدل انتخاب‌شده: {model}\n" if model else "")
+            + "\nیک برچسب (Label) کوتاه برای این کلید بنویسید و بفرستید (مثلاً «کلید اصلی تیم»):\n"
+            "سپس در مرحله ۶ خود کلید را جداگانه می‌فرستید.",
+            [[Button.inline("لغو", b"admin:ai:keys")]],
+        )
 
     async def begin_key_wizard(self, event, slug: str) -> None:
         if slug not in PROVIDER_REGISTRY:
@@ -1285,7 +1649,29 @@ class AIPanels:
         db = self.bot.db
         rows = await db.ai_routes_list(SERVICE, task_type)
         provider_settings = await db.ai_provider_settings_all()
-        lines = [f"🧭 مسیر «{_TASK_LABELS[task_type]}» (ترتیب failover)", ""]
+        leg1 = rows[0]["provider"] if len(rows) > 0 else "—"
+        leg2 = rows[1]["provider"] if len(rows) > 1 else "—"
+        leg3 = rows[2]["provider"] if len(rows) > 2 else "—"
+        settings = self.bot.settings
+        base_profile = profile_for(rows[0]["provider"] if rows else "gemini")
+        retries = (
+            settings.ai_max_generation_retries
+            if settings.ai_max_generation_retries >= 0
+            else base_profile.policy.max_retries
+        )
+        lines = [
+            f"🧭 مسیر «{_TASK_LABELS[task_type]}» (Routing Panel)",
+            "",
+            f"• سرویس: {SERVICE}",
+            f"• اولیه (Primary): {leg1}",
+            f"• ثانویه (Secondary): {leg2}",
+            f"• ثالثیه (Tertiary): {leg3}",
+            f"• حالت رایگان (Free-only): {'فعال ✅' if settings.ai_free_only else 'غیرفعال ⛔'}",
+            f"• پشتیبان پولی (Paid fallback): {'مجاز ⚠️' if settings.ai_allow_paid_fallback else 'غیرمجاز 🔒'}",
+            f"• سقف تلاش مجدد (Max retries): {retries}",
+            f"• سقف هم‌زمانی (Max concurrency): {base_profile.max_concurrency}",
+            "",
+        ]
         buttons: list[list] = []
         task_buttons = [
             Button.inline(
@@ -1964,27 +2350,64 @@ class AIPanels:
         sent by the separate per-key "test request" action, which is logged
         with ``check_type='generation'``.
         """
-        checker = getattr(self.bot, "health_checker", None)
+        checker = getattr(self.bot, "provider_health", None) or getattr(self.bot, "health_checker", None)
         results = []
         if checker is not None:
             try:
                 results = list(checker.cached())
             except Exception:
                 results = []
-        lines = ["🩺 سلامت ارائه‌دهنده‌ها", ""]
+        lines = [
+            "🩺 سلامت ارائه‌دهنده‌ها (Health Panel)",
+            "",
+            "قالب: وضعیت / تأخیر / HTTP / آخرین بررسی / کلید / مدل / قابلیت‌ها",
+            "",
+        ]
         if not results:
             lines.append("هنوز نتیجهٔ بررسی‌ای در حافظه نیست.")
-            lines.append("بررسی‌ها فقط هنگام باز شدن پنل قدیمی سلامت یا تست دستی اجرا می‌شوند.")
+            lines.append("بررسی‌ها فقط هنگام باز شدن پنل یا تست دستی اجرا می‌شوند.")
         for result in results[:12]:
             if str(getattr(result, "service", "")) != SERVICE:
                 continue
             http = f"HTTP {result.http_status}" if result.http_status else "HTTP —"
             latency = f"{result.latency_ms}ms" if result.latency_ms else "—"
             checked = str(result.checked_at or "")[:16] or "—"
+            model_name = "خودکار"
+            caps_text = "نامشخص"
+            if result.credential_id:
+                try:
+                    rec = await self.bot.db.provider_credential_record(result.credential_id)
+                    if rec and rec.get("model"):
+                        model_name = rec["model"]
+                except Exception:
+                    pass
+            try:
+                minfo = await self.bot.provider_router.models.resolve(
+                    result.provider,
+                    model_name if model_name != "خودکار" else default_model_for(result.provider) or "",
+                )
+                if minfo:
+                    caps = minfo.capabilities
+                    c_list = []
+                    if caps.supports_strict_json_schema:
+                        c_list.append("StrictSchema")
+                    elif caps.supports_json_schema:
+                        c_list.append("Schema")
+                    elif caps.supports_json_object:
+                        c_list.append("JSONObject")
+                    if caps.supports_reasoning:
+                        c_list.append("Reasoning")
+                    if caps.supports_image:
+                        c_list.append("Vision")
+                    caps_text = "+".join(c_list) if c_list else "PromptJSON"
+            except Exception:
+                pass
             lines.append(
                 f"• {result.provider} / {result.label or '—'}: {result.status_fa} ({http}, {latency})"
             )
-            lines.append(f"  آخرین بررسی: {checked} | نوع: {result.check_type}")
+            lines.append(
+                f"  آخرین بررسی: {checked} | نوع: {result.check_type} | مدل: {model_name} | قابلیت‌ها: {caps_text}"
+            )
         lines.append("")
         lines.append("🟢 سالم | 🟡 کاهش کیفیت | 🔴 محدود/خطا | ⛔ غیرفعال یا نیازمند صورتحساب")
         lines.append("بررسی خودکار فقط خواندنی (read_only) است و هیچ تولیدی ارسال نمی‌کند.")
@@ -1996,7 +2419,7 @@ class AIPanels:
 
     async def _health_refresh(self, event) -> None:
         """Run the cached read-only probes once and redraw the panel."""
-        checker = getattr(self.bot, "health_checker", None)
+        checker = getattr(self.bot, "provider_health", None) or getattr(self.bot, "health_checker", None)
         if checker is None:
             await event.answer("بررسی‌گر سلامت در دسترس نیست.", alert=True)
             return
@@ -2114,13 +2537,35 @@ class AIPanels:
             f"استراتژی JSON: {redacted.json_strategy}",
             f"تخمین توکن ورودی: {_fmt_int(tokens)}",
             "",
-            "پارامترها:",
+            "سرفصل‌ها (Headers):",
         ]
-        for key, value in sorted((redacted.json_body or {}).items()):
-            if isinstance(value, (int, float, str, bool)) and len(str(value)) < 48:
-                lines.append(f"• {key} = {value}")
-            else:
-                lines.append(f"• {key} = …")
+        for h_name, h_val in sorted(redacted.headers.items()):
+            lines.append(f"• {h_name}: {h_val}")
+        lines.append("")
+        lines.append("بدنهٔ درخواست (JSON با متادیتا به جای محتوای خام):")
+        body = redacted.json_body or {}
+        if "messages" in body and isinstance(body["messages"], list):
+            lines.append("messages:")
+            for msg in body["messages"]:
+                role = msg.get("role", "unknown")
+                c = msg.get("content", "")
+                desc = "GAMAS SYSTEM PROMPT" if role == "system" else "TRANSCRIPT CHUNK"
+                lines.append(f"  {role} = <{desc}: {len(str(c))} chars>")
+        elif "contents" in body and isinstance(body["contents"], list):
+            lines.append("contents:")
+            for item in body["contents"]:
+                role = item.get("role", "user")
+                lines.append(f"  {role} = <TRANSCRIPT CHUNK: {len(ctx.user_text or '')} chars>")
+            if "systemInstruction" in body:
+                lines.append(f"systemInstruction: <GAMAS SYSTEM PROMPT: {len(ctx.system_prompt or '')} chars>")
+            if "generationConfig" in body:
+                lines.append(f"generationConfig: {json.dumps(body['generationConfig'], ensure_ascii=False)}")
+        else:
+            for key, value in sorted(body.items()):
+                if isinstance(value, (int, float, str, bool)) and len(str(value)) < 48:
+                    lines.append(f"• {key} = {value}")
+                else:
+                    lines.append(f"• {key} = …")
         lines.append("")
         lines.append("⚠️ چیزی ارسال نشد؛ این فقط پیش‌نمایش ساختار است.")
         buttons = [[Button.inline("↩️ ارائه‌دهنده", f"admin:ai:pv:{slug}".encode("ascii"))]]
@@ -2242,6 +2687,22 @@ async def handle_ai_callback(bot, event, data: str) -> None:
         await ui.show_settings(event)
     elif action == "lgf" and arg1:
         await ui._log_filter(event, arg1)
+    elif action == "keys":
+        await ui.show_all_keys(event, filter_service=arg1)
+    elif action == "kview" and arg1:
+        try:
+            await ui.show_key_detail(event, int(arg1))
+        except ValueError:
+            await event.answer("شناسهٔ کلید نامعتبر.", alert=True)
+    elif action == "wiz":
+        if arg1 == "srv" and arg2:
+            await ui.begin_wizard(event, service=arg2)
+        elif arg1 == "pv" and arg2 and len(parts) >= 6:
+            await ui.begin_wizard(event, service=arg2, slug=parts[5])
+        elif arg1 == "mdl" and arg2 and len(parts) >= 7:
+            await ui.wizard_pick_model_step(event, service=arg2, slug=parts[5], choice=parts[6])
+        else:
+            await ui.begin_wizard(event)
     elif action == "ky" and arg1:
         await ui.show_provider_keys(event, arg1)
     elif action == "kstate" and arg1 and arg2:
