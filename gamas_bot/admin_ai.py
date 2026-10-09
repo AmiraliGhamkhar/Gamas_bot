@@ -13,8 +13,13 @@ from datetime import datetime, timedelta, timezone
 import aiohttp
 from telethon import Button
 
-from .ai.adapters import RequestContext, adapter_for
+from .ai.adapters import RequestContext, adapter_for, resolve_json_strategy
 from .ai.models import (
+    FREE_PERMANENT,
+    FREE_PLAN,
+    FREE_PROMOTIONAL,
+    FREE_UNKNOWN,
+    PAID,
     ModelCapabilities,
     ModelInfo,
     default_model_for,
@@ -22,10 +27,20 @@ from .ai.models import (
     static_models,
 )
 from .ai.profiles import profile_for
+from .ai.routing import (
+    ROUTE_TASKS,
+    TASK_BENCHMARK,
+    TASK_CHUNK,
+    TASK_COMPILE,
+    TASK_HEALTH,
+    TASK_OUTLINE,
+    TASK_REPAIR,
+)
 from .ai.registry import (
     PROVIDER_REGISTRY,
     ProviderClass,
     free_only_generation_allowed,
+    region_service_scope_free_allowed,
     registry_info,
 )
 from .ai.sync import sync_provider_catalog
@@ -35,7 +50,15 @@ from .database import utc_now
 from .provider_health import cooldown_remaining_seconds
 
 SERVICE = "notes"
-TASK = "chunk_structuring"
+TASK = TASK_CHUNK
+_TASK_LABELS = {
+    TASK_OUTLINE: "طرح کلی",
+    TASK_CHUNK: "ساختاردهی چانک",
+    TASK_REPAIR: "تعمیر QA",
+    TASK_COMPILE: "تلفیق نهایی",
+    TASK_HEALTH: "تست سلامت",
+    TASK_BENCHMARK: "ارزیابی",
+}
 
 #: Extra-pass override columns and their Persian labels (spec §26).
 _PASS_COLUMNS = {
@@ -58,15 +81,42 @@ _CLASS_FA = {
 
 def _provider_mark(slug: str, settings_row: dict | None) -> str:
     info = registry_info(slug)
+    stored = settings_row or {}
     if settings_row and not settings_row.get("enabled", 1):
         return "⛔"
-    if free_only_generation_allowed(slug):
-        return "🟢"
+    attested = bool(stored.get("account_entitlement_attested_at")) and (
+        stored.get("account_entitlement_attested_by_admin_id") is not None
+    )
+    unlocked = bool(stored.get("experimental_unlocked"))
     if info.classification is ProviderClass.TRIAL_ONLY:
         return "🟡"
     if info.classification is ProviderClass.REGION_RESTRICTED:
+        if (
+            not unlocked
+            or not stored.get("region")
+            or not stored.get("deployment_scope")
+            or not stored.get("service_deployment_scope")
+            or not region_service_scope_free_allowed(
+                slug, stored.get("region"), stored.get("service_deployment_scope")
+            )
+            or not _future_timestamp(stored.get("quota_expires_at"))
+        ):
+            return "🟠"
+    if info.requires_account_verification and not attested:
         return "🟠"
+    if free_only_generation_allowed(slug, admin_enabled=unlocked or attested):
+        return "🟢"
     return "🔴"
+
+
+def _future_timestamp(value: object) -> bool:
+    if not value:
+        return False
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return bool(parsed.tzinfo and parsed.astimezone(timezone.utc) > datetime.now(timezone.utc))
+    except (TypeError, ValueError, OverflowError):
+        return False
 
 
 def _fmt_int(value) -> str:
@@ -185,7 +235,9 @@ class AIPanels:
         db = self.bot.db
         info = registry_info(slug)
         stored = (await db.ai_provider_settings_get(slug)) or {}
-        profile = profile_for(slug)
+        registry_row = await db.ai_provider_registry_get(slug)
+        base_profile = profile_for(slug)
+        profile = self.bot.provider_router._profile_with_settings(base_profile, stored)
         keys = await self.bot.credential_manager.list_summaries()
         key_rows = [
             item for item in keys
@@ -208,7 +260,7 @@ class AIPanels:
             # The local free-request ledger (spec §12): OpenRouter free models
             # are capped per UTC day; the live counter comes from the
             # key-endpoint probe (کاوش سهمیه), the reset is 00:00 UTC.
-            used = await db.ai_usage_today_count("openrouter")
+            used = await db.ai_usage_today_canonical_count("openrouter")
             live = await db.ai_quota_live_remaining("openrouter")
             limit = profile.daily_request_limit or 50
             remaining = live if live is not None else max(0, limit - used)
@@ -254,6 +306,19 @@ class AIPanels:
                     catalog_lines.append(f"• ارائه‌دهندهٔ پشت مدل: {upstream}")
             if verified:
                 catalog_lines.append(f"• آخرین تأیید کاتالوگ: {verified}")
+        if registry_row:
+            catalog_lines.append(
+                f"• رجیستری پایدار: {registry_row['classification']}"
+                f" | بازبینی مستندات: {registry_row['last_reviewed']}"
+            )
+            if registry_row.get("last_catalog_sync_at"):
+                catalog_lines.append(
+                    f"• آخرین ثبت موفق کاتالوگ: {str(registry_row['last_catalog_sync_at'])[:16]}"
+                )
+            if registry_row.get("last_quota_sync_at"):
+                catalog_lines.append(
+                    f"• آخرین ثبت سهمیه: {str(registry_row['last_quota_sync_at'])[:16]}"
+                )
         # Extra-pass policy with its origin (spec §26). Computed for *this*
         # provider, independently of which provider currently leads the route,
         # so the panel never shows another provider's policy.
@@ -284,7 +349,24 @@ class AIPanels:
             f"وضعیت: {'فعال ✅' if enabled else 'غیرفعال ⛔'}"
             + (" | قفل آزمایشی: باز 🔓" if unlocked else ""),
             f"بودجهٔ چانک: {_fmt_int(profile.chunk_token_budget)} توکن"
-            f" | حداکثر خروجی: {_fmt_int(profile.max_output_tokens)} توکن",
+            f" / {_fmt_int(profile.chunk_char_cap)} نویسه"
+            f" | حداکثر خروجی: {_fmt_int(profile.max_output_tokens)} توکن"
+            f" | تلفیق: {_fmt_int(profile.compile_token_budget)} توکن",
+            f"هم‌زمانی: {profile.max_concurrency} | تلاش مجدد: {profile.policy.max_retries}"
+            f" | مهلت: {profile.policy.timeout_seconds}s",
+            "سیاست عددی: "
+            + ", ".join(
+                f"{label}={'مدیر' if stored.get(field) is not None else 'پیش‌فرض'}"
+                for field, label in (
+                    ("chunk_token_budget", "chunk tokens"),
+                    ("chunk_char_cap", "chunk chars"),
+                    ("max_output_tokens", "output"),
+                    ("compile_token_budget", "compile"),
+                    ("max_concurrency", "concurrency"),
+                    ("max_retries", "retries"),
+                    ("timeout_seconds", "timeout"),
+                )
+            ),
             f"کلیدهای ثبت‌شده: {len(key_rows)}",
             "(وضعیت «آخرین بررسی» ثابت است تا زمانی که تأیید سند رسمی بروز شود.)",
         ]
@@ -319,6 +401,24 @@ class AIPanels:
             else:
                 lines.append("• مستندات این ارائه‌دهنده استحقاق رایگان حساب را اثبات نمی‌کند.")
                 lines.append("• تا زمان تأیید مدیر، در FREE_ONLY مسیردهی نمی‌شود.")
+            if slug == "alibaba":
+                lines.append(
+                    "• برای هر مدل در کنسول Alibaba، quota باقی‌مانده/انقضا را بررسی و "
+                    "Free Quota Only را فعال کنید؛ Gamas این داده‌ها را خودکار نمی‌خواند."
+                )
+        if info.classification is ProviderClass.REGION_RESTRICTED:
+            lines.append("")
+            lines.append("⚠️ محدوده و سهمیهٔ منطقه‌ای:")
+            lines.append(
+                f"• منطقه: {stored.get('region') or 'ثبت نشده'}"
+                f" | محیط: {stored.get('deployment_scope') or 'ثبت نشده'}"
+                f" | محدودهٔ سرویس Alibaba: {stored.get('service_deployment_scope') or 'ثبت نشده'}"
+            )
+            expiry = stored.get("quota_expires_at")
+            lines.append(
+                f"• پایان سهمیهٔ رایگان: {expiry or 'ثبت نشده'}"
+                + (" (فعال)" if _future_timestamp(expiry) else " (منقضی/تأییدنشده)")
+            )
         buttons = [
             [
                 Button.inline(
@@ -337,6 +437,15 @@ class AIPanels:
                     Button.inline(
                         "🔓 بازکردن قفل آزمایشی" if not unlocked else "🔒 قفل آزمایشی",
                         f"admin:ai:pxun:{slug}".encode("ascii"),
+                    )
+                ]
+            )
+        if info.classification is ProviderClass.REGION_RESTRICTED:
+            buttons.append(
+                [
+                    Button.inline(
+                        "🗺 ثبت/به‌روزرسانی منطقه و انقضا",
+                        f"admin:ai:pmeta:{slug}".encode("ascii"),
                     )
                 ]
             )
@@ -370,6 +479,32 @@ class AIPanels:
                 )
             )
         buttons.append(pass_row)
+        policy_steps = (
+            ("chunk_token_budget", "چانک", "down", "up"),
+            ("chunk_char_cap", "نویسه", "down", "up"),
+            ("max_output_tokens", "خروجی", "down", "up"),
+            ("compile_token_budget", "تلفیق", "down", "up"),
+            ("max_concurrency", "هم‌زمانی", "down", "up"),
+            ("max_retries", "تلاش", "down", "up"),
+            ("timeout_seconds", "مهلت", "down", "up"),
+        )
+        for field, label, down, up in policy_steps:
+            buttons.append(
+                [
+                    Button.inline(
+                        f"{label} −",
+                        f"admin:ai:ppol:{slug}:{field}:{down}".encode("ascii"),
+                    ),
+                    Button.inline(
+                        f"{label} +",
+                        f"admin:ai:ppol:{slug}:{field}:{up}".encode("ascii"),
+                    ),
+                    Button.inline(
+                        "↺ پیش‌فرض",
+                        f"admin:ai:ppol:{slug}:{field}:reset".encode("ascii"),
+                    ),
+                ]
+            )
         buttons.extend(
             [
                 [
@@ -390,6 +525,29 @@ class AIPanels:
             ]
         )
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
+    async def _begin_region_metadata(self, event, slug: str) -> None:
+        if slug not in PROVIDER_REGISTRY or registry_info(slug).classification is not ProviderClass.REGION_RESTRICTED:
+            await event.answer("این ارائه‌دهنده اطلاعات منطقه‌ای نمی‌خواهد.", alert=True)
+            return
+        admin_id = int((await event.get_sender()).id)
+        self.bot._pending_admin_actions[admin_id] = f"aiprovider_meta:{slug}"
+        await self.bot._edit_callback(
+            event,
+            "برای بررسی سهمیهٔ منطقه‌ای، فقط اطلاعات غیرمحرمانه را بفرستید:\n"
+            "region | service_scope | production | quota_expiry_UTC\n"
+            "Beijing: cn-beijing | china_mainland | production | 2026-12-31T00:00:00Z\n"
+            "Singapore: ap-southeast-1 | international | production | 2026-12-31T00:00:00Z\n\n"
+            "در کنسول Alibaba برای هر مدل quota و انقضا را ببینید و Free Quota Only را روشن کنید. "
+            "برای لغو /cancel را بفرستید.",
+            [[Button.inline("لغو", f"admin:ai:pmetacancel:{slug}".encode("ascii"))]],
+        )
+
+    async def _cancel_region_metadata(self, event, slug: str) -> None:
+        admin_id = int((await event.get_sender()).id)
+        self.bot._pending_admin_actions.pop(admin_id, None)
+        await event.answer("ثبت اطلاعات منطقه‌ای لغو شد.")
+        await self.show_provider_detail(event, slug)
 
     async def _toggle_provider(self, event, slug: str, field: str, label: str) -> None:
         if slug not in PROVIDER_REGISTRY:
@@ -492,6 +650,54 @@ class AIPanels:
         )
         label = {None: "پیش‌فرض", 1: "روشن", 0: "خاموش"}.get(new_value, "پیش‌فرض")
         await event.answer(f"{_PASS_COLUMNS[column]}: {label}")
+        await self.show_provider_detail(event, slug)
+
+    async def _adjust_profile(self, event, slug: str, field: str, direction: str) -> None:
+        """Bounded per-provider budget/retry/concurrency override."""
+        increments = {
+            "chunk_token_budget": (1000, 256, 1_000_000),
+            "chunk_char_cap": (2000, 1000, 2_000_000),
+            "max_output_tokens": (512, 256, 131_072),
+            "compile_token_budget": (2000, 512, 1_000_000),
+            "max_concurrency": (1, 1, 32),
+            "max_retries": (1, 0, 10),
+            "timeout_seconds": (30, 10, 600),
+        }
+        if slug not in PROVIDER_REGISTRY or field not in increments or direction not in {"up", "down", "reset"}:
+            await event.answer("تنظیم پروفایل نامعتبر است.", alert=True)
+            return
+        stored = (await self.bot.db.ai_provider_settings_get(slug)) or {}
+        base = profile_for(slug)
+        profile = self.bot.provider_router._profile_with_settings(base, stored)
+        if field == "max_retries":
+            effective = profile.policy.max_retries
+        elif field == "timeout_seconds":
+            effective = profile.policy.timeout_seconds
+        else:
+            effective = int(getattr(profile, field))
+        if direction == "reset":
+            value = None
+            audit_effective = int(getattr(base, field)) if field not in {"max_retries", "timeout_seconds"} else (
+                base.policy.max_retries if field == "max_retries" else base.policy.timeout_seconds
+            )
+        else:
+            step, minimum, maximum = increments[field]
+            value = max(minimum, min(maximum, effective + (step if direction == "up" else -step)))
+            audit_effective = value
+        admin_id = int((await event.get_sender()).id)
+        await self.bot.db.ai_provider_settings_upsert(
+            slug, admin_id=admin_id, **{field: value}
+        )
+        self.bot.provider_router.invalidate_cache()
+        await self.bot.db.add_audit_entry(
+            admin_id=admin_id,
+            action="ai_provider_profile_override",
+            target_type="ai_provider",
+            target_id=slug,
+            details={"field": field, "value": value, "effective": audit_effective},
+        )
+        label = "به پیش‌فرض برگشت" if value is None else f"به {value} تنظیم شد"
+        await event.answer(f"{field}: {label}")
         await self.show_provider_detail(event, slug)
 
     # ----------------------------------------------------------------- keys
@@ -605,6 +811,16 @@ class AIPanels:
         admin_id = int((await event.get_sender()).id)
         manager = self.bot.credential_manager
         if action == "enable":
+            record = await self.bot.db.provider_credential_record(key_id)
+            attested = bool(record and record.get("billing_attested_at")) and (
+                record.get("billing_attested_by_admin_id") is not None
+            )
+            if not record or str(record.get("billing_state") or "unknown") not in {"free", "paid"} or not attested:
+                await event.answer(
+                    "پیش از فعال‌سازی، صورتحساب این کلید را صریحاً تأیید کنید.", alert=True
+                )
+                await self.show_provider_keys(event, slug)
+                return
             changed = await manager.enable(key_id, admin_id)
         elif action == "disable":
             changed = await manager.disable(key_id, admin_id)
@@ -768,27 +984,30 @@ class AIPanels:
         )
 
     async def _wizard_model_choices(self, slug: str) -> list[ModelInfo]:
-        """Model buttons for the wizard: static seeds first, then the cached
-        live-discovered catalog (NaraRouter/NVIDIA have no static seeds)."""
-        choices = static_models(slug)[:6]
-        if choices:
-            return choices
+        """Prefer the live account catalog; use reviewed seeds only before sync.
+
+        Once a provider has returned a live catalog, absent static models are
+        not offered as choices (they may be inaccessible to this account).
+        """
         try:
-            rows = await self.bot.db.ai_models_list(slug, include_unavailable=False)
+            choices = await self.bot.provider_router.models.cached(slug)
         except Exception:
-            rows = []
-        discovered: list[ModelInfo] = []
-        for row in rows[:6]:
-            discovered.append(
-                ModelInfo(
-                    provider=slug,
-                    model_id=str(row["model"]),
-                    display_name=str(row.get("display_name") or ""),
-                    free_status=str(row.get("free_status") or "unknown"),
-                    capabilities=ModelCapabilities.from_json(row.get("capabilities_json")),
-                )
-            )
-        return discovered
+            choices = static_models(slug)
+        available = [
+            item for item in choices
+            if item.available and not item.deprecated and item.capabilities.supports_text
+        ]
+        rank = {
+            FREE_PERMANENT: 0,
+            FREE_PLAN: 0,
+            FREE_PROMOTIONAL: 1,
+            FREE_UNKNOWN: 2,
+            PAID: 3,
+        }
+        return sorted(
+            available,
+            key=lambda item: (rank.get(item.free_status, 2), item.model_id.casefold()),
+        )[:8]
 
     async def begin_key_wizard(self, event, slug: str) -> None:
         if slug not in PROVIDER_REGISTRY:
@@ -818,7 +1037,12 @@ class AIPanels:
             )
         buttons = []
         for index, m in enumerate(choices):
-            free_mark = "🆓" if m.free_status in {"free_permanent", "free_plan"} else "❔"
+            free_mark = {
+                FREE_PERMANENT: "🆓",
+                FREE_PLAN: "🆓",
+                FREE_PROMOTIONAL: "⏳",
+                PAID: "💳",
+            }.get(m.free_status, "❔")
             label = f"{free_mark} {m.model_id[:26]}"
             buttons.append(
                 [Button.inline(label, f"admin:ai:kmdl:{slug}:{index}".encode("ascii"))]
@@ -867,9 +1091,11 @@ class AIPanels:
     async def wizard_finish_report(
         self, event, *, credential_id: int, slug: str, label: str, model: str | None
     ) -> None:
-        """Spec §33 steps 7-9: non-destructive test, report, activate choice."""
+        """Read-only test report followed by explicit billing/activation choices."""
         bot = self.bot
         result = await bot.provider_health.test_credential(credential_id, force=True)
+        record = await bot.db.provider_credential_record(credential_id) or {}
+        billing_state = str(record.get("billing_state") or "unknown").lower()
         self._pending_key_test[f"{credential_id}"] = {
             "slug": slug,
             "http_status": result.http_status,
@@ -878,37 +1104,133 @@ class AIPanels:
         lines = [
             f"🧪 نتیجهٔ تست کلید #{credential_id} ({label})",
             "",
-            f"ارائه‌دهنده: {slug}" + (f" | مدل: {model}" if model else ""),
-            f"کلید: {result.masked} (به‌صورت رمزنگاری‌شده ذخیره شد — فقط ۴ رقم آخر نمایش داده می‌شود)",
+            f"ارائه‌دهنده: {slug}" + (f" | مدل انتخاب‌شده: {model}" if model else " | مدل: خودکار"),
+            f"کلید: {result.masked} (رمزشده ذخیره شد؛ فقط ۴ رقم آخر دیده می‌شود)",
             f"HTTP: {result.http_status or '—'} | وضعیت: {result.status_fa}",
-            f"تأخیر: {result.latency_ms or '—'}ms | نوع بررسی: {result.check_type} (read-only)",
+            f"تأخیر: {result.latency_ms or '—'}ms | بررسی: {result.check_type} (فقط خواندنی)",
+            f"صورتحساب کلید: {billing_state}"
+            + (f" | attested {str(record.get('billing_attested_at'))[:10]}"
+               if record.get("billing_attested_at") else " — تا attestation تولید مسدود است"),
         ]
+        model_for_report = model
+        choices = await self._wizard_model_choices(slug)
+        if not model_for_report and choices:
+            model_for_report = choices[0].model_id
+            lines.append(f"مدل پیشنهادی برای بررسی (نه الزاماً انتخاب نهایی): {model_for_report}")
+        if model_for_report:
+            try:
+                model_info = await bot.provider_router.models.resolve(slug, model_for_report)
+                adapter = adapter_for(slug, bot.settings)
+                strategy = resolve_json_strategy(adapter, model_info, provider_slug=slug)
+                status = {
+                    FREE_PERMANENT: "free_permanent",
+                    FREE_PLAN: "free_plan (requires free/no-overage key attestation)",
+                    FREE_PROMOTIONAL: "promotional (requires an active expiry)",
+                    PAID: "paid",
+                }.get(model_info.free_status, "unknown (not assumed free)")
+                caps = model_info.capabilities
+                lines.extend(
+                    [
+                        f"مدل: {model_info.model_id} | وضعیت رایگان: {status}",
+                        f"خروجی ساخت‌یافته: {strategy} | ورودی: "
+                        f"{_fmt_int(model_info.context_window) if model_info.context_window else 'نامشخص'}"
+                        f" | سقف خروجی: {_fmt_int(model_info.max_output_tokens) if model_info.max_output_tokens else 'نامشخص'}",
+                        "قابلیت‌ها: "
+                        + ", ".join(
+                            name for enabled, name in (
+                                (caps.supports_strict_json_schema, "Strict Schema"),
+                                (caps.supports_json_schema, "JSON Schema"),
+                                (caps.supports_json_object, "JSON Object"),
+                                (caps.supports_tools, "Tools"),
+                                (caps.supports_image, "Image"),
+                            ) if enabled
+                        ) if any((caps.supports_strict_json_schema, caps.supports_json_schema,
+                                  caps.supports_json_object, caps.supports_tools, caps.supports_image))
+                        else "قابلیت‌های پیشرفته تأیید نشده‌اند؛ از prompt-JSON استفاده می‌شود.",
+                    ]
+                )
+                if not str(model_info.source or "").startswith("live:"):
+                    lines.append("دسترسی این مدل در کاتالوگ زندهٔ این حساب هنوز تأیید نشده است.")
+            except Exception:
+                lines.append("قابلیت/کاتالوگ مدل قابل بررسی نبود؛ تا sync موفق، رایگان/در‌دسترس فرض نمی‌شود.")
+        quotas = await bot.db.ai_quota_latest(slug)
+        if quotas:
+            lines.append(
+                f"سهمیهٔ آخرین snapshot: {quotas[0].get('window')} / "
+                f"{quotas[0].get('remaining') or 'ناموجود'}"
+                + (f" | {str(quotas[0].get('observed_at'))[:16]}" if quotas[0].get("observed_at") else "")
+            )
+        else:
+            lines.append("سهمیهٔ زنده ثبت نشده؛ نبود داده به معنی سهمیهٔ نامحدود نیست.")
         if result.detail:
-            lines.append(f"جزئیات: {sanitize_text(result.detail)[:200]}")
-        lines.append("")
-        lines.append(
-            "کلید در حالت «غیرفعال» ذخیره شد. برای ورود به مسیر تولید، فعال کنید:"
+            lines.append(f"جزئیات تست: {sanitize_text(result.detail)[:160]}")
+        info = registry_info(slug)
+        provider_settings = (await bot.db.ai_provider_settings_get(slug)) or {}
+        account_attested = bool(provider_settings.get("account_entitlement_attested_at")) and (
+            provider_settings.get("account_entitlement_attested_by_admin_id") is not None
         )
-        buttons = [
-            [
-                Button.inline(
-                    "✅ فعال‌سازی", f"admin:ai:kact:{credential_id}".encode("ascii")
-                ),
-                Button.inline(
-                    "❌ حذف کلید", f"admin:ai:kdel:{credential_id}".encode("ascii")
-                ),
-            ],
-            [Button.inline("↩️ کلیدها", f"admin:ai:ky:{slug}".encode("ascii"))],
-        ]
+        if info.requires_account_verification:
+            lines.append(
+                "استحقاق حساب: " + ("تأیید شده" if account_attested else "تأیید نشده؛ FREE_ONLY مسدود است")
+            )
+        if info.classification is ProviderClass.REGION_RESTRICTED:
+            lines.append(
+                "محدوده/انقضای quota: "
+                + ("ثبت شده" if _future_timestamp(provider_settings.get("quota_expires_at"))
+                   and provider_settings.get("region") and provider_settings.get("deployment_scope")
+                   and region_service_scope_free_allowed(
+                       slug, provider_settings.get("region"), provider_settings.get("service_deployment_scope")
+                   ) else "نیازمند ثبت و بررسی")
+            )
+        lines.append("")
+        buttons: list[list] = []
+        attested_key = bool(record.get("billing_attested_at")) and (
+            record.get("billing_attested_by_admin_id") is not None
+        )
+        if billing_state == "unknown" or not attested_key:
+            lines.append("⚠️ برای این کلید هنوز وضعیت no-overage/paid را تأیید نکرده‌اید؛ تولید تا آن زمان مسدود می‌ماند.")
+            buttons.append(
+                [
+                    Button.inline("🔒 تأیید FREE / no-overage", f"admin:ai:kstate:attest_free:{credential_id}".encode("ascii")),
+                    Button.inline("💳 تأیید استفادهٔ پولی", f"admin:ai:kstate:attest_paid:{credential_id}".encode("ascii")),
+                ]
+            )
+        else:
+            lines.append("کلید هنوز غیرفعال است؛ پس از تأیید وضعیت صورتحساب می‌توانید آن را فعال کنید.")
+            buttons.append(
+                [
+                    Button.inline("✅ فعال‌سازی", f"admin:ai:kact:{credential_id}".encode("ascii")),
+                    Button.inline("❌ حذف کلید", f"admin:ai:kdel:{credential_id}".encode("ascii")),
+                ]
+            )
+        if info.requires_account_verification and not account_attested:
+            buttons.append(
+                [Button.inline("🧾 تأیید استحقاق حساب", f"admin:ai:patt:{slug}".encode("ascii"))]
+            )
+        if info.classification is ProviderClass.REGION_RESTRICTED:
+            buttons.append(
+                [Button.inline("🗺 ثبت منطقه/انقضا", f"admin:ai:pmeta:{slug}".encode("ascii"))]
+            )
+        buttons.append([Button.inline("❌ حذف کلید", f"admin:ai:kdel:{credential_id}".encode("ascii"))])
+        buttons.append([Button.inline("↩️ کلیدها", f"admin:ai:ky:{slug}".encode("ascii"))])
         await event.respond("\n".join(lines), buttons=buttons)
 
     async def _wizard_activate(self, event, credential_id: int) -> None:
         admin_id = int((await event.get_sender()).id)
-        changed = await self.bot.credential_manager.enable(credential_id, admin_id)
         record = await self.bot.db.provider_credential_record(credential_id)
         slug = _canonical_of(record) if record else "openai_compatible"
+        attested = bool(record and record.get("billing_attested_at")) and (
+            record.get("billing_attested_by_admin_id") is not None
+        )
+        if not record or str(record.get("billing_state") or "unknown") not in {"free", "paid"} or not attested:
+            await event.answer(
+                "پیش از فعال‌سازی، صورتحساب این کلید را صریحاً تأیید کنید.", alert=True
+            )
+            await self.show_provider_keys(event, slug)
+            return
+        changed = await self.bot.credential_manager.enable(credential_id, admin_id)
         self.bot.provider_health.invalidate()
-        await event.answer("کلید فعال شد و وارد مسیر می‌شود." if changed else "تغییری ثبت نشد.")
+        await event.answer("کلید فعال شد؛ مسیر FREE_ONLY/paid همچنان جداگانه کنترل می‌شود." if changed else "تغییری ثبت نشد.")
         await self.show_provider_keys(event, slug)
 
     async def _wizard_delete(self, event, credential_id: int) -> None:
@@ -947,35 +1269,62 @@ class AIPanels:
         )
 
     # --------------------------------------------------------------- routes
-    async def show_routes(self, event) -> None:
+    @staticmethod
+    def _route_callback(action: str, task_type: str, *args: str) -> bytes:
+        parts = ["admin", "ai", action]
+        # Preserve legacy callback bytes for the original chunk route.
+        if task_type != TASK:
+            parts.append(task_type)
+        parts.extend(args)
+        return ":".join(parts).encode("ascii")
+
+    async def show_routes(self, event, task_type: str = TASK) -> None:
+        if task_type not in ROUTE_TASKS:
+            await event.answer("نوع وظیفه نامعتبر است.", alert=True)
+            return
         db = self.bot.db
-        rows = await db.ai_routes_list(SERVICE, TASK)
-        lines = ["🧭 مسیر تولید جزوه (ترتیب failover)", ""]
+        rows = await db.ai_routes_list(SERVICE, task_type)
+        provider_settings = await db.ai_provider_settings_all()
+        lines = [f"🧭 مسیر «{_TASK_LABELS[task_type]}» (ترتیب failover)", ""]
         buttons: list[list] = []
+        task_buttons = [
+            Button.inline(
+                ("• " if candidate == task_type else "") + _TASK_LABELS[candidate],
+                f"admin:ai:rttask:{candidate}".encode("ascii"),
+            )
+            for candidate in ROUTE_TASKS
+        ]
+        buttons.extend([task_buttons[i : i + 2] for i in range(0, len(task_buttons), 2)])
         if not rows:
-            lines.append("مسیری ثبت نشده؛ پیش‌فرض داخلی اعمال می‌شود.")
+            lines.append("برای این وظیفه مسیری ثبت نشده؛ پیش‌فرض داخلی اعمال می‌شود.")
         for index, row in enumerate(rows):
             slug = str(row["provider"])
-            mark = _provider_mark(slug, None)
+            mark = _provider_mark(slug, provider_settings.get(slug))
             label = (
                 f"{index + 1}. {mark} {slug}"
                 + (" 🆓" if row.get("free_only") else " 💳")
                 + ("" if row.get("enabled", 1) else " ⛔")
             )
-            lines.append(label + (f" — مدل: {row['model']}" if row.get("model") else ""))
+            lines.append(
+                label + (f" — مدل: {row['model']}" if row.get("model") else " — مدل: خودکار")
+            )
             buttons.append(
                 [
-                    Button.inline("▲", f"admin:ai:rtmv:{index}:u".encode("ascii")),
-                    Button.inline("▼", f"admin:ai:rtmv:{index}:d".encode("ascii")),
+                    Button.inline("▲", self._route_callback("rtmv", task_type, str(index), "u")),
+                    Button.inline("▼", self._route_callback("rtmv", task_type, str(index), "d")),
                     Button.inline(
                         "⛔" if row.get("enabled", 1) else "✅",
-                        f"admin:ai:rten:{index}".encode("ascii"),
+                        self._route_callback("rten", task_type, str(index)),
                     ),
                     Button.inline(
                         "🆓" if row.get("free_only", 1) else "💳",
-                        f"admin:ai:rtfo:{index}".encode("ascii"),
+                        self._route_callback("rtfo", task_type, str(index)),
                     ),
-                    Button.inline("❌", f"admin:ai:rtdel:{index}".encode("ascii")),
+                    Button.inline(
+                        "🧠 مدل",
+                        f"admin:ai:rmodel:{task_type}:{index}".encode("ascii"),
+                    ),
+                    Button.inline("❌", self._route_callback("rtdel", task_type, str(index))),
                 ]
             )
         existing = {str(r["provider"]) for r in rows}
@@ -987,7 +1336,7 @@ class AIPanels:
             buttons.append(
                 [
                     Button.inline(
-                        f"➕ {slug}", f"admin:ai:rtadd:{slug}".encode("ascii")
+                        f"➕ {slug}", self._route_callback("rtadd", task_type, slug)
                     )
                     for slug in addable[:2]
                 ]
@@ -996,21 +1345,77 @@ class AIPanels:
                 buttons.append(
                     [
                         Button.inline(
-                            f"➕ {slug}", f"admin:ai:rtadd:{slug}".encode("ascii")
+                            f"➕ {slug}", self._route_callback("rtadd", task_type, slug)
                         )
                         for slug in addable[2:4]
                     ]
                 )
-        lines.append("")
-        lines.append("🆓 رایگان | 💳 fallback پولی | ⛔ غیرفعال. مسیرها بلافاصله در موتور اعمال می‌شوند.")
+        lines.extend(
+            [
+                "",
+                "🆓 رایگان | 💳 مجاز به fallback پولی (فقط با opt-in) | ⛔ غیرفعال.",
+                "مدل انتخاب‌شده پیش از درخواست بررسی می‌شود؛ مدل نامعتبر/پولی در FREE_ONLY رد می‌شود.",
+            ]
+        )
         buttons.append([Button.inline("↩️ پلتفرم AI", b"admin:ai")])
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
 
-    async def _routes(self) -> list[dict]:
-        rows = await self.bot.db.ai_routes_list(SERVICE, TASK)
+    async def show_route_model_choices(self, event, task_type: str, index_text: str) -> None:
+        if task_type not in ROUTE_TASKS:
+            await event.answer("نوع وظیفه نامعتبر است.", alert=True)
+            return
+        try:
+            index = int(index_text)
+        except ValueError:
+            await event.answer("ایندکس نامعتبر.", alert=True)
+            return
+        rows = await self._routes(task_type)
+        if not 0 <= index < len(rows):
+            await event.answer("مسیر نامعتبر.", alert=True)
+            return
+        slug = str(rows[index]["provider"])
+        choices = await self._wizard_model_choices(slug)
+        lines = [
+            f"🧠 انتخاب مدل برای {slug} — وظیفهٔ {_TASK_LABELS[task_type]}",
+            "",
+            "مدل‌های live اولویت دارند؛ اگر کاتالوگ sync شده باشد، مدل‌های غایب انتخاب نمی‌شوند.",
+        ]
+        buttons = [
+            [Button.inline("⚙️ خودکار", f"admin:ai:rsetmodel:{task_type}:{index}:a".encode("ascii"))]
+        ]
+        status_mark = {
+            FREE_PERMANENT: "🆓",
+            FREE_PLAN: "🆓",
+            FREE_PROMOTIONAL: "⏳",
+            PAID: "💳",
+        }
+        for choice_index, model in enumerate(choices):
+            mark = status_mark.get(model.free_status, "❔")
+            lines.append(
+                f"{choice_index + 1}. {mark} {model.model_id}"
+                + (f" | ورودی {_fmt_int(model.context_window)}" if model.context_window else "")
+                + (f" | خروجی {_fmt_int(model.max_output_tokens)}" if model.max_output_tokens else "")
+            )
+            buttons.append(
+                [
+                    Button.inline(
+                        f"{mark} {model.model_id[:32]}",
+                        f"admin:ai:rsetmodel:{task_type}:{index}:{choice_index}".encode("ascii"),
+                    )
+                ]
+            )
+        buttons.append([Button.inline("↩️ مسیرها", f"admin:ai:rt:{task_type}".encode("ascii"))])
+        await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
+    async def _routes(self, task_type: str = TASK) -> list[dict]:
+        if task_type not in ROUTE_TASKS:
+            return []
+        rows = await self.bot.db.ai_routes_list(SERVICE, task_type)
         return [dict(row) for row in rows]
 
-    async def _save_routes(self, rows: list[dict], admin_id: int) -> None:
+    async def _save_routes(
+        self, rows: list[dict], admin_id: int, task_type: str = TASK
+    ) -> None:
         entries = [
             {
                 "provider": str(row["provider"]),
@@ -1020,85 +1425,103 @@ class AIPanels:
             }
             for row in rows
         ]
-        await self.bot.db.ai_routes_replace(SERVICE, TASK, entries, admin_id=admin_id)
+        await self.bot.db.ai_routes_replace(SERVICE, task_type, entries, admin_id=admin_id)
         await self.bot.db.add_audit_entry(
             admin_id=admin_id,
             action="ai_route_update",
             target_type="ai_route",
-            target_id=TASK,
-            details={"providers": [e["provider"] for e in entries]},
+            target_id=task_type,
+            details={
+                "routes": [
+                    {
+                        "provider": entry["provider"],
+                        "enabled": bool(entry["enabled"]),
+                        "free_only": bool(entry["free_only"]),
+                        "model": str(entry.get("model") or "")[:160],
+                    }
+                    for entry in entries
+                ]
+            },
         )
         self.bot.provider_router.invalidate_cache()
 
-    async def _route_move(self, event, index_text: str, direction: str) -> None:
+    async def _route_move(
+        self, event, index_text: str, direction: str, task_type: str = TASK
+    ) -> None:
         try:
             index = int(index_text)
         except ValueError:
             await event.answer("ایندکس نامعتبر.", alert=True)
             return
-        rows = await self._routes()
+        rows = await self._routes(task_type)
         target = index + (1 if direction == "d" else -1)
         if not (0 <= index < len(rows) and 0 <= target < len(rows)):
             await event.answer("حرکت ممکن نیست.", alert=True)
             return
         rows[index], rows[target] = rows[target], rows[index]
         admin_id = int((await event.get_sender()).id)
-        await self._save_routes(rows, admin_id)
-        await self.show_routes(event)
+        await self._save_routes(rows, admin_id, task_type)
+        await self.show_routes(event, task_type)
 
-    async def _route_toggle(self, event, index_text: str) -> None:
+    async def _route_toggle(
+        self, event, index_text: str, task_type: str = TASK
+    ) -> None:
         try:
             index = int(index_text)
         except ValueError:
             await event.answer("ایندکس نامعتبر.", alert=True)
             return
-        rows = await self._routes()
+        rows = await self._routes(task_type)
         if not 0 <= index < len(rows):
             await event.answer("ایندکس نامعتبر.", alert=True)
             return
         rows[index]["enabled"] = 0 if rows[index].get("enabled", 1) else 1
         admin_id = int((await event.get_sender()).id)
-        await self._save_routes(rows, admin_id)
-        await self.show_routes(event)
+        await self._save_routes(rows, admin_id, task_type)
+        await self.show_routes(event, task_type)
 
-    async def _route_toggle_free_only(self, event, index_text: str) -> None:
+    async def _route_toggle_free_only(
+        self, event, index_text: str, task_type: str = TASK
+    ) -> None:
         try:
             index = int(index_text)
         except ValueError:
             await event.answer("ایندکس نامعتبر.", alert=True)
             return
-        rows = await self._routes()
+        rows = await self._routes(task_type)
         if not 0 <= index < len(rows):
             await event.answer("ایندکس نامعتبر.", alert=True)
             return
         rows[index]["free_only"] = 0 if rows[index].get("free_only", 1) else 1
         admin_id = int((await event.get_sender()).id)
-        await self._save_routes(rows, admin_id)
+        await self._save_routes(rows, admin_id, task_type)
         state_label = "فقط-رایگان" if rows[index]["free_only"] else "مجاز پولی"
         await event.answer(f"حالت این پله به «{state_label}» تغییر یافت.")
-        await self.show_routes(event)
+        await self.show_routes(event, task_type)
 
-    async def _route_delete(self, event, index_text: str) -> None:
+    async def _route_delete(
+        self, event, index_text: str, task_type: str = TASK
+    ) -> None:
         try:
             index = int(index_text)
         except ValueError:
             await event.answer("ایندکس نامعتبر.", alert=True)
             return
-        rows = await self._routes()
+        rows = await self._routes(task_type)
         if not 0 <= index < len(rows):
             await event.answer("ایندکس نامعتبر.", alert=True)
             return
         removed = rows.pop(index)
         admin_id = int((await event.get_sender()).id)
-        await self._save_routes(rows, admin_id)
+        await self._save_routes(rows, admin_id, task_type)
         await event.answer(f"{removed['provider']} از مسیر حذف شد.")
-        await self.show_routes(event)
+        await self.show_routes(event, task_type)
 
-    async def _route_add(self, event, slug: str) -> None:
+    async def _route_add(self, event, slug: str, task_type: str = TASK) -> None:
         if slug not in PROVIDER_REGISTRY:
             await event.answer("ارائه‌دهندهٔ نامعتبر.", alert=True)
             return
-        rows = await self._routes()
+        rows = await self._routes(task_type)
         if any(str(r["provider"]) == slug for r in rows):
             await event.answer("این ارائه‌دهنده هم‌اکنون در مسیر است.", alert=True)
             return
@@ -1112,9 +1535,39 @@ class AIPanels:
             }
         )
         admin_id = int((await event.get_sender()).id)
-        await self._save_routes(rows, admin_id)
+        await self._save_routes(rows, admin_id, task_type)
         await event.answer(f"{slug} به انتهای مسیر اضافه شد.")
-        await self.show_routes(event)
+        await self.show_routes(event, task_type)
+
+    async def _route_set_model(
+        self, event, task_type: str, index_text: str, choice: str
+    ) -> None:
+        if task_type not in ROUTE_TASKS:
+            await event.answer("نوع وظیفه نامعتبر است.", alert=True)
+            return
+        try:
+            index = int(index_text)
+        except ValueError:
+            await event.answer("ایندکس نامعتبر.", alert=True)
+            return
+        rows = await self._routes(task_type)
+        if not 0 <= index < len(rows):
+            await event.answer("مسیر نامعتبر.", alert=True)
+            return
+        if choice == "a":
+            model_id = None
+        else:
+            choices = await self._wizard_model_choices(str(rows[index]["provider"]))
+            try:
+                model_id = choices[int(choice)].model_id
+            except (ValueError, IndexError):
+                await event.answer("مدل نامعتبر یا از کاتالوگ منقضی است.", alert=True)
+                return
+        rows[index]["model"] = model_id
+        admin_id = int((await event.get_sender()).id)
+        await self._save_routes(rows, admin_id, task_type)
+        await event.answer(f"مدل این مسیر {'خودکار' if model_id is None else model_id} شد.")
+        await self.show_routes(event, task_type)
 
     # ---------------------------------------------------------------- usage
     async def show_usage(self, event, days: int = 7) -> None:
@@ -1773,8 +2226,14 @@ async def handle_ai_callback(bot, event, data: str) -> None:
         await ui._toggle_provider(event, arg1, "experimental_unlocked", "قفل آزمایشی")
     elif action == "patt" and arg1:
         await ui._toggle_account_entitlement(event, arg1)
+    elif action == "pmeta" and arg1:
+        await ui._begin_region_metadata(event, arg1)
+    elif action == "pmetacancel" and arg1:
+        await ui._cancel_region_metadata(event, arg1)
     elif action == "ppass" and arg1 and arg2:
         await ui._toggle_pass(event, arg1, arg2)
+    elif action == "ppol" and len(parts) >= 6:
+        await ui._adjust_profile(event, parts[3], parts[4], parts[5])
     elif action == "he":
         await ui.show_health(event)
     elif action == "herefresh":
@@ -1808,21 +2267,42 @@ async def handle_ai_callback(bot, event, data: str) -> None:
         slug = _canonical_of(record) if record else "openai_compatible"
         await ui._key_test(event, arg1, slug)
     elif action == "rt":
-        await ui.show_routes(event)
-    elif action == "rtmv" and arg1 is not None and arg2:
-        await ui._route_move(event, arg1, arg2)
-    elif action == "rten" and arg1 is not None:
-        await ui._route_toggle(event, arg1)
-    elif action == "rtdel" and arg1 is not None:
-        await ui._route_delete(event, arg1)
-    elif action == "rtadd" and arg1:
-        await ui._route_add(event, arg1)
+        await ui.show_routes(event, arg1 or TASK)
+    elif action == "rttask" and arg1:
+        await ui.show_routes(event, arg1)
+    elif action == "rtmv":
+        if len(parts) >= 6 and parts[3] in ROUTE_TASKS:
+            await ui._route_move(event, parts[4], parts[5], parts[3])
+        elif arg1 is not None and arg2:
+            await ui._route_move(event, arg1, arg2, TASK)
+    elif action == "rten":
+        if len(parts) >= 5 and parts[3] in ROUTE_TASKS:
+            await ui._route_toggle(event, parts[4], parts[3])
+        elif arg1 is not None:
+            await ui._route_toggle(event, arg1, TASK)
+    elif action == "rtdel":
+        if len(parts) >= 5 and parts[3] in ROUTE_TASKS:
+            await ui._route_delete(event, parts[4], parts[3])
+        elif arg1 is not None:
+            await ui._route_delete(event, arg1, TASK)
+    elif action == "rtadd":
+        if len(parts) >= 5 and parts[3] in ROUTE_TASKS:
+            await ui._route_add(event, parts[4], parts[3])
+        elif arg1:
+            await ui._route_add(event, arg1, TASK)
+    elif action == "rmodel" and arg1 and arg2:
+        await ui.show_route_model_choices(event, arg1, arg2)
+    elif action == "rsetmodel" and len(parts) >= 6:
+        await ui._route_set_model(event, parts[3], parts[4], parts[5])
     elif action == "kact" and arg1:
         await ui._wizard_activate(event, int(arg1))
     elif action == "kdel" and arg1:
         await ui._wizard_delete(event, int(arg1))
-    elif action == "rtfo" and arg1 is not None:
-        await ui._route_toggle_free_only(event, arg1)
+    elif action == "rtfo":
+        if len(parts) >= 5 and parts[3] in ROUTE_TASKS:
+            await ui._route_toggle_free_only(event, parts[4], parts[3])
+        elif arg1 is not None:
+            await ui._route_toggle_free_only(event, arg1, TASK)
     elif action == "pqprobe" and arg1:
         await ui.probe_quota_action(event, arg1)
     elif action == "bm":

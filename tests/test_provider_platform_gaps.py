@@ -4,7 +4,8 @@ Focused on behaviour that only appears once a deployment is actually
 configured, i.e. the parts the first platform pass deliberately left closed:
 
 * account-entitlement attestation for providers whose free eligibility is a
-  property of the account rather than of published documentation (Groq);
+  property of the account rather than of published documentation (Groq,
+  Mistral, Cloudflare and region-limited Alibaba);
 * administrator overrides for the extra pipeline passes (outline/repair/
   final compilation), which each spend free-tier quota;
 * non-token metering (Cloudflare Neurons) — estimation, daily guard, and the
@@ -20,6 +21,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from cryptography.fernet import Fernet
@@ -139,6 +141,145 @@ class AccountEntitlementTests(PlatformCase):
         groq_leg = next(leg for leg in plan.legs if leg.canonical == "groq")
         self.assertTrue(groq_leg.account_verified)
 
+    async def test_mistral_and_cloudflare_require_account_attestation(self):
+        for slug in ("mistral", "cloudflare"):
+            self.assertTrue(registry_info(slug).requires_account_verification)
+            plan = await self.router.plan()
+            self.assertEqual(
+                dict(plan.skipped).get(slug), "account_entitlement_unverified"
+            )
+            await self._attest(slug)
+            plan = await self.router.plan()
+            self.assertIn(slug, [leg.canonical for leg in plan.legs])
+
+    async def test_alibaba_fails_closed_until_unlock_scope_expiry_and_attestation(self):
+        from datetime import datetime, timedelta, timezone
+
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "alibaba", "enabled": 1, "free_only": 1}],
+            admin_id=None,
+        )
+        plan = await self.router.plan()
+        self.assertEqual(dict(plan.skipped).get("alibaba"), "region_restricted_locked")
+
+        await self.db.ai_provider_settings_upsert(
+            "alibaba", admin_id=42, experimental_unlocked=1
+        )
+        self.router.invalidate_cache()
+        plan = await self.router.plan()
+        self.assertEqual(dict(plan.skipped).get("alibaba"), "region_metadata_unverified")
+
+        expiry = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        await self.db.ai_provider_settings_upsert(
+            "alibaba", admin_id=42, region="us-east-1",
+            deployment_scope="production", service_deployment_scope="international",
+            quota_expires_at=expiry,
+        )
+        self.router.invalidate_cache()
+        plan = await self.router.plan()
+        self.assertEqual(dict(plan.skipped).get("alibaba"), "region_scope_ineligible")
+
+        await self.db.ai_provider_settings_upsert(
+            "alibaba", admin_id=42, region="cn-beijing",
+            deployment_scope="production", service_deployment_scope="china_mainland",
+            quota_expires_at=expiry,
+        )
+        self.router.invalidate_cache()
+        plan = await self.router.plan()
+        self.assertEqual(dict(plan.skipped).get("alibaba"), "account_entitlement_unverified")
+
+        await self._attest("alibaba")
+        plan = await self.router.plan()
+        self.assertIn("alibaba", [leg.canonical for leg in plan.legs])
+        leg = next(item for item in plan.legs if item.canonical == "alibaba")
+        self.assertTrue(leg.account_verified)
+        self.assertEqual(leg.account_quota_expires_at, expiry)
+        self.assertEqual(leg.account_region, "cn-beijing")
+        self.assertEqual(leg.account_service_scope, "china_mainland")
+        self.assertTrue(
+            self.router._alibaba_endpoint_matches_region(
+                leg.account_region, leg.account_service_scope,
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+            )
+        )
+        self.assertFalse(
+            self.router._alibaba_endpoint_matches_region(
+                leg.account_region, leg.account_service_scope,
+                "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            )
+        )
+
+    async def test_paid_alibaba_route_still_carries_region_for_endpoint_validation(self):
+        settings = replace(
+            self.settings, ai_free_only=False, ai_allow_paid_fallback=True
+        )
+        self.router = ProviderRouter(
+            self.db, settings, self.manager, self.tracker, self.models
+        )
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "alibaba", "enabled": 1, "free_only": 0}],
+            admin_id=None,
+        )
+        await self.db.ai_provider_settings_upsert(
+            "alibaba", admin_id=42, experimental_unlocked=1,
+            region="cn-beijing", deployment_scope="production",
+            service_deployment_scope="china_mainland",
+            quota_expires_at="2020-01-01T00:00:00+00:00",
+        )
+        self.router.invalidate_cache()
+
+        plan = await self.router.plan()
+        self.assertEqual([leg.canonical for leg in plan.legs], ["alibaba"])
+        leg = plan.legs[0]
+        self.assertFalse(leg.free_only)
+        self.assertEqual(leg.account_region, "cn-beijing")
+        self.assertTrue(self.router._alibaba_endpoint_matches_region(
+            leg.account_region, leg.account_service_scope,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ))
+        self.assertFalse(self.router._alibaba_endpoint_matches_region(
+            leg.account_region, leg.account_service_scope,
+            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        ))
+
+    async def test_free_account_gate_survives_relaxed_global_free_only_switch(self):
+        settings = replace(self.settings, ai_free_only=False)
+        self.router = ProviderRouter(
+            self.db, settings, self.manager, self.tracker, self.models
+        )
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "mistral", "enabled": 1, "free_only": 1}],
+            admin_id=None,
+        )
+        plan = await self.router.plan()
+        self.assertEqual(
+            dict(plan.skipped).get("mistral"), "account_entitlement_unverified"
+        )
+
+        # A free-marked Alibaba leg still cannot use a region/scope pair that
+        # has no reviewed free-quota evidence when the global switch is relaxed.
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "alibaba", "enabled": 1, "free_only": 1}],
+            admin_id=None,
+        )
+        from datetime import datetime, timedelta, timezone
+
+        expiry = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        await self.db.ai_provider_settings_upsert(
+            "alibaba", admin_id=42, experimental_unlocked=1,
+            region="us-east-1", deployment_scope="production",
+            service_deployment_scope="international", quota_expires_at=expiry,
+            account_entitlement_attested_at=utc_now(),
+            account_entitlement_attested_by_admin_id=42,
+        )
+        self.router.invalidate_cache()
+        plan = await self.router.plan()
+        self.assertEqual(dict(plan.skipped).get("alibaba"), "region_scope_ineligible")
+
     async def test_partial_attestation_is_not_evidence(self):
         # A timestamp without the attesting admin id is not an attestation.
         await self.db.ai_provider_settings_upsert(
@@ -163,7 +304,7 @@ class AccountEntitlementTests(PlatformCase):
         declared = {
             slug for slug, info in PROVIDER_REGISTRY.items() if info.requires_account_verification
         }
-        self.assertEqual(declared, {"groq"})
+        self.assertEqual(declared, {"groq", "mistral", "cloudflare", "alibaba"})
         # A provider without the requirement keeps its own classification gate:
         # NVIDIA hosted endpoints are trial-only and stay blocked regardless of
         # any provider setting an administrator can flip from the panel.
@@ -178,6 +319,25 @@ class AccountEntitlementTests(PlatformCase):
         for provider, reason in plan.skipped:
             self.assertIsInstance(provider, str)
             self.assertIsInstance(reason, str)
+
+
+class PaidFallbackGateTests(PlatformCase):
+    async def test_paid_route_stays_closed_when_ai_free_only_is_off_without_paid_opt_in(self):
+        settings = replace(
+            self.settings, ai_free_only=False, ai_allow_paid_fallback=False
+        )
+        self.router = ProviderRouter(
+            self.db, settings, self.manager, self.tracker, self.models
+        )
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "anthropic", "enabled": 1, "free_only": 0}],
+            admin_id=None,
+        )
+        self.router.invalidate_cache()
+        plan = await self.router.plan()
+        self.assertEqual(dict(plan.skipped).get("anthropic"), "paid_fallback_disabled")
+        self.assertFalse(plan.legs)
 
 
 class ExtraPassOverrideTests(PlatformCase):
@@ -234,6 +394,67 @@ class ExtraPassOverrideTests(PlatformCase):
         self.assertFalse(profile_for("groq").repair_enabled)
         self.assertFalse(profile_for("groq").final_compile_enabled)
         self.assertFalse(profile_for("openrouter").outline_enabled)
+
+
+class ProviderProfileOverrideTests(PlatformCase):
+    async def test_profile_overrides_apply_to_the_task_plan(self):
+        await self.db.ai_routes_replace(
+            "notes", "chunk_structuring",
+            [{"provider": "nara", "enabled": 1, "free_only": 1}],
+            admin_id=None,
+        )
+        await self.db.ai_provider_settings_upsert(
+            "nara", admin_id=42, chunk_token_budget=3000, chunk_char_cap=9000,
+            max_concurrency=3, max_retries=0, timeout_seconds=60,
+        )
+        self.router.invalidate_cache()
+        plan = await self.router.plan()
+        self.assertEqual(plan.profile.chunk_token_budget, 3000)
+        self.assertEqual(plan.profile.chunk_char_cap, 9000)
+        effective = self.router._profile_with_settings(
+            profile_for("nara"), await self.db.ai_provider_settings_get("nara")
+        )
+        self.assertEqual(effective.max_concurrency, 3)
+        self.assertEqual(effective.policy.max_retries, 0)
+        self.assertEqual(effective.policy.timeout_seconds, 60)
+
+    async def test_provider_limiter_enforces_configured_concurrency(self):
+        import asyncio
+
+        limiter = self.router._provider_limiter("nara")
+        active = 0
+        maximum = 0
+        lock = asyncio.Lock()
+
+        async def worker(limit: int):
+            nonlocal active, maximum
+            async with limiter.slot(limit):
+                async with lock:
+                    active += 1
+                    maximum = max(maximum, active)
+                await asyncio.sleep(0.01)
+                async with lock:
+                    active -= 1
+
+        await asyncio.gather(*(worker(1) for _ in range(4)))
+        self.assertEqual(maximum, 1)
+
+    async def test_provider_failure_propagates_without_masking_or_leaking_a_slot(self):
+        from gamas_bot.ai.adapters import NoteFailure
+
+        limiter = self.router._provider_limiter("groq")
+        failure = NoteFailure(
+            category="rate_limited", provider="groq", model="model-x",
+            http_status=429, message="quota reached",
+        )
+        with self.assertRaises(NoteFailure) as caught:
+            async with limiter.slot(1):
+                raise failure
+        self.assertIs(caught.exception, failure)
+        self.assertEqual(limiter._active, 0)
+        async with limiter.slot(1):
+            self.assertEqual(limiter._active, 1)
+        self.assertEqual(limiter._active, 0)
 
 
 class MeteredUnitTests(unittest.TestCase):
@@ -430,6 +651,56 @@ class Migration008ApplyTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await db.ai_usage_today_units("cloudflare"), 0)
             finally:
                 await db.close()
+
+
+class Migration009010Tests(unittest.TestCase):
+    def test_registry_and_policy_migrations_are_forward_only(self):
+        from gamas_bot.database import split_sql_statements
+
+        for name in (
+            "009_provider_registry.sql",
+            "010_provider_policy_overrides.sql",
+            "011_alibaba_service_scope.sql",
+        ):
+            script = _migrations_sql(name)
+            upper = script.upper()
+            for forbidden in ("DROP TABLE", "DROP COLUMN", "TRUNCATE", "DELETE FROM"):
+                self.assertNotIn(forbidden, upper, f"{name}: {forbidden}")
+            for statement in split_sql_statements(script):
+                normalized = statement.upper()
+                if "ALTER TABLE" in normalized:
+                    self.assertIn("ADD COLUMN", normalized, statement)
+
+
+class ProviderRegistryPersistenceTests(PlatformCase):
+    async def test_reviewed_registry_and_successful_sync_timestamps_persist(self):
+        await self.router.ensure_seeded()
+        row = await self.db.ai_provider_registry_get("cloudflare")
+        self.assertIsNotNone(row)
+        self.assertEqual(row["classification"], "free_plan")
+        self.assertEqual(row["metering_unit"], "neurons")
+        self.assertTrue(row["requires_account_verification"])
+        self.assertNotIn("secret", json.dumps(row).lower())
+
+        await self.models.apply_discovery(
+            "cloudflare",
+            [ModelInfo(provider="cloudflare", model_id="@cf/account/model", source=_LIVE)],
+        )
+        await self.db.ai_quota_upsert(
+            "cloudflare", None, "@cf/account/model", "day", "9000", None, source="test"
+        )
+        first = await self.db.ai_provider_registry_get("cloudflare")
+        self.assertTrue(first["last_catalog_sync_at"])
+        self.assertTrue(first["last_quota_sync_at"])
+        catalog_at = first["last_catalog_sync_at"]
+        quota_at = first["last_quota_sync_at"]
+
+        await self.db.ai_provider_registry_sync(
+            [info.as_registry_row() for info in PROVIDER_REGISTRY.values()]
+        )
+        refreshed = await self.db.ai_provider_registry_get("cloudflare")
+        self.assertEqual(refreshed["last_catalog_sync_at"], catalog_at)
+        self.assertEqual(refreshed["last_quota_sync_at"], quota_at)
 
 
 class LogFilterTests(PlatformCase):
@@ -660,6 +931,29 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class AccountModelVerificationTests(PlatformCase):
+    async def test_account_attestation_does_not_replace_live_model_discovery(self):
+        from gamas_bot.ai.models import FREE_UNKNOWN
+
+        leg = RouteLeg(
+            provider="cloudflare", canonical="cloudflare", account_verified=True,
+            free_only=True,
+        )
+        static = ModelInfo(
+            provider="cloudflare", model_id="@cf/account/model",
+            free_status=FREE_UNKNOWN, source="static_seed",
+        )
+        self.assertEqual(
+            self.router._model_blocked(leg, static),
+            "model availability requires a live catalog sync",
+        )
+        live = ModelInfo(
+            provider="cloudflare", model_id="@cf/account/model",
+            free_status=FREE_UNKNOWN, source="live:/accounts/model-search",
+        )
+        self.assertIsNone(self.router._model_blocked(leg, live))
+
+
 class NvidiaEndpointLifecycleTests(PlatformCase):
     """Spec §16: free endpoints are live capabilities, and dead models get a
     suggested replacement instead of an unexplained failover."""
@@ -715,6 +1009,19 @@ class NvidiaEndpointLifecycleTests(PlatformCase):
         )
         info = await self.models.resolve("nvidia", "a/one")
         self.assertTrue(info.free_endpoint)
+
+    async def test_catalog_sync_does_not_resurrect_deprecated_models(self):
+        await self.models.apply_discovery(
+            "nvidia", [ModelInfo(provider="nvidia", model_id="a/one", source=_LIVE)]
+        )
+        await self.db.ai_models_set_deprecated("nvidia", "a/one", date="2026-10-01")
+        await self.models.apply_discovery(
+            "nvidia", [ModelInfo(provider="nvidia", model_id="a/one", source=_LIVE)]
+        )
+        info = await self.models.resolve("nvidia", "a/one")
+        self.assertTrue(info.deprecated)
+        leg = RouteLeg(provider="nvidia", canonical="nvidia", free_only=True)
+        self.assertEqual(self.router._model_blocked(leg, info), "model unavailable/deprecated")
 
     def test_replacement_prefers_a_live_free_endpoint(self):
         from gamas_bot.ai.models import suggest_replacement

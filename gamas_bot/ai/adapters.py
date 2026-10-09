@@ -671,12 +671,27 @@ class CloudflareAdapter(OpenAICompatibleAdapter):
     def parse_discovery(self, payload, **_kwargs) -> list[ModelInfo]:
         from datetime import datetime, timezone
 
-        from .models import FREE_UNKNOWN, ModelCapabilities
+        from .models import FREE_UNKNOWN, PAID, ModelCapabilities
 
         entries = self._model_search_entries(payload)
         if entries is None:
             raise ValueError("invalid Cloudflare Model Search page")
         now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        # Workers AI pricing docs explicitly mark these model IDs as requiring
+        # a paid billing method (reviewed 2026-10-09). Never infer free status
+        # from catalog presence or a reported $0 price: the rest remain unknown
+        # and require the account no-overage attestation plus the local quota
+        # guard before this deployment can use them.
+        paid_only_ids = {
+            "@cf/moonshotai/kimi-k2.6",
+            "@cf/moonshotai/kimi-k2.7-code",
+            "@cf/zai-org/glm-5.2",
+            "@cf/zai-org/glm-5.3",
+            "@cf/zai-org/glm-5.3-flash",
+            "@cf/deepseek-ai/deepseek-v4-flash-0731",
+            "@cf/deepseek-ai/deepseek-v4-pro-0813",
+        }
+        paid_only_ids = {value.casefold() for value in paid_only_ids}
         discovered = []
         for entry in entries:
             if not isinstance(entry, dict):
@@ -684,14 +699,66 @@ class CloudflareAdapter(OpenAICompatibleAdapter):
             model_id = entry.get("id")
             if not isinstance(model_id, str) or not model_id.strip():
                 raise ValueError("Cloudflare model entry has no documented id")
-            # Model Search's OpenRouter format is used only for stable IDs.
-            # Pricing, capabilities, and FREE_ONLY status are not inferred.
+            model_id = model_id.strip()
+            parameters = entry.get("supported_parameters")
+            if not isinstance(parameters, list):
+                parameters = []
+            supported = {str(value).casefold() for value in parameters}
+            architecture = entry.get("architecture")
+            if not isinstance(architecture, dict):
+                architecture = {}
+            modalities = architecture.get("input_modalities")
+            if not isinstance(modalities, list):
+                modalities = []
+            modalities = {str(value).casefold() for value in modalities}
+            output_modalities = architecture.get("output_modalities")
+            if not isinstance(output_modalities, list):
+                output_modalities = []
+            output_modalities = {str(value).casefold() for value in output_modalities}
+            top_provider = entry.get("top_provider")
+            if not isinstance(top_provider, dict):
+                top_provider = {}
+            context_window = _int_or_none(entry.get("context_length")) or 0
+            max_output = (
+                _int_or_none(top_provider.get("max_completion_tokens"))
+                or _int_or_none(entry.get("max_output_tokens"))
+                or 0
+            )
+            capabilities = ModelCapabilities(
+                supports_text=(
+                    "text" in output_modalities
+                    if output_modalities else "text" in modalities
+                ),
+                supports_image="image" in modalities,
+                supports_audio=bool({"audio", "speech"} & (modalities | output_modalities)),
+                supports_pdf=bool({"file", "pdf"} & modalities),
+                supports_tools="tools" in supported,
+                supports_json_object="response_format" in supported,
+                supports_json_schema="structured_outputs" in supported,
+                # OpenRouter compatibility metadata does not prove strict JSON
+                # Schema enforcement; leave this false absent explicit evidence.
+                supports_strict_json_schema=False,
+                supports_temperature="temperature" in supported,
+                supports_top_p="top_p" in supported,
+                supports_system_message=True,
+                requires_paid_billing=model_id.casefold() in paid_only_ids,
+            )
+            is_paid_only = model_id.casefold() in paid_only_ids
             discovered.append(
                 ModelInfo(
                     provider=self.canonical,
-                    model_id=model_id.strip(),
-                    capabilities=ModelCapabilities(),
-                    free_status=FREE_UNKNOWN,
+                    model_id=model_id,
+                    display_name=str(entry.get("name") or "")[:160],
+                    context_window=context_window,
+                    max_output_tokens=max_output,
+                    capabilities=capabilities,
+                    # Catalog presence proves access, not free pricing. Keep
+                    # unreviewed IDs unknown so only this account-scoped
+                    # provider's explicit no-overage attestation can authorize
+                    # them; known paid-billing IDs remain hard-blocked.
+                    free_status=PAID if is_paid_only else FREE_UNKNOWN,
+                    deprecated=bool(entry.get("deprecated", False)),
+                    available=entry.get("available") is not False,
                     source="live:/accounts/{account_id}/ai/models/search?format=openrouter",
                     source_last_verified_at=now,
                 )
@@ -775,6 +842,13 @@ class GeminiNativeAdapter(NoteAdapter):
         generation_config: dict = {"maxOutputTokens": ctx.max_output_tokens}
         if ctx.temperature is not None and ctx.model_info.capabilities.supports_temperature:
             generation_config["temperature"] = NOTE_TEMPERATURE
+        if (
+            ctx.model_info.capabilities.supports_reasoning_effort
+            and ctx.reasoning_policy in {"low", "medium", "high"}
+        ):
+            generation_config["thinkingConfig"] = {
+                "thinkingLevel": ctx.reasoning_policy.upper()
+            }
         if ctx.json_strategy == STRATEGY_GEMINI_SCHEMA:
             generation_config["responseMimeType"] = "application/json"
             generation_config["responseSchema"] = gemini_compat()

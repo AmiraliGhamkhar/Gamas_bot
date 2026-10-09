@@ -1842,6 +1842,79 @@ class StudyBot:
             await self.ai_panels.handle_wizard_label(event, text)
             return
 
+        if action.startswith("aiprovider_meta:"):
+            from .ai.registry import (
+                ProviderClass,
+                region_service_scope_free_allowed,
+                registry_info,
+            )
+
+            slug = action.split(":", 1)[1]
+            if slug not in {"alibaba"} or registry_info(slug).classification is not ProviderClass.REGION_RESTRICTED:
+                self._pending_admin_actions.pop(telegram_id, None)
+                await event.reply("ارائه‌دهندهٔ منطقه‌ای نامعتبر است.", buttons=admin_menu())
+                return
+            parts = [part.strip() for part in text.split("|")]
+            if len(parts) != 4 or any(not part for part in parts):
+                await event.reply(
+                    "قالب درست: region | service_scope | production | quota_expiry_UTC — هر چهار بخش الزامی‌اند."
+                )
+                return
+            region, service_scope, deployment, expiry_text = parts
+            region = region.casefold()
+            service_scope = service_scope.casefold().replace("-", "_").replace(" ", "_")
+            if (
+                not re.fullmatch(r"[a-z0-9_-]{2,80}", region)
+                or deployment.casefold() not in {"production", "prod", "live"}
+            ):
+                await event.reply(
+                    "این ثبت فقط برای استقرار production و کد منطقهٔ معتبر است؛ دوباره بفرستید."
+                )
+                return
+            if not region_service_scope_free_allowed(slug, region, service_scope):
+                await event.reply(
+                    "FREE_ONLY برای Alibaba فقط با cn-beijing + china_mainland یا "
+                    "ap-southeast-1 + international قابل بررسی است."
+                )
+                return
+            try:
+                expiry = datetime.fromisoformat(expiry_text.replace("Z", "+00:00"))
+                if expiry.tzinfo is None or expiry.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+                    raise ValueError("expiry must be a future timezone-aware timestamp")
+            except (TypeError, ValueError, OverflowError):
+                await event.reply("انقضا باید تاریخ/زمان آینده با منطقهٔ زمانی داشته باشد؛ نمونه: 2026-12-31T00:00:00Z")
+                return
+            expiry_utc = expiry.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+            await self.db.ai_provider_settings_upsert(
+                slug,
+                admin_id=telegram_id,
+                region=region,
+                deployment_scope="production",
+                service_deployment_scope=service_scope,
+                quota_expires_at=expiry_utc,
+            )
+            self._pending_admin_actions.pop(telegram_id, None)
+            self.provider_router.invalidate_cache()
+            await self.db.add_audit_entry(
+                admin_id=telegram_id,
+                action="ai_provider_region_quota_metadata_updated",
+                target_type="ai_provider",
+                target_id=slug,
+                details={
+                    "region": region,
+                    "deployment_scope": "production",
+                    "service_deployment_scope": service_scope,
+                    "quota_expires_at": expiry_utc,
+                },
+            )
+            await event.reply(
+                "اطلاعات منطقه/محدودهٔ سرویس و پایان سهمیه ثبت شد. برای جلوگیری از هزینه، "
+                "مدل را در Alibaba Free Quota Only کنید، Base URL کلید را با منطقه هماهنگ سازید، "
+                "و سپس استحقاق حساب و no-overage را تأیید کنید.",
+                buttons=[[Button.inline("جزئیات ارائه‌دهنده", f"admin:ai:pv:{slug}".encode("ascii"))]],
+            )
+            return
+
         if action.startswith("aikey_replace:"):
             # Spec §34: replace secret without ever exposing old or new key.
             # Message is deleted BEFORE persistence; if deletion fails, abort.
@@ -2311,6 +2384,7 @@ class StudyBot:
             or pending_action.startswith("credential_meta:")
             or pending_action.startswith("payment_reject:")
             or pending_action.startswith("aikey_")
+            or pending_action.startswith("aiprovider_meta:")
         ):
             if command == "/cancel":
                 self._pending_admin_actions.pop(telegram_id, None)

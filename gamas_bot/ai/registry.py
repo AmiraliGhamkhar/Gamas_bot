@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import json
 
 
 class ProviderClass(str, Enum):
@@ -114,6 +115,35 @@ class ProviderInfo:
     aliases: tuple[str, ...] = ()
     last_reviewed: str = "2026-10"  # month precision: reviewed metadata date
 
+    def as_registry_row(self) -> dict[str, object]:
+        """Plain, secret-free row persisted for admin audit/visibility."""
+        return {
+            "provider": self.slug,
+            "display_name": self.display_name,
+            "classification": self.classification.value,
+            "protocol": self.protocol,
+            "base_url": self.base_url,
+            "auth_style": self.auth_style.value,
+            "docs_url": self.docs_url,
+            "pricing_url": self.pricing_url,
+            "data_use_policy": self.data_use_policy,
+            "commercial_use_allowed": int(self.commercial_use_allowed),
+            "free_tier_policy": self.free_tier_policy,
+            "supported_services_json": json.dumps(self.supported_services),
+            "generation_allowed_in_free_only": int(self.generation_allowed_in_free_only),
+            "quota_can_become_paid": int(self.quota_can_become_paid),
+            "exposes_quota_headers": int(self.exposes_quota_headers),
+            "model_discovery": int(self.model_discovery),
+            "requires_explicit_enable": int(self.requires_explicit_enable),
+            "requires_account_verification": int(self.requires_account_verification),
+            "metering_unit": self.metering_unit,
+            "included_units_per_day": self.included_units_per_day,
+            "region_restriction": self.region_restriction,
+            "experimental_only": int(self.experimental_only),
+            "aliases_json": json.dumps(self.aliases),
+            "last_reviewed": self.last_reviewed,
+        }
+
 
 # ---------------------------------------------------------------------------
 # Registry data
@@ -135,10 +165,11 @@ _GEMINI = ProviderInfo(
     commercial_use_allowed=True,
     free_tier_policy=(
         "Free tier per model in AI Studio projects without billing. RPM/TPM/RPD "
-        "limits are model-dependent and read live from responses."
+        "limits are model-dependent and read live from responses; linking a "
+        "billing account changes requests to paid-tier pricing."
     ),
     generation_allowed_in_free_only=True,
-    quota_can_become_paid=False,
+    quota_can_become_paid=True,
     exposes_quota_headers=True,
     aliases=(),
 )
@@ -237,12 +268,15 @@ _MISTRAL = ProviderInfo(
     free_tier_policy=(
         "Free mode (last verified 2026-10-09): API keys work with included "
         "monthly usage inside the per-model limits on the Admin Panel Limits "
-        "page; pay-as-you-go only extends usage beyond it. The exact limit is "
-        "not hard-coded and is observed at runtime."
+        "page; pay-as-you-go extends usage beyond it. The account's current "
+        "mode/limits are not exposed by a documented API, so FREE_ONLY requires "
+        "an administrator's no-overage account attestation plus live model "
+        "discovery."
     ),
-    generation_allowed_in_free_only=True,
+    generation_allowed_in_free_only=False,
     quota_can_become_paid=True,
     exposes_quota_headers=True,
+    requires_account_verification=True,
 )
 
 _SAMBANOVA = ProviderInfo(
@@ -257,11 +291,11 @@ _SAMBANOVA = ProviderInfo(
     data_use_policy="See SambaNova cloud terms.",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Free tier = no payment method on the account (last verified "
-        "2026-10-09): e.g. Meta-Llama-3.3-70B-Instruct at 20 RPM / 20 RPD / "
-        "200K TPD; the Developer tier (payment method linked) raises these. "
-        "Limits are per model — never assumed equal. Multiple API keys are "
-        "supported by the provider and by Gamas rotation."
+        "Free tier = no payment method linked (last verified 2026-10-09). "
+        "Production models DeepSeek-V3.1, Meta-Llama-3.3-70B-Instruct and "
+        "gpt-oss-120b each list 20 RPM / 20 RPD / 200K TPD; preview models are "
+        "excluded. The Developer tier raises limits and requires a payment "
+        "method. Multiple API keys are supported by the provider and Gamas."
     ),
     generation_allowed_in_free_only=True,
     quota_can_become_paid=True,
@@ -338,14 +372,17 @@ _CLOUDFLARE = ProviderInfo(
     commercial_use_allowed=True,
     free_tier_policy=(
         "10,000 Neurons/day account allocation (last verified 2026-10-09); "
-        "Workers Paid can bill usage above it. Model Search does not document "
-        "free-pricing/capability fields, so discovered models remain unknown "
-        "until explicitly verified. FREE_ONLY needs current account and "
-        "overage-safeguard attestation."
+        "Workers Paid can bill usage above it. Official pricing names models "
+        "that require paid billing; those exact IDs are blocked. Other "
+        "account-discovered models remain free-status unknown because catalog "
+        "presence/pricing does not prove quota entitlement. FREE_ONLY therefore "
+        "requires a no-overage account attestation, a live catalog and a local "
+        "Neuron guard."
     ),
-    generation_allowed_in_free_only=True,
+    generation_allowed_in_free_only=False,
     quota_can_become_paid=True,
     exposes_quota_headers=False,
+    requires_account_verification=True,
     # Workers AI meters every modality in Neurons, not tokens, and the OpenAI
     # compatible endpoint does not return a neuron count. Gamas estimates
     # neuron spend locally so the documented daily inclusion can be protected.
@@ -393,16 +430,18 @@ _ALIBABA = ProviderInfo(
     data_use_policy="See Alibaba Cloud Model Studio terms (regional).",
     commercial_use_allowed=True,
     free_tier_policy=(
-        "Free quota is region/model/account dependent with an expiry "
-        "(help.aliyun.com/en/model-studio/new-free-quota). Disabled for global "
-        "free routing by default; admins opt in per deployment after explicit "
-        "confirmation."
+        "Free quota is region/model/account dependent and expires "
+        "(help.aliyun.com/en/model-studio/new-free-quota). Never auto-routed: "
+        "an administrator must explicitly enable the provider, attest the "
+        "account's no-overage free entitlement, and record region, deployment "
+        "scope and a future quota-expiry timestamp."
     ),
-    generation_allowed_in_free_only=False,
-    quota_can_become_paid=False,
+    generation_allowed_in_free_only=True,
+    quota_can_become_paid=True,
     exposes_quota_headers=False,
     requires_explicit_enable=True,
-    region_restriction="Region/account-dependent free quota; endpoint per region.",
+    requires_account_verification=True,
+    region_restriction="Region/account/model-dependent free quota; regional endpoint required.",
 )
 
 _COHERE = ProviderInfo(
@@ -514,6 +553,26 @@ PROVIDER_REGISTRY: dict[str, ProviderInfo] = {
 #: ``openai_compatible`` stays for backward compatibility and generic gateways.
 PROVIDER_CHOICES_NOTES = frozenset(PROVIDER_REGISTRY)
 
+#: Provider/model-studio scopes with an explicitly documented free quota.
+#: Beijing is Mainland-only; Singapore uses the International deployment scope.
+#: Other region/scope pairs fail closed for Alibaba FREE_ONLY routing.
+ALIBABA_FREE_REGION_SCOPES = {
+    "cn-beijing": "china_mainland",
+    "ap-southeast-1": "international",
+}
+
+
+def region_service_scope_free_allowed(
+    slug: str, region: str | None, service_scope: str | None
+) -> bool:
+    """Whether a provider's exact region/scope pair is reviewed for free use."""
+    if slug != "alibaba":
+        return True
+    expected = ALIBABA_FREE_REGION_SCOPES.get(str(region or "").strip().casefold())
+    actual = str(service_scope or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    return bool(expected and actual == expected)
+
+
 #: Percent-encoded/host substrings → canonical slug (URL-based classification).
 _HOST_HINTS: tuple[tuple[str, str], ...] = (
     ("router.bynara.id", "nara"),
@@ -566,7 +625,7 @@ def classification_of(slug: str) -> ProviderClass:
     return registry_info(slug).classification
 
 
-def free_only_generation_allowed(slug: str, *, admin_enabled: bool = True) -> bool:
+def free_only_generation_allowed(slug: str, *, admin_enabled: bool = False) -> bool:
     """Provider-level FREE_ONLY gate (model-level checks happen later).
 
     ``region_restricted`` providers can be opted in by an admin after explicit
@@ -577,7 +636,12 @@ def free_only_generation_allowed(slug: str, *, admin_enabled: bool = True) -> bo
         return False
     if info.requires_explicit_enable and not admin_enabled:
         return False
-    return info.generation_allowed_in_free_only
+    if info.generation_allowed_in_free_only:
+        return True
+    # Providers whose free entitlement is account-scoped become eligible only
+    # after a deployment attestation. This is never used for trial/paid-only
+    # providers; ProviderRouter applies those stronger class gates first.
+    return bool(info.requires_account_verification and admin_enabled)
 
 
 def free_class_fa(slug: str) -> str:
