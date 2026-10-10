@@ -48,6 +48,7 @@ from .ai.sync import sync_provider_catalog
 from .ai.tokens import estimate_tokens
 from .ai.usage import sanitize_text
 from .database import utc_now
+from .progress import to_persian_digits
 from .provider_health import cooldown_remaining_seconds
 from .stt_platform.models import static_stt_models
 from .stt_platform.registry import STT_PROVIDER_REGISTRY, free_class_fa
@@ -129,6 +130,20 @@ def _fmt_int(value) -> str:
         return str(value)
 
 
+def latency_sample_note(metrics: dict) -> str:
+    """Suffix naming the sampling cap when the p95 could not see the whole window.
+
+    The percentile is read from at most ``Database.LATENCY_PERCENTILE_SAMPLE``
+    newest rows so a busy day never materialises every latency in Python. When
+    that read saturated, the figure is the p95 of recent traffic rather than of
+    the window the request counters describe — and an admin comparing the two
+    lines on one screen has to be told, not left to notice.
+    """
+    if not metrics.get("latency_sample_capped"):
+        return ""
+    return f" (نمونه: {_fmt_int(metrics.get('latency_samples') or 0)} درخواست اخیر)"
+
+
 def _stt_size_label(size) -> str:
     try:
         size = int(size)
@@ -151,6 +166,27 @@ def _stt_duration_label(seconds) -> str:
     return f"{total} ثانیه ({total // 60} دقیقه)"
 
 
+#: Persian label for a catalog row's free class. ``unknown`` never reads as
+#: "free": the panel states what is actually known, because an undocumented
+#: price is not an entitlement (spec §16).
+_FREE_STATUS_FA = {
+    "free_permanent": "رایگان دائمی 🆓",
+    "free_plan": "رایگان (پلن حساب) 🆓",
+    "free_promotional": "رایگان موقت 🎁",
+    "paid": "پولی 💳",
+    "unknown": "نامشخص — رایگان تلقی نمی‌شود ⚠️",
+}
+
+
+def _free_status_label(row: dict) -> str:
+    status = str(row.get("free_status") or "unknown").strip().lower()
+    label = _FREE_STATUS_FA.get(status, status)
+    until = str(row.get("free_until") or "").strip()
+    if status == "free_promotional" and until:
+        label += f" تا {until[:10]}"
+    return label
+
+
 def _requires_paid_billing(row: dict) -> bool:
     """Read the ``requires_paid_billing`` capability from a catalog row.
 
@@ -168,6 +204,36 @@ def _requires_paid_billing(row: dict) -> bool:
     return bool((caps or {}).get("requires_paid_billing"))
 
 
+#: Skip codes emitted by :meth:`ProviderRouter.plan` in operator language. The
+#: technical code is always printed next to the sentence so a report can be
+#: matched to the code without guessing, and the four families answer the only
+#: question an operator has: is this my configuration, the provider, its quota,
+#: or the billing policy?
+_SKIP_REASON_FA = {
+    "route_disabled": ("پلهٔ مسیر در پنل غیرفعال شده است", "config"),
+    "disabled": ("ارائه‌دهنده در تنظیمات غیرفعال شده است", "config"),
+    "experimental_locked": ("ارائه‌دهندهٔ آزمایشی قفل است؛ بازکردن آن دستی است", "config"),
+    "no_usable_model": ("مدل رایگان قابل استفاده‌ای برای این حساب یافت نشد", "config"),
+    "no_credential": ("کلید فعال و آماده‌ای برای این سرویس ثبت نشده است", "config"),
+    "region_metadata_unverified": ("منطقه و محدودهٔ استقرار تأیید نشده‌اند", "config"),
+    "region_restricted_locked": ("این ارائه‌دهنده فقط با فعال‌سازی دستی مجاز است", "policy"),
+    "region_scope_ineligible": ("محدودهٔ ثبت‌شده برای استفادهٔ رایگان مجاز نیست", "policy"),
+    "unavailable": ("سرویس در دسترس نیست", "provider"),
+    "provider_transient": ("سرویس موقتاً خطا می‌دهد؛ کمی بعد دوباره امتحان کنید", "provider"),
+    "auth_failed": ("کلید رد شد؛ باید تعویض یا رفع قرنطینه شود", "provider"),
+    "quota_exhausted": ("سهمیهٔ روزانهٔ این کلید تمام شده است", "quota"),
+    "free_quota_expiry_unverified": ("تاریخ انقضای سهمیهٔ رایگان تأیید نشده است", "quota"),
+    "billing_blocked": ("سیاست رایگان‌سازی این ارائه‌دهنده را بلاک کرده است", "billing"),
+    "not_free_eligible": ("استفادهٔ رایگان این ارائه‌دهنده تأیید نشده است", "billing"),
+    "account_entitlement_unverified": ("پلن حساب باید توسط مدیر تأیید شود", "billing"),
+    "billing_attestation_required": ("کلید هنوز برای لایهٔ رایگان/پولی تأیید نشده است", "billing"),
+    "trial_only_blocked": ("این سرویس فقط اعتبار آزمایشی دارد و برای جزوه مجاز نیست", "billing"),
+    "paid_fallback_disabled": ("مسیر پولی است و fallback پولی در سطح سرور بسته است", "billing"),
+    "terms_of_use_blocked": ("شرایط استفاده، استفادهٔ تجاری/آموزشی ربات را اجازه نمی‌دهد", "policy"),
+    "provider_license_required": ("این سرویس برای ربات نیازمند لایسنس جداگانه است", "policy"),
+}
+
+
 class AIPanels:
     """Thin UI layer bound to one bot instance (kept out of bot.py for size)."""
 
@@ -179,8 +245,10 @@ class AIPanels:
     # ------------------------------------------------------------------ UI
     async def show_platform_home(self, event) -> None:
         db = self.bot.db
-        metrics = await db.ai_usage_metrics(days=1)
-        latency_p95 = await db.ai_usage_latency_p95(days=1)
+        # One read for counters *and* latency: the panel used to run two queries
+        # over two different windows for the same "today".
+        metrics = await db.ai_usage_overview(days=1)
+        latency_p95 = metrics["latency_p95_ms"]
         settings = self.bot.settings
         lines = [
             "🤖 پلتفرم ارائه‌دهنده‌های هوش مصنوعی",
@@ -189,7 +257,11 @@ class AIPanels:
             f" (موفق {_fmt_int(metrics['successes'])}, "
             f"429/quota {_fmt_int(metrics['rate_limited'])}, "
             f"fallback {_fmt_int(metrics['fallbacks'])})",
-            f"تأخیر p95: {_fmt_int(latency_p95)}ms" if latency_p95 else "تأخیر p95: —",
+            (
+                f"تأخیر p95: {_fmt_int(latency_p95)}ms{latency_sample_note(metrics)}"
+                if latency_p95
+                else "تأخیر p95: —"
+            ),
             "",
             f"حالت FREE_ONLY: {'روشن ✅' if settings.ai_free_only else 'خاموش ⛔'}"
             f" | fallback پولی: {'روشن ⚠️' if settings.ai_allow_paid_fallback else 'خاموش ✅'}",
@@ -197,6 +269,9 @@ class AIPanels:
             "",
             "تغییر حالت FREE_ONLY/fallback فقط از طریق متغیرهای محیطی سرور انجام می‌شود.",
         ]
+        # Three groups, every existing control kept: configuration first, then
+        # observation, then the tools that can spend quota. Route management
+        # exists ONLY here (the admin root used to duplicate it).
         buttons = [
             [
                 Button.inline("📡 ارائه‌دهنده‌ها", b"admin:ai:pv"),
@@ -218,10 +293,8 @@ class AIPanels:
                 Button.inline("⚙️ تنظیمات", b"admin:ai:st"),
                 Button.inline("🧪 Dry-run", b"admin:ai:dry"),
             ],
-            [
-                Button.inline("📈 نمای مسیر و بودجه", b"admin:ai:plan"),
-                Button.inline("↩️ پنل مدیریت", b"admin:home"),
-            ],
+            [Button.inline("📈 نمای مسیر و بودجه", b"admin:ai:plan")],
+            [Button.inline("↩️ پنل مدیریت", b"admin:home")],
         ]
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
 
@@ -248,7 +321,7 @@ class AIPanels:
             buttons.append(
                 row_pairs[index] + (row_pairs[index + 1] if index + 1 < len(row_pairs) else [])
             )
-        lines.append("🟢 رایگان | 🟡 trial | 🟠 محلودیت منطقه | 🔴 پولی | ⛔ غیرفعال")
+        lines.append("🟢 رایگان | 🟡 trial | 🟠 محدودیت منطقه | 🔴 پولی | ⛔ غیرفعال")
         lines.append("برای مدیریت کلید، مسیر، سیاست و تست هر ارائه‌دهنده روی نام آن بزنید.")
         buttons.append([Button.inline("↩️ پلتفرم AI", b"admin:ai")])
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
@@ -272,11 +345,21 @@ class AIPanels:
         enabled = stored.get("enabled", 1)
         unlocked = bool(stored.get("experimental_unlocked"))
         free_blocked = bool(stored.get("free_only_blocked"))
-        quotas = await db.ai_quota_latest(slug)
+        # The snapshot table keeps exactly one row per (credential, model,
+        # window) — the upsert overwrites in place — so every row here is a
+        # distinct quota the provider reports. Three of them used to be shown
+        # under a heading that promised the picture; now the panel renders all
+        # of them up to a stated display bound, with the rest named.
+        quotas = await db.ai_quota_latest_for_provider(slug, limit=self.QUOTA_ROWS + 1)
+        quota_cut = len(quotas) > self.QUOTA_ROWS
+        quotas = quotas[: self.QUOTA_ROWS]
         quota_lines: list[str] = []
-        for row in quotas[:3]:
+        ledger_lines: list[str] = []
+        for row in quotas:
+            who = f" | کلید #{row['credential_id']}" if row.get("credential_id") else ""
+            who += f" | {row['model']}" if row.get("model") else ""
             quota_lines.append(
-                f"• {row['window']}: {row['remaining'] or '—'}"
+                f"• {row['window']}: {row['remaining'] or '—'}{who}"
                 + (f" | بازنشانی: {row['reset_at']}" if row.get("reset_at") else "")
                 + f" | {str(row['observed_at'])[:16]}"
                 + (f" ({row['source']})" if row.get("source") not in {None, "headers"} else "")
@@ -289,7 +372,10 @@ class AIPanels:
             live = await db.ai_quota_live_remaining("openrouter")
             limit = profile.daily_request_limit or 50
             remaining = live if live is not None else max(0, limit - used)
-            quota_lines.append(
+            # Not a provider snapshot, so it stays out of the counted group:
+            # the openrouter ledger is a local counter, and mixing it in would
+            # make any statement about how many snapshots are shown wrong.
+            ledger_lines.append(
                 f"• حسابگر روزانه: {used} مصرف‌شده | {remaining} باقی‌مانده"
                 f" (سقف پیش‌فرض {limit}) | بازنشانی ۰۰:۰۰ UTC"
             )
@@ -416,10 +502,16 @@ class AIPanels:
             f"کلیدهای ثبت‌شده: {len(key_rows)}",
             "(وضعیت «آخرین بررسی» ثابت است تا زمانی که تأیید سند رسمی بروز شود.)",
         ]
-        if quota_lines:
+        if quota_lines or ledger_lines:
             lines.append("")
-            lines.append("سهمیهٔ رصدشده (آخرین تصویر):")
+            lines.append("سهمیهٔ رصدشده — جدیدترین تصویر هر کلید/مدل/پنجره:")
             lines.extend(quota_lines)
+            lines.extend(ledger_lines)
+        if quota_cut:
+            lines.append(
+                f"فقط {to_persian_digits(self.QUOTA_ROWS)} تصویر سهمیه این‌جا فهرست می‌شود؛ "
+                "ادامه در جدول ai_quota_snapshots است."
+            )
         if unit_lines:
             lines.append("")
             lines.append(f"مصرف برآوردی {profile.metering_unit}:")
@@ -747,11 +839,23 @@ class AIPanels:
         await self.show_provider_detail(event, slug)
 
     # ----------------------------------------------------------------- keys
-    async def show_all_keys(self, event, filter_service: str | None = None) -> None:
+    #: Credential rows per page. Every row costs a text line plus a three-button
+    #: row, and an inline keyboard stops at 100 buttons, so an uncapped list was
+    #: not merely long: past ~33 keys the panel could not be sent at all.
+    KEYS_PAGE_SIZE = 12
+
+    async def show_all_keys(
+        self, event, filter_service: str | None = None, page: object = 0
+    ) -> None:
         """Spec §35 API Keys panel: provider / label / model / masked key / status / priority."""
         items = await self.bot.credential_manager.list_summaries()
         if filter_service and filter_service in {"notes", "stt"}:
             items = [item for item in items if item.get("service") == filter_service]
+        size = self.KEYS_PAGE_SIZE
+        pages = max(1, -(-len(items) // size))
+        current = min(self._split_page(page), pages - 1)
+        start = current * size
+        window = items[start : start + size]
         lines = [
             "🔑 پنل کلیدهای API (API Keys Panel)",
             "",
@@ -762,7 +866,9 @@ class AIPanels:
             lines.append("هنوز کلیدی در پایگاه‌داده ثبت نشده است.")
             lines.append("برای ثبت امن از دکمهٔ «➕ افزودن کلید (Wizard)» استفاده کنید.")
         buttons: list[list] = []
-        for index, item in enumerate(items, start=1):
+        if pages > 1:
+            lines.insert(1, f"صفحهٔ {current + 1} از {pages} — {_fmt_int(len(items))} کلید")
+        for index, item in enumerate(window, start=start + 1):
             provider = str(item.get("provider") or "-")
             label = str(item.get("label") or "-")
             model = str(item.get("model") or "پیش‌فرض")
@@ -784,16 +890,30 @@ class AIPanels:
                 Button.inline("🧪 تست", f"admin:ai:keytest:{key_id}".encode("ascii")),
                 Button.inline("⛔" if item.get("enabled") else "✅", f"admin:ai:kstate:{'disable' if item.get('enabled') else 'enable'}:{key_id}".encode("ascii")),
             ])
+        scope = filter_service if filter_service in {"notes", "stt"} else "all"
+        if pages > 1:
+            nav: list = []
+            if current > 0:
+                nav.append(self._keys_button(scope, current - 1, "◀️ قبلی"))
+            if current < pages - 1:
+                nav.append(self._keys_button(scope, current + 1, "بعدی ▶️"))
+            buttons.append(nav)
         buttons.extend([
             [
                 Button.inline("➕ افزودن کلید (Wizard)", b"admin:ai:wiz"),
-                Button.inline("همه", b"admin:ai:keys"),
-                Button.inline("📝 جزوه", b"admin:ai:keys:notes"),
-                Button.inline("🎙 STT", b"admin:ai:keys:stt"),
+                self._keys_button("all", 0, "همه"),
+                self._keys_button("notes", 0, "📝 جزوه"),
+                self._keys_button("stt", 0, "🎙 STT"),
             ],
             [Button.inline("↩️ پلتفرم AI", b"admin:ai")],
         ])
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
+    @staticmethod
+    def _keys_button(scope: str, page: int, label: str) -> Button:
+        return Button.inline(
+            label, f"admin:ai:keys:{scope}:{int(page)}".encode("ascii")
+        )
 
     async def show_key_detail(self, event, key_id: int) -> None:
         """Spec §34 Key actions and detailed status card."""
@@ -1194,6 +1314,31 @@ class AIPanels:
             [[Button.inline("↩️ کلیدها", f"admin:ai:ky:{slug}".encode("ascii"))]],
         )
 
+    #: How many model choices one wizard step offers. The list is a convenience,
+    #: not a gate: the custom-model step accepts any id, and the panel now says
+    #: when it left known models out.
+    WIZARD_MODEL_CHOICES = 8
+
+    def _wizard_stt_models(self, slug: str) -> list[str]:
+        """The STT ids this step offers, in exactly the order it renders them.
+
+        Shared by the render and the resolve path on purpose: the callback has to
+        carry an index into *this* list, because Telegram caps ``callback_data``
+        at 64 bytes and
+        ``admin:ai:wiz:mdl:stt:gemini_transcribe:gemini-3.5-transcribe-live`` is
+        already 65 — a long model id used to make the whole step unsendable.
+        """
+        info = STT_PROVIDER_REGISTRY.get(slug)
+        if info is None:
+            return []
+        models = list(
+            dict.fromkeys(list(info.models) + [seed.model for seed in static_stt_models(slug)])
+        )
+        if slug == "openai_compatible":
+            default_openai = self.bot.settings.stt_openai_model or "whisper-1"
+            models = list(dict.fromkeys([default_openai] + models))
+        return models
+
     async def _wizard_model_choices(self, slug: str) -> list[ModelInfo]:
         """Prefer the live account catalog; use reviewed seeds only before sync.
 
@@ -1310,12 +1455,8 @@ class AIPanels:
             if info is None:
                 await event.answer("ارائه‌دهندهٔ ناشناخته است.", alert=True)
                 return
-            stt_models = list(
-                dict.fromkeys(list(info.models) + [seed.model for seed in static_stt_models(slug)])
-            )
-            default_openai = bot.settings.stt_openai_model or "whisper-1"
-            if slug == "openai_compatible":
-                stt_models = list(dict.fromkeys([default_openai] + stt_models))
+            stt_models = self._wizard_stt_models(slug)
+            shown_models = stt_models[: self.WIZARD_MODEL_CHOICES]
             base_url = {
                 "speechmatics": bot.settings.speechmatics_base_url,
                 "openai_compatible": bot.settings.stt_openai_base_url,
@@ -1338,9 +1479,21 @@ class AIPanels:
                 "",
                 "اکنون مدل پیش‌فرض این کلید را انتخاب کنید:",
             ]
+            if len(stt_models) > len(shown_models):
+                lines.append(
+                    f"   ({len(stt_models) - len(shown_models)} مدل شناخته‌شدهٔ دیگر در این "
+                    "فهرست نیامده؛ با «مدل سفارشی» شناسهٔ کامل را وارد کنید.)"
+                )
             buttons = []
-            for m in stt_models[:8]:
-                buttons.append([Button.inline(f"🎯 {m}"[:60], f"admin:ai:wiz:mdl:stt:{slug}:{m}".encode("ascii"))])
+            for index, m in enumerate(shown_models):
+                buttons.append(
+                    [
+                        Button.inline(
+                            f"🎯 {m}"[:60],
+                            f"admin:ai:wiz:mdl:stt:{slug}:{index}".encode("ascii")[:64],
+                        )
+                    ]
+                )
             buttons.append([Button.inline("مدل سفارشی / پیش‌فرض", f"admin:ai:wiz:mdl:stt:{slug}:custom".encode("ascii"))])
             buttons.append([Button.inline("↩️ مرحله قبل", f"admin:ai:wiz:srv:{service}".encode("ascii"))])
             await self.bot._edit_callback(event, "\n".join(lines), buttons)
@@ -1361,7 +1514,7 @@ class AIPanels:
             "مدل پیش‌فرض این کلید را انتخاب کنید:",
         ]
         buttons = []
-        for index, m in enumerate(choices[:8]):
+        for index, m in enumerate(choices[: self.WIZARD_MODEL_CHOICES]):
             free_mark = {
                 FREE_PERMANENT: "🆓",
                 FREE_PLAN: "🆓",
@@ -1370,6 +1523,11 @@ class AIPanels:
             }.get(m.free_status, "❔")
             label = f"{free_mark} {m.model_id[:26]}"
             buttons.append([Button.inline(label, f"admin:ai:wiz:mdl:notes:{slug}:{index}".encode("ascii"))])
+        if len(choices) > self.WIZARD_MODEL_CHOICES:
+            lines.append(
+                f"   ({len(choices) - self.WIZARD_MODEL_CHOICES} مدل دیگر در کاتالوگ شناخته شده "
+                "این فهرست نیست؛ با «مدل سفارشی» شناسهٔ کامل را وارد کنید.)"
+            )
         buttons.append([Button.inline("مدل سفارشی / بدون مدل", f"admin:ai:wiz:mdl:notes:{slug}:custom".encode("ascii"))])
         buttons.append([Button.inline("↩️ مرحله قبل", f"admin:ai:wiz:srv:{service}".encode("ascii"))])
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
@@ -1379,7 +1537,19 @@ class AIPanels:
         model = None
         base_url = None
         if service == "stt":
-            if choice != "custom":
+            if choice == "custom":
+                model = None
+            elif choice.isdigit():
+                options = self._wizard_stt_models(slug)
+                position = int(choice)
+                if position >= len(options):
+                    # A stale wizard card (the catalog changed under it): say so and
+                    # keep the pending setup untouched rather than storing a wrong model.
+                    await event.answer("این مدل دیگر در فهرست نیست؛ مرحله را دوباره باز کنید.", alert=True)
+                    return
+                model = options[position]
+            else:
+                # A literal model id is still accepted (older callbacks, custom flows).
                 model = choice
             stt_entry = STT_PROVIDER_REGISTRY.get(slug)
             base_url = {
@@ -1700,6 +1870,29 @@ class AIPanels:
         db = self.bot.db
         rows = await db.ai_routes_list(SERVICE, task_type)
         provider_settings = await db.ai_provider_settings_all()
+        # "Saved in the route" is not "usable right now". The panel asks the same
+        # authoritative planner the executor uses, so a provider blocked by a
+        # gate (no credential, ToU, region, quota, attestation) is never shown as
+        # merely green. A failed plan leaves the rows unannotated rather than
+        # guessing: the route itself stays editable either way.
+        blocked: dict[str, str] = {}
+        try:
+            plan = await self.bot.provider_router.plan(task_type)
+        except Exception:
+            plan = None
+        if plan is not None:
+            for slug, code in plan.skipped:
+                blocked[slug] = code
+            # Legs that pass the gates but have no ready credential are the other
+            # half of "looks fine, will not run". This asks the router's own
+            # credential pool (the exact predicate the executor rotates over)
+            # rather than a second eligibility implementation.
+            try:
+                for leg in plan.legs:
+                    if not await self.bot.provider_router.credentials_for(leg):
+                        blocked.setdefault(leg.canonical, "no_credential")
+            except Exception:
+                pass
         leg1 = rows[0]["provider"] if len(rows) > 0 else "—"
         leg2 = rows[1]["provider"] if len(rows) > 1 else "—"
         leg3 = rows[2]["provider"] if len(rows) > 2 else "—"
@@ -1745,6 +1938,12 @@ class AIPanels:
             lines.append(
                 label + (f" — مدل: {row['model']}" if row.get("model") else " — مدل: خودکار")
             )
+            code = blocked.get(_canonical_of(row)) or blocked.get(slug)
+            if code:
+                reason, kind = _SKIP_REASON_FA.get(
+                    code, ("دلایل سیاست‌گذاری این ارائه‌دهنده را ببینید", "policy")
+                )
+                lines.append(f"   ⚠️ {reason} [{kind}] — {code}")
             buttons.append(
                 [
                     Button.inline("▲", self._route_callback("rtmv", task_type, str(index), "u")),
@@ -1765,32 +1964,31 @@ class AIPanels:
                 ]
             )
         existing = {str(r["provider"]) for r in rows}
+        # Every provider that supports this service and is not on the route yet.
+        # The panel used to offer the first four only, which made the rest of
+        # the registry unreachable from route management.
         addable = [
             slug for slug in PROVIDER_REGISTRY
             if SERVICE in registry_info(slug).supported_services and slug not in existing
-        ][:4]
-        if addable:
+        ]
+        for index in range(0, len(addable), 3):
             buttons.append(
                 [
                     Button.inline(
                         f"➕ {slug}", self._route_callback("rtadd", task_type, slug)
                     )
-                    for slug in addable[:2]
+                    for slug in addable[index : index + 3]
                 ]
             )
-            if len(addable) > 2:
-                buttons.append(
-                    [
-                        Button.inline(
-                            f"➕ {slug}", self._route_callback("rtadd", task_type, slug)
-                        )
-                        for slug in addable[2:4]
-                    ]
-                )
+        if rows:
+            buttons.append(
+                [Button.inline("🧭 بازنشانی ترتیب پیش‌فرض", self._route_callback("rtsd", task_type))]
+            )
         lines.extend(
             [
                 "",
                 "🆓 رایگان | 💳 مجاز به fallback پولی (فقط با opt-in) | ⛔ غیرفعال.",
+                "⚠️ یعنی ردیف در مسیر ذخیره شده ولی همین حالا قابل استفاده نیست (دلیل زیرش).",
                 "مدل انتخاب‌شده پیش از درخواست بررسی می‌شود؛ مدل نامعتبر/پولی در FREE_ONLY رد می‌شود.",
             ]
         )
@@ -1954,6 +2152,29 @@ class AIPanels:
         await event.answer(f"{removed['provider']} از مسیر حذف شد.")
         await self.show_routes(event, task_type)
 
+    async def _route_reset_order(self, event, task_type: str = TASK) -> None:
+        """Restore the reviewed default order for this task's route.
+
+        This is the documented manual counterpart of the startup upgrade: it
+        permutes the existing rows (keeping each row's model, enabled and
+        free-only flags) and marks the route as administrator-set, which is what
+        stops the automatic alignment from touching it again.
+        """
+        rows = await self._routes(task_type)
+        if not rows:
+            await event.answer("برای این وظیفه مسیری ثبت نشده است.", alert=True)
+            return
+        wanted = self.bot.provider_router.default_route_order(task_type)
+        by_provider: dict[str, dict] = {}
+        for row in rows:
+            by_provider.setdefault(str(row["provider"]).strip().lower(), row)
+        ordered = [by_provider.pop(slug) for slug in wanted if slug in by_provider]
+        ordered += [by_provider[slug] for slug in sorted(by_provider)]
+        admin_id = int((await event.get_sender()).id)
+        await self._save_routes(ordered, admin_id, task_type)
+        await event.answer("ترتیب پیش‌فرض بازگردانی شد؛ مسیر حالا دستی تنظیم‌شده محسوب می‌شود.")
+        await self.show_routes(event, task_type)
+
     async def _route_add(self, event, slug: str, task_type: str = TASK) -> None:
         if slug not in PROVIDER_REGISTRY:
             await event.answer("ارائه‌دهندهٔ نامعتبر.", alert=True)
@@ -2010,17 +2231,21 @@ class AIPanels:
     async def show_usage(self, event, days: int = 7) -> None:
         db = self.bot.db
         rows = await db.ai_usage_summary(days=days)
-        metrics = await db.ai_usage_metrics(days=1)
+        metrics = await db.ai_usage_overview(days=1)
         event_counts = await db.ai_event_metrics(days=1)
-        latency_p95 = await db.ai_usage_latency_p95(days=1)
-        quotas = await db.ai_quota_latest_all(limit=12)
+        latency_p95 = metrics["latency_p95_ms"]
+        # Latest snapshot *per provider*, so the honest bound is the provider
+        # count (a code-owned number), not a row count that silently drops the
+        # tail: the read used to be capped at 12 and then rendered down to 4.
+        quotas = await db.ai_quota_latest_all(limit=len(PROVIDER_REGISTRY))
         lines = [
             f"📊 وضعیت مصرف و رصدپذیری ({'امروز' if days == 1 else f'{days} روز گذشته'})",
             "",
             f"امروز: {_fmt_int(metrics['requests'])} درخواست"
             f" (موفق {_fmt_int(metrics['successes'])}, خطا {_fmt_int(metrics['failures'])}, "
             f"429/quota {_fmt_int(metrics['rate_limited'])}, 5xx {_fmt_int(metrics['server_errors'])})",
-            f"تأخیر: p95 {_fmt_int(latency_p95)}ms | fallback‌ها: {_fmt_int(metrics['fallbacks'])}",
+            f"تأخیر: p95 {_fmt_int(latency_p95)}ms{latency_sample_note(metrics)}"
+            f" | fallback‌ها: {_fmt_int(metrics['fallbacks'])}",
             f"توکن‌ها: ورودی {_fmt_int(metrics['input_tokens'])} | "
             f"خروجی {_fmt_int(metrics['output_tokens'])} | مجموع {_fmt_int(metrics['total_tokens'])}",
         ]
@@ -2074,8 +2299,11 @@ class AIPanels:
 
         if quotas:
             lines.append("")
-            lines.append("آخرین تصویر سهمیهٔ ارائه‌دهنده‌ها:")
-            for q in quotas[:4]:
+            lines.append(
+                f"آخرین تصویر سهمیهٔ ارائه‌دهنده‌ها "
+                f"({to_persian_digits(len(quotas))} ارائه‌دهنده):"
+            )
+            for q in quotas:
                 lines.append(
                     f"• {q['provider']}: {q['remaining'] or '—'}"
                     + (f" | بازنشانی {q['reset_at']}" if q.get("reset_at") else "")
@@ -2104,7 +2332,26 @@ class AIPanels:
         await self.show_usage(event)
 
     # --------------------------------------------------------------- models
-    async def show_models(self, event, slug: str | None = None) -> None:
+    #: Models listed per page in the catalog panel. The panel used to show the
+    #: first 14 rows and silently drop the rest of a provider catalog, which
+    #: hid exactly the models an operator needs to see (retired, paid-only,
+    #: newly discovered).
+    MODELS_PAGE_SIZE = 10
+
+    @staticmethod
+    def _page_token(slug: str, page: object) -> bytes:
+        """One bounded callback payload for a catalog page (Telegram: 64 bytes)."""
+        return f"admin:ai:md:{slug}:{int(page)}".encode("ascii")[:64]
+
+    @staticmethod
+    def _split_page(value: str | None) -> int:
+        try:
+            page = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(page, 10_000))
+
+    async def show_models(self, event, slug: str | None = None, page: object = 0) -> None:
         db = self.bot.db
         buttons: list[list] = []
         if slug is None:
@@ -2116,7 +2363,7 @@ class AIPanels:
                 if SERVICE not in info.supported_services or not info.model_discovery:
                     continue
                 row.append(
-                    Button.inline(candidate, f"admin:ai:md:{candidate}".encode("ascii"))
+                    Button.inline(candidate, f"admin:ai:md:{candidate}:0".encode("ascii"))
                 )
                 seen += 1
                 if seen % 2 == 0:
@@ -2128,13 +2375,29 @@ class AIPanels:
             await self.bot._edit_callback(event, "\n".join(lines), buttons)
             return
         if slug not in PROVIDER_REGISTRY:
-            await event.answer("ارائه‌دهندهٔ نامعتبر.", alert=True)
+            await self.bot._ack(event, "ارائه‌دهندهٔ نامعتبر.", alert=True)
             return
-        models = await db.ai_models_list(slug, include_unavailable=True)
+        # Catalog reads only: this panel must never sync from a provider while
+        # being drawn, and a failed sync leaves the last valid rows in place.
+        size = self.MODELS_PAGE_SIZE
+        current = self._split_page(page)
+        window, total = await db.ai_models_page(
+            slug, offset=current * size, limit=size
+        )
+        pages = max(1, -(-total // size))
+        if not window and current > 0 and total:
+            # Stale "بعدی" click after the catalog shrank: clamp to the last
+            # real page instead of rendering an empty screen.
+            current = pages - 1
+            window, total = await db.ai_models_page(
+                slug, offset=current * size, limit=size
+            )
         lines = [f"🧬 مدل‌های {slug}", ""]
-        if not models:
+        if not window:
             lines.append("هنوز مدلی ثبت نشده؛ «همگام‌سازی» بزنید.")
-        for row in models[:14]:
+        elif total > size:
+            lines.append(f"صفحهٔ {current + 1} از {pages} — {_fmt_int(total)} مدل")
+        for row in window:
             status = []
             if row.get("deprecated"):
                 status.append("منسوخ")
@@ -2142,7 +2405,7 @@ class AIPanels:
                 status.append("حذف‌شده از کاتالوگ")
             if _requires_paid_billing(row):
                 status.append("نیازمند صورتحساب 💳")
-            free_status = str(row.get("free_status") or "unknown")
+            free_status = _free_status_label(row)
             lines.append(
                 f"• #{row['id']} {row['model']} — {free_status}"
                 + (" (" + ", ".join(status) + ")" if status else "")
@@ -2153,11 +2416,11 @@ class AIPanels:
                     [
                         Button.inline(
                             f"🗂 منسوخ #{row['id']}",
-                            f"admin:ai:mdep:{row['id']}".encode("ascii"),
+                            f"admin:ai:mdep:{row['id']}:{current}".encode("ascii"),
                         ),
                         Button.inline(
                             f"{'💳' if paid_billing else '🆓'} پولی #{row['id']}",
-                            f"admin:ai:mpaid:{row['id']}".encode("ascii"),
+                            f"admin:ai:mpaid:{row['id']}:{current}".encode("ascii"),
                         ),
                     ]
                 )
@@ -2166,13 +2429,19 @@ class AIPanels:
         # instead of silently failing over at request time.
         from .ai.models import suggest_replacement
 
-        try:
-            live_catalog = await self.bot.provider_router.models.cached(slug)
-        except Exception:
-            live_catalog = []
-        for row in models[:14]:
-            if not (row.get("deprecated") or not row.get("available", 1)):
-                continue
+        stale_rows = [
+            row for row in window
+            if row.get("deprecated") or not row.get("available", 1)
+        ]
+        # The live catalog is only loaded when this page actually contains a
+        # withdrawn model: a plain redraw must stay a cheap page read.
+        live_catalog: list = []
+        if stale_rows:
+            try:
+                live_catalog = await self.bot.provider_router.models.cached(slug)
+            except Exception:
+                live_catalog = []
+        for row in stale_rows:
             replacement = suggest_replacement(live_catalog, str(row["model"]))
             if replacement is None:
                 continue
@@ -2193,6 +2462,13 @@ class AIPanels:
         if region_bits:
             lines.append("")
             lines.append("محدودیت منطقه‌ای: " + " | ".join(region_bits))
+        if pages > 1:
+            nav: list = []
+            if current > 0:
+                nav.append(Button.inline("◀️ قبلی", self._page_token(slug, current - 1)))
+            if current < pages - 1:
+                nav.append(Button.inline("بعدی ▶️", self._page_token(slug, current + 1)))
+            buttons.append(nav)
         buttons.extend(
             [
                 [Button.inline("🔄 همگام‌سازی مدل‌ها", f"admin:ai:mdsync:{slug}".encode("ascii"))],
@@ -2202,9 +2478,8 @@ class AIPanels:
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
 
     async def _mark_deprecated(self, event, model_id_text: str) -> None:
-        try:
-            model_row_id = int(model_id_text)
-        except ValueError:
+        model_row_id, page = self._row_and_page(model_id_text)
+        if model_row_id is None:
             await event.answer("شناسهٔ مدل نامعتبر.", alert=True)
             return
         db = self.bot.db
@@ -2213,8 +2488,10 @@ class AIPanels:
             await event.answer("مدل پیدا نشد.", alert=True)
             return
         admin_id = int((await event.get_sender()).id)
+        # The date is what "retired" means for quota planning: a route pinned
+        # to a withdrawn model must be diagnosable long after the click.
         await db.ai_models_set_deprecated(
-            record["provider"], record["model"], date=None
+            record["provider"], record["model"], date=utc_now()[:10]
         )
         await db.add_audit_entry(
             admin_id=admin_id,
@@ -2224,7 +2501,16 @@ class AIPanels:
             details={"provider": record["provider"], "model": record["model"]},
         )
         await event.answer("مدل منسوخ علامت‌گذاری شد؛ از مسیر کنار گذاشته می‌شود.")
-        await self.show_models(event, record["provider"])
+        await self.show_models(event, record["provider"], page)
+
+    @staticmethod
+    def _row_and_page(value: str) -> tuple[int | None, int]:
+        """``"<row id>"`` or ``"<row id>:<page>"`` from a catalog callback."""
+        head, _, tail = str(value).partition(":")
+        try:
+            return int(head), max(0, int(tail or 0))
+        except (TypeError, ValueError):
+            return None, 0
 
     async def _mark_paid_billing(self, event, model_id_text: str) -> None:
         """Toggle whether a model needs a billable plan (spec §17).
@@ -2233,9 +2519,8 @@ class AIPanels:
         the free allocation. Marking one here makes FREE_ONLY reject it up
         front instead of burning the daily quota discovering that the hard way.
         """
-        try:
-            model_row_id = int(model_id_text)
-        except ValueError:
+        model_row_id, page = self._row_and_page(model_id_text)
+        if model_row_id is None:
             await event.answer("شناسهٔ مدل نامعتبر.", alert=True)
             return
         db = self.bot.db
@@ -2262,7 +2547,7 @@ class AIPanels:
         await event.answer(
             "مدل نیازمند صورتحساب شد." if new_value else "علامت صورتحساب برداشته شد."
         )
-        await self.show_models(event, record["provider"])
+        await self.show_models(event, record["provider"], page)
 
     async def _sync_models(self, event, slug: str) -> None:
         if slug not in PROVIDER_REGISTRY:
@@ -2276,7 +2561,7 @@ class AIPanels:
             f"همگام‌سازی مدل‌های {slug}: {'موفق ✅' if result.ok else 'ناموفق ⛔'}\n"
             f"مدل‌های همگام‌شده: {result.synced} | غیرفعال‌شده: {result.deactivated}\n"
             f"جزئیات: {detail[:300]}",
-            [[Button.inline("↩️ مدل‌ها", f"admin:ai:md:{slug}".encode("ascii"))]],
+            [[Button.inline("↩️ مدل‌ها", self._page_token(slug, 0))]],
         )
 
     async def _run_catalog_sync(self, slug: str):
@@ -2303,6 +2588,7 @@ class AIPanels:
         error_class: str | None = None,
         job_id: str | None = None,
         days: int = 0,
+        page: object = 0,
     ) -> None:
         """Spec §35: logs filterable by provider/status/date/error type.
 
@@ -2315,16 +2601,41 @@ class AIPanels:
             since = (
                 datetime.now(timezone.utc) - timedelta(days=max(1, int(days)))
             ).isoformat(timespec="seconds")
-        events = await db.ai_events_list(
-            limit=14,
+        size = self.LOGS_PAGE_SIZE
+        current = self._split_page(page)
+
+        async def _page(index: int) -> list[dict]:
+            return await db.ai_events_list(
+                limit=size,
+                provider=slug,
+                event=event_name,
+                error_class=error_class,
+                job_id=job_id,
+                since=since,
+                http_status=status_class,
+                offset=index * size,
+            )
+
+        events = await _page(current)
+        # One cheap count query buys an authoritative page count and a total, so
+        # the panel can say how much history the filter matches instead of
+        # implying "this is all of it". The table is ring-pruned, so it is bounded.
+        total = await db.ai_event_count(
             provider=slug,
             event=event_name,
+            since=since,
             error_class=error_class,
             job_id=job_id,
-            since=since,
             http_status=status_class,
         )
-        title = "🧾 آخرین رویدادهای AI"
+        pages = max(1, -(-total // size))
+        if current > pages - 1:
+            current = pages - 1
+            events = await _page(current)
+        has_more = current + 1 < pages
+        title = "🧾 آخرین رویدادهای AI" + (
+            f" — صفحهٔ {current + 1} از {pages} ({total} رویداد)" if pages > 1 else ""
+        )
         if slug:
             title += f" — {slug}"
         if event_name:
@@ -2374,9 +2685,101 @@ class AIPanels:
                 Button.inline("⏱ تلاش مجدد", b"admin:ai:lgfilter:retry"),
                 Button.inline("🔁 تعمیر JSON", b"admin:ai:lgfilter:json"),
             ],
-            [Button.inline("↩️ پلتفرم AI", b"admin:ai")],
         ]
+        token = self._log_token(
+            slug=slug,
+            event_name=event_name,
+            status_class=status_class,
+            error_class=error_class,
+            days=days,
+        )
+        if current or has_more:
+            nav: list = []
+            if current > 0:
+                nav.append(self._logs_button(token, current - 1, "◀️ قبلی"))
+            if has_more:
+                nav.append(self._logs_button(token, current + 1, "بعدی ▶️"))
+            buttons.append(nav)
+        buttons.append([Button.inline("↩️ پلتفرم AI", b"admin:ai")])
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
+
+    #: Models listed by the benchmark panel (ranked by score, newest evidence first).
+    BENCHMARK_ROWS = 10
+
+    #: Quota snapshots listed by the provider detail panel (one per key/model/window).
+    QUOTA_ROWS = 12
+
+    #: Health results listed by the provider health panel.
+    HEALTH_ROWS = 12
+
+    #: Logs rows per page. The panel used to show a flat 14 rows and stop, so
+    #: the row that explained a failure could be unreachable by design.
+    LOGS_PAGE_SIZE = 14
+
+    #: Event filters the panel offers, abbreviated so a page callback can carry
+    #: the whole active filter inside Telegram's 64-byte ``callback_data`` limit.
+    _LOG_EVENT_CODES = {
+        "err": "note_request_failed",
+        "fb": "note_request_fallback",
+        "rl": "provider_rate_limited",
+        "retry": "note_request_retry",
+        "json": "note_json_validation_failed",
+    }
+
+    @classmethod
+    def _log_token(
+        cls,
+        *,
+        slug: str | None = None,
+        event_name: str | None = None,
+        status_class: int | None = None,
+        error_class: str | None = None,
+        days: int = 0,
+    ) -> str:
+        bits: list[str] = []
+        if slug:
+            bits.append(f"p{slug}"[:20])
+        if event_name:
+            code = next(
+                (c for c, name in cls._LOG_EVENT_CODES.items() if name == event_name),
+                event_name,
+            )
+            bits.append(f"e{code}"[:24])
+        if status_class:
+            bits.append(f"s{int(status_class)}")
+        if error_class:
+            bits.append(f"x{error_class}"[:20])
+        if days:
+            bits.append(f"d{int(days)}")
+        # 40 leaves room for "admin:ai:lgp:<page>:" inside the 64-byte limit.
+        return (".".join(bits) or "-")[:40]
+
+    @classmethod
+    def _log_kwargs(cls, token: str) -> dict:
+        """Inverse of :meth:`_log_token`; a malformed token means "no filter"."""
+        kwargs: dict = {"days": 0}
+        for bit in str(token or "").split("."):
+            kind, value = bit[:1], bit[1:]
+            try:
+                if kind == "p":
+                    kwargs["slug"] = value
+                elif kind == "e":
+                    kwargs["event_name"] = cls._LOG_EVENT_CODES.get(value, value)
+                elif kind == "s":
+                    kwargs["status_class"] = int(value)
+                elif kind == "x":
+                    kwargs["error_class"] = value
+                elif kind == "d":
+                    kwargs["days"] = int(value)
+            except ValueError:
+                return {"days": 0}
+        return kwargs
+
+    @staticmethod
+    def _logs_button(token: str, page: int, label: str) -> Button:
+        payload = f"admin:ai:lgp:{max(0, min(int(page), 9999))}:{token}"
+        assert len(payload.encode("ascii")) <= 64, payload
+        return Button.inline(label, payload.encode("ascii"))
 
     async def _log_filter(self, event, token: str) -> None:
         """Apply one compact log filter token (``st4``, ``st5``, ``d1``, …)."""
@@ -2417,9 +2820,19 @@ class AIPanels:
         if not results:
             lines.append("هنوز نتیجهٔ بررسی‌ای در حافظه نیست.")
             lines.append("بررسی‌ها فقط هنگام باز شدن پنل یا تست دستی اجرا می‌شوند.")
-        for result in results[:12]:
-            if str(getattr(result, "service", "")) != SERVICE:
-                continue
+        # Filter by service *before* taking the display cap: the cap used to be
+        # applied to the mixed AI+STT cache, so STT probes could push every AI
+        # result out of this panel and the short list looked like the truth.
+        results = [
+            result for result in results if str(getattr(result, "service", "")) == SERVICE
+        ]
+        if len(results) > self.HEALTH_ROWS:
+            lines.append(
+                f"این سرویس {to_persian_digits(len(results))} نتیجه در کش سلامت دارد؛ "
+                f"فقط {to_persian_digits(self.HEALTH_ROWS)} تای نخست این‌جا فهرست می‌شوند."
+            )
+            lines.append("")
+        for result in results[: self.HEALTH_ROWS]:
             http = f"HTTP {result.http_status}" if result.http_status else "HTTP —"
             latency = f"{result.latency_ms}ms" if result.latency_ms else "—"
             checked = str(result.checked_at or "")[:16] or "—"
@@ -2510,21 +2923,29 @@ class AIPanels:
         ]
         stored = await self.bot.db.ai_provider_settings_all()
         overrides = {k: v for k, v in (stored or {}).items() if v}
-        if overrides:
+        override_lines: list[str] = []
+        for slug, row in overrides.items():
+            flags = []
+            if row.get("enabled") == 0:
+                flags.append("غیرفعال")
+            if row.get("free_only_blocked"):
+                flags.append("بلاک رایگان")
+            if row.get("experimental_unlocked"):
+                flags.append("قفل آزمایشی باز")
+            if row.get("account_entitlement_attested_at"):
+                flags.append("استحقاق تأییدشده")
+            if flags:
+                override_lines.append(f"• {slug}: " + "، ".join(flags))
+        # One line per provider that actually carries a flag: the old slice was
+        # taken before the flag filter, so providers without flags consumed
+        # slots (a ninth override vanished) and the heading could print alone
+        # over an empty list.
+        if override_lines:
             lines.append("")
-            lines.append("لغوهای ثبت‌شدهٔ مدیر:")
-            for slug, row in list(overrides.items())[:8]:
-                flags = []
-                if row.get("enabled") == 0:
-                    flags.append("غیرفعال")
-                if row.get("free_only_blocked"):
-                    flags.append("بلاک رایگان")
-                if row.get("experimental_unlocked"):
-                    flags.append("قفل آزمایشی باز")
-                if row.get("account_entitlement_attested_at"):
-                    flags.append("استحقاق تأییدشده")
-                if flags:
-                    lines.append(f"• {slug}: " + "، ".join(flags))
+            lines.append(
+                f"لغوهای ثبت‌شدهٔ مدیر ({to_persian_digits(len(override_lines))} ارائه‌دهنده):"
+            )
+            lines.extend(override_lines)
         buttons = [[Button.inline("↩️ پلتفرم AI", b"admin:ai")]]
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
 
@@ -2643,7 +3064,11 @@ class AIPanels:
     async def show_benchmarks(self, event) -> None:
         """Spec §35 Benchmarks panel: scores for models evaluated with scripts/benchmark_notes.py."""
         db = self.bot.db
-        scores = await db.ai_model_benchmark_scores(limit=10)
+        # One extra row is read as a probe, so the panel can say when the ranked
+        # list it shows is a cut of a longer one.
+        scores = await db.ai_model_benchmark_scores(limit=self.BENCHMARK_ROWS + 1)
+        truncated = len(scores) > self.BENCHMARK_ROWS
+        scores = scores[: self.BENCHMARK_ROWS]
         lines = [
             "🏆 ارزیابی و امتیاز کیفیت مدل‌ها (Gamas Quality Score)",
             "",
@@ -2659,6 +3084,11 @@ class AIPanels:
             lines.append(
                 f"{rank}. {s['provider']}/{s['model']} — امتیاز {s['quality_score']:.1f}/100 {free_mark}"
                 + (f" ({str(s['last_benchmarked_at'])[:10]})" if s.get("last_benchmarked_at") else "")
+            )
+        if truncated:
+            lines.append(
+                f"فقط {to_persian_digits(self.BENCHMARK_ROWS)} مدل برتر این‌جا فهرست می‌شود؛ "
+                "ادامه در جدول ai_models است."
             )
         buttons = [[Button.inline("↩️ پلتفرم AI", b"admin:ai")]]
         await self.bot._edit_callback(event, "\n".join(lines), buttons)
@@ -2680,7 +3110,10 @@ class AIPanels:
                 + f" — چانک {_fmt_int(profile.chunk_token_budget)} توکن / {_fmt_int(chars)} نویسه"
             )
         for provider, reason in plan.skipped:
-            lines.append(f"- {provider}: {reason}")
+            label, kind = _SKIP_REASON_FA.get(
+                reason, ("دلایل سیاست‌گذاری این ارائه‌دهنده را ببینید", "policy")
+            )
+            lines.append(f"- {provider}: {label} [{kind}] — {reason}")
         lines.append("")
         lines.append(
             f"outline: {'✅' if plan.outline_enabled else '❌'}"
@@ -2736,10 +3169,14 @@ async def handle_ai_callback(bot, event, data: str) -> None:
         await ui._health_refresh(event)
     elif action == "st":
         await ui.show_settings(event)
+    elif action == "lgp" and arg1 is not None:
+        await ui.show_logs(event, page=arg1, **ui._log_kwargs(arg2))
     elif action == "lgf" and arg1:
         await ui._log_filter(event, arg1)
     elif action == "keys":
-        await ui.show_all_keys(event, filter_service=arg1)
+        await ui.show_all_keys(
+            event, None if arg1 in (None, "all") else arg1, page=arg2
+        )
     elif action == "kview" and arg1:
         try:
             await ui.show_key_detail(event, int(arg1))
@@ -2797,6 +3234,8 @@ async def handle_ai_callback(bot, event, data: str) -> None:
             await ui._route_delete(event, parts[4], parts[3])
         elif arg1 is not None:
             await ui._route_delete(event, arg1, TASK)
+    elif action == "rtsd":
+        await ui._route_reset_order(event, arg1 if arg1 in ROUTE_TASKS else TASK)
     elif action == "rtadd":
         if len(parts) >= 5 and parts[3] in ROUTE_TASKS:
             await ui._route_add(event, parts[4], parts[3])
@@ -2839,13 +3278,13 @@ async def handle_ai_callback(bot, event, data: str) -> None:
     elif action == "usrst" and arg1:
         await ui._usage_reset(event, arg1)
     elif action == "md" and arg1:
-        await ui.show_models(event, arg1)
+        await ui.show_models(event, arg1, arg2 if arg2 is not None else 0)
     elif action == "md":
         await ui.show_models(event)
     elif action == "mdep" and arg1:
-        await ui._mark_deprecated(event, arg1)
+        await ui._mark_deprecated(event, ":".join(parts[3:]))
     elif action == "mpaid" and arg1:
-        await ui._mark_paid_billing(event, arg1)
+        await ui._mark_paid_billing(event, ":".join(parts[3:]))
     elif action == "mdsync" and arg1:
         await ui._sync_models(event, arg1)
     elif action == "lg" and arg1:

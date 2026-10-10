@@ -140,6 +140,94 @@ Provider-specific notes:
 
 Generation strategy is selected from the exact model capability record: strict JSON Schema → JSON Schema → Gemini native schema/MIME → JSON object → prompt-enforced JSON. An explicit provider rejection can trigger one supported downgrade; the canonical Gamas note schema, output parser, QA/repair, and note-scrubbing rules remain authoritative.
 
+## Note route order
+
+This is the reviewed default that `ProviderRouter` seeds for the four note
+tasks (`chunk_structuring`, `outline`, `repair`, `final_compilation`) and what
+`AI_DEFAULT_NOTE_ROUTE` / the route panel reorder:
+
+```
+nara → openrouter → gemini → groq → mistral → sambanova → zai → nvidia → cloudflare
+```
+
+Nara leads because it is the platform's primary note provider: the NaraRouter
+endpoint is resolved canonically from `NOTE_API_BASE_URL`, its request profile
+and free-class model (`agnes-2.5-flash`) are registered in
+`ai/registry.py`/`ai/profiles.py`, and it is the provider the supported Persian
+note pipeline is tuned against. OpenRouter is second as the broadest
+free-endpoint catalog. **Position in this list is a preference, never an
+assertion of entitlement or of price** — a model list proves availability, not
+billing, and Nara's free status is still decided per model, so an unknown
+billing class is never used as free.
+
+`ProviderRouter.plan()` walks the stored route and keeps only the legs that pass
+the real gates, in this order (the code in brackets is what the admin panels
+report, next to a Persian explanation):
+
+1. `route_disabled` — the route row is switched off (a disabled row is a
+   disabled *route*, never a paid leg);
+2. `trial_only_blocked`, `terms_of_use_blocked` — classification and Terms of
+   Use of the provider;
+3. `experimental_locked`, `region_restricted_locked`,
+   `region_metadata_unverified`, `region_scope_ineligible`,
+   `free_quota_expiry_unverified` — explicit unlock / region attestation state;
+4. `disabled`, `unavailable` — the provider switch in its own settings row;
+5. `billing_blocked`, `account_entitlement_unverified`, `not_free_eligible`,
+   `paid_fallback_disabled` — free/paid boundary (`AI_FREE_ONLY`,
+   `AI_ALLOW_PAID_FALLBACK`, per-key billing attestation, account attestation);
+6. `quota_exhausted` — the local daily/request-budget reservation, or the
+   provider's own quota headers when it publishes them.
+
+The route panel annotates every saved row that the planner will *not* use right
+now: `⚠️ <reason> [<family>] — <code>` under the row. Rows blocked by a gate and
+rows with no ready credential are both annotated, because both mean "saved but
+not runnable". The panel does not decide eligibility on its own: it renders the
+verdict of `ProviderRouter.plan(task)` and the router's own credential-pool
+predicate `credentials_for(leg)` — the same calls the note job makes — so the
+panel and the job cannot disagree, and an unattested key stays flagged until an
+administrator attests it. That annotation costs one `plan()` per redraw of the
+route panel; it performs no provider request.
+
+### Custom routes and `AI_DEFAULT_NOTE_ROUTE`
+
+* A route saved from the admin panel is authoritative; automatic seeding never
+  replaces it (see below).
+* `AI_DEFAULT_NOTE_ROUTE` reorders the note tasks only and never drops a
+  provider: named slugs move to the front, the rest keep their relative order.
+* `AI_ROUTING_ENABLED=false` reproduces the legacy single-provider behaviour,
+  and *only in that mode* does a leftover `NOTE_API_PROVIDER` keep its provider
+  in position zero. With routing on, the environment provider is still
+  guaranteed to be **on** the route — a provider the reviewed default does not
+  know at all (a custom OpenAI-compatible gateway) is seeded first, so no
+  existing integration is stranded.
+
+### Upgrading the default order on an existing install
+
+`ProviderRouter.ensure_seeded()` runs at startup. The alignment is forward-only,
+Python-side (no SQL migration), idempotent and conservative:
+
+* a task group is considered only when every row still has
+  `updated_by_admin_id IS NULL`, `enabled=1`, `free_only=1` and no pinned
+  `model`, and when all of its providers belong to the reviewed (or previously
+  reviewed) default list;
+* the write only renumbers `route_index` inside the existing rows, in one
+  `BEGIN IMMEDIATE` transaction — no row is added, deleted, re-flagged or
+  rewritten, so credentials, usage history, model catalogs and audit keep their
+  keys;
+* anything that fails that shape test is left exactly as found, including a
+  single task an admin customised;
+* if the route read itself fails, nothing is written: a read error is never
+  mistaken for "nothing seeded";
+* each reordered task logs one `provider_route_changed` event.
+
+Rolling back across this change is safe (only `route_index` values moved). To be
+explicit, take a copy before upgrading —
+`cp "$DATABASE_PATH" "$DATABASE_PATH.bak-$(date +%F)"` — and restore it if you
+need the previous order with the original audit trail. Inside the app,
+"🧭 بازنشانی ترتیب پیش‌فرض" in the route panel re-applies the current default,
+and the ↑/↓ controls set any order you want (both mark the route as
+admin-owned, which stops the automatic alignment from touching it again).
+
 ## Request budgets and legacy compatibility
 
 `gamas_bot/ai/profiles.py` holds conservative per-provider chunk-token/character/output budgets, local RPM/TPM/daily caps, retry counts, concurrency, and pipeline-pass policy. Nullable `ai_provider_settings` overrides let an admin tune chunk-token/character, output/compile budgets, retry count, timeout, and max concurrent requests; `NULL` inherits the reviewed profile. The Telegram provider panel bounds and audits these changes. A dynamic provider-scoped limiter applies the effective concurrency setting in addition to the existing global job semaphore. Provider-supplied rate/quota headers refine the ledger. Retry caps are bounded by the provider profile and `AI_MAX_GENERATION_RETRIES`; failed attempts count against local budgets. Before each attempt, the router projects input plus the full output-token cap against RPM/TPM/daily ledgers and atomically reserves that budget across in-flight workers in the bot process; recorded usage is committed before the reservation is released. This is a conservative local guard, not a replacement for the provider's own cap or the required no-overage billing attestation. A quota-ledger read failure fails closed.

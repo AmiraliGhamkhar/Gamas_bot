@@ -5,14 +5,14 @@
 ```bash
 python -m compileall -q gamas_bot scripts tests passenger_wsgi.py
 ruff check .                      # config in pyproject.toml
-python -m pytest -q               # latest local run: 923 passed, 1 skipped, 1,786 subtests, ~90 s
+python -m pytest -q               # latest local run: 1,183 passed, 1 skipped, 1,821 subtests, ~141 s
 python -m pip check
 python -m scripts.sync_requirements --check
 ```
 
 `.github/workflows/tests.yml` runs the suite on Python 3.11, 3.12 and 3.13,
 through both `pytest` and `unittest discover` (the entry point deployments use).
-The latest local `unittest discover -s tests` run executed 924 tests with one
+The latest local `unittest discover -s tests` run executed 1,184 tests with one
 skip and passed. Counts are snapshots; update them when the suite changes.
 
 ## What the suite is organised around
@@ -32,6 +32,10 @@ dedicated files:
 | Per-provider request/response contracts | `test_provider_adapters.py` |
 | Provider credentials and health | `test_provider_credentials.py`, `test_provider_health.py` |
 | Telegram AI administration and billing attestation | `test_admin_ai.py` |
+| Seeded note-route order, safe startup upgrade, admin-route preservation | `test_route_seed_upgrade.py` |
+| Failover budget, disabled route rows, Retry-After, leg time budget | `test_route_failover_eligibility.py` |
+| Panel pagination, status labels, callback limits, keyboard limits, ack order, counted digests, sampled-statistic labels | `test_admin_panel_presentation.py` |
+| Admin credit screen: balance agreement with billing, expiry/start predicates, counted history windows | `test_admin_credit_overview.py` |
 | Billing, payments, special users | `test_billing.py`, `test_payment_flow.py`, `test_special_users_and_plan_panel.py` |
 | Note quality, coverage, QA | `test_note_quality.py`, `test_semantic_coverage.py`, `test_note_evaluation.py` |
 | DOCX layout, RTL, TOC, pagination | `test_docx_export.py`, `test_docx_polish.py`, `test_docx_layout_requirements.py`, `test_mixed_script_typography.py` |
@@ -55,6 +59,7 @@ python -m scripts.benchmark_notes --mode full            # deterministic, offlin
 python -m scripts.benchmark_notes --live                # calls configured AI provider
 python -m scripts.benchmark_stt audio.mp3                # per-provider STT latency
 python -m scripts.benchmark_queue                       # bounded-queue load, 1..50 jobs
+python -m scripts.benchmark_admin_panels --json          # admin panel + routing reads, offline
 python -m scripts.validate_docx --render                 # structure + offline page render
 python -m scripts.validate_provider_platform   # offline AI platform validation, no API key
 ```

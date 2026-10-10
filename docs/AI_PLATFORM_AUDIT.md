@@ -110,7 +110,11 @@ Additives only; the pieces above stay in place unless listed here.
   * `routing.py` — task-aware routing + provider-level failover on top of
     the existing credential-level rotation; free-only safety; route order
     stored in SQLite (admin-editable), seeded from environment for backward
-    compatibility. Current Z.AI pricing lists selected GLM models as Free, but
+    compatibility. The seeded note order is the reviewed
+    `nara → openrouter → gemini → groq → mistral → sambanova → zai → nvidia →
+    cloudflare`; a stored route is aligned to it at startup only when it is
+    provably still automatic (see §3), and `plan()` reports every provider it
+    skipped with a machine code the admin panel translates. Current Z.AI pricing lists selected GLM models as Free, but
     Terms §III.06 restrict specified education-related decision-making and
     services requiring educational qualifications or professional review. The
     wording is not a blanket ban on all educational use; Gamas conservatively
@@ -130,8 +134,20 @@ Additives only; the pieces above stay in place unless listed here.
   panels, step-by-step key-add wizard, key actions (replace secret, edit
   metadata, explicit free-no-overage/paid billing attestations, delete with
   confirmation), dry-run request view, generation-test vs read-only distinction.
+* `gamas_bot/bot.py` — panel information architecture: the user menu leads with
+  «📎 ساخت جزوه», help and formats share one screen, balance and subscription
+  share the account screen, and Back/Cancel/Home behave identically everywhere.
+  The admin side has five destinations (overview and statistics, users and
+  billing, AI note generation, speech recognition, operations and security),
+  with exactly one route-management entry per platform. Every long list is
+  paginated (catalogs, event logs, credential screens, users) instead of cut
+  off; read-only admin panels are acknowledged before their database work and
+  answered at most once (`_arm_answer_once`).
 * `scripts/benchmark_notes.py` — provider-profile benchmarking keeping the
   deterministic CI gate untouched.
+* `scripts/benchmark_admin_panels.py` — offline benchmark of those panel reads
+  and of `router.plan()`, timing the pre-change and post-change query shape in
+  the same run (documented in `docs/TESTING.md`).
 * Configuration: `AI_FREE_ONLY` (default true), `AI_ALLOW_PAID_FALLBACK`
   (default false), `AI_ROUTING_ENABLED`, `AI_PROVIDER_SYNC_TTL`,
   `AI_DEFAULT_NOTE_ROUTE`, `AI_MAX_PROVIDER_FAILOVERS`,
@@ -153,5 +169,11 @@ Additives only; the pieces above stay in place unless listed here.
 * `NOTE_API_JSON_MODE` keeps working as the generic fallback json-object
   switch; capability-aware strategies take precedence only for providers whose
   models advertise the feature.
+* Default-order alignment (`ProviderRouter._upgrade_seeded_order`) is additive
+  and reversible: it only renumbers `route_index` inside the rows of a task
+  group that is still automatic in every field, never adds or removes a row, is
+  idempotent on every later startup, and writes nothing when the route read
+  fails. An administrator-saved route (any row with `updated_by_admin_id`, a
+  pinned model, a disabled row or a `free_only` change) is never reordered.
 * All existing QA, repair, merge, DOCX/PPTX, billing, STT, credential
   encryption, health, and deployment components keep their public contracts.

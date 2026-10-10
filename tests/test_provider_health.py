@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 from cryptography.fernet import Fernet
 
-from gamas_bot.bot import StudyBot, admin_menu, main_menu
+from gamas_bot.bot import StudyBot, admin_menu, admin_navigation, admin_section_menu, main_menu
 from gamas_bot.database import Database
 from gamas_bot.provider_credentials import ProviderCredentialManager
 from gamas_bot.provider_health import (
@@ -388,24 +388,63 @@ class HealthPanelIsolationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(getattr(bot, "_health_calls", 1), 1)
 
     def test_health_menu_entries_are_admin_only(self):
+        # The user keyboard never leaks an admin callback, and the account
+        # screen keeps both credit visibility and purchase reachable.
         user_callbacks = {button.type.data for row in main_menu(False) for button in row}
-        admin_callbacks = {button.type.data for row in admin_menu() for button in row}
         self.assertNotIn(b"admin:health", user_callbacks)
-        self.assertIn(b"admin:health", admin_callbacks)
-        self.assertIn(b"admin:credits", admin_callbacks)
-        self.assertIn(b"admin:credentials", admin_callbacks)
-        self.assertIn(b"billing:balance", user_callbacks)
-        self.assertIn(b"billing:plans", user_callbacks)
+        self.assertEqual(user_callbacks & set(admin_navigation()), set())
+        self.assertIn(b"menu:account", user_callbacks)
+
+        admin_callbacks = set(admin_navigation())
+        for required in (b"admin:health", b"admin:credits", b"admin:credentials"):
+            self.assertIn(required, admin_callbacks)
+        # Sections are how an admin reaches them now; the direct callbacks stay
+        # routable so an older message on screen still works.
+        section_rows = admin_section_menu("ops") + admin_section_menu("users")
+        section_callbacks = {button.type.data for row in section_rows for button in row}
+        self.assertIn(b"admin:health", section_callbacks)
+        self.assertIn(b"admin:credits", section_callbacks)
 
     def test_menu_labels_match_the_approved_ux(self):
         labels = [button.text for row in main_menu(False) for button in row]
-        self.assertIn("⏱ اعتبار من", labels)
-        self.assertIn("💳 خرید اشتراک", labels)
-        seen = {button.text: button.type.data for row in admin_menu() for button in row}
-        self.assertEqual(seen["🩺 وضعیت سرویس‌ها"], b"admin:health")
-        self.assertEqual(seen["🔑 API Keys"], b"admin:credentials")
-        self.assertEqual(seen["💳 پرداخت‌ها"], b"admin:payments")
-        self.assertEqual(seen["⏱ اعتبار کاربران"], b"admin:credits")
+        # One primary action, one merged help+formats destination, one merged
+        # account/credit destination, and the privacy notice.
+        self.assertEqual(labels[0], "📎 ساخت جزوه")
+        self.assertIn("📚 راهنما و قالب‌ها", labels)
+        self.assertIn("💳 حساب و اعتبار", labels)
+        self.assertIn("🔐 حریم خصوصی", labels)
+        self.assertNotIn("🧰 قالب‌ها", labels)
+        seen = admin_navigation()
+        self.assertEqual(seen[b"admin:health"], "🩺 وضعیت سرویس‌ها")
+        self.assertEqual(seen[b"admin:credentials"], "🔑 API Keys")
+        self.assertEqual(seen[b"admin:payments"], "💳 پرداخت‌ها")
+        self.assertEqual(seen[b"admin:credits"], "⏱ اعتبار کاربران")
+
+    def test_admin_reorganisation_keeps_every_previous_control_reachable(self):
+        """The five-section IA must not orphan a control the flat menu had."""
+        reachable = set(admin_navigation())
+        previously_exposed = {
+            b"admin:home",
+            b"admin:stats",
+            b"admin:users",
+            b"admin:payments",
+            b"admin:credits",
+            b"admin:plans",
+            b"admin:special",
+            b"admin:health",
+            b"admin:credentials",
+            b"admin:ai",
+            b"admin:stt",
+            b"admin:audit",
+            b"admin:broadcast",
+            b"admin:ban",
+            b"admin:unban",
+            b"menu:home",
+        }
+        self.assertEqual(previously_exposed - reachable, set())
+        # Route management has exactly ONE entry point in the keyboard now.
+        root_callbacks = [button.type.data for row in admin_menu() for button in row]
+        self.assertNotIn(b"admin:ai:rt", root_callbacks)
 
 
 class CredentialAdminActionTests(unittest.IsolatedAsyncioTestCase):

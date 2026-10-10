@@ -1,5 +1,251 @@
 # Changelog
 
+## Unreleased — Nara-first routing, five-panel admin IA, bounded lists
+
+### Changed
+
+* **The note route is now Nara first, OpenRouter second.** `DEFAULT_NOTE_ORDER`
+  is `nara → openrouter → gemini → groq → mistral → sambanova → zai → nvidia →
+  cloudflare`, seeded for all four note tasks plus the health and benchmark
+  routes. A leftover `NOTE_API_PROVIDER` only keeps its provider in position
+  zero in legacy mode (`AI_ROUTING_ENABLED=false`) or when it is a custom
+  gateway the reviewed default does not know; in that second case it is seeded
+  first so an existing integration is never stranded. Order is a preference:
+  `plan()` still filters every leg through the real eligibility gates and
+  reports each skipped provider with a machine code.
+* **The admin panel has five destinations instead of a wall of buttons**:
+  overview and statistics, users and billing, AI note generation, speech
+  recognition, operations and security. Route management exists in exactly one
+  place per platform (inside its own panel) — the root menu used to offer a
+  second, competing entry to the AI routes. Nothing was dropped: every callback
+  that the old flat menu had is reachable, and
+  `tests/test_provider_health.py` now guards that reachability structurally.
+* **The user menu leads with the one action that matters.** "📎 ساخت جزوه" is
+  the primary button; help and formats are one screen; balance and subscription
+  are one account screen (purchasing stays inside it); privacy is unchanged and
+  Back/Cancel/Home behave the same everywhere.
+* **The billing and special-user screens page instead of stopping.** Pending
+  receipts page 20 at a time (`admin:payments:<page>`: a footer message with the
+  total and prev/next, and only the current page's receipts are sent), the plan
+  list pages 10 at a time (45 custom plans used to be rendered into one message
+  and one keyboard, passing both the 4 096-character and the 100-button caps),
+  and the special-user list gives every row it shows its own remove button
+  instead of offering 12 buttons for 30 listed users.
+* **Large lists are paginated instead of truncated**: AI and STT model
+  catalogs, the AI and STT event logs, the route panel's "add a provider" list,
+  both credential screens (the AI key panel and the operations digest), the STT
+  quota screens and the user list. Panels show a page indicator, keep the
+  provider/task/service context across redraws, and every row action
+  (deprecate, paid-billing toggle) returns to the page it was clicked from. This
+  is not only cosmetic: a keyboard is capped at 100 buttons and a message at
+  4 096 characters, so an uncapped list stops being sendable at all once a
+  deployment grows.
+* **The AI event-log page states how much history it is paging.** Its total now
+  comes from one `ai_event_count()` call that mirrors the page query's WHERE
+  clause exactly — including the "status class below 100" convention — so the
+  header can say «صفحهٔ X از Y (N رویداد)». A stale token for a page past the end
+  clamps to the last real page instead of rendering an empty screen.
+
+### Fixed
+
+* **A disabled route row is a disabled route, not a paid leg.** `route()` folded
+  `enabled` into the `free_only` flag, so switching a provider off while paid
+  fallback was allowed silently turned it into a *billable* attempt. The row
+  flag is now carried on the leg and skipped as `route_disabled`.
+* **A failed route read could delete an administrator's configuration.**
+  `ensure_seeded()` treated "could not read" as "nothing seeded" and re-inserted
+  defaults over the top; it now skips the task and writes nothing.
+* **Unconfigured preferred providers no longer strand a usable one.** The job
+  truncated the route to `AI_MAX_PROVIDER_FAILOVERS + 1` legs *before* checking
+  whether a provider had a credential at all, so on the long default route a
+  deployment with only a tail provider configured failed without ever trying
+  it. Legs that cannot be attempted are now pruned first, and the plain
+  truncation (with its "no credentials configured" error) is kept when nothing
+  is prunable.
+* **A provider-specified pause is honoured instead of hot-looped.** A 429 whose
+  `Retry-After` is longer than the provider's retry cap no longer burns another
+  in-leg retry and the next credential; the credential goes into cooldown for
+  the full `Retry-After` and the route moves on.
+* **A provider-wide fault no longer walks the credential pool.** 5xx, transport
+  and response-contract failures are properties of the provider, not of one key,
+  so the remaining keys are no longer spent on the same leg; per-key failures
+  (auth, per-key quota) still rotate.
+* **One slow provider can no longer consume the whole job.** Each route leg now
+  carries a wall-clock budget (`clamp(timeout × 2, 60 s, 600 s)`); an attempt
+  that cannot finish inside it is not started, and the leg fails over instead of
+  queueing through the rest of the pool and the retries.
+* **The overview screens were slow and their two numbers were not comparable.**
+  The AI overview ran two queries over *different* windows and then sorted every
+  latency in Python; `ai_usage_overview()` now computes the counters and the
+  bounded p95 sample in one pass over one window.
+* **Opening the health panel contacted providers on a cold cache.** It now reads
+  the persisted snapshot (expired rows are labelled as stale) and only the
+  explicit "🔄 بررسی همه" action probes.
+* **A route row that cannot run was shown as healthy.** The route panel's
+  per-row mark came from the provider's billing class, so a saved row blocked
+  by a gate (ToU, region, attestation, trial, disabled leg) — or with no ready
+  credential at all — still read 🟢. `show_routes()` now asks the authoritative
+  planner for the task and annotates those rows with `⚠️` plus the Persian
+  reason and machine code, reusing the router's own credential-pool predicate
+  for the "no ready key" case (an unattested key stays flagged; attesting it
+  clears the warning). The redraw pays `plan()` for it: 2.9 ms → ~73 ms in the
+  benchmark database, database-only, no provider request.
+* **A sampled p95 was printed as if it described the whole window.** `ai_usage_overview()`
+  reads at most `Database.LATENCY_PERCENTILE_SAMPLE` (5 000) newest rows for the
+  percentile — by design, so a busy day does not sort every latency in Python — and it
+  already returned `latency_samples`, but no panel used it. Three screens therefore
+  printed «تأخیر p95: X ms» beside a request counter for the full window, and on a
+  deployment over 5 000 requests a day those two numbers described different
+  populations. The overview now also returns `latency_sample_capped` (a *saturated*
+  read, which is the honest signal — a short sample can also just mean rows without a
+  recorded latency), and `latency_sample_note()` appends «(نمونه: 5/000 درخواست اخیر)»
+  to the AI platform home, the AI usage panel and the admin overview line whenever the
+  cap applied. Nothing was removed or widened: the sample stays, the label says what it is.
+* **The admin credit screen could show a balance that billing did not honour.**
+  `admin_user_credit_overview()` computed the free/paid split as a Python sum over
+  `… ORDER BY e.id DESC LIMIT 50`, so once a user's entitlement history passed fifty rows
+  a still-spendable grant silently stopped counting — measured on a synthetic user with
+  57 rows: `paid_seconds = 0` while `user_balance()` said 900 was available to spend. A
+  future-dated grant counted in the panel and not in billing, the opposite disagreement.
+  The screen also re-sliced its own lists (`entitlements[:10]`, `usage[:8]`), presenting a
+  display window as the user's history. The split is now one SQL aggregate over exactly the
+  predicate `_available_seconds_in_transaction()` spends from, the two lists are returned at
+  their display sizes (`recent_rows` / `usage_rows`) beside real `entitlement_total` /
+  `usage_total` counts, `_credit_history_heading` states «۱۰ مورد از N سابقه» whenever the
+  window is smaller than the table, and `admin:credits:` joins the ack-first set because the
+  screen now reads four indexed queries instead of two. Cost: 1.46 → 2.84 ms at 600
+  entitlements and a 3 000-row ledger, every new read covering-indexed, no new index.
+  `tests/test_admin_credit_overview.py` (7 tests) pins the balance agreement, the expiry
+  and start-date predicates, the counted labels and the window parameters, and
+  `test_admin_panel_presentation.py` pins the new acknowledgement order.
+* **Three more digests sliced a list before describing it.** `show_provider_detail`
+  printed ``quotas[:3]`` out of `ai_quota_latest()`, whose rows are unique per
+  (credential, model, window) — so a provider reporting four quotas showed three and
+  said nothing about the fourth; the health panel applied its ``results[:12]`` cap to
+  the *mixed* AI+STT cache and filtered by service afterwards, so enough STT probes
+  could empty the AI panel; `show_settings` sliced ``list(overrides.items())[:8]``
+  before dropping providers without flags, so a ninth override vanished and the
+  heading could print over an empty list. The provider panel now reads every quota
+  through `ai_quota_latest_for_provider()` (`QUOTA_ROWS` display bound with a probe row
+  and a stated cut, ordered by quota identity so the shown prefix is stable), the
+  health panel filters before capping at `HEALTH_ROWS` and says how many results were
+  left out, and admin overrides render one line per flagged provider with the heading
+  suppressed when there are none.
+* **The monitoring digests presented a bounded read as a complete view.** `show_usage`
+  fetched the latest quota snapshot for up to twelve providers and printed
+  ``quotas[:4]``; `show_benchmarks` listed ten scored models as a ranking without
+  saying ten was a cut; `/users` printed fifty rows under a header that implied the
+  whole user base. The quota digest is now bounded by `len(PROVIDER_REGISTRY)` — the
+  query returns one row per provider, so every snapshot has a line and the header says
+  how many providers it covers — the benchmark board fetches one probe row and appends
+  a line naming the cut while it exists, and the `/users` copy is titled
+  «۵۰ کاربر اخیر از ۶۰ کاربر» whenever the table is larger than the copy — the fifty comes
+  from a new `USERS_EXPORT_ROWS` constant instead of a literal duplicated between the
+  query and the sentence, and every count in these three labels is rendered with
+  `to_persian_digits` so a Persian sentence does not switch numeral systems mid-line.
+* **Three admin screens could become unsendable because a callback carried a
+  name instead of an address.** Telegram caps ``callback_data`` at 64 bytes, and
+  three tokens embedded strings whose length is not ours to bound:
+  ``admin:ai:wiz:mdl:stt:<provider>:<model>``, which the *seeded* Gemini-STT
+  catalog already overflows at 65 bytes; ``admin:stt:mdep:<provider>:<model>``,
+  59 bytes for that same id and 90 for a synced 66-character one; and
+  ``admin:stt:qdel:<provider>:<scope>:<quota_type>``, measured at 141 bytes with
+  the 60-character-per-field input the budget prompt itself accepts.
+  Each screen stopped being sendable for exactly the rows an admin needed to act
+  on. They now address a rendered row by position (plus an 8-hex identity
+  fingerprint for the quota row, so a keyboard that went stale under the admin
+  refuses the write instead of deleting a neighbouring row), the legacy literal
+  tokens keep working, and a position that no longer exists answers in Persian
+  and redraws rather than touching another row. The wizard steps also state how
+  many known models they left out instead of hiding them.
+* **The finance screens reported a page as if it were the backlog.** The admin
+  overview said «۵ پرداخت در انتظار بررسی» while 34 receipts waited, because it
+  printed `len(list_pending_payments(limit=5))`; `/payments` and the payment
+  panel did the same with 20. The pending queue and the special-user list now
+  take one `COUNT` each, so the number an admin decides on is the real one.
+* **Silent truncation removed from the panels.** The AI catalog showed 14
+  models and hid the rest, the route panel offered four addable providers,
+  STT listed every model of every provider in one message, the log panels
+  stopped at 14/40 rows, both credential screens grew past the keyboard limit,
+  the combined STT quota screen passed the 4 096-character message limit once a few
+  budgets existed (providers are now paged three at a time, with the folded-away
+  counts stated), and the user list stopped at 50 users.
+* **Unknown billing state was presented as free.** The catalog now renders
+  `unknown` as "نامشخص — رایگان تلقی نمی‌شود ⚠️", shows a promotional free tier
+  with its end date, and keeps the deprecated / withdrawn /
+  needs-billing markers on every page.
+* **Panel redraws no longer answer the same callback twice** (the second answer
+  always failed and produced a red toast), and the read-only admin panels that
+  touch several tables are acknowledged *before* the database work so the button
+  stops spinning while the panel reads.
+* Deprecating a model from the catalog panel recorded no date (`None`), so the
+  deprecation could not be aged; and the provider legend had a typo.
+
+### Added
+
+* `database.py`: `ai_usage_overview()` (with `ai_usage_metrics` /
+  `ai_usage_latency_p95` as wrappers), `ai_models_page()`, `ai_event_count()`,
+  `stt_events_count()`, `ai_routes_reorder()` (transactional, two-phase, under
+  the `UNIQUE(service, task_type, route_index)` constraint), and `offset`
+  support on `ai_events_list()`, `stt_events_list()` and `user_summaries()`.
+* `provider_health.snapshot()` — a network-free read of the persisted health
+  rows for panel redraws; `ProviderRouter.default_route_order()` so the route
+  panel asks the router what a fresh install looks like instead of keeping a
+  second copy of the list; `StudyBot._arm_answer_once()` for once-only
+  acknowledgements; the "🧭 بازنشانی ترتیب پیش‌فرض" route action.
+* Tests: `test_route_seed_upgrade.py` (seeding, startup alignment, admin-route
+  preservation, idempotence, history preservation, env/legacy modes),
+  `test_route_failover_eligibility.py` (failover budget, disabled rows,
+  Retry-After, credential pool, leg budget, attribution, slot release) and
+  `test_admin_panel_presentation.py` (pagination and labels for AI/STT catalogs,
+  logs, users; callback-size limit; malformed and stale callbacks;
+  acknowledgement order; skip-reason coverage).
+
+### Performance
+
+Measured with the committed harness, which seeds synthetic data and times both
+the pre-change and post-change query shape in the same process, so no
+cross-session comparison is involved:
+
+```bash
+python -m scripts.benchmark_admin_panels --rows 20000 --events 2000 \
+       --models 600 --users 800 --repeat 20
+```
+
+20 000 usage rows, 2 000 events, 600 catalog models, 800 users, SQLite in a
+temporary directory, no network, mean of 20 timed calls after a warm-up
+(sandbox: 4 cores, Python 3.11). Before-numbers are the old code path measured
+in the same run, or the pre-change baseline session for the panel renders.
+
+| Path | Before | After |
+| --- | --- | --- |
+| Overview usage reads (metrics + p95) | 40.5 ms | 22.4 ms (`ai_usage_overview`, one window) |
+| AI catalog read for one provider | 5.9 ms (whole table) | 1.0 ms first page, 1.8 ms last page |
+| AI catalog panel redraw (600 models) | 13.8 ms | 4.5 ms (15.5 ms on a page that offers replacements) |
+| Health panel open | live probes on a cold cache | 2.2 ms, zero requests |
+| Event-log page (2 000 rows) | flat 14 rows, no paging | 6.7 ms first page with an authoritative total; 4.1 ms for a stale token, which now clamps to the last real page |
+| Pending-receipt page (20 rows) | 21 queries — one `payment_detail` per row | 1 query; `payment_detail` called zero times (pinned by a test) |
+| STT catalog / log page | whole registry in one message | 3.5 ms / 4.0 ms |
+| User page (800 users) | 1.2 ms for the 50-row query, then a long-message send | 3.7 ms per page of 25 — complete and inline |
+| `router.plan()` per pipeline stage | 41 ms | unchanged (full eligibility read) |
+| `ensure_seeded()` at every startup | — | 4.5 ms, and it writes nothing once aligned |
+
+No new index was added. `EXPLAIN QUERY PLAN` still shows a `USE TEMP B-TREE`
+for the bounded p95 sample, for the catalog page's `ORDER BY deprecated, id` and
+for the user page's `ORDER BY first_seen`; at these sizes each of those sorts
+costs well under a millisecond per page (or, for the p95 sample, is bounded by
+the 5 000-row sample cap), and `ai_events` is ring-pruned to 2 000 rows, so no
+index benefit has been demonstrated — an index that is not needed is write cost
+and migration surface for nothing.
+
+### Notes
+
+* Pricing, model identifiers and free-quota limits are provider-side facts that
+  change without notice; the numbers quoted in `docs/AI_PROVIDERS.md` are dated
+  evidence, not guarantees, and the router treats an unverifiable billing state
+  as not-free rather than as free.
+
+
 ## Unreleased — audit, reliability and performance pass
 
 ### Fixed
