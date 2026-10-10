@@ -26,6 +26,7 @@ from .ai.models import (
     default_model_for,
     fallback_free_model,
     static_models,
+    suggest_replacement,
 )
 from .ai.profiles import profile_for
 from .ai.routing import (
@@ -44,8 +45,8 @@ from .ai.registry import (
     region_service_scope_free_allowed,
     registry_info,
 )
-from .ai.sync import sync_provider_catalog
-from .ai.tokens import estimate_tokens
+from .ai.sync import probe_provider_quota, sync_provider_catalog
+from .ai.tokens import chunk_char_budget, estimate_tokens
 from .ai.usage import sanitize_text
 from .database import utc_now
 from .progress import to_persian_digits
@@ -2427,8 +2428,6 @@ class AIPanels:
         # Replacement suggestions for dead models (spec §16): a route pointing
         # at a withdrawn NVIDIA endpoint should offer a live alternative
         # instead of silently failing over at request time.
-        from .ai.models import suggest_replacement
-
         stale_rows = [
             row for row in window
             if row.get("deprecated") or not row.get("available", 1)
@@ -3050,8 +3049,6 @@ class AIPanels:
             await event.answer("ارائه‌دهندهٔ نامعتبر.", alert=True)
             return
         await event.answer("در حال کاوش وضعیت سهمیه…")
-        from .ai.sync import probe_provider_quota
-
         result = await probe_provider_quota(self.bot.provider_router, slug)
         summary = result.summary() if result else "کاوش ممکن نشد."
         await self.bot._edit_callback(
@@ -3101,9 +3098,9 @@ class AIPanels:
             lines.append("هیچ مسیر واجد شرایطی نیست؛ ربات از مسیر قدیمی استفاده می‌کند یا خطا می‌دهد.")
         for index, leg in enumerate(plan.legs, start=1):
             profile = profile_for(leg.canonical)
-            from .ai.tokens import chunk_char_budget
-
-            chars = chunk_char_budget(profile.chunk_token_budget, char_cap=profile.chunk_char_cap)
+            chars = chunk_char_budget(
+                profile.chunk_token_budget, char_cap=profile.chunk_char_cap
+            )
             lines.append(
                 f"{index}. {leg.provider}"
                 + (" 🆓" if leg.free_only else " 💳")

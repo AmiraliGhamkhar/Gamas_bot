@@ -216,6 +216,20 @@ render, while the row read itself got *smaller* (three rows displayed instead of
 fetched and then sliced). `EXPLAIN QUERY PLAN` for the count: `SEARCH stt_quota_snapshots
 USING COVERING INDEX idx_stt_quota_latest (provider=?)`. No new index.
 
+Re-measured after the last five rounds (same command, same arguments, one run — read
+the in-run BEFORE/AFTER pairs, not the absolute values): overview reads
+41.3 → 20.7 ms, catalog 5.4 → 0.7 ms first page and 1.2 ms last page, user page
+0.80 → 1.07 ms, health panel from cache 2.2 ms, AI log page 6.1 ms (3.1 ms for an
+out-of-range page, which clamps), `ensure_seeded()` 4.4 ms in steady state. The
+shape the table above describes is unchanged; nothing in these rounds moved a
+number materially.
+
+Two screens are the slowest in the panel and both are slow on purpose:
+📈 نمای مسیر و بودجه (52 ms) and 🧭 مسیرها (46 ms) each pay one authoritative
+`router.plan()` eligibility read (40.7 ms on the same database) rather than a
+cached summary, because a route panel that disagreed with the router would be worse
+than one that takes 50 ms to open.
+
 The sampled-percentile label costs nothing: `latency_sample_capped` is a
 comparison on rows the read already fetched, and the note is one suffix on three
 existing lines. The cap itself stays — removing it would mean sorting every
@@ -275,10 +289,12 @@ route-availability annotation → `test_admin_panel_presentation.py`.
   itself would conflate "what this provider costs" with "whether it runs now",
   which is why the annotation was added next to the row instead.
 * That annotation costs one `plan()` per route-panel redraw (~73 ms measured,
-  database-only); caching it was excluded by the no-new-caches rule.
-* The quota overview shows 4 budgets and 3 snapshots per provider and says how
-  many were folded away, with a link to the provider's own screen — bounded and
-  explicit, but not the full list in one message.
+  database-only; 46 ms in the latest run), and the plan/budget panel pays the same
+  single read (52 ms). Caching either was excluded by the no-new-caches rule.
+* The quota overview shows 4 budgets and 3 snapshots per provider and says how many
+  were folded away, with a link to the provider's own screen — which itself reads a
+  20-row window, now labelled, with the rest left in `stt_quota_snapshots`. Bounded
+  and explicit at both levels, but not the full list in one message.
 * The admin audit screen (`admin:audit`, `/audit`) still renders the latest 30
   entries of each ledger with no paging. It is labelled «آخرین», it goes through
   the long-message splitter so it can never be too long to send, and the DB caps

@@ -4,6 +4,15 @@
 
 ### Changed
 
+* Three deferred imports in `admin_ai.py` were hoisted into the module's existing
+  import block — `suggest_replacement`, `probe_provider_quota` and, worst of the
+  three, `chunk_char_budget` which sat **inside** the plan panel's per-leg loop and
+  was therefore looked up once per route on every redraw. Each of the three was
+  provably safe (the module already imported those submodules at top level, so the
+  laziness bought nothing) and the deferred `from .stt import …` in `admin_stt.py`
+  was left alone, because that one does break an import cycle. This is clarity, not
+  a measured speed-up: the import machinery is a dictionary lookup, and no number is
+  claimed for it.
 * **The note route is now Nara first, OpenRouter second.** `DEFAULT_NOTE_ORDER`
   is `nara → openrouter → gemini → groq → mistral → sambanova → zai → nvidia →
   cloudflare`, seeded for all four note tasks plus the health and benchmark
@@ -240,6 +249,13 @@ in the same run, or the pre-change baseline session for the panel renders.
 | User page (800 users) | 1.2 ms for the 50-row query, then a long-message send | 3.7 ms per page of 25 — complete and inline |
 | `router.plan()` per pipeline stage | 41 ms | unchanged (full eligibility read) |
 | `ensure_seeded()` at every startup | — | 4.5 ms, and it writes nothing once aligned |
+
+A later re-run of the same command (same arguments, after the bounded-read and
+credit-screen rounds) reproduced the shape: overview 41.3 → 20.7 ms, catalog page
+5.4 → 0.7 ms, user page 0.80 → 1.07 ms, health panel 2.2 ms from cache, `ensure_seeded()`
+4.4 ms. The two slowest admin screens remain 📈 نمای مسیر و بودجه (52 ms) and 🧭 مسیرها
+(46 ms): each pays one authoritative `router.plan()` read instead of a cached summary,
+by design.
 
 No new index was added. `EXPLAIN QUERY PLAN` still shows a `USE TEMP B-TREE`
 for the bounded p95 sample, for the catalog page's `ORDER BY deprecated, id` and
