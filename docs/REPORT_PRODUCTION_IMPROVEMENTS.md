@@ -7,7 +7,10 @@ snapshot, so the history is now `376a49e` (everything up to the credit-screen fi
 plus the commits after it. No code was lost and no history was rewritten — the
 squash is an environment accident, recorded here rather than hidden.
 Everything below is what was actually changed, run and measured in this workspace;
-nothing here is a projection.
+nothing here is a projection. Defects 1-24 were merged into `main` through PR #42
+(merge commit `ffff87d`, whose head was `bbb7b49`); defect 25 arrived after that
+merge and travels in the follow-up PR #43 as `09d5193`, so the section counts below
+match the branch rather than the merged head.
 
 ---
 
