@@ -75,6 +75,19 @@
   digits-only, anything else falls back to page one, and an out-of-range page clamps to the last
   real page rather than rendering an empty screen.
 
+* **One STT panel still put a model id inside its callback.** `admin:stt:rset:<provider>:<model>`
+  is the shape the catalog and budget rows had already abandoned, and it is the *payload* that
+  runs out of room: Telegram gives `callback_data` 64 bytes in total, and the longest shipped STT
+  model id needed 59 of them — so a slightly longer id, or a longer provider slug, would have made
+  the route-step picker undeliverable rather than merely clipped, and a non-ASCII id from a sync
+  raised in `.encode("ascii")`. `show_route_models` and `route_set_model` now resolve through one
+  `_route_model_choices()` list and address a choice by position plus an 8-hex fingerprint, so the
+  token fits by shape; a stale or out-of-range position is answered with an alert and a re-render,
+  a malformed one is refused before any write, and a name-carrying token from an older message is
+  still honoured (that message was sendable, so refusing it would break a working click).
+  `tests/test_admin_panel_presentation.py` gained 9 tests, including the premise: the old token for
+  the same id is asserted to be over 64 bytes.
+
 * **One long label could silence a whole screen: the 64-unit button limit.** Telegram counts an
   inline button's text in UTF-16 code units, and one oversized button does not render small — the
   entire message is rejected. The purchase button interpolated `plan['name']` (the schema accepts

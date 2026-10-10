@@ -21,7 +21,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from cryptography.fernet import Fernet
 
@@ -793,6 +793,125 @@ class SttCatalogCallbackTests(PanelCase):
         await self._callback("admin:stt:mdep:google_cloud_stt:0:not-a-number")
         rows = {row["model"]: row for row in await self.db.stt_models_list("google_cloud_stt")}
         self.assertEqual(int(rows[self.LONG_MODEL]["deprecated"]), 0)
+
+
+class SttRouteModelCallbackTests(PanelCase):
+    """The route-step model picker must stay sendable whatever an id looks like.
+
+    The catalog and the budget rows learned to be addressed by position; this
+    panel was still putting a provider's model id straight into ``callback_data``,
+    which is 64 bytes of budget for the whole token (the longest shipped id left
+    5 bytes of headroom, so one longer id or provider slug breaks the message).
+    """
+
+    PROVIDER = "google_cloud_stt"
+    LONG_MODEL = "2025-01-01-google-us-en-wideband-reflow-extended-diagnostic-v3"
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        await self.db.stt_routes_replace(
+            [{"provider": self.PROVIDER, "position": 0, "enabled": 1, "model_override": None}],
+            admin_id=7,
+        )
+        # The registry is code-fixed, so a synthetic long id stands in for the
+        # longest thing a provider sync could ever hand us.
+        patcher = patch(
+            "gamas_bot.admin_stt.stt_registry_info",
+            return_value=SimpleNamespace(
+                provider_slug=self.PROVIDER,
+                display_name="Google Cloud STT",
+                models=(self.LONG_MODEL, "second-model"),
+            ),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def _picker(self) -> list[tuple[str, bytes]]:
+        await self._callback(f"admin:stt:rmd:{self.PROVIDER}")
+        return self.flat_buttons()
+
+    async def _override(self) -> object:
+        rows = await self.db.stt_routes_list()
+        return rows[0]["model_override"]
+
+    async def test_the_old_token_could_not_fit(self) -> None:
+        old = f"admin:stt:rset:{self.PROVIDER}:{self.LONG_MODEL}".encode("ascii")
+        self.assertGreater(len(old), 64, old)  # the premise of the fix
+
+    async def test_every_picker_payload_fits_even_with_a_pathological_model_id(self) -> None:
+        buttons = await self._picker()
+        payloads = [payload for _label, payload in buttons]
+        self.assertTrue(any(b"rset" in payload for payload in payloads), payloads)
+        for payload in payloads:
+            self.assertLessEqual(len(payload), 64, payload)
+
+    async def test_the_invariant_holds_for_every_shipped_provider(self) -> None:
+        # One render per registry entry: a future long provider slug has to fail
+        # here rather than turn a picker into an undeliverable message.
+        for slug in STT_PROVIDER_REGISTRY:
+            with self.subTest(provider=slug):
+                await self._callback(f"admin:stt:rmd:{slug}")
+                for _label, payload in self.flat_buttons():
+                    self.assertLessEqual(len(payload), 64, payload)
+
+    async def test_a_position_token_writes_the_model_it_showed(self) -> None:
+        buttons = await self._picker()
+        payload = next(
+            payload.decode("ascii")
+            for _label, payload in buttons
+            if b"rset" in payload and f":{self.PROVIDER}:0:".encode() in payload
+        )
+        await self._callback(payload)
+        self.assertEqual(await self._override(), self.LONG_MODEL)
+
+    async def test_the_second_choice_writes_the_second_model(self) -> None:
+        buttons = await self._picker()
+        payload = next(
+            payload.decode("ascii")
+            for _label, payload in buttons
+            if b"rset" in payload and f":{self.PROVIDER}:1:".encode() in payload
+        )
+        await self._callback(payload)
+        self.assertEqual(await self._override(), "second-model")
+
+    async def test_the_auto_slot_clears_the_override(self) -> None:
+        await self._callback(f"admin:stt:rset:{self.PROVIDER}:1:{'0' * 8}")  # may be refused
+        buttons = await self._picker()
+        payload = next(
+            payload.decode("ascii")
+            for _label, payload in buttons
+            if b"rset" in payload and f":{self.PROVIDER}:-1:".encode() in payload
+        )
+        await self._callback(payload)
+        self.assertIsNone(await self._override())
+
+    async def test_a_stale_fingerprint_is_refused_without_writing(self) -> None:
+        buttons = await self._picker()
+        payload = next(
+            payload.decode("ascii")
+            for _label, payload in buttons
+            if b"rset" in payload and f":{self.PROVIDER}:0:".encode() in payload
+        )
+        wrong = f"{payload.rsplit(':', 1)[0]}:{'0' * 8}"
+        event = await self._callback(wrong)
+        self.assertIn("دوباره باز کنید", str(event.answer.call_args))
+        self.assertIsNone(await self._override())
+
+    async def test_an_out_of_range_position_is_refused(self) -> None:
+        event = await self._callback(f"admin:stt:rset:{self.PROVIDER}:99:{'0' * 8}")
+        self.assertIn("دوباره باز کنید", str(event.answer.call_args))
+        self.assertIsNone(await self._override())
+
+    async def test_a_malformed_position_is_refused(self) -> None:
+        event = await self._callback(f"admin:stt:rset:{self.PROVIDER}:not-a-number:{'0' * 8}")
+        self.assertIn("دستور نامعتبر", str(event.answer.call_args))
+        self.assertIsNone(await self._override())
+
+    async def test_a_token_from_an_older_message_still_works(self) -> None:
+        # A button the admin already has on screen carries the id itself, and that
+        # message was sendable, so refusing it would be the worse bug.
+        await self._callback(f"admin:stt:rset:{self.PROVIDER}:legacy-model-name")
+        self.assertEqual(await self._override(), "legacy-model-name")
 
 
 class BillingPanelTests(PanelCase):

@@ -363,6 +363,37 @@ class SttPanels:
         return f"admin:stt:qdx:{provider}:{int(position)}:{fingerprint}".encode("ascii")[:64]
 
     @staticmethod
+    def _route_model_choices(provider: str) -> list[str]:
+        """The model choices one route step may carry, in render order.
+
+        The picker and the click both resolve through this list, which is why a
+        callback can address a choice by position instead of carrying its name:
+        a provider model id has a length we do not control (the longest shipped
+        one already leaves 5 bytes of headroom), and one over-long
+        ``callback_data`` makes the *whole* message unsendable.
+        """
+        info = stt_registry_info(provider)
+        if info is None:
+            return []
+        models = list(info.models) + [row.model for row in static_stt_models(provider)]
+        return list(dict.fromkeys(str(model) for model in models if str(model or "").strip()))
+
+    @staticmethod
+    def _model_fingerprint(provider: str, model: str) -> str:
+        digest = hashlib.sha1(f"{provider}|{model}".encode("utf-8", "replace")).hexdigest()
+        return digest[:8]
+
+    @classmethod
+    def _route_model_token(cls, provider: str, index: int, model: str) -> bytes:
+        """``admin:stt:rset:<provider>:<index>:<fingerprint>`` — bounded by shape.
+
+        ``index`` ``-1`` is the «خودکار» slot, whose fingerprint is that of the
+        empty override, so the stale check is uniform for every button.
+        """
+        payload = f"admin:stt:rset:{provider}:{int(index)}:{cls._model_fingerprint(provider, model)}"
+        return payload.encode("ascii", "replace")[:64]
+
+    @staticmethod
     def _deprecate_token(provider: str, page: int, index: int) -> bytes:
         """Address one rendered catalog row without carrying its model id.
 
@@ -704,7 +735,7 @@ class SttPanels:
         if info is None:
             await event.answer("ارائه‌دهندهٔ ناشناخته.", alert=True)
             return
-        models = list(dict.fromkeys(list(info.models) + [m.model for m in static_stt_models(provider)]))
+        models = self._route_model_choices(provider)
         lines = [
             f"⚙️ مدل گام «{info.display_name}» در مسیر",
             "",
@@ -712,16 +743,54 @@ class SttPanels:
             "«خودکار» مدل پیش‌فرض تنظیمات را نگه می‌دارد.",
         ]
         buttons = [
-            [Button.inline("⚙️ خودکار (بدون override)", f"admin:stt:rset:{provider}:-".encode("ascii"))]
+            [Button.inline("⚙️ خودکار (بدون override)", self._route_model_token(provider, -1, ""))]
         ]
-        for model in models:
+        for index, model in enumerate(models):
             buttons.append(
-                [Button.inline(f"🎯 {model}"[:60], f"admin:stt:rset:{provider}:{model}".encode("ascii"))]
+                [
+                    Button.inline(
+                        f"🎯 {model}"[:60],
+                        self._route_model_token(provider, index, model),
+                    )
+                ]
             )
         buttons.append([Button.inline("↩️ مسیرها", b"admin:stt:rt")])
         await self._edit(event, "\n".join(lines), buttons)
 
-    async def route_set_model(self, event, provider: str, model: str) -> None:
+    async def route_set_model(
+        self,
+        event,
+        provider: str,
+        model: str | None = None,
+        *,
+        index: object = None,
+        fingerprint: str | None = None,
+    ) -> None:
+        """Apply one route step's model, addressed by name (legacy) or by position.
+
+        Position addressing verifies the fingerprint of the row that was on screen,
+        so a click on an outdated panel is refused instead of writing whichever
+        model happens to sit at that index now.
+        """
+        if model is None:
+            choices = self._route_model_choices(provider)
+            try:
+                position = int(str(index))
+            except (TypeError, ValueError):
+                await event.answer("دستور نامعتبر.", alert=True)
+                return
+            if position >= 0:
+                if position >= len(choices):
+                    await event.answer("این فهرست عوض شده است؛ پنل را دوباره باز کنید.", alert=True)
+                    return
+                candidate = choices[position]
+                if str(fingerprint or "") != self._model_fingerprint(provider, candidate):
+                    await event.answer("این فهرست عوض شده است؛ پنل را دوباره باز کنید.", alert=True)
+                    await self.show_route_models(event, provider)
+                    return
+                model = candidate
+            else:
+                model = "-"
         admin_id = int((await event.get_sender()).id)
         rows = [dict(row) for row in await self.db.stt_routes_list()]
         found = False
@@ -1450,7 +1519,10 @@ async def handle_stt_callback(bot, event, data: str) -> None:
         await ui.route_add(event, arg1)
     elif action == "rmd" and arg1:
         await ui.show_route_models(event, arg1)
+    elif action == "rset" and arg1 and arg2 is not None and arg3 is not None:
+        await ui.route_set_model(event, arg1, index=arg2, fingerprint=arg3)
     elif action == "rset" and arg1 and arg2 is not None:
+        # A button from an older message still carries the model id itself.
         await ui.route_set_model(event, arg1, arg2)
     elif action == "qt" and arg1:
         await ui.show_quotas(event, arg1)
