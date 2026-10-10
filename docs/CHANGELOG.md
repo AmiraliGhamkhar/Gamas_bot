@@ -4,6 +4,16 @@
 
 ### Fixed
 
+* **Word output is now explicitly right-aligned, not justified.** Direction
+  (`w:bidi`) and alignment (`w:jc`) are different properties: a paragraph
+  with `w:bidi` and no `w:jc` aligns to its logical *start* edge, which a
+  reader resolves through its own defaults, and the body text was justified
+  (`both`) rather than right-aligned. Right alignment is now declared at all
+  three layers Word reads -- `w:docDefaults`' `w:pPrDefault`, every
+  paragraph style (`Normal`, the headings, `Title`/`Subtitle`, the box
+  styles, `Quote`, `TOC Heading`, `TOC 1..3`) and every paragraph the build
+  writes -- while the centred blocks keep their explicit centring and a
+  Latin-only formula stays LTR *and* right-aligned.
 * **A missing LibreOffice no longer loses a user's document.** The static table
   of contents used to make the whole delivery fail when no renderer was
   present, discarding a perfectly good transcript and note set. The new

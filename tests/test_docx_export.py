@@ -479,5 +479,84 @@ class StyleLayerDirectionTests(unittest.TestCase):
         self.assertTrue(is_rtl_dominant("تشخیص بر پایهٔ HbA1c است."))
 
 
+class RightAlignmentTests(unittest.TestCase):
+    """Every paragraph is right-aligned -- never justified, never left.
+
+    Alignment is a property of its own, separate from direction: a paragraph
+    marked ``w:bidi`` with no ``w:jc`` aligns to its logical start edge, and
+    the body text of the previous build was justified
+    (``w:jc w:val="both"``), which is not the right-aligned booklet this
+    project promises. The contract is pinned at all three layers Word reads:
+    ``w:docDefaults``, the style definitions, and the paragraphs the build
+    writes.
+    """
+
+    #: Style ids that must declare a right alignment of their own.
+    RIGHT_ALIGNED_STYLES = (
+        "Normal", "Heading1", "Heading2", "Heading3", "Title", "Subtitle",
+        "Quote", "Definition", "Example", "Note", "Warning", "Tabletext",
+        "TOCHeading", "TOC1", "TOC2", "TOC3",
+    )
+
+    def _parts(self, data: bytes) -> dict[str, str]:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            return {
+                name: archive.read(name).decode("utf-8")
+                for name in archive.namelist()
+                if name.endswith(".xml")
+            }
+
+    def _document(self) -> dict[str, str]:
+        notes = parse_structured_notes(FULL_NOTES_JSON)
+        return self._parts(build_notes_docx(notes, meta=META))
+
+    def test_document_defaults_align_right(self):
+        styles = self._document()["word/styles.xml"]
+        p_pr_default = re.search(r"<w:pPrDefault>.*?</w:pPrDefault>", styles, re.S)
+        self.assertIsNotNone(p_pr_default, "the template must keep its pPrDefault")
+        self.assertIn('<w:jc w:val="right"/>', p_pr_default.group(0))
+
+    def test_every_configured_style_aligns_right(self):
+        styles = self._document()["word/styles.xml"]
+        for style_id in self.RIGHT_ALIGNED_STYLES:
+            match = re.search(
+                r'<w:style [^>]*w:styleId="%s".*?</w:style>' % style_id, styles, re.S
+            )
+            self.assertIsNotNone(match, f"missing style {style_id}")
+            self.assertIn('<w:jc w:val="right"/>', match.group(0), style_id)
+
+    def test_no_paragraph_is_justified_or_left_aligned(self):
+        body = self._document()["word/document.xml"]
+        self.assertNotIn('w:val="both"', body, "body text must not be justified")
+        self.assertNotIn('w:val="left"', body, "no paragraph may be left-aligned")
+
+    def test_every_written_paragraph_aligns_right_or_center(self):
+        body = self._document()["word/document.xml"]
+        for xml in re.findall(r"<w:p\b.*?</w:p>", body, re.S):
+            p_pr = re.search(r"<w:pPr>(.*?)</w:pPr>", xml, re.S)
+            jc = re.search(r'<w:jc w:val="([^"]+)"', p_pr.group(1) if p_pr else "")
+            # A paragraph with no explicit ``w:jc`` inherits the document
+            # default, which is right.
+            value = jc.group(1) if jc else "right"
+            self.assertIn(value, ("right", "center", "end"), xml)
+
+    def test_latin_only_line_is_right_aligned_and_keeps_ltr_direction(self):
+        body = self._parts(
+            build_plain_docx("جزوه", "## بخش\n\nF = ma", meta=META)
+        )["word/document.xml"]
+        targets = [
+            xml
+            for xml in re.findall(r"<w:p\b.*?</w:p>", body, re.S)
+            if "".join(re.findall(r"<w:t[^>]*>(.*?)</w:t>", xml, re.S)) == "F = ma"
+        ]
+        self.assertTrue(targets, "the Latin-only line must be present")
+        paragraph = targets[0]
+        # Alignment is right even though the direction stays LTR, so a formula
+        # lines up with the Persian text around it.
+        self.assertIn('<w:jc w:val="right"/>', paragraph)
+        self.assertNotIn("<w:bidi", paragraph)
+
+
+
 if __name__ == "__main__":
     unittest.main()

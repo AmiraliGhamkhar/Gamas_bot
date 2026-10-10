@@ -617,6 +617,15 @@ PPR_AFTER_BIDI = (
     "w:rPr", "w:sectPr", "w:pPrChange",
 )
 
+#: Children that must follow ``w:jc`` inside ``w:pPr`` (CT_PPrBase order).
+#: ``w:jc`` sits after ``w:spacing``/``w:ind`` and before ``w:textDirection``, so
+#: a right alignment written with :data:`PPR_AFTER_BIDI` as its successor list
+#: would be placed *before* the spacing it must follow.
+PPR_AFTER_JC = (
+    "w:textDirection", "w:textAlignment", "w:textboxTightWrap", "w:outlineLvl",
+    "w:divId", "w:cnfStyle", "w:rPr", "w:sectPr", "w:pPrChange",
+)
+
 
 def _insert_ppr_child(p_pr, element, successors: tuple[str, ...]) -> None:
     """Insert a pPr child before its first successor (OOXML is order-sensitive)."""
@@ -914,6 +923,10 @@ def _add_page_break(container):
     (an unwanted table-of-contents page) can remove exactly that element.
     """
     paragraph = container.add_paragraph()
+    # A structural paragraph is still a paragraph of a Persian document: it
+    # carries the right alignment like every other one, so the contract "every
+    # paragraph in this file is right-aligned" holds without exceptions.
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
     paragraph.add_run().add_break(WD_BREAK.PAGE)
     return paragraph
 
@@ -927,7 +940,7 @@ def _add_rtl_paragraph(
     bold: bool = False,
     color: RGBColor | None = None,
     italic: bool = False,
-    align=WD_ALIGN_PARAGRAPH.JUSTIFY,
+    align=WD_ALIGN_PARAGRAPH.RIGHT,
     space_after: float = 6,
     space_before: float = 0,
     line_spacing: float = 1.15,
@@ -960,7 +973,7 @@ def _fill_paragraph(
     bold: bool = False,
     color: RGBColor | None = None,
     italic: bool = False,
-    align=WD_ALIGN_PARAGRAPH.JUSTIFY,
+    align=WD_ALIGN_PARAGRAPH.RIGHT,
     space_after: float = 6,
     space_before: float = 0,
     line_spacing: float = 1.15,
@@ -1233,6 +1246,20 @@ def _style_direction(style, *, rtl: bool = True) -> None:
     _set_rpr_rtl(style.element.get_or_add_rPr(), rtl=rtl)
 
 
+def _set_style_alignment(style, align=WD_ALIGN_PARAGRAPH.RIGHT) -> None:
+    """Give a *style definition* an explicit base alignment (``w:jc``).
+
+    Direction and alignment are different properties. A right-to-left
+    paragraph with no ``w:jc`` aligns to its logical *start* edge, which a
+    reader resolves through its own defaults and the paragraph mark rather
+    than through ``w:bidi``. Declaring the alignment on the style -- not only
+    on the paragraphs this build writes -- keeps style-derived content (a list
+    Word generates, a paragraph the reader inserts, pasted text) on the right
+    margin of this Persian document.
+    """
+    style.paragraph_format.alignment = align
+
+
 def _configure_document_defaults(document, fonts: DocumentFonts) -> None:
     """Make the document's own defaults a Persian, right-to-left context.
 
@@ -1254,6 +1281,17 @@ def _configure_document_defaults(document, fonts: DocumentFonts) -> None:
         for found in p_pr.findall(qn("w:bidi")):
             p_pr.remove(found)
         _insert_ppr_child(p_pr, OxmlElement("w:bidi"), PPR_AFTER_BIDI)
+        # Alignment is declared separately from direction: a right-to-left
+        # paragraph with no ``w:jc`` aligns to its logical *start* edge, and
+        # every helper and style below asks for right alignment explicitly.
+        # Declaring it here too keeps a paragraph Word synthesises -- or one a
+        # reader types into an unstyled context -- on the right margin instead
+        # of falling back to the reader's default text direction and edge.
+        for found in p_pr.findall(qn("w:jc")):
+            p_pr.remove(found)
+        default_alignment = OxmlElement("w:jc")
+        default_alignment.set(qn("w:val"), "right")
+        _insert_ppr_child(p_pr, default_alignment, PPR_AFTER_JC)
     r_pr_default = doc_defaults.find(qn("w:rPrDefault"))
     if r_pr_default is not None:
         r_pr = r_pr_default.find(qn("w:rPr"))
@@ -1300,6 +1338,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
     normal.font.size = Pt(11)
     _style_complex_face(normal, fonts, size=11)
     _style_direction(normal)
+    _set_style_alignment(normal)
     normal.paragraph_format.space_after = Pt(6)
     normal.paragraph_format.line_spacing = 1.15
     normal.paragraph_format.widow_control = True
@@ -1319,6 +1358,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
         style.font.color.rgb = ACCENT
         _style_complex_face(style, DocumentFonts(face, face, fonts.latin, fonts.fallback), size=size)
         _style_direction(style)
+        _set_style_alignment(style)
         paragraph_format = style.paragraph_format
         paragraph_format.space_before = Pt(before)
         paragraph_format.space_after = Pt(after)
@@ -1337,6 +1377,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
         style.font.color.rgb = color
         _style_complex_face(style, fonts, size=size)
         _style_direction(style)
+        _set_style_alignment(style)
         style.paragraph_format.space_before = Pt(before)
         style.paragraph_format.space_after = Pt(after)
         style.paragraph_format.line_spacing = 1.1
@@ -1355,6 +1396,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
         style.font.bold = False
         _style_complex_face(style, fonts, size=size)
         _style_direction(style)
+        _set_style_alignment(style)
         style.paragraph_format.space_before = Pt(before)
         style.paragraph_format.space_after = Pt(after)
         style.paragraph_format.line_spacing = 1.15
@@ -1366,6 +1408,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
     quote.font.italic = False
     _style_complex_face(quote, fonts, size=11.5)
     _style_direction(quote)
+    _set_style_alignment(quote)
     quote.paragraph_format.space_before = Pt(6)
     quote.paragraph_format.space_after = Pt(6)
     quote.paragraph_format.line_spacing = 1.2
@@ -1377,6 +1420,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
     toc_heading.font.color.rgb = ACCENT
     _style_complex_face(toc_heading, fonts, size=16)
     _style_direction(toc_heading)
+    _set_style_alignment(toc_heading)
     toc_heading.paragraph_format.space_before = Pt(0)
     toc_heading.paragraph_format.space_after = Pt(12)
 

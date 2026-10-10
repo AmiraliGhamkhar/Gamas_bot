@@ -19,6 +19,16 @@ These are contracts, not styling preferences, and each has tests:
   `w:bidi`, and their *paragraph mark* gets its own `w:rtl` so an empty line,
   the caret and a shaded spacer behave RTL too. Latin-only lines are left to
   Word's default direction.
+* **Right alignment** — direction and alignment are separate properties, so
+  the document declares the alignment too: `w:docDefaults`, every paragraph
+  style and every written paragraph carry `w:jc w:val="right"`. A paragraph
+  with `w:bidi` and no `w:jc` aligns to its logical *start* edge, which a
+  reader resolves through its own defaults rather than through the file, and
+  justified (`both`) body text is not the right-aligned booklet this project
+  delivers. Only the deliberately centred blocks (brand mark, cover title,
+  footer, formula lines, TOC page cells) override it, and a Latin-only line
+  such as a formula stays LTR *and* right-aligned, so it lines up with the
+  Persian text around it.
 * **Mixed scripts** — `gamas_bot/bidi.py` splits text into direction runs;
   Persian runs get the complex-script face (`w:cs`) with `w:rtl`, embedded
   English keeps `w:ascii`/`w:hAnsi` and `w:rtl=0`. Logical order is never
