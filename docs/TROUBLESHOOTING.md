@@ -19,6 +19,34 @@ it; the surrounding exception is the cause. Common cases:
 * the file has no audio stream → the error is explicit and user-visible.
 * the file is larger than the direct-upload limit of every configured engine.
 
+## STT providers fail or a job says no eligible engine
+
+Open **🎙 پلتفرم STT** first: «مسیرها» shows the active route and why each
+provider is eligible or denied (the same stable reason codes the logs use),
+«سهمیه‌ها» shows budget/quota state, and «رویدادها» shows the structured event
+trail. `python -m scripts.benchmark_stt --plan sample.wav` prints the route
+decision per engine without sending audio.
+
+Normalized error categories (spec §46) appear in the logs and the STT Logs
+panel:
+
+| Category | Meaning | What to do |
+| --- | --- | --- |
+| `authentication` / `permission` | 401/403 — the key is invalid or disabled | Re-add or enable the key in 🔑 API Keys; rotation happens automatically across the key pool |
+| `quota_exhausted` / `rate_limited` | 429 or an exhausted budget | Respect `Retry-After`; the job moves to the next provider. Check «سهمیه‌ها» for the remaining window |
+| `billing_required` | Provider demands payment | Do not enable paid fallback unless deliberate (`STT_ALLOW_PAID_FALLBACK`) |
+| `model_unavailable` / `language_unsupported` / `format_unsupported` / `file_too_large` / `duration_too_long` | Deterministic rejection | Not retried; fix the request or let routing pick another provider |
+| `provider_timeout` / `network_failure` / `server_error` | Transient | Retried within `STT_MAX_ATTEMPTS`; then the next provider runs |
+| `quality_failure` | The transcript failed the deterministic quality gate | Logged as `stt_quality_rejected`; the next provider is tried |
+| `response_schema_error` / `invalid_request` / `unknown` | Malformed output or bad request | Report with the event id; never with audio or keys |
+
+If every provider fails, the job is preserved and reported as failed with its
+tracking reference — Gamas never fabricates a transcript or returns an empty
+"success". A "no eligible high-quality free STT provider" message means the
+free/trial gates refused every candidate: check Free-only policy
+(`STT_FREE_ONLY`, `STT_TRIAL_ALLOWLIST`), per-provider enable/billing state and
+the quota panel.
+
 ## The booklet arrives, but the table of contents has no page numbers
 
 Expected when no renderer is installed and `DOCX_TOC_PAGE_NUMBERS=auto`: the

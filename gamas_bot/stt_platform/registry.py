@@ -34,8 +34,10 @@ from dataclasses import dataclass, replace
 from enum import Enum
 
 #: Date the classifications/limits below were last cross-checked against the
-#: providers' official documentation.
-VERIFIED_AT = "2026-10-09"
+#: providers' official documentation. 2026-10-10: Gemini Transcribe
+#: (transcribe/pricing pages) and Groq (speech-to-text/rate-limits pages) were
+#: re-verified end-to-end; every recorded claim matched the live pages.
+VERIFIED_AT = "2026-10-10"
 
 
 class STTProviderClass(str, Enum):
@@ -171,6 +173,12 @@ class STTProviderInfo:
     #: ``generic_gateway`` or ``unverified``. Only the first three count as
     #: official evidence; ``last_verified_at`` is set only for them.
     evidence: str = "unverified"
+    # -- privacy metadata (spec §53): claims are only recorded when the
+    # provider's own documentation supports them. "unknown"/"none_claimed"
+    # must never be upgraded to HIPAA/GDPR/no-training marketing language. --
+    data_training_policy: str = "unknown"
+    data_region: str = "unknown"
+    medical_compliance: str = "none_claimed"
 
     @property
     def classification(self) -> STTProviderClass:
@@ -186,8 +194,8 @@ class STTProviderInfo:
 
 
 # ---------------------------------------------------------------------------
-# Registry data (all free-tier facts verified against official documentation
-# on 2026-10-09; see docs/STT_PROVIDERS.md for the per-provider evidence).
+# Registry data (all free-tier facts verified against official documentation;
+# see docs/STT_PROVIDERS.md for the per-provider evidence and dates).
 # ---------------------------------------------------------------------------
 
 _SPEECHMATICS = STTProviderInfo(
@@ -323,7 +331,7 @@ _GROQ = STTProviderInfo(
     supports_confidence=False,
     vocabulary_supported=True,
     vocabulary_max_terms=1,
-    vocabulary_parameter="prompt (single free-form prompt field)",
+    vocabulary_parameter="prompt (single free-form prompt field, <=224 tokens)",
     supports_smart_formatting=True,
     supports_audio_enhancement=False,
     experimental=False,
@@ -865,13 +873,48 @@ PROVIDER_EVIDENCE: dict[str, str] = {
     "elevenlabs_scribe": "search_snippet",
 }
 
+#: Per-provider privacy metadata (spec §53), only where the provider's own
+#: documentation records the fact. Everything else stays ``unknown`` /
+#: ``none_claimed``: Gamas never labels a provider HIPAA-safe, GDPR-safe or
+#: no-training on the strength of marketing copy.
+PROVIDER_PRIVACY: dict[str, dict[str, str]] = {
+    "gemini_transcribe": {
+        "data_training_policy": (
+            "free-of-charge (unpaid) API traffic may be used by Google to improve its "
+            "products; paid-tier traffic is not (official pricing page)"
+        ),
+        "data_region": "global endpoint; no data-residency claim",
+    },
+    "groq": {
+        "data_training_policy": (
+            "zero-data-retention option documented for some endpoints "
+            "(console.groq.com/docs/your-data)"
+        ),
+        "data_region": "no data-residency claim",
+    },
+    "assemblyai": {
+        "data_training_policy": (
+            "training on transcripts is opt-in for paid accounts; free-tier users "
+            "cannot opt out (official pricing page)"
+        ),
+        "data_region": "no data-residency claim",
+    },
+    "speechmatics": {
+        "data_training_policy": "unknown; see Speechmatics data-security documentation",
+        "data_region": "eu1 endpoint default; region selectable on request",
+    },
+}
+
 
 def _with_evidence(info: STTProviderInfo) -> STTProviderInfo:
     evidence = PROVIDER_EVIDENCE.get(info.provider_slug, "unverified")
+    privacy = PROVIDER_PRIVACY.get(info.provider_slug, {})
     return replace(
         info,
         evidence=evidence,
         last_verified_at=VERIFIED_AT if evidence in _OFFICIAL_EVIDENCE else "unverified",
+        data_training_policy=privacy.get("data_training_policy", info.data_training_policy),
+        data_region=privacy.get("data_region", info.data_region),
     )
 
 
@@ -978,6 +1021,10 @@ def capability_matrix() -> list[dict]:
                 "free_limit": info.free_limit,
                 "commercial_use": info.commercial_use,
                 "region_restrictions": info.region_restrictions,
+                "data_training_policy": info.data_training_policy,
+                "retention_policy": info.data_retention,
+                "data_region": info.data_region,
+                "medical_compliance": info.medical_compliance,
                 "experimental": info.experimental,
                 "enabled": info.enabled,
                 "quality_score": info.quality_score,

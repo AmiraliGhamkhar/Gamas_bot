@@ -382,6 +382,31 @@ class Database:
         async with self._lock:
             return await self._user_is_unlimited_in_transaction(self._db(), int(user_id))
 
+    async def user_plan_tier(self, user_id: int) -> str:
+        """Billing tier that may influence provider routing (spec §52).
+
+        ``paid`` for special/unlimited users and holders of an active non-free
+        plan entitlement; everyone else is ``free``. The value only *narrows*
+        the STT policy — a free user's job never reaches a paid provider — and
+        can never widen it beyond the deployment's configured policy.
+        """
+        now = utc_now()
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT is_unlimited FROM users WHERE id=?", (int(user_id),)
+            )
+            row = await cursor.fetchone()
+            if row and int(row["is_unlimited"]):
+                return "paid"
+            cursor = await self._db().execute(
+                "SELECT 1 FROM entitlements e JOIN plans p ON p.id=e.plan_id "
+                "WHERE e.user_id=? AND e.status='active' AND p.is_free=0 "
+                "AND e.remaining_seconds > 0 "
+                "AND (e.expires_at IS NULL OR e.expires_at > ?) LIMIT 1",
+                (int(user_id), now),
+            )
+            return "paid" if await cursor.fetchone() else "free"
+
     async def set_user_unlimited(
         self,
         telegram_id: int,
@@ -3083,6 +3108,23 @@ class Database:
             )
             row = await cursor.fetchone()
             return dict(row) if row else None
+
+    async def stt_quota_budget_delete(
+        self, provider: str, account_scope: str, quota_type: str, *, admin_id: int
+    ) -> bool:
+        """Remove an admin-entered budget ceiling; observed snapshots are kept."""
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "DELETE FROM stt_quota_budgets WHERE provider=? AND account_scope=? AND quota_type=?",
+                (provider, account_scope, quota_type),
+            )
+            deleted = bool(cursor.rowcount)
+            if deleted:
+                await self._insert_audit(
+                    db, admin_id, "stt_quota_budget_deleted", "stt_quota_budget",
+                    f"{provider}:{account_scope}", {"quota_type": quota_type},
+                )
+            return deleted
 
     async def stt_quota_reserve(
         self,

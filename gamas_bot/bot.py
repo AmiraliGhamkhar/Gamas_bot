@@ -70,6 +70,7 @@ from .presentations import (
 )
 from .progress import JobProgress
 from .admin_ai import AIPanels, handle_ai_callback
+from .admin_stt import SttPanels, handle_stt_callback
 from .ai.models import ModelRegistry
 from .ai.routing import (
     NoteJobSession,
@@ -213,8 +214,9 @@ def admin_menu():
         ],
         [
             Button.inline("🤖 پلتفرم AI", b"admin:ai"),
-            Button.inline("🧭 مسیرها", b"admin:ai:rt"),
+            Button.inline("🎙 پلتفرم STT", b"admin:stt"),
         ],
+        [Button.inline("🧭 مسیرها", b"admin:ai:rt")],
         [
             Button.inline("📜 گزارش مدیر", b"admin:audit"),
             Button.inline("📣 پیام همگانی", b"admin:broadcast"),
@@ -439,6 +441,9 @@ class StudyBot:
         # routes, usage, models, logs, dry-run). Kept in its own module to keep
         # bot.py focused on the job pipeline.
         self.ai_panels = AIPanels(self)
+        # Gamas Speech Platform admin panels (STT providers, models, routes,
+        # quotas, health, logs, test tool, dry-run) — same separation for STT.
+        self.stt_panels = SttPanels(self)
         self._receipt_cleanup_task: asyncio.Task | None = None
         self._receipt_root: Path | None = None
         self._pending_credential_setup: dict[int, dict[str, str | None]] = {}
@@ -1711,6 +1716,9 @@ class StudyBot:
         if data == "admin:credentials":
             await self._show_provider_credentials(event)
             return
+        if data.startswith("admin:stt"):
+            await handle_stt_callback(self, event, data)
+            return
         if data.startswith("admin:ai"):
             await handle_ai_callback(self, event, data)
             return
@@ -1833,6 +1841,11 @@ class StudyBot:
     ) -> None:
         if action == "aikey_label":
             await self.ai_panels.handle_wizard_label(event, text)
+            return
+
+        if action.startswith("stt_budget:"):
+            provider = action.split(":", 1)[1]
+            await self.stt_panels.handle_budget_input(event, provider, text)
             return
 
         if action.startswith("aiprovider_meta:"):
@@ -2378,6 +2391,7 @@ class StudyBot:
             or pending_action.startswith("payment_reject:")
             or pending_action.startswith("aikey_")
             or pending_action.startswith("aiprovider_meta:")
+            or pending_action.startswith("stt_")
         ):
             if command == "/cancel":
                 self._pending_admin_actions.pop(telegram_id, None)
@@ -2754,6 +2768,11 @@ class StudyBot:
                             self.settings,
                             credentials=self.credential_manager,
                             submission_id=submission_id,
+                            plan_tier=(
+                                await self.db.user_plan_tier(user_id)
+                                if user_id is not None
+                                else None
+                            ),
                         )
                     except BaseException:
                         if reservation_active and await self._release_submission_usage(
@@ -2977,6 +2996,11 @@ class StudyBot:
                         self.settings,
                         credentials=self.credential_manager,
                         submission_id=submission_id,
+                        plan_tier=(
+                            await self.db.user_plan_tier(user_id)
+                            if user_id is not None
+                            else None
+                        ),
                     )
                 except BaseException:
                     if reservation_active and await self._release_submission_usage(
