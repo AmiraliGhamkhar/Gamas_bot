@@ -12,8 +12,8 @@ python -m scripts.sync_requirements --check
 
 `.github/workflows/tests.yml` runs the suite on Python 3.11, 3.12 and 3.13,
 through both `pytest` and `unittest discover` (the entry point deployments use).
-The latest local `unittest discover -s tests` run executed 1,218 tests with one
-skip and passed (158.2 s); the same run under `pytest` reports 1,217 passed because
+The latest local `unittest discover -s tests` run executed 1,220 tests with one
+skip and passed (144.7 s); the same run under `pytest` reports 1,219 passed because
 the two runners count the one skip differently. Counts are snapshots; update them
 when the suite changes.
 

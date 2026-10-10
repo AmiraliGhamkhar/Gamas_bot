@@ -3693,9 +3693,11 @@ class StudyBot:
         """Deliver the polished RTL Word document plus the raw-text file.
 
         The Word document is the primary deliverable. When it cannot be
-        generated (for example a broken python-docx installation) the notes
-        fall back to an in-chat text message so no content is ever lost; the
-        raw-text file is always sent.
+        generated (for example a broken python-docx installation), or cannot be
+        handed to Telegram, the notes fall back to an in-chat text message so no
+        content is ever lost; the raw-text file is always sent, whatever
+        happened to the Word one. A failure of either note delivery is therefore
+        never allowed to skip the remaining sends.
         """
         meta = DocumentMeta(
             reference=reference,
@@ -3754,12 +3756,30 @@ class StudyBot:
             caption = f"📖 جزوهٔ «{docx_title}» — فایل Word" + notice
             # Telegram captions are capped at 1024 characters.
             caption = caption[:1000]
-            await self._send_document(
-                event, docx_path, caption, buttons=main_menu(is_admin)
-            )
-        elif pagination_error is None:
+            try:
+                await self._send_document(
+                    event, docx_path, caption, buttons=main_menu(is_admin)
+                )
+            except Exception:
+                # The *upload* can fail on a document that was built fine (Telegram
+                # rejects the file, the connection drops). Losing the file is no
+                # reason to lose the note: the text goes out below and the raw
+                # transcript is still delivered, instead of the whole job being
+                # recorded as a failure after the model work was already paid for.
+                logger.exception(
+                    "Word document delivery failed; falling back to the text note reference=%s",
+                    reference,
+                )
+                docx_path = None
+        if docx_path is None and pagination_error is None:
             body = (notes.to_markdown() if notes is not None else plain_text) + notice
-            await self._send_long_message(event, body, is_admin=is_admin)
+            try:
+                await self._send_long_message(event, body, is_admin=is_admin)
+            except Exception:
+                logger.exception(
+                    "Text note delivery failed; the raw transcript still goes out reference=%s",
+                    reference,
+                )
 
         # The raw transcript is the one deliverable that never depends on the
         # Word document, so it is always sent — see the docstring above.
