@@ -1,8 +1,13 @@
 # گزارش کار / Work report — production improvements (routing, panels, performance)
 
-Branch `arena/e4af84af-gamas-bot`, commits `eb67a1a` and `0251f0c` on top of
-`e64ca86`. Everything below is what was actually changed, run and measured in
-this workspace; nothing here is a projection.
+Branch `arena/e4af84af-gamas-bot`, on top of `e64ca86`. The work was built up in
+twelve per-round commits; the Arena sandbox was re-cloned from the remote partway
+through, which discarded the unpushed commit objects while keeping the file
+snapshot, so the history is now `376a49e` (everything up to the credit-screen fix)
+plus the commits after it. No code was lost and no history was rewritten — the
+squash is an environment accident, recorded here rather than hidden.
+Everything below is what was actually changed, run and measured in this workspace;
+nothing here is a projection.
 
 ---
 
@@ -31,14 +36,32 @@ this workspace; nothing here is a projection.
 | 19 | The latency percentile is deliberately sampled — `ai_usage_overview()` reads at most `LATENCY_PERCENTILE_SAMPLE` (5 000) newest rows instead of materialising every latency — and the database exposed `latency_samples`, but **no panel consumed it**: three screens printed «تأخیر p95: X ms» next to «درخواست‌های امروز: N», so on a day with more than 5 000 requests an admin compared a *sample* percentile against a full-window counter and nothing marked the difference | The p95 an operator uses to judge a provider's tail latency was silently the p95 of whatever 5 000 requests happened to be newest — the same "bounded read presented as the whole" class as defects 9, 15, 16 and 17, on a number people make routing decisions with. Note the subtlety: `latency_samples < requests` is **not** the signal (rows can legitimately have no latency recorded); the honest signal is that the read saturated |
 | 20 | The STT quota screen stated a total it had invented: `stt_quota_latest()` ended in a hard `LIMIT 20`, the overview sliced that to `[:3]`, and the label printed `len(snapshots)` — so a provider with more than 20 quota rows read «آخرین 3 از 20» — while the advice in the same line, «برای دیدن همه، صفحهٔ همین ارائه‌دهنده را باز کنید», pointed at a screen that applied the very same 20-row read and so could not show them either | An admin debugging a quota problem was told a number that was the size of the read, and was sent to a screen that would silently repeat the cut; on a provider with per-model quotas (the table is unique per account_scope/model/quota_type, so 25 rows is ordinary) the history looked finite and reachable when it was neither |
 
-Every item above is fixed. Defects 12-15 were found after the main commit and
-closed in the commits that follow it (`0251f0c` bound the quota screen,
-`56f5b19` added the route annotation, `e9aa436` gave the log page its total,
-`dbe4fea` replaced the three name-carrying tokens with positions plus a
-fingerprint, and the finance commit counted the backlog and paged the billing
-screens); §6 records what defect 12's fix costs. The
-remedy for 12 is an explicit annotation next to the row rather than a new colour
-glyph — the honest caveat is in §8.
+Every item above is fixed. Defects 12-20 were found after the first pass and
+closed round by round: the quota screen was bounded, the route annotation added,
+the log page given its total, the three name-carrying tokens replaced by positions
+plus a fingerprint, the billing screens counted and paged, the AI monitoring
+digests labelled, the digest filters reordered before their caps, the credit
+screen's balance made to agree with billing, the sampled percentile labelled, and
+the STT quota totals re-sourced from the table (§6 records what defect 12's fix
+costs). The remedy for 12 is an explicit annotation next to the row rather than a
+new colour glyph — the honest caveat is in §8.
+
+**Sweep closure.** The bounded-read family was swept three ways and each pass is
+recorded: `limit=` arguments and hard `LIMIT`s in the read itself (defects 9, 13, 15,
+18, 20), Python slices taken from an already-bounded read (9, 16, 17, 18, 20), and
+filters applied *after* a cap
+or aggregates computed *over* a windowed read (17, 18, 19). The remaining bounded
+displays were read and are labelled by design, not overlooked:
+`QUOTA_ROWS` (probe row + «فقط ۱۲ تصویر سهمیه…» next to it), `BENCHMARK_ROWS`
+(same shape), `HEALTH_ROWS` (states how many results the cache holds),
+`WIZARD_MODEL_CHOICES` on both wizard branches («N مدل شناخته‌شدهٔ دیگر در این فهرست
+نیامده» plus the custom-model escape hatch), `QUOTA_OVERVIEW_BUDGETS` /
+`QUOTA_PROVIDERS_PAGE_SIZE` (folded counts stated, drill-in button offered),
+`USERS_EXPORT_ROWS` («۵۰ کاربر اخیر از N کاربر»), the finance pages (real `COUNT`s),
+`LATENCY_PERCENTILE_SAMPLE` (sampled note), `admin_audit`/`admin_usage_ledger`
+(labelled «آخرین» digests, DB-capped at 200 and sent through the long-message pager),
+and the credential lists whose "N از M" totals come from uncapped
+`list_summaries()` rather than from a page.
 
 ## 2. Files changed and why
 
