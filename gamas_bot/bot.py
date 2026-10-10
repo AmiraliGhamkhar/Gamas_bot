@@ -2047,6 +2047,12 @@ class StudyBot:
         if not is_admin:
             await event.answer("این بخش فقط برای مدیر ربات است.", alert=True)
             return
+        # Tapping any panel button abandons a half-finished text prompt (a plan,
+        # credit, broadcast, rejection or key prompt). Without this, the next
+        # message the administrator types is silently consumed by the stale
+        # prompt, so the panel they just opened looks broken. Flows that need a
+        # pending state set it again in their own handler below.
+        self._pending_admin_actions.pop(telegram_id, None)
         if data in _ADMIN_ACK_FIRST or data.startswith(_ADMIN_ACK_FIRST_PREFIXES):
             # Read-only admin panels with a fixed payload: acknowledge the tap
             # before the database work, so the button stops spinning while the

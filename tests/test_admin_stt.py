@@ -16,6 +16,7 @@ from gamas_bot.bot import StudyBot
 from gamas_bot.database import Database
 from gamas_bot.provider_credentials import ProviderCredentialManager
 from gamas_bot.provider_health import ProviderHealthChecker
+from gamas_bot.stt_platform.models import STTModelRegistry
 from gamas_bot.stt_platform.registry import STT_PROVIDER_REGISTRY
 
 from support import make_settings
@@ -137,6 +138,18 @@ class SttPanelCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(deprecated[0]["deprecated"])
         self.assertEqual(deprecated[0]["status"], "deprecated")
         self.assertTrue(any(row["model"] == "whisper-large-v3-turbo" for row in rows))
+        # Marking one model must not collapse the provider's catalog: the write
+        # persists the whole visible catalog, so a later registry read still
+        # sees every model (not just the deprecation flag on one row).
+        self.assertEqual(
+            {row["model"] for row in rows},
+            {"whisper-large-v3", "whisper-large-v3-turbo"},
+        )
+        cached = await STTModelRegistry(self.db, self.settings).cached("groq")
+        self.assertEqual(
+            {row.model for row in cached},
+            {"whisper-large-v3", "whisper-large-v3-turbo"},
+        )
 
     # ------------------------------------------------------------ routes
     async def test_route_persist_move_toggle_and_delete(self):

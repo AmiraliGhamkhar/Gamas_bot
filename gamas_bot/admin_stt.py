@@ -530,23 +530,10 @@ class SttPanels:
             return
         await self.mark_model(event, provider, str(window[position].model))
 
-    async def mark_model(self, event, provider: str, model: str) -> None:
-        registry = STTModelRegistry(self.db, self.settings)
-        known = {str(row.model) for row in await registry.cached(provider)}
-        if model not in known:
-            # An action may only ever touch a row that exists: a stale button
-            # (or a hand-built callback) must not insert a phantom model.
-            await event.answer("این مدل دیگر در رجیستری نیست.", alert=True)
-            await self.show_models(event, provider)
-            return
-        try:
-            info = await registry.resolve(provider, model)
-        except Exception:
-            # A read that fails must surface as a message, not a traceback in
-            # the callback handler.
-            await event.answer("رجیستری STT برای این ارائه‌دهنده خوانده نشد.", alert=True)
-            return
-        updated = STTModelInfo(
+    @staticmethod
+    def _deprecated_row(info: STTModelInfo) -> dict:
+        """The registry row for ``info`` marked deprecated, keeping every field."""
+        return STTModelInfo(
             provider=info.provider,
             model=info.model,
             display_name=info.display_name,
@@ -563,8 +550,28 @@ class SttPanels:
             available=info.available,
             source=info.source,
             last_verified=info.last_verified,
+        ).to_row()
+
+    async def mark_model(self, event, provider: str, model: str) -> None:
+        registry = STTModelRegistry(self.db, self.settings)
+        catalog = await registry.cached(provider)
+        if model not in {str(row.model) for row in catalog}:
+            # An action may only ever touch a row that exists: a stale button
+            # (or a hand-built callback) must not insert a phantom model.
+            await event.answer("این مدل دیگر در رجیستری نیست.", alert=True)
+            await self.show_models(event, provider)
+            return
+        # Persist the *whole* visible catalog with only the chosen model
+        # flagged. Writing just the changed row (the previous behaviour) made
+        # the next ``cached(provider)`` return that single row, collapsing the
+        # provider's entire catalog to one model everywhere the registry is
+        # read (the models panel, page counting, route model choices).
+        await self.db.stt_models_upsert(
+            [
+                self._deprecated_row(row) if str(row.model) == model else row.to_row()
+                for row in catalog
+            ]
         )
-        await self.db.stt_models_upsert([updated.to_row()])
         replacement = default_stt_model(provider)
         message = "مدل به عنوان DEPRECATED علامت خورد؛ حذف نشد."
         if replacement and replacement != model:

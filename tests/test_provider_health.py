@@ -387,6 +387,15 @@ class HealthPanelIsolationTests(unittest.IsolatedAsyncioTestCase):
         await bot._handle_callback(event)
         self.assertEqual(getattr(bot, "_health_calls", 1), 1)
 
+    async def test_admin_panel_button_clears_a_stale_text_prompt(self):
+        # A half-finished prompt (e.g. «طرح جدید») must not survive navigation:
+        # otherwise the next message the administrator types is silently
+        # consumed by the abandoned prompt instead of reaching the panel.
+        bot, event = self._bot_and_event()
+        bot._pending_admin_actions[7] = "plan_new"
+        await bot._handle_callback(event)
+        self.assertEqual(bot._pending_admin_actions, {})
+
     def test_health_menu_entries_are_admin_only(self):
         # The user keyboard never leaks an admin callback, and the account
         # screen keeps both credit visibility and purchase reachable.

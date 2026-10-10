@@ -252,6 +252,18 @@
   stops spinning while the panel reads.
 * Deprecating a model from the catalog panel recorded no date (`None`), so the
   deprecation could not be aged; and the provider legend had a typo.
+* **Marking an STT model deprecated collapsed the provider's catalog.** The
+  action wrote only the changed row to `stt_model_registry`, so the next
+  `STTModelRegistry.cached(provider)` returned that single row and every other
+  model on the provider disappeared from the models panel, from the page count
+  and from the route model picker. The write now persists the whole visible
+  catalog with only the chosen model flagged.
+* **A stale admin text prompt survived panel navigation.** Opening another
+  admin panel left a pending plan/credit/broadcast/rejection prompt armed, so
+  the next message the administrator typed was silently consumed by the
+  abandoned prompt and the newly opened panel looked broken. Any admin callback
+  now clears the pending prompt before dispatch; flows that need one set it
+  again in their own handler.
 
 ### Added
 
