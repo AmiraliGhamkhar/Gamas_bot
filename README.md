@@ -39,6 +39,14 @@ A completed job delivers two files: the Word booklet and a `.txt` file
 containing the transcript exactly as extracted. If the note model is unavailable,
 the transcript is still delivered — content is never lost to a provider outage.
 
+In the chat the flow starts from one button, **📎 ساخت جزوه**; help and output
+formats share a single screen and balance, top-up and subscription share the
+account screen. Administrators get five destinations — overview and statistics,
+users and billing, AI note generation, speech recognition, and operations and
+security — with long lists (model catalogs, event logs, users) paginated rather
+than cut off, and every provider switch, attestation, route, quota and test
+control reachable from inside its own panel.
+
 ## Supported formats
 
 * **Audio** — MP3, M4A, WAV, OGG/OPUS, FLAC, WMA, AMR, AAC and Telegram voice

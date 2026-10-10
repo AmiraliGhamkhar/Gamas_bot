@@ -107,6 +107,19 @@ silently consume credit.
    a fixed argument vector and `shell=False`.
 6. The Telegram session is guarded by an advisory lock so two processes cannot
    both poll the same bot account.
+7. A panel never pays for a provider. Opening or redrawing any AI/STT screen
+   reads SQLite only; live probes, catalog syncs and test generations are
+   separate, explicit actions, and a failed sync leaves the last valid rows in
+   place.
+8. A long list is paged, never cut. Callbacks that carry a page keep it inside
+   Telegram's 64-byte ``callback_data`` limit and degrade to the first (or last
+   valid) page when a stale or malformed token arrives. A callback carries an
+   *address*, never a *payload*: anything whose length comes from provider data
+   (a synced model id) or from admin free text (a quota scope) is addressed by
+   position — plus an identity fingerprint when the action destroys a row — since
+   one over-long name makes the entire screen unsendable, not just that button.
+9. Route order is a preference and an admin edit is a fact. Startup may align a
+   route that is still provably automatic, and never one an administrator saved.
 
 ## Where to change things
 

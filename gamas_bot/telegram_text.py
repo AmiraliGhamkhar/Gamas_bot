@@ -28,12 +28,37 @@ MESSAGE_CHUNK_SIZE = 3800
 # is what has to be measured before sending.
 TELEGRAM_TEXT_LIMIT = 4096
 MIN_CHUNK_SIZE = 400
+# A keyboard button has its own, much smaller budget: Telegram refuses an inline
+# button whose text is longer than 64 UTF-16 code units, and a single oversized
+# button makes the *whole message* unsendable — the panel does not render small,
+# it does not render. Button labels here are built from stored, human-written
+# strings (a plan name, a credential label), whose length no panel can promise.
+BUTTON_LABEL_LIMIT = 64
 TAG_PATTERN = re.compile(r"<[^>]+>")
 # A configuration error (unsupported language/model for the selected engine)
 # is actionable for the operator, so it is reported verbatim. Transient provider
 # failures are not: the tracking reference is what the user needs for those.
 def _utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
+
+
+def button_label(text: str, limit: int = BUTTON_LABEL_LIMIT) -> str:
+    """Fit ``text`` into one inline-keyboard button, marking a cut with an ellipsis.
+
+    Measured in UTF-16 code units like every other Telegram limit, so a label made
+    of astral-plane characters (emoji, 2 units each) is shortened too. Trimming
+    walks backwards from the budget instead of slicing a fixed number of
+    characters, because a slice that counts code points can still be over budget.
+    """
+    if limit < 1:
+        raise ValueError("Button label limit must be positive")
+    if _utf16_length(text) <= limit:
+        return text
+    keep = limit - 1  # the ellipsis itself costs one code unit
+    cut = min(keep, len(text))
+    while cut > 1 and _utf16_length(text[:cut]) > keep:
+        cut -= 1
+    return text[:cut].rstrip() + "…"
 
 
 def split_message(text: str, limit: int = MESSAGE_CHUNK_SIZE) -> list[str]:

@@ -20,9 +20,11 @@ from telethon.tl.types import MessageMediaWebPage
 
 from .config import Settings
 from .telegram_text import (  # noqa: F401 - re-exported for backward compatibility
+    BUTTON_LABEL_LIMIT,
     MESSAGE_CHUNK_SIZE,
     MIN_CHUNK_SIZE,
     TELEGRAM_TEXT_LIMIT,
+    button_label,
     _emphasis_is_nested,
     _plain_length,
     _split_rendered,
@@ -68,8 +70,8 @@ from .presentations import (
     prepare_audio,
     slides_outline,
 )
-from .progress import JobProgress
-from .admin_ai import AIPanels, handle_ai_callback
+from .progress import JobProgress, to_persian_digits
+from .admin_ai import AIPanels, handle_ai_callback, latency_sample_note
 from .admin_stt import SttPanels, handle_stt_callback
 from .ai.models import ModelRegistry
 from .ai.routing import (
@@ -171,17 +173,19 @@ PRIVACY_TEXT = (
 
 
 def main_menu(is_admin: bool = False):
+    """User entry points.
+
+    One primary action (send a file), one merged "help + supported formats"
+    destination, the privacy notice, and one account/credit destination that
+    keeps purchasing next to the balance it pays from. ``menu:formats``,
+    ``billing:plans`` and ``billing:balance`` stay routable so an older message
+    on screen keeps working.
+    """
     rows = [
         [Button.inline("📎 ساخت جزوه", b"menu:create")],
-        [
-            Button.inline("📚 راهنما", b"menu:help"),
-            Button.inline("🧰 قالب‌ها", b"menu:formats"),
-        ],
+        [Button.inline("📚 راهنما و قالب‌ها", b"menu:help")],
+        [Button.inline("💳 حساب و اعتبار", b"menu:account")],
         [Button.inline("🔐 حریم خصوصی", b"menu:privacy")],
-        [
-            Button.inline("💳 خرید اشتراک", b"billing:plans"),
-            Button.inline("⏱ اعتبار من", b"billing:balance"),
-        ],
     ]
     if is_admin:
         rows.append([Button.inline("⚙️ پنل مدیریت", b"admin:home")])
@@ -189,44 +193,125 @@ def main_menu(is_admin: bool = False):
 
 
 def back_menu(is_admin: bool = False):
-    return [[Button.inline("↩️ بازگشت به منو", b"menu:home")]] + (
+    return [[Button.inline("↩️ منوی اصلی", b"menu:home")]] + (
         [[Button.inline("⚙️ پنل مدیریت", b"admin:home")]] if is_admin else []
     )
 
 
+#: Read-only admin panels that acknowledge the tap before reading the database.
+_ADMIN_ACK_FIRST = frozenset(
+    {
+        "admin:stats",
+        "admin:users",
+        "admin:payments",
+        "admin:audit",
+        "admin:credentials",
+        "admin:health",
+        "admin:plans",
+        "admin:special",
+        "admin:home",
+    }
+)
+
+
+#: Same idea for the paged read-only panels, whose callback carries a page.
+_ADMIN_ACK_FIRST_PREFIXES = (
+    "admin:users:",
+    "admin:credentials:",
+    "admin:payments:",
+    "admin:special:",
+    "admin:plans:",
+    "admin:credits:",
+)
+
+
+#: The five admin destinations. ``overview`` is the root screen itself; the
+#: other four are sections that group every existing control by job to be done.
+#: "Routes" lives in exactly one place — inside the AI platform — because the
+#: note route and the STT route are separate tables and one entry per panel is
+#: the whole point of the reorganisation.
+ADMIN_SECTIONS: tuple[tuple[str, bytes, str], ...] = (
+    ("👥 کاربران و مالی", b"admin:sec:users", "users"),
+    ("🤖 تولید جزوه (AI)", b"admin:ai", "ai"),
+    ("🎙 گفتار (STT)", b"admin:stt", "stt"),
+    ("🛡 عملیات و امنیت", b"admin:sec:ops", "ops"),
+)
+
+#: Buttons inside a section. Every callback that existed in the flat admin menu
+#: is here, so the reorganisation cannot lose a control.
+ADMIN_SECTION_MENUS: dict[str, list[tuple[str, bytes]]] = {
+    "users": [
+        ("👥 کاربران", b"admin:users"),
+        ("💳 پرداخت‌ها", b"admin:payments"),
+        ("⏱ اعتبار کاربران", b"admin:credits"),
+        ("🧾 طرح‌های فروش", b"admin:plans"),
+        ("⭐ کاربران ویژه", b"admin:special"),
+    ],
+    "ops": [
+        ("🩺 وضعیت سرویس‌ها", b"admin:health"),
+        ("🔑 API Keys", b"admin:credentials"),
+        ("📜 گزارش مدیر", b"admin:audit"),
+        ("📣 پیام همگانی", b"admin:broadcast"),
+        ("🚫 مسدودسازی", b"admin:ban"),
+        ("✅ رفع مسدودیت", b"admin:unban"),
+    ],
+}
+
+
 def admin_menu():
-    return [
-        [
-            Button.inline("📊 آمار", b"admin:stats"),
-            Button.inline("👥 کاربران", b"admin:users"),
-        ],
-        [
-            Button.inline("💳 پرداخت‌ها", b"admin:payments"),
-            Button.inline("⏱ اعتبار کاربران", b"admin:credits"),
-        ],
-        [
-            Button.inline("🧾 طرح‌های فروش", b"admin:plans"),
-            Button.inline("⭐ کاربران ویژه", b"admin:special"),
-        ],
-        [
-            Button.inline("🩺 وضعیت سرویس‌ها", b"admin:health"),
-            Button.inline("🔑 API Keys", b"admin:credentials"),
-        ],
-        [
-            Button.inline("🤖 پلتفرم AI", b"admin:ai"),
-            Button.inline("🎙 پلتفرم STT", b"admin:stt"),
-        ],
-        [Button.inline("🧭 مسیرها", b"admin:ai:rt")],
-        [
-            Button.inline("📜 گزارش مدیر", b"admin:audit"),
-            Button.inline("📣 پیام همگانی", b"admin:broadcast"),
-        ],
-        [
-            Button.inline("🚫 مسدودسازی", b"admin:ban"),
-            Button.inline("✅ رفع مسدودیت", b"admin:unban"),
-        ],
-        [Button.inline("↩️ منوی اصلی", b"menu:home")],
+    """Admin root: an overview entry point plus the four work sections.
+
+    The keyboard is deliberately small — every concrete control lives in one of
+    the sections (and inside the AI / STT platform panels), which keeps this
+    screen stable as the platform grows. ``admin_navigation()`` is the flat view
+    of the whole tree and is what the reachability tests check.
+    """
+    rows: list[list] = [[Button.inline("📊 نمای کلی و آمار", b"admin:home")]]
+    pending: list = []
+    for label, data, _section in ADMIN_SECTIONS:
+        pending.append(Button.inline(label, data))
+        if len(pending) == 2:
+            rows.append(pending)
+            pending = []
+    if pending:
+        rows.append(pending)
+    rows.append([Button.inline("↩️ منوی اصلی", b"menu:home")])
+    return rows
+
+
+def admin_section_menu(section: str):
+    """Keyboard of one admin section (``users`` / ``ops``)."""
+    entries = ADMIN_SECTION_MENUS.get(section) or []
+    rows: list[list] = [
+        [Button.inline(label, data) for label, data in entries[index : index + 2]]
+        for index in range(0, len(entries), 2)
     ]
+    rows.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
+    return rows
+
+
+#: Controls the overview screen exposes next to the four sections (the detailed
+#: statistics dump is a drill-down of the overview, not a section of its own).
+ADMIN_OVERVIEW_EXTRA: tuple[tuple[str, bytes], ...] = (("🔬 آمار تفصیلی", b"admin:stats"),)
+
+
+def admin_navigation() -> dict[bytes, str]:
+    """Every admin callback reachable from the root, mapped to its label.
+
+    Used by the panels to draw the tree and by the tests to prove that a
+    reorganisation did not orphan a control.
+    """
+    seen: dict[bytes, str] = {}
+    for row in admin_menu():
+        for button in row:
+            seen[bytes(button.type.data)] = str(button.text)
+    for section, entries in ADMIN_SECTION_MENUS.items():
+        for label, data in entries:
+            seen[bytes(data)] = label
+        seen[f"admin:sec:{section}".encode("ascii")] = f"بخش {section}"
+    for label, data in ADMIN_OVERVIEW_EXTRA:
+        seen[bytes(data)] = label
+    return seen
 
 
 def _error_reference(submission_id: int) -> str:
@@ -260,6 +345,25 @@ def _format_duration(seconds: float | None) -> str:
     if minutes:
         return f"{minutes} دقیقه و {secs} ثانیه"
     return f"{secs} ثانیه"
+
+
+def _credit_history_heading(title: str, noun: str, rows: list, total: object) -> str:
+    """A credit-screen heading that admits when it is only the recent slice.
+
+    The two lists on the screen are a display window, not the ledger, and the
+    database hands over the real count so the difference can be stated instead
+    of a user's history looking complete when it is not.
+    """
+    try:
+        count = int(total or 0)
+    except (TypeError, ValueError):
+        count = 0
+    if count > len(rows):
+        return (
+            f"{title} — {to_persian_digits(len(rows))} مورد از "
+            f"{to_persian_digits(count)} {noun}"
+        )
+    return title
 
 
 def _parse_user_id(value: str) -> int | None:
@@ -781,11 +885,62 @@ class StudyBot:
                 except Exception:
                     logger.exception("Could not notify the user about a handler error")
 
-    async def _edit_callback(self, event, text: str, buttons=None) -> None:
+    @staticmethod
+    def _arm_answer_once(event) -> None:
+        """Make ``event.answer`` fire at most once for one callback query.
+
+        Panels legitimately want to answer a tap early (before a slow read) and
+        still redraw afterwards; Telegram accepts only one ``answerCallbackQuery``
+        per update, so the second attempt used to cost a failed request that the
+        editor then swallowed. The wrapper keeps the first answer — the one the
+        user is waiting for — and turns later ones into no-ops.
+        """
+        answer = getattr(event, "answer", None)
+        if answer is None or getattr(answer, "_gamas_once", False):
+            return
+
+        async def once(*args, **kwargs):
+            if once._used:
+                return None
+            once._used = True
+            return await answer(*args, **kwargs)
+
+        once._used = False
+        once._gamas_once = True
         try:
-            await event.answer()
+            event.answer = once
+        except Exception:  # pragma: no cover - exotic event implementations
+            return
+
+    #: Attribute set on an event whose callback query was already answered.
+    #: Telegram accepts exactly one ``answerCallbackQuery`` per update; panels
+    #: that acknowledge a tap up front (before slow work) and then redraw would
+    #: otherwise answer the same query twice and get ``BotResponseInvalidError``.
+    _CALLBACK_ACKED = "_gamas_callback_acked"
+
+    async def _ack(self, event, text: str | None = None, *, alert: bool = False) -> None:
+        """Answer a callback query at most once, optionally with a toast.
+
+        Expensive actions acknowledge first so the button stops spinning while
+        the work runs; every later answer on the same event is dropped here
+        instead of at the transport layer.
+        """
+        if getattr(event, self._CALLBACK_ACKED, False):
+            return
+        try:
+            setattr(event, self._CALLBACK_ACKED, True)
+        except Exception:  # pragma: no cover - exotic event implementations
+            pass
+        try:
+            if text is None:
+                await event.answer()
+            else:
+                await event.answer(text, alert=alert)
         except Exception:
             logger.debug("Callback answer failed", exc_info=True)
+
+    async def _edit_callback(self, event, text: str, buttons=None) -> None:
+        await self._ack(event)
         try:
             await event.edit(text, buttons=buttons, parse_mode=None)
         except MessageNotModifiedError:
@@ -823,7 +978,10 @@ class StudyBot:
         )
         if entitlements:
             lines.append("\nاعتبارهای فعال:")
-            for entitlement in entitlements:
+            # Soonest to expire first, and a counted remainder instead of an
+            # unbounded list: `available_seconds` above already covers every row.
+            shown = entitlements[: self.ACCOUNT_ENTITLEMENT_ROWS]
+            for entitlement in shown:
                 expiry = (
                     "بدون انقضا"
                     if not entitlement["expires_at"]
@@ -833,31 +991,86 @@ class StudyBot:
                     f"• {entitlement['plan_name']}: "
                     f"{format_duration(entitlement['remaining_seconds'])} ({expiry})"
                 )
+            hidden = len(entitlements) - len(shown)
+            if hidden:
+                lines.append(
+                    f"… و {to_persian_digits(hidden)} اعتبار فعال دیگر — مجموع بالا "
+                    "همهٔ آن‌ها را می‌شمارد."
+                )
         else:
             lines.append(
                 "اعتبار فعالی ندارید؛ با «💳 خرید اشتراک» یکی از طرح‌ها را انتخاب کنید."
             )
         return "\n".join(lines)
 
-    async def _billing_plans(self) -> tuple[str, list]:
+    async def _show_account_overview(self, event, user_id: int) -> None:
+        """One account screen: what is left, what is active, and how to buy more.
+
+        The balance and the purchasable plans used to be two menu entries that
+        both answered "how much can I still generate"; buying needed a second
+        tap on a different screen. Purchase stays here, next to the credit it
+        tops up, and ``billing:plans`` / ``billing:balance`` keep working for
+        older messages.
+        """
+        balance = await self._billing_balance_text(user_id)
+        plans_text, plan_buttons = await self._billing_plans()
+        lines = ["💳 حساب و اعتبار", ""]
+        lines.extend(balance.splitlines()[1:])
+        lines.extend(["", plans_text, "", "پس از ارسال رسید، مدیر آن را بررسی و اعتبار را اضافه می‌کند."])
+        buttons = list(plan_buttons)
+        buttons.append([Button.inline("🔐 حریم خصوصی", b"menu:privacy")])
+        await self._edit_callback(event, "\n".join(lines), buttons)
+
+    async def _billing_plans(self, page: int = 0) -> tuple[str, list]:
+        """Purchasable plans, a page at a time.
+
+        Every enabled paid plan used to be rendered into one message with one
+        button each: with the six-plan default that is invisible, and once an
+        admin had created a few dozen the screen simply stopped sending — the
+        user could not buy anything at all. `list_plans` orders by
+        (sort_order, id), so a page is a stable window and the plan an admin put
+        first is the plan a user sees first.
+        """
         plans = await self.db.list_plans(paid_only=True)
         if not plans:
             return "در حال حاضر طرح پرداختی فعالی نیست.", [[Button.inline("↩️ منوی اصلی", b"menu:home")]]
+        pages = max(1, -(-len(plans) // self.USER_PLAN_PAGE))
+        page = min(max(0, int(page)), pages - 1)
+        window = plans[page * self.USER_PLAN_PAGE : (page + 1) * self.USER_PLAN_PAGE]
         lines = ["طرح‌های اعتبار پیش‌پرداختی 💳"]
+        if pages > 1:
+            lines.append(
+                f"({to_persian_digits(len(plans))} طرح فعال — صفحهٔ "
+                f"{to_persian_digits(page + 1)} از {to_persian_digits(pages)})"
+            )
         buttons = []
-        for plan in plans:
+        for plan in window:
             lines.append(
                 f"• {plan['name']} — {format_duration(plan['included_seconds'])}، "
                 f"{format_toman(plan['price_toman'])}، {format_validity(plan['validity_days'])}"
             )
+            # A plan name is stored up to 60 characters, so «خرید …» plus a price
+            # does not fit one button. Everything but the name is fixed, so the
+            # name gets whatever is left of the 64-unit budget and never the price
+            # — that is the number a purchase decision is made on.
+            price_text = format_toman(plan["price_toman"])
+            name_budget = max(BUTTON_LABEL_LIMIT - _utf16_length(" — " + price_text), 12)
+            buy_label = button_label("خرید " + str(plan["name"]), name_budget)
             buttons.append(
                 [
                     Button.inline(
-                        f"خرید {plan['name']} — {format_toman(plan['price_toman'])}",
+                        f"{buy_label} — {price_text}",
                         f"billing:buy:{plan['code']}",
                     )
                 ]
             )
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"billing:plans:{page - 1}"))
+        if page + 1 < pages:
+            nav.append(Button.inline("طرح‌های بیشتر ▶️", f"billing:plans:{page + 1}"))
+        if nav:
+            buttons.append(nav)
         buttons.append([Button.inline("↩️ منوی اصلی", b"menu:home")])
         return "\n".join(lines), buttons
 
@@ -1017,23 +1230,57 @@ class StudyBot:
                 # Never include a receipt path, card data, or receipt contents in logs.
                 logger.warning("Private receipt notification failed payment_id=%s admin_id=%s", payment_id, admin_id)
 
-    async def _show_pending_payments(self, event) -> None:
-        payments = await self.db.list_pending_payments(limit=20)
+    #: Receipts per admin page. Each receipt is sent as its own message (with its
+    #: file), so a page is bounded by the flood limits as well as by Telegram's
+    #: message and keyboard caps.
+    PAYMENTS_PAGE_SIZE = 20
+    #: Plans per page: each row carries up to three action buttons and a caption
+    #: line, and the panel used to render every plan the deployment had.
+    PLANS_PAGE_SIZE = 10
+    #: Remove buttons per page for the special-users list (the text lists 30).
+    SPECIAL_PAGE_SIZE = 12
+
+    async def _show_pending_payments(self, event, page_text: str | None = None) -> None:
+        """Pending receipts, paged, with the backlog counted rather than guessed.
+
+        The panel used to read 20 rows and announce ``len(payments)`` — so a queue
+        of 34 looked like 20 and the oldest-unseen 14 had no way to be reached.
+        """
+        size = self.PAYMENTS_PAGE_SIZE
+        page = self._admin_page(page_text)
+        total = await self.db.pending_payment_count()
+        pages = max(1, -(-total // size))
+        page = min(page, pages - 1)
+        payments = await self.db.list_pending_payments(limit=size, offset=page * size)
         if not payments:
             await self._edit_callback(
                 event,
-                "پرداختِ منتظر بررسی وجود ندارد.",
+                "پرداختِ منتظر بررسی وجود ندارد." if not total else "این صفحه دیگر خالی است.",
                 [[Button.inline("↩️ پنل مدیریت", b"admin:home")]],
             )
             return
-        await event.answer(f"{len(payments)} پرداخت در انتظار بررسی")
+        await event.answer(
+            f"صفحهٔ {page + 1} از {pages} — {total} پرداخت در انتظار بررسی"
+        )
         await self._send_pending_payment_rows(event, payments)
+        if pages > 1:
+            nav = [Button.inline("↩️ پنل مدیریت", b"admin:home")]
+            if page + 1 < pages:
+                nav.insert(0, Button.inline("بعدی ▶️", f"admin:payments:{page + 1}"))
+            if page > 0:
+                nav.insert(0, Button.inline("◀️ قبلی", f"admin:payments:{page - 1}"))
+            await self._edit_callback(
+                event,
+                f"💳 پرداخت‌های در انتظار بررسی — صفحهٔ {page + 1} از {pages} "
+                f"({total} مورد، {size} مورد در هر صفحه)",
+                [nav],
+            )
 
     async def _send_pending_payment_rows(self, event, payments: list[dict]) -> None:
-        for payment in payments:
-            detail = await self.db.payment_detail(int(payment["id"]))
-            if not detail:
-                continue
+        for detail in payments:
+            # ``list_pending_payments`` already returns every field this caption and
+            # its receipt path need, so one page is one query. It used to re-read
+            # each row through ``payment_detail`` — 20 extra queries per draw.
             caption = (
                 f"پرداخت در انتظار بررسی دستی — درخواست {detail['id']}\n"
                 f"کاربر: {detail['telegram_id']}"
@@ -1175,10 +1422,92 @@ class StudyBot:
     def _masked_key(secret: str | None) -> str:
         return "تنظیم نشده" if not secret else "••••••••" + secret[-4:]
 
-    async def _show_provider_health(self, event, *, force: bool = False) -> None:
-        """Admin-only provider health panel (manual, cached, secret-free)."""
+    async def _show_admin_overview(self, event) -> None:
+        """Admin overview: service status, activity, provider availability, issues.
+
+        Everything here is a bounded read of local state — no provider request
+        is made because an administrator opened a panel.
+        """
+        stats = await self.db.stats()
+        lines = ["پنل مدیریت ربات ⚙️", "", "📊 نمای کلی"]
+        lines.append(
+            f"کاربران: {stats['users']} (غیرمسدود {stats['unbanned_users']}) | "
+            f"فایل‌ها: {stats['submissions']} | موفق {stats['done']} | ناموفق {stats['failed']}"
+        )
+        ai = await self.db.ai_usage_overview(days=1)
+        lines.append(
+            f"🤖 AI امروز: {ai['requests']} درخواست (موفق {ai['successes']}, خطا {ai['failures']})"
+            + (
+                f" | p95 {ai['latency_p95_ms']}ms{latency_sample_note(ai)}"
+                if ai["latency_p95_ms"]
+                else ""
+            )
+        )
+        stt_ready = bool(
+            self.settings.deepgram_api_key
+            or self.settings.speechmatics_api_key
+            or self.settings.stt_openai_api_key
+            or self.settings.note_api_key
+        )
+        lines.append(
+            f"🎙 گفتار: {'تنظیم‌شده ✅' if stt_ready else 'تنظیم‌نشده ⛔'} | "
+            f"🧾 جزوه: {'تنظیم‌شده ✅' if (self.settings.effective_note_api_key) else 'تنظیم‌نشده ⛔'}"
+        )
+        issues: list[str] = []
         try:
-            results = await self.provider_health.check_all(force=force)
+            # A count, because the length of a capped list is not the backlog.
+            pending = await self.db.pending_payment_count()
+            if pending:
+                issues.append(f"💳 {pending} پرداخت در انتظار بررسی")
+        except Exception:
+            logger.debug("Pending payments unavailable for the overview", exc_info=True)
+        try:
+            summaries = await self.credential_manager.list_summaries()
+            quarantined = sum(1 for item in summaries if item.get("quarantined_at"))
+            cooling = sum(
+                1
+                for item in summaries
+                if item.get("enabled") and _cooldown_active(item.get("cooldown_until"))
+            )
+            if quarantined:
+                issues.append(f"🔑 {quarantined} کلید در قرنطینه (احراز هویت)")
+            if cooling:
+                issues.append(f"⏳ {cooling} کلید در cooldown")
+            if not any(item.get("enabled") for item in summaries) and not (
+                self.settings.effective_note_api_key
+            ):
+                issues.append("🔑 هیچ کلید فعالی ثبت نشده است")
+        except Exception:
+            logger.debug("Credential summaries unavailable for the overview", exc_info=True)
+        lines.append("")
+        lines.append("⚠️ مسائل باز" if issues else "✅ مسئلهٔ بازی وجود ندارد")
+        lines.extend(f"• {item}" for item in issues)
+        lines.append("")
+        lines.append("برای هر بخش روی نام آن بزنید؛ مسیرهای AI و STT هر کدام جای خودشان هستند.")
+        rows = admin_menu()
+        rows.insert(
+            1, [Button.inline(label, data) for label, data in ADMIN_OVERVIEW_EXTRA]
+        )
+        await self._edit_callback(event, "\n".join(lines), rows)
+
+    async def _show_provider_health(self, event, *, force: bool = False) -> None:
+        """Admin-only provider health panel (manual, cached, secret-free).
+
+        Opening or redrawing the panel only reads what is already known. A probe
+        against a provider happens when the operator asks for one
+        (``admin:health:refresh``) or tests a single key, so a panel view can
+        never spend provider quota, trip a rate limit, or hold the callback open
+        for several network timeouts.
+        """
+        try:
+            if force:
+                results = await self.provider_health.check_all(force=True)
+            else:
+                snapshot = getattr(self.provider_health, "snapshot", None)
+                if callable(snapshot):
+                    results = await snapshot()
+                else:  # pragma: no cover - defensive for injected doubles
+                    results = await self.provider_health.check_all(force=False)
         except Exception:
             logger.exception("Provider health check failed")
             await self._edit_callback(
@@ -1188,7 +1517,12 @@ class StudyBot:
                  [Button.inline("↩️ پنل مدیریت", b"admin:home")]],
             )
             return
-        lines = ["🩺 وضعیت سرویس‌ها", "این صفحه فقط با درخواست شما بررسی می‌شود و نتیجه‌ها موقتاً ذخیره می‌شوند."]
+        lines = [
+            "🩺 وضعیت سرویس‌ها",
+            "این صفحه فقط نتیجه‌های ثبت‌شده را نشان می‌دهد؛ سنجش زنده انجام نمی‌دهد.",
+        ]
+        if not force:
+            lines.append("برای سنجش زندهٔ همهٔ سرویس‌ها «🔄 بررسی همه» را بزنید.")
         if not results:
             lines.append("هنوز سرویسی تنظیم نشده است.")
         current_group = None
@@ -1217,7 +1551,10 @@ class StudyBot:
                 buttons.append(
                     [
                         Button.inline(
-                            f"🧪 تست {result.label} ({result.masked})",
+                            # A credential label is free text with no stored length
+                            # limit; without the clamp one long label stops the whole
+                            # health panel from sending.
+                            button_label(f"🧪 تست {result.label} ({result.masked})"),
                             f"admin:health:test:{result.credential_id}",
                         )
                     ]
@@ -1261,8 +1598,22 @@ class StudyBot:
             ],
         )
 
-    async def _show_provider_credentials(self, event) -> None:
+    #: Credential rows per page. Each row costs two button rows, so an uncapped
+    #: list passed Telegram's 100-button keyboard limit and the screen stopped
+    #: rendering at all (about twenty keys).
+    CREDENTIALS_PAGE_SIZE = 12
+
+    async def _show_provider_credentials(self, event, page: object = 0) -> None:
         summaries = await self.credential_manager.list_summaries()
+        size = self.CREDENTIALS_PAGE_SIZE
+        try:
+            current = max(0, int(page)) if page is not None else 0
+        except (TypeError, ValueError):
+            current = 0  # a stale or malformed token simply shows the first page
+        pages = max(1, -(-len(summaries) // size))
+        current = min(current, pages - 1)
+        start = current * size
+        window = summaries[start : start + size]
         lines = [
             "کلیدها و آخرین پاسخ providerها 🔑",
             "برای بررسی زندهٔ سرویس‌ها از «🩺 وضعیت سرویس‌ها» استفاده کنید؛ "
@@ -1290,8 +1641,14 @@ class StudyBot:
             )
         buttons = []
         if summaries:
-            lines.append("\nکلیدهای رمزگذاری‌شده در پایگاه‌داده:")
-            for item in summaries:
+            if pages > 1:
+                lines.append(
+                    f"\nکلیدهای رمزگذاری‌شده در پایگاه‌داده — صفحهٔ {current + 1} "
+                    f"از {pages} ({len(summaries)} کلید):"
+                )
+            else:
+                lines.append("\nکلیدهای رمزگذاری‌شده در پایگاه‌داده:")
+            for item in window:
                 state = "غیرفعال" if not item["enabled"] else "فعال"
                 if item["enabled"] and item["quarantined_at"]:
                     state = "قرنطینه (401/403)"
@@ -1321,6 +1678,21 @@ class StudyBot:
                         Button.inline("🧪 تست", f"admin:health:test:{item['id']}"),
                     ]
                 )
+        if pages > 1:
+            nav: list = []
+            if current > 0:
+                nav.append(
+                    Button.inline(
+                        "◀️ قبلی", f"admin:credentials:{current - 1}".encode("ascii")
+                    )
+                )
+            if current < pages - 1:
+                nav.append(
+                    Button.inline(
+                        "بعدی ▶️", f"admin:credentials:{current + 1}".encode("ascii")
+                    )
+                )
+            buttons.append(nav)
         buttons.extend(
             [
                 [
@@ -1359,13 +1731,21 @@ class StudyBot:
         ]
         entitlements = overview["entitlements"]
         if entitlements:
-            lines.append("\nاعتبارها (جدیدترین):")
+            lines.append(
+                "\n"
+                + _credit_history_heading(
+                    "اعتبارها (جدیدترین)",
+                    "سابقه",
+                    entitlements,
+                    overview.get("entitlement_total"),
+                )
+            )
             statuses_fa = {
                 "active": "فعال",
                 "expired": "منقضی",
                 "revoked": "لغوشده",
             }
-            for item in entitlements[:10]:
+            for item in entitlements:
                 expiry = (
                     "بدون انقضا"
                     if not item["expires_at"]
@@ -1381,8 +1761,13 @@ class StudyBot:
             lines.append("\nاعتباری ثبت نشده است.")
         usage = overview["usage"]
         if usage:
-            lines.append("\nآخرین رویدادهای مصرف (ثانیه):")
-            for item in usage[:8]:
+            lines.append(
+                "\n"
+                + _credit_history_heading(
+                    "آخرین رویدادهای مصرف (ثانیه)", "رویداد", usage, overview.get("usage_total")
+                )
+            )
+            for item in usage:
                 quantities = []
                 for label, key in (
                     ("درخواست", "requested_seconds"),
@@ -1419,16 +1804,17 @@ class StudyBot:
         await self._edit_callback(event, self._admin_credit_text(overview), buttons)
 
     @staticmethod
-    def _special_users_text(users: list[dict]) -> str:
+    def _special_users_text(users: list[dict], total: int | None = None) -> str:
         if not users:
             return (
                 "⭐ کاربران ویژه\n\n"
                 "هنوز کاربری در این فهرست نیست.\n"
                 "کاربران ویژه بدون کسر اعتبار از ربات استفاده می‌کنند."
             )
+        shown_total = len(users) if total is None else total
         lines = [
             "⭐ کاربران ویژه (استفادهٔ نامحدود)",
-            f"تعداد: {len(users)}",
+            f"تعداد: {shown_total}" + (f" (این صفحه {len(users)} مورد اخیر را نشان می‌دهد)" if shown_total > len(users) else ""),
             "",
         ]
         for user in users:
@@ -1440,9 +1826,9 @@ class StudyBot:
                 f"پردازش‌های ویژه: {user['unbilled_jobs']}{ban}{reason}"
             )
         lines.append("")
-        if len(users) > 12:
+        if total is not None and total > len(users):
             lines.append(
-                "برای حذف کاربران بیشتر از دکمه‌ها، از دستور "
+                "فهرست این صفحه فقط ۳۰ کاربر ویژهٔ اخیر است؛ برای بقیه از دستور "
                 "`/unlimited شناسه off دلیل` استفاده کنید."
             )
         lines.append(
@@ -1451,10 +1837,20 @@ class StudyBot:
         )
         return "\n".join(lines)
 
-    async def _show_special_users(self, event) -> None:
+    async def _show_special_users(self, event, page_text: str | None = None) -> None:
+        """Paged remove buttons.
+
+        The screen listed 30 special users but only offered 12 remove buttons and
+        told the admin to use a command for the rest; every row it lists now has
+        its own action, and the total says when the list itself is a prefix.
+        """
         users = await self.db.unlimited_users(limit=30)
+        total = await self.db.unlimited_user_count()
+        size = self.SPECIAL_PAGE_SIZE
+        pages = max(1, -(-len(users) // size))
+        page = min(self._admin_page(page_text), pages - 1)
         buttons = [[Button.inline("➕ افزودن کاربر ویژه", b"admin:special:add")]]
-        for user in users[:12]:
+        for user in users[page * size : (page + 1) * size]:
             buttons.append(
                 [
                     Button.inline(
@@ -1463,8 +1859,19 @@ class StudyBot:
                     )
                 ]
             )
+        if pages > 1:
+            nav: list = []
+            if page > 0:
+                nav.append(Button.inline("◀️ قبلی", f"admin:special:{page - 1}"))
+            if page + 1 < pages:
+                nav.append(Button.inline("بعدی ▶️", f"admin:special:{page + 1}"))
+            nav.append(Button.inline(f"صفحهٔ {page + 1} از {pages}", b"admin:special"))
+            buttons.append(nav)
         buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
-        await self._edit_callback(event, self._special_users_text(users), buttons)
+        body = self._special_users_text(users, total)
+        if pages > 1:
+            body += f"\nصفحهٔ {page + 1} از {pages} (هر صفحه {size} دکمهٔ حذف)"
+        await self._edit_callback(event, body, buttons)
 
     @staticmethod
     def _plan_admin_line(plan: dict) -> str:
@@ -1476,20 +1883,31 @@ class StudyBot:
             f"{price} — {format_validity(plan['validity_days'])} — {status}{origin}"
         )
 
-    async def _show_admin_plans(self, event) -> None:
+    async def _show_admin_plans(self, event, page_text: str | None = None) -> None:
+        """Paged plan list.
+
+        Every plan used to be rendered into one message with up to three buttons
+        each, so a deployment with enough custom plans passed Telegram's message
+        and keyboard limits and the panel stopped opening at all.
+        """
         plans = await self.db.list_plans(include_disabled=True)
+        size = self.PLANS_PAGE_SIZE
+        pages = max(1, -(-len(plans) // size))
+        page = min(self._admin_page(page_text), pages - 1)
+        window = plans[page * size : (page + 1) * size]
         lines = [
             "🧾 مدیریت طرح‌های فروش",
-            f"تعداد طرح‌ها: {len(plans)}",
+            f"تعداد طرح‌ها: {len(plans)}"
+            + (f" — صفحهٔ {page + 1} از {pages}" if pages > 1 else ""),
             "",
-            *[self._plan_admin_line(plan) for plan in plans],
+            *[self._plan_admin_line(plan) for plan in window],
             "",
             "طرح‌های پیش‌فرض با هر راه‌اندازی از تنظیمات به‌روز می‌شوند؛ به‌محض ویرایش یا "
             "غیرفعال‌سازی، اختیار آن طرح به این پنل منتقل می‌شود و دیگر بازنویسی نمی‌شود. "
             "طرح غیرفعال برای خریداران نمایش داده نمی‌شود.",
         ]
         buttons = [[Button.inline("➕ طرح جدید", b"admin:plan:new")]]
-        for plan in plans:
+        for plan in window:
             if plan["is_free"]:
                 continue
             row = [
@@ -1502,6 +1920,14 @@ class StudyBot:
             if plan["is_custom"]:
                 row.append(Button.inline("🗑 حذف", f"admin:plan:delete:{plan['id']}"))
             buttons.append(row)
+        if pages > 1:
+            nav = []
+            if page > 0:
+                nav.append(Button.inline("◀️ قبلی", f"admin:plans:{page - 1}"))
+            if page + 1 < pages:
+                nav.append(Button.inline("بعدی ▶️", f"admin:plans:{page + 1}"))
+            nav.append(Button.inline(f"صفحهٔ {page + 1} از {pages}", b"admin:plans"))
+            buttons.append(nav)
         buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
         await self._edit_callback(event, "\n".join(lines), buttons)
 
@@ -1521,6 +1947,9 @@ class StudyBot:
         if not sender or getattr(sender, "bot", False):
             return
         telegram_id = int(sender.id)
+        # Armed before the first read: every panel below can answer as early as
+        # it likes without risking a duplicate answerCallbackQuery later.
+        self._arm_answer_once(event)
         user = await self.db.upsert_user(telegram_id, getattr(sender, "username", None))
         is_admin = telegram_id in self.settings.admin_ids
         data = bytes(event.data or b"").decode("utf-8", "replace")
@@ -1547,10 +1976,29 @@ class StudyBot:
             )
             return
         if data == "menu:help":
-            await self._edit_callback(event, HELP_TEXT, back_menu(is_admin))
+            # One destination: what the bot does and exactly what it accepts,
+            # because "how do I use it" and "why was my file rejected" are the
+            # same question for a first-time user.
+            await self._edit_callback(
+                event,
+                f"{HELP_TEXT}\n\n{FORMATS_TEXT}",
+                [
+                    [Button.inline("🔐 حریم خصوصی", b"menu:privacy")],
+                    [Button.inline("💳 حساب و اعتبار", b"menu:account")],
+                    *back_menu(is_admin),
+                ],
+            )
             return
         if data == "menu:formats":
             await self._edit_callback(event, FORMATS_TEXT, back_menu(is_admin))
+            return
+        if data == "menu:account":
+            if not getattr(event, "is_private", True):
+                await self._ack(
+                    event, "اطلاعات حساب فقط در گفت‌وگوی خصوصی نمایش داده می‌شود.", alert=True
+                )
+                return
+            await self._show_account_overview(event, int(user["id"]))
             return
         if data == "menu:privacy":
             await self._edit_callback(event, PRIVACY_TEXT, back_menu(is_admin))
@@ -1569,8 +2017,9 @@ class StudyBot:
                     ],
                 )
                 return
-            if data == "billing:plans":
-                text, buttons = await self._billing_plans()
+            if data == "billing:plans" or data.startswith("billing:plans:"):
+                page = self._page_arg(data, "billing:plans:")
+                text, buttons = await self._billing_plans(self._admin_page(page))
                 await self._edit_callback(event, text, buttons)
                 return
             if data.startswith("billing:buy:"):
@@ -1598,8 +2047,15 @@ class StudyBot:
         if not is_admin:
             await event.answer("این بخش فقط برای مدیر ربات است.", alert=True)
             return
-        if data == "admin:payments":
-            await self._show_pending_payments(event)
+        if data in _ADMIN_ACK_FIRST or data.startswith(_ADMIN_ACK_FIRST_PREFIXES):
+            # Read-only admin panels with a fixed payload: acknowledge the tap
+            # before the database work, so the button stops spinning while the
+            # panel reads. These panels parse nothing, so nothing that would
+            # need an alert toast is displaced by the early answer.
+            await self._ack(event)
+        payments_page = self._page_arg(data, "admin:payments:")
+        if data == "admin:payments" or payments_page is not None:
+            await self._show_pending_payments(event, payments_page)
             return
         if data.startswith("admin:payment:"):
             parts = data.split(":")
@@ -1613,9 +2069,10 @@ class StudyBot:
                 return
             await self._payment_callback(event, telegram_id, parts[2], payment_id)
             return
-        if data == "admin:special":
+        special_page = self._page_arg(data, "admin:special:")
+        if data == "admin:special" or special_page is not None:
             self._pending_admin_actions.pop(telegram_id, None)
-            await self._show_special_users(event)
+            await self._show_special_users(event, special_page)
             return
         if data == "admin:special:add":
             self._pending_admin_actions[telegram_id] = "special_add"
@@ -1643,9 +2100,10 @@ class StudyBot:
             )
             await self._show_special_users(event)
             return
-        if data == "admin:plans":
+        plans_page = self._page_arg(data, "admin:plans:")
+        if data == "admin:plans" or plans_page is not None:
             self._pending_admin_actions.pop(telegram_id, None)
-            await self._show_admin_plans(event)
+            await self._show_admin_plans(event, plans_page)
             return
         if data == "admin:plan:new":
             self._pending_admin_actions[telegram_id] = "plan_new"
@@ -1713,8 +2171,9 @@ class StudyBot:
         if data == "admin:audit":
             await self._show_admin_audit(event)
             return
-        if data == "admin:credentials":
-            await self._show_provider_credentials(event)
+        if data == "admin:credentials" or data.startswith("admin:credentials:"):
+            parts = data.split(":")
+            await self._show_provider_credentials(event, parts[2] if len(parts) > 2 else None)
             return
         if data.startswith("admin:stt"):
             await handle_stt_callback(self, event, data)
@@ -1799,7 +2258,18 @@ class StudyBot:
             return
         if data == "admin:home":
             self._pending_admin_actions.pop(telegram_id, None)
-            await self._edit_callback(event, "پنل مدیریت ربات ⚙️", admin_menu())
+            await self._show_admin_overview(event)
+            return
+        if data.startswith("admin:sec:"):
+            section = data.rsplit(":", 1)[-1]
+            if section not in ADMIN_SECTION_MENUS:
+                await self._ack(event, "این بخش وجود ندارد.", alert=True)
+                return
+            self._pending_admin_actions.pop(telegram_id, None)
+            title = next(
+                (label for label, _data, name in ADMIN_SECTIONS if name == section), "پنل مدیریت"
+            )
+            await self._edit_callback(event, f"{title} ⚙️", admin_section_menu(section))
             return
         if data == "admin:stats":
             stats = await self.db.stats()
@@ -1808,13 +2278,9 @@ class StudyBot:
                 event, text, [[Button.inline("↩️ پنل مدیریت", b"admin:home")]]
             )
             return
-        if data == "admin:users":
-            users = await self.db.user_summaries(limit=50)
-            text = self._users_text(users)
-            # The list can exceed Telegram's callback edit limit, so send it as
-            # paginated messages and keep the current menu intact.
-            await event.answer("فهرست کاربران ارسال شد.")
-            await self._send_long_message(event, text, is_admin=True)
+        if data == "admin:users" or data.startswith("admin:users:"):
+            parts = data.split(":")
+            await self._show_admin_users(event, parts[2] if len(parts) > 2 else None)
             return
         action_prompts = {
             "admin:broadcast": ("broadcast", "پیامی را که می‌خواهید برای همه برود بفرستید."),
@@ -2433,6 +2899,7 @@ class StudyBot:
                 await event.reply(plan_text, buttons=plan_buttons)
             elif command == "/history":
                 history = await self.db.payment_history(int(user["id"]))
+                total_payments = await self.db.payment_count(int(user["id"]))
                 statuses = {
                     "awaiting_receipt": "منتظر رسید",
                     "pending": "منتظر بررسی دستی",
@@ -2440,7 +2907,15 @@ class StudyBot:
                     "rejected": "رد شد",
                     "cancelled": "لغو شد",
                 }
-                lines = ["سوابق پرداخت:"]
+                heading = "سوابق پرداخت:"
+                if len(history) < total_payments:
+                    # The window is real paging by design; the reader must be
+                    # able to see that older rows exist behind it.
+                    heading += (
+                        f" ({to_persian_digits(len(history))} پرداخت اخیر از "
+                        f"{to_persian_digits(total_payments)} پرداخت)"
+                    )
+                lines = [heading]
                 lines.extend(
                     f"• #{item['id']} {item['plan_name']} — {format_toman(item['amount_toman'])} — "
                     f"{statuses.get(item['status'], item['status'])}"
@@ -3294,11 +3769,79 @@ class StudyBot:
         if pagination_error is not None:
             raise pagination_error
 
+    #: Rows per page in the admin user list.
+    USERS_PAGE_SIZE = 25
+
+    #: Rows in the flat `/users` export copy — the title states this is a prefix.
+    USERS_EXPORT_ROWS = 50
+
+    #: Plans offered per page on the user's purchase screen (Telegram caps a
+    #: message at 4096 characters and a keyboard at 100 buttons).
+    USER_PLAN_PAGE = 8
+
+    #: Active entitlements listed on the user's account screen before the rest
+    #: are summarised; the totals above always count every row.
+    ACCOUNT_ENTITLEMENT_ROWS = 8
+
     @staticmethod
-    def _users_text(users: list[dict]) -> str:
+    def _page_arg(data: str, prefix: str) -> str | None:
+        """The page number of ``<prefix><page>``, or None for any other token.
+
+        Only digits count, so ``admin:special:add`` keeps going to its own branch
+        while ``admin:special:1`` is a page request; the same rule guards the
+        user-side ``billing:plans:2`` against a hand-built or stale tail.
+        """
+        if not data.startswith(prefix):
+            return None
+        tail = data[len(prefix) :]
+        return tail if tail.isdigit() else None
+
+    @staticmethod
+    def _admin_page(value: object) -> int:
+        """Page number from a callback argument; anything malformed is page 0.
+
+        A stale or hand-built callback must still open a valid screen, and no
+        admin panel may fail because a page token stopped making sense.
+        """
+        try:
+            return max(0, min(int(str(value)), 1_000_000))
+        except (TypeError, ValueError):
+            return 0
+
+    async def _show_admin_users(self, event, page_text: str | None) -> None:
+        """Paged user list.
+
+        It used to stop at the 50 most recent users with no way back, so an
+        older account could not be found in the panel at all. ``/users`` still
+        sends the flat list as a message for copy/export.
+        """
+        page = self._admin_page(page_text)
+        size = self.USERS_PAGE_SIZE
+        stats = await self.db.stats()
+        total = int(stats.get("users") or 0)
+        pages = max(1, -(-total // size))
+        page = min(page, pages - 1)
+        users = await self.db.user_summaries(limit=size, offset=page * size)
+        title = "👥 کاربران" + (
+            f" — صفحهٔ {page + 1} از {pages} ({total} کاربر)" if pages > 1 else ""
+        )
+        lines = [self._users_text(users, title=title)]
+        buttons: list = []
+        if pages > 1:
+            nav: list = []
+            if page > 0:
+                nav.append(Button.inline("◀️ قبلی", f"admin:users:{page - 1}".encode("ascii")))
+            if page < pages - 1:
+                nav.append(Button.inline("بعدی ▶️", f"admin:users:{page + 1}".encode("ascii")))
+            buttons.append(nav)
+        buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
+        await self._edit_callback(event, "\n".join(lines), buttons)
+
+    @staticmethod
+    def _users_text(users: list[dict], *, title: str | None = None) -> str:
         if not users:
             return "هنوز کاربری در ربات ثبت نشده است."
-        lines = ["فهرست کاربران (حداکثر ۵۰ کاربر اخیر):"]
+        lines = [title or "فهرست کاربران (حداکثر ۵۰ کاربر اخیر):"]
         for user in users:
             name = f"@{user['username']}" if user["username"] else "بدون نام کاربری"
             ban = " | مسدود" if user["is_banned"] else ""
@@ -3329,11 +3872,15 @@ class StudyBot:
     async def _handle_admin_command(self, event, command: str, text: str) -> None:
         admin_id = int((await event.get_sender()).id)
         if command == "/payments":
+            total = await self.db.pending_payment_count()
             payments = await self.db.list_pending_payments(limit=20)
             if not payments:
                 await event.reply("پرداختِ منتظر بررسی وجود ندارد.", buttons=admin_menu())
             else:
-                await event.reply(f"{len(payments)} پرداخت در انتظار بررسی است؛ رسیدها ارسال می‌شوند.")
+                await event.reply(
+                    f"{len(payments)} مورد اول از {total} پرداخت در انتظار بررسی است؛ "
+                    "رسیدها ارسال می‌شوند."
+                )
                 await self._send_pending_payment_rows(event, payments)
             return
         if command == "/audit":
@@ -3402,8 +3949,20 @@ class StudyBot:
             )
             return
         if command == "/users":
-            users = await self.db.user_summaries(limit=50)
-            await self._send_long_message(event, self._users_text(users), is_admin=True)
+            # The flat export copy stays a *copy*, but it says so: 50 rows out of
+            # a larger table used to read like the whole user base.
+            stats = await self.db.stats()
+            total = int(stats.get("users") or 0)
+            users = await self.db.user_summaries(limit=self.USERS_EXPORT_ROWS)
+            title = "👥 کاربران" + (
+                f" — {to_persian_digits(len(users))} کاربر اخیر از "
+                f"{to_persian_digits(total)} کاربر"
+                if total > len(users)
+                else ""
+            )
+            await self._send_long_message(
+                event, self._users_text(users, title=title), is_admin=True
+            )
             return
         if command == "/stats":
             stats = await self.db.stats()

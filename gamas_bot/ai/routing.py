@@ -49,6 +49,7 @@ from .adapters import (
     FAIL_MODEL,
     FAIL_QUOTA,
     FAIL_RATE_LIMITED,
+    FAIL_SERVER,
     FAIL_TRANSIENT,
     NoteAdapter,
     NoteFailure,
@@ -89,15 +90,47 @@ TASK_HEALTH = "health_test"
 TASK_BENCHMARK = "benchmark"
 ROUTE_TASKS = (TASK_CHUNK, TASK_OUTLINE, TASK_REPAIR, TASK_COMPILE, TASK_HEALTH, TASK_BENCHMARK)
 
-#: Default note route order (spec §23 example); experimental/trial providers
-#: are deliberately absent — they only enter routes by explicit admin action.
+#: Reviewed default note route order (spec §23): Nara first, OpenRouter second,
+#: then the remaining reviewed providers in registry order. Experimental,
+#: trial-only and region-restricted providers are deliberately absent — they
+#: only enter routes by explicit admin action, and *eligibility* (credentials,
+#: attestation, quota, ToU, model availability) is what finally decides whether
+#: a leg in this list is attempted at all.
 DEFAULT_NOTE_ORDER = (
+    "nara", "openrouter", "gemini", "groq", "mistral", "sambanova",
+    "zai", "nvidia", "cloudflare",
+)
+
+#: Identifies the reviewed default order above. ``ensure_seeded`` compares it
+#: with what an existing database actually contains, so an installation that was
+#: seeded before this order existed is aligned once at startup — and only when
+#: every row of that route is still in its automatically seeded, never
+#: administrator-edited shape (see ``_upgrade_seeded_order``).
+ROUTE_SEED_REVISION = 1
+
+#: The order shipped before the reviewed Nara-first default existed. Kept only
+#: so the startup upgrade can recognise a route that was produced by it.
+LEGACY_NOTE_ORDER = (
     "gemini", "nara", "groq", "openrouter", "mistral", "sambanova",
     "zai", "nvidia", "cloudflare",
 )
 
 #: Providers an environment-only legacy deployment keeps first when seeding.
+#: Promotion only happens in legacy mode (``AI_ROUTING_ENABLED=false``) or when
+#: the configured provider would otherwise be absent from the route entirely;
+#: with multi-provider routing on, the reviewed order above wins so a leftover
+#: single-provider environment cannot silently override the Nara-first default.
 _SEED_FROM_ENV_SLUGS = {"gemini", "openai_compatible", "anthropic"}
+
+#: Note tasks an explicit ``AI_DEFAULT_NOTE_ROUTE`` preference reorders. Health
+#: and benchmark routes are deployment diagnostics, not note traffic.
+_NOTE_ROUTE_TASKS = (TASK_CHUNK, TASK_OUTLINE, TASK_REPAIR, TASK_COMPILE)
+
+#: Wall-clock share of a job's provider budget that ONE route leg may use.
+#: ``NOTE_API_TIMEOUT_SECONDS`` bounds a single HTTP attempt; without a leg
+#: budget one slow/erroring provider (timeout × credentials × retries) could
+#: consume the whole job before the next provider in the route is ever tried.
+LEG_DEADLINE_FACTOR = 2.0
 
 #: Error message texts must stay user-facing Persian and content-free.
 _ALL_FAILED_FA = "هیچ‌کدام از سرویس‌های تولید جزوه پاسخ مناسبی نداد."
@@ -127,6 +160,10 @@ class RouteLeg:
     account_region: str | None = None
     account_service_scope: str | None = None
     free_only: bool = True
+    #: The stored route row is enabled. Kept separate from ``free_only`` so an
+    #: administrator disabling one row can never turn that row into a *paid*
+    #: leg; a disabled row is planned out with its own skip reason.
+    enabled: bool = True
     index: int = 0
 
 
@@ -310,13 +347,25 @@ class ProviderRouter:
         self._provider_settings_cache = None
 
     async def ensure_seeded(self) -> None:
-        """Persist reviewed metadata and seed routes without overwriting admins."""
+        """Persist reviewed metadata and seed routes without overwriting admins.
+
+        Seeding is write-once: an existing route is never replaced by a plain
+        re-seed, because an administrator may have customised it. When the
+        reviewed default order changes, :meth:`_upgrade_seeded_order` reorders
+        only the rows that are provably still automatic.
+        """
         await self.db.ai_provider_registry_sync(
             [info.as_registry_row() for info in PROVIDER_REGISTRY.values()]
         )
         for task in ROUTE_TASKS:
             existing = await self._safe_routes("notes", task)
-            if existing is not None and existing:
+            if existing is None:
+                # A failed read must not be mistaken for "nothing seeded":
+                # seeding would DELETE the administrator's rows and re-insert
+                # the defaults, silently destroying a working configuration.
+                continue
+            if existing:
+                await self._upgrade_seeded_order(task, existing)
                 continue
             order = self._seed_order(task)
             await self.db.ai_routes_replace(
@@ -330,12 +379,16 @@ class ProviderRouter:
             )
 
     def _seed_order(self, task: str) -> list[str]:
-        """Seeded order: the env-configured provider first, defaults after.
+        """Seeded order: the reviewed default, plus the deployment's provider.
 
-        A legacy deployment (e.g. NOTE_API_PROVIDER=openai_compatible +
-        NaraRouter base URL) keeps its provider as route position zero, so
-        enabling the platform changes billing safety, never which provider
-        serves production traffic.
+        With multi-provider routing enabled :data:`DEFAULT_NOTE_ORDER` is
+        authoritative — a leftover ``NOTE_API_PROVIDER`` from a single-provider
+        deployment must not silently keep an older provider in first position.
+        The environment provider is still guaranteed to *be on the route* (so a
+        legacy deployment keeps serving traffic), and it is promoted to position
+        zero only in the two cases where the reviewed default says nothing about
+        it: legacy mode (``AI_ROUTING_ENABLED=false``) or a provider that is not
+        part of the reviewed order at all (a custom gateway).
         """
         if task == TASK_BENCHMARK:
             order: list[str] = list(DEFAULT_NOTE_ORDER) + ["cerebras", "cohere", "huggingface"]
@@ -346,17 +399,84 @@ class ProviderRouter:
             self.settings.effective_note_api_key or self.settings.note_api_base_url
         ):
             canonical = resolve_canonical(env_provider, self.settings.note_api_base_url)
-            if canonical in order:
+            if canonical not in order:
+                order.insert(0, canonical)
+            elif not self.settings.ai_routing_enabled:
                 order.remove(canonical)
-            order.insert(0, canonical)
+                order.insert(0, canonical)
         override = (getattr(self.settings, "ai_default_note_route", "") or "").strip()
-        if task == TASK_CHUNK and override:
+        if task in _NOTE_ROUTE_TASKS and override:
             explicit = [s.strip().lower() for s in override.split(",") if s.strip()]
             if explicit:
                 merged = [s for s in explicit if s in order]
                 merged += [s for s in order if s not in merged]
                 order = merged
         return order
+
+    def default_route_order(self, task: str = TASK_CHUNK) -> list[str]:
+        """The reviewed default order for one task, for the admin panels.
+
+        Route management needs to be able to say "this is what a fresh install
+        would look like" and to put it back; the panel must not keep a second
+        copy of that order (it drifted before), so it asks the router.
+        """
+        return self._seed_order(task)
+
+    async def _upgrade_seeded_order(self, task: str, rows: list[dict]) -> None:
+        """Forward-only alignment of an untouched seeded route to the default.
+
+        Safety contract:
+
+        * every row of the task group must still carry ``updated_by_admin_id IS
+          NULL`` — any administrator write (order, enable, free-only, model)
+          marks the whole group as customised and it is left alone forever;
+        * the rows must still look like what seeding produced (automatic model,
+          enabled, free-only) and only contain providers the reviewed defaults
+          know about; a task-specific customisation therefore never matches;
+        * the rewrite only permutes ``route_index`` inside the existing rows;
+          providers are never added, removed or re-flagged, so route metadata,
+          usage history and credentials are untouched;
+        * it is idempotent: once stored order == desired order the comparison
+          short-circuits and no write happens on any later startup.
+        """
+        if any(row.get("updated_by_admin_id") is not None for row in rows):
+            return
+        if any(
+            row.get("model") or not int(row.get("enabled", 1) or 0) or not int(row.get("free_only", 1) or 0)
+            for row in rows
+        ):
+            return
+        recognized = set(DEFAULT_NOTE_ORDER) | set(LEGACY_NOTE_ORDER)
+        current = [str(row.get("provider") or "").strip().lower() for row in rows]
+        if not current or any(slug not in recognized for slug in current):
+            return
+        desired = [slug for slug in self._seed_order(task) if slug in current]
+        desired += [slug for slug in current if slug not in desired]
+        if len(desired) != len(current) or desired == current:
+            return
+        try:
+            changed = await self.db.ai_routes_reorder("notes", task, desired)
+        except Exception:
+            logger.warning("Could not align seeded AI route order task=%s", task)
+            return
+        if not changed:
+            return
+        logger.info(
+            "Aligned seeded AI note route task=%s to reviewed default order (revision %s): %s",
+            task,
+            ROUTE_SEED_REVISION,
+            " -> ".join(desired),
+        )
+        await self.tracker.event(
+            "provider_route_changed",
+            service="notes",
+            request_type=task,
+            level="info",
+            detail=(
+                f"seeded route aligned to reviewed default order (revision {ROUTE_SEED_REVISION}): "
+                + " -> ".join(desired)
+            ),
+        )
 
     async def _safe_routes(self, service: str, task: str) -> list[dict] | None:
         try:
@@ -385,7 +505,8 @@ class ProviderRouter:
                     provider=slug,
                     canonical=canonical,
                     model=row.get("model"),
-                    free_only=bool(row.get("free_only", 1)) and bool(row.get("enabled", 1)),
+                    free_only=bool(row.get("free_only", 1)),
+                    enabled=bool(row.get("enabled", 1)),
                     index=index,
                 )
             )
@@ -413,6 +534,10 @@ class ProviderRouter:
         for leg in legs:
             info = registry_info(leg.canonical)
             stored = settings.get(leg.canonical, {})
+            if not leg.enabled:
+                # A disabled route row is a disabled *route*, not a paid leg.
+                skipped.append((leg.canonical, "route_disabled"))
+                continue
             if info.classification is ProviderClass.TRIAL_ONLY:
                 skipped.append((leg.canonical, "trial_only_blocked"))
                 continue
@@ -816,8 +941,16 @@ class ProviderRouter:
         job_id: str,
         submission_id: int | None,
         failure_log: list[NoteFailure],
+        deadline: float | None = None,
+        leg_budget_seconds: float = 0.0,
     ) -> NoteResponse:
-        """Run one leg over its credential pool; raise on leg failure."""
+        """Run one leg over its credential pool; raise on leg failure.
+
+        ``deadline`` is a :func:`time.perf_counter` value owned by the caller: a
+        leg that has already spent its wall-clock budget stops *between*
+        credentials (and stops retrying) so the next provider in the route still
+        gets its own share of the job instead of queueing behind a slow one.
+        """
         stored_settings = (await self.provider_settings()).get(leg.canonical) or {}
         profile = self._profile_with_settings(profile_for(leg.canonical), stored_settings)
         adapter = adapter_for(leg.canonical, self.settings)
@@ -846,7 +979,17 @@ class ProviderRouter:
             raise _LegFailed(failure)
         last_failure: NoteFailure | None = None
         downgraded = False
-        for credential in pool:
+        for credential_index, credential in enumerate(pool):
+            if deadline is not None and credential_index and time.perf_counter() >= deadline:
+                last_failure = NoteFailure(
+                    category=FAIL_TRANSIENT,
+                    provider=leg.canonical,
+                    model="",
+                    retryable=True,
+                    message=f"route leg exceeded its {int(leg_budget_seconds or 0)}s time budget",
+                )
+                failure_log.append(last_failure)
+                break
             model = await self._model_for(leg, credential, profile)
             if not model:
                 last_failure = NoteFailure(
@@ -914,6 +1057,7 @@ class ProviderRouter:
                 response = await self._execute_with_provider_limit(
                     adapter=adapter, ctx=ctx, credential=credential,
                     profile=profile, session=session, position=position,
+                    deadline=deadline,
                 )
                 return response
             except _DowngradeRequested:
@@ -925,6 +1069,7 @@ class ProviderRouter:
                     response = await self._execute_with_provider_limit(
                         adapter=adapter, ctx=ctx, credential=credential,
                         profile=profile, session=session, position=position,
+                        deadline=deadline,
                     )
                     return response
                 except NoteFailure as exc:
@@ -958,6 +1103,12 @@ class ProviderRouter:
             await self._apply_credential_state(credential, last_failure, job_id)
             if last_failure.category == FAIL_BAD_REQUEST and not downgraded:
                 continue  # try the same provider with a fresh credential? -> rotate
+            if last_failure.category in {FAIL_TRANSIENT, FAIL_SERVER, FAIL_CONTRACT}:
+                # A 5xx, a transport failure or a response-contract mismatch is
+                # a property of the provider/account, not of this one key:
+                # repeating it against every key in the pool only burns the job.
+                # Key-specific failures (auth, per-key quota) still rotate.
+                break
         if last_failure is None:
             last_failure = NoteFailure(category=FAIL_MODEL, provider=leg.canonical, model="", model_unavailable=True, message="no usable model")
             failure_log.append(last_failure)
@@ -1280,6 +1431,7 @@ class ProviderRouter:
         profile: NoteProviderProfile,
         session,
         position: int,
+        deadline: float | None = None,
     ) -> NoteResponse:
         limiter = self._provider_limiter(ctx.canonical)
         async with limiter.slot(profile.max_concurrency):
@@ -1290,6 +1442,7 @@ class ProviderRouter:
                 profile=profile,
                 session=session,
                 position=position,
+                deadline=deadline,
             )
 
     async def _execute_with_retries(
@@ -1301,6 +1454,7 @@ class ProviderRouter:
         profile: NoteProviderProfile,
         session,
         position: int,
+        deadline: float | None = None,
     ) -> NoteResponse:
         policy = profile.policy
         retries = policy.max_retries
@@ -1365,6 +1519,19 @@ class ProviderRouter:
                 profile_timeout = max(1, int(policy.timeout_seconds))
                 legacy_timeout = max(1, int(getattr(self.settings, "note_api_timeout", profile_timeout)))
                 timeout_seconds = min(profile_timeout, legacy_timeout)
+                if deadline is not None:
+                    # Never start an attempt the route leg cannot still finish;
+                    # a provider that is merely slow must not occupy the job.
+                    left = deadline - time.perf_counter()
+                    if left < 1.0:
+                        raise NoteFailure(
+                            category=FAIL_TRANSIENT,
+                            provider=ctx.canonical,
+                            model=ctx.model,
+                            retryable=True,
+                            message="route leg time budget exhausted",
+                        )
+                    timeout_seconds = min(timeout_seconds, max(1.0, left))
                 timeout = aiohttp.ClientTimeout(
                     total=timeout_seconds,
                     connect=min(30, timeout_seconds),
@@ -1440,6 +1607,16 @@ class ProviderRouter:
                         failure.retryable
                         and attempt < attempts
                         and (failure.category != FAIL_RATE_LIMITED or policy.retry_on_rate_limit)
+                        # A provider that asked for a longer pause than one
+                        # retry cycle may spend is not going to be persuaded by
+                        # another request now: the credential goes into
+                        # cooldown for the full Retry-After and the route moves
+                        # on, instead of a hot loop against a hard limit.
+                        and not (
+                            failure.retry_after is not None
+                            and failure.retry_after > policy.retry_after_cap_seconds
+                        )
+                        and self._time_left_for_retry(deadline, delay)
                     )
                     await self._record_attempt(
                         ctx=request_ctx, credential=credential, result="failure",
@@ -1485,8 +1662,8 @@ class ProviderRouter:
                     estimated_tokens=estimated, parsed=None, position=position,
                     failure=failure,
                 )
-                if attempt < attempts:
-                    delay = min(policy.backoff_base_seconds ** attempt, policy.backoff_cap_seconds)
+                delay = min(policy.backoff_base_seconds ** attempt, policy.backoff_cap_seconds)
+                if attempt < attempts and self._time_left_for_retry(deadline, delay):
                     await self.tracker.event(
                         "note_request_retry",
                         service="notes",
@@ -1519,6 +1696,11 @@ class ProviderRouter:
             for needle in ("response_format", "json_schema", "json mode", "invalid parameter",
                             "unsupported", "schema")
         )
+
+    @staticmethod
+    def _time_left_for_retry(deadline: float | None, delay: float) -> bool:
+        """True when waiting ``delay`` still leaves room before the leg deadline."""
+        return deadline is None or time.perf_counter() + delay < deadline
 
     @staticmethod
     def _retry_delay(policy, failure: NoteFailure, attempt: int) -> float:
@@ -1732,6 +1914,9 @@ class NoteJobSession:
         self.submission_id = submission_id
         self.failures: list[NoteFailure] = []
         self.fallbacks = 0
+        #: Legs with a usable credential, computed once per job (see
+        #: :meth:`_attempted_legs`); ``generate`` runs for every chunk.
+        self._runnable_legs: list[RouteLeg] | None = None
 
     # -- budgeting ----------------------------------------------------------
 
@@ -1772,6 +1957,39 @@ class NoteJobSession:
 
     # -- generation -----------------------------------------------------------
 
+    async def _attempted_legs(self, plan_legs: list[RouteLeg], *, budget: int) -> list[RouteLeg]:
+        """Route legs this job may try, bounded by the failover budget.
+
+        The budget counts provider attempts, so it must be spent on providers
+        that can answer at all: on a long default route an unconfigured preferred
+        provider would otherwise consume the whole budget and leave a usable
+        provider further down untried (which fails the job even though the
+        deployment could serve it). When nothing is prunable the plain
+        truncation is kept, so a genuine "no credentials configured" error
+        stays visible to the user instead of turning into a silent skip.
+        """
+        if len(plan_legs) <= budget:
+            return list(plan_legs)
+        if self._runnable_legs is None:
+            runnable: list[RouteLeg] = []
+            for leg in plan_legs:
+                if await self.router.credentials_for(leg):
+                    runnable.append(leg)
+            self._runnable_legs = runnable
+        return self._runnable_legs[:budget] or list(plan_legs[:budget])
+
+    def _leg_budget_seconds(self) -> float:
+        """Wall-clock share of the job one route leg may spend.
+
+        ``NOTE_API_TIMEOUT_SECONDS`` bounds a single HTTP attempt, but a leg can
+        make many of them (credential pool × retries). Without a per-leg bound a
+        provider that keeps answering slowly or with 5xx is tried until the whole
+        job budget is gone and the next provider in the route never runs, which
+        turns a temporary single-provider failure into a failed note.
+        """
+        policy = self.plan.profile.policy
+        return max(60.0, min(600.0, float(policy.timeout_seconds) * LEG_DEADLINE_FACTOR))
+
     async def generate(
         self,
         *,
@@ -1786,7 +2004,8 @@ class NoteJobSession:
         if not plan_legs:
             raise AllProvidersFailedError(_ALL_FAILED_FA, failures=self.failures)
         max_failovers = max(0, int(getattr(self.settings, "ai_max_provider_failovers", 3)))
-        legs = plan_legs[: max_failovers + 1]
+        legs = await self._attempted_legs(plan_legs, budget=max_failovers + 1)
+        leg_budget_seconds = self._leg_budget_seconds()
         last_error: Exception | None = None
         for position, leg in enumerate(legs):
             if position > 0:
@@ -1823,6 +2042,10 @@ class NoteJobSession:
                     job_id=self.job_id,
                     submission_id=self.submission_id,
                     failure_log=self.failures,
+                    # Deadline instead of a task cancellation: every attempt is
+                    # still recorded and releases its quota reservation.
+                    deadline=time.perf_counter() + leg_budget_seconds,
+                    leg_budget_seconds=leg_budget_seconds,
                 )
                 return response.text
             except _LegFailed as exc:

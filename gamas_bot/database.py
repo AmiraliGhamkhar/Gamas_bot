@@ -465,6 +465,13 @@ class Database:
                 "reason": reason,
             }
 
+    async def unlimited_user_count(self) -> int:
+        """Total special users, so the panel can say when its list is a prefix."""
+        async with self._lock:
+            cursor = await self._db().execute("SELECT COUNT(*) FROM users WHERE is_unlimited=1")
+            row = await cursor.fetchone()
+        return int(row[0] or 0)
+
     async def unlimited_users(self, *, limit: int = 50) -> list[dict[str, Any]]:
         """Every special user, newest grant first, with their media usage count."""
         async with self._lock:
@@ -583,14 +590,22 @@ class Database:
                 (submission_id, engine, raw_text, structured_text, utc_now()),
             )
 
-    async def user_summaries(self, limit: int = 50) -> list[dict[str, Any]]:
+    async def user_summaries(
+        self, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """One page of the admin user list.
+
+        ``offset`` exists so the Users panel paginates instead of silently
+        dropping everyone past the first page; the total count comes from
+        :meth:`stats`, which the same screen already reads.
+        """
         async with self._lock:
             cursor = await self._db().execute(
                 "SELECT u.telegram_id, u.username, u.first_seen, u.is_banned, "
                 "u.is_unlimited, COUNT(s.id) AS submission_count FROM users u "
                 "LEFT JOIN audio_submissions s ON s.user_id=u.id "
-                "GROUP BY u.id ORDER BY u.first_seen DESC LIMIT ?",
-                (limit,),
+                "GROUP BY u.id ORDER BY u.first_seen DESC LIMIT ? OFFSET ?",
+                (max(1, int(limit)), max(0, int(offset))),
             )
             return [dict(row) for row in await cursor.fetchall()]
 
@@ -1029,13 +1044,27 @@ class Database:
         async with self._lock:
             cursor = await self._db().execute(
                 "SELECT pr.id, pr.amount_toman, pr.status, pr.created_at, pr.receipt_submitted_at, "
-                "u.telegram_id, u.username, p.code AS plan_code, p.name AS plan_name, "
-                "p.included_seconds FROM payment_requests pr "
+                "pr.receipt_path, u.telegram_id, u.username, p.code AS plan_code, "
+                "p.name AS plan_name, p.included_seconds FROM payment_requests pr "
                 "JOIN users u ON u.id=pr.user_id JOIN plans p ON p.id=pr.plan_id "
                 "WHERE pr.status='pending' ORDER BY pr.created_at, pr.id LIMIT ? OFFSET ?",
                 (max(1, min(limit, 50)), max(0, offset)),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def pending_payment_count(self) -> int:
+        """How many receipts are waiting, for the overview and the payment page.
+
+        Callers used to report ``len(list_pending_payments(limit=5))`` as if it
+        were the backlog, which understated a queue of 34 as "5 پرداخت در انتظار
+        بررسی" — a wrong number in front of the person deciding whether to act.
+        """
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT COUNT(*) FROM payment_requests WHERE status='pending'"
+            )
+            row = await cursor.fetchone()
+        return int(row[0] or 0)
 
     async def payment_detail(self, payment_id: int) -> dict[str, Any] | None:
         """Admin-only handler data, including the private local receipt path."""
@@ -1063,6 +1092,21 @@ class Database:
                 (user_id, max(1, min(limit, 50))),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def payment_count(self, user_id: int) -> int:
+        """How many payment requests a user has ever made, whatever the status.
+
+        ``/history`` prints the newest ten rows (``payment_history``'s default
+        window, hard-capped at 50 in SQL). This is the number that lets the
+        heading say so instead of presenting ten rows as the whole record.
+        """
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT COUNT(*) FROM payment_requests WHERE user_id=?",
+                (int(user_id),),
+            )
+            row = await cursor.fetchone()
+        return int(row[0] or 0)
 
     async def approve_payment(
         self, payment_id: int, admin_id: int, *, admin_note: str | None = None
@@ -1470,14 +1514,21 @@ class Database:
             )
             return [dict(row) for row in await cursor.fetchall()]
 
-    async def admin_user_credit_overview(self, telegram_id: int) -> dict[str, Any] | None:
+    async def admin_user_credit_overview(
+        self, telegram_id: int, *, recent_rows: int = 10, usage_rows: int = 8
+    ) -> dict[str, Any] | None:
         """Everything the admin credit screen shows for one user.
 
-        Read-only and index-backed: the free/paid split comes from the same
-        entitlement rows the reservation engine consumes, so the screen can
-        never disagree with billing.
+        The balance is one SQL aggregate over the same predicate the reservation
+        engine spends from, so what the admin reads is what a job is billed
+        against even when a user has more entitlement history than the screen
+        lists. ``entitlements`` / ``usage`` are that display window and
+        ``entitlement_total`` / ``usage_total`` are the real counts, so the panel
+        can say which of the two it is showing.
         """
         now = utc_now()
+        recent_rows = max(1, int(recent_rows))
+        usage_rows = max(1, int(usage_rows))
         async with self._transaction(immediate=True) as db:
             cursor = await db.execute(
                 "SELECT id, telegram_id, username, is_banned, first_seen, is_unlimited, "
@@ -1490,30 +1541,39 @@ class Database:
             user_id = int(user["id"])
             await self._expire_entitlements_in_transaction(db, user_id, now)
             cursor = await db.execute(
+                "SELECT COALESCE(SUM(CASE WHEN e.source='free_lifetime' "
+                "THEN e.remaining_seconds END), 0), "
+                "COALESCE(SUM(CASE WHEN e.source<>'free_lifetime' "
+                "THEN e.remaining_seconds END), 0) "
+                "FROM entitlements e WHERE e.user_id=? AND e.status='active' "
+                "AND datetime(e.starts_at)<=datetime(?) "
+                "AND (e.expires_at IS NULL OR datetime(e.expires_at)>datetime(?))",
+                (user_id, now, now),
+            )
+            free_seconds, paid_seconds = (int(value or 0) for value in await cursor.fetchone())
+            cursor = await db.execute(
                 "SELECT e.id, e.granted_seconds, e.remaining_seconds, e.starts_at, e.expires_at, "
                 "e.status, e.source, p.code AS plan_code, p.name AS plan_name "
                 "FROM entitlements e JOIN plans p ON p.id=e.plan_id WHERE e.user_id=? "
-                "ORDER BY e.id DESC LIMIT 50",
-                (user_id,),
+                "ORDER BY e.id DESC LIMIT ?",
+                (user_id, recent_rows),
             )
             entitlements = [dict(row) for row in await cursor.fetchall()]
-            free_seconds = sum(
-                int(row["remaining_seconds"])
-                for row in entitlements
-                if row["status"] == "active" and row["source"] == "free_lifetime"
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM entitlements WHERE user_id=?", (user_id,)
             )
-            paid_seconds = sum(
-                int(row["remaining_seconds"])
-                for row in entitlements
-                if row["status"] == "active" and row["source"] != "free_lifetime"
-            )
+            entitlement_total = int((await cursor.fetchone())[0])
             cursor = await db.execute(
                 "SELECT l.id, l.event_type, l.submission_id, l.reserved_seconds, "
                 "l.consumed_seconds, l.released_seconds, l.requested_seconds, l.reason, "
-                "l.created_at FROM usage_ledger l WHERE l.user_id=? ORDER BY l.id DESC LIMIT 15",
-                (user_id,),
+                "l.created_at FROM usage_ledger l WHERE l.user_id=? ORDER BY l.id DESC LIMIT ?",
+                (user_id, usage_rows),
             )
             usage = [dict(row) for row in await cursor.fetchall()]
+            cursor = await db.execute(
+                "SELECT COUNT(*) FROM usage_ledger WHERE user_id=?", (user_id,)
+            )
+            usage_total = int((await cursor.fetchone())[0])
             cursor = await db.execute(
                 "SELECT COUNT(*) AS total, "
                 "SUM(CASE WHEN status='done' THEN 1 ELSE 0 END) AS done, "
@@ -1535,7 +1595,9 @@ class Database:
                 "free_seconds": free_seconds,
                 "paid_seconds": paid_seconds,
                 "entitlements": entitlements,
+                "entitlement_total": entitlement_total,
                 "usage": usage,
+                "usage_total": usage_total,
                 "submissions": {key: int(value or 0) for key, value in submissions.items()},
             }
 
@@ -2044,6 +2106,34 @@ class Database:
             cursor = await self._db().execute(query, params)
             return [dict(row) for row in await cursor.fetchall()]
 
+    async def ai_models_page(
+        self,
+        provider: str,
+        *,
+        offset: int = 0,
+        limit: int = 10,
+        only_available: bool = False,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """One page of a provider catalog plus the total row count.
+
+        The catalog panel is paginated rather than truncated, and a page reads
+        only its own rows (``LIMIT/OFFSET``): a provider with hundreds of
+        models must not cost a full table load on every redraw.
+        """
+        where = "provider=?" + (" AND available=1" if only_available else "")
+        params = (provider, max(1, int(limit)), max(0, int(offset)))
+        async with self._lock:
+            cursor = await self._db().execute(
+                f"SELECT * FROM ai_models WHERE {where} ORDER BY deprecated, id LIMIT ? OFFSET ?",
+                params,
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+            cursor = await self._db().execute(
+                f"SELECT COUNT(*) FROM ai_models WHERE {where}", (provider,)
+            )
+            total = await cursor.fetchone()
+        return rows, int(total[0] or 0)
+
     async def ai_model_get(self, provider: str, model: str) -> dict[str, Any] | None:
         async with self._lock:
             cursor = await self._db().execute(
@@ -2352,6 +2442,61 @@ class Database:
                     },
                 )
 
+    async def ai_routes_reorder(
+        self, service: str, task_type: str, ordered_providers: list[str]
+    ) -> int:
+        """Renumber one route in place; returns how many rows moved.
+
+        Used by the startup default-order upgrade, so renumbering must never
+        rewrite anything else: ``enabled``/``free_only``/``model``/
+        ``updated_by_admin_id`` and the row ids all keep their values, and
+        ``updated_at`` is only touched on the rows that actually moved.
+
+        ``UNIQUE(service, task_type, route_index)`` forbids a single-pass
+        rewrite (two rows would share an index mid-flight), so this is
+        transactional and two-phase: every moving row is first shifted clear of
+        the 0..n-1 range, then written to its final index. Either the whole
+        reorder commits or none of it does.
+        """
+        wanted = [str(slug).strip().lower() for slug in ordered_providers]
+        if len(set(wanted)) != len(wanted):
+            raise ValueError("ordered_providers must not repeat a provider")
+        async with self._transaction(immediate=True) as db:
+            cursor = await db.execute(
+                "SELECT id, provider, route_index FROM ai_provider_routes "
+                "WHERE service=? AND task_type=? ORDER BY route_index, id",
+                (service, task_type),
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+            by_provider = {str(row["provider"]).strip().lower(): row for row in rows}
+            # A provider in the route that the requested order does not mention
+            # keeps its slot at the end; a provider the order mentions but the
+            # route does not contain is ignored (never invent a row here).
+            plan = [(by_provider[slug], index) for index, slug in enumerate(wanted) if slug in by_provider]
+            mentioned = {id(row) for row, _ in plan}
+            next_index = len(plan)
+            for row in rows:
+                if id(row) not in mentioned:
+                    plan.append((row, next_index))
+                    next_index += 1
+            moving = [(row, index) for row, index in plan if int(row["route_index"]) != index]
+            if not moving:
+                return 0
+            now = utc_now()
+            await db.execute(
+                "UPDATE ai_provider_routes SET route_index = route_index + 1000 "
+                "WHERE service=? AND task_type=? AND id IN ("
+                + ",".join("?" * len(moving))
+                + ")",
+                (service, task_type, *[int(row["id"]) for row, _ in moving]),
+            )
+            for row, index in moving:
+                await db.execute(
+                    "UPDATE ai_provider_routes SET route_index=?, updated_at=? WHERE id=?",
+                    (index, now, int(row["id"])),
+                )
+        return len(moving)
+
     async def ai_route_enabled(self, service: str, task_type: str, provider: str) -> bool | None:
         async with self._lock:
             cursor = await self._db().execute(
@@ -2575,8 +2720,34 @@ class Database:
             )
             return [dict(row) for row in await cursor.fetchall()]
 
-    async def ai_usage_metrics(self, *, days: int = 1) -> dict[str, Any]:
+    #: Request counters shown by the AI overview/usage panels, in SELECT order.
+    _AI_USAGE_METRIC_KEYS = (
+        "requests", "successes", "failures", "rate_limited", "server_errors",
+        "input_tokens", "output_tokens", "total_tokens", "latency_ms_total", "fallbacks",
+    )
+
+    #: Rows read for the latency percentile. A panel needs the p95 of *recent*
+    #: traffic, so one bounded newest-first read replaces sorting every row of
+    #: the window; ``latency_samples`` and ``latency_sample_capped`` tell the
+    #: panels when the figure describes only that sample, so they can say so.
+    LATENCY_PERCENTILE_SAMPLE = 5000
+
+    async def ai_usage_overview(
+        self, *, days: int = 1, sample: int | None = None
+    ) -> dict[str, Any]:
+        """Request metrics *and* p95 latency for one panel, in one read pass.
+
+        The admin overview used to run two independent queries with two
+        different windows (a UTC day floor for the counters, a rolling N×24 h
+        for the percentile), so one screen could show numbers describing two
+        periods while paying for two scans. Both halves here share the same
+        window expression and one lock acquisition; the percentile reads at most
+        :attr:`LATENCY_PERCENTILE_SAMPLE` newest rows instead of materialising
+        every latency in the window in Python.
+        """
         cutoff = utc_now()[:10]
+        window = (f"{cutoff}T00:00:00", f"-{max(1, int(days))} days")
+        limit = max(100, int(sample or self.LATENCY_PERCENTILE_SAMPLE))
         async with self._lock:
             cursor = await self._db().execute(
                 "SELECT COUNT(*) AS n, SUM(CASE WHEN result='success' THEN 1 ELSE 0 END) AS ok, "
@@ -2586,25 +2757,36 @@ class Database:
                 "SUM(actual_input_tokens), SUM(actual_output_tokens), SUM(total_tokens), "
                 "SUM(latency_ms), SUM(CASE WHEN route_position>0 THEN 1 ELSE 0 END) AS fb "
                 "FROM ai_usage_records WHERE created_at >= datetime(?, ?)",
-                (f"{cutoff}T00:00:00", f"-{max(1, int(days))} days"),
+                window,
             )
             row = await cursor.fetchone()
-            keys = ["requests", "successes", "failures", "rate_limited", "server_errors",
-                    "input_tokens", "output_tokens", "total_tokens", "latency_ms_total", "fallbacks"]
-            return {k: int(row[i] or 0) for i, k in enumerate(keys)}
-
-    async def ai_usage_latency_p95(self, *, days: int = 1) -> int:
-        async with self._lock:
+            overview: dict[str, Any] = {
+                key: int(row[index] or 0)
+                for index, key in enumerate(self._AI_USAGE_METRIC_KEYS)
+            }
             cursor = await self._db().execute(
                 "SELECT latency_ms FROM ai_usage_records WHERE latency_ms IS NOT NULL "
-                "AND created_at >= datetime(?, ?) ORDER BY latency_ms",
-                (utc_now(), f"-{max(1, int(days)) * 24} hours"),
+                "AND created_at >= datetime(?, ?) ORDER BY id DESC LIMIT ?",
+                (*window, limit),
             )
-            values = [int(r[0]) for r in await cursor.fetchall() if r[0] is not None]
-        if not values:
-            return 0
-        index = min(len(values) - 1, int(len(values) * 0.95))
-        return values[index]
+            values = sorted(int(item[0]) for item in await cursor.fetchall() if item[0] is not None)
+        overview["latency_p95_ms"] = (
+            values[min(len(values) - 1, int(len(values) * 0.95))] if values else 0
+        )
+        overview["latency_samples"] = len(values)
+        # A saturated read is the only honest signal that the window was bigger
+        # than the sample: the sample can also be shorter than `requests` simply
+        # because some rows have no recorded latency.
+        overview["latency_sample_capped"] = len(values) >= limit
+        return overview
+
+    async def ai_usage_metrics(self, *, days: int = 1) -> dict[str, Any]:
+        """Request counters for the window (see :meth:`ai_usage_overview`)."""
+        overview = await self.ai_usage_overview(days=days)
+        return {key: overview[key] for key in self._AI_USAGE_METRIC_KEYS}
+
+    async def ai_usage_latency_p95(self, *, days: int = 1) -> int:
+        return int((await self.ai_usage_overview(days=days))["latency_p95_ms"])
 
     # -- quota snapshots ---------------------------------------------------------
 
@@ -2662,6 +2844,24 @@ class Database:
             cursor = await self._db().execute(
                 "SELECT * FROM ai_quota_snapshots WHERE provider=? ORDER BY observed_at DESC LIMIT 20",
                 (provider,),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
+
+    async def ai_quota_latest_for_provider(
+        self, provider: str, *, limit: int = 12
+    ) -> list[dict[str, Any]]:
+        """Every quota snapshot the provider currently holds (provider detail panel).
+
+        ``ai_quota_upsert`` overwrites in place on ``(provider, credential_id,
+        model, window)``, so one row is one live quota. Ordered by quota identity
+        rather than observation time so a bounded view is a stable prefix that
+        does not shuffle while providers keep reporting.
+        """
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT * FROM ai_quota_snapshots WHERE provider=? "
+                "ORDER BY window, IFNULL(credential_id, -1), model LIMIT ?",
+                (provider, max(1, int(limit))),
             )
             return [dict(row) for row in await cursor.fetchall()]
 
@@ -2729,6 +2929,7 @@ class Database:
         job_id: str | None = None,
         since: str | None = None,
         http_status: int | None = None,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         """Structured-log query for the admin Logs panel (spec §35).
 
@@ -2767,11 +2968,59 @@ class Database:
             else:
                 query += " AND http_status=?"
                 params.append(http_status)
-        query += " ORDER BY id DESC LIMIT ?"
-        params.append(max(1, int(limit)))
+        # Bounded paging (spec: no unlimited event history per redraw). The
+        # table is ring-pruned, so an offset past the end is simply empty.
+        query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+        params.append(max(1, min(int(limit), 200)))
+        params.append(max(0, int(offset)))
         async with self._lock:
             cursor = await self._db().execute(query, tuple(params))
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def ai_event_count(
+        self,
+        *,
+        provider: str | None = None,
+        event: str | None = None,
+        since: str | None = None,
+        error_class: str | None = None,
+        job_id: str | None = None,
+        http_status: int | None = None,
+    ) -> int:
+        """How many event rows a Logs filter matches (page count, not a scan).
+
+        The clause set is the one in :meth:`ai_events_list`, including the
+        "status class below 100" convention: a count that answered a different
+        question than the page it annotates would be worse than no count.
+        """
+        query = "SELECT COUNT(*) FROM ai_events WHERE 1=1"
+        params: list = []
+        if provider:
+            query += " AND provider=?"
+            params.append(provider)
+        if event:
+            query += " AND event=?"
+            params.append(event)
+        if error_class:
+            query += " AND error_class=?"
+            params.append(error_class)
+        if job_id:
+            query += " AND job_id=?"
+            params.append(job_id)
+        if since:
+            query += " AND created_at>=?"
+            params.append(since)
+        if http_status is not None:
+            if http_status < 100:
+                query += " AND http_status>=? AND http_status<=?"
+                params.extend([http_status * 100, http_status * 100 + 99])
+            else:
+                query += " AND http_status=?"
+                params.append(http_status)
+        async with self._lock:
+            cursor = await self._db().execute(query, tuple(params))
+            row = await cursor.fetchone()
+        return int(row[0] or 0)
 
 
     # -- Gamas Speech Platform --------------------------------------------------
@@ -3025,8 +3274,20 @@ class Database:
             )
 
     async def stt_quota_latest(
-        self, provider: str, quota_type: str | None = None, *, account_scope: str | None = None
+        self,
+        provider: str,
+        quota_type: str | None = None,
+        *,
+        account_scope: str | None = None,
+        limit: int = 20,
     ) -> list[dict[str, Any]]:
+        """The provider's live quota rows, newest observation first.
+
+        ``stt_quota_upsert`` keeps exactly one row per
+        ``(provider, account_scope, model, quota_type)``, so a row is a live quota
+        rather than a history entry and this list is a page of distinct quotas.
+        The page is bounded; :meth:`stt_quota_count` is how many there are.
+        """
         query = "SELECT * FROM stt_quota_snapshots WHERE provider=?"
         params: list[Any] = [provider]
         if quota_type:
@@ -3035,10 +3296,24 @@ class Database:
         if account_scope:
             query += " AND account_scope=?"
             params.append(account_scope)
-        query += " ORDER BY observed_at DESC, id DESC LIMIT 20"
+        query += " ORDER BY observed_at DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
         async with self._lock:
             cursor = await self._db().execute(query, tuple(params))
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def stt_quota_count(
+        self, provider: str, *, account_scope: str | None = None
+    ) -> int:
+        """How many quota rows a provider holds (the page above is a slice of it)."""
+        query = "SELECT COUNT(*) FROM stt_quota_snapshots WHERE provider=?"
+        params: list[Any] = [provider]
+        if account_scope:
+            query += " AND account_scope=?"
+            params.append(account_scope)
+        async with self._lock:
+            cursor = await self._db().execute(query, tuple(params))
+            return int((await cursor.fetchone())[0] or 0)
 
     async def stt_quota_set_budget(
         self,
@@ -3285,7 +3560,7 @@ class Database:
 
     async def stt_events_list(
         self, *, limit: int = 50, provider: str | None = None, event: str | None = None,
-        failures_only: bool = False,
+        failures_only: bool = False, offset: int = 0,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM stt_provider_events WHERE 1=1"
         params: list[Any] = []
@@ -3297,8 +3572,20 @@ class Database:
             params.append(event)
         if failures_only:
             query += " AND level IN ('warning','error')"
-        query += " ORDER BY id DESC LIMIT ?"
+        query += " ORDER BY id DESC LIMIT ? OFFSET ?"
         params.append(max(1, min(int(limit), 200)))
+        params.append(max(0, int(offset)))
         async with self._lock:
             cursor = await self._db().execute(query, tuple(params))
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def stt_events_count(self, *, failures_only: bool = False) -> int:
+        """Total rows behind an STT log filter, for the panel page indicator."""
+        query = "SELECT COUNT(*) FROM stt_provider_events WHERE 1=1"
+        params: list[Any] = []
+        if failures_only:
+            query += " AND level IN ('warning','error')"
+        async with self._lock:
+            cursor = await self._db().execute(query, tuple(params))
+            row = await cursor.fetchone()
+        return int(row[0] or 0)

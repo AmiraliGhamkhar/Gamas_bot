@@ -416,27 +416,71 @@ class ProviderHealthChecker:
         return pairs
 
     # -- checks ---------------------------------------------------------------
-    async def check(
-        self, service: str, provider: str, *, force: bool = False
-    ) -> list[HealthResult]:
-        """Health for one provider: one row per credential, plus a fallback row."""
+    @staticmethod
+    def _not_configured(service: str, provider: str) -> HealthResult:
+        return HealthResult(
+            service=service,
+            provider=provider,
+            credential_id=None,
+            source="none",
+            label="—",
+            masked="—",
+            status="not_configured",
+            detail="کلیدی برای این سرویس تنظیم نشده است.",
+        )
+
+    async def _rows_for(self, service: str, provider: str) -> list[HealthResult]:
+        """One row per credential of a provider (stored + environment key)."""
         results = await self._stored_candidates(service, provider)
         environment = self._environment_credential(service, provider)
         if environment is not None:
             results.append(self._credential_result(environment))
-        if not results:
-            return [
-                HealthResult(
-                    service=service,
-                    provider=provider,
-                    credential_id=None,
-                    source="none",
-                    label="—",
-                    masked="—",
-                    status="not_configured",
-                    detail="کلیدی برای این سرویس تنظیم نشده است.",
+        return results
+
+    async def snapshot(self, service: str | None = None) -> list[HealthResult]:
+        """Last known state for every credential — **no network request**.
+
+        Opening or redrawing a panel uses this. A probe stays an explicit action
+        (:meth:`check_all` with ``force=True``, or the per-credential test), so a
+        panel view can never spend provider quota, hammer a rate limit or delay
+        the answer to the tap. A result remembered past its TTL is still shown —
+        marked stale — because the alternative after a restart is an implicit
+        probe of every provider at once.
+        """
+        pairs = [
+            pair for pair in await self.providers() if service is None or pair[0] == service
+        ]
+        rows: list[HealthResult] = []
+        for provider_service, provider in pairs:
+            candidates = await self._rows_for(provider_service, provider)
+            if not candidates:
+                rows.append(self._not_configured(provider_service, provider))
+                continue
+            for result in candidates:
+                remembered = self._cache.get(
+                    (result.service, result.provider, result.credential_id)
                 )
-            ]
+                if remembered is None:
+                    rows.append(
+                        replace(
+                            result,
+                            cached=True,
+                            detail=(result.detail or "") + " نتیجهٔ زنده‌ای ثبت نشده است.",
+                        )
+                    )
+                    continue
+                expires, cached = remembered
+                note = "" if expires > time.monotonic() else " (کهنه)"
+                rows.append(replace(cached, cached=True, detail=(cached.detail or "") + note))
+        return rows
+
+    async def check(
+        self, service: str, provider: str, *, force: bool = False
+    ) -> list[HealthResult]:
+        """Health for one provider: one row per credential, plus a fallback row."""
+        results = await self._rows_for(service, provider)
+        if not results:
+            return [self._not_configured(service, provider)]
         # Probes run concurrently so a panel with several keys answers in about
         # one timeout, not one timeout per key. ``gather`` keeps the pool order.
         pending: list = []

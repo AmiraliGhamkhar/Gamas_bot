@@ -13,6 +13,8 @@ capabilities can never drift between the routing engine and the admin UI
 
 from __future__ import annotations
 
+import hashlib
+
 import re
 import tempfile
 import wave
@@ -327,53 +329,223 @@ class SttPanels:
         await self.show_provider_detail(event, slug)
 
     # ------------------------------------------------------------- models
-    async def show_models(self, event, slug: str | None = None) -> None:
-        registry = STTModelRegistry(self.db, self.settings)
-        lines = ["🧠 مدل‌های STT (رجیستری مدل‌ها)", ""]
-        buttons: list = []
-        providers = [slug] if slug else list(STT_PROVIDER_REGISTRY)
-        for provider in providers:
-            info = stt_registry_info(provider)
-            if info is None:
-                continue
+    #: Models shown per provider page. The panel used to render every model of
+    #: every provider in one message, which Telegram rejects (message length and
+    #: 100-button limits) as soon as a catalog grows — and an over-long catalog
+    #: silently lost its tail.
+    MODELS_PAGE_SIZE = 10
+
+    @staticmethod
+    def _page_token(provider: str, page: object) -> bytes:
+        """One bounded callback payload for a catalog page (Telegram: 64 bytes)."""
+        return f"admin:stt:md:{provider}:{int(page)}".encode("ascii")[:64]
+
+    @staticmethod
+    def _budget_fingerprint(provider: str, scope: str, quota_type: str) -> str:
+        """Short identity check for a quota row addressed by list position."""
+        digest = hashlib.sha1(
+            f"{provider}|{scope}|{quota_type}".encode("utf-8", "replace")
+        ).hexdigest()
+        return digest[:8]
+
+    @staticmethod
+    def _budget_token(provider: str, position: int, scope: str, quota_type: str) -> bytes:
+        """Address one listed budget row without carrying its identity fields.
+
+        ``account_scope`` and ``quota_type`` are admin-typed free text (the budget
+        prompt allows 60 characters each), so the previous
+        ``admin:stt:qdel:<provider>:<scope>:<type>`` payload could pass Telegram's
+        64-byte ``callback_data`` limit — which made the quota screen unsendable
+        for exactly the rows an admin wanted to clean up. The fingerprint keeps the
+        action pinned to the row this keyboard actually showed.
+        """
+        fingerprint = SttPanels._budget_fingerprint(provider, scope, quota_type)
+        return f"admin:stt:qdx:{provider}:{int(position)}:{fingerprint}".encode("ascii")[:64]
+
+    @staticmethod
+    def _route_model_choices(provider: str) -> list[str]:
+        """The model choices one route step may carry, in render order.
+
+        The picker and the click both resolve through this list, which is why a
+        callback can address a choice by position instead of carrying its name:
+        a provider model id has a length we do not control (the longest shipped
+        one already leaves 5 bytes of headroom), and one over-long
+        ``callback_data`` makes the *whole* message unsendable.
+        """
+        info = stt_registry_info(provider)
+        if info is None:
+            return []
+        models = list(info.models) + [row.model for row in static_stt_models(provider)]
+        return list(dict.fromkeys(str(model) for model in models if str(model or "").strip()))
+
+    @staticmethod
+    def _model_fingerprint(provider: str, model: str) -> str:
+        digest = hashlib.sha1(f"{provider}|{model}".encode("utf-8", "replace")).hexdigest()
+        return digest[:8]
+
+    @classmethod
+    def _route_model_token(cls, provider: str, index: int, model: str) -> bytes:
+        """``admin:stt:rset:<provider>:<index>:<fingerprint>`` — bounded by shape.
+
+        ``index`` ``-1`` is the «خودکار» slot, whose fingerprint is that of the
+        empty override, so the stale check is uniform for every button.
+        """
+        payload = f"admin:stt:rset:{provider}:{int(index)}:{cls._model_fingerprint(provider, model)}"
+        return payload.encode("ascii", "replace")[:64]
+
+    @staticmethod
+    def _deprecate_token(provider: str, page: int, index: int) -> bytes:
+        """Address one rendered catalog row without carrying its model id.
+
+        Model ids arrive from provider sync, so their length is not ours to
+        bound; ``admin:stt:mdep:<provider>:<model>`` could exceed Telegram's
+        64-byte ``callback_data`` limit and then the *whole* page became
+        unsendable. A page+index pair always fits.
+        """
+        return f"admin:stt:mdep:{provider}:{int(page)}:{int(index)}".encode("ascii")[:64]
+
+    @staticmethod
+    def _split_page(value: str | None) -> int:
+        try:
+            page = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return max(0, min(page, 10_000))
+
+    async def _page_of_model(self, registry, provider: str, model: str) -> int:
+        """Which page a model currently sits on, so an action can return to it."""
+        try:
             rows = await registry.cached(provider)
-            lines.append(f"▫️ {info.display_name} (`{provider}`)")
-            if not rows:
-                lines.append("   مدل ثبت‌شده‌ای وجود ندارد.")
-            for item in rows:
-                badge = "🚫 DEPRECATED" if item.deprecated else (
-                    "❌ unavailable" if not item.available else "✅"
-                )
-                fa = "fa✓" if item.persian_supported else "fa✗"
-                lines.append(
-                    f"   {badge} `{item.model}` [{fa}] "
-                    f"quality={_fmt(item.quality_score)} free={item.free_status} "
-                    f"src={item.source}"
-                )
-                if item.deprecated:
-                    replacement = default_stt_model(provider)
-                    if replacement and replacement != item.model:
-                        lines.append(f"      ↳ جایگزین پیشنهادی: `{replacement}`")
-                if item.available and not item.deprecated:
-                    buttons.append(
-                        [
-                            Button.inline(
-                                f"🚫 DEPRECATED · {provider}/{item.model}"[:60],
-                                f"admin:stt:mdep:{provider}:{item.model}".encode("ascii"),
-                            )
-                        ]
+            index = next(
+                (i for i, row in enumerate(rows) if str(row.model) == str(model)), None
+            )
+        except Exception:
+            return 0
+        return (index // self.MODELS_PAGE_SIZE) if index is not None else 0
+
+    async def show_models(self, event, slug: str | None = None, page: object = 0) -> None:
+        registry = STTModelRegistry(self.db, self.settings)
+        buttons: list = []
+        if slug is None:
+            # Provider picker: counts only, so the list itself can never overflow.
+            lines = [
+                "🧠 مدل‌های STT (رجیستری مدل‌ها)",
+                "",
+                "ارائه‌دهنده را انتخاب کنید (فقط خواندنی؛ همگام‌سازی خودکار ندارد):",
+            ]
+            row: list = []
+            for candidate in STT_PROVIDER_REGISTRY:
+                info = stt_registry_info(candidate)
+                if info is None:
+                    continue
+                try:
+                    count = len(await registry.cached(candidate))
+                except Exception:
+                    count = 0
+                row.append(
+                    Button.inline(
+                        f"{info.display_name} ({count})"[:60],
+                        self._page_token(candidate, 0),
                     )
-            lines.append("")
+                )
+                if len(row) == 2:
+                    buttons.append(row)
+                    row = []
+            if row:
+                buttons.append(row)
+            buttons.append([Button.inline("🎙 پلتفرم STT", b"admin:stt")])
+            await self._edit(event, "\n".join(lines), buttons)
+            return
+        info = stt_registry_info(slug)
+        if info is None:
+            await event.answer("ارائه‌دهندهٔ ناشناخته.", alert=True)
+            return
+        rows = await registry.cached(slug)
+        size = self.MODELS_PAGE_SIZE
+        pages = max(1, -(-len(rows) // size))
+        current = min(self._split_page(page), pages - 1)
+        window = rows[current * size : (current + 1) * size]
+        lines = [f"🧠 مدل‌های {info.display_name} (`{slug}`)", ""]
+        if not rows:
+            lines.append("مدل ثبت‌شده‌ای وجود ندارد.")
+        elif len(rows) > size:
+            lines.append(f"صفحهٔ {current + 1} از {pages} — {len(rows)} مدل")
+        for position, item in enumerate(window):
+            badge = "🚫 DEPRECATED" if item.deprecated else (
+                "❌ unavailable" if not item.available else "✅"
+            )
+            fa = "fa✓" if item.persian_supported else "fa✗"
+            lines.append(
+                f"   {badge} `{item.model}` [{fa}] "
+                f"quality={_fmt(item.quality_score)} free={item.free_status} "
+                f"src={item.source}"
+            )
+            if item.deprecated:
+                replacement = default_stt_model(slug)
+                if replacement and replacement != item.model:
+                    lines.append(f"      ↳ جایگزین پیشنهادی: `{replacement}`")
+            if item.available and not item.deprecated:
+                buttons.append(
+                    [
+                        Button.inline(
+                            f"🚫 DEPRECATED · {slug}/{item.model}"[:60],
+                            self._deprecate_token(slug, current, position),
+                        )
+                    ]
+                )
+        lines.append("")
         lines.append(
             "مدل deprecated حذف نمی‌شود؛ فقط از مسیر خارج می‌شود (spec §49). "
             "تغییرات کاتالوگ زنده فقط با همگام‌سازی صریح اعمال می‌شود."
         )
+        if pages > 1:
+            nav: list = []
+            if current > 0:
+                nav.append(Button.inline("◀️ قبلی", self._page_token(slug, current - 1)))
+            if current < pages - 1:
+                nav.append(Button.inline("بعدی ▶️", self._page_token(slug, current + 1)))
+            buttons.append(nav)
+        buttons.append([Button.inline("🗂 همهٔ ارائه‌دهندگان", b"admin:stt:md")])
         buttons.append([Button.inline("🎙 پلتفرم STT", b"admin:stt")])
         await self._edit(event, "\n".join(lines), buttons)
 
+    async def mark_model_at(self, event, provider: str, page: object, index: object) -> None:
+        """Toggle the model the admin actually saw, addressed by page + position.
+
+        The row is re-read from the same source the page rendered from, so an
+        action can only ever touch a row that exists on that page.
+        """
+        rows = await STTModelRegistry(self.db, self.settings).cached(provider)
+        size = self.MODELS_PAGE_SIZE
+        pages = max(1, -(-len(rows) // size))
+        current = min(self._split_page(page), pages - 1)
+        try:
+            position = int(str(index))
+        except (TypeError, ValueError):
+            position = -1
+        window = rows[current * size : (current + 1) * size]
+        if not 0 <= position < len(window):
+            await event.answer("این مدل دیگر در فهرست نیست؛ صفحه را دوباره باز کنید.", alert=True)
+            await self.show_models(event, provider)
+            return
+        await self.mark_model(event, provider, str(window[position].model))
+
     async def mark_model(self, event, provider: str, model: str) -> None:
         registry = STTModelRegistry(self.db, self.settings)
-        info = await registry.resolve(provider, model)
+        known = {str(row.model) for row in await registry.cached(provider)}
+        if model not in known:
+            # An action may only ever touch a row that exists: a stale button
+            # (or a hand-built callback) must not insert a phantom model.
+            await event.answer("این مدل دیگر در رجیستری نیست.", alert=True)
+            await self.show_models(event, provider)
+            return
+        try:
+            info = await registry.resolve(provider, model)
+        except Exception:
+            # A read that fails must surface as a message, not a traceback in
+            # the callback handler.
+            await event.answer("رجیستری STT برای این ارائه‌دهنده خوانده نشد.", alert=True)
+            return
         updated = STTModelInfo(
             provider=info.provider,
             model=info.model,
@@ -398,7 +570,9 @@ class SttPanels:
         if replacement and replacement != model:
             message += f" جایگزین پیشنهادی: {replacement}"
         await event.answer(message)
-        await self.show_models(event, provider)
+        # Stay on the page the button came from, so marking a model in the
+        # middle of a long catalog does not throw the admin back to page one.
+        await self.show_models(event, provider, await self._page_of_model(registry, provider, model))
 
     # -------------------------------------------------------------- routes
     def _route_summary_lines(self) -> list[str]:
@@ -561,7 +735,7 @@ class SttPanels:
         if info is None:
             await event.answer("ارائه‌دهندهٔ ناشناخته.", alert=True)
             return
-        models = list(dict.fromkeys(list(info.models) + [m.model for m in static_stt_models(provider)]))
+        models = self._route_model_choices(provider)
         lines = [
             f"⚙️ مدل گام «{info.display_name}» در مسیر",
             "",
@@ -569,16 +743,54 @@ class SttPanels:
             "«خودکار» مدل پیش‌فرض تنظیمات را نگه می‌دارد.",
         ]
         buttons = [
-            [Button.inline("⚙️ خودکار (بدون override)", f"admin:stt:rset:{provider}:-".encode("ascii"))]
+            [Button.inline("⚙️ خودکار (بدون override)", self._route_model_token(provider, -1, ""))]
         ]
-        for model in models:
+        for index, model in enumerate(models):
             buttons.append(
-                [Button.inline(f"🎯 {model}"[:60], f"admin:stt:rset:{provider}:{model}".encode("ascii"))]
+                [
+                    Button.inline(
+                        f"🎯 {model}"[:60],
+                        self._route_model_token(provider, index, model),
+                    )
+                ]
             )
         buttons.append([Button.inline("↩️ مسیرها", b"admin:stt:rt")])
         await self._edit(event, "\n".join(lines), buttons)
 
-    async def route_set_model(self, event, provider: str, model: str) -> None:
+    async def route_set_model(
+        self,
+        event,
+        provider: str,
+        model: str | None = None,
+        *,
+        index: object = None,
+        fingerprint: str | None = None,
+    ) -> None:
+        """Apply one route step's model, addressed by name (legacy) or by position.
+
+        Position addressing verifies the fingerprint of the row that was on screen,
+        so a click on an outdated panel is refused instead of writing whichever
+        model happens to sit at that index now.
+        """
+        if model is None:
+            choices = self._route_model_choices(provider)
+            try:
+                position = int(str(index))
+            except (TypeError, ValueError):
+                await event.answer("دستور نامعتبر.", alert=True)
+                return
+            if position >= 0:
+                if position >= len(choices):
+                    await event.answer("این فهرست عوض شده است؛ پنل را دوباره باز کنید.", alert=True)
+                    return
+                candidate = choices[position]
+                if str(fingerprint or "") != self._model_fingerprint(provider, candidate):
+                    await event.answer("این فهرست عوض شده است؛ پنل را دوباره باز کنید.", alert=True)
+                    await self.show_route_models(event, provider)
+                    return
+                model = candidate
+            else:
+                model = "-"
         admin_id = int((await event.get_sender()).id)
         rows = [dict(row) for row in await self.db.stt_routes_list()]
         found = False
@@ -605,7 +817,7 @@ class SttPanels:
         await self.show_routes(event)
 
     # -------------------------------------------------------------- quotas
-    async def show_quotas(self, event, slug: str | None = None) -> None:
+    async def show_quotas(self, event, slug: str | None = None, page: object = 0) -> None:
         margin = float(self.settings.stt_quota_safety_margin or 0.0)
         lines = [
             "📊 سهمیه‌های STT",
@@ -616,15 +828,46 @@ class SttPanels:
         ]
         buttons: list = []
         providers = [slug] if slug else list(STT_PROVIDER_REGISTRY)
+        scoped = slug is not None
+        # Providers are paged too: a full registry plus its budgets does not fit
+        # one Telegram message, and cutting the list silently is not acceptable.
+        pages = 1
+        current = 0
+        if not scoped:
+            size = self.QUOTA_PROVIDERS_PAGE_SIZE
+            pages = max(1, -(-len(providers) // size))
+            current = min(self._split_page(page), pages - 1)
+            providers = providers[current * size : (current + 1) * size]
+            if pages > 1:
+                lines.append(f"صفحهٔ {current + 1} از {pages}")
+                lines.append("")
         for provider in providers:
             info = stt_registry_info(provider)
             if info is None:
                 continue
-            budgets = await self.db.stt_quota_budgets(provider)
-            snapshots = await self.db.stt_quota_latest(provider)
+            all_budgets = await self.db.stt_quota_budgets(provider)
+            # The combined screen stays sendable: beyond a few budgets per
+            # provider the full list (and its delete buttons) lives on that
+            # provider's own screen, which is linked here. Positions are taken
+            # from the full list so both views address the same rows.
+            budgets = all_budgets
+            hidden_budgets = 0
+            if not scoped and len(budgets) > self.QUOTA_OVERVIEW_BUDGETS:
+                hidden_budgets = len(budgets) - self.QUOTA_OVERVIEW_BUDGETS
+                budgets = budgets[: self.QUOTA_OVERVIEW_BUDGETS]
+            # A page of the provider's live quotas, newest first. The total comes
+            # from the table, not from the length of the page: saying "3 of 20"
+            # when the read itself stops at 20 is a count that lies, and the old
+            # "open this provider's screen to see them all" hint promised more rows
+            # than that screen reads either.
+            snapshot_limit = (
+                self.QUOTA_SNAPSHOT_ROWS if scoped else self.QUOTA_OVERVIEW_SNAPSHOTS
+            )
+            snapshots = await self.db.stt_quota_latest(provider, limit=snapshot_limit)
+            snapshot_total = await self.db.stt_quota_count(provider)
             lines.append(f"▫️ {info.display_name} (`{provider}`)")
             if budgets:
-                for budget in budgets:
+                for position, budget in enumerate(budgets):
                     limit = budget.get("quota_limit")
                     remaining = budget.get("remaining")
                     used = None
@@ -647,8 +890,14 @@ class SttPanels:
                         [
                             Button.inline(
                                 f"✕ حذف سقف {provider}/{budget.get('quota_type')}"[:60],
-                                f"admin:stt:qdel:{provider}:{budget.get('account_scope')}:{budget.get('quota_type')}".encode(
-                                    "ascii"
+                                self._budget_token(
+                                    provider,
+                                    # ``budgets`` is a prefix of ``all_budgets`` in
+                                    # both views, so this position is the index the
+                                    # resolver looks up in the provider's full list.
+                                    position,
+                                    str(budget.get("account_scope") or ""),
+                                    str(budget.get("quota_type") or ""),
                                 ),
                             )
                         ]
@@ -656,7 +905,19 @@ class SttPanels:
             else:
                 lines.append("   سقف (budget): Unknown — سقفی ثبت نشده است.")
             if snapshots:
-                for snapshot in snapshots[:3]:
+                shown = snapshots
+                if snapshot_total > len(shown):
+                    if scoped:
+                        lines.append(
+                            f"   20 مشاهدهٔ اخیر از {snapshot_total} نمایش داده می‌شود؛ "
+                            "ادامه در جدول stt_quota_snapshots است."
+                        )
+                    else:
+                        lines.append(
+                            f"   آخرین {len(shown)} از {snapshot_total} مشاهدهٔ سهمیهٔ این "
+                            "ارائه‌دهنده (سقف‌ها و مابقی مشاهده‌ها در صفحهٔ همین ارائه‌دهنده)."
+                        )
+                for snapshot in shown:
                     lines.append(
                         f"   مشاهده: {snapshot.get('quota_type')} limit={_fmt(snapshot.get('quota_limit'))} "
                         f"used={_fmt(snapshot.get('used'))} remaining={_fmt(snapshot.get('remaining'))}"
@@ -668,6 +929,18 @@ class SttPanels:
                     )
             else:
                 lines.append("   مشاهدهٔ زنده: Unknown — هیچ هدری ثبت نشده است.")
+            if hidden_budgets:
+                lines.append(
+                    f"   {hidden_budgets} سقف دیگر برای همین ارائه‌دهنده ثبت شده است."
+                )
+                buttons.append(
+                    [
+                        Button.inline(
+                            f"🧮 همهٔ سقف‌های {info.display_name}"[:60],
+                            f"admin:stt:qt:{provider}".encode("ascii"),
+                        )
+                    ]
+                )
             buttons.append(
                 [
                     Button.inline(
@@ -677,6 +950,18 @@ class SttPanels:
                 ]
             )
             lines.append("")
+        if not scoped and pages > 1:
+            nav: list = []
+            if current > 0:
+                nav.append(
+                    Button.inline("◀️ قبلی", f"admin:stt:qtp:{current - 1}".encode("ascii")[:64])
+                )
+            if current + 1 < pages:
+                nav.append(
+                    Button.inline("بعدی ▶️", f"admin:stt:qtp:{current + 1}".encode("ascii")[:64])
+                )
+            if nav:
+                buttons.append(nav)
         buttons.append([Button.inline("🎙 پلتفرم STT", b"admin:stt")])
         await self._edit(event, "\n".join(lines), buttons)
 
@@ -730,6 +1015,35 @@ class SttPanels:
         await event.reply("سقف سهمیه ثبت شد.")
         await self.show_quotas(event, provider)
 
+    async def budget_delete_at(self, event, provider: str, position: object, fingerprint: str | None = None) -> None:
+        """Delete the budget row this keyboard listed at ``position``.
+
+        A fingerprint that no longer matches means the list changed under the
+        admin: the write is refused and the screen is redrawn, so a stale keyboard
+        can never delete a different row than the one it displayed.
+        """
+        rows = await self.db.stt_quota_budgets(provider)
+        try:
+            index = int(str(position))
+        except (TypeError, ValueError):
+            index = -1
+        if not 0 <= index < len(rows):
+            await event.answer("این سقف دیگر در فهرست نیست؛ صفحه را تازه کنید.", alert=True)
+            await self.show_quotas(event, provider)
+            return
+        row = rows[index]
+        if fingerprint is not None:
+            current = self._budget_fingerprint(
+                provider, str(row.get("account_scope") or ""), str(row.get("quota_type") or "")
+            )
+            if current != str(fingerprint):
+                await event.answer("فهرست سقف‌ها عوض شده است؛ صفحه تازه شد.", alert=True)
+                await self.show_quotas(event, provider)
+                return
+        await self.budget_delete(
+            event, provider, str(row.get("account_scope") or ""), str(row.get("quota_type") or "")
+        )
+
     async def budget_delete(self, event, provider: str, scope: str, quota_type: str) -> None:
         admin_id = int((await event.get_sender()).id)
         deleted = await self.db.stt_quota_budget_delete(
@@ -773,10 +1087,35 @@ class SttPanels:
         await self.show_health(event)
 
     # ---------------------------------------------------------------- logs
-    async def show_logs(self, event, failures_only: bool = False) -> None:
-        rows = await self.db.stt_events_list(limit=40, failures_only=failures_only)
+    #: Event rows per page (bounded: no unlimited history per redraw).
+    LOGS_PAGE_SIZE = 14
+    #: The unscoped quota screen summarizes; full lists live on the provider screen.
+    QUOTA_OVERVIEW_BUDGETS = 4
+    QUOTA_PROVIDERS_PAGE_SIZE = 3
+    QUOTA_OVERVIEW_SNAPSHOTS = 3
+    #: Quota rows read by one provider's own screen.
+    QUOTA_SNAPSHOT_ROWS = 20
+
+    async def show_logs(
+        self, event, failures_only: bool = False, page: object = 0
+    ) -> None:
+        size = self.LOGS_PAGE_SIZE
+        current = self._split_page(page)
+        rows = await self.db.stt_events_list(
+            limit=size, failures_only=failures_only, offset=current * size
+        )
+        # One cheap count query buys the page indicator; the alternative was a
+        # flat "last 40" list that hid everything older with no way back.
+        total = await self.db.stt_events_count(failures_only=failures_only)
+        pages = max(1, -(-total // size))
+        if current > pages - 1:
+            current = pages - 1
+            rows = await self.db.stt_events_list(
+                limit=size, failures_only=failures_only, offset=current * size
+            )
         lines = [
-            "📜 رویدادهای STT (stt_provider_events)",
+            "📜 رویدادهای STT (stt_provider_events)"
+            + (f" — صفحهٔ {current + 1} از {pages} ({total} رویداد)" if pages > 1 else ""),
             "",
             "رویدادها فقط فرادادهٔ عملیاتی دارند؛ متن ترنسکریپت، صدا و کلید هرگز ثبت نمی‌شوند.",
             "",
@@ -795,9 +1134,22 @@ class SttPanels:
                 Button.inline("فقط خطاها" if not failures_only else "همه", b"admin:stt:lgerr"
                               if not failures_only else b"admin:stt:lg"),
             ],
-            [Button.inline("🎙 پلتفرم STT", b"admin:stt")],
         ]
+        if pages > 1:
+            nav: list = []
+            if current > 0:
+                nav.append(self._logs_button(current - 1, failures_only, "◀️ قبلی"))
+            if current < pages - 1:
+                nav.append(self._logs_button(current + 1, failures_only, "بعدی ▶️"))
+            buttons.append(nav)
+        buttons.append([Button.inline("🎙 پلتفرم STT", b"admin:stt")])
         await self._edit(event, "\n".join(lines), buttons)
+
+    @staticmethod
+    def _logs_button(page: int, failures_only: bool, label: str) -> Button:
+        return Button.inline(
+            label, f"admin:stt:lgp:{page}:{1 if failures_only else 0}".encode("ascii")
+        )
 
     # ----------------------------------------------------------- test tool
     async def show_test(self, event, slug: str | None = None) -> None:
@@ -1146,9 +1498,11 @@ async def handle_stt_callback(bot, event, data: str) -> None:
     elif action == "pbl" and arg1 and arg2:
         await ui.set_billing_state(event, arg1, arg2)
     elif action == "md" and arg1:
-        await ui.show_models(event, arg1)
+        await ui.show_models(event, arg1, arg2)
     elif action == "md":
         await ui.show_models(event)
+    elif action == "mdep" and arg1 and arg2 is not None and arg3 is not None:
+        await ui.mark_model_at(event, arg1, arg2, arg3)
     elif action == "mdep" and arg1 and arg2:
         await ui.mark_model(event, arg1, arg2)
     elif action == "rt":
@@ -1165,12 +1519,17 @@ async def handle_stt_callback(bot, event, data: str) -> None:
         await ui.route_add(event, arg1)
     elif action == "rmd" and arg1:
         await ui.show_route_models(event, arg1)
+    elif action == "rset" and arg1 and arg2 is not None and arg3 is not None:
+        await ui.route_set_model(event, arg1, index=arg2, fingerprint=arg3)
     elif action == "rset" and arg1 and arg2 is not None:
+        # A button from an older message still carries the model id itself.
         await ui.route_set_model(event, arg1, arg2)
     elif action == "qt" and arg1:
         await ui.show_quotas(event, arg1)
     elif action == "qt":
         await ui.show_quotas(event)
+    elif action == "qtp":
+        await ui.show_quotas(event, None, arg1)
     elif action == "qset" and arg1:
         bot._pending_admin_actions[int((await event.get_sender()).id)] = f"stt_budget:{arg1}"
         await bot._edit_callback(
@@ -1178,6 +1537,8 @@ async def handle_stt_callback(bot, event, data: str) -> None:
             ui.budget_prompt(arg1),
             [[Button.inline("لغو", b"admin:stt:qt")]],
         )
+    elif action == "qdx" and arg1 and arg2 is not None:
+        await ui.budget_delete_at(event, arg1, arg2, arg3)
     elif action == "qdel" and arg1 and arg2 and arg3:
         await ui.budget_delete(event, arg1, arg2, arg3)
     elif action == "he":
@@ -1186,6 +1547,8 @@ async def handle_stt_callback(bot, event, data: str) -> None:
         await ui.refresh_health(event)
     elif action == "lgerr":
         await ui.show_logs(event, failures_only=True)
+    elif action == "lgp" and arg1 is not None:
+        await ui.show_logs(event, failures_only=(arg2 == "1"), page=arg1)
     elif action == "lg":
         await ui.show_logs(event)
     elif action == "tst" and arg1:
