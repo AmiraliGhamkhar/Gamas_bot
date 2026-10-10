@@ -9,10 +9,15 @@
   three, `chunk_char_budget` which sat **inside** the plan panel's per-leg loop and
   was therefore looked up once per route on every redraw. Each of the three was
   provably safe (the module already imported those submodules at top level, so the
-  laziness bought nothing) and the deferred `from .stt import …` in `admin_stt.py`
-  was left alone, because that one does break an import cycle. This is clarity, not
-  a measured speed-up: the import machinery is a dictionary lookup, and no number is
-  claimed for it.
+  laziness bought nothing). The deferred `from .stt import …` calls in `admin_stt.py`
+  were left alone **after testing the reason**: hoisting them would *not* create an
+  import cycle — `gamas_bot.stt` and everything it pulls in never reach
+  `gamas_bot.bot`, and `admin_stt` imports on its own — but the STT runtime drags in
+  aiohttp, `stt_platform` and `structuring`, and the offline consumers that import
+  the panel alone (the benchmark harness, `tests/test_admin_stt.py`) currently do not
+  pay for that, while `bot.py` imports `.stt` at top level anyway. No upside, so no
+  change. None of this is a measured speed-up either: an import is a dictionary
+  lookup, and no number is claimed for it.
 * **The note route is now Nara first, OpenRouter second.** `DEFAULT_NOTE_ORDER`
   is `nara → openrouter → gemini → groq → mistral → sambanova → zai → nvidia →
   cloudflare`, seeded for all four note tasks plus the health and benchmark
