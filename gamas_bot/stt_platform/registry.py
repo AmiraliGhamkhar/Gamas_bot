@@ -908,11 +908,13 @@ PROVIDER_PRIVACY: dict[str, dict[str, str]] = {
 
 def _with_evidence(info: STTProviderInfo) -> STTProviderInfo:
     evidence = PROVIDER_EVIDENCE.get(info.provider_slug, "unverified")
+    privacy = PROVIDER_PRIVACY.get(info.provider_slug, {})
     return replace(
         info,
         evidence=evidence,
         last_verified_at=VERIFIED_AT if evidence in _OFFICIAL_EVIDENCE else "unverified",
-        **PROVIDER_PRIVACY.get(info.provider_slug, {}),
+        data_training_policy=privacy.get("data_training_policy", info.data_training_policy),
+        data_region=privacy.get("data_region", info.data_region),
     )
 
 
