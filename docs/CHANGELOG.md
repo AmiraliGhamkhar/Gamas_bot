@@ -75,6 +75,20 @@
   digits-only, anything else falls back to page one, and an out-of-range page clamps to the last
   real page rather than rendering an empty screen.
 
+* **One long label could silence a whole screen: the 64-unit button limit.** Telegram counts an
+  inline button's text in UTF-16 code units, and one oversized button does not render small — the
+  entire message is rejected. The purchase button interpolated `plan['name']` (the schema accepts
+  60 characters; the seeded names need only 35–37 units next to a price, so the headroom read as
+  infinite) and the provider-health button interpolated a credential `label`, which is stored with
+  a whitespace pass and **no length check at all**. Both now go through `button_label()`, added in
+  `telegram_text.py` beside the message pager that already counts units; the purchase button
+  reserves the price *outside* the clamp, so shortening a name can never hide what a plan costs,
+  and the full name is still in the message body. `tests/test_button_labels.py` pins the helper
+  (exact budget, emoji counting, trailing whitespace, the empty-label floor, a rejected impossible
+  budget) and both screens through the shipped renderers. Three labels that were already shortened
+  by hand (`label[:16]`, `model.model_id[:32]`, `model_id[:26]`) cannot overflow and were left as
+  they are — restyling them would be uniformity for its own sake.
+
 * **`/history` let a ten-row window pose as the whole record.** `payment_history()` is capped at
   the ten newest requests by design, but the heading was a bare «سوابق پرداخت:», so from the
   eleventh payment on the user could conclude that the list was everything they had ever bought.

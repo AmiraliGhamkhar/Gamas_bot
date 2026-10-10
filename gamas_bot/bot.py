@@ -20,9 +20,11 @@ from telethon.tl.types import MessageMediaWebPage
 
 from .config import Settings
 from .telegram_text import (  # noqa: F401 - re-exported for backward compatibility
+    BUTTON_LABEL_LIMIT,
     MESSAGE_CHUNK_SIZE,
     MIN_CHUNK_SIZE,
     TELEGRAM_TEXT_LIMIT,
+    button_label,
     _emphasis_is_nested,
     _plain_length,
     _split_rendered,
@@ -1047,10 +1049,17 @@ class StudyBot:
                 f"• {plan['name']} — {format_duration(plan['included_seconds'])}، "
                 f"{format_toman(plan['price_toman'])}، {format_validity(plan['validity_days'])}"
             )
+            # A plan name is stored up to 60 characters, so «خرید …» plus a price
+            # does not fit one button. Everything but the name is fixed, so the
+            # name gets whatever is left of the 64-unit budget and never the price
+            # — that is the number a purchase decision is made on.
+            price_text = format_toman(plan["price_toman"])
+            name_budget = max(BUTTON_LABEL_LIMIT - _utf16_length(" — " + price_text), 12)
+            buy_label = button_label("خرید " + str(plan["name"]), name_budget)
             buttons.append(
                 [
                     Button.inline(
-                        f"خرید {plan['name']} — {format_toman(plan['price_toman'])}",
+                        f"{buy_label} — {price_text}",
                         f"billing:buy:{plan['code']}",
                     )
                 ]
@@ -1542,7 +1551,10 @@ class StudyBot:
                 buttons.append(
                     [
                         Button.inline(
-                            f"🧪 تست {result.label} ({result.masked})",
+                            # A credential label is free text with no stored length
+                            # limit; without the clamp one long label stops the whole
+                            # health panel from sending.
+                            button_label(f"🧪 تست {result.label} ({result.masked})"),
                             f"admin:health:test:{result.credential_id}",
                         )
                     ]
