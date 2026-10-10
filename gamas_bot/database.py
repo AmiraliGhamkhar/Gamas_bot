@@ -3259,8 +3259,20 @@ class Database:
             )
 
     async def stt_quota_latest(
-        self, provider: str, quota_type: str | None = None, *, account_scope: str | None = None
+        self,
+        provider: str,
+        quota_type: str | None = None,
+        *,
+        account_scope: str | None = None,
+        limit: int = 20,
     ) -> list[dict[str, Any]]:
+        """The provider's live quota rows, newest observation first.
+
+        ``stt_quota_upsert`` keeps exactly one row per
+        ``(provider, account_scope, model, quota_type)``, so a row is a live quota
+        rather than a history entry and this list is a page of distinct quotas.
+        The page is bounded; :meth:`stt_quota_count` is how many there are.
+        """
         query = "SELECT * FROM stt_quota_snapshots WHERE provider=?"
         params: list[Any] = [provider]
         if quota_type:
@@ -3269,10 +3281,24 @@ class Database:
         if account_scope:
             query += " AND account_scope=?"
             params.append(account_scope)
-        query += " ORDER BY observed_at DESC, id DESC LIMIT 20"
+        query += " ORDER BY observed_at DESC, id DESC LIMIT ?"
+        params.append(max(1, int(limit)))
         async with self._lock:
             cursor = await self._db().execute(query, tuple(params))
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def stt_quota_count(
+        self, provider: str, *, account_scope: str | None = None
+    ) -> int:
+        """How many quota rows a provider holds (the page above is a slice of it)."""
+        query = "SELECT COUNT(*) FROM stt_quota_snapshots WHERE provider=?"
+        params: list[Any] = [provider]
+        if account_scope:
+            query += " AND account_scope=?"
+            params.append(account_scope)
+        async with self._lock:
+            cursor = await self._db().execute(query, tuple(params))
+            return int((await cursor.fetchone())[0] or 0)
 
     async def stt_quota_set_budget(
         self,

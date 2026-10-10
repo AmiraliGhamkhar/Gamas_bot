@@ -90,6 +90,17 @@
   for the "no ready key" case (an unattested key stays flagged; attesting it
   clears the warning). The redraw pays `plan()` for it: 2.9 ms → ~73 ms in the
   benchmark database, database-only, no provider request.
+* **The STT quota screen invented its own total.** `stt_quota_latest()` ended in a hard
+  ``LIMIT 20``, the combined overview sliced that to its three display rows, and the note
+  beside them printed the length of the *read* — so a provider holding more than twenty
+  quota rows was told «آخرین 3 از 20», and the advice to open the provider's own screen to
+  see the rest led to a screen running the same 20-row read. `Database.stt_quota_count()`
+  now supplies the real total (`stt_quota_latest()` takes an explicit `limit`, default kept
+  at 20), `admin_stt.QUOTA_SNAPSHOT_ROWS` bounds the provider screen and says
+  «20 مشاهدهٔ اخیر از N … ادامه در جدول stt_quota_snapshots است» when it cuts, and the
+  overview states «آخرین 3 از N مشاهدهٔ سهمیهٔ این ارائه‌دهنده». Three tests in
+  `SttPanelTests` pin the counted label, the row count actually rendered, and that short
+  history carries no cut note at all.
 * **A sampled p95 was printed as if it described the whole window.** `ai_usage_overview()`
   reads at most `Database.LATENCY_PERCENTILE_SAMPLE` (5 000) newest rows for the
   percentile — by design, so a busy day does not sort every latency in Python — and it

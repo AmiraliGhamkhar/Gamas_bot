@@ -786,7 +786,16 @@ class SttPanels:
             if not scoped and len(budgets) > self.QUOTA_OVERVIEW_BUDGETS:
                 hidden_budgets = len(budgets) - self.QUOTA_OVERVIEW_BUDGETS
                 budgets = budgets[: self.QUOTA_OVERVIEW_BUDGETS]
-            snapshots = await self.db.stt_quota_latest(provider)
+            # A page of the provider's live quotas, newest first. The total comes
+            # from the table, not from the length of the page: saying "3 of 20"
+            # when the read itself stops at 20 is a count that lies, and the old
+            # "open this provider's screen to see them all" hint promised more rows
+            # than that screen reads either.
+            snapshot_limit = (
+                self.QUOTA_SNAPSHOT_ROWS if scoped else self.QUOTA_OVERVIEW_SNAPSHOTS
+            )
+            snapshots = await self.db.stt_quota_latest(provider, limit=snapshot_limit)
+            snapshot_total = await self.db.stt_quota_count(provider)
             lines.append(f"▫️ {info.display_name} (`{provider}`)")
             if budgets:
                 for position, budget in enumerate(budgets):
@@ -827,12 +836,18 @@ class SttPanels:
             else:
                 lines.append("   سقف (budget): Unknown — سقفی ثبت نشده است.")
             if snapshots:
-                shown = snapshots if scoped else snapshots[: self.QUOTA_OVERVIEW_SNAPSHOTS]
-                if len(snapshots) > len(shown):
-                    lines.append(
-                        f"   آخرین {len(shown)} مشاهده از {len(snapshots)} نمایش داده می‌شود "
-                        f"(برای دیدن همه، صفحهٔ همین ارائه‌دهنده را باز کنید)."
-                    )
+                shown = snapshots
+                if snapshot_total > len(shown):
+                    if scoped:
+                        lines.append(
+                            f"   20 مشاهدهٔ اخیر از {snapshot_total} نمایش داده می‌شود؛ "
+                            "ادامه در جدول stt_quota_snapshots است."
+                        )
+                    else:
+                        lines.append(
+                            f"   آخرین {len(shown)} از {snapshot_total} مشاهدهٔ سهمیهٔ این "
+                            "ارائه‌دهنده (سقف‌ها و مابقی مشاهده‌ها در صفحهٔ همین ارائه‌دهنده)."
+                        )
                 for snapshot in shown:
                     lines.append(
                         f"   مشاهده: {snapshot.get('quota_type')} limit={_fmt(snapshot.get('quota_limit'))} "
@@ -1009,6 +1024,8 @@ class SttPanels:
     QUOTA_OVERVIEW_BUDGETS = 4
     QUOTA_PROVIDERS_PAGE_SIZE = 3
     QUOTA_OVERVIEW_SNAPSHOTS = 3
+    #: Quota rows read by one provider's own screen.
+    QUOTA_SNAPSHOT_ROWS = 20
 
     async def show_logs(
         self, event, failures_only: bool = False, page: object = 0

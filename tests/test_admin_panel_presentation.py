@@ -1150,6 +1150,52 @@ class SttPanelTests(PanelCase):
             self.payloads(),
         )
 
+    async def _seed_stt_quotas(self, provider: str, count: int) -> None:
+        for index in range(count):
+            await self.db.stt_quota_upsert(
+                {
+                    "provider": provider,
+                    "account_scope": "provider",
+                    "model": "",
+                    "quota_type": f"qt{index:02d}",
+                    "limit": 100.0,
+                    "used": 10.0,
+                    "remaining": 90.0,
+                    "reset_at": None,
+                    "source": "headers",
+                }
+            )
+
+    async def test_quota_overview_counts_snapshots_beyond_its_page(self) -> None:
+        await self._seed_stt_quotas("groq", 5)
+        page = list(STT_PROVIDER_REGISTRY).index("groq") // SttPanels.QUOTA_PROVIDERS_PAGE_SIZE
+        await self._callback(f"admin:stt:qtp:{page}")
+        text = self.last_text
+        # The digest shows three rows; the sentence next to it must count the
+        # table, not the length of the read.
+        self.assertIn(f"آخرین {SttPanels.QUOTA_OVERVIEW_SNAPSHOTS} از 5 مشاهدهٔ سهمیهٔ این", text)
+
+    async def test_scoped_quota_screen_states_a_real_total_past_the_read_cap(self) -> None:
+        await self._seed_stt_quotas("groq", 25)
+        await self._callback("admin:stt:qt:groq")
+        text = self.last_text
+        self.assertIn("20 مشاهدهٔ اخیر از 25 نمایش داده می‌شود", text)
+        # the old wording promised a total of 20 (its own read cap) and told the
+        # admin the provider screen would show them all — which read 20 as well
+        self.assertNotIn("از 20 نمایش داده می‌شود", text)
+        self.assertNotIn("برای دیدن همه", text)
+        self.assertEqual(
+            len([line for line in text.split("\n") if line.startswith("   مشاهده:")]), 20
+        )
+
+    async def test_short_quota_history_gets_no_cut_label(self) -> None:
+        await self._seed_stt_quotas("groq", 2)
+        await self._callback("admin:stt:qt:groq")
+        text = self.last_text
+        self.assertNotIn("مشاهدهٔ اخیر از", text)
+        # every row the read returned is rendered (two display lines each)
+        self.assertEqual(len([line for line in text.split("\n") if line.startswith("   مشاهده:")]), 2)
+
     async def test_marking_a_model_returns_to_its_page(self):
         await self._seed_stt_models(count=14)
         await self._callback("admin:stt:md:groq:1")

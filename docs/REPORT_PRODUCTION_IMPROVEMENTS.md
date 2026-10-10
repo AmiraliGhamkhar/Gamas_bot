@@ -29,6 +29,7 @@ this workspace; nothing here is a projection.
 | 17 | Three read-only digests sliced a list that was not yet the thing they described: `show_provider_detail` printed `quotas[:3]` of a 20-row read of `ai_quota_latest()` (one row per key/model/window, so it dropped quotas entirely); the health panel took `results[:12]` from the **mixed AI+STT** cache and filtered by service *afterwards*, so STT probes could evict every AI row from the AI panel; `show_settings` sliced `list(overrides.items())[:8]` before the flag filter, so a ninth provider disappeared and a heading could print over an empty list | An admin read three quotas as the provider's whole quota picture, saw a nearly empty health panel that actually had data, and missed an admin-imposed block in the settings digest — all silent, none of them labelled |
 | 18 | `admin_user_credit_overview()` computed the admin's view of a user's balance as a **Python sum over the newest 50 entitlement rows**, and the screen then sliced that list again (`entitlements[:10]`, `usage[:8]`) under headings that promised the history. The docstring claimed the split "comes from the same entitlement rows the reservation engine consumes, so the screen can never disagree with billing" — it could: `user_balance()` aggregates every spendable row with no window | On a user with 57 entitlement rows and one old 900-second grant still spendable, the panel showed **0** paid seconds while the reservation engine would happily spend 900: the admin judging a refund saw a different number than the one billing used. Not-yet-started grants were counted as spendable, the opposite disagreement | **Fixed** |
 | 19 | The latency percentile is deliberately sampled — `ai_usage_overview()` reads at most `LATENCY_PERCENTILE_SAMPLE` (5 000) newest rows instead of materialising every latency — and the database exposed `latency_samples`, but **no panel consumed it**: three screens printed «تأخیر p95: X ms» next to «درخواست‌های امروز: N», so on a day with more than 5 000 requests an admin compared a *sample* percentile against a full-window counter and nothing marked the difference | The p95 an operator uses to judge a provider's tail latency was silently the p95 of whatever 5 000 requests happened to be newest — the same "bounded read presented as the whole" class as defects 9, 15, 16 and 17, on a number people make routing decisions with. Note the subtlety: `latency_samples < requests` is **not** the signal (rows can legitimately have no latency recorded); the honest signal is that the read saturated |
+| 20 | The STT quota screen stated a total it had invented: `stt_quota_latest()` ended in a hard `LIMIT 20`, the overview sliced that to `[:3]`, and the label printed `len(snapshots)` — so a provider with more than 20 quota rows read «آخرین 3 از 20» — while the advice in the same line, «برای دیدن همه، صفحهٔ همین ارائه‌دهنده را باز کنید», pointed at a screen that applied the very same 20-row read and so could not show them either | An admin debugging a quota problem was told a number that was the size of the read, and was sent to a screen that would silently repeat the cut; on a provider with per-model quotas (the table is unique per account_scope/model/quota_type, so 25 rows is ordinary) the history looked finite and reachable when it was neither |
 
 Every item above is fixed. Defects 12-15 were found after the main commit and
 closed in the commits that follow it (`0251f0c` bound the quota screen,
@@ -48,7 +49,7 @@ glyph — the honest caveat is in §8.
 | `gamas_bot/provider_health.py` | `snapshot()` / `cached()` / `invalidate()` so redraws need no network |
 | `gamas_bot/bot.py` | Ack-before-read, `_arm_answer_once` + idempotent `_edit_callback`; user menu (ساخت جزوه primary, merged help/formats, merged balance/subscription, privacy kept); five admin sections; users, credential, payment, plan and special-user screens paged with counted totals (one `_admin_page` parser, `_page_arg` accepts digit-only page tokens so `admin:special:add` still routes to its own branch); network-free health panel; a page of receipts no longer re-reads each row through `payment_detail`; the `/users` export titled against `stats()["users"]` when it is only a prefix, with `USERS_EXPORT_ROWS` as the single source for the row count; the credit screen's two history headings now state «۱۰ مورد از N سابقه» via `_credit_history_heading`, the redundant `[:10]`/`[:8]` slices are gone, and `admin:credits:` joins the ack-first set; the overview AI line appends `latency_sample_note()` so a sampled p95 is labelled |
 | `gamas_bot/admin_ai.py` | `MODELS_PAGE_SIZE=10`, `LOGS_PAGE_SIZE=14`, `KEYS_PAGE_SIZE=12`; merged overview metrics; `show_routes(task_type)` via `_route_callback`; uncut addable list; `stale_rows` gate for the live catalog read; `_SKIP_REASON_FA`; log pages with an authoritative total and a clamped stale page; paged key screens with service filter preserved; unusable route rows annotated from `plan()` / `credentials_for()`; quota digest bounded by `len(PROVIDER_REGISTRY)` instead of a silent `[:4]`; `BENCHMARK_ROWS` plus a probe row that labels the cut; counts rendered with `to_persian_digits`; `QUOTA_ROWS` for the provider-detail quota block (the OpenRouter local ledger moved out of the counted group so the statements about it stay true); `HEALTH_ROWS` with the service filter applied *before* the cap; admin overrides built line-by-line and the heading suppressed when no provider carries a flag; both p95 lines carry `latency_sample_note()` — «(نمونه: 5/000 درخواست اخیر)» whenever the sample was capped |
-| `gamas_bot/admin_stt.py` | Paged model catalog and log list (`_page_token`/`_split_page`/`_logs_button`), `mark_model` phantom-row guard, paged quota overview (`admin:stt:qtp:{page}`, 3 providers × 4 budgets) with the folded counts stated in the text |
+| `gamas_bot/admin_stt.py` | Paged model catalog and log list (`_page_token`/`_split_page`/`_logs_button`), `mark_model` phantom-row guard, paged quota overview (`admin:stt:qtp:{page}`, 3 providers × 4 budgets) with the folded counts stated in the text; the snapshot note now counts the table (`stt_quota_count`) instead of the page, `QUOTA_SNAPSHOT_ROWS` bounds the provider's own screen and says so when it cuts |
 | `scripts/benchmark_admin_panels.py` | New, committed, offline benchmark that measures BEFORE and AFTER query shapes, every panel render and `router.plan()` in one process |
 | `tests/test_route_seed_upgrade.py` (new, 20 tests + 19 subtests) | Seeding/migration contract |
 | `tests/test_route_failover_eligibility.py` (new, 11 tests) | Eligibility, 429/5xx, cooldown, invalid-credential rotation, per-key quota rotation, attribution, reservation release, leg deadline, FREE_ONLY / unknown-billing blocking |
@@ -186,6 +187,12 @@ usage_ledger USING COVERING INDEX idx_usage_ledger_user_created (user_id=?)`
 and `SEARCH e USING INDEX idx_entitlements_balance_order (user_id=? AND
 status=?)`. No new index.
 
+The STT quota screen's honest total costs one covering-index `COUNT` per provider on
+the page: measured at 3 providers × 25 quota rows, **1.02 → 1.56 ms** per overview
+render, while the row read itself got *smaller* (three rows displayed instead of twenty
+fetched and then sliced). `EXPLAIN QUERY PLAN` for the count: `SEARCH stt_quota_snapshots
+USING COVERING INDEX idx_stt_quota_latest (provider=?)`. No new index.
+
 The sampled-percentile label costs nothing: `latency_sample_capped` is a
 comparison on rows the read already fetched, and the note is one suffix on three
 existing lines. The cap itself stays — removing it would mean sorting every
@@ -195,8 +202,8 @@ longer be read as a window statistic when it is not one.
 ## 7. Exact test commands and actual results
 
 ```
-/home/user/venv/bin/python -m pytest tests/ -q      → 1183 passed, 1 skipped, 1821 subtests in 141.16 s
-/home/user/venv/bin/python -m unittest discover -s tests → Ran 1184 tests, OK (skipped=1), 135.2 s
+/home/user/venv/bin/python -m pytest tests/ -q      → 1186 passed, 1 skipped, 1821 subtests in 143.30 s
+/home/user/venv/bin/python -m unittest discover -s tests → Ran 1187 tests, OK (skipped=1), 144.0 s
 /home/user/venv/bin/python -m scripts.validate_docx → PASSED: 0 structural failure(s)
 /home/user/venv/bin/python -m ruff check .          → All checks passed!
 /home/user/venv/bin/python -m compileall -q gamas_bot scripts tests passenger_wsgi.py → OK
@@ -213,8 +220,8 @@ longer be read as a window statistic when it is not one.
     depending on sandbox load
 ```
 
-Baseline before the work was `1076 passed, 1 skipped, 1793 subtests`. **107 tests
-were added and the pre-existing failure count stayed zero** (1076 + 107 = 1183
+Baseline before the work was `1076 passed, 1 skipped, 1793 subtests`. **110 tests
+were added and the pre-existing failure count stayed zero** (1076 + 110 = 1186
 passing, the same one skip throughout, and 28 more subtests). No live or billable provider call was made and no real
 credential was used anywhere: the credential tests run against Fernet-encrypted
 rows in temporary SQLite files with fake key material.
