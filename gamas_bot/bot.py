@@ -976,7 +976,10 @@ class StudyBot:
         )
         if entitlements:
             lines.append("\nاعتبارهای فعال:")
-            for entitlement in entitlements:
+            # Soonest to expire first, and a counted remainder instead of an
+            # unbounded list: `available_seconds` above already covers every row.
+            shown = entitlements[: self.ACCOUNT_ENTITLEMENT_ROWS]
+            for entitlement in shown:
                 expiry = (
                     "بدون انقضا"
                     if not entitlement["expires_at"]
@@ -985,6 +988,12 @@ class StudyBot:
                 lines.append(
                     f"• {entitlement['plan_name']}: "
                     f"{format_duration(entitlement['remaining_seconds'])} ({expiry})"
+                )
+            hidden = len(entitlements) - len(shown)
+            if hidden:
+                lines.append(
+                    f"… و {to_persian_digits(hidden)} اعتبار فعال دیگر — مجموع بالا "
+                    "همهٔ آن‌ها را می‌شمارد."
                 )
         else:
             lines.append(
@@ -1010,13 +1019,30 @@ class StudyBot:
         buttons.append([Button.inline("🔐 حریم خصوصی", b"menu:privacy")])
         await self._edit_callback(event, "\n".join(lines), buttons)
 
-    async def _billing_plans(self) -> tuple[str, list]:
+    async def _billing_plans(self, page: int = 0) -> tuple[str, list]:
+        """Purchasable plans, a page at a time.
+
+        Every enabled paid plan used to be rendered into one message with one
+        button each: with the six-plan default that is invisible, and once an
+        admin had created a few dozen the screen simply stopped sending — the
+        user could not buy anything at all. `list_plans` orders by
+        (sort_order, id), so a page is a stable window and the plan an admin put
+        first is the plan a user sees first.
+        """
         plans = await self.db.list_plans(paid_only=True)
         if not plans:
             return "در حال حاضر طرح پرداختی فعالی نیست.", [[Button.inline("↩️ منوی اصلی", b"menu:home")]]
+        pages = max(1, -(-len(plans) // self.USER_PLAN_PAGE))
+        page = min(max(0, int(page)), pages - 1)
+        window = plans[page * self.USER_PLAN_PAGE : (page + 1) * self.USER_PLAN_PAGE]
         lines = ["طرح‌های اعتبار پیش‌پرداختی 💳"]
+        if pages > 1:
+            lines.append(
+                f"({to_persian_digits(len(plans))} طرح فعال — صفحهٔ "
+                f"{to_persian_digits(page + 1)} از {to_persian_digits(pages)})"
+            )
         buttons = []
-        for plan in plans:
+        for plan in window:
             lines.append(
                 f"• {plan['name']} — {format_duration(plan['included_seconds'])}، "
                 f"{format_toman(plan['price_toman'])}، {format_validity(plan['validity_days'])}"
@@ -1029,6 +1055,13 @@ class StudyBot:
                     )
                 ]
             )
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"billing:plans:{page - 1}"))
+        if page + 1 < pages:
+            nav.append(Button.inline("طرح‌های بیشتر ▶️", f"billing:plans:{page + 1}"))
+        if nav:
+            buttons.append(nav)
         buttons.append([Button.inline("↩️ منوی اصلی", b"menu:home")])
         return "\n".join(lines), buttons
 
@@ -1972,8 +2005,9 @@ class StudyBot:
                     ],
                 )
                 return
-            if data == "billing:plans":
-                text, buttons = await self._billing_plans()
+            if data == "billing:plans" or data.startswith("billing:plans:"):
+                page = self._page_arg(data, "billing:plans:")
+                text, buttons = await self._billing_plans(self._admin_page(page))
                 await self._edit_callback(event, text, buttons)
                 return
             if data.startswith("billing:buy:"):
@@ -2007,7 +2041,7 @@ class StudyBot:
             # panel reads. These panels parse nothing, so nothing that would
             # need an alert toast is displaced by the early answer.
             await self._ack(event)
-        payments_page = self._page_arg(data, "payments")
+        payments_page = self._page_arg(data, "admin:payments:")
         if data == "admin:payments" or payments_page is not None:
             await self._show_pending_payments(event, payments_page)
             return
@@ -2023,7 +2057,7 @@ class StudyBot:
                 return
             await self._payment_callback(event, telegram_id, parts[2], payment_id)
             return
-        special_page = self._page_arg(data, "special")
+        special_page = self._page_arg(data, "admin:special:")
         if data == "admin:special" or special_page is not None:
             self._pending_admin_actions.pop(telegram_id, None)
             await self._show_special_users(event, special_page)
@@ -2054,7 +2088,7 @@ class StudyBot:
             )
             await self._show_special_users(event)
             return
-        plans_page = self._page_arg(data, "plans")
+        plans_page = self._page_arg(data, "admin:plans:")
         if data == "admin:plans" or plans_page is not None:
             self._pending_admin_actions.pop(telegram_id, None)
             await self._show_admin_plans(event, plans_page)
@@ -2853,6 +2887,7 @@ class StudyBot:
                 await event.reply(plan_text, buttons=plan_buttons)
             elif command == "/history":
                 history = await self.db.payment_history(int(user["id"]))
+                total_payments = await self.db.payment_count(int(user["id"]))
                 statuses = {
                     "awaiting_receipt": "منتظر رسید",
                     "pending": "منتظر بررسی دستی",
@@ -2860,7 +2895,15 @@ class StudyBot:
                     "rejected": "رد شد",
                     "cancelled": "لغو شد",
                 }
-                lines = ["سوابق پرداخت:"]
+                heading = "سوابق پرداخت:"
+                if len(history) < total_payments:
+                    # The window is real paging by design; the reader must be
+                    # able to see that older rows exist behind it.
+                    heading += (
+                        f" ({to_persian_digits(len(history))} پرداخت اخیر از "
+                        f"{to_persian_digits(total_payments)} پرداخت)"
+                    )
+                lines = [heading]
                 lines.extend(
                     f"• #{item['id']} {item['plan_name']} — {format_toman(item['amount_toman'])} — "
                     f"{statuses.get(item['status'], item['status'])}"
@@ -3720,14 +3763,22 @@ class StudyBot:
     #: Rows in the flat `/users` export copy — the title states this is a prefix.
     USERS_EXPORT_ROWS = 50
 
+    #: Plans offered per page on the user's purchase screen (Telegram caps a
+    #: message at 4096 characters and a keyboard at 100 buttons).
+    USER_PLAN_PAGE = 8
+
+    #: Active entitlements listed on the user's account screen before the rest
+    #: are summarised; the totals above always count every row.
+    ACCOUNT_ENTITLEMENT_ROWS = 8
+
     @staticmethod
-    def _page_arg(data: str, action: str) -> str | None:
-        """The page number of ``admin:<action>:<page>``, or None for any other token.
+    def _page_arg(data: str, prefix: str) -> str | None:
+        """The page number of ``<prefix><page>``, or None for any other token.
 
         Only digits count, so ``admin:special:add`` keeps going to its own branch
-        while ``admin:special:1`` is a page request.
+        while ``admin:special:1`` is a page request; the same rule guards the
+        user-side ``billing:plans:2`` against a hand-built or stale tail.
         """
-        prefix = f"admin:{action}:"
         if not data.startswith(prefix):
             return None
         tail = data[len(prefix) :]

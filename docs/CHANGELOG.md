@@ -62,6 +62,26 @@
 
 ### Fixed
 
+* **The purchase and balance screens could outgrow Telegram.** `_billing_plans()` emitted one
+  text line *and* one inline button for every enabled paid plan, and `_billing_balance_text()`
+  one line per active entitlement row — neither read had a `LIMIT`, so both grew with the plan
+  catalog and with how long the account had been paying. Around 24 plans the message passes
+  Telegram's 4 096-character and 100-button caps and the screen stops sending: not slow,
+  undeliverable. The plan screen is paged now (`USER_PLAN_PAGE = 8`, `billing:plans:{page}`;
+  the bare legacy token still means page 0, so a button on an older message keeps working) and
+  the balance screen prints at most `ACCOUNT_ENTITLEMENT_ROWS = 8` rows with «…و N اعتبار فعال
+  دیگر» under totals that still count every row. `_page_arg()` takes the whole callback prefix
+  (`"admin:special:"`, `"billing:plans:"`) so user and admin screens share one parser:
+  digits-only, anything else falls back to page one, and an out-of-range page clamps to the last
+  real page rather than rendering an empty screen.
+
+* **`/history` let a ten-row window pose as the whole record.** `payment_history()` is capped at
+  the ten newest requests by design, but the heading was a bare «سوابق پرداخت:», so from the
+  eleventh payment on the user could conclude that the list was everything they had ever bought.
+  `payment_count(user_id)` was added — one `COUNT(*)` on `user_id`, served by the index the
+  schema already has — and the heading now reads «۱۰ پرداخت اخیر از N پرداخت» only when rows
+  really are behind the window.
+
 * **A disabled route row is a disabled route, not a paid leg.** `route()` folded
   `enabled` into the `free_only` flag, so switching a provider off while paid
   fallback was allowed silently turned it into a *billable* attempt. The row
@@ -271,6 +291,17 @@ index benefit has been demonstrated — an index that is not needed is write cos
 and migration surface for nothing.
 
 ### Notes
+
+* The deployment checklist in `docs/REPORT_PRODUCTION_IMPROVEMENTS.md` §9 told an operator that
+  `ensure_seeded()` realigns "the six note tasks". There are four note tasks; the six is
+  `ROUTE_TASKS`, which adds `health_test` and `benchmark`. Reworded to name both groups, since
+  the `AI_DEFAULT_NOTE_ROUTE` override is applied to the four note tasks alone
+  (`ProviderRouter._seed_order`).
+* A summary sentence from the previous round described the AI provider settings digest as
+  deliberately keeping its full text with a measured character count. That sentence was never
+  written into the report (checked), and it was wrong anyway: the credential screen pages at
+  `CREDENTIALS_PAGE_SIZE = 12` keys per page with «صفحهٔ X از Y (N کلید)», so no claim about
+  a deliberately unbounded screen was needed there. Nothing in the docs still says it.
 
 * Pricing, model identifiers and free-quota limits are provider-side facts that
   change without notice; the numbers quoted in `docs/AI_PROVIDERS.md` are dated

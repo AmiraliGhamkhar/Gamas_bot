@@ -35,14 +35,17 @@ nothing here is a projection.
 | 18 | `admin_user_credit_overview()` computed the admin's view of a user's balance as a **Python sum over the newest 50 entitlement rows**, and the screen then sliced that list again (`entitlements[:10]`, `usage[:8]`) under headings that promised the history. The docstring claimed the split "comes from the same entitlement rows the reservation engine consumes, so the screen can never disagree with billing" — it could: `user_balance()` aggregates every spendable row with no window | On a user with 57 entitlement rows and one old 900-second grant still spendable, the panel showed **0** paid seconds while the reservation engine would happily spend 900: the admin judging a refund saw a different number than the one billing used. Not-yet-started grants were counted as spendable, the opposite disagreement | **Fixed** |
 | 19 | The latency percentile is deliberately sampled — `ai_usage_overview()` reads at most `LATENCY_PERCENTILE_SAMPLE` (5 000) newest rows instead of materialising every latency — and the database exposed `latency_samples`, but **no panel consumed it**: three screens printed «تأخیر p95: X ms» next to «درخواست‌های امروز: N», so on a day with more than 5 000 requests an admin compared a *sample* percentile against a full-window counter and nothing marked the difference | The p95 an operator uses to judge a provider's tail latency was silently the p95 of whatever 5 000 requests happened to be newest — the same "bounded read presented as the whole" class as defects 9, 15, 16 and 17, on a number people make routing decisions with. Note the subtlety: `latency_samples < requests` is **not** the signal (rows can legitimately have no latency recorded); the honest signal is that the read saturated |
 | 20 | The STT quota screen stated a total it had invented: `stt_quota_latest()` ended in a hard `LIMIT 20`, the overview sliced that to `[:3]`, and the label printed `len(snapshots)` — so a provider with more than 20 quota rows read «آخرین 3 از 20» — while the advice in the same line, «برای دیدن همه، صفحهٔ همین ارائه‌دهنده را باز کنید», pointed at a screen that applied the very same 20-row read and so could not show them either | An admin debugging a quota problem was told a number that was the size of the read, and was sent to a screen that would silently repeat the cut; on a provider with per-model quotas (the table is unique per account_scope/model/quota_type, so 25 rows is ordinary) the history looked finite and reachable when it was neither |
+| 21 | The two **user** screens wrote a whole table into one message: `_billing_plans()` emitted one text line *and* one inline button per enabled paid plan, and `_billing_balance_text()` one line per active entitlement row — neither read had a `LIMIT` | Both grow without bound (a fresh database already ships 6 paid plans, and every approved payment adds an entitlement row). Past roughly 24 plans the message passes Telegram's 4 096-character and 100-button caps and the purchase screen stops sending at all; a long-lived account gets an unscrollable wall. The admin equivalents were bounded rounds ago — this was the same class on the side nobody had audited |
+| 22 | `/history` printed `payment_history()`'s ten newest rows under a bare «سوابق پرداخت:» heading with no total | The read is capped at ten by design (and clamped to 50 in SQL), so this is defect 9's family on the user's side rather than defect 21's: after an eleventh payment the list reads as the complete record of what you ever bought, with nothing marking it as a window. The heading now says «۱۰ پرداخت اخیر از N پرداخت» from a new `payment_count()` |
 
-Every item above is fixed. Defects 12-20 were found after the first pass and
+Every item above is fixed. Defects 12-21 were found after the first pass and
 closed round by round: the quota screen was bounded, the route annotation added,
 the log page given its total, the three name-carrying tokens replaced by positions
 plus a fingerprint, the billing screens counted and paged, the AI monitoring
 digests labelled, the digest filters reordered before their caps, the credit
 screen's balance made to agree with billing, the sampled percentile labelled, and
-the STT quota totals re-sourced from the table (§6 records what defect 12's fix
+the STT quota totals re-sourced from the table, and the user's own purchase and balance screens
+bounded by the sendability pass (§6 records what defect 12's fix
 costs). The remedy for 12 is an explicit annotation next to the row rather than a
 new colour glyph — the honest caveat is in §8.
 
@@ -58,23 +61,33 @@ displays were read and are labelled by design, not overlooked:
 نیامده» plus the custom-model escape hatch), `QUOTA_OVERVIEW_BUDGETS` /
 `QUOTA_PROVIDERS_PAGE_SIZE` (folded counts stated, drill-in button offered),
 `USERS_EXPORT_ROWS` («۵۰ کاربر اخیر از N کاربر»), the finance pages (real `COUNT`s),
+`payment_history`'s ten-row window (now «۱۰ پرداخت اخیر از N پرداخت»),
 `LATENCY_PERCENTILE_SAMPLE` (sampled note), `admin_audit`/`admin_usage_ledger`
 (labelled «آخرین» digests, DB-capped at 200 and sent through the long-message pager),
 and the credential lists whose "N از M" totals come from uncapped
 `list_summaries()` rather than from a page.
+
+A **fourth pass** was needed after that closure was written, because the three sweeps above all
+asked "was a bounded read presented as the whole?" and never asked "is this message *sendable*?".
+A list with no read limit at all is not merely slow — it fails to deliver. So every user-facing
+screen was re-read for unbounded renders: `_billing_plans()` and `_billing_balance_text()` had
+none (defect 21) and are bounded now. The rest were checked and are bounded for a stated reason:
+the help, privacy and receipt texts are constant-size, and long documents already go through
+`_send_long_message`'s pager.
 
 ## 2. Files changed and why
 
 | File | Why |
 |---|---|
 | `gamas_bot/ai/routing.py` | Authoritative router. New `DEFAULT_NOTE_ORDER`; `ROUTE_SEED_REVISION`; `ensure_seeded()` → `_seed_order` / `_upgrade_seeded_order`; `plan()` gate order with `skipped: list[tuple[slug, code]]`; `RouteLeg.enabled`; `NoteJobSession._runnable_legs` / `_attempted_legs` / `_leg_budget_seconds()`; Retry-After clamp; provider-wide-fault short circuit; `default_route_order()` for the panel |
-| `gamas_bot/database.py` | `pending_payment_count()` and `unlimited_user_count()` (a real total for panels that used `len()` of a capped list); `list_pending_payments` carries `receipt_path`, which is what removed the per-row `payment_detail` read; `ai_routes_reorder()` (route_index-only, transactional, under the UNIQUE constraint); `ai_usage_overview()` (one window for counters + bounded p95 sample); `ai_models_page(offset,limit)`; `ai_event_count()` extended to mirror every page filter (error_class, job_id, http_status class) so the log panel's total and its page cannot disagree; `stt_events_count`; offsets for event-log and user queries; `admin_user_credit_overview()` now takes its balance from one SQL aggregate over the reservation engine's own predicate (never a sum over the display window) and returns `entitlement_total` / `usage_total` beside the two display lists, whose sizes became parameters (`recent_rows=10`, `usage_rows=8`); `ai_quota_latest_for_provider()` — every quota snapshot a provider holds, ordered by quota identity instead of observation time so a stated cut is a stable prefix (`EXPLAIN QUERY PLAN`: `SEARCH ai_quota_snapshots USING INDEX sqlite_autoindex_ai_quota_snapshots_1 (provider=?)` + a temp B-tree over one provider's rows, the same access path the previous read used, so no new index); `ai_usage_overview()` now returns `latency_sample_capped` next to `latency_samples`, because a short sample is not proof of a cap (rows may have no latency recorded) while a saturated read is |
+| `gamas_bot/database.py` | `pending_payment_count()` and `unlimited_user_count()` (a real total for panels that used `len()` of a capped list); `list_pending_payments` carries `receipt_path`, which is what removed the per-row `payment_detail` read; `ai_routes_reorder()` (route_index-only, transactional, under the UNIQUE constraint); `ai_usage_overview()` (one window for counters + bounded p95 sample); `ai_models_page(offset,limit)`; `ai_event_count()` extended to mirror every page filter (error_class, job_id, http_status class) so the log panel's total and its page cannot disagree; `stt_events_count`; offsets for event-log and user queries; `admin_user_credit_overview()` now takes its balance from one SQL aggregate over the reservation engine's own predicate (never a sum over the display window) and returns `entitlement_total` / `usage_total` beside the two display lists, whose sizes became parameters (`recent_rows=10`, `usage_rows=8`); `ai_quota_latest_for_provider()` — every quota snapshot a provider holds, ordered by quota identity instead of observation time so a stated cut is a stable prefix (`EXPLAIN QUERY PLAN`: `SEARCH ai_quota_snapshots USING INDEX sqlite_autoindex_ai_quota_snapshots_1 (provider=?)` + a temp B-tree over one provider's rows, the same access path the previous read used, so no new index); `ai_usage_overview()` now returns `latency_sample_capped` next to `latency_samples`, because a short sample is not proof of a cap (rows may have no latency recorded) while a saturated read is ; `payment_count(user_id)` was added so `/history` can state its window's total — a `COUNT(*)` on `user_id`, which the existing `idx_payment_requests_user_created` already covers (no new index) |
 | `gamas_bot/provider_health.py` | `snapshot()` / `cached()` / `invalidate()` so redraws need no network |
-| `gamas_bot/bot.py` | Ack-before-read, `_arm_answer_once` + idempotent `_edit_callback`; user menu (ساخت جزوه primary, merged help/formats, merged balance/subscription, privacy kept); five admin sections; users, credential, payment, plan and special-user screens paged with counted totals (one `_admin_page` parser, `_page_arg` accepts digit-only page tokens so `admin:special:add` still routes to its own branch); network-free health panel; a page of receipts no longer re-reads each row through `payment_detail`; the `/users` export titled against `stats()["users"]` when it is only a prefix, with `USERS_EXPORT_ROWS` as the single source for the row count; the credit screen's two history headings now state «۱۰ مورد از N سابقه» via `_credit_history_heading`, the redundant `[:10]`/`[:8]` slices are gone, and `admin:credits:` joins the ack-first set; the overview AI line appends `latency_sample_note()` so a sampled p95 is labelled |
+| `gamas_bot/bot.py` | Ack-before-read, `_arm_answer_once` + idempotent `_edit_callback`; user menu (ساخت جزوه primary, merged help/formats, merged balance/subscription, privacy kept); five admin sections; users, credential, payment, plan and special-user screens paged with counted totals (one `_admin_page` parser, `_page_arg` accepts digit-only page tokens so `admin:special:add` still routes to its own branch); network-free health panel; a page of receipts no longer re-reads each row through `payment_detail`; the `/users` export titled against `stats()["users"]` when it is only a prefix, with `USERS_EXPORT_ROWS` as the single source for the row count; the credit screen's two history headings now state «۱۰ مورد از N سابقه» via `_credit_history_heading`, the redundant `[:10]`/`[:8]` slices are gone, and `admin:credits:` joins the ack-first set; the overview AI line appends `latency_sample_note()` so a sampled p95 is labelled; the purchase screen is paged (`USER_PLAN_PAGE = 8`, `billing:plans:{page}`, the bare legacy token still page 0, «صفحهٔ X از Y» only when a second page exists) and the balance screen prints at most `ACCOUNT_ENTITLEMENT_ROWS = 8` rows under its all-rows totals with a counted remainder; `_page_arg(data, prefix)` now takes the whole token prefix so every paged screen shares one parser; `/history` labels its ten-row window against `payment_count()` |
 | `gamas_bot/admin_ai.py` | `MODELS_PAGE_SIZE=10`, `LOGS_PAGE_SIZE=14`, `KEYS_PAGE_SIZE=12`; merged overview metrics; `show_routes(task_type)` via `_route_callback`; uncut addable list; `stale_rows` gate for the live catalog read; `_SKIP_REASON_FA`; log pages with an authoritative total and a clamped stale page; paged key screens with service filter preserved; unusable route rows annotated from `plan()` / `credentials_for()`; quota digest bounded by `len(PROVIDER_REGISTRY)` instead of a silent `[:4]`; `BENCHMARK_ROWS` plus a probe row that labels the cut; counts rendered with `to_persian_digits`; `QUOTA_ROWS` for the provider-detail quota block (the OpenRouter local ledger moved out of the counted group so the statements about it stay true); `HEALTH_ROWS` with the service filter applied *before* the cap; admin overrides built line-by-line and the heading suppressed when no provider carries a flag; both p95 lines carry `latency_sample_note()` — «(نمونه: 5/000 درخواست اخیر)» whenever the sample was capped |
 | `gamas_bot/admin_stt.py` | Paged model catalog and log list (`_page_token`/`_split_page`/`_logs_button`), `mark_model` phantom-row guard, paged quota overview (`admin:stt:qtp:{page}`, 3 providers × 4 budgets) with the folded counts stated in the text; the snapshot note now counts the table (`stt_quota_count`) instead of the page, `QUOTA_SNAPSHOT_ROWS` bounds the provider's own screen and says so when it cuts |
 | `scripts/benchmark_admin_panels.py` | New, committed, offline benchmark that measures BEFORE and AFTER query shapes, every panel render and `router.plan()` in one process |
 | `tests/test_route_seed_upgrade.py` (new, 20 tests + 19 subtests) | Seeding/migration contract |
+| `tests/test_user_account_screen.py` (new, 12 tests + 3 subtests) | The purchase screen's per-page cap, every plan reachable across pages, a stale or malformed page token falling back to the first page, buy payloads unchanged by paging, the balance screen's counted remainder — and the same screens through `_handle_callback`, so `billing:plans:1` is proved to reach page 2 and not to be read as a plan code, and `/history`'s heading through `_handle_message` at 12, 3 and 0 payments |
 | `tests/test_route_failover_eligibility.py` (new, 11 tests) | Eligibility, 429/5xx, cooldown, invalid-credential rotation, per-key quota rotation, attribution, reservation release, leg deadline, FREE_ONLY / unknown-billing blocking |
 | `tests/test_admin_panel_presentation.py` (new, 54 tests + 7 subtests) | Paging, ack order, stale/malformed callbacks, callback-size and keyboard limits, label and masking contracts for both platforms, both credential screens, the quota overview, the route-availability annotation, the log-total/page-query agreement and the "callback carries an address" rule for the STT catalog, the quota rows and the key wizard |
 | `.env.example`, `README.md`, `docs/{AI_PROVIDERS,AI_PLATFORM_AUDIT,ARCHITECTURE,CONFIGURATION,TESTING,CHANGELOG}.md` | Contracts an operator needs: default order, gate semantics, upgrade + rollback, panel structure, measured performance, test counts |
@@ -236,11 +249,22 @@ existing lines. The cap itself stays — removing it would mean sorting every
 latency of a busy day in Python to render one number — but the number can no
 longer be read as a window statistic when it is not one.
 
+* The two user screens from defect 21 cost nothing measurable to bound: the plan page and the
+  entitlement window are slices of reads that already happened, and `list_plans()` still has no
+  `LIMIT` on purpose — `ORDER BY sort_order, id` is what keeps a paging window stable. The
+  balance screen's *totals* keep summing every active row, so printing fewer rows never caps the
+  number that matters.
+
+* `/history`'s new total costs one `COUNT(*)` per view: 0.351 ms for a user with 5 000 payment
+  rows (mean of 100, temporary SQLite, covering index per `EXPLAIN QUERY PLAN`) against 2.892 ms
+  for the ten-row join the screen was already doing — about 12 % on top of the read it already
+  paid, and no migration.
+
 ## 7. Exact test commands and actual results
 
 ```
-/home/user/venv/bin/python -m pytest tests/ -q      → 1186 passed, 1 skipped, 1821 subtests in 143.30 s
-/home/user/venv/bin/python -m unittest discover -s tests → Ran 1187 tests, OK (skipped=1), 144.0 s
+/home/user/venv/bin/python -m pytest tests/ -q      → 1198 passed, 1 skipped, 1824 subtests in 149.60 s
+/home/user/venv/bin/python -m unittest discover -s tests → Ran 1199 tests, OK (skipped=1), 146.8 s
 /home/user/venv/bin/python -m scripts.validate_docx → PASSED: 0 structural failure(s)
 /home/user/venv/bin/python -m ruff check .          → All checks passed!
 /home/user/venv/bin/python -m compileall -q gamas_bot scripts tests passenger_wsgi.py → OK
@@ -257,9 +281,9 @@ longer be read as a window statistic when it is not one.
     depending on sandbox load
 ```
 
-Baseline before the work was `1076 passed, 1 skipped, 1793 subtests`. **110 tests
-were added and the pre-existing failure count stayed zero** (1076 + 110 = 1186
-passing, the same one skip throughout, and 28 more subtests). No live or billable provider call was made and no real
+Baseline before the work was `1076 passed, 1 skipped, 1793 subtests`. **122 tests
+were added and the pre-existing failure count stayed zero** (1076 + 122 = 1198
+passing, the same one skip throughout, and 31 more subtests). No live or billable provider call was made and no real
 credential was used anywhere: the credential tests run against Fernet-encrypted
 rows in temporary SQLite files with fake key material.
 
@@ -313,6 +337,10 @@ route-availability annotation → `test_admin_panel_presentation.py`.
   (`کلیدهای ثبت‌شده: 0`, log page headers) render Latin digits, while the new digest
   labels go through `to_persian_digits`. Normalising every counter in both panels is
   presentational and was deliberately left out of this sweep.
+* The purchase screen pages at 8 plans. The point was sendability, not browsing UX, and a catalog
+  that long is unusual — so a plan can now be one press away, and the heading only says
+  «صفحهٔ X از Y» when a second page really exists. Same trade for the balance screen: 8 rows
+  printed, all rows counted, remainder named.
 * Per-provider billing prices, model identifiers and free-quota numbers are
   provider-side facts; the docs record them as dated observations, not
   guarantees, and entitlement is always re-checked from live signals.
@@ -329,9 +357,11 @@ route-availability annotation → `test_admin_panel_presentation.py`.
 
 1. Backup first: `cp "$DATABASE_PATH" "$DATABASE_PATH.bak-$(date +%F)"`. Nothing
    in this change set migrates the schema, so a restore is just the reverse copy.
-2. Deploy the code and restart the worker. On boot, `ensure_seeded()` aligns
-   untouched seeded routes for the six note tasks; the log will contain
-   `provider_route_changed` only for tasks it actually reordered.
+2. Deploy the code and restart the worker. On boot, `ensure_seeded()` walks all six seeded route
+   sets — the four note tasks (`chunk_structuring`, `outline`, `repair`, `final_compilation`) plus
+   `health_test` and `benchmark` — and realigns only a group that is still provably automatic; the
+   log will contain `provider_route_changed` only for tasks it actually reordered. The
+   `AI_DEFAULT_NOTE_ROUTE` override is applied to the four note tasks alone.
 3. Verify with `python -m scripts.validate_provider_platform` and the panel:
    `پنل مدیریت → 🤖 تولید جزوه (AI) → مسیرها` — expected nara first, openrouter
    second, and a Persian reason for anything greyed out.

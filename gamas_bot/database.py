@@ -1093,6 +1093,21 @@ class Database:
             )
             return [dict(row) for row in await cursor.fetchall()]
 
+    async def payment_count(self, user_id: int) -> int:
+        """How many payment requests a user has ever made, whatever the status.
+
+        ``/history`` prints the newest ten rows (``payment_history``'s default
+        window, hard-capped at 50 in SQL). This is the number that lets the
+        heading say so instead of presenting ten rows as the whole record.
+        """
+        async with self._lock:
+            cursor = await self._db().execute(
+                "SELECT COUNT(*) FROM payment_requests WHERE user_id=?",
+                (int(user_id),),
+            )
+            row = await cursor.fetchone()
+        return int(row[0] or 0)
+
     async def approve_payment(
         self, payment_id: int, admin_id: int, *, admin_note: str | None = None
     ) -> dict[str, Any] | None:

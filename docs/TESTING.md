@@ -5,15 +5,16 @@
 ```bash
 python -m compileall -q gamas_bot scripts tests passenger_wsgi.py
 ruff check .                      # config in pyproject.toml
-python -m pytest -q               # latest local run: 1,186 passed, 1 skipped, 1,821 subtests, ~143 s
+python -m pytest -q               # latest local run: 1,198 passed, 1 skipped, 1,824 subtests, ~150 s
 python -m pip check
 python -m scripts.sync_requirements --check
 ```
 
 `.github/workflows/tests.yml` runs the suite on Python 3.11, 3.12 and 3.13,
 through both `pytest` and `unittest discover` (the entry point deployments use).
-The latest local `unittest discover -s tests` run executed 1,187 tests with one
-skip and passed. Counts are snapshots; update them when the suite changes.
+The latest local `unittest discover -s tests` run executed 1,199 tests with one
+skip and passed (146.8 s); the same run under `pytest` reports 1,198 passed because
+the two runners count the one skip differently. Counts are snapshots; update them when the suite changes.
 
 ## What the suite is organised around
 
