@@ -789,5 +789,150 @@ class SemanticContractPromptTests(unittest.TestCase):
         self.assertIn("قرارداد معنایی", prompt)
 
 
+class FabricationDetectionTests(unittest.TestCase):
+    """The notes must never state a fact the lecture did not contain.
+
+    The existing QA measures *loss* (numbers that disappeared). A hallucinated
+    dosage or lab value is the opposite failure and a recall measure cannot
+    see it, so the same deterministic layer measures *added* content: a value
+    whose canonical token is absent from every source chunk and that shares no
+    digit run with the source.
+    """
+
+    SOURCE = (
+        "جلسه دربارهٔ دیابت بود. دوز متفورمین 500 mg در روز و HbA1c زیر 7 درصد است "
+        "و فشار خون 120/80 mmHg ثبت شد."
+    )
+
+    @staticmethod
+    def _notes(text: str) -> StructuredNotes:
+        return StructuredNotes(
+            title="جزوه", sections=(NoteSection(heading="بخش", paragraphs=(text,)),)
+        )
+
+    def _report(self, text: str):
+        return run_note_qa(self._notes(text), [self.SOURCE])
+
+    def test_a_faithful_booklet_has_no_unsupported_content(self):
+        report = self._report(
+            "دوز متفورمین 500 mg و HbA1c زیر 7 درصد و فشار 120/80 mmHg است."
+        )
+        self.assertEqual(report.unsupported_numbers, ())
+        self.assertEqual(report.unsupported_terms, ())
+        self.assertFalse(report.has_unsupported_facts)
+
+    def test_invented_dosage_is_detected(self):
+        report = self._report("دوز متفورمین 1500 mg در روز است.")
+        self.assertIn("1500 mg", report.unsupported_numbers)
+        self.assertTrue(report.has_unsupported_facts)
+        self.assertTrue(
+            any("invented values" in finding for finding in report.findings),
+            report.findings,
+        )
+
+    def test_invented_statistic_and_acronym_are_detected(self):
+        report = self._report("میزان مرگ‌ومیر 45 درصد و تصویربرداری MRI انجام شد.")
+        self.assertIn("45 %", report.unsupported_numbers)
+        self.assertIn("MRI", report.unsupported_terms)
+        self.assertTrue(report.has_unsupported_facts)
+
+    def test_persian_digit_formatting_is_not_mistaken_for_an_invention(self):
+        """A value written in the other script is faithful, not fabricated."""
+        report = self._report("دوز ۵۰۰ میلی‌گرم و فشار ۱۲۰/۸۰ میلی‌متر جیوه.")
+        self.assertEqual(report.unsupported_numbers, ())
+        self.assertFalse(report.has_unsupported_facts)
+
+    def test_a_reformatted_but_magnitude_present_value_is_not_flagged(self):
+        # The source states 120/80; a note that keeps the magnitude but drops
+        # the pair formatting must not be accused of inventing it.
+        report = self._report("عدد 120 در متن بود.")
+        self.assertEqual(report.unsupported_numbers, ())
+
+    def test_ordinary_rephrased_english_word_is_not_an_unsupported_term(self):
+        report = self._report("این دارو یک compound شیمیایی است.")
+        self.assertNotIn("compound", report.unsupported_terms)
+
+    def test_notes_are_never_modified_by_the_detection(self):
+        notes = self._notes("دوز 9999 mg ابداعی.")
+        before = notes.to_json()
+        report = run_note_qa(notes, [self.SOURCE])
+        self.assertTrue(report.has_unsupported_facts)
+        self.assertEqual(notes.to_json(), before)
+
+
+class FabricationRepairGateTests(unittest.TestCase):
+    """The repair pass is the only automated way a fabricated value can go away."""
+
+    SOURCE = (
+        "جلسه دربارهٔ دیابت بود. دوز متفورمین 500 mg در روز و HbA1c زیر 7 درصد است. "
+        "تعریف دیابت بر پایهٔ قند خون است و مثال بیمار با قند ناشتای 126 آمد. "
+        "هشدار: بدون تجویز پزشک دارو را قطع نکنید."
+    ) * 8
+
+    def _report(self, text: str):
+        notes = StructuredNotes(
+            title="جزوه", sections=(NoteSection(heading="بخش", paragraphs=(text,)),)
+        )
+        return run_note_qa(notes, [self.SOURCE])
+
+    def test_an_invented_value_alone_triggers_the_corrective_pass(self):
+        from gamas_bot.structuring import _repair_notes_if_needed  # noqa: F401
+        report = self._report(
+            "تعریف دیابت بر پایهٔ قند خون است و مثال بیمار با قند ناشتای 126 آمد. "
+            "دوز متفورمین 500 mg و HbA1c زیر 7 درصد. هشدار: بدون تجویز پزشک دارو را قطع نکنید. "
+            "همچنین دوز 2500 mg توصیه شد."
+        )
+        # Recall is fine; only the invented 2500 mg is wrong.
+        self.assertFalse(report.needs_repair)
+        self.assertIn("2500 mg", report.unsupported_numbers)
+        self.assertTrue(report.has_unsupported_facts)
+
+    def test_a_repair_that_removes_an_invented_value_is_accepted(self):
+        from gamas_bot import structuring as S
+
+        before = self._report(
+            "تعریف دیابت بر پایهٔ قند خون است و مثال بیمار با قند ناشتای 126 آمد. "
+            "هشدار: بدون تجویز پزشک دارو را قطع نکنید. دوز 2500 mg توصیه شد."
+        )
+        after = self._report(
+            "تعریف دیابت بر پایهٔ قند خون است و مثال بیمار با قند ناشتای 126 آمد. "
+            "هشدار: بدون تجویز پزشک دارو را قطع نکنید."
+        )
+        self.assertTrue(before.unsupported_numbers)
+        self.assertFalse(after.unsupported_numbers)
+        accepted, reason = S._repair_is_better(before, after)
+        self.assertTrue(accepted, reason)
+        self.assertIn("unsupported", reason)
+
+    def test_a_repair_that_introduces_an_invented_value_is_rejected(self):
+        from gamas_bot import structuring as S
+
+        before = self._report("تعریف دیابت بر پایهٔ قند خون است و مثال بیمار با قند ناشتای 126 آمد.")
+        after = self._report(
+            "تعریف دیابت بر پایهٔ قند خون است و مثال بیمار با قند ناشتای 126 آمد "
+            "و دوز 9999 mg ابداعی."
+        )
+        self.assertFalse(before.unsupported_numbers)
+        self.assertTrue(after.unsupported_numbers)
+        accepted, reason = S._repair_is_better(before, after)
+        self.assertFalse(accepted)
+        self.assertIn("invented", reason)
+
+    def test_repair_prompt_names_the_invented_values_to_remove(self):
+        from gamas_bot import structuring as S
+
+        prompt = S.build_repair_prompt(
+            "متن منبع", (), (), existing="جزوه", unsupported=("2500 mg",)
+        )
+        self.assertIn("مقادیر بی‌منبع", prompt)
+        self.assertIn("2500 mg", prompt)
+
+    def test_reminder_forbids_keeping_invented_values(self):
+        from gamas_bot import structuring as S
+
+        self.assertIn("حذف", S.REPAIR_REMINDER)
+
+
+
 if __name__ == "__main__":
     unittest.main()

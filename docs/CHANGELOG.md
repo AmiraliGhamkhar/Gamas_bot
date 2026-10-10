@@ -143,6 +143,20 @@ compared member-by-member by SHA-256 before and after):
 
 ### Added
 
+* **Fabrication (precision) QA and a corrective pass for invented values.**
+  The deterministic QA layer only measured *loss*; a hallucinated dosage,
+  lab value or statistic is the opposite failure and was invisible to it.
+  `run_note_qa` now also reports values and strong terms the notes state
+  that no source chunk contains, computed conservatively (as
+  `NoteQAReport.unsupported_numbers` / `unsupported_terms`, with
+  `has_unsupported_facts`), so a formatting difference such as `۱۲۰/۸۰` vs
+  `120/80` is never mistaken for an invention. An invented value now
+  triggers the existing, bounded repair pass (`NOTE_REPAIR_ENABLED`), whose
+  prompt names the unsupported values to remove and whose reminder forbids
+  keeping them. Acceptance is guarded both ways: a pass that *introduces*
+  an invented value is rejected outright, and a pass that *removes* one is
+  accepted even when recall is unchanged — per part and per document — so a
+  fabricated number can never be traded for restored prose.
 * **Account-entitlement attestation.** Providers that publish rate limits but no
   documented no-charge entitlement (Groq) are now explicit, opt-in states
   instead of being silently treated as free: they stay out of `AI_FREE_ONLY`

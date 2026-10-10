@@ -185,7 +185,10 @@ REPAIR_REMINDER = (
     "هشدار، استثنا، فرمول، عدد، واحد، دوز، درصد و اصطلاح انگلیسی‌ای را که جا افتاده "
     "بود با همان معنا و همان اصطلاح بازگردانید. "
     "فقط و فقط اطلاعاتی را بنویسید که در همین متن ورودی آمده است؛ چیزی حدس نزنید و "
-    "هیچ مثال، فرمول، مرجع یا نتیجه‌ای از خودتان اضافه نکنید. ترتیب منطقی متن را حفظ کنید. "
+    "هیچ مثال، فرمول، مرجع یا نتیجه‌ای از خودتان اضافه نکنید. "
+    "اگر در جزوهٔ قبلی عدد، درصد، فشار خون، دوز، مقدار آزمایشگاهی، آمار یا اصطلاح "
+    "انگلیسی‌ای آمده که در متن ورودی وجود ندارد، آن را حذف کنید و به‌جایش چیزی از خود "
+    "اضافه نکنید. ترتیب منطقی متن را حفظ کنید. "
     "خروجی همچنان فقط و فقط یک شیء JSON معتبر با همان ساختار قبلی است."
 )
 
@@ -196,6 +199,7 @@ def build_repair_prompt(
     findings: tuple[str, ...],
     existing: str = "",
     missing_units: tuple[str, ...] = (),
+    unsupported: tuple[str, ...] = (),
 ) -> str:
     """A targeted second-pass prompt naming what QA found missing.
 
@@ -227,7 +231,15 @@ def build_repair_prompt(
             "این بخش‌ها از متن بالا در جزوه نیامده‌اند و باید با همان معنا بازگردانده شوند:\n"
             + "\n".join(f"- {unit}" for unit in missing_units)
         )
-    if not missing and not missing_units:
+    if unsupported:
+        parts.append(
+            "### گزارش کیفیت خودکار — مقادیر بی‌منبع (ابداعی)\n"
+            "این مقادیر در جزوه آمده‌اند ولی در متن بالا وجود ندارند؛ اگر در بازنویسی آن‌ها را "
+            "حفظ کرده‌اید، حذفشان کنید و هیچ عدد، درصد، فشار، دوز، مقدار آزمایشگاهی یا آمار "
+            "تازه‌ای از خود اضافه نکنید:\n"
+            + "\n".join(f"- {item}" for item in unsupported)
+        )
+    if not missing and not missing_units and not unsupported:
         parts.append("### گزارش کیفیت خودکار\nموارد اعلام‌شده بازگردانده نشدند.")
     parts.append(
         "اگر موردی در متن بالا وجود ندارد، آن را نسازید و فقط همان‌قدر که در متن هست بنویسید."
@@ -2362,7 +2374,15 @@ def _repair_is_better(before, after) -> tuple[bool, str]:
     measures that reflect information loss, and every branch also requires the
     other measures not to regress, so a repair cannot trade a real gain in
     semantic coverage for a real loss of numbers.
+
+    Two extra rules protect *faithfulness* -- the failure a recall measure
+    cannot see. A pass that introduces a value the source does not contain is
+    never accepted, and a pass that removes such a value is accepted even when
+    recall is unchanged, because an invented dosage or lab value is a
+    correctness defect of its own.
     """
+    if len(after.unsupported_numbers) > len(before.unsupported_numbers):
+        return False, "repair introduced unsupported (invented) values"
     if after.semantic_coverage > before.semantic_coverage:
         # ``missing_numbers`` is a tuple of *values*, so it must be compared by
         # length: comparing the tuples compares the strings element-wise, which
@@ -2379,22 +2399,29 @@ def _repair_is_better(before, after) -> tuple[bool, str]:
         return True, "signal coverage restored"
     if after.coverage < before.coverage:
         return False, "signal coverage regressed"
+    # Recall is equal: removing an invented value is the only remaining gain.
+    if len(after.unsupported_numbers) < len(before.unsupported_numbers):
+        return True, "unsupported (invented) values removed"
     if after.compression_ratio > before.compression_ratio:
         return True, "more of the lecture preserved at equal coverage"
     return False, "no measurable improvement"
 
 
-def _chunk_quality(draft: StructuredNotes, source: str) -> tuple[float, float, int]:
-    """``(semantic coverage, signal coverage, missing numbers)`` for one part.
+def _chunk_quality(
+    draft: StructuredNotes, source: str
+) -> tuple[float, float, int, int]:
+    """``(semantic coverage, signal coverage, missing numbers, invented)``.
 
     Used to accept a *targeted* repair part by part: the repair only ever
-    replaces the draft it improves.
+    replaces the draft it improves. The invented-value count is part of the
+    comparison so a part cannot be swapped for one that restores prose but
+    adds a value the source never stated.
     """
     from .units import extract_all_units, semantic_coverage
 
     report = run_note_qa(draft, [source])
     semantic, _ = semantic_coverage(extract_all_units([source]), notes_text(draft))
-    return semantic, report.coverage, len(report.missing_numbers)
+    return semantic, report.coverage, len(report.missing_numbers), report.unsupported_count
 
 
 def _choose_repaired_draft(
@@ -2411,8 +2438,17 @@ def _choose_repaired_draft(
     """
     if not candidate.has_content:
         return original
-    before_semantic, before_coverage, before_missing = _chunk_quality(original, source)
-    after_semantic, after_coverage, after_missing = _chunk_quality(candidate, source)
+    before_semantic, before_coverage, before_missing, before_invented = _chunk_quality(
+        original, source
+    )
+    after_semantic, after_coverage, after_missing, after_invented = _chunk_quality(
+        candidate, source
+    )
+    # A part that introduces an invented value is never chosen, whatever else it
+    # improves: the candidate would otherwise smuggle a fabricated number into
+    # a booklet the document-level gate would still call an improvement.
+    if after_invented > before_invented:
+        return original
     if after_semantic > before_semantic:
         if after_coverage < before_coverage or after_missing > before_missing:
             return original
@@ -2420,6 +2456,13 @@ def _choose_repaired_draft(
     if after_semantic < before_semantic:
         return original
     if after_coverage > before_coverage and after_missing <= before_missing:
+        return candidate
+    # Equal recall: only removing an invented value justifies the swap.
+    if (
+        after_invented < before_invented
+        and after_coverage >= before_coverage
+        and after_missing <= before_missing
+    ):
         return candidate
     return original
 
@@ -2461,10 +2504,14 @@ async def _repair_notes_if_needed(
       and does not reintroduce the whole lecture.
     """
     report = run_note_qa(merged, source_chunks)
+    # The pass fires on information *loss* (missing numbers/units/coverage) or
+    # on a fabricated fact: a value the notes state that the lecture never
+    # mentions is a correctness defect a recall check cannot see, and the one
+    # deliverable a student cannot audit by reading.
     if (
         not settings.note_repair_enabled
         or not _pass_allowed("repair")
-        or not report.needs_repair
+        or not (report.needs_repair or report.has_unsupported_facts)
     ):
         return merged
 
@@ -2478,19 +2525,21 @@ async def _repair_notes_if_needed(
     unit_types = sorted({unit.type for unit in missing_units})
     logger.warning(
         "Note QA triggered the repair pass %s coverage=%.2f semantic=%.2f ratio=%.3f "
-        "missing_signals=%s missing_units=%s",
+        "missing_signals=%s missing_units=%s invented=%s",
         label,
         report.coverage,
         report.semantic_coverage,
         report.compression_ratio,
         ",".join(missing[:6]) or "-",
         ",".join(unit_types) or "-",
+        ",".join(report.unsupported_numbers[:6]) or "-",
     )
     await _emit_lifecycle(
         "note_repair_started",
         qa_coverage=round(report.coverage, 3),
         qa_semantic_coverage=round(report.semantic_coverage, 3),
         qa_compression_ratio=round(report.compression_ratio, 4),
+        qa_unsupported=report.unsupported_count,
     )
     try:
         # The repair re-reads the *same documents* the first pass used, with the
@@ -2500,7 +2549,8 @@ async def _repair_notes_if_needed(
         # text at all. The only added cost is the bounded repair framing.
         framing = len(
             build_repair_prompt(
-                "", missing, report.findings, notes_text(merged), ()
+                "", missing, report.findings, notes_text(merged), (),
+                report.unsupported_numbers,
             )
         ) + len(REPAIR_REMINDER)
         if any(len(document) + framing > max_chars for document in source_chunks):
@@ -2535,6 +2585,7 @@ async def _repair_notes_if_needed(
                     missing_units=tuple(
                         by_chunk.get(index, [])[:MAX_UNITS_IN_REPAIR_PROMPT]
                     ),
+                    unsupported=report.unsupported_numbers,
                 ),
                 settings,
                 session,

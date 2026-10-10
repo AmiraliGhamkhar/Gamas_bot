@@ -509,6 +509,55 @@ class RepairPassTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(len(call.args[0]), 4000)
 
 
+    #: A booklet that restates every source unit *and* adds a dosage the
+    #: lecture never stated. Recall is perfect; the invented 2500 mg is the
+    #: only defect, and a recall-only QA could not see it.
+    INVENTED = {
+        "title": "د",
+        "summary": "s",
+        "sections": [
+            {
+                "heading": "د",
+                "paragraphs": [
+                    "در این جلسه دربارهٔ دیابت بود. دوز متفورمین 500 mg است. "
+                    "HbA1c باید زیر 7% باشد. فشار خون 120/80 و نبض 80 bpm است. "
+                    "همچنین دوز 2500 mg توصیه شد."
+                ],
+            }
+        ],
+    }
+
+    async def test_invented_value_triggers_the_corrective_pass(self):
+        """A fabricated fact is corrected even when nothing needs restoring."""
+        notes, calls = await self._run([self.INVENTED, self.RICH])
+        self.assertEqual(calls, 2)
+        report = run_note_qa(notes, self._chunks())
+        self.assertFalse(report.has_unsupported_facts, report.unsupported_numbers)
+        self.assertEqual(report.coverage, 1.0)
+
+    async def test_faithful_notes_never_trigger_a_corrective_call(self):
+        # Regression guard: the new precision trigger must not fire on a
+        # booklet that adds nothing.
+        notes, calls = await self._run([self.RICH])
+        self.assertEqual(calls, 1)
+        self.assertFalse(run_note_qa(notes, self._chunks()).has_unsupported_facts)
+
+    async def test_a_provider_that_keeps_the_invented_value_is_not_accepted(self):
+        """The pass cannot lower quality by swapping in an equally wrong answer."""
+        notes, calls = await self._run([self.INVENTED, self.INVENTED])
+        self.assertEqual(calls, 2)
+        # The original is kept unchanged rather than "repaired" into another
+        # invented booklet; the QA finding is what surfaces the problem.
+        report = run_note_qa(notes, self._chunks())
+        self.assertTrue(report.has_unsupported_facts)
+
+    async def test_corrective_pass_respects_disabled_repair(self):
+        notes, calls = await self._run(
+            [self.INVENTED, self.RICH], make_settings(note_repair_enabled=False)
+        )
+        self.assertEqual(calls, 1)
+
+
 class RepairPromptTests(unittest.TestCase):
     def test_repair_prompt_names_missing_signals_and_forbids_invention(self):
         prompt = S.build_repair_prompt("متن", ("500 mg", "HbA1c"), ("gap",))

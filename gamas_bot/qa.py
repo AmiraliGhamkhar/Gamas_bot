@@ -19,6 +19,14 @@ What it detects:
   explanations) that survived. Signal-level checks alone are blind to the
   worst failure mode: a document can keep every number and term while
   deleting the explanation that made them meaningful;
+* **added content** — numbers with units/percentages/BP pairs, and strong
+  technical tokens (acronyms, digit-bearing terms such as ``HbA1c``), that the
+  notes state but no source chunk contains. This is the deterministic
+  fingerprint of a *hallucinated* fact (a fabricated dosage, lab value or
+  statistic). The check is deliberately conservative — a token is only
+  "unsupported" when it is absent from the source *and* shares no digit run
+  with it — so a formatting difference (``۱۲۰/۸۰`` vs ``120/80``) is never
+  mistaken for an invention;
 * length/compression facts, reported as evidence and deliberately *not*
   treated as a failure on their own, because a lecture can legitimately be
   tightened a long way without losing information.
@@ -606,6 +614,13 @@ class NoteQAReport:
     missing_numbers: tuple[str, ...] = ()
     missing_terms: tuple[str, ...] = ()
     uncovered_chunks: tuple[int, ...] = ()
+    #: Precision side of the comparison: what the notes state that no source
+    #: chunk supports. Reported as the fingerprint of added ("hallucinated")
+    #: content; see :func:`run_note_qa`.
+    notes_numbers: int = 0
+    notes_terms: int = 0
+    unsupported_numbers: tuple[str, ...] = ()
+    unsupported_terms: tuple[str, ...] = ()
     notes_text_chars: int = 0
     findings: tuple[str, ...] = field(default_factory=tuple)
     # Length / compression facts (added for measurable before/after checks).
@@ -665,6 +680,23 @@ class NoteQAReport:
     def missing_units_count(self) -> int:
         """How many expected content units were not preserved."""
         return max(self.total_units - self.covered_units, 0)
+
+    @property
+    def unsupported_count(self) -> int:
+        """How many invented values/strong terms the notes state."""
+        return len(self.unsupported_numbers) + len(self.unsupported_terms)
+
+    @property
+    def has_unsupported_facts(self) -> bool:
+        """True when the notes state a measured value the lecture never mentions.
+
+        A *missing* number is information loss that a recall check can see; an
+        *added* number cannot be — it is a correctness defect of its own, and
+        the one failure mode a student cannot detect by reading. Only the
+        conservative numeric signal is strong enough to gate a corrective
+        pass; unsupported terms are reported but never used to trigger one.
+        """
+        return bool(self.unsupported_numbers)
 
     @property
     def compression_is_concerning(self) -> bool:
@@ -742,6 +774,27 @@ def _extract_numbers(text: str) -> set[str]:
     for match in _BP_PAIR.finditer(normalized):
         found.add(f"{match.group(1)}/{match.group(2)}")
     return found
+
+
+#: A run of digits, used to decide whether an apparently unseen value is a
+#: genuine invention or merely the same magnitude written differently.
+_DIGIT_RUN = re.compile(r"\d+")
+
+
+def _digit_parts(value: str) -> set[str]:
+    """The digit runs of a value, digit-normalised (``۵۰۰`` -> ``500``)."""
+    return set(_DIGIT_RUN.findall(_normalize_digits(value)))
+
+
+def _is_strong_term(term: str) -> bool:
+    """A term whose absence from the source is a *strong* invention signal.
+
+    An ordinary lowercase English word is too noisy to accuse: a Persian
+    lecture rephrased with a different English word is not proof that a fact
+    was invented. An acronym or a digit-bearing token (``MRI``, ``HbA1c``,
+    ``COVID19``) that the notes contain but no source chunk does is.
+    """
+    return any(ch.isdigit() for ch in term) or (term.isupper() and len(term) >= 2)
 
 
 def _extract_terms(text: str) -> set[str]:
@@ -844,6 +897,26 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         else:
             covered_chunks += 1
 
+    # Precision: the deterministic fingerprint of *added* content. A value is
+    # only called unsupported when its canonical token is absent from every
+    # source chunk *and* none of its digit runs occurs anywhere in the source,
+    # so a formatting difference (``۱۲۰/۸۰`` vs ``120/80``, ``۵۰۰ میلی‌گرم``
+    # vs ``500 mg``) is never mistaken for an invention. Terms are additionally
+    # restricted to strong tokens (acronyms, digit-bearing forms) because an
+    # ordinary rephrased English word is not evidence of fabrication.
+    source_digits = _digit_parts(" ".join(source_chunks))
+    unsupported_numbers = {
+        token
+        for token in (rendered_numbers - source_numbers)
+        if not (_digit_parts(token) & source_digits)
+    }
+    source_terms_folded = {term.casefold() for term in source_terms}
+    unsupported_terms = {
+        term
+        for term in rendered_terms
+        if term.casefold() not in source_terms_folded and _is_strong_term(term)
+    }
+
     # Semantic completeness: the fraction of educational content units
     # (definitions, examples, procedures, warnings, comparisons, explanations)
     # that survived. This is the check that catches a deleted explanation even
@@ -869,6 +942,10 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         missing_numbers=tuple(sorted(missing_numbers)[:MAX_REPORTED_FINDINGS]),
         missing_terms=tuple(sorted(missing_terms)[:MAX_REPORTED_FINDINGS]),
         uncovered_chunks=tuple(uncovered[:MAX_REPORTED_FINDINGS]),
+        notes_numbers=len(rendered_numbers),
+        notes_terms=len(rendered_terms),
+        unsupported_numbers=tuple(sorted(unsupported_numbers)[:MAX_REPORTED_FINDINGS]),
+        unsupported_terms=tuple(sorted(unsupported_terms)[:MAX_REPORTED_FINDINGS]),
         notes_text_chars=len(rendered),
         source_chars=source_chars,
         total_chunks=signal_chunks,
@@ -895,6 +972,16 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
             "chunks with no preserved signal: "
             + ", ".join(str(index) for index in report.uncovered_chunks)
         )
+    if report.unsupported_numbers:
+        findings.append(
+            "invented values in notes (absent from the source): "
+            + ", ".join(report.unsupported_numbers)
+        )
+    if report.unsupported_terms:
+        findings.append(
+            "terms in notes absent from the source: "
+            + ", ".join(report.unsupported_terms)
+        )
     if report.missing_units_count:
         findings.append(
             f"missing educational content: {report.missing_units_count} unit(s) of type "
@@ -911,7 +998,8 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
 
     logger.info(
         "Note QA mode=%s source_chars=%s notes_chars=%s ratio=%.3f coverage=%.2f "
-        "semantic=%.2f units=%s/%s chunk_coverage=%.2f numbers=%s/%s terms=%s/%s",
+        "semantic=%.2f units=%s/%s chunk_coverage=%.2f numbers=%s/%s terms=%s/%s "
+        "invented=%s/%s",
         getattr(notes, "note_mode", "?"),
         report.source_chars,
         report.notes_text_chars,
@@ -925,6 +1013,8 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         report.source_numbers,
         report.preserved_terms,
         report.source_terms,
+        report.unsupported_count,
+        report.notes_numbers + report.notes_terms,
     )
     if report.has_findings:
         logger.warning(
