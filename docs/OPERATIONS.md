@@ -93,6 +93,40 @@ be presented as a health check.
   `--live` calls the configured model and may incur provider cost; use only after
   reviewing the billing attestation, route, and account spend cap.
 
+## STT platform operations
+
+* `🎙 پلتفرم STT` in the Telegram admin panel manages STT providers (registry
+  cards with free class, limits and privacy fields), STT models (including
+  `DEPRECATED` marking with a replacement suggestion), the data-driven route
+  (`stt_routes`: order, enable/disable, per-leg model override), quotas
+  (admin budget ceilings + observed snapshots with the safety margin), read-only
+  health, event logs, the provider test tool and the redacted dry-run request
+  viewer. The full reference is [STT_PROVIDERS.md](STT_PROVIDERS.md).
+* Defaults are `STT_FREE_ONLY=true`, `STT_ALLOW_TRIAL_PROVIDERS=false`,
+  `STT_ALLOW_PAID_FALLBACK=false`. Speechmatics and Deepgram stay in the trial
+  allowlist so existing deployments keep working; any other trial-class provider
+  needs an explicit opt-in. A `paid` billing attestation blocks free/trial use of
+  that provider.
+* Route precedence: admin `stt_routes` rows, then `STT_DEFAULT_ROUTE`, then the
+  legacy `STT_PRIMARY` chain. Editing the route in the panel needs no restart
+  and no code change.
+* Quota budgets are admin attestations of the remaining no-overage allocation
+  seen in the provider console. The job reserves from them atomically before the
+  HTTP request (safety margin applied) and never displays a manufactured
+  remaining value: unknown stays Unknown.
+* Health checks are READ_ONLY_HEALTH (metadata/model/quota endpoints, no audio).
+  The test tool's sample modes are GENERATION_TEST and consume real provider
+  quota; run them deliberately. Sample fixtures live in
+  `tests/fixtures/stt/samples/` (see `tests/fixtures/stt/README.md`).
+* Benchmarks: `python -m scripts.benchmark_stt --plan sample.wav` shows route
+  decisions without sending audio; a full run records WER/CER, terminology and
+  numeric preservation, quality signals and the weighted score per profile.
+  Provider ranking must come from real Persian Gamas fixtures — never from
+  marketing claims or English WER.
+* Structured STT events (`stt_provider_events`, `stt_usage_records`) carry
+  provider/model/status/latency/quota metadata only. Transcript text, audio
+  content, prompts and secrets are never logged (spec §54/§73).
+
 ## Logs
 
 `LOG_FORMAT=json` emits structured operational metadata. `LOG_FILE` enables

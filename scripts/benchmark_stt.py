@@ -4,49 +4,26 @@ import argparse
 import asyncio
 import csv
 import logging
-import re
-import string
 import sys
 import time
-import unicodedata
 from dataclasses import replace
 from pathlib import Path
 
 from gamas_bot.config import Settings
 from gamas_bot.stt import STT_PROVIDERS, _language_error, transcribe
+from gamas_bot.stt_platform.benchmark_metrics import (
+    BENCHMARK_PROFILES,
+    normalize_words,
+    profile_from_path,
+    result_row,
+    word_error_rate,
+)
 from gamas_bot.stt_platform.adapters import get_audio_duration_seconds
 from gamas_bot.stt_platform.policy import SttPolicy
 from gamas_bot.stt_platform.registry import STT_PROVIDER_REGISTRY
 from gamas_bot.stt_platform.router import CandidateFacts, SttRequirements, plan_route
 
-PERSIAN_NORMALIZATION = str.maketrans({"ي": "ی", "ى": "ی", "ك": "ک", "ۀ": "ه", "ة": "ه"})
-
-
-def normalize_words(text: str) -> list[str]:
-    text = unicodedata.normalize("NFKC", text).translate(PERSIAN_NORMALIZATION)
-    text = re.sub(r"[\u064b-\u065f\u0670\u0640]", "", text)
-    text = text.translate(str.maketrans("", "", string.punctuation + "،؛؟٪٬٫«»…“”‘’"))
-    return text.split()
-
-
-def word_error_rate(reference: str, hypothesis: str) -> float:
-    ref = normalize_words(reference)
-    hyp = normalize_words(hypothesis)
-    if not ref:
-        return 0.0 if not hyp else float("inf")
-    previous = list(range(len(hyp) + 1))
-    for row, ref_word in enumerate(ref, start=1):
-        current = [row]
-        for column, hyp_word in enumerate(hyp, start=1):
-            current.append(
-                min(
-                    current[column - 1] + 1,
-                    previous[column] + 1,
-                    previous[column - 1] + (ref_word != hyp_word),
-                )
-            )
-        previous = current
-    return previous[-1] / len(ref)
+__all__ = ["word_error_rate", "normalize_words", "main"]
 
 
 def plan_report(settings: Settings, audio: Path) -> list[dict[str, str]]:
@@ -87,6 +64,15 @@ def plan_report(settings: Settings, audio: Path) -> list[dict[str, str]]:
     return rows
 
 
+def load_terms(path: Path | None) -> tuple[str, ...]:
+    """One terminology entry per line (drug names, acronyms, technical terms)."""
+    if path is None or not path.is_file():
+        return ()
+    return tuple(
+        line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()
+    )
+
+
 async def run(args: argparse.Namespace) -> None:
     settings = Settings.from_env()
     if getattr(args, "plan", False):
@@ -105,6 +91,7 @@ async def run(args: argparse.Namespace) -> None:
     ]
     if not engines:
         raise SystemExit("هیچ سرویس STT پیکربندی نشده است؛ مقایسه‌ای برای انجام نیست.")
+    terms = load_terms(getattr(args, "terms", None))
     rows: list[dict[str, str | float]] = []
     logging.basicConfig(level=logging.WARNING)
     for audio in args.audio:
@@ -113,6 +100,8 @@ async def run(args: argparse.Namespace) -> None:
             continue
         reference_path = audio.with_suffix(audio.suffix + ".txt")
         reference = reference_path.read_text(encoding="utf-8") if reference_path.exists() else None
+        profile = getattr(args, "profile", None) or profile_from_path(audio)
+        duration = get_audio_duration_seconds(audio)
         for engine in engines:
             # Pin the route to this engine: the free-only policy still applies,
             # so a refused engine shows up as a failed row with its reason.
@@ -132,40 +121,70 @@ async def run(args: argparse.Namespace) -> None:
                 if result.engine != engine:
                     raise ValueError("Requested benchmark engine was not used")
                 elapsed = round(time.perf_counter() - started, 3)
-                rows.append({
+                row = result_row(
+                    provider=engine,
+                    model=str(STT_PROVIDER_REGISTRY[engine].default_model or ""),
+                    profile=profile,
+                    language=settings.stt_language,
+                    audio_duration=duration,
+                    reference=reference,
+                    hypothesis=result.text,
+                    terms=terms,
+                    latency_seconds=elapsed,
+                    reliability=1.0,
+                    quota_efficiency=None,
+                )
+                row.pop("provider", None)
+                row.update({
                     "sample": audio.name,
                     "engine": engine,
                     "status": "ok",
-                    "latency_seconds": elapsed,
                     "file_size_mb": round(audio.stat().st_size / (1024 * 1024), 3),
                     "confidence": result.confidence if result.confidence is not None else "",
-                    "wer": round(word_error_rate(reference, result.text), 4) if reference is not None else "",
                     "reference_file": reference_path.name if reference is not None else "",
                     "error": "",
                     "evidence": STT_PROVIDER_REGISTRY[engine].evidence,
                 })
+                rows.append(row)
             except Exception as exc:
                 elapsed = round(time.perf_counter() - started, 3)
                 logging.exception("%s failed for %s", engine, audio.name)
                 rows.append({
                     "sample": audio.name,
                     "engine": engine,
+                    "model": str(STT_PROVIDER_REGISTRY[engine].default_model or ""),
+                    "profile": profile,
+                    "language": settings.stt_language,
+                    "audio_duration_seconds": duration if duration is not None else "",
                     "status": "failed",
                     "latency_seconds": elapsed,
                     "file_size_mb": round(audio.stat().st_size / (1024 * 1024), 3),
                     "confidence": "",
                     "wer": "",
+                    "cer": "",
+                    "terminology_preservation": "",
+                    "numeric_preservation": "",
+                    "punctuation_per_100_words": "",
+                    "persian_character_ratio": "",
+                    "latin_character_ratio": "",
+                    "repetition_ratio": "",
+                    "quality_flags": "",
+                    "score": "",
                     "reference_file": reference_path.name if reference is not None else "",
                     "error": str(exc)[:400],
                     "evidence": STT_PROVIDER_REGISTRY[engine].evidence,
                 })
     fields = [
-        "sample", "engine", "status", "latency_seconds", "file_size_mb",
-        "confidence", "wer", "reference_file", "error", "evidence",
+        "sample", "engine", "model", "profile", "language", "audio_duration_seconds",
+        "status", "latency_seconds", "file_size_mb", "confidence",
+        "wer", "cer", "terminology_preservation", "numeric_preservation",
+        "punctuation_per_100_words", "persian_character_ratio", "latin_character_ratio",
+        "repetition_ratio", "quality_flags", "score",
+        "reference_file", "error", "evidence",
     ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", newline="", encoding="utf-8-sig") as output:
-        writer = csv.DictWriter(output, fieldnames=fields)
+        writer = csv.DictWriter(output, fieldnames=fields, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
     print(f"نتایج {len(rows)} ارزیابی در {args.output} ذخیره شد؛ متن فایل‌ها ذخیره نشده است.")
@@ -179,6 +198,18 @@ def main() -> None:
         "--plan",
         action="store_true",
         help="print the route decision per engine to stdout; sends no audio",
+    )
+    parser.add_argument(
+        "--terms",
+        type=Path,
+        default=None,
+        help="file with one medical/technical term per line for terminology preservation",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=BENCHMARK_PROFILES,
+        default=None,
+        help="benchmark category override (default: taken from the fixture directory)",
     )
     args = parser.parse_args()
     asyncio.run(run(args))

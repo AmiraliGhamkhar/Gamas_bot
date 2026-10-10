@@ -64,6 +64,12 @@ moves a job onto an account that is card-billed.
 is set only for those. The other providers are `unverified` or
 `search_snippet`, and must not be routed on the strength of their numbers.
 
+Gemini Transcribe (transcribe + pricing pages) and Groq (speech-to-text +
+rate-limits pages) were re-verified against the live official documentation on
+**2026-10-10**; every recorded claim (models, limits, quota numbers, the
+30-minute diarization/timestamp cap, the free-of-charge tier and the free-tier
+training policy) matched the current pages.
+
 | Provider | Evidence | Free facts (as recorded) | Notes |
 | --- | --- | --- | --- |
 | Gemini Transcribe (`gemini_transcribe`) | `official_docs` | Free tier with rate limits; caps not published in the pages read | Free tier content is **used by Google to improve its products**; paid is not. Caps Unknown. Standard limit 1 h; 30 min with diarization or word timestamps. `custom_vocabulary` cannot be combined with diarization or timestamps. |
@@ -84,21 +90,32 @@ replace it before anyone relies on it.
 
 ## Routing
 
-1. The route is `STT_DEFAULT_ROUTE` if set. Otherwise it is `STT_PRIMARY`
-   followed by `speechmatics`, `deepgram`, `openai_compatible` in that order,
-   which matches the pre-platform behaviour.
-2. Every candidate is evaluated and gets either `eligible` or a list of stable
+1. The effective route is resolved in this order (spec §28/§61):
+   1. the admin-edited `stt_routes` table (the 🎙 STT Platform → «مسیرها» panel),
+      when it holds at least one enabled row;
+   2. `STT_DEFAULT_ROUTE` when set;
+   3. `STT_PRIMARY` followed by `speechmatics`, `deepgram`, `openai_compatible`
+      in that order (the pre-platform behaviour).
+2. Each `stt_routes` row can also carry a per-leg `model_override`, which is
+   applied only for that route leg through the provider's own model field
+   (Speechmatics `model`, Deepgram `model`, native `*_STT_MODEL` mapping).
+3. Every candidate is evaluated and gets either `eligible` or a list of stable
    denial reasons: `trial_not_allowed`, `paid_not_allowed`, `not_configured`,
    `admin_disabled`, `billing_attested_paid`, `persian_unsupported`,
    `language_unsupported`, `file_too_large`, `duration_too_long`,
    `feature_unsupported:*`, `provider_disabled`, `unknown_provider`.
-3. Eligible candidates run in route order. Paid-tier candidates always run after
+4. Eligible candidates run in route order. Paid-tier candidates always run after
    every free, trial and legacy candidate.
-4. `fa` is a hard capability requirement. A provider without `persian_batch` is
+5. `fa` is a hard capability requirement. A provider without `persian_batch` is
    never given Persian audio.
-5. `auto` and `multi` are sent only where the provider documents them. Otherwise
+6. `auto` and `multi` are sent only where the provider documents them. Otherwise
    the provider's documented omission or language identification is used, or the
    candidate is refused with `language_unsupported`.
+7. The user's subscription narrows the policy per job (spec §52): a **free**
+   user's job is always routed free-only even when the deployment enabled paid
+   fallback; a **paid** user's job runs under the deployment's configured
+   `STT_*` policy. The tier can never widen access, and users cannot override
+   provider security.
 
 `scripts/benchmark_stt.py --plan sample.wav` prints the decision for every
 engine without sending audio.
@@ -138,6 +155,12 @@ a low confidence triggers the next provider, and the more confident outcome wins
 
 ## Privacy and data use
 
+* Provider records carry `data_training_policy`, `retention_policy`
+  (`data_retention`), `data_region`, `medical_compliance` and `commercial_use`
+  (spec §53). Values are only recorded where the provider's own documentation
+  supports the claim; everything else stays `unknown` / `none_claimed`, and the
+  admin panel shows that literally. Gamas never labels a provider "HIPAA-safe",
+  "GDPR-safe" or "no-training" on marketing copy.
 * Keys are stored as Fernet ciphertext only. Keys travel in request headers,
   never in URLs. Gemini and Google Cloud STT both send the key as
   `x-goog-api-key`, per Google's guidance to avoid the `key=` query parameter. This
@@ -146,34 +169,79 @@ a low confidence triggers the next provider, and the more confident outcome wins
   status only. Transcripts, audio and raw provider responses are never logged.
 * A free tier may let the provider use the content to improve its products. For
   Gemini, the official pricing page says so for the free tier and says no for the
-  paid tier. **Do not send confidential or medical audio to a free tier.** Gamas
-  makes no "HIPAA-safe", "GDPR-safe" or "no-training" claim for any provider
-  without official support.
+  paid tier. **Do not send confidential or medical audio to a free tier.** For
+  medical audio the admin panel surfaces a warning whenever the selected
+  provider's `medical_compliance` is `none_claimed` (the default).
 
 ## Operations
 
-* There is no Telegram admin screen for STT provider settings yet. `enabled` and
-  `billing_state` are set through the database helper
-  `Database.stt_provider_settings_upsert`, and budgets through
-  `Database.stt_quota_set_budget`. Both are audited with the admin ID.
-* `stt_provider_events` and `stt_usage_records` hold the audit trail, with the
-  events listed in `gamas_bot/stt_platform/events.py`.
-* Per-provider concurrency defaults to the provider profile (1 or 2). A third
-  concurrent job for one provider waits in a queue. It does not fail.
+The 🎙 STT Platform admin screens (Telegram: «⚙️ پنل مدیریت» → «🎙 پلتفرم STT»,
+namespace `admin:stt`, implemented in `gamas_bot/admin_stt.py`) cover:
+
+* **Providers** — registry-backed cards (protocol, auth, free class, limits,
+  languages, batch/realtime, privacy fields) with enable/disable and
+  `billing_state` attestation (`unknown` / `free` / `paid`);
+* **Models** — the `stt_model_registry` cache and reviewed seeds; a model can be
+  marked `DEPRECATED` (never deleted) and the panel offers a replacement
+  recommendation (spec §48/§49);
+* **Routes** — the data-driven route editor (move/enable/disable/remove/add,
+  per-leg `model_override`) writing `stt_routes`, plus the policy summary
+  (Free-only / Trial / Paid fallback) (spec §61);
+* **Quotas** — admin-entered budget ceilings (`stt_quota_budgets`) and observed
+  snapshots (`stt_quota_snapshots`) with the safety margin applied; values the
+  provider never exposed are shown as **Unknown**, never manufactured (spec §62);
+* **Health** — READ_ONLY_HEALTH probes by default; GENERATION_TEST only through
+  the explicit test button (spec §38);
+* **Logs** — `stt_provider_events` with failure filtering (spec §44);
+* **Test tool** — metadata-only or one of three sample transcriptions
+  (10-second / Persian / medical) from `tests/fixtures/stt/samples/`; if the
+  fixture is not installed nothing is sent, and neither audio nor transcript
+  content is ever displayed or logged (spec §39/§64);
+* **Dry-run** — a redacted, provider-native request preview (endpoint, method,
+  headers redacted, form fields, payload structure) with no audio and no secret
+  (spec §63);
+* **Benchmarks** — how to run `scripts/benchmark_stt.py` and the reviewed
+  scoring weights.
+
+The API-key wizard («افزودن کلید (Wizard)») lists **every** STT registry
+provider with its metadata card and model list. The secret is sent alone, the
+message is deleted before persisting — if deletion fails the key is **not**
+stored (spec §36).
+
+Route precedence detail: `stt_routes` rows win over `STT_DEFAULT_ROUTE`, which
+wins over the legacy `STT_PRIMARY` chain. An empty `stt_routes` table (the state
+after upgrading) keeps the pre-platform behaviour unchanged (spec §66).
+
+`stt_provider_events` and `stt_usage_records` hold the audit trail, with the
+events listed in `gamas_bot/stt_platform/events.py`. Per-provider concurrency is
+independent of `MAX_CONCURRENT_JOBS` (provider profile 1-2); a third concurrent
+job for one provider waits in a queue and does not fail (spec §42/§69).
+
+## Benchmarking
+
+`gamas_bot/stt_platform/benchmark_metrics.py` is the offline metric library
+(WER, CER, terminology/numeric preservation, punctuation, quality signals and
+the weighted provider score). `scripts/benchmark_stt.py` measures configured
+engines on real fixtures; the ten benchmark categories and the fixture layout
+are documented in `tests/fixtures/stt/README.md`. No production keys are needed
+in CI and no transcript text is written to results.
 
 ## Not done
 
-* Full Telegram admin wizard. The STT route editor and budget editor are not built.
 * Real-provider production validation. There are no keys in CI, and no live call
   was made in this increment. Native adapters are covered by offline fakes.
-* Real-fixture benchmarks. The benchmark script is upgraded (route plan,
-  evidence column, route pinning with policy), but no measured WER or latency
-  has been recorded, so no provider is ranked.
-* AWS Transcribe, Azure Speech, Soniox and ElevenLabs remain scaffolds, disabled.
+* Real-fixture benchmarks. The benchmark tooling is complete (route plan,
+  metrics, profile column, weighted score, evidence column), but no measured WER
+  or latency has been recorded on Gamas fixtures, so no provider is ranked and
+  the registry `quality_score` values remain unbenchmarked placeholders.
+* AWS Transcribe, Azure Speech, Soniox and ElevenLabs Scribe remain scaffolds,
+  disabled. Soniox is classified `paid_only` (free credits discontinued for new
+  sign-ups) and ElevenLabs Scribe is **not** classified as permanently free.
 * The `x-goog-api-key` header for Gemini and Google Cloud STT, and the Gemini
   `interactions` path, have not been exercised against the live APIs.
-* Speechmatics, AssemblyAI, Gladia, Google, IBM, Azure, AWS, ElevenLabs and
-  Soniox free-tier facts beyond the evidence column are not re-verified here.
+* Gladia, Google Cloud STT, IBM Watson, AWS, Azure and ElevenLabs free-tier
+  facts carry `search_snippet` evidence and must be re-verified against the
+  official pages before routing on the strength of their numbers.
 * Emergency chunking is not implemented. Whole-file transcription only.
 
 ## Sources

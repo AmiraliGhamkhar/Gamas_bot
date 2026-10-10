@@ -228,8 +228,8 @@ def _seed(provider: str, model: str, **kwargs) -> STTModelInfo:
 
 
 #: Reviewed static seeds. Facts here were verified against official
-#: documentation on 2026-10-09; live discovery overlays availability and never
-#: deletes history (spec §48/§49).
+#: documentation (Gemini Transcribe and Groq re-verified 2026-10-10); live
+#: discovery overlays availability and never deletes history (spec §48/§49).
 STATIC_STT_MODELS: dict[str, list[STTModelInfo]] = {
     "speechmatics": [
         _seed("speechmatics", "enhanced", display_name="Enhanced (highest accuracy)",

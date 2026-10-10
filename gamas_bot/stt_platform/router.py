@@ -232,15 +232,20 @@ def plan_route(
     facts_by_provider: Mapping[str, CandidateFacts],
     *,
     policy: SttPolicy | None = None,
+    route: tuple[str, ...] | None = None,
 ) -> RoutePlan:
     """Evaluate every routed provider and return the execution order.
 
     Paid-tier candidates always run after every free/trial/legacy candidate.
     With ``STT_FALLBACK_ENABLED=false`` only the first eligible provider runs.
     ``STT_MAX_PROVIDER_FAILOVERS`` caps how many providers one job may try.
+
+    ``route`` overrides the settings-derived order when the admin-edited
+    ``stt_routes`` table supplies one (spec §28 data-driven routes); ``None``
+    keeps the historical ``STT_PRIMARY``/``STT_DEFAULT_ROUTE`` resolution.
     """
     policy = policy or SttPolicy.from_settings(settings)
-    route = resolve_route(settings)
+    route = tuple(route) if route is not None else resolve_route(settings)
     decisions = []
     for position, name in enumerate(route):
         facts = facts_by_provider.get(name) or CandidateFacts(has_credential=False)

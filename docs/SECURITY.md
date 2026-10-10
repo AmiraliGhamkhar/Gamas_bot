@@ -42,6 +42,10 @@ and no others.
 under `PROVIDER_CREDENTIALS_ENCRYPTION_KEY`, which is environment-only. The
 admin panels show a masked tail and never the value. A key message in Telegram
 is deleted before being stored, and if deletion fails the key is *not* stored.
+This covers every STT provider key added through the STT wizard (spec §36) as
+well as note providers. The STT test tool and dry-run viewer never render a key,
+an authorization header, raw audio or transcript text, and sample-test audio is
+never copied to a temporary file.
 
 **Authorization.** Every admin action requires the sender to be in `ADMIN_IDS`;
 admin panels refuse to run in group chats; a banned user is refused at both the
@@ -55,7 +59,12 @@ request per user is enforced by a unique index.
 
 **Log hygiene.** Structured logs carry a job identifier, provider attempt
 counts, timings and failure classes. Transcripts, API keys, ciphertext and
-receipt contents are never logged.
+receipt contents are never logged. STT lifecycle events
+(`stt_provider_events`, `stt_usage_records`) carry the same metadata-only
+fields; event field names are allow-listed and values are screened for secret
+markers before writing (spec §44/§54). The test suite asserts that panel output
+and logs never contain a configured key, a bearer token or a raw provider
+response (spec §73).
 
 **Single instance.** An advisory lock on the Telegram session path prevents two
 processes from polling the same bot account.

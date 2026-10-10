@@ -24,7 +24,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 from pathlib import Path
@@ -872,6 +872,66 @@ class _AdminState:
     billing_state: str = ""
 
 
+async def _db_route_plan(db: Any) -> tuple[tuple[str, ...], dict[str, str]] | None:
+    """Admin-edited ``stt_routes`` order plus per-leg model overrides.
+
+    The STT Routes panel writes this table (spec §28/§61), so provider order
+    and per-leg models are data-driven and need no code change. Returns
+    ``None`` when the table holds no enabled rows: deployments without
+    panel-managed routes keep the settings-derived order unchanged (spec §66).
+    """
+    if db is None:
+        return None
+    try:
+        rows = await db.stt_routes_list(enabled_only=True)
+    except Exception:
+        logger.warning("Could not read stt_routes; falling back to the settings route")
+        return None
+    route = tuple(str(row.get("provider") or "").strip().lower() for row in rows)
+    route = tuple(name for name in route if name)
+    if not route:
+        return None
+    overrides = {
+        str(row.get("provider") or "").strip().lower(): str(row.get("model_override") or "").strip()
+        for row in rows
+        if row.get("provider") and row.get("model_override")
+    }
+    return route, {name: model for name, model in overrides.items() if model}
+
+
+def _job_policy(settings: Settings, plan_tier: str | None) -> SttPolicy:
+    """Free/trial/paid policy for one job (spec §52).
+
+    A free user's job is always free-only, even when the deployment enabled
+    paid fallback for paying users. The tier never *widens* access: a paid job
+    still runs under the deployment's configured ``STT_*`` policy, and an admin
+    override happens through the admin panel, not through user input.
+    """
+    policy = SttPolicy.from_settings(settings)
+    if str(plan_tier or "").strip().lower() == "free" and not policy.free_only:
+        return replace(policy, free_only=True)
+    return policy
+
+
+def _settings_with_model(settings: Settings, engine: str, override: str | None) -> Settings:
+    """Apply one route-leg ``model_override`` to the settings of that attempt.
+
+    Each provider family stores its model in its own field; the override lands
+    in exactly one of them so every request keeps its historical shape.
+    """
+    if not override:
+        return settings
+    if engine == "speechmatics":
+        return replace(settings, speechmatics_operating_point=override)
+    if engine == "deepgram":
+        return replace(settings, deepgram_model=override)
+    if engine == "openai_compatible":
+        return replace(settings, stt_openai_model=override)
+    pairs = dict(settings.stt_provider_models)
+    pairs[engine] = override
+    return replace(settings, stt_provider_models=tuple(pairs.items()))
+
+
 def _native_model_label(provider: str, settings: Settings) -> str:
     configured = settings.stt_model(provider)
     if configured:
@@ -1314,6 +1374,7 @@ async def transcribe(
     credentials: ProviderCredentialManager | None = None,
     submission_id: int | None = None,
     job_id: str = "",
+    plan_tier: str | None = None,
 ) -> Transcript:
     """Transcribe with planned provider routing, fallback and key rotation.
 
@@ -1321,6 +1382,10 @@ async def transcribe(
     to another eligible engine instead of being split. The route, free/trial
     policy, quota reservations and quality gate are applied per candidate, and
     the legacy confidence rule picks between results exactly as before.
+
+    ``plan_tier`` (``"free"`` / ``"paid"``) narrows the policy for the caller's
+    subscription (spec §52): a free user's job is always routed free-only, and
+    the value can never widen access beyond the deployment's configured policy.
     """
     db = getattr(credentials, "db", None)
     events = STTEventLogger(db)
@@ -1339,6 +1404,7 @@ async def transcribe(
             submission_id=submission_id,
             file_size=file_size,
             duration=duration,
+            plan_tier=plan_tier,
         )
     finally:
         _QUOTA_TRACKER.reset(token)
@@ -1355,6 +1421,7 @@ async def _transcribe_routed(
     submission_id: int | None,
     file_size: int,
     duration: float | None,
+    plan_tier: str | None = None,
 ) -> Transcript:
     job_started = time.monotonic()
     req = SttRequirements.for_job(
@@ -1365,9 +1432,14 @@ async def _transcribe_routed(
         word_timestamps=bool(settings.stt_request_word_timestamps),
         vocabulary_terms=len(vocabulary_hints(settings).terms),
     )
+    db_route = await _db_route_plan(db)
+    if db_route is not None:
+        effective_route, model_overrides = db_route
+    else:
+        effective_route, model_overrides = resolve_route(settings), {}
     facts: dict[str, CandidateFacts] = {}
     key_pools: dict[str, list] = {}
-    for name in resolve_route(settings):
+    for name in effective_route:
         if name not in STT_PROVIDERS:
             continue
         key_pools[name] = await _credential_pool(name, settings, credentials)
@@ -1379,7 +1451,13 @@ async def _transcribe_routed(
             max_upload=STT_PROVIDERS[name].max_upload(settings),
             language_error=_language_error(name, settings),
         )
-    plan = plan_route(settings, req, facts, policy=SttPolicy.from_settings(settings))
+    plan = plan_route(
+        settings,
+        req,
+        facts,
+        policy=_job_policy(settings, plan_tier),
+        route=effective_route,
+    )
     for decision in plan.decisions:
         logger.info(
             "STT route decision %s",
@@ -1405,7 +1483,8 @@ async def _transcribe_routed(
         for index, engine in enumerate(plan.execution):
             started = time.monotonic()
             position = plan.route.index(engine) if engine in plan.route else 0
-            model = _native_model_label(engine, settings)
+            engine_settings = _settings_with_model(settings, engine, model_overrides.get(engine))
+            model = _native_model_label(engine, engine_settings)
             logger.info(
                 "STT attempt started provider=%s file_bytes=%s attempt=%s/%s",
                 engine,
@@ -1430,7 +1509,7 @@ async def _transcribe_routed(
                         engine,
                         session,
                         audio_path,
-                        settings,
+                        engine_settings,
                         key_pools.get(engine) or [],
                         credentials=credentials,
                         db=db,

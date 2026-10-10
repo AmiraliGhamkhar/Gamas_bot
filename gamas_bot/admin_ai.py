@@ -49,6 +49,8 @@ from .ai.tokens import estimate_tokens
 from .ai.usage import sanitize_text
 from .database import utc_now
 from .provider_health import cooldown_remaining_seconds
+from .stt_platform.models import static_stt_models
+from .stt_platform.registry import STT_PROVIDER_REGISTRY, free_class_fa
 
 SERVICE = "notes"
 TASK = TASK_CHUNK
@@ -125,6 +127,28 @@ def _fmt_int(value) -> str:
         return f"{int(value):,}".replace(",", "/")
     except Exception:
         return str(value)
+
+
+def _stt_size_label(size) -> str:
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        return "نامشخص"
+    if size >= 1_000_000_000:
+        return f"{size / 1_000_000_000:.1f} GB"
+    if size >= 1_000_000:
+        return f"{size / 1_000_000:.0f} MB"
+    return f"{size} B"
+
+
+def _stt_duration_label(seconds) -> str:
+    try:
+        total = int(seconds)
+    except (TypeError, ValueError):
+        return "نامشخص"
+    if total <= 0:
+        return "نامشخص"
+    return f"{total} ثانیه ({total // 60} دقیقه)"
 
 
 def _requires_paid_billing(row: dict) -> bool:
@@ -1227,16 +1251,26 @@ class AIPanels:
         if not slug:
             if service == "stt":
                 lines = [
-                    "🧭 راهنمای افزودن کلید (مرحله ۲ از ۹ — انتخاب ارائه‌دهنده)",
+                    "🧭 راهنمای افزودن کلید (مرحله ۲ از ۹ — انتخاب ارائه‌دهندهٔ STT)",
                     "",
                     "ارائه‌دهندهٔ تبدیل گفتار به متن (STT) را انتخاب کنید:",
+                    "موارد ⏸ در registry غیرفعال‌اند (آزمایشی/پولی/تأییدنشده).",
                 ]
-                buttons = [
-                    [Button.inline("Speechmatics", b"admin:ai:wiz:pv:stt:speechmatics")],
-                    [Button.inline("Deepgram", b"admin:ai:wiz:pv:stt:deepgram")],
-                    [Button.inline("OpenAI Compatible (Whisper)", b"admin:ai:wiz:pv:stt:openai_compatible")],
-                    [Button.inline("↩️ مرحله قبل", b"admin:ai:wiz")],
-                ]
+                buttons = []
+                stt_slugs = list(STT_PROVIDER_REGISTRY)
+                for index in range(0, len(stt_slugs), 2):
+                    row = []
+                    for provider_slug in stt_slugs[index : index + 2]:
+                        info = STT_PROVIDER_REGISTRY[provider_slug]
+                        mark = "⏸" if not info.enabled else ("🧪" if info.experimental else "🎙")
+                        row.append(
+                            Button.inline(
+                                f"{mark} {info.display_name}"[:60],
+                                f"admin:ai:wiz:pv:stt:{provider_slug}".encode("ascii"),
+                            )
+                        )
+                    buttons.append(row)
+                buttons.append([Button.inline("↩️ مرحله قبل", b"admin:ai:wiz")])
             else:
                 lines = [
                     "🧭 راهنمای افزودن کلید (مرحله ۲ از ۹ — انتخاب ارائه‌دهنده)",
@@ -1270,36 +1304,43 @@ class AIPanels:
             await self.bot._edit_callback(event, "\n".join(lines), buttons)
             return
 
-        # STEP 3 & 4: Automatically load base URL, protocol, auth style, and pick model
+        # STEP 3 & 4: Provider metadata card (from the STT registry) + model pick
         if service == "stt":
-            stt_info = {
-                "speechmatics": ("https://api.speechmatics.com/v2", "REST", "Bearer", "سهمیه استاندارد"),
-                "deepgram": ("https://api.deepgram.com/v1", "REST", "Token", "سهمیه اشتراک/اعتبار"),
-                "openai_compatible": (
-                    bot.settings.stt_openai_base_url or "https://api.openai.com/v1",
-                    "OpenAI Audio",
-                    "Bearer",
-                    "متغیر بر اساس سرویس‌دهنده",
-                ),
-            }.get(slug, ("", "REST", "Bearer", "نامشخص"))
-            stt_models = {
-                "deepgram": ["nova-3", "nova-2"],
-                "speechmatics": ["default"],
-                "openai_compatible": [bot.settings.stt_openai_model or "whisper-1"],
-            }.get(slug, ["default"])
-
+            info = STT_PROVIDER_REGISTRY.get(slug)
+            if info is None:
+                await event.answer("ارائه‌دهندهٔ ناشناخته است.", alert=True)
+                return
+            stt_models = list(
+                dict.fromkeys(list(info.models) + [seed.model for seed in static_stt_models(slug)])
+            )
+            default_openai = bot.settings.stt_openai_model or "whisper-1"
+            if slug == "openai_compatible":
+                stt_models = list(dict.fromkeys([default_openai] + stt_models))
+            base_url = {
+                "speechmatics": bot.settings.speechmatics_base_url,
+                "openai_compatible": bot.settings.stt_openai_base_url,
+            }.get(slug) or info.base_url or "وابسته به حساب"
             lines = [
-                f"🧭 راهنمای افزودن کلید (مرحله ۳ و ۴ از ۹) — {slug}",
+                f"🧭 راهنمای افزودن کلید (مرحله ۳ و ۴ از ۹) — {info.display_name}",
                 "",
-                f"پروتکل: {stt_info[1]} | احراز هویت: {stt_info[2]}",
-                f"Base URL پیش‌فرض: {stt_info[0]}",
-                f"وضعیت پلن: {stt_info[3]}",
+                f"۱) ساخت کلید: {info.official_docs_url}",
+                f"۲) پروتکل: {info.protocol} | احراز هویت: {info.authentication_type}",
+                f"۳) Base URL پیش‌فرض: {base_url}",
+                f"۴) وضعیت رایگان: {free_class_fa(slug)}",
+                f"   محدودیت: {info.free_limit or '—'}",
+                f"۵) زبان‌ها: {', '.join(info.language_capabilities) or '—'}",
+                f"۶) حداکثر فایل: {_stt_size_label(info.max_file_size)} | "
+                f"حداکثر مدت: {_stt_duration_label(info.max_audio_duration)}",
+                f"۷) batch={'بله' if info.batch_supported else 'خیر'} | "
+                f"realtime={'بله' if info.realtime_supported else 'خیر'} | "
+                f"فارسی={'بله' if info.persian_batch else 'خیر'}",
+                f"۸) مدل‌های شناخته‌شده: {', '.join(info.models) or '—'}",
                 "",
                 "اکنون مدل پیش‌فرض این کلید را انتخاب کنید:",
             ]
             buttons = []
-            for m in stt_models:
-                buttons.append([Button.inline(f"🎯 {m}", f"admin:ai:wiz:mdl:stt:{slug}:{m}".encode("ascii"))])
+            for m in stt_models[:8]:
+                buttons.append([Button.inline(f"🎯 {m}"[:60], f"admin:ai:wiz:mdl:stt:{slug}:{m}".encode("ascii"))])
             buttons.append([Button.inline("مدل سفارشی / پیش‌فرض", f"admin:ai:wiz:mdl:stt:{slug}:custom".encode("ascii"))])
             buttons.append([Button.inline("↩️ مرحله قبل", f"admin:ai:wiz:srv:{service}".encode("ascii"))])
             await self.bot._edit_callback(event, "\n".join(lines), buttons)
@@ -1340,10 +1381,11 @@ class AIPanels:
         if service == "stt":
             if choice != "custom":
                 model = choice
+            stt_entry = STT_PROVIDER_REGISTRY.get(slug)
             base_url = {
                 "speechmatics": self.bot.settings.speechmatics_base_url,
                 "openai_compatible": self.bot.settings.stt_openai_base_url,
-            }.get(slug)
+            }.get(slug) or (stt_entry.base_url if stt_entry else None)
         else:
             if slug in PROVIDER_REGISTRY:
                 base_url = registry_info(slug).base_url
@@ -1576,6 +1618,15 @@ class AIPanels:
                 [Button.inline("🗺 ثبت منطقه/انقضا", f"admin:ai:pmeta:{slug}".encode("ascii"))]
             )
         buttons.append([Button.inline("❌ حذف کلید", f"admin:ai:kdel:{credential_id}".encode("ascii"))])
+        if str(record.get("service") or "") == "stt":
+            buttons.append(
+                [
+                    Button.inline(
+                        "🧪 تست ترنسکریپشن نمونه (اختیاری — مصرف سهمیه)",
+                        f"admin:stt:tst:{slug}".encode("ascii"),
+                    )
+                ]
+            )
         buttons.append([Button.inline("↩️ کلیدها", f"admin:ai:ky:{slug}".encode("ascii"))])
         await event.respond("\n".join(lines), buttons=buttons)
 
