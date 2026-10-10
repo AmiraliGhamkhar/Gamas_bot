@@ -39,6 +39,7 @@ nothing here is a projection.
 | 22 | `/history` printed `payment_history()`'s ten newest rows under a bare «سوابق پرداخت:» heading with no total | The read is capped at ten by design (and clamped to 50 in SQL), so this is defect 9's family on the user's side rather than defect 21's: after an eleventh payment the list reads as the complete record of what you ever bought, with nothing marking it as a window. The heading now says «۱۰ پرداخت اخیر از N پرداخت» from a new `payment_count()` |
 | 23 | Two panels built a **button label** out of stored free text with no length promise: the purchase button interpolated `plan['name']` (the schema keeps 60 characters) next to the price, and the provider-health button interpolated a credential `label` (whitespace-normalised, never length-checked). Telegram caps a button's text at 64 UTF-16 code units and rejects the *whole* message when one button is over | One long enough plan name or key label made the purchase screen and the health panel undeliverable for every user, not just ugly — the per-button twin of defect 21, invisible with the 35–37-unit labels the seeded catalog ships |
 | 24 | The STT route-step model picker still put the provider's model id *in the callback*: `admin:stt:rset:{provider}:{model}` — after the catalog rows and the budget rows had already been converted to address-by-position, and with `.encode("ascii")` on top | Telegram's `callback_data` budget is 64 bytes for the whole token and the longest shipped STT id needed 59, so one longer id or provider slug made the picker message undeliverable (and a non-ASCII id from a sync raised instead of degrading). The admin could not set a route model at all — the failure mode of defect 9's callback-sizing family, in the one panel that had been missed |
+| 25 | `_deliver_result_documents` carries a comment promising that the raw transcript "is the one deliverable that never depends on the Word document, so it is always sent" — but only the document *build* was guarded; the document *upload* was not, and the fallback text send had no guard at all | A Telegram refusal or a dropped connection on a finished `.docx` unwound the rest of the delivery: the user received neither file nor text, the job was recorded failed and its usage reservation was released — after the model work had already been spent and the note had already been written. A build failure degraded gracefully while a delivery failure lost everything, which is backwards |
 
 Every item above is fixed. Defects 12-21 were found after the first pass and
 closed round by round: the quota screen was bounded, the route annotation added,
@@ -84,7 +85,7 @@ the help, privacy and receipt texts are constant-size, and long documents alread
 | `gamas_bot/ai/routing.py` | Authoritative router. New `DEFAULT_NOTE_ORDER`; `ROUTE_SEED_REVISION`; `ensure_seeded()` → `_seed_order` / `_upgrade_seeded_order`; `plan()` gate order with `skipped: list[tuple[slug, code]]`; `RouteLeg.enabled`; `NoteJobSession._runnable_legs` / `_attempted_legs` / `_leg_budget_seconds()`; Retry-After clamp; provider-wide-fault short circuit; `default_route_order()` for the panel |
 | `gamas_bot/database.py` | `pending_payment_count()` and `unlimited_user_count()` (a real total for panels that used `len()` of a capped list); `list_pending_payments` carries `receipt_path`, which is what removed the per-row `payment_detail` read; `ai_routes_reorder()` (route_index-only, transactional, under the UNIQUE constraint); `ai_usage_overview()` (one window for counters + bounded p95 sample); `ai_models_page(offset,limit)`; `ai_event_count()` extended to mirror every page filter (error_class, job_id, http_status class) so the log panel's total and its page cannot disagree; `stt_events_count`; offsets for event-log and user queries; `admin_user_credit_overview()` now takes its balance from one SQL aggregate over the reservation engine's own predicate (never a sum over the display window) and returns `entitlement_total` / `usage_total` beside the two display lists, whose sizes became parameters (`recent_rows=10`, `usage_rows=8`); `ai_quota_latest_for_provider()` — every quota snapshot a provider holds, ordered by quota identity instead of observation time so a stated cut is a stable prefix (`EXPLAIN QUERY PLAN`: `SEARCH ai_quota_snapshots USING INDEX sqlite_autoindex_ai_quota_snapshots_1 (provider=?)` + a temp B-tree over one provider's rows, the same access path the previous read used, so no new index); `ai_usage_overview()` now returns `latency_sample_capped` next to `latency_samples`, because a short sample is not proof of a cap (rows may have no latency recorded) while a saturated read is ; `payment_count(user_id)` was added so `/history` can state its window's total — a `COUNT(*)` on `user_id`, which the existing `idx_payment_requests_user_created` already covers (no new index) |
 | `gamas_bot/telegram_text.py` | `BUTTON_LABEL_LIMIT = 64` and `button_label()`: measures a button label in the same UTF-16 units the message pager already uses (so a label of emoji is shortened too) and marks the cut with `…`; the walk is backwards from the budget rather than a fixed character slice | | `gamas_bot/provider_health.py` | `snapshot()` / `cached()` / `invalidate()` so redraws need no network |
-| `gamas_bot/bot.py` | Ack-before-read, `_arm_answer_once` + idempotent `_edit_callback`; user menu (ساخت جزوه primary, merged help/formats, merged balance/subscription, privacy kept); five admin sections; users, credential, payment, plan and special-user screens paged with counted totals (one `_admin_page` parser, `_page_arg` accepts digit-only page tokens so `admin:special:add` still routes to its own branch); network-free health panel; a page of receipts no longer re-reads each row through `payment_detail`; the `/users` export titled against `stats()["users"]` when it is only a prefix, with `USERS_EXPORT_ROWS` as the single source for the row count; the credit screen's two history headings now state «۱۰ مورد از N سابقه» via `_credit_history_heading`, the redundant `[:10]`/`[:8]` slices are gone, and `admin:credits:` joins the ack-first set; the overview AI line appends `latency_sample_note()` so a sampled p95 is labelled; the purchase screen is paged (`USER_PLAN_PAGE = 8`, `billing:plans:{page}`, the bare legacy token still page 0, «صفحهٔ X از Y» only when a second page exists) and the balance screen prints at most `ACCOUNT_ENTITLEMENT_ROWS = 8` rows under its all-rows totals with a counted remainder; `_page_arg(data, prefix)` now takes the whole token prefix so every paged screen shares one parser; `/history` labels its ten-row window against `payment_count()`; both data-driven button labels (`خرید …` on the purchase screen, `🧪 تست …` on the health panel) now go through `button_label()`, with the price reserved outside the clamp so shortening a name never hides what a plan costs |
+| `gamas_bot/bot.py` | Ack-before-read, `_arm_answer_once` + idempotent `_edit_callback`; user menu (ساخت جزوه primary, merged help/formats, merged balance/subscription, privacy kept); five admin sections; users, credential, payment, plan and special-user screens paged with counted totals (one `_admin_page` parser, `_page_arg` accepts digit-only page tokens so `admin:special:add` still routes to its own branch); network-free health panel; a page of receipts no longer re-reads each row through `payment_detail`; the `/users` export titled against `stats()["users"]` when it is only a prefix, with `USERS_EXPORT_ROWS` as the single source for the row count; the credit screen's two history headings now state «۱۰ مورد از N سابقه» via `_credit_history_heading`, the redundant `[:10]`/`[:8]` slices are gone, and `admin:credits:` joins the ack-first set; the overview AI line appends `latency_sample_note()` so a sampled p95 is labelled; the purchase screen is paged (`USER_PLAN_PAGE = 8`, `billing:plans:{page}`, the bare legacy token still page 0, «صفحهٔ X از Y» only when a second page exists) and the balance screen prints at most `ACCOUNT_ENTITLEMENT_ROWS = 8` rows under its all-rows totals with a counted remainder; `_page_arg(data, prefix)` now takes the whole token prefix so every paged screen shares one parser; `/history` labels its ten-row window against `payment_count()`; the Word upload and the text fallback are each best-effort now, so one Telegram failure can no longer swallow the other (defect 25); both data-driven button labels (`خرید …` on the purchase screen, `🧪 تست …` on the health panel) now go through `button_label()`, with the price reserved outside the clamp so shortening a name never hides what a plan costs |
 | `gamas_bot/admin_ai.py` | `MODELS_PAGE_SIZE=10`, `LOGS_PAGE_SIZE=14`, `KEYS_PAGE_SIZE=12`; merged overview metrics; `show_routes(task_type)` via `_route_callback`; uncut addable list; `stale_rows` gate for the live catalog read; `_SKIP_REASON_FA`; log pages with an authoritative total and a clamped stale page; paged key screens with service filter preserved; unusable route rows annotated from `plan()` / `credentials_for()`; quota digest bounded by `len(PROVIDER_REGISTRY)` instead of a silent `[:4]`; `BENCHMARK_ROWS` plus a probe row that labels the cut; counts rendered with `to_persian_digits`; `QUOTA_ROWS` for the provider-detail quota block (the OpenRouter local ledger moved out of the counted group so the statements about it stay true); `HEALTH_ROWS` with the service filter applied *before* the cap; admin overrides built line-by-line and the heading suppressed when no provider carries a flag; both p95 lines carry `latency_sample_note()` — «(نمونه: 5/000 درخواست اخیر)» whenever the sample was capped |
 | `gamas_bot/admin_stt.py` | Paged model catalog and log list (`_page_token`/`_split_page`/`_logs_button`), `mark_model` phantom-row guard, paged quota overview (`admin:stt:qtp:{page}`, 3 providers × 4 budgets) with the folded counts stated in the text; the snapshot note now counts the table (`stt_quota_count`) instead of the page, `QUOTA_SNAPSHOT_ROWS` bounds the provider's own screen and says so when it cuts; `show_route_models` and `route_set_model` now share one `_route_model_choices()` list and address a choice by `index` + an 8-hex `_model_fingerprint()`, so every picker payload fits by shape (`_route_model_token`); a stale or out-of-range position is refused with an alert and the panel re-rendered, a malformed one is refused without writing, and the name-carrying token is still accepted for buttons on older messages |
 | `scripts/benchmark_admin_panels.py` | New, committed, offline benchmark that measures BEFORE and AFTER query shapes, every panel render and `router.plan()` in one process |
@@ -93,6 +94,7 @@ the help, privacy and receipt texts are constant-size, and long documents alread
 | `tests/test_user_account_screen.py` (new, 12 tests + 3 subtests) | The purchase screen's per-page cap, every plan reachable across pages, a stale or malformed page token falling back to the first page, buy payloads unchanged by paging, the balance screen's counted remainder — and the same screens through `_handle_callback`, so `billing:plans:1` is proved to reach page 2 and not to be read as a plan code, and `/history`'s heading through `_handle_message` at 12, 3 and 0 payments |
 | `tests/test_route_failover_eligibility.py` (new, 11 tests) | Eligibility, 429/5xx, cooldown, invalid-credential rotation, per-key quota rotation, attribution, reservation release, leg deadline, FREE_ONLY / unknown-billing blocking |
 | `tests/test_admin_panel_presentation.py` (new, 81 tests + 22 subtests) | Paging, ack order, stale/malformed callbacks, callback-size and keyboard limits, label and masking contracts for both platforms, both credential screens, the quota overview, the route-availability annotation, the log-total/page-query agreement and the "callback carries an address" rule for the STT catalog, the quota rows, the key wizard and the route-step model picker (payload fits with a pathological id, position round-trips, auto slot clears, stale/malformed position refuses without writing, legacy token still honoured) |
+| `tests/test_media_intake.py` (2 more tests, 31 total) | Both delivery failures of defect 25, driven through the real `_process_submission` with the real Word builder and the real caption text: a refused `.docx` upload still sends the note as a chat message plus the raw transcript and leaves the usage reservation consumed rather than released, and a failing text send still lets the transcript go out |
 | `.env.example`, `README.md`, `docs/{AI_PROVIDERS,AI_PLATFORM_AUDIT,ARCHITECTURE,CONFIGURATION,TESTING,CHANGELOG}.md` | Contracts an operator needs: default order, gate semantics, upgrade + rollback, panel structure, measured performance, test counts |
 
 No dependency was added (`pip check` clean, `sync_requirements --check` up to
@@ -266,8 +268,8 @@ longer be read as a window statistic when it is not one.
 ## 7. Exact test commands and actual results
 
 ```
-/home/user/venv/bin/python -m pytest tests/ -q      → 1217 passed, 1 skipped, 1842 subtests in 175.51 s
-/home/user/venv/bin/python -m unittest discover -s tests → Ran 1218 tests, OK (skipped=1), 158.2 s
+/home/user/venv/bin/python -m pytest tests/ -q      → 1219 passed, 1 skipped, 1842 subtests in 173.94 s
+/home/user/venv/bin/python -m unittest discover -s tests → Ran 1220 tests, OK (skipped=1), 144.7 s
 /home/user/venv/bin/python -m scripts.validate_docx → PASSED: 0 structural failure(s)
 /home/user/venv/bin/python -m ruff check .          → All checks passed!
 /home/user/venv/bin/python -m compileall -q gamas_bot scripts tests passenger_wsgi.py → OK
@@ -284,8 +286,8 @@ longer be read as a window statistic when it is not one.
     depending on sandbox load
 ```
 
-Baseline before the work was `1076 passed, 1 skipped, 1793 subtests`. **141 tests
-were added and the pre-existing failure count stayed zero** (1076 + 141 = 1217
+Baseline before the work was `1076 passed, 1 skipped, 1793 subtests`. **143 tests
+were added and the pre-existing failure count stayed zero** (1076 + 143 = 1219
 passing, the same one skip throughout, and 49 more subtests). No live or billable provider call was made and no real
 credential was used anywhere: the credential tests run against Fernet-encrypted
 rows in temporary SQLite files with fake key material.
@@ -296,7 +298,10 @@ invalid-credential rotation, per-key quota rotation, attribution, reservation
 release, leg deadline, FREE_ONLY and unknown-billing blocking →
 `test_route_failover_eligibility.py`; paging, ack, stale callbacks and label
 contracts including both credential screens, plus the quota-screen bounds and the
-route-availability annotation → `test_admin_panel_presentation.py`.
+route-availability annotation → `test_admin_panel_presentation.py`; a Telegram refusal on a finished
+Word file and a failing text fallback, both proving the raw transcript and the note text still go
+out and the job is recorded as delivered → `test_media_intake.py` (both cases fail against the code
+before defect 25 and pass against this).
 
 ## 8. Limits, residual issues, honest caveats
 
@@ -349,14 +354,39 @@ route-availability annotation → `test_admin_panel_presentation.py`.
 * Per-provider billing prices, model identifiers and free-quota numbers are
   provider-side facts; the docs record them as dated observations, not
   guarantees, and entitlement is always re-checked from live signals.
-* Note-quality pipeline untouched (schemas, chunking, outline, semantic coverage,
+* Note-quality pipeline untouched: schemas, chunking, outline, semantic coverage,
   deterministic QA, repair/compile gates, scrubbing, Persian normalisation, RTL
-  Word, PPTX/DOCX, raw-transcript delivery). QA, validation, provider accounting
-  and billing safeguards were not weakened to obtain a green run.
+  Word and PPTX generation. A later round changed how those finished files are
+  *handed to Telegram* (defect 25) — nothing about how they are produced, and the
+  two tests that pin it drive `_process_submission` itself, not a copy of its logic.
+  QA, validation, provider accounting and billing safeguards were not weakened to
+  obtain a green run.
 * Deliberately *not* "fixed" after reading the code: reservation release on
   cancellation (already in `finally`), payment idempotency, banned-user checks in
   both layers, health-probe concurrency, masked-only key screens, DB usability
   after a mid-flight cancellation.
+* The Telegram text pager was audited in the round that found defect 25 and found
+  sound, so nothing was changed there: `render_pages` / `split_message` were driven
+  through fourteen adversarial inputs (a 9 000-character token, a 600-word table
+  cell, a 400-row table, an 800-line fence, a 9 000-character line inside a fence,
+  unclosed and crossed emphasis, 3 000 astral-plane emoji, a list item longer than
+  the budget, `limit=1`) and every emitted page came back ≤ 4 032 UTF-16 units with
+  balanced tags, in order and without a lost character — including the suspicious
+  cases of `.strip()` removing indentation at a cut, fence markers dropped from an
+  over-eager split, and whitespace-only pages being discarded. `PaginationTests` in
+  `tests/test_regressions.py` already pins those invariants, so no pager tests were
+  duplicated.
+* Two other sendability bounds were measured rather than assumed, and both are safe
+  as they stand: the 1 000-character caption clamp on a delivered document is
+  character-based where Telegram counts UTF-16 units, but `MAX_TITLE_CHARS = 200`
+  and `MAX_FILENAME_TITLE_CHARS = 50` keep the worst legal caption far below 1 024
+  units; and the same bounds keep every generated filename under the 255-byte
+  per-component limit (`PC_NAME_MAX`), inside a write that already falls back to a
+  plain text file. A clamp written for a length that cannot be reached would have
+  been dead code, so it was left out.
+* `/broadcast` splits through the same pager, so any length is *sendable*; what is
+  uncapped is the number of pages and the serial one-by-one send over every user. It
+  was left alone for that reason — the failure mode would be slow, not corrupt.
 
 ## 9. Deployment, migration and backup
 

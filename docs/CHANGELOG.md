@@ -75,6 +75,18 @@
   digits-only, anything else falls back to page one, and an out-of-range page clamps to the last
   real page rather than rendering an empty screen.
 
+* **A refused Word upload used to cost the user the whole note.** `_deliver_result_documents`
+  guards the document *build* (any exception falls back to sending the note as a chat message, and a
+  pagination failure re-raises only *after* the raw transcript has gone out) and says so in a comment:
+  the transcript is the deliverable that never depends on the Word file. But the finished file's
+  *upload* sat outside that guard, and so did the fallback text send. So one Telegram refusal or a
+  dropped connection on a document that had been generated successfully unwound the rest of delivery:
+  no file, no text, no transcript, the submission recorded as `failed`, and the usage reservation
+  released — the model work paid for, the note discarded. Each send is best-effort now: a refused
+  `.docx` degrades to the text note, a failing text send still lets the transcript go out, and the
+  job completes as delivered because the user did receive the content. Both paths are tested by
+  `tests/test_media_intake.py`, which fails against the previous code and passes against this.
+
 * **One STT panel still put a model id inside its callback.** `admin:stt:rset:<provider>:<model>`
   is the shape the catalog and budget rows had already abandoned, and it is the *payload* that
   runs out of room: Telegram gives `callback_data` 64 bytes in total, and the longest shipped STT

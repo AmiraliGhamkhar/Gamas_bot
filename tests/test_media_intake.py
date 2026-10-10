@@ -209,6 +209,61 @@ class MediaJobTests(unittest.IsolatedAsyncioTestCase):
         user_id = await self.bot.db.submission_user_id(submission_id)
         self.assertEqual((await self.bot.db.user_balance(user_id))["available_seconds"], 3_597)
 
+    async def test_a_refused_word_upload_still_delivers_the_note(self) -> None:
+        """The document may fail to upload; the note itself may not be lost with it.
+
+        ``_deliver_result_documents`` promises the raw transcript is always sent,
+        but the Word upload used to sit outside any guard: a refusal there
+        unwound the whole delivery, so the user got neither file nor text and the
+        job was recorded as failed after the model work had already been spent.
+        """
+        real_send = self.bot._send_document
+
+        async def refusing_send(event, path, caption, *, buttons=None):
+            if str(path).endswith(".docx"):
+                raise RuntimeError("Telegram refused the document")
+            return await real_send(event, path, caption, buttons=buttons)
+
+        with patch.object(self.bot, "_send_document", new=refusing_send):
+            event, _stt, submission_id = await self._run(
+                "docx-refused.wav", "audio", payload=wav_bytes(2.2)
+            )
+
+        self.assertTrue(event.file_paths, "the raw transcript must still go out")
+        self.assertFalse(any(path.endswith(".docx") for path in event.file_paths))
+        self.assertTrue(any(path.endswith(".txt") for path in event.file_paths))
+        delivered = "\n".join(event.responses + event.replies)
+        self.assertIn("خلاصهٔ آزمایشی", delivered)  # the note itself, as text
+        # The job is not marked failed: the user received the note.
+        reservation = await self.bot.db.usage_reservation(submission_id)
+        self.assertEqual(reservation["status"], "consumed")
+
+    async def test_a_failed_text_fallback_still_delivers_the_transcript(self) -> None:
+        """Nor may the fallback's own failure cost the second deliverable."""
+        source = self.root / "text-send-fails.wav"
+        source.write_bytes(wav_bytes(2.2))
+        user = await self.bot.db.upsert_user(109, "student")
+        submission_id = await self.bot.db.create_submission(
+            int(user["id"]), "text-send-fails", 2.2, source.name,
+            "audio/wav", source_type="audio",
+        )
+        event = FakeEvent(source)
+        with patch(
+            "gamas_bot.bot.transcribe",
+            new=AsyncMock(return_value=Transcript("deepgram", "متن درس", 0.9)),
+        ), patch(
+            "gamas_bot.bot.structure_transcript",
+            new=AsyncMock(return_value=parse_structured_notes(sample_notes_json())),
+        ), patch(
+            "gamas_bot.bot.build_notes_docx",
+            side_effect=RuntimeError("python-docx exploded"),
+        ), patch.object(
+            self.bot, "_send_long_message", new=AsyncMock(side_effect=RuntimeError("peer is gone"))
+        ):
+            await self.bot._process_submission(event, submission_id, source.name, "audio")
+
+        self.assertTrue(any(path.endswith(".txt") for path in event.file_paths), event.file_paths)
+
     async def test_docx_pagination_failure_after_stt_releases_reserved_seconds(self):
         source = self.root / "pagination-failure.wav"
         source.write_bytes(wav_bytes(2.2))
