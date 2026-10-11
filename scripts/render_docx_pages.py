@@ -79,6 +79,38 @@ def font(family: str, bold: bool, size_pt: float) -> ImageFont.FreeTypeFont:
     return _FONT_CACHE[key]
 
 
+#: A codepoint no font defines. Rendering it is how Pillow reports ``.notdef``.
+_UNDEFINED_CODEPOINT = "\ue000"
+#: One Arabic letter: if a face cannot draw this, every Persian word in the
+#: sample would be drawn as a box, and a "no layout warnings" verdict would be
+#: read as "the Persian looks right".
+_PERSIAN_PROBE = "ا"
+
+
+def face_renders_persian(family: str = "sans") -> bool:
+    """Whether the face this renderer selected can draw Persian glyphs.
+
+    Pillow does not report a missing glyph, so the probe renders one Arabic
+    letter and compares it with a codepoint no font defines: the same bitmap
+    means the face fell back to ``.notdef``. The offline renderer only ever
+    claims layout, never shaping, and this is what makes that claim checkable.
+    """
+    try:
+        face = font(family, False, 12)
+        probe = _glyph_bitmap(face, _PERSIAN_PROBE)
+        undefined = _glyph_bitmap(face, _UNDEFINED_CODEPOINT)
+    except Exception:  # pragma: no cover - a broken font backend has no glyphs
+        return False
+    return probe.getbbox() is not None and probe.tobytes() != undefined.tobytes()
+
+
+def _glyph_bitmap(face, text: str) -> Image.Image:
+    """One glyph drawn on its own, so two glyphs can be compared pixel by pixel."""
+    image = Image.new("L", (64, 64), 0)
+    ImageDraw.Draw(image).text((8, 8), text, font=face, fill=255)
+    return image
+
+
 # ---------------------------------------------------------------------------
 # XML -> blocks
 # ---------------------------------------------------------------------------
@@ -462,14 +494,29 @@ def _layout_paragraph(block: dict, geometry: dict) -> dict:
         "height": line_height * len(lines),
         "before": int(round(style["before"] * TWIP)),
         "after": int(round(style["after"] * TWIP)),
+        # The painter draws callout boxes with padding around the text
+        # (``shade`` +/-4px, ``bordered`` +/-2px). Pagination must reserve the
+        # same space, otherwise a box near the page bottom is drawn past the
+        # margin and the renderer reports a document defect that is really its
+        # own measurement artefact.
+        "pad_bottom": _box_padding(block),
     }
     block["_layout"] = layout
     return layout
 
 
+def _box_padding(block: dict) -> int:
+    """Bottom padding the painter adds around a shaded/bordered paragraph."""
+    if block["shade"]:
+        return 4
+    if block["bordered"] and block["text"]:
+        return 2
+    return 0
+
+
 def _measure_paragraph(block: dict, geometry: dict) -> int:
     layout = _layout_paragraph(block, geometry)
-    return layout["before"] + layout["height"] + layout["after"]
+    return layout["before"] + layout["height"] + layout["after"] + layout["pad_bottom"]
 
 
 def _draw_paragraph(page: Page, block: dict, cursor: int, geometry: dict) -> int:
@@ -514,7 +561,7 @@ def _draw_paragraph(page: Page, block: dict, cursor: int, geometry: dict) -> int
         "text" if block["text"] else "empty"
     )
     page.blocks += 1
-    cursor += total_height + layout["after"]
+    cursor += total_height + layout["after"] + layout["pad_bottom"]
     page.content_bottom = cursor
     return cursor
 
@@ -823,12 +870,22 @@ def render(
         pages.append(_page_facts(page, page_number, page_index))
         if out_dir:
             page.save(out_dir / f"page-{page_index:02d}.png")
+    # Renderer *capability* limits, kept apart from document defects: they say
+    # what this render cannot show, never that something is wrong with the file.
+    capability_notes: list[str] = []
+    if not face_renders_persian():
+        capability_notes.append(
+            "the selected font face cannot draw Persian glyphs, so this render "
+            "shows layout and direction only (install a Persian-capable face such "
+            "as Vazirmatn, or render with LibreOffice, to inspect shaping)"
+        )
     facts = {
         "source": str(path),
         "pages": pages,
         "sections": len(sections),
         "page_size_px": [int(FALLBACK_PAGE["w"] * TWIP), int(FALLBACK_PAGE["h"] * TWIP)],
         "warnings": warnings,
+        "capability_notes": capability_notes,
         "ok": not warnings,
     }
     if sheet and pages:
@@ -898,6 +955,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     for warning in facts["warnings"]:
         print(f"  ! {warning}")
+    for note in facts["capability_notes"]:
+        print(f"  ~ {note}")
     for page in facts["pages"]:
         print(
             f"  sheet {page['index']:>2} (printed {page['page']:>2}): "

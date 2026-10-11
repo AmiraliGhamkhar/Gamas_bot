@@ -1645,6 +1645,26 @@ class ProviderRouter:
                         await asyncio.sleep(delay)
                         last = failure
                         continue
+                    # No retry budget (or no time) is left on this leg: this is
+                    # a terminal failure, not a pending retry. Operators filter
+                    # the event log by name, so a 502 leg that exhausted its
+                    # retries must still produce one content-free failure event
+                    # instead of vanishing after the retry warning.
+                    await self.tracker.event(
+                        "note_request_failed",
+                        service="notes",
+                        provider=ctx.provider,
+                        canonical=ctx.canonical,
+                        model=ctx.model,
+                        request_type=ctx.request_type,
+                        route_position=position,
+                        attempt=attempt,
+                        http_status=status,
+                        latency_ms=latency_ms,
+                        error_class=failure.category,
+                        detail=failure.category,
+                        job_id=ctx.job_id,
+                    )
                     last = failure
                     break
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
@@ -1680,6 +1700,21 @@ class ProviderRouter:
                     await asyncio.sleep(delay)
                     last = failure
                     continue
+                await self.tracker.event(
+                    "note_request_failed",
+                    service="notes",
+                    provider=ctx.provider,
+                    canonical=ctx.canonical,
+                    model=ctx.model,
+                    request_type=ctx.request_type,
+                    route_position=position,
+                    attempt=attempt,
+                    http_status=status,
+                    latency_ms=latency_ms,
+                    error_class=failure.category,
+                    detail=type(exc).__name__,
+                    job_id=ctx.job_id,
+                )
                 last = failure
                 break
             finally:
