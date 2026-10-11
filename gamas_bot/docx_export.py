@@ -42,11 +42,7 @@ import io
 import itertools
 import logging
 import re
-import shutil
-import subprocess
-import tempfile
 import zipfile
-from pathlib import Path
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -61,27 +57,12 @@ from docx.text.run import Run
 from lxml import etree
 
 from .bidi import TextRun, is_rtl_dominant, split_direction_runs
-from .config import PROJECT_ROOT
+from .config import PROJECT_DIR
 from .progress import to_persian_digits
-from .structuring import NoteSection, StructuredNotes
+from .notes import NoteSection, StructuredNotes
 from .textnorm import normalize_display
 
 logger = logging.getLogger(__name__)
-
-
-class DocxPaginationError(RuntimeError):
-    """Exact static-TOC page mapping could not be produced safely."""
-
-
-class DocxPaginationUnavailable(DocxPaginationError):
-    """No DOCX layout engine (renderer + PDF reader) is available.
-
-    Kept separate from :class:`DocxPaginationError` on purpose: a missing
-    renderer is an *environment* condition, while a renderer that produced an
-    ambiguous or unstable link map is a *content* condition. Only the first may
-    be degraded to a link-only table of contents -- page numbers are still
-    never guessed.
-    """
 
 
 #: Attribute holding this document's own bookmark counter. It used to be a
@@ -174,8 +155,9 @@ ALLOWED_TOC_LEVELS = frozenset({"1", "1-1", "1-2", "1-3"})
 #: topic list when it is not; ``required`` restores the strict behaviour that
 #: fails rather than emit an unnumbered TOC; ``off`` skips the renderer
 #: entirely, which is the Python-only deployment mode.
-TOC_PAGE_NUMBER_MODES = ("auto", "required", "off")
-TOC_PAGE_NUMBER_MODE = "auto"
+#: v3 policy: the static TOC is link-only. Page numbers in the *footer* are a
+#: native Word ``PAGE`` field and always present; TOC page numbers would need a
+#: layout engine (LibreOffice), which v3 deliberately does not require.
 
 #: Auto-detected optional logo, used when DOCX_LOGO_PATH is not configured.
 #: Fonts and images are never downloaded at generation time.
@@ -365,14 +347,6 @@ class DocxDesign:
     border_space: int = DEFAULT_BORDER_SPACE
     footer_brand: bool = True
     logo_path: str = ""
-    pagination_timeout_seconds: int = 120
-    pagination_renderer_bin: str | None = None
-    #: How the static TOC gets its page numbers (see :data:`TOC_PAGE_NUMBER_MODES`):
-    #: ``auto`` uses the renderer when one is installed and falls back to a
-    #: link-only topic list when it is not; ``required`` refuses to emit a
-    #: document whose TOC lacks verified numbers; ``off`` never invokes a
-    #: renderer at all (the pure-Python deployment).
-    toc_page_numbers: str = "auto"
 
     @property
     def logo_file(self):
@@ -386,7 +360,7 @@ class DocxDesign:
         for candidate in candidates:
             if not candidate:
                 continue
-            path = PROJECT_ROOT / candidate
+            path = PROJECT_DIR / candidate
             try:
                 if path.is_file():
                     return path
@@ -431,13 +405,6 @@ def resolve_design(design_config: dict | None = None) -> DocxDesign:
         toc_min_sections = int(config.get("toc_min_sections") or TOC_MIN_SECTIONS)
     except (TypeError, ValueError):
         toc_min_sections = TOC_MIN_SECTIONS
-    try:
-        pagination_timeout = int(config.get("pagination_timeout_seconds") or 120)
-    except (TypeError, ValueError):
-        pagination_timeout = 120
-    toc_page_numbers = str(config.get("toc_page_numbers") or TOC_PAGE_NUMBER_MODE).strip().lower()
-    if toc_page_numbers not in TOC_PAGE_NUMBER_MODES:
-        toc_page_numbers = TOC_PAGE_NUMBER_MODE
     return DocxDesign(
         cover_enabled=_as_flag(config.get("cover_enabled"), True),
         toc_enabled=_as_flag(config.get("toc_enabled"), True),
@@ -450,11 +417,6 @@ def resolve_design(design_config: dict | None = None) -> DocxDesign:
         border_space=min(max(space, 0), 31),
         footer_brand=_as_flag(config.get("footer_brand"), True),
         logo_path=str(config.get("logo_path") or "").strip(),
-        pagination_timeout_seconds=min(max(pagination_timeout, 1), 900),
-        pagination_renderer_bin=(
-            str(config.get("pagination_renderer_bin") or "").strip() or None
-        ),
-        toc_page_numbers=toc_page_numbers,
     )
 
 
@@ -2040,21 +2002,7 @@ def _clear_static_toc_page_cells(table) -> None:
                 paragraph._p.remove(child)
 
 
-def _set_static_toc_page_numbers(table, pages: list[int], *, fonts: DocumentFonts) -> None:
-    if len(table.rows) != len(pages):
-        raise DocxPaginationError("تعداد پیوندهای فهرست پس از صفحه‌بندی تغییر کرد؛ سند ارسال نشد.")
-    for row, page in zip(table.rows, pages, strict=True):
-        paragraph = row.cells[1].paragraphs[0]
-        for child in list(paragraph._p):
-            if child.tag != qn("w:pPr"):
-                paragraph._p.remove(child)
-        _add_directional_text(
-            paragraph,
-            to_persian_digits(str(page)),
-            fonts=fonts,
-            size=10.5,
-            color=MUTED,
-        )
+
 def _save_document_payload(document) -> bytes:
     """Serialise the document exactly as python-docx wrote it.
 
@@ -2073,149 +2021,6 @@ def _save_document_bytes(document, fonts: DocumentFonts) -> bytes:
     return _inject_font_fallbacks(_save_document_payload(document), fonts)
 
 
-def _destination_page_number(reader, destination) -> int | None:
-    """Resolve a PDF link destination to its one-based physical page number."""
-    if destination is None:
-        return None
-    try:
-        from pypdf.generic import Destination, IndirectObject
-    except Exception:
-        return None
-    if isinstance(destination, (str, bytes)):
-        name = destination.decode("utf-8", "replace") if isinstance(destination, bytes) else destination
-        destination = reader.named_destinations.get(name.lstrip("#/"))
-    if isinstance(destination, Destination):
-        page_index = reader.get_destination_page_number(destination)
-        return page_index + 1 if page_index is not None else None
-    try:
-        first = destination[0]
-    except (TypeError, IndexError, KeyError):
-        return None
-    if isinstance(first, IndirectObject):
-        try:
-            page_index = reader.get_page_number(first.get_object())
-            return page_index + 1 if page_index is not None else None
-        except Exception:
-            return None
-    try:
-        page_index = reader.get_page_number(first)
-        return page_index + 1 if page_index is not None else None
-    except Exception:
-        return None
-
-
-def _rendered_toc_page_numbers(
-    docx_bytes: bytes,
-    entries: list[dict[str, str | int]],
-    *,
-    timeout_seconds: int,
-    renderer_bin: str | None = None,
-) -> list[int]:
-    """Render through LibreOffice and resolve every TOC link from its PDF target.
-
-    This intentionally has no Pillow/layout-estimate fallback. A missing
-    renderer, PDF reader, TOC link, or ambiguous link map is a hard failure:
-    page numbers are never guessed.
-    """
-    renderer = renderer_bin or shutil.which("soffice") or shutil.which("libreoffice")
-    if not renderer:
-        raise DocxPaginationUnavailable(
-            "فهرست ایستا به شمارهٔ صفحهٔ واقعی نیاز دارد؛ LibreOffice (soffice) در سرور پیدا نشد."
-        )
-    try:
-        from pypdf import PdfReader
-    except Exception:
-        raise DocxPaginationUnavailable(
-            "برای تعیین صفحهٔ واقعی فهرست ایستا، بستهٔ pypdf نصب نیست."
-        ) from None
-
-    with tempfile.TemporaryDirectory(prefix="gamas-docx-pagination-") as temporary:
-        root = Path(temporary)
-        source = root / "document.docx"
-        source.write_bytes(docx_bytes)
-        profile = root / "libreoffice-profile"
-        profile.mkdir(mode=0o700)
-        command = [
-            renderer,
-            f"-env:UserInstallation={profile.as_uri()}",
-            "--headless",
-            "--convert-to",
-            "pdf:writer_pdf_Export",
-            "--outdir",
-            str(root),
-            str(source),
-        ]
-        try:
-            completed = subprocess.run(
-                command,
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=max(1, min(int(timeout_seconds), 900)),
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            raise DocxPaginationError(
-                "LibreOffice نتوانست صفحه‌بندی دقیق سند را در مهلت تنظیم‌شده انجام دهد."
-            ) from None
-        pdf_path = root / "document.pdf"
-        if completed.returncode != 0 or not pdf_path.is_file() or pdf_path.stat().st_size == 0:
-            # Renderer output is intentionally not surfaced: it may contain
-            # excerpts of user-provided document text.
-            raise DocxPaginationError("خروجی PDF صفحه‌بندی دقیق سند تولید نشد.")
-        try:
-            reader = PdfReader(str(pdf_path), strict=True)
-            if len(reader.pages) < 2:
-                raise ValueError("Rendered document has no second page")
-            page = reader.pages[1]
-            annotations = page.get("/Annots") or []
-            links: list[tuple[float, str | None, int]] = []
-            for reference in annotations:
-                annotation = reference.get_object()
-                if str(annotation.get("/Subtype")) != "/Link":
-                    continue
-                destination = annotation.get("/Dest")
-                action = annotation.get("/A")
-                if destination is None and action is not None:
-                    action = action.get_object()
-                    if str(action.get("/S")) == "/GoTo":
-                        destination = action.get("/D")
-                page_number = _destination_page_number(reader, destination)
-                rectangle = annotation.get("/Rect")
-                if page_number is None or rectangle is None:
-                    continue
-                top = float(rectangle[3])
-                tooltip = annotation.get("/Contents")
-                tooltip_text = str(tooltip) if tooltip is not None else None
-                links.append((top, tooltip_text, page_number))
-        except DocxPaginationError:
-            raise
-        except Exception:
-            raise DocxPaginationError(
-                "پیوندهای داخلی فهرست از PDF صفحه‌بندی‌شده قابل خواندن نبودند."
-            ) from None
-
-    expected = len(entries)
-    if len(links) != expected:
-        raise DocxPaginationError(
-            "فهرست در یک صفحهٔ قابل نگاشت جا نشد یا LibreOffice همهٔ پیوندهای آن را حفظ نکرد."
-        )
-
-    # If the renderer preserves the OOXML tooltip in PDF annotations, use that
-    # unique bookmark name directly. Otherwise the one-link-per-row geometry on
-    # the single TOC page gives an unambiguous visual order.
-    by_tooltip = {tooltip: page for _top, tooltip, page in links if tooltip}
-    anchors = [str(entry["anchor"]) for entry in entries]
-    if all(anchor in by_tooltip for anchor in anchors):
-        pages = [by_tooltip[anchor] for anchor in anchors]
-        if any(page < 3 for page in pages):
-            raise DocxPaginationError("یکی از فهرست‌پیوندها به جایگاه بدنهٔ سند نرسید.")
-        return pages
-    links.sort(key=lambda item: item[0], reverse=True)
-    pages = [item[2] for item in links]
-    if any(page < 3 for page in pages):
-        raise DocxPaginationError("یکی از فهرست‌پیوندها به جایگاه بدنهٔ سند نرسید.")
-    return pages
-
 
 def _finish_static_toc(
     document,
@@ -2225,74 +2030,22 @@ def _finish_static_toc(
     fonts: DocumentFonts,
     design: DocxDesign,
 ) -> bytes:
-    """Resolve the static TOC page numbers when the design asks for them.
+    """Finish the document with a link-only static table of contents.
 
-    Policy (``DOCX_TOC_PAGE_NUMBERS``):
-
-    * ``off`` -- never invokes a renderer. The topic list keeps its internal
-      hyperlinks and its page cells stay empty: a truthful Python-only design
-      that never shows a page number it did not measure.
-    * ``auto`` -- exact, renderer-verified numbers when the renderer and PDF
-      reader are installed; otherwise the same link-only list as ``off``.
-    * ``required`` -- like ``auto``, but a missing/unusable renderer fails
-      instead of degrading (the historical behaviour).
-
-    Even in ``auto``/``required`` a number is only ever written after a render
-    *of the document that already contains it* confirms it. Instability, an
-    ambiguous link map, or a link onto the cover/TOC pages is always a hard
-    failure -- the one thing that never happens is a guessed page number.
-
-    The font-fallback rewrite is layout-neutral, so it is applied once to the
-    returned payload instead of on every intermediate save.
+    v3 policy: TOC entries are internal hyperlinks to real Word bookmarks and
+    the page cells stay empty — a page number is never guessed. Page numbers
+    the reader *does* see are the native ``PAGE`` field in the footer of every
+    body page.
     """
     if toc_table is None:
         return _save_document_bytes(document, fonts)
     if not entries:
-        # Nothing qualified for the topic list. Dropping the page is the one
-        # outcome that both keeps the document and prints no page number that
-        # was never measured.
         _remove_static_toc(document, toc_table)
         return _save_document_bytes(document, fonts)
-    if design.toc_page_numbers == "off":
-        _clear_static_toc_page_cells(toc_table)
-        return _save_document_bytes(document, fonts)
+    _clear_static_toc_page_cells(toc_table)
+    return _save_document_bytes(document, fonts)
 
-    payload = _save_document_payload(document)
-    try:
-        pages = _rendered_toc_page_numbers(
-            payload,
-            entries,
-            timeout_seconds=design.pagination_timeout_seconds,
-            renderer_bin=design.pagination_renderer_bin,
-        )
-    except DocxPaginationUnavailable:
-        if design.toc_page_numbers == "required":
-            raise
-        logger.warning(
-            "DOCX static-TOC page numbers unavailable (no renderer/PDF reader); "
-            "delivering a link-only table of contents"
-        )
-        _clear_static_toc_page_cells(toc_table)
-        return _save_document_bytes(document, fonts)
 
-    # At most two corrective passes: each iteration writes the numbers it just
-    # measured, re-renders, and only accepts the payload whose re-render
-    # reproduced them. Bounded to three renders in total.
-    for _attempt in range(2):
-        _set_static_toc_page_numbers(toc_table, pages, fonts=fonts)
-        payload = _save_document_payload(document)
-        verified = _rendered_toc_page_numbers(
-            payload,
-            entries,
-            timeout_seconds=design.pagination_timeout_seconds,
-            renderer_bin=design.pagination_renderer_bin,
-        )
-        if verified == pages:
-            return _inject_font_fallbacks(payload, fonts)
-        pages = verified
-    raise DocxPaginationError(
-        "شماره‌های فهرست پس از صفحه‌بندی نهایی پایدار نماندند؛ سند ارسال نشد."
-    )
 
 # ---------------------------------------------------------------------------
 # Body blocks

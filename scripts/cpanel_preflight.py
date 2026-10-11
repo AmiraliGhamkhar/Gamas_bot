@@ -31,7 +31,7 @@ MIN_FREE_BYTES = 3 * 1024**3
 TELEGRAM_PROBES = (("149.154.167.51", 443), ("149.154.175.53", 443))
 REQUIRED_PACKAGES = (
     "Telethon", "aiohttp", "aiosqlite", "python-dotenv", "python-pptx",
-    "lxml", "av", "ppt2pptx", "python-docx", "cryptography", "pypdf",
+    "lxml", "av", "ppt2pptx", "python-docx",
 )
 
 
@@ -84,79 +84,8 @@ def check_packages() -> list[Result]:
         importlib.import_module("av")
     except Exception as exc:  # noqa: BLE001 - report any import failure
         results.append(Result("FAIL", "PyAV import", f"{type(exc).__name__}: {exc}"))
-    try:
-        importlib.import_module("python_socks")
-    except ImportError:
-        results.append(Result("WARN", "package python-socks", "needed only when TELEGRAM_PROXY is set"))
     return results
 
-
-def check_docx_pagination(settings) -> Result:
-    """Check the renderer that prints real page numbers in a static TOC.
-
-    The severity follows ``DOCX_TOC_PAGE_NUMBERS``: with ``off`` no renderer is
-    needed at all, with ``auto`` (the default) a missing renderer only degrades
-    the TOC to a link-only topic list, and with ``required`` the renderer is a
-    hard requirement because the document is not produced without it.
-    """
-    policy = getattr(settings, "docx_toc_page_numbers", "auto")
-    if not settings.docx_toc_enabled:
-        return Result("PASS", "DOCX pagination renderer", "TOC disabled; no renderer required")
-    if policy == "off":
-        return Result(
-            "PASS", "DOCX pagination renderer",
-            "DOCX_TOC_PAGE_NUMBERS=off; the TOC is delivered without page numbers.",
-        )
-    missing_level = "FAIL" if policy == "required" else "WARN"
-    missing_detail = (
-        "DOCX_TOC_PAGE_NUMBERS=required needs a renderer for exact static-TOC page mapping. "
-        "Install LibreOffice (soffice/libreoffice) or switch to auto/off."
-        if policy == "required"
-        else "No renderer found; the static TOC will be delivered with internal links and no "
-        "page numbers (never a guessed number). Install LibreOffice for exact numbers."
-    )
-    configured = settings.docx_pagination_renderer_bin
-    if configured:
-        renderer = Path(configured).expanduser()
-        if not renderer.is_file() or not os.access(renderer, os.X_OK):
-            return Result(
-                "FAIL", "DOCX pagination renderer",
-                "DOCX_PAGINATION_RENDERER_BIN is not an executable file; install LibreOffice "
-                "or point it to soffice.",
-            )
-        renderer_path = str(renderer)
-    else:
-        renderer_path = shutil.which("soffice") or shutil.which("libreoffice")
-        if not renderer_path:
-            return Result(missing_level, "DOCX pagination renderer", missing_detail)
-    try:
-        importlib.import_module("pypdf")
-    except ImportError:
-        return Result(
-            "FAIL", "DOCX pagination renderer",
-            "pypdf is required to map rendered TOC links to PDF pages; run pip install -r requirements.txt.",
-        )
-    return Result("PASS", "DOCX pagination renderer", renderer_path)
-
-
-def check_credential_encryption(settings) -> Result:
-    """Validate the environment-only Fernet key without ever printing it."""
-    key = settings.provider_credentials_encryption_key
-    if not key:
-        return Result(
-            "WARN", "Provider credential encryption",
-            "PROVIDER_CREDENTIALS_ENCRYPTION_KEY is unset; admin-managed database keys are disabled.",
-        )
-    try:
-        from cryptography.fernet import Fernet
-
-        Fernet(key.encode("ascii"))
-    except Exception:  # noqa: BLE001 - never disclose secret values
-        return Result(
-            "FAIL", "Provider credential encryption",
-            "PROVIDER_CREDENTIALS_ENCRYPTION_KEY is not a valid Fernet key; generate one with the documented command.",
-        )
-    return Result("PASS", "Provider credential encryption", "valid environment-only key configured")
 
 
 def check_private_receipt_directory(directory: Path) -> Result:
@@ -236,7 +165,7 @@ def check_directory(name: str, directory: Path) -> Result:
 
 
 def check_settings() -> tuple[list[Result], object | None]:
-    from gamas_bot.config import Settings
+    from gamas_bot.config import from_env
 
     env_file = ROOT / ".env"
     results: list[Result] = []
@@ -247,54 +176,38 @@ def check_settings() -> tuple[list[Result], object | None]:
         if os.name == "posix" and mode:
             results.append(Result("WARN", ".env permissions", "run: chmod 600 .env"))
     try:
-        settings = Settings.from_env()
-        settings.validate_runtime()
+        settings = from_env()
     except ValueError as exc:
         results.append(Result("FAIL", "Configuration", str(exc)))
         return results, None
     results.append(Result("PASS", "Configuration", "required settings are present and valid"))
     if not settings.admin_ids:
         results.append(Result("WARN", "ADMIN_IDS", "no administrator is configured"))
-    if settings.max_concurrent_jobs > 1:
+    if settings.max_active_jobs > 1:
         results.append(
             Result(
                 "WARN", "MAX_CONCURRENT_JOBS",
-                f"{settings.max_concurrent_jobs}: shared hosting usually limits memory "
+                f"{settings.max_active_jobs}: shared hosting usually limits memory "
                 "to 1-2 GB; start with 1.",
             )
         )
     results.extend(check_stt_queue(settings))
-    results.append(check_docx_pagination(settings))
-    results.append(check_credential_encryption(settings))
     return results, settings
 
 
 def check_stt_queue(settings) -> list[Result]:
-    """Warn about a queue or a custom dictionary that will not fit one job."""
+    """Warn about a queue that will not fit one job."""
     results: list[Result] = []
-    if settings.max_pending_jobs > 4 * max(1, settings.max_concurrent_jobs):
+    if settings.max_queued_jobs > 4 * max(1, settings.max_active_jobs):
         results.append(
             Result(
                 "WARN",
-                "MAX_PENDING_JOBS",
-                f"{settings.max_pending_jobs} waiting jobs for {settings.max_concurrent_jobs} "
+                "MAX_QUEUED_JOBS",
+                f"{settings.max_queued_jobs} waiting jobs for {settings.max_active_jobs} "
                 "worker(s): uploads beyond that are rejected with back-pressure.",
             )
         )
-    terms = len(settings.speechmatics_additional_vocab)
-    if terms and terms > settings.speechmatics_vocab_max_items:
-        results.append(
-            Result(
-                "WARN",
-                "SPEECHMATICS_ADDITIONAL_VOCAB",
-                f"{terms} terms configured but only the first "
-                f"{settings.speechmatics_vocab_max_items} are sent per job; raise "
-                "SPEECHMATICS_VOCAB_MAX_ITEMS (1000 recommended, 20000 hard cap) or "
-                "reorder the terms so the most valuable ones come first.",
-            )
-        )
     return results
-
 
 def tcp_reachable(host: str, port: int, timeout: float = 6.0) -> str | None:
     """None when a TCP connection succeeds, otherwise the error text."""
@@ -307,15 +220,7 @@ def tcp_reachable(host: str, port: int, timeout: float = 6.0) -> str | None:
 
 def check_network(settings) -> list[Result]:
     results = []
-    if settings is not None and settings.telegram_proxy:
-        _kind, host, port, *_rest = settings.telegram_proxy
-        error = tcp_reachable(host, port)
-        results.append(
-            Result("PASS", "Telegram proxy", f"{host}:{port} reachable")
-            if error is None
-            else Result("FAIL", "Telegram proxy", f"{host}:{port} unreachable ({error})")
-        )
-    else:
+    if True:
         probes = [(host, port, tcp_reachable(host, port)) for host, port in TELEGRAM_PROBES]
         failures = [f"{host}:{port} ({error})" for host, port, error in probes if error is not None]
         if len(failures) == len(TELEGRAM_PROBES):
@@ -334,14 +239,14 @@ def check_network(settings) -> list[Result]:
             hosts.append(("Speechmatics", settings.speechmatics_base_url))
         if settings.deepgram_api_key:
             hosts.append(("Deepgram", "https://api.deepgram.com"))
-        if settings.stt_openai_base_url:
-            hosts.append(("OpenAI-compatible STT", settings.stt_openai_base_url))
-        if settings.note_api_provider != "disabled":
+        if settings.stt_openai_base_url or '':
+            hosts.append(("OpenAI-compatible STT", settings.stt_openai_base_url or ''))
+        if settings.note_provider != "disabled":
             base = settings.note_api_base_url or {
                 "gemini": "https://generativelanguage.googleapis.com",
                 "anthropic": "https://api.anthropic.com",
-            }.get(settings.note_api_provider, "https://api.openai.com")
-            hosts.append((f"Note API ({settings.note_api_provider})", base))
+            }.get(settings.note_provider, "https://api.openai.com")
+            hosts.append((f"Note API ({settings.note_provider})", base))
     for label, url in hosts:
         parsed = urlparse(url)
         port = parsed.port or (443 if parsed.scheme == "https" else 80)

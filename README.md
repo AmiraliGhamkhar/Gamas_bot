@@ -1,51 +1,46 @@
 # Gamas Bot
 
 A Persian study assistant for Telegram. Send a lecture recording (audio or
-video) or a PowerPoint deck and the bot returns a polished, right-to-left Word
-booklet plus the raw transcript.
+video) or a PowerPoint deck and the bot returns the raw transcript first,
+then a polished, right-to-left Word booklet.
 
 * **Persian first.** RTL paragraphs and styles, mixed Persian/English runs,
-  Persian digits, real heading styles, a cover page, a page frame and a visible
-  table of contents on page 2.
+  Persian digits, real heading styles, a cover page, a page frame, native
+  page-number fields and a link-only table of contents.
 * **No system media binaries.** Media handling uses PyAV and python-pptx from
   the Python dependencies — there is no `ffmpeg`, `ffprobe` or `soffice`
-  requirement for transcription.
+  requirement.
 * **Provider-neutral.** Speech-to-text (Speechmatics / Deepgram / any
   OpenAI-compatible endpoint) and note generation (Gemini / Anthropic / any
-  OpenAI-compatible endpoint) are configuration, not code.
+  OpenAI-compatible endpoint) are configuration, not code. Keys live in the
+  environment only.
 * **Prepaid billing with a real ledger.** Credit is reserved before a job runs
   and released in full on every failure or cancellation path.
 
 | Documentation | |
 | --- | --- |
-| [docs/README.md](docs/README.md) | index of every page |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | pipeline, modules, concurrency, data model |
-| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | the configuration model |
-| [docs/DOCX.md](docs/DOCX.md) | the Word booklet and its RTL contracts |
-| [docs/DEPLOY_CPANEL.md](docs/DEPLOY_CPANEL.md) · [docs/DEPLOY_FA.md](docs/DEPLOY_FA.md) | deployment (English / فارسی) |
-| [docs/TESTING.md](docs/TESTING.md) | gates and benchmarks |
-| [docs/SECURITY.md](docs/SECURITY.md) | threat model and controls |
-| [docs/CHANGELOG.md](docs/CHANGELOG.md) | notable changes |
+| [docs/OVERHAUL_PLAN.md](docs/OVERHAUL_PLAN.md) | the v3 design contract (module map, invariants) |
+| [docs/README.md](docs/README.md) | index of every page (v3 pages first, v2-era pages marked) |
 
 ## How it works
 
 ```
 Telegram → bounded job queue → media worker (PyAV) → speech-to-text
-        → normalization → structuring (chunk + global context) → QA
-        → RTL Word document + raw text → delivery
+        → transcript engine (fidelity-gated cleanup + paragraphing)
+        → raw .txt delivered  →  note model (map + optional reduce)
+        → RTL Word document → delivery
 ```
 
-A completed job delivers two files: the Word booklet and a `.txt` file
-containing the transcript exactly as extracted. If the note model is unavailable,
-the transcript is still delivered — content is never lost to a provider outage.
+The transcript engine's primary output is the document handed to the note
+model — cleaned, deterministically paragraphed from word timings, and checked
+against the raw engine text so nothing is silently lost. That same document is
+the `.txt` deliverable. If the note model is unavailable, the raw transcript is
+still delivered — content is never lost to a provider outage.
 
-In the chat the flow starts from one button, **📎 ساخت جزوه**; help and output
-formats share a single screen and balance, top-up and subscription share the
-account screen. Administrators get five destinations — overview and statistics,
-users and billing, AI note generation, speech recognition, and operations and
-security — with long lists (model catalogs, event logs, users) paginated rather
-than cut off, and every provider switch, attestation, route, quota and test
-control reachable from inside its own panel.
+In the chat everything starts from one button, **📎 ساخت جزوه**; the account
+screen shows balance, purchase plans and payment history. Administrators get
+an overview with statistics, user listings, pending card-to-card payments with
+receipts, grants and broadcast — one small panel, no provider plumbing.
 
 ## Supported formats
 
@@ -60,11 +55,9 @@ control reachable from inside its own panel.
 
 * Python **3.11 – 3.13**
 * A Telegram bot token and API credentials ([my.telegram.org](https://my.telegram.org))
-* At least one speech-to-text provider, unless you configure encrypted keys
-  from the admin panel instead
-* Optional, for exact TOC page numbers only: LibreOffice (`soffice`) and `pypdf`
-  — see [`docs/DOCX.md`](docs/DOCX.md). Without them the booklet is still
-  delivered with a link-only table of contents.
+* At least one speech-to-text provider key
+* Optional: a note-generation provider (without one, the bot delivers raw
+  transcripts only and says so in `--check`)
 
 ## Installation
 
@@ -102,25 +95,35 @@ TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_API_ID=123456
 TELEGRAM_API_HASH=abcdef0123456789abcdef0123456789
 
-# At least one STT engine (or add encrypted keys from the admin panel):
+# At least one STT engine:
 SPEECHMATICS_API_KEY=...
 # DEEPGRAM_API_KEY=...
 # STT_OPENAI_BASE_URL=https://api.openai.com/v1
 # STT_OPENAI_API_KEY=...
 
-# Note generation:
-NOTE_API_PROVIDER=gemini
-GEMINI_API_KEY=...
+# Note generation (optional; without it only raw transcripts are delivered):
+NOTE_PROVIDER=gemini
+NOTE_API_KEY=...
 
 # Admin Telegram numeric ids, comma separated:
 ADMIN_IDS=123456789
-
-# Required to store provider keys from the admin panel:
-# PROVIDER_CREDENTIALS_ENCRYPTION_KEY=<python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())">
 ```
 
 Relative paths are anchored to the project directory, so a cron job or
 `su -c` start cannot accidentally create a second database or session.
+
+### Migrating from v2
+
+Existing deployments import users, plans, pending payments and live credit
+balances from the old database in one shot:
+
+```bash
+python scripts/import_v2.py --from data/gamas_v2.db --into data/gamas.db
+```
+
+The v2 `entitlements` state is replayed into the v3 append-only ledger, so the
+derived balance equals the old remaining balance and expiry dates survive.
+The script refuses to run twice and never writes to the source database.
 
 ## Processing limits
 
@@ -143,21 +146,19 @@ Defaults, all configurable:
 python -m compileall -q gamas_bot scripts tests passenger_wsgi.py
 ruff check .
 python -m pytest -q
-python -m scripts.benchmark_notes         # deterministic, offline
-python -m scripts.validate_docx --render
 ```
 
-See [`docs/TESTING.md`](docs/TESTING.md). CI runs the suite on Python 3.11,
-3.12 and 3.13 with both `pytest` and `unittest`.
+The suite covers the transcript engine (fidelity, paragraphing, chunking),
+the STT failover/cooldown machinery, the note merge invariants, the ledger
+(reserve → consume/release, exactly-once settlement), the job queue bounds,
+the DOCX RTL contracts and the v2 import.
 
 ## Deployment
 
 * **cPanel / Passenger** — [`docs/DEPLOY_CPANEL.md`](docs/DEPLOY_CPANEL.md) and
   [`docs/DEPLOY_FA.md`](docs/DEPLOY_FA.md).
 * **systemd** — install `deploy/gamas-bot.service` (hardened unit:
-  `Restart=always`, `UMask=0077`, `ProtectSystem=strict`);
-  [`docs/OPERATIONS.md`](docs/OPERATIONS.md) explains the unit and the
-  start/stop/health workflow.
+  `Restart=always`, `UMask=0077`, `ProtectSystem=strict`).
 * An advisory lock on the Telegram session path guarantees a single polling
   instance even if a watchdog starts a second copy.
 
@@ -166,8 +167,9 @@ See [`docs/TESTING.md`](docs/TESTING.md). CI runs the suite on Python 3.11,
 * Speech-to-text is billed by provider duration and is never chunked: a file
   larger than every configured engine's direct-upload limit is rejected rather
   than split.
-* Exact TOC page numbers need an office layout engine. Without one the numbers
-  are omitted, never estimated.
+* The table of contents links to headings but does not print page numbers —
+  exact numbers need an office layout engine, and numbers are omitted rather
+  than estimated.
 * Legacy `.ppt` fidelity is bounded by what the converter library supports;
   unsupported content is reported rather than silently dropped.
 * A single process serves one bot token. Horizontal scaling would need a real
@@ -182,7 +184,7 @@ the configured note provider. Temporary files are removed after processing.
 The database keeps the transcript and the generated notes so a job can be
 audited; payment receipts are stored privately (outside the web root, `0600`)
 and deleted after the retention window. Logs never contain transcripts, keys or
-receipt contents. See [`docs/SECURITY.md`](docs/SECURITY.md).
+receipt contents.
 
 ## License
 
