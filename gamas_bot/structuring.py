@@ -40,6 +40,14 @@ class ProviderTransientError(StructuringError):
     """Network failure after the configured bounded retry budget."""
 
 
+class NoteInputTooLarge(StructuringError):
+    """A local request preflight could not fit the complete prompt in context."""
+
+    def __init__(self, reason: str = "input_exceeds_context") -> None:
+        super().__init__("درخواست تولید جزوه از ظرفیت متن مدل بزرگ‌تر است.")
+        self.reason = reason
+
+
 class NoteOutputTruncated(StructuringError):
     """The provider stopped because the answer hit its output-token budget.
 
@@ -1684,6 +1692,25 @@ async def _structure_chunk_once(
         chunk + reminder, settings, prompt, system_prompt
     )
     provider = settings.note_api_provider
+    # Legacy deployments have no job router, but still need the same bounded
+    # preflight. Import lazily: ai.adapters imports this module at runtime.
+    from .ai.adapters import NoteRequest
+    from .ai.models import ModelInfo, STATIC_SEEDS
+    from .ai.request_budget import check_request_budget
+
+    model_name = settings.effective_note_model
+    model_info = next(
+        (item for item in STATIC_SEEDS.get(provider, ()) if item.model_id == model_name),
+        ModelInfo(provider=provider, model_id=model_name),
+    )
+    decision = check_request_budget(
+        NoteRequest(method="POST", url=url, headers=headers, params=params, json_body=payload),
+        model_info,
+        output_tokens=settings.note_api_max_output_tokens,
+        input_only_window=provider == "gemini",
+    )
+    if not decision.fits:
+        raise NoteInputTooLarge(decision.reason)
     attempts = settings.note_api_retries + 1
     for attempt in range(attempts):
         try:
@@ -2031,16 +2058,21 @@ async def _structured_notes_for(
 #: of parts that may be split in one job is bounded, so a pathological lecture
 #: cannot turn into an unbounded chain of provider calls.
 MAX_TRUNCATION_SPLITS = 4
+#: Bounded per original source chunk, separately from the job-wide output
+#: truncation budget. Long lectures must not exhaust one global input-split
+#: allowance after their first few chunks.
+MAX_INPUT_SPLITS = 8
 #: A half is only worth a provider call when it still carries real content.
 MIN_TRUNCATION_PART_CHARS = 400
 
 
-def split_document_for_truncation(document: str) -> tuple[str, str] | None:
+def split_document_for_truncation(document: str, *, min_chars: int = MIN_TRUNCATION_PART_CHARS) -> tuple[str, str] | None:
     """Split one model input into two halves at a natural, lossless boundary.
 
-    Used only when a provider stopped at its output budget: the source text was
-    never the problem, it simply does not fit into one answer. The cut prefers a
-    paragraph break, then a line break, then a sentence end, then any space, and
+    Used for output truncation and for a local input-context rejection; the
+    caller passes only the affected source, not its prompt or slide wrapper.
+    The cut prefers a paragraph break, then a line break, then a sentence end,
+    then any space, and
     it always picks the boundary closest to the middle so the two halves are
     balanced. Only the whitespace *at the seam* is normalised — no word of the
     lecture is dropped, reordered or rewritten (the same contract
@@ -2050,12 +2082,12 @@ def split_document_for_truncation(document: str) -> tuple[str, str] | None:
     reports the truncation instead of guessing.
     """
     text = document or ""
-    if len(text) < 2 * MIN_TRUNCATION_PART_CHARS:
+    if len(text) < 2 * min_chars:
         return None
     middle = len(text) // 2
-    window = max(MIN_TRUNCATION_PART_CHARS, len(text) // 8)
-    low = max(MIN_TRUNCATION_PART_CHARS, middle - window)
-    high = min(len(text) - MIN_TRUNCATION_PART_CHARS, middle + window)
+    window = max(min_chars, len(text) // 8)
+    low = max(min_chars, middle - window)
+    high = min(len(text) - min_chars, middle + window)
     if high <= low:
         return None
     for pattern in (r"\n\s*\n", r"\n", r"(?<=[.!?؟…؛])\s+", r"\s+"):
@@ -2066,8 +2098,8 @@ def split_document_for_truncation(document: str) -> tuple[str, str] | None:
         for position in positions:
             before, after = text[:position].rstrip(), text[position:].lstrip()
             if (
-                len(before) >= MIN_TRUNCATION_PART_CHARS
-                and len(after) >= MIN_TRUNCATION_PART_CHARS
+                len(before) >= min_chars
+                and len(after) >= min_chars
             ):
                 return before, after
     return None
@@ -2083,20 +2115,18 @@ async def _notes_for_part(
     label: str,
     task: str = "chunk_structuring",
     split_budget: list[int] | None = None,
+    input_split_budget: list[int] | None = None,
+    source: str | None = None,
+    wrap_source=None,
 ) -> StructuredNotes:
-    """One part's structured notes, recovering from output-token exhaustion.
+    """One part's notes; split only source when input or output cannot fit.
 
-    The ordinary path is a single call. When — and only when — the provider
-    reports that it stopped at its output budget, the part is re-requested as
-    two smaller parts cut from the same text and the two answers are merged
-    additively, so the same content the oversized call could not fit in one
-    answer is preserved instead of lost. Every other failure propagates
-    untouched: a 502, a 429 or an unsupported JSON mode is not an input-size
-    problem and must not be answered by splitting anything.
-
-    ``split_budget`` is a one-element counter shared by every part of one job
-    (``[MAX_TRUNCATION_SPLITS]``); it bounds the extra provider calls the
-    recovery may cost.
+    Output truncation or a local context-size rejection re-requests smaller
+    portions of the same source and merges the notes additively. The caller
+    supplies the source separately so the original prompt/context is rebuilt,
+    not split in half. A 502, 429 or unsupported JSON mode still propagates.
+    An input counter per original chunk and a job-wide output counter bound
+    extra calls.
     """
     try:
         return await _structured_notes_for(
@@ -2108,30 +2138,35 @@ async def _notes_for_part(
             label=label,
             task=task,
         )
-    except NoteOutputTruncated:
-        if split_budget is None or split_budget[0] <= 0:
+    except (NoteOutputTruncated, NoteInputTooLarge) as exc:
+        is_input = isinstance(exc, NoteInputTooLarge)
+        budget = input_split_budget if is_input else split_budget
+        if (
+            is_input and exc.reason in {"output_limit", "instructions_or_output_exceed_context"}
+        ) or budget is None or budget[0] <= 0:
             raise
-        halves = split_document_for_truncation(document)
+        # A presentation may repeat a slide outline as context. It is never
+        # split or silently duplicated as source: the caller supplies the
+        # separable narration and a wrapper for rebuilding each half.
+        material = document if source is None else source
+        halves = split_document_for_truncation(material, min_chars=80 if is_input else MIN_TRUNCATION_PART_CHARS)
         if halves is None:
             raise
-        split_budget[0] -= 1
+        budget[0] -= 1
         logger.warning(
-            "Note answer hit the output budget %s; re-requesting it as two smaller "
-            "parts (%s and %s characters of the same text)",
-            label,
-            len(halves[0]),
-            len(halves[1]),
+            "Note %s budget %s; splitting source into %s and %s characters",
+            "input" if is_input else "output", label, len(halves[0]), len(halves[1]),
         )
         await _emit_lifecycle(
-            "note_output_truncated",
+            "note_input_too_large" if is_input else "note_output_truncated",
             request_type=task,
-            detail=f"{label}: split {len(document)} characters into 2 parts",
+            detail=f"split {len(material)} characters into 2 parts",
         )
         parts: list[StructuredNotes] = []
         for position, half in enumerate(halves, start=1):
             parts.append(
                 await _notes_for_part(
-                    half,
+                    wrap_source(half) if wrap_source is not None else half,
                     settings,
                     session,
                     prompt,
@@ -2139,6 +2174,9 @@ async def _notes_for_part(
                     label=f"{label} (part {position}/2)",
                     task=task,
                     split_budget=split_budget,
+                    input_split_budget=input_split_budget,
+                    source=half,
+                    wrap_source=wrap_source,
                 )
             )
         return merge_structured_notes(parts)
@@ -2484,9 +2522,11 @@ async def structure_transcript(
         # budget is re-requested as two smaller parts (see _notes_for_part).
         split_budget = [MAX_TRUNCATION_SPLITS]
         for index, chunk in enumerate(chunks, start=1):
+            input_split_budget = [MAX_INPUT_SPLITS]
+            prefix = _chunk_prefix(index, len(chunks))
             notes.append(
                 await _notes_for_part(
-                    _chunk_prefix(index, len(chunks)) + chunk,
+                    prefix + chunk,
                     settings,
                     session,
                     TRANSCRIPT_PROMPT,
@@ -2498,6 +2538,9 @@ async def structure_transcript(
                     ),
                     label=f"chunk {index}/{len(chunks)}",
                     split_budget=split_budget,
+                    input_split_budget=input_split_budget,
+                    source=chunk,
+                    wrap_source=lambda part, prefix=prefix: prefix + part,
                 )
             )
         # The optional repair pass reuses this session, so it must run while
@@ -2693,14 +2736,14 @@ async def _repair_notes_if_needed(
     unit_types = sorted({unit.type for unit in missing_units})
     logger.warning(
         "Note QA triggered the repair pass %s coverage=%.2f semantic=%.2f ratio=%.3f "
-        "missing_signals=%s missing_units=%s invented=%s",
+        "missing_signals_count=%s missing_unit_types=%s unsupported_count=%s",
         label,
         report.coverage,
         report.semantic_coverage,
         report.compression_ratio,
-        ",".join(missing[:6]) or "-",
+        len(missing),
         ",".join(unit_types) or "-",
-        ",".join(report.unsupported_numbers[:6]) or "-",
+        len(report.unsupported_numbers),
     )
     await _emit_lifecycle(
         "note_repair_started",
@@ -2710,28 +2753,10 @@ async def _repair_notes_if_needed(
         qa_unsupported=report.unsupported_count,
     )
     try:
-        # The repair re-reads the *same documents* the first pass used, with the
-        # same boundaries. Re-joining and re-splitting them would be actively
-        # harmful: a presentation document carries the slide outline as
-        # context, and splitting it can send a repair request with no slide
-        # text at all. The only added cost is the bounded repair framing.
-        framing = len(
-            build_repair_prompt(
-                "", missing, report.findings, notes_text(merged), (),
-                report.unsupported_numbers,
-            )
-        ) + len(REPAIR_REMINDER)
-        if any(len(document) + framing > max_chars for document in source_chunks):
-            logger.info(
-                "Note repair skipped %s: documents plus repair framing exceed the "
-                "request budget of %s characters",
-                label,
-                max_chars,
-            )
-            return merged
+        # Re-read the same source chunks; do not re-split a presentation's slide
+        # context. Restrict previous notes and findings to this part instead of
+        # including the whole booklet in EVERY request.
         sources = list(source_chunks)
-        # The units relevant to one document only, so each repair request points
-        # at what is missing from *that* part of the lecture.
         all_units = extract_all_units(source_chunks)
         _, all_missing = semantic_coverage(all_units, notes_text(merged))
         by_chunk: dict[int, list[str]] = {}
@@ -2739,33 +2764,56 @@ async def _repair_notes_if_needed(
             by_chunk.setdefault(unit.source_chunk, []).append(unit.text[:200])
         repaired_notes = []
         for index, source in enumerate(sources, start=1):
+            original = originals[index - 1] if originals is not None and index <= len(originals) else None
+            previous = notes_text(original) if original is not None else notes_text(merged)
             chunk_prompt = (
                 system_prompt
                 if system_prompt_for is None
                 else system_prompt_for(index, len(sources))
             )
-            candidate = await _structured_notes_for(
-                build_repair_prompt(
-                    source,
-                    missing,
-                    report.findings,
-                    existing=notes_text(merged),
-                    missing_units=tuple(
-                        by_chunk.get(index, [])[:MAX_UNITS_IN_REPAIR_PROMPT]
-                    ),
-                    unsupported=report.unsupported_numbers,
-                ),
-                settings,
-                session,
-                prompt,
-                system_prompt=chunk_prompt,
-                label=f"{label} (repair {index}/{len(sources)})",
-                reminder=REPAIR_REMINDER,
-                task="repair",
-            )
-            # Targeted repair: a part that was already right is kept as it was.
-            if originals is not None and index <= len(originals):
-                candidate = _choose_repaired_draft(originals[index - 1], candidate, source)
+            local_report = run_note_qa(original, [source]) if original is not None else report
+            local_missing = local_report.missing_numbers + local_report.missing_terms
+            local_unsupported = local_report.unsupported_numbers
+            local_units = tuple(by_chunk.get(index, [])[:MAX_UNITS_IN_REPAIR_PROMPT])
+            def repair_document(
+                existing: str, *, source=source, local_missing=local_missing,
+                units=local_units,
+                local_unsupported=local_unsupported,
+                findings=local_report.findings,
+            ) -> str:
+                return build_repair_prompt(
+                    source, local_missing, findings,
+                    existing=existing, missing_units=units, unsupported=local_unsupported,
+                )
+
+            document = repair_document(previous)
+            if len(document) + len(REPAIR_REMINDER) > max_chars:
+                # The draft is optional context, never a reason to discard the
+                # source. QA compares the answer against the existing draft.
+                document = repair_document("")
+            if len(document) + len(REPAIR_REMINDER) > max_chars:
+                logger.info("Note repair part %s/%s exceeds framing budget; keeping its draft", index, len(sources))
+                if original is None:
+                    return merged
+                repaired_notes.append(original)
+                continue
+            try:
+                candidate = await _structured_notes_for(
+                    document, settings, session, prompt,
+                    system_prompt=chunk_prompt,
+                    label=f"{label} (repair {index}/{len(sources)})",
+                    reminder=REPAIR_REMINDER,
+                    task="repair",
+                )
+            except NoteInputTooLarge:
+                # An optional pass must not destroy a valid first-pass result.
+                logger.info("Note repair part %s/%s could not fit; keeping its draft", index, len(sources))
+                if original is None:
+                    return merged
+                repaired_notes.append(original)
+                continue
+            if original is not None:
+                candidate = _choose_repaired_draft(original, candidate, source)
             repaired_notes.append(candidate)
         repaired = merge_structured_notes(repaired_notes)
     except Exception:
@@ -2840,10 +2888,9 @@ async def structure_presentation(
         transcript_budget = (
             max_chars - len(build_presentation_document(outline, "")) - 100 - _CHUNK_PREFIX_RESERVE
         )
-        documents = [
-            build_presentation_document(outline, chunk)
-            for chunk in split_transcript(transcript, transcript_budget)
-        ]
+        narration_chunks = split_transcript(transcript, transcript_budget)
+        documents = [build_presentation_document(outline, chunk) for chunk in narration_chunks]
+        repeated_outline = True
     else:
         # Long decks (including slides-only decks) must not silently lose their
         # final slides. Chunk the complete material instead of truncating it.
@@ -2851,6 +2898,8 @@ async def structure_presentation(
             build_presentation_document(outline, transcript),
             max_chars=max_chars - _CHUNK_PREFIX_RESERVE,
         )
+        repeated_outline = False
+        narration_chunks = documents
 
     timeout = aiohttp.ClientTimeout(
         total=settings.note_api_timeout,
@@ -2864,9 +2913,15 @@ async def structure_presentation(
         )
         split_budget = [MAX_TRUNCATION_SPLITS]
         for index, document in enumerate(documents, start=1):
+            input_split_budget = [MAX_INPUT_SPLITS]
+            prefix = _chunk_prefix(index, len(documents))
+            wrap = (
+                (lambda part, prefix=prefix: prefix + build_presentation_document(outline, part))
+                if repeated_outline else (lambda part, prefix=prefix: prefix + part)
+            )
             notes.append(
                 await _notes_for_part(
-                    _chunk_prefix(index, len(documents)) + document,
+                    prefix + document,
                     settings,
                     session,
                     PRESENTATION_PROMPT,
@@ -2878,6 +2933,9 @@ async def structure_presentation(
                     ),
                     label=f"presentation chunk {index}/{len(documents)}",
                     split_budget=split_budget,
+                    input_split_budget=input_split_budget,
+                    source=narration_chunks[index - 1],
+                    wrap_source=wrap,
                 )
             )
         merged = await _repair_notes_if_needed(

@@ -4,6 +4,37 @@ This is the operational reference for the existing multi-provider note pipeline.
 
 Provider plan and capability statements below were reviewed against provider-owned documentation on **2026-10-09**. Quotas and terms can change: the URLs in the registry are the source of truth. A `$0` price or a provider-wide “free” label is not enough to enable a model under `AI_FREE_ONLY`.
 
+## Note request-context budgeting
+
+Transcript/presentation chunk sizes are a *first-pass heuristic*: routed jobs
+use the narrowest eligible route profile's document-token and character caps,
+while legacy jobs keep their 22,000-character ceiling. These do not prove a
+request fits. After the selected adapter builds its JSON payload, and before
+quota reservation or HTTP, the bot estimates tokens for the complete payload
+(system and user text, framing and schema). The request reserves its configured
+maximum output and a safety margin (`AI_QUOTA_SAFETY_MARGIN`, default 15% in
+routed mode). The local estimator is conservative, not an exact provider
+encoder; the legacy path uses the same 15% preflight margin.
+
+For native Gemini the advertised context window is treated as input-only and
+its maximum output is checked separately. Other chat transports are budgeted
+as combined input + reserved output. Unknown model limits use finite defaults
+(16,384 context, 8,192 output tokens), never infinity; configure verified
+metadata for unusual gateways. Profile document caps remain independent of
+model context capacity. TPM/RPM/daily quota reservations also stay independent:
+429 and exhausted quota never trigger source splitting.
+
+A local input-size failure tries the next eligible route leg; if no leg can
+accept the request, structuring splits **source only**, rebuilds prompt/slide
+context, and processes the halves in order. The input split budget is 8 per
+original chunk, separate from the existing 4 job-wide output-truncation
+splits. An irreducible source fails explicitly and the bot delivers its raw
+transcript. Optional outline, repair and compilation passes retain accepted
+first-pass notes if those passes cannot fit. Repair attaches the matching
+chunk's prior notes, not the entire booklet. Budget events contain only numeric
+metadata/reason codes, never prompts, secrets or source fragments. QA keeps
+exact missing signals in memory for repair but logs only their counts.
+
 ## Hard safety rules
 
 1. Defaults are `AI_FREE_ONLY=true` and `AI_ALLOW_PAID_FALLBACK=false`. A paid route is never a fallback unless paid fallback is enabled, its route is deliberately marked paid, and the selected key is explicitly attested `paid`.

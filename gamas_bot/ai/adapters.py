@@ -77,6 +77,7 @@ FAIL_QUOTA = "quota_exhausted"
 FAIL_BILLING = "billing_required"
 FAIL_MODEL = "model_unavailable"
 FAIL_CONTRACT = "contract"
+FAIL_INPUT_TOO_LARGE = "input_too_large"
 FAIL_CONTENT_BLOCKED = "content_blocked"
 FAIL_UNKNOWN = "unknown"
 
