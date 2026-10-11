@@ -1017,9 +1017,15 @@ def run_note_qa(notes: StructuredNotes, source_chunks: list[str]) -> NoteQARepor
         report.notes_numbers + report.notes_terms,
     )
     if report.has_findings:
+        # The report retains exact signals for in-memory repair, but logs must
+        # not reproduce numbers, terms or transcript fragments from the source.
         logger.warning(
-            "Note QA coverage gaps (informational; notes delivered unchanged): %s",
-            " | ".join(findings),
+            "Note QA coverage gaps (informational; notes delivered unchanged) "
+            "missing_numbers=%s missing_terms=%s unsupported_numbers=%s "
+            "unsupported_terms=%s missing_units=%s",
+            len(report.missing_numbers), len(report.missing_terms),
+            len(report.unsupported_numbers), len(report.unsupported_terms),
+            report.missing_units_count,
         )
     if not structure.is_clean:
         logger.warning(

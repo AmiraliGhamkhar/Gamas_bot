@@ -37,6 +37,7 @@ from ..provider_credentials import (
     ProviderCredentialManager,
 )
 from ..structuring import (
+    NoteInputTooLarge,
     ProviderHTTPError,
     ProviderTransientError,
     StructuringError,
@@ -46,6 +47,7 @@ from .adapters import (
     FAIL_AUTH,
     FAIL_BAD_REQUEST,
     FAIL_CONTRACT,
+    FAIL_INPUT_TOO_LARGE,
     FAIL_MODEL,
     FAIL_QUOTA,
     FAIL_RATE_LIMITED,
@@ -68,6 +70,7 @@ from .models import (
     fallback_free_model,
 )
 from .profiles import NoteProviderProfile, profile_for
+from .request_budget import check_request_budget
 from .registry import (
     PROVIDER_REGISTRY,
     ProviderClass,
@@ -1073,6 +1076,9 @@ class ProviderRouter:
                     )
                     return response
                 except NoteFailure as exc:
+                    if exc.category == FAIL_INPUT_TOO_LARGE:
+                        failure_log.append(exc)
+                        raise _LegFailed(exc) from None
                     if exc.local_budget_blocked:
                         failure_log.append(exc)
                         await self.tracker.event(
@@ -1083,6 +1089,11 @@ class ProviderRouter:
                         raise _LegFailed(exc) from None
                     last_failure = exc
             except NoteFailure as exc:
+                if exc.category == FAIL_INPUT_TOO_LARGE:
+                    # Changing a key cannot enlarge a model's context. The job
+                    # may still try a different provider before splitting source.
+                    failure_log.append(exc)
+                    raise _LegFailed(exc) from None
                 if exc.local_budget_blocked:
                     failure_log.append(exc)
                     await self.tracker.event(
@@ -1467,13 +1478,42 @@ class ProviderRouter:
         if override is not None and int(override) >= 0:
             retries = min(retries, int(override))
         attempts = retries + 1
-        estimated = token_budget.estimate_tokens(ctx.system_prompt) + token_budget.estimate_tokens(
-            ctx.user_text
-        )
         last: NoteFailure | None = None
         for attempt in range(1, attempts + 1):
             request_ctx = replace(ctx, attempt=attempt)
             started = time.perf_counter()
+            try:
+                request = adapter.build(request_ctx, credential.secret)
+            except StructuringError as exc:
+                raise NoteFailure(
+                    category=FAIL_CONTRACT,
+                    provider=ctx.canonical,
+                    model=ctx.model,
+                    message="request build failed (configuration)",
+                ) from exc
+            decision = check_request_budget(
+                request,
+                ctx.model_info,
+                output_tokens=ctx.max_output_tokens,
+                document_token_budget=profile.chunk_token_budget,
+                margin=float(getattr(self.settings, "ai_quota_safety_margin", 0.15)),
+                input_only_window=adapter.protocol == "gemini_native",
+            )
+            if not decision.fits:
+                await self.tracker.event(
+                    "note_request_input_too_large", service="notes",
+                    provider=ctx.provider, canonical=ctx.canonical, model=ctx.model,
+                    request_type=ctx.request_type, route_position=position,
+                    job_id=ctx.job_id, detail=decision.reason,
+                    estimated_input_tokens=decision.input_tokens,
+                )
+                raise NoteFailure(
+                    category=FAIL_INPUT_TOO_LARGE, provider=ctx.canonical,
+                    model=ctx.model, message=decision.reason,
+                )
+            # Charge the same full-request estimate (including schema/framing)
+            # to the independent quota ledger, not just the two prompt strings.
+            estimated = decision.input_tokens
             if attempt == 1:
                 await self.tracker.event(
                     "note_request_started",
@@ -1490,15 +1530,6 @@ class ProviderRouter:
                     job_id=ctx.job_id,
                     level="info",
                 )
-            try:
-                request = adapter.build(request_ctx, credential.secret)
-            except StructuringError as exc:
-                raise NoteFailure(
-                    category=FAIL_CONTRACT,
-                    provider=ctx.canonical,
-                    model=ctx.model,
-                    message="request build failed (configuration)",
-                ) from exc
             local_reason, reservation_id = await self._reserve_local_request_budget(
                 profile,
                 ctx.canonical,
@@ -2042,6 +2073,7 @@ class NoteJobSession:
         legs = await self._attempted_legs(plan_legs, budget=max_failovers + 1)
         leg_budget_seconds = self._leg_budget_seconds()
         last_error: Exception | None = None
+        first_failure = len(self.failures)
         for position, leg in enumerate(legs):
             if position > 0:
                 self.fallbacks += 1
@@ -2089,6 +2121,15 @@ class NoteJobSession:
             except AllProvidersFailedError as exc:
                 last_error = exc
                 break
+        current_failures = self.failures[first_failure:]
+        if (
+            current_failures
+            and current_failures[-1].category == FAIL_INPUT_TOO_LARGE
+            and all(f.category in {FAIL_INPUT_TOO_LARGE, FAIL_TRANSIENT, FAIL_SERVER} for f in current_failures)
+        ):
+            # A narrower fallback may work after splitting even when a larger
+            # primary timed out. Never split on a quota/auth/contract failure.
+            raise NoteInputTooLarge(current_failures[-1].message)
         raise self._as_legacy_error(last_error)
 
     def _as_legacy_error(self, error: NoteFailure | Exception | None) -> StructuringError:
