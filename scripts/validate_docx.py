@@ -240,6 +240,8 @@ def _render_status(out_dir: Path, sample: Path) -> str:
             "rendered offline with scripts.render_docx_pages "
             f"({len(facts['pages'])} pages) -> {pages_dir}"
         ]
+        for note in facts.get("capability_notes", ()):
+            lines.append(f"renderer capability: {note}")
         if facts["warnings"]:
             lines.append("layout warnings:")
             lines.extend(f"  ! {warning}" for warning in facts["warnings"])

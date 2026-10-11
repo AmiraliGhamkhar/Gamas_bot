@@ -40,6 +40,18 @@ class ProviderTransientError(StructuringError):
     """Network failure after the configured bounded retry budget."""
 
 
+class NoteOutputTruncated(StructuringError):
+    """The provider stopped because the answer hit its output-token budget.
+
+    Deliberately distinct from a transport failure, a rate limit, an
+    authentication failure or an invalid request: the request was accepted and
+    the only problem is that the answer is *incomplete*. Re-sending the
+    identical oversized request would spend the same budget again, so the
+    pipeline answers this condition by re-asking for smaller, source-preserving
+    parts of the same text (:func:`split_document_for_truncation`).
+    """
+
+
 ERROR_DETAIL_LIMIT = 180
 
 #: Maximum accepted lengths when normalising model-supplied strings.
@@ -364,8 +376,15 @@ _BACKEND_NAMES = (
 _BACKEND_NAME_ALT = "|".join(re.escape(name) for name in _BACKEND_NAMES)
 
 #: Well-known API-key prefixes (never legitimate inside a study note).
+#:
+#: Two shapes exist and both must be matched. Most vendors separate the prefix
+#: from the body (``sk-…``, ``sk-ant-…``, ``hf_…``, ``gsk_…``, ``nvapi-…``), but
+#: a Google API key runs straight on from ``AIza`` with no separator at all, so
+#: a pattern that requires one let a live Gemini key through into the notes it
+#: was echoed into. ``tests/test_backend_artifact_scrub.py`` pins every shape.
 _KEY_PREFIX = re.compile(
-    r"\b(?:sk|sk-nry|sk-ant|AIza|ghp|gho|github_pat|hf|xox[baprs])[_-][A-Za-z0-9_-]{8,}\b"
+    r"\b(?:sk|sk-nry|sk-ant|ghp|gho|github_pat|hf|gsk|nvapi|xox[baprs])[_-][A-Za-z0-9_-]{8,}\b"
+    r"|\bAIza[A-Za-z0-9_-]{12,}\b"
     r"|\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b"
 )
 
@@ -395,15 +414,36 @@ _SELF_REFERENCE = re.compile(
 )
 
 #: "As an AI assistant"-class disclaimers (EN + FA).
+#:
+#: Case-insensitive on purpose: a model almost always writes this sentence
+#: *first*, so the capitalised ``As an AI assistant …`` was the common form and
+#: the case-sensitive pattern missed exactly it. The English alternatives are
+#: also narrowed to the shapes a lecture cannot legitimately need — a role word
+#: after ``AI``, or a first-person continuation — so an AI course that writes
+#: "an LLM, as a language model, predicts the next token" keeps its sentence.
 _AI_DISCLAIMER = re.compile(
-    r"(?:as an?\s+AI(?:\s+(?:assistant|language\s+model|model|chatbot|bot))?"
-    r"|I['’]?m\s+(?:just\s+)?an?\s+AI(?:\s+(?:assistant|language\s+model|model))?"
-    r"|I\s+am\s+(?:just\s+)?an?\s+AI(?:\s+(?:assistant|language\s+model|model))?"
+    # Every English form requires the self-referential continuation a
+    # disclaimer always carries ("…, I cannot…"), so a lecture that merely
+    # mentions the phrase ("a chatbot acts as an AI assistant to the user",
+    # "an LLM, as a language model, predicts the next token") keeps its
+    # sentence. Only the disclaimer shape is removed.
+    r"\bas\s+an?\s+AI(?:\s+(?:assistant|language\s+model|model|chatbot|bot))?\b"
+    r"(?=[,؛.]?\s*(?:I\b|I['’]|my\b|we\b|our\b))"
+    r"|\bas\s+a\s+language\s+model\b(?=[,؛.]?\s*(?:I\b|I['’]|my\b|we\b))"
+    # The label form: a line that *starts* with the phrase and then stops or
+    # introduces its own text ("As an AI assistant: …"). Line-initial plus a
+    # colon cannot be a lecture sentence; a mid-sentence mention stays.
+    r"|^\s*as\s+an?\s+AI(?:\s+(?:assistant|language\s+model|model|chatbot|bot))?"
+    r"(?:\s*[:،؛]|\s*$)"
+    r"|\bI['’]?m\s+(?:just\s+)?an?\s+AI(?:\s+(?:assistant|language\s+model|model))?\b"
+    r"|\bI\s+am\s+(?:just\s+)?an?\s+AI(?:\s+(?:assistant|language\s+model|model))?\b"
+    # Persian equivalents; the same continuation rule applies.
     r"|من\s+یک\s+هوش\s+مصنوعی\s*(?:هستم|نیستم)?"
-    r"|من\s+یک\s+مدل\s+زبانی\s+(?:هستم| نیستم| نیستم)?"
-    r"|به[‌\s]-?عنوان\s+یک\s+(?:هوش\s+مصنوعی|مدل\s+زبانی)"
-    r"|به[‌\s]عنوان\s+دستیار\s+هوش\s+مصنوعی)"
+    r"|من\s+یک\s+مدل\s+زبانی\s+(?:هستم|نیستم)?"
+    r"|به[\u200c\s]-?عنوان\s+یک\s+(?:دستیار\s+هوش\s+مصنوعی|هوش\s+مصنوعی|مدل\s+زبانی)\b"
+    r"(?=[,،؛]?\s*(?:نمی[\u200c\s]?توانم|نمیتونم|هستم|نیستم|من\b))"
     r"[.,،؛]?",
+    re.IGNORECASE,
 )
 
 #: Prompt/schema meta phrases that indicate prompt or schema leakage.
@@ -1588,12 +1628,12 @@ def _provider_response(payload: dict, provider: str) -> str:
                     raise StructuringError(f"پاسخ سرویس تولید جزوه مسدود شد ({reason}).")
                 raise StructuringError("پاسخ سرویس تولید جزوه خالی یا نامعتبر است.")
             if candidates[0].get("finishReason") == "MAX_TOKENS":
-                raise StructuringError("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
+                raise NoteOutputTruncated("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
             parts = candidates[0]["content"]["parts"]
             text = "".join(str(part.get("text", "")) for part in parts)
         elif provider == "anthropic":
             if payload.get("stop_reason") == "max_tokens":
-                raise StructuringError("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
+                raise NoteOutputTruncated("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
             text = "".join(
                 str(part.get("text", ""))
                 for part in payload["content"]
@@ -1601,7 +1641,7 @@ def _provider_response(payload: dict, provider: str) -> str:
             )
         else:
             if payload["choices"][0].get("finish_reason") == "length":
-                raise StructuringError("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
+                raise NoteOutputTruncated("خروجی جزوه به سقف توکن رسید؛ متن خام برگردانده می‌شود.")
             content = payload["choices"][0]["message"]["content"]
             if isinstance(content, list):
                 text = "".join(
@@ -1985,6 +2025,125 @@ async def _structured_notes_for(
     return notes
 
 
+#: Recovery from output-token exhaustion. A part whose answer was cut off is
+#: re-requested as two smaller parts of the *same* text, never as the identical
+#: oversized request. One level of splitting is allowed per part, and the number
+#: of parts that may be split in one job is bounded, so a pathological lecture
+#: cannot turn into an unbounded chain of provider calls.
+MAX_TRUNCATION_SPLITS = 4
+#: A half is only worth a provider call when it still carries real content.
+MIN_TRUNCATION_PART_CHARS = 400
+
+
+def split_document_for_truncation(document: str) -> tuple[str, str] | None:
+    """Split one model input into two halves at a natural, lossless boundary.
+
+    Used only when a provider stopped at its output budget: the source text was
+    never the problem, it simply does not fit into one answer. The cut prefers a
+    paragraph break, then a line break, then a sentence end, then any space, and
+    it always picks the boundary closest to the middle so the two halves are
+    balanced. Only the whitespace *at the seam* is normalised — no word of the
+    lecture is dropped, reordered or rewritten (the same contract
+    :func:`split_transcript` offers).
+
+    Returns ``None`` when no boundary leaves two usable halves; the caller then
+    reports the truncation instead of guessing.
+    """
+    text = document or ""
+    if len(text) < 2 * MIN_TRUNCATION_PART_CHARS:
+        return None
+    middle = len(text) // 2
+    window = max(MIN_TRUNCATION_PART_CHARS, len(text) // 8)
+    low = max(MIN_TRUNCATION_PART_CHARS, middle - window)
+    high = min(len(text) - MIN_TRUNCATION_PART_CHARS, middle + window)
+    if high <= low:
+        return None
+    for pattern in (r"\n\s*\n", r"\n", r"(?<=[.!?؟…؛])\s+", r"\s+"):
+        positions = sorted(
+            (low + match.start() for match in re.finditer(pattern, text[low:high])),
+            key=lambda position: abs(position - middle),
+        )
+        for position in positions:
+            before, after = text[:position].rstrip(), text[position:].lstrip()
+            if (
+                len(before) >= MIN_TRUNCATION_PART_CHARS
+                and len(after) >= MIN_TRUNCATION_PART_CHARS
+            ):
+                return before, after
+    return None
+
+
+async def _notes_for_part(
+    document: str,
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    prompt: str,
+    *,
+    system_prompt: str,
+    label: str,
+    task: str = "chunk_structuring",
+    split_budget: list[int] | None = None,
+) -> StructuredNotes:
+    """One part's structured notes, recovering from output-token exhaustion.
+
+    The ordinary path is a single call. When — and only when — the provider
+    reports that it stopped at its output budget, the part is re-requested as
+    two smaller parts cut from the same text and the two answers are merged
+    additively, so the same content the oversized call could not fit in one
+    answer is preserved instead of lost. Every other failure propagates
+    untouched: a 502, a 429 or an unsupported JSON mode is not an input-size
+    problem and must not be answered by splitting anything.
+
+    ``split_budget`` is a one-element counter shared by every part of one job
+    (``[MAX_TRUNCATION_SPLITS]``); it bounds the extra provider calls the
+    recovery may cost.
+    """
+    try:
+        return await _structured_notes_for(
+            document,
+            settings,
+            session,
+            prompt,
+            system_prompt=system_prompt,
+            label=label,
+            task=task,
+        )
+    except NoteOutputTruncated:
+        if split_budget is None or split_budget[0] <= 0:
+            raise
+        halves = split_document_for_truncation(document)
+        if halves is None:
+            raise
+        split_budget[0] -= 1
+        logger.warning(
+            "Note answer hit the output budget %s; re-requesting it as two smaller "
+            "parts (%s and %s characters of the same text)",
+            label,
+            len(halves[0]),
+            len(halves[1]),
+        )
+        await _emit_lifecycle(
+            "note_output_truncated",
+            request_type=task,
+            detail=f"{label}: split {len(document)} characters into 2 parts",
+        )
+        parts: list[StructuredNotes] = []
+        for position, half in enumerate(halves, start=1):
+            parts.append(
+                await _notes_for_part(
+                    half,
+                    settings,
+                    session,
+                    prompt,
+                    system_prompt=system_prompt,
+                    label=f"{label} (part {position}/2)",
+                    task=task,
+                    split_budget=split_budget,
+                )
+            )
+        return merge_structured_notes(parts)
+
+
 def _chunk_prefix(index: int, total: int) -> str:
     """Positional context prepended to every chunk sent to the model.
 
@@ -2297,6 +2456,11 @@ async def structure_transcript(
     context and its neighbours -> additive merge -> optional source-grounded
     repair when QA sees real loss -> one editorial compilation pass, accepted
     only when no measured content is lost.
+
+    A part whose answer was cut off at the provider's output-token budget is
+    re-requested as two smaller parts of the same text and merged additively
+    (see :func:`_notes_for_part`), so an answer that does not fit costs extra
+    calls rather than part of the lecture.
     """
     if not text.strip():
         raise StructuringError("متن پیاده‌سازی‌شده خالی است.")
@@ -2316,9 +2480,12 @@ async def structure_transcript(
             chunks, settings, session,
             budget=chunk_budget + _CHUNK_PREFIX_RESERVE, label="transcript",
         )
+        # Shared by every part of this job: a part whose answer hit the output
+        # budget is re-requested as two smaller parts (see _notes_for_part).
+        split_budget = [MAX_TRUNCATION_SPLITS]
         for index, chunk in enumerate(chunks, start=1):
             notes.append(
-                await _structured_notes_for(
+                await _notes_for_part(
                     _chunk_prefix(index, len(chunks)) + chunk,
                     settings,
                     session,
@@ -2330,6 +2497,7 @@ async def structure_transcript(
                         ),
                     ),
                     label=f"chunk {index}/{len(chunks)}",
+                    split_budget=split_budget,
                 )
             )
         # The optional repair pass reuses this session, so it must run while
@@ -2694,9 +2862,10 @@ async def structure_presentation(
         context = await _lecture_context(
             documents, settings, session, budget=max_chars, label="presentation"
         )
+        split_budget = [MAX_TRUNCATION_SPLITS]
         for index, document in enumerate(documents, start=1):
             notes.append(
-                await _structured_notes_for(
+                await _notes_for_part(
                     _chunk_prefix(index, len(documents)) + document,
                     settings,
                     session,
@@ -2708,6 +2877,7 @@ async def structure_presentation(
                         ),
                     ),
                     label=f"presentation chunk {index}/{len(documents)}",
+                    split_budget=split_budget,
                 )
             )
         merged = await _repair_notes_if_needed(

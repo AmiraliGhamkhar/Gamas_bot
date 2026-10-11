@@ -1026,6 +1026,22 @@ async def _native_attempt(
     return _legacy_transcript(platform)
 
 
+def _native_max_upload(slug: str, settings: Settings) -> int:
+    """Direct-upload cap for one native provider, in bytes.
+
+    The registry records the limit the provider documents. A deployment that
+    knows its own account differs has the last word through
+    ``STT_PROVIDER_MAX_UPLOADS`` (``GROQ_STT_MAX_UPLOAD_BYTES`` for Groq): that
+    variable was documented, validated at startup and then never read, so an
+    operator who lowered the cap to match their plan still had the bot upload
+    the larger file and be rejected after the whole transfer.
+    """
+    override = dict(getattr(settings, "stt_provider_max_uploads", ()) or ()).get(slug)
+    if override:
+        return int(override)
+    return int(STT_PROVIDER_REGISTRY[slug].max_file_size)
+
+
 def _native_provider(slug: str) -> STTProvider:
     info = STT_PROVIDER_REGISTRY[slug]
     return STTProvider(
@@ -1034,8 +1050,9 @@ def _native_provider(slug: str) -> STTProvider:
             _slug, session, audio, settings
         ),
         label=info.display_name,
-        # The registry records the provider's direct-upload limit.
-        max_upload=lambda settings, _slug=slug: STT_PROVIDER_REGISTRY[_slug].max_file_size,
+        # The registry records the provider's direct-upload limit; a configured
+        # override (if any) wins over the published default.
+        max_upload=lambda settings, _slug=slug: _native_max_upload(_slug, settings),
     )
 
 

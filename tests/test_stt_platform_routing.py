@@ -446,6 +446,48 @@ class TranscribeRoutingTests(unittest.IsolatedAsyncioTestCase):
             result = await transcribe(self.audio, settings)
         self.assertEqual(result.engine, "gemini_transcribe")
 
+    async def test_configured_provider_upload_cap_overrides_the_registry_default(self):
+        """``GROQ_STT_MAX_UPLOAD_BYTES`` is enforced, not merely documented.
+
+        The registry records Groq's published 25 MB direct-upload limit. The
+        deployment variable was parsed, validated at startup and then never
+        read, so an operator whose account rejects a smaller upload still had
+        the bot transfer the larger file and lose the whole attempt to a
+        provider-side rejection.
+        """
+        from gamas_bot.stt import _native_max_upload
+
+        override = self._settings(stt_provider_max_uploads=(("groq", 10_000_000),))
+        self.assertEqual(_native_max_upload("groq", override), 10_000_000)
+        # An unset override keeps the registry's published limit.
+        self.assertEqual(
+            _native_max_upload("groq", self._settings()),
+            STT_PROVIDER_REGISTRY["groq"].max_file_size,
+        )
+        # A file between the two caps: refused with the configured cap, accepted
+        # (and attempted) with the published one.
+        big = _wav(self.root / "big.wav", 375.0)
+        self.assertGreaterEqual(big.stat().st_size, 10_000_000)
+        self.assertLess(big.stat().st_size, 25_000_000)
+
+        async def fake(engine, *_args, **_kwargs):  # pragma: no cover - must not run
+            raise AssertionError("a file over the configured cap must not be uploaded")
+
+        with self.assertRaises(STTError) as ctx:
+            await transcribe(big, override, credentials=_FakeCredentials(self.db, {"groq": [self.groq]}))
+        # The refusal names the *configured* cap (10 MB = 0.01 GB), not the
+        # registry's 25 MB: that is the whole point of the override.
+        self.assertIn(f"{10_000_000 / 1_000_000_000:g} گیگابایت", str(ctx.exception))
+
+        async def accepted(engine, _session, _audio, _settings, **_kwargs):
+            return Transcript(engine, PERSIAN, None)
+
+        with patch("gamas_bot.stt._attempt_with_retries", side_effect=accepted):
+            result = await transcribe(
+                big, self._settings(), credentials=_FakeCredentials(self.db, {"groq": [self.groq]})
+            )
+        self.assertEqual(result.engine, "groq")
+
     async def test_no_keys_still_reports_the_configuration_error(self):
         async def fake(engine, *_args, **_kwargs):  # pragma: no cover - must not run
             raise AssertionError("no provider should be attempted")

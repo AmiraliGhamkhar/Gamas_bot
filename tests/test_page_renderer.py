@@ -12,6 +12,7 @@ happily hand out a false "all good".
 from __future__ import annotations
 
 import io
+import json
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -161,8 +162,98 @@ class RendererTests(unittest.TestCase):
         self.render(data)
         self.assertTrue(io.BytesIO(data).read(2) == b"PK")
 
+    def test_a_callout_box_on_the_page_bottom_is_not_a_false_overflow(self):
+        """Reproduced: callout boxes were measured without their own padding.
+
+        The painter draws a shaded callout four pixels beyond its text, but the
+        height reserved before placing the block counted only the text. A
+        callout landing near the bottom margin was therefore drawn past it, and
+        the renderer reported "content overflows the bottom margin" — a defect
+        warning created by the verifier's own drawing rather than by the
+        document, which is exactly the kind of false alarm an operator cannot
+        afford when the only visual evidence available is this tool.
+        """
+        payload = {
+            "title": "جزوهٔ آزمون",
+            "summary": "خلاصهٔ درس",
+            "sections": [
+                {
+                    "heading": f"سرفصل {index} (tier {index})",
+                    "paragraphs": [
+                        f"در این بخش سرفصل {index} توضیح داده می‌شود و مقدار "
+                        f"TSH {index} mIU/L ذکر می‌شود.",
+                        f"The English note says chapter {index}, measured at {index} mIU/L.",
+                    ],
+                    "bullets": [f"نکتهٔ {index}: مقدار مرجع {index} mIU/L"],
+                    "key_points": [f"مقدار کلیدی {index}"],
+                    "callouts": [{"kind": "هشدار", "text": f"پایش سرفصل {index} ضروری است"}],
+                }
+                for index in range(1, 7)
+            ],
+            "key_points": ["لووتیروکسین ۵۰ میکروگرم"],
+            "glossary": [{"term": "TSH", "definition": "هورمون محرک تیروئید"}],
+        }
+        notes = parse_structured_notes(json.dumps(payload, ensure_ascii=False))
+        data = build_notes_docx(notes, meta=META, design=resolve_design({"toc_enabled": True}))
+
+        facts = self.render(data)
+
+        self.assertEqual(facts["warnings"], [])
+        # Silencing the warning by dropping content would be far worse than the
+        # false positive: the pages must still carry the whole booklet.
+        self.assertGreaterEqual(len(facts["pages"]), 4)
+        for page in facts["pages"]:
+            self.assertGreater(page["blocks"], 0, f"blank page {page['index']}")
+
 
 @unittest.skipUnless(RENDER_AVAILABLE, "the validator needs Pillow and lxml")
+@unittest.skipUnless(RENDER_AVAILABLE, "the page renderer needs Pillow and lxml")
+class RendererCapabilityTests(unittest.TestCase):
+    """A layout-only render must say so instead of implying the pages look right.
+
+    Pillow in this repository draws with whatever face it finds; when that face
+    has no Arabic coverage every Persian word becomes a box. Reporting "no layout
+    warnings" without that caveat invites an operator to read a page of tofu as
+    "the Persian renders correctly", which is the one judgement this tool cannot
+    make.
+    """
+
+    def build_docx(self) -> bytes:
+        notes = parse_structured_notes(LONG_NOTES)
+        return build_notes_docx(notes, meta=META, design=resolve_design({"toc_enabled": False}))
+
+    def render(self, data: bytes, **kwargs) -> dict:
+        with TemporaryDirectory() as folder:
+            path = Path(folder) / "booklet.docx"
+            path.write_bytes(data)
+            return R.render(path, kwargs.get("out"), kwargs.get("sheet"))
+
+    def test_a_face_without_persian_coverage_is_detected(self):
+        # Pillow's bundled default face carries no Arabic glyphs, so the probe
+        # must conclude that Persian cannot be drawn with it.
+        from PIL import ImageFont
+
+        with patch.object(R, "font", lambda *args, **kwargs: ImageFont.load_default(size=12)):
+            self.assertFalse(R.face_renders_persian())
+
+    def test_a_face_with_persian_coverage_is_not_flagged(self):
+        from PIL import Image
+
+        def distinct(_face, text):
+            return Image.new("L", (8, 8), 255 if text == R._PERSIAN_PROBE else 0)
+
+        with patch.object(R, "_glyph_bitmap", side_effect=distinct):
+            self.assertTrue(R.face_renders_persian())
+
+    def test_the_note_is_a_capability_limit_and_never_a_document_defect(self):
+        with patch.object(R, "face_renders_persian", return_value=False):
+            facts = self.render(self.build_docx())
+        self.assertEqual(facts["warnings"], [])
+        self.assertTrue(facts["ok"])
+        self.assertEqual(len(facts["capability_notes"]), 1)
+        self.assertIn("layout and direction only", facts["capability_notes"][0])
+
+
 class ValidatorOrderingTests(unittest.TestCase):
     """``scripts.validate_docx`` must catch real order bugs, not nested tags."""
 
@@ -215,6 +306,27 @@ class ValidateRenderStatusTests(unittest.TestCase):
 
             self.assertIn("rendered with /usr/bin/soffice", message)
             self.assertEqual((output / "notes.pdf").read_bytes(), b"%PDF-mock")
+
+
+    def test_the_offline_report_surfaces_the_capability_note(self):
+        from scripts.validate_docx import _render_status
+
+        with TemporaryDirectory() as folder:
+            output = Path(folder)
+            sample = output / "notes.docx"
+            sample.write_bytes(b"mock docx")
+            facts = {
+                "pages": [{}, {}],
+                "warnings": [],
+                "capability_notes": ["the selected font face cannot draw Persian glyphs"],
+            }
+            with patch("scripts.validate_docx.shutil.which", return_value=None), patch(
+                "scripts.render_docx_pages.render", return_value=facts
+            ):
+                message = _render_status(output, sample)
+        self.assertIn("renderer capability:", message)
+        self.assertIn("cannot draw Persian glyphs", message)
+        self.assertIn("no layout warnings", message)
 
 
 if __name__ == "__main__":
