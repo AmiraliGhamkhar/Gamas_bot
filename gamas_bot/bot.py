@@ -1,3 +1,22 @@
+"""Gamas Bot v3 — Telegram handlers, job pipeline, delivery.
+
+One file, three concerns, in order:
+
+* **Intake** — classify an upload (audio / video / presentation), record it,
+  enqueue it on the bounded queue with explicit back-pressure.
+* **The pipeline** — download → media worker → STT → raw-text engine →
+  **deliver the transcript immediately** → note generation → RTL Word booklet.
+  The transcript is delivered before note generation starts: an LLM outage can
+  delay the booklet, never the raw text.
+* **The screens** — one button for the main flow, one account screen
+  (balance, plans, payment), one small admin panel (overview, users,
+  payments, broadcast, audit).
+
+Everything provider-related lives in ``stt.py`` / ``llm.py``; everything text
+lives in ``transcript.py`` / ``notes.py``; everything layout in
+``docx_export.py``. This module only orchestrates.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -7,62 +26,43 @@ import re
 import secrets
 import shutil
 import tempfile
-from collections.abc import Awaitable, Callable
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
-from typing import Any
 
+import aiohttp
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.tl.types import MessageMediaWebPage
 
-from .config import Settings
-from .telegram_text import (  # noqa: F401 - re-exported for backward compatibility
-    BUTTON_LABEL_LIMIT,
-    MESSAGE_CHUNK_SIZE,
-    MIN_CHUNK_SIZE,
-    TELEGRAM_TEXT_LIMIT,
-    button_label,
-    _emphasis_is_nested,
-    _plain_length,
-    _split_rendered,
-    _utf16_length,
-    markdown_to_telegram_html,
-    render_pages,
-    split_message,
-)
-from .database import Database, UNLIMITED_REVOKED_REASON, clean_human_text
 from .billing import (
-    MAX_PLAN_HOURS,
-    MAX_PLAN_VALIDITY_DAYS,
+    FREE_PLAN_NAME,
     format_duration,
     format_toman,
     format_validity,
     plan_catalog,
 )
+from .config import Settings, format_payment_card
+from .db import Database, InsufficientBalanceError
 from .docx_export import (
-    DocxPaginationError,
     DocumentMeta,
     build_notes_docx,
     build_plain_docx,
-    build_raw_text_document,
     notes_docx_filename,
     plain_docx_filename,
     raw_text_filename,
     resolve_design,
     resolve_fonts,
 )
+from .jobs import Job, JobQueue, QueueFullError
 from .logging_config import log_job_id
 from .media import (
     MediaToolError,
-    check_media_worker,
     convert_to_pptx,
     extract_audio_track,
     needs_transcode,
     probe_media,
 )
+from .notes import StructuredNotes, structure_presentation, structure_transcript
 from .presentations import (
     PresentationError,
     classify_presentation,
@@ -71,31 +71,13 @@ from .presentations import (
     slides_outline,
 )
 from .progress import JobProgress, to_persian_digits
-from .admin_ai import AIPanels, handle_ai_callback, latency_sample_note
-from .admin_stt import SttPanels, handle_stt_callback
-from .ai.models import ModelRegistry
-from .ai.routing import (
-    NoteJobSession,
-    ProviderRouter,
-    job_session_scope,
-)
-from .ai.usage import AIUsageTracker
-from .provider_credentials import (
-    CredentialStoreError,
-    PROVIDER_CHOICES,
-    ProviderCredentialManager,
-    use_provider_credentials,
-)
-from .provider_health import ProviderHealthChecker, cooldown_remaining_seconds
-from .stt import STTConfigurationError, transcribe
-from .structuring import (
-    StructuredNotes,
-    StructuringError,
-    structure_presentation,
-    structure_transcript,
-)
+from .stt import STTError, STTConfigurationError, transcribe
+from .telegram_text import button_label, render_pages
+from .transcript import build_document, render as render_transcript
+from .textnorm import normalize_display
 
 logger = logging.getLogger(__name__)
+
 AUDIO_EXTENSIONS = {
     ".aac", ".aif", ".aiff", ".amr", ".au", ".flac", ".m4a", ".m4b", ".mp3",
     ".oga", ".ogg", ".opus", ".ra", ".wav", ".wma", ".webm",
@@ -104,347 +86,21 @@ VIDEO_EXTENSIONS = {
     ".3gp", ".asf", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg",
     ".mpg", ".ts", ".webm", ".wmv",
 }
-USER_VISIBLE_ERRORS = (
-    ValueError,
-    PresentationError,
-    STTConfigurationError,
-    DocxPaginationError,
-)
+PRESENTATION_EXTENSIONS = {".ppt", ".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm", ".pps", ".pot"}
+
+USER_VISIBLE_ERRORS = (ValueError, PresentationError, STTConfigurationError, MediaToolError)
+
+RAW_PREVIEW_CHARS = 800
+MAX_RAW_PREVIEW_LINES = 12
 
 
-class InsufficientBalanceError(ValueError):
-    """A safe user-facing billing denial with auditable available/required seconds."""
-
-    def __init__(self, available_seconds: int, required_seconds: int):
-        self.available_seconds = int(available_seconds)
-        self.required_seconds = int(required_seconds)
-        super().__init__(
-            "اعتبار زمانی شما کافی نیست. "
-            f"موجود: {format_duration(self.available_seconds)}؛ "
-            f"موردنیاز: {format_duration(self.required_seconds)}. "
-            "از منوی «💳 خرید اشتراک» یکی از طرح‌ها را انتخاب کنید."
-        )
+# ---------------------------------------------------------------------------
+# Intake classification helpers
+# ---------------------------------------------------------------------------
 
 
-UNSUPPORTED_FILE_MESSAGE = (
-    "این نوع فایل را نمی‌توانم پردازش کنم. 🤔\n\n"
-    "یکی از این‌ها را بفرستید:\n"
-    "• پیام صوتی یا فایل صوتی\n"
-    "• ویدیوی کلاس\n"
-    "• فایل PowerPoint\n\n"
-    "فهرست دقیق پسوندها در بخش «قالب‌ها» است."
-)
-UNSUPPORTED_PRESENTATION_MESSAGE = (
-    "فایل‌های ODP/OTP پشتیبانی نمی‌شوند. ♻️\n\n"
-    "لطفاً ارائه را در برنامهٔ PowerPoint (یا LibreOffice) با پسوند pptx ذخیره "
-    "و دوباره ارسال کنید."
-)
-WELCOME_TEXT = (
-    "سلام! 👋\n\n"
-    "فایل صوتی، ویدیوی کلاس یا PowerPoint را بفرستید؛ من محتوایش را به یک جزوهٔ "
-    "مرتب تبدیل می‌کنم و روند کار را همین‌جا نشان می‌دهم.\n\n"
-    "برای شروع، فایل را بفرستید یا روی «ساخت جزوه» بزنید."
-)
-HELP_TEXT = (
-    "چطور جزوه بسازم؟ 📚\n\n"
-    "۱) فایل صوتی، ویدیو یا PowerPoint را بفرستید.\n"
-    "۲) پیشرفت کار را در همان پیام دنبال کنید.\n"
-    "۳) جزوه به شکل یک فایل Word مرتب (راست‌به‌چپ) به‌همراه متن خام پیاده‌شده "
-    "ارسال می‌شود.\n\n"
-    "PowerPoint بدون صدا هم قابل استفاده است؛ در این حالت جزوه از متن و یادداشت "
-    "اسلایدها ساخته می‌شود. اگر ساخت جزوهٔ هوشمند موقتاً در دسترس نباشد، متن خام را "
-    "از دست نمی‌دهید و همان را در قالب فایل تحویل می‌گیرید."
-)
-FORMATS_TEXT = (
-    "چه فایل‌هایی می‌توانم بفرستم؟ 🧰\n\n"
-    "• صوت: MP3، M4A، WAV، OGG، OPUS، FLAC، WMA و AMR\n"
-    "• ویدیو: MP4، MKV، MOV، AVI، WEBM و ویدیوی گرد تلگرام\n"
-    "• ارائه: PPTX، PPTM، PPSX، PPSM، POTX، POTM، PPT، PPS، POT\n\n"
-    "قالب‌های صوتی و ویدیویی رایج دیگر هم معمولاً قابل پردازش‌اند. فایل‌های "
-    "ODP/OTP پشتیبانی نمی‌شوند؛ آن‌ها را با پسوند pptx ذخیره کنید."
-)
-PRIVACY_TEXT = (
-    "حریم خصوصی 🔐\n\n"
-    "صدای فایل برای تبدیل به متن و متن به‌دست‌آمده برای ساخت جزوه به سرویس‌های ربات "
-    "فرستاده می‌شوند. فایل‌های موقت پس از پردازش حذف می‌شوند، اما متن و جزوه ممکن است "
-    "در پایگاه‌داده بمانند. رسید پرداخت فقط برای مدیران قابل مشاهده است و طبق مهلت "
-    "نگهداری تنظیم‌شده از فضای خصوصی سرور حذف می‌شود. لطفاً فایل خیلی حساس نفرستید."
-)
-
-
-def main_menu(is_admin: bool = False):
-    """User entry points.
-
-    One primary action (send a file), one merged "help + supported formats"
-    destination, the privacy notice, and one account/credit destination that
-    keeps purchasing next to the balance it pays from. ``menu:formats``,
-    ``billing:plans`` and ``billing:balance`` stay routable so an older message
-    on screen keeps working.
-    """
-    rows = [
-        [Button.inline("📎 ساخت جزوه", b"menu:create")],
-        [Button.inline("📚 راهنما و قالب‌ها", b"menu:help")],
-        [Button.inline("💳 حساب و اعتبار", b"menu:account")],
-        [Button.inline("🔐 حریم خصوصی", b"menu:privacy")],
-    ]
-    if is_admin:
-        rows.append([Button.inline("⚙️ پنل مدیریت", b"admin:home")])
-    return rows
-
-
-def back_menu(is_admin: bool = False):
-    return [[Button.inline("↩️ منوی اصلی", b"menu:home")]] + (
-        [[Button.inline("⚙️ پنل مدیریت", b"admin:home")]] if is_admin else []
-    )
-
-
-#: Read-only admin panels that acknowledge the tap before reading the database.
-_ADMIN_ACK_FIRST = frozenset(
-    {
-        "admin:stats",
-        "admin:users",
-        "admin:payments",
-        "admin:audit",
-        "admin:credentials",
-        "admin:health",
-        "admin:plans",
-        "admin:special",
-        "admin:home",
-    }
-)
-
-
-#: Same idea for the paged read-only panels, whose callback carries a page.
-_ADMIN_ACK_FIRST_PREFIXES = (
-    "admin:users:",
-    "admin:credentials:",
-    "admin:payments:",
-    "admin:special:",
-    "admin:plans:",
-    "admin:credits:",
-)
-
-
-#: The five admin destinations. ``overview`` is the root screen itself; the
-#: other four are sections that group every existing control by job to be done.
-#: "Routes" lives in exactly one place — inside the AI platform — because the
-#: note route and the STT route are separate tables and one entry per panel is
-#: the whole point of the reorganisation.
-ADMIN_SECTIONS: tuple[tuple[str, bytes, str], ...] = (
-    ("👥 کاربران و مالی", b"admin:sec:users", "users"),
-    ("🤖 تولید جزوه (AI)", b"admin:ai", "ai"),
-    ("🎙 گفتار (STT)", b"admin:stt", "stt"),
-    ("🛡 عملیات و امنیت", b"admin:sec:ops", "ops"),
-)
-
-#: Buttons inside a section. Every callback that existed in the flat admin menu
-#: is here, so the reorganisation cannot lose a control.
-ADMIN_SECTION_MENUS: dict[str, list[tuple[str, bytes]]] = {
-    "users": [
-        ("👥 کاربران", b"admin:users"),
-        ("💳 پرداخت‌ها", b"admin:payments"),
-        ("⏱ اعتبار کاربران", b"admin:credits"),
-        ("🧾 طرح‌های فروش", b"admin:plans"),
-        ("⭐ کاربران ویژه", b"admin:special"),
-    ],
-    "ops": [
-        ("🩺 وضعیت سرویس‌ها", b"admin:health"),
-        ("🔑 API Keys", b"admin:credentials"),
-        ("📜 گزارش مدیر", b"admin:audit"),
-        ("📣 پیام همگانی", b"admin:broadcast"),
-        ("🚫 مسدودسازی", b"admin:ban"),
-        ("✅ رفع مسدودیت", b"admin:unban"),
-    ],
-}
-
-
-def admin_menu():
-    """Admin root: an overview entry point plus the four work sections.
-
-    The keyboard is deliberately small — every concrete control lives in one of
-    the sections (and inside the AI / STT platform panels), which keeps this
-    screen stable as the platform grows. ``admin_navigation()`` is the flat view
-    of the whole tree and is what the reachability tests check.
-    """
-    rows: list[list] = [[Button.inline("📊 نمای کلی و آمار", b"admin:home")]]
-    pending: list = []
-    for label, data, _section in ADMIN_SECTIONS:
-        pending.append(Button.inline(label, data))
-        if len(pending) == 2:
-            rows.append(pending)
-            pending = []
-    if pending:
-        rows.append(pending)
-    rows.append([Button.inline("↩️ منوی اصلی", b"menu:home")])
-    return rows
-
-
-def admin_section_menu(section: str):
-    """Keyboard of one admin section (``users`` / ``ops``)."""
-    entries = ADMIN_SECTION_MENUS.get(section) or []
-    rows: list[list] = [
-        [Button.inline(label, data) for label, data in entries[index : index + 2]]
-        for index in range(0, len(entries), 2)
-    ]
-    rows.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
-    return rows
-
-
-#: Controls the overview screen exposes next to the four sections (the detailed
-#: statistics dump is a drill-down of the overview, not a section of its own).
-ADMIN_OVERVIEW_EXTRA: tuple[tuple[str, bytes], ...] = (("🔬 آمار تفصیلی", b"admin:stats"),)
-
-
-def admin_navigation() -> dict[bytes, str]:
-    """Every admin callback reachable from the root, mapped to its label.
-
-    Used by the panels to draw the tree and by the tests to prove that a
-    reorganisation did not orphan a control.
-    """
-    seen: dict[bytes, str] = {}
-    for row in admin_menu():
-        for button in row:
-            seen[bytes(button.type.data)] = str(button.text)
-    for section, entries in ADMIN_SECTION_MENUS.items():
-        for label, data in entries:
-            seen[bytes(data)] = label
-        seen[f"admin:sec:{section}".encode("ascii")] = f"بخش {section}"
-    for label, data in ADMIN_OVERVIEW_EXTRA:
-        seen[bytes(data)] = label
-    return seen
-
-
-def _error_reference(submission_id: int) -> str:
-    return f"GMS-{submission_id:06d}"
-
-
-def _cooldown_active(until: object) -> bool:
-    if not until:
-        return False
-    try:
-        deadline = (
-            until
-            if isinstance(until, datetime)
-            else datetime.fromisoformat(str(until).replace("Z", "+00:00"))
-        )
-        if deadline.tzinfo is None:
-            deadline = deadline.replace(tzinfo=timezone.utc)
-        return deadline > datetime.now(timezone.utc)
-    except (TypeError, ValueError, OverflowError):
-        return False
-
-
-def _format_duration(seconds: float | None) -> str:
-    if not seconds or seconds <= 0:
-        return "نامشخص"
-    total = int(round(seconds))
-    hours, remainder = divmod(total, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours:
-        return f"{hours} ساعت و {minutes} دقیقه"
-    if minutes:
-        return f"{minutes} دقیقه و {secs} ثانیه"
-    return f"{secs} ثانیه"
-
-
-def _credit_history_heading(title: str, noun: str, rows: list, total: object) -> str:
-    """A credit-screen heading that admits when it is only the recent slice.
-
-    The two lists on the screen are a display window, not the ledger, and the
-    database hands over the real count so the difference can be stated instead
-    of a user's history looking complete when it is not.
-    """
-    try:
-        count = int(total or 0)
-    except (TypeError, ValueError):
-        count = 0
-    if count > len(rows):
-        return (
-            f"{title} — {to_persian_digits(len(rows))} مورد از "
-            f"{to_persian_digits(count)} {noun}"
-        )
-    return title
-
-
-def _parse_user_id(value: str) -> int | None:
-    """A Telegram user id typed by an admin (ASCII or Persian digits), else None."""
-    value = value.strip().lstrip("+")
-    # isdecimal() rejects characters such as "²" that isdigit() accepts but int() cannot read.
-    if not value.isdecimal() or len(value) > 15:
-        return None
-    return int(value)
-
-
-#: A plan field the administrator leaves unchanged in the edit prompt.
-PLAN_FIELD_PLACEHOLDERS = frozenset({"", "-", "—", "_"})
-
-SPECIAL_USER_PROMPT = (
-    "شناسهٔ عددی کاربر و دلیل را با قالب «شناسه | دلیل» بفرستید؛ مثال:\n"
-    "`123456789 | همکار پشتیبانی`\n\n"
-    "این کاربر از این پس بدون کسر اعتبار از ربات استفاده می‌کند و همهٔ "
-    "پردازش‌هایش در گزارش مدیر ثبت می‌شود."
-)
-
-PLAN_NEW_PROMPT = (
-    "طرح جدید را با قالب «کد | نام | ساعت | قیمت | روز اعتبار» بفرستید؛ مثال:\n"
-    "`promo_3h | ۳ ساعت ویژه | 3 | 35000 | 30`\n\n"
-    "• کد: با حرف لاتین شروع شود و فقط حروف کوچک، رقم و _ داشته باشد.\n"
-    "• قیمت به تومان و بزرگ‌تر از صفر است.\n"
-    "• برای طرح بدون انقضا در بخش روز اعتبار `0` بفرستید."
-)
-
-
-def _plan_field(value: str) -> str | None:
-    """One plan-input field; ``None`` when the administrator left it unchanged."""
-    cleaned = value.strip()
-    return None if cleaned in PLAN_FIELD_PLACEHOLDERS else cleaned
-
-
-def _plan_number(value: str) -> int | None:
-    """A non-negative plan number (``0`` is meaningful: no expiry)."""
-    cleaned = value.strip()
-    if not cleaned.isdecimal() or len(cleaned) > 12:
-        return None
-    return int(cleaned)
-
-
-def _plan_edit_prompt(plan: dict) -> str:
-    return (
-        f"ویرایش طرح {plan['code']} — {plan['name']}\n"
-        f"مقدار فعلی: {format_duration(plan['included_seconds'])}، "
-        f"{format_toman(plan['price_toman'])}، {format_validity(plan['validity_days'])}\n\n"
-        "قالب: «قیمت | ساعت | روز اعتبار | نام»\n"
-        "هر فیلد را برای تغییر بفرستید و برای بی‌تغییر `-` بگذارید. مثال:\n"
-        "`60000 | - | 60 | -`\n"
-        "برای طرح بدون انقضا در بخش روز اعتبار `0` بفرستید."
-    )
-
-
-#: Image types accepted as a card-to-card receipt.
-RECEIPT_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
-
-
-def _is_receipt_image(message, mime_type: str | None = None) -> bool:
-    """Whether an attachment is a receipt image rather than a lecture file.
-
-    Only images can be receipts, so a lecture audio/video/PowerPoint upload is
-    never diverted from the normal pipeline just because a payment is open.
-    """
-    if getattr(message, "photo", None) is not None:
-        return True
-    document = getattr(message, "document", None)
-    if document is None:
-        return False
-    file_obj = getattr(message, "file", None)
-    mime = (mime_type or getattr(file_obj, "mime_type", None) or "").lower()
-    if mime.startswith("image/"):
-        return True
-    name = getattr(file_obj, "name", None) or ""
-    return Path(name).suffix.lower() in RECEIPT_IMAGE_EXTENSIONS
-
-
-def _media_metadata(message) -> tuple[str | None, str | None, str | None, float | None, str | None]:
-    """Classify an incoming message as ('audio' | 'video' | None, name, mime, duration, id)."""
+def _media_metadata(message) -> tuple[str | None, str | None, str | None, float | None]:
+    """Classify an incoming message as ('audio' | 'video' | None, name, mime, duration)."""
     file_obj = message.file
     filename = getattr(file_obj, "name", None)
     mime_type = getattr(file_obj, "mime_type", None)
@@ -455,8 +111,7 @@ def _media_metadata(message) -> tuple[str | None, str | None, str | None, float 
     if message.voice or message.audio:
         kind = "audio"
     elif getattr(message, "gif", None):
-        # Animated GIFs are silent video/mp4; treating them as lectures is noise.
-        kind = None
+        kind = None  # animated stickers are not lectures
     elif getattr(message, "video_note", None) or getattr(message, "video", None):
         kind = "video"
     elif message.document is not None:
@@ -465,3586 +120,1030 @@ def _media_metadata(message) -> tuple[str | None, str | None, str | None, float 
         elif normalized_mime.startswith("video/"):
             kind = "video"
         elif extension in VIDEO_EXTENSIONS:
-            # Before AUDIO_EXTENSIONS on purpose: ``.webm`` belongs to both, and
-            # only the video path always extracts the audio track. Treating a
-            # .webm screen recording as plain audio sent its whole container —
-            # video bytes included — to the speech engine, where a large enough
-            # file exceeds the direct-upload limit and the user gets no booklet
-            # at all. An audio-only .webm takes the same path harmlessly.
+            # ``.webm`` belongs to both lists; only the video path always
+            # extracts the audio track, and a video-only .webm must not be
+            # sent to the speech engine as a whole container.
             kind = "video"
         elif extension in AUDIO_EXTENSIONS:
             kind = "audio"
     if kind is None:
-        return None, None, None, None, None
-
+        return None, None, None, None
     duration = getattr(file_obj, "duration", None)
     if duration is None and message.voice:
         duration = getattr(message.voice, "duration", None)
-    file_id = str(getattr(message.document, "id", None) or message.id)
-    return kind, filename, mime_type, float(duration) if duration else None, file_id
+    return kind, filename, mime_type, float(duration) if duration else None
+
+
+def _presentation_metadata(message) -> tuple[str | None, str | None]:
+    """Return (kind, filename) for PowerPoint documents."""
+    if message.document is None or message.voice or message.audio:
+        return None, None
+    filename = getattr(message.file, "name", None)
+    mime_type = getattr(message.file, "mime_type", None)
+    kind = classify_presentation(filename, mime_type)
+    if kind is None:
+        return None, None
+    return kind, filename
 
 
 def _is_unsupported_attachment(message) -> bool:
-    """True for a real file the bot cannot use — never for link previews or text."""
+    """True for a real file the bot cannot use — never for links or text."""
     media = getattr(message, "media", None)
     if media is None or isinstance(media, MessageMediaWebPage):
         return False
     if getattr(message, "sticker", None) is not None or getattr(message, "gif", None) is not None:
-        # Stickers and animations are conversational, not failed uploads.
         return False
     return getattr(message, "document", None) is not None or getattr(message, "photo", None) is not None
 
 
-def _presentation_metadata(message) -> tuple[str | None, str | None, str | None, str | None]:
-    """Return (kind, filename, mime_type, file_id) for PowerPoint documents."""
-    if message.document is None or message.voice or message.audio:
-        return None, None, None, None
-    file_obj = message.file
-    filename = getattr(file_obj, "name", None)
-    mime_type = getattr(file_obj, "mime_type", None)
-    kind = classify_presentation(filename, mime_type)
-    if kind is None:
-        return None, None, None, None
-    file_id = str(getattr(message.document, "id", None) or message.id)
-    return kind, filename, mime_type, file_id
+def _is_receipt_image(message) -> bool:
+    if getattr(message, "photo", None) is None:
+        return False
+    mime = getattr(message.file, "mime_type", "") or ""
+    return mime.startswith("image/")
 
 
-@dataclass(frozen=True)
-class QueuedJob:
-    """One accepted upload waiting for (or running in) a worker.
-
-    ``run`` is a factory, not a coroutine, so a job can be queued, cancelled or
-    rejected without ever being started.
-    """
-
-    submission_id: int
-    kind: str
-    run: Callable[[], Awaitable[None]]
-    event: Any = None
-    progress: Any = None
-    is_admin: bool = False
+# ---------------------------------------------------------------------------
+# The bot
+# ---------------------------------------------------------------------------
 
 
-class StudyBot:
+class GamasBot:
     def __init__(self, settings: Settings):
         self.settings = settings
-        self.db = Database(settings.database_path)
-        self.credential_manager = ProviderCredentialManager(self.db, settings)
-        # Health checks are manual and cached: opening the panel must never
-        # hammer a provider, and a redraw must never call the network again.
-        self.provider_health = ProviderHealthChecker(
-            self.db, settings, self.credential_manager
+        self.db = Database(settings.db_path)
+        self.queue = JobQueue(
+            max_queued=settings.max_queued_jobs,
+            max_active=settings.max_active_jobs,
+            worker=self._run_job,
         )
-        # AI provider platform: routing/failover, model registry, usage ledger.
-        self.ai_tracker = AIUsageTracker(self.db)
-        self.model_registry = ModelRegistry(self.db, settings)
-        self.provider_router = ProviderRouter(
-            self.db, settings, self.credential_manager, self.ai_tracker, self.model_registry
-        )
-        # Telegram admin panels for the AI provider platform (providers, keys,
-        # routes, usage, models, logs, dry-run). Kept in its own module to keep
-        # bot.py focused on the job pipeline.
-        self.ai_panels = AIPanels(self)
-        # Gamas Speech Platform admin panels (STT providers, models, routes,
-        # quotas, health, logs, test tool, dry-run) — same separation for STT.
-        self.stt_panels = SttPanels(self)
         self._receipt_cleanup_task: asyncio.Task | None = None
-        self._receipt_root: Path | None = None
-        self._pending_credential_setup: dict[int, dict[str, str | None]] = {}
-        # Telethon opens its SQLite session in the constructor, before start().
+        self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
+        self._pending_broadcast: set[int] = set()
         settings.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = TelegramClient(
-            str(settings.session_path), settings.telegram_api_id, settings.telegram_api_hash,
-            proxy=settings.telegram_proxy,
+            str(settings.session_path), settings.api_id, settings.api_hash
         )
         self.client.parse_mode = None
-        self._tasks: set[asyncio.Task] = set()
-        # Second, defensive bound on *active* jobs: the worker pool already
-        # limits concurrency, and this keeps the same guarantee for a job that
-        # is ever started outside a worker.
-        self._job_semaphore = asyncio.Semaphore(settings.max_concurrent_jobs)
-        # Bounded pending work: a semaphore alone only limits *active* jobs,
-        # so a burst of uploads could otherwise pile up thousands of waiting
-        # tasks in memory. ``MAX_PENDING_JOBS`` bounds the queue itself and a
-        # fixed pool of workers drains it; anything beyond the capacity is
-        # rejected with back-pressure instead of being accepted and forgotten.
-        self._queue: asyncio.Queue[QueuedJob] | None = None
-        self._workers: list[asyncio.Task] = []
-        self._pending_admin_actions: dict[int, str] = {}
-
-    # -- AI provider platform ------------------------------------------------
-
-    @asynccontextmanager
-    async def _note_job_scope(self, submission_id: int):
-        """Bind credentials + (optionally) the provider router for one note job.
-
-        With AI_ROUTING_ENABLED=false (or no usable route) this degrades to the
-        historical single-provider credential-rotation context — the legacy
-        pipeline then runs byte-for-byte as before.
-        """
-        if (
-            not getattr(self.settings, "ai_routing_enabled", True)
-            or self.settings.note_api_provider == "disabled"
-        ):
-            with use_provider_credentials(self.credential_manager):
-                yield
-            return
-        try:
-            plan = await self.provider_router.plan()
-        except Exception:
-            logger.warning("AI route planning failed; using the legacy provider path")
-            with use_provider_credentials(self.credential_manager):
-                yield
-            return
-        session = NoteJobSession(
-            self.provider_router,
-            plan,
-            self.settings,
-            job_id=_error_reference(submission_id),
-            submission_id=submission_id,
-        )
-        with use_provider_credentials(self.credential_manager), job_session_scope(session):
-            yield
-
-    # -- job queue ---------------------------------------------------------
-
-    def _job_queue(self) -> asyncio.Queue:
-        if self._queue is None:
-            self._queue = asyncio.Queue(maxsize=self.settings.max_pending_jobs)
-        return self._queue
-
-    def _ensure_workers(self) -> None:
-        """Start the fixed worker pool once (idempotent)."""
-        if self._workers:
-            return
-        count = max(1, self.settings.max_concurrent_jobs)
-        for index in range(count):
-            self._workers.append(
-                asyncio.create_task(self._worker(index), name=f"job-worker-{index}")
-            )
-        logger.info(
-            "Job workers started workers=%s max_pending_jobs=%s",
-            count,
-            self.settings.max_pending_jobs,
-        )
-
-    async def _worker(self, index: int) -> None:
-        """Run queued jobs until cancelled; one job at a time."""
-        queue = self._job_queue()
-        while True:
-            job = await queue.get()
-            try:
-                await job.run()
-            except asyncio.CancelledError:
-                # Shutdown: the job coroutine records its own state.
-                raise
-            except Exception:
-                # A worker must never die because one job misbehaved.
-                logger.exception(
-                    "Unhandled job failure submission_id=%s worker=%s",
-                    job.submission_id,
-                    index,
-                )
-            finally:
-                queue.task_done()
-
-    def _enqueue(self, job: QueuedJob) -> bool:
-        """Accept a job into the bounded queue; False when it is full."""
-        self._ensure_workers()
-        try:
-            self._job_queue().put_nowait(job)
-            return True
-        except asyncio.QueueFull:
-            logger.warning(
-                "Job queue is full submission_id=%s capacity=%s; rejecting with back-pressure",
-                job.submission_id,
-                self.settings.max_pending_jobs,
-            )
-            return False
-
-    async def _reject_job(self, job: QueuedJob, reason: str) -> None:
-        """Fail a job that will never run (queue overflow or shutdown)."""
-        reference = _error_reference(job.submission_id)
-        try:
-            await self.db.set_submission_status(job.submission_id, "failed", reason)
-        except Exception:
-            logger.exception(
-                "Could not store rejected job state reference=%s", reference
-            )
-        if job.progress is not None:
-            try:
-                await job.progress.fail(reference)
-            except Exception:
-                logger.debug("Progress report failed for rejected job", exc_info=True)
-            try:
-                await job.progress.aclose()
-            except Exception:
-                logger.debug("Closing progress failed for rejected job", exc_info=True)
-        if job.event is not None:
-            try:
-                await job.event.reply(
-                    f"{reason}\n\nکد پیگیری: {reference}",
-                    buttons=main_menu(job.is_admin),
-                )
-            except Exception:
-                logger.exception(
-                    "Could not notify the user about a rejected job reference=%s",
-                    reference,
-                )
-
-    async def _drain_queue(self, reason: str) -> None:
-        """Reject everything still waiting when the bot shuts down."""
-        if self._queue is None:
-            return
-        while True:
-            try:
-                job = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            try:
-                await self._reject_job(job, reason)
-            finally:
-                self._queue.task_done()
-
-    def _track_task(self, task: asyncio.Task) -> None:
-        self._tasks.add(task)
-        task.add_done_callback(self._task_finished)
-
-    def _task_finished(self, task: asyncio.Task) -> None:
-        self._tasks.discard(task)
-        if task.cancelled():
-            return
-        try:
-            error = task.exception()
-        except asyncio.CancelledError:
-            return
-        if error is not None:
-            logger.error(
-                "Background task escaped its error task=%s",
-                task.get_name(),
-                exc_info=(type(error), error, error.__traceback__),
-            )
-
-    async def start(self) -> None:
-        self.settings.validate_runtime()
-        self.settings.database_path.parent.mkdir(parents=True, exist_ok=True)
-        self.settings.session_path.parent.mkdir(parents=True, exist_ok=True)
-        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        self._clean_stale_workdirs()
-        await self.db.open()
-        await self.db.sync_plan_catalog(
-            [plan.as_record() for plan in plan_catalog(self.settings.plan_values)]
-        )
-        try:
-            await self.provider_router.ensure_seeded()
-        except Exception:
-            logger.warning("AI provider route seeding failed; routing falls back to defaults")
-        self._ensure_secure_receipt_directory()
-        await self._cleanup_expired_receipts()
+        self._http: aiohttp.ClientSession | None = None
         self._register_handlers()
-        await self.client.start(bot_token=self.settings.telegram_bot_token)
-        self._receipt_cleanup_task = asyncio.create_task(
-            self._receipt_cleanup_loop(), name="receipt-retention-cleanup"
-        )
-        me = await self.client.get_me()
-        logger.info(
-            "Persian study assistant is online username=@%s note_provider=%s stt_primary=%s "
-            "max_concurrent_jobs=%s",
-            me.username,
-            self.settings.note_api_provider,
-            self.settings.stt_primary,
-            self.settings.max_concurrent_jobs,
-        )
-        try:
-            summary = await check_media_worker()
-            logger.info("Media worker ready %s", summary)
-        except MediaToolError as exc:
-            # Non-fatal, like the old binary checks: media jobs will fail with
-            # an explicit error until the Python dependencies are repaired.
-            logger.warning("Media worker self-check failed: %s", exc)
 
-    def _ensure_secure_receipt_directory(self) -> Path:
-        path = self.settings.receipt_dir.resolve()
-        web_roots = {"public_html", "www", "htdocs", "httpdocs"}
-        if any(part.lower() in web_roots for part in path.parts):
-            raise ValueError("RECEIPT_DIR must be outside the web document root.")
-        path.mkdir(parents=True, exist_ok=True, mode=0o700)
-        try:
-            path.chmod(0o700)
-        except OSError as exc:
-            raise ValueError("RECEIPT_DIR permissions could not be restricted to owner-only.") from exc
-        self._receipt_root = path
-        return path
-
-    async def _cleanup_expired_receipts(self) -> None:
-        root = getattr(self, "_receipt_root", None) or self._ensure_secure_receipt_directory()
-        cutoff = datetime.now(timezone.utc) - timedelta(
-            days=self.settings.receipt_retention_days
-        )
-        candidates = await self.db.receipt_cleanup_candidates(
-            cutoff.isoformat(timespec="seconds")
-        )
-        for item in candidates:
-            payment_id = int(item["id"])
-            raw_path = str(item["receipt_path"])
-            path = Path(raw_path).resolve()
-            try:
-                path.relative_to(root)
-            except ValueError:
-                # Never delete a path outside the private receipt directory.
-                logger.error("Receipt path escaped private storage payment_id=%s", payment_id)
-                continue
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                logger.warning("Expired receipt could not be deleted payment_id=%s", payment_id)
-                continue
-            await self.db.mark_receipt_deleted(payment_id, raw_path)
-
-    async def _receipt_cleanup_loop(self) -> None:
-        while True:
-            await asyncio.sleep(24 * 60 * 60)
-            try:
-                await self._cleanup_expired_receipts()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Receipt-retention cleanup failed")
-
-    def _clean_stale_workdirs(self) -> None:
-        """Delete job folders left behind by a crash or a hard restart.
-
-        No job can be running at startup, so anything matching the job prefixes
-        is garbage that would otherwise sit in ``data/tmp`` forever.
-        """
-        removed = 0
-        for prefix in ("submission-", "deck-"):
-            for leftover in self.settings.temp_dir.glob(f"{prefix}*"):
-                if not leftover.is_dir():
-                    continue
-                shutil.rmtree(leftover, ignore_errors=True)
-                if not leftover.exists():
-                    removed += 1
-        if removed:
-            logger.info("Removed stale temporary job folders count=%s", removed)
-
+    # ------------------------------------------------------------------ boot
     async def run(self) -> None:
-        try:
-            await self.start()
-            self._ensure_workers()
-            await self.client.run_until_disconnected()
-        finally:
-            await self.shutdown()
+        await self.db.connect()
+        await self.db.sync_plans(
+            [
+                {
+                    "code": plan.code,
+                    "hours": plan.included_seconds / 3600,
+                    "price": plan.price_toman,
+                    "validity_days": plan.validity_days,
+                }
+                for plan in plan_catalog(self.settings.tariff_values())
+                if not plan.is_free
+            ]
+        )
+        await self.db.recover_interrupted()
+        self.queue.ensure_workers()
+        self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
+        await self.client.start(bot_token=self.settings.bot_token)
+        logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
+        await self.client.run_until_disconnected()
 
     async def shutdown(self) -> None:
-        # Order matters: stop accepting work first, then stop the workers, so a
-        # job is either fully recorded as failed or fully processed — never
-        # silently dropped with a "processing" row left behind.
         if self._receipt_cleanup_task is not None:
             self._receipt_cleanup_task.cancel()
-            await asyncio.gather(self._receipt_cleanup_task, return_exceptions=True)
-            self._receipt_cleanup_task = None
-        await self._drain_queue("ربات خاموش شد و این کار از صف خارج شد")
-        if self._tasks:
-            for task in self._tasks:
-                task.cancel()
-            await asyncio.gather(*self._tasks, return_exceptions=True)
-        for worker in self._workers:
-            worker.cancel()
-        if self._workers:
-            await asyncio.gather(*self._workers, return_exceptions=True)
-            self._workers = []
-        if self.client.is_connected():
-            await self.client.disconnect()
+        await self.queue.shutdown()
+        if self._http is not None:
+            await self._http.close()
+            self._http = None
+        await self.client.disconnect()
         await self.db.close()
 
+    def _http_session(self) -> aiohttp.ClientSession:
+        if self._http is None or self._http.closed:
+            self._http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=self.settings.stt_job_timeout)
+            )
+        return self._http
+
+    # -------------------------------------------------------------- handlers
     def _register_handlers(self) -> None:
-        @self.client.on(events.CallbackQuery())
+        client = self.client
+
+        @client.on(events.CallbackQuery)
         async def handle_callback(event):
             try:
                 await self._handle_callback(event)
-            except asyncio.CancelledError:
-                raise
+            except MessageNotModifiedError:
+                pass
             except Exception:
-                logger.exception("Unhandled callback query failure")
-                try:
-                    await event.answer("خطایی رخ داد؛ دوباره تلاش کنید.", alert=True)
-                except Exception:
-                    logger.exception("Could not answer the failed callback")
+                logger.exception("callback failed data=%r", event.data)
+                await self._ack(event, "خطایی رخ داد؛ دوباره امتحان کنید.", alert=True)
 
-        @self.client.on(events.NewMessage(incoming=True))
+        @client.on(events.NewMessage)
         async def handle_message(event):
             try:
                 await self._handle_message(event)
-            except asyncio.CancelledError:
+            except FloodWaitError:
                 raise
             except Exception:
-                logger.exception("Unhandled incoming message failure")
+                logger.exception("message handler failed")
                 try:
-                    await event.reply("یک مشکل پیش آمد. لطفاً چند لحظه دیگر دوباره امتحان کنید.")
+                    await event.reply("⚠️ خطای غیرمنتظره‌ای رخ داد. لطفاً دوباره امتحان کنید.")
                 except Exception:
-                    logger.exception("Could not notify the user about a handler error")
-
-    @staticmethod
-    def _arm_answer_once(event) -> None:
-        """Make ``event.answer`` fire at most once for one callback query.
-
-        Panels legitimately want to answer a tap early (before a slow read) and
-        still redraw afterwards; Telegram accepts only one ``answerCallbackQuery``
-        per update, so the second attempt used to cost a failed request that the
-        editor then swallowed. The wrapper keeps the first answer — the one the
-        user is waiting for — and turns later ones into no-ops.
-        """
-        answer = getattr(event, "answer", None)
-        if answer is None or getattr(answer, "_gamas_once", False):
-            return
-
-        async def once(*args, **kwargs):
-            if once._used:
-                return None
-            once._used = True
-            return await answer(*args, **kwargs)
-
-        once._used = False
-        once._gamas_once = True
-        try:
-            event.answer = once
-        except Exception:  # pragma: no cover - exotic event implementations
-            return
-
-    #: Attribute set on an event whose callback query was already answered.
-    #: Telegram accepts exactly one ``answerCallbackQuery`` per update; panels
-    #: that acknowledge a tap up front (before slow work) and then redraw would
-    #: otherwise answer the same query twice and get ``BotResponseInvalidError``.
-    _CALLBACK_ACKED = "_gamas_callback_acked"
+                    pass
 
     async def _ack(self, event, text: str | None = None, *, alert: bool = False) -> None:
-        """Answer a callback query at most once, optionally with a toast.
-
-        Expensive actions acknowledge first so the button stops spinning while
-        the work runs; every later answer on the same event is dropped here
-        instead of at the transport layer.
-        """
-        if getattr(event, self._CALLBACK_ACKED, False):
-            return
         try:
-            setattr(event, self._CALLBACK_ACKED, True)
-        except Exception:  # pragma: no cover - exotic event implementations
-            pass
-        try:
-            if text is None:
-                await event.answer()
-            else:
-                await event.answer(text, alert=alert)
+            await event.answer(text, alert=alert)
         except Exception:
-            logger.debug("Callback answer failed", exc_info=True)
+            logger.debug("callback answer failed", exc_info=True)
 
-    async def _edit_callback(self, event, text: str, buttons=None) -> None:
-        await self._ack(event)
+    async def _edit(self, event, text: str, buttons=None) -> None:
+        """Edit a callback message; fall back to sending a new one."""
         try:
-            await event.edit(text, buttons=buttons, parse_mode=None)
+            await event.edit(text, buttons=buttons)
         except MessageNotModifiedError:
-            return
+            pass
         except Exception:
-            # Editing can fail when the originating message is old. A fresh
-            # response keeps the menu usable without losing the button flow.
-            logger.debug("Callback edit failed; sending a new message", exc_info=True)
-            await event.respond(text, buttons=buttons, parse_mode=None)
+            logger.debug("callback edit failed; responding instead", exc_info=True)
+            try:
+                await event.respond(text, buttons=buttons)
+            except Exception:
+                logger.warning("callback screen could not be delivered", exc_info=True)
 
-    async def _billing_balance_text(self, user_id: int) -> str:
-        balance = await self.db.user_balance(user_id)
-        entitlements = balance["entitlements"]
-        free_seconds = sum(
-            int(item["remaining_seconds"])
-            for item in entitlements
-            if item["source"] == "free_lifetime"
-        )
-        paid_seconds = sum(
-            int(item["remaining_seconds"])
-            for item in entitlements
-            if item["source"] != "free_lifetime"
-        )
-        lines = ["⏱ اعتبار من"]
-        if await self.db.is_unlimited_user(user_id):
-            lines.append(
-                "♾️ وضعیت: کاربر ویژه — استفادهٔ نامحدود و بدون کسر اعتبار"
-            )
-        lines.extend(
+    # ----------------------------------------------------------------- menus
+    def _main_menu(self) -> list:
+        return [
+            [Button.inline("📎 ساخت جزوه", b"make")],
+            [Button.inline("💳 حساب و شارژ", b"account"), Button.inline("❓ راهنما", b"help")],
+        ]
+
+    def _admin_menu(self) -> list:
+        return [
+            [Button.inline("📊 نمای کلی", b"adm:home")],
             [
-                f"قابل استفاده: {format_duration(balance['available_seconds'])}",
-                f"رایگان: {format_duration(free_seconds)} | "
-                f"خریداری‌شده: {format_duration(paid_seconds)}",
-            ]
-        )
-        if entitlements:
-            lines.append("\nاعتبارهای فعال:")
-            # Soonest to expire first, and a counted remainder instead of an
-            # unbounded list: `available_seconds` above already covers every row.
-            shown = entitlements[: self.ACCOUNT_ENTITLEMENT_ROWS]
-            for entitlement in shown:
-                expiry = (
-                    "بدون انقضا"
-                    if not entitlement["expires_at"]
-                    else f"تا {str(entitlement['expires_at'])[:10]}"
-                )
-                lines.append(
-                    f"• {entitlement['plan_name']}: "
-                    f"{format_duration(entitlement['remaining_seconds'])} ({expiry})"
-                )
-            hidden = len(entitlements) - len(shown)
-            if hidden:
-                lines.append(
-                    f"… و {to_persian_digits(hidden)} اعتبار فعال دیگر — مجموع بالا "
-                    "همهٔ آن‌ها را می‌شمارد."
-                )
-        else:
-            lines.append(
-                "اعتبار فعالی ندارید؛ با «💳 خرید اشتراک» یکی از طرح‌ها را انتخاب کنید."
-            )
-        return "\n".join(lines)
+                Button.inline("👥 کاربران", b"adm:users"),
+                Button.inline("🧾 پرداخت‌ها", b"adm:pay"),
+            ],
+            [
+                Button.inline("📣 پیام همگانی", b"adm:bcast"),
+                Button.inline("🛡 آخرین اقدام‌ها", b"adm:audit"),
+            ],
+            [Button.inline("🔙 بازگشت", b"menu:main")],
+        ]
 
-    async def _show_account_overview(self, event, user_id: int) -> None:
-        """One account screen: what is left, what is active, and how to buy more.
+    def _root_menu(self, is_admin: bool) -> list:
+        return self._admin_menu() if is_admin else self._main_menu()
 
-        The balance and the purchasable plans used to be two menu entries that
-        both answered "how much can I still generate"; buying needed a second
-        tap on a different screen. Purchase stays here, next to the credit it
-        tops up, and ``billing:plans`` / ``billing:balance`` keep working for
-        older messages.
-        """
-        balance = await self._billing_balance_text(user_id)
-        plans_text, plan_buttons = await self._billing_plans()
-        lines = ["💳 حساب و اعتبار", ""]
-        lines.extend(balance.splitlines()[1:])
-        lines.extend(["", plans_text, "", "پس از ارسال رسید، مدیر آن را بررسی و اعتبار را اضافه می‌کند."])
-        buttons = list(plan_buttons)
-        buttons.append([Button.inline("🔐 حریم خصوصی", b"menu:privacy")])
-        await self._edit_callback(event, "\n".join(lines), buttons)
-
-    async def _billing_plans(self, page: int = 0) -> tuple[str, list]:
-        """Purchasable plans, a page at a time.
-
-        Every enabled paid plan used to be rendered into one message with one
-        button each: with the six-plan default that is invisible, and once an
-        admin had created a few dozen the screen simply stopped sending — the
-        user could not buy anything at all. `list_plans` orders by
-        (sort_order, id), so a page is a stable window and the plan an admin put
-        first is the plan a user sees first.
-        """
-        plans = await self.db.list_plans(paid_only=True)
-        if not plans:
-            return "در حال حاضر طرح پرداختی فعالی نیست.", [[Button.inline("↩️ منوی اصلی", b"menu:home")]]
-        pages = max(1, -(-len(plans) // self.USER_PLAN_PAGE))
-        page = min(max(0, int(page)), pages - 1)
-        window = plans[page * self.USER_PLAN_PAGE : (page + 1) * self.USER_PLAN_PAGE]
-        lines = ["طرح‌های اعتبار پیش‌پرداختی 💳"]
-        if pages > 1:
-            lines.append(
-                f"({to_persian_digits(len(plans))} طرح فعال — صفحهٔ "
-                f"{to_persian_digits(page + 1)} از {to_persian_digits(pages)})"
-            )
-        buttons = []
-        for plan in window:
-            lines.append(
-                f"• {plan['name']} — {format_duration(plan['included_seconds'])}، "
-                f"{format_toman(plan['price_toman'])}، {format_validity(plan['validity_days'])}"
-            )
-            # A plan name is stored up to 60 characters, so «خرید …» plus a price
-            # does not fit one button. Everything but the name is fixed, so the
-            # name gets whatever is left of the 64-unit budget and never the price
-            # — that is the number a purchase decision is made on.
-            price_text = format_toman(plan["price_toman"])
-            name_budget = max(BUTTON_LABEL_LIMIT - _utf16_length(" — " + price_text), 12)
-            buy_label = button_label("خرید " + str(plan["name"]), name_budget)
-            buttons.append(
-                [
-                    Button.inline(
-                        f"{buy_label} — {price_text}",
-                        f"billing:buy:{plan['code']}",
-                    )
-                ]
-            )
-        nav = []
-        if page > 0:
-            nav.append(Button.inline("◀️ قبلی", f"billing:plans:{page - 1}"))
-        if page + 1 < pages:
-            nav.append(Button.inline("طرح‌های بیشتر ▶️", f"billing:plans:{page + 1}"))
-        if nav:
-            buttons.append(nav)
-        buttons.append([Button.inline("↩️ منوی اصلی", b"menu:home")])
-        return "\n".join(lines), buttons
-
-    async def _start_payment(self, event, user_id: int, plan_code: str) -> None:
-        try:
-            request = await self.db.create_payment_request(user_id, plan_code)
-        except ValueError:
-            await event.reply("این طرح پرداختی در دسترس نیست.")
-            return
-        if request["status"] == "pending":
-            text = (
-                f"درخواست پرداخت شمارهٔ {request['id']} برای «{request['plan_name']}» "
-                "ثبت شده و منتظر بررسی دستی مدیر است. تا آن زمان درخواست دیگری ثبت نمی‌شود."
-            )
-            await event.reply(text, buttons=main_menu())
-            return
-        validity = request.get("validity_days")
-        validity_line = (
-            f"اعتبار طرح: {validity} روز از زمان تأیید\n" if validity else ""
-        )
+    async def _show_main(self, event, *, first_start: bool = False) -> None:
+        user_id = event.sender_id
+        await self.db.ensure_user(user_id)
+        if await self.db.grant_free_plan_once(
+            user_id, self._free_plan_seconds()
+        ):
+            logger.info("free plan granted user=%s", user_id)
+        available = await self.db.available_seconds(user_id)
+        greeting = "سلام! من گاماس هستم 🌱" if first_start else "منوی اصلی"
         text = (
-            f"طرح انتخاب‌شده: {request['plan_name']}\n"
-            f"زمان: {format_duration(request['included_seconds'])}\n"
-            f"{validity_line}"
-            f"مبلغ: {format_toman(request['amount_toman'])}\n\n"
-            "مبلغ را کارت‌به‌کارت کنید و تصویر رسید را در همین گفت‌وگوی خصوصی بفرستید. "
-            "ارسال رسید به‌تنهایی اعتبار ایجاد نمی‌کند؛ اعتبار فقط پس از تأیید دستی مدیر افزوده می‌شود.\n\n"
-            f"بانک: {self.settings.payment_bank_name}\n"
-            f"شماره کارت: {self.settings.payment_card_display}\n"
-            f"به نام: {self.settings.payment_card_holder}\n\n"
-            f"شماره درخواست: {request['id']}"
+            f"{greeting}\n\n"
+            "جزوهٔ کلاس‌تان را از یک فایل صوتی، ویدیویی یا پاورپوینت می‌سازم؛ "
+            "متن خام پیاده‌سازی‌شده را هم همان لحظه تحویل می‌دهم.\n\n"
+            f"⏳ اعتبار باقی‌مانده: {format_duration(available)}"
         )
-        await event.reply(
-            text,
-            buttons=[
-                [Button.inline("لغو درخواست", f"billing:cancel:{request['id']}")],
-                [Button.inline("بازگشت", b"billing:plans")],
-            ],
-        )
+        await self._edit_or_reply(event, text, self._root_menu(self._is_admin(user_id)))
 
-    def _safe_receipt_path(self, raw_path: str | None) -> Path | None:
-        if not raw_path:
-            return None
-        root = getattr(self, "_receipt_root", None) or self.settings.receipt_dir.resolve()
-        path = Path(raw_path).resolve()
-        try:
-            path.relative_to(root)
-        except ValueError:
-            return None
-        return path
-
-    async def _handle_receipt_upload(self, event, user: dict, payment: dict) -> bool:
-        """Treat an incoming image as a payment receipt.
-
-        Returns ``True`` when the message was a receipt attempt (handled here,
-        never queued as media) and ``False`` when it is an ordinary lecture file
-        that must continue through the normal media pipeline.
-        """
-        message = event.message
-        file_obj = getattr(message, "file", None)
-        mime = (getattr(file_obj, "mime_type", None) or "").lower()
-        is_photo = getattr(message, "photo", None) is not None
-        if is_photo and not mime:
-            mime = "image/jpeg"
-        if not _is_receipt_image(message, mime):
-            return False
-        if not getattr(event, "is_private", True):
-            await event.reply("برای امنیت، رسید را فقط در گفت‌وگوی خصوصی ربات بفرستید.")
-            return True
-        extension_by_mime = {
-            "image/jpeg": ".jpg",
-            "image/png": ".png",
-            "image/webp": ".webp",
-        }
-        extension = extension_by_mime.get(mime)
-        if extension is None:
-            await event.reply("رسید باید تصویر JPEG، PNG یا WebP باشد.")
-            return True
-        size = getattr(file_obj, "size", None)
-        if size is not None and size > self.settings.max_receipt_size_bytes:
-            await event.reply("حجم تصویر رسید از سقف مجاز بیشتر است.")
-            return True
-
-        root = self._receipt_root or self._ensure_secure_receipt_directory()
-        path = root / f"receipt-{secrets.token_hex(16)}{extension}"
-        try:
-            path.touch(mode=0o600, exist_ok=False)
-            downloaded = await message.download_media(file=str(path))
-            if not downloaded or not path.is_file():
-                raise OSError("download failed")
-            path.chmod(0o600)
-            if path.stat().st_size > self.settings.max_receipt_size_bytes:
-                raise ValueError("رسید از سقف حجم مجاز بیشتر است.")
-            with path.open("rb") as stream:
-                signature = stream.read(16)
-            valid_signature = (
-                (mime == "image/jpeg" and signature.startswith(b"\xff\xd8\xff"))
-                or (mime == "image/png" and signature.startswith(b"\x89PNG\r\n\x1a\n"))
-                or (mime == "image/webp" and signature[:4] == b"RIFF" and signature[8:12] == b"WEBP")
-            )
-            if not valid_signature:
-                raise ValueError("محتوای فایل با قالب تصویر اعلام‌شده هماهنگ نیست.")
-            accepted = await self.db.submit_payment_receipt(
-                int(payment["id"]),
-                int(user["id"]),
-                str(path),
-                int(message.id),
-                receipt_file_id=getattr(file_obj, "id", None),
-            )
-            if not accepted:
-                raise ValueError("درخواست پرداخت دیگر منتظر رسید نیست؛ /balance را بررسی کنید.")
-        except Exception as exc:
-            path.unlink(missing_ok=True)
-            if isinstance(exc, ValueError):
-                await event.reply(str(exc))
-            else:
-                logger.warning("Private receipt upload failed payment_id=%s", payment["id"])
-                await event.reply("ذخیرهٔ امن رسید انجام نشد؛ لطفاً بعداً دوباره تلاش کنید.")
-            return True
-
-        self._pending_admin_actions.pop(int(user["telegram_id"]), None)
-        await event.reply(
-            "تصویر رسید به‌صورت خصوصی دریافت شد و برای بررسی دستی مدیر ارسال می‌شود. "
-            "تا پیش از تأیید، اعتباری افزوده نشده است.",
-            buttons=main_menu(int(user["telegram_id"]) in self.settings.admin_ids),
-        )
-        await self._notify_admins_of_payment(int(payment["id"]), path)
-        return True
-
-    async def _notify_admins_of_payment(self, payment_id: int, receipt_path: Path) -> None:
-        detail = await self.db.payment_detail(payment_id)
-        if not detail:
+    async def _edit_or_reply(self, event, text: str, buttons=None) -> None:
+        """Render a screen: edit when triggered by a button, reply when by a message."""
+        if hasattr(event, "data"):  # a CallbackQuery event
+            await self._edit(event, text, buttons)
             return
-        caption = (
-            f"رسید پرداخت در انتظار بررسی دستی — درخواست {payment_id}\n"
-            f"کاربر: {detail['telegram_id']}"
-            + (f" (@{detail['username']})" if detail["username"] else "")
-            + f"\nطرح: {detail['plan_name']}\nمبلغ: {format_toman(detail['amount_toman'])}"
-        )
-        buttons = [
-            [
-                Button.inline("تأیید و افزودن اعتبار", f"admin:payment:approve:{payment_id}"),
-                Button.inline("رد رسید", f"admin:payment:reject:{payment_id}"),
-            ]
-        ]
-        for admin_id in self.settings.admin_ids:
-            try:
-                await self.client.send_file(
-                    admin_id,
-                    str(receipt_path),
-                    caption=caption,
-                    force_document=True,
-                    buttons=buttons,
-                    parse_mode=None,
-                )
-            except Exception:
-                # Never include a receipt path, card data, or receipt contents in logs.
-                logger.warning("Private receipt notification failed payment_id=%s admin_id=%s", payment_id, admin_id)
+        await event.reply(text, buttons=buttons)
 
-    #: Receipts per admin page. Each receipt is sent as its own message (with its
-    #: file), so a page is bounded by the flood limits as well as by Telegram's
-    #: message and keyboard caps.
-    PAYMENTS_PAGE_SIZE = 20
-    #: Plans per page: each row carries up to three action buttons and a caption
-    #: line, and the panel used to render every plan the deployment had.
-    PLANS_PAGE_SIZE = 10
-    #: Remove buttons per page for the special-users list (the text lists 30).
-    SPECIAL_PAGE_SIZE = 12
+    def _is_admin(self, user_id: int | None) -> bool:
+        return user_id is not None and user_id in self.settings.admin_ids
 
-    async def _show_pending_payments(self, event, page_text: str | None = None) -> None:
-        """Pending receipts, paged, with the backlog counted rather than guessed.
+    def _free_plan_seconds(self) -> int:
+        for plan in plan_catalog(self.settings.tariff_values()):
+            if plan.is_free:
+                return plan.included_seconds
+        return 3600
 
-        The panel used to read 20 rows and announce ``len(payments)`` — so a queue
-        of 34 looked like 20 and the oldest-unseen 14 had no way to be reached.
-        """
-        size = self.PAYMENTS_PAGE_SIZE
-        page = self._admin_page(page_text)
-        total = await self.db.pending_payment_count()
-        pages = max(1, -(-total // size))
-        page = min(page, pages - 1)
-        payments = await self.db.list_pending_payments(limit=size, offset=page * size)
-        if not payments:
-            await self._edit_callback(
-                event,
-                "پرداختِ منتظر بررسی وجود ندارد." if not total else "این صفحه دیگر خالی است.",
-                [[Button.inline("↩️ پنل مدیریت", b"admin:home")]],
-            )
-            return
-        await event.answer(
-            f"صفحهٔ {page + 1} از {pages} — {total} پرداخت در انتظار بررسی"
-        )
-        await self._send_pending_payment_rows(event, payments)
-        if pages > 1:
-            nav = [Button.inline("↩️ پنل مدیریت", b"admin:home")]
-            if page + 1 < pages:
-                nav.insert(0, Button.inline("بعدی ▶️", f"admin:payments:{page + 1}"))
-            if page > 0:
-                nav.insert(0, Button.inline("◀️ قبلی", f"admin:payments:{page - 1}"))
-            await self._edit_callback(
-                event,
-                f"💳 پرداخت‌های در انتظار بررسی — صفحهٔ {page + 1} از {pages} "
-                f"({total} مورد، {size} مورد در هر صفحه)",
-                [nav],
-            )
-
-    async def _send_pending_payment_rows(self, event, payments: list[dict]) -> None:
-        for detail in payments:
-            # ``list_pending_payments`` already returns every field this caption and
-            # its receipt path need, so one page is one query. It used to re-read
-            # each row through ``payment_detail`` — 20 extra queries per draw.
-            caption = (
-                f"پرداخت در انتظار بررسی دستی — درخواست {detail['id']}\n"
-                f"کاربر: {detail['telegram_id']}"
-                + (f" (@{detail['username']})" if detail["username"] else "")
-                + f"\nطرح: {detail['plan_name']}\nمبلغ: {format_toman(detail['amount_toman'])}"
-            )
-            buttons = [
-                [
-                    Button.inline("تأیید و افزودن اعتبار", f"admin:payment:approve:{detail['id']}"),
-                    Button.inline("رد رسید", f"admin:payment:reject:{detail['id']}"),
-                ]
-            ]
-            receipt = self._safe_receipt_path(detail.get("receipt_path"))
-            if receipt is not None and receipt.is_file():
-                await event.respond(
-                    caption,
-                    file=str(receipt),
-                    force_document=True,
-                    buttons=buttons,
-                    parse_mode=None,
-                )
-            else:
-                await event.respond(caption + "\nتصویر رسید در فضای خصوصی در دسترس نیست.", buttons=buttons)
-
-    async def _payment_callback(self, event, admin_id: int, action: str, payment_id: int) -> None:
-        detail = await self.db.payment_detail(payment_id)
-        if not detail:
-            await event.answer("درخواست پرداخت پیدا نشد.", alert=True)
-            return
-        if action == "receipt":
-            receipt = self._safe_receipt_path(detail.get("receipt_path"))
-            if receipt is None or not receipt.is_file():
-                await event.answer("رسید در فضای خصوصی در دسترس نیست.", alert=True)
-                return
-            await event.answer()
-            await event.respond(
-                f"رسید خصوصی درخواست {payment_id} — {detail['telegram_id']}",
-                file=str(receipt),
-                force_document=True,
-                parse_mode=None,
-            )
-            return
-        if action == "approve":
-            approved = await self.db.approve_payment(payment_id, admin_id)
-            if approved is None:
-                await event.answer("این درخواست قبلاً بررسی شده یا دیگر منتظر تأیید نیست.", alert=True)
-                return
-            try:
-                await self.client.send_message(
-                    int(approved["user_telegram_id"]),
-                    f"پرداخت شما تأیید شد؛ {format_duration(approved['granted_seconds'])} "
-                    f"اعتبار برای {approved['plan_name']} افزوده شد. از /balance موجودی را ببینید.",
-                    parse_mode=None,
-                )
-            except Exception:
-                logger.warning("Payment approval notification failed payment_id=%s", payment_id)
-            await self._cleanup_expired_receipts()
-            await self._edit_callback(
-                event,
-                f"پرداخت {payment_id} تأیید شد و اعتبار به‌صورت اتمیک افزوده شد.",
-                [[Button.inline("💳 پرداخت‌ها", b"admin:payments")]],
-            )
-            return
-        if action == "reject":
-            if detail["status"] != "pending":
-                await event.answer("این درخواست قبلاً بررسی شده است.", alert=True)
-                return
-            self._pending_admin_actions[admin_id] = f"payment_reject:{payment_id}"
-            await self._edit_callback(
-                event,
-                "دلیل رد رسید را بفرستید؛ هیچ اعتباری افزوده نمی‌شود. برای انصراف لغو را بزنید.",
-                [[Button.inline("لغو", b"admin:payments")]],
-            )
-            return
-        await event.answer("عملیات پرداخت معتبر نیست.", alert=True)
-
-    async def _show_admin_audit(self, event) -> None:
-        rows = await self.db.admin_audit(limit=30)
-        usage = await self.db.admin_usage_ledger(limit=30)
-        if not rows and not usage:
-            text = "هنوز رویداد مدیریتی یا حسابداری ثبت نشده است."
-        else:
-            lines = []
-            if rows:
-                lines.append("آخرین رویدادهای مدیریتی:")
-                for row in rows:
-                    details = row.get("details") or {}
-                    summary = ", ".join(f"{key}={value}" for key, value in details.items())
-                    lines.append(
-                        f"• {row['created_at']} | مدیر {row['admin_telegram_id']} | "
-                        f"{row['action']} | {row.get('target_type')} {row.get('target_id') or ''}"
-                        + (f" | {summary}" if summary else "")
-                    )
-            if usage:
-                lines.extend(["", "آخرین رویدادهای ریزحساب اعتبار (ثانیهٔ صحیح):"])
-                for row in usage:
-                    quantities = []
-                    event_type = str(row["event_type"])
-                    if event_type == "grant" and int(row.get("reserved_seconds") or 0):
-                        quantities.append(
-                            f"افزوده {format_duration(int(row['reserved_seconds']))}"
-                        )
-                    else:
-                        for label, key in (
-                            ("درخواست", "requested_seconds"),
-                            ("رزرو", "reserved_seconds"),
-                            ("مصرف", "consumed_seconds"),
-                            ("آزادسازی", "released_seconds"),
-                        ):
-                            value = row.get(key)
-                            if value is not None and int(value) != 0:
-                                quantities.append(f"{label} {format_duration(int(value))}")
-                    available = row.get("available_seconds")
-                    if available is not None:
-                        quantities.append(f"موجود هنگام ثبت {format_duration(int(available))}")
-                    details = "، ".join(quantities) or "بدون مقدار"
-                    submission = (
-                        f" | ارسال {_error_reference(int(row['submission_id']))}"
-                        if row.get("submission_id") is not None
-                        else ""
-                    )
-                    admin = (
-                        f" | مدیر {row['admin_telegram_id']}"
-                        if row.get("admin_telegram_id") is not None
-                        else ""
-                    )
-                    reason = f" | {row['reason']}" if row.get("reason") else ""
-                    lines.append(
-                        f"• {row['created_at']} | کاربر {row['telegram_id']} | "
-                        f"{row['event_type']} | {details}{submission}{admin}{reason}"
-                    )
-            text = "\n".join(lines)
-        answer = getattr(event, "answer", None)
-        if callable(answer):
-            await answer()
-        await self._send_long_message(event, text, is_admin=True)
-
-    @staticmethod
-    def _masked_key(secret: str | None) -> str:
-        return "تنظیم نشده" if not secret else "••••••••" + secret[-4:]
-
-    async def _show_admin_overview(self, event) -> None:
-        """Admin overview: service status, activity, provider availability, issues.
-
-        Everything here is a bounded read of local state — no provider request
-        is made because an administrator opened a panel.
-        """
-        stats = await self.db.stats()
-        lines = ["پنل مدیریت ربات ⚙️", "", "📊 نمای کلی"]
-        lines.append(
-            f"کاربران: {stats['users']} (غیرمسدود {stats['unbanned_users']}) | "
-            f"فایل‌ها: {stats['submissions']} | موفق {stats['done']} | ناموفق {stats['failed']}"
-        )
-        ai = await self.db.ai_usage_overview(days=1)
-        lines.append(
-            f"🤖 AI امروز: {ai['requests']} درخواست (موفق {ai['successes']}, خطا {ai['failures']})"
-            + (
-                f" | p95 {ai['latency_p95_ms']}ms{latency_sample_note(ai)}"
-                if ai["latency_p95_ms"]
-                else ""
-            )
-        )
-        stt_ready = bool(
-            self.settings.deepgram_api_key
-            or self.settings.speechmatics_api_key
-            or self.settings.stt_openai_api_key
-            or self.settings.note_api_key
-        )
-        lines.append(
-            f"🎙 گفتار: {'تنظیم‌شده ✅' if stt_ready else 'تنظیم‌نشده ⛔'} | "
-            f"🧾 جزوه: {'تنظیم‌شده ✅' if (self.settings.effective_note_api_key) else 'تنظیم‌نشده ⛔'}"
-        )
-        issues: list[str] = []
-        try:
-            # A count, because the length of a capped list is not the backlog.
-            pending = await self.db.pending_payment_count()
-            if pending:
-                issues.append(f"💳 {pending} پرداخت در انتظار بررسی")
-        except Exception:
-            logger.debug("Pending payments unavailable for the overview", exc_info=True)
-        try:
-            summaries = await self.credential_manager.list_summaries()
-            quarantined = sum(1 for item in summaries if item.get("quarantined_at"))
-            cooling = sum(
-                1
-                for item in summaries
-                if item.get("enabled") and _cooldown_active(item.get("cooldown_until"))
-            )
-            if quarantined:
-                issues.append(f"🔑 {quarantined} کلید در قرنطینه (احراز هویت)")
-            if cooling:
-                issues.append(f"⏳ {cooling} کلید در cooldown")
-            if not any(item.get("enabled") for item in summaries) and not (
-                self.settings.effective_note_api_key
-            ):
-                issues.append("🔑 هیچ کلید فعالی ثبت نشده است")
-        except Exception:
-            logger.debug("Credential summaries unavailable for the overview", exc_info=True)
-        lines.append("")
-        lines.append("⚠️ مسائل باز" if issues else "✅ مسئلهٔ بازی وجود ندارد")
-        lines.extend(f"• {item}" for item in issues)
-        lines.append("")
-        lines.append("برای هر بخش روی نام آن بزنید؛ مسیرهای AI و STT هر کدام جای خودشان هستند.")
-        rows = admin_menu()
-        rows.insert(
-            1, [Button.inline(label, data) for label, data in ADMIN_OVERVIEW_EXTRA]
-        )
-        await self._edit_callback(event, "\n".join(lines), rows)
-
-    async def _show_provider_health(self, event, *, force: bool = False) -> None:
-        """Admin-only provider health panel (manual, cached, secret-free).
-
-        Opening or redrawing the panel only reads what is already known. A probe
-        against a provider happens when the operator asks for one
-        (``admin:health:refresh``) or tests a single key, so a panel view can
-        never spend provider quota, trip a rate limit, or hold the callback open
-        for several network timeouts.
-        """
-        try:
-            if force:
-                results = await self.provider_health.check_all(force=True)
-            else:
-                snapshot = getattr(self.provider_health, "snapshot", None)
-                if callable(snapshot):
-                    results = await snapshot()
-                else:  # pragma: no cover - defensive for injected doubles
-                    results = await self.provider_health.check_all(force=False)
-        except Exception:
-            logger.exception("Provider health check failed")
-            await self._edit_callback(
-                event,
-                "بررسی سلامت سرویس‌ها با خطا روبه‌رو شد؛ هیچ کلیدی نمایش داده نشد.",
-                [[Button.inline("🔄 تلاش دوباره", b"admin:health:refresh")],
-                 [Button.inline("↩️ پنل مدیریت", b"admin:home")]],
-            )
-            return
-        lines = [
-            "🩺 وضعیت سرویس‌ها",
-            "این صفحه فقط نتیجه‌های ثبت‌شده را نشان می‌دهد؛ سنجش زنده انجام نمی‌دهد.",
-        ]
-        if not force:
-            lines.append("برای سنجش زندهٔ همهٔ سرویس‌ها «🔄 بررسی همه» را بزنید.")
-        if not results:
-            lines.append("هنوز سرویسی تنظیم نشده است.")
-        current_group = None
-        buttons: list = []
-        for result in results:
-            group = ("STT" if result.service == "stt" else "جزوه") + f" / {result.provider}"
-            if group != current_group:
-                lines.append(f"\n{group}:")
-                current_group = group
-            parts = [f"• {result.label} ({result.masked}) — {result.status_fa}"]
-            if result.http_status is not None:
-                parts.append(f"HTTP {result.http_status}")
-            if result.latency_ms is not None:
-                parts.append(f"{result.latency_ms}ms")
-            if result.cached:
-                parts.append("نتیجهٔ ذخیره‌شده")
-            if result.checked_at:
-                parts.append(f"بررسی {result.checked_at[11:19]}")
-            remaining = cooldown_remaining_seconds(result.cooldown_until)
-            if remaining:
-                parts.append(f"cooldown {remaining}s")
-            if result.detail:
-                parts.append(result.detail)
-            lines.append(" | ".join(parts))
-            if result.credential_id is not None:
-                buttons.append(
-                    [
-                        Button.inline(
-                            # A credential label is free text with no stored length
-                            # limit; without the clamp one long label stops the whole
-                            # health panel from sending.
-                            button_label(f"🧪 تست {result.label} ({result.masked})"),
-                            f"admin:health:test:{result.credential_id}",
-                        )
-                    ]
-                )
-        buttons.append([Button.inline("🔄 بررسی همه", b"admin:health:refresh")])
-        buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
-        await self._edit_callback(event, "\n".join(lines), buttons)
-
-    async def _test_credential_health(self, event, credential_id: int, admin_id: int) -> None:
-        try:
-            result = await self.provider_health.test_credential(credential_id)
-        except CredentialStoreError:
-            await event.answer("کلید پیدا نشد یا قابل رمزگشایی نیست.", alert=True)
-            return
-        except Exception:
-            logger.exception("Credential test failed credential=%s", credential_id)
-            await event.answer("تست کلید با خطا روبه‌رو شد.", alert=True)
-            return
-        # Audit the action, never the key: the masked tail and status only.
-        try:
-            await self.db.add_audit_entry(
-                admin_id,
-                "provider_credential_tested",
-                "provider_credential",
-                str(credential_id),
-                {"status": result.status, "http_status": result.http_status, "masked": result.masked},
-            )
-        except Exception:
-            logger.warning("Could not write credential-test audit entry credential=%s", credential_id)
-        detail = f"\n{result.detail}" if result.detail else ""
-        http = f" | HTTP {result.http_status}" if result.http_status is not None else ""
-        latency = f" | {result.latency_ms}ms" if result.latency_ms is not None else ""
-        await self._edit_callback(
-            event,
-            f"🧪 نتیجهٔ تست کلید #{credential_id} ({result.masked})\n"
-            f"سرویس: {result.service}/{result.provider}\n"
-            f"وضعیت: {result.status_fa}{http}{latency}{detail}",
-            [
-                [Button.inline("🔄 بررسی همه", b"admin:health:refresh")],
-                [Button.inline("🔑 API Keys", b"admin:credentials")],
-            ],
-        )
-
-    #: Credential rows per page. Each row costs two button rows, so an uncapped
-    #: list passed Telegram's 100-button keyboard limit and the screen stopped
-    #: rendering at all (about twenty keys).
-    CREDENTIALS_PAGE_SIZE = 12
-
-    async def _show_provider_credentials(self, event, page: object = 0) -> None:
-        summaries = await self.credential_manager.list_summaries()
-        size = self.CREDENTIALS_PAGE_SIZE
-        try:
-            current = max(0, int(page)) if page is not None else 0
-        except (TypeError, ValueError):
-            current = 0  # a stale or malformed token simply shows the first page
-        pages = max(1, -(-len(summaries) // size))
-        current = min(current, pages - 1)
-        start = current * size
-        window = summaries[start : start + size]
-        lines = [
-            "کلیدها و آخرین پاسخ providerها 🔑",
-            "برای بررسی زندهٔ سرویس‌ها از «🩺 وضعیت سرویس‌ها» استفاده کنید؛ "
-            "این صفحه وضعیت ثبت‌شده را نشان می‌دهد.",
-            "Master key رمزگذاری: "
-            + ("تنظیم شده" if self.credential_manager.encryption_configured else "تنظیم نشده"),
-            "\nکلیدهای محیطی:",
-        ]
-        environment = [
-            ("stt", "speechmatics", self.settings.speechmatics_api_key),
-            ("stt", "deepgram", self.settings.deepgram_api_key),
-            ("stt", "openai_compatible", self.settings.stt_openai_api_key),
-            ("notes", self.settings.note_api_provider, self.settings.effective_note_api_key),
-        ]
-        health = self.credential_manager.environment_health()
-        for service, provider, secret in environment:
-            if not secret:
-                continue
-            state = health.get((service, provider), {})
-            last = f"؛ آخرین HTTP {state['last_status_code']}" if state.get("last_status_code") else ""
-            cool = "؛ در cooldown" if _cooldown_active(state.get("cooldown_until")) else ""
-            quarantine = "؛ قرنطینه" if state.get("quarantined_at") else ""
-            lines.append(
-                f"• {service}/{provider}: {self._masked_key(secret)}{last}{cool}{quarantine}"
-            )
-        buttons = []
-        if summaries:
-            if pages > 1:
-                lines.append(
-                    f"\nکلیدهای رمزگذاری‌شده در پایگاه‌داده — صفحهٔ {current + 1} "
-                    f"از {pages} ({len(summaries)} کلید):"
-                )
-            else:
-                lines.append("\nکلیدهای رمزگذاری‌شده در پایگاه‌داده:")
-            for item in window:
-                state = "غیرفعال" if not item["enabled"] else "فعال"
-                if item["enabled"] and item["quarantined_at"]:
-                    state = "قرنطینه (401/403)"
-                elif item["enabled"] and _cooldown_active(item["cooldown_until"]):
-                    state = f"cooldown تا {str(item['cooldown_until'])[:19]}"
-                elif item["enabled"] and item["cooldown_until"]:
-                    state = "فعال؛ cooldown پایان‌یافته"
-                last = f"؛ HTTP {item['last_status_code']}" if item["last_status_code"] else ""
-                lines.append(
-                    f"• #{item['id']} {item['service']}/{item['provider']} — {item['label']} "
-                    f"{self._masked_key(item['secret_last4'])}{last}؛ {state}"
-                )
-                toggle = "enable" if not item["enabled"] else "disable"
-                buttons.append(
-                    [
-                        Button.inline(
-                            f"{('فعال‌سازی' if toggle == 'enable' else 'غیرفعال‌سازی')} #{item['id']}",
-                            f"admin:credential:{toggle}:{item['id']}",
-                        ),
-                        Button.inline("حذف", f"admin:credential:delete:{item['id']}"),
-                    ]
-                )
-                buttons.append(
-                    [
-                        Button.inline("▲ بالاتر", f"admin:credential:up:{item['id']}"),
-                        Button.inline("▼ پایین‌تر", f"admin:credential:down:{item['id']}"),
-                        Button.inline("🧪 تست", f"admin:health:test:{item['id']}"),
-                    ]
-                )
-        if pages > 1:
-            nav: list = []
-            if current > 0:
-                nav.append(
-                    Button.inline(
-                        "◀️ قبلی", f"admin:credentials:{current - 1}".encode("ascii")
-                    )
-                )
-            if current < pages - 1:
-                nav.append(
-                    Button.inline(
-                        "بعدی ▶️", f"admin:credentials:{current + 1}".encode("ascii")
-                    )
-                )
-            buttons.append(nav)
-        buttons.extend(
-            [
-                [
-                    Button.inline("➕ افزودن با راهنما (Wizard)", b"admin:ai:wiz"),
-                    Button.inline("🔑 پنل جامع کلیدها", b"admin:ai:keys"),
-                ],
-                [
-                    Button.inline("افزودن کلید STT", b"admin:credential:add:stt"),
-                    Button.inline("افزودن کلید جزوه", b"admin:credential:add:notes"),
-                ],
-                [Button.inline("↩️ پنل مدیریت", b"admin:home")],
-            ]
-        )
-        await self._edit_callback(event, "\n".join(lines), buttons)
-
-    @staticmethod
-    def _admin_credit_text(overview: dict) -> str:
-        lines = [
-            f"⏱ اعتبار کاربر {overview['telegram_id']}"
-            + (f" (@{overview['username']})" if overview["username"] else ""),
-            f"موجودی قابل استفاده: {format_duration(overview['available_seconds'])}",
-            f"سهم رایگان: {format_duration(overview['free_seconds'])} | "
-            f"سهم خریداری‌شده: {format_duration(overview['paid_seconds'])}",
-            (
-                "♾️ کاربر ویژه (نامحدود)"
-                + (
-                    f" — دلیل: {overview['unlimited_reason']}"
-                    if overview.get("unlimited_reason")
-                    else ""
-                )
-                if overview.get("is_unlimited")
-                else "وضعیت ویژه: ندارد"
-            ),
-            f"ارسال‌ها: {overview['submissions']['total']} "
-            f"(موفق {overview['submissions']['done']} / ناموفق {overview['submissions']['failed']})",
-        ]
-        entitlements = overview["entitlements"]
-        if entitlements:
-            lines.append(
-                "\n"
-                + _credit_history_heading(
-                    "اعتبارها (جدیدترین)",
-                    "سابقه",
-                    entitlements,
-                    overview.get("entitlement_total"),
-                )
-            )
-            statuses_fa = {
-                "active": "فعال",
-                "expired": "منقضی",
-                "revoked": "لغوشده",
-            }
-            for item in entitlements:
-                expiry = (
-                    "بدون انقضا"
-                    if not item["expires_at"]
-                    else f"تا {str(item['expires_at'])[:10]}"
-                )
-                lines.append(
-                    f"• #{item['id']} {item['plan_name']} — "
-                    f"{format_duration(item['remaining_seconds'])} از "
-                    f"{format_duration(item['granted_seconds'])} — {expiry} — "
-                    f"{statuses_fa.get(item['status'], item['status'])} ({item['source']})"
-                )
-        else:
-            lines.append("\nاعتباری ثبت نشده است.")
-        usage = overview["usage"]
-        if usage:
-            lines.append(
-                "\n"
-                + _credit_history_heading(
-                    "آخرین رویدادهای مصرف (ثانیه)", "رویداد", usage, overview.get("usage_total")
-                )
-            )
-            for item in usage:
-                quantities = []
-                for label, key in (
-                    ("درخواست", "requested_seconds"),
-                    ("رزرو", "reserved_seconds"),
-                    ("مصرف", "consumed_seconds"),
-                    ("آزادسازی", "released_seconds"),
-                ):
-                    value = item.get(key)
-                    if value is not None and int(value):
-                        quantities.append(f"{label} {int(value)}")
-                reason = f" — {item['reason']}" if item.get("reason") else ""
-                lines.append(
-                    f"• {str(item['created_at'])[:19]} {item['event_type']}: "
-                    + ("، ".join(quantities) or "بدون مقدار")
-                    + reason
-                )
-        return "\n".join(lines)
-
-    async def _show_user_credit(self, event, telegram_id: int) -> None:
-        overview = await self.db.admin_user_credit_overview(telegram_id)
-        if overview is None:
-            await self._edit_callback(
-                event,
-                "این شناسه در پایگاه‌داده پیدا نشد.",
-                [[Button.inline("↩️ اعتبار کاربران", b"admin:credits"),
-                  Button.inline("پنل مدیریت", b"admin:home")]],
-            )
-            return
-        buttons = [
-            [Button.inline("➕ افزودن اعتبار دستی", f"admin:credit:add:{telegram_id}")],
-            [Button.inline("🔄 به‌روزرسانی", f"admin:credits:{telegram_id}")],
-            [Button.inline("↩️ پنل مدیریت", b"admin:home")],
-        ]
-        await self._edit_callback(event, self._admin_credit_text(overview), buttons)
-
-    @staticmethod
-    def _special_users_text(users: list[dict], total: int | None = None) -> str:
-        if not users:
-            return (
-                "⭐ کاربران ویژه\n\n"
-                "هنوز کاربری در این فهرست نیست.\n"
-                "کاربران ویژه بدون کسر اعتبار از ربات استفاده می‌کنند."
-            )
-        shown_total = len(users) if total is None else total
-        lines = [
-            "⭐ کاربران ویژه (استفادهٔ نامحدود)",
-            f"تعداد: {shown_total}" + (f" (این صفحه {len(users)} مورد اخیر را نشان می‌دهد)" if shown_total > len(users) else ""),
-            "",
-        ]
-        for user in users:
-            name = f"@{user['username']}" if user["username"] else "بدون نام کاربری"
-            ban = " | مسدود" if user["is_banned"] else ""
-            reason = f" | دلیل: {user['unlimited_reason']}" if user["unlimited_reason"] else ""
-            lines.append(
-                f"• {name} | شناسه: {user['telegram_id']} | "
-                f"پردازش‌های ویژه: {user['unbilled_jobs']}{ban}{reason}"
-            )
-        lines.append("")
-        if total is not None and total > len(users):
-            lines.append(
-                "فهرست این صفحه فقط ۳۰ کاربر ویژهٔ اخیر است؛ برای بقیه از دستور "
-                "`/unlimited شناسه off دلیل` استفاده کنید."
-            )
-        lines.append(
-            "این فهرست فقط برای مدیران است و هر تغییر آن در گزارش مدیر ثبت می‌شود. "
-            "مدیران به‌صورت خودکار در این فهرست نیستند."
-        )
-        return "\n".join(lines)
-
-    async def _show_special_users(self, event, page_text: str | None = None) -> None:
-        """Paged remove buttons.
-
-        The screen listed 30 special users but only offered 12 remove buttons and
-        told the admin to use a command for the rest; every row it lists now has
-        its own action, and the total says when the list itself is a prefix.
-        """
-        users = await self.db.unlimited_users(limit=30)
-        total = await self.db.unlimited_user_count()
-        size = self.SPECIAL_PAGE_SIZE
-        pages = max(1, -(-len(users) // size))
-        page = min(self._admin_page(page_text), pages - 1)
-        buttons = [[Button.inline("➕ افزودن کاربر ویژه", b"admin:special:add")]]
-        for user in users[page * size : (page + 1) * size]:
-            buttons.append(
-                [
-                    Button.inline(
-                        f"❌ حذف {user['telegram_id']}",
-                        f"admin:special:remove:{int(user['telegram_id'])}",
-                    )
-                ]
-            )
-        if pages > 1:
-            nav: list = []
-            if page > 0:
-                nav.append(Button.inline("◀️ قبلی", f"admin:special:{page - 1}"))
-            if page + 1 < pages:
-                nav.append(Button.inline("بعدی ▶️", f"admin:special:{page + 1}"))
-            nav.append(Button.inline(f"صفحهٔ {page + 1} از {pages}", b"admin:special"))
-            buttons.append(nav)
-        buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
-        body = self._special_users_text(users, total)
-        if pages > 1:
-            body += f"\nصفحهٔ {page + 1} از {pages} (هر صفحه {size} دکمهٔ حذف)"
-        await self._edit_callback(event, body, buttons)
-
-    @staticmethod
-    def _plan_admin_line(plan: dict) -> str:
-        status = "فعال" if plan["enabled"] else "غیرفعال"
-        price = "رایگان" if plan["is_free"] else format_toman(plan["price_toman"])
-        origin = " | ساختهٔ مدیر" if plan["is_custom"] else ""
-        return (
-            f"• {plan['code']} — {plan['name']} — {format_duration(plan['included_seconds'])} — "
-            f"{price} — {format_validity(plan['validity_days'])} — {status}{origin}"
-        )
-
-    async def _show_admin_plans(self, event, page_text: str | None = None) -> None:
-        """Paged plan list.
-
-        Every plan used to be rendered into one message with up to three buttons
-        each, so a deployment with enough custom plans passed Telegram's message
-        and keyboard limits and the panel stopped opening at all.
-        """
-        plans = await self.db.list_plans(include_disabled=True)
-        size = self.PLANS_PAGE_SIZE
-        pages = max(1, -(-len(plans) // size))
-        page = min(self._admin_page(page_text), pages - 1)
-        window = plans[page * size : (page + 1) * size]
-        lines = [
-            "🧾 مدیریت طرح‌های فروش",
-            f"تعداد طرح‌ها: {len(plans)}"
-            + (f" — صفحهٔ {page + 1} از {pages}" if pages > 1 else ""),
-            "",
-            *[self._plan_admin_line(plan) for plan in window],
-            "",
-            "طرح‌های پیش‌فرض با هر راه‌اندازی از تنظیمات به‌روز می‌شوند؛ به‌محض ویرایش یا "
-            "غیرفعال‌سازی، اختیار آن طرح به این پنل منتقل می‌شود و دیگر بازنویسی نمی‌شود. "
-            "طرح غیرفعال برای خریداران نمایش داده نمی‌شود.",
-        ]
-        buttons = [[Button.inline("➕ طرح جدید", b"admin:plan:new")]]
-        for plan in window:
-            if plan["is_free"]:
-                continue
-            row = [
-                Button.inline(
-                    "⛔️ غیرفعال کن" if plan["enabled"] else "✅ فعال کن",
-                    f"admin:plan:toggle:{plan['id']}",
-                ),
-                Button.inline("✏️ ویرایش", f"admin:plan:edit:{plan['id']}"),
-            ]
-            if plan["is_custom"]:
-                row.append(Button.inline("🗑 حذف", f"admin:plan:delete:{plan['id']}"))
-            buttons.append(row)
-        if pages > 1:
-            nav = []
-            if page > 0:
-                nav.append(Button.inline("◀️ قبلی", f"admin:plans:{page - 1}"))
-            if page + 1 < pages:
-                nav.append(Button.inline("بعدی ▶️", f"admin:plans:{page + 1}"))
-            nav.append(Button.inline(f"صفحهٔ {page + 1} از {pages}", b"admin:plans"))
-            buttons.append(nav)
-        buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
-        await self._edit_callback(event, "\n".join(lines), buttons)
-
-    async def _begin_credential_add(self, event, admin_id: int, service: str) -> None:
-        if not self.credential_manager.encryption_configured:
-            await self._edit_callback(
-                event,
-                "ابتدا PROVIDER_CREDENTIALS_ENCRYPTION_KEY را در environment سرور تنظیم کنید؛ "
-                "بدون آن کلید جدید ذخیره نمی‌شود.",
-                [[Button.inline("↩️ پنل مدیریت", b"admin:credentials")]],
-            )
-            return
-        await self.ai_panels.begin_wizard(event, service=service)
-
+    # ------------------------------------------------------------- callbacks
     async def _handle_callback(self, event) -> None:
-        sender = await event.get_sender()
-        if not sender or getattr(sender, "bot", False):
-            return
-        telegram_id = int(sender.id)
-        # Armed before the first read: every panel below can answer as early as
-        # it likes without risking a duplicate answerCallbackQuery later.
-        self._arm_answer_once(event)
-        user = await self.db.upsert_user(telegram_id, getattr(sender, "username", None))
-        is_admin = telegram_id in self.settings.admin_ids
-        data = bytes(event.data or b"").decode("utf-8", "replace")
-
-        if user["is_banned"] and not is_admin:
-            await event.answer("دسترسی شما به ربات محدود شده است.", alert=True)
-            return
-        if data.startswith("admin:") and not getattr(event, "is_private", True):
-            await event.answer("لطفاً پنل مدیریت را در گفت‌وگوی خصوصی ربات باز کنید.", alert=True)
-            return
-        if data.startswith("menu:") and getattr(event, "is_private", True):
-            self._pending_admin_actions.pop(telegram_id, None)
-        if data == "menu:home":
-            self._pending_admin_actions.pop(telegram_id, None)
-            await self._edit_callback(event, WELCOME_TEXT, main_menu(is_admin))
-            return
-        if data == "menu:create":
-            await self._edit_callback(
-                event,
-                "فایلتان را بفرستید 📎\n\n"
-                "صوت، ویدیو یا PowerPoint فرقی ندارد؛ بعد از دریافت فایل، پیشرفت کار را "
-                "مرحله‌به‌مرحله می‌بینید.",
-                back_menu(is_admin),
-            )
-            return
-        if data == "menu:help":
-            # One destination: what the bot does and exactly what it accepts,
-            # because "how do I use it" and "why was my file rejected" are the
-            # same question for a first-time user.
-            await self._edit_callback(
-                event,
-                f"{HELP_TEXT}\n\n{FORMATS_TEXT}",
-                [
-                    [Button.inline("🔐 حریم خصوصی", b"menu:privacy")],
-                    [Button.inline("💳 حساب و اعتبار", b"menu:account")],
-                    *back_menu(is_admin),
-                ],
-            )
-            return
-        if data == "menu:formats":
-            await self._edit_callback(event, FORMATS_TEXT, back_menu(is_admin))
-            return
-        if data == "menu:account":
-            if not getattr(event, "is_private", True):
-                await self._ack(
-                    event, "اطلاعات حساب فقط در گفت‌وگوی خصوصی نمایش داده می‌شود.", alert=True
-                )
-                return
-            await self._show_account_overview(event, int(user["id"]))
-            return
-        if data == "menu:privacy":
-            await self._edit_callback(event, PRIVACY_TEXT, back_menu(is_admin))
-            return
-        if data.startswith("billing:"):
-            if not getattr(event, "is_private", True):
-                await event.answer("اطلاعات پرداخت و موجودی فقط در گفت‌وگوی خصوصی نمایش داده می‌شود.", alert=True)
-                return
-            if data == "billing:balance":
-                await self._edit_callback(
-                    event,
-                    await self._billing_balance_text(int(user["id"])),
-                    [
-                        [Button.inline("💳 خرید اشتراک", b"billing:plans")],
-                        [Button.inline("↩️ منو", b"menu:home")],
-                    ],
-                )
-                return
-            if data == "billing:plans" or data.startswith("billing:plans:"):
-                page = self._page_arg(data, "billing:plans:")
-                text, buttons = await self._billing_plans(self._admin_page(page))
-                await self._edit_callback(event, text, buttons)
-                return
-            if data.startswith("billing:buy:"):
-                await self._start_payment(event, int(user["id"]), data.rsplit(":", 1)[-1])
-                return
-            if data.startswith("billing:cancel:"):
-                try:
-                    payment_id = int(data.rsplit(":", 1)[-1])
-                except ValueError:
-                    await event.answer("درخواست پرداخت معتبر نیست.", alert=True)
-                    return
-                cancelled = await self.db.cancel_payment_intent(payment_id, int(user["id"]))
-                await self._edit_callback(
-                    event,
-                    "درخواست پرداخت لغو شد." if cancelled else "این درخواست قابل لغو نیست یا قبلاً رسید آن ثبت شده است.",
-                    [[Button.inline("طرح‌ها", b"billing:plans"), Button.inline("منو", b"menu:home")]],
-                )
-                return
-            await event.answer("این دکمهٔ پرداخت معتبر نیست.", alert=True)
-            return
-
-        if not data.startswith("admin:"):
-            await event.answer("این دکمه معتبر نیست.", alert=True)
-            return
-        if not is_admin:
-            await event.answer("این بخش فقط برای مدیر ربات است.", alert=True)
-            return
-        # Tapping any panel button abandons a half-finished text prompt (a plan,
-        # credit, broadcast, rejection or key prompt). Without this, the next
-        # message the administrator types is silently consumed by the stale
-        # prompt, so the panel they just opened looks broken. Flows that need a
-        # pending state set it again in their own handler below.
-        self._pending_admin_actions.pop(telegram_id, None)
-        if data in _ADMIN_ACK_FIRST or data.startswith(_ADMIN_ACK_FIRST_PREFIXES):
-            # Read-only admin panels with a fixed payload: acknowledge the tap
-            # before the database work, so the button stops spinning while the
-            # panel reads. These panels parse nothing, so nothing that would
-            # need an alert toast is displaced by the early answer.
+        data = (event.data or b"").decode("utf-8", "replace").strip()
+        user_id = event.sender_id
+        if user_id is None:
             await self._ack(event)
-        payments_page = self._page_arg(data, "admin:payments:")
-        if data == "admin:payments" or payments_page is not None:
-            await self._show_pending_payments(event, payments_page)
             return
-        if data.startswith("admin:payment:"):
-            parts = data.split(":")
-            if len(parts) != 4:
-                await event.answer("دکمهٔ پرداخت معتبر نیست.", alert=True)
-                return
-            try:
-                payment_id = int(parts[3])
-            except ValueError:
-                await event.answer("شمارهٔ درخواست معتبر نیست.", alert=True)
-                return
-            await self._payment_callback(event, telegram_id, parts[2], payment_id)
+        if not self._is_admin(user_id) and data.startswith("adm:"):
+            await self._ack(event, "این بخش ویژهٔ مدیران است.", alert=True)
             return
-        special_page = self._page_arg(data, "admin:special:")
-        if data == "admin:special" or special_page is not None:
-            self._pending_admin_actions.pop(telegram_id, None)
-            await self._show_special_users(event, special_page)
-            return
-        if data == "admin:special:add":
-            self._pending_admin_actions[telegram_id] = "special_add"
-            await self._edit_callback(
-                event, SPECIAL_USER_PROMPT, [[Button.inline("لغو", b"admin:special")]]
+
+        if data == "make":
+            await self._ack(event)
+            await event.respond(
+                "📎 فایل درس را بفرستید:\n"
+                "• صوت یا ویدیوی کلاس (MP3، MP4، WAV، OGG، M4A، …)\n"
+                "• ویس یا ویدیو-پیام تلگرام\n"
+                "• فایل پاورپوینت (PPTX/PPT) — صدای ضبط‌شدهٔ داخل اسلایدها هم پشتیبانی می‌شود\n\n"
+                "متن خام پیاده‌سازی را همان اول می‌گیرید؛ جزوهٔ Word چند لحظه بعد می‌رسد."
             )
-            return
-        if data.startswith("admin:special:remove:"):
-            self._pending_admin_actions.pop(telegram_id, None)
-            try:
-                target_id = int(data.rsplit(":", 1)[-1])
-            except ValueError:
-                await event.answer("شناسهٔ کاربر معتبر نیست.", alert=True)
-                return
-            result = await self.db.set_user_unlimited(
-                target_id, False, telegram_id, UNLIMITED_REVOKED_REASON
+        elif data == "help":
+            await self._ack(event)
+            await event.respond(
+                "❓ راهنما\n\n"
+                "۱) دکمهٔ «ساخت جزوه» را بزنید و فایل درس را بفرستید.\n"
+                "۲) اول فایل «متن خام» می‌رسد — همان چیزی که از صدا پیاده شده.\n"
+                "۳) بعد جزوهٔ Word ساختارمند (RTL، جدول، شماره صفحه) ارسال می‌شود.\n\n"
+                "قانون حساب: مصرف بر پایهٔ مدت صوت است و کار ناموفق اعتبار نمی‌سوزاند.\n"
+                "محدودیت‌ها: هر فایل تا ۲ گیگابایت؛ هم‌زمان ۳ کار فعال و ۸ کار در صف."
             )
-            if result is None:
-                await event.answer("این شناسه در پایگاه‌داده پیدا نشد.", alert=True)
-                return
-            await event.answer(
-                "از فهرست کاربران ویژه حذف شد."
-                if result["changed"]
-                else "این کاربر از قبل در فهرست نبود."
-            )
-            await self._show_special_users(event)
-            return
-        plans_page = self._page_arg(data, "admin:plans:")
-        if data == "admin:plans" or plans_page is not None:
-            self._pending_admin_actions.pop(telegram_id, None)
-            await self._show_admin_plans(event, plans_page)
-            return
-        if data == "admin:plan:new":
-            self._pending_admin_actions[telegram_id] = "plan_new"
-            await self._edit_callback(
-                event, PLAN_NEW_PROMPT, [[Button.inline("لغو", b"admin:plans")]]
-            )
-            return
-        if data.startswith("admin:plan:edit:"):
-            self._pending_admin_actions.pop(telegram_id, None)
-            try:
-                plan_id = int(data.rsplit(":", 1)[-1])
-            except ValueError:
-                await event.answer("شناسهٔ طرح معتبر نیست.", alert=True)
-                return
-            plan = await self.db.get_plan(plan_id)
-            if plan is None:
-                await event.answer("این طرح پیدا نشد.", alert=True)
-                return
-            if plan["is_free"]:
-                await event.answer("طرح رایگان از این پنل ویرایش نمی‌شود.", alert=True)
-                return
-            self._pending_admin_actions[telegram_id] = f"plan_edit:{plan_id}"
-            await self._edit_callback(
-                event, _plan_edit_prompt(plan), [[Button.inline("لغو", b"admin:plans")]]
-            )
-            return
-        if data.startswith("admin:plan:toggle:"):
-            self._pending_admin_actions.pop(telegram_id, None)
-            try:
-                plan_id = int(data.rsplit(":", 1)[-1])
-            except ValueError:
-                await event.answer("شناسهٔ طرح معتبر نیست.", alert=True)
-                return
-            plan = await self.db.get_plan(plan_id)
-            if plan is None:
-                await event.answer("این طرح پیدا نشد.", alert=True)
-                return
-            try:
-                changed = await self.db.set_plan_enabled(
-                    plan_id, not plan["enabled"], telegram_id
-                )
-            except ValueError as exc:
-                await event.answer(str(exc), alert=True)
-                return
-            await event.answer(
-                "وضعیت طرح تغییر کرد." if changed else "وضعیت طرح تغییری نکرد."
-            )
-            await self._show_admin_plans(event)
-            return
-        if data.startswith("admin:plan:delete:"):
-            self._pending_admin_actions.pop(telegram_id, None)
-            try:
-                plan_id = int(data.rsplit(":", 1)[-1])
-            except ValueError:
-                await event.answer("شناسهٔ طرح معتبر نیست.", alert=True)
-                return
-            try:
-                changed = await self.db.delete_plan(plan_id, telegram_id)
-            except ValueError as exc:
-                await event.answer(str(exc), alert=True)
-                return
-            await event.answer("طرح حذف شد." if changed else "این طرح پیدا نشد.")
-            await self._show_admin_plans(event)
-            return
-        if data == "admin:audit":
-            await self._show_admin_audit(event)
-            return
-        if data == "admin:credentials" or data.startswith("admin:credentials:"):
-            parts = data.split(":")
-            await self._show_provider_credentials(event, parts[2] if len(parts) > 2 else None)
-            return
-        if data.startswith("admin:stt"):
-            await handle_stt_callback(self, event, data)
-            return
-        if data.startswith("admin:ai"):
-            await handle_ai_callback(self, event, data)
-            return
-        if data == "admin:health":
-            await self._show_provider_health(event)
-            return
-        if data == "admin:health:refresh":
-            await event.answer("در حال بررسی سرویس‌ها…")
-            await self._show_provider_health(event, force=True)
-            return
-        if data.startswith("admin:health:test:"):
-            try:
-                credential_id = int(data.rsplit(":", 1)[-1])
-            except ValueError:
-                await event.answer("شناسهٔ کلید معتبر نیست.", alert=True)
-                return
-            await event.answer("در حال تست کلید…")
-            await self._test_credential_health(event, credential_id, telegram_id)
-            return
-        if data.startswith("admin:credit:add:"):
-            try:
-                target_id = int(data.rsplit(":", 1)[-1])
-            except ValueError:
-                await event.answer("شناسهٔ کاربر معتبر نیست.", alert=True)
-                return
-            self._pending_admin_actions[telegram_id] = f"credit_add:{target_id}"
-            await self._edit_callback(
-                event,
-                "مقدار اعتبار را به‌صورت «ثانیه | دلیل» بفرستید؛ مثال:\n"
-                "`3600 | جبران قطعی سرویس`\n"
-                "اعتبار فقط با دلیل ثبت می‌شود و در گزارش مدیر می‌آید.\n"
-                "برای انصراف دکمهٔ زیر را بزنید.",
-                [[Button.inline("لغو", b"admin:home")]],
-            )
-            return
-        if data.startswith("admin:credits:"):
-            try:
-                target_id = int(data.rsplit(":", 1)[-1])
-            except ValueError:
-                await event.answer("شناسهٔ کاربر معتبر نیست.", alert=True)
-                return
-            await self._show_user_credit(event, target_id)
-            return
-        if data.startswith("admin:credential:add:"):
-            service = data.rsplit(":", 1)[-1]
-            if service not in PROVIDER_CHOICES:
-                await event.answer("سرویس معتبر نیست.", alert=True)
-                return
-            await self._begin_credential_add(event, telegram_id, service)
-            return
-        if data.startswith("admin:credential:"):
-            parts = data.split(":")
-            if len(parts) != 4 or parts[2] not in {"enable", "disable", "delete", "up", "down"}:
-                await event.answer("عملیات کلید معتبر نیست.", alert=True)
-                return
-            try:
-                credential_id = int(parts[3])
-            except ValueError:
-                await event.answer("شناسهٔ کلید معتبر نیست.", alert=True)
-                return
-            if parts[2] == "enable":
-                changed = await self.credential_manager.enable(credential_id, telegram_id)
-            elif parts[2] == "disable":
-                changed = await self.credential_manager.disable(credential_id, telegram_id)
-            elif parts[2] in {"up", "down"}:
-                changed = await self.credential_manager.reorder(
-                    credential_id, parts[2], telegram_id
-                )
-            else:
-                changed = await self.credential_manager.delete(credential_id, telegram_id)
-            if changed:
-                self.provider_health.invalidate()
-            await self._edit_callback(
-                event,
-                "تغییر ذخیره شد." if changed else "کلید پیدا نشد یا تغییر نکرد.",
-                [[Button.inline("بازگشت به کلیدها", b"admin:credentials")]],
-            )
-            return
-        if data == "admin:home":
-            self._pending_admin_actions.pop(telegram_id, None)
+        elif data == "menu:main":
+            await self._ack(event)
+            await self._show_main(event)
+        elif data == "account":
+            await self._ack(event)
+            await self._show_account(event)
+        elif data.startswith("plan:"):
+            await self._ack(event)
+            await self._start_payment(event, data.split(":", 1)[1])
+        elif data.startswith("payr:"):
+            # user reports having paid -> upload receipt
+            await self._ack(event)
+            await self._await_receipt(event, int(data.split(":", 1)[1]))
+        elif data.startswith("payv:"):
+            await self._review_payment(event, data)
+        elif data == "adm:home":
+            await self._ack(event)
             await self._show_admin_overview(event)
-            return
-        if data.startswith("admin:sec:"):
-            section = data.rsplit(":", 1)[-1]
-            if section not in ADMIN_SECTION_MENUS:
-                await self._ack(event, "این بخش وجود ندارد.", alert=True)
-                return
-            self._pending_admin_actions.pop(telegram_id, None)
-            title = next(
-                (label for label, _data, name in ADMIN_SECTIONS if name == section), "پنل مدیریت"
+        elif data == "adm:users":
+            await self._ack(event)
+            await self._show_admin_users(event)
+        elif data == "adm:pay":
+            await self._ack(event)
+            await self._show_admin_payments(event)
+        elif data == "adm:bcast":
+            await self._ack(event)
+            self._pending_broadcast.add(user_id)
+            await event.respond(
+                "📣 متن پیام همگانی را بفرستید. برای لغو، /cancel بفرستید."
             )
-            await self._edit_callback(event, f"{title} ⚙️", admin_section_menu(section))
-            return
-        if data == "admin:stats":
-            stats = await self.db.stats()
-            text = self._stats_text(stats)
-            await self._edit_callback(
-                event, text, [[Button.inline("↩️ پنل مدیریت", b"admin:home")]]
-            )
-            return
-        if data == "admin:users" or data.startswith("admin:users:"):
-            parts = data.split(":")
-            await self._show_admin_users(event, parts[2] if len(parts) > 2 else None)
-            return
-        action_prompts = {
-            "admin:broadcast": ("broadcast", "پیامی را که می‌خواهید برای همه برود بفرستید."),
-            "admin:ban": ("ban", "شناسهٔ عددی کاربر را بفرستید."),
-            "admin:unban": ("unban", "شناسهٔ عددی کاربر را بفرستید."),
-            "admin:credits": (
-                "credits_lookup",
-                "شناسهٔ عددی کاربر را بفرستید تا اعتبار، طرح‌های فعال و سابقهٔ مصرفش را ببینید.",
-            ),
-        }
-        if data in action_prompts:
-            action, prompt = action_prompts[data]
-            self._pending_admin_actions[telegram_id] = action
-            await self._edit_callback(
-                event,
-                prompt + "\n\nبرای انصراف دکمهٔ زیر را بزنید.",
-                [[Button.inline("لغو", b"admin:home")]],
-            )
-            return
-        await event.answer("این دکمه معتبر نیست.", alert=True)
-
-    async def _handle_pending_admin_input(
-        self, event, telegram_id: int, action: str, text: str
-    ) -> None:
-        if action == "aikey_label":
-            await self.ai_panels.handle_wizard_label(event, text)
-            return
-
-        if action.startswith("stt_budget:"):
-            provider = action.split(":", 1)[1]
-            await self.stt_panels.handle_budget_input(event, provider, text)
-            return
-
-        if action.startswith("aiprovider_meta:"):
-            from .ai.registry import (
-                ProviderClass,
-                region_service_scope_free_allowed,
-                registry_info,
-            )
-
-            slug = action.split(":", 1)[1]
-            if slug not in {"alibaba"} or registry_info(slug).classification is not ProviderClass.REGION_RESTRICTED:
-                self._pending_admin_actions.pop(telegram_id, None)
-                await event.reply("ارائه‌دهندهٔ منطقه‌ای نامعتبر است.", buttons=admin_menu())
-                return
-            parts = [part.strip() for part in text.split("|")]
-            if len(parts) != 4 or any(not part for part in parts):
-                await event.reply(
-                    "قالب درست: region | service_scope | production | quota_expiry_UTC — هر چهار بخش الزامی‌اند."
-                )
-                return
-            region, service_scope, deployment, expiry_text = parts
-            region = region.casefold()
-            service_scope = service_scope.casefold().replace("-", "_").replace(" ", "_")
-            if (
-                not re.fullmatch(r"[a-z0-9_-]{2,80}", region)
-                or deployment.casefold() not in {"production", "prod", "live"}
-            ):
-                await event.reply(
-                    "این ثبت فقط برای استقرار production و کد منطقهٔ معتبر است؛ دوباره بفرستید."
-                )
-                return
-            if not region_service_scope_free_allowed(slug, region, service_scope):
-                await event.reply(
-                    "FREE_ONLY برای Alibaba فقط با cn-beijing + china_mainland یا "
-                    "ap-southeast-1 + international قابل بررسی است."
-                )
-                return
-            try:
-                expiry = datetime.fromisoformat(expiry_text.replace("Z", "+00:00"))
-                if expiry.tzinfo is None or expiry.astimezone(timezone.utc) <= datetime.now(timezone.utc):
-                    raise ValueError("expiry must be a future timezone-aware timestamp")
-            except (TypeError, ValueError, OverflowError):
-                await event.reply("انقضا باید تاریخ/زمان آینده با منطقهٔ زمانی داشته باشد؛ نمونه: 2026-12-31T00:00:00Z")
-                return
-            expiry_utc = expiry.astimezone(timezone.utc).replace(microsecond=0).isoformat()
-            await self.db.ai_provider_settings_upsert(
-                slug,
-                admin_id=telegram_id,
-                region=region,
-                deployment_scope="production",
-                service_deployment_scope=service_scope,
-                quota_expires_at=expiry_utc,
-            )
-            self._pending_admin_actions.pop(telegram_id, None)
-            self.provider_router.invalidate_cache()
-            await self.db.add_audit_entry(
-                admin_id=telegram_id,
-                action="ai_provider_region_quota_metadata_updated",
-                target_type="ai_provider",
-                target_id=slug,
-                details={
-                    "region": region,
-                    "deployment_scope": "production",
-                    "service_deployment_scope": service_scope,
-                    "quota_expires_at": expiry_utc,
-                },
-            )
-            await event.reply(
-                "اطلاعات منطقه/محدودهٔ سرویس و پایان سهمیه ثبت شد. برای جلوگیری از هزینه، "
-                "مدل را در Alibaba Free Quota Only کنید، Base URL کلید را با منطقه هماهنگ سازید، "
-                "و سپس استحقاق حساب و no-overage را تأیید کنید.",
-                buttons=[[Button.inline("جزئیات ارائه‌دهنده", f"admin:ai:pv:{slug}".encode("ascii"))]],
-            )
-            return
-
-        if action.startswith("aikey_replace:"):
-            # Spec §34: replace secret without ever exposing old or new key.
-            # Message is deleted BEFORE persistence; if deletion fails, abort.
-            try:
-                key_id = int(action.split(":", 1)[1])
-            except ValueError:
-                self._pending_admin_actions.pop(telegram_id, None)
-                await event.reply("شناسهٔ کلید نامعتبر.", buttons=admin_menu())
-                return
-            new_secret = text.strip()
-            if not new_secret:
-                self._pending_admin_actions.pop(telegram_id, None)
-                await event.reply("کلید خالی پذیرفته نمی‌شود.", buttons=admin_menu())
-                return
-            try:
-                delete_message = getattr(event.message, "delete", None)
-                if not callable(delete_message):
-                    raise RuntimeError("message deletion unavailable")
-                await delete_message()
-            except Exception:
-                self._pending_admin_actions.pop(telegram_id, None)
-                await event.respond(
-                    "پیام کلید حذف نشد؛ کلید تغییر نکرد. آن را دستی پاک کنید و دوباره تلاش نمایید.",
-                    buttons=admin_menu(),
-                )
-                return
-            self._pending_admin_actions.pop(telegram_id, None)
-            try:
-                changed = await self.credential_manager.replace_secret(
-                    key_id, new_secret=new_secret, admin_id=telegram_id
-                )
-            except CredentialStoreError as exc:
-                await event.respond(str(exc), buttons=admin_menu())
-                return
-            finally:
-                new_secret = ""
-            if changed:
-                self.provider_health.invalidate()
-                await event.respond(
-                    f"کلید #{key_id} با موفقیت تعویض و رمزنگاری شد (فقط ۴ رقم پایانی نمایش داده می‌شود).",
-                    buttons=admin_menu(),
-                )
-            else:
-                await event.respond("کلید پیدا نشد یا تغییر نکرد.", buttons=admin_menu())
-            return
-
-        if action.startswith("aikey_edit:"):
-            # Spec §34: edit label / model / base_url.
-            self._pending_admin_actions.pop(telegram_id, None)
-            parts = action.split(":")
-            field_name = parts[1] if len(parts) > 1 else ""
-            try:
-                key_id = int(parts[2]) if len(parts) > 2 else -1
-            except ValueError:
-                await event.reply("شناسهٔ کلید نامعتبر.", buttons=admin_menu())
-                return
-            val = text.strip()
-            val_clean = None if val in {"-", "—", ""} else val
-            try:
-                if field_name == "label":
-                    changed = await self.credential_manager.update_metadata(
-                        key_id, label=val, admin_id=telegram_id
-                    )
-                elif field_name == "model":
-                    changed = await self.credential_manager.update_metadata(
-                        key_id, model=val_clean, admin_id=telegram_id
-                    )
-                elif field_name == "base":
-                    changed = await self.credential_manager.update_metadata(
-                        key_id, base_url=val_clean, admin_id=telegram_id
-                    )
-                else:
-                    changed = False
-            except CredentialStoreError as exc:
-                await event.reply(str(exc), buttons=admin_menu())
-                return
-            if changed:
-                self.provider_health.invalidate()
-                await event.reply(
-                    f"مشخصات کلید #{key_id} به‌روزرسانی شد.", buttons=admin_menu()
-                )
-            else:
-                await event.reply("کلید پیدا نشد یا تغییر نکرد.", buttons=admin_menu())
-            return
-        if action == "credits_lookup":
-            target_id = _parse_user_id(text.strip())
-            self._pending_admin_actions.pop(telegram_id, None)
-            if target_id is None:
-                await event.reply("شناسهٔ عددی معتبر نیست.", buttons=admin_menu())
-                return
-            overview = await self.db.admin_user_credit_overview(target_id)
-            if overview is None:
-                await event.reply("این شناسه در پایگاه‌داده پیدا نشد.", buttons=admin_menu())
-                return
-            await event.reply(
-                self._admin_credit_text(overview),
-                buttons=[
-                    [Button.inline("➕ افزودن اعتبار دستی", f"admin:credit:add:{target_id}")],
-                    [Button.inline("🔄 به‌روزرسانی", f"admin:credits:{target_id}")],
-                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
-                ],
-            )
-            return
-
-        if action.startswith("credit_add:"):
-            self._pending_admin_actions.pop(telegram_id, None)
-            try:
-                target_id = int(action.split(":", 1)[1])
-            except (ValueError, IndexError):
-                await event.reply("درخواست افزودن اعتبار معتبر نیست.", buttons=admin_menu())
-                return
-            parts = [part.strip() for part in text.split("|", 1)]
-            seconds = _parse_user_id(parts[0]) if parts and parts[0] else None
-            reason = parts[1][:500] if len(parts) > 1 else ""
-            if not seconds or not reason:
-                await event.reply(
-                    "قالب درست: «ثانیه | دلیل» — مثال: 3600 | جبران قطعی سرویس",
-                    buttons=admin_menu(),
-                )
-                return
-            if target_id in self.settings.admin_ids:
-                await event.reply(
-                    "برای ایمنی، اعتبار مدیریتی به مدیر دیگری افزوده نمی‌شود.",
-                    buttons=admin_menu(),
-                )
-                return
-            try:
-                credit = await self.db.add_admin_credit(target_id, seconds, telegram_id, reason)
-            except ValueError as exc:
-                await event.reply(str(exc), buttons=admin_menu())
-                return
-            if credit is None:
-                await event.reply("این کاربر در پایگاه‌داده پیدا نشد.", buttons=admin_menu())
-                return
-            await event.reply(
-                f"{format_duration(credit['seconds'])} اعتبار به کاربر {target_id} افزوده شد "
-                "و در گزارش مدیر ثبت شد.",
-                buttons=[
-                    [Button.inline("🔄 وضعیت کاربر", f"admin:credits:{target_id}")],
-                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
-                ],
-            )
-            return
-
-        if action == "special_add":
-            self._pending_admin_actions.pop(telegram_id, None)
-            parts = [part.strip() for part in text.split("|", 1)]
-            target_id = _parse_user_id(parts[0]) if parts and parts[0] else None
-            reason = parts[1][:500] if len(parts) > 1 else ""
-            if target_id is None or not reason:
-                await event.reply(
-                    "قالب درست: «شناسه | دلیل» — مثال: 123456789 | همکار پشتیبانی",
-                    buttons=admin_menu(),
-                )
-                return
-            try:
-                result = await self.db.set_user_unlimited(
-                    target_id, True, telegram_id, reason
-                )
-            except ValueError as exc:
-                await event.reply(str(exc), buttons=admin_menu())
-                return
-            if result is None:
-                await event.reply(
-                    "این شناسه در فهرست کاربران ربات پیدا نشد.", buttons=admin_menu()
-                )
-                return
-            summary = (
-                f"کاربر {target_id} به فهرست کاربران ویژه اضافه شد و از این پس "
-                "بدون کسر اعتبار از ربات استفاده می‌کند."
-                if result["changed"]
-                else f"کاربر {target_id} از قبل کاربر ویژه بود؛ تغییری لازم نبود."
-            )
-            await event.reply(
-                summary,
-                buttons=[
-                    [Button.inline("⭐ فهرست کاربران ویژه", b"admin:special")],
-                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
-                ],
-            )
-            return
-
-        if action == "plan_new":
-            self._pending_admin_actions.pop(telegram_id, None)
-            parts = [part.strip() for part in text.split("|")]
-            if len(parts) != 5:
-                await event.reply(
-                    "قالب درست: «کد | نام | ساعت | قیمت | روز اعتبار» — پنج بخش با | جدا شود.",
-                    buttons=admin_menu(),
-                )
-                return
-            code, name, hours_raw, price_raw, days_raw = parts
-            hours = _plan_number(hours_raw)
-            price = _plan_number(price_raw)
-            days = _plan_number(days_raw)
-            if not hours or not price or days is None:
-                await event.reply(
-                    "ساعت، قیمت و روز اعتبار باید عدد باشند (برای بدون انقضا: 0).",
-                    buttons=admin_menu(),
-                )
-                return
-            try:
-                plan = await self.db.create_plan(
-                    code=code,
-                    name=name,
-                    hours=hours,
-                    price_toman=price,
-                    validity_days=None if days == 0 else days,
-                    admin_id=telegram_id,
-                )
-            except ValueError as exc:
-                await event.reply(str(exc), buttons=admin_menu())
-                return
-            await event.reply(
-                f"طرح «{plan['name']}» با کد {plan['code']} ساخته شد و از همین حالا "
-                f"برای خریداران نمایش داده می‌شود ({format_toman(plan['price_toman'])}، "
-                f"{format_validity(plan['validity_days'])}).",
-                buttons=[
-                    [Button.inline("🧾 فهرست طرح‌ها", b"admin:plans")],
-                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
-                ],
-            )
-            return
-
-        if action.startswith("plan_edit:"):
-            self._pending_admin_actions.pop(telegram_id, None)
-            try:
-                plan_id = int(action.split(":", 1)[1])
-            except (ValueError, IndexError):
-                await event.reply("درخواست ویرایش طرح معتبر نیست.", buttons=admin_menu())
-                return
-            parts = [part.strip() for part in text.split("|")]
-            if len(parts) != 4:
-                await event.reply(
-                    "قالب درست: «قیمت | ساعت | روز اعتبار | نام» — چهار بخش با | جدا شود.",
-                    buttons=admin_menu(),
-                )
-                return
-            changes: dict[str, Any] = {}
-            price_raw, hours_raw, days_raw, name_raw = parts
-            if (price_value := _plan_field(price_raw)) is not None:
-                price = _plan_number(price_value)
-                if not price:
-                    await event.reply("قیمت باید عددی بزرگ‌تر از صفر باشد.", buttons=admin_menu())
-                    return
-                changes["price_toman"] = price
-            if (hours_value := _plan_field(hours_raw)) is not None:
-                hours = _plan_number(hours_value)
-                if not hours or hours > MAX_PLAN_HOURS:
-                    await event.reply(
-                        f"ساعت باید عددی بین ۱ و {MAX_PLAN_HOURS} باشد.", buttons=admin_menu()
-                    )
-                    return
-                changes["hours"] = hours
-            if (days_value := _plan_field(days_raw)) is not None:
-                days = _plan_number(days_value)
-                if days is None or (days and days > MAX_PLAN_VALIDITY_DAYS):
-                    await event.reply(
-                        "روز اعتبار باید عددی بین ۱ و "
-                        f"{MAX_PLAN_VALIDITY_DAYS} باشد یا 0 برای بدون انقضا.",
-                        buttons=admin_menu(),
-                    )
-                    return
-                changes["validity_days"] = None if days == 0 else days
-            if (name_value := _plan_field(name_raw)) is not None:
-                changes["name"] = name_value
-            if not changes:
-                await event.reply(
-                    "هیچ فیلدی برای تغییر مشخص نشده است؛ برای هر فیلد یا مقدار جدید "
-                    "یا `-` بفرستید.",
-                    buttons=admin_menu(),
-                )
-                return
-            try:
-                plan = await self.db.update_plan(plan_id, changes, telegram_id)
-            except ValueError as exc:
-                await event.reply(str(exc), buttons=admin_menu())
-                return
-            if plan is None:
-                await event.reply("این طرح پیدا نشد.", buttons=admin_menu())
-                return
-            await event.reply(
-                f"طرح {plan['code']} به‌روزرسانی شد: {plan['name']} — "
-                f"{format_duration(plan['included_seconds'])} — "
-                f"{format_toman(plan['price_toman'])} — "
-                f"{format_validity(plan['validity_days'])}. "
-                "این طرح دیگر با تنظیمات .env بازنویسی نمی‌شود.",
-                buttons=[
-                    [Button.inline("🧾 فهرست طرح‌ها", b"admin:plans")],
-                    [Button.inline("↩️ پنل مدیریت", b"admin:home")],
-                ],
-            )
-            return
-
-        if action.startswith("payment_reject:"):
-            reason = clean_human_text(text) or ""
-            if not reason:
-                await event.reply("دلیل رد نمی‌تواند خالی باشد؛ دوباره بفرستید.")
-                return
-            try:
-                payment_id = int(action.split(":", 1)[1])
-                changed = await self.db.reject_payment(payment_id, telegram_id, reason)
-            except (ValueError, TypeError):
-                changed = False
-                payment_id = -1
-            self._pending_admin_actions.pop(telegram_id, None)
-            if not changed:
-                await event.reply("این درخواست پیدا نشد یا قبلاً بررسی شده است.", buttons=admin_menu())
-                return
-            detail = await self.db.payment_detail(payment_id)
-            if detail:
-                try:
-                    await self.client.send_message(
-                        int(detail["telegram_id"]),
-                        f"رسید درخواست پرداخت {payment_id} تأیید نشد؛ هیچ اعتباری افزوده نشده است. "
-                        f"دلیل: {reason}",
-                        parse_mode=None,
-                    )
-                except Exception:
-                    logger.warning("Payment rejection notification failed payment_id=%s", payment_id)
-            await self._cleanup_expired_receipts()
-            await event.reply("رسید رد شد؛ اعتبار افزوده نشد و رویداد ثبت شد.", buttons=admin_menu())
-            return
-
-        if action.startswith("credential_meta:"):
-            service = action.split(":", 1)[1]
-            parts = [part.strip() for part in text.split("|")]
-            if len(parts) < 2 or len(parts) > 4 or not parts[0] or not parts[1]:
-                await event.reply("قالب نادرست است؛ provider | label | base_url اختیاری | model اختیاری را بفرستید.")
-                return
-            provider = parts[0].lower()
-            if service not in PROVIDER_CHOICES or provider not in PROVIDER_CHOICES[service]:
-                await event.reply("provider برای این سرویس پشتیبانی نمی‌شود؛ metadata را دوباره بفرستید.")
-                return
-            base_url = parts[2] if len(parts) >= 3 and parts[2] not in {"-", "—"} else None
-            model = parts[3] if len(parts) >= 4 and parts[3] not in {"-", "—"} else None
-            self._pending_credential_setup[telegram_id] = {
-                "service": service,
-                "provider": provider,
-                "label": parts[1],
-                "base_url": base_url,
-                "model": model,
-            }
-            self._pending_admin_actions[telegram_id] = "credential_secret"
-            await event.reply(
-                "حالا کلید API را به‌تنهایی بفرستید. پیام آن پیش از ذخیره حذف می‌شود؛ "
-                "اگر حذف پیام ممکن نباشد، کلید ذخیره نخواهد شد."
-            )
-            return
-
-        if action == "credential_secret":
-            secret = text.strip()
-            metadata = self._pending_credential_setup.get(telegram_id)
-            if not metadata or not secret:
-                await event.reply("تنظیم کلید ناقص است؛ دوباره از پنل کلیدها شروع کنید.")
-                self._pending_admin_actions.pop(telegram_id, None)
-                self._pending_credential_setup.pop(telegram_id, None)
-                return
-            try:
-                delete_message = getattr(event.message, "delete", None)
-                if not callable(delete_message):
-                    raise RuntimeError("message deletion unavailable")
-                await delete_message()
-            except Exception:
-                self._pending_admin_actions.pop(telegram_id, None)
-                self._pending_credential_setup.pop(telegram_id, None)
-                await event.respond(
-                    "پیام کلید حذف نشد؛ کلید ذخیره نشد. آن را دستی از گفت‌وگو پاک و دوباره تلاش کنید.",
-                    buttons=admin_menu(),
-                )
-                return
-            self._pending_admin_actions.pop(telegram_id, None)
-            self._pending_credential_setup.pop(telegram_id, None)
-            try:
-                credential_id = await self.credential_manager.add_credential(
-                    service=str(metadata["service"]),
-                    provider=str(metadata["provider"]),
-                    label=str(metadata["label"]),
-                    secret=secret,
-                    admin_id=telegram_id,
-                    base_url=metadata.get("base_url"),
-                    model=metadata.get("model"),
-                    enabled=bool(metadata.get("enabled", True)),
-                    free_only=metadata.get("free_only"),
-                    paid_allowed=metadata.get("paid_allowed"),
-                )
-            except CredentialStoreError as exc:
-                await event.respond(str(exc), buttons=admin_menu())
-            except Exception as exc:
-                logger.warning(
-                    "Provider credential save failed service=%s provider=%s error_type=%s",
-                    metadata.get("service"), metadata.get("provider"), type(exc).__name__,
-                )
-                await event.respond("ذخیرهٔ امن کلید انجام نشد؛ تنظیمات و نام برچسب را بررسی کنید.", buttons=admin_menu())
-            else:
-                # A new key changes the pool; never show stale cached health.
-                self.provider_health.invalidate()
-                if metadata.get("via_wizard"):
-                    # Spec §33 steps 7-9: non-destructive credential test,
-                    # capability/quota report card, and an activation choice.
-                    await self.ai_panels.wizard_finish_report(
-                        event,
-                        credential_id=credential_id,
-                        slug=str(metadata["provider"]),
-                        label=str(metadata["label"]),
-                        model=metadata.get("model"),
-                    )
-                else:
-                    await event.respond(
-                        f"کلید #{credential_id} با رمزگذاری ذخیره شد؛ فقط چهار رقم پایانی در پنل نمایش داده می‌شود.",
-                        buttons=admin_menu(),
-                    )
-            finally:
-                secret = ""
-            return
-
-        if action == "broadcast":
-            if not text:
-                await event.reply("پیام خالی است؛ لطفاً متن را دوباره بفرستید.")
-                return
-            self._pending_admin_actions.pop(telegram_id, None)
-            status = await event.reply("دارم پیام را برای کاربران می‌فرستم…")
-            sent = await self._broadcast(telegram_id, text)
-            result = f"انجام شد؛ پیام به {sent} کاربر رسید."
-            if status is not None and callable(getattr(status, "edit", None)):
-                await status.edit(result, buttons=admin_menu())
-            else:
-                await event.respond(result, buttons=admin_menu())
-            return
-
-        target_id = _parse_user_id(text)
-        if target_id is None:
-            await event.reply("شناسه باید عددی باشد؛ لطفاً دوباره بفرستید.")
-            return
-        if target_id in self.settings.admin_ids:
-            await event.reply("نمی‌توانید دسترسی مدیر ربات را تغییر دهید.")
-            return
-        self._pending_admin_actions.pop(telegram_id, None)
-        changed = await self.db.set_banned(
-            target_id, action == "ban", admin_id=telegram_id
-        )
-        if not changed:
-            result = "این شناسه در فهرست کاربران ربات پیدا نشد."
+        elif data == "adm:audit":
+            await self._ack(event)
+            await self._show_admin_audit(event)
         else:
-            result = "کاربر مسدود شد." if action == "ban" else "مسدودیت کاربر برداشته شد."
-        await event.reply(result, buttons=admin_menu())
+            await self._ack(event)
 
+    # -------------------------------------------------------------- messages
     async def _handle_message(self, event) -> None:
-        sender = await event.get_sender()
-        if not sender or getattr(sender, "bot", False):
+        if event.message is None or not event.is_private:
             return
-        telegram_id = int(sender.id)
-        user = await self.db.upsert_user(telegram_id, getattr(sender, "username", None))
-        is_admin = telegram_id in self.settings.admin_ids
-        text = (event.raw_text or "").strip()
-        command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else ""
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        await self.db.ensure_user(user_id)
+        text = (event.message.message or "").strip()
 
-        if user["is_banned"] and not is_admin:
-            await event.reply("دسترسی شما به ربات محدود شده است.")
-            return
-        pending_action = (
-            self._pending_admin_actions.get(telegram_id)
-            if getattr(event, "is_private", True) else None
-        )
-        if is_admin and pending_action and (
-            pending_action.startswith("credential_")
-            or pending_action.startswith("credential_meta:")
-            or pending_action.startswith("payment_reject:")
-            or pending_action.startswith("aikey_")
-            or pending_action.startswith("aiprovider_meta:")
-            or pending_action.startswith("stt_")
-        ):
-            if command == "/cancel":
-                self._pending_admin_actions.pop(telegram_id, None)
-                self._pending_credential_setup.pop(telegram_id, None)
-                await event.reply("عملیات لغو شد.", buttons=admin_menu())
+        # Admin conversational states.
+        if self._is_admin(user_id) and user_id in self._pending_broadcast:
+            if text.lower() == "/cancel":
+                self._pending_broadcast.discard(user_id)
+                await event.reply("پیام همگانی لغو شد.")
                 return
-            if getattr(event.message, "media", None) is not None:
-                self._pending_admin_actions.pop(telegram_id, None)
-                self._pending_credential_setup.pop(telegram_id, None)
-                await event.reply("ورودی رسانه‌ای پذیرفته نشد؛ عملیات مدیریتی لغو شد.")
-            elif text and not command:
-                await self._handle_pending_admin_input(
-                    event, telegram_id, pending_action, text
-                )
-                return
-            elif command:
-                # Never mistake a bot command for a provider key or rejection
-                # reason. Drop the pending prompt before handling the command.
-                self._pending_admin_actions.pop(telegram_id, None)
-                self._pending_credential_setup.pop(telegram_id, None)
-        if command == "/start":
-            self._pending_admin_actions.pop(telegram_id, None)
-            self._pending_credential_setup.pop(telegram_id, None)
-            await event.reply(WELCOME_TEXT, buttons=main_menu(is_admin))
+            self._pending_broadcast.discard(user_id)
+            await self._broadcast(event, text)
             return
-        if command in {"/help", "/cancel"}:
-            self._pending_admin_actions.pop(telegram_id, None)
-            self._pending_credential_setup.pop(telegram_id, None)
-            await event.reply(HELP_TEXT, buttons=back_menu(is_admin))
-            return
-        if command in {"/balance", "/buy", "/history", "/cancelpayment"}:
-            if not getattr(event, "is_private", True):
-                await event.reply("موجودی و پرداخت را فقط در گفت‌وگوی خصوصی ربات بررسی کنید.")
-                return
-            if command == "/balance":
-                await event.reply(await self._billing_balance_text(int(user["id"])), buttons=main_menu(is_admin))
-            elif command == "/buy":
-                plan_text, plan_buttons = await self._billing_plans()
-                await event.reply(plan_text, buttons=plan_buttons)
-            elif command == "/history":
-                history = await self.db.payment_history(int(user["id"]))
-                total_payments = await self.db.payment_count(int(user["id"]))
-                statuses = {
-                    "awaiting_receipt": "منتظر رسید",
-                    "pending": "منتظر بررسی دستی",
-                    "approved": "تأیید شد",
-                    "rejected": "رد شد",
-                    "cancelled": "لغو شد",
-                }
-                heading = "سوابق پرداخت:"
-                if len(history) < total_payments:
-                    # The window is real paging by design; the reader must be
-                    # able to see that older rows exist behind it.
-                    heading += (
-                        f" ({to_persian_digits(len(history))} پرداخت اخیر از "
-                        f"{to_persian_digits(total_payments)} پرداخت)"
-                    )
-                lines = [heading]
-                lines.extend(
-                    f"• #{item['id']} {item['plan_name']} — {format_toman(item['amount_toman'])} — "
-                    f"{statuses.get(item['status'], item['status'])}"
-                    for item in history
-                )
-                await event.reply("\n".join(lines) if history else "سابقهٔ پرداختی ندارید.", buttons=main_menu(is_admin))
-            else:
-                payment = await self.db.get_awaiting_payment(int(user["id"]))
-                cancelled = bool(payment and await self.db.cancel_payment_intent(int(payment["id"]), int(user["id"])))
-                await event.reply(
-                    "درخواستِ منتظر رسید لغو شد." if cancelled else "درخواستِ منتظر رسیدی برای لغو ندارید.",
-                    buttons=main_menu(is_admin),
-                )
-            return
-        if command in {
-            "/users", "/stats", "/broadcast", "/ban", "/unban", "/payments", "/credit",
-            "/audit", "/unlimited",
-        }:
-            if not is_admin:
-                await event.reply("این دستور فقط برای مدیر ربات فعال است.")
-                return
-            if not getattr(event, "is_private", True):
-                await event.reply("دستورهای مدیریت فقط در گفت‌وگوی خصوصی ربات قابل استفاده‌اند.")
-                return
-            self._pending_admin_actions.pop(telegram_id, None)
-            await self._handle_admin_command(event, command, text)
-            return
-        pending_action = (
-            self._pending_admin_actions.get(telegram_id)
-            if getattr(event, "is_private", True) else None
-        )
-        # A captioned upload is a file, not an answer to the admin prompt: the
-        # caption must never be broadcast (or read as a user id) while the file
-        # itself is silently dropped.
-        if is_admin and pending_action and getattr(event.message, "media", None) is not None:
-            self._pending_admin_actions.pop(telegram_id, None)
-            pending_action = None
-        if is_admin and pending_action and text and not command:
-            await self._handle_pending_admin_input(
-                event, telegram_id, pending_action, text
-            )
+        if self._is_admin(user_id) and text.startswith("/grant"):
+            await self._admin_grant(event, text)
             return
 
-        if getattr(event, "is_private", True) and (
-            getattr(event.message, "photo", None) is not None
-            or getattr(event.message, "document", None) is not None
-        ):
-            # Payment state is read from SQLite, never from in-memory state, so a
-            # restart cannot turn a receipt into a transcription job.
-            awaiting = await self.db.get_awaiting_payment(int(user["id"]))
-            if awaiting:
-                if await self._handle_receipt_upload(event, user, awaiting):
-                    return
-            elif _is_receipt_image(event.message):
-                pending = await self.db.current_payment_request(int(user["id"]))
-                if pending and pending["status"] == "pending":
-                    await event.reply(
-                        f"رسید درخواست پرداخت #{pending['id']} پیش‌تر ثبت شده و در انتظار "
-                        "بررسی دستی مدیر است؛ تا آن زمان اعتباری افزوده نمی‌شود. "
-                        "اگر می‌خواهید رسید دیگری بفرستید، ابتدا درخواست را لغو کنید.",
-                        buttons=main_menu(is_admin),
-                    )
-                    return
-
-        media_kind, filename, mime_type, duration, file_id = _media_metadata(event.message)
-        if media_kind:
-            await self._accept_media(
-                event, user, media_kind, filename, mime_type, duration, file_id
-            )
+        # Payment receipt pending for this user?
+        if user_id in self._pending_payments and _is_receipt_image(event.message):
+            await self._handle_receipt_upload(event, user_id)
             return
 
-        deck_kind, deck_name, deck_mime, deck_file_id = _presentation_metadata(event.message)
-        if deck_kind:
-            await self._accept_presentation(
-                event, user, deck_kind, deck_name, deck_mime, deck_file_id
-            )
+        if text.startswith("/start"):
+            await self._show_main(event, first_start=True)
+            return
+        if text.startswith("/cancel"):
+            self._pending_payments.pop(user_id, None)
+            await event.reply("لغو شد.")
+            return
+
+        # Presentations.
+        pkind, pfilename = _presentation_metadata(event.message)
+        if pkind is not None:
+            await self._accept_presentation(event, user_id, pkind, pfilename)
+            return
+
+        # Media.
+        kind, filename, mime, duration = _media_metadata(event.message)
+        if kind is not None:
+            await self._accept_media(event, user_id, kind, filename, duration)
             return
 
         if _is_unsupported_attachment(event.message):
-            await event.reply(UNSUPPORTED_FILE_MESSAGE, buttons=main_menu(is_admin))
-
-    async def _billable_media_seconds(
-        self, path: Path, duration_hint: float | None = None
-    ) -> int:
-        duration = None
-        try:
-            info = await probe_media(path, self.settings)
-            duration = info.duration if info is not None else None
-        except MediaToolError:
-            duration = None
-        if duration is None:
-            duration = duration_hint
-        try:
-            duration_value = float(duration)
-        except (TypeError, ValueError, OverflowError):
-            duration_value = 0.0
-        if not math.isfinite(duration_value) or duration_value <= 0:
-            raise ValueError(
-                "مدت واقعی صوت برای محاسبهٔ اعتبار مشخص نشد؛ فایل بدون کسر اعتبار متوقف شد."
-            )
-        return max(1, math.ceil(duration_value))
-
-    async def _reserve_submission_usage(
-        self,
-        submission_id: int,
-        user_id: int | None,
-        audio_path: Path,
-        duration_hint: float | None,
-    ) -> int | None:
-        if user_id is None:
-            # Backwards-compatible direct worker invocation; production queue
-            # closures always pass the registered user id.
-            user_id = await self.db.submission_user_id(submission_id)
-        seconds = await self._billable_media_seconds(audio_path, duration_hint)
-        reservation = await self.db.reserve_usage(user_id, submission_id, seconds)
-        if not reservation.get("ok"):
-            raise InsufficientBalanceError(
-                int(reservation.get("available_seconds", 0)), seconds
-            )
-        if reservation.get("unlimited"):
-            # A special user is never billed: the database recorded the job for
-            # the audit trail, and there is nothing to finalize or refund.
-            logger.info(
-                "Unlimited submission accepted submission_id=%s seconds=%s",
-                submission_id,
-                seconds,
-            )
-            return None
-        return seconds
-
-    async def _release_submission_usage(self, submission_id: int, reason: str) -> bool:
-        try:
-            await self.db.release_usage(submission_id, reason)
-            return True
-        except Exception:
-            logger.exception("Could not release usage reservation submission_id=%s", submission_id)
-            return False
-
-    async def _accept_media(
-        self, event, user, kind: str, filename, mime_type, duration, file_id
-    ) -> None:
-        file_obj = event.message.file
-        size = getattr(file_obj, "size", None)
-        if size is not None and size > self.settings.max_file_size:
-            await event.reply("این فایل از سقف حجم ربات بزرگ‌تر است.")
-            logger.warning(
-                "Rejected oversized %s from user %s: %s bytes", kind, user["telegram_id"], size
+            await event.reply(
+                "⚠️ این نوع فایل را پشتیبانی نمی‌کنم. صدا، ویدیو یا پاورپوینت بفرستید."
             )
             return
-        submission_id = await self.db.create_submission(
-            user["id"], file_id, duration, filename, mime_type, source_type=kind
-        )
-        progress = await JobProgress.create(
-            event,
-            submission_id=submission_id,
-            stage="🎬 ویدیو رسید و در صف است" if kind == "video" else "🎧 فایل صوتی رسید و در صف است",
-            animate=self.settings.progress_animation,
-        )
-        job = QueuedJob(
-            submission_id=submission_id,
-            kind=kind,
-            run=lambda: self._process_submission(
-                event,
-                submission_id,
-                filename,
-                kind,
-                progress=progress,
-                is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
-                user_id=int(user["id"]),
-                duration_hint=duration,
-            ),
-            event=event,
-            progress=progress,
-            is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
-        )
-        if not self._enqueue(job):
-            await self._reject_job(
-                job,
-                "ربات هم‌اکنون چند کار دیگر را انجام می‌دهد و ظرفیت صف پر است؛ "
-                "چند دقیقه دیگر دوباره این فایل را بفرستید.",
+        if text:
+            await event.reply(
+                "برای ساخت جزوه، فایل صوتی/تصویری درس را بفرستید یا از منوی شروعه "
+                "دکمهٔ «📎 ساخت جزوه» را بزنید."
             )
+
+    # ---------------------------------------------------------------- intake
+    async def _accept_media(
+        self, event, user_id: int, kind: str, filename: str | None, duration: float | None
+    ) -> None:
+        available = await self.db.available_seconds(user_id)
+        needed = self._reserve_estimate(duration)
+        if duration is not None and available < needed:
+            await event.reply(
+                f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
+                f"مدت فایل: {format_duration(duration)} — اعتبار فعلی: {format_duration(available)}\n"
+                "از «💳 حساب و شارژ» می‌توانید اعتبار بگیرید."
+            )
+            return
+        submission_id = await self.db.create_submission(user_id, kind, filename)
+        progress = await JobProgress.create(event, submission_id=submission_id)
+        job = Job(
+            submission_id=submission_id,
+            user_id=user_id,
+            kind=kind,
+            filename=filename,
+            message=event.message,
+            is_admin=self._is_admin(user_id),
+            duration_hint=duration,
+            meta={"progress": progress},
+        )
+        try:
+            self.queue.submit(job)
+        except QueueFullError as exc:
+            await self.db.set_submission_status(submission_id, "rejected", error=str(exc))
+            await progress.fail(str(submission_id))
+            await event.reply(f"⏸ {exc}")
+            return
+        logger.info(
+            "accepted media submission=%s kind=%s user=%s duration=%s",
+            submission_id, kind, user_id, duration,
+        )
 
     async def _accept_presentation(
-        self, event, user, kind: str, filename, mime_type, file_id
+        self, event, user_id: int, kind: str, filename: str | None
     ) -> None:
-        if not self.settings.presentation_enabled:
-            await event.reply("فعلاً امکان ساخت جزوه از PowerPoint فعال نیست.")
-            return
-        if kind == "unsupported":
-            await event.reply(UNSUPPORTED_PRESENTATION_MESSAGE)
-            logger.info("Rejected unsupported presentation format filename=%s", filename)
-            return
-        if kind == "legacy" and not self.settings.presentation_legacy_enabled:
-            await event.reply(
-                "این فایل PowerPoint قدیمی است. لطفاً آن را با پسوند pptx ذخیره و دوباره ارسال کنید."
-            )
-            return
-        size = getattr(event.message.file, "size", None)
-        if size is not None and size > self.settings.max_file_size:
-            await event.reply("این فایل از سقف حجم ربات بزرگ‌تر است.")
-            logger.warning(
-                "Rejected oversized deck from user %s: %s bytes", user["telegram_id"], size
-            )
-            return
-        submission_id = await self.db.create_submission(
-            user["id"], file_id, None, filename, mime_type, source_type="pptx"
-        )
-        progress = await JobProgress.create(
-            event,
+        submission_id = await self.db.create_submission(user_id, "presentation", filename)
+        progress = await JobProgress.create(event, submission_id=submission_id)
+        job = Job(
             submission_id=submission_id,
-            stage="📊 PowerPoint رسید و در صف است",
-            animate=self.settings.progress_animation,
+            user_id=user_id,
+            kind="presentation",
+            filename=filename,
+            message=event.message,
+            is_admin=self._is_admin(user_id),
+            meta={"presentation_kind": kind, "progress": progress},
         )
-        job = QueuedJob(
-            submission_id=submission_id,
-            kind="pptx",
-            run=lambda: self._process_presentation(
-                event,
-                submission_id,
-                filename,
-                kind,
-                progress=progress,
-                is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
-                user_id=int(user["id"]),
-            ),
-            event=event,
-            progress=progress,
-            is_admin=int(user["telegram_id"]) in self.settings.admin_ids,
-        )
-        if not self._enqueue(job):
-            await self._reject_job(
-                job,
-                "ربات هم‌اکنون چند کار دیگر را انجام می‌دهد و ظرفیت صف پر است؛ "
-                "چند دقیقه دیگر دوباره این فایل را بفرستید.",
-            )
-
-    async def _process_presentation(
-        self,
-        event,
-        submission_id: int,
-        filename: str | None,
-        kind: str,
-        *,
-        progress: JobProgress | None = None,
-        is_admin: bool = False,
-        user_id: int | None = None,
-    ) -> None:
-        workdir: Path | None = None
-        reservation_active = False
-        billable_seconds: int | None = None
-        progress = progress or JobProgress(event, submission_id=submission_id)
-        log_token = log_job_id.set(_error_reference(submission_id))
         try:
-            async with self._job_semaphore:
-                await progress.update(5, "🚀 شروع کردم")
-                await self.db.set_submission_status(submission_id, "processing")
-                self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-                workdir = Path(
-                    tempfile.mkdtemp(prefix=f"deck-{submission_id}-", dir=self.settings.temp_dir)
-                )
-                suffix = Path(filename).suffix.lower() if filename else (
-                    ".pptx" if kind == "native" else ".ppt"
-                )
-                if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
-                    suffix = ".pptx" if kind == "native" else ".ppt"
-                deck_path = workdir / f"deck{suffix}"
-                await progress.update(10, "📥 دارم فایل را از تلگرام می‌گیرم…")
-                downloaded = await event.message.download_media(file=str(deck_path))
-                if not downloaded or not deck_path.exists():
-                    raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
-                if deck_path.stat().st_size > self.settings.max_file_size:
-                    raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
-                await progress.update(25, "🔍 فایل رسید؛ دارم بررسی‌اش می‌کنم")
-
-                if kind == "legacy":
-                    await progress.update(
-                        32,
-                        "♻️ این فایل قدیمی است و اول به pptx تبدیل می‌شود",
-                    )
-                    deck_path = await convert_to_pptx(
-                        deck_path, workdir / "converted", self.settings
-                    )
-
-                await progress.update(40, "🗂️ دارم متن و صدای اسلایدها را بیرون می‌کشم")
-                content = await load_presentation(
-                    deck_path, workdir / "media", self.settings
-                )
-                await progress.update(50, "🎚️ دارم صداهای اسلایدها را آماده می‌کنم")
-                deck_skips: list[str] = []
-                prepared = await prepare_audio(
-                    content, workdir, self.settings, skipped_out=deck_skips
-                )
-                await self._store_presentation_details(submission_id, content, prepared)
-
-                slide_note = f"{content.slide_count} اسلاید" if content.slide_count else "بدون متن اسلاید"
-                outline = slides_outline(content.slides)
-                if prepared is None:
-                    if not outline.strip():
-                        raise ValueError(
-                            "داخل این PowerPoint متن یا صدای قابل استفاده‌ای پیدا نکردم."
-                        )
-                    await progress.update(
-                        70,
-                        "📝 صدایی در این ارائه پیدا نشد؛ جزوه را از متن اسلایدها می‌سازم",
-                        slide_note,
-                    )
-                    transcript_text = ""
-                    engine = "slides-only"
-                else:
-                    await progress.update(
-                        60,
-                        "🎙️ صداها آماده شدند؛ دارم آن‌ها را به متن تبدیل می‌کنم",
-                        f"{slide_note}، {len(prepared.clips)} فایل صوتی، "
-                        f"مجموعاً {_format_duration(prepared.total_duration)}",
-                    )
-                    if prepared.path.stat().st_size > self.settings.max_file_size:
-                        raise ValueError("صدای این PowerPoint از سقف حجم ربات بزرگ‌تر است.")
-                    billable_seconds = await self._reserve_submission_usage(
-                        submission_id, user_id, prepared.path, prepared.total_duration
-                    )
-                    reservation_active = billable_seconds is not None
-                    try:
-                        result = await transcribe(
-                            prepared.path,
-                            self.settings,
-                            credentials=self.credential_manager,
-                            submission_id=submission_id,
-                            plan_tier=(
-                                await self.db.user_plan_tier(user_id)
-                                if user_id is not None
-                                else None
-                            ),
-                        )
-                    except BaseException:
-                        if reservation_active and await self._release_submission_usage(
-                            submission_id, "Transcription failed or was cancelled"
-                        ):
-                            reservation_active = False
-                        raise
-                    await progress.update(80, "✍️ متن صدا آماده شد")
-                    transcript_text = result.text
-                    engine = result.engine
-
-                await progress.update(85, "📚 دارم مطالب را به شکل جزوه مرتب می‌کنم")
-                notes: StructuredNotes | None = None
-                try:
-                    async with self._note_job_scope(submission_id):
-                        notes = await structure_presentation(
-                            outline, transcript_text, self.settings, mode=self.settings.note_mode
-                        )
-                    notice = ""
-                except Exception as exc:
-                    if isinstance(exc, StructuringError):
-                        logger.warning(
-                            "Note structuring unavailable provider=%s; returning raw material: %s",
-                            self.settings.note_api_provider,
-                            exc,
-                        )
-                    else:
-                        logger.exception("Unexpected note structuring failure; returning raw material")
-                    notice = (
-                        "\n\nنکته: این بار نتوانستم متن را به شکل جزوهٔ ساختارمند دربیاورم؛ "
-                        "همان مطالب خام را در قالب فایل فرستادم."
-                    )
-                # Without a prepared track the reasons live on the deck itself;
-                # either way the user should learn what was left out.
-                skipped = prepared.skipped if prepared is not None else tuple(deck_skips)
-                if skipped:
-                    notice += "\n\nموارد نادیده‌گرفته‌شده: " + "؛ ".join(skipped[:10])
-
-                await progress.update(94, "📑 جزوه آماده است؛ دارم نتیجه را نهایی می‌کنم")
-                await self.db.save_transcription(
-                    submission_id,
-                    engine,
-                    transcript_text,
-                    notes.to_json() if notes is not None else self._fallback_presentation_text(outline, transcript_text),
-                )
-                await progress.update(97, "📤 دارم جزوه را می‌فرستم")
-                await self._deliver_result_documents(
-                    event,
-                    workdir,
-                    notes=notes,
-                    plain_text=self._fallback_presentation_text(outline, transcript_text),
-                    plain_title="جزوهٔ PowerPoint",
-                    reference=_error_reference(submission_id),
-                    source_name=filename,
-                    engine=None if engine == "slides-only" else engine,
-                    raw_sections=(
-                        [("متن اسلایدها", outline)] if outline.strip() else []
-                    )
-                    + (
-                        [("متن پیاده‌سازی‌شدهٔ صدای ارائه", transcript_text)]
-                        if transcript_text.strip()
-                        else []
-                    ),
-                    notice=notice,
-                    is_admin=is_admin,
-                )
-                if reservation_active:
-                    if billable_seconds is None:
-                        raise RuntimeError("Usage reservation has no billable duration")
-                    finalized = await self.db.finalize_usage(
-                        submission_id, billable_seconds
-                    )
-                    if not finalized:
-                        raise RuntimeError("Usage reservation was not finalized")
-                    reservation_active = False
-                await self.db.set_submission_status(submission_id, "done")
-                await progress.complete()
-                logger.info(
-                    "Presentation submission completed submission_id=%s engine=%s slides=%s",
-                    submission_id,
-                    engine,
-                    content.slide_count,
-                )
-        except asyncio.CancelledError:
-            if reservation_active and await self._release_submission_usage(
-                submission_id, "Processing cancelled"
-            ):
-                reservation_active = False
-            await self.db.set_submission_status(
-                submission_id, "failed", "پردازش هنگام خاموش‌شدن متوقف شد"
-            )
-            raise
-        except Exception as exc:
-            if reservation_active and await self._release_submission_usage(
-                submission_id, "Processing failed before transcript was accepted"
-            ):
-                reservation_active = False
-            reference = _error_reference(submission_id)
-            logger.exception(
-                "Presentation submission failed submission_id=%s reference=%s",
-                submission_id,
-                reference,
-            )
-            try:
-                await self.db.set_submission_status(submission_id, "failed", str(exc)[:1000])
-            except Exception:
-                logger.exception("Could not store submission failure reference=%s", reference)
-            try:
-                await progress.fail(reference)
-                message = (
-                    str(exc)
-                    if isinstance(exc, USER_VISIBLE_ERRORS)
-                    else "متأسفم، نتوانستم این PowerPoint را پردازش کنم. لطفاً فایل را بررسی و دوباره ارسال کنید."
-                )
-                await event.reply(
-                    f"{message}\n\nکد پیگیری: {reference}",
-                    buttons=main_menu(is_admin),
-                )
-            except Exception:
-                logger.exception(
-                    "Could not notify the user about processing failure reference=%s",
-                    reference,
-                )
-        finally:
-            if reservation_active and await self._release_submission_usage(
-                submission_id, "Final processing cleanup"
-            ):
-                reservation_active = False
-            await progress.aclose()
-            if workdir:
-                shutil.rmtree(workdir, ignore_errors=True)
-            log_job_id.reset(log_token)
-
-    async def _store_presentation_details(self, submission_id, content, prepared) -> None:
-        used = {clip.part_name: clip for clip in (prepared.clips if prepared else ())}
-        rows = [
-            {
-                "slide_number": clip.slide_number,
-                "part_name": clip.part_name,
-                "kind": clip.kind,
-                "duration": (used[clip.part_name].duration if clip.part_name in used else None),
-                "included": clip.part_name in used,
-                "skip_reason": None if clip.part_name in used else "در ادغام صدا استفاده نشد",
-            }
-            for clip in content.clips
-        ]
-        try:
-            await self.db.save_presentation_details(
-                submission_id,
-                content.slide_count,
-                rows,
-                prepared.total_duration if prepared else None,
-            )
-        except Exception:
-            logger.exception("Could not store presentation details for %s", submission_id)
+            self.queue.submit(job)
+        except QueueFullError as exc:
+            await self.db.set_submission_status(submission_id, "rejected", error=str(exc))
+            await progress.fail(str(submission_id))
+            await event.reply(f"⏸ {exc}")
+            return
+        logger.info("accepted presentation submission=%s user=%s", submission_id, user_id)
 
     @staticmethod
-    def _fallback_presentation_text(outline: str, transcript: str) -> str:
-        parts = []
-        if outline.strip():
-            parts.append("## متن اسلایدها\n\n" + outline.strip())
-        if transcript.strip():
-            parts.append("## متن پیاده‌سازی‌شدهٔ صدای ارائه\n\n" + transcript.strip())
-        return "\n\n".join(parts)
+    def _reserve_estimate(duration: float | None) -> int:
+        if duration is None or duration <= 0:
+            return 600  # unknown duration: reserve a conservative floor
+        return int(math.ceil(duration))
 
-    async def _process_submission(
-        self,
-        event,
-        submission_id: int,
-        filename: str | None,
-        kind: str = "audio",
-        *,
-        progress: JobProgress | None = None,
-        is_admin: bool = False,
-        user_id: int | None = None,
-        duration_hint: float | None = None,
-    ) -> None:
+    # ------------------------------------------------------------ job worker
+    async def _run_job(self, job: Job) -> None:
+        progress: JobProgress | None = job.meta.get("progress")
+        log_token = log_job_id.set(f"GMS-{job.submission_id}")
         workdir: Path | None = None
-        reservation_active = False
-        billable_seconds: int | None = None
-        progress = progress or JobProgress(event, submission_id=submission_id)
-        log_token = log_job_id.set(_error_reference(submission_id))
         try:
-            async with self._job_semaphore:
-                await progress.update(5, "🚀 شروع کردم")
-                await self.db.set_submission_status(submission_id, "processing")
-                self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-                workdir = Path(
-                    tempfile.mkdtemp(
-                        prefix=f"submission-{submission_id}-", dir=self.settings.temp_dir
-                    )
-                )
-                suffix = Path(filename).suffix.lower() if filename else (
-                    ".mp4" if kind == "video" else ".ogg"
-                )
-                if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
-                    suffix = ".media"
-                source_path = workdir / f"source{suffix}"
-                await progress.update(10, "📥 دارم فایل را از تلگرام می‌گیرم…")
-                downloaded = await event.message.download_media(file=str(source_path))
-                if not downloaded or not source_path.exists():
-                    raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
-                if source_path.stat().st_size > self.settings.max_file_size:
-                    raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
-                await progress.update(30, "🔍 فایل رسید؛ دارم صدا را بررسی می‌کنم")
-
-                audio_path = await self._ensure_transcribable(
-                    event, source_path, workdir, filename, kind, progress=progress
-                )
-                if audio_path.stat().st_size > self.settings.max_file_size:
-                    raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
-
-                billable_seconds = await self._reserve_submission_usage(
-                    submission_id, user_id, audio_path, duration_hint
-                )
-                reservation_active = billable_seconds is not None
-                await progress.update(55, "🎙️ دارم صدا را به متن تبدیل می‌کنم")
-                try:
-                    result = await transcribe(
-                        audio_path,
-                        self.settings,
-                        credentials=self.credential_manager,
-                        submission_id=submission_id,
-                        plan_tier=(
-                            await self.db.user_plan_tier(user_id)
-                            if user_id is not None
-                            else None
-                        ),
-                    )
-                except BaseException:
-                    if reservation_active and await self._release_submission_usage(
-                        submission_id, "Transcription failed or was cancelled"
-                    ):
-                        reservation_active = False
-                    raise
-                await progress.update(80, "✍️ متن آماده شد؛ دارم آن را به شکل جزوه مرتب می‌کنم")
-                notes: StructuredNotes | None = None
-                try:
-                    async with self._note_job_scope(submission_id):
-                        notes = await structure_transcript(
-                            result.text, self.settings, mode=self.settings.note_mode
-                        )
-                except Exception as exc:
-                    if isinstance(exc, StructuringError):
-                        logger.warning(
-                            "Note structuring unavailable provider=%s; returning raw transcript: %s",
-                            self.settings.note_api_provider,
-                            exc,
-                        )
-                    else:
-                        logger.exception("Unexpected note structuring failure; returning raw transcript")
-                    notice = (
-                        "\n\nنکته: این بار نتوانستم متن را به شکل جزوهٔ ساختارمند دربیاورم؛ "
-                        "همان متن خام را در قالب فایل فرستادم."
-                    )
-                else:
-                    notice = ""
-                await progress.update(94, "📑 جزوه آماده است؛ دارم نتیجه را نهایی می‌کنم")
-                await self.db.save_transcription(
-                    submission_id,
-                    result.engine,
-                    result.text,
-                    notes.to_json() if notes is not None else "## متن پیاده‌سازی‌شده\n\n" + result.text,
-                )
-                await progress.update(97, "📤 دارم جزوه را می‌فرستم")
-                await self._deliver_result_documents(
-                    event,
-                    workdir,
-                    notes=notes,
-                    plain_text="## متن پیاده‌سازی‌شده\n\n" + result.text,
-                    plain_title="جزوهٔ کلاس",
-                    reference=_error_reference(submission_id),
-                    source_name=filename,
-                    engine=result.engine,
-                    raw_sections=[("متن پیاده‌سازی‌شده", result.text)],
-                    notice=notice,
-                    is_admin=is_admin,
-                )
-                if reservation_active:
-                    if billable_seconds is None:
-                        raise RuntimeError("Usage reservation has no billable duration")
-                    finalized = await self.db.finalize_usage(
-                        submission_id, billable_seconds
-                    )
-                    if not finalized:
-                        raise RuntimeError("Usage reservation was not finalized")
-                    reservation_active = False
-                await self.db.set_submission_status(submission_id, "done")
-                await progress.complete()
-                logger.info(
-                    "Media submission completed submission_id=%s kind=%s engine=%s",
-                    submission_id,
-                    kind,
-                    result.engine,
-                )
+            await self.db.set_submission_status(job.submission_id, "processing")
+            self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+            workdir = Path(tempfile.mkdtemp(
+                prefix=f"submission-{job.submission_id}-", dir=self.settings.temp_dir
+            ))
+            if job.kind == "presentation":
+                await self._process_presentation(job, workdir, progress)
+            else:
+                await self._process_media(job, workdir, progress)
+        except InsufficientBalanceError as exc:
+            await self.db.set_submission_status(
+                job.submission_id, "failed",
+                error=f"insufficient balance: {exc}",
+            )
+            if progress:
+                await progress.fail(str(job.submission_id))
+            await self._reply(job, (
+                f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
+                f"لازم: {format_duration(exc.required_seconds)} — "
+                f"موجودی: {format_duration(exc.available_seconds)}\n"
+                "از «💳 حساب و شارژ» اعتبار بگیرید."
+            ))
+        except USER_VISIBLE_ERRORS as exc:
+            await self._release(job, "user-visible failure")
+            await self.db.set_submission_status(
+                job.submission_id, "failed", error=str(exc)[:500]
+            )
+            if progress:
+                await progress.fail(str(job.submission_id))
+            await self._reply(job, f"❌ {exc}")
+        except STTError as exc:
+            await self._release(job, "stt failure")
+            await self.db.set_submission_status(
+                job.submission_id, "failed", error=str(exc)[:500]
+            )
+            if progress:
+                await progress.fail(str(job.submission_id))
+            await self._reply(job, f"❌ تبدیل گفتار به متن نشد: {exc}")
         except asyncio.CancelledError:
-            if reservation_active and await self._release_submission_usage(
-                submission_id, "Processing cancelled"
-            ):
-                reservation_active = False
-            await self.db.set_submission_status(submission_id, "failed", "پردازش هنگام خاموش‌شدن متوقف شد")
+            await self._release(job, "cancelled")
+            await self.db.set_submission_status(
+                job.submission_id, "failed", error="cancelled"
+            )
             raise
         except Exception as exc:
-            if reservation_active and await self._release_submission_usage(
-                submission_id, "Processing failed before transcript was accepted"
-            ):
-                reservation_active = False
-            reference = _error_reference(submission_id)
-            logger.exception(
-                "Media submission failed submission_id=%s reference=%s",
-                submission_id,
-                reference,
+            await self._release(job, f"unexpected: {type(exc).__name__}")
+            await self.db.set_submission_status(
+                job.submission_id, "failed", error=f"{type(exc).__name__}: {exc}"[:500]
             )
-            try:
-                await self.db.set_submission_status(submission_id, "failed", str(exc)[:1000])
-            except Exception:
-                logger.exception("Could not store submission failure reference=%s", reference)
-            try:
-                await progress.fail(reference)
-                message = (
-                    str(exc)
-                    if isinstance(exc, USER_VISIBLE_ERRORS)
-                    else "متأسفم، نتوانستم این فایل را پردازش کنم. لطفاً فایل را بررسی و دوباره ارسال کنید."
-                )
-                await event.reply(
-                    f"{message}\n\nکد پیگیری: {reference}",
-                    buttons=main_menu(is_admin),
-                )
-            except Exception:
-                logger.exception(
-                    "Could not notify the user about processing failure reference=%s",
-                    reference,
-                )
+            logger.exception("job failed submission=%s", job.submission_id)
+            if progress:
+                await progress.fail(str(job.submission_id))
+            await self._reply(
+                job, "❌ متأسفم، کار کامل نشد. لطفاً بعداً دوباره امتحان کنید."
+            )
         finally:
-            if reservation_active and await self._release_submission_usage(
-                submission_id, "Final processing cleanup"
-            ):
-                reservation_active = False
-            await progress.aclose()
-            if workdir:
+            if progress:
+                await progress.aclose()
+            if workdir is not None:
                 shutil.rmtree(workdir, ignore_errors=True)
             log_job_id.reset(log_token)
 
-    async def _ensure_transcribable(
-        self,
-        event,
-        source_path: Path,
-        workdir: Path,
-        filename: str | None,
-        kind: str,
-        *,
-        progress: JobProgress | None = None,
-    ) -> Path:
-        """Return a file the STT providers accept, transcoding only when needed."""
-        progress = progress or JobProgress(event)
-        info = None
+    async def _release(self, job: Job, reason: str) -> bool:
+        return await self.db.release_hold(job.submission_id, reason)
+
+    async def _reply(self, job: Job, text: str) -> None:
+        if job.message is None:
+            return
         try:
-            info = await probe_media(source_path, self.settings)
-        except MediaToolError as exc:
-            logger.warning("Probing the upload failed: %s", exc)
-        if info is not None and not info.has_audio:
-            raise ValueError(
-                "داخل این فایل صدایی پیدا نکردم. لطفاً نسخه‌ای را بفرستید که صدا داشته باشد."
-            )
-        if kind == "video":
-            await progress.update(40, "🎚️ دارم صدای ویدیو را جدا می‌کنم…")
-            return await extract_audio_track(
-                source_path,
-                workdir,
-                self.settings,
-                total_duration=info.duration if info else None,
-                stem="extracted-audio",
-            )
-        # The stored copy carries the resolved suffix, so unnamed uploads such
-        # as Telegram voice notes (.ogg/opus) are no longer re-encoded blindly.
-        if needs_transcode(filename or source_path.name, info):
-            await progress.update(40, "🎚️ دارم فایل صوتی را برای تبدیل آماده می‌کنم…")
-            return await extract_audio_track(
-                source_path,
-                workdir,
-                self.settings,
-                total_duration=info.duration if info else None,
-                stem="normalised-audio",
-            )
-        return source_path
+            await job.message.reply(text)
+        except Exception:
+            logger.warning("could not reply to user submission=%s", job.submission_id)
 
-    async def _send_long_message(self, event, text: str, *, is_admin: bool = False) -> None:
-        pages = render_pages(text)
-        for index, rendered in enumerate(pages, start=1):
-            if index > 1:
-                await asyncio.sleep(1.05)
-            if len(pages) > 1:
-                rendered = f"بخش {index} از {len(pages)}\n\n" + rendered
-            buttons = main_menu(is_admin) if index == len(pages) else None
-            try:
-                await event.respond(rendered, parse_mode="html", buttons=buttons)
-            except FloodWaitError as exc:
-                logger.warning(
-                    "Telegram flood wait while delivering result seconds=%s page=%s/%s",
-                    exc.seconds,
-                    index,
-                    len(pages),
-                )
-                await asyncio.sleep(exc.seconds + 1)
-                await event.respond(rendered, parse_mode="html", buttons=buttons)
+    # ------------------------------------------------------- media pipeline
+    async def _process_media(self, job: Job, workdir: Path, progress) -> None:
+        assert progress is not None
+        await progress.update(10, "🚀 شروع کردم")
+        suffix = Path(job.filename).suffix.lower() if job.filename else (
+            ".mp4" if job.kind == "video" else ".ogg"
+        )
+        if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
+            suffix = ".media"
+        source_path = workdir / f"source{suffix}"
+        await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
+        downloaded = await job.message.download_media(file=str(source_path))
+        if not downloaded or not source_path.exists():
+            raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
+        if source_path.stat().st_size > self.settings.max_file_size:
+            raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
 
-    async def _send_document(
-        self, event, path: Path, caption: str, *, buttons=None
-    ) -> None:
-        """Send one file as a Telegram document, surviving flood waits."""
+        await progress.update(35, "🔍 فایل رسید؛ دارم صدا را بررسی می‌کنم")
+        audio_path = await self._prepare_audio(source_path, workdir, job.filename, job.kind)
+        if audio_path.stat().st_size > self.settings.max_file_size:
+            raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
+
+        info = await probe_media(audio_path, self.settings)
+        duration = info.duration or job.duration_hint
+        needed = self._reserve_estimate(duration)
+        await self.db.reserve(job.user_id, job.submission_id, needed)
+
+        await progress.update(50, "🎙️ دارم صدا را به متن تبدیل می‌کنم")
         try:
-            await event.reply(caption, file=str(path), force_document=True, buttons=buttons)
-        except FloodWaitError as exc:
-            logger.warning(
-                "Telegram flood wait while sending document seconds=%s file=%s",
-                exc.seconds,
-                path.name,
-            )
-            await asyncio.sleep(exc.seconds + 1)
-            await event.reply(caption, file=str(path), force_document=True, buttons=buttons)
+            raw = await transcribe(audio_path, self.settings, session=self._http_session())
+        except BaseException:
+            await self._release(job, "transcription failed")
+            raise
+        document = build_document(raw)
 
-    async def _deliver_result_documents(
-        self,
-        event,
-        workdir: Path,
-        *,
-        notes: StructuredNotes | None,
-        plain_text: str,
-        plain_title: str,
-        reference: str,
-        source_name: str | None,
-        engine: str | None,
-        raw_sections: list[tuple[str, str]],
-        notice: str,
-        is_admin: bool = False,
-    ) -> None:
-        """Deliver the polished RTL Word document plus the raw-text file.
-
-        The Word document is the primary deliverable. When it cannot be
-        generated (for example a broken python-docx installation), or cannot be
-        handed to Telegram, the notes fall back to an in-chat text message so no
-        content is ever lost; the raw-text file is always sent, whatever
-        happened to the Word one. A failure of either note delivery is therefore
-        never allowed to skip the remaining sends.
-        """
+        await progress.update(75, "📝 متن آماده شد؛ فایل خام را می‌فرستم")
+        await self.db.set_submission_status(
+            job.submission_id, "processing", duration_seconds=duration
+        )
+        reference = f"GMS-{job.submission_id}"
         meta = DocumentMeta(
             reference=reference,
-            source_name=source_name,
-            engine=engine,
+            source_name=job.filename,
             created_at=datetime.now(),
         )
+        # ---- PROGRESSIVE DELIVERY: the raw text goes out before the notes. ----
+        raw_text = render_transcript(document, self.settings.raw_text_profile)
+        raw_path = workdir / raw_text_filename(reference)
+        raw_path.write_text(raw_text, encoding="utf-8", newline="\n")
+        await self._send_file(
+            job, raw_path,
+            caption=f"📝 متن خام — {reference}" ,
+        )
+        await self._send_preview(job, raw_text)
+
+        await self.db.save_transcription(
+            job.submission_id, engine=raw.engine, text=document.plain(), notes_json=""
+        )
+        await self._settle(job, duration)
+
+        await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
+        notes = await self._generate_notes(document.llm_document(), job, progress)
+
+        await self.db.save_transcription(
+            job.submission_id, engine=raw.engine, text=document.plain(),
+            notes_json=notes.to_json() if notes else "",
+        )
+        await self._deliver_booklet(job, workdir, notes, document, reference, meta, progress)
+
+    async def _prepare_audio(
+        self, source_path: Path, workdir: Path, filename: str | None, kind: str
+    ) -> Path:
+        info = await probe_media(source_path, self.settings)
+        if not info.has_audio:
+            raise ValueError("این فایل شاخهٔ صوتی ندارد؛ چیزی برای پیاده‌سازی نیست.")
+        if kind == "video" or needs_transcode(filename, info):
+            return await extract_audio_track(source_path, workdir, self.settings)
+        return source_path
+
+    async def _settle(self, job: Job, duration: float | None) -> None:
+        measured = int(math.ceil(duration)) if duration else 0
+        await self.db.settle_hold(job.submission_id, measured)
+
+    # ------------------------------------------------- presentation pipeline
+    async def _process_presentation(self, job: Job, workdir: Path, progress) -> None:
+        assert progress is not None
+        await progress.update(10, "🚀 شروع کردم")
+        suffix = Path(job.filename).suffix.lower() if job.filename else ".pptx"
+        source_path = workdir / f"source{suffix}"
+        await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
+        downloaded = await job.message.download_media(file=str(source_path))
+        if not downloaded or not source_path.exists():
+            raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
+
+        if job.meta.get("presentation_kind") == "legacy":
+            await progress.update(30, "🔁 دارم قالب قدیمی را تبدیل می‌کنم…")
+            source_path = await convert_to_pptx(source_path, workdir, self.settings)
+
+        await progress.update(40, "🔍 دارم اسلایدها را می‌خوانم")
+        content = await load_presentation(source_path, workdir, self.settings)
+        outline = slides_outline(content.slides)
+        skipped: list[str] = []
+        prepared = await prepare_audio(content, workdir, self.settings, skipped_out=skipped)
+
+        raw_text_parts: list[str] = []
+        if outline.strip():
+            raw_text_parts.append("متن اسلایدها:\n\n" + outline.strip())
+        document = None
+        if prepared is not None:
+            info = await probe_media(prepared.path, self.settings)
+            duration = info.duration or prepared.total_duration
+            needed = self._reserve_estimate(duration)
+            await self.db.reserve(job.user_id, job.submission_id, needed)
+            await progress.update(55, "🎙️ دارم صدای ارائه را به متن تبدیل می‌کنم")
+            try:
+                raw = await transcribe(
+                    prepared.path, self.settings, session=self._http_session()
+                )
+            except BaseException:
+                await self._release(job, "transcription failed")
+                raise
+            document = build_document(raw)
+            raw_text_parts.append("متن پیاده‌سازی‌شدهٔ صدای ارائه:\n\n" + document.plain())
+            await self._settle(job, duration)
+        elif not outline.strip():
+            raise ValueError("در این ارائه نه متن اسلایدی پیدا شد و نه صدای ضبط‌شده.")
+
+        reference = f"GMS-{job.submission_id}"
+        meta = DocumentMeta(reference=reference, source_name=job.filename, created_at=datetime.now())
+
+        # ---- PROGRESSIVE DELIVERY ----
+        await progress.update(70, "📝 متن خام را می‌فرستم")
+        raw_text = "\n\n\n".join(part for part in raw_text_parts if part.strip())
+        raw_path = workdir / raw_text_filename(reference)
+        raw_path.write_text(raw_text, encoding="utf-8", newline="\n")
+        await self._send_file(job, raw_path, caption=f"📝 متن خام — {reference}")
+        await self._send_preview(job, raw_text)
+
+        await self.db.save_transcription(
+            job.submission_id, engine="stt", text=raw_text, notes_json=""
+        )
+
+        await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
+        transcript_text = document.llm_document() if document is not None else ""
+        notes = await self._generate_presentation_notes(outline, transcript_text, job, progress)
+        await self.db.save_transcription(
+            job.submission_id, engine="stt", text=raw_text,
+            notes_json=notes.to_json() if notes else "",
+        )
+        await self._deliver_booklet(job, workdir, notes, document, reference, meta, progress,
+                                    plain_title="جزوهٔ ارائه")
+
+    # ----------------------------------------------------------- notes + docx
+    async def _generate_notes(self, document_text: str, job: Job, progress) -> StructuredNotes | None:
+        if not self.settings.note_configured:
+            logger.info("note provider not configured; delivering raw only")
+            return None
+        try:
+            return await structure_transcript(
+                document_text, self.settings, self._http_session(),
+                mode=self.settings.note_mode,
+            )
+        except Exception as exc:
+            logger.warning("note generation failed; raw already delivered: %s", exc)
+            await self._reply(
+                job,
+                "ℹ️ این بار نتوانستم متن را به جزوهٔ ساختارمند دربیاورم؛ متن خام را دریافت کردید.",
+            )
+            return None
+
+    async def _generate_presentation_notes(
+        self, outline: str, transcript_text: str, job: Job, progress
+    ) -> StructuredNotes | None:
+        if not self.settings.note_configured:
+            return None
+        if not outline.strip() and not transcript_text.strip():
+            return None
+        try:
+            return await structure_presentation(
+                outline, transcript_text, self.settings, self._http_session(),
+                mode=self.settings.note_mode,
+            )
+        except Exception as exc:
+            logger.warning("presentation note generation failed: %s", exc)
+            await self._reply(
+                job,
+                "ℹ️ این بار نتوانستم متن را به جزوهٔ ساختارمند دربیاورم؛ متن خام را دریافت کردید.",
+            )
+            return None
+
+    async def _deliver_booklet(
+        self,
+        job: Job,
+        workdir: Path,
+        notes: StructuredNotes | None,
+        document,
+        reference: str,
+        meta: DocumentMeta,
+        progress,
+        *,
+        plain_title: str = "جزوهٔ کلاس",
+    ) -> None:
+        await progress.update(94, "📑 جزوه آماده است؛ دارم فایل Word را می‌سازم")
+        notice = ""
         docx_path: Path | None = None
-        docx_title = plain_title
-        # A pagination failure is re-raised so the job is recorded as failed and
-        # the user is told why, but only *after* the transcript has gone out: a
-        # layout decision must never cost a user the lecture they paid for.
-        pagination_error: BaseException | None = None
         if notes is not None:
-            docx_title = notes.display_title
             try:
                 docx_bytes = await asyncio.to_thread(
-                    build_notes_docx,
-                    notes,
-                    fonts=resolve_fonts(self.settings.docx_fonts),
-                    design=resolve_design(self.settings.docx_design),
+                    build_notes_docx, notes,
+                    fonts=resolve_fonts(),
+                    design=resolve_design(),
                     meta=meta,
                 )
                 docx_path = workdir / notes_docx_filename(notes, reference)
                 docx_path.write_bytes(docx_bytes)
-            except DocxPaginationError as exc:
-                pagination_error = exc
             except Exception:
-                logger.exception(
-                    "Word document generation failed; falling back to a chat message reference=%s",
-                    reference,
-                )
+                logger.exception("docx generation failed; falling back to chat message")
                 docx_path = None
-        else:
+        if docx_path is None:
+            plain_text = document.llm_document() if document is not None else ""
             try:
                 docx_bytes = await asyncio.to_thread(
-                    build_plain_docx,
-                    plain_title,
-                    plain_text,
-                    fonts=resolve_fonts(self.settings.docx_fonts),
-                    design=resolve_design(self.settings.docx_design),
-                    meta=meta,
+                    build_plain_docx, plain_title, plain_text,
+                    fonts=resolve_fonts(), design=resolve_design(), meta=meta,
                 )
                 docx_path = workdir / plain_docx_filename(plain_title, reference)
                 docx_path.write_bytes(docx_bytes)
-            except DocxPaginationError as exc:
-                pagination_error = exc
             except Exception:
-                logger.exception(
-                    "Plain Word document generation failed; falling back to a chat message reference=%s",
-                    reference,
-                )
-                docx_path = None
+                logger.exception("plain docx generation failed too")
+                notice = "\n\nنکته: فایل Word ساخته نشد؛ متن خام ارسال شد."
 
         if docx_path is not None:
-            caption = f"📖 جزوهٔ «{docx_title}» — فایل Word" + notice
-            # Telegram captions are capped at 1024 characters.
-            caption = caption[:1000]
+            caption = f"📖 جزوهٔ Word — {reference}"
             try:
-                await self._send_document(
-                    event, docx_path, caption, buttons=main_menu(is_admin)
-                )
+                await self._send_file(job, docx_path, caption=caption)
             except Exception:
-                # The *upload* can fail on a document that was built fine (Telegram
-                # rejects the file, the connection drops). Losing the file is no
-                # reason to lose the note: the text goes out below and the raw
-                # transcript is still delivered, instead of the whole job being
-                # recorded as a failure after the model work was already paid for.
-                logger.exception(
-                    "Word document delivery failed; falling back to the text note reference=%s",
-                    reference,
-                )
-                docx_path = None
-        if docx_path is None and pagination_error is None:
-            body = (notes.to_markdown() if notes is not None else plain_text) + notice
-            try:
-                await self._send_long_message(event, body, is_admin=is_admin)
-            except Exception:
-                logger.exception(
-                    "Text note delivery failed; the raw transcript still goes out reference=%s",
-                    reference,
-                )
+                logger.exception("docx delivery failed")
+                notice = "\n\nنکته: ارسال فایل Word ناموفق بود؛ متن خام ارسال شد."
 
-        # The raw transcript is the one deliverable that never depends on the
-        # Word document, so it is always sent — see the docstring above.
-        txt_path = workdir / raw_text_filename(reference)
-        txt_path.write_text(
-            build_raw_text_document(
-                title=f"متن خام — {docx_title}", sections=raw_sections, meta=meta
-            ),
-            encoding="utf-8",
+        await self.db.set_submission_status(job.submission_id, "done")
+        if notice:
+            await progress.complete("متن خام ارسال شد. " + notice.strip())
+        else:
+            await progress.complete()
+
+    async def _send_file(self, job: Job, path: Path, *, caption: str = "") -> None:
+        if job.message is None:
+            return
+        await job.message.reply(
+            file=str(path), caption=caption[:1000] or None, force_document=True
         )
-        await self._send_document(event, txt_path, "📄 متن خام پیاده‌سازی‌شده.")
 
-        if pagination_error is not None:
-            raise pagination_error
-
-    #: Rows per page in the admin user list.
-    USERS_PAGE_SIZE = 25
-
-    #: Rows in the flat `/users` export copy — the title states this is a prefix.
-    USERS_EXPORT_ROWS = 50
-
-    #: Plans offered per page on the user's purchase screen (Telegram caps a
-    #: message at 4096 characters and a keyboard at 100 buttons).
-    USER_PLAN_PAGE = 8
-
-    #: Active entitlements listed on the user's account screen before the rest
-    #: are summarised; the totals above always count every row.
-    ACCOUNT_ENTITLEMENT_ROWS = 8
-
-    @staticmethod
-    def _page_arg(data: str, prefix: str) -> str | None:
-        """The page number of ``<prefix><page>``, or None for any other token.
-
-        Only digits count, so ``admin:special:add`` keeps going to its own branch
-        while ``admin:special:1`` is a page request; the same rule guards the
-        user-side ``billing:plans:2`` against a hand-built or stale tail.
-        """
-        if not data.startswith(prefix):
-            return None
-        tail = data[len(prefix) :]
-        return tail if tail.isdigit() else None
-
-    @staticmethod
-    def _admin_page(value: object) -> int:
-        """Page number from a callback argument; anything malformed is page 0.
-
-        A stale or hand-built callback must still open a valid screen, and no
-        admin panel may fail because a page token stopped making sense.
-        """
+    async def _send_preview(self, job: Job, raw_text: str) -> None:
+        text = normalize_display(raw_text)
+        lines: list[str] = []
+        used = 0
+        for line in text.splitlines():
+            if used + len(line) + 1 > RAW_PREVIEW_CHARS or len(lines) >= MAX_RAW_PREVIEW_LINES:
+                lines.append("…")
+                break
+            lines.append(line)
+            used += len(line) + 1
+        preview = "\n".join(lines).strip()
+        if not preview:
+            return
         try:
-            return max(0, min(int(str(value)), 1_000_000))
-        except (TypeError, ValueError):
-            return 0
+            await self._reply(job, f"👀 پیش‌نمایش متن خام:\n\n{preview}")
+        except Exception:
+            logger.debug("preview send failed", exc_info=True)
 
-    async def _show_admin_users(self, event, page_text: str | None) -> None:
-        """Paged user list.
+    # ------------------------------------------------------------ accounting
+    async def _show_account(self, event) -> None:
+        user_id = event.sender_id
+        available = await self.db.available_seconds(user_id)
+        history = await self.db.payment_history(user_id, limit=5)
+        plans = await self.db.plans()
+        lines = [
+            "💳 حساب شما",
+            "",
+            f"⏳ اعتبار باقی‌مانده: {format_duration(available)}",
+            "",
+            "شارژ:",
+        ]
+        buttons = []
+        for plan in plans:
+            if plan["price"] <= 0:
+                continue
+            hours = plan["hours"]
+            hours_text = to_persian_digits(int(hours) if float(hours).is_integer() else hours)
+            label = button_label(f"{hours_text} ساعت — {format_toman(plan['price'])}")
+            buttons.append([Button.inline(label, f"plan:{plan['code']}".encode())])
+        if history:
+            lines.append("")
+            lines.append("آخرین پرداخت‌ها:")
+            for item in history:
+                status = {
+                    "pending": "⏳ در انتظار بررسی",
+                    "approved": "✅ تایید شد",
+                    "rejected": "❌ رد شد",
+                }.get(item["status"], item["status"])
+                lines.append(f"• {item['plan_code']} — {status}")
+        lines.append("")
+        lines.append(FREE_PLAN_NAME + " برای همه در شروع فعال است.")
+        buttons.append([Button.inline("🔙 بازگشت", b"menu:main")])
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
 
-        It used to stop at the 50 most recent users with no way back, so an
-        older account could not be found in the panel at all. ``/users`` still
-        sends the flat list as a message for copy/export.
-        """
-        page = self._admin_page(page_text)
-        size = self.USERS_PAGE_SIZE
-        stats = await self.db.stats()
-        total = int(stats.get("users") or 0)
-        pages = max(1, -(-total // size))
-        page = min(page, pages - 1)
-        users = await self.db.user_summaries(limit=size, offset=page * size)
-        title = "👥 کاربران" + (
-            f" — صفحهٔ {page + 1} از {pages} ({total} کاربر)" if pages > 1 else ""
+    async def _start_payment(self, event, plan_code: str) -> None:
+        plan = await self.db.plan(plan_code)
+        if plan is None or plan["price"] <= 0:
+            await event.respond("این طرح در دسترس نیست.")
+            return
+        card = format_payment_card(self.settings.payment_card_number)
+        hours = plan["hours"]
+        hours_text = to_persian_digits(int(hours) if float(hours).is_integer() else hours)
+        text = (
+            f"🧾 خرید {hours_text} ساعت اعتبار\n\n"
+            f"مبلغ: {format_toman(plan['price'])}\n"
+            f"اعتبار تا {format_validity(plan['validity_days'])} معتبر است.\n\n"
+            "کارت‌به‌کارت:\n"
+            f"💳 شماره کارت: {card}\n"
+            f"👤 به نام: {self.settings.payment_card_holder}\n"
+            f"🏦 بانک: {self.settings.payment_bank_name}\n\n"
+            "پس از واریز، دکمهٔ زیر را بزنید و تصویر رسید را بفرستید. "
+            "تا تایید مدیر معمولاً چند ساعت طول می‌کشد."
         )
-        lines = [self._users_text(users, title=title)]
-        buttons: list = []
-        if pages > 1:
-            nav: list = []
-            if page > 0:
-                nav.append(Button.inline("◀️ قبلی", f"admin:users:{page - 1}".encode("ascii")))
-            if page < pages - 1:
-                nav.append(Button.inline("بعدی ▶️", f"admin:users:{page + 1}".encode("ascii")))
-            buttons.append(nav)
-        buttons.append([Button.inline("↩️ پنل مدیریت", b"admin:home")])
-        await self._edit_callback(event, "\n".join(lines), buttons)
+        payment_id = await self.db.create_payment(event.sender_id, plan_code)
+        await event.respond(text, buttons=[
+            [Button.inline("📤 واریز کردم؛ ارسال رسید", f"payr:{payment_id}".encode())],
+            [Button.inline("🔙 بازگشت", b"account")],
+        ])
 
-    @staticmethod
-    def _users_text(users: list[dict], *, title: str | None = None) -> str:
-        if not users:
-            return "هنوز کاربری در ربات ثبت نشده است."
-        lines = [title or "فهرست کاربران (حداکثر ۵۰ کاربر اخیر):"]
-        for user in users:
-            name = f"@{user['username']}" if user["username"] else "بدون نام کاربری"
-            ban = " | مسدود" if user["is_banned"] else ""
-            special = " | ⭐ ویژه (نامحدود)" if user.get("is_unlimited") else ""
-            joined = str(user["first_seen"])[:10]
-            lines.append(
-                f"• {name} | شناسه: {user['telegram_id']} | عضویت: {joined} | "
-                f"فایل‌ها: {user['submission_count']}{ban}{special}"
-            )
-        return "\n".join(lines)
+    async def _await_receipt(self, event, payment_id: int) -> None:
+        payment = await self.db.payment(payment_id)
+        if payment is None or payment["status"] != "pending":
+            await event.respond("این درخواست دیگر فعال نیست.")
+            return
+        self._pending_payments[event.sender_id] = payment_id
+        await event.respond("📷 تصویر رسید را بفرستید (همین‌جا در چت).")
 
-    @staticmethod
-    def _stats_text(stats: dict) -> str:
-        return (
-            "آمار ربات 📊\n"
-            f"کاربران ثبت‌شده: {stats['users']}\n"
-            f"کاربران غیرمسدود: {stats['unbanned_users']}\n"
-            f"کاربران ویژه (نامحدود): {stats.get('unlimited_users', 0)}\n"
-            f"کاربران دارای ارسال در ۳۰ روز اخیر: {stats['active_30d']}\n"
-            f"کل فایل‌های دریافتی: {stats['submissions']}\n"
-            f"فایل‌های تصویری: {stats['videos']}\n"
-            f"فایل‌های ارائه (PowerPoint): {stats['presentations']}\n"
-            f"کلیپ‌های صوتی استخراج‌شده از ارائه‌ها: {stats['presentation_clips']}\n"
-            f"پردازش‌های موفق: {stats['done']}\n"
-            f"پردازش‌های ناموفق: {stats['failed']}"
+    async def _handle_receipt_upload(self, event, user_id: int) -> None:
+        payment_id = self._pending_payments.pop(user_id, None)
+        if payment_id is None:
+            return
+        payment = await self.db.payment(payment_id)
+        if payment is None or payment["status"] != "pending":
+            await event.respond("این درخواست دیگر فعال نیست.")
+            return
+        if event.message.photo is None:
+            return
+        size = getattr(event.message.file, "size", 0) or 0
+        if size > self.settings.max_payment_receipt_bytes:
+            await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
+            self._pending_payments[user_id] = payment_id
+            return
+        self.settings.receipt_dir.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_hex(8)
+        receipt_path = self.settings.receipt_dir / f"receipt-{payment_id}-{token}.jpg"
+        await event.message.download_media(file=str(receipt_path))
+        try:
+            receipt_path.chmod(0o600)
+        except OSError:
+            pass
+        await self.db.set_payment_receipt(payment_id, str(receipt_path))
+        await event.respond(
+            "✅ رسید ثبت شد. پس از تایید مدیر، اعتبار به حسابتان اضافه می‌شود."
         )
+        await self._notify_admins_of_payment(payment_id)
 
-    async def _handle_admin_command(self, event, command: str, text: str) -> None:
-        admin_id = int((await event.get_sender()).id)
-        if command == "/payments":
-            total = await self.db.pending_payment_count()
-            payments = await self.db.list_pending_payments(limit=20)
-            if not payments:
-                await event.reply("پرداختِ منتظر بررسی وجود ندارد.", buttons=admin_menu())
-            else:
-                await event.reply(
-                    f"{len(payments)} مورد اول از {total} پرداخت در انتظار بررسی است؛ "
-                    "رسیدها ارسال می‌شوند."
-                )
-                await self._send_pending_payment_rows(event, payments)
+    async def _notify_admins_of_payment(self, payment_id: int) -> None:
+        payment = await self.db.payment(payment_id)
+        if payment is None:
             return
-        if command == "/audit":
-            await self._show_admin_audit(event)
-            return
-        if command == "/credit":
-            args = text.split(maxsplit=3)
-            target_id = _parse_user_id(args[1]) if len(args) > 1 else None
-            seconds = _parse_user_id(args[2]) if len(args) > 2 else None
-            reason = args[3].strip() if len(args) > 3 else ""
-            if target_id is None or seconds is None or not reason:
-                await event.reply("روش استفاده: /credit شناسه_کاربر ثانیه دلیل")
-                return
-            if target_id in self.settings.admin_ids:
-                await event.reply("برای ایمنی، اعتبار مدیریتی به مدیر دیگری افزوده نمی‌شود.")
-                return
+        text = (
+            f"🧾 پرداخت جدید شمارهٔ {to_persian_digits(payment_id)}\n"
+            f"کاربر: {payment['user_id']}\n"
+            f"طرح: {payment['plan_code']}\n"
+            "برای بررسی: پنل مدیریت → 🧾 پرداخت‌ها"
+        )
+        for admin_id in self.settings.admin_ids:
             try:
-                credit = await self.db.add_admin_credit(target_id, seconds, admin_id, reason)
-            except ValueError as exc:
-                await event.reply(str(exc))
-                return
-            if credit is None:
-                await event.reply("این کاربر در پایگاه‌داده پیدا نشد.")
-                return
-            await event.reply(
-                f"{format_duration(credit['seconds'])} اعتبار به کاربر {target_id} افزوده شد و ثبت حسابرسی شد.",
-                buttons=admin_menu(),
-            )
-            return
-        if command == "/unlimited":
-            args = text.split(maxsplit=3)
-            target_id = _parse_user_id(args[1]) if len(args) > 1 else None
-            flag_word = args[2].strip().lower() if len(args) > 2 else ""
-            reason = args[3].strip() if len(args) > 3 else ""
-            if target_id is None or flag_word not in {"on", "off", "روشن", "خاموش"} or not reason:
-                await event.reply(
-                    "روش استفاده: /unlimited شناسه_کاربر on|off دلیل\n"
-                    "مثال: /unlimited 123456789 on همکار پشتیبانی"
-                )
-                return
-            unlimited = flag_word in {"on", "روشن"}
-            try:
-                result = await self.db.set_user_unlimited(
-                    target_id, unlimited, admin_id, reason
-                )
-            except ValueError as exc:
-                await event.reply(str(exc))
-                return
-            if result is None:
-                await event.reply("این کاربر در پایگاه‌داده پیدا نشد.")
-                return
-            if not result["changed"]:
-                await event.reply(
-                    f"کاربر {target_id} از قبل "
-                    + ("کاربر ویژه بود." if unlimited else "کاربر عادی بود.")
-                )
-                return
-            await event.reply(
-                f"کاربر {target_id} "
-                + (
-                    "به فهرست کاربران ویژه اضافه شد؛ استفادهٔ او دیگر اعتبار کم نمی‌کند."
-                    if unlimited
-                    else "از فهرست کاربران ویژه حذف شد؛ از این پس اعتبارش کسر می‌شود."
-                ),
-                buttons=admin_menu(),
-            )
-            return
-        if command == "/users":
-            # The flat export copy stays a *copy*, but it says so: 50 rows out of
-            # a larger table used to read like the whole user base.
-            stats = await self.db.stats()
-            total = int(stats.get("users") or 0)
-            users = await self.db.user_summaries(limit=self.USERS_EXPORT_ROWS)
-            title = "👥 کاربران" + (
-                f" — {to_persian_digits(len(users))} کاربر اخیر از "
-                f"{to_persian_digits(total)} کاربر"
-                if total > len(users)
-                else ""
-            )
-            await self._send_long_message(
-                event, self._users_text(users, title=title), is_admin=True
-            )
-            return
-        if command == "/stats":
-            stats = await self.db.stats()
-            await event.reply(self._stats_text(stats), buttons=admin_menu())
-            return
-        if command in {"/ban", "/unban"}:
-            args = text.split(maxsplit=1)
-            target_id = _parse_user_id(args[1]) if len(args) == 2 else None
-            if target_id is None:
-                await event.reply(f"روش استفاده: {command} شناسه_عددی_کاربر")
-                return
-            if target_id in self.settings.admin_ids:
-                await event.reply("امکان مسدودسازی یا رفع مسدودیت مدیران از این دستور وجود ندارد.")
-                return
-            changed = await self.db.set_banned(
-                target_id, command == "/ban", admin_id=admin_id
-            )
-            if not changed:
-                await event.reply("این شناسه در فهرست کاربران ربات پیدا نشد.")
-                return
-            await event.reply(
-                "کاربر مسدود شد." if command == "/ban" else "مسدودیت کاربر برداشته شد."
-            )
-            return
-        if command == "/broadcast":
-            args = text.split(maxsplit=1)
-            if len(args) != 2 or not args[1].strip():
-                await event.reply("روش استفاده: /broadcast متن پیام")
-                return
-            await event.reply("ارسال پیام همگانی آغاز شد؛ نتیجه پس از پایان اعلام می‌شود.")
-            sent = await self._broadcast(admin_id, args[1].strip())
-            await event.respond(f"ارسال همگانی پایان یافت. پیام به {sent} کاربر رسید.")
-
-    async def _send_broadcast_pages(self, telegram_id: int, pages: list[str]) -> None:
-        for page_index, page in enumerate(pages):
-            if page_index:
-                await asyncio.sleep(1.05)
-            try:
-                await self.client.send_message(telegram_id, page, parse_mode=None)
-            except FloodWaitError as exc:
-                logger.warning("Telegram flood wait during broadcast seconds=%s", exc.seconds)
-                await asyncio.sleep(exc.seconds + 1)
-                # Retry this page, not every previously delivered page.
-                await self.client.send_message(telegram_id, page, parse_mode=None)
-
-    async def _broadcast(self, admin_id: int, message: str) -> int:
-        recipients = await self.db.user_ids(include_banned=False)
-        pages = split_message(message)
-        sent = 0
-        for index, telegram_id in enumerate(recipients):
-            if index:
-                await asyncio.sleep(1.05)
-            try:
-                await self._send_broadcast_pages(telegram_id, pages)
-                sent += 1
+                await self.client.send_message(admin_id, text)
             except Exception:
-                logger.exception("Broadcast failed for user %s", telegram_id)
-        await self.db.add_broadcast(admin_id, message, sent)
-        return sent
+                logger.warning("could not notify admin=%s", admin_id)
+
+    async def _review_payment(self, event, data: str) -> None:
+        # payv:<id>:a | payv:<id>:r
+        try:
+            _, raw_id, verdict = data.split(":", 2)
+            payment_id = int(raw_id)
+        except ValueError:
+            await self._ack(event, "درخواست نامعتبر است.", alert=True)
+            return
+        approved = verdict == "a"
+        payment = await self.db.payment(payment_id)
+        if payment is None or payment["status"] != "pending":
+            await self._ack(event, "این پرداخت قبلاً بررسی شده است.", alert=True)
+            await self._show_admin_payments(event)
+            return
+        plan = await self.db.plan(payment["plan_code"])
+        hours = plan["hours"] if plan else 0
+        days = plan["validity_days"] if plan else None
+        changed = await self.db.review_payment(
+            payment_id, approved, event.sender_id,
+            plan_hours=hours, plan_validity_days=days,
+        )
+        if not changed:
+            await self._ack(event, "این پرداخت قبلاً بررسی شده است.", alert=True)
+        else:
+            await self._ack(event, "ثبت شد." if approved else "رد شد.")
+            user_text = (
+                f"✅ پرداخت شما تایید شد: {to_persian_digits(hours)} ساعت اعتبار اضافه شد."
+                if approved
+                else "❌ پرداخت شما تایید نشد. در صورت اعتراض با پشتیبانی تماس بگیرید."
+            )
+            try:
+                await self.client.send_message(payment["user_id"], user_text)
+            except Exception:
+                logger.warning("could not notify user=%s", payment["user_id"])
+        await self._show_admin_payments(event)
+
+    # ----------------------------------------------------------------- admin
+    async def _show_admin_overview(self, event) -> None:
+        stats = await self.db.stats()
+        text = (
+            "📊 نمای کلی\n\n"
+            f"👥 کاربران: {to_persian_digits(stats['users'])}\n"
+            f"✅ کارهای موفق: {to_persian_digits(stats['submissions_done'])}\n"
+            f"❌ کارهای ناموفق: {to_persian_digits(stats['submissions_failed'])}\n"
+            f"⏳ در حال پردازش/صف: {to_persian_digits(stats['submissions_active'])}\n"
+            f"⏱ مجموع صوت پیاده‌شده: {format_duration(stats['seconds_transcribed'])}\n"
+            f"💰 درآمد تاییدشده: {format_toman(stats['toman_approved'])}\n\n"
+            f"صف فعلی: {to_persian_digits(self.queue.pending)} در انتظار"
+        )
+        await self._edit_or_reply(event, text, self._admin_menu())
+
+    async def _show_admin_users(self, event) -> None:
+        users = await self.db.list_users(limit=25)
+        lines = ["👥 آخرین کاربران\n"]
+        for user in users:
+            flag = "🚫 " if user["banned"] else ""
+            lines.append(
+                f"{flag}{user['telegram_id']} — {format_duration(user['available_seconds'])}"
+            )
+        lines.append("")
+        lines.append(
+            "برای اهدای اعتبار بفرستید:\n/grant <user_id> <hours>"
+        )
+        await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
+
+    async def _show_admin_payments(self, event) -> None:
+        payments = await self.db.pending_payments()
+        if not payments:
+            await self._edit_or_reply(
+                event, "🧾 پرداخت‌ها\n\nپرداخت در انتظار بررسی نیست.", self._admin_menu()
+            )
+            return
+        buttons = []
+        lines = ["🧾 پرداخت‌های در انتظار\n"]
+        for payment in payments:
+            lines.append(
+                f"#{payment['payment_id']} — کاربر {payment['user_id']} — "
+                f"{payment['plan_code']} — رسید: {'دارد ✅' if payment['receipt_path'] else 'ندارد ❌'}"
+            )
+            buttons.append([
+                Button.inline("✅ تایید", f"payv:{payment['payment_id']}:a".encode()),
+                Button.inline("❌ رد", f"payv:{payment['payment_id']}:r".encode()),
+            ])
+        buttons.append([Button.inline("🔙 بازگشت", b"adm:home")])
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_audit(self, event) -> None:
+        rows = await self.db.recent_audit(limit=15)
+        lines = ["🛡 آخرین اقدام‌های مدیران\n"]
+        if not rows:
+            lines.append("چیزی ثبت نشده است.")
+        for row in rows:
+            lines.append(f"• {row['created_at']} — {row['admin_id']} — {row['action']}")
+        await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
+
+    async def _admin_grant(self, event, text: str) -> None:
+        parts = text.split()
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+            await event.reply("قالب درست: /grant <user_id> <hours>")
+            return
+        target, hours = int(parts[1]), int(parts[2])
+        if not (0 < hours <= 10_000):
+            await event.reply("ساعت باید بین ۱ و ۱۰۰۰۰ باشد.")
+            return
+        await self.db.ensure_user(target)
+        await self.db.add_credit(
+            target, hours * 3600, note=f"admin grant by {event.sender_id}",
+            validity_days=None, admin_id=event.sender_id,
+        )
+        await event.reply(f"✅ {format_duration(hours * 3600)} اعتبار به {target} اضافه شد.")
+
+    async def _broadcast(self, event, text: str) -> None:
+        users = await self.db.list_users(limit=100_000)
+        pages = render_pages(text)
+        sent = 0
+        for user in users:
+            try:
+                for page in pages:
+                    await self.client.send_message(user["telegram_id"], page)
+                sent += 1
+            except FloodWaitError as exc:
+                logger.warning("broadcast flood wait seconds=%s", exc.seconds)
+                await asyncio.sleep(min(exc.seconds, 60))
+            except Exception:
+                logger.debug("broadcast to %s failed", user["telegram_id"])
+        await self.db.audit(event.sender_id, "broadcast", f"text:{len(text)} users:{sent}")
+        await event.reply(f"📣 پیام به {to_persian_digits(sent)} کاربر رسید.")
+
+    # --------------------------------------------------------------- cleanup
+    async def _receipt_cleanup_loop(self) -> None:
+        """Delete reviewed receipts after the retention window."""
+        while True:
+            try:
+                await asyncio.sleep(24 * 3600)
+                await self._cleanup_expired_receipts()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("receipt cleanup failed", exc_info=True)
+
+    async def _cleanup_expired_receipts(self) -> None:
+        if not self.settings.receipt_dir.is_dir():
+            return
+        from datetime import timedelta
+
+        cutoff = datetime.now() - timedelta(days=self.settings.receipt_retention_days)
+        removed = 0
+        for path in self.settings.receipt_dir.glob("receipt-*.jpg"):
+            try:
+                if datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
+                    path.unlink(missing_ok=True)
+                    removed += 1
+            except OSError:
+                continue
+        if removed:
+            logger.info("removed %d expired receipts", removed)
+
+
+# ---------------------------------------------------------------------------
+# Module-level helpers (kept importable for tests)
+# ---------------------------------------------------------------------------
+
+

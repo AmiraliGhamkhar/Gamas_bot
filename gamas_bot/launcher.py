@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 
-from .config import PROJECT_ROOT, Settings
+from .config import PROJECT_DIR, from_env
 from .instance_lock import is_locked
 
 RUNNING = "running"
@@ -35,12 +35,14 @@ MIN_SPAWN_INTERVAL_SECONDS = 45
 def ensure_running(*, min_interval: float = MIN_SPAWN_INTERVAL_SECONDS) -> str:
     """Return ``running``, ``started``, ``throttled`` or ``misconfigured``."""
     try:
-        settings = Settings.from_env()
-        settings.validate_runtime()
+        settings = from_env()
     except ValueError as exc:
         print(f"gamas-bot launcher: configuration error: {exc}", file=sys.stderr)
         return MISCONFIGURED
-    if is_locked(settings.lock_path):
+    if not settings.bot_token or settings.api_id <= 0 or not settings.api_hash:
+        print("gamas-bot launcher: TELEGRAM_BOT_TOKEN/API_ID/API_HASH missing", file=sys.stderr)
+        return MISCONFIGURED
+    if is_locked(settings.session_path.with_suffix(".lock")):
         return RUNNING
 
     data_dir = settings.session_path.parent
@@ -64,7 +66,7 @@ def ensure_running(*, min_interval: float = MIN_SPAWN_INTERVAL_SECONDS) -> str:
     with open(log_dir / "launcher.err", "wb") as err:
         subprocess.Popen(  # noqa: S603 - fixed argument vector, no shell
             [sys.executable, "-m", "gamas_bot"],
-            cwd=PROJECT_ROOT,
+            cwd=PROJECT_DIR,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,

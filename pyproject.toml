@@ -17,7 +17,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gamas-bot"
-version = "2.0.0"
+version = "3.0.0"
 description = "Persian study-note bot: lecture audio/video/PowerPoint -> structured RTL Word booklet"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -25,7 +25,6 @@ license = { text = "Proprietary" }
 dependencies = [
     # Telegram transport.
     "Telethon>=1.45,<2.0",
-    "python-socks[asyncio]>=2.4,<3.0",
     # Async HTTP (provider calls) and async SQLite.
     "aiohttp>=3.14,<4.0",
     "aiosqlite>=0.22,<1.0",
@@ -39,20 +38,6 @@ dependencies = [
     "ppt2pptx>=0.4.2,<0.5",
     # XML rewriting of OOXML parts.
     "lxml>=6.1,<7.0",
-    # Rasterising rendered pages for the offline fidelity tool
-    # (scripts/render_docx_pages.py). Pillow is also pulled in by python-pptx;
-    # declaring it makes the requirement explicit rather than incidental.
-    "Pillow>=10.0,<13.0",
-    # Persian shaping/bidi for the offline page renderer: without them the
-    # rendered pages show disconnected letters.
-    "arabic-reshaper>=3.0,<4.0",
-    "python-bidi>=0.6,<0.7",
-    # Fernet-encrypted provider credentials. The floor is the first release
-    # that contains every published fix (pip-audit reported 7 advisories in
-    # <50, including GHSA-537c-gmf6-5ccf); deployments must not resolve below
-    # it. pypdf is the rendered-PDF TOC page reader.
-    "cryptography>=50.0.0,<51.0",
-    "pypdf>=5.0,<7.0",
 ]
 
 [project.optional-dependencies]
@@ -66,7 +51,7 @@ dev = [
 gamas-bot = "gamas_bot.__main__:main"
 
 [tool.setuptools]
-packages = ["gamas_bot", "gamas_bot.ai", "gamas_bot.stt_platform"]
+packages = ["gamas_bot"]
 
 [tool.ruff]
 target-version = "py311"
