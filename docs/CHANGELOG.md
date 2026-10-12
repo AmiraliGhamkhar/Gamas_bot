@@ -1,6 +1,45 @@
 # Changelog
 
-## Unreleased — Nara-first routing, five-panel admin IA, bounded lists
+## Unreleased — v3: complete overhaul (simplicity, performance, raw text)
+
+The v3 rebuild landed as PR #45. The full contract and the phase-by-phase
+deliverables are in [`OVERHAUL_PLAN.md`](OVERHAUL_PLAN.md); the short version:
+
+* **Ground-up core, same product.** `bot.py`, `config.py`, `database.py` and the
+  `ai/` + `stt_platform/` provider platforms were rebuilt or deleted. The
+  pipeline is now `bot.py → jobs.py → media/media_worker → stt.py →
+  transcript.py → llm/notes.py → docx_export.py` over ~10.6k source lines
+  (from ~38.6k), with the kept primitives (`textnorm`, `bidi`, `telegram_text`,
+  `media`, `media_worker`, `presentations`, `progress`, `instance_lock`,
+  `logging_config`) unchanged.
+* **Database: 28 tables → 8** (`users`, `submissions`, `transcriptions`,
+  `plans`, `payments`, `ledger`, `holds`, `audit`) in one migration,
+  `migrations/v3/001_baseline.sql`. The v2 database is not migrated in place;
+  `scripts/import_v2.py` copies users, credit and the ledger across.
+* **Progressive delivery.** The raw transcript `.txt` (plus an 800-char chat
+  preview) is sent as soon as STT completes, before note generation starts.
+* **Raw text engine** (`transcript.py`): deterministic paragraphing from word
+  timings, typography-only cleanup, and a hard fidelity gate (digit groups,
+  Latin tokens, ZWNJ and non-space characters must survive every transform).
+* **Notes:** map-reduce — one map call per chunk (concurrent, bounded) plus one
+  reduce call; no repair loops, no QA re-asks. A failed notes step degrades to
+  the raw transcript the user already holds.
+* **STT:** Speechmatics / Deepgram / OpenAI-compatible with ordered failover
+  (`STT_PROVIDERS` *is* the policy) and in-memory cooldowns. Provider
+  credentials live in the environment only.
+* **DOCX:** polished RTL booklet with a link-only TOC — the LibreOffice/pypdf
+  page-number pass is gone, along with `Pillow`, `arabic-reshaper`,
+  `python-bidi`, `pypdf` and `cryptography`.
+* **Billing kept, simplified:** card-to-card receipts, plans, and the
+  append-only ledger with the reserve → settle/release invariant (a failed job
+  can never silently consume credit).
+* **Dependencies 15 → 9**; the test suite runs 190 contract tests in ~11 s.
+
+## v2 (superseded by v3) — Nara-first routing, five-panel admin IA, bounded lists
+
+> Historical: this section describes the v2 provider platforms (`admin_ai.py`,
+> `admin_stt.py`, `stt_platform/`, route tables, attestations) which the v3
+> overhaul deleted. Kept for the audit trail.
 
 ### Changed
 

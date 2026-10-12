@@ -11,7 +11,7 @@ the workload of one deployment does not justify them.
 ```
 Telegram Interface            gamas_bot/bot.py (handlers, menus, delivery)
         ↓
-Job intake + back-pressure    bounded asyncio.Queue + fixed worker pool
+Job intake + back-pressure    jobs.py (bounded asyncio.Queue + fixed worker pool)
         ↓
 Media intake                  media.py (async child process, hard timeout)
         ↓
@@ -19,44 +19,43 @@ Python media worker           media_worker.py (PyAV — no ffmpeg binary)
         ↓
 STT provider layer            stt.py (Speechmatics / Deepgram / OpenAI-compatible)
         ↓
-Normalization                 textnorm.py, units.py
+Raw text engine               transcript.py (paragraphing, fidelity gate)
         ↓
-Structuring                   structuring.py (chunk → global context → editorial)
+Progressive delivery          raw .txt + chat preview → the user, immediately
         ↓
-QA                            qa.py, units.semantic_coverage
+Notes (map-reduce)            llm.py + notes.py (one map per chunk, one reduce)
         ↓
 DOCX / PPTX export            docx_export.py, presentations.py
         ↓
 Delivery                      telegram_text.py (render → paginate → send)
 ```
 
-Cross-cutting concerns: `config.py` (settings), `database.py` (accounting,
-plans, payments, provider credentials, audit), `billing.py` (plan catalog),
-`provider_credentials.py` (Fernet-encrypted key pool), `provider_health.py`
-(cached health checks), `logging_config.py` (structured logs + `job_id`),
-`instance_lock.py` (single Telegram session guard).
+Cross-cutting concerns: `config.py` (settings), `db.py` (users, submissions,
+plans, payments, ledger, holds, audit), `billing.py` (plan catalog),
+`logging_config.py` (structured logs + `job_id`), `instance_lock.py` (single
+Telegram session guard). Provider credentials are read from the environment
+only — nothing secret is stored in the database.
 
 ## Module map
 
 | Module | Responsibility |
 | --- | --- |
-| `bot.py` | Telegram handlers, job queue, billing/admin UI, delivery orchestration |
-| `telegram_text.py` | Markdown → Telegram-safe HTML and UTF-16 pagination |
+| `__main__.py`, `launcher.py` | Entrypoint, self-check, single-instance launch |
 | `config.py` | The single configuration model; validates every environment value |
-| `database.py` | Schema, migrations, accounting ledger, payments, credentials, audit |
+| `bot.py` | Telegram handlers, menus, small admin panel, delivery orchestration |
+| `jobs.py` | Bounded queue, worker pool, clean shutdown and recovery |
+| `db.py` | Eight tables, WAL, migrations, ledger, holds, payments, audit |
 | `billing.py` | Canonical plan catalog and formatting helpers |
-| `docx_export.py` | RTL Word document: cover, frame, styles, static TOC, fonts |
-| `structuring.py` | Transcript/slide → structured notes (chunking, prompts, repair) |
-| `editorial.py` | Global-context outline and cross-chunk compilation |
-| `qa.py` | Deterministic note-quality gates |
-| `units.py` | Number/unit extraction and semantic coverage |
-| `stt.py` | Provider abstraction, retries, fallback, credential rotation |
+| `stt.py` | Three STT providers, ordered failover, in-memory cooldowns, word timings |
+| `transcript.py` | The raw text engine: paragraphing, typography cleanup, fidelity gate |
+| `llm.py` | One thin LLM client (OpenAI-compatible, Gemini, Anthropic) |
+| `notes.py` | Map-reduce note generation with deterministic merge fallback |
+| `docx_export.py` | RTL Word document: cover, styles, link-only TOC, page numbers |
 | `media.py` | Async child-process media worker with a hard timeout |
 | `media_worker.py` | PyAV probe/extract/merge (in-process, no system binaries) |
 | `presentations.py` | PPTX/legacy-PPT reading, zip-bomb limits, slide audio |
 | `progress.py` | Flood-safe progress messages |
-| `provider_credentials.py` | Encrypted provider-key storage and rotation |
-| `provider_health.py` | Cached, secret-free provider health checks |
+| `telegram_text.py` | Markdown → Telegram-safe HTML and UTF-16 pagination |
 | `textnorm.py`, `bidi.py` | Persian normalization and mixed-script run splitting |
 
 Dependency direction is acyclic: `bot.py` imports the pipeline modules, the
@@ -67,8 +66,8 @@ the package.
 
 * **Handlers** are Telethon coroutines. They never do CPU-heavy or blocking
   work inline: uploads are accepted, recorded, and queued.
-* **Job queue**: `asyncio.Queue(maxsize=MAX_PENDING_JOBS)` drained by
-  `MAX_CONCURRENT_JOBS` workers. A full queue is rejected with an explicit
+* **Job queue**: `asyncio.Queue(maxsize=MAX_QUEUED_JOBS)` drained by
+  `MAX_ACTIVE_JOBS` workers. A full queue is rejected with an explicit
   back-pressure message instead of growing an unbounded backlog.
 * **Job semaphore**: a second bound on *active* jobs, so a job started outside
   the worker pool still cannot exceed the configured concurrency.
@@ -83,23 +82,28 @@ the package.
 
 ## Data model
 
-SQLite in WAL mode with `foreign_keys=ON`, a 5 s busy timeout and a single
+SQLite in WAL mode with `foreign_keys=ON`, a busy timeout and a single
 connection guarded by an `asyncio.Lock`; write transactions use
-`BEGIN IMMEDIATE`. Migrations are plain `.sql` files applied once in filename
-order and recorded in `schema_migrations`.
+`BEGIN IMMEDIATE`. Migrations are plain `.sql` files in `migrations/v3/`,
+applied once in filename order and recorded in `schema_migrations`. The eight
+tables are `users`, `submissions`, `transcriptions`, `plans`, `payments`,
+`ledger`, `holds` and `audit`; the v2 database is not migrated in place —
+`scripts/import_v2.py` copies users, credit and the ledger across when needed.
 
-Billing is an append-only ledger, never a mutated balance: `entitlements`
-(what a user owns), `usage_reservations` (what a running job holds) and
-`usage_ledger` (every reserve/consume/release/grant event with its reason).
-`reserve → finalize` charges the measured duration; `reserve → release` returns
-it untouched on any failure or cancellation, which is why a failed job cannot
-silently consume credit.
+Billing is append-only, never a mutated balance: `ledger` rows of kind `credit`
+(seconds granted, optionally expiring) and `debit` (seconds consumed by a
+finished job), plus `holds` rows (seconds reserved by a running job).
+`available = credits(not expired) − debits − holds(not released)`. A job
+reserves before it runs, settles for the measured duration on success and
+releases everything on any failure or cancellation — which is why a failed job
+cannot silently consume credit.
 
 ## Invariants the code is built around
 
 1. A provider result is never attributed to the wrong provider.
-2. A page number in the table of contents is only ever a *measured* page
-   number; page numbers are never guessed or interpolated.
+2. The table of contents is link-only; page numbers exist only as the native
+   Word `PAGE` field in the footer. TOC page numbers are never guessed — there
+   is no layout engine in v3 to measure them.
 3. A failed job releases its reserved credit exactly once.
 4. Text never reaches a `w:t` element that Word cannot store (invalid XML
    characters are dropped, soft breaks become spaces).
@@ -107,19 +111,15 @@ silently consume credit.
    a fixed argument vector and `shell=False`.
 6. The Telegram session is guarded by an advisory lock so two processes cannot
    both poll the same bot account.
-7. A panel never pays for a provider. Opening or redrawing any AI/STT screen
-   reads SQLite only; live probes, catalog syncs and test generations are
-   separate, explicit actions, and a failed sync leaves the last valid rows in
-   place.
-8. A long list is paged, never cut. Callbacks that carry a page keep it inside
-   Telegram's 64-byte ``callback_data`` limit and degrade to the first (or last
-   valid) page when a stale or malformed token arrives. A callback carries an
-   *address*, never a *payload*: anything whose length comes from provider data
-   (a synced model id) or from admin free text (a quota scope) is addressed by
-   position — plus an identity fingerprint when the action destroys a row — since
-   one over-long name makes the entire screen unsendable, not just that button.
-9. Route order is a preference and an admin edit is a fact. Startup may align a
-   route that is still provably automatic, and never one an administrator saved.
+7. The raw text can be *reformatted*, never *lost*: every `transcript.py`
+   transform runs inside a fidelity gate that compares content fingerprints
+   (digit groups, Latin tokens, ZWNJ, non-space characters) and rejects any
+   transform that changes them.
+8. The raw transcript is delivered before note generation starts. An LLM
+   outage degrades the job to raw-only; it can never withhold the transcript
+   or silently consume credit.
+9. Provider credentials come from the environment only. No secret is ever
+   written to the database or a log line.
 
 ## Where to change things
 

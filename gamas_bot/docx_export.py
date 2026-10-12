@@ -150,14 +150,10 @@ TOC_MIN_BODY_CHARS = 2400
 TOC_LEVELS = "1-1"
 ALLOWED_TOC_LEVELS = frozenset({"1", "1-1", "1-2", "1-3"})
 
-#: Static-TOC page-number policy. ``auto`` keeps exact, renderer-verified page
-#: numbers when LibreOffice/PDF tooling is present and degrades to a link-only
-#: topic list when it is not; ``required`` restores the strict behaviour that
-#: fails rather than emit an unnumbered TOC; ``off`` skips the renderer
-#: entirely, which is the Python-only deployment mode.
-#: v3 policy: the static TOC is link-only. Page numbers in the *footer* are a
-#: native Word ``PAGE`` field and always present; TOC page numbers would need a
-#: layout engine (LibreOffice), which v3 deliberately does not require.
+#: Static-TOC policy (v3): the static TOC is link-only. Page numbers in the
+#: *footer* are a native Word ``PAGE`` field and always present; TOC page
+#: numbers would need a layout engine (LibreOffice), which v3 deliberately does
+#: not require.
 
 #: Auto-detected optional logo, used when DOCX_LOGO_PATH is not configured.
 #: Fonts and images are never downloaded at generation time.
