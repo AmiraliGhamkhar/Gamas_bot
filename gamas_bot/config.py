@@ -23,6 +23,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 
@@ -37,11 +38,69 @@ NOTE_MODES = ("full", "standard", "summary")
 RAW_TEXT_PROFILES = ("plain", "timestamped")
 
 STT_PROVIDER_ORDER = ("speechmatics", "deepgram", "openai_compatible")
-NOTE_PROVIDERS = ("openai_compatible", "gemini", "anthropic")
+
+#: Every note provider the pipeline knows, with the request style each one
+#: speaks. ``nara``/``openrouter``/``openai_compatible`` are OpenAI-compatible
+#: chat-completions APIs; ``gemini`` and ``anthropic`` have their own contracts.
+NOTE_PROVIDER_SLUGS = ("nara", "openrouter", "openai_compatible", "gemini", "anthropic")
+NOTE_REQUEST_STYLE = {
+    "nara": "openai",
+    "openrouter": "openai",
+    "openai_compatible": "openai",
+    "gemini": "gemini",
+    "anthropic": "anthropic",
+}
+NOTE_PROVIDER_LABELS = {
+    "nara": "NaraRouter",
+    "openrouter": "OpenRouter",
+    "openai_compatible": "OpenAI-compatible",
+    "gemini": "Gemini",
+    "anthropic": "Anthropic",
+}
+#: OpenAI ``response_format`` JSON mode is only sent to providers whose public
+#: API documents it (NaraRouter does not document it, so asking for it there
+#: would be an unsupported parameter).
+NOTE_JSON_OBJECT_PROVIDERS = frozenset({"openrouter", "openai_compatible"})
+#: Provider hostnames, so a deployment that configures one OpenAI-compatible
+#: slot with a ``NOTE_BASE_URL`` pointing at a documented provider keeps that
+#: provider's place in the priority order (and never becomes a duplicate leg).
+NOTE_HOST_PROVIDERS = (("bynara.id", "nara"), ("openrouter.ai", "openrouter"))
+
+#: Documented API defaults per provider. Nara's free plan currently lists
+#: ``agnes-2.5-flash`` (https://router.bynara.id/api/plans) and OpenRouter's
+#: documented free router is ``openrouter/free``
+#: (https://openrouter.ai/docs/cookbook/get-started/free-models-router-playground);
+#: both are overridable, and no model is called free without this evidence.
+DEFAULT_NARA_BASE_URL = "https://router.bynara.id/v1"
+DEFAULT_NARA_MODEL = "agnes-2.5-flash"
+DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_OPENROUTER_MODEL = "openrouter/free"
+NOTE_BASE_URL_DEFAULTS = {
+    "nara": DEFAULT_NARA_BASE_URL,
+    "openrouter": DEFAULT_OPENROUTER_BASE_URL,
+    "openai_compatible": "https://api.openai.com/v1",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta",
+    "anthropic": "https://api.anthropic.com/v1",
+}
+
+#: Default note failover order: Nara first, OpenRouter second, everything else
+#: only when it is explicitly listed and configured. The order in
+#: ``NOTE_PROVIDERS`` *is* the failover policy, exactly like ``STT_PROVIDERS``.
+DEFAULT_NOTE_PROVIDERS = "nara,openrouter"
+
 DEFAULT_NOTE_MODELS = {
     "openai_compatible": "gpt-4o-mini",
     "gemini": "gemini-2.5-flash",
+    "nara": DEFAULT_NARA_MODEL,
+    "openrouter": DEFAULT_OPENROUTER_MODEL,
 }
+
+#: Context window assumed for one note request when the operator does not say.
+#: It is the *smallest* window among the configured models that matters, because
+#: the chain must fit the tightest provider that may answer.
+DEFAULT_NOTE_CONTEXT_TOKENS = 32000
+#: A request needs at least this much room for the transcript itself.
+MIN_NOTE_INPUT_TOKENS = 4096
 
 #: Environment variable -> resolved settings attribute for the tariff. The
 #: attribute spelling matches the dataclass field exactly.
@@ -205,10 +264,19 @@ class Settings:
     stt_openai_max_upload: int
 
     # --- Note generation ----------------------------------------------------
+    note_providers: tuple[str, ...]
     note_provider: str
     note_api_key: str
     note_api_base_url: str
     note_model: str
+    nara_api_key: str
+    nara_base_url: str
+    nara_model: str
+    openrouter_api_key: str
+    openrouter_base_url: str
+    openrouter_model: str
+    gemini_api_key: str
+    note_context_tokens: int
     note_mode: str
     note_max_output_tokens: int
     note_json_mode: bool
@@ -270,15 +338,191 @@ class Settings:
         return any(configured.get(provider, False) for provider in self.stt_providers)
 
     @property
+    def nara_configured(self) -> bool:
+        return bool(self.nara_api_key)
+
+    @property
+    def openrouter_configured(self) -> bool:
+        return bool(self.openrouter_api_key)
+
+    @property
     def note_configured(self) -> bool:
-        """A note provider is usable without falling back to raw-only mode."""
-        if self.note_provider == "openai_compatible":
-            return bool(self.note_api_base_url or self.note_api_key)
-        return bool(self.note_api_key)
+        """Whether at least one provider in the active order is usable."""
+        return bool(note_routes(self))
+
+    @property
+    def note_provider_labels(self) -> tuple[str, ...]:
+        """The eligible providers, in the order they will be attempted."""
+        return tuple(route.label for route in note_routes(self))
 
     def tariff_values(self) -> dict[str, int]:
         """The resolved tariff mapping consumed by ``billing.plan_catalog``."""
         return dict(self.plan_values)
+
+
+@dataclass(frozen=True, slots=True)
+class NoteRoute:
+    """One eligible note provider: everything one request needs, and nothing else."""
+
+    slug: str
+    label: str
+    style: str
+    base_url: str
+    model: str
+    api_key: str
+    json_object_mode: bool
+
+
+def classify_note_provider(slug: str, base_url: str) -> str:
+    """The provider a configured slot really points at.
+
+    A v2-era deployment configures a single OpenAI-compatible slot through
+    ``NOTE_PROVIDER``/``NOTE_BASE_URL``; recognising a documented provider host
+    keeps that deployment in its priority place (a NaraRouter base URL stays the
+    Nara leg of the chain) instead of turning it into a generic gateway that
+    would be tried last — or twice.
+    """
+    host = (urlsplit(base_url).hostname or "").lower()
+    if not host:
+        return slug
+    for suffix, provider in NOTE_HOST_PROVIDERS:
+        if host == suffix or host.endswith("." + suffix):
+            return provider
+    return slug
+
+
+def _parse_note_providers(raw: str) -> tuple[str, ...]:
+    """Parse the note failover order: known slugs, de-duplicated, order kept."""
+    order: list[str] = []
+    for part in re.split(r"[,\s]+", raw):
+        slug = part.strip().lower()
+        if not slug:
+            continue
+        if slug not in NOTE_PROVIDER_SLUGS:
+            logger.warning(
+                "Ignoring unknown note provider %r (known: %s)",
+                slug, ", ".join(NOTE_PROVIDER_SLUGS),
+            )
+            continue
+        if slug not in order:
+            order.append(slug)
+    return tuple(order)
+
+
+def _legacy_note_configured(settings: Settings) -> bool:
+    """True when the v2-era ``NOTE_*`` slot holds an explicit configuration."""
+    return bool(settings.note_api_key or settings.note_api_base_url)
+
+
+def note_slot_credentials(settings: Settings, slug: str) -> tuple[str, str, str]:
+    """``(api_key, base_url, model)`` configured for one provider slot.
+
+    A credential belongs to exactly one provider: ``NARA_API_KEY`` and
+    ``OPENROUTER_API_KEY`` to theirs, ``GEMINI_API_KEY`` to Gemini, and the
+    v2-era ``NOTE_API_KEY``/``NOTE_BASE_URL``/``NOTE_MODEL`` trio to the slot
+    ``NOTE_PROVIDER`` names (a ``NOTE_BASE_URL`` pointing at a documented
+    provider host is classified as that provider, see
+    :func:`classify_note_provider`). Sharing one key between two providers would
+    send it to a service that never issued it, so a slot with no credential of
+    its own is simply not attempted.
+    """
+    if slug == "nara":
+        key, base, model = settings.nara_api_key, settings.nara_base_url, settings.nara_model
+    elif slug == "openrouter":
+        key = settings.openrouter_api_key
+        base, model = settings.openrouter_base_url, settings.openrouter_model
+    elif slug == "gemini":
+        key, base, model = settings.gemini_api_key, "", ""
+    else:  # openai_compatible / anthropic: configured through the v2-era slot
+        key, base, model = "", "", ""
+    if slug == settings.note_provider and _legacy_note_configured(settings):
+        key = settings.note_api_key or key
+        base = settings.note_api_base_url or base
+        model = settings.note_model or model
+    return key, base, model
+
+
+def note_route_order(settings: Settings) -> tuple[str, ...]:
+    """The explicit provider order: the declared chain, then the v2-era slot.
+
+    ``NOTE_PROVIDERS`` is the policy (default ``nara,openrouter``). A configured
+    ``NOTE_PROVIDER`` slot (the v2 spelling, still honoured) keeps its place when
+    it is already a member of that chain — a NaraRouter deployment is the Nara
+    leg — and is otherwise appended as one further explicitly configured
+    provider. Nothing is inferred at runtime, so the order survives restarts and
+    is testable from the environment alone.
+    """
+    order = list(settings.note_providers)
+    legacy = settings.note_provider if _legacy_note_configured(settings) else ""
+    if legacy and legacy not in order:
+        order.append(legacy)
+    return tuple(order)
+
+
+def _note_route(settings: Settings, slug: str) -> NoteRoute | None:
+    """Build one provider's route, or ``None`` when its slot is not configured.
+
+    Eligibility is configuration, never assumption: a hosted provider needs its
+    own credential (a missing key is not a configured provider), the
+    OpenAI-compatible slot is also usable as a keyless local gateway when its
+    base URL is explicit, and a provider without a model can never build a
+    request.
+    """
+    style = NOTE_REQUEST_STYLE.get(slug)
+    if style is None:
+        return None
+    key, base, model = note_slot_credentials(settings, slug)
+    # A provider that has a documented default model uses it; ``anthropic`` has
+    # none, so it stays unusable until an operator names one (and says so in
+    # check()).
+    model = model or DEFAULT_NOTE_MODELS.get(slug, "")
+    if slug == "openai_compatible":
+        if not (key or base):
+            return None
+    elif not key:
+        return None
+    if not model:
+        return None
+    return NoteRoute(
+        slug=slug,
+        label=NOTE_PROVIDER_LABELS[slug],
+        style=style,
+        base_url=(base or NOTE_BASE_URL_DEFAULTS[slug]).rstrip("/"),
+        model=model,
+        api_key=key,
+        json_object_mode=settings.note_json_mode and slug in NOTE_JSON_OBJECT_PROVIDERS,
+    )
+
+
+def note_routes(settings: Settings) -> tuple[NoteRoute, ...]:
+    """The ordered, eligible note providers — the note pipeline's whole policy."""
+    routes: list[NoteRoute] = []
+    for slug in note_route_order(settings):
+        route = _note_route(settings, slug)
+        if route is not None:
+            routes.append(route)
+    return tuple(routes)
+
+
+def note_route_diagnostics(settings: Settings) -> list[str]:
+    """Problems in *partly* configured note providers.
+
+    A provider with no credentials in this deployment is not a problem: that is
+    what an ordered failover chain looks like. A listed provider that has a
+    credential but no model is, because a request could never be built for it.
+    """
+    problems: list[str] = []
+    for slug in note_route_order(settings):
+        if NOTE_REQUEST_STYLE.get(slug) is None or _note_route(settings, slug) is not None:
+            continue
+        key, base, model = note_slot_credentials(settings, slug)
+        has_credential = bool(key or base) if slug == "openai_compatible" else bool(key)
+        if has_credential and not model:
+            problems.append(
+                f"NOTE_MODEL must be set for the {NOTE_PROVIDER_LABELS[slug]} note "
+                "provider (a credential is configured but no model name is)."
+            )
+    return problems
 
 
 def _parse_admin_ids(raw: str) -> frozenset[int]:
@@ -321,16 +565,30 @@ def from_env(env_file: str | None = None) -> Settings:
                 break
 
     raw_providers = _env("STT_PROVIDERS", DEFAULT_STT_PROVIDERS)
+    raw_note_providers = _env("NOTE_PROVIDERS", DEFAULT_NOTE_PROVIDERS)
     explicit_note_provider = _env("NOTE_PROVIDER").lower()
-    # Preserve the old Gemini-only environment setup while keeping the
-    # documented OpenAI-compatible provider as the ordinary default.
-    note_provider = explicit_note_provider or (
-        "gemini"
-        if _env("GEMINI_API_KEY") and not _env("NOTE_API_KEY") and not _env("NOTE_BASE_URL")
-        else "openai_compatible"
+    note_api_base_url = _env("NOTE_BASE_URL").rstrip("/")
+    # The v2-era single slot (``NOTE_PROVIDER``/``NOTE_API_KEY``/``NOTE_BASE_URL``)
+    # is still honoured, and it is classified by host: a deployment that points
+    # that slot at a documented provider keeps that provider's place in the
+    # priority order instead of becoming a generic gateway. A Gemini-only
+    # environment still selects Gemini, exactly as before.
+    # A Gemini-only environment (no NOTE_* slot and no dedicated provider key)
+    # still selects Gemini; once a dedicated provider key exists, the declared
+    # chain decides and Gemini is only used when it is listed and configured.
+    gemini_only = bool(
+        _env("GEMINI_API_KEY")
+        and not _env("NOTE_API_KEY")
+        and not note_api_base_url
+        and not _env("NARA_API_KEY")
+        and not _env("OPENROUTER_API_KEY")
     )
+    legacy_slug = explicit_note_provider or (
+        "gemini" if gemini_only else "openai_compatible"
+    )
+    note_provider = classify_note_provider(legacy_slug, note_api_base_url)
     note_api_key = _env("NOTE_API_KEY") or (
-        _env("GEMINI_API_KEY") if note_provider == "gemini" else ""
+        _env("GEMINI_API_KEY") if legacy_slug == "gemini" else ""
     )
     note_model = _env("NOTE_MODEL", DEFAULT_NOTE_MODELS.get(note_provider, ""))
     plan_values = {
@@ -392,10 +650,21 @@ def from_env(env_file: str | None = None) -> Settings:
         stt_openai_max_upload=_env_int(
             "STT_OPENAI_MAX_UPLOAD_BYTES", OPENAI_STT_MAX_UPLOAD, minimum=1024
         ),
+        note_providers=_parse_note_providers(raw_note_providers),
         note_provider=note_provider,
         note_api_key=note_api_key,
-        note_api_base_url=_env("NOTE_BASE_URL").rstrip("/"),
+        note_api_base_url=note_api_base_url,
         note_model=note_model,
+        nara_api_key=_env("NARA_API_KEY"),
+        nara_base_url=_env("NARA_BASE_URL", DEFAULT_NARA_BASE_URL).rstrip("/"),
+        nara_model=_env("NARA_MODEL", DEFAULT_NARA_MODEL),
+        openrouter_api_key=_env("OPENROUTER_API_KEY"),
+        openrouter_base_url=_env("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL).rstrip("/"),
+        openrouter_model=_env("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
+        gemini_api_key=_env("GEMINI_API_KEY"),
+        note_context_tokens=_env_int(
+            "NOTE_CONTEXT_TOKENS", DEFAULT_NOTE_CONTEXT_TOKENS, minimum=2048
+        ),
         note_mode=resolve_note_mode(_env("NOTE_MODE")),
         note_max_output_tokens=_env_int("NOTE_MAX_OUTPUT_TOKENS", 16384, minimum=256),
         note_json_mode=_env_bool("NOTE_JSON_MODE", False),
@@ -417,7 +686,11 @@ def from_env(env_file: str | None = None) -> Settings:
 #: Substrings that mark a problem as advisory: the bot still runs correctly,
 #: with reduced functionality. ``run()`` and the self-check only fail on the
 #: rest.
-ADVISORY_PROBLEMS = ("raw transcripts only", "does not support Persian")
+ADVISORY_PROBLEMS = (
+    "raw transcripts only",
+    "does not support Persian",
+    "no room for the transcript",
+)
 
 
 def is_advisory(problem: str) -> bool:
@@ -451,17 +724,25 @@ def check(settings: Settings) -> list[str]:
             f"(STT_LANGUAGE={settings.stt_language}); set DEEPGRAM_MODEL to one of: "
             f"{', '.join(sorted(DEEPGRAM_PERSIAN_MODELS))}."
         )
-    if settings.note_provider not in NOTE_PROVIDERS:
+    if settings.note_provider not in NOTE_PROVIDER_SLUGS and _legacy_note_configured(settings):
         problems.append(
-            f"NOTE_PROVIDER must be one of: {', '.join(NOTE_PROVIDERS)} "
+            f"NOTE_PROVIDER must be one of: {', '.join(NOTE_PROVIDER_SLUGS)} "
             f"(got {settings.note_provider!r})."
         )
-    if settings.note_configured and not settings.note_model:
-        problems.append("NOTE_MODEL must be set for the selected note provider.")
     if not settings.note_configured:
         problems.append(
-            "Note generation is not configured (NOTE_API_KEY / NOTE_BASE_URL); "
-            "the bot will deliver raw transcripts only."
+            "Note generation is not configured (NOTE_PROVIDERS / NOTE_API_KEY / "
+            "NARA_API_KEY / OPENROUTER_API_KEY); the bot will deliver raw transcripts only."
+        )
+    # A listed provider with a credential but no model can never build a request.
+    problems.extend(note_route_diagnostics(settings))
+    # One request must fit the transcript, the system prompt and the output.
+    if settings.note_context_tokens - settings.note_max_output_tokens < MIN_NOTE_INPUT_TOKENS:
+        problems.append(
+            f"NOTE_CONTEXT_TOKENS={settings.note_context_tokens} leaves no room for the "
+            f"transcript in one note request (NOTE_MAX_OUTPUT_TOKENS="
+            f"{settings.note_max_output_tokens}); lower NOTE_MAX_OUTPUT_TOKENS or raise "
+            "NOTE_CONTEXT_TOKENS."
         )
     if not settings.admin_ids:
         problems.append("ADMIN_IDS is empty; nobody will be able to approve payments.")

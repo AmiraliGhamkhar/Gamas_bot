@@ -1,5 +1,82 @@
 # Changelog
 
+## Unreleased — 2026-10-12 — file delivery, ordered note failover, transcript safety
+
+### Fixed
+
+* **File delivery used an API that does not exist.** `_send_file` called
+  `message.reply(file=…, caption=…, force_document=True)`. `Message.reply`
+  forwards to `TelegramClient.send_message`, which accepts `file` and
+  `force_document` but **has no `caption` parameter** (the caption of a file
+  message is the `message` argument), so every raw-transcript and Word delivery
+  died with `MessageMethods.send_message() got an unexpected keyword argument
+  'caption'` and the job was reported as failed. Raw `.txt`, Word `.docx` and
+  payment receipts now go through `TelegramClient.send_file`, threaded to the
+  user's upload (`reply_to`) in a private chat or a group alike.
+* **The test double hid the defect.** `FakeJobEvent.message` was a
+  `SimpleNamespace` whose hand-written `reply(**kwargs)` accepted any keyword, so
+  the suite stayed green while production failed. The suite now uses a
+  `FakeTelegramClient`/`FakeTelegramMessage` pair that binds every call against
+  the installed Telethon signature (a `caption=` on `reply` fails the test with
+  the production `TypeError`) and mirrors `send_message` → `send_file` forwarding.
+* **The transcript is persisted before it is delivered.** A Telegram failure
+  during raw delivery no longer discards a finished transcription: the
+  `transcriptions` row is written first, and a refused `.txt` upload falls back
+  to paginated chat messages (bounded, single pass) before the job is allowed to
+  fail. Both paths failing releases the reservation and still leaves the
+  transcript in the database.
+* **The bot-level tests were reaching the network.** The pipeline tests now run
+  with no note endpoint configured (raw-only), and the end-to-end note test uses
+  a scripted session instead of `note.example` DNS failures with real backoff
+  sleeps.
+* **`scripts/cpanel_preflight.py` probed a guessed note host.** It used
+  `settings.note_provider != "disabled"` (a value the code never produces) and a
+  hardcoded host map, so it always probed `api.openai.com` and never the
+  configured providers. It now probes exactly the eligible routes.
+
+### Added
+
+* **Ordered note providers: Nara → OpenRouter → everything else.** `NOTE_PROVIDERS`
+  (default `nara,openrouter`) *is* the failover policy, with per-provider
+  configuration (`NARA_API_KEY`/`NARA_BASE_URL`/`NARA_MODEL`,
+  `OPENROUTER_API_KEY`/`OPENROUTER_BASE_URL`/`OPENROUTER_MODEL`). A provider is
+  eligible only when it is listed **and** has its own credential; a credential is
+  never reused for a second provider. The v2-era `NOTE_PROVIDER`/`NOTE_API_KEY`/
+  `NOTE_BASE_URL` slot keeps working, is classified by host (a NaraRouter base URL
+  is the Nara leg, not a duplicate generic gateway) and is tried after the
+  declared chain otherwise, so an existing deployment keeps its behaviour and its
+  provider order across restarts.
+* **Bounded, explicit failover in `gamas_bot/llm.py`.** Transient failures get
+  their small per-provider retry budget, then the next provider is tried;
+  authentication failures, rejected requests and unusable answers move on
+  immediately; a context overflow keeps its own error class so the note pipeline
+  can react to it. The failure class of the first provider is preserved, and keys
+  are still redacted from every message.
+* **Token-aware request sizing.** `NOTE_CONTEXT_TOKENS` (default 32000) minus the
+  output budget, the system prompt and the contextual material becomes the chunk
+  budget (`notes.effective_chunk_chars`); `NOTE_CHUNK_CHARS` stays an upper
+  bound. A request the provider rejects as oversized is halved at a
+  paragraph/sentence boundary and retried (bounded depth, lossless split) instead
+  of being re-sent unchanged or thrown away.
+* **Structured-output capability check.** `response_format` is only sent to
+  providers that document it (OpenRouter, generic OpenAI-compatible gateways) —
+  NaraRouter never receives an unsupported parameter.
+* **Diagnostics that say what is wrong**: a listed provider with a credential but
+  no model, a `NOTE_CONTEXT_TOKENS`/`NOTE_MAX_OUTPUT_TOKENS` combination with no
+  room for the transcript, and the eligible-provider list in `--check`.
+* `tests/test_bot.py` covers file delivery, the text fallback, total delivery
+  failure (refund + stored transcript), the Word booklet built from model notes
+  and single-settlement accounting; `tests/test_llm.py`,
+  `tests/test_notes.py` and `tests/test_config.py` cover the routing, failover,
+  budget and overflow-recovery rules.
+
+### Changed
+
+* `docs/PROVIDERS.md`, `docs/CONFIGURATION.md`, `docs/OPERATIONS.md`,
+  `docs/DEPLOY_FA.md`, `docs/SECURITY.md`, `docs/TROUBLESHOOTING.md`, `README.md`
+  and `.env.example` now describe the shipped v3 note-provider chain (the v2
+  platform documentation is marked historical in `docs/AI_PROVIDERS.md`).
+
 ## Unreleased — 2026-10-12 — special (unlimited) users
 
 ### Added

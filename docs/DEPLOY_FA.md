@@ -156,46 +156,69 @@ PPTX_LEGACY_ENABLED=false
 
 ## تنظیم API ساخت جزوه
 
-یکی از این سه روش را انتخاب کنید:
+ترتیب سرویس‌ها خودش سیاست failover است و فقط سرویس‌هایی که کلید خودشان را
+دارند امتحان می‌شوند. پیش‌فرض پروژه **نارا و سپس OpenRouter** است:
+
+```dotenv
+NOTE_PROVIDERS=nara,openrouter
+
+# نارا (NaraRouter)
+NARA_API_KEY=...
+#NARA_BASE_URL=https://router.bynara.id/v1
+#NARA_MODEL=agnes-2.5-flash
+
+# OpenRouter
+OPENROUTER_API_KEY=...
+#OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+#OPENROUTER_MODEL=openrouter/free
+```
+
+اگر فقط یک سرویس می‌خواهید، همان یکی را در `NOTE_PROVIDERS` بگذارید. برای
+سرویس‌های دیگر (Gemini، Anthropic، OpenAI یا هر Gateway سازگار با
+`/chat/completions`) همان اسلات تک‌سرویسی نسخهٔ قبل کار می‌کند:
 
 ```dotenv
 # Gemini
-NOTE_API_PROVIDER=gemini
-NOTE_API_KEY=...
-NOTE_API_MODEL=gemini-2.5-flash-lite
-```
+NOTE_PROVIDER=gemini
+GEMINI_API_KEY=...
+#NOTE_MODEL=gemini-2.5-flash
 
-```dotenv
 # OpenAI یا هر API سازگار با /chat/completions
-NOTE_API_PROVIDER=openai_compatible
+NOTE_PROVIDER=openai_compatible
 NOTE_API_KEY=...
-NOTE_API_BASE_URL=https://api.openai.com/v1
-NOTE_API_MODEL=gpt-4o-mini
-```
+NOTE_BASE_URL=https://api.openai.com/v1
+NOTE_MODEL=gpt-4o-mini
 
-```dotenv
-# Anthropic
-NOTE_API_PROVIDER=anthropic
+# Anthropic (مدل پیش‌فرض ندارد؛ NOTE_MODEL اجباری است)
+NOTE_PROVIDER=anthropic
 NOTE_API_KEY=...
-NOTE_API_MODEL=claude-haiku-4-5
+NOTE_MODEL=claude-haiku-4-5
 ```
 
-مدل‌های خانوادهٔ `claude-3-5-haiku` در ۲۰۲۶-۰۲-۱۹ بازنشسته شدند و دیگر پاسخ
-نمی‌دهند؛ `claude-haiku-4-5` مدل Haiku جاری است (شناسهٔ پین‌شده:
-`claude-haiku-4-5-20251001`). پارامترهای نمونه‌برداری برای هر مدل ساخته می‌شوند:
-فقط `temperature` فرستاده می‌شود و برای نسل‌هایی که مقدار غیرپیش‌فرض را رد
-می‌کنند (Opus 4.7 به بعد) حذف می‌شود؛ `top_p`/`top_k` هرگز به Anthropic
-فرستاده نمی‌شوند.
+اگر `NOTE_BASE_URL` به یکی از سرویس‌های شناخته‌شده اشاره کند
+(`router.bynara.id` یا `openrouter.ai`)، همان سرویس شناخته می‌شود و در جای
+خودش در زنجیره می‌ماند؛ یک کلید هرگز برای دو سرویس استفاده نمی‌شود.
 
-برای OpenRouter، Groq، Together، DeepSeek، Ollama یا vLLM فقط Base URL و Model را عوض کنید. اگر از هدر سفارشی زیر systemd استفاده می‌کنید، JSON را کامل داخل تک‌کوتیشن قرار دهید:
+`NOTE_CONTEXT_TOKENS` را روی کوچک‌ترین پنجرهٔ زمینهٔ مدل‌های فعال بگذارید
+(پیش‌فرض ۳۲۰۰۰). اندازهٔ هر درخواست از همین عدد حساب می‌شود: خروجی مورد
+انتظار، system prompt و زمینهٔ درس کم می‌شوند و باقی‌مانده در مرزهای پاراگراف و
+جمله تکه‌تکه می‌شود. اگر مدل باز هم درخواست را بزرگ بداند، همان تکه یک بار
+نصف می‌شود (محدود) و هرگز درخواست بزرگِ بدون‌تغییر دوباره فرستاده نمی‌شود.
 
-```dotenv
-NOTE_API_EXTRA_HEADERS_JSON='{"HTTP-Referer":"https://example.com","X-Title":"Gamas Bot"}'
-```
+خطاهای شبکه و پاسخ‌های `429` و `5xx` با Backoff محدود Retry می‌شوند؛ خطای
+اعتبارنامه، رد شدن درخواست یا پاسخ نامعتبر باعث رفتن به سرویس بعدی زنجیره
+می‌شود. سرویس ساخت جزوه با یک System Prompt سخت‌گیرانه فقط JSON می‌پذیرد
+(حالت بومی JSON فقط برای Gemini و `response_format` فقط برای سرویس‌هایی که آن
+را مستند کرده‌اند فرستاده می‌شود)، خروجی اعتبارسنجی می‌شود و در صورت نامعتبر
+بودن یک بار درخواست اصلاح تکرار می‌شود. با وجود شکست API ساخت جزوه، متن
+استخراج‌شده از بین نمی‌رود: **اول فایل `txt` متن خام و سپس جزوهٔ Word** فرستاده
+می‌شود، و اگر ارسال فایل متن خام ناموفق باشد همان متن در چند پیام (با رعایت
+سقف پیام تلگرام) تحویل داده می‌شود.
 
-خطاهای شبکه و پاسخ‌های `429` و `5xx` با Backoff محدود Retry می‌شوند. سرویس ساخت جزوه با یک System Prompt سخت‌گیرانه فقط JSON می‌پذیرد (برای Gemini حالت بومی JSON هم فعال است)؛ خروجی در کد اعتبارسنجی می‌شود و در صورت نامعتبر بودن، یک بار درخواست اصلاح تکرار می‌شود. با وجود شکست API ساخت جزوه، متن استخراج‌شده از بین نمی‌رود و به‌عنوان خروجی جایگزین ارسال می‌شود.
-
-خروجی نهایی هر کار دو فایل است: سند Word راست‌به‌چپِ مرتب (با تاریخ شمسی، جدول‌ها و کادرهای نکته/هشدار) و یک فایل `txt` با متن خام. فونت سند Word با `DOCX_FONT` قابل تغییر است (پیش‌فرض `Tahoma`؛ در صورت نیاز `B Nazanin` یا `Vazirmatn` بگذارید). انیمیشن نوار پیشرفت (چرخش هر چند ثانیه هنگام مراحل طولانی) با `PROGRESS_ANIMATION_ENABLED=false` قابل خاموش‌کردن است.
+خروجی نهایی هر کار دو فایل است: سند Word راست‌به‌چپِ مرتب (با تاریخ شمسی،
+جدول‌ها و کادرهای نکته/هشدار) و یک فایل `txt` با متن خام. اگر فقط متن خام
+رسیده باشد، در لاگ دنبال خط `note generation failed` یا `note provider failed`
+بگردید؛ نام سرویس و دلیل آن‌جا ثبت می‌شود.
 
 ### عیب‌یابی خطای HTTP 400 (مثلاً Gemini)
 

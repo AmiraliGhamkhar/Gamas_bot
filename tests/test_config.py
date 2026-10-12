@@ -8,6 +8,7 @@ from unittest import mock
 
 from gamas_bot.config import (
     DEEPGRAM_PERSIAN_MODELS,
+    note_routes,
     DEFAULT_DEEPGRAM_MODEL,
     DEFAULT_STT_PROVIDERS,
     PLAN_ENV_FIELDS,
@@ -135,6 +136,117 @@ class FromEnvTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env(PAYMENT_CARD_NUMBER="5022-2913 3290 6625"), clear=False):
             settings = from_env(env_file="/nonexistent")
         self.assertEqual(settings.payment_card_number, "5022291332906625")
+
+
+def note_env(**values):
+    """Telegram plus exactly the note-provider settings a test gives."""
+    base = {
+        "TELEGRAM_BOT_TOKEN": "123:abc",
+        "TELEGRAM_API_ID": "42",
+        "TELEGRAM_API_HASH": "hash",
+        "ADMIN_IDS": "111",
+        "SPEECHMATICS_API_KEY": "sm",
+    }
+    base.update(values)
+    return base
+
+
+class NoteProviderOrderTests(unittest.TestCase):
+    """``NOTE_PROVIDERS`` is the note failover policy, and it is testable."""
+
+    def settings(self, **values):
+        with mock.patch.dict(os.environ, note_env(**values), clear=True):
+            return from_env(env_file="/nonexistent")
+
+    @staticmethod
+    def slugs(settings):
+        return [route.slug for route in note_routes(settings)]
+
+    def test_default_order_is_nara_then_openrouter(self):
+        settings = self.settings(NARA_API_KEY="nara", OPENROUTER_API_KEY="or")
+        routes = note_routes(settings)
+        self.assertEqual(self.slugs(settings), ["nara", "openrouter"])
+        # Each provider keeps its own documented base URL and model.
+        self.assertEqual(routes[0].base_url, "https://router.bynara.id/v1")
+        self.assertEqual(routes[0].model, "agnes-2.5-flash")
+        self.assertEqual(routes[1].base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(routes[1].model, "openrouter/free")
+        self.assertTrue(settings.note_configured)
+        self.assertEqual(check(settings), [])
+
+    def test_a_missing_key_is_not_a_configured_provider(self):
+        settings = self.settings(NARA_API_KEY="nara")
+        self.assertEqual(self.slugs(settings), ["nara"])
+        self.assertFalse(settings.openrouter_configured)
+
+    def test_the_configured_order_is_the_attempted_order(self):
+        settings = self.settings(
+            NOTE_PROVIDERS="openrouter, nara", NARA_API_KEY="n", OPENROUTER_API_KEY="o"
+        )
+        self.assertEqual(self.slugs(settings), ["openrouter", "nara"])
+
+    def test_unknown_provider_slugs_are_ignored(self):
+        settings = self.settings(NOTE_PROVIDERS="nara,bogus,openrouter")
+        self.assertEqual(settings.note_providers, ("nara", "openrouter"))
+
+    def test_a_legacy_nararouter_slot_is_the_nara_leg(self):
+        """The production v2 deployment stays Nara-first, with no duplicate leg."""
+        settings = self.settings(
+            NOTE_API_KEY="legacy-key",
+            NOTE_BASE_URL="https://router.bynara.id/v1",
+            OPENROUTER_API_KEY="or",
+        )
+        self.assertEqual(settings.note_provider, "nara")
+        routes = note_routes(settings)
+        self.assertEqual([route.slug for route in routes], ["nara", "openrouter"])
+        self.assertEqual(routes[0].api_key, "legacy-key")
+        # The model default follows the classified provider, not the generic one.
+        self.assertEqual(routes[0].model, "agnes-2.5-flash")
+
+    def test_an_explicit_gateway_is_tried_after_the_chain(self):
+        settings = self.settings(
+            NARA_API_KEY="n",
+            NOTE_PROVIDER="openai_compatible",
+            NOTE_API_KEY="k",
+            NOTE_BASE_URL="https://local.example/v1",
+        )
+        self.assertEqual(self.slugs(settings), ["nara", "openai_compatible"])
+
+    def test_one_credential_never_serves_two_providers(self):
+        settings = self.settings(NOTE_PROVIDERS="nara,openrouter,gemini", NARA_API_KEY="n")
+        self.assertEqual(self.slugs(settings), ["nara"])
+
+    def test_gemini_can_be_a_fallback_with_its_own_key(self):
+        settings = self.settings(
+            NOTE_PROVIDERS="nara,gemini", NARA_API_KEY="n", GEMINI_API_KEY="g"
+        )
+        routes = note_routes(settings)
+        self.assertEqual(self.slugs(settings), ["nara", "gemini"])
+        self.assertEqual(routes[1].api_key, "g")
+        self.assertEqual(routes[1].model, "gemini-2.5-flash")
+
+    def test_a_dedicated_key_does_not_auto_select_gemini(self):
+        settings = self.settings(GEMINI_API_KEY="g", NARA_API_KEY="n")
+        self.assertEqual(self.slugs(settings), ["nara"])
+
+    def test_a_tight_context_window_is_reported_as_advisory(self):
+        settings = self.settings(
+            NARA_API_KEY="n", NOTE_CONTEXT_TOKENS="8000", NOTE_MAX_OUTPUT_TOKENS="6000"
+        )
+        problems = check(settings)
+        self.assertTrue(
+            any(is_advisory(problem) and "no room for the transcript" in problem
+                for problem in problems),
+            problems,
+        )
+
+    def test_a_credential_without_a_model_is_reported(self):
+        settings = self.settings(
+            NOTE_PROVIDER="anthropic", NOTE_API_KEY="k", NOTE_MODEL=""
+        )
+        problems = check(settings)
+        self.assertTrue(any("NOTE_MODEL" in problem for problem in problems), problems)
+        self.assertFalse(settings.note_configured)
 
 
 class CheckTests(unittest.TestCase):

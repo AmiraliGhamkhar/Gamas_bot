@@ -10,8 +10,10 @@ import aiohttp
 
 
 from gamas_bot import llm
+from gamas_bot.config import note_routes
 from gamas_bot.llm import (
     LLMAuthError,
+    LLMContextOverflowError,
     LLMResponseError,
     _build_request,
     _endpoint,
@@ -141,6 +143,35 @@ class ExtractJsonTests(unittest.TestCase):
     def test_unterminated_raises(self):
         with self.assertRaises(LLMResponseError):
             extract_json_object('{"a": 1')
+
+
+def routed_settings(**overrides):
+    """Settings whose only eligible note providers are Nara and OpenRouter.
+
+    The default order and both providers' documented API shapes come from
+    ``gamas_bot.config``; nothing here is inferred from a provider name.
+    """
+    base = {
+        "note_providers": ("nara", "openrouter"),
+        "note_provider": "",
+        "note_api_key": "",
+        "note_api_base_url": "",
+        "nara_api_key": "nara-key",
+        "openrouter_api_key": "or-key",
+    }
+    base.update(overrides)
+    return make_settings(**base)
+
+
+def chat_answer(text: str, status: int = 200) -> "FakeResponse":
+    return FakeResponse(status, {"choices": [{"message": {"content": text}}]})
+
+
+def context_overflow(status: int = 400) -> "FakeResponse":
+    return FakeResponse(status, {"error": {
+        "message": "This model's maximum context length is 8192 tokens",
+        "code": "context_length_exceeded",
+    }})
 
 
 class FakeSession:
@@ -331,6 +362,97 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LLMResponseError):
             await complete_json(session, make_settings(), system="S", user="U")
         self.assertEqual(len(session.calls), 1)
+
+
+class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
+    """Nara first, OpenRouter second, bounded retries, no silent retries."""
+
+    async def test_nara_answers_first_with_its_own_documented_request(self):
+        session = FakeSession([chat_answer("nara-answer")])
+        result = await complete(session, routed_settings(), system="S", user="U")
+        self.assertEqual(result, "nara-answer")
+        self.assertEqual(len(session.calls), 1)
+        call = session.calls[0]
+        self.assertEqual(call["url"], "https://router.bynara.id/v1/chat/completions")
+        self.assertEqual(call["headers"]["Authorization"], "Bearer nara-key")
+        self.assertEqual(call["json"]["model"], "agnes-2.5-flash")
+
+    async def test_auth_failure_moves_on_to_openrouter(self):
+        session = FakeSession([
+            FakeResponse(401, {"error": {"message": "invalid api key"}}),
+            chat_answer("openrouter-answer"),
+        ])
+        result = await complete(session, routed_settings(), system="S", user="U")
+        self.assertEqual(result, "openrouter-answer")
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(
+            session.calls[1]["url"], "https://openrouter.ai/api/v1/chat/completions"
+        )
+        self.assertEqual(session.calls[1]["headers"]["Authorization"], "Bearer or-key")
+
+    async def test_context_overflow_fails_over_to_the_next_provider(self):
+        session = FakeSession([context_overflow(), chat_answer("smaller")])
+        result = await complete(session, routed_settings(), system="S", user="U")
+        self.assertEqual(result, "smaller")
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_every_provider_failing_keeps_the_first_error_class(self):
+        session = FakeSession([context_overflow(), context_overflow()])
+        with self.assertRaises(LLMContextOverflowError) as caught:
+            await complete(session, routed_settings(), system="S", user="U")
+        message = str(caught.exception)
+        self.assertIn("NaraRouter", message)
+        self.assertIn("OpenRouter", message)
+        self.assertNotIn("nara-key", message)
+        # One attempt per provider: nothing is re-sent unchanged.
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_a_transient_failure_is_retried_on_the_same_provider(self):
+        session = FakeSession([FakeResponse(503, {}), chat_answer("recovered")])
+        with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
+            result = await complete(session, routed_settings(), system="S", user="U")
+        self.assertEqual(result, "recovered")
+        self.assertEqual(
+            [call["url"] for call in session.calls],
+            ["https://router.bynara.id/v1/chat/completions"] * 2,
+        )
+
+    async def test_a_permanent_rejection_is_not_retried_per_provider(self):
+        bad = FakeResponse(400, {"error": {"message": "unsupported parameter"}})
+        session = FakeSession([bad, FakeResponse(400, {"error": {"message": "unsupported parameter"}})])
+        with self.assertRaises(LLMResponseError):
+            await complete(session, routed_settings(), system="S", user="U")
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_json_mode_is_only_sent_where_it_is_documented(self):
+        settings = routed_settings(note_json_mode=True)
+        nara, openrouter = note_routes(settings)
+        _url, _headers, nara_payload = _build_request(settings, "S", "U", route=nara)
+        self.assertNotIn("response_format", nara_payload)
+        _url, _headers, router_payload = _build_request(settings, "S", "U", route=openrouter)
+        self.assertEqual(router_payload["response_format"], {"type": "json_object"})
+
+    async def test_malformed_json_fails_over_after_one_retry(self):
+        session = FakeSession([
+            chat_answer("not json"),
+            chat_answer("still not json"),
+            chat_answer('{"ok": true}'),
+        ])
+        payload = await complete_json(session, routed_settings(), system="S", user="U")
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(len(session.calls), 3)
+
+    async def test_nothing_configured_calls_no_provider(self):
+        settings = make_settings(
+            note_providers=("nara", "openrouter"),
+            note_provider="",
+            note_api_key="",
+            note_api_base_url="",
+        )
+        session = FakeSession([])
+        with self.assertRaises(LLMAuthError):
+            await complete(session, settings, system="S", user="U")
+        self.assertEqual(session.calls, [])
 
 
 async def _noop():

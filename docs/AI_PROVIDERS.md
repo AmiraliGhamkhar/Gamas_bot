@@ -1,5 +1,14 @@
 # Gamas AI Provider Platform
 
+> **Historical document (v2).** Everything below describes the v2 “Gamas AI
+> Provider Platform” (`gamas_bot/ai/`, provider registry, routing table,
+> credential vault, quotas, attestations, `AI_*` settings). That platform was
+> removed in v3 and **none of these settings are read any more**. The shipped
+> behaviour is a short ordered chain documented in
+> [PROVIDERS.md](PROVIDERS.md#note-generation) and `.env.example`; keep this
+> file for history and provider research only.
+
+
 This is the operational reference for the existing multi-provider note pipeline. It preserves the canonical structured-note schema and the current transcript/chunk/QA/repair/merge/DOCX/PPTX, billing, Telegram, encrypted-key, health, and deployment paths. Provider routing is an additional layer; it does not replace the note pipeline.
 
 Provider plan and capability statements below were reviewed against provider-owned documentation on **2026-10-09**. Quotas and terms can change: the URLs in the registry are the source of truth. A `$0` price or a provider-wide “free” label is not enough to enable a model under `AI_FREE_ONLY`.

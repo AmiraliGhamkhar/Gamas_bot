@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import html
+import re
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -14,8 +17,17 @@ from gamas_bot.jobs import Job
 from gamas_bot.media import MediaInfo, MediaToolError
 from gamas_bot.progress import JobProgress
 from gamas_bot.stt import STTError
+from gamas_bot.telegram_text import TELEGRAM_TEXT_LIMIT
 from gamas_bot.transcript import RawTranscript, Word
-from tests.support import FakeJobEvent, make_settings, wav_bytes
+from tests.support import (
+    docx_text,
+    sample_notes_json,
+    FakeJobEvent,
+    FakeTelegramClient,
+    FakeTelegramMessage,
+    make_settings,
+    wav_bytes,
+)
 
 USER_ID = 555
 
@@ -29,7 +41,10 @@ class BotPipelineTestCase(unittest.IsolatedAsyncioTestCase):
         self.settings = make_settings(
             db_path=root / "bot.db",
             temp_dir=root / "tmp",
-            note_api_key="",           # raw-only mode: no note API in tests
+            # Raw-only by default: no note API, so no test ever reaches the
+            # network. Subclasses that exercise note generation script a
+            # session instead of pointing at a real endpoint.
+            **{"note_api_key": "", "note_api_base_url": "", **self.settings_overrides()},
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.settings.db_path)
@@ -41,15 +56,29 @@ class BotPipelineTestCase(unittest.IsolatedAsyncioTestCase):
         self.bot = GamasBot(self.settings)
         self.bot.db = self.db
 
+    def settings_overrides(self) -> dict:
+        """Extra ``Settings`` overrides for a specialised test case."""
+        return {}
+
     async def asyncTearDown(self):
         await self.bot.shutdown()
         await self.db.close()
         self._tmp.cleanup()
 
+    def wire(self, event: FakeJobEvent) -> FakeJobEvent:
+        """Point the bot at the event's signature-enforcing Telegram client.
+
+        The bot talks to Telegram through ``self.client``; a test double that
+        enforces Telethon's real signatures is what catches a call the library
+        would reject (see ``tests/support.py``).
+        """
+        self.bot.client = event.client
+        return event
+
     def media_event(self, name: str = "source.wav") -> FakeJobEvent:
         source = Path(self._tmp.name) / name
         source.write_bytes(wav_bytes(duration=0.2))
-        return FakeJobEvent(source=source)
+        return self.wire(FakeJobEvent(source=source))
 
     async def run_media_job(
         self, event: FakeJobEvent, *, duration=100.0, credit=3600, transcribe=None
@@ -154,8 +183,10 @@ class HappyPathTests(BotPipelineTestCase):
 
     async def test_oversize_file_rejected_before_transcription(self):
         source = Path(self._tmp.name) / "source.wav"
-        source.write_bytes(b"x" * (self.settings.max_file_size + 1))
-        event = FakeJobEvent(source=source)
+        source.write_bytes(b"x" * 4096)
+        # Same comparison as production, without copying a real 2 GB upload.
+        self.bot.settings = replace(self.settings, max_file_size=1024)
+        event = self.wire(FakeJobEvent(source=source))
         submission = await self.run_media_job(event)
         row = await self.db.submission(submission)
         assert row is not None
@@ -311,6 +342,21 @@ class _SpeechmaticsFakeSession:
         return _FakeAsyncContext(self._response())
 
 
+class _SttAndLlmSession(_SpeechmaticsFakeSession):
+    """The real ``stt.transcribe`` driver plus one scripted note completion."""
+
+    def __init__(self, llm_payload: dict):
+        super().__init__()
+        self.llm_payload = llm_payload
+        self.llm_calls: list[dict] = []
+
+    def post(self, url, **kwargs):
+        if url.endswith("/chat/completions"):
+            self.llm_calls.append({"url": url, **kwargs})
+            return _FakeAsyncContext(_FakeAsyncResponse(200, self.llm_payload))
+        return super().post(url, **kwargs)
+
+
 class _FakeAsyncResponse:
     def __init__(self, status: int, payload: dict):
         self.status = status
@@ -335,6 +381,145 @@ class _FakeAsyncContext:
 
     async def __aexit__(self, *_exc):
         return False
+
+
+class FileDeliveryTests(BotPipelineTestCase):
+    """File delivery through the supported Telethon API (production incident)."""
+
+    async def test_raw_and_docx_use_send_file_with_caption_and_reply(self):
+        event = self.media_event()
+        submission = await self.run_media_job(event, transcribe=self._raw())
+
+        # ``Message.reply`` has no ``caption`` parameter — only
+        # ``TelegramClient.send_file`` accepts a captioned document. The double
+        # in tests/support.py binds every call against the real signature, so a
+        # regression to the old call fails here instead of in production.
+        raw = event.delivery(".txt")
+        self.assertTrue(raw["force_document"])
+        self.assertEqual(raw["entity"], event.message.chat_id)
+        self.assertEqual(raw["reply_to"], event.message.id)
+        self.assertIn("متن خام", raw["caption"])
+
+        docx = event.delivery(".docx")
+        self.assertTrue(docx["force_document"])
+        self.assertEqual(docx["reply_to"], event.message.id)
+        self.assertIn("جزوه", docx["caption"])
+
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "done")
+
+    async def test_caption_on_message_reply_fails_like_the_real_client(self):
+        """The old call is rejected by the double, exactly like Telethon.
+
+        ``MessageMethods.send_message() got an unexpected keyword argument
+        'caption'`` is the production error; the double reproduces it so the
+        test-suite can never again hide the defect behind a permissive mock.
+        """
+        event = FakeJobEvent()
+        with self.assertRaises(TypeError) as caught:
+            await event.message.reply(file="x.txt", caption="hi", force_document=True)
+        self.assertIn("caption", str(caught.exception))
+
+    async def test_file_failure_falls_back_to_text_and_still_settles(self):
+        event = self.media_event()
+        event.client.fail_file_delivery = True
+        submission = await self.run_media_job(event, transcribe=self._raw())
+
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "done")
+        # No file was delivered, but the transcript reached the chat as text.
+        self.assertEqual(event.files, [])
+        fallback = [text for text in event.replies if "سلام دوستان" in text]
+        self.assertTrue(fallback, event.replies)
+        # Every fallback page respects Telegram's real message limit, measured
+        # the way Telegram counts an HTML message (tags excluded, entities
+        # decoded, astral characters twice).
+        for page in fallback:
+            visible = html.unescape(re.sub(r"<[^>]+>", "", page))
+            self.assertLessEqual(len(visible.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT)
+        # The work was delivered, so the measured duration was charged once.
+        self.assertEqual(await self.debit_count(USER_ID), 1)
+        self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
+
+    async def test_total_delivery_failure_refunds_and_keeps_the_transcript(self):
+        event = self.media_event()
+        event.client.fail_file_delivery = True
+
+        async def refuse(*_args, **_kwargs):
+            raise RuntimeError("Telegram is unavailable (simulated)")
+
+        event.client.send_message = refuse
+        submission = await self.run_media_job(event, transcribe=self._raw())
+
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "failed")
+        # Nothing was delivered, so nothing is charged.
+        self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
+        self.assertEqual(await self.debit_count(USER_ID), 0)
+        # The finished transcription is not lost with the delivery attempt.
+        transcript = await self.db.transcription(submission)
+        assert transcript is not None
+        self.assertIn("سلام دوستان. امروز", transcript["text"])
+
+    async def debit_count(self, user_id: int) -> int:
+        rows = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE user_id = ? AND kind = 'debit'", (user_id,)
+        )
+        return int(rows[0][0])
+
+
+class NoteGenerationDeliveryTests(BotPipelineTestCase):
+    """Upload → STT → raw delivery → notes → Word, with a scripted provider."""
+
+    def settings_overrides(self) -> dict:
+        return {"note_api_base_url": "https://note.example/v1", "note_api_key": "note-key"}
+
+    async def test_notes_reach_the_word_booklet_and_usage_is_settled_once(self):
+        event = self.media_event()
+        session = _SttAndLlmSession(
+            {"choices": [{"message": {"content": sample_notes_json("جزوهٔ آزمون")}}]}
+        )
+        self.bot._http_session = lambda: session  # type: ignore[method-assign]
+
+        await self.db.add_credit(USER_ID, 3600, note="test")
+        submission = await self.db.create_submission(USER_ID, "audio", "a.wav")
+        progress = await JobProgress.create(event, submission_id=submission)
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="audio",
+            filename="a.wav",
+            message=event.message,
+            is_admin=False,
+            duration_hint=100.0,
+            meta={"progress": progress},
+        )
+        audio = Path(self._tmp.name) / "in.wav"
+        audio.write_bytes(wav_bytes(duration=0.2))
+        with mock.patch(
+            "gamas_bot.bot.probe_media", new=self._fake_probe(100.0),
+        ), mock.patch(
+            "gamas_bot.bot.extract_audio_track", new=self._fake_extract(audio),
+        ):
+            await self.bot._run_job(job)
+
+        # The raw transcript went out first, the structured booklet after it.
+        self.assertTrue(event.file_bytes(".txt"))
+        self.assertIn("جزوهٔ آزمون", docx_text(event.file_bytes(".docx")))
+        self.assertTrue(any("/chat/completions" in call["url"] for call in session.llm_calls))
+
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "done")
+        rows = await self.db.db.execute_fetchall(
+            "SELECT COALESCE(SUM(seconds), 0), COUNT(*) FROM ledger "
+            "WHERE user_id = ? AND kind = 'debit'",
+            (USER_ID,),
+        )
+        self.assertEqual((int(rows[0][0]), int(rows[0][1])), (100, 1))
 
 
 class ReserveEstimateTests(unittest.TestCase):
@@ -419,20 +604,42 @@ async def _no_progress(event, **_kwargs):
     return None
 
 
+class _FakeIncomingTextMessage(FakeTelegramMessage):
+    """A private text message: the fields ``_handle_message`` inspects."""
+
+    def __init__(self, client, *, sender_id: int, text: str):
+        super().__init__(client, chat_id=sender_id, message_id=4242)
+        self.message = text
+        for name in (
+            "media", "document", "audio", "voice", "video", "video_note",
+            "gif", "sticker", "file", "photo",
+        ):
+            setattr(self, name, None)
+
+
 class FakeMessageEvent:
-    """Minimal Telethon NewMessage double for the admin text commands."""
+    """Minimal Telethon NewMessage double for the admin text commands.
+
+    Replies go through the signature-enforcing client, so an admin screen that
+    sends an argument Telethon does not accept fails in the test, not in
+    production.
+    """
 
     def __init__(self, sender_id: int, text: str):
         self.sender_id = sender_id
         self.is_private = True
-        self.message = SimpleNamespace(
-            message=text, media=None, document=None, audio=None, voice=None,
-            video=None, file=None, photo=None,
+        self.record = SimpleNamespace(replies=[], files=[], file_payloads=[], edits=[])
+        self.client = FakeTelegramClient(self.record)
+        self.message = _FakeIncomingTextMessage(
+            self.client, sender_id=sender_id, text=text
         )
-        self.replies: list[str] = []
 
-    async def reply(self, text: str = "", buttons=None, **_kwargs):
-        self.replies.append(text)
+    @property
+    def replies(self) -> list[str]:
+        return self.record.replies
+
+    async def reply(self, text: str = "", **kwargs):
+        return await self.message.reply(text, **kwargs)
 
 
 class UnlimitedCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -531,6 +738,11 @@ class FakeCallbackEvent:
         self.answers: list[tuple] = []    # (text, alert)
         self.edits: list[tuple] = []      # (text, buttons)
         self.responses: list[tuple] = []  # (text, buttons)
+        self.client = FakeTelegramClient()
+
+    async def get_input_chat(self) -> int:
+        """The chat the callback happened in (used by file-like deliveries)."""
+        return self.sender_id
 
     async def answer(self, text=None, *, alert=False):
         self.answers.append((text, alert))

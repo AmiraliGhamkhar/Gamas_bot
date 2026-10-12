@@ -19,7 +19,7 @@ failed or processed; it is not left in `processing` after restart.
 ```bash
 .venv/bin/python -m scripts.cpanel_preflight
 .venv/bin/python -m gamas_bot --check
-.venv/bin/python -m scripts.validate_docx --render
+.venv/bin/python -m gamas_bot.media_worker check
 ```
 
 `🩺 وضعیت سرویس‌ها` shows provider health; `📜 گزارش مدیر` shows admin actions
@@ -27,72 +27,40 @@ and usage metadata. Provider health/catalog checks use read-only endpoints where
 available. A generation test is a separate, billable operation and must never
 be presented as a health check.
 
-## AI provider operations
+## Note-provider operations
 
-* `🤖 پلتفرم AI` in the Telegram admin panel manages providers, routes, encrypted
-  keys, explicit billing attestations, read-only catalog sync, quota summaries,
-  redacted logs, and dry-run requests.
-* Defaults are `AI_FREE_ONLY=true` and `AI_ALLOW_PAID_FALLBACK=false`. After
-  migration 007, old credentials are `unknown` and cannot generate until an
-  admin attests each stored key. Read-only health and catalog checks remain
-  available. A `free` attestation is valid only when the provider account cannot
-  bill overage (billing disabled or an enforced `$0` hard cap). The `paid`
-  attestation alone does not enable paid fallback.
-* Existing `NOTE_API_*` values are not deleted or rewritten. The current
-  `NOTE_API_PROVIDER=openai_compatible` + Nara base URL/model remains in place;
-  to authorize its environment key for generation, add the same secret to the
-  encrypted vault and attest it. Do not mark `agnes-3-flash` free: the active
-  Nara Free-plan catalog currently lists `agnes-2.5-flash`, not that legacy
-  model.
-* Provider failover is distinct from credential rotation. A failed key rotates
-  inside its provider pool before the router tries the next provider leg.
-  Provider-specific retries, RPM/TPM/daily caps, local chunk/output budgets,
-  provider quota headers, and live entitlement probes all apply. Each attempt
-  projects estimated input plus the full output-token cap and reserves it against
-  in-flight requests in the bot process before network I/O. Failed calls count
-  against local caps. Completed calls without usage metadata conservatively
-  book the configured output ceiling in the quota ledger. A failed local
-  quota-ledger read fails closed when that provider has a configured cap. These
-  process-local estimates supplement—but do not replace—the provider's
-  enforcement or required hard no-overage attestation; reservations do not
-  coordinate multiple bot processes or survive a restart.
-* The admin UI does **not** provide a manual daily-counter reset: that could
-  bypass known provider quotas. Wait for the UTC daily window/provider reset or
-  obtain a fresh documented entitlement probe. A provider 429 places the key in
-  cooldown and routes to another eligible leg.
-* Model sync uses documented endpoints with a TTL (`AI_PROVIDER_SYNC_TTL`,
-  default 24 h). Cloudflare Model Search is account-scoped and paginated; Nara
-  discovery intersects its account model list with its public Free-plan list.
-  Empty, malformed, incomplete, or failed refreshes preserve the previous valid
-  catalog. Discovery data alone never proves price, capability, or account
-  billing state.
-* Structured logs contain provider/model/status/attempt/latency/route position
-  and redacted error classes only. Prompts, transcripts, raw outputs, provider
-  response bodies, and secrets are not logged or placed in student notes.
-  See [SECURITY.md](SECURITY.md) and [AI_PROVIDERS.md](AI_PROVIDERS.md).
-* Providers whose free entitlement is a property of the account rather than of
-  published documentation (Groq today) stay out of `AI_FREE_ONLY` routes until an
-  administrator attests them under **AI → provider → 🧾 تأیید استحقاق حساب**.
-  The attestation is per deployment, audited and revocable, and it never
-  replaces the per-key billing attestation.
-* Cloudflare Workers AI is metered in Neurons, which the API does not return.
-  Gamas estimates spend pessimistically and stops before the configured daily
-  budget; the estimate is visible under **AI → provider**. Adjust
-  `neuron_budget_daily` only against a measured allocation.
-* Extra pipeline passes (outline, QA repair, final compilation) each spend
-  free-tier quota. Restrictive free providers default them off; override per
-  provider under **AI → provider → ✅/❌ طرح‌کلی / تعمیر / تلفیق** when the extra
-  quality is worth the quota.
-* Offline end-to-end platform validation (no API key required):
-  `.venv/bin/python -m scripts.validate_provider_platform`. Run it after any
-  change to the registry, profiles, routing or migrations.
-* Offline route and profile report (no API calls):
-  `.venv/bin/python -m scripts.benchmark_notes --router`.
-  Deterministic note/DOCX benchmark (offline):
-  `.venv/bin/python -m scripts.benchmark_notes --json`.
-  `--live` calls the configured model and may incur provider cost; use only after
-  reviewing the billing attestation, route, and account spend cap.
-
+* **Order is policy.** `NOTE_PROVIDERS` (default `nara,openrouter`) lists the
+  providers in the order they are attempted; only a provider with its own
+  credential is attempted at all. Changing the order means changing that one
+  variable — nothing is reordered at runtime and nothing is remembered in the
+  database, so a restart cannot change the priority.
+* **Credentials are environment-only.** `NARA_API_KEY`, `OPENROUTER_API_KEY`,
+  `GEMINI_API_KEY` and the v2-era `NOTE_API_KEY` live in `.env`/systemd; there is
+  no credential vault, key wizard or encrypted store in v3, and a key is never
+  written to the database or a user-facing message.
+* **Missing keys are visible, not silent.** `python -m gamas_bot --check` lists
+  the eligible providers and warns (without failing the process) when note
+  generation is not configured — the bot then delivers raw transcripts only.
+  The job log names every provider that was skipped for missing credentials and
+  every provider that was left behind after a failure.
+* **Failures are bounded.** Transient failures get a small retry budget per
+  provider, then the next provider is tried; an authentication failure or a
+  rejected request moves on immediately; an oversized request is split once and
+  retried, never re-sent unchanged. Duplicate provider calls are not made, and a
+  slow provider cannot extend a job past its budget: every note request has its
+  own 5-minute timeout.
+* **Only explicitly configured providers are used.** There is no implicit paid
+  fallback: a provider participates when it is listed in `NOTE_PROVIDERS`
+  (or is the configured `NOTE_PROVIDER` slot) **and** has its own credential.
+  Pointing `NOTE_PROVIDER`/`NOTE_BASE_URL` at a provider host keeps that
+  deployment in its place in the chain — a NaraRouter base URL stays the Nara
+  leg and is never duplicated.
+* **Model free status is not assumed.** The defaults are the identifiers the
+  providers publish as free (`agnes-2.5-flash` on Nara's free plan,
+  `openrouter/free` on OpenRouter); changing `NARA_MODEL`/`OPENROUTER_MODEL` is
+  an explicit decision by the operator, and Gamas never relabels a model as free.
+* **Quota/limit diagnostics stay in the log**, and no provider panel exists in
+  the bot: see [PROVIDERS.md](PROVIDERS.md#provider-diagnostics).
 ## STT platform operations
 
 * `🎙 پلتفرم STT` in the Telegram admin panel manages STT providers (registry

@@ -45,16 +45,32 @@ table is the map of what exists.
 | Logging | `LOG_FILE`, `LOG_LEVEL`, `LOG_FORMAT`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT` |
 | Job queue | `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS`, `MEDIA_TIMEOUT`, `CONVERT_TIMEOUT` |
 | Speech-to-text | `STT_PROVIDERS`, `STT_LANGUAGE`, `SPEECHMATICS_API_KEY`, `SPEECHMATICS_BASE_URL`, `SPEECHMATICS_MODEL`, `DEEPGRAM_API_KEY`, `DEEPGRAM_BASE_URL`, `DEEPGRAM_MODEL`, `STT_OPENAI_BASE_URL`, `STT_OPENAI_API_KEY`, `STT_OPENAI_MODEL`, `STT_OPENAI_MAX_UPLOAD_BYTES`, `STT_JOB_TIMEOUT`, `STT_POLL_INTERVAL` — see [STT_PROVIDERS.md](STT_PROVIDERS.md) |
-| Note generation | `NOTE_PROVIDER`, `NOTE_API_KEY`, `GEMINI_API_KEY` (legacy alias), `NOTE_BASE_URL`, `NOTE_MODEL`, `NOTE_MODE`, `NOTE_MAX_OUTPUT_TOKENS`, `NOTE_JSON_MODE`, `NOTE_CHUNK_CHARS`, `NOTE_CONCURRENCY`, `NOTE_COMPILE` |
+| Note generation | `NOTE_PROVIDERS`, `NARA_API_KEY`, `NARA_BASE_URL`, `NARA_MODEL`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`, `NOTE_PROVIDER` (v2-era slot), `NOTE_API_KEY`, `NOTE_BASE_URL`, `NOTE_MODEL`, `GEMINI_API_KEY`, `NOTE_MODE`, `NOTE_CONTEXT_TOKENS`, `NOTE_MAX_OUTPUT_TOKENS`, `NOTE_JSON_MODE`, `NOTE_CHUNK_CHARS`, `NOTE_CONCURRENCY`, `NOTE_COMPILE` |
 | Raw text | `RAW_TEXT_PROFILE` (`plain` \| `timestamped`) |
 | Presentations | `PRESENTATION_MAX_CLIPS`, `PRESENTATION_MAX_TOTAL_DURATION`, `PRESENTATION_MAX_UNPACKED_BYTES`, `PRESENTATION_MIN_CLIP_SECONDS`, `PRESENTATION_SILENCE_SECONDS`, `PRESENTATION_WAV_LIMIT_BYTES`, `PRESENTATION_INCLUDE_SLIDE_TEXT`, `PRESENTATION_INCLUDE_VIDEO_AUDIO` |
 | Billing | `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME`, `RECEIPT_DIR`, `RECEIPT_RETENTION_DAYS`, `MAX_PAYMENT_RECEIPT_BYTES`, `FREE_PLAN_HOURS`, `PLAN_*_HOURS`, `PLAN_*_PRICE_TOMAN`, `PLAN_*_VALIDITY_DAYS` |
 
 Notes:
 
-* `GEMINI_API_KEY` is only a legacy alias: when `NOTE_PROVIDER` is unset and it
-  is the only key present, `NOTE_PROVIDER=gemini` is selected automatically.
+* `NOTE_PROVIDERS` is the note failover order (default `nara,openrouter`) and
+  the only routing policy: only a provider with its **own** credential is
+  attempted, so a missing key is never treated as a configured provider.
+* `NOTE_PROVIDER` is the v2-era single slot and still works. It is classified by
+  host, so a deployment whose `NOTE_BASE_URL` is `https://router.bynara.id/v1`
+  (or `https://openrouter.ai/api/v1`) is that provider's leg of the chain
+  instead of a generic gateway. The `NOTE_API_KEY`/`NOTE_BASE_URL`/`NOTE_MODEL`
+  trio belongs to the slot `NOTE_PROVIDER` names — one credential is never sent
+  to two providers.
+* `GEMINI_API_KEY` is only a legacy alias: when `NOTE_PROVIDER` is unset, it is
+  the only key present, and no dedicated provider key exists,
+  `NOTE_PROVIDER=gemini` is selected automatically.
 * `NOTE_PROVIDER=anthropic` has no built-in default model: set `NOTE_MODEL`.
+  `NARA_MODEL`, `OPENROUTER_MODEL` and `NOTE_MODEL` all have documented
+  defaults otherwise.
+* `NOTE_CONTEXT_TOKENS` is the model context window used to size one request:
+  the expected output, the system prompt and the contextual material are
+  subtracted from it, and the rest is split into chunks at paragraph/sentence
+  boundaries. Set it to the smallest window among the configured models.
 * Speech-to-text secrets are read from the environment only. There is no
   credential vault, admin key wizard or encryption key in v3.
 
@@ -66,8 +82,11 @@ Notes:
   providers listed in `STT_PROVIDERS`**, an unknown `NOTE_PROVIDER`, an empty
   `ADMIN_IDS`; the process exits `2` at startup for these;
 * `WARN` — advisory problems that reduce functionality but keep the bot
-  running: note generation not configured (“raw transcripts only”) and a
-  Persian deployment whose `DEEPGRAM_MODEL` cannot transcribe `fa`.
+  running: note generation not configured (“raw transcripts only”), a note
+  provider that has a credential but no model name, a
+  `NOTE_CONTEXT_TOKENS`/`NOTE_MAX_OUTPUT_TOKENS` combination that leaves no room
+  for the transcript in one request, and a Persian deployment whose
+  `DEEPGRAM_MODEL` cannot transcribe `fa`.
 
 Advisory problems are printed by `--check`, written to the log at startup, and
 never prevent a job from running.

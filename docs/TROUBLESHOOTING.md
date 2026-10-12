@@ -23,9 +23,24 @@ shapes you will see:
 * `❌ این فایل از سقف حجم ربات بزرگ‌تر است.` — larger than `MAX_FILE_SIZE`.
 
 In every failure path the reserved credit is released exactly once
-(`holds.released_at`), the submission is marked `failed` with the reason, and no
-`.txt`/`.docx` is delivered. If the reserve exists without a release, that is a
-bug worth reporting with the submission id.
+(`holds.released_at`) and the submission is marked `failed` with the reason. If
+the reserve exists without a release, that is a bug worth reporting with the
+submission id.
+
+The raw transcript is a success case, not a failure case:
+
+* `📝 متن خام — GMS-000123` as a `.txt` attachment is the normal raw delivery; a
+  `📖 جزوهٔ Word — GMS-000123` `.docx` follows it. If the `.txt` upload is
+  refused, the same text is sent as paginated chat messages and the job still
+  completes — look for `raw .txt delivery failed; falling back to text` in the
+  log to see why the file could not be attached.
+* Only when both the file upload **and** the text fallback fail does the job fail
+  and the reservation get released; the finished transcript is still in the
+  `transcriptions` table for that submission id.
+* `ℹ️ این بار نتوانستم متن را به جزوهٔ ساختارمند دربیاورم` means the note
+  providers all failed — the raw transcript was already delivered. The log lines
+  `note provider failed; trying the next one` name each provider, its error class
+  and the reason; a missing key shows up as a skip, not as a request.
 
 ## STT failures
 
@@ -100,6 +115,7 @@ CT_SectPr, CT_TblPr) are the first thing to check.
 | --- | --- |
 | No reply at all | `instance_lock`, log, `python -m gamas_bot --check` |
 | Job fails | tracking reference in the log, `docs/STT_PROVIDERS.md` |
+| Only the raw text arrives | `note provider failed` lines in the log, `docs/PROVIDERS.md` |
 | Wrong billing | ledger report in the admin panel, `docs/BILLING.md` |
 | Document layout | `docs/DOCX.md` |
 | Deployment | `docs/DEPLOY_CPANEL.md`, `docs/DEPLOY_FA.md` |

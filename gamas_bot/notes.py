@@ -30,7 +30,7 @@ from dataclasses import dataclass, replace
 import aiohttp
 
 from .config import NOTE_MODES, Settings
-from .llm import LLMError, complete_json
+from .llm import LLMContextOverflowError, LLMError, complete_json
 from .progress import to_persian_digits
 from .textnorm import normalize_for_compare
 from .transcript import split_transcript
@@ -54,6 +54,22 @@ NEIGHBOUR_CONTEXT_CHARS = 260
 CONTEXT_HEAD_CHARS = 220
 #: Hard bound on the deterministic digest.
 CONTEXT_DIGEST_MAX_CHARS = 6000
+
+#: Conservative characters-per-token ratio for a Persian/English lecture.
+#: Persian tokenizes less efficiently than English on every mainstream
+#: tokenizer, and an over-estimate produces a request the provider rejects, so
+#: this is deliberately low (real Persian text is usually closer to 2.5–3).
+CHARS_PER_TOKEN = 2.0
+#: Prompt scaffolding that is neither the system prompt nor the transcript
+#: (position markers, the JSON envelope, provider boilerplate).
+PROMPT_RESERVE_TOKENS = 512
+#: The smallest request still worth sending, matching the ``NOTE_CHUNK_CHARS``
+#: lower bound in the configuration.
+MIN_REQUEST_CHARS = 2000
+MIN_REQUEST_TOKENS = 1000
+#: How many times one oversized request may be halved before the step gives up
+#: (1 → 2 → 4 requests, each cut at a paragraph/sentence boundary).
+MAX_CONTEXT_SPLITS = 2
 
 
 class StructuringError(RuntimeError):
@@ -1253,21 +1269,77 @@ def compile_accepts(compiled: StructuredNotes, merged: StructuredNotes) -> bool:
 # ===========================================================================
 
 
-async def _notes_for_chunk(
+def effective_chunk_chars(
+    settings: Settings, *, system_prompt: str, extra_reserve_chars: int = 0
+) -> int:
+    """The character budget of one note request, derived from the context window.
+
+    A character count says nothing about whether a request fits: the expected
+    output, the system prompt and the contextual material all live in the same
+    window. This subtracts them from ``NOTE_CONTEXT_TOKENS`` and converts what is
+    left with a deliberately conservative ratio, so a model with a smaller window
+    receives smaller chunks instead of a request the provider rejects.
+    ``NOTE_CHUNK_CHARS`` remains an upper bound — a smaller configured chunk is
+    never grown.
+    """
+    reserve_characters = len(system_prompt) + max(0, extra_reserve_chars)
+    reserve_tokens = int(reserve_characters / CHARS_PER_TOKEN) + PROMPT_RESERVE_TOKENS
+    available_tokens = max(
+        MIN_REQUEST_TOKENS,
+        settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens,
+    )
+    context_budget = max(MIN_REQUEST_CHARS, int(available_tokens * CHARS_PER_TOKEN))
+    # ``NOTE_CHUNK_CHARS`` may be smaller than the window allows; it is never grown.
+    return max(1, min(settings.note_chunk_chars, context_budget))
+
+
+async def _structure_piece(
     session: aiohttp.ClientSession,
     settings: Settings,
     document: str,
     *,
     system_prompt: str,
     mode: str,
+    semaphore: asyncio.Semaphore,
+    depth: int = 0,
 ) -> StructuredNotes:
-    payload = await complete_json(
-        session,
-        settings,
-        system=system_prompt,
-        user=TRANSCRIPT_PROMPT + document,
-    )
-    return _load_json_payload(payload)
+    """One note request, with bounded recovery from an oversized input.
+
+    A context overflow is the one provider error that more input can fix, so the
+    input is cut at a paragraph/sentence boundary and the halves are requested
+    instead. The depth is bounded and an input with no safe cut point is given
+    up: an unchanged oversized request is never re-sent.
+    """
+    try:
+        async with semaphore:
+            payload = await complete_json(
+                session,
+                settings,
+                system=system_prompt,
+                user=TRANSCRIPT_PROMPT + document,
+            )
+        return _load_json_payload(payload)
+    except LLMContextOverflowError as exc:
+        if depth >= MAX_CONTEXT_SPLITS:
+            raise
+        pieces = split_transcript(document, max(1, len(document) // 2))
+        if len(pieces) < 2:
+            raise
+        logger.warning(
+            "note request exceeded the model context; splitting into %d part(s) depth=%d (%s)",
+            len(pieces), depth + 1, exc,
+        )
+        parts = await asyncio.gather(
+            *(
+                _structure_piece(
+                    session, settings, piece,
+                    system_prompt=system_prompt, mode=mode,
+                    semaphore=semaphore, depth=depth + 1,
+                )
+                for piece in pieces
+            )
+        )
+        return merge_structured_notes(list(parts))
 
 
 async def structure_document(
@@ -1280,9 +1352,13 @@ async def structure_document(
 ) -> StructuredNotes:
     """Map-reduce a prepared LLM document into one structured booklet.
 
-    * one chunk → one call;
-    * several chunks → one call per chunk (concurrent, bounded) plus one
-      editorial compile call;
+    * one chunk → one request;
+    * several chunks → one request per chunk (concurrent, bounded) plus one
+      editorial compile request;
+    * the chunk budget comes from the model's context window
+      (:func:`effective_chunk_chars`), not from a character count alone;
+    * an oversized input is split at a safe boundary and retried (bounded), and
+      an overflowing chunk fails over to the next provider instead;
     * a failed chunk fails the whole step (the caller delivers the raw
       transcript, which the user already holds);
     * a failed compile falls back to the deterministic merge.
@@ -1290,22 +1366,37 @@ async def structure_document(
     document = document.strip()
     if not document:
         raise StructuringError("متن ورودی خالی بود.")
-    chunks = split_transcript(document, settings.note_chunk_chars)
+    base_system = (
+        build_presentation_system_prompt(mode)
+        if presentation
+        else build_system_prompt(mode)
+    )
+    semaphore = asyncio.Semaphore(max(1, settings.note_concurrency))
+    chunks = split_transcript(document, effective_chunk_chars(settings, system_prompt=base_system))
     if not chunks:
         raise StructuringError("متن ورودی خالی بود.")
 
     if len(chunks) == 1:
-        system = (
-            build_presentation_system_prompt(mode)
-            if presentation
-            else build_system_prompt(mode)
+        return await _structure_piece(
+            session, settings, chunks[0],
+            system_prompt=base_system, mode=mode, semaphore=semaphore,
         )
-        return await _notes_for_chunk(
-            session, settings, chunks[0], system_prompt=system, mode=mode
+
+    # A chunked request also carries the topic digest and the neighbour windows,
+    # so the document is re-cut with that material reserved for the prompt.
+    chunks = split_transcript(
+        document,
+        effective_chunk_chars(
+            settings, system_prompt=base_system, extra_reserve_chars=CONTEXT_DIGEST_MAX_CHARS
+        ),
+    )
+    if len(chunks) == 1:
+        return await _structure_piece(
+            session, settings, chunks[0],
+            system_prompt=base_system, mode=mode, semaphore=semaphore,
         )
 
     context = build_context(chunks)
-    semaphore = asyncio.Semaphore(max(1, settings.note_concurrency))
 
     async def map_chunk(index: int, chunk: str) -> StructuredNotes:
         block = context_block_for(context, chunks, index)
@@ -1315,10 +1406,10 @@ async def structure_document(
             else build_system_prompt(mode, context_block=block)
         )
         prefixed = _chunk_prefix(index, len(chunks)) + chunk
-        async with semaphore:
-            return await _notes_for_chunk(
-                session, settings, prefixed, system_prompt=system, mode=mode
-            )
+        return await _structure_piece(
+            session, settings, prefixed,
+            system_prompt=system, mode=mode, semaphore=semaphore,
+        )
 
     chunk_notes = await asyncio.gather(
         *(map_chunk(index, chunk) for index, chunk in enumerate(chunks, start=1))

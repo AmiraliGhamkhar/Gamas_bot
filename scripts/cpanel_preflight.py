@@ -219,6 +219,8 @@ def tcp_reachable(host: str, port: int, timeout: float = 6.0) -> str | None:
 
 
 def check_network(settings) -> list[Result]:
+    from gamas_bot.config import note_routes
+
     results = []
     if True:
         probes = [(host, port, tcp_reachable(host, port)) for host, port in TELEGRAM_PROBES]
@@ -241,12 +243,16 @@ def check_network(settings) -> list[Result]:
             hosts.append(("Deepgram", "https://api.deepgram.com"))
         if settings.stt_openai_base_url or '':
             hosts.append(("OpenAI-compatible STT", settings.stt_openai_base_url or ''))
-        if settings.note_provider != "disabled":
-            base = settings.note_api_base_url or {
-                "gemini": "https://generativelanguage.googleapis.com",
-                "anthropic": "https://api.anthropic.com",
-            }.get(settings.note_provider, "https://api.openai.com")
-            hosts.append((f"Note API ({settings.note_provider})", base))
+        # Probe exactly the note providers this deployment will call, in the
+        # order it will call them (the configured chain — see
+        # ``gamas_bot.config.note_routes``), not a guessed default host.
+        routes = note_routes(settings)
+        if not routes:
+            results.append(
+                Result("WARN", "Note API", "no note provider is configured; raw transcripts only")
+            )
+        for route in routes:
+            hosts.append((f"Note API ({route.slug})", route.base_url))
     for label, url in hosts:
         parsed = urlparse(url)
         port = parsed.port or (443 if parsed.scheme == "https" else 80)

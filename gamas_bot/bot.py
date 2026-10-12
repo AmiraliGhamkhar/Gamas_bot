@@ -97,6 +97,13 @@ USER_VISIBLE_ERRORS = (ValueError, PresentationError, STTConfigurationError, Med
 RAW_PREVIEW_CHARS = 800
 MAX_RAW_PREVIEW_LINES = 12
 
+#: Telegram's documented caption limit for a media message (UTF-16 code units).
+TELEGRAM_CAPTION_LIMIT = 1024
+#: Upper bound on the paginated text fallback when a file upload fails. The raw
+#: transcript is the product's core artifact, so a delivery-size failure is
+#: recovered in the chat rather than thrown away — but never unboundedly.
+RAW_FALLBACK_MAX_PAGES = 4
+
 
 # ---------------------------------------------------------------------------
 # Intake classification helpers
@@ -686,17 +693,16 @@ class GamasBot:
         )
         # ---- PROGRESSIVE DELIVERY: the raw text goes out before the notes. ----
         raw_text = render_transcript(document, self.settings.raw_text_profile)
-        raw_path = workdir / raw_text_filename(reference)
-        raw_path.write_text(raw_text, encoding="utf-8", newline="\n")
-        await self._send_file(
-            job, raw_path,
-            caption=f"📝 متن خام — {reference}" ,
-        )
-        await self._send_preview(job, raw_text)
-
+        # Persist before delivering: a Telegram outage must not lose a finished
+        # transcription (the work is done, the row is what an operator disputes).
         await self.db.save_transcription(
             job.submission_id, engine=raw.engine, text=document.plain(), notes_json=""
         )
+        raw_path = workdir / raw_text_filename(reference)
+        raw_path.write_text(raw_text, encoding="utf-8", newline="\n")
+        await self._deliver_raw(job, raw_text, raw_path, reference)
+        await self._send_preview(job, raw_text)
+
         await self._settle(job, duration)
 
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
@@ -772,14 +778,13 @@ class GamasBot:
         # ---- PROGRESSIVE DELIVERY ----
         await progress.update(70, "📝 متن خام را می‌فرستم")
         raw_text = "\n\n\n".join(part for part in raw_text_parts if part.strip())
-        raw_path = workdir / raw_text_filename(reference)
-        raw_path.write_text(raw_text, encoding="utf-8", newline="\n")
-        await self._send_file(job, raw_path, caption=f"📝 متن خام — {reference}")
-        await self._send_preview(job, raw_text)
-
         await self.db.save_transcription(
             job.submission_id, engine="stt", text=raw_text, notes_json=""
         )
+        raw_path = workdir / raw_text_filename(reference)
+        raw_path.write_text(raw_text, encoding="utf-8", newline="\n")
+        await self._deliver_raw(job, raw_text, raw_path, reference)
+        await self._send_preview(job, raw_text)
 
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
         transcript_text = document.llm_document() if document is not None else ""
@@ -885,11 +890,91 @@ class GamasBot:
             await progress.complete()
 
     async def _send_file(self, job: Job, path: Path, *, caption: str = "") -> None:
+        """Deliver one generated artifact as a Telegram document.
+
+        ``TelegramClient.send_file`` is the supported API for a captioned file.
+        ``Message.reply``/``send_message`` forward ``file`` to it but have **no**
+        ``caption`` parameter — the caption of a file message is the ``message``
+        argument — so passing ``caption`` there raises ``TypeError`` on a real
+        client (the production incident this replaced).
+
+        The destination is the upload's own chat and ``reply_to`` is that
+        message's id — the same reference ``Message.reply`` passes — so the
+        artifact stays threaded to the user's upload in a private chat and in a
+        group alike.
+
+        A job with no message cannot deliver anything: that is an error, not a
+        silent success, because the caller settles the credit for a job only
+        after its raw text has actually been delivered.
+        """
         if job.message is None:
-            return
-        await job.message.reply(
-            file=str(path), caption=caption[:1000] or None, force_document=True
+            raise RuntimeError("پیام کاربر برای ارسال فایل در دسترس نیست.")
+        await self.client.send_file(
+            await job.message.get_input_chat(),
+            str(path),
+            caption=caption[:TELEGRAM_CAPTION_LIMIT] or None,
+            force_document=True,
+            reply_to=job.message.id,
         )
+
+    async def _deliver_raw(
+        self, job: Job, raw_text: str, raw_path: Path, reference: str
+    ) -> None:
+        """Deliver the raw transcript: the ``.txt`` file first, then the text.
+
+        The transcript is the product's core artifact, so a single per-file
+        upload failure must not discard finished (and paid-for) work: the text is
+        re-sent as paginated messages that respect Telegram's real message
+        limits. The fallback is bounded and single-pass — the same artifact is
+        never re-uploaded repeatedly — and if both paths fail the job fails with
+        its reservation released, with the transcript already in the database.
+        """
+        try:
+            await self._send_file(job, raw_path, caption=f"📝 متن خام — {reference}")
+            return
+        except Exception:
+            logger.exception(
+                "raw .txt delivery failed; falling back to text submission=%s",
+                job.submission_id,
+            )
+        if job.message is None:
+            raise RuntimeError("ارسال فایل متن خام ناموفق بود.")
+        rendered = render_pages(raw_text)
+        pages = [page for page in rendered[:RAW_FALLBACK_MAX_PAGES] if page.strip()]
+        if not pages:
+            raise RuntimeError("ارسال فایل متن خام ناموفق بود.")
+        truncated = len(rendered) > len(pages)
+        delivered = 0
+        for page in pages:
+            try:
+                await self.client.send_message(
+                    await job.message.get_input_chat(),
+                    page,
+                    parse_mode="html",
+                    reply_to=job.message.id,
+                )
+            except Exception:
+                logger.warning(
+                    "raw text fallback page %d/%d failed submission=%s",
+                    delivered + 1, len(pages), job.submission_id,
+                    exc_info=True,
+                )
+                break
+            delivered += 1
+        if not delivered:
+            raise RuntimeError("ارسال متن خام ناموفق بود.")
+        logger.warning(
+            "delivered raw transcript as %d text message(s) submission=%s truncated=%s",
+            delivered, job.submission_id, truncated,
+        )
+        if truncated:
+            # Never leave a partial delivery unexplained: the user is told what
+            # arrived, and the Word booklet that follows carries the whole text.
+            await self._reply(
+                job,
+                "ℹ️ فایل متن خام به‌صورت پیوست ارسال نشد؛ بخشی از متن در پیام‌های بالا "
+                "آمد و متن کامل در جزوهٔ Word خواهد بود.",
+            )
 
     async def _send_preview(self, job: Job, raw_text: str) -> None:
         text = normalize_display(raw_text)
@@ -1182,10 +1267,15 @@ class GamasBot:
                 Button.inline("❌ رد", f"payv:{payment_id}:r".encode()),
             ])
         buttons.append([Button.inline("🔙 پرداخت‌ها", b"adm:pay")])
-        await event.respond(
-            f"📷 رسید پرداخت #{number}\n"
-            f"کاربر: {payment['user_id']} — طرح: {payment['plan_code']}",
-            file=path,
+        # The same supported file API as every other delivery, as a photo
+        # (no ``force_document``): receipts are viewed in the app, not filed.
+        await self.client.send_file(
+            await event.get_input_chat(),
+            path,
+            caption=(
+                f"📷 رسید پرداخت #{number}\n"
+                f"کاربر: {payment['user_id']} — طرح: {payment['plan_code']}"
+            )[:TELEGRAM_CAPTION_LIMIT],
             buttons=buttons,
         )
 

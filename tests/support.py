@@ -7,6 +7,7 @@ stub binaries — every fixture the suite probes/merges must actually decode.
 
 from __future__ import annotations
 
+import inspect
 import io
 import shutil
 import tempfile
@@ -14,7 +15,8 @@ import wave
 import zipfile
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
+
+from telethon import TelegramClient
 
 from gamas_bot.config import Settings
 
@@ -27,42 +29,178 @@ RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 FIXTURES_DIR = Path(__file__).resolve().parent / "fixtures"
 
 
+class FakeTelegramClient:
+    """A ``TelegramClient`` double that enforces the *installed* Telethon API.
+
+    A permissive double is what hid the production failure: ``Message.reply``
+    forwards to ``send_message``, which has **no** ``caption`` parameter (the
+    caption of a file message is its ``message`` argument), so
+    ``reply(file=…, caption=…)`` raises ``TypeError`` on a real client while a
+    hand-written fake accepted it. Every call here is therefore bound against
+    the real signature, and ``send_message`` forwards a file to ``send_file``
+    exactly as Telethon does — an unsupported keyword fails the same way it
+    fails in production.
+    """
+
+    SEND_MESSAGE = inspect.signature(TelegramClient.send_message)
+    SEND_FILE = inspect.signature(TelegramClient.send_file)
+
+    def __init__(self, recorder: "FakeJobEvent | None" = None, *, fail_file_delivery: bool = False):
+        self.recorder = recorder
+        self.fail_file_delivery = fail_file_delivery
+        #: every text message, as the arguments it was sent with.
+        self.texts: list[dict] = []
+        #: every document/photo delivery, as the arguments it was sent with.
+        self.deliveries: list[dict] = []
+        self.disconnected = False
+
+    async def disconnect(self) -> None:
+        """The shutdown path calls this on the real client."""
+        self.disconnected = True
+
+    @staticmethod
+    def _bind(signature, name: str, *args, **kwargs):
+        """Bind a call to the real Telethon signature (``None`` is ``self``)."""
+        try:
+            return signature.bind(None, *args, **kwargs)
+        except TypeError as exc:  # the error production would raise, verbatim
+            raise TypeError(f"{name}() {exc}") from None
+
+    async def send_message(self, *args, **kwargs):
+        bound = self._bind(self.SEND_MESSAGE, "send_message", *args, **kwargs)
+        bound.apply_defaults()
+        arguments = dict(bound.arguments)
+        entity = arguments.pop("entity")
+        message = arguments.pop("message")
+        file = arguments.pop("file", None)
+        if file is not None:
+            # Telethon: ``send_message`` delegates to ``send_file`` with the
+            # message text as the caption (``MessageMethods.send_message``).
+            forwarded = {
+                key: value
+                for key, value in arguments.items()
+                if key in self.SEND_FILE.parameters and key != "reply_to"
+            }
+            return await self.send_file(
+                entity, file, caption=message, reply_to=arguments.get("reply_to"), **forwarded
+            )
+        record = {"entity": entity, "text": message, **arguments}
+        self.texts.append(record)
+        if self.recorder is not None:
+            self.recorder.replies.append(message)
+        return FakeSentMessage(self, record)
+
+    async def send_file(self, *args, **kwargs):
+        bound = self._bind(self.SEND_FILE, "send_file", *args, **kwargs)
+        bound.apply_defaults()
+        arguments = dict(bound.arguments)
+        entity = arguments.pop("entity")
+        path = str(arguments.pop("file"))
+        if self.fail_file_delivery:
+            raise RuntimeError("Telegram refused the upload (simulated)")
+        record = {"entity": entity, "path": path, **arguments}
+        self.deliveries.append(record)
+        if self.recorder is not None:
+            caption = arguments.get("caption") or ""
+            try:
+                payload = Path(path).read_bytes()
+            except OSError:
+                payload = b""
+            self.recorder.files.append((caption, path))
+            self.recorder.file_payloads.append((path, payload))
+        return FakeSentMessage(self, record)
+
+
+class FakeSentMessage:
+    """The message a send produced: enough of Telethon's ``Message`` to edit."""
+
+    def __init__(self, client: FakeTelegramClient, record: dict):
+        self.client = client
+        self.record = record
+
+    async def edit(self, text: str = "", buttons=None) -> "FakeSentMessage":
+        self.record["text"] = text
+        if self.client.recorder is not None:
+            self.client.recorder.edits.append(text)
+        return self
+
+
+class FakeTelegramMessage:
+    """The incoming upload message, with Telethon's reply/respond contract.
+
+    ``reply`` sets ``reply_to`` to this message and calls ``send_message`` on the
+    client, exactly like ``telethon.tl.custom.message.Message.reply`` — so code
+    that replies with an unsupported keyword fails here too.
+    """
+
+    def __init__(
+        self,
+        client: FakeTelegramClient,
+        *,
+        chat_id: int,
+        message_id: int,
+        download=None,
+    ):
+        self.client = client
+        self._chat_id = chat_id
+        self.id = message_id
+        self._download = download
+
+    @property
+    def chat_id(self) -> int:
+        return self._chat_id
+
+    async def get_input_chat(self):
+        return self._chat_id
+
+    async def reply(self, *args, **kwargs):
+        kwargs["reply_to"] = self.id
+        return await self.client.send_message(self._chat_id, *args, **kwargs)
+
+    async def respond(self, *args, **kwargs):
+        return await self.reply(*args, **kwargs)
+
+    async def download_media(self, file: str | None = None) -> str | None:
+        if self._download is None:
+            raise AssertionError("this fake message carries no downloadable media")
+        return await self._download(file)
+
+
 class FakeJobEvent:
-    """Minimal Telethon event double that also records sent document files.
+    """Telethon event double wired to a signature-enforcing client.
 
     File payloads are snapshotted at send time because the job's temporary
     directory is removed right after delivery.
     """
 
-    def __init__(self, source: Path | None = None):
+    def __init__(self, source: Path | None = None, *, chat_id: int = 555, message_id: int = 77):
         self.source = source
         self.replies: list[str] = []
         self.responses: list[str] = []
         self.files: list[tuple[str, str]] = []
         self.file_payloads: list[tuple[str, bytes]] = []
-        if source is not None:
-            self.message = SimpleNamespace(
-                download_media=self._download, reply=self.reply
-            )
+        self.edits: list[str] = []
+        self.client = FakeTelegramClient(self)
+        self.message = FakeTelegramMessage(
+            self.client,
+            chat_id=chat_id,
+            message_id=message_id,
+            download=self._download if source is not None else None,
+        )
+
+    @property
+    def deliveries(self) -> list[dict]:
+        return self.client.deliveries
 
     async def _download(self, file: str) -> str:
         shutil.copyfile(self.source, file)
         return file
 
-    async def reply(self, text: str = "", *, file=None, **_kwargs) -> None:
-        if file is not None:
-            path = str(file)
-            try:
-                payload = Path(path).read_bytes()
-            except OSError:
-                payload = b""
-            self.files.append((text, path))
-            self.file_payloads.append((path, payload))
-        else:
-            self.replies.append(text)
+    async def reply(self, text: str = "", **kwargs) -> FakeSentMessage:
+        return await self.message.reply(text, **kwargs)
 
-    async def respond(self, text: str = "", **_kwargs) -> None:
-        self.responses.append(text)
+    async def respond(self, text: str = "", **kwargs) -> FakeSentMessage:
+        return await self.message.respond(text, **kwargs)
 
     @property
     def file_paths(self) -> list[str]:
@@ -74,6 +212,13 @@ class FakeJobEvent:
             if path.endswith(suffix):
                 return payload
         raise AssertionError(f"no sent file ends with {suffix!r}: {self.file_paths}")
+
+    def delivery(self, suffix: str) -> dict:
+        """The recorded ``send_file`` call whose path ends with ``suffix``."""
+        for record in self.deliveries:
+            if str(record["path"]).endswith(suffix):
+                return record
+        raise AssertionError(f"no send_file call delivered {suffix!r}: {self.file_paths}")
 
 
 def sample_notes_json(title: str = "جزوهٔ آزمایشی") -> str:
@@ -165,10 +310,19 @@ def make_settings(**overrides) -> Settings:
         stt_openai_api_key="",
         stt_openai_model="whisper-1",
         stt_openai_max_upload=25_000_000,
+        note_providers=("openai_compatible", "nara", "openrouter"),
         note_provider="openai_compatible",
         note_api_key="note-key",
         note_api_base_url="https://note.example/v1",
         note_model="test-model",
+        nara_api_key="",
+        nara_base_url="https://router.bynara.id/v1",
+        nara_model="agnes-2.5-flash",
+        openrouter_api_key="",
+        openrouter_base_url="https://openrouter.ai/api/v1",
+        openrouter_model="openrouter/free",
+        gemini_api_key="",
+        note_context_tokens=32000,
         note_mode="full",
         note_max_output_tokens=4096,
         note_json_mode=False,

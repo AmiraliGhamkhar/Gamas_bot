@@ -6,9 +6,12 @@ import json
 import unittest
 from unittest import mock
 
-from gamas_bot.llm import LLMError
+from gamas_bot.llm import LLMContextOverflowError, LLMError
 from gamas_bot.notes import (
+    MAX_CONTEXT_SPLITS,
+    TRANSCRIPT_PROMPT,
     StructuringError,
+    effective_chunk_chars,
     NoteSection,
     NoteTable,
     GlossaryEntry,
@@ -271,6 +274,85 @@ class CompileAcceptanceTests(unittest.TestCase):
         self.assertFalse(compile_accepts(StructuredNotes(), merged))
 
 
+class ContextBudgetTests(unittest.TestCase):
+    """The request budget comes from the model window, not from a character cap."""
+
+    def test_a_smaller_window_produces_smaller_chunks(self):
+        system = build_system_prompt("full")
+        wide = make_settings(note_context_tokens=200_000, note_max_output_tokens=4096)
+        narrow = make_settings(note_context_tokens=8192, note_max_output_tokens=2048)
+        wide_budget = effective_chunk_chars(wide, system_prompt=system)
+        narrow_budget = effective_chunk_chars(narrow, system_prompt=system)
+        self.assertEqual(wide_budget, wide.note_chunk_chars)  # window is not binding
+        self.assertLess(narrow_budget, wide_budget)
+        self.assertLess(narrow_budget, narrow.note_chunk_chars)
+
+    def test_a_configured_chunk_is_never_grown(self):
+        settings = make_settings(note_chunk_chars=4000, note_context_tokens=200_000)
+        budget = effective_chunk_chars(settings, system_prompt=build_system_prompt("full"))
+        self.assertEqual(budget, 4000)
+
+    def test_reserved_material_shrinks_the_budget(self):
+        system = build_system_prompt("full")
+        settings = make_settings(
+            note_context_tokens=40_000, note_max_output_tokens=4096, note_chunk_chars=100_000
+        )
+        without = effective_chunk_chars(settings, system_prompt=system)
+        with_digest = effective_chunk_chars(
+            settings, system_prompt=system, extra_reserve_chars=6000
+        )
+        self.assertLess(with_digest, without)
+
+    def test_a_tiny_window_still_produces_a_usable_request(self):
+        settings = make_settings(note_context_tokens=4096, note_max_output_tokens=4096)
+        budget = effective_chunk_chars(settings, system_prompt=build_system_prompt("full"))
+        self.assertGreaterEqual(budget, 1)
+        self.assertLess(budget, settings.note_chunk_chars)
+
+
+class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    """An oversized request is split at a safe boundary, never re-sent as is."""
+
+    @staticmethod
+    def document() -> str:
+        return "\n\n".join(
+            f"موضوع {index}: " + "توضیح کامل و مثال برای درس. " * 30
+            for index in range(4)
+        )
+
+    async def test_overflow_splits_the_input_and_merges_the_answers(self):
+        settings = make_settings(note_chunk_chars=100_000)
+        document = self.document()
+        session = FakeSession([
+            context_overflow_response(),
+            big_notes_json("نیمهٔ نخست"),
+            big_notes_json("نیمهٔ دوم"),
+        ])
+        notes = await structure_transcript(document, settings, session)
+        # The oversized request was replaced by two smaller ones…
+        self.assertEqual(len(session.calls), 3)
+        first = session.calls[1]["json"]["messages"][1]["content"].removeprefix(TRANSCRIPT_PROMPT)
+        second = session.calls[2]["json"]["messages"][1]["content"].removeprefix(TRANSCRIPT_PROMPT)
+        self.assertNotEqual(first, second)
+        # …and no content was lost between them (the splitter trims boundary
+        # whitespace only, never words).
+        self.assertEqual(
+            " ".join((first + " " + second).split()), " ".join(document.split())
+        )
+        # The merged booklet keeps both halves.
+        headings = [section.heading for section in notes.sections]
+        self.assertTrue(any("نیمهٔ نخست" in heading for heading in headings))
+        self.assertTrue(any("نیمهٔ دوم" in heading for heading in headings))
+
+    async def test_an_unchanged_oversized_request_is_never_retried_forever(self):
+        settings = make_settings(note_chunk_chars=100_000)
+        session = FakeSession([context_overflow_response() for _ in range(64)])
+        with self.assertRaises(LLMContextOverflowError):
+            await structure_transcript(self.document(), settings, session)
+        # 1 + 2 + 4 requests: the split depth is bounded, nothing is re-sent.
+        self.assertEqual(len(session.calls), 1 + 2 ** 1 + 2 ** MAX_CONTEXT_SPLITS)
+
+
 class _AsyncCM:
     def __init__(self, value):
         self.value = value
@@ -283,15 +365,30 @@ class _AsyncCM:
 
 
 class FakeSession:
+    """Scripted note-provider session: one answer (or error) per call."""
+
     def __init__(self, contents):
         self.contents = list(contents)
         self.calls: list[dict] = []
 
     def post(self, url, **kwargs):
         self.calls.append({"url": url, **kwargs})
+        scripted = self.contents.pop(0)
+        if isinstance(scripted, _FakeResponse):
+            return _AsyncCM(scripted)
         return _AsyncCM(_FakeResponse(200, {
-            "choices": [{"message": {"content": self.contents.pop(0)}, "finish_reason": "stop"}]
+            "choices": [{"message": {"content": scripted}, "finish_reason": "stop"}]
         }))
+
+
+def context_overflow_response() -> "_FakeResponse":
+    """A provider 400 describing an input larger than the model's window."""
+    return _FakeResponse(400, {
+        "error": {
+            "message": "This model's maximum context length is 8192 tokens",
+            "code": "context_length_exceeded",
+        }
+    })
 
 
 class _FakeResponse:
@@ -301,7 +398,8 @@ class _FakeResponse:
         self._payload = payload
 
     async def read(self):
-        return b"{}"
+        # A real provider body: the error classifiers read it.
+        return json.dumps(self._payload).encode()
 
     async def json(self, content_type=None):
         return self._payload

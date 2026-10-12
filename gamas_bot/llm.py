@@ -1,12 +1,15 @@
-"""The single LLM client for note generation.
+"""The single LLM client for note generation: ordered providers, bounded retries.
 
-Three providers — ``openai_compatible`` (OpenAI, OpenRouter, Groq, local
-gateways), ``gemini`` and ``anthropic`` — one request builder, one response
-parser, one bounded retry loop. There is no model registry, no routing table
-and no usage platform: the model comes from ``NOTE_MODEL`` and that is all.
+``NOTE_PROVIDERS`` *is* the failover policy (``nara,openrouter`` by default,
+i.e. Nara first, OpenRouter second, any other provider only when it is listed
+and configured). For every route the client builds that provider's own request
+(base URL, authentication, model, supported parameters), parses its own response
+shape, retries only transient failures — a bounded budget per provider — and
+then moves to the next eligible provider. Nothing is retried forever and a
+permanent 4xx is never re-sent unchanged.
 
 Everything the note pipeline needs is :func:`complete` (plain text) and
-:func:`complete_json` (strict JSON with exactly one deterministic retry).
+:func:`complete_json` (strict JSON, one deterministic retry, then failover).
 """
 
 from __future__ import annotations
@@ -22,7 +25,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
 
-from .config import Settings
+from .config import NoteRoute, Settings, note_routes
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +67,46 @@ class LLMResponseError(LLMError):
 
 class LLMRequestError(LLMResponseError):
     """The provider rejected the request (retrying it with new content cannot help)."""
+
+
+class LLMContextOverflowError(LLMRequestError):
+    """The request was larger than the model's context window.
+
+    Recoverable — but not by asking the same provider again with the same
+    content: the caller splits the input at a safe boundary (or lets the next
+    provider in the chain answer).
+    """
+
+
+#: Provider wording for "the input is larger than my context window". Providers
+#: are inconsistent here, so the classification is deliberately generous: it is
+#: only used to choose between splitting the input and giving up on it.
+CONTEXT_OVERFLOW_MARKERS = (
+    "context length",
+    "context_length",
+    "context window",
+    "maximum context",
+    "max context",
+    "input exceeds",
+    "exceeds the maximum",
+    "exceed the maximum",
+    "too many tokens",
+    "token limit",
+    "input is too long",
+    "prompt is too long",
+    "reduce the length",
+    "max_tokens is too large",
+    "maximum tokens",
+    "request too large",
+    "context overflow",
+    "context limit",
+)
+
+
+def is_context_overflow(detail: str) -> bool:
+    """True when a provider 400 describes an oversized input."""
+    haystack = detail.lower()
+    return any(marker in haystack for marker in CONTEXT_OVERFLOW_MARKERS)
 
 
 def _endpoint(base_url: str, suffix: str) -> str:
@@ -151,6 +194,10 @@ async def _error_from_response(
     )
     if auth_error:
         return LLMAuthError(f"{label} اعتبارنامه را نپذیرفت (HTTP {response.status}){suffix}")
+    if response.status == 400 and is_context_overflow(f"{detail or ''} {codes if error_markers else ''}"):
+        return LLMContextOverflowError(
+            f"{label} متن ورودی را بزرگ‌تر از پنجرهٔ زمینهٔ خود دانست (HTTP 400){suffix}"
+        )
     if response.status in (408, 425, 429) or response.status >= 500:
         return LLMTransientError(
             f"{label} موقتاً در دسترس نیست (HTTP {response.status}){suffix}",
@@ -159,22 +206,25 @@ async def _error_from_response(
     return LLMRequestError(f"{label} درخواست را رد کرد (HTTP {response.status}){suffix}")
 
 
-def _build_request(
-    settings: Settings, system: str, user: str
+def _build_request_for(
+    route: NoteRoute, settings: Settings, system: str, user: str
 ) -> tuple[str, dict[str, str], dict]:
-    """Build the provider request. Authentication is never caller-overridable."""
-    provider = settings.note_provider
-    key = settings.note_api_key
-    model = settings.note_model
+    """Build one provider's request from its own route.
+
+    Authentication is never caller-overridable: each style sets its documented
+    header itself.
+    """
+    style = route.style
+    key = route.api_key
+    model = route.model
     max_tokens = settings.note_max_output_tokens
 
-    if provider == "gemini":
+    if style == "gemini":
         if not key:
-            raise LLMAuthError("کلید NOTE_API_KEY (یا GEMINI_API_KEY) تنظیم نشده است.")
-        base = settings.note_api_base_url or "https://generativelanguage.googleapis.com/v1beta"
+            raise LLMAuthError("کلید سرویس تولید جزوه تنظیم نشده است.")
         # Accept the documented "models/<name>" spelling without doubling it.
         model_id = quote(model.strip().removeprefix("models/"), safe="")
-        url = _endpoint(base, f"models/{model_id}:generateContent")
+        url = _endpoint(route.base_url, f"models/{model_id}:generateContent")
         payload = {
             "contents": [{"role": "user", "parts": [{"text": user}]}],
             "systemInstruction": {"parts": [{"text": system}]},
@@ -186,10 +236,9 @@ def _build_request(
         }
         return url, {"x-goog-api-key": key}, payload
 
-    if provider == "anthropic":
+    if style == "anthropic":
         if not key:
             raise LLMAuthError("برای Anthropic باید NOTE_API_KEY تنظیم شود.")
-        base = settings.note_api_base_url or "https://api.anthropic.com/v1"
         headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
         payload = {
             "model": model,
@@ -198,10 +247,9 @@ def _build_request(
             "messages": [{"role": "user", "content": user}],
             "temperature": NOTE_TEMPERATURE,
         }
-        return _endpoint(base, "messages"), headers, payload
+        return _endpoint(route.base_url, "messages"), headers, payload
 
-    # openai_compatible
-    base = settings.note_api_base_url or "https://api.openai.com/v1"
+    # openai: NaraRouter, OpenRouter and any OpenAI-compatible gateway.
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     payload = {
         "model": model,
@@ -212,10 +260,26 @@ def _build_request(
         "temperature": NOTE_TEMPERATURE,
         "max_tokens": max_tokens,
     }
-    if settings.note_json_mode:
-        # Opt-in: not every gateway implements response_format.
+    if route.json_object_mode:
+        # Opt-in, and only for providers that document ``response_format``
+        # (NaraRouter does not, so it is never asked for it).
         payload["response_format"] = {"type": "json_object"}
-    return _endpoint(base, "chat/completions"), headers, payload
+    return _endpoint(route.base_url, "chat/completions"), headers, payload
+
+
+def _build_request(
+    settings: Settings, system: str, user: str, *, route: NoteRoute | None = None
+) -> tuple[str, dict[str, str], dict]:
+    """Build the request for one route — by default the first eligible one."""
+    if route is None:
+        routes = note_routes(settings)
+        if not routes:
+            raise LLMAuthError(
+                "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
+                "NARA_API_KEY / OPENROUTER_API_KEY)."
+            )
+        route = routes[0]
+    return _build_request_for(route, settings, system, user)
 
 
 def _parse_response(payload: dict, provider: str) -> str:
@@ -260,16 +324,16 @@ def _parse_response(payload: dict, provider: str) -> str:
     return text
 
 
-async def complete(
+async def _complete_on_route(
+    route: NoteRoute,
     session: aiohttp.ClientSession,
     settings: Settings,
     *,
     system: str,
     user: str,
 ) -> str:
-    """One completion with bounded retries; returns plain text."""
-    url, headers, payload = _build_request(settings, system, user)
-    provider = settings.note_provider
+    """One completion from one provider, with its own bounded retry budget."""
+    url, headers, payload = _build_request_for(route, settings, system, user)
     attempt = 0
     while True:
         try:
@@ -281,7 +345,7 @@ async def complete(
             ) as response:
                 if response.status != 200:
                     raise await _error_from_response(
-                        "سرویس تولید جزوه", response, settings.note_api_key or None
+                        route.label, response, route.api_key or None
                     )
                 try:
                     result = await response.json(content_type=None)
@@ -291,7 +355,7 @@ async def complete(
                     ) from exc
             if not isinstance(result, dict):
                 raise LLMResponseError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
-            return _parse_response(result, provider)
+            return _parse_response(result, route.style)
         except (LLMTransientError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if attempt >= MAX_TRANSIENT_RETRIES:
                 if isinstance(exc, LLMTransientError):
@@ -305,11 +369,58 @@ async def complete(
             )
             delay = retry_after if retry_after is not None else min(2.0**attempt, 15.0)
             logger.warning(
-                "LLM transient failure (attempt %d/%d; %s); retrying in %.1fs",
-                attempt, MAX_TRANSIENT_RETRIES + 1,
+                "LLM transient failure provider=%s (attempt %d/%d; %s); retrying in %.1fs",
+                route.slug, attempt, MAX_TRANSIENT_RETRIES + 1,
                 type(exc).__name__, delay,
             )
             await asyncio.sleep(delay)
+
+
+async def complete(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    *,
+    system: str,
+    user: str,
+) -> str:
+    """One completion from the first eligible provider that answers.
+
+    Providers are tried in the configured order. Each one gets its own bounded
+    retry budget for transient failures only; an authentication problem, a
+    rejected request or an unusable answer moves on to the next provider
+    immediately. The failure class of the *first* provider is preserved, so a
+    context overflow still reaches the caller as one.
+    """
+    routes = note_routes(settings)
+    if not routes:
+        raise LLMAuthError(
+            "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
+            "NARA_API_KEY / OPENROUTER_API_KEY)."
+        )
+    failures: list[LLMError] = []
+    descriptions: list[str] = []
+    for route in routes:
+        try:
+            text = await _complete_on_route(
+                route, session, settings, system=system, user=user
+            )
+        except LLMError as exc:
+            failures.append(exc)
+            descriptions.append(f"{route.label}: {exc}")
+            logger.warning(
+                "note provider failed; trying the next one provider=%s error=%s detail=%s",
+                route.slug, type(exc).__name__, exc,
+            )
+            continue
+        if failures:
+            logger.info(
+                "note generation succeeded after %d provider failure(s) provider=%s",
+                len(failures), route.slug,
+            )
+        return text
+    if len(descriptions) > 1:
+        logger.error("every configured note provider failed: %s", " | ".join(descriptions))
+    raise type(failures[0])("؛ ".join(descriptions))
 
 
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
@@ -369,6 +480,13 @@ def _parse_json_object(text: str) -> dict:
     return payload
 
 
+#: Prepended to the retry request when a model answered with unparsable text.
+JSON_ONLY_REMINDER = (
+    "پاسخ قبلی قابل تجزیه نبود. فقط و فقط یک شیء JSON معتبر و کامل "
+    "بدون هیچ متن یا توضیح اضافه برگردانید.\n\n"
+)
+
+
 async def complete_json(
     session: aiohttp.ClientSession,
     settings: Settings,
@@ -376,26 +494,51 @@ async def complete_json(
     system: str,
     user: str,
 ) -> dict:
-    """One completion parsed as strict JSON, with exactly one retry.
+    """A completion parsed as strict JSON, with bounded per-provider recovery.
 
-    The retry prepends a minimal "valid JSON only" reminder; anything still
-    unparsable raises :class:`LLMResponseError` and the caller degrades to the
-    raw transcript (which the user has already received).
+    Each provider gets at most two requests: the original one and a single retry
+    whose prompt is a minimal "valid JSON only" reminder. A provider that still
+    cannot produce JSON is left behind for the next provider in the chain — its
+    answer is a fresh chance rather than a repeat of the same request — and when
+    the chain runs out the caller degrades to the raw transcript, which the user
+    already holds. A rejected request (4xx) is permanent for that provider and is
+    never re-sent to it with the same content.
     """
-    try:
-        raw = await complete(session, settings, system=system, user=user)
-        return _parse_json_object(raw)
-    except LLMRequestError:
-        raise
-    except LLMResponseError as first_failure:
-        logger.warning("JSON parse failed (%s); retrying once", type(first_failure).__name__)
-    raw = await complete(
-        session,
-        settings,
-        system=system,
-        user=(
-            "پاسخ قبلی قابل تجزیه نبود. فقط و فقط یک شیء JSON معتبر و کامل "
-            "بدون هیچ متن یا توضیح اضافه برگردانید.\n\n" + user
-        ),
-    )
-    return _parse_json_object(raw)
+    routes = note_routes(settings)
+    if not routes:
+        raise LLMAuthError(
+            "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
+            "NARA_API_KEY / OPENROUTER_API_KEY)."
+        )
+    failures: list[LLMError] = []
+    descriptions: list[str] = []
+    for route in routes:
+        for attempt, prompt in enumerate((user, JSON_ONLY_REMINDER + user)):
+            try:
+                raw = await _complete_on_route(
+                    route, session, settings, system=system, user=prompt
+                )
+                return _parse_json_object(raw)
+            except LLMRequestError as exc:
+                # Permanent for this provider: another provider's model or
+                # parameters may still accept the request, this one will not.
+                failures.append(exc)
+                descriptions.append(f"{route.label}: {exc}")
+                logger.warning(
+                    "note provider rejected the request provider=%s error=%s",
+                    route.slug, exc,
+                )
+                break
+            except LLMError as exc:
+                failures.append(exc)
+                descriptions.append(f"{route.label}: {exc}")
+                logger.warning(
+                    "note request failed provider=%s attempt=%d error=%s detail=%s",
+                    route.slug, attempt + 1, type(exc).__name__, exc,
+                )
+                if not isinstance(exc, LLMResponseError) or attempt:
+                    # Transient and authentication failures already exhausted
+                    # their own budget; a second unusable answer ends this
+                    # provider's turn.
+                    break
+    raise type(failures[0])("؛ ".join(descriptions))
