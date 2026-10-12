@@ -321,13 +321,12 @@ class GamasBot:
             user_id, self._free_plan_seconds()
         ):
             logger.info("free plan granted user=%s", user_id)
-        available = await self.db.available_seconds(user_id)
         greeting = "سلام! من گاماس هستم 🌱" if first_start else "منوی اصلی"
         text = (
             f"{greeting}\n\n"
             "جزوهٔ کلاس‌تان را از یک فایل صوتی، ویدیویی یا پاورپوینت می‌سازم؛ "
             "متن خام پیاده‌سازی‌شده را هم همان لحظه تحویل می‌دهم.\n\n"
-            f"⏳ اعتبار باقی‌مانده: {format_duration(available)}"
+            f"⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
         )
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
 
@@ -340,6 +339,12 @@ class GamasBot:
 
     def _is_admin(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.settings.admin_ids
+
+    async def _balance_text(self, user_id: int) -> str:
+        """The balance as users see it: a special user has no limit to show."""
+        if await self.db.is_unlimited(user_id):
+            return "نامحدود ⭐ (کاربر ویژه)"
+        return format_duration(await self.db.available_seconds(user_id))
 
     def _free_plan_seconds(self) -> int:
         for plan in plan_catalog(self.settings.tariff_values()):
@@ -448,6 +453,9 @@ class GamasBot:
         if self._is_admin(user_id) and text.startswith("/grant"):
             await self._admin_grant(event, text)
             return
+        if self._is_admin(user_id) and text.startswith("/unlimited"):
+            await self._admin_unlimited(event, text)
+            return
 
         # Payment receipt pending for this user?
         if user_id in self._pending_payments and _is_receipt_image(event.message):
@@ -491,7 +499,8 @@ class GamasBot:
     ) -> None:
         available = await self.db.available_seconds(user_id)
         needed = self._reserve_estimate(duration)
-        if duration is not None and available < needed:
+        unlimited = await self.db.is_unlimited(user_id)
+        if not unlimited and duration is not None and available < needed:
             await event.reply(
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
                 f"مدت فایل: {format_duration(duration)} — اعتبار فعلی: {format_duration(available)}\n"
@@ -903,13 +912,13 @@ class GamasBot:
     # ------------------------------------------------------------ accounting
     async def _show_account(self, event) -> None:
         user_id = event.sender_id
-        available = await self.db.available_seconds(user_id)
+        balance = await self._balance_text(user_id)
         history = await self.db.payment_history(user_id, limit=5)
         plans = await self.db.plans()
         lines = [
             "💳 حساب شما",
             "",
-            f"⏳ اعتبار باقی‌مانده: {format_duration(available)}",
+            f"⏳ اعتبار باقی‌مانده: {balance}",
             "",
             "شارژ:",
         ]
@@ -1092,16 +1101,28 @@ class GamasBot:
             heading += " (تازه‌ترین‌ها)"
         lines = [heading + "\n"]
         for user in users:
-            flag = "🚫" if user["banned"] else "•"
+            if user["banned"]:
+                flag = "🚫"
+            elif user["is_unlimited"]:
+                flag = "⭐"
+            else:
+                flag = "•"
+            balance = (
+                "نامحدود" if user["is_unlimited"]
+                else format_duration(user["available_seconds"]) + " اعتبار"
+            )
             joined = (user["joined_at"] or "")[:10]
             lines.append(
-                f"{flag} {user['telegram_id']} — "
-                f"{format_duration(user['available_seconds'])} اعتبار"
-                f" — عضو از {joined}"
+                f"{flag} {user['telegram_id']} — {balance} — عضو از {joined}"
             )
         lines.append("")
         lines.append(
             "برای اهدای اعتبار بفرستید:\n/grant <user_id> <hours>"
+        )
+        lines.append(
+            "کاربر ویژه (بدون مصرف اعتبار):\n"
+            "/unlimited <user_id> on <دلیل>\n"
+            "/unlimited <user_id> off"
         )
         await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
 
@@ -1201,6 +1222,40 @@ class GamasBot:
             f"✅ {format_duration(hours * 3600)} اعتبار به {target} اضافه شد.",
             buttons=self._admin_menu(),
         )
+
+    async def _admin_unlimited(self, event, text: str) -> None:
+        """``/unlimited <user_id> on <reason>`` or ``/unlimited <user_id> off``."""
+        parts = text.split(maxsplit=3)
+        if len(parts) < 3 or not parts[1].isdigit() or parts[2].lower() not in ("on", "off"):
+            await event.reply(
+                "قالب درست:\n/unlimited <user_id> on <دلیل>\n/unlimited <user_id> off",
+                buttons=self._admin_menu(),
+            )
+            return
+        target = int(parts[1])
+        enable = parts[2].lower() == "on"
+        reason = parts[3].strip() if len(parts) == 4 else ""
+        if enable and not reason:
+            await event.reply(
+                "برای کاربر ویژه کردن، دلیل را هم بنویسید.",
+                buttons=self._admin_menu(),
+            )
+            return
+        if self._is_admin(target):
+            # Admins are never special users; keep the list free of operators.
+            await event.reply(
+                "مدیران به‌صورت خودکار کاربر ویژه نیستند و نمی‌توان آن‌ها را به این فهرست افزود.",
+                buttons=self._admin_menu(),
+            )
+            return
+        await self.db.ensure_user(target)
+        await self.db.set_unlimited(target, enable, admin_id=event.sender_id, reason=reason)
+        logger.info("unlimited set user=%s enabled=%s by=%s", target, enable, event.sender_id)
+        if enable:
+            message = f"⭐ کاربر {target} کاربر ویژه شد؛ استفاده از ربات برای او بدون محدودیت است."
+        else:
+            message = f"کاربر {target} دیگر کاربر ویژه نیست؛ از این پس اعتبار عادی مصرف می‌شود."
+        await event.reply(message, buttons=self._admin_menu())
 
     async def _broadcast(self, event, text: str) -> None:
         users = await self.db.list_users(limit=100_000)

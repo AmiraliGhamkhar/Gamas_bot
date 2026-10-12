@@ -118,6 +118,102 @@ class RecoveryTests(DatabaseTestCase):
         self.assertEqual(await self.db.available_seconds(100), 3000)
 
 
+class UnlimitedUserTests(DatabaseTestCase):
+    """Special (unlimited) users: never billed, usage still recorded."""
+
+    async def debit_rows(self, user_id: int) -> int:
+        rows = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE user_id = ? AND kind = 'debit'", (user_id,)
+        )
+        return int(rows[0][0])
+
+    async def hold_rows(self, user_id: int) -> int:
+        rows = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM holds WHERE user_id = ?", (user_id,)
+        )
+        return int(rows[0][0])
+
+    async def test_new_users_are_not_special(self):
+        self.assertFalse(await self.db.is_unlimited(100))
+        self.assertFalse(await self.db.is_unlimited(999_999))  # unknown user
+
+    async def test_special_user_reserve_is_never_denied(self):
+        await self.db.set_unlimited(100, True, admin_id=1, reason="استاد")
+        submission = await self.db.create_submission(100, "audio", "a.mp3")
+        # No credit at all, and a reservation far beyond any balance.
+        await self.db.reserve(100, submission, 10 * 3600)
+        self.assertEqual(await self.hold_rows(100), 0)
+        self.assertEqual(await self.db.available_seconds(100), 0)
+
+    async def test_special_user_settle_writes_no_debit(self):
+        await self.db.set_unlimited(100, True, admin_id=1, reason="استاد")
+        await self.grant(100, 3600)
+        submission = await self.db.create_submission(100, "audio", "a.mp3")
+        await self.db.reserve(100, submission, 3600)
+        await self.db.settle_hold(submission, 1800)
+        self.assertEqual(await self.debit_rows(100), 0)
+        self.assertEqual(await self.db.available_seconds(100), 3600)
+
+    async def test_job_started_before_grant_is_released_not_charged(self):
+        await self.grant(100, 3600)
+        submission = await self.db.create_submission(100, "audio", "a.mp3")
+        await self.db.reserve(100, submission, 3600)
+        await self.db.set_unlimited(100, True, admin_id=1, reason="استاد")
+        await self.db.settle_hold(submission, 1800)
+        self.assertEqual(await self.debit_rows(100), 0)
+        # The held credit came back in full.
+        self.assertEqual(await self.db.available_seconds(100), 3600)
+
+    async def test_settle_without_hold_is_quiet_for_special_user(self):
+        await self.db.set_unlimited(100, True, admin_id=1, reason="استاد")
+        submission = await self.db.create_submission(100, "audio", "a.mp3")
+        with self.assertNoLogs("gamas_bot.db", level="WARNING"):
+            await self.db.settle_hold(submission, 600)
+        self.assertEqual(await self.debit_rows(100), 0)
+
+    async def test_turning_off_restores_billing(self):
+        await self.db.set_unlimited(100, True, admin_id=1, reason="استاد")
+        await self.db.set_unlimited(100, False, admin_id=1)
+        self.assertFalse(await self.db.is_unlimited(100))
+        submission = await self.db.create_submission(100, "audio", "a.mp3")
+        with self.assertRaises(InsufficientBalanceError):
+            await self.db.reserve(100, submission, 60)
+
+    async def test_grant_is_audited_with_reason_and_provenance(self):
+        await self.db.set_unlimited(100, True, admin_id=7, reason="  استاد درس  ")
+        rows = await self.db.db.execute_fetchall(
+            "SELECT unlimited_reason, unlimited_granted_by, unlimited_granted_at "
+            "FROM users WHERE telegram_id = 100"
+        )
+        self.assertEqual(rows[0][0], "  استاد درس  ")
+        self.assertEqual(rows[0][1], 7)
+        self.assertTrue(rows[0][2])
+        audit = await self.db.recent_audit(limit=1)
+        self.assertEqual(audit[0]["action"], "unlimited_on")
+        self.assertEqual(audit[0]["admin_id"], 7)
+        self.assertEqual(audit[0]["subject_user"], 100)
+
+    async def test_revoke_is_audited_and_clears_provenance(self):
+        await self.db.set_unlimited(100, True, admin_id=7, reason="استاد")
+        await self.db.set_unlimited(100, False, admin_id=8)
+        rows = await self.db.db.execute_fetchall(
+            "SELECT unlimited_reason, unlimited_granted_by FROM users WHERE telegram_id = 100"
+        )
+        self.assertIsNone(rows[0][0])
+        self.assertIsNone(rows[0][1])
+        audit = await self.db.recent_audit(limit=1)
+        self.assertEqual(audit[0]["action"], "unlimited_off")
+        self.assertEqual(audit[0]["admin_id"], 8)
+
+    async def test_special_users_listing_and_user_flag(self):
+        await self.db.ensure_user(101)
+        await self.db.set_unlimited(100, True, admin_id=1, reason="استاد")
+        listed = await self.db.unlimited_users()
+        self.assertEqual([row["telegram_id"] for row in listed], [100])
+        flags = {u["telegram_id"]: u["is_unlimited"] for u in await self.db.list_users()}
+        self.assertEqual(flags, {100: True, 101: False})
+
+
 class PaymentTests(DatabaseTestCase):
     async def test_approve_payment_credits_once(self):
         await self.db.sync_plans([

@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased — 2026-10-12 — special (unlimited) users
+
+### Added
+
+* **Special users who are never billed.** Admins run `/unlimited <user_id> on <reason>`
+  or `/unlimited <user_id> off`. A special user's jobs skip the credit check and
+  reservation and are never debited, while the submission still records its
+  duration. A job already running when the flag is set is released, not charged.
+  Balances show «نامحدود», and the admin user list marks these users with ⭐.
+  Admins cannot be made special. Every change is audited. Schema:
+  `migrations/v3/002_special_users.sql`. See [BILLING.md](BILLING.md#special-unlimited-users).
+
 ## Unreleased — 2026-10-12 — separated, user-friendly admin and user panels
 
 ### Changed
