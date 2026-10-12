@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — 2026-10-12 — separated, user-friendly admin and user panels
+
+### Changed
+
+* **The user panel is the root screen for every account.** `menu:main` and
+  `/start` always render the user menu (ساخت جزوه، حساب و شارژ، راهنما);
+  admins get one extra entry button, «🛠 پنل مدیریت», into their own panel.
+  Previously the root menu swapped to the admin panel for administrators, so
+  the admin "back" button looped back into the admin panel and the user flow
+  was unreachable from the menu.
+* **The admin panel is its own screen tree** under `adm:*` callbacks with a
+  tab-bar keyboard rendered on every screen (overview, users, payments,
+  broadcast, audit, plus «🔙 منوی کاربر» home). The overview also reports
+  pending payments; the users screen shows totals, join date and credit; the
+  broadcast prompt has an «انصراف» button; broadcast and `/grant` replies
+  carry the panel keyboard; the payment notification carries a «🧾 بررسی
+  پرداخت‌ها» button.
+* **Receipts are reviewable from the payments screen.** A new `adm:rcpt:<id>`
+  callback sends the receipt image to the reviewing admin with approve/reject
+  buttons right on that message.
+* **Panel boundaries are enforced server-side.** `payv:*` (payment
+  approve/reject) is admin-only like `adm:*` — previously any user could
+  invoke it by crafting callback data. Receipt upload (`payr:*`) verifies the
+  payment belongs to the sender, navigating away disarms a waiting receipt
+  upload or a half-typed broadcast, and «انصراف» cancels the prompt.
+
+### Verification
+
+* `tests/test_bot.py` gained `PanelSeparationTests`: menu structure for both
+  roles, the admin root screen, non-admin rejection of `adm:*`/`payv:*`, and
+  prompt disarming on navigation.
+
 ## v3.0.0 — 2026-10-11 — complete core overhaul
 
 ### Rebuilt
