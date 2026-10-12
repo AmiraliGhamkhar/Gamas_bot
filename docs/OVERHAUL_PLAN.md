@@ -2,15 +2,16 @@
 
 **Priorities, in order: (1) simplicity, (2) performance, (3) best-in-class raw text handling.**
 
-This is a plan for a ground-up rebuild of the bot core while keeping the small set of
-modules that are already excellent. Nothing is executed yet — this document is the
-contract for the work.
+**Status: v3 implementation complete.** The rebuild described here landed in
+PR #45; the phase table in §6 records the delivered architecture and its
+verification status. This document began as the design contract, so the metrics
+in §1 are the historical v2 baseline—not measurements of the current v3 tree.
 
 ---
 
-## 1. Where the codebase is today
+## 1. Where the codebase was before the overhaul (v2 baseline)
 
-Baseline verified on this branch: **1,271 tests pass in 2m29s** on Python 3.11.
+Baseline verified before the rebuild: **1,271 tests passed in 2m29s** on Python 3.11.
 
 | Fact | Value |
 | --- | --- |
@@ -229,14 +230,19 @@ Each phase ends with the suite green, `ruff` clean, and a commit on this branch.
 
 | Phase | Deliverable | Test focus |
 | --- | --- | --- |
-| **0. Baseline** | ✅ Done — suite green (1,271 tests / 2m29s), venv working | — |
-| **1. Skeleton** | New `config`, `db`, `jobs`, `bot` (intake + menus), media modules moved in; bot boots and accepts uploads | queue bounds, back-pressure, shutdown/recovery |
-| **2. STT + raw text** ★ | `stt.py` (3 providers, failover), `transcript.py` engine, `.txt` + preview delivery | timing fixtures, fidelity gate property tests, failover |
-| **3. Notes** | `llm.py`, `notes.py` map-reduce, degradation path | chunking, JSON contract, concurrency bound |
-| **4. DOCX** | Simplified `docx_export.py`, link-only TOC | ported RTL contract tests |
-| **5. Billing/admin** | Per Decision B/C below | ledger reserve/release invariant |
-| **6. Demolition** | Delete `ai/`, `stt_platform/`, `admin_ai/stt`, 20+ DB tables, ~160 env vars, prune docs to README + ARCHITECTURE + DEPLOY + this plan's successor | full suite re-run |
-| **7. Verification** | `compileall`, `ruff`, `mypy` (core), full suite, offline benchmarks, CHANGELOG, PR to `main` | — |
+| **0. Baseline (v2)** | ✅ Historical baseline — 1,271 tests / 2m29s before the rebuild | — |
+| **1. Skeleton** | ✅ Done — v3 config, database, bounded jobs, bot intake and media pipeline | queue bounds, back-pressure, shutdown/recovery |
+| **2. STT + raw text** ★ | ✅ Done — three STT adapters, failover, fidelity-gated transcript and raw-first delivery | timing fixtures, fidelity gate, failover |
+| **3. Notes** | ✅ Done — `llm.py` and bounded map/reduce with raw-transcript fallback | chunking, JSON contract, concurrency bound |
+| **4. DOCX** | ✅ Done — RTL renderer with link-only TOC and no LibreOffice dependency | RTL contract tests |
+| **5. Billing/admin** | ✅ Done — simplified billing, ledger holds, payments and compact admin panel | ledger reserve/release invariant |
+| **6. Demolition** | ✅ Done — v2 provider platforms and credential systems removed; v2 SQL/import path retained only for migration; legacy docs are labelled historical | full v3 suite |
+| **7. Verification** | 🟡 Local gates pass; corrected Python 3.11–3.13 GitHub Actions matrix pending | `compileall`, `ruff`, `mypy`, pytest, unittest, fresh-schema check, media-worker smoke |
+
+The v2 offline benchmark scripts were intentionally removed with the old
+provider platform. CI therefore checks v3's real database/schema and media
+runtime instead; no production latency improvement is claimed without a v3
+benchmark harness.
 
 Ordering note: Phase 2 lands *before* notes because raw text is the stated priority
 and is independently shippable (STT → transcript file already helps a user).

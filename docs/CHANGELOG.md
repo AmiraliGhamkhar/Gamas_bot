@@ -1,6 +1,31 @@
 # Changelog
 
-## Unreleased — Nara-first routing, five-panel admin IA, bounded lists
+## v3.0.0 — 2026-10-11 — complete core overhaul
+
+### Rebuilt
+
+* Replaced the v2 AI/STT platform stacks and their route, catalog, quota and
+  credential-management layers with a compact v3 application: `stt.py`,
+  `transcript.py`, `llm.py`, `notes.py`, `db.py`, `jobs.py` and a user-focused
+  `bot.py`.
+* Made the raw transcript a first-class output: timing-aware paragraphing,
+  fidelity-gated typography, boundary-aware note chunks, and delivery before
+  note generation so model failures cannot hold back the transcript.
+* Reworked persistence around a fresh eight-table v3 schema and append-only
+  credit ledger; retained a one-shot `scripts/import_v2.py` for supported user,
+  payment and balance data.
+* Simplified provider configuration to environment-based credentials and
+  ordered failover. The v3 runtime dependency list is generated from
+  `pyproject.toml` and has nine direct packages.
+
+### Verification hardening
+
+* Updated CI to test the actual v3 database API and schema, run both supported
+  test runners, and smoke-test the PyAV/`ppt2pptx` media worker.
+* Corrected the media-worker timeout annotation so configured fractional-second
+  limits type-check without rounding away precision.
+
+## Historical v2 notes — Nara-first routing, five-panel admin IA, bounded lists
 
 ### Changed
 
@@ -360,7 +385,7 @@ and migration surface for nothing.
   as not-free rather than as free.
 
 
-## Unreleased — audit, reliability and performance pass
+## Historical v2 notes — audit, reliability and performance pass
 
 ### Fixed
 
