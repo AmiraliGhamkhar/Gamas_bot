@@ -8,9 +8,13 @@ One file, three concerns, in order:
   **deliver the transcript immediately** → note generation → RTL Word booklet.
   The transcript is delivered before note generation starts: an LLM outage can
   delay the booklet, never the raw text.
-* **The screens** — one button for the main flow, one account screen
-  (balance, plans, payment), one small admin panel (overview, users,
-  payments, broadcast, audit).
+* **The screens** — two separated panels with their own navigation. The
+  **user panel** is the root for every account: one button for the main
+  flow, one account screen (balance, plans, payment), help. The **admin
+  panel** (overview, users, payments, broadcast, audit) is a separate
+  screen tree entered from its own button — admins get both panels, the
+  user menu never turns into the admin menu, and admin-only callbacks are
+  enforced server-side.
 
 Everything provider-related lives in ``stt.py`` / ``llm.py``; everything text
 lives in ``transcript.py`` / ``notes.py``; everything layout in
@@ -274,13 +278,29 @@ class GamasBot:
                 logger.warning("callback screen could not be delivered", exc_info=True)
 
     # ----------------------------------------------------------------- menus
-    def _main_menu(self) -> list:
-        return [
+    def _user_menu(self, *, is_admin: bool = False) -> list:
+        """The user panel — the root screen every account starts from.
+
+        Admins get one extra entry row to their own panel; the admin panel
+        never replaces this menu, so both panels stay separately reachable.
+        """
+        rows = [
             [Button.inline("📎 ساخت جزوه", b"make")],
-            [Button.inline("💳 حساب و شارژ", b"account"), Button.inline("❓ راهنما", b"help")],
+            [
+                Button.inline("💳 حساب و شارژ", b"account"),
+                Button.inline("❓ راهنما", b"help"),
+            ],
         ]
+        if is_admin:
+            rows.append([Button.inline("🛠 پنل مدیریت", b"adm:home")])
+        return rows
 
     def _admin_menu(self) -> list:
+        """The admin panel: section tabs plus the way back to the user panel.
+
+        Rendered on every admin screen so the panel behaves like a tab bar —
+        one tap from any section to any other, and one tap home.
+        """
         return [
             [Button.inline("📊 نمای کلی", b"adm:home")],
             [
@@ -289,13 +309,10 @@ class GamasBot:
             ],
             [
                 Button.inline("📣 پیام همگانی", b"adm:bcast"),
-                Button.inline("🛡 آخرین اقدام‌ها", b"adm:audit"),
+                Button.inline("🛡 لاگ اقدامات", b"adm:audit"),
             ],
-            [Button.inline("🔙 بازگشت", b"menu:main")],
+            [Button.inline("🔙 منوی کاربر", b"menu:main")],
         ]
-
-    def _root_menu(self, is_admin: bool) -> list:
-        return self._admin_menu() if is_admin else self._main_menu()
 
     async def _show_main(self, event, *, first_start: bool = False) -> None:
         user_id = event.sender_id
@@ -312,7 +329,7 @@ class GamasBot:
             "متن خام پیاده‌سازی‌شده را هم همان لحظه تحویل می‌دهم.\n\n"
             f"⏳ اعتبار باقی‌مانده: {format_duration(available)}"
         )
-        await self._edit_or_reply(event, text, self._root_menu(self._is_admin(user_id)))
+        await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
 
     async def _edit_or_reply(self, event, text: str, buttons=None) -> None:
         """Render a screen: edit when triggered by a button, reply when by a message."""
@@ -337,9 +354,17 @@ class GamasBot:
         if user_id is None:
             await self._ack(event)
             return
-        if not self._is_admin(user_id) and data.startswith("adm:"):
+        if not self._is_admin(user_id) and data.startswith(("adm:", "payv:")):
             await self._ack(event, "این بخش ویژهٔ مدیران است.", alert=True)
             return
+        # Opening any panel screen disarms a half-finished broadcast prompt,
+        # so a stray "انصراف"/navigation tap can never send stale text later.
+        if data.startswith("adm:") and data != "adm:bcast":
+            self._pending_broadcast.discard(user_id)
+        # Likewise, navigating away from the payment flow drops a waiting
+        # receipt upload — a photo sent later belongs to the new screen.
+        if not data.startswith("payr:"):
+            self._pending_payments.pop(user_id, None)
 
         if data == "make":
             await self._ack(event)
@@ -388,11 +413,16 @@ class GamasBot:
             await self._ack(event)
             self._pending_broadcast.add(user_id)
             await event.respond(
-                "📣 متن پیام همگانی را بفرستید. برای لغو، /cancel بفرستید."
+                "📣 متن پیام همگانی را بفرستید.\n"
+                "برای لغو متن‌نویسی، /cancel بزنید یا دکمهٔ زیر را بزنید.",
+                buttons=[[Button.inline("↩️ انصراف", b"adm:home")]],
             )
         elif data == "adm:audit":
             await self._ack(event)
             await self._show_admin_audit(event)
+        elif data.startswith("adm:rcpt:"):
+            await self._ack(event)
+            await self._show_receipt(event, data)
         else:
             await self._ack(event)
 
@@ -933,19 +963,30 @@ class GamasBot:
 
     async def _await_receipt(self, event, payment_id: int) -> None:
         payment = await self.db.payment(payment_id)
-        if payment is None or payment["status"] != "pending":
-            await event.respond("این درخواست دیگر فعال نیست.")
+        if (
+            payment is None
+            or payment["status"] != "pending"
+            or payment["user_id"] != event.sender_id
+        ):
+            await event.respond("این درخواست فعال نیست.")
             return
         self._pending_payments[event.sender_id] = payment_id
-        await event.respond("📷 تصویر رسید را بفرستید (همین‌جا در چت).")
+        await event.respond(
+            "📷 تصویر رسید را بفرستید (همین‌جا در چت).",
+            buttons=[[Button.inline("↩️ انصراف", b"account")]],
+        )
 
     async def _handle_receipt_upload(self, event, user_id: int) -> None:
         payment_id = self._pending_payments.pop(user_id, None)
         if payment_id is None:
             return
         payment = await self.db.payment(payment_id)
-        if payment is None or payment["status"] != "pending":
-            await event.respond("این درخواست دیگر فعال نیست.")
+        if (
+            payment is None
+            or payment["status"] != "pending"
+            or payment["user_id"] != user_id
+        ):
+            await event.respond("این درخواست فعال نیست.")
             return
         if event.message.photo is None:
             return
@@ -980,7 +1021,10 @@ class GamasBot:
         )
         for admin_id in self.settings.admin_ids:
             try:
-                await self.client.send_message(admin_id, text)
+                await self.client.send_message(
+                    admin_id, text,
+                    buttons=[[Button.inline("🧾 بررسی پرداخت‌ها", b"adm:pay")]],
+                )
             except Exception:
                 logger.warning("could not notify admin=%s", admin_id)
 
@@ -1023,25 +1067,37 @@ class GamasBot:
     # ----------------------------------------------------------------- admin
     async def _show_admin_overview(self, event) -> None:
         stats = await self.db.stats()
+        pending = len(await self.db.pending_payments())
         text = (
-            "📊 نمای کلی\n\n"
+            "🛠 پنل مدیریت — نمای کلی\n\n"
             f"👥 کاربران: {to_persian_digits(stats['users'])}\n"
             f"✅ کارهای موفق: {to_persian_digits(stats['submissions_done'])}\n"
             f"❌ کارهای ناموفق: {to_persian_digits(stats['submissions_failed'])}\n"
             f"⏳ در حال پردازش/صف: {to_persian_digits(stats['submissions_active'])}\n"
             f"⏱ مجموع صوت پیاده‌شده: {format_duration(stats['seconds_transcribed'])}\n"
-            f"💰 درآمد تاییدشده: {format_toman(stats['toman_approved'])}\n\n"
+            f"💰 درآمد تاییدشده: {format_toman(stats['toman_approved'])}\n"
+            f"🧾 پرداخت‌های در انتظار بررسی: {to_persian_digits(pending)}\n\n"
             f"صف فعلی: {to_persian_digits(self.queue.pending)} در انتظار"
         )
         await self._edit_or_reply(event, text, self._admin_menu())
 
     async def _show_admin_users(self, event) -> None:
         users = await self.db.list_users(limit=25)
-        lines = ["👥 آخرین کاربران\n"]
+        total = await self.db.count_users()
+        heading = (
+            f"👥 کاربران — {to_persian_digits(len(users))} از "
+            f"{to_persian_digits(total)} نفر"
+        )
+        if total > len(users):
+            heading += " (تازه‌ترین‌ها)"
+        lines = [heading + "\n"]
         for user in users:
-            flag = "🚫 " if user["banned"] else ""
+            flag = "🚫" if user["banned"] else "•"
+            joined = (user["joined_at"] or "")[:10]
             lines.append(
-                f"{flag}{user['telegram_id']} — {format_duration(user['available_seconds'])}"
+                f"{flag} {user['telegram_id']} — "
+                f"{format_duration(user['available_seconds'])} اعتبار"
+                f" — عضو از {joined}"
             )
         lines.append("")
         lines.append(
@@ -1053,22 +1109,64 @@ class GamasBot:
         payments = await self.db.pending_payments()
         if not payments:
             await self._edit_or_reply(
-                event, "🧾 پرداخت‌ها\n\nپرداخت در انتظار بررسی نیست.", self._admin_menu()
+                event,
+                "🧾 پرداخت‌های در انتظار\n\nپرداخت در انتظار بررسی نیست.",
+                self._admin_menu(),
             )
             return
         buttons = []
-        lines = ["🧾 پرداخت‌های در انتظار\n"]
+        lines = [
+            f"🧾 پرداخت‌های در انتظار — {to_persian_digits(len(payments))} مورد\n"
+        ]
         for payment in payments:
+            number = to_persian_digits(payment["payment_id"])
+            receipt_row = [Button.inline(
+                "📷 دیدن رسید", f"adm:rcpt:{payment['payment_id']}".encode()
+            )]
             lines.append(
-                f"#{payment['payment_id']} — کاربر {payment['user_id']} — "
-                f"{payment['plan_code']} — رسید: {'دارد ✅' if payment['receipt_path'] else 'ندارد ❌'}"
+                f"#{number} — کاربر {payment['user_id']} — "
+                f"{payment['plan_code']} — رسید: "
+                f"{'دارد ✅' if payment['receipt_path'] else 'ندارد ❌'}"
             )
             buttons.append([
                 Button.inline("✅ تایید", f"payv:{payment['payment_id']}:a".encode()),
                 Button.inline("❌ رد", f"payv:{payment['payment_id']}:r".encode()),
             ])
-        buttons.append([Button.inline("🔙 بازگشت", b"adm:home")])
+            if payment["receipt_path"]:
+                buttons.append(receipt_row)
+        buttons.append([Button.inline("🔙 منوی کاربر", b"menu:main")])
         await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_receipt(self, event, data: str) -> None:
+        """Send a pending payment's receipt image to the reviewing admin."""
+        try:
+            payment_id = int(data.rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            await self._ack(event, "درخواست نامعتبر است.", alert=True)
+            return
+        payment = await self.db.payment(payment_id)
+        if payment is None:
+            await self._ack(event, "این پرداخت پیدا نشد.", alert=True)
+            return
+        path = payment.get("receipt_path")
+        if not path or not Path(path).is_file():
+            await self._ack(event, "برای این پرداخت رسیدی ثبت نشده است.", alert=True)
+            return
+        await self._ack(event)
+        number = to_persian_digits(payment_id)
+        buttons: list[list] = []
+        if payment["status"] == "pending":
+            buttons.append([
+                Button.inline("✅ تایید", f"payv:{payment_id}:a".encode()),
+                Button.inline("❌ رد", f"payv:{payment_id}:r".encode()),
+            ])
+        buttons.append([Button.inline("🔙 پرداخت‌ها", b"adm:pay")])
+        await event.respond(
+            f"📷 رسید پرداخت #{number}\n"
+            f"کاربر: {payment['user_id']} — طرح: {payment['plan_code']}",
+            file=path,
+            buttons=buttons,
+        )
 
     async def _show_admin_audit(self, event) -> None:
         rows = await self.db.recent_audit(limit=15)
@@ -1082,18 +1180,27 @@ class GamasBot:
     async def _admin_grant(self, event, text: str) -> None:
         parts = text.split()
         if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
-            await event.reply("قالب درست: /grant <user_id> <hours>")
+            await event.reply(
+                "قالب درست: /grant <user_id> <hours>",
+                buttons=self._admin_menu(),
+            )
             return
         target, hours = int(parts[1]), int(parts[2])
         if not (0 < hours <= 10_000):
-            await event.reply("ساعت باید بین ۱ و ۱۰۰۰۰ باشد.")
+            await event.reply(
+                "ساعت باید بین ۱ و ۱۰۰۰۰ باشد.",
+                buttons=self._admin_menu(),
+            )
             return
         await self.db.ensure_user(target)
         await self.db.add_credit(
             target, hours * 3600, note=f"admin grant by {event.sender_id}",
             validity_days=None, admin_id=event.sender_id,
         )
-        await event.reply(f"✅ {format_duration(hours * 3600)} اعتبار به {target} اضافه شد.")
+        await event.reply(
+            f"✅ {format_duration(hours * 3600)} اعتبار به {target} اضافه شد.",
+            buttons=self._admin_menu(),
+        )
 
     async def _broadcast(self, event, text: str) -> None:
         users = await self.db.list_users(limit=100_000)
@@ -1110,7 +1217,10 @@ class GamasBot:
             except Exception:
                 logger.debug("broadcast to %s failed", user["telegram_id"])
         await self.db.audit(event.sender_id, "broadcast", f"text:{len(text)} users:{sent}")
-        await event.reply(f"📣 پیام به {to_persian_digits(sent)} کاربر رسید.")
+        await event.reply(
+            f"📣 پیام به {to_persian_digits(sent)} کاربر رسید.",
+            buttons=self._admin_menu(),
+        )
 
     # --------------------------------------------------------------- cleanup
     async def _receipt_cleanup_loop(self) -> None:

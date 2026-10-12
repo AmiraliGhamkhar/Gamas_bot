@@ -38,9 +38,12 @@ the `.txt` deliverable. If the note model is unavailable, the raw transcript is
 still delivered — content is never lost to a provider outage.
 
 In the chat everything starts from one button, **📎 ساخت جزوه**; the account
-screen shows balance, purchase plans and payment history. Administrators get
-an overview with statistics, user listings, pending card-to-card payments with
-receipts, grants and broadcast — one small panel, no provider plumbing.
+screen shows balance, purchase plans and payment history. The two panels are
+separate: the user menu is the root for every account, admins included, and
+administrators step into their own panel (**🛠 پنل مدیریت**) from a dedicated
+button — overview with statistics, user listings, pending card-to-card
+payments with receipts you can open and decide on the spot, grants and
+broadcast, with one tap back to the user menu.
 
 ## Supported formats
 

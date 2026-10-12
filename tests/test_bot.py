@@ -207,5 +207,136 @@ class AdminDetectionTests(unittest.TestCase):
         self.assertFalse(bot._is_admin(None))
 
 
+def _button_data(button) -> bytes | None:
+    """Callback payload of an inline button (Telethon-version tolerant)."""
+    data = getattr(getattr(button, "type", None), "data", None)
+    if data is None:
+        data = getattr(button, "data", None)
+    return data
+
+
+def menu_payloads(menu) -> set[bytes]:
+    return {
+        data
+        for row in (menu or [])
+        for button in row
+        for data in [_button_data(button)]
+        if data is not None
+    }
+
+
+class FakeCallbackEvent:
+    """Minimal Telethon CallbackQuery double that records every outcome."""
+
+    def __init__(self, sender_id: int, data: bytes):
+        self.sender_id = sender_id
+        self.data = data
+        self.answers: list[tuple] = []    # (text, alert)
+        self.edits: list[tuple] = []      # (text, buttons)
+        self.responses: list[tuple] = []  # (text, buttons)
+
+    async def answer(self, text=None, *, alert=False):
+        self.answers.append((text, alert))
+
+    async def edit(self, text, buttons=None):
+        self.edits.append((text, buttons))
+
+    async def respond(self, text="", buttons=None, **_kwargs):
+        self.responses.append((text, buttons))
+
+
+class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
+    """The user panel and the admin panel are two separate screen trees."""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "bot.db",
+            temp_dir=root / "tmp",
+            note_api_key="",
+        )
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.admin_id = next(iter(self.settings.admin_ids))
+        self.user_id = 555
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    def test_user_menu_is_the_root_for_everyone(self):
+        user_menu = menu_payloads(self.bot._user_menu(is_admin=False))
+        admin_menu = menu_payloads(self.bot._user_menu(is_admin=True))
+        # A regular user sees only the user actions.
+        self.assertIn(b"make", user_menu)
+        self.assertIn(b"account", user_menu)
+        self.assertIn(b"help", user_menu)
+        self.assertFalse(any(d.startswith(b"adm:") for d in user_menu))
+        # An admin gets one extra entry into their own panel — and only that.
+        self.assertIn(b"adm:home", admin_menu)
+        self.assertEqual(
+            {d for d in admin_menu if d.startswith(b"adm:")},
+            {b"adm:home"},
+        )
+
+    def test_admin_menu_is_its_own_panel_with_way_back(self):
+        payloads = menu_payloads(self.bot._admin_menu())
+        for section in (b"adm:home", b"adm:users", b"adm:pay", b"adm:bcast", b"adm:audit"):
+            self.assertIn(section, payloads)
+        # The panel returns to the user panel…
+        self.assertIn(b"menu:main", payloads)
+        # …and never mixes the user flow into itself.
+        self.assertNotIn(b"make", payloads)
+        self.assertNotIn(b"account", payloads)
+
+    async def test_admin_root_screen_is_the_user_panel(self):
+        event = FakeCallbackEvent(self.admin_id, b"menu:main")
+        await self.bot._handle_callback(event)
+        self.assertTrue(event.edits, "menu:main must render a screen")
+        text, buttons = event.edits[-1]
+        payloads = menu_payloads(buttons)
+        self.assertIn("منوی اصلی", text)
+        self.assertIn(b"make", payloads)      # admin keeps the user flow
+        self.assertIn(b"adm:home", payloads)  # …plus the separate admin entry
+
+    async def test_regular_user_cannot_open_admin_panel(self):
+        event = FakeCallbackEvent(self.user_id, b"adm:users")
+        await self.bot._handle_callback(event)
+        self.assertEqual(event.edits, [])
+        self.assertTrue(event.answers)
+        text, alert = event.answers[-1]
+        self.assertTrue(alert)
+        self.assertIn("مدیران", text)
+
+    async def test_regular_user_cannot_review_payments(self):
+        """payv: approves money — it is admin-only, not just adm:-prefixed."""
+        event = FakeCallbackEvent(self.user_id, b"payv:7:a")
+        await self.bot._handle_callback(event)
+        self.assertEqual(event.edits, [])
+        self.assertTrue(event.answers)
+        _, alert = event.answers[-1]
+        self.assertTrue(alert)
+
+    async def test_opening_panel_disarms_broadcast_prompt(self):
+        start = FakeCallbackEvent(self.admin_id, b"adm:bcast")
+        await self.bot._handle_callback(start)
+        self.assertIn(self.admin_id, self.bot._pending_broadcast)
+        home = FakeCallbackEvent(self.admin_id, b"adm:home")
+        await self.bot._handle_callback(home)
+        self.assertNotIn(self.admin_id, self.bot._pending_broadcast)
+        self.assertTrue(home.edits, "adm:home must render the overview")
+
+    async def test_navigating_disarms_receipt_upload(self):
+        self.bot._pending_payments[self.user_id] = 42
+        event = FakeCallbackEvent(self.user_id, b"account")
+        await self.bot._handle_callback(event)
+        self.assertNotIn(self.user_id, self.bot._pending_payments)
+        self.assertTrue(event.edits)
+
+
 if __name__ == "__main__":
     unittest.main()
