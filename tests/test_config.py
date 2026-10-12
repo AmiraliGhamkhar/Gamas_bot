@@ -7,12 +7,15 @@ import unittest
 from unittest import mock
 
 from gamas_bot.config import (
+    DEEPGRAM_PERSIAN_MODELS,
+    DEFAULT_DEEPGRAM_MODEL,
     DEFAULT_STT_PROVIDERS,
     PLAN_ENV_FIELDS,
     Settings,
     check,
     format_payment_card,
     from_env,
+    is_advisory,
     resolve_note_mode,
     resolve_raw_text_profile,
 )
@@ -73,6 +76,13 @@ class FromEnvTests(unittest.TestCase):
         self.assertEqual(settings.note_provider, "openai_compatible")
         self.assertEqual(settings.note_api_key, "")
         self.assertTrue(settings.note_configured)
+
+    def test_default_deepgram_model_can_transcribe_persian(self):
+        """Persian is a Nova-3 language; Nova-2 has no Persian pack."""
+        with mock.patch.dict(os.environ, env(), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.deepgram_model, DEFAULT_DEEPGRAM_MODEL)
+        self.assertIn(settings.deepgram_model, DEEPGRAM_PERSIAN_MODELS)
 
     def test_selected_but_unconfigured_stt_provider_is_not_ready(self):
         with mock.patch.dict(os.environ, env(STT_PROVIDERS="deepgram"), clear=False):
@@ -158,6 +168,49 @@ class CheckTests(unittest.TestCase):
         settings = self.make(ADMIN_IDS="")
         problems = check(settings)
         self.assertTrue(any("ADMIN_IDS" in p for p in problems))
+
+    def test_persian_with_a_non_persian_deepgram_model_is_reported(self):
+        """nova-2 + language=fa is rejected by Deepgram: catch it at startup."""
+        settings = self.make(
+            STT_PROVIDERS="deepgram",
+            SPEECHMATICS_API_KEY="",
+            DEEPGRAM_API_KEY="dg",
+            DEEPGRAM_MODEL="nova-2",
+        )
+        problems = check(settings)
+        persian = [p for p in problems if "Persian" in p]
+        self.assertEqual(len(persian), 1, problems)
+        self.assertIn("nova-3", persian[0])
+        # Advisory: another provider may still transcribe, so the bot runs.
+        self.assertTrue(is_advisory(persian[0]))
+
+    def test_persian_with_nova_3_is_not_reported(self):
+        settings = self.make(
+            STT_PROVIDERS="deepgram",
+            SPEECHMATICS_API_KEY="",
+            DEEPGRAM_API_KEY="dg",
+            DEEPGRAM_MODEL="nova-3",
+        )
+        self.assertFalse(any("Persian" in p for p in check(settings)))
+
+    def test_non_persian_language_does_not_flag_the_deepgram_model(self):
+        settings = self.make(
+            STT_PROVIDERS="deepgram",
+            SPEECHMATICS_API_KEY="",
+            DEEPGRAM_API_KEY="dg",
+            DEEPGRAM_MODEL="nova-2",
+            STT_LANGUAGE="en",
+        )
+        self.assertFalse(any("Persian" in p for p in check(settings)))
+
+    def test_inactive_deepgram_model_is_not_reported(self):
+        """Only the configured failover order counts, like stt_configured."""
+        settings = self.make(
+            STT_PROVIDERS="speechmatics",
+            DEEPGRAM_API_KEY="dg",
+            DEEPGRAM_MODEL="nova-2",
+        )
+        self.assertFalse(any("Persian" in p for p in check(settings)))
 
 
 class SettingsSurfaceTests(unittest.TestCase):

@@ -3,56 +3,90 @@
 ## The bot does not answer
 
 1. `python -m gamas_bot --check` — configuration and dependency self-check.
-2. Look for `Persian study assistant is online` in the log.
+2. Look for the startup line in the log (`Gamas Bot v3 started`).
 3. If the log says the session or lock is unavailable, another process is
-   already polling this bot account. Stop it; the advisory lock is intentional.
-4. `TELEGRAM_PROXY` must be a full URL (`socks5://host:port`); a partial value
-   is rejected at startup.
+   already polling this bot account. Stop it; the advisory lock is intentional
+   and a second instance exits with code `3`.
+4. Network problems reaching Telegram (`FloodWait`, connection errors) are
+   handled by Telethon; check outbound TCP 443.
 
 ## Every upload fails with a tracking reference
 
-The reference (`GMS-000123`) is in the message and the log. Search the log for
-it; the surrounding exception is the cause. Common cases:
+The reference (`GMS-000123`) is in the chat message and in the log. Search the
+log for it (`grep GMS-000123`) — the surrounding lines are the cause. The three
+shapes you will see:
 
-* all configured STT engines failed → check `🩺 وضعیت سرویس‌ها`; a key can be in
-  cooldown (429) or quarantine (401/403).
-* the file has no audio stream → the error is explicit and user-visible.
-* the file is larger than the direct-upload limit of every configured engine.
+* `❌ تبدیل گفتار به متن نشد: …` — the speech-to-text chain failed. Continue
+  with [STT failures](#stt-failures) below.
+* `❌ این فایل شاخهٔ صوتی ندارد؛ …` — the file (or the extracted track) carries
+  no audio stream; the message is explicit and no credit is consumed.
+* `❌ این فایل از سقف حجم ربات بزرگ‌تر است.` — larger than `MAX_FILE_SIZE`.
 
-## STT providers fail or a job says no eligible engine
+In every failure path the reserved credit is released exactly once
+(`holds.released_at`), the submission is marked `failed` with the reason, and no
+`.txt`/`.docx` is delivered. If the reserve exists without a release, that is a
+bug worth reporting with the submission id.
 
-Open **🎙 پلتفرم STT** first: «مسیرها» shows the active route and why each
-provider is eligible or denied (the same stable reason codes the logs use),
-«سهمیه‌ها» shows budget/quota state, and «رویدادها» shows the structured event
-trail. `python -m scripts.benchmark_stt --plan sample.wav` prints the route
-decision per engine without sending audio.
+## STT failures
 
-Normalized error categories (spec §46) appear in the logs and the STT Logs
-panel:
+Search the log for the submission id and read these lines:
 
-| Category | Meaning | What to do |
+```
+STT failover chain providers=speechmatics,deepgram,openai_compatible bytes=… language=fa
+STT provider speechmatics has no credentials; skipped
+STT provider deepgram in cooldown for 812s more; skipped
+STT provider openai_compatible skipped: file is 41000000 bytes, over its 25000000 byte ceiling
+STT attempt provider=deepgram bytes=… model=nova-3 language=fa
+STT done provider=deepgram bytes=… elapsed_seconds=12.4
+STT exhausted every eligible provider (2 attempted/skipped): …
+```
+
+Classification a message falls into and what to do:
+
+| Message fragment | Meaning | Action |
 | --- | --- | --- |
-| `authentication` / `permission` | 401/403 — the key is invalid or disabled | Re-add or enable the key in 🔑 API Keys; rotation happens automatically across the key pool |
-| `quota_exhausted` / `rate_limited` | 429 or an exhausted budget | Respect `Retry-After`; the job moves to the next provider. Check «سهمیه‌ها» for the remaining window |
-| `billing_required` | Provider demands payment | Do not enable paid fallback unless deliberate (`STT_ALLOW_PAID_FALLBACK`) |
-| `model_unavailable` / `language_unsupported` / `format_unsupported` / `file_too_large` / `duration_too_long` | Deterministic rejection | Not retried; fix the request or let routing pick another provider |
-| `provider_timeout` / `network_failure` / `server_error` | Transient | Retried within `STT_MAX_ATTEMPTS`; then the next provider runs |
-| `quality_failure` | The transcript failed the deterministic quality gate | Logged as `stt_quality_rejected`; the next provider is tried |
-| `response_schema_error` / `invalid_request` / `unknown` | Malformed output or bad request | Report with the event id; never with audio or keys |
+| `هیچ سرویس تبدیل گفتاری پیکربندی نشده است` | no key for any provider in `STT_PROVIDERS` | set a key, or add the configured provider to `STT_PROVIDERS` |
+| `اعتبارنامه را نپذیرفت (HTTP 401/403)` | the key is invalid or disabled | replace it; the provider is skipped for 15 minutes (`AUTH_COOLDOWN_SECONDS`) |
+| `محدودیت نرخ درخواست را اعلام کرد (HTTP 429)` | rate limited | transient; up to 3 attempts, `Retry-After` honoured up to 60 s, then the next provider |
+| `درخواست را رد کرد (HTTP 4xx)` | the provider refused the request — unsupported model, language or media | read the provider's own detail after the colon; for Persian check the model pairing below |
+| `موقتاً در دسترس نیست (HTTP 5xx)` / `پس از چند تلاش در دسترس نبود` | provider or network outage | transient, then failover; check outbound TCP 443 and DNS |
+| `سقف حجم …MB دارد` | the file is over that provider's direct-upload ceiling | expected; the file goes to the next provider |
+| `در حال استراحت (…s)` | the provider is in cooldown | wait, or fix the credential that caused it |
+| `پاسخ JSON معتبری برنگرداند` / `متن قابل استفاده‌ای تولید نکرد` | unusable or empty provider payload | provider-side problem or an incompatible gateway; the next provider runs |
 
-If every provider fails, the job is preserved and reported as failed with its
-tracking reference — Gamas never fabricates a transcript or returns an empty
-"success". A "no eligible high-quality free STT provider" message means the
-free/trial gates refused every candidate: check Free-only policy
-(`STT_FREE_ONLY`, `STT_TRIAL_ALLOWLIST`), per-provider enable/billing state and
-the quota panel.
+### Persian check
+
+* Deepgram needs `DEEPGRAM_MODEL=nova-3` (`nova-3-general` also works). Nova-2
+  has no Persian language pack and rejects `language=fa`. `--check` warns about
+  this pairing and the bot logs the warning at startup.
+* Speechmatics `enhanced`/`standard` accept `fa` directly; `melia-1`/`oak-1`
+  require `STT_LANGUAGE=multi` and reject `auto`.
+* OpenAI-compatible gateways need a model that supports the language. Segment
+  timings are requested with `response_format=verbose_json` and retried once
+  with `json` when a gateway explicitly refuses that format.
+
+A `--check` run is the fastest way to see all of this at once; it never contacts
+a provider and is safe to run while the bot is serving traffic.
+
+## Credit was not returned after a failure
+
+It should be, in every failure and cancellation path, and there is a test per
+path. Check the ledger for a release event for that submission:
+`release_hold` sets `holds.released_at` and is a no-op on a second call, so a
+double release cannot double-refund. If a reserve has neither a release nor a
+debit, report it with the submission id.
+
+## Media processing fails after a dependency change
+
+`python -m gamas_bot --check` runs `python -m gamas_bot.media_worker check`, so a
+broken `av`/`ppt2pptx` install is reported there instead of surfacing later as a
+mysterious media error. `ffmpeg`, `ffprobe` and `soffice` are **not** used:
+media runs in a dedicated worker process through PyAV.
 
 ## The booklet arrives, but the table of contents has no page numbers
 
-Expected when no renderer is installed and `DOCX_TOC_PAGE_NUMBERS=auto`: the
-topic list keeps its internal links and the number column stays empty. Install
-LibreOffice (`soffice`) and `pypdf` for exact numbers, or set `required` if a
-deployment must refuse to deliver without them. Numbers are never guessed.
+There is no renderer in v3: the table of contents links to the headings and the
+page-number column stays empty. Numbers are never guessed.
 
 ## Word offers to "repair" the document
 
@@ -60,58 +94,12 @@ That would be a real bug — the OOXML element order is maintained explicitly.
 Report it with the generated file; OOXML ordering rules (CT_PPr, CT_RPr,
 CT_SectPr, CT_TblPr) are the first thing to check.
 
-## Persian text renders as disconnected letters in a *rendered image*
-
-That only affects the offline inspection tool (`scripts/render_docx_pages.py`),
-which paints glyphs itself and therefore needs `arabic-reshaper` and
-`python-bidi`. In Word the shaping is done by the font and the document.
-
-## Credit was not returned after a failure
-
-It should be, in every failure and cancellation path, and there is a test per
-path. Check the `📜 گزارش مدیر` ledger for a `release` event for that
-submission. If the reserve exists without a matching release or consume, that is
-a bug worth reporting with the submission id.
-
-## Media processing fails after a dependency change
-
-`python -m gamas_bot --check` verifies that the media worker imports and runs.
-The worker is a child process that uses PyAV; a broken `av` wheel is reported
-there rather than surfacing later as a mysterious media error.
-
-## The notes provider says "no suitable response"
-
-Everything failed, or nothing was eligible. Open **AI → 📈 نمای مسیر و بودجه**:
-every provider that was skipped is listed with the reason.
-
-| Reason | Meaning | What to do |
-| --- | --- | --- |
-| `account_entitlement_unverified` | The provider publishes no free tier, so Gamas will not assert one (Groq today) | Attest the account under **AI → provider → 🧾 تأیید استحقاق حساب** if you have verified the account is no-charge, or remove it from the route |
-| `model free eligibility unknown (FREE_ONLY)` | The model's free status is not documented | Sync the catalog; if the account really includes it, attest the key `free`. Gamas will not spend quota to find out |
-| `not_free_eligible` / `billing_blocked` | The provider is paid-only or trial-only | Remove it from the free route, or enable paid fallback deliberately |
-| `terms_of_use_blocked` | Provider terms prohibit this use (Z.AI today) | Do not route; the price or a key attestation does not override terms |
-| `quota_exhausted` | The local daily ledger says the free budget is spent | Wait for the UTC reset, or add another free provider to the route |
-| `no eligible credential` | No key is attested for this billing lane | Attest the key `free` (or `paid` on a paid leg) under **AI → provider → کلیدها** |
-
-Run `python -m scripts.validate_provider_platform` to confirm the routing,
-failover and secret-hygiene behaviour offline before changing production
-configuration.
-
-## Cloudflare fails immediately even though it is enabled
-
-Check the estimated Neuron figure under **AI → provider → Cloudflare**. Workers
-AI meters Neurons, not tokens, and does not return a neuron count, so Gamas
-guards the daily inclusion from a pessimistic estimate. If the estimate has
-reached the configured budget, `AI_FREE_ONLY` stops routing there and uses the
-next free provider. Lower `neuron_budget_daily` only if you have measured your
-account's real allocation.
-
 ## Where to look first
 
 | Symptom | Start here |
 | --- | --- |
-| No reply at all | `instance_lock`, logs, `--check` |
-| Job fails | tracking reference in the log, provider health panel |
-| Wrong billing | `📜 گزارش مدیر` ledger, `docs/BILLING.md` |
-| Document layout | `docs/DOCX.md`, `python -m scripts.validate_docx --render` |
-| Deployment | `docs/DEPLOY_CPANEL.md`, `scripts/cpanel_preflight.py` |
+| No reply at all | `instance_lock`, log, `python -m gamas_bot --check` |
+| Job fails | tracking reference in the log, `docs/STT_PROVIDERS.md` |
+| Wrong billing | ledger report in the admin panel, `docs/BILLING.md` |
+| Document layout | `docs/DOCX.md` |
+| Deployment | `docs/DEPLOY_CPANEL.md`, `docs/DEPLOY_FA.md` |

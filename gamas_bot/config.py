@@ -70,12 +70,28 @@ DEFAULT_STT_PROVIDERS = "speechmatics,deepgram,openai_compatible"
 
 #: Per-provider direct-upload ceilings (bytes). A file larger than a
 #: provider's ceiling is routed to the next configured provider instead of
-#: being split — chunked audio loses word context at every boundary.
-SPEECHMATICS_MAX_UPLOAD = 2 * 1024**3
-DEEPGRAM_MAX_UPLOAD = 2 * 1024**3
+#: being split — chunked audio loses word context at every boundary. Both
+#: values are the conservative (decimal) reading of the documented limit, so a
+#: file is never uploaded only to be rejected.
+#:
+#: * Speechmatics Batch rejects a ``/jobs`` POST body of 1 GB or more
+#:   (https://docs.speechmatics.com/speech-to-text/batch/limits); larger files
+#:   would need their ``fetch_data`` URL form, which this bot does not use.
+#: * Deepgram pre-recorded audio accepts a maximum of 2 GB
+#:   (https://developers.deepgram.com/docs/pre-recorded-audio).
+SPEECHMATICS_MAX_UPLOAD = 1_000_000_000
+DEEPGRAM_MAX_UPLOAD = 2_000_000_000
 # OpenAI's hosted audio transcription endpoint has a 25 MB per-file limit.
 # Compatible gateways can set STT_OPENAI_MAX_UPLOAD_BYTES to their own ceiling.
 OPENAI_STT_MAX_UPLOAD = 25_000_000
+
+#: Default Deepgram model. Persian (``fa``) is transcribed by Nova-3; Nova-2
+#: has no Persian language pack, so ``nova-2`` + ``STT_LANGUAGE=fa`` is
+#: rejected by the API (see https://developers.deepgram.com/docs/models-languages-overview).
+DEFAULT_DEEPGRAM_MODEL = "nova-3"
+
+#: Deepgram models whose documented language list contains Persian (``fa``).
+DEEPGRAM_PERSIAN_MODELS = frozenset({"nova-3", "nova-3-general"})
 
 
 def _project_path(value: str | None, default: str) -> Path:
@@ -369,7 +385,7 @@ def from_env(env_file: str | None = None) -> Settings:
         speechmatics_model=_env("SPEECHMATICS_MODEL", "enhanced"),
         deepgram_api_key=_env("DEEPGRAM_API_KEY"),
         deepgram_base_url=_env("DEEPGRAM_BASE_URL", "https://api.deepgram.com/v1").rstrip("/"),
-        deepgram_model=_env("DEEPGRAM_MODEL", "nova-2"),
+        deepgram_model=_env("DEEPGRAM_MODEL", DEFAULT_DEEPGRAM_MODEL),
         stt_openai_base_url=_env("STT_OPENAI_BASE_URL").rstrip("/"),
         stt_openai_api_key=_env("STT_OPENAI_API_KEY"),
         stt_openai_model=_env("STT_OPENAI_MODEL", "whisper-1"),
@@ -401,7 +417,7 @@ def from_env(env_file: str | None = None) -> Settings:
 #: Substrings that mark a problem as advisory: the bot still runs correctly,
 #: with reduced functionality. ``run()`` and the self-check only fail on the
 #: rest.
-ADVISORY_PROBLEMS = ("raw transcripts only",)
+ADVISORY_PROBLEMS = ("raw transcripts only", "does not support Persian")
 
 
 def is_advisory(problem: str) -> bool:
@@ -421,6 +437,19 @@ def check(settings: Settings) -> list[str]:
         problems.append(
             "No speech-to-text provider is configured: set SPEECHMATICS_API_KEY, "
             "DEEPGRAM_API_KEY, or STT_OPENAI_BASE_URL + STT_OPENAI_API_KEY."
+        )
+    # A language/model pairing that the provider documents as unsupported would
+    # only surface as a per-job HTTP 400; report it before any upload happens.
+    if (
+        "deepgram" in settings.stt_providers
+        and settings.deepgram_configured
+        and (settings.stt_language or "").strip().lower().split("-")[0] == "fa"
+        and settings.deepgram_model.strip().lower() not in DEEPGRAM_PERSIAN_MODELS
+    ):
+        problems.append(
+            f"DEEPGRAM_MODEL={settings.deepgram_model} does not support Persian "
+            f"(STT_LANGUAGE={settings.stt_language}); set DEEPGRAM_MODEL to one of: "
+            f"{', '.join(sorted(DEEPGRAM_PERSIAN_MODELS))}."
         )
     if settings.note_provider not in NOTE_PROVIDERS:
         problems.append(

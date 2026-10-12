@@ -160,7 +160,7 @@ def make_settings(**overrides) -> Settings:
         speechmatics_model="enhanced",
         deepgram_api_key="dg-key",
         deepgram_base_url="https://api.deepgram.com/v1",
-        deepgram_model="nova-2",
+        deepgram_model="nova-3",
         stt_openai_base_url="",
         stt_openai_api_key="",
         stt_openai_model="whisper-1",
