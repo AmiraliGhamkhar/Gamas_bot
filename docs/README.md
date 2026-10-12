@@ -23,7 +23,7 @@ database.
 | [`CONFIGURATION.md`](CONFIGURATION.md) | v2-era | configuration model (v3: `.env.example` + `config.py`) |
 | [`PROVIDERS.md`](PROVIDERS.md) · [`STT_PROVIDERS.md`](STT_PROVIDERS.md) · [`AI_PROVIDERS.md`](AI_PROVIDERS.md) | v2-era | provider platforms that no longer exist |
 | [`SECURITY.md`](SECURITY.md) | v2-era | threat model (credential encryption dropped: env-only keys) |
-| [`TESTING.md`](TESTING.md) | v2-era | gates and benchmarks (benchmarks removed in v3) |
+| [`TESTING.md`](TESTING.md) | **v3** | current CI gates, test coverage and offline checks |
 | [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | v2-era | symptom → cause → where to look |
 | [`CHANGELOG.md`](CHANGELOG.md) | log | notable changes |
 | [`AUDIT_HISTORY.md`](AUDIT_HISTORY.md) · [`AI_PLATFORM_AUDIT.md`](AI_PLATFORM_AUDIT.md) · [`ENGINEERING_AUDIT.md`](ENGINEERING_AUDIT.md) · [`REPORT_PRODUCTION_IMPROVEMENTS.md`](REPORT_PRODUCTION_IMPROVEMENTS.md) | historical | superseded reports, kept for traceability |

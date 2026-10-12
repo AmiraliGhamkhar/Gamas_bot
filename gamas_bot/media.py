@@ -70,7 +70,7 @@ def worker_env() -> dict[str, str]:
 
 async def run_command(
     command: list[str],
-    timeout: int,
+    timeout: float,
     *,
     capture_output: bool = True,
     label: str | None = None,
