@@ -1,192 +1,108 @@
-# Deploying Gamas Bot on a cPanel host
+# Deploying on cPanel
 
 > **Read this first.** Gamas Bot is a Telegram bot, not a website. It keeps one
-> permanent outbound connection to Telegram and has no pages, no HTTP API and no
-> frontend. cPanel is built to serve web requests, so the bot has to be started
-> *next to* the web hosting, not through it. This guide does that with a
-> once-a-minute cron watchdog (primary) and an optional Passenger status URL
-> (secondary). It works only on cPanel plans that satisfy the checklist below —
-> if your plan does not, the honest answer is a small VPS (see
-> [`DEPLOY_FA.md`](DEPLOY_FA.md)).
+> permanent outbound connection to Telegram and serves no pages and no HTTP API.
+> cPanel serves web requests, so the bot has to run *next to* the hosting, not
+> through it. This guide does that with a once-a-minute cron watchdog (primary)
+> and an optional Passenger status URL (secondary).
 >
-> This procedure was verified against the code and the test-suite on Linux. It
-> has **not** been run on a real cPanel account; step 5 (`cpanel_preflight.py`)
-> is there to prove your host before you rely on it.
+> This procedure is verified against the code and test suite on Linux. It has
+> **not** been run on a real cPanel account — step 4 exists to prove your host
+> before you rely on it. If your plan fails that checklist, the honest answer is
+> a small VPS (see [DEPLOY_FA.md](DEPLOY_FA.md)).
 
-## 1. Can your plan run it? (checklist)
+## 1. Can your plan run it?
 
 | Requirement | Why | How to check |
-|---|---|---|
-| Terminal/SSH access | install packages, run the preflight | cPanel → *Terminal* |
+| --- | --- | --- |
+| Terminal / SSH | install packages, run the preflight | cPanel → *Terminal* |
 | **Cron Jobs** | restarts the bot when the host kills it | cPanel → *Cron Jobs* |
-| Python **3.11+** (*Setup Python App* or CloudLinux alt-python) | code base requirement | `python3.11 --version` |
-| LibreOffice `soffice` + Python `pypdf` (unless TOC is explicitly disabled) | exact page mapping for the static TOC on eligible long DOCX files | preflight checks `soffice`; `pypdf` is installed by `requirements.txt` |
-| glibc **2.28+** (CloudLinux/AlmaLinux/Rocky **8+**) | `av` (PyAV) and `lxml` ship manylinux wheels that need it; on CloudLinux 7 they cannot be installed | preflight prints it |
-| Outbound TCP **443** to Telegram and your STT / note-API hosts | MTProto and the provider APIs | preflight tests it |
-| Background processes allowed for more than a few minutes | the bot is a long-running process; some hosts kill anything over a CPU/time budget (CloudLinux LVE, "entry/nproc" limits) | watch `data/logs/bot.log` after step 8 |
-| ~1–2 GB RAM and several GB of free disk / inodes | audio/video decoding and temp files (up to 2 GB per upload) | cPanel → *Resource Usage* |
+| Python **3.11+** | code requirement | `python3.11 --version` |
+| glibc **2.28+** (CloudLinux / AlmaLinux / Rocky 8+) | `av` and `lxml` ship manylinux wheels that need it; on CloudLinux 7 they cannot install | preflight prints it |
+| Outbound TCP **443** to Telegram and your provider hosts | MTProto and the provider APIs | preflight tests it |
+| Background processes allowed for more than a few minutes | some hosts kill anything over a CPU/time budget (CloudLinux LVE) | watch the log after step 6 |
+| ~1–2 GB RAM, several GB disk and inodes | decoding and temp files, up to 2 GB per upload | cPanel → *Resource Usage* |
 
-Also know:
+Also:
 
-* **Application code and data must live outside `public_html`.** `.env`,
-  `data/bot.sqlite3` and the Telegram session must never be downloadable.
-  The preflight fails when the project is inside a web root. On POSIX, the bot
-  also sets the SQLite database and live `-wal`/`-shm` files to mode `600`; keep
-  backups restricted and encrypted.
-* Telegram is filtered in some countries/data-centres. If the preflight cannot
-  reach it, set `TELEGRAM_PROXY` (SOCKS5/HTTP). **Only Telegram traffic uses the
-  proxy** — the Speechmatics/Deepgram/note-API calls go out directly, so those
-  hosts must be reachable from the server.
-* Use `MAX_CONCURRENT_JOBS=1` on shared hosting, and keep the pending queue
-  small (`MAX_PENDING_JOBS=2`): at most `MAX_CONCURRENT_JOBS` jobs run and
-  at most `MAX_PENDING_JOBS` wait; anything beyond that is rejected with a
-  "bot is busy" message instead of piling up in memory.
+* **Code and data must live outside `public_html`.** `.env`, the SQLite database
+  and the Telegram session must never be downloadable. The preflight fails when
+  the project is inside a web root.
+* No `ffmpeg`, `ffprobe`, `soffice`, Redis, Docker, external database or root
+  access is needed. Media runs on PyAV inside a worker process.
+* Use `MAX_ACTIVE_JOBS=1` and a small `MAX_QUEUED_JOBS` on shared hosting.
 
 ## 2. Upload the code
-
-Over SSH (recommended):
 
 ```bash
 cd ~
 git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git gamas_bot
 ```
 
-Without git, upload and extract a ZIP into `/home/USER/gamas_bot` (File Manager).
-Do **not** put it under `public_html`.
+Without git, upload and extract a ZIP into `/home/USER/gamas_bot`. **Not** under
+`public_html`.
 
-## 3. Create the Python environment
+## 3. Create the environment
 
-**Option A — *Setup Python App* (gives you a virtualenv and the optional status URL):**
+**Option A — *Setup Python App*** (gives you a virtualenv and the status URL):
+create an application with Python 3.11+, root `gamas_bot`, startup file
+`passenger_wsgi.py`, entry point `application`, any URL such as `bot-status`.
+Then copy the *"Enter the virtual environment"* command it shows and run it.
 
-1. cPanel → *Setup Python App* → *Create Application*.
-2. Python version **3.11 or newer**; *Application root* `gamas_bot`;
-   *Application URL* e.g. `bot-status` (any sub-path/domain);
-   *Startup file* `passenger_wsgi.py`; *Entry point* `application`.
-3. Create, then copy the *"Enter to the virtual environment"* command shown at the
-   top of the page and run it in *Terminal*. It looks like
-   `source /home/USER/virtualenv/gamas_bot/3.11/bin/activate && cd /home/USER/gamas_bot`.
-
-**Option B — plain venv (no status URL):**
+**Option B — plain venv:**
 
 ```bash
 cd ~/gamas_bot && python3.11 -m venv .venv && source .venv/bin/activate
 ```
 
-Then, in the activated environment:
+Then:
 
 ```bash
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-(Do not use cPanel's *Run Pip Install* button with a big requirements file if it
-times out; the terminal has no such limit.)
-
-## 4. Configure
+## 4. Configure and run the preflight
 
 ```bash
 cd ~/gamas_bot
 cp .env.example .env
 chmod 600 .env
 nano .env
+python -m scripts.cpanel_preflight
 ```
 
-Minimum: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ADMIN_IDS`,
-one STT key, and (optionally) the note-API key. `.env.example` contains the
-single canonical card-to-card destination and the canonical plans; do not copy
-card details into application code. Before enabling admin-managed API keys,
-generate a Fernet master key and put it in the owner-only `.env` file (never in
-SQLite or source control):
+Minimum: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`,
+`ADMIN_IDS`, one STT key, and optionally the note keys. Everything else has a
+working default — see [CONFIGURATION.md](CONFIGURATION.md).
 
-```bash
-.venv/bin/python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
-```
+Fix every `FAIL`. The preflight checks Python version, OS/glibc, PyAV import,
+project location, the single-instance lock, `.env` presence and permissions,
+configuration, `ADMIN_IDS`, Telegram connectivity, note-API reachability, the
+private receipt directory and the media worker. Typical failures:
 
-Keep the key stable and back it up securely; losing it makes encrypted provider
-keys unreadable. Recommended for shared hosting:
+| Message | Fix |
+| --- | --- |
+| `Operating system` WARN | host OS too old for the wheels → ask for CloudLinux/AlmaLinux 8+, or use a VPS |
+| `Project location` FAIL | move the project out of `public_html` |
+| `Telegram connectivity` FAIL | ask the host to allow outbound 443 |
+| `Note API` WARN | outbound firewall or DNS for your note provider |
+| `Single-instance lock` FAIL | the data directory is on a filesystem without `flock`; point `DB_PATH`, `TELEGRAM_SESSION` and `TEMP_DIR` at a local disk |
+| `Private receipt directory` FAIL | move `RECEIPT_DIR` outside the web root |
+| `Media worker` FAIL | `pip install -r requirements.txt` did not finish |
 
-```dotenv
-MAX_CONCURRENT_JOBS=1
-MAX_PENDING_JOBS=2
-PROGRESS_ANIMATION_ENABLED=false   # fewer Telegram edits, less CPU
-# RECEIPT_DIR=data/receipts       # outside the web root; directory 700/files 600
-# RECEIPT_RETENTION_DAYS=90       # counted from the admin review, not submission
-# MAX_PAYMENT_RECEIPT_BYTES=5000000
-# DOCX_TOC_ENABLED=true           # needs the LibreOffice renderer for long docs
-# DOCX_PAGINATION_RENDERER_BIN=/usr/bin/soffice  # if not on PATH
-# TELEGRAM_PROXY=socks5://user:pass@proxy.example.com:1080
-# --- canonical tariff (defaults shown; change only if the business changes) ---
-# Plans an admin creates/edits from "🧾 طرح‌های فروش" are never overwritten.
-# FREE_PLAN_HOURS=1
-# PLAN_5_HOURS=5
-# PLAN_5_PRICE_TOMAN=50000
-# PLAN_5_VALIDITY_DAYS=30
-# PLAN_10_HOURS=10
-# PLAN_10_PRICE_TOMAN=75000
-# PLAN_10_VALIDITY_DAYS=30
-# PLAN_20_HOURS=20
-# PLAN_20_PRICE_TOMAN=130000
-# PLAN_20_VALIDITY_DAYS=30
-# PLAN_25_HOURS=25
-# PLAN_25_PRICE_TOMAN=150000
-# PLAN_25_VALIDITY_DAYS=30
-# PLAN_50_HOURS=50
-# PLAN_50_PRICE_TOMAN=250000
-# PLAN_50_VALIDITY_DAYS=30
-```
-
-Everything the bot must not lose is on disk under the project directory and
-survives a restart, a cPanel "Stop/Start" and a watchdog-restart cycle:
-
-| State | Location | Notes |
-|---|---|---|
-| Billing (plans, entitlements, usage ledger, payments, admin audit) | `data/bot.sqlite3` (WAL) | mode `600`; the migration runner applies `migrations/*.sql` automatically at startup |
-| Pending/approved payments and their status | same database | a restart cannot lose an approval or re-open a decided request |
-| Receipt images | `RECEIPT_DIR` (default `data/receipts`) | directory `700`, files `600`, outside `public_html` |
-| Encrypted provider keys | `provider_credentials` table | ciphertext only; the Fernet master key stays in `.env` (never in SQLite) |
-
-No Redis, no Docker, no external database, no extra daemon and no root access is
-required. Migrations run inside the normal startup path, so the launcher,
-Passenger entry point and cron watchdog all keep working unchanged.
-
-Relative paths (`data/...`) and `.env` are resolved from the **project
-directory**, not from the shell's current directory, so cron and Passenger see the
-same database and session as your terminal.
-
-## 5. Run the preflight
-
-```bash
-python scripts/cpanel_preflight.py
-```
-
-Fix every `FAIL`. Typical messages:
-
-| Message | Meaning / fix |
-|---|---|
-| `glibc < 2.28` | host OS too old for the wheels → ask for CloudLinux/AlmaLinux 8+ or use a VPS |
-| `inside the web root` | move the project out of `public_html` |
-| `cannot open outbound TCP 443 to Telegram` | ask the host to allow it, or set `TELEGRAM_PROXY` |
-| `Speechmatics/Deepgram/Note API … unreachable` | outbound firewall/DNS; the app does not proxy these |
-| `file locking is not enforced` | data directory is on a filesystem without `flock`; point `TELEGRAM_SESSION_PATH`, `DATABASE_PATH`, `TEMP_DIR` to a local disk |
-| `DOCX pagination renderer` fails | install/use `soffice` and confirm `pypdf` is installed, or explicitly set `DOCX_TOC_ENABLED=false` (no TOC will be generated) |
-| `Provider credential encryption` fails | set a valid Fernet key in `PROVIDER_CREDENTIALS_ENCRYPTION_KEY`; never print or log it |
-| `Private receipt directory` fails | move `RECEIPT_DIR` outside the web root and ensure owner-only permissions are supported |
-| `Media worker` fails | `pip install -r requirements.txt` did not finish |
-
-## 6. First run in the foreground
+## 5. First run in the foreground
 
 ```bash
 python -m gamas_bot
 ```
 
-You should see `Persian study assistant is online username=@…`. Send the bot a
-message on Telegram, then stop it with `Ctrl+C` (shutdown is graceful; running jobs
-are marked as interrupted).
+Send the bot a message on Telegram, then stop it with `Ctrl+C`. Shutdown is
+graceful; running jobs are marked interrupted and their credit released.
 
-## 7. Keep it alive with cron
+## 6. Keep it alive with cron
 
-cPanel → *Cron Jobs* → *Once Per Minute* (`* * * * *`). Command — use **absolute
-paths** of the Python from step 3:
+cPanel → *Cron Jobs* → once per minute, with **absolute** paths:
 
 ```text
 /home/USER/virtualenv/gamas_bot/3.11/bin/python /home/USER/gamas_bot/scripts/ensure_running.py >/dev/null 2>&1
@@ -194,78 +110,54 @@ paths** of the Python from step 3:
 
 (Option B: `/home/USER/gamas_bot/.venv/bin/python …`.)
 
-What it does every minute, in a few tens of milliseconds: if the bot holds its
-lock nothing happens; otherwise it starts one detached bot process, at most once
-per 45 seconds, so a bot that crashes at start-up (wrong token, no network) is
-retried politely instead of hammered. Only one bot can ever run — a second
-process exits immediately with code 3 ("Not starting").
-
-Check it:
+Each run costs a few tens of milliseconds — it imports only the configuration and
+the lock helper, not Telethon or PyAV. If the bot holds its lock, nothing
+happens. Otherwise it starts one detached process, at most once per 45 seconds,
+so a bot that dies at startup (bad token, no network) is retried politely instead
+of hammered. It prints `running`, `started`, `throttled` or `misconfigured`
+(exit 2 for the last).
 
 ```bash
-python scripts/ensure_running.py     # prints: running | started | throttled | misconfigured
+python scripts/ensure_running.py
 tail -f ~/gamas_bot/data/logs/bot.log
-cat ~/gamas_bot/data/logs/launcher.err   # only non-empty if Python itself failed to start
+cat ~/gamas_bot/data/logs/launcher.err   # non-empty only if Python itself failed
 ```
 
-## 8. Optional: status URL + second watchdog (Passenger)
+## 7. Optional: Passenger status URL
 
-If you used *Setup Python App*, opening its URL returns
+If you used *Setup Python App*, its URL returns
+`{"service": "gamas-bot", "status": "running"}` (200; 503 with `starting` or
+`error` otherwise) and each request also ensures the bot is running — so an
+external monitor hitting it every 5 minutes is a second, independent watchdog.
+The cPanel *Restart* button restarts only the status app, **not** the bot.
 
-```json
-{"service": "gamas-bot", "status": "running"}
-```
-
-(HTTP 200; 503 with `starting` or `error` otherwise; nothing else is exposed).
-Each request also makes sure the bot is running, so an external monitor such as
-UptimeRobot hitting that URL every 5 minutes is a second, independent watchdog.
-The cPanel *Restart* button restarts only this status app, **not** the bot.
-
-## 9. Operations
+## 8. Day-to-day
 
 | Task | Command |
-|---|---|
-| Restart the bot (graceful; cron starts it again within a minute) | `pkill -TERM -u "$USER" -f 'python.* -m gamas_bot$'` |
-| Stop it permanently | remove the cron line, then the `pkill` above |
-| Update | `cd ~/gamas_bot && git pull && pip install -r requirements.txt`, then restart |
-| Logs | `data/logs/bot.log` (rotated, 10 MB × 5). Set `LOG_FILE` in `.env` to choose another path |
-| Backup | `.env` (especially the stable provider encryption master key), `data/bot.sqlite3` (plus `-wal`/`-shm` while running), `data/telegram_bot.session`, and `data/receipts/`. Stop the bot or use `sqlite3 data/bot.sqlite3 ".backup backup.sqlite3"`; encrypt and restrict backup access |
-| Disk cleanup | `data/tmp` is emptied automatically at start-up and after each job |
+| --- | --- |
+| Restart | `pkill -TERM -u "$USER" -f 'python.* -m gamas_bot$'` — cron restarts it within a minute |
+| Stop permanently | remove the cron line, then the `pkill` above |
+| Update | `git pull && pip install -r requirements.txt`, then restart |
+| Logs | `data/logs/bot.log` (or `LOG_FILE`) |
+| Backup | `.env`, `data/gamas_v3.db` (+ `-wal`/`-shm` while running), `data/gamas.session`, `data/receipts/` |
 
-The database is created and migrated automatically on first start. Receipt images
-are private payment records; the bot stores them under `RECEIPT_DIR` with
-owner-only permissions and keeps them until manual review. After approval or
-rejection, it removes them after `RECEIPT_RETENTION_DAYS` (90 days by default,
-measured from the review time). Configure backups and retention according to your
-legal obligations.
+Migrations run at startup, so the launcher, Passenger entry point and cron
+watchdog all keep working unchanged. Relative paths resolve from the **project
+directory**, so cron and Passenger see the same database and session as your
+terminal.
 
-Billing is paid by manual card-to-card transfer. The bot does not verify a bank
-transaction: an administrator must inspect the private receipt and approve or
-reject it from the **💳 پرداخت‌ها** panel or `/payments`. Uploading a receipt
-grants no credit. The **⏱ اعتبار کاربران** screen shows one user's balance,
-active entitlements with expiry and recent usage; a manual adjustment there (or
-`/credit TELEGRAM_USER_ID SECONDS REASON`) always requires a reason and is
-audited. Provider health (**🩺 وضعیت سرویس‌ها**) and key management
-(**🔑 API Keys**) run only when an administrator opens them, so they add no
-per-message cost on shared hosting.
+Billing is manual card-to-card: an admin must inspect the receipt and approve or
+reject it from the **🧾 پرداخت‌ها** panel. Uploading a receipt grants no credit.
 
-## 10. Troubleshooting
+## 9. Troubleshooting
 
 * **Bot starts, then disappears after some minutes.** The host is killing
-  long-running processes (CloudLinux LVE limits). `data/logs/bot.log` will simply
-  stop without an error. Lower `MAX_CONCURRENT_JOBS`, disable
-  `PROGRESS_ANIMATION_ENABLED`, ask the host to raise CPU/`nproc` limits — or move
-  to a VPS. Cron will keep restarting it, but jobs running at that moment are
-  lost (they are marked `failed` and the user must resend), and jobs still
-  waiting in the queue are rejected with an explanation at shutdown.
-* **`status: starting` forever.** Read `data/logs/launcher.err` and
-  `data/logs/bot.log`; the usual causes are a wrong token/API id/hash or blocked
-  Telegram access.
-* **A long DOCX fails with a pagination-renderer error.** The static TOC uses
-  rendered page destinations, so install `soffice` (or set
-  `DOCX_PAGINATION_RENDERER_BIN`) and install `pypdf`. No page number is guessed.
-  Alternatively, explicitly disable `DOCX_TOC_ENABLED` to omit the TOC.
+  long-running processes (CloudLinux LVE). The log just stops with no error.
+  Lower `MAX_ACTIVE_JOBS`, ask the host to raise CPU/`nproc` limits, or move to a
+  VPS. Jobs running at that moment are marked `failed` and the user must resend.
+* **`misconfigured` every minute.** Read `data/logs/launcher.err`; the usual
+  causes are a wrong token/API id/hash or a missing `.env`.
 * **Every upload fails immediately.** Check `df -h ~` and `df -i ~` (disk and
   inodes) and the `data/tmp` permissions.
 * **Two replies to every message.** Two bots share a token from *different
-  directories* (each has its own session/lock). Run only one copy per token.
+  directories*, so each has its own session and lock. Run one copy per token.

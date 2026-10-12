@@ -1,194 +1,160 @@
 # Gamas Bot
 
-A Persian study assistant for Telegram. Send a lecture recording (audio or
-video) or a PowerPoint deck and the bot returns the raw transcript first,
-then a polished, right-to-left Word booklet.
+A Persian study assistant for Telegram. Send a lecture recording (audio or video)
+or a PowerPoint deck; the bot returns the raw transcript first, then a
+right-to-left Word booklet.
 
-* **Persian first.** RTL paragraphs and styles, mixed Persian/English runs,
-  Persian digits, real heading styles, a cover page, a page frame, native
-  page-number fields and a link-only table of contents.
-* **No system media binaries.** Media handling uses PyAV and python-pptx from
-  the Python dependencies — there is no `ffmpeg`, `ffprobe` or `soffice`
-  requirement.
-* **Provider-neutral.** Speech-to-text (Speechmatics / Deepgram / any
-  OpenAI-compatible endpoint) and note generation (Gemini / Anthropic / any
-  OpenAI-compatible endpoint) are configuration, not code. Keys live in the
-  environment only.
-* **Prepaid billing with a real ledger.** Credit is reserved before a job runs
-  and released in full on every failure or cancellation path.
+* **Persian first** — RTL paragraphs and styles, mixed Persian/English runs,
+  Persian digits, real heading styles, cover page, page frame, native
+  page-number fields.
+* **No system media binaries** — media runs on PyAV and python-pptx. There is no
+  `ffmpeg`, `ffprobe` or `soffice` requirement.
+* **Providers are configuration** — speech-to-text (Speechmatics / Deepgram /
+  any OpenAI-compatible endpoint) and note generation (NaraRouter / OpenRouter /
+  Gemini / Anthropic / any OpenAI-compatible endpoint). Keys live in the
+  environment only, never in the database.
+* **Prepaid billing with a real ledger** — credit is reserved before a job runs
+  and released in full on every failure path.
 
-| Documentation | |
-| --- | --- |
-| [docs/OVERHAUL_PLAN.md](docs/OVERHAUL_PLAN.md) | the v3 design contract (module map, invariants) |
-| [docs/README.md](docs/README.md) | index of every page (v3 pages first, v2-era pages marked) |
-
-## How it works
+## Pipeline
 
 ```
 Telegram → bounded job queue → media worker (PyAV) → speech-to-text
-        → transcript engine (fidelity-gated cleanup + paragraphing)
-        → raw .txt delivered  →  note model (map + optional reduce)
+        → transcript engine (cleanup + paragraphing)
+        → raw .txt delivered → note model (map + optional reduce)
         → RTL Word document → delivery
 ```
 
-The transcript engine's primary output is the document handed to the note
-model — cleaned, deterministically paragraphed from word timings, and checked
-against the raw engine text so nothing is silently lost. That same document is
-the `.txt` deliverable. If the note model is unavailable, the raw transcript is
-still delivered — content is never lost to a provider outage.
+The raw transcript is persisted and delivered **before** note generation starts,
+so a note-provider outage never costs the user their content.
 
-In the chat everything starts from one button, **📎 ساخت جزوه**; the account
-screen shows balance, purchase plans and payment history. The two panels are
-separate: the user menu is the root for every account, admins included, and
-administrators step into their own panel (**🛠 پنل مدیریت**) from a dedicated
-button — overview with statistics, user listings, pending card-to-card
-payments with receipts you can open and decide on the spot, grants and
-broadcast, with one tap back to the user menu.
+In chat everything starts from one button, **📎 ساخت جزوه**. Admins step into
+their own panel (**🛠 پنل مدیریت**) for statistics, users, pending payments and
+broadcasts.
 
 ## Supported formats
 
-* **Audio** — MP3, M4A, WAV, OGG/OPUS, FLAC, WMA, AMR, AAC and Telegram voice
-  notes; other common containers are probed and handled when they carry audio.
-* **Video** — MP4, MKV, MOV, AVI, WEBM, WMV, MPEG/TS and Telegram round video
-  notes. The audio track is extracted; the video stream is never re-encoded.
-* **Presentations** — PPTX, PPTM, PPSX, PPSM, POTX, POTM, and legacy PPT/PPS/POT
-  (converted in-process). ODP/OTP are not supported; export them to PPTX.
+| Kind | Formats |
+| --- | --- |
+| Audio | MP3, M4A, WAV, OGG/OPUS, FLAC, WMA, AMR, AAC, Telegram voice notes |
+| Video | MP4, MKV, MOV, AVI, WEBM, WMV, MPEG/TS, Telegram round videos (audio track extracted, never re-encoded) |
+| Decks | PPTX, PPTM, PPSX, PPSM, POTX, POTM, legacy PPT/PPS/POT (converted in-process). ODP/OTP are not supported |
 
-## Requirements
-
-* Python **3.11 – 3.13**
-* A Telegram bot token and API credentials ([my.telegram.org](https://my.telegram.org))
-* At least one speech-to-text provider key
-* Optional: a note-generation provider (without one, the bot delivers raw
-  transcripts only and says so in `--check`)
-
-## Installation
-
-Dependencies have one canonical definition in `pyproject.toml`;
-`requirements.txt` is generated from it and is what a cPanel/Passenger
-deployment installs.
+## Install
 
 ```bash
 git clone https://github.com/AmiraliGhamkhar/Gamas_bot
 cd Gamas_bot
-python -m venv .venv
-. .venv/bin/activate            # Windows: .venv\Scripts\activate
+python -m venv .venv && . .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-cp .env.example .env            # then edit .env
-python -m scripts.cpanel_preflight   # readiness checklist
-python -m gamas_bot --check          # configuration/dependency self-check
+cp .env.example .env          # then edit .env
+python -m scripts.cpanel_preflight   # host readiness checklist
+python -m gamas_bot --check          # offline config self-check
 python -m gamas_bot                  # run
 ```
 
-For development:
-
-```bash
-python -m pip install -r requirements.txt ruff pytest
-ruff check .
-python -m pytest -q
-```
+Requires Python **3.11–3.13**, a Telegram bot token and API credentials
+([my.telegram.org](https://my.telegram.org)), and at least one STT key.
 
 ### Minimum configuration
 
-Everything is documented in `.env.example`; the values you cannot start without:
+`.env.example` documents all 81 variables. The ones you cannot start without:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=123456:ABC...
 TELEGRAM_API_ID=123456
 TELEGRAM_API_HASH=abcdef0123456789abcdef0123456789
+ADMIN_IDS=123456789            # numeric ids, comma separated
 
 # At least one STT engine:
 SPEECHMATICS_API_KEY=...
 # DEEPGRAM_API_KEY=...
-# STT_OPENAI_BASE_URL=https://api.openai.com/v1
-# STT_OPENAI_API_KEY=...
 
-# Note generation (optional; without it only raw transcripts are delivered).
-# The order is the failover policy: Nara first, OpenRouter second.
+# Optional — without it the bot delivers raw transcripts only.
+# The order IS the failover policy:
 NARA_API_KEY=...
 OPENROUTER_API_KEY=...
-
-# Admin Telegram numeric ids, comma separated:
-ADMIN_IDS=123456789
 ```
 
-Relative paths are anchored to the project directory, so a cron job or
-`su -c` start cannot accidentally create a second database or session.
+Relative paths are anchored to the project directory, so cron or `su -c` cannot
+silently create a second database or session.
 
 ### Migrating from v2
-
-Existing deployments import users, plans, pending payments and live credit
-balances from the old database in one shot:
 
 ```bash
 python scripts/import_v2.py --from data/gamas_v2.db --into data/gamas.db
 ```
 
-The v2 `entitlements` state is replayed into the v3 append-only ledger, so the
-derived balance equals the old remaining balance and expiry dates survive.
-The script refuses to run twice and never writes to the source database.
+Users, plans, pending payments and live balances are replayed into the v3
+append-only ledger. The script refuses to run twice and never writes to the
+source database.
 
-## Processing limits
+## Limits
 
-Defaults, all configurable:
+All configurable; defaults shown.
 
-| Limit | Default |
-| --- | --- |
-| Upload size | 2 GB |
-| Active jobs / queued jobs | 3 / 8 (further uploads are rejected with an explicit message) |
-| One media operation | 3600 s |
-| Legacy `.ppt` conversion | 600 s |
-| STT job | 21600 s |
-| Slide clips per deck | 300 (21600 s total) |
-| Unpacked deck size | 4 GB (with entry-count and path checks) |
-| Receipt image | 5 MB, retained 90 days |
+| Limit | Variable | Default |
+| --- | --- | --- |
+| Upload size | `MAX_FILE_SIZE` | 2 GB |
+| Active / queued jobs | `MAX_ACTIVE_JOBS` / `MAX_QUEUED_JOBS` | 3 / 8 |
+| One media operation | `MEDIA_TIMEOUT` | 3600 s |
+| Legacy `.ppt` conversion | `CONVERT_TIMEOUT` | 600 s |
+| One STT job | `STT_JOB_TIMEOUT` | 21600 s |
+| Clips per deck | `PRESENTATION_MAX_CLIPS` | 300 |
+| Unpacked deck size | `PRESENTATION_MAX_UNPACKED_BYTES` | 4 GB |
+| Note request window | `NOTE_CONTEXT_TOKENS` | 32000 tokens |
+| Note answer budget | `NOTE_MAX_OUTPUT_TOKENS` | 16384 tokens |
+| Receipt image | `MAX_PAYMENT_RECEIPT_BYTES` | 5 MB, kept 90 days |
 
-## Testing
+Beyond the queue bounds an upload is rejected with an explicit message rather
+than queued in memory.
+
+## Test
 
 ```bash
-python -m compileall -q gamas_bot scripts tests passenger_wsgi.py
 ruff check .
+python -m mypy
 python -m pytest -q
 ```
 
-The suite covers the transcript engine (fidelity, paragraphing, chunking),
-the STT failover/cooldown machinery, the note merge invariants, the ledger
-(reserve → consume/release, exactly-once settlement), the job queue bounds,
-the DOCX RTL contracts and the v2 import.
+No test needs an API key or makes a billable call. See
+[docs/TESTING.md](docs/TESTING.md).
 
-## Deployment
+## Deploy
 
-* **cPanel / Passenger** — [`docs/DEPLOY_CPANEL.md`](docs/DEPLOY_CPANEL.md) and
-  [`docs/DEPLOY_FA.md`](docs/DEPLOY_FA.md).
-* **systemd** — install `deploy/gamas-bot.service` (hardened unit:
-  `Restart=always`, `UMask=0077`, `ProtectSystem=strict`).
-* An advisory lock on the Telegram session path guarantees a single polling
-  instance even if a watchdog starts a second copy.
+* **cPanel / Passenger** — [docs/DEPLOY_CPANEL.md](docs/DEPLOY_CPANEL.md),
+  Persian walkthrough in [docs/DEPLOY_FA.md](docs/DEPLOY_FA.md).
+* **systemd** — `deploy/gamas-bot.service` (`Restart=always`, `UMask=0077`,
+  `ProtectSystem=strict`).
+
+An advisory lock on the Telegram session path guarantees a single polling
+instance even if a watchdog starts a second copy.
 
 ## Known limitations
 
-* Speech-to-text is billed by provider duration and is never chunked: a file
-  larger than every configured engine's direct-upload limit is rejected rather
-  than split.
-* The table of contents links to headings but does not print page numbers —
-  exact numbers need an office layout engine, and numbers are omitted rather
-  than estimated.
-* Legacy `.ppt` fidelity is bounded by what the converter library supports;
-  unsupported content is reported rather than silently dropped.
-* A single process serves one bot token. Horizontal scaling would need a real
-  job broker, which this workload does not justify.
-* Payments are card-to-card and confirmed manually; there is no gateway
-  integration.
+* STT is billed by provider duration and is never chunked: a file larger than
+  every configured engine's upload ceiling is rejected, not split.
+* The table of contents links to headings but prints no page numbers — exact
+  numbers need an office layout engine, and they are omitted rather than
+  guessed.
+* Legacy `.ppt` fidelity is bounded by the converter library; unsupported
+  content is reported, not silently dropped.
+* One process serves one bot token. Horizontal scaling would need a real job
+  broker.
+* Payments are card-to-card and confirmed by a human. No gateway integration.
 
 ## Privacy
 
-Audio is sent to the configured speech-to-text provider and the transcript to
-the configured note provider. Temporary files are removed after processing.
-The database keeps the transcript and the generated notes so a job can be
-audited; payment receipts are stored privately (outside the web root, `0600`)
-and deleted after the retention window. Logs never contain transcripts, keys or
-receipt contents.
+Audio goes to the configured STT provider, the transcript to the configured note
+provider. Temporary files are removed after processing. The database keeps the
+transcript and generated notes so a job can be audited. Receipts are stored
+outside the web root at `0600` and deleted after the retention window. Logs never
+contain transcripts, keys or receipt contents.
+
+## Documentation
+
+[docs/README.md](docs/README.md) indexes every page.
 
 ## License
 

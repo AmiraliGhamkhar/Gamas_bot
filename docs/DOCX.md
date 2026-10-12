@@ -1,121 +1,89 @@
 # Word document generation
 
 `gamas_bot/docx_export.py` produces the deliverable. It is the most
-detail-sensitive module in the project because "looks right in Persian" is a
-much narrower target than "is a valid `.docx`".
+detail-sensitive module here, because "looks right in Persian" is a much narrower
+target than "is a valid `.docx`".
 
 ## Layout
 
-Cover page (optional) → static table of contents (optional, long documents
-only) → learning objectives → summary → sections → key points → review
-questions → glossary. The raw transcript ships alongside as a `.txt` file; it is
-never replaced by the Word document.
+Cover page → topic list (long documents only) → learning objectives → summary →
+sections → key points → review questions → glossary. The raw transcript ships
+alongside as a `.txt`; it is never replaced by the Word document.
 
-## Persian / RTL requirements
+## RTL contracts
 
-These are contracts, not styling preferences, and each has tests:
+These are contracts, not styling preferences. `tests/test_docx_export.py` covers
+them.
 
-* **Paragraph direction** — paragraphs whose text is RTL-dominant get
-  `w:bidi`, and their *paragraph mark* gets its own `w:rtl` so an empty line,
-  the caret and a shaded spacer behave RTL too. Latin-only lines are left to
-  Word's default direction.
-* **Right alignment** — direction and alignment are separate properties, so
-  the document declares the alignment too: `w:docDefaults`, every paragraph
-  style and every written paragraph carry `w:jc w:val="right"`. A paragraph
-  with `w:bidi` and no `w:jc` aligns to its logical *start* edge, which a
-  reader resolves through its own defaults rather than through the file, and
-  justified (`both`) body text is not the right-aligned booklet this project
-  delivers. Only the deliberately centred blocks (brand mark, cover title,
-  footer, formula lines, TOC page cells) override it, and a Latin-only line
-  such as a formula stays LTR *and* right-aligned, so it lines up with the
-  Persian text around it.
-* **Mixed scripts** — `gamas_bot/bidi.py` splits text into direction runs;
-  Persian runs get the complex-script face (`w:cs`) with `w:rtl`, embedded
+* **Paragraph direction** — RTL-dominant paragraphs get `w:bidi`, and their
+  *paragraph mark* gets its own `w:rtl`, so an empty line, the caret and a shaded
+  spacer behave RTL too. Latin-only lines keep Word's default.
+* **Right alignment** — direction and alignment are separate properties, so the
+  document declares both: `w:docDefaults`, every paragraph style and every
+  written paragraph carry `w:jc w:val="right"`. A paragraph with `w:bidi` and no
+  `w:jc` aligns to its logical *start* edge, which a reader resolves from its own
+  defaults rather than from the file. Only deliberately centred blocks (brand
+  mark, cover title, footer, formula lines, topic-list cells) override it.
+* **Mixed scripts** — `gamas_bot/bidi.py` splits text into direction runs.
+  Persian runs get the complex-script face (`w:cs`) with `w:rtl`; embedded
   English keeps `w:ascii`/`w:hAnsi` and `w:rtl=0`. Logical order is never
   reversed in the file.
 * **Defaults and styles** — `w:docDefaults` and every style definition are
-  configured RTL, because Word derives the direction of style-generated
-  content and of anything the reader types from there, not from the runs.
+  configured RTL, because Word derives the direction of style-generated content
+  from there, not from the runs.
 * **Real heading styles** — `Heading 1/2/3` carry the outline level, so the
-  Navigation Pane, bookmarks and the TOC all work. `TOC 1/2/3`, `Title`,
-  `Subtitle`, `Quote`, `Table text`, `Definition`, `Example`, `Note` and
-  `Warning` are defined explicitly.
-* **Digits** — page numbers, section numbers and list markers are rendered in
-  Persian digits; numeric *values* in the content are never converted.
-* **Fonts** — referenced by name, never embedded. A named profile sets the four
-  roles (see `FONT_PROFILES` in `config.py`); `word/fontTable.xml` advertises
-  the fallback through `w:altName` so a reader without the Persian face
+  Navigation Pane, bookmarks and the topic list all work. `Title`, `Subtitle`,
+  `Quote`, `Table text`, `Definition`, `Example`, `Note` and `Warning` are
+  defined explicitly.
+* **Digits** — page numbers, section numbers and list markers are Persian digits;
+  numeric *values* in the content are never converted.
+* **Fonts** — referenced by name, never embedded. `DEFAULT_FONT_CONFIG` sets the
+  four roles (body, heading, latin, fallback) and `word/fontTable.xml` advertises
+  the fallback through `w:altName`, so a reader without the Persian face
   substitutes gracefully.
 
-## The page frame, header and footer
+## Page frame, header, footer
 
 The frame is a real `w:pgBorders` inside the section properties
 (`offsetFrom="page"`), not a bordered paragraph. The running header carries the
-document title; the footer carries a real `PAGE` field, so it stays correct if
+document title; the footer carries a native `PAGE` field, so it stays correct if
 the document is re-paginated.
 
-## The static table of contents
+## The topic list
 
-The TOC is a two-column table of **ordinary text**: each entry is an internal
-hyperlink to the bookmark of a real `Heading 1/2/3` paragraph. It is not a
-`TOC` field, so a reader never sees "update field" placeholders and the numbers
-are stable.
+The topic list is a two-column table of **ordinary text**: each entry is an
+internal hyperlink to the bookmark of a real `Heading 1/2/3` paragraph.
 
-Page numbers come from an actual layout pass:
+It is **link-only — it prints no page numbers.** Exact numbers would need a
+layout pass through an office renderer, which v3 deliberately does not require.
+A number that was not measured is never printed, so the column is omitted rather
+than guessed.
 
-1. the document is saved with fixed-width placeholders;
-2. LibreOffice converts it to PDF headlessly and `pypdf` resolves every TOC
-   hyperlink to the physical page its target landed on;
-3. those numbers are written into the table and the document is saved again;
-4. the document is rendered *again* to confirm the written numbers did not move
-   anything, and only then is it returned.
-
-`DOCX_TOC_PAGE_NUMBERS` selects the policy when the renderer is unavailable:
-
-| Value | Renderer present | Renderer absent |
-| --- | --- | --- |
-| `auto` (default) | exact verified numbers | link-only topic list, empty number column |
-| `required` | exact verified numbers | document is not generated; explicit error |
-| `off` | never invoked | link-only topic list |
-
-Ambiguity, an unstable map, or a link that points at the cover/TOC page is
-always a hard failure — a page number that was not measured is never printed.
-
-A TOC is only ever built from headings the list will actually contain, so the
-level filter (`DOCX_TOC_LEVELS`) and the decision to have a topic list can never
-disagree. If nothing qualifies, the topic page is dropped and the document is
-delivered without one; an empty "فهرست مطالب" over an empty table is never
-emitted, and it is never a reason to lose the booklet.
-
-The render loop is bounded: a stable document costs exactly two renders, and a
-document that never stabilises fails after three instead of looping.
+It is built only for documents that need one: at least `TOC_MIN_SECTIONS` (4)
+navigable headings or `TOC_MIN_BODY_CHARS` (2400) of body text. `TOC_LEVELS`
+defaults to `"1-1"`, because the document's own block labels («تعریفها»,
+«مثالها») are real Heading 2s that repeat in every section and would otherwise
+dominate the list. If nothing qualifies, the page is dropped — an empty
+«فهرست مطالب» over an empty table is never emitted, and a missing topic list is
+never a reason to lose the booklet.
 
 ## Reproducibility and performance
 
 * Identical inputs produce byte-identical output. python-docx stamps package
-  members with the wall clock on save; the final post-processing pass
-  normalises the timestamps so artifacts are comparable by hash.
-* Bookmark identifiers are per-document. They used to come from a
-  process-global counter, which made the name of a heading in one user's
-  booklet reveal that user's position in the server's job sequence.
+  members with the wall clock on save; a final post-processing pass normalizes
+  the timestamps so artifacts are comparable by hash.
+* Bookmark identifiers are per-document. They used to come from a process-global
+  counter, which made a heading name in one user's booklet reveal that user's
+  position in the server's job sequence.
 * The font-fallback rewrite touches the whole package, so it runs once on the
   final payload instead of after every intermediate save.
-* python-docx resolves a paragraph style by scanning every style in the
-  document on every assignment. The resolved id is memoized per document, which
-  removes about a quarter of the document build's CPU. Output is unchanged
+* Style resolution is memoized per document, and every run's `w:rPr` is written
+  directly for fresh runs instead of going through python-docx property setters
+  (each of which performs several schema-order tree scans). Output is unchanged
   byte-for-byte.
-* Every run's `w:rPr` is written directly for fresh runs instead of going
-  through six python-docx property setters (each of which performs several
-  schema-order tree scans), and the static TOC resolves heading styles from the
-  raw `w:pStyle` id instead of resolving `paragraph.style` per paragraph.
-  Together these halve a full booklet build (2727 ms → 1406 ms on a 30-section
-  document, median of 5) with byte-identical output;
-  `tests/test_docx_run_styling.py` proves the fast paths emit exactly the XML
-  the setter-based paths do for every combination of direction, weight, style,
-  colour, size and font role.
 
-## Fonts and images
+## Logo
 
-A logo is used only from a local path (`DOCX_LOGO_PATH`, or
-`assets/gamas_logo.*`); generation never downloads an image and never fails when
-the file is missing (it falls back to the typographic mark).
+A logo is used only from a local path in `LOGO_CANDIDATES`
+(`assets/gamas_logo.png` or `.jpg`). Generation never downloads an image and
+never fails when the file is missing — it falls back to the typographic mark.

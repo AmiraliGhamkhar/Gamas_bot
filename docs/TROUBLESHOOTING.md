@@ -3,127 +3,109 @@
 ## The bot does not answer
 
 1. `python -m gamas_bot --check` — configuration and dependency self-check.
-2. Look for the startup line in the log (`Gamas Bot v3 started`).
-3. If the log says the session or lock is unavailable, another process is
-   already polling this bot account. Stop it; the advisory lock is intentional
-   and a second instance exits with code `3`.
-4. Network problems reaching Telegram (`FloodWait`, connection errors) are
-   handled by Telethon; check outbound TCP 443.
+2. Look for the startup line in the log.
+3. If the log says the session or lock is unavailable, another process is already
+   polling this bot account. Stop it — the advisory lock is intentional and a
+   second instance exits with code `3`.
+4. `FloodWait` and connection errors are handled by Telethon; check outbound
+   TCP 443.
 
 ## Every upload fails with a tracking reference
 
-The reference (`GMS-000123`) is in the chat message and in the log. Search the
-log for it (`grep GMS-000123`) — the surrounding lines are the cause. The three
-shapes you will see:
+The reference (`GMS-000123`) is in the chat message and in the log. `grep` for
+it — the surrounding lines are the cause.
 
-* `❌ تبدیل گفتار به متن نشد: …` — the speech-to-text chain failed. Continue
-  with [STT failures](#stt-failures) below.
-* `❌ این فایل شاخهٔ صوتی ندارد؛ …` — the file (or the extracted track) carries
-  no audio stream; the message is explicit and no credit is consumed.
-* `❌ این فایل از سقف حجم ربات بزرگ‌تر است.` — larger than `MAX_FILE_SIZE`.
+| Message | Meaning |
+| --- | --- |
+| `❌ تبدیل گفتار به متن نشد: …` | the STT chain failed — see [STT failures](#stt-failures) |
+| `❌ این فایل شاخهٔ صوتی ندارد؛ …` | no audio stream; no credit consumed |
+| `❌ این فایل از سقف حجم ربات بزرگ‌تر است.` | larger than `MAX_FILE_SIZE` |
 
 In every failure path the reserved credit is released exactly once
-(`holds.released_at`) and the submission is marked `failed` with the reason. If
-the reserve exists without a release, that is a bug worth reporting with the
+(`holds.released_at`) and the submission is marked `failed` with the reason. A
+reserve with neither a release nor a debit is a bug — report it with the
 submission id.
 
-The raw transcript is a success case, not a failure case:
+## Only the raw transcript arrives
 
-* `📝 متن خام — GMS-000123` as a `.txt` attachment is the normal raw delivery; a
-  `📖 جزوهٔ Word — GMS-000123` `.docx` follows it. If the `.txt` upload is
-  refused, the same text is sent as paginated chat messages and the job still
-  completes — look for `raw .txt delivery failed; falling back to text` in the
-  log to see why the file could not be attached.
-* Only when both the file upload **and** the text fallback fail does the job fail
-  and the reservation get released; the finished transcript is still in the
-  `transcriptions` table for that submission id.
-* `ℹ️ این بار نتوانستم متن را به جزوهٔ ساختارمند دربیاورم` means the note
-  providers all failed — the raw transcript was already delivered. The log lines
-  `note provider failed; trying the next one` name each provider, its error class
-  and the reason; a missing key shows up as a skip, not as a request.
-* A logged `LLMOutputBudgetError` (`پاسخ … به سقف توکن خروجی رسید`) is not a
-  provider outage: the answer was cut off by `NOTE_MAX_OUTPUT_TOKENS`. Raise it.
-  This is the expected shape of the failure on a reasoning model, which spends
-  part of the same budget thinking before it writes anything.
-* A logged `LLMContextOverflowError` after several `splitting into N part(s)`
-  lines means the input was too large even after the bounded halving — shorten
-  the recording or raise `NOTE_CONTEXT_TOKENS` if the model really has a larger
-  window than the default assumes.
+This is a **partial success**, not a failure: the raw `.txt` is delivered and
+persisted before note generation starts.
+
+* `📝 متن خام — GMS-000123` is the normal raw delivery; `📖 جزوهٔ Word — …`
+  follows it. If the `.txt` upload is refused, the same text goes out as
+  paginated chat messages and the job still completes — look for
+  `raw .txt delivery failed; falling back to text`.
+* `ℹ️ این بار نتوانستم متن را به جزوهٔ ساختارمند دربیاورم` means every note
+  provider failed. The log line `note provider failed; trying the next one`
+  names each provider, its error class and the reason. A missing key shows up as
+  a skip, not as a request.
+
+Two note failures have specific fixes:
+
+| Log line | Cause | Fix |
+| --- | --- | --- |
+| `LLMOutputBudgetError` (`به سقف توکن خروجی رسید`) | the answer was cut off by the output budget. Expected on a reasoning model, which spends part of the same budget thinking | raise `NOTE_MAX_OUTPUT_TOKENS` |
+| `LLMContextOverflowError` after several `splitting into N part(s)` | the input was too large even after the bounded halving | shorten the recording, or raise `NOTE_CONTEXT_TOKENS` if the model's window really is larger |
 
 ## STT failures
 
-Search the log for the submission id and read these lines:
+Search the log for the submission id:
 
 ```
 STT failover chain providers=speechmatics,deepgram,openai_compatible bytes=… language=fa
 STT provider speechmatics has no credentials; skipped
 STT provider deepgram in cooldown for 812s more; skipped
-STT provider openai_compatible skipped: file is 41000000 bytes, over its 25000000 byte ceiling
 STT attempt provider=deepgram bytes=… model=nova-3 language=fa
 STT done provider=deepgram bytes=… elapsed_seconds=12.4
 STT exhausted every eligible provider (2 attempted/skipped): …
 ```
 
-Classification a message falls into and what to do:
-
 | Message fragment | Meaning | Action |
 | --- | --- | --- |
-| `هیچ سرویس تبدیل گفتاری پیکربندی نشده است` | no key for any provider in `STT_PROVIDERS` | set a key, or add the configured provider to `STT_PROVIDERS` |
-| `اعتبارنامه را نپذیرفت (HTTP 401/403)` | the key is invalid or disabled | replace it; the provider is skipped for 15 minutes (`AUTH_COOLDOWN_SECONDS`) |
-| `محدودیت نرخ درخواست را اعلام کرد (HTTP 429)` | rate limited | transient; up to 3 attempts, `Retry-After` honoured up to 60 s, then the next provider |
-| `درخواست را رد کرد (HTTP 4xx)` | the provider refused the request — unsupported model, language or media | read the provider's own detail after the colon; for Persian check the model pairing below |
-| `موقتاً در دسترس نیست (HTTP 5xx)` / `پس از چند تلاش در دسترس نبود` | provider or network outage | transient, then failover; check outbound TCP 443 and DNS |
-| `سقف حجم …MB دارد` | the file is over that provider's direct-upload ceiling | expected; the file goes to the next provider |
-| `در حال استراحت (…s)` | the provider is in cooldown | wait, or fix the credential that caused it |
-| `پاسخ JSON معتبری برنگرداند` / `متن قابل استفاده‌ای تولید نکرد` | unusable or empty provider payload | provider-side problem or an incompatible gateway; the next provider runs |
+| `هیچ سرویس تبدیل گفتاری پیکربندی نشده است` | no key for any provider in `STT_PROVIDERS` | set a key, or list the configured provider |
+| `اعتبارنامه را نپذیرفت (HTTP 401/403)` | invalid or disabled key | replace it; the provider cools down 15 minutes |
+| `محدودیت نرخ درخواست را اعلام کرد (HTTP 429)` | rate limited | transient: 3 attempts, `Retry-After` honoured to 60 s, then failover |
+| `درخواست را رد کرد (HTTP 4xx)` | unsupported model, language or media | read the detail after the colon; check the pairing below |
+| `موقتاً در دسترس نیست` | provider or network outage | transient, then failover; check TCP 443 and DNS |
+| `سقف حجم …MB دارد` | over that provider's upload ceiling | expected; the file goes to the next provider |
+| `در حال استراحت (…s)` | cooldown | wait, or fix the credential that caused it |
+| `متن قابل استفاده‌ای تولید نکرد` | unusable or empty payload | provider-side; the next provider runs |
 
 ### Persian check
 
-* Deepgram needs `DEEPGRAM_MODEL=nova-3` (`nova-3-general` also works). Nova-2
-  has no Persian language pack and rejects `language=fa`. `--check` warns about
-  this pairing and the bot logs the warning at startup.
-* Speechmatics `enhanced`/`standard` accept `fa` directly; `melia-1`/`oak-1`
-  require `STT_LANGUAGE=multi` and reject `auto`.
-* OpenAI-compatible gateways need a model that supports the language. Segment
-  timings are requested with `response_format=verbose_json` and retried once
-  with `json` when a gateway explicitly refuses that format.
+* **Deepgram** needs `DEEPGRAM_MODEL=nova-3` (`nova-3-general` also works).
+  Nova-2 has no Persian pack and rejects `language=fa`.
+* **Speechmatics** `enhanced`/`standard` accept `fa` directly; `melia-1`/`oak-1`
+  need `STT_LANGUAGE=multi` and reject `auto`.
+* **OpenAI-compatible** gateways need a model that supports the language.
+  `verbose_json` is retried once as `json` when a gateway refuses it.
 
-A `--check` run is the fastest way to see all of this at once; it never contacts
-a provider and is safe to run while the bot is serving traffic.
+`--check` reports all of this at once, never contacts a provider, and is safe to
+run while the bot is serving traffic.
 
-## Credit was not returned after a failure
+## Media fails after a dependency change
 
-It should be, in every failure and cancellation path, and there is a test per
-path. Check the ledger for a release event for that submission:
-`release_hold` sets `holds.released_at` and is a no-op on a second call, so a
-double release cannot double-refund. If a reserve has neither a release nor a
-debit, report it with the submission id.
+`python -m gamas_bot.media_worker check` reports a broken `av` or `ppt2pptx`
+install directly. `ffmpeg`, `ffprobe` and `soffice` are **not** used.
 
-## Media processing fails after a dependency change
+## The topic list has no page numbers
 
-`python -m gamas_bot --check` runs `python -m gamas_bot.media_worker check`, so a
-broken `av`/`ppt2pptx` install is reported there instead of surfacing later as a
-mysterious media error. `ffmpeg`, `ffprobe` and `soffice` are **not** used:
-media runs in a dedicated worker process through PyAV.
-
-## The booklet arrives, but the table of contents has no page numbers
-
-There is no renderer in v3: the table of contents links to the headings and the
-page-number column stays empty. Numbers are never guessed.
+That is the design: v3 has no layout renderer, the topic list links to the
+headings, and a number that was not measured is never printed.
 
 ## Word offers to "repair" the document
 
-That would be a real bug — the OOXML element order is maintained explicitly.
-Report it with the generated file; OOXML ordering rules (CT_PPr, CT_RPr,
-CT_SectPr, CT_TblPr) are the first thing to check.
+That is a real bug — OOXML element order is maintained explicitly. Report it with
+the generated file; `CT_PPr`, `CT_RPr`, `CT_SectPr` and `CT_TblPr` ordering are
+the first things to check.
 
 ## Where to look first
 
 | Symptom | Start here |
 | --- | --- |
-| No reply at all | `instance_lock`, log, `python -m gamas_bot --check` |
-| Job fails | tracking reference in the log, `docs/STT_PROVIDERS.md` |
-| Only the raw text arrives | `note provider failed` lines in the log, `docs/PROVIDERS.md` |
-| Wrong billing | ledger report in the admin panel, `docs/BILLING.md` |
-| Document layout | `docs/DOCX.md` |
-| Deployment | `docs/DEPLOY_CPANEL.md`, `docs/DEPLOY_FA.md` |
+| No reply at all | `--check`, the log, `instance_lock` |
+| Job fails | tracking reference in the log, [STT_PROVIDERS.md](STT_PROVIDERS.md) |
+| Only raw text arrives | `note provider failed` lines, [PROVIDERS.md](PROVIDERS.md) |
+| Wrong billing | the ledger in the admin panel, [BILLING.md](BILLING.md) |
+| Document layout | [DOCX.md](DOCX.md) |
+| Deployment | [DEPLOY_CPANEL.md](DEPLOY_CPANEL.md), [DEPLOY_FA.md](DEPLOY_FA.md) |

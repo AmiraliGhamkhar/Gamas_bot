@@ -1,9 +1,9 @@
-# Testing (v3)
+# Testing
 
 ## CI gates
 
-GitHub Actions runs the v3 checks on Python 3.11, 3.12 and 3.13. From the
-repository root, the equivalent local checks are:
+GitHub Actions runs on Python 3.11, 3.12 and 3.13 (`.github/workflows/tests.yml`).
+The equivalent local run:
 
 ```bash
 python -m pip check
@@ -16,52 +16,56 @@ python -m unittest discover -s tests -q
 python -m gamas_bot.media_worker check
 ```
 
-The fresh-database CI smoke test opens a temporary SQLite database through
-`gamas_bot.db.Database`, confirms that every SQL file under `migrations/v3/`
-was applied, and asserts the expected eight application tables. The media
-worker smoke test checks the PyAV and `ppt2pptx` runtime dependencies without
-calling a media or AI provider.
+CI also applies every SQL file under `migrations/v3/` to a fresh temporary
+database and asserts the resulting eight application tables, and runs a
+non-blocking `pip-audit` scan.
 
 `requirements.txt` is generated from `[project].dependencies` in
-`pyproject.toml`; `scripts.sync_requirements --check` fails if the deployment
-file has drifted. CI also runs `pip check` and a non-blocking `pip-audit` scan.
+`pyproject.toml`; `scripts.sync_requirements --check` fails if the deployment file
+has drifted.
 
-## Test coverage
+## Coverage
 
-The suite asserts v3 behavior rather than the deleted v2 provider-platform
-internals:
-
-| Area | Test module |
+| Area | Module |
 | --- | --- |
-| Bot intake, raw-first delivery, billing settlement | `test_bot.py` |
-| Settings and configuration validation | `test_config.py` |
-| SQLite migrations, ledger, payments and plans | `test_db_billing.py` |
-| RTL Word output and document structure | `test_docx_export.py` |
-| One-shot v2 database import | `test_import_v2.py` |
-| Queue bounds, back-pressure and shutdown | `test_jobs.py` |
-| LLM request and response handling | `test_llm.py` |
-| Note parsing, chunking, map/reduce and fallback | `test_notes.py` |
-| STT adapters, retries and ordered failover | `test_stt.py` |
-| Transcript paragraphing, fidelity and chunk boundaries | `test_transcript.py` |
+| Bot intake, raw-first delivery, billing settlement | `tests/test_bot.py` |
+| Settings parsing, precedence, `check()` | `tests/test_config.py` |
+| `.env.example` ↔ `config.py` consistency | `tests/test_config_consistency.py` |
+| Migrations, ledger, holds, payments, plans, special users | `tests/test_db_billing.py` |
+| RTL Word output and document structure | `tests/test_docx_export.py` |
+| One-shot v2 database import | `tests/test_import_v2.py` |
+| Queue bounds, back-pressure, shutdown | `tests/test_jobs.py` |
+| LLM request/response shapes, error classes, failover | `tests/test_llm.py` |
+| Note parsing, chunk budget, map/reduce, split recovery | `tests/test_notes.py` |
+| STT adapters, retries, cooldowns, ordered failover | `tests/test_stt.py` |
+| Transcript paragraphing, fidelity, chunk boundaries | `tests/test_transcript.py` |
 
-The tests use synthetic media and mocked HTTP/Telegram boundaries; they do not
-need API credentials and do not make billable provider calls. The legacy `.ppt`
-fixtures are documented in `tests/fixtures/README.md`.
+The suite uses synthetic media and scripted HTTP/Telegram doubles. **No test
+needs an API key and no test makes a billable call.**
 
-The pre-overhaul v2 suite count is historical, not the v3 test count. v3 keeps
-focused behavior tests for its smaller architecture; current results should be
-reported from the run being evaluated rather than copied forward as a fixed
-count.
+Two doubles are deliberately strict, because permissive ones hid real bugs:
 
-## Optional manual checks
+* `tests/support.py` binds every fake Telegram call against the *installed*
+  Telethon signature, so an unsupported keyword fails in the test the same way it
+  fails in production.
+* The provider doubles return real documented payloads (NaraRouter's error
+  envelope, Gemini's `promptFeedback`, Deepgram's word timings) rather than
+  whatever shape the code happens to expect.
 
-For a deployment configuration self-check (requires valid local configuration,
-but does not connect to Telegram or AI providers):
+## Writing a test here
+
+* Prefer asserting the **documented provider contract** over the current code
+  path — a test that only mirrors the implementation cannot catch drift.
+* A regression test should fail against the commit before the fix. Verify that
+  with `git stash` before claiming it.
+* Report the count from the run you are looking at, never a copied-forward
+  number.
+
+## Manual checks
 
 ```bash
-python -m gamas_bot --check
+python -m gamas_bot --check    # offline; needs valid local configuration
 ```
 
-For an end-to-end test against live services, configure a test bot and provider
-credentials separately. These calls may incur provider charges; they are not
-part of CI and should only be run with explicit approval.
+An end-to-end run against live services needs a test bot and provider
+credentials, may incur charges, and is not part of CI.
