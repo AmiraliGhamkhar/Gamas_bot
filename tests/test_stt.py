@@ -66,10 +66,12 @@ class FakeSession:
         self.posts = list(posts or [])
         self.gets = list(gets or [])
         self.post_calls: list[str] = []
+        self.post_kwargs: list[dict] = []
         self.get_calls: list[str] = []
 
     def post(self, url, **kwargs):
         self.post_calls.append(url)
+        self.post_kwargs.append(kwargs)
         return _AsyncCM(self.posts.pop(0))
 
     def get(self, url, **kwargs):
@@ -125,6 +127,15 @@ class SpeechmaticsParsingTests(unittest.TestCase):
     def test_empty_results(self):
         self.assertEqual(_speechmatics_words([]), ("", []))
 
+    def test_trailing_both_punctuation_is_not_duplicated(self):
+        results = [
+            {"type": "word", "alternatives": [{"content": "واژه"}]},
+            {"type": "punctuation", "alternatives": [{"content": "-", "attaches_to": "both"}]},
+        ]
+        text, words = _speechmatics_words(results)
+        self.assertEqual(text, "واژه-")
+        self.assertEqual([word.text for word in words], ["واژه-"])
+
 
 class SpeechmaticsFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_end_to_end(self):
@@ -141,6 +152,20 @@ class SpeechmaticsFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raw.words[0].start, 0.0)
         # The transcript request asked for json-v2 (the timed format).
         self.assertEqual(session.get_kwargs.get("params"), {"format": "json-v2"})
+
+    async def test_multilingual_model_requests_multilingual_detection(self):
+        settings = make_settings(
+            stt_providers=("speechmatics",),
+            speechmatics_model="melia-1",
+            stt_language="auto",
+        )
+        session = speechmatics_flow([
+            {"type": "word", "alternatives": [{"content": "درس"}]},
+        ])
+        await stt._speechmatics(session, audio_file(), settings)
+        form = session.post_kwargs[0]["data"]
+        config = json.loads(form._fields[0][2])
+        self.assertEqual(config["transcription_config"]["language"], "multi")
 
     async def test_rejected_job_is_request_error(self):
         settings = make_settings(stt_providers=("speechmatics",))
@@ -216,12 +241,76 @@ class LanguageNormalizationTests(unittest.TestCase):
     def test_speechmatics_passthrough_and_auto(self):
         self.assertEqual(_normalize_language("speechmatics", "fa", model="enhanced"), "fa")
         self.assertEqual(_normalize_language("speechmatics", "auto", model="enhanced"), "auto")
-        self.assertEqual(_normalize_language("speechmatics", "auto", model="melia-1"), "fa")
+        self.assertEqual(_normalize_language("speechmatics", "auto", model="melia-1"), "multi")
+        self.assertEqual(_normalize_language("speechmatics", "fa", model="melia-1"), "multi")
+        self.assertEqual(_normalize_language("speechmatics", "multi", model="melia-1"), "multi")
+        self.assertEqual(_normalize_language("speechmatics", "multi", model="enhanced"), "fa")
         self.assertEqual(_normalize_language("speechmatics", "ar_en"), "ar_en")
 
     def test_deepgram_multi_omits_language(self):
         self.assertEqual(_normalize_language("deepgram", "multi", model="nova-2"), "")
         self.assertEqual(_normalize_language("deepgram", "fa", model="nova-2"), "fa")
+
+    def test_openai_auto_detection_omits_language(self):
+        for keyword in ("auto", "detect", "multi"):
+            self.assertEqual(_normalize_language("openai_compatible", keyword), "")
+        self.assertEqual(_normalize_language("openai_compatible", "fa"), "fa")
+
+
+class ProviderRequestTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deepgram_accepts_a_full_listen_endpoint_and_sends_audio_mime(self):
+        settings = make_settings(
+            deepgram_base_url="https://dg.example/v1/listen?tenant=course",
+            stt_language="fa",
+        )
+        payload = {
+            "results": {"channels": [{"alternatives": [{"transcript": "متن", "words": []}]}]}
+        }
+        session = FakeSession(posts=[FakeResponse(200, payload)])
+        await stt._deepgram(session, audio_file("deepgram.wav"), settings)
+        self.assertEqual(
+            session.post_calls[0], "https://dg.example/v1/listen?tenant=course"
+        )
+        self.assertEqual(session.post_kwargs[0]["headers"]["Content-Type"], "audio/wav")
+
+    async def test_openai_falls_back_only_for_verbose_json_rejection(self):
+        settings = make_settings(
+            stt_openai_base_url="https://asr.example/v1",
+            stt_openai_api_key="stt-key",
+        )
+        session = FakeSession([
+            FakeResponse(400, {"error": {"message": "verbose_json is not supported"}}),
+            FakeResponse(200, {"text": "متن ساده"}),
+        ])
+        raw = await stt._openai_compatible(session, audio_file("openai.wav"), settings)
+        self.assertEqual(raw.text, "متن ساده")
+        self.assertEqual(len(session.post_calls), 2)
+        self.assertEqual(
+            session.post_calls[0], "https://asr.example/v1/audio/transcriptions"
+        )
+
+    async def test_openai_auto_detection_omits_invalid_auto_language_field(self):
+        settings = make_settings(
+            stt_openai_base_url="https://asr.example/v1",
+            stt_openai_api_key="stt-key",
+            stt_language="auto",
+        )
+        session = FakeSession([FakeResponse(200, {"text": "متن"})])
+        await stt._openai_compatible(session, audio_file("openai.wav"), settings)
+        names = [field[0].get("name") for field in session.post_kwargs[0]["data"]._fields]
+        self.assertNotIn("language", names)
+
+    async def test_openai_does_not_retry_unrelated_bad_request(self):
+        settings = make_settings(
+            stt_openai_base_url="https://asr.example/v1",
+            stt_openai_api_key="stt-key",
+        )
+        session = FakeSession([
+            FakeResponse(400, {"error": {"message": "invalid audio file"}}),
+        ])
+        with self.assertRaises(STTRequestError):
+            await stt._openai_compatible(session, audio_file("openai.wav"), settings)
+        self.assertEqual(len(session.post_calls), 1)
 
 
 class FailoverTests(unittest.IsolatedAsyncioTestCase):
@@ -274,6 +363,46 @@ class FailoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raw.text, "از دیپ‌گرم")
         # the auth failure put speechmatics on cooldown
         self.assertGreater(stt._cooldown_remaining("speechmatics"), 0)
+
+    async def test_unusable_provider_response_fails_over(self):
+        settings = make_settings(stt_providers=("speechmatics", "deepgram"))
+        calls = []
+
+        async def malformed_run(_session, _path, _settings):
+            calls.append("speechmatics")
+            raise stt.STTError("bad response schema")
+
+        async def deepgram_run(_session, _path, _settings):
+            calls.append("deepgram")
+            return stt.RawTranscript.from_text("متن", engine="deepgram")
+
+        with mock.patch.dict(
+            stt.PROVIDERS,
+            {
+                "speechmatics": self.provider_with_run("speechmatics", malformed_run),
+                "deepgram": self.provider_with_run("deepgram", deepgram_run),
+            },
+        ):
+            raw = await transcribe(audio_file(), settings, session=object())
+        self.assertEqual(raw.engine, "deepgram")
+        self.assertEqual(calls, ["speechmatics", "deepgram"])
+
+    async def test_network_error_retries_before_failover(self):
+        settings = make_settings(stt_providers=("speechmatics",))
+        attempts = {"n": 0}
+
+        async def flaky_run(_session, _path, _settings):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise stt.aiohttp.ClientConnectionError("temporary connection issue")
+            return stt.RawTranscript.from_text("متن", engine="speechmatics")
+
+        spec = replace(PROVIDERS["speechmatics"], run=flaky_run)
+        with mock.patch.dict(stt.PROVIDERS, {"speechmatics": spec}):
+            with mock.patch.object(asyncio, "sleep", new=_noop_sleep):
+                raw = await transcribe(audio_file(), settings, session=object())
+        self.assertEqual(raw.text, "متن")
+        self.assertEqual(attempts["n"], 2)
 
     async def test_all_failures_reported(self):
         settings = make_settings(stt_providers=("speechmatics", "deepgram"))
@@ -337,6 +466,25 @@ class FailoverTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(stt.STTError):
                     await transcribe(audio_file(), settings, session=object())
 
+    async def test_openai_limit_is_applied_before_upload(self):
+        settings = make_settings(
+            stt_providers=("openai_compatible",),
+            stt_openai_base_url="https://asr.example/v1",
+            stt_openai_api_key="key",
+            stt_openai_max_upload=5,
+        )
+        calls = []
+
+        async def should_not_run(_session, _path, _settings):
+            calls.append(True)
+            return stt.RawTranscript.from_text("unexpected", engine="openai_compatible")
+
+        spec = replace(PROVIDERS["openai_compatible"], run=should_not_run)
+        with mock.patch.dict(stt.PROVIDERS, {"openai_compatible": spec}):
+            with self.assertRaises(stt.STTError):
+                await transcribe(audio_file("over-limit.wav"), settings, session=object())
+        self.assertEqual(calls, [])
+
     async def test_transient_retries_then_succeeds(self):
         settings = make_settings(stt_providers=("speechmatics",))
         attempts = {"n": 0}
@@ -366,10 +514,16 @@ class ErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         )
         error = await stt._error_from_response("Test", response)
         self.assertIsInstance(error, STTTransientError)
+        self.assertEqual(error.retry_after_seconds, 2.0)
 
-        response = FakeResponse(401, {"error": {"message": "invalid key"}})
+        response = FakeResponse(408, {})
         error = await stt._error_from_response("Test", response)
+        self.assertIsInstance(error, STTTransientError)
+
+        response = FakeResponse(401, {"error": {"message": "invalid key secret-stt-key"}})
+        error = await stt._error_from_response("Test", response, api_key="secret-stt-key")
         self.assertIsInstance(error, STTAuthenticationError)
+        self.assertNotIn("secret-stt-key", str(error))
 
         response = FakeResponse(400, {"error": {"message": "bad audio"}})
         error = await stt._error_from_response("Test", response)

@@ -44,6 +44,8 @@ class FromEnvTests(unittest.TestCase):
         self.assertEqual(settings.admin_ids, frozenset({111, 222}))
         self.assertTrue(settings.speechmatics_configured)
         self.assertTrue(settings.note_configured)
+        self.assertEqual(settings.note_model, "gpt-4o-mini")
+        self.assertEqual(settings.stt_openai_max_upload, 25_000_000)
         self.assertEqual(settings.stt_providers, tuple(DEFAULT_STT_PROVIDERS.split(",")))
         self.assertEqual(check(settings), [])
 
@@ -53,6 +55,37 @@ class FromEnvTests(unittest.TestCase):
         ):
             settings = from_env(env_file="/nonexistent")
         self.assertEqual(settings.stt_providers, ("deepgram", "speechmatics"))
+
+    def test_legacy_gemini_key_selects_gemini_and_its_default_model(self):
+        with mock.patch.dict(os.environ, {"GEMINI_API_KEY": "g-key"}, clear=True):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.note_provider, "gemini")
+        self.assertEqual(settings.note_api_key, "g-key")
+        self.assertEqual(settings.note_model, "gemini-2.5-flash")
+
+    def test_keyless_custom_base_url_keeps_openai_compatible_provider(self):
+        with mock.patch.dict(
+            os.environ,
+            {"GEMINI_API_KEY": "legacy-key", "NOTE_BASE_URL": "https://local.example/v1"},
+            clear=True,
+        ):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.note_provider, "openai_compatible")
+        self.assertEqual(settings.note_api_key, "")
+        self.assertTrue(settings.note_configured)
+
+    def test_selected_but_unconfigured_stt_provider_is_not_ready(self):
+        with mock.patch.dict(os.environ, env(STT_PROVIDERS="deepgram"), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertFalse(settings.stt_configured)
+        self.assertTrue(any("speech-to-text" in problem for problem in check(settings)))
+
+    def test_openai_stt_upload_limit_is_configurable(self):
+        with mock.patch.dict(
+            os.environ, env(STT_OPENAI_MAX_UPLOAD_BYTES="100000000"), clear=False
+        ):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.stt_openai_max_upload, 100_000_000)
 
     def test_relative_paths_anchored_to_project(self):
         with mock.patch.dict(os.environ, env(DB_PATH="data/x.db", TEMP_DIR="t"), clear=False):
@@ -116,6 +149,10 @@ class CheckTests(unittest.TestCase):
         settings = self.make(NOTE_API_KEY="")
         problems = check(settings)
         self.assertTrue(any("raw transcripts only" in p for p in problems))
+
+    def test_anthropic_requires_explicit_model(self):
+        settings = self.make(NOTE_PROVIDER="anthropic", NOTE_MODEL="")
+        self.assertTrue(any("NOTE_MODEL" in problem for problem in check(settings)))
 
     def test_no_admins_reported(self):
         settings = self.make(ADMIN_IDS="")

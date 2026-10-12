@@ -38,6 +38,10 @@ RAW_TEXT_PROFILES = ("plain", "timestamped")
 
 STT_PROVIDER_ORDER = ("speechmatics", "deepgram", "openai_compatible")
 NOTE_PROVIDERS = ("openai_compatible", "gemini", "anthropic")
+DEFAULT_NOTE_MODELS = {
+    "openai_compatible": "gpt-4o-mini",
+    "gemini": "gemini-2.5-flash",
+}
 
 #: Environment variable -> resolved settings attribute for the tariff. The
 #: attribute spelling matches the dataclass field exactly.
@@ -69,7 +73,9 @@ DEFAULT_STT_PROVIDERS = "speechmatics,deepgram,openai_compatible"
 #: being split — chunked audio loses word context at every boundary.
 SPEECHMATICS_MAX_UPLOAD = 2 * 1024**3
 DEEPGRAM_MAX_UPLOAD = 2 * 1024**3
-OPENAI_STT_MAX_UPLOAD = 2 * 1024**3
+# OpenAI's hosted audio transcription endpoint has a 25 MB per-file limit.
+# Compatible gateways can set STT_OPENAI_MAX_UPLOAD_BYTES to their own ceiling.
+OPENAI_STT_MAX_UPLOAD = 25_000_000
 
 
 def _project_path(value: str | None, default: str) -> Path:
@@ -180,6 +186,7 @@ class Settings:
     stt_openai_base_url: str
     stt_openai_api_key: str
     stt_openai_model: str
+    stt_openai_max_upload: int
 
     # --- Note generation ----------------------------------------------------
     note_provider: str
@@ -238,13 +245,13 @@ class Settings:
 
     @property
     def stt_configured(self) -> bool:
-        return any(
-            (
-                self.speechmatics_configured,
-                self.deepgram_configured,
-                self.stt_openai_configured,
-            )
-        )
+        """Whether at least one provider in the active order has credentials."""
+        configured = {
+            "speechmatics": self.speechmatics_configured,
+            "deepgram": self.deepgram_configured,
+            "openai_compatible": self.stt_openai_configured,
+        }
+        return any(configured.get(provider, False) for provider in self.stt_providers)
 
     @property
     def note_configured(self) -> bool:
@@ -298,6 +305,18 @@ def from_env(env_file: str | None = None) -> Settings:
                 break
 
     raw_providers = _env("STT_PROVIDERS", DEFAULT_STT_PROVIDERS)
+    explicit_note_provider = _env("NOTE_PROVIDER").lower()
+    # Preserve the old Gemini-only environment setup while keeping the
+    # documented OpenAI-compatible provider as the ordinary default.
+    note_provider = explicit_note_provider or (
+        "gemini"
+        if _env("GEMINI_API_KEY") and not _env("NOTE_API_KEY") and not _env("NOTE_BASE_URL")
+        else "openai_compatible"
+    )
+    note_api_key = _env("NOTE_API_KEY") or (
+        _env("GEMINI_API_KEY") if note_provider == "gemini" else ""
+    )
+    note_model = _env("NOTE_MODEL", DEFAULT_NOTE_MODELS.get(note_provider, ""))
     plan_values = {
         attribute: _env_int(name, default)
         for name, attribute, default in PLAN_ENV_FIELDS
@@ -354,10 +373,13 @@ def from_env(env_file: str | None = None) -> Settings:
         stt_openai_base_url=_env("STT_OPENAI_BASE_URL").rstrip("/"),
         stt_openai_api_key=_env("STT_OPENAI_API_KEY"),
         stt_openai_model=_env("STT_OPENAI_MODEL", "whisper-1"),
-        note_provider=_env("NOTE_PROVIDER", "openai_compatible").strip().lower(),
-        note_api_key=_env("NOTE_API_KEY") or _env("GEMINI_API_KEY"),
+        stt_openai_max_upload=_env_int(
+            "STT_OPENAI_MAX_UPLOAD_BYTES", OPENAI_STT_MAX_UPLOAD, minimum=1024
+        ),
+        note_provider=note_provider,
+        note_api_key=note_api_key,
         note_api_base_url=_env("NOTE_BASE_URL").rstrip("/"),
-        note_model=_env("NOTE_MODEL", "gemini-2.5-flash"),
+        note_model=note_model,
         note_mode=resolve_note_mode(_env("NOTE_MODE")),
         note_max_output_tokens=_env_int("NOTE_MAX_OUTPUT_TOKENS", 16384, minimum=256),
         note_json_mode=_env_bool("NOTE_JSON_MODE", False),
@@ -405,6 +427,8 @@ def check(settings: Settings) -> list[str]:
             f"NOTE_PROVIDER must be one of: {', '.join(NOTE_PROVIDERS)} "
             f"(got {settings.note_provider!r})."
         )
+    if settings.note_configured and not settings.note_model:
+        problems.append("NOTE_MODEL must be set for the selected note provider.")
     if not settings.note_configured:
         problems.append(
             "Note generation is not configured (NOTE_API_KEY / NOTE_BASE_URL); "

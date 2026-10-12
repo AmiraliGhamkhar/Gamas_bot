@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 #: extraction and organisation, not creative writing.
 NOTE_TEMPERATURE = 0.2
 
+#: A hung note-provider request must not inherit the STT job's multi-hour read timeout.
+LLM_REQUEST_TIMEOUT_SECONDS = 300.0
+
 #: Bounded retries for transient LLM failures (5xx, 429, network).
 MAX_TRANSIENT_RETRIES = 2
 
@@ -56,7 +59,11 @@ class LLMAuthError(LLMError):
 
 
 class LLMResponseError(LLMError):
-    """The answer was malformed, blocked or empty (no retry)."""
+    """The answer was malformed, blocked or empty."""
+
+
+class LLMRequestError(LLMResponseError):
+    """The provider rejected the request (retrying it with new content cannot help)."""
 
 
 def _endpoint(base_url: str, suffix: str) -> str:
@@ -96,25 +103,60 @@ async def _error_from_response(
 ) -> LLMError:
     body = await response.read()
     detail = None
+    error_markers: list[str] = []
     try:
         payload = json.loads(body.decode("utf-8", "replace"))
-        if isinstance(payload, dict) and isinstance(payload.get("error"), dict):
-            message = payload["error"].get("message")
-            if isinstance(message, str):
-                detail = _sanitize_error_text(message)
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                message = error.get("message")
+                if isinstance(message, str):
+                    detail = _sanitize_error_text(message)
+                for field in ("status", "code", "type"):
+                    value = error.get(field)
+                    if isinstance(value, (str, int)):
+                        error_markers.append(str(value).upper())
+                details = error.get("details")
+                if isinstance(details, list):
+                    for item in details:
+                        if not isinstance(item, dict):
+                            continue
+                        reason = item.get("reason")
+                        metadata = item.get("metadata")
+                        if isinstance(reason, str):
+                            error_markers.append(reason.upper())
+                        if isinstance(metadata, dict):
+                            meta_reason = metadata.get("reason")
+                            if isinstance(meta_reason, str):
+                                error_markers.append(meta_reason.upper())
+            elif isinstance(error, str):
+                detail = _sanitize_error_text(error)
     except (ValueError, TypeError):
         pass
+    if error_markers:
+        codes = _sanitize_error_text(", ".join(dict.fromkeys(error_markers)), limit=80)
+        detail = f"{detail} [{codes}]" if detail else codes
     if detail and api_key and api_key in detail:
         detail = detail.replace(api_key, "***")
     suffix = f": {detail}" if detail else ""
-    if response.status in (401, 403):
+    lower_detail = (detail or "").lower()
+    auth_error = (
+        response.status in (401, 403)
+        or any(
+            marker in error_markers
+            for marker in ("API_KEY_INVALID", "INVALID_API_KEY", "UNAUTHENTICATED", "PERMISSION_DENIED")
+        )
+        or "api key not valid" in lower_detail
+        or "invalid api key" in lower_detail
+    )
+    if auth_error:
         return LLMAuthError(f"{label} اعتبارنامه را نپذیرفت (HTTP {response.status}){suffix}")
-    if response.status == 429 or response.status >= 500:
+    if response.status in (408, 425, 429) or response.status >= 500:
         return LLMTransientError(
             f"{label} موقتاً در دسترس نیست (HTTP {response.status}){suffix}",
             retry_after_seconds=_retry_after_seconds(response.headers),
         )
-    return LLMResponseError(f"{label} درخواست را رد کرد (HTTP {response.status}){suffix}")
+    return LLMRequestError(f"{label} درخواست را رد کرد (HTTP {response.status}){suffix}")
 
 
 def _build_request(
@@ -231,23 +273,41 @@ async def complete(
     attempt = 0
     while True:
         try:
-            async with session.post(url, headers=headers, json=payload) as response:
+            async with session.post(
+                url,
+                headers=headers,
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=LLM_REQUEST_TIMEOUT_SECONDS),
+            ) as response:
                 if response.status != 200:
                     raise await _error_from_response(
                         "سرویس تولید جزوه", response, settings.note_api_key or None
                     )
-                result = await response.json(content_type=None)
+                try:
+                    result = await response.json(content_type=None)
+                except (ValueError, TypeError) as exc:
+                    raise LLMResponseError(
+                        "پاسخ سرویس تولید جزوه JSON معتبری نبود."
+                    ) from exc
             if not isinstance(result, dict):
                 raise LLMResponseError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
             return _parse_response(result, provider)
-        except LLMTransientError as exc:
+        except (LLMTransientError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if attempt >= MAX_TRANSIENT_RETRIES:
-                raise
+                if isinstance(exc, LLMTransientError):
+                    raise
+                raise LLMTransientError(
+                    "سرویس تولید جزوه پس از چند تلاش در دسترس نبود."
+                ) from exc
             attempt += 1
-            delay = exc.retry_after_seconds or min(2.0**attempt, 15.0)
+            retry_after = (
+                exc.retry_after_seconds if isinstance(exc, LLMTransientError) else None
+            )
+            delay = retry_after if retry_after is not None else min(2.0**attempt, 15.0)
             logger.warning(
-                "LLM transient failure (attempt %d/%d); retrying in %.1fs",
-                attempt, MAX_TRANSIENT_RETRIES + 1, delay,
+                "LLM transient failure (attempt %d/%d; %s); retrying in %.1fs",
+                attempt, MAX_TRANSIENT_RETRIES + 1,
+                type(exc).__name__, delay,
             )
             await asyncio.sleep(delay)
 
@@ -292,6 +352,23 @@ def extract_json_object(text: str) -> str:
     raise LLMResponseError("شیء JSON در پاسخ مدل کامل نبود.")
 
 
+def _parse_json_object(text: str) -> dict:
+    """Parse strict JSON and enforce the object shape used by note prompts."""
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"non-standard JSON constant: {value}")
+
+    try:
+        payload = json.loads(
+            extract_json_object(text),
+            parse_constant=reject_constant,
+        )
+    except (LLMResponseError, ValueError, TypeError) as exc:
+        raise LLMResponseError("پاسخ مدل شامل JSON معتبر نبود.") from exc
+    if not isinstance(payload, dict):
+        raise LLMResponseError("پاسخ مدل باید یک شیء JSON باشد.")
+    return payload
+
+
 async def complete_json(
     session: aiohttp.ClientSession,
     settings: Settings,
@@ -307,8 +384,10 @@ async def complete_json(
     """
     try:
         raw = await complete(session, settings, system=system, user=user)
-        return json.loads(extract_json_object(raw))
-    except (LLMResponseError, ValueError) as first_failure:
+        return _parse_json_object(raw)
+    except LLMRequestError:
+        raise
+    except LLMResponseError as first_failure:
         logger.warning("JSON parse failed (%s); retrying once", type(first_failure).__name__)
     raw = await complete(
         session,
@@ -319,4 +398,4 @@ async def complete_json(
             "بدون هیچ متن یا توضیح اضافه برگردانید.\n\n" + user
         ),
     )
-    return json.loads(extract_json_object(raw))
+    return _parse_json_object(raw)
