@@ -159,7 +159,7 @@ class Database:
 
     async def list_users(self, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
         rows = await self.db.execute_fetchall(
-            "SELECT telegram_id, joined_at, banned FROM users "
+            "SELECT telegram_id, joined_at, banned, is_unlimited FROM users "
             "ORDER BY joined_at DESC LIMIT ? OFFSET ?",
             (limit, offset),
         )
@@ -171,10 +171,57 @@ class Database:
                     "telegram_id": row[0],
                     "joined_at": row[1],
                     "banned": bool(row[2]),
+                    "is_unlimited": bool(row[3]),
                     "available_seconds": available,
                 }
             )
         return result
+
+    async def is_unlimited(self, user_id: int) -> bool:
+        rows = await self.db.execute_fetchall(
+            "SELECT is_unlimited FROM users WHERE telegram_id = ?", (user_id,)
+        )
+        return bool(rows and rows[0][0])
+
+    async def set_unlimited(
+        self,
+        user_id: int,
+        enabled: bool,
+        *,
+        admin_id: int,
+        reason: str = "",
+    ) -> None:
+        """Mark or unmark a special (unlimited) user, and audit the change."""
+        now = iso(utc_now())
+        async with self._write_lock:
+            if enabled:
+                await self.db.execute(
+                    "UPDATE users SET is_unlimited = 1, unlimited_reason = ?, "
+                    "unlimited_granted_by = ?, unlimited_granted_at = ? "
+                    "WHERE telegram_id = ?",
+                    (reason[:200], admin_id, now, user_id),
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE users SET is_unlimited = 0, unlimited_reason = NULL, "
+                    "unlimited_granted_by = NULL, unlimited_granted_at = NULL "
+                    "WHERE telegram_id = ?",
+                    (user_id,),
+                )
+            await self.db.commit()
+        await self.audit(
+            admin_id,
+            "unlimited_on" if enabled else "unlimited_off",
+            reason or "-",
+            user_id,
+        )
+
+    async def unlimited_users(self) -> list[dict[str, Any]]:
+        rows = await self.db.execute_fetchall(
+            "SELECT telegram_id, unlimited_reason, unlimited_granted_by, unlimited_granted_at "
+            "FROM users WHERE is_unlimited = 1 ORDER BY unlimited_granted_at DESC, telegram_id"
+        )
+        return [dict(row) for row in rows]
 
     async def count_users(self) -> int:
         row = await self.db.execute_fetchall("SELECT COUNT(*) FROM users")
@@ -361,10 +408,16 @@ class Database:
             await self.audit(admin_id, "grant_credit", note, user_id)
 
     async def reserve(self, user_id: int, submission_id: int, seconds: int) -> None:
-        """Reserve credit for a job, or raise :class:`InsufficientBalanceError`."""
+        """Reserve credit for a job, or raise :class:`InsufficientBalanceError`.
+
+        Special (unlimited) users get no reservation and are never denied; the
+        job's submission row still records its duration for the audit trail.
+        """
         if seconds <= 0:
             raise ValueError("reservation must be positive")
         async with self._write_lock:
+            if await self.is_unlimited(user_id):
+                return
             available = await self._available_seconds_locked(user_id)
             if available < seconds:
                 raise InsufficientBalanceError(available, seconds)
@@ -398,9 +451,22 @@ class Database:
             (submission_id,),
         )
         if not rows:
+            owner = await self.db.execute_fetchall(
+                "SELECT u.is_unlimited FROM submissions s "
+                "JOIN users u ON u.telegram_id = s.user_id "
+                "WHERE s.submission_id = ?",
+                (submission_id,),
+            )
+            if owner and owner[0][0]:
+                logger.debug("special user job not billed submission=%s", submission_id)
+                return
             logger.warning("settle_hold found no active hold submission=%s", submission_id)
             return
         user_id, reserved = int(rows[0][0]), int(rows[0][1])
+        if await self.is_unlimited(user_id):
+            # Made special while the job was running: release, never charge.
+            await self.release_hold(submission_id, "unlimited user")
+            return
         charge = max(0, min(int(measured_seconds), reserved))
         now = iso(utc_now())
         await self._write_many(

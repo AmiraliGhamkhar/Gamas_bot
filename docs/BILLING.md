@@ -54,9 +54,26 @@ database records that the file is gone; the row itself is kept for accounting.
 
 ## Special (unlimited) users
 
-`⭐ کاربران ویژه` are never billed. Their jobs are still recorded — so the audit
-trail shows the usage — but no reservation is created. Admins cannot add other
-admins to this list, and every change is written to the admin audit log.
+A special user is never billed. Admins manage the flag from the chat:
+
+```
+/unlimited <user_id> on <reason>   # the reason is required and stored
+/unlimited <user_id> off
+```
+
+* A special user's jobs get no credit reservation, so no balance is checked and
+  nothing is debited. The job row still records its `duration_seconds`, so the
+  audit trail shows the usage.
+* A job that was already running when the user was made special is released,
+  not charged.
+* The balance screens show «نامحدود» for these users, and the admin user list
+  marks them with ⭐.
+* Admins cannot be made special users, and nobody can change their own flag
+  through the command. Admins are billed like everyone else.
+* Every change is written to the admin audit log (`unlimited_on` /
+  `unlimited_off`) with the admin ID. The flag lives on `users` with the reason
+  and the granting admin (`migrations/v3/002_special_users.sql`); turning it off
+  clears those fields.
 
 ## What is not implemented
 

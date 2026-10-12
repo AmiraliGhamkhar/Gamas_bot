@@ -5,6 +5,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from gamas_bot.bot import GamasBot
@@ -223,6 +224,156 @@ def menu_payloads(menu) -> set[bytes]:
         for data in [_button_data(button)]
         if data is not None
     }
+
+
+class UnlimitedUserBotTests(BotPipelineTestCase):
+    """A special user's jobs run to completion with no credit and no charge."""
+
+    async def debit_count(self, user_id: int) -> int:
+        rows = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE user_id = ? AND kind = 'debit'", (user_id,)
+        )
+        return int(rows[0][0])
+
+    async def test_special_user_job_completes_without_credit(self):
+        await self.db.set_unlimited(USER_ID, True, admin_id=1, reason="استاد")
+        event = self.media_event()
+        submission = await self.run_media_job(
+            event, duration=7200.0, credit=0, transcribe=self._raw()
+        )
+        self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "done")
+        # Usage is still recorded on the submission for the audit trail…
+        self.assertEqual(row.duration_seconds, 7200.0)
+        # …but nothing was debited.
+        self.assertEqual(await self.debit_count(USER_ID), 0)
+        self.assertEqual(await self.db.available_seconds(USER_ID), 0)
+
+    async def test_special_user_is_not_refused_at_intake(self):
+        await self.db.set_unlimited(USER_ID, True, admin_id=1, reason="استاد")
+        event = FakeMessageEvent(USER_ID, "")
+        with mock.patch("gamas_bot.bot.JobProgress.create", new=_no_progress), \
+                mock.patch.object(self.bot.queue, "submit") as submit:
+            await self.bot._accept_media(event, USER_ID, "audio", "a.mp3", 7200.0)
+        submit.assert_called_once()
+        self.assertFalse(any("کافی نیست" in r for r in event.replies))
+
+    async def test_regular_user_is_still_refused_at_intake(self):
+        event = FakeMessageEvent(USER_ID, "")
+        with mock.patch("gamas_bot.bot.JobProgress.create", new=_no_progress), \
+                mock.patch.object(self.bot.queue, "submit") as submit:
+            await self.bot._accept_media(event, USER_ID, "audio", "a.mp3", 7200.0)
+        submit.assert_not_called()
+        self.assertTrue(any("کافی نیست" in r for r in event.replies))
+
+
+async def _no_progress(event, **_kwargs):
+    return None
+
+
+class FakeMessageEvent:
+    """Minimal Telethon NewMessage double for the admin text commands."""
+
+    def __init__(self, sender_id: int, text: str):
+        self.sender_id = sender_id
+        self.is_private = True
+        self.message = SimpleNamespace(
+            message=text, media=None, document=None, audio=None, voice=None,
+            video=None, file=None, photo=None,
+        )
+        self.replies: list[str] = []
+
+    async def reply(self, text: str = "", buttons=None, **_kwargs):
+        self.replies.append(text)
+
+
+class UnlimitedCommandTests(unittest.IsolatedAsyncioTestCase):
+    """The admin ``/unlimited`` command and the screens that show the flag."""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "bot.db",
+            temp_dir=root / "tmp",
+            note_api_key="",
+        )
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.admin_id = next(iter(self.settings.admin_ids))
+        self.user_id = 555
+        await self.db.ensure_user(self.user_id)
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def send(self, sender: int, text: str) -> FakeMessageEvent:
+        event = FakeMessageEvent(sender, text)
+        await self.bot._handle_message(event)
+        return event
+
+    async def test_admin_marks_and_unmarks_special_user(self):
+        event = await self.send(self.admin_id, f"/unlimited {self.user_id} on استاد درس")
+        self.assertTrue(await self.db.is_unlimited(self.user_id))
+        self.assertTrue(any("کاربر ویژه شد" in r for r in event.replies))
+
+        event = await self.send(self.admin_id, f"/unlimited {self.user_id} OFF")
+        self.assertFalse(await self.db.is_unlimited(self.user_id))
+        self.assertTrue(any("دیگر کاربر ویژه نیست" in r for r in event.replies))
+
+    async def test_enabling_requires_a_reason(self):
+        event = await self.send(self.admin_id, f"/unlimited {self.user_id} on")
+        self.assertFalse(await self.db.is_unlimited(self.user_id))
+        self.assertTrue(any("دلیل" in r for r in event.replies))
+
+    async def test_malformed_command_shows_usage(self):
+        for text in ("/unlimited", f"/unlimited {self.user_id}", "/unlimited abc on x",
+                     f"/unlimited {self.user_id} maybe"):
+            event = await self.send(self.admin_id, text)
+            self.assertTrue(any("قالب درست" in r for r in event.replies), text)
+        self.assertFalse(await self.db.is_unlimited(self.user_id))
+
+    async def test_admins_cannot_be_made_special(self):
+        other_admin = next(iter(self.settings.admin_ids))
+        event = await self.send(self.admin_id, f"/unlimited {other_admin} on استاد")
+        self.assertFalse(await self.db.is_unlimited(other_admin))
+        self.assertTrue(any("مدیران" in r for r in event.replies))
+
+    async def test_regular_user_cannot_use_the_command(self):
+        event = await self.send(self.user_id, f"/unlimited {self.user_id} on خودم")
+        self.assertFalse(await self.db.is_unlimited(self.user_id))
+        # Falls through to the normal user reply, not an admin confirmation.
+        self.assertFalse(any("کاربر ویژه" in r for r in event.replies))
+
+    async def test_command_is_audited(self):
+        await self.send(self.admin_id, f"/unlimited {self.user_id} on استاد")
+        audit = await self.db.recent_audit(limit=1)
+        self.assertEqual(audit[0]["action"], "unlimited_on")
+        self.assertEqual(audit[0]["admin_id"], self.admin_id)
+        self.assertEqual(audit[0]["subject_user"], self.user_id)
+
+    async def test_main_menu_and_account_show_unlimited(self):
+        await self.db.set_unlimited(self.user_id, True, admin_id=self.admin_id, reason="استاد")
+        for data in (b"menu:main", b"account"):
+            event = FakeCallbackEvent(self.user_id, data)
+            await self.bot._handle_callback(event)
+            text, _buttons = event.edits[-1]
+            self.assertIn("نامحدود", text, data)
+            self.assertNotIn("ساعت", text.split("اعتبار")[1].split("\n")[0], data)
+
+    async def test_admin_user_list_flags_special_users(self):
+        await self.db.set_unlimited(self.user_id, True, admin_id=self.admin_id, reason="استاد")
+        event = FakeCallbackEvent(self.admin_id, b"adm:users")
+        await self.bot._handle_callback(event)
+        text, _buttons = event.edits[-1]
+        self.assertIn(f"⭐ {self.user_id}", text)
+        self.assertIn("/unlimited <user_id> on", text)
 
 
 class FakeCallbackEvent:
