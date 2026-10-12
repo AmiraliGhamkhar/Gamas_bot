@@ -10,11 +10,13 @@ import aiohttp
 
 
 from gamas_bot import llm
-from gamas_bot.config import note_routes
+from gamas_bot.config import DEFAULT_NARA_MODEL, note_routes
 from gamas_bot.llm import (
     LLMAuthError,
     LLMContextOverflowError,
+    LLMOutputBudgetError,
     LLMResponseError,
+    LLMTransientError,
     _build_request,
     _endpoint,
     _parse_response,
@@ -362,6 +364,162 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LLMResponseError):
             await complete_json(session, make_settings(), system="S", user="U")
         self.assertEqual(len(session.calls), 1)
+
+
+def nara_error(
+    status: int, error_type: str, message: str, request_id: str = "req_1"
+) -> "FakeResponse":
+    """NaraRouter's single documented error envelope.
+
+    ``{"error": {"type", "message", "request_id"}}`` — see
+    https://router.bynara.id/docs ("Errors"). The gateway has no ``code`` and
+    no ``status`` field, so ``type`` is the only machine-readable signal.
+    """
+    return FakeResponse(status, {
+        "error": {"type": error_type, "message": message, "request_id": request_id}
+    })
+
+
+def truncated_answer(text: str = "") -> "FakeResponse":
+    """A 200 whose answer stopped at the output budget (``finish_reason``)."""
+    return FakeResponse(200, {
+        "choices": [{"message": {"content": text}, "finish_reason": "length"}]
+    })
+
+
+class NaraRouterContractTests(unittest.IsolatedAsyncioTestCase):
+    """The documented NaraRouter chat-completions contract, end to end.
+
+    Every expectation is a documented one (https://router.bynara.id/docs):
+    the endpoint and Bearer key, the request fields, the success shape, the
+    one error envelope, the status-code table, and the reasoning models'
+    output-budget behaviour.
+    """
+
+    async def test_request_matches_the_documented_shape(self):
+        settings = routed_settings()
+        nara = note_routes(settings)[0]
+        url, headers, payload = _build_request(settings, "SYS", "USER", route=nara)
+        self.assertEqual(url, "https://router.bynara.id/v1/chat/completions")
+        self.assertEqual(headers, {"Authorization": "Bearer nara-key"})
+        # Only fields the gateway documents; anything else risks a 400.
+        self.assertEqual(sorted(payload), ["max_tokens", "messages", "model", "temperature"])
+        self.assertEqual(payload["model"], "agnes-2.5-flash")
+
+    async def test_default_model_is_on_the_published_free_plan(self):
+        # https://router.bynara.id/api/plans lists agnes-2.5-flash on `free`.
+        self.assertEqual(DEFAULT_NARA_MODEL, "agnes-2.5-flash")
+
+    async def test_response_format_is_never_sent_to_nara(self):
+        settings = routed_settings(note_json_mode=True)
+        nara = note_routes(settings)[0]
+        _url, _headers, payload = _build_request(settings, "S", "U", route=nara)
+        self.assertNotIn("response_format", payload)
+
+    async def test_documented_success_shape_parses(self):
+        session = FakeSession([FakeResponse(200, {
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "model": "agnes-2.5-flash",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": "Hello!"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 18, "completion_tokens": 8, "total_tokens": 26},
+        })])
+        result = await complete(session, routed_settings(), system="S", user="U")
+        self.assertEqual(result, "Hello!")
+
+    async def test_documented_status_codes_map_to_the_right_class(self):
+        expected = {
+            400: LLMResponseError,    # validation_error
+            401: LLMAuthError,        # unauthorized
+            403: LLMAuthError,        # forbidden: the plan lacks the model
+            404: LLMResponseError,    # not_found
+            415: LLMResponseError,    # unsupported_media_type
+            429: LLMTransientError,   # rate_limited
+            500: LLMTransientError,   # internal_error
+            503: LLMTransientError,   # service_unavailable
+        }
+        for status, klass in expected.items():
+            error = await llm._error_from_response(
+                "NaraRouter", nara_error(status, "some_type", "m"), None
+            )
+            self.assertIsInstance(error, klass, f"HTTP {status} -> {type(error).__name__}")
+            self.assertNotIsInstance(error, LLMContextOverflowError, f"HTTP {status}")
+
+    async def test_413_oversized_body_is_a_context_overflow(self):
+        """413 is NaraRouter's documented "the request body or input is too large"."""
+        error = await llm._error_from_response(
+            "NaraRouter",
+            nara_error(413, "bad_request", "The request body or input is too large."),
+            None,
+        )
+        self.assertIsInstance(error, LLMContextOverflowError)
+
+    async def test_413_without_context_wording_is_still_an_overflow(self):
+        """The status alone classifies it; no message wording is required."""
+        error = await llm._error_from_response(
+            "NaraRouter", nara_error(413, "bad_request", "Payload rejected."), None
+        )
+        self.assertIsInstance(error, LLMContextOverflowError)
+
+    async def test_request_id_reaches_the_operator(self):
+        error = await llm._error_from_response(
+            "NaraRouter",
+            nara_error(429, "rate_limited", "Rate limit exceeded.", "req_abc123"),
+            None,
+        )
+        self.assertIn("request_id=req_abc123", str(error))
+
+    async def test_request_id_never_carries_the_key(self):
+        body = FakeResponse(429, {"error": {
+            "type": "rate_limited", "message": "slow down", "request_id": "nara-key"}})
+        error = await llm._error_from_response("NaraRouter", body, "nara-key")
+        self.assertNotIn("nara-key", str(error))
+
+    def test_reasoning_starvation_reports_the_output_budget(self):
+        """Empty content + ``finish_reason: length`` is the documented case where
+        thinking spent the whole ``max_tokens`` budget."""
+        payload = {
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "length",
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 512},
+        }
+        with self.assertRaises(LLMOutputBudgetError):
+            _parse_response(payload, "openai")
+
+    def test_truncation_is_detected_in_every_request_style(self):
+        self.assertTrue(llm._output_truncated({"choices": [{"finish_reason": "length"}]}, "openai"))
+        self.assertTrue(llm._output_truncated({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "gemini"))
+        self.assertTrue(llm._output_truncated({"stop_reason": "max_tokens"}, "anthropic"))
+        self.assertFalse(llm._output_truncated({"choices": [{"finish_reason": "stop"}]}, "openai"))
+        self.assertFalse(llm._output_truncated({}, "openai"))
+
+    async def test_a_truncated_answer_is_not_retried_as_bad_json(self):
+        """The JSON-reminder retry cannot fix a budget cut, so it is not sent."""
+        session = FakeSession([truncated_answer('{"title": "cu'), chat_answer('{"ok": true}')])
+        payload = await complete_json(session, routed_settings(), system="S", user="U")
+        self.assertEqual(payload, {"ok": True})
+        # One request per provider: Nara is left behind, OpenRouter answers.
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(session.calls[0]["url"], "https://router.bynara.id/v1/chat/completions")
+        self.assertEqual(session.calls[1]["url"], "https://openrouter.ai/api/v1/chat/completions")
+
+    async def test_an_empty_answer_without_truncation_is_still_retried(self):
+        """A blank answer with no ``length`` signal keeps its one recovery retry."""
+        session = FakeSession([chat_answer("   "), chat_answer('{"ok": true}')])
+        payload = await complete_json(session, routed_settings(), system="S", user="U")
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(
+            [call["url"] for call in session.calls],
+            ["https://router.bynara.id/v1/chat/completions"] * 2,
+        )
 
 
 class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
