@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased — 2026-10-12 — NaraRouter contract: 413, output budget, request_id
+
+Audited `gamas_bot/llm.py` against NaraRouter's published contract
+(https://router.bynara.id/docs and the live https://router.bynara.id/api/plans).
+The endpoint, Bearer authentication, request fields, default model
+(`agnes-2.5-flash`, on the published Free plan) and the withholding of
+`response_format` were already correct; three real defects were not.
+
+### Fixed
+
+* **HTTP 413 was treated as a permanent rejection, so an oversized input was
+  never split.** NaraRouter documents `413 / bad_request` as "The request body
+  or input is too large", but `_error_from_response` only tested for context
+  overflow on `status == 400`, and NaraRouter's 413 wording names no context
+  window at all — so it fell through to `LLMRequestError`. The note pipeline
+  catches only `LLMContextOverflowError`, so a document the gateway refused for
+  size failed the whole job (the user got the raw transcript and no booklet)
+  instead of being halved at a paragraph boundary. 413 is now a context
+  overflow on its own status, and the "too large" family was added to the
+  wording markers for providers that answer 400 instead.
+* **A truncated answer was indistinguishable from a broken one.** The parser
+  ignored `finish_reason` entirely, so a reasoning model that spent its whole
+  `max_tokens` on thinking (documented NaraRouter behaviour: the answer then
+  comes back empty) surfaced as "the answer was empty", and a JSON answer cut
+  off mid-object surfaced as "invalid JSON". Both were handed to
+  `complete_json`'s recovery retry, which re-sends the same request with the
+  same budget and cannot succeed. `finish_reason: "length"` (with Gemini's
+  `MAX_TOKENS` and Anthropic's `max_tokens`) now raises the new
+  `LLMOutputBudgetError`, which names `NOTE_MAX_OUTPUT_TOKENS` and is permanent
+  for that provider, so the chain moves on instead of burning a second request.
+* **The provider's `request_id` was discarded.** NaraRouter's error envelope
+  exists to be correlated with its logs, and the client read only
+  `error.status`/`code`/`type`. A logged failure now carries
+  `[request_id=…]`, scrubbed for key material like the rest of the message.
+
+### Added
+
+* `LLMOutputBudgetError`, the output-side sibling of `LLMContextOverflowError`:
+  the two size failures now have distinct classes because only one of them is
+  fixed by asking again with less input.
+* 14 tests: a `NaraRouterContractTests` class asserting the documented request
+  and success shapes, the whole status-code table, both 413 spellings, the
+  `request_id`, truncation detection in all three request styles, and that a
+  truncated answer is not re-sent — plus an end-to-end note-pipeline test that
+  a 413 splits the transcript and merges both halves with no content lost.
+
 ## Unreleased — 2026-10-12 — file delivery, ordered note failover, transcript safety
 
 ### Fixed

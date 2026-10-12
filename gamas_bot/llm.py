@@ -10,6 +10,12 @@ permanent 4xx is never re-sent unchanged.
 
 Everything the note pipeline needs is :func:`complete` (plain text) and
 :func:`complete_json` (strict JSON, one deterministic retry, then failover).
+
+Two size failures are told apart because only one of them is fixed by asking
+again with less input: :class:`LLMContextOverflowError` (the *input* was too
+big — HTTP 413, or a 400 that says so) makes the caller split the transcript,
+while :class:`LLMOutputBudgetError` (the *answer* was cut off by
+``max_tokens``) makes the caller raise ``NOTE_MAX_OUTPUT_TOKENS`` instead.
 """
 
 from __future__ import annotations
@@ -78,6 +84,19 @@ class LLMContextOverflowError(LLMRequestError):
     """
 
 
+class LLMOutputBudgetError(LLMRequestError):
+    """The answer was cut off by the *output* budget, not by a broken model.
+
+    NaraRouter documents this for reasoning models: thinking tokens are spent
+    out of the same ``max_tokens`` budget, so a small budget can return an
+    empty or half-finished answer (https://router.bynara.id/docs, "Output
+    budget"). Re-sending the same request with the same budget produces the
+    same truncation, so this is treated as permanent for the provider — the
+    fix is a larger ``NOTE_MAX_OUTPUT_TOKENS``, or the next provider in the
+    chain, never another identical attempt.
+    """
+
+
 #: Provider wording for "the input is larger than my context window". Providers
 #: are inconsistent here, so the classification is deliberately generous: it is
 #: only used to choose between splitting the input and giving up on it.
@@ -100,6 +119,13 @@ CONTEXT_OVERFLOW_MARKERS = (
     "request too large",
     "context overflow",
     "context limit",
+    # NaraRouter answers an oversized body with HTTP 413 / ``bad_request`` and
+    # the generic wording "The request body or input is too large."
+    # (https://router.bynara.id/docs, "Status codes").
+    "is too large",
+    "input too large",
+    "payload too large",
+    "body too large",
 )
 
 
@@ -146,11 +172,16 @@ async def _error_from_response(
 ) -> LLMError:
     body = await response.read()
     detail = None
+    # The provider's own correlation key. NaraRouter's error envelope carries
+    # ``request_id`` precisely so a failure can be matched against its logs
+    # (https://router.bynara.id/docs, "Errors"), so it belongs in our message.
+    request_id = ""
     error_markers: list[str] = []
     try:
         payload = json.loads(body.decode("utf-8", "replace"))
         if isinstance(payload, dict):
             error = payload.get("error")
+            candidate = None
             if isinstance(error, dict):
                 message = error.get("message")
                 if isinstance(message, str):
@@ -159,6 +190,7 @@ async def _error_from_response(
                     value = error.get(field)
                     if isinstance(value, (str, int)):
                         error_markers.append(str(value).upper())
+                candidate = error.get("request_id")
                 details = error.get("details")
                 if isinstance(details, list):
                     for item in details:
@@ -174,14 +206,23 @@ async def _error_from_response(
                                 error_markers.append(meta_reason.upper())
             elif isinstance(error, str):
                 detail = _sanitize_error_text(error)
+            if not candidate:
+                candidate = payload.get("request_id")
+            if isinstance(candidate, str) and candidate.strip():
+                request_id = _sanitize_error_text(candidate, limit=80)
     except (ValueError, TypeError):
         pass
+    codes = ""
     if error_markers:
         codes = _sanitize_error_text(", ".join(dict.fromkeys(error_markers)), limit=80)
         detail = f"{detail} [{codes}]" if detail else codes
     if detail and api_key and api_key in detail:
         detail = detail.replace(api_key, "***")
+    if request_id and api_key and api_key in request_id:
+        request_id = request_id.replace(api_key, "***")
     suffix = f": {detail}" if detail else ""
+    if request_id:
+        suffix = f"{suffix} [request_id={request_id}]"
     lower_detail = (detail or "").lower()
     auth_error = (
         response.status in (401, 403)
@@ -194,9 +235,15 @@ async def _error_from_response(
     )
     if auth_error:
         return LLMAuthError(f"{label} اعتبارنامه را نپذیرفت (HTTP {response.status}){suffix}")
-    if response.status == 400 and is_context_overflow(f"{detail or ''} {codes if error_markers else ''}"):
+    # NaraRouter reserves 413 for an oversized body ("The request body or input
+    # is too large"), so the status alone says the input must be split — no
+    # message wording is needed, and none is always present.
+    if response.status == 413 or (
+        response.status == 400 and is_context_overflow(f"{detail or ''} {codes}")
+    ):
         return LLMContextOverflowError(
-            f"{label} متن ورودی را بزرگ‌تر از پنجرهٔ زمینهٔ خود دانست (HTTP 400){suffix}"
+            f"{label} متن ورودی را بزرگ‌تر از پنجرهٔ زمینهٔ خود دانست "
+            f"(HTTP {response.status}){suffix}"
         )
     if response.status in (408, 425, 429) or response.status >= 500:
         return LLMTransientError(
@@ -282,6 +329,23 @@ def _build_request(
     return _build_request_for(route, settings, system, user)
 
 
+def _output_truncated(payload: dict, provider: str) -> bool:
+    """True when the provider says the answer hit its output budget.
+
+    Each request style spells this differently: ``finish_reason: "length"``
+    (OpenAI-compatible, which is what NaraRouter speaks), ``finishReason:
+    "MAX_TOKENS"`` (Gemini) and ``stop_reason: "max_tokens"`` (Anthropic).
+    """
+    try:
+        if provider == "gemini":
+            return payload["candidates"][0].get("finishReason") == "MAX_TOKENS"
+        if provider == "anthropic":
+            return payload.get("stop_reason") == "max_tokens"
+        return payload["choices"][0].get("finish_reason") == "length"
+    except (AttributeError, KeyError, IndexError, TypeError):
+        return False
+
+
 def _parse_response(payload: dict, provider: str) -> str:
     """Normalize a provider response to plain text."""
     try:
@@ -318,6 +382,14 @@ def _parse_response(payload: dict, provider: str) -> str:
         raise LLMResponseError(
             "پاسخ سرویس تولید جزوه با قرارداد انتظار ما سازگار نبود."
         ) from exc
+    # Checked before the emptiness test: a budget-truncated answer is empty or
+    # half-finished for a reason an identical retry cannot change, and the
+    # caller has to hear that reason rather than "the answer was empty".
+    if _output_truncated(payload, provider):
+        raise LLMOutputBudgetError(
+            "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
+            "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
+        )
     text = text.strip()
     if not text:
         raise LLMResponseError("پاسخ سرویس تولید جزوه خالی بود.")

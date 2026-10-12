@@ -41,6 +41,14 @@ The raw transcript is a success case, not a failure case:
   providers all failed — the raw transcript was already delivered. The log lines
   `note provider failed; trying the next one` name each provider, its error class
   and the reason; a missing key shows up as a skip, not as a request.
+* A logged `LLMOutputBudgetError` (`پاسخ … به سقف توکن خروجی رسید`) is not a
+  provider outage: the answer was cut off by `NOTE_MAX_OUTPUT_TOKENS`. Raise it.
+  This is the expected shape of the failure on a reasoning model, which spends
+  part of the same budget thinking before it writes anything.
+* A logged `LLMContextOverflowError` after several `splitting into N part(s)`
+  lines means the input was too large even after the bounded halving — shorten
+  the recording or raise `NOTE_CONTEXT_TOKENS` if the model really has a larger
+  window than the default assumes.
 
 ## STT failures
 

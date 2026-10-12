@@ -63,6 +63,15 @@ Behaviour:
 * **Ordered failover** on authentication, rejection, unusable answers and
   context overflow. The failure class of the first provider is preserved, so a
   context overflow still reaches the note pipeline as one.
+* **Both size failures are recognised, in every spelling.** An oversized
+  *input* is HTTP 413 — NaraRouter's documented `bad_request`, "The request
+  body or input is too large" — or a 400 that says so in words; either one
+  makes the pipeline split the transcript. An answer cut short by the *output*
+  budget (`finish_reason: "length"`, Gemini's `MAX_TOKENS`, Anthropic's
+  `max_tokens`) is a different failure with a different fix
+  (`NOTE_MAX_OUTPUT_TOKENS`), so it is never re-sent unchanged: NaraRouter
+  documents that reasoning models spend thinking tokens out of the same
+  budget, which is how an answer comes back empty.
 * **Context-aware sizing**: `NOTE_CONTEXT_TOKENS` minus the output budget, the
   system prompt and the contextual material becomes the chunk budget, and the
   document is split at paragraph/sentence boundaries. A request the model still
@@ -90,3 +99,10 @@ which note providers are eligible), `python -m scripts.cpanel_preflight`
 (outbound reachability of the configured note and STT hosts) and the job log,
 which names every provider that was attempted, skipped for missing credentials,
 or left behind after a failure — with no key material in it.
+
+A provider rejection is logged with its own error `type` and, where the
+provider supplies one, its `request_id`. NaraRouter's error envelope
+(`{"error": {"type", "message", "request_id"}}`) carries that id precisely so a
+failure can be matched against its logs, so a `[request_id=req_…]` suffix in a
+logged failure is the value to quote when opening a support ticket.
+

@@ -344,6 +344,32 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("نیمهٔ نخست" in heading for heading in headings))
         self.assertTrue(any("نیمهٔ دوم" in heading for heading in headings))
 
+    async def test_a_413_oversized_body_splits_too(self):
+        """NaraRouter signals an oversized input with HTTP 413, not 400.
+
+        Its documented wording ("The request body or input is too large") names
+        no context window, so the status is the only reliable signal — and the
+        split recovery must still run, or the user loses the booklet.
+        """
+        settings = make_settings(note_chunk_chars=100_000)
+        document = self.document()
+        session = FakeSession([
+            nara_oversized_response(),
+            big_notes_json("نیمهٔ نخست"),
+            big_notes_json("نیمهٔ دوم"),
+        ])
+        notes = await structure_transcript(document, settings, session)
+        self.assertEqual(len(session.calls), 3)
+        first = session.calls[1]["json"]["messages"][1]["content"].removeprefix(TRANSCRIPT_PROMPT)
+        second = session.calls[2]["json"]["messages"][1]["content"].removeprefix(TRANSCRIPT_PROMPT)
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            " ".join((first + " " + second).split()), " ".join(document.split())
+        )
+        headings = [section.heading for section in notes.sections]
+        self.assertTrue(any("نیمهٔ نخست" in heading for heading in headings))
+        self.assertTrue(any("نیمهٔ دوم" in heading for heading in headings))
+
     async def test_an_unchanged_oversized_request_is_never_retried_forever(self):
         settings = make_settings(note_chunk_chars=100_000)
         session = FakeSession([context_overflow_response() for _ in range(64)])
@@ -387,6 +413,22 @@ def context_overflow_response() -> "_FakeResponse":
         "error": {
             "message": "This model's maximum context length is 8192 tokens",
             "code": "context_length_exceeded",
+        }
+    })
+
+
+def nara_oversized_response() -> "_FakeResponse":
+    """NaraRouter's documented 413: an oversized body, no context wording.
+
+    https://router.bynara.id/docs ("Status codes"): ``413 / bad_request —
+    The request body or input is too large.`` The status is the only signal
+    that the input must be split.
+    """
+    return _FakeResponse(413, {
+        "error": {
+            "type": "bad_request",
+            "message": "The request body or input is too large.",
+            "request_id": "req_7f3a",
         }
     })
 
