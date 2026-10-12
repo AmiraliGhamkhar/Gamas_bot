@@ -6,7 +6,10 @@ import json
 import unittest
 from unittest import mock
 
+import aiohttp
 
+
+from gamas_bot import llm
 from gamas_bot.llm import (
     LLMAuthError,
     LLMResponseError,
@@ -147,7 +150,10 @@ class FakeSession:
 
     def post(self, url, **kwargs):
         self.calls.append({"url": url, **kwargs})
-        return _AsyncCM(self.responses.pop(0))
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return _AsyncCM(response)
 
 
 class _AsyncCM:
@@ -174,7 +180,26 @@ class FakeResponse:
         return self._payload
 
 
+class InvalidJsonResponse(FakeResponse):
+    async def json(self, content_type=None):
+        raise json.JSONDecodeError("invalid JSON", "<body>", 0)
+
+
 class CompleteTests(unittest.IsolatedAsyncioTestCase):
+    async def test_gemini_400_invalid_key_is_classified_as_auth_error(self):
+        response = FakeResponse(400, {
+            "error": {
+                "code": 400,
+                "message": "API key not valid. Please pass a valid API key.",
+                "status": "INVALID_ARGUMENT",
+                "details": [{"reason": "API_KEY_INVALID"}],
+            }
+        })
+        error = await llm._error_from_response("Gemini", response, "secret-key")
+        self.assertIsInstance(error, LLMAuthError)
+        self.assertIn("API_KEY_INVALID", str(error))
+        self.assertNotIn("secret-key", str(error))
+
     async def test_success(self):
         session = FakeSession([FakeResponse(200, {
             "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}]
@@ -183,6 +208,24 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "answer")
         self.assertEqual(len(session.calls), 1)
+        timeout = session.calls[0]["timeout"]
+        self.assertEqual(timeout.total, llm.LLM_REQUEST_TIMEOUT_SECONDS)
+
+    async def test_network_error_is_retried(self):
+        session = FakeSession([
+            aiohttp.ClientConnectionError("connection reset"),
+            FakeResponse(200, {"choices": [{"message": {"content": "recovered"}}]}),
+        ])
+        settings = make_settings()
+        with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
+            result = await complete(session, settings, system="S", user="U")
+        self.assertEqual(result, "recovered")
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_bad_success_body_is_response_error(self):
+        session = FakeSession([InvalidJsonResponse(200)])
+        with self.assertRaises(LLMResponseError):
+            await complete(session, make_settings(), system="S", user="U")
 
     async def test_transient_retry_then_success(self):
         session = FakeSession([
@@ -194,6 +237,31 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
              mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
             result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "ok")
+
+    async def test_http_408_is_retried(self):
+        session = FakeSession([
+            FakeResponse(408, {}),
+            FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]}),
+        ])
+        with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
+            result = await complete(session, make_settings(), system="S", user="U")
+        self.assertEqual(result, "ok")
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_retry_after_zero_is_respected(self):
+        delays = []
+
+        async def record_sleep(delay):
+            delays.append(delay)
+
+        session = FakeSession([
+            FakeResponse(429, {}, headers={"Retry-After": "0"}),
+            FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]}),
+        ])
+        with mock.patch("asyncio.sleep", new=record_sleep):
+            result = await complete(session, make_settings(), system="S", user="U")
+        self.assertEqual(result, "ok")
+        self.assertEqual(delays, [0.0])
 
     async def test_auth_error_no_retry(self):
         session = FakeSession([FakeResponse(401, {"error": {"message": "bad"}})])
@@ -237,8 +305,32 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
             FakeResponse(200, {"choices": [{"message": {"content": "still nope"}}]}),
         ])
         settings = make_settings()
-        with self.assertRaises((LLMResponseError, ValueError)):
+        with self.assertRaises(LLMResponseError):
             await complete_json(session, settings, system="S", user="U")
+
+    async def test_empty_model_answer_is_retried(self):
+        session = FakeSession([
+            FakeResponse(200, {"choices": [{"message": {"content": "   "}}]}),
+            FakeResponse(200, {"choices": [{"message": {"content": '{"ok": true}'}}]}),
+        ])
+        result = await complete_json(session, make_settings(), system="S", user="U")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_non_json_nan_is_retried(self):
+        session = FakeSession([
+            FakeResponse(200, {"choices": [{"message": {"content": '{"value": NaN}'}}]}),
+            FakeResponse(200, {"choices": [{"message": {"content": '{"ok": true}'}}]}),
+        ])
+        result = await complete_json(session, make_settings(), system="S", user="U")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_provider_400_does_not_trigger_json_retry(self):
+        session = FakeSession([FakeResponse(400, {"error": {"message": "bad request"}})])
+        with self.assertRaises(LLMResponseError):
+            await complete_json(session, make_settings(), system="S", user="U")
+        self.assertEqual(len(session.calls), 1)
 
 
 async def _noop():

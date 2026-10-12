@@ -164,6 +164,7 @@ def make_settings(**overrides) -> Settings:
         stt_openai_base_url="",
         stt_openai_api_key="",
         stt_openai_model="whisper-1",
+        stt_openai_max_upload=25_000_000,
         note_provider="openai_compatible",
         note_api_key="note-key",
         note_api_base_url="https://note.example/v1",
