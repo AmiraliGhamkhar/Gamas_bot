@@ -237,7 +237,7 @@ Each phase ends with the suite green, `ruff` clean, and a commit on this branch.
 | **4. DOCX** | ✅ Done — RTL renderer with link-only TOC and no LibreOffice dependency | RTL contract tests |
 | **5. Billing/admin** | ✅ Done — simplified billing, ledger holds, payments and compact admin panel | ledger reserve/release invariant |
 | **6. Demolition** | ✅ Done — v2 provider platforms and credential systems removed; v2 SQL/import path retained only for migration; legacy docs are labelled historical | full v3 suite |
-| **7. Verification** | 🟡 Local gates pass; corrected Python 3.11–3.13 GitHub Actions matrix pending | `compileall`, `ruff`, `mypy`, pytest, unittest, fresh-schema check, media-worker smoke |
+| **7. Verification** | ✅ Done — Python 3.11/3.12/3.13 GitHub Actions green; 190 pytest and 190 unittest tests pass locally | `compileall`, `ruff`, `mypy`, pytest, unittest, fresh-schema check, media-worker smoke |
 
 The v2 offline benchmark scripts were intentionally removed with the old
 provider platform. CI therefore checks v3's real database/schema and media
