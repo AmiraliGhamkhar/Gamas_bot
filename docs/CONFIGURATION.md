@@ -3,86 +3,78 @@
 ## One source of truth
 
 `.env.example` is the canonical, complete list of environment variables, and
-`gamas_bot/config.py` is the only place they are read. There is exactly one
-configuration model: the frozen `Settings` dataclass, built by
-`Settings.from_env()`, which validates every value at startup and raises a
-Persian, actionable error instead of failing later inside a job.
+`gamas_bot/config.py` is the only place they are read: one frozen `Settings`
+dataclass built by `Settings.from_env()`. Nothing else touches `os.environ` at
+runtime, and no secret is ever stored in the database.
 
-`tests/test_config_consistency.py` enforces this:
+`tests/test_config_consistency.py` enforces the contract:
 
-* every variable `config.py` reads must appear in `.env.example` (including the
-  legacy aliases documented as commented examples);
-* every variable assigned in `.env.example` must be read by some code path;
-* `Settings` defaults must agree with the canonical constants in `config.py`
-  and `billing.py`, so a plan price cannot be defined twice with two values;
-* documentation may not reference a module or a document that does not exist.
+* every variable `config.py` reads appears in `.env.example`;
+* every variable documented in `.env.example` is read by the code;
+* each value shown in `.env.example` is what the code produces when that
+  variable is set to it (so a documented default cannot drift from the code —
+  this is what caught the stale `DEEPGRAM_MODEL`, log path and database name);
+* the STT pages do not advertise settings from the deleted v2 provider
+  platform.
+
+`tests/test_config.py` covers parsing, precedence and `check()`.
 
 ## Precedence
 
 1. Real environment variables (systemd `Environment=`, Passenger, the shell);
-2. `.env` — the working directory first, then the project root;
-3. the built-in default.
+2. `.env` — the project root first, then the working directory;
+3. the built-in default in `config.py`.
 
 `load_dotenv(..., override=False)` means an exported variable always wins over
 `.env`, which is what an operator expects from a service unit.
 
-Relative paths (`DATABASE_PATH`, `TELEGRAM_SESSION_PATH`, `TEMP_DIR`,
-`RECEIPT_DIR`, `LOG_FILE`) are anchored to the project root, never to the
-process working directory: Passenger, `su -c` and cron all start in a different
-directory, and a relative path there would silently create a second, empty
-database and Telegram session.
+Relative paths (`DB_PATH`, `TELEGRAM_SESSION`, `TEMP_DIR`, `RECEIPT_DIR`,
+`LOG_FILE`) are anchored to the project directory, never to the process working
+directory: Passenger, `su -c` and cron all start somewhere else, and a relative
+path there would silently create a second database and session.
 
-Aliases (`DOCX_BODY_FONT`, `DOCX_HEADING_FONT`, `DOCX_LATIN_FONT`,
-`DOCX_FALLBACK_FONT`, `SPEECHMATICS_MODEL`, `FFMPEG_TIMEOUT_SECONDS`,
-`SOFFICE_TIMEOUT_SECONDS`) are still read for deployments that predate the
-canonical spellings. The canonical name always wins when both are set.
+## Variables by area
 
-## Categories
+Exact names, defaults and the Persian explanations live in `.env.example`; this
+table is the map of what exists.
 
-| Area | Variables (canonical spelling) |
+| Area | Variables |
 | --- | --- |
-| Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ADMIN_IDS`, `TELEGRAM_PROXY`, `TELEGRAM_SESSION_PATH` |
-| Storage | `DATABASE_PATH`, `TEMP_DIR`, `MAX_FILE_SIZE_BYTES` |
-| Job queue | `MAX_CONCURRENT_JOBS`, `MAX_PENDING_JOBS`, `PROGRESS_ANIMATION_ENABLED` |
-| STT | `STT_PRIMARY`, `STT_LANGUAGE`, `STT_FALLBACK_ENABLED`, `STT_MIN_CONFIDENCE`, `STT_MAX_ATTEMPTS`, `STT_RETRY_*`, `STT_JOB_TIMEOUT_SECONDS`, `STT_POLL_INTERVAL_SECONDS`, `SPEECHMATICS_*`, `DEEPGRAM_*`, `STT_OPENAI_*` — platform policy: `STT_FREE_ONLY`, `STT_ALLOW_TRIAL_PROVIDERS`, `STT_ALLOW_PAID_FALLBACK`, `STT_TRIAL_ALLOWLIST`, `STT_QUOTA_SAFETY_MARGIN`, `STT_PROVIDER_SYNC_TTL_SECONDS`, `STT_MAX_PROVIDER_FAILOVERS`, `STT_QUALITY_GATE_ENABLED`, `STT_DEFAULT_ROUTE`, `STT_REQUEST_DIARIZATION`, `STT_REQUEST_WORD_TIMESTAMPS`, `STT_SMART_TRANSCRIPTION`, `STT_VOCABULARY_HINTS`, `*_STT_API_KEY`/`*_STT_MODEL`/`*_STT_BASE_URL` — full reference in [STT_PROVIDERS.md](STT_PROVIDERS.md) |
-| Notes | `NOTE_API_PROVIDER`, `NOTE_API_KEY`, `NOTE_API_BASE_URL`, `NOTE_API_MODEL`, `NOTE_API_TIMEOUT_SECONDS`, `NOTE_API_RETRIES`, `NOTE_API_MAX_OUTPUT_TOKENS`, `NOTE_API_JSON_MODE`, `NOTE_API_EXTRA_HEADERS_JSON`, `NOTE_MODE`, `NOTE_REPAIR_ENABLED`, `NOTE_GLOBAL_CONTEXT_ENABLED` |
-| AI provider platform | `AI_FREE_ONLY` (default `true`), `AI_ALLOW_PAID_FALLBACK` (default `false`), `AI_ROUTING_ENABLED` (default `true`; with it off the legacy single-provider order is kept and a leftover `NOTE_API_PROVIDER` stays first, with it on the reviewed Nara-first order applies), `AI_DEFAULT_NOTE_ROUTE` (reorders the four note tasks only, never drops a provider, and never overrides a route saved from the admin panel), `AI_PROVIDER_SYNC_TTL`, `AI_DEFAULT_NOTE_ROUTE`, `AI_MAX_PROVIDER_FAILOVERS`, `AI_MAX_GENERATION_RETRIES` (`-1` = auto), `AI_QUOTA_SAFETY_MARGIN`, `CLOUDFLARE_ACCOUNT_ID` — full reference in [AI_PROVIDERS.md](AI_PROVIDERS.md) |
-| Word document | `DOCX_FONT_PROFILE`, `DOCX_FONT_*`, `DOCX_COVER_ENABLED`, `DOCX_TOC_*`, `DOCX_TOC_PAGE_NUMBERS`, `DOCX_PAGE_BORDER_*`, `DOCX_SHOW_FOOTER_BRAND`, `DOCX_LOGO_PATH`, `DOCX_PAGINATION_*` |
-| PowerPoint | `PPTX_ENABLED`, `PPTX_LEGACY_ENABLED`, `PPTX_INCLUDE_*`, `PPTX_MIN_CLIP_SECONDS`, `PPTX_SILENCE_SECONDS`, `PPTX_MAX_*`, `MEDIA_TIMEOUT_SECONDS`, `PPT_CONVERT_TIMEOUT_SECONDS` |
-| Billing | `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME`, `FREE_PLAN_HOURS`, `PLAN_5_*`, `PLAN_10_*`, `PLAN_20_*`, `PLAN_25_*`, `PLAN_50_*`, `RECEIPT_DIR`, `RECEIPT_RETENTION_DAYS`, `MAX_PAYMENT_RECEIPT_BYTES`, `PROVIDER_CREDENTIALS_ENCRYPTION_KEY` |
-| Observability | `LOG_LEVEL`, `LOG_FORMAT`, `LOG_FILE`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT` |
+| Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ADMIN_IDS`, `TELEGRAM_SESSION` |
+| Storage | `DB_PATH`, `TEMP_DIR`, `MAX_FILE_SIZE` |
+| Logging | `LOG_FILE`, `LOG_LEVEL`, `LOG_FORMAT`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT` |
+| Job queue | `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS`, `MEDIA_TIMEOUT`, `CONVERT_TIMEOUT` |
+| Speech-to-text | `STT_PROVIDERS`, `STT_LANGUAGE`, `SPEECHMATICS_API_KEY`, `SPEECHMATICS_BASE_URL`, `SPEECHMATICS_MODEL`, `DEEPGRAM_API_KEY`, `DEEPGRAM_BASE_URL`, `DEEPGRAM_MODEL`, `STT_OPENAI_BASE_URL`, `STT_OPENAI_API_KEY`, `STT_OPENAI_MODEL`, `STT_OPENAI_MAX_UPLOAD_BYTES`, `STT_JOB_TIMEOUT`, `STT_POLL_INTERVAL` — see [STT_PROVIDERS.md](STT_PROVIDERS.md) |
+| Note generation | `NOTE_PROVIDER`, `NOTE_API_KEY`, `GEMINI_API_KEY` (legacy alias), `NOTE_BASE_URL`, `NOTE_MODEL`, `NOTE_MODE`, `NOTE_MAX_OUTPUT_TOKENS`, `NOTE_JSON_MODE`, `NOTE_CHUNK_CHARS`, `NOTE_CONCURRENCY`, `NOTE_COMPILE` |
+| Raw text | `RAW_TEXT_PROFILE` (`plain` \| `timestamped`) |
+| Presentations | `PRESENTATION_MAX_CLIPS`, `PRESENTATION_MAX_TOTAL_DURATION`, `PRESENTATION_MAX_UNPACKED_BYTES`, `PRESENTATION_MIN_CLIP_SECONDS`, `PRESENTATION_SILENCE_SECONDS`, `PRESENTATION_WAV_LIMIT_BYTES`, `PRESENTATION_INCLUDE_SLIDE_TEXT`, `PRESENTATION_INCLUDE_VIDEO_AUDIO` |
+| Billing | `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME`, `RECEIPT_DIR`, `RECEIPT_RETENTION_DAYS`, `MAX_PAYMENT_RECEIPT_BYTES`, `FREE_PLAN_HOURS`, `PLAN_*_HOURS`, `PLAN_*_PRICE_TOMAN`, `PLAN_*_VALIDITY_DAYS` |
 
-Exact names, defaults and Persian explanations live in `.env.example`; the
-values above are the ones this page mentions by name so that a reader can find
-them quickly.
+Notes:
 
-Routing retains the existing `NOTE_API_*` contract. `NOTE_API_TIMEOUT_SECONDS`,
-`NOTE_API_RETRIES`, and `NOTE_API_MAX_OUTPUT_TOKENS` remain upper bounds on
-provider-specific request profiles; they can tighten but cannot increase those
-limits. The provider/key/base URL/model/extra-header settings continue to feed
-the current provider adapter. Provider billing attestations are per encrypted
-credential in SQLite (not environment variables); old environment keys stay
-configured but are not auto-attested for generation after migration 007.
+* `GEMINI_API_KEY` is only a legacy alias: when `NOTE_PROVIDER` is unset and it
+  is the only key present, `NOTE_PROVIDER=gemini` is selected automatically.
+* `NOTE_PROVIDER=anthropic` has no built-in default model: set `NOTE_MODEL`.
+* Speech-to-text secrets are read from the environment only. There is no
+  credential vault, admin key wizard or encryption key in v3.
 
-## The static table of contents
+## What `--check` validates
 
-`DOCX_TOC_PAGE_NUMBERS` decides how the table of contents gets its numbers:
+`python -m gamas_bot --check` is offline and side-effect free. It reports:
 
-* `auto` (default) — when LibreOffice (`soffice`) and `pypdf` are available the
-  exact, renderer-verified page numbers are printed; when they are not, the
-  document is still delivered with a topic list whose entries are internal
-  hyperlinks and whose page-number column is empty.
-* `required` — the strict behaviour: a document whose exact mapping cannot be
-  produced is not generated at all.
-* `off` — the renderer is never invoked; the TOC is always the link-only list.
+* `FAIL` — Telegram settings missing, **no STT provider configured among the
+  providers listed in `STT_PROVIDERS`**, an unknown `NOTE_PROVIDER`, an empty
+  `ADMIN_IDS`; the process exits `2` at startup for these;
+* `WARN` — advisory problems that reduce functionality but keep the bot
+  running: note generation not configured (“raw transcripts only”) and a
+  Persian deployment whose `DEEPGRAM_MODEL` cannot transcribe `fa`.
 
-No mode ever invents a page number. `scripts/cpanel_preflight.py` reports the
-missing renderer as a warning under `auto` and a failure under `required`.
+Advisory problems are printed by `--check`, written to the log at startup, and
+never prevent a job from running.
 
 ## Secrets
 
-Provider keys and the Fernet master key belong in the service environment or in
-the `🩺 وضعیت سرویس‌ها` / `🔑 API Keys` panel (which stores ciphertext), never in
-`.env` committed to a repository. `PROVIDER_CREDENTIALS_ENCRYPTION_KEY` is
-environment-only: losing it makes stored credentials unrecoverable, so back it
-up with the database.
+Provider keys live in the process environment / owner-only `.env` file. They are
+never written to the database, never logged, and never included in a user-facing
+message; provider error text is redacted against the key before it is stored in
+the job's error column.

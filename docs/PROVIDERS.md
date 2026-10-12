@@ -9,29 +9,28 @@ actually ran** — a fallback never reports itself as the primary.
 
 | Provider | Notes |
 | --- | --- |
-| Speechmatics (batch) | default; `SPEECHMATICS_OPERATING_POINT` selects `enhanced`, `standard`, `melia-1` or `oak-1`; custom dictionary via `SPEECHMATICS_ADDITIONAL_VOCAB` |
-| Deepgram | `DEEPGRAM_MODEL` (default `nova-3`) |
-| OpenAI-compatible | `STT_OPENAI_BASE_URL` + model, for OpenAI/Groq/self-hosted gateways |
+| Speechmatics (batch) | `SPEECHMATICS_MODEL` selects `enhanced` (default), `standard`, `melia-1` or `oak-1` |
+| Deepgram (pre-recorded) | `DEEPGRAM_MODEL` (default `nova-3`; Persian needs Nova-3) |
+| OpenAI-compatible | `STT_OPENAI_BASE_URL` + `STT_OPENAI_MODEL`, for OpenAI/self-hosted gateways |
 
-The native platform adds Groq, Gemini Transcribe and registry-backed adapters
-for AssemblyAI, Gladia, Google Cloud STT, IBM Watson, and experimental Azure,
-AWS, Soniox and ElevenLabs. Free-only policy, trial allowlist, quota budgets,
-the quality gate, and evidence levels are documented in
-[STT_PROVIDERS.md](STT_PROVIDERS.md). The legacy three behave as described here.
+There are exactly these three engines; the v2 provider platform (native Groq,
+Gemini Transcribe, AssemblyAI, Gladia, Google Cloud, Watson, Azure, AWS, Soniox,
+ElevenLabs adapters, routes, quotas and the quality gate) was removed in v3. The
+current behaviour, settings and limits are documented in
+[STT_PROVIDERS.md](STT_PROVIDERS.md).
 
 Behaviour:
 
-* **One session per job** with explicit connect/read timeouts, so a job reuses
-  one connection for upload, polling and download.
-* **Bounded retries** for transient failures (429/5xx/network) with exponential
-  backoff bounded by `STT_RETRY_MAX_DELAY_SECONDS`, honouring `Retry-After`.
-* **Fallback** to the next configured engine when the primary fails and
-  `STT_FALLBACK_ENABLED` is true.
-* **Size routing**: a file above a provider's direct-upload limit is routed to
-  another configured engine. Audio is never chunked, because splitting would
+* **Provider order is the failover policy**: `STT_PROVIDERS` is tried in order,
+  and only providers with credentials are attempted.
+* **Bounded retries** for transient failures (408/425/429/5xx, network, timeout)
+  with exponential backoff, honouring `Retry-After` up to
+  `MAX_RETRY_AFTER_SECONDS` (60 s). Permanent rejections are never retried.
+* **Cooldowns**: 15 minutes after a 401/403, 60 seconds after an exhausted
+  transient budget; the log and the error message name every skipped provider.
+* **Size routing**: a file above a provider's direct-upload ceiling is routed to
+  the next configured engine. Audio is never chunked, because splitting would
   cost word context at every boundary.
-* **Credential rotation**: encrypted keys are tried in order; a 401/403
-  quarantines a key, a 429 puts it in cooldown.
 * Transcript content and secrets are never logged.
 
 Whole-file transcription only: no chunking in the STT layer.

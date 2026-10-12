@@ -114,6 +114,11 @@ def run() -> None:
         configure_logging(settings)
         configured = True
         problems = check(settings)
+        # Advisory problems keep the bot running with reduced functionality;
+        # they still belong in the log, where an operator debugs a job.
+        for problem in problems:
+            if is_advisory(problem):
+                logging.getLogger(__name__).warning("configuration: %s", problem)
         fatal = [p for p in problems if not is_advisory(p)]
         if fatal:
             for problem in fatal:

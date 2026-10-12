@@ -1,0 +1,214 @@
+"""Configuration ↔ documentation consistency.
+
+``.env.example`` is the operator-facing contract of this project: every
+variable ``config.py`` reads is documented there, and the value shown next to
+a variable is the value the code actually uses. Both kinds of drift have
+caused real confusion (a Deepgram model without Persian support, a stale log
+path, a database name that no longer matched ``config.py``), so they are
+locked here instead of being caught by reading the code.
+
+The third check keeps the v3 documentation honest: the deleted v2 provider
+platform must not be advertised as configuration again.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from gamas_bot import config
+from gamas_bot.config import PLAN_ENV_FIELDS, PROJECT_DIR, from_env
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ENV_EXAMPLE = REPO_ROOT / ".env.example"
+CONFIG_SOURCE = Path(config.__file__)
+
+#: ``NAME=value`` and ``#NAME=value`` lines of the example file.
+ENV_LINE = re.compile(r"^#?\s*([A-Z0-9_]+)=(.*)$", re.M)
+
+#: Variables that only exist to document an optional integration and are read
+#: conditionally rather than through ``_env`` in the code path scanned below.
+EXTRA_DOCUMENTED = frozenset()
+
+#: ``(variable, Settings attribute, kind)`` for the values an operator reads as
+#: "defaults" in the example file. ``kind`` drives the comparison.
+DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
+    ("DB_PATH", "db_path", "path"),
+    ("TEMP_DIR", "temp_dir", "path"),
+    ("LOG_FILE", "log_file", "path"),
+    ("LOG_LEVEL", "log_level", "str"),
+    ("LOG_FORMAT", "log_format", "str"),
+    ("LOG_MAX_BYTES", "log_max_bytes", "int"),
+    ("LOG_BACKUP_COUNT", "log_backup_count", "int"),
+    ("MAX_FILE_SIZE", "max_file_size", "int"),
+    ("MAX_ACTIVE_JOBS", "max_active_jobs", "int"),
+    ("MAX_QUEUED_JOBS", "max_queued_jobs", "int"),
+    ("MEDIA_TIMEOUT", "media_timeout", "float"),
+    ("CONVERT_TIMEOUT", "convert_timeout", "float"),
+    ("STT_JOB_TIMEOUT", "stt_job_timeout", "float"),
+    ("STT_POLL_INTERVAL", "stt_poll_interval", "float"),
+    ("STT_PROVIDERS", "stt_providers", "csv"),
+    ("STT_LANGUAGE", "stt_language", "str"),
+    ("SPEECHMATICS_MODEL", "speechmatics_model", "str"),
+    ("DEEPGRAM_BASE_URL", "deepgram_base_url", "str"),
+    ("DEEPGRAM_MODEL", "deepgram_model", "str"),
+    ("STT_OPENAI_MODEL", "stt_openai_model", "str"),
+    ("STT_OPENAI_MAX_UPLOAD_BYTES", "stt_openai_max_upload", "int"),
+    ("NOTE_PROVIDER", "note_provider", "str"),
+    ("NOTE_MODEL", "note_model", "str"),
+    ("NOTE_MODE", "note_mode", "str"),
+    ("NOTE_MAX_OUTPUT_TOKENS", "note_max_output_tokens", "int"),
+    ("NOTE_CHUNK_CHARS", "note_chunk_chars", "int"),
+    ("NOTE_CONCURRENCY", "note_concurrency", "int"),
+    ("RAW_TEXT_PROFILE", "raw_text_profile", "str"),
+    ("PRESENTATION_MAX_CLIPS", "presentation_max_clips", "int"),
+    ("PRESENTATION_MAX_TOTAL_DURATION", "presentation_max_total_duration", "float"),
+    ("PRESENTATION_MIN_CLIP_SECONDS", "presentation_min_clip_seconds", "float"),
+    ("PRESENTATION_SILENCE_SECONDS", "presentation_silence_seconds", "float"),
+    ("PRESENTATION_WAV_LIMIT_BYTES", "presentation_wav_limit_bytes", "int"),
+    ("RECEIPT_DIR", "receipt_dir", "path"),
+    ("RECEIPT_RETENTION_DAYS", "receipt_retention_days", "int"),
+    ("MAX_PAYMENT_RECEIPT_BYTES", "max_payment_receipt_bytes", "int"),
+)
+
+#: v2 provider-platform settings that no longer exist in the code. Documentation
+#: must not tell an operator to set them.
+REMOVED_V2_SETTINGS = (
+    "STT_PRIMARY",
+    "STT_DEFAULT_ROUTE",
+    "STT_FALLBACK_ENABLED",
+    "STT_MAX_PROVIDER_FAILOVERS",
+    "STT_MAX_ATTEMPTS",
+    "STT_FREE_ONLY",
+    "STT_TRIAL_ALLOWLIST",
+    "STT_ALLOW_TRIAL_PROVIDERS",
+    "STT_ALLOW_PAID_FALLBACK",
+    "STT_QUOTA_SAFETY_MARGIN",
+    "STT_QUALITY_GATE_ENABLED",
+    "STT_REQUEST_DIARIZATION",
+    "STT_REQUEST_WORD_TIMESTAMPS",
+    "SPEECHMATICS_OPERATING_POINT",
+    "SPEECHMATICS_ADDITIONAL_VOCAB",
+    "SPEECHMATICS_MODEL_FIELD",
+)
+
+STT_DOC_PAGES = (
+    "docs/STT_PROVIDERS.md",
+    "docs/CONFIGURATION.md",
+    "docs/TROUBLESHOOTING.md",
+    "docs/PROVIDERS.md",
+    "docs/DEPLOY_FA.md",
+    ".env.example",
+)
+
+
+def example_values() -> dict[str, str]:
+    values: dict[str, str] = {}
+    for name, value in ENV_LINE.findall(ENV_EXAMPLE.read_text(encoding="utf-8")):
+        values[name] = value.strip()
+    return values
+
+
+def configured_names() -> set[str]:
+    """Every environment variable name ``config.py`` reads."""
+    source = CONFIG_SOURCE.read_text(encoding="utf-8")
+    names = set(re.findall(r'_env(?:_int|_float|_bool)?\(\s*"([A-Z0-9_]+)"', source))
+    names.update(name for name, _attribute, _default in PLAN_ENV_FIELDS)
+    return names
+
+
+def default_settings():
+    """``Settings`` built from an empty environment: the code defaults."""
+    with mock.patch.dict(os.environ, {}, clear=True):
+        return from_env(env_file="/nonexistent")
+
+
+class EnvExampleCoverageTests(unittest.TestCase):
+    def test_every_variable_config_reads_is_documented(self):
+        documented = set(example_values())
+        missing = sorted(name for name in configured_names() if name not in documented)
+        self.assertEqual(missing, [], f"undocumented configuration variables: {missing}")
+
+    def test_every_documented_variable_is_read_by_the_code(self):
+        read = configured_names() | EXTRA_DOCUMENTED
+        unknown = sorted(name for name in example_values() if name not in read)
+        self.assertEqual(unknown, [], f".env.example documents unused variables: {unknown}")
+
+
+class DocumentedDefaultsTests(unittest.TestCase):
+    def test_documented_defaults_are_what_the_code_produces(self):
+        """Setting a variable to the documented value must give that value.
+
+        ``.env.example`` shows a default next to each variable; this asserts the
+        code parses the documented value into exactly the documented setting,
+        which is how an operator reads the file. ``LOG_FILE`` is the one
+        variable whose *unset* default is intentionally "no file", so its
+        documented path is verified through the configured form.
+        """
+        documented = example_values()
+        mismatches: list[str] = []
+        for name, attribute, kind in DOCUMENTED_DEFAULTS:
+            raw = documented.get(name)
+            if raw is None:
+                mismatches.append(f"{name}: missing from .env.example")
+                continue
+            with mock.patch.dict(os.environ, {name: raw}, clear=True):
+                settings = from_env(env_file="/nonexistent")
+            actual = getattr(settings, attribute)
+            if kind == "csv":
+                ok = list(actual) == [part.strip() for part in raw.split(",") if part.strip()]
+            elif kind == "path":
+                ok = actual == PROJECT_DIR / Path(raw)
+            elif kind == "int":
+                ok = int(actual) == int(raw)
+            elif kind == "float":
+                ok = float(actual) == float(raw)
+            else:
+                ok = str(actual) == raw
+            if not ok:
+                mismatches.append(f"{name}: .env.example={raw!r} code={actual!r}")
+        self.assertEqual(mismatches, [], "; ".join(mismatches))
+
+    def test_stt_defaults_are_the_persian_ready_ones(self):
+        settings = default_settings()
+        # Persian-first deployment: the defaults must be able to transcribe fa.
+        self.assertEqual(settings.stt_language, "fa")
+        self.assertIn(settings.deepgram_model, config.DEEPGRAM_PERSIAN_MODELS)
+        self.assertEqual(settings.speechmatics_model, "enhanced")
+        self.assertEqual(
+            settings.stt_providers, tuple(config.DEFAULT_STT_PROVIDERS.split(","))
+        )
+
+
+class SttDocumentationTests(unittest.TestCase):
+    def test_stt_pages_do_not_advertise_removed_settings(self):
+        for page in STT_DOC_PAGES:
+            text = (REPO_ROOT / page).read_text(encoding="utf-8")
+            for removed in REMOVED_V2_SETTINGS:
+                self.assertNotIn(
+                    removed, text, f"{page} still documents the removed setting {removed}"
+                )
+
+    def test_stt_providers_page_documents_the_real_settings(self):
+        text = (REPO_ROOT / "docs/STT_PROVIDERS.md").read_text(encoding="utf-8")
+        for name in (
+            "STT_PROVIDERS",
+            "STT_LANGUAGE",
+            "SPEECHMATICS_API_KEY",
+            "SPEECHMATICS_MODEL",
+            "DEEPGRAM_API_KEY",
+            "DEEPGRAM_MODEL",
+            "DEEPGRAM_BASE_URL",
+            "STT_OPENAI_BASE_URL",
+            "STT_OPENAI_API_KEY",
+            "STT_OPENAI_MODEL",
+            "STT_OPENAI_MAX_UPLOAD_BYTES",
+        ):
+            self.assertIn(name, text, f"docs/STT_PROVIDERS.md does not document {name}")
+
+
+if __name__ == "__main__":
+    unittest.main()

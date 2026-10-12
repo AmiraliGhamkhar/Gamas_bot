@@ -209,37 +209,63 @@ sudo journalctl -u gamas-bot -n 200 --no-pager | grep 'Note API request failed'
 
 ### موتورهای STT
 
-علاوه بر Speechmatics و Deepgram می‌توانید یک endpoint سازگار با OpenAI (`POST /audio/transcriptions`) را به‌عنوان موتور اصلی یا جایگزین فعال کنید:
+سه موتور پشتیبانی می‌شود و ترتیب `STT_PROVIDERS` همان ترتیب failover است.
+Speechmatics و Deepgram و یک endpoint سازگار با OpenAI:
 
 ```dotenv
-STT_PRIMARY=speechmatics           # یا deepgram یا openai_compatible
-STT_OPENAI_BASE_URL=https://api.groq.com/openai/v1
-STT_OPENAI_API_KEY=...
-STT_OPENAI_MODEL=whisper-large-v3
+STT_PROVIDERS=speechmatics,deepgram,openai_compatible
+STT_LANGUAGE=fa
+
+SPEECHMATICS_API_KEY=...
+SPEECHMATICS_MODEL=enhanced        # standard | enhanced | melia-1 | oak-1
+
+DEEPGRAM_API_KEY=...
+DEEPGRAM_MODEL=nova-3              # فارسی فقط با Nova-3؛ nova-2 زبان fa ندارد
+
+# STT_OPENAI_BASE_URL=https://api.groq.com/openai/v1
+# STT_OPENAI_API_KEY=...
+# STT_OPENAI_MODEL=whisper-large-v3
 ```
 
-Speechmatics به‌صورت پیش‌فرض با مدل `enhanced` (بالاترین دقت سرویس) کار می‌کند:
+موتوری که کلید ندارد یا از سقف حجم فایل بزرگ‌تر است، با یک پیام روشن در لاگ
+رد می‌شود و نوبت به موتور بعدی می‌رسد. اگر همهٔ موتورها رد شوند، کار با خطای
+قابل‌پیگیری شکست می‌خورد و اعتبار رزروشده آزاد می‌شود؛ هیچ متن ساختگی
+تولید نمی‌شود.
 
-```dotenv
-SPEECHMATICS_OPERATING_POINT=enhanced
-SPEECHMATICS_ADDITIONAL_VOCAB=Metformin, Insulin, MRI, HbA1c
-SPEECHMATICS_VOCAB_MAX_ITEMS=1000
-```
+نکته‌های مهم:
 
-اسم این تنظیم همان «مدل/operating point» سرویس است؛ فیلدی که در JSON فرستاده
-می‌شود `model` است (نام منسوخ `operating_point` فقط با
-`SPEECHMATICS_MODEL_FIELD=operating_point` برای کانتینرهای batch قدیمی). نام
-قدیمی `SPEECHMATICS_MODEL` همچنان خوانده می‌شود. مقادار معتبر: `standard`،
-`enhanced`، `melia-1` و `oak-1` (دو مدل آخر چندزبانه‌اند، با `STT_LANGUAGE=multi`
-کار می‌کنند و confidence و فرهنگ اصطلاحات نمی‌دهند).
-
-فرهنگ اصطلاحات (custom dictionary) سقف دارد: سرویس برای هر Job حداکثر ۱۰۰۰
-مدخل را توصیه می‌کند و بالای ۲۰۰۰۰ مدخل کار را رد می‌کند؛ بنابراین فقط
-`SPEECHMATICS_VOCAB_MAX_ITEMS` مدخل اول (به همان ترتیبی که نوشته‌اید، یعنی
-مهم‌ترین‌ها اول) فرستاده می‌شود و باقی در لاگ گزارش می‌شود. واژگان بزرگ‌تر از
-سقف سخت هنگام راه‌اندازی خطا می‌دهند، نه وسط کار.
-
-اگر حساب شما سطح enhanced را نداشته باشد، ثبت Job رد می‌شود؛ با موتور جایگزین کار ادامه می‌یابد و می‌توانید مدل را به `standard` برگردانید. فایل‌های بزرگ‌تر از سقف آپلود مستقیم یک موتور (۱GB برای Speechmatics، ‌۲GB برای Deepgram، `STT_OPENAI_MAX_UPLOAD_BYTES` برای سرویس سازگار) به موتور پیکربندی‌شدهٔ بعدی سپرده می‌شوند؛ فایل صوتی برای STT تکه تکه نمی‌شود تا دقت کلمات در مرز قطعه‌ها افت نکند.
+* **فارسی و Deepgram**: زبان `fa` فقط در Nova-3 وجود دارد؛ `nova-2` درخواست
+  `language=fa` را با خطای ۴۰۰ رد می‌کند. مقدار پیش‌فرض `DEEPGRAM_MODEL`
+  در کد `nova-3` است و `python -m gamas_bot --check` ترکیب ناسازگار را هشدار
+  می‌دهد. برای `STT_LANGUAGE=auto` پارامتر `detect_language=true` فرستاده
+  می‌شود (حذف `language` باعث تشخیص زبان نمی‌شود و Deepgram پیش‌فرض انگلیسی
+  می‌گیرد).
+* **Speechmatics**: `enhanced` و `standard` زبان `fa` را مستقیم می‌پذیرند.
+  `melia-1` و `oak-1` فقط در Batch و فقط با `STT_LANGUAGE=multi` کار می‌کنند
+  (`auto` را رد می‌کنند) و confidence و واژگان سفارشی نمی‌دهند.
+* **OpenAI-compatible**: زبان به‌صورت کد ISO-639-1 (`fa`) فرستاده می‌شود و
+  برای `auto`/`multi` حذف می‌شود تا Whisper خودش زبان را تشخیص دهد. خروجی با
+  `response_format=verbose_json` گرفته می‌شود و اگر gateway آن را صریحاً رد
+  کند، یک بار با `json` تکرار می‌شود.
+* **خطاهای موقت** (شبکه، `408`، `425`، `429` و `5xx`) تا دو بار دیگر با
+  Backoff محدود Retry می‌شوند؛ `Retry-After` تا سقف ۶۰ ثانیه رعایت می‌شود تا
+  نوبت به موتور بعدی هم برسد. خطاهای دائمی (`400`، `404`، `422`، `401`،
+  `403`) بلافاصله باعث رفتن به موتور بعدی می‌شوند.
+* **Cooldown** در حافظهٔ همان پروسه: بعد از خطای اعتبارنامه ۱۵ دقیقه و بعد از
+  تمام‌شدن سهم خطاهای موقت ۶۰ ثانیه. موتوری که در Cooldown است با ذکر
+  ثانیه‌های باقی‌مانده در لاگ رد می‌شود؛ اگر همه در Cooldown باشند، خطای نهایی
+  نام همهٔ موتورها را می‌آورد.
+* **سقف حجم**: Speechmatics کمتر از ۱GB در هر `POST /jobs` (بیشتر از آن فقط
+  با URL عمومی `fetch_data`، که این ربات استفاده نمی‌کند)، Deepgram تا ۲GB و
+  سرویس سازگار تا `STT_OPENAI_MAX_UPLOAD_BYTES` (پیش‌فرض ۲۵MB). فایل
+  بزرگ‌تر به موتور بعدی سپرده می‌شود و صدا برای STT تکه تکه نمی‌شود تا دقت
+  کلمات در مرز قطعه‌ها کم نشود.
+* **سقف مدت Speechmatics**: Batch برای هر Job حدود ۲ ساعت صدای ضبط‌شده را
+  قبول می‌کند؛ فایل بلندتر را خود سرویس رد می‌کند و کار با موتور بعدی ادامه
+  می‌یابد (برش خودکار پیاده‌سازی نشده است).
+* **لاگ تشخیصی**: هر Job با کد `GMS-000123` در لاگ قابل جست‌وجو است؛ نام موتور،
+  حجم فایل، مدل، زبان، مدت درخواست، شمارهٔ تلاش، وضعیت HTTP و متن خطای
+  پاک‌سازی‌شده (بدون کلید و بدون متن گفتار) ثبت می‌شود.
 
 ## لاگینگ و پیگیری خطا
 

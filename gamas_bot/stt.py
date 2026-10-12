@@ -75,6 +75,15 @@ AUTH_COOLDOWN_SECONDS = 900.0
 #: How long a provider is skipped after repeated server errors.
 TRANSIENT_COOLDOWN_SECONDS = 60.0
 
+#: Longest ``Retry-After`` that is actually waited out. Providers may ask for
+#: minutes (or a date hours away) before the next attempt; a user's job must
+#: fail over to the next engine long before that.
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+#: Sentinel returned by :func:`_normalize_language` when the engine detects the
+#: language with its own request parameter instead of a language code.
+_AUTO_LANGUAGE = "auto"
+
 
 def _set_cooldown(slug: str, seconds: float) -> None:
     _COOLDOWNS[slug] = time.monotonic() + max(0.0, seconds)
@@ -125,6 +134,18 @@ def _sanitize_error(value: object, limit: int = 180) -> str:
     """Bound a provider-supplied string so it is safe to log."""
     text = " ".join(str(value).split())
     return text[:limit]
+
+
+def _has_meaningful_text(text: str) -> bool:
+    """True when a transcript contains at least one letter or digit.
+
+    A provider that answers with punctuation only (silence, music, a stream it
+    could not make sense of) has not transcribed anything. Treating that as a
+    success would deliver an empty ``.txt`` and settle the credit, so it is an
+    error for this engine and the next provider gets the file. ``isalnum``
+    covers Persian letters and Persian/Arabic-Indic digits.
+    """
+    return any(character.isalnum() for character in text)
 
 
 async def _error_from_response(
@@ -219,6 +240,13 @@ def _normalize_language(provider: str, language: str, *, model: str = "") -> str
     ``auto`` asks for detection when the provider has it, ``multi`` selects a
     multilingual model when one exists, and anything else (a language code or a
     Speechmatics bilingual pack like ``ar_en``) passes through untouched.
+
+    Deepgram is the one engine whose detection is a separate parameter: it
+    returns :data:`_AUTO_LANGUAGE` for ``auto``/``detect``, which ``_deepgram``
+    turns into ``detect_language=true``. Omitting ``language`` would not detect
+    anything — Deepgram defaults to English — and ``multi`` is only documented
+    for its multilingual models (a set that does not include Persian, so
+    ``STT_LANGUAGE=fa`` remains the correct setting for Persian audio).
     """
     value = (language or "").strip()
     key = value.lower()
@@ -234,14 +262,27 @@ def _normalize_language(provider: str, language: str, *, model: str = "") -> str
             return "fa"
         return value or "fa"
     if provider == "deepgram":
-        if key in ("auto", "detect", "multi"):
-            return ""  # detection/multilingual is requested by omitting language
+        if key in ("auto", "detect"):
+            return _AUTO_LANGUAGE
+        if key == "multi":
+            return "multi"
+        # Language codes keep the configured spelling: region subtags are
+        # documented with uppercase regions (``en-US``, ``fa-IR``).
         return value
     # Whisper detects the language when the parameter is omitted; "auto" is
     # not a valid ISO-639-1 language code for the OpenAI transcription API.
     if key in ("auto", "detect", "multi"):
         return ""
     return value
+
+
+def _provider_model(slug: str, settings: Settings) -> str:
+    """The model configured for one provider (for logs; never a secret)."""
+    if slug == "speechmatics":
+        return settings.speechmatics_model
+    if slug == "deepgram":
+        return settings.deepgram_model
+    return settings.stt_openai_model
 
 
 # ---------------------------------------------------------------------------
@@ -397,7 +438,7 @@ async def _speechmatics(
     if not isinstance(result, dict):
         raise STTError("Speechmatics پاسخ متن را با ساختار قابل‌خواندن برنگرداند.")
     text, words = _speechmatics_words(result.get("results"))
-    if not text:
+    if not _has_meaningful_text(text):
         raise STTError("Speechmatics متن قابل‌استفاده‌ای تولید نکرد.")
     confidence = None
     duration = result.get("duration")
@@ -441,7 +482,7 @@ def _deepgram_transcript(payload: object) -> RawTranscript:
             words.append(Word(token, start, end))
     if not text:
         text = " ".join(word.text for word in words).strip()
-    if not text:
+    if not _has_meaningful_text(text):
         raise STTError("Deepgram متن قابل‌استفاده‌ای تولید نکرد.")
     confidence_value = _optional_float(alternative.get("confidence"))
     return RawTranscript(words=words, text=text, confidence=confidence_value, engine="deepgram")
@@ -458,7 +499,11 @@ async def _deepgram(
         "smart_format": "true",
         "punctuate": "true",
     }
-    if language:
+    if language == _AUTO_LANGUAGE:
+        # Deepgram detects the dominant language with its own parameter; the
+        # docs state that it also picks the best model available for it.
+        params["detect_language"] = "true"
+    elif language:
         params["language"] = language
     with audio_path.open("rb") as audio:
         async with session.post(
@@ -509,7 +554,7 @@ def _openai_transcript(payload: object) -> RawTranscript:
         text = " ".join(word.text for word in words).strip()
     else:
         text = str(payload.get("text", "")).strip()
-    if not text:
+    if not _has_meaningful_text(text):
         raise STTError("سرویس تبدیل گفتار سازگار با OpenAI متن قابل‌استفاده‌ای تولید نکرد.")
     return RawTranscript(words=words, text=text, confidence=None, engine="openai_compatible")
 
@@ -646,7 +691,12 @@ async def _attempt_with_retries(
                 raise
             attempt += 1
             retry_after = exc.retry_after_seconds
-            delay = retry_after if retry_after is not None else min(2.0**attempt, 15.0)
+            if retry_after is None:
+                delay = min(2.0**attempt, 15.0)
+            else:
+                # Respect Retry-After, but never sleep for minutes: the budget
+                # is bounded and the next provider must stay reachable.
+                delay = min(retry_after, MAX_RETRY_AFTER_SECONDS)
             logger.warning(
                 "STT provider %s transient failure (attempt %d/%d); retrying in %.1fs: %s",
                 spec.slug, attempt, MAX_TRANSIENT_RETRIES + 1, delay, exc,
@@ -687,12 +737,20 @@ async def transcribe(
         )
     try:
         failures: list[str] = []
+        logger.info(
+            "STT failover chain providers=%s bytes=%s language=%s",
+            ",".join(settings.stt_providers), size, settings.stt_language or "auto",
+        )
         for slug in settings.stt_providers:
             spec = PROVIDERS.get(slug)
             if spec is None or not spec.configured(settings):
+                logger.info("STT provider %s has no credentials; skipped", slug)
                 continue
             remaining = _cooldown_remaining(slug)
             if remaining > 0:
+                logger.warning(
+                    "STT provider %s in cooldown for %.0fs more; skipped", slug, remaining
+                )
                 failures.append(f"{spec.label} در حال استراحت ({int(remaining)}s)")
                 continue
             max_upload = (
@@ -702,30 +760,61 @@ async def transcribe(
             )
             if size > max_upload:
                 limit_mb = max(1, math.ceil(max_upload / 1_000_000))
+                logger.warning(
+                    "STT provider %s skipped: file is %s bytes, over its %s byte ceiling",
+                    slug, size, max_upload,
+                )
                 failures.append(f"{spec.label} سقف حجم {limit_mb}MB دارد")
                 continue
+            logger.info(
+                "STT attempt provider=%s bytes=%s model=%s language=%s",
+                slug, size, _provider_model(slug, settings), settings.stt_language or "auto",
+            )
+            started = time.monotonic()
             try:
                 result = await _attempt_with_retries(spec, session, audio_path, settings)
-                logger.info("STT done provider=%s bytes=%s", slug, size)
+                logger.info(
+                    "STT done provider=%s bytes=%s elapsed_seconds=%.1f",
+                    result.engine or slug, size, time.monotonic() - started,
+                )
                 return result
             except STTAuthenticationError as exc:
-                logger.warning("STT provider %s auth failure: %s", slug, exc)
+                logger.warning(
+                    "STT provider %s auth failure after %.1fs: %s",
+                    slug, time.monotonic() - started, exc,
+                )
                 failures.append(str(exc))
             except STTRequestError as exc:
-                logger.warning("STT provider %s rejected the request: %s", slug, exc)
+                logger.warning(
+                    "STT provider %s rejected the request after %.1fs: %s",
+                    slug, time.monotonic() - started, exc,
+                )
                 failures.append(str(exc))
             except STTTransientError as exc:
-                logger.warning("STT provider %s transient failure exhausted: %s", slug, exc)
+                logger.warning(
+                    "STT provider %s transient failure exhausted after %.1fs: %s",
+                    slug, time.monotonic() - started, exc,
+                )
                 failures.append(str(exc))
             except STTError as exc:
                 # Provider payload/schema errors are definitive for this engine,
                 # but another configured engine may still transcribe the audio.
-                logger.warning("STT provider %s returned an unusable response: %s", slug, exc)
+                logger.warning(
+                    "STT provider %s returned an unusable response after %.1fs: %s",
+                    slug, time.monotonic() - started, exc,
+                )
                 failures.append(str(exc))
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                logger.warning("STT provider %s network failure: %s", slug, exc)
+                logger.warning(
+                    "STT provider %s network failure after %.1fs: %s",
+                    slug, time.monotonic() - started, exc,
+                )
                 failures.append(f"{spec.label} در دسترس نبود")
         if failures:
+            logger.error(
+                "STT exhausted every eligible provider (%d attempted/skipped): %s",
+                len(failures), " | ".join(failures),
+            )
             raise STTError("؛ ".join(failures))
         raise STTConfigurationError(
             "هیچ سرویس تبدیل گفتاری پیکربندی نشده است "

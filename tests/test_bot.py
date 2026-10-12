@@ -11,7 +11,7 @@ from unittest import mock
 from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database
 from gamas_bot.jobs import Job
-from gamas_bot.media import MediaInfo
+from gamas_bot.media import MediaInfo, MediaToolError
 from gamas_bot.progress import JobProgress
 from gamas_bot.stt import STTError
 from gamas_bot.transcript import RawTranscript, Word
@@ -188,7 +188,153 @@ class HappyPathTests(BotPipelineTestCase):
         self.assertEqual(row.status, "failed")
         self.assertTrue(any("شاخهٔ صوتی" in r for r in event.replies))
 
+    async def test_media_tool_failure_is_user_visible_and_refunded(self):
+        """A PyAV/worker failure propagates as an explicit message, not a crash."""
+        event = self.media_event()
+        await self.db.add_credit(USER_ID, 3600, note="test")
+        submission = await self.db.create_submission(USER_ID, "audio", "a.wav")
+        progress = await JobProgress.create(event, submission_id=submission)
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="audio",
+            filename="a.wav",
+            message=event.message,
+            is_admin=False,
+            duration_hint=100.0,
+            meta={"progress": progress},
+        )
+
+        async def broken_probe(_path, _settings):
+            raise MediaToolError("زمان اجرای «media_worker» به پایان رسید.")
+
+        with mock.patch("gamas_bot.bot.probe_media", new=broken_probe):
+            await self.bot._run_job(job)
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "failed")
+        self.assertTrue(any("media_worker" in r for r in event.replies))
+        self.assertEqual(event.files, [])
+        # The reservation was released: the user keeps every second.
+        self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
+
     # ------------------------------------------------------------- helpers
+
+
+class RealSttStackTests(BotPipelineTestCase):
+    """The job pipeline with the real ``stt.transcribe`` driver (fake HTTP)."""
+
+    async def test_valid_audio_is_transcribed_delivered_and_charged(self):
+        event = self.media_event()
+        await self.db.add_credit(USER_ID, 3600, note="test")
+        submission = await self.db.create_submission(USER_ID, "audio", "a.wav")
+        progress = await JobProgress.create(event, submission_id=submission)
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="audio",
+            filename="a.wav",
+            message=event.message,
+            is_admin=False,
+            duration_hint=100.0,
+            meta={"progress": progress},
+        )
+        audio = Path(self._tmp.name) / "in.wav"
+        audio.write_bytes(wav_bytes(duration=0.2))
+        session = _SpeechmaticsFakeSession()
+        self.bot._http_session = lambda: session  # type: ignore[method-assign]
+
+        with mock.patch(
+            "gamas_bot.bot.probe_media", new=self._fake_probe(100.0),
+        ), mock.patch(
+            "gamas_bot.bot.extract_audio_track", new=self._fake_extract(audio),
+        ):
+            await self.bot._run_job(job)
+
+        raw_text = event.file_bytes(".txt").decode("utf-8")
+        self.assertIn("سلام دوستان. امروز درس شبکه است.", raw_text)
+        self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "done")
+        transcript = await self.db.transcription(submission)
+        assert transcript is not None
+        self.assertEqual(transcript["engine"], "speechmatics")
+        self.assertIn("شبکه", transcript["text"])
+        # 100 s measured and charged, not the 3600 s reserved.
+        self.assertEqual(await self.db.available_seconds(USER_ID), 3500)
+        # The request really was the documented Speechmatics batch shape.
+        self.assertTrue(session.post_calls[0].endswith("/jobs"))
+        self.assertTrue(session.get_calls[-1].endswith("/transcript"))
+        self.assertEqual(session.get_kwargs[-1]["params"], {"format": "json-v2"})
+
+
+class _SpeechmaticsFakeSession:
+    """Minimal scripted HTTP session: submit, one poll (done), transcript."""
+
+    def __init__(self):
+        self.post_calls: list[str] = []
+        self.get_calls: list[str] = []
+        self.get_kwargs: list[dict] = []
+        self._responses = [
+            (202, {"id": "job-1"}),
+            (200, {"job": {"status": "done"}}),
+            (200, {"results": [
+                {"type": "word", "start_time": 0.0, "end_time": 0.4,
+                 "alternatives": [{"content": "سلام", "confidence": 0.9}]},
+                {"type": "word", "start_time": 0.5, "end_time": 1.0,
+                 "alternatives": [{"content": "دوستان", "confidence": 0.9}]},
+                {"type": "punctuation", "alternatives": [{"content": ".", "attaches_to": "previous"}]},
+                {"type": "word", "start_time": 2.0, "end_time": 2.4,
+                 "alternatives": [{"content": "امروز", "confidence": 0.9}]},
+                {"type": "word", "start_time": 2.5, "end_time": 2.8,
+                 "alternatives": [{"content": "درس", "confidence": 0.9}]},
+                {"type": "word", "start_time": 2.9, "end_time": 3.2,
+                 "alternatives": [{"content": "شبکه", "confidence": 0.9}]},
+                {"type": "word", "start_time": 3.3, "end_time": 3.6,
+                 "alternatives": [{"content": "است", "confidence": 0.9}]},
+                {"type": "punctuation", "alternatives": [{"content": ".", "attaches_to": "previous"}]},
+            ]}),
+        ]
+
+    def _response(self):
+        status, payload = self._responses.pop(0)
+        return _FakeAsyncResponse(status, payload)
+
+    def post(self, url, **_kwargs):
+        self.post_calls.append(url)
+        return _FakeAsyncContext(self._response())
+
+    def get(self, url, **kwargs):
+        self.get_calls.append(url)
+        self.get_kwargs.append(kwargs)
+        return _FakeAsyncContext(self._response())
+
+
+class _FakeAsyncResponse:
+    def __init__(self, status: int, payload: dict):
+        self.status = status
+        self.headers: dict[str, str] = {}
+        self._payload = payload
+
+    async def json(self, content_type=None):
+        return self._payload
+
+    async def read(self):
+        import json as _json
+
+        return _json.dumps(self._payload).encode()
+
+
+class _FakeAsyncContext:
+    def __init__(self, response):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, *_exc):
+        return False
 
 
 class ReserveEstimateTests(unittest.TestCase):
