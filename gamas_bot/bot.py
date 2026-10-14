@@ -721,7 +721,12 @@ class GamasBot:
         if not info.has_audio:
             raise ValueError("این فایل شاخهٔ صوتی ندارد؛ چیزی برای پیاده‌سازی نیست.")
         if kind == "video" or needs_transcode(filename, info):
-            return await extract_audio_track(source_path, workdir, self.settings)
+            # Forward the measured duration so a long recording can fall back to
+            # a compact Opus track instead of an oversized WAV (see
+            # ``media.choose_merge_format``).
+            return await extract_audio_track(
+                source_path, workdir, self.settings, total_duration=info.duration
+            )
         return source_path
 
     async def _settle(self, job: Job, duration: float | None) -> None:

@@ -207,10 +207,22 @@ def _convert(source: Path, output: Path, max_input_bytes: int) -> dict:
 
 
 def _check() -> dict:
-    import av
-    from importlib.metadata import version
+    """Report the importable media dependencies, or fail with a clear message.
 
-    return {"av": av.__version__, "ppt2pptx": version("ppt2pptx")}
+    Uses :func:`_require_av` and an explicit ``ppt2pptx`` lookup so a missing
+    dependency surfaces as the same actionable :class:`WorkerError` the media
+    commands use, instead of an import traceback from the diagnostic itself.
+    """
+    from importlib.metadata import PackageNotFoundError, version
+
+    av = _require_av()
+    try:
+        ppt2pptx = version("ppt2pptx")
+    except PackageNotFoundError as exc:
+        raise WorkerError(
+            "ppt2pptx is missing (run: pip install -r requirements.txt)"
+        ) from exc
+    return {"av": av.__version__, "ppt2pptx": ppt2pptx}
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -252,7 +264,13 @@ def _configure_logging() -> None:
     log records instead of printing them; restoring FFmpeg's default callback
     and limiting it to errors gives deterministic, bounded stderr output.
     """
-    import av
+    try:
+        import av
+    except ImportError:
+        # A missing PyAV is reported by the command handler (``_require_av`` /
+        # ``_check``) with a clear install instruction; configuring logging must
+        # not pre-empt that with an import traceback.
+        return
 
     av.logging.restore_default_callback()
     av.logging.set_libav_level(av.logging.ERROR)
