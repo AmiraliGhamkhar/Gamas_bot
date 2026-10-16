@@ -449,6 +449,18 @@ async def convert_to_pptx(source: Path, out_dir: Path, settings: Settings) -> Pa
     summary = stdout.strip()
     if summary:
         logger.info("Legacy deck converted output=%s summary=%s", converted.name, summary)
+        # Surface ppt2pptx warnings (e.g. MEDIA_ACTION_OMITTED) so operators
+        # know when a legacy deck lost embedded media during conversion.
+        try:
+            payload = json.loads(summary)
+            warnings = payload.get("warning_codes") if isinstance(payload, dict) else None
+            if warnings:
+                logger.warning(
+                    "Legacy deck conversion warnings output=%s warnings=%s",
+                    converted.name, warnings,
+                )
+        except (json.JSONDecodeError, AttributeError):
+            pass
     return converted
 
 
