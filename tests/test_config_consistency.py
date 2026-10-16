@@ -71,6 +71,8 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_MAX_OUTPUT_TOKENS", "note_max_output_tokens", "int"),
     ("NOTE_CHUNK_CHARS", "note_chunk_chars", "int"),
     ("NOTE_CONCURRENCY", "note_concurrency", "int"),
+    ("NOTE_COMPILE_MAX_CHARS", "note_compile_max_chars", "int"),
+    ("NOTE_REASONING_EFFORT", "note_reasoning_effort", "str"),
     ("RAW_TEXT_PROFILE", "raw_text_profile", "str"),
     ("PRESENTATION_MAX_CLIPS", "presentation_max_clips", "int"),
     ("PRESENTATION_MAX_TOTAL_DURATION", "presentation_max_total_duration", "float"),

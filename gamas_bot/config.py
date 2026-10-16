@@ -67,14 +67,17 @@ NOTE_JSON_OBJECT_PROVIDERS = frozenset({"openrouter", "openai_compatible"})
 NOTE_HOST_PROVIDERS = (("bynara.id", "nara"), ("openrouter.ai", "openrouter"))
 
 #: Documented API defaults per provider. Nara's free plan currently lists
-#: ``agnes-2.5-flash`` (https://router.bynara.id/api/plans) and OpenRouter's
-#: documented free router is ``openrouter/free``
-#: (https://openrouter.ai/docs/cookbook/get-started/free-models-router-playground);
-#: both are overridable, and no model is called free without this evidence.
+#: ``agnes-2.5-flash`` (https://router.bynara.id/api/plans). The OpenRouter
+#: default is one *pinned* free model, ``google/gemma-4-31b-it:free``, not the
+#: ``openrouter/free`` router: the router picks a model per request, so the
+#: window that actually serves a request is unknown when the bot sizes it,
+#: while the pinned model's endpoint serves a documented 262,144-token
+#: context with 32,768 completion tokens (https://openrouter.ai/api/v1/models).
+#: Both are overridable, and no model is called free without this evidence.
 DEFAULT_NARA_BASE_URL = "https://router.bynara.id/v1"
 DEFAULT_NARA_MODEL = "agnes-2.5-flash"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = "openrouter/free"
+DEFAULT_OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
 NOTE_BASE_URL_DEFAULTS = {
     "nara": DEFAULT_NARA_BASE_URL,
     "openrouter": DEFAULT_OPENROUTER_BASE_URL,
@@ -97,8 +100,24 @@ DEFAULT_NOTE_MODELS = {
 
 #: Context window assumed for one note request when the operator does not say.
 #: It is the *smallest* window among the configured models that matters, because
-#: the chain must fit the tightest provider that may answer.
-DEFAULT_NOTE_CONTEXT_TOKENS = 32000
+#: the chain must fit the tightest provider that may answer. The default pair
+#: is matched on purpose: the pinned OpenRouter endpoint serves a 262,144-token
+#: window and Agnes 2.5 Flash's official reference window is 512K (Nara's own
+#: gateway cap is unpublished), so the operational assumption is half of the
+#: matched served window — headroom for gateway caps and for the deliberately
+#: conservative Persian character-to-token estimate in ``notes.py``.
+DEFAULT_NOTE_CONTEXT_TOKENS = 131072
+#: Per-chunk character ceiling of one note request (an upper bound that the
+#: token budget in ``notes.effective_chunk_chars`` may still shrink).
+DEFAULT_NOTE_CHUNK_CHARS = 64000
+#: Output-token budget sent as ``max_tokens`` on every note request. It stays
+#: at half (or less) of the default models' documented completion caps
+#: (32,768 on the pinned OpenRouter endpoint, 65.5K for Agnes 2.5 Flash), so
+#: the budget itself never exceeds what a default model may emit.
+DEFAULT_NOTE_MAX_OUTPUT_TOKENS = 16384
+#: ``reasoning_effort`` levels accepted for OpenAI-style note routes. ``ultra``
+#: is accepted as the documented alias of ``max`` (https://router.bynara.id/docs).
+NOTE_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 #: A request needs at least this much room for the transcript itself.
 MIN_NOTE_INPUT_TOKENS = 4096
 
@@ -199,6 +218,18 @@ def resolve_note_mode(mode: str | None) -> str:
     return value if value in NOTE_MODES else "full"
 
 
+def resolve_note_reasoning_effort(effort: str | None) -> str:
+    """Resolve ``NOTE_REASONING_EFFORT``; empty means \"provider default\".
+
+    An unrecognised value resolves to empty rather than being forwarded: an
+    unsupported level must never become a request a provider rejects.
+    """
+    value = (effort or "").strip().lower()
+    if value == "ultra":
+        value = "max"
+    return value if value in NOTE_REASONING_EFFORTS else ""
+
+
 def resolve_raw_text_profile(profile: str | None) -> str:
     value = (profile or "").strip().lower()
     return value if value in RAW_TEXT_PROFILES else "plain"
@@ -283,6 +314,8 @@ class Settings:
     note_chunk_chars: int
     note_concurrency: int
     note_compile: bool
+    note_compile_max_chars: int
+    note_reasoning_effort: str
 
     # --- Raw text -----------------------------------------------------------
     raw_text_profile: str
@@ -666,11 +699,19 @@ def from_env(env_file: str | None = None) -> Settings:
             "NOTE_CONTEXT_TOKENS", DEFAULT_NOTE_CONTEXT_TOKENS, minimum=2048
         ),
         note_mode=resolve_note_mode(_env("NOTE_MODE")),
-        note_max_output_tokens=_env_int("NOTE_MAX_OUTPUT_TOKENS", 16384, minimum=256),
+        note_max_output_tokens=_env_int(
+            "NOTE_MAX_OUTPUT_TOKENS", DEFAULT_NOTE_MAX_OUTPUT_TOKENS, minimum=256
+        ),
         note_json_mode=_env_bool("NOTE_JSON_MODE", False),
-        note_chunk_chars=_env_int("NOTE_CHUNK_CHARS", 22000, minimum=2000, maximum=200_000),
+        note_chunk_chars=_env_int(
+            "NOTE_CHUNK_CHARS", DEFAULT_NOTE_CHUNK_CHARS, minimum=2000, maximum=200_000
+        ),
         note_concurrency=_env_int("NOTE_CONCURRENCY", 3, minimum=1, maximum=8),
         note_compile=_env_bool("NOTE_COMPILE", True),
+        note_compile_max_chars=_env_int(
+            "NOTE_COMPILE_MAX_CHARS", 0, minimum=0, maximum=2_000_000
+        ),
+        note_reasoning_effort=resolve_note_reasoning_effort(_env("NOTE_REASONING_EFFORT")),
         raw_text_profile=resolve_raw_text_profile(_env("RAW_TEXT_PROFILE")),
         payment_card_number=re.sub(r"\D", "", _env("PAYMENT_CARD_NUMBER", "5022291332906625"))[-16:],
         payment_card_holder=_env("PAYMENT_CARD_HOLDER", "امیرعلی غمخوار"),

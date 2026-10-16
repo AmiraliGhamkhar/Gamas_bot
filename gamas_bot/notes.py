@@ -43,9 +43,13 @@ VALID_CALLOUT_KINDS = ("نکته", "هشدار", "یادآوری")
 
 #: A merge below this size is not worth an editorial compile call.
 COMPILE_MIN_NOTES_CHARS = 400
-#: Hard bound on the compile request; a larger merged booklet is delivered as
-#: the deterministic merge rather than re-sent as one oversized request.
-COMPILE_MAX_CHARS = 48000
+#: Absolute ceiling on the compile request, however large the configured
+#: window is: a larger merged booklet is delivered as the deterministic merge
+#: rather than re-sent as one enormous request. The operative budget below
+#: that ceiling is derived from the context window per request (see
+#: :func:`effective_compile_max_chars`); ``NOTE_COMPILE_MAX_CHARS`` overrides
+#: the derivation when an operator sets it explicitly.
+COMPILE_HARD_MAX_CHARS = 160000
 #: The compile result must keep at least this share of the merged sections.
 COMPILE_MIN_SECTION_RATIO = 0.5
 #: The neighbour window handed to a chunk as context only.
@@ -1293,6 +1297,38 @@ def effective_chunk_chars(
     return max(1, min(settings.note_chunk_chars, context_budget))
 
 
+def effective_compile_max_chars(settings: Settings) -> int:
+    """The character budget of the merged notes in one compile request.
+
+    The compile (reduce) request lives in the same window as every other note
+    request: its system prompt, the topic digest wrapped around the merged
+    notes and the reserved output all compete with the notes themselves. The
+    budget is therefore derived with the same math as
+    :func:`effective_chunk_chars` (minus the ``NOTE_CHUNK_CHARS`` cap, which
+    sizes map chunks, not the reduce input) instead of the former fixed
+    character bound, which silently disabled the editorial pass for every
+    booklet above it however large the model's window was.
+
+    ``NOTE_COMPILE_MAX_CHARS`` (> 0) is an explicit operator cap and wins
+    as-is; the derived budget is additionally bounded by
+    ``COMPILE_HARD_MAX_CHARS``, so a very large configured window cannot turn
+    the reduce step into one unbounded request — the deterministic merge is
+    delivered instead, exactly as before.
+    """
+    if settings.note_compile_max_chars > 0:
+        return settings.note_compile_max_chars
+    reserve_tokens = (
+        int((len(COMPILE_SYSTEM_PROMPT) + CONTEXT_DIGEST_MAX_CHARS) / CHARS_PER_TOKEN)
+        + PROMPT_RESERVE_TOKENS
+    )
+    available_tokens = max(
+        MIN_REQUEST_TOKENS,
+        settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens,
+    )
+    derived = max(MIN_REQUEST_CHARS, int(available_tokens * CHARS_PER_TOKEN))
+    return min(derived, COMPILE_HARD_MAX_CHARS)
+
+
 async def _structure_piece(
     session: aiohttp.ClientSession,
     settings: Settings,
@@ -1420,7 +1456,7 @@ async def structure_document(
     if (
         not settings.note_compile
         or merged_chars < COMPILE_MIN_NOTES_CHARS
-        or merged_chars > COMPILE_MAX_CHARS
+        or merged_chars > effective_compile_max_chars(settings)
     ):
         return merged
 

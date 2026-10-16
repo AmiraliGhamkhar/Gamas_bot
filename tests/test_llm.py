@@ -20,6 +20,7 @@ from gamas_bot.llm import (
     _build_request,
     _endpoint,
     _parse_response,
+    _usage_summary,
     complete,
     complete_json,
     extract_json_object,
@@ -51,6 +52,21 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertEqual(payload["messages"][0]["role"], "system")
         self.assertEqual(payload["messages"][1]["content"], "USER")
         self.assertNotIn("response_format", payload)  # opt-in only
+        self.assertNotIn("reasoning_effort", payload)  # provider default unless set
+
+    def test_reasoning_effort_sent_on_openai_style(self):
+        settings = make_settings(note_reasoning_effort="low")
+        _url, _headers, payload = _build_request(settings, "S", "U")
+        self.assertEqual(payload["reasoning_effort"], "low")
+
+    def test_reasoning_effort_not_invented_for_gemini_style(self):
+        settings = make_settings(
+            note_provider="gemini", note_api_key="g-key", note_api_base_url="",
+            note_reasoning_effort="low",
+        )
+        _url, _headers, payload = _build_request(settings, "S", "U")
+        self.assertNotIn("reasoning_effort", payload)
+        self.assertNotIn("reasoning_effort", payload["generationConfig"])
 
     def test_openai_json_mode_opt_in(self):
         settings = make_settings(note_json_mode=True)
@@ -120,6 +136,41 @@ class ResponseParsingTests(unittest.TestCase):
         payload = {"choices": [{"message": {"content": "   "}}]}
         with self.assertRaises(LLMResponseError):
             _parse_response(payload, "openai_compatible")
+
+
+class UsageSummaryTests(unittest.TestCase):
+    def test_openai_style_usage(self):
+        payload = {
+            "model": "served-model",
+            "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
+        }
+        self.assertEqual(_usage_summary(payload, "openai"), ("served-model", 120, 30, 150))
+
+    def test_partial_usage_stays_unknown(self):
+        payload = {"model": "google/gemma-4-31b-it:free", "usage": {"prompt_tokens": 5}}
+        model, prompt, completion, total = _usage_summary(payload, "openai")
+        self.assertEqual(model, "google/gemma-4-31b-it:free")
+        self.assertEqual(prompt, 5)
+        self.assertIsNone(completion)
+        self.assertIsNone(total)
+
+    def test_gemini_usage_metadata_and_model_version(self):
+        payload = {
+            "modelVersion": "gemini-2.5-flash",
+            "usageMetadata": {
+                "promptTokenCount": 10, "candidatesTokenCount": 4, "totalTokenCount": 14,
+            },
+        }
+        self.assertEqual(_usage_summary(payload, "gemini"), ("gemini-2.5-flash", 10, 4, 14))
+
+    def test_anthropic_total_is_derived(self):
+        payload = {"model": "claude-x", "usage": {"input_tokens": 7, "output_tokens": 3}}
+        self.assertEqual(_usage_summary(payload, "anthropic"), ("claude-x", 7, 3, 10))
+
+    def test_missing_or_bool_counts_stay_unknown(self):
+        payload = {"usage": {"prompt_tokens": True, "completion_tokens": "9"}}
+        self.assertEqual(_usage_summary(payload, "openai"), ("", None, None, None))
+        self.assertEqual(_usage_summary({}, "openai"), ("", None, None, None))
 
 
 class ExtractJsonTests(unittest.TestCase):
@@ -235,11 +286,20 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_success(self):
         session = FakeSession([FakeResponse(200, {
-            "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}]
+            "model": "served-model",
+            "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
         })])
         settings = make_settings()
-        result = await complete(session, settings, system="S", user="U")
+        with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
+            result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "answer")
+        # The served model and its real token counts reach the operator log;
+        # the answer text itself never does.
+        self.assertTrue(any("model=served-model" in line for line in logs.output), logs.output)
+        self.assertTrue(any("input_tokens=120" in line for line in logs.output), logs.output)
+        self.assertTrue(any("output_tokens=30" in line for line in logs.output), logs.output)
+        self.assertFalse(any("content=answer" in line for line in logs.output), logs.output)
         self.assertEqual(len(session.calls), 1)
         timeout = session.calls[0]["timeout"]
         self.assertEqual(timeout.total, llm.LLM_REQUEST_TIMEOUT_SECONDS)
@@ -415,6 +475,13 @@ class NaraRouterContractTests(unittest.IsolatedAsyncioTestCase):
         nara = note_routes(settings)[0]
         _url, _headers, payload = _build_request(settings, "S", "U", route=nara)
         self.assertNotIn("response_format", payload)
+
+    async def test_reasoning_effort_reaches_nara_only_when_configured(self):
+        """NaraRouter documents ``reasoning_effort``; unset keeps its default."""
+        settings = routed_settings(note_reasoning_effort="none")
+        nara = note_routes(settings)[0]
+        _url, _headers, payload = _build_request(settings, "S", "U", route=nara)
+        self.assertEqual(payload["reasoning_effort"], "none")
 
     async def test_documented_success_shape_parses(self):
         session = FakeSession([FakeResponse(200, {

@@ -4,6 +4,38 @@ Entries describe user- and operator-visible change. For anything older than
 v3.0.0, read the git history — the v2 provider platform those entries describe
 no longer exists in the code.
 
+## Unreleased — 2026-10-16 — matched free-model pair, larger note requests
+
+The note chain's two defaults are now chosen as a pair, and every size limit
+is derived from that pair instead of from a generic 32K assumption (provider
+data re-verified 2026-10-16; see `docs/PROVIDERS.md`).
+
+### Changed
+
+* **The OpenRouter default is a pinned free model, not the free router.**
+  `openrouter/free` selects a model per request, so the window serving a
+  request was unknown when the bot sized it. The default is now
+  `google/gemma-4-31b-it:free` (served 262,144-token context, 32,768
+  completion cap, `response_format`-capable). Nara's default is unchanged
+  (`agnes-2.5-flash`).
+* **Note requests are sized for the matched pair.** `NOTE_CONTEXT_TOKENS`
+  defaults to 131072 (half the matched 262K served window, leaving margin
+  for Nara's unpublished gateway cap) and `NOTE_CHUNK_CHARS` to 64000, so a
+  lecture takes roughly a third as many map requests as before.
+  `NOTE_MAX_OUTPUT_TOKENS` stays 16384, within both models' completion caps.
+* **The compile pass budget is token-derived.** The fixed 48,000-character
+  bound that silently skipped the editorial compile for larger booklets is
+  replaced by a budget derived from the context window (with an absolute
+  ceiling); `NOTE_COMPILE_MAX_CHARS` overrides it, `0` means automatic.
+
+### Added
+
+* **`NOTE_REASONING_EFFORT`** (unset by default): `reasoning_effort` for
+  OpenAI-style note routes only; unknown values resolve to "send nothing".
+* **Per-request usage logging.** Every completed note request logs its served
+  model and real input/output token counts, so the conservative
+  character-to-token estimate can be recalibrated from Persian traffic.
+
 ## Unreleased — 2026-10-12 — documentation rewritten against the code
 
 ### Fixed

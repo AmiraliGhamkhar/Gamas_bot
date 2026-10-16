@@ -10,6 +10,9 @@ from gamas_bot.config import (
     DEEPGRAM_PERSIAN_MODELS,
     note_routes,
     DEFAULT_DEEPGRAM_MODEL,
+    DEFAULT_NOTE_CHUNK_CHARS,
+    DEFAULT_NOTE_CONTEXT_TOKENS,
+    DEFAULT_OPENROUTER_MODEL,
     DEFAULT_STT_PROVIDERS,
     PLAN_ENV_FIELDS,
     Settings,
@@ -18,6 +21,7 @@ from gamas_bot.config import (
     from_env,
     is_advisory,
     resolve_note_mode,
+    resolve_note_reasoning_effort,
     resolve_raw_text_profile,
 )
 
@@ -170,7 +174,7 @@ class NoteProviderOrderTests(unittest.TestCase):
         self.assertEqual(routes[0].base_url, "https://router.bynara.id/v1")
         self.assertEqual(routes[0].model, "agnes-2.5-flash")
         self.assertEqual(routes[1].base_url, "https://openrouter.ai/api/v1")
-        self.assertEqual(routes[1].model, "openrouter/free")
+        self.assertEqual(routes[1].model, "google/gemma-4-31b-it:free")
         self.assertTrue(settings.note_configured)
         self.assertEqual(check(settings), [])
 
@@ -228,6 +232,42 @@ class NoteProviderOrderTests(unittest.TestCase):
     def test_a_dedicated_key_does_not_auto_select_gemini(self):
         settings = self.settings(GEMINI_API_KEY="g", NARA_API_KEY="n")
         self.assertEqual(self.slugs(settings), ["nara"])
+
+    def test_default_window_chunk_and_models_are_the_matched_pair(self):
+        """The default sizing assumes the matched 262K served windows.
+
+        Both default models serve 262,144 tokens; the operational assumption
+        is half of that, and the output budget stays within both models'
+        documented completion caps (32,768 OpenRouter / 65.5K Agnes).
+        """
+        settings = self.settings(NARA_API_KEY="nara", OPENROUTER_API_KEY="or")
+        self.assertEqual(settings.openrouter_model, DEFAULT_OPENROUTER_MODEL)
+        self.assertEqual(settings.openrouter_model, "google/gemma-4-31b-it:free")
+        self.assertEqual(settings.note_context_tokens, DEFAULT_NOTE_CONTEXT_TOKENS)
+        self.assertEqual(settings.note_context_tokens, 131072)
+        self.assertEqual(settings.note_chunk_chars, DEFAULT_NOTE_CHUNK_CHARS)
+        self.assertEqual(settings.note_chunk_chars, 64000)
+        self.assertEqual(settings.note_max_output_tokens, 16384)
+        self.assertLess(settings.note_max_output_tokens, 32768)
+        # Automatic compile budget and provider-default reasoning out of the box.
+        self.assertEqual(settings.note_compile_max_chars, 0)
+        self.assertEqual(settings.note_reasoning_effort, "")
+
+    def test_compile_cap_and_reasoning_effort_from_env(self):
+        settings = self.settings(
+            NARA_API_KEY="n", NOTE_COMPILE_MAX_CHARS="90000", NOTE_REASONING_EFFORT="low"
+        )
+        self.assertEqual(settings.note_compile_max_chars, 90000)
+        self.assertEqual(settings.note_reasoning_effort, "low")
+
+    def test_reasoning_effort_resolution(self):
+        self.assertEqual(resolve_note_reasoning_effort("LOW"), "low")
+        self.assertEqual(resolve_note_reasoning_effort(" ultra "), "max")
+        self.assertEqual(resolve_note_reasoning_effort("xhigh"), "xhigh")
+        # Unknown levels fall back to "provider default" instead of being sent.
+        self.assertEqual(resolve_note_reasoning_effort("bogus"), "")
+        self.assertEqual(resolve_note_reasoning_effort(""), "")
+        self.assertEqual(resolve_note_reasoning_effort(None), "")
 
     def test_a_tight_context_window_is_reported_as_advisory(self):
         settings = self.settings(

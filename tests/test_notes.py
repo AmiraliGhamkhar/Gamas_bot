@@ -8,10 +8,12 @@ from unittest import mock
 
 from gamas_bot.llm import LLMContextOverflowError, LLMError
 from gamas_bot.notes import (
+    COMPILE_HARD_MAX_CHARS,
     MAX_CONTEXT_SPLITS,
     TRANSCRIPT_PROMPT,
     StructuringError,
     effective_chunk_chars,
+    effective_compile_max_chars,
     NoteSection,
     NoteTable,
     GlossaryEntry,
@@ -310,6 +312,40 @@ class ContextBudgetTests(unittest.TestCase):
         self.assertLess(budget, settings.note_chunk_chars)
 
 
+class CompileBudgetTests(unittest.TestCase):
+    """The compile (reduce) budget is token-derived, not a fixed char bound."""
+
+    def test_the_default_window_lifts_the_former_fixed_bound(self):
+        # Under the old fixed 48,000-char bound this booklet size skipped the
+        # editorial pass; the matched 262K-window defaults must allow it.
+        settings = make_settings()
+        self.assertGreater(effective_compile_max_chars(settings), 48000)
+
+    def test_a_smaller_window_produces_a_smaller_compile_budget(self):
+        narrow = make_settings(note_context_tokens=8192, note_max_output_tokens=2048)
+        wide = make_settings(note_context_tokens=131072, note_max_output_tokens=4096)
+        self.assertLess(
+            effective_compile_max_chars(narrow), effective_compile_max_chars(wide)
+        )
+
+    def test_the_derived_budget_is_bounded_by_the_hard_ceiling(self):
+        settings = make_settings(
+            note_context_tokens=10_000_000, note_max_output_tokens=4096
+        )
+        self.assertEqual(effective_compile_max_chars(settings), COMPILE_HARD_MAX_CHARS)
+
+    def test_an_explicit_operator_cap_wins(self):
+        settings = make_settings(note_compile_max_chars=12345)
+        self.assertEqual(effective_compile_max_chars(settings), 12345)
+
+    def test_output_budget_shrinks_the_compile_budget(self):
+        lean = make_settings(note_max_output_tokens=4096)
+        hungry = make_settings(note_max_output_tokens=100_000)
+        self.assertLess(
+            effective_compile_max_chars(hungry), effective_compile_max_chars(lean)
+        )
+
+
 class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
     """An oversized request is split at a safe boundary, never re-sent as is."""
 
@@ -514,6 +550,23 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         chunks = split_transcript(document, 400)
         session = FakeSession([sample_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))])
         await structure_transcript(document, settings, session)
+        self.assertEqual(len(session.calls), len(chunks))
+
+    async def test_explicit_compile_cap_skips_reduce(self):
+        """A merged booklet above the operator's compile cap is merged, not sent."""
+        from gamas_bot.transcript import split_transcript
+
+        settings = make_settings(
+            note_chunk_chars=400, note_compile=True, note_compile_max_chars=10
+        )
+        document = "\n\n".join(
+            f"موضوع {index}: " + "جمله‌های بسیار زیاد برای پر کردن حجم. " * 20
+            for index in range(4)
+        )
+        chunks = split_transcript(document, 400)
+        session = FakeSession([sample_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))])
+        await structure_transcript(document, settings, session)
+        # Map calls only: the compile request was never built.
         self.assertEqual(len(session.calls), len(chunks))
 
     async def test_provider_failure_propagates(self):

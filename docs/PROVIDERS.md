@@ -7,16 +7,40 @@ Gemini `generateContent`, and Anthropic `messages`.
 | Provider | Base URL default | Credential | Model default |
 | --- | --- | --- | --- |
 | NaraRouter (`nara`) | `https://router.bynara.id/v1` | `NARA_API_KEY` | `agnes-2.5-flash` |
-| OpenRouter | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `openrouter/free` |
+| OpenRouter | `https://openrouter.ai/api/v1` | `OPENROUTER_API_KEY` | `google/gemma-4-31b-it:free` |
 | OpenAI-compatible | `https://api.openai.com/v1` (or `NOTE_BASE_URL`) | `NOTE_API_KEY` (optional for a local gateway) | `NOTE_MODEL` (`gpt-4o-mini`) |
 | Gemini | `https://generativelanguage.googleapis.com/v1beta` | `GEMINI_API_KEY` (or `NOTE_API_KEY`) | `gemini-2.5-flash` |
 | Anthropic | `https://api.anthropic.com/v1` | `NOTE_API_KEY` | none — set `NOTE_MODEL` |
 
-The defaults are the models the providers publish as free
-([NaraRouter plans](https://router.bynara.id/api/plans),
-[OpenRouter free router](https://openrouter.ai/docs/cookbook/get-started/free-models-router-playground)).
-Changing `NARA_MODEL` or `OPENROUTER_MODEL` is an explicit operator decision; the
-bot never relabels a model as free.
+The defaults are free models published by the providers
+([NaraRouter plans](https://router.bynara.id/api/plans), the OpenRouter model
+catalogue). Changing `NARA_MODEL` or `OPENROUTER_MODEL` is an explicit operator
+decision; the bot never relabels a model as free.
+
+## The default pair is window-matched
+
+One global `NOTE_CONTEXT_TOKENS` sizes requests for whichever provider
+answers, so the two defaults were chosen to serve the *same* window
+(verified against the providers' published data on 2026-10-16):
+
+| Default model | Served context | Completion cap | Why this one |
+| --- | --- | --- | --- |
+| `agnes-2.5-flash` (Nara) | 512K official reference; Nara's gateway cap is unpublished | 65.5K | The general instruct model on Nara's Free plan (7M tokens/day, 15 req/min) |
+| `google/gemma-4-31b-it:free` (OpenRouter) | 262,144 (endpoint) | 32,768 | Pinned endpoint, `response_format`-capable, pre-trained on 140+ languages |
+
+That is why the OpenRouter default is a pinned model and not the
+`openrouter/free` router: the router selects a model per request, so the
+window that will serve a request is unknown at sizing time (its pool currently
+spans 66K–1M windows, with completion caps as low as 8,192). The operational
+assumption is `NOTE_CONTEXT_TOKENS=131072` — half the matched served window —
+with `NOTE_CHUNK_CHARS=64000` and `NOTE_MAX_OUTPUT_TOKENS=16384` (within both
+completion caps). Re-verify the endpoints before changing any of the three:
+Nara's authenticated `/v1/models`, OpenRouter's
+`/api/v1/models/<model>/endpoints`, and `GET /api/v1/key` for the free-tier
+daily request counter (20/min; 50/day, or 1,000/day after $10 of lifetime
+credit purchases). Free rosters rotate; a model that leaves the free tier
+fails as a provider error and the chain falls back, but the sizing assumption
+must be revisited at the same time.
 
 ## Failover
 
@@ -31,6 +55,15 @@ bot never relabels a model as free.
 * **`NOTE_JSON_MODE`** sends `response_format` only to providers that document it
   (OpenRouter and generic OpenAI-compatible gateways — not NaraRouter). Gemini
   always asks for its native JSON.
+* **`NOTE_REASONING_EFFORT`** (unset by default) sends `reasoning_effort` on
+  OpenAI-style routes only, where both gateways document or accept it; the
+  Gemini/Anthropic styles receive nothing. Each completed request logs its
+  served model and real token usage (`note provider usage …`), which is the
+  data to recalibrate the chunk budget's character-to-token estimate from.
+* **The compile (reduce) budget is token-derived** (`NOTE_COMPILE_MAX_CHARS=0`
+  means automatic): a merged booklet larger than the derived budget — bounded
+  by an absolute ceiling in `notes.py` — is delivered as the deterministic
+  merge instead of being re-sent as one oversized request.
 
 ## Size failures
 
@@ -53,12 +86,15 @@ chain runs out, the caller degrades to the raw transcript the user already holds
 
 ## Diagnostics
 
-There is no in-bot provider panel and no background probing: a provider is
-exercised only by a real job.
+There is no in-bot provider panel and no background probing: inside the bot, a
+provider is exercised only by a real job. The one explicit exception is the
+operator-run probe below, which is never invoked by the bot itself.
 
 ```bash
 python -m gamas_bot --check          # offline: which providers are eligible
 python -m scripts.cpanel_preflight   # outbound reachability of the note hosts
+python -m scripts.probe_note_providers            # read-only: entitlements, served caps, free-tier counters
+python -m scripts.probe_note_providers --generate lecture.txt   # opt-in: one real generation per provider (consumes quota)
 ```
 
 The job log names every provider attempted, skipped for missing credentials, or

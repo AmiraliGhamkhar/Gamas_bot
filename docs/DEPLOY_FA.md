@@ -140,7 +140,7 @@ journalctl -u gamas-bot -f
 # OpenRouter — سرویس دوم
 #OPENROUTER_API_KEY=
 #OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
-#OPENROUTER_MODEL=openrouter/free
+#OPENROUTER_MODEL=google/gemma-4-31b-it:free
 
 # Gemini
 #GEMINI_API_KEY=

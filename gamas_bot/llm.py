@@ -311,6 +311,14 @@ def _build_request_for(
         # Opt-in, and only for providers that document ``response_format``
         # (NaraRouter does not, so it is never asked for it).
         payload["response_format"] = {"type": "json_object"}
+    if settings.note_reasoning_effort:
+        # OpenAI-style routes only: NaraRouter documents ``reasoning_effort``
+        # and clamps unsupported levels instead of erroring, and OpenRouter
+        # accepts the same field. The Gemini and Anthropic styles above have
+        # their own thinking knobs, which this setting deliberately does not
+        # invent a mapping for. Unset (the default) sends nothing, so the
+        # provider's own reasoning default applies.
+        payload["reasoning_effort"] = settings.note_reasoning_effort
     return _endpoint(route.base_url, "chat/completions"), headers, payload
 
 
@@ -396,6 +404,70 @@ def _parse_response(payload: dict, provider: str) -> str:
     return text
 
 
+def _usage_count(value: object) -> int | None:
+    """One token count from a provider usage block, or ``None`` if unusable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
+
+
+def _usage_summary(payload: dict, style: str) -> tuple[str, int | None, int | None, int | None]:
+    """``(served_model, input_tokens, output_tokens, total_tokens)`` of a reply.
+
+    Each request style reports usage under its own names: OpenAI-compatible
+    ``usage.prompt_tokens``/``completion_tokens``, Gemini ``usageMetadata``
+    (served model arrives as ``modelVersion``) and Anthropic ``usage``
+    ``input_tokens``/``output_tokens`` with no total of its own. Anything a
+    provider omits stays ``None``: the summary is for calibrating the
+    character-to-token estimate against real Persian traffic, never for
+    billing, so a partial report is logged as-is instead of being guessed.
+    """
+    model = payload.get("model") or payload.get("modelVersion") or ""
+    input_tokens = output_tokens = total_tokens = None
+    if style == "gemini":
+        usage = payload.get("usageMetadata")
+        if isinstance(usage, dict):
+            input_tokens = _usage_count(usage.get("promptTokenCount"))
+            output_tokens = _usage_count(usage.get("candidatesTokenCount"))
+            total_tokens = _usage_count(usage.get("totalTokenCount"))
+    elif style == "anthropic":
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            input_tokens = _usage_count(usage.get("input_tokens"))
+            output_tokens = _usage_count(usage.get("output_tokens"))
+    else:
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            input_tokens = _usage_count(usage.get("prompt_tokens"))
+            output_tokens = _usage_count(usage.get("completion_tokens"))
+            total_tokens = _usage_count(usage.get("total_tokens"))
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    return str(model), input_tokens, output_tokens, total_tokens
+
+
+def _log_usage(route: NoteRoute, payload: dict) -> None:
+    """Log one completed request's token usage (never its content or key)."""
+    model, input_tokens, output_tokens, total_tokens = _usage_summary(payload, route.style)
+
+    def shown(value: int | None) -> str:
+        return str(value) if value is not None else "-"
+
+    logger.info(
+        "note provider usage provider=%s model=%s input_tokens=%s "
+        "output_tokens=%s total_tokens=%s",
+        route.slug,
+        model or route.model,
+        shown(input_tokens),
+        shown(output_tokens),
+        shown(total_tokens),
+    )
+
+
 async def _complete_on_route(
     route: NoteRoute,
     session: aiohttp.ClientSession,
@@ -427,6 +499,10 @@ async def _complete_on_route(
                     ) from exc
             if not isinstance(result, dict):
                 raise LLMResponseError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
+            # Usage is logged even for an answer the parser then rejects or
+            # reports as truncated: those are exactly the requests whose real
+            # token counts calibrate the chunk budget.
+            _log_usage(route, result)
             return _parse_response(result, route.style)
         except (LLMTransientError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if attempt >= MAX_TRANSIENT_RETRIES:
