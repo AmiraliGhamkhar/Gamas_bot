@@ -753,12 +753,33 @@ class GamasBot:
         outline = slides_outline(content.slides)
         skipped: list[str] = []
         prepared = await prepare_audio(content, workdir, self.settings, skipped_out=skipped)
+        # Legacy .ppt conversion can drop embedded media (ppt2pptx warns
+        # MEDIA_ACTION_OMITTED). If the deck converted but has no audio clips,
+        # surface that as a skip reason so the user understands why narration
+        # is missing.
+        if (
+            job.meta.get("presentation_kind") == "legacy"
+            and not content.clips
+            and outline.strip()
+        ):
+            # Only add the generic note when we have no other explanation.
+            if not skipped:
+                skipped.append(
+                    "برخی رسانه‌های قالب قدیمی در تبدیل به pptx حذف شدند (MEDIA_ACTION_OMITTED)؛ "
+                    "برای حفظ صدا، فایل را با PowerPoint جدید به‌صورت pptx ذخیره و دوباره بفرستید."
+                )
 
         raw_text_parts: list[str] = []
         if outline.strip():
             raw_text_parts.append("متن اسلایدها:\n\n" + outline.strip())
         document = None
+        raw_engine: str | None = None
+        duration: float | None = None
         if prepared is not None:
+            # Guard the merged artifact against the global file-size ceiling,
+            # mirroring the media pipeline's check after extraction.
+            if prepared.path.stat().st_size > self.settings.max_file_size:
+                raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
             info = await probe_media(prepared.path, self.settings)
             duration = info.duration or prepared.total_duration
             needed = self._reserve_estimate(duration)
@@ -771,9 +792,13 @@ class GamasBot:
             except BaseException:
                 await self._release(job, "transcription failed")
                 raise
+            raw_engine = raw.engine
             document = build_document(raw)
             raw_text_parts.append("متن پیاده‌سازی‌شدهٔ صدای ارائه:\n\n" + document.plain())
-            await self._settle(job, duration)
+            # Record measured duration early, like the media pipeline does.
+            await self.db.set_submission_status(
+                job.submission_id, "processing", duration_seconds=duration
+            )
         elif not outline.strip():
             raise ValueError("در این ارائه نه متن اسلایدی پیدا شد و نه صدای ضبط‌شده.")
 
@@ -781,21 +806,40 @@ class GamasBot:
         meta = DocumentMeta(reference=reference, source_name=job.filename, created_at=datetime.now())
 
         # ---- PROGRESSIVE DELIVERY ----
+        # The raw text is persisted and delivered before the credit is settled,
+        # exactly like the media pipeline: a delivery failure must not leave a
+        # billed job without its transcript in the user's chat.
         await progress.update(70, "📝 متن خام را می‌فرستم")
         raw_text = "\n\n\n".join(part for part in raw_text_parts if part.strip())
+        # Include skip reasons when any clip was dropped, so the user knows
+        # why a narration file did not make it into the transcript.
+        if skipped:
+            raw_text += "\n\n---\nنکته: برخی فایل‌های رسانه‌ای نادیده گرفته شدند:\n" + "\n".join(f"• {reason}" for reason in skipped)
         await self.db.save_transcription(
-            job.submission_id, engine="stt", text=raw_text, notes_json=""
+            job.submission_id,
+            engine=raw_engine or ("slides" if document is None else "stt"),
+            text=raw_text,
+            notes_json="",
         )
         raw_path = workdir / raw_text_filename(reference)
         raw_path.write_text(raw_text, encoding="utf-8", newline="\n")
         await self._deliver_raw(job, raw_text, raw_path, reference)
         await self._send_preview(job, raw_text)
 
+        # Settle only after the transcript has actually reached the user.
+        if prepared is not None and duration is not None:
+            await self._settle(job, duration)
+        elif prepared is not None:
+            # Duration unknown: settle with the best estimate we have.
+            await self._settle(job, prepared.total_duration)
+
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
         transcript_text = document.llm_document() if document is not None else ""
         notes = await self._generate_presentation_notes(outline, transcript_text, job, progress)
         await self.db.save_transcription(
-            job.submission_id, engine="stt", text=raw_text,
+            job.submission_id,
+            engine=raw_engine or ("slides" if document is None else "stt"),
+            text=raw_text,
             notes_json=notes.to_json() if notes else "",
         )
         await self._deliver_booklet(job, workdir, notes, document, reference, meta, progress,
