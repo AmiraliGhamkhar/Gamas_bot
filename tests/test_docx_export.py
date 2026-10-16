@@ -8,8 +8,22 @@ import unittest
 import zipfile
 from datetime import datetime
 
+from lxml import etree
+
 from gamas_bot.docx_export import (
+    ACCENT_HEX,
+    ACCENT_SOFT_HEX,
+    CALLOUT_BORDERS,
+    CALLOUT_SHADES,
     DocumentMeta,
+    FORMULA_SHADE,
+    HEADING_COLORS,
+    KEYPOINT_BORDER,
+    KEYPOINT_SHADE,
+    SUMMARY_BORDER,
+    SUMMARY_SHADE,
+    TABLE_BORDER_COLOR,
+    ZEBRA_SHADE,
     build_notes_docx,
     build_plain_docx,
     gregorian_to_jalali,
@@ -22,6 +36,23 @@ from gamas_bot.docx_export import (
 )
 from gamas_bot.notes import StructuredNotes
 from tests.support import docx_text, sample_notes_json
+
+#: Shorthand for the wordprocessingml namespace used by the raw-XML assertions.
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+
+
+def document_root(data: bytes):
+    """Parsed ``word/document.xml`` of a built booklet."""
+    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+        return etree.fromstring(archive.read("word/document.xml"))
+
+
+def paragraph_text(paragraph) -> str:
+    return "".join(node.text or "" for node in paragraph.iter(f"{W}t"))
+
+
+def has_persian(text: str) -> bool:
+    return any("\u0600" <= char <= "\u06ff" for char in text)
 
 META = DocumentMeta(
     reference="GMS-000123",
@@ -190,6 +221,202 @@ class PlainDocxTests(unittest.TestCase):
                     footer += archive.read(name).decode("utf-8")
         self.assertIn('<w:bidi w:val="1"/>', doc_xml)
         self.assertIn("PAGE", footer)
+
+
+PALETTE_NOTES_JSON = (
+    '{"title": "درس رنگ‌ها و جدول‌ها", "summary": "خلاصهٔ درس با یک اصطلاح English.", '
+    '"sections": [{'
+    '"heading": "جدول‌ها", '
+    '"paragraphs": ["توضیح مختصر دربارهٔ Metformin و دوز آن."], '
+    '"formulas": ["eGFR = 175 × (Scr)^-1.154"], '
+    '"key_points": ["نکتهٔ کلیدی اول", "نکتهٔ کلیدی دوم"], '
+    '"table": {"headers": ["دارو", "دوز روزانه"], "rows": ['
+    '["Metformin", "دوز 500 mg روزانه"], ["Insulin", "10 units nightly"], '
+    '["Aspirin", "۸۰ میلی‌گرم"]]}, '
+    '"callouts": [{"kind": "هشدار", "text": "در AKI قطع شود"}, '
+    '{"kind": "یادآوری", "text": "پایش HbA1c"}, {"kind": "نکته", "text": "مصرف با غذا"}]'
+    "}], "
+    '"glossary": [{"term": "HbA1c", "definition": "هموگلوبین گلیکوزیله"}, '
+    '{"term": "AKI", "definition": "آسیب حاد کلیه"}, {"term": "CKD", "definition": "بیماری مزمن کلیه"}]}'
+)
+
+TOC_NOTES_JSON = (
+    '{"title": "درس بلند", "summary": "خلاصه.", "sections": ['
+    + ",".join(
+        '{"heading": "بخش %d", "paragraphs": ["%s"]}'
+        % (index, "پاراگراف بلند فارسی برای عبور از آستانهٔ فهرست مطالب. " * 4)
+        for index in range(1, 5)
+    )
+    + "]}"
+)
+
+
+class RtlAlignmentContractTests(unittest.TestCase):
+    """Every paragraph of the deliverable is explicitly right- or centre-aligned.
+
+    The booklet's contract is that no paragraph — body text, table cell,
+    structural spacer, TOC row or the sectPr-bearing break paragraph — relies
+    on a reader default for its alignment, and every paragraph containing
+    Persian declares its right-to-left base direction (``w:bidi``).
+    """
+
+    def assert_alignment_contract(self, data: bytes) -> None:
+        root = document_root(data)
+        unaligned = []
+        bad_bidi = []
+        paragraphs = 0
+        for paragraph in root.iter(f"{W}p"):
+            paragraphs += 1
+            properties = paragraph.find(f"{W}pPr")
+            jc = properties.find(f"{W}jc") if properties is not None else None
+            if jc is None or jc.get(f"{W}val") not in {"right", "center"}:
+                unaligned.append(paragraph_text(paragraph)[:40])
+            if has_persian(paragraph_text(paragraph)):
+                bidi = properties.find(f"{W}bidi") if properties is not None else None
+                if bidi is None or bidi.get(f"{W}val", "1") != "1":
+                    bad_bidi.append(paragraph_text(paragraph)[:40])
+        self.assertEqual(unaligned, [])
+        self.assertEqual(bad_bidi, [])
+        self.assertGreater(paragraphs, 20)
+
+    def test_notes_booklet_satisfies_the_contract(self):
+        notes = StructuredNotes.from_payload(json.loads(PALETTE_NOTES_JSON))
+        self.assert_alignment_contract(build_notes_docx(notes, meta=META))
+
+    def test_booklet_with_toc_satisfies_the_contract(self):
+        # The TOC page adds linked rows in a borderless table plus cleared
+        # page-number cells; they obey the same contract.
+        notes = StructuredNotes.from_payload(json.loads(TOC_NOTES_JSON))
+        data = build_notes_docx(notes, meta=META)
+        self.assertIn("فهرست مطالب", docx_text(data))  # the TOC page really was built
+        self.assert_alignment_contract(data)
+
+    def test_plain_docx_satisfies_the_contract(self):
+        body = "# عنوان\n\nمتن ساده با یک واژهٔ English در میان جمله.\n\n- مورد"
+        self.assert_alignment_contract(build_plain_docx("جزوهٔ خام", body, meta=META))
+
+
+class RtlTableTests(unittest.TestCase):
+    """Tables are right-to-left, right-aligned and readable in mixed scripts."""
+
+    @classmethod
+    def setUpClass(cls):
+        notes = StructuredNotes.from_payload(json.loads(PALETTE_NOTES_JSON))
+        cls.data = build_notes_docx(notes, meta=META)
+        cls.root = document_root(cls.data)
+
+    def test_every_table_is_bidi_visual(self):
+        tables = list(self.root.iter(f"{W}tbl"))
+        self.assertTrue(tables)
+        for table in tables:
+            tbl_pr = table.find(f"{W}tblPr")
+            self.assertIsNotNone(tbl_pr.find(f"{W}bidiVisual"))
+
+    def test_body_cells_are_right_aligned_and_headers_centred(self):
+        for table in self.root.iter(f"{W}tbl"):
+            for row_index, row in enumerate(table.findall(f"{W}tr")):
+                for cell in row.findall(f"{W}tc"):
+                    for paragraph in cell.findall(f"{W}p"):
+                        jc = paragraph.find(f"{W}pPr/{W}jc")
+                        self.assertIsNotNone(jc)
+                        expected = "center" if row_index == 0 else "right"
+                        self.assertEqual(jc.get(f"{W}val"), expected)
+
+    def test_mixed_script_cells_split_into_direction_runs(self):
+        import docx as docx_library
+
+        document = docx_library.Document(io.BytesIO(self.data))
+        mixed_cells = 0
+        for table in document.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    for paragraph in cell.paragraphs:
+                        text = paragraph.text
+                        if not (has_persian(text) and any(ch.isascii() and ch.isalpha() for ch in text)):
+                            continue
+                        mixed_cells += 1
+                        directions = {
+                            run.font.rtl for run in paragraph.runs if run.text.strip()
+                        }
+                        self.assertIn(True, directions)   # Persian run is RTL
+                        self.assertIn(False, directions)  # Latin run is explicitly LTR
+        self.assertGreaterEqual(mixed_cells, 1)
+
+
+class BookletPaletteTests(unittest.TestCase):
+    """The palette is one harmonised family with visible frames on every box."""
+
+    @classmethod
+    def setUpClass(cls):
+        notes = StructuredNotes.from_payload(json.loads(PALETTE_NOTES_JSON))
+        cls.data = build_notes_docx(notes, meta=META)
+        cls.root = document_root(cls.data)
+        cls.body = etree.tostring(cls.root).decode()
+
+    def test_every_shaded_box_is_framed_with_a_deeper_tone(self):
+        # A box framed with its own fill colour is invisible; every pBdr next
+        # to a shading must use a different (deeper) tone of the same family.
+        framed = 0
+        for borders in self.root.iter(f"{W}pBdr"):
+            properties = borders.getparent()
+            shading = properties.find(f"{W}shd")
+            if shading is None:
+                continue
+            fill = shading.get(f"{W}fill")
+            colors = {edge.get(f"{W}color") for edge in borders}
+            self.assertNotIn(fill, colors)
+            framed += 1
+        self.assertGreaterEqual(framed, 4)  # summary, key points, 3 callouts, quote
+
+    def test_callout_kinds_have_distinct_fills_and_borders(self):
+        for kind, fill in CALLOUT_SHADES.items():
+            self.assertIn(fill, self.body)
+            self.assertNotEqual(CALLOUT_BORDERS[kind], fill)
+        fills = set(CALLOUT_SHADES.values())
+        self.assertEqual(len(fills), 3)  # «نکته» no longer shares «یادآوری»'s tint
+
+    def test_palette_tints_are_present(self):
+        for color in (
+            ACCENT_HEX, ACCENT_SOFT_HEX, SUMMARY_SHADE, SUMMARY_BORDER,
+            KEYPOINT_SHADE, KEYPOINT_BORDER, FORMULA_SHADE, ZEBRA_SHADE,
+            TABLE_BORDER_COLOR,
+        ):
+            self.assertIn(color, self.body)
+
+    def test_heading_hierarchy_uses_two_accent_steps(self):
+        self.assertNotEqual(HEADING_COLORS[1], HEADING_COLORS[2])
+        self.assertNotEqual(HEADING_COLORS[1], HEADING_COLORS[3])
+
+    def test_content_tables_have_soft_borders_and_zebra_rows(self):
+        striped_cells = 0
+        for table in self.root.iter(f"{W}tbl"):
+            borders = table.find(f"{W}tblPr/{W}tblBorders")
+            if borders is None:
+                continue
+            for edge in borders:
+                if edge.get(f"{W}val") == "nil":
+                    continue  # the borderless TOC layout table
+                # Content tables never draw black grid lines any more.
+                self.assertEqual(edge.get(f"{W}color"), TABLE_BORDER_COLOR)
+            for shading in table.iter(f"{W}shd"):
+                if shading.get(f"{W}fill") == ZEBRA_SHADE:
+                    striped_cells += 1
+        # 3-row content table + 3-entry glossary -> one striped 2-cell row each.
+        self.assertEqual(striped_cells, 4)
+
+    def test_header_row_is_accent_filled_and_vertically_centred(self):
+        centred = 0
+        for table in self.root.iter(f"{W}tbl"):
+            rows = table.findall(f"{W}tr")
+            if not rows:
+                continue
+            for cell in rows[0].findall(f"{W}tc"):
+                tc_pr = cell.find(f"{W}tcPr")
+                shading = tc_pr.find(f"{W}shd") if tc_pr is not None else None
+                if shading is not None and shading.get(f"{W}fill") == ACCENT_HEX:
+                    self.assertIsNotNone(tc_pr.find(f"{W}vAlign"))
+                    centred += 1
+        self.assertEqual(centred, 4)  # 2 content-table + 2 glossary header cells
 
 
 if __name__ == "__main__":

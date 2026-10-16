@@ -31,6 +31,12 @@ Layout rules that matter and are implemented here:
 * **Fonts are referenced, never embedded.** ``word/fontTable.xml`` advertises
   the configured fallback through ``w:altName`` so a reader without the
   Persian face substitutes gracefully.
+* **The palette is one family, and every box owns a visible frame.** Deep
+  navy carries the identity (title, ``Heading 1``, table headers), steel blue
+  the secondary accents (``Heading 2``/``3``, the running-header rule), and
+  each block type (summary, key points, definitions, callouts, formulas,
+  zebra table rows) is a light tint *plus a deeper border tone of the same
+  hue* — a box framed with its own fill colour has no visible frame.
 
 A plain ``build_plain_docx`` path keeps the same polished look when the note
 API was unavailable and only raw material could be delivered.
@@ -49,6 +55,7 @@ from datetime import datetime
 from docx import Document
 from docx.enum.section import WD_SECTION
 from docx.enum.style import WD_STYLE_TYPE
+from docx.enum.table import WD_ALIGN_VERTICAL
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -73,18 +80,49 @@ logger = logging.getLogger(__name__)
 #: bookmarks from 1.
 _BOOKMARK_COUNTER_ATTRIBUTE = "_gamas_bookmark_ids"
 
-ACCENT = RGBColor(0x1F, 0x38, 0x64)
-ACCENT_HEX = "1F3864"
-MUTED = RGBColor(0x59, 0x59, 0x59)
+#: ---------------------------------------------------------------------------
+#: Booklet palette. One navy identity (deep navy for the primary accent, steel
+#: blue for secondary accents) plus a tint family per block type. Every shaded
+#: block also owns a *border tone* — a visibly deeper step of the same tint —
+#: because a box framed with its own fill colour has no frame at all: the
+#: border disappears and the block reads as a flat stain on the page.
+#: ---------------------------------------------------------------------------
+#: Deep navy: document title, Heading 1, brand mark, table header fill.
+ACCENT = RGBColor(0x1D, 0x35, 0x57)
+ACCENT_HEX = "1D3557"
+#: Steel blue: Heading 2/3, the running-header rule — hierarchy without
+#: introducing a second, unrelated hue.
+ACCENT_SOFT = RGBColor(0x45, 0x7B, 0x9D)
+ACCENT_SOFT_HEX = "457B9D"
+#: Cool slate grey: metadata, footers, subtitles, secondary terms.
+MUTED = RGBColor(0x5C, 0x6B, 0x7A)
 #: Text on the accent-filled (dark) table header cells.
 ON_ACCENT = RGBColor(0xFF, 0xFF, 0xFF)
-RULE_FILL = "D6DEEB"
-SUMMARY_SHADE = "EEF3FA"
-KEYPOINT_SHADE = "E7F3E8"
-DEFINITION_SHADE = "F5F0FA"
-QUOTE_SHADE = "F7F4EC"
-CALLOUT_SHADES = {"هشدار": "FDE7E9", "یادآوری": "FFF6E0"}
+#: Decorative hairline rules (cover, section separators).
+RULE_FILL = "B9CFDD"
+SUMMARY_SHADE = "EEF4F8"
+SUMMARY_BORDER = "C7D9E5"
+KEYPOINT_SHADE = "EAF3EC"
+KEYPOINT_BORDER = "C0DCC6"
+#: Definitions and formulas are flat tinted panels, not framed boxes — only
+#: the blocks that read as a box (summary, key points, callouts, the cover
+#: quote) own a border tone.
+DEFINITION_SHADE = "F1EEF7"
+QUOTE_SHADE = "FAF6EC"
+QUOTE_BORDER = "E2D6BB"
+FORMULA_SHADE = "F1F3F6"
+#: Alternating body-row fill in content tables (kept cooler than every callout
+#: tint so stripes never compete with the boxes around them).
+ZEBRA_SHADE = "F4F8FA"
+#: Content-table grid lines: a soft blue-grey instead of Table Grid's black.
+TABLE_BORDER_COLOR = "C7D3DE"
+#: Callout families: fill + the deeper border tone of the same hue. «نکته»
+#: gets its own informational blue tint instead of sharing «یادآوری»'s amber.
+CALLOUT_SHADES = {"هشدار": "FBEAEC", "یادآوری": "FDF3E0", "نکته": "EAF2F5"}
+CALLOUT_BORDERS = {"هشدار": "EABFC7", "یادآوری": "ECD6A6", "نکته": "C3D9E2"}
 CALLOUT_EMOJI = {"هشدار": "⚠️", "یادآوری": "🔔"}
+#: Heading colour by level: navy for section headings, steel blue below.
+HEADING_COLORS = {1: ACCENT, 2: ACCENT_SOFT, 3: ACCENT_SOFT}
 DEFAULT_FONT = "Tahoma"
 
 #: The exact cover quotation. It is quoted verbatim and must never be
@@ -98,7 +136,7 @@ BRAND_SUBTITLE = "Gamas Bot"
 
 #: Default page-border look: a thin, elegant line 24 pt inside the page edge,
 #: which clears the 2.2 cm text margin and the footer.
-DEFAULT_BORDER_COLOR = "BFCEE4"
+DEFAULT_BORDER_COLOR = "C2CEDC"
 DEFAULT_BORDER_SIZE = 8  # eighths of a point -> 1 pt
 DEFAULT_BORDER_SPACE = 24  # points from the page edge (0-31)
 #: The complete ECMA-376 ``ST_Border`` line-style enumeration (the "border
@@ -1134,7 +1172,9 @@ def _add_document_header(section, *, fonts: DocumentFonts, title: str) -> None:
     bottom.set(qn("w:val"), "single")
     bottom.set(qn("w:sz"), "4")
     bottom.set(qn("w:space"), "2")
-    bottom.set(qn("w:color"), ACCENT_HEX)
+    # The steel-blue secondary accent: a hairline under a running header
+    # should whisper, not shout in the same navy as every Heading 1.
+    bottom.set(qn("w:color"), ACCENT_SOFT_HEX)
     borders.append(bottom)
     _insert_ppr_child(p_pr, borders, ("w:shd",) + PPR_SUCCESSORS)
 
@@ -1308,16 +1348,16 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
     # Real heading styles power Word's Navigation Pane and outline, and provide
     # the actual bookmarks used to build the application's static TOC.
     heading_specs = (
-        (HEADING_STYLES[1], fonts.heading, HEADING_SIZES[1], 14, 6),
-        (HEADING_STYLES[2], fonts.heading, HEADING_SIZES[2], 10, 4),
-        (HEADING_STYLES[3], fonts.heading, HEADING_SIZES[3], 8, 3),
+        (HEADING_STYLES[1], fonts.heading, HEADING_SIZES[1], 14, 6, HEADING_COLORS[1]),
+        (HEADING_STYLES[2], fonts.heading, HEADING_SIZES[2], 10, 4, HEADING_COLORS[2]),
+        (HEADING_STYLES[3], fonts.heading, HEADING_SIZES[3], 8, 3, HEADING_COLORS[3]),
     )
-    for name, face, size, before, after in heading_specs:
+    for name, face, size, before, after, heading_color in heading_specs:
         style = document.styles[name]
         style.font.name = fonts.latin
         style.font.size = Pt(size)
         style.font.bold = True
-        style.font.color.rgb = ACCENT
+        style.font.color.rgb = heading_color
         _style_complex_face(style, DocumentFonts(face, face, fonts.latin, fonts.fallback), size=size)
         _style_direction(style)
         _set_style_alignment(style)
@@ -1590,6 +1630,11 @@ def _add_body_section(document, *, design: DocxDesign):
     if p_pr is not None and p_pr.find(qn("w:sectPr")) is not None:
         _enable_bidi(document.paragraphs[-1], rtl=True)
         _set_paragraph_mark_direction(document.paragraphs[-1], rtl=True)
+        # The sectPr-bearing paragraph is empty but has a visible height at the
+        # foot of the previous section's last page; it carries the right
+        # alignment like every other paragraph, so the contract "every
+        # paragraph in this file is explicitly right- or centre-aligned" holds.
+        document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.RIGHT
     return section
 
 
@@ -1680,7 +1725,7 @@ def _add_cover_page(
         quote_paragraph, f"«{COVER_QUOTE}»", fonts=fonts, size=12, bold=False, color=ACCENT,
     )
     _shade_paragraph(quote_paragraph, QUOTE_SHADE)
-    _paragraph_borders(quote_paragraph, RULE_FILL, size="4")
+    _paragraph_borders(quote_paragraph, QUOTE_BORDER, size="4")
 
 
 def _add_body_title_block(
@@ -2107,7 +2152,7 @@ def _add_heading(
         fonts=heading_fonts,
         size=resolved_size,
         bold=True,
-        color=ACCENT,
+        color=HEADING_COLORS.get(level, ACCENT),
         align=WD_ALIGN_PARAGRAPH.RIGHT,
         space_after=(HEADING_SPACING[level][1] if space_after is None else space_after),
         space_before=(HEADING_SPACING[level][0] if space_before is None else space_before),
@@ -2125,6 +2170,7 @@ def _add_boxed_lines(
     *,
     fonts: DocumentFonts,
     fill: str,
+    border: str | None = None,
     marker: str = "✦",
     level: int = 2,
     style: str = NOTE_STYLE,
@@ -2135,10 +2181,12 @@ def _add_boxed_lines(
     the bottom edge, and every line draws the sides, so the block reads as one
     panel instead of a stack of separately framed rows. Only the first line is
     kept with the next one, so a box never leaves its label behind at the foot
-    of a page.
+    of a page. ``border`` is the frame tone — a visibly deeper step of the
+    fill; a box framed with its own fill has no visible frame at all.
     """
     if label:
         _add_heading(document, label, fonts=fonts, level=level, space_before=8, space_after=3)
+    frame = border or fill
     for index, line in enumerate(lines):
         paragraph = _add_rtl_paragraph(
             document,
@@ -2156,7 +2204,7 @@ def _add_boxed_lines(
             edges.insert(0, "top")
         if index == len(lines) - 1:
             edges.append("bottom")
-        _paragraph_border_edges(paragraph, fill, edges=tuple(edges))
+        _paragraph_border_edges(paragraph, frame, edges=tuple(edges))
         _keep_lines(paragraph)
 
 
@@ -2245,6 +2293,18 @@ def _make_table_layout_fixed(table, total_cm: float) -> None:
         )
 
 
+#: Children that must follow ``w:shd`` inside ``w:tcPr`` (CT_TcPr order).
+#: python-docx inserts ``w:vAlign``/``w:tcW`` through its own ordered setters,
+#: but a raw append of ``w:shd`` after a vertically-centred cell would put the
+#: shading past ``w:vAlign`` — an out-of-sequence ``w:tcPr`` Word reports as
+#: needing repair.
+TCPR_AFTER_SHD = (
+    "w:noWrap", "w:tcMar", "w:textDirection", "w:tcFitText", "w:vAlign",
+    "w:hideMark", "w:headers", "w:cellIns", "w:cellDel", "w:cellMerge",
+    "w:tcPrChange",
+)
+
+
 def _shade_cell(cell, fill: str) -> None:
     tc_pr = cell._tc.get_or_add_tcPr()
     for found in tc_pr.findall(qn("w:shd")):
@@ -2252,18 +2312,85 @@ def _shade_cell(cell, fill: str) -> None:
     shd = OxmlElement("w:shd")
     shd.set(qn("w:val"), "clear")
     shd.set(qn("w:fill"), fill)
-    tc_pr.append(shd)
+    _insert_ppr_child(tc_pr, shd, TCPR_AFTER_SHD)
+
+
+def _set_table_borders(table, color: str, *, size: str = "4") -> None:
+    """Replace the table style's borders with the palette's soft grid lines.
+
+    ``Table Grid`` draws black rules, which read heavy against the booklet's
+    tinted panels. A table-level ``w:tblBorders`` overrides the style's edges
+    (outside and inside alike) without giving up the rest of the style look.
+    In an RTL (``w:bidiVisual``) table the left/right edges mirror visually;
+    a uniform grid makes that moot.
+    """
+    tbl_pr = table._tbl.tblPr
+    for found in tbl_pr.findall(qn("w:tblBorders")):
+        tbl_pr.remove(found)
+    borders = OxmlElement("w:tblBorders")
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        edge = OxmlElement(f"w:{side}")
+        edge.set(qn("w:val"), "single")
+        edge.set(qn("w:sz"), size)
+        edge.set(qn("w:space"), "0")
+        edge.set(qn("w:color"), color)
+        borders.append(edge)
+    # ``w:tblBorders`` precedes ``w:shd``/``w:tblLayout``/``w:tblCellMar``/``w:tblLook``.
+    _insert_ppr_child(
+        tbl_pr,
+        borders,
+        (
+            "w:shd", "w:tblLayout", "w:tblCellMar", "w:tblLook",
+            "w:tblCaption", "w:tblDescription", "w:tblPrChange",
+        ),
+    )
+
+
+def _set_table_cell_margins(
+    table, *, top: int = 40, bottom: int = 40, left: int = 110, right: int = 110
+) -> None:
+    """Padding between cell text and the grid lines (twentieths of a point).
+
+    The template ships with zero top/bottom padding, so shaded header cells
+    clamp their text against the rules; a small symmetric margin gives every
+    cell breathing room (symmetric because ``w:bidiVisual`` mirrors the
+    left/right pair visually in an RTL table).
+    """
+    tbl_pr = table._tbl.tblPr
+    for found in tbl_pr.findall(qn("w:tblCellMar")):
+        tbl_pr.remove(found)
+    margins = OxmlElement("w:tblCellMar")
+    for side, value in (("top", top), ("left", left), ("bottom", bottom), ("right", right)):
+        edge = OxmlElement(f"w:{side}")
+        edge.set(qn("w:w"), str(value))
+        edge.set(qn("w:type"), "dxa")
+        margins.append(edge)
+    _insert_ppr_child(
+        tbl_pr, margins, ("w:tblLook", "w:tblCaption", "w:tblDescription", "w:tblPrChange")
+    )
+
+
+def _prepare_content_table(table) -> None:
+    """Shared dress for every content table (section tables and glossary).
+
+    RTL column order (first logical column on the right), the palette's soft
+    grid lines instead of the table style's black, and cell padding.
+    """
+    table.style = "Table Grid"
+    _apply_rtl_table_direction(table)
+    _set_table_borders(table, TABLE_BORDER_COLOR)
+    _set_table_cell_margins(table)
 
 
 def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
     headers = table_data.headers
     rows = table_data.rows
     table = document.add_table(rows=len(rows) + 1, cols=len(headers))
-    table.style = "Table Grid"
-    _apply_rtl_table_direction(table)
+    _prepare_content_table(table)
 
     for column, header in enumerate(headers):
         cell = table.cell(0, column)
+        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
         paragraph = _fill_paragraph(
             cell.paragraphs[0],
             header,
@@ -2280,8 +2407,14 @@ def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
     # Keep the column headings visible on every page of a long table.
     _repeat_table_header(table.rows[0])
     for row_index, row in enumerate(rows, start=1):
+        # Zebra striping: every second body row gets the cool tint, so the
+        # eye tracks a wide Persian row across the full content width and the
+        # white rows in between keep the table calm.
+        stripe = ZEBRA_SHADE if row_index % 2 == 0 else ""
         for column, value in enumerate(row):
             cell = table.cell(row_index, column)
+            if stripe:
+                _shade_cell(cell, stripe)
             paragraph = _fill_paragraph(
                 cell.paragraphs[0],
                 value,
@@ -2317,7 +2450,10 @@ def _table_column_widths(columns: int, *, total_cm: float = TABLE_CONTENT_WIDTH_
 
 
 def _add_callout(document, callout, *, fonts: DocumentFonts) -> None:
-    fill = CALLOUT_SHADES.get(callout.kind, "FFF6E0")
+    # «نکته» (and anything unexpected upstream let through) is the informational
+    # default: its own blue tint, never «یادآوری»'s amber.
+    fill = CALLOUT_SHADES.get(callout.kind) or CALLOUT_SHADES["نکته"]
+    frame = CALLOUT_BORDERS.get(callout.kind) or CALLOUT_BORDERS["نکته"]
     emoji = CALLOUT_EMOJI.get(callout.kind, "💡")
     style = CALLOUT_STYLE_BY_KIND.get(callout.kind, NOTE_STYLE)
     paragraph = _add_rtl_paragraph(
@@ -2330,7 +2466,10 @@ def _add_callout(document, callout, *, fonts: DocumentFonts) -> None:
         style=style,
     )
     _shade_paragraph(paragraph, fill)
-    _paragraph_borders(paragraph, fill)
+    # A frame drawn in the fill colour is invisible; the border tone is the
+    # deeper step of the same hue, so the box keeps its shape on screen and
+    # survives a grey-scale print.
+    _paragraph_borders(paragraph, frame)
     # A warning split across a page boundary is exactly the note a reader can
     # lose. Word keeps the whole paragraph together (and ignores the rule when
     # the paragraph is longer than a page, so this can never break the layout).
@@ -2352,7 +2491,8 @@ def _add_definitions(document, section: NoteSection, *, fonts: DocumentFonts) ->
             space_after=2,
         )
         _add_directional_text(
-            term_paragraph, f"◆ {entry.term}", fonts=_heading_fonts(fonts), size=11.5, bold=True, color=ACCENT,
+            term_paragraph, f"◆ {entry.term}", fonts=_heading_fonts(fonts), size=11.5,
+            bold=True, color=HEADING_COLORS[3],
         )
         if entry.term_en:
             _add_directional_text(term_paragraph, f" ({entry.term_en}) ", fonts=fonts, size=10.5, color=MUTED)
@@ -2402,7 +2542,7 @@ def _add_formulas(document, formulas: tuple[str, ...], *, fonts: DocumentFonts) 
             align=WD_ALIGN_PARAGRAPH.CENTER,
             space_after=4,
         )
-        _shade_paragraph(paragraph, "F2F2F2")
+        _shade_paragraph(paragraph, FORMULA_SHADE)
 
 
 def _add_examples(document, examples: tuple[str, ...], *, fonts: DocumentFonts) -> None:
@@ -2467,6 +2607,7 @@ def _add_section(document, index: int, section: NoteSection, *, fonts: DocumentF
             list(section.key_points),
             fonts=fonts,
             fill=KEYPOINT_SHADE,
+            border=KEYPOINT_BORDER,
             level=2,
         )
     for callout in section.callouts:
@@ -2554,7 +2695,7 @@ def build_notes_docx(
         _add_heading(document, "خلاصه", fonts=resolved, level=1, space_before=4)
         paragraph = _add_rtl_paragraph(document, notes.summary, fonts=resolved, size=11.5, space_after=10)
         _shade_paragraph(paragraph, SUMMARY_SHADE)
-        _paragraph_borders(paragraph, SUMMARY_SHADE)
+        _paragraph_borders(paragraph, SUMMARY_BORDER)
 
     for index, section_model in enumerate(notes.sections, start=1):
         _add_section(document, index, section_model, fonts=resolved)
@@ -2563,7 +2704,7 @@ def build_notes_docx(
         _add_heading(document, "نکته‌های کلیدی", fonts=resolved, level=1)
         _add_boxed_lines(
             document, "مهم‌ترین نکته‌های این جزوه", list(notes.key_points),
-            fonts=resolved, fill=KEYPOINT_SHADE, level=2,
+            fonts=resolved, fill=KEYPOINT_SHADE, border=KEYPOINT_BORDER, level=2,
         )
 
     if notes.review_questions:
@@ -2573,12 +2714,12 @@ def build_notes_docx(
     if notes.glossary:
         _add_heading(document, "واژه‌نامه", fonts=resolved, level=1)
         glossary_table = document.add_table(rows=len(notes.glossary) + 1, cols=2)
-        glossary_table.style = "Table Grid"
-        _apply_rtl_table_direction(glossary_table)
+        _prepare_content_table(glossary_table)
         header = glossary_table.rows[0]
         _repeat_table_header(header)
         for column, label in enumerate(("اصطلاح", "توضیح")):
             cell = glossary_table.cell(0, column)
+            cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
             paragraph = _fill_paragraph(
                 cell.paragraphs[0], label, fonts=resolved, size=10.5,
                 bold=True, color=ON_ACCENT,
@@ -2588,12 +2729,17 @@ def build_notes_docx(
             _shade_paragraph(paragraph, ACCENT_HEX)
             _shade_cell(cell, ACCENT_HEX)
         for row_index, entry in enumerate(notes.glossary, start=1):
+            stripe = ZEBRA_SHADE if row_index % 2 == 0 else ""
             term_cell = glossary_table.cell(row_index, 0)
+            if stripe:
+                _shade_cell(term_cell, stripe)
             _fill_paragraph(
                 term_cell.paragraphs[0], entry.term, fonts=resolved, size=10.5,
                 bold=True, align=WD_ALIGN_PARAGRAPH.RIGHT, space_after=0,
             )
             definition_cell = glossary_table.cell(row_index, 1)
+            if stripe:
+                _shade_cell(definition_cell, stripe)
             _fill_paragraph(
                 definition_cell.paragraphs[0], entry.definition, fonts=resolved,
                 size=10.5, align=WD_ALIGN_PARAGRAPH.RIGHT, space_after=0,
