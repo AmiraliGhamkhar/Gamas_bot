@@ -325,6 +325,8 @@ def make_settings(**overrides) -> Settings:
         note_context_tokens=32000,
         note_mode="full",
         note_max_output_tokens=4096,
+        note_circuit_breaker_threshold=3,
+        note_circuit_breaker_cooldown=300.0,
         note_json_mode=False,
         note_chunk_chars=22000,
         note_concurrency=2,

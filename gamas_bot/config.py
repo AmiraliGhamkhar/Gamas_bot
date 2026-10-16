@@ -279,6 +279,8 @@ class Settings:
     note_context_tokens: int
     note_mode: str
     note_max_output_tokens: int
+    note_circuit_breaker_threshold: int
+    note_circuit_breaker_cooldown: float
     note_json_mode: bool
     note_chunk_chars: int
     note_concurrency: int
@@ -667,6 +669,8 @@ def from_env(env_file: str | None = None) -> Settings:
         ),
         note_mode=resolve_note_mode(_env("NOTE_MODE")),
         note_max_output_tokens=_env_int("NOTE_MAX_OUTPUT_TOKENS", 16384, minimum=256),
+        note_circuit_breaker_threshold=_env_int("NOTE_CIRCUIT_BREAKER_THRESHOLD", 3, minimum=1),
+        note_circuit_breaker_cooldown=_env_float("NOTE_CIRCUIT_BREAKER_COOLDOWN", 300.0, minimum=0.0),
         note_json_mode=_env_bool("NOTE_JSON_MODE", False),
         note_chunk_chars=_env_int("NOTE_CHUNK_CHARS", 22000, minimum=2000, maximum=200_000),
         note_concurrency=_env_int("NOTE_CONCURRENCY", 3, minimum=1, maximum=8),

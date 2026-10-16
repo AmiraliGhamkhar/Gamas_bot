@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, replace
 
 import aiohttp
@@ -1372,7 +1373,12 @@ async def structure_document(
         else build_system_prompt(mode)
     )
     semaphore = asyncio.Semaphore(max(1, settings.note_concurrency))
+    started = time.monotonic()
     chunks = split_transcript(document, effective_chunk_chars(settings, system_prompt=base_system))
+    chunking_elapsed = time.monotonic() - started
+    logger.info("note_chunking_complete chunks=%d chunk_chars=%d elapsed_ms=%.0f",
+                len(chunks), effective_chunk_chars(settings, system_prompt=base_system),
+                chunking_elapsed * 1000)
     if not chunks:
         raise StructuringError("متن ورودی خالی بود.")
 
@@ -1414,7 +1420,13 @@ async def structure_document(
     chunk_notes = await asyncio.gather(
         *(map_chunk(index, chunk) for index, chunk in enumerate(chunks, start=1))
     )
+    map_elapsed = time.monotonic() - started
+    logger.info("note_map_complete chunks=%d elapsed_seconds=%.1f",
+                len(chunks), map_elapsed)
     merged = merge_structured_notes(list(chunk_notes))
+    merge_elapsed = time.monotonic() - started - map_elapsed
+    logger.info("note_merge_complete sections=%d elapsed_seconds=%.1f",
+                len(merged.sections), merge_elapsed)
 
     merged_chars = len(json.dumps(compact_notes_payload(merged), ensure_ascii=False))
     if (
@@ -1435,6 +1447,9 @@ async def structure_document(
     except LLMError as exc:
         logger.warning("compile pass failed (%s); delivering deterministic merge", exc)
         return merged
+    compile_elapsed = time.monotonic() - started - map_elapsed - merge_elapsed
+    logger.info("note_compile_complete elapsed_seconds=%.1f sections=%d",
+                compile_elapsed, len(compiled.sections))
     if compile_accepts(compiled, merged):
         return compiled
     return merged

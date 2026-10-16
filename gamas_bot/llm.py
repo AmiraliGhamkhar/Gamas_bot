@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import re
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -44,6 +45,69 @@ LLM_REQUEST_TIMEOUT_SECONDS = 300.0
 
 #: Bounded retries for transient LLM failures (5xx, 429, network).
 MAX_TRANSIENT_RETRIES = 2
+
+#: Circuit breaker: consecutive failures before cooldown.
+CIRCUIT_BREAKER_THRESHOLD = 3
+#: Circuit breaker: cooldown duration in seconds after threshold exceeded.
+CIRCUIT_BREAKER_COOLDOWN = 300.0
+#: Maximum retry-after value to respect (cap to prevent long waits).
+MAX_RETRY_AFTER_SECONDS = 60.0
+
+#: Provider state for circuit breaker (slug -> (consecutive_failures, cooldown_deadline))
+_LLM_PROVIDER_STATE: dict[str, tuple[int, float | None]] = {}
+
+
+def _get_llm_provider_state(slug: str) -> tuple[int, float | None]:
+    """Get (consecutive_failures, cooldown_deadline) for a provider."""
+    return _LLM_PROVIDER_STATE.get(slug, (0, None))
+
+
+def _set_llm_provider_state(slug: str, failures: int, cooldown: float | None) -> None:
+    """Set provider state for circuit breaker."""
+    _LLM_PROVIDER_STATE[slug] = (failures, cooldown)
+
+
+def _should_skip_llm_provider(slug: str) -> bool:
+    """Check if provider should be skipped due to circuit breaker."""
+    failures, cooldown = _get_llm_provider_state(slug)
+    if cooldown is None:
+        return False
+    remaining = cooldown - time.monotonic()
+    if remaining <= 0:
+        # Cooldown expired, reset failures but keep provider eligible
+        _set_llm_provider_state(slug, 0, None)
+        return False
+    logger.info("llm_circuit_breaker_skip provider=%s failures=%d cooldown_remaining_seconds=%.0f",
+                slug, failures, remaining)
+    return True
+
+
+def _record_llm_failure(route: NoteRoute) -> None:
+    """Record a failure for circuit breaker, set cooldown if threshold exceeded."""
+    slug = route.slug
+    failures, _ = _get_llm_provider_state(slug)
+    failures += 1
+    if failures >= CIRCUIT_BREAKER_THRESHOLD:
+        cooldown = time.monotonic() + CIRCUIT_BREAKER_COOLDOWN
+        logger.warning(
+            "llm_circuit_breaker_open provider=%s consecutive_failures=%d cooldown_seconds=%.0f",
+            slug, failures, CIRCUIT_BREAKER_COOLDOWN
+        )
+    else:
+        cooldown = None
+    _set_llm_provider_state(slug, failures, cooldown)
+
+
+def _record_llm_success(route: NoteRoute) -> None:
+    """Record success, reset failure count."""
+    slug = route.slug
+    _set_llm_provider_state(slug, 0, None)
+
+
+def reset_llm_circuit_breaker() -> None:
+    """Test hook: clear all provider circuit breaker state."""
+    _LLM_PROVIDER_STATE.clear()
+
 
 #: Authentication header names a caller may never override.
 RESERVED_HEADER_NAMES = frozenset(
@@ -396,6 +460,38 @@ def _parse_response(payload: dict, provider: str) -> str:
     return text
 
 
+def _extract_token_usage(payload: dict, provider: str) -> dict:
+    """Extract token usage from provider response.
+
+    Returns dict with prompt_tokens, completion_tokens, total_tokens (all default to 0).
+    """
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+    try:
+        if provider == "gemini":
+            # Gemini uses usageMetadata
+            meta = payload.get("usageMetadata", {})
+            usage["prompt_tokens"] = meta.get("promptTokenCount", 0)
+            usage["completion_tokens"] = meta.get("candidatesTokenCount", 0)
+            usage["total_tokens"] = meta.get("totalTokenCount", 0)
+        elif provider == "anthropic":
+            # Anthropic uses usage_metadata
+            meta = payload.get("usage_metadata", {})
+            usage["prompt_tokens"] = meta.get("input_tokens", 0)
+            usage["completion_tokens"] = meta.get("output_tokens", 0)
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        else:
+            # OpenAI-compatible (NaraRouter, OpenRouter, etc.)
+            u = payload.get("usage", {})
+            usage["prompt_tokens"] = u.get("prompt_tokens", 0)
+            usage["completion_tokens"] = u.get("completion_tokens", 0)
+            usage["total_tokens"] = u.get("total_tokens", 0)
+    except (KeyError, TypeError, AttributeError):
+        pass
+
+    return usage
+
+
 async def _complete_on_route(
     route: NoteRoute,
     session: aiohttp.ClientSession,
@@ -408,6 +504,7 @@ async def _complete_on_route(
     url, headers, payload = _build_request_for(route, settings, system, user)
     attempt = 0
     while True:
+        request_started = time.monotonic()
         try:
             async with session.post(
                 url,
@@ -415,6 +512,7 @@ async def _complete_on_route(
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=LLM_REQUEST_TIMEOUT_SECONDS),
             ) as response:
+                elapsed_ms = (time.monotonic() - request_started) * 1000
                 if response.status != 200:
                     raise await _error_from_response(
                         route.label, response, route.api_key or None
@@ -427,8 +525,19 @@ async def _complete_on_route(
                     ) from exc
             if not isinstance(result, dict):
                 raise LLMResponseError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
+
+            # Log timing and token usage for successful requests
+            usage = _extract_token_usage(result, route.style)
+            logger.info(
+                "llm_request_complete provider=%s model=%s attempt=%d status=%d elapsed_ms=%.0f "
+                "prompt_tokens=%d completion_tokens=%d total_tokens=%d",
+                route.slug, route.model, attempt + 1, 200, elapsed_ms,
+                usage["prompt_tokens"], usage["completion_tokens"], usage["total_tokens"],
+            )
+
             return _parse_response(result, route.style)
         except (LLMTransientError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            elapsed_ms = (time.monotonic() - request_started) * 1000
             if attempt >= MAX_TRANSIENT_RETRIES:
                 if isinstance(exc, LLMTransientError):
                     raise
@@ -439,11 +548,18 @@ async def _complete_on_route(
             retry_after = (
                 exc.retry_after_seconds if isinstance(exc, LLMTransientError) else None
             )
-            delay = retry_after if retry_after is not None else min(2.0**attempt, 15.0)
+            if retry_after is not None:
+                delay = min(retry_after, MAX_RETRY_AFTER_SECONDS)
+                logger.info(
+                    "llm_retry_after provider=%s retry_after_seconds=%.1f delay_seconds=%.1f",
+                    route.slug, retry_after, delay
+                )
+            else:
+                delay = min(2.0**attempt, 15.0)
             logger.warning(
-                "LLM transient failure provider=%s (attempt %d/%d; %s); retrying in %.1fs",
+                "LLM transient failure provider=%s (attempt %d/%d; %s); retrying in %.1fs elapsed_ms=%.0f",
                 route.slug, attempt, MAX_TRANSIENT_RETRIES + 1,
-                type(exc).__name__, delay,
+                type(exc).__name__, delay, elapsed_ms,
             )
             await asyncio.sleep(delay)
 

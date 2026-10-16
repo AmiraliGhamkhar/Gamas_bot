@@ -774,8 +774,16 @@ class GamasBot:
             document = build_document(raw)
             raw_text_parts.append("متن پیاده‌سازی‌شدهٔ صدای ارائه:\n\n" + document.plain())
             await self._settle(job, duration)
-        elif not outline.strip():
-            raise ValueError("در این ارائه نه متن اسلایدی پیدا شد و نه صدای ضبط‌شده.")
+        else:
+            # Audio extraction failed or returned no usable clips
+            if skipped:
+                logger.info("presentation_audio_skipped reasons=%s", skipped)
+            if not outline.strip():
+                raise ValueError("در این ارائه نه متن اسلایدی پیدا شد و نه صدای ضبط‌شده.")
+            # Warn user that audio was skipped but slides are available
+            if skipped:
+                reason_text = "\n".join(f"• {s}" for s in skipped[:5])
+                await self._reply(job, f"⚠️ صدای ارائه قابل پردازش نبود:\n{reason_text}")
 
         reference = f"GMS-{job.submission_id}"
         meta = DocumentMeta(reference=reference, source_name=job.filename, created_at=datetime.now())
