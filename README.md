@@ -103,7 +103,8 @@ All configurable; defaults shown.
 | One STT job | `STT_JOB_TIMEOUT` | 21600 s |
 | Clips per deck | `PRESENTATION_MAX_CLIPS` | 300 |
 | Unpacked deck size | `PRESENTATION_MAX_UNPACKED_BYTES` | 4 GB |
-| Note request window | `NOTE_CONTEXT_TOKENS` | 32000 tokens |
+| Note request window | `NOTE_CONTEXT_TOKENS` | 131072 tokens |
+| Note chunk ceiling | `NOTE_CHUNK_CHARS` | 64000 chars |
 | Note answer budget | `NOTE_MAX_OUTPUT_TOKENS` | 16384 tokens |
 | Receipt image | `MAX_PAYMENT_RECEIPT_BYTES` | 5 MB, kept 90 days |
 
