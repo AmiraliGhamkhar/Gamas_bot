@@ -19,12 +19,13 @@ Generation stage (opt-in, consumes provider quota)::
 
     python -m scripts.probe_note_providers --generate lecture.txt
 
-    Runs the bot's real ``structure_transcript`` once per eligible route
-    (each restricted to that single provider) over the given transcript text
-    and reports per-route success, elapsed time and section count, so the
-    chunk/output settings can be validated before they are rolled out. Use a
-    real, anonymised lecture transcript; expect one map request per chunk
-    plus at most one compile request per route.
+    Sends one real map-style note request per eligible route — the bot's own
+    system prompt plus the first chunk-sized excerpt of the given transcript,
+    built and parsed with the bot's own request/JSON code — and reports
+    per-route success, elapsed time and section count, so the chunk/output
+    settings can be validated before they are rolled out. Use a real,
+    anonymised lecture transcript; expect exactly one generation request per
+    route (plus the pipeline's bounded retries, if any).
 
 Exit code is 1 when any check or generation probe fails.
 """
@@ -38,13 +39,12 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from gamas_bot.config import Settings, from_env, note_routes  # noqa: E402
+from gamas_bot.config import from_env, note_routes  # noqa: E402
 
 
 def _get_json(url: str, api_key: str, timeout: float = 30.0) -> tuple[int, object]:
@@ -69,7 +69,7 @@ def _get_json(url: str, api_key: str, timeout: float = 30.0) -> tuple[int, objec
         return status, body[:400]
 
 
-def _check_nara(settings: Settings, route) -> bool:
+def _check_nara(route) -> bool:
     """NaraRouter: the configured model must be entitled on this key's plan."""
     status, payload = _get_json(f"{route.base_url}/models", route.api_key)
     if status != 200 or not isinstance(payload, dict):
@@ -99,7 +99,7 @@ def _check_nara(settings: Settings, route) -> bool:
     return entitled
 
 
-def _check_openrouter(settings: Settings, route) -> bool:
+def _check_openrouter(route) -> bool:
     """OpenRouter: endpoint caps for the pinned model + the free-tier counter."""
     ok = True
     status, payload = _get_json(
@@ -139,38 +139,40 @@ def _check_openrouter(settings: Settings, route) -> bool:
     return ok
 
 
-def _single_route_settings(settings: Settings, slug: str) -> Settings:
-    """Settings whose eligible chain is exactly ``slug`` (its own key only)."""
-    return replace(
-        settings,
-        note_providers=(slug,),
-        note_provider="",
-        note_api_key="",
-        note_api_base_url="",
-        gemini_api_key="",
-    )
+async def _generate(route, settings, text: str) -> bool:
+    """One map-style note request against exactly ``route``.
 
-
-async def _generate(route, settings: Settings, text: str) -> bool:
+    The request is built, sent and parsed with the bot's own LLM code for
+    that single route (no failover, no Settings surgery), so a pass proves
+    the route's model accepts the real prompt shape and answers with valid,
+    schema-conforming Persian notes JSON.
+    """
     import aiohttp
 
-    from gamas_bot.notes import structure_transcript
+    from gamas_bot.llm import _complete_on_route, _parse_json_object
+    from gamas_bot.notes import (
+        TRANSCRIPT_PROMPT,
+        _load_json_payload,
+        build_system_prompt,
+        effective_chunk_chars,
+    )
 
-    scoped = _single_route_settings(settings, route.slug)
-    if not note_routes(scoped):
-        print(f"[WARN] {route.slug}: no dedicated credential; generation skipped")
-        return True
+    system = build_system_prompt(settings.note_mode)
+    excerpt = text[: effective_chunk_chars(settings, system_prompt=system)]
     started = time.monotonic()
     try:
         async with aiohttp.ClientSession() as session:
-            notes = await structure_transcript(text, scoped, session, mode=settings.note_mode)
+            raw = await _complete_on_route(
+                route, session, settings, system=system, user=TRANSCRIPT_PROMPT + excerpt
+            )
+        notes = _load_json_payload(_parse_json_object(raw))
     except Exception as exc:  # noqa: BLE001 - report any provider failure verbatim
         elapsed = time.monotonic() - started
         print(f"[FAIL] {route.slug} generation ({elapsed:.1f}s): {type(exc).__name__}: {exc}")
         return False
     elapsed = time.monotonic() - started
     print(
-        f"[PASS] {route.slug} generation ({elapsed:.1f}s): "
+        f"[PASS] {route.slug} generation ({elapsed:.1f}s, {len(excerpt)} chars): "
         f"title={notes.display_title!r} sections={len(notes.sections)}"
     )
     return True
@@ -181,7 +183,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--generate",
         metavar="TRANSCRIPT_FILE",
-        help="also run one real note generation per provider over this text file",
+        help="also send one real note request per provider over this text file",
     )
     args = parser.parse_args(argv)
 
@@ -204,18 +206,17 @@ def main(argv: list[str] | None = None) -> int:
     ok = True
     for route in routes:
         if route.slug == "nara":
-            ok = _check_nara(settings, route) and ok
+            ok = _check_nara(route) and ok
         elif route.slug == "openrouter":
-            ok = _check_openrouter(settings, route) and ok
+            ok = _check_openrouter(route) and ok
         else:
             print(f"[WARN] {route.slug}: no metadata probe; generation stage still applies")
 
     if args.generate:
         text = Path(args.generate).read_text(encoding="utf-8")
         print(
-            f"\nGeneration probe over {len(text)} chars "
-            f"(~{max(1, len(text) // max(1, settings.note_chunk_chars))} chunk(s) per route "
-            "plus at most one compile call; consumes provider quota):"
+            f"\nGeneration probe over the first chunk-sized excerpt of "
+            f"{len(text)} chars (one request per route; consumes provider quota):"
         )
         for route in routes:
             ok = asyncio.run(_generate(route, settings, text)) and ok

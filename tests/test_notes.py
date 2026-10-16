@@ -523,6 +523,38 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), len(chunks) + 1)
         self.assertEqual(notes.title, "جزوهٔ نهایی")
 
+    async def test_compile_runs_above_the_former_fixed_bound(self):
+        """A merged booklet over the old 48,000-char bound still gets compiled.
+
+        Regression test for the fixed ``COMPILE_MAX_CHARS``: under the token-
+        derived budget (default settings), the editorial pass must run.
+        """
+        from gamas_bot.transcript import split_transcript
+
+        settings = make_settings(note_chunk_chars=400, note_compile=True)
+        document = "\n\n".join(
+            f"موضوع {index}: " + "جمله‌های بسیار زیاد برای پر کردن حجم. " * 20
+            for index in range(60)
+        )
+        chunks = split_transcript(document, 400)
+        compile_answer = {
+            "title": "جزوهٔ نهایی بزرگ",
+            "summary": "خلاصهٔ نهایی",
+            "sections": [
+                {"heading": f"بخش یکپارچهٔ {number}", "paragraphs": ["متن یکپارچه."]}
+                for number in range(max(2, len(chunks)))
+            ],
+        }
+        session = FakeSession(
+            [big_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))]
+            + [json.dumps(compile_answer, ensure_ascii=False)]
+        )
+        notes = await structure_transcript(document, settings, session)
+        # Map calls + exactly one compile call, despite the merged booklet
+        # being far above the former fixed 48,000-char bound.
+        self.assertEqual(len(session.calls), len(chunks) + 1)
+        self.assertEqual(notes.title, "جزوهٔ نهایی بزرگ")
+
     async def test_compile_failure_falls_back_to_merge(self):
         from gamas_bot.transcript import split_transcript
 

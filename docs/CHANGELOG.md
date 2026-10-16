@@ -30,8 +30,8 @@ data re-verified 2026-10-16; see `docs/PROVIDERS.md`).
 
 ### Added
 
-* **`NOTE_REASONING_EFFORT`** (unset by default): `reasoning_effort` for
-  OpenAI-style note routes only; unknown values resolve to "send nothing".
+* **`NOTE_REASONING_EFFORT`** (unset by default): `reasoning_effort` for the
+  Nara/OpenRouter note routes only; unknown values resolve to "send nothing".
 * **Per-request usage logging.** Every completed note request logs its served
   model and real input/output token counts, so the conservative
   character-to-token estimate can be recalibrated from Persian traffic.

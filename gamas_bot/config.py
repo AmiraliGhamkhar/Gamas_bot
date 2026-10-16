@@ -115,8 +115,9 @@ DEFAULT_NOTE_CHUNK_CHARS = 64000
 #: (32,768 on the pinned OpenRouter endpoint, 65.5K for Agnes 2.5 Flash), so
 #: the budget itself never exceeds what a default model may emit.
 DEFAULT_NOTE_MAX_OUTPUT_TOKENS = 16384
-#: ``reasoning_effort`` levels accepted for OpenAI-style note routes. ``ultra``
-#: is accepted as the documented alias of ``max`` (https://router.bynara.id/docs).
+#: ``reasoning_effort`` levels accepted on the Nara/OpenRouter note routes
+#: (the two gateways verified for the field). ``ultra`` is accepted as the
+#: documented alias of ``max`` (https://router.bynara.id/docs).
 NOTE_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 #: A request needs at least this much room for the transcript itself.
 MIN_NOTE_INPUT_TOKENS = 4096

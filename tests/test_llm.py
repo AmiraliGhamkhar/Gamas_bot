@@ -54,10 +54,18 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertNotIn("response_format", payload)  # opt-in only
         self.assertNotIn("reasoning_effort", payload)  # provider default unless set
 
-    def test_reasoning_effort_sent_on_openai_style(self):
+    def test_reasoning_effort_sent_on_verified_gateways(self):
+        settings = routed_settings(note_reasoning_effort="low")
+        nara, openrouter = note_routes(settings)
+        for route in (nara, openrouter):
+            _url, _headers, payload = _build_request(settings, "S", "U", route=route)
+            self.assertEqual(payload["reasoning_effort"], "low")
+
+    def test_reasoning_effort_never_sent_to_a_generic_gateway(self):
+        """A generic gateway's model may reject the parameter outright."""
         settings = make_settings(note_reasoning_effort="low")
         _url, _headers, payload = _build_request(settings, "S", "U")
-        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertNotIn("reasoning_effort", payload)
 
     def test_reasoning_effort_not_invented_for_gemini_style(self):
         settings = make_settings(
@@ -303,6 +311,19 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), 1)
         timeout = session.calls[0]["timeout"]
         self.assertEqual(timeout.total, llm.LLM_REQUEST_TIMEOUT_SECONDS)
+
+    async def test_served_model_cannot_forge_a_log_line(self):
+        """The served-model string is provider-controlled; it is sanitised."""
+        session = FakeSession([FakeResponse(200, {
+            "model": "evil\n[INFO] forged entry",
+            "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })])
+        with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
+            result = await complete(session, make_settings(), system="S", user="U")
+        self.assertEqual(result, "answer")
+        self.assertFalse(any("\n" in line for line in logs.output), logs.output)
+        self.assertTrue(any("model=evil" in line for line in logs.output), logs.output)
 
     async def test_network_error_is_retried(self):
         session = FakeSession([

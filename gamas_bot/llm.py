@@ -311,12 +311,13 @@ def _build_request_for(
         # Opt-in, and only for providers that document ``response_format``
         # (NaraRouter does not, so it is never asked for it).
         payload["response_format"] = {"type": "json_object"}
-    if settings.note_reasoning_effort:
-        # OpenAI-style routes only: NaraRouter documents ``reasoning_effort``
-        # and clamps unsupported levels instead of erroring, and OpenRouter
-        # accepts the same field. The Gemini and Anthropic styles above have
-        # their own thinking knobs, which this setting deliberately does not
-        # invent a mapping for. Unset (the default) sends nothing, so the
+    if settings.note_reasoning_effort and route.slug in ("nara", "openrouter"):
+        # Only the two gateways whose contracts were verified for this field:
+        # NaraRouter documents ``reasoning_effort`` and clamps unsupported
+        # levels instead of erroring, and OpenRouter accepts it for the models
+        # that support it. A generic OpenAI-compatible gateway (whose model
+        # may reject the parameter outright) and the Gemini/Anthropic styles
+        # above never receive it. Unset (the default) sends nothing, so the
         # provider's own reasoning default applies.
         payload["reasoning_effort"] = settings.note_reasoning_effort
     return _endpoint(route.base_url, "chat/completions"), headers, payload
@@ -461,7 +462,9 @@ def _log_usage(route: NoteRoute, payload: dict) -> None:
         "note provider usage provider=%s model=%s input_tokens=%s "
         "output_tokens=%s total_tokens=%s",
         route.slug,
-        model or route.model,
+        # The served-model string is provider-controlled: collapse any
+        # whitespace (including newlines) so it can never forge a log line.
+        _sanitize_error_text(model or route.model, limit=80),
         shown(input_tokens),
         shown(output_tokens),
         shown(total_tokens),

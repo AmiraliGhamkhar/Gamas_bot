@@ -60,16 +60,18 @@ the map of what exists.
 * **`NOTE_CONTEXT_TOKENS`** sizes one request: the output budget, system prompt
   and contextual material are subtracted and the rest is split into chunks. Set
   it to the smallest window among the configured models. The defaults are a
-  matched pair (both serve 262,144 tokens; see [PROVIDERS.md](PROVIDERS.md)),
-  so the default assumption is 131,072 — half the served window. Changing
+  matched pair (the pinned OpenRouter endpoint serves 262,144 tokens and
+  Agnes's reference window is larger still, with Nara's gateway cap
+  unpublished; see [PROVIDERS.md](PROVIDERS.md)), so the default assumption
+  is 131,072 — half the known served window. Changing
   `NARA_MODEL`/`OPENROUTER_MODEL` without revisiting this value sizes requests
   for a window the new model may not have.
 * **`NOTE_COMPILE_MAX_CHARS`** caps the merged booklet sent to the editorial
   compile pass; `0` (default) derives the cap from `NOTE_CONTEXT_TOKENS` with
   an absolute ceiling in the code.
-* **`NOTE_REASONING_EFFORT`** optionally sets `reasoning_effort` on
-  OpenAI-style note routes (`none`…`max`); unset sends nothing and keeps each
-  provider's own default.
+* **`NOTE_REASONING_EFFORT`** optionally sets `reasoning_effort` on the
+  Nara/OpenRouter note routes (`none`…`max`); unset sends nothing and keeps
+  each provider's own default.
 * **No credential vault.** Keys come from the environment only. There is no
   encryption key, no key wizard and no key column in the database.
 

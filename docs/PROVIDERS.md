@@ -56,8 +56,9 @@ must be revisited at the same time.
   (OpenRouter and generic OpenAI-compatible gateways — not NaraRouter). Gemini
   always asks for its native JSON.
 * **`NOTE_REASONING_EFFORT`** (unset by default) sends `reasoning_effort` on
-  OpenAI-style routes only, where both gateways document or accept it; the
-  Gemini/Anthropic styles receive nothing. Each completed request logs its
+  the Nara and OpenRouter routes only — the two gateways verified for the
+  field. A generic OpenAI-compatible gateway (whose model may reject the
+  parameter) and the Gemini/Anthropic styles never receive it. Each completed request logs its
   served model and real token usage (`note provider usage …`), which is the
   data to recalibrate the chunk budget's character-to-token estimate from.
 * **The compile (reduce) budget is token-derived** (`NOTE_COMPILE_MAX_CHARS=0`
