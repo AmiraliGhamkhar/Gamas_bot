@@ -321,6 +321,13 @@ class Settings:
     # --- Raw text -----------------------------------------------------------
     raw_text_profile: str
 
+    # --- Free Office --------------------------------------------------------
+    office_enabled: bool
+    office_max_input_bytes: int
+    office_max_chars: int
+    office_max_slides: int
+    office_session_ttl_minutes: int
+
     # --- Billing / payments --------------------------------------------------
     payment_card_number: str
     payment_card_holder: str
@@ -714,6 +721,19 @@ def from_env(env_file: str | None = None) -> Settings:
         ),
         note_reasoning_effort=resolve_note_reasoning_effort(_env("NOTE_REASONING_EFFORT")),
         raw_text_profile=resolve_raw_text_profile(_env("RAW_TEXT_PROFILE")),
+        office_enabled=_env_bool("OFFICE_ENABLED", True),
+        office_max_input_bytes=_env_int(
+            "OFFICE_MAX_INPUT_BYTES", 1_000_000, minimum=1024, maximum=50_000_000
+        ),
+        office_max_chars=_env_int(
+            "OFFICE_MAX_CHARS", 20_000, minimum=200, maximum=1_000_000
+        ),
+        office_max_slides=_env_int(
+            "OFFICE_MAX_SLIDES", 30, minimum=1, maximum=200
+        ),
+        office_session_ttl_minutes=_env_int(
+            "OFFICE_SESSION_TTL_MINUTES", 30, minimum=1, maximum=1440
+        ),
         payment_card_number=re.sub(r"\D", "", _env("PAYMENT_CARD_NUMBER", "5022291332906625"))[-16:],
         payment_card_holder=_env("PAYMENT_CARD_HOLDER", "امیرعلی غمخوار"),
         payment_bank_name=_env("PAYMENT_BANK_NAME", "بانک پاسارگاد"),

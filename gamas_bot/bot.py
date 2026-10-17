@@ -30,6 +30,7 @@ import re
 import secrets
 import shutil
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -48,6 +49,7 @@ from .billing import (
 from .config import Settings, format_payment_card
 from .db import Database, InsufficientBalanceError
 from .docx_export import (
+    OFFICE_HEADING_OFFSET,
     DocumentMeta,
     build_notes_docx,
     build_plain_docx,
@@ -67,6 +69,23 @@ from .media import (
     probe_media,
 )
 from .notes import StructuredNotes, structure_presentation, structure_transcript
+from .office import (
+    FORMAT_EMOJI,
+    FORMAT_LABELS,
+    OFFICE_FORMATS,
+    OFFICE_MODE_LABELS,
+    TEXT_FILE_EXTENSIONS,
+    OfficeError,
+    OfficeSession,
+    build_office_document,
+    build_office_pptx,
+    build_office_xlsx,
+    fallback_slides,
+    office_filename,
+    office_title_from_filename,
+    read_text_file,
+)
+from .office_ai import infer_table, plan_deck
 from .presentations import (
     PresentationError,
     classify_presentation,
@@ -92,7 +111,13 @@ VIDEO_EXTENSIONS = {
 }
 PRESENTATION_EXTENSIONS = {".ppt", ".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm", ".pps", ".pot"}
 
-USER_VISIBLE_ERRORS = (ValueError, PresentationError, STTConfigurationError, MediaToolError)
+USER_VISIBLE_ERRORS = (
+    ValueError,
+    PresentationError,
+    STTConfigurationError,
+    MediaToolError,
+    OfficeError,
+)
 
 RAW_PREVIEW_CHARS = 800
 MAX_RAW_PREVIEW_LINES = 12
@@ -191,6 +216,10 @@ class GamasBot:
         self._receipt_cleanup_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
         self._pending_broadcast: set[int] = set()
+        # Free Office: the in-flight request of every user, and the last
+        # document each of them built (so «افزودن متن» can extend it).
+        self._office_sessions: dict[int, OfficeSession] = {}
+        self._office_last: dict[int, tuple[str, str]] = {}
         settings.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = TelegramClient(
             str(settings.session_path), settings.api_id, settings.api_hash
@@ -293,11 +322,15 @@ class GamasBot:
         """
         rows = [
             [Button.inline("📎 ساخت جزوه", b"make")],
+        ]
+        if self.settings.office_enabled:
+            rows.append([Button.inline("📄 آفیس رایگان", b"office")])
+        rows.append(
             [
                 Button.inline("💳 حساب و شارژ", b"account"),
                 Button.inline("❓ راهنما", b"help"),
-            ],
-        ]
+            ]
+        )
         if is_admin:
             rows.append([Button.inline("🛠 پنل مدیریت", b"adm:home")])
         return rows
@@ -332,9 +365,14 @@ class GamasBot:
         text = (
             f"{greeting}\n\n"
             "جزوهٔ کلاس‌تان را از یک فایل صوتی، ویدیویی یا پاورپوینت می‌سازم؛ "
-            "متن خام پیاده‌سازی‌شده را هم همان لحظه تحویل می‌دهم.\n\n"
-            f"⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
+            "متن خام پیاده‌سازی‌شده را هم همان لحظه تحویل می‌دهم.\n"
         )
+        if self.settings.office_enabled:
+            text += (
+                "با «📄 آفیس رایگان» هم هر متنی را که دارید به فایل واقعی Word، "
+                "Excel یا PowerPoint تبدیل می‌کنم — رایگان است.\n"
+            )
+        text += f"\n⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
 
     async def _edit_or_reply(self, event, text: str, buttons=None) -> None:
@@ -358,6 +396,252 @@ class GamasBot:
             if plan.is_free:
                 return plan.included_seconds
         return 3600
+
+    # ------------------------------------------------------------- free office
+    async def _show_office_menu(self, event, *, notice: str = "") -> None:
+        """The Free Office screen: the three formats, and what they cost.
+
+        The section is free, and the screen says so: a user who does not know
+        the bot's credit rules must not wonder whether a document is going to
+        spend their balance.
+        """
+        text = (
+            "📄 آفیس رایگان\n\n"
+            "متن خودتان را بفرستید؛ من همان متن را به یک فایل واقعی تبدیل "
+            "می‌کنم — Word، Excel یا PowerPoint. متن شما عیناً در فایل می‌آید.\n"
+            "رایگان است و از اعتبار شما کم نمی‌کند.\n\n"
+            "قالب را انتخاب کنید:"
+        )
+        if notice:
+            text = f"{notice}\n\n{text}"
+        buttons = [
+            [Button.inline(f"{FORMAT_EMOJI['word']} {FORMAT_LABELS['word']}", b"office:word")],
+            [Button.inline(f"{FORMAT_EMOJI['excel']} {FORMAT_LABELS['excel']}", b"office:excel")],
+            [Button.inline(f"{FORMAT_EMOJI['ppt']} {FORMAT_LABELS['ppt']}", b"office:ppt")],
+            [Button.inline("🔙 بازگشت", b"menu:main")],
+        ]
+        await self._edit_or_reply(event, text, buttons)
+
+    def _office_session(self, user_id: int, *, create: bool = False) -> OfficeSession | None:
+        """The user's live Office session, or ``None``.
+
+        A session that has been idle for longer than the configured window is
+        dropped: the content of a request is not kept for the user to find
+        hours later.
+        """
+        session = self._office_sessions.get(user_id)
+        if session is not None:
+            age = time.monotonic() - session.updated_at
+            if age > self.settings.office_session_ttl_minutes * 60:
+                self._office_sessions.pop(user_id, None)
+                self._office_last.pop(user_id, None)
+                return None
+        if session is None and create:
+            session = OfficeSession()
+            self._office_sessions[user_id] = session
+        if session is not None:
+            session.updated_at = time.monotonic()
+        return session
+
+    async def _handle_office_action(self, event, action: str) -> None:
+        """A button of the Free Office section."""
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        if action == "cancel":
+            self._office_sessions.pop(user_id, None)
+            await event.respond(
+                "لغو شد. هر وقت سندی خواستی، از «📄 آفیس رایگان» شروع کن."
+            )
+            return
+        if action == "more":
+            # Extend the document that was just built: the previous content
+            # stays, and whatever arrives next is added to it.
+            previous = self._office_last.get(user_id)
+            if previous is not None:
+                kind, text, title, built_at = previous
+                age = time.monotonic() - built_at
+                if age > self.settings.office_session_ttl_minutes * 60:
+                    # The document is too old to extend; it is forgotten with
+                    # the same window as the rest of the request.
+                    self._office_last.pop(user_id, None)
+                    previous = None
+            if previous is None:
+                await self._show_office_menu(event, notice="سندی برای ادامه ندارم.")
+                return
+            kind, text, title, _built_at = previous
+            session = self._office_session(user_id, create=True) or OfficeSession()
+            session.kind = kind
+            session.parts = [text]
+            session.title = title
+            await event.respond(
+                "متن تازه را بفرستید؛ به سند قبلی اضافه می‌شود و سند تازه‌ای "
+                "برایتان می‌سازم.",
+                buttons=[[Button.inline("↩️ انصراف", b"office:cancel")]],
+            )
+            return
+        if action not in OFFICE_FORMATS:
+            return
+        session = self._office_session(user_id, create=True) or OfficeSession()
+        session.kind = action
+        if session.text.strip():
+            # The content arrived first: the document can be built right away.
+            await self._start_office_job(event, user_id, session)
+            return
+        await event.respond(
+            "متن سند را بفرستید (یا یک فایل ‎.txt/‎.csv بفرستید).\n"
+            "هرچه بنویسید عیناً در سند می‌آید؛ سطرهای جدول را با Tab جدا کنید.\n"
+            "اگر متن بیشتری دارید، بعد از ساخت دکمهٔ «➕ افزودن متن» را بزنید.",
+            buttons=[[Button.inline("↩️ انصراف", b"office:cancel")]],
+        )
+
+    async def _handle_office_message(self, event, user_id: int, text: str) -> bool:
+        """Route an incoming message into the Free Office section.
+
+        Returns ``True`` when the message *was* the section's content, so the
+        caller must not treat it as anything else. A lecture upload is never
+        office content, and a command is never content either.
+        """
+        if not self.settings.office_enabled:
+            return False
+        message = event.message
+        if message is None:
+            return False
+        # A lecture upload belongs to the lecture pipeline, not here.
+        if _presentation_metadata(message)[0] is not None:
+            return False
+        if _media_metadata(message)[0] is not None:
+            return False
+        filename = getattr(message.file, "name", None) if message.file else None
+        extension = Path(filename or "").suffix.lower()
+        is_text_file = message.document is not None and extension in TEXT_FILE_EXTENSIONS
+        if not is_text_file:
+            # Any other attachment (a photo, a sticker) is not office content:
+            # only a message and a text file are.
+            if (
+                getattr(message, "photo", None) is not None
+                or getattr(message, "sticker", None) is not None
+                or getattr(message, "gif", None) is not None
+            ):
+                return False
+            if not text or text.startswith("/"):
+                return False
+        session = self._office_session(user_id, create=True) or OfficeSession()
+        if is_text_file:
+            try:
+                content = await self._download_office_text(message, filename or "")
+            except OfficeError as exc:
+                await event.reply(f"❌ {exc}")
+                return True
+            session.parts = [content]
+            session.filename = filename
+            # A short caption is a better title than the file name.
+            caption = (message.message or "").strip()
+            session.title = (
+                caption[:120] if 0 < len(caption) <= 90
+                else office_title_from_filename(filename)
+            )
+        else:
+            if len(session.text) + len(text) > self.settings.office_max_chars:
+                await event.reply(
+                    "❌ متن شما از حد مجاز بیشتر است.\n"
+                    f"حداکثر {self.settings.office_max_chars} نویسه در هر سند؛ "
+                    "متن را کوتاه‌تر کنید یا در چند سند بفرستید."
+                )
+                return True
+            session.add(text)
+        session.message = message
+        if session.kind:
+            await self._start_office_job(event, user_id, session)
+        else:
+            await self._show_office_menu(
+                event, notice="متن شما آماده است؛ حالا قالب فایل را انتخاب کنید."
+            )
+        return True
+
+    async def _download_office_text(self, message, filename: str) -> str | None:
+        """Download an uploaded text file and read it.
+
+        The file is removed as soon as it has been read: the content lives in
+        the session, and the bot's promise is that temporary files do not
+        outlive the work.
+        """
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_hex(6)
+        target = self.settings.temp_dir / f"office-{token}{Path(filename).suffix.lower()}"
+        try:
+            downloaded = await message.download_media(file=str(target))
+            if not downloaded or not target.exists():
+                raise OfficeError("فایل ارسالی از تلگرام دریافت نشد.")
+            return read_text_file(
+                target, max_bytes=self.settings.office_max_input_bytes
+            )
+        except OfficeError:
+            raise
+        except Exception as exc:
+            logger.warning("office upload could not be read: %s", exc)
+            raise OfficeError("فایل ارسالی خوانده نشد.") from exc
+        finally:
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:  # pragma: no cover - defensive
+                pass
+
+    async def _start_office_job(self, event, user_id: int, session: OfficeSession) -> None:
+        """Queue the build of a Free Office document.
+
+        The document is built by the job queue, exactly like a lecture: the
+        chat handler only records the request and returns. The section never
+        reserves credit — it is free — so no hold is created and nothing is
+        charged when the build succeeds or fails.
+        """
+        content = session.text
+        kind = session.kind or "word"
+        if not content.strip():
+            await event.reply("متنی برای ساخت سند نیست؛ متن را بفرستید.")
+            return
+        if len(content) > self.settings.office_max_chars:
+            await event.reply(
+                "❌ متن شما از حد مجاز بیشتر است "
+                f"({self.settings.office_max_chars} نویسه)."
+            )
+            return
+        # A title the user gave (a file caption) wins; otherwise the document
+        # itself finds one from the text when the job runs.
+        title = session.title or ""
+        submission_id = await self.db.create_submission(
+            user_id, "office", session.filename or f"office-{kind}"
+        )
+        anchor = session.message or getattr(event, "message", None)
+        progress = await JobProgress.create(anchor, submission_id=submission_id)
+        job = Job(
+            submission_id=submission_id,
+            user_id=user_id,
+            kind="office",
+            filename=session.filename,
+            message=anchor,
+            is_admin=self._is_admin(user_id),
+            meta={
+                "progress": progress,
+                "office_kind": kind,
+                "office_title": title,
+                "office_text": content,
+            },
+        )
+        try:
+            self.queue.submit(job)
+        except QueueFullError as exc:
+            await self.db.set_submission_status(submission_id, "rejected", error=str(exc))
+            await progress.fail(str(submission_id))
+            await event.reply(f"⏸ {exc}")
+            return
+        # The request is now the job's business; the session is closed so a
+        # later, unrelated message is never mistaken for more content.
+        self._office_sessions.pop(user_id, None)
+        logger.info(
+            "accepted office request submission=%s user=%s kind=%s chars=%d",
+            submission_id, user_id, kind, len(content),
+        )
 
     # ------------------------------------------------------------- callbacks
     async def _handle_callback(self, event) -> None:
@@ -396,10 +680,28 @@ class GamasBot:
                 "۳) بعد جزوهٔ Word ساختارمند (RTL، جدول، شماره صفحه) ارسال می‌شود.\n\n"
                 "قانون حساب: مصرف بر پایهٔ مدت صوت است و کار ناموفق اعتبار نمی‌سوزاند.\n"
                 "محدودیت‌ها: هر فایل تا ۲ گیگابایت؛ هم‌زمان ۳ کار فعال و ۸ کار در صف."
+                + (
+                    "\n\n📄 «آفیس رایگان»: متن خودتان را بفرستید تا فایل Word، Excel یا "
+                    "PowerPoint شود. رایگان است و اعتبار شما را کم نمی‌کند."
+                    if self.settings.office_enabled
+                    else ""
+                )
             )
         elif data == "menu:main":
             await self._ack(event)
             await self._show_main(event)
+        elif data == "office":
+            await self._ack(event)
+            if not self.settings.office_enabled:
+                await event.respond("این بخش روی این سرور فعال نیست.")
+                return
+            await self._show_office_menu(event)
+        elif data.startswith("office:"):
+            await self._ack(event)
+            if not self.settings.office_enabled:
+                await event.respond("این بخش روی این سرور فعال نیست.")
+                return
+            await self._handle_office_action(event, data.split(":", 1)[1])
         elif data == "account":
             await self._ack(event)
             await self._show_account(event)
@@ -474,6 +776,7 @@ class GamasBot:
             return
         if text.startswith("/cancel"):
             self._pending_payments.pop(user_id, None)
+            self._office_sessions.pop(user_id, None)
             await event.reply("لغو شد.")
             return
 
@@ -489,12 +792,24 @@ class GamasBot:
             await self._accept_media(event, user_id, kind, filename, duration)
             return
 
+        # Free Office: the user's own text becomes a document.
+        if await self._handle_office_message(event, user_id, text):
+            return
+
         if _is_unsupported_attachment(event.message):
-            await event.reply(
-                "⚠️ این نوع فایل را پشتیبانی نمی‌کنم. صدا، ویدیو یا پاورپوینت بفرستید."
-            )
+            if self.settings.office_enabled:
+                await event.reply(
+                    "⚠️ این نوع فایل را پشتیبانی نمی‌کنم. صدا، ویدیو یا پاورپوینت "
+                    "بفرستید — یا برای ساخت سند، یک فایل ‎.txt/‎.csv بفرستید."
+                )
+            else:
+                await event.reply(
+                    "⚠️ این نوع فایل را پشتیبانی نمی‌کنم. صدا، ویدیو یا پاورپوینت بفرستید."
+                )
             return
         if text:
+            # The Free Office section already had its chance above: it either
+            # took the text (and asked for a format) or is switched off.
             await event.reply(
                 "برای ساخت جزوه، فایل صوتی/تصویری درس را بفرستید یا از منوی شروعه "
                 "دکمهٔ «📎 ساخت جزوه» را بزنید."
@@ -580,6 +895,8 @@ class GamasBot:
             ))
             if job.kind == "presentation":
                 await self._process_presentation(job, workdir, progress)
+            elif job.kind == "office":
+                await self._process_office(job, workdir, progress)
             else:
                 await self._process_media(job, workdir, progress)
         except InsufficientBalanceError as exc:
@@ -844,6 +1161,116 @@ class GamasBot:
         )
         await self._deliver_booklet(job, workdir, notes, document, reference, meta, progress,
                                     plain_title="جزوهٔ ارائه")
+
+    # ------------------------------------------------------- free office job
+    async def _process_office(self, job: Job, workdir: Path, progress) -> None:
+        """Build and deliver a Free Office document.
+
+        This path never touches the credit ledger: the section is free, so a
+        document costs the user nothing, and a failed build costs them
+        nothing either. The only thing recorded is the submission row, so the
+        admin panel can see how many documents were made.
+        """
+        assert progress is not None
+        await progress.update(15, "📄 دارم سند شما را می‌سازم")
+        kind = str(job.meta.get("office_kind") or "word")
+        content = str(job.meta.get("office_text") or "")
+        title = str(job.meta.get("office_title") or "")
+        if not content.strip():
+            raise OfficeError("متنی برای ساخت سند نبود.")
+        document = build_office_document(content, title=title)
+        reference = f"GMS-{job.submission_id}"
+        meta = DocumentMeta(
+            reference=reference,
+            source_name=job.filename,
+            created_at=datetime.now(),
+        )
+
+        if kind == "excel":
+            payload = await self._build_office_excel(document, content)
+        elif kind == "ppt":
+            payload = await self._build_office_pptx(document, content)
+        else:
+            payload = await asyncio.to_thread(
+                build_plain_docx,
+                document.title,
+                document.text,
+                fonts=resolve_fonts(),
+                design=resolve_design(),
+                meta=meta,
+                mode_label=OFFICE_MODE_LABELS["word"],
+                heading_offset=OFFICE_HEADING_OFFSET,
+            )
+
+        await progress.update(80, "📤 دارم فایل را می‌فرستم")
+        path = workdir / office_filename(document.title, kind, reference)
+        path.write_bytes(payload)
+        caption = (
+            f"{FORMAT_EMOJI.get(kind, '📄')} سند {FORMAT_LABELS.get(kind, '')} — {reference}"
+        )
+        await self._send_file(job, path, caption=caption)
+        await self.db.set_submission_status(job.submission_id, "done")
+        # Remember the document so «➕ افزودن متن» can extend it.
+        self._office_last[job.user_id] = (kind, content, document.title, time.monotonic())
+        self._trim_office_history()
+        await progress.complete("سند شما آماده شد ✅", "🎉 سند آماده شد! 🎉")
+        await self._offer_office_more(job)
+
+    async def _offer_office_more(self, job: Job) -> None:
+        """Offer to extend the document that was just delivered."""
+        if job.message is None:
+            return
+        try:
+            await job.message.reply(
+                "می‌خواهید متن دیگری هم به همین سند اضافه کنم؟",
+                buttons=[[Button.inline("➕ افزودن متن", b"office:more")]],
+            )
+        except Exception:
+            logger.debug("could not offer the 'add more' button", exc_info=True)
+
+    def _trim_office_history(self) -> None:
+        """Keep the «last document» cache bounded.
+
+        The cache holds the text of the last document per user, so it is
+        dropped for the oldest users once it grows past the limit.
+        """
+        limit = 500
+        while len(self._office_last) > limit:
+            oldest = next(iter(self._office_last))
+            self._office_last.pop(oldest, None)
+
+    async def _build_office_excel(self, document, content: str) -> bytes:
+        """The sheet: the user's own table, or a table the model arranges."""
+        tables = list(document.tables)
+        if not tables:
+            # No grid in the text: the model may arrange the prose into one.
+            # Every cell it proposes is checked against the source, and a
+            # rejected plan falls back to a plain one-column sheet.
+            table = await infer_table(
+                content, settings=self.settings, session=self._http_session()
+            )
+            if table is not None:
+                tables = [table]
+        return await asyncio.to_thread(build_office_xlsx, document, tables)
+
+    async def _build_office_pptx(self, document, content: str) -> bytes:
+        """The deck: the model's slide order, or the user's own headings."""
+        slides = await plan_deck(
+            content,
+            settings=self.settings,
+            session=self._http_session(),
+            max_sections=self.settings.office_max_slides,
+        )
+        if not slides:
+            slides = fallback_slides(
+                document, max_slides=self.settings.office_max_slides
+            )
+        return await asyncio.to_thread(
+            build_office_pptx,
+            document,
+            slides,
+            max_slides=self.settings.office_max_slides,
+        )
 
     # ----------------------------------------------------------- notes + docx
     async def _generate_notes(self, document_text: str, job: Job, progress) -> StructuredNotes | None:

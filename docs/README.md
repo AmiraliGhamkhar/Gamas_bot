@@ -12,6 +12,7 @@ disagree, the code wins — and that is a bug worth reporting.
 | [`STT_PROVIDERS.md`](STT_PROVIDERS.md) | Speech-to-text providers, languages, limits |
 | [`MEDIA.md`](MEDIA.md) | The Python-only media pipeline |
 | [`DOCX.md`](DOCX.md) | RTL Word generation contracts |
+| [`OFFICE.md`](OFFICE.md) | The free Office section: text → Word/Excel/PowerPoint |
 | [`BILLING.md`](BILLING.md) | Ledger, plans, card-to-card payments |
 | [`SECURITY.md`](SECURITY.md) | Threat model and what is enforced |
 | [`OPERATIONS.md`](OPERATIONS.md) | Start/stop, health, logs, backups |

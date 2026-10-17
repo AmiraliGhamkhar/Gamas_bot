@@ -125,12 +125,34 @@ class FakeSentMessage:
         return self
 
 
+class FakeTelegramFile:
+    """The ``message.file`` double: name, mime type, size and duration."""
+
+    def __init__(self, name=None, mime_type=None, size=0, duration=None):
+        self.name = name
+        self.mime_type = mime_type
+        self.size = size
+        self.duration = duration
+
+
+class FakeTelegramDocument:
+    """The ``message.document`` double of an uploaded file."""
+
+    def __init__(self, file: FakeTelegramFile):
+        self.file = file
+        self.attributes: list = []
+
+
 class FakeTelegramMessage:
     """The incoming upload message, with Telethon's reply/respond contract.
 
     ``reply`` sets ``reply_to`` to this message and calls ``send_message`` on the
     client, exactly like ``telethon.tl.custom.message.Message.reply`` — so code
     that replies with an unsupported keyword fails here too.
+
+    The media attributes (``voice``, ``audio``, ``document``, ``photo`` …) are
+    the ones the bot classifies an upload by, so a message can be turned into
+    an upload with :meth:`attach_document` or :meth:`attach_voice`.
     """
 
     def __init__(
@@ -140,11 +162,36 @@ class FakeTelegramMessage:
         chat_id: int,
         message_id: int,
         download=None,
+        text: str = "",
     ):
         self.client = client
         self._chat_id = chat_id
         self.id = message_id
         self._download = download
+        #: The text of the message (Telethon calls it ``message``).
+        self.message = text
+        self.media = None
+        self.file = FakeTelegramFile()
+        self.document = None
+        self.voice = None
+        self.audio = None
+        self.video = None
+        self.video_note = None
+        self.gif = None
+        self.sticker = None
+        self.photo = None
+
+    def attach_document(self, name: str, *, mime_type: str | None = None, size: int = 0) -> None:
+        """Make this message an uploaded file."""
+        self.file = FakeTelegramFile(name, mime_type, size)
+        self.document = FakeTelegramDocument(self.file)
+        self.media = self.document
+
+    def attach_voice(self, *, duration: float = 1.0) -> None:
+        """Make this message a Telegram voice note."""
+        self.file = FakeTelegramFile("voice.ogg", "audio/ogg", 0, duration)
+        self.voice = self.file
+        self.media = self.voice
 
     @property
     def chat_id(self) -> int:
@@ -173,8 +220,12 @@ class FakeJobEvent:
     directory is removed right after delivery.
     """
 
+    #: The bot only answers private chats.
+    is_private = True
+
     def __init__(self, source: Path | None = None, *, chat_id: int = 555, message_id: int = 77):
         self.source = source
+        self.sender_id = chat_id
         self.replies: list[str] = []
         self.responses: list[str] = []
         self.files: list[tuple[str, str]] = []
@@ -219,6 +270,45 @@ class FakeJobEvent:
             if str(record["path"]).endswith(suffix):
                 return record
         raise AssertionError(f"no send_file call delivered {suffix!r}: {self.file_paths}")
+
+
+class FakeCallbackEvent:
+    """A Telethon CallbackQuery double: the panels' buttons are answered with it.
+
+    The panel is a screen tree, so the buttons have to be pressable in a
+    test. ``data`` is the raw ``callback_data`` byte string, exactly as
+    Telegram delivers it.
+    """
+
+    is_private = True
+
+    def __init__(
+        self,
+        client: FakeTelegramClient,
+        *,
+        data: bytes,
+        chat_id: int = 555,
+        message_id: int = 77,
+    ):
+        self.client = client
+        self.data = data
+        self.sender_id = chat_id
+        self.message = FakeTelegramMessage(client, chat_id=chat_id, message_id=message_id)
+        self.answers: list[tuple[str | None, bool]] = []
+        self.edits: list[dict] = []
+
+    async def answer(self, text: str | None = None, alert: bool = False) -> None:
+        self.answers.append((text, alert))
+
+    async def respond(self, *args, **kwargs):
+        return await self.message.respond(*args, **kwargs)
+
+    async def reply(self, *args, **kwargs):
+        return await self.message.reply(*args, **kwargs)
+
+    async def edit(self, text: str = "", buttons=None):
+        self.edits.append({"text": text, "buttons": buttons})
+        return FakeSentMessage(self.client, {"text": text})
 
 
 def sample_notes_json(title: str = "جزوهٔ آزمایشی") -> str:
@@ -332,6 +422,11 @@ def make_settings(**overrides) -> Settings:
         note_compile_max_chars=0,
         note_reasoning_effort="",
         raw_text_profile="plain",
+        office_enabled=True,
+        office_max_input_bytes=1_000_000,
+        office_max_chars=20_000,
+        office_max_slides=30,
+        office_session_ttl_minutes=30,
         payment_card_number="5022291332906625",
         payment_card_holder="تستر",
         payment_bank_name="بانک تست",

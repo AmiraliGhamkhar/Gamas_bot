@@ -4,6 +4,44 @@ Entries describe user- and operator-visible change. For anything older than
 v3.0.0, read the git history — the v2 provider platform those entries describe
 no longer exists in the code.
 
+## Unreleased — 2026-10-17 — the Free Office section
+
+A second front door: the user's own text becomes a real Office file.
+
+### Added
+
+* **📄 آفیس رایگان** in the user menu. Pick Word, Excel or PowerPoint, send
+  the text (or upload a `.txt`/`.csv`/`.tsv`/`.md` file), and the document is
+  delivered — right-to-left and in the same brand as the lecture booklet.
+* **The section is free.** It never reserves, charges or releases credit; a
+  document costs the user nothing, and a failed build costs them nothing
+  either. Only a `submissions` row of kind `office` is recorded.
+* **The content and the format may arrive in any order**, and several messages
+  may be collected into one document. «➕ افزودن متن» extends a document that
+  was just delivered.
+* **Word** reuses the booklet engine (`docx_export.py`), so the document has
+  the cover, the topic list, the page frame, the running header and the footer
+  page field. A pasted grid becomes a **real Word table**.
+* **Excel** is a right-to-left sheet with a navy repeating header row, frozen
+  headings, zebra rows and sized columns. A cell that is only an ASCII number
+  becomes a real number; Persian digits stay text.
+* **PowerPoint** is 16:9 with a title slide, an agenda, one slide per section
+  and a closing slide; the full text of each section is kept in the notes pane.
+  A text with no headings of its own is cut into slides of six lines, and its
+  first line titles the deck.
+* **One text parser** (`gamas_bot/mdblocks.py`) now reads both the lecture
+  pipeline's Markdown and the user's text, so the two can never disagree about
+  what a line is.
+* **The model layer is optional and checked.** A model may only *arrange* the
+  user's text (slide order, table); every line and cell it proposes is
+  validated against the source, and anything invented is dropped. With no
+  provider configured, the deterministic fallback runs and the section still
+  works.
+* **Configuration**: `OFFICE_ENABLED`, `OFFICE_MAX_INPUT_BYTES`,
+  `OFFICE_MAX_CHARS`, `OFFICE_MAX_SLIDES`, `OFFICE_SESSION_TTL_MINUTES`.
+* **`openpyxl`** joins the dependency list (`.xlsx` writing); it is pure
+  Python, like the rest of the Office stack.
+
 ## Unreleased — 2026-10-16 — matched free-model pair, larger note requests
 
 The note chain's two defaults are now chosen as a pair, and every size limit
