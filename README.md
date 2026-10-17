@@ -31,6 +31,12 @@ Telegram → bounded job queue → media worker (PyAV) → speech-to-text
 The raw transcript is persisted and delivered **before** note generation starts,
 so a note-provider outage never costs the user their content.
 
+For PowerPoint, narration linked to slides is merged into one STT request and
+mapped back to slides only when the provider supplies timestamps; untimed and
+unlinked narration is labelled instead of guessed. Unreferenced media is opt-in.
+See [docs/PRESENTATIONS.md](docs/PRESENTATIONS.md) for duration, billing and
+resource-limit semantics.
+
 In chat everything starts from one button, **📎 ساخت جزوه**. A second button,
 **📄 آفیس رایگان**, turns the user's own text into a real Word, Excel,
 PowerPoint or PDF file — free, and without touching the credit ledger.
@@ -66,7 +72,7 @@ Requires Python **3.11–3.13**, a Telegram bot token and API credentials
 
 ### Minimum configuration
 
-`.env.example` documents all 81 variables. The ones you cannot start without:
+`.env.example` documents the full configuration surface. The variables you cannot start without:
 
 ```dotenv
 TELEGRAM_BOT_TOKEN=123456:ABC...
@@ -105,11 +111,14 @@ All configurable; defaults shown.
 | --- | --- | --- |
 | Upload size | `MAX_FILE_SIZE` | 2 GB |
 | Active / queued jobs | `MAX_ACTIVE_JOBS` / `MAX_QUEUED_JOBS` | 3 / 8 |
+| Heavy media stages | `MEDIA_WORKER_CONCURRENCY` | 1 |
 | One media operation | `MEDIA_TIMEOUT` | 3600 s |
 | Legacy `.ppt` conversion | `CONVERT_TIMEOUT` | 600 s |
 | One STT job | `STT_JOB_TIMEOUT` | 21600 s |
-| Clips per deck | `PRESENTATION_MAX_CLIPS` | 300 |
+| Playback uses per deck | `PRESENTATION_MAX_CLIPS` | 300 |
+| Merged presentation duration (including gaps) | `PRESENTATION_MAX_TOTAL_DURATION` | 21600 s |
 | Unpacked deck size | `PRESENTATION_MAX_UNPACKED_BYTES` | 4 GB |
+| Presentation scratch files | `PRESENTATION_MAX_TEMP_BYTES` | 8 GB |
 | Note request window | `NOTE_CONTEXT_TOKENS` | 131072 tokens |
 | Note chunk ceiling | `NOTE_CHUNK_CHARS` | 64000 chars |
 | Note answer budget | `NOTE_MAX_OUTPUT_TOKENS` | 16384 tokens |

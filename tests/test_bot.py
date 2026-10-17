@@ -626,11 +626,17 @@ class PresentationPromptTests(BotPipelineTestCase):
             if skipped_out is not None:
                 skipped_out.clear()
             return PreparedAudio(
-                path=audio, clips=(), total_duration=12.0, merged=True
+                path=audio,
+                clips=(),
+                source_duration=10.0,
+                output_duration=12.0,
+                clip_spans=(),
+                merged=True,
             )
 
-        async def fake_probe(_path, _settings):
-            return MediaInfo(has_audio=True, duration=12.0, audio_codec="pcm_s16le")
+        fake_probe = mock.AsyncMock(
+            return_value=MediaInfo(has_audio=True, duration=12.0, audio_codec="pcm_s16le")
+        )
 
         async def fake_transcribe(_path, _settings, session=None):
             return RawTranscript(
@@ -642,6 +648,7 @@ class PresentationPromptTests(BotPipelineTestCase):
                 mock.patch("gamas_bot.bot.transcribe", new=fake_transcribe):
             await self.bot._run_job(job)
 
+        fake_probe.assert_not_awaited()
         self.assertEqual(len(session.llm_calls), 1, session.llm_calls)
         request = session.llm_calls[0]["json"]
         user_content = request["messages"][1]["content"]
@@ -654,6 +661,12 @@ class PresentationPromptTests(BotPipelineTestCase):
         row = await self.db.submission(submission)
         assert row is not None
         self.assertEqual(row.status, "done")
+        self.assertAlmostEqual(row.duration_seconds, 10.0, delta=0.01)
+        charges = await self.db.db.execute_fetchall(
+            "SELECT seconds FROM ledger WHERE user_id = ? AND kind = 'debit' AND note = ?",
+            (USER_ID, f"submission:{submission}"),
+        )
+        self.assertEqual(int(charges[0][0]), 10)
 
     async def test_a_deck_whose_text_the_reader_cannot_open_still_sends_it(self):
         """python-pptx failing must not silently strip the slides from the prompt."""

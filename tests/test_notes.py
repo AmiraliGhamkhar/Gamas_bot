@@ -27,6 +27,7 @@ from gamas_bot.notes import (
     headings_share_a_topic,
     merge_structured_notes,
     scrub_backend_artifacts,
+    split_presentation_document,
     structure_presentation,
     structure_transcript,
 )
@@ -646,6 +647,47 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("یادداشت گوینده: نکته", document)
         self.assertIn("## متن پیاده‌سازی‌شدهٔ صدای ارائه", document)
         self.assertIn("صدای کلاس", document)
+
+    def test_aligned_narration_is_grouped_with_its_slide(self):
+        outline = (
+            "### اسلاید 1 — مقدمه\n- نکتهٔ یک\n\n"
+            "### اسلاید 2 — نتیجه\n- نکتهٔ دو"
+        )
+        transcript = (
+            "### گفتار مرتبط با اسلاید 1\n\nتوضیح مرتبط با نکتهٔ یک\n\n"
+            "### گفتار بدون نگاشت مطمئن به اسلاید\n\nیک بخشِ بدون زمان‌بندی"
+        )
+        document = build_presentation_document(outline, transcript)
+        first_slide = document.index("### اسلاید ۱ — مقدمه")
+        narration = document.index("توضیح مرتبط با نکتهٔ یک")
+        second_slide = document.index("### اسلاید ۲ — نتیجه")
+        unassigned = document.index("یک بخشِ بدون زمان‌بندی")
+        self.assertLess(first_slide, narration)
+        self.assertLess(narration, second_slide)
+        self.assertLess(second_slide, unassigned)
+        self.assertIn("بدون نگاشت مطمئن", document)
+
+    def test_presentation_chunker_prefers_slide_boundaries(self):
+        document = (
+            "## متن اسلایدها و گفتار ارائه به تفکیک اسلاید\n\n"
+            "### اسلاید 1 — الف\n\nمتن کوتاه اسلاید یک\n\n"
+            "### اسلاید 2 — ب\n\nمتن کوتاه اسلاید دو"
+        )
+        chunks = split_presentation_document(document, 90)
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertIn("### اسلاید 1", chunks[0])
+        self.assertNotIn("### اسلاید 2", chunks[0])
+        self.assertIn("### اسلاید 2", chunks[1])
+        self.assertTrue(all(len(chunk) <= 90 for chunk in chunks))
+
+    def test_long_slide_continuations_preserve_text_and_stay_within_budget(self):
+        body = "واژه " * 70
+        document = f"### اسلاید ۳ — طولانی\n\n{body}"
+        chunks = split_presentation_document(document, 90)
+        self.assertGreater(len(chunks), 2)
+        self.assertTrue(all(len(chunk) <= 90 for chunk in chunks))
+        self.assertEqual(sum(chunk.count("واژه") for chunk in chunks), 70)
+        self.assertTrue(any("ادامهٔ اسلاید ۳" in chunk for chunk in chunks[1:]))
 
 
 if __name__ == "__main__":

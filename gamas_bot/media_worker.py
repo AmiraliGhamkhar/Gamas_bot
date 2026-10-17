@@ -113,21 +113,23 @@ def _transcode(
     silence_seconds: float = 0.0,
     bit_rate: int | None = None,
     codec_options: dict | None = None,
-) -> None:
-    """Decode every input's first audio track to mono PCM/Opus at ``output``.
+) -> dict:
+    """Decode inputs to mono and report sample-accurate clip positions.
 
     Each input gets its own resampler because PyAV locks a resampler to the
-    format of the first frame it sees, while inputs can differ in rate/layout
-    (mirroring ffmpeg's per-input ``aresample`` chains).  A short silence is
-    appended after every clip but the last, exactly like the old
-    ``apad=pad_dur`` filter did.
+    format of the first frame it sees, while inputs can differ in rate/layout.
+    The source sample count excludes synthetic inter-clip silence; clip spans
+    are measured on the exact output sample clock used by the STT file.
     """
+    if not math.isfinite(silence_seconds) or not 0 <= silence_seconds <= 60:
+        raise WorkerError("silence duration must be between 0 and 60 seconds")
     av = _require_av()
     from av.audio.frame import AudioFrame
     from av.audio.resampler import AudioResampler
 
     open_kwargs = {"format": container_format} if container_format else {}
     container = av.open(str(output), "w", **open_kwargs)
+    summary: dict = {}
     try:
         stream = container.add_stream(codec, rate=rate)
         stream.layout = "mono"
@@ -136,10 +138,13 @@ def _transcode(
         if codec_options:
             stream.codec_context.options = dict(codec_options)
         next_pts = [0]
-        decoded_samples = 0
+        source_samples = 0
+        clip_spans: list[dict[str, int]] = []
 
         for index, source in enumerate(inputs):
             resampler = AudioResampler(format="s16", layout="mono", rate=rate)
+            clip_start = next_pts[0]
+            clip_samples = 0
             with av.open(str(source), options=dict(INPUT_PROTOCOL_OPTIONS)) as media:
                 audio_streams = [
                     item for item in media.streams if item.type == "audio"
@@ -149,10 +154,19 @@ def _transcode(
                 for frame in media.decode(audio_streams[0]):
                     for converted in resampler.resample(frame):
                         _emit(container, stream, converted, rate, next_pts)
-                        decoded_samples += converted.samples
+                        clip_samples += converted.samples
+                        source_samples += converted.samples
             for converted in resampler.resample(None):  # flush per-input state
                 _emit(container, stream, converted, rate, next_pts)
-                decoded_samples += converted.samples
+                clip_samples += converted.samples
+                source_samples += converted.samples
+            if clip_samples <= 0:
+                raise WorkerError(f"no decodable audio samples in '{source.name}'")
+            clip_spans.append({
+                "index": index,
+                "start_sample": clip_start,
+                "end_sample": next_pts[0],
+            })
             if silence_seconds > 0 and index < len(inputs) - 1:
                 samples = int(round(rate * silence_seconds))
                 if samples > 0:
@@ -164,14 +178,20 @@ def _transcode(
                         view = memoryview(plane)
                         view[: len(view)] = b"\0" * len(view)
                     _emit(container, stream, silence, rate, next_pts)
-                    decoded_samples += samples
 
-        if decoded_samples == 0:
+        if source_samples == 0:
             raise WorkerError("no decodable audio samples in the inputs")
         for packet in stream.encode(None):
             container.mux(packet)
+        summary = {
+            "sample_rate": rate,
+            "source_samples": source_samples,
+            "output_samples": next_pts[0],
+            "clip_spans": clip_spans,
+        }
     finally:
         container.close()
+    return summary
 
 
 def _convert(source: Path, output: Path, max_input_bytes: int) -> dict:
@@ -316,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             if not args.inputs:
                 raise WorkerError("no input files given for merging")
             rate = OPUS_SAMPLE_RATE if args.format == "opus" else WAV_SAMPLE_RATE
-            _transcode(
+            summary = _transcode(
                 [Path(item) for item in args.inputs],
                 Path(args.output),
                 rate=rate,
@@ -326,6 +346,7 @@ def main(argv: list[str] | None = None) -> int:
                 bit_rate=OPUS_BIT_RATE if args.format == "opus" else None,
                 codec_options=OPUS_CODEC_OPTIONS if args.format == "opus" else None,
             )
+            print(json.dumps(summary))
         elif args.command == "convert":
             summary = _convert(
                 Path(args.source), Path(args.output), args.max_input_bytes

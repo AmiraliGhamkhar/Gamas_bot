@@ -1338,6 +1338,7 @@ async def _structure_piece(
     mode: str,
     semaphore: asyncio.Semaphore,
     depth: int = 0,
+    presentation: bool = False,
 ) -> StructuredNotes:
     """One note request, with bounded recovery from an oversized input.
 
@@ -1358,7 +1359,8 @@ async def _structure_piece(
     except LLMContextOverflowError as exc:
         if depth >= MAX_CONTEXT_SPLITS:
             raise
-        pieces = split_transcript(document, max(1, len(document) // 2))
+        splitter = split_presentation_document if presentation else split_transcript
+        pieces = splitter(document, max(1, len(document) // 2))
         if len(pieces) < 2:
             raise
         logger.warning(
@@ -1371,6 +1373,7 @@ async def _structure_piece(
                     session, settings, piece,
                     system_prompt=system_prompt, mode=mode,
                     semaphore=semaphore, depth=depth + 1,
+                    presentation=presentation,
                 )
                 for piece in pieces
             )
@@ -1408,7 +1411,8 @@ async def structure_document(
         else build_system_prompt(mode)
     )
     semaphore = asyncio.Semaphore(max(1, settings.note_concurrency))
-    chunks = split_transcript(document, effective_chunk_chars(settings, system_prompt=base_system))
+    splitter = split_presentation_document if presentation else split_transcript
+    chunks = splitter(document, effective_chunk_chars(settings, system_prompt=base_system))
     if not chunks:
         raise StructuringError("متن ورودی خالی بود.")
 
@@ -1416,11 +1420,12 @@ async def structure_document(
         return await _structure_piece(
             session, settings, chunks[0],
             system_prompt=base_system, mode=mode, semaphore=semaphore,
+            presentation=presentation,
         )
 
     # A chunked request also carries the topic digest and the neighbour windows,
     # so the document is re-cut with that material reserved for the prompt.
-    chunks = split_transcript(
+    chunks = splitter(
         document,
         effective_chunk_chars(
             settings, system_prompt=base_system, extra_reserve_chars=CONTEXT_DIGEST_MAX_CHARS
@@ -1430,6 +1435,7 @@ async def structure_document(
         return await _structure_piece(
             session, settings, chunks[0],
             system_prompt=base_system, mode=mode, semaphore=semaphore,
+            presentation=presentation,
         )
 
     context = build_context(chunks)
@@ -1445,6 +1451,7 @@ async def structure_document(
         return await _structure_piece(
             session, settings, prefixed,
             system_prompt=system, mode=mode, semaphore=semaphore,
+            presentation=presentation,
         )
 
     chunk_notes = await asyncio.gather(
@@ -1476,14 +1483,168 @@ async def structure_document(
     return merged
 
 
+_SLIDE_NUMBER_CHARS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
+_SLIDE_NUMBER_ASCII = "01234567890123456789"
+_SLIDE_NUMBER_TRANSLATION = str.maketrans(_SLIDE_NUMBER_CHARS, _SLIDE_NUMBER_ASCII)
+_SLIDE_OUTLINE_RE = re.compile(
+    r"(?m)^###\s+اسلاید\s+([0-9۰-۹٠-٩]+)(?:\s*[—–-]\s*(.*))?\s*$"
+)
+_SLIDE_NARRATION_RE = re.compile(
+    r"(?m)^###\s+گفتار مرتبط با اسلاید\s+([0-9۰-۹٠-٩]+)\s*$"
+)
+_UNASSIGNED_NARRATION_RE = re.compile(
+    r"(?m)^###\s+گفتار بدون نگاشت مطمئن به اسلاید.*$"
+)
+
+
+def _number_from_heading(value: str) -> int:
+    return int(value.translate(_SLIDE_NUMBER_TRANSLATION))
+
+
+def _slide_blocks(text: str) -> tuple[dict[int, tuple[str, str]], list[int]]:
+    matches = list(_SLIDE_OUTLINE_RE.finditer(text))
+    blocks: dict[int, tuple[str, str]] = {}
+    order: list[int] = []
+    for index, match in enumerate(matches):
+        number = _number_from_heading(match.group(1))
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        title = (match.group(2) or "").strip()
+        body = text[match.end():end].strip()
+        if number in blocks:
+            prior_title, prior_body = blocks[number]
+            title = prior_title or title
+            body = "\n\n".join(part for part in (prior_body, body) if part)
+        else:
+            order.append(number)
+        blocks[number] = (title, body)
+    return blocks, order
+
+
+def _slide_narration_blocks(text: str) -> tuple[dict[int, str], str, bool]:
+    matches = sorted(
+        [*(_SLIDE_NARRATION_RE.finditer(text)), *(_UNASSIGNED_NARRATION_RE.finditer(text))],
+        key=lambda match: match.start(),
+    )
+    if not matches:
+        return {}, "", False
+    assigned: dict[int, str] = {}
+    unassigned: list[str] = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        body = text[match.end():end].strip()
+        if match.re is _SLIDE_NARRATION_RE:
+            number = _number_from_heading(match.group(1))
+            previous = assigned.get(number, "")
+            assigned[number] = "\n\n".join(part for part in (previous, body) if part)
+        else:
+            if body:
+                unassigned.append(body)
+    return assigned, "\n\n".join(unassigned), True
+
+
 def build_presentation_document(outline: str, transcript: str) -> str:
-    """Combine slide text and narration transcript into one prompt payload."""
+    """Build presentation input grouped by slide when narration timings allow it.
+
+    Marked, timestamp-aligned narration is joined to its slide text. Plain or
+    unaligned provider output stays in a clearly separate section; it is never
+    heuristically assigned to a slide.
+    """
+    slide_blocks, slide_order = _slide_blocks(outline)
+    narration, unassigned, has_markers = _slide_narration_blocks(transcript)
+    if has_markers:
+        sections: list[str] = []
+        if outline.strip() and not slide_blocks:
+            sections.append("## متن اسلایدها\n\n" + outline.strip())
+        sections.append("## متن اسلایدها و گفتار ارائه به تفکیک اسلاید")
+        order = list(dict.fromkeys([*slide_order, *sorted(narration)]))
+        for number in order:
+            title, slide_body = slide_blocks.get(number, ("", ""))
+            header = f"### اسلاید {to_persian_digits(number)}"
+            if title:
+                header += f" — {title}"
+            block = [header]
+            if slide_body:
+                block.append("متن اسلاید و یادداشت‌ها:\n\n" + slide_body)
+            if narration.get(number):
+                block.append("گفتار مرتبط با این اسلاید:\n\n" + narration[number])
+            sections.append("\n\n".join(block))
+        if unassigned:
+            sections.append(
+                "## متن پیاده‌سازی‌شدهٔ صدای ارائه (بدون نگاشت زمانی مطمئن)"
+            )
+            sections.append(
+                "### گفتار بدون نگاشت مطمئن به اسلاید\n\n" + unassigned
+            )
+        return "\n\n".join(sections)
+
     sections: list[str] = []
     if outline.strip():
         sections.append("## متن اسلایدها\n\n" + outline.strip())
     if transcript.strip():
         sections.append("## متن پیاده‌سازی‌شدهٔ صدای ارائه\n\n" + transcript.strip())
     return "\n\n".join(sections)
+
+
+def split_presentation_document(text: str, max_chars: int) -> list[str]:
+    """Pack complete slide blocks into chunks, splitting only an oversized slide.
+
+    This preserves slide boundaries when practical, so the note model receives
+    each slide's text beside its aligned narration instead of a generic text
+    chunk that crosses slide attribution boundaries.
+    """
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+    text = text.strip()
+    if not text:
+        return []
+    headings = list(re.finditer(
+        r"(?m)^###\s+(?:اسلاید\s+[0-9۰-۹٠-٩]+|گفتار بدون نگاشت مطمئن به اسلاید)",
+        text,
+    ))
+    if not headings:
+        return split_transcript(text, max_chars)
+
+    preamble = text[:headings[0].start()].strip()
+    blocks = [
+        text[match.start():(headings[index + 1].start() if index + 1 < len(headings) else len(text))].strip()
+        for index, match in enumerate(headings)
+    ]
+    chunks: list[str] = []
+    current = preamble
+
+    def flush() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for block in blocks:
+        candidate = "\n\n".join(part for part in (current, block) if part)
+        if len(candidate) <= max_chars:
+            current = candidate
+            continue
+        if current:
+            flush()
+        if len(block) <= max_chars:
+            current = block
+            continue
+
+        pieces = split_transcript(block, max_chars)
+        slide_match = _SLIDE_OUTLINE_RE.match(block)
+        slide_number = slide_match.group(1) if slide_match else ""
+        for index, piece in enumerate(pieces):
+            if index and slide_number:
+                prefix = (
+                    f"### ادامهٔ اسلاید "
+                    f"{to_persian_digits(_number_from_heading(slide_number))}\n\n"
+                )
+                piece_budget = max(1, max_chars - len(prefix))
+                for continuation in split_transcript(piece, piece_budget):
+                    chunks.append(prefix + continuation)
+            else:
+                chunks.append(piece)
+    flush()
+    return chunks
 
 
 async def structure_transcript(

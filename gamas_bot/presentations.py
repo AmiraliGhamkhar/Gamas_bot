@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import posixpath
 import re
 import shutil
@@ -21,7 +22,8 @@ from pathlib import Path, PurePosixPath
 from lxml import etree
 
 from .config import Settings
-from .media import merge_audio_tracks, probe_media_many
+from .media import merge_audio_tracks, needs_transcode, probe_media_many
+from .transcript import RawTranscript, Word, build_document
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +112,25 @@ class MediaClip:
     path: Path
     kind: str
     duration: float | None = None
+    relationship_id: str | None = None
 
     @property
     def label(self) -> str:
         where = f"اسلاید {self.slide_number}" if self.slide_number else "بدون اسلاید"
         return f"{where} ({posixpath.basename(self.part_name)})"
+
+
+@dataclass(frozen=True, slots=True)
+class ClipSpan:
+    """The interval a source clip occupies in the merged STT audio."""
+
+    clip: MediaClip
+    start_seconds: float
+    end_seconds: float
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.end_seconds - self.start_seconds)
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,9 +149,37 @@ class PresentationContent:
 class PreparedAudio:
     path: Path
     clips: tuple[MediaClip, ...]
-    total_duration: float | None
+    source_duration: float
+    output_duration: float
+    clip_spans: tuple[ClipSpan, ...]
     merged: bool
     skipped: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PresentationNarration:
+    """Timed narration mapped only where a clip-to-slide relation is known."""
+
+    slide_text: tuple[tuple[int, str], ...]
+    unassigned_text: str
+    aligned: bool
+
+    def as_text(self) -> str:
+        if not self.aligned:
+            return (
+                "### گفتار بدون نگاشت مطمئن به اسلاید\n\n"
+                + self.unassigned_text.strip()
+            ).strip()
+        blocks = [
+            f"### گفتار مرتبط با اسلاید {number}\n\n{text}"
+            for number, text in self.slide_text
+            if text.strip()
+        ]
+        if self.unassigned_text.strip():
+            blocks.append(
+                "### گفتار بدون نگاشت مطمئن به اسلاید\n\n" + self.unassigned_text.strip()
+            )
+        return "\n\n".join(blocks)
 
 
 def classify_presentation(filename: str | None, mime_type: str | None) -> str | None:
@@ -503,12 +547,7 @@ def _diagram_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
 
 
 def _chart_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
-    """A chart's title, series names and category labels, from its chart part.
-
-    A chart stores the visible labels in ``ppt/charts/chartN.xml``; the values
-    are numbers and are deliberately left out — they are not prose, and the
-    ``|``-joined table rows are not the place for a data dump.
-    """
+    """Read a chart's title, labels, series names and bounded cached values."""
     payload = _read_member(archive, part_name, 8_000_000)
     if not payload:
         return []
@@ -524,31 +563,70 @@ def _chart_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
             titles.extend(_lines_of(title))
         if titles:
             lines.append("عنوان نمودار: " + " ".join(dict.fromkeys(titles)))
-        series: list[str] = []
-        for entry in chart.iter(f"{{{CHART_NS}}}ser"):
-            name = entry.find(f"{{{CHART_NS}}}tx")
-            if name is not None:
-                series.extend(_lines_of(name))
-                series.extend(
-                    (value.text or "").strip()
-                    for value in name.iter(f"{{{CHART_NS}}}v")
-                    if (value.text or "").strip()
-                )
-        series = list(dict.fromkeys(series))
-        if series:
-            lines.append("سری‌های نمودار: " + "، ".join(series))
-        categories: list[str] = []
+
+        category_by_index: dict[int, str] = {}
+        category_order: list[str] = []
         for category in chart.iter(f"{{{CHART_NS}}}cat"):
-            for point in category.iter(f"{{{CHART_NS}}}pt"):
+            for position, point in enumerate(category.iter(f"{{{CHART_NS}}}pt")):
                 value = point.find(f"{{{CHART_NS}}}v")
                 text = (value.text or "").strip() if value is not None else ""
-                if text:
-                    categories.append(text)
-        categories = list(dict.fromkeys(categories))
-        if categories:
-            if len(categories) > 60:
-                categories = categories[:60] + ["…"]
-            lines.append("دسته‌های نمودار: " + "، ".join(categories))
+                if not text:
+                    continue
+                try:
+                    index = int(point.get("idx", position))
+                except (TypeError, ValueError):
+                    index = position
+                category_by_index[index] = text
+                category_order.append(text)
+        category_order = list(dict.fromkeys(category_order))
+        if category_order:
+            shown = category_order[:60]
+            if len(category_order) > 60:
+                shown.append("…")
+            lines.append("دسته‌های نمودار: " + "، ".join(shown))
+
+        series_names: list[str] = []
+        for entry in chart.iter(f"{{{CHART_NS}}}ser"):
+            name_node = entry.find(f"{{{CHART_NS}}}tx")
+            name_values: list[str] = []
+            if name_node is not None:
+                name_values.extend(_lines_of(name_node))
+                name_values.extend(
+                    (value.text or "").strip()
+                    for value in name_node.iter(f"{{{CHART_NS}}}v")
+                    if (value.text or "").strip()
+                )
+            name = " ".join(dict.fromkeys(name_values)).strip()
+            if name:
+                series_names.append(name)
+
+            value_node = entry.find(f"{{{CHART_NS}}}val")
+            if value_node is None:
+                continue
+            points: list[tuple[int, str]] = []
+            for position, point in enumerate(value_node.iter(f"{{{CHART_NS}}}pt")):
+                value = point.find(f"{{{CHART_NS}}}v")
+                text = (value.text or "").strip() if value is not None else ""
+                if not text:
+                    continue
+                try:
+                    index = int(point.get("idx", position))
+                except (TypeError, ValueError):
+                    index = position
+                points.append((index, text))
+            if points:
+                shown_points = points[:60]
+                value_labels = [
+                    f"{category_by_index[index]}={value}"
+                    if index in category_by_index else value
+                    for index, value in shown_points
+                ]
+                if len(points) > 60:
+                    value_labels.append("…")
+                label = f"مقادیر سری «{name}»: " if name else "مقادیر نمودار: "
+                lines.append(label + "، ".join(value_labels))
+        if series_names:
+            lines.append("سری‌های نمودار: " + "، ".join(dict.fromkeys(series_names)))
         break  # a chart part holds exactly one c:chart
     return lines
 
@@ -585,20 +663,6 @@ def _graphic_frame_lines(
                     if part:
                         lines.extend(_chart_lines(archive, part))
     return list(dict.fromkeys(lines))
-
-
-def _slide_graphics_text(
-    archive: zipfile.ZipFile, slide_part: str
-) -> list[str]:
-    """Diagram/chart text of one slide, read from the package alone."""
-    payload = _read_member(archive, slide_part, 20_000_000)
-    if not payload:
-        return []
-    try:
-        root = _parse_xml(payload)
-    except etree.XMLSyntaxError:
-        return []
-    return _graphic_frame_lines(archive, slide_part, root)
 
 
 def _notes_part_for(archive: zipfile.ZipFile, slide_part: str) -> str | None:
@@ -688,71 +752,74 @@ def _extract_slide_text_from_xml(path: Path) -> list[SlideText]:
         return []
 
 
-def _graphics_text_by_slide(path: Path) -> dict[int, tuple[str, ...]]:
-    """Diagram/chart text keyed by slide number, in the deck's own order."""
-    if not zipfile.is_zipfile(path):
-        return {}
-    try:
-        with zipfile.ZipFile(path) as archive:
-            return {
-                number: tuple(_slide_graphics_text(archive, part))
-                for number, part in enumerate(
-                    _slide_parts_in_order(archive), start=1
-                )
-            }
-    except Exception:  # the text frames still carry the deck
-        logger.warning("could not read diagram/chart text", exc_info=True)
-        return {}
+def _extract_slide_text(path: Path) -> list[SlideText]:
+    """Merge python-pptx text with XML fallback on each individual slide.
 
-
-def _with_graphics_text(
-    slides: list[SlideText], graphics: dict[int, tuple[str, ...]]
-) -> list[SlideText]:
-    """Append a slide's SmartArt/chart words to the text python-pptx read."""
+    The XML reader runs even when python-pptx succeeds: a deck can be only
+    partially readable (one broken slide, a table/notes edge case, or text held
+    in SmartArt/chart parts). We keep the richer primary result and fill every
+    missing field from that slide's package XML instead of using an all-or-none
+    fallback for the entire deck.
+    """
+    primary = _extract_slide_text_with_pptx(path)
+    fallback = _extract_slide_text_from_xml(path)
+    primary_by_number = {slide.number: slide for slide in primary}
+    fallback_by_number = {slide.number: slide for slide in fallback}
+    numbers = sorted(set(primary_by_number) | set(fallback_by_number))
     merged: list[SlideText] = []
-    for slide in slides:
-        extra = graphics.get(slide.number, ())
-        if not extra:
-            merged.append(slide)
+    recovered = 0
+
+    for number in numbers:
+        preferred = primary_by_number.get(number, SlideText(number))
+        xml = fallback_by_number.get(number, SlideText(number))
+        if preferred.is_empty and not xml.is_empty:
+            merged.append(xml)
+            recovered += 1
             continue
-        seen = {slide.title, *slide.body}
-        body = list(slide.body)
-        for line in extra:
+
+        title = preferred.title or xml.title
+        body = list(preferred.body)
+        seen = {line for line in (title, *body) if line}
+        # If both extractors found different candidate titles, preserve the
+        # secondary text as body rather than silently discarding slide content.
+        for line in (xml.title, *xml.body):
             if line and line not in seen:
                 seen.add(line)
                 body.append(line)
-        merged.append(
-            SlideText(slide.number, slide.title, tuple(body), slide.notes)
-        )
-    return merged
+                if line != preferred.title:
+                    recovered += 1
+        note_lines = list(dict.fromkeys(
+            line.strip()
+            for value in (preferred.notes, xml.notes)
+            for line in value.splitlines()
+            if line.strip()
+        ))
+        merged.append(SlideText(number, title, tuple(body), "\n".join(note_lines)))
 
-
-def _extract_slide_text(path: Path) -> list[SlideText]:
-    """Every slide's text: python-pptx first, the package XML as the fallback.
-
-    python-pptx understands placeholders, grouped shapes and tables, so it is
-    preferred. It is imported lazily and a single exotic deck can make it fail;
-    neither case may silently strip the deck's text from the model's input,
-    which is what the fallback exists for.
-    """
-    slides = _extract_slide_text_with_pptx(path)
-    graphics = _graphics_text_by_slide(path)
-    if any(not slide.is_empty for slide in slides):
-        return _with_graphics_text(slides, graphics)
-    fallback = _extract_slide_text_from_xml(path)
-    if any(not slide.is_empty for slide in fallback):
+    if recovered:
         logger.info(
-            "slide text recovered from the package XML slides=%d (python-pptx read %d)",
-            len(fallback), len(slides),
+            "slide text supplemented from package XML slides=%d fields=%d",
+            len(merged), recovered,
         )
-        return fallback
-    return _with_graphics_text(slides, graphics) or fallback
+    return merged or primary or fallback
+
+
+def _directory_size(directory: Path) -> int:
+    """Best-effort byte count of regular files currently under a work directory."""
+    total = 0
+    for item in directory.rglob("*"):
+        try:
+            if item.is_file():
+                total += item.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def read_presentation(
     path: Path, media_dir: Path, settings: Settings
 ) -> PresentationContent:
-    """Extract media clips and slide text from a .pptx package (blocking)."""
+    """Extract slide-linked media and slide text from a .pptx package (blocking)."""
     if not zipfile.is_zipfile(path):
         raise PresentationError(
             "این فایل یک ارائهٔ معتبر PowerPoint نیست یا آسیب دیده است."
@@ -760,48 +827,94 @@ def read_presentation(
     media_dir.mkdir(parents=True, exist_ok=True)
     clips: list[MediaClip] = []
     skipped: list[str] = []
-    handled: set[str] = set()
+    copied_paths: dict[str, Path] = {}
+    copied_bytes = 0
+    base_temp_bytes = _directory_size(path.parent)
+    if base_temp_bytes > settings.presentation_max_temp_bytes:
+        raise PresentationError("حجم فایل‌های موقت ارائه از سقف تعیین‌شده بیشتر است.")
 
     with zipfile.ZipFile(path) as archive:
         _validate_archive(archive, settings)
         names = set(archive.namelist())
         slide_parts = _slide_parts_in_order(archive)
-        ordered_media: list[tuple[int | None, str]] = []
+        references: list[tuple[int | None, str | None, str]] = []
+        referenced_parts: set[str] = set()
         for slide_number, slide_part in enumerate(slide_parts, start=1):
-            for _rel_id, rel_type, target in _relationships(archive, slide_part):
+            for rel_id, rel_type, target in _relationships(archive, slide_part):
                 if not target or rel_type not in MEDIA_REL_TYPES:
                     continue
                 resolved = _resolve_target(slide_part, target)
                 if resolved in names:
-                    ordered_media.append((slide_number, resolved))
-        # Media that no slide references (e.g. audio attached to a layout).
-        for name in sorted(names, key=natural_key):
-            if name.startswith("ppt/media/") and media_kind(name):
-                ordered_media.append((None, name))
+                    references.append((slide_number, rel_id, resolved))
+                    referenced_parts.add(resolved)
 
-        for slide_number, part_name in ordered_media:
-            if part_name in handled:
-                continue
-            handled.add(part_name)
+        unreferenced = sorted(
+            (
+                name for name in names
+                if name.startswith("ppt/media/")
+                and media_kind(name)
+                and name not in referenced_parts
+            ),
+            key=natural_key,
+        )
+        if settings.presentation_include_unreferenced_media:
+            references.extend((None, None, name) for name in unreferenced)
+        elif unreferenced:
+            skipped.append(
+                f"رسانهٔ بدون پیوند مستقیم به اسلاید نادیده گرفته شد ({len(unreferenced)} فایل)"
+            )
+
+        for slide_number, rel_id, part_name in references:
             kind = media_kind(part_name)
             if kind is None:
-                skipped.append(f"{posixpath.basename(part_name)}: قالب پشتیبانی‌نشده")
+                reason = f"{posixpath.basename(part_name)}: قالب رسانه پشتیبانی‌نشده"
+                if reason not in skipped:
+                    skipped.append(reason)
                 continue
             if kind == "video" and not settings.presentation_include_video_audio:
-                skipped.append(f"{posixpath.basename(part_name)}: ویدیو نادیده گرفته شد")
+                reason = f"{posixpath.basename(part_name)}: ویدیو نادیده گرفته شد"
+                if reason not in skipped:
+                    skipped.append(reason)
                 continue
             if len(clips) >= settings.presentation_max_clips:
-                skipped.append("تعداد فایل‌های رسانه‌ای بیش از حد مجاز بود")
+                if "تعداد استفاده‌های رسانه‌ای بیش از حد مجاز بود" not in skipped:
+                    skipped.append("تعداد استفاده‌های رسانه‌ای بیش از حد مجاز بود")
                 break
-            order = len(clips) + 1
-            destination = media_dir / _safe_media_filename(order, part_name)
-            info = archive.getinfo(part_name)
-            if info.file_size > settings.max_file_size:
-                skipped.append(f"{posixpath.basename(part_name)}: حجم بیش از حد مجاز")
+
+            try:
+                info = archive.getinfo(part_name)
+            except KeyError:
                 continue
-            with archive.open(info) as source, destination.open("wb") as target:
-                shutil.copyfileobj(source, target, 1024 * 1024)
-            clips.append(MediaClip(order, slide_number, part_name, destination, kind))
+            if info.file_size > settings.max_file_size:
+                reason = f"{posixpath.basename(part_name)}: حجم بیش از حد مجاز"
+                if reason not in skipped:
+                    skipped.append(reason)
+                continue
+
+            destination = copied_paths.get(part_name)
+            if destination is None:
+                if base_temp_bytes + copied_bytes + info.file_size > settings.presentation_max_temp_bytes:
+                    raise PresentationError(
+                        "حجم فایل‌های موقت ارائه از سقف تعیین‌شده بیشتر می‌شود."
+                    )
+                destination = media_dir / _safe_media_filename(
+                    len(copied_paths) + 1, part_name
+                )
+                with archive.open(info) as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target, 1024 * 1024)
+                copied_paths[part_name] = destination
+                copied_bytes += info.file_size
+
+            clips.append(
+                MediaClip(
+                    order=len(clips) + 1,
+                    slide_number=slide_number,
+                    part_name=part_name,
+                    path=destination,
+                    kind=kind,
+                    relationship_id=rel_id,
+                )
+            )
 
     slides = _extract_slide_text(path) if settings.presentation_include_slide_text else []
     if (
@@ -809,9 +922,6 @@ def read_presentation(
         and slide_parts
         and not any(not slide.is_empty for slide in slides)
     ):
-        # The deck is valid but carries no selectable words (a picture-only
-        # deck, or one whose text lives in a SmartArt/chart part). Say so:
-        # otherwise the booklet silently becomes a narration-only transcript.
         logger.warning(
             "the deck has %d slide(s) but no readable slide text", len(slide_parts)
         )
@@ -845,23 +955,28 @@ async def prepare_audio(
     *,
     skipped_out: list[str] | None = None,
 ) -> PreparedAudio | None:
-    """Probe the extracted clips and merge them into one track for the STT stage.
+    """Select, probe and prepare slide-linked clips for one deck-level STT call.
 
-    ``skipped_out`` receives the skip reasons even when the deck ends up with no
-    usable audio at all, so the caller can still explain what was dropped.
+    Source duration excludes synthetic inter-clip silence and is the billed
+    quantity. Output duration includes that silence and is the quantity checked
+    against the presentation cap and used for timestamp-to-slide mapping.
     """
     skipped = list(content.skipped)
-    if skipped_out is not None:
-        skipped_out.clear()
-        skipped_out.extend(skipped)
+
+    def sync_skipped() -> None:
+        if skipped_out is not None:
+            skipped_out.clear()
+            skipped_out.extend(skipped)
+
+    sync_skipped()
     if not content.clips:
         return None
-    # One worker process probes the whole deck (see ``media.probe_media_many``):
-    # probing each clip in its own process paid the interpreter + PyAV import
-    # per clip (~0.1 s on the reference VM, ~90% startup). Files that cannot
-    # be probed are simply absent from the mapping, so each becomes its own
-    # skip reason exactly like the per-clip MediaToolError did, in clip order.
-    probes = await probe_media_many([clip.path for clip in content.clips], settings)
+
+    # One worker process probes the whole deck. Duplicate paths are possible
+    # when the same media part is referenced on more than one slide; probing it
+    # once is enough, but each relationship remains a separate playback clip.
+    unique_paths = list(dict.fromkeys(clip.path for clip in content.clips))
+    probes = await probe_media_many(unique_paths, settings)
     usable: list[MediaClip] = []
     for clip in content.clips:
         info = probes.get(str(clip.path))
@@ -879,35 +994,184 @@ async def prepare_audio(
             continue
         usable.append(replace(clip, duration=info.duration))
 
-    if skipped_out is not None:
-        skipped_out.clear()
-        skipped_out.extend(skipped)
+    sync_skipped()
     if not usable:
         logger.info("No usable narration in the deck skipped=%s", len(skipped))
         return None
 
-    durations = [clip.duration for clip in usable if clip.duration is not None]
-    total_duration = sum(durations) if len(durations) == len(usable) else None
-    # The bound is checked against the best estimate available: the complete
-    # total when every clip was measured, otherwise the measured part (an
-    # unmeasurable clip cannot make the estimate smaller).
-    known_duration = total_duration if total_duration is not None else sum(durations)
-    if known_duration > settings.presentation_max_total_duration:
+    measured_source = (
+        sum(clip.duration for clip in usable)
+        if all(clip.duration is not None for clip in usable)
+        else None
+    )
+    estimated_output = (
+        measured_source + settings.presentation_silence_seconds * (len(usable) - 1)
+        if measured_source is not None else None
+    )
+    # A plainly oversized estimate can be rejected before decoding. The merge
+    # report remains authoritative, since container probes can slightly
+    # overestimate a video/audio stream's usable samples.
+    if (
+        estimated_output is not None
+        and estimated_output > settings.presentation_max_total_duration + 1.0
+    ):
         raise PresentationError(
-            "مجموع مدت صداهای این ارائه از سقف تعیین‌شدهٔ ربات بیشتر است."
+            "مدت صدای ادغام‌شدهٔ این ارائه (با فاصله‌های بین کلیپ‌ها) از سقف ربات بیشتر است."
         )
 
-    merged = await merge_audio_tracks(
+    if len(usable) == 1:
+        clip = usable[0]
+        info = probes[str(clip.path)]
+        if (
+            clip.kind == "audio"
+            and clip.duration is not None
+            and not needs_transcode(clip.path.name, info)
+        ):
+            output_duration = clip.duration
+            if output_duration > settings.presentation_max_total_duration:
+                raise PresentationError(
+                    "مدت صدای ارائه از سقف تعیین‌شدهٔ ربات بیشتر است."
+                )
+            if clip.path.stat().st_size > settings.max_file_size:
+                raise PresentationError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
+            if _directory_size(workdir) > settings.presentation_max_temp_bytes:
+                raise PresentationError("حجم فایل‌های موقت ارائه از سقف تعیین‌شده بیشتر است.")
+            return PreparedAudio(
+                path=clip.path,
+                clips=(clip,),
+                source_duration=clip.duration,
+                output_duration=output_duration,
+                clip_spans=(ClipSpan(clip, 0.0, output_duration),),
+                merged=False,
+                skipped=tuple(skipped),
+            )
+
+    # If one duration is unavailable, choose a format for the configured
+    # maximum rather than defaulting blindly to a potentially huge WAV.
+    format_duration = (
+        estimated_output
+        if estimated_output is not None
+        else settings.presentation_max_total_duration
+    )
+    available_temp_bytes = settings.presentation_max_temp_bytes - _directory_size(workdir)
+    if available_temp_bytes <= 0:
+        raise PresentationError("برای آماده‌سازی صدای ارائه فضای موقت کافی نیست.")
+    result = await merge_audio_tracks(
         [clip.path for clip in usable],
         workdir,
         settings,
-        total_duration=(
-            total_duration + settings.presentation_silence_seconds * (len(usable) - 1)
-            if total_duration is not None else None
-        ),
+        total_duration=format_duration,
+        max_output_bytes=min(available_temp_bytes, settings.max_file_size),
         stem="presentation-audio",
     )
-    return PreparedAudio(merged, tuple(usable), total_duration, True, tuple(skipped))
+    if result.output_duration > settings.presentation_max_total_duration + 1e-9:
+        raise PresentationError(
+            "مدت صدای ادغام‌شدهٔ این ارائه (با فاصله‌های بین کلیپ‌ها) از سقف ربات بیشتر است."
+        )
+    if result.path.stat().st_size > settings.max_file_size:
+        raise PresentationError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
+    if _directory_size(workdir) > settings.presentation_max_temp_bytes:
+        raise PresentationError("حجم فایل‌های موقت ارائه از سقف تعیین‌شده بیشتر است.")
+
+    spans = tuple(
+        ClipSpan(
+            clip=usable[span.input_index],
+            start_seconds=span.start_seconds,
+            end_seconds=span.end_seconds,
+        )
+        for span in result.clip_spans
+    )
+    return PreparedAudio(
+        path=result.path,
+        clips=tuple(usable),
+        source_duration=result.source_duration,
+        output_duration=result.output_duration,
+        clip_spans=spans,
+        merged=True,
+        skipped=tuple(skipped),
+    )
+
+
+def align_narration_to_slides(
+    raw: RawTranscript,
+    prepared: PreparedAudio,
+    slides: tuple[SlideText, ...] | list[SlideText],
+) -> PresentationNarration:
+    """Assign timed STT segments only to known slide-linked clip intervals.
+
+    Providers that return plain text (or segments without timestamps) stay
+    unaligned. Words in synthetic gaps, unreferenced clips, and segments without
+    usable timestamps are kept in an explicit unassigned section, never guessed
+    onto the nearest slide.
+    """
+    if not raw.words:
+        plain = build_document(raw).plain()
+        return PresentationNarration((), plain, False)
+
+    slide_order = {slide.number: index for index, slide in enumerate(slides)}
+    assigned: dict[int, list[Word]] = {}
+    unassigned: list[Word] = []
+    mapped_count = 0
+    has_timing = False
+    spans = sorted(prepared.clip_spans, key=lambda span: span.start_seconds)
+
+    for word in raw.words:
+        if not word.text.strip():
+            continue
+        start, end = word.start, word.end
+        timed = (
+            start is not None and end is not None
+            and math.isfinite(start) and math.isfinite(end)
+            and start >= 0 and end >= start
+        )
+        if not timed:
+            unassigned.append(word)
+            continue
+        has_timing = True
+        matches = [
+            item for item in spans
+            if start >= item.start_seconds and end <= item.end_seconds
+        ]
+        # A timed word/segment that crosses a clip edge or a synthetic gap is
+        # not attributed by its midpoint; it stays visible but unassigned.
+        span = matches[0] if len(matches) == 1 else None
+        slide_number = span.clip.slide_number if span is not None else None
+        if slide_number is None:
+            unassigned.append(word)
+            continue
+        assigned.setdefault(slide_number, []).append(word)
+        mapped_count += 1
+
+    if not has_timing or mapped_count == 0:
+        plain = build_document(raw).plain()
+        return PresentationNarration((), plain, False)
+
+    slide_text: list[tuple[int, str]] = []
+    for number in sorted(
+        assigned, key=lambda value: slide_order.get(value, len(slide_order) + value)
+    ):
+        words = assigned[number]
+        text = build_document(
+            RawTranscript(
+                words=words,
+                text=" ".join(word.text for word in words),
+                confidence=raw.confidence,
+                engine=raw.engine,
+            )
+        ).plain()
+        if text:
+            slide_text.append((number, text))
+    unassigned_text = ""
+    if unassigned:
+        unassigned_text = build_document(
+            RawTranscript(
+                words=unassigned,
+                text=" ".join(word.text for word in unassigned),
+                confidence=raw.confidence,
+                engine=raw.engine,
+            )
+        ).plain()
+    return PresentationNarration(tuple(slide_text), unassigned_text, bool(slide_text))
 
 
 def slides_outline(slides: tuple[SlideText, ...] | list[SlideText], limit: int | None = None) -> str:

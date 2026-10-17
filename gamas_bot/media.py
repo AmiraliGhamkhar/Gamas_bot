@@ -27,6 +27,8 @@ from .config import Settings
 logger = logging.getLogger(__name__)
 
 WAV_BYTES_PER_SECOND = 32000  # 16 kHz, mono, signed 16-bit PCM.
+OPUS_BYTES_PER_SECOND = 4000  # 32 kbit/s mono target.
+OPUS_SIZE_MARGIN = 128 * 1024
 OPUS_SAMPLE_RATE = 48000
 WAV_SAMPLE_RATE = 16000
 
@@ -43,6 +45,22 @@ class MediaInfo:
     has_audio: bool
     duration: float | None
     audio_codec: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class MergedClipSpan:
+    input_index: int
+    start_seconds: float
+    end_seconds: float
+
+
+@dataclass(frozen=True, slots=True)
+class AudioMergeResult:
+    path: Path
+    sample_rate: int
+    source_duration: float
+    output_duration: float
+    clip_spans: tuple[MergedClipSpan, ...]
 
 
 def worker_command(*args: str) -> list[str]:
@@ -215,6 +233,58 @@ def parse_probe_list_output(payload: str, paths: list[Path]) -> dict[str, MediaI
     return result
 
 
+def parse_merge_output(payload: str, input_count: int) -> tuple[int, int, int, tuple[MergedClipSpan, ...]]:
+    """Validate the worker's sample-accurate merge accounting report."""
+    try:
+        data = json.loads(payload or "{}")
+    except json.JSONDecodeError as exc:
+        raise MediaToolError("گزارش زمان‌بندی ادغام صدا قابل‌خواندن نیست.") from exc
+    if not isinstance(data, dict):
+        raise MediaToolError("ساختار گزارش زمان‌بندی ادغام صدا معتبر نیست.")
+
+    def integer(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise MediaToolError("ساختار گزارش زمان‌بندی ادغام صدا معتبر نیست.")
+        return value
+
+    def sample_count(name: str) -> int:
+        value = integer(data.get(name))
+        if value < 0:
+            raise MediaToolError("ساختار گزارش زمان‌بندی ادغام صدا معتبر نیست.")
+        return value
+
+    rate = sample_count("sample_rate")
+    source_samples = sample_count("source_samples")
+    output_samples = sample_count("output_samples")
+    raw_spans = data.get("clip_spans")
+    if (
+        rate <= 0 or source_samples <= 0 or output_samples < source_samples
+        or not isinstance(raw_spans, list) or len(raw_spans) != input_count
+    ):
+        raise MediaToolError("ساختار گزارش زمان‌بندی ادغام صدا معتبر نیست.")
+
+    spans: list[MergedClipSpan] = []
+    previous_end = 0
+    summed_clip_samples = 0
+    for expected_index, item in enumerate(raw_spans):
+        if not isinstance(item, dict):
+            raise MediaToolError("ساختار گزارش زمان‌بندی ادغام صدا معتبر نیست.")
+        index = integer(item.get("index"))
+        start = integer(item.get("start_sample"))
+        end = integer(item.get("end_sample"))
+        if (
+            index != expected_index or start < previous_end or start < 0
+            or end <= start or end > output_samples
+        ):
+            raise MediaToolError("ساختار گزارش زمان‌بندی ادغام صدا معتبر نیست.")
+        spans.append(MergedClipSpan(index, start / rate, end / rate))
+        summed_clip_samples += end - start
+        previous_end = end
+    if summed_clip_samples != source_samples:
+        raise MediaToolError("مدت فایل‌های ورودی با گزارش ادغام صدا سازگار نیست.")
+    return rate, source_samples, output_samples, tuple(spans)
+
+
 async def probe_media(path: Path, settings: Settings) -> MediaInfo:
     code, stdout, stderr = await run_command(
         build_probe_command(path),
@@ -274,13 +344,33 @@ async def probe_media_many(paths: list[Path], settings: Settings) -> dict[str, M
     return result
 
 
-def choose_merge_format(total_duration: float | None, settings: Settings) -> str:
-    """Pick a lossless WAV output, or Opus when WAV would grow too large."""
+def choose_merge_format(
+    total_duration: float | None,
+    settings: Settings,
+    *,
+    max_output_bytes: int | None = None,
+) -> str:
+    """Pick WAV or Opus while respecting the available file/temp budget."""
+    if max_output_bytes is not None and max_output_bytes <= 0:
+        raise MediaToolError("برای فایل صدای آماده‌شده فضای موقت کافی نیست.")
     if total_duration is None:
+        if max_output_bytes is None:
+            return "wav"
+        total_duration = settings.presentation_max_total_duration
+    if not math.isfinite(total_duration) or total_duration < 0:
+        raise MediaToolError("مدت صدای ادغام‌شده معتبر نیست.")
+    estimated_wav = total_duration * WAV_BYTES_PER_SECOND + 44
+    output_budget = settings.max_file_size
+    if max_output_bytes is not None:
+        output_budget = min(output_budget, max_output_bytes)
+    if estimated_wav <= min(settings.presentation_wav_limit_bytes, output_budget):
         return "wav"
-    estimated = total_duration * WAV_BYTES_PER_SECOND
-    limit = min(settings.presentation_wav_limit_bytes, settings.max_file_size)
-    return "opus" if estimated > limit else "wav"
+    estimated_opus = total_duration * OPUS_BYTES_PER_SECOND * 1.25 + OPUS_SIZE_MARGIN
+    if estimated_opus > output_budget:
+        raise MediaToolError(
+            "حجم تقریبی صدای ادغام‌شده از فضای موقت یا سقف حجم فایل بیشتر است."
+        )
+    return "opus"
 
 
 def merge_output_name(stem: str, output_format: str) -> str:
@@ -302,6 +392,8 @@ def build_merge_command(
     """
     if not inputs:
         raise MediaToolError("فهرست ورودی برای ادغام صدا خالی است.")
+    if not math.isfinite(silence_seconds) or not 0 <= silence_seconds <= 60:
+        raise MediaToolError("مدت سکوت میان کلیپ‌ها باید بین صفر تا ۶۰ ثانیه باشد.")
     command = worker_command(
         "merge",
         "--output", str(output),
@@ -319,10 +411,15 @@ async def merge_audio_tracks(
     settings: Settings,
     *,
     total_duration: float | None = None,
+    max_output_bytes: int | None = None,
     stem: str = "merged",
-) -> Path:
-    """Concatenate every input into one mono track ready for the STT engines."""
-    output_format = choose_merge_format(total_duration, settings)
+) -> AudioMergeResult:
+    """Concatenate audio and return exact source/output durations and clip spans."""
+    if not inputs:
+        raise MediaToolError("فهرست ورودی برای ادغام صدا خالی است.")
+    output_format = choose_merge_format(
+        total_duration, settings, max_output_bytes=max_output_bytes
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / merge_output_name(stem, output_format)
     command = build_merge_command(
@@ -331,7 +428,7 @@ async def merge_audio_tracks(
         output_format=output_format,
         silence_seconds=settings.presentation_silence_seconds,
     )
-    code, _, stderr = await run_command(
+    code, stdout, stderr = await run_command(
         command,
         settings.media_timeout,
         label="media_worker:merge",
@@ -339,7 +436,14 @@ async def merge_audio_tracks(
     )
     if code != 0 or not output.exists() or output.stat().st_size == 0:
         raise MediaToolError(f"ادغام صداهای ارائه ناموفق بود: {stderr.strip()[:300]}")
-    return output
+    rate, source_samples, output_samples, spans = parse_merge_output(stdout, len(inputs))
+    return AudioMergeResult(
+        path=output,
+        sample_rate=rate,
+        source_duration=source_samples / rate,
+        output_duration=output_samples / rate,
+        clip_spans=spans,
+    )
 
 
 # Codecs both STT providers accept directly, so the upload can skip transcoding.

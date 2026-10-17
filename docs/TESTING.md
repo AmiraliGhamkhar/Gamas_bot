@@ -36,13 +36,18 @@ has drifted.
 | One-shot v2 database import | `tests/test_import_v2.py` |
 | Queue bounds, back-pressure, shutdown | `tests/test_jobs.py` |
 | LLM request/response shapes, error classes, failover | `tests/test_llm.py` |
-| Note parsing, chunk budget, map/reduce, split recovery | `tests/test_notes.py` |
+| Note parsing, slide-aware chunking, map/reduce, split recovery | `tests/test_notes.py` |
+| PyAV merge metadata, PPTX media relationships, timing and XML fallback | `tests/test_media.py` |
 | Free Office: parser, Word/Excel/PowerPoint output, bot flow | `tests/test_office.py` |
 | STT adapters, retries, cooldowns, ordered failover | `tests/test_stt.py` |
 | Transcript paragraphing, fidelity, chunk boundaries | `tests/test_transcript.py` |
 
 The suite uses synthetic media and scripted HTTP/Telegram doubles. **No test
-needs an API key and no test makes a billable call.**
+needs an API key and no test makes a billable call.** Presentation tests verify
+mechanics (clip ordering/spans, source-vs-merged accounting, alignment,
+extraction fallback and resource caps); they do not establish STT accuracy,
+latency or denoising/VAD quality. Those claims require a separate
+consented/reference-audio benchmark.
 
 Two doubles are deliberately strict, because permissive ones hid real bugs:
 

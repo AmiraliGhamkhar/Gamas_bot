@@ -22,6 +22,13 @@ One job's lifecycle is `reserve → (settle | release)`:
 3. on any failure, cancellation or shutdown `release_hold` returns it in full,
    with a reason, exactly once.
 
+For a PowerPoint deck, the measured **source narration duration** is reserved and
+settled. Synthetic silence inserted between clips is not billable. The separate
+`PRESENTATION_MAX_TOTAL_DURATION` safety cap is applied to the merged STT artifact,
+so it includes those gaps; this prevents many short clips from exceeding the STT
+limit while avoiding charges for padding. See [PRESENTATIONS.md](PRESENTATIONS.md)
+for clip-span and alignment behavior.
+
 `recover_interrupted()` runs at startup: every `pending`/`processing` submission
 is marked failed and its hold released, so a crash cannot leave credit held
 forever.
