@@ -4,6 +4,33 @@ Entries describe user- and operator-visible change. For anything older than
 v3.0.0, read the git history — the v2 provider platform those entries describe
 no longer exists in the code.
 
+## Unreleased — 2026-10-17 — every slide word reaches the note model
+
+A deck's own words are the first input of the booklet prompt. Three paths
+could still keep them out of the request, and none of them said so.
+
+### Fixed
+
+* **A deck python-pptx cannot open no longer loses its text.** Slide text is
+  now read straight from the OPC package — `p:sp`/`a:r` runs, grouped shapes,
+  tables, speaker notes — whenever python-pptx is missing or raises on a deck.
+  The reader was checked against python-pptx on the sample decks; without this
+  fallback the note request silently held the narration only.
+* **SmartArt and chart text is read.** `ppt/diagrams/dataN.xml` and
+  `ppt/charts/chartN.xml` hold words that are not shape text frames, so a
+  diagram-only or chart-only slide read as empty — and a deck with no other
+  text was rejected as "no slide text and no audio". Diagram nodes, chart
+  titles, series names and category labels now join that slide's outline.
+* **A deck with no readable text says why.** The raw transcript (and the
+  delivered `.txt`) carries the reason, instead of the booklet quietly becoming
+  a narration-only transcript, and the job logs
+  `slides=… outline_chars=… clips=…` so an empty extraction is visible.
+* **ODP/OTP uploads are refused at intake** with a message naming the format to
+  send instead of being queued and failing later with a misleading reason.
+* **Soft line breaks are normalised.** U+000B (PowerPoint's in-run break) and
+  `a:br` are folded into a space, so Persian titles such as `Data \v Science`
+  reach the model as clean prose.
+
 ## Unreleased — 2026-10-17 — the Free Office section
 
 A second front door: the user's own text becomes a real Office file.

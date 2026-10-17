@@ -611,8 +611,10 @@ def build_deck(
 ) -> Path:
     """Create a .pptx whose slides carry real text plus injected media relations.
 
-    ``slides`` entries accept ``title``, ``bullets``, ``notes`` and ``media``
-    (a list of ``(part_filename, payload, rel_type)`` tuples).
+    ``slides`` entries accept ``title``, ``bullets``, ``notes``, ``media``
+    (a list of ``(part_filename, payload, rel_type)`` tuples), ``chart``
+    (``{"categories": [...], "series": [(name, values), ...]}``) and
+    ``smartart`` (a list of node texts, written to a real diagram-data part).
     """
     from pptx import Presentation
 
@@ -628,6 +630,20 @@ def build_deck(
             body.text = bullets[0]
             for extra in bullets[1:]:
                 body.add_paragraph().text = extra
+        chart = spec.get("chart")
+        if chart:
+            from pptx.chart.data import CategoryChartData
+            from pptx.enum.chart import XL_CHART_TYPE
+            from pptx.util import Inches
+
+            data = CategoryChartData()
+            data.categories = chart.get("categories") or ()
+            for name, values in chart.get("series") or ():
+                data.add_series(name, values)
+            slide.shapes.add_chart(
+                XL_CHART_TYPE.COLUMN_CLUSTERED,
+                Inches(1), Inches(3), Inches(5), Inches(3), data,
+            )
         if spec.get("notes"):
             slide.notes_slide.notes_text_frame.text = spec["notes"]
     deck.save(str(path))
@@ -661,6 +677,55 @@ def build_deck(
             )
         rels = rels.replace("</Relationships>", "".join(additions) + "</Relationships>")
         members[rels_name] = rels.encode("utf-8")
+
+    for index, spec in enumerate(slides, start=1):
+        points = spec.get("smartart") or []
+        if not points:
+            continue
+        # SmartArt: the words live in ppt/diagrams/dataN.xml and the slide only
+        # holds a graphicFrame pointing at it — exactly what python-pptx cannot
+        # read, so the fixture has to be assembled at the package level.
+        part = f"ppt/diagrams/data{index}.xml"
+        members[part] = (
+            '<dgm:dataModel '
+            'xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" '
+            'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">'
+            "<dgm:ptLst>"
+            '<dgm:pt modelId="0" type="doc"><dgm:t><a:p>'
+            "<a:endParaRPr/></a:p></dgm:t></dgm:pt>"
+            + "".join(
+                f'<dgm:pt modelId="{position + 1}"><dgm:t><a:p>'
+                f"<a:r><a:t>{point}</a:t></a:r></a:p></dgm:t></dgm:pt>"
+                for position, point in enumerate(points)
+            )
+            + "</dgm:ptLst></dgm:dataModel>"
+        ).encode("utf-8")
+        rels_name = f"ppt/slides/_rels/slide{index}.xml.rels"
+        rels = members[rels_name].decode("utf-8")
+        rels = rels.replace(
+            "</Relationships>",
+            f'<Relationship Id="rIdDiagram{index}" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/diagramData" '
+            f'Target="../diagrams/data{index}.xml"/></Relationships>',
+        )
+        members[rels_name] = rels.encode("utf-8")
+        slide_name = f"ppt/slides/slide{index}.xml"
+        slide_xml = members[slide_name].decode("utf-8")
+        frame = (
+            "<p:graphicFrame>"
+            '<p:nvGraphicFramePr><p:cNvPr id="900" name="SmartArt"/>'
+            "<p:cNvGraphicFramePr/><p:nvPr/></p:nvGraphicFramePr>"
+            '<p:xfrm><a:off x="0" y="0"/><a:ext cx="914400" cy="914400"/></p:xfrm>'
+            '<a:graphic><a:graphicData '
+            'uri="http://schemas.openxmlformats.org/drawingml/2006/diagram">'
+            '<dgm:relIds '
+            'xmlns:dgm="http://schemas.openxmlformats.org/drawingml/2006/diagram" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships" '
+            f'r:dm="rIdDiagram{index}"/>'
+            "</a:graphicData></a:graphic></p:graphicFrame>"
+        )
+        slide_xml = slide_xml.replace("</p:spTree>", frame + "</p:spTree>", 1)
+        members[slide_name] = slide_xml.encode("utf-8")
 
     for name, payload in (orphan_media or {}).items():
         members[f"ppt/media/{name}"] = payload

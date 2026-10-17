@@ -15,12 +15,13 @@ from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database
 from gamas_bot.jobs import Job
 from gamas_bot.media import MediaInfo, MediaToolError
-from gamas_bot.presentations import PresentationContent, SlideText
+from gamas_bot.presentations import PreparedAudio, PresentationContent, SlideText
 from gamas_bot.progress import JobProgress
 from gamas_bot.stt import STTError
 from gamas_bot.telegram_text import TELEGRAM_TEXT_LIMIT
 from gamas_bot.transcript import RawTranscript, Word
 from tests.support import (
+    build_deck,
     docx_text,
     sample_notes_json,
     FakeJobEvent,
@@ -358,6 +359,20 @@ class _SttAndLlmSession(_SpeechmaticsFakeSession):
         return super().post(url, **kwargs)
 
 
+class _LlmOnlySession:
+    """A scripted note provider — the presentation job's only HTTP call."""
+
+    def __init__(self, notes_json: str):
+        self.payload = {"choices": [{"message": {"content": notes_json}}]}
+        self.llm_calls: list[dict] = []
+
+    def post(self, url, **kwargs):
+        if not url.endswith("/chat/completions"):
+            raise AssertionError(f"unexpected request: {url}")
+        self.llm_calls.append({"url": url, **kwargs})
+        return _FakeAsyncContext(_FakeAsyncResponse(200, self.payload))
+
+
 class _FakeAsyncResponse:
     def __init__(self, status: int, payload: dict):
         self.status = status
@@ -568,6 +583,134 @@ class PresentationNotesDeliveryTests(BotPipelineTestCase):
         row = await self.db.submission(submission)
         assert row is not None
         self.assertEqual(row.status, "done")
+
+
+class PresentationPromptTests(BotPipelineTestCase):
+    """The deck's own text must be part of the note request, not only the audio."""
+
+    def settings_overrides(self) -> dict:
+        return {"note_api_base_url": "https://note.example/v1", "note_api_key": "note-key"}
+
+    async def test_slide_text_notes_and_narration_all_reach_the_note_model(self):
+        deck = build_deck(
+            Path(self._tmp.name) / "deck.pptx",
+            slides=[
+                {
+                    "title": "شبکهٔ عصبی",
+                    "bullets": ["لایهٔ ورودی", "لایهٔ پنهان"],
+                    "notes": "توضیح تکمیلی گوینده",
+                }
+            ],
+        )
+        event = self.wire(FakeJobEvent(source=deck))
+        await self.db.add_credit(USER_ID, 3600, note="test")
+        submission = await self.db.create_submission(
+            USER_ID, "presentation", deck.name
+        )
+        progress = await JobProgress.create(event, submission_id=submission)
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="presentation",
+            filename=deck.name,
+            message=event.message,
+            is_admin=False,
+            meta={"presentation_kind": "native", "progress": progress},
+        )
+        audio = Path(self._tmp.name) / "narration.wav"
+        audio.write_bytes(wav_bytes(duration=0.2))
+        session = _LlmOnlySession(sample_notes_json("جزوهٔ ارائه"))
+        self.bot._http_session = lambda: session  # type: ignore[method-assign]
+
+        async def fake_prepare(_content, _workdir, _settings, *, skipped_out=None):
+            if skipped_out is not None:
+                skipped_out.clear()
+            return PreparedAudio(
+                path=audio, clips=(), total_duration=12.0, merged=True
+            )
+
+        async def fake_probe(_path, _settings):
+            return MediaInfo(has_audio=True, duration=12.0, audio_codec="pcm_s16le")
+
+        async def fake_transcribe(_path, _settings, session=None):
+            return RawTranscript(
+                words=(), text="امروز درباره شبکهٔ عصبی صحبت شد", engine="fake"
+            )
+
+        with mock.patch("gamas_bot.bot.prepare_audio", new=fake_prepare), \
+                mock.patch("gamas_bot.bot.probe_media", new=fake_probe), \
+                mock.patch("gamas_bot.bot.transcribe", new=fake_transcribe):
+            await self.bot._run_job(job)
+
+        self.assertEqual(len(session.llm_calls), 1, session.llm_calls)
+        request = session.llm_calls[0]["json"]
+        user_content = request["messages"][1]["content"]
+        self.assertIn("## متن اسلایدها", user_content)
+        self.assertIn("شبکهٔ عصبی", user_content)
+        self.assertIn("لایهٔ ورودی", user_content)
+        self.assertIn("یادداشت گوینده: توضیح تکمیلی گوینده", user_content)
+        self.assertIn("## متن پیاده‌سازی‌شدهٔ صدای ارائه", user_content)
+        self.assertIn("امروز درباره", user_content)
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "done")
+
+    async def test_a_deck_whose_text_the_reader_cannot_open_still_sends_it(self):
+        """python-pptx failing must not silently strip the slides from the prompt."""
+        deck = build_deck(
+            Path(self._tmp.name) / "deck.pptx",
+            slides=[{"title": "آموزش", "bullets": ["گرادیان کاهشی"]}],
+        )
+        event = self.wire(FakeJobEvent(source=deck))
+        await self.db.add_credit(USER_ID, 3600, note="test")
+        submission = await self.db.create_submission(
+            USER_ID, "presentation", deck.name
+        )
+        progress = await JobProgress.create(event, submission_id=submission)
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="presentation",
+            filename=deck.name,
+            message=event.message,
+            is_admin=False,
+            meta={"presentation_kind": "native", "progress": progress},
+        )
+        session = _LlmOnlySession(sample_notes_json("جزوهٔ ارائه"))
+        self.bot._http_session = lambda: session  # type: ignore[method-assign]
+
+        async def no_audio(_content, _workdir, _settings, *, skipped_out=None):
+            if skipped_out is not None:
+                skipped_out.clear()
+            return None
+
+        with mock.patch("gamas_bot.bot.prepare_audio", new=no_audio), mock.patch(
+            "gamas_bot.presentations._extract_slide_text_with_pptx",
+            new=lambda _path: [],
+        ):
+            await self.bot._run_job(job)
+
+        self.assertEqual(len(session.llm_calls), 1, session.llm_calls)
+        user_content = session.llm_calls[0]["json"]["messages"][1]["content"]
+        self.assertIn("آموزش", user_content)
+        self.assertIn("گرادیان کاهشی", user_content)
+
+
+class PresentationIntakeTests(BotPipelineTestCase):
+    async def test_an_odp_upload_is_refused_with_a_clear_message(self):
+        source = Path(self._tmp.name) / "deck.odp"
+        source.write_bytes(b"not an odp the bot can read")
+        event = self.wire(FakeJobEvent(source=source))
+        with mock.patch.object(self.bot.queue, "submit") as submit:
+            await self.bot._accept_presentation(
+                event, USER_ID, "unsupported", "deck.odp"
+            )
+        submit.assert_not_called()
+        self.assertTrue(
+            any("ODP/OTP" in reply for reply in event.replies), event.replies
+        )
+        rows = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM submissions")
+        self.assertEqual(int(rows[0][0]), 0)
 
 
 class ReserveEstimateTests(unittest.TestCase):
