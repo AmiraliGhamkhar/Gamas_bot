@@ -235,7 +235,6 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
     slides: list[OfficeSlide] = []
     current_title = document.title or DEFAULT_TITLE
     current_lines: list[str] = []
-    notes: list[str] = []
 
     def flush() -> None:
         if current_lines:
@@ -243,7 +242,10 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
                 OfficeSlide(
                     title=current_title,
                     bullets=tuple(current_lines),
-                    notes="\n".join(notes).strip(),
+                    # Keep the exact body in the notes pane too. Using the
+                    # accumulated slide lines includes table rows as well as
+                    # prose; a separate prose-only list silently lost grids.
+                    notes="\n".join(current_lines).strip(),
                 )
             )
 
@@ -253,7 +255,6 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
             flush()
             current_title = block.text or current_title
             current_lines = []
-            notes = []
             continue
         if block.kind == "table":
             for row in block.rows:
@@ -261,7 +262,6 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
             continue
         if block.text:
             current_lines.append(block.text)
-            notes.append(block.text)
     flush()
 
     if not has_heading and len(current_lines) > 0:

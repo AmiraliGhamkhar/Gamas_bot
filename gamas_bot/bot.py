@@ -68,7 +68,12 @@ from .media import (
     needs_transcode,
     probe_media,
 )
-from .notes import StructuredNotes, structure_presentation, structure_transcript
+from .notes import (
+    StructuredNotes,
+    build_presentation_document,
+    structure_presentation,
+    structure_transcript,
+)
 from .pdf_export import build_office_pdf
 from .office import (
     FORMAT_EMOJI,
@@ -1154,6 +1159,7 @@ class GamasBot:
 
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
         transcript_text = document.llm_document() if document is not None else ""
+        presentation_text = build_presentation_document(outline, transcript_text)
         notes = await self._generate_presentation_notes(outline, transcript_text, job, progress)
         await self.db.save_transcription(
             job.submission_id,
@@ -1161,8 +1167,17 @@ class GamasBot:
             text=raw_text,
             notes_json=notes.to_json() if notes else "",
         )
-        await self._deliver_booklet(job, workdir, notes, document, reference, meta, progress,
-                                    plain_title="جزوهٔ ارائه")
+        await self._deliver_booklet(
+            job,
+            workdir,
+            notes,
+            document,
+            reference,
+            meta,
+            progress,
+            plain_title="جزوهٔ ارائه",
+            plain_text=presentation_text,
+        )
 
     # ------------------------------------------------------- free office job
     async def _process_office(self, job: Job, workdir: Path, progress) -> None:
@@ -1332,6 +1347,7 @@ class GamasBot:
         progress,
         *,
         plain_title: str = "جزوهٔ کلاس",
+        plain_text: str | None = None,
     ) -> None:
         await progress.update(94, "📑 جزوه آماده است؛ دارم فایل Word را می‌سازم")
         notice = ""
@@ -1350,10 +1366,12 @@ class GamasBot:
                 logger.exception("docx generation failed; falling back to chat message")
                 docx_path = None
         if docx_path is None:
-            plain_text = document.llm_document() if document is not None else ""
+            fallback_text = plain_text
+            if fallback_text is None:
+                fallback_text = document.llm_document() if document is not None else ""
             try:
                 docx_bytes = await asyncio.to_thread(
-                    build_plain_docx, plain_title, plain_text,
+                    build_plain_docx, plain_title, fallback_text,
                     fonts=resolve_fonts(), design=resolve_design(), meta=meta,
                 )
                 docx_path = workdir / plain_docx_filename(plain_title, reference)

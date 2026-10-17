@@ -20,12 +20,14 @@ from gamas_bot.notes import (
     StructuredNotes,
     build_context,
     build_system_prompt,
+    build_presentation_document,
     compile_accepts,
     context_block_for,
     heading_topic_key,
     headings_share_a_topic,
     merge_structured_notes,
     scrub_backend_artifacts,
+    structure_presentation,
     structure_transcript,
 )
 from tests.support import make_settings, sample_notes_json
@@ -614,6 +616,36 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
 async def _noop():
     return None
+
+
+class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slide_text_speaker_notes_and_narration_reach_the_note_model(self):
+        outline = (
+            "### اسلاید ۱ — شبکه‌های عصبی\n"
+            "- لایهٔ ورودی\n"
+            "یادداشت گوینده: هر لایه ویژگی‌ها را به مرحلهٔ بعد می‌فرستد."
+        )
+        transcript = "در صدا هم دربارهٔ آموزش وزن‌ها توضیح داده شد."
+        settings = make_settings(note_chunk_chars=100_000, note_compile=False)
+        session = FakeSession([sample_notes_json()])
+
+        await structure_presentation(outline, transcript, settings, session)
+
+        self.assertEqual(len(session.calls), 1)
+        request = session.calls[0]["json"]
+        user_content = request["messages"][1]["content"]
+        self.assertIn("## متن اسلایدها", user_content)
+        self.assertIn("یادداشت گوینده: هر لایه ویژگی‌ها را", user_content)
+        self.assertIn("## متن پیاده‌سازی‌شدهٔ صدای ارائه", user_content)
+        self.assertIn(transcript, user_content)
+        self.assertIn("یادداشت گویندهٔ هر اسلاید جزو محتوای آموزشی است", request["messages"][0]["content"])
+
+    def test_presentation_document_keeps_both_sources_separate(self):
+        document = build_presentation_document("### اسلاید ۱\nیادداشت گوینده: نکته", "صدای کلاس")
+        self.assertIn("## متن اسلایدها", document)
+        self.assertIn("یادداشت گوینده: نکته", document)
+        self.assertIn("## متن پیاده‌سازی‌شدهٔ صدای ارائه", document)
+        self.assertIn("صدای کلاس", document)
 
 
 if __name__ == "__main__":
