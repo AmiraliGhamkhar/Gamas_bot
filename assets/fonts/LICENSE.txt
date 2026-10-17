@@ -1,0 +1,14 @@
+Vazirmatn v33.003
+Copyright (c) 2015-2025 The Vazirmatn Project Authors
+https://github.com/rastikerdar/vazirmatn
+
+This font is distributed under the SIL Open Font License, Version 1.1
+("OFL"), which permits free use, distribution and modification, with or
+without modification, provided the font is not sold by itself.
+
+The full license text is available at:
+https://openfontlicense.org
+and in the upstream repository: https://github.com/rastikerdar/vazirmatn/blob/master/OFL.txt
+
+Used by the Free Office section to render Persian text in PDF documents
+(gamas_bot/pdf_export.py).

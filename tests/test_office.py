@@ -554,7 +554,7 @@ class OfficeScreenTests(OfficeBotTestCase):
         await self.bot._handle_message(event)
         self.assertTrue(any("آفیس رایگان" in reply for reply in event.replies))
 
-    async def test_the_office_button_shows_the_three_formats(self):
+    async def test_the_office_button_shows_the_four_formats(self):
         event = self.wire(FakeJobEvent())
         callback = self.callback(b"office", client=event.client)
         await self.bot._handle_callback(callback)
@@ -565,6 +565,9 @@ class OfficeScreenTests(OfficeBotTestCase):
         self.assertIn("Word", screen)
         self.assertIn("Excel", screen)
         self.assertIn("PowerPoint", screen)
+        self.assertIn("PDF", screen)
+        labels = [button.text for row in callback.edits[-1]["buttons"] for button in row]
+        self.assertIn("📕 PDF", labels)
 
     async def test_cancelling_clears_the_session(self):
         self.bot._office_sessions[USER_ID] = mock.Mock()
@@ -590,6 +593,25 @@ class OfficeJobTests(OfficeBotTestCase):
         payload = event.file_bytes(".docx")
         self.assertTrue(payload.startswith(b"PK"))
         self.assertIn("این متن عیناً در سند می‌آید.", docx_text(payload))
+        # The section is free: the balance is untouched.
+        self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
+        row = await self.db.submission(job.submission_id)
+        assert row is not None
+        self.assertEqual(row.status, "done")
+        self.assertEqual(row.kind, "office")
+
+    async def test_a_pdf_document_is_delivered_and_costs_no_credit(self):
+        await self.db.add_credit(USER_ID, 3600, note="test")
+        event = self.wire(FakeJobEvent())
+        event.message._chat_id = USER_ID
+        await self.bot._handle_office_message(event, USER_ID, SAMPLE)
+        callback = self.callback(b"office:pdf", client=event.client)
+        await self.bot._handle_office_action(callback, "pdf")
+        job = await self.run_queued_job()
+
+        payload = event.file_bytes(".pdf")
+        self.assertTrue(payload.startswith(b"%PDF"))
+        self.assertTrue(payload.rstrip().endswith(b"%%EOF"))
         # The section is free: the balance is untouched.
         self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
         row = await self.db.submission(job.submission_id)

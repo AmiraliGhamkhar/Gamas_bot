@@ -7,9 +7,9 @@ right-to-left Word booklet.
 * **Persian first** — RTL paragraphs and styles, mixed Persian/English runs,
   Persian digits, real heading styles, cover page, page frame, native
   page-number fields.
-* **Free Office section** — send your own text and get a real Word, Excel or
-  PowerPoint file, right-to-left and in the same brand. It costs no credit,
-  and it never rewrites what you wrote.
+* **Free Office section** — send your own text and get a real Word, Excel,
+  PowerPoint or PDF file, right-to-left and in the same brand. It costs no
+  credit, and it never rewrites what you wrote.
 * **No system media binaries** — media runs on PyAV and python-pptx. There is no
   `ffmpeg`, `ffprobe` or `soffice` requirement.
 * **Providers are configuration** — speech-to-text (Speechmatics / Deepgram /
@@ -32,8 +32,9 @@ The raw transcript is persisted and delivered **before** note generation starts,
 so a note-provider outage never costs the user their content.
 
 In chat everything starts from one button, **📎 ساخت جزوه**. A second button,
-**📄 آفیس رایگان**, turns the user's own text into a real Word, Excel or
-PowerPoint file — free, and without touching the credit ledger. Admins step
+**📄 آفیس رایگان**, turns the user's own text into a real Word, Excel,
+PowerPoint or PDF file — free, and without touching the credit ledger.
+Admins step
 into their own panel (**🛠 پنل مدیریت**) for statistics, users, pending
 payments and broadcasts.
 
@@ -44,7 +45,7 @@ payments and broadcasts.
 | Audio | MP3, M4A, WAV, OGG/OPUS, FLAC, WMA, AMR, AAC, Telegram voice notes |
 | Video | MP4, MKV, MOV, AVI, WEBM, WMV, MPEG/TS, Telegram round videos (audio track extracted, never re-encoded) |
 | Decks | PPTX, PPTM, PPSX, PPSM, POTX, POTM, legacy PPT/PPS/POT (converted in-process). ODP/OTP are not supported |
-| Free Office | Word (`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`) built from a chat message or an uploaded `.txt`/`.csv`/`.tsv`/`.md` file |
+| Free Office | Word (`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`), PDF (`.pdf`) built from a chat message or an uploaded `.txt`/`.csv`/`.tsv`/`.md` file |
 
 ## Install
 
