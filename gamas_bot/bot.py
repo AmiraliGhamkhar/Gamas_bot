@@ -863,6 +863,15 @@ class GamasBot:
     async def _accept_presentation(
         self, event, user_id: int, kind: str, filename: str | None
     ) -> None:
+        if kind == "unsupported":
+            # Classified as a presentation we cannot read (ODP/OTP). Refusing
+            # here keeps a queued job from failing later with a misleading
+            # "no slide text and no audio" message.
+            await event.reply(
+                "⚠️ فرمت ODP/OTP پشتیبانی نمی‌شود؛ لطفاً ارائه را با PowerPoint "
+                "به‌صورت pptx ذخیره و دوباره بفرستید."
+            )
+            return
         submission_id = await self.db.create_submission(user_id, "presentation", filename)
         progress = await JobProgress.create(event, submission_id=submission_id)
         job = Job(
@@ -1075,6 +1084,13 @@ class GamasBot:
         await progress.update(40, "🔍 دارم اسلایدها را می‌خوانم")
         content = await load_presentation(source_path, workdir, self.settings)
         outline = slides_outline(content.slides)
+        # The note model is only as good as this input, so record what was
+        # actually read from the deck: a deck whose text silently extracted as
+        # empty is otherwise indistinguishable from a deck without text.
+        logger.info(
+            "presentation read submission=%s slides=%d outline_chars=%d clips=%d",
+            job.submission_id, len(content.slides), len(outline), len(content.clips),
+        )
         skipped: list[str] = []
         prepared = await prepare_audio(content, workdir, self.settings, skipped_out=skipped)
         # Legacy .ppt conversion can drop embedded media (ppt2pptx warns
@@ -1138,7 +1154,7 @@ class GamasBot:
         # Include skip reasons when any clip was dropped, so the user knows
         # why a narration file did not make it into the transcript.
         if skipped:
-            raw_text += "\n\n---\nنکته: برخی فایل‌های رسانه‌ای نادیده گرفته شدند:\n" + "\n".join(f"• {reason}" for reason in skipped)
+            raw_text += "\n\n---\nنکته: این موارد در پردازش نادیده گرفته شدند:\n" + "\n".join(f"• {reason}" for reason in skipped)
         await self.db.save_transcription(
             job.submission_id,
             engine=raw_engine or ("slides" if document is None else "stt"),

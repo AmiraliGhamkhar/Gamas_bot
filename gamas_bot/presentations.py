@@ -55,12 +55,26 @@ VIDEO_MEDIA_EXTENSIONS = {
 
 RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 PML_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 MEDIA_REL_TYPES = {
     f"{OFFICE_REL_NS}/audio": "audio",
     f"{OFFICE_REL_NS}/video": "video",
     f"{OFFICE_REL_NS}/media": "media",
 }
+NOTES_SLIDE_REL_TYPE = f"{OFFICE_REL_NS}/notesSlide"
+#: Placeholders that carry page furniture (slide number, date, header, footer),
+#: never the lecture's own words; python-pptx skips their ``a:fld`` text too.
+FURNITURE_PLACEHOLDERS = frozenset({"sldNum", "hdr", "ftr", "dt"})
+#: ``type`` values of the placeholders that hold a slide's title.
+TITLE_PLACEHOLDERS = frozenset({"title", "ctrTitle"})
+DIAGRAM_NS = "http://schemas.openxmlformats.org/drawingml/2006/diagram"
+CHART_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
+#: SmartArt keeps its words in a diagram-data part, a chart in a chart part;
+#: neither is a text frame, so python-pptx (and a naive slide-XML scan) misses
+#: them. Both parts are read and merged back into their slide's text.
+DIAGRAM_DATA_REL_TYPE = f"{OFFICE_REL_NS}/diagramData"
+CHART_REL_TYPE = f"{OFFICE_REL_NS}/chart"
 MAX_ZIP_ENTRIES = 20000
 
 
@@ -261,7 +275,19 @@ def _validate_archive(archive: zipfile.ZipFile, settings: Settings) -> None:
             raise PresentationError("حجم بازشدهٔ فایل ارائه از حد مجاز بیشتر است.")
 
 
-def _extract_slide_text(path: Path) -> list[SlideText]:
+#: PowerPoint stores a soft line break inside one run as U+000B and python-pptx
+#: passes it through in ``shape.text``. It is not meaningful to the note model
+#: (and some providers reject raw control characters), so it is folded into a
+#: space while the text is still on its way in.
+_SOFT_BREAKS = str.maketrans({"\v": " ", "\u2028": " ", "\u2029": " "})
+
+
+def _clean_text(text: str) -> str:
+    """One line of clean prose: no control characters, no stray whitespace."""
+    return " ".join(text.translate(_SOFT_BREAKS).split())
+
+
+def _extract_slide_text_with_pptx(path: Path) -> list[SlideText]:
     """Read titles, bullet text, tables and speaker notes with python-pptx."""
     try:
         # Presentation() rejects slideshow/template main content types even
@@ -301,14 +327,16 @@ def _extract_slide_text(path: Path) -> list[SlideText]:
                     continue
                 if getattr(shape, "has_table", False):
                     for row in shape.table.rows:
-                        cells = [cell.text.strip() for cell in row.cells]
+                        cells = [_clean_text(cell.text) for cell in row.cells]
                         line = " | ".join(cell for cell in cells if cell)
                         if line:
                             collected.append(line)
                     continue
                 if getattr(shape, "has_text_frame", False):
                     for paragraph in shape.text_frame.paragraphs:
-                        line = "".join(run.text for run in paragraph.runs).strip()
+                        line = _clean_text(
+                            "".join(run.text for run in paragraph.runs)
+                        )
                         if line:
                             collected.append(line)
             except Exception:  # a single broken shape must not lose the deck
@@ -320,18 +348,405 @@ def _extract_slide_text(path: Path) -> list[SlideText]:
         title = ""
         try:
             if slide.shapes.title is not None and slide.shapes.title.has_text_frame:
-                title = slide.shapes.title.text.strip()
+                title = _clean_text(slide.shapes.title.text)
         except Exception:
             logger.debug("Slide %s has no readable title", number, exc_info=True)
         body = [line for line in shape_texts(slide.shapes) if line and line != title]
         notes = ""
         try:
             if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
-                notes = slide.notes_slide.notes_text_frame.text.strip()
+                notes = _clean_text(slide.notes_slide.notes_text_frame.text)
         except Exception:
             logger.debug("Slide %s has no readable notes", number, exc_info=True)
         slides.append(SlideText(number, title, tuple(dict.fromkeys(body)), notes))
     return slides
+
+
+def _local_name(element) -> str:
+    """The local part of a namespaced tag (``{ns}sp`` → ``sp``)."""
+    tag = element.tag
+    if not isinstance(tag, str):
+        return ""
+    return tag.rsplit("}", 1)[-1]
+
+
+def _paragraph_text(paragraph) -> str:
+    """The visible text of one ``a:p``, in document order.
+
+    Only ``a:r`` runs and ``a:br`` breaks are read. An ``a:fld`` (a slide
+    number, a date) is page furniture and python-pptx's ``paragraph.runs``
+    skips it too, so skipping it here keeps the two readers in step.
+    """
+    parts: list[str] = []
+    for node in paragraph:
+        if node.tag == f"{{{DRAWING_NS}}}r":
+            parts.extend(t.text or "" for t in node.iter(f"{{{DRAWING_NS}}}t"))
+        elif node.tag == f"{{{DRAWING_NS}}}br":
+            # python-pptx renders ``a:br`` as U+000B; keep the word boundary.
+            parts.append(" ")
+    return _clean_text("".join(parts))
+
+
+def _text_body_lines(shape) -> list[str]:
+    """The non-empty paragraphs of a shape's ``p:txBody``."""
+    body = shape.find(f"{{{PML_NS}}}txBody")
+    if body is None:
+        return []
+    lines = [
+        _paragraph_text(paragraph)
+        for paragraph in body.findall(f"{{{DRAWING_NS}}}p")
+    ]
+    return [line for line in lines if line]
+
+
+def _placeholder_type(shape) -> str:
+    """The ``p:ph/@type`` of a placeholder shape, or ``""`` for a plain shape."""
+    node = shape.find(f"{{{PML_NS}}}nvSpPr/{{{PML_NS}}}nvPr/{{{PML_NS}}}ph")
+    return (node.get("type") or "") if node is not None else ""
+
+
+def _table_lines(frame) -> list[str]:
+    """One line per table row, cells joined the way the python-pptx reader does."""
+    lines: list[str] = []
+    for table in frame.iter(f"{{{DRAWING_NS}}}tbl"):
+        for row in table.findall(f"{{{DRAWING_NS}}}tr"):
+            cells = [
+                " ".join(
+                    line
+                    for line in (
+                        _paragraph_text(paragraph)
+                        for paragraph in cell.iter(f"{{{DRAWING_NS}}}p")
+                    )
+                    if line
+                )
+                for cell in row.findall(f"{{{DRAWING_NS}}}tc")
+            ]
+            line = " | ".join(cell for cell in cells if cell)
+            if line:
+                lines.append(line)
+    return lines
+
+
+def _shape_tree_lines(node) -> list[tuple[bool, str]]:
+    """``(is_title, line)`` pairs of one ``p:spTree``/``p:grpSp``, in order."""
+    entries: list[tuple[bool, str]] = []
+    for child in node:
+        name = _local_name(child)
+        if name == "sp":
+            is_title = _placeholder_type(child) in TITLE_PLACEHOLDERS
+            entries.extend((is_title, line) for line in _text_body_lines(child))
+        elif name == "grpSp":
+            entries.extend(_shape_tree_lines(child))
+        elif name == "AlternateContent":
+            # ``mc:AlternateContent`` wraps a newer shape plus a fallback of
+            # the same shape; descend into both, the duplicate is removed by
+            # the caller's de-duplication.
+            for branch in child:
+                entries.extend(_shape_tree_lines(branch))
+        elif name == "graphicFrame":
+            entries.extend((False, line) for line in _table_lines(child))
+    return entries
+
+
+def _related_part(
+    archive: zipfile.ZipFile, source_part: str, rel_id: str, rel_type: str
+) -> str | None:
+    """The internal part ``rel_id`` of ``source_part`` names, if it matches."""
+    if not rel_id:
+        return None
+    for candidate_id, candidate_type, target in _relationships(archive, source_part):
+        if candidate_id == rel_id and candidate_type == rel_type and target:
+            name = _resolve_target(source_part, target)
+            try:
+                archive.getinfo(name)
+            except KeyError:
+                return None
+            return name
+    return None
+
+
+def _lines_of(element) -> list[str]:
+    """One line per paragraph of an element's drawing text."""
+    return [
+        line
+        for line in (_paragraph_text(p) for p in element.iter(f"{{{DRAWING_NS}}}p"))
+        if line
+    ]
+
+
+def _diagram_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
+    """The words of a SmartArt diagram, from its ``dgm:dataModel`` part.
+
+    SmartArt text is not a shape text frame: it lives in ``ppt/diagrams`` and
+    python-pptx never sees it, so a diagram-only slide used to read as empty.
+    """
+    payload = _read_member(archive, part_name, 8_000_000)
+    if not payload:
+        return []
+    try:
+        root = _parse_xml(payload)
+    except etree.XMLSyntaxError:
+        logger.warning("Malformed diagram part: %s", part_name)
+        return []
+    lines: list[str] = []
+    for point in root.iter(f"{{{DIAGRAM_NS}}}pt"):
+        if point.get("type"):
+            continue  # doc/transition nodes are wiring, not content
+        text = point.find(f"{{{DIAGRAM_NS}}}t")
+        if text is None:
+            continue
+        lines.extend(_lines_of(text))
+        if len(lines) >= 200:
+            lines.append("…")
+            break
+    return lines
+
+
+def _chart_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
+    """A chart's title, series names and category labels, from its chart part.
+
+    A chart stores the visible labels in ``ppt/charts/chartN.xml``; the values
+    are numbers and are deliberately left out — they are not prose, and the
+    ``|``-joined table rows are not the place for a data dump.
+    """
+    payload = _read_member(archive, part_name, 8_000_000)
+    if not payload:
+        return []
+    try:
+        root = _parse_xml(payload)
+    except etree.XMLSyntaxError:
+        logger.warning("Malformed chart part: %s", part_name)
+        return []
+    lines: list[str] = []
+    for chart in root.iter(f"{{{CHART_NS}}}chart"):
+        titles: list[str] = []
+        for title in chart.findall(f"{{{CHART_NS}}}title"):
+            titles.extend(_lines_of(title))
+        if titles:
+            lines.append("عنوان نمودار: " + " ".join(dict.fromkeys(titles)))
+        series: list[str] = []
+        for entry in chart.iter(f"{{{CHART_NS}}}ser"):
+            name = entry.find(f"{{{CHART_NS}}}tx")
+            if name is not None:
+                series.extend(_lines_of(name))
+                series.extend(
+                    (value.text or "").strip()
+                    for value in name.iter(f"{{{CHART_NS}}}v")
+                    if (value.text or "").strip()
+                )
+        series = list(dict.fromkeys(series))
+        if series:
+            lines.append("سری‌های نمودار: " + "، ".join(series))
+        categories: list[str] = []
+        for category in chart.iter(f"{{{CHART_NS}}}cat"):
+            for point in category.iter(f"{{{CHART_NS}}}pt"):
+                value = point.find(f"{{{CHART_NS}}}v")
+                text = (value.text or "").strip() if value is not None else ""
+                if text:
+                    categories.append(text)
+        categories = list(dict.fromkeys(categories))
+        if categories:
+            if len(categories) > 60:
+                categories = categories[:60] + ["…"]
+            lines.append("دسته‌های نمودار: " + "، ".join(categories))
+        break  # a chart part holds exactly one c:chart
+    return lines
+
+
+def _graphic_frame_lines(
+    archive: zipfile.ZipFile, slide_part: str, node
+) -> list[str]:
+    """Diagram/chart text of every ``p:graphicFrame`` under ``node``.
+
+    A SmartArt's words live in its diagram-data part and a chart's labels in
+    its chart part; neither is a shape text frame, so both are resolved
+    through the slide's relationships and read from their own parts.
+    """
+    lines: list[str] = []
+    for frame in node.iter(f"{{{PML_NS}}}graphicFrame"):
+        for data in frame.iter(f"{{{DRAWING_NS}}}graphicData"):
+            for child in data:
+                if child.tag == f"{{{DIAGRAM_NS}}}relIds":
+                    part = _related_part(
+                        archive,
+                        slide_part,
+                        child.get(f"{{{OFFICE_REL_NS}}}dm") or "",
+                        DIAGRAM_DATA_REL_TYPE,
+                    )
+                    if part:
+                        lines.extend(_diagram_lines(archive, part))
+                elif child.tag == f"{{{CHART_NS}}}chart":
+                    part = _related_part(
+                        archive,
+                        slide_part,
+                        child.get(f"{{{OFFICE_REL_NS}}}id") or "",
+                        CHART_REL_TYPE,
+                    )
+                    if part:
+                        lines.extend(_chart_lines(archive, part))
+    return list(dict.fromkeys(lines))
+
+
+def _slide_graphics_text(
+    archive: zipfile.ZipFile, slide_part: str
+) -> list[str]:
+    """Diagram/chart text of one slide, read from the package alone."""
+    payload = _read_member(archive, slide_part, 20_000_000)
+    if not payload:
+        return []
+    try:
+        root = _parse_xml(payload)
+    except etree.XMLSyntaxError:
+        return []
+    return _graphic_frame_lines(archive, slide_part, root)
+
+
+def _notes_part_for(archive: zipfile.ZipFile, slide_part: str) -> str | None:
+    """The notes part a slide points at through its relationships, if any."""
+    for _rel_id, rel_type, target in _relationships(archive, slide_part):
+        if rel_type == NOTES_SLIDE_REL_TYPE and target:
+            return _resolve_target(slide_part, target)
+    return None
+
+
+def _notes_text_from_xml(archive: zipfile.ZipFile, slide_part: str) -> str:
+    """Speaker-note text of one slide, read from ``ppt/notesSlides/*.xml``."""
+    notes_part = _notes_part_for(archive, slide_part)
+    if not notes_part:
+        return ""
+    payload = _read_member(archive, notes_part, 8_000_000)
+    if not payload:
+        return ""
+    try:
+        root = _parse_xml(payload)
+    except etree.XMLSyntaxError:
+        logger.warning("Malformed notes part: %s", notes_part)
+        return ""
+    tree = root.find(f"{{{PML_NS}}}cSld/{{{PML_NS}}}spTree")
+    if tree is None:
+        return ""
+    lines: list[str] = []
+    for shape in tree.iter(f"{{{PML_NS}}}sp"):
+        if _placeholder_type(shape) in FURNITURE_PLACEHOLDERS:
+            continue
+        lines.extend(_text_body_lines(shape))
+    return "\n".join(dict.fromkeys(lines))
+
+
+def _slide_text_from_xml(
+    archive: zipfile.ZipFile, slide_part: str, number: int
+) -> SlideText:
+    """One slide's title, body, tables and speaker notes from its XML part."""
+    payload = _read_member(archive, slide_part, 20_000_000)
+    if not payload:
+        return SlideText(number)
+    try:
+        root = _parse_xml(payload)
+    except etree.XMLSyntaxError:
+        logger.warning("Malformed slide part: %s", slide_part)
+        return SlideText(number)
+    tree = root.find(f"{{{PML_NS}}}cSld/{{{PML_NS}}}spTree")
+    entries = _shape_tree_lines(tree) if tree is not None else []
+    title = " ".join(line for is_title, line in entries if is_title).strip()
+    body = [
+        line
+        for is_title, line in entries
+        if not is_title and line and line != title
+    ]
+    body.extend(
+        line
+        for line in _graphic_frame_lines(archive, slide_part, root)
+        if line and line != title
+    )
+    return SlideText(
+        number,
+        title,
+        tuple(dict.fromkeys(body)),
+        _notes_text_from_xml(archive, slide_part),
+    )
+
+
+def _extract_slide_text_from_xml(path: Path) -> list[SlideText]:
+    """Read every slide's text straight from the OPC package (no python-pptx).
+
+    This is the fallback for a deck python-pptx cannot open (or an environment
+    where it is not importable): the words on the slides still reach the note
+    model instead of the narration being the only input. Only text stored as
+    ``a:t`` is read — text that exists only as a picture stays a picture.
+    """
+    if not zipfile.is_zipfile(path):
+        return []
+    try:
+        with zipfile.ZipFile(path) as archive:
+            slide_parts = _slide_parts_in_order(archive)
+            return [
+                _slide_text_from_xml(archive, part, number)
+                for number, part in enumerate(slide_parts, start=1)
+            ]
+    except Exception:  # a damaged package must not cost the narration
+        logger.warning("could not read slide text from the package XML", exc_info=True)
+        return []
+
+
+def _graphics_text_by_slide(path: Path) -> dict[int, tuple[str, ...]]:
+    """Diagram/chart text keyed by slide number, in the deck's own order."""
+    if not zipfile.is_zipfile(path):
+        return {}
+    try:
+        with zipfile.ZipFile(path) as archive:
+            return {
+                number: tuple(_slide_graphics_text(archive, part))
+                for number, part in enumerate(
+                    _slide_parts_in_order(archive), start=1
+                )
+            }
+    except Exception:  # the text frames still carry the deck
+        logger.warning("could not read diagram/chart text", exc_info=True)
+        return {}
+
+
+def _with_graphics_text(
+    slides: list[SlideText], graphics: dict[int, tuple[str, ...]]
+) -> list[SlideText]:
+    """Append a slide's SmartArt/chart words to the text python-pptx read."""
+    merged: list[SlideText] = []
+    for slide in slides:
+        extra = graphics.get(slide.number, ())
+        if not extra:
+            merged.append(slide)
+            continue
+        seen = {slide.title, *slide.body}
+        body = list(slide.body)
+        for line in extra:
+            if line and line not in seen:
+                seen.add(line)
+                body.append(line)
+        merged.append(
+            SlideText(slide.number, slide.title, tuple(body), slide.notes)
+        )
+    return merged
+
+
+def _extract_slide_text(path: Path) -> list[SlideText]:
+    """Every slide's text: python-pptx first, the package XML as the fallback.
+
+    python-pptx understands placeholders, grouped shapes and tables, so it is
+    preferred. It is imported lazily and a single exotic deck can make it fail;
+    neither case may silently strip the deck's text from the model's input,
+    which is what the fallback exists for.
+    """
+    slides = _extract_slide_text_with_pptx(path)
+    graphics = _graphics_text_by_slide(path)
+    if any(not slide.is_empty for slide in slides):
+        return _with_graphics_text(slides, graphics)
+    fallback = _extract_slide_text_from_xml(path)
+    if any(not slide.is_empty for slide in fallback):
+        logger.info(
+            "slide text recovered from the package XML slides=%d (python-pptx read %d)",
+            len(fallback), len(slides),
+        )
+        return fallback
+    return _with_graphics_text(slides, graphics) or fallback
 
 
 def read_presentation(
@@ -389,6 +804,20 @@ def read_presentation(
             clips.append(MediaClip(order, slide_number, part_name, destination, kind))
 
     slides = _extract_slide_text(path) if settings.presentation_include_slide_text else []
+    if (
+        settings.presentation_include_slide_text
+        and slide_parts
+        and not any(not slide.is_empty for slide in slides)
+    ):
+        # The deck is valid but carries no selectable words (a picture-only
+        # deck, or one whose text lives in a SmartArt/chart part). Say so:
+        # otherwise the booklet silently becomes a narration-only transcript.
+        logger.warning(
+            "the deck has %d slide(s) but no readable slide text", len(slide_parts)
+        )
+        skipped.append(
+            "متن قابل‌انتخاب روی اسلایدها پیدا نشد؛ جزوه فقط از صدای ارائه ساخته می‌شود"
+        )
     return PresentationContent(tuple(slides), tuple(clips), tuple(skipped), len(slide_parts))
 
 

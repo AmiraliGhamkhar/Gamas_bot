@@ -31,7 +31,13 @@ from gamas_bot.media import (
     probe_media,
     probe_media_many,
 )
-from gamas_bot.presentations import prepare_audio, read_presentation, slides_outline
+from gamas_bot.presentations import (
+    _extract_slide_text_from_xml,
+    _extract_slide_text_with_pptx,
+    prepare_audio,
+    read_presentation,
+    slides_outline,
+)
 from tests.support import (
     AUDIO_REL,
     FIXTURES_DIR,
@@ -272,6 +278,148 @@ class PresentationTests(MediaTempCase):
         self.assertIn("موضوع ارائه", outline)
         self.assertIn("نکتهٔ روی اسلاید", outline)
         self.assertIn("یادداشت گوینده: توضیح تکمیلی گوینده", outline)
+
+
+class SmartArtAndChartTests(MediaTempCase):
+    """Text that is not a shape text frame must still reach the outline.
+
+    SmartArt keeps its words in ``ppt/diagrams/dataN.xml`` and a chart keeps
+    its title, series names and category labels in ``ppt/charts/chartN.xml``.
+    Neither part is read by python-pptx, and both used to leave the slide
+    looking empty — so the note model never saw that slide at all.
+    """
+
+    def test_smartart_node_text_is_read(self):
+        deck = build_deck(
+            self.tmp / "smartart.pptx",
+            slides=[
+                {
+                    "title": "فرایند",
+                    "smartart": ["تحلیل نیاز", "طراحی", "پیاده‌سازی"],
+                }
+            ],
+        )
+        outline = slides_outline(read_presentation(deck, self.tmp / "media", self.settings).slides)
+        self.assertIn("تحلیل نیاز", outline)
+        self.assertIn("طراحی", outline)
+        self.assertIn("پیاده‌سازی", outline)
+
+    def test_chart_title_series_and_categories_are_read(self):
+        deck = build_deck(
+            self.tmp / "chart.pptx",
+            slides=[
+                {
+                    "title": "عملکرد",
+                    "chart": {
+                        "categories": ["فروردین", "اردیبهشت"],
+                        "series": [("درآمد", (10, 20))],
+                    },
+                }
+            ],
+        )
+        outline = slides_outline(read_presentation(deck, self.tmp / "media", self.settings).slides)
+        self.assertIn("سری‌های نمودار: درآمد", outline)
+        self.assertIn("دسته‌های نمودار: فروردین، اردیبهشت", outline)
+
+    def test_graphics_text_is_read_by_the_xml_fallback_too(self):
+        deck = build_deck(
+            self.tmp / "graphics.pptx",
+            slides=[
+                {
+                    "title": "فرایند",
+                    "smartart": ["گام یک"],
+                    "chart": {"categories": ["الف"], "series": [("سری", (1,))]},
+                }
+            ],
+        )
+        with mock.patch(
+            "gamas_bot.presentations._extract_slide_text_with_pptx",
+            new=lambda _path: [],
+        ):
+            content = read_presentation(deck, self.tmp / "media", self.settings)
+        outline = slides_outline(content.slides)
+        self.assertIn("گام یک", outline)
+        self.assertIn("سری‌های نمودار: سری", outline)
+        self.assertIn("دسته‌های نمودار: الف", outline)
+
+
+class SlideTextFallbackTests(MediaTempCase):
+    """The deck's text must reach the note model even without python-pptx.
+
+    ``presentations._extract_slide_text`` used to return ``[]`` whenever
+    python-pptx was missing or could not open a particular deck — the narration
+    was transcribed and the slide text silently never reached the LLM. The
+    package-XML reader is the fallback these tests pin down.
+    """
+
+    def build(self) -> Path:
+        return build_deck(
+            self.tmp / "lecture.pptx",
+            slides=[
+                {
+                    "title": "شبکهٔ عصبی",
+                    "bullets": ["لایهٔ ورودی", "لایهٔ پنهان"],
+                    "notes": "توضیح تکمیلی گوینده",
+                },
+                {"title": "آموزش", "bullets": ["گرادیان کاهشی"]},
+            ],
+        )
+
+    def test_the_xml_fallback_reads_what_python_pptx_reads(self):
+        deck = self.build()
+        self.assertEqual(
+            _extract_slide_text_from_xml(deck),
+            _extract_slide_text_with_pptx(deck),
+        )
+
+    def test_the_xml_fallback_reads_table_rows_like_the_primary_reader(self):
+        from pptx import Presentation
+        from pptx.util import Inches
+
+        deck = Presentation()
+        slide = deck.slides.add_slide(deck.slide_layouts[6])
+        frame = slide.shapes.add_table(
+            2, 2, Inches(1), Inches(1), Inches(4), Inches(1)
+        )
+        table = frame.table
+        table.cell(0, 0).text = "نام"
+        table.cell(0, 1).text = "سن"
+        table.cell(1, 0).text = "علی"
+        table.cell(1, 1).text = "۲۰"
+        path = self.tmp / "table.pptx"
+        deck.save(path)
+        self.assertEqual(
+            _extract_slide_text_from_xml(path),
+            _extract_slide_text_with_pptx(path),
+        )
+
+    def test_slide_text_survives_a_missing_python_pptx(self):
+        deck = self.build()
+        with mock.patch.dict(sys.modules, {"pptx": None}):
+            content = read_presentation(deck, self.tmp / "media", self.settings)
+        outline = slides_outline(content.slides)
+        self.assertIn("شبکهٔ عصبی", outline)
+        self.assertIn("لایهٔ ورودی", outline)
+        self.assertIn("یادداشت گوینده: توضیح تکمیلی گوینده", outline)
+
+    def test_slide_text_survives_a_deck_python_pptx_cannot_open(self):
+        deck = self.build()
+        with mock.patch(
+            "gamas_bot.presentations._extract_slide_text_with_pptx",
+            new=lambda _path: [],
+        ):
+            content = read_presentation(deck, self.tmp / "media", self.settings)
+        outline = slides_outline(content.slides)
+        self.assertIn("شبکهٔ عصبی", outline)
+        self.assertIn("گرادیان کاهشی", outline)
+
+    def test_a_text_free_deck_says_why_only_the_narration_is_used(self):
+        deck = build_deck(self.tmp / "pictures.pptx", slides=[{"title": ""}])
+        content = read_presentation(deck, self.tmp / "media", self.settings)
+        self.assertTrue(
+            any("متن قابل‌انتخاب" in reason for reason in content.skipped),
+            content.skipped,
+        )
 
 
 class LegacyConversionTests(MediaTempCase):
