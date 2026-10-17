@@ -94,6 +94,7 @@ from .office import (
 from .office_ai import infer_table, plan_deck
 from .presentations import (
     PresentationError,
+    align_narration_to_slides,
     classify_presentation,
     load_presentation,
     prepare_audio,
@@ -219,6 +220,7 @@ class GamasBot:
             max_active=settings.max_active_jobs,
             worker=self._run_job,
         )
+        self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
         self._receipt_cleanup_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
         self._pending_broadcast: set[int] = set()
@@ -997,11 +999,13 @@ class GamasBot:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
 
         await progress.update(35, "🔍 فایل رسید؛ دارم صدا را بررسی می‌کنم")
-        audio_path = await self._prepare_audio(source_path, workdir, job.filename, job.kind)
+        audio_path = await self._run_media_operation(
+            self._prepare_audio, source_path, workdir, job.filename, job.kind
+        )
         if audio_path.stat().st_size > self.settings.max_file_size:
             raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
 
-        info = await probe_media(audio_path, self.settings)
+        info = await self._run_media_operation(probe_media, audio_path, self.settings)
         duration = info.duration or job.duration_hint
         needed = self._reserve_estimate(duration)
         await self.db.reserve(job.user_id, job.submission_id, needed)
@@ -1062,6 +1066,11 @@ class GamasBot:
             )
         return source_path
 
+    async def _run_media_operation(self, operation, *args, **kwargs):
+        """Run one CPU/disk-heavy media stage under the configured process cap."""
+        async with self._media_semaphore:
+            return await operation(*args, **kwargs)
+
     async def _settle(self, job: Job, duration: float | None) -> None:
         measured = int(math.ceil(duration)) if duration else 0
         await self.db.settle_hold(job.submission_id, measured)
@@ -1076,13 +1085,23 @@ class GamasBot:
         downloaded = await job.message.download_media(file=str(source_path))
         if not downloaded or not source_path.exists():
             raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
+        if source_path.stat().st_size > self.settings.max_file_size:
+            raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
+        if source_path.stat().st_size > self.settings.presentation_max_temp_bytes:
+            raise PresentationError("حجم فایل موقت ارائه از سقف تعیین‌شده بیشتر است.")
 
         if job.meta.get("presentation_kind") == "legacy":
             await progress.update(30, "🔁 دارم قالب قدیمی را تبدیل می‌کنم…")
-            source_path = await convert_to_pptx(source_path, workdir, self.settings)
+            source_path = await self._run_media_operation(
+                convert_to_pptx, source_path, workdir, self.settings
+            )
+            if source_path.stat().st_size > self.settings.max_file_size:
+                raise PresentationError("ارائهٔ تبدیل‌شده از سقف حجم فایل بزرگ‌تر است.")
 
         await progress.update(40, "🔍 دارم اسلایدها را می‌خوانم")
-        content = await load_presentation(source_path, workdir, self.settings)
+        content = await self._run_media_operation(
+            load_presentation, source_path, workdir, self.settings
+        )
         outline = slides_outline(content.slides)
         # The note model is only as good as this input, so record what was
         # actually read from the deck: a deck whose text silently extracted as
@@ -1092,7 +1111,20 @@ class GamasBot:
             job.submission_id, len(content.slides), len(outline), len(content.clips),
         )
         skipped: list[str] = []
-        prepared = await prepare_audio(content, workdir, self.settings, skipped_out=skipped)
+        prepared = await self._run_media_operation(
+            prepare_audio, content, workdir, self.settings, skipped_out=skipped
+        )
+        if prepared is not None:
+            logger.info(
+                "presentation audio prepared submission=%s source_seconds=%.3f "
+                "output_seconds=%.3f clips=%d merged=%s skipped=%d",
+                job.submission_id,
+                prepared.source_duration,
+                prepared.output_duration,
+                len(prepared.clips),
+                prepared.merged,
+                len(prepared.skipped),
+            )
         # Legacy .ppt conversion can drop embedded media (ppt2pptx warns
         # MEDIA_ACTION_OMITTED). If the deck converted but has no audio clips,
         # surface that as a skip reason so the user understands why narration
@@ -1115,13 +1147,14 @@ class GamasBot:
         document = None
         raw_engine: str | None = None
         duration: float | None = None
+        narration_text = ""
         if prepared is not None:
-            # Guard the merged artifact against the global file-size ceiling,
-            # mirroring the media pipeline's check after extraction.
+            # prepare_audio has already measured the merged output and retained
+            # exact per-clip spans, so another probe would only add latency and
+            # could return a codec/container duration that includes padding.
             if prepared.path.stat().st_size > self.settings.max_file_size:
                 raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
-            info = await probe_media(prepared.path, self.settings)
-            duration = info.duration or prepared.total_duration
+            duration = prepared.source_duration  # synthetic silence is not billed
             needed = self._reserve_estimate(duration)
             await self.db.reserve(job.user_id, job.submission_id, needed)
             await progress.update(55, "🎙️ دارم صدای ارائه را به متن تبدیل می‌کنم")
@@ -1134,8 +1167,21 @@ class GamasBot:
                 raise
             raw_engine = raw.engine
             document = build_document(raw)
-            raw_text_parts.append("متن پیاده‌سازی‌شدهٔ صدای ارائه:\n\n" + document.plain())
-            # Record measured duration early, like the media pipeline does.
+            alignment = align_narration_to_slides(raw, prepared, content.slides)
+            narration_text = alignment.as_text()
+            logger.info(
+                "presentation narration aligned submission=%s aligned=%s slides=%d "
+                "unassigned=%s",
+                job.submission_id,
+                alignment.aligned,
+                len(alignment.slide_text),
+                bool(alignment.unassigned_text),
+            )
+            raw_text_parts.append(
+                "متن پیاده‌سازی‌شدهٔ صدای ارائه:\n\n" + narration_text
+            )
+            # Record source-audio duration early. Synthetic inter-clip gaps are
+            # included in STT timestamps/output limits, not in the user's bill.
             await self.db.set_submission_status(
                 job.submission_id, "processing", duration_seconds=duration
             )
@@ -1166,15 +1212,13 @@ class GamasBot:
         await self._deliver_raw(job, raw_text, raw_path, reference)
         await self._send_preview(job, raw_text)
 
-        # Settle only after the transcript has actually reached the user.
-        if prepared is not None and duration is not None:
-            await self._settle(job, duration)
-        elif prepared is not None:
-            # Duration unknown: settle with the best estimate we have.
-            await self._settle(job, prepared.total_duration)
+        # Settle only after the transcript has actually reached the user. The
+        # source audio is measured by the worker; synthetic silence is excluded.
+        if prepared is not None:
+            await self._settle(job, prepared.source_duration)
 
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
-        transcript_text = document.llm_document() if document is not None else ""
+        transcript_text = narration_text
         presentation_text = build_presentation_document(outline, transcript_text)
         notes = await self._generate_presentation_notes(outline, transcript_text, job, progress)
         await self.db.save_transcription(

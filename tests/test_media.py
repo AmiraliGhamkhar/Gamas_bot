@@ -10,6 +10,7 @@ so a regression in extraction from a video or a deck is caught here.
 
 from __future__ import annotations
 
+import asyncio
 import functools
 import json
 import sys
@@ -21,7 +22,9 @@ from unittest import mock
 from gamas_bot import media_worker
 from gamas_bot.bot import GamasBot
 from gamas_bot.media import (
+    AudioMergeResult,
     MediaInfo,
+    MergedClipSpan,
     MediaToolError,
     check_media_worker,
     choose_merge_format,
@@ -30,14 +33,23 @@ from gamas_bot.media import (
     merge_audio_tracks,
     probe_media,
     probe_media_many,
+    parse_merge_output,
 )
 from gamas_bot.presentations import (
+    ClipSpan,
+    MediaClip,
+    PreparedAudio,
+    PresentationContent,
+    PresentationError,
+    SlideText,
     _extract_slide_text_from_xml,
     _extract_slide_text_with_pptx,
+    align_narration_to_slides,
     prepare_audio,
     read_presentation,
     slides_outline,
 )
+from gamas_bot.transcript import RawTranscript, Word
 from tests.support import (
     AUDIO_REL,
     FIXTURES_DIR,
@@ -138,13 +150,56 @@ class ExtractTests(MediaTempCase):
         first = self.write("a.wav", _wav(1.0))
         second = self.write("b.wav", _wav(1.0))
         settings = make_settings(presentation_silence_seconds=0.5)
-        out = await merge_audio_tracks(
+        result = await merge_audio_tracks(
             [first, second], self.tmp / "merged", settings,
-            total_duration=2.0, stem="m",
+            total_duration=2.5, stem="m",
         )
-        info = await probe_media(out, self.settings)
+        info = await probe_media(result.path, self.settings)
         self.assertTrue(info.has_audio)
         self.assertAlmostEqual(info.duration, 2.5, delta=0.3)
+        self.assertAlmostEqual(result.source_duration, 2.0, delta=0.05)
+        self.assertAlmostEqual(result.output_duration, 2.5, delta=0.05)
+        self.assertEqual(len(result.clip_spans), 2)
+        self.assertAlmostEqual(result.clip_spans[0].start_seconds, 0.0, delta=0.01)
+        self.assertAlmostEqual(result.clip_spans[0].end_seconds, 1.0, delta=0.05)
+        self.assertAlmostEqual(result.clip_spans[1].start_seconds, 1.5, delta=0.05)
+        self.assertAlmostEqual(result.clip_spans[1].end_seconds, 2.5, delta=0.05)
+
+
+class MediaOperationLimitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_media_stages_obey_the_configured_semaphore(self):
+        stub = _AudioPipelineStub(make_settings(media_worker_concurrency=1))
+        stub._media_semaphore = asyncio.Semaphore(stub.settings.media_worker_concurrency)
+        active = 0
+        high_water = 0
+
+        async def operation():
+            nonlocal active, high_water
+            active += 1
+            high_water = max(high_water, active)
+            await asyncio.sleep(0.005)
+            active -= 1
+
+        await asyncio.gather(*(
+            GamasBot._run_media_operation(stub, operation)
+            for _ in range(4)
+        ))
+        self.assertEqual(high_water, 1)
+
+
+class MergeReportTests(unittest.TestCase):
+    def test_rejects_a_merge_report_with_inconsistent_clip_accounting(self):
+        payload = json.dumps({
+            "sample_rate": 16000,
+            "source_samples": 32000,
+            "output_samples": 36000,
+            "clip_spans": [
+                {"index": 0, "start_sample": 0, "end_sample": 16000},
+                {"index": 1, "start_sample": 20000, "end_sample": 30000},
+            ],
+        })
+        with self.assertRaises(MediaToolError):
+            parse_merge_output(payload, 2)
 
 
 class FormatChoiceTests(unittest.TestCase):
@@ -153,6 +208,14 @@ class FormatChoiceTests(unittest.TestCase):
         self.assertEqual(choose_merge_format(None, settings), "wav")
         self.assertEqual(choose_merge_format(0.5, settings), "wav")
         self.assertEqual(choose_merge_format(10.0, settings), "opus")
+
+    def test_merge_format_respects_remaining_temp_and_file_budget(self):
+        settings = make_settings(presentation_wav_limit_bytes=1_000_000)
+        self.assertEqual(
+            choose_merge_format(10.0, settings, max_output_bytes=200_000), "opus"
+        )
+        with self.assertRaises(MediaToolError):
+            choose_merge_format(10.0, settings, max_output_bytes=100_000)
 
 
 class PrepareAudioRoutingTests(MediaTempCase):
@@ -210,12 +273,13 @@ class PresentationTests(MediaTempCase):
 
     async def test_deck_extracts_and_merges_audio_and_video_narration(self):
         deck = self.deck_with_media()
-        content = read_presentation(deck, self.tmp / "media", self.settings)
+        settings = make_settings(presentation_include_unreferenced_media=True)
+        content = read_presentation(deck, self.tmp / "media", settings)
         self.assertEqual(
             [(clip.slide_number, clip.kind) for clip in content.clips],
             [(1, "audio"), (2, "video"), (3, "video"), (None, "audio")],
         )
-        prepared = await prepare_audio(content, self.tmp / "work", self.settings)
+        prepared = await prepare_audio(content, self.tmp / "work", settings)
         self.assertIsNotNone(prepared)
         # The silent video is dropped; the other three clips are merged.
         self.assertEqual(len(prepared.clips), 3)
@@ -224,8 +288,60 @@ class PresentationTests(MediaTempCase):
         )
         info = await probe_media(prepared.path, self.settings)
         self.assertTrue(info.has_audio)
-        # 1.5 + 1.0 + 0.8 seconds plus two 0.25 s paddings.
-        self.assertAlmostEqual(info.duration, 4.05, delta=0.3)
+        # The measured audio sum excludes two synthetic 0.25 s gaps.
+        self.assertAlmostEqual(info.duration, prepared.output_duration, delta=0.03)
+        self.assertAlmostEqual(
+            prepared.output_duration, prepared.source_duration + 0.5, delta=0.01
+        )
+        self.assertEqual([span.clip.slide_number for span in prepared.clip_spans], [1, 2, None])
+        self.assertAlmostEqual(prepared.clip_spans[1].start_seconds, 1.75, delta=0.1)
+        self.assertAlmostEqual(
+            prepared.clip_spans[2].start_seconds,
+            prepared.clip_spans[1].end_seconds + 0.25,
+            delta=0.01,
+        )
+
+    async def test_one_compatible_audio_clip_uses_the_extracted_source_directly(self):
+        deck = build_deck(
+            self.tmp / "single.pptx",
+            slides=[{
+                "title": "One",
+                "media": [("voice.wav", _wav(0.8), AUDIO_REL)],
+            }],
+        )
+        content = read_presentation(deck, self.tmp / "media", self.settings)
+        prepared = await prepare_audio(content, self.tmp / "work", self.settings)
+        self.assertIsNotNone(prepared)
+        assert prepared is not None
+        self.assertFalse(prepared.merged)
+        self.assertEqual(prepared.path, content.clips[0].path)
+        self.assertAlmostEqual(prepared.source_duration, 0.8, delta=0.1)
+        self.assertAlmostEqual(prepared.output_duration, prepared.source_duration, delta=0.01)
+        self.assertEqual(len(prepared.clip_spans), 1)
+        self.assertEqual(prepared.clip_spans[0].clip.slide_number, 1)
+
+    def test_unreferenced_media_is_excluded_by_default(self):
+        deck = self.deck_with_media()
+        content = read_presentation(deck, self.tmp / "media", self.settings)
+        self.assertEqual([clip.slide_number for clip in content.clips], [1, 2, 3])
+        self.assertTrue(
+            any("بدون پیوند مستقیم" in reason for reason in content.skipped),
+            content.skipped,
+        )
+
+    def test_reused_media_part_keeps_each_slide_reference(self):
+        payload = _wav(0.8)
+        deck = build_deck(
+            self.tmp / "reused.pptx",
+            slides=[
+                {"title": "One", "media": [("shared.wav", payload, AUDIO_REL)]},
+                {"title": "Two", "media": [("shared.wav", payload, AUDIO_REL)]},
+            ],
+        )
+        content = read_presentation(deck, self.tmp / "media", self.settings)
+        self.assertEqual([clip.slide_number for clip in content.clips], [1, 2])
+        self.assertEqual(content.clips[0].path, content.clips[1].path)
+        self.assertEqual([clip.order for clip in content.clips], [1, 2])
 
     async def test_video_audio_is_dropped_when_disabled(self):
         deck = self.deck_with_media()
@@ -280,6 +396,112 @@ class PresentationTests(MediaTempCase):
         self.assertIn("یادداشت گوینده: توضیح تکمیلی گوینده", outline)
 
 
+class PresentationAlignmentTests(MediaTempCase):
+    def prepared(self) -> PreparedAudio:
+        clips = (
+            MediaClip(1, 1, "ppt/media/one.wav", self.tmp / "one.wav", "audio", 1.0),
+            MediaClip(2, 2, "ppt/media/two.wav", self.tmp / "two.wav", "audio", 1.0),
+            MediaClip(3, None, "ppt/media/orphan.wav", self.tmp / "orphan.wav", "audio", 1.0),
+        )
+        return PreparedAudio(
+            path=self.tmp / "merged.wav",
+            clips=clips,
+            source_duration=3.0,
+            output_duration=3.5,
+            clip_spans=(
+                ClipSpan(clips[0], 0.0, 1.0),
+                ClipSpan(clips[1], 1.25, 2.25),
+                ClipSpan(clips[2], 2.5, 3.5),
+            ),
+            merged=True,
+        )
+
+    def test_timed_words_map_only_to_their_linked_slide_clip(self):
+        raw = RawTranscript(
+            words=[
+                Word("first", 0.1, 0.3),
+                Word("gap", 1.05, 1.15),
+                Word("second", 1.4, 1.6),
+                Word("crosses", 0.8, 1.4),
+                Word("orphan", 2.7, 2.9),
+                Word("untimed"),
+            ],
+            text="first gap second orphan untimed",
+            engine="test",
+        )
+        aligned = align_narration_to_slides(
+            raw, self.prepared(), (SlideText(1), SlideText(2))
+        )
+        self.assertTrue(aligned.aligned)
+        self.assertEqual(aligned.slide_text, ((1, "first"), (2, "second")))
+        self.assertIn("gap", aligned.unassigned_text)
+        self.assertIn("crosses", aligned.unassigned_text)
+        self.assertIn("orphan", aligned.unassigned_text)
+        self.assertIn("untimed", aligned.unassigned_text)
+        self.assertNotIn("orphan", aligned.as_text().split("### گفتار بدون", 1)[0])
+
+    def test_plain_text_stays_explicitly_unaligned(self):
+        raw = RawTranscript.from_text("بدون زمان‌بندی")
+        aligned = align_narration_to_slides(
+            raw, self.prepared(), (SlideText(1), SlideText(2))
+        )
+        self.assertFalse(aligned.aligned)
+        self.assertEqual(aligned.slide_text, ())
+        self.assertIn("بدون نگاشت مطمئن", aligned.as_text())
+        self.assertIn("بدون زمان‌بندی", aligned.as_text())
+
+
+class PresentationLimitTests(MediaTempCase):
+    async def test_merged_duration_cap_includes_inter_clip_silence(self):
+        first = self.write("first.wav", b"fake")
+        second = self.write("second.wav", b"fake")
+        clips = (
+            MediaClip(1, 1, "ppt/media/first.wav", first, "audio"),
+            MediaClip(2, 2, "ppt/media/second.wav", second, "audio"),
+        )
+        content = PresentationContent((SlideText(1), SlideText(2)), clips)
+        settings = make_settings(presentation_max_total_duration=1.44)
+        merged_path = self.tmp / "work" / "merged.wav"
+        merged_path.parent.mkdir()
+        merged_path.write_bytes(b"merged")
+
+        async def fake_probe(paths, _settings):
+            return {str(path): MediaInfo(True, 0.6, "pcm_s16le") for path in paths}
+
+        captured: dict = {}
+
+        async def fake_merge(*_args, **kwargs):
+            captured.update(kwargs)
+            return AudioMergeResult(
+                merged_path,
+                sample_rate=16000,
+                source_duration=1.2,
+                output_duration=1.45,
+                clip_spans=(
+                    MergedClipSpan(0, 0.0, 0.6),
+                    MergedClipSpan(1, 0.85, 1.45),
+                ),
+            )
+
+        with mock.patch("gamas_bot.presentations.probe_media_many", new=fake_probe), mock.patch(
+            "gamas_bot.presentations.merge_audio_tracks", new=fake_merge
+        ):
+            with self.assertRaises(PresentationError):
+                await prepare_audio(content, merged_path.parent, settings)
+        self.assertAlmostEqual(captured["total_duration"], 1.45, delta=0.01)
+
+    def test_extraction_respects_the_per_presentation_temp_budget(self):
+        deck = build_deck(
+            self.tmp / "large-temp.pptx",
+            slides=[{"title": "S", "media": [("clip.wav", _wav(0.8), AUDIO_REL)]}],
+        )
+        settings = make_settings(
+            presentation_max_temp_bytes=deck.stat().st_size + 100
+        )
+        with self.assertRaises(PresentationError):
+            read_presentation(deck, self.tmp / "media", settings)
+
+
 class SmartArtAndChartTests(MediaTempCase):
     """Text that is not a shape text frame must still reach the outline.
 
@@ -320,6 +542,7 @@ class SmartArtAndChartTests(MediaTempCase):
         outline = slides_outline(read_presentation(deck, self.tmp / "media", self.settings).slides)
         self.assertIn("سری‌های نمودار: درآمد", outline)
         self.assertIn("دسته‌های نمودار: فروردین، اردیبهشت", outline)
+        self.assertIn("مقادیر سری «درآمد»: فروردین=10، اردیبهشت=20", outline)
 
     def test_graphics_text_is_read_by_the_xml_fallback_too(self):
         deck = build_deck(
@@ -392,6 +615,24 @@ class SlideTextFallbackTests(MediaTempCase):
             _extract_slide_text_from_xml(path),
             _extract_slide_text_with_pptx(path),
         )
+
+    def test_xml_fallback_fills_each_partially_empty_slide(self):
+        deck = self.build()
+        partial = [
+            SlideText(1, "شبکهٔ عصبی", ("متن اولیه",)),
+            SlideText(2),
+        ]
+        with mock.patch(
+            "gamas_bot.presentations._extract_slide_text_with_pptx",
+            new=lambda _path: partial,
+        ):
+            content = read_presentation(deck, self.tmp / "media", self.settings)
+        outline = slides_outline(content.slides)
+        self.assertIn("متن اولیه", outline)
+        self.assertIn("لایهٔ ورودی", outline)
+        self.assertIn("توضیح تکمیلی گوینده", outline)
+        self.assertIn("آموزش", outline)
+        self.assertIn("گرادیان کاهشی", outline)
 
     def test_slide_text_survives_a_missing_python_pptx(self):
         deck = self.build()

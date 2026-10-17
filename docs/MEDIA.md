@@ -19,7 +19,9 @@ bot → media.py → asyncio.create_subprocess_exec(sys.executable, "-m", "gamas
 * **`shell=False` with a fixed argument vector** means no user-controlled value
   ever reaches a shell. A file named `; rm -rf /` is just a file name.
 * The worker reports structured JSON on stdout; a non-zero exit becomes
-  `MediaToolError`.
+  `MediaToolError`. Merge JSON includes sample counts and a per-input clip span,
+  so presentation orchestration can align timestamped STT output without
+  re-probing the merged file.
 
 `media_worker.py` uses **PyAV** (`av`), which ships its own FFmpeg *libraries*
 inside the wheel. Probing, extraction, resampling and merging all go through the
@@ -37,7 +39,7 @@ timeout, unparseable output) the files are re-probed one process each.
 | --- | --- | --- |
 | `probe` | `probe_media` / `probe_media_many` | duration and whether a stream carries audio — billing depends on the duration |
 | `extract` | `extract_audio_track` | video → audio, and any audio that must be normalized before STT |
-| `merge` | `merge_audio_tracks` | concatenating per-slide narration clips from a deck |
+| `merge` | `merge_audio_tracks` | concatenating per-slide narration clips and returning source/output durations plus sample-accurate clip spans |
 | `convert` | `convert_to_pptx` | legacy `.ppt` → `.pptx`, in process |
 | `check` | `check_media_worker` | startup self-check that the worker imports and runs |
 
@@ -50,7 +52,12 @@ timeout, unparseable output) the files are re-probed one process each.
   stale `submission-*` / `deck-*` directories from a crash are removed at
   startup.
 * `needs_transcode()` re-encodes only when the container or codec is one the STT
-  providers do not accept, so a normal upload is not re-encoded blindly.
+  providers do not accept, so a normal upload is not re-encoded blindly. A single
+  compatible slide-linked audio clip follows the same passthrough rule; video,
+  multiple playback uses, and incompatible codecs are decoded/merged.
+* `MEDIA_WORKER_CONCURRENCY` (default 1) caps the bot's CPU/disk-heavy media
+  stages independently of `MAX_ACTIVE_JOBS`. Presentation extraction also obeys
+  `PRESENTATION_MAX_TEMP_BYTES`; see [PRESENTATIONS.md](PRESENTATIONS.md).
 * A `.webm` document with missing or generic MIME metadata is treated as video
   (the suffix is shared with audio), so its audio track is extracted before STT
   instead of sending a screen recording's video stream to the speech service.

@@ -19,6 +19,7 @@ Design rules:
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass, field
@@ -199,13 +200,24 @@ def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None =
     return value
 
 
-def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    minimum: float = 0.0,
+    maximum: float | None = None,
+) -> float:
     raw = _env(name, str(default))
     try:
         value = float(raw)
     except ValueError:
         value = default
-    return max(value, minimum)
+    if not math.isfinite(value):
+        value = default
+    value = max(value, minimum)
+    if maximum is not None:
+        value = min(value, maximum)
+    return value
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -266,6 +278,7 @@ class Settings:
     max_file_size: int
     max_active_jobs: int
     max_queued_jobs: int
+    media_worker_concurrency: int
     media_timeout: float
     convert_timeout: float
     stt_job_timeout: float
@@ -275,11 +288,13 @@ class Settings:
     presentation_max_clips: int
     presentation_max_total_duration: float
     presentation_max_unpacked_bytes: int
+    presentation_max_temp_bytes: int
     presentation_min_clip_seconds: float
     presentation_silence_seconds: float
     presentation_wav_limit_bytes: int
     presentation_include_slide_text: bool
     presentation_include_video_audio: bool
+    presentation_include_unreferenced_media: bool
 
     # --- Speech-to-text -----------------------------------------------------
     stt_providers: tuple[str, ...]
@@ -657,6 +672,9 @@ def from_env(env_file: str | None = None) -> Settings:
         max_file_size=_env_int("MAX_FILE_SIZE", 2 * 1024**3, minimum=1024),
         max_active_jobs=_env_int("MAX_ACTIVE_JOBS", 3, minimum=1, maximum=32),
         max_queued_jobs=_env_int("MAX_QUEUED_JOBS", 8, minimum=0, maximum=100),
+        media_worker_concurrency=_env_int(
+            "MEDIA_WORKER_CONCURRENCY", 1, minimum=1, maximum=8
+        ),
         media_timeout=_env_float("MEDIA_TIMEOUT", 3600.0, minimum=1.0),
         convert_timeout=_env_float("CONVERT_TIMEOUT", 600.0, minimum=1.0),
         stt_job_timeout=_env_float("STT_JOB_TIMEOUT", 21600.0, minimum=60.0),
@@ -668,13 +686,23 @@ def from_env(env_file: str | None = None) -> Settings:
         presentation_max_unpacked_bytes=_env_int(
             "PRESENTATION_MAX_UNPACKED_BYTES", 4 * 1024**3, minimum=1024
         ),
-        presentation_min_clip_seconds=_env_float("PRESENTATION_MIN_CLIP_SECONDS", 0.5),
-        presentation_silence_seconds=_env_float("PRESENTATION_SILENCE_SECONDS", 0.25),
+        presentation_max_temp_bytes=_env_int(
+            "PRESENTATION_MAX_TEMP_BYTES", 8 * 1024**3, minimum=1024
+        ),
+        presentation_min_clip_seconds=_env_float(
+            "PRESENTATION_MIN_CLIP_SECONDS", 0.5, minimum=0.0
+        ),
+        presentation_silence_seconds=_env_float(
+            "PRESENTATION_SILENCE_SECONDS", 0.25, minimum=0.0, maximum=60.0
+        ),
         presentation_wav_limit_bytes=_env_int(
             "PRESENTATION_WAV_LIMIT_BYTES", 2 * 1024**3, minimum=1024
         ),
         presentation_include_slide_text=_env_bool("PRESENTATION_INCLUDE_SLIDE_TEXT", True),
         presentation_include_video_audio=_env_bool("PRESENTATION_INCLUDE_VIDEO_AUDIO", True),
+        presentation_include_unreferenced_media=_env_bool(
+            "PRESENTATION_INCLUDE_UNREFERENCED_MEDIA", False
+        ),
         stt_providers=_parse_provider_order(raw_providers),
         stt_language=_env("STT_LANGUAGE", "fa"),
         speechmatics_api_key=_env("SPEECHMATICS_API_KEY"),

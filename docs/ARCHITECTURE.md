@@ -28,6 +28,14 @@ Word export              docx_export.py RTL booklet
 Delivery                 telegram_text.py   render → paginate → send
 ```
 
+A presentation stays one deck-level STT request. Relationship-linked media are
+ordered by slide and playback use; the media worker returns source/output
+durations and sample-accurate clip spans. Timestamped transcript segments are
+attached only when their full interval belongs to one slide-linked span. Plain,
+untimed, gap, orphan and boundary-crossing text remains explicitly unmapped.
+Presentation note chunks prefer whole slide blocks. See
+[PRESENTATIONS.md](PRESENTATIONS.md) for defaults and limits.
+
 The Free Office section is a second, much shorter path off the same queue:
 
 ```
@@ -57,7 +65,7 @@ Arrangement (optional)   office_ai.py   one model request, checked against the s
 | `bot.py` | Telegram handlers, menus, admin panel, delivery orchestration |
 | `media.py` | Runs the media worker as a child process with a hard timeout |
 | `media_worker.py` | PyAV probe / extract / merge (in-process, no system binaries) |
-| `presentations.py` | PPTX and legacy-PPT reading, zip-bomb limits, slide audio; slide/notes text via python-pptx with an OPC-XML fallback, plus SmartArt and chart text |
+| `presentations.py` | PPTX and legacy-PPT reading, relationship-linked slide audio, per-slide XML fallback, chart values, duration limits and timestamp-to-slide mapping |
 | `stt.py` | STT provider adapters, retries, cooldowns, ordered failover |
 | `transcript.py` | Fidelity-gated cleanup, paragraphing from word timings, chunking |
 | `llm.py` | One LLM client: per-provider request/response, failover, error classes |
@@ -82,7 +90,9 @@ modules never import `bot.py`, and `config.py` imports nothing from the package.
   back-pressure message instead of growing an unbounded backlog.
 * **Blocking calls** run through `asyncio.to_thread` (document generation,
   presentation reading). The media worker is a real child process, so a decoder
-  crash cannot take the bot down and a timeout can kill it.
+  crash cannot take the bot down and a timeout can kill it. `MEDIA_WORKER_CONCURRENCY`
+  separately bounds heavy media stages (default 1); presentation package and
+  scratch-file sizes are capped by the `PRESENTATION_MAX_*` settings.
 * **Shutdown** stops intake, rejects queued work, cancels workers, disconnects
   Telegram, then closes SQLite. A job is either fully recorded or fully failed —
   never left in `processing`.

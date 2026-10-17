@@ -108,6 +108,22 @@ class FromEnvTests(unittest.TestCase):
         self.assertTrue(settings.db_path.is_absolute())
         self.assertTrue(settings.temp_dir.is_absolute())
 
+    def test_media_and_silence_limits_are_bounded(self):
+        with mock.patch.dict(
+            os.environ,
+            env(MEDIA_WORKER_CONCURRENCY="99", PRESENTATION_SILENCE_SECONDS="inf"),
+            clear=False,
+        ):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.media_worker_concurrency, 8)
+        self.assertEqual(settings.presentation_silence_seconds, 0.25)
+
+        with mock.patch.dict(
+            os.environ, env(PRESENTATION_SILENCE_SECONDS="120"), clear=False
+        ):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.presentation_silence_seconds, 60.0)
+
     def test_plan_overrides(self):
         values = {"PLAN_5_HOURS": "7", "PLAN_5_PRICE_TOMAN": "99000"}
         with mock.patch.dict(os.environ, env(**values), clear=False):
