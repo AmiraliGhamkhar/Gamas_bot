@@ -450,6 +450,40 @@ class PresentationAlignmentTests(MediaTempCase):
         self.assertIn("بدون نگاشت مطمئن", aligned.as_text())
         self.assertIn("بدون زمان‌بندی", aligned.as_text())
 
+    def test_boundary_jittered_word_stays_with_its_slide_clip(self):
+        raw = RawTranscript(
+            words=[
+                Word("شروع", 0.1, 0.5),
+                # Spills 30 ms into the 250 ms synthetic silence gap after clip 1:
+                Word("پایان.", 0.85, 1.03),
+                # Starts 20 ms before clip 2's nominal 1.25 s boundary:
+                Word("اسلاید", 1.23, 1.5),
+            ],
+            text="شروع پایان. اسلاید",
+            engine="test",
+        )
+        aligned = align_narration_to_slides(
+            raw, self.prepared(), (SlideText(1), SlideText(2))
+        )
+        self.assertTrue(aligned.aligned)
+        self.assertEqual(
+            aligned.slide_text,
+            ((1, "شروع پایان."), (2, "اسلاید")),
+        )
+        self.assertEqual(aligned.unassigned_text, "")
+
+    def test_slide_table_renders_as_markdown_pipe_rows_in_outline(self):
+        slide = SlideText(
+            number=1,
+            title="جدول مقایسه",
+            body=("نام | سن", "علی | ۲۰"),
+            notes="خط اول یادداشت\nخط دوم یادداشت",
+        )
+        markdown = slide.as_markdown()
+        self.assertIn("| نام | سن |", markdown)
+        self.assertIn("| علی | ۲۰ |", markdown)
+        self.assertIn("یادداشت گوینده: خط اول یادداشت\nخط دوم یادداشت", markdown)
+
 
 class PresentationLimitTests(MediaTempCase):
     async def test_merged_duration_cap_includes_inter_clip_silence(self):

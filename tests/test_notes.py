@@ -10,10 +10,12 @@ from gamas_bot.llm import LLMContextOverflowError, LLMError
 from gamas_bot.notes import (
     COMPILE_HARD_MAX_CHARS,
     MAX_CONTEXT_SPLITS,
+    PRESENTATION_PROMPT,
     TRANSCRIPT_PROMPT,
     StructuringError,
     effective_chunk_chars,
     effective_compile_max_chars,
+    NoteDefinition,
     NoteSection,
     NoteTable,
     GlossaryEntry,
@@ -24,6 +26,7 @@ from gamas_bot.notes import (
     compile_accepts,
     context_block_for,
     heading_topic_key,
+    headings_overlap,
     headings_share_a_topic,
     merge_structured_notes,
     scrub_backend_artifacts,
@@ -688,6 +691,142 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(len(chunk) <= 90 for chunk in chunks))
         self.assertEqual(sum(chunk.count("واژه") for chunk in chunks), 70)
         self.assertTrue(any("ادامهٔ اسلاید ۳" in chunk for chunk in chunks[1:]))
+
+    def test_oversized_first_slide_does_not_emit_preamble_only_chunk(self):
+        body = "توضیح مفصل اسلاید یک. " * 20
+        document = (
+            "## متن اسلایدها و گفتار ارائه به تفکیک اسلاید\n\n"
+            f"### اسلاید ۱ — مقدمه\n\n{body}"
+        )
+        chunks = split_presentation_document(document, 180)
+        self.assertGreater(len(chunks), 1)
+        self.assertIn("### اسلاید ۱", chunks[0])
+        self.assertIn("توضیح مفصل", chunks[0])
+
+    def test_unassigned_section_header_stays_with_unassigned_block(self):
+        outline = "### اسلاید 1 — اول\n- نکتهٔ یک"
+        transcript = (
+            "### گفتار مرتبط با اسلاید 1\n\nتوضیح کوتاه اسلاید یک.\n\n"
+            "### گفتار بدون نگاشت مطمئن به اسلاید\n\n" + ("توضیح بدون نگاشت. " * 15)
+        )
+        document = build_presentation_document(outline, transcript)
+        chunks = split_presentation_document(document, 220)
+        self.assertGreaterEqual(len(chunks), 2)
+        self.assertNotIn("بدون نگاشت زمانی مطمئن", chunks[0])
+        self.assertTrue(
+            any(
+                "بدون نگاشت زمانی مطمئن" in chunk and "### گفتار بدون نگاشت" in chunk
+                for chunk in chunks[1:]
+            )
+        )
+
+    def test_unaligned_narration_keeps_separate_sections_without_false_slide_grouping(self):
+        outline = "### اسلاید 1 — مقدمه\n- نکته"
+        transcript = "### گفتار بدون نگاشت مطمئن به اسلاید\n\nکل گفتار بدون زمان‌بندی."
+        document = build_presentation_document(outline, transcript)
+        self.assertIn("## متن اسلایدها\n\n", document)
+        self.assertIn("## متن پیاده‌سازی‌شدهٔ صدای ارائه\n\n", document)
+        self.assertNotIn("به تفکیک اسلاید", document)
+
+    def test_unaligned_plain_narration_is_not_labeled_as_last_slide_continuation(self):
+        outline = "### اسلاید ۱ — اول\n- نکتهٔ یک\n\n### اسلاید ۲ — دوم\n- نکتهٔ دو"
+        transcript = "توضیح طولانی گفتار استاد دربارهٔ کل جلسه. " * 12
+        document = build_presentation_document(outline, transcript)
+        chunks = split_presentation_document(document, 180)
+        self.assertGreaterEqual(len(chunks), 3)
+        self.assertFalse(any("ادامهٔ اسلاید ۲" in chunk for chunk in chunks))
+        self.assertTrue(
+            any("ادامهٔ گفتار بدون نگاشت" in chunk for chunk in chunks[1:])
+        )
+
+    def test_presentation_context_lists_all_slides_in_each_chunk(self):
+        chunks = [
+            "## متن اسلایدها\n\n### اسلاید ۱ — مقدمه\n- الف\n\n### اسلاید ۲ — تعاریف\n- ب",
+            "### اسلاید ۳ — روش کار\n- ج\n\n### اسلاید ۴ — نتیجه‌گیری\n- د",
+        ]
+        context = build_context(chunks)
+        self.assertEqual(len(context.topics), 2)
+        self.assertIn("اسلاید ۱ — مقدمه", context.topics[0])
+        self.assertIn("اسلاید ۲ — تعاریف", context.topics[0])
+        self.assertIn("اسلاید ۳ — روش کار", context.topics[1])
+        self.assertIn("اسلاید ۴ — نتیجه‌گیری", context.topics[1])
+
+    def test_cross_chunk_merge_keeps_distinctly_numbered_slides_separate(self):
+        self.assertFalse(
+            headings_overlap(
+                "اسلاید ۴: ساختمان داده‌های خطی",
+                "اسلاید ۵: ساختمان داده‌های خطی",
+            )
+        )
+        first = StructuredNotes(
+            sections=[one_section("اسلاید ۴: ساختمان داده‌های خطی", paragraphs=["الف"])]
+        )
+        second = StructuredNotes(
+            sections=[one_section("اسلاید ۵: ساختمان داده‌های خطی", paragraphs=["ب"])]
+        )
+        merged = merge_structured_notes([first, second])
+        self.assertEqual(len(merged.sections), 2)
+
+    def test_compile_accepts_rejects_dropped_definitions_and_gutted_prose(self):
+        defs = (
+            NoteDefinition("کیفیت", "توضیح اول"),
+            NoteDefinition("پایایی", "توضیح دوم"),
+        )
+        merged = StructuredNotes(
+            sections=(
+                NoteSection(
+                    heading="بخش ۱",
+                    paragraphs=("توضیح بسیار مفصل و کامل آموزشی. " * 20,),
+                    definitions=defs,
+                ),
+                NoteSection(
+                    heading="بخش ۲",
+                    paragraphs=("توضیح بسیار مفصل و کامل بخش دوم. " * 20,),
+                ),
+            )
+        )
+        no_defs = StructuredNotes(
+            sections=(
+                NoteSection(
+                    heading="بخش ۱",
+                    paragraphs=("توضیح بسیار مفصل و کامل آموزشی. " * 20,),
+                ),
+                NoteSection(
+                    heading="بخش ۲",
+                    paragraphs=("توضیح بسیار مفصل و کامل بخش دوم. " * 20,),
+                ),
+            )
+        )
+        self.assertFalse(compile_accepts(no_defs, merged))
+
+        gutted_prose = StructuredNotes(
+            sections=(
+                NoteSection(heading="بخش ۱", paragraphs=("کوتاه.",), definitions=defs),
+                NoteSection(heading="بخش ۲", paragraphs=("کوتاه دو.",)),
+            )
+        )
+        self.assertFalse(compile_accepts(gutted_prose, merged))
+
+    async def test_output_budget_truncation_splits_chunk_and_recovers(self):
+        settings = make_settings(note_chunk_chars=100_000, note_compile=False)
+        outline = (
+            "### اسلاید ۱ — بخش نخست\n" + ("- نکتهٔ اول برای تست.\n" * 15) + "\n"
+            "### اسلاید ۲ — بخش دوم\n" + ("- نکتهٔ دوم برای تست.\n" * 15)
+        )
+        truncated = _FakeResponse(200, {
+            "choices": [{"message": {"content": "{\"title\": \"ناقص\""}, "finish_reason": "length"}]
+        })
+        session = FakeSession([
+            truncated,
+            big_notes_json("نیمهٔ نخست"),
+            big_notes_json("نیمهٔ دوم"),
+        ])
+        notes = await structure_presentation(outline, "", settings, session, mode="summary")
+        self.assertEqual(len(session.calls), 3)
+        self.assertTrue(
+            session.calls[0]["json"]["messages"][1]["content"].startswith(PRESENTATION_PROMPT)
+        )
+        self.assertEqual(notes.note_mode, "summary")
 
 
 if __name__ == "__main__":
