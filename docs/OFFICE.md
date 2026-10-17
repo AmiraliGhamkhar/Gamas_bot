@@ -1,7 +1,7 @@
 # The Free Office section
 
 `📄 آفیس رایگان` turns the user's own text into a real Office file: Word,
-Excel or PowerPoint. It is a second front door to the bot — the lecture
+Excel, PowerPoint or PDF. It is a second front door to the bot — the lecture
 pipeline answers *«I have a recording, make me a booklet»*, this one answers
 *«I have text, make me a document»*.
 
@@ -33,7 +33,7 @@ the content of a request is not kept for hours.
 
 ## What the text becomes
 
-`gamas_bot/mdblocks.py` reads the text once, for all three formats:
+`gamas_bot/mdblocks.py` reads the text once, for all four formats:
 
 | The user wrote | It becomes |
 | --- | --- |
@@ -49,7 +49,7 @@ into a table; a tab or a pipe is unambiguous and is accepted at any width.
 The title of the document is the first heading, or the first line when it is
 short enough to be one, or the name of the uploaded file.
 
-## The three files
+## The four files
 
 **Word** is rendered by `gamas_bot/docx_export.py` — the same engine as the
 lecture booklet, so the document has the brand cover, the topic list, the page
@@ -68,6 +68,16 @@ right-aligned, and Persian runs carry a complex-script face. The full text of
 each section is kept in the notes pane. A text that has no headings of its
 own is cut into slides of six lines; its first line titles the deck instead
 of repeating itself as the first bullet.
+
+**PDF** (`gamas_bot/pdf_export.py`) is rendered by `reportlab` from the same
+parsed blocks, so it reuses the booklet's cover, the optional clickable topic
+list, the page frame, the running header and the footer page number. Persian
+is shaped with `arabic-reshaper` and reordered for storage with `python-bidi`,
+set in the bundled Vazirmatn face (SIL OFL, `assets/fonts/`); wrapping happens
+on the logical text and only the finished lines are shaped. The canvas is
+`invariant`, so identical text always produces identical bytes. Like the other
+formats it never calls a model: the words that reach the PDF are exactly the
+words the user sent.
 
 ## The model layer is optional
 

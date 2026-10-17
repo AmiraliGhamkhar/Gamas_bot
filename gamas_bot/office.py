@@ -2,7 +2,7 @@
 
 This module owns the *document* side of the section. It reads a piece of
 text — typed in the chat, pasted, or uploaded as ``.txt``/``.csv`` — and
-produces three deliverables with the same brand and the same right-to-left
+produces four deliverables with the same brand and the same right-to-left
 rules as the lecture booklet:
 
 * **Word** — handed to :mod:`gamas_bot.docx_export`, which already owns the
@@ -13,6 +13,8 @@ rules as the lecture booklet:
   that repeats on every page, frozen headings and zebra rows.
 * **PowerPoint** — a real ``.pptx`` in 16:9, with a title slide, an agenda,
   one slide per section and a closing slide.
+* **PDF** — handed to :mod:`gamas_bot.pdf_export`: cover, optional topic
+  list, the same palette, all right-to-left, shaped with Vazirmatn.
 
 Two rules run through the whole module:
 
@@ -43,23 +45,24 @@ from .textnorm import normalize_display, normalize_for_compare
 
 logger = logging.getLogger(__name__)
 
-#: The three deliverables, in the order the menu shows them.
-OFFICE_FORMATS = ("word", "excel", "ppt")
+#: The four deliverables, in the order the menu shows them.
+OFFICE_FORMATS = ("word", "excel", "ppt", "pdf")
 
 #: Human labels (used in captions and messages).
-FORMAT_LABELS = {"word": "Word", "excel": "Excel", "ppt": "PowerPoint"}
+FORMAT_LABELS = {"word": "Word", "excel": "Excel", "ppt": "PowerPoint", "pdf": "PDF"}
 
 #: The extension each format is delivered with.
-FORMAT_EXTENSIONS = {"word": ".docx", "excel": ".xlsx", "ppt": ".pptx"}
+FORMAT_EXTENSIONS = {"word": ".docx", "excel": ".xlsx", "ppt": ".pptx", "pdf": ".pdf"}
 
 #: The emoji shown on the menu button of each format.
-FORMAT_EMOJI = {"word": "📝", "excel": "📊", "ppt": "📖"}
+FORMAT_EMOJI = {"word": "📝", "excel": "📊", "ppt": "📖", "pdf": "📕"}
 
 #: The label printed on the cover of a Free Office Word document.
 OFFICE_MODE_LABELS = {
     "word": "سند آزاد — Word",
     "excel": "سند آزاد — Excel",
     "ppt": "سند آزاد — PowerPoint",
+    "pdf": "سند آزاد — PDF",
 }
 
 #: Uploads the section accepts as *content* (a document, not a lecture).

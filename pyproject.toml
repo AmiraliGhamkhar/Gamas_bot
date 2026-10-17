@@ -41,6 +41,12 @@ dependencies = [
     "openpyxl>=3.1,<4.0",
     # XML rewriting of OOXML parts.
     "lxml>=6.1,<7.0",
+    # The Free Office section writes .pdf: reportlab is pure Python (no
+    # office suite, no system libraries), and Persian text is shaped with
+    # arabic-reshaper + python-bidi before it reaches the renderer.
+    "reportlab>=4.0,<5.0",
+    "arabic-reshaper>=3.0,<4.0",
+    "python-bidi>=0.4,<1.0",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +54,8 @@ dev = [
     "ruff>=0.6",
     "pytest>=8.0",
     "mypy>=1.11",
+    # Reads the Free Office section's produced PDFs in the tests.
+    "pypdf>=4.0,<7.0",
 ]
 
 [project.scripts]

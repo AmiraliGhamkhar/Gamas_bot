@@ -10,9 +10,10 @@ A second front door: the user's own text becomes a real Office file.
 
 ### Added
 
-* **📄 آفیس رایگان** in the user menu. Pick Word, Excel or PowerPoint, send
-  the text (or upload a `.txt`/`.csv`/`.tsv`/`.md` file), and the document is
-  delivered — right-to-left and in the same brand as the lecture booklet.
+* **📄 آفیس رایگان** in the user menu. Pick Word, Excel, PowerPoint or PDF,
+  send the text (or upload a `.txt`/`.csv`/`.tsv`/`.md` file), and the
+  document is delivered — right-to-left and in the same brand as the lecture
+  booklet.
 * **The section is free.** It never reserves, charges or releases credit; a
   document costs the user nothing, and a failed build costs them nothing
   either. Only a `submissions` row of kind `office` is recorded.
@@ -29,6 +30,17 @@ A second front door: the user's own text becomes a real Office file.
   and a closing slide; the full text of each section is kept in the notes pane.
   A text with no headings of its own is cut into slides of six lines, and its
   first line titles the deck.
+* **PDF** is rendered by `reportlab` from the same parsed blocks: the
+  booklet's cover, an optional clickable topic list, the page frame, the
+  running header and the footer page number. Persian is shaped with
+  `arabic-reshaper` + `python-bidi` and set in the bundled Vazirmatn face
+  (SIL OFL, `assets/fonts/`). The canvas is `invariant`, so the same text
+  always yields the same bytes, and — like the other formats — no model is
+  ever called for it.
+* **`reportlab`, `arabic-reshaper` and `python-bidi`** join the dependency
+  list (`.pdf` writing); they are pure Python, like the rest of the Office
+  stack, and `pypdf` is added as a dev-only extra so the tests can read the
+  produced files back.
 * **One text parser** (`gamas_bot/mdblocks.py`) now reads both the lecture
   pipeline's Markdown and the user's text, so the two can never disagree about
   what a line is.

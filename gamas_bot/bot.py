@@ -69,6 +69,7 @@ from .media import (
     probe_media,
 )
 from .notes import StructuredNotes, structure_presentation, structure_transcript
+from .pdf_export import build_office_pdf
 from .office import (
     FORMAT_EMOJI,
     FORMAT_LABELS,
@@ -370,7 +371,7 @@ class GamasBot:
         if self.settings.office_enabled:
             text += (
                 "با «📄 آفیس رایگان» هم هر متنی را که دارید به فایل واقعی Word، "
-                "Excel یا PowerPoint تبدیل می‌کنم — رایگان است.\n"
+                "Excel، PowerPoint یا PDF تبدیل می‌کنم — رایگان است.\n"
             )
         text += f"\n⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
@@ -399,7 +400,7 @@ class GamasBot:
 
     # ------------------------------------------------------------- free office
     async def _show_office_menu(self, event, *, notice: str = "") -> None:
-        """The Free Office screen: the three formats, and what they cost.
+        """The Free Office screen: the four formats, and what they cost.
 
         The section is free, and the screen says so: a user who does not know
         the bot's credit rules must not wonder whether a document is going to
@@ -408,7 +409,7 @@ class GamasBot:
         text = (
             "📄 آفیس رایگان\n\n"
             "متن خودتان را بفرستید؛ من همان متن را به یک فایل واقعی تبدیل "
-            "می‌کنم — Word، Excel یا PowerPoint. متن شما عیناً در فایل می‌آید.\n"
+            "می‌کنم — Word، Excel، PowerPoint یا PDF. متن شما عیناً در فایل می‌آید.\n"
             "رایگان است و از اعتبار شما کم نمی‌کند.\n\n"
             "قالب را انتخاب کنید:"
         )
@@ -418,6 +419,7 @@ class GamasBot:
             [Button.inline(f"{FORMAT_EMOJI['word']} {FORMAT_LABELS['word']}", b"office:word")],
             [Button.inline(f"{FORMAT_EMOJI['excel']} {FORMAT_LABELS['excel']}", b"office:excel")],
             [Button.inline(f"{FORMAT_EMOJI['ppt']} {FORMAT_LABELS['ppt']}", b"office:ppt")],
+            [Button.inline(f"{FORMAT_EMOJI['pdf']} {FORMAT_LABELS['pdf']}", b"office:pdf")],
             [Button.inline("🔙 بازگشت", b"menu:main")],
         ]
         await self._edit_or_reply(event, text, buttons)
@@ -681,8 +683,8 @@ class GamasBot:
                 "قانون حساب: مصرف بر پایهٔ مدت صوت است و کار ناموفق اعتبار نمی‌سوزاند.\n"
                 "محدودیت‌ها: هر فایل تا ۲ گیگابایت؛ هم‌زمان ۳ کار فعال و ۸ کار در صف."
                 + (
-                    "\n\n📄 «آفیس رایگان»: متن خودتان را بفرستید تا فایل Word، Excel یا "
-                    "PowerPoint شود. رایگان است و اعتبار شما را کم نمی‌کند."
+                    "\n\n📄 «آفیس رایگان»: متن خودتان را بفرستید تا فایل Word، Excel، "
+                    "PowerPoint یا PDF شود. رایگان است و اعتبار شما را کم نمی‌کند."
                     if self.settings.office_enabled
                     else ""
                 )
@@ -1190,6 +1192,15 @@ class GamasBot:
             payload = await self._build_office_excel(document, content)
         elif kind == "ppt":
             payload = await self._build_office_pptx(document, content)
+        elif kind == "pdf":
+            # The PDF path is fully deterministic: no model call, no network,
+            # so it stays as fast and reliable as the Word path.
+            payload = await asyncio.to_thread(
+                build_office_pdf,
+                document,
+                meta=meta,
+                mode_label=OFFICE_MODE_LABELS["pdf"],
+            )
         else:
             payload = await asyncio.to_thread(
                 build_plain_docx,
