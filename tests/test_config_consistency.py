@@ -74,6 +74,11 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_COMPILE_MAX_CHARS", "note_compile_max_chars", "int"),
     ("NOTE_REASONING_EFFORT", "note_reasoning_effort", "str"),
     ("RAW_TEXT_PROFILE", "raw_text_profile", "str"),
+    ("OFFICE_ENABLED", "office_enabled", "bool"),
+    ("OFFICE_MAX_INPUT_BYTES", "office_max_input_bytes", "int"),
+    ("OFFICE_MAX_CHARS", "office_max_chars", "int"),
+    ("OFFICE_MAX_SLIDES", "office_max_slides", "int"),
+    ("OFFICE_SESSION_TTL_MINUTES", "office_session_ttl_minutes", "int"),
     ("PRESENTATION_MAX_CLIPS", "presentation_max_clips", "int"),
     ("PRESENTATION_MAX_TOTAL_DURATION", "presentation_max_total_duration", "float"),
     ("PRESENTATION_MIN_CLIP_SECONDS", "presentation_min_clip_seconds", "float"),
@@ -176,6 +181,8 @@ class DocumentedDefaultsTests(unittest.TestCase):
                 ok = int(actual) == int(raw)
             elif kind == "float":
                 ok = float(actual) == float(raw)
+            elif kind == "bool":
+                ok = bool(actual) == (raw.strip().lower() in {"1", "true", "yes", "on"})
             else:
                 ok = str(actual) == raw
             if not ok:

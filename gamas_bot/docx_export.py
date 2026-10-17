@@ -65,8 +65,9 @@ from lxml import etree
 
 from .bidi import TextRun, is_rtl_dominant, split_direction_runs
 from .config import PROJECT_DIR
+from .mdblocks import heading_level, parse_blocks
 from .progress import to_persian_digits
-from .notes import NoteSection, StructuredNotes
+from .notes import NoteSection, NoteTable, StructuredNotes
 from .textnorm import normalize_display
 
 logger = logging.getLogger(__name__)
@@ -1962,16 +1963,23 @@ def _toc_maximum_level(levels: str) -> int:
         return 1
 
 
+#: The heading offset of the *lecture* pipeline: its top level is ``##`` (the
+#: raw material the fallback path renders starts at ``## متن پیاده‌سازی‌شده``),
+#: so ``#`` and ``##`` both become Heading 1. The Free Office section uses the
+#: plain-Markdown convention instead (``#`` is the top level), because there
+#: the text was written by a user, not by the transcript engine.
+PIPELINE_HEADING_OFFSET = -1
+OFFICE_HEADING_OFFSET = 0
+
+
 def _markdown_heading_level(match) -> int:
     """Map a Markdown heading match to the Word level it becomes.
 
-    ``##`` is the top level the pipeline actually emits (the raw material the
-    fallback path renders starts at ``## متن پیاده‌سازی‌شده``), so ``#`` and
-    ``##`` both become Heading 1. Deeper levels shift down one step and clamp
-    at Heading 3 — which puts ``###`` and below *outside* the default
-    ``DOCX_TOC_LEVELS=1-1`` topic list.
+    Kept for the callers that still hold a regex match; the mapping itself
+    lives in :func:`gamas_bot.mdblocks.heading_level`, so the parser and the
+    renderer can never disagree about it.
     """
-    return min(max(len(match.group(1)) - 1, 1), 3)
+    return heading_level(len(match.group(1)), offset=PIPELINE_HEADING_OFFSET)
 
 
 def _fill_static_toc(
@@ -2766,24 +2774,26 @@ def build_notes_docx(
 def build_plain_docx(
     title: str, text: str, *, fonts: DocumentFonts | None = None, meta: DocumentMeta,
     font: str | None = None, design: DocxDesign | None = None,
+    mode_label: str = "", heading_offset: int = PIPELINE_HEADING_OFFSET,
 ) -> bytes:
     """Polished RTL Word document built from raw/fallback material.
 
     Understands the light Markdown the pipeline itself emits (``#``/``##``
-    headings, ``-`` bullets); everything else is a paragraph.
+    headings, ``-`` bullets) and the grid rows a user may paste (a tab, a
+    pipe table or a comma-separated row); everything else is a paragraph.
+
+    The text is read by :func:`gamas_bot.mdblocks.parse_blocks`, so the
+    Free Office section and the lecture pipeline agree on what a line is.
+    ``heading_offset`` chooses the convention: the lecture pipeline's top
+    level is ``##`` (``PIPELINE_HEADING_OFFSET``), while a document a *user*
+    wrote starts at ``#`` (``OFFICE_HEADING_OFFSET``).
     """
     resolved = fonts or resolve_fonts(font=font)
     style = design or DocxDesign()
     document = _new_document(meta, title)
     _configure_styles(document, resolved)
-    heading_matches = [
-        match
-        for match in (
-            re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", raw_line.rstrip())
-            for raw_line in text.splitlines()
-        )
-        if match is not None
-    ]
+    blocks = parse_blocks(text)
+    headings = [block for block in blocks if block.kind == "heading"]
     # Only headings the topic list will actually contain may earn one. Counting
     # every Markdown heading used to be enough to build the TOC page for a
     # document whose headings were all ``###`` or deeper: those become Heading
@@ -2791,11 +2801,12 @@ def build_plain_docx(
     # and the whole document was discarded instead.
     toc_headings = sum(
         1
-        for match in heading_matches
-        if _markdown_heading_level(match) <= _toc_maximum_level(style.toc_levels)
+        for block in headings
+        if heading_level(block.level, offset=heading_offset)
+        <= _toc_maximum_level(style.toc_levels)
     )
     toc_needed = toc_headings >= 2 and toc_is_worth_it(
-        len(text), len(heading_matches), style
+        len(text), len(headings), style
     )
     toc_table = None
 
@@ -2803,11 +2814,13 @@ def build_plain_docx(
     _configure_section(first_section)
     apply_page_border(first_section, style)
     if style.cover_enabled:
-        _add_cover_page(document, title, meta, fonts=resolved, design=style)
+        _add_cover_page(document, title, meta, fonts=resolved, design=style, mode_label=mode_label)
         body_section = _add_body_section(document, design=style)
     else:
         body_section = first_section
-        _add_body_title_block(document, title, meta, fonts=resolved, design=style)
+        _add_body_title_block(
+            document, title, meta, fonts=resolved, design=style, mode_label=mode_label
+        )
         if toc_needed:
             _add_page_break(document)
     _set_section_page_numbering(
@@ -2822,26 +2835,33 @@ def build_plain_docx(
         # The skeleton owns its own page break so the page can be dropped whole.
         toc_table = _add_static_toc_skeleton(document, fonts=resolved)
 
-    for raw_line in text.splitlines():
-        line = raw_line.rstrip()
-        if not line.strip():
+    for block in blocks:
+        if block.kind == "heading":
+            # The same mapping the TOC decision uses, so a heading is never
+            # counted as TOC-worthy here and then filtered out of the topic
+            # list there.
+            level = heading_level(block.level, offset=heading_offset)
+            _add_heading(document, block.text, fonts=resolved, level=level)
             continue
-        heading = re.match(r"^\s{0,3}(#{1,6})\s+(.*)$", line)
-        if heading:
-            # See :func:`_markdown_heading_level` — the same mapping the TOC
-            # decision uses, so a heading is never counted as TOC-worthy here
-            # and then filtered out of the topic list there.
-            level = _markdown_heading_level(heading)
-            _add_heading(document, heading.group(2).strip(), fonts=resolved, level=level)
-            continue
-        bullet = re.match(r"^\s*[-*+]\s+(.*)$", line)
-        if bullet:
+        if block.kind == "bullet":
             paragraph = _add_rtl_paragraph(
-                document, f"• {bullet.group(1).strip()}", fonts=resolved, align=WD_ALIGN_PARAGRAPH.RIGHT
+                document, f"• {block.text}", fonts=resolved, align=WD_ALIGN_PARAGRAPH.RIGHT
             )
             paragraph.paragraph_format.right_indent = Cm(0.35)
             continue
-        _add_rtl_paragraph(document, line.strip(), fonts=resolved)
+        if block.kind == "table":
+            # A pasted grid becomes a real table: the same dress as every other
+            # content table in a booklet (RTL column order, soft grid lines,
+            # a navy header row that repeats on every page).
+            rows = [list(row) for row in block.rows]
+            if rows:
+                _add_table(
+                    document,
+                    NoteTable(headers=rows[0], rows=rows[1:]),
+                    fonts=resolved,
+                )
+            continue
+        _add_rtl_paragraph(document, block.text, fonts=resolved)
     toc_entries = (
         _fill_static_toc(document, toc_table, fonts=resolved, levels=style.toc_levels)
         if toc_table is not None

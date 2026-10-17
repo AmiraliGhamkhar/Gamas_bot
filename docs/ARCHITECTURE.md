@@ -28,6 +28,20 @@ Word export              docx_export.py RTL booklet
 Delivery                 telegram_text.py   render → paginate → send
 ```
 
+The Free Office section is a second, much shorter path off the same queue:
+
+```
+Free Office handlers     bot.py         text / .txt upload → a request
+        ↓
+Text parser              mdblocks.py    headings, bullets, grids, paragraphs
+        ↓
+Document builders        office.py      .xlsx (openpyxl) and .pptx (python-pptx)
+        ↓
+Word export              docx_export.py the same booklet engine
+        ↓
+Arrangement (optional)   office_ai.py   one model request, checked against the source
+```
+
 ## Module map
 
 | Module | Responsibility |
@@ -49,6 +63,9 @@ Delivery                 telegram_text.py   render → paginate → send
 | `llm.py` | One LLM client: per-provider request/response, failover, error classes |
 | `notes.py` | Prompts, chunk budget, map/reduce, deterministic merge |
 | `docx_export.py` | RTL Word document: cover, frame, styles, TOC, fonts |
+| `mdblocks.py` | The one text parser: headings, bullets, grids, paragraphs |
+| `office.py` | The Free Office section: document model, `.xlsx` and `.pptx` builders |
+| `office_ai.py` | The optional model layer: slide order and table, checked against the source |
 | `progress.py` | Flood-safe progress messages |
 | `telegram_text.py` | Markdown → Telegram-safe HTML, UTF-16 pagination |
 | `textnorm.py`, `bidi.py` | Persian normalization and mixed-script run splitting |
@@ -82,7 +99,7 @@ files under `migrations/v3/`, applied once in filename order and recorded in
 | Table | Meaning |
 | --- | --- |
 | `users` | Telegram id, join date, banned flag, special (unlimited) flag |
-| `submissions` | One upload: kind, filename, status, error, measured duration |
+| `submissions` | One upload: kind (`audio` \| `video` \| `presentation` \| `office`), filename, status, error, measured duration |
 | `transcriptions` | The transcript text and the generated `notes_json` |
 | `plans` | Selling plans: hours, price, validity, `is_custom`, active |
 | `payments` | Card-to-card requests, receipt path, review outcome |
@@ -109,6 +126,9 @@ Billing is an append-only ledger, never a mutated balance. A job's lifecycle is
    so a note-provider outage never costs the user their content.
 8. A long list is paged, never cut. Callbacks carry an *address*, never a
    payload, and stay inside Telegram's 64-byte `callback_data` limit.
+9. The Free Office section never rewrites the user's text. A model may
+   *arrange* it; every line it proposes is checked against the source, and a
+   line that is not there is dropped. The section works with no model at all.
 
 ## Where to change things
 

@@ -31,7 +31,7 @@ MIN_FREE_BYTES = 3 * 1024**3
 TELEGRAM_PROBES = (("149.154.167.51", 443), ("149.154.175.53", 443))
 REQUIRED_PACKAGES = (
     "Telethon", "aiohttp", "aiosqlite", "python-dotenv", "python-pptx",
-    "lxml", "av", "ppt2pptx", "python-docx",
+    "lxml", "av", "ppt2pptx", "python-docx", "openpyxl",
 )
 
 

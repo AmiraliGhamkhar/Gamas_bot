@@ -232,12 +232,14 @@ class JobProgress:
         await self._publish(self._render())
 
     async def complete(
-        self, detail: str = "جزوهٔ Word و متن خام در پیام‌های بعدی می‌رسند."
+        self,
+        detail: str = "جزوهٔ Word و متن خام در پیام‌های بعدی می‌رسند.",
+        headline: str = "🎉 جزوه آماده شد! 🎉",
     ) -> None:
         self._finish()
         self.percent = 100
         text = (
-            "🎉 جزوه آماده شد! 🎉\n\n"
+            f"{headline}\n\n"
             f"{progress_bar(100)}  ۱۰۰٪  ✅\n"
             f"{detail.strip()}"
         )

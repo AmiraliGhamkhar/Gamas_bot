@@ -7,6 +7,9 @@ right-to-left Word booklet.
 * **Persian first** — RTL paragraphs and styles, mixed Persian/English runs,
   Persian digits, real heading styles, cover page, page frame, native
   page-number fields.
+* **Free Office section** — send your own text and get a real Word, Excel or
+  PowerPoint file, right-to-left and in the same brand. It costs no credit,
+  and it never rewrites what you wrote.
 * **No system media binaries** — media runs on PyAV and python-pptx. There is no
   `ffmpeg`, `ffprobe` or `soffice` requirement.
 * **Providers are configuration** — speech-to-text (Speechmatics / Deepgram /
@@ -28,9 +31,11 @@ Telegram → bounded job queue → media worker (PyAV) → speech-to-text
 The raw transcript is persisted and delivered **before** note generation starts,
 so a note-provider outage never costs the user their content.
 
-In chat everything starts from one button, **📎 ساخت جزوه**. Admins step into
-their own panel (**🛠 پنل مدیریت**) for statistics, users, pending payments and
-broadcasts.
+In chat everything starts from one button, **📎 ساخت جزوه**. A second button,
+**📄 آفیس رایگان**, turns the user's own text into a real Word, Excel or
+PowerPoint file — free, and without touching the credit ledger. Admins step
+into their own panel (**🛠 پنل مدیریت**) for statistics, users, pending
+payments and broadcasts.
 
 ## Supported formats
 
@@ -39,6 +44,7 @@ broadcasts.
 | Audio | MP3, M4A, WAV, OGG/OPUS, FLAC, WMA, AMR, AAC, Telegram voice notes |
 | Video | MP4, MKV, MOV, AVI, WEBM, WMV, MPEG/TS, Telegram round videos (audio track extracted, never re-encoded) |
 | Decks | PPTX, PPTM, PPSX, PPSM, POTX, POTM, legacy PPT/PPS/POT (converted in-process). ODP/OTP are not supported |
+| Free Office | Word (`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`) built from a chat message or an uploaded `.txt`/`.csv`/`.tsv`/`.md` file |
 
 ## Install
 
@@ -107,6 +113,9 @@ All configurable; defaults shown.
 | Note chunk ceiling | `NOTE_CHUNK_CHARS` | 64000 chars |
 | Note answer budget | `NOTE_MAX_OUTPUT_TOKENS` | 16384 tokens |
 | Receipt image | `MAX_PAYMENT_RECEIPT_BYTES` | 5 MB, kept 90 days |
+| Free Office text | `OFFICE_MAX_CHARS` | 20000 chars |
+| Free Office upload | `OFFICE_MAX_INPUT_BYTES` | 1 MB |
+| Free Office slides | `OFFICE_MAX_SLIDES` | 30 |
 
 Beyond the queue bounds an upload is rejected with an explicit message rather
 than queued in memory.
@@ -141,6 +150,8 @@ instance even if a watchdog starts a second copy.
   guessed.
 * Legacy `.ppt` fidelity is bounded by the converter library; unsupported
   content is reported, not silently dropped.
+* The Free Office section reads text, not documents: a `.docx` or a `.pdf` is
+  not a source, only a message or a `.txt`/`.csv`/`.tsv`/`.md` file is.
 * One process serves one bot token. Horizontal scaling would need a real job
   broker.
 * Payments are card-to-card and confirmed by a human. No gateway integration.
@@ -152,6 +163,10 @@ provider. Temporary files are removed after processing. The database keeps the
 transcript and generated notes so a job can be audited. Receipts are stored
 outside the web root at `0600` and deleted after the retention window. Logs never
 contain transcripts, keys or receipt contents.
+
+The Free Office section keeps the user's text in memory only, for as long as
+the request is open (`OFFICE_SESSION_TTL_MINUTES`); nothing about it is written
+to the database, and an uploaded file is deleted as soon as it has been read.
 
 ## Documentation
 

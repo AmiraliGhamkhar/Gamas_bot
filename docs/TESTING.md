@@ -37,6 +37,7 @@ has drifted.
 | Queue bounds, back-pressure, shutdown | `tests/test_jobs.py` |
 | LLM request/response shapes, error classes, failover | `tests/test_llm.py` |
 | Note parsing, chunk budget, map/reduce, split recovery | `tests/test_notes.py` |
+| Free Office: parser, Word/Excel/PowerPoint output, bot flow | `tests/test_office.py` |
 | STT adapters, retries, cooldowns, ordered failover | `tests/test_stt.py` |
 | Transcript paragraphing, fidelity, chunk boundaries | `tests/test_transcript.py` |
 
