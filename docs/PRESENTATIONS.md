@@ -3,7 +3,9 @@
 ## Media selection and playback order
 
 The reader follows the deck's slide order and each slide's internal audio/video
-relationships. A media part referenced from two slides is treated as two playback
+and Office `p14:media` relationships (deduplicating redundant `media` links when
+the same slide already references that target via an explicit audio/video
+relationship). A media part referenced from two slides is treated as two playback
 uses (while its bytes are extracted only once), so the merged timeline retains
 both slide positions. Media parts without a direct slide relationship are
 excluded by default. Set `PRESENTATION_INCLUDE_UNREFERENCED_MEDIA=true` to opt
@@ -21,13 +23,16 @@ span in that one output. It does not need a second probe of the merged file.
 A single compatible audio clip is passed through unchanged; video audio,
 multiple clips, and incompatible audio are decoded/merged as needed.
 
-When STT returns timestamps, a word or segment is attached to a slide only when
-its full timestamp interval lies inside exactly one span belonging to a
-slide-linked clip. Text in synthetic gaps, orphan media, clip-boundary-crossing
-segments, or responses without usable timestamps stays in an explicit
-**unmapped narration** section. The bot never assigns untimed text to the
-nearest slide. Slide-aware note input keeps each aligned narration block beside
-its slide text; oversized slides are split only when necessary.
+When STT returns timestamps, a word or segment is attached to a slide when its
+timestamp interval lies inside (or within a bounded `80 ms` edge-jitter
+tolerance of) a single span belonging to a slide-linked clip with at least half
+of its duration inside that clip. Text wholly in synthetic gaps, orphan media,
+clip-boundary-crossing segments, or responses without usable timestamps stays in
+an explicit **unmapped narration** section. The bot never assigns untimed text to
+the nearest slide. Slide-aware note input keeps each aligned narration block
+beside its slide text, lists all slide headings per chunk in the lecture context
+digest, and splits oversized slides or unmapped narration blocks with explicit
+continuation headings only when necessary.
 
 ## Duration, billing and storage limits
 

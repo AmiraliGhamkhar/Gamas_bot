@@ -420,10 +420,7 @@ def render(document: TranscriptDocument, profile: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
-    """Cut an oversized paragraph at sentence, then word, boundaries."""
-    if max_chars <= 0:
-        raise ValueError("max_chars must be positive")
+def _split_single_line_paragraph(paragraph: str, max_chars: int) -> list[str]:
     pieces: list[str] = []
     for sentence_start, sentence_end in sentence_spans(paragraph):
         sentence = paragraph[sentence_start:sentence_end].strip()
@@ -442,6 +439,31 @@ def _split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
             packed[-1] = packed[-1] + " " + piece
         else:
             packed.append(piece)
+    return packed or [paragraph[:max_chars]]
+
+
+def _split_long_paragraph(paragraph: str, max_chars: int) -> list[str]:
+    """Cut an oversized paragraph at line, sentence, then word boundaries."""
+    if max_chars <= 0:
+        raise ValueError("max_chars must be positive")
+    if "\n" not in paragraph:
+        return _split_single_line_paragraph(paragraph, max_chars)
+    lines = [line.strip() for line in paragraph.splitlines() if line.strip()]
+    if len(lines) <= 1:
+        return _split_single_line_paragraph(paragraph.strip(), max_chars)
+    packed: list[str] = []
+    for line in lines:
+        line_pieces = (
+            [line]
+            if len(line) <= max_chars
+            else _split_single_line_paragraph(line, max_chars)
+        )
+        for index, piece in enumerate(line_pieces):
+            separator = "\n" if index == 0 else " "
+            if packed and len(packed[-1]) + len(piece) + len(separator) <= max_chars:
+                packed[-1] = packed[-1] + separator + piece
+            else:
+                packed.append(piece)
     return packed or [paragraph[:max_chars]]
 
 
@@ -479,7 +501,23 @@ def split_transcript(text: str, max_chars: int = TRANSCRIPT_CHUNK_CHARS) -> list
 
     for paragraph in paragraphs:
         pieces = [paragraph]
-        if len(paragraph) > max_chars:
+        if (
+            current
+            and all(item.lstrip().startswith("#") for item in current)
+            and current_len + 2 + len(paragraph) > max_chars
+        ):
+            first_budget = max_chars - current_len - 2
+            if first_budget >= max(20, max_chars // 5):
+                initial = _split_long_paragraph(paragraph, first_budget)
+                if len(initial) > 1:
+                    sep = "\n" if "\n" in paragraph else " "
+                    rest = sep.join(initial[1:])
+                    pieces = [initial[0], *_split_long_paragraph(rest, max_chars)]
+                else:
+                    pieces = initial
+            elif len(paragraph) > max_chars:
+                pieces = _split_long_paragraph(paragraph, max_chars)
+        elif len(paragraph) > max_chars:
             pieces = _split_long_paragraph(paragraph, max_chars)
         for piece_index, piece in enumerate(pieces):
             if (

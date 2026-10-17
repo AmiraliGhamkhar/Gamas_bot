@@ -1166,7 +1166,6 @@ class GamasBot:
                 await self._release(job, "transcription failed")
                 raise
             raw_engine = raw.engine
-            document = build_document(raw)
             alignment = align_narration_to_slides(raw, prepared, content.slides)
             narration_text = alignment.as_text()
             logger.info(
@@ -1201,9 +1200,10 @@ class GamasBot:
         # why a narration file did not make it into the transcript.
         if skipped:
             raw_text += "\n\n---\nنکته: این موارد در پردازش نادیده گرفته شدند:\n" + "\n".join(f"• {reason}" for reason in skipped)
+        engine_label = raw_engine or ("slides" if prepared is None else "stt")
         await self.db.save_transcription(
             job.submission_id,
-            engine=raw_engine or ("slides" if document is None else "stt"),
+            engine=engine_label,
             text=raw_text,
             notes_json="",
         )
@@ -1220,10 +1220,12 @@ class GamasBot:
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
         transcript_text = narration_text
         presentation_text = build_presentation_document(outline, transcript_text)
-        notes = await self._generate_presentation_notes(outline, transcript_text, job, progress)
+        notes = await self._generate_presentation_notes(
+            outline, transcript_text, job, progress, document=presentation_text
+        )
         await self.db.save_transcription(
             job.submission_id,
-            engine=raw_engine or ("slides" if document is None else "stt"),
+            engine=engine_label,
             text=raw_text,
             notes_json=notes.to_json() if notes else "",
         )
@@ -1377,7 +1379,13 @@ class GamasBot:
             return None
 
     async def _generate_presentation_notes(
-        self, outline: str, transcript_text: str, job: Job, progress
+        self,
+        outline: str,
+        transcript_text: str,
+        job: Job,
+        progress,
+        *,
+        document: str | None = None,
     ) -> StructuredNotes | None:
         if not self.settings.note_configured:
             return None
@@ -1385,8 +1393,12 @@ class GamasBot:
             return None
         try:
             return await structure_presentation(
-                outline, transcript_text, self.settings, self._http_session(),
+                outline,
+                transcript_text,
+                self.settings,
+                self._http_session(),
                 mode=self.settings.note_mode,
+                document=document,
             )
         except Exception as exc:
             logger.warning("presentation note generation failed: %s", exc)

@@ -59,12 +59,17 @@ RELS_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 PML_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
 DRAWING_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 OFFICE_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+MS_OFFICE_REL_NS = "http://schemas.microsoft.com/office/2007/relationships"
 MEDIA_REL_TYPES = {
     f"{OFFICE_REL_NS}/audio": "audio",
     f"{OFFICE_REL_NS}/video": "video",
     f"{OFFICE_REL_NS}/media": "media",
+    f"{MS_OFFICE_REL_NS}/media": "media",
 }
 NOTES_SLIDE_REL_TYPE = f"{OFFICE_REL_NS}/notesSlide"
+#: Maximum STT timestamp jitter (seconds) tolerated at a clip boundary when a
+#: word overlaps only that clip and at least half of the word lies inside it.
+ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS = 0.08
 #: Placeholders that carry page furniture (slide number, date, header, footer),
 #: never the lecture's own words; python-pptx skips their ``a:fld`` text too.
 FURNITURE_PLACEHOLDERS = frozenset({"sldNum", "hdr", "ftr", "dt"})
@@ -98,9 +103,26 @@ class SlideText:
     def as_markdown(self, include_notes: bool = True) -> str:
         heading = f"### اسلاید {self.number}" + (f" — {self.title.strip()}" if self.title.strip() else "")
         lines = [heading]
-        lines.extend(f"- {item}" for item in self.body if item.strip())
+        for raw_item in self.body:
+            item = raw_item.strip()
+            if not item:
+                continue
+            if " | " in item:
+                row = item if item.startswith("|") else f"| {item} |"
+                lines.append(row)
+            else:
+                lines.append(f"- {item}")
         if include_notes and self.notes.strip():
-            lines.append("یادداشت گوینده: " + " ".join(self.notes.split()))
+            note_paragraphs = [
+                " ".join(part.split())
+                for part in self.notes.splitlines()
+                if part.strip()
+            ]
+            if note_paragraphs:
+                if len(lines) > 1:
+                    lines.append("")
+                lines.append("یادداشت گوینده: " + note_paragraphs[0])
+                lines.extend(note_paragraphs[1:])
         return "\n".join(lines)
 
 
@@ -372,9 +394,10 @@ def _extract_slide_text_with_pptx(path: Path) -> list[SlideText]:
                 if getattr(shape, "has_table", False):
                     for row in shape.table.rows:
                         cells = [_clean_text(cell.text) for cell in row.cells]
-                        line = " | ".join(cell for cell in cells if cell)
-                        if line:
-                            collected.append(line)
+                        if any(cells):
+                            line = " | ".join(cells) if len(cells) > 1 else cells[0]
+                            if line:
+                                collected.append(line)
                     continue
                 if getattr(shape, "has_text_frame", False):
                     for paragraph in shape.text_frame.paragraphs:
@@ -390,16 +413,31 @@ def _extract_slide_text_with_pptx(path: Path) -> list[SlideText]:
     slides: list[SlideText] = []
     for number, slide in enumerate(deck.slides, start=1):
         title = ""
+        title_lines: set[str] = set()
         try:
             if slide.shapes.title is not None and slide.shapes.title.has_text_frame:
-                title = _clean_text(slide.shapes.title.text)
+                title_shape = slide.shapes.title
+                title_parts = [
+                    _clean_text("".join(run.text for run in paragraph.runs))
+                    for paragraph in title_shape.text_frame.paragraphs
+                ]
+                title_parts = [part for part in title_parts if part]
+                title_lines.update(title_parts)
+                title = " ".join(title_parts) or _clean_text(title_shape.text)
+                if title:
+                    title_lines.add(title)
         except Exception:
             logger.debug("Slide %s has no readable title", number, exc_info=True)
-        body = [line for line in shape_texts(slide.shapes) if line and line != title]
+        body = [line for line in shape_texts(slide.shapes) if line and line not in title_lines]
         notes = ""
         try:
             if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
-                notes = _clean_text(slide.notes_slide.notes_text_frame.text)
+                note_lines = [
+                    _clean_text("".join(run.text for run in paragraph.runs))
+                    for paragraph in slide.notes_slide.notes_text_frame.paragraphs
+                ]
+                note_lines = [line for line in dict.fromkeys(note_lines) if line]
+                notes = "\n".join(note_lines) or _clean_text(slide.notes_slide.notes_text_frame.text)
         except Exception:
             logger.debug("Slide %s has no readable notes", number, exc_info=True)
         slides.append(SlideText(number, title, tuple(dict.fromkeys(body)), notes))
@@ -465,9 +503,10 @@ def _table_lines(frame) -> list[str]:
                 )
                 for cell in row.findall(f"{{{DRAWING_NS}}}tc")
             ]
-            line = " | ".join(cell for cell in cells if cell)
-            if line:
-                lines.append(line)
+            if any(cells):
+                line = " | ".join(cells) if len(cells) > 1 else cells[0]
+                if line:
+                    lines.append(line)
     return lines
 
 
@@ -840,13 +879,28 @@ def read_presentation(
         references: list[tuple[int | None, str | None, str]] = []
         referenced_parts: set[str] = set()
         for slide_number, slide_part in enumerate(slide_parts, start=1):
+            slide_rels: list[tuple[str, str, str]] = []
             for rel_id, rel_type, target in _relationships(archive, slide_part):
                 if not target or rel_type not in MEDIA_REL_TYPES:
                     continue
                 resolved = _resolve_target(slide_part, target)
                 if resolved in names:
-                    references.append((slide_number, rel_id, resolved))
+                    slide_rels.append((rel_id, MEDIA_REL_TYPES[rel_type], resolved))
                     referenced_parts.add(resolved)
+            # Desktop PowerPoint often writes both an OOXML audio/video
+            # relationship and a 2007 p14:media relationship for the same
+            # embedded clip on a slide; drop the redundant "media" twin while
+            # keeping explicit audio/video uses and standalone media links.
+            primary_targets = {
+                resolved for _rel_id, kind_tag, resolved in slide_rels if kind_tag != "media"
+            }
+            seen_media_targets: set[str] = set()
+            for rel_id, kind_tag, resolved in slide_rels:
+                if kind_tag == "media":
+                    if resolved in primary_targets or resolved in seen_media_targets:
+                        continue
+                    seen_media_targets.add(resolved)
+                references.append((slide_number, rel_id, resolved))
 
         unreferenced = sorted(
             (
@@ -1092,6 +1146,47 @@ async def prepare_audio(
     )
 
 
+def _match_clip_span(
+    start: float,
+    end: float,
+    spans: list[ClipSpan],
+    *,
+    tolerance: float = ALIGNMENT_BOUNDARY_TOLERANCE_SECONDS,
+) -> ClipSpan | None:
+    """Return the unique clip span containing ``[start, end]``, with edge jitter tolerance.
+
+    Exact containment wins first. When STT timestamps jitter slightly into the
+    adjacent synthetic silence gap (up to ``tolerance`` seconds), a word is
+    still attributed to its clip only if it overlaps that single clip, touches
+    no other clip, and has at least half of its duration inside the clip.
+    Words wholly inside a silence gap or crossing between clips return ``None``.
+    """
+    exact = [
+        item for item in spans
+        if start >= item.start_seconds and end <= item.end_seconds
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    if len(exact) > 1 or tolerance <= 0:
+        return None
+    overlapping = [
+        item for item in spans
+        if start < item.end_seconds and end > item.start_seconds
+    ]
+    if len(overlapping) != 1:
+        return None
+    candidate = overlapping[0]
+    leading_overhang = max(0.0, candidate.start_seconds - start)
+    trailing_overhang = max(0.0, end - candidate.end_seconds)
+    if leading_overhang > tolerance or trailing_overhang > tolerance:
+        return None
+    word_duration = end - start
+    overlap_duration = min(end, candidate.end_seconds) - max(start, candidate.start_seconds)
+    if word_duration > 0 and overlap_duration < word_duration * 0.5:
+        return None
+    return candidate
+
+
 def align_narration_to_slides(
     raw: RawTranscript,
     prepared: PreparedAudio,
@@ -1128,13 +1223,8 @@ def align_narration_to_slides(
             unassigned.append(word)
             continue
         has_timing = True
-        matches = [
-            item for item in spans
-            if start >= item.start_seconds and end <= item.end_seconds
-        ]
-        # A timed word/segment that crosses a clip edge or a synthetic gap is
-        # not attributed by its midpoint; it stays visible but unassigned.
-        span = matches[0] if len(matches) == 1 else None
+        assert start is not None and end is not None
+        span = _match_clip_span(start, end, spans)
         slide_number = span.clip.slide_number if span is not None else None
         if slide_number is None:
             unassigned.append(word)

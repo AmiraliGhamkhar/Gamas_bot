@@ -29,8 +29,13 @@ from dataclasses import dataclass, replace
 
 import aiohttp
 
-from .config import NOTE_MODES, Settings
-from .llm import LLMContextOverflowError, LLMError, complete_json
+from .config import NOTE_MODES, Settings, resolve_note_mode
+from .llm import (
+    LLMContextOverflowError,
+    LLMError,
+    LLMOutputBudgetError,
+    complete_json,
+)
 from .progress import to_persian_digits
 from .textnorm import normalize_for_compare
 from .transcript import split_transcript
@@ -52,10 +57,16 @@ COMPILE_MIN_NOTES_CHARS = 400
 COMPILE_HARD_MAX_CHARS = 160000
 #: The compile result must keep at least this share of the merged sections.
 COMPILE_MIN_SECTION_RATIO = 0.5
+#: Minimum body-character retention when compiling substantive sections.
+COMPILE_MIN_CONTENT_RATIO = 0.35
+#: Average body characters per section above which prose-loss gating applies.
+COMPILE_SUBSTANTIVE_SECTION_CHARS = 400
 #: The neighbour window handed to a chunk as context only.
 NEIGHBOUR_CONTEXT_CHARS = 260
 #: Characters of each chunk opening used for the deterministic topic digest.
 CONTEXT_HEAD_CHARS = 220
+#: Maximum characters for a multi-slide chunk's topic summary in the digest.
+PRESENTATION_CHUNK_TOPIC_MAX_CHARS = 440
 #: Hard bound on the deterministic digest.
 CONTEXT_DIGEST_MAX_CHARS = 6000
 
@@ -246,6 +257,7 @@ class StructuredNotes:
         return {
             "title": self.title,
             "summary": self.summary,
+            "note_mode": self.note_mode if self.note_mode in NOTE_MODES else "full",
             "learning_objectives": list(self.learning_objectives),
             "sections": [
                 {
@@ -351,7 +363,9 @@ class StructuredNotes:
         return "\n\n".join(parts)
 
     @classmethod
-    def from_payload(cls, payload: object) -> "StructuredNotes":
+    def from_payload(
+        cls, payload: object, *, default_mode: str = "full"
+    ) -> "StructuredNotes":
         """Validate and normalise a model-supplied JSON payload."""
         if not isinstance(payload, dict):
             raise StructuringError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
@@ -373,12 +387,19 @@ class StructuredNotes:
         glossary = tuple(
             filter(None, (GlossaryEntry.from_payload(item) for item in glossary_items))
         )
+        raw_mode = payload.get("note_mode")
+        note_mode = (
+            raw_mode
+            if isinstance(raw_mode, str) and raw_mode in NOTE_MODES
+            else resolve_note_mode(default_mode)
+        )
         notes = cls(
             title=_bounded_text(payload.get("title"), MAX_TITLE_CHARS),
             summary=_bounded_text(payload.get("summary")),
             sections=sections,
             key_points=tuple(_string_list(payload.get("key_points"))),
             glossary=glossary,
+            note_mode=note_mode,
             learning_objectives=tuple(_string_list(payload.get("learning_objectives"))),
             review_questions=tuple(_string_list(payload.get("review_questions"))),
         )
@@ -518,8 +539,9 @@ _CONTINUATION_SUFFIX = re.compile(
 _HEADING_STOPWORDS = frozenset(
     {
         "و", "در", "به", "از", "با", "بر", "برای", "که", "این", "آن", "های",
-        "ها", "یک", "یا", "تا", "را", "هم", "می", "شود", "است", "the", "of",
-        "and", "a", "an", "to", "in", "on", "for", "with", "part", "section",
+        "ها", "یک", "یا", "تا", "را", "هم", "می", "شود", "است", "اسلاید",
+        "the", "of", "and", "a", "an", "to", "in", "on", "for", "with", "part",
+        "section", "slide",
     }
 )
 
@@ -557,6 +579,11 @@ def heading_topic_words(heading: str) -> frozenset[str]:
     )
 
 
+def _heading_numbers(heading: str) -> tuple[str, ...]:
+    key = heading_topic_key(heading) or _compare_key(heading)
+    return tuple(re.findall(r"\d+", key))
+
+
 def headings_share_a_topic(first: str, second: str, *, minimum: int = MIN_SHARED_TOPIC_WORDS) -> bool:
     """Do two headings clearly describe one topic? (conservative)"""
     key_a = heading_topic_key(first)
@@ -577,6 +604,10 @@ def headings_share_a_topic(first: str, second: str, *, minimum: int = MIN_SHARED
 
 def headings_overlap(first: str, second: str, *, threshold: float = 0.5) -> bool:
     """A looser topic test, used *only* across a chunk boundary."""
+    nums_a = _heading_numbers(first)
+    nums_b = _heading_numbers(second)
+    if nums_a and nums_b and nums_a != nums_b:
+        return False
     words_a = heading_topic_words(first)
     words_b = heading_topic_words(second)
     if not words_a or not words_b:
@@ -769,6 +800,7 @@ def build_presentation_system_prompt(mode: str = "full", *, context_block: str =
 
 
 TRANSCRIPT_PROMPT = "متن پیاده‌سازی‌شدهٔ خام:\n\n"
+PRESENTATION_PROMPT = "محتوای ارائه (متن اسلایدها و گفتار):\n\n"
 
 COMPILE_SYSTEM_PROMPT = (
     "شما ویراستار نهایی جزوهٔ فارسی «گاماس» هستید. ورودی شما «زمینهٔ کلی درس» و «جزوهٔ فعلی» "
@@ -776,7 +808,7 @@ COMPILE_SYSTEM_PROMPT = (
     "خروجی شما یک جزوهٔ واحد و روان است، نه خلاصه‌ای از جزوه.\n\n"
     "کار شما:\n"
     "- بخش‌هایی که به یک موضوع واحد تعلق دارند را در یک بخش منسجم ادغام کنید؛ ترتیب منطقی متن را نگه دارید.\n"
-    "- عنوان بخش‌ها را از «موضوع‌های درس» بردارید و برای هر موضوع، دقیقاً یک بخش بسازید.\n"
+    "- عنوان بخش‌ها را روشن، گویا و هماهنگ با «موضوع‌های درس» بنویسید؛ بخش‌های هم‌موضوع یا دنباله‌دار را ادغام کنید، اما موضوع‌های متمایز را در یک بخش واحد ادغام نکنید.\n"
     "- تکرارهای عینی و تیترهای تکراری را یک‌بار بنویسید، ولی هیچ توضیح، تعریف، مثال، مرحله، مقایسه، هشدار، "
     "استثنا، فرمول، عدد، واحد، تاریخ یا اصطلاح تازه‌ای را به‌خاطر کوتاه‌شدن حذف نکنید. دو جمله که یک "
     "مفهوم را با کلمات متفاوت می‌گویند، تکرار عینی نیستند و هر دو می‌مانند؛ فقط تکرار لفظ‌به‌لفظ را یکی کنید.\n"
@@ -792,6 +824,17 @@ COMPILE_SYSTEM_PROMPT = (
     "ساختار خروجی — فقط یک شیء JSON معتبر، بدون هیچ متن اضافه، با همان ساختار ورودی؛ "
     "«sections» هرگز خالی نمی‌شود و در callouts مقدار kind فقط «نکته»، «هشدار» یا «یادآوری» است."
 )
+
+
+def build_compile_system_prompt(
+    mode: str = "full", *, presentation: bool = False
+) -> str:
+    """Build the editorial compile system prompt for a note mode and source kind."""
+    mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
+    prompt = COMPILE_SYSTEM_PROMPT + "\n\nقواعد حالت خروجی:\n" + mode_rule.rstrip()
+    if presentation:
+        prompt += "\n" + _PRESENTATION_CONTENT_RULES.strip()
+    return prompt
 
 
 # ===========================================================================
@@ -939,14 +982,17 @@ def _merge_sections(
     merged: list[NoteSection] = []
     seen_text: set[str] = set()
     seen_blocks: set[str] = set()
+    pending_chunk_boundary = False
     for position, section in enumerate(sections):
+        if position in chunk_starts:
+            pending_chunk_boundary = True
         paragraphs = _dedupe_by_key(section.paragraphs, _compare_key)
         bullets = _dedupe_by_key(section.bullets, _compare_key)
         paragraphs = tuple(
             value for value in paragraphs if _compare_key(value) not in seen_text
         )
-        bullets = tuple(value for value in bullets if _compare_key(value) not in seen_text)
         seen_text.update(_compare_key(value) for value in paragraphs)
+        bullets = tuple(value for value in bullets if _compare_key(value) not in seen_text)
         seen_text.update(_compare_key(value) for value in bullets)
         cleaned = replace(
             section,
@@ -965,8 +1011,10 @@ def _merge_sections(
         if keys and seen_blocks and all(key in seen_blocks for key in keys):
             continue
         seen_blocks.update(keys)
+        across_chunk = pending_chunk_boundary
+        pending_chunk_boundary = False
         if merged and _same_logical_section(
-            merged[-1], cleaned, across_chunk=position in chunk_starts
+            merged[-1], cleaned, across_chunk=across_chunk
         ):
             merged[-1] = _combine_sections(merged[-1], cleaned)
         else:
@@ -1061,9 +1109,9 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
 # ===========================================================================
 
 
-def _load_json_payload(payload: dict) -> StructuredNotes:
+def _load_json_payload(payload: dict, *, mode: str = "full") -> StructuredNotes:
     try:
-        return StructuredNotes.from_payload(payload)
+        return StructuredNotes.from_payload(payload, default_mode=mode)
     except (KeyError, TypeError) as exc:
         raise StructuringError("پاسخ سرویس تولید جزوه ساختار معتبری نداشت.") from exc
 
@@ -1071,6 +1119,12 @@ def _load_json_payload(payload: dict) -> StructuredNotes:
 # ===========================================================================
 # Deterministic lecture context (no LLM call: chunk openings)
 # ===========================================================================
+
+_SLIDE_TOPIC_HEADING_RE = re.compile(
+    r"(?m)^###\s+((?:ادامهٔ\s+)?اسلاید\s+[0-9۰-۹٠-٩]+(?:\s*[—–-]\s*[^\n]+)?|"
+    r"(?:ادامهٔ\s+)?گفتار بدون نگاشت مطمئن به اسلاید)"
+)
+_LEADING_WRAPPER_HEADINGS_RE = re.compile(r"^(?:\s*#{1,6}\s+[^\n]+\n+)+")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1090,27 +1144,46 @@ class LectureContext:
         return ""
 
 
-def build_context(chunks: list[str]) -> LectureContext:
-    """Topics = the first sentence of each chunk, bounded.
+def _chunk_topic_summary(chunk: str) -> str:
+    """Summarize the topics of one chunk from its slide headings or opening sentence."""
+    slide_headings = [
+        " ".join(match.split())
+        for match in _SLIDE_TOPIC_HEADING_RE.findall(chunk)
+        if match.strip()
+    ]
+    slide_headings = list(dict.fromkeys(slide_headings))
+    if slide_headings:
+        summary = "؛ ".join(slide_headings)
+        if len(summary) > PRESENTATION_CHUNK_TOPIC_MAX_CHARS:
+            summary = summary[:PRESENTATION_CHUNK_TOPIC_MAX_CHARS].rsplit("؛", 1)[0] + "؛ …"
+        return summary
+    stripped = chunk.strip()
+    unwrapped = _LEADING_WRAPPER_HEADINGS_RE.sub("", stripped).strip() or stripped
+    opening = unwrapped[:CONTEXT_HEAD_CHARS]
+    first_sentence = opening
+    match = _SENTENCE_SPAN.search(opening)
+    if match and match.end() >= 10:
+        first_sentence = opening[: match.end()]
+    return " ".join(first_sentence.split())
 
-    This is the v3 simplification of v2's orientation LLM call: the opening of
-    a chunk states its topic, so the digest is deterministic, free and instant.
+
+def build_context(chunks: list[str]) -> LectureContext:
+    """Topics = slide headings in each chunk (for decks) or the opening sentence.
+
+    This is the v3 simplification of v2's orientation LLM call: the slide
+    headings or opening of a chunk state its topics, so the digest is
+    deterministic, free and instant.
     """
     topics: list[str] = []
     budget = CONTEXT_DIGEST_MAX_CHARS
     for chunk in chunks:
-        opening = chunk.strip()[:CONTEXT_HEAD_CHARS]
-        first_sentence = opening
-        match = _SENTENCE_SPAN.search(opening)
-        if match and match.end() >= 10:
-            first_sentence = opening[: match.end()]
-        first_sentence = " ".join(first_sentence.split())
-        if not first_sentence:
+        topic = _chunk_topic_summary(chunk)
+        if not topic:
             continue
-        if len(first_sentence) > budget:
+        if len(topic) > budget:
             break
-        topics.append(first_sentence)
-        budget -= len(first_sentence) + 2
+        topics.append(topic)
+        budget -= len(topic) + 2
     return LectureContext(title="", topics=tuple(topics))
 
 
@@ -1154,8 +1227,8 @@ def context_block_for(
     topic = context.topic_for(index, total)
     if topic:
         lines.append(
-            f"موضوع همین بخش: «{topic}» — فقط همین موضوع را بنویسید و عنوان بخش‌های "
-            "خود را از این موضوع بردارید."
+            f"موضوع همین بخش: «{topic}» — تمام مطالب همین بخش را پوشش دهید و عنوان بخش‌های "
+            "خود را متناسب با همین موضوع‌ها انتخاب کنید."
         )
     if index > 1:
         previous_tail = documents[index - 2].strip()[-NEIGHBOUR_CONTEXT_CHARS:].strip()
@@ -1248,6 +1321,34 @@ def build_compile_document(context: LectureContext, notes: StructuredNotes) -> s
     return "\n\n".join(parts)
 
 
+def _notes_structured_item_count(notes: StructuredNotes) -> int:
+    return sum(
+        len(section.definitions)
+        + len(section.formulas)
+        + len(section.steps)
+        + len(section.examples)
+        + (1 if section.table is not None else 0)
+        for section in notes.sections
+    )
+
+
+def _notes_body_chars(notes: StructuredNotes) -> int:
+    total = 0
+    for section in notes.sections:
+        total += sum(len(p) for p in section.paragraphs)
+        total += sum(len(b) for b in section.bullets)
+        total += sum(len(d.term) + len(d.definition) for d in section.definitions)
+        total += sum(len(e) for e in section.examples)
+        total += sum(len(s) for s in section.steps)
+        total += sum(len(f) for f in section.formulas)
+        total += sum(len(k) for k in section.key_points)
+        total += sum(len(c.text) for c in section.callouts)
+        if section.table is not None:
+            total += sum(len(h) for h in section.table.headers)
+            total += sum(len(cell) for row in section.table.rows for cell in row)
+    return total
+
+
 def compile_accepts(compiled: StructuredNotes, merged: StructuredNotes) -> bool:
     """The deterministic acceptance gate for the compile answer.
 
@@ -1265,6 +1366,26 @@ def compile_accepts(compiled: StructuredNotes, merged: StructuredNotes) -> bool:
             ratio, len(merged.sections), len(compiled.sections),
         )
         return False
+    merged_structured = _notes_structured_item_count(merged)
+    if merged_structured >= 2:
+        compiled_structured = _notes_structured_item_count(compiled)
+        structured_ratio = compiled_structured / merged_structured
+        if structured_ratio < COMPILE_MIN_SECTION_RATIO:
+            logger.warning(
+                "compile rejected: structured item ratio %.2f (%d -> %d)",
+                structured_ratio, merged_structured, compiled_structured,
+            )
+            return False
+    merged_chars = _notes_body_chars(merged)
+    if merged_chars / len(merged.sections) >= COMPILE_SUBSTANTIVE_SECTION_CHARS:
+        compiled_chars = _notes_body_chars(compiled)
+        char_ratio = compiled_chars / merged_chars if merged_chars else 1.0
+        if char_ratio < COMPILE_MIN_CONTENT_RATIO:
+            logger.warning(
+                "compile rejected: body char ratio %.2f (%d -> %d)",
+                char_ratio, merged_chars, compiled_chars,
+            )
+            return False
     return True
 
 
@@ -1340,31 +1461,43 @@ async def _structure_piece(
     depth: int = 0,
     presentation: bool = False,
 ) -> StructuredNotes:
-    """One note request, with bounded recovery from an oversized input.
+    """One note request, with bounded recovery from an oversized or dense input.
 
-    A context overflow is the one provider error that more input can fix, so the
-    input is cut at a paragraph/sentence boundary and the halves are requested
-    instead. The depth is bounded and an input with no safe cut point is given
-    up: an unchanged oversized request is never re-sent.
+    A context overflow or output-budget truncation is the provider failure that
+    smaller input chunks can fix, so the input is cut at a slide/paragraph/
+    sentence boundary and the halves are requested instead. The depth is
+    bounded and an input with no safe cut point is given up: an unchanged
+    oversized request is never re-sent.
     """
+    prompt_prefix = PRESENTATION_PROMPT if presentation else TRANSCRIPT_PROMPT
     try:
         async with semaphore:
             payload = await complete_json(
                 session,
                 settings,
                 system=system_prompt,
-                user=TRANSCRIPT_PROMPT + document,
+                user=prompt_prefix + document,
             )
-        return _load_json_payload(payload)
-    except LLMContextOverflowError as exc:
+        return _load_json_payload(payload, mode=mode)
+    except (LLMContextOverflowError, LLMOutputBudgetError) as exc:
         if depth >= MAX_CONTEXT_SPLITS:
             raise
         splitter = split_presentation_document if presentation else split_transcript
-        pieces = splitter(document, max(1, len(document) // 2))
+        half_budget = max(1, len(document) // 2)
+        if presentation:
+            first_marker = _SLIDE_TOPIC_HEADING_RE.search(document)
+            if first_marker and first_marker.start() > 0:
+                balanced = (len(document) + first_marker.start()) // 2 + 2
+                candidate = splitter(document, balanced)
+                pieces = candidate if len(candidate) >= 2 else splitter(document, half_budget)
+            else:
+                pieces = splitter(document, half_budget)
+        else:
+            pieces = splitter(document, half_budget)
         if len(pieces) < 2:
             raise
         logger.warning(
-            "note request exceeded the model context; splitting into %d part(s) depth=%d (%s)",
+            "note request exceeded model budget; splitting into %d part(s) depth=%d (%s)",
             len(pieces), depth + 1, exc,
         )
         parts = await asyncio.gather(
@@ -1405,10 +1538,11 @@ async def structure_document(
     document = document.strip()
     if not document:
         raise StructuringError("متن ورودی خالی بود.")
+    resolved_mode = resolve_note_mode(mode)
     base_system = (
-        build_presentation_system_prompt(mode)
+        build_presentation_system_prompt(resolved_mode)
         if presentation
-        else build_system_prompt(mode)
+        else build_system_prompt(resolved_mode)
     )
     semaphore = asyncio.Semaphore(max(1, settings.note_concurrency))
     splitter = split_presentation_document if presentation else split_transcript
@@ -1419,7 +1553,7 @@ async def structure_document(
     if len(chunks) == 1:
         return await _structure_piece(
             session, settings, chunks[0],
-            system_prompt=base_system, mode=mode, semaphore=semaphore,
+            system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation,
         )
 
@@ -1434,7 +1568,7 @@ async def structure_document(
     if len(chunks) == 1:
         return await _structure_piece(
             session, settings, chunks[0],
-            system_prompt=base_system, mode=mode, semaphore=semaphore,
+            system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation,
         )
 
@@ -1443,14 +1577,14 @@ async def structure_document(
     async def map_chunk(index: int, chunk: str) -> StructuredNotes:
         block = context_block_for(context, chunks, index)
         system = (
-            build_presentation_system_prompt(mode, context_block=block)
+            build_presentation_system_prompt(resolved_mode, context_block=block)
             if presentation
-            else build_system_prompt(mode, context_block=block)
+            else build_system_prompt(resolved_mode, context_block=block)
         )
         prefixed = _chunk_prefix(index, len(chunks)) + chunk
         return await _structure_piece(
             session, settings, prefixed,
-            system_prompt=system, mode=mode, semaphore=semaphore,
+            system_prompt=system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation,
         )
 
@@ -1467,15 +1601,20 @@ async def structure_document(
     ):
         return merged
 
+    compile_system = (
+        COMPILE_SYSTEM_PROMPT
+        if resolved_mode == "full" and not presentation
+        else build_compile_system_prompt(resolved_mode, presentation=presentation)
+    )
     try:
         payload = await complete_json(
             session,
             settings,
-            system=COMPILE_SYSTEM_PROMPT,
+            system=compile_system,
             user=build_compile_document(context, merged),
         )
-        compiled = _load_json_payload(payload)
-    except LLMError as exc:
+        compiled = _load_json_payload(payload, mode=resolved_mode)
+    except (LLMError, StructuringError) as exc:
         logger.warning("compile pass failed (%s); delivering deterministic merge", exc)
         return merged
     if compile_accepts(compiled, merged):
@@ -1487,13 +1626,22 @@ _SLIDE_NUMBER_CHARS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
 _SLIDE_NUMBER_ASCII = "01234567890123456789"
 _SLIDE_NUMBER_TRANSLATION = str.maketrans(_SLIDE_NUMBER_CHARS, _SLIDE_NUMBER_ASCII)
 _SLIDE_OUTLINE_RE = re.compile(
-    r"(?m)^###\s+اسلاید\s+([0-9۰-۹٠-٩]+)(?:\s*[—–-]\s*(.*))?\s*$"
+    r"(?m)^###\s+(?:ادامهٔ\s+)?اسلاید\s+([0-9۰-۹٠-٩]+)(?:\s*[—–-]\s*(.*))?\s*$"
 )
 _SLIDE_NARRATION_RE = re.compile(
     r"(?m)^###\s+گفتار مرتبط با اسلاید\s+([0-9۰-۹٠-٩]+)\s*$"
 )
 _UNASSIGNED_NARRATION_RE = re.compile(
-    r"(?m)^###\s+گفتار بدون نگاشت مطمئن به اسلاید.*$"
+    r"(?m)^###\s+(?:ادامهٔ\s+)?گفتار بدون نگاشت مطمئن به اسلاید.*$"
+)
+_UNALIGNED_SECTION_RE = re.compile(
+    r"(?m)^##\s+متن پیاده‌سازی‌شدهٔ صدای ارائه[^\n]*$"
+)
+_PRESENTATION_BLOCK_RE = re.compile(
+    r"(?m)^(?:"
+    r"##\s+متن پیاده‌سازی‌شدهٔ صدای ارائه[^\n]*(?:\n+\s*###\s+(?:ادامهٔ\s+)?گفتار بدون نگاشت مطمئن به اسلاید)?"
+    r"|###\s+(?:(?:ادامهٔ\s+)?اسلاید\s+[0-9۰-۹٠-٩]+|(?:ادامهٔ\s+)?گفتار بدون نگاشت مطمئن به اسلاید)"
+    r")"
 )
 
 
@@ -1539,7 +1687,7 @@ def _slide_narration_blocks(text: str) -> tuple[dict[int, str], str, bool]:
         else:
             if body:
                 unassigned.append(body)
-    return assigned, "\n\n".join(unassigned), True
+    return assigned, "\n\n".join(unassigned), bool(assigned)
 
 
 def build_presentation_document(outline: str, transcript: str) -> str:
@@ -1585,6 +1733,24 @@ def build_presentation_document(outline: str, transcript: str) -> str:
     return "\n\n".join(sections)
 
 
+def _continuation_prefix_for_block(block: str, max_chars: int) -> str:
+    """Build a bounded continuation heading for an oversized presentation block."""
+    slide_match = _SLIDE_OUTLINE_RE.search(block)
+    if slide_match is not None:
+        number = to_persian_digits(_number_from_heading(slide_match.group(1)))
+        title = (slide_match.group(2) or "").strip()
+        short_prefix = f"### ادامهٔ اسلاید {number}\n\n"
+        if title:
+            with_title = f"### ادامهٔ اسلاید {number} — {title}\n\n"
+            if len(with_title) <= max_chars // 3:
+                return with_title
+        return short_prefix if len(short_prefix) <= max_chars // 2 else ""
+    if _UNASSIGNED_NARRATION_RE.search(block) or _UNALIGNED_SECTION_RE.search(block):
+        unassigned_prefix = "### ادامهٔ گفتار بدون نگاشت مطمئن به اسلاید\n\n"
+        return unassigned_prefix if len(unassigned_prefix) <= max_chars // 2 else ""
+    return ""
+
+
 def split_presentation_document(text: str, max_chars: int) -> list[str]:
     """Pack complete slide blocks into chunks, splitting only an oversized slide.
 
@@ -1597,10 +1763,7 @@ def split_presentation_document(text: str, max_chars: int) -> list[str]:
     text = text.strip()
     if not text:
         return []
-    headings = list(re.finditer(
-        r"(?m)^###\s+(?:اسلاید\s+[0-9۰-۹٠-٩]+|گفتار بدون نگاشت مطمئن به اسلاید)",
-        text,
-    ))
+    headings = list(_PRESENTATION_BLOCK_RE.finditer(text))
     if not headings:
         return split_transcript(text, max_chars)
 
@@ -1610,7 +1773,12 @@ def split_presentation_document(text: str, max_chars: int) -> list[str]:
         for index, match in enumerate(headings)
     ]
     chunks: list[str] = []
-    current = preamble
+    if preamble:
+        if blocks and len(preamble) + 2 < max_chars:
+            blocks[0] = f"{preamble}\n\n{blocks[0]}"
+        else:
+            chunks.extend(split_transcript(preamble, max_chars))
+    current = ""
 
     def flush() -> None:
         nonlocal current
@@ -1629,18 +1797,16 @@ def split_presentation_document(text: str, max_chars: int) -> list[str]:
             current = block
             continue
 
-        pieces = split_transcript(block, max_chars)
-        slide_match = _SLIDE_OUTLINE_RE.match(block)
-        slide_number = slide_match.group(1) if slide_match else ""
+        prefix = _continuation_prefix_for_block(block, max_chars)
+        piece_budget = max(1, max_chars - len(prefix))
+        pieces = split_transcript(block, piece_budget) if prefix else split_transcript(block, max_chars)
         for index, piece in enumerate(pieces):
-            if index and slide_number:
-                prefix = (
-                    f"### ادامهٔ اسلاید "
-                    f"{to_persian_digits(_number_from_heading(slide_number))}\n\n"
-                )
-                piece_budget = max(1, max_chars - len(prefix))
-                for continuation in split_transcript(piece, piece_budget):
-                    chunks.append(prefix + continuation)
+            if index and prefix:
+                if len(prefix) + len(piece) <= max_chars:
+                    chunks.append(prefix + piece)
+                else:
+                    for continuation in split_transcript(piece, piece_budget):
+                        chunks.append(prefix + continuation)
             else:
                 chunks.append(piece)
     flush()
@@ -1665,9 +1831,14 @@ async def structure_presentation(
     session: aiohttp.ClientSession,
     *,
     mode: str = "full",
+    document: str | None = None,
 ) -> StructuredNotes:
     """Slide outline + narration transcript → structured notes."""
-    document = build_presentation_document(outline, transcript)
+    resolved_document = (
+        document
+        if document is not None
+        else build_presentation_document(outline, transcript)
+    )
     return await structure_document(
-        document, settings, session, mode=mode, presentation=True
+        resolved_document, settings, session, mode=mode, presentation=True
     )
