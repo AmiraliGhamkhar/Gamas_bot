@@ -186,7 +186,16 @@ async def plan_deck(
             # A section whose every line was rejected carries no content; a
             # slide with an empty body is noise in a deck.
             continue
-        slides.append(OfficeSlide(title=title or "بخش", bullets=tuple(kept)))
+        slides.append(
+            OfficeSlide(
+                title=title or "بخش",
+                bullets=tuple(kept),
+                # The slide planner only returns the on-slide outline. Mirror
+                # those validated source lines into speaker notes so choosing
+                # the model path does not leave the notes pane empty.
+                notes="\n".join(kept),
+            )
+        )
     if not slides:
         return None
     if proposed and len(slides) and (proposed - sum(len(s.bullets) for s in slides)) / proposed > MAX_DROPPED_LINE_RATIO:

@@ -15,6 +15,7 @@ from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database
 from gamas_bot.jobs import Job
 from gamas_bot.media import MediaInfo, MediaToolError
+from gamas_bot.presentations import PresentationContent, SlideText
 from gamas_bot.progress import JobProgress
 from gamas_bot.stt import STTError
 from gamas_bot.telegram_text import TELEGRAM_TEXT_LIMIT
@@ -520,6 +521,53 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
             (USER_ID,),
         )
         self.assertEqual((int(rows[0][0]), int(rows[0][1])), (100, 1))
+
+
+class PresentationNotesDeliveryTests(BotPipelineTestCase):
+    async def test_slide_only_deck_keeps_source_in_plain_booklet_without_provider(self):
+        source = Path(self._tmp.name) / "slides.pptx"
+        source.write_bytes(b"test deck")
+        event = self.wire(FakeJobEvent(source=source))
+        submission = await self.db.create_submission(USER_ID, "presentation", source.name)
+        progress = await JobProgress.create(event, submission_id=submission)
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="presentation",
+            filename=source.name,
+            message=event.message,
+            is_admin=False,
+            meta={"presentation_kind": "native", "progress": progress},
+        )
+        content = PresentationContent(
+            slides=(
+                SlideText(
+                    number=1,
+                    title="موضوع ارائه",
+                    body=("نکتهٔ روی اسلاید",),
+                    notes="توضیح تکمیلی گوینده",
+                ),
+            ),
+            clips=(),
+            total_slides=1,
+        )
+
+        async def load_slides(_path, _media_dir, _settings):
+            return content
+
+        with mock.patch("gamas_bot.bot.load_presentation", new=load_slides):
+            await self.bot._run_job(job)
+
+        raw_text = event.file_bytes(".txt").decode("utf-8")
+        booklet_text = docx_text(event.file_bytes(".docx"))
+        self.assertIn("موضوع ارائه", raw_text)
+        self.assertIn("توضیح تکمیلی گوینده", raw_text)
+        self.assertIn("موضوع ارائه", booklet_text)
+        self.assertIn("نکتهٔ روی اسلاید", booklet_text)
+        self.assertIn("توضیح تکمیلی گوینده", booklet_text)
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "done")
 
 
 class ReserveEstimateTests(unittest.TestCase):

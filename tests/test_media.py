@@ -31,7 +31,7 @@ from gamas_bot.media import (
     probe_media,
     probe_media_many,
 )
-from gamas_bot.presentations import prepare_audio, read_presentation
+from gamas_bot.presentations import prepare_audio, read_presentation, slides_outline
 from tests.support import (
     AUDIO_REL,
     FIXTURES_DIR,
@@ -257,6 +257,21 @@ class PresentationTests(MediaTempCase):
         self.assertEqual(content.clips, ())
         self.assertTrue(content.slides)
         self.assertIsNone(await prepare_audio(content, self.tmp / "work", self.settings))
+
+    def test_outline_contains_slide_text_and_speaker_notes(self):
+        deck = build_deck(
+            self.tmp / "notes.pptx",
+            slides=[{
+                "title": "موضوع ارائه",
+                "bullets": ["نکتهٔ روی اسلاید"],
+                "notes": "توضیح تکمیلی گوینده",
+            }],
+        )
+        content = read_presentation(deck, self.tmp / "media", self.settings)
+        outline = slides_outline(content.slides)
+        self.assertIn("موضوع ارائه", outline)
+        self.assertIn("نکتهٔ روی اسلاید", outline)
+        self.assertIn("یادداشت گوینده: توضیح تکمیلی گوینده", outline)
 
 
 class LegacyConversionTests(MediaTempCase):

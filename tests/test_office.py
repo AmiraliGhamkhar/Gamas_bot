@@ -329,7 +329,7 @@ class PowerPointDocumentTests(unittest.TestCase):
         self.assertIn("این متن عیناً در سند می‌آید.", joined)
         self.assertIn("گزارش عملکرد", joined)
 
-    def test_the_section_text_is_kept_in_the_notes(self):
+    def test_the_section_text_and_table_rows_are_kept_in_the_notes(self):
         document = build_office_document(SAMPLE)
         slides = fallback_slides(document)
         payload = build_office_pptx(document, slides)
@@ -340,6 +340,8 @@ class PowerPointDocumentTests(unittest.TestCase):
             if slide.has_notes_slide
         ]
         self.assertTrue(any("این متن عیناً در سند می‌آید." in note for note in notes))
+        self.assertTrue(any("نام | سن | شهر" in note for note in notes))
+        self.assertTrue(any("علی | ۲۰ | تهران" in note for note in notes))
 
 
 # ---------------------------------------------------------------------------
@@ -403,6 +405,16 @@ class ModelValidationTests(unittest.IsolatedAsyncioTestCase):
         assert slides is not None
         self.assertEqual(slides[0].title, "بخش اول")
         self.assertEqual(slides[0].bullets, ("این متن عیناً در سند می‌آید.",))
+        self.assertEqual(slides[0].notes, "این متن عیناً در سند می‌آید.")
+
+        document = build_office_document(SAMPLE)
+        presentation = Presentation(
+            io.BytesIO(build_office_pptx(document, slides))
+        )
+        self.assertIn(
+            "این متن عیناً در سند می‌آید.",
+            presentation.slides[2].notes_slide.notes_text_frame.text,
+        )
 
     async def test_a_line_that_is_not_in_the_source_is_dropped(self):
         session = _FakeLLMSession(
