@@ -241,9 +241,9 @@ async def _generate(route, settings, text: str) -> bool:
     )
 
     system = build_system_prompt(settings.note_mode)
-    excerpt = text[: effective_chunk_chars(settings, system_prompt=system)]
     started = time.monotonic()
     try:
+        excerpt = text[: effective_chunk_chars(settings, system_prompt=system)]
         async with aiohttp.ClientSession() as session:
             raw = await _complete_on_route(
                 route, session, settings, system=system, user=TRANSCRIPT_PROMPT + excerpt

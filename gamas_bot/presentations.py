@@ -188,10 +188,10 @@ class PresentationNarration:
 
     def as_text(self) -> str:
         if not self.aligned:
-            return (
-                "### گفتار بدون نگاشت مطمئن به اسلاید\n\n"
-                + self.unassigned_text.strip()
-            ).strip()
+            text = self.unassigned_text.strip()
+            if not text:
+                return ""
+            return "### گفتار بدون نگاشت مطمئن به اسلاید\n\n" + text
         blocks = [
             f"### گفتار مرتبط با اسلاید {number}\n\n{text}"
             for number, text in self.slide_text

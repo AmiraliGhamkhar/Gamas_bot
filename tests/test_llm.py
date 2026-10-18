@@ -54,6 +54,13 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertNotIn("response_format", payload)  # opt-in only
         self.assertNotIn("reasoning_effort", payload)  # provider default unless set
 
+    def test_openai_compatible_uses_the_configured_output_budget(self):
+        settings = make_settings(note_max_output_tokens=2048)
+        _url, _headers, payload = _build_request(settings, "SYS", "USER")
+        self.assertEqual(payload["max_tokens"], 2048)
+        self.assertEqual(payload["temperature"], llm.NOTE_TEMPERATURE)
+        self.assertNotIn("max_completion_tokens", payload)
+
     def test_reasoning_effort_sent_on_verified_gateways(self):
         settings = routed_settings(note_reasoning_effort="low")
         nara, openrouter = note_routes(settings)
@@ -90,6 +97,12 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertIn("models/test-model", url)
         self.assertEqual(headers["x-goog-api-key"], "g-key")
         self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
+        self.assertEqual(
+            payload["generationConfig"]["maxOutputTokens"], settings.note_max_output_tokens
+        )
+        self.assertEqual(
+            payload["generationConfig"]["temperature"], llm.NOTE_TEMPERATURE
+        )
         self.assertEqual(payload["systemInstruction"]["parts"][0]["text"], "SYS")
 
     def test_gemini_models_prefix_not_doubled(self):
@@ -107,6 +120,8 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertEqual(headers["x-api-key"], "a-key")
         self.assertEqual(headers["anthropic-version"], "2023-06-01")
         self.assertEqual(payload["system"], "SYS")
+        self.assertEqual(payload["max_tokens"], settings.note_max_output_tokens)
+        self.assertEqual(payload["temperature"], llm.NOTE_TEMPERATURE)
 
     def test_missing_key_is_auth_error(self):
         settings = make_settings(note_provider="gemini", note_api_key="")
@@ -342,6 +357,61 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "recovered")
         self.assertEqual(len(session.calls), 2)
+
+    async def test_renames_rejected_max_tokens_to_max_completion_tokens(self):
+        rejected = FakeResponse(400, {"error": {
+            "message": "Unsupported parameter: 'max_tokens'. Use 'max_completion_tokens' instead."
+        }})
+        session = FakeSession([rejected, chat_answer("recovered")])
+        with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
+            result = await complete(session, make_settings(), system="S", user="U")
+        self.assertEqual(result, "recovered")
+        self.assertEqual(len(session.calls), 2)
+        request_logs = [line for line in logs.output if "LLM request sending" in line]
+        self.assertIn("attempt=1", request_logs[0])
+        self.assertIn("attempt=2", request_logs[1])
+        retried_payload = session.calls[-1]["json"]
+        self.assertEqual(retried_payload["max_completion_tokens"], 4096)
+        self.assertNotIn("max_tokens", retried_payload)
+
+    async def test_drops_temperature_when_model_explicitly_rejects_it(self):
+        rejected = FakeResponse(400, {"error": {
+            "message": "Unsupported parameter: 'temperature' is not supported with this model."
+        }})
+        session = FakeSession([rejected, chat_answer("recovered")])
+        result = await complete(session, make_settings(), system="S", user="U")
+        self.assertEqual(result, "recovered")
+        self.assertEqual(len(session.calls), 2)
+        retried_payload = session.calls[-1]["json"]
+        self.assertNotIn("temperature", retried_payload)
+        self.assertEqual(retried_payload["max_tokens"], 4096)
+
+    async def test_gemini_rejected_generation_options_are_removed_in_sequence(self):
+        settings = make_settings(
+            note_providers=("gemini",),
+            note_provider="gemini",
+            note_api_key="",
+            note_api_base_url="",
+            gemini_api_key="gemini-key",
+        )
+        session = FakeSession([
+            FakeResponse(400, {"error": {
+                "message": "temperature is not supported for this model"
+            }}),
+            FakeResponse(400, {"error": {
+                "message": "response_mime_type application/json is not supported"
+            }}),
+            FakeResponse(200, {"candidates": [{
+                "content": {"parts": [{"text": '{"ok": true}'}]}
+            }]}),
+        ])
+        result = await complete_json(session, settings, system="S", user="U")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(session.calls), 3)
+        generation_config = session.calls[-1]["json"]["generationConfig"]
+        self.assertNotIn("temperature", generation_config)
+        self.assertNotIn("responseMimeType", generation_config)
+        self.assertEqual(generation_config["maxOutputTokens"], 4096)
 
     async def test_bad_success_body_is_response_error(self):
         session = FakeSession([InvalidJsonResponse(200)])
@@ -1037,6 +1107,13 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
             }),
         ):
             self.assertTrue(probe._check_gemini(gemini))
+
+    async def test_probe_reports_an_unusable_context_budget_as_a_failure(self):
+        from scripts import probe_note_providers as probe
+
+        settings = make_settings(note_context_tokens=8192, note_max_output_tokens=8192)
+        route = note_routes(make_settings())[0]
+        self.assertFalse(await probe._generate(route, settings, "متن آزمایشی"))
 
     async def test_null_error_envelope_on_200_does_not_trigger_false_positive(self):
         session = FakeSession([

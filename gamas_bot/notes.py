@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, replace
 
@@ -52,8 +53,8 @@ COMPILE_MIN_NOTES_CHARS = 400
 #: window is: a larger merged booklet is delivered as the deterministic merge
 #: rather than re-sent as one enormous request. The operative budget below
 #: that ceiling is derived from the context window per request (see
-#: :func:`effective_compile_max_chars`); ``NOTE_COMPILE_MAX_CHARS`` overrides
-#: the derivation when an operator sets it explicitly.
+#: :func:`effective_compile_max_chars`); ``NOTE_COMPILE_MAX_CHARS`` can further
+#: lower that budget when an operator sets it explicitly.
 COMPILE_HARD_MAX_CHARS = 160000
 #: The compile result must keep at least this share of the merged sections.
 COMPILE_MIN_SECTION_RATIO = 0.5
@@ -78,10 +79,6 @@ CHARS_PER_TOKEN = 2.0
 #: Prompt scaffolding that is neither the system prompt nor the transcript
 #: (position markers, the JSON envelope, provider boilerplate).
 PROMPT_RESERVE_TOKENS = 512
-#: The smallest request still worth sending, matching the ``NOTE_CHUNK_CHARS``
-#: lower bound in the configuration.
-MIN_REQUEST_CHARS = 2000
-MIN_REQUEST_TOKENS = 1000
 #: How many times one oversized request may be halved before the step gives up
 #: (1 → 2 → 4 requests, each cut at a paragraph/sentence boundary).
 MAX_CONTEXT_SPLITS = 2
@@ -745,6 +742,16 @@ _CHUNKED_CONTENT_RULES = (
     "- اصطلاح‌های تخصصی و نام‌های انگلیسی را عیناً مثل بقیهٔ بخش‌ها بنویسید.\n"
 )
 
+#: Maximum prompt material added when chunk context is enabled: the bounded
+#: topic digest, the current topic, both neighbour windows, labels and rules.
+CHUNK_CONTEXT_RESERVE_CHARS = (
+    CONTEXT_DIGEST_MAX_CHARS
+    + PRESENTATION_CHUNK_TOPIC_MAX_CHARS
+    + (2 * NEIGHBOUR_CONTEXT_CHARS)
+    + len(_CHUNKED_CONTENT_RULES)
+    + 512
+)
+
 _PRESENTATION_CONTENT_RULES = (
     "\nقواعد ویژهٔ ارائه:\n"
     "- ورودی شامل متن اسلایدها (با شمارهٔ اسلاید و یادداشت گوینده) و متن پیاده‌سازی‌شدهٔ صدای ارائه است.\n"
@@ -1175,15 +1182,19 @@ def build_context(chunks: list[str]) -> LectureContext:
     deterministic, free and instant.
     """
     topics: list[str] = []
-    budget = CONTEXT_DIGEST_MAX_CHARS
+    used_chars = 0
     for chunk in chunks:
         topic = _chunk_topic_summary(chunk)
         if not topic:
             continue
-        if len(topic) > budget:
+        position = to_persian_digits(len(topics) + 1)
+        rendered_topic = f"({position}) {topic}"
+        separator_chars = 2 if topics else 0  # the Persian comma and following space
+        addition_chars = separator_chars + len(rendered_topic)
+        if used_chars + addition_chars > CONTEXT_DIGEST_MAX_CHARS:
             break
         topics.append(topic)
-        budget -= len(topic) + 2
+        used_chars += addition_chars
     return LectureContext(title="", topics=tuple(topics))
 
 
@@ -1405,20 +1416,27 @@ def effective_chunk_chars(
     left with a deliberately conservative ratio, so a model with a smaller window
     receives smaller chunks instead of a request the provider rejects.
     ``NOTE_CHUNK_CHARS`` remains an upper bound — a smaller configured chunk is
-    never grown.
+    never grown. The budget is never floored to a minimum that would exceed the
+    model's configured window.
     """
     reserve_characters = len(system_prompt) + max(0, extra_reserve_chars)
-    reserve_tokens = int(reserve_characters / CHARS_PER_TOKEN) + PROMPT_RESERVE_TOKENS
-    available_tokens = max(
-        MIN_REQUEST_TOKENS,
-        settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens,
+    reserve_tokens = math.ceil(reserve_characters / CHARS_PER_TOKEN) + PROMPT_RESERVE_TOKENS
+    available_tokens = (
+        settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens
     )
-    context_budget = max(MIN_REQUEST_CHARS, int(available_tokens * CHARS_PER_TOKEN))
+    if available_tokens <= 0:
+        raise StructuringError(
+            "پنجرهٔ زمینهٔ مدل پس از کسر دستور جزوه و سقف پاسخ، فضایی برای متن ورودی ندارد؛ "
+            "NOTE_MAX_OUTPUT_TOKENS را کم کنید یا NOTE_CONTEXT_TOKENS را افزایش دهید."
+        )
+    context_budget = max(1, int(available_tokens * CHARS_PER_TOKEN))
     # ``NOTE_CHUNK_CHARS`` may be smaller than the window allows; it is never grown.
     return max(1, min(settings.note_chunk_chars, context_budget))
 
 
-def effective_compile_max_chars(settings: Settings) -> int:
+def effective_compile_max_chars(
+    settings: Settings, *, mode: str = "full", presentation: bool = False
+) -> int:
     """The character budget of the merged notes in one compile request.
 
     The compile (reduce) request lives in the same window as every other note
@@ -1430,24 +1448,30 @@ def effective_compile_max_chars(settings: Settings) -> int:
     character bound, which silently disabled the editorial pass for every
     booklet above it however large the model's window was.
 
-    ``NOTE_COMPILE_MAX_CHARS`` (> 0) is an explicit operator cap and wins
-    as-is; the derived budget is additionally bounded by
-    ``COMPILE_HARD_MAX_CHARS``, so a very large configured window cannot turn
-    the reduce step into one unbounded request — the deterministic merge is
-    delivered instead, exactly as before.
+    ``NOTE_COMPILE_MAX_CHARS`` (> 0) is an additional operator cap; it cannot
+    enlarge the request beyond the context-derived budget. The correct system
+    prompt for the mode and source type is reserved, as is the bounded topic
+    digest. The derived budget is also bounded by ``COMPILE_HARD_MAX_CHARS``, so
+    a very large configured window cannot turn the reduce step into one
+    unbounded request — the deterministic merge is delivered instead, exactly
+    as before.
     """
+    compile_system = (
+        COMPILE_SYSTEM_PROMPT
+        if mode == "full" and not presentation
+        else build_compile_system_prompt(mode, presentation=presentation)
+    )
+    reserve_characters = len(compile_system) + CONTEXT_DIGEST_MAX_CHARS
+    reserve_tokens = math.ceil(reserve_characters / CHARS_PER_TOKEN) + PROMPT_RESERVE_TOKENS
+    available_tokens = (
+        settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens
+    )
+    if available_tokens <= 0:
+        return 0
+    derived = min(int(available_tokens * CHARS_PER_TOKEN), COMPILE_HARD_MAX_CHARS)
     if settings.note_compile_max_chars > 0:
-        return settings.note_compile_max_chars
-    reserve_tokens = (
-        int((len(COMPILE_SYSTEM_PROMPT) + CONTEXT_DIGEST_MAX_CHARS) / CHARS_PER_TOKEN)
-        + PROMPT_RESERVE_TOKENS
-    )
-    available_tokens = max(
-        MIN_REQUEST_TOKENS,
-        settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens,
-    )
-    derived = max(MIN_REQUEST_CHARS, int(available_tokens * CHARS_PER_TOKEN))
-    return min(derived, COMPILE_HARD_MAX_CHARS)
+        return min(settings.note_compile_max_chars, derived)
+    return derived
 
 
 async def _structure_piece(
@@ -1546,36 +1570,61 @@ async def structure_document(
     )
     semaphore = asyncio.Semaphore(max(1, settings.note_concurrency))
     splitter = split_presentation_document if presentation else split_transcript
-    chunks = splitter(document, effective_chunk_chars(settings, system_prompt=base_system))
+    chunk_chars = effective_chunk_chars(settings, system_prompt=base_system)
+    chunks = splitter(document, chunk_chars)
     if not chunks:
         raise StructuringError("متن ورودی خالی بود.")
 
     if len(chunks) == 1:
+        logger.info(
+            "note document sizing kind=%s chars=%d chunk_chars=%d chunks=1 context_digest=false",
+            "presentation" if presentation else "transcript",
+            len(document),
+            chunk_chars,
+        )
         return await _structure_piece(
             session, settings, chunks[0],
             system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation,
         )
 
-    # A chunked request also carries the topic digest and the neighbour windows,
-    # so the document is re-cut with that material reserved for the prompt.
-    chunks = splitter(
-        document,
-        effective_chunk_chars(
-            settings, system_prompt=base_system, extra_reserve_chars=CONTEXT_DIGEST_MAX_CHARS
-        ),
-    )
+    # A chunked request also carries the topic digest and the neighbour windows.
+    # Reserve their worst-case size when it fits; for a narrow model window,
+    # drop this optional orientation rather than exceed the configured context.
+    include_context = True
+    try:
+        contextual_chunk_chars = effective_chunk_chars(
+            settings, system_prompt=base_system, extra_reserve_chars=CHUNK_CONTEXT_RESERVE_CHARS
+        )
+    except StructuringError:
+        include_context = False
+        contextual_chunk_chars = chunk_chars
+    chunks = splitter(document, contextual_chunk_chars)
     if len(chunks) == 1:
+        logger.info(
+            "note document sizing kind=%s chars=%d chunk_chars=%d chunks=1 context_digest=false",
+            "presentation" if presentation else "transcript",
+            len(document),
+            contextual_chunk_chars,
+        )
         return await _structure_piece(
             session, settings, chunks[0],
             system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation,
         )
 
-    context = build_context(chunks)
+    context = build_context(chunks) if include_context else LectureContext()
+    logger.info(
+        "note document sizing kind=%s chars=%d chunk_chars=%d chunks=%d context_digest=%s",
+        "presentation" if presentation else "transcript",
+        len(document),
+        contextual_chunk_chars,
+        len(chunks),
+        include_context,
+    )
 
     async def map_chunk(index: int, chunk: str) -> StructuredNotes:
-        block = context_block_for(context, chunks, index)
+        block = context_block_for(context, chunks, index) if include_context else ""
         system = (
             build_presentation_system_prompt(resolved_mode, context_block=block)
             if presentation
@@ -1597,7 +1646,9 @@ async def structure_document(
     if (
         not settings.note_compile
         or merged_chars < COMPILE_MIN_NOTES_CHARS
-        or merged_chars > effective_compile_max_chars(settings)
+        or merged_chars > effective_compile_max_chars(
+            settings, mode=resolved_mode, presentation=presentation
+        )
     ):
         return merged
 

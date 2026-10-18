@@ -102,8 +102,9 @@ data re-verified 2026-10-16; see `docs/PROVIDERS.md`).
   `NOTE_MAX_OUTPUT_TOKENS` stays 16384, within both models' completion caps.
 * **The compile pass budget is token-derived.** The fixed 48,000-character
   bound that silently skipped the editorial compile for larger booklets is
-  replaced by a budget derived from the context window (with an absolute
-  ceiling); `NOTE_COMPILE_MAX_CHARS` overrides it, `0` means automatic.
+  replaced by a budget derived from the context window and the actual compile
+  prompt (with an absolute ceiling); a positive `NOTE_COMPILE_MAX_CHARS` can
+  further lower that budget, while `0` means automatic.
 
 ### Added
 

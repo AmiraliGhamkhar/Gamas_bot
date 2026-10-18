@@ -103,7 +103,7 @@ the map of what exists.
 * note generation not configured ("raw transcripts only");
 * a Persian deployment whose `DEEPGRAM_MODEL` cannot transcribe `fa`;
 * a `NOTE_CONTEXT_TOKENS` / `NOTE_MAX_OUTPUT_TOKENS` pair that leaves no room for
-  the transcript in one request.
+  the transcript and note system prompt in one request.
 
 Advisory problems are printed by `--check` and written to the log at startup, and
 never prevent a job from running.
