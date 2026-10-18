@@ -42,6 +42,15 @@ credit purchases). Free rosters rotate; a model that leaves the free tier
 fails as a provider error and the chain falls back, but the sizing assumption
 must be revisited at the same time.
 
+The **request deadline** is the other half of the sizing: the context window
+decides whether a request *fits*, the deadline decides whether it *finishes*.
+`NOTE_REQUEST_TIMEOUT_SECONDS=900` (15 minutes) is the shipped default, because
+the output budget — not the input — is what fills the deadline: 16,384 output
+tokens need several minutes on a free or shared-pool gateway, and a reasoning
+model spends part of that same budget thinking. A request that misses the
+deadline is not rejected and not retried unchanged: the provider is left behind
+and the next provider in the chain is tried at once.
+
 ## Failover
 
 * **`NOTE_PROVIDERS` is the policy** (default `nara,openrouter`). Providers are

@@ -4,6 +4,32 @@ Entries describe user- and operator-visible change. For anything older than
 v3.0.0, read the git history — the v2 provider platform those entries describe
 no longer exists in the code.
 
+## Unreleased — 2026-10-18 — note generation: the deadline, not the context
+
+A note request that stalls used to fail in the worst possible way: the provider
+was asked the *same* expensive question three times, each time until the
+hard-wired 300-second deadline, and only then did the chain move to the next
+provider. On a free or shared-pool gateway that is 15 minutes of waiting for
+one chunk, and when the fallback was a free OpenRouter model in a rate-limited
+shared pool (HTTP 429 `UPSTREAM_PROVIDER_SHARED_POOL`) the job produced no
+notes at all.
+
+* **The request deadline is configurable** (`NOTE_REQUEST_TIMEOUT_SECONDS`,
+  default 900 s) and paired with the default output budget, so the shipped
+  configuration is coherent. A note request is not rejected for being large
+  here — it is not finished in time.
+* **A timeout no longer repeats the same request.** A provider that missed the
+  deadline is left behind and the next provider in the chain is tried at once;
+  only the last provider in the chain still retries within its bounded budget,
+  so a single-provider deployment keeps its resilience.
+* **The failure says what happened.** The operator-facing message names the
+  deadline and the two knobs that change it (`NOTE_REQUEST_TIMEOUT_SECONDS`,
+  `NOTE_MAX_OUTPUT_TOKENS`) instead of a generic "the service was unavailable".
+* **The startup self-check warns** when the configured output budget cannot
+  plausibly be produced inside the configured deadline (advisory: the bot still
+  runs). A reasoning model spends its thinking tokens out of the same output
+  budget, so `NOTE_REASONING_EFFORT` is a third lever.
+
 ## Unreleased — 2026-10-18 — audit fixes: money path, recovery, fidelity
 
 Fixes for the 2026-10-18 audit of `edc5b2c` (`AUDIT_2026-10-18_edc5b2c.md`).

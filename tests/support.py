@@ -418,6 +418,7 @@ def make_settings(**overrides) -> Settings:
         note_context_tokens=131072,
         note_mode="full",
         note_max_output_tokens=4096,
+        note_request_timeout=300.0,
         note_json_mode=False,
         note_chunk_chars=64000,
         note_concurrency=2,

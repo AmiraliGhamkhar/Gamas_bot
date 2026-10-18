@@ -40,7 +40,11 @@ logger = logging.getLogger(__name__)
 #: extraction and organisation, not creative writing.
 NOTE_TEMPERATURE = 0.2
 
-#: A hung note-provider request must not inherit the STT job's multi-hour read timeout.
+#: A hung note-provider request must not inherit the STT job's multi-hour read
+#: timeout. This is the hard fallback for a request whose settings carry no
+#: deadline; the operator's ``NOTE_REQUEST_TIMEOUT_SECONDS`` is the one in use
+#: (``Settings.note_request_timeout``), because the right deadline depends on
+#: how long the configured output budget takes to produce on the gateway.
 LLM_REQUEST_TIMEOUT_SECONDS = 300.0
 
 #: Bounded retries for transient LLM failures (5xx, 429, network).
@@ -1110,9 +1114,22 @@ async def _complete_on_route(
     *,
     system: str,
     user: str,
+    retry_on_timeout: bool = True,
 ) -> str:
-    """One completion from one provider, with its own bounded retry budget."""
+    """One completion from one provider, with its own bounded retry budget.
+
+    ``retry_on_timeout`` decides what a deadline miss means for the *same*
+    provider: with it (the default) the request is re-sent within the bounded
+    budget, without it the provider is left behind immediately. The chain uses
+    the second form for every provider that still has a successor, because a
+    provider that needed the whole deadline once will need it again — the
+    identical request is simply re-waiting — while the next provider may
+    answer in seconds.
+    """
     url, headers, payload = _build_request_for(route, settings, system, user)
+    timeout_seconds = float(settings.note_request_timeout or 0) or (
+        LLM_REQUEST_TIMEOUT_SECONDS
+    )
     attempt = 0
     request_number = 0
     while True:
@@ -1134,7 +1151,7 @@ async def _complete_on_route(
                 url,
                 headers=headers,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=LLM_REQUEST_TIMEOUT_SECONDS),
+                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
             ) as response:
                 if response.status != 200:
                     raise await _error_from_response(
@@ -1170,9 +1187,30 @@ async def _complete_on_route(
                     continue
             raise
         except (LLMTransientError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            timed_out = isinstance(exc, asyncio.TimeoutError)
+            if timed_out and not retry_on_timeout:
+                # The provider did not answer inside the deadline. Asking the
+                # same (expensive) request again only repeats the wait, so the
+                # provider is left behind and the chain moves on.
+                logger.warning(
+                    "LLM request timed out provider=%s; trying the next provider "
+                    "instead of repeating the request (timeout_seconds=%.0f)",
+                    route.slug, timeout_seconds,
+                )
+                raise LLMTransientError(
+                    f"سرویس تولید جزوه در مهلت {timeout_seconds:.0f} ثانیه‌ای پاسخ نداد "
+                    "(NOTE_REQUEST_TIMEOUT_SECONDS را افزایش دهید یا "
+                    "NOTE_MAX_OUTPUT_TOKENS را کم کنید)."
+                ) from exc
             if attempt >= MAX_TRANSIENT_RETRIES:
                 if isinstance(exc, LLMTransientError):
                     raise
+                if timed_out:
+                    raise LLMTransientError(
+                        f"سرویس تولید جزوه در مهلت {timeout_seconds:.0f} ثانیه‌ای پاسخ نداد "
+                        "(NOTE_REQUEST_TIMEOUT_SECONDS را افزایش دهید یا "
+                        "NOTE_MAX_OUTPUT_TOKENS را کم کنید)."
+                    ) from exc
                 raise LLMTransientError(
                     "سرویس تولید جزوه پس از چند تلاش در دسترس نبود."
                 ) from exc
@@ -1271,10 +1309,14 @@ async def complete(
         )
     failures: list[LLMError] = []
     descriptions: list[str] = []
-    for route in routes:
+    for index, route in enumerate(routes):
         try:
             text = await _complete_on_route(
-                route, session, settings, system=system, user=user
+                route, session, settings, system=system, user=user,
+                # A provider that ran out of time is left behind when a
+                # successor is still available: re-sending the same request
+                # would only wait for the same deadline again.
+                retry_on_timeout=index == len(routes) - 1,
             )
         except LLMError as exc:
             failures.append(exc)
@@ -1384,11 +1426,12 @@ async def complete_json(
         )
     failures: list[LLMError] = []
     descriptions: list[str] = []
-    for route in routes:
+    for index, route in enumerate(routes):
         for attempt, prompt in enumerate((user, JSON_ONLY_REMINDER + user)):
             try:
                 raw = await _complete_on_route(
-                    route, session, settings, system=system, user=prompt
+                    route, session, settings, system=system, user=prompt,
+                    retry_on_timeout=index == len(routes) - 1,
                 )
                 return _parse_json_object(raw)
             except LLMRequestError as exc:
