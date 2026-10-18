@@ -17,13 +17,14 @@ metadata are never interpolated into a command line.
 **Private storage.** `RECEIPT_DIR` must be outside the web document root, is
 created `0700` and verified at startup. SQLite and its `-wal`/`-shm` sidecars are
 `0600`. Receipt files are `0600` and only ever re-sent to admins; the path is
-checked against the private root before any read or delete, and cleanup never
-deletes outside it.
+resolved and checked to be strictly inside the private root before any read or
+delete (symlink-aware), and cleanup never deletes outside it.
 
 **Upload validation.** Receipts must be JPEG/PNG/WebP **by content signature**
-after download, not only by declared MIME type, and are bounded by
-`MAX_PAYMENT_RECEIPT_BYTES`. Media and decks are bounded by `MAX_FILE_SIZE`
-before and after download.
+after download (magic-byte check for `FF D8 FF`/PNG/WebP), not only by
+declared MIME type, and are bounded by `MAX_PAYMENT_RECEIPT_BYTES` (pre- and
+post-download). Media and decks are bounded by `MAX_FILE_SIZE` before and
+after download, with symlink entries in ZIPs rejected.
 
 **Office packages.** Decks are validated before parsing: entry count, total
 unpacked size (`PRESENTATION_MAX_UNPACKED_BYTES`), and a path check that rejects

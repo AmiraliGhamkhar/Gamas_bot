@@ -26,6 +26,9 @@ has drifted.
 
 ## Coverage
 
+The suite contains 13 test modules plus `tests/support.py` (514 tests at
+`0753372`).
+
 | Area | Module |
 | --- | --- |
 | Bot intake, raw-first delivery, billing settlement | `tests/test_bot.py` |

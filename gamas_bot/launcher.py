@@ -54,7 +54,26 @@ def ensure_running(*, min_interval: float = MIN_SPAWN_INTERVAL_SECONDS) -> str:
             return THROTTLED
     except FileNotFoundError:
         pass
-    stamp.touch()
+    # TOCTOU fix (audit F-H03): re-check the instance lock after the throttle
+    # gate, immediately before spawning. Two concurrent watchdogs that both
+    # passed the stale stamp window will now serialize on the same lock check.
+    if is_locked(settings.session_path.with_suffix(".lock")):
+        return RUNNING
+    try:
+        # Atomic stamp update: use write-then-rename to avoid torn reads, and
+        # set the mtime explicitly so throttling is accurate even under races.
+        tmp_stamp = data_dir / f".launcher.stamp.{os.getpid()}.tmp"
+        tmp_stamp.write_text(str(time.time()), encoding="utf-8")
+        tmp_stamp.rename(stamp)
+    except OSError:
+        try:
+            stamp.touch()
+        except OSError:
+            pass
+    # Final lock check after updating stamp: if another launcher won the race
+    # and started between our throttle check and now, don't spawn a second.
+    if is_locked(settings.session_path.with_suffix(".lock")):
+        return RUNNING
 
     env = os.environ.copy()
     if settings.log_file is None:
