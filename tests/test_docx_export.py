@@ -33,6 +33,7 @@ from gamas_bot.docx_export import (
     raw_text_filename,
     resolve_design,
     sanitize_filename_part,
+    xml_safe,
 )
 from gamas_bot.notes import StructuredNotes
 from tests.support import docx_text, sample_notes_json
@@ -91,6 +92,10 @@ class JalaliDateTests(unittest.TestCase):
 
 
 class FilenameTests(unittest.TestCase):
+    def test_xml_safe_preserves_nbsp_and_private_use_characters(self):
+        self.assertEqual(xml_safe("500\u00a0mg"), "500\u00a0mg")
+        self.assertEqual(xml_safe("\ue000\u00a0X"), "\ue000\u00a0X")
+
     def test_filenames_are_safe_and_reference_tagged(self):
         notes = full_notes()
         self.assertEqual(
@@ -119,7 +124,7 @@ class NotesDocxTests(unittest.TestCase):
         self.assertIn("یادآوری: پایش HbA1c هر سه ماه", text)
         self.assertIn("HbA1c | هموگلوبین گلیکوزیله", text)  # glossary is a table
         self.assertIn("دارو | دوز روزانه", text)
-        self.assertIn("Metformin | 500-2000 mg", text)
+        self.assertIn("Metformin | 500-2000\u00a0mg", text)
         # Internal backend metadata MUST NOT appear in the student document
         self.assertNotIn("موتور تبدیل گفتار", text)
         self.assertNotIn("speechmatics", text)
@@ -143,7 +148,7 @@ class NotesDocxTests(unittest.TestCase):
         self.assertIn('<w:bidi w:val="1"/>', body)   # RTL paragraphs
         self.assertIn("w:rtl", body)                 # RTL runs
         self.assertIn("<w:bidiVisual/>", body)       # RTL table column order
-        self.assertIn('w:cs="Tahoma"', body)         # complex-script font honoured
+        self.assertIn('w:cs="Vazirmatn"', body)      # complex-script font honoured
         self.assertIn("w:shd", body)                 # shaded summary/callout boxes
         self.assertIn("w:szCs", body)                # complex-script font size honoured
         self.assertIn("PAGE", footer)                # page-number field code
@@ -166,6 +171,26 @@ class NotesDocxTests(unittest.TestCase):
             self.assertIn(True, directions)
             self.assertIn(False, directions)
 
+    def test_mixed_script_heading_keeps_logical_order_and_parentheses(self):
+        from gamas_bot.docx_export import build_plain_docx
+
+        data = build_plain_docx(
+            "جزوهٔ ترکیبی",
+            "# شبکهٔ عصبی (Artificial Neural Network) در تشخیص تصویر",
+            meta=META,
+            heading_offset=0,
+        )
+        import docx as docx_library
+
+        document = docx_library.Document(io.BytesIO(data))
+        heading = next(p for p in document.paragraphs if "Artificial Neural Network" in p.text)
+        self.assertEqual(
+            heading.text,
+            "شبکهٔ عصبی (Artificial Neural Network) در تشخیص تصویر",
+        )
+        self.assertTrue(any(run.font.rtl is True for run in heading.runs))
+        self.assertTrue(any(run.font.rtl is False for run in heading.runs))
+
     def test_table_is_right_to_left(self):
         data = build_notes_docx(full_notes(), meta=META)
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
@@ -179,6 +204,25 @@ class NotesDocxTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(data)) as archive:
             body = archive.read("word/document.xml").decode("utf-8")
         self.assertIn('w:cs="B Nazanin"', body)
+
+    def test_cover_section_is_bordered_unpaginated_and_body_restarts_at_one(self):
+        data = build_notes_docx(full_notes(), meta=META)
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            root = etree.fromstring(archive.read("word/document.xml"))
+            sections = list(root.iter(f"{W}sectPr"))
+            self.assertEqual(len(sections), 2)
+            self.assertIsNotNone(sections[0].find(f"{W}pgBorders"))
+            self.assertIsNone(sections[1].find(f"{W}pgBorders"))
+            self.assertIsNone(sections[0].find(f"{W}headerReference"))
+            self.assertIsNone(sections[0].find(f"{W}footerReference"))
+            numbering = sections[1].find(f"{W}pgNumType")
+            self.assertIsNotNone(numbering)
+            self.assertEqual(numbering.get(f"{W}start"), "1")
+            for section in sections:
+                self.assertIsNotNone(section.find(f"{W}bidi"))
+            for name in archive.namelist():
+                if name.endswith(".xml") or name.endswith(".rels"):
+                    etree.fromstring(archive.read(name))
 
     def test_cover_page_included_when_design_allows(self):
         design = resolve_design({"enabled": True, "cover": True, "toc": True})
@@ -197,6 +241,67 @@ class NotesDocxTests(unittest.TestCase):
         document = docx_library.Document(io.BytesIO(data))
         self.assertEqual(document.core_properties.title, "فارماکولوژی دیابت")
         self.assertEqual(document.core_properties.author, "Gamas Bot")
+
+
+class OOXMLChildOrderTests(unittest.TestCase):
+    """Check schema-sensitive child ordering in the generated DOCX parts."""
+
+    def test_core_properties_follow_ooxml_sequence(self):
+        notes = StructuredNotes.from_payload(json.loads(PALETTE_NOTES_JSON))
+        data = build_notes_docx(notes, meta=META)
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            document = etree.fromstring(archive.read("word/document.xml"))
+            styles = etree.fromstring(archive.read("word/styles.xml"))
+
+        ppr_order = (
+            "pStyle", "keepNext", "keepLines", "pageBreakBefore", "framePr",
+            "widowControl", "numPr", "suppressLineNumbers", "pBdr", "shd", "tabs",
+            "suppressAutoHyphens", "kinsoku", "wordWrap", "overflowPunct",
+            "topLinePunct", "autoSpaceDE", "autoSpaceDN", "bidi", "adjustRightInd",
+            "snapToGrid", "spacing", "ind", "contextualSpacing", "mirrorIndents",
+            "suppressOverlap", "jc", "textDirection", "textAlignment",
+            "textboxTightWrap", "outlineLvl", "divId", "cnfStyle", "rPr", "sectPr",
+            "pPrChange",
+        )
+        rpr_order = (
+            "rStyle", "rFonts", "b", "bCs", "i", "iCs", "caps", "smallCaps",
+            "strike", "dstrike", "outline", "shadow", "emboss", "imprint", "noProof",
+            "snapToGrid", "vanish", "webHidden", "color", "spacing", "w", "kern",
+            "position", "sz", "szCs", "highlight", "u", "effect", "bdr", "shd",
+            "fitText", "vertAlign", "rtl", "cs", "em", "lang", "eastAsianLayout",
+            "specVanish", "oMath",
+        )
+        sect_order = (
+            "headerReference", "footerReference", "footnotePr", "endnotePr", "type",
+            "pgSz", "pgMar", "paperSrc", "pgBorders", "lnNumType", "pgNumType",
+            "cols", "formProt", "vAlign", "noEndnote", "titlePg", "textDirection",
+            "bidi", "rtlGutter", "docGrid", "printerSettings", "sectPrChange",
+        )
+        tblpr_order = (
+            "tblStyle", "tblpPr", "tblOverlap", "bidiVisual", "tblStyleRowBandSize",
+            "tblStyleColBandSize", "tblW", "jc", "tblCellSpacing", "tblInd",
+            "tblBorders", "shd", "tblLayout", "tblCellMar", "tblLook", "tblCaption",
+            "tblDescription", "tblPrChange",
+        )
+
+        def assert_children_ordered(elements, order, description):
+            ranks = {f"{W}{name}": index for index, name in enumerate(order)}
+            for element in elements:
+                actual = [ranks[child.tag] for child in element if child.tag in ranks]
+                self.assertEqual(actual, sorted(actual), description)
+
+        assert_children_ordered(
+            list(document.iter(f"{W}pPr")) + list(styles.iter(f"{W}pPr")),
+            ppr_order,
+            "pPr child sequence",
+        )
+        assert_children_ordered(
+            list(document.iter(f"{W}rPr")) + list(styles.iter(f"{W}rPr")),
+            rpr_order,
+            "rPr child sequence",
+        )
+        assert_children_ordered(list(document.iter(f"{W}sectPr")), sect_order, "sectPr child sequence")
+        assert_children_ordered(list(document.iter(f"{W}tblPr")), tblpr_order, "tblPr child sequence")
 
 
 class PlainDocxTests(unittest.TestCase):
@@ -262,30 +367,70 @@ class RtlAlignmentContractTests(unittest.TestCase):
 
     def assert_alignment_contract(self, data: bytes) -> None:
         root = document_root(data)
-        unaligned = []
+        bad_right_jc = []
         bad_bidi = []
         paragraphs = 0
         for paragraph in root.iter(f"{W}p"):
             paragraphs += 1
             properties = paragraph.find(f"{W}pPr")
             jc = properties.find(f"{W}jc") if properties is not None else None
-            if jc is None or jc.get(f"{W}val") not in {"right", "center"}:
-                unaligned.append(paragraph_text(paragraph)[:40])
+            # RTL right/start is represented by no jc. Center and justified
+            # paragraphs are explicit; jc=right is the known Word desktop trap.
+            if jc is not None and jc.get(f"{W}val") not in {"center", "both"}:
+                bad_right_jc.append(paragraph_text(paragraph)[:40])
             if has_persian(paragraph_text(paragraph)):
                 bidi = properties.find(f"{W}bidi") if properties is not None else None
                 if bidi is None or bidi.get(f"{W}val", "1") != "1":
                     bad_bidi.append(paragraph_text(paragraph)[:40])
-        self.assertEqual(unaligned, [])
+        self.assertEqual(bad_right_jc, [])
         self.assertEqual(bad_bidi, [])
         self.assertGreater(paragraphs, 20)
+
+    def test_body_uses_logical_start_for_headings_and_justifies_prose(self):
+        data = build_notes_docx(full_notes(), meta=META)
+        root = document_root(data)
+        headings = [p for p in root.iter(f"{W}p") if paragraph_text(p).startswith("۱. Metformin")]
+        self.assertTrue(headings)
+        for heading in headings:
+            p_pr = heading.find(f"{W}pPr")
+            jc = p_pr.find(f"{W}jc") if p_pr is not None else None
+            self.assertIsNone(jc)
+        prose = [p for p in root.iter(f"{W}p") if paragraph_text(p) == "خط اول درمان دیابت نوع ۲ است."]
+        self.assertTrue(prose)
+        self.assertEqual(prose[0].find(f"{W}pPr/{W}jc").get(f"{W}val"), "both")
+
+    def test_theme_language_and_complex_run_locale_are_persian(self):
+        with zipfile.ZipFile(io.BytesIO(build_notes_docx(full_notes(), meta=META))) as archive:
+            settings = etree.fromstring(archive.read("word/settings.xml"))
+            styles = etree.fromstring(archive.read("word/styles.xml"))
+            self.assertFalse(
+                any(node.get(f"{W}val") == "right" for node in styles.iter(f"{W}jc"))
+            )
+            theme_lang = settings.find(f"{W}themeFontLang")
+            self.assertIsNotNone(theme_lang)
+            self.assertEqual(theme_lang.get(f"{W}val"), "fa-IR")
+            self.assertEqual(theme_lang.get(f"{W}bidi"), "fa-IR")
+            body = etree.fromstring(archive.read("word/document.xml"))
+        persian_runs = []
+        for run in body.iter(f"{W}r"):
+            text = "".join(node.text or "" for node in run.iter(f"{W}t"))
+            if has_persian(text):
+                persian_runs.append(run)
+        self.assertTrue(persian_runs)
+        for run in persian_runs:
+            r_pr = run.find(f"{W}rPr")
+            self.assertEqual(r_pr.find(f"{W}lang").get(f"{W}val"), "fa-IR")
+            self.assertEqual(r_pr.find(f"{W}lang").get(f"{W}bidi"), "fa-IR")
+            self.assertIsNotNone(r_pr.find(f"{W}szCs"))
+            self.assertIsNotNone(r_pr.find(f"{W}rtl"))
 
     def test_notes_booklet_satisfies_the_contract(self):
         notes = StructuredNotes.from_payload(json.loads(PALETTE_NOTES_JSON))
         self.assert_alignment_contract(build_notes_docx(notes, meta=META))
 
     def test_booklet_with_toc_satisfies_the_contract(self):
-        # The TOC page adds linked rows in a borderless table plus cleared
-        # page-number cells; they obey the same contract.
+        # The TOC page adds linked rows in a borderless RTL table; every row
+        # obeys the same paragraph direction/alignment contract.
         notes = StructuredNotes.from_payload(json.loads(TOC_NOTES_JSON))
         data = build_notes_docx(notes, meta=META)
         self.assertIn("فهرست مطالب", docx_text(data))  # the TOC page really was built
@@ -312,15 +457,24 @@ class RtlTableTests(unittest.TestCase):
             tbl_pr = table.find(f"{W}tblPr")
             self.assertIsNotNone(tbl_pr.find(f"{W}bidiVisual"))
 
-    def test_body_cells_are_right_aligned_and_headers_centred(self):
+    def test_table_headers_are_centred_and_body_uses_rtl_start(self):
         for table in self.root.iter(f"{W}tbl"):
             for row_index, row in enumerate(table.findall(f"{W}tr")):
                 for cell in row.findall(f"{W}tc"):
                     for paragraph in cell.findall(f"{W}p"):
                         jc = paragraph.find(f"{W}pPr/{W}jc")
-                        self.assertIsNotNone(jc)
-                        expected = "center" if row_index == 0 else "right"
-                        self.assertEqual(jc.get(f"{W}val"), expected)
+                        if row_index == 0:
+                            self.assertIsNotNone(jc)
+                            self.assertEqual(jc.get(f"{W}val"), "center")
+                        else:
+                            self.assertTrue(jc is None or jc.get(f"{W}val") == "both")
+
+    def test_latin_cell_terms_use_nonbreaking_spaces(self):
+        table_texts = [
+            "".join(node.text or "" for node in cell.iter(f"{W}t"))
+            for cell in self.root.iter(f"{W}tc")
+        ]
+        self.assertTrue(any("500\u00a0mg" in text for text in table_texts))
 
     def test_mixed_script_cells_split_into_direction_runs(self):
         import docx as docx_library

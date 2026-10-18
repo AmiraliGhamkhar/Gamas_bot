@@ -18,46 +18,57 @@ them.
 * **Paragraph direction** — RTL-dominant paragraphs get `w:bidi`, and their
   *paragraph mark* gets its own `w:rtl`, so an empty line, the caret and a shaded
   spacer behave RTL too. Latin-only lines keep Word's default.
-* **Right alignment** — direction and alignment are separate properties, so the
-  document declares both: `w:docDefaults`, every paragraph style and every
-  written paragraph carry `w:jc w:val="right"`. A paragraph with `w:bidi` and no
-  `w:jc` aligns to its logical *start* edge, which a reader resolves from its own
-  defaults rather than from the file. Only deliberately centred blocks (brand
-  mark, cover title, footer, formula lines, topic-list cells) override it.
+* **RTL start alignment** — direction and alignment are separate properties.
+  Right/start-aligned RTL paragraphs deliberately have **no** `w:jc`: Word
+  resolves `w:jc="right"` logically in bidi context and can place headings at
+  the physical left margin. No RTL style or document default carries a hidden
+  right-alignment `w:jc`; centred blocks use `w:jc="center"`, and prose uses
+  `w:jc="both"` for justification. This is the Word-desktop-sensitive path;
+  LibreOffice previews are not a substitute for checking Microsoft Word.
 * **Mixed scripts** — `gamas_bot/bidi.py` splits text into direction runs.
   Persian runs get the complex-script face (`w:cs`) with `w:rtl`; embedded
   English keeps `w:ascii`/`w:hAnsi` and `w:rtl=0`. Logical order is never
   reversed in the file.
-* **Defaults and styles** — `w:docDefaults` and every style definition are
-  configured RTL, because Word derives the direction of style-generated content
-  from there, not from the runs.
+* **Defaults and styles** — RTL paragraph styles and document defaults carry
+  `w:bidi`; `Normal`, heading, `Header` and `Footer` styles are explicitly set.
+  Every output section also has `w:bidi`, and `settings.xml`'s existing
+  `w:themeFontLang` is set to `fa-IR` (including its `w:bidi` locale).
 * **Real heading styles** — `Heading 1/2/3` carry the outline level, so the
   Navigation Pane, bookmarks and the topic list all work. `Title`, `Subtitle`,
   `Quote`, `Table text`, `Definition`, `Example`, `Note` and `Warning` are
   defined explicitly.
-* **Digits** — page numbers, section numbers and list markers are Persian digits;
-  numeric *values* in the content are never converted.
-* **Fonts** — referenced by name, never embedded. `DEFAULT_FONT_CONFIG` sets the
-  four roles (body, heading, latin, fallback) and `word/fontTable.xml` advertises
-  the fallback through `w:altName`, so a reader without the Persian face
-  substitutes gracefully.
+* **Digits** — generated section numbers and list markers use Persian digits;
+  numeric *values* in content are never converted. Footer numbers are a native
+  `PAGE` field whose run uses the Persian locale.
+* **Fonts and language** — fonts are referenced by name, never embedded.
+  `DEFAULT_FONT_CONFIG` defaults the Persian body/heading faces to bundled
+  Vazirmatn and Latin/fallback to Tahoma; the DOCX references fonts by name
+  rather than embedding them. Persian runs carry `w:rtl`,
+  `w:lang w:val="fa-IR" w:bidi="fa-IR"`, `w:szCs`, and the complex-script font
+  slot. Latin runs are explicitly LTR and tagged `en-US`.
+  `word/fontTable.xml` advertises the fallback through `w:altName`.
 
 ## Page frame, header, footer
 
-The frame is a real `w:pgBorders` inside the section properties
-(`offsetFrom="page"`), not a bordered paragraph. The running header carries the
-document title; the footer carries a native `PAGE` field, so it stays correct if
-the document is re-paginated.
+When a cover is enabled, its frame is a real `w:pgBorders` inside the cover
+section properties (`offsetFrom="page"`), not a bordered paragraph.
+`add_section()` copies section properties, so the following content section
+explicitly removes the cloned frame. Without a cover, the first/body section
+retains the configured frame. The cover has no header/footer references; content
+has a running title header and a native `PAGE` footer field. Numbering restarts
+at 1 in the content section.
 
 ## The topic list
 
-The topic list is a two-column table of **ordinary text**: each entry is an
+The topic list is a one-column static list of **ordinary text**: each entry is an
 internal hyperlink to the bookmark of a real `Heading 1/2/3` paragraph.
 
-It is **link-only — it prints no page numbers.** Exact numbers would need a
-layout pass through an office renderer, which v3 deliberately does not require.
-A number that was not measured is never printed, so the column is omitted rather
-than guessed.
+It is **link-only — it prints no page numbers.** Exact page values require a
+layout pass through an office renderer. This service deliberately has no
+LibreOffice runtime dependency, so it does not guess or emit placeholder page
+numbers. Entries are internal hyperlinks to real bookmarks and remain usable
+in mobile viewers. A two-pass renderer-backed TOC is a separate feature, not a
+claim made by this Python-only generator.
 
 It is built only for documents that need one: at least `TOC_MIN_SECTIONS` (4)
 navigable headings or `TOC_MIN_BODY_CHARS` (2400) of body text. `TOC_LEVELS`
@@ -66,6 +77,14 @@ defaults to `"1-1"`, because the document's own block labels («تعریفها»
 dominate the list. If nothing qualifies, the page is dropped — an empty
 «فهرست مطالب» over an empty table is never emitted, and a missing topic list is
 never a reason to lose the booklet.
+
+## Typography and tables
+
+Body paragraphs use justified alignment and 1.5 line spacing with 10 pt after
+paragraphs; headings are real outline styles with `keep_with_next`. Callout
+paragraphs are kept together and table rows use `cantSplit`, with repeating
+header rows. Tables use python-docx's `table_direction = RTL` API (minimum
+python-docx version 1.2) so logical column one appears on the visual right.
 
 ## Reproducibility and performance
 
