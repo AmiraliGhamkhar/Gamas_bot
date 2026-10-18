@@ -60,9 +60,12 @@ must be revisited at the same time.
   still reaches the note pipeline as one.
 * **`NOTE_JSON_MODE`** sends `response_format` only to providers that document it
   (OpenRouter and generic OpenAI-compatible gateways — not NaraRouter). If a
-  model on an OpenAI-compatible gateway rejects `response_format` or
-  `reasoning_effort` with HTTP 400, the client strips the unsupported optional
-  field and retries once on that route. Gemini always asks for its native JSON.
+  model explicitly rejects `response_format`, `reasoning_effort`, `temperature`,
+  or Gemini's native JSON response option, the client removes that unsupported
+  optional field and retries the route. If an OpenAI-compatible endpoint explicitly
+  recommends `max_completion_tokens` instead of `max_tokens`, the client retries
+  with the same output budget under that name. These corrections are bounded; an
+  unchanged rejected request is never resent. Gemini normally asks for native JSON.
 * **`NOTE_REASONING_EFFORT`** (unset by default) sends `reasoning_effort` on
   the Nara and OpenRouter routes only — the two gateways verified for the
   field (`ultra` is normalized to `max`). A generic OpenAI-compatible gateway

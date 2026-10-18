@@ -130,6 +130,8 @@ DEFAULT_NOTE_MAX_OUTPUT_TOKENS = 16384
 NOTE_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 #: A request needs at least this much room for the transcript itself.
 MIN_NOTE_INPUT_TOKENS = 4096
+#: Headroom for the note system prompt and provider/request scaffolding.
+MIN_NOTE_PROMPT_TOKENS = 4096
 
 #: Environment variable -> resolved settings attribute for the tariff. The
 #: attribute spelling matches the dataclass field exactly.
@@ -921,10 +923,11 @@ def check(settings: Settings) -> list[str]:
     # A listed provider with a credential but no model can never build a request.
     problems.extend(note_route_diagnostics(settings))
     # One request must fit the transcript, the system prompt and the output.
-    if settings.note_context_tokens - settings.note_max_output_tokens < MIN_NOTE_INPUT_TOKENS:
+    required_note_tokens = MIN_NOTE_INPUT_TOKENS + MIN_NOTE_PROMPT_TOKENS
+    if settings.note_context_tokens - settings.note_max_output_tokens < required_note_tokens:
         problems.append(
             f"NOTE_CONTEXT_TOKENS={settings.note_context_tokens} leaves no room for the "
-            f"transcript in one note request (NOTE_MAX_OUTPUT_TOKENS="
+            f"transcript and system prompt in one note request (NOTE_MAX_OUTPUT_TOKENS="
             f"{settings.note_max_output_tokens}); lower NOTE_MAX_OUTPUT_TOKENS or raise "
             "NOTE_CONTEXT_TOKENS."
         )

@@ -332,6 +332,17 @@ class NoteProviderOrderTests(unittest.TestCase):
             problems,
         )
 
+    def test_prompt_reserve_is_included_in_the_note_window_check(self):
+        settings = self.settings(
+            NARA_API_KEY="n", NOTE_CONTEXT_TOKENS="8192", NOTE_MAX_OUTPUT_TOKENS="4096"
+        )
+        problems = check(settings)
+        self.assertTrue(
+            any(is_advisory(problem) and "no room for the transcript" in problem
+                for problem in problems),
+            problems,
+        )
+
     def test_a_credential_without_a_model_is_reported(self):
         settings = self.settings(
             NOTE_PROVIDER="anthropic", NOTE_API_KEY="k", NOTE_MODEL=""

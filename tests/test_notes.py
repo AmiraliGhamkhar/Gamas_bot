@@ -3,14 +3,17 @@
 from __future__ import annotations
 
 import json
+import math
 import unittest
 from unittest import mock
 
 from gamas_bot.llm import LLMContextOverflowError, LLMError
 from gamas_bot.notes import (
     COMPILE_HARD_MAX_CHARS,
+    CONTEXT_DIGEST_MAX_CHARS,
     MAX_CONTEXT_SPLITS,
     PRESENTATION_PROMPT,
+    PROMPT_RESERVE_TOKENS,
     TRANSCRIPT_PROMPT,
     StructuringError,
     effective_chunk_chars,
@@ -22,6 +25,7 @@ from gamas_bot.notes import (
     StructuredNotes,
     build_context,
     build_system_prompt,
+    build_presentation_system_prompt,
     build_presentation_document,
     compile_accepts,
     context_block_for,
@@ -245,6 +249,17 @@ class ContextTests(unittest.TestCase):
         self.assertIn("اول این درس است", block)      # previous tail
         self.assertIn("سوم این درس است", block)       # next head
 
+    def test_rendered_topic_digest_obeys_its_reserved_character_limit(self):
+        chunks = [
+            f"### اسلاید {number} — موضوع کوتاه {number}\n- متن"
+            for number in range(1, 401)
+        ]
+        context = build_context(chunks)
+        block = context_block_for(context, chunks, 1)
+        digest = block.splitlines()[0].partition(": ")[2]
+        self.assertLessEqual(len(digest), CONTEXT_DIGEST_MAX_CHARS)
+        self.assertLess(len(context.topics), len(chunks))
+
 
 class PromptTests(unittest.TestCase):
     def test_mode_rules_selected(self):
@@ -311,11 +326,19 @@ class ContextBudgetTests(unittest.TestCase):
         )
         self.assertLess(with_digest, without)
 
-    def test_a_tiny_window_still_produces_a_usable_request(self):
-        settings = make_settings(note_context_tokens=4096, note_max_output_tokens=4096)
-        budget = effective_chunk_chars(settings, system_prompt=build_system_prompt("full"))
-        self.assertGreaterEqual(budget, 1)
-        self.assertLess(budget, settings.note_chunk_chars)
+    def test_small_window_budget_never_exceeds_the_remaining_context(self):
+        settings = make_settings(note_context_tokens=8192, note_max_output_tokens=4096)
+        system = build_system_prompt("full")
+        budget = effective_chunk_chars(settings, system_prompt=system)
+        reserve_tokens = math.ceil(len(system) / 2.0) + PROMPT_RESERVE_TOKENS
+        available_tokens = settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens
+        self.assertGreater(available_tokens, 0)
+        self.assertEqual(budget, min(settings.note_chunk_chars, available_tokens * 2))
+
+    def test_no_input_room_is_reported_instead_of_floored_over_budget(self):
+        settings = make_settings(note_context_tokens=8192, note_max_output_tokens=8192)
+        with self.assertRaises(StructuringError):
+            effective_chunk_chars(settings, system_prompt=build_system_prompt("full"))
 
 
 class CompileBudgetTests(unittest.TestCase):
@@ -334,6 +357,14 @@ class CompileBudgetTests(unittest.TestCase):
             effective_compile_max_chars(narrow), effective_compile_max_chars(wide)
         )
 
+    def test_budget_reserves_the_selected_mode_and_presentation_compile_prompt(self):
+        settings = make_settings(note_context_tokens=40_000, note_max_output_tokens=4096)
+        full = effective_compile_max_chars(settings)
+        summary = effective_compile_max_chars(settings, mode="summary")
+        presentation = effective_compile_max_chars(settings, presentation=True)
+        self.assertLess(summary, full)
+        self.assertLess(presentation, full)
+
     def test_the_derived_budget_is_bounded_by_the_hard_ceiling(self):
         settings = make_settings(
             note_context_tokens=10_000_000, note_max_output_tokens=4096
@@ -343,6 +374,14 @@ class CompileBudgetTests(unittest.TestCase):
     def test_an_explicit_operator_cap_wins(self):
         settings = make_settings(note_compile_max_chars=12345)
         self.assertEqual(effective_compile_max_chars(settings), 12345)
+
+    def test_explicit_compile_cap_cannot_overrun_a_small_context(self):
+        settings = make_settings(
+            note_context_tokens=8192,
+            note_max_output_tokens=4096,
+            note_compile_max_chars=10000,
+        )
+        self.assertLess(effective_compile_max_chars(settings), settings.note_compile_max_chars)
 
     def test_output_budget_shrinks_the_compile_budget(self):
         lean = make_settings(note_max_output_tokens=4096)
@@ -806,6 +845,36 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertFalse(compile_accepts(gutted_prose, merged))
+
+    async def test_narrow_window_drops_optional_digest_instead_of_overflowing(self):
+        settings = make_settings(
+            note_context_tokens=8192,
+            note_max_output_tokens=2048,
+            note_chunk_chars=100_000,
+            note_compile=False,
+        )
+        outline = "\n\n".join(
+            f"### اسلاید {number} — موضوع {number}\n"
+            + ("- توضیح آموزشی برای اسلاید. " * 55)
+            for number in range(1, 6)
+        )
+        document = build_presentation_document(outline, "")
+        base_system = build_presentation_system_prompt("full")
+        chunk_chars = effective_chunk_chars(settings, system_prompt=base_system)
+        expected_chunks = split_presentation_document(document, chunk_chars)
+        self.assertGreater(len(expected_chunks), 1)
+        session = FakeSession([
+            sample_notes_json(f"جزوهٔ بخش {index}")
+            for index in range(1, len(expected_chunks) + 1)
+        ])
+
+        await structure_presentation(outline, "", settings, session)
+
+        self.assertEqual(len(session.calls), len(expected_chunks))
+        for call in session.calls:
+            request = call["json"]
+            self.assertNotIn("موضوع‌های درس به ترتیب", request["messages"][0]["content"])
+            self.assertTrue(request["messages"][1]["content"].startswith(PRESENTATION_PROMPT))
 
     async def test_output_budget_truncation_splits_chunk_and_recovers(self):
         settings = make_settings(note_chunk_chars=100_000, note_compile=False)

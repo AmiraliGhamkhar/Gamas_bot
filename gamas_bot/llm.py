@@ -1022,10 +1022,23 @@ def _log_usage(route: NoteRoute, payload: dict) -> None:
     )
 
 
-def _strip_rejected_optional_param(payload: dict, error_text: str) -> str | None:
-    """If a 400/422 explicitly names an optional parameter in ``payload``,
-    remove it and return its name so the route can retry once without it."""
+def _adjust_rejected_request_param(payload: dict, error_text: str) -> str | None:
+    """Adjust a request field after an explicit 400/422 parameter rejection."""
     lower = error_text.lower()
+    rejected_markers = (
+        "unsupported parameter",
+        "unknown parameter",
+        "unrecognized parameter",
+        "unknown field",
+        "unrecognized field",
+        "unknown name",
+        "cannot find field",
+        "not supported",
+        "not allowed",
+        "only supports",
+        "must be 1",
+        "must equal 1",
+    )
     if "response_format" in payload and any(
         marker in lower for marker in ("response_format", "json_object", "structured_output")
     ):
@@ -1044,6 +1057,49 @@ def _strip_rejected_optional_param(payload: dict, error_text: str) -> str | None
     ):
         payload.pop("reasoning_effort", None)
         return "reasoning_effort"
+    generation_config = payload.get("generationConfig")
+    if isinstance(generation_config, dict):
+        if (
+            "responseMimeType" in generation_config
+            and any(
+                marker in lower
+                for marker in ("responsemimetype", "response_mime_type", "application/json")
+            )
+            and any(marker in lower for marker in rejected_markers)
+        ):
+            generation_config.pop("responseMimeType", None)
+            return "generationConfig.responseMimeType"
+        if (
+            "temperature" in generation_config
+            and "temperature" in lower
+            and any(marker in lower for marker in rejected_markers)
+        ):
+            generation_config.pop("temperature", None)
+            return "generationConfig.temperature"
+    if (
+        "max_tokens" in payload
+        and "max_tokens" in lower
+        and "max_completion_tokens" in lower
+        and any(
+            marker in lower
+            for marker in (
+                "unsupported",
+                "not supported",
+                "unknown parameter",
+                "unrecognized",
+                "not allowed",
+            )
+        )
+    ):
+        payload["max_completion_tokens"] = payload.pop("max_tokens")
+        return "max_tokens_to_max_completion_tokens"
+    if (
+        "temperature" in payload
+        and "temperature" in lower
+        and any(marker in lower for marker in rejected_markers)
+    ):
+        payload.pop("temperature", None)
+        return "temperature"
     return None
 
 
@@ -1058,7 +1114,21 @@ async def _complete_on_route(
     """One completion from one provider, with its own bounded retry budget."""
     url, headers, payload = _build_request_for(route, settings, system, user)
     attempt = 0
+    request_number = 0
     while True:
+        request_number += 1
+        logger.info(
+            "LLM request sending provider=%s model=%s style=%s attempt=%d system_chars=%d "
+            "user_chars=%d output_tokens=%d fields=%s",
+            route.slug,
+            route.model,
+            route.style,
+            request_number,
+            len(system),
+            len(user),
+            settings.note_max_output_tokens,
+            ",".join(sorted(payload)),
+        )
         try:
             async with session.post(
                 url,
@@ -1089,13 +1159,13 @@ async def _complete_on_route(
             return _parse_response(result, route.style)
         except LLMRequestError as exc:
             if not isinstance(exc, (LLMContextOverflowError, LLMOutputBudgetError)):
-                removed = _strip_rejected_optional_param(payload, str(exc))
-                if removed is not None:
+                adjustment = _adjust_rejected_request_param(payload, str(exc))
+                if adjustment is not None:
                     logger.info(
-                        "Provider rejected optional parameter; retrying without it "
-                        "provider=%s param=%s",
+                        "Adjusting rejected request parameter and retrying "
+                        "provider=%s adjustment=%s",
                         route.slug,
-                        removed,
+                        adjustment,
                     )
                     continue
             raise

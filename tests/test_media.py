@@ -450,6 +450,14 @@ class PresentationAlignmentTests(MediaTempCase):
         self.assertIn("بدون نگاشت مطمئن", aligned.as_text())
         self.assertIn("بدون زمان‌بندی", aligned.as_text())
 
+    def test_empty_plain_transcript_does_not_create_marker_only_text(self):
+        raw = RawTranscript.from_text("")
+        aligned = align_narration_to_slides(
+            raw, self.prepared(), (SlideText(1), SlideText(2))
+        )
+        self.assertFalse(aligned.aligned)
+        self.assertEqual(aligned.as_text(), "")
+
     def test_boundary_jittered_word_stays_with_its_slide_clip(self):
         raw = RawTranscript(
             words=[
