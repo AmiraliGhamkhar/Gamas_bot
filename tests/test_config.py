@@ -12,6 +12,7 @@ from gamas_bot.config import (
     DEFAULT_DEEPGRAM_MODEL,
     DEFAULT_NOTE_CHUNK_CHARS,
     DEFAULT_NOTE_CONTEXT_TOKENS,
+    DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_STT_PROVIDERS,
     PLAN_ENV_FIELDS,
@@ -311,6 +312,47 @@ class NoteProviderOrderTests(unittest.TestCase):
         )
         self.assertEqual(settings.note_compile_max_chars, 90000)
         self.assertEqual(settings.note_reasoning_effort, "low")
+
+    def test_the_request_deadline_is_configurable(self):
+        settings = self.settings(NARA_API_KEY="n")
+        self.assertEqual(settings.note_request_timeout, 900.0)
+        self.assertEqual(settings.note_request_timeout, DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS)
+        settings = self.settings(NARA_API_KEY="n", NOTE_REQUEST_TIMEOUT_SECONDS="600")
+        self.assertEqual(settings.note_request_timeout, 600.0)
+        # The deadline is bounded: a note request never runs for hours.
+        settings = self.settings(NARA_API_KEY="n", NOTE_REQUEST_TIMEOUT_SECONDS="99999")
+        self.assertEqual(settings.note_request_timeout, 3600.0)
+
+    def test_an_output_budget_that_cannot_finish_in_time_is_advisory(self):
+        """The context window decides whether a request fits, the deadline
+        whether it finishes: a 16K output budget cannot be produced inside a
+        300 s deadline on a slow gateway, and that is worth warning about."""
+        settings = self.settings(
+            NARA_API_KEY="n",
+            NOTE_MAX_OUTPUT_TOKENS="16384",
+            NOTE_REQUEST_TIMEOUT_SECONDS="300",
+        )
+        problems = check(settings)
+        self.assertTrue(
+            any(
+                is_advisory(problem)
+                and "will time out on a slow gateway" in problem
+                for problem in problems
+            ),
+            problems,
+        )
+
+    def test_a_generous_deadline_is_not_reported(self):
+        settings = self.settings(
+            NARA_API_KEY="n",
+            NOTE_MAX_OUTPUT_TOKENS="16384",
+            NOTE_REQUEST_TIMEOUT_SECONDS="900",
+        )
+        problems = check(settings)
+        self.assertFalse(
+            any("will time out on a slow gateway" in problem for problem in problems),
+            problems,
+        )
 
     def test_reasoning_effort_resolution(self):
         self.assertEqual(resolve_note_reasoning_effort("LOW"), "low")

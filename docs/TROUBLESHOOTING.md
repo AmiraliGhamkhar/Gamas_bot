@@ -47,6 +47,29 @@ Two note failures have specific fixes:
 | `LLMOutputBudgetError` (`به سقف توکن خروجی رسید`) | the answer was cut off by the output budget. Expected on a reasoning model, which spends part of the same budget thinking | raise `NOTE_MAX_OUTPUT_TOKENS` |
 | `LLMContextOverflowError` after several `splitting into N part(s)` | the input was too large even after the bounded halving | shorten the recording, or raise `NOTE_CONTEXT_TOKENS` if the model's window really is larger |
 
+**A timeout is not a context problem.** `LLM transient failure provider=… (attempt
+1/3; TimeoutError)` means the provider did not answer inside the request
+deadline — the request was *not* rejected for being too large (that is
+`LLMContextOverflowError`, and it never appears as a `TimeoutError`). The
+deadline is filled by the **output** budget, not by the input: the model has to
+emit `NOTE_MAX_OUTPUT_TOKENS` tokens, and on a free or shared-pool gateway that
+takes minutes. The progress bar then sits at one percentage for a long time,
+which is the symptom users report.
+
+| Log line | Cause | Fix |
+| --- | --- | --- |
+| `LLM request timed out provider=…` / `TimeoutError` | the provider needed longer than `NOTE_REQUEST_TIMEOUT_SECONDS` to produce the answer | raise `NOTE_REQUEST_TIMEOUT_SECONDS`, lower `NOTE_MAX_OUTPUT_TOKENS`, or lower `NOTE_REASONING_EFFORT` (thinking tokens are spent out of the same output budget) |
+| `HTTP 429 … UPSTREAM_PROVIDER_SHARED_POOL` | the fallback provider is a free OpenRouter model and its shared pool is rate-limited — the failover has nowhere to go | use a non-free fallback model, or add another provider (for example `gemini`) to `NOTE_PROVIDERS` |
+
+The chain does not repeat an identical request after a timeout: a provider that
+missed the deadline is left behind and the next provider in the chain is tried
+at once. A timeout on the *last* provider in the chain is still retried within
+its bounded budget, so a single-provider deployment keeps its resilience.
+
+The startup self-check (`--check`) warns when the configured output budget
+cannot plausibly be produced inside the configured deadline
+("the note request will time out on a slow gateway").
+
 ## STT failures
 
 Search the log for the submission id:

@@ -70,6 +70,7 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_CONTEXT_TOKENS", "note_context_tokens", "int"),
     ("NOTE_MODE", "note_mode", "str"),
     ("NOTE_MAX_OUTPUT_TOKENS", "note_max_output_tokens", "int"),
+    ("NOTE_REQUEST_TIMEOUT_SECONDS", "note_request_timeout", "float"),
     ("NOTE_CHUNK_CHARS", "note_chunk_chars", "int"),
     ("NOTE_CONCURRENCY", "note_concurrency", "int"),
     ("NOTE_COMPILE_MAX_CHARS", "note_compile_max_chars", "int"),

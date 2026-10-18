@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import unittest
 from unittest import mock
@@ -332,7 +333,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any("content=answer" in line for line in logs.output), logs.output)
         self.assertEqual(len(session.calls), 1)
         timeout = session.calls[0]["timeout"]
-        self.assertEqual(timeout.total, llm.LLM_REQUEST_TIMEOUT_SECONDS)
+        self.assertEqual(timeout.total, settings.note_request_timeout)
 
     async def test_served_model_cannot_forge_a_log_line(self):
         """The served-model string is provider-controlled; it is sanitised."""
@@ -745,6 +746,72 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([bad, FakeResponse(400, {"error": {"message": "unsupported parameter"}})])
         with self.assertRaises(LLMResponseError):
             await complete(session, routed_settings(), system="S", user="U")
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_a_timeout_moves_on_instead_of_repeating_the_same_request(self):
+        """A provider that missed the deadline is left behind, not asked again.
+
+        Re-sending the identical request only waits for the same deadline a
+        second time, while the next provider in the chain may answer in
+        seconds — so a timeout must not consume the whole retry budget.
+        """
+        session = FakeSession([asyncio.TimeoutError(), chat_answer("second-answer")])
+        with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
+            result = await complete(session, routed_settings(), system="S", user="U")
+        self.assertEqual(result, "second-answer")
+        self.assertEqual(
+            [call["url"] for call in session.calls],
+            [
+                "https://router.bynara.id/v1/chat/completions",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ],
+        )
+
+    async def test_the_last_provider_still_retries_a_timeout(self):
+        """With no successor left, the bounded retry budget still applies."""
+        session = FakeSession([asyncio.TimeoutError(), chat_answer("late-answer")])
+        with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
+            result = await complete(
+                session, routed_settings(note_providers=("nara",)), system="S", user="U"
+            )
+        self.assertEqual(result, "late-answer")
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_a_timeout_reports_the_deadline_and_the_knobs(self):
+        # One provider only: the timeout is retried within the bounded budget
+        # and the final failure names the deadline and both knobs.
+        session = FakeSession([asyncio.TimeoutError()] * 3)
+        settings = routed_settings(
+            note_providers=("nara",), note_request_timeout=120.0
+        )
+        with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
+            with self.assertRaises(LLMTransientError) as caught:
+                await complete(session, settings, system="S", user="U")
+        message = str(caught.exception)
+        self.assertIn("120", message)
+        self.assertIn("NOTE_REQUEST_TIMEOUT_SECONDS", message)
+        self.assertIn("NOTE_MAX_OUTPUT_TOKENS", message)
+
+    async def test_the_configured_deadline_is_used_for_the_request(self):
+        session = FakeSession([chat_answer("answer")])
+        settings = routed_settings(note_request_timeout=900.0)
+        await complete(session, settings, system="S", user="U")
+        self.assertEqual(session.calls[0]["timeout"].total, 900.0)
+
+    async def test_a_settings_object_without_a_deadline_uses_the_fallback(self):
+        session = FakeSession([chat_answer("answer")])
+        settings = routed_settings(note_request_timeout=0.0)
+        await complete(session, settings, system="S", user="U")
+        self.assertEqual(
+            session.calls[0]["timeout"].total, llm.LLM_REQUEST_TIMEOUT_SECONDS
+        )
+
+    async def test_a_timeout_in_json_mode_also_moves_on(self):
+        session = FakeSession([asyncio.TimeoutError(), chat_answer('{"ok": true}')])
+        payload = await complete_json(
+            session, routed_settings(), system="S", user="U"
+        )
+        self.assertEqual(payload, {"ok": True})
         self.assertEqual(len(session.calls), 2)
 
     async def test_json_mode_is_only_sent_where_it_is_documented(self):

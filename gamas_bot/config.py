@@ -124,6 +124,20 @@ DEFAULT_NOTE_CHUNK_CHARS = 64000
 #: (32,768 on the pinned OpenRouter endpoint, 65.5K for Agnes 2.5 Flash), so
 #: the budget itself never exceeds what a default model may emit.
 DEFAULT_NOTE_MAX_OUTPUT_TOKENS = 16384
+#: Wall-clock deadline of one note request, in seconds. A hung provider must
+#: not inherit the STT job's multi-hour read timeout — but the deadline must
+#: still be long enough for the configured *output* budget to be produced by
+#: a slow (free-tier, shared-pool) gateway. The output budget, not the input
+#: size, is what fills this window: the default 16,384 output tokens need
+#: several minutes on such a gateway, which is why this is configurable
+#: instead of hard-wired. The default is paired with the default output
+#: budget so the shipped configuration is coherent (see ``check``).
+DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS = 900.0
+#: Conservative output speed (tokens per second) a free or shared note
+#: gateway is assumed to sustain. Used only to warn that a configured output
+#: budget cannot be produced inside the request deadline — the warning is
+#: advisory, because a fast or paid gateway easily beats this estimate.
+MIN_NOTE_OUTPUT_TOKENS_PER_SECOND = 20.0
 #: ``reasoning_effort`` levels accepted on the Nara/OpenRouter note routes
 #: (the two gateways verified for the field). ``ultra`` is accepted as the
 #: documented alias of ``max`` (https://router.bynara.id/docs).
@@ -336,6 +350,7 @@ class Settings:
     note_context_tokens: int
     note_mode: str
     note_max_output_tokens: int
+    note_request_timeout: float
     note_json_mode: bool
     note_chunk_chars: int
     note_concurrency: int
@@ -834,6 +849,12 @@ def from_env(env_file: str | None = None) -> Settings:
         note_max_output_tokens=_env_int(
             "NOTE_MAX_OUTPUT_TOKENS", DEFAULT_NOTE_MAX_OUTPUT_TOKENS, minimum=256
         ),
+        note_request_timeout=_env_float(
+            "NOTE_REQUEST_TIMEOUT_SECONDS",
+            DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS,
+            minimum=30.0,
+            maximum=3600.0,
+        ),
         note_json_mode=_env_bool("NOTE_JSON_MODE", False),
         note_chunk_chars=_env_int(
             "NOTE_CHUNK_CHARS", DEFAULT_NOTE_CHUNK_CHARS, minimum=2000, maximum=200_000
@@ -876,6 +897,7 @@ ADVISORY_PROBLEMS = (
     "raw transcripts only",
     "does not support Persian",
     "no room for the transcript",
+    "the note request will time out on a slow gateway",
 )
 
 
@@ -930,6 +952,23 @@ def check(settings: Settings) -> list[str]:
             f"transcript and system prompt in one note request (NOTE_MAX_OUTPUT_TOKENS="
             f"{settings.note_max_output_tokens}); lower NOTE_MAX_OUTPUT_TOKENS or raise "
             "NOTE_CONTEXT_TOKENS."
+        )
+    # The context window decides whether a request *fits*; the request deadline
+    # decides whether it *finishes*. A free or shared-pool gateway that cannot
+    # emit the configured output budget inside the deadline answers nothing at
+    # all — the request is not rejected, it simply times out. Warn the operator
+    # before that happens instead of after a 25-minute stall.
+    seconds_needed = (
+        settings.note_max_output_tokens / MIN_NOTE_OUTPUT_TOKENS_PER_SECOND
+    )
+    if seconds_needed > settings.note_request_timeout:
+        problems.append(
+            f"NOTE_MAX_OUTPUT_TOKENS={settings.note_max_output_tokens} needs about "
+            f"{seconds_needed:.0f}s of output at "
+            f"{MIN_NOTE_OUTPUT_TOKENS_PER_SECOND:.0f} tokens/s, which is more than "
+            f"NOTE_REQUEST_TIMEOUT_SECONDS={settings.note_request_timeout:.0f}; the note "
+            "request will time out on a slow gateway. Lower NOTE_MAX_OUTPUT_TOKENS, raise "
+            "NOTE_REQUEST_TIMEOUT_SECONDS, or lower NOTE_REASONING_EFFORT."
         )
     if not settings.admin_ids:
         problems.append("ADMIN_IDS is empty; nobody will be able to approve payments.")
