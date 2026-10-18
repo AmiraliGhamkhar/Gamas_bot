@@ -1,10 +1,9 @@
 """RTL Persian Word (.docx) and raw-text exporters for finished jobs.
 
-The Word document is the polished deliverable of the bot: a real cover page, a
-section-level page border (``w:pgBorders``), a static linked table of contents
-built from actual Word heading styles and rendered PDF destinations, a subtle
-running header, a footer with a real ``PAGE`` field, and right-to-left body text
-where embedded English keeps its own direction and font.
+The Word document is the polished deliverable of the bot: a bordered cover, a
+static, clickable one-column topic list linked to real Word heading bookmarks,
+a subtle running header, a native ``PAGE`` footer field, and right-to-left body
+text where embedded English keeps its own direction and font.
 
 Layout rules that matter and are implemented here:
 
@@ -13,21 +12,19 @@ Layout rules that matter and are implemented here:
   Navigation Pane, the application's static linked TOC and document
   restructuring all work. A styled ``Normal`` paragraph is never used as a
   heading.
-* **The page frame is a page frame.** ``w:pgBorders`` is written into each
-  section's ``w:sectPr``; the previous implementation drew a bordered empty
-  paragraph, which is a paragraph border and not a page frame.
+* **The cover frame is a page frame.** ``w:pgBorders`` is written into the
+  cover section's ``w:sectPr``. The next section explicitly removes the cloned
+  border so the cover frame does not leak onto body pages.
 * **Mixed-script text is split into direction runs** (see :mod:`gamas_bot.bidi`)
   so Persian runs get ``w:cs`` complex-script faces and Latin tokens keep
   ``w:ascii``/``w:hAnsi`` with ``w:rtl`` set to zero. Logical order is never
   reversed in the file.
-* **Direction lives in defaults, styles and paragraphs.** Marking written
-  paragraphs ``w:bidi`` and Persian runs ``w:rtl`` is not enough: Word derives
-  unstyled and style-generated content from ``w:docDefaults`` and the style
-  definitions. Those are configured RTL here (``_style_direction``,
-  ``_configure_document_defaults``, ``_configure_toc_entry_styles``), and every
-  paragraph mark carries its own ``w:rtl`` so an empty line and the caret are
-  RTL too. A document that is RTL only where it was written still behaves LTR
-  everywhere the reader touches it.
+* **Direction lives in settings, defaults, styles, sections and paragraphs.**
+  Word derives unstyled/style-generated content from the package defaults, so
+  `themeFontLang`, document defaults, RTL paragraph styles, every section, and
+  written Persian paragraphs/runs carry the appropriate `fa-IR`/bidi properties.
+  Paragraph marks carry their own `w:rtl`, so empty lines and the caret behave
+  RTL too. RTL start alignment omits `w:jc=right`; body prose uses `w:jc=both`.
 * **Fonts are referenced, never embedded.** ``word/fontTable.xml`` advertises
   the configured fallback through ``w:altName`` so a reader without the
   Persian face substitutes gracefully.
@@ -55,7 +52,7 @@ from datetime import datetime
 from docx import Document
 from docx.enum.section import WD_SECTION
 from docx.enum.style import WD_STYLE_TYPE
-from docx.enum.table import WD_ALIGN_VERTICAL
+from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_DIRECTION
 from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -124,7 +121,7 @@ CALLOUT_BORDERS = {"هشدار": "EABFC7", "یادآوری": "ECD6A6", "نکته
 CALLOUT_EMOJI = {"هشدار": "⚠️", "یادآوری": "🔔"}
 #: Heading colour by level: navy for section headings, steel blue below.
 HEADING_COLORS = {1: ACCENT, 2: ACCENT_SOFT, 3: ACCENT_SOFT}
-DEFAULT_FONT = "Tahoma"
+DEFAULT_FONT = "Vazirmatn"
 
 #: The exact cover quotation. It is quoted verbatim and must never be
 #: reworded, translated or normalized away.
@@ -189,14 +186,8 @@ TOC_MIN_BODY_CHARS = 2400
 TOC_LEVELS = "1-1"
 ALLOWED_TOC_LEVELS = frozenset({"1", "1-1", "1-2", "1-3"})
 
-#: Static-TOC page-number policy. ``auto`` keeps exact, renderer-verified page
-#: numbers when LibreOffice/PDF tooling is present and degrades to a link-only
-#: topic list when it is not; ``required`` restores the strict behaviour that
-#: fails rather than emit an unnumbered TOC; ``off`` skips the renderer
-#: entirely, which is the Python-only deployment mode.
-#: v3 policy: the static TOC is link-only. Page numbers in the *footer* are a
-#: native Word ``PAGE`` field and always present; TOC page numbers would need a
-#: layout engine (LibreOffice), which v3 deliberately does not require.
+#: Static-TOC policy: link-only. Exact page values require an office layout
+#: engine; this Python-only exporter never guesses page numbers.
 
 #: Auto-detected optional logo, used when DOCX_LOGO_PATH is not configured.
 #: Fonts and images are never downloaded at generation time.
@@ -207,8 +198,8 @@ LOGO_CANDIDATES = ("assets/gamas_logo.png", "assets/gamas_logo.jpg")
 #: terms; ``fallback`` is written into word/fontTable.xml as w:altName so a
 #: reader without the primary Persian font substitutes gracefully.
 DEFAULT_FONT_CONFIG = {
-    "body": "Tahoma",
-    "heading": "Tahoma",
+    "body": "Vazirmatn",
+    "heading": "Vazirmatn",
     "latin": "Tahoma",
     "fallback": "Tahoma",
 }
@@ -268,7 +259,11 @@ def xml_safe(text: str) -> str:
     Normalization is idempotent and never touches ZWNJ, Latin text, formulas,
     URLs or digit values — see :mod:`gamas_bot.textnorm`.
     """
-    return normalize_display(XML_INVALID_CHARS.sub("", SOFT_BREAK_CHARS.sub(" ", text)))
+    # NBSP is intentional typography in compact Latin table terms; normalize
+    # each run between NBSPs independently, then put the original nonbreaking
+    # separators back. This avoids sentinels that could collide with user text.
+    safe = XML_INVALID_CHARS.sub("", SOFT_BREAK_CHARS.sub(" ", text))
+    return "\u00a0".join(normalize_display(part) for part in safe.split("\u00a0"))
 
 
 #: python-docx resolves a paragraph style to its *id* by scanning **every**
@@ -797,6 +792,11 @@ def _style_fresh_run(
     if not rtl:
         direction.set(qn("w:val"), "0")
     r_pr.append(direction)
+    language = OxmlElement("w:lang")
+    language.set(qn("w:val"), "fa-IR" if rtl else "en-US")
+    if rtl:
+        language.set(qn("w:bidi"), "fa-IR")
+    r_pr.append(language)
 
 
 def _style_run(
@@ -862,6 +862,16 @@ def _style_run(
         # the configured Latin font is missing, without ever reversing text.
         if font != DEFAULT_FONT_CONFIG["latin"]:
             r_fonts.set(qn("w:cs"), font)
+    r_pr = run._r.get_or_add_rPr()
+    lang = r_pr.find(qn("w:lang"))
+    if lang is None:
+        lang = OxmlElement("w:lang")
+        _insert_rpr_child(r_pr, lang, "w:lang")
+    lang.set(qn("w:val"), "fa-IR" if rtl else "en-US")
+    if rtl:
+        lang.set(qn("w:bidi"), "fa-IR")
+    else:
+        lang.attrib.pop(qn("w:bidi"), None)
 
 
 def _add_directional_text(paragraph, text: str, *, fonts: DocumentFonts, size: float,
@@ -924,12 +934,29 @@ def _add_page_break(container):
     (an unwanted table-of-contents page) can remove exactly that element.
     """
     paragraph = container.add_paragraph()
-    # A structural paragraph is still a paragraph of a Persian document: it
-    # carries the right alignment like every other one, so the contract "every
-    # paragraph in this file is right-aligned" holds without exceptions.
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    # A structural paragraph is still a paragraph of a Persian document. Its
+    # RTL start alignment comes from bidi context, not a right-valued jc.
+    _set_paragraph_alignment(paragraph, None)
     paragraph.add_run().add_break(WD_BREAK.PAGE)
     return paragraph
+
+
+def _set_paragraph_alignment(paragraph, align) -> None:
+    """Apply Word alignment without the RTL ``right``/physical-left trap.
+
+    In a bidi paragraph, ``w:jc=right`` is a logical value and Word desktop can
+    resolve it to the physical left margin. RTL start alignment is represented
+    by omitting ``w:jc``; center and justification remain explicit.
+    """
+    p_pr = paragraph._p.get_or_add_pPr()
+    for found in p_pr.findall(qn("w:jc")):
+        p_pr.remove(found)
+    if align in (None, WD_ALIGN_PARAGRAPH.RIGHT):
+        return
+    value = "both" if align == WD_ALIGN_PARAGRAPH.JUSTIFY else "center"
+    element = OxmlElement("w:jc")
+    element.set(qn("w:val"), value)
+    _insert_ppr_child(p_pr, element, PPR_AFTER_JC)
 
 
 def _add_rtl_paragraph(
@@ -941,10 +968,10 @@ def _add_rtl_paragraph(
     bold: bool = False,
     color: RGBColor | None = None,
     italic: bool = False,
-    align=WD_ALIGN_PARAGRAPH.RIGHT,
-    space_after: float = 6,
+    align=WD_ALIGN_PARAGRAPH.JUSTIFY,
+    space_after: float = 10,
     space_before: float = 0,
-    line_spacing: float = 1.15,
+    line_spacing: float = 1.5,
     style: str | None = None,
 ) -> object:
     paragraph = container.add_paragraph()
@@ -974,13 +1001,13 @@ def _fill_paragraph(
     bold: bool = False,
     color: RGBColor | None = None,
     italic: bool = False,
-    align=WD_ALIGN_PARAGRAPH.RIGHT,
-    space_after: float = 6,
+    align=WD_ALIGN_PARAGRAPH.JUSTIFY,
+    space_after: float = 10,
     space_before: float = 0,
-    line_spacing: float = 1.15,
+    line_spacing: float = 1.5,
 ) -> object:
     """Apply RTL styling to an existing (possibly pre-created) paragraph."""
-    paragraph.alignment = align
+    _set_paragraph_alignment(paragraph, align)
     # The base direction is decided in ``_add_directional_text``, the single
     # funnel every run passes through: any strong RTL character makes the
     # paragraph RTL, a Latin-only line keeps Word's LTR default.
@@ -1102,8 +1129,7 @@ def _add_page_number_footer(section, *, fonts: DocumentFonts, design: DocxDesign
     """A professional footer: optional brand plus a real ``PAGE`` field.
 
     The footer page number is a Word field (``w:fldChar``/``w:instrText``),
-    never a hardcoded integer, so it stays correct when document pagination or
-    the section count changes. The TOC page numbers are separate static text.
+    never a hardcoded integer, so it stays correct when pagination changes.
     """
     footer = section.footer
     footer.is_linked_to_previous = False
@@ -1215,6 +1241,12 @@ def _style_complex_face(style, fonts: DocumentFonts, *, size: float | None = Non
     r_fonts.set(qn("w:cs"), fonts.body)
     r_fonts.set(qn("w:ascii"), fonts.latin)
     r_fonts.set(qn("w:hAnsi"), fonts.latin)
+    lang = r_pr.find(qn("w:lang"))
+    if lang is None:
+        lang = OxmlElement("w:lang")
+        _insert_rpr_child(r_pr, lang, "w:lang")
+    lang.set(qn("w:val"), "fa-IR")
+    lang.set(qn("w:bidi"), "fa-IR")
     if size is not None:
         sz = r_pr.find(qn("w:sz"))
         _remove_rpr_child(r_pr, "w:szCs")
@@ -1249,17 +1281,13 @@ def _style_direction(style, *, rtl: bool = True) -> None:
     _set_rpr_rtl(style.element.get_or_add_rPr(), rtl=rtl)
 
 
-def _set_style_alignment(style, align=WD_ALIGN_PARAGRAPH.RIGHT) -> None:
-    """Give a *style definition* an explicit base alignment (``w:jc``).
-
-    Direction and alignment are different properties. A right-to-left
-    paragraph with no ``w:jc`` aligns to its logical *start* edge, which a
-    reader resolves through its own defaults and the paragraph mark rather
-    than through ``w:bidi``. Declaring the alignment on the style -- not only
-    on the paragraphs this build writes -- keeps style-derived content (a list
-    Word generates, a paragraph the reader inserts, pasted text) on the right
-    margin of this Persian document.
-    """
+def _set_style_alignment(style, align=None) -> None:
+    """Set style alignment; RTL start alignment is absence of ``w:jc``."""
+    p_pr = style.element.get_or_add_pPr()
+    for found in p_pr.findall(qn("w:jc")):
+        p_pr.remove(found)
+    if align in (None, WD_ALIGN_PARAGRAPH.RIGHT):
+        return
     style.paragraph_format.alignment = align
 
 
@@ -1284,17 +1312,9 @@ def _configure_document_defaults(document, fonts: DocumentFonts) -> None:
         for found in p_pr.findall(qn("w:bidi")):
             p_pr.remove(found)
         _insert_ppr_child(p_pr, OxmlElement("w:bidi"), PPR_AFTER_BIDI)
-        # Alignment is declared separately from direction: a right-to-left
-        # paragraph with no ``w:jc`` aligns to its logical *start* edge, and
-        # every helper and style below asks for right alignment explicitly.
-        # Declaring it here too keeps a paragraph Word synthesises -- or one a
-        # reader types into an unstyled context -- on the right margin instead
-        # of falling back to the reader's default text direction and edge.
+        # RTL start is the schema default: do not write ``w:jc=right``.
         for found in p_pr.findall(qn("w:jc")):
             p_pr.remove(found)
-        default_alignment = OxmlElement("w:jc")
-        default_alignment.set(qn("w:val"), "right")
-        _insert_ppr_child(p_pr, default_alignment, PPR_AFTER_JC)
     r_pr_default = doc_defaults.find(qn("w:rPrDefault"))
     if r_pr_default is not None:
         r_pr = r_pr_default.find(qn("w:rPr"))
@@ -1315,6 +1335,7 @@ def _configure_document_defaults(document, fonts: DocumentFonts) -> None:
         if lang is None:
             lang = OxmlElement("w:lang")
             _insert_rpr_child(r_pr, lang, "w:lang")
+        lang.set(qn("w:val"), "fa-IR")
         lang.set(qn("w:bidi"), "fa-IR")
         _set_rpr_rtl(r_pr, rtl=True)
 
@@ -1342,8 +1363,8 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
     _style_complex_face(normal, fonts, size=11)
     _style_direction(normal)
     _set_style_alignment(normal)
-    normal.paragraph_format.space_after = Pt(6)
-    normal.paragraph_format.line_spacing = 1.15
+    normal.paragraph_format.space_after = Pt(10)
+    normal.paragraph_format.line_spacing = 1.5
     normal.paragraph_format.widow_control = True
 
     # Real heading styles power Word's Navigation Pane and outline, and provide
@@ -1402,7 +1423,7 @@ def _configure_styles(document, fonts: DocumentFonts) -> None:
         _set_style_alignment(style)
         style.paragraph_format.space_before = Pt(before)
         style.paragraph_format.space_after = Pt(after)
-        style.paragraph_format.line_spacing = 1.15
+        style.paragraph_format.line_spacing = 1.5
         style.paragraph_format.widow_control = True
 
     quote = _ensure_paragraph_style(document, QUOTE_STYLE)
@@ -1445,27 +1466,15 @@ def _configure_toc_entry_styles(document, fonts: DocumentFonts) -> None:
         style.font.bold = False
         _style_complex_face(style, fonts, size=11)
         _style_direction(style)
-        # A TOC entry is right-aligned with a dot leader running to the page
-        # number on the left; Word's own default is a left-aligned leader, which
-        # is the visible symptom of a non-RTL table of contents.
+        # Logical RTL start alignment is represented by the absent jc. Use
+        # left_indent because OOXML counts that indent from an RTL paragraph's
+        # visual right margin.
         paragraph_format = style.paragraph_format
-        paragraph_format.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _set_style_alignment(style)
         paragraph_format.space_before = Pt(4 if level == 1 else 0)
         paragraph_format.space_after = Pt(0)
         paragraph_format.line_spacing = 1.15
         paragraph_format.left_indent = Cm(0.5 * (level - 1))
-        p_pr = style.element.get_or_add_pPr()
-        for found in p_pr.findall(qn("w:tabs")):
-            p_pr.remove(found)
-        tabs = OxmlElement("w:tabs")
-        tab = OxmlElement("w:tab")
-        tab.set(qn("w:val"), "right")
-        tab.set(qn("w:leader"), "dot")
-        tab.set(qn("w:pos"), str(_cm_to_twips(TABLE_CONTENT_WIDTH_CM)))
-        tabs.append(tab)
-        # ``w:tabs`` precedes ``w:bidi``, so insert it before the bidi that
-        # ``_style_direction`` already wrote as well as before its successors.
-        _insert_ppr_child(p_pr, tabs, ("w:bidi",) + PPR_AFTER_BIDI)
 
 
 def _apply_document_defaults(document, fonts: DocumentFonts) -> None:
@@ -1618,11 +1627,14 @@ def _add_rule(
     _shade_paragraph(paragraph, fill)
 
 
-def _add_body_section(document, *, design: DocxDesign):
-    """Start the body section (A4, page frame) after the cover page."""
+def _add_body_section(document):
+    """Start the unframed body section (A4) after the cover page."""
     section = document.add_section(WD_SECTION.NEW_PAGE)
     _configure_section(section)
-    apply_page_border(section, design)
+    # ``add_section`` clones section properties, including the cover frame.
+    # Remove the clone: the border belongs to the cover, not every body page.
+    for border in section._sectPr.findall(qn("w:pgBorders")):
+        section._sectPr.remove(border)
     # ``add_section`` leaves behind the paragraph that carries the break. It is
     # a real, empty paragraph with a visible height on the page, so its mark
     # needs the same direction as every other paragraph in the document.
@@ -1631,11 +1643,9 @@ def _add_body_section(document, *, design: DocxDesign):
     if p_pr is not None and p_pr.find(qn("w:sectPr")) is not None:
         _enable_bidi(document.paragraphs[-1], rtl=True)
         _set_paragraph_mark_direction(document.paragraphs[-1], rtl=True)
-        # The sectPr-bearing paragraph is empty but has a visible height at the
-        # foot of the previous section's last page; it carries the right
-        # alignment like every other paragraph, so the contract "every
-        # paragraph in this file is explicitly right- or centre-aligned" holds.
-        document.paragraphs[-1].alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        # The sectPr-bearing break paragraph is RTL-start by omission; never
+        # persist ``jc=right`` in a bidi paragraph.
+        _set_paragraph_alignment(document.paragraphs[-1], None)
     return section
 
 
@@ -1803,15 +1813,11 @@ def toc_is_worth_it(body_chars: int, sections: int, design: DocxDesign) -> bool:
 
 
 def _add_static_toc_skeleton(document, *, fonts: DocumentFonts):
-    """Insert the page-two TOC container before the body content.
+    """Insert a one-column, mobile-friendly topic list before body content.
 
     Entries are populated after the body has been assembled, when their unique
-    bookmarks are known. Page numbers start as fixed-width plain text so the
-    first real renderer pass can discover each hyperlink's destination.
-
-    The container owns its page break, so the whole page — heading, table and
-    break — can be lifted back out if no heading ever qualifies for it
-    (see :func:`_remove_static_toc`).
+    bookmarks are known. The container owns its page break, so the whole page —
+    heading, table and break — can be lifted back out if no heading qualifies.
     """
     paragraph = _add_rtl_paragraph(
         document,
@@ -1830,10 +1836,10 @@ def _add_static_toc_skeleton(document, *, fonts: DocumentFonts):
         bold=True,
         color=ACCENT,
     )
-    table = document.add_table(rows=0, cols=2)
+    table = document.add_table(rows=0, cols=1)
     table.style = "Table Grid"
     _apply_rtl_table_direction(table)
-    _set_table_widths(table, [TABLE_CONTENT_WIDTH_CM - 1.4, 1.4])
+    _set_table_widths(table, [TABLE_CONTENT_WIDTH_CM])
     borders = OxmlElement("w:tblBorders")
     for side in ("top", "left", "bottom", "right", "insideH", "insideV"):
         edge = OxmlElement(f"w:{side}")
@@ -1858,8 +1864,7 @@ def _remove_static_toc(document, table) -> None:
     """Lift an unwanted TOC page back out of the body.
 
     Used when the topic list ended up empty: the page would otherwise be a
-    heading over an empty table, and the body would start one page later than
-    the page numbering assumed.
+    heading over an empty table and insert an unnecessary blank navigation page.
     """
     for element in (
         getattr(table, "_gamas_toc_break", None),
@@ -2021,14 +2026,14 @@ def _fill_static_toc(
     for entry in entries:
         row = table.add_row()
         row._tr.get_or_add_trPr().append(OxmlElement("w:cantSplit"))
-        title_cell, page_cell = row.cells
+        title_cell = row.cells[0]
         title_paragraph = title_cell.paragraphs[0]
         _apply_paragraph_style(title_paragraph, document, f"TOC {entry['level']}")
-        title_paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        _set_paragraph_alignment(title_paragraph, None)
         title_paragraph.paragraph_format.space_before = Pt(0)
         title_paragraph.paragraph_format.space_after = Pt(0)
         title_paragraph.paragraph_format.line_spacing = 1.0
-        title_paragraph.paragraph_format.right_indent = Cm(0.45 * (int(entry["level"]) - 1))
+        title_paragraph.paragraph_format.left_indent = Cm(0.45 * (int(entry["level"]) - 1))
         _add_directional_hyperlink(
             title_paragraph,
             str(entry["title"]),
@@ -2036,42 +2041,38 @@ def _fill_static_toc(
             fonts=fonts,
             size=10.5,
         )
-        page_paragraph = page_cell.paragraphs[0]
-        _apply_paragraph_style(page_paragraph, document, f"TOC {entry['level']}")
-        page_paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        page_paragraph.paragraph_format.space_before = Pt(0)
-        page_paragraph.paragraph_format.space_after = Pt(0)
-        page_paragraph.paragraph_format.line_spacing = 1.0
-        _add_directional_text(page_paragraph, "00000", fonts=fonts, size=10.5, color=MUTED)
     return entries
-
-
-def _clear_static_toc_page_cells(table) -> None:
-    """Empty every page-number cell (link-only TOC, never a guessed number)."""
-    for row in table.rows:
-        paragraph = row.cells[1].paragraphs[0]
-        for child in list(paragraph._p):
-            if child.tag != qn("w:pPr"):
-                paragraph._p.remove(child)
-
 
 
 def _save_document_payload(document) -> bytes:
     """Serialise the document exactly as python-docx wrote it.
 
-    Intermediate saves during static-TOC pagination use this: rewriting the
-    whole package to inject font fallbacks costs a full decompress/recompress
-    of every part, and the fallback is layout-neutral, so it is applied once to
-    the final payload instead (see :func:`_save_document_bytes`).
+    The whole-package font fallback rewrite is deliberately kept for the final
+    payload only; it is layout-neutral and costs a full decompress/recompress.
     """
     buffer = io.BytesIO()
     document.save(buffer)
     return buffer.getvalue()
 
 
+def _set_persian_theme_language(docx_bytes: bytes) -> bytes:
+    """Set the existing themeFontLang bidi locale to Persian in settings.xml."""
+    def transform(root) -> None:
+        theme_language = root.find(qn("w:themeFontLang"))
+        if theme_language is None:
+            logger.warning("settings.xml has no themeFontLang element; locale not injected")
+            return
+        theme_language.set(qn("w:val"), "fa-IR")
+        theme_language.set(qn("w:bidi"), "fa-IR")
+
+    return _rewrite_docx_part(docx_bytes, "word/settings.xml", transform)
+
+
 def _save_document_bytes(document, fonts: DocumentFonts) -> bytes:
-    """Serialise the document with the (layout-neutral) font fallbacks applied."""
-    return _inject_font_fallbacks(_save_document_payload(document), fonts)
+    """Serialise with Persian locale metadata and font fallbacks applied."""
+    payload = _save_document_payload(document)
+    payload = _set_persian_theme_language(payload)
+    return _inject_font_fallbacks(payload, fonts)
 
 
 
@@ -2081,21 +2082,18 @@ def _finish_static_toc(
     entries: list[dict[str, str | int]],
     *,
     fonts: DocumentFonts,
-    design: DocxDesign,
 ) -> bytes:
     """Finish the document with a link-only static table of contents.
 
-    v3 policy: TOC entries are internal hyperlinks to real Word bookmarks and
-    the page cells stay empty — a page number is never guessed. Page numbers
-    the reader *does* see are the native ``PAGE`` field in the footer of every
-    body page.
+    TOC entries are internal hyperlinks to real Word bookmarks. The list is
+    link-only because no office layout engine is required by this service; the
+    footer page number remains a native ``PAGE`` field.
     """
     if toc_table is None:
         return _save_document_bytes(document, fonts)
     if not entries:
         _remove_static_toc(document, toc_table)
         return _save_document_bytes(document, fonts)
-    _clear_static_toc_page_cells(toc_table)
     return _save_document_bytes(document, fonts)
 
 
@@ -2205,7 +2203,7 @@ def _add_boxed_lines(
             space_after=2 if index < len(lines) - 1 else 8,
             style=style,
         )
-        paragraph.paragraph_format.right_indent = Cm(0.35)
+        paragraph.paragraph_format.left_indent = Cm(0.35)
         _shade_paragraph(paragraph, fill)
         edges = ["left", "right"]
         if index == 0:
@@ -2217,27 +2215,8 @@ def _add_boxed_lines(
 
 
 def _apply_rtl_table_direction(table) -> None:
-    """Make the first logical column render on the right (``w:bidiVisual``).
-
-    CT_TblPr is order-sensitive and w:bidiVisual must precede w:tblW/w:tblLook;
-    appending it last produces a document Word reports as needing repair.
-    """
-    tbl_pr = table._tbl.tblPr
-    _remove_ppr_child(tbl_pr, "w:bidiVisual")
-    bidi_visual = OxmlElement("w:bidiVisual")
-    anchor = None
-    for tag in ("w:tblStyleRowBandSize", "w:tblStyleColBandSize", "w:tblW", "w:jc",
-                "w:tblCellSpacing", "w:tblInd", "w:tblBorders", "w:shd",
-                "w:tblLayout", "w:tblCellMar", "w:tblLook", "w:tblCaption",
-                "w:tblDescription"):
-        found = tbl_pr.find(qn(tag))
-        if found is not None:
-            anchor = found
-            break
-    if anchor is not None:
-        anchor.addprevious(bidi_visual)
-    else:
-        tbl_pr.append(bidi_visual)
+    """Use python-docx's public RTL table-direction API (``w:bidiVisual``)."""
+    table.table_direction = WD_TABLE_DIRECTION.RTL
 
 
 def _set_table_widths(table, widths_cm: list[float]) -> None:
@@ -2390,6 +2369,16 @@ def _prepare_content_table(table) -> None:
     _set_table_cell_margins(table)
 
 
+def _table_cell_text(value: str) -> str:
+    """Keep adjacent ASCII words/numbers in a cell together across line wraps.
+
+    NBSP has the same visible width as an ordinary space but prevents Word from
+    splitting compact Latin terms such as ``500 mg`` or ``HbA1c target`` across
+    lines, particularly in narrow RTL table columns.
+    """
+    return re.sub(r"(?<=[A-Za-z0-9]) (?=[A-Za-z0-9])", "\u00a0", value)
+
+
 def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
     headers = table_data.headers
     rows = table_data.rows
@@ -2425,7 +2414,7 @@ def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
                 _shade_cell(cell, stripe)
             paragraph = _fill_paragraph(
                 cell.paragraphs[0],
-                value,
+                _table_cell_text(value),
                 fonts=fonts,
                 size=10.5,
                 align=WD_ALIGN_PARAGRAPH.RIGHT,
@@ -2513,7 +2502,7 @@ def _add_definitions(document, section: NoteSection, *, fonts: DocumentFonts) ->
             space_after=4,
             style=DEFINITION_STYLE,
         )
-        definition_paragraph.paragraph_format.right_indent = Cm(0.25)
+        definition_paragraph.paragraph_format.left_indent = Cm(0.25)
         _shade_paragraph(definition_paragraph, DEFINITION_SHADE)
 
 
@@ -2528,7 +2517,7 @@ def _add_numbered_steps(document, steps: tuple[str, ...], *, fonts: DocumentFont
             align=WD_ALIGN_PARAGRAPH.RIGHT,
             space_after=3,
         )
-        paragraph.paragraph_format.right_indent = Cm(0.5)
+        paragraph.paragraph_format.left_indent = Cm(0.5)
         # Hanging indent so wrapped lines align under the text, not the number.
         p_pr = paragraph._p.get_or_add_pPr()
         ind = p_pr.find(qn("w:ind"))
@@ -2563,7 +2552,7 @@ def _add_examples(document, examples: tuple[str, ...], *, fonts: DocumentFonts) 
             space_after=4,
             style=EXAMPLE_STYLE,
         )
-        paragraph.paragraph_format.right_indent = Cm(0.25)
+        paragraph.paragraph_format.left_indent = Cm(0.25)
 
 
 def _add_bullets(document, bullets: tuple[str, ...], *, fonts: DocumentFonts) -> None:
@@ -2571,7 +2560,7 @@ def _add_bullets(document, bullets: tuple[str, ...], *, fonts: DocumentFonts) ->
         paragraph = _add_rtl_paragraph(
             document, f"• {bullet}", fonts=fonts, align=WD_ALIGN_PARAGRAPH.RIGHT
         )
-        paragraph.paragraph_format.right_indent = Cm(0.35)
+        paragraph.paragraph_format.left_indent = Cm(0.35)
 
 
 #: A heading that already enumerates itself: «۱» / «۱.» / «(۱)» / «بخش ۲» / «فصل 3 -».
@@ -2667,7 +2656,7 @@ def build_notes_docx(
         )
         # The cover is a section of its own: no running header, no page number,
         # and the body restarts at page one behind a page break.
-        body_section = _add_body_section(document, design=style)
+        body_section = _add_body_section(document)
     else:
         # Without a cover the first page *is* body content. Adding a section
         # break here would silently create a blank leading page.
@@ -2681,11 +2670,11 @@ def build_notes_docx(
             mode_label=MODE_LABELS.get(notes.note_mode, ""),
         )
         if toc_needed:
-            # Without a designed cover, the title block is page one and the
-            # static TOC still occupies page two before body page three.
+            # Without a cover, title content is page one, TOC is page two, and
+            # the body follows it in the same continuously numbered section.
             _add_page_break(document)
     _set_section_page_numbering(
-        body_section, start=2 if toc_needed and style.cover_enabled else 1
+        body_section, start=1
     )
     _add_document_header(body_section, fonts=resolved, title=notes.display_title)
     _add_page_number_footer(body_section, fonts=resolved, design=style)
@@ -2742,14 +2731,14 @@ def build_notes_docx(
             if stripe:
                 _shade_cell(term_cell, stripe)
             _fill_paragraph(
-                term_cell.paragraphs[0], entry.term, fonts=resolved, size=10.5,
+                term_cell.paragraphs[0], _table_cell_text(entry.term), fonts=resolved, size=10.5,
                 bold=True, align=WD_ALIGN_PARAGRAPH.RIGHT, space_after=0,
             )
             definition_cell = glossary_table.cell(row_index, 1)
             if stripe:
                 _shade_cell(definition_cell, stripe)
             _fill_paragraph(
-                definition_cell.paragraphs[0], entry.definition, fonts=resolved,
+                definition_cell.paragraphs[0], _table_cell_text(entry.definition), fonts=resolved,
                 size=10.5, align=WD_ALIGN_PARAGRAPH.RIGHT, space_after=0,
             )
         # A term is short and its explanation is long: the glossary keeps its
@@ -2767,7 +2756,6 @@ def build_notes_docx(
         toc_table,
         toc_entries,
         fonts=resolved,
-        design=style,
     )
 
 
@@ -2815,7 +2803,7 @@ def build_plain_docx(
     apply_page_border(first_section, style)
     if style.cover_enabled:
         _add_cover_page(document, title, meta, fonts=resolved, design=style, mode_label=mode_label)
-        body_section = _add_body_section(document, design=style)
+        body_section = _add_body_section(document)
     else:
         body_section = first_section
         _add_body_title_block(
@@ -2824,13 +2812,13 @@ def build_plain_docx(
         if toc_needed:
             _add_page_break(document)
     _set_section_page_numbering(
-        body_section, start=2 if toc_needed and style.cover_enabled else 1
+        body_section, start=1
     )
     _add_document_header(body_section, fonts=resolved, title=title)
     _add_page_number_footer(body_section, fonts=resolved, design=style)
 
-    # Raw material's heading-derived TOC uses the same static, rendered-page
-    # mapping as the structured-notes path.
+    # Raw material's heading-derived TOC uses the same static bookmark list
+    # as the structured-notes path.
     if toc_needed:
         # The skeleton owns its own page break so the page can be dropped whole.
         toc_table = _add_static_toc_skeleton(document, fonts=resolved)
@@ -2847,7 +2835,7 @@ def build_plain_docx(
             paragraph = _add_rtl_paragraph(
                 document, f"• {block.text}", fonts=resolved, align=WD_ALIGN_PARAGRAPH.RIGHT
             )
-            paragraph.paragraph_format.right_indent = Cm(0.35)
+            paragraph.paragraph_format.left_indent = Cm(0.35)
             continue
         if block.kind == "table":
             # A pasted grid becomes a real table: the same dress as every other
@@ -2872,7 +2860,6 @@ def build_plain_docx(
         toc_table,
         toc_entries,
         fonts=resolved,
-        design=style,
     )
 
 
