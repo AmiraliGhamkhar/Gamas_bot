@@ -235,9 +235,14 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
     slides: list[OfficeSlide] = []
     current_title = document.title or DEFAULT_TITLE
     current_lines: list[str] = []
+    pending_heading = False
 
     def flush() -> None:
-        if current_lines:
+        nonlocal pending_heading
+        # A heading with no body text under it is still content the user
+        # wrote: it becomes a title slide rather than disappearing (audit
+        # F-13).
+        if current_lines or pending_heading:
             slides.append(
                 OfficeSlide(
                     title=current_title,
@@ -248,13 +253,19 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
                     notes="\n".join(current_lines).strip(),
                 )
             )
+            pending_heading = False
 
     has_heading = any(block.kind == "heading" for block in document.blocks)
     for block in document.blocks:
         if block.kind == "heading":
             flush()
-            current_title = block.text or current_title
+            heading_text = block.text or current_title
+            current_title = heading_text
             current_lines = []
+            # The document's own title heading is not a section of its own.
+            pending_heading = not (
+                not slides and heading_text.strip() == (document.title or "").strip()
+            )
             continue
         if block.kind == "table":
             for row in block.rows:
@@ -289,6 +300,12 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
     if not slides:
         # No headings and no lines: one slide carrying the whole text.
         return [OfficeSlide(title=document.title or DEFAULT_TITLE, bullets=(), notes=document.text)]
+    if len(slides) > max_slides:
+        logger.warning(
+            "deck truncated slides=%d max_slides=%d; tail kept only in the source text",
+            len(slides),
+            max_slides,
+        )
     return slides[:max_slides]
 
 
@@ -311,9 +328,20 @@ def fallback_table(document: OfficeDocument) -> OfficeTable:
 
 
 def _cell_value(text: str):
-    """The value written to a cell: a number when the text is only a number."""
+    """The value written to a cell: a number when the text is only a number.
+
+    Never at the cost of what the cell says: a zero-padded code (``007``,
+    ``09123456789``) and anything longer than Excel can hold exactly stays a
+    string, because coercion would change the displayed value (audit F-09).
+    """
     stripped = text.strip()
     if stripped and _NUMBER_PATTERN.match(stripped):
+        digits = stripped.lstrip("-")
+        integer_part = digits.split(".", 1)[0]
+        if len(integer_part) > 1 and integer_part.startswith("0"):
+            return text
+        if len(digits.replace(".", "")) > 15:
+            return text
         try:
             return float(stripped) if "." in stripped else int(stripped)
         except ValueError:  # pragma: no cover - the pattern already guarantees it
@@ -565,7 +593,12 @@ def build_office_pptx(
     except ImportError as exc:  # pragma: no cover - python-pptx is a dependency
         raise OfficeError("کتابخانهٔ ساخت PowerPoint روی سرور نصب نیست.") from exc
 
-    sections = list(slides)[:max_slides]
+    sections = list(slides)
+    if len(sections) > max_slides:
+        logger.warning(
+            "deck truncated at build slides=%d max_slides=%d", len(sections), max_slides
+        )
+        sections = sections[:max_slides]
     if not sections:
         sections = [OfficeSlide(title=document.title or DEFAULT_TITLE, bullets=())]
 

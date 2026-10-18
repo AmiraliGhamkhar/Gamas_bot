@@ -4,8 +4,8 @@
 # requirements. ``requirements.txt`` is generated from it by
 # ``python -m scripts.sync_requirements`` so a cPanel/Passenger deployment that
 # still runs ``pip install -r requirements.txt`` cannot drift from the
-# canonical list; ``tests/test_dependency_consistency.py`` fails the build when
-# they disagree.
+# canonical list; the CI step ``python -m scripts.sync_requirements --check``
+# fails the build when they disagree.
 #
 # This project is an *application*: it is deployed in place (Passenger/wsgi or
 # systemd) rather than installed from an index, which is why the runtime
@@ -79,7 +79,8 @@ extend-exclude = [".venv", ".render"]
 select = ["E4", "E7", "E9", "F", "W", "B", "C4"]
 ignore = [
     # Subprocess calls always use a fixed argument vector with shell=False;
-    # the security posture is asserted by tests/test_audit.py instead.
+    # the ban is enforced by review (and the bounded ranges in
+    # ``[project].dependencies``), not by an extra lint plugin.
     "S",
 ]
 

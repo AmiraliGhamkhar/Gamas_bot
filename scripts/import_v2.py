@@ -24,6 +24,8 @@ It never writes to the source database.
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -59,8 +61,37 @@ def parse_expiry(expires_at: str | None) -> datetime | None:
     return parsed
 
 
+_ADD_COLUMN_RE = re.compile(
+    r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
+    r"[\"'`]?([A-Za-z_][A-Za-z0-9_]*)[\"'`]?"
+)
+
+
+def _without_applied_columns(target: sqlite3.Connection, raw_sql: str) -> str:
+    """Drop ``ADD COLUMN`` statements whose column already exists.
+
+    ``executescript`` is not transactional, so a crash midway through a
+    migration must be safe to retry; SQLite has no ``ADD COLUMN IF NOT
+    EXISTS``.
+    """
+    known: dict[str, set[str]] = {}
+    kept: list[str] = []
+    for line in raw_sql.splitlines():
+        match = _ADD_COLUMN_RE.match(line)
+        if match:
+            table, column = match.group(1), match.group(2)
+            if table not in known:
+                known[table] = {
+                    row[1] for row in target.execute(f"PRAGMA table_info({table})")
+                }
+            if column in known[table]:
+                continue
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def ensure_v3_schema(target: sqlite3.Connection) -> None:
-    """Apply the v3 baseline if the target is empty (same as bot startup)."""
+    """Apply the v3 migrations to a fresh target (same as bot startup)."""
     target.execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations ("
         "name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -69,7 +100,8 @@ def ensure_v3_schema(target: sqlite3.Connection) -> None:
     for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
         if path.name in applied:
             continue
-        target.executescript(path.read_text(encoding="utf-8"))
+        raw_sql = path.read_text(encoding="utf-8")
+        target.executescript(_without_applied_columns(target, raw_sql))
         target.execute(
             "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
             (path.name, iso_now()),
@@ -101,6 +133,13 @@ def import_v2(source_path: Path, target_path: Path) -> int:
     source = sqlite3.connect(f"file:{source_path}?mode=ro", uri=True)
     source.row_factory = sqlite3.Row
     target = sqlite3.connect(target_path)
+    # The database holds Telegram ids and full transcripts; never leave it
+    # world-readable just because this entry point does not set a umask
+    # (audit F-12).
+    try:
+        os.chmod(target_path, 0o600)
+    except OSError:
+        print(f"warning: could not restrict permissions on {target_path}", file=sys.stderr)
 
     try:
         target.execute("PRAGMA foreign_keys=ON")
@@ -196,10 +235,20 @@ def import_v2(source_path: Path, target_path: Path) -> int:
                         source_plan["validity_days"],
                     ),
                 )
+            # Freeze the purchase terms: the v3 approval credits this
+            # snapshot, never a later plan edit (audit F-02/F-14).
+            plan_row = target.execute(
+                "SELECT hours, price, validity_days FROM plans WHERE code = ?",
+                (payment["code"],),
+            ).fetchone()
+            purchased_seconds = (
+                int(round(float(plan_row[0]) * 3600)) if plan_row else None
+            )
             target.execute(
                 "INSERT INTO payments"
                 "(user_id, plan_code, status, receipt_path, created_at, "
-                "reviewed_at, reviewed_by) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "reviewed_at, reviewed_by, purchased_seconds, purchased_price, "
+                "purchased_validity_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     payment["telegram_id"],
                     payment["code"],
@@ -208,6 +257,9 @@ def import_v2(source_path: Path, target_path: Path) -> int:
                     payment["created_at"],
                     payment["reviewed_at"],
                     payment["reviewer_telegram_id"],
+                    purchased_seconds,
+                    int(plan_row[1]) if plan_row else None,
+                    plan_row[2] if plan_row else None,
                 ),
             )
             imported_payments += 1
@@ -216,7 +268,10 @@ def import_v2(source_path: Path, target_path: Path) -> int:
         # -------------------------------------------- credit -> the ledger
         now = datetime.now(timezone.utc)
         credit_rows = debit_rows = 0
-        mismatches: list[tuple[int, int, int]] = []
+        # Expected balances are accumulated with the *same* predicate the
+        # ledger replay uses: active, not expired, and only entitlements this
+        # importer actually converts (audit F-01).
+        expected_by_user: dict[int, int] = {}
         entitlements = source.execute(
             "SELECT e.user_id, e.granted_seconds, e.remaining_seconds, "
             "e.starts_at, e.expires_at, e.status, e.source, e.reason, e.updated_at "
@@ -253,18 +308,7 @@ def import_v2(source_path: Path, target_path: Path) -> int:
                     (user_id, consumed, entry["updated_at"] or entry["starts_at"]),
                 )
                 debit_rows += 1
-            expected = source.execute(
-                "SELECT COALESCE(SUM(remaining_seconds), 0) FROM entitlements "
-                "WHERE user_id = ? AND status = 'active'",
-                (entry["user_id"],),
-            ).fetchone()[0]
-            derived = target.execute(
-                "SELECT COALESCE(SUM(CASE kind WHEN 'credit' THEN seconds ELSE -seconds END), 0) "
-                "FROM ledger WHERE user_id = ?",
-                (user_id,),
-            ).fetchone()[0]
-            # Only compare at the user's last entitlement; count mismatches once.
-            mismatches.append((user_id, int(expected), int(derived)))
+            expected_by_user[user_id] = expected_by_user.get(user_id, 0) + remaining
         # v2 "unlimited" special users: v3 has no unlimited flag, so they get
         # a century of credit — effectively unlimited, still auditable.
         for user_id in unlimited:
@@ -279,21 +323,20 @@ def import_v2(source_path: Path, target_path: Path) -> int:
         print(f"ledger: {credit_rows} credit rows, {debit_rows} debit rows")
 
         # ---------------------------------------------- verification pass
-        # Compare per-user derived v3 balance with the v2 remaining balance
-        # for the users that had entitlements.
-        seen_users: set[int] = set()
+        # Compare per-user derived v3 balance with the v2 remaining balance for
+        # the users that had entitlements. Unlimited users are excluded: their
+        # century credit is deliberate and is not part of the v2 balance.
+        unlimited_set = set(unlimited)
         problems = 0
-        for user_id, expected, derived in mismatches:
-            if user_id in seen_users:
+        for user_id, expected in sorted(expected_by_user.items()):
+            if user_id in unlimited_set:
                 continue
-            seen_users.add(user_id)
-            # Recompute the true derived value now that all rows are in.
             derived = target.execute(
                 "SELECT COALESCE(SUM(CASE kind WHEN 'credit' THEN seconds ELSE -seconds END), 0) "
                 "FROM ledger WHERE user_id = ?",
                 (user_id,),
             ).fetchone()[0]
-            if expected != derived:
+            if int(expected) != int(derived):
                 print(
                     f"  MISMATCH user={user_id}: v2 remaining={expected}, "
                     f"v3 derived={derived}",

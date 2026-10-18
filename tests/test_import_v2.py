@@ -189,6 +189,62 @@ class ImportV2TestCase(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_expired_and_unlimited_entitlements_do_not_abort_the_import(self):
+        """The verification uses the ledger's own predicate (audit F-01)."""
+        source = sqlite3.connect(self.source_path)
+        try:
+            ids = {
+                row[1]: row[0]
+                for row in source.execute("SELECT id, telegram_id FROM users")
+            }
+            plan_free = source.execute(
+                "SELECT id FROM plans WHERE code = 'free_1h'"
+            ).fetchone()[0]
+            plan_paid = source.execute(
+                "SELECT id FROM plans WHERE code = 'paid_5h_30d'"
+            ).fetchone()[0]
+            # 111: an "active" row whose expiry is long past — v2 itself does
+            # not count it, and the importer skips it.
+            insert(
+                source, "entitlements",
+                user_id=ids[111], plan_id=plan_free, payment_id=None,
+                granted_seconds=500, remaining_seconds=500, starts_at="2019-01-01",
+                expires_at="2020-01-01", status="active", source="admin_credit",
+                granted_by_admin_id=None, reason="expired",
+                created_at="2019-01-01", updated_at="2019-01-01",
+            )
+            # 444: unlimited in v2 *and* holding a live entitlement; the century
+            # credit must not make the comparison fail.
+            insert(
+                source, "entitlements",
+                user_id=ids[444], plan_id=plan_paid, payment_id=None,
+                granted_seconds=18000, remaining_seconds=18000, starts_at="2025-04-02",
+                expires_at="2030-01-01", status="active", source="admin_credit",
+                granted_by_admin_id=None, reason=None,
+                created_at="2025-04-02", updated_at="2025-04-02",
+            )
+            source.commit()
+        finally:
+            source.close()
+        result = self.run_import()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        conn = self.target()
+        try:
+            balance = conn.execute(
+                "SELECT COALESCE(SUM(CASE kind WHEN 'credit' THEN seconds "
+                "ELSE -seconds END), 0) FROM ledger WHERE user_id = 111"
+            ).fetchone()[0]
+            self.assertEqual(balance, 3600)  # expired row contributed nothing
+            self.assertGreater(
+                conn.execute(
+                    "SELECT COALESCE(SUM(seconds), 0) FROM ledger "
+                    "WHERE user_id = 444 AND kind = 'credit'"
+                ).fetchone()[0],
+                99 * 365 * 24 * 3600,
+            )
+        finally:
+            conn.close()
+
     def test_second_run_is_refused(self):
         first = self.run_import()
         self.assertEqual(first.returncode, 0, first.stderr)

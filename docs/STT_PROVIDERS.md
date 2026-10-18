@@ -55,9 +55,11 @@ Persian is the default (`STT_LANGUAGE=fa`), so these pairings matter:
   not detect anything, Deepgram defaults to English. Persian is in neither
   Deepgram's detection list nor its `multi` set.
 * **Speechmatics** — `enhanced`, `standard`, `melia-1`, `oak-1`. The last two are
-  batch-only multilingual: the config must send `language=multi`, `auto` is
-  rejected, and language packs are unavailable. `enhanced`/`standard` accept `fa`
-  directly and are the only tiers supporting `language=auto`.
+  batch-only multilingual: the config always sends `language=multi`, whatever
+  `STT_LANGUAGE` says (`auto` included — it is mapped to `multi`, not rejected),
+  and language packs are unavailable. `enhanced`/`standard` accept `fa` directly
+  and are the only tiers supporting `language=auto`; on those tiers `auto`
+  becomes `fa`.
 * **OpenAI-compatible** — `language` is an ISO-639-1 code and is omitted for
   `auto`/`detect`/`multi`. `whisper-1` supports `verbose_json` (segment timings);
   the `gpt-4o-transcribe` family does not, hence the one retry.

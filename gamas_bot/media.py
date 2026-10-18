@@ -6,7 +6,10 @@ backed by the PyAV and ppt2pptx Python packages.  Each command is built by a
 pure function so the argument lists stay unit-testable, and executed through
 one async subprocess wrapper that always enforces a timeout, never runs through
 a shell, and kills the whole process group on POSIX when a job times out or is
-cancelled — the same process-safety guarantees the old external tools had.
+cancelled. That guarantee is scoped to a live parent: if the bot is killed with
+``SIGKILL`` the child is in its own session and finishes (or hits its own
+timeout) with no parent to stop it, which is why startup removes its stale work
+directory instead of pretending the worker disappeared with the parent.
 """
 
 from __future__ import annotations
@@ -496,7 +499,12 @@ async def extract_audio_track(
     stem: str = "audio",
 ) -> Path:
     """Pull a single mono audio track out of any media file PyAV can read."""
-    output_format = choose_merge_format(total_duration, settings)
+    # A budget is always passed: with an unknown duration the selector must not
+    # default to an unbounded PCM WAV that fills the temp partition before the
+    # post-hoc size check can reject it (audit F-22).
+    output_format = choose_merge_format(
+        total_duration, settings, max_output_bytes=settings.max_file_size
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / merge_output_name(stem, output_format)
     command = build_extract_command(source, output, output_format=output_format)

@@ -26,8 +26,9 @@ has drifted.
 
 ## Coverage
 
-The suite contains 13 test modules plus `tests/support.py` (514 tests at
-`0753372`).
+The suite contains 14 test modules plus `tests/support.py`. Counts are not
+repeated here on purpose — run `python -m pytest -q` and report the number from
+that run.
 
 | Area | Module |
 | --- | --- |
@@ -44,6 +45,7 @@ The suite contains 13 test modules plus `tests/support.py` (514 tests at
 | Free Office: parser, Word/Excel/PowerPoint output, bot flow | `tests/test_office.py` |
 | STT adapters, retries, cooldowns, ordered failover | `tests/test_stt.py` |
 | Transcript paragraphing, fidelity, chunk boundaries | `tests/test_transcript.py` |
+| PDF layout, shaping and page numbering | `tests/test_pdf_export.py` |
 
 The suite uses synthetic media and scripted HTTP/Telegram doubles. **No test
 needs an API key and no test makes a billable call.** Presentation tests verify

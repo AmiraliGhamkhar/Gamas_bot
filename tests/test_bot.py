@@ -173,6 +173,16 @@ class HappyPathTests(BotPipelineTestCase):
         # Credit fully refunded.
         self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
 
+    async def test_unmeasurable_duration_is_refused_before_transcription(self):
+        """BILLING.md: an unknown duration is refused, not billed at 0 (F-21)."""
+        event = self.media_event()
+        submission = await self.run_media_job(event, duration=None)
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "failed")
+        self.assertTrue(any("مدت" in reply for reply in event.replies))
+        self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
+
     async def test_insufficient_balance_fails_with_notice(self):
         event = self.media_event()
         submission = await self.run_media_job(event, duration=7200.0, credit=600)
@@ -1049,6 +1059,29 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(event)
         self.assertNotIn(self.user_id, self.bot._pending_payments)
         self.assertTrue(event.edits)
+
+
+class ModerationTests(BotPipelineTestCase):
+    async def test_banned_user_cannot_send_messages(self):
+        await self.db.set_banned(USER_ID, True, admin_id=1)
+        event = self.wire(self.media_event())
+        event.message.message = "/start"
+        await self.bot._handle_message(event)
+        self.assertTrue(any("مسدود" in text for text in event.replies))
+        self.assertFalse(any("منوی اصلی" in text for text in event.replies))
+        self.assertFalse(await self.db.user_submissions(USER_ID))
+
+    async def test_banned_user_cannot_use_callbacks(self):
+        await self.db.set_banned(USER_ID, True, admin_id=1)
+        event = FakeCallbackEvent(USER_ID, b"menu:main")
+        await self.bot._handle_callback(event)
+        self.assertTrue(event.answers)
+        self.assertTrue(event.answers[-1][1])  # alert=True
+
+    async def test_unban_restores_access(self):
+        await self.db.set_banned(USER_ID, True, admin_id=1)
+        await self.db.set_banned(USER_ID, False, admin_id=1)
+        self.assertFalse(await self.db.is_banned(USER_ID))
 
 
 if __name__ == "__main__":

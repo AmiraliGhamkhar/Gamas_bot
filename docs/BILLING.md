@@ -50,16 +50,30 @@ overwriting it.
 
 Card-to-card, verified by a human admin:
 
-1. the user asks for a plan → a `payments` row (one open request per user,
-   enforced by a unique index);
-2. the user sends a receipt image in private chat — checked by content signature,
-   size-bounded, stored `0600` in `RECEIPT_DIR`;
-3. admins are notified and approve or reject with a required reason;
+1. the user asks for a plan → a `payments` row with the **purchase terms frozen
+   on it** (`purchased_seconds`, `purchased_price`, `purchased_validity_days`).
+   One open request per user is enforced by a partial unique index; tapping the
+   same plan again returns the existing request, and a different plan is refused
+   until the open one is reviewed;
+2. the user sends a receipt image in private chat — checked by content signature
+   at upload and again before an admin views it, size-bounded, stored `0600` in
+   `RECEIPT_DIR`;
+3. admins are notified and approve or reject. Approval credits the snapshot; a
+   payment whose snapshot is missing is **never** marked approved. Rejection
+   asks the admin for a reason, which is stored on the row and in the audit
+   entry written in the same transaction;
 4. approval credits the ledger idempotently (one entitlement per payment), and
-   the user is notified.
+   the user is notified with the amount actually credited.
+
+Because the snapshot is the source of truth, deactivating, deleting or
+re-pricing a plan between purchase and review cannot change — or zero — the
+credit, and the admin revenue figure is the sum of what users were quoted, not
+the current catalogue price.
 
 Uploading a receipt grants nothing. Receipts are deleted after
-`RECEIPT_RETENTION_DAYS`; the row is kept for accounting.
+`RECEIPT_RETENTION_DAYS`; the sweep runs once at startup and then daily, so a bot
+that restarts at least once a day still enforces retention. The payment row is
+kept for accounting.
 
 ## Special (unlimited) users
 
@@ -81,11 +95,14 @@ A special user is never billed. Admins manage the flag from chat:
 
 ## Tests
 
-`tests/test_db_billing.py` covers the free grant being once-only, reserve →
-settle charging the measured duration, reserve → release returning everything,
-settle never exceeding the reservation, insufficient balance, expired credit,
-concurrent reservations, startup recovery, the whole special-user matrix, payment
-approval crediting exactly once, and catalog sync protecting custom plans.
+`tests/test_db_billing.py` covers the free grant being once-only (including ten
+concurrent grants), reserve → settle charging the measured duration, reserve →
+release returning everything under the write lock, settle never exceeding the
+reservation, insufficient balance, expired credit, concurrent reservations,
+startup recovery, the whole special-user matrix, payment approval crediting the
+purchase snapshot exactly once after the plan was deactivated, rejection
+requiring a reason, one-open-request reuse, and catalog sync protecting custom
+plans.
 
 ## Not implemented
 

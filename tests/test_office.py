@@ -145,6 +145,12 @@ class OfficeDocumentTests(unittest.TestCase):
         self.assertEqual([slide.title for slide in slides], ["بخش اول", "بخش دوم"])
         self.assertIn("مورد اول", slides[0].bullets)
 
+    def test_a_heading_without_a_body_still_becomes_a_slide(self):
+        document = build_office_document("# عنوان\n\n## بخش خالی\n## بخش پر\nمتن\n")
+        slides = fallback_slides(document)
+        self.assertEqual([slide.title for slide in slides], ["بخش خالی", "بخش پر"])
+        self.assertEqual(slides[0].bullets, ())
+
     def test_fallback_slides_without_headings(self):
         document = build_office_document("سطر یک\nسطر دو\n")
         slides = fallback_slides(document)
@@ -270,6 +276,17 @@ class ExcelDocumentTests(unittest.TestCase):
         sheet = workbook.active
         self.assertEqual(sheet["B2"].value, "۲۰")
         self.assertEqual(sheet["B3"].value, 25)
+
+    def test_zero_padded_identifiers_stay_text(self):
+        """A phone number is not a number: coercion would delete the leading 0."""
+        document = build_office_document(
+            "کد\tمقدار\nتلفن\t09123456789\nکد\t007\nعدد\t1.5\n"
+        )
+        payload = build_office_xlsx(document, list(document.tables))
+        sheet = openpyxl.load_workbook(io.BytesIO(payload)).active
+        self.assertEqual(sheet["B2"].value, "09123456789")
+        self.assertEqual(sheet["B3"].value, "007")
+        self.assertEqual(sheet["B4"].value, 1.5)
 
     def test_a_text_without_a_table_still_produces_a_sheet(self):
         document = build_office_document("سطر یک\nسطر دو\n")
@@ -681,6 +698,21 @@ class OfficeJobTests(OfficeBotTestCase):
         event.message._chat_id = USER_ID
         await self.bot._handle_office_message(event, USER_ID, "متن " * 100)
         self.assertTrue(any("حد مجاز" in reply for reply in event.replies))
+
+    async def test_an_oversize_text_file_is_refused_before_download(self):
+        """The upload is rejected on Telegram's size, not after writing it (F-10)."""
+        event = self.wire(FakeJobEvent())
+        event.message._chat_id = USER_ID
+        event.message.attach_document(
+            "big.txt",
+            mime_type="text/plain",
+            size=self.settings.office_max_input_bytes + 1,
+        )
+        handled = await self.bot._handle_office_message(event, USER_ID, "")
+        self.assertTrue(handled)
+        self.assertTrue(any("بزرگ" in reply for reply in event.replies))
+        # Nothing was downloaded, so no temporary file exists.
+        self.assertEqual(list(self.settings.temp_dir.glob("office-*")), [])
 
     async def test_a_lecture_upload_is_never_office_content(self):
         event = self.wire(FakeJobEvent())

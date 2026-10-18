@@ -49,8 +49,13 @@ timeout, unparseable output) the files are re-probed one process each.
 * One operation is bounded by `MEDIA_TIMEOUT`; legacy `.ppt` conversion by
   `CONVERT_TIMEOUT`.
 * Temporary work is confined to `TEMP_DIR` and removed in a `finally` block;
-  stale `submission-*` / `deck-*` directories from a crash are removed at
-  startup.
+  stale `submission-*` / `deck-*` / `office-*` directories from a crash are
+  removed at startup, before any handler runs (`GamasBot._sweep_stale_temp_dirs`).
+  Only directories older than the process start are touched, so a sibling start
+  that has not yet taken the instance lock is never robbed.
+* An audio extraction whose duration cannot be measured is never rendered as an
+  unbounded PCM WAV: the format selector always receives a byte budget and falls
+  back to Opus when WAV would not fit.
 * `needs_transcode()` re-encodes only when the container or codec is one the STT
   providers do not accept, so a normal upload is not re-encoded blindly. A single
   compatible slide-linked audio clip follows the same passthrough rule; video,

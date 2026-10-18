@@ -102,10 +102,13 @@ modules never import `bot.py`, and `config.py` imports nothing from the package.
 ## Data model
 
 SQLite in WAL mode, `foreign_keys=ON`, 5 s busy timeout, one connection guarded
-by an `asyncio.Lock`; writes are serialized by the asyncio lock and committed
-atomically (single-writer, no `BEGIN IMMEDIATE` needed). Migrations are plain `.sql`
-files under `migrations/v3/`, applied once in filename order and recorded in
-`schema_migrations`. Eight application tables:
+by an `asyncio.Lock`; **every** write — including `release_hold`, free grants and
+payment review — takes that lock and commits atomically (single-writer, no `BEGIN
+IMMEDIATE` needed). Migrations are plain `.sql` files under `migrations/v3/`,
+applied once in filename order and recorded in `schema_migrations`; they run
+before any handler or worker starts, and `ADD COLUMN` statements whose column
+already exists are skipped so a crash mid-migration is safe to retry. Eight
+application tables:
 
 | Table | Meaning |
 | --- | --- |
@@ -135,11 +138,17 @@ Billing is an append-only ledger, never a mutated balance. A job's lifecycle is
    both poll one bot account.
 7. The raw transcript is persisted and delivered before note generation starts,
    so a note-provider outage never costs the user their content.
-8. A long list is paged, never cut. Callbacks carry an *address*, never a
-   payload, and stay inside Telegram's 64-byte `callback_data` limit.
-9. The Free Office section never rewrites the user's text. A model may
-   *arrange* it; every line it proposes is checked against the source, and a
-   line that is not there is dropped. The section works with no model at all.
+8. A long list is paged. The transcript is normally delivered as a `.txt`; when
+   that upload fails the text fallback pages it in chat up to a bounded 40
+   pages, and says so if the bound is ever reached. Callbacks carry an
+   *address*, never a payload, and stay inside Telegram's 64-byte
+   `callback_data` limit.
+9. The Free Office section does not change the content the user wrote. It
+   normalises typography (Arabic letter forms to Persian, repeated whitespace)
+   and does not carry horizontal-rule lines, and a model may *arrange* the text;
+   every line it proposes is checked against the source, and a line that is not
+   there is dropped. A heading with no body still becomes a slide. The section
+   works with no model at all.
 
 ## Where to change things
 

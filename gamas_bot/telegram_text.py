@@ -12,8 +12,9 @@ not have to remember:
 
 This module owns exactly that: it converts the small Markdown subset the note
 model emits into Telegram-safe HTML and splits the *rendered* result on line
-boundaries that never cut inside a tag. ``gamas_bot.bot`` re-exports these
-names for backward compatibility.
+boundaries that never cut inside a tag. ``gamas_bot.bot`` imports
+``button_label`` and ``render_pages`` from here; ``split_message`` is an
+internal detail of this module and is not re-exported.
 """
 
 from __future__ import annotations

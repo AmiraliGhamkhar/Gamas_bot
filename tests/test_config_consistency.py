@@ -230,5 +230,15 @@ class SttDocumentationTests(unittest.TestCase):
             self.assertIn(name, text, f"docs/STT_PROVIDERS.md does not document {name}")
 
 
+class VersionConsistencyTests(unittest.TestCase):
+    def test_package_version_matches_pyproject(self):
+        import tomllib
+
+        import gamas_bot
+
+        data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertEqual(gamas_bot.__version__, data["project"]["version"])
+
+
 if __name__ == "__main__":
     unittest.main()

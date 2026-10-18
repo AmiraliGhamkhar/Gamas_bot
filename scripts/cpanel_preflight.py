@@ -230,7 +230,8 @@ def check_network(settings) -> list[Result]:
                 Result(
                     "FAIL", "Telegram connectivity",
                     "cannot open outbound TCP 443 to Telegram: " + "; ".join(failures)
-                    + ". Ask the host to allow it, or set TELEGRAM_PROXY.",
+                    + ". Ask the host to allow it; this build has no proxy "
+                    "setting (TELEGRAM_PROXY was removed in v3).",
                 )
             )
         else:

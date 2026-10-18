@@ -1637,9 +1637,20 @@ async def structure_document(
             presentation=presentation,
         )
 
-    chunk_notes = await asyncio.gather(
-        *(map_chunk(index, chunk) for index, chunk in enumerate(chunks, start=1))
-    )
+    # Cancel the siblings when one chunk fails: ``gather`` propagates the first
+    # error but leaves the other provider requests running against a job that
+    # has already been failed and released (audit F-17).
+    tasks = [
+        asyncio.create_task(map_chunk(index, chunk))
+        for index, chunk in enumerate(chunks, start=1)
+    ]
+    try:
+        chunk_notes = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
     merged = merge_structured_notes(list(chunk_notes))
 
     merged_chars = len(json.dumps(compact_notes_payload(merged), ensure_ascii=False))

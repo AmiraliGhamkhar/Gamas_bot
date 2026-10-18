@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+import os
 import re
 import secrets
 import shutil
@@ -47,7 +48,12 @@ from .billing import (
     plan_catalog,
 )
 from .config import Settings, format_payment_card
-from .db import Database, InsufficientBalanceError
+from .db import (
+    Database,
+    InsufficientBalanceError,
+    OpenPaymentError,
+    PaymentSnapshotError,
+)
 from .docx_export import (
     OFFICE_HEADING_OFFSET,
     DocumentMeta,
@@ -133,8 +139,10 @@ MAX_RAW_PREVIEW_LINES = 12
 TELEGRAM_CAPTION_LIMIT = 1024
 #: Upper bound on the paginated text fallback when a file upload fails. The raw
 #: transcript is the product's core artifact, so a delivery-size failure is
-#: recovered in the chat rather than thrown away — but never unboundedly.
-RAW_FALLBACK_MAX_PAGES = 4
+#: recovered in the chat rather than thrown away — but never unboundedly. The
+#: bound is generous enough for a multi-hour lecture (~40 pages ≈ 150 000
+#: characters); reaching it means the file is pathological, not a lecture.
+RAW_FALLBACK_MAX_PAGES = 40
 
 #: Maximum length of a user-controlled string that is logged verbatim. Longer
 #: values are truncated to avoid log-bloat / log-injection.
@@ -281,6 +289,9 @@ class GamasBot:
         self._receipt_cleanup_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
         self._pending_broadcast: set[int] = set()
+        # admin_id -> payment_id awaiting a rejection reason
+        self._pending_reject_reason: dict[int, int] = {}
+        self._started_at = time.time()
         # Free Office: the in-flight request of every user, and the last
         # document each of them built (so «افزودن متن» can extend it).
         self._office_sessions: dict[int, OfficeSession] = {}
@@ -294,7 +305,23 @@ class GamasBot:
         self._register_handlers()
 
     # ------------------------------------------------------------------ boot
+    def _prepare_private_dirs(self) -> None:
+        """Create the bot's private directories and restrict them to 0700.
+
+        ``docs/SECURITY.md`` promises the receipt directory is private and
+        verified at startup; this is that check (audit F-20 / SECURITY drift).
+        Whether the directory sits outside a web root is a deployment question
+        the preflight script answers.
+        """
+        for directory in (self.settings.temp_dir, self.settings.receipt_dir):
+            try:
+                directory.mkdir(parents=True, exist_ok=True)
+                os.chmod(directory, 0o700)
+            except OSError:
+                logger.warning("could not prepare private directory %s", directory)
+
     async def run(self) -> None:
+        self._prepare_private_dirs()
         await self.db.connect()
         await self.db.sync_plans(
             [
@@ -309,11 +336,38 @@ class GamasBot:
             ]
         )
         await self.db.recover_interrupted()
+        self._sweep_stale_temp_dirs()
         self.queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
         await self.client.start(bot_token=self.settings.bot_token)
         logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
         await self.client.run_until_disconnected()
+
+    def _sweep_stale_temp_dirs(self) -> None:
+        """Remove work directories left behind by a crash (audit F-07).
+
+        Only this process's own naming scheme is touched, only directories, and
+        only ones older than the process start: a live sibling instance's
+        directory (possible before the instance lock is taken) is never swept.
+        """
+        root = self.settings.temp_dir
+        if not root.is_dir():
+            return
+        removed = 0
+        for entry in root.iterdir():
+            if not entry.is_dir() or entry.is_symlink():
+                continue
+            if not entry.name.startswith(("submission-", "deck-", "office-")):
+                continue
+            try:
+                if entry.stat().st_mtime >= self._started_at:
+                    continue
+                shutil.rmtree(entry)
+                removed += 1
+            except OSError:
+                logger.warning("could not remove stale temp dir %s", entry.name)
+        if removed:
+            logger.info("removed %d stale temp dir(s) at startup", removed)
 
     async def shutdown(self) -> None:
         if self._receipt_cleanup_task is not None:
@@ -574,7 +628,8 @@ class GamasBot:
             return
         await event.respond(
             "متن سند را بفرستید (یا یک فایل ‎.txt/‎.csv بفرستید).\n"
-            "هرچه بنویسید عیناً در سند می‌آید؛ سطرهای جدول را با Tab جدا کنید.\n"
+            "محتوای متن شما تغییر نمی‌کند؛ فقط نوشتار یکسان‌سازی می‌شود "
+            "(حروف عربی به فارسی و فاصله‌های اضافی). سطرهای جدول را با Tab جدا کنید.\n"
             "اگر متن بیشتری دارید، بعد از ساخت دکمهٔ «➕ افزودن متن» را بزنید.",
             buttons=[[Button.inline("↩️ انصراف", b"office:cancel")]],
         )
@@ -599,6 +654,17 @@ class GamasBot:
         filename = getattr(message.file, "name", None) if message.file else None
         extension = Path(filename or "").suffix.lower()
         is_text_file = message.document is not None and extension in TEXT_FILE_EXTENSIONS
+        if is_text_file:
+            # Size before bytes: a document is downloaded by the Telethon task,
+            # outside the bounded job queue, so an unchecked 2 GB upload would
+            # bypass MAX_QUEUED_JOBS entirely (audit F-10).
+            reported = getattr(message.file, "size", None) or 0
+            if reported > self.settings.office_max_input_bytes:
+                await event.reply(
+                    "❌ فایل متنی از حد مجاز بزرگ‌تر است "
+                    f"({self.settings.office_max_input_bytes} بایت)."
+                )
+                return True
         if not is_text_file:
             # Any other attachment (a photo, a sticker) is not office content:
             # only a message and a text file are.
@@ -734,6 +800,11 @@ class GamasBot:
         if user_id is None:
             await self._ack(event)
             return
+        # The ban gate is enforced on callbacks as well as messages: a blocked
+        # user must not be able to act on a stale keyboard (audit F-05).
+        if await self.db.is_banned(user_id):
+            await self._ack(event, "⛔ دسترسی شما به ربات مسدود شده است.", alert=True)
+            return
         if not self._is_admin(user_id) and data.startswith(("adm:", "payv:")):
             await self._ack(event, "این بخش ویژهٔ مدیران است.", alert=True)
             return
@@ -741,6 +812,7 @@ class GamasBot:
         # so a stray "انصراف"/navigation tap can never send stale text later.
         if data.startswith("adm:") and data != "adm:bcast":
             self._pending_broadcast.discard(user_id)
+            self._pending_reject_reason.pop(user_id, None)
         # Likewise, navigating away from the payment flow drops a waiting
         # receipt upload — a photo sent later belongs to the new screen.
         if not data.startswith("payr:"):
@@ -835,10 +907,27 @@ class GamasBot:
         user_id = event.sender_id
         if user_id is None:
             return
-        await self.db.ensure_user(user_id)
+        user = await self.db.ensure_user(user_id)
+        if user.banned:
+            await event.reply("⛔ دسترسی شما به ربات مسدود شده است.")
+            return
         text = (event.message.message or "").strip()
 
         # Admin conversational states.
+        if self._is_admin(user_id) and user_id in self._pending_reject_reason:
+            payment_id = self._pending_reject_reason.pop(user_id, None)
+            if payment_id is not None:
+                if text.lower() == "/cancel":
+                    await event.reply("رد پرداخت لغو شد.")
+                    await self._show_admin_payments(event)
+                    return
+                if not text:
+                    # A photo or sticker is not a reason: keep waiting.
+                    self._pending_reject_reason[user_id] = payment_id
+                    await event.reply("دلیل رد را در یک پیام متنی بنویسید (یا /cancel).")
+                    return
+                await self._reject_payment_with_reason(event, payment_id, text)
+                return
         if self._is_admin(user_id) and user_id in self._pending_broadcast:
             if text.lower() == "/cancel":
                 self._pending_broadcast.discard(user_id)
@@ -852,6 +941,9 @@ class GamasBot:
             return
         if self._is_admin(user_id) and text.startswith("/unlimited"):
             await self._admin_unlimited(event, text)
+            return
+        if self._is_admin(user_id) and (text.startswith("/ban") or text.startswith("/unban")):
+            await self._admin_ban(event, text)
             return
 
         # Payment receipt pending for this user?
@@ -1121,6 +1213,12 @@ class GamasBot:
 
         info = await self._run_media_operation(probe_media, audio_path, self.settings)
         duration = info.duration or job.duration_hint
+        if not duration or duration <= 0:
+            # Billing.md promises an unmeasurable duration is refused, not
+            # reserved at a guess and settled at zero (audit F-21).
+            raise ValueError(
+                "مدت این فایل مشخص نشد؛ نمی‌توانم آن را برای پیاده‌سازی بپذیرم."
+            )
         needed = self._reserve_estimate(duration)
         await self.db.reserve(job.user_id, job.submission_id, needed)
 
@@ -1740,7 +1838,17 @@ class GamasBot:
             "پس از واریز، دکمهٔ زیر را بزنید و تصویر رسید را بفرستید. "
             "تا تایید مدیر معمولاً چند ساعت طول می‌کشد."
         )
-        payment_id = await self.db.create_payment(event.sender_id, plan_code)
+        try:
+            payment_id = await self.db.create_payment(event.sender_id, plan_code)
+        except OpenPaymentError as exc:
+            await event.respond(
+                "⚠️ شما یک درخواست پرداخت باز دارید "
+                f"(طرح {exc.plan_code}). ابتدا آن را تکمیل یا لغو کنید."
+            )
+            return
+        except ValueError:
+            await event.respond("این طرح در دسترس نیست.")
+            return
         await event.respond(text, buttons=[
             [Button.inline("📤 واریز کردم؛ ارسال رسید", f"payr:{payment_id}".encode())],
             [Button.inline("🔙 بازگشت", b"account")],
@@ -1845,26 +1953,65 @@ class GamasBot:
             await self._ack(event, "این پرداخت قبلاً بررسی شده است.", alert=True)
             await self._show_admin_payments(event)
             return
-        plan = await self.db.plan(payment["plan_code"])
-        hours = plan["hours"] if plan else 0
-        days = plan["validity_days"] if plan else None
-        changed = await self.db.review_payment(
-            payment_id, approved, event.sender_id,
-            plan_hours=hours, plan_validity_days=days,
-        )
+        if not approved:
+            # A rejection must carry a reason, so ask for it before changing
+            # any row (audit F-15).
+            self._pending_reject_reason[event.sender_id] = payment_id
+            await self._ack(event, "دلیل رد را بنویسید.", alert=True)
+            await event.respond(
+                f"✍️ دلیل رد پرداخت #{to_persian_digits(payment_id)} را در یک پیام "
+                "بنویسید (یا /cancel).",
+                buttons=[[Button.inline("↩️ انصراف", b"adm:pay")]],
+            )
+            return
+        try:
+            changed = await self.db.review_payment(payment_id, True, event.sender_id)
+        except PaymentSnapshotError:
+            logger.error("payment approval without a snapshot payment=%s", payment_id)
+            await self._ack(
+                event,
+                "این پرداخت اطلاعات خرید ندارد؛ تایید انجام نشد. طرح را بررسی کنید.",
+                alert=True,
+            )
+            return
         if not changed:
             await self._ack(event, "این پرداخت قبلاً بررسی شده است.", alert=True)
         else:
-            await self._ack(event, "ثبت شد." if approved else "رد شد.")
+            await self._ack(event, "ثبت شد.")
+            # The credited amount is the purchase snapshot, never the live plan.
+            seconds = int(payment["purchased_seconds"] or 0)
             user_text = (
-                f"✅ پرداخت شما تایید شد: {to_persian_digits(hours)} ساعت اعتبار اضافه شد."
-                if approved
-                else "❌ پرداخت شما تایید نشد. در صورت اعتراض با پشتیبانی تماس بگیرید."
+                f"✅ پرداخت شما تایید شد: {format_duration(seconds)} اعتبار اضافه شد."
             )
             try:
                 await self.client.send_message(payment["user_id"], user_text)
             except Exception:
                 logger.warning("could not notify user=%s", payment["user_id"])
+        await self._show_admin_payments(event)
+
+    async def _reject_payment_with_reason(
+        self, event, payment_id: int, reason: str
+    ) -> None:
+        reason = reason.strip()
+        if not reason:
+            await event.reply("دلیل رد نمی‌تواند خالی باشد.", buttons=self._admin_menu())
+            return
+        payment = await self.db.payment(payment_id)
+        changed = await self.db.review_payment(
+            payment_id, False, event.sender_id, reason=reason
+        )
+        if not changed:
+            await event.reply("این پرداخت قبلاً بررسی شده است.")
+        else:
+            await event.reply(f"پرداخت #{to_persian_digits(payment_id)} رد شد.")
+            if payment is not None:
+                try:
+                    await self.client.send_message(
+                        payment["user_id"],
+                        "❌ پرداخت شما تایید نشد. در صورت اعتراض با پشتیبانی تماس بگیرید.",
+                    )
+                except Exception:
+                    logger.warning("could not notify user=%s", payment["user_id"])
         await self._show_admin_payments(event)
 
     # ----------------------------------------------------------------- admin
@@ -1918,6 +2065,7 @@ class GamasBot:
             "/unlimited <user_id> on <دلیل>\n"
             "/unlimited <user_id> off"
         )
+        lines.append("مسدود کردن کاربر:\n/ban <user_id>\n/unban <user_id>")
         await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
 
     async def _show_admin_payments(self, event) -> None:
@@ -1966,10 +2114,14 @@ class GamasBot:
         path = payment.get("receipt_path")
         # Enforce the RECEIPT_DIR boundary: a compromised payment row must not
         # make the bot serve an arbitrary server file (audit F-H01). Resolve
-        # symlinks and verify the target is strictly inside receipt_dir and
-        # passes a lightweight magic-byte check.
-        if not path or not _is_safe_receipt_path(self.settings.receipt_dir, path):
-            await self._ack(event, "برای این پرداخت رسیدی ثبت نشده است.", alert=True)
+        # symlinks, verify the target is strictly inside receipt_dir, and
+        # re-check the magic bytes before forwarding it (audit F-20).
+        if (
+            not path
+            or not _is_safe_receipt_path(self.settings.receipt_dir, path)
+            or not _validate_receipt_image_signature(Path(path))
+        ):
+            await self._ack(event, "برای این پرداخت رسید معتبری ثبت نشده است.", alert=True)
             return
         await self._ack(event)
         number = to_persian_digits(payment_id)
@@ -2010,6 +2162,14 @@ class GamasBot:
             )
             return
         target, hours = int(parts[1]), int(parts[2])
+        if self._is_admin(target):
+            # No separation-of-duties escape: an admin cannot mint credit for a
+            # peer (audit F-06, docs/SECURITY.md).
+            await event.reply(
+                "به مدیران دیگر نمی‌توان اعتبار اهدا کرد.",
+                buttons=self._admin_menu(),
+            )
+            return
         if not (0 < hours <= 10_000):
             await event.reply(
                 "ساعت باید بین ۱ و ۱۰۰۰۰ باشد.",
@@ -2023,6 +2183,32 @@ class GamasBot:
         )
         await event.reply(
             f"✅ {format_duration(hours * 3600)} اعتبار به {target} اضافه شد.",
+            buttons=self._admin_menu(),
+        )
+
+    async def _admin_ban(self, event, text: str) -> None:
+        """``/ban <user_id>`` / ``/unban <user_id>`` — audited, admin-only."""
+        parts = text.split()
+        if len(parts) != 2 or not parts[1].isdigit():
+            await event.reply(
+                "قالب درست:\n/ban <user_id>\n/unban <user_id>",
+                buttons=self._admin_menu(),
+            )
+            return
+        target = int(parts[1])
+        banning = parts[0].lower() == "/ban"
+        if self._is_admin(target):
+            await event.reply("مدیران را نمی‌توان مسدود کرد.", buttons=self._admin_menu())
+            return
+        await self.db.ensure_user(target)
+        await self.db.set_banned(target, banning, admin_id=event.sender_id)
+        logger.info(
+            "ban flag changed user=%s banned=%s by=%s", target, banning, event.sender_id
+        )
+        await event.reply(
+            f"🚫 کاربر {target} مسدود شد."
+            if banning
+            else f"✅ مسدودی کاربر {target} برداشته شد.",
             buttons=self._admin_menu(),
         )
 
@@ -2064,25 +2250,37 @@ class GamasBot:
     BROADCAST_BATCH_PROGRESS_EVERY = 100
 
     async def _broadcast(self, event, text: str) -> None:
-        users = await self.db.list_users(limit=100_000)
+        # Ids only: the per-user balance work in list_users is unnecessary and
+        # made a broadcast O(users) round-trips before the first message
+        # (audit F-18).
+        user_ids = await self.db.user_ids()
         pages = render_pages(text)
         sent = 0
-        for idx, user in enumerate(users, 1):
+        for idx, user_id in enumerate(user_ids, 1):
             try:
                 for page in pages:
-                    await self.client.send_message(user["telegram_id"], page)
+                    try:
+                        # render_pages returns Telegram HTML: without the mode
+                        # every tag is shown to every user.
+                        await self.client.send_message(
+                            user_id, page, parse_mode="html"
+                        )
+                    except Exception:
+                        # A page Telegram refuses to parse is still delivered
+                        # as plain text rather than silently dropped.
+                        await self.client.send_message(user_id, page)
                 sent += 1
             except FloodWaitError as exc:
                 logger.warning("broadcast flood wait seconds=%s", exc.seconds)
                 await asyncio.sleep(min(exc.seconds, 60))
             except Exception:
-                logger.debug("broadcast to %s failed", user["telegram_id"])
+                logger.debug("broadcast to %s failed", user_id)
             # Throttle to avoid hammering Telegram and blocking the event loop
             # (audit F-M02). Also yields to other handlers.
             await asyncio.sleep(self.BROADCAST_THROTTLE_SECONDS)
             # Periodic progress log for long broadcasts (visibility, audit)
             if idx % self.BROADCAST_BATCH_PROGRESS_EVERY == 0:
-                logger.info("broadcast progress sent=%d/%d", sent, len(users))
+                logger.info("broadcast progress sent=%d/%d", sent, len(user_ids))
         await self.db.audit(event.sender_id, "broadcast", f"text:{len(text)} users:{sent}")
         await event.reply(
             f"📣 پیام به {to_persian_digits(sent)} کاربر رسید.",
@@ -2094,8 +2292,11 @@ class GamasBot:
         """Delete reviewed receipts after the retention window."""
         while True:
             try:
-                await asyncio.sleep(24 * 3600)
+                # Sweep first: a bot that restarts at least daily would
+                # otherwise reset the 24-hour timer forever and never delete
+                # an expired receipt (audit F-08).
                 await self._cleanup_expired_receipts()
+                await asyncio.sleep(24 * 3600)
             except asyncio.CancelledError:
                 raise
             except Exception:

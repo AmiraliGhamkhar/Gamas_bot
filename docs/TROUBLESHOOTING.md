@@ -76,7 +76,9 @@ STT exhausted every eligible provider (2 attempted/skipped): …
 * **Deepgram** needs `DEEPGRAM_MODEL=nova-3` (`nova-3-general` also works).
   Nova-2 has no Persian pack and rejects `language=fa`.
 * **Speechmatics** `enhanced`/`standard` accept `fa` directly; `melia-1`/`oak-1`
-  need `STT_LANGUAGE=multi` and reject `auto`.
+  always use the multilingual pack — `STT_LANGUAGE=multi` is the clearest
+  setting, and `auto` is mapped to `multi` for those models rather than
+  producing a configuration error.
 * **OpenAI-compatible** gateways need a model that supports the language.
   `verbose_json` is retried once as `json` when a gateway refuses it.
 

@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import io
 import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest import mock
 
@@ -44,6 +46,7 @@ from gamas_bot.presentations import (
     SlideText,
     _extract_slide_text_from_xml,
     _extract_slide_text_with_pptx,
+    _validate_archive,
     align_narration_to_slides,
     prepare_audio,
     read_presentation,
@@ -396,6 +399,18 @@ class PresentationTests(MediaTempCase):
         self.assertIn("یادداشت گوینده: توضیح تکمیلی گوینده", outline)
 
 
+class ArchiveValidationTests(MediaTempCase):
+    def test_part_names_with_control_characters_are_rejected(self):
+        """A newline in an entry name would let a deck forge log lines (F-19)."""
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("ppt/slides/slide1.xml\nFAKE", "x")
+        buffer.seek(0)
+        with zipfile.ZipFile(buffer) as archive:
+            with self.assertRaises(PresentationError):
+                _validate_archive(archive, self.settings)
+
+
 class PresentationAlignmentTests(MediaTempCase):
     def prepared(self) -> PreparedAudio:
         clips = (
@@ -457,6 +472,26 @@ class PresentationAlignmentTests(MediaTempCase):
         )
         self.assertFalse(aligned.aligned)
         self.assertEqual(aligned.as_text(), "")
+
+    def test_a_word_that_spills_past_the_last_clip_stays_with_it(self):
+        """The passthrough span ends at the probed duration; MP3 padding jitters."""
+        clips = (
+            MediaClip(1, 1, "ppt/media/one.wav", self.tmp / "one.wav", "audio", 1.0),
+        )
+        prepared = PreparedAudio(
+            path=self.tmp / "one.wav",
+            clips=clips,
+            source_duration=1.0,
+            output_duration=1.0,
+            clip_spans=(ClipSpan(clips[0], 0.0, 1.0),),
+            merged=False,
+        )
+        raw = RawTranscript(
+            words=[Word("پایان", 0.9, 1.03)], text="پایان", engine="test"
+        )
+        aligned = align_narration_to_slides(raw, prepared, (SlideText(1),))
+        self.assertTrue(aligned.aligned)
+        self.assertEqual(aligned.slide_text, ((1, "پایان"),))
 
     def test_boundary_jittered_word_stays_with_its_slide_clip(self):
         raw = RawTranscript(

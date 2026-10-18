@@ -4,6 +4,74 @@ Entries describe user- and operator-visible change. For anything older than
 v3.0.0, read the git history — the v2 provider platform those entries describe
 no longer exists in the code.
 
+## Unreleased — 2026-10-18 — audit fixes: money path, recovery, fidelity
+
+Fixes for the 2026-10-18 audit of `edc5b2c` (`AUDIT_2026-10-18_edc5b2c.md`).
+
+### Billing
+
+* **A payment now carries its purchase terms.** `payments` snapshots
+  `purchased_seconds`, `purchased_price` and `purchased_validity_days` when the
+  request is created (migration `v3/003`), and approval credits that snapshot.
+  Deactivating, deleting or re-pricing a plan between purchase and review can no
+  longer approve a payment for zero seconds. An approval whose snapshot is
+  missing is refused instead of reported as success, and the admin revenue figure
+  sums what users were quoted.
+* **One open request per user** is enforced by a partial unique index, and a
+  second tap on the same plan reuses the existing row.
+* **Rejections require a reason**, which is stored on the payment and in the
+  audit entry; the audit row now commits in the same transaction as the status
+  change.
+* **`release_hold` takes the database write lock.** It could previously commit
+  another coroutine's pending ledger insert, which could make a debit durable
+  while its hold stayed open.
+* **The free plan is granted atomically**, so concurrent `/start` handlers can
+  no longer both grant it.
+
+### Recovery, retention, storage
+
+* Stale `submission-*` / `deck-*` / `office-*` work directories are removed at
+  startup, as MEDIA.md always claimed.
+* Receipt retention sweeps once at startup and then daily, so a bot that
+  restarts at least daily still enforces `RECEIPT_RETENTION_DAYS`.
+* `Database.connect` forces `0600` on the database and its WAL sidecars, and the
+  importer does the same, independent of the entry point's umask.
+* The bot creates `TEMP_DIR` and `RECEIPT_DIR` with `0700` at startup.
+
+### Correctness and safety
+
+* A file whose duration cannot be measured is refused before transcription
+  instead of being reserved at 600 s and settled at 0.
+* Audio extraction always receives a byte budget, so an unmeasurable duration
+  cannot expand into an unbounded PCM WAV.
+* Excel keeps zero-padded identifiers (`007`, `09123456789`) as text; only
+  plain numbers become numeric.
+* A Free Office heading with no body becomes a slide instead of disappearing,
+  and a slide-cap truncation is logged.
+* Office text uploads are size-checked before download, closing the one intake
+  path that bypassed the queue's back-pressure.
+* The raw-text fallback pages up to 40 messages instead of 4.
+* A failed note chunk cancels its siblings instead of leaving provider requests
+  running after the job failed.
+* Broadcasts pass `parse_mode="html"` (falling back to plain text per page) and
+  read ids only, instead of loading every user's balance first.
+* The banned flag is enforced on messages and callbacks, with audited `/ban` and
+  `/unban`; admins can no longer grant credit to another admin.
+* Deck entry names containing control characters are rejected, and deck part
+  names are single-lined before logging.
+* The receipt image signature is re-checked before an admin views it.
+* The v2 importer's balance verification uses the same predicate as the ledger
+  replay (active, not expired) and ignores the deliberate century credit for
+  unlimited users, so ordinary v2 databases import again.
+
+### Documentation
+
+`SECURITY.md`, `BILLING.md`, `ARCHITECTURE.md`, `OFFICE.md`, `MEDIA.md`,
+`TESTING.md`, `STT_PROVIDERS.md` and `TROUBLESHOOTING.md` now describe what the
+code does (including the Speechmatics `auto` → `multi` mapping and the
+normalisation the Office section performs). `__version__` matches
+`pyproject.toml`.
+
 ## Unreleased — 2026-10-17 — every slide word reaches the note model
 
 A deck's own words are the first input of the booklet prompt. Three paths

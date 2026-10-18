@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
 
 from gamas_bot.billing import plan_catalog
-from gamas_bot.db import Database, InsufficientBalanceError
+from gamas_bot.db import (
+    Database,
+    InsufficientBalanceError,
+    OpenPaymentError,
+    PaymentSnapshotError,
+)
 
 
 class DatabaseTestCase(unittest.IsolatedAsyncioTestCase):
@@ -216,32 +223,121 @@ class UnlimitedUserTests(DatabaseTestCase):
 
 class PaymentTests(DatabaseTestCase):
     async def test_approve_payment_credits_once(self):
-        await self.db.sync_plans([
-            {"code": "paid_5h_30d", "hours": 5, "price": 50000, "validity_days": 30},
-        ])
         payment = await self.db.create_payment(100, "paid_5h_30d")
-        self.assertTrue(await self.db.review_payment(
-            payment, True, 1, plan_hours=5, plan_validity_days=30
-        ))
+        self.assertTrue(await self.db.review_payment(payment, True, 1))
         self.assertEqual(await self.db.available_seconds(100), 5 * 3600)
         # A second review is rejected (exactly-once).
-        self.assertFalse(await self.db.review_payment(
-            payment, True, 1, plan_hours=5, plan_validity_days=30
-        ))
+        self.assertFalse(await self.db.review_payment(payment, True, 1))
         self.assertEqual(await self.db.available_seconds(100), 5 * 3600)
 
     async def test_reject_payment_credits_nothing(self):
         payment = await self.db.create_payment(100, "paid_5h_30d")
         self.assertTrue(await self.db.review_payment(
-            payment, False, 1, plan_hours=5, plan_validity_days=30
+            payment, False, 1, reason="رسید ناخوانا"
         ))
         self.assertEqual(await self.db.available_seconds(100), 0)
+
+    async def test_reject_requires_a_reason(self):
+        payment = await self.db.create_payment(100, "paid_5h_30d")
+        with self.assertRaises(ValueError):
+            await self.db.review_payment(payment, False, 1)
+        # Nothing was written.
+        row = await self.db.payment(payment)
+        assert row is not None
+        self.assertEqual(row["status"], "pending")
+
+    async def test_approval_uses_the_purchase_snapshot(self):
+        """Deactivating or re-pricing the plan cannot change the credit (F-02/F-14)."""
+        payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.db.execute("UPDATE plans SET active = 0, hours = 1 WHERE code = ?",
+                                 ("paid_5h_30d",))
+        await self.db.db.commit()
+        self.assertTrue(await self.db.review_payment(payment, True, 1))
+        self.assertEqual(await self.db.available_seconds(100), 5 * 3600)
+        row = await self.db.payment(payment)
+        assert row is not None
+        self.assertEqual(row["purchased_seconds"], 5 * 3600)
+
+    async def test_approval_without_snapshot_is_refused(self):
+        payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.db.execute(
+            "UPDATE payments SET purchased_seconds = NULL WHERE payment_id = ?",
+            (payment,),
+        )
+        await self.db.db.commit()
+        with self.assertRaises(PaymentSnapshotError):
+            await self.db.review_payment(payment, True, 1)
+        row = await self.db.payment(payment)
+        assert row is not None
+        self.assertEqual(row["status"], "pending")
+        self.assertEqual(await self.db.available_seconds(100), 0)
+
+    async def test_second_tap_reuses_the_open_request(self):
+        first = await self.db.create_payment(100, "paid_5h_30d")
+        second = await self.db.create_payment(100, "paid_5h_30d")
+        self.assertEqual(first, second)
+        self.assertEqual(len(await self.db.pending_payments()), 1)
+
+    async def test_a_second_plan_is_refused_while_one_is_open(self):
+        await self.db.sync_plans([
+            {"code": "paid_10h_30d", "hours": 10, "price": 75000, "validity_days": 30},
+        ])
+        await self.db.create_payment(100, "paid_5h_30d")
+        with self.assertRaises(OpenPaymentError):
+            await self.db.create_payment(100, "paid_10h_30d")
+
+    async def test_review_and_audit_commit_together(self):
+        payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.review_payment(payment, True, 7)
+        audit = await self.db.recent_audit(limit=1)
+        self.assertEqual(audit[0]["action"], "payment_approved")
+        self.assertEqual(audit[0]["admin_id"], 7)
+        self.assertEqual(audit[0]["subject_user"], 100)
+
+    async def test_revenue_uses_the_purchase_price(self):
+        payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.review_payment(payment, True, 1)
+        await self.db.sync_plans([
+            {"code": "paid_5h_30d", "hours": 5, "price": 90000, "validity_days": 30},
+        ])
+        stats = await self.db.stats()
+        self.assertEqual(stats["toman_approved"], 50000)
 
     async def test_pending_payments_listing(self):
         await self.db.create_payment(100, "paid_5h_30d")
         pending = await self.db.pending_payments()
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0]["user_id"], 100)
+        self.assertEqual(pending[0]["purchased_seconds"], 5 * 3600)
+
+
+class AtomicityTests(DatabaseTestCase):
+    async def test_concurrent_free_grants_grant_once(self):
+        results = await asyncio.gather(
+            *(self.db.grant_free_plan_once(100, 3600) for _ in range(10))
+        )
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(await self.db.available_seconds(100), 3600)
+
+    async def test_release_hold_takes_the_write_lock(self):
+        await self.grant(100, 3600)
+        submission = await self.db.create_submission(100, "audio", "a.mp3")
+        await self.db.reserve(100, submission, 3600)
+        async with self.db._write_lock:
+            task = asyncio.create_task(self.db.release_hold(submission, "test"))
+            await asyncio.sleep(0.05)
+            self.assertFalse(task.done(), "release_hold must wait for the lock")
+        self.assertTrue(await task)
+        self.assertEqual(await self.db.available_seconds(100), 3600)
+
+    async def test_database_file_is_owner_only(self):
+        await self.grant(100, 3600)
+        mode = stat.S_IMODE(os.stat(self.path).st_mode)
+        self.assertEqual(mode, 0o600)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{self.path}{suffix}")
+            if sidecar.exists():
+                self.assertEqual(stat.S_IMODE(os.stat(sidecar).st_mode), 0o600)
 
 
 class PlanTests(DatabaseTestCase):

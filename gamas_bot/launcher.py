@@ -54,9 +54,11 @@ def ensure_running(*, min_interval: float = MIN_SPAWN_INTERVAL_SECONDS) -> str:
             return THROTTLED
     except FileNotFoundError:
         pass
-    # TOCTOU fix (audit F-H03): re-check the instance lock after the throttle
-    # gate, immediately before spawning. Two concurrent watchdogs that both
-    # passed the stale stamp window will now serialize on the same lock check.
+    # Re-check the instance lock after the throttle gate, immediately before
+    # spawning. ``is_locked`` is a probe, not a held lock: two watchdogs can
+    # still both pass it and both spawn, and the authoritative single-instance
+    # guarantee is the bot's own flock on the session path (instance_lock.py),
+    # which makes the second process exit without polling Telegram.
     if is_locked(settings.session_path.with_suffix(".lock")):
         return RUNNING
     try:

@@ -263,7 +263,7 @@ def _relationships(archive: zipfile.ZipFile, part_name: str) -> list[tuple[str, 
     try:
         root = _parse_xml(payload)
     except etree.XMLSyntaxError:
-        logger.warning("Malformed relationship part: %s", part_name)
+        logger.warning("Malformed relationship part: %s", _safe_log_name(part_name))
         return []
     result = []
     for element in root.findall(f"{{{RELS_NS}}}Relationship"):
@@ -320,6 +320,12 @@ def natural_key(name: str) -> tuple:
     )
 
 
+def _safe_log_name(name: object, *, limit: int = 200) -> str:
+    """A deck-controlled part name that is safe to put on one log line."""
+    text = " ".join(str(name).split())
+    return text[:limit] + ("…" if len(text) > limit else "")
+
+
 def _safe_media_filename(order: int, part_name: str) -> str:
     base = posixpath.basename(part_name) or "media"
     cleaned = re.sub(r"[^A-Za-z0-9._-]", "_", base)[-64:].lstrip(".") or "media"
@@ -343,6 +349,10 @@ def _validate_archive(archive: zipfile.ZipFile, settings: Settings) -> None:
             raise PresentationError("فایل ارائه شامل مسیر نامعتبر است و پردازش نشد.")
         if _is_zip_symlink(info):
             raise PresentationError("فایل ارائه شامل پیوند نمادین است و پردازش نشد.")
+        # Control characters would let a crafted part name forge extra lines
+        # in the line-oriented log (audit F-19).
+        if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
+            raise PresentationError("فایل ارائه شامل نام بخش نامعتبر است و پردازش نشد.")
         total += info.file_size
         if total > settings.presentation_max_unpacked_bytes:
             raise PresentationError("حجم بازشدهٔ فایل ارائه از حد مجاز بیشتر است.")
@@ -576,7 +586,7 @@ def _diagram_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
     try:
         root = _parse_xml(payload)
     except etree.XMLSyntaxError:
-        logger.warning("Malformed diagram part: %s", part_name)
+        logger.warning("Malformed diagram part: %s", _safe_log_name(part_name))
         return []
     lines: list[str] = []
     for point in root.iter(f"{{{DIAGRAM_NS}}}pt"):
@@ -600,7 +610,7 @@ def _chart_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
     try:
         root = _parse_xml(payload)
     except etree.XMLSyntaxError:
-        logger.warning("Malformed chart part: %s", part_name)
+        logger.warning("Malformed chart part: %s", _safe_log_name(part_name))
         return []
     lines: list[str] = []
     for chart in root.iter(f"{{{CHART_NS}}}chart"):
@@ -730,7 +740,7 @@ def _notes_text_from_xml(archive: zipfile.ZipFile, slide_part: str) -> str:
     try:
         root = _parse_xml(payload)
     except etree.XMLSyntaxError:
-        logger.warning("Malformed notes part: %s", notes_part)
+        logger.warning("Malformed notes part: %s", _safe_log_name(notes_part))
         return ""
     tree = root.find(f"{{{PML_NS}}}cSld/{{{PML_NS}}}spTree")
     if tree is None:
@@ -753,7 +763,7 @@ def _slide_text_from_xml(
     try:
         root = _parse_xml(payload)
     except etree.XMLSyntaxError:
-        logger.warning("Malformed slide part: %s", slide_part)
+        logger.warning("Malformed slide part: %s", _safe_log_name(slide_part))
         return SlideText(number)
     tree = root.find(f"{{{PML_NS}}}cSld/{{{PML_NS}}}spTree")
     entries = _shape_tree_lines(tree) if tree is not None else []

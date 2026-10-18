@@ -3,8 +3,8 @@
 The canonical runtime dependency list lives in ``[project].dependencies`` of
 ``pyproject.toml``. Deployment (cPanel/Passenger) and CI install from
 ``requirements.txt``, so the two must never drift: this script rewrites the
-deployment file from the canonical one, and
-``tests/test_dependency_consistency.py`` fails when it is stale.
+deployment file from the canonical one; ``--check`` exits non-zero when it is
+stale, which is the CI gate.
 
 Usage::
 

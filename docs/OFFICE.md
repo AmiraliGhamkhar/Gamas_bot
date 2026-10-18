@@ -76,8 +76,10 @@ is shaped with `arabic-reshaper` and reordered for storage with `python-bidi`,
 set in the bundled Vazirmatn face (SIL OFL, `assets/fonts/`); wrapping happens
 on the logical text and only the finished lines are shaped. The canvas is
 `invariant`, so identical text always produces identical bytes. Like the other
-formats it never calls a model: the words that reach the PDF are exactly the
-words the user sent.
+formats it never calls a model: the words that reach the PDF are the user's
+words. The only textual changes are typographic — Arabic letter forms are
+folded to Persian, repeated whitespace collapses, and a horizontal rule line is
+not carried into the document. Nothing else is added, removed or reordered.
 
 ## The model layer is optional
 
@@ -111,6 +113,11 @@ section therefore works on a deployment with no model at all.
 
 * The section does not read **uploads of documents**: a `.docx` or a `.pdf` is
   not a source. Only text and text files are.
-* The section does not **rewrite** the user's text. That is the whole point.
+* The section does not **rewrite** the user's text. It normalises letter forms
+  and whitespace and does not carry `---` rule lines; if a cap truncates a deck
+  the event is logged. Nothing is reworded or summarised.
+* A cell that is only an ASCII number becomes a real number so it can be summed,
+  **unless** it is zero-padded (`007`, `09123456789`) or longer than 15 digits —
+  coercion there would change what the cell says, so it stays text.
 * The section does not **cost credit**, so it is not a way around the balance:
   it is a separate, free feature, and the lecture pipeline is unchanged.

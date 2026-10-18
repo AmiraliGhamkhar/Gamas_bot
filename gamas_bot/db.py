@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -53,6 +55,22 @@ class InsufficientBalanceError(RuntimeError):
         super().__init__(
             f"required={self.required_seconds}s available={self.available_seconds}s"
         )
+
+
+class PaymentSnapshotError(RuntimeError):
+    """An approval that would credit nothing because the snapshot is missing."""
+
+    def __init__(self, payment_id: int):
+        self.payment_id = int(payment_id)
+        super().__init__(f"payment {payment_id} has no purchase snapshot")
+
+
+class OpenPaymentError(RuntimeError):
+    """The user already has an open request for a different plan."""
+
+    def __init__(self, plan_code: str):
+        self.plan_code = plan_code
+        super().__init__(f"an open payment already exists for plan {plan_code}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +116,22 @@ class Database:
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._apply_migrations()
         await self._db.commit()
+        self._secure_file_permissions()
+
+    def _secure_file_permissions(self) -> None:
+        """Best-effort ``0600`` on the database file and its WAL sidecars.
+
+        ``__main__`` sets ``umask(077)``, but the importer, maintenance scripts
+        and tests do not go through it; the file mode is the guarantee
+        ``docs/SECURITY.md`` makes, so it is enforced here (audit F-12).
+        """
+        for suffix in ("", "-wal", "-shm"):
+            candidate = Path(f"{self.path}{suffix}")
+            try:
+                if candidate.exists():
+                    os.chmod(candidate, 0o600)
+            except OSError:
+                logger.warning("could not restrict permissions on %s", candidate)
 
     async def close(self) -> None:
         if self._db is not None:
@@ -119,34 +153,37 @@ class Database:
             if path.name in applied:
                 continue
             logger.info("Applying migration %s", path.name)
-            # Audit verification gap 7: make 002_special_users idempotent against
-            # crash-retry (SQLite lacks ADD COLUMN IF NOT EXISTS).
+            # SQLite lacks ADD COLUMN IF NOT EXISTS and executescript is not
+            # transactional, so a crash midway through a migration must be safe
+            # to retry (audit verification gap 7).
             raw_sql = path.read_text(encoding="utf-8")
-            if path.name == "002_special_users.sql":
-                try:
-                    cols = await self.db.execute_fetchall("PRAGMA table_info(users)")
-                    existing = {row[1] for row in cols}
-                    stmts: list[str] = []
-                    for line in raw_sql.splitlines():
-                        stripped = line.strip()
-                        if stripped.upper().startswith("ALTER TABLE USERS ADD COLUMN"):
-                            try:
-                                after = stripped.split("ADD COLUMN", 1)[1].strip()
-                                col = after.split()[0].strip('"\'`')
-                                if col in existing:
-                                    continue
-                            except Exception:
-                                pass
-                        stmts.append(line)
-                    raw_sql = "\n".join(stmts)
-                except Exception:
-                    pass
+            raw_sql = await self._without_applied_columns(raw_sql)
             await self.db.executescript(raw_sql)
             await self.db.execute(
                 "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
                 (path.name, iso(utc_now())),
             )
         await self.db.commit()
+
+    async def _without_applied_columns(self, raw_sql: str) -> str:
+        """Drop ``ADD COLUMN`` statements whose column already exists."""
+        pattern = re.compile(
+            r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
+            r"[\"'`]?([A-Za-z_][A-Za-z0-9_]*)[\"'`]?"
+        )
+        known: dict[str, set[str]] = {}
+        kept: list[str] = []
+        for line in raw_sql.splitlines():
+            match = pattern.match(line)
+            if match:
+                table, column = match.group(1), match.group(2)
+                if table not in known:
+                    rows = await self.db.execute_fetchall(f"PRAGMA table_info({table})")
+                    known[table] = {row[1] for row in rows}
+                if column in known[table]:
+                    continue
+            kept.append(line)
+        return "\n".join(kept)
 
     # ------------------------------------------------------------------ write
     async def _write(self, sql: str, params: tuple = ()) -> None:
@@ -174,10 +211,32 @@ class Database:
             raise RuntimeError(f"user {telegram_id} vanished after insert")
         return UserRow(row[0][0], row[0][1], bool(row[0][2]))
 
-    async def set_banned(self, telegram_id: int, banned: bool) -> None:
+    async def set_banned(
+        self, telegram_id: int, banned: bool, *, admin_id: int | None = None
+    ) -> None:
         await self._write(
             "UPDATE users SET banned = ? WHERE telegram_id = ?", (1 if banned else 0, telegram_id)
         )
+        if admin_id is not None:
+            await self.audit(
+                admin_id,
+                "user_banned" if banned else "user_unbanned",
+                "ban flag changed",
+                telegram_id,
+            )
+
+    async def is_banned(self, telegram_id: int) -> bool:
+        rows = await self.db.execute_fetchall(
+            "SELECT banned FROM users WHERE telegram_id = ?", (telegram_id,)
+        )
+        return bool(rows and rows[0][0])
+
+    async def user_ids(self) -> list[int]:
+        """Every user id, without the per-row balance work of ``list_users``."""
+        rows = await self.db.execute_fetchall(
+            "SELECT telegram_id FROM users ORDER BY telegram_id"
+        )
+        return [int(row[0]) for row in rows]
 
     async def list_users(self, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
         rows = await self.db.execute_fetchall(
@@ -336,9 +395,12 @@ class Database:
         seconds = await self.db.execute_fetchall(
             "SELECT COALESCE(SUM(duration_seconds), 0) FROM submissions WHERE status = 'done'"
         )
+        # Revenue is the sum of what each user was actually quoted at purchase,
+        # never the plan's current price (audit F-14).
         revenue = await self.db.execute_fetchall(
-            "SELECT COALESCE(SUM(pl.price), 0) FROM payments p "
-            "JOIN plans pl ON pl.code = p.plan_code WHERE p.status = 'approved'"
+            "SELECT COALESCE(SUM(COALESCE(p.purchased_price, "
+            "  (SELECT price FROM plans pl WHERE pl.code = p.plan_code), 0)), 0) "
+            "FROM payments p WHERE p.status = 'approved'"
         )
         return {
             "users": users,
@@ -396,18 +458,23 @@ class Database:
         return max(0, int(rows[0][0])) if rows else 0
 
     async def grant_free_plan_once(self, user_id: int, seconds: int) -> bool:
-        """Grant the free plan the first time a user is seen."""
-        existing = await self.db.execute_fetchall(
-            "SELECT 1 FROM ledger WHERE user_id = ? AND note = 'free_plan'", (user_id,)
-        )
-        if existing:
-            return False
-        await self._write(
-            "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
-            "VALUES (?, ?, 'credit', 'free_plan', ?)",
-            (user_id, seconds, iso(utc_now())),
-        )
-        return True
+        """Grant the free plan the first time a user is seen.
+
+        A single statement under the write lock: two concurrent ``/start``
+        handlers can no longer both observe "no grant yet" and insert
+        (audit F-04).
+        """
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
+                "SELECT ?, ?, 'credit', 'free_plan', ? "
+                "WHERE NOT EXISTS ("
+                "  SELECT 1 FROM ledger WHERE user_id = ? AND note = 'free_plan'"
+                ")",
+                (user_id, seconds, iso(utc_now()), user_id),
+            )
+            await self.db.commit()
+            return cursor.rowcount > 0
 
     async def add_credit(
         self,
@@ -511,14 +578,21 @@ class Database:
         )
 
     async def release_hold(self, submission_id: int, reason: str) -> bool:
-        """Release a hold untouched (failure/cancellation path). Exactly once."""
-        cursor = await self.db.execute(
-            "UPDATE holds SET released_at = ?, settled = 0, release_reason = ? "
-            "WHERE submission_id = ? AND released_at IS NULL",
-            (iso(utc_now()), reason[:200], submission_id),
-        )
-        await self.db.commit()
-        return bool(cursor.rowcount)
+        """Release a hold untouched (failure/cancellation path). Exactly once.
+
+        The update takes the write lock like every other write: committing
+        outside it would also commit whatever another coroutine had pending on
+        this shared connection, which can make a debit durable while its hold
+        is still open (audit F-03).
+        """
+        async with self._write_lock:
+            cursor = await self.db.execute(
+                "UPDATE holds SET released_at = ?, settled = 0, release_reason = ? "
+                "WHERE submission_id = ? AND released_at IS NULL",
+                (iso(utc_now()), reason[:200], submission_id),
+            )
+            await self.db.commit()
+            return bool(cursor.rowcount)
 
     async def credit_history(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
         rows = await self.db.execute_fetchall(
@@ -562,11 +636,42 @@ class Database:
 
     # --------------------------------------------------------------- payments
     async def create_payment(self, user_id: int, plan_code: str) -> int:
-        return await self._write_returning(
-            "INSERT INTO payments(user_id, plan_code, status, created_at) "
-            "VALUES (?, ?, 'pending', ?)",
-            (user_id, plan_code, iso(utc_now())),
-        )
+        """Create a payment with the purchase terms frozen onto the row.
+
+        The approval credits this snapshot rather than the live plan row, so a
+        plan deactivated or re-priced between purchase and review cannot change
+        what the user paid for (audit F-02/F-14). A second tap on the same plan
+        returns the existing open request; a different plan is refused because
+        only one request per user may be open (audit F-16).
+        """
+        async with self._write_lock:
+            plan = await self.db.execute_fetchall(
+                "SELECT hours, price, validity_days FROM plans "
+                "WHERE code = ? AND active = 1",
+                (plan_code,),
+            )
+            if not plan:
+                raise ValueError(f"plan {plan_code} is not on sale")
+            hours, price, validity_days = plan[0]
+            seconds = int(round(float(hours) * 3600))
+            open_rows = await self.db.execute_fetchall(
+                "SELECT payment_id, plan_code FROM payments "
+                "WHERE user_id = ? AND status = 'pending' "
+                "ORDER BY payment_id LIMIT 1",
+                (user_id,),
+            )
+            if open_rows:
+                if str(open_rows[0][1]) == plan_code:
+                    return int(open_rows[0][0])
+                raise OpenPaymentError(str(open_rows[0][1]))
+            cursor = await self.db.execute(
+                "INSERT INTO payments(user_id, plan_code, status, created_at, "
+                "purchased_seconds, purchased_price, purchased_validity_days) "
+                "VALUES (?, ?, 'pending', ?, ?, ?, ?)",
+                (user_id, plan_code, iso(utc_now()), seconds, int(price), validity_days),
+            )
+            await self.db.commit()
+            return int(cursor.lastrowid or 0)
 
     async def set_payment_receipt(self, payment_id: int, receipt_path: str) -> None:
         await self._write(
@@ -574,18 +679,22 @@ class Database:
             (receipt_path, payment_id),
         )
 
+    _PAYMENT_COLUMNS = (
+        "payment_id, user_id, plan_code, status, receipt_path, created_at, "
+        "reviewed_at, reviewed_by, purchased_seconds, purchased_price, "
+        "purchased_validity_days, review_reason"
+    )
+
     async def payment(self, payment_id: int) -> dict[str, Any] | None:
         rows = await self.db.execute_fetchall(
-            "SELECT payment_id, user_id, plan_code, status, receipt_path, created_at, "
-            "reviewed_at, reviewed_by FROM payments WHERE payment_id = ?",
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE payment_id = ?",
             (payment_id,),
         )
         return dict(rows[0]) if rows else None
 
     async def pending_payments(self) -> list[dict[str, Any]]:
         rows = await self.db.execute_fetchall(
-            "SELECT payment_id, user_id, plan_code, status, receipt_path, created_at, "
-            "reviewed_at, reviewed_by FROM payments WHERE status = 'pending' "
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status = 'pending' "
             "ORDER BY payment_id"
         )
         return [dict(row) for row in rows]
@@ -596,29 +705,46 @@ class Database:
         approved: bool,
         admin_id: int,
         *,
-        plan_hours: float,
-        plan_validity_days: int | None,
+        reason: str = "",
     ) -> bool:
-        """Approve (and credit) or reject a payment. Exactly once."""
+        """Approve (crediting the purchase snapshot) or reject. Exactly once.
+
+        The audit row is written in the same transaction as the status change:
+        an approved payment can never exist without its audit entry, and a
+        rejection always carries the admin's reason (audit F-15).
+        """
+        if not approved and not reason.strip():
+            raise ValueError("rejecting a payment requires a reason")
         async with self._write_lock:
             rows = await self.db.execute_fetchall(
-                "SELECT status, user_id, plan_code FROM payments WHERE payment_id = ?",
+                "SELECT status, user_id, plan_code, purchased_seconds, "
+                "purchased_validity_days FROM payments WHERE payment_id = ?",
                 (payment_id,),
             )
             if not rows or rows[0][0] != "pending":
                 return False
             user_id, plan_code = int(rows[0][1]), str(rows[0][2])
+            seconds = int(rows[0][3] or 0)
+            validity_days = rows[0][4]
+            if approved and seconds <= 0:
+                # Never report success while crediting nothing.
+                raise PaymentSnapshotError(payment_id)
             now = iso(utc_now())
             await self.db.execute(
-                "UPDATE payments SET status = ?, reviewed_at = ?, reviewed_by = ? "
-                "WHERE payment_id = ?",
-                ("approved" if approved else "rejected", now, admin_id, payment_id),
+                "UPDATE payments SET status = ?, reviewed_at = ?, reviewed_by = ?, "
+                "review_reason = ? WHERE payment_id = ?",
+                (
+                    "approved" if approved else "rejected",
+                    now,
+                    admin_id,
+                    reason.strip()[:400] or None,
+                    payment_id,
+                ),
             )
             if approved:
-                seconds = int(round(plan_hours * 3600))
                 expires = (
-                    iso(utc_now() + timedelta(days=plan_validity_days))
-                    if plan_validity_days
+                    iso(utc_now() + timedelta(days=int(validity_days)))
+                    if validity_days
                     else None
                 )
                 await self.db.execute(
@@ -626,13 +752,19 @@ class Database:
                     "VALUES (?, ?, 'credit', ?, ?, ?)",
                     (user_id, seconds, f"plan:{plan_code}", expires, now),
                 )
+            await self.db.execute(
+                "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    admin_id,
+                    "payment_approved" if approved else "payment_rejected",
+                    f"payment:{payment_id} plan:{plan_code}"
+                    + (f" reason:{reason.strip()[:200]}" if reason.strip() else ""),
+                    user_id,
+                    now,
+                ),
+            )
             await self.db.commit()
-        await self.audit(
-            admin_id,
-            "payment_approved" if approved else "payment_rejected",
-            f"payment:{payment_id} plan:{plan_code}",
-            user_id,
-        )
         return True
 
     async def payment_history(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
