@@ -223,6 +223,42 @@ class NoteProviderOrderTests(unittest.TestCase):
         # The model default follows the classified provider, not the generic one.
         self.assertEqual(routes[0].model, "agnes-2.5-flash")
 
+    def test_bearer_prefix_and_endpoint_suffix_are_normalized(self):
+        settings = self.settings(
+            NARA_API_KEY="Bearer sk-nry-test",
+            NARA_BASE_URL="https://router.bynara.web.id/v1/chat/completions",
+            OPENROUTER_API_KEY="bearer sk-or-v1-test",
+            OPENROUTER_BASE_URL="https://openrouter.ai",
+            GEMINI_API_KEY="Bearer AIzaSyTestKey1234567890",
+            NOTE_PROVIDERS="nara,openrouter,gemini",
+        )
+        routes = note_routes(settings)
+        self.assertEqual([r.slug for r in routes], ["nara", "openrouter", "gemini"])
+        self.assertEqual(routes[0].api_key, "sk-nry-test")
+        self.assertEqual(routes[0].base_url, "https://router.bynara.web.id/v1")
+        self.assertEqual(routes[1].api_key, "sk-or-v1-test")
+        self.assertEqual(routes[1].base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(routes[2].api_key, "AIzaSyTestKey1234567890")
+        self.assertEqual(routes[2].base_url, "https://generativelanguage.googleapis.com/v1beta")
+
+    def test_google_ai_studio_native_vs_openai_compat_classification(self):
+        native = self.settings(
+            NOTE_API_KEY="g-key",
+            NOTE_BASE_URL="https://generativelanguage.googleapis.com/v1beta/models",
+        )
+        self.assertEqual(native.note_provider, "gemini")
+        self.assertEqual(native.note_api_base_url, "https://generativelanguage.googleapis.com/v1beta")
+
+        compat = self.settings(
+            NOTE_API_KEY="g-key",
+            NOTE_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai",
+        )
+        self.assertEqual(compat.note_provider, "openai_compatible")
+        self.assertEqual(
+            compat.note_api_base_url,
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        )
+
     def test_an_explicit_gateway_is_tried_after_the_chain(self):
         settings = self.settings(
             NARA_API_KEY="n",
