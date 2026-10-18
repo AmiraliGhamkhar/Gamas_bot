@@ -241,7 +241,14 @@ class FakeSession:
         self.calls: list[dict] = []
 
     def post(self, url, **kwargs):
-        self.calls.append({"url": url, **kwargs})
+        self.calls.append({"method": "POST", "url": url, **kwargs})
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return _AsyncCM(response)
+
+    def get(self, url, **kwargs):
+        self.calls.append({"method": "GET", "url": url, **kwargs})
         response = self.responses.pop(0)
         if isinstance(response, BaseException):
             raise response
@@ -699,6 +706,362 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LLMAuthError):
             await complete(session, settings, system="S", user="U")
         self.assertEqual(session.calls, [])
+
+
+class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
+    """Hardened GET/POST contracts for NaraRouter, OpenRouter and Gemini."""
+
+    def test_get_request_building_across_providers(self):
+        settings = make_settings(
+            note_providers=("nara", "openrouter", "gemini"),
+            note_provider="",
+            note_api_key="",
+            note_api_base_url="",
+            nara_api_key="Bearer sk-nry-123",
+            openrouter_api_key="sk-or-v1-456",
+            gemini_api_key="AIzaSyGem789",
+        )
+        nara, openrouter, gemini = note_routes(settings)
+
+        # NaraRouter GET /v1/models and public GET /api/plans
+        nara_models_url, nara_headers = llm._build_get_request_for(nara, "models")
+        self.assertEqual(nara_models_url, "https://router.bynara.id/v1/models")
+        self.assertEqual(nara_headers, {"Authorization": "Bearer sk-nry-123"})
+
+        nara_plans_url, nara_plans_headers = llm._build_get_request_for(nara, "plans")
+        self.assertEqual(nara_plans_url, "https://router.bynara.id/api/plans")
+        self.assertEqual(nara_plans_headers, {})
+
+        # OpenRouter GET /api/v1/models/<author>/<slug>/endpoints and /api/v1/key
+        or_ep_url, or_headers = llm._build_get_request_for(openrouter, "model_endpoints")
+        self.assertEqual(
+            or_ep_url,
+            "https://openrouter.ai/api/v1/models/google/gemma-4-31b-it:free/endpoints",
+        )
+        self.assertEqual(or_headers, {"Authorization": "Bearer sk-or-v1-456"})
+
+        or_key_url, _ = llm._build_get_request_for(openrouter, "key")
+        self.assertEqual(or_key_url, "https://openrouter.ai/api/v1/key")
+
+        # Gemini GET /v1beta/models/<model> and GET /v1beta/models
+        gem_model_url, gem_headers = llm._build_get_request_for(gemini, "model")
+        self.assertEqual(
+            gem_model_url,
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash",
+        )
+        self.assertEqual(gem_headers, {"x-goog-api-key": "AIzaSyGem789"})
+
+        gem_list_url, _ = llm._build_get_request_for(gemini, "models")
+        self.assertEqual(
+            gem_list_url,
+            "https://generativelanguage.googleapis.com/v1beta/models",
+        )
+
+    async def test_get_json_retries_transient_failure_and_parses_payload(self):
+        settings = routed_settings()
+        nara = note_routes(settings)[0]
+        session = FakeSession([
+            FakeResponse(503, {"error": {"type": "service_unavailable", "message": "busy"}}),
+            FakeResponse(200, {"data": [{"id": "agnes-2.5-flash"}]}),
+        ])
+        with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
+            payload = await llm.get_json(session, nara, "models")
+        self.assertEqual(payload["data"][0]["id"], "agnes-2.5-flash")
+        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(session.calls[0]["method"], "GET")
+        self.assertEqual(session.calls[0]["url"], "https://router.bynara.id/v1/models")
+
+    async def test_openrouter_http_200_top_level_in_body_error_is_classified(self):
+        """OpenRouter can send 200 OK headers then return a top-level error object."""
+        session = FakeSession([
+            FakeResponse(200, {
+                "error": {
+                    "code": 503,
+                    "message": "Provider returned error",
+                    "metadata": {
+                        "error_type": "provider_overloaded",
+                        "raw": '{"error": {"message": "Upstream capacity exhausted"}}',
+                    },
+                }
+            }),
+            chat_answer("recovered-from-200-error"),
+        ])
+        with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
+            result = await complete(session, routed_settings(), system="S", user="U")
+        self.assertEqual(result, "recovered-from-200-error")
+        self.assertEqual(len(session.calls), 2)
+
+    async def test_openrouter_http_200_context_overflow_in_body_raises_overflow(self):
+        session = FakeSession([
+            FakeResponse(200, {
+                "error": {
+                    "code": 400,
+                    "message": "Provider returned error",
+                    "metadata": {"error_type": "token_limit_exceeded"},
+                }
+            }),
+            FakeResponse(200, {
+                "error": {
+                    "code": 400,
+                    "message": "Provider returned error",
+                    "metadata": {"error_type": "max_tokens_exceeded"},
+                }
+            }),
+        ])
+        with self.assertRaises(LLMContextOverflowError):
+            await complete(session, routed_settings(), system="S", user="U")
+
+    async def test_openrouter_http_200_choice_finish_reason_error_is_not_accepted(self):
+        """Partial content with finish_reason='error' must never be accepted as valid text."""
+        session = FakeSession([
+            FakeResponse(200, {
+                "choices": [{
+                    "message": {"content": '{"title": "partial broken'},
+                    "finish_reason": "error",
+                    "error": {"code": 502, "message": "Provider disconnected mid-stream"},
+                }]
+            }),
+            chat_answer('{"ok": true}'),
+        ])
+        with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
+            result = await complete_json(session, routed_settings(), system="S", user="U")
+        self.assertEqual(result, {"ok": True})
+
+    async def test_openrouter_402_in_flight_budget_is_transient_unlike_credit_depletion(self):
+        in_flight_402 = FakeResponse(
+            402,
+            {
+                "error": {
+                    "code": 402,
+                    "message": "In-flight reservation limit reached",
+                    "metadata": {
+                        "error_type": "payment_required",
+                        "reason": "in_flight_budget_exhausted",
+                        "limit_source": "openrouter_in_flight_budget",
+                    },
+                }
+            },
+            headers={"Retry-After": "1.5"},
+        )
+        transient_err = await llm._error_from_response("OpenRouter", in_flight_402, "or-key")
+        self.assertIsInstance(transient_err, LLMTransientError)
+        self.assertEqual(transient_err.retry_after_seconds, 1.5)
+
+        depleted_402 = FakeResponse(
+            402,
+            {
+                "error": {
+                    "code": 402,
+                    "message": "Insufficient credits",
+                    "metadata": {"error_type": "payment_required"},
+                }
+            },
+        )
+        auth_err = await llm._error_from_response("OpenRouter", depleted_402, "or-key")
+        self.assertIsInstance(auth_err, LLMAuthError)
+
+    async def test_openrouter_403_content_policy_is_request_error_not_auth_error(self):
+        mod_403 = FakeResponse(
+            403,
+            {
+                "error": {
+                    "code": 403,
+                    "message": "Prompt flagged by moderation",
+                    "metadata": {"error_type": "content_policy_violation"},
+                }
+            },
+        )
+        err = await llm._error_from_response("OpenRouter", mod_403, "or-key")
+        self.assertIsInstance(err, llm.LLMRequestError)
+        self.assertNotIsInstance(err, LLMAuthError)
+
+    async def test_gemini_retry_info_and_prepay_402_vs_429_resource_exhausted(self):
+        # Gemini 402 RESOURCE_EXHAUSTED is depleted prepay balance -> LLMAuthError (no retry)
+        gem_402 = FakeResponse(402, {
+            "error": {
+                "code": 402,
+                "message": "Your Prepay credit balance is depleted.",
+                "status": "RESOURCE_EXHAUSTED",
+            }
+        })
+        err_402 = await llm._error_from_response("Gemini", gem_402, "g-key")
+        self.assertIsInstance(err_402, LLMAuthError)
+
+        # Gemini 429 RESOURCE_EXHAUSTED with google.rpc.RetryInfo -> LLMTransientError with delay
+        gem_429 = FakeResponse(429, {
+            "error": {
+                "code": 429,
+                "message": "Resource has been exhausted (e.g. check quota).",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "12.5s",
+                    }
+                ],
+            }
+        })
+        err_429 = await llm._error_from_response("Gemini", gem_429, "g-key")
+        self.assertIsInstance(err_429, LLMTransientError)
+        self.assertEqual(err_429.retry_after_seconds, 12.5)
+
+    def test_gemini_thinking_parts_are_excluded_from_answer_text(self):
+        payload = {
+            "candidates": [{
+                "content": {
+                    "role": "model",
+                    "parts": [
+                        {"text": "Internal thought summary that is not JSON", "thought": True},
+                        {"text": '{"title": "جزوهٔ نهایی"}'},
+                    ],
+                },
+                "finishReason": "STOP",
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 50,
+                "candidatesTokenCount": 20,
+                "thoughtsTokenCount": 80,
+                "totalTokenCount": 150,
+            },
+        }
+        self.assertEqual(_parse_response(payload, "gemini"), '{"title": "جزوهٔ نهایی"}')
+
+    def test_gemini_max_tokens_without_parts_raises_output_budget_error(self):
+        """When Gemini 2.5 spends maxOutputTokens on thinking, content.parts is omitted."""
+        payload = {
+            "candidates": [{
+                "content": {"role": "model"},
+                "finishReason": "MAX_TOKENS",
+            }],
+            "usageMetadata": {"promptTokenCount": 20, "thoughtsTokenCount": 512},
+        }
+        with self.assertRaises(LLMOutputBudgetError):
+            _parse_response(payload, "gemini")
+
+    def test_gemini_safety_finish_reason_without_parts_raises_response_error(self):
+        payload = {
+            "candidates": [{
+                "finishReason": "SAFETY",
+            }]
+        }
+        with self.assertRaises(LLMResponseError) as ctx:
+            _parse_response(payload, "gemini")
+        self.assertIn("SAFETY", str(ctx.exception))
+
+    def test_openrouter_reasoning_token_exhaustion_without_length_reason_raises_budget_error(self):
+        payload = {
+            "choices": [{
+                "message": {"role": "assistant", "content": "", "reasoning": "thinking..."},
+                "finish_reason": "stop",
+            }],
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 512,
+                "completion_tokens_details": {"reasoning_tokens": 512},
+            },
+        }
+        with self.assertRaises(LLMOutputBudgetError):
+            _parse_response(payload, "openai")
+
+    async def test_optional_response_format_is_downgraded_when_rejected_by_model(self):
+        settings = make_settings(
+            note_providers=("openrouter",),
+            note_provider="",
+            note_api_key="",
+            note_api_base_url="",
+            openrouter_api_key="or-key",
+            note_json_mode=True,
+        )
+        session = FakeSession([
+            FakeResponse(400, {
+                "error": {
+                    "code": 400,
+                    "message": "response_format json_object is not supported by this model",
+                }
+            }),
+            chat_answer('{"ok": true}'),
+        ])
+        result = await complete_json(session, settings, system="S", user="U")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(session.calls), 2)
+        self.assertNotIn("response_format", session.calls[1]["json"])
+
+    def test_probe_script_checks_nara_openrouter_and_gemini(self):
+        from scripts import probe_note_providers as probe
+
+        settings = make_settings(
+            note_providers=("nara", "openrouter", "gemini"),
+            note_provider="",
+            note_api_key="",
+            note_api_base_url="",
+            nara_api_key="nara-secret",
+            openrouter_api_key="or-secret",
+            gemini_api_key="gem-secret",
+        )
+        nara, openrouter, gemini = note_routes(settings)
+
+        with mock.patch.object(
+            probe,
+            "_get_json",
+            return_value=(200, {"data": [{"id": "agnes-2.5-flash", "reasoning": True}]}),
+        ):
+            self.assertTrue(probe._check_nara(nara))
+
+        with mock.patch.object(
+            probe,
+            "_get_json",
+            side_effect=[
+                (200, {"data": {"endpoints": [{
+                    "provider_name": "Google AI Studio",
+                    "context_length": 262144,
+                    "max_completion_tokens": 32768,
+                    "uptime_last_1d": 99.9,
+                }]}}),
+                (200, {"data": {
+                    "is_free_tier": True,
+                    "free_model_daily_requests": {"used": 1, "limit": 50, "remaining": 49},
+                }}),
+            ],
+        ):
+            self.assertTrue(probe._check_openrouter(openrouter))
+
+        with mock.patch.object(
+            probe,
+            "_get_json",
+            return_value=(200, {
+                "name": "models/gemini-2.5-flash",
+                "inputTokenLimit": 1048576,
+                "outputTokenLimit": 65536,
+                "supportedGenerationMethods": ["generateContent", "countTokens"],
+                "thinking": True,
+            }),
+        ):
+            self.assertTrue(probe._check_gemini(gemini))
+
+    async def test_null_error_envelope_on_200_does_not_trigger_false_positive(self):
+        session = FakeSession([
+            FakeResponse(200, {
+                "error": {"message": None, "code": None},
+                "choices": [{"message": {"content": "clean answer"}, "finish_reason": "stop"}],
+            })
+        ])
+        result = await complete(session, make_settings(), system="S", user="U")
+        self.assertEqual(result, "clean answer")
+
+    def test_openai_refusal_and_content_filter_without_message_raise_response_error(self):
+        with self.assertRaises(LLMResponseError) as refusal_ctx:
+            _parse_response(
+                {"choices": [{"message": {"content": None, "refusal": "Cannot comply"}, "finish_reason": "stop"}]},
+                "openai",
+            )
+        self.assertIn("refusal", str(refusal_ctx.exception))
+
+        with self.assertRaises(LLMResponseError) as filter_ctx:
+            _parse_response(
+                {"choices": [{"finish_reason": "content_filter"}]},
+                "openai",
+            )
+        self.assertIn("content_filter", str(filter_ctx.exception))
 
 
 async def _noop():

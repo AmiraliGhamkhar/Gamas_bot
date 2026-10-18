@@ -24,7 +24,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
@@ -65,7 +65,15 @@ NOTE_JSON_OBJECT_PROVIDERS = frozenset({"openrouter", "openai_compatible"})
 #: Provider hostnames, so a deployment that configures one OpenAI-compatible
 #: slot with a ``NOTE_BASE_URL`` pointing at a documented provider keeps that
 #: provider's place in the priority order (and never becomes a duplicate leg).
-NOTE_HOST_PROVIDERS = (("bynara.id", "nara"), ("openrouter.ai", "openrouter"))
+#: NaraRouter documents both ``router.bynara.id`` and ``router.bynara.web.id``
+#: (https://router.bynara.id/docs); Google AI Studio's native REST host is
+#: ``generativelanguage.googleapis.com``.
+NOTE_HOST_PROVIDERS = (
+    ("bynara.id", "nara"),
+    ("bynara.web.id", "nara"),
+    ("openrouter.ai", "openrouter"),
+    ("generativelanguage.googleapis.com", "gemini"),
+)
 
 #: Documented API defaults per provider. Nara's free plan currently lists
 #: ``agnes-2.5-flash`` (https://router.bynara.id/api/plans). The OpenRouter
@@ -429,6 +437,79 @@ class NoteRoute:
     json_object_mode: bool
 
 
+def _normalize_api_key(value: str | None) -> str:
+    """Strip surrounding whitespace and any accidental ``Bearer `` prefix.
+
+    Operators sometimes copy ``Bearer sk-...`` directly from curl snippets into
+    ``.env``; stripping the scheme prevents ``Authorization: Bearer Bearer ...``
+    on NaraRouter/OpenRouter and ``x-goog-api-key: Bearer ...`` on Gemini.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    return re.sub(r"^bearer\s+", "", raw, flags=re.IGNORECASE).strip()
+
+
+def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
+    """Normalize a note provider base URL without losing explicit paths/queries.
+
+    Heals common operator copy-paste mistakes:
+    * Pasting a full endpoint URL (``.../chat/completions``, ``.../messages``,
+      ``.../models/<id>:generateContent``, or ``.../v1beta/models``).
+    * Pasting a bare origin without the documented API version prefix
+      (``https://router.bynara.id`` -> ``/v1``, ``https://openrouter.ai`` ->
+      ``/api/v1``, ``https://generativelanguage.googleapis.com`` -> ``/v1beta``).
+    """
+    raw = (base_url or "").strip().rstrip("/")
+    if not raw:
+        return ""
+    parsed = urlsplit(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/")
+
+    for action in (":generateContent", ":streamGenerateContent"):
+        if action in path:
+            models_idx = path.rfind("/models/")
+            if models_idx >= 0:
+                path = path[:models_idx]
+            else:
+                path = path[: path.find(action)]
+            break
+
+    for suffix in ("/chat/completions",):
+        if path.endswith(suffix):
+            path = path[: -len(suffix)].rstrip("/")
+
+    if slug == "anthropic" and path.endswith("/messages"):
+        path = path[: -len("/messages")].rstrip("/")
+
+    is_nara_host = (
+        host == "bynara.id"
+        or host.endswith(".bynara.id")
+        or host == "bynara.web.id"
+        or host.endswith(".bynara.web.id")
+    )
+    is_openrouter_host = host == "openrouter.ai" or host.endswith(".openrouter.ai")
+    is_gemini_host = host == "generativelanguage.googleapis.com"
+
+    if (slug == "gemini" or is_gemini_host) and path.endswith("/models"):
+        path = path[: -len("/models")].rstrip("/")
+
+    if path == "":
+        if slug == "nara" or is_nara_host:
+            path = "/v1"
+        elif slug == "openrouter" or is_openrouter_host:
+            path = "/api/v1"
+        elif slug == "gemini" or is_gemini_host:
+            path = "/v1beta"
+    elif path == "/api" and (slug == "openrouter" or is_openrouter_host):
+        path = "/api/v1"
+
+    return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
 def classify_note_provider(slug: str, base_url: str) -> str:
     """The provider a configured slot really points at.
 
@@ -436,11 +517,19 @@ def classify_note_provider(slug: str, base_url: str) -> str:
     ``NOTE_PROVIDER``/``NOTE_BASE_URL``; recognising a documented provider host
     keeps that deployment in its priority place (a NaraRouter base URL stays the
     Nara leg of the chain) instead of turning it into a generic gateway that
-    would be tried last — or twice.
+    would be tried last — or twice. Google AI Studio's OpenAI compatibility
+    layer (``/v1beta/openai``) stays ``openai_compatible`` while its native
+    ``/v1beta`` endpoint is classified as ``gemini``.
     """
-    host = (urlsplit(base_url).hostname or "").lower()
+    parsed = urlsplit(base_url)
+    host = (parsed.hostname or "").lower()
     if not host:
         return slug
+    path = (parsed.path or "").rstrip("/").lower()
+    if host == "generativelanguage.googleapis.com" and (
+        path.endswith("/openai") or "/openai/" in path
+    ):
+        return "openai_compatible"
     for suffix, provider in NOTE_HOST_PROVIDERS:
         if host == suffix or host.endswith("." + suffix):
             return provider
@@ -495,7 +584,7 @@ def note_slot_credentials(settings: Settings, slug: str) -> tuple[str, str, str]
         key = settings.note_api_key or key
         base = settings.note_api_base_url or base
         model = settings.note_model or model
-    return key, base, model
+    return _normalize_api_key(key), normalize_note_base_url(base, slug), model.strip()
 
 
 def note_route_order(settings: Settings) -> tuple[str, ...]:
@@ -543,9 +632,9 @@ def _note_route(settings: Settings, slug: str) -> NoteRoute | None:
         slug=slug,
         label=NOTE_PROVIDER_LABELS[slug],
         style=style,
-        base_url=(base or NOTE_BASE_URL_DEFAULTS[slug]).rstrip("/"),
+        base_url=normalize_note_base_url(base or NOTE_BASE_URL_DEFAULTS[slug], slug),
         model=model,
-        api_key=key,
+        api_key=_normalize_api_key(key),
         json_object_mode=settings.note_json_mode and slug in NOTE_JSON_OBJECT_PROVIDERS,
     )
 
@@ -643,9 +732,10 @@ def from_env(env_file: str | None = None) -> Settings:
         "gemini" if gemini_only else "openai_compatible"
     )
     note_provider = classify_note_provider(legacy_slug, note_api_base_url)
-    note_api_key = _env("NOTE_API_KEY") or (
-        _env("GEMINI_API_KEY") if legacy_slug == "gemini" else ""
+    note_api_key = _normalize_api_key(
+        _env("NOTE_API_KEY") or (_env("GEMINI_API_KEY") if legacy_slug == "gemini" else "")
     )
+    note_api_base_url = normalize_note_base_url(note_api_base_url, note_provider)
     note_model = _env("NOTE_MODEL", DEFAULT_NOTE_MODELS.get(note_provider, ""))
     plan_values = {
         attribute: _env_int(name, default)
@@ -724,13 +814,17 @@ def from_env(env_file: str | None = None) -> Settings:
         note_api_key=note_api_key,
         note_api_base_url=note_api_base_url,
         note_model=note_model,
-        nara_api_key=_env("NARA_API_KEY"),
-        nara_base_url=_env("NARA_BASE_URL", DEFAULT_NARA_BASE_URL).rstrip("/"),
+        nara_api_key=_normalize_api_key(_env("NARA_API_KEY")),
+        nara_base_url=normalize_note_base_url(
+            _env("NARA_BASE_URL", DEFAULT_NARA_BASE_URL), "nara"
+        ),
         nara_model=_env("NARA_MODEL", DEFAULT_NARA_MODEL),
-        openrouter_api_key=_env("OPENROUTER_API_KEY"),
-        openrouter_base_url=_env("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL).rstrip("/"),
+        openrouter_api_key=_normalize_api_key(_env("OPENROUTER_API_KEY")),
+        openrouter_base_url=normalize_note_base_url(
+            _env("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL), "openrouter"
+        ),
         openrouter_model=_env("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
-        gemini_api_key=_env("GEMINI_API_KEY"),
+        gemini_api_key=_normalize_api_key(_env("GEMINI_API_KEY")),
         note_context_tokens=_env_int(
             "NOTE_CONTEXT_TOKENS", DEFAULT_NOTE_CONTEXT_TOKENS, minimum=2048
         ),

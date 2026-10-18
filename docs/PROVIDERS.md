@@ -46,21 +46,32 @@ must be revisited at the same time.
 
 * **`NOTE_PROVIDERS` is the policy** (default `nara,openrouter`). Providers are
   attempted in that order and only when they have their own credential.
-* **Bounded retries per provider** for transient failures (408/425/429/5xx,
-  network, timeout) with backoff and `Retry-After`; three attempts, then the next
-  provider. Every request has its own 300 s timeout.
+* **Bounded retries per provider** for transient failures (408/409/425/429/499/5xx,
+  OpenRouter HTTP 402 `openrouter_in_flight_budget`, network, timeout) with backoff
+  and `Retry-After` / `X-RateLimit-Reset` / Gemini `google.rpc.RetryInfo`; three
+  attempts, then the next provider. Every request has its own 300 s timeout.
+* **HTTP 200 in-body error detection**: OpenRouter can emit HTTP `200 OK` headers
+  as soon as an upstream provider accepts a request and then return a top-level
+  `{"error": ...}` or `choices[0].finish_reason == "error"` / `choices[0].error`
+  when generation fails mid-flight. These are classified through the same error
+  pipeline as HTTP 4xx/5xx responses rather than accepted as partial text.
 * **Ordered failover** on authentication failure, rejection and unusable answers.
   The failure class of the first provider is preserved, so a context overflow
   still reaches the note pipeline as one.
 * **`NOTE_JSON_MODE`** sends `response_format` only to providers that document it
-  (OpenRouter and generic OpenAI-compatible gateways — not NaraRouter). Gemini
-  always asks for its native JSON.
+  (OpenRouter and generic OpenAI-compatible gateways — not NaraRouter). If a
+  model on an OpenAI-compatible gateway rejects `response_format` or
+  `reasoning_effort` with HTTP 400, the client strips the unsupported optional
+  field and retries once on that route. Gemini always asks for its native JSON.
 * **`NOTE_REASONING_EFFORT`** (unset by default) sends `reasoning_effort` on
   the Nara and OpenRouter routes only — the two gateways verified for the
-  field. A generic OpenAI-compatible gateway (whose model may reject the
-  parameter) and the Gemini/Anthropic styles never receive it. Each completed request logs its
-  served model and real token usage (`note provider usage …`), which is the
-  data to recalibrate the chunk budget's character-to-token estimate from.
+  field (`ultra` is normalized to `max`). A generic OpenAI-compatible gateway
+  (whose model may reject the parameter) and the Gemini/Anthropic styles never
+  receive it. On Gemini thinking models, thought summary parts (`"thought": true`)
+  are excluded from the extracted answer text so internal reasoning never
+  pollutes JSON output. Each completed request logs its served model and real
+  token usage (`note provider usage …`), which is the data to recalibrate the
+  chunk budget's character-to-token estimate from.
 * **The compile (reduce) budget is token-derived** (`NOTE_COMPILE_MAX_CHARS=0`
   means automatic): a merged booklet larger than the derived budget — bounded
   by an absolute ceiling in `notes.py` — is delivered as the deterministic
@@ -72,8 +83,8 @@ Two failures look similar and have opposite fixes, so they are separate classes:
 
 | Class | Trigger | What the pipeline does |
 | --- | --- | --- |
-| `LLMContextOverflowError` | HTTP **413**, or a 400 whose text names the context window | splits the transcript in half and retries both halves (bounded depth) |
-| `LLMOutputBudgetError` | answer cut off by the output budget — `finish_reason: "length"`, Gemini `MAX_TOKENS`, Anthropic `max_tokens` | does **not** retry; raises with a pointer to `NOTE_MAX_OUTPUT_TOKENS` |
+| `LLMContextOverflowError` | HTTP **413**, typed overflow codes (`context_length_exceeded`, `token_limit_exceeded`, `max_tokens_exceeded`, `string_too_long`, `payload_too_large`), or a 400/422 whose text names the context window | splits the transcript in half and retries both halves (bounded depth) |
+| `LLMOutputBudgetError` | answer cut off by the output budget — `finish_reason` / `native_finish_reason` `"length"` or `"max_tokens"`, Gemini `MAX_TOKENS` / `CONTINUATION`, Anthropic `max_tokens`, or thinking tokens exhausting the completion budget with empty visible output | does **not** retry; raises with a pointer to `NOTE_MAX_OUTPUT_TOKENS` |
 
 NaraRouter reserves 413 for an oversized body ("The request body or input is too
 large") and documents that reasoning models spend thinking tokens out of the same

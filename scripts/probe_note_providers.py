@@ -10,10 +10,12 @@ Read-only stage (default)::
     Prints the eligible note routes from the current ``.env``, then asks each
     gateway only metadata questions: NaraRouter's authenticated ``/v1/models``
     (is the configured model entitled, and what limits does the gateway
-    publish for it?) and OpenRouter's ``/api/v1/key`` plus the configured
+    publish for it?), OpenRouter's ``/api/v1/key`` plus the configured
     model's ``/endpoints`` record (served context, completion cap, uptime,
-    and the free-tier daily request counter). No generation call is made and
-    no secret is printed.
+    and the free-tier daily request counter), and Google AI Studio Gemini's
+    ``/v1beta/models/{model}`` resource (input/output token limits, thinking
+    support, and ``generateContent`` capability). No generation call is made
+    and no secret is printed.
 
 Generation stage (opt-in, consumes provider quota)::
 
@@ -45,15 +47,33 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from gamas_bot.config import from_env, note_routes  # noqa: E402
+from gamas_bot.llm import (  # noqa: E402
+    _build_get_request_for,
+    _clean_api_key,
+    _endpoint,
+    _openrouter_model_path,
+    _redact_secrets,
+)
 
 
-def _get_json(url: str, api_key: str, timeout: float = 30.0) -> tuple[int, object]:
+def _get_json(
+    url: str,
+    api_key: str = "",
+    timeout: float = 30.0,
+    *,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, object]:
     """One authenticated GET; returns ``(status, parsed_json_or_text)``."""
-    request = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-        method="GET",
-    )
+    clean_key = _clean_api_key(api_key)
+    req_headers: dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": "GamasBot/3.0",
+    }
+    if headers is not None:
+        req_headers.update(headers)
+    elif clean_key:
+        req_headers["Authorization"] = f"Bearer {clean_key}"
+    request = urllib.request.Request(url, headers=req_headers, method="GET")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", "replace")
@@ -62,24 +82,32 @@ def _get_json(url: str, api_key: str, timeout: float = 30.0) -> tuple[int, objec
         body = exc.read().decode("utf-8", "replace")
         status = exc.code
     except (urllib.error.URLError, OSError) as exc:
-        return 0, f"unreachable: {exc}"
+        return 0, _redact_secrets(f"unreachable: {exc}", clean_key)
     try:
         return status, json.loads(body)
     except ValueError:
-        return status, body[:400]
+        return status, _redact_secrets(body[:400], clean_key)
 
 
 def _check_nara(route) -> bool:
     """NaraRouter: the configured model must be entitled on this key's plan."""
-    status, payload = _get_json(f"{route.base_url}/models", route.api_key)
+    url, headers = _build_get_request_for(route, "models")
+    status, payload = _get_json(url, route.api_key, headers=headers)
     if status != 200 or not isinstance(payload, dict):
-        print(f"[FAIL] nara /v1/models: HTTP {status}: {str(payload)[:200]}")
+        detail = _redact_secrets(str(payload)[:200], route.api_key)
+        print(f"[FAIL] nara /v1/models: HTTP {status}: {detail}")
         return False
     entries = payload.get("data")
     if not isinstance(entries, list):
         print("[FAIL] nara /v1/models: unexpected response shape (no data list)")
         return False
     ids = [entry.get("id") for entry in entries if isinstance(entry, dict)]
+    if route.model.startswith("combo/") and ids:
+        print(
+            f"[PASS] nara combo model {route.model!r} is routable "
+            f"({len(ids)} underlying model(s) on this plan)"
+        )
+        return True
     entitled = route.model in ids
     print(
         f"[{'PASS' if entitled else 'FAIL'}] nara model {route.model!r} "
@@ -89,11 +117,11 @@ def _check_nara(route) -> bool:
         if isinstance(entry, dict) and entry.get("id") == route.model:
             limits = {
                 key: entry[key]
-                for key in ("context_length", "max_completion_tokens", "max_tokens")
+                for key in ("context_length", "max_completion_tokens", "max_tokens", "reasoning")
                 if key in entry
             }
             if limits:
-                print(f"       published limits: {limits}")
+                print(f"       published metadata: {limits}")
             else:
                 print("       gateway publishes no context/completion limits for it")
     return entitled
@@ -102,11 +130,18 @@ def _check_nara(route) -> bool:
 def _check_openrouter(route) -> bool:
     """OpenRouter: endpoint caps for the pinned model + the free-tier counter."""
     ok = True
-    status, payload = _get_json(
-        f"{route.base_url}/models/{route.model}/endpoints", route.api_key
-    )
+    url, headers = _build_get_request_for(route, "model_endpoints")
+    status, payload = _get_json(url, route.api_key, headers=headers)
+    if status == 404 and ":" in route.model:
+        base_model = route.model.split(":", 1)[0]
+        fallback_url = _endpoint(
+            route.base_url, f"models/{_openrouter_model_path(base_model)}/endpoints"
+        )
+        status, payload = _get_json(fallback_url, route.api_key, headers=headers)
     if status == 200 and isinstance(payload, dict):
-        endpoints = (payload.get("data") or {}).get("endpoints") or []
+        data_obj = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        endpoints = data_obj.get("endpoints") or []
+        arch = data_obj.get("architecture") if isinstance(data_obj.get("architecture"), dict) else {}
         for endpoint in endpoints:
             print(
                 f"[PASS] openrouter endpoint {endpoint.get('provider_name')}: "
@@ -115,15 +150,34 @@ def _check_openrouter(route) -> bool:
                 f"uptime_last_1d={endpoint.get('uptime_last_1d')}"
             )
         if not endpoints:
-            print("[FAIL] openrouter endpoints: the model has no live endpoint")
-            ok = False
+            if arch.get("tokenizer") == "Router" or route.model in ("openrouter/free", "openrouter/auto"):
+                print(
+                    f"[WARN] openrouter model {route.model!r} is a dynamic router "
+                    "(no pinned endpoint; served context window varies per request)"
+                )
+            else:
+                print("[FAIL] openrouter endpoints: the model has no live endpoint")
+                ok = False
     else:
-        print(f"[FAIL] openrouter endpoints: HTTP {status}: {str(payload)[:200]}")
+        detail = _redact_secrets(str(payload)[:200], route.api_key)
+        print(f"[FAIL] openrouter endpoints: HTTP {status}: {detail}")
         ok = False
 
-    status, payload = _get_json(f"{route.base_url}/key", route.api_key)
+    key_url, key_headers = _build_get_request_for(route, "key")
+    status, payload = _get_json(key_url, route.api_key, headers=key_headers)
     if status == 200 and isinstance(payload, dict):
         data = payload.get("data") or {}
+        limit_remaining = data.get("limit_remaining")
+        if (
+            isinstance(limit_remaining, (int, float))
+            and not isinstance(limit_remaining, bool)
+            and limit_remaining <= 0
+        ):
+            print(
+                f"[FAIL] openrouter /api/v1/key: credit limit exhausted "
+                f"(limit_remaining={limit_remaining})"
+            )
+            ok = False
         counter = data.get("free_model_daily_requests") or {}
         if counter:
             print(
@@ -134,9 +188,38 @@ def _check_openrouter(route) -> bool:
             )
         else:
             print("[WARN] openrouter /api/v1/key: no free-tier counter reported")
+    elif status in (401, 403):
+        detail = _redact_secrets(str(payload)[:200], route.api_key)
+        print(f"[FAIL] openrouter /api/v1/key: HTTP {status}: {detail}")
+        ok = False
     else:
-        print(f"[WARN] openrouter /api/v1/key: HTTP {status}: {str(payload)[:200]}")
+        detail = _redact_secrets(str(payload)[:200], route.api_key)
+        print(f"[WARN] openrouter /api/v1/key: HTTP {status}: {detail}")
     return ok
+
+
+def _check_gemini(route) -> bool:
+    """Google AI Studio Gemini: verify model metadata and ``generateContent`` support."""
+    url, headers = _build_get_request_for(route, "model")
+    status, payload = _get_json(url, route.api_key, headers=headers)
+    if status != 200 or not isinstance(payload, dict):
+        detail = _redact_secrets(str(payload)[:200], route.api_key)
+        print(f"[FAIL] gemini model {route.model!r}: HTTP {status}: {detail}")
+        return False
+    methods = payload.get("supportedGenerationMethods")
+    if isinstance(methods, list) and "generateContent" not in methods:
+        print(
+            f"[FAIL] gemini model {route.model!r} does not support generateContent "
+            f"(supportedGenerationMethods={methods})"
+        )
+        return False
+    print(
+        f"[PASS] gemini model {payload.get('name') or route.model!r}: "
+        f"inputTokenLimit={payload.get('inputTokenLimit')} "
+        f"outputTokenLimit={payload.get('outputTokenLimit')} "
+        f"thinking={payload.get('thinking')}"
+    )
+    return True
 
 
 async def _generate(route, settings, text: str) -> bool:
@@ -209,6 +292,8 @@ def main(argv: list[str] | None = None) -> int:
             ok = _check_nara(route) and ok
         elif route.slug == "openrouter":
             ok = _check_openrouter(route) and ok
+        elif route.slug == "gemini":
+            ok = _check_gemini(route) and ok
         else:
             print(f"[WARN] {route.slug}: no metadata probe; generation stage still applies")
 
