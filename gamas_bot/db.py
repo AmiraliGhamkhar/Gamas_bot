@@ -119,7 +119,29 @@ class Database:
             if path.name in applied:
                 continue
             logger.info("Applying migration %s", path.name)
-            await self.db.executescript(path.read_text(encoding="utf-8"))
+            # Audit verification gap 7: make 002_special_users idempotent against
+            # crash-retry (SQLite lacks ADD COLUMN IF NOT EXISTS).
+            raw_sql = path.read_text(encoding="utf-8")
+            if path.name == "002_special_users.sql":
+                try:
+                    cols = await self.db.execute_fetchall("PRAGMA table_info(users)")
+                    existing = {row[1] for row in cols}
+                    stmts: list[str] = []
+                    for line in raw_sql.splitlines():
+                        stripped = line.strip()
+                        if stripped.upper().startswith("ALTER TABLE USERS ADD COLUMN"):
+                            try:
+                                after = stripped.split("ADD COLUMN", 1)[1].strip()
+                                col = after.split()[0].strip('"\'`')
+                                if col in existing:
+                                    continue
+                            except Exception:
+                                pass
+                        stmts.append(line)
+                    raw_sql = "\n".join(stmts)
+                except Exception:
+                    pass
+            await self.db.executescript(raw_sql)
             await self.db.execute(
                 "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
                 (path.name, iso(utc_now())),
@@ -416,7 +438,12 @@ class Database:
         if seconds <= 0:
             raise ValueError("reservation must be positive")
         async with self._write_lock:
-            if await self.is_unlimited(user_id):
+            # Re-check inside the lock to close TOCTOU with set_unlimited
+            # happening concurrently (audit F-M01).
+            rows = await self.db.execute_fetchall(
+                "SELECT is_unlimited FROM users WHERE telegram_id = ?", (user_id,)
+            )
+            if rows and rows[0][0]:
                 return
             available = await self._available_seconds_locked(user_id)
             if available < seconds:

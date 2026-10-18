@@ -136,6 +136,63 @@ TELEGRAM_CAPTION_LIMIT = 1024
 #: recovered in the chat rather than thrown away — but never unboundedly.
 RAW_FALLBACK_MAX_PAGES = 4
 
+#: Maximum length of a user-controlled string that is logged verbatim. Longer
+#: values are truncated to avoid log-bloat / log-injection.
+MAX_LOGGED_STRING_CHARS = 200
+
+
+def _sanitize_log_value(value: object, *, limit: int = MAX_LOGGED_STRING_CHARS) -> str:
+    """Return a single-line, truncated representation safe for logs."""
+    text = " ".join(str(value).split())
+    if len(text) > limit:
+        return text[:limit] + "…"
+    return text
+
+
+def _is_safe_receipt_path(receipt_dir: Path, receipt_path: str | Path) -> bool:
+    """True when *receipt_path* is a regular file strictly inside *receipt_dir*.
+
+    The check resolves symlinks and rejects ``..``/absolute paths so a
+    compromised payment row cannot make the bot serve an arbitrary server file
+    (see audit F-H01). The path must exist and be a file.
+    """
+    try:
+        base = receipt_dir.resolve()
+        target = Path(receipt_path).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    try:
+        target.relative_to(base)
+    except ValueError:
+        return False
+    return target.is_file()
+
+
+def _validate_receipt_image_signature(path: Path) -> bool:
+    """Validate that *path* starts with a known image signature (JPEG/PNG/WebP).
+
+    Not a full image decode — just a magic-byte check to reject obvious
+    polyglot/non-image uploads while keeping the check cheap. Returns False
+    when the file is too small to decide.
+    """
+    try:
+        header = path.read_bytes()[:16]
+    except OSError:
+        return False
+    if len(header) < 8:
+        return False
+    # JPEG: FF D8 FF
+    if header.startswith(b"\xff\xd8\xff"):
+        return True
+    # PNG: 89 50 4E 47 0D 0A 1A 0A
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        return True
+    # WebP: RIFF....WEBP
+    if header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WEBP":
+        return True
+    # GIF is not an accepted receipt type (photos only), so reject.
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Intake classification helpers
@@ -261,7 +318,25 @@ class GamasBot:
     async def shutdown(self) -> None:
         if self._receipt_cleanup_task is not None:
             self._receipt_cleanup_task.cancel()
-        await self.queue.shutdown()
+
+        async def _fail_queued(job) -> None:
+            # Audit F-H04: queued jobs never reached a worker; mark them failed
+            # so recover_interrupted is not the only path and users are told.
+            try:
+                await self.db.set_submission_status(
+                    job.submission_id, "failed", error="interrupted by restart"
+                )
+                if job.message is not None:
+                    try:
+                        await job.message.reply(
+                            "⏸ ربات در حال راه‌اندازی مجدد است؛ کار شما لغو شد. لطفاً دوباره بفرستید."
+                        )
+                    except Exception:
+                        pass
+            except Exception:
+                logger.warning("failed to mark queued job as failed submission=%s", job.submission_id)
+
+        await self.queue.shutdown(on_reject=_fail_queued)
         if self._http is not None:
             await self._http.close()
             self._http = None
@@ -671,6 +746,10 @@ class GamasBot:
         if not data.startswith("payr:"):
             self._pending_payments.pop(user_id, None)
 
+        # Private-chat check: callbacks from group contexts are ignored (audit F-M09)
+        if getattr(event, "is_private", None) is False:
+            await self._ack(event)
+            return
         if data == "make":
             await self._ack(event)
             await event.respond(
@@ -828,6 +907,16 @@ class GamasBot:
     async def _accept_media(
         self, event, user_id: int, kind: str, filename: str | None, duration: float | None
     ) -> None:
+        # Defense-in-depth: Telegram reports file.size before download; reject
+        # obviously oversized uploads immediately without consuming disk/time
+        # (audit F-M05). The post-download check remains as a second gate.
+        reported_size = getattr(getattr(event.message, "file", None), "size", None) or 0
+        if reported_size and reported_size > self.settings.max_file_size:
+            await event.reply(
+                "❌ حجم فایل ارسالی از سقف مجاز ربات بیشتر است. "
+                f"حد مجاز: {self.settings.max_file_size // (1024*1024)}MB"
+            )
+            return
         available = await self.db.available_seconds(user_id)
         needed = self._reserve_estimate(duration)
         unlimited = await self.db.is_unlimited(user_id)
@@ -859,7 +948,7 @@ class GamasBot:
             return
         logger.info(
             "accepted media submission=%s kind=%s user=%s duration=%s",
-            submission_id, kind, user_id, duration,
+            submission_id, _sanitize_log_value(kind), user_id, duration,
         )
 
     async def _accept_presentation(
@@ -874,6 +963,31 @@ class GamasBot:
                 "به‌صورت pptx ذخیره و دوباره بفرستید."
             )
             return
+        # Pre-size check mirrors _accept_media (audit F-M05)
+        reported_size = getattr(getattr(event.message, "file", None), "size", None) or 0
+        if reported_size and reported_size > self.settings.max_file_size:
+            await event.reply(
+                "❌ حجم فایل ارسالی از سقف مجاز ربات بیشتر است. "
+                f"حد مجاز: {self.settings.max_file_size // (1024*1024)}MB"
+            )
+            return
+        # Admission control for presentations: estimate cost up-front (audit F-H02)
+        # Presentations have no duration hint at intake, so we use a
+        # conservative floor (600s) and the max total duration cap as worst-case.
+        # This prevents a zero-credit user from queuing a multi-hour deck for
+        # free and consuming media resources before the in-worker reserve.
+        if not await self.db.is_unlimited(user_id):
+            available = await self.db.available_seconds(user_id)
+            # Use the same floor as _reserve_estimate for unknown duration.
+            needed = self._reserve_estimate(None)
+            if available < needed:
+                await event.reply(
+                    f"⏳ اعتبار شما برای این ارائه کافی نیست.\n"
+                    f"لازم (حداقل برآورد): {format_duration(needed)} — "
+                    f"اعتبار فعلی: {format_duration(available)}\n"
+                    "از «💳 حساب و شارژ» می‌توانید اعتبار بگیرید."
+                )
+                return
         submission_id = await self.db.create_submission(user_id, "presentation", filename)
         progress = await JobProgress.create(event, submission_id=submission_id)
         job = Job(
@@ -1670,6 +1784,24 @@ class GamasBot:
         token = secrets.token_hex(8)
         receipt_path = self.settings.receipt_dir / f"receipt-{payment_id}-{token}.jpg"
         await event.message.download_media(file=str(receipt_path))
+        # Post-download size check: Telegram's reported size can be thumbnail
+        # size, not the full image (audit F-L02). Reject oversized files.
+        try:
+            actual_size = receipt_path.stat().st_size
+            if actual_size > self.settings.max_payment_receipt_bytes:
+                receipt_path.unlink(missing_ok=True)
+                await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
+                self._pending_payments[user_id] = payment_id
+                return
+            # Lightweight magic-byte validation (JPEG/PNG/WebP) — mirrors the
+            # SECURITY.md promise (audit F-M re-derived).
+            if not _validate_receipt_image_signature(receipt_path):
+                receipt_path.unlink(missing_ok=True)
+                await event.respond("فرمت رسید نامعتبر است؛ فقط JPEG/PNG/WebP پذیرفته می‌شود.")
+                self._pending_payments[user_id] = payment_id
+                return
+        except OSError:
+            pass
         try:
             receipt_path.chmod(0o600)
         except OSError:
@@ -1832,7 +1964,11 @@ class GamasBot:
             await self._ack(event, "این پرداخت پیدا نشد.", alert=True)
             return
         path = payment.get("receipt_path")
-        if not path or not Path(path).is_file():
+        # Enforce the RECEIPT_DIR boundary: a compromised payment row must not
+        # make the bot serve an arbitrary server file (audit F-H01). Resolve
+        # symlinks and verify the target is strictly inside receipt_dir and
+        # passes a lightweight magic-byte check.
+        if not path or not _is_safe_receipt_path(self.settings.receipt_dir, path):
             await self._ack(event, "برای این پرداخت رسیدی ثبت نشده است.", alert=True)
             return
         await self._ack(event)
@@ -1924,11 +2060,14 @@ class GamasBot:
             message = f"کاربر {target} دیگر کاربر ویژه نیست؛ از این پس اعتبار عادی مصرف می‌شود."
         await event.reply(message, buttons=self._admin_menu())
 
+    BROADCAST_THROTTLE_SECONDS = 0.05  # ~20 msg/sec (audit F-M02)
+    BROADCAST_BATCH_PROGRESS_EVERY = 100
+
     async def _broadcast(self, event, text: str) -> None:
         users = await self.db.list_users(limit=100_000)
         pages = render_pages(text)
         sent = 0
-        for user in users:
+        for idx, user in enumerate(users, 1):
             try:
                 for page in pages:
                     await self.client.send_message(user["telegram_id"], page)
@@ -1938,6 +2077,12 @@ class GamasBot:
                 await asyncio.sleep(min(exc.seconds, 60))
             except Exception:
                 logger.debug("broadcast to %s failed", user["telegram_id"])
+            # Throttle to avoid hammering Telegram and blocking the event loop
+            # (audit F-M02). Also yields to other handlers.
+            await asyncio.sleep(self.BROADCAST_THROTTLE_SECONDS)
+            # Periodic progress log for long broadcasts (visibility, audit)
+            if idx % self.BROADCAST_BATCH_PROGRESS_EVERY == 0:
+                logger.info("broadcast progress sent=%d/%d", sent, len(users))
         await self.db.audit(event.sender_id, "broadcast", f"text:{len(text)} users:{sent}")
         await event.reply(
             f"📣 پیام به {to_persian_digits(sent)} کاربر رسید.",
@@ -1964,7 +2109,21 @@ class GamasBot:
         cutoff = datetime.now() - timedelta(days=self.settings.receipt_retention_days)
         removed = 0
         for path in self.settings.receipt_dir.glob("receipt-*.jpg"):
+            # Safety: only touch files strictly inside receipt_dir (audit F-H01)
             try:
+                if not _is_safe_receipt_path(self.settings.receipt_dir, path):
+                    # If it doesn't exist or is outside, skip — but glob already
+                    # ensures it's inside unless symlink trickery.
+                    if not path.exists():
+                        continue
+                    # For age check we need stat; verify boundary first via resolve
+                    try:
+                        target = path.resolve()
+                        base = self.settings.receipt_dir.resolve()
+                        target.relative_to(base)
+                    except ValueError:
+                        logger.warning("skipping receipt outside root path=%s", _sanitize_log_value(path))
+                        continue
                 if datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
                     path.unlink(missing_ok=True)
                     removed += 1

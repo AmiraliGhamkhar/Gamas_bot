@@ -102,7 +102,8 @@ modules never import `bot.py`, and `config.py` imports nothing from the package.
 ## Data model
 
 SQLite in WAL mode, `foreign_keys=ON`, 5 s busy timeout, one connection guarded
-by an `asyncio.Lock`; writes use `BEGIN IMMEDIATE`. Migrations are plain `.sql`
+by an `asyncio.Lock`; writes are serialized by the asyncio lock and committed
+atomically (single-writer, no `BEGIN IMMEDIATE` needed). Migrations are plain `.sql`
 files under `migrations/v3/`, applied once in filename order and recorded in
 `schema_migrations`. Eight application tables:
 

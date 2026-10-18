@@ -97,18 +97,32 @@ class JobQueue:
             finally:
                 self._queue.task_done()
 
-    async def shutdown(self) -> None:
-        """Stop intake, reject queued jobs, cancel workers."""
+    async def shutdown(self, on_reject: Callable[[Job], Awaitable[None]] | None = None) -> None:
+        """Stop intake, reject queued jobs, cancel workers.
+
+        If *on_reject* is provided, it is awaited for each queued job so the
+        caller can transition DB rows / notify users (audit F-H04). The queue
+        promise — 'a job is either fully recorded or fully failed' — is thus
+        kept even for jobs that never reached a worker.
+        """
         self._closed = True
         rejected = 0
+        pending_rejects: list[Job] = []
         while not self._queue.empty():
             try:
                 job = self._queue.get_nowait()
                 rejected += 1
+                pending_rejects.append(job)
                 self._queue.task_done()
                 logger.warning("rejected queued job at shutdown submission=%s", job.submission_id)
             except asyncio.QueueEmpty:
                 break
+        if on_reject is not None and pending_rejects:
+            for job in pending_rejects:
+                try:
+                    await on_reject(job)
+                except Exception:
+                    logger.exception("on_reject failed for submission=%s", job.submission_id)
         for worker in self._workers:
             worker.cancel()
         if self._workers:

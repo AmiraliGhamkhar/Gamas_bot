@@ -326,6 +326,11 @@ def _safe_media_filename(order: int, part_name: str) -> str:
     return f"{order:04d}-{cleaned}"
 
 
+def _is_zip_symlink(info: zipfile.ZipInfo) -> bool:
+    # POSIX symlink is stored with file type 0xA000 in external_attr
+    return (info.external_attr >> 16) & 0xA000 == 0xA000
+
+
 def _validate_archive(archive: zipfile.ZipFile, settings: Settings) -> None:
     infos = archive.infolist()
     if len(infos) > MAX_ZIP_ENTRIES:
@@ -336,6 +341,8 @@ def _validate_archive(archive: zipfile.ZipFile, settings: Settings) -> None:
         parts = PurePosixPath(name).parts
         if name.startswith("/") or ".." in parts or PurePosixPath(name).is_absolute():
             raise PresentationError("فایل ارائه شامل مسیر نامعتبر است و پردازش نشد.")
+        if _is_zip_symlink(info):
+            raise PresentationError("فایل ارائه شامل پیوند نمادین است و پردازش نشد.")
         total += info.file_size
         if total > settings.presentation_max_unpacked_bytes:
             raise PresentationError("حجم بازشدهٔ فایل ارائه از حد مجاز بیشتر است.")
