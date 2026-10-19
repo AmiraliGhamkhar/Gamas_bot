@@ -47,6 +47,8 @@ dependencies = [
     "reportlab>=4.0,<5.0",
     "arabic-reshaper>=3.0,<4.0",
     "python-bidi>=0.4,<1.0",
+    # Local PDF page rendering for API-free OCR; PyMuPDF wheels include MuPDF.
+    "PyMuPDF>=1.24,<2.0",
 ]
 
 [project.optional-dependencies]
