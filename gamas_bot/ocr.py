@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 DEFAULT_LANGUAGES = "fas+ara+eng"
@@ -122,7 +123,7 @@ def extract_text(
         raise OcrError("وابستگی PDF نصب نیست؛ بستهٔ PyMuPDF را نصب کنید.") from exc
 
     pieces: list[str] = []
-    elapsed_budget = timeout_seconds
+    deadline = time.monotonic() + timeout_seconds
     try:
         with fitz.open(source) as document:
             if document.is_encrypted:
@@ -137,7 +138,9 @@ def extract_text(
                 # 2x is a practical compromise for shared-hosting CPU and memory.
                 pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
                 image = pixmap.tobytes("png")
-                page_timeout = max(1.0, elapsed_budget / max(1, document.page_count - index))
+                page_timeout = deadline - time.monotonic()
+                if page_timeout <= 0:
+                    raise OcrError("زمان OCR تمام شد؛ PDF کوتاه‌تر یا فایل کوچک‌تری بفرستید.")
                 page_text = _run_tesseract(
                     command, image, languages=language_setting,
                     timeout_seconds=page_timeout,
