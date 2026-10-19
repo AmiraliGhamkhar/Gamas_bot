@@ -39,7 +39,7 @@ the map of what exists.
 | Storage & logs | `DB_PATH`, `TEMP_DIR`, `LOG_FILE`, `LOG_LEVEL`, `LOG_FORMAT`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT` |
 | Queue & timeouts | `MAX_FILE_SIZE`, `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS`, `MEDIA_WORKER_CONCURRENCY`, `MEDIA_TIMEOUT`, `CONVERT_TIMEOUT`, `STT_JOB_TIMEOUT`, `STT_POLL_INTERVAL` |
 | Speech-to-text | `STT_PROVIDERS`, `STT_LANGUAGE`, `SPEECHMATICS_API_KEY`, `SPEECHMATICS_BASE_URL`, `SPEECHMATICS_MODEL`, `DEEPGRAM_API_KEY`, `DEEPGRAM_BASE_URL`, `DEEPGRAM_MODEL`, `STT_OPENAI_BASE_URL`, `STT_OPENAI_API_KEY`, `STT_OPENAI_MODEL`, `STT_OPENAI_MAX_UPLOAD_BYTES` — see [STT_PROVIDERS.md](STT_PROVIDERS.md) |
-| Note generation | `NOTE_PROVIDERS`, `NARA_API_KEY`, `NARA_BASE_URL`, `NARA_MODEL`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`, `NOTE_PROVIDER`, `NOTE_API_KEY`, `NOTE_BASE_URL`, `NOTE_MODEL`, `GEMINI_API_KEY`, `NOTE_MODE`, `NOTE_CONTEXT_TOKENS`, `NOTE_MAX_OUTPUT_TOKENS`, `NOTE_REQUEST_TIMEOUT_SECONDS`, `NOTE_JSON_MODE`, `NOTE_CHUNK_CHARS`, `NOTE_CONCURRENCY`, `NOTE_COMPILE`, `NOTE_COMPILE_MAX_CHARS`, `NOTE_REASONING_EFFORT` — see [PROVIDERS.md](PROVIDERS.md) |
+| Note generation | `NOTE_PROVIDERS`, `NARA_API_KEY`, `NARA_BASE_URL`, `NARA_MODEL`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`, `NOTE_PROVIDER`, `NOTE_API_KEY`, `NOTE_BASE_URL`, `NOTE_MODEL`, `GEMINI_API_KEY`, `NOTE_MODE`, `NOTE_CONTEXT_TOKENS`, `NOTE_MAX_OUTPUT_TOKENS`, `NOTE_REQUEST_TIMEOUT_SECONDS`, `NOTE_JSON_MODE`, `NOTE_CHUNK_CHARS`, `NOTE_CONCURRENCY`, `NOTE_COMPILE`, `NOTE_COMPILE_MAX_CHARS`, `NOTE_REASONING_EFFORT`, `NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE` — see [PROVIDERS.md](PROVIDERS.md) |
 | Raw text | `RAW_TEXT_PROFILE` (`plain` \| `timestamped`) |
 | Free Office | `OFFICE_ENABLED`, `OFFICE_MAX_INPUT_BYTES`, `OFFICE_MAX_CHARS`, `OFFICE_MAX_SLIDES`, `OFFICE_SESSION_TTL_MINUTES` — see [OFFICE.md](OFFICE.md) |
 | Presentations | `PRESENTATION_MAX_CLIPS`, `PRESENTATION_MAX_TOTAL_DURATION`, `PRESENTATION_MAX_UNPACKED_BYTES`, `PRESENTATION_MAX_TEMP_BYTES`, `PRESENTATION_MIN_CLIP_SECONDS`, `PRESENTATION_SILENCE_SECONDS`, `PRESENTATION_WAV_LIMIT_BYTES`, `PRESENTATION_INCLUDE_SLIDE_TEXT`, `PRESENTATION_INCLUDE_VIDEO_AUDIO`, `PRESENTATION_INCLUDE_UNREFERENCED_MEDIA` |
@@ -66,6 +66,18 @@ the map of what exists.
   only key present and no dedicated provider key exists, `gemini` is selected
   automatically.
 * **`NOTE_PROVIDER=anthropic` has no default model** — set `NOTE_MODEL`.
+* **`NOTE_STRICT_GROUNDING`** (default `true`) turns on the evidence gate: every
+  number and term in the generated booklet is compared with the transcript,
+  tables whose cells are not in the source are dropped, practical tips without a
+  verbatim source basis are dropped, and objectives/review questions the lecture
+  does not support are removed. `false` restores the pre-v4 behaviour (prompt
+  only, no audit) and is the rollback switch.
+* **`NOTE_QUALITY_GATE`** chooses what the gate may do: `repair` (default) sends
+  at most one bounded repair request with the missing facts and their source
+  sentences, then scrubs any sentence that still states a number absent from the
+  source; `warn` audits and logs and changes nothing at all (not even a table
+  or tip the gate can prove unsupported) — the safe setting for the first week
+  after a model or prompt change.
 * **`NOTE_CONTEXT_TOKENS`** sizes one request: the output budget, system prompt
   and contextual material are subtracted and the rest is split into chunks. Set
   it to the smallest window among the configured models. The defaults are a

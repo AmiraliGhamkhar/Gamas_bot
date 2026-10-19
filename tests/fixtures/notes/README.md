@@ -1,10 +1,11 @@
 # Note-quality benchmark corpus
 
-> **Status: currently unused.** Nothing loads `corpus.json`. The scorer it names
-> — `gamas_bot.qa.run_note_qa`, still quoted in the `description` field of
-> `corpus.json` — was removed in the v3 overhaul, along with
-> `tests/test_note_evaluation.py` that drove it. The corpus is kept because the
-> reference documents are hand-written Persian and expensive to reproduce.
+> **Status: live again.** `corpus.json` is loaded by
+> `tests/test_note_evidence.py`, the deterministic scorer that replaced the
+> removed v2 `gamas_bot.qa.run_note_qa` / `tests/test_note_evaluation.py`. It
+> measures coverage, precision (fabrication), truncation, structural masking and
+> the table/tip checks of `gamas_bot/notes_evidence.py`. The `description` field
+> of `corpus.json` still names the v2 scorer and is kept as a historical note.
 
 Six realistic lecture transcripts paired with hand-written *reference documents*
 — the shape a good model answer should take — plus the coverage floor each pair
@@ -47,5 +48,8 @@ were 100% for numbers everywhere, and 100% for terms except
 `05_code_switching_tech` (0.8), where spoken code produces phonetic tokens such
 as "equals" and "string" that a good note legitimately rewrites into real syntax.
 
-To restore the benchmark, write a scorer over this corpus and add it as a test
-module; the fixtures and floors need no change.
+The scorer now lives in `tests/test_note_evidence.py`. Two reference documents
+were corrected when the strict grounding policy landed: `01` had dropped the
+`۱.۷۳` body-surface denominator and asserted clinical verdicts («طبیعی») the
+lecture never gave, and `06` had dropped the semester `۱۴۰۵`; both are content
+under the "nothing added, nothing removed" contract.

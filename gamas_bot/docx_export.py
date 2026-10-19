@@ -1792,9 +1792,27 @@ def _sections_chars(sections) -> int:
         total += sum(len(value) for value in section.key_points)
         for callout in section.callouts:
             total += len(callout.text)
-        if section.table is not None:
-            total += sum(len(header) for header in section.table.headers)
-            total += sum(len(cell) for row in section.table.rows for cell in row)
+        for table in section.all_tables:
+            total += len(table.caption)
+            total += sum(len(header) for header in table.headers)
+            total += sum(len(cell) for row in table.rows for cell in row)
+    return total
+
+
+def _document_chars(notes) -> int:
+    """Visible length of the whole booklet.
+
+    ``_sections_chars`` covers the body; the parts around it (summary, key
+    points, practical tips, review questions, glossary) are just as long and
+    just as much of a reason to offer a table of contents.
+    """
+    total = _sections_chars(notes.sections)
+    total += len(notes.title or "") + len(notes.summary or "")
+    total += sum(len(value) for value in notes.learning_objectives)
+    total += sum(len(value) for value in notes.key_points)
+    total += sum(len(tip.kind) + len(tip.text) for tip in notes.practical_tips)
+    total += sum(len(value) for value in notes.review_questions)
+    total += sum(len(entry.term) + len(entry.definition) for entry in notes.glossary)
     return total
 
 
@@ -2609,9 +2627,17 @@ def _add_section(document, index: int, section: NoteSection, *, fonts: DocumentF
         )
     for callout in section.callouts:
         _add_callout(document, callout, fonts=fonts)
-    if section.table is not None:
-        _add_heading(document, "مقایسه و دسته‌بندی", fonts=fonts, level=2)
-        _add_table(document, section.table, fonts=fonts)
+    for position, table in enumerate(section.all_tables, start=1):
+        if table.caption:
+            label = table.caption
+        else:
+            label = (
+                "مقایسه و دسته‌بندی"
+                if len(section.all_tables) == 1
+                else f"جدول {to_persian_digits(position)}"
+            )
+        _add_heading(document, label, fonts=fonts, level=2)
+        _add_table(document, table, fonts=fonts)
 
 
 #: Persian labels for the note modes, shown on the cover.
@@ -2639,7 +2665,7 @@ def build_notes_docx(
     style = design or DocxDesign()
     document = _new_document(meta, notes.display_title)
     _configure_styles(document, resolved)
-    toc_needed = toc_is_worth_it(_sections_chars(notes.sections), len(notes.sections), style)
+    toc_needed = toc_is_worth_it(_document_chars(notes), len(notes.sections), style)
     toc_table = None
 
     first_section = document.sections[0]
@@ -2702,6 +2728,17 @@ def build_notes_docx(
         _add_boxed_lines(
             document, "مهم‌ترین نکته‌های این جزوه", list(notes.key_points),
             fonts=resolved, fill=KEYPOINT_SHADE, border=KEYPOINT_BORDER, level=2,
+        )
+
+    if notes.practical_tips:
+        _add_heading(document, "نکته‌های کاربردی", fonts=resolved, level=1)
+        _add_boxed_lines(
+            document,
+            "توصیه‌های خودِ مدرس برای کاربرد و آزمون",
+            [f"{tip.kind}: {tip.text}" for tip in notes.practical_tips],
+            fonts=resolved,
+            fill=KEYPOINT_SHADE,
+            border=KEYPOINT_BORDER,
         )
 
     if notes.review_questions:

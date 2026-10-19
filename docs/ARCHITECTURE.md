@@ -23,6 +23,9 @@ Transcript engine        transcript.py  cleanup, paragraphing, chunking
         ↓  raw .txt delivered here
 Note generation          notes.py + llm.py   map over chunks, optional reduce
         ↓
+Evidence gate            notes_evidence.py   signals, table cells, tip bases
+        ↓  optional bounded repair + number scrub
+        ↓
 Word export              docx_export.py RTL booklet
         ↓
 Delivery                 telegram_text.py   render → paginate → send
@@ -69,7 +72,8 @@ Arrangement (optional)   office_ai.py   one model request, checked against the s
 | `stt.py` | STT provider adapters, retries, cooldowns, ordered failover |
 | `transcript.py` | Fidelity-gated cleanup, paragraphing from word timings, chunking |
 | `llm.py` | One LLM client: per-provider request/response, failover, error classes |
-| `notes.py` | Prompts, chunk budget, map/reduce, deterministic merge |
+| `notes.py` | Prompts, chunk budget, map/reduce, deterministic merge, evidence gate and one-pass repair |
+| `notes_evidence.py` | Deterministic signals (numbers with units, terms, URLs), notes audit, table-cell and tip-basis validation, sentence coverage. No network, no model, no dependency |
 | `docx_export.py` | RTL Word document: cover, frame, styles, TOC, fonts |
 | `mdblocks.py` | The one text parser: headings, bullets, grids, paragraphs |
 | `office.py` | The Free Office section: document model, `.xlsx` and `.pptx` builders |
@@ -80,6 +84,20 @@ Arrangement (optional)   office_ai.py   one model request, checked against the s
 
 Dependencies point one way: `bot.py` imports the pipeline modules, the pipeline
 modules never import `bot.py`, and `config.py` imports nothing from the package.
+
+### Note generation and evidence
+
+The note model restructures; it does not author. `notes.py` sends one request per
+chunk (bounded concurrency), merges the answers deterministically, and then
+`notes_evidence.py` checks the result against the transcript: every number+unit,
+Latin term and URL must survive (recall), nothing may appear that the source does
+not contain (precision), every table cell must trace to the source, and every
+practical tip must carry a verbatim `basis`. A deficit triggers at most one
+bounded repair request that carries only the missing facts and their source
+windows; a number the lecture never contained is removed with the sentence that
+states it. `NOTE_STRICT_GROUNDING=false` restores prompt-only behaviour and
+`NOTE_QUALITY_GATE=warn` audits without acting. See
+[NOTE_QUALITY.md](NOTE_QUALITY.md).
 
 ## Concurrency
 

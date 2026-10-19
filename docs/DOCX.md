@@ -86,6 +86,15 @@ paragraphs are kept together and table rows use `cantSplit`, with repeating
 header rows. Tables use python-docx's `table_direction = RTL` API (minimum
 python-docx version 1.2) so logical column one appears on the visual right.
 
+Each section can carry more than one table (`NoteSection.tables`, schema v4)
+alongside the legacy single `table`; they are rendered in that order, each under
+its own `caption` paragraph, and are part of the `_sections_chars` length
+estimate. The lecturer's advice is rendered as **«نکتههای کاربردی»**: one shaded,
+bordered box before the review questions, one paragraph per tip with its `kind`
+label («هشدار»، «نکته»، …). Both sections are pure formatting of validated
+content — the evidence gate has already dropped any table or tip that the
+transcript does not support, so the renderer never decides what is true.
+
 ## Reproducibility and performance
 
 * Identical inputs produce byte-identical output. python-docx stamps package

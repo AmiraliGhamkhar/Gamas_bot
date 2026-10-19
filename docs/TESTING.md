@@ -26,7 +26,7 @@ has drifted.
 
 ## Coverage
 
-The suite contains 14 test modules plus `tests/support.py`. Counts are not
+The suite contains 15 test modules plus `tests/support.py`. Counts are not
 repeated here on purpose — run `python -m pytest -q` and report the number from
 that run.
 
@@ -40,7 +40,8 @@ that run.
 | One-shot v2 database import | `tests/test_import_v2.py` |
 | Queue bounds, back-pressure, shutdown | `tests/test_jobs.py` |
 | LLM request/response shapes, error classes, failover | `tests/test_llm.py` |
-| Note parsing, slide-aware chunking, map/reduce, split recovery | `tests/test_notes.py` |
+| Note parsing, slide-aware chunking, map/reduce, split recovery, evidence gate, repair, number scrub | `tests/test_notes.py` |
+| Deterministic note benchmark: signal extraction, unit aliases, structural masking, table cells, tip bases, coverage floors over `tests/fixtures/notes/` | `tests/test_note_evidence.py` |
 | PyAV merge metadata, PPTX media relationships, timing and XML fallback | `tests/test_media.py` |
 | Free Office: parser, Word/Excel/PowerPoint output, bot flow | `tests/test_office.py` |
 | STT adapters, retries, cooldowns, ordered failover | `tests/test_stt.py` |

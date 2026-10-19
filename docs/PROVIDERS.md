@@ -75,6 +75,11 @@ and the next provider in the chain is tried at once.
   recommends `max_completion_tokens` instead of `max_tokens`, the client retries
   with the same output budget under that name. These corrections are bounded; an
   unchanged rejected request is never resent. Gemini normally asks for native JSON.
+* **`NOTE_STRICT_GROUNDING` / `NOTE_QUALITY_GATE`** control the evidence gate
+  that runs *after* the model answers (see [NOTE_QUALITY.md](NOTE_QUALITY.md)).
+  They do not change a request, so they are provider-independent; the extra
+  repair request, when it runs, uses the same failover chain as the compile
+  pass and can be disabled with `NOTE_QUALITY_GATE=warn`.
 * **`NOTE_REASONING_EFFORT`** (unset by default) sends `reasoning_effort` on
   the Nara and OpenRouter routes only — the two gateways verified for the
   field (`ultra` is normalized to `max`). A generic OpenAI-compatible gateway

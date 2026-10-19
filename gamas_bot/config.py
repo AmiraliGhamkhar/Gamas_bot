@@ -249,6 +249,18 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw in TRUTHY
 
 
+#: The two evidence-gate behaviours. ``repair`` is the default; ``warn`` exists
+#: so an operator can observe the audit on real lectures before it is allowed
+#: to change an answer.
+NOTE_QUALITY_GATES = ("repair", "warn")
+
+
+def resolve_note_quality_gate(value: str | None) -> str:
+    """Resolve ``NOTE_QUALITY_GATE``; an unknown value means ``repair``."""
+    resolved = (value or "").strip().lower()
+    return resolved if resolved in NOTE_QUALITY_GATES else "repair"
+
+
 def resolve_note_mode(mode: str | None) -> str:
     """Resolve a note compression mode, defaulting to ``full``."""
     value = (mode or "").strip().lower()
@@ -357,6 +369,12 @@ class Settings:
     note_compile: bool
     note_compile_max_chars: int
     note_reasoning_effort: str
+    #: Evidence gate: audit the generated notes against the source and repair
+    #: what is missing. Off restores the pre-v4 behaviour exactly.
+    note_strict_grounding: bool
+    #: ``repair`` performs the one bounded repair request; ``warn`` only audits
+    #: and logs, which is the safe first-week setting for a new deployment.
+    note_quality_gate: str
 
     # --- Raw text -----------------------------------------------------------
     raw_text_profile: str
@@ -865,6 +883,8 @@ def from_env(env_file: str | None = None) -> Settings:
             "NOTE_COMPILE_MAX_CHARS", 0, minimum=0, maximum=2_000_000
         ),
         note_reasoning_effort=resolve_note_reasoning_effort(_env("NOTE_REASONING_EFFORT")),
+        note_strict_grounding=_env_bool("NOTE_STRICT_GROUNDING", True),
+        note_quality_gate=resolve_note_quality_gate(_env("NOTE_QUALITY_GATE")),
         raw_text_profile=resolve_raw_text_profile(_env("RAW_TEXT_PROFILE")),
         office_enabled=_env_bool("OFFICE_ENABLED", True),
         office_max_input_bytes=_env_int(
