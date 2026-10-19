@@ -1,107 +1,154 @@
-"""Azure AI Document Intelligence adapter for Persian/Arabic document OCR."""
+"""API-free Persian/Arabic OCR using a local Tesseract executable.
+
+The Python package does not download models or contact a cloud OCR provider.
+On cPanel, the host must provide Tesseract (or the operator must install a
+compatible local binary and set TESSERACT_CMD/TESSDATA_PREFIX).
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+import shutil
+import subprocess
 from pathlib import Path
-from urllib.parse import urlsplit
+
+DEFAULT_LANGUAGES = "fas+ara+eng"
+SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+DEFAULT_MAX_PAGES = 20
+DEFAULT_MAX_BYTES = 15 * 1024 * 1024
 
 
 class OcrError(RuntimeError):
-    """Safe-to-display OCR error."""
+    """A safe-to-display OCR failure."""
 
 
-@dataclass(frozen=True)
-class OcrResult:
-    text: str
-    searchable_pdf: bytes
+def _tesseract_command() -> str:
+    configured = os.environ.get("TESSERACT_CMD", "").strip()
+    command = configured or shutil.which("tesseract")
+    if not command:
+        raise OcrError(
+            "OCR محلی روی این سرور آماده نیست: برنامهٔ Tesseract نصب نیست. "
+            "از میزبان cPanel بخواهید Tesseract با زبان‌های fas و ara را نصب کند."
+        )
+    return command
 
 
-SUPPORTED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".bmp"}
+def _run_tesseract(
+    command: str, image: bytes, *, languages: str, timeout_seconds: float
+) -> str:
+    try:
+        result = subprocess.run(
+            [command, "stdin", "stdout", "-l", languages, "--psm", "3"],
+            input=image,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+            env=os.environ.copy(),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise OcrError("زمان OCR تمام شد؛ فایل کوچک‌تر یا واضح‌تری بفرستید.") from exc
+    except OSError as exc:
+        raise OcrError("اجرای Tesseract روی این سرور ممکن نیست.") from exc
+
+    if result.returncode:
+        stderr = result.stderr.decode("utf-8", errors="replace").lower()
+        if "failed loading language" in stderr or "could not initialize" in stderr:
+            raise OcrError(
+                "دادهٔ زبان OCR موجود نیست. Tesseract باید زبان‌های fas و ara "
+                "و در صورت نیاز eng را داشته باشد."
+            )
+        raise OcrError("Tesseract نتوانست این صفحه را پردازش کند.")
+    return result.stdout.decode("utf-8", errors="replace").strip()
 
 
-def classify_file(filename: str | None, mime_type: str | None, *, is_photo=False):
-    if is_photo:
-        return "telegram-photo.jpg", "image/jpeg"
-    extension = Path(filename or "").suffix.lower()
-    mime_map = {
-        "application/pdf": ".pdf",
-        "image/png": ".png",
-        "image/jpeg": ".jpg",
-        "image/bmp": ".bmp",
-    }
-    if extension in SUPPORTED_EXTENSIONS:
-        return filename or f"document{extension}", {
-            ".pdf": "application/pdf", ".png": "image/png",
-            ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".bmp": "image/bmp",
-        }[extension]
-    extension = mime_map.get((mime_type or "").split(";")[0].strip().lower())
-    if extension:
-        return filename or f"document{extension}", {
-            ".pdf": "application/pdf", ".png": "image/png",
-            ".jpg": "image/jpeg", ".bmp": "image/bmp",
-        }[extension]
-    return None
+def extract_text(
+    path: str | Path,
+    *,
+    languages: str | None = None,
+    max_pages: int = DEFAULT_MAX_PAGES,
+    max_bytes: int = DEFAULT_MAX_BYTES,
+    timeout_seconds: float = 240.0,
+) -> str:
+    """Extract text from a supported image/PDF without any network/API calls.
 
+    Searchable PDF pages use their embedded text layer. Scanned PDF pages are
+    rasterized with PyMuPDF and passed to local Tesseract one at a time.
+    """
+    source = Path(path)
+    if source.suffix.lower() not in SUPPORTED_EXTENSIONS:
+        raise OcrError("فرمت پشتیبانی نمی‌شود؛ PDF یا تصویر بفرستید.")
+    try:
+        size = source.stat().st_size
+    except OSError as exc:
+        raise OcrError("فایل بارگذاری‌شده پیدا نشد.") from exc
+    if size <= 0 or size > max_bytes:
+        raise OcrError(f"حجم فایل باید کمتر از {max_bytes // (1024 * 1024)} مگابایت باشد.")
 
-def run_azure_ocr(path: Path, endpoint: str, api_key: str, max_pages: int = 50,
-                  timeout_seconds: float = 300) -> OcrResult:
-    if not endpoint or not api_key:
-        raise OcrError("OCR provider is not configured.")
-    parsed = urlsplit(endpoint)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.query or parsed.fragment:
-        raise OcrError("Azure OCR endpoint must be a valid HTTPS URL.")
+    command = _tesseract_command()
+    language_setting = (languages or os.environ.get("OCR_LANGUAGES", DEFAULT_LANGUAGES)).strip()
+    if not language_setting or any(ch.isspace() for ch in language_setting):
+        raise OcrError("تنظیم زبان OCR نامعتبر است.")
 
-    if path.suffix.lower() == ".pdf":
-        try:
-            from pypdf import PdfReader
-            reader = PdfReader(str(path), strict=False)
-            if reader.is_encrypted:
-                raise OcrError("Encrypted PDFs are not supported; upload an unlocked PDF.")
-            if not 1 <= len(reader.pages) <= max_pages:
-                raise OcrError(f"PDF page count must be between 1 and {max_pages}.")
-        except OcrError:
-            raise
-        except Exception as exc:
-            raise OcrError("Could not read this PDF.") from exc
+    # Confirm the configured language packs exist before doing expensive work.
+    try:
+        langs = subprocess.run(
+            [command, "--list-langs"], capture_output=True, text=True,
+            timeout=10, check=False, env=os.environ.copy(),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise OcrError("بررسی نصب Tesseract روی سرور ناموفق بود.") from exc
+    if langs.returncode:
+        raise OcrError("Tesseract روی سرور به‌درستی اجرا نمی‌شود.")
+    available = set(langs.stdout.splitlines()[1:])
+    missing = [lang for lang in language_setting.split("+") if lang not in available]
+    if missing:
+        raise OcrError(
+            "دادهٔ زبان OCR نصب نیست: " + ", ".join(missing)
+            + ". میزبان باید زبان‌های fas و ara را نصب کند."
+        )
+
+    if source.suffix.lower() != ".pdf":
+        text = _run_tesseract(
+            command, source.read_bytes(), languages=language_setting,
+            timeout_seconds=timeout_seconds,
+        )
+        if not text:
+            raise OcrError("متنی در تصویر تشخیص داده نشد؛ تصویر واضح‌تری بفرستید.")
+        return text
 
     try:
-        from azure.ai.documentintelligence import DocumentIntelligenceClient
-        from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
-        from azure.ai.documentintelligence.models import AnalyzeOutputOption
-        from azure.ai.documentintelligence.models import DocumentContentFormat
-        from azure.core.credentials import AzureKeyCredential
+        import fitz  # PyMuPDF; ships wheels and does not require Poppler.
     except ImportError as exc:
-        raise OcrError("OCR dependencies are missing. Reinstall requirements.txt.") from exc
+        raise OcrError("وابستگی PDF نصب نیست؛ بستهٔ PyMuPDF را نصب کنید.") from exc
 
-    client = None
+    pieces: list[str] = []
+    elapsed_budget = timeout_seconds
     try:
-        client = DocumentIntelligenceClient(
-            endpoint=endpoint, credential=AzureKeyCredential(api_key)
-        )
-        with path.open("rb") as f:
-            request = AnalyzeDocumentRequest(bytes_source=f.read())
-        poller = client.begin_analyze_document(
-            model_id="prebuilt-read",
-            body=request,
-            output_content_format=DocumentContentFormat.TEXT,
-            output=[AnalyzeOutputOption.PDF],
-            content_type="application/json",
-        )
-        result = poller.result(timeout=timeout_seconds)
-        operation_id = poller.details.get("operation_id")
-        if not operation_id:
-            raise OcrError("OCR provider did not return a result identifier.")
-        pdf = b"".join(client.get_analyze_result_pdf(
-            model_id="prebuilt-read", result_id=operation_id
-        ))
-        text = (getattr(result, "content", None) or "").strip()
-        if not text or not pdf:
-            raise OcrError("No readable text or searchable PDF was returned.")
-        return OcrResult(text=text, searchable_pdf=pdf)
+        with fitz.open(source) as document:
+            if document.is_encrypted:
+                raise OcrError("PDF رمزدار پشتیبانی نمی‌شود؛ نسخهٔ بدون رمز بفرستید.")
+            if not 1 <= document.page_count <= max_pages:
+                raise OcrError(f"PDF باید بین ۱ تا {max_pages} صفحه داشته باشد.")
+            for index, page in enumerate(document):
+                embedded = page.get_text("text").strip()
+                if embedded:
+                    pieces.append(embedded)
+                    continue
+                # 2x is a practical compromise for shared-hosting CPU and memory.
+                pixmap = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False)
+                image = pixmap.tobytes("png")
+                page_timeout = max(1.0, elapsed_budget / max(1, document.page_count - index))
+                page_text = _run_tesseract(
+                    command, image, languages=language_setting,
+                    timeout_seconds=page_timeout,
+                )
+                pieces.append(page_text)
     except OcrError:
         raise
     except Exception as exc:
-        raise OcrError(f"OCR provider failed ({type(exc).__name__}).") from exc
-    finally:
-        if client is not None:
-            client.close()
+        raise OcrError("PDF خراب است یا قابل خواندن نیست.") from exc
+
+    text = "\n\n".join(part for part in pieces if part).strip()
+    if not text:
+        raise OcrError("متنی در فایل تشخیص داده نشد؛ فایل واضح‌تری بفرستید.")
+    return text
