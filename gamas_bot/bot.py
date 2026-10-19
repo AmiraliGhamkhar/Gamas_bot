@@ -314,6 +314,7 @@ class GamasBot:
             worker=self._run_job,
         )
         self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
+        self._ocr_semaphore = asyncio.Semaphore(1)  # protect shared-host CPU/RAM
         self._receipt_cleanup_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
         self._pending_broadcast: set[int] = set()
@@ -1064,13 +1065,14 @@ class GamasBot:
                 from .ocr import OcrError, extract_text
 
                 try:
-                    text = await asyncio.to_thread(
-                        extract_text,
-                        input_path,
-                        max_pages=20,
-                        max_bytes=OCR_MAX_BYTES,
-                        timeout_seconds=240.0,
-                    )
+                    async with self._ocr_semaphore:
+                        text = await asyncio.to_thread(
+                            extract_text,
+                            input_path,
+                            max_pages=20,
+                            max_bytes=OCR_MAX_BYTES,
+                            timeout_seconds=240.0,
+                        )
                 except OcrError as exc:
                     await event.reply(str(exc))
                     return
