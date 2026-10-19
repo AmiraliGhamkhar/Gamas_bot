@@ -13,7 +13,7 @@ documents were made.
 ## The flow
 
 ```
-📄 آفیس رایگان  →  choose a format  →  send the text (or a .txt/.csv)
+📄 آفیس رایگان  →  choose a format  →  send the text (or a .txt/.md/.markdown/.csv)
         ↑                                     ↓
         └──── «➕ افزودن متن»  ←  the document is delivered
 ```
@@ -23,8 +23,10 @@ table first is asked for the format afterwards; a user who picks a format
 first is asked for the text. Both end at the same place.
 
 * a **text message** is the content;
-* an uploaded **`.txt` / `.csv` / `.tsv` / `.md` / `.log`** file is the content
-  (read as UTF-8, UTF-8-BOM, cp1256 or Latin-1, whichever decodes);
+* an uploaded **`.txt` / `.markdown` / `.md` / `.csv` / `.tsv` / `.log`** file is
+  the content (read as UTF-8, UTF-8-BOM, cp1256 or Latin-1, whichever decodes);
+  very long messages and full text uploads are split at headings / paragraphs
+  so the presentation planner always receives a processable chunk;
 * after the document is delivered, «➕ افزودن متن» reopens the request so the
   next message is added to the same document and a new one is built.
 
@@ -85,8 +87,10 @@ not carried into the document. Nothing else is added, removed or reordered.
 
 Arranging prose into slides, and inventing a table where there is none, is
 the only thing a model is asked for — and it is only asked when a note
-provider is configured. `gamas_bot/office_ai.py` makes **one** request per
-document and then *checks the answer against the user's text*:
+provider is configured. `gamas_bot/office_ai.py` splits very long messages
+and `.txt` / `.markdown` uploads at headings and paragraphs, then sends each
+chunk separately to the model, merges the results, and validates the output
+against the user's text:
 
 * a slide bullet that does not appear in the source is dropped, and a bullet
   that appears out of order is dropped too;
