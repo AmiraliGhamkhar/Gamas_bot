@@ -10,6 +10,7 @@ disagree, the code wins — and that is a bug worth reporting.
 | [`CONFIGURATION.md`](CONFIGURATION.md) | Every environment variable, precedence, what `--check` validates |
 | [`PROVIDERS.md`](PROVIDERS.md) | Note-generation providers and failover |
 | [`STT_PROVIDERS.md`](STT_PROVIDERS.md) | Speech-to-text providers, languages, limits |
+| [`OCR_PLAN.md`](OCR_PLAN.md) | Design record for the proposed Persian/Arabic/English OCR feature (not implemented yet) |
 | [`MEDIA.md`](MEDIA.md) | The Python-only media pipeline |
 | [`NOTE_QUALITY.md`](NOTE_QUALITY.md) | The note-fidelity contract: what must survive, what the evidence gate checks, how repair works |
 | [`NOTE_QUALITY_PLAN.md`](NOTE_QUALITY_PLAN.md) | Design record and research behind the fidelity contract |
