@@ -25,11 +25,18 @@ right-to-left Word booklet.
 Telegram → bounded job queue → media worker (PyAV) → speech-to-text
         → transcript engine (cleanup + paragraphing)
         → raw .txt delivered → note model (map + optional reduce)
-        → RTL Word document → delivery
+        → evidence gate (nothing invented, nothing lost) → RTL Word document
+        → delivery
 ```
 
 The raw transcript is persisted and delivered **before** note generation starts,
 so a note-provider outage never costs the user their content.
+
+Generated notes are checked against their source before delivery: every number,
+unit and term is compared with the transcript, tables and practical tips are kept
+only where the lecture supports them, and a value the lecture never contained is
+removed rather than shipped. The note model restructures; it does not author.
+See [docs/NOTE_QUALITY.md](docs/NOTE_QUALITY.md).
 
 For PowerPoint, narration linked to slides is merged into one STT request and
 mapped back to slides only when the provider supplies timestamps; untimed and

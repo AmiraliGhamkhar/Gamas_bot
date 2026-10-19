@@ -425,6 +425,8 @@ def make_settings(**overrides) -> Settings:
         note_compile=True,
         note_compile_max_chars=0,
         note_reasoning_effort="",
+        note_strict_grounding=False,
+        note_quality_gate="repair",
         raw_text_profile="plain",
         office_enabled=True,
         office_max_input_bytes=1_000_000,

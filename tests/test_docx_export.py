@@ -35,7 +35,7 @@ from gamas_bot.docx_export import (
     sanitize_filename_part,
     xml_safe,
 )
-from gamas_bot.notes import StructuredNotes
+from gamas_bot.notes import NoteSection, NoteTable, PracticalTip, StructuredNotes
 from tests.support import docx_text, sample_notes_json
 
 #: Shorthand for the wordprocessingml namespace used by the raw-XML assertions.
@@ -241,6 +241,110 @@ class NotesDocxTests(unittest.TestCase):
         document = docx_library.Document(io.BytesIO(data))
         self.assertEqual(document.core_properties.title, "فارماکولوژی دیابت")
         self.assertEqual(document.core_properties.author, "Gamas Bot")
+
+
+class PracticalTipsAndTablesTests(unittest.TestCase):
+    """The v4 booklet surfaces the lecturer's advice and every table."""
+
+    def _notes(self) -> StructuredNotes:
+        return StructuredNotes(
+            title="جزوهٔ کاربردی",
+            sections=[
+                NoteSection(
+                    heading="دوز دارو",
+                    paragraphs=["دوز شروع ۵۰۰ mg است."],
+                    table=NoteTable(
+                        ["دارو", "دوز"], [["Metformin", "۵۰۰ mg"]], "دوزهای شروع"
+                    ),
+                    tables=(
+                        NoteTable(
+                            ["عارضه", "شیوع"],
+                            [["تهوع", "شایع"]],
+                            "عارضه‌های شایع",
+                        ),
+                    ),
+                )
+            ],
+            practical_tips=[
+                PracticalTip(
+                    "Metformin در نارسایی کلیوی قطع می‌شود.",
+                    basis="بیمار با نارسایی کلیوی نباید Metformin بگیرد",
+                    kind="هشدار",
+                )
+            ],
+        )
+
+    def test_every_table_and_its_caption_is_rendered(self):
+        import docx as docx_library
+
+        data = build_notes_docx(self._notes(), meta=META)
+        document = docx_library.Document(io.BytesIO(data))
+        texts = [paragraph.text for paragraph in document.paragraphs]
+        self.assertIn("دوزهای شروع", texts)
+        self.assertIn("عارضه‌های شایع", texts)
+        self.assertEqual(len(document.tables) >= 2, True)
+
+    def test_the_practical_tips_section_is_rendered_as_a_box(self):
+        import docx as docx_library
+
+        base = self._notes()
+        notes = StructuredNotes(
+            title=base.title,
+            sections=base.sections,
+            practical_tips=base.practical_tips,
+            review_questions=("دوز شروع Metformin چقدر است؟",),
+        )
+        data = build_notes_docx(notes, meta=META)
+        document = docx_library.Document(io.BytesIO(data))
+        texts = [paragraph.text for paragraph in document.paragraphs]
+        self.assertIn("نکته‌های کاربردی", texts)
+
+        tip_index = texts.index("نکته‌های کاربردی")
+        review_index = texts.index("پرسش‌های مرور")
+        self.assertLess(tip_index, review_index)
+        tip_paragraphs = [text for text in texts if "Metformin در نارسایی کلیوی" in text]
+        self.assertTrue(tip_paragraphs)
+        self.assertIn("هشدار", tip_paragraphs[0])
+
+        # The section is a box: shading and border, not just a heading.
+        body = document_root(data)
+        tip_element = next(
+            paragraph._p
+            for paragraph in document.paragraphs
+            if "Metformin در نارسایی کلیوی" in paragraph.text
+        )
+        properties = tip_element.find(f"{W}pPr")
+        self.assertIsNotNone(properties)
+        shading = properties.find(f"{W}shd")
+        self.assertIsNotNone(shading)
+        self.assertEqual(shading.get(f"{W}fill"), KEYPOINT_SHADE)
+        borders = properties.find(f"{W}pBdr")
+        self.assertIsNotNone(borders)
+        self.assertIn(KEYPOINT_BORDER, etree.tostring(borders, encoding="unicode"))
+        self.assertIn("w:shd", etree.tostring(body, encoding="unicode"))
+
+    def test_tips_are_part_of_the_length_estimate(self):
+        from gamas_bot.docx_export import _document_chars
+
+        base = self._notes()
+        without_tips = StructuredNotes(
+            title=base.title, sections=base.sections, practical_tips=()
+        )
+        self.assertGreater(
+            _document_chars(base),
+            _document_chars(without_tips) + len(base.practical_tips[0].text),
+        )
+
+    def test_tables_are_part_of_the_length_estimate(self):
+        from gamas_bot.docx_export import _document_chars, _sections_chars
+
+        section = self._notes().sections[0]
+        bare = NoteSection(heading=section.heading, paragraphs=section.paragraphs)
+        self.assertGreater(_sections_chars([section]), _sections_chars([bare]))
+        self.assertEqual(_document_chars(self._notes()), _sections_chars([section])
+                         + len(self._notes().title)
+                         + sum(len(tip.kind) + len(tip.text)
+                               for tip in self._notes().practical_tips))
 
 
 class OOXMLChildOrderTests(unittest.TestCase):

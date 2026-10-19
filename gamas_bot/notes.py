@@ -26,6 +26,7 @@ import json
 import logging
 import math
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 
 import aiohttp
@@ -36,6 +37,18 @@ from .llm import (
     LLMError,
     LLMOutputBudgetError,
     complete_json,
+)
+from .notes_evidence import (
+    NoteQualityReport,
+    SignalAudit,
+    audit_notes,
+    content_words,
+    coverage_thresholds,
+    evidence_windows,
+    extract_signals,
+    sentence_coverage,
+    validate_table,
+    validate_tip,
 )
 from .progress import to_persian_digits
 from .textnorm import normalize_for_compare
@@ -83,6 +96,15 @@ PROMPT_RESERVE_TOKENS = 512
 #: (1 → 2 → 4 requests, each cut at a paragraph/sentence boundary).
 MAX_CONTEXT_SPLITS = 2
 
+#: Hard ceiling on practical tips in one booklet; a long lecture may contain
+#: more advice than a study document should surface at once.
+MAX_PRACTICAL_TIPS = 8
+#: How many missing signals one repair request may carry. The windows are
+#: bounded, so the repair request stays far below the compile budget.
+MAX_REPAIR_SIGNALS = 40
+#: Source characters of context handed to the repair pass per missing signal.
+REPAIR_WINDOW_CHARS = 160
+
 
 class StructuringError(RuntimeError):
     """Note generation failed; the caller degrades to the raw transcript."""
@@ -115,6 +137,7 @@ class NoteCallout:
 class NoteTable:
     headers: list[str]
     rows: list[list[str]]
+    caption: str = ""
 
     @classmethod
     def from_payload(cls, payload: object) -> "NoteTable | None":
@@ -133,7 +156,45 @@ class NoteTable:
             if any(cell for cell in cells):
                 cells = (cells + [""] * len(headers))[: len(headers)]
                 rows.append(cells)
-        return cls(headers, rows) if rows else None
+        if not rows:
+            return None
+        caption = _bounded_text(payload.get("caption"), MAX_TITLE_CHARS)
+        return cls(headers, rows, caption)
+
+    def signature(self) -> tuple[str, ...]:
+        """Column identity, used to merge the same table across chunks."""
+        return tuple(_compare_key(header) for header in self.headers)
+
+
+#: The kinds a practical tip may carry. The label is the lecturer's stance,
+#: which the evidence layer can check against the basis sentence.
+TIP_KINDS = ("کاربردی", "آزمونی", "هشدار")
+
+
+@dataclass(frozen=True, slots=True)
+class PracticalTip:
+    """A surfaced piece of the lecturer's own advice.
+
+    ``basis`` is the verbatim source phrase the tip was derived from. It is
+    never rendered: it exists so :func:`gamas_bot.notes_evidence.validate_tip`
+    can prove the tip is not new content. A tip without a basis is dropped.
+    """
+
+    text: str
+    basis: str = ""
+    kind: str = "کاربردی"
+
+    @classmethod
+    def from_payload(cls, payload: object) -> "PracticalTip | None":
+        if not isinstance(payload, dict):
+            return None
+        text = _bounded_text(payload.get("text"))
+        if not text:
+            return None
+        kind = _bounded_text(payload.get("kind"), 20)
+        if kind not in TIP_KINDS:
+            kind = "کاربردی"
+        return cls(text, _bounded_text(payload.get("basis")), kind)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,6 +202,7 @@ class NoteDefinition:
     term: str
     definition: str
     term_en: str = ""
+
 
     @classmethod
     def from_payload(cls, payload: object) -> "NoteDefinition | None":
@@ -151,6 +213,35 @@ class NoteDefinition:
         if not term or not definition:
             return None
         return cls(term, definition, _bounded_text(payload.get("term_en"), MAX_TITLE_CHARS))
+
+
+def _normalise_tables(payload: dict) -> tuple[NoteTable | None, tuple[NoteTable, ...]]:
+    """Read ``table`` (legacy) and ``tables`` (v4) into primary + extras.
+
+    The primary table is ``table`` when present, else the first entry of
+    ``tables``. ``tables`` keeps every table that is not the primary one, so a
+    renderer that knows only ``table`` still shows the first table and the v4
+    renderer shows all of them. Identical tables are emitted once.
+    """
+    primary = NoteTable.from_payload(payload.get("table"))
+    extra: list[NoteTable] = []
+    seen: set[tuple[str, ...]] = set()
+    if primary is not None:
+        seen.add(primary.signature())
+    raw_tables = payload.get("tables")
+    if isinstance(raw_tables, dict):
+        # A model that returns one table under ``tables`` means a list of one.
+        raw_tables = [raw_tables]
+    for item in raw_tables if isinstance(raw_tables, (list, tuple)) else ():
+        table = NoteTable.from_payload(item)
+        if table is None or table.signature() in seen:
+            continue
+        seen.add(table.signature())
+        if primary is None:
+            primary = table
+        else:
+            extra.append(table)
+    return primary, tuple(extra)
 
 
 @dataclass(frozen=True, slots=True)
@@ -165,6 +256,15 @@ class NoteSection:
     key_points: tuple[str, ...] = ()
     table: NoteTable | None = None
     callouts: tuple[NoteCallout, ...] = ()
+    #: Additional tables beyond ``table``. The primary table stays in ``table``
+    #: so every existing renderer and the legacy payload keep working; a model
+    #: answer with ``tables`` is normalised into both fields.
+    tables: tuple[NoteTable, ...] = ()
+
+    @property
+    def all_tables(self) -> tuple[NoteTable, ...]:
+        primary = (self.table,) if self.table is not None else ()
+        return primary + tuple(self.tables)
 
     @property
     def has_content(self) -> bool:
@@ -176,7 +276,7 @@ class NoteSection:
             or self.steps
             or self.formulas
             or self.key_points
-            or self.table is not None
+            or self.all_tables
             or self.callouts
         )
 
@@ -193,6 +293,7 @@ class NoteSection:
         definitions = tuple(
             filter(None, (NoteDefinition.from_payload(item) for item in payload.get("definitions") or []))
         )
+        primary, extra = _normalise_tables(payload)
         section = cls(
             heading=heading,
             paragraphs=tuple(_string_list(payload.get("paragraphs"))),
@@ -202,8 +303,9 @@ class NoteSection:
             steps=tuple(_string_list(payload.get("steps"))),
             formulas=tuple(_string_list(payload.get("formulas"))),
             key_points=tuple(_string_list(payload.get("key_points"))),
-            table=NoteTable.from_payload(payload.get("table")),
+            table=primary,
             callouts=callouts,
+            tables=extra,
         )
         return section if section.has_content else None
 
@@ -234,6 +336,8 @@ class StructuredNotes:
     note_mode: str = "full"
     learning_objectives: tuple[str, ...] = ()
     review_questions: tuple[str, ...] = ()
+    #: The lecturer's own practical advice, surfaced with its source basis.
+    practical_tips: tuple[PracticalTip, ...] = ()
 
     @property
     def display_title(self) -> str:
@@ -248,6 +352,7 @@ class StructuredNotes:
             or self.glossary
             or self.learning_objectives
             or self.review_questions
+            or self.practical_tips
         )
 
     def to_payload(self) -> dict:
@@ -273,17 +378,24 @@ class StructuredNotes:
                     "steps": list(section.steps),
                     "formulas": list(section.formulas),
                     "key_points": list(section.key_points),
-                    "table": (
-                        {"headers": section.table.headers, "rows": section.table.rows}
-                        if section.table
-                        else None
-                    ),
+                    "tables": [
+                        {
+                            "caption": table.caption,
+                            "headers": list(table.headers),
+                            "rows": [list(row) for row in table.rows],
+                        }
+                        for table in section.all_tables
+                    ],
                     "callouts": [
                         {"kind": callout.kind, "text": callout.text}
                         for callout in section.callouts
                     ],
                 }
                 for section in self.sections
+            ],
+            "practical_tips": [
+                {"text": tip.text, "basis": tip.basis, "kind": tip.kind}
+                for tip in self.practical_tips
             ],
             "key_points": list(self.key_points),
             "review_questions": list(self.review_questions),
@@ -332,22 +444,23 @@ class StructuredNotes:
                 parts.extend(f"- {point}" for point in section.key_points)
             for callout in section.callouts:
                 parts.append(f"**{callout.kind}:** {callout.text}")
-            if section.table is not None:
-                header = "| " + " | ".join(section.table.headers) + " |"
+            for table in section.all_tables:
+                if table.caption:
+                    parts.append(f"**{table.caption}**")
+                header = "| " + " | ".join(table.headers) + " |"
                 separator = (
                     "|"
-                    + "|".join(
-                        "-" * max(len(header) + 2, 3) for header in section.table.headers
-                    )
+                    + "|".join("-" * max(len(header) + 2, 3) for header in table.headers)
                     + "|"
                 )
-                rows = "\n".join(
-                    "| " + " | ".join(row) + " |" for row in section.table.rows
-                )
+                rows = "\n".join("| " + " | ".join(row) + " |" for row in table.rows)
                 parts.append(f"{header}\n{separator}\n{rows}")
         if self.key_points:
             parts.append("## نکته‌های کلیدی")
             parts.extend(f"- {point}" for point in self.key_points)
+        if self.practical_tips:
+            parts.append("## نکته‌های کاربردی")
+            parts.extend(f"- **{tip.kind}:** {tip.text}" for tip in self.practical_tips)
         if self.review_questions:
             parts.append("## پرسش‌های مرور")
             parts.extend(
@@ -390,6 +503,16 @@ class StructuredNotes:
             if isinstance(raw_mode, str) and raw_mode in NOTE_MODES
             else resolve_note_mode(default_mode)
         )
+        raw_tips = payload.get("practical_tips")
+        practical_tips = tuple(
+            filter(
+                None,
+                (
+                    PracticalTip.from_payload(item)
+                    for item in (raw_tips if isinstance(raw_tips, (list, tuple)) else [])
+                ),
+            )
+        )
         notes = cls(
             title=_bounded_text(payload.get("title"), MAX_TITLE_CHARS),
             summary=_bounded_text(payload.get("summary")),
@@ -399,6 +522,7 @@ class StructuredNotes:
             note_mode=note_mode,
             learning_objectives=tuple(_string_list(payload.get("learning_objectives"))),
             review_questions=tuple(_string_list(payload.get("review_questions"))),
+            practical_tips=practical_tips,
         )
         if not notes.has_content:
             raise StructuringError("ساختار جزوهٔ دریافتی خالی بود.")
@@ -636,15 +760,28 @@ MODE_RULES = {
 
 _CONTENT_RULES = (
     "\nقواعد حفظ محتوا — مهم‌ترین بخش دستور است:\n"
-    "- فقط بر پایهٔ متن داده‌شده بنویسید؛ اطلاعات، فرمول، تعریف یا نتیجهٔ تازه نسازید. اگر بخشی نامفهوم است، آن را حدس نزنید و همان‌قدر که فهمیده‌اید بنویسید.\n"
-    "- هیچ عدد، واحد، درصد، دوز دارو، مقدار آزمایشگاهی یا علامت اختصاری را حذف یا تغییر ندهید؛ صورت دقیق آن‌ها را عیناً بیاورید.\n"
+    "- فقط بر پایهٔ متن داده‌شده بنویسید؛ اگر بخشی نامفهوم است، آن را حدس نزنید و همان‌قدر که فهمیده‌اید بنویسید.\n"
+    "- هیچ عدد، واحد، درصد، دوز، مقدار آزمایشگاهی، بازه یا علامت اختصاری را حذف یا تغییر ندهید؛ صورت دقیق آن‌ها را عیناً بیاورید.\n"
     "- اصطلاح‌های تخصصی و عبارت‌های انگلیسی (نام دارو، دستگاه، مفهوم علمی و مخفف‌ها) را به همان شکل انگلیسی و بدون ترجمهٔ اجباری داخل متن فارسی حفظ کنید؛ ترجمهٔ فارسی رایج را می‌توانید در پرانتز بیاورید.\n"
-    "- تعریف‌ها را در آرایهٔ definitions بیاورید (term، term_en اختیاری، definition)؛ مثال‌ها را در examples؛ روند یا دستورالعمل گام‌به‌گام را در steps؛ فرمول‌ها و معادله‌ها را با صورت دقیق‌شان در formulas بنویسید.\n"
+    "- تعریف‌ها را در definitions بیاورید (term، term_en اختیاری، definition)؛ مثال‌ها را در examples؛ روند گام‌به‌گام را در steps؛ فرمول‌ها را با صورت دقیق‌شان در formulas.\n"
     "- توضیح‌های مهم گوینده را به‌جای یک خط کوتاه، پاراگراف کامل بنویسید؛ جزوه باید درس را بدون شنیدن صدا قابل فهم کند.\n"
     "- نکته‌های کلیدی، یادآوری‌ها و هشدارهای مهم را در callouts یا key_points جداگانه برجسته کنید.\n"
     "- مطالب را با عنوان‌های بخش کوتاه و گویا مرتب کنید و ترتیب منطقی متن اصلی را نگه دارید.\n"
-    "- اگر چند مورد قابل مقایسه یا دسته‌بندی وجود دارد، از table استفاده کنید؛ جدول را بی‌دلیل به کار نبرید.\n"
+    "- اگر چند مورد قابل مقایسه یا دسته‌بندی وجود دارد، از tables استفاده کنید؛ جدول را بی‌دلیل به کار نبرید.\n"
     "- فقط حذف‌های مجاز: پرگویی بی‌محتوا، اصطلاح‌های گفتاری تصادفی، نویزِ پیاده‌سازی صدا و تکرار عین‌هم. هیچ توضیح آموزشی را به‌خاطر کوتاهی حذف نکنید.\n"
+)
+
+#: The explicit forbid-list: the additions this bot must never make. Each line
+#: is a failure mode observed in note generation, not a stylistic preference.
+_FORBIDDEN_ADDITIONS = (
+    "\nقواعد ممنوعیت افزودن — این فهرست استثنا ندارد:\n"
+    "- آمار، مرجع، راهنما، توصیهٔ درمانی، دوز، مثال یا تشبیه تازه نسازید.\n"
+    "- عدد، واحد، بازه، تاریخ یا نامی که در متن نیست ننویسید.\n"
+    "- اصطلاح تخصصی را ترجمه نکنید و مخفف را باز نکنید، مگر خود متن آن را گفته باشد.\n"
+    "- تبدیل واحد، گرد کردن، محاسبه و مقدار مشتق‌شده (BMI، eGFR، درصد) ننویسید.\n"
+    "- جملهٔ کلیشه‌ای، نصیحت مطالعه یا لحن تبلیغاتی اضافه نکنید.\n"
+    "- جملهٔ مبهم را «بهتر» یا «منطقی‌تر» بازنویسی نکنید؛ همان ابهام را نگه دارید.\n"
+    "- هیچ ادعایی که در متن منبع نیست، حتی اگر درست یا مشهور باشد، نیاورید.\n"
 )
 
 _SEMANTIC_RULES = (
@@ -653,6 +790,7 @@ _SEMANTIC_RULES = (
     "واحد آموزشی یعنی: تعریف، توضیح، مکانیزم و چرایی، مثال، مثال نقض، روند گام‌به‌گام، مقایسه، "
     "هشدار، استثنا، فرمول، عدد و اندازه‌گیری، تاریخ، نام‌های خاص، اصطلاح انگلیسی، مخفف، و نتیجه‌ای "
     "که گوینده صریحاً بیان کرده است.\n"
+    "- پیش از نوشتن، فهرست واحدهای آموزشی متن را در ذهن مرور کنید و مطمئن شوید هر کدام جایی در جزوه آمده است.\n"
     "- فقط این چهار چیز را می‌توانید حذف کنید: پرگویی و مکث، گفت‌وگوی حاشیه‌ای بی‌محتوا، نویزِ آشکار "
     "پیاده‌سازی صدا، و تکرار عیناً لفظ‌به‌لفظ.\n"
     "- این‌ها را هرگز حذف نکنید: توضیح آموزشی، مثال، زمینه‌ای که گفته برای فهم آن لازم است، جزئیات "
@@ -680,6 +818,34 @@ _STYLE_RULES = (
     "- اصطلاح تخصصی و انگلیسی را داخل جملهٔ فارسی به همان صورت اصلی بنویسید.\n"
 )
 
+#: Academic register. A booklet is a study document, not a chat reply.
+_ACADEMIC_RULES = (
+    "\nقواعد لحن دانشگاهی و حرفه‌ای:\n"
+    "- سوم‌شخص، بی‌طرف و فشرده بنویسید؛ از «شما»، «بیایید»، «در این جزوه خواهیم دید» و لحن گفتاری پرهیز کنید.\n"
+    "- جمله‌های خبری و روشن بنویسید؛ تعجب، هیجان، ایموجی و تعارف ننویسید.\n"
+    "- هر اصطلاح را در همهٔ جزوه یکدست بنویسید و برای یک مفهوم دو نام متفاوت نسازید.\n"
+    "- اگر گوینده احتمال یا تردید داده، همان را نگه دارید (ممکن است، احتمالاً، شواهد محدود است)؛ "
+    "آن را به قطعیت تبدیل نکنید.\n"
+)
+
+_TABLES_RULES = (
+    "\nقواعد جدول:\n"
+    "- جدول فقط وقتی که متن حداقل دو مورد قابل‌مقایسه با حداقل دو ویژگی داشته باشد.\n"
+    "- هر خانه باید عیناً از متن منبع آمده باشد (یا عدد و واحدِ موجود در متن)؛ محاسبه، میانگین، "
+    "رتبه‌بندی و خانهٔ استنتاجی ممنوع است.\n"
+    "- عنوان ستون‌ها را خودتان انتخاب کنید؛ محتوای خانه‌ها را نسازید و خانهٔ خالی را با حدس پر نکنید.\n"
+    "- حداکثر دو جدول در هر بخش، حداکثر ۸ سطر و ۶ ستون؛ اگر مطمئن نیستید، به‌جای جدول فهرست بنویسید.\n"
+    "- برای هر جدول یک caption کوتاه بنویسید که بگوید جدول چه چیزی را مقایسه می‌کند.\n"
+)
+
+_TIPS_RULES = (
+    "\nقواعد نکته‌های کاربردی:\n"
+    "- فقط توصیه، هشدار و تأکید عملیِ خودِ گوینده را بیاورید؛ نصیحت مطالعه و انگیزه‌بخشی ممنوع است.\n"
+    "- برای هر نکته، «basis» را عیناً از متن منبع کپی کنید (۵ تا ۳۰ واژه).\n"
+    "- نکته‌ای که پشتوانهٔ لفظی در متن ندارد، نوشته نمی‌شود؛ حداکثر ۸ نکته.\n"
+    "- اگر متن توصیهٔ عملی ندارد، آرایهٔ practical_tips خالی می‌ماند.\n"
+)
+
 _TRANSITION_RULES = (
     "\nقواعد پیوند و انسجام:\n"
     "- روابط متن را با همان کلمات ربط منبع حفظ کنید: علت و معلول (چون، زیرا، بنابراین، در نتیجه)، "
@@ -699,7 +865,7 @@ _JSON_RULES = (
     "{\n"
     "  \"title\": \"عنوان کوتاه جزوه\",\n"
     "  \"summary\": \"خلاصهٔ چند جمله‌ایِ موضوع و هدف جزوه\",\n"
-    "  \"learning_objectives\": [\"هدف یادگیری برگرفته از متن (اختیاری)\"],\n"
+    "  \"learning_objectives\": [\"هدف یادگیری که خود متن صریحاً پشتیبانی می‌کند (اختیاری)\"],\n"
     "  \"sections\": [\n"
     "    {\n"
     "      \"heading\": \"عنوان بخش\",\n"
@@ -710,19 +876,21 @@ _JSON_RULES = (
     "      \"steps\": [\"گام ۱ …\", \"گام ۲ …\"],\n"
     "      \"formulas\": [\"صورت دقیق فرمول\"],\n"
     "      \"key_points\": [\"نکتهٔ کلیدی همین بخش\"],\n"
-    "      \"table\": {\"headers\": [\"ستون ۱\", \"ستون ۲\"], \"rows\": [[\"مقدار\", \"مقدار\"]]},\n"
+    "      \"tables\": [{\"caption\": \"جدول چه چیزی را مقایسه می‌کند\", \"headers\": [\"ستون ۱\", \"ستون ۲\"], \"rows\": [[\"مقدار\", \"مقدار\"]]}],\n"
     "      \"callouts\": [{\"kind\": \"نکته\", \"text\": \"متن برجسته\"}]\n"
     "    }\n"
     "  ],\n"
+    "  \"practical_tips\": [{\"text\": \"توصیهٔ عملی برگرفته از متن\", \"basis\": \"عین جملهٔ منبع\", \"kind\": \"کاربردی\"}],\n"
     "  \"key_points\": [\"نکته‌های کلیدی کل جزوه\"],\n"
-    "  \"review_questions\": [\"پرسش مرور برگرفته از متن (اختیاری)\"],\n"
+    "  \"review_questions\": [\"پرسش مرور که خود متن صریحاً پشتیبانی می‌کند (اختیاری)\"],\n"
     "  \"glossary\": [{\"term\": \"اصطلاح\", \"definition\": \"تعریف کوتاه\"}]\n"
     "}\n"
     "۳) هر کلید اختیاری است؛ اگر محتوایی برایش ندارید آن را حذف کنید یا آرایه/رشتهٔ خالی بدهید. کلید تازه‌ای از خودتان نسازید.\n"
     "۳-۱) «learning_objectives» و «review_questions» را فقط وقتی بنویسید که خودِ متن صریحاً پشتوانهٔ آن‌ها باشد؛ "
     "هدف یا پرسشی که در متن نیست، نسازید.\n"
     "۴) «sections» را خالی نگذارید؛ دست‌کم یک بخش با عنوان معنادار و محتوای واقعی بسازید.\n"
-    "۵) در callouts مقدار kind فقط یکی از این سه باشد: «نکته»، «هشدار» یا «یادآوری».\n"
+    "۵) در callouts مقدار kind فقط یکی از این سه باشد: «نکته»، «هشدار» یا «یادآوری». "
+    "در practical_tips مقدار kind فقط یکی از این سه باشد: «کاربردی»، «آزمونی» یا «هشدار».\n"
     "۶) JSON باید بدون خطا قابل خواندن باشد: از نقل‌قول دوگانه استفاده کنید، کامای اضافی نگذارید و خط جدید داخل رشته‌ها را با \\n بنویسید.\n"
 )
 
@@ -777,7 +945,11 @@ def build_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
         + mode_rule
         + _SEMANTIC_RULES
         + _CONTENT_RULES
+        + _FORBIDDEN_ADDITIONS
+        + _TABLES_RULES
+        + _TIPS_RULES
         + _STYLE_RULES
+        + _ACADEMIC_RULES
         + _TRANSITION_RULES
     )
     if context_block:
@@ -797,8 +969,13 @@ def build_presentation_system_prompt(mode: str = "full", *, context_block: str =
         + "\n\nقواعد محتوا:\n"
         + mode_rule
         + _SEMANTIC_RULES
+        + _CONTENT_RULES
+        + _FORBIDDEN_ADDITIONS
         + _PRESENTATION_CONTENT_RULES
+        + _TABLES_RULES
+        + _TIPS_RULES
         + _STYLE_RULES
+        + _ACADEMIC_RULES
         + _TRANSITION_RULES
     )
     if context_block:
@@ -812,26 +989,27 @@ PRESENTATION_PROMPT = "محتوای ارائه (متن اسلایدها و گف�
 COMPILE_SYSTEM_PROMPT = (
     "شما ویراستار نهایی جزوهٔ فارسی «گاماس» هستید. ورودی شما «زمینهٔ کلی درس» و «جزوهٔ فعلی» "
     "به شکل JSON است؛ جزوهٔ فعلی از چند بخش جداگانه ساخته شده و ممکن است ناپیوسته یا تکراری باشد. "
-    "خروجی شما یک جزوهٔ واحد و روان است، نه خلاصه‌ای از جزوه.\n\n"
+    "خروجی شما همان جزوهٔ واحد است، نه خلاصه‌ای از آن.\n\n"
+    "قانون بنیادی: شما اجازهٔ بازنویسی سبکی و افزودن دانش بیرونی ندارید؛ کارتان ویرایش ساختاری است.\n\n"
     "کار شما:\n"
+    "- جمله‌ها را تا حد امکان عیناً نگه دارید؛ فقط نقطه‌گذاری، فاصله و پیوندهای لازم را اصلاح کنید.\n"
     "- بخش‌هایی که به یک موضوع واحد تعلق دارند را در یک بخش منسجم ادغام کنید؛ ترتیب منطقی متن را نگه دارید.\n"
     "- عنوان بخش‌ها را روشن، گویا و هماهنگ با «موضوع‌های درس» بنویسید؛ بخش‌های هم‌موضوع یا دنباله‌دار را ادغام کنید، اما موضوع‌های متمایز را در یک بخش واحد ادغام نکنید.\n"
-    "- تکرارهای عینی و تیترهای تکراری را یک‌بار بنویسید، ولی هیچ توضیح، تعریف، مثال، مرحله، مقایسه، هشدار، "
-    "استثنا، فرمول، عدد، واحد، تاریخ یا اصطلاح تازه‌ای را به‌خاطر کوتاه‌شدن حذف نکنید. دو جمله که یک "
-    "مفهوم را با کلمات متفاوت می‌گویند، تکرار عینی نیستند و هر دو می‌مانند؛ فقط تکرار لفظ‌به‌لفظ را یکی کنید.\n"
-    "- گذارهای طبیعی را فقط بر پایهٔ روابطی که در متن هست بازسازی کنید. ادعای تازه نسازید.\n"
-    "- به‌جای جمله‌های بریده‌بریده و فهرست‌های بی‌جا، پاراگراف‌های کامل و روان بنویسید.\n"
-    "- یک صورت یکدست برای هر اصطلاح انتخاب کنید و در همه‌جا همان را بنویسید.\n"
+    "- تکرار لفظ‌به‌لفظ را یک‌بار بنویسید؛ دو جمله که یک مفهوم را با کلمات متفاوت می‌گویند تکرار نیستند و هر دو می‌مانند.\n"
+    "- هیچ توضیح، تعریف، مثال، مرحله، مقایسه، هشدار، استثنا، فرمول، عدد، واحد، تاریخ، اصطلاح یا نکتهٔ کاربردی را حذف نکنید.\n"
+    "- هیچ ادعا، عدد، واحد، مرجع، توصیه یا مثال تازه‌ای اضافه نکنید و هیچ عددی را تبدیل، گرد یا دوباره محاسبه نکنید.\n"
     "- تعریف‌ها را در definitions، مثال‌ها را در examples، مراحل را در steps، فرمول‌ها را در formulas، "
-    "جدول‌ها را در table و هشدارها را در callouts نگه دارید.\n"
+    "جدول‌ها را در tables و هشدارها را در callouts نگه دارید.\n"
+    "- نکته‌های کاربردی را با متن و «basis» خودشان نگه دارید؛ نکته‌ای نسازید و پشتوانه‌ای را عوض نکنید.\n"
+    "- اگر دستور، فهرست «موارد جامانده» دارد، هر مورد را فقط با همان جملهٔ منبعی که همراه آن آمده در "
+    "جای درست خودش برگردانید و هیچ چیز دیگری اضافه نکنید.\n"
     "- خلاصهٔ کل درس را در summary و مهم‌ترین نکته‌های کل درس را در key_points بنویسید.\n"
-    "- فقط اگر همین متن مدرک روشنی برای «اهداف یادگیری» یا «پرسش‌های مرور» دارد، آن‌ها را کوتاه و مستقیماً "
-    "برگرفته از متن اضافه کنید؛ در غیر این صورت این دو کلید را نیاورید.\n"
+    "- «learning_objectives» و «review_questions» را فقط اگر همان متن مدرک روشنی دارد نگه دارید؛ "
+    "در غیر این صورت حذف کنید.\n"
     "- اطلاعات تازه اضافه نکنید. اگر چیزی در ورودی نیست، حدس نزنید.\n\n"
     "ساختار خروجی — فقط یک شیء JSON معتبر، بدون هیچ متن اضافه، با همان ساختار ورودی؛ "
     "«sections» هرگز خالی نمی‌شود و در callouts مقدار kind فقط «نکته»، «هشدار» یا «یادآوری» است."
 )
-
 
 def build_compile_system_prompt(
     mode: str = "full", *, presentation: bool = False
@@ -916,30 +1094,50 @@ def _table_rows_as_bullets(table: NoteTable) -> tuple[str, ...]:
     return tuple(bullets)
 
 
+def _merge_table_group(
+    tables: Sequence[NoteTable],
+) -> tuple[NoteTable | None, tuple[NoteTable, ...]]:
+    """Merge tables that share a column signature, keep distinct ones apart.
+
+    Two chunks that describe the same comparison produce two tables with the
+    same headers; their rows belong together. Two genuinely different tables
+    in one section are kept as separate tables instead of being flattened into
+    bullets — a table is the shape the lecturer's comparison actually has.
+    """
+    primary: NoteTable | None = None
+    extras: list[NoteTable] = []
+    for table in tables:
+        if primary is None:
+            primary = table
+            continue
+        if table.signature() == primary.signature():
+            primary = NoteTable(
+                list(primary.headers),
+                _dedupe_table_rows([list(row) for row in primary.rows] + [list(row) for row in table.rows]),
+                primary.caption or table.caption,
+            )
+            continue
+        for index, existing in enumerate(extras):
+            if existing.signature() == table.signature():
+                extras[index] = NoteTable(
+                    list(existing.headers),
+                    _dedupe_table_rows(
+                        [list(row) for row in existing.rows] + [list(row) for row in table.rows]
+                    ),
+                    existing.caption or table.caption,
+                )
+                break
+        else:
+            extras.append(table)
+    return primary, tuple(extras)
+
+
 def _combine_sections(first: NoteSection, second: NoteSection) -> NoteSection:
-    if first.table is None:
-        table = second.table
-        extra_bullets: tuple[str, ...] = ()
-    elif second.table is None:
-        table = first.table
-        extra_bullets = ()
-    elif [_compare_key(header) for header in first.table.headers] == [
-        _compare_key(header) for header in second.table.headers
-    ]:
-        table = NoteTable(
-            list(first.table.headers),
-            _dedupe_table_rows(
-                [list(row) for row in first.table.rows] + [list(row) for row in second.table.rows]
-            ),
-        )
-        extra_bullets = ()
-    else:
-        table = first.table
-        extra_bullets = _table_rows_as_bullets(second.table)
+    table, tables = _merge_table_group(first.all_tables + second.all_tables)
     return replace(
         first,
         paragraphs=_dedupe_by_key(first.paragraphs + second.paragraphs, _compare_key),
-        bullets=_dedupe_by_key(first.bullets + second.bullets + extra_bullets, _compare_key),
+        bullets=_dedupe_by_key(first.bullets + second.bullets, _compare_key),
         definitions=_dedupe_definitions(first.definitions + second.definitions),
         examples=_dedupe_by_key(first.examples + second.examples, _compare_key),
         steps=_dedupe_by_key(first.steps + second.steps, _compare_key),
@@ -947,6 +1145,7 @@ def _combine_sections(first: NoteSection, second: NoteSection) -> NoteSection:
         key_points=_dedupe_by_key(first.key_points + second.key_points, _compare_key),
         callouts=_dedupe_callouts(first.callouts + second.callouts),
         table=table,
+        tables=tables,
     )
 
 
@@ -963,11 +1162,11 @@ def _block_keys(section: NoteSection) -> tuple[str, ...]:
     keys.extend("f|" + _compare_key(value) for value in section.formulas if value)
     keys.extend("k|" + _compare_key(value) for value in section.key_points if value)
     keys.extend("c|" + callout.kind + "|" + _compare_key(callout.text) for callout in section.callouts)
-    if section.table is not None:
-        headers = "|".join(_compare_key(header) for header in section.table.headers)
+    for table in section.all_tables:
+        headers = "|".join(_compare_key(header) for header in table.headers)
         keys.extend(
             headers + "||" + "|".join(_compare_key(cell) for cell in row)
-            for row in section.table.rows
+            for row in table.rows
         )
     return tuple(key for key in keys if not key.endswith("|"))
 
@@ -1074,6 +1273,22 @@ def _dedupe_glossary(notes: list[StructuredNotes]) -> tuple[GlossaryEntry, ...]:
     return tuple(by_term[term] for term in term_order)
 
 
+def _dedupe_tips(tips: Sequence[PracticalTip]) -> tuple[PracticalTip, ...]:
+    """One copy of each tip; a longer basis wins because it is better evidence."""
+    by_text: dict[str, PracticalTip] = {}
+    order: list[str] = []
+    for tip in tips:
+        key = _compare_key(tip.text)
+        if not key:
+            continue
+        if key not in by_text:
+            by_text[key] = tip
+            order.append(key)
+        elif len(tip.basis) > len(by_text[key].basis):
+            by_text[key] = tip
+    return tuple(by_text[key] for key in order)
+
+
 def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
     """Combine per-chunk notes into one document, preserving order."""
     if not notes:
@@ -1105,6 +1320,7 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
         review_questions=_dedupe_by_key(
             [item for note in notes for item in note.review_questions], _compare_key
         ),
+        practical_tips=_dedupe_tips([tip for note in notes for tip in note.practical_tips]),
     )
     if not merged.has_content:
         raise StructuringError("ساختار جزوهٔ دریافتی خالی بود.")
@@ -1286,11 +1502,15 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
             item["formulas"] = list(section.formulas)
         if section.key_points:
             item["key_points"] = list(section.key_points)
-        if section.table is not None:
-            item["table"] = {
-                "headers": list(section.table.headers),
-                "rows": [list(row) for row in section.table.rows],
-            }
+        if section.all_tables:
+            item["tables"] = [
+                {
+                    "caption": table.caption,
+                    "headers": list(table.headers),
+                    "rows": [list(row) for row in table.rows],
+                }
+                for table in section.all_tables
+            ]
         if section.callouts:
             item["callouts"] = [{"kind": c.kind, "text": c.text} for c in section.callouts]
         sections.append(item)
@@ -1299,6 +1519,11 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
         payload["key_points"] = list(notes.key_points)
     if notes.review_questions:
         payload["review_questions"] = list(notes.review_questions)
+    if notes.practical_tips:
+        payload["practical_tips"] = [
+            {"text": tip.text, "basis": tip.basis, "kind": tip.kind}
+            for tip in notes.practical_tips
+        ]
     if notes.glossary:
         payload["glossary"] = [
             {"term": e.term, "definition": e.definition} for e in notes.glossary
@@ -1338,7 +1563,7 @@ def _notes_structured_item_count(notes: StructuredNotes) -> int:
         + len(section.formulas)
         + len(section.steps)
         + len(section.examples)
-        + (1 if section.table is not None else 0)
+        + len(section.all_tables)
         for section in notes.sections
     )
 
@@ -1354,9 +1579,10 @@ def _notes_body_chars(notes: StructuredNotes) -> int:
         total += sum(len(f) for f in section.formulas)
         total += sum(len(k) for k in section.key_points)
         total += sum(len(c.text) for c in section.callouts)
-        if section.table is not None:
-            total += sum(len(h) for h in section.table.headers)
-            total += sum(len(cell) for row in section.table.rows for cell in row)
+        for table in section.all_tables:
+            total += sum(len(h) for h in table.headers)
+            total += sum(len(cell) for row in table.rows for cell in row)
+        total += sum(len(tip.text) + len(tip.basis) for tip in notes.practical_tips)
     return total
 
 
@@ -1398,6 +1624,332 @@ def compile_accepts(compiled: StructuredNotes, merged: StructuredNotes) -> bool:
             )
             return False
     return True
+
+
+# ===========================================================================
+# Grounding gate and one-pass repair
+# ===========================================================================
+
+
+def _supported_by_source(text: str, source_words: frozenset[str], *, minimum: float) -> bool:
+    """Whether a model-written sentence is backed by the source's vocabulary.
+
+    Used for the two fields that invite outside knowledge —
+    ``learning_objectives`` and ``review_questions``. A field whose content
+    words are largely absent from the lecture is not "derived from the text";
+    it is the model's own study advice, and the strict policy drops it.
+    """
+    words = content_words(text)
+    if not words:
+        return False
+    return len(words & source_words) / len(words) >= minimum
+
+
+def gate_notes(
+    notes: StructuredNotes,
+    source: str,
+    *,
+    strict: bool = True,
+    mode: str = "full",
+) -> tuple[StructuredNotes, NoteQualityReport]:
+    """Drop what the source cannot support, then audit what remains.
+
+    * a table with an untraceable numeric cell — or with more than a quarter of
+      its text cells untraceable — is removed (it is never "fixed");
+    * a practical tip without a verbatim basis is removed;
+    * objectives and review questions without source vocabulary are removed;
+    * the surviving document is audited for omissions and fabrications.
+
+    Dropping is deliberately preferred to rewriting: a table or tip that fails
+    the check carries the exact failure the check exists for, and the prose
+    still states the fact (the audit reports it as missing if it does not).
+
+    With ``strict=False`` the validators still run and the counters still say
+    what *would* be dropped, but nothing is removed and no objective or review
+    question is filtered. That is the ``warn`` mode: an audit of the real
+    deployment without any effect on what the user receives.
+    """
+    from .notes_evidence import mask_structural  # local: keeps the import cycle-free
+
+    resolved_mode = resolve_note_mode(mode)
+    source_words = content_words(mask_structural(source))
+    tables_seen = tables_accepted = tips_seen = tips_accepted = 0
+    dropped_cells: list[str] = []
+    sections: list[NoteSection] = []
+    for section in notes.sections:
+        accepted_tables: list[NoteTable] = []
+        for table in section.all_tables:
+            tables_seen += 1
+            verdict = validate_table(table, source)
+            if not verdict.accepted:
+                dropped_cells.extend(verdict.failed_cells)
+                logger.info(
+                    "note table%s reason=%s cells=%d",
+                    " dropped" if strict else " would be dropped",
+                    verdict.reason,
+                    len(verdict.failed_cells),
+                )
+                if strict:
+                    continue
+            else:
+                tables_accepted += 1
+            accepted_tables.append(table)
+        gated = replace(
+            section,
+            table=accepted_tables[0] if accepted_tables else None,
+            tables=tuple(accepted_tables[1:]),
+        )
+        if gated.has_content:
+            sections.append(gated)
+
+    tips: list[PracticalTip] = []
+    for tip in notes.practical_tips:
+        tips_seen += 1
+        if not validate_tip(tip, source):
+            logger.info(
+                "note tip%s: basis not found in the source",
+                " dropped" if strict else " would be dropped",
+            )
+            if strict:
+                continue
+        else:
+            tips_accepted += 1
+        tips.append(tip)
+
+    objectives = notes.learning_objectives
+    review_questions = notes.review_questions
+    if strict:
+        objectives = tuple(
+            item
+            for item in objectives
+            if _supported_by_source(item, source_words, minimum=0.7)
+        )
+        review_questions = tuple(
+            item
+            for item in review_questions
+            if _supported_by_source(item, source_words, minimum=0.6)
+        )
+
+    gated = replace(
+        notes,
+        sections=tuple(sections),
+        practical_tips=tuple(tips[:MAX_PRACTICAL_TIPS]),
+        learning_objectives=objectives,
+        review_questions=review_questions,
+    )
+    audit = audit_notes(source, gated)
+    report = NoteQualityReport(
+        audit=audit,
+        coverage=sentence_coverage(source, gated),
+        tables_seen=tables_seen,
+        tables_accepted=tables_accepted,
+        tables_rejected=tables_seen - tables_accepted,
+        tips_seen=tips_seen,
+        tips_accepted=tips_accepted,
+        tips_rejected=tips_seen - tips_accepted,
+        objectives_dropped=len(notes.learning_objectives) - len(objectives),
+        review_questions_dropped=len(notes.review_questions) - len(review_questions),
+        dropped_cells=tuple(dict.fromkeys(dropped_cells)),
+    )
+    logger.info("note quality %s mode=%s", report.summary(), resolved_mode)
+    return gated, report
+
+
+def notes_need_repair(report: NoteQualityReport, *, mode: str = "full") -> bool:
+    """Whether a bounded repair request is justified.
+
+    A fabrication always is (faithfulness is a hard gate). Missing numbers are
+    a defect below the mode's recall floor, not a matter of taste. Prose
+    coverage is a soft signal: it only asks for repair when it is clearly low,
+    so a legitimately paraphrased booklet is not sent again.
+    """
+    number_floor, term_floor = coverage_thresholds(resolve_note_mode(mode))
+    audit = report.audit
+    return bool(
+        audit.fabricated
+        or audit.number_coverage < number_floor
+        or audit.term_coverage < term_floor
+        or report.coverage.ratio < 0.75
+    )
+
+
+def build_repair_document(
+    notes: StructuredNotes,
+    report: NoteQualityReport,
+    source: str,
+    *,
+    mode: str = "full",
+) -> str:
+    """The one repair request: the notes, what was lost, and where it came from.
+
+    Only the *missing* facts and the source windows around them are added to
+    the request — never the whole transcript — so restoring them is copying a
+    sentence the model can see, not recalling one it cannot.
+    """
+    parts: list[str] = []
+    parts.append(
+        "### جزوهٔ فعلی\n" + json.dumps(compact_notes_payload(notes), ensure_ascii=False)
+    )
+    audit = report.audit
+    if audit.missing:
+        windows = evidence_windows(
+            source, audit.missing[:MAX_REPAIR_SIGNALS], radius=REPAIR_WINDOW_CHARS
+        )
+        lines = [
+            "### موارد جامانده از جزوه (هر مورد را با جملهٔ زیرش، در جای درست خودش برگردانید)"
+        ]
+        for signal, window in windows:
+            lines.append(f"- «{signal.label}» — جملهٔ منبع: {window}")
+        for signal in audit.missing[:MAX_REPAIR_SIGNALS]:
+            if not any(signal is item for item, _ in windows):
+                lines.append(f"- «{signal.label}» — شمارهٔ منبع پیدا نشد؛ فقط اگر در جزوه هست بازگردانید.")
+        parts.append("\n".join(lines))
+    if audit.fabricated:
+        labels = "، ".join(f"«{signal.label}»" for signal in audit.fabricated[:MAX_REPAIR_SIGNALS])
+        parts.append(
+            "### مواردی که در متن منبع نیست\n"
+            + labels
+            + "\nاین موارد را از جزوه حذف کنید (یا اگر صورت درست‌شان در متن است، با همان صورت بنویسید). "
+            "چیز دیگری اضافه نکنید."
+        )
+    number_floor, term_floor = coverage_thresholds(resolve_note_mode(mode))
+    parts.append(
+        "### دستور\n"
+        "همان جزوه را با همان ساختار JSON برگردانید و فقط این دو کار را بکنید:\n"
+        f"- موارد جامانده را در بخش مناسب برگردانید (پوشش اعداد باید دست‌کم {number_floor:.0%} و "
+        f"پوشش اصطلاح‌ها دست‌کم {term_floor:.0%} باشد).\n"
+        "- مواردی را که در منبع نیست حذف کنید.\n"
+        "هیچ جملهٔ تازه، عدد تازه، تعریف تازه یا نکتهٔ تازه‌ای نسازید؛ هیچ بخشی را حذف نکنید."
+    )
+    return "\n\n".join(parts)
+
+
+_SCRUB_SENTENCE = re.compile(r"(?<=[.!?؟…])\s+")
+
+
+def _scrub_text(text: str, fabricated_values: frozenset[str]) -> tuple[str, int]:
+    """Drop the sentences that assert a number the source does not contain.
+
+    A fabricated number cannot be "corrected" without inventing the right one,
+    and it cannot be shipped as fact. The smallest honest unit is the sentence:
+    it is removed whole (never truncated), and the rest of the paragraph is
+    kept in order. Removing a sentence can cost a real fact, which the audit
+    then reports as missing — an omission is recoverable and visible, an
+    invented dosage is neither.
+    """
+    if not text or not fabricated_values:
+        return text, 0
+    kept: list[str] = []
+    removed = 0
+    for sentence in _SCRUB_SENTENCE.split(text):
+        if not sentence.strip():
+            continue
+        numbers = extract_signals(sentence, mask=False)
+        if any(
+            signal.kind == "number" and signal.value in fabricated_values
+            for signal in numbers
+        ):
+            removed += 1
+            continue
+        kept.append(sentence.strip())
+    return " ".join(kept), removed
+
+
+def scrub_fabricated_numbers(
+    notes: StructuredNotes, audit: SignalAudit
+) -> tuple[StructuredNotes, int]:
+    """Remove every sentence that states a number absent from the source."""
+    values = frozenset(
+        signal.value for signal in audit.fabricated if signal.kind == "number"
+    )
+    if not values:
+        return notes, 0
+    removed = 0
+
+    def scrub(value: str) -> str:
+        nonlocal removed
+        cleaned, count = _scrub_text(value, values)
+        removed += count
+        return cleaned
+
+    def scrub_tuple(values_in: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned = (scrub(item) for item in values_in)
+        return tuple(item for item in cleaned if item.strip())
+
+    sections: list[NoteSection] = []
+    for section in notes.sections:
+        definitions = []
+        for entry in section.definitions:
+            definition = scrub(entry.definition)
+            if definition.strip():
+                definitions.append(replace(entry, definition=definition))
+        callouts = []
+        for callout in section.callouts:
+            text = scrub(callout.text)
+            if text.strip():
+                callouts.append(replace(callout, text=text))
+        tables = []
+        for table in section.all_tables:
+            rows = []
+            for row in table.rows:
+                cells = [scrub(cell) for cell in row]
+                if any(cell.strip() for cell in cells):
+                    rows.append(cells)
+            if rows:
+                tables.append(replace(table, rows=rows))
+        cleaned = replace(
+            section,
+            heading=scrub(section.heading),
+            paragraphs=scrub_tuple(section.paragraphs),
+            bullets=scrub_tuple(section.bullets),
+            definitions=tuple(definitions),
+            examples=scrub_tuple(section.examples),
+            steps=scrub_tuple(section.steps),
+            formulas=scrub_tuple(section.formulas),
+            key_points=scrub_tuple(section.key_points),
+            callouts=tuple(callouts),
+            table=tables[0] if tables else None,
+            tables=tuple(tables[1:]),
+        )
+        if cleaned.has_content:
+            sections.append(cleaned)
+    tips = []
+    for tip in notes.practical_tips:
+        text = scrub(tip.text)
+        if text.strip():
+            tips.append(replace(tip, text=text))
+    glossary = []
+    for entry in notes.glossary:
+        definition = scrub(entry.definition)
+        if definition.strip():
+            glossary.append(replace(entry, definition=definition))
+    scrubbed = replace(
+        notes,
+        title=scrub(notes.title),
+        summary=scrub(notes.summary),
+        sections=tuple(sections),
+        key_points=scrub_tuple(notes.key_points),
+        learning_objectives=scrub_tuple(notes.learning_objectives),
+        review_questions=scrub_tuple(notes.review_questions),
+        practical_tips=tuple(tips),
+        glossary=tuple(glossary),
+    )
+    if removed:
+        logger.warning("note scrub removed %d sentence(s) with an unsupported number", removed)
+    return scrubbed, removed
+
+
+def repair_improves(candidate: NoteQualityReport, current: NoteQualityReport) -> bool:
+    """A repair is accepted only if it is grounded and loses no ground."""
+    if candidate.audit.fabricated:
+        return False
+    if candidate.audit.number_coverage < current.audit.number_coverage:
+        return False
+    if candidate.audit.term_coverage < current.audit.term_coverage - 0.05:
+        return False
+    if candidate.coverage.ratio < current.coverage.ratio - 0.05:
+        return False
+    return candidate.audit.coverage > current.audit.coverage or candidate.coverage.ratio > current.coverage.ratio
 
 
 # ===========================================================================
@@ -1538,6 +2090,86 @@ async def _structure_piece(
         return merge_structured_notes(list(parts))
 
 
+async def _audit_and_repair(
+    notes: StructuredNotes,
+    source: str,
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    *,
+    mode: str,
+    presentation: bool,
+    semaphore: asyncio.Semaphore,
+) -> tuple[StructuredNotes, NoteQualityReport]:
+    """Gate the notes, then make at most one bounded repair request.
+
+    The gate is deterministic and free. The repair is one request that carries
+    only the missing facts and their source windows; it is skipped when the
+    request would not fit the configured budget, when the operator chose
+    ``warn`` mode, or when nothing is actually wrong.
+
+    In ``warn`` mode the notes are returned **unchanged**: the audit still runs
+    and is logged, so the operator can read what the gate would have dropped on
+    real lectures before it is allowed to drop anything.
+    """
+    if not settings.note_strict_grounding:
+        # Defensive: every caller already skips this step when grounding is off.
+        return notes, gate_notes(notes, source, strict=False, mode=mode)[1]
+    if settings.note_quality_gate != "repair":
+        observed, report = gate_notes(notes, source, strict=False, mode=mode)
+        logger.info(
+            "note quality gate=warn: nothing changed; %s", report.summary()
+        )
+        return observed, report
+    gated, report = gate_notes(notes, source, strict=True, mode=mode)
+    if notes_need_repair(report, mode=mode):
+        gated, report = await _repair_once(
+            gated, report, source, settings, session,
+            mode=mode, presentation=presentation, semaphore=semaphore,
+        )
+    if report.audit.fabricated:
+        scrubbed, removed = scrub_fabricated_numbers(gated, report.audit)
+        if removed:
+            gated, report = gate_notes(scrubbed, source, strict=True, mode=mode)
+    return gated, report
+
+
+async def _repair_once(
+    notes: StructuredNotes,
+    report: NoteQualityReport,
+    source: str,
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    *,
+    mode: str,
+    presentation: bool,
+    semaphore: asyncio.Semaphore,
+) -> tuple[StructuredNotes, NoteQualityReport]:
+    """One bounded repair request; the caller keeps its state on any failure."""
+    repair_document = build_repair_document(notes, report, source, mode=mode)
+    budget = effective_compile_max_chars(settings, mode=mode, presentation=presentation)
+    if len(repair_document) > budget:
+        logger.warning(
+            "repair skipped: request_chars=%d budget=%d", len(repair_document), budget
+        )
+        return notes, report
+    system_prompt = build_compile_system_prompt(mode, presentation=presentation)
+    try:
+        async with semaphore:
+            payload = await complete_json(
+                session, settings, system=system_prompt, user=repair_document
+            )
+        candidate = _load_json_payload(payload, mode=mode)
+    except (LLMError, StructuringError) as exc:
+        logger.warning("repair pass failed (%s); keeping the audited notes", exc)
+        return notes, report
+    candidate, candidate_report = gate_notes(candidate, source, strict=True, mode=mode)
+    if repair_improves(candidate_report, report):
+        logger.info("repair accepted %s", candidate_report.summary())
+        return candidate, candidate_report
+    logger.info("repair rejected %s", candidate_report.summary())
+    return notes, report
+
+
 async def structure_document(
     document: str,
     settings: Settings,
@@ -1582,11 +2214,19 @@ async def structure_document(
             len(document),
             chunk_chars,
         )
-        return await _structure_piece(
+        single = await _structure_piece(
             session, settings, chunks[0],
             system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation,
         )
+        if not settings.note_strict_grounding:
+            return single
+        return (
+            await _audit_and_repair(
+                single, document, settings, session,
+                mode=resolved_mode, presentation=presentation, semaphore=semaphore,
+            )
+        )[0]
 
     # A chunked request also carries the topic digest and the neighbour windows.
     # Reserve their worst-case size when it fits; for a narrow model window,
@@ -1607,11 +2247,19 @@ async def structure_document(
             len(document),
             contextual_chunk_chars,
         )
-        return await _structure_piece(
+        single = await _structure_piece(
             session, settings, chunks[0],
             system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation,
         )
+        if not settings.note_strict_grounding:
+            return single
+        return (
+            await _audit_and_repair(
+                single, document, settings, session,
+                mode=resolved_mode, presentation=presentation, semaphore=semaphore,
+            )
+        )[0]
 
     context = build_context(chunks) if include_context else LectureContext()
     logger.info(
@@ -1652,6 +2300,12 @@ async def structure_document(
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     merged = merge_structured_notes(list(chunk_notes))
+    merged_report: NoteQualityReport | None = None
+    if settings.note_strict_grounding:
+        merged, merged_report = await _audit_and_repair(
+            merged, document, settings, session,
+            mode=resolved_mode, presentation=presentation, semaphore=semaphore,
+        )
 
     merged_chars = len(json.dumps(compact_notes_payload(merged), ensure_ascii=False))
     if (
@@ -1679,9 +2333,34 @@ async def structure_document(
     except (LLMError, StructuringError) as exc:
         logger.warning("compile pass failed (%s); delivering deterministic merge", exc)
         return merged
-    if compile_accepts(compiled, merged):
-        return compiled
-    return merged
+    if not compile_accepts(compiled, merged):
+        return merged
+    if settings.note_strict_grounding:
+        compiled, compiled_report = gate_notes(
+            compiled, document, strict=True, mode=resolved_mode
+        )
+        baseline = merged_report
+        if baseline is None:
+            _, baseline = gate_notes(merged, document, strict=True, mode=resolved_mode)
+        # The editorial pass may not trade completeness for fluency: an answer
+        # that invents a fact, or that covers less of the source than the merge
+        # it replaced, is rejected even if its shape looks better.
+        if compiled_report.audit.fabricated:
+            logger.warning("compiled notes rejected: they assert facts absent from the source")
+            return merged
+        if compiled_report.audit.coverage + 0.02 < baseline.audit.coverage:
+            logger.warning(
+                "compiled notes rejected: coverage %.2f < %.2f",
+                compiled_report.audit.coverage, baseline.audit.coverage,
+            )
+            return merged
+        if compiled_report.coverage.ratio + 0.05 < baseline.coverage.ratio:
+            logger.warning(
+                "compiled notes rejected: sentence coverage %.2f < %.2f",
+                compiled_report.coverage.ratio, baseline.coverage.ratio,
+            )
+            return merged
+    return compiled
 
 
 _SLIDE_NUMBER_CHARS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"

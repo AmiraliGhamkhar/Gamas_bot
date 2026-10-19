@@ -10,6 +10,7 @@ from unittest import mock
 from gamas_bot.llm import LLMContextOverflowError, LLMError
 from gamas_bot.notes import (
     COMPILE_HARD_MAX_CHARS,
+    MAX_PRACTICAL_TIPS,
     CONTEXT_DIGEST_MAX_CHARS,
     MAX_CONTEXT_SPLITS,
     PRESENTATION_PROMPT,
@@ -24,11 +25,16 @@ from gamas_bot.notes import (
     GlossaryEntry,
     StructuredNotes,
     build_context,
+    build_repair_document,
     build_system_prompt,
     build_presentation_system_prompt,
     build_presentation_document,
     compile_accepts,
     context_block_for,
+    gate_notes,
+    notes_need_repair,
+    repair_improves,
+    scrub_fabricated_numbers,
     heading_topic_key,
     headings_overlap,
     headings_share_a_topic,
@@ -327,7 +333,10 @@ class ContextBudgetTests(unittest.TestCase):
         self.assertLess(with_digest, without)
 
     def test_small_window_budget_never_exceeds_the_remaining_context(self):
-        settings = make_settings(note_context_tokens=8192, note_max_output_tokens=4096)
+        # The v4 system prompt is larger than v3's (schema v4, table and tip
+        # rules), so the smallest window that still leaves input room grew with
+        # it; the invariant under test is unchanged.
+        settings = make_settings(note_context_tokens=16384, note_max_output_tokens=4096)
         system = build_system_prompt("full")
         budget = effective_chunk_chars(settings, system_prompt=system)
         reserve_tokens = math.ceil(len(system) / 2.0) + PROMPT_RESERVE_TOKENS
@@ -900,3 +909,321 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ===========================================================================
+# Grounding gate, repair and scrubbing
+# ===========================================================================
+
+
+GATE_SOURCE = (
+    "دوز شروع ۵۰۰ mg همراه با وعدهٔ غذایی است. "
+    "بیمار با نارسایی کلیوی نباید Metformin بگیرد. "
+    "HbA1c برابر ۸.۵ درصد بود."
+)
+
+
+class GroundingGateTests(unittest.TestCase):
+    def test_a_table_with_an_invented_number_is_dropped(self):
+        payload = {
+            "sections": [
+                {
+                    "heading": "دوز",
+                    "paragraphs": ["دوز شروع ۵۰۰ mg است."],
+                    "tables": [
+                        {
+                            "caption": "دوزها",
+                            "headers": ["دارو", "دوز"],
+                            "rows": [["Metformin", "500 mg"], ["Metformin", "750 mg"]],
+                        }
+                    ],
+                }
+            ]
+        }
+        gated, report = gate_notes(notes_from_dict(payload), GATE_SOURCE)
+        self.assertEqual(gated.sections[0].all_tables, ())
+        self.assertEqual(report.tables_rejected, 1)
+        self.assertIn("750 mg", report.dropped_cells)
+
+    def test_a_table_of_source_facts_survives(self):
+        payload = {
+            "sections": [
+                {
+                    "heading": "دوز",
+                    "paragraphs": ["دوز شروع ۵۰۰ mg است."],
+                    "tables": {
+                        "caption": "دوزها",
+                        "headers": ["دارو", "دوز"],
+                        "rows": [["Metformin", "500 mg"]],
+                    },
+                }
+            ]
+        }
+        gated, report = gate_notes(notes_from_dict(payload), GATE_SOURCE)
+        self.assertEqual(report.tables_accepted, 1)
+        self.assertEqual(len(gated.sections[0].all_tables), 1)
+
+    def test_a_tip_without_a_basis_is_dropped(self):
+        payload = {
+            "sections": [{"heading": "دوز", "paragraphs": ["دوز شروع ۵۰۰ mg است."]}],
+            "practical_tips": [
+                {
+                    "text": "در نارسایی کلیوی Metformin قطع می‌شود.",
+                    "basis": "بیمار با نارسایی کلیوی نباید Metformin بگیرد",
+                },
+                {"text": "هر شب درس را مرور کنید.", "kind": "کاربردی"},
+            ],
+        }
+        gated, report = gate_notes(notes_from_dict(payload), GATE_SOURCE)
+        self.assertEqual(len(gated.practical_tips), 1)
+        self.assertEqual(report.tips_rejected, 1)
+
+    def test_tips_are_capped(self):
+        payload = {
+            "sections": [{"heading": "دوز", "paragraphs": ["دوز شروع ۵۰۰ mg است."]}],
+            "practical_tips": [
+                {
+                    "text": f"توصیهٔ عملی شمارهٔ {index}",
+                    "basis": "بیمار با نارسایی کلیوی نباید Metformin بگیرد",
+                }
+                for index in range(12)
+            ],
+        }
+        gated, _ = gate_notes(notes_from_dict(payload), GATE_SOURCE)
+        self.assertEqual(len(gated.practical_tips), MAX_PRACTICAL_TIPS)
+
+    def test_objectives_and_questions_without_source_support_are_dropped(self):
+        payload = {
+            "sections": [{"heading": "دوز", "paragraphs": ["دوز شروع ۵۰۰ mg است."]}],
+            "learning_objectives": [
+                "دوز شروع ۵۰۰ mg همراه با وعدهٔ غذایی",
+                "طراحی یک برنامهٔ ورزشی هفتگی برای بیماران دیابتی",
+            ],
+            "review_questions": [
+                "دوز شروع Metformin چقدر است؟",
+                "نقش تمرینات هوازی در کاهش قند خون چیست؟",
+            ],
+        }
+        gated, report = gate_notes(notes_from_dict(payload), GATE_SOURCE)
+        self.assertEqual(
+            gated.learning_objectives, ("دوز شروع ۵۰۰ mg همراه با وعدهٔ غذایی",)
+        )
+        self.assertEqual(gated.review_questions, ("دوز شروع Metformin چقدر است؟",))
+        self.assertEqual(report.objectives_dropped, 1)
+        self.assertEqual(report.review_questions_dropped, 1)
+
+    def test_warn_is_not_a_gate_flag(self):
+        """``strict=False`` keeps everything; the audit still reports it."""
+        payload = {
+            "sections": [
+                {
+                    "heading": "دوز",
+                    "paragraphs": ["دوز شروع ۵۰۰ mg است."],
+                    "tables": {"headers": ["a"], "rows": [["۷۵۰ mg"]]},
+                }
+            ],
+            "practical_tips": [{"text": "متن بی‌پشتوانه"}],
+        }
+        gated, report = gate_notes(notes_from_dict(payload), GATE_SOURCE, strict=False)
+        self.assertEqual(len(gated.sections[0].all_tables), 1)
+        self.assertEqual(len(gated.practical_tips), 1)
+        # The counters say what ``repair`` mode would have dropped.
+        self.assertEqual(report.tables_rejected, 1)
+        self.assertEqual(report.tips_rejected, 1)
+        self.assertTrue(report.audit.fabricated)
+
+
+class RepairDocumentTests(unittest.TestCase):
+    def test_missing_signal_is_listed_with_its_source_window(self):
+        payload = {"sections": [{"heading": "دوز", "paragraphs": ["دارو بررسی شد."]}]}
+        notes = notes_from_dict(payload)
+        gated, report = gate_notes(notes, GATE_SOURCE)
+        document = build_repair_document(gated, report, GATE_SOURCE)
+        self.assertIn("موارد جامانده", document)
+        self.assertIn("500 mg", document)
+        self.assertIn("همراه با وعدهٔ غذایی", document)
+
+    def test_fabricated_labels_are_listed(self):
+        payload = {
+            "sections": [
+                {"heading": "دوز", "paragraphs": ["دوز ۵۰۰ mg و ۷۵۰ mg است."]}
+            ]
+        }
+        gated, report = gate_notes(notes_from_dict(payload), GATE_SOURCE)
+        document = build_repair_document(gated, report, GATE_SOURCE)
+        self.assertIn("در متن منبع نیست", document)
+        self.assertIn("750 mg", document)
+
+    def test_repair_improves_requires_grounding(self):
+        payload = {"sections": [{"heading": "h", "paragraphs": ["متن."]}]}
+        base, base_report = gate_notes(notes_from_dict(payload), GATE_SOURCE)
+        self.assertFalse(repair_improves(base_report, base_report))
+        fabricated = {
+            "sections": [{"heading": "h", "paragraphs": ["دوز ۷۵۰ mg است."]}]
+        }
+        _, fabricated_report = gate_notes(notes_from_dict(fabricated), GATE_SOURCE)
+        self.assertFalse(repair_improves(fabricated_report, base_report))
+
+    def test_notes_need_repair_for_missing_numbers(self):
+        payload = {"sections": [{"heading": "دوز", "paragraphs": ["دارو بررسی شد."]}]}
+        _, report = gate_notes(notes_from_dict(payload), GATE_SOURCE)
+        self.assertTrue(notes_need_repair(report, mode="full"))
+
+    def test_a_complete_note_does_not_need_repair(self):
+        payload = {"sections": [{"heading": "دوز", "paragraphs": [GATE_SOURCE]}]}
+        _, report = gate_notes(notes_from_dict(payload), GATE_SOURCE)
+        self.assertFalse(notes_need_repair(report, mode="full"))
+
+
+class FabricatedNumberScrubTests(unittest.TestCase):
+    def test_the_whole_sentence_holding_a_fabricated_number_is_removed(self):
+        payload = {
+            "sections": [
+                {
+                    "heading": "دوز",
+                    "paragraphs": [
+                        "دوز شروع ۵۰۰ mg است. در برخی منابع دوز ۷۵۰ mg توصیه شده است."
+                    ],
+                }
+            ]
+        }
+        notes = notes_from_dict(payload)
+        _, report = gate_notes(notes, GATE_SOURCE)
+        scrubbed, removed = scrub_fabricated_numbers(notes, report.audit)
+        self.assertEqual(removed, 1)
+        text = json.dumps(scrubbed.to_payload(), ensure_ascii=False)
+        self.assertNotIn("750", text)
+        self.assertIn("۵۰۰ mg", text)
+
+    def test_each_removed_sentence_is_counted_once(self):
+        """The same sentence in a callout, a tip and the glossary is one removal each."""
+        payload = {
+            "sections": [
+                {
+                    "heading": "دوز",
+                    "paragraphs": ["دوز شروع ۵۰۰ mg است."],
+                    "callouts": [{"kind": "هشدار", "text": "دوز ۷۵۰ mg خطرناک است."}],
+                }
+            ],
+            "practical_tips": [
+                {"text": "دوز ۷۵۰ mg را قطع کنید.", "basis": "دوز شروع ۵۰۰ mg", "kind": "هشدار"}
+            ],
+            "glossary": [{"term": "دوز", "definition": "مقدار دارو؛ ۷۵۰ mg حد کشنده است."}],
+        }
+        notes = notes_from_dict(payload)
+        _, report = gate_notes(notes, GATE_SOURCE)
+        scrubbed, removed = scrub_fabricated_numbers(notes, report.audit)
+        self.assertEqual(removed, 3)
+        self.assertEqual(scrubbed.sections[0].callouts, ())
+        self.assertEqual(scrubbed.glossary, ())
+        self.assertEqual(scrubbed.practical_tips, ())
+
+    def test_clean_notes_are_untouched(self):
+        payload = {"sections": [{"heading": "دوز", "paragraphs": [GATE_SOURCE]}]}
+        notes = notes_from_dict(payload)
+        _, report = gate_notes(notes, GATE_SOURCE)
+        scrubbed, removed = scrub_fabricated_numbers(notes, report.audit)
+        self.assertEqual(removed, 0)
+        self.assertEqual(scrubbed, notes)
+
+
+class StrictPipelineTests(unittest.IsolatedAsyncioTestCase):
+    SOURCE = "دوز شروع 500 mg همراه با وعدهٔ غذایی است.\n\nبیمار نباید Metformin بگیرد."
+    LOSSY = {
+        "title": "جزوه",
+        "sections": [{"heading": "دوز", "paragraphs": ["دوز شروع دارو بررسی شد."]}],
+    }
+    REPAIRED = {
+        "title": "جزوه",
+        "sections": [
+            {
+                "heading": "دوز",
+                "paragraphs": [
+                    "دوز شروع 500 mg همراه با وعدهٔ غذایی است.",
+                    "بیمار نباید Metformin بگیرد.",
+                ],
+            }
+        ],
+    }
+
+    async def test_missing_facts_trigger_one_repair_and_are_restored(self):
+        settings = make_settings(note_strict_grounding=True)
+        session = FakeSession([
+            json.dumps(self.LOSSY, ensure_ascii=False),
+            json.dumps(self.REPAIRED, ensure_ascii=False),
+        ])
+        notes = await structure_transcript(self.SOURCE, settings, session)
+        self.assertEqual(len(session.calls), 2)
+        text = json.dumps(notes.to_payload(), ensure_ascii=False)
+        self.assertIn("500 mg", text)
+        self.assertIn("Metformin", text)
+        repair_prompt = session.calls[1]["json"]["messages"][1]["content"]
+        self.assertIn("موارد جامانده", repair_prompt)
+
+    async def test_warn_mode_never_calls_the_model_twice(self):
+        settings = make_settings(note_strict_grounding=True, note_quality_gate="warn")
+        session = FakeSession([json.dumps(self.LOSSY, ensure_ascii=False)])
+        notes = await structure_transcript(self.SOURCE, settings, session)
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(len(notes.sections), 1)
+
+    async def test_warn_mode_changes_nothing_but_still_audits(self):
+        """``warn`` is observation: not even a provably false table is dropped."""
+        answer = {
+            "title": "جزوه",
+            "sections": [
+                {
+                    "heading": "دوز",
+                    "paragraphs": ["دوز شروع 500 mg همراه با وعدهٔ غذایی است."],
+                    "tables": [
+                        {
+                            "caption": "دوزها",
+                            "headers": ["دارو", "دوز"],
+                            "rows": [["Metformin", "1000 mg"]],
+                        }
+                    ],
+                }
+            ],
+            "practical_tips": [
+                {"text": "دوز را دو برابر کنید.", "basis": "چیزی که گفته نشد", "kind": "هشدار"}
+            ],
+        }
+        settings = make_settings(note_strict_grounding=True, note_quality_gate="warn")
+        session = FakeSession([json.dumps(answer, ensure_ascii=False)])
+        with self.assertLogs("gamas_bot.notes", level="INFO") as logs:
+            notes = await structure_transcript(self.SOURCE, settings, session)
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(len(notes.practical_tips), 1)
+        self.assertEqual(len(notes.sections[0].all_tables), 1)
+        self.assertTrue(any("gate=warn" in line for line in logs.output))
+
+    async def test_a_fabricated_number_is_scrubbed_when_repair_keeps_it(self):
+        fabricated = {
+            "title": "جزوه",
+            "sections": [
+                {
+                    "heading": "دوز",
+                    "paragraphs": [
+                        "دوز شروع 500 mg همراه با وعدهٔ غذایی است.",
+                        "دوز نگه‌دارنده 750 mg است.",
+                        "بیمار نباید Metformin بگیرد.",
+                    ],
+                }
+            ],
+        }
+        settings = make_settings(note_strict_grounding=True)
+        session = FakeSession([
+            json.dumps(fabricated, ensure_ascii=False),
+            json.dumps(fabricated, ensure_ascii=False),
+        ])
+        notes = await structure_transcript(self.SOURCE, settings, session)
+        text = json.dumps(notes.to_payload(), ensure_ascii=False)
+        self.assertNotIn("750", text)
+        self.assertIn("500 mg", text)
+        self.assertIn("Metformin", text)
+
+    async def test_grounding_off_keeps_the_legacy_single_call(self):
+        settings = make_settings(note_strict_grounding=False)
+        session = FakeSession([json.dumps(self.LOSSY, ensure_ascii=False)])
+        await structure_transcript(self.SOURCE, settings, session)
+        self.assertEqual(len(session.calls), 1)

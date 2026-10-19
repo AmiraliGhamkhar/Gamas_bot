@@ -11,6 +11,8 @@ disagree, the code wins — and that is a bug worth reporting.
 | [`PROVIDERS.md`](PROVIDERS.md) | Note-generation providers and failover |
 | [`STT_PROVIDERS.md`](STT_PROVIDERS.md) | Speech-to-text providers, languages, limits |
 | [`MEDIA.md`](MEDIA.md) | The Python-only media pipeline |
+| [`NOTE_QUALITY.md`](NOTE_QUALITY.md) | The note-fidelity contract: what must survive, what the evidence gate checks, how repair works |
+| [`NOTE_QUALITY_PLAN.md`](NOTE_QUALITY_PLAN.md) | Design record and research behind the fidelity contract |
 | [`DOCX.md`](DOCX.md) | RTL Word generation contracts |
 | [`OFFICE.md`](OFFICE.md) | The free Office section: text → Word/Excel/PowerPoint |
 | [`BILLING.md`](BILLING.md) | Ledger, plans, card-to-card payments |

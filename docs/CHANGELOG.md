@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased — 2026-10-19 — note generation: complete, but nothing invented
+
+The note prompt asked for completeness; nothing checked it. A model could drop a
+dose, change `12.5` to `12.3`, or invent a "normal range" and the booklet still
+shipped — the only post-generation gate counted sections and characters.
+
+The pipeline now enforces the contract it states: **lossless editorial
+restructuring with evidence checks**. The transcript stays the only source of
+truth; tables and practical tips are extractions of it, not additions to it.
+
+* **Numbers and terms are audited.** A new deterministic module,
+  `gamas_bot/notes_evidence.py`, extracts every number+unit, date-like number,
+  Latin term, acronym and URL from the transcript and from the answer, and
+  reports omissions and fabrications separately. Units are compared through an
+  alias table (`میلی‌گرم` = `mg`), digits of both scripts fold, slide/step/list
+  numbering is masked, and a URL is one atomic token.
+* **A fabricated number cannot ship.** One bounded repair request carries the
+  missing facts and the source sentence around each (never the whole
+  transcript); if a sentence still states a number the lecture does not contain,
+  the sentence is removed and the loss is logged as a missing signal.
+* **Tables are multiple, captioned and cell-checked.** Schema v4 adds
+  `tables` (with `caption`) per section next to the legacy `table`, which is
+  still read. Every cell is validated: a numeric cell must exist in the source;
+  more than a quarter of untraceable text cells drops the table; an anchored row
+  may gloss its own term. Rejected tables are dropped, never rewritten.
+* **Practical tips are surfaced, not generated.** Schema v4 adds
+  `practical_tips`, each with a verbatim `basis` of 5–30 source words. A tip
+  without a basis is dropped; at most eight are kept. A lecture with no advice
+  produces no tips.
+* **Objectives and review questions are gated.** They are emitted only when the
+  lecture's own vocabulary supports them; the model's study advice is removed.
+* **The prompt is rewritten around the contract** (v4): an explicit
+  forbid-list of additions, an operational definition of cleaning and
+  organizing, table and tip rules, an academic register (third person, no
+  emoji, hedges preserved), and a compile prompt that is a *lossless* editor
+  rather than a fluent rewriter.
+* **The editorial pass can no longer trade completeness for fluency.** A
+  compiled answer that invents a fact, or that covers less of the source than
+  the merge it replaces, is rejected in favour of the merge.
+* **The benchmark corpus is live again.** `tests/test_note_evidence.py` runs
+  the six preserved transcripts/reference documents deterministically: coverage
+  floors, truncation fails, a changed digit fails, the Persian-only lecture
+  reports zero signals, and slide numbers are masked while a semester is not.
+  Two reference documents were corrected where they themselves dropped a real
+  value (`۱.۷۳`, `۱۴۰۵`) or asserted a clinical verdict the lecture never gave.
+* **Two operator switches.** `NOTE_STRICT_GROUNDING` (default on) is the
+  rollback to prompt-only behaviour; `NOTE_QUALITY_GATE=warn` audits and logs
+  while changing nothing, including tables and tips the gate could prove
+  unsupported — the first-week observation mode. See
+  [NOTE_QUALITY.md](NOTE_QUALITY.md).
+
+Call budget: the common path is unchanged (one request per chunk, one optional
+compile). The repair is a single extra request, only when the gate finds a
+deficit, and it is skipped when it would not fit the context budget.
+
 Entries describe user- and operator-visible change. For anything older than
 v3.0.0, read the git history — the v2 provider platform those entries describe
 no longer exists in the code.
