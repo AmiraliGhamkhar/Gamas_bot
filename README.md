@@ -44,6 +44,12 @@ Admins step
 into their own panel (**🛠 پنل مدیریت**) for statistics, users, pending
 payments and broadcasts.
 
+## Local Persian/Arabic OCR (no OCR API)
+
+Send a PDF or image (PNG/JPEG/WebP/BMP/TIFF) in a private chat to receive the recognized text as a UTF-8 `.txt` file. OCR runs locally with Tesseract; no document is uploaded to a cloud OCR service. Limits are 15 MB per file and 20 PDF pages. Persian, Arabic and English language data are selected with `OCR_LANGUAGES` (default `fas+ara+eng`).
+
+**cPanel requirement:** Python packages alone cannot provide the Tesseract OCR executable or its trained language data. The hosting provider must install Tesseract and the `fas`, `ara` and `eng` language packs, or provide a compatible binary/data directory that the account can execute. Set `TESSERACT_CMD` if the binary is outside `PATH`. If the host does not permit local executables, this feature cannot run on that shared plan without moving OCR to a VPS or another machine you control. See [docs/OCR_LOCAL.md](docs/OCR_LOCAL.md).
+
 ## Supported formats
 
 | Kind | Formats |
