@@ -254,6 +254,34 @@ def _presentation_metadata(message) -> tuple[str | None, str | None]:
     return kind, filename
 
 
+
+OCR_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+OCR_MAX_BYTES = 15 * 1024 * 1024
+
+
+def _ocr_metadata(message) -> tuple[str, str] | None:
+    """Return a safe filename and suffix for a PDF/image OCR upload."""
+    file_obj = getattr(message, "file", None)
+    if file_obj is None:
+        return None
+    if getattr(message, "photo", None) is not None:
+        return "telegram-photo.jpg", ".jpg"
+    name = getattr(file_obj, "name", None) or ""
+    mime = (getattr(file_obj, "mime_type", None) or "").split(";", 1)[0].lower()
+    suffix = Path(name).suffix.lower()
+    if suffix not in OCR_EXTENSIONS:
+        suffix = {
+            "application/pdf": ".pdf",
+            "image/png": ".png",
+            "image/jpeg": ".jpg",
+            "image/webp": ".webp",
+            "image/bmp": ".bmp",
+            "image/tiff": ".tiff",
+        }.get(mime, "")
+    if suffix not in OCR_EXTENSIONS:
+        return None
+    return (Path(name).name if name else f"document{suffix}", suffix)
+
 def _is_unsupported_attachment(message) -> bool:
     """True for a real file the bot cannot use — never for links or text."""
     media = getattr(message, "media", None)
@@ -974,6 +1002,12 @@ class GamasBot:
             await self._accept_media(event, user_id, kind, filename, duration)
             return
 
+        # Local OCR for Persian/Arabic PDFs and images (no cloud OCR API).
+        ocr_file = _ocr_metadata(event.message)
+        if ocr_file is not None:
+            await self._accept_ocr(event, user_id, ocr_file[0], ocr_file[1])
+            return
+
         # Free Office: the user's own text becomes a document.
         if await self._handle_office_message(event, user_id, text):
             return
@@ -998,6 +1032,72 @@ class GamasBot:
             )
 
     # ---------------------------------------------------------------- intake
+    async def _accept_ocr(
+        self, event, user_id: int, original_name: str, suffix: str
+    ) -> None:
+        """Run bounded local OCR and deliver the recognized text as a .txt file."""
+        file_obj = getattr(event.message, "file", None)
+        reported_size = getattr(file_obj, "size", None) or 0
+        if reported_size > OCR_MAX_BYTES:
+            await event.reply("حجم فایل برای OCR باید حداکثر ۱۵ مگابایت باشد.")
+            return
+
+        try:
+            self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+            with tempfile.TemporaryDirectory(
+                prefix="ocr-", dir=str(self.settings.temp_dir)
+            ) as work:
+                root = Path(work)
+                input_path = root / ("input" + suffix)
+                output_path = root / "extracted_text.txt"
+                await event.reply(
+                    "🔎 فایل دریافت شد؛ OCR محلی فارسی/عربی شروع شد. "
+                    "ممکن است روی هاست اشتراکی کمی زمان ببرد."
+                )
+                downloaded = await event.message.download_media(file=str(input_path))
+                if not downloaded or not input_path.is_file():
+                    raise ValueError("دانلود فایل از تلگرام ناموفق بود.")
+                actual_size = input_path.stat().st_size
+                if actual_size <= 0 or actual_size > OCR_MAX_BYTES:
+                    raise ValueError("حجم فایل باید حداکثر ۱۵ مگابایت باشد.")
+
+                from .ocr import OcrError, extract_text
+
+                try:
+                    text = await asyncio.to_thread(
+                        extract_text,
+                        input_path,
+                        max_pages=20,
+                        max_bytes=OCR_MAX_BYTES,
+                        timeout_seconds=240.0,
+                    )
+                except OcrError as exc:
+                    await event.reply(str(exc))
+                    return
+                output_path.write_text(text + "\n", encoding="utf-8")
+                safe_stem = Path(original_name).stem[:60] or "document"
+                delivered_path = root / f"{safe_stem}_ocr.txt"
+                output_path.replace(delivered_path)
+                await self.client.send_file(
+                    await event.message.get_input_chat(),
+                    str(delivered_path),
+                    caption="📄 متن استخراج‌شده با OCR محلی (فارسی/عربی)",
+                    force_document=True,
+                    reply_to=event.message.id,
+                )
+                logger.info(
+                    "local OCR delivered user=%s bytes=%d chars=%d",
+                    user_id, actual_size, len(text),
+                )
+        except ValueError as exc:
+            await event.reply(f"❌ {exc}")
+        except Exception:
+            logger.exception("local OCR failed user=%s", user_id)
+            await event.reply(
+                "❌ پردازش OCR ناموفق بود. اگر پیام نصب نبودن Tesseract را دیدید، "
+                "باید از پشتیبانی هاست بخواهید موتور و زبان‌های fas/ara را نصب کند."
+            )
+
     async def _accept_media(
         self, event, user_id: int, kind: str, filename: str | None, duration: float | None
     ) -> None:
