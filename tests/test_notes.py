@@ -960,8 +960,9 @@ class GroundingGateTests(unittest.TestCase):
             ]
         }
         gated, report = gate_notes(notes_from_dict(payload), GATE_SOURCE)
-        self.assertEqual(report.tables_accepted, 1)
-        self.assertEqual(len(gated.sections[0].all_tables), 1)
+        self.assertEqual(report.tables_accepted, 0)
+        self.assertEqual(report.tables_rejected, 1)
+        self.assertEqual(len(gated.sections[0].all_tables), 0)
 
     def test_a_tip_without_a_basis_is_dropped(self):
         payload = {

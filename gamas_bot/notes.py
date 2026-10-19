@@ -781,6 +781,7 @@ _FORBIDDEN_ADDITIONS = (
     "- تبدیل واحد، گرد کردن، محاسبه و مقدار مشتق‌شده (BMI، eGFR، درصد) ننویسید.\n"
     "- جملهٔ کلیشه‌ای، نصیحت مطالعه یا لحن تبلیغاتی اضافه نکنید.\n"
     "- جملهٔ مبهم را «بهتر» یا «منطقی‌تر» بازنویسی نکنید؛ همان ابهام را نگه دارید.\n"
+    "- یادآوری ‘بزرگتر’, ‘بهتر’, ‘مناسبة’ و جملات کلیشه‌ای similares نیاورید."
     "- هیچ ادعایی که در متن منبع نیست، حتی اگر درست یا مشهور باشد، نیاورید.\n"
 )
 
@@ -1733,7 +1734,7 @@ def gate_notes(
     gated = replace(
         notes,
         sections=tuple(sections),
-        practical_tips=tuple(tips[:MAX_PRACTICAL_TIPS]),
+        practical_tips=tuple(sorted(tips, key=lambda t: len(t.basis), reverse=True)[:MAX_PRACTICAL_TIPS]),
         learning_objectives=objectives,
         review_questions=review_questions,
     )

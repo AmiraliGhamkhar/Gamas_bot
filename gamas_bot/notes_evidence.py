@@ -761,6 +761,8 @@ def validate_table(table: object, source: str) -> TableVerdict:
         return TableVerdict(False, reason="empty")
     if len(headers) > 8 or len(rows) > 40:
         return TableVerdict(False, reason="size")
+    if len(headers) < 2 or len(rows) < 2:
+        return TableVerdict(False, reason="size")
 
     source_numbers = _numbers(extract_signals(source))
     source_words = content_words(mask_structural(source))
