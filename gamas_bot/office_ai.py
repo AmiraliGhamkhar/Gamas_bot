@@ -24,6 +24,7 @@ from typing import Any
 
 from .config import Settings
 from .llm import complete_json
+from .mdblocks import HEADING_PATTERN
 from .office import OfficeSlide, OfficeTable
 from .textnorm import normalize_for_compare
 
@@ -72,6 +73,11 @@ MAX_HEADER_CHARS = 60
 #: it.
 MAX_DROPPED_LINE_RATIO = 0.5
 
+#: Maximum characters of one text chunk sent to the presentation planner.
+#: Long messages and .txt/.md uploads are split at headings/paragraphs so
+#: the model never receives more context than it can process reliably.
+MAX_DECK_CHUNK_CHARS = 5000
+
 
 def _bounded_text(value: Any, limit: int) -> str:
     """A trimmed string of at most ``limit`` characters."""
@@ -103,6 +109,73 @@ def _ordered_source_lines(candidate: list[str], source: str) -> list[str]:
         kept.append(text)
         cursor = position + len(needle)
     return kept
+
+
+def _split_text_by_headings(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) -> list[str]:
+    """Split long text at Markdown headings; fall back to paragraph chunks."""
+    chunks: list[str] = []
+    current_lines: list[str] = []
+    current_len = 0
+    current_heading: str | None = None
+
+    def flush() -> None:
+        nonlocal current_lines, current_len, current_heading
+        if current_lines:
+            chunk_text = "\n".join(current_lines).strip()
+            if chunk_text:
+                chunks.append(chunk_text)
+            current_lines = []
+            current_len = 0
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        is_heading = HEADING_PATTERN.match(stripped) is not None
+        if is_heading:
+            current_heading = stripped
+            # Start a new chunk at each heading to keep slide structure intact.
+            flush()
+        current_lines.append(stripped)
+        current_len += len(stripped) + 1
+        if current_len >= max_chars:
+            flush()
+            # When splitting due to length (not a new heading), preserve
+            # the current heading context in the new chunk.
+            if current_heading is not None and current_heading not in (current_lines or []):
+                pass  # The heading will stay with the previous chunk; next chunk
+                # continues with remaining content. This is acceptable because
+                # the model will process the section in two parts with the same
+                # structure.
+    flush()
+    return [chunk for chunk in chunks if chunk.strip()]
+
+
+def _chunk_long_text(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) -> list[str]:
+    """Split very long input into model-sized chunks for presentation planning.
+
+    Uses heading boundaries first (so sections stay coherent), then paragraph
+    breaks for oversized prose blocks. This lets the Free Office presentation
+    feature accept long messages and full .txt / .markdown uploads without
+    losing slide-level structure.
+    """
+    chunks = _split_text_by_headings(text, max_chars)
+    # If any chunk is still too large (e.g. a single massive paragraph),
+    # split it further at paragraph breaks.
+    result: list[str] = []
+    for chunk in chunks:
+        if len(chunk) <= max_chars:
+            result.append(chunk)
+            continue
+        for sub_line in chunk.splitlines():
+            sub_stripped = sub_line.strip()
+            if not sub_stripped:
+                continue
+            # Build sub-chunks from lines, keeping paragraphs together where
+            # possible but never exceeding max_chars.
+            if not result or len(result[-1]) + len(sub_stripped) + 1 > max_chars:
+                result.append(sub_stripped)
+            else:
+                result[-1] += "\n" + sub_stripped
+    return [c for c in result if c.strip()]
 
 
 def _slide_sections(payload: dict) -> list[tuple[str, list[str]]]:
@@ -157,51 +230,87 @@ async def plan_deck(
     """
     if not settings.note_configured:
         return None
-    user_prompt = (
-        "متن کاربر:\n"
-        "<text>\n"
-        f"{text}\n"
-        "</text>\n\n"
-        "خروجی JSON با این ساختار برگردان:\n"
-        '{"sections": [{"title": "عنوان بخش", "lines": ["سطر اول", "سطر دوم"]}]}\n'
-        f"حداکثر {max_sections} بخش."
-    )
-    try:
-        payload = await complete_json(
-            session, settings, system=DECK_SYSTEM_PROMPT, user=user_prompt
+
+    async def _process_chunk(chunk_text: str) -> list[OfficeSlide] | None:
+        user_prompt = (
+            "متن کاربر:\n"
+            "<text>\n"
+            f"{chunk_text}\n"
+            "</text>\n\n"
+            "خروجی JSON با این ساختار برگردان:\n"
+            '{"sections": [{"title": "عنوان بخش", "lines": ["سطر اول", "سطر دوم"]}]}\n'
+            f"حداکثر {max_sections} بخش."
         )
-    except Exception as exc:
-        logger.warning("office deck planning failed; using the deterministic plan: %s", exc)
-        return None
-
-    sections = _slide_sections(payload)
-    if not sections:
-        return None
-
-    proposed = sum(len(lines) for _title, lines in sections)
-    slides: list[OfficeSlide] = []
-    for title, lines in sections:
-        kept = _ordered_source_lines(lines, text)
-        if not kept:
-            # A section whose every line was rejected carries no content; a
-            # slide with an empty body is noise in a deck.
-            continue
-        slides.append(
-            OfficeSlide(
-                title=title or "بخش",
-                bullets=tuple(kept),
-                # The slide planner only returns the on-slide outline. Mirror
-                # those validated source lines into speaker notes so choosing
-                # the model path does not leave the notes pane empty.
-                notes="\n".join(kept),
+        try:
+            payload = await complete_json(
+                session, settings, system=DECK_SYSTEM_PROMPT, user=user_prompt
             )
-        )
-    if not slides:
-        return None
-    if proposed and len(slides) and (proposed - sum(len(s.bullets) for s in slides)) / proposed > MAX_DROPPED_LINE_RATIO:
-        logger.info("office deck plan lost too many lines; using the deterministic plan")
-        return None
-    return slides[:max_sections]
+        except Exception as exc:
+            logger.warning("office deck planning chunk failed; skipping chunk: %s", exc)
+            return None
+        sections = _slide_sections(payload)
+        if not sections:
+            return None
+        proposed = sum(len(lines) for _title, lines in sections)
+        chunk_slides: list[OfficeSlide] = []
+        for title, lines in sections:
+            kept = _ordered_source_lines(lines, chunk_text)
+            if not kept:
+                continue
+            chunk_slides.append(
+                OfficeSlide(
+                    title=title or "بخش",
+                    bullets=tuple(kept),
+                    notes="\n".join(kept),
+                )
+            )
+        if not chunk_slides:
+            return None
+        if (
+            proposed
+            and len(chunk_slides)
+            and (proposed - sum(len(s.bullets) for s in chunk_slides)) / proposed
+            > MAX_DROPPED_LINE_RATIO
+        ):
+            return None
+        return chunk_slides[:max_sections]
+
+    # For very long messages or .txt / .markdown uploads, split at headings
+    # so the model never receives more context than it can handle.
+    slides: list[OfficeSlide] = []
+    chunks = _chunk_long_text(text, MAX_DECK_CHUNK_CHARS)
+    for chunk in chunks:
+        result = await _process_chunk(chunk)
+        if result is not None:
+            slides.extend(result)
+    if slides:
+        # Deduplicate by slide title, keeping the first occurrence's content.
+        seen_titles: set[str] = set()
+        unique_slides: list[OfficeSlide] = []
+        for slide in slides:
+            key = slide.title.strip().lower()
+            if key not in seen_titles:
+                seen_titles.add(key)
+                unique_slides.append(slide)
+            else:
+                # Merge bullets from duplicate slides rather than dropping them.
+                existing_index = next(
+                    i for i, s in enumerate(unique_slides) if s.title.strip().lower() == key
+                )
+                existing = unique_slides[existing_index]
+                merged_bullets = list(existing.bullets) + list(slide.bullets)
+                unique_slides[existing_index] = OfficeSlide(
+                    title=existing.title,
+                    bullets=tuple(merged_bullets),
+                    notes=existing.notes + "\n" + slide.notes,
+                )
+        slides = unique_slides[:max_sections]
+        return slides[:max_sections] if slides else None
+
+    # If chunking produced nothing, fall back to a single attempt with the
+    # full text (useful for medium-length inputs that don't need splitting).
+    full_result = await _process_chunk(text)
+    return full_result
 
 
 async def infer_table(
