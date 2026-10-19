@@ -130,7 +130,7 @@ def extract_text(
                 raise OcrError("PDF رمزدار پشتیبانی نمی‌شود؛ نسخهٔ بدون رمز بفرستید.")
             if not 1 <= document.page_count <= max_pages:
                 raise OcrError(f"PDF باید بین ۱ تا {max_pages} صفحه داشته باشد.")
-            for index, page in enumerate(document):
+            for page in document:
                 embedded = page.get_text("text").strip()
                 if embedded:
                     pieces.append(embedded)
