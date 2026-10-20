@@ -11,10 +11,10 @@ Billing model — three append-only facts and one derived balance:
 * ``ledger`` rows of kind ``debit`` (seconds consumed by a finished job);
 * ``holds`` rows (seconds reserved by a running job, released on settle).
 
-``available = credits(not expired) − debits − holds(not released)``. A job
-reserves before it runs, settles for the measured duration on success and
-releases everything on any failure or cancellation — so a failed job can never
-silently consume credit.
+``available = sum(unexpired credit lot remainders minus active allocations)``. A job
+reserves before it runs and settles at raw-transcript delivery. Failures before
+that milestone release the hold. Later booklet failures are recorded as partial
+success and retain the transcription charge.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import re
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations" / "v3"
 
-TERMINAL_SUBMISSION_STATUSES = ("done", "failed", "rejected")
+TERMINAL_SUBMISSION_STATUSES = ("done", "partial", "failed", "rejected")
 LEDGER_KINDS = ("credit", "debit")
 
 
@@ -55,6 +56,10 @@ class InsufficientBalanceError(RuntimeError):
         super().__init__(
             f"required={self.required_seconds}s available={self.available_seconds}s"
         )
+
+
+class UserBannedError(ValueError):
+    """A blocked user cannot start billable work."""
 
 
 class PaymentSnapshotError(RuntimeError):
@@ -116,6 +121,7 @@ class Database:
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._apply_migrations()
         await self._db.commit()
+        await self._backfill_allocations()
         self._secure_file_permissions()
 
     def _secure_file_permissions(self) -> None:
@@ -185,17 +191,106 @@ class Database:
             kept.append(line)
         return "\n".join(kept)
 
+    @asynccontextmanager
+    async def _transaction(self):
+        """Serialize writers, including across connections; rollback partial work.
+
+        Cancellation also rolls back before another coroutine can use the shared
+        connection. Helpers called inside this context must not open another one.
+        """
+        async with self._write_lock:
+            try:
+                await self.db.execute("BEGIN IMMEDIATE")
+                yield
+                await self.db.commit()
+            except BaseException:
+                await self.db.rollback()
+                raise
+
+    async def _credit_lots(self, user_id: int, at: str, before_id: int | None = None):
+        return await self.db.execute_fetchall(
+            "SELECT l.id, l.seconds "
+            "- COALESCE((SELECT SUM(a.seconds) FROM debit_allocations a "
+            "WHERE a.credit_id = l.id), 0) "
+            "- COALESCE((SELECT SUM(a.seconds) FROM hold_allocations a "
+            "JOIN holds h ON h.submission_id = a.submission_id "
+            "WHERE a.credit_id = l.id AND h.released_at IS NULL), 0) AS remaining "
+            "FROM ledger l WHERE l.user_id = ? AND l.kind = 'credit' "
+            "AND julianday(l.created_at) <= julianday(?) "
+            "AND (l.expires_at IS NULL OR julianday(l.expires_at) > julianday(?)) "
+            "AND (? IS NULL OR l.id < ?) "
+            "ORDER BY l.expires_at IS NULL, julianday(l.expires_at), l.id",
+            (user_id, at, at, before_id, before_id),
+        )
+
+    async def _backfill_allocations(self):
+        """Replay legacy usage once, without ever charging future purchases.
+
+        Old records do not identify the consumed lot. Use earliest-expiry-first
+        at the event time. Unfunded historical debits remain in the ledger for
+        audit but cannot become debt against future grants.
+        """
+        async with self._transaction():
+            if await self.db.execute_fetchall(
+                "SELECT 1 FROM billing_migrations WHERE name = 'credit_lots_v1'"
+            ):
+                return
+            events = await self.db.execute_fetchall(
+                "SELECT l.id, l.user_id, l.seconds, COALESCE("
+                "(SELECT h.created_at FROM holds h WHERE l.note = "
+                "'submission:' || h.submission_id AND h.settled = 1), l.created_at) "
+                "AS created_at, 'debit' AS kind FROM ledger l WHERE l.kind = 'debit' "
+                "AND NOT EXISTS (SELECT 1 FROM debit_allocations a WHERE a.debit_id = l.id) "
+                "UNION ALL "
+                "SELECT submission_id, user_id, seconds, created_at, 'hold' "
+                "FROM holds WHERE released_at IS NULL ORDER BY created_at, id"
+            )
+            for event in events:
+                remaining = int(event['seconds'])
+                for credit_id, available in await self._credit_lots(
+                    event['user_id'], event['created_at'],
+                    event['id'] if event['kind'] == 'debit' else None
+                ):
+                    used = min(remaining, max(0, available))
+                    if used:
+                        table, key = (('debit_allocations', 'debit_id')
+                                      if event['kind'] == 'debit'
+                                      else ('hold_allocations', 'submission_id'))
+                        await self.db.execute(
+                            f"INSERT INTO {table}({key}, credit_id, seconds) VALUES (?, ?, ?)",
+                            (event['id'], credit_id, used),
+                        )
+                        remaining -= used
+                    if not remaining:
+                        break
+                if remaining:
+                    logger.warning("legacy billing event has %s unallocated seconds: %s %s",
+                                   remaining, event['kind'], event['id'])
+            # Historical settled jobs reached the old raw-delivery milestone.
+            await self.db.execute(
+                "UPDATE submissions SET delivered_at = COALESCE("
+                "(SELECT released_at FROM holds WHERE holds.submission_id = "
+                "submissions.submission_id AND settled = 1), finished_at) "
+                "WHERE status = 'done' OR submission_id IN "
+                "(SELECT submission_id FROM holds WHERE settled = 1)"
+            )
+            await self.db.execute(
+                "UPDATE submissions SET status = 'partial' "
+                "WHERE status = 'failed' AND delivered_at IS NOT NULL"
+            )
+            await self.db.execute(
+                "INSERT INTO billing_migrations(name) VALUES ('credit_lots_v1')"
+            )
+
     # ------------------------------------------------------------------ write
     async def _write(self, sql: str, params: tuple = ()) -> None:
-        async with self._write_lock:
+        async with self._transaction():
             await self.db.execute(sql, params)
-            await self.db.commit()
 
     async def _write_many(self, statements: list[tuple[str, tuple]]) -> None:
-        async with self._write_lock:
+        async with self._transaction():
             for sql, params in statements:
                 await self.db.execute(sql, params)
-            await self.db.commit()
 
     # ------------------------------------------------------------------ users
     async def ensure_user(self, telegram_id: int) -> UserRow:
@@ -214,22 +309,26 @@ class Database:
     async def set_banned(
         self, telegram_id: int, banned: bool, *, admin_id: int | None = None
     ) -> None:
-        await self._write(
-            "UPDATE users SET banned = ? WHERE telegram_id = ?", (1 if banned else 0, telegram_id)
-        )
-        if admin_id is not None:
-            await self.audit(
-                admin_id,
-                "user_banned" if banned else "user_unbanned",
-                "ban flag changed",
-                telegram_id,
+        now = iso(utc_now())
+        async with self._transaction():
+            await self.db.execute(
+                "UPDATE users SET banned = ? WHERE telegram_id = ?",
+                (int(banned), telegram_id),
             )
+            if admin_id is not None:
+                await self.db.execute(
+                    "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (admin_id, "user_banned" if banned else "user_unbanned",
+                     "ban flag changed", telegram_id, now),
+                )
 
     async def is_banned(self, telegram_id: int) -> bool:
-        rows = await self.db.execute_fetchall(
-            "SELECT banned FROM users WHERE telegram_id = ?", (telegram_id,)
-        )
-        return bool(rows and rows[0][0])
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT banned FROM users WHERE telegram_id = ?", (telegram_id,)
+            )
+            return bool(rows and rows[0][0])
 
     async def user_ids(self) -> list[int]:
         """Every user id, without the per-row balance work of ``list_users``."""
@@ -259,10 +358,11 @@ class Database:
         return result
 
     async def is_unlimited(self, user_id: int) -> bool:
-        rows = await self.db.execute_fetchall(
-            "SELECT is_unlimited FROM users WHERE telegram_id = ?", (user_id,)
-        )
-        return bool(rows and rows[0][0])
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT is_unlimited FROM users WHERE telegram_id = ?", (user_id,)
+            )
+            return bool(rows and rows[0][0])
 
     async def set_unlimited(
         self,
@@ -274,13 +374,18 @@ class Database:
     ) -> None:
         """Mark or unmark a special (unlimited) user, and audit the change."""
         now = iso(utc_now())
-        async with self._write_lock:
+        async with self._transaction():
             if enabled:
                 await self.db.execute(
                     "UPDATE users SET is_unlimited = 1, unlimited_reason = ?, "
                     "unlimited_granted_by = ?, unlimited_granted_at = ? "
                     "WHERE telegram_id = ?",
                     (reason[:200], admin_id, now, user_id),
+                )
+                await self.db.execute(
+                    "UPDATE holds SET released_at = ?, settled = 0, "
+                    "release_reason = 'unlimited user' WHERE user_id = ? AND released_at IS NULL",
+                    (now, user_id),
                 )
             else:
                 await self.db.execute(
@@ -289,13 +394,12 @@ class Database:
                     "WHERE telegram_id = ?",
                     (user_id,),
                 )
-            await self.db.commit()
-        await self.audit(
-            admin_id,
-            "unlimited_on" if enabled else "unlimited_off",
-            reason or "-",
-            user_id,
-        )
+            await self.db.execute(
+                "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (admin_id, "unlimited_on" if enabled else "unlimited_off",
+                 reason or "-", user_id, now),
+            )
 
     async def unlimited_users(self) -> list[dict[str, Any]]:
         rows = await self.db.execute_fetchall(
@@ -320,9 +424,8 @@ class Database:
         return cursor
 
     async def _write_returning(self, sql: str, params: tuple = ()) -> int:
-        async with self._write_lock:
+        async with self._transaction():
             cursor = await self.db.execute(sql, params)
-            await self.db.commit()
             return int(cursor.lastrowid or 0)
 
     async def set_submission_status(
@@ -335,11 +438,12 @@ class Database:
     ) -> None:
         finished = iso(utc_now()) if status in TERMINAL_SUBMISSION_STATUSES else None
         await self._write(
-            "UPDATE submissions SET status = ?, error = ?, "
+            "UPDATE submissions SET status = CASE WHEN ? = 'failed' AND delivered_at IS NOT NULL "
+            "THEN 'partial' ELSE ? END, error = ?, "
             "duration_seconds = COALESCE(?, duration_seconds), "
             "finished_at = COALESCE(?, finished_at) "
             "WHERE submission_id = ?",
-            (status, error, duration_seconds, finished, submission_id),
+            (status, status, error, duration_seconds, finished, submission_id),
         )
 
     async def save_transcription(
@@ -393,7 +497,7 @@ class Database:
         by_status = {row[0]: int(row[1]) for row in totals}
         users = await self.count_users()
         seconds = await self.db.execute_fetchall(
-            "SELECT COALESCE(SUM(duration_seconds), 0) FROM submissions WHERE status = 'done'"
+            "SELECT COALESCE(SUM(duration_seconds), 0) FROM submissions WHERE delivered_at IS NOT NULL OR status = 'done'"
         )
         # Revenue is the sum of what each user was actually quoted at purchase,
         # never the plan's current price (audit F-14).
@@ -405,7 +509,8 @@ class Database:
         return {
             "users": users,
             "submissions_done": by_status.get("done", 0),
-            "submissions_failed": by_status.get("failed", 0),
+            "submissions_failed": by_status.get("failed", 0) + by_status.get("partial", 0),
+            "submissions_partial": by_status.get("partial", 0),
             "submissions_active": by_status.get("processing", 0) + by_status.get("pending", 0),
             "seconds_transcribed": float(seconds[0][0]) if seconds else 0.0,
             "toman_approved": int(revenue[0][0]) if revenue else 0,
@@ -419,14 +524,15 @@ class Database:
         row and a live hold left behind.
         """
         now = iso(utc_now())
-        recovered = await self.db.execute_fetchall(
-            "SELECT submission_id, user_id FROM submissions "
-            "WHERE status IN ('pending', 'processing')"
-        )
-        async with self._write_lock:
+        async with self._transaction():
+            recovered = await self.db.execute_fetchall(
+                "SELECT submission_id, user_id FROM submissions "
+                "WHERE status IN ('pending', 'processing')"
+            )
             for row in recovered:
                 await self.db.execute(
-                    "UPDATE submissions SET status = 'failed', error = 'interrupted by restart', "
+                    "UPDATE submissions SET status = CASE WHEN delivered_at IS NOT NULL "
+                    "THEN 'partial' ELSE 'failed' END, error = 'interrupted by restart', "
                     "finished_at = ? WHERE submission_id = ?",
                     (now, row[0]),
                 )
@@ -435,27 +541,15 @@ class Database:
                     "WHERE submission_id = ? AND released_at IS NULL",
                     (now, row[0]),
                 )
-            await self.db.commit()
         if recovered:
             logger.warning("Recovered %d interrupted submissions at startup", len(recovered))
         return len(recovered)
 
     # ---------------------------------------------------------------- billing
     async def available_seconds(self, user_id: int) -> int:
-        """Credits(not expired) − debits − active holds, never below zero."""
-        now = iso(utc_now())
-        rows = await self.db.execute_fetchall(
-            "SELECT "
-            "COALESCE((SELECT SUM(seconds) FROM ledger "
-            "  WHERE user_id = ? AND kind = 'credit' "
-            "  AND (expires_at IS NULL OR expires_at > ?)), 0) "
-            "- COALESCE((SELECT SUM(seconds) FROM ledger "
-            "  WHERE user_id = ? AND kind = 'debit'), 0) "
-            "- COALESCE((SELECT SUM(seconds) FROM holds "
-            "  WHERE user_id = ? AND released_at IS NULL), 0)",
-            (user_id, now, user_id, user_id),
-        )
-        return max(0, int(rows[0][0])) if rows else 0
+        """Unexpired lot remainders, excluding their active reservations."""
+        async with self._write_lock:
+            return await self._available_seconds_locked(user_id)
 
     async def grant_free_plan_once(self, user_id: int, seconds: int) -> bool:
         """Grant the free plan the first time a user is seen.
@@ -464,7 +558,7 @@ class Database:
         handlers can no longer both observe "no grant yet" and insert
         (audit F-04).
         """
-        async with self._write_lock:
+        async with self._transaction():
             cursor = await self.db.execute(
                 "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
                 "SELECT ?, ?, 'credit', 'free_plan', ? "
@@ -473,7 +567,6 @@ class Database:
                 ")",
                 (user_id, seconds, iso(utc_now()), user_id),
             )
-            await self.db.commit()
             return cursor.rowcount > 0
 
     async def add_credit(
@@ -488,13 +581,18 @@ class Database:
         expires = (
             iso(utc_now() + timedelta(days=validity_days)) if validity_days else None
         )
-        await self._write(
-            "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
-            "VALUES (?, ?, 'credit', ?, ?, ?)",
-            (user_id, int(seconds), note, expires, iso(utc_now())),
-        )
-        if admin_id is not None:
-            await self.audit(admin_id, "grant_credit", note, user_id)
+        async with self._transaction():
+            await self.db.execute(
+                "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
+                "VALUES (?, ?, 'credit', ?, ?, ?)",
+                (user_id, int(seconds), note, expires, iso(utc_now())),
+            )
+            if admin_id is not None:
+                await self.db.execute(
+                    "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
+                    "VALUES (?, 'grant_credit', ?, ?, ?)",
+                    (admin_id, note, user_id, iso(utc_now())),
+                )
 
     async def reserve(self, user_id: int, submission_id: int, seconds: int) -> None:
         """Reserve credit for a job, or raise :class:`InsufficientBalanceError`.
@@ -504,12 +602,20 @@ class Database:
         """
         if seconds <= 0:
             raise ValueError("reservation must be positive")
-        async with self._write_lock:
+        async with self._transaction():
             # Re-check inside the lock to close TOCTOU with set_unlimited
             # happening concurrently (audit F-M01).
             rows = await self.db.execute_fetchall(
-                "SELECT is_unlimited FROM users WHERE telegram_id = ?", (user_id,)
+                "SELECT is_unlimited, banned FROM users WHERE telegram_id = ?", (user_id,)
             )
+            if rows and rows[0][1]:
+                raise UserBannedError("⛔ دسترسی شما به ربات مسدود شده است.")
+            owner = await self.db.execute_fetchall(
+                "SELECT 1 FROM submissions WHERE submission_id = ? AND user_id = ?",
+                (submission_id, user_id),
+            )
+            if not owner:
+                raise ValueError("submission does not belong to user")
             if rows and rows[0][0]:
                 return
             available = await self._available_seconds_locked(user_id)
@@ -520,62 +626,79 @@ class Database:
                 "VALUES (?, ?, ?, ?)",
                 (submission_id, user_id, seconds, iso(utc_now())),
             )
-            await self.db.commit()
+            remaining = seconds
+            for credit_id, available in await self._credit_lots(user_id, iso(utc_now())):
+                used = min(remaining, max(0, available))
+                if used:
+                    await self.db.execute(
+                        "INSERT INTO hold_allocations(submission_id, credit_id, seconds) "
+                        "VALUES (?, ?, ?)", (submission_id, credit_id, used),
+                    )
+                    remaining -= used
+                if not remaining:
+                    break
+            if remaining:
+                raise InsufficientBalanceError(seconds - remaining, seconds)
+
 
     async def _available_seconds_locked(self, user_id: int) -> int:
-        now = iso(utc_now())
-        rows = await self.db.execute_fetchall(
-            "SELECT "
-            "COALESCE((SELECT SUM(seconds) FROM ledger "
-            "  WHERE user_id = ? AND kind = 'credit' "
-            "  AND (expires_at IS NULL OR expires_at > ?)), 0) "
-            "- COALESCE((SELECT SUM(seconds) FROM ledger "
-            "  WHERE user_id = ? AND kind = 'debit'), 0) "
-            "- COALESCE((SELECT SUM(seconds) FROM holds "
-            "  WHERE user_id = ? AND released_at IS NULL), 0)",
-            (user_id, now, user_id, user_id),
-        )
-        return max(0, int(rows[0][0])) if rows else 0
+        return sum(max(0, int(row[1])) for row in
+                   await self._credit_lots(user_id, iso(utc_now())))
 
     async def settle_hold(self, submission_id: int, measured_seconds: int) -> None:
-        """Charge the measured duration and close the hold (success path)."""
-        rows = await self.db.execute_fetchall(
-            "SELECT user_id, seconds FROM holds "
-            "WHERE submission_id = ? AND released_at IS NULL",
-            (submission_id,),
-        )
-        if not rows:
-            owner = await self.db.execute_fetchall(
-                "SELECT u.is_unlimited FROM submissions s "
-                "JOIN users u ON u.telegram_id = s.user_id "
-                "WHERE s.submission_id = ?",
+        """Exactly-once billing and raw-delivery milestone in one transaction."""
+        async with self._transaction():
+            rows = await self.db.execute_fetchall(
+                "SELECT h.user_id, h.seconds, u.is_unlimited FROM holds h "
+                "JOIN users u ON u.telegram_id = h.user_id "
+                "WHERE h.submission_id = ? AND h.released_at IS NULL",
                 (submission_id,),
             )
-            if owner and owner[0][0]:
-                logger.debug("special user job not billed submission=%s", submission_id)
+            now = iso(utc_now())
+            if not rows:
+                # Unlimited jobs intentionally have no hold. A released or
+                # already-settled paid hold must never be charged again.
+                await self.db.execute(
+                    "UPDATE submissions SET delivered_at = COALESCE(delivered_at, ?) "
+                    "WHERE submission_id = ? AND NOT EXISTS "
+                    "(SELECT 1 FROM holds WHERE submission_id = ? "
+                    "AND COALESCE(release_reason, '') != 'unlimited user')",
+                    (now, submission_id, submission_id),
+                )
                 return
-            logger.warning("settle_hold found no active hold submission=%s", submission_id)
-            return
-        user_id, reserved = int(rows[0][0]), int(rows[0][1])
-        if await self.is_unlimited(user_id):
-            # Made special while the job was running: release, never charge.
-            await self.release_hold(submission_id, "unlimited user")
-            return
-        charge = max(0, min(int(measured_seconds), reserved))
-        now = iso(utc_now())
-        await self._write_many(
-            [
-                (
-                    "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
-                    "VALUES (?, ?, 'debit', ?, ?)",
-                    (user_id, charge, f"submission:{submission_id}", now),
-                ),
-                (
-                    "UPDATE holds SET released_at = ?, settled = 1 WHERE submission_id = ?",
-                    (now, submission_id),
-                ),
-            ]
-        )
+            user_id, reserved, unlimited = rows[0]
+            if not unlimited:
+                allocations = await self.db.execute_fetchall(
+                    "SELECT a.credit_id, a.seconds FROM hold_allocations a "
+                    "JOIN ledger l ON l.id = a.credit_id WHERE a.submission_id = ? "
+                    "ORDER BY l.expires_at IS NULL, l.expires_at, l.id", (submission_id,),
+                )
+                charge = max(0, min(int(measured_seconds), reserved))
+                # A legacy hold may be underfunded; never charge an unrelated lot.
+                charge = min(charge, sum(row[1] for row in allocations))
+                cursor = await self.db.execute(
+                    "INSERT INTO ledger(user_id, seconds, kind, note, created_at, submission_id) "
+                    "VALUES (?, ?, 'debit', ?, ?, ?)",
+                    (user_id, charge, f"submission:{submission_id}", now, submission_id),
+                )
+                remaining = charge
+                for credit_id, seconds in allocations:
+                    used = min(remaining, seconds)
+                    if used:
+                        await self.db.execute(
+                            "INSERT INTO debit_allocations(debit_id, credit_id, seconds) "
+                            "VALUES (?, ?, ?)", (cursor.lastrowid, credit_id, used),
+                        )
+                        remaining -= used
+            await self.db.execute(
+                "UPDATE holds SET released_at = ?, settled = ?, release_reason = ? "
+                "WHERE submission_id = ? AND released_at IS NULL",
+                (now, int(not unlimited), "unlimited user" if unlimited else None, submission_id),
+            )
+            await self.db.execute(
+                "UPDATE submissions SET delivered_at = COALESCE(delivered_at, ?) "
+                "WHERE submission_id = ?", (now, submission_id),
+            )
 
     async def release_hold(self, submission_id: int, reason: str) -> bool:
         """Release a hold untouched (failure/cancellation path). Exactly once.
@@ -585,13 +708,12 @@ class Database:
         this shared connection, which can make a debit durable while its hold
         is still open (audit F-03).
         """
-        async with self._write_lock:
+        async with self._transaction():
             cursor = await self.db.execute(
                 "UPDATE holds SET released_at = ?, settled = 0, release_reason = ? "
                 "WHERE submission_id = ? AND released_at IS NULL",
                 (iso(utc_now()), reason[:200], submission_id),
             )
-            await self.db.commit()
             return bool(cursor.rowcount)
 
     async def credit_history(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
@@ -644,16 +766,7 @@ class Database:
         returns the existing open request; a different plan is refused because
         only one request per user may be open (audit F-16).
         """
-        async with self._write_lock:
-            plan = await self.db.execute_fetchall(
-                "SELECT hours, price, validity_days FROM plans "
-                "WHERE code = ? AND active = 1",
-                (plan_code,),
-            )
-            if not plan:
-                raise ValueError(f"plan {plan_code} is not on sale")
-            hours, price, validity_days = plan[0]
-            seconds = int(round(float(hours) * 3600))
+        async with self._transaction():
             open_rows = await self.db.execute_fetchall(
                 "SELECT payment_id, plan_code FROM payments "
                 "WHERE user_id = ? AND status = 'pending' "
@@ -664,20 +777,41 @@ class Database:
                 if str(open_rows[0][1]) == plan_code:
                     return int(open_rows[0][0])
                 raise OpenPaymentError(str(open_rows[0][1]))
+            plan = await self.db.execute_fetchall(
+                "SELECT hours, price, validity_days FROM plans "
+                "WHERE code = ? AND active = 1 AND price > 0",
+                (plan_code,),
+            )
+            if not plan:
+                raise ValueError(f"plan {plan_code} is not on sale")
+            hours, price, validity_days = plan[0]
+            seconds = int(round(float(hours) * 3600))
             cursor = await self.db.execute(
                 "INSERT INTO payments(user_id, plan_code, status, created_at, "
                 "purchased_seconds, purchased_price, purchased_validity_days) "
                 "VALUES (?, ?, 'pending', ?, ?, ?, ?)",
                 (user_id, plan_code, iso(utc_now()), seconds, int(price), validity_days),
             )
-            await self.db.commit()
             return int(cursor.lastrowid or 0)
 
-    async def set_payment_receipt(self, payment_id: int, receipt_path: str) -> None:
-        await self._write(
-            "UPDATE payments SET receipt_path = ? WHERE payment_id = ?",
-            (receipt_path, payment_id),
-        )
+    async def cancel_payment(self, payment_id: int, user_id: int) -> bool:
+        """Only the owner may cancel an unsubmitted purchase."""
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "UPDATE payments SET status = 'cancelled', reviewed_at = ?, "
+                "review_reason = 'cancelled by owner before receipt' "
+                "WHERE payment_id = ? AND user_id = ? AND status = 'pending' "
+                "AND receipt_path IS NULL", (iso(utc_now()), payment_id, user_id),
+            )
+            return bool(cursor.rowcount)
+
+    async def set_payment_receipt(self, payment_id: int, receipt_path: str) -> bool:
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "UPDATE payments SET receipt_path = ? WHERE payment_id = ? "
+                "AND status = 'pending'", (receipt_path, payment_id),
+            )
+            return bool(cursor.rowcount)
 
     _PAYMENT_COLUMNS = (
         "payment_id, user_id, plan_code, status, receipt_path, created_at, "
@@ -686,11 +820,12 @@ class Database:
     )
 
     async def payment(self, payment_id: int) -> dict[str, Any] | None:
-        rows = await self.db.execute_fetchall(
-            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE payment_id = ?",
-            (payment_id,),
-        )
-        return dict(rows[0]) if rows else None
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE payment_id = ?",
+                (payment_id,),
+            )
+            return dict(rows[0]) if rows else None
 
     async def pending_payments(self) -> list[dict[str, Any]]:
         rows = await self.db.execute_fetchall(
@@ -715,7 +850,7 @@ class Database:
         """
         if not approved and not reason.strip():
             raise ValueError("rejecting a payment requires a reason")
-        async with self._write_lock:
+        async with self._transaction():
             rows = await self.db.execute_fetchall(
                 "SELECT status, user_id, plan_code, purchased_seconds, "
                 "purchased_validity_days FROM payments WHERE payment_id = ?",
@@ -764,12 +899,11 @@ class Database:
                     now,
                 ),
             )
-            await self.db.commit()
         return True
 
     async def payment_history(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
         rows = await self.db.execute_fetchall(
-            "SELECT payment_id, plan_code, status, created_at, reviewed_at FROM payments "
+            "SELECT payment_id, plan_code, status, receipt_path, created_at, reviewed_at FROM payments "
             "WHERE user_id = ? ORDER BY payment_id DESC LIMIT ?",
             (user_id, limit),
         )

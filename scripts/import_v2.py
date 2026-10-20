@@ -301,7 +301,7 @@ def import_v2(source_path: Path, target_path: Path) -> int:
             note = f"v2 import ({entry['source']})"
             if entry["reason"]:
                 note += f": {entry['reason']}"
-            target.execute(
+            credit = target.execute(
                 "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
                 "VALUES (?, ?, 'credit', ?, ?, ?)",
                 (user_id, granted, note, entry["expires_at"], entry["starts_at"]),
@@ -309,10 +309,14 @@ def import_v2(source_path: Path, target_path: Path) -> int:
             credit_rows += 1
             consumed = granted - remaining
             if consumed > 0:
-                target.execute(
+                debit = target.execute(
                     "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
                     "VALUES (?, ?, 'debit', 'v2 import: consumed before migration', NULL, ?)",
                     (user_id, consumed, entry["updated_at"] or entry["starts_at"]),
+                )
+                target.execute(
+                    "INSERT INTO debit_allocations(debit_id, credit_id, seconds) VALUES (?, ?, ?)",
+                    (debit.lastrowid, credit.lastrowid, consumed),
                 )
                 debit_rows += 1
             expected_by_user[user_id] = expected_by_user.get(user_id, 0) + remaining

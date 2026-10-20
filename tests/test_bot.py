@@ -454,7 +454,7 @@ class FileDeliveryTests(BotPipelineTestCase):
 
         row = await self.db.submission(submission)
         assert row is not None
-        self.assertEqual(row.status, "done")
+        self.assertEqual(row.status, "partial")
         # No file was delivered, but the transcript reached the chat as text.
         self.assertEqual(event.files, [])
         fallback = [text for text in event.replies if "سلام دوستان" in text]
@@ -1049,8 +1049,8 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("راهنمای استفاده", text)
         self.assertIn("۱. «📎 ساخت جزوه» را انتخاب کنید.", text)
-        self.assertIn("اعتبار بر اساس مدت فایل صوتی محاسبه می‌شود", text)
-        self.assertIn("اعتبار مصرف‌شده به حسابتان بازمی‌گردد", text)
+        self.assertIn("پس از ارسال متن خام محاسبه می‌شود", text)
+        self.assertIn("خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود", text)
         self.assertIn("آفیس رایگان", text)
 
     async def test_main_panel_is_clear_when_word_generation_is_not_configured(self):
