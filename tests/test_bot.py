@@ -1124,6 +1124,35 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.edits)
 
 
+class PaymentGuardTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "bot.db",
+            temp_dir=root / "tmp",
+            note_api_key="",
+        )
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.user_id = 555
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def test_payment_without_a_configured_card_creates_no_request(self):
+        """No PAYMENT_CARD_NUMBER: refuse before a payable request exists."""
+        self.bot.settings = replace(self.settings, payment_card_number="")
+        event = FakeCallbackEvent(self.user_id, b"plan:paid_5h_30d")
+        await self.bot._start_payment(event, "paid_5h_30d")
+        self.assertTrue(any("فعال نیست" in text for text, _ in event.responses))
+        self.assertEqual(await self.db.pending_payments(), [])
+
+
 class ModerationTests(BotPipelineTestCase):
     async def test_banned_user_cannot_send_messages(self):
         await self.db.set_banned(USER_ID, True, admin_id=1)
