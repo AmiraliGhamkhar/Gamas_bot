@@ -10,6 +10,8 @@ balance column and no floating-point hours.
 | `plans` | Selling plans: hours, price in Toman, validity days, `is_custom`, active |
 | `ledger` | Every credit event — grant, charge, adjustment — with a note and expiry |
 | `holds` | What a running job currently has reserved, and how it ended |
+| `hold_allocations` | The specific credit lots reserved by each hold |
+| `debit_allocations` | The specific credit lots consumed by each debit |
 | `payments` | Card-to-card requests, receipt path, review outcome |
 
 One job's lifecycle is `reserve → (settle | release)`:
@@ -17,10 +19,31 @@ One job's lifecycle is `reserve → (settle | release)`:
 1. the **measured** media duration is reserved before transcription begins
    (`math.ceil`, minimum 1 s) — a file whose duration cannot be determined is
    refused rather than billed blindly;
-2. on success `settle_hold` charges exactly that duration, never more than was
-   reserved;
-3. on any failure, cancellation or shutdown `release_hold` returns it in full,
-   with a reason, exactly once.
+2. after **complete raw-transcript delivery**, `settle_hold` charges that duration,
+   never more than was reserved, and records `submissions.delivered_at` in the
+   same transaction;
+3. before that milestone, failure, cancellation or shutdown releases the hold
+   exactly once. Releasing an expired reservation does not revive expired credit;
+4. after that milestone, a booklet failure, cancellation or restart records
+   `partial`, retains the transcription charge, and still counts the delivered
+   transcription in usage statistics. A successful booklet ends in `done`.
+
+Incomplete/truncated raw-text fallback delivery is not billable. The full
+transcript remains persisted for support, but the reservation is released.
+Telegram delivery and SQLite cannot be one atomic transaction: a crash after
+Telegram accepts a transcript but before settlement may leave the delivery
+unbilled; recovery favors the user and never bills an unconfirmed delivery.
+
+Credits are separate **lots**, allocated earliest-expiry-first (permanent grants
+last). Available balance is the sum of unexpired lots' unused seconds, less
+active allocations against those lots. Historical debits never reduce a later
+purchase. A hold retains its original lots even if they expire while work is
+running; settlement consumes those lots, not a new purchase.
+
+All financial/status writes use a serialized `BEGIN IMMEDIATE` transaction with
+rollback on exceptions and cancellation. Settlement checks the hold and user
+flag inside that transaction and has a unique submission/debit reference.
+Concurrent settle/release attempts therefore have one winner.
 
 For a PowerPoint deck, the measured **source narration duration** is reserved and
 settled. Synthetic silence inserted between clips is not billable. The separate
@@ -29,9 +52,9 @@ so it includes those gaps; this prevents many short clips from exceeding the STT
 limit while avoiding charges for padding. See [PRESENTATIONS.md](PRESENTATIONS.md)
 for clip-span and alignment behavior.
 
-`recover_interrupted()` runs at startup: every `pending`/`processing` submission
-is marked failed and its hold released, so a crash cannot leave credit held
-forever.
+`recover_interrupted()` runs at startup: interrupted `pending`/`processing`
+submissions become `failed` before raw delivery or `partial` after delivery.
+Any still-active hold is released, so a crash cannot leave credit held forever.
 
 ## Plans
 
@@ -54,7 +77,7 @@ Card-to-card, verified by a human admin:
    on it** (`purchased_seconds`, `purchased_price`, `purchased_validity_days`).
    One open request per user is enforced by a partial unique index; tapping the
    same plan again returns the existing request, and a different plan is refused
-   until the open one is reviewed;
+   until the open one is reviewed or cancelled before receipt submission;
 2. the user sends a receipt image in private chat — checked by content signature
    at upload and again before an admin views it, size-bounded, stored `0600` in
    `RECEIPT_DIR`;
@@ -69,6 +92,20 @@ Because the snapshot is the source of truth, deactivating, deleting or
 re-pricing a plan between purchase and review cannot change — or zero — the
 credit, and the admin revenue figure is the sum of what users were quoted, not
 the current catalogue price.
+
+The purchase screen always renders the persisted snapshot, including when a
+request is reopened after a catalog change. The account panel offers **resume**
+for pending requests even if their plan is no longer active. It offers **cancel
+purchase** only before a receipt is submitted; cancellation is owner-checked,
+persisted as `cancelled`, and frees the one-open-request slot. Requests with a
+receipt require admin review, not user cancellation. Receipt attachment and
+cancellation are serialized, so both cannot win. A reviewed/cancelled request
+cannot accept a late upload.
+
+`/cancel` or navigating away only cancels the in-memory upload prompt, not the
+purchase; the Persian UI states this explicitly. Reopen the account panel to
+resume or cancel a purchase, including after a restart. Already-submitted
+receipts are identified as awaiting review; users are told not to pay again.
 
 Uploading a receipt grants nothing. Receipts are deleted after
 `RECEIPT_RETENTION_DAYS`; the sweep runs once at startup and then daily, so a bot
@@ -86,25 +123,63 @@ A special user is never billed. Admins manage the flag from chat:
 
 * No reservation is taken, so no balance is checked and nothing is debited. The
   submission row still records `duration_seconds`, so the audit trail shows usage.
-* A job already running when the user became special is released, not charged.
+* Enabling unlimited status immediately releases active holds in the same
+  transaction as the flag and audit entry. Turning it off again does not
+  retroactively charge those jobs; new reservations use normal credit rules.
 * Balance screens show «نامحدود»; the admin user list marks them ⭐.
 * Admins cannot be made special, and nobody can change their own flag. Admins are
   billed like everyone else.
 * Every change is written to `audit` (`unlimited_on` / `unlimited_off`) with the
   admin id. Turning it off clears the reason and provenance.
 
+## Banned users
+
+Bans reject new messages/callbacks and queued jobs at worker entry, before any
+pipeline/download work. Reservation also rechecks the ban under the write lock,
+including for unlimited users. Jobs already processing are not forcibly killed;
+if they already reserved credit, normal delivery/settlement rules apply. A job
+that has not yet reserved is denied at reservation. The ban flag and audit entry
+are committed or rolled back together. Admin accounts remain protected by the
+command handlers.
+
+## Upgrade and legacy accounting
+
+Migration `004_credit_allocations.sql` adds lot allocation tables, a unique
+submission/debit reference, and the raw-delivery timestamp. Startup performs a
+one-time, transactional backfill (`billing_migrations.credit_lots_v1`) before
+accepting jobs. It is safe to retry after failure and does not rewrite ledger
+amounts. The v2 importer now preserves the exact entitlement-to-debit allocation
+available in its source data.
+
+Legacy v3 did not store consumption allocation. Backfill reconstructs it using
+earliest expiry at the reservation time when a settled hold can be identified,
+or otherwise at debit time. Credits created later are never used to fund an
+older debit. Active legacy holds also receive allocations. An unfunded legacy
+event is logged with its ID and unallocated seconds; it remains in the audit
+ledger, but is not carried as debt against future purchases. Legacy settled
+submissions receive a delivery milestone and historically failed, settled jobs
+become `partial`.
+
+**Deployment:** stop the bot, back up the database (including any live WAL via a
+SQLite-aware backup), deploy, then restart. Inspect startup migration warnings
+and reconcile any unfunded legacy events with the original records. Exact
+historical lot choices and incomplete legacy payment approvals cannot be
+recovered from missing data; this upgrade does not invent entitlements, refund
+historical duplicate charges, or silently modify payment amounts. Do not run an
+old binary against a database that has begun using the allocation model.
+
 ## Tests
 
-`tests/test_db_billing.py` covers the free grant being once-only (including ten
-concurrent grants), reserve → settle charging the measured duration, reserve →
-release returning everything under the write lock, settle never exceeding the
-reservation, insufficient balance, expired credit, concurrent reservations,
-startup recovery, the whole special-user matrix, payment approval crediting the
-purchase snapshot exactly once after the plan was deactivated, rejection
-requiring a reason, one-open-request reuse, and catalog sync protecting custom
-plans.
+`tests/test_db_billing.py`, `tests/test_workflow_regressions.py`,
+`tests/test_bot.py`, and `tests/test_import_v2.py` cover free grants, allocations,
+expiry/renewal, active holds across expiry, concurrent and cross-connection
+reservations, exactly-once settlement, release races, unlimited transitions,
+transaction failure/cancellation rollback, migration retry/restart, imported
+balances, purchase snapshots, cancellation ownership/receipt races, queued bans,
+and partial-success usage accounting.
 
 ## Not implemented
 
-No payment gateway, no refunds, no proration. Adding one needs a real provider
-integration and is deliberately out of scope.
+No payment gateway, post-delivery automatic refunds, or proration. Card-to-card
+payments still require human verification; database approval is not proof of a
+bank transfer.

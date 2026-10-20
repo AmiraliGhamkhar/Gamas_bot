@@ -147,7 +147,9 @@ Billing is an append-only ledger, never a mutated balance. A job's lifecycle is
 1. A provider result is never attributed to the wrong provider.
 2. A table-of-contents page number is only ever a *measured* one; numbers are
    never guessed, so v3 prints links instead of unverified numbers.
-3. A failed job releases its reserved credit exactly once.
+3. Failures before complete raw delivery release reserved credit exactly once.
+   Failures after raw delivery are `partial`: transcription remains billed and
+   counted in usage, independently of booklet completion.
 4. Text never reaches a `w:t` element Word cannot store (invalid XML characters
    dropped, soft breaks become spaces).
 5. No shell command is built from user input; the media worker is invoked with a

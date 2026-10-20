@@ -881,8 +881,9 @@ class GamasBot:
             guide.extend(
                 [
                     "",
-                    "اعتبار بر اساس مدت فایل صوتی محاسبه می‌شود. اگر پردازش ناموفق باشد، "
-                    "اعتبار مصرف‌شده به حسابتان بازمی‌گردد.",
+                    "اعتبار بر اساس مدت فایل صوتی و پس از ارسال متن خام محاسبه می‌شود. "
+                    "اگر ارسال متن خام ناموفق باشد، اعتبار مصرف نمی‌شود. "
+                    "پس از دریافت متن خام، خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود.",
                 ]
             )
             if self.settings.office_enabled:
@@ -919,10 +920,19 @@ class GamasBot:
         elif data.startswith("plan:"):
             await self._ack(event)
             await self._start_payment(event, data.split(":", 1)[1])
-        elif data.startswith("payr:"):
-            # user reports having paid -> upload receipt
+        elif data.startswith(("payr:", "payc:", "payopen:")):
             await self._ack(event)
-            await self._await_receipt(event, int(data.split(":", 1)[1]))
+            try:
+                payment_id = int(data.split(":", 1)[1])
+            except ValueError:
+                await event.respond("درخواست نامعتبر است.")
+                return
+            if data.startswith("payc:"):
+                await self._cancel_payment(event, payment_id)
+            elif data.startswith("payopen:"):
+                await self._show_payment(event, payment_id)
+            else:
+                await self._await_receipt(event, payment_id)
         elif data.startswith("payv:"):
             await self._review_payment(event, data)
         elif data == "adm:home":
@@ -1009,7 +1019,7 @@ class GamasBot:
         if text.startswith("/cancel"):
             self._pending_payments.pop(user_id, None)
             self._office_sessions.pop(user_id, None)
-            await event.reply("لغو شد.")
+            await event.reply("ارسال لغو شد. برای لغو درخواست خرید از بخش اعتبار و پرداخت اقدام کنید.")
             return
 
         # Presentations.
@@ -1164,6 +1174,11 @@ class GamasBot:
         log_token = log_job_id.set(f"GMS-{job.submission_id}")
         workdir: Path | None = None
         try:
+            if await self.db.is_banned(job.user_id):
+                await self._release(job, "user banned before processing")
+                await self.db.set_submission_status(job.submission_id, "rejected", error="user banned")
+                await self._reply(job, "⛔ درخواست صف‌شده به دلیل مسدودی حساب لغو شد.")
+                return
             await self.db.set_submission_status(job.submission_id, "processing")
             self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
             workdir = Path(tempfile.mkdtemp(
@@ -1724,7 +1739,9 @@ class GamasBot:
                 logger.exception("docx delivery failed")
                 notice = "\n\nنکته: ارسال فایل Word ناموفق بود؛ متن خام ارسال شد."
 
-        await self.db.set_submission_status(job.submission_id, "done")
+        await self.db.set_submission_status(
+            job.submission_id, "partial" if notice else "done", error=notice.strip() or None
+        )
         if notice:
             await progress.complete("متن خام ارسال شد. " + notice.strip())
         else:
@@ -1784,7 +1801,6 @@ class GamasBot:
         pages = [page for page in rendered[:RAW_FALLBACK_MAX_PAGES] if page.strip()]
         if not pages:
             raise RuntimeError("ارسال فایل متن خام ناموفق بود.")
-        truncated = len(rendered) > len(pages)
         delivered = 0
         for page in pages:
             try:
@@ -1802,20 +1818,14 @@ class GamasBot:
                 )
                 break
             delivered += 1
-        if not delivered:
-            raise RuntimeError("ارسال متن خام ناموفق بود.")
-        logger.warning(
-            "delivered raw transcript as %d text message(s) submission=%s truncated=%s",
-            delivered, job.submission_id, truncated,
+        if not delivered or delivered != len(rendered):
+            # Partial text is not the billable delivery milestone. The stored
+            # transcript remains available for support, but no debit is taken.
+            raise RuntimeError("ارسال کامل متن خام ناموفق بود؛ اعتبار مصرف نشد.")
+        logger.info(
+            "delivered raw transcript as %d text message(s) submission=%s",
+            delivered, job.submission_id,
         )
-        if truncated:
-            # Never leave a partial delivery unexplained: the user is told what
-            # arrived, and the Word booklet that follows carries the whole text.
-            await self._reply(
-                job,
-                "ℹ️ فایل متن خام به‌صورت پیوست ارسال نشد؛ بخشی از متن در پیام‌های بالا "
-                "آمد و متن کامل در جزوهٔ Word خواهد بود.",
-            )
 
     async def _send_preview(self, job: Job, raw_text: str) -> None:
         text = normalize_display(raw_text)
@@ -1864,8 +1874,18 @@ class GamasBot:
                     "pending": "⏳ در انتظار بررسی",
                     "approved": "✅ تأیید شد",
                     "rejected": "❌ رد شد",
+                    "cancelled": "لغو شد",
                 }.get(item["status"], item["status"])
                 lines.append(f"• {item['plan_code']} — {status}")
+                if item["status"] == "pending":
+                    pending_buttons = [Button.inline(
+                        "ادامهٔ درخواست باز", f"payopen:{item['payment_id']}".encode()
+                    )]
+                    if not item["receipt_path"]:
+                        pending_buttons.append(Button.inline(
+                            "لغو درخواست خرید", f"payc:{item['payment_id']}".encode()
+                        ))
+                    buttons.insert(0, pending_buttons)
         lines.append("")
         lines.append(f"اعتبار اولیهٔ «{FREE_PLAN_NAME}» برای همهٔ کاربران فعال می‌شود.")
         buttons.append([Button.inline("🔙 منوی اصلی", b"menu:main")])
@@ -1879,10 +1899,35 @@ class GamasBot:
                 "پرداخت کارت‌به‌کارت در حال حاضر فعال نیست؛ لطفاً بعداً دوباره امتحان کنید."
             )
             return
-        plan = await self.db.plan(plan_code)
-        if plan is None or plan["price"] <= 0:
+        try:
+            payment_id = await self.db.create_payment(event.sender_id, plan_code)
+        except OpenPaymentError:
+            await event.respond(
+                "⚠️ شما یک درخواست پرداخت باز دارید؛ از بخش اعتبار و پرداخت آن را ادامه دهید "
+                "یا پیش از ارسال رسید، درخواست را لغو کنید."
+            )
+            return
+        except ValueError:
             await event.respond("این طرح در دسترس نیست.")
             return
+        await self._show_payment(event, payment_id)
+
+    async def _show_payment(self, event, payment_id: int) -> None:
+        payment = await self.db.payment(payment_id)
+        if (payment is None or payment["user_id"] != event.sender_id
+                or payment["status"] != "pending"):
+            await event.respond("این درخواست فعال نیست.")
+            return
+        if not self.settings.payment_card_number:
+            await event.respond("پرداخت کارت‌به‌کارت در حال حاضر فعال نیست؛ با مدیر تماس بگیرید.")
+            return
+        if not payment["purchased_seconds"] or payment["purchased_price"] is None:
+            await event.respond("اطلاعات خرید کامل نیست؛ لطفاً با مدیر تماس بگیرید.")
+            return
+        # The request snapshot, not the mutable catalog, is the quote.
+        plan = {"hours": payment["purchased_seconds"] / 3600,
+                "price": payment["purchased_price"],
+                "validity_days": payment["purchased_validity_days"]}
         card = format_payment_card(self.settings.payment_card_number)
         hours = plan["hours"]
         hours_text = to_persian_digits(int(hours) if float(hours).is_integer() else hours)
@@ -1897,21 +1942,24 @@ class GamasBot:
             "پس از واریز، «واریز کردم؛ ارسال رسید» را انتخاب کنید و تصویر رسید را بفرستید. "
             "پس از بررسی و تأیید مدیر، اعتبار به حساب شما اضافه می‌شود. بررسی ممکن است چند ساعت طول بکشد."
         )
-        try:
-            payment_id = await self.db.create_payment(event.sender_id, plan_code)
-        except OpenPaymentError as exc:
-            await event.respond(
-                "⚠️ شما یک درخواست پرداخت باز دارید "
-                f"(طرح {exc.plan_code}). ابتدا آن را تکمیل یا لغو کنید."
-            )
-            return
-        except ValueError:
-            await event.respond("این طرح در دسترس نیست.")
-            return
-        await event.respond(text, buttons=[
-            [Button.inline("📤 واریز کردم؛ ارسال رسید", f"payr:{payment_id}".encode())],
-            [Button.inline("🔙 بازگشت", b"account")],
-        ])
+        if payment["receipt_path"]:
+            text += "\n\n✅ رسید ثبت شده و در انتظار بررسی است؛ نیازی به واریز مجدد نیست."
+            buttons = []
+        else:
+            buttons = [[Button.inline("📤 واریز کردم؛ ارسال رسید", f"payr:{payment_id}".encode())]]
+        if not payment["receipt_path"]:
+            buttons.append([Button.inline("لغو درخواست خرید", f"payc:{payment_id}".encode())])
+        buttons.append([Button.inline("🔙 بازگشت", b"account")])
+        await event.respond(text, buttons=buttons)
+
+    async def _cancel_payment(self, event, payment_id: int) -> None:
+        changed = await self.db.cancel_payment(payment_id, event.sender_id)
+        self._pending_payments.pop(event.sender_id, None)
+        await event.respond(
+            "درخواست خرید لغو شد." if changed else
+            "این درخواست قابل لغو نیست؛ رسید ارسال‌شده باید توسط مدیر بررسی شود."
+        )
+        await self._show_account(event)
 
     async def _await_receipt(self, event, payment_id: int) -> None:
         payment = await self.db.payment(payment_id)
@@ -1925,7 +1973,7 @@ class GamasBot:
         self._pending_payments[event.sender_id] = payment_id
         await event.respond(
             "📷 لطفاً تصویر خوانای رسید را به‌صورت عکس، همین‌جا در گفت‌وگو بفرستید.",
-            buttons=[[Button.inline("↩️ لغو", b"account")]],
+            buttons=[[Button.inline("↩️ بازگشت (فقط لغو ارسال تصویر)", b"account")]],
         )
 
     async def _handle_receipt_upload(self, event, user_id: int) -> None:
@@ -1950,7 +1998,13 @@ class GamasBot:
         self.settings.receipt_dir.mkdir(parents=True, exist_ok=True)
         token = secrets.token_hex(8)
         receipt_path = self.settings.receipt_dir / f"receipt-{payment_id}-{token}.jpg"
-        await event.message.download_media(file=str(receipt_path))
+        try:
+            await event.message.download_media(file=str(receipt_path))
+        except Exception:
+            receipt_path.unlink(missing_ok=True)
+            self._pending_payments[user_id] = payment_id
+            await event.respond("دریافت رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
+            return
         # Post-download size check: Telegram's reported size can be thumbnail
         # size, not the full image (audit F-L02). Reject oversized files.
         try:
@@ -1967,13 +2021,16 @@ class GamasBot:
                 await event.respond("فرمت رسید نامعتبر است؛ فقط JPEG/PNG/WebP پذیرفته می‌شود.")
                 self._pending_payments[user_id] = payment_id
                 return
-        except OSError:
-            pass
-        try:
             receipt_path.chmod(0o600)
         except OSError:
-            pass
-        await self.db.set_payment_receipt(payment_id, str(receipt_path))
+            receipt_path.unlink(missing_ok=True)
+            self._pending_payments[user_id] = payment_id
+            await event.respond("ذخیرهٔ رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
+            return
+        if not await self.db.set_payment_receipt(payment_id, str(receipt_path)):
+            receipt_path.unlink(missing_ok=True)
+            await event.respond("این درخواست دیگر فعال نیست.")
+            return
         await event.respond(
             "✅ رسید ثبت شد. پس از بررسی و تأیید مدیر، اعتبار به حسابتان اضافه می‌شود."
         )
@@ -2081,7 +2138,8 @@ class GamasBot:
             "🛠 پنل مدیریت | آمار و وضعیت\n\n"
             f"👥 کاربران ثبت‌شده: {to_persian_digits(stats['users'])}\n"
             f"✅ درخواست‌های تکمیل‌شده: {to_persian_digits(stats['submissions_done'])}\n"
-            f"❌ درخواست‌های ناموفق: {to_persian_digits(stats['submissions_failed'])}\n"
+            f"❌ درخواست‌های ناموفق / ناقص: {to_persian_digits(stats['submissions_failed'])}\n"
+            f"📝 متن تحویل‌شده با جزوهٔ ناقص: {to_persian_digits(stats['submissions_partial'])}\n"
             f"⏳ در حال پردازش یا منتظر در صف: "
             f"{to_persian_digits(stats['submissions_active'])}\n"
             f"⏱ مدت کل فایل‌های پیاده‌سازی‌شده: "

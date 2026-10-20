@@ -134,6 +134,24 @@ class ImportV2TestCase(unittest.TestCase):
         conn.row_factory = sqlite3.Row
         return conn
 
+    def test_imported_allocations_survive_bot_startup(self):
+        import asyncio
+        from gamas_bot.db import Database
+
+        result = self.run_import()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        async def check():
+            db = Database(self.target_path)
+            await db.connect()
+            try:
+                self.assertEqual(await db.available_seconds(111), 3600)
+                self.assertEqual(await db.available_seconds(222), 9000)
+                self.assertEqual(await db.available_seconds(333), 0)
+            finally:
+                await db.close()
+        asyncio.run(check())
+
     def test_balances_plans_payments_and_users_migrate(self):
         result = self.run_import()
         self.assertEqual(result.returncode, 0, result.stderr)
