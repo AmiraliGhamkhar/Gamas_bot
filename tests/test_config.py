@@ -8,19 +8,35 @@ from unittest import mock
 
 from gamas_bot.config import (
     DEEPGRAM_PERSIAN_MODELS,
-    note_routes,
+    DEFAULT_CEREBRAS_BASE_URL,
+    DEFAULT_CEREBRAS_MODEL,
     DEFAULT_DEEPGRAM_MODEL,
+    DEFAULT_GEMINI_MODEL,
+    DEFAULT_GEMINI_THINKING_BUDGET,
+    DEFAULT_GROQ_BASE_URL,
+    DEFAULT_GROQ_MODEL,
     DEFAULT_NOTE_CHUNK_CHARS,
     DEFAULT_NOTE_CONTEXT_TOKENS,
+    DEFAULT_NOTE_MODELS,
     DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_STT_PROVIDERS,
+    NOTE_BASE_URL_DEFAULTS,
+    NOTE_HOST_PROVIDERS,
+    NOTE_JSON_OBJECT_PROVIDERS,
+    NOTE_PROVIDER_LABELS,
+    NOTE_PROVIDER_SLUGS,
+    NOTE_REQUEST_STYLE,
     PLAN_ENV_FIELDS,
     Settings,
     check,
+    classify_note_provider,
     format_payment_card,
     from_env,
     is_advisory,
+    normalize_note_base_url,
+    note_routes,
+    note_slot_credentials,
     resolve_note_mode,
     resolve_note_reasoning_effort,
     resolve_raw_text_profile,
@@ -70,7 +86,7 @@ class FromEnvTests(unittest.TestCase):
             settings = from_env(env_file="/nonexistent")
         self.assertEqual(settings.note_provider, "gemini")
         self.assertEqual(settings.note_api_key, "g-key")
-        self.assertEqual(settings.note_model, "gemini-2.5-flash")
+        self.assertEqual(settings.note_model, DEFAULT_GEMINI_MODEL)
 
     def test_keyless_custom_base_url_keeps_openai_compatible_provider(self):
         with mock.patch.dict(
@@ -197,17 +213,53 @@ class NoteProviderOrderTests(unittest.TestCase):
     def slugs(settings):
         return [route.slug for route in note_routes(settings)]
 
-    def test_default_order_is_nara_then_openrouter(self):
-        settings = self.settings(NARA_API_KEY="nara", OPENROUTER_API_KEY="or")
+    def test_default_order_is_the_fast_preset(self):
+        """Gemini flash-lite first, then Nara, OpenRouter, Groq and Cerebras."""
+        settings = self.settings(
+            GEMINI_API_KEY="g",
+            NARA_API_KEY="nara",
+            OPENROUTER_API_KEY="or",
+            GROQ_API_KEY="groq",
+            CEREBRAS_API_KEY="cerebras",
+        )
         routes = note_routes(settings)
-        self.assertEqual(self.slugs(settings), ["nara", "openrouter"])
+        self.assertEqual(
+            self.slugs(settings),
+            ["gemini", "nara", "openrouter", "groq", "cerebras"],
+        )
+        self.assertEqual(tuple(settings.note_providers), (
+            "gemini", "nara", "openrouter", "groq", "cerebras",
+        ))
         # Each provider keeps its own documented base URL and model.
-        self.assertEqual(routes[0].base_url, "https://router.bynara.id/v1")
-        self.assertEqual(routes[0].model, "agnes-2.5-flash")
-        self.assertEqual(routes[1].base_url, "https://openrouter.ai/api/v1")
-        self.assertEqual(routes[1].model, "google/gemma-4-31b-it:free")
+        self.assertEqual(routes[0].base_url, "https://generativelanguage.googleapis.com/v1beta")
+        self.assertEqual(routes[0].model, DEFAULT_GEMINI_MODEL)
+        self.assertEqual(routes[1].base_url, "https://router.bynara.id/v1")
+        self.assertEqual(routes[1].model, "agnes-2.5-flash")
+        self.assertEqual(routes[2].base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(routes[2].model, "google/gemma-4-31b-it:free")
+        self.assertEqual(routes[3].base_url, "https://api.groq.com/openai/v1")
+        self.assertEqual(routes[3].model, "openai/gpt-oss-120b")
+        self.assertEqual(routes[4].base_url, "https://api.cerebras.ai/v1")
+        self.assertEqual(routes[4].model, "gpt-oss-120b")
         self.assertTrue(settings.note_configured)
         self.assertEqual(check(settings), [])
+
+    def test_the_default_chain_degrades_to_the_credentialed_legs(self):
+        """A deployment with only the old keys keeps exactly its old legs."""
+        settings = self.settings(NARA_API_KEY="nara", OPENROUTER_API_KEY="or")
+        self.assertEqual(self.slugs(settings), ["nara", "openrouter"])
+        self.assertFalse(settings.groq_configured)
+        self.assertFalse(settings.cerebras_configured)
+
+    def test_only_a_groq_key_adds_only_the_groq_leg(self):
+        settings = self.settings(GROQ_API_KEY="gsk-test")
+        self.assertEqual(self.slugs(settings), ["groq"])
+        self.assertTrue(settings.groq_configured)
+
+    def test_only_a_cerebras_key_adds_only_the_cerebras_leg(self):
+        settings = self.settings(CEREBRAS_API_KEY="csk-test")
+        self.assertEqual(self.slugs(settings), ["cerebras"])
+        self.assertTrue(settings.cerebras_configured)
 
     def test_a_missing_key_is_not_a_configured_provider(self):
         settings = self.settings(NARA_API_KEY="nara")
@@ -294,10 +346,13 @@ class NoteProviderOrderTests(unittest.TestCase):
         routes = note_routes(settings)
         self.assertEqual(self.slugs(settings), ["nara", "gemini"])
         self.assertEqual(routes[1].api_key, "g")
-        self.assertEqual(routes[1].model, "gemini-2.5-flash")
+        self.assertEqual(routes[1].model, DEFAULT_GEMINI_MODEL)
 
-    def test_a_dedicated_key_does_not_auto_select_gemini(self):
-        settings = self.settings(GEMINI_API_KEY="g", NARA_API_KEY="n")
+    def test_a_dedicated_key_does_not_auto_select_gemini_outside_the_chain(self):
+        """Only a listed slug is attempted: an explicit chain stays explicit."""
+        settings = self.settings(
+            NOTE_PROVIDERS="nara", GEMINI_API_KEY="g", NARA_API_KEY="n"
+        )
         self.assertEqual(self.slugs(settings), ["nara"])
 
     def test_default_window_chunk_and_models_are_the_matched_pair(self):
@@ -406,6 +461,137 @@ class NoteProviderOrderTests(unittest.TestCase):
         problems = check(settings)
         self.assertTrue(any("NOTE_MODEL" in problem for problem in problems), problems)
         self.assertFalse(settings.note_configured)
+
+
+class GroqAndCerebrasRouteTests(unittest.TestCase):
+    """First-class ``groq``/``cerebras`` slugs, wired through every registry."""
+
+    def settings(self, **values):
+        with mock.patch.dict(os.environ, note_env(**values), clear=True):
+            return from_env(env_file="/nonexistent")
+
+    def test_new_slugs_are_in_every_registry_structure(self):
+        for slug, label in (("groq", "Groq"), ("cerebras", "Cerebras")):
+            self.assertIn(slug, NOTE_PROVIDER_SLUGS)
+            self.assertEqual(NOTE_REQUEST_STYLE[slug], "openai")
+            self.assertEqual(NOTE_PROVIDER_LABELS[slug], label)
+            self.assertIn(slug, NOTE_JSON_OBJECT_PROVIDERS)
+            self.assertIn(slug, DEFAULT_NOTE_MODELS)
+            self.assertIn(slug, NOTE_BASE_URL_DEFAULTS)
+        hosts = dict(NOTE_HOST_PROVIDERS)
+        self.assertEqual(hosts["groq.com"], "groq")
+        self.assertEqual(hosts["cerebras.ai"], "cerebras")
+        self.assertEqual(DEFAULT_GROQ_BASE_URL, "https://api.groq.com/openai/v1")
+        self.assertEqual(DEFAULT_GROQ_MODEL, "openai/gpt-oss-120b")
+        self.assertEqual(DEFAULT_CEREBRAS_BASE_URL, "https://api.cerebras.ai/v1")
+        self.assertEqual(DEFAULT_CEREBRAS_MODEL, "gpt-oss-120b")
+
+    def test_from_env_parses_the_new_provider_and_gemini_variables(self):
+        settings = self.settings(
+            GROQ_API_KEY="gsk-test",
+            GROQ_BASE_URL="https://api.groq.com",
+            GROQ_MODEL="openai/gpt-oss-20b",
+            CEREBRAS_API_KEY="csk-test",
+            CEREBRAS_BASE_URL="https://api.cerebras.ai",
+            CEREBRAS_MODEL="llama3.1-8b",
+            GEMINI_MODEL="gemini-2.5-flash",
+            NOTE_GEMINI_THINKING_BUDGET="24576",
+        )
+        self.assertEqual(settings.groq_api_key, "gsk-test")
+        self.assertEqual(settings.groq_base_url, "https://api.groq.com/openai/v1")
+        self.assertEqual(settings.groq_model, "openai/gpt-oss-20b")
+        self.assertEqual(settings.cerebras_api_key, "csk-test")
+        self.assertEqual(settings.cerebras_base_url, "https://api.cerebras.ai/v1")
+        self.assertEqual(settings.cerebras_model, "llama3.1-8b")
+        self.assertEqual(settings.gemini_model, "gemini-2.5-flash")
+        self.assertEqual(settings.gemini_thinking_budget, 24576)
+        self.assertTrue(settings.groq_configured)
+        self.assertTrue(settings.cerebras_configured)
+
+    def test_gemini_defaults_are_flash_lite_with_zero_thinking(self):
+        settings = self.settings()
+        self.assertEqual(settings.gemini_model, "gemini-2.5-flash-lite")
+        self.assertEqual(settings.gemini_thinking_budget, 0)
+        self.assertEqual(DEFAULT_GEMINI_THINKING_BUDGET, 0)
+
+    def test_thinking_budget_accepts_minus_one_and_is_bounded(self):
+        self.assertEqual(
+            self.settings(NOTE_GEMINI_THINKING_BUDGET="-1").gemini_thinking_budget, -1
+        )
+        self.assertEqual(
+            self.settings(NOTE_GEMINI_THINKING_BUDGET="-5").gemini_thinking_budget, -1
+        )
+        self.assertEqual(
+            self.settings(NOTE_GEMINI_THINKING_BUDGET="999999").gemini_thinking_budget,
+            32768,
+        )
+
+    def test_bare_groq_and_cerebras_origins_are_healed(self):
+        self.assertEqual(
+            normalize_note_base_url("https://api.groq.com", "groq"),
+            "https://api.groq.com/openai/v1",
+        )
+        self.assertEqual(
+            normalize_note_base_url("https://api.cerebras.ai", "cerebras"),
+            "https://api.cerebras.ai/v1",
+        )
+        # The host is enough: an unlabelled origin heals by host, not by slug.
+        self.assertEqual(
+            normalize_note_base_url("https://api.groq.com"), "https://api.groq.com/openai/v1"
+        )
+        self.assertEqual(
+            normalize_note_base_url("https://api.cerebras.ai/"), "https://api.cerebras.ai/v1"
+        )
+        # An explicit path is never overwritten.
+        self.assertEqual(
+            normalize_note_base_url("https://api.groq.com/openai/v1/chat/completions", "groq"),
+            "https://api.groq.com/openai/v1",
+        )
+
+    def test_slot_credentials_are_per_provider_and_gemini_uses_its_own_model(self):
+        settings = self.settings(
+            GEMINI_API_KEY="g",
+            GROQ_API_KEY="gsk",
+            CEREBRAS_API_KEY="csk",
+            GEMINI_MODEL="gemini-2.5-flash-lite",
+        )
+        self.assertEqual(
+            note_slot_credentials(settings, "groq"),
+            ("gsk", "https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
+        )
+        self.assertEqual(
+            note_slot_credentials(settings, "cerebras"),
+            ("csk", "https://api.cerebras.ai/v1", "gpt-oss-120b"),
+        )
+        self.assertEqual(
+            note_slot_credentials(settings, "gemini")[0],
+            "g",
+        )
+        self.assertEqual(note_slot_credentials(settings, "gemini")[2], settings.gemini_model)
+
+    def test_a_legacy_slot_on_a_groq_host_is_the_groq_leg(self):
+        """A ``NOTE_BASE_URL`` at api.groq.com is Groq, never a duplicate leg."""
+        settings = self.settings(
+            NOTE_PROVIDER="openai_compatible",
+            NOTE_API_KEY="gsk-legacy",
+            NOTE_BASE_URL="https://api.groq.com",
+        )
+        self.assertEqual(settings.note_provider, classify_note_provider(
+            "openai_compatible", "https://api.groq.com/openai/v1"
+        ))
+        self.assertEqual(settings.note_provider, "groq")
+        routes = note_routes(settings)
+        self.assertEqual([route.slug for route in routes], ["groq"])
+        self.assertEqual(routes[0].api_key, "gsk-legacy")
+        self.assertEqual(routes[0].base_url, "https://api.groq.com/openai/v1")
+        self.assertEqual(routes[0].model, "openai/gpt-oss-120b")
+
+    def test_note_not_configured_message_names_the_new_keys(self):
+        settings = self.settings()
+        problems = [p for p in check(settings) if "raw transcripts only" in p]
+        self.assertTrue(problems, check(settings))
+        for name in ("GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY"):
+            self.assertIn(name, problems[0])
 
 
 class CheckTests(unittest.TestCase):

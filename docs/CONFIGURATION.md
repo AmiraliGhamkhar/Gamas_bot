@@ -29,7 +29,7 @@ ADMIN_IDS=123456789
 SPEECHMATICS_API_KEY=your_stt_key
 ```
 
-Use a real numeric Telegram user ID for each admin, separated by commas. Configure one STT key whose provider appears in `STT_PROVIDERS`. Add note-provider keys (for example `NARA_API_KEY` or `OPENROUTER_API_KEY`) to get structured booklets; without them, the bot still returns raw transcripts.
+Use a real numeric Telegram user ID for each admin, separated by commas. Configure one STT key whose provider appears in `STT_PROVIDERS`. Add note-provider keys (for example `GEMINI_API_KEY`, `NARA_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY` or `CEREBRAS_API_KEY`) to get structured booklets; without them, the bot still returns raw transcripts.
 
 ## Useful settings
 
@@ -44,7 +44,7 @@ Use a real numeric Telegram user ID for each admin, separated by commas. Configu
 | `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME` | Set these to enable card-to-card purchases. Admins review receipts manually. |
 | `NOTE_MAX_OUTPUT_TOKENS` | Measure real `output_tokens` p95 from the Phase 0 usage logs (with `ttfb_ms`/`elapsed_ms`) over at least one week, then set cap = p95 + 15% margin (example: 16384 → 8192). Never cut below observed p95 — booklet truncation risk. |
 | `NOTE_JSON_MODE` | Enable `true` only when the configured OpenRouter model documents `json_object`; the code already never sends it to Nara. |
-| `NOTE_REASONING_EFFORT` | If used, start at `low` (never `minimal` first) and A/B against the quality-gate report before keeping it; only Nara and OpenRouter accept it. |
+| `NOTE_REASONING_EFFORT` | If used, start at `low` (never `minimal` first) and A/B against the quality-gate report before keeping it; only Nara, OpenRouter, Groq and Cerebras accept it (never the generic slot or Gemini); on gpt-oss it also keeps hidden reasoning from eating output tokens. |
 | `NOTE_CONCURRENCY` | Keep `3` on cPanel; a VPS may use `6-8`. |
 | `NOTE_REQUEST_TIMEOUT_SECONDS` | Re-derive after any token-cap change: it must remain greater than the time to generate `NOTE_MAX_OUTPUT_TOKENS` on the slowest configured model. |
 | `LLM_CONNECTOR_LIMIT`, `LLM_CONNECTOR_LIMIT_PER_HOST`, `LLM_CONNECTOR_TTL_DNS_CACHE`, `LLM_CONNECTOR_KEEPALIVE` | Shared HTTP connector pool sizing (defaults `32`/`8`/`300`/`300`). |

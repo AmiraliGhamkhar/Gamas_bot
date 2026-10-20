@@ -17,7 +17,15 @@ from pathlib import Path
 
 from telethon import TelegramClient
 
-from gamas_bot.config import Settings
+from gamas_bot.config import (
+    DEFAULT_CEREBRAS_BASE_URL,
+    DEFAULT_CEREBRAS_MODEL,
+    DEFAULT_GEMINI_MODEL,
+    DEFAULT_GEMINI_THINKING_BUDGET,
+    DEFAULT_GROQ_BASE_URL,
+    DEFAULT_GROQ_MODEL,
+    Settings,
+)
 
 AUDIO_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/audio"
 VIDEO_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/video"
@@ -423,7 +431,17 @@ def make_settings(**overrides) -> Settings:
         openrouter_api_key="",
         openrouter_base_url="https://openrouter.ai/api/v1",
         openrouter_model="google/gemma-4-31b-it:free",
+        groq_api_key="",
+        groq_base_url=DEFAULT_GROQ_BASE_URL,
+        groq_model=DEFAULT_GROQ_MODEL,
+        cerebras_api_key="",
+        cerebras_base_url=DEFAULT_CEREBRAS_BASE_URL,
+        cerebras_model=DEFAULT_CEREBRAS_MODEL,
         gemini_api_key="",
+        gemini_model=DEFAULT_GEMINI_MODEL,
+        # Zero by default, matching the shipped configuration: note requests
+        # must never wait on hidden reasoning tokens.
+        gemini_thinking_budget=DEFAULT_GEMINI_THINKING_BUDGET,
         note_context_tokens=131072,
         note_mode="full",
         note_max_output_tokens=4096,

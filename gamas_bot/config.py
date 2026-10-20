@@ -44,10 +44,20 @@ STT_PROVIDER_ORDER = ("speechmatics", "deepgram", "openai_compatible")
 #: Every note provider the pipeline knows, with the request style each one
 #: speaks. ``nara``/``openrouter``/``openai_compatible`` are OpenAI-compatible
 #: chat-completions APIs; ``gemini`` and ``anthropic`` have their own contracts.
-NOTE_PROVIDER_SLUGS = ("nara", "openrouter", "openai_compatible", "gemini", "anthropic")
+NOTE_PROVIDER_SLUGS = (
+    "nara",
+    "openrouter",
+    "groq",
+    "cerebras",
+    "openai_compatible",
+    "gemini",
+    "anthropic",
+)
 NOTE_REQUEST_STYLE = {
     "nara": "openai",
     "openrouter": "openai",
+    "groq": "openai",
+    "cerebras": "openai",
     "openai_compatible": "openai",
     "gemini": "gemini",
     "anthropic": "anthropic",
@@ -55,14 +65,17 @@ NOTE_REQUEST_STYLE = {
 NOTE_PROVIDER_LABELS = {
     "nara": "NaraRouter",
     "openrouter": "OpenRouter",
+    "groq": "Groq",
+    "cerebras": "Cerebras",
     "openai_compatible": "OpenAI-compatible",
     "gemini": "Gemini",
     "anthropic": "Anthropic",
 }
 #: OpenAI ``response_format`` JSON mode is only sent to providers whose public
 #: API documents it (NaraRouter does not document it, so asking for it there
-#: would be an unsupported parameter).
-NOTE_JSON_OBJECT_PROVIDERS = frozenset({"openrouter", "openai_compatible"})
+#: would be an unsupported parameter). Groq and Cerebras document it on their
+#: OpenAI-compatible chat-completions endpoints.
+NOTE_JSON_OBJECT_PROVIDERS = frozenset({"openrouter", "groq", "cerebras", "openai_compatible"})
 #: Provider hostnames, so a deployment that configures one OpenAI-compatible
 #: slot with a ``NOTE_BASE_URL`` pointing at a documented provider keeps that
 #: provider's place in the priority order (and never becomes a duplicate leg).
@@ -73,6 +86,8 @@ NOTE_HOST_PROVIDERS = (
     ("bynara.id", "nara"),
     ("bynara.web.id", "nara"),
     ("openrouter.ai", "openrouter"),
+    ("groq.com", "groq"),
+    ("cerebras.ai", "cerebras"),
     ("generativelanguage.googleapis.com", "gemini"),
 )
 
@@ -88,24 +103,49 @@ DEFAULT_NARA_BASE_URL = "https://router.bynara.id/v1"
 DEFAULT_NARA_MODEL = "agnes-2.5-flash"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+#: Groq's OpenAI-compatible endpoint. Its default model is the served
+#: ``openai/gpt-oss-120b`` id (the namespace is part of the id on Groq).
+DEFAULT_GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-120b"
+#: Cerebras' OpenAI-compatible endpoint; its model ids carry no namespace.
+DEFAULT_CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
+DEFAULT_CEREBRAS_MODEL = "gpt-oss-120b"
+#: Google AI Studio's default note model. ``flash-lite`` answers note
+#: extraction/organisation requests several times faster than the thinking
+#: models while staying inside the free tier.
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+#: Gemini thinking budget sent as ``generationConfig.thinkingConfig.thinkingBudget``:
+#:
+#: * ``0`` (default) disables thinking outright — the note task is extraction
+#:   and organisation, so hidden reasoning tokens are pure latency; the model
+#:   answers as soon as it starts emitting JSON.
+#: * a positive value caps the reasoning tokens the model may spend.
+#: * ``-1`` sends no ``thinkingConfig`` field at all (pre-flag behaviour).
+DEFAULT_GEMINI_THINKING_BUDGET = 0
 NOTE_BASE_URL_DEFAULTS = {
     "nara": DEFAULT_NARA_BASE_URL,
     "openrouter": DEFAULT_OPENROUTER_BASE_URL,
+    "groq": DEFAULT_GROQ_BASE_URL,
+    "cerebras": DEFAULT_CEREBRAS_BASE_URL,
     "openai_compatible": "https://api.openai.com/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
     "anthropic": "https://api.anthropic.com/v1",
 }
 
-#: Default note failover order: Nara first, OpenRouter second, everything else
-#: only when it is explicitly listed and configured. The order in
-#: ``NOTE_PROVIDERS`` *is* the failover policy, exactly like ``STT_PROVIDERS``.
-DEFAULT_NOTE_PROVIDERS = "nara,openrouter"
+#: Default note failover order: Gemini flash-lite first (fastest documented
+#: route), then NaraRouter, OpenRouter, Groq and Cerebras. A slug without its
+#: own credential is skipped silently, so this default degrades safely for
+#: every existing deployment. The order in ``NOTE_PROVIDERS`` *is* the failover
+#: policy, exactly like ``STT_PROVIDERS``.
+DEFAULT_NOTE_PROVIDERS = "gemini,nara,openrouter,groq,cerebras"
 
 DEFAULT_NOTE_MODELS = {
     "openai_compatible": "gpt-4o-mini",
-    "gemini": "gemini-2.5-flash",
+    "gemini": DEFAULT_GEMINI_MODEL,
     "nara": DEFAULT_NARA_MODEL,
     "openrouter": DEFAULT_OPENROUTER_MODEL,
+    "groq": DEFAULT_GROQ_MODEL,
+    "cerebras": DEFAULT_CEREBRAS_MODEL,
 }
 
 #: Context window assumed for one note request when the operator does not say.
@@ -359,7 +399,17 @@ class Settings:
     openrouter_api_key: str
     openrouter_base_url: str
     openrouter_model: str
+    groq_api_key: str
+    groq_base_url: str
+    groq_model: str
+    cerebras_api_key: str
+    cerebras_base_url: str
+    cerebras_model: str
     gemini_api_key: str
+    gemini_model: str
+    #: ``0`` disables Gemini thinking, a positive value caps it, ``-1`` sends no
+    #: ``thinkingConfig`` field at all (see ``DEFAULT_GEMINI_THINKING_BUDGET``).
+    gemini_thinking_budget: int
     note_context_tokens: int
     note_mode: str
     note_max_output_tokens: int
@@ -456,6 +506,14 @@ class Settings:
         return bool(self.openrouter_api_key)
 
     @property
+    def groq_configured(self) -> bool:
+        return bool(self.groq_api_key)
+
+    @property
+    def cerebras_configured(self) -> bool:
+        return bool(self.cerebras_api_key)
+
+    @property
     def note_configured(self) -> bool:
         """Whether at least one provider in the active order is usable."""
         return bool(note_routes(self))
@@ -504,7 +562,9 @@ def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
       ``.../models/<id>:generateContent``, or ``.../v1beta/models``).
     * Pasting a bare origin without the documented API version prefix
       (``https://router.bynara.id`` -> ``/v1``, ``https://openrouter.ai`` ->
-      ``/api/v1``, ``https://generativelanguage.googleapis.com`` -> ``/v1beta``).
+      ``/api/v1``, ``https://api.groq.com`` -> ``/openai/v1``,
+      ``https://api.cerebras.ai`` -> ``/v1``,
+      ``https://generativelanguage.googleapis.com`` -> ``/v1beta``).
     """
     raw = (base_url or "").strip().rstrip("/")
     if not raw:
@@ -538,6 +598,8 @@ def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
         or host.endswith(".bynara.web.id")
     )
     is_openrouter_host = host == "openrouter.ai" or host.endswith(".openrouter.ai")
+    is_groq_host = host == "groq.com" or host.endswith(".groq.com")
+    is_cerebras_host = host == "cerebras.ai" or host.endswith(".cerebras.ai")
     is_gemini_host = host == "generativelanguage.googleapis.com"
 
     if (slug == "gemini" or is_gemini_host) and path.endswith("/models"):
@@ -548,6 +610,11 @@ def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
             path = "/v1"
         elif slug == "openrouter" or is_openrouter_host:
             path = "/api/v1"
+        elif slug == "groq" or is_groq_host:
+            # Groq serves only under its OpenAI-compatibility prefix.
+            path = "/openai/v1"
+        elif slug == "cerebras" or is_cerebras_host:
+            path = "/v1"
         elif slug == "gemini" or is_gemini_host:
             path = "/v1beta"
     elif path == "/api" and (slug == "openrouter" or is_openrouter_host):
@@ -608,8 +675,9 @@ def _legacy_note_configured(settings: Settings) -> bool:
 def note_slot_credentials(settings: Settings, slug: str) -> tuple[str, str, str]:
     """``(api_key, base_url, model)`` configured for one provider slot.
 
-    A credential belongs to exactly one provider: ``NARA_API_KEY`` and
-    ``OPENROUTER_API_KEY`` to theirs, ``GEMINI_API_KEY`` to Gemini, and the
+    A credential belongs to exactly one provider: ``NARA_API_KEY``,
+    ``OPENROUTER_API_KEY``, ``GROQ_API_KEY``, ``CEREBRAS_API_KEY`` and
+    ``GEMINI_API_KEY`` to theirs, and the
     v2-era ``NOTE_API_KEY``/``NOTE_BASE_URL``/``NOTE_MODEL`` trio to the slot
     ``NOTE_PROVIDER`` names (a ``NOTE_BASE_URL`` pointing at a documented
     provider host is classified as that provider, see
@@ -622,8 +690,14 @@ def note_slot_credentials(settings: Settings, slug: str) -> tuple[str, str, str]
     elif slug == "openrouter":
         key = settings.openrouter_api_key
         base, model = settings.openrouter_base_url, settings.openrouter_model
+    elif slug == "groq":
+        key, base, model = settings.groq_api_key, settings.groq_base_url, settings.groq_model
+    elif slug == "cerebras":
+        key = settings.cerebras_api_key
+        base, model = settings.cerebras_base_url, settings.cerebras_model
     elif slug == "gemini":
-        key, base, model = settings.gemini_api_key, "", ""
+        key = settings.gemini_api_key
+        base, model = "", settings.gemini_model
     else:  # openai_compatible / anthropic: configured through the v2-era slot
         key, base, model = "", "", ""
     if slug == settings.note_provider and _legacy_note_configured(settings):
@@ -636,7 +710,9 @@ def note_slot_credentials(settings: Settings, slug: str) -> tuple[str, str, str]
 def note_route_order(settings: Settings) -> tuple[str, ...]:
     """The explicit provider order: the declared chain, then the v2-era slot.
 
-    ``NOTE_PROVIDERS`` is the policy (default ``nara,openrouter``). A configured
+    ``NOTE_PROVIDERS`` is the policy (default
+    ``gemini,nara,openrouter,groq,cerebras``; uncredentialed slugs are skipped).
+    A configured
     ``NOTE_PROVIDER`` slot (the v2 spelling, still honoured) keeps its place when
     it is already a member of that chain — a NaraRouter deployment is the Nara
     leg — and is otherwise appended as one further explicitly configured
@@ -872,7 +948,24 @@ def from_env(env_file: str | None = None) -> Settings:
             _env("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL), "openrouter"
         ),
         openrouter_model=_env("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
+        groq_api_key=_normalize_api_key(_env("GROQ_API_KEY")),
+        groq_base_url=normalize_note_base_url(
+            _env("GROQ_BASE_URL", DEFAULT_GROQ_BASE_URL), "groq"
+        ),
+        groq_model=_env("GROQ_MODEL", DEFAULT_GROQ_MODEL),
+        cerebras_api_key=_normalize_api_key(_env("CEREBRAS_API_KEY")),
+        cerebras_base_url=normalize_note_base_url(
+            _env("CEREBRAS_BASE_URL", DEFAULT_CEREBRAS_BASE_URL), "cerebras"
+        ),
+        cerebras_model=_env("CEREBRAS_MODEL", DEFAULT_CEREBRAS_MODEL),
         gemini_api_key=_normalize_api_key(_env("GEMINI_API_KEY")),
+        gemini_model=_env("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
+        gemini_thinking_budget=_env_int(
+            "NOTE_GEMINI_THINKING_BUDGET",
+            DEFAULT_GEMINI_THINKING_BUDGET,
+            minimum=-1,
+            maximum=32768,
+        ),
         note_context_tokens=_env_int(
             "NOTE_CONTEXT_TOKENS", DEFAULT_NOTE_CONTEXT_TOKENS, minimum=2048
         ),
@@ -994,7 +1087,8 @@ def check(settings: Settings) -> list[str]:
     if not settings.note_configured:
         problems.append(
             "Note generation is not configured (NOTE_PROVIDERS / NOTE_API_KEY / "
-            "NARA_API_KEY / OPENROUTER_API_KEY); the bot will deliver raw transcripts only."
+            "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GROQ_API_KEY / "
+            "CEREBRAS_API_KEY); the bot will deliver raw transcripts only."
         )
     # A listed provider with a credential but no model can never build a request.
     problems.extend(note_route_diagnostics(settings))
