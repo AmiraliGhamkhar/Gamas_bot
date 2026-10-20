@@ -888,11 +888,11 @@ class UnlimitedCommandTests(unittest.IsolatedAsyncioTestCase):
     async def test_admin_marks_and_unmarks_special_user(self):
         event = await self.send(self.admin_id, f"/unlimited {self.user_id} on استاد درس")
         self.assertTrue(await self.db.is_unlimited(self.user_id))
-        self.assertTrue(any("کاربر ویژه شد" in r for r in event.replies))
+        self.assertTrue(any("به فهرست کاربران ویژه افزوده شد" in r for r in event.replies))
 
         event = await self.send(self.admin_id, f"/unlimited {self.user_id} OFF")
         self.assertFalse(await self.db.is_unlimited(self.user_id))
-        self.assertTrue(any("دیگر کاربر ویژه نیست" in r for r in event.replies))
+        self.assertTrue(any("وضعیت ویژهٔ کاربر" in r and "لغو شد" in r for r in event.replies))
 
     async def test_enabling_requires_a_reason(self):
         event = await self.send(self.admin_id, f"/unlimited {self.user_id} on")
@@ -939,8 +939,10 @@ class UnlimitedCommandTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.admin_id, b"adm:users")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn(f"⭐ {self.user_id}", text)
-        self.assertIn("/unlimited <user_id> on", text)
+        self.assertIn(f"⭐ ویژه | شناسه: {self.user_id}", text)
+        self.assertIn("دستورهای مدیریت", text)
+        self.assertIn("/unlimited <شناسه کاربر> on", text)
+        self.assertIn("مثال: /grant 123456789 2", text)
 
 
 class FakeCallbackEvent:
@@ -1025,6 +1027,67 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("منوی اصلی", text)
         self.assertIn(b"make", payloads)      # admin keeps the user flow
         self.assertIn(b"adm:home", payloads)  # …plus the separate admin entry
+
+    async def test_main_panel_copy_gives_clear_first_steps(self):
+        event = FakeCallbackEvent(self.user_id, b"menu:main")
+        await self.bot._handle_callback(event)
+        text, _buttons = event.edits[-1]
+
+        self.assertIn("برای ساخت جزوه", text)
+        self.assertIn("«📎 ساخت جزوه»", text)
+        self.assertIn("اعتبار باقی‌مانده", text)
+        if self.settings.note_configured:
+            self.assertIn("متن گفتار و سپس جزوهٔ Word", text)
+        else:
+            self.assertIn("ساخت جزوهٔ Word در حال حاضر", text)
+        self.assertIn("از اعتبار شما کم نمی‌کند", text)
+
+    async def test_help_copy_explains_steps_and_billing_in_plain_language(self):
+        event = FakeCallbackEvent(self.user_id, b"help")
+        await self.bot._handle_callback(event)
+        text, _buttons = event.responses[-1]
+
+        self.assertIn("راهنمای استفاده", text)
+        self.assertIn("۱. «📎 ساخت جزوه» را انتخاب کنید.", text)
+        self.assertIn("اعتبار بر اساس مدت فایل صوتی محاسبه می‌شود", text)
+        self.assertIn("اعتبار مصرف‌شده به حسابتان بازمی‌گردد", text)
+        self.assertIn("آفیس رایگان", text)
+
+    async def test_main_panel_is_clear_when_word_generation_is_not_configured(self):
+        self.bot.settings = replace(
+            self.settings,
+            note_api_key="",
+            note_api_base_url="",
+            note_providers=(),
+        )
+        self.assertFalse(self.bot.settings.note_configured)
+
+        event = FakeCallbackEvent(self.user_id, b"menu:main")
+        await self.bot._handle_callback(event)
+        text, _buttons = event.edits[-1]
+        self.assertIn("📎 تبدیل فایل به متن", text)
+        self.assertIn("ساخت جزوهٔ Word در حال حاضر روی این سرور فعال نیست", text)
+        self.assertNotIn("متن گفتار و سپس جزوهٔ Word", text)
+
+    async def test_admin_guides_explain_user_actions_and_empty_states(self):
+        users = FakeCallbackEvent(self.admin_id, b"adm:users")
+        await self.bot._handle_callback(users)
+        users_text, _buttons = users.edits[-1]
+        self.assertIn("وضعیت حساب", users_text)
+        self.assertIn("دستورهای مدیریت", users_text)
+        self.assertIn("مثال: /grant 123456789 2", users_text)
+
+        payments = FakeCallbackEvent(self.admin_id, b"adm:pay")
+        await self.bot._handle_callback(payments)
+        payments_text, _buttons = payments.edits[-1]
+        self.assertIn("در حال حاضر پرداختی برای بررسی وجود ندارد", payments_text)
+
+    async def test_broadcast_prompt_warns_that_message_goes_to_everyone(self):
+        event = FakeCallbackEvent(self.admin_id, b"adm:bcast")
+        await self.bot._handle_callback(event)
+        text, _buttons = event.responses[-1]
+        self.assertIn("همان متن برای همهٔ کاربران ارسال می‌شود", text)
+        self.assertIn("/cancel", text)
 
     async def test_regular_user_cannot_open_admin_panel(self):
         event = FakeCallbackEvent(self.user_id, b"adm:users")
