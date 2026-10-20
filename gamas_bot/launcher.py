@@ -20,7 +20,7 @@ import sys
 import time
 
 from .config import PROJECT_DIR, from_env
-from .instance_lock import is_locked
+from .instance_lock import AlreadyRunningError, InstanceLock, is_locked
 
 RUNNING = "running"
 STARTED = "started"
@@ -33,7 +33,12 @@ MIN_SPAWN_INTERVAL_SECONDS = 45
 
 
 def ensure_running(*, min_interval: float = MIN_SPAWN_INTERVAL_SECONDS) -> str:
-    """Return ``running``, ``started``, ``throttled`` or ``misconfigured``."""
+    """Return ``running``, ``started``, ``throttled`` or ``misconfigured``.
+
+    A separate launcher lock serializes watchdogs from cron and Passenger. The
+    bot's own session lock remains authoritative after spawn, but this lock
+    avoids starting redundant Python interpreters while the winner is booting.
+    """
     try:
         settings = from_env()
     except ValueError as exc:
@@ -42,60 +47,70 @@ def ensure_running(*, min_interval: float = MIN_SPAWN_INTERVAL_SECONDS) -> str:
     if not settings.bot_token or settings.api_id <= 0 or not settings.api_hash:
         print("gamas-bot launcher: TELEGRAM_BOT_TOKEN/API_ID/API_HASH missing", file=sys.stderr)
         return MISCONFIGURED
-    if is_locked(settings.session_path.with_suffix(".lock")):
-        return RUNNING
 
     data_dir = settings.session_path.parent
+    data_dir.mkdir(parents=True, exist_ok=True)
     log_dir = data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    stamp = data_dir / "launcher.stamp"
+    instance_lock_path = settings.session_path.with_suffix(".lock")
+    launcher_lock = InstanceLock(data_dir / "launcher.lock")
     try:
-        if time.time() - stamp.stat().st_mtime < min_interval:
-            return THROTTLED
-    except FileNotFoundError:
-        pass
-    # Re-check the instance lock after the throttle gate, immediately before
-    # spawning. ``is_locked`` is a probe, not a held lock: two watchdogs can
-    # still both pass it and both spawn, and the authoritative single-instance
-    # guarantee is the bot's own flock on the session path (instance_lock.py),
-    # which makes the second process exit without polling Telegram.
-    if is_locked(settings.session_path.with_suffix(".lock")):
-        return RUNNING
+        launcher_lock.acquire()
+    except AlreadyRunningError:
+        return RUNNING if is_locked(instance_lock_path) else THROTTLED
     try:
-        # Atomic stamp update: use write-then-rename to avoid torn reads, and
-        # set the mtime explicitly so throttling is accurate even under races.
-        tmp_stamp = data_dir / f".launcher.stamp.{os.getpid()}.tmp"
-        tmp_stamp.write_text(str(time.time()), encoding="utf-8")
-        tmp_stamp.rename(stamp)
-    except OSError:
-        try:
-            stamp.touch()
-        except OSError:
-            pass
-    # Final lock check after updating stamp: if another launcher won the race
-    # and started between our throttle check and now, don't spawn a second.
-    if is_locked(settings.session_path.with_suffix(".lock")):
-        return RUNNING
+        # The process lock is checked only while this launcher's lock is held,
+        # so no competing watchdog can pass the same check and spawn alongside.
+        if is_locked(instance_lock_path):
+            return RUNNING
 
-    env = os.environ.copy()
-    if settings.log_file is None:
-        # stdout is discarded below, so without a log file a start-up failure
-        # would leave no trace at all. The file is size-rotated by the bot.
-        env["LOG_FILE"] = str(log_dir / "bot.log")
-    # stderr is truncated on every launch: it only ever needs to explain why
-    # the *latest* start failed before logging was configured.
-    with open(log_dir / "launcher.err", "wb") as err:
-        subprocess.Popen(  # noqa: S603 - fixed argument vector, no shell
-            [sys.executable, "-m", "gamas_bot"],
-            cwd=PROJECT_DIR,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=err,
-            start_new_session=(os.name == "posix"),
-            close_fds=True,
-        )
-    return STARTED
+        stamp = data_dir / "launcher.stamp"
+        try:
+            if time.time() - stamp.stat().st_mtime < min_interval:
+                return THROTTLED
+        except FileNotFoundError:
+            pass
+
+        # Recheck immediately before updating the throttle stamp and spawning.
+        if is_locked(instance_lock_path):
+            return RUNNING
+        try:
+            tmp_stamp = data_dir / f".launcher.stamp.{os.getpid()}.tmp"
+            tmp_stamp.write_text(str(time.time()), encoding="utf-8")
+            os.chmod(tmp_stamp, 0o600)
+            tmp_stamp.replace(stamp)
+            os.chmod(stamp, 0o600)
+        except OSError:
+            try:
+                stamp.touch()
+            except OSError:
+                pass
+        # A manually started bot does not use launcher.lock; make one final
+        # session-lock check after the stamp update before creating a child.
+        if is_locked(instance_lock_path):
+            return RUNNING
+
+        env = os.environ.copy()
+        if settings.log_file is None:
+            # stdout is discarded below, so without a log file a start-up
+            # failure would leave no trace at all.
+            env["LOG_FILE"] = str(log_dir / "bot.log")
+        error_log = log_dir / "launcher.err"
+        with open(error_log, "wb") as err:
+            os.chmod(error_log, 0o600)
+            subprocess.Popen(  # noqa: S603 - fixed argument vector, no shell
+                [sys.executable, "-m", "gamas_bot"],
+                cwd=PROJECT_DIR,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=err,
+                start_new_session=(os.name == "posix"),
+                close_fds=True,
+            )
+        return STARTED
+    finally:
+        launcher_lock.release()
 
 
 def main() -> int:

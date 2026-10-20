@@ -1,131 +1,55 @@
-# Configuration
+# Configuration for Windows and cPanel
 
-## One source of truth
+`.env.example` is the full settings list. Copy it to `.env`, fill the required values and leave optional settings commented unless you need them. Keep `.env` private; never commit or send it to support.
 
-`.env.example` is the complete list of environment variables; `gamas_bot/config.py`
-is the only place they are read — one frozen `Settings` dataclass built by
-`from_env()`. Nothing else touches `os.environ` at runtime, and no secret is ever
-stored in the database.
+## Create `.env`
 
-`tests/test_config_consistency.py` locks the contract:
+**Windows PowerShell** (from the repository folder):
 
-* every variable `config.py` reads appears in `.env.example`;
-* every variable in `.env.example` is read by the code;
-* each value shown in `.env.example` is what the code produces when that variable
-  is set to it, so a documented default cannot drift.
+```powershell
+Copy-Item .env.example .env
+notepad .env
+```
 
-## Precedence
+**cPanel Terminal** (from the project folder, outside `public_html`):
 
-1. Real environment variables (systemd `Environment=`, Passenger, the shell);
-2. `.env` — project root first, then the working directory;
-3. the built-in default in `config.py`.
+```bash
+cp .env.example .env
+chmod 600 .env
+nano .env
+```
 
-`load_dotenv(..., override=False)` means an exported variable always wins over
-`.env`, which is what an operator expects from a service unit.
+## Required values
 
-Relative paths (`DB_PATH`, `TELEGRAM_SESSION`, `TEMP_DIR`, `RECEIPT_DIR`,
-`LOG_FILE`) are anchored to the **project directory**, never to the process
-working directory. Passenger, `su -c` and cron all start elsewhere, and a
-relative path there would silently create a second database and session.
+```dotenv
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_API_ID=your_api_id
+TELEGRAM_API_HASH=your_api_hash
+ADMIN_IDS=123456789
+SPEECHMATICS_API_KEY=your_stt_key
+```
 
-## Variables by area
+Use a real numeric Telegram user ID for each admin, separated by commas. Configure one STT key whose provider appears in `STT_PROVIDERS`. Add note-provider keys (for example `NARA_API_KEY` or `OPENROUTER_API_KEY`) to get structured booklets; without them, the bot still returns raw transcripts.
 
-Exact names, defaults and Persian explanations live in `.env.example`; this is
-the map of what exists.
+## Useful settings
 
-| Area | Variables |
+| Setting | What to do |
 | --- | --- |
-| Telegram | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `TELEGRAM_SESSION`, `ADMIN_IDS` |
-| Storage & logs | `DB_PATH`, `TEMP_DIR`, `LOG_FILE`, `LOG_LEVEL`, `LOG_FORMAT`, `LOG_MAX_BYTES`, `LOG_BACKUP_COUNT` |
-| Queue & timeouts | `MAX_FILE_SIZE`, `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS`, `MEDIA_WORKER_CONCURRENCY`, `MEDIA_TIMEOUT`, `CONVERT_TIMEOUT`, `STT_JOB_TIMEOUT`, `STT_POLL_INTERVAL` |
-| Speech-to-text | `STT_PROVIDERS`, `STT_LANGUAGE`, `SPEECHMATICS_API_KEY`, `SPEECHMATICS_BASE_URL`, `SPEECHMATICS_MODEL`, `DEEPGRAM_API_KEY`, `DEEPGRAM_BASE_URL`, `DEEPGRAM_MODEL`, `STT_OPENAI_BASE_URL`, `STT_OPENAI_API_KEY`, `STT_OPENAI_MODEL`, `STT_OPENAI_MAX_UPLOAD_BYTES` — see [STT_PROVIDERS.md](STT_PROVIDERS.md) |
-| Note generation | `NOTE_PROVIDERS`, `NARA_API_KEY`, `NARA_BASE_URL`, `NARA_MODEL`, `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`, `NOTE_PROVIDER`, `NOTE_API_KEY`, `NOTE_BASE_URL`, `NOTE_MODEL`, `GEMINI_API_KEY`, `NOTE_MODE`, `NOTE_CONTEXT_TOKENS`, `NOTE_MAX_OUTPUT_TOKENS`, `NOTE_REQUEST_TIMEOUT_SECONDS`, `NOTE_JSON_MODE`, `NOTE_CHUNK_CHARS`, `NOTE_CONCURRENCY`, `NOTE_COMPILE`, `NOTE_COMPILE_MAX_CHARS`, `NOTE_REASONING_EFFORT`, `NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE` — see [PROVIDERS.md](PROVIDERS.md) |
-| Raw text | `RAW_TEXT_PROFILE` (`plain` \| `timestamped`) |
-| Free Office | `OFFICE_ENABLED`, `OFFICE_MAX_INPUT_BYTES`, `OFFICE_MAX_CHARS`, `OFFICE_MAX_SLIDES`, `OFFICE_SESSION_TTL_MINUTES` — see [OFFICE.md](OFFICE.md) |
-| Presentations | `PRESENTATION_MAX_CLIPS`, `PRESENTATION_MAX_TOTAL_DURATION`, `PRESENTATION_MAX_UNPACKED_BYTES`, `PRESENTATION_MAX_TEMP_BYTES`, `PRESENTATION_MIN_CLIP_SECONDS`, `PRESENTATION_SILENCE_SECONDS`, `PRESENTATION_WAV_LIMIT_BYTES`, `PRESENTATION_INCLUDE_SLIDE_TEXT`, `PRESENTATION_INCLUDE_VIDEO_AUDIO`, `PRESENTATION_INCLUDE_UNREFERENCED_MEDIA` |
-| Billing | `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME`, `RECEIPT_DIR`, `RECEIPT_RETENTION_DAYS`, `MAX_PAYMENT_RECEIPT_BYTES`, `FREE_PLAN_HOURS`, `PLAN_*_HOURS`, `PLAN_*_PRICE_TOMAN`, `PLAN_*_VALIDITY_DAYS` |
+| `STT_PROVIDERS`, `STT_LANGUAGE` | Choose failover order and language; Persian defaults to `fa`. See [STT providers](STT_PROVIDERS.md). |
+| `NOTE_PROVIDERS` | Set note-provider order. Each provider needs its own key. See [Note providers](PROVIDERS.md). |
+| `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS` | On cPanel, start with `1` active job and a small queue. |
+| `MAX_FILE_SIZE` | Lower it to fit the host's upload and temporary-disk limits. |
+| `PRESENTATION_MAX_TEMP_BYTES` | Keep it below the available scratch-disk space. |
+| `DB_PATH`, `TELEGRAM_SESSION`, `TEMP_DIR`, `RECEIPT_DIR`, `LOG_FILE` | Relative paths resolve from the project directory, not the current shell directory. Keep data outside `public_html`. |
+| `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME` | Set these to enable card-to-card purchases. Admins review receipts manually. |
 
-## Notes that matter
+## Precedence and checks
 
-* **`MEDIA_WORKER_CONCURRENCY` defaults to 1** to bound concurrent CPU/disk-heavy
-  media work separately from queued jobs. `PRESENTATION_MAX_TEMP_BYTES` is a
-  per-presentation scratch-file ceiling; ensure `TEMP_DIR` has enough space for
-  the configured budget and any concurrently downloaded source files.
-* **`PRESENTATION_MAX_TOTAL_DURATION` includes synthetic inter-clip silence.**
-  Billing uses the measured source narration duration, not those inserted gaps.
-  Unreferenced PowerPoint media stays out unless
-  `PRESENTATION_INCLUDE_UNREFERENCED_MEDIA=true`.
-* **`NOTE_PROVIDERS` is the failover order** (default `nara,openrouter`) and the
-  only routing policy. A provider is attempted only when it has its **own**
-  credential, so a missing key is never treated as a configured provider and one
-  key is never sent to two providers.
-* **`NOTE_PROVIDER` is the older single slot** and still works. It is classified
-  by host, so a deployment whose `NOTE_BASE_URL` is `https://router.bynara.id/v1`
-  is the Nara leg of the chain rather than a duplicate generic gateway.
-* **`GEMINI_API_KEY` is a legacy alias**: when `NOTE_PROVIDER` is unset, it is the
-  only key present and no dedicated provider key exists, `gemini` is selected
-  automatically.
-* **`NOTE_PROVIDER=anthropic` has no default model** — set `NOTE_MODEL`.
-* **`NOTE_STRICT_GROUNDING`** (default `true`) turns on the evidence gate: every
-  number and term in the generated booklet is compared with the transcript,
-  tables whose cells are not in the source are dropped, practical tips without a
-  verbatim source basis are dropped, and objectives/review questions the lecture
-  does not support are removed. `false` restores the pre-v4 behaviour (prompt
-  only, no audit) and is the rollback switch.
-* **`NOTE_QUALITY_GATE`** chooses what the gate may do: `repair` (default) sends
-  at most one bounded repair request with the missing facts and their source
-  sentences, then scrubs any sentence that still states a number absent from the
-  source; `warn` audits and logs and changes nothing at all (not even a table
-  or tip the gate can prove unsupported) — the safe setting for the first week
-  after a model or prompt change.
-* **`NOTE_CONTEXT_TOKENS`** sizes one request: the output budget, system prompt
-  and contextual material are subtracted and the rest is split into chunks. Set
-  it to the smallest window among the configured models. The defaults are a
-  matched pair (the pinned OpenRouter endpoint serves 262,144 tokens and
-  Agnes's reference window is larger still, with Nara's gateway cap
-  unpublished; see [PROVIDERS.md](PROVIDERS.md)), so the default assumption
-  is 131,072 — half the known served window. Changing
-  `NARA_MODEL`/`OPENROUTER_MODEL` without revisiting this value sizes requests
-  for a window the new model may not have.
-* **`NOTE_COMPILE_MAX_CHARS`** caps the merged booklet sent to the editorial
-  compile pass; `0` (default) derives the cap from `NOTE_CONTEXT_TOKENS` with
-  an absolute ceiling in the code.
-* **`NOTE_REASONING_EFFORT`** optionally sets `reasoning_effort` on the
-  Nara/OpenRouter note routes (`none`…`max`); unset sends nothing and keeps
-  each provider's own default.
-* **No credential vault.** Keys come from the environment only. There is no
-  encryption key, no key wizard and no key column in the database.
+A real process environment variable overrides `.env`; otherwise the built-in default is used. Run this after editing configuration:
 
-## What `--check` reports
+```powershell
+# Windows PowerShell
+.\.venv\Scripts\python.exe -m gamas_bot --check
+```
 
-`python -m gamas_bot --check` is offline and side-effect free.
-
-**`FAIL`** — the process exits `2` at startup:
-
-* Telegram settings missing (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`,
-  `TELEGRAM_API_HASH`);
-* no STT provider configured among those listed in `STT_PROVIDERS`;
-* an unknown `NOTE_PROVIDER`;
-* a note provider that has a credential but no model name (for example
-  `NOTE_PROVIDER=anthropic` without `NOTE_MODEL`);
-* `ADMIN_IDS` empty.
-
-**`WARN`** — advisory; the bot still runs:
-
-* note generation not configured ("raw transcripts only");
-* a Persian deployment whose `DEEPGRAM_MODEL` cannot transcribe `fa`;
-* a `NOTE_CONTEXT_TOKENS` / `NOTE_MAX_OUTPUT_TOKENS` pair that leaves no room for
-  the transcript and note system prompt in one request;
-* a `NOTE_MAX_OUTPUT_TOKENS` budget that cannot plausibly be produced inside
-  `NOTE_REQUEST_TIMEOUT_SECONDS` — the request would not be rejected, it would
-  simply time out.
-
-Advisory problems are printed by `--check` and written to the log at startup, and
-never prevent a job from running.
-
-## Secrets
-
-Provider keys live in the process environment or an owner-only `.env`. They are
-never written to the database, never logged, and never included in a user-facing
-message. Provider error text is redacted against the key before it reaches the
-job's error column.
+On cPanel, activate the virtual environment first, then run `python -m gamas_bot --check` and `python -m scripts.cpanel_preflight`. The first check is offline; the preflight tests the host's OS, disk, permissions and outbound network. See [.env.example](../.env.example) for every supported setting and default.

@@ -29,6 +29,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import shutil
 import tempfile
 import time
@@ -108,7 +109,7 @@ from .presentations import (
 )
 from .progress import JobProgress, to_persian_digits
 from .stt import STTError, STTConfigurationError, transcribe
-from .telegram_text import button_label, render_pages
+from .telegram_text import button_label, render_pages, split_message
 from .transcript import build_document, render as render_transcript
 from .textnorm import normalize_display
 
@@ -123,6 +124,10 @@ VIDEO_EXTENSIONS = {
     ".mpg", ".ts", ".webm", ".wmv",
 }
 PRESENTATION_EXTENSIONS = {".ppt", ".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm", ".pps", ".pot"}
+
+class UploadTooLargeError(ValueError):
+    """A Telegram transfer exceeded its configured byte ceiling."""
+
 
 USER_VISIBLE_ERRORS = (
     ValueError,
@@ -158,48 +163,159 @@ def _sanitize_log_value(value: object, *, limit: int = MAX_LOGGED_STRING_CHARS) 
 
 
 def _is_safe_receipt_path(receipt_dir: Path, receipt_path: str | Path) -> bool:
-    """True when *receipt_path* is a regular file strictly inside *receipt_dir*.
+    """True when *receipt_path* is a single-link regular file in *receipt_dir*.
 
-    The check resolves symlinks and rejects ``..``/absolute paths so a
-    compromised payment row cannot make the bot serve an arbitrary server file
-    (see audit F-H01). The path must exist and be a file.
+    Resolve and constrain the path, reject symlinks and hard links, and require
+    a regular file. Rejecting ``st_nlink > 1`` prevents a receipt-directory
+    name from aliasing an inode also reachable outside the private directory.
     """
     try:
-        base = receipt_dir.resolve()
-        target = Path(receipt_path).resolve()
+        base = receipt_dir.resolve(strict=True)
+        raw = Path(receipt_path)
+        raw_stat = raw.lstat()
+        if not stat.S_ISREG(raw_stat.st_mode) or raw_stat.st_nlink != 1:
+            return False
+        target = raw.resolve(strict=True)
+        target.relative_to(base)
+        resolved_stat = target.stat()
     except (OSError, RuntimeError, ValueError):
         return False
-    try:
-        target.relative_to(base)
-    except ValueError:
-        return False
-    return target.is_file()
+    return stat.S_ISREG(resolved_stat.st_mode) and resolved_stat.st_nlink == 1
 
 
-def _validate_receipt_image_signature(path: Path) -> bool:
-    """Validate that *path* starts with a known image signature (JPEG/PNG/WebP).
+def _command_name(text: str) -> str:
+    """Return an exact slash-command token; never strip an arbitrary @target."""
+    token = text.split(maxsplit=1)[0] if text.strip() else ""
+    if not token.startswith("/") or "@" in token:
+        return ""
+    return token.lower()
 
-    Not a full image decode — just a magic-byte check to reject obvious
-    polyglot/non-image uploads while keeping the check cheap. Returns False
-    when the file is too small to decide.
+
+def _parse_telegram_user_id(raw: str) -> int | None:
+    """Parse a Telegram user ID from admin command input robustly.
+
+    Rejects non-decimal digits (e.g. superscript ``²``) that ``isdigit()``
+    accepts but ``int()`` rejects, and bounds to Telegram's 64-bit ID range.
+    Returns None on failure.
     """
+    cleaned = raw.strip()
+    if not cleaned.isdecimal():
+        return None
     try:
-        header = path.read_bytes()[:16]
-    except OSError:
+        value = int(cleaned)
+    except ValueError:
+        return None
+    if not 0 < value < 2**63:
+        return None
+    return value
+
+
+MAX_RECEIPT_IMAGE_PIXELS = 12_000_000
+
+
+def _normalize_receipt_image(path: Path, *, max_bytes: int) -> bool:
+    """Validate and re-encode a JPEG/PNG/WebP receipt as a clean JPEG.
+
+    Magic bytes alone accept truncated images and polyglots. Pillow verifies
+    and fully decodes a bounded-size image, then re-encoding strips trailing
+    payloads and unneeded metadata before the receipt is stored or forwarded.
+    The validation fails closed if Pillow is unavailable.
+    """
+    temp_path: Path | None = None
+    try:
+        size = path.stat().st_size
+        if size < 8 or size > max_bytes:
+            return False
+        with path.open("rb") as source:
+            header = source.read(16)
+        is_jpeg = header.startswith(b"\xff\xd8\xff")
+        is_png = header.startswith(b"\x89PNG\r\n\x1a\n")
+        is_webp = header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WEBP"
+        if not (is_jpeg or is_png or is_webp):
+            return False
+
+        from PIL import Image
+
+        with Image.open(path) as image:
+            if image.format not in {"JPEG", "PNG", "WEBP"}:
+                return False
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > MAX_RECEIPT_IMAGE_PIXELS:
+                return False
+            image.verify()
+        with Image.open(path) as image:
+            width, height = image.size
+            if width <= 0 or height <= 0 or width * height > MAX_RECEIPT_IMAGE_PIXELS:
+                return False
+            image.load()
+            if image.mode in {"RGBA", "LA"} or "transparency" in image.info:
+                rgba = image.convert("RGBA")
+                clean = Image.new("RGB", rgba.size, "white")
+                clean.paste(rgba, mask=rgba.getchannel("A"))
+            else:
+                clean = image.convert("RGB")
+            fd, temp_name = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".jpg.tmp", dir=path.parent
+            )
+            os.close(fd)
+            temp_path = Path(temp_name)
+            clean.save(temp_path, format="JPEG", quality=90, optimize=True)
+            os.chmod(temp_path, 0o600)
+        if temp_path.stat().st_size > max_bytes:
+            return False
+        os.replace(temp_path, path)
+        temp_path = None
+        os.chmod(path, 0o600)
+        return True
+    except (ImportError, OSError, ValueError, SyntaxError):
         return False
-    if len(header) < 8:
+    except Exception:
+        # Corrupt images and Pillow's decompression-bomb errors fail closed.
         return False
-    # JPEG: FF D8 FF
-    if header.startswith(b"\xff\xd8\xff"):
-        return True
-    # PNG: 89 50 4E 47 0D 0A 1A 0A
-    if header.startswith(b"\x89PNG\r\n\x1a\n"):
-        return True
-    # WebP: RIFF....WEBP
-    if header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WEBP":
-        return True
-    # GIF is not an accepted receipt type (photos only), so reject.
-    return False
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+async def _download_media_limited(message, target: Path, limit_bytes: int) -> Path:
+    """Download Telegram media with live abort if it exceeds *limit_bytes*.
+
+    Telegram may report ``file.size`` as None or as a thumbnail size, so
+    pre-check alone is insufficient. The progress callback aborts the download
+    as soon as the declared total or the running total exceeds the limit,
+    preventing a multi-GB disk-fill before the post-download stat check.
+    """
+    if limit_bytes <= 0:
+        raise ValueError("download limit must be positive")
+
+    def _guard(received: int, total: int) -> None:
+        # Telethon reports (received, total); total can be zero for an unknown
+        # size. Check both the declaration and running byte count.
+        if total and total > limit_bytes:
+            raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+        if received > limit_bytes:
+            raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+
+    try:
+        downloaded = await message.download_media(
+            file=str(target), progress_callback=_guard
+        )
+        if not downloaded or not target.is_file():
+            raise RuntimeError("download did not produce a file")
+        if target.stat().st_size > limit_bytes:
+            raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+        return target
+    except BaseException:
+        # This includes cancellation and progress-callback failures: never keep
+        # a partial upload in private storage.
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +407,8 @@ class GamasBot:
         self._pending_broadcast: set[int] = set()
         # admin_id -> payment_id awaiting a rejection reason
         self._pending_reject_reason: dict[int, int] = {}
+        self._admin_action_times: dict[tuple[int, str], float] = {}
+        self._broadcast_running: set[int] = set()
         self._started_at = time.time()
         # Free Office: the in-flight request of every user, and the last
         # document each of them built (so «افزودن متن» can extend it).
@@ -675,8 +793,8 @@ class GamasBot:
             # Size before bytes: a document is downloaded by the Telethon task,
             # outside the bounded job queue, so an unchecked 2 GB upload would
             # bypass MAX_QUEUED_JOBS entirely (audit F-10).
-            reported = getattr(message.file, "size", None) or 0
-            if reported > self.settings.office_max_input_bytes:
+            reported = getattr(message.file, "size", None)
+            if isinstance(reported, int) and reported > self.settings.office_max_input_bytes:
                 await event.reply(
                     "❌ فایل متنی از حد مجاز بزرگ‌تر است "
                     f"({self.settings.office_max_input_bytes} بایت)."
@@ -737,14 +855,19 @@ class GamasBot:
         token = secrets.token_hex(6)
         target = self.settings.temp_dir / f"office-{token}{Path(filename).suffix.lower()}"
         try:
-            downloaded = await message.download_media(file=str(target))
-            if not downloaded or not target.exists():
-                raise OfficeError("فایل ارسالی از تلگرام دریافت نشد.")
+            await _download_media_limited(
+                message, target, self.settings.office_max_input_bytes
+            )
             return read_text_file(
                 target, max_bytes=self.settings.office_max_input_bytes
             )
         except OfficeError:
             raise
+        except ValueError as exc:
+            raise OfficeError(
+                f"حجم فایل بیش از حد مجاز است (حداکثر "
+                f"{self.settings.office_max_input_bytes // 1024} کیلوبایت)."
+            ) from exc
         except Exception as exc:
             logger.warning("office upload could not be read: %s", exc)
             raise OfficeError("فایل ارسالی خوانده نشد.") from exc
@@ -817,6 +940,12 @@ class GamasBot:
         if user_id is None:
             await self._ack(event)
             return
+        # Ignore callbacks outside private chats before touching per-user state.
+        # CallbackQuery may report None on older Telethon builds; treating only
+        # literal False as group context would let those events through.
+        if not getattr(event, "is_private", False):
+            await self._ack(event)
+            return
         # The ban gate is enforced on callbacks as well as messages: a blocked
         # user must not be able to act on a stale keyboard (audit F-05).
         if await self.db.is_banned(user_id):
@@ -835,10 +964,6 @@ class GamasBot:
         if not data.startswith("payr:"):
             self._pending_payments.pop(user_id, None)
 
-        # Private-chat check: callbacks from group contexts are ignored (audit F-M09)
-        if getattr(event, "is_private", None) is False:
-            await self._ack(event)
-            return
         if data == "make":
             await self._ack(event)
             if self.settings.note_configured:
@@ -974,12 +1099,13 @@ class GamasBot:
             await event.reply("⛔ دسترسی شما به ربات مسدود شده است.")
             return
         text = (event.message.message or "").strip()
+        command = _command_name(text)
 
         # Admin conversational states.
         if self._is_admin(user_id) and user_id in self._pending_reject_reason:
             payment_id = self._pending_reject_reason.pop(user_id, None)
             if payment_id is not None:
-                if text.lower() == "/cancel":
+                if command == "/cancel":
                     await event.reply("رد پرداخت لغو شد.")
                     await self._show_admin_payments(event)
                     return
@@ -988,23 +1114,33 @@ class GamasBot:
                     self._pending_reject_reason[user_id] = payment_id
                     await event.reply("لطفاً دلیل رد را در یک پیام متنی بنویسید؛ برای لغو /cancel بفرستید.")
                     return
+                if text.startswith("/"):
+                    self._pending_reject_reason[user_id] = payment_id
+                    await event.reply("دستور نامعتبر است؛ دلیل را بنویسید یا برای لغو /cancel بفرستید.")
+                    return
                 await self._reject_payment_with_reason(event, payment_id, text)
                 return
         if self._is_admin(user_id) and user_id in self._pending_broadcast:
-            if text.lower() == "/cancel":
+            if command == "/cancel":
                 self._pending_broadcast.discard(user_id)
                 await event.reply("پیام همگانی لغو شد.")
+                return
+            if not text:
+                await event.reply("پیام همگانی باید متن داشته باشد؛ متن را بفرستید یا /cancel بزنید.")
+                return
+            if text.startswith("/"):
+                await event.reply("دستور نامعتبر است؛ متن پیام را بفرستید یا /cancel بزنید.")
                 return
             self._pending_broadcast.discard(user_id)
             await self._broadcast(event, text)
             return
-        if self._is_admin(user_id) and text.startswith("/grant"):
+        if self._is_admin(user_id) and command == "/grant":
             await self._admin_grant(event, text)
             return
-        if self._is_admin(user_id) and text.startswith("/unlimited"):
+        if self._is_admin(user_id) and command == "/unlimited":
             await self._admin_unlimited(event, text)
             return
-        if self._is_admin(user_id) and (text.startswith("/ban") or text.startswith("/unban")):
+        if self._is_admin(user_id) and command in {"/ban", "/unban"}:
             await self._admin_ban(event, text)
             return
 
@@ -1013,10 +1149,10 @@ class GamasBot:
             await self._handle_receipt_upload(event, user_id)
             return
 
-        if text.startswith("/start"):
+        if command == "/start":
             await self._show_main(event, first_start=True)
             return
-        if text.startswith("/cancel"):
+        if command == "/cancel":
             self._pending_payments.pop(user_id, None)
             self._office_sessions.pop(user_id, None)
             await event.reply("ارسال لغو شد. برای لغو درخواست خرید از بخش اعتبار و پرداخت اقدام کنید.")
@@ -1064,8 +1200,8 @@ class GamasBot:
         # Defense-in-depth: Telegram reports file.size before download; reject
         # obviously oversized uploads immediately without consuming disk/time
         # (audit F-M05). The post-download check remains as a second gate.
-        reported_size = getattr(getattr(event.message, "file", None), "size", None) or 0
-        if reported_size and reported_size > self.settings.max_file_size:
+        reported_size = getattr(getattr(event.message, "file", None), "size", None)
+        if isinstance(reported_size, int) and reported_size > self.settings.max_file_size:
             await event.reply(
                 "❌ حجم فایل ارسالی از سقف مجاز ربات بیشتر است. "
                 f"حد مجاز: {self.settings.max_file_size // (1024*1024)}MB"
@@ -1118,8 +1254,8 @@ class GamasBot:
             )
             return
         # Pre-size check mirrors _accept_media (audit F-M05)
-        reported_size = getattr(getattr(event.message, "file", None), "size", None) or 0
-        if reported_size and reported_size > self.settings.max_file_size:
+        reported_size = getattr(getattr(event.message, "file", None), "size", None)
+        if isinstance(reported_size, int) and reported_size > self.settings.max_file_size:
             await event.reply(
                 "❌ حجم فایل ارسالی از سقف مجاز ربات بیشتر است. "
                 f"حد مجاز: {self.settings.max_file_size // (1024*1024)}MB"
@@ -1265,9 +1401,12 @@ class GamasBot:
             suffix = ".media"
         source_path = workdir / f"source{suffix}"
         await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
-        downloaded = await job.message.download_media(file=str(source_path))
-        if not downloaded or not source_path.exists():
-            raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
+        try:
+            await _download_media_limited(
+                job.message, source_path, self.settings.max_file_size
+            )
+        except UploadTooLargeError as exc:
+            raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc
         if source_path.stat().st_size > self.settings.max_file_size:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
 
@@ -1361,9 +1500,12 @@ class GamasBot:
         suffix = Path(job.filename).suffix.lower() if job.filename else ".pptx"
         source_path = workdir / f"source{suffix}"
         await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
-        downloaded = await job.message.download_media(file=str(source_path))
-        if not downloaded or not source_path.exists():
-            raise RuntimeError("دانلود فایل از تلگرام ناموفق بود.")
+        try:
+            await _download_media_limited(
+                job.message, source_path, self.settings.max_file_size
+            )
+        except UploadTooLargeError as exc:
+            raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc
         if source_path.stat().st_size > self.settings.max_file_size:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
         if source_path.stat().st_size > self.settings.presentation_max_temp_bytes:
@@ -1990,8 +2132,8 @@ class GamasBot:
             return
         if event.message.photo is None:
             return
-        size = getattr(event.message.file, "size", 0) or 0
-        if size > self.settings.max_payment_receipt_bytes:
+        size = getattr(event.message.file, "size", None)
+        if isinstance(size, int) and size > self.settings.max_payment_receipt_bytes:
             await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
             self._pending_payments[user_id] = payment_id
             return
@@ -1999,24 +2141,24 @@ class GamasBot:
         token = secrets.token_hex(8)
         receipt_path = self.settings.receipt_dir / f"receipt-{payment_id}-{token}.jpg"
         try:
-            await event.message.download_media(file=str(receipt_path))
+            await _download_media_limited(
+                event.message, receipt_path, self.settings.max_payment_receipt_bytes
+            )
+        except ValueError:
+            self._pending_payments[user_id] = payment_id
+            await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
+            return
         except Exception:
-            receipt_path.unlink(missing_ok=True)
             self._pending_payments[user_id] = payment_id
             await event.respond("دریافت رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
             return
-        # Post-download size check: Telegram's reported size can be thumbnail
-        # size, not the full image (audit F-L02). Reject oversized files.
+        # The bounded downloader checks both the live transfer and final size.
         try:
-            actual_size = receipt_path.stat().st_size
-            if actual_size > self.settings.max_payment_receipt_bytes:
-                receipt_path.unlink(missing_ok=True)
-                await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
-                self._pending_payments[user_id] = payment_id
-                return
-            # Lightweight magic-byte validation (JPEG/PNG/WebP) — mirrors the
-            # SECURITY.md promise (audit F-M re-derived).
-            if not _validate_receipt_image_signature(receipt_path):
+            # Decode and re-encode so an image/polyglot is never persisted as
+            # an executable-looking payload, regardless of its original format.
+            if not _normalize_receipt_image(
+                receipt_path, max_bytes=self.settings.max_payment_receipt_bytes
+            ):
                 receipt_path.unlink(missing_ok=True)
                 await event.respond("فرمت رسید نامعتبر است؛ فقط JPEG/PNG/WebP پذیرفته می‌شود.")
                 self._pending_payments[user_id] = payment_id
@@ -2264,7 +2406,9 @@ class GamasBot:
         if (
             not path
             or not _is_safe_receipt_path(self.settings.receipt_dir, path)
-            or not _validate_receipt_image_signature(Path(path))
+            or not _normalize_receipt_image(
+                Path(path), max_bytes=self.settings.max_payment_receipt_bytes
+            )
         ):
             await self._ack(event, "برای این پرداخت رسید معتبری ثبت نشده است.", alert=True)
             return
@@ -2316,9 +2460,41 @@ class GamasBot:
             )
         await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
 
+    ADMIN_COMMAND_COOLDOWN_SECONDS = 30.0
+    BROADCAST_COOLDOWN_SECONDS = 60.0
+    MAX_BROADCAST_CHARS = 20_000
+
+    async def _check_admin_cooldown(
+        self, event, action: str, cooldown_seconds: float
+    ) -> bool:
+        """Apply a per-admin/action cooldown to reduce accidental mass writes."""
+        admin_id = event.sender_id
+        if admin_id is None:
+            return False
+        now = time.monotonic()
+        key = (admin_id, action)
+        previous = self._admin_action_times.get(key)
+        if previous is not None:
+            remaining = cooldown_seconds - (now - previous)
+            if remaining > 0:
+                await event.reply(
+                    f"این دستور موقتاً محدود شده است؛ {math.ceil(remaining)} ثانیه دیگر تلاش کنید.",
+                    buttons=self._admin_menu(),
+                )
+                return False
+        self._admin_action_times[key] = now
+        if len(self._admin_action_times) > 1024:
+            cutoff = now - max(cooldown_seconds, self.BROADCAST_COOLDOWN_SECONDS) * 2
+            self._admin_action_times = {
+                cached_key: timestamp
+                for cached_key, timestamp in self._admin_action_times.items()
+                if timestamp >= cutoff
+            }
+        return True
+
     async def _admin_grant(self, event, text: str) -> None:
         parts = text.split()
-        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        if _command_name(text) != "/grant" or len(parts) != 3:
             await event.reply(
                 "قالب درست برای افزودن اعتبار:\n"
                 "/grant <شناسه کاربر> <ساعت>\n"
@@ -2326,7 +2502,16 @@ class GamasBot:
                 buttons=self._admin_menu(),
             )
             return
-        target, hours = int(parts[1]), int(parts[2])
+        target = _parse_telegram_user_id(parts[1])
+        hours = _parse_telegram_user_id(parts[2])
+        if target is None or hours is None:
+            await event.reply(
+                "قالب درست برای افزودن اعتبار:\n"
+                "/grant <شناسه کاربر> <ساعت>\n"
+                "مثال: /grant 123456789 2",
+                buttons=self._admin_menu(),
+            )
+            return
         if self._is_admin(target):
             # No separation-of-duties escape: an admin cannot mint credit for a
             # peer (audit F-06, docs/SECURITY.md).
@@ -2341,6 +2526,10 @@ class GamasBot:
                 buttons=self._admin_menu(),
             )
             return
+        if not await self._check_admin_cooldown(
+            event, "grant", self.ADMIN_COMMAND_COOLDOWN_SECONDS
+        ):
+            return
         await self.db.ensure_user(target)
         await self.db.add_credit(
             target, hours * 3600, note=f"admin grant by {event.sender_id}",
@@ -2354,7 +2543,7 @@ class GamasBot:
     async def _admin_ban(self, event, text: str) -> None:
         """``/ban <user_id>`` / ``/unban <user_id>`` — audited, admin-only."""
         parts = text.split()
-        if len(parts) != 2 or not parts[1].isdigit():
+        if _command_name(text) not in {"/ban", "/unban"} or len(parts) != 2:
             await event.reply(
                 "قالب درست:\n"
                 "مسدودکردن: /ban <شناسه کاربر>\n"
@@ -2362,10 +2551,23 @@ class GamasBot:
                 buttons=self._admin_menu(),
             )
             return
-        target = int(parts[1])
-        banning = parts[0].lower() == "/ban"
+        target = _parse_telegram_user_id(parts[1])
+        if target is None:
+            await event.reply(
+                "قالب درست:\n"
+                "مسدودکردن: /ban <شناسه کاربر>\n"
+                "رفع مسدودی: /unban <شناسه کاربر>",
+                buttons=self._admin_menu(),
+            )
+            return
+        banning = _command_name(text) == "/ban"
         if self._is_admin(target):
             await event.reply("حساب مدیران را نمی‌توان مسدود کرد.", buttons=self._admin_menu())
+            return
+        action = "ban" if banning else "unban"
+        if not await self._check_admin_cooldown(
+            event, action, self.ADMIN_COMMAND_COOLDOWN_SECONDS
+        ):
             return
         await self.db.ensure_user(target)
         await self.db.set_banned(target, banning, admin_id=event.sender_id)
@@ -2382,7 +2584,11 @@ class GamasBot:
     async def _admin_unlimited(self, event, text: str) -> None:
         """``/unlimited <user_id> on <reason>`` or ``/unlimited <user_id> off``."""
         parts = text.split(maxsplit=3)
-        if len(parts) < 3 or not parts[1].isdigit() or parts[2].lower() not in ("on", "off"):
+        if (
+            _command_name(text) != "/unlimited"
+            or len(parts) < 3
+            or parts[2].lower() not in ("on", "off")
+        ):
             await event.reply(
                 "قالب درست:\n"
                 "فعال‌سازی: /unlimited <شناسه کاربر> on <دلیل>\n"
@@ -2391,7 +2597,16 @@ class GamasBot:
                 buttons=self._admin_menu(),
             )
             return
-        target = int(parts[1])
+        target = _parse_telegram_user_id(parts[1])
+        if target is None:
+            await event.reply(
+                "قالب درست:\n"
+                "فعال‌سازی: /unlimited <شناسه کاربر> on <دلیل>\n"
+                "غیرفعال‌سازی: /unlimited <شناسه کاربر> off\n"
+                "برای فعال‌سازی، دلیل را هم وارد کنید.",
+                buttons=self._admin_menu(),
+            )
+            return
         enable = parts[2].lower() == "on"
         reason = parts[3].strip() if len(parts) == 4 else ""
         if enable and not reason:
@@ -2407,6 +2622,11 @@ class GamasBot:
                 buttons=self._admin_menu(),
             )
             return
+        action = "unlimited_on" if enable else "unlimited_off"
+        if not await self._check_admin_cooldown(
+            event, action, self.ADMIN_COMMAND_COOLDOWN_SECONDS
+        ):
+            return
         await self.db.ensure_user(target)
         await self.db.set_unlimited(target, enable, admin_id=event.sender_id, reason=reason)
         logger.info("unlimited set user=%s enabled=%s by=%s", target, enable, event.sender_id)
@@ -2420,42 +2640,62 @@ class GamasBot:
     BROADCAST_BATCH_PROGRESS_EVERY = 100
 
     async def _broadcast(self, event, text: str) -> None:
-        # Ids only: the per-user balance work in list_users is unnecessary and
-        # made a broadcast O(users) round-trips before the first message
-        # (audit F-18).
-        user_ids = await self.db.user_ids()
-        pages = render_pages(text)
-        sent = 0
-        for idx, user_id in enumerate(user_ids, 1):
-            try:
-                for page in pages:
-                    try:
-                        # render_pages returns Telegram HTML: without the mode
-                        # every tag is shown to every user.
-                        await self.client.send_message(
-                            user_id, page, parse_mode="html"
-                        )
-                    except Exception:
-                        # A page Telegram refuses to parse is still delivered
-                        # as plain text rather than silently dropped.
-                        await self.client.send_message(user_id, page)
-                sent += 1
-            except FloodWaitError as exc:
-                logger.warning("broadcast flood wait seconds=%s", exc.seconds)
-                await asyncio.sleep(min(exc.seconds, 60))
-            except Exception:
-                logger.debug("broadcast to %s failed", user_id)
-            # Throttle to avoid hammering Telegram and blocking the event loop
-            # (audit F-M02). Also yields to other handlers.
-            await asyncio.sleep(self.BROADCAST_THROTTLE_SECONDS)
-            # Periodic progress log for long broadcasts (visibility, audit)
-            if idx % self.BROADCAST_BATCH_PROGRESS_EVERY == 0:
-                logger.info("broadcast progress sent=%d/%d", sent, len(user_ids))
-        await self.db.audit(event.sender_id, "broadcast", f"text:{len(text)} users:{sent}")
-        await event.reply(
-            f"📣 پیام به {to_persian_digits(sent)} کاربر رسید.",
-            buttons=self._admin_menu(),
-        )
+        text = text.strip()
+        if not text:
+            await event.reply("پیام همگانی خالی است؛ متن را بفرستید.", buttons=self._admin_menu())
+            return
+        if len(text) > self.MAX_BROADCAST_CHARS:
+            await event.reply(
+                f"پیام همگانی بیش از حد طولانی است (حداکثر {self.MAX_BROADCAST_CHARS} نویسه).",
+                buttons=self._admin_menu(),
+            )
+            return
+        admin_id = event.sender_id
+        if admin_id is None:
+            return
+        if admin_id in self._broadcast_running:
+            await event.reply("ارسال پیام همگانی دیگری در حال انجام است؛ کمی صبر کنید.", buttons=self._admin_menu())
+            return
+        if not await self._check_admin_cooldown(
+            event, "broadcast", self.BROADCAST_COOLDOWN_SECONDS
+        ):
+            return
+        self._broadcast_running.add(admin_id)
+        try:
+            # Ids only: the per-user balance work in list_users is unnecessary and
+            # made a broadcast O(users) round-trips before the first message
+            # (audit F-18).
+            user_ids = await self.db.user_ids()
+            # Broadcasts are plain text, not user-controlled HTML/Markdown. This
+            # both preserves literal text such as ``<b>`` and removes parse-mode
+            # failure/fallback ambiguity.
+            pages = split_message(text)
+            sent = 0
+            for idx, user_id in enumerate(user_ids, 1):
+                try:
+                    for page in pages:
+                        await self.client.send_message(user_id, page, parse_mode=None)
+                        # Limit message rate per page, not merely per recipient.
+                        await asyncio.sleep(self.BROADCAST_THROTTLE_SECONDS)
+                    sent += 1
+                except FloodWaitError as exc:
+                    logger.warning("broadcast flood wait seconds=%s", exc.seconds)
+                    await asyncio.sleep(min(exc.seconds, 60))
+                except Exception:
+                    logger.debug("broadcast to %s failed", user_id)
+                if idx % self.BROADCAST_BATCH_PROGRESS_EVERY == 0:
+                    logger.info("broadcast progress sent=%d/%d", sent, len(user_ids))
+            await self.db.audit(admin_id, "broadcast", f"text:{len(text)} users:{sent}")
+            await event.reply(
+                f"📣 پیام به {to_persian_digits(sent)} کاربر رسید.",
+                buttons=self._admin_menu(),
+            )
+        finally:
+            self._broadcast_running.discard(admin_id)
+            # A long-running broadcast must also wait the full cooldown after
+            # completion; otherwise its start-time cooldown could expire while
+            # it is still sending and allow overlapping fan-out jobs.
+            self._admin_action_times[(admin_id, "broadcast")] = time.monotonic()
 
     # --------------------------------------------------------------- cleanup
     async def _receipt_cleanup_loop(self) -> None:
@@ -2483,18 +2723,8 @@ class GamasBot:
             # Safety: only touch files strictly inside receipt_dir (audit F-H01)
             try:
                 if not _is_safe_receipt_path(self.settings.receipt_dir, path):
-                    # If it doesn't exist or is outside, skip — but glob already
-                    # ensures it's inside unless symlink trickery.
-                    if not path.exists():
-                        continue
-                    # For age check we need stat; verify boundary first via resolve
-                    try:
-                        target = path.resolve()
-                        base = self.settings.receipt_dir.resolve()
-                        target.relative_to(base)
-                    except ValueError:
-                        logger.warning("skipping receipt outside root path=%s", _sanitize_log_value(path))
-                        continue
+                    logger.warning("skipping unsafe receipt path=%s", _sanitize_log_value(path))
+                    continue
                 if datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
                     path.unlink(missing_ok=True)
                     removed += 1

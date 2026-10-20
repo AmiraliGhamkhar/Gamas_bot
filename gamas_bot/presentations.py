@@ -14,7 +14,6 @@ import logging
 import math
 import posixpath
 import re
-import shutil
 import zipfile
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
@@ -83,6 +82,8 @@ CHART_NS = "http://schemas.openxmlformats.org/drawingml/2006/chart"
 DIAGRAM_DATA_REL_TYPE = f"{OFFICE_REL_NS}/diagramData"
 CHART_REL_TYPE = f"{OFFICE_REL_NS}/chart"
 MAX_ZIP_ENTRIES = 20000
+MAX_ZIP_MEMBER_NAME_BYTES = 4096
+MAX_ZIP_CENTRAL_DIRECTORY_BYTES = 32 * 1024 * 1024
 
 
 class PresentationError(RuntimeError):
@@ -244,15 +245,49 @@ def _parse_xml(payload: bytes) -> etree._Element:
     return etree.fromstring(payload, parser=parser)
 
 
+def _zip_member_stream_complete(handle, info: zipfile.ZipInfo) -> bool:
+    """Check that a member's compressed stream was consumed to its true EOF.
+
+    ``ZipExtFile`` stops at the central-directory ``file_size``. Checking its
+    stream state catches a forged small ``file_size`` that would otherwise
+    make a ZIP bomb appear harmless while leaving compressed payload unread.
+    """
+    if getattr(handle, "_compress_left", None) != 0:
+        return False
+    if info.compress_type == zipfile.ZIP_STORED:
+        return info.compress_size == info.file_size
+    decompressor = getattr(handle, "_decompressor", None)
+    return bool(
+        decompressor is not None
+        and decompressor.eof
+        and not decompressor.unconsumed_tail
+        and not decompressor.unused_data
+    )
+
+
 def _read_member(archive: zipfile.ZipFile, name: str, limit: int) -> bytes | None:
+    """Read one ZIP member under a hard output limit; never silently truncate."""
     try:
         info = archive.getinfo(name)
     except KeyError:
         return None
-    if info.file_size > limit:
+    if limit < 0 or info.file_size < 0 or info.file_size > limit:
         raise PresentationError("یکی از بخش‌های فایل ارائه بیش از حد بزرگ است.")
-    with archive.open(info) as handle:
-        return handle.read(limit + 1)[:limit]
+    try:
+        with archive.open(info) as handle:
+            # ZipExtFile normally stops at central-directory file_size. Permit
+            # one byte beyond that declaration (but never beyond our limit) so
+            # a forged smaller value is detected instead of silently hiding
+            # decompressed bytes.
+            member_cap = min(limit, info.file_size)
+            handle._left = member_cap + 1
+            payload = handle.read(member_cap + 1)
+            complete = _zip_member_stream_complete(handle, info)
+    except (zipfile.BadZipFile, EOFError, OSError, RuntimeError) as exc:
+        raise PresentationError("یکی از بخش‌های فایل ارائه خراب است.") from exc
+    if len(payload) > limit or len(payload) != info.file_size or not complete:
+        raise PresentationError("اندازهٔ واقعی یکی از بخش‌های فایل ارائه معتبر نیست.")
+    return payload
 
 
 def _relationships(archive: zipfile.ZipFile, part_name: str) -> list[tuple[str, str, str]]:
@@ -347,12 +382,18 @@ def _validate_archive(archive: zipfile.ZipFile, settings: Settings) -> None:
         parts = PurePosixPath(name).parts
         if name.startswith("/") or ".." in parts or PurePosixPath(name).is_absolute():
             raise PresentationError("فایل ارائه شامل مسیر نامعتبر است و پردازش نشد.")
+        if len(name.encode("utf-8", "surrogatepass")) > MAX_ZIP_MEMBER_NAME_BYTES:
+            raise PresentationError("نام یکی از بخش‌های فایل ارائه بیش از حد طولانی است.")
         if _is_zip_symlink(info):
             raise PresentationError("فایل ارائه شامل پیوند نمادین است و پردازش نشد.")
         # Control characters would let a crafted part name forge extra lines
         # in the line-oriented log (audit F-19).
         if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in name):
             raise PresentationError("فایل ارائه شامل نام بخش نامعتبر است و پردازش نشد.")
+        if info.file_size < 0 or info.compress_size < 0:
+            raise PresentationError("اندازهٔ یکی از بخش‌های فایل ارائه معتبر نیست.")
+        if info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}:
+            raise PresentationError("روش فشرده‌سازی یکی از بخش‌های ارائه پشتیبانی نمی‌شود.")
         total += info.file_size
         if total > settings.presentation_max_unpacked_bytes:
             raise PresentationError("حجم بازشدهٔ فایل ارائه از حد مجاز بیشتر است.")
@@ -860,6 +901,28 @@ def _extract_slide_text(path: Path) -> list[SlideText]:
     return merged or primary or fallback
 
 
+def _preflight_zip_directory(path: Path) -> None:
+    """Bound central-directory parsing before ``ZipFile`` allocates its index.
+
+    The standard library reads the whole directory into memory before yielding
+    ``ZipInfo`` objects. Its EOCD helper only reads the final 64 KiB, so inspect
+    the advertised count/size first and reject pathological indexes early.
+    """
+    try:
+        with path.open("rb") as source:
+            end_record = zipfile._EndRecData(source)
+    except OSError as exc:
+        raise PresentationError("فایل ارائه قابل‌خواندن نیست.") from exc
+    if end_record is None:
+        return  # ``is_zipfile``/``ZipFile`` below will report malformed input.
+    entries = int(end_record[zipfile._ECD_ENTRIES_TOTAL])
+    directory_size = int(end_record[zipfile._ECD_SIZE])
+    if entries > MAX_ZIP_ENTRIES:
+        raise PresentationError("تعداد بخش‌های داخل فایل ارائه بیش از حد مجاز است.")
+    if directory_size < 0 or directory_size > MAX_ZIP_CENTRAL_DIRECTORY_BYTES:
+        raise PresentationError("فهرست داخلی فایل ارائه بیش از حد بزرگ است.")
+
+
 def _directory_size(directory: Path) -> int:
     """Best-effort byte count of regular files currently under a work directory."""
     total = 0
@@ -872,14 +935,61 @@ def _directory_size(directory: Path) -> int:
     return total
 
 
+def _copy_zip_member_bounded(
+    archive: zipfile.ZipFile,
+    info: zipfile.ZipInfo,
+    destination: Path,
+    *,
+    limit: int,
+) -> int:
+    """Copy a member with a streaming output cap and verify its declared size."""
+    if info.file_size < 0 or info.file_size > limit:
+        raise PresentationError("یکی از رسانه‌های ارائه از حد مجاز بزرگ‌تر است.")
+    copied = 0
+    stream_complete = False
+    try:
+        with archive.open(info) as source, destination.open("wb") as target:
+            # Read at most one byte past the declared size to detect a forged
+            # small file_size; the independent resource limit is checked too.
+            source._left = min(limit, info.file_size) + 1
+            while True:
+                chunk = source.read(min(1024 * 1024, min(limit, info.file_size) - copied + 1))
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > info.file_size:
+                    raise PresentationError("اندازهٔ واقعی رسانه از مقدار اعلام‌شده بیشتر است.")
+                if copied > limit:
+                    raise PresentationError("حجم بازشدهٔ رسانه از حد مجاز بیشتر است.")
+                target.write(chunk)
+            stream_complete = _zip_member_stream_complete(source, info)
+    except PresentationError:
+        destination.unlink(missing_ok=True)
+        raise
+    except (zipfile.BadZipFile, EOFError, OSError, RuntimeError) as exc:
+        destination.unlink(missing_ok=True)
+        raise PresentationError("یکی از رسانه‌های ارائه خراب است.") from exc
+    if copied != info.file_size or not stream_complete:
+        destination.unlink(missing_ok=True)
+        raise PresentationError("اندازهٔ واقعی رسانه با ساختار فایل ارائه سازگار نیست.")
+    return copied
+
+
 def read_presentation(
     path: Path, media_dir: Path, settings: Settings
 ) -> PresentationContent:
     """Extract slide-linked media and slide text from a .pptx package (blocking)."""
+    try:
+        source_size = path.stat().st_size
+    except OSError as exc:
+        raise PresentationError("فایل ارائه قابل‌خواندن نیست.") from exc
+    if source_size > min(settings.max_file_size, settings.presentation_max_temp_bytes):
+        raise PresentationError("حجم فایل ارائه از سقف تعیین‌شده بیشتر است.")
     if not zipfile.is_zipfile(path):
         raise PresentationError(
             "این فایل یک ارائهٔ معتبر PowerPoint نیست یا آسیب دیده است."
         )
+    _preflight_zip_directory(path)
     media_dir.mkdir(parents=True, exist_ok=True)
     clips: list[MediaClip] = []
     skipped: list[str] = []
@@ -971,10 +1081,15 @@ def read_presentation(
                 destination = media_dir / _safe_media_filename(
                     len(copied_paths) + 1, part_name
                 )
-                with archive.open(info) as source, destination.open("wb") as target:
-                    shutil.copyfileobj(source, target, 1024 * 1024)
+                remaining_temp = settings.presentation_max_temp_bytes - base_temp_bytes - copied_bytes
+                copied = _copy_zip_member_bounded(
+                    archive,
+                    info,
+                    destination,
+                    limit=min(settings.max_file_size, remaining_temp),
+                )
                 copied_paths[part_name] = destination
-                copied_bytes += info.file_size
+                copied_bytes += copied
 
             clips.append(
                 MediaClip(

@@ -1,198 +1,47 @@
 # Gamas Bot
 
-A Persian study assistant for Telegram. Send a lecture recording (audio or video)
-or a PowerPoint deck; the bot returns the raw transcript first, then a
-right-to-left Word booklet.
+A Persian Telegram study assistant. Send lecture audio/video or a PowerPoint deck to get a raw transcript and an RTL Word booklet. The free Office menu turns text into Word, Excel, PowerPoint or PDF.
 
-* **Persian first** — RTL paragraphs and styles, mixed Persian/English runs,
-  Persian digits, real heading styles, cover page, page frame, native
-  page-number fields.
-* **Free Office section** — send your own text and get a real Word, Excel,
-  PowerPoint or PDF file, right-to-left and in the same brand. It costs no
-  credit, and it never rewrites what you wrote.
-* **No system media binaries** — media runs on PyAV and python-pptx. There is no
-  `ffmpeg`, `ffprobe` or `soffice` requirement.
-* **Providers are configuration** — speech-to-text (Speechmatics / Deepgram /
-  any OpenAI-compatible endpoint) and note generation (NaraRouter / OpenRouter /
-  Gemini / Anthropic / any OpenAI-compatible endpoint). Keys live in the
-  environment only, never in the database.
-* **Prepaid billing with a real ledger** — credit is reserved before a job runs
-  and released in full on every failure path.
+## Windows PowerShell: install and run
 
-## Pipeline
+Use Python 3.11–3.13 and Git. From PowerShell (replace `3.12` below with your installed version if needed):
 
-```
-Telegram → bounded job queue → media worker (PyAV) → speech-to-text
-        → transcript engine (cleanup + paragraphing)
-        → raw .txt delivered → note model (map + optional reduce)
-        → evidence gate (nothing invented, nothing lost) → RTL Word document
-        → delivery
+```powershell
+git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git
+Set-Location Gamas_bot
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install --upgrade pip
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+Copy-Item .env.example .env
+notepad .env
+.\.venv\Scripts\python.exe -m gamas_bot --check
+.\.venv\Scripts\python.exe -m gamas_bot
 ```
 
-The raw transcript is persisted and delivered **before** note generation starts,
-so a note-provider outage never costs the user their content.
+Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ADMIN_IDS`, and at least one STT key in `.env`. Note-generation keys are optional; without them, the bot delivers the transcript only. Stop a foreground run with **Ctrl+C**. Do not share or upload `.env`.
 
-Generated notes are checked against their source before delivery: every number,
-unit and term is compared with the transcript, tables and practical tips are kept
-only where the lecture supports them, and a value the lecture never contained is
-removed rather than shipped. The note model restructures; it does not author.
-See [docs/NOTE_QUALITY.md](docs/NOTE_QUALITY.md).
+To run tests on Windows, install the `.[dev]` extra and follow [Testing](docs/TESTING.md). Production cPanel hosting runs Linux; use its Terminal, not PowerShell, for the server steps.
 
-For PowerPoint, narration linked to slides is merged into one STT request and
-mapped back to slides only when the provider supplies timestamps; untimed and
-unlinked narration is labelled instead of guessed. Unreferenced media is opt-in.
-See [docs/PRESENTATIONS.md](docs/PRESENTATIONS.md) for duration, billing and
-resource-limit semantics.
+## cPanel shared hosting
 
-In chat everything starts from one button, **📎 ساخت جزوه**. A second button,
-**📄 آفیس رایگان**, turns the user's own text into a real Word, Excel,
-PowerPoint or PDF file — free, and without touching the credit ledger.
-Admins step
-into their own panel (**🛠 پنل مدیریت**) for statistics, users, pending
-payments and broadcasts.
+Follow [Deploy on cPanel](docs/DEPLOY_CPANEL.md). Keep the project, `.env`, database, session and receipts **outside `public_html`**. The host must allow Python 3.11+, outbound TCP 443 and a cron job. Shared-host limits may stop long-running jobs; use one active worker and test the host before relying on it.
 
-## Supported formats
+## What it supports
 
-| Kind | Formats |
-| --- | --- |
-| Audio | MP3, M4A, WAV, OGG/OPUS, FLAC, WMA, AMR, AAC, Telegram voice notes |
-| Video | MP4, MKV, MOV, AVI, WEBM, WMV, MPEG/TS, Telegram round videos (audio track extracted, never re-encoded) |
-| Decks | PPTX, PPTM, PPSX, PPSM, POTX, POTM, legacy PPT/PPS/POT (converted in-process). ODP/OTP are not supported |
-| Free Office | Word (`.docx`), Excel (`.xlsx`), PowerPoint (`.pptx`), PDF (`.pdf`) built from a chat message or an uploaded `.txt`/`.csv`/`.tsv`/`.md` file |
+- Audio, video, PowerPoint (`.pptx` and legacy `.ppt`) → transcript and RTL `.docx`.
+- Text or supported text files → free `.docx`, `.xlsx`, `.pptx` or `.pdf`.
+- STT: Speechmatics, Deepgram or an OpenAI-compatible endpoint. Note generation supports NaraRouter, OpenRouter, Gemini, Anthropic and OpenAI-compatible APIs.
+- No system `ffmpeg`, `soffice`, Redis, Docker or external database required. PyAV supplies the media libraries.
 
-## Install
+OCR for images and scanned PDFs is **not supported**. Free Office accepts text files, not source `.docx` or `.pdf` documents.
 
-```bash
-git clone https://github.com/AmiraliGhamkhar/Gamas_bot
-cd Gamas_bot
-python -m venv .venv && . .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-cp .env.example .env          # then edit .env
-python -m scripts.cpanel_preflight   # host readiness checklist
-python -m gamas_bot --check          # offline config self-check
-python -m gamas_bot                  # run
-```
+## Operations and help
 
-Requires Python **3.11–3.13**, a Telegram bot token and API credentials
-([my.telegram.org](https://my.telegram.org)), and at least one STT key.
+- [Configuration](docs/CONFIGURATION.md) · [cPanel deployment](docs/DEPLOY_CPANEL.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Billing](docs/BILLING.md) · [Security](docs/SECURITY.md) · [All documentation](docs/README.md)
 
-### Minimum configuration
-
-`.env.example` documents the full configuration surface. The variables you cannot start without:
-
-```dotenv
-TELEGRAM_BOT_TOKEN=123456:ABC...
-TELEGRAM_API_ID=123456
-TELEGRAM_API_HASH=abcdef0123456789abcdef0123456789
-ADMIN_IDS=123456789            # numeric ids, comma separated
-
-# At least one STT engine:
-SPEECHMATICS_API_KEY=...
-# DEEPGRAM_API_KEY=...
-
-# Optional — without it the bot delivers raw transcripts only.
-# The order IS the failover policy:
-NARA_API_KEY=...
-OPENROUTER_API_KEY=...
-```
-
-Relative paths are anchored to the project directory, so cron or `su -c` cannot
-silently create a second database or session.
-
-### Migrating from v2
-
-```bash
-python scripts/import_v2.py --from data/gamas_v2.db --into data/gamas.db
-```
-
-Users, plans, pending payments and live balances are replayed into the v3
-append-only ledger. The script refuses to run twice and never writes to the
-source database.
-
-## Limits
-
-All configurable; defaults shown.
-
-| Limit | Variable | Default |
-| --- | --- | --- |
-| Upload size | `MAX_FILE_SIZE` | 2 GB |
-| Active / queued jobs | `MAX_ACTIVE_JOBS` / `MAX_QUEUED_JOBS` | 3 / 8 |
-| Heavy media stages | `MEDIA_WORKER_CONCURRENCY` | 1 |
-| One media operation | `MEDIA_TIMEOUT` | 3600 s |
-| Legacy `.ppt` conversion | `CONVERT_TIMEOUT` | 600 s |
-| One STT job | `STT_JOB_TIMEOUT` | 21600 s |
-| Playback uses per deck | `PRESENTATION_MAX_CLIPS` | 300 |
-| Merged presentation duration (including gaps) | `PRESENTATION_MAX_TOTAL_DURATION` | 21600 s |
-| Unpacked deck size | `PRESENTATION_MAX_UNPACKED_BYTES` | 4 GB |
-| Presentation scratch files | `PRESENTATION_MAX_TEMP_BYTES` | 8 GB |
-| Note request window | `NOTE_CONTEXT_TOKENS` | 131072 tokens |
-| Note chunk ceiling | `NOTE_CHUNK_CHARS` | 64000 chars |
-| Note answer budget | `NOTE_MAX_OUTPUT_TOKENS` | 16384 tokens |
-| Receipt image | `MAX_PAYMENT_RECEIPT_BYTES` | 5 MB, kept 90 days |
-| Free Office text | `OFFICE_MAX_CHARS` | 20000 chars |
-| Free Office upload | `OFFICE_MAX_INPUT_BYTES` | 1 MB |
-| Free Office slides | `OFFICE_MAX_SLIDES` | 30 |
-
-Beyond the queue bounds an upload is rejected with an explicit message rather
-than queued in memory.
-
-## Test
-
-```bash
-ruff check .
-python -m mypy
-python -m pytest -q
-```
-
-No test needs an API key or makes a billable call. See
-[docs/TESTING.md](docs/TESTING.md).
-
-## Deploy
-
-* **cPanel / Passenger** — [docs/DEPLOY_CPANEL.md](docs/DEPLOY_CPANEL.md),
-  Persian walkthrough in [docs/DEPLOY_FA.md](docs/DEPLOY_FA.md).
-* **systemd** — `deploy/gamas-bot.service` (`Restart=always`, `UMask=0077`,
-  `ProtectSystem=strict`).
-
-An advisory lock on the Telegram session path guarantees a single polling
-instance even if a watchdog starts a second copy.
-
-## Known limitations
-
-* STT is billed by provider duration and is never chunked: a file larger than
-  every configured engine's upload ceiling is rejected, not split.
-* The table of contents links to headings but prints no page numbers — exact
-  numbers need an office layout engine, and they are omitted rather than
-  guessed.
-* Legacy `.ppt` fidelity is bounded by the converter library; unsupported
-  content is reported, not silently dropped.
-* The Free Office section reads text, not documents: a `.docx` or a `.pdf` is
-  not a source, only a message or a `.txt`/`.csv`/`.tsv`/`.md` file is.
-* One process serves one bot token. Horizontal scaling would need a real job
-  broker.
-* Payments are card-to-card and confirmed by a human. No gateway integration.
-
-## Privacy
-
-Audio goes to the configured STT provider, the transcript to the configured note
-provider. Temporary files are removed after processing. The database keeps the
-transcript and generated notes so a job can be audited. Receipts are stored
-outside the web root at `0600` and deleted after the retention window. Logs never
-contain transcripts, keys or receipt contents.
-
-The Free Office section keeps the user's text in memory only, for as long as
-the request is open (`OFFICE_SESSION_TTL_MINUTES`); nothing about it is written
-to the database, and an uploaded file is deleted as soon as it has been read.
-
-## Documentation
-
-[docs/README.md](docs/README.md) indexes every page.
+Back up the database, Telegram session and `.env` before upgrades. Database migrations run when the bot starts. Card-to-card payments require manual admin review; sending a receipt does not add credit.
 
 ## License
 
-Proprietary — all rights reserved.
-
-## Author
-
-Amirali Ghamkhar
+Proprietary — all rights reserved. See `assets/fonts/LICENSE.txt` for the bundled font license.
