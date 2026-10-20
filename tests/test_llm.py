@@ -11,7 +11,7 @@ import aiohttp
 
 
 from gamas_bot import llm
-from gamas_bot.config import DEFAULT_NARA_MODEL, note_routes
+from gamas_bot.config import DEFAULT_GEMINI_MODEL, DEFAULT_NARA_MODEL, note_routes
 from gamas_bot.llm import (
     LLMAuthError,
     LLMContextOverflowError,
@@ -74,6 +74,82 @@ class RequestBuildingTests(unittest.TestCase):
         settings = make_settings(note_reasoning_effort="low")
         _url, _headers, payload = _build_request(settings, "S", "U")
         self.assertNotIn("reasoning_effort", payload)
+
+    def test_reasoning_effort_sent_on_the_gpt_oss_routes(self):
+        """Groq and Cerebras document ``reasoning_effort`` on gpt-oss."""
+        settings = routed_settings(
+            note_providers=("groq", "cerebras"),
+            nara_api_key="",
+            openrouter_api_key="",
+            groq_api_key="gsk-key",
+            cerebras_api_key="csk-key",
+            note_reasoning_effort="low",
+        )
+        groq, cerebras = note_routes(settings)
+        for route in (groq, cerebras):
+            url, headers, payload = _build_request(settings, "S", "U", route=route)
+            self.assertEqual(payload["reasoning_effort"], "low")
+            self.assertEqual(payload["model"], route.model)
+            self.assertTrue(url.endswith("/chat/completions"))
+            self.assertEqual(headers["Authorization"], f"Bearer {route.api_key}")
+
+    def test_gemini_thinking_budget_is_zero_by_default(self):
+        settings = make_settings(
+            note_providers=("gemini",),
+            note_provider="",
+            note_api_key="",
+            note_api_base_url="",
+            gemini_api_key="g-key",
+        )
+        route = note_routes(settings)[0]
+        url, _headers, payload = _build_request(settings, "S", "U", route=route)
+        self.assertIn(f"models/{DEFAULT_GEMINI_MODEL}:generateContent", url)
+        self.assertEqual(
+            payload["generationConfig"]["thinkingConfig"], {"thinkingBudget": 0}
+        )
+        # The rest of the generation config is untouched.
+        self.assertEqual(
+            payload["generationConfig"]["responseMimeType"], "application/json"
+        )
+
+    def test_minus_one_thinking_budget_sends_no_thinking_config(self):
+        settings = make_settings(
+            note_providers=("gemini",),
+            note_provider="",
+            note_api_key="",
+            note_api_base_url="",
+            gemini_api_key="g-key",
+            gemini_thinking_budget=-1,
+        )
+        _url, _headers, payload = _build_request(settings, "S", "U")
+        self.assertNotIn("thinkingConfig", payload["generationConfig"])
+
+    def test_positive_thinking_budget_is_sent_verbatim(self):
+        settings = make_settings(
+            note_providers=("gemini",),
+            note_provider="",
+            note_api_key="",
+            note_api_base_url="",
+            gemini_api_key="g-key",
+            gemini_thinking_budget=24576,
+        )
+        _url, _headers, payload = _build_request(settings, "S", "U")
+        self.assertEqual(
+            payload["generationConfig"]["thinkingConfig"]["thinkingBudget"], 24576
+        )
+
+    def test_gemini_route_never_carries_reasoning_effort(self):
+        settings = make_settings(
+            note_providers=("gemini",),
+            note_provider="",
+            note_api_key="",
+            note_api_base_url="",
+            gemini_api_key="g-key",
+            note_reasoning_effort="low",
+        )
+        _url, _headers, payload = _build_request(settings, "S", "U")
+        self.assertNotIn("reasoning_effort", payload)
+        self.assertNotIn("reasoning_effort", payload["generationConfig"])
 
     def test_reasoning_effort_not_invented_for_gemini_style(self):
         settings = make_settings(
@@ -413,6 +489,58 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("temperature", generation_config)
         self.assertNotIn("responseMimeType", generation_config)
         self.assertEqual(generation_config["maxOutputTokens"], 4096)
+
+    async def test_rejected_thinking_config_is_dropped_and_retried_once(self):
+        """A model that predates ``thinkingConfig`` costs exactly one retry."""
+        settings = make_settings(
+            note_providers=("gemini",),
+            note_provider="",
+            note_api_key="",
+            note_api_base_url="",
+            gemini_api_key="gemini-key",
+        )
+        session = FakeSession([
+            FakeResponse(400, {"error": {
+                "message": "Unknown name \"thinkingConfig\": Cannot find field."
+            }}),
+            FakeResponse(200, {"candidates": [{
+                "content": {"parts": [{"text": '{"ok": true}'}]}
+            }]}),
+        ])
+        result = await complete_json(session, settings, system="S", user="U")
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(len(session.calls), 2)
+        # ``FakeSession`` records the live payload object, which the retry path
+        # mutates in place — so the surviving payload is the adjusted one.
+        self.assertNotIn("thinkingConfig", session.calls[1]["json"]["generationConfig"])
+        # Everything else about the retried request is unchanged.
+        self.assertEqual(
+            session.calls[1]["json"]["generationConfig"]["responseMimeType"],
+            "application/json",
+        )
+
+    def test_thinking_config_is_kept_without_a_rejection_marker(self):
+        """Only an explicit rejection drops the field; a vague error keeps it."""
+        payload = {"generationConfig": {
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingBudget": 0},
+        }}
+        adjustment = llm._adjust_rejected_request_param(
+            payload, "thinkingConfig backend hiccup"
+        )
+        self.assertIsNone(adjustment)
+        self.assertIn("thinkingConfig", payload["generationConfig"])
+
+    def test_thinking_budget_error_variants_are_recognized(self):
+        for error_text in (
+            "Unsupported parameter: thinking_budget",
+            "Unknown field thinkingBudget",
+            "thinking_config is not supported for this model",
+        ):
+            payload = {"generationConfig": {"thinkingConfig": {"thinkingBudget": 0}}}
+            adjustment = llm._adjust_rejected_request_param(payload, error_text)
+            self.assertEqual(adjustment, "generationConfig.thinkingConfig", error_text)
+            self.assertNotIn("thinkingConfig", payload["generationConfig"])
 
     async def test_bad_success_body_is_response_error(self):
         session = FakeSession([InvalidJsonResponse(200)])
@@ -884,7 +1012,8 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
         gem_model_url, gem_headers = llm._build_get_request_for(gemini, "model")
         self.assertEqual(
             gem_model_url,
-            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash",
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            + DEFAULT_GEMINI_MODEL,
         )
         self.assertEqual(gem_headers, {"x-goog-api-key": "AIzaSyGem789"})
 

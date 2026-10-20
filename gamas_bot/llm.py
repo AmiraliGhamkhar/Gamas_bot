@@ -1,8 +1,9 @@
 """The single LLM client for note generation: ordered providers, bounded retries.
 
-``NOTE_PROVIDERS`` *is* the failover policy (``nara,openrouter`` by default,
-i.e. Nara first, OpenRouter second, any other provider only when it is listed
-and configured). For every route the client builds that provider's own request
+``NOTE_PROVIDERS`` *is* the failover policy (``gemini,nara,openrouter,groq,
+cerebras`` by default — Gemini flash-lite first, then each further provider
+only when it is listed *and* has its own credential). For every route the
+client builds that provider's own request
 (base URL, authentication, model, supported parameters), parses its own response
 shape, retries only transient failures — a bounded budget per provider — and
 then moves to the next eligible provider. Nothing is retried forever and a
@@ -621,14 +622,25 @@ def _build_request_for(
         # Accept the documented "models/<name>" spelling without doubling it.
         model_id = _gemini_model_id(model)
         url = _endpoint(route.base_url, f"models/{model_id}:generateContent")
+        generation_config = {
+            "temperature": NOTE_TEMPERATURE,
+            "maxOutputTokens": max_tokens,
+            "responseMimeType": "application/json",
+        }
+        if settings.gemini_thinking_budget >= 0:
+            # ``0`` (the default) turns thinking off entirely: a note request is
+            # extraction/organisation, so hidden reasoning tokens buy nothing
+            # and cost latency. A positive value caps them; ``-1`` sends no
+            # ``thinkingConfig`` at all (the pre-flag behaviour). A model that
+            # rejects the field is handled by the generic rejected-parameter
+            # retry below, so no model-name sniffing is needed here.
+            generation_config["thinkingConfig"] = {
+                "thinkingBudget": settings.gemini_thinking_budget,
+            }
         payload = {
             "contents": [{"role": "user", "parts": [{"text": user}]}],
             "systemInstruction": {"parts": [{"text": system}]},
-            "generationConfig": {
-                "temperature": NOTE_TEMPERATURE,
-                "maxOutputTokens": max_tokens,
-                "responseMimeType": "application/json",
-            },
+            "generationConfig": generation_config,
         }
         return url, {"x-goog-api-key": key}, payload
 
@@ -660,11 +672,16 @@ def _build_request_for(
         # Opt-in, and only for providers that document ``response_format``
         # (NaraRouter does not, so it is never asked for it).
         payload["response_format"] = {"type": "json_object"}
-    if settings.note_reasoning_effort and route.slug in ("nara", "openrouter"):
-        # Only the two gateways whose contracts were verified for this field:
+    if settings.note_reasoning_effort and route.slug in (
+        "nara", "openrouter", "groq", "cerebras"
+    ):
+        # Only the gateways whose contracts were verified for this field:
         # NaraRouter documents ``reasoning_effort`` and clamps unsupported
-        # levels instead of erroring, and OpenRouter accepts it for the models
-        # that support it. A generic OpenAI-compatible gateway (whose model
+        # levels instead of erroring, OpenRouter accepts it for the models
+        # that support it, and Groq and Cerebras document
+        # ``reasoning_effort`` on their OpenAI-compatible gpt-oss endpoints
+        # (where ``low`` keeps the model from spending output tokens on
+        # hidden reasoning). A generic OpenAI-compatible gateway (whose model
         # may reject the parameter outright) and the Gemini/Anthropic styles
         # above never receive it. Unset (the default) sends nothing, so the
         # provider's own reasoning default applies.
@@ -1108,6 +1125,23 @@ def _adjust_rejected_request_param(payload: dict, error_text: str) -> str | None
         ):
             generation_config.pop("responseMimeType", None)
             return "generationConfig.responseMimeType"
+        if (
+            "thinkingConfig" in generation_config
+            and any(
+                marker in lower
+                for marker in (
+                    "thinkingconfig",
+                    "thinking_config",
+                    "thinkingbudget",
+                    "thinking_budget",
+                )
+            )
+            and any(marker in lower for marker in rejected_markers)
+        ):
+            # A model that predates ``thinkingConfig`` rejects the field
+            # instead of ignoring it; drop it and retry the same request once.
+            generation_config.pop("thinkingConfig", None)
+            return "generationConfig.thinkingConfig"
         if (
             "temperature" in generation_config
             and "temperature" in lower
