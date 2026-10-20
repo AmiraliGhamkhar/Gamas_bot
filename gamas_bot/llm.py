@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import re
+import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -1006,7 +1007,9 @@ def _usage_summary(payload: dict, style: str) -> tuple[str, int | None, int | No
     return str(model), input_tokens, output_tokens, total_tokens
 
 
-def _log_usage(route: NoteRoute, payload: dict) -> None:
+def _log_usage(
+    route: NoteRoute, payload: dict, *, ttfb_ms: float = 0.0, elapsed_ms: float = 0.0
+) -> None:
     """Log one completed request's token usage (never its content or key)."""
     model, input_tokens, output_tokens, total_tokens = _usage_summary(payload, route.style)
 
@@ -1015,7 +1018,7 @@ def _log_usage(route: NoteRoute, payload: dict) -> None:
 
     logger.info(
         "note provider usage provider=%s model=%s input_tokens=%s "
-        "output_tokens=%s total_tokens=%s",
+        "output_tokens=%s total_tokens=%s ttfb_ms=%.0f elapsed_ms=%.0f",
         route.slug,
         # The served-model string is provider-controlled: collapse any
         # whitespace (including newlines) so it can never forge a log line.
@@ -1023,6 +1026,8 @@ def _log_usage(route: NoteRoute, payload: dict) -> None:
         shown(input_tokens),
         shown(output_tokens),
         shown(total_tokens),
+        ttfb_ms,
+        elapsed_ms,
     )
 
 
@@ -1146,6 +1151,9 @@ async def _complete_on_route(
             settings.note_max_output_tokens,
             ",".join(sorted(payload)),
         )
+        started = time.perf_counter()
+        ttfb_ms = 0.0
+        elapsed_ms = 0.0
         try:
             async with session.post(
                 url,
@@ -1153,6 +1161,7 @@ async def _complete_on_route(
                 json=payload,
                 timeout=aiohttp.ClientTimeout(total=timeout_seconds),
             ) as response:
+                ttfb_ms = (time.perf_counter() - started) * 1000.0
                 if response.status != 200:
                     raise await _error_from_response(
                         route.label, response, route.api_key or None
@@ -1164,12 +1173,13 @@ async def _complete_on_route(
                     raise LLMResponseError(
                         "پاسخ سرویس تولید جزوه JSON معتبری نبود."
                     ) from exc
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
             if not isinstance(result, dict):
                 raise LLMResponseError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
             # Usage is logged even for an answer the parser then rejects or
             # reports as truncated: those are exactly the requests whose real
             # token counts calibrate the chunk budget.
-            _log_usage(route, result)
+            _log_usage(route, result, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms)
             _raise_if_in_body_error(
                 route.label, result, resp_headers, route.api_key or None
             )
@@ -1243,12 +1253,14 @@ async def get_json(
     url, headers = _build_get_request_for(route, target)
     attempt = 0
     while True:
+        started = time.perf_counter()
         try:
             async with session.get(
                 url,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout_seconds),
             ) as response:
+                ttfb_ms = (time.perf_counter() - started) * 1000.0
                 if response.status != 200:
                     raise await _error_from_response(
                         route.label, response, route.api_key or None
@@ -1260,6 +1272,11 @@ async def get_json(
                     raise LLMResponseError(
                         "پاسخ سرویس تولید جزوه JSON معتبری نبود."
                     ) from exc
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                logger.debug(
+                    "note provider GET timing provider=%s ttfb_ms=%.0f elapsed_ms=%.0f",
+                    route.slug, ttfb_ms, elapsed_ms,
+                )
             if not isinstance(result, dict):
                 raise LLMResponseError("پاسخ سرویس تولید جزوه یک شیء JSON نبود.")
             _raise_if_in_body_error(
