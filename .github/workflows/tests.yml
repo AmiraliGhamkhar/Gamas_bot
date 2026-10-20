@@ -63,13 +63,18 @@ jobs:
                       assert applied == expected, f"applied {applied}, expected {expected}"
 
                       rows = await db.db.execute_fetchall(
-                          "SELECT COUNT(*) AS count FROM sqlite_master "
+                          "SELECT name FROM sqlite_master "
                           "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
                           "AND name != 'schema_migrations'"
                       )
-                      table_count = int(rows[0]["count"])
-                      assert table_count == 8, f"expected 8 application tables, found {table_count}"
-                      print(f"applied {len(applied)} migration(s); verified {table_count} application tables")
+                      tables = {row["name"] for row in rows}
+                      expected_tables = {
+                          "users", "submissions", "transcriptions", "plans",
+                          "payments", "ledger", "holds", "audit",
+                          "debit_allocations", "hold_allocations", "billing_migrations",
+                      }
+                      assert tables == expected_tables, f"unexpected application tables: {tables}"
+                      print(f"applied {len(applied)} migration(s); verified {len(tables)} application tables")
                   finally:
                       await db.close()
 
