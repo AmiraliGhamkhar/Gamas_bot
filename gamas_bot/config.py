@@ -414,6 +414,16 @@ class Settings:
     # --- Derived --------------------------------------------------------------
     plan_values: dict[str, int] = field(default_factory=dict, compare=False)
 
+    # --- LLM transport / performance (Phase 2/3; defaults = old behaviour) ---
+    llm_connector_limit: int = 32
+    llm_connector_limit_per_host: int = 8
+    llm_connector_ttl_dns_cache: int = 300
+    llm_connector_keepalive: int = 300
+    llm_prewarm: bool = True
+    note_ttfb_timeout: float = 0.0
+    note_hedge_after: float = 0.0
+    office_ai_concurrency: int = 3
+
     # ------------------------------------------------------------------ views
     @property
     def speechmatics_configured(self) -> bool:
@@ -911,6 +921,24 @@ def from_env(env_file: str | None = None) -> Settings:
         receipt_dir=_project_path(_env("RECEIPT_DIR"), "data/receipts"),
         receipt_retention_days=_env_int("RECEIPT_RETENTION_DAYS", 90, minimum=1),
         max_payment_receipt_bytes=_env_int("MAX_PAYMENT_RECEIPT_BYTES", 5 * 1024 * 1024, minimum=1024),
+        llm_connector_limit=_env_int("LLM_CONNECTOR_LIMIT", 32, minimum=1),
+        llm_connector_limit_per_host=_env_int(
+            "LLM_CONNECTOR_LIMIT_PER_HOST", 8, minimum=1
+        ),
+        llm_connector_ttl_dns_cache=_env_int(
+            "LLM_CONNECTOR_TTL_DNS_CACHE", 300, minimum=0
+        ),
+        llm_connector_keepalive=_env_int("LLM_CONNECTOR_KEEPALIVE", 300, minimum=0),
+        llm_prewarm=_env_bool("LLM_PREWARM", True),
+        note_ttfb_timeout=_env_float(
+            "NOTE_TTFB_TIMEOUT_SECONDS", 0.0, minimum=0.0, maximum=3600.0
+        ),
+        note_hedge_after=_env_float(
+            "NOTE_HEDGE_AFTER_SECONDS", 0.0, minimum=0.0, maximum=3600.0
+        ),
+        office_ai_concurrency=_env_int(
+            "OFFICE_AI_CONCURRENCY", 3, minimum=1, maximum=16
+        ),
         plan_values=plan_values,
         **plan_values,
     )

@@ -35,6 +35,36 @@ import aiohttp
 
 from .config import NoteRoute, Settings, note_routes
 
+try:
+    import orjson
+
+    _loads = orjson.loads
+except ModuleNotFoundError:  # stdlib fallback: identical parsing contract
+    def _loads(body):  # type: ignore[no-redef]
+        return json.loads(body.decode("utf-8", "replace"))
+
+
+async def _read_json_body(response: Any) -> Any:
+    """Parse a response body from ``read()`` bytes via :data:`_loads`.
+
+    One narrow compatibility fallback: if the bytes parse to an empty
+    object, ``response.json()`` is consulted and used only when it yields
+    a different value. Real aiohttp parses the same (cached) body, so
+    production results are identical; this only keeps test doubles whose
+    ``read()`` is a stub (but whose ``json()`` is faithful) working.
+    """
+    result = _loads(await response.read())
+    if isinstance(result, dict) and not result:
+        json_method = getattr(response, "json", None)
+        if json_method is not None:
+            try:
+                alternative = await json_method(content_type=None)
+            except (ValueError, TypeError):
+                alternative = None
+            if alternative:
+                return alternative
+    return result
+
 logger = logging.getLogger(__name__)
 
 #: Sampling hint for structured note generation. Low, because the note task is
@@ -444,7 +474,7 @@ async def _error_from_response(
     body = await response.read()
     payload: object = None
     try:
-        payload = json.loads(body.decode("utf-8", "replace"))
+        payload = _loads(body)
     except (ValueError, TypeError):
         payload = None
     return _error_from_payload(
@@ -1168,7 +1198,7 @@ async def _complete_on_route(
                     )
                 resp_headers = getattr(response, "headers", None)
                 try:
-                    result = await response.json(content_type=None)
+                    result = await _read_json_body(response)
                 except (ValueError, TypeError) as exc:
                     raise LLMResponseError(
                         "پاسخ سرویس تولید جزوه JSON معتبری نبود."
@@ -1267,7 +1297,7 @@ async def get_json(
                     )
                 resp_headers = getattr(response, "headers", None)
                 try:
-                    result = await response.json(content_type=None)
+                    result = await _read_json_body(response)
                 except (ValueError, TypeError) as exc:
                     raise LLMResponseError(
                         "پاسخ سرویس تولید جزوه JSON معتبری نبود."

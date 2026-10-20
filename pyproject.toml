@@ -27,6 +27,7 @@ dependencies = [
     "Telethon>=1.45,<2.0",
     # Async HTTP (provider calls) and async SQLite.
     "aiohttp>=3.14,<4.0",
+    "orjson>=3.10,<4.0",
     "aiosqlite>=0.22,<1.0",
     "python-dotenv>=1.2,<2.0",
     # Media: PyAV ships its own FFmpeg libraries, so no system ffmpeg/ffprobe

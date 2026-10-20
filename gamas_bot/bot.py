@@ -48,7 +48,7 @@ from .billing import (
     format_validity,
     plan_catalog,
 )
-from .config import Settings, format_payment_card
+from .config import Settings, format_payment_card, note_routes
 from .db import (
     Database,
     InsufficientBalanceError,
@@ -522,10 +522,44 @@ class GamasBot:
 
     def _http_session(self) -> aiohttp.ClientSession:
         if self._http is None or self._http.closed:
-            self._http = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=None, sock_read=self.settings.stt_job_timeout)
+            connector = aiohttp.TCPConnector(
+                limit=self.settings.llm_connector_limit,
+                limit_per_host=self.settings.llm_connector_limit_per_host,
+                ttl_dns_cache=self.settings.llm_connector_ttl_dns_cache,
+                keepalive_timeout=float(self.settings.llm_connector_keepalive),
             )
+            self._http = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=self.settings.stt_job_timeout),
+                connector=connector,
+            )
+            if self.settings.llm_prewarm:
+                self._schedule_llm_prewarm()
         return self._http
+
+    def _schedule_llm_prewarm(self) -> None:
+        """Warm one connection to the first note route's host (no quota used)."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._prewarm_llm())
+
+    async def _prewarm_llm(self) -> None:
+        session = self._http
+        if session is None:
+            return
+        try:
+            routes = note_routes(self.settings)
+            if not routes:
+                return
+            url = routes[0].base_url
+            logger.debug("pre-warming LLM connection host=%s", url)
+            async with session.head(
+                url, timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                await response.read()
+        except Exception:
+            logger.debug("LLM connection pre-warm failed (ignored)", exc_info=True)
 
     # -------------------------------------------------------------- handlers
     def _register_handlers(self) -> None:
