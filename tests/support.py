@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import inspect
 import io
-import shutil
 import tempfile
 import wave
 import zipfile
@@ -207,10 +206,12 @@ class FakeTelegramMessage:
     async def respond(self, *args, **kwargs):
         return await self.reply(*args, **kwargs)
 
-    async def download_media(self, file: str | None = None) -> str | None:
+    async def download_media(
+        self, file: str | None = None, *, progress_callback=None
+    ) -> str | None:
         if self._download is None:
             raise AssertionError("this fake message carries no downloadable media")
-        return await self._download(file)
+        return await self._download(file, progress_callback=progress_callback)
 
 
 class FakeJobEvent:
@@ -243,8 +244,16 @@ class FakeJobEvent:
     def deliveries(self) -> list[dict]:
         return self.client.deliveries
 
-    async def _download(self, file: str) -> str:
-        shutil.copyfile(self.source, file)
+    async def _download(self, file: str, *, progress_callback=None) -> str:
+        total = self.source.stat().st_size
+        received = 0
+        with self.source.open("rb") as source, open(file, "wb") as target:
+            while chunk := source.read(64 * 1024):
+                target.write(chunk)
+                received += len(chunk)
+                if progress_callback is not None:
+                    # Match Telethon's (received_bytes, total_bytes) callback.
+                    progress_callback(received, total if self.message.file.size else 0)
         return file
 
     async def reply(self, text: str = "", **kwargs) -> FakeSentMessage:

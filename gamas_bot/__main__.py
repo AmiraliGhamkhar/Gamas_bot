@@ -23,7 +23,8 @@ from .logging_config import configure_logging, install_asyncio_exception_handler
 #: worker's own ``av``/``ppt2pptx`` check is reported separately). ``python-socks``
 #: is excluded: it is only needed with a proxy, which v3 does not configure.
 CHECK_REQUIRED_DISTRIBUTIONS = (
-    "telethon", "aiohttp", "aiosqlite", "dotenv", "pptx", "docx", "lxml", "av", "ppt2pptx",
+    "telethon", "aiohttp", "aiosqlite", "dotenv", "pptx", "docx", "lxml",
+    "av", "ppt2pptx", "openpyxl", "PIL",
 )
 
 

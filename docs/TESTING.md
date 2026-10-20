@@ -1,83 +1,30 @@
 # Testing
 
-## CI gates
+Run tests from the repository root. Python 3.11–3.13 are exercised in CI. Replace `3.12` below with your installed version if needed.
 
-GitHub Actions runs on Python 3.11, 3.12 and 3.13 (`.github/workflows/tests.yml`).
-The equivalent local run:
+## Windows PowerShell / local development
 
-```bash
-python -m pip check
-python -m scripts.sync_requirements --check
-ruff check .
-python -m mypy
-python -m compileall -q gamas_bot scripts tests passenger_wsgi.py
-python -m pytest -q
-python -m unittest discover -s tests -q
-python -m gamas_bot.media_worker check
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -m scripts.sync_requirements --check
+.\.venv\Scripts\ruff.exe check .
+.\.venv\Scripts\python.exe -m mypy
+.\.venv\Scripts\python.exe -m pytest -q
+.\.venv\Scripts\python.exe -m unittest discover -s tests -q
+.\.venv\Scripts\python.exe -m gamas_bot.media_worker check
 ```
 
-CI also applies every SQL file under `migrations/v3/` to a fresh temporary
-database and asserts the resulting eight application tables, and runs a
-non-blocking `pip-audit` scan.
+If the `ruff.exe` command is unavailable, run `ruff check .` after activating the virtual environment. Tests use fake Telegram/provider responses; they need no production keys and make no billable API calls.
 
-`requirements.txt` is generated from `[project].dependencies` in
-`pyproject.toml`; `scripts.sync_requirements --check` fails if the deployment file
-has drifted.
+## cPanel check
 
-## Coverage
-
-The suite contains 15 test modules plus `tests/support.py`. Counts are not
-repeated here on purpose — run `python -m pytest -q` and report the number from
-that run.
-
-| Area | Module |
-| --- | --- |
-| Bot intake, raw-first delivery, billing settlement | `tests/test_bot.py` |
-| Settings parsing, precedence, `check()` | `tests/test_config.py` |
-| `.env.example` ↔ `config.py` consistency | `tests/test_config_consistency.py` |
-| Migrations, ledger, holds, payments, plans, special users | `tests/test_db_billing.py` |
-| RTL Word output and document structure | `tests/test_docx_export.py` |
-| One-shot v2 database import | `tests/test_import_v2.py` |
-| Queue bounds, back-pressure, shutdown | `tests/test_jobs.py` |
-| LLM request/response shapes, error classes, failover | `tests/test_llm.py` |
-| Note parsing, slide-aware chunking, map/reduce, split recovery, evidence gate, repair, number scrub | `tests/test_notes.py` |
-| Deterministic note benchmark: signal extraction, unit aliases, structural masking, table cells, tip bases, coverage floors over `tests/fixtures/notes/` | `tests/test_note_evidence.py` |
-| PyAV merge metadata, PPTX media relationships, timing and XML fallback | `tests/test_media.py` |
-| Free Office: parser, Word/Excel/PowerPoint output, bot flow | `tests/test_office.py` |
-| STT adapters, retries, cooldowns, ordered failover | `tests/test_stt.py` |
-| Transcript paragraphing, fidelity, chunk boundaries | `tests/test_transcript.py` |
-| PDF layout, shaping and page numbering | `tests/test_pdf_export.py` |
-
-The suite uses synthetic media and scripted HTTP/Telegram doubles. **No test
-needs an API key and no test makes a billable call.** Presentation tests verify
-mechanics (clip ordering/spans, source-vs-merged accounting, alignment,
-extraction fallback and resource caps); they do not establish STT accuracy,
-latency or denoising/VAD quality. Those claims require a separate
-consented/reference-audio benchmark.
-
-Two doubles are deliberately strict, because permissive ones hid real bugs:
-
-* `tests/support.py` binds every fake Telegram call against the *installed*
-  Telethon signature, so an unsupported keyword fails in the test the same way it
-  fails in production.
-* The provider doubles return real documented payloads (NaraRouter's error
-  envelope, Gemini's `promptFeedback`, Deepgram's word timings) rather than
-  whatever shape the code happens to expect.
-
-## Writing a test here
-
-* Prefer asserting the **documented provider contract** over the current code
-  path — a test that only mirrors the implementation cannot catch drift.
-* A regression test should fail against the commit before the fix. Verify that
-  with `git stash` before claiming it.
-* Report the count from the run you are looking at, never a copied-forward
-  number.
-
-## Manual checks
+After installing runtime dependencies on the target account, run these from the project folder with the same Python executable used by cron:
 
 ```bash
-python -m gamas_bot --check    # offline; needs valid local configuration
+python -m gamas_bot --check
+python -m scripts.cpanel_preflight
 ```
 
-An end-to-end run against live services needs a test bot and provider
-credentials, may incur charges, and is not part of CI.
+The first checks local settings and packages. The preflight also tests disk, permissions, the lock and outbound network; it is the host-compatibility check. CI additionally checks dependency consistency and compiles the package. Do not run the test suite with production credentials or data.

@@ -18,6 +18,8 @@ import sys
 import tempfile
 import unittest
 import zipfile
+import struct
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -46,7 +48,10 @@ from gamas_bot.presentations import (
     SlideText,
     _extract_slide_text_from_xml,
     _extract_slide_text_with_pptx,
+    _preflight_zip_directory,
+    _read_member,
     _validate_archive,
+    MAX_ZIP_CENTRAL_DIRECTORY_BYTES,
     align_narration_to_slides,
     prepare_audio,
     read_presentation,
@@ -409,6 +414,52 @@ class ArchiveValidationTests(MediaTempCase):
         with zipfile.ZipFile(buffer) as archive:
             with self.assertRaises(PresentationError):
                 _validate_archive(archive, self.settings)
+
+    def test_overlong_member_names_are_rejected(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("a" * 4097, "x")
+        buffer.seek(0)
+        with zipfile.ZipFile(buffer) as archive:
+            with self.assertRaises(PresentationError):
+                _validate_archive(archive, self.settings)
+
+    def test_oversized_central_directory_is_rejected_before_zipfile_indexing(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("ppt/slides/slide1.xml", "x")
+        forged = bytearray(buffer.getvalue())
+        end_record = forged.rfind(b"PK\x05\x06")
+        self.assertGreaterEqual(end_record, 0)
+        struct.pack_into(
+            "<I",
+            forged,
+            end_record + 12,
+            MAX_ZIP_CENTRAL_DIRECTORY_BYTES + 1,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "large-index.zip"
+            path.write_bytes(forged)
+            with self.assertRaises(PresentationError):
+                _preflight_zip_directory(path)
+
+    def test_declared_zip_size_cannot_hide_actual_member_data(self):
+        payload = b"actual expanded member contents" * 100
+        for compression in (zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED):
+            with self.subTest(compression=compression):
+                buffer = io.BytesIO()
+                with zipfile.ZipFile(buffer, "w", compression=compression) as archive:
+                    archive.writestr("ppt/media/clip.bin", payload)
+                forged = bytearray(buffer.getvalue())
+                central = forged.find(b"PK\x01\x02")
+                self.assertGreaterEqual(central, 0)
+                # Forge a one-byte uncompressed size and matching one-byte CRC,
+                # while retaining the original compressed length and contents.
+                struct.pack_into("<I", forged, central + 16, zlib.crc32(payload[:1]))
+                struct.pack_into("<I", forged, central + 24, 1)
+                with zipfile.ZipFile(io.BytesIO(forged)) as archive:
+                    with self.assertRaises(PresentationError):
+                        _read_member(archive, "ppt/media/clip.bin", len(payload) + 1)
 
 
 class PresentationAlignmentTests(MediaTempCase):

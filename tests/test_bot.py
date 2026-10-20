@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+import os
 import re
 import tempfile
 import unittest
@@ -11,7 +12,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from gamas_bot.bot import GamasBot
+from gamas_bot.bot import (
+    GamasBot,
+    _download_media_limited,
+    _is_safe_receipt_path,
+    _normalize_receipt_image,
+    _parse_telegram_user_id,
+)
 from gamas_bot.db import Database
 from gamas_bot.jobs import Job
 from gamas_bot.media import MediaInfo, MediaToolError
@@ -944,9 +951,51 @@ class UnlimitedCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/unlimited <شناسه کاربر> on", text)
         self.assertIn("مثال: /grant 123456789 2", text)
 
+    async def test_superscript_digit_is_rejected_without_handler_error(self):
+        self.assertIsNone(_parse_telegram_user_id("²"))
+        grant = await self.send(self.admin_id, f"/grant {self.user_id} ²")
+        self.assertEqual(await self.db.available_seconds(self.user_id), 0)
+        self.assertTrue(any("قالب درست" in reply for reply in grant.replies))
+
+        unlimited = await self.send(self.admin_id, "/unlimited ² on test reason")
+        self.assertFalse(await self.db.is_unlimited(self.user_id))
+        self.assertTrue(any("قالب درست" in reply for reply in unlimited.replies))
+
+    async def test_admin_command_names_are_matched_exactly(self):
+        grant = await self.send(self.admin_id, f"/grantfoo {self.user_id} 1")
+        self.assertEqual(await self.db.available_seconds(self.user_id), 0)
+        self.assertFalse(any("اعتبار به حساب کاربر" in reply for reply in grant.replies))
+
+        grant_other = await self.send(self.admin_id, f"/grant@anotherbot {self.user_id} 1")
+        self.assertEqual(await self.db.available_seconds(self.user_id), 0)
+        self.assertFalse(any("اعتبار به حساب کاربر" in reply for reply in grant_other.replies))
+
+        ban = await self.send(self.admin_id, f"/banish {self.user_id}")
+        self.assertFalse(await self.db.is_banned(self.user_id))
+        self.assertFalse(any("مسدود شد" in reply for reply in ban.replies))
+
+    async def test_group_callback_with_unknown_private_flag_is_ignored(self):
+        self.bot._pending_payments[self.user_id] = 17
+        event = FakeCallbackEvent(self.user_id, b"menu:main")
+        event.is_private = None
+        await self.bot._handle_callback(event)
+        self.assertEqual(event.edits, [])
+        self.assertEqual(event.responses, [])
+        self.assertEqual(self.bot._pending_payments[self.user_id], 17)
+
+    async def test_admin_credit_command_is_rate_limited(self):
+        first = await self.send(self.admin_id, "/grant 777 1")
+        self.assertTrue(any("اعتبار به حساب کاربر" in reply for reply in first.replies))
+        second = await self.send(self.admin_id, "/grant 778 1")
+        self.assertTrue(any("محدود" in reply for reply in second.replies))
+        self.assertEqual(await self.db.available_seconds(777), 3600)
+        self.assertEqual(await self.db.available_seconds(778), 0)
+
 
 class FakeCallbackEvent:
     """Minimal Telethon CallbackQuery double that records every outcome."""
+
+    is_private = True
 
     def __init__(self, sender_id: int, data: bytes):
         self.sender_id = sender_id
@@ -1089,6 +1138,32 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("همان متن برای همهٔ کاربران ارسال می‌شود", text)
         self.assertIn("/cancel", text)
 
+    async def test_broadcast_is_literal_text_and_rate_limited(self):
+        await self.db.ensure_user(self.admin_id)
+        await self.db.ensure_user(self.user_id)
+        event = FakeMessageEvent(self.admin_id, "")
+        self.bot.client = event.client
+        await self.bot._broadcast(event, "<b>literal & text</b>")
+        delivered = [
+            item for item in event.client.texts
+            if item["text"] == "<b>literal & text</b>"
+        ]
+        self.assertEqual(len(delivered), 2)
+        self.assertTrue(all(item["parse_mode"] is None for item in delivered))
+
+        next_event = FakeMessageEvent(self.admin_id, "")
+        next_event.message.client = event.client
+        await self.bot._broadcast(next_event, "second broadcast")
+        self.assertFalse(any(item["text"] == "second broadcast" for item in event.client.texts))
+        self.assertTrue(any("محدود" in item["text"] for item in event.client.texts))
+
+    async def test_oversized_broadcast_is_rejected(self):
+        event = FakeMessageEvent(self.admin_id, "")
+        self.bot.client = event.client
+        await self.bot._broadcast(event, "x" * (self.bot.MAX_BROADCAST_CHARS + 1))
+        self.assertEqual(len(event.client.texts), 1)  # only the admin's error reply
+        self.assertIn("حداکثر", event.client.texts[0]["text"])
+
     async def test_regular_user_cannot_open_admin_panel(self):
         event = FakeCallbackEvent(self.user_id, b"adm:users")
         await self.bot._handle_callback(event)
@@ -1174,6 +1249,65 @@ class ModerationTests(BotPipelineTestCase):
         await self.db.set_banned(USER_ID, True, admin_id=1)
         await self.db.set_banned(USER_ID, False, admin_id=1)
         self.assertFalse(await self.db.is_banned(USER_ID))
+
+
+class IntakeLimitTests(BotPipelineTestCase):
+    async def test_unknown_reported_size_download_aborts_and_cleans_partial_file(self):
+        source = Path(self._tmp.name) / "large.bin"
+        source.write_bytes(b"x" * (128 * 1024))
+        event = FakeJobEvent(source=source)
+        event.message.file.size = None  # Telegram did not report a usable size.
+        target = Path(self._tmp.name) / "download.bin"
+
+        with self.assertRaises(ValueError):
+            await _download_media_limited(event.message, target, 1024)
+        self.assertFalse(target.exists())
+
+
+class ReceiptPathAndImageTests(unittest.TestCase):
+    def test_receipt_path_rejects_hardlinks_and_symlinks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            receipts = root / "receipts"
+            receipts.mkdir()
+            regular = receipts / "receipt.jpg"
+            regular.write_bytes(b"receipt")
+            self.assertTrue(_is_safe_receipt_path(receipts, regular))
+
+            outside = root / "outside.jpg"
+            outside.write_bytes(b"secret")
+            hard_link = receipts / "hardlink.jpg"
+            os.link(outside, hard_link)
+            self.assertFalse(_is_safe_receipt_path(receipts, hard_link))
+
+            symbolic_link = receipts / "symlink.jpg"
+            symbolic_link.symlink_to(outside)
+            self.assertFalse(_is_safe_receipt_path(receipts, symbolic_link))
+
+    def test_receipt_image_is_decoded_and_reencoded_without_trailing_payload(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "receipt.jpg"
+            Image.new("RGB", (16, 12), "white").save(path, format="JPEG")
+            with path.open("ab") as output:
+                output.write(b"<?php echo 'polyglot'; ?>")
+
+            self.assertTrue(_normalize_receipt_image(path, max_bytes=1024 * 1024))
+            self.assertNotIn(b"<?php", path.read_bytes())
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            with Image.open(path) as image:
+                self.assertEqual(image.format, "JPEG")
+                self.assertEqual(image.size, (16, 12))
+                image.verify()
+
+    def test_invalid_image_and_non_decimal_digits_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "invalid.jpg"
+            path.write_bytes(b"\xff\xd8\xffnot-an-image")
+            self.assertFalse(_normalize_receipt_image(path, max_bytes=1024))
+        self.assertIsNone(_parse_telegram_user_id("²"))
+        self.assertEqual(_parse_telegram_user_id("۱۲۳۴۵"), 12345)
 
 
 if __name__ == "__main__":

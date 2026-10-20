@@ -1,43 +1,24 @@
 # Documentation
 
-Every page describes the code as it exists now. When a page and the code
-disagree, the code wins — and that is a bug worth reporting.
+Start with the [main README](../README.md). Setup commands are split by platform: Windows PowerShell for local use and cPanel Terminal for shared hosting.
 
-| Page | What it covers |
+| Page | Use it for |
 | --- | --- |
-| [`../README.md`](../README.md) | What the bot does, install, run, limits |
-| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Module map, pipeline, concurrency, data model, invariants |
-| [`CONFIGURATION.md`](CONFIGURATION.md) | Every environment variable, precedence, what `--check` validates |
-| [`PROVIDERS.md`](PROVIDERS.md) | Note-generation providers and failover |
-| [`STT_PROVIDERS.md`](STT_PROVIDERS.md) | Speech-to-text providers, languages, limits |
-| [`OCR_PLAN.md`](OCR_PLAN.md) | Design record for the proposed Persian/Arabic/English OCR feature (not implemented yet) |
-| [`MEDIA.md`](MEDIA.md) | The Python-only media pipeline |
-| [`NOTE_QUALITY.md`](NOTE_QUALITY.md) | The note-fidelity contract: what must survive, what the evidence gate checks, how repair works |
-| [`NOTE_QUALITY_PLAN.md`](NOTE_QUALITY_PLAN.md) | Design record and research behind the fidelity contract |
-| [`DOCX.md`](DOCX.md) | RTL Word generation contracts |
-| [`OFFICE.md`](OFFICE.md) | The free Office section: text → Word/Excel/PowerPoint |
-| [`BILLING.md`](BILLING.md) | Ledger, plans, card-to-card payments |
-| [`SECURITY.md`](SECURITY.md) | Threat model and what is enforced |
-| [`OPERATIONS.md`](OPERATIONS.md) | Start/stop, health, logs, backups |
-| [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md) | Symptom → cause → where to look |
-| [`TESTING.md`](TESTING.md) | CI gates and coverage |
-| [`DEPLOY_CPANEL.md`](DEPLOY_CPANEL.md) | cPanel / Passenger deployment |
-| [`DEPLOY_FA.md`](DEPLOY_FA.md) | راهنمای استقرار به فارسی |
-| [`CHANGELOG.md`](CHANGELOG.md) | Notable changes |
+| [Deploy on cPanel](DEPLOY_CPANEL.md) | Install, preflight, cron watchdog, backups |
+| [Windows/cPanel configuration](CONFIGURATION.md) | `.env`, required keys, safe defaults |
+| [Operations](OPERATIONS.md) | Start, stop, update and back up |
+| [Troubleshooting](TROUBLESHOOTING.md) | Common failures and fixes |
+| [Testing](TESTING.md) | Local checks and CI commands |
+| [Security](SECURITY.md) | Data, uploads, credentials and privacy |
+| [Billing](BILLING.md) | Credit, receipts and admin review |
+| [Speech-to-text](STT_PROVIDERS.md) | STT provider settings and failover |
+| [Note providers](PROVIDERS.md) | Note generation and provider keys |
+| [Presentations](PRESENTATIONS.md) | PowerPoint audio, billing and limits |
+| [Media](MEDIA.md) | Audio/video processing requirements |
+| [Free Office](OFFICE.md) | Text-to-document features |
+| [Word output](DOCX.md) | RTL Word behavior and fonts |
+| [Note quality](NOTE_QUALITY.md) | Grounding checks and limitations |
+| [Architecture](ARCHITECTURE.md) | Short code and data-flow map |
+| [Changelog](CHANGELOG.md) | Recent user-visible changes |
 
-## Start here
-
-* **Running it locally** — [`../README.md`](../README.md)
-* **Deploying** — [`DEPLOY_CPANEL.md`](DEPLOY_CPANEL.md) or
-  [`DEPLOY_FA.md`](DEPLOY_FA.md)
-* **Something is broken** — [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md)
-* **Changing configuration** — [`CONFIGURATION.md`](CONFIGURATION.md), then
-  `.env.example`
-
-## Two rules for editing these pages
-
-1. **Never document a setting that `config.py` does not read.**
-   `tests/test_config_consistency.py` fails the build when `.env.example` and
-   `config.py` drift in either direction.
-2. **Never document a file or test that does not exist.** Cite the module you
-   actually read.
+The Persian quick guide is [DEPLOY_FA.md](DEPLOY_FA.md). Detailed historical audit reports and completed/proposed design plans were removed; they described old code or unfinished ideas. OCR is not implemented.
