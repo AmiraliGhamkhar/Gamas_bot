@@ -1142,6 +1142,164 @@ def _adjust_rejected_request_param(payload: dict, error_text: str) -> str | None
     return None
 
 
+class _TTFBTimeoutError(LLMTransientError):
+    """First streaming bytes did not arrive inside NOTE_TTFB_TIMEOUT_SECONDS."""
+
+
+class _PrimaryEarlyFailure(Exception):
+    def __init__(self, exc: LLMError):
+        self.exc = exc
+
+
+class _HedgedFailures(Exception):
+    def __init__(self, first: LLMError, second: LLMError):
+        self.first = first
+        self.second = second
+
+
+async def _hedge_two(first_factory, second_factory, hedge_after: float):
+    """Race two route attempts, starting the second only after a delay.
+
+    A first attempt that finishes (success *or* failure) before the hedge
+    delay is returned/raised unchanged via :class:`_PrimaryEarlyFailure`
+    for failures, so sub-threshold behaviour is exactly the sequential
+    path. Once both run, the first success wins and the loser is cancelled.
+    At most one extra in-flight POST per pipeline call is added.
+    """
+    first_task = asyncio.ensure_future(first_factory())
+    done, _pending = await asyncio.wait({first_task}, timeout=hedge_after)
+    if first_task in done:
+        try:
+            return first_task.result()
+        except LLMError as exc:
+            raise _PrimaryEarlyFailure(exc) from exc
+    second_task = asyncio.ensure_future(second_factory())
+    pending = {first_task, second_task}
+    errors: dict = {}
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            try:
+                result = task.result()
+            except LLMError as exc:
+                errors[task] = exc
+                continue
+            for loser in pending:
+                loser.cancel()
+                try:
+                    await loser
+                except (asyncio.CancelledError, LLMError):
+                    pass
+            return result
+    raise _HedgedFailures(errors[first_task], errors[second_task])
+
+
+def _parse_sse_line(line: bytes) -> dict | None:
+    text = line.decode("utf-8", "replace").strip() if isinstance(line, (bytes, bytearray)) else str(line).strip()
+    if not text or text.startswith(":"):
+        return None
+    if text.startswith("data:"):
+        text = text[5:].strip()
+    if not text or text == "[DONE]":
+        return None
+    try:
+        parsed = _loads(text.encode("utf-8"))
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+async def _complete_streaming_on_route(
+    route: NoteRoute,
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: dict,
+    timeout_seconds: float,
+) -> str:
+    """OpenAI-style streaming completion guarded by a first-byte deadline."""
+    ttfb_timeout = float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0)
+    stream_payload = dict(payload)
+    stream_payload["stream"] = True
+    stream_payload["stream_options"] = {"include_usage": True}
+    started = time.perf_counter()
+    ttfb_ms = 0.0
+    text_parts: list[str] = []
+    finish_reason = ""
+    usage: dict = {}
+    async with session.post(
+        url,
+        headers=headers,
+        json=stream_payload,
+        timeout=aiohttp.ClientTimeout(total=timeout_seconds, sock_connect=10),
+    ) as response:
+        if response.status != 200:
+            raise await _error_from_response(route.label, response, route.api_key or None)
+        resp_headers = getattr(response, "headers", None)
+        content = getattr(response, "content", None)
+        iterator = content.__aiter__() if hasattr(content, "__aiter__") else None
+        lines: list = []
+        if iterator is not None:
+            try:
+                first_line = await asyncio.wait_for(iterator.__anext__(), timeout=ttfb_timeout)
+            except asyncio.TimeoutError as exc:
+                raise _TTFBTimeoutError(
+                    f"{route.label} در مهلت نخستین بایت پاسخ نداد."
+                ) from exc
+            except StopAsyncIteration:
+                first_line = None
+            ttfb_ms = (time.perf_counter() - started) * 1000.0
+            if first_line is not None:
+                lines.append(first_line)
+                async for line in iterator:
+                    lines.append(line)
+        else:  # Fallback for doubles exposing only read()
+            body = await response.read()
+            ttfb_ms = (time.perf_counter() - started) * 1000.0
+            lines = body.splitlines()
+        for line in lines:
+            chunk = _parse_sse_line(line)
+            if chunk is None:
+                continue
+            error_obj = chunk.get("error")
+            if _has_error_content(error_obj):
+                status = _infer_in_body_error_status(error_obj)
+                raise _error_from_payload(
+                    route.label, status, {"error": error_obj}, resp_headers, route.api_key or None
+                )
+            if isinstance(chunk.get("usage"), dict):
+                usage = chunk["usage"]
+            choices = chunk.get("choices")
+            if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                choice = choices[0]
+                if _has_error_content(choice.get("error")):
+                    status = _infer_in_body_error_status(choice["error"])
+                    raise _error_from_payload(
+                        route.label, status, {"error": choice["error"]},
+                        resp_headers, route.api_key or None,
+                    )
+                if choice.get("finish_reason"):
+                    finish_reason = str(choice["finish_reason"])
+                delta = choice.get("delta")
+                if isinstance(delta, dict) and delta.get("content"):
+                    text_parts.append(str(delta["content"]))
+                elif isinstance(choice.get("message"), dict) and choice["message"].get("content"):
+                    text_parts.append(str(choice["message"]["content"]))
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    assembled: dict = {
+        "choices": [{
+            "message": {"content": "".join(text_parts)},
+            "finish_reason": finish_reason or "stop",
+        }],
+        "usage": usage,
+    }
+    _log_usage(route, assembled, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms)
+    _raise_if_in_body_error(route.label, assembled, resp_headers, route.api_key or None)
+    return _parse_response(assembled, route.style)
+
+
 async def _complete_on_route(
     route: NoteRoute,
     session: aiohttp.ClientSession,
@@ -1185,6 +1343,14 @@ async def _complete_on_route(
         ttfb_ms = 0.0
         elapsed_ms = 0.0
         try:
+            if (
+                float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0) > 0
+                and route.style == "openai"
+            ):
+                return await _complete_streaming_on_route(
+                    route, session, settings, url=url, headers=headers,
+                    payload=payload, timeout_seconds=timeout_seconds,
+                )
             async with session.post(
                 url,
                 headers=headers,
@@ -1227,7 +1393,7 @@ async def _complete_on_route(
                     continue
             raise
         except (LLMTransientError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            timed_out = isinstance(exc, asyncio.TimeoutError)
+            timed_out = isinstance(exc, (asyncio.TimeoutError, _TTFBTimeoutError))
             if timed_out and not retry_on_timeout:
                 # The provider did not answer inside the deadline. Asking the
                 # same (expensive) request again only repeats the wait, so the
@@ -1356,7 +1522,36 @@ async def complete(
         )
     failures: list[LLMError] = []
     descriptions: list[str] = []
+    start_index = 0
+    hedge_after = float(getattr(settings, "note_hedge_after", 0.0) or 0.0)
+    if hedge_after > 0 and len(routes) >= 2:
+        def _make(index: int):
+            return lambda: _complete_on_route(
+                routes[index], session, settings, system=system, user=user,
+                retry_on_timeout=index == len(routes) - 1,
+            )
+        try:
+            return await _hedge_two(_make(0), _make(1), hedge_after)
+        except _PrimaryEarlyFailure as early:
+            failures.append(early.exc)
+            descriptions.append(f"{routes[0].label}: {early.exc}")
+            logger.warning(
+                "note provider failed; trying the next one provider=%s error=%s detail=%s",
+                routes[0].slug, type(early.exc).__name__, early.exc,
+            )
+            start_index = 1
+        except _HedgedFailures as both:
+            for route, exc in ((routes[0], both.first), (routes[1], both.second)):
+                failures.append(exc)
+                descriptions.append(f"{route.label}: {exc}")
+                logger.warning(
+                    "note provider failed; trying the next one provider=%s error=%s detail=%s",
+                    route.slug, type(exc).__name__, exc,
+                )
+            start_index = 2
     for index, route in enumerate(routes):
+        if index < start_index:
+            continue
         try:
             text = await _complete_on_route(
                 route, session, settings, system=system, user=user,
@@ -1448,6 +1643,34 @@ JSON_ONLY_REMINDER = (
 )
 
 
+async def _complete_json_on_route(
+    route: NoteRoute,
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    *,
+    system: str,
+    user: str,
+    retry_on_timeout: bool,
+) -> dict:
+    """One provider's two-attempt JSON turn (used by the hedged path)."""
+    last_exc: LLMError | None = None
+    for attempt, prompt in enumerate((user, JSON_ONLY_REMINDER + user)):
+        try:
+            raw = await _complete_on_route(
+                route, session, settings, system=system, user=prompt,
+                retry_on_timeout=retry_on_timeout,
+            )
+            return _parse_json_object(raw)
+        except LLMRequestError:
+            raise
+        except LLMError as exc:
+            last_exc = exc
+            if not isinstance(exc, LLMResponseError) or attempt:
+                raise
+    assert last_exc is not None
+    raise last_exc
+
+
 async def complete_json(
     session: aiohttp.ClientSession,
     settings: Settings,
@@ -1473,7 +1696,28 @@ async def complete_json(
         )
     failures: list[LLMError] = []
     descriptions: list[str] = []
+    start_index = 0
+    hedge_after = float(getattr(settings, "note_hedge_after", 0.0) or 0.0)
+    if hedge_after > 0 and len(routes) >= 2:
+        def _make_json(index: int):
+            return lambda: _complete_json_on_route(
+                routes[index], session, settings, system=system, user=user,
+                retry_on_timeout=index == len(routes) - 1,
+            )
+        try:
+            return await _hedge_two(_make_json(0), _make_json(1), hedge_after)
+        except _PrimaryEarlyFailure as early:
+            failures.append(early.exc)
+            descriptions.append(f"{routes[0].label}: {early.exc}")
+            start_index = 1
+        except _HedgedFailures as both:
+            for route, exc in ((routes[0], both.first), (routes[1], both.second)):
+                failures.append(exc)
+                descriptions.append(f"{route.label}: {exc}")
+            start_index = 2
     for index, route in enumerate(routes):
+        if index < start_index:
+            continue
         for attempt, prompt in enumerate((user, JSON_ONLY_REMINDER + user)):
             try:
                 raw = await _complete_on_route(

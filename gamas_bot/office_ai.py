@@ -19,6 +19,7 @@ The module therefore has exactly one failure mode that matters: it returns
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -279,8 +280,14 @@ async def plan_deck(
     # so the model never receives more context than it can handle.
     slides: list[OfficeSlide] = []
     chunks = _chunk_long_text(text, MAX_DECK_CHUNK_CHARS)
-    for chunk in chunks:
-        result = await _process_chunk(chunk)
+    semaphore = asyncio.Semaphore(max(1, int(getattr(settings, "office_ai_concurrency", 3) or 3)))
+
+    async def _bounded(chunk_text: str) -> list[OfficeSlide] | None:
+        async with semaphore:
+            return await _process_chunk(chunk_text)
+
+    # gather preserves chunk order, so the merged deck is unchanged.
+    for result in await asyncio.gather(*(_bounded(chunk) for chunk in chunks)):
         if result is not None:
             slides.extend(result)
     if slides:
