@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- LLM request-layer performance work (quality gate untouched): per-request TTFB/elapsed timing in the provider usage log; tuned shared HTTP connector, orjson response parsing with a stdlib fallback, and quota-free connection pre-warm; opt-in (default-off) streaming TTFB failover guard and two-provider hedged racing; concurrent (order-preserving) Office deck planning. New flags: `LLM_CONNECTOR_*`, `LLM_PREWARM`, `NOTE_TTFB_TIMEOUT_SECONDS`, `NOTE_HEDGE_AFTER_SECONDS`, `OFFICE_AI_CONCURRENCY` — unset, behaviour is exactly as before.
+
 - Hardened callback authorization, file-download limits, receipt validation, ZIP extraction, admin cooldowns, broadcasts and cPanel launcher locking.
 - Added regression tests for the security fixes.
 - Rewrote setup and operations guides for Windows PowerShell and cPanel shared hosting; removed stale audits and completed/unimplemented design plans.

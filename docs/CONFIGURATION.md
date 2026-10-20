@@ -47,6 +47,13 @@ Use a real numeric Telegram user ID for each admin, separated by commas. Configu
 | `NOTE_REASONING_EFFORT` | If used, start at `low` (never `minimal` first) and A/B against the quality-gate report before keeping it; only Nara and OpenRouter accept it. |
 | `NOTE_CONCURRENCY` | Keep `3` on cPanel; a VPS may use `6-8`. |
 | `NOTE_REQUEST_TIMEOUT_SECONDS` | Re-derive after any token-cap change: it must remain greater than the time to generate `NOTE_MAX_OUTPUT_TOKENS` on the slowest configured model. |
+| `LLM_CONNECTOR_LIMIT`, `LLM_CONNECTOR_LIMIT_PER_HOST`, `LLM_CONNECTOR_TTL_DNS_CACHE`, `LLM_CONNECTOR_KEEPALIVE` | Shared HTTP connector pool sizing (defaults `32`/`8`/`300`/`300`). |
+| `LLM_PREWARM` | Default `true`: one quota-free `HEAD` to the first note provider's host when the shared session is created, so the first real request skips connection setup. Errors are ignored. |
+| `NOTE_TTFB_TIMEOUT_SECONDS` | Default `0` (off): streaming first-byte guard for OpenAI-style routes; see [Note providers](PROVIDERS.md). |
+| `NOTE_HEDGE_AFTER_SECONDS` | Default `0` (off): start the second provider in parallel after this delay; at most one extra in-flight POST per call. |
+| `OFFICE_AI_CONCURRENCY` | Default `3`: how many deck-planning chunks may be planned concurrently (chunk order is preserved). |
+
+On a VPS only, event-loop speed can optionally come from uvloop: `pip install uvloop` and run with `UVLOOP=1` handled by your own service wrapper. It is deliberately **not** a project dependency, nothing imports it by default, and the default (off) behaviour is unchanged without it.
 
 ## Precedence and checks
 

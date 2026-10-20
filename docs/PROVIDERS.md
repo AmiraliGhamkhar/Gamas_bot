@@ -12,6 +12,11 @@ The legacy single-provider settings (`NOTE_PROVIDER`, `NOTE_BASE_URL`, `NOTE_MOD
 
 Transient network, timeout and rate-limit errors get bounded retries, then the next eligible provider is tried. Oversized input is split within configured limits; an answer cut off at the output-token limit is not resent unchanged. Tune `NOTE_CONTEXT_TOKENS`, `NOTE_MAX_OUTPUT_TOKENS` and `NOTE_REQUEST_TIMEOUT_SECONDS` for the smallest/slowest model in the configured chain.
 
+Two optional, default-off guards can shorten the wait on a hung or slow provider; neither changes what is asked or how answers are validated:
+
+- **TTFB guard (`NOTE_TTFB_TIMEOUT_SECONDS`, default `0` = off).** On OpenAI-style routes only (`nara`, `openrouter`, `openai_compatible`), the request is streamed and the time to the first streamed byte is measured (gateway comment lines count as liveness). If no byte arrives within the threshold, the provider is abandoned and the chain fails over in seconds instead of waiting out the full request timeout, with no same-provider retry when a successor exists. The streamed deltas are reassembled and parsed by exactly the same response parser, in-body error checks and usage logging as a non-streaming answer, so a `length` finish still raises the output-budget error and is never resent unchanged. Gemini and Anthropic routes keep the non-streaming path.
+- **Hedged racing (`NOTE_HEDGE_AFTER_SECONDS`, default `0` = off).** With at least two eligible providers, the first provider starts alone; only if it has not finished after the threshold does the second provider start in parallel. The first successful answer wins and the loser is cancelled. A provider that fails *before* the threshold behaves exactly as in the sequential chain (no race is started). A hedge adds at most one extra in-flight POST per pipeline call, so it can consume extra provider quota — enable it only when the tail latency is worth that cost.
+
 Provider output is checked by the evidence gate before delivery. It is still third-party generated content; see [Note quality](NOTE_QUALITY.md).
 
 ## Check configuration
