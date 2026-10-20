@@ -46,7 +46,12 @@ class JobQueue:
     def __init__(self, *, max_queued: int, max_active: int, worker: Callable[[Job], Awaitable[None]]):
         if max_active < 1:
             raise ValueError("max_active must be >= 1")
-        self._queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=max(0, max_queued))
+        if max_queued < 1:
+            # ``asyncio.Queue(maxsize=0)`` means *unbounded*, not "no waiting
+            # room": passing 0 through would silently drop the back-pressure
+            # this class exists to provide. Refuse it like ``max_active``.
+            raise ValueError("max_queued must be >= 1")
+        self._queue: asyncio.Queue[Job] = asyncio.Queue(maxsize=max_queued)
         self._max_active = max_active
         self._worker = worker
         self._workers: list[asyncio.Task] = []

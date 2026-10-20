@@ -295,7 +295,8 @@ class GamasBot:
         # Free Office: the in-flight request of every user, and the last
         # document each of them built (so «افزودن متن» can extend it).
         self._office_sessions: dict[int, OfficeSession] = {}
-        self._office_last: dict[int, tuple[str, str]] = {}
+        # user_id -> (kind, text, title, built_at monotonic timestamp)
+        self._office_last: dict[int, tuple[str, str, str, float]] = {}
         settings.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = TelegramClient(
             str(settings.session_path), settings.api_id, settings.api_hash
@@ -341,6 +342,10 @@ class GamasBot:
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
         await self.client.start(bot_token=self.settings.bot_token)
         logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
+        if not self.settings.payment_card_number:
+            logger.warning(
+                "PAYMENT_CARD_NUMBER is not set; card-to-card payments are disabled"
+            )
         await self.client.run_until_disconnected()
 
     def _sweep_stale_temp_dirs(self) -> None:
@@ -1867,6 +1872,13 @@ class GamasBot:
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _start_payment(self, event, plan_code: str) -> None:
+        if not self.settings.payment_card_number:
+            # Never create a payable request the user cannot pay for: without
+            # a configured card there is nowhere to send the money.
+            await event.respond(
+                "پرداخت کارت‌به‌کارت در حال حاضر فعال نیست؛ لطفاً بعداً دوباره امتحان کنید."
+            )
+            return
         plan = await self.db.plan(plan_code)
         if plan is None or plan["price"] <= 0:
             await event.respond("این طرح در دسترس نیست.")

@@ -6,8 +6,9 @@ runtime (``load_dotenv`` is applied once, here).
 
 Design rules:
 
-* **~55 settings, not ~194.** Anything that existed only to support the deleted
-  provider platforms (routes, registries, quotas, credentials) is gone.
+* **One settings dataclass, not ~194 knobs.** Anything that existed only to
+  support the deleted provider platforms (routes, registries, quotas,
+  credentials) is gone.
 * Provider order *is* failover policy: ``STT_PROVIDERS=speechmatics,deepgram``
   means "try Speechmatics, then Deepgram".
 * Relative paths are anchored to the project directory, so a cron job or a
@@ -796,7 +797,9 @@ def from_env(env_file: str | None = None) -> Settings:
         log_backup_count=_env_int("LOG_BACKUP_COUNT", 5, minimum=1),
         max_file_size=_env_int("MAX_FILE_SIZE", 2 * 1024**3, minimum=1024),
         max_active_jobs=_env_int("MAX_ACTIVE_JOBS", 3, minimum=1, maximum=32),
-        max_queued_jobs=_env_int("MAX_QUEUED_JOBS", 8, minimum=0, maximum=100),
+        # Minimum 1: ``asyncio.Queue(maxsize=0)`` is unbounded, so 0 would
+        # silently remove the queue's back-pressure instead of disabling it.
+        max_queued_jobs=_env_int("MAX_QUEUED_JOBS", 8, minimum=1, maximum=100),
         media_worker_concurrency=_env_int(
             "MEDIA_WORKER_CONCURRENCY", 1, minimum=1, maximum=8
         ),
@@ -899,9 +902,12 @@ def from_env(env_file: str | None = None) -> Settings:
         office_session_ttl_minutes=_env_int(
             "OFFICE_SESSION_TTL_MINUTES", 30, minimum=1, maximum=1440
         ),
-        payment_card_number=re.sub(r"\D", "", _env("PAYMENT_CARD_NUMBER", "5022291332906625"))[-16:],
-        payment_card_holder=_env("PAYMENT_CARD_HOLDER", "امیرعلی غمخوار"),
-        payment_bank_name=_env("PAYMENT_BANK_NAME", "بانک پاسارگاد"),
+        # No fallback card: a deployment that forgets PAYMENT_CARD_* must not
+        # silently direct its users' money to a card baked into the source.
+        # ``_start_payment`` refuses to open a payment while this is empty.
+        payment_card_number=re.sub(r"\D", "", _env("PAYMENT_CARD_NUMBER"))[-16:],
+        payment_card_holder=_env("PAYMENT_CARD_HOLDER"),
+        payment_bank_name=_env("PAYMENT_BANK_NAME"),
         receipt_dir=_project_path(_env("RECEIPT_DIR"), "data/receipts"),
         receipt_retention_days=_env_int("RECEIPT_RETENTION_DAYS", 90, minimum=1),
         max_payment_receipt_bytes=_env_int("MAX_PAYMENT_RECEIPT_BYTES", 5 * 1024 * 1024, minimum=1024),

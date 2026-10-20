@@ -158,6 +158,20 @@ class FromEnvTests(unittest.TestCase):
             settings = from_env(env_file="/nonexistent")
         self.assertEqual(settings.payment_card_number, "5022291332906625")
 
+    def test_payment_card_has_no_baked_in_default(self):
+        """A deployment that sets no PAYMENT_CARD_* gets no card at all."""
+        with mock.patch.dict(os.environ, env(), clear=True):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.payment_card_number, "")
+        self.assertEqual(settings.payment_card_holder, "")
+        self.assertEqual(settings.payment_bank_name, "")
+
+    def test_zero_queued_jobs_clamps_to_one_not_unbounded(self):
+        """0 must not reach ``asyncio.Queue(maxsize=0)`` (which is unbounded)."""
+        with mock.patch.dict(os.environ, env(MAX_QUEUED_JOBS="0"), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.max_queued_jobs, 1)
+
 
 def note_env(**values):
     """Telegram plus exactly the note-provider settings a test gives."""

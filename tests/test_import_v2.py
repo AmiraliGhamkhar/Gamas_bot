@@ -153,6 +153,14 @@ class ImportV2TestCase(unittest.TestCase):
 
             # The v2 unlimited user got a century of credit instead.
             self.assertGreater(balance(444), 99 * 365 * 24 * 3600)
+            # …and keeps the v3 special-user flag, so the admin panel lists
+            # them and billing skips them like any other unlimited user.
+            self.assertEqual(
+                conn.execute(
+                    "SELECT is_unlimited FROM users WHERE telegram_id=444"
+                ).fetchone()[0],
+                1,
+            )
 
             # Users and the ban flag.
             self.assertEqual(

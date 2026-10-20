@@ -91,6 +91,17 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0.02)
         self.assertEqual(handled, [])
 
+    async def test_zero_queue_capacity_is_refused_not_unbounded(self):
+        """``asyncio.Queue(maxsize=0)`` is unbounded, so 0 must never reach it."""
+
+        async def worker(job: Job) -> None:
+            return None
+
+        with self.assertRaises(ValueError):
+            JobQueue(max_queued=0, max_active=1, worker=worker)
+        with self.assertRaises(ValueError):
+            JobQueue(max_queued=-1, max_active=1, worker=worker)
+
     async def test_submit_after_close_rejected(self):
         async def worker(job: Job) -> None:
             return None

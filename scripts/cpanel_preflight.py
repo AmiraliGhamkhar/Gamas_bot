@@ -186,7 +186,7 @@ def check_settings() -> tuple[list[Result], object | None]:
     if settings.max_active_jobs > 1:
         results.append(
             Result(
-                "WARN", "MAX_CONCURRENT_JOBS",
+                "WARN", "MAX_ACTIVE_JOBS",
                 f"{settings.max_active_jobs}: shared hosting usually limits memory "
                 "to 1-2 GB; start with 1.",
             )

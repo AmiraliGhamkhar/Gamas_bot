@@ -171,8 +171,15 @@ def import_v2(source_path: Path, target_path: Path) -> int:
         unlimited: list[int] = []
         for user in users:
             target.execute(
-                "INSERT INTO users(telegram_id, joined_at, banned) VALUES (?, ?, ?)",
-                (user["telegram_id"], user["first_seen"], 1 if user["is_banned"] else 0),
+                "INSERT INTO users(telegram_id, joined_at, banned, is_unlimited, "
+                "unlimited_reason) VALUES (?, ?, ?, ?, ?)",
+                (
+                    user["telegram_id"],
+                    user["first_seen"],
+                    1 if user["is_banned"] else 0,
+                    1 if user["is_unlimited"] else 0,
+                    "v2 import" if user["is_unlimited"] else None,
+                ),
             )
             if user["is_unlimited"]:
                 unlimited.append(user["telegram_id"])
@@ -309,8 +316,10 @@ def import_v2(source_path: Path, target_path: Path) -> int:
                 )
                 debit_rows += 1
             expected_by_user[user_id] = expected_by_user.get(user_id, 0) + remaining
-        # v2 "unlimited" special users: v3 has no unlimited flag, so they get
-        # a century of credit — effectively unlimited, still auditable.
+        # v2 "unlimited" special users keep the v3 flag (set on the user row
+        # above, so the admin panel lists them and billing skips them) and
+        # also get a century of credit — belt and braces, still auditable if
+        # an admin later turns the flag off.
         for user_id in unlimited:
             target.execute(
                 "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
