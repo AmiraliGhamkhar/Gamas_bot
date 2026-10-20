@@ -457,14 +457,17 @@ class GamasBot:
         Admins get one extra entry row to their own panel; the admin panel
         never replaces this menu, so both panels stay separately reachable.
         """
+        make_label = (
+            "📎 ساخت جزوه" if self.settings.note_configured else "📎 تبدیل فایل به متن"
+        )
         rows = [
-            [Button.inline("📎 ساخت جزوه", b"make")],
+            [Button.inline(make_label, b"make")],
         ]
         if self.settings.office_enabled:
             rows.append([Button.inline("📄 آفیس رایگان", b"office")])
         rows.append(
             [
-                Button.inline("💳 حساب و شارژ", b"account"),
+                Button.inline("💳 اعتبار و پرداخت", b"account"),
                 Button.inline("❓ راهنما", b"help"),
             ]
         )
@@ -479,16 +482,16 @@ class GamasBot:
         one tap from any section to any other, and one tap home.
         """
         return [
-            [Button.inline("📊 نمای کلی", b"adm:home")],
+            [Button.inline("📊 آمار و وضعیت", b"adm:home")],
             [
                 Button.inline("👥 کاربران", b"adm:users"),
                 Button.inline("🧾 پرداخت‌ها", b"adm:pay"),
             ],
             [
-                Button.inline("📣 پیام همگانی", b"adm:bcast"),
-                Button.inline("🛡 لاگ اقدامات", b"adm:audit"),
+                Button.inline("📣 ارسال پیام", b"adm:bcast"),
+                Button.inline("🛡 گزارش فعالیت‌ها", b"adm:audit"),
             ],
-            [Button.inline("🔙 منوی کاربر", b"menu:main")],
+            [Button.inline("🔙 پنل کاربری", b"menu:main")],
         ]
 
     async def _show_main(self, event, *, first_start: bool = False) -> None:
@@ -498,16 +501,23 @@ class GamasBot:
             user_id, self._free_plan_seconds()
         ):
             logger.info("free plan granted user=%s", user_id)
-        greeting = "سلام! من گاماس هستم 🌱" if first_start else "منوی اصلی"
-        text = (
-            f"{greeting}\n\n"
-            "جزوهٔ کلاس‌تان را از یک فایل صوتی، ویدیویی یا پاورپوینت می‌سازم؛ "
-            "متن خام پیاده‌سازی‌شده را هم همان لحظه تحویل می‌دهم.\n"
-        )
+        greeting = "سلام! به گاماس خوش آمدید 🌱" if first_start else "منوی اصلی"
+        if self.settings.note_configured:
+            introduction = (
+                "برای ساخت جزوه، «📎 ساخت جزوه» را انتخاب کنید و فایل صوتی، ویدیویی یا "
+                "پاورپوینت کلاس را بفرستید. ابتدا متن گفتار و سپس جزوهٔ Word برایتان ارسال می‌شود.\n"
+            )
+        else:
+            introduction = (
+                "برای تبدیل فایل کلاس به متن، «📎 تبدیل فایل به متن» را انتخاب کنید و فایل صوتی، "
+                "ویدیویی یا پاورپوینت را بفرستید. متن گفتار برایتان ارسال می‌شود.\n"
+                "ساخت جزوهٔ Word در حال حاضر روی این سرور فعال نیست.\n"
+            )
+        text = f"{greeting}\n\n{introduction}"
         if self.settings.office_enabled:
             text += (
-                "با «📄 آفیس رایگان» هم هر متنی را که دارید به فایل واقعی Word، "
-                "Excel، PowerPoint یا PDF تبدیل می‌کنم — رایگان است.\n"
+                "برای تبدیل متن دلخواهتان به فایل Word، Excel، PowerPoint یا PDF، از "
+                "«📄 آفیس رایگان» استفاده کنید. این بخش رایگان است و از اعتبار شما کم نمی‌کند.\n"
             )
         text += f"\n⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
@@ -808,7 +818,7 @@ class GamasBot:
             await self._ack(event, "⛔ دسترسی شما به ربات مسدود شده است.", alert=True)
             return
         if not self._is_admin(user_id) and data.startswith(("adm:", "payv:")):
-            await self._ack(event, "این بخش ویژهٔ مدیران است.", alert=True)
+            await self._ack(event, "دسترسی به این بخش فقط برای مدیران مجاز است.", alert=True)
             return
         # Opening any panel screen disarms a half-finished broadcast prompt,
         # so a stray "انصراف"/navigation tap can never send stale text later.
@@ -826,28 +836,62 @@ class GamasBot:
             return
         if data == "make":
             await self._ack(event)
+            if self.settings.note_configured:
+                result_guide = "ابتدا متن گفتار و سپس جزوهٔ Word برایتان ارسال می‌شود."
+            else:
+                result_guide = (
+                    "متن گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ Word در حال حاضر فعال نیست."
+                )
+            prompt_title = (
+                "📎 ارسال فایل برای ساخت جزوه"
+                if self.settings.note_configured
+                else "📎 ارسال فایل برای تبدیل به متن"
+            )
             await event.respond(
-                "📎 فایل درس را بفرستید:\n"
-                "• صوت یا ویدیوی کلاس (MP3، MP4، WAV، OGG، M4A، …)\n"
-                "• ویس یا ویدیو-پیام تلگرام\n"
-                "• فایل پاورپوینت (PPTX/PPT) — صدای ضبط‌شدهٔ داخل اسلایدها هم پشتیبانی می‌شود\n\n"
-                "متن خام پیاده‌سازی را همان اول می‌گیرید؛ جزوهٔ Word چند لحظه بعد می‌رسد."
+                f"{prompt_title}\n\n"
+                "فایل صوتی یا ویدیویی کلاس، پیام صوتی یا ویدیویی تلگرام، یا فایل پاورپوینت را "
+                "همین‌جا بفرستید. قالب‌های رایج مانند MP3، MP4، WAV، OGG، M4A و PPTX/PPT پشتیبانی می‌شوند.\n"
+                "صدای ضبط‌شدهٔ داخل اسلایدهای پاورپوینت نیز قابل پردازش است.\n\n"
+                f"{result_guide}",
+                buttons=[[Button.inline("🔙 منوی اصلی", b"menu:main")]],
             )
         elif data == "help":
             await self._ack(event)
-            await event.respond(
-                "❓ راهنما\n\n"
-                "۱) دکمهٔ «ساخت جزوه» را بزنید و فایل درس را بفرستید.\n"
-                "۲) اول فایل «متن خام» می‌رسد — همان چیزی که از صدا پیاده شده.\n"
-                "۳) بعد جزوهٔ Word ساختارمند (RTL، جدول، شماره صفحه) ارسال می‌شود.\n\n"
-                "قانون حساب: مصرف بر پایهٔ مدت صوت است و کار ناموفق اعتبار نمی‌سوزاند.\n"
-                "محدودیت‌ها: هر فایل تا ۲ گیگابایت؛ هم‌زمان ۳ کار فعال و ۸ کار در صف."
-                + (
-                    "\n\n📄 «آفیس رایگان»: متن خودتان را بفرستید تا فایل Word، Excel، "
-                    "PowerPoint یا PDF شود. رایگان است و اعتبار شما را کم نمی‌کند."
-                    if self.settings.office_enabled
-                    else ""
+            make_label = (
+                "📎 ساخت جزوه" if self.settings.note_configured else "📎 تبدیل فایل به متن"
+            )
+            task_label = "ساخت جزوه:" if self.settings.note_configured else "تبدیل فایل به متن:"
+            guide = [
+                "❓ راهنمای استفاده",
+                "",
+                task_label,
+                f"۱. «{make_label}» را انتخاب کنید.",
+                "۲. فایل صوتی یا ویدیویی، پیام صوتی یا ویدیویی تلگرام یا پاورپوینت درس را بفرستید.",
+                "۳. ابتدا متن گفتار برایتان ارسال می‌شود.",
+            ]
+            if self.settings.note_configured:
+                guide.append("۴. سپس جزوهٔ Word آماده و ارسال می‌شود.")
+            else:
+                guide.append("ساخت جزوهٔ Word در حال حاضر روی این سرور فعال نیست.")
+            guide.extend(
+                [
+                    "",
+                    "اعتبار بر اساس مدت فایل صوتی محاسبه می‌شود. اگر پردازش ناموفق باشد، "
+                    "اعتبار مصرف‌شده به حسابتان بازمی‌گردد.",
+                ]
+            )
+            if self.settings.office_enabled:
+                guide.extend(
+                    [
+                        "",
+                        "آفیس رایگان:",
+                        "«📄 آفیس رایگان» را انتخاب کنید، قالب موردنظر را بزنید و متن یا فایل متنی "
+                        "خود را بفرستید. این بخش رایگان است و از اعتبار شما کم نمی‌کند.",
+                    ]
                 )
+            await event.respond(
+                "\n".join(guide),
+                buttons=[[Button.inline("🔙 منوی اصلی", b"menu:main")]],
             )
         elif data == "menu:main":
             await self._ack(event)
@@ -889,9 +933,10 @@ class GamasBot:
             await self._ack(event)
             self._pending_broadcast.add(user_id)
             await event.respond(
-                "📣 متن پیام همگانی را بفرستید.\n"
-                "برای لغو متن‌نویسی، /cancel بزنید یا دکمهٔ زیر را بزنید.",
-                buttons=[[Button.inline("↩️ انصراف", b"adm:home")]],
+                "📣 ارسال پیام به کاربران\n\n"
+                "متن موردنظر را در پیام بعدی بفرستید؛ همان متن برای همهٔ کاربران ارسال می‌شود.\n"
+                "برای لغو، /cancel بفرستید یا دکمهٔ زیر را انتخاب کنید.",
+                buttons=[[Button.inline("↩️ لغو", b"adm:home")]],
             )
         elif data == "adm:audit":
             await self._ack(event)
@@ -926,7 +971,7 @@ class GamasBot:
                 if not text:
                     # A photo or sticker is not a reason: keep waiting.
                     self._pending_reject_reason[user_id] = payment_id
-                    await event.reply("دلیل رد را در یک پیام متنی بنویسید (یا /cancel).")
+                    await event.reply("لطفاً دلیل رد را در یک پیام متنی بنویسید؛ برای لغو /cancel بفرستید.")
                     return
                 await self._reject_payment_with_reason(event, payment_id, text)
                 return
@@ -993,8 +1038,8 @@ class GamasBot:
             # The Free Office section already had its chance above: it either
             # took the text (and asked for a format) or is switched off.
             await event.reply(
-                "برای ساخت جزوه، فایل صوتی/تصویری درس را بفرستید یا از منوی شروعه "
-                "دکمهٔ «📎 ساخت جزوه» را بزنید."
+                "برای ساخت جزوه، فایل صوتی یا ویدیویی درس را بفرستید؛ "
+                "یا در منوی اصلی «📎 ساخت جزوه» را انتخاب کنید."
             )
 
     # ---------------------------------------------------------------- intake
@@ -1018,7 +1063,7 @@ class GamasBot:
             await event.reply(
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
                 f"مدت فایل: {format_duration(duration)} — اعتبار فعلی: {format_duration(available)}\n"
-                "از «💳 حساب و شارژ» می‌توانید اعتبار بگیرید."
+                "از «💳 اعتبار و پرداخت» می‌توانید اعتبار بگیرید."
             )
             return
         submission_id = await self.db.create_submission(user_id, kind, filename)
@@ -1079,7 +1124,7 @@ class GamasBot:
                     f"⏳ اعتبار شما برای این ارائه کافی نیست.\n"
                     f"لازم (حداقل برآورد): {format_duration(needed)} — "
                     f"اعتبار فعلی: {format_duration(available)}\n"
-                    "از «💳 حساب و شارژ» می‌توانید اعتبار بگیرید."
+                    "از «💳 اعتبار و پرداخت» می‌توانید اعتبار بگیرید."
                 )
                 return
         submission_id = await self.db.create_submission(user_id, "presentation", filename)
@@ -1136,7 +1181,7 @@ class GamasBot:
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
                 f"لازم: {format_duration(exc.required_seconds)} — "
                 f"موجودی: {format_duration(exc.available_seconds)}\n"
-                "از «💳 حساب و شارژ» اعتبار بگیرید."
+                "از «💳 اعتبار و پرداخت» اعتبار بگیرید."
             ))
         except USER_VISIBLE_ERRORS as exc:
             await self._release(job, "user-visible failure")
@@ -1792,11 +1837,11 @@ class GamasBot:
         history = await self.db.payment_history(user_id, limit=5)
         plans = await self.db.plans()
         lines = [
-            "💳 حساب شما",
+            "💳 اعتبار و پرداخت",
             "",
             f"⏳ اعتبار باقی‌مانده: {balance}",
             "",
-            "شارژ:",
+            "برای افزایش اعتبار، یکی از بسته‌های زیر را انتخاب کنید:",
         ]
         buttons = []
         for plan in plans:
@@ -1812,13 +1857,13 @@ class GamasBot:
             for item in history:
                 status = {
                     "pending": "⏳ در انتظار بررسی",
-                    "approved": "✅ تایید شد",
+                    "approved": "✅ تأیید شد",
                     "rejected": "❌ رد شد",
                 }.get(item["status"], item["status"])
                 lines.append(f"• {item['plan_code']} — {status}")
         lines.append("")
-        lines.append(FREE_PLAN_NAME + " برای همه در شروع فعال است.")
-        buttons.append([Button.inline("🔙 بازگشت", b"menu:main")])
+        lines.append(f"اعتبار اولیهٔ «{FREE_PLAN_NAME}» برای همهٔ کاربران فعال می‌شود.")
+        buttons.append([Button.inline("🔙 منوی اصلی", b"menu:main")])
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _start_payment(self, event, plan_code: str) -> None:
@@ -1830,15 +1875,15 @@ class GamasBot:
         hours = plan["hours"]
         hours_text = to_persian_digits(int(hours) if float(hours).is_integer() else hours)
         text = (
-            f"🧾 خرید {hours_text} ساعت اعتبار\n\n"
-            f"مبلغ: {format_toman(plan['price'])}\n"
-            f"اعتبار تا {format_validity(plan['validity_days'])} معتبر است.\n\n"
-            "کارت‌به‌کارت:\n"
+            f"🧾 خرید بستهٔ {hours_text} ساعته\n\n"
+            f"مبلغ قابل پرداخت: {format_toman(plan['price'])}\n"
+            f"اعتبار این بسته تا {format_validity(plan['validity_days'])} معتبر است.\n\n"
+            "اطلاعات واریز کارت‌به‌کارت:\n"
             f"💳 شماره کارت: {card}\n"
             f"👤 به نام: {self.settings.payment_card_holder}\n"
             f"🏦 بانک: {self.settings.payment_bank_name}\n\n"
-            "پس از واریز، دکمهٔ زیر را بزنید و تصویر رسید را بفرستید. "
-            "تا تایید مدیر معمولاً چند ساعت طول می‌کشد."
+            "پس از واریز، «واریز کردم؛ ارسال رسید» را انتخاب کنید و تصویر رسید را بفرستید. "
+            "پس از بررسی و تأیید مدیر، اعتبار به حساب شما اضافه می‌شود. بررسی ممکن است چند ساعت طول بکشد."
         )
         try:
             payment_id = await self.db.create_payment(event.sender_id, plan_code)
@@ -1867,8 +1912,8 @@ class GamasBot:
             return
         self._pending_payments[event.sender_id] = payment_id
         await event.respond(
-            "📷 تصویر رسید را بفرستید (همین‌جا در چت).",
-            buttons=[[Button.inline("↩️ انصراف", b"account")]],
+            "📷 لطفاً تصویر خوانای رسید را به‌صورت عکس، همین‌جا در گفت‌وگو بفرستید.",
+            buttons=[[Button.inline("↩️ لغو", b"account")]],
         )
 
     async def _handle_receipt_upload(self, event, user_id: int) -> None:
@@ -1918,7 +1963,7 @@ class GamasBot:
             pass
         await self.db.set_payment_receipt(payment_id, str(receipt_path))
         await event.respond(
-            "✅ رسید ثبت شد. پس از تایید مدیر، اعتبار به حسابتان اضافه می‌شود."
+            "✅ رسید ثبت شد. پس از بررسی و تأیید مدیر، اعتبار به حسابتان اضافه می‌شود."
         )
         await self._notify_admins_of_payment(payment_id)
 
@@ -1930,13 +1975,13 @@ class GamasBot:
             f"🧾 پرداخت جدید شمارهٔ {to_persian_digits(payment_id)}\n"
             f"کاربر: {payment['user_id']}\n"
             f"طرح: {payment['plan_code']}\n"
-            "برای بررسی: پنل مدیریت → 🧾 پرداخت‌ها"
+            "برای بررسی رسید، وارد پنل مدیریت شوید و بخش «پرداخت‌ها» را باز کنید."
         )
         for admin_id in self.settings.admin_ids:
             try:
                 await self.client.send_message(
                     admin_id, text,
-                    buttons=[[Button.inline("🧾 بررسی پرداخت‌ها", b"adm:pay")]],
+                    buttons=[[Button.inline("🧾 بررسی پرداخت", b"adm:pay")]],
                 )
             except Exception:
                 logger.warning("could not notify admin=%s", admin_id)
@@ -1959,11 +2004,11 @@ class GamasBot:
             # A rejection must carry a reason, so ask for it before changing
             # any row (audit F-15).
             self._pending_reject_reason[event.sender_id] = payment_id
-            await self._ack(event, "دلیل رد را بنویسید.", alert=True)
+            await self._ack(event, "برای رد پرداخت، واردکردن دلیل الزامی است.", alert=True)
             await event.respond(
-                f"✍️ دلیل رد پرداخت #{to_persian_digits(payment_id)} را در یک پیام "
-                "بنویسید (یا /cancel).",
-                buttons=[[Button.inline("↩️ انصراف", b"adm:pay")]],
+                f"✍️ دلیل رد پرداخت #{to_persian_digits(payment_id)} را در پیام بعدی بنویسید. "
+                "با ارسال دلیل، پرداخت رد می‌شود. برای لغو /cancel بفرستید یا دکمهٔ زیر را انتخاب کنید.",
+                buttons=[[Button.inline("↩️ لغو", b"adm:pay")]],
             )
             return
         try:
@@ -1972,7 +2017,7 @@ class GamasBot:
             logger.error("payment approval without a snapshot payment=%s", payment_id)
             await self._ack(
                 event,
-                "این پرداخت اطلاعات خرید ندارد؛ تایید انجام نشد. طرح را بررسی کنید.",
+                "اطلاعات خرید این پرداخت کامل نیست؛ تأیید انجام نشد. لطفاً جزئیات طرح را بررسی کنید.",
                 alert=True,
             )
             return
@@ -1983,7 +2028,7 @@ class GamasBot:
             # The credited amount is the purchase snapshot, never the live plan.
             seconds = int(payment["purchased_seconds"] or 0)
             user_text = (
-                f"✅ پرداخت شما تایید شد: {format_duration(seconds)} اعتبار اضافه شد."
+                f"✅ پرداخت شما تأیید شد؛ {format_duration(seconds)} اعتبار به حسابتان اضافه شد."
             )
             try:
                 await self.client.send_message(payment["user_id"], user_text)
@@ -1996,7 +2041,7 @@ class GamasBot:
     ) -> None:
         reason = reason.strip()
         if not reason:
-            await event.reply("دلیل رد نمی‌تواند خالی باشد.", buttons=self._admin_menu())
+            await event.reply("برای رد پرداخت، واردکردن دلیل الزامی است.", buttons=self._admin_menu())
             return
         payment = await self.db.payment(payment_id)
         changed = await self.db.review_payment(
@@ -2010,7 +2055,7 @@ class GamasBot:
                 try:
                     await self.client.send_message(
                         payment["user_id"],
-                        "❌ پرداخت شما تایید نشد. در صورت اعتراض با پشتیبانی تماس بگیرید.",
+                        "❌ پرداخت شما تأیید نشد. برای پیگیری، لطفاً با پشتیبانی تماس بگیرید.",
                     )
                 except Exception:
                     logger.warning("could not notify user=%s", payment["user_id"])
@@ -2021,15 +2066,18 @@ class GamasBot:
         stats = await self.db.stats()
         pending = len(await self.db.pending_payments())
         text = (
-            "🛠 پنل مدیریت — نمای کلی\n\n"
-            f"👥 کاربران: {to_persian_digits(stats['users'])}\n"
-            f"✅ کارهای موفق: {to_persian_digits(stats['submissions_done'])}\n"
-            f"❌ کارهای ناموفق: {to_persian_digits(stats['submissions_failed'])}\n"
-            f"⏳ در حال پردازش/صف: {to_persian_digits(stats['submissions_active'])}\n"
-            f"⏱ مجموع صوت پیاده‌شده: {format_duration(stats['seconds_transcribed'])}\n"
-            f"💰 درآمد تاییدشده: {format_toman(stats['toman_approved'])}\n"
-            f"🧾 پرداخت‌های در انتظار بررسی: {to_persian_digits(pending)}\n\n"
-            f"صف فعلی: {to_persian_digits(self.queue.pending)} در انتظار"
+            "🛠 پنل مدیریت | آمار و وضعیت\n\n"
+            f"👥 کاربران ثبت‌شده: {to_persian_digits(stats['users'])}\n"
+            f"✅ درخواست‌های تکمیل‌شده: {to_persian_digits(stats['submissions_done'])}\n"
+            f"❌ درخواست‌های ناموفق: {to_persian_digits(stats['submissions_failed'])}\n"
+            f"⏳ در حال پردازش یا منتظر در صف: "
+            f"{to_persian_digits(stats['submissions_active'])}\n"
+            f"⏱ مدت کل فایل‌های پیاده‌سازی‌شده: "
+            f"{format_duration(stats['seconds_transcribed'])}\n"
+            f"💰 مجموع مبالغ پرداختیِ تأییدشده: "
+            f"{format_toman(stats['toman_approved'])}\n"
+            f"🧾 پرداخت‌های نیازمند بررسی: {to_persian_digits(pending)}\n\n"
+            f"📥 درخواست‌های منتظر در صف فعلی: {to_persian_digits(self.queue.pending)}"
         )
         await self._edit_or_reply(event, text, self._admin_menu())
 
@@ -2037,37 +2085,46 @@ class GamasBot:
         users = await self.db.list_users(limit=25)
         total = await self.db.count_users()
         heading = (
-            f"👥 کاربران — {to_persian_digits(len(users))} از "
+            f"👥 فهرست کاربران — {to_persian_digits(len(users))} از "
             f"{to_persian_digits(total)} نفر"
         )
         if total > len(users):
-            heading += " (تازه‌ترین‌ها)"
-        lines = [heading + "\n"]
+            heading += " (۲۵ کاربر اخیر)"
+        lines = [
+            heading,
+            "",
+            "وضعیت حساب: 🚫 مسدود | ⭐ ویژه (اعتبار نامحدود) | 👤 عادی",
+            "",
+        ]
         for user in users:
             if user["banned"]:
-                flag = "🚫"
+                status = "🚫 مسدود"
             elif user["is_unlimited"]:
-                flag = "⭐"
+                status = "⭐ ویژه"
             else:
-                flag = "•"
+                status = "👤 عادی"
             balance = (
                 "نامحدود" if user["is_unlimited"]
-                else format_duration(user["available_seconds"]) + " اعتبار"
+                else format_duration(user["available_seconds"])
             )
-            joined = (user["joined_at"] or "")[:10]
+            joined = (user["joined_at"] or "")[:10] or "—"
             lines.append(
-                f"{flag} {user['telegram_id']} — {balance} — عضو از {joined}"
+                f"{status} | شناسه: {user['telegram_id']} | اعتبار: {balance} | عضویت: {joined}"
             )
-        lines.append("")
-        lines.append(
-            "برای اهدای اعتبار بفرستید:\n/grant <user_id> <hours>"
+        lines.extend(
+            [
+                "",
+                "دستورهای مدیریت (در همین گفت‌وگو ارسال کنید):",
+                "• افزودن اعتبار برحسب ساعت: /grant <شناسه کاربر> <ساعت>",
+                "  مثال: /grant 123456789 2",
+                "• فعال‌سازی وضعیت ویژه (بدون محدودیت اعتبار؛ دلیل الزامی است):",
+                "  /unlimited <شناسه کاربر> on <دلیل>",
+                "• لغو وضعیت ویژه: /unlimited <شناسه کاربر> off",
+                "• مسدودکردن کاربر: /ban <شناسه کاربر>",
+                "• رفع مسدودی: /unban <شناسه کاربر>",
+                "شناسهٔ هر کاربر در فهرست بالا نمایش داده شده است.",
+            ]
         )
-        lines.append(
-            "کاربر ویژه (بدون مصرف اعتبار):\n"
-            "/unlimited <user_id> on <دلیل>\n"
-            "/unlimited <user_id> off"
-        )
-        lines.append("مسدود کردن کاربر:\n/ban <user_id>\n/unban <user_id>")
         await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
 
     async def _show_admin_payments(self, event) -> None:
@@ -2075,31 +2132,47 @@ class GamasBot:
         if not payments:
             await self._edit_or_reply(
                 event,
-                "🧾 پرداخت‌های در انتظار\n\nپرداخت در انتظار بررسی نیست.",
+                "🧾 پرداخت‌ها\n\nدر حال حاضر پرداختی برای بررسی وجود ندارد.",
                 self._admin_menu(),
             )
             return
         buttons = []
         lines = [
-            f"🧾 پرداخت‌های در انتظار — {to_persian_digits(len(payments))} مورد\n"
+            f"🧾 پرداخت‌های در انتظار بررسی — {to_persian_digits(len(payments))} مورد",
+            "",
+            "در صورت نیاز رسید را مشاهده کنید؛ سپس «تأیید پرداخت» یا «رد پرداخت» را انتخاب کنید.",
+            "برای رد پرداخت، در پیام بعدی واردکردن دلیل الزامی است.",
+            "",
         ]
         for payment in payments:
             number = to_persian_digits(payment["payment_id"])
             receipt_row = [Button.inline(
-                "📷 دیدن رسید", f"adm:rcpt:{payment['payment_id']}".encode()
+                "📷 مشاهدهٔ رسید", f"adm:rcpt:{payment['payment_id']}".encode()
             )]
+            receipt_status = "ثبت شده ✅" if payment["receipt_path"] else "ثبت نشده ❌"
+            purchased_seconds = payment.get("purchased_seconds")
+            purchased_price = payment.get("purchased_price")
+            package = (
+                format_duration(int(purchased_seconds))
+                if purchased_seconds is not None
+                else payment["plan_code"]
+            )
+            price = (
+                format_toman(int(purchased_price))
+                if purchased_price is not None
+                else "نامشخص"
+            )
             lines.append(
-                f"#{number} — کاربر {payment['user_id']} — "
-                f"{payment['plan_code']} — رسید: "
-                f"{'دارد ✅' if payment['receipt_path'] else 'ندارد ❌'}"
+                f"#{number} | شناسهٔ کاربر: {payment['user_id']} | "
+                f"بسته: {package} | مبلغ: {price} | رسید: {receipt_status}"
             )
             buttons.append([
-                Button.inline("✅ تایید", f"payv:{payment['payment_id']}:a".encode()),
-                Button.inline("❌ رد", f"payv:{payment['payment_id']}:r".encode()),
+                Button.inline("✅ تأیید پرداخت", f"payv:{payment['payment_id']}:a".encode()),
+                Button.inline("❌ رد پرداخت", f"payv:{payment['payment_id']}:r".encode()),
             ])
             if payment["receipt_path"]:
                 buttons.append(receipt_row)
-        buttons.append([Button.inline("🔙 منوی کاربر", b"menu:main")])
+        buttons.append([Button.inline("🔙 بازگشت به پنل مدیریت", b"adm:home")])
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _show_receipt(self, event, data: str) -> None:
@@ -2130,10 +2203,10 @@ class GamasBot:
         buttons: list[list] = []
         if payment["status"] == "pending":
             buttons.append([
-                Button.inline("✅ تایید", f"payv:{payment_id}:a".encode()),
-                Button.inline("❌ رد", f"payv:{payment_id}:r".encode()),
+                Button.inline("✅ تأیید پرداخت", f"payv:{payment_id}:a".encode()),
+                Button.inline("❌ رد پرداخت", f"payv:{payment_id}:r".encode()),
             ])
-        buttons.append([Button.inline("🔙 پرداخت‌ها", b"adm:pay")])
+        buttons.append([Button.inline("🔙 فهرست پرداخت‌ها", b"adm:pay")])
         # The same supported file API as every other delivery, as a photo
         # (no ``force_document``): receipts are viewed in the app, not filed.
         await self.client.send_file(
@@ -2141,25 +2214,45 @@ class GamasBot:
             path,
             caption=(
                 f"📷 رسید پرداخت #{number}\n"
-                f"کاربر: {payment['user_id']} — طرح: {payment['plan_code']}"
+                f"شناسهٔ کاربر: {payment['user_id']} — طرح: {payment['plan_code']}"
             )[:TELEGRAM_CAPTION_LIMIT],
             buttons=buttons,
         )
 
     async def _show_admin_audit(self, event) -> None:
         rows = await self.db.recent_audit(limit=15)
-        lines = ["🛡 آخرین اقدام‌های مدیران\n"]
+        action_labels = {
+            "grant_credit": "افزودن اعتبار",
+            "unlimited_on": "فعال‌کردن کاربر ویژه",
+            "unlimited_off": "لغو وضعیت کاربر ویژه",
+            "user_banned": "مسدودکردن کاربر",
+            "user_unbanned": "رفع مسدودی کاربر",
+            "payment_approved": "تأیید پرداخت",
+            "payment_rejected": "رد پرداخت",
+            "broadcast": "ارسال پیام همگانی",
+        }
+        lines = ["🛡 گزارش فعالیت مدیران", "", "آخرین ۱۵ اقدام ثبت‌شده:"]
         if not rows:
-            lines.append("چیزی ثبت نشده است.")
+            lines.append("هنوز فعالیتی ثبت نشده است.")
         for row in rows:
-            lines.append(f"• {row['created_at']} — {row['admin_id']} — {row['action']}")
+            action = action_labels.get(row["action"], row["action"].replace("_", " "))
+            subject = (
+                f" — شناسهٔ کاربر: {row['subject_user']}"
+                if row["subject_user"] is not None
+                else ""
+            )
+            lines.append(
+                f"• {row['created_at']} — مدیر {row['admin_id']} — {action}{subject}"
+            )
         await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
 
     async def _admin_grant(self, event, text: str) -> None:
         parts = text.split()
         if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
             await event.reply(
-                "قالب درست: /grant <user_id> <hours>",
+                "قالب درست برای افزودن اعتبار:\n"
+                "/grant <شناسه کاربر> <ساعت>\n"
+                "مثال: /grant 123456789 2",
                 buttons=self._admin_menu(),
             )
             return
@@ -2168,13 +2261,13 @@ class GamasBot:
             # No separation-of-duties escape: an admin cannot mint credit for a
             # peer (audit F-06, docs/SECURITY.md).
             await event.reply(
-                "به مدیران دیگر نمی‌توان اعتبار اهدا کرد.",
+                "برای حفظ تفکیک دسترسی‌ها، امکان افزودن اعتبار به حساب مدیر دیگر وجود ندارد.",
                 buttons=self._admin_menu(),
             )
             return
         if not (0 < hours <= 10_000):
             await event.reply(
-                "ساعت باید بین ۱ و ۱۰۰۰۰ باشد.",
+                "تعداد ساعت باید بین ۱ و ۱۰٬۰۰۰ باشد.",
                 buttons=self._admin_menu(),
             )
             return
@@ -2184,7 +2277,7 @@ class GamasBot:
             validity_days=None, admin_id=event.sender_id,
         )
         await event.reply(
-            f"✅ {format_duration(hours * 3600)} اعتبار به {target} اضافه شد.",
+            f"✅ {format_duration(hours * 3600)} اعتبار به حساب کاربر {target} اضافه شد.",
             buttons=self._admin_menu(),
         )
 
@@ -2193,14 +2286,16 @@ class GamasBot:
         parts = text.split()
         if len(parts) != 2 or not parts[1].isdigit():
             await event.reply(
-                "قالب درست:\n/ban <user_id>\n/unban <user_id>",
+                "قالب درست:\n"
+                "مسدودکردن: /ban <شناسه کاربر>\n"
+                "رفع مسدودی: /unban <شناسه کاربر>",
                 buttons=self._admin_menu(),
             )
             return
         target = int(parts[1])
         banning = parts[0].lower() == "/ban"
         if self._is_admin(target):
-            await event.reply("مدیران را نمی‌توان مسدود کرد.", buttons=self._admin_menu())
+            await event.reply("حساب مدیران را نمی‌توان مسدود کرد.", buttons=self._admin_menu())
             return
         await self.db.ensure_user(target)
         await self.db.set_banned(target, banning, admin_id=event.sender_id)
@@ -2208,9 +2303,9 @@ class GamasBot:
             "ban flag changed user=%s banned=%s by=%s", target, banning, event.sender_id
         )
         await event.reply(
-            f"🚫 کاربر {target} مسدود شد."
+            f"🚫 حساب کاربر {target} مسدود شد."
             if banning
-            else f"✅ مسدودی کاربر {target} برداشته شد.",
+            else f"✅ مسدودی حساب کاربر {target} برداشته شد.",
             buttons=self._admin_menu(),
         )
 
@@ -2219,7 +2314,10 @@ class GamasBot:
         parts = text.split(maxsplit=3)
         if len(parts) < 3 or not parts[1].isdigit() or parts[2].lower() not in ("on", "off"):
             await event.reply(
-                "قالب درست:\n/unlimited <user_id> on <دلیل>\n/unlimited <user_id> off",
+                "قالب درست:\n"
+                "فعال‌سازی: /unlimited <شناسه کاربر> on <دلیل>\n"
+                "غیرفعال‌سازی: /unlimited <شناسه کاربر> off\n"
+                "برای فعال‌سازی، دلیل را هم وارد کنید.",
                 buttons=self._admin_menu(),
             )
             return
@@ -2228,14 +2326,14 @@ class GamasBot:
         reason = parts[3].strip() if len(parts) == 4 else ""
         if enable and not reason:
             await event.reply(
-                "برای کاربر ویژه کردن، دلیل را هم بنویسید.",
+                "برای فعال‌کردن وضعیت کاربر ویژه، واردکردن دلیل الزامی است.",
                 buttons=self._admin_menu(),
             )
             return
         if self._is_admin(target):
             # Admins are never special users; keep the list free of operators.
             await event.reply(
-                "مدیران به‌صورت خودکار کاربر ویژه نیستند و نمی‌توان آن‌ها را به این فهرست افزود.",
+                "فعال‌کردن وضعیت کاربر ویژه برای حساب مدیران مجاز نیست.",
                 buttons=self._admin_menu(),
             )
             return
@@ -2243,9 +2341,9 @@ class GamasBot:
         await self.db.set_unlimited(target, enable, admin_id=event.sender_id, reason=reason)
         logger.info("unlimited set user=%s enabled=%s by=%s", target, enable, event.sender_id)
         if enable:
-            message = f"⭐ کاربر {target} کاربر ویژه شد؛ استفاده از ربات برای او بدون محدودیت است."
+            message = f"⭐ کاربر {target} به فهرست کاربران ویژه افزوده شد؛ اعتبار او نامحدود است."
         else:
-            message = f"کاربر {target} دیگر کاربر ویژه نیست؛ از این پس اعتبار عادی مصرف می‌شود."
+            message = f"وضعیت ویژهٔ کاربر {target} لغو شد؛ از این پس استفاده از ربات به اعتبار او وابسته است."
         await event.reply(message, buttons=self._admin_menu())
 
     BROADCAST_THROTTLE_SECONDS = 0.05  # ~20 msg/sec (audit F-M02)
