@@ -100,9 +100,21 @@ MAX_CONTEXT_SPLITS = 2
 #: requests; the caller then delivers the raw transcript it already has.
 MAX_NOTE_CHUNKS = 200
 
+#: How many editorial levels a booklet above the compile budget may cost. A
+#: merged booklet that does not fit one request is compiled in whole-section
+#: groups (level 1); the only deeper level that can help is one final merge of
+#: those groups, which is attempted *only* when the compile actually shortened
+#: the booklet enough to fit. Re-grouping an over-budget document cannot shrink
+#: it, so no further level is ever attempted.
+MAX_COMPILE_LEVELS = 2
+
 #: Hard ceiling on practical tips in one booklet; a long lecture may contain
 #: more advice than a study document should surface at once.
 MAX_PRACTICAL_TIPS = 8
+#: How many sections one targeted repair request may carry when the whole
+#: booklet does not fit the repair budget. The lost facts live in a handful of
+#: sections, and the rest of the booklet is delivered unchanged and uncharged.
+MAX_REPAIR_SECTIONS = 6
 #: How many missing signals one repair request may carry. The windows are
 #: bounded, so the repair request stays far below the compile budget.
 MAX_REPAIR_SIGNALS = 40
@@ -1478,6 +1490,57 @@ def context_block_for(
 # ===========================================================================
 
 
+def section_payload(section: NoteSection) -> dict:
+    """One section as the compact payload: empty fields are omitted."""
+    item: dict = {"heading": section.heading}
+    if section.paragraphs:
+        item["paragraphs"] = list(section.paragraphs)
+    if section.bullets:
+        item["bullets"] = list(section.bullets)
+    if section.definitions:
+        item["definitions"] = [
+            {"term": d.term, "term_en": d.term_en, "definition": d.definition}
+            for d in section.definitions
+        ]
+    if section.examples:
+        item["examples"] = list(section.examples)
+    if section.steps:
+        item["steps"] = list(section.steps)
+    if section.formulas:
+        item["formulas"] = list(section.formulas)
+    if section.key_points:
+        item["key_points"] = list(section.key_points)
+    if section.all_tables:
+        item["tables"] = [
+            {
+                "caption": table.caption,
+                "headers": list(table.headers),
+                "rows": [list(row) for row in table.rows],
+            }
+            for table in section.all_tables
+        ]
+    if section.callouts:
+        item["callouts"] = [{"kind": c.kind, "text": c.text} for c in section.callouts]
+    return item
+
+
+def section_plain_text(section: NoteSection) -> str:
+    """All searchable text of a section, for deterministic relevance tests."""
+    parts: list[str] = [section.heading]
+    parts.extend(section.paragraphs)
+    parts.extend(section.bullets)
+    parts.extend(f"{d.term} {d.term_en} {d.definition}" for d in section.definitions)
+    parts.extend(section.examples)
+    parts.extend(section.steps)
+    parts.extend(section.formulas)
+    parts.extend(section.key_points)
+    for table in section.all_tables:
+        parts.append(" ".join(table.headers))
+        parts.extend(" ".join(row) for row in table.rows)
+    parts.extend(callout.text for callout in section.callouts)
+    return "\n".join(part for part in parts if part)
+
+
 def compact_notes_payload(notes: StructuredNotes) -> dict:
     """The notes as a compact payload: empty fields are omitted."""
     payload: dict = {}
@@ -1487,38 +1550,7 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
         payload["summary"] = notes.summary
     if notes.learning_objectives:
         payload["learning_objectives"] = list(notes.learning_objectives)
-    sections: list[dict] = []
-    for section in notes.sections:
-        item: dict = {"heading": section.heading}
-        if section.paragraphs:
-            item["paragraphs"] = list(section.paragraphs)
-        if section.bullets:
-            item["bullets"] = list(section.bullets)
-        if section.definitions:
-            item["definitions"] = [
-                {"term": d.term, "term_en": d.term_en, "definition": d.definition}
-                for d in section.definitions
-            ]
-        if section.examples:
-            item["examples"] = list(section.examples)
-        if section.steps:
-            item["steps"] = list(section.steps)
-        if section.formulas:
-            item["formulas"] = list(section.formulas)
-        if section.key_points:
-            item["key_points"] = list(section.key_points)
-        if section.all_tables:
-            item["tables"] = [
-                {
-                    "caption": table.caption,
-                    "headers": list(table.headers),
-                    "rows": [list(row) for row in table.rows],
-                }
-                for table in section.all_tables
-            ]
-        if section.callouts:
-            item["callouts"] = [{"kind": c.kind, "text": c.text} for c in section.callouts]
-        sections.append(item)
+    sections: list[dict] = [section_payload(section) for section in notes.sections]
     payload["sections"] = sections
     if notes.key_points:
         payload["key_points"] = list(notes.key_points)
@@ -1781,22 +1813,66 @@ def notes_need_repair(report: NoteQualityReport, *, mode: str = "full") -> bool:
     )
 
 
+def repair_target_indexes(
+    notes: StructuredNotes,
+    report: NoteQualityReport,
+    source: str,
+    *,
+    limit: int = MAX_REPAIR_SECTIONS,
+) -> list[int]:
+    """Which sections a bounded repair request should carry, best first.
+
+    A booklet above the repair budget cannot be re-sent whole, but the lost
+    facts belong to particular sections. Sections whose text overlaps the source
+    window of a missing or fabricated signal score highest (that is where the
+    fact belongs); the remaining slots are filled in document order so a
+    booklet-wide pattern is not hidden behind the first few sections. The caller
+    presents the chosen sections in document order.
+    """
+    total = len(notes.sections)
+    if total <= limit:
+        return list(range(total))
+    scores: dict[int, int] = dict.fromkeys(range(total), 0)
+    signals = [*report.audit.missing, *report.audit.fabricated]
+    for _signal, window in evidence_windows(source, signals, radius=REPAIR_WINDOW_CHARS):
+        window_words = content_words(window)
+        if not window_words:
+            continue
+        for index, section in enumerate(notes.sections):
+            overlap = len(window_words & content_words(section_plain_text(section)))
+            if overlap:
+                scores[index] += overlap
+    return sorted(range(total), key=lambda index: (-scores[index], index))[: max(1, limit)]
+
+
+def _subset_notes(notes: StructuredNotes, sections: Sequence[NoteSection]) -> StructuredNotes:
+    """The notes limited to ``sections`` (global fields kept: they are cheap)."""
+    return replace(notes, sections=tuple(sections))
+
+
 def build_repair_document(
     notes: StructuredNotes,
     report: NoteQualityReport,
     source: str,
     *,
     mode: str = "full",
+    sections: Sequence[NoteSection] | None = None,
 ) -> str:
     """The one repair request: the notes, what was lost, and where it came from.
 
     Only the *missing* facts and the source windows around them are added to
     the request — never the whole transcript — so restoring them is copying a
     sentence the model can see, not recalling one it cannot.
+
+    ``sections`` restricts the request to a bounded subset of the booklet (used
+    when the whole booklet does not fit the repair budget). The answer then
+    carries only those sections and is merged back by heading.
     """
+    targeted = sections is not None
+    booklet = _subset_notes(notes, sections) if targeted else notes
     parts: list[str] = []
     parts.append(
-        "### جزوهٔ فعلی\n" + json.dumps(compact_notes_payload(notes), ensure_ascii=False)
+        "### جزوهٔ فعلی\n" + json.dumps(compact_notes_payload(booklet), ensure_ascii=False)
     )
     audit = report.audit
     if audit.missing:
@@ -1821,9 +1897,16 @@ def build_repair_document(
             "چیز دیگری اضافه نکنید."
         )
     number_floor, term_floor = coverage_thresholds(resolve_note_mode(mode))
+    scope = (
+        "فقط همین بخش‌ها را (به همان ترتیب و با همان عنوان) برگردانید؛ "
+        "بخش دیگری از جزوه در این درخواست نیست.\n"
+        if targeted
+        else ""
+    )
     parts.append(
         "### دستور\n"
-        "همان جزوه را با همان ساختار JSON برگردانید و فقط این دو کار را بکنید:\n"
+        + scope
+        + "همان جزوه را با همان ساختار JSON برگردانید و فقط این دو کار را بکنید:\n"
         f"- موارد جامانده را در بخش مناسب برگردانید (پوشش اعداد باید دست‌کم {number_floor:.0%} و "
         f"پوشش اصطلاح‌ها دست‌کم {term_floor:.0%} باشد).\n"
         "- مواردی را که در منبع نیست حذف کنید.\n"
@@ -2154,6 +2237,90 @@ async def _audit_and_repair(
     return gated, report
 
 
+def repair_request_document(
+    notes: StructuredNotes,
+    report: NoteQualityReport,
+    source: str,
+    *,
+    budget: int,
+    mode: str = "full",
+) -> tuple[str, Sequence[NoteSection]] | None:
+    """The repair request, whole if it fits, otherwise targeted at sections.
+
+    Returns ``(document, sections)`` where ``sections`` is the repaired subset
+    (the whole booklet in the fitting case), or ``None`` when not even one
+    section fits the budget — a request that cannot fit is never sent.
+
+    A booklet above the budget used to skip the repair pass *silently*, so a
+    multi-hour lecture shipped with whatever the first pass produced. Only the
+    sections that hold the lost facts are re-sent now, and the answer is merged
+    back by heading: the rest of the booklet is delivered exactly as audited.
+    """
+    if budget <= 0:
+        return None
+    whole = build_repair_document(notes, report, source, mode=mode)
+    if len(whole) <= budget:
+        return whole, notes.sections
+    chosen = repair_target_indexes(notes, report, source)
+    while chosen:
+        sections = [notes.sections[index] for index in sorted(chosen)]
+        document = build_repair_document(
+            notes, report, source, mode=mode, sections=sections
+        )
+        if len(document) <= budget:
+            logger.info(
+                "repair pass targeted: whole_chars=%d request_chars=%d budget=%d sections=%d/%d",
+                len(whole), len(document), budget, len(sections), len(notes.sections),
+            )
+            return document, sections
+        # Drop the least relevant section and try again: a section is never
+        # split, and a request over the budget would be rejected anyway.
+        chosen.pop()
+    logger.warning(
+        "repair skipped: request_chars=%d budget=%d", len(whole), budget
+    )
+    return None
+
+
+def merge_repaired_sections(
+    notes: StructuredNotes, repaired: Sequence[NoteSection]
+) -> tuple[StructuredNotes, int]:
+    """Put the repaired sections back where they came from, by heading.
+
+    Headings are the only stable identity across the request (the model may
+    reflow a paragraph, never the section it belongs to). A section the model
+    returns that matches nothing is not merged — inventing a section is exactly
+    the failure this merge must not amplify. Returns the notes and the number of
+    sections that could not be placed.
+    """
+    indexes: dict[str, int] = {}
+    for index, section in enumerate(notes.sections):
+        key = heading_topic_key(section.heading)
+        if key and key not in indexes:
+            indexes[key] = index
+    merged = list(notes.sections)
+    placed: set[int] = set()
+    unplaced = 0
+    for section in repaired:
+        index = indexes.get(heading_topic_key(section.heading))
+        if index is None:
+            # A reworded heading still refers to one topic: accept the unique
+            # unplaced section it clearly overlaps, never an ambiguous one.
+            candidates = [
+                position
+                for position, original in enumerate(notes.sections)
+                if position not in placed
+                and headings_overlap(section.heading, original.heading)
+            ]
+            index = candidates[0] if len(candidates) == 1 else None
+        if index is None or index in placed:
+            unplaced += 1
+            continue
+        merged[index] = section
+        placed.add(index)
+    return replace(notes, sections=tuple(merged)), unplaced
+
+
 async def _repair_once(
     notes: StructuredNotes,
     report: NoteQualityReport,
@@ -2166,13 +2333,12 @@ async def _repair_once(
     semaphore: asyncio.Semaphore,
 ) -> tuple[StructuredNotes, NoteQualityReport]:
     """One bounded repair request; the caller keeps its state on any failure."""
-    repair_document = build_repair_document(notes, report, source, mode=mode)
     budget = effective_compile_max_chars(settings, mode=mode, presentation=presentation)
-    if len(repair_document) > budget:
-        logger.warning(
-            "repair skipped: request_chars=%d budget=%d", len(repair_document), budget
-        )
+    request = repair_request_document(notes, report, source, budget=budget, mode=mode)
+    if request is None:
         return notes, report
+    repair_document, repaired_sections = request
+    targeted = len(repaired_sections) < len(notes.sections)
     system_prompt = build_compile_system_prompt(mode, presentation=presentation)
     try:
         async with semaphore:
@@ -2183,12 +2349,257 @@ async def _repair_once(
     except (LLMError, StructuringError) as exc:
         logger.warning("repair pass failed (%s); keeping the audited notes", exc)
         return notes, report
+    if targeted:
+        candidate, unplaced = merge_repaired_sections(notes, candidate.sections)
+        if unplaced:
+            logger.warning(
+                "repair returned %d section(s) with no place in the booklet; ignored",
+                unplaced,
+            )
     candidate, candidate_report = gate_notes(candidate, source, strict=True, mode=mode)
     if repair_improves(candidate_report, report):
         logger.info("repair accepted %s", candidate_report.summary())
         return candidate, candidate_report
     logger.info("repair rejected %s", candidate_report.summary())
     return notes, report
+
+
+async def _compile_once(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    context: LectureContext,
+    notes: StructuredNotes,
+    *,
+    mode: str,
+    presentation: bool,
+    budget: int,
+) -> StructuredNotes | None:
+    """One editorial compile request, or ``None`` when it cannot be sent.
+
+    The deterministic acceptance gate is applied here, so every caller (the
+    whole-booklet path and each group of a grouped compile) gets the same
+    "restructure, never gut" guarantee.
+    """
+    document = build_compile_document(context, notes)
+    if budget <= 0 or len(document) > budget:
+        logger.warning(
+            "compile skipped: request_chars=%d budget=%d sections=%d",
+            len(document), budget, len(notes.sections),
+        )
+        return None
+    compile_system = (
+        COMPILE_SYSTEM_PROMPT
+        if mode == "full" and not presentation
+        else build_compile_system_prompt(mode, presentation=presentation)
+    )
+    try:
+        payload = await complete_json(
+            session, settings, system=compile_system, user=document
+        )
+        compiled = _load_json_payload(payload, mode=mode)
+    except (LLMError, StructuringError) as exc:
+        logger.warning("compile pass failed (%s); delivering deterministic merge", exc)
+        return None
+    if not compile_accepts(compiled, notes):
+        return None
+    return compiled
+
+
+def compile_groups(
+    notes: StructuredNotes, context: LectureContext, *, budget: int
+) -> list[StructuredNotes]:
+    """Partition a booklet into contiguous whole-section groups that fit.
+
+    A section is never split: it is the unit the acceptance gate and the merge
+    both reason about. A section that cannot fit on its own is returned as a
+    single-section group, which the caller keeps verbatim (with a warning)
+    rather than dropping content it cannot re-send.
+    """
+    if budget <= 0:
+        return []
+    base = len(build_compile_document(context, StructuredNotes()))
+    groups: list[StructuredNotes] = []
+    current: list[NoteSection] = []
+    current_chars = base
+    for section in notes.sections:
+        cost = len(json.dumps(section_payload(section), ensure_ascii=False))
+        extra = cost + (2 if current else 0)  # ", " between array items
+        if current and current_chars + extra > budget:
+            groups.append(StructuredNotes(sections=tuple(current)))
+            current = [section]
+            current_chars = base + cost
+            continue
+        current.append(section)
+        current_chars += extra
+    if current:
+        groups.append(StructuredNotes(sections=tuple(current)))
+    return groups
+
+
+def _gate_compiled(
+    compiled: StructuredNotes | None,
+    baseline_notes: StructuredNotes,
+    baseline_report: NoteQualityReport | None,
+    document: str,
+    settings: Settings,
+    *,
+    mode: str,
+) -> StructuredNotes | None:
+    """The editorial answer, unless it trades completeness for fluency."""
+    if compiled is None:
+        return None
+    if not settings.note_strict_grounding:
+        return compiled
+    compiled, compiled_report = gate_notes(compiled, document, strict=True, mode=mode)
+    baseline = baseline_report
+    if baseline is None:
+        _, baseline = gate_notes(baseline_notes, document, strict=True, mode=mode)
+    # An answer that invents a fact, or that covers less of the source than the
+    # text it replaced, is rejected even if its shape looks better.
+    if compiled_report.audit.fabricated:
+        logger.warning("compiled notes rejected: they assert facts absent from the source")
+        return None
+    if compiled_report.audit.coverage + 0.02 < baseline.audit.coverage:
+        logger.warning(
+            "compiled notes rejected: coverage %.2f < %.2f",
+            compiled_report.audit.coverage, baseline.audit.coverage,
+        )
+        return None
+    if compiled_report.coverage.ratio + 0.05 < baseline.coverage.ratio:
+        logger.warning(
+            "compiled notes rejected: sentence coverage %.2f < %.2f",
+            compiled_report.coverage.ratio, baseline.coverage.ratio,
+        )
+        return None
+    return compiled
+
+
+async def _compile_in_groups(
+    merged: StructuredNotes,
+    context: LectureContext,
+    document: str,
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    *,
+    mode: str,
+    presentation: bool,
+    budget: int,
+) -> StructuredNotes:
+    """Level 1: compile whole-section groups; keep any group that fails."""
+    groups = compile_groups(merged, context, budget=budget)
+    logger.warning(
+        "compile pass grouped: merged_chars=%d budget=%d groups=%d",
+        len(json.dumps(compact_notes_payload(merged), ensure_ascii=False)),
+        budget,
+        len(groups),
+    )
+    sections: list[NoteSection] = []
+    compiled_groups = 0
+    for group in groups:
+        compiled = await _compile_once(
+            session, settings, context, group,
+            mode=mode, presentation=presentation, budget=budget,
+        )
+        if compiled is None:
+            sections.extend(group.sections)
+            continue
+        if settings.note_strict_grounding:
+            _, group_report = gate_notes(compiled, document, strict=True, mode=mode)
+            if group_report.audit.fabricated:
+                logger.warning(
+                    "compiled group rejected: it asserts facts absent from the source"
+                )
+                sections.extend(group.sections)
+                continue
+        sections.extend(compiled.sections)
+        compiled_groups += 1
+    if not compiled_groups:
+        return merged
+    assembled = replace(merged, sections=tuple(sections))
+    if not assembled.has_content:
+        return merged
+    logger.info(
+        "compile pass grouped: compiled=%d/%d sections=%d",
+        compiled_groups, len(groups), len(assembled.sections),
+    )
+    return assembled
+
+
+async def _compile_pass(
+    merged: StructuredNotes,
+    merged_report: NoteQualityReport | None,
+    document: str,
+    context: LectureContext,
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    *,
+    mode: str,
+    presentation: bool,
+) -> StructuredNotes:
+    """The editorial pass: one request when it fits, whole-section groups when not.
+
+    The size-driven skip used to be silent, which made a 3-hour lecture look
+    exactly like an unedited merge. It is now logged, and the booklet is
+    compiled in groups so the pass still runs; a booklet that fits one request
+    keeps the original single-request behaviour and cost.
+    """
+    if not settings.note_compile:
+        return merged
+    merged_chars = len(json.dumps(compact_notes_payload(merged), ensure_ascii=False))
+    if merged_chars < COMPILE_MIN_NOTES_CHARS:
+        return merged
+    budget = effective_compile_max_chars(
+        settings, mode=mode, presentation=presentation
+    )
+    if budget <= 0:
+        # A zero budget means the configured window cannot hold the merged
+        # booklet plus the compile prompt. Skipping silently made a
+        # misconfiguration look like a normal, unedited merge.
+        logger.warning(
+            "compile pass disabled: NOTE_CONTEXT_TOKENS leaves no room for the "
+            "merged booklet (merged_chars=%d, NOTE_MAX_OUTPUT_TOKENS=%d)",
+            merged_chars, settings.note_max_output_tokens,
+        )
+        return merged
+    if merged_chars <= budget:
+        compiled = await _compile_once(
+            session, settings, context, merged,
+            mode=mode, presentation=presentation, budget=budget,
+        )
+        accepted = _gate_compiled(
+            compiled, merged, merged_report, document, settings, mode=mode
+        )
+        return accepted if accepted is not None else merged
+
+    assembled = await _compile_in_groups(
+        merged, context, document, settings, session,
+        mode=mode, presentation=presentation, budget=budget,
+    )
+    accepted = _gate_compiled(
+        assembled if assembled is not merged else None,
+        merged, merged_report, document, settings, mode=mode,
+    )
+    if accepted is None:
+        return merged
+    # Level 2 (the last one): a final merge of the compiled groups, only when
+    # the compile shortened the booklet enough that it now fits one request.
+    if MAX_COMPILE_LEVELS >= 2:
+        if len(build_compile_document(context, accepted)) > budget:
+            logger.info(
+                "compile pass level 2 skipped: assembled_chars=%d budget=%d",
+                len(build_compile_document(context, accepted)), budget,
+            )
+            return accepted
+        final = await _compile_once(
+            session, settings, context, accepted,
+            mode=mode, presentation=presentation, budget=budget,
+        )
+        merged_final = _gate_compiled(
+            final, merged, merged_report, document, settings, mode=mode
+        )
+        if merged_final is not None:
+            return merged_final
+    return accepted
 
 
 async def structure_document(
@@ -2333,70 +2744,10 @@ async def structure_document(
             mode=resolved_mode, presentation=presentation, semaphore=semaphore,
         )
 
-    merged_chars = len(json.dumps(compact_notes_payload(merged), ensure_ascii=False))
-    compile_budget = effective_compile_max_chars(
-        settings, mode=resolved_mode, presentation=presentation
+    return await _compile_pass(
+        merged, merged_report, document, context, settings, session,
+        mode=resolved_mode, presentation=presentation,
     )
-    if settings.note_compile and compile_budget <= 0:
-        # A zero budget means the configured window cannot hold the merged
-        # booklet plus the compile prompt. Skipping silently made a
-        # misconfiguration look like a normal, unedited merge.
-        logger.warning(
-            "compile pass disabled: NOTE_CONTEXT_TOKENS leaves no room for the "
-            "merged booklet (merged_chars=%d, NOTE_MAX_OUTPUT_TOKENS=%d)",
-            merged_chars, settings.note_max_output_tokens,
-        )
-    if (
-        not settings.note_compile
-        or merged_chars < COMPILE_MIN_NOTES_CHARS
-        or merged_chars > compile_budget
-    ):
-        return merged
-
-    compile_system = (
-        COMPILE_SYSTEM_PROMPT
-        if resolved_mode == "full" and not presentation
-        else build_compile_system_prompt(resolved_mode, presentation=presentation)
-    )
-    try:
-        payload = await complete_json(
-            session,
-            settings,
-            system=compile_system,
-            user=build_compile_document(context, merged),
-        )
-        compiled = _load_json_payload(payload, mode=resolved_mode)
-    except (LLMError, StructuringError) as exc:
-        logger.warning("compile pass failed (%s); delivering deterministic merge", exc)
-        return merged
-    if not compile_accepts(compiled, merged):
-        return merged
-    if settings.note_strict_grounding:
-        compiled, compiled_report = gate_notes(
-            compiled, document, strict=True, mode=resolved_mode
-        )
-        baseline = merged_report
-        if baseline is None:
-            _, baseline = gate_notes(merged, document, strict=True, mode=resolved_mode)
-        # The editorial pass may not trade completeness for fluency: an answer
-        # that invents a fact, or that covers less of the source than the merge
-        # it replaced, is rejected even if its shape looks better.
-        if compiled_report.audit.fabricated:
-            logger.warning("compiled notes rejected: they assert facts absent from the source")
-            return merged
-        if compiled_report.audit.coverage + 0.02 < baseline.audit.coverage:
-            logger.warning(
-                "compiled notes rejected: coverage %.2f < %.2f",
-                compiled_report.audit.coverage, baseline.audit.coverage,
-            )
-            return merged
-        if compiled_report.coverage.ratio + 0.05 < baseline.coverage.ratio:
-            logger.warning(
-                "compiled notes rejected: sentence coverage %.2f < %.2f",
-                compiled_report.coverage.ratio, baseline.coverage.ratio,
-            )
-            return merged
-    return compiled
 
 
 _SLIDE_NUMBER_CHARS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
