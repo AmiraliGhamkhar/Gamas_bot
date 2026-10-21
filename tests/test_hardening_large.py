@@ -18,10 +18,15 @@ from __future__ import annotations
 
 import json
 import re
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from gamas_bot import notes as notes_module
+from gamas_bot.bot import GamasBot, raw_parts
+from gamas_bot.db import Database
+from gamas_bot.jobs import Job
 from gamas_bot.notes import (
     MAX_REPAIR_SECTIONS,
     LectureContext,
@@ -32,7 +37,7 @@ from gamas_bot.notes import (
     gate_notes,
     structure_transcript,
 )
-from tests.support import make_settings
+from tests.support import FakeJobEvent, FakeTelegramClient, make_settings
 
 #: The booklet block of a compile or repair request (both embed it verbatim).
 _BOOKLET_RE = re.compile(r"### جزوهٔ فعلی[^\n]*\n(\{.*?\})\n\n### ", re.DOTALL)
@@ -298,6 +303,123 @@ class TargetedRepairTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(
             "بخش تازهٔ ساختگی", [section.heading for section in repaired.sections]
         )
+
+
+
+
+class RawPartsTests(unittest.TestCase):
+    """F-2: the raw transcript is split into bounded parts, never truncated."""
+
+    def test_a_long_transcript_splits_into_bounded_parts_that_lose_nothing(self):
+        paragraph = "جملهٔ کامل دربارهٔ موضوع درس. " * 40 + "\n\n"
+        text = (paragraph * 400).strip()  # ~ 430k characters
+        parts = raw_parts(text, max_chars=100_000, max_parts=8)
+        self.assertGreater(len(parts), 1)
+        self.assertLessEqual(len(parts), 8)
+        for part in parts:
+            self.assertLessEqual(len(part), 100_000)
+        # Joining the parts reproduces the transcript: no word or line lost.
+        self.assertEqual("".join(parts), text)
+
+    def test_a_transcript_that_needs_more_parts_than_allowed_is_refused(self):
+        text = "متن " * 300_000  # 1.2M characters: beyond any allowed part count
+        self.assertEqual(raw_parts(text, max_chars=100_000, max_parts=8), [])
+
+    def test_a_short_transcript_is_one_part_and_blank_text_is_none(self):
+        self.assertEqual(raw_parts("متن کوتاه", max_chars=100_000, max_parts=8),
+                         ["متن کوتاه"])
+        self.assertEqual(raw_parts("   \n ", max_chars=100_000, max_parts=8), [])
+
+
+class ScriptedClient(FakeTelegramClient):
+    """The Telegram double, with the ability to fail chosen upload attempts."""
+
+    def __init__(self, recorder, *, fail_indexes=()):
+        super().__init__(recorder)
+        self.fail_indexes = set(fail_indexes)
+        self.file_attempts = 0
+
+    async def send_file(self, *args, **kwargs):
+        self.file_attempts += 1
+        if self.file_attempts in self.fail_indexes:
+            raise RuntimeError("Telegram refused the upload (simulated)")
+        return await super().send_file(*args, **kwargs)
+
+
+class RawFallbackDeliveryTests(unittest.IsolatedAsyncioTestCase):
+    """F-2: a failed ``.txt`` upload of a long transcript still delivers."""
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "large.db",
+            temp_dir=root / "tmp",
+            receipt_dir=root / "receipts",
+        )
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.user_id = 404
+        await self.db.ensure_user(self.user_id)
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.event = FakeJobEvent()
+        self.bot.client = self.event.client
+
+    async def asyncTearDown(self) -> None:
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def job(self) -> tuple[Job, Path]:
+        submission = await self.db.create_submission(self.user_id, "audio", "a.wav")
+        raw_path = Path(self._tmp.name) / "raw.txt"
+        job = Job(
+            submission_id=submission,
+            user_id=self.user_id,
+            kind="audio",
+            filename="a.wav",
+            message=self.event.message,
+            is_admin=False,
+        )
+        return job, raw_path
+
+    def long_text(self, characters: int) -> str:
+        block = "این یک جملهٔ کامل از متن پیاده‌سازی‌شده است. " * 30 + "\n\n"
+        return (block * (characters // len(block) + 1))[:characters]
+
+    async def test_a_failed_single_upload_of_a_long_transcript_delivers_all_parts(self):
+        job, raw_path = await self.job()
+        raw_text = self.long_text(250_000)
+        raw_path.write_text(raw_text, encoding="utf-8")
+        self.bot.client = self.event.client = ScriptedClient(
+            self.event, fail_indexes={1}
+        )
+        await GamasBot._deliver_raw(self.bot, job, raw_text, raw_path, "GMS-7")
+        delivered = self.event.client.deliveries
+        self.assertGreater(len(delivered), 1)
+        payloads = [payload.decode("utf-8") for _path, payload in self.event.file_payloads]
+        for payload in payloads:
+            self.assertLessEqual(len(payload), 100_000)
+        # Nothing was dropped between the parts.
+        self.assertEqual("".join(payloads), raw_text)
+        # The workdir holds no part files after delivery.
+        self.assertEqual(sorted(path.name for path in raw_path.parent.glob("raw.*")),
+                         ["raw.txt"])
+
+    async def test_a_failed_part_fails_the_delivery_instead_of_settling_it(self):
+        job, raw_path = await self.job()
+        raw_text = self.long_text(250_000)
+        raw_path.write_text(raw_text, encoding="utf-8")
+        self.bot.client = self.event.client = ScriptedClient(
+            self.event, fail_indexes={1, 3}
+        )
+        with self.assertRaises(RuntimeError):
+            await GamasBot._deliver_raw(self.bot, job, raw_text, raw_path, "GMS-8")
+        # The original .txt is untouched and no part file is left behind.
+        self.assertEqual(sorted(path.name for path in raw_path.parent.glob("raw.*")),
+                         ["raw.txt"])
 
 
 if __name__ == "__main__":  # pragma: no cover

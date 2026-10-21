@@ -172,6 +172,59 @@ def _sanitize_log_value(value: object, *, limit: int = MAX_LOGGED_STRING_CHARS) 
     return text
 
 
+#: Delivery-size boundaries tried for one raw-transcript part, in order. A part
+#: is cut at the last of these that falls in its second half, so a boundary is
+#: never mid-word and the parts stay balanced.
+_RAW_PART_BOUNDARIES = ("\n\n", "\n", "؟ ", ". ", "، ", " ")
+
+
+def raw_parts(
+    text: str, *, max_chars: int, max_parts: int
+) -> list[str]:
+    """Split a raw transcript into delivery-sized parts, or refuse.
+
+    The single ``.txt`` upload is the normal path; when *it* fails, the same
+    document is re-sent in parts rather than truncated. A multi-hour lecture
+    (150k–300k characters) does not fit the paginated text fallback at all, so
+    before this split the whole job was refunded with nothing delivered.
+
+    Cuts land on a paragraph, then a line, then a sentence, then a word
+    boundary — never inside a character — and the number of parts is bounded.
+    An empty list means the text cannot be delivered within ``max_parts``: the
+    caller refuses it instead of shipping a truncated transcript.
+    """
+    body = text.strip("\n")
+    if not body.strip():
+        return []
+    if max_chars <= 0 or max_parts <= 0:
+        return []
+    if len(body) <= max_chars:
+        return [body]
+    parts: list[str] = []
+    rest = body
+    while rest:
+        if len(rest) <= max_chars:
+            parts.append(rest)
+            break
+        if len(parts) + 1 >= max_parts:
+            # One more cut would leave a remainder with no part left to carry
+            # it: refuse rather than lose the tail silently.
+            return []
+        window = rest[:max_chars]
+        cut = max_chars
+        for boundary in _RAW_PART_BOUNDARIES:
+            index = window.rfind(boundary)
+            if index >= max_chars // 2:
+                cut = index + len(boundary)
+                break
+        # The part keeps its boundary characters and the remainder drops only
+        # the newlines the boundary already ended with: rejoining the parts
+        # reproduces the transcript exactly, including between words.
+        parts.append(rest[:cut])
+        rest = rest[cut:].lstrip("\n")
+    return [part for part in parts if part.strip()]
+
+
 def _is_safe_receipt_path(receipt_dir: Path, receipt_path: str | Path) -> bool:
     """True when *receipt_path* is a single-link regular file in *receipt_dir*.
 
@@ -2094,6 +2147,18 @@ class GamasBot:
             )
         if job.message is None:
             raise RuntimeError("ارسال فایل متن خام ناموفق بود.")
+        parts = raw_parts(
+            raw_text,
+            max_chars=self.settings.raw_fallback_file_chars,
+            max_parts=self.settings.raw_fallback_max_files,
+        )
+        if len(parts) > 1:
+            await self._deliver_raw_parts(job, parts, raw_path, reference)
+            return
+        if not parts:
+            raise RuntimeError(
+                "متن خام برای ارسال در چند قطعه بیش از حد بزرگ است؛ اعتبار مصرف نشد."
+            )
         rendered = render_pages(raw_text)
         pages = [page for page in rendered[:RAW_FALLBACK_MAX_PAGES] if page.strip()]
         # Truncation and filtering are two different things: a blank rendered
@@ -2126,6 +2191,48 @@ class GamasBot:
             raise RuntimeError("ارسال کامل متن خام ناموفق بود؛ اعتبار مصرف نشد.")
         logger.info(
             "delivered raw transcript as %d text message(s) submission=%s",
+            delivered, job.submission_id,
+        )
+
+    async def _deliver_raw_parts(
+        self, job: Job, parts: list[str], raw_path: Path, reference: str
+    ) -> None:
+        """Re-send the raw transcript as bounded ``.txt`` parts.
+
+        Every part must arrive: a partially delivered transcript is not the
+        billable milestone, and the caller refunds the job instead. Each part is
+        written next to the original file and removed again immediately, so the
+        workdir holds at most one extra copy at a time.
+        """
+        if job.message is None:
+            raise RuntimeError("پیام کاربر برای ارسال فایل در دسترس نیست.")
+        delivered = 0
+        for index, part in enumerate(parts, start=1):
+            part_path = raw_path.with_name(f"{raw_path.stem}.{index}{raw_path.suffix}")
+            try:
+                part_path.write_text(part, encoding="utf-8", newline="\n")
+                await self._send_file(
+                    job,
+                    part_path,
+                    caption=(
+                        f"📝 متن خام ({index}/{len(parts)}) — {reference}"
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "raw text fallback part %d/%d failed submission=%s",
+                    index, len(parts), job.submission_id,
+                    exc_info=True,
+                )
+                break
+            finally:
+                part_path.unlink(missing_ok=True)
+            delivered += 1
+        if delivered != len(parts):
+            # Partial text is not the billable delivery milestone.
+            raise RuntimeError("ارسال کامل متن خام ناموفق بود؛ اعتبار مصرف نشد.")
+        logger.info(
+            "delivered raw transcript as %d file part(s) submission=%s",
             delivered, job.submission_id,
         )
 

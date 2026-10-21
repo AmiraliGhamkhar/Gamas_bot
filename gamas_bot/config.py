@@ -379,6 +379,14 @@ class Settings:
     convert_timeout: float
     stt_job_timeout: float
     stt_poll_interval: float
+    #: Free space that must remain on ``temp_dir`` before a download starts.
+    #: A long lecture plus its extracted audio is several gigabytes; a full
+    #: disk mid-download used to fail the job with a provider-level error.
+    temp_min_free_bytes: int
+    #: A download that produces no bytes for this many seconds is aborted.
+    #: Telegram can stall a transfer indefinitely; the job used to inherit no
+    #: deadline at all (there is no job-level timeout by design).
+    download_stall_seconds: float
 
     # --- Presentations ------------------------------------------------------
     presentation_max_clips: int
@@ -405,6 +413,13 @@ class Settings:
     stt_openai_api_key: str
     stt_openai_model: str
     stt_openai_max_upload: int
+    #: Deadline for one upload/download transfer of an STT request, in seconds.
+    #: It bounds the transfer, never the provider's processing time (that is
+    #: ``stt_job_timeout``), so a stalled socket cannot hold a worker for hours.
+    stt_transfer_timeout: float
+    #: Hard ceiling on an STT response body read into memory. A corrupted or
+    #: hostile answer cannot exhaust the worker's memory.
+    max_stt_response_bytes: int
 
     # --- Note generation ----------------------------------------------------
     note_providers: tuple[str, ...]
@@ -448,6 +463,14 @@ class Settings:
 
     # --- Raw text -----------------------------------------------------------
     raw_text_profile: str
+    #: Character budget of one delivery part when the raw ``.txt`` upload fails.
+    #: A multi-hour transcript is split into parts of this size, because one
+    #: document can no longer be re-uploaded and the paginated text fallback
+    #: only carries a bounded number of pages.
+    raw_fallback_file_chars: int
+    #: Hard ceiling on the number of parts the raw transcript may be split
+    #: into. A transcript that needs more is refused instead of truncated.
+    raw_fallback_max_files: int
 
     # --- Free Office --------------------------------------------------------
     office_enabled: bool
@@ -464,6 +487,9 @@ class Settings:
     receipt_dir: Path
     receipt_retention_days: int
     max_payment_receipt_bytes: int
+    #: Days a finished transcription row is kept before the retention sweep
+    #: deletes its text. 0 disables the sweep (rows are kept forever).
+    transcript_retention_days: int
     free_plan_hours: int
     plan_5_hours: int
     plan_5_price_toman: int
@@ -919,6 +945,12 @@ def from_env(env_file: str | None = None) -> Settings:
         convert_timeout=_env_float("CONVERT_TIMEOUT", 600.0, minimum=1.0),
         stt_job_timeout=_env_float("STT_JOB_TIMEOUT", 21600.0, minimum=60.0),
         stt_poll_interval=_env_float("STT_POLL_INTERVAL", 10.0, minimum=1.0),
+        temp_min_free_bytes=_env_int(
+            "TEMP_MIN_FREE_BYTES", 2 * 1024**3, minimum=0
+        ),
+        download_stall_seconds=_env_float(
+            "DOWNLOAD_STALL_SECONDS", 300.0, minimum=30.0
+        ),
         presentation_max_clips=_env_int("PRESENTATION_MAX_CLIPS", 300, minimum=1),
         presentation_max_total_duration=_env_float(
             "PRESENTATION_MAX_TOTAL_DURATION", 21600.0, minimum=1.0
@@ -958,6 +990,12 @@ def from_env(env_file: str | None = None) -> Settings:
         stt_openai_model=_env("STT_OPENAI_MODEL", "whisper-1"),
         stt_openai_max_upload=_env_int(
             "STT_OPENAI_MAX_UPLOAD_BYTES", OPENAI_STT_MAX_UPLOAD, minimum=1024
+        ),
+        stt_transfer_timeout=_env_float(
+            "STT_TRANSFER_TIMEOUT_SECONDS", 600.0, minimum=30.0
+        ),
+        max_stt_response_bytes=_env_int(
+            "MAX_STT_RESPONSE_BYTES", 64 * 1024 * 1024, minimum=1024 * 1024
         ),
         note_providers=_parse_note_providers(raw_note_providers),
         note_provider=note_provider,
@@ -1018,6 +1056,12 @@ def from_env(env_file: str | None = None) -> Settings:
         note_strict_grounding=_env_bool("NOTE_STRICT_GROUNDING", True),
         note_quality_gate=resolve_note_quality_gate(_env("NOTE_QUALITY_GATE")),
         raw_text_profile=resolve_raw_text_profile(_env("RAW_TEXT_PROFILE")),
+        raw_fallback_file_chars=_env_int(
+            "RAW_FALLBACK_FILE_CHARS", 100_000, minimum=1_000, maximum=400_000
+        ),
+        raw_fallback_max_files=_env_int(
+            "RAW_FALLBACK_MAX_FILES", 8, minimum=1, maximum=20
+        ),
         office_enabled=_env_bool("OFFICE_ENABLED", True),
         office_max_input_bytes=_env_int(
             "OFFICE_MAX_INPUT_BYTES", 1_000_000, minimum=1024, maximum=50_000_000
@@ -1046,6 +1090,9 @@ def from_env(env_file: str | None = None) -> Settings:
         receipt_dir=_project_path(_env("RECEIPT_DIR"), "data/receipts"),
         receipt_retention_days=_env_int("RECEIPT_RETENTION_DAYS", 90, minimum=1),
         max_payment_receipt_bytes=_env_int("MAX_PAYMENT_RECEIPT_BYTES", 5 * 1024 * 1024, minimum=1024),
+        transcript_retention_days=_env_int(
+            "TRANSCRIPT_RETENTION_DAYS", 0, minimum=0, maximum=3650
+        ),
         llm_connector_limit=_env_int("LLM_CONNECTOR_LIMIT", 32, minimum=1),
         llm_connector_limit_per_host=_env_int(
             "LLM_CONNECTOR_LIMIT_PER_HOST", 8, minimum=1
