@@ -6,12 +6,16 @@ lines) with one module and a fixed call budget:
 * **one map call per transcript chunk** — run concurrently (bounded by
   ``NOTE_CONCURRENCY``), each with a deterministic position/context block so
   nothing is lost at chunk edges;
-* **one optional reduce call** — the editorial compile that merges the chunk
-  notes into a coherent booklet. If it fails, the deterministic merge is
-  delivered instead;
-* **no repair passes, no QA-driven re-asks, no truncation re-sends.** A bad
-  answer degrades to the raw transcript — which the user already holds,
-  because the transcript is delivered before note generation starts.
+* **one optional reduce pass** — the editorial compile that merges the chunk
+  notes into a coherent booklet. A booklet too large for one request is
+  compiled in groups of whole sections (bounded levels); if the pass fails, the
+  deterministic merge is delivered instead;
+* **at most one bounded repair pass**, only when the evidence gate asks for it
+  (see ``NOTE_QUALITY_GATE``); an oversized repair request carries only the
+  sections that hold the lost facts;
+* **no QA-driven re-asks and no truncation re-sends.** A bad answer degrades to
+  the raw transcript — which the user already holds, because the transcript is
+  delivered before note generation starts.
 
 The note dataclasses, the Persian prompts and the conservative deterministic
 merge are ported from v2 nearly verbatim: they encode the content-preservation
@@ -2108,8 +2112,8 @@ def effective_compile_max_chars(
     prompt for the mode and source type is reserved, as is the bounded topic
     digest. The derived budget is also bounded by ``COMPILE_HARD_MAX_CHARS``, so
     a very large configured window cannot turn the reduce step into one
-    unbounded request — the deterministic merge is delivered instead, exactly
-    as before.
+    unbounded request. A merged booklet above this budget is compiled in whole
+    section groups instead of being skipped (see :func:`_compile_pass`).
     """
     compile_system = (
         COMPILE_SYSTEM_PROMPT
