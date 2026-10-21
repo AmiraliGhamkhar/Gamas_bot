@@ -1197,6 +1197,17 @@ def check(settings: Settings) -> list[str]:
             "request will time out on a slow gateway. Lower NOTE_MAX_OUTPUT_TOKENS, raise "
             "NOTE_REQUEST_TIMEOUT_SECONDS, or lower NOTE_REASONING_EFFORT."
         )
+    # Media extraction runs before transcription and has its own deadline. A
+    # six-hour video needs minutes of decoding even at many times real time, so
+    # a short MEDIA_TIMEOUT fails a lecture whose transcription budget is huge.
+    media_floor = max(600.0, settings.stt_job_timeout / 12)
+    if settings.media_timeout < media_floor:
+        problems.append(
+            f"MEDIA_TIMEOUT={settings.media_timeout:.0f}s is short for a multi-hour "
+            f"lecture (STT_JOB_TIMEOUT={settings.stt_job_timeout:.0f}s allows one); "
+            f"media extraction would be killed at {settings.media_timeout:.0f}s. "
+            "Raise MEDIA_TIMEOUT or lower STT_JOB_TIMEOUT."
+        )
     if not settings.admin_ids:
         problems.append("ADMIN_IDS is empty; nobody will be able to approve payments.")
     # A non-positive tariff override is silently ignored by ``billing._resolved``

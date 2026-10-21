@@ -524,6 +524,7 @@ class GamasBot:
         )
         self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
         self._receipt_cleanup_task: asyncio.Task | None = None
+        self._transcript_cleanup_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
         self._pending_broadcast: set[int] = set()
         # admin_id -> payment_id awaiting a rejection reason
@@ -583,6 +584,9 @@ class GamasBot:
         self._sweep_stale_temp_dirs()
         self.queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
+        self._transcript_cleanup_task = asyncio.create_task(
+            self._transcript_cleanup_loop()
+        )
         await self.client.start(bot_token=self.settings.bot_token)
         logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
         if not self.settings.payment_card_number:
@@ -618,6 +622,8 @@ class GamasBot:
             logger.info("removed %d stale temp dir(s) at startup", removed)
 
     async def shutdown(self) -> None:
+        if self._transcript_cleanup_task is not None:
+            self._transcript_cleanup_task.cancel()
         if self._receipt_cleanup_task is not None:
             self._receipt_cleanup_task.cancel()
 
@@ -3067,6 +3073,45 @@ class GamasBot:
                 raise
             except Exception:
                 logger.warning("receipt cleanup failed", exc_info=True)
+
+    #: Batches one transcript-retention sweep may delete (bounded work per run).
+    TRANSCRIPT_CLEANUP_BATCHES = 25
+
+    async def _transcript_cleanup_loop(self) -> None:
+        """Delete finished transcripts after the retention window (audit F-10)."""
+        if self.settings.transcript_retention_days <= 0:
+            return
+        while True:
+            try:
+                # Sweep first: a restart must not reset the timer forever.
+                await self._cleanup_expired_transcripts()
+                await asyncio.sleep(24 * 3600)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("transcript cleanup failed", exc_info=True)
+
+    async def _cleanup_expired_transcripts(self) -> int:
+        """Delete expired transcript rows in bounded batches; returns the count."""
+        days = self.settings.transcript_retention_days
+        if days <= 0:
+            return 0
+        removed = 0
+        for _ in range(self.TRANSCRIPT_CLEANUP_BATCHES):
+            batch = await self.db.expire_transcriptions(older_than_days=days)
+            removed += batch
+            if batch == 0:
+                break
+        if removed:
+            # The deletion is recorded: an operator reading the audit trail must
+            # be able to tell why a transcript is gone.
+            await self.db.audit(
+                0, "transcript_expired", f"deleted:{removed} days:{days}"
+            )
+            logger.info(
+                "removed %d expired transcriptions (retention %d days)", removed, days
+            )
+        return removed
 
     async def _cleanup_expired_receipts(self) -> None:
         if not self.settings.receipt_dir.is_dir():

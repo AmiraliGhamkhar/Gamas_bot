@@ -484,6 +484,42 @@ class Database:
             (submission_id, engine, text, notes_json, iso(utc_now())),
         )
 
+    async def expire_transcriptions(
+        self, *, older_than_days: int, batch: int = 200
+    ) -> int:
+        """Delete at most ``batch`` finished transcripts older than the window.
+
+        The ``transcriptions`` table grows forever (one row per finished job,
+        both text and the notes JSON), so a long-lived deployment pays for every
+        lecture it has ever transcribed. Only rows of *finished* submissions are
+        touched: a pending or processing job's row is what a retry or a support
+        ticket reads, and deleting it mid-flight would lose the only copy of the
+        work while it is still being delivered.
+
+        The caller loops over batches, so a large backlog is deleted in bounded
+        transactions instead of one long write lock.
+        """
+        if older_than_days <= 0:
+            return 0
+        cutoff = iso(utc_now() - timedelta(days=older_than_days))
+        rows = await self.db.execute_fetchall(
+            "SELECT t.submission_id FROM transcriptions t "
+            "JOIN submissions s ON s.submission_id = t.submission_id "
+            "WHERE t.created_at < ? AND s.status IN ('done', 'failed', 'rejected') "
+            "ORDER BY t.created_at LIMIT ?",
+            (cutoff, max(1, batch)),
+        )
+        ids = [row[0] for row in rows]
+        if not ids:
+            return 0
+        await self._write_many(
+            [
+                ("DELETE FROM transcriptions WHERE submission_id = ?", (submission_id,))
+                for submission_id in ids
+            ]
+        )
+        return len(ids)
+
     async def transcription(self, submission_id: int) -> dict | None:
         """The persisted transcript (engine, text, notes JSON) for auditing."""
         rows = await self.db.execute_fetchall(

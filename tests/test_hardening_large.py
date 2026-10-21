@@ -21,11 +21,12 @@ import json
 import re
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from gamas_bot import notes as notes_module
+from gamas_bot import config, notes as notes_module
 from gamas_bot import stt
 from gamas_bot.bot import (
     DiskSpaceError,
@@ -35,7 +36,7 @@ from gamas_bot.bot import (
     _ensure_disk_headroom,
     raw_parts,
 )
-from gamas_bot.db import Database
+from gamas_bot.db import Database, iso, utc_now
 from gamas_bot.jobs import Job
 from gamas_bot.notes import (
     MAX_REPAIR_SECTIONS,
@@ -706,6 +707,154 @@ class DiskRefusalPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any("فضای موقت" in reply for reply in event.replies), event.replies
         )
+
+
+
+
+class BoundedResponseTests(unittest.IsolatedAsyncioTestCase):
+    """F-7: an STT response body is bounded before it is parsed."""
+
+    async def test_a_streamed_body_over_the_ceiling_is_refused_while_reading(self):
+        response = StreamedResponse(b'{"results": "' + b"x" * 50_000 + b'"}')
+        with self.assertRaises(stt.STTError):
+            await stt._json_response("provider", response, max_bytes=1024)
+        # The read stopped at the ceiling instead of loading the whole body.
+        self.assertLessEqual(response.read_bytes, 1024 + 256)
+
+    async def test_a_declared_length_over_the_ceiling_is_refused_before_reading(self):
+        response = StreamedResponse(b"{}")
+        response.headers = {"Content-Length": "99999999"}
+        with self.assertRaises(stt.STTError):
+            await stt._json_response("provider", response, max_bytes=1024)
+        self.assertEqual(response.read_bytes, 0)
+
+    async def test_a_normal_body_still_parses(self):
+        response = StreamedResponse(b'{"job": {"status": "done"}}')
+        parsed = await stt._json_response("provider", response, max_bytes=1024)
+        self.assertEqual(parsed, {"job": {"status": "done"}})
+
+    async def test_the_configured_ceiling_is_used_by_the_provider_call(self):
+        settings = make_settings(
+            stt_providers=("speechmatics",),
+            max_stt_response_bytes=200,
+            stt_poll_interval=0.01,
+        )
+        session = RecordingSession(
+            posts=[_FakeResponse(202, {"id": "job-1"})],
+            gets=[
+                _FakeResponse(200, {"job": {"status": "done"}}),
+                _FakeResponse(200, {"results": [
+                    {"type": "word", "start_time": 0.0, "end_time": 0.4,
+                     "alternatives": [{"content": "کلمهٔ بسیار طولانی" * 20}]},
+                ]}),
+            ],
+        )
+        with self.assertRaises(stt.STTError):
+            await stt._speechmatics(session, audio_file(), settings)
+
+
+class StreamedResponse:
+    """An aiohttp-like streaming response (``content.read(n)``), chunked."""
+
+    def __init__(self, body: bytes, *, chunk: int = 256):
+        self.headers: dict[str, str] = {}
+        self._body = body
+        self._chunk = chunk
+        self.read_bytes = 0
+        self.content = SimpleNamespace(read=self._read)
+
+    async def _read(self, size: int) -> bytes:
+        take = min(size, self._chunk)
+        chunk = self._body[:take]
+        self._body = self._body[take:]
+        self.read_bytes += len(chunk)
+        return chunk
+
+
+class MediaTimeoutAdvisoryTests(unittest.TestCase):
+    """F-9: a media deadline too short for a multi-hour lecture is reported."""
+
+    def test_a_short_media_timeout_is_reported(self):
+        problems = config.check(
+            make_settings(media_timeout=300.0, stt_job_timeout=21_600.0)
+        )
+        self.assertTrue(
+            any("MEDIA_TIMEOUT" in problem for problem in problems), problems
+        )
+
+    def test_the_shipped_default_media_timeout_is_accepted(self):
+        problems = config.check(
+            make_settings(media_timeout=3_600.0, stt_job_timeout=21_600.0)
+        )
+        self.assertFalse(
+            any("MEDIA_TIMEOUT" in problem for problem in problems), problems
+        )
+
+
+class TranscriptRetentionTests(unittest.IsolatedAsyncioTestCase):
+    """F-10: finished transcripts expire; in-flight ones are never touched."""
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "retention.db",
+            temp_dir=root / "tmp",
+            receipt_dir=root / "receipts",
+            transcript_retention_days=30,
+        )
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.user_id = 505
+        await self.db.ensure_user(self.user_id)
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+
+    async def asyncTearDown(self) -> None:
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def transcript(self, *, status: str, age_days: int) -> int:
+        submission = await self.db.create_submission(self.user_id, "audio", "a.wav")
+        await self.db.save_transcription(submission, "engine", "متن", "{}")
+        await self.db.set_submission_status(submission, status)
+        await self.db._write(
+            "UPDATE transcriptions SET created_at = ? WHERE submission_id = ?",
+            (iso(utc_now() - timedelta(days=age_days)), submission),
+        )
+        return submission
+
+    async def test_expired_finished_transcripts_are_deleted_and_audited(self):
+        old_done = await self.transcript(status="done", age_days=40)
+        old_failed = await self.transcript(status="failed", age_days=40)
+        in_flight = await self.transcript(status="processing", age_days=40)
+        fresh = await self.transcript(status="done", age_days=1)
+
+        removed = await self.bot._cleanup_expired_transcripts()
+
+        self.assertEqual(removed, 2)
+        self.assertIsNone(await self.db.transcription(old_done))
+        self.assertIsNone(await self.db.transcription(old_failed))
+        # An in-flight job's row is the only copy of work being delivered.
+        self.assertIsNotNone(await self.db.transcription(in_flight))
+        self.assertIsNotNone(await self.db.transcription(fresh))
+        audit = await self.db.recent_audit(limit=5)
+        self.assertTrue(
+            any(row["action"] == "transcript_expired" for row in audit), audit
+        )
+
+    async def test_retention_off_keeps_every_row(self):
+        self.bot.settings = make_settings(
+            db_path=self.settings.db_path,
+            temp_dir=self.settings.temp_dir,
+            receipt_dir=self.settings.receipt_dir,
+            transcript_retention_days=0,
+        )
+        old_done = await self.transcript(status="done", age_days=4000)
+        self.assertEqual(await self.bot._cleanup_expired_transcripts(), 0)
+        self.assertIsNotNone(await self.db.transcription(old_done))
 
 
 if __name__ == "__main__":  # pragma: no cover

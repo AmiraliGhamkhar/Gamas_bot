@@ -16,6 +16,7 @@ is no post-hoc repair pass anywhere in v3.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import mimetypes
@@ -200,10 +201,57 @@ def _transfer_timeout(settings: Settings) -> aiohttp.ClientTimeout:
     return aiohttp.ClientTimeout(total=settings.stt_transfer_timeout)
 
 
-async def _json_response(label: str, response: aiohttp.ClientResponse) -> object:
-    """Decode a provider response without leaking a raw body on schema errors."""
+#: Default ceiling on one provider response body read into memory. It matches
+#: the shipped ``MAX_STT_RESPONSE_BYTES``; every call site passes the configured
+#: value explicitly.
+DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+
+
+async def _read_bounded(label: str, response, max_bytes: int) -> bytes:
+    """Read a response body up to ``max_bytes``, never more (audit F-7).
+
+    A provider answer was decoded straight into memory, so a corrupted stream,
+    an error page or a hostile gateway could hand a worker an arbitrarily large
+    document. The bytes are read in chunks and the read stops at the ceiling.
+    """
+    content = getattr(response, "content", None)
+    reader = getattr(content, "read", None)
+    if reader is None:
+        # A stub that only exposes ``read()``: the whole body, then the check.
+        body = await response.read()
+        if len(body) > max_bytes:
+            raise STTError(f"{label} پاسخ بزرگ‌تری از حد مجاز برگرداند.")
+        return body
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await reader(min(64 * 1024, max_bytes + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
+            raise STTError(f"{label} پاسخ بزرگ‌تری از حد مجاز برگرداند.")
+    return b"".join(chunks)
+
+
+async def _json_response(
+    label: str,
+    response: aiohttp.ClientResponse,
+    *,
+    max_bytes: int = DEFAULT_MAX_RESPONSE_BYTES,
+) -> object:
+    """Decode a bounded provider response without leaking a raw body."""
+    headers = getattr(response, "headers", None) or {}
     try:
-        return await response.json(content_type=None)
+        declared = int(headers.get("Content-Length", ""))
+    except (TypeError, ValueError):
+        declared = None
+    if declared is not None and declared > max_bytes:
+        raise STTError(f"{label} پاسخ بزرگ‌تری از حد مجاز برگرداند.")
+    body = await _read_bounded(label, response, max_bytes)
+    try:
+        return json.loads(body)
     except (ValueError, TypeError) as exc:
         raise STTError(f"{label} پاسخ JSON معتبری برنگرداند.") from exc
 
@@ -402,7 +450,9 @@ async def _speechmatics(
                 raise await _error_from_response(
                     "Speechmatics", response, api_key=settings.speechmatics_api_key
                 )
-            payload = await _json_response("Speechmatics", response)
+            payload = await _json_response(
+                "Speechmatics", response, max_bytes=settings.max_stt_response_bytes
+            )
     if not isinstance(payload, dict):
         raise STTError("Speechmatics پاسخ ایجاد پردازش را با ساختار قابل‌خواندن برنگرداند.")
     job_id = payload.get("id")
@@ -474,7 +524,9 @@ async def _get_json(
                     raise await _error_from_response(
                         label, response, api_key=settings.speechmatics_api_key
                     )
-                return await _json_response(label, response)
+                return await _json_response(
+                    label, response, max_bytes=settings.max_stt_response_bytes
+                )
         except (STTTransientError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             if attempt >= MAX_TRANSIENT_RETRIES:
                 raise
@@ -625,7 +677,9 @@ async def _deepgram(
                 raise await _error_from_response(
                     "Deepgram", response, api_key=settings.deepgram_api_key
                 )
-            payload = await _json_response("Deepgram", response)
+            payload = await _json_response(
+                "Deepgram", response, max_bytes=settings.max_stt_response_bytes
+            )
     return _deepgram_transcript(payload)
 
 
@@ -707,7 +761,11 @@ async def _openai_compatible(
                         api_key=settings.stt_openai_api_key, body=body,
                     )
             else:
-                payload = await _json_response("سرویس تبدیل گفتار", response)
+                payload = await _json_response(
+                    "سرویس تبدیل گفتار",
+                    response,
+                    max_bytes=settings.max_stt_response_bytes,
+                )
     if retry_plain:
         logger.info("openai_compatible rejected verbose_json; retrying plain")
         return await _openai_plain(session, audio_path, settings, language)
@@ -740,7 +798,9 @@ async def _openai_plain(
                 raise await _error_from_response(
                     "سرویس تبدیل گفتار", response, api_key=settings.stt_openai_api_key
                 )
-            payload = await _json_response("سرویس تبدیل گفتار", response)
+            payload = await _json_response(
+                "سرویس تبدیل گفتار", response, max_bytes=settings.max_stt_response_bytes
+            )
     return _openai_transcript(payload)
 
 
