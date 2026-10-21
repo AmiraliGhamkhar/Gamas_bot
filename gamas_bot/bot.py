@@ -131,6 +131,10 @@ class UploadTooLargeError(ValueError):
     """A Telegram transfer exceeded its configured byte ceiling."""
 
 
+class DownloadStalledError(ValueError):
+    """A Telegram download produced no bytes for the configured stall window."""
+
+
 USER_VISIBLE_ERRORS = (
     ValueError,
     PresentationError,
@@ -343,37 +347,64 @@ def _normalize_receipt_image(path: Path, *, max_bytes: int) -> bool:
                 pass
 
 
-async def _download_media_limited(message, target: Path, limit_bytes: int) -> Path:
+async def _download_media_limited(
+    message, target: Path, limit_bytes: int, *, stall_seconds: float = 0.0
+) -> Path:
     """Download Telegram media with live abort if it exceeds *limit_bytes*.
 
     Telegram may report ``file.size`` as None or as a thumbnail size, so
     pre-check alone is insufficient. The progress callback aborts the download
     as soon as the declared total or the running total exceeds the limit,
     preventing a multi-GB disk-fill before the post-download stat check.
+
+    A download that produces no bytes for ``stall_seconds`` is also aborted
+    (``0`` disables the watchdog). There is no job-level timeout by design, so
+    a half-open socket used to hold a worker — and its temporary directory —
+    indefinitely on a multi-gigabyte lecture.
     """
     if limit_bytes <= 0:
         raise ValueError("download limit must be positive")
+    last_progress = [time.monotonic()]
 
     def _guard(received: int, total: int) -> None:
         # Telethon reports (received, total); total can be zero for an unknown
         # size. Check both the declaration and running byte count.
+        last_progress[0] = time.monotonic()
         if total and total > limit_bytes:
             raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
         if received > limit_bytes:
             raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
 
-    try:
-        downloaded = await message.download_media(
+    async def _download():
+        return await message.download_media(
             file=str(target), progress_callback=_guard
         )
+
+    task = asyncio.create_task(_download())
+    try:
+        if stall_seconds > 0:
+            tick = max(1.0, min(stall_seconds / 4, 15.0))
+            while True:
+                done, _pending = await asyncio.wait({task}, timeout=tick)
+                if done:
+                    break
+                idle = time.monotonic() - last_progress[0]
+                if idle > stall_seconds:
+                    raise DownloadStalledError(
+                        "دانلود فایل از تلگرام متوقف شد؛ لطفاً دوباره بفرستید."
+                    )
+        downloaded = await task
         if not downloaded or not target.is_file():
             raise RuntimeError("download did not produce a file")
         if target.stat().st_size > limit_bytes:
             raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
         return target
     except BaseException:
-        # This includes cancellation and progress-callback failures: never keep
-        # a partial upload in private storage.
+        # This includes cancellation, a stalled transfer and progress-callback
+        # failures: never keep a partial upload in private storage.
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         try:
             target.unlink(missing_ok=True)
         except OSError:
@@ -1356,12 +1387,22 @@ class GamasBot:
             )
             return
         available = await self.db.available_seconds(user_id)
+        # ``duration is None`` is not an exemption: an unknown duration used to
+        # skip the balance check entirely, so a 2 GiB upload could be downloaded
+        # from the provider with zero credit. The conservative floor is checked
+        # exactly like a measured duration (audit F-4).
         needed = self._reserve_estimate(duration)
         unlimited = await self.db.is_unlimited(user_id)
-        if not unlimited and duration is not None and available < needed:
+        if not unlimited and available < needed:
+            measured = (
+                f"مدت فایل: {format_duration(duration)}"
+                if duration is not None and duration > 0
+                else "مدت فایل نامشخص است"
+            )
             await event.reply(
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
-                f"مدت فایل: {format_duration(duration)} — اعتبار فعلی: {format_duration(available)}\n"
+                f"{measured} — لازم (دست‌کم): {format_duration(needed)} — "
+                f"اعتبار فعلی: {format_duration(available)}\n"
                 "از «💳 اعتبار و پرداخت» می‌توانید اعتبار بگیرید."
             )
             return
@@ -1573,7 +1614,10 @@ class GamasBot:
         await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
         try:
             await _download_media_limited(
-                job.message, source_path, self.settings.max_file_size
+                job.message,
+                source_path,
+                self.settings.max_file_size,
+                stall_seconds=self.settings.download_stall_seconds,
             )
         except UploadTooLargeError as exc:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc

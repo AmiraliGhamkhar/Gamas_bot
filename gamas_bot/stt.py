@@ -20,7 +20,7 @@ import logging
 import math
 import mimetypes
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 from pathlib import Path
@@ -187,6 +187,17 @@ async def _error_from_response(
             retry_after_seconds=_retry_after_seconds(response.headers),
         )
     return STTRequestError(f"{label} درخواست را رد کرد (HTTP {response.status}){suffix}")
+
+
+def _transfer_timeout(settings: Settings) -> aiohttp.ClientTimeout:
+    """The deadline of one provider transfer, never of the job.
+
+    ``STT_JOB_TIMEOUT`` bounds how long a transcription may take; it was also
+    being used as the socket read timeout, so one stalled upload could hold a
+    worker for hours. The transfer deadline is its own, much smaller knob: a
+    stalled socket now fails (and the chain moves on) instead of waiting.
+    """
+    return aiohttp.ClientTimeout(total=settings.stt_transfer_timeout)
 
 
 async def _json_response(label: str, response: aiohttp.ClientResponse) -> object:
@@ -385,6 +396,7 @@ async def _speechmatics(
             f"{settings.speechmatics_base_url}/jobs",
             headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
             data=form,
+            timeout=_transfer_timeout(settings),
         ) as response:
             if response.status not in (200, 201, 202):
                 raise await _error_from_response(
@@ -431,6 +443,59 @@ async def _cancel_speechmatics_job(
         logger.warning("could not cancel Speechmatics job_id=%s", job_id, exc_info=True)
 
 
+async def _get_json(
+    label: str,
+    session: aiohttp.ClientSession,
+    url: str,
+    *,
+    settings: Settings,
+    headers: dict[str, str],
+    deadline: float,
+    params: dict[str, str] | None = None,
+) -> object:
+    """One idempotent GET with a bounded transient retry.
+
+    A GET re-reads state; it never re-uploads the audio, so a throttled or
+    dropped status read is retried in place. The submit call is *not* retried
+    anywhere in the chain: repeating it means re-sending gigabytes, which is
+    the failure this retry policy exists to prevent (audit F-3). Retries are
+    bounded and never extend past the chain deadline.
+    """
+    attempt = 0
+    while True:
+        try:
+            async with session.get(
+                url,
+                params=params,
+                headers=headers,
+                timeout=_transfer_timeout(settings),
+            ) as response:
+                if response.status != 200:
+                    raise await _error_from_response(
+                        label, response, api_key=settings.speechmatics_api_key
+                    )
+                return await _json_response(label, response)
+        except (STTTransientError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            if attempt >= MAX_TRANSIENT_RETRIES:
+                raise
+            attempt += 1
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise
+            retry_after = getattr(exc, "retry_after_seconds", None)
+            delay = (
+                min(2.0**attempt, 15.0)
+                if retry_after is None
+                else min(retry_after, MAX_RETRY_AFTER_SECONDS)
+            )
+            delay = min(delay, remaining)
+            logger.warning(
+                "%s read failed (attempt %d/%d); retrying in %.1fs (%s)",
+                label, attempt, MAX_TRANSIENT_RETRIES + 1, delay, type(exc).__name__,
+            )
+            await asyncio.sleep(delay)
+
+
 async def _speechmatics_poll(
     session: aiohttp.ClientSession,
     settings: Settings,
@@ -442,15 +507,14 @@ async def _speechmatics_poll(
     while True:
         if time.monotonic() >= deadline:
             raise STTTransientError("زمان پردازش Speechmatics به پایان رسید.")
-        async with session.get(
+        status_data = await _get_json(
+            "Speechmatics",
+            session,
             f"{settings.speechmatics_base_url}/jobs/{quote(str(job_id), safe='')}",
+            settings=settings,
             headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
-        ) as response:
-            if response.status != 200:
-                raise await _error_from_response(
-                    "Speechmatics", response, api_key=settings.speechmatics_api_key
-                )
-            status_data = await _json_response("Speechmatics", response)
+            deadline=deadline,
+        )
         if not isinstance(status_data, dict):
             raise STTError("Speechmatics پاسخ وضعیت را با ساختار قابل‌خواندن برنگرداند.")
         job = status_data.get("job", status_data)
@@ -467,16 +531,15 @@ async def _speechmatics_poll(
             min(settings.stt_poll_interval, max(0.1, deadline - time.monotonic()))
         )
 
-    async with session.get(
+    result = await _get_json(
+        "Speechmatics",
+        session,
         f"{settings.speechmatics_base_url}/jobs/{quote(str(job_id), safe='')}/transcript",
-        params={"format": "json-v2"},
+        settings=settings,
         headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
-    ) as response:
-        if response.status != 200:
-            raise await _error_from_response(
-                "Speechmatics", response, api_key=settings.speechmatics_api_key
-            )
-        result = await _json_response("Speechmatics", response)
+        params={"format": "json-v2"},
+        deadline=deadline,
+    )
     if not isinstance(result, dict):
         raise STTError("Speechmatics پاسخ متن را با ساختار قابل‌خواندن برنگرداند.")
     text, words = _speechmatics_words(result.get("results"))
@@ -556,6 +619,7 @@ async def _deepgram(
                 "Content-Type": _audio_content_type(audio_path),
             },
             data=audio,
+            timeout=_transfer_timeout(settings),
         ) as response:
             if response.status != 200:
                 raise await _error_from_response(
@@ -632,6 +696,7 @@ async def _openai_compatible(
             _endpoint(settings.stt_openai_base_url, "audio/transcriptions"),
             headers={"Authorization": f"Bearer {settings.stt_openai_api_key}"},
             data=form,
+            timeout=_transfer_timeout(settings),
         ) as response:
             if response.status != 200:
                 body = await read_error_body(response)
@@ -669,6 +734,7 @@ async def _openai_plain(
             _endpoint(settings.stt_openai_base_url, "audio/transcriptions"),
             headers={"Authorization": f"Bearer {settings.stt_openai_api_key}"},
             data=form,
+            timeout=_transfer_timeout(settings),
         ) as response:
             if response.status != 200:
                 raise await _error_from_response(
@@ -716,10 +782,6 @@ PROVIDERS: dict[str, ProviderSpec] = {
     ),
 }
 
-#: Bounded per-provider retries for transient failures.
-MAX_TRANSIENT_RETRIES = 2
-
-
 def provider_upload_limit(slug: str, settings: Settings) -> int:
     """The upload ceiling of one provider, honouring the configurable one."""
     if slug == "openai_compatible":
@@ -745,46 +807,34 @@ def largest_configured_upload(settings: Settings) -> int | None:
     return max(limits) if limits else None
 
 
-async def _attempt_with_retries(
+#: Bounded per-provider retries for transient failures. They apply to
+#: *idempotent reads only* (``GET`` status/transcript calls): a transient
+#: submit failure fails over to the next provider instead of re-uploading the
+#: file, because repeating a multi-gigabyte POST inside one 6-hour budget is the
+#: failure mode this policy exists to prevent (audit F-3).
+MAX_TRANSIENT_RETRIES = 2
+
+
+async def _attempt_provider(
     spec: ProviderSpec, session: aiohttp.ClientSession, audio_path: Path, settings: Settings
 ) -> RawTranscript:
-    attempt = 0
-    while True:
-        try:
-            return await spec.run(session, audio_path, settings)
-        except STTTransientError as exc:
-            if attempt >= MAX_TRANSIENT_RETRIES:
-                _set_cooldown(spec.slug, TRANSIENT_COOLDOWN_SECONDS)
-                raise
-            attempt += 1
-            retry_after = exc.retry_after_seconds
-            if retry_after is None:
-                delay = min(2.0**attempt, 15.0)
-            else:
-                # Respect Retry-After, but never sleep for minutes: the budget
-                # is bounded and the next provider must stay reachable.
-                delay = min(retry_after, MAX_RETRY_AFTER_SECONDS)
-            logger.warning(
-                "STT provider %s transient failure (attempt %d/%d); retrying in %.1fs: %s",
-                spec.slug, attempt, MAX_TRANSIENT_RETRIES + 1, delay, exc,
-            )
-            await asyncio.sleep(delay)
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            if attempt >= MAX_TRANSIENT_RETRIES:
-                _set_cooldown(spec.slug, TRANSIENT_COOLDOWN_SECONDS)
-                raise STTTransientError(
-                    f"{spec.label} پس از چند تلاش در دسترس نبود."
-                ) from exc
-            attempt += 1
-            delay = min(2.0**attempt, 15.0)
-            logger.warning(
-                "STT provider %s network failure (attempt %d/%d); retrying in %.1fs (%s)",
-                spec.slug, attempt, MAX_TRANSIENT_RETRIES + 1, delay, type(exc).__name__,
-            )
-            await asyncio.sleep(delay)
-        except STTAuthenticationError:
-            _set_cooldown(spec.slug, AUTH_COOLDOWN_SECONDS)
-            raise
+    """One provider attempt: submit once, never re-upload on a transient error.
+
+    The provider reads its own deadline from ``settings.stt_job_timeout``; the
+    chain passes a copy narrowed to the time it has left, so every attempt in
+    the chain shares one budget instead of each getting a fresh one.
+    """
+    try:
+        return await spec.run(session, audio_path, settings)
+    except STTAuthenticationError:
+        _set_cooldown(spec.slug, AUTH_COOLDOWN_SECONDS)
+        raise
+    except (STTTransientError, aiohttp.ClientError, asyncio.TimeoutError):
+        # The provider is degraded, not the audio: rest it briefly and let the
+        # chain try the next engine with a *fresh* submit (the upload already
+        # happened once).
+        _set_cooldown(spec.slug, TRANSIENT_COOLDOWN_SECONDS)
+        raise
 
 
 async def transcribe(
@@ -804,6 +854,11 @@ async def transcribe(
         )
     try:
         failures: list[str] = []
+        # One budget for the whole chain: every eligible provider shares it, and
+        # each attempt sees only what is left of it. Previously each attempt
+        # restarted the full ``STT_JOB_TIMEOUT``, so a chain of retries could run
+        # for days on a multi-hour lecture.
+        deadline = time.monotonic() + settings.stt_job_timeout
         # Skips (cooldown, upload ceiling) are not failures: they must not be
         # reported as if the provider had tried and rejected the audio.
         skipped: list[str] = []
@@ -832,13 +887,30 @@ async def transcribe(
                 )
                 skipped.append(f"{spec.label} سقف حجم {limit_mb}MB دارد")
                 continue
+            remaining_budget = deadline - time.monotonic()
+            if remaining_budget <= 0:
+                logger.warning(
+                    "STT chain deadline exhausted before provider %s (budget=%.0fs)",
+                    slug, settings.stt_job_timeout,
+                )
+                failures.append(
+                    f"مهلت زنجیرهٔ تبدیل گفتار ({int(settings.stt_job_timeout)}s) به پایان رسید"
+                )
+                break
             logger.info(
                 "STT attempt provider=%s bytes=%s model=%s language=%s",
                 slug, size, _provider_model(slug, settings), settings.stt_language or "auto",
             )
+            attempt_settings = (
+                settings
+                if remaining_budget >= settings.stt_job_timeout
+                else replace(settings, stt_job_timeout=remaining_budget)
+            )
             started = time.monotonic()
             try:
-                result = await _attempt_with_retries(spec, session, audio_path, settings)
+                result = await _attempt_provider(
+                    spec, session, audio_path, attempt_settings
+                )
                 logger.info(
                     "STT done provider=%s bytes=%s elapsed_seconds=%.1f",
                     result.engine or slug, size, time.monotonic() - started,
@@ -858,7 +930,8 @@ async def transcribe(
                 failures.append(str(exc))
             except STTTransientError as exc:
                 logger.warning(
-                    "STT provider %s transient failure exhausted after %.1fs: %s",
+                    "STT provider %s transient failure after %.1fs; failing over "
+                    "without re-uploading: %s",
                     slug, time.monotonic() - started, exc,
                 )
                 failures.append(str(exc))

@@ -16,6 +16,7 @@ exercised on honest content instead of on hand-written shapes.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import re
 import tempfile
@@ -24,7 +25,8 @@ from pathlib import Path
 from unittest import mock
 
 from gamas_bot import notes as notes_module
-from gamas_bot.bot import GamasBot, raw_parts
+from gamas_bot import stt
+from gamas_bot.bot import DownloadStalledError, GamasBot, _download_media_limited, raw_parts
 from gamas_bot.db import Database
 from gamas_bot.jobs import Job
 from gamas_bot.notes import (
@@ -37,7 +39,12 @@ from gamas_bot.notes import (
     gate_notes,
     structure_transcript,
 )
-from tests.support import FakeJobEvent, FakeTelegramClient, make_settings
+from tests.support import (
+    FakeJobEvent,
+    FakeTelegramClient,
+    FakeTelegramMessage,
+    make_settings,
+)
 
 #: The booklet block of a compile or repair request (both embed it verbatim).
 _BOOKLET_RE = re.compile(r"### جزوهٔ فعلی[^\n]*\n(\{.*?\})\n\n### ", re.DOTALL)
@@ -420,6 +427,202 @@ class RawFallbackDeliveryTests(unittest.IsolatedAsyncioTestCase):
         # The original .txt is untouched and no part file is left behind.
         self.assertEqual(sorted(path.name for path in raw_path.parent.glob("raw.*")),
                          ["raw.txt"])
+
+
+
+
+class RecordingSession:
+    """Scripted POST/GET responses that record every call's arguments."""
+
+    def __init__(self, *, posts, gets):
+        self.posts = list(posts)
+        self.gets = list(gets)
+        self.post_kwargs: list[dict] = []
+        self.get_kwargs: list[dict] = []
+
+    def post(self, _url, **kwargs):
+        self.post_kwargs.append(kwargs)
+        return _AsyncCM(self.posts.pop(0))
+
+    def get(self, _url, **kwargs):
+        self.get_kwargs.append(kwargs)
+        return _AsyncCM(self.gets.pop(0))
+
+
+class _Clock:
+    """A monotonic clock a test can advance (patched into ``gamas_bot.stt``)."""
+
+    def __init__(self) -> None:
+        self.now = 1_000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def audio_file(name: str = "large.wav") -> Path:
+    path = Path(tempfile.gettempdir()) / f"gamas-large-{name}"
+    path.write_bytes(b"fake-audio")
+    return path
+
+
+class ChainDeadlineAndTransferTests(unittest.IsolatedAsyncioTestCase):
+    """F-3/F-6: one chain deadline, no re-upload, bounded transfers."""
+
+    async def test_the_whole_chain_shares_one_deadline(self):
+        clock = _Clock()
+        calls: list[str] = []
+
+        async def slow_run(_session, _path, _settings):
+            calls.append("speechmatics")
+            clock.now += 1_000.0  # well past the 60s chain budget
+            raise stt.STTTransientError("hiccup")
+
+        async def should_not_run(_session, _path, _settings):
+            calls.append("deepgram")
+            return stt.RawTranscript.from_text("متن", engine="deepgram")
+
+        settings = make_settings(
+            stt_providers=("speechmatics", "deepgram"), stt_job_timeout=60.0
+        )
+        with mock.patch.dict(
+            stt.PROVIDERS,
+            {
+                "speechmatics": replace_run(stt.PROVIDERS["speechmatics"], slow_run),
+                "deepgram": replace_run(stt.PROVIDERS["deepgram"], should_not_run),
+            },
+        ), mock.patch.object(stt, "time", clock):
+            with self.assertRaises(stt.STTError) as ctx:
+                await stt.transcribe(audio_file(), settings, session=object())
+        # The second provider is not started on a budget that is already spent.
+        self.assertEqual(calls, ["speechmatics"])
+        self.assertIn("مهلت", str(ctx.exception))
+
+    async def test_a_transient_submit_failure_never_repeats_the_upload(self):
+        calls: list[str] = []
+
+        async def throttled_run(_session, _path, _settings):
+            calls.append("speechmatics")
+            raise stt.STTTransientError("hiccup")
+
+        async def working_run(_session, _path, _settings):
+            calls.append("deepgram")
+            return stt.RawTranscript.from_text("متن", engine="deepgram")
+
+        settings = make_settings(stt_providers=("speechmatics", "deepgram"))
+        with mock.patch.dict(
+            stt.PROVIDERS,
+            {
+                "speechmatics": replace_run(stt.PROVIDERS["speechmatics"], throttled_run),
+                "deepgram": replace_run(stt.PROVIDERS["deepgram"], working_run),
+            },
+        ), mock.patch.object(asyncio, "sleep", new=_noop_sleep):
+            raw = await stt.transcribe(audio_file(), settings, session=object())
+        self.assertEqual(raw.text, "متن")
+        # One submit each: never a second upload to the same provider.
+        self.assertEqual(calls, ["speechmatics", "deepgram"])
+
+    async def test_every_provider_request_carries_the_transfer_deadline(self):
+        settings = make_settings(
+            stt_providers=("speechmatics",),
+            stt_transfer_timeout=123.0,
+            stt_poll_interval=0.01,
+        )
+        session = RecordingSession(
+            posts=[_FakeResponse(202, {"id": "job-1"})],
+            gets=[
+                _FakeResponse(200, {"job": {"status": "done"}}),
+                _FakeResponse(200, {"results": [
+                    {"type": "word", "start_time": 0.0, "end_time": 0.4,
+                     "alternatives": [{"content": "سلام"}]},
+                ]}),
+            ],
+        )
+        await stt._speechmatics(session, audio_file(), settings)
+        timeouts = [kwargs["timeout"].total for kwargs in session.post_kwargs]
+        timeouts.extend(kwargs["timeout"].total for kwargs in session.get_kwargs)
+        self.assertEqual(len(timeouts), 3)
+        self.assertTrue(all(total == 123.0 for total in timeouts), timeouts)
+
+
+async def _noop_sleep(*_args, **_kwargs):
+    return None
+
+
+def replace_run(spec, run):
+    from dataclasses import replace
+
+    return replace(spec, run=run)
+
+
+class DownloadWatchdogTests(unittest.IsolatedAsyncioTestCase):
+    """F-6: a stalled Telegram download is aborted instead of holding a worker."""
+
+    async def test_a_stalled_download_aborts_and_removes_the_partial_file(self):
+        async def stalled(file, *, progress_callback=None):
+            progress_callback(64, 0)  # one chunk, then silence forever
+            await asyncio.sleep(3600)
+
+        with tempfile.TemporaryDirectory() as folder:
+            message = FakeTelegramMessage(
+                FakeTelegramClient(), chat_id=1, message_id=2, download=stalled
+            )
+            target = Path(folder) / "stalled.bin"
+            with mock.patch("gamas_bot.bot.time.monotonic", side_effect=_fast_clock):
+                with self.assertRaises(DownloadStalledError):
+                    await _download_media_limited(
+                        message, target, 1024, stall_seconds=0.05
+                    )
+            self.assertFalse(target.exists())
+
+
+def _fast_clock():
+    """A monotonic clock that moves 1s per call, so a stall is detected fast."""
+    _fast_clock.now += 1.0
+    return _fast_clock.now
+
+
+_fast_clock.now = 0.0
+
+
+class IntakeAdmissionTests(unittest.IsolatedAsyncioTestCase):
+    """F-4: an unknown duration is not an exemption from the balance check."""
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "intake.db",
+            temp_dir=root / "tmp",
+            receipt_dir=root / "receipts",
+        )
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.user_id = 707
+        await self.db.ensure_user(self.user_id)
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.event = FakeJobEvent()
+        self.bot.client = self.event.client
+
+    async def asyncTearDown(self) -> None:
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def test_an_unknown_duration_is_refused_when_the_floor_is_not_covered(self):
+        event = FakeJobEvent()
+        with mock.patch.object(
+            GamasBot, "_reserve_estimate", staticmethod(lambda _duration: 10**9)
+        ):
+            await self.bot._accept_media(event, self.user_id, "video", "big.mp4", None)
+        self.assertTrue(any("اعتبار" in reply for reply in event.replies), event.replies)
+        self.assertEqual(await self.db.user_submissions(self.user_id), [])
+
+    def test_the_floor_for_an_unknown_duration_is_the_documented_estimate(self):
+        self.assertEqual(GamasBot._reserve_estimate(None), 600)
+        self.assertEqual(GamasBot._reserve_estimate(0), 600)
+        self.assertEqual(GamasBot._reserve_estimate(42.2), 43)
 
 
 if __name__ == "__main__":  # pragma: no cover

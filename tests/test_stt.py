@@ -473,22 +473,31 @@ class FailoverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raw.engine, "deepgram")
         self.assertEqual(calls, ["speechmatics", "deepgram"])
 
-    async def test_network_error_retries_before_failover(self):
-        settings = make_settings(stt_providers=("speechmatics",))
-        attempts = {"n": 0}
+    async def test_a_network_error_fails_over_without_a_second_upload(self):
+        """A submit is never repeated: the next provider gets a fresh upload."""
+        settings = make_settings(stt_providers=("speechmatics", "deepgram"))
+        calls = []
 
-        async def flaky_run(_session, _path, _settings):
-            attempts["n"] += 1
-            if attempts["n"] == 1:
-                raise stt.aiohttp.ClientConnectionError("temporary connection issue")
-            return stt.RawTranscript.from_text("متن", engine="speechmatics")
+        async def broken_run(_session, _path, _settings):
+            calls.append("speechmatics")
+            raise stt.aiohttp.ClientConnectionError("temporary connection issue")
 
-        spec = replace(PROVIDERS["speechmatics"], run=flaky_run)
-        with mock.patch.dict(stt.PROVIDERS, {"speechmatics": spec}):
+        async def working_run(_session, _path, _settings):
+            calls.append("deepgram")
+            return stt.RawTranscript.from_text("متن", engine="deepgram")
+
+        with mock.patch.dict(
+            stt.PROVIDERS,
+            {
+                "speechmatics": self.provider_with_run("speechmatics", broken_run),
+                "deepgram": self.provider_with_run("deepgram", working_run),
+            },
+        ):
             with mock.patch.object(asyncio, "sleep", new=_noop_sleep):
                 raw = await transcribe(audio_file(), settings, session=object())
         self.assertEqual(raw.text, "متن")
-        self.assertEqual(attempts["n"], 2)
+        # Exactly one attempt per provider: the 4-hour upload happened once.
+        self.assertEqual(calls, ["speechmatics", "deepgram"])
 
     async def test_all_failures_reported(self):
         settings = make_settings(stt_providers=("speechmatics", "deepgram"))
@@ -571,71 +580,74 @@ class FailoverTests(unittest.IsolatedAsyncioTestCase):
                 await transcribe(audio_file("over-limit.wav"), settings, session=object())
         self.assertEqual(calls, [])
 
-    async def test_transient_retries_then_succeeds(self):
-        settings = make_settings(stt_providers=("speechmatics",))
-        attempts = {"n": 0}
+    async def test_a_transient_submit_failure_fails_over_instead_of_re_uploading(self):
+        settings = make_settings(stt_providers=("speechmatics", "deepgram"))
+        calls = []
 
-        async def flaky_run(_session, _path, _settings):
-            attempts["n"] += 1
-            if attempts["n"] == 1:
-                raise STTTransientError("hiccup")
-            return stt.RawTranscript.from_text("ok", engine="speechmatics")
+        async def throttled_run(_session, _path, _settings):
+            calls.append("speechmatics")
+            raise STTTransientError("hiccup", retry_after_seconds=3600.0)
 
-        spec = replace(PROVIDERS["speechmatics"], run=flaky_run)
-        with mock.patch.dict(stt.PROVIDERS, {"speechmatics": spec}):
+        async def working_run(_session, _path, _settings):
+            calls.append("deepgram")
+            return stt.RawTranscript.from_text("ok", engine="deepgram")
+
+        with mock.patch.dict(
+            stt.PROVIDERS,
+            {
+                "speechmatics": self.provider_with_run("speechmatics", throttled_run),
+                "deepgram": self.provider_with_run("deepgram", working_run),
+            },
+        ):
             with mock.patch.object(asyncio, "sleep", new=_noop_sleep):
                 raw = await transcribe(audio_file(), settings, session=object())
         self.assertEqual(raw.text, "ok")
-        self.assertEqual(attempts["n"], 2)
+        self.assertEqual(calls, ["speechmatics", "deepgram"])
 
-    async def test_retry_after_is_respected_but_bounded(self):
-        """A provider must not be able to park a job for hours."""
-        settings = make_settings(stt_providers=("speechmatics",))
+    async def test_a_transient_status_read_is_retried_within_the_deadline(self):
+        """The only retries left are idempotent GETs: no upload is repeated."""
+        settings = make_settings(
+            stt_providers=("speechmatics",), stt_poll_interval=0.01
+        )
         delays: list[float] = []
+
+        async def record_sleep(delay, *_args, **_kwargs):
+            delays.append(delay)
+
+        session = FakeSession(
+            posts=[FakeResponse(202, {"id": "job-1"})],
+            gets=[
+                FakeResponse(429, {"error": "slow down"}, {"Retry-After": "3600"}),
+                FakeResponse(200, {"job": {"status": "done"}}),
+                FakeResponse(200, {"results": [
+                    {"type": "word", "start_time": 0.0, "end_time": 0.4,
+                     "alternatives": [{"content": "سلام"}]},
+                ]}),
+            ],
+        )
+        with mock.patch.object(asyncio, "sleep", new=record_sleep):
+            raw = await stt._speechmatics(session, audio_file(), settings)
+        self.assertEqual(raw.text, "سلام")
+        # One bounded retry of the status read, and the hour-long Retry-After
+        # was clamped instead of parking the job.
+        self.assertEqual(len(delays), 1)
+        self.assertLessEqual(delays[0], stt.MAX_RETRY_AFTER_SECONDS)
+        self.assertEqual(len(session.post_calls), 1)
+
+    async def test_a_transient_submit_error_of_the_last_provider_is_reported(self):
+        settings = make_settings(stt_providers=("speechmatics",))
         attempts = {"n": 0}
 
         async def throttled_run(_session, _path, _settings):
             attempts["n"] += 1
             raise STTTransientError("slow down", retry_after_seconds=3600.0)
 
-        async def record_sleep(delay, *_args, **_kwargs):
-            delays.append(delay)
-
         spec = replace(PROVIDERS["speechmatics"], run=throttled_run)
         with mock.patch.dict(stt.PROVIDERS, {"speechmatics": spec}):
-            with mock.patch.object(asyncio, "sleep", new=record_sleep):
+            with mock.patch.object(asyncio, "sleep", new=_noop_sleep):
                 with self.assertRaises(stt.STTError):
                     await transcribe(audio_file(), settings, session=object())
-        self.assertEqual(attempts["n"], stt.MAX_TRANSIENT_RETRIES + 1)
-        self.assertEqual(len(delays), stt.MAX_TRANSIENT_RETRIES)
-        # The provider asked for an hour; the job waits the bounded maximum.
-        self.assertTrue(all(delay <= stt.MAX_RETRY_AFTER_SECONDS for delay in delays))
-        self.assertTrue(all(delay < 3600.0 for delay in delays))
-
-    async def test_transient_exhaustion_fails_over_to_the_next_provider(self):
-        settings = make_settings(stt_providers=("speechmatics", "deepgram"))
-        calls = []
-
-        async def unavailable(_session, _path, _settings):
-            calls.append("speechmatics")
-            raise STTTransientError("server error")
-
-        async def working(_session, _path, _settings):
-            calls.append("deepgram")
-            return stt.RawTranscript.from_text("متن", engine="deepgram")
-
-        with mock.patch.dict(
-            stt.PROVIDERS,
-            {
-                "speechmatics": self.provider_with_run("speechmatics", unavailable),
-                "deepgram": self.provider_with_run("deepgram", working),
-            },
-        ):
-            with mock.patch.object(asyncio, "sleep", new=_noop_sleep):
-                raw = await transcribe(audio_file(), settings, session=object())
-        self.assertEqual(raw.engine, "deepgram")
-        # The bounded budget is 1 initial attempt + MAX_TRANSIENT_RETRIES.
-        self.assertEqual(calls, ["speechmatics"] * (stt.MAX_TRANSIENT_RETRIES + 1) + ["deepgram"])
+        self.assertEqual(attempts["n"], 1)
 
     async def test_configured_order_is_respected(self):
         settings = make_settings(stt_providers=("deepgram", "speechmatics"))
