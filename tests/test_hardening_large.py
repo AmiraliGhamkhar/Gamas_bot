@@ -22,11 +22,19 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from gamas_bot import notes as notes_module
 from gamas_bot import stt
-from gamas_bot.bot import DownloadStalledError, GamasBot, _download_media_limited, raw_parts
+from gamas_bot.bot import (
+    DiskSpaceError,
+    DownloadStalledError,
+    GamasBot,
+    _download_media_limited,
+    _ensure_disk_headroom,
+    raw_parts,
+)
 from gamas_bot.db import Database
 from gamas_bot.jobs import Job
 from gamas_bot.notes import (
@@ -623,6 +631,81 @@ class IntakeAdmissionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(GamasBot._reserve_estimate(None), 600)
         self.assertEqual(GamasBot._reserve_estimate(0), 600)
         self.assertEqual(GamasBot._reserve_estimate(42.2), 43)
+
+
+
+
+class DiskHeadroomTests(unittest.TestCase):
+    """F-5: a download that cannot fit the temp filesystem is refused."""
+
+    def test_the_floor_and_the_estimate_are_both_respected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with mock.patch(
+                "gamas_bot.bot.shutil.disk_usage",
+                return_value=SimpleNamespace(
+                    total=100, used=90, free=10
+                ),
+            ):
+                # 10 GiB free is plenty for 4 + 2.
+                _ensure_disk_headroom(Path(folder), 4, reserve_bytes=2)
+                with self.assertRaises(DiskSpaceError):
+                    _ensure_disk_headroom(Path(folder), 9, reserve_bytes=2)
+
+
+class DiskRefusalPipelineTests(unittest.IsolatedAsyncioTestCase):
+    """F-5: the refusal happens before the download, and nothing is charged."""
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "disk.db",
+            temp_dir=root / "tmp",
+            receipt_dir=root / "receipts",
+            temp_min_free_bytes=10**12,
+        )
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.user_id = 606
+        await self.db.ensure_user(self.user_id)
+        await self.db.add_credit(self.user_id, 3600, note="test")
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+
+    async def asyncTearDown(self) -> None:
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def test_a_full_temp_disk_refuses_the_job_before_downloading(self):
+        from gamas_bot.progress import JobProgress
+
+        source = Path(self._tmp.name) / "lecture.wav"
+        source.write_bytes(b"RIFF" + b"\0" * 64)
+        event = FakeJobEvent(source=source)
+        self.bot.client = event.client
+        submission = await self.db.create_submission(self.user_id, "audio", "a.wav")
+        progress = await JobProgress.create(event, submission_id=submission)
+        job = Job(
+            submission_id=submission,
+            user_id=self.user_id,
+            kind="audio",
+            filename="lecture.wav",
+            message=event.message,
+            is_admin=False,
+            meta={"progress": progress},
+        )
+        await self.bot._run_job(job)
+
+        status = (await self.db.submission(submission)).status
+        self.assertNotEqual(status, "done")
+        # The download never started, and the finished-work debit never happened.
+        self.assertEqual(event.file_paths, [])
+        self.assertEqual(await self.db.available_seconds(self.user_id), 3600)
+        self.assertTrue(
+            any("فضای موقت" in reply for reply in event.replies), event.replies
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

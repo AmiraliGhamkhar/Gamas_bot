@@ -135,6 +135,10 @@ class DownloadStalledError(ValueError):
     """A Telegram download produced no bytes for the configured stall window."""
 
 
+class DiskSpaceError(ValueError):
+    """The temporary filesystem cannot hold the job's files."""
+
+
 USER_VISIBLE_ERRORS = (
     ValueError,
     PresentationError,
@@ -345,6 +349,29 @@ def _normalize_receipt_image(path: Path, *, max_bytes: int) -> bool:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _ensure_disk_headroom(
+    directory: Path, required_bytes: int, *, reserve_bytes: int = 0
+) -> None:
+    """Refuse a download that would leave the temp filesystem below its floor.
+
+    A long lecture briefly needs the downloaded source *and* the prepared audio
+    copy, so the estimate is twice the upload. ``TEMP_MIN_FREE_BYTES`` is the
+    operator's floor: it protects the other jobs' temporary directories and the
+    SQLite database from a full disk. Without this check a full disk surfaced as
+    an opaque provider failure after the whole multi-gigabyte download had been
+    written (audit F-5).
+    """
+    free = shutil.disk_usage(directory).free
+    if free < required_bytes + reserve_bytes:
+        logger.warning(
+            "temp disk headroom refused: free=%d required=%d reserve=%d dir=%s",
+            free, required_bytes, reserve_bytes, directory,
+        )
+        raise DiskSpaceError(
+            "فضای موقت سرور برای این فایل کافی نیست؛ لطفاً کمی بعد دوباره بفرستید."
+        )
 
 
 async def _download_media_limited(
@@ -1611,6 +1638,18 @@ class GamasBot:
         if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
             suffix = ".media"
         source_path = workdir / f"source{suffix}"
+        reported_size = getattr(getattr(job.message, "file", None), "size", None)
+        upload_bytes = (
+            reported_size
+            if isinstance(reported_size, int) and reported_size > 0
+            else self.settings.max_file_size
+        )
+        # The download and the prepared audio can both exist at once.
+        _ensure_disk_headroom(
+            self.settings.temp_dir,
+            upload_bytes * 2,
+            reserve_bytes=self.settings.temp_min_free_bytes,
+        )
         await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
         try:
             await _download_media_limited(
