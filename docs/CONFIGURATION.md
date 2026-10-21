@@ -41,6 +41,10 @@ Use a real numeric Telegram user ID for each admin, separated by commas. Configu
 | `MAX_ACTIVE_JOBS_PER_USER` | Per-user admission cap (default `2`). Lower it to stop one user from queueing work their balance cannot cover. |
 | `OFFICE_MIN_INTERVAL_SECONDS` | Minimum gap between two Free Office documents for one user (default `10`; `0` disables). The section is free but may call the note model. |
 | `MAX_FILE_SIZE` | Lower it to fit the host's upload and temporary-disk limits. |
+| `TEMP_MIN_FREE_BYTES`, `DOWNLOAD_STALL_SECONDS` | Free space that must remain on `TEMP_DIR` before a download (default `2 GiB`) and the no-progress window that aborts a stalled download (default `300`). See [Media](MEDIA.md). |
+| `STT_TRANSFER_TIMEOUT_SECONDS`, `MAX_STT_RESPONSE_BYTES` | Deadline of one provider transfer (default `600`) and the response-body ceiling (default `64 MiB`). See [STT providers](STT_PROVIDERS.md). |
+| `RAW_FALLBACK_FILE_CHARS`, `RAW_FALLBACK_MAX_FILES` | Size of one raw-transcript file part (default `100 000` characters) and the maximum number of parts (default `8`) used when the single `.txt` upload fails. |
+| `TRANSCRIPT_RETENTION_DAYS` | Days to keep a finished transcript's text (`0` = keep forever). The daily sweep only deletes rows of `done`/`failed`/`rejected` jobs. |
 | `PRESENTATION_MAX_TEMP_BYTES` | Keep it below the available scratch-disk space. |
 | `DB_PATH`, `TELEGRAM_SESSION`, `TEMP_DIR`, `RECEIPT_DIR`, `LOG_FILE` | Relative paths resolve from the project directory, not the current shell directory. Keep data outside `public_html`. |
 | `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME` | Set these to enable card-to-card purchases. Admins review receipts manually. |

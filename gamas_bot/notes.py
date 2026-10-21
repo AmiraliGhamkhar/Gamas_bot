@@ -2584,10 +2584,11 @@ async def _compile_pass(
     # Level 2 (the last one): a final merge of the compiled groups, only when
     # the compile shortened the booklet enough that it now fits one request.
     if MAX_COMPILE_LEVELS >= 2:
-        if len(build_compile_document(context, accepted)) > budget:
+        assembled_chars = len(build_compile_document(context, accepted))
+        if assembled_chars > budget:
             logger.info(
                 "compile pass level 2 skipped: assembled_chars=%d budget=%d",
-                len(build_compile_document(context, accepted)), budget,
+                assembled_chars, budget,
             )
             return accepted
         final = await _compile_once(

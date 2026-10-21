@@ -27,9 +27,10 @@ The raw transcript is saved and delivered before note generation. PowerPoint nar
 
 ## Operating rules
 
-- The in-memory queue is bounded by `MAX_ACTIVE_JOBS` and `MAX_QUEUED_JOBS`; excess work is rejected.
+- The in-memory queue is bounded by `MAX_ACTIVE_JOBS` and `MAX_QUEUED_JOBS`; excess work is rejected. Dispatch is round-robin across users (a user's own jobs keep their order, and a user whose job just finished goes to the back), so one person's backlog cannot occupy every worker for hours.
 - Each user may hold at most `MAX_ACTIVE_JOBS_PER_USER` pending/processing submissions; the cap is checked in the same write transaction that creates the row, so two fast uploads cannot both pass.
 - The media worker runs with a timeout and no shell. `av` supplies media libraries; system FFmpeg is not required.
 - SQLite migrations run at startup. Billing writes are transactional; a job hold is settled or released according to the raw-transcript delivery milestone.
 - A lock on the Telegram session prevents duplicate polling. Keep the session and database on a local writable filesystem.
+- A lecture whose booklet exceeds one note request is compiled and repaired in bounded whole-section groups instead of skipping those passes; see [Note quality](NOTE_QUALITY.md).
 - Provider output is untrusted and is checked before a note is delivered. See [Billing](BILLING.md), [Security](SECURITY.md) and [Note quality](NOTE_QUALITY.md).
