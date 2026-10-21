@@ -35,6 +35,7 @@ from .config import (
     SPEECHMATICS_MAX_UPLOAD,
     Settings,
 )
+from .http_util import read_error_body
 from .transcript import RawTranscript, Word
 
 logger = logging.getLogger(__name__)
@@ -155,7 +156,7 @@ async def _error_from_response(
     api_key: str | None = None,
     body: bytes | None = None,
 ) -> STTError:
-    body = await response.read() if body is None else body
+    body = await read_error_body(response) if body is None else body
     detail = None
     try:
         import json
@@ -396,7 +397,48 @@ async def _speechmatics(
     if not isinstance(job_id, (str, int)) or isinstance(job_id, bool) or not str(job_id):
         raise STTError("Speechmatics شناسهٔ پردازش را برنگرداند.")
 
-    deadline = time.monotonic() + settings.stt_job_timeout
+    try:
+        return await _speechmatics_poll(
+            session, settings, str(job_id), submitted_at=time.monotonic()
+        )
+    except BaseException:
+        # A rejected, timed-out or cancelled job keeps running (and billing)
+        # on the provider side; deleting it is the only way to stop that.
+        await _cancel_speechmatics_job(session, settings, str(job_id))
+        raise
+
+
+async def _cancel_speechmatics_job(
+    session: aiohttp.ClientSession, settings: Settings, job_id: str
+) -> None:
+    """Best-effort DELETE of an abandoned Speechmatics job.
+
+    The client session is not always an ``aiohttp.ClientSession`` (tests and
+    local gateways use a stub), so a missing ``delete`` is not an error.
+    """
+    delete = getattr(session, "delete", None)
+    if delete is None:
+        return
+    try:
+        async with delete(
+            f"{settings.speechmatics_base_url}/jobs/{quote(job_id, safe='')}",
+            headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
+        ) as response:
+            logger.info(
+                "Speechmatics job cancelled job_id=%s status=%s", job_id, response.status
+            )
+    except Exception:
+        logger.warning("could not cancel Speechmatics job_id=%s", job_id, exc_info=True)
+
+
+async def _speechmatics_poll(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    job_id: str,
+    *,
+    submitted_at: float,
+) -> RawTranscript:
+    deadline = submitted_at + settings.stt_job_timeout
     while True:
         if time.monotonic() >= deadline:
             raise STTTransientError("زمان پردازش Speechmatics به پایان رسید.")
@@ -592,7 +634,7 @@ async def _openai_compatible(
             data=form,
         ) as response:
             if response.status != 200:
-                body = await response.read()
+                body = await read_error_body(response)
                 retry_plain = response.status == 400 and _rejects_verbose_json(body)
                 if not retry_plain:
                     raise await _error_from_response(
@@ -678,6 +720,31 @@ PROVIDERS: dict[str, ProviderSpec] = {
 MAX_TRANSIENT_RETRIES = 2
 
 
+def provider_upload_limit(slug: str, settings: Settings) -> int:
+    """The upload ceiling of one provider, honouring the configurable one."""
+    if slug == "openai_compatible":
+        return settings.stt_openai_max_upload
+    spec = PROVIDERS.get(slug)
+    return spec.max_upload if spec is not None else settings.max_file_size
+
+
+def largest_configured_upload(settings: Settings) -> int | None:
+    """The biggest file any *configured* provider accepts, or ``None``.
+
+    Media preparation runs before the failover chain: a merged WAV that no
+    configured provider accepts fails the job after the download, the decode
+    and the merge. Targeting the largest reachable ceiling (Opus when WAV would
+    not fit) turns that late failure into a format choice that can succeed.
+    """
+    limits = [
+        provider_upload_limit(slug, settings)
+        for slug in settings.stt_providers
+        if (PROVIDERS.get(slug) is not None
+            and PROVIDERS[slug].configured(settings))
+    ]
+    return max(limits) if limits else None
+
+
 async def _attempt_with_retries(
     spec: ProviderSpec, session: aiohttp.ClientSession, audio_path: Path, settings: Settings
 ) -> RawTranscript:
@@ -737,6 +804,9 @@ async def transcribe(
         )
     try:
         failures: list[str] = []
+        # Skips (cooldown, upload ceiling) are not failures: they must not be
+        # reported as if the provider had tried and rejected the audio.
+        skipped: list[str] = []
         logger.info(
             "STT failover chain providers=%s bytes=%s language=%s",
             ",".join(settings.stt_providers), size, settings.stt_language or "auto",
@@ -751,20 +821,16 @@ async def transcribe(
                 logger.warning(
                     "STT provider %s in cooldown for %.0fs more; skipped", slug, remaining
                 )
-                failures.append(f"{spec.label} در حال استراحت ({int(remaining)}s)")
+                skipped.append(f"{spec.label} در حال استراحت ({int(remaining)}s)")
                 continue
-            max_upload = (
-                settings.stt_openai_max_upload
-                if slug == "openai_compatible"
-                else spec.max_upload
-            )
+            max_upload = provider_upload_limit(slug, settings)
             if size > max_upload:
                 limit_mb = max(1, math.ceil(max_upload / 1_000_000))
                 logger.warning(
                     "STT provider %s skipped: file is %s bytes, over its %s byte ceiling",
                     slug, size, max_upload,
                 )
-                failures.append(f"{spec.label} سقف حجم {limit_mb}MB دارد")
+                skipped.append(f"{spec.label} سقف حجم {limit_mb}MB دارد")
                 continue
             logger.info(
                 "STT attempt provider=%s bytes=%s model=%s language=%s",
@@ -812,10 +878,19 @@ async def transcribe(
                 failures.append(f"{spec.label} در دسترس نبود")
         if failures:
             logger.error(
-                "STT exhausted every eligible provider (%d attempted/skipped): %s",
-                len(failures), " | ".join(failures),
+                "STT exhausted every eligible provider (%d attempted, %d skipped): %s",
+                len(failures), len(skipped), " | ".join(failures + skipped),
             )
             raise STTError("؛ ".join(failures))
+        if skipped:
+            # Every provider was skipped without a single attempt: a cooldown
+            # or an upload ceiling. That is temporary/operational, not a
+            # transcription failure, and the wording must say so.
+            logger.warning("STT skipped every eligible provider: %s", " | ".join(skipped))
+            raise STTTransientError(
+                "سرویس تبدیل گفتار همین حالا در دسترس نیست؛ چند دقیقهٔ دیگر "
+                "دوباره بفرستید. " + "؛ ".join(skipped)
+            )
         raise STTConfigurationError(
             "هیچ سرویس تبدیل گفتاری پیکربندی نشده است "
             "(SPEECHMATICS_API_KEY، DEEPGRAM_API_KEY یا STT_OPENAI_BASE_URL+STT_OPENAI_API_KEY)."

@@ -22,6 +22,7 @@ from lxml import etree
 
 from .config import Settings
 from .media import merge_audio_tracks, needs_transcode, probe_media_many
+from .stt import largest_configured_upload
 from .transcript import RawTranscript, Word, build_document
 
 logger = logging.getLogger(__name__)
@@ -1205,12 +1206,24 @@ async def prepare_audio(
             "مدت صدای ادغام‌شدهٔ این ارائه (با فاصله‌های بین کلیپ‌ها) از سقف ربات بیشتر است."
         )
 
+    # The prepared audio exists only to be uploaded to an STT provider, so its
+    # size budget is the tightest of the temp budget, MAX_FILE_SIZE and the
+    # largest ceiling among the *configured* providers. Without this the merge
+    # happily produced a WAV that every configured provider then rejected.
+    stt_ceiling = largest_configured_upload(settings)
+    upload_budget = (
+        settings.max_file_size
+        if stt_ceiling is None
+        else min(settings.max_file_size, stt_ceiling)
+    )
+
     if len(usable) == 1:
         clip = usable[0]
         info = probes[str(clip.path)]
         if (
             clip.kind == "audio"
             and clip.duration is not None
+            and clip.path.stat().st_size <= upload_budget
             and not needs_transcode(clip.path.name, info)
         ):
             output_duration = clip.duration
@@ -1247,7 +1260,7 @@ async def prepare_audio(
         workdir,
         settings,
         total_duration=format_duration,
-        max_output_bytes=min(available_temp_bytes, settings.max_file_size),
+        max_output_bytes=min(available_temp_bytes, upload_budget),
         stem="presentation-audio",
     )
     if result.output_duration > settings.presentation_max_total_duration + 1e-9:

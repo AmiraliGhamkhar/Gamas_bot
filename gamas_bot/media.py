@@ -496,14 +496,25 @@ async def extract_audio_track(
     settings: Settings,
     *,
     total_duration: float | None = None,
+    max_output_bytes: int | None = None,
     stem: str = "audio",
 ) -> Path:
-    """Pull a single mono audio track out of any media file PyAV can read."""
+    """Pull a single mono audio track out of any media file PyAV can read.
+
+    ``max_output_bytes`` is the size the result must not exceed: the caller
+    passes the smallest of the temp budget, ``MAX_FILE_SIZE`` and the largest
+    ceiling of the *configured* STT providers, so the format is chosen once,
+    up front, instead of producing a WAV no provider will accept.
+    """
     # A budget is always passed: with an unknown duration the selector must not
     # default to an unbounded PCM WAV that fills the temp partition before the
     # post-hoc size check can reject it (audit F-22).
     output_format = choose_merge_format(
-        total_duration, settings, max_output_bytes=settings.max_file_size
+        total_duration,
+        settings,
+        max_output_bytes=(
+            settings.max_file_size if max_output_bytes is None else max_output_bytes
+        ),
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / merge_output_name(stem, output_format)
@@ -532,7 +543,13 @@ def build_convert_command(
     )
 
 
-async def convert_to_pptx(source: Path, out_dir: Path, settings: Settings) -> Path:
+async def convert_to_pptx(
+    source: Path,
+    out_dir: Path,
+    settings: Settings,
+    *,
+    warnings_out: list[str] | None = None,
+) -> Path:
     """Convert a legacy .ppt/.pps/.pot deck to .pptx with the ppt2pptx package.
 
     ODP/OTP decks are refused with an explicit message: no verified pure-Python
@@ -562,15 +579,18 @@ async def convert_to_pptx(source: Path, out_dir: Path, settings: Settings) -> Pa
     if summary:
         logger.info("Legacy deck converted output=%s summary=%s", converted.name, summary)
         # Surface ppt2pptx warnings (e.g. MEDIA_ACTION_OMITTED) so operators
-        # know when a legacy deck lost embedded media during conversion.
+        # *and users* know when a legacy deck lost embedded media.
         try:
             payload = json.loads(summary)
             warnings = payload.get("warning_codes") if isinstance(payload, dict) else None
             if warnings:
+                codes = [str(code) for code in warnings] if isinstance(warnings, list) else [str(warnings)]
                 logger.warning(
                     "Legacy deck conversion warnings output=%s warnings=%s",
-                    converted.name, warnings,
+                    converted.name, codes,
                 )
+                if warnings_out is not None:
+                    warnings_out.extend(codes)
         except (json.JSONDecodeError, AttributeError):
             pass
     return converted

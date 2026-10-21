@@ -35,6 +35,7 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import aiohttp
 
 from .config import NoteRoute, Settings, note_routes
+from .http_util import read_error_body
 
 try:
     import orjson
@@ -472,7 +473,7 @@ def _error_from_payload(
 async def _error_from_response(
     label: str, response: aiohttp.ClientResponse, api_key: str | None
 ) -> LLMError:
-    body = await response.read()
+    body = await read_error_body(response)
     payload: object = None
     try:
         payload = _loads(body)
@@ -1210,20 +1211,39 @@ async def _hedge_two(first_factory, second_factory, hedge_after: float):
     second_task = asyncio.ensure_future(second_factory())
     pending = {first_task, second_task}
     errors: dict = {}
+
+    async def _settle_losers() -> None:
+        for loser in list(pending):
+            if loser.done():
+                continue
+            loser.cancel()
+            try:
+                await loser
+            except (asyncio.CancelledError, LLMError):
+                pass
+            except Exception:  # pragma: no cover - a loser's own error is moot
+                pass
+
     while pending:
         done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             try:
                 result = task.result()
+            except asyncio.CancelledError:
+                # The task was cancelled from outside: treat it as a failure of
+                # this attempt rather than crashing the race.
+                errors[task] = LLMError("درخواست لغو شد.")
+                continue
             except LLMError as exc:
                 errors[task] = exc
                 continue
-            for loser in pending:
-                loser.cancel()
-                try:
-                    await loser
-                except (asyncio.CancelledError, LLMError):
-                    pass
+            except Exception:
+                # A non-LLMError (a bug, a malformed local gateway) must not be
+                # swallowed by the hedged path: stop the sibling and surface it
+                # exactly as the sequential path would.
+                await _settle_losers()
+                raise
+            await _settle_losers()
             return result
     raise _HedgedFailures(errors[first_task], errors[second_task])
 

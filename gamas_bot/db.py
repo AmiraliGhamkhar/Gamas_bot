@@ -78,6 +78,14 @@ class OpenPaymentError(RuntimeError):
         super().__init__(f"an open payment already exists for plan {plan_code}")
 
 
+class TooManyActiveJobsError(RuntimeError):
+    """Admission control: this user already has the maximum active work."""
+
+    def __init__(self, limit: int):
+        self.limit = int(limit)
+        super().__init__(f"user already has {self.limit} active submission(s)")
+
+
 @dataclass(frozen=True, slots=True)
 class UserRow:
     telegram_id: int
@@ -414,14 +422,33 @@ class Database:
 
     # ----------------------------------------------------------- submissions
     async def create_submission(
-        self, user_id: int, kind: str, filename: str | None
+        self,
+        user_id: int,
+        kind: str,
+        filename: str | None,
+        *,
+        active_limit: int | None = None,
     ) -> int:
-        cursor = await self._write_returning(
-            "INSERT INTO submissions(user_id, kind, filename, status, created_at) "
-            "VALUES (?, ?, ?, 'pending', ?)",
-            (user_id, kind, filename, iso(utc_now())),
-        )
-        return cursor
+        """Insert a pending submission, optionally enforcing a per-user cap.
+
+        The count and the insert share one write transaction: two uploads that
+        arrive back-to-back cannot both observe the same free slot.
+        """
+        async with self._transaction():
+            if active_limit is not None:
+                rows = await self.db.execute_fetchall(
+                    "SELECT COUNT(*) FROM submissions WHERE user_id = ? "
+                    "AND status IN ('pending', 'processing')",
+                    (user_id,),
+                )
+                if rows and int(rows[0][0]) >= int(active_limit):
+                    raise TooManyActiveJobsError(int(active_limit))
+            cursor = await self.db.execute(
+                "INSERT INTO submissions(user_id, kind, filename, status, created_at) "
+                "VALUES (?, ?, ?, 'pending', ?)",
+                (user_id, kind, filename, iso(utc_now())),
+            )
+            return int(cursor.lastrowid or 0)
 
     async def _write_returning(self, sql: str, params: tuple = ()) -> int:
         async with self._transaction():
@@ -812,6 +839,32 @@ class Database:
                 "AND status = 'pending'", (receipt_path, payment_id),
             )
             return bool(cursor.rowcount)
+
+    async def forget_receipts(self, paths: tuple[str, ...] | list[str]) -> int:
+        """Clear stored receipt references whose files were deleted.
+
+        The retention job removes old image files; leaving ``receipt_path``
+        behind made the admin's «مشاهدهٔ رسید» button point at nothing and left
+        the deletion unauditable. Both are fixed here, in one transaction.
+        """
+        cleaned = tuple(dict.fromkeys(path for path in paths if path))
+        if not cleaned:
+            return 0
+        now = iso(utc_now())
+        async with self._transaction():
+            cleared = 0
+            for path in cleaned:
+                cursor = await self.db.execute(
+                    "UPDATE payments SET receipt_path = NULL WHERE receipt_path = ?",
+                    (path,),
+                )
+                cleared += max(0, int(cursor.rowcount or 0))
+                await self.db.execute(
+                    "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
+                    "VALUES (0, 'receipt_expired', ?, NULL, ?)",
+                    (path, now),
+                )
+            return cleared
 
     _PAYMENT_COLUMNS = (
         "payment_id, user_id, plan_code, status, receipt_path, created_at, "

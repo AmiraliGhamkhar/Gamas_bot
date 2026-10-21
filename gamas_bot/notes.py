@@ -95,6 +95,10 @@ PROMPT_RESERVE_TOKENS = 512
 #: How many times one oversized request may be halved before the step gives up
 #: (1 → 2 → 4 requests, each cut at a paragraph/sentence boundary).
 MAX_CONTEXT_SPLITS = 2
+#: Hard ceiling on map requests for one booklet. A tiny window (or a tiny
+#: ``NOTE_CHUNK_CHARS``) otherwise turns a long lecture into hundreds of paid
+#: requests; the caller then delivers the raw transcript it already has.
+MAX_NOTE_CHUNKS = 200
 
 #: Hard ceiling on practical tips in one booklet; a long lecture may contain
 #: more advice than a study document should surface at once.
@@ -1734,7 +1738,10 @@ def gate_notes(
     gated = replace(
         notes,
         sections=tuple(sections),
-        practical_tips=tuple(sorted(tips, key=lambda t: len(t.basis), reverse=True)[:MAX_PRACTICAL_TIPS]),
+        # The model emits its tips in importance order; the cap keeps the first
+        # ones. Sorting by ``len(basis)`` (the old behaviour) promoted tips with
+        # the longest justification, not the most useful advice.
+        practical_tips=tuple(tips[:MAX_PRACTICAL_TIPS]),
         learning_objectives=objectives,
         review_questions=review_questions,
     )
@@ -2077,17 +2084,28 @@ async def _structure_piece(
             "note request exceeded model budget; splitting into %d part(s) depth=%d (%s)",
             len(pieces), depth + 1, exc,
         )
-        parts = await asyncio.gather(
-            *(
+        tasks = [
+            asyncio.ensure_future(
                 _structure_piece(
                     session, settings, piece,
                     system_prompt=system_prompt, mode=mode,
                     semaphore=semaphore, depth=depth + 1,
                     presentation=presentation,
                 )
-                for piece in pieces
             )
-        )
+            for piece in pieces
+        ]
+        try:
+            parts = await asyncio.gather(*tasks)
+        except BaseException:
+            # ``gather`` propagates immediately but leaves the siblings running:
+            # they would keep the semaphore, the HTTP session and the provider
+            # quota busy for a result nobody reads.
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         return merge_structured_notes(list(parts))
 
 
@@ -2117,7 +2135,9 @@ async def _audit_and_repair(
         return notes, gate_notes(notes, source, strict=False, mode=mode)[1]
     if settings.note_quality_gate != "repair":
         observed, report = gate_notes(notes, source, strict=False, mode=mode)
-        logger.info(
+        # ``warn`` ships exactly what the gate would have removed, so the log
+        # line is the only trace of a real fidelity problem: it is a warning.
+        logger.warning(
             "note quality gate=warn: nothing changed; %s", report.summary()
         )
         return observed, report
@@ -2241,6 +2261,11 @@ async def structure_document(
         include_context = False
         contextual_chunk_chars = chunk_chars
     chunks = splitter(document, contextual_chunk_chars)
+    if len(chunks) > MAX_NOTE_CHUNKS:
+        raise StructuringError(
+            f"این متن به {len(chunks)} بخش تقسیم می‌شود که از سقف {MAX_NOTE_CHUNKS} "
+            "بخش بیشتر است؛ NOTE_CONTEXT_TOKENS یا NOTE_CHUNK_CHARS را افزایش دهید."
+        )
     if len(chunks) == 1:
         logger.info(
             "note document sizing kind=%s chars=%d chunk_chars=%d chunks=1 context_digest=false",
@@ -2309,12 +2334,22 @@ async def structure_document(
         )
 
     merged_chars = len(json.dumps(compact_notes_payload(merged), ensure_ascii=False))
+    compile_budget = effective_compile_max_chars(
+        settings, mode=resolved_mode, presentation=presentation
+    )
+    if settings.note_compile and compile_budget <= 0:
+        # A zero budget means the configured window cannot hold the merged
+        # booklet plus the compile prompt. Skipping silently made a
+        # misconfiguration look like a normal, unedited merge.
+        logger.warning(
+            "compile pass disabled: NOTE_CONTEXT_TOKENS leaves no room for the "
+            "merged booklet (merged_chars=%d, NOTE_MAX_OUTPUT_TOKENS=%d)",
+            merged_chars, settings.note_max_output_tokens,
+        )
     if (
         not settings.note_compile
         or merged_chars < COMPILE_MIN_NOTES_CHARS
-        or merged_chars > effective_compile_max_chars(
-            settings, mode=resolved_mode, presentation=presentation
-        )
+        or merged_chars > compile_budget
     ):
         return merged
 

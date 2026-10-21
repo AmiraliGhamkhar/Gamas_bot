@@ -28,6 +28,7 @@ The raw transcript is saved and delivered before note generation. PowerPoint nar
 ## Operating rules
 
 - The in-memory queue is bounded by `MAX_ACTIVE_JOBS` and `MAX_QUEUED_JOBS`; excess work is rejected.
+- Each user may hold at most `MAX_ACTIVE_JOBS_PER_USER` pending/processing submissions; the cap is checked in the same write transaction that creates the row, so two fast uploads cannot both pass.
 - The media worker runs with a timeout and no shell. `av` supplies media libraries; system FFmpeg is not required.
 - SQLite migrations run at startup. Billing writes are transactional; a job hold is settled or released according to the raw-transcript delivery milestone.
 - A lock on the Telegram session prevents duplicate polling. Keep the session and database on a local writable filesystem.

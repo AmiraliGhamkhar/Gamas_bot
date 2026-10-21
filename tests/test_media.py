@@ -235,8 +235,12 @@ class PrepareAudioRoutingTests(MediaTempCase):
         async def fake_probe(_path, _settings):
             return MediaInfo(True, 123.5, "aac")
 
-        async def fake_extract(source, _workdir, _settings, *, total_duration=None, stem="audio"):
+        async def fake_extract(
+            source, _workdir, _settings, *, total_duration=None,
+            max_output_bytes=None, stem="audio",
+        ):
             captured["total_duration"] = total_duration
+            captured["max_output_bytes"] = max_output_bytes
             return source
 
         stub = _AudioPipelineStub(self.settings)
@@ -247,6 +251,10 @@ class PrepareAudioRoutingTests(MediaTempCase):
                 stub, Path("v.mp4"), self.tmp, "v.mp4", "video"
             )
         self.assertEqual(captured["total_duration"], 123.5)
+        # The prepared file is sized to the STT chain's largest ceiling, not
+        # only to MAX_FILE_SIZE: a WAV no provider accepts is never produced.
+        self.assertIsNotNone(captured["max_output_bytes"])
+        self.assertLessEqual(captured["max_output_bytes"], self.settings.max_file_size)
         self.assertEqual(result, Path("v.mp4"))
 
     async def test_passthrough_audio_is_not_transcoded(self):

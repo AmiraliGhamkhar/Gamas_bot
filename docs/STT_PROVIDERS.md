@@ -14,4 +14,8 @@ The default language is `STT_LANGUAGE=fa`; the default provider order is `speech
 
 Temporary network/rate-limit/server errors are retried a bounded number of times, then the next provider is tried. Permanent request or authentication errors move to the next provider. Files are **not chunked**; if no provider accepts the file, the job fails and its pre-delivery credit hold is released. Empty/unusable transcripts are not treated as success.
 
+Audio is prepared *for the chain*, not for `MAX_FILE_SIZE`: the merged/extracted track is sized to the largest upload ceiling among the configured providers (Opus instead of WAV when the raw PCM would not fit), so a deployment whose only provider accepts 25 MB never produces a file that every provider must skip. A provider skipped for cooldown or upload size is reported to the user as temporarily unavailable, not as a transcription failure; the abandoned Speechmatics job is deleted so it cannot keep running (and billing) after the bot gave up on it.
+
+Only the first audio track of a multi-track file or embedded clip is transcribed. A second track (a second microphone, a dubbed audio track) is ignored without a notice.
+
 Run `python -m gamas_bot --check` to validate local settings. On cPanel, `python -m scripts.cpanel_preflight` also checks outbound access. Logs show provider, model and error class, not audio or transcript content. See [Troubleshooting](TROUBLESHOOTING.md) for common errors.

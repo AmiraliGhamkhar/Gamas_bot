@@ -9,6 +9,7 @@ Media is decoded with PyAV in a child Python process. The project does not call 
 - `TEMP_DIR` needs free space for source and working files. Temporary job folders are removed after processing and stale folders are cleaned at startup.
 - `MEDIA_WORKER_CONCURRENCY` limits CPU/disk-heavy work. Use `1` on shared hosting.
 - A file with no measurable audio duration is refused rather than charged blindly.
+- Prepared audio is sized to the STT chain's largest upload ceiling (see [Speech-to-text](STT_PROVIDERS.md)); a source already small enough is sent unchanged, and only the first audio track is used.
 
 Check the installed media stack with:
 

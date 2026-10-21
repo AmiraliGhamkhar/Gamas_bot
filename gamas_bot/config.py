@@ -265,6 +265,24 @@ def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int | None =
     return value
 
 
+def _plan_value(name: str, default: int) -> int:
+    """Read one tariff value *without* clamping it.
+
+    ``_env_int`` clamps to its minimum, which turned ``PLAN_5_PRICE_TOMAN=0``
+    into a 1-Toman price instead of a visible configuration error — the exact
+    kind of silently-quoted number this project refuses elsewhere. The raw
+    integer is kept here so ``billing._resolved`` can fall back to the
+    canonical default *and* ``check()`` can report the mistake at startup.
+    """
+    raw = _env(name)
+    if not raw:
+        return default
+    try:
+        return int(float(raw))
+    except ValueError:
+        return default
+
+
 def _env_float(
     name: str,
     default: float,
@@ -354,6 +372,7 @@ class Settings:
     # --- Limits -------------------------------------------------------------
     max_file_size: int
     max_active_jobs: int
+    max_active_jobs_per_user: int
     max_queued_jobs: int
     media_worker_concurrency: int
     media_timeout: float
@@ -436,6 +455,7 @@ class Settings:
     office_max_chars: int
     office_max_slides: int
     office_session_ttl_minutes: int
+    office_min_interval_seconds: float
 
     # --- Billing / payments --------------------------------------------------
     payment_card_number: str
@@ -860,7 +880,7 @@ def from_env(env_file: str | None = None) -> Settings:
     note_api_base_url = normalize_note_base_url(note_api_base_url, note_provider)
     note_model = _env("NOTE_MODEL", DEFAULT_NOTE_MODELS.get(note_provider, ""))
     plan_values = {
-        attribute: _env_int(name, default)
+        attribute: _plan_value(name, default)
         for name, attribute, default in PLAN_ENV_FIELDS
     }
 
@@ -883,6 +903,12 @@ def from_env(env_file: str | None = None) -> Settings:
         log_backup_count=_env_int("LOG_BACKUP_COUNT", 5, minimum=1),
         max_file_size=_env_int("MAX_FILE_SIZE", 2 * 1024**3, minimum=1024),
         max_active_jobs=_env_int("MAX_ACTIVE_JOBS", 3, minimum=1, maximum=32),
+        # Per-user admission: a balance check at intake cannot see the jobs a
+        # user queued one second earlier, so N uploads each individually
+        # affordable would all be downloaded before the first reserve fails.
+        max_active_jobs_per_user=_env_int(
+            "MAX_ACTIVE_JOBS_PER_USER", 2, minimum=1, maximum=16
+        ),
         # Minimum 1: ``asyncio.Queue(maxsize=0)`` is unbounded, so 0 would
         # silently remove the queue's back-pressure instead of disabling it.
         max_queued_jobs=_env_int("MAX_QUEUED_JOBS", 8, minimum=1, maximum=100),
@@ -1005,6 +1031,12 @@ def from_env(env_file: str | None = None) -> Settings:
         office_session_ttl_minutes=_env_int(
             "OFFICE_SESSION_TTL_MINUTES", 30, minimum=1, maximum=1440
         ),
+        # The section is free and its xlsx/pptx builds can call the note model
+        # (``infer_table`` / ``plan_deck``), so one user must not be able to loop
+        # paste → build and drain the shared quota. 0 disables the throttle.
+        office_min_interval_seconds=_env_float(
+            "OFFICE_MIN_INTERVAL_SECONDS", 10.0, minimum=0.0, maximum=3600.0
+        ),
         # No fallback card: a deployment that forgets PAYMENT_CARD_* must not
         # silently direct its users' money to a card baked into the source.
         # ``_start_payment`` refuses to open a payment while this is empty.
@@ -1120,4 +1152,15 @@ def check(settings: Settings) -> list[str]:
         )
     if not settings.admin_ids:
         problems.append("ADMIN_IDS is empty; nobody will be able to approve payments.")
+    # A non-positive tariff override is silently ignored by ``billing._resolved``
+    # (the canonical default wins), so an operator typo would quote a price they
+    # never chose. Say so at startup instead of hiding it.
+    if settings.plan_values:
+        for name, attribute, default in PLAN_ENV_FIELDS:
+            value = settings.plan_values.get(attribute)
+            if value is None or value <= 0:
+                problems.append(
+                    f"{name}={value!r} is not a positive number; the built-in "
+                    f"{attribute}={default} is used instead. Fix or remove {name}."
+                )
     return problems
