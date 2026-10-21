@@ -477,6 +477,14 @@ def audio_file(name: str = "large.wav") -> Path:
 class ChainDeadlineAndTransferTests(unittest.IsolatedAsyncioTestCase):
     """F-3/F-6: one chain deadline, no re-upload, bounded transfers."""
 
+    def setUp(self) -> None:
+        # The provider cooldowns are module state: a transient failure in one
+        # test must not silently skip the provider in the next one.
+        stt.reset_cooldowns()
+
+    def tearDown(self) -> None:
+        stt.reset_cooldowns()
+
     async def test_the_whole_chain_shares_one_deadline(self):
         clock = _Clock()
         calls: list[str] = []

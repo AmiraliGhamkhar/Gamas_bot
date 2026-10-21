@@ -1832,17 +1832,29 @@ def repair_target_indexes(
     total = len(notes.sections)
     if total <= limit:
         return list(range(total))
-    scores: dict[int, int] = dict.fromkeys(range(total), 0)
+    # Each section's words are computed once: the booklet can hold hundreds of
+    # sections and every signal window would otherwise re-tokenize all of them.
+    section_words = [
+        content_words(section_plain_text(section)) for section in notes.sections
+    ]
+    scores = [0] * total
     signals = [*report.audit.missing, *report.audit.fabricated]
     for _signal, window in evidence_windows(source, signals, radius=REPAIR_WINDOW_CHARS):
         window_words = content_words(window)
         if not window_words:
             continue
-        for index, section in enumerate(notes.sections):
-            overlap = len(window_words & content_words(section_plain_text(section)))
+        for index, words in enumerate(section_words):
+            overlap = len(window_words & words)
             if overlap:
                 scores[index] += overlap
-    return sorted(range(total), key=lambda index: (-scores[index], index))[: max(1, limit)]
+    if not any(scores):
+        # No signal locates itself in the booklet: spread the bounded request
+        # across it instead of repairing only its opening sections, which is
+        # where a booklet-wide pattern (a repeated term, a recurring unit) would
+        # never be found.
+        step = total / limit
+        return [min(total - 1, int(position * step)) for position in range(limit)]
+    return sorted(range(total), key=lambda index: (-scores[index], index))[:limit]
 
 
 def _subset_notes(notes: StructuredNotes, sections: Sequence[NoteSection]) -> StructuredNotes:

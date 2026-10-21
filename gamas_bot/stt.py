@@ -909,8 +909,14 @@ async def transcribe(
     size = audio_path.stat().st_size
     owned_session = session is None
     if session is None:
+        # Every request also carries ``_transfer_timeout``; this is the
+        # session-level default for anything that is added later.
         session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=None, sock_read=settings.stt_job_timeout)
+            timeout=aiohttp.ClientTimeout(
+                total=None,
+                sock_read=settings.stt_transfer_timeout,
+                sock_connect=min(60.0, settings.stt_transfer_timeout),
+            )
         )
     try:
         failures: list[str] = []
