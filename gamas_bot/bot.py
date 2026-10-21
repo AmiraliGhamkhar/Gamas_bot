@@ -54,6 +54,7 @@ from .db import (
     InsufficientBalanceError,
     OpenPaymentError,
     PaymentSnapshotError,
+    TooManyActiveJobsError,
 )
 from .docx_export import (
     OFFICE_HEADING_OFFSET,
@@ -108,6 +109,7 @@ from .presentations import (
     slides_outline,
 )
 from .progress import JobProgress, to_persian_digits
+from .stt import largest_configured_upload
 from .stt import STTError, STTConfigurationError, transcribe
 from .telegram_text import button_label, render_pages, split_message
 from .transcript import build_document, render as render_transcript
@@ -148,6 +150,14 @@ TELEGRAM_CAPTION_LIMIT = 1024
 #: bound is generous enough for a multi-hour lecture (~40 pages ≈ 150 000
 #: characters); reaching it means the file is pathological, not a lecture.
 RAW_FALLBACK_MAX_PAGES = 40
+
+#: Shown when a user already has the configured number of active submissions.
+#: The balance check at intake cannot see a job queued a moment earlier, so the
+#: cap is enforced where the row is created (``db.create_submission``).
+ACTIVE_LIMIT_MESSAGE = (
+    "⏳ شما هم‌اکنون {limit} درخواست در حال پردازش دارید. "
+    "بگذارید یکی از آن‌ها تمام شود و بعد این فایل را بفرستید."
+)
 
 #: Maximum length of a user-controlled string that is logged verbatim. Longer
 #: values are truncated to avoid log-bloat / log-injection.
@@ -415,6 +425,10 @@ class GamasBot:
         self._office_sessions: dict[int, OfficeSession] = {}
         # user_id -> (kind, text, title, built_at monotonic timestamp)
         self._office_last: dict[int, tuple[str, str, str, float]] = {}
+        # user_id -> monotonic time of the last *accepted* build request. The
+        # section is free and may call the note model, so it needs its own
+        # per-user throttle (``OFFICE_MIN_INTERVAL_SECONDS``).
+        self._office_request_times: dict[int, float] = {}
         settings.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = TelegramClient(
             str(settings.session_path), settings.api_id, settings.api_hash
@@ -797,9 +811,11 @@ class GamasBot:
             "متن سند را بفرستید (یا یک فایل ‎.txt / .md / .markdown / .csv بفرستید).\n"
             "محتوای متن شما تغییر نمی‌کند؛ فقط نوشتار یکسان‌سازی می‌شود "
             "(حروف عربی به فارسی و فاصله‌های اضافی). سطرهای جدول را با Tab جدا کنید.\n"
-            "متن‌های طولانی و فایل‌های متنی بزرگ هم پذیرفته می‌شوند؛ سند به‌صورت خودکار "
-            "به بخش‌های منسجم تقسیم می‌شود و ارائه ساخته می‌شود.\n"
-            "اگر متن بیشتری دارید، بعد از ساخت دکمهٔ «➕ افزودن متن» را بزنید.",
+            "حداکثر {limit} نویسه در هر سند پذیرفته می‌شود؛ متن بلندتر را در چند "
+            "سند بفرستید. سند خودکار به بخش‌های منسجم تقسیم می‌شود.\n"
+            "اگر متن بیشتری دارید، بعد از ساخت دکمهٔ «➕ افزودن متن» را بزنید.".format(
+                limit=to_persian_digits(self.settings.office_max_chars)
+            ),
             buttons=[[Button.inline("↩️ انصراف", b"office:cancel")]],
         )
 
@@ -852,7 +868,21 @@ class GamasBot:
             except OfficeError as exc:
                 await event.reply(f"❌ {exc}")
                 return True
-            session.parts = [content]
+            if len(session.text) + len(content) > self.settings.office_max_chars:
+                # Checked *after* reading: the byte ceiling of an upload and the
+                # character ceiling of a document are different limits, and the
+                # old flow accepted a 1 MB file only to reject it later forever
+                # (the session was never cleared, so every retry failed too).
+                await event.reply(
+                    "❌ متن این فایل از حد مجاز سند بیشتر است.\n"
+                    f"حداکثر {to_persian_digits(self.settings.office_max_chars)} نویسه؛ "
+                    "فایل را کوتاه‌تر کنید یا در چند سند بفرستید."
+                )
+                self._office_sessions.pop(user_id, None)
+                return True
+            # Appending (not replacing) keeps text the user typed before the
+            # file arrived; a file used to silently discard it.
+            session.add(content)
             session.filename = filename
             # A short caption is a better title than the file name.
             caption = (message.message or "").strip()
@@ -929,13 +959,44 @@ class GamasBot:
                 "❌ متن شما از حد مجاز بیشتر است "
                 f"({self.settings.office_max_chars} نویسه)."
             )
+            # The session must be closed: otherwise every later message keeps
+            # appending to a document that can never be built.
+            self._office_sessions.pop(user_id, None)
             return
+        # Free does not mean unmetered: the xlsx/pptx build may call the note
+        # model, so a single user cannot drive it in a loop.
+        interval = self.settings.office_min_interval_seconds
+        if interval > 0:
+            now = time.monotonic()
+            last = self._office_request_times.get(user_id)
+            if last is not None and now - last < interval:
+                wait = int(math.ceil(interval - (now - last)))
+                await event.reply(
+                    "⏳ برای ساخت سند بعدی کمی صبر کنید "
+                    f"({to_persian_digits(max(1, wait))} ثانیه)."
+                )
+                return
+            self._office_request_times[user_id] = now
+            for stale in [
+                key for key, value in self._office_request_times.items()
+                if now - value > max(interval * 10, 600.0)
+            ]:
+                self._office_request_times.pop(stale, None)
         # A title the user gave (a file caption) wins; otherwise the document
         # itself finds one from the text when the job runs.
         title = session.title or ""
-        submission_id = await self.db.create_submission(
-            user_id, "office", session.filename or f"office-{kind}"
-        )
+        try:
+            submission_id = await self.db.create_submission(
+                user_id,
+                "office",
+                session.filename or f"office-{kind}",
+                active_limit=self.settings.max_active_jobs_per_user,
+            )
+        except TooManyActiveJobsError as exc:
+            await event.reply(
+                ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
+            )
+            return
         anchor = session.message or getattr(event, "message", None)
         progress = await JobProgress.create(anchor, submission_id=submission_id)
         job = Job(
@@ -1251,7 +1312,18 @@ class GamasBot:
                 "از «💳 اعتبار و پرداخت» می‌توانید اعتبار بگیرید."
             )
             return
-        submission_id = await self.db.create_submission(user_id, kind, filename)
+        try:
+            submission_id = await self.db.create_submission(
+                user_id,
+                kind,
+                filename,
+                active_limit=self.settings.max_active_jobs_per_user,
+            )
+        except TooManyActiveJobsError as exc:
+            await event.reply(
+                ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
+            )
+            return
         progress = await JobProgress.create(event, submission_id=submission_id)
         job = Job(
             submission_id=submission_id,
@@ -1312,7 +1384,18 @@ class GamasBot:
                     "از «💳 اعتبار و پرداخت» می‌توانید اعتبار بگیرید."
                 )
                 return
-        submission_id = await self.db.create_submission(user_id, "presentation", filename)
+        try:
+            submission_id = await self.db.create_submission(
+                user_id,
+                "presentation",
+                filename,
+                active_limit=self.settings.max_active_jobs_per_user,
+            )
+        except TooManyActiveJobsError as exc:
+            await event.reply(
+                ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
+            )
+            return
         progress = await JobProgress.create(event, submission_id=submission_id)
         job = Job(
             submission_id=submission_id,
@@ -1509,12 +1592,31 @@ class GamasBot:
         info = await probe_media(source_path, self.settings)
         if not info.has_audio:
             raise ValueError("این فایل شاخهٔ صوتی ندارد؛ چیزی برای پیاده‌سازی نیست.")
-        if kind == "video" or needs_transcode(filename, info):
+        # Media preparation and the STT upload are separated by the failover
+        # chain, which skips any provider whose ceiling the file exceeds.
+        # Sizing the prepared audio to the *largest configured* ceiling means a
+        # compact Opus track is produced when a WAV would only be skipped later.
+        ceiling = largest_configured_upload(self.settings)
+        budget = (
+            self.settings.max_file_size
+            if ceiling is None
+            else min(self.settings.max_file_size, ceiling)
+        )
+        try:
+            oversized = source_path.stat().st_size > budget
+        except OSError:
+            oversized = False
+        if kind == "video" or needs_transcode(filename, info) or oversized:
             # Forward the measured duration so a long recording can fall back to
             # a compact Opus track instead of an oversized WAV (see
-            # ``media.choose_merge_format``).
+            # ``media.choose_merge_format``), and cap the result so at least one
+            # configured provider can actually accept it.
             return await extract_audio_track(
-                source_path, workdir, self.settings, total_duration=info.duration
+                source_path,
+                workdir,
+                self.settings,
+                total_duration=info.duration,
+                max_output_bytes=budget,
             )
         return source_path
 
@@ -1545,10 +1647,15 @@ class GamasBot:
         if source_path.stat().st_size > self.settings.presentation_max_temp_bytes:
             raise PresentationError("حجم فایل موقت ارائه از سقف تعیین‌شده بیشتر است.")
 
+        conversion_warnings: list[str] = []
         if job.meta.get("presentation_kind") == "legacy":
             await progress.update(30, "🔁 دارم قالب قدیمی را تبدیل می‌کنم…")
             source_path = await self._run_media_operation(
-                convert_to_pptx, source_path, workdir, self.settings
+                convert_to_pptx,
+                source_path,
+                workdir,
+                self.settings,
+                warnings_out=conversion_warnings,
             )
             if source_path.stat().st_size > self.settings.max_file_size:
                 raise PresentationError("ارائهٔ تبدیل‌شده از سقف حجم فایل بزرگ‌تر است.")
@@ -1566,6 +1673,14 @@ class GamasBot:
             job.submission_id, len(content.slides), len(outline), len(content.clips),
         )
         skipped: list[str] = []
+        if conversion_warnings:
+            # Partial media loss during a legacy conversion used to be invisible
+            # whenever *some* clip survived: the user got a booklet with silent
+            # slides and no explanation.
+            skipped.append(
+                "در تبدیل قالب قدیمی این موارد از ارائه حذف شدند: "
+                + "، ".join(dict.fromkeys(conversion_warnings))
+            )
         prepared = await self._run_media_operation(
             prepare_audio, content, workdir, self.settings, skipped_out=skipped
         )
@@ -1671,6 +1786,12 @@ class GamasBot:
         # source audio is measured by the worker; synthetic silence is excluded.
         if prepared is not None:
             await self._settle(job, prepared.source_duration)
+        else:
+            # A slide-only deck has no audio, so there is no hold and nothing
+            # to charge — but the delivery milestone still has to be recorded,
+            # otherwise the admin stats and the delivered/partial mapping miss
+            # every text-only deck.
+            await self._settle(job, 0)
 
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
         transcript_text = narration_text
@@ -1975,6 +2096,11 @@ class GamasBot:
             raise RuntimeError("ارسال فایل متن خام ناموفق بود.")
         rendered = render_pages(raw_text)
         pages = [page for page in rendered[:RAW_FALLBACK_MAX_PAGES] if page.strip()]
+        # Truncation and filtering are two different things: a blank rendered
+        # page is not a delivery failure, but dropping whole pages past the cap
+        # is. Comparing the *filtered* count with ``len(rendered)`` conflated
+        # them and reported a complete delivery as failed.
+        truncated = len(rendered) > RAW_FALLBACK_MAX_PAGES
         if not pages:
             raise RuntimeError("ارسال فایل متن خام ناموفق بود.")
         delivered = 0
@@ -1994,7 +2120,7 @@ class GamasBot:
                 )
                 break
             delivered += 1
-        if not delivered or delivered != len(rendered):
+        if not delivered or delivered != len(pages) or truncated:
             # Partial text is not the billable delivery milestone. The stored
             # transcript remains available for support, but no debit is taken.
             raise RuntimeError("ارسال کامل متن خام ناموفق بود؛ اعتبار مصرف نشد.")
@@ -2034,6 +2160,10 @@ class GamasBot:
             "",
             "برای افزایش اعتبار، یکی از بسته‌های زیر را انتخاب کنید:",
         ]
+        plan_labels = {
+            plan["code"]: format_duration(int(round(float(plan["hours"]) * 3600)))
+            for plan in plans
+        }
         buttons = []
         for plan in plans:
             if plan["price"] <= 0:
@@ -2052,7 +2182,9 @@ class GamasBot:
                     "rejected": "❌ رد شد",
                     "cancelled": "لغو شد",
                 }.get(item["status"], item["status"])
-                lines.append(f"• {item['plan_code']} — {status}")
+                lines.append(
+                    f"• {plan_labels.get(item['plan_code'], item['plan_code'])} — {status}"
+                )
                 if item["status"] == "pending":
                     pending_buttons = [Button.inline(
                         "ادامهٔ درخواست باز", f"payopen:{item['payment_id']}".encode()
@@ -2752,7 +2884,7 @@ class GamasBot:
         from datetime import timedelta
 
         cutoff = datetime.now() - timedelta(days=self.settings.receipt_retention_days)
-        removed = 0
+        removed: list[str] = []
         for path in self.settings.receipt_dir.glob("receipt-*.jpg"):
             # Safety: only touch files strictly inside receipt_dir (audit F-H01)
             try:
@@ -2761,11 +2893,17 @@ class GamasBot:
                     continue
                 if datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
                     path.unlink(missing_ok=True)
-                    removed += 1
+                    removed.append(str(path))
             except OSError:
                 continue
         if removed:
-            logger.info("removed %d expired receipts", removed)
+            # A deleted file must not stay referenced: the admin's «مشاهدهٔ
+            # رسید» button would open nothing, and the deletion left no trace.
+            cleared = await self.db.forget_receipts(removed)
+            logger.info(
+                "removed %d expired receipts (%d payment references cleared)",
+                len(removed), cleared,
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -6,7 +6,8 @@ Credit is an append-only ledger measured in integer seconds. A job reserves its 
 
 - Credit is charged after the complete raw transcript is delivered. A successful booklet completes as `done`; a later booklet failure is `partial` and the transcription remains billed.
 - Failures or cancellations before complete transcript delivery release the hold. A truncated text fallback is not billable. A crash before confirmed delivery favors the user.
-- PowerPoint billing uses source narration duration; inserted silence is not charged.
+- PowerPoint billing uses source narration duration; inserted silence is not charged. A deck with no narration is free (nothing is reserved), but its delivery is still recorded, so it appears as delivered in statistics.
+- At most `MAX_ACTIVE_JOBS_PER_USER` submissions per user may be pending or processing at once. The balance check at intake cannot see work queued a moment earlier, so this cap is what stops a user from queueing several downloads their balance cannot cover.
 - Credits are tracked by lot and expire independently. New purchases are not reduced by old debits. Active holds keep their original allocations.
 - Startup recovery closes interrupted work and releases any active hold.
 
@@ -14,12 +15,12 @@ Credit is an append-only ledger measured in integer seconds. A job reserves its 
 
 The default catalog includes a free grant and paid hour bundles; prices and validity are configurable in `.env.example`. Admin changes to a plan are preserved. Payments are card-to-card and manually reviewed:
 
-1. A purchase stores a snapshot of its price, duration and validity.
+1. A purchase stores a snapshot of its price, duration and validity. A non-positive `PLAN_*` value is reported by the startup self-check and the built-in default is used instead — it is never clamped to a 1-Toman price.
 2. A receipt upload does **not** grant credit. Receipt images are size-checked, validated and kept in the private receipt directory.
 3. An admin approves or rejects the request. Approval uses the saved snapshot and is idempotent; rejection requires a reason.
 4. Users may resume a pending purchase or cancel it before submitting a receipt. A submitted receipt must be reviewed by an admin.
 
-Set `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER` and `PAYMENT_BANK_NAME` to enable purchases. Receipt files are removed after `RECEIPT_RETENTION_DAYS`; payment records remain for accounting.
+Set `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER` and `PAYMENT_BANK_NAME` to enable purchases. Receipt files are removed after `RECEIPT_RETENTION_DAYS`; the payment record remains for accounting, its receipt reference is cleared in the same pass, and the deletion is written to the audit log (`receipt_expired`).
 
 ## Admin and user status
 

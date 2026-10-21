@@ -38,6 +38,8 @@ Use a real numeric Telegram user ID for each admin, separated by commas. Configu
 | `STT_PROVIDERS`, `STT_LANGUAGE` | Choose failover order and language; Persian defaults to `fa`. See [STT providers](STT_PROVIDERS.md). |
 | `NOTE_PROVIDERS` | Set note-provider order. Each provider needs its own key. See [Note providers](PROVIDERS.md). |
 | `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS` | On cPanel, start with `1` active job and a small queue. |
+| `MAX_ACTIVE_JOBS_PER_USER` | Per-user admission cap (default `2`). Lower it to stop one user from queueing work their balance cannot cover. |
+| `OFFICE_MIN_INTERVAL_SECONDS` | Minimum gap between two Free Office documents for one user (default `10`; `0` disables). The section is free but may call the note model. |
 | `MAX_FILE_SIZE` | Lower it to fit the host's upload and temporary-disk limits. |
 | `PRESENTATION_MAX_TEMP_BYTES` | Keep it below the available scratch-disk space. |
 | `DB_PATH`, `TELEGRAM_SESSION`, `TEMP_DIR`, `RECEIPT_DIR`, `LOG_FILE` | Relative paths resolve from the project directory, not the current shell directory. Keep data outside `public_html`. |

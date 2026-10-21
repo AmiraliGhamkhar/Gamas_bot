@@ -2426,7 +2426,10 @@ def _add_table(document, table_data, *, fonts: DocumentFonts) -> None:
         # eye tracks a wide Persian row across the full content width and the
         # white rows in between keep the table calm.
         stripe = ZEBRA_SHADE if row_index % 2 == 0 else ""
-        for column, value in enumerate(row):
+        # A row with more cells than the header has no column to land in. The
+        # payload normaliser pads/truncates model output, but this renderer is
+        # also called with hand-built tables (and must never raise IndexError).
+        for column, value in enumerate(row[: len(headers)]):
             cell = table.cell(row_index, column)
             if stripe:
                 _shade_cell(cell, stripe)

@@ -33,4 +33,4 @@ For cPanel, make sure the cron job does not start the bot during the update. See
 
 ## Backups and capacity
 
-Keep backups encrypted and outside the web root and Git. Stop the bot before copying the SQLite database, or use a SQLite-aware backup so WAL data is included. Shared hosting should use `MAX_ACTIVE_JOBS=1`, a short queue and upload/temp limits that fit the account. If the host kills the process or lacks disk/RAM, move to a VPS; cron cannot bypass provider limits.
+Receipt retention (`RECEIPT_RETENTION_DAYS`) deletes the image **and** clears the reference on the payment record, writing `receipt_expired` to the audit log; a cleared reference means the picture is gone by policy, not that an approval is missing. Keep backups encrypted and outside the web root and Git. Stop the bot before copying the SQLite database, or use a SQLite-aware backup so WAL data is included. Shared hosting should use `MAX_ACTIVE_JOBS=1`, a short queue and upload/temp limits that fit the account. If the host kills the process or lacks disk/RAM, move to a VPS; cron cannot bypass provider limits.
