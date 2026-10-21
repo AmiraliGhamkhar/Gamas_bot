@@ -154,9 +154,10 @@ MAX_RAW_PREVIEW_LINES = 12
 TELEGRAM_CAPTION_LIMIT = 1024
 #: Upper bound on the paginated text fallback when a file upload fails. The raw
 #: transcript is the product's core artifact, so a delivery-size failure is
-#: recovered in the chat rather than thrown away — but never unboundedly. The
-#: bound is generous enough for a multi-hour lecture (~40 pages ≈ 150 000
-#: characters); reaching it means the file is pathological, not a lecture.
+#: recovered in the chat rather than thrown away — but never unboundedly.
+#: This path only handles transcripts that fit one document
+#: (``RAW_FALLBACK_FILE_CHARS``); a longer one is re-sent as bounded ``.txt``
+#: parts instead, so reaching this cap at all means the text is pathological.
 RAW_FALLBACK_MAX_PAGES = 40
 
 #: Shown when a user already has the configured number of active submissions.
@@ -349,6 +350,16 @@ def _normalize_receipt_image(path: Path, *, max_bytes: int) -> bool:
                 temp_path.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def _reported_upload_bytes(message, fallback: int) -> int:
+    """The upload's byte size as Telegram reported it, or *fallback*.
+
+    ``file.size`` is absent or a thumbnail size for some uploads, so the
+    configured ceiling is the honest worst case in that situation.
+    """
+    reported = getattr(getattr(message, "file", None), "size", None)
+    return reported if isinstance(reported, int) and reported > 0 else fallback
 
 
 def _ensure_disk_headroom(
@@ -1644,12 +1655,7 @@ class GamasBot:
         if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
             suffix = ".media"
         source_path = workdir / f"source{suffix}"
-        reported_size = getattr(getattr(job.message, "file", None), "size", None)
-        upload_bytes = (
-            reported_size
-            if isinstance(reported_size, int) and reported_size > 0
-            else self.settings.max_file_size
-        )
+        upload_bytes = _reported_upload_bytes(job.message, self.settings.max_file_size)
         # The download and the prepared audio can both exist at once.
         _ensure_disk_headroom(
             self.settings.temp_dir,
@@ -1777,10 +1783,20 @@ class GamasBot:
         await progress.update(10, "🚀 شروع کردم")
         suffix = Path(job.filename).suffix.lower() if job.filename else ".pptx"
         source_path = workdir / f"source{suffix}"
+        upload_bytes = _reported_upload_bytes(job.message, self.settings.max_file_size)
+        # The deck and the clips unpacked from it coexist in the workdir.
+        _ensure_disk_headroom(
+            self.settings.temp_dir,
+            upload_bytes * 2,
+            reserve_bytes=self.settings.temp_min_free_bytes,
+        )
         await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
         try:
             await _download_media_limited(
-                job.message, source_path, self.settings.max_file_size
+                job.message,
+                source_path,
+                self.settings.max_file_size,
+                stall_seconds=self.settings.download_stall_seconds,
             )
         except UploadTooLargeError as exc:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc

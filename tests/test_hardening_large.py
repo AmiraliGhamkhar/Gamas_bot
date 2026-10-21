@@ -362,6 +362,16 @@ class ScriptedClient(FakeTelegramClient):
         return await super().send_file(*args, **kwargs)
 
 
+class _ProgressStub:
+    """The ``progress.update`` surface the pipelines call before delivery."""
+
+    def __init__(self) -> None:
+        self.updates: list[int] = []
+
+    async def update(self, percent: int, _text: str = "") -> None:
+        self.updates.append(percent)
+
+
 class RawFallbackDeliveryTests(unittest.IsolatedAsyncioTestCase):
     """F-2: a failed ``.txt`` upload of a long transcript still delivers."""
 
@@ -423,6 +433,38 @@ class RawFallbackDeliveryTests(unittest.IsolatedAsyncioTestCase):
         # The workdir holds no part files after delivery.
         self.assertEqual(sorted(path.name for path in raw_path.parent.glob("raw.*")),
                          ["raw.txt"])
+
+    async def test_both_download_sites_check_the_floor_and_watch_for_a_stall(self):
+        """F-5/F-6 apply to the presentation download too, not only to media."""
+        order: list[str] = []
+        stalls: list[float] = []
+
+        def headroom(*_args, **_kwargs):
+            order.append("headroom")
+
+        async def download(_message, _target, _limit, *, stall_seconds=0.0):
+            order.append("download")
+            stalls.append(stall_seconds)
+            raise RuntimeError("stop the pipeline here")
+
+        workdir = Path(self._tmp.name) / "work"
+        workdir.mkdir()
+        for kind in ("audio", "presentation"):
+            job, _raw = await self.job()
+            job.kind = kind
+            pipeline = (
+                self.bot._process_media
+                if kind == "audio"
+                else self.bot._process_presentation
+            )
+            with mock.patch("gamas_bot.bot._ensure_disk_headroom", new=headroom), \
+                 mock.patch("gamas_bot.bot._download_media_limited", new=download):
+                with self.assertRaises(RuntimeError):
+                    await pipeline(job, workdir, _ProgressStub())
+
+        # Headroom is checked before the download, and both pass the watchdog.
+        self.assertEqual(order, ["headroom", "download", "headroom", "download"])
+        self.assertEqual(stalls, [self.settings.download_stall_seconds] * 2)
 
     async def test_a_failed_part_fails_the_delivery_instead_of_settling_it(self):
         job, raw_path = await self.job()
