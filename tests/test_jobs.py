@@ -8,8 +8,10 @@ import unittest
 from gamas_bot.jobs import Job, JobQueue, QueueFullError
 
 
-def make_job(submission_id: int) -> Job:
-    return Job(submission_id=submission_id, user_id=1, kind="audio", filename="a.mp3")
+def make_job(submission_id: int, user_id: int = 1) -> Job:
+    return Job(
+        submission_id=submission_id, user_id=user_id, kind="audio", filename="a.mp3"
+    )
 
 
 class JobQueueTests(unittest.IsolatedAsyncioTestCase):
@@ -110,6 +112,70 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         await queue.shutdown()
         with self.assertRaises(QueueFullError):
             queue.submit(make_job(0))
+
+    async def test_one_users_backlog_does_not_delay_another_users_job(self):
+        """F-8: dispatch is round-robin across users, order kept per user.
+
+        The per-user admission cap is 2 and a job runs for hours, so two
+        uploads from one user used to occupy the whole pool while everyone
+        else's jobs waited behind them.
+        """
+        order: list[tuple[int, int]] = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def worker(job: Job) -> None:
+            order.append((job.user_id, job.submission_id))
+            started.set()
+            await release.wait()
+
+        queue = JobQueue(max_queued=10, max_active=1, worker=worker)
+        queue.ensure_workers()
+        queue.submit(make_job(0, user_id=1))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        queue.submit(make_job(1, user_id=1))
+        queue.submit(make_job(2, user_id=2))
+        queue.submit(make_job(3, user_id=3))
+        release.set()
+        await asyncio.wait_for(_drain(queue), timeout=5)
+        self.assertEqual(order, [(1, 0), (2, 2), (3, 3), (1, 1)])
+        await queue.shutdown()
+
+    async def test_a_users_jobs_keep_their_own_order(self):
+        order: list[tuple[int, int]] = []
+
+        async def worker(job: Job) -> None:
+            order.append((job.user_id, job.submission_id))
+
+        queue = JobQueue(max_queued=10, max_active=1, worker=worker)
+        queue.ensure_workers()
+        for submission, user in ((0, 1), (1, 2), (2, 1), (3, 1), (4, 2)):
+            queue.submit(make_job(submission, user_id=user))
+        await asyncio.wait_for(_drain(queue), timeout=5)
+        self.assertEqual([job for user, job in order if user == 1], [0, 2, 3])
+        self.assertEqual([job for user, job in order if user == 2], [1, 4])
+        await queue.shutdown()
+
+    async def test_amount_kept_pending_matches_the_submitted_jobs(self):
+        blocked = asyncio.Event()
+        started = asyncio.Event()
+
+        async def worker(job: Job) -> None:
+            started.set()
+            await blocked.wait()
+
+        queue = JobQueue(max_queued=2, max_active=1, worker=worker)
+        queue.ensure_workers()
+        queue.submit(make_job(0, user_id=1))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        queue.submit(make_job(1, user_id=1))
+        queue.submit(make_job(2, user_id=2))
+        self.assertEqual(queue.pending, 2)
+        # ``pending`` is the back-pressure count, exactly as before.
+        with self.assertRaises(QueueFullError):
+            queue.submit(make_job(3, user_id=3))
+        blocked.set()
+        await queue.shutdown()
 
     async def test_active_bound_respected(self):
         concurrent = 0

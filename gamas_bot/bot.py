@@ -131,6 +131,14 @@ class UploadTooLargeError(ValueError):
     """A Telegram transfer exceeded its configured byte ceiling."""
 
 
+class DownloadStalledError(ValueError):
+    """A Telegram download produced no bytes for the configured stall window."""
+
+
+class DiskSpaceError(ValueError):
+    """The temporary filesystem cannot hold the job's files."""
+
+
 USER_VISIBLE_ERRORS = (
     ValueError,
     PresentationError,
@@ -146,9 +154,10 @@ MAX_RAW_PREVIEW_LINES = 12
 TELEGRAM_CAPTION_LIMIT = 1024
 #: Upper bound on the paginated text fallback when a file upload fails. The raw
 #: transcript is the product's core artifact, so a delivery-size failure is
-#: recovered in the chat rather than thrown away — but never unboundedly. The
-#: bound is generous enough for a multi-hour lecture (~40 pages ≈ 150 000
-#: characters); reaching it means the file is pathological, not a lecture.
+#: recovered in the chat rather than thrown away — but never unboundedly.
+#: This path only handles transcripts that fit one document
+#: (``RAW_FALLBACK_FILE_CHARS``); a longer one is re-sent as bounded ``.txt``
+#: parts instead, so reaching this cap at all means the text is pathological.
 RAW_FALLBACK_MAX_PAGES = 40
 
 #: Shown when a user already has the configured number of active submissions.
@@ -170,6 +179,59 @@ def _sanitize_log_value(value: object, *, limit: int = MAX_LOGGED_STRING_CHARS) 
     if len(text) > limit:
         return text[:limit] + "…"
     return text
+
+
+#: Delivery-size boundaries tried for one raw-transcript part, in order. A part
+#: is cut at the last of these that falls in its second half, so a boundary is
+#: never mid-word and the parts stay balanced.
+_RAW_PART_BOUNDARIES = ("\n\n", "\n", "؟ ", ". ", "، ", " ")
+
+
+def raw_parts(
+    text: str, *, max_chars: int, max_parts: int
+) -> list[str]:
+    """Split a raw transcript into delivery-sized parts, or refuse.
+
+    The single ``.txt`` upload is the normal path; when *it* fails, the same
+    document is re-sent in parts rather than truncated. A multi-hour lecture
+    (150k–300k characters) does not fit the paginated text fallback at all, so
+    before this split the whole job was refunded with nothing delivered.
+
+    Cuts land on a paragraph, then a line, then a sentence, then a word
+    boundary — never inside a character — and the number of parts is bounded.
+    An empty list means the text cannot be delivered within ``max_parts``: the
+    caller refuses it instead of shipping a truncated transcript.
+    """
+    body = text.strip("\n")
+    if not body.strip():
+        return []
+    if max_chars <= 0 or max_parts <= 0:
+        return []
+    if len(body) <= max_chars:
+        return [body]
+    parts: list[str] = []
+    rest = body
+    while rest:
+        if len(rest) <= max_chars:
+            parts.append(rest)
+            break
+        if len(parts) + 1 >= max_parts:
+            # One more cut would leave a remainder with no part left to carry
+            # it: refuse rather than lose the tail silently.
+            return []
+        window = rest[:max_chars]
+        cut = max_chars
+        for boundary in _RAW_PART_BOUNDARIES:
+            index = window.rfind(boundary)
+            if index >= max_chars // 2:
+                cut = index + len(boundary)
+                break
+        # The part keeps its boundary characters and the remainder drops only
+        # the newlines the boundary already ended with: rejoining the parts
+        # reproduces the transcript exactly, including between words.
+        parts.append(rest[:cut])
+        rest = rest[cut:].lstrip("\n")
+    return [part for part in parts if part.strip()]
 
 
 def _is_safe_receipt_path(receipt_dir: Path, receipt_path: str | Path) -> bool:
@@ -290,37 +352,97 @@ def _normalize_receipt_image(path: Path, *, max_bytes: int) -> bool:
                 pass
 
 
-async def _download_media_limited(message, target: Path, limit_bytes: int) -> Path:
+def _reported_upload_bytes(message, fallback: int) -> int:
+    """The upload's byte size as Telegram reported it, or *fallback*.
+
+    ``file.size`` is absent or a thumbnail size for some uploads, so the
+    configured ceiling is the honest worst case in that situation.
+    """
+    reported = getattr(getattr(message, "file", None), "size", None)
+    return reported if isinstance(reported, int) and reported > 0 else fallback
+
+
+def _ensure_disk_headroom(
+    directory: Path, required_bytes: int, *, reserve_bytes: int = 0
+) -> None:
+    """Refuse a download that would leave the temp filesystem below its floor.
+
+    A long lecture briefly needs the downloaded source *and* the prepared audio
+    copy, so the estimate is twice the upload. ``TEMP_MIN_FREE_BYTES`` is the
+    operator's floor: it protects the other jobs' temporary directories and the
+    SQLite database from a full disk. Without this check a full disk surfaced as
+    an opaque provider failure after the whole multi-gigabyte download had been
+    written (audit F-5).
+    """
+    free = shutil.disk_usage(directory).free
+    if free < required_bytes + reserve_bytes:
+        logger.warning(
+            "temp disk headroom refused: free=%d required=%d reserve=%d dir=%s",
+            free, required_bytes, reserve_bytes, directory,
+        )
+        raise DiskSpaceError(
+            "فضای موقت سرور برای این فایل کافی نیست؛ لطفاً کمی بعد دوباره بفرستید."
+        )
+
+
+async def _download_media_limited(
+    message, target: Path, limit_bytes: int, *, stall_seconds: float = 0.0
+) -> Path:
     """Download Telegram media with live abort if it exceeds *limit_bytes*.
 
     Telegram may report ``file.size`` as None or as a thumbnail size, so
     pre-check alone is insufficient. The progress callback aborts the download
     as soon as the declared total or the running total exceeds the limit,
     preventing a multi-GB disk-fill before the post-download stat check.
+
+    A download that produces no bytes for ``stall_seconds`` is also aborted
+    (``0`` disables the watchdog). There is no job-level timeout by design, so
+    a half-open socket used to hold a worker — and its temporary directory —
+    indefinitely on a multi-gigabyte lecture.
     """
     if limit_bytes <= 0:
         raise ValueError("download limit must be positive")
+    last_progress = [time.monotonic()]
 
     def _guard(received: int, total: int) -> None:
         # Telethon reports (received, total); total can be zero for an unknown
         # size. Check both the declaration and running byte count.
+        last_progress[0] = time.monotonic()
         if total and total > limit_bytes:
             raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
         if received > limit_bytes:
             raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
 
-    try:
-        downloaded = await message.download_media(
+    async def _download():
+        return await message.download_media(
             file=str(target), progress_callback=_guard
         )
+
+    task = asyncio.create_task(_download())
+    try:
+        if stall_seconds > 0:
+            tick = max(1.0, min(stall_seconds / 4, 15.0))
+            while True:
+                done, _pending = await asyncio.wait({task}, timeout=tick)
+                if done:
+                    break
+                idle = time.monotonic() - last_progress[0]
+                if idle > stall_seconds:
+                    raise DownloadStalledError(
+                        "دانلود فایل از تلگرام متوقف شد؛ لطفاً دوباره بفرستید."
+                    )
+        downloaded = await task
         if not downloaded or not target.is_file():
             raise RuntimeError("download did not produce a file")
         if target.stat().st_size > limit_bytes:
             raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
         return target
     except BaseException:
-        # This includes cancellation and progress-callback failures: never keep
-        # a partial upload in private storage.
+        # This includes cancellation, a stalled transfer and progress-callback
+        # failures: never keep a partial upload in private storage.
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         try:
             target.unlink(missing_ok=True)
         except OSError:
@@ -413,6 +535,7 @@ class GamasBot:
         )
         self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
         self._receipt_cleanup_task: asyncio.Task | None = None
+        self._transcript_cleanup_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
         self._pending_broadcast: set[int] = set()
         # admin_id -> payment_id awaiting a rejection reason
@@ -472,6 +595,9 @@ class GamasBot:
         self._sweep_stale_temp_dirs()
         self.queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
+        self._transcript_cleanup_task = asyncio.create_task(
+            self._transcript_cleanup_loop()
+        )
         await self.client.start(bot_token=self.settings.bot_token)
         logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
         if not self.settings.payment_card_number:
@@ -507,6 +633,8 @@ class GamasBot:
             logger.info("removed %d stale temp dir(s) at startup", removed)
 
     async def shutdown(self) -> None:
+        if self._transcript_cleanup_task is not None:
+            self._transcript_cleanup_task.cancel()
         if self._receipt_cleanup_task is not None:
             self._receipt_cleanup_task.cancel()
 
@@ -1303,12 +1431,22 @@ class GamasBot:
             )
             return
         available = await self.db.available_seconds(user_id)
+        # ``duration is None`` is not an exemption: an unknown duration used to
+        # skip the balance check entirely, so a 2 GiB upload could be downloaded
+        # from the provider with zero credit. The conservative floor is checked
+        # exactly like a measured duration (audit F-4).
         needed = self._reserve_estimate(duration)
         unlimited = await self.db.is_unlimited(user_id)
-        if not unlimited and duration is not None and available < needed:
+        if not unlimited and available < needed:
+            measured = (
+                f"مدت فایل: {format_duration(duration)}"
+                if duration is not None and duration > 0
+                else "مدت فایل نامشخص است"
+            )
             await event.reply(
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
-                f"مدت فایل: {format_duration(duration)} — اعتبار فعلی: {format_duration(available)}\n"
+                f"{measured} — لازم (دست‌کم): {format_duration(needed)} — "
+                f"اعتبار فعلی: {format_duration(available)}\n"
                 "از «💳 اعتبار و پرداخت» می‌توانید اعتبار بگیرید."
             )
             return
@@ -1517,10 +1655,20 @@ class GamasBot:
         if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
             suffix = ".media"
         source_path = workdir / f"source{suffix}"
+        upload_bytes = _reported_upload_bytes(job.message, self.settings.max_file_size)
+        # The download and the prepared audio can both exist at once.
+        _ensure_disk_headroom(
+            self.settings.temp_dir,
+            upload_bytes * 2,
+            reserve_bytes=self.settings.temp_min_free_bytes,
+        )
         await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
         try:
             await _download_media_limited(
-                job.message, source_path, self.settings.max_file_size
+                job.message,
+                source_path,
+                self.settings.max_file_size,
+                stall_seconds=self.settings.download_stall_seconds,
             )
         except UploadTooLargeError as exc:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc
@@ -1635,10 +1783,20 @@ class GamasBot:
         await progress.update(10, "🚀 شروع کردم")
         suffix = Path(job.filename).suffix.lower() if job.filename else ".pptx"
         source_path = workdir / f"source{suffix}"
+        upload_bytes = _reported_upload_bytes(job.message, self.settings.max_file_size)
+        # The deck and the clips unpacked from it coexist in the workdir.
+        _ensure_disk_headroom(
+            self.settings.temp_dir,
+            upload_bytes * 2,
+            reserve_bytes=self.settings.temp_min_free_bytes,
+        )
         await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
         try:
             await _download_media_limited(
-                job.message, source_path, self.settings.max_file_size
+                job.message,
+                source_path,
+                self.settings.max_file_size,
+                stall_seconds=self.settings.download_stall_seconds,
             )
         except UploadTooLargeError as exc:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc
@@ -2094,6 +2252,18 @@ class GamasBot:
             )
         if job.message is None:
             raise RuntimeError("ارسال فایل متن خام ناموفق بود.")
+        parts = raw_parts(
+            raw_text,
+            max_chars=self.settings.raw_fallback_file_chars,
+            max_parts=self.settings.raw_fallback_max_files,
+        )
+        if len(parts) > 1:
+            await self._deliver_raw_parts(job, parts, raw_path, reference)
+            return
+        if not parts:
+            raise RuntimeError(
+                "متن خام برای ارسال در چند قطعه بیش از حد بزرگ است؛ اعتبار مصرف نشد."
+            )
         rendered = render_pages(raw_text)
         pages = [page for page in rendered[:RAW_FALLBACK_MAX_PAGES] if page.strip()]
         # Truncation and filtering are two different things: a blank rendered
@@ -2126,6 +2296,48 @@ class GamasBot:
             raise RuntimeError("ارسال کامل متن خام ناموفق بود؛ اعتبار مصرف نشد.")
         logger.info(
             "delivered raw transcript as %d text message(s) submission=%s",
+            delivered, job.submission_id,
+        )
+
+    async def _deliver_raw_parts(
+        self, job: Job, parts: list[str], raw_path: Path, reference: str
+    ) -> None:
+        """Re-send the raw transcript as bounded ``.txt`` parts.
+
+        Every part must arrive: a partially delivered transcript is not the
+        billable milestone, and the caller refunds the job instead. Each part is
+        written next to the original file and removed again immediately, so the
+        workdir holds at most one extra copy at a time.
+        """
+        if job.message is None:
+            raise RuntimeError("پیام کاربر برای ارسال فایل در دسترس نیست.")
+        delivered = 0
+        for index, part in enumerate(parts, start=1):
+            part_path = raw_path.with_name(f"{raw_path.stem}.{index}{raw_path.suffix}")
+            try:
+                part_path.write_text(part, encoding="utf-8", newline="\n")
+                await self._send_file(
+                    job,
+                    part_path,
+                    caption=(
+                        f"📝 متن خام ({index}/{len(parts)}) — {reference}"
+                    ),
+                )
+            except Exception:
+                logger.warning(
+                    "raw text fallback part %d/%d failed submission=%s",
+                    index, len(parts), job.submission_id,
+                    exc_info=True,
+                )
+                break
+            finally:
+                part_path.unlink(missing_ok=True)
+            delivered += 1
+        if delivered != len(parts):
+            # Partial text is not the billable delivery milestone.
+            raise RuntimeError("ارسال کامل متن خام ناموفق بود؛ اعتبار مصرف نشد.")
+        logger.info(
+            "delivered raw transcript as %d file part(s) submission=%s",
             delivered, job.submission_id,
         )
 
@@ -2877,6 +3089,45 @@ class GamasBot:
                 raise
             except Exception:
                 logger.warning("receipt cleanup failed", exc_info=True)
+
+    #: Batches one transcript-retention sweep may delete (bounded work per run).
+    TRANSCRIPT_CLEANUP_BATCHES = 25
+
+    async def _transcript_cleanup_loop(self) -> None:
+        """Delete finished transcripts after the retention window (audit F-10)."""
+        if self.settings.transcript_retention_days <= 0:
+            return
+        while True:
+            try:
+                # Sweep first: a restart must not reset the timer forever.
+                await self._cleanup_expired_transcripts()
+                await asyncio.sleep(24 * 3600)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning("transcript cleanup failed", exc_info=True)
+
+    async def _cleanup_expired_transcripts(self) -> int:
+        """Delete expired transcript rows in bounded batches; returns the count."""
+        days = self.settings.transcript_retention_days
+        if days <= 0:
+            return 0
+        removed = 0
+        for _ in range(self.TRANSCRIPT_CLEANUP_BATCHES):
+            batch = await self.db.expire_transcriptions(older_than_days=days)
+            removed += batch
+            if batch == 0:
+                break
+        if removed:
+            # The deletion is recorded: an operator reading the audit trail must
+            # be able to tell why a transcript is gone.
+            await self.db.audit(
+                0, "transcript_expired", f"deleted:{removed} days:{days}"
+            )
+            logger.info(
+                "removed %d expired transcriptions (retention %d days)", removed, days
+            )
+        return removed
 
     async def _cleanup_expired_receipts(self) -> None:
         if not self.settings.receipt_dir.is_dir():

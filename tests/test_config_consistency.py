@@ -52,6 +52,10 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("CONVERT_TIMEOUT", "convert_timeout", "float"),
     ("STT_JOB_TIMEOUT", "stt_job_timeout", "float"),
     ("STT_POLL_INTERVAL", "stt_poll_interval", "float"),
+    ("STT_TRANSFER_TIMEOUT_SECONDS", "stt_transfer_timeout", "float"),
+    ("MAX_STT_RESPONSE_BYTES", "max_stt_response_bytes", "int"),
+    ("TEMP_MIN_FREE_BYTES", "temp_min_free_bytes", "int"),
+    ("DOWNLOAD_STALL_SECONDS", "download_stall_seconds", "float"),
     ("STT_PROVIDERS", "stt_providers", "csv"),
     ("STT_LANGUAGE", "stt_language", "str"),
     ("SPEECHMATICS_MODEL", "speechmatics_model", "str"),
@@ -83,6 +87,8 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_COMPILE_MAX_CHARS", "note_compile_max_chars", "int"),
     ("NOTE_REASONING_EFFORT", "note_reasoning_effort", "str"),
     ("RAW_TEXT_PROFILE", "raw_text_profile", "str"),
+    ("RAW_FALLBACK_FILE_CHARS", "raw_fallback_file_chars", "int"),
+    ("RAW_FALLBACK_MAX_FILES", "raw_fallback_max_files", "int"),
     ("OFFICE_ENABLED", "office_enabled", "bool"),
     ("OFFICE_MAX_INPUT_BYTES", "office_max_input_bytes", "int"),
     ("OFFICE_MAX_CHARS", "office_max_chars", "int"),
@@ -99,6 +105,7 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("RECEIPT_DIR", "receipt_dir", "path"),
     ("RECEIPT_RETENTION_DAYS", "receipt_retention_days", "int"),
     ("MAX_PAYMENT_RECEIPT_BYTES", "max_payment_receipt_bytes", "int"),
+    ("TRANSCRIPT_RETENTION_DAYS", "transcript_retention_days", "int"),
 )
 
 #: v2 provider-platform settings that no longer exist in the code. Documentation

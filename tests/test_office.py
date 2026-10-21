@@ -541,7 +541,7 @@ class OfficeBotTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def run_queued_job(self):
         """Run the job the handler queued, the way the worker pool would."""
-        job = self.bot.queue._queue.get_nowait()
+        job = self.bot.queue.pop_pending()
         await self.bot._run_job(job)
         return job
 
