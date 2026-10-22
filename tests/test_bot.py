@@ -2,24 +2,31 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
+import json
 import os
 import re
 import tempfile
 import unittest
+from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 from gamas_bot.bot import (
+    TELEGRAM_DOWNLOAD_CHUNK_BYTES,
     GamasBot,
     _download_media_limited,
+    plan_download_ranges,
     _is_safe_receipt_path,
     _normalize_receipt_image,
     _parse_telegram_user_id,
 )
 from gamas_bot.db import Database
+from gamas_bot.docx_export import DocumentMeta
+from gamas_bot.notes import StructuredNotes
 from gamas_bot.jobs import Job
 from gamas_bot.media import MediaInfo, MediaToolError
 from gamas_bot.presentations import PreparedAudio, PresentationContent, SlideText
@@ -1262,6 +1269,203 @@ class IntakeLimitTests(BotPipelineTestCase):
         with self.assertRaises(ValueError):
             await _download_media_limited(event.message, target, 1024)
         self.assertFalse(target.exists())
+
+
+class ProgressiveBookletTests(BotPipelineTestCase):
+    """Phase 4: the merge is delivered while the compile is still running."""
+
+    def settings_overrides(self) -> dict:
+        return {"note_progressive_booklet": True, "note_api_key": "note-key"}
+
+    async def test_the_draft_is_a_real_word_file_with_its_own_caption(self):
+        workdir = Path(self._tmp.name) / "work"
+        workdir.mkdir()
+        event = self.media_event()
+        submission = await self.db.create_submission(USER_ID, "audio", "a.wav")
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="audio",
+            filename="a.wav",
+            message=event.message,
+            is_admin=False,
+            duration_hint=100.0,
+        )
+        notes = StructuredNotes.from_payload(json.loads(sample_notes_json()))
+        meta = DocumentMeta(reference="GMS-1", source_name="a.wav", created_at=datetime.now())
+        sender = self.bot._progressive_booklet_sender(job, workdir, "GMS-1", meta)
+        await sender(notes)
+
+        draft = workdir / "GMS-1-draft.docx"
+        self.assertTrue(draft.is_file())
+        sent = event.client.deliveries
+        self.assertEqual(len(sent), 1)
+        self.assertIn("نسخهٔ نخست", sent[0]["caption"])
+        # The draft is a genuine booklet, not the raw transcript.
+        self.assertIn("جزوه", docx_text(draft.read_bytes()))
+
+    async def test_a_failure_to_deliver_the_draft_is_swallowed(self):
+        workdir = Path(self._tmp.name) / "work2"
+        workdir.mkdir()
+        event = self.media_event()
+        submission = await self.db.create_submission(USER_ID, "audio", "a.wav")
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="audio",
+            filename="a.wav",
+            message=event.message,
+            is_admin=False,
+            duration_hint=100.0,
+        )
+        sender = self.bot._progressive_booklet_sender(
+            job, workdir, "GMS-2", mock.Mock()
+        )
+        # A broken meta must not raise into the note pipeline.
+        await sender(StructuredNotes.from_payload(json.loads(sample_notes_json())))
+        self.assertFalse((workdir / "GMS-2-draft.docx").exists())
+
+    async def test_the_callback_is_only_installed_when_the_setting_is_on(self):
+        captured: dict = {}
+
+        async def fake_structure(_text, _settings, _session, *, mode, on_merged=None):
+            captured["on_merged"] = on_merged
+            return StructuredNotes.from_payload(json.loads(sample_notes_json()))
+
+        with mock.patch("gamas_bot.bot.structure_transcript", new=fake_structure):
+            await self.bot._generate_notes(
+                "متن",
+                mock.Mock(submission_id=1, message=None),
+                None,
+                workdir=Path(self._tmp.name),
+                reference="GMS-3",
+                meta=mock.Mock(),
+            )
+        self.assertIsNotNone(captured["on_merged"])
+
+        self.bot.settings = replace(self.settings, note_progressive_booklet=False)
+        with mock.patch("gamas_bot.bot.structure_transcript", new=fake_structure):
+            await self.bot._generate_notes(
+                "متن",
+                mock.Mock(submission_id=1, message=None),
+                None,
+                workdir=Path(self._tmp.name),
+                reference="GMS-3",
+                meta=mock.Mock(),
+            )
+        self.assertIsNone(captured["on_merged"])
+
+
+class _RangedClient:
+    """A client whose ``iter_download`` yields slices of a fixed payload."""
+
+    def __init__(self, payload: bytes, *, fail: bool = False):
+        self.payload = payload
+        self.fail = fail
+        self.calls: list[dict] = []
+
+    def iter_download(self, _media, *, offset=0, limit=None, **_kwargs):
+        self.calls.append({"offset": offset, "limit": limit})
+
+        async def generator():
+            if self.fail:
+                raise RuntimeError("range transfer failed")
+            remaining = len(self.payload) - offset
+            count = limit if limit is not None else remaining
+            position = offset
+            for _ in range(count):
+                piece = self.payload[position: position + TELEGRAM_DOWNLOAD_CHUNK_BYTES]
+                if not piece:
+                    return
+                yield piece
+                position += len(piece)
+
+        return generator()
+
+
+class _RangedMessage:
+    def __init__(self, size: int, payload: bytes):
+        self.file = SimpleNamespace(size=size)
+        self.media = "media"
+        self.payload = payload
+        self.download_calls: list[str] = []
+
+    async def download_media(self, *, file, progress_callback=None):
+        self.download_calls.append(file)
+        if progress_callback is not None:
+            progress_callback(len(self.payload), len(self.payload))
+        Path(file).write_bytes(self.payload)
+        return file
+
+
+class RangedDownloadTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_range_plan_covers_the_file_and_keeps_telethon_direct(self):
+        chunk = TELEGRAM_DOWNLOAD_CHUNK_BYTES
+        total = chunk * 10
+        for connections in (1, 2, 3, 4, 8):
+            ranges = plan_download_ranges(total, connections)
+            self.assertEqual(sum(count for _offset, count in ranges), 10)
+            self.assertEqual(ranges[0][0], 0)
+            for offset, count in ranges:
+                # Direct-iterator preconditions (telethon/client/downloads.py).
+                self.assertEqual(offset % 4096, 0)
+                self.assertEqual(offset % count, 0)
+                self.assertLessEqual(count * chunk, total)
+
+    def test_one_connection_is_the_untouched_single_stream_path(self):
+        target = self.root / "single.bin"
+        payload = b"a" * 4096
+        message = _RangedMessage(len(payload), payload)
+        client = _RangedClient(payload)
+        asyncio.run(
+            _download_media_limited(
+                message, target, 10_000, client=client, connections=1
+            )
+        )
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertEqual(client.calls, [])
+        self.assertTrue(message.download_calls)
+
+    def test_ranges_are_written_at_their_own_offsets(self):
+        target = self.root / "ranged.bin"
+        payload = bytes(range(256)) * 16384  # 4 MiB, eight 512 KiB chunks
+        message = _RangedMessage(len(payload), payload)
+        client = _RangedClient(payload)
+        asyncio.run(
+            _download_media_limited(message, target, 10_000_000, client=client, connections=4)
+        )
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertEqual(len(client.calls), 4)
+        self.assertEqual(message.download_calls, [])
+
+    def test_a_failed_range_falls_back_to_one_stream(self):
+        target = self.root / "fallback.bin"
+        payload = b"z" * 8192
+        message = _RangedMessage(len(payload), payload)
+        client = _RangedClient(payload, fail=True)
+        asyncio.run(
+            _download_media_limited(message, target, 10_000_000, client=client, connections=4)
+        )
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertEqual(len(message.download_calls), 1)
+
+    def test_a_declared_oversize_file_is_refused_before_any_transfer(self):
+        target = self.root / "big.bin"
+        message = _RangedMessage(10_000, b"x" * 10_000)
+        client = _RangedClient(b"")
+        with self.assertRaises(ValueError):
+            asyncio.run(
+                _download_media_limited(
+                    message, target, 1_000, client=client, connections=4
+                )
+            )
+        self.assertFalse(target.exists())
+        self.assertEqual(client.calls, [])
 
 
 class ReceiptPathAndImageTests(unittest.TestCase):

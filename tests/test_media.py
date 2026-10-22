@@ -226,6 +226,58 @@ class FormatChoiceTests(unittest.TestCase):
             choose_merge_format(10.0, settings, max_output_bytes=100_000)
 
 
+class FormatPolicyTests(unittest.TestCase):
+    """``AUDIO_FORMAT_POLICY`` decides by time once a transfer rate is known."""
+
+    def test_auto_prefers_opus_when_the_upload_is_the_bottleneck(self):
+        settings = make_settings(audio_format_policy="auto")
+        # 2 h: 230 MB of PCM against 29 MB of Opus. At 2 MB/s the PCM upload
+        # costs ~115 s more than the whole Opus encode.
+        self.assertEqual(
+            choose_merge_format(7200.0, settings, egress_bytes_per_second=2e6),
+            "opus",
+        )
+
+    def test_auto_keeps_pcm_when_the_link_is_faster_than_the_encoder(self):
+        settings = make_settings(audio_format_policy="auto")
+        # At 100 MB/s the transfer is irrelevant and PCM's cheaper encode wins.
+        self.assertEqual(
+            choose_merge_format(7200.0, settings, egress_bytes_per_second=100e6),
+            "wav",
+        )
+
+    def test_auto_without_a_measured_rate_keeps_the_size_only_rule(self):
+        settings = make_settings(
+            audio_format_policy="auto", presentation_wav_limit_bytes=1000
+        )
+        self.assertEqual(choose_merge_format(10.0, settings), "opus")
+
+    def test_explicit_policies_override_the_costing(self):
+        fast = make_settings(audio_format_policy="wav")
+        slow = make_settings(audio_format_policy="opus")
+        self.assertEqual(
+            choose_merge_format(7200.0, fast, egress_bytes_per_second=1e6), "wav"
+        )
+        self.assertEqual(
+            choose_merge_format(7200.0, slow, egress_bytes_per_second=1e6), "opus"
+        )
+
+    def test_a_forced_pcm_policy_still_respects_the_budget(self):
+        settings = make_settings(
+            audio_format_policy="wav", presentation_wav_limit_bytes=32_000
+        )
+        # PCM does not fit the budget, so the smaller container is produced
+        # rather than an upload no provider could accept.
+        self.assertEqual(choose_merge_format(3600.0, settings), "opus")
+
+    def test_neither_container_fitting_is_an_error(self):
+        settings = make_settings(audio_format_policy="auto")
+        with self.assertRaises(MediaToolError):
+            choose_merge_format(
+                3600.0, settings, max_output_bytes=1_000, egress_bytes_per_second=1e6
+            )
+
+
 class PrepareAudioRoutingTests(MediaTempCase):
     """The bot must forward the measured duration to extraction."""
 
@@ -237,10 +289,11 @@ class PrepareAudioRoutingTests(MediaTempCase):
 
         async def fake_extract(
             source, _workdir, _settings, *, total_duration=None,
-            max_output_bytes=None, stem="audio",
+            max_output_bytes=None, egress_bytes_per_second=None, stem="audio",
         ):
             captured["total_duration"] = total_duration
             captured["max_output_bytes"] = max_output_bytes
+            captured["egress_bytes_per_second"] = egress_bytes_per_second
             return source
 
         stub = _AudioPipelineStub(self.settings)
@@ -248,13 +301,21 @@ class PrepareAudioRoutingTests(MediaTempCase):
             "gamas_bot.bot.extract_audio_track", new=fake_extract
         ):
             result = await GamasBot._prepare_audio(
-                stub, Path("v.mp4"), self.tmp, "v.mp4", "video"
+                stub,
+                Path("v.mp4"),
+                self.tmp,
+                "v.mp4",
+                "video",
+                egress_bytes_per_second=2_000_000.0,
             )
         self.assertEqual(captured["total_duration"], 123.5)
         # The prepared file is sized to the STT chain's largest ceiling, not
         # only to MAX_FILE_SIZE: a WAV no provider accepts is never produced.
         self.assertIsNotNone(captured["max_output_bytes"])
         self.assertLessEqual(captured["max_output_bytes"], self.settings.max_file_size)
+        # The measured transfer rate reaches the format decision, which is what
+        # makes AUDIO_FORMAT_POLICY=auto a time trade rather than a size trade.
+        self.assertEqual(captured["egress_bytes_per_second"], 2_000_000.0)
         self.assertEqual(result, Path("v.mp4"))
 
     async def test_passthrough_audio_is_not_transcoded(self):

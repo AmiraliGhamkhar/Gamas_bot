@@ -37,9 +37,19 @@ INPUT_PROTOCOL_OPTIONS = {"protocol_whitelist": "file,pipe"}
 WAV_SAMPLE_RATE = 16000
 OPUS_SAMPLE_RATE = 48000
 OPUS_BIT_RATE = 32000
-# Speech-optimised libopus with compression_level=5 (~1.2x–2x faster encode
-# than the music-mastering default of 10, with identical speech recognition WER).
-OPUS_CODEC_OPTIONS = {"application": "voip", "compression_level": "5"}
+# Why these two flags:
+#
+# * ``application=audio`` keeps libopus on the hybrid SILK+CELT path, so the
+#   4–8 kHz band (fricatives, which carry a lot of word identity) survives at
+#   this bitrate; ``voip`` narrows the encoder to SILK and discards it.
+# * ``compression_level=0`` is the cheap search mode. On the same 4-minute
+#   speech sample it encodes ~3.3x faster than the shipped level of 5 for the
+#   same audited output (13.5 MB/h vs 12.6 MB/h, +7 %), which is the right
+#   trade because the encoder runs on the same 2 vCPUs that serve the bot.
+#
+# Measured with ``python -m scripts.perf_bench audio``; see
+# docs/PERFORMANCE_PLAN.md §1.1.
+OPUS_CODEC_OPTIONS = {"application": "audio", "compression_level": "0"}
 
 LEGACY_EXTENSIONS = {".ppt", ".pps", ".pot"}
 UNSUPPORTED_ODF_EXTENSIONS = {".odp", ".otp"}

@@ -24,7 +24,11 @@ from gamas_bot.notes import (
     NoteTable,
     GlossaryEntry,
     StructuredNotes,
+    MAX_NOTE_CONCURRENCY,
+    build_chunk_message,
     build_context,
+    _note_semaphore,
+    _response_schema,
     build_repair_document,
     build_system_prompt,
     build_presentation_system_prompt,
@@ -39,6 +43,7 @@ from gamas_bot.notes import (
     headings_overlap,
     headings_share_a_topic,
     merge_structured_notes,
+    notes_response_schema,
     scrub_backend_artifacts,
     split_presentation_document,
     structure_presentation,
@@ -535,6 +540,113 @@ class _FakeResponse:
 
     async def json(self, content_type=None):
         return self._payload
+
+
+class CacheStablePrefixTests(unittest.TestCase):
+    """The system prompt must not vary per chunk, or the provider cannot cache it."""
+
+    def test_the_rules_block_is_identical_for_every_chunk(self):
+        full = build_system_prompt("full")
+        # What the map phase sends: the same string for chunk 1, 2 and 3.
+        self.assertEqual(len({full, build_system_prompt("full")}), 1)
+        self.assertNotIn("موضوع همین بخش", full)
+
+    def test_the_varying_context_moves_into_the_user_message(self):
+        block = "موضوع همین بخش: «انتقال فعال»"
+        message = build_chunk_message(block, "متن این بخش")
+        self.assertTrue(message.startswith("\nقواعد نوشتن یک «بخش»"))
+        self.assertIn(block, message)
+        self.assertTrue(message.endswith("متن این بخش"))
+        # No block, no wrapper: the message is exactly the chunk.
+        self.assertEqual(build_chunk_message("", "متن"), "متن")
+
+
+class ConcurrencyBoundTests(unittest.TestCase):
+    def test_the_semaphore_is_bounded_by_the_work_and_the_ceiling(self):
+        settings = make_settings(note_concurrency=6)
+        self.assertEqual(_note_semaphore(settings, 2)._value, 2)
+        self.assertEqual(_note_semaphore(settings, 6)._value, 6)
+        self.assertEqual(_note_semaphore(make_settings(note_concurrency=8), 50)._value, 8)
+        self.assertEqual(MAX_NOTE_CONCURRENCY, 8)
+
+
+class ResponseSchemaTests(unittest.TestCase):
+    def test_the_schema_is_only_sent_when_the_setting_is_on(self):
+        self.assertIsNone(_response_schema(make_settings()))
+        schema = _response_schema(make_settings(note_structured_output=True))
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(schema["required"], ["sections"])
+        section = schema["properties"]["sections"]["items"]
+        for key in ("heading", "paragraphs", "tables", "callouts", "definitions"):
+            self.assertIn(key, section["properties"])
+
+    def test_every_field_the_loader_reads_is_in_the_schema(self):
+        schema = notes_response_schema()
+        top = schema["properties"]
+        for key in (
+            "title", "summary", "learning_objectives", "sections",
+            "practical_tips", "key_points", "review_questions", "glossary",
+        ):
+            self.assertIn(key, top)
+
+
+class ProgressiveBookletTests(unittest.IsolatedAsyncioTestCase):
+    async def test_the_merge_is_handed_over_before_the_compile_runs(self):
+        from gamas_bot.transcript import split_transcript
+
+        settings = make_settings(note_chunk_chars=400, note_compile=True)
+        document = "\n\n".join(
+            f"موضوع {index}: " + "جمله‌های بسیار زیاد برای پر کردن حجم. " * 20
+            for index in range(4)
+        )
+        chunks = split_transcript(document, 400)
+        # The acceptance gate refuses a compile that keeps far fewer sections
+        # than the merge, so the answer carries at least as many.
+        compile_answer = {
+            "title": "جزوهٔ نهایی",
+            "summary": "خلاصهٔ نهایی",
+            "sections": [
+                {"heading": f"بخش یکپارچهٔ {number}", "paragraphs": ["متن یکپارچه."]}
+                for number in range(40)
+            ],
+        }
+        session = FakeSession(
+            [big_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))]
+            + [json.dumps(compile_answer, ensure_ascii=False)]
+        )
+        seen: list[tuple[str, int]] = []
+
+        async def on_merged(merged):
+            # The compile request has not been sent yet: the callback receives
+            # the deterministic merge while the user can already read it.
+            seen.append((merged.title, len(session.calls)))
+            if False:
+                raise AssertionError("unreachable")
+
+        notes = await structure_transcript(
+            document, settings, session, on_merged=on_merged
+        )
+        self.assertEqual(notes.title, "جزوهٔ نهایی")
+        self.assertEqual(seen, [("جزوهٔ 0", len(chunks))])
+
+    async def test_a_failing_callback_never_fails_the_notes(self):
+        from gamas_bot.transcript import split_transcript
+
+        settings = make_settings(note_chunk_chars=400, note_compile=True)
+        document = "\n\n".join(
+            f"موضوع {index}: " + "جمله‌های بسیار زیاد برای پر کردن حجم. " * 20
+            for index in range(4)
+        )
+        chunks = split_transcript(document, 400)
+        session = FakeSession([sample_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))])
+
+        async def on_merged(_merged):
+            raise RuntimeError("telegram is down")
+
+        notes = await structure_transcript(
+            document, settings, session, on_merged=on_merged
+        )
+        self.assertEqual(notes.title, "جزوهٔ 0")
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):

@@ -35,6 +35,14 @@ OPUS_SIZE_MARGIN = 128 * 1024
 OPUS_SAMPLE_RATE = 48000
 WAV_SAMPLE_RATE = 16000
 
+#: Encoder throughput as *audio seconds per second of CPU*, measured on a
+#: 2-vCPU host with ``python -m scripts.perf_bench audio`` (824x for PCM,
+#: 355x for Opus at the shipped flags). The values are deliberately derated:
+#: they only have to rank WAV against Opus, and an optimistic constant would
+#: pick the slower format. See docs/PERFORMANCE_PLAN.md §1.1.
+WAV_ENCODE_SPEED = 600.0
+OPUS_ENCODE_SPEED = 300.0
+
 WORKER_MODULE = "gamas_bot.media_worker"
 CHECK_TIMEOUT_SECONDS = 60
 
@@ -352,13 +360,31 @@ def choose_merge_format(
     settings: Settings,
     *,
     max_output_bytes: int | None = None,
+    egress_bytes_per_second: float | None = None,
 ) -> str:
-    """Pick WAV or Opus while respecting the available file/temp budget."""
+    """Pick WAV or Opus from the budget *and*, when known, the transfer cost.
+
+    ``AUDIO_FORMAT_POLICY=auto`` (the default) is a time decision, not a size
+    decision: a 2-hour lecture is 230 MB of PCM or 29 MB of Opus, so the PCM
+    upload can cost minutes on a shared host while the Opus encode costs
+    seconds. ``egress_bytes_per_second`` is the measured rate of the same job's
+    Telegram download (the only transfer measurement the bot has for free);
+    without it the historical size-only rule applies, which keeps every caller
+    that cannot measure a rate on exactly its previous behaviour.
+
+    ``wav`` and ``opus`` force one container, still bounded by the budget: a
+    policy may not produce a file the temp partition or the provider ceiling
+    cannot take.
+    """
     if max_output_bytes is not None and max_output_bytes <= 0:
         raise MediaToolError("برای فایل صدای آماده‌شده فضای موقت کافی نیست.")
+    policy = getattr(settings, "audio_format_policy", "auto") or "auto"
     if total_duration is None:
         if max_output_bytes is None:
-            return "wav"
+            # No duration and no budget: nothing can be costed, so the policy
+            # alone decides (``auto`` keeps the historical PCM answer).
+            return "opus" if policy == "opus" else "wav"
+        # With a budget the worst case has to be costed, exactly as before.
         total_duration = settings.presentation_max_total_duration
     if not math.isfinite(total_duration) or total_duration < 0:
         raise MediaToolError("مدت صدای ادغام‌شده معتبر نیست.")
@@ -366,14 +392,30 @@ def choose_merge_format(
     output_budget = settings.max_file_size
     if max_output_bytes is not None:
         output_budget = min(output_budget, max_output_bytes)
-    if estimated_wav <= min(settings.presentation_wav_limit_bytes, output_budget):
-        return "wav"
     estimated_opus = total_duration * OPUS_BYTES_PER_SECOND * 1.25 + OPUS_SIZE_MARGIN
     if estimated_opus > output_budget:
+        # Neither container fits: fail now, not after a wasted encode.
         raise MediaToolError(
             "حجم تقریبی صدای ادغام‌شده از فضای موقت یا سقف حجم فایل بیشتر است."
         )
-    return "opus"
+    wav_fits = estimated_wav <= min(settings.presentation_wav_limit_bytes, output_budget)
+    if policy == "opus":
+        return "opus"
+    if policy == "wav":
+        return "wav" if wav_fits else "opus"
+    if not wav_fits:
+        return "opus"
+    rate = egress_bytes_per_second
+    if rate is None or not math.isfinite(rate) or rate <= 0:
+        return "wav"
+    # Seconds of wall clock per container: encoder CPU plus transfer.
+    wav_cost = total_duration / WAV_ENCODE_SPEED + estimated_wav / rate
+    opus_cost = total_duration / OPUS_ENCODE_SPEED + estimated_opus / rate
+    logger.debug(
+        "audio format costing duration=%.0fs egress=%.2fMB/s wav=%.1fs opus=%.1fs",
+        total_duration, rate / 1e6, wav_cost, opus_cost,
+    )
+    return "wav" if wav_cost <= opus_cost else "opus"
 
 
 def merge_output_name(stem: str, output_format: str) -> str:
@@ -415,13 +457,17 @@ async def merge_audio_tracks(
     *,
     total_duration: float | None = None,
     max_output_bytes: int | None = None,
+    egress_bytes_per_second: float | None = None,
     stem: str = "merged",
 ) -> AudioMergeResult:
     """Concatenate audio and return exact source/output durations and clip spans."""
     if not inputs:
         raise MediaToolError("فهرست ورودی برای ادغام صدا خالی است.")
     output_format = choose_merge_format(
-        total_duration, settings, max_output_bytes=max_output_bytes
+        total_duration,
+        settings,
+        max_output_bytes=max_output_bytes,
+        egress_bytes_per_second=egress_bytes_per_second,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / merge_output_name(stem, output_format)
@@ -497,6 +543,7 @@ async def extract_audio_track(
     *,
     total_duration: float | None = None,
     max_output_bytes: int | None = None,
+    egress_bytes_per_second: float | None = None,
     stem: str = "audio",
 ) -> Path:
     """Pull a single mono audio track out of any media file PyAV can read.
@@ -515,6 +562,7 @@ async def extract_audio_track(
         max_output_bytes=(
             settings.max_file_size if max_output_bytes is None else max_output_bytes
         ),
+        egress_bytes_per_second=egress_bytes_per_second,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / merge_output_name(stem, output_format)

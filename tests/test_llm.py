@@ -43,6 +43,111 @@ class EndpointTests(unittest.TestCase):
         )
 
 
+class StructuredOutputAndRoutingTests(unittest.TestCase):
+    """Phase 4 request controls: schema, throughput routing, compile provider."""
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "sections": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {"heading": {"type": "string"}},
+                    "required": ["heading"],
+                },
+            }
+        },
+        "required": ["sections"],
+    }
+
+    def test_no_schema_is_sent_unless_a_caller_asks(self):
+        settings = make_settings()
+        route = note_routes(settings)[0]
+        _url, _headers, payload = llm._build_request_for(route, settings, "S", "U")
+        self.assertNotIn("response_format", payload)
+
+    def test_gemini_schema_uses_the_upper_case_dialect(self):
+        settings = make_settings(
+            note_providers=("gemini",), gemini_api_key="k", note_structured_output=True
+        )
+        route = note_routes(settings)[0]
+        _url, _headers, payload = llm._build_request_for(
+            route, settings, "S", "U", schema=self.schema
+        )
+        generation = payload["generationConfig"]
+        self.assertEqual(generation["responseMimeType"], "application/json")
+        self.assertEqual(generation["responseSchema"]["type"], "OBJECT")
+        section = generation["responseSchema"]["properties"]["sections"]
+        self.assertEqual(section["type"], "ARRAY")
+        self.assertEqual(section["items"]["type"], "OBJECT")
+        # Gemini infers required-ness; the key itself is not in its dialect.
+        self.assertNotIn("required", section["items"])
+
+    def test_openai_style_uses_json_schema_not_strict_mode(self):
+        settings = make_settings(note_structured_output=True)
+        route = note_routes(settings)[0]
+        _url, _headers, payload = llm._build_request_for(
+            route, settings, "S", "U", schema=self.schema
+        )
+        response_format = payload["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertEqual(response_format["json_schema"]["name"], "gamas_notes")
+        self.assertNotIn("strict", response_format["json_schema"])
+
+    def test_a_rejected_schema_is_dropped_instead_of_failing_the_request(self):
+        settings = make_settings(
+            note_providers=("gemini",), gemini_api_key="k", note_structured_output=True
+        )
+        route = note_routes(settings)[0]
+        _url, _headers, payload = llm._build_request_for(
+            route, settings, "S", "U", schema=self.schema
+        )
+        changed = llm._adjust_rejected_request_param(
+            payload, "400: Unknown name 'responseSchema' at 'generation_config'"
+        )
+        self.assertEqual(changed, "generationConfig.responseSchema")
+        self.assertNotIn("responseSchema", payload["generationConfig"])
+        # The JSON mime type stays: the answer must still be a JSON object.
+        self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
+
+    def test_openrouter_throughput_routing_is_opt_in_and_openrouter_only(self):
+        off = make_settings(
+            note_providers=("openrouter",), openrouter_api_key="k"
+        )
+        route = note_routes(off)[0]
+        _url, _headers, payload = llm._build_request_for(route, off, "S", "U")
+        self.assertNotIn("provider", payload)
+
+        on = make_settings(
+            note_providers=("openrouter",),
+            openrouter_api_key="k",
+            note_openrouter_throughput=True,
+        )
+        route = note_routes(on)[0]
+        _url, _headers, payload = llm._build_request_for(route, on, "S", "U")
+        self.assertEqual(payload["provider"], {"sort": "throughput"})
+
+        # A generic OpenAI-compatible gateway never receives an OpenRouter field.
+        generic = make_settings(note_openrouter_throughput=True)
+        route = note_routes(generic)[0]
+        _url, _headers, payload = llm._build_request_for(route, generic, "S", "U")
+        self.assertNotIn("provider", payload)
+
+    def test_the_compile_provider_moves_to_the_front_without_dropping_backups(self):
+        settings = make_settings(
+            note_providers=("openai_compatible", "nara"),
+            nara_api_key="nara-key",
+            note_compile_provider="nara",
+        )
+        routes = note_routes(settings)
+        ordered = llm._ordered_routes(routes, "nara")
+        self.assertEqual([route.slug for route in ordered], ["nara", "openai_compatible"])
+        # An unknown or empty slug changes nothing.
+        self.assertEqual(llm._ordered_routes(routes, ""), routes)
+        self.assertEqual(llm._ordered_routes(routes, "gemini"), routes)
+
+
 class RequestBuildingTests(unittest.TestCase):
     def test_openai_compatible(self):
         settings = make_settings()

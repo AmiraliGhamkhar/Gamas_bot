@@ -30,7 +30,7 @@ import json
 import logging
 import math
 import re
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 
 import aiohttp
@@ -984,6 +984,119 @@ def build_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
     if context_block:
         prompt += "\n\n" + _CHUNKED_CONTENT_RULES + "\n" + context_block
     return prompt
+
+
+def notes_response_schema() -> dict:
+    """A JSON schema for the note document the prompts already describe.
+
+    This is a *shape* constraint, not a content one: every field is optional
+    except the top-level ``sections`` array (a booklet without sections is the
+    failure the prompt itself forbids), and the string arrays are the ones
+    ``_load_json_payload`` reads. Providers that enforce it cannot answer with
+    prose, which is what removes the second "valid JSON only" request from the
+    failure path.
+    """
+    text_array = {"type": "array", "items": {"type": "string"}}
+    section = {
+        "type": "object",
+        "properties": {
+            "heading": {"type": "string"},
+            "paragraphs": text_array,
+            "bullets": text_array,
+            "definitions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "term": {"type": "string"},
+                        "term_en": {"type": "string"},
+                        "definition": {"type": "string"},
+                    },
+                },
+            },
+            "examples": text_array,
+            "steps": text_array,
+            "formulas": text_array,
+            "key_points": text_array,
+            "tables": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "caption": {"type": "string"},
+                        "headers": text_array,
+                        "rows": {
+                            "type": "array",
+                            "items": {"type": "array", "items": {"type": "string"}},
+                        },
+                    },
+                },
+            },
+            "callouts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"type": "string"},
+                        "text": {"type": "string"},
+                    },
+                },
+            },
+        },
+        "required": ["heading"],
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "summary": {"type": "string"},
+            "learning_objectives": text_array,
+            "sections": {"type": "array", "items": section},
+            "practical_tips": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string"},
+                        "basis": {"type": "string"},
+                        "kind": {"type": "string"},
+                    },
+                },
+            },
+            "key_points": text_array,
+            "review_questions": text_array,
+            "glossary": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "term": {"type": "string"},
+                        "definition": {"type": "string"},
+                    },
+                },
+            },
+        },
+        "required": ["sections"],
+    }
+
+
+def _response_schema(settings: Settings) -> dict | None:
+    """The schema to send, or ``None`` when structured output is off."""
+    return notes_response_schema() if getattr(settings, "note_structured_output", False) else None
+
+
+def build_chunk_message(block: str, body: str) -> str:
+    """The user message of one map request: orientation block, then its text.
+
+    The block used to be appended to the **system** prompt, which made that
+    prompt different for every chunk. Providers cache on a byte-identical
+    prefix, so per-chunk text in the system prompt disabled the cache for the
+    4 200-token rule block on every request. Keeping the rules constant and
+    putting the varying material here is what makes the prefix cacheable.
+    """
+    if not block:
+        return body
+    return _CHUNKED_CONTENT_RULES + "\n" + block + "\n\n" + body
 
 
 def build_presentation_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
@@ -2127,6 +2240,23 @@ def effective_compile_max_chars(
     return derived
 
 
+#: Hard ceiling on concurrent note requests. More in-flight requests than a
+#: provider will serve only converts a serial queue into 429s.
+MAX_NOTE_CONCURRENCY = 8
+
+
+def _note_semaphore(settings: Settings, chunks: int) -> asyncio.Semaphore:
+    """Bound map concurrency by the setting *and* the number of chunks.
+
+    A semaphore of ``NOTE_CONCURRENCY`` over two chunks is two idle slots, and
+    over a hundred chunks it is a rate-limit generator; the useful limit is the
+    smaller of the configured value and the actual work, capped at
+    :data:`MAX_NOTE_CONCURRENCY`.
+    """
+    configured = max(1, int(getattr(settings, "note_concurrency", 1) or 1))
+    return asyncio.Semaphore(max(1, min(configured, MAX_NOTE_CONCURRENCY, max(1, chunks))))
+
+
 async def _structure_piece(
     session: aiohttp.ClientSession,
     settings: Settings,
@@ -2154,6 +2284,7 @@ async def _structure_piece(
                 settings,
                 system=system_prompt,
                 user=prompt_prefix + document,
+                schema=_response_schema(settings),
             )
         return _load_json_payload(payload, mode=mode)
     except (LLMContextOverflowError, LLMOutputBudgetError) as exc:
@@ -2404,7 +2535,12 @@ async def _compile_once(
     )
     try:
         payload = await complete_json(
-            session, settings, system=compile_system, user=document
+            session,
+            settings,
+            system=compile_system,
+            user=document,
+            schema=_response_schema(settings),
+            prefer_provider=getattr(settings, "note_compile_provider", ""),
         )
         compiled = _load_json_payload(payload, mode=mode)
     except (LLMError, StructuringError) as exc:
@@ -2630,6 +2766,11 @@ async def _compile_pass(
     return accepted
 
 
+#: Called with the deterministic merge before the editorial compile runs, so
+#: the caller can deliver it while the compile is still in flight.
+MergedCallback = Callable[["StructuredNotes"], Awaitable[None]]
+
+
 async def structure_document(
     document: str,
     settings: Settings,
@@ -2637,6 +2778,7 @@ async def structure_document(
     *,
     mode: str = "full",
     presentation: bool = False,
+    on_merged: MergedCallback | None = None,
 ) -> StructuredNotes:
     """Map-reduce a prepared LLM document into one structured booklet.
 
@@ -2649,7 +2791,9 @@ async def structure_document(
       an overflowing chunk fails over to the next provider instead;
     * a failed chunk fails the whole step (the caller delivers the raw
       transcript, which the user already holds);
-    * a failed compile falls back to the deterministic merge.
+    * a failed compile falls back to the deterministic merge;
+    * ``on_merged`` receives that merge before the compile starts, which is what
+      lets the caller deliver a booklet while the editorial pass still runs.
     """
     document = document.strip()
     if not document:
@@ -2660,12 +2804,12 @@ async def structure_document(
         if presentation
         else build_system_prompt(resolved_mode)
     )
-    semaphore = asyncio.Semaphore(max(1, settings.note_concurrency))
     splitter = split_presentation_document if presentation else split_transcript
     chunk_chars = effective_chunk_chars(settings, system_prompt=base_system)
     chunks = splitter(document, chunk_chars)
     if not chunks:
         raise StructuringError("متن ورودی خالی بود.")
+    semaphore = _note_semaphore(settings, len(chunks))
 
     if len(chunks) == 1:
         logger.info(
@@ -2705,6 +2849,7 @@ async def structure_document(
             f"این متن به {len(chunks)} بخش تقسیم می‌شود که از سقف {MAX_NOTE_CHUNKS} "
             "بخش بیشتر است؛ NOTE_CONTEXT_TOKENS یا NOTE_CHUNK_CHARS را افزایش دهید."
         )
+    semaphore = _note_semaphore(settings, len(chunks))
     if len(chunks) == 1:
         logger.info(
             "note document sizing kind=%s chars=%d chunk_chars=%d chunks=1 context_digest=false",
@@ -2738,15 +2883,13 @@ async def structure_document(
 
     async def map_chunk(index: int, chunk: str) -> StructuredNotes:
         block = context_block_for(context, chunks, index) if include_context else ""
-        system = (
-            build_presentation_system_prompt(resolved_mode, context_block=block)
-            if presentation
-            else build_system_prompt(resolved_mode, context_block=block)
-        )
         prefixed = _chunk_prefix(index, len(chunks)) + chunk
+        # ``base_system`` is byte-identical for every chunk (and every job), so
+        # the provider can serve it from its prefix cache; only the user
+        # message differs. See ``build_chunk_message``.
         return await _structure_piece(
-            session, settings, prefixed,
-            system_prompt=system, mode=resolved_mode, semaphore=semaphore,
+            session, settings, build_chunk_message(block, prefixed),
+            system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation,
         )
 
@@ -2771,6 +2914,13 @@ async def structure_document(
             merged, document, settings, session,
             mode=resolved_mode, presentation=presentation, semaphore=semaphore,
         )
+    if on_merged is not None:
+        # Deliberately after the repair: the provisional booklet is the same
+        # audited content the compile starts from, never the raw merge.
+        try:
+            await on_merged(merged)
+        except Exception:  # noqa: BLE001 - delivery is never a note failure
+            logger.warning("progressive booklet delivery failed", exc_info=True)
 
     return await _compile_pass(
         merged, merged_report, document, context, settings, session,
@@ -2975,9 +3125,12 @@ async def structure_transcript(
     session: aiohttp.ClientSession,
     *,
     mode: str = "full",
+    on_merged: MergedCallback | None = None,
 ) -> StructuredNotes:
     """Transcript text (the cleaned LLM document) → structured notes."""
-    return await structure_document(text, settings, session, mode=mode, presentation=False)
+    return await structure_document(
+        text, settings, session, mode=mode, presentation=False, on_merged=on_merged
+    )
 
 
 async def structure_presentation(
@@ -2988,6 +3141,7 @@ async def structure_presentation(
     *,
     mode: str = "full",
     document: str | None = None,
+    on_merged: MergedCallback | None = None,
 ) -> StructuredNotes:
     """Slide outline + narration transcript → structured notes."""
     resolved_document = (
@@ -2996,5 +3150,10 @@ async def structure_presentation(
         else build_presentation_document(outline, transcript)
     )
     return await structure_document(
-        resolved_document, settings, session, mode=mode, presentation=True
+        resolved_document,
+        settings,
+        session,
+        mode=mode,
+        presentation=True,
+        on_merged=on_merged,
     )

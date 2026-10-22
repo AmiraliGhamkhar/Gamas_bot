@@ -562,18 +562,58 @@ chunks); and a golden test that the same lecture still produces the same paragra
 | `STT_PROVIDERS` | `speechmatics,deepgram,…` | `deepgram,speechmatics` when Deepgram is configured | order *is* the latency policy |
 | `SPEECHMATICS_MODEL` | `enhanced` | `melia-1` (or `standard`) | 24.1× → 206× / 43.9× |
 | `SPEECHMATICS_BASE_URL` | global host | nearest regional host | Melia batch endpoints |
-| `OPUS_CODEC_OPTIONS` (constant) | `voip`, `cl=5` | `audio`, `cl=0` | 106× → 355× |
-| `AUDIO_FORMAT_POLICY` (new) | — | `auto` | choose from measured egress |
-| `TELEGRAM_DOWNLOAD_CONNECTIONS` (new) | — | `4` (1–8) | pipelined range download |
+| `OPUS_CODEC_OPTIONS` (constant) | `audio`, `cl=0` (changed) | `audio`, `cl=0` | 106× → 355× |
+| `AUDIO_FORMAT_POLICY` | `auto` | `auto` | choose from the measured rate |
+| `TELEGRAM_DOWNLOAD_CONNECTIONS` | `1` | `1` → raise after the host measurement | pipelined range download |
 | `NOTE_CONCURRENCY` | `3` | `6`, adaptive | halve map rounds |
 | `NOTE_TTFB_TIMEOUT_SECONDS` | `0` | `25` | first-byte guard |
 | `NOTE_HEDGE_AFTER_SECONDS` | `0` | `60` | one hedged attempt |
 | `NOTE_CHUNK_CHARS` | `64 000` | `64 000`…`96 000` | rounds vs output budget |
-| `NOTE_PROGRESSIVE_BOOKLET` (new) | — | `false` → `true` after A/B | perceived latency |
+| `NOTE_PROGRESSIVE_BOOKLET` | `0` | `1` after a look at the draft | perceived latency |
+| `NOTE_STRUCTURED_OUTPUT` | `0` | `1` when the provider documents it | removes the retry path |
+| `NOTE_OPENROUTER_THROUGHPUT` | `0` | `1` on an OpenRouter route | fastest upstream |
+| `NOTE_COMPILE_PROVIDER` | empty | the fastest configured slug | compile off the slow route |
 
 ---
 
-## 8. References
+## 8. Implementation status
+
+**Applied in code: phases 2, 3 and 4.** Phase 1 stays an operator decision (it changes
+provider and model selection, which needs the E1 quality A/B); phase 0 is measurement, and
+phase 5 is the measured-only fallback list.
+
+| Phase | Change | Where | Default |
+| --- | --- | --- | --- |
+| 2 | `application=audio, compression_level=0` for Opus | `media_worker.OPUS_CODEC_OPTIONS` | on |
+| 2 | Time-based container choice (`encode + bytes/egress`) | `media.choose_merge_format`, fed by the job's measured download rate | `AUDIO_FORMAT_POLICY=auto` |
+| 2 | Concurrent 512 KiB byte-range download on one client | `bot.plan_download_ranges`, `bot._download_media_ranges` | `TELEGRAM_DOWNLOAD_CONNECTIONS=1` (opt-in) |
+| 3 | `wait` long-poll on submit + inline transcript | `stt._speechmatics_wait_params`, `_speechmatics`, `_speechmatics_poll` | `STT_STATUS_LONG_POLL=25` |
+| 4 | Cache-stable system prompt (context moved to the user message) | `notes.build_chunk_message`, `structure_document.map_chunk` | on |
+| 4 | Map concurrency `min(NOTE_CONCURRENCY, chunks, 8)` | `notes._note_semaphore` | on |
+| 4 | Response schema / `json_schema` | `notes.notes_response_schema`, `llm._build_request_for` | `NOTE_STRUCTURED_OUTPUT=0` |
+| 4 | OpenRouter throughput routing | `llm._build_request_for` | `NOTE_OPENROUTER_THROUGHPUT=0` |
+| 4 | Compile routed to a chosen provider first | `llm._ordered_routes`, `notes._compile_once` | `NOTE_COMPILE_PROVIDER=` (empty) |
+| 4 | Progressive booklet (merge delivered before the compile) | `notes.structure_document(on_merged=…)`, `bot._progressive_booklet_sender` | `NOTE_PROGRESSIVE_BOOKLET=0` |
+
+Why the two download/encode flags ship off or at `1`: neither can be verified in a sandbox
+without Telegram, so the proven path stays the default. Turn them on after one measurement
+on the host — `python -m scripts.perf_bench audio` plus the download timing line.
+
+**Deliberately not implemented, with the reason:**
+
+| Phase 2 item | Why it did not ship |
+| --- | --- |
+| *Encode segment i+1 while segment i uploads* | The upload is one `POST` of one file; there is nothing to overlap it with until the file itself is segmented, and segmenting is Phase 5 (measured-only). Implementing an overlap here would mean building the segmentation seam logic to hide a 20 s encode behind a 22 s upload — a 20 s win bought with a new failure mode |
+| *Download at intake, bounded by a semaphore* | It moves the transfer ahead of the job slot, which changes the queue's admission and billing order (a download can then run for a job that is later rejected for credit), and it doubles peak disk use for queued jobs. The measured benefit is queue wait, not per-job latency; it is a scheduling change, not an I/O change |
+
+Everything else in phase 2 is in place. The cumulative expectation is unchanged for the
+parts that shipped; a deployment that turns the download flag on after measuring ≥2.5x
+reaches the numbers in §5, and one that leaves it at `1` lands ~54 s higher on the 2 h
+scenario (download 77 s instead of 24 s).
+
+---
+
+## 9. References
 
 * Speechmatics models (turnaround, features, `melia-1` needs `language=multi`):
   <https://docs.speechmatics.com/speech-to-text/models>

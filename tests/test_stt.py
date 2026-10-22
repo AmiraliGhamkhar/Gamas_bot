@@ -292,6 +292,100 @@ class LanguageNormalizationTests(unittest.TestCase):
         self.assertEqual(_normalize_language("openai_compatible", "fa"), "fa")
 
 
+def speechmatics_words(text: str = "سلام") -> list[dict]:
+    """One json-v2 ``results`` entry, as the transcript endpoint returns it."""
+    return [
+        {"type": "word", "start_time": 0.0, "end_time": 0.5,
+         "alternatives": [{"content": text}]},
+    ]
+
+
+class SpeechmaticsLongPollTests(unittest.IsolatedAsyncioTestCase):
+    """``wait`` on the submit is what removes the poll *and* the transcript GET."""
+
+    async def test_submit_asks_for_the_long_poll_and_the_timed_format(self):
+        settings = make_settings(speechmatics_model="enhanced", stt_language="fa")
+        session = speechmatics_flow(speechmatics_words())
+        await stt._speechmatics(session, audio_file("wait.wav"), settings)
+        params = session.post_kwargs[0]["params"]
+        self.assertEqual(params, {"wait": "25", "format": "json-v2"})
+
+    async def test_long_poll_can_be_disabled(self):
+        settings = make_settings(stt_status_long_poll=0.0)
+        session = speechmatics_flow(speechmatics_words())
+        await stt._speechmatics(session, audio_file("nowait.wav"), settings)
+        # Only the format remains; no wait parameter is invented.
+        self.assertEqual(session.post_kwargs[0]["params"], {"format": "json-v2"})
+
+    async def test_an_inline_transcript_ends_the_job_without_any_get(self):
+        settings = make_settings()
+        session = FakeSession(
+            posts=[
+                FakeResponse(
+                    201,
+                    {
+                        "id": "job-9",
+                        "status": "done",
+                        "json-v2": {"results": speechmatics_words("متن آماده")},
+                    },
+                )
+            ]
+        )
+        raw = await stt._speechmatics(session, audio_file("inline.wav"), settings)
+        self.assertEqual(raw.text, "متن آماده")
+        self.assertEqual(session.get_calls, [])
+
+    async def test_an_empty_inline_document_fails_like_an_empty_transcript(self):
+        settings = make_settings()
+        session = FakeSession(
+            posts=[
+                FakeResponse(
+                    201,
+                    {"id": "job-10", "status": "done", "json-v2": {"results": []}},
+                )
+            ]
+        )
+        # The inline document is the transcript: an empty one is the same
+        # "nothing was transcribed" answer the transcript endpoint would give,
+        # so the chain fails over instead of shipping an empty file.
+        with self.assertRaises(stt.STTError):
+            await stt._speechmatics(session, audio_file("empty.wav"), settings)
+        self.assertEqual(session.get_calls, [])
+
+    async def test_done_without_an_inline_document_skips_the_status_poll(self):
+        settings = make_settings()
+        session = FakeSession(
+            posts=[FakeResponse(201, {"id": "job-11", "status": "done"})],
+            gets=[FakeResponse(200, {"results": speechmatics_words("بدون وضعیت")})],
+        )
+        raw = await stt._speechmatics(session, audio_file("nopoll.wav"), settings)
+        self.assertEqual(raw.text, "بدون وضعیت")
+        self.assertEqual(len(session.get_calls), 1)
+        self.assertTrue(session.get_calls[0].endswith("/transcript"))
+
+    async def test_created_still_polls_and_fetches_the_transcript(self):
+        settings = make_settings(stt_poll_interval=1.0)
+        session = FakeSession(
+            posts=[FakeResponse(201, {"id": "job-12", "status": "created"})],
+            gets=[
+                FakeResponse(200, {"job": {"status": "done"}}),
+                FakeResponse(200, {"results": speechmatics_words("دوباره")}),
+            ],
+        )
+        raw = await stt._speechmatics(session, audio_file("poll.wav"), settings)
+        self.assertEqual(raw.text, "دوباره")
+        self.assertEqual(len(session.get_calls), 2)
+
+    async def test_a_rejected_submit_fails_without_polling(self):
+        settings = make_settings()
+        session = FakeSession(
+            posts=[FakeResponse(201, {"id": "job-13", "status": "rejected"})]
+        )
+        with self.assertRaises(STTRequestError):
+            await stt._speechmatics(session, audio_file("rejected.wav"), settings)
+        self.assertEqual(session.get_calls, [])
+
+
 class ProviderRequestTests(unittest.IsolatedAsyncioTestCase):
     async def test_deepgram_persian_request_sends_language_and_model(self):
         """Persian: model=nova-3 with language=fa is what the API documents."""
