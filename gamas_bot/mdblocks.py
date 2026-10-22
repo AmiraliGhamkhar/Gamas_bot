@@ -35,8 +35,6 @@ from dataclasses import dataclass
 HEADING_PATTERN = re.compile(r"^\s{0,3}(#{1,6})\s+(.*\S)\s*$")
 #: ``-`` / ``*`` / ``+`` / ``•`` with the text after it.
 BULLET_PATTERN = re.compile(r"^\s*[-*+•]\s+(.*\S)\s*$")
-#: A Markdown pipe-table row: it starts with a pipe and has at least two.
-PIPE_ROW_PATTERN = re.compile(r"^\s*\|.*$")
 #: The ``|---|---|`` separator row of a Markdown table.
 PIPE_SEPARATOR_PATTERN = re.compile(r"^\s*\|(?:\s*:?-{1,}:?\s*\|)+\s*$")
 #: A horizontal rule: skipped, never rendered as a paragraph of dashes.
@@ -217,26 +215,3 @@ def parse_blocks(text: str) -> list[TextBlock]:
         blocks.append(TextBlock("paragraph", stripped))
         index += 1
     return blocks
-
-
-def blocks_to_text(blocks: list[TextBlock]) -> str:
-    """Render blocks back to the text they came from.
-
-    Used by the Office section to hand a *parsed* document to a renderer that
-    speaks plain text. The round trip is lossless for every kind but the
-    table, which becomes a Markdown pipe table.
-    """
-    lines: list[str] = []
-    for block in blocks:
-        if block.kind == "heading":
-            lines.append(f"{'#' * max(1, block.level)} {block.text}")
-        elif block.kind == "bullet":
-            lines.append(f"- {block.text}")
-        elif block.kind == "table":
-            for row in block.rows:
-                lines.append("| " + " | ".join(row) + " |")
-            if block.rows:
-                lines.append("|" + "|".join("---" for _ in block.rows[0]) + "|")
-        else:
-            lines.append(block.text)
-    return "\n".join(lines)

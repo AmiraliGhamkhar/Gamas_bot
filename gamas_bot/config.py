@@ -544,10 +544,6 @@ class Settings:
         return any(configured.get(provider, False) for provider in self.stt_providers)
 
     @property
-    def nara_configured(self) -> bool:
-        return bool(self.nara_api_key)
-
-    @property
     def openrouter_configured(self) -> bool:
         return bool(self.openrouter_api_key)
 
@@ -563,11 +559,6 @@ class Settings:
     def note_configured(self) -> bool:
         """Whether at least one provider in the active order is usable."""
         return bool(note_routes(self))
-
-    @property
-    def note_provider_labels(self) -> tuple[str, ...]:
-        """The eligible providers, in the order they will be attempted."""
-        return tuple(route.label for route in note_routes(self))
 
     def tariff_values(self) -> dict[str, int]:
         """The resolved tariff mapping consumed by ``billing.plan_catalog``."""

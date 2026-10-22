@@ -141,6 +141,9 @@ class TranscriptDocument:
 
 _ALNUM_RUN = re.compile(r"[A-Za-z0-9]+")
 _DIGIT_GROUP = re.compile(r"\d+(?:[.,:/]\d+)*")
+_DIGIT_RUN = re.compile(r"\d+")
+_PERSIAN_RUN = re.compile(r"[\u0600-\u06FF]+")
+_ASCII_ALPHA_RUN = re.compile(r"[A-Za-z]+")
 _ZWNJ = "\u200c"
 
 
@@ -155,11 +158,11 @@ def fingerprint(text: str) -> tuple[int, int, int, int, int, int]:
     digits_folded = normalize_digits(text)
     return (
         len(_DIGIT_GROUP.findall(digits_folded)),
-        sum(1 for ch in digits_folded if ch.isdigit()),
+        sum(map(len, _DIGIT_RUN.findall(digits_folded))),
         len(_ALNUM_RUN.findall(digits_folded)),
-        text.count(_ZWNJ),
-        sum(1 for ch in text if "\u0600" <= ch <= "\u06FF" and not ch.isdigit()),
-        sum(1 for ch in text if ch.isascii() and ch.isalpha()),
+        digits_folded.count(_ZWNJ),
+        sum(map(len, _PERSIAN_RUN.findall(digits_folded))),
+        sum(map(len, _ASCII_ALPHA_RUN.findall(digits_folded))),
     )
 
 
@@ -173,7 +176,6 @@ def guarded(text: str, transform, *, name: str) -> str:
     """
     if not text:
         return text
-    before = fingerprint(text)
     try:
         result = transform(text)
     except Exception:  # noqa: BLE001 — a typography fix must never crash delivery
@@ -182,7 +184,9 @@ def guarded(text: str, transform, *, name: str) -> str:
     if not result or not result.strip():
         logger.warning("raw-text transform %r emptied the text; keeping original", name)
         return text
-    if fingerprint(result) != before:
+    if result == text:
+        return result
+    if fingerprint(result) != fingerprint(text):
         logger.warning("raw-text transform %r rejected by the fidelity gate", name)
         return text
     return result
@@ -333,13 +337,16 @@ def paragraphs_from_words(
         if current and gap is not None and gap > paragraph_gap:
             flush()
         elif current and starts_sentence:
-            # A spoken topic transition spans several words («حالا می‌رسیم
-            # سراغ …»), so the marker is tested against a lookahead window.
-            window = " ".join(
-                upcoming.text for upcoming in words[index : index + 8]
-            )
-            if starts_a_topic(window) or current_len >= soft_cap:
+            if current_len >= soft_cap:
                 flush()
+            else:
+                # A spoken topic transition spans several words («حالا می‌رسیم
+                # سراغ …»), so the marker is tested against a lookahead window.
+                window = " ".join(
+                    upcoming.text for upcoming in words[index : index + 8]
+                )
+                if starts_a_topic(window):
+                    flush()
         current.append(word)
         current_len += len(word.text) + 1
         sentence_terminated = _ends_sentence(word.text)

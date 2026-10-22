@@ -121,7 +121,6 @@ CALLOUT_BORDERS = {"هشدار": "EABFC7", "یادآوری": "ECD6A6", "نکته
 CALLOUT_EMOJI = {"هشدار": "⚠️", "یادآوری": "🔔"}
 #: Heading colour by level: navy for section headings, steel blue below.
 HEADING_COLORS = {1: ACCENT, 2: ACCENT_SOFT, 3: ACCENT_SOFT}
-DEFAULT_FONT = "Vazirmatn"
 
 #: The exact cover quotation. It is quoted verbatim and must never be
 #: reworded, translated or normalized away.
@@ -237,9 +236,6 @@ SECTPR_SUCCESSORS = (
     "w:noEndnote", "w:titlePg", "w:textDirection", "w:bidi", "w:rtlGutter",
     "w:docGrid", "w:printerSettings", "w:sectPrChange",
 )
-SECTPR_PAGE_SIZE_SUCCESSORS = (
-    "w:pgMar", "w:paperSrc", "w:pgBorders",
-) + SECTPR_SUCCESSORS
 SECTPR_AFTER_MARGINS = ("w:paperSrc", "w:pgBorders") + SECTPR_SUCCESSORS
 
 
@@ -1477,11 +1473,6 @@ def _configure_toc_entry_styles(document, fonts: DocumentFonts) -> None:
         paragraph_format.left_indent = Cm(0.5 * (level - 1))
 
 
-def _apply_document_defaults(document, fonts: DocumentFonts) -> None:
-    """Backwards-compatible alias for the style configuration."""
-    _configure_styles(document, fonts)
-
-
 def _rewrite_docx_part(docx_bytes: bytes, part_name: str, transform) -> bytes:
     """Apply ``transform`` to one existing XML part of a saved package.
 
@@ -1993,16 +1984,6 @@ def _toc_maximum_level(levels: str) -> int:
 #: the text was written by a user, not by the transcript engine.
 PIPELINE_HEADING_OFFSET = -1
 OFFICE_HEADING_OFFSET = 0
-
-
-def _markdown_heading_level(match) -> int:
-    """Map a Markdown heading match to the Word level it becomes.
-
-    Kept for the callers that still hold a regex match; the mapping itself
-    lives in :func:`gamas_bot.mdblocks.heading_level`, so the parser and the
-    renderer can never disagree about it.
-    """
-    return heading_level(len(match.group(1)), offset=PIPELINE_HEADING_OFFSET)
 
 
 def _fill_static_toc(
@@ -2901,30 +2882,6 @@ def build_plain_docx(
         toc_entries,
         fonts=resolved,
     )
-
-
-def build_raw_text_document(
-    *, title: str, sections: list[tuple[str, str]], meta: DocumentMeta
-) -> str:
-    """The companion .txt file: labelled raw texts exactly as extracted.
-
-    Internal backend metadata (engine, source_name, reference/ID) is NOT included.
-    Only the document title and preparation date appear as educational context.
-    """
-    created = meta.created_at or datetime.now()
-    lines = [title, "=" * 48, f"تاریخ تهیه: {created.strftime('%Y-%m-%d %H:%M')}"]
-    for heading, body in sections:
-        content = body.strip()
-        if not content:
-            continue
-        lines.append("")
-        lines.append("")
-        lines.append(heading)
-        lines.append("-" * min(len(heading), 48))
-        lines.append("")
-        lines.append(content)
-    lines.append("")
-    return "\n".join(lines)
 
 
 def notes_docx_filename(notes: StructuredNotes, reference: str) -> str:

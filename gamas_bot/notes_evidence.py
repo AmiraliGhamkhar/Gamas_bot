@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Iterable, Iterator, Sequence
 
 from .textnorm import normalize_digits, normalize_for_compare
@@ -186,6 +187,15 @@ STANDARD_EQUIVALENTS: dict[str, tuple[str, ...]] = {
     "egfr": ("ای‌جی‌اف‌آر",),
 }
 
+_NORMALIZED_STANDARD_EQUIVALENTS: tuple[tuple[str, tuple[str, ...]], ...] = tuple(
+    (token, tuple(normalize_for_compare(item) for item in spellings))
+    for token, spellings in STANDARD_EQUIVALENTS.items()
+)
+
+_HORIZONTAL_SPACES = re.compile(r"[ \t]+")
+_UNIT_SPACE_COLLAPSE = re.compile(r"[\s\u200c]+")
+_CONTENT_WORD_TOKEN = re.compile(r"[0-9a-z][0-9a-z_+#.\-]*|[\u0600-\u06FF]{3,}")
+
 
 # ===========================================================================
 # Signals
@@ -211,13 +221,6 @@ class Signal:
         if self.kind != "number" or not self.unit:
             return self.value
         return f"{self.value} {self.unit}"
-
-    def compatible_with(self, other: "Signal") -> bool:
-        if self.kind != other.kind or self.value != other.value:
-            return False
-        if self.kind != "number":
-            return True
-        return units_compatible(self.unit, other.unit)
 
 
 def units_compatible(first: str, second: str) -> bool:
@@ -335,7 +338,7 @@ def _fold(text: str) -> str:
     """Digits, decimal separators and whitespace, without touching letters."""
     folded = normalize_digits(text or "")
     folded = folded.translate(_NUMBER_FIXUPS)
-    return re.sub(r"[ \t]+", " ", folded)
+    return _HORIZONTAL_SPACES.sub(" ", folded)
 
 
 def _canonical_value(raw: str) -> str:
@@ -354,7 +357,7 @@ def _canonical_value(raw: str) -> str:
 def _canonical_unit(raw: str) -> str:
     if not raw:
         return ""
-    key = re.sub(r"[\s\u200c]+", " ", raw.strip().casefold())
+    key = _UNIT_SPACE_COLLAPSE.sub(" ", raw.strip().casefold())
     return _UNIT_SPELLINGS.get(key, key)
 
 
@@ -466,8 +469,92 @@ def _terms(signals: Iterable[Signal]) -> tuple[Signal, ...]:
     return tuple(signal for signal in signals if signal.kind in ("term", "url"))
 
 
-def _covers(signal: Signal, candidates: Sequence[Signal]) -> bool:
-    return any(signal.compatible_with(candidate) for candidate in candidates)
+def _build_signal_lookup(signals: Iterable[Signal]) -> dict[tuple[str, str], tuple[Signal, ...]]:
+    """Index signals by ``(kind, value)`` for O(1) compatibility lookups."""
+    grouped: dict[tuple[str, str], list[Signal]] = {}
+    for signal in signals:
+        grouped.setdefault((signal.kind, signal.value), []).append(signal)
+    return {key: tuple(items) for key, items in grouped.items()}
+
+
+def _covers_lookup(
+    signal: Signal, lookup: dict[tuple[str, str], tuple[Signal, ...]]
+) -> bool:
+    bucket = lookup.get((signal.kind, signal.value))
+    if not bucket:
+        return False
+    if signal.kind != "number":
+        return True
+    return any(units_compatible(signal.unit, candidate.unit) for candidate in bucket)
+
+
+@dataclass(frozen=True, slots=True)
+class SourceEvidenceIndex:
+    """Pre-computed source representations so evidence checks avoid redundant passes."""
+
+    source: str
+    masked_folded: str
+    masked_folded_lower: str
+    masked_raw: str
+    compare_source: str
+    compare_masked: str
+    signals: frozenset[Signal]
+    numbers: tuple[Signal, ...]
+    terms: tuple[Signal, ...]
+    number_lookup: dict[tuple[str, str], tuple[Signal, ...]]
+    term_lookup: dict[tuple[str, str], tuple[Signal, ...]]
+    masked_words: frozenset[str]
+    raw_sentences: tuple[tuple[str, frozenset[str]], ...]
+    masked_sentences: tuple[tuple[str, frozenset[str]], ...]
+    standard_equivalent_tokens: frozenset[str]
+
+
+@lru_cache(maxsize=16)
+def build_source_index(source: str) -> SourceEvidenceIndex:
+    """Build and cache the pre-computed evidence index for *source*."""
+    folded = _fold(source)
+    masked_folded = mask_structural(folded)
+    masked_raw = mask_structural(source)
+    compare_source = normalize_for_compare(source)
+    compare_masked = normalize_for_compare(masked_raw)
+    signals = extract_signals(source)
+    numbers = _numbers(signals)
+    terms = _terms(signals)
+    masked_words = content_words(masked_raw)
+    raw_sentences = tuple(
+        (sentence, content_words(sentence))
+        for sentence in split_sentences(source)
+    )
+    masked_sentences = tuple(
+        (sentence, content_words(sentence))
+        for sentence in split_sentences(masked_raw)
+    )
+    standard_equivalent_tokens = (
+        frozenset(
+            token
+            for token, norm_spellings in _NORMALIZED_STANDARD_EQUIVALENTS
+            if any(item in compare_source for item in norm_spellings)
+        )
+        if compare_source
+        else frozenset()
+    )
+    return SourceEvidenceIndex(
+        source=source,
+        masked_folded=masked_folded,
+        masked_folded_lower=masked_folded.casefold(),
+        masked_raw=masked_raw,
+        compare_source=compare_source,
+        compare_masked=compare_masked,
+        signals=signals,
+        numbers=numbers,
+        terms=terms,
+        number_lookup=_build_signal_lookup(numbers),
+        term_lookup=_build_signal_lookup(terms),
+        masked_words=masked_words,
+        raw_sentences=raw_sentences,
+        masked_sentences=masked_sentences,
+        standard_equivalent_tokens=standard_equivalent_tokens,
+    )
 
 
 # ===========================================================================
@@ -537,7 +624,12 @@ def _collect_table(table: object, allowed: set[str]) -> None:
         _collect_tokens(cell, allowed)
 
 
-def _equivalent_additions(notes: object, source: str = "") -> frozenset[str]:
+def _equivalent_additions(
+    notes: object,
+    source: str = "",
+    *,
+    source_index: SourceEvidenceIndex | None = None,
+) -> frozenset[str]:
     """Latin tokens in equivalence positions (see the module docstring).
 
     ``term_en`` fields, glossary terms, short parenthetical expansions, table
@@ -577,15 +669,19 @@ def _equivalent_additions(notes: object, source: str = "") -> frozenset[str]:
         for match in _EQUIVALENCE_PAREN.finditer(text):
             if _is_equivalence_paren(match.group(1)):
                 _collect_tokens(match.group(1), allowed)
-    if source:
-        folded_source = normalize_for_compare(source)
-        for token, spellings in STANDARD_EQUIVALENTS.items():
-            if any(normalize_for_compare(item) in folded_source for item in spellings):
-                allowed.add(token)
+    if source_index is not None:
+        allowed.update(source_index.standard_equivalent_tokens)
+    elif source:
+        allowed.update(build_source_index(source).standard_equivalent_tokens)
     return frozenset(allowed)
 
 
-def audit_notes(source: str, notes: object) -> SignalAudit:
+def audit_notes(
+    source: str,
+    notes: object,
+    *,
+    source_index: SourceEvidenceIndex | None = None,
+) -> SignalAudit:
     """Compare the source's hard facts with the ones the notes assert.
 
     ``notes`` may be a :class:`gamas_bot.notes.StructuredNotes` or any object
@@ -593,28 +689,36 @@ def audit_notes(source: str, notes: object) -> SignalAudit:
     fabrications are reported separately: the first is a completeness defect,
     the second a faithfulness defect, and they need different repairs.
     """
-    source_signals = extract_signals(source)
+    idx = source_index if source_index is not None else build_source_index(source)
     note_signals = extract_signals(_notes_text(notes))
 
-    source_numbers = _numbers(source_signals)
-    source_terms = _terms(source_signals)
+    source_numbers = idx.numbers
+    source_terms = idx.terms
     note_numbers = _numbers(note_signals)
     note_terms = _terms(note_signals)
-    allowed = _equivalent_additions(notes, source)
+    note_number_lookup = _build_signal_lookup(note_numbers)
+    note_term_lookup = _build_signal_lookup(note_terms)
+    allowed = _equivalent_additions(notes, source, source_index=idx)
 
     missing_numbers = tuple(
-        signal for signal in source_numbers if not _covers(signal, note_numbers)
+        signal
+        for signal in source_numbers
+        if not _covers_lookup(signal, note_number_lookup)
     )
     missing_terms = tuple(
-        signal for signal in source_terms if not _covers(signal, note_terms)
+        signal
+        for signal in source_terms
+        if not _covers_lookup(signal, note_term_lookup)
     )
     fabricated_numbers = tuple(
-        signal for signal in note_numbers if not _covers(signal, source_numbers)
+        signal
+        for signal in note_numbers
+        if not _covers_lookup(signal, idx.number_lookup)
     )
     fabricated_terms = tuple(
         signal
         for signal in note_terms
-        if signal.value not in allowed and not _covers(signal, source_terms)
+        if signal.value not in allowed and not _covers_lookup(signal, idx.term_lookup)
     )
     return SignalAudit(
         source_numbers=source_numbers,
@@ -629,7 +733,11 @@ def audit_notes(source: str, notes: object) -> SignalAudit:
 
 
 def evidence_windows(
-    source: str, signals: Sequence[Signal], *, radius: int = 160
+    source: str,
+    signals: Sequence[Signal],
+    *,
+    radius: int = 160,
+    source_index: SourceEvidenceIndex | None = None,
 ) -> tuple[tuple[Signal, str], ...]:
     """The source window in which each signal occurs.
 
@@ -638,10 +746,12 @@ def evidence_windows(
     """
     if not signals or not source:
         return ()
-    masked = mask_structural(_fold(source))
+    idx = source_index if source_index is not None else build_source_index(source)
+    masked = idx.masked_folded
+    masked_lower = idx.masked_folded_lower
     windows: list[tuple[Signal, str]] = []
     for signal in signals:
-        index = masked.casefold().find(signal.value.casefold())
+        index = masked_lower.find(signal.value.casefold())
         if index < 0:
             continue
         start = max(0, index - radius)
@@ -669,7 +779,7 @@ _PERSIAN_STOPWORDS = frozenset(
 def content_words(text: str) -> frozenset[str]:
     """Meaning-bearing words of a text (lower-case, stopwords removed)."""
     folded = normalize_for_compare(text)
-    words = re.findall(r"[0-9a-z][0-9a-z_+#.\-]*|[\u0600-\u06FF]{3,}", folded)
+    words = _CONTENT_WORD_TOKEN.findall(folded)
     return frozenset(
         word for word in words if word not in _PERSIAN_STOPWORDS and word not in _LATIN_STOPWORDS
     )
@@ -684,7 +794,11 @@ def split_sentences(text: str) -> tuple[str, ...]:
 
 
 def sentence_coverage(
-    source: str, notes: object, *, minimum_ratio: float = 0.6
+    source: str,
+    notes: object,
+    *,
+    minimum_ratio: float = 0.6,
+    source_index: SourceEvidenceIndex | None = None,
 ) -> CoverageReport:
     """The share of source sentences with most of their words in the notes.
 
@@ -692,20 +806,20 @@ def sentence_coverage(
     is used to trigger a repair and to log, never to reject a booklet on its
     own.
     """
-    sentences = split_sentences(mask_structural(source))
-    if not sentences:
+    idx = source_index if source_index is not None else build_source_index(source)
+    sentence_pairs = idx.masked_sentences
+    if not sentence_pairs:
         return CoverageReport(0, 0, 1.0)
     note_words = content_words(_notes_text(notes))
     matched = 0
-    for sentence in sentences:
-        words = content_words(sentence)
+    for _sentence, words in sentence_pairs:
         if not words:
             matched += 1  # nothing to lose
             continue
         shared = len(words & note_words)
         if shared / len(words) >= minimum_ratio:
             matched += 1
-    return CoverageReport(len(sentences), matched, matched / len(sentences))
+    return CoverageReport(len(sentence_pairs), matched, matched / len(sentence_pairs))
 
 
 # ===========================================================================
@@ -743,7 +857,12 @@ def _cell_grounded(cell: str, source_words: frozenset[str], source_text: str) ->
     return shared / len(words) >= 0.6
 
 
-def validate_table(table: object, source: str) -> TableVerdict:
+def validate_table(
+    table: object,
+    source: str,
+    *,
+    source_index: SourceEvidenceIndex | None = None,
+) -> TableVerdict:
     """Validate one proposed table: numbers hard, text soft.
 
     * a numeric cell must exist in the source as the same value (unit-aware);
@@ -764,9 +883,10 @@ def validate_table(table: object, source: str) -> TableVerdict:
     if len(headers) < 2 or len(rows) < 2:
         return TableVerdict(False, reason="size")
 
-    source_numbers = _numbers(extract_signals(source))
-    source_words = content_words(mask_structural(source))
-    source_text = normalize_for_compare(mask_structural(source))
+    idx = source_index if source_index is not None else build_source_index(source)
+    source_number_lookup = idx.number_lookup
+    source_words = idx.masked_words
+    source_text = idx.compare_masked
 
     numeric_total = 0
     numeric_failed: list[str] = []
@@ -786,7 +906,7 @@ def validate_table(table: object, source: str) -> TableVerdict:
             if numbers:
                 numeric_total += len(numbers)
                 for signal in numbers:
-                    if not _covers(signal, source_numbers):
+                    if not _covers_lookup(signal, source_number_lookup):
                         numeric_failed.append(signal.label)
                 continue
             text_total += 1
@@ -798,7 +918,7 @@ def validate_table(table: object, source: str) -> TableVerdict:
     for header in headers:
         for signal in _numbers(extract_signals(header, mask=False)):
             numeric_total += 1
-            if not _covers(signal, source_numbers):
+            if not _covers_lookup(signal, source_number_lookup):
                 numeric_failed.append(signal.label)
 
     if numeric_failed:
@@ -820,7 +940,12 @@ MIN_TIP_BASIS_WORDS = 5
 MAX_TIP_CHARS = 400
 
 
-def validate_tip(tip: object, source: str) -> bool:
+def validate_tip(
+    tip: object,
+    source: str,
+    *,
+    source_index: SourceEvidenceIndex | None = None,
+) -> bool:
     """A tip is valid only when its ``basis`` is verifiably in the source.
 
     The check accepts a verbatim substring (after normalisation) or a sentence
@@ -835,15 +960,15 @@ def validate_tip(tip: object, source: str) -> bool:
         return False
     if len(text) > MAX_TIP_CHARS:
         return False
-    folded_source = normalize_for_compare(source)
+    idx = source_index if source_index is not None else build_source_index(source)
+    folded_source = idx.compare_source
     folded_basis = normalize_for_compare(basis)
     if folded_basis and folded_basis in folded_source:
         return True
     basis_words = content_words(basis)
     if not basis_words:
         return False
-    for sentence in split_sentences(source):
-        words = content_words(sentence)
+    for _sentence, words in idx.raw_sentences:
         if not words:
             continue
         if len(basis_words & words) / len(basis_words) >= 0.85:

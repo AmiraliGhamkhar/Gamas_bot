@@ -21,4 +21,4 @@ Start with the [main README](../README.md). Setup commands are split by platform
 | [Architecture](ARCHITECTURE.md) | Short code and data-flow map |
 | [Changelog](CHANGELOG.md) | Recent user-visible changes |
 
-The Persian quick guide is [DEPLOY_FA.md](DEPLOY_FA.md). Detailed historical audit reports and completed/proposed design plans were removed; they described old code or unfinished ideas. OCR is not implemented.
+The Persian quick guide is [DEPLOY_FA.md](DEPLOY_FA.md). OCR is not implemented.

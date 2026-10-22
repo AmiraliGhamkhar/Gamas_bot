@@ -24,24 +24,27 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import math
 import re
 import time
-from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
 
 from .config import NoteRoute, Settings, note_routes
-from .http_util import read_error_body
+from .http_util import (
+    read_error_body,
+    retry_after_seconds as _retry_after_seconds,
+    sanitize_error_text as _sanitize_error_text,
+)
 
 try:
-    import orjson
+    import orjson as _orjson
 
-    _loads = orjson.loads
+    _loads = _orjson.loads
 except ModuleNotFoundError:  # stdlib fallback: identical parsing contract
+    _orjson = None  # type: ignore[assignment]
+
     def _loads(body):  # type: ignore[no-redef]
         return json.loads(body.decode("utf-8", "replace"))
 
@@ -82,11 +85,6 @@ LLM_REQUEST_TIMEOUT_SECONDS = 300.0
 
 #: Bounded retries for transient LLM failures (5xx, 429, network).
 MAX_TRANSIENT_RETRIES = 2
-
-#: Authentication header names a caller may never override.
-RESERVED_HEADER_NAMES = frozenset(
-    {"authorization", "x-api-key", "x-goog-api-key", "anthropic-version"}
-)
 
 
 class LLMError(RuntimeError):
@@ -231,70 +229,6 @@ def _endpoint(base_url: str, suffix: str) -> str:
         base_path = base_path[: -len("/models")].rstrip("/")
     path = base_path if base_path.endswith(suffix_path) else base_path + suffix_path
     return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
-
-
-def _parse_retry_value(raw: object) -> float | None:
-    """Parse one Retry-After / RetryInfo / RateLimit-Reset value to seconds."""
-    text = str(raw if raw is not None else "").strip()
-    if not text:
-        return None
-    # Google RPC RetryInfo format: "42s" or "12.5s".
-    if text.endswith("s") and text[:-1].replace(".", "", 1).isdigit():
-        text = text[:-1]
-    try:
-        value = float(text)
-        if math.isfinite(value):
-            now = datetime.now(timezone.utc).timestamp()
-            if value > 1_000_000_000_000:
-                # OpenRouter X-RateLimit-Reset is Unix epoch in milliseconds.
-                value = (value / 1000.0) - now
-            elif value > 1_000_000_000:
-                # Unix epoch in seconds.
-                value = value - now
-            return min(max(value, 0.0), 86_400.0)
-    except (TypeError, ValueError):
-        pass
-    try:
-        retry_at = parsedate_to_datetime(text)
-        if retry_at.tzinfo is None:
-            retry_at = retry_at.replace(tzinfo=timezone.utc)
-        return min(
-            max((retry_at - datetime.now(timezone.utc)).total_seconds(), 0.0),
-            86_400.0,
-        )
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
-def _retry_after_seconds(headers, payload: object = None) -> float | None:
-    if headers:
-        for header_name in ("Retry-After", "retry-after", "X-RateLimit-Reset", "x-ratelimit-reset"):
-            parsed = _parse_retry_value(headers.get(header_name, ""))
-            if parsed is not None:
-                return parsed
-    if isinstance(payload, dict):
-        error = payload.get("error")
-        if isinstance(error, dict):
-            metadata = error.get("metadata")
-            if isinstance(metadata, dict):
-                meta_headers = metadata.get("headers")
-                if isinstance(meta_headers, dict):
-                    for key in ("Retry-After", "retry-after", "X-RateLimit-Reset", "x-ratelimit-reset"):
-                        parsed = _parse_retry_value(meta_headers.get(key, ""))
-                        if parsed is not None:
-                            return parsed
-            details = error.get("details")
-            if isinstance(details, list):
-                for item in details:
-                    if isinstance(item, dict) and "retryDelay" in item:
-                        parsed = _parse_retry_value(item.get("retryDelay"))
-                        if parsed is not None:
-                            return parsed
-    return None
-
-
-def _sanitize_error_text(value: object, limit: int = 180) -> str:
-    return " ".join(str(value).split())[:limit]
 
 
 def _redact_secrets(text: str, api_key: str | None) -> str:
@@ -753,21 +687,6 @@ def _build_get_request_for(
         model_path = _openrouter_model_path(route.model)
         return _endpoint(route.base_url, f"models/{model_path}"), headers
     return _endpoint(route.base_url, clean_target or "models"), headers
-
-
-def _build_get_request(
-    settings: Settings, target: str = "models", *, route: NoteRoute | None = None
-) -> tuple[str, dict[str, str]]:
-    """Build the GET request for one route — by default the first eligible one."""
-    if route is None:
-        routes = note_routes(settings)
-        if not routes:
-            raise LLMAuthError(
-                "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
-                "NARA_API_KEY / OPENROUTER_API_KEY)."
-            )
-        route = routes[0]
-    return _build_get_request_for(route, target)
 
 
 #: Gemini FinishReason values that report safety, policy or recitation blocks
@@ -1248,8 +1167,21 @@ async def _hedge_two(first_factory, second_factory, hedge_after: float):
     raise _HedgedFailures(errors[first_task], errors[second_task])
 
 
-def _parse_sse_line(line: bytes) -> dict | None:
-    text = line.decode("utf-8", "replace").strip() if isinstance(line, (bytes, bytearray)) else str(line).strip()
+def _parse_sse_line(line: bytes | str) -> dict | None:
+    if isinstance(line, (bytes, bytearray)):
+        raw = bytes(line).strip()
+        if not raw or raw.startswith(b":"):
+            return None
+        if raw.startswith(b"data:"):
+            raw = raw[5:].strip()
+        if not raw or raw == b"[DONE]":
+            return None
+        try:
+            parsed = _loads(raw)
+        except (ValueError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    text = str(line).strip()
     if not text or text.startswith(":"):
         return None
     if text.startswith("data:"):
@@ -1263,6 +1195,15 @@ def _parse_sse_line(line: bytes) -> dict | None:
     return parsed if isinstance(parsed, dict) else None
 
 
+def _gemini_sse_url(url: str) -> str:
+    """Convert a Gemini ``:generateContent`` URL into ``:streamGenerateContent?alt=sse``."""
+    stream_url = url.replace(":generateContent", ":streamGenerateContent")
+    if "alt=sse" in stream_url:
+        return stream_url
+    sep = "&" if "?" in stream_url else "?"
+    return f"{stream_url}{sep}alt=sse"
+
+
 async def _complete_streaming_on_route(
     route: NoteRoute,
     session: aiohttp.ClientSession,
@@ -1273,18 +1214,27 @@ async def _complete_streaming_on_route(
     payload: dict,
     timeout_seconds: float,
 ) -> str:
-    """OpenAI-style streaming completion guarded by a first-byte deadline."""
+    """OpenAI- or Gemini-style streaming completion guarded by a first-byte deadline."""
     ttfb_timeout = float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0)
-    stream_payload = dict(payload)
-    stream_payload["stream"] = True
-    stream_payload["stream_options"] = {"include_usage": True}
+    is_gemini = route.style == "gemini"
+    if is_gemini:
+        stream_url = _gemini_sse_url(url)
+        stream_payload = payload
+    else:
+        stream_url = url
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
+        stream_payload["stream_options"] = {"include_usage": True}
     started = time.perf_counter()
     ttfb_ms = 0.0
     text_parts: list[str] = []
     finish_reason = ""
     usage: dict = {}
+    saw_thought = False
+    model_version = ""
+    raw_fallback_body: bytes | None = None
     async with session.post(
-        url,
+        stream_url,
         headers=headers,
         json=stream_payload,
         timeout=aiohttp.ClientTimeout(total=timeout_seconds, sock_connect=10),
@@ -1311,18 +1261,43 @@ async def _complete_streaming_on_route(
                     lines.append(line)
         else:  # Fallback for doubles exposing only read()
             body = await response.read()
+            raw_fallback_body = body
             ttfb_ms = (time.perf_counter() - started) * 1000.0
             lines = body.splitlines()
+        parsed_chunks = 0
         for line in lines:
             chunk = _parse_sse_line(line)
             if chunk is None:
                 continue
+            parsed_chunks += 1
             error_obj = chunk.get("error")
             if _has_error_content(error_obj):
                 status = _infer_in_body_error_status(error_obj)
                 raise _error_from_payload(
                     route.label, status, {"error": error_obj}, resp_headers, route.api_key or None
                 )
+            if is_gemini:
+                if isinstance(chunk.get("usageMetadata"), dict):
+                    usage = chunk["usageMetadata"]
+                if isinstance(chunk.get("modelVersion"), str):
+                    model_version = chunk["modelVersion"]
+                candidates = chunk.get("candidates")
+                if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+                    first_cand = candidates[0]
+                    if first_cand.get("finishReason"):
+                        finish_reason = str(first_cand["finishReason"])
+                    content_obj = first_cand.get("content")
+                    parts = content_obj.get("parts") if isinstance(content_obj, dict) else None
+                    if isinstance(parts, list):
+                        for part in parts:
+                            if not isinstance(part, dict):
+                                continue
+                            if part.get("thought") is True:
+                                saw_thought = True
+                                continue
+                            if "text" in part and part.get("text") is not None:
+                                text_parts.append(str(part.get("text", "")))
+                continue
             if isinstance(chunk.get("usage"), dict):
                 usage = chunk["usage"]
             choices = chunk.get("choices")
@@ -1342,13 +1317,38 @@ async def _complete_streaming_on_route(
                 elif isinstance(choice.get("message"), dict) and choice["message"].get("content"):
                     text_parts.append(str(choice["message"]["content"]))
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    assembled: dict = {
-        "choices": [{
-            "message": {"content": "".join(text_parts)},
-            "finish_reason": finish_reason or "stop",
-        }],
-        "usage": usage,
-    }
+    if parsed_chunks == 0 and raw_fallback_body:
+        try:
+            fallback_dict = _loads(raw_fallback_body)
+            if isinstance(fallback_dict, dict):
+                _log_usage(route, fallback_dict, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms)
+                _raise_if_in_body_error(route.label, fallback_dict, resp_headers, route.api_key or None)
+                return _parse_response(fallback_dict, route.style)
+        except (ValueError, TypeError):
+            pass
+    if is_gemini:
+        assembled_parts: list[dict[str, object]] = []
+        if saw_thought:
+            assembled_parts.append({"thought": True, "text": ""})
+        if text_parts:
+            assembled_parts.append({"text": "".join(text_parts)})
+        assembled = {
+            "candidates": [{
+                "content": {"parts": assembled_parts},
+                "finishReason": finish_reason or "STOP",
+            }],
+            "usageMetadata": usage,
+        }
+        if model_version:
+            assembled["modelVersion"] = model_version
+    else:
+        assembled = {
+            "choices": [{
+                "message": {"content": "".join(text_parts)},
+                "finish_reason": finish_reason or "stop",
+            }],
+            "usage": usage,
+        }
     _log_usage(route, assembled, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms)
     _raise_if_in_body_error(route.label, assembled, resp_headers, route.api_key or None)
     return _parse_response(assembled, route.style)
@@ -1399,7 +1399,7 @@ async def _complete_on_route(
         try:
             if (
                 float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0) > 0
-                and route.style == "openai"
+                and route.style in ("openai", "gemini")
             ):
                 return await _complete_streaming_on_route(
                     route, session, settings, url=url, headers=headers,
@@ -1633,9 +1633,6 @@ async def complete(
     raise type(failures[0])("؛ ".join(descriptions))
 
 
-_JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
-
-
 def extract_json_object(text: str) -> str:
     """Extract the outermost JSON object from a model answer.
 
@@ -1675,6 +1672,16 @@ def extract_json_object(text: str) -> str:
 
 def _parse_json_object(text: str) -> dict:
     """Parse strict JSON and enforce the object shape used by note prompts."""
+    if _orjson is not None and isinstance(text, str):
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                fast_payload = _orjson.loads(stripped)
+                if isinstance(fast_payload, dict):
+                    return fast_payload
+            except ValueError:
+                pass
+
     def reject_constant(value: str) -> None:
         raise ValueError(f"non-standard JSON constant: {value}")
 

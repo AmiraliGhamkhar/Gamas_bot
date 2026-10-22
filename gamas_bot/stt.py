@@ -22,13 +22,16 @@ import math
 import mimetypes
 import time
 from dataclasses import dataclass, replace
-from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import aiohttp
+
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - optional fast-path
+    _orjson = None  # type: ignore[assignment]
 
 from .config import (
     DEEPGRAM_MAX_UPLOAD,
@@ -36,7 +39,11 @@ from .config import (
     SPEECHMATICS_MAX_UPLOAD,
     Settings,
 )
-from .http_util import read_error_body
+from .http_util import (
+    read_error_body,
+    retry_after_seconds as _retry_after_seconds,
+    sanitize_error_text as _sanitize_error,
+)
 from .transcript import RawTranscript, Word
 
 logger = logging.getLogger(__name__)
@@ -112,32 +119,6 @@ def reset_cooldowns() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _retry_after_seconds(headers) -> float | None:
-    """Parse Retry-After (seconds or HTTP date), bounded to one day."""
-    raw = str(headers.get("Retry-After", "")).strip()
-    if not raw:
-        return None
-    try:
-        seconds = float(raw)
-        if math.isfinite(seconds):
-            return min(max(seconds, 0.0), 86_400.0)
-    except (TypeError, ValueError):
-        pass
-    try:
-        retry_at = parsedate_to_datetime(raw)
-        if retry_at.tzinfo is None:
-            retry_at = retry_at.replace(tzinfo=timezone.utc)
-        return min(max((retry_at - datetime.now(timezone.utc)).total_seconds(), 0.0), 86_400.0)
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
-def _sanitize_error(value: object, limit: int = 180) -> str:
-    """Bound a provider-supplied string so it is safe to log."""
-    text = " ".join(str(value).split())
-    return text[:limit]
-
-
 def _has_meaningful_text(text: str) -> bool:
     """True when a transcript contains at least one letter or digit.
 
@@ -160,9 +141,7 @@ async def _error_from_response(
     body = await read_error_body(response) if body is None else body
     detail = None
     try:
-        import json
-
-        payload = json.loads(body.decode("utf-8", "replace"))
+        payload = _json_loads(body)
         if isinstance(payload, dict):
             error = payload.get("error")
             if isinstance(error, dict) and isinstance(error.get("message"), str):
@@ -206,6 +185,32 @@ def _transfer_timeout(settings: Settings) -> aiohttp.ClientTimeout:
 #: value explicitly.
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
+#: Read/upload buffer size for large audio and JSON streams (matches aiohttp's
+#: 256 KiB payload chunk size while reducing OS read syscalls).
+AUDIO_UPLOAD_BUFFER_BYTES = 1024 * 1024
+RESPONSE_READ_CHUNK_BYTES = 256 * 1024
+
+
+def _json_loads(raw: bytes | str) -> object:
+    """Parse JSON bytes/str with ``orjson`` when available, stdlib otherwise."""
+    if _orjson is not None:
+        try:
+            return _orjson.loads(raw)
+        except ValueError:
+            if isinstance(raw, (bytes, bytearray)):
+                return _orjson.loads(raw.decode("utf-8", errors="replace"))
+            raise
+    if isinstance(raw, (bytes, bytearray)):
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    return json.loads(raw)
+
+
+def _json_dumps_str(value: object) -> str:
+    """Serialize a small config dictionary to a JSON string."""
+    if _orjson is not None:
+        return _orjson.dumps(value).decode("utf-8")
+    return json.dumps(value)
+
 
 async def _read_bounded(label: str, response, max_bytes: int) -> bytes:
     """Read a response body up to ``max_bytes``, never more (audit F-7).
@@ -225,7 +230,7 @@ async def _read_bounded(label: str, response, max_bytes: int) -> bytes:
     chunks: list[bytes] = []
     total = 0
     while True:
-        chunk = await reader(min(64 * 1024, max_bytes + 1 - total))
+        chunk = await reader(min(RESPONSE_READ_CHUNK_BYTES, max_bytes + 1 - total))
         if not chunk:
             break
         chunks.append(chunk)
@@ -251,7 +256,7 @@ async def _json_response(
         raise STTError(f"{label} پاسخ بزرگ‌تری از حد مجاز برگرداند.")
     body = await _read_bounded(label, response, max_bytes)
     try:
-        return json.loads(body)
+        return _json_loads(body)
     except (ValueError, TypeError) as exc:
         raise STTError(f"{label} پاسخ JSON معتبری برنگرداند.") from exc
 
@@ -359,7 +364,9 @@ def _speechmatics_words(results: object) -> tuple[str, list[Word]]:
     """
     if not isinstance(results, (list, tuple)):
         return "", []
-    tokens: list[Word] = []
+    # Stage mutable [text, start, end] entries so attaching punctuation mutates
+    # in place rather than discarding and reallocating frozen Word dataclasses.
+    staged: list[list[object]] = []
     # The bool marks punctuation already attached to the previous token (for
     # attaches_to="both") but still needed as a prefix on the next token.
     pending: list[tuple[str, bool]] = []
@@ -379,41 +386,42 @@ def _speechmatics_words(results: object) -> tuple[str, list[Word]]:
         content = str(alternative.get("content", "")).strip()
         if not content:
             continue
-        start = item.get("start_time", item.get("startTime"))
-        end = item.get("end_time", item.get("endTime"))
-        start_value = _optional_float(start)
-        end_value = _optional_float(end)
         if item_type == "punctuation":
             attachment = str(alternative.get("attaches_to", "")).strip().lower()
             if attachment == "next":
                 pending.append((content, False))
             elif attachment == "both":
-                attached_to_previous = bool(tokens)
-                if tokens:
-                    tokens[-1] = Word(
-                        tokens[-1].text + content, tokens[-1].start, tokens[-1].end
-                    )
+                attached_to_previous = bool(staged)
+                if staged:
+                    staged[-1][0] = str(staged[-1][0]) + content
                 pending.append((content, attached_to_previous))
             else:  # previous, or unknown: closing the previous token is safest
-                if tokens:
-                    tokens[-1] = Word(
-                        tokens[-1].text + content, tokens[-1].start, tokens[-1].end
-                    )
+                if staged:
+                    staged[-1][0] = str(staged[-1][0]) + content
                 else:
                     pending.append((content, False))
             continue
-        prefix = "".join(content for content, _already_attached in pending)
-        tokens.append(Word(prefix + content, start_value, end_value))
-        pending.clear()
-    if pending and tokens:
+        start = item.get("start_time", item.get("startTime"))
+        end = item.get("end_time", item.get("endTime"))
+        start_value = _optional_float(start)
+        end_value = _optional_float(end)
+        prefix = "".join(part for part, _already_attached in pending) if pending else ""
+        staged.append([prefix + content, start_value, end_value])
+        if pending:
+            pending.clear()
+    if pending and staged:
         # A dangling "next" mark has nowhere to go, so attach it to the last
         # word; a dangling "both" mark is already present there and must not
         # be duplicated.
         suffix = "".join(content for content, already_attached in pending if not already_attached)
         if suffix:
-            tokens[-1] = Word(tokens[-1].text + suffix, tokens[-1].start, tokens[-1].end)
+            staged[-1][0] = str(staged[-1][0]) + suffix
     elif pending:
-        tokens.append(Word("".join(content for content, _already_attached in pending)))
+        staged.append(["".join(content for content, _already_attached in pending), None, None])
+    tokens = [
+        Word(str(entry[0]), entry[1], entry[2])  # type: ignore[arg-type]
+        for entry in staged
+    ]
     text = " ".join(token.text for token in tokens if token.text).strip()
     return text, tokens
 
@@ -421,8 +429,6 @@ def _speechmatics_words(results: object) -> tuple[str, list[Word]]:
 async def _speechmatics(
     session: aiohttp.ClientSession, audio_path: Path, settings: Settings
 ) -> RawTranscript:
-    import json
-
     language = _normalize_language(
         "speechmatics", settings.stt_language, model=settings.speechmatics_model
     )
@@ -434,8 +440,8 @@ async def _speechmatics(
         },
     }
     form = aiohttp.FormData()
-    form.add_field("config", json.dumps(config), content_type="application/json")
-    with audio_path.open("rb") as audio:
+    form.add_field("config", _json_dumps_str(config), content_type="application/json")
+    with audio_path.open("rb", buffering=AUDIO_UPLOAD_BUFFER_BYTES) as audio:
         form.add_field(
             "data_file", audio, filename=audio_path.name,
             content_type="application/octet-stream",
@@ -548,6 +554,14 @@ async def _get_json(
             await asyncio.sleep(delay)
 
 
+def _adaptive_poll_interval(base_interval: float, poll_count: int) -> float:
+    """Progressive polling interval: faster initial checks, capped at *base_interval*."""
+    if base_interval <= 0.5 or poll_count >= 4:
+        return base_interval
+    scale = 0.25 * poll_count
+    return min(base_interval, max(0.5, base_interval * scale))
+
+
 async def _speechmatics_poll(
     session: aiohttp.ClientSession,
     settings: Settings,
@@ -556,6 +570,7 @@ async def _speechmatics_poll(
     submitted_at: float,
 ) -> RawTranscript:
     deadline = submitted_at + settings.stt_job_timeout
+    poll_count = 0
     while True:
         if time.monotonic() >= deadline:
             raise STTTransientError("زمان پردازش Speechmatics به پایان رسید.")
@@ -579,8 +594,12 @@ async def _speechmatics_poll(
             break
         if status in {"rejected", "failed", "deleted", "expired"}:
             raise STTRequestError(f"Speechmatics کار را با وضعیت {status} پایان داد.")
+        poll_count += 1
         await asyncio.sleep(
-            min(settings.stt_poll_interval, max(0.1, deadline - time.monotonic()))
+            min(
+                _adaptive_poll_interval(settings.stt_poll_interval, poll_count),
+                max(0.1, deadline - time.monotonic()),
+            )
         )
 
     result = await _get_json(
@@ -662,7 +681,7 @@ async def _deepgram(
         params["detect_language"] = "true"
     elif language:
         params["language"] = language
-    with audio_path.open("rb") as audio:
+    with audio_path.open("rb", buffering=AUDIO_UPLOAD_BUFFER_BYTES) as audio:
         async with session.post(
             _endpoint(settings.deepgram_base_url, "listen"),
             params=params,
@@ -741,7 +760,7 @@ async def _openai_compatible(
     form.add_field("response_format", "verbose_json")
     retry_plain = False
     payload: object = None
-    with audio_path.open("rb") as audio:
+    with audio_path.open("rb", buffering=AUDIO_UPLOAD_BUFFER_BYTES) as audio:
         form.add_field(
             "file", audio, filename=audio_path.name,
             content_type=_audio_content_type(audio_path),
@@ -783,7 +802,7 @@ async def _openai_plain(
     if language:
         form.add_field("language", language)
     form.add_field("response_format", "json")
-    with audio_path.open("rb") as audio:
+    with audio_path.open("rb", buffering=AUDIO_UPLOAD_BUFFER_BYTES) as audio:
         form.add_field(
             "file", audio, filename=audio_path.name,
             content_type=_audio_content_type(audio_path),
@@ -865,6 +884,21 @@ def largest_configured_upload(settings: Settings) -> int | None:
             and PROVIDERS[slug].configured(settings))
     ]
     return max(limits) if limits else None
+
+
+def first_configured_stt_url(settings: Settings) -> str | None:
+    """Base URL of the first configured STT provider, for connection pre-warming."""
+    for slug in settings.stt_providers:
+        spec = PROVIDERS.get(slug)
+        if spec is None or not spec.configured(settings):
+            continue
+        if slug == "speechmatics":
+            return settings.speechmatics_base_url
+        if slug == "deepgram":
+            return settings.deepgram_base_url
+        if slug == "openai_compatible":
+            return settings.stt_openai_base_url
+    return None
 
 
 #: Bounded per-provider retries for transient failures. They apply to

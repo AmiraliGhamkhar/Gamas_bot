@@ -4,7 +4,7 @@ The bot reads slide text and extracts linked audio/video narration from supporte
 
 ## Narration, timing and credit
 
-Usable narration is combined into one STT request per deck. When a provider returns timestamps, text is assigned to a slide only if the timing fits that slide's audio span. Untimed, unlinked or ambiguous text is labeled as unmapped instead of guessed. Unreferenced media is excluded unless `PRESENTATION_INCLUDE_UNREFERENCED_MEDIA=true`.
+Slide text, speaker notes, diagrams and charts are read from a single open `.pptx` archive with per-slide `.rels` caching. Usable narration is combined into one STT request per deck. When a provider returns timestamps, words are matched against sorted clip spans via binary-search windowing and assigned to a slide only if the timing fits that slide's audio span. Untimed, unlinked or ambiguous text is labeled as unmapped instead of guessed. Unreferenced media is excluded unless `PRESENTATION_INCLUDE_UNREFERENCED_MEDIA=true`.
 
 Billing uses the measured source narration duration. Synthetic silence between clips counts toward `PRESENTATION_MAX_TOTAL_DURATION` but is not billed.
 

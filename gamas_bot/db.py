@@ -36,7 +36,11 @@ logger = logging.getLogger(__name__)
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations" / "v3"
 
 TERMINAL_SUBMISSION_STATUSES = ("done", "partial", "failed", "rejected")
-LEDGER_KINDS = ("credit", "debit")
+
+ADD_COLUMN_RE = re.compile(
+    r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
+    r"[\"'`]?([A-Za-z_][A-Za-z0-9_]*)[\"'`]?"
+)
 
 
 def utc_now() -> datetime:
@@ -181,14 +185,10 @@ class Database:
 
     async def _without_applied_columns(self, raw_sql: str) -> str:
         """Drop ``ADD COLUMN`` statements whose column already exists."""
-        pattern = re.compile(
-            r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
-            r"[\"'`]?([A-Za-z_][A-Za-z0-9_]*)[\"'`]?"
-        )
         known: dict[str, set[str]] = {}
         kept: list[str] = []
         for line in raw_sql.splitlines():
-            match = pattern.match(line)
+            match = ADD_COLUMN_RE.match(line)
             if match:
                 table, column = match.group(1), match.group(2)
                 if table not in known:
@@ -448,11 +448,6 @@ class Database:
                 "VALUES (?, ?, ?, 'pending', ?)",
                 (user_id, kind, filename, iso(utc_now())),
             )
-            return int(cursor.lastrowid or 0)
-
-    async def _write_returning(self, sql: str, params: tuple = ()) -> int:
-        async with self._transaction():
-            cursor = await self.db.execute(sql, params)
             return int(cursor.lastrowid or 0)
 
     async def set_submission_status(
@@ -778,14 +773,6 @@ class Database:
                 (iso(utc_now()), reason[:200], submission_id),
             )
             return bool(cursor.rowcount)
-
-    async def credit_history(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
-            "SELECT seconds, kind, note, expires_at, created_at FROM ledger "
-            "WHERE user_id = ? ORDER BY id DESC LIMIT ?",
-            (user_id, limit),
-        )
-        return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------ plans
     async def sync_plans(self, catalog: list[dict[str, Any]]) -> None:

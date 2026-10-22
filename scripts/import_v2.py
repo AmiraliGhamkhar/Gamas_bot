@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -34,7 +33,7 @@ from pathlib import Path
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_DIR))
 
-from gamas_bot.db import MIGRATIONS_DIR  # noqa: E402
+from gamas_bot.db import ADD_COLUMN_RE, MIGRATIONS_DIR  # noqa: E402
 
 V2_STATUS_MAP = {
     "awaiting_receipt": "pending",
@@ -61,12 +60,6 @@ def parse_expiry(expires_at: str | None) -> datetime | None:
     return parsed
 
 
-_ADD_COLUMN_RE = re.compile(
-    r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
-    r"[\"'`]?([A-Za-z_][A-Za-z0-9_]*)[\"'`]?"
-)
-
-
 def _without_applied_columns(target: sqlite3.Connection, raw_sql: str) -> str:
     """Drop ``ADD COLUMN`` statements whose column already exists.
 
@@ -77,7 +70,7 @@ def _without_applied_columns(target: sqlite3.Connection, raw_sql: str) -> str:
     known: dict[str, set[str]] = {}
     kept: list[str] = []
     for line in raw_sql.splitlines():
-        match = _ADD_COLUMN_RE.match(line)
+        match = ADD_COLUMN_RE.match(line)
         if match:
             table, column = match.group(1), match.group(2)
             if table not in known:
