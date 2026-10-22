@@ -26,6 +26,9 @@ that no one is watching. Reopening keeps all earlier messages.
 - A user can list, read, reply to, close and reopen only tickets they own. Ownership is checked in
   the database layer (`add_ticket_message`, `close_ticket`, `reopen_ticket`) and again in the bot.
 - Administrators are checked with the existing `ADMIN_IDS` mechanism on every `adm:` callback.
+- Admin list filters cover `active`, `open`, `awaiting_admin` (`wait`), `awaiting_user` (`user`),
+  and `closed`, plus `همه دسته‌ها` and all four categories (`💳 پرداخت`, `⚙️ مشکل فنی`,
+  `📦 اشتراک و اعتبار`, `📌 سایر موارد`); switching status tabs preserves the selected category.
 - An admin reply is routed by the ticket ID carried by the admin's own verified callback, never by
   a username or a free-text lookup.
 

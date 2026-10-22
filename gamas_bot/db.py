@@ -207,6 +207,8 @@ class Database:
         connection. Helpers called inside this context must not open another one.
         """
         async with self._write_lock:
+            if self.db.in_transaction:
+                await self.db.rollback()
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
                 yield
@@ -850,7 +852,13 @@ class Database:
                 "VALUES (?, ?, 'awaiting_payment', ?, ?, ?, ?)",
                 (user_id, plan_code, iso(utc_now()), seconds, int(price), validity_days),
             )
-            return int(cursor.lastrowid or 0)
+            payment_id = int(cursor.lastrowid or 0)
+        logger.info(
+            "payment state transition payment_id=%s plan_code=%s status=awaiting_payment",
+            payment_id,
+            plan_code,
+        )
+        return payment_id
 
     async def cancel_payment(self, payment_id: int, user_id: int) -> bool:
         """Only the owner may cancel an unsubmitted purchase."""
@@ -861,7 +869,13 @@ class Database:
                 "WHERE payment_id = ? AND user_id = ? AND status IN ('pending','awaiting_payment') "
                 "AND receipt_path IS NULL", (iso(utc_now()), payment_id, user_id),
             )
-            return bool(cursor.rowcount)
+            changed = bool(cursor.rowcount)
+        if changed:
+            logger.info(
+                "payment state transition payment_id=%s status=cancelled",
+                payment_id,
+            )
+        return changed
 
     async def set_payment_receipt(
         self, payment_id: int, receipt_path: str, user_id: int | None = None
@@ -931,47 +945,64 @@ class Database:
             )
             return dict(rows[0]) if rows else None
 
+    async def open_awaiting_payment_for_user(self, user_id: int) -> dict[str, Any] | None:
+        """Return the user's open unsubmitted order awaiting a receipt, if any."""
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                f"SELECT {self._PAYMENT_COLUMNS} FROM payments "
+                "WHERE user_id = ? AND status IN ('awaiting_payment', 'pending') "
+                "AND receipt_path IS NULL ORDER BY payment_id DESC LIMIT 1",
+                (user_id,),
+            )
+            return dict(rows[0]) if rows else None
+
     async def pending_payments(self) -> list[dict[str, Any]]:
         # For backward compat, includes legacy 'pending' and new explicit states.
-        rows = await self.db.execute_fetchall(
-            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status IN ('pending','awaiting_payment','pending_review') "
-            "ORDER BY payment_id"
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status IN ('pending','awaiting_payment','pending_review') "
+                "ORDER BY payment_id"
+            )
+            return [dict(row) for row in rows]
 
     async def awaiting_payments(self) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
-            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status = 'awaiting_payment' "
-            "ORDER BY payment_id"
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status = 'awaiting_payment' "
+                "ORDER BY payment_id"
+            )
+            return [dict(row) for row in rows]
 
     async def pending_review_payments(self) -> list[dict[str, Any]]:
         """Orders with a stored receipt that are ready for a human decision."""
-        rows = await self.db.execute_fetchall(
-            f"SELECT {self._PAYMENT_COLUMNS} FROM payments "
-            "WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL "
-            "ORDER BY payment_id"
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                f"SELECT {self._PAYMENT_COLUMNS} FROM payments "
+                "WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL "
+                "ORDER BY payment_id"
+            )
+            return [dict(row) for row in rows]
 
     async def all_payments(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
-            f"SELECT {self._PAYMENT_COLUMNS} FROM payments ORDER BY payment_id DESC LIMIT ? OFFSET ?",
-            (limit, offset),
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                f"SELECT {self._PAYMENT_COLUMNS} FROM payments ORDER BY payment_id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
+            )
+            return [dict(row) for row in rows]
 
     async def payment_history_paginated(self, user_id: int, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
-            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE user_id = ? ORDER BY payment_id DESC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE user_id = ? ORDER BY payment_id DESC LIMIT ? OFFSET ?",
+                (user_id, limit, offset),
+            )
+            return [dict(row) for row in rows]
 
     async def count_payments_by_status(self) -> dict[str, int]:
-        rows = await self.db.execute_fetchall("SELECT status, COUNT(*) FROM payments GROUP BY status")
-        return {row[0]: int(row[1]) for row in rows}
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall("SELECT status, COUNT(*) FROM payments GROUP BY status")
+            return {row[0]: int(row[1]) for row in rows}
 
     async def review_payment(
         self,
@@ -1064,12 +1095,13 @@ class Database:
         return True
 
     async def payment_history(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
-            "SELECT payment_id, plan_code, status, receipt_path, created_at, reviewed_at FROM payments "
-            "WHERE user_id = ? ORDER BY payment_id DESC LIMIT ?",
-            (user_id, limit),
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT payment_id, plan_code, status, receipt_path, created_at, reviewed_at FROM payments "
+                "WHERE user_id = ? ORDER BY payment_id DESC LIMIT ?",
+                (user_id, limit),
+            )
+            return [dict(row) for row in rows]
 
     # ------------------------------------------------------------------ audit
     async def audit(
@@ -1082,12 +1114,13 @@ class Database:
         )
 
     async def recent_audit(self, limit: int = 30) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
-            "SELECT admin_id, action, detail, subject_user, created_at FROM audit "
-            "ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT admin_id, action, detail, subject_user, created_at FROM audit "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+            return [dict(row) for row in rows]
 
     # ----------------------------------------------------------------- support tickets
     #: Fixed categories shown to the user (callback key -> stored value).
@@ -1171,6 +1204,13 @@ class Database:
                     (target, now, ticket_id),
                 )
                 status = target
+        logger.info(
+            "support ticket state transition ticket_id=%s public_id=%s category=%s status=%s",
+            ticket_id,
+            public_id,
+            category,
+            status,
+        )
         return {
             "id": ticket_id, "public_ticket_id": public_id, "user_id": user_id,
             "category": category, "subject": subject, "status": status,
@@ -1178,28 +1218,32 @@ class Database:
         }
 
     async def get_ticket(self, ticket_id: int) -> dict[str, Any] | None:
-        rows = await self.db.execute_fetchall(
-            "SELECT * FROM support_tickets WHERE id = ?", (ticket_id,)
-        )
-        return dict(rows[0]) if rows else None
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT * FROM support_tickets WHERE id = ?", (ticket_id,)
+            )
+            return dict(rows[0]) if rows else None
 
     async def get_ticket_by_public_id(self, public_id: str) -> dict[str, Any] | None:
-        rows = await self.db.execute_fetchall(
-            "SELECT * FROM support_tickets WHERE public_ticket_id = ?", (public_id,)
-        )
-        return dict(rows[0]) if rows else None
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT * FROM support_tickets WHERE public_ticket_id = ?", (public_id,)
+            )
+            return dict(rows[0]) if rows else None
 
     async def list_user_tickets(self, user_id: int, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
-            "SELECT * FROM support_tickets WHERE user_id = ? "
-            "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
-            (user_id, limit, offset),
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT * FROM support_tickets WHERE user_id = ? "
+                "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+                (user_id, limit, offset),
+            )
+            return [dict(row) for row in rows]
 
     #: Admin list filters: ``active`` is every ticket not closed.
     SUPPORT_FILTERS = {
         "active": "status != 'closed'",
+        "open": "status = 'open'",
         "wait": "status = 'awaiting_admin'",
         "user": "status = 'awaiting_user'",
         "closed": "status = 'closed'",
@@ -1219,18 +1263,20 @@ class Database:
                 raise ValueError(f"invalid category {category}")
             clause += " AND category = ?"
             params.append(category)
-        rows = await self.db.execute_fetchall(
-            f"SELECT * FROM support_tickets WHERE {clause} "
-            "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
-            (*params, limit, offset),
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                f"SELECT * FROM support_tickets WHERE {clause} "
+                "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            )
+            return [dict(row) for row in rows]
 
     async def count_tickets_by_status(self) -> dict[str, int]:
-        rows = await self.db.execute_fetchall(
-            "SELECT status, COUNT(*) FROM support_tickets GROUP BY status"
-        )
-        return {row[0]: int(row[1]) for row in rows}
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT status, COUNT(*) FROM support_tickets GROUP BY status"
+            )
+            return {row[0]: int(row[1]) for row in rows}
 
     async def add_ticket_message(
         self,
@@ -1272,6 +1318,13 @@ class Database:
                 "UPDATE support_tickets SET status = ?, updated_at = ? WHERE id = ?",
                 (target, now, ticket_id),
             )
+        logger.info(
+            "support ticket state transition ticket_id=%s role=%s from_status=%s status=%s",
+            ticket_id,
+            sender_role,
+            current,
+            target,
+        )
         return {
             "id": message_id, "ticket_id": ticket_id, "sender_id": sender_id,
             "sender_role": sender_role, "message_text": message_text,
@@ -1280,18 +1333,20 @@ class Database:
 
     async def ticket_messages(self, ticket_id: int, *, limit: int = 6, offset: int = 0) -> list[dict[str, Any]]:
         """One page of a history, newest first offset, returned oldest-first."""
-        rows = await self.db.execute_fetchall(
-            "SELECT * FROM (SELECT * FROM support_messages WHERE ticket_id = ? "
-            "ORDER BY id DESC LIMIT ? OFFSET ?) ORDER BY id ASC",
-            (ticket_id, limit, offset),
-        )
-        return [dict(row) for row in rows]
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT * FROM (SELECT * FROM support_messages WHERE ticket_id = ? "
+                "ORDER BY id DESC LIMIT ? OFFSET ?) ORDER BY id ASC",
+                (ticket_id, limit, offset),
+            )
+            return [dict(row) for row in rows]
 
     async def count_ticket_messages(self, ticket_id: int) -> int:
-        rows = await self.db.execute_fetchall(
-            "SELECT COUNT(*) FROM support_messages WHERE ticket_id = ?", (ticket_id,)
-        )
-        return int(rows[0][0]) if rows else 0
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(
+                "SELECT COUNT(*) FROM support_messages WHERE ticket_id = ?", (ticket_id,)
+            )
+            return int(rows[0][0]) if rows else 0
 
     async def close_ticket(self, ticket_id: int, actor_id: int, *, admin: bool) -> bool:
         """Close a ticket. Returns False when it is already closed."""
@@ -1318,6 +1373,13 @@ class Database:
                     "VALUES (?, 'ticket_closed', ?, ?, ?)",
                     (actor_id, f"ticket:{ticket_id}", owner_id, now),
                 )
+        logger.info(
+            "support ticket state transition ticket_id=%s role=%s from_status=%s status=%s",
+            ticket_id,
+            "admin" if admin else "user",
+            current,
+            target,
+        )
         return True
 
     async def reopen_ticket(self, ticket_id: int, actor_id: int, *, admin: bool) -> bool:
@@ -1345,6 +1407,13 @@ class Database:
                     "VALUES (?, 'ticket_reopened', ?, ?, ?)",
                     (actor_id, f"ticket:{ticket_id}", owner_id, now),
                 )
+        logger.info(
+            "support ticket state transition ticket_id=%s role=%s from_status=%s status=%s",
+            ticket_id,
+            "admin" if admin else "user",
+            current,
+            target,
+        )
         return True
 
 

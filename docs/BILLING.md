@@ -34,13 +34,16 @@ Purchases are card-to-card and manually reviewed. A purchase request moves throu
 Steps:
 
 1. Creating a purchase stores a snapshot of its price, duration and validity.
-2. Uploading a Telegram photo or JPEG/PNG/WebP image document moves the order to `pending_review`;
-   it does **not** grant credit. The image is validated, re-encoded and stored privately.
-3. The admin opens «🔎 جزئیات سفارش», checks the receipt, and explicitly confirms approval or enters
-   a rejection reason. An order without a receipt cannot be approved or rejected.
+2. Uploading a Telegram photo or JPEG/PNG/WebP image document (immediately after choosing a plan, via
+   «📤 ارسال رسید», or directly after a bot restart when an unpaid order exists) moves the order to
+   `pending_review`; it does **not** grant credit. The image is validated, re-encoded and stored privately.
+3. The admin opens «🔎 جزئیات سفارش» (from «💳 پرداخت‌های در انتظار» or «📋 تاریخچه پرداخت‌ها»),
+   checks the receipt, and explicitly confirms approval or selects a preset / custom rejection reason.
+   An order without a receipt cannot be approved or rejected.
 4. Approval credits the saved snapshot in the same transaction as the status and audit updates.
-   Migration `006_payment_entitlement_links.sql` links the credit to the payment and enforces one
-   credit row per payment, including across retries and concurrent reviewers.
+   Migrations `006_payment_entitlement_links.sql` and `007_payment_state_guards.sql` link the credit
+   to the payment and enforce valid statuses, terminal-state immutability, and one credit row per
+   payment across retries and concurrent reviewers.
 5. If activation fails, the entire transaction rolls back to `pending_review`; the admin can safely
    fix the database issue and retry. Notification failures never undo or repeat activation.
 6. A user may cancel an unsubmitted purchase. Only one request per user may be open. Users have a

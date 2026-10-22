@@ -95,7 +95,7 @@ def progress_text(
     value = max(0, min(100, int(percent)))
     spinner = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
     text = (
-        f"⏳ دارم جزوه‌تان را آماده می‌کنم {stage_emoji(value)}\n\n"
+        f"⏳ در حال پردازش فایل {stage_emoji(value)}\n\n"
         f"{progress_bar(value, head=head)}  {to_persian_digits(value)}٪  {spinner}\n"
         f"{stage.strip()}"
     )
@@ -135,11 +135,11 @@ class JobProgress:
         event: Any,
         *,
         submission_id: int | None = None,
-        stage: str = "فایل رسید و در صف است",
+        stage: str = "در صف پردازش",
         animate: bool = True,
         animation_interval: float = ANIMATION_INTERVAL_SECONDS,
     ) -> "JobProgress":
-        text = progress_text(0, stage, "کمی صبر کنید؛ به‌زودی شروع می‌کنم.")
+        text = progress_text(0, stage, "پردازش به‌زودی آغاز می‌شود.")
         try:
             message = await event.reply(text)
         except Exception:
@@ -152,7 +152,7 @@ class JobProgress:
         )
         reporter._last_text = text
         reporter._stage = stage
-        reporter._detail = "کمی صبر کنید؛ به‌زودی شروع می‌کنم."
+        reporter._detail = "پردازش به‌زودی آغاز می‌شود."
         if animate:
             reporter.start_animation()
         return reporter
@@ -233,8 +233,8 @@ class JobProgress:
 
     async def complete(
         self,
-        detail: str = "جزوهٔ Word و متن خام در پیام‌های بعدی می‌رسند.",
-        headline: str = "🎉 جزوه آماده شد! 🎉",
+        detail: str = "متن گفتار و فایل خروجی ارسال شد.",
+        headline: str = "✅ پردازش تکمیل شد",
     ) -> None:
         self._finish()
         self.percent = 100
@@ -248,10 +248,10 @@ class JobProgress:
     async def fail(self, reference: str) -> None:
         self._finish()
         text = (
-            "❌ متأسفم، کار کامل نشد.\n\n"
+            "❌ پردازش تکمیل نشد.\n\n"
             f"{progress_bar(self.percent, head=FAILED_HEAD)}  "
-            f"{to_persian_digits(self.percent)}٪  💔\n"
-            f"کد پیگیری: {reference}"
+            f"{to_persian_digits(self.percent)}٪\n"
+            f"کد پیگیری: {to_persian_digits(reference)}"
         )
         await self._publish(text)
 

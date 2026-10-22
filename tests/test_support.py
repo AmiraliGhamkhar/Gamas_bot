@@ -458,6 +458,52 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(view.responses, "navigation belongs on the final chunk")
         self.assertIsNotNone(view.responses[-1][1])
 
+    async def test_all_categories_open_filter_and_notification_outage_resilience(self):
+        seen_ids: set[str] = set()
+        payment_ticket_id: int | None = None
+        for category in ("payment", "technical", "subscription", "other"):
+            await self.open_ticket(USER_A, category, f"درخواست آزمایشی {category}")
+            ticket = await self.latest_ticket()
+            self.assertEqual(ticket["category"], category)
+            self.assertEqual(ticket["status"], "awaiting_admin")
+            self.assertRegex(ticket["public_ticket_id"], r"^T-\d{6,}$")
+            self.assertNotIn(ticket["public_ticket_id"], seen_ids)
+            seen_ids.add(ticket["public_ticket_id"])
+            if category == "payment":
+                payment_ticket_id = ticket["id"]
+
+        assert payment_ticket_id is not None
+        await self.press(USER_A, f"sup:c:{payment_ticket_id}")
+        self.assertEqual((await self.db.get_ticket(payment_ticket_id))["status"], "closed")
+        await self.press(USER_A, f"sup:o:{payment_ticket_id}")
+        self.assertEqual((await self.db.get_ticket(payment_ticket_id))["status"], "open")
+
+        # Open filter combined with payment category shows reopened ticket & preserves category across tabs.
+        filtered = await self.press(ADMIN, "adm:sl:open:payment:0")
+        rendered, buttons = filtered.edits[-1]
+        self.assertIn("جدید: ۱", rendered)
+        self.assertIn("💳 پرداخت", rendered)
+        callbacks = [
+            (getattr(btn, "data", None) or btn.type.data).decode("utf-8", errors="ignore")
+            for row in buttons
+            for btn in row
+        ]
+        self.assertIn(f"adm:sv:{payment_ticket_id}", callbacks)
+        self.assertIn("adm:sl:wait:payment:0", callbacks)
+        self.assertIn("adm:sl:open:all:0", callbacks)
+
+        # Telegram delivery outage must not lose user ticket or admin reply.
+        async def failing_send(*_args, **_kwargs):
+            raise RuntimeError("telegram temporary network outage")
+
+        self.bot.client.send_message = failing_send
+        target = await self.latest_ticket()
+        await self.press(ADMIN, f"adm:sr:{target['id']}")
+        await self.say(ADMIN, "پاسخ ثبت‌شده در زمان قطعی شبکه")
+        updated = await self.db.get_ticket(target["id"])
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(await self.db.count_ticket_messages(target["id"]), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

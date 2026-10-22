@@ -239,6 +239,43 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.db.payment(payment_id))["status"], "pending_review")
         self.assertEqual(await self.db.available_seconds(USER), 0)
 
+    async def test_direct_and_post_restart_receipt_uploads_succeed_without_extra_click(self):
+        # 1) Direct upload right after pressing plan:<code > without pressing payr:<id>.
+        plan_tap = await self.press(USER, f"plan:{PLAN}")
+        self.assertTrue(plan_tap.responses)
+        payment_id = (await self.db.all_payments(limit=1))[0]["payment_id"]
+        await self.submit_receipt(payment_id)
+        self.assertEqual((await self.db.payment(payment_id))["status"], "pending_review")
+        await self.press(ADMIN, f"payv:{payment_id}:rp:blur")
+        rejected = await self.db.payment(payment_id)
+        self.assertEqual(rejected["status"], "rejected")
+        self.assertIn("ناخوانا", rejected["review_reason"])
+
+        # 2) Post-restart upload: wipe in-memory _pending_payments and send PNG document
+        # with octet-stream MIME (as certain desktop clients do).
+        second_id = await self.new_order()
+        self.bot._pending_payments.clear()
+        source = self.root / "desktop-receipt.png"
+        Image.new("RGB", (32, 32), "navy").save(source, format="PNG")
+        msg = FakeJobEvent(source=source, chat_id=USER)
+        msg.message.attach_document(
+            "bank_receipt.png",
+            mime_type="application/octet-stream",
+            size=source.stat().st_size,
+        )
+        await self.bot._handle_message(msg)
+        updated = await self.db.payment(second_id)
+        self.assertEqual(updated["status"], "pending_review")
+        self.assertTrue(updated["receipt_path"])
+        self.assertTrue(any("در انتظار بررسی" in text for text in msg.replies))
+
+        # 3) Admin detail view exposes complete order metadata and credit link.
+        await self.press(ADMIN, f"payv:{second_id}:a:yes")
+        detail = await self.press(ADMIN, f"adm:pd:{second_id}")
+        detail_text = detail.edits[-1][0]
+        for expected in ("شناسه سفارش:", "طرح:", "بسته:", "مدت اعتبار:", "مبلغ:", "اعتبار متصل به سفارش: ثبت شده"):
+            self.assertIn(expected, detail_text)
+
 
 if __name__ == "__main__":
     unittest.main()
