@@ -141,7 +141,8 @@ def format_duration(seconds: int | float | None) -> str:
 
 
 def format_toman(amount: int) -> str:
-    return f"{to_persian_digits(f'{int(amount):,}')} تومان"
+    grouped = f"{int(amount):,}".replace(",", "٬")
+    return f"{to_persian_digits(grouped)} تومان"
 
 
 def format_validity(days: int | None) -> str:

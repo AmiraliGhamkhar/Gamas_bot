@@ -564,12 +564,12 @@ class OfficeScreenTests(OfficeBotTestCase):
     async def test_the_user_menu_has_the_office_entry(self):
         menu = self.bot._user_menu()
         labels = [button.text for row in menu for button in row]
-        self.assertIn("📄 آفیس رایگان", labels)
+        self.assertIn("📄 ساخت سند رایگان", labels)
 
     async def test_the_office_entry_is_hidden_when_the_section_is_off(self):
         self.bot.settings = replace(self.settings, office_enabled=False)
         labels = [button.text for row in self.bot._user_menu() for button in row]
-        self.assertNotIn("📄 آفیس رایگان", labels)
+        self.assertNotIn("📄 ساخت سند رایگان", labels)
 
     async def test_the_button_does_nothing_when_the_section_is_off(self):
         self.bot.settings = replace(self.settings, office_enabled=False)
@@ -595,7 +595,7 @@ class OfficeScreenTests(OfficeBotTestCase):
         event.message._chat_id = USER_ID
         event.message.message = "متن آزمایشی"
         await self.bot._handle_message(event)
-        self.assertTrue(any("آفیس رایگان" in reply for reply in event.replies))
+        self.assertTrue(any("ساخت سند رایگان" in reply for reply in event.replies))
 
     async def test_the_office_button_shows_the_four_formats(self):
         event = self.wire(FakeJobEvent())
@@ -604,7 +604,7 @@ class OfficeScreenTests(OfficeBotTestCase):
         # The panel is a screen tree: the menu is edited, not sent again.
         self.assertTrue(callback.edits)
         screen = callback.edits[-1]["text"]
-        self.assertIn("آفیس رایگان", screen)
+        self.assertIn("ساخت سند رایگان", screen)
         self.assertIn("Word", screen)
         self.assertIn("Excel", screen)
         self.assertIn("PowerPoint", screen)
@@ -627,7 +627,7 @@ class OfficeJobTests(OfficeBotTestCase):
         event.message._chat_id = USER_ID
         await self.bot._handle_office_message(event, USER_ID, SAMPLE)
         # The format is asked for first: the content arrived before it.
-        self.assertTrue(any("آفیس رایگان" in reply for reply in event.replies))
+        self.assertTrue(any("ساخت سند رایگان" in reply for reply in event.replies))
 
         callback = self.callback(b"office:word", client=event.client)
         await self.bot._handle_office_action(callback, "word")

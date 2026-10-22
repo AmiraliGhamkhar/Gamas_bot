@@ -189,6 +189,24 @@ class ReceiptBookkeepingTests(_BotHarness):
         actions = [row["action"] for row in await self.db.recent_audit(10)]
         self.assertIn("receipt_expired", actions)
 
+    async def test_retention_never_deletes_a_receipt_still_awaiting_review(self):
+        await self.db.sync_plans([
+            {"code": "paid_5h_30d", "hours": 5, "price": 50000, "validity_days": 30},
+        ])
+        payment_id = await self.db.create_payment(self.user_id, "paid_5h_30d")
+        path = Path(self.settings.receipt_dir / "receipt-1-old.jpg")
+        path.write_bytes(b"jpeg")
+        os.utime(path, (1, 1))
+        await self.db.set_payment_receipt(payment_id, str(path), user_id=self.user_id)
+        await self.bot._cleanup_expired_receipts()
+        self.assertTrue(path.exists())
+        self.assertEqual((await self.db.payment(payment_id))["status"], "pending_review")
+
+        await self.db.review_payment(payment_id, True, 1)
+        await self.bot._cleanup_expired_receipts()
+        self.assertFalse(path.exists())
+        self.assertIsNone((await self.db.payment(payment_id))["receipt_path"])
+
 
 # ---------------------------------------------------------------------------
 # Speech-to-text

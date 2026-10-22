@@ -1,8 +1,9 @@
 # Support tickets
 
 Users open support requests from the main menu («🎧 پشتیبانی»). Every request is a **ticket** with a
-human-readable ID (`T-000001`), one of four categories, and its own message history. Administrators
-work the tickets from «🎧 مدیریت پشتیبانی» in the admin panel.
+human-readable ID (`T-000001`), one of four categories, and its own message history. The ticket and
+its initial message are inserted atomically, so a failed first-message write cannot leave an empty
+ticket. Administrators work the tickets from «🎧 مدیریت پشتیبانی» in the admin panel.
 
 ## Statuses and transitions
 
@@ -41,9 +42,10 @@ that no one is watching. Reopening keeps all earlier messages.
 Tables (migration `005_payments_and_support.sql`): `support_tickets`, `support_messages`,
 `support_ticket_seq`. Timestamps are UTC ISO-8601 strings, as in the rest of the schema.
 
-## Limitations
+## History and limitations
 
-- A history screen shows each message up to 900 characters; the full text is stored and is used
-  for the audit trail. Very long messages are therefore cut on screen.
+- History pages preserve message order and contain complete text. When a page exceeds Telegram's
+  message limit, the bot sends multiple bounded messages and puts navigation on the last one;
+  stored messages are never cut to fit a screen.
 - Attachments in support messages are not stored; only text is accepted.
 - Tickets are not purged automatically.

@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+Payment, support and Persian UX fixes:
+
+- Manual review now requires a stored receipt and an explicit approval confirmation. Payment status,
+  credit and audit writes are atomic, and migration 006 enforces one credit ledger row per payment.
+- Added user/admin payment histories, order details, complete admin receipt notifications, rejection
+  reasons, safe activation retries, and Telegram image-document receipt support.
+- Ticket creation and its first message are atomic. Support prompts survive input mistakes, commands
+  disarm stale replies, and long histories are delivered completely in Telegram-sized chunks.
+- Simplified the main menu into purchase, balance, payment history and support actions with concise
+  formal Persian labels and Persian currency grouping.
+
 Documentation and maintenance pass:
 
 - Rewrote every guide for two platforms only: Windows PowerShell (local) and Linux cPanel shared

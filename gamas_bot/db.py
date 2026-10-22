@@ -863,14 +863,31 @@ class Database:
             )
             return bool(cursor.rowcount)
 
-    async def set_payment_receipt(self, payment_id: int, receipt_path: str) -> bool:
+    async def set_payment_receipt(
+        self, payment_id: int, receipt_path: str, user_id: int | None = None
+    ) -> bool:
+        """Store one receipt and move an owned order into admin review.
+
+        ``user_id`` is optional only for compatibility with older internal
+        callers and migrations. Telegram handlers always supply it, so a
+        forged or stale order id cannot attach a receipt to another user's
+        order even if the surrounding handler changes later.
+        """
         async with self._transaction():
+            ownership = "AND user_id = ? " if user_id is not None else ""
+            params: tuple[Any, ...] = (receipt_path, payment_id)
+            if user_id is not None:
+                params += (int(user_id),)
             cursor = await self.db.execute(
                 "UPDATE payments SET receipt_path = ?, status = 'pending_review' "
-                "WHERE payment_id = ? "
-                "AND status IN ('pending','awaiting_payment')", (receipt_path, payment_id),
+                f"WHERE payment_id = ? {ownership}"
+                "AND status IN ('pending','awaiting_payment')",
+                params,
             )
-            return bool(cursor.rowcount)
+            changed = bool(cursor.rowcount)
+        if changed:
+            logger.info("payment receipt stored payment_id=%s status=pending_review", payment_id)
+        return changed
 
     async def forget_receipts(self, paths: tuple[str, ...] | list[str]) -> int:
         """Clear stored receipt references whose files were deleted.
@@ -901,7 +918,9 @@ class Database:
     _PAYMENT_COLUMNS = (
         "payment_id, user_id, plan_code, status, receipt_path, created_at, "
         "reviewed_at, reviewed_by, purchased_seconds, purchased_price, "
-        "purchased_validity_days, review_reason"
+        "purchased_validity_days, review_reason, "
+        "(SELECT l.id FROM ledger l WHERE l.payment_id = payments.payment_id "
+        "AND l.kind = 'credit') AS credit_ledger_id"
     )
 
     async def payment(self, payment_id: int) -> dict[str, Any] | None:
@@ -928,25 +947,13 @@ class Database:
         return [dict(row) for row in rows]
 
     async def pending_review_payments(self) -> list[dict[str, Any]]:
+        """Orders with a stored receipt that are ready for a human decision."""
         rows = await self.db.execute_fetchall(
-            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL "
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments "
+            "WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL "
             "ORDER BY payment_id"
         )
-        # Also include explicit pending_review without receipt_path check for new rows
-        extra = await self.db.execute_fetchall(
-            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status = 'pending_review' ORDER BY payment_id"
-        )
-        # dedupe
-        seen = set()
-        result = []
-        for r in rows + extra:
-            d = dict(r)
-            if d["payment_id"] not in seen:
-                seen.add(d["payment_id"])
-                result.append(d)
-        # ensure sorted
-        result.sort(key=lambda x: x["payment_id"])
-        return result
+        return [dict(row) for row in rows]
 
     async def all_payments(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         rows = await self.db.execute_fetchall(
@@ -974,32 +981,47 @@ class Database:
         *,
         reason: str = "",
     ) -> bool:
-        """Approve (crediting the purchase snapshot) or reject. Exactly once.
+        """Review a receipt-backed order and grant its entitlement at most once.
 
-        The audit row is written in the same transaction as the status change:
-        an approved payment can never exist without its audit entry, and a
-        rejection always carries the admin's reason (audit F-15).
+        Only ``pending_review`` (or a legacy ``pending`` row with a receipt)
+        can be decided. Approval, the credit insert and the audit record are one
+        transaction. The unique ``ledger.payment_id`` index added by migration
+        006 is a second line of defence against duplicate grants across worker
+        retries or multiple database connections.
+
+        If any activation write fails, the whole transaction rolls back and the
+        order stays reviewable; an administrator can safely retry after fixing
+        the database problem. No partial ``approved`` state is left behind.
         """
         if not approved and not reason.strip():
             raise ValueError("rejecting a payment requires a reason")
         async with self._transaction():
             rows = await self.db.execute_fetchall(
                 "SELECT status, user_id, plan_code, purchased_seconds, "
-                "purchased_validity_days, receipt_path FROM payments WHERE payment_id = ?",
+                "purchased_validity_days, receipt_path, purchased_price "
+                "FROM payments WHERE payment_id = ?",
                 (payment_id,),
             )
-            if not rows or rows[0][0] not in ("pending", "pending_review", "awaiting_payment"):
+            if not rows:
+                return False
+            status = str(rows[0][0])
+            receipt_path = rows[0][5]
+            if status not in ("pending_review", "pending") or not receipt_path:
                 return False
             user_id, plan_code = int(rows[0][1]), str(rows[0][2])
             seconds = int(rows[0][3] or 0)
+            price = int(rows[0][6] or 0)
             validity_days = rows[0][4]
-            if approved and seconds <= 0:
-                # Never report success while crediting nothing.
+            if approved and (seconds <= 0 or price <= 0):
+                # Never report success while crediting nothing or accepting an
+                # incomplete amount snapshot. The stored plan code and snapshot
+                # are authoritative; a live, possibly re-priced plan is not.
                 raise PaymentSnapshotError(payment_id)
             now = iso(utc_now())
-            await self.db.execute(
+            cursor = await self.db.execute(
                 "UPDATE payments SET status = ?, reviewed_at = ?, reviewed_by = ?, "
-                "review_reason = ? WHERE payment_id = ?",
+                "review_reason = ? WHERE payment_id = ? "
+                "AND status IN ('pending_review','pending') AND receipt_path IS NOT NULL",
                 (
                     "approved" if approved else "rejected",
                     now,
@@ -1008,6 +1030,8 @@ class Database:
                     payment_id,
                 ),
             )
+            if cursor.rowcount != 1:
+                return False
             if approved:
                 expires = (
                     iso(utc_now() + timedelta(days=int(validity_days)))
@@ -1015,9 +1039,9 @@ class Database:
                     else None
                 )
                 await self.db.execute(
-                    "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
-                    "VALUES (?, ?, 'credit', ?, ?, ?)",
-                    (user_id, seconds, f"plan:{plan_code}", expires, now),
+                    "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at, "
+                    "payment_id) VALUES (?, ?, 'credit', ?, ?, ?, ?)",
+                    (user_id, seconds, f"plan:{plan_code}", expires, now, payment_id),
                 )
             await self.db.execute(
                 "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
@@ -1031,6 +1055,12 @@ class Database:
                     now,
                 ),
             )
+        logger.info(
+            "payment reviewed payment_id=%s decision=%s admin_id=%s",
+            payment_id,
+            "approved" if approved else "rejected",
+            admin_id,
+        )
         return True
 
     async def payment_history(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
@@ -1091,12 +1121,32 @@ class Database:
     def _ticket_public_id(seq_id: int) -> str:
         return f"T-{seq_id:06d}"
 
-    async def create_ticket(self, user_id: int, category: str, subject: str) -> dict[str, Any]:
+    async def create_ticket(
+        self,
+        user_id: int,
+        category: str,
+        subject: str,
+        *,
+        initial_message: str | None = None,
+        telegram_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Create a ticket, optionally with its first message, atomically.
+
+        The Telegram flow supplies ``initial_message``. A failure writing that
+        message therefore rolls back the ticket and public-id sequence insert
+        too, instead of leaving an empty conversation with no admin alert.
+        Direct service callers may still create an empty ``open`` ticket and
+        add messages later.
+        """
         if category not in self.SUPPORT_CATEGORIES:
             raise ValueError(f"invalid category {category}")
         subject = " ".join(subject.split())
         if not 2 <= len(subject) <= self.SUPPORT_SUBJECT_MAX:
             raise ValueError("subject length out of range")
+        if initial_message is not None:
+            initial_message = initial_message.strip()
+            if not 1 <= len(initial_message) <= self.SUPPORT_MESSAGE_MAX:
+                raise ValueError("message length out of range")
         now = iso(utc_now())
         status = self._transition("create", None)
         async with self._transaction():
@@ -1108,6 +1158,19 @@ class Database:
                 (public_id, user_id, category, subject, status, now, now),
             )
             ticket_id = int(cursor.lastrowid or 0)
+            if initial_message is not None:
+                target = self._transition("user_message", status)
+                await self.db.execute(
+                    "INSERT INTO support_messages(ticket_id, sender_id, sender_role, "
+                    "message_text, telegram_message_id, created_at) "
+                    "VALUES (?, ?, 'user', ?, ?, ?)",
+                    (ticket_id, user_id, initial_message, telegram_message_id, now),
+                )
+                await self.db.execute(
+                    "UPDATE support_tickets SET status = ?, updated_at = ? WHERE id = ?",
+                    (target, now, ticket_id),
+                )
+                status = target
         return {
             "id": ticket_id, "public_ticket_id": public_id, "user_id": user_id,
             "category": category, "subject": subject, "status": status,

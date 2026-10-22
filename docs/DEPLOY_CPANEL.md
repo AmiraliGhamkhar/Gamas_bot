@@ -107,33 +107,69 @@ The preflight is the final check for your account layout.
 
 ## 7. Upgrade to the payment and support release
 
-This release adds migration `005_payments_and_support.sql` (idempotent; runs at startup). It changes
-payment state names and creates the support tables. Existing balances, purchases and subscriptions
-are not modified.
+This release includes `005_payments_and_support.sql` (explicit payment states and support tables)
+and `006_payment_entitlement_links.sql` (a nullable payment link on credit rows and uniqueness
+indexes). Both run automatically at startup. Existing balances, purchases, expiry dates and tickets
+are not reset or rewritten. No new environment variables or dependencies are required.
 
 ```bash
 cd "$HOME/gamas_bot"
-# 1. Pause the cron job in cPanel.
-PID="$(cat data/gamas.lock 2>/dev/null)"; ps -p "$PID" >/dev/null 2>&1 && kill "$PID"
-# 2. Back up before migrating (keep the copy outside public_html).
-mkdir -p "$HOME/backups/$(date +%F-%H%M)" && cp -p data/gamas_v3.db* .env "$HOME/backups/$(date +%F-%H%M)/" 2>/dev/null
-# 3. Update and check.
+# 1. In cPanel -> Cron Jobs, pause the watchdog so it cannot restart mid-upgrade.
+PID="$(cat data/gamas.lock 2>/dev/null)"
+if [ -n "$PID" ] && ps -p "$PID" >/dev/null 2>&1; then kill "$PID"; fi
+
+# 2. Back up configuration and the stopped SQLite database outside public_html.
+BACKUP_DIR="$HOME/backups/$(date +%F-%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+cp -p .env "$BACKUP_DIR/.env"
+cp -p data/gamas_v3.db "$BACKUP_DIR/gamas_v3.db"
+# If sidecars exist after the clean stop, preserve them too.
+for FILE in data/gamas_v3.db-wal data/gamas_v3.db-shm data/gamas.session; do
+    [ ! -f "$FILE" ] || cp -p "$FILE" "$BACKUP_DIR/"
+done
+chmod 600 "$BACKUP_DIR/.env" "$BACKUP_DIR"/*
+
+# 3. Update without replacing .env, then run offline checks.
 . .venv/bin/activate
 git pull
 python -m pip install -r requirements.txt
-python -m pytest -q          # optional: needs the dev extras
 python -m gamas_bot --check
-# 4. Re-enable the cron job. The migration runs when the bot starts.
+# Optional on a development checkout with dev extras installed (never use production data):
+# python -m pytest -q
+
+# 4. Re-enable the cron job. It starts the bot and applies migrations within a minute.
+# Check that the log contains startup, not a migration or configuration error.
+tail -n 80 data/logs/bot.log
 ```
 
-Smoke test after the first start (use an admin account):
+Smoke test after the first start (use an admin account and a small test order):
 
-1. `/start` shows the main menu with «🎧 پشتیبانی».
-2. Open «🎧 پشتیبانی» → «➕ درخواست جدید» → pick a category → send a subject. The reply shows a `T-` number and the admin receives a notification.
-3. From the admin panel open «🎧 مدیریت پشتیبانی», open the ticket, reply. The user receives the notification.
-4. Open «🧾 پرداخت‌ها» and confirm existing pending requests are listed.
+1. `/start` shows «💳 خرید اشتراک», «🧾 پرداخت‌های من» and «🎧 پشتیبانی».
+2. Create a ticket from «🎧 پشتیبانی», then reply to it from «🎧 مدیریت پشتیبانی». Confirm both
+   notifications and that the history remains after `/start`.
+3. Create an order, send a receipt, and open it from «💳 پرداخت‌های در انتظار». The first approval
+   tap must only show confirmation; «✅ تأیید نهایی» activates credit. A repeated tap must not change
+   the balance. Reject another test order and verify its reason reaches the user without credit.
 
-**Rollback.** Stop the bot, restore `data/gamas_v3.db` (and its `-wal`/`-shm` files) from the backup
-taken in step 2, restore the previous code with `git checkout <previous-commit>`, then start the bot.
-Do not run the previous code against a migrated database without restoring the backup first:
-the old code does not know the new payment states.
+**Rollback.** Pause cron and stop the bot. Set `BACKUP_DIR` to the actual pre-upgrade directory,
+move the current database aside (do not delete it), restore the matching backup, and only then start
+older code:
+
+```bash
+cd "$HOME/gamas_bot"
+BACKUP_DIR="$HOME/backups/YYYY-MM-DD-HHMMSS"  # replace with the real backup
+RESCUE_DIR="$HOME/backups/rescue-$(date +%F-%H%M%S)"
+mkdir -p "$RESCUE_DIR"
+for FILE in data/gamas_v3.db data/gamas_v3.db-wal data/gamas_v3.db-shm; do
+    [ ! -f "$FILE" ] || mv "$FILE" "$RESCUE_DIR/"
+done
+cp -p "$BACKUP_DIR/gamas_v3.db" data/gamas_v3.db
+for NAME in gamas_v3.db-wal gamas_v3.db-shm; do
+    [ ! -f "$BACKUP_DIR/$NAME" ] || cp -p "$BACKUP_DIR/$NAME" "data/$NAME"
+done
+git checkout <previous-commit>
+# Re-enable cron after python -m gamas_bot --check succeeds with the restored code.
+```
+
+Do not run older code against the migrated database without restoring its matching backup. Keep both
+backup directories until acceptance tests and normal billing have been verified.
