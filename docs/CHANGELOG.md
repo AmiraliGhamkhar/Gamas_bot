@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added `tests/test_acceptance_mission.py`: post-merge acceptance coverage mapping the manual
+  payment workflow, the two-way support tickets and the main-menu copy to one executable check
+  each, including the exact Persian messages users and administrators see.
+
 Payment, support and Persian UX fixes:
 
 - Bounded and paginated the admin pending-payment screen so large review backlogs remain usable.

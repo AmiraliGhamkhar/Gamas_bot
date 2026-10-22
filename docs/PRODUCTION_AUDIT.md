@@ -118,6 +118,52 @@ Final results on Python 3.11.2:
 - `python -m gamas_bot --check` with synthetic non-production settings: passed, including imports,
   configuration and media worker. The expected advisory noted that note generation was not configured.
 
+## Post-merge independent verification
+
+Date: 2026-10-22
+Merge commit verified: `81ca4ab` (PR #85), working branch `arena/736cab45-gamas-bot`
+
+After the merge, the complete workflow was re-traced against `gamas_bot/bot.py` and
+`gamas_bot/db.py` and re-verified on Python 3.11.2 with a fresh virtualenv:
+
+- `python -m pytest -q`: **871 passed, 38 subtests passed; 0 failed; 0 skipped**
+  (the pre-existing 862 tests plus 9 new acceptance tests, see below).
+- `python -m unittest discover -s tests -q`: **871 tests, OK**.
+- `ruff check .`, `mypy` (12-module incremental gate), `python -m compileall -q gamas_bot scripts
+  tests passenger_wsgi.py`, `scripts.sync_requirements --check`: all passed.
+- Fresh-database migration smoke check: all 8 v3 migrations apply and the 14 expected application
+  tables exist, including `support_tickets`, `support_messages` and `support_ticket_seq`.
+- `python -m gamas_bot.media_worker check`: passed.
+- `python -m gamas_bot --check` with synthetic settings (including a card-to-card setup): passed.
+
+New acceptance coverage in `tests/test_acceptance_mission.py`, one executable check per
+acceptance item against the real handlers and the exact user-visible Persian copy:
+
+- Plan screen lists the canonical 25-hour/150,000-toman and 50-hour/250,000-toman plans; the order
+  screen shows the configured card instructions.
+- An order cannot be approved before a receipt exists (an early `payv:*:a:yes` tap changes
+  nothing); receipt upload moves it to `pending_review` with the exact awaiting-review copy and
+  the administrator receives the order reference, user ID, plan, amount and the receipt file.
+- Approval requires the confirmation tap, credits exactly once (repeated taps and the unique
+  ledger index verified), and the user receives the exact approval copy only after the commit.
+- Rejection delivers the reason, grants nothing, and a later approval attempt is refused;
+  cancellation and preset rejection reasons leave a zero balance with the history copy intact.
+- Catalogue invariants: 25 h → 90,000 s / 150,000 t / 30 d, 50 h → 180,000 s / 250,000 t / 30 d,
+  free 1 h granted exactly once.
+- Tickets are created in all four categories with unique `T-000000` IDs and the exact creation
+  copy; the admin answer marks `awaiting_user` with the exact reply-notification copy; the user
+  answer marks `awaiting_admin` and alerts the administrators.
+- Close and reopen preserve history; a new ticket is a separate conversation.
+- Forged verdicts, non-admin `adm:`/`payv:` callbacks and cross-user ticket access are refused.
+- A simulated Telegram outage loses nothing: stored tickets/messages and the approved credit stay
+  intact and repeated approval still credits once.
+- The user menu offers the mission buttons («🎙️ تبدیل صدا به متن», «📝 ساخت جزوه» when note
+  generation is configured, «💳 خرید اشتراک», «📊 اعتبار من», «🧾 پرداخت‌های من», «🎧 پشتیبانی»,
+  «ℹ️ راهنما») and the admin menu keeps the payment queue, history and support sections.
+
+No runtime code changes were required by this verification; production data, tariffs, expiry
+rules and existing entitlements are untouched.
+
 New coverage includes independent-connection concurrent approval, illegal backward/unaudited SQL
 transitions, large admin backlog pagination and forged page callbacks, multiple-admin support
 notifications/reply routing, and submitted-order visibility with new purchases disabled. Existing
