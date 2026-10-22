@@ -25,7 +25,13 @@ The default catalog is a lifetime free grant plus paid hour bundles, configurabl
 `FREE_PLAN_HOURS` and `PLAN_*` variables. A non-positive tariff value is reported by
 `--check` and the built-in default is used instead.
 
-Purchases are card-to-card and manually reviewed:
+Purchases are card-to-card and manually reviewed. A purchase request moves through these states:
+
+`awaiting_payment` (created, no receipt yet) → `pending_review` (receipt uploaded) → `approved` or
+`rejected` (admin decision). `cancelled` is the owner's choice before a receipt is sent. Only
+`approved` grants credit. Legacy `pending` rows are mapped to one of the new states by migration 005.
+
+Steps:
 
 1. Creating a purchase stores a snapshot of its price, duration and validity.
 2. Uploading a receipt does **not** grant credit. The image is validated and stored privately.

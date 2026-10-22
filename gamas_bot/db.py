@@ -809,6 +809,12 @@ class Database:
         return dict(rows[0]) if rows else None
 
     # --------------------------------------------------------------- payments
+    # Payment states: awaiting_payment -> pending_review -> approved/rejected,
+    # with cancelled as user-initiated terminal. Legacy 'pending' is treated as
+    # awaiting_payment (no receipt) or pending_review (with receipt) for compat.
+    PAYMENT_OPEN_STATUSES = ("awaiting_payment", "pending_review", "pending")
+    PAYMENT_PENDING_REVIEW_STATUSES = ("pending_review", "pending")
+
     async def create_payment(self, user_id: int, plan_code: str) -> int:
         """Create a payment with the purchase terms frozen onto the row.
 
@@ -821,7 +827,7 @@ class Database:
         async with self._transaction():
             open_rows = await self.db.execute_fetchall(
                 "SELECT payment_id, plan_code FROM payments "
-                "WHERE user_id = ? AND status = 'pending' "
+                "WHERE user_id = ? AND status IN ('pending','awaiting_payment','pending_review') "
                 "ORDER BY payment_id LIMIT 1",
                 (user_id,),
             )
@@ -841,7 +847,7 @@ class Database:
             cursor = await self.db.execute(
                 "INSERT INTO payments(user_id, plan_code, status, created_at, "
                 "purchased_seconds, purchased_price, purchased_validity_days) "
-                "VALUES (?, ?, 'pending', ?, ?, ?, ?)",
+                "VALUES (?, ?, 'awaiting_payment', ?, ?, ?, ?)",
                 (user_id, plan_code, iso(utc_now()), seconds, int(price), validity_days),
             )
             return int(cursor.lastrowid or 0)
@@ -852,7 +858,7 @@ class Database:
             cursor = await self.db.execute(
                 "UPDATE payments SET status = 'cancelled', reviewed_at = ?, "
                 "review_reason = 'cancelled by owner before receipt' "
-                "WHERE payment_id = ? AND user_id = ? AND status = 'pending' "
+                "WHERE payment_id = ? AND user_id = ? AND status IN ('pending','awaiting_payment') "
                 "AND receipt_path IS NULL", (iso(utc_now()), payment_id, user_id),
             )
             return bool(cursor.rowcount)
@@ -860,8 +866,9 @@ class Database:
     async def set_payment_receipt(self, payment_id: int, receipt_path: str) -> bool:
         async with self._transaction():
             cursor = await self.db.execute(
-                "UPDATE payments SET receipt_path = ? WHERE payment_id = ? "
-                "AND status = 'pending'", (receipt_path, payment_id),
+                "UPDATE payments SET receipt_path = ?, status = 'pending_review' "
+                "WHERE payment_id = ? "
+                "AND status IN ('pending','awaiting_payment')", (receipt_path, payment_id),
             )
             return bool(cursor.rowcount)
 
@@ -906,11 +913,58 @@ class Database:
             return dict(rows[0]) if rows else None
 
     async def pending_payments(self) -> list[dict[str, Any]]:
+        # For backward compat, includes legacy 'pending' and new explicit states.
         rows = await self.db.execute_fetchall(
-            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status = 'pending' "
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status IN ('pending','awaiting_payment','pending_review') "
             "ORDER BY payment_id"
         )
         return [dict(row) for row in rows]
+
+    async def awaiting_payments(self) -> list[dict[str, Any]]:
+        rows = await self.db.execute_fetchall(
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status = 'awaiting_payment' "
+            "ORDER BY payment_id"
+        )
+        return [dict(row) for row in rows]
+
+    async def pending_review_payments(self) -> list[dict[str, Any]]:
+        rows = await self.db.execute_fetchall(
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL "
+            "ORDER BY payment_id"
+        )
+        # Also include explicit pending_review without receipt_path check for new rows
+        extra = await self.db.execute_fetchall(
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status = 'pending_review' ORDER BY payment_id"
+        )
+        # dedupe
+        seen = set()
+        result = []
+        for r in rows + extra:
+            d = dict(r)
+            if d["payment_id"] not in seen:
+                seen.add(d["payment_id"])
+                result.append(d)
+        # ensure sorted
+        result.sort(key=lambda x: x["payment_id"])
+        return result
+
+    async def all_payments(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        rows = await self.db.execute_fetchall(
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments ORDER BY payment_id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        return [dict(row) for row in rows]
+
+    async def payment_history_paginated(self, user_id: int, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
+        rows = await self.db.execute_fetchall(
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE user_id = ? ORDER BY payment_id DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
+        )
+        return [dict(row) for row in rows]
+
+    async def count_payments_by_status(self) -> dict[str, int]:
+        rows = await self.db.execute_fetchall("SELECT status, COUNT(*) FROM payments GROUP BY status")
+        return {row[0]: int(row[1]) for row in rows}
 
     async def review_payment(
         self,
@@ -931,10 +985,10 @@ class Database:
         async with self._transaction():
             rows = await self.db.execute_fetchall(
                 "SELECT status, user_id, plan_code, purchased_seconds, "
-                "purchased_validity_days FROM payments WHERE payment_id = ?",
+                "purchased_validity_days, receipt_path FROM payments WHERE payment_id = ?",
                 (payment_id,),
             )
-            if not rows or rows[0][0] != "pending":
+            if not rows or rows[0][0] not in ("pending", "pending_review", "awaiting_payment"):
                 return False
             user_id, plan_code = int(rows[0][1]), str(rows[0][2])
             seconds = int(rows[0][3] or 0)
@@ -1004,3 +1058,237 @@ class Database:
             (limit,),
         )
         return [dict(row) for row in rows]
+
+    # ----------------------------------------------------------------- support tickets
+    #: Fixed categories shown to the user (callback key -> stored value).
+    SUPPORT_CATEGORIES = ("payment", "technical", "subscription", "other")
+    SUPPORT_STATUSES = ("open", "awaiting_admin", "awaiting_user", "closed")
+    SUPPORT_SUBJECT_MAX = 400
+    SUPPORT_MESSAGE_MAX = 4000
+
+    #: The single place where ticket status changes are defined. Every handler
+    #: goes through :meth:`_transition`; no caller writes a status directly.
+    #: ``event`` -> status it leads to, for the status the ticket is in now.
+    SUPPORT_TRANSITIONS = {
+        "create": {None: "open"},
+        "user_message": {"open": "awaiting_admin", "awaiting_admin": "awaiting_admin",
+                         "awaiting_user": "awaiting_admin"},
+        "admin_message": {"open": "awaiting_user", "awaiting_admin": "awaiting_user",
+                          "awaiting_user": "awaiting_user"},
+        "close": {"open": "closed", "awaiting_admin": "closed", "awaiting_user": "closed"},
+        "reopen": {"closed": "open"},
+    }
+
+    @classmethod
+    def _transition(cls, event: str, current: str | None) -> str:
+        """The status an event leads to, or :class:`TicketStateError`."""
+        target = cls.SUPPORT_TRANSITIONS.get(event, {}).get(current)
+        if target is None:
+            raise TicketStateError(event, current)
+        return target
+
+    @staticmethod
+    def _ticket_public_id(seq_id: int) -> str:
+        return f"T-{seq_id:06d}"
+
+    async def create_ticket(self, user_id: int, category: str, subject: str) -> dict[str, Any]:
+        if category not in self.SUPPORT_CATEGORIES:
+            raise ValueError(f"invalid category {category}")
+        subject = " ".join(subject.split())
+        if not 2 <= len(subject) <= self.SUPPORT_SUBJECT_MAX:
+            raise ValueError("subject length out of range")
+        now = iso(utc_now())
+        status = self._transition("create", None)
+        async with self._transaction():
+            cursor = await self.db.execute("INSERT INTO support_ticket_seq DEFAULT VALUES")
+            public_id = self._ticket_public_id(int(cursor.lastrowid or 0))
+            cursor = await self.db.execute(
+                "INSERT INTO support_tickets(public_ticket_id, user_id, category, subject, "
+                "status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (public_id, user_id, category, subject, status, now, now),
+            )
+            ticket_id = int(cursor.lastrowid or 0)
+        return {
+            "id": ticket_id, "public_ticket_id": public_id, "user_id": user_id,
+            "category": category, "subject": subject, "status": status,
+            "created_at": now, "updated_at": now, "closed_at": None,
+        }
+
+    async def get_ticket(self, ticket_id: int) -> dict[str, Any] | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM support_tickets WHERE id = ?", (ticket_id,)
+        )
+        return dict(rows[0]) if rows else None
+
+    async def get_ticket_by_public_id(self, public_id: str) -> dict[str, Any] | None:
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM support_tickets WHERE public_ticket_id = ?", (public_id,)
+        )
+        return dict(rows[0]) if rows else None
+
+    async def list_user_tickets(self, user_id: int, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM support_tickets WHERE user_id = ? "
+            "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            (user_id, limit, offset),
+        )
+        return [dict(row) for row in rows]
+
+    #: Admin list filters: ``active`` is every ticket not closed.
+    SUPPORT_FILTERS = {
+        "active": "status != 'closed'",
+        "wait": "status = 'awaiting_admin'",
+        "user": "status = 'awaiting_user'",
+        "closed": "status = 'closed'",
+        "all": "1 = 1",
+    }
+
+    async def list_tickets(
+        self, *, view: str = "active", category: str | None = None,
+        limit: int = 10, offset: int = 0,
+    ) -> list[dict[str, Any]]:
+        clause = self.SUPPORT_FILTERS.get(view)
+        if clause is None:
+            raise ValueError(f"unknown view {view}")
+        params: list[Any] = []
+        if category is not None:
+            if category not in self.SUPPORT_CATEGORIES:
+                raise ValueError(f"invalid category {category}")
+            clause += " AND category = ?"
+            params.append(category)
+        rows = await self.db.execute_fetchall(
+            f"SELECT * FROM support_tickets WHERE {clause} "
+            "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
+            (*params, limit, offset),
+        )
+        return [dict(row) for row in rows]
+
+    async def count_tickets_by_status(self) -> dict[str, int]:
+        rows = await self.db.execute_fetchall(
+            "SELECT status, COUNT(*) FROM support_tickets GROUP BY status"
+        )
+        return {row[0]: int(row[1]) for row in rows}
+
+    async def add_ticket_message(
+        self,
+        ticket_id: int,
+        sender_id: int,
+        sender_role: str,
+        message_text: str,
+        telegram_message_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Persist one message and advance the ticket. Ownership is checked here.
+
+        A user may only write to a ticket they own; a closed ticket must be
+        reopened first, so no message can land in a conversation nobody watches.
+        """
+        if sender_role not in ("user", "admin"):
+            raise ValueError("invalid role")
+        message_text = message_text.strip()
+        if not 1 <= len(message_text) <= self.SUPPORT_MESSAGE_MAX:
+            raise ValueError("message length out of range")
+        now = iso(utc_now())
+        async with self._transaction():
+            rows = await self.db.execute_fetchall(
+                "SELECT user_id, status FROM support_tickets WHERE id = ?", (ticket_id,)
+            )
+            if not rows:
+                raise ValueError("ticket not found")
+            owner_id, current = int(rows[0][0]), str(rows[0][1])
+            if sender_role == "user" and owner_id != int(sender_id):
+                raise PermissionError("user cannot write to another user's ticket")
+            event = "user_message" if sender_role == "user" else "admin_message"
+            target = self._transition(event, current)
+            cursor = await self.db.execute(
+                "INSERT INTO support_messages(ticket_id, sender_id, sender_role, message_text, "
+                "telegram_message_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (ticket_id, sender_id, sender_role, message_text, telegram_message_id, now),
+            )
+            message_id = int(cursor.lastrowid or 0)
+            await self.db.execute(
+                "UPDATE support_tickets SET status = ?, updated_at = ? WHERE id = ?",
+                (target, now, ticket_id),
+            )
+        return {
+            "id": message_id, "ticket_id": ticket_id, "sender_id": sender_id,
+            "sender_role": sender_role, "message_text": message_text,
+            "created_at": now, "status": target, "owner_id": owner_id,
+        }
+
+    async def ticket_messages(self, ticket_id: int, *, limit: int = 6, offset: int = 0) -> list[dict[str, Any]]:
+        """One page of a history, newest first offset, returned oldest-first."""
+        rows = await self.db.execute_fetchall(
+            "SELECT * FROM (SELECT * FROM support_messages WHERE ticket_id = ? "
+            "ORDER BY id DESC LIMIT ? OFFSET ?) ORDER BY id ASC",
+            (ticket_id, limit, offset),
+        )
+        return [dict(row) for row in rows]
+
+    async def count_ticket_messages(self, ticket_id: int) -> int:
+        rows = await self.db.execute_fetchall(
+            "SELECT COUNT(*) FROM support_messages WHERE ticket_id = ?", (ticket_id,)
+        )
+        return int(rows[0][0]) if rows else 0
+
+    async def close_ticket(self, ticket_id: int, actor_id: int, *, admin: bool) -> bool:
+        """Close a ticket. Returns False when it is already closed."""
+        now = iso(utc_now())
+        async with self._transaction():
+            rows = await self.db.execute_fetchall(
+                "SELECT user_id, status FROM support_tickets WHERE id = ?", (ticket_id,)
+            )
+            if not rows:
+                raise ValueError("ticket not found")
+            owner_id, current = int(rows[0][0]), str(rows[0][1])
+            if not admin and owner_id != int(actor_id):
+                raise PermissionError("user cannot close another user's ticket")
+            if current == "closed":
+                return False
+            target = self._transition("close", current)
+            await self.db.execute(
+                "UPDATE support_tickets SET status = ?, closed_at = ?, updated_at = ? WHERE id = ?",
+                (target, now, now, ticket_id),
+            )
+            if admin:
+                await self.db.execute(
+                    "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
+                    "VALUES (?, 'ticket_closed', ?, ?, ?)",
+                    (actor_id, f"ticket:{ticket_id}", owner_id, now),
+                )
+        return True
+
+    async def reopen_ticket(self, ticket_id: int, actor_id: int, *, admin: bool) -> bool:
+        """Reopen a closed ticket; its earlier messages are kept untouched."""
+        now = iso(utc_now())
+        async with self._transaction():
+            rows = await self.db.execute_fetchall(
+                "SELECT user_id, status FROM support_tickets WHERE id = ?", (ticket_id,)
+            )
+            if not rows:
+                raise ValueError("ticket not found")
+            owner_id, current = int(rows[0][0]), str(rows[0][1])
+            if not admin and owner_id != int(actor_id):
+                raise PermissionError("user cannot reopen another user's ticket")
+            if current != "closed":
+                return False
+            target = self._transition("reopen", current)
+            await self.db.execute(
+                "UPDATE support_tickets SET status = ?, closed_at = NULL, updated_at = ? WHERE id = ?",
+                (target, now, ticket_id),
+            )
+            if admin:
+                await self.db.execute(
+                    "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
+                    "VALUES (?, 'ticket_reopened', ?, ?, ?)",
+                    (actor_id, f"ticket:{ticket_id}", owner_id, now),
+                )
+        return True
+
+
+class TicketStateError(RuntimeError):
+    """An event that the ticket's current status does not allow."""
+
+    def __init__(self, event: str, current: str | None):
+        self.event = event
+        self.current = current
+        super().__init__(f"ticket event {event!r} not allowed in status {current!r}")

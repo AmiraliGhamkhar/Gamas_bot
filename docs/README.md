@@ -24,3 +24,4 @@ and **cPanel Terminal** (Linux shared hosting).
 | [Changelog](CHANGELOG.md) | Recent user-visible changes |
 
 Persian quick guide: [DEPLOY_FA.md](DEPLOY_FA.md). OCR is not implemented.
+- [Support tickets](SUPPORT.md) — user and admin support flow, statuses, notifications.

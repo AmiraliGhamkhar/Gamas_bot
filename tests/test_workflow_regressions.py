@@ -179,7 +179,7 @@ class TransactionAndPaymentTests(DatabaseTestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             await self.db.review_payment(pid, True, 1)
         await self.db.ensure_user(200)
-        self.assertEqual((await self.db.payment(pid))["status"], "pending")
+        self.assertEqual((await self.db.payment(pid))["status"], "awaiting_payment")
         self.assertEqual(await self.db.available_seconds(100), 0)
         await self.db._write("DROP TRIGGER fail_insert")
         self.assertTrue(await self.db.review_payment(pid, True, 1))
@@ -198,7 +198,7 @@ class TransactionAndPaymentTests(DatabaseTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await self.db.review_payment(pid, True, 1)
         await self.db.ensure_user(200)
-        self.assertEqual((await self.db.payment(pid))["status"], "pending")
+        self.assertEqual((await self.db.payment(pid))["status"], "awaiting_payment")
         self.assertEqual(await self.db.available_seconds(100), 0)
 
     async def test_settlement_allocation_failure_rolls_back_debit_and_hold(self):
@@ -323,7 +323,7 @@ class WorkflowBotTests(BotPipelineTestCase):
         for action in ("payopen", "payc", "payr"):
             event = FakeCallbackEvent(USER_ID, f"{action}:{pid}".encode())
             await self.bot._handle_callback(event)
-        self.assertEqual((await self.db.payment(pid))["status"], "pending")
+        self.assertEqual((await self.db.payment(pid))["status"], "awaiting_payment")
         self.assertNotIn(USER_ID, self.bot._pending_payments)
 
     async def test_invalid_payment_callback_does_not_crash(self):
