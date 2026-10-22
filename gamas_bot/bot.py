@@ -54,6 +54,7 @@ from .db import (
     InsufficientBalanceError,
     OpenPaymentError,
     PaymentSnapshotError,
+    TicketStateError,
     TooManyActiveJobsError,
 )
 from .docx_export import (
@@ -197,6 +198,35 @@ ACTIVE_LIMIT_MESSAGE = (
     "⏳ شما هم‌اکنون {limit} درخواست در حال پردازش دارید. "
     "بگذارید یکی از آن‌ها تمام شود و بعد این فایل را بفرستید."
 )
+
+SUPPORT_CATEGORY_BUTTONS = {
+    "payment": "💳 پرداخت",
+    "technical": "⚙️ مشکل فنی",
+    "subscription": "📦 اشتراک و اعتبار",
+    "other": "📌 سایر موارد",
+}
+SUPPORT_STATUS_LABELS = {
+    "open": "🆕 باز",
+    "awaiting_admin": "⏳ در انتظار پاسخ پشتیبانی",
+    "awaiting_user": "💬 پاسخ پشتیبانی ثبت شد",
+    "closed": "✅ بسته",
+}
+VIEW_LABELS = {
+    "active": "🆕 فعال",
+    "wait": "⏳ منتظر پاسخ",
+    "user": "💬 منتظر کاربر",
+    "closed": "✅ بسته‌شده",
+}
+CATEGORY_FILTER_LABELS = {"all": "همه", **SUPPORT_CATEGORY_BUTTONS}
+
+
+def _to_int(raw: str) -> int | None:
+    """A callback-data integer, or ``None`` for anything that is not one."""
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
 
 #: Maximum length of a user-controlled string that is logged verbatim. Longer
 #: values are truncated to avoid log-bloat / log-injection.
@@ -705,6 +735,15 @@ def _is_unsupported_attachment(message) -> bool:
     return getattr(message, "document", None) is not None or getattr(message, "photo", None) is not None
 
 
+#: Payment states that still accept a receipt, a cancel or a review. The legacy
+#: ``pending`` value is read as an open state for rows written before the split.
+OPEN_PAYMENT_STATUSES = frozenset({"awaiting_payment", "pending_review", "pending"})
+
+
+def is_open_payment(status: object) -> bool:
+    return str(status) in OPEN_PAYMENT_STATUSES
+
+
 def _is_receipt_image(message) -> bool:
     if getattr(message, "photo", None) is None:
         return False
@@ -732,6 +771,10 @@ class GamasBot:
         self._prewarm_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
         self._pending_broadcast: set[int] = set()
+        # user_id -> ("new", category) or ("reply", ticket_id) awaiting the next text.
+        self._support_states: dict[int, tuple[str, object]] = {}
+        # admin_id -> ticket_id awaiting a reply text (set only by a verified admin callback).
+        self._support_admin_states: dict[int, int] = {}
         # admin_id -> payment_id awaiting a rejection reason
         self._pending_reject_reason: dict[int, int] = {}
         self._admin_action_times: dict[tuple[int, str], float] = {}
@@ -993,9 +1036,10 @@ class GamasBot:
         rows.append(
             [
                 Button.inline("💳 اعتبار و پرداخت", b"account"),
-                Button.inline("❓ راهنما", b"help"),
+                Button.inline("🎧 پشتیبانی", b"support"),
             ]
         )
+        rows.append([Button.inline("❓ راهنما", b"help")])
         if is_admin:
             rows.append([Button.inline("🛠 پنل مدیریت", b"adm:home")])
         return rows
@@ -1012,6 +1056,7 @@ class GamasBot:
                 Button.inline("👥 کاربران", b"adm:users"),
                 Button.inline("🧾 پرداخت‌ها", b"adm:pay"),
             ],
+            [Button.inline("🎧 مدیریت پشتیبانی", b"adm:sup")],
             [
                 Button.inline("📣 ارسال پیام", b"adm:bcast"),
                 Button.inline("🛡 گزارش فعالیت‌ها", b"adm:audit"),
@@ -1412,6 +1457,11 @@ class GamasBot:
         # receipt upload — a photo sent later belongs to the new screen.
         if not data.startswith("payr:"):
             self._pending_payments.pop(user_id, None)
+        # Support prompts are disarmed by any navigation except the prompt itself.
+        if not data.startswith(("sup:cat:", "sup:r:")):
+            self._support_states.pop(user_id, None)
+        if not data.startswith("adm:sr:"):
+            self._support_admin_states.pop(user_id, None)
 
         if data == "make":
             await self._ack(event)
@@ -1533,6 +1583,12 @@ class GamasBot:
         elif data.startswith("adm:rcpt:"):
             await self._ack(event)
             await self._show_receipt(event, data)
+        elif data == "adm:sup" or data.startswith(("adm:sl:", "adm:sv:", "adm:sr:", "adm:sc:", "adm:so:")):
+            await self._ack(event)
+            await self._handle_admin_support_callback(event, user_id, data)
+        elif data == "support" or data.startswith("sup:"):
+            await self._ack(event)
+            await self._handle_support_callback(event, user_id, data)
         else:
             await self._ack(event)
 
@@ -1583,6 +1639,10 @@ class GamasBot:
             self._pending_broadcast.discard(user_id)
             await self._broadcast(event, text)
             return
+        if self._is_admin(user_id) and user_id in self._support_admin_states and not command:
+            ticket_id = self._support_admin_states.pop(user_id)
+            await self._handle_admin_support_text(event, user_id, ticket_id, text)
+            return
         if self._is_admin(user_id) and command == "/grant":
             await self._admin_grant(event, text)
             return
@@ -1592,6 +1652,14 @@ class GamasBot:
         if self._is_admin(user_id) and command in {"/ban", "/unban"}:
             await self._admin_ban(event, text)
             return
+
+        if user_id in self._support_states and command in ("", ):
+            state = self._support_states.pop(user_id)
+            await self._handle_support_text(event, user_id, state, text)
+            return
+        if user_id in self._support_states and command and command != "/cancel" and not command == "/start":
+            # A command while a support prompt is open: the prompt is dropped, the command runs.
+            self._support_states.pop(user_id, None)
 
         # Payment receipt pending for this user?
         if user_id in self._pending_payments and _is_receipt_image(event.message):
@@ -1604,6 +1672,8 @@ class GamasBot:
         if command == "/cancel":
             self._pending_payments.pop(user_id, None)
             self._office_sessions.pop(user_id, None)
+            self._support_states.pop(user_id, None)
+            self._support_admin_states.pop(user_id, None)
             await event.reply("ارسال لغو شد. برای لغو درخواست خرید از بخش اعتبار و پرداخت اقدام کنید.")
             return
 
@@ -2725,7 +2795,9 @@ class GamasBot:
             lines.append("آخرین پرداخت‌ها:")
             for item in history:
                 status = {
-                    "pending": "⏳ در انتظار بررسی",
+                    "pending": "🕒 در انتظار بررسی",
+                    "awaiting_payment": "⏳ منتظر پرداخت",
+                    "pending_review": "🕒 در انتظار بررسی",
                     "approved": "✅ تأیید شد",
                     "rejected": "❌ رد شد",
                     "cancelled": "لغو شد",
@@ -2733,7 +2805,7 @@ class GamasBot:
                 lines.append(
                     f"• {plan_labels.get(item['plan_code'], item['plan_code'])} — {status}"
                 )
-                if item["status"] == "pending":
+                if is_open_payment(item["status"]):
                     pending_buttons = [Button.inline(
                         "ادامهٔ درخواست باز", f"payopen:{item['payment_id']}".encode()
                     )]
@@ -2771,7 +2843,7 @@ class GamasBot:
     async def _show_payment(self, event, payment_id: int) -> None:
         payment = await self.db.payment(payment_id)
         if (payment is None or payment["user_id"] != event.sender_id
-                or payment["status"] != "pending"):
+                or not is_open_payment(payment["status"])):
             await event.respond("این درخواست فعال نیست.")
             return
         if not self.settings.payment_card_number:
@@ -2821,7 +2893,7 @@ class GamasBot:
         payment = await self.db.payment(payment_id)
         if (
             payment is None
-            or payment["status"] != "pending"
+            or not is_open_payment(payment["status"])
             or payment["user_id"] != event.sender_id
         ):
             await event.respond("این درخواست فعال نیست.")
@@ -2839,7 +2911,7 @@ class GamasBot:
         payment = await self.db.payment(payment_id)
         if (
             payment is None
-            or payment["status"] != "pending"
+            or not is_open_payment(payment["status"])
             or payment["user_id"] != user_id
         ):
             await event.respond("این درخواست فعال نیست.")
@@ -2921,7 +2993,7 @@ class GamasBot:
             return
         approved = verdict == "a"
         payment = await self.db.payment(payment_id)
-        if payment is None or payment["status"] != "pending":
+        if payment is None or not is_open_payment(payment["status"]):
             await self._ack(event, "این پرداخت قبلاً بررسی شده است.", alert=True)
             await self._show_admin_payments(event)
             return
@@ -3129,7 +3201,7 @@ class GamasBot:
         await self._ack(event)
         number = to_persian_digits(payment_id)
         buttons: list[list] = []
-        if payment["status"] == "pending":
+        if is_open_payment(payment["status"]):
             buttons.append([
                 Button.inline("✅ تأیید پرداخت", f"payv:{payment_id}:a".encode()),
                 Button.inline("❌ رد پرداخت", f"payv:{payment_id}:r".encode()),
@@ -3410,6 +3482,441 @@ class GamasBot:
             # completion; otherwise its start-time cooldown could expire while
             # it is still sending and allow overlapping fan-out jobs.
             self._admin_action_times[(admin_id, "broadcast")] = time.monotonic()
+
+    # ------------------------------------------------------------- support
+    SUPPORT_PAGE_SIZE = 8
+    SUPPORT_HISTORY_PAGE = 6
+    #: Longest part of one message shown on a history screen (the stored text is complete).
+    SUPPORT_VIEW_CHARS = 900
+
+    @staticmethod
+    def _support_when(value: str | None) -> str:
+        if not value:
+            return "—"
+        return to_persian_digits(value[:16].replace("T", " ")) + " (UTC)"
+
+    @staticmethod
+    def _support_status_label(status: str) -> str:
+        return SUPPORT_STATUS_LABELS.get(status, status)
+
+    @staticmethod
+    def _support_category_label(category: str) -> str:
+        return SUPPORT_CATEGORY_BUTTONS.get(category, category)
+
+    def _support_history_text(self, messages: list[dict], total: int, offset: int) -> str:
+        lines: list[str] = []
+        if total > offset + len(messages):
+            lines.append("… پیام‌های قدیمی‌تر در صفحهٔ بعدی")
+        for message in messages:
+            who = "👤 شما" if message["sender_role"] == "user" else "🎧 پشتیبانی"
+            body = message["message_text"]
+            if len(body) > self.SUPPORT_VIEW_CHARS:
+                body = body[: self.SUPPORT_VIEW_CHARS] + " …"
+            lines.append(f"{who} · {self._support_when(message['created_at'])}\n{body}")
+        return "\n\n".join(lines) if lines else "هنوز پیامی ثبت نشده است."
+
+    async def _notify_admins(self, text: str, buttons=None) -> None:
+        """Tell every administrator something happened. Failures are logged, never raised."""
+        for admin_id in sorted(self.settings.admin_ids):
+            try:
+                await self.client.send_message(admin_id, text, buttons=buttons)
+            except Exception:
+                logger.warning("support notification not delivered admin=%s", admin_id)
+
+    async def _notify_user(self, user_id: int, text: str, buttons=None) -> None:
+        try:
+            await self.client.send_message(user_id, text, buttons=buttons)
+        except Exception:
+            # The state change is already stored; a blocked bot must not undo it.
+            logger.warning("support notification not delivered user=%s", user_id)
+
+    async def _show_support_home(self, event) -> None:
+        text = (
+            "🎧 پشتیبانی\n\n"
+            "برای ثبت درخواست جدید یا پیگیری درخواست‌های قبلی، یکی از گزینه‌ها را انتخاب کنید."
+        )
+        buttons = [
+            [Button.inline("➕ درخواست جدید", b"sup:new")],
+            [Button.inline("📋 درخواست‌های من", b"sup:list")],
+            [Button.inline("🔙 منوی اصلی", b"menu:main")],
+        ]
+        await self._edit_or_reply(event, text, buttons)
+
+    async def _show_support_categories(self, event) -> None:
+        buttons = [
+            [Button.inline(label, f"sup:cat:{key}".encode())]
+            for key, label in SUPPORT_CATEGORY_BUTTONS.items()
+        ]
+        buttons.append([Button.inline("🔙 بازگشت", b"support")])
+        await self._edit_or_reply(event, "دسته‌بندی درخواست را انتخاب کنید:", buttons)
+
+    async def _show_user_tickets(self, event, user_id: int, page: int = 0) -> None:
+        page = max(0, page)
+        rows = await self.db.list_user_tickets(
+            user_id, limit=self.SUPPORT_PAGE_SIZE + 1, offset=page * self.SUPPORT_PAGE_SIZE
+        )
+        has_more = len(rows) > self.SUPPORT_PAGE_SIZE
+        rows = rows[: self.SUPPORT_PAGE_SIZE]
+        if not rows and page == 0:
+            text = "شما هنوز درخواستی ثبت نکرده‌اید."
+        else:
+            text = f"📋 درخواست‌های شما — صفحهٔ {to_persian_digits(page + 1)}"
+        buttons = [
+            [Button.inline(
+                f"{row['public_ticket_id']} · {self._support_status_label(row['status'])}",
+                f"sup:v:{row['id']}".encode(),
+            )]
+            for row in rows
+        ]
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"sup:lp:{page - 1}".encode()))
+        if has_more:
+            nav.append(Button.inline("بعدی ▶️", f"sup:lp:{page + 1}".encode()))
+        if nav:
+            buttons.append(nav)
+        buttons.append([Button.inline("➕ درخواست جدید", b"sup:new")])
+        buttons.append([Button.inline("🔙 بازگشت", b"support")])
+        await self._edit_or_reply(event, text, buttons)
+
+    async def _owned_ticket(self, user_id: int, ticket_id: int) -> dict | None:
+        """The ticket only when the signed-in user owns it (never by id alone)."""
+        ticket = await self.db.get_ticket(ticket_id)
+        if ticket is None or int(ticket["user_id"]) != int(user_id):
+            return None
+        return ticket
+
+    async def _show_user_ticket(self, event, user_id: int, ticket_id: int, page: int = 0) -> None:
+        ticket = await self._owned_ticket(user_id, ticket_id)
+        if ticket is None:
+            await self._ack(event, "این درخواست پیدا نشد.", alert=True)
+            await self._show_user_tickets(event, user_id)
+            return
+        page = max(0, page)
+        offset = page * self.SUPPORT_HISTORY_PAGE
+        total = await self.db.count_ticket_messages(ticket_id)
+        messages = await self.db.ticket_messages(
+            ticket_id, limit=self.SUPPORT_HISTORY_PAGE, offset=offset
+        )
+        head = (
+            f"🎫 درخواست {ticket['public_ticket_id']}\n"
+            f"دسته: {self._support_category_label(ticket['category'])}\n"
+            f"وضعیت: {self._support_status_label(ticket['status'])}\n"
+            f"موضوع: {ticket['subject']}\n"
+            f"ثبت: {self._support_when(ticket['created_at'])}\n"
+        )
+        history = self._support_history_text(messages, total, offset)
+        text = f"{head}\n{history}"
+        buttons = []
+        if ticket["status"] != "closed":
+            buttons.append([Button.inline("✍️ پاسخ به پشتیبانی", f"sup:r:{ticket_id}".encode())])
+            buttons.append([Button.inline("✅ بستن درخواست", f"sup:c:{ticket_id}".encode())])
+        else:
+            buttons.append([Button.inline("🔁 باز کردن دوباره", f"sup:o:{ticket_id}".encode())])
+        if total > offset + self.SUPPORT_HISTORY_PAGE:
+            buttons.append([Button.inline("پیام‌های قدیمی‌تر ▶️", f"sup:v:{ticket_id}:{page + 1}".encode())])
+        if page > 0:
+            buttons.append([Button.inline("◀️ پیام‌های جدیدتر", f"sup:v:{ticket_id}:{page - 1}".encode())])
+        buttons.append([Button.inline("🔙 درخواست‌های من", b"sup:list")])
+        await self._edit_or_reply(event, text, buttons)
+
+    async def _handle_support_callback(self, event, user_id: int, data: str) -> None:
+        parts = data.split(":")
+        if data in ("support", "sup:home"):
+            await self._show_support_home(event)
+            return
+        if data == "sup:new":
+            await self._show_support_categories(event)
+            return
+        if data.startswith("sup:cat:"):
+            category = parts[2] if len(parts) == 3 else ""
+            if category not in SUPPORT_CATEGORY_BUTTONS:
+                await self._ack(event, "این دسته معتبر نیست.", alert=True)
+                return
+            self._support_states[user_id] = ("new", category)
+            await event.respond(
+                f"{SUPPORT_CATEGORY_BUTTONS[category]}\n\n"
+                "موضوع یا شرح کوتاه مشکل را در یک پیام بفرستید (حداکثر ۴۰۰ نویسه).\n"
+                "برای لغو، /cancel بفرستید.",
+                buttons=[[Button.inline("🔙 بازگشت", b"sup:new")]],
+            )
+            return
+        if data == "sup:list":
+            await self._show_user_tickets(event, user_id)
+            return
+        if data.startswith("sup:lp:"):
+            await self._show_user_tickets(event, user_id, _to_int(parts[2]) or 0)
+            return
+        ticket_id = _to_int(parts[2]) if len(parts) >= 3 else None
+        if ticket_id is None:
+            await self._ack(event, "درخواست نامعتبر است.", alert=True)
+            return
+        if parts[1] == "v":
+            page = (_to_int(parts[3]) or 0) if len(parts) > 3 else 0
+            await self._show_user_ticket(event, user_id, ticket_id, page)
+        elif parts[1] == "r":
+            ticket = await self._owned_ticket(user_id, ticket_id)
+            if ticket is None or ticket["status"] == "closed":
+                await self._ack(event, "این درخواست پاسخ‌پذیر نیست؛ ابتدا آن را باز کنید.", alert=True)
+                return
+            self._support_states[user_id] = ("reply", ticket_id)
+            await event.respond(
+                f"پیام خود را برای درخواست {ticket['public_ticket_id']} بفرستید.\n"
+                "برای لغو، /cancel بفرستید.",
+                buttons=[[Button.inline("🔙 بازگشت", f"sup:v:{ticket_id}".encode())]],
+            )
+        elif parts[1] == "c":
+            ticket = await self._owned_ticket(user_id, ticket_id)
+            if ticket is None:
+                await self._ack(event, "این درخواست پیدا نشد.", alert=True)
+                return
+            try:
+                closed = await self.db.close_ticket(ticket_id, user_id, admin=False)
+            except (ValueError, PermissionError, TicketStateError):
+                closed = False
+            if closed:
+                await self._notify_admins(
+                    f"🔒 کاربر {user_id} درخواست {ticket['public_ticket_id']} را بست."
+                )
+                logger.info("support ticket closed by user ticket=%s", ticket_id)
+            await self._show_user_ticket(event, user_id, ticket_id)
+        elif parts[1] == "o":
+            ticket = await self._owned_ticket(user_id, ticket_id)
+            if ticket is None:
+                await self._ack(event, "این درخواست پیدا نشد.", alert=True)
+                return
+            try:
+                reopened = await self.db.reopen_ticket(ticket_id, user_id, admin=False)
+            except (ValueError, PermissionError, TicketStateError):
+                reopened = False
+            if reopened:
+                await self._notify_admins(
+                    f"🔁 کاربر {user_id} درخواست {ticket['public_ticket_id']} را دوباره باز کرد."
+                )
+                logger.info("support ticket reopened by user ticket=%s", ticket_id)
+            await self._show_user_ticket(event, user_id, ticket_id)
+        else:
+            await self._ack(event, "درخواست نامعتبر است.", alert=True)
+
+    async def _handle_support_text(self, event, user_id: int, state: tuple, text: str) -> None:
+        """The next plain message of a user who opened a support prompt."""
+        kind, value = state
+        if not text:
+            await event.reply("لطفاً پیام خود را به‌صورت متن بفرستید؛ برای لغو /cancel بفرستید.")
+            return
+        if kind == "new":
+            try:
+                ticket = await self.db.create_ticket(user_id, value, text)
+            except ValueError:
+                await event.reply("موضوع باید بین ۲ تا ۴۰۰ نویسه باشد؛ دوباره بنویسید.")
+                return
+            self._support_states.pop(user_id, None)
+            await self.db.add_ticket_message(
+                ticket["id"], user_id, "user", text,
+                telegram_message_id=getattr(event.message, "id", None),
+            )
+            logger.info("support ticket created ticket=%s category=%s", ticket["id"], value)
+            await event.reply(
+                "✅ درخواست شما ثبت شد.\n"
+                f"شماره پیگیری: {ticket['public_ticket_id']}\n"
+                "از همین بخش می‌توانید پاسخ‌ها را پیگیری کنید.",
+                buttons=[[Button.inline("📋 مشاهدهٔ درخواست", f"sup:v:{ticket['id']}".encode())]],
+            )
+            await self._notify_admins(
+                "🎧 درخواست پشتیبانی جدید\n"
+                f"شماره: {ticket['public_ticket_id']}\n"
+                f"کاربر: {user_id}\n"
+                f"دسته: {self._support_category_label(value)}\n"
+                f"موضوع: {ticket['subject']}",
+                buttons=[[Button.inline("🔎 بررسی درخواست", f"adm:sv:{ticket['id']}".encode())]],
+            )
+            return
+        # kind == "reply": the ticket id came from a verified ownership check.
+        self._support_states.pop(user_id, None)
+        try:
+            await self.db.add_ticket_message(
+                value, user_id, "user", text,
+                telegram_message_id=getattr(event.message, "id", None),
+            )
+        except (ValueError, PermissionError, TicketStateError):
+            await event.reply("این درخواست دیگر پاسخ‌پذیر نیست؛ ابتدا آن را باز کنید.")
+            return
+        ticket = await self.db.get_ticket(value)
+        public_id = ticket["public_ticket_id"] if ticket else str(value)
+        await event.reply(
+            "✅ پیام شما ثبت شد.",
+            buttons=[[Button.inline("📋 مشاهدهٔ درخواست", f"sup:v:{value}".encode())]],
+        )
+        await self._notify_admins(
+            f"💬 پیام جدیدی در درخواست {public_id} ثبت شد.\nکاربر: {user_id}",
+            buttons=[[Button.inline("🔎 بررسی درخواست", f"adm:sv:{value}".encode())]],
+        )
+
+    async def _handle_admin_support_text(self, event, admin_id: int, ticket_id: int, text: str) -> None:
+        self._support_admin_states.pop(admin_id, None)
+        if not text:
+            await event.reply("پاسخ باید متن داشته باشد؛ دوباره متن را بفرستید یا /cancel بزنید.")
+            self._support_admin_states[admin_id] = ticket_id
+            return
+        try:
+            await self.db.add_ticket_message(ticket_id, admin_id, "admin", text)
+        except (ValueError, TicketStateError):
+            await event.reply("این درخواست دیگر پاسخ‌پذیر نیست؛ ابتدا آن را باز کنید.", buttons=self._admin_menu())
+            return
+        ticket = await self.db.get_ticket(ticket_id)
+        public_id = ticket["public_ticket_id"] if ticket else str(ticket_id)
+        logger.info("support admin reply ticket=%s admin=%s", ticket_id, admin_id)
+        await event.reply(
+            f"✅ پاسخ به درخواست {public_id} ثبت شد.",
+            buttons=[[Button.inline("🔎 مشاهدهٔ درخواست", f"adm:sv:{ticket_id}".encode())]],
+        )
+        if ticket is not None:
+            await self._notify_user(
+                int(ticket["user_id"]),
+                f"📩 پاسخ جدیدی برای درخواست {public_id} ثبت شده است.",
+                buttons=[[Button.inline("📋 مشاهدهٔ پاسخ", f"sup:v:{ticket_id}".encode())]],
+            )
+
+    async def _show_admin_support(self, event, view: str = "active", category: str = "all", page: int = 0) -> None:
+        counts = await self.db.count_tickets_by_status()
+        page = max(0, page)
+        cat = None if category == "all" else category
+        rows = await self.db.list_tickets(
+            view=view, category=cat,
+            limit=self.SUPPORT_PAGE_SIZE + 1, offset=page * self.SUPPORT_PAGE_SIZE,
+        )
+        has_more = len(rows) > self.SUPPORT_PAGE_SIZE
+        rows = rows[: self.SUPPORT_PAGE_SIZE]
+        open_count = counts.get("open", 0) + counts.get("awaiting_admin", 0) + counts.get("awaiting_user", 0)
+        text = (
+            "🎧 مدیریت پشتیبانی\n\n"
+            f"فعال: {to_persian_digits(open_count)} | "
+            f"منتظر پاسخ شما: {to_persian_digits(counts.get('awaiting_admin', 0))} | "
+            f"بسته: {to_persian_digits(counts.get('closed', 0))}\n"
+            f"فهرست: {VIEW_LABELS.get(view, view)} — دسته: {CATEGORY_FILTER_LABELS.get(category, category)}"
+        )
+        buttons = [
+            [Button.inline(VIEW_LABELS["active"], b"adm:sl:active:all:0"),
+             Button.inline(VIEW_LABELS["wait"], b"adm:sl:wait:all:0")],
+            [Button.inline(VIEW_LABELS["user"], b"adm:sl:user:all:0"),
+             Button.inline(VIEW_LABELS["closed"], b"adm:sl:closed:all:0")],
+            [Button.inline(label, f"adm:sl:{view}:{key}:0".encode())
+             for key, label in SUPPORT_CATEGORY_BUTTONS.items()][:2],
+            [Button.inline(label, f"adm:sl:{view}:{key}:0".encode())
+             for key, label in SUPPORT_CATEGORY_BUTTONS.items()][2:],
+        ]
+        for row in rows:
+            buttons.append([Button.inline(
+                f"{row['public_ticket_id']} · {self._support_category_label(row['category'])} · "
+                f"{self._support_status_label(row['status'])}",
+                f"adm:sv:{row['id']}".encode(),
+            )])
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"adm:sl:{view}:{category}:{page - 1}".encode()))
+        if has_more:
+            nav.append(Button.inline("بعدی ▶️", f"adm:sl:{view}:{category}:{page + 1}".encode()))
+        if nav:
+            buttons.append(nav)
+        if not rows:
+            text += "\n\nدرخواستی در این فهرست نیست."
+        buttons.append([Button.inline("🔙 پنل مدیریت", b"adm:home")])
+        await self._edit_or_reply(event, text, buttons)
+
+    async def _show_admin_ticket(self, event, ticket_id: int, page: int = 0) -> None:
+        ticket = await self.db.get_ticket(ticket_id)
+        if ticket is None:
+            await self._ack(event, "این درخواست پیدا نشد.", alert=True)
+            await self._show_admin_support(event)
+            return
+        page = max(0, page)
+        total = await self.db.count_ticket_messages(ticket_id)
+        offset = page * self.SUPPORT_HISTORY_PAGE
+        messages = await self.db.ticket_messages(
+            ticket_id, limit=self.SUPPORT_HISTORY_PAGE, offset=offset,
+        )
+        head = (
+            f"🎫 درخواست {ticket['public_ticket_id']}\n"
+            f"کاربر: {ticket['user_id']}\n"
+            f"دسته: {self._support_category_label(ticket['category'])}\n"
+            f"وضعیت: {self._support_status_label(ticket['status'])}\n"
+            f"موضوع: {ticket['subject']}\n"
+            f"ثبت: {self._support_when(ticket['created_at'])} | "
+            f"آخرین تغییر: {self._support_when(ticket['updated_at'])}\n"
+        )
+        text = f"{head}\n{self._support_history_text(messages, total, offset)}"
+        buttons = []
+        if ticket["status"] != "closed":
+            buttons.append([Button.inline("✍️ پاسخ به کاربر", f"adm:sr:{ticket_id}".encode())])
+            buttons.append([Button.inline("✅ بستن درخواست", f"adm:sc:{ticket_id}".encode())])
+        else:
+            buttons.append([Button.inline("🔁 باز کردن دوباره", f"adm:so:{ticket_id}".encode())])
+        if total > offset + self.SUPPORT_HISTORY_PAGE:
+            buttons.append([Button.inline("پیام‌های قدیمی‌تر ▶️", f"adm:sv:{ticket_id}:{page + 1}".encode())])
+        if page > 0:
+            buttons.append([Button.inline("◀️ پیام‌های جدیدتر", f"adm:sv:{ticket_id}:{page - 1}".encode())])
+        buttons.append([Button.inline("🔙 فهرست پشتیبانی", b"adm:sup")])
+        await self._edit_or_reply(event, text, buttons)
+
+    async def _handle_admin_support_callback(self, event, admin_id: int, data: str) -> None:
+        parts = data.split(":")
+        if data == "adm:sup":
+            await self._show_admin_support(event)
+            return
+        if data.startswith("adm:sl:") and len(parts) == 5:
+            view, category = parts[2], parts[3]
+            if view not in VIEW_LABELS or (category != "all" and category not in SUPPORT_CATEGORY_BUTTONS):
+                await self._ack(event, "فهرست نامعتبر است.", alert=True)
+                return
+            await self._show_admin_support(event, view, category, _to_int(parts[4]) or 0)
+            return
+        ticket_id = _to_int(parts[2]) if len(parts) >= 3 else None
+        if ticket_id is None:
+            await self._ack(event, "درخواست نامعتبر است.", alert=True)
+            return
+        ticket = await self.db.get_ticket(ticket_id)
+        if ticket is None:
+            await self._ack(event, "این درخواست پیدا نشد.", alert=True)
+            return
+        if parts[1] == "sv":
+            await self._show_admin_ticket(event, ticket_id, (_to_int(parts[3]) or 0) if len(parts) > 3 else 0)
+        elif parts[1] == "sr":
+            if ticket["status"] == "closed":
+                await self._ack(event, "این درخواست بسته است؛ ابتدا آن را باز کنید.", alert=True)
+                return
+            self._support_admin_states[admin_id] = ticket_id
+            await event.respond(
+                f"پاسخ خود را برای درخواست {ticket['public_ticket_id']} بنویسید.\n"
+                "پس از ارسال، کاربر از پاسخ شما مطلع می‌شود. برای لغو /cancel بفرستید.",
+                buttons=[[Button.inline("↩️ بازگشت", f"adm:sv:{ticket_id}".encode())]],
+            )
+        elif parts[1] == "sc":
+            try:
+                closed = await self.db.close_ticket(ticket_id, admin_id, admin=True)
+            except (ValueError, PermissionError):
+                closed = False
+            if closed:
+                await self._notify_user(
+                    int(ticket["user_id"]),
+                    f"✅ درخواست {ticket['public_ticket_id']} بسته شد. "
+                    "اگر مشکل شما هنوز باقی است، می‌توانید درخواست را دوباره باز کنید.",
+                    buttons=[[Button.inline("📋 مشاهدهٔ درخواست", f"sup:v:{ticket_id}".encode())]],
+                )
+            await self._show_admin_ticket(event, ticket_id)
+        elif parts[1] == "so":
+            try:
+                reopened = await self.db.reopen_ticket(ticket_id, admin_id, admin=True)
+            except (ValueError, PermissionError):
+                reopened = False
+            if reopened:
+                await self._notify_user(
+                    int(ticket["user_id"]),
+                    f"🔁 درخواست {ticket['public_ticket_id']} دوباره باز شد.",
+                    buttons=[[Button.inline("📋 مشاهدهٔ درخواست", f"sup:v:{ticket_id}".encode())]],
+                )
+            await self._show_admin_ticket(event, ticket_id)
+        else:
+            await self._ack(event, "درخواست نامعتبر است.", alert=True)
 
     # --------------------------------------------------------------- cleanup
     async def _receipt_cleanup_loop(self) -> None:

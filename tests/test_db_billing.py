@@ -244,7 +244,7 @@ class PaymentTests(DatabaseTestCase):
         # Nothing was written.
         row = await self.db.payment(payment)
         assert row is not None
-        self.assertEqual(row["status"], "pending")
+        self.assertIn(row["status"], ("pending", "awaiting_payment"))
 
     async def test_approval_uses_the_purchase_snapshot(self):
         """Deactivating or re-pricing the plan cannot change the credit (F-02/F-14)."""
@@ -269,7 +269,7 @@ class PaymentTests(DatabaseTestCase):
             await self.db.review_payment(payment, True, 1)
         row = await self.db.payment(payment)
         assert row is not None
-        self.assertEqual(row["status"], "pending")
+        self.assertIn(row["status"], ("pending", "awaiting_payment"))
         self.assertEqual(await self.db.available_seconds(100), 0)
 
     async def test_second_tap_reuses_the_open_request(self):

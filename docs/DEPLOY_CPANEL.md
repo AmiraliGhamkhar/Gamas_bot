@@ -104,3 +104,36 @@ or use a SQLite-aware backup so WAL data is included. Store backups encrypted an
 | `Permission denied` on data files | `chmod 700 data`, `chmod 600 .env`; check the account owns the files |
 
 The preflight is the final check for your account layout.
+
+## 7. Upgrade to the payment and support release
+
+This release adds migration `005_payments_and_support.sql` (idempotent; runs at startup). It changes
+payment state names and creates the support tables. Existing balances, purchases and subscriptions
+are not modified.
+
+```bash
+cd "$HOME/gamas_bot"
+# 1. Pause the cron job in cPanel.
+PID="$(cat data/gamas.lock 2>/dev/null)"; ps -p "$PID" >/dev/null 2>&1 && kill "$PID"
+# 2. Back up before migrating (keep the copy outside public_html).
+mkdir -p "$HOME/backups/$(date +%F-%H%M)" && cp -p data/gamas_v3.db* .env "$HOME/backups/$(date +%F-%H%M)/" 2>/dev/null
+# 3. Update and check.
+. .venv/bin/activate
+git pull
+python -m pip install -r requirements.txt
+python -m pytest -q          # optional: needs the dev extras
+python -m gamas_bot --check
+# 4. Re-enable the cron job. The migration runs when the bot starts.
+```
+
+Smoke test after the first start (use an admin account):
+
+1. `/start` shows the main menu with «🎧 پشتیبانی».
+2. Open «🎧 پشتیبانی» → «➕ درخواست جدید» → pick a category → send a subject. The reply shows a `T-` number and the admin receives a notification.
+3. From the admin panel open «🎧 مدیریت پشتیبانی», open the ticket, reply. The user receives the notification.
+4. Open «🧾 پرداخت‌ها» and confirm existing pending requests are listed.
+
+**Rollback.** Stop the bot, restore `data/gamas_v3.db` (and its `-wal`/`-shm` files) from the backup
+taken in step 2, restore the previous code with `git checkout <previous-commit>`, then start the bot.
+Do not run the previous code against a migrated database without restoring the backup first:
+the old code does not know the new payment states.
