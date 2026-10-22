@@ -72,6 +72,7 @@ jobs:
                           "users", "submissions", "transcriptions", "plans",
                           "payments", "ledger", "holds", "audit",
                           "debit_allocations", "hold_allocations", "billing_migrations",
+                          "support_tickets", "support_messages", "support_ticket_seq",
                       }
                       assert tables == expected_tables, f"unexpected application tables: {tables}"
                       print(f"applied {len(applied)} migration(s); verified {len(tables)} application tables")
