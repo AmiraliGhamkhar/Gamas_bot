@@ -364,6 +364,17 @@ class WorkflowBotTests(BotPipelineTestCase):
         self.assertNotIn(f"payc:{pid}".encode(), menu_payloads(buttons))
         self.assertNotIn(f"payr:{pid}".encode(), menu_payloads(buttons))
 
+    async def test_submitted_order_status_remains_visible_when_new_payments_are_disabled(self):
+        pid = await self.db.create_payment(USER_ID, "paid_5h_30d")
+        await self.db.set_payment_receipt(pid, "receipt.jpg", user_id=USER_ID)
+        self.bot.settings = replace(self.settings, payment_card_number="")
+        event = FakeCallbackEvent(USER_ID, f"payopen:{pid}".encode())
+        await self.bot._handle_callback(event)
+        text, buttons = event.responses[-1]
+        self.assertIn("در انتظار بررسی", text)
+        self.assertNotIn("اطلاعات واریز", text)
+        self.assertNotIn(f"payr:{pid}".encode(), menu_payloads(buttons))
+
 
 class LegacyAllocationMigrationTests(DatabaseTestCase):
     async def legacy_database(self):

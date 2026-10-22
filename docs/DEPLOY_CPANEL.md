@@ -107,10 +107,12 @@ The preflight is the final check for your account layout.
 
 ## 7. Upgrade to the payment and support release
 
-This release includes `005_payments_and_support.sql` (explicit payment states and support tables)
-and `006_payment_entitlement_links.sql` (a nullable payment link on credit rows and uniqueness
-indexes). Both run automatically at startup. Existing balances, purchases, expiry dates and tickets
-are not reset or rewritten. No new environment variables or dependencies are required.
+This release includes `005_payments_and_support.sql` (explicit payment states and support tables),
+`006_payment_entitlement_links.sql` (payment-linked credit and uniqueness indexes),
+`007_payment_state_guards.sql`, and `008_payment_transition_integrity.sql` (complete forward-only
+review transitions and reviewer metadata). They run automatically at startup. Migration 008 replaces
+only a trigger; it rewrites no rows. Existing balances, purchases, expiry dates and tickets are not
+reset. No new environment variables or dependencies are required.
 
 ```bash
 cd "$HOME/gamas_bot"
@@ -151,6 +153,10 @@ Smoke test after the first start (use an admin account and a small test order):
    «💳 پرداخت‌های در انتظار». The first approval tap must only show confirmation; «✅ تأیید نهایی»
    activates credit once. Reject another test order (preset or custom reason) and verify its reason
    reaches the user without granting credit.
+4. Tap the stale approval button again and confirm the balance and payment-linked ledger credit do
+   not change. Check the approved/rejected states in «🧾 پرداخت‌های من» after a restart.
+5. Reply from both sides of a ticket, close and reopen it, and confirm the earlier messages remain.
+   If Telegram is temporarily unavailable, confirm the stored history is still intact after recovery.
 
 **Rollback.** Pause cron and stop the bot. Set `BACKUP_DIR` to the actual pre-upgrade directory,
 move the current database aside (do not delete it), restore the matching backup, and only then start

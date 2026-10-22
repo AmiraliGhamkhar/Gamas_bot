@@ -4,6 +4,13 @@
 
 Payment, support and Persian UX fixes:
 
+- Bounded and paginated the admin pending-payment screen so large review backlogs remain usable.
+- Fixed the admin new/open ticket filter to include freshly created `awaiting_admin` tickets as well
+  as reopened `open` tickets.
+- Migration 008 enforces forward-only payment transitions and complete review metadata without
+  rewriting production rows. Tests cover concurrent approvals through independent SQLite connections.
+- Submitted orders remain readable when new card-to-card purchases are disabled; simplified the main
+  menu copy and made unavailable-receipt status wording accurate.
 - Manual review now requires a stored receipt and an explicit approval confirmation. Payment status,
   credit and audit writes are atomic, and migration 006 enforces one credit ledger row per payment.
 - Added user/admin payment histories, order details, complete admin receipt notifications, rejection

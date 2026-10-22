@@ -55,6 +55,7 @@ python -m gamas_bot
 گزارش‌ها در `data/logs/bot.log` و `data/logs/launcher.err` هستند. پیش از به‌روزرسانی، کران را
 موقتاً غیرفعال کنید، ربات را متوقف کنید، از `.env`، `data/gamas_v3.db` (و فایل‌های `-wal`/`-shm`)
 و `data/receipts` نسخهٔ پشتیبان بگیرید، سپس `git pull`، نصب `requirements.txt`، اجرای
-`python -m scripts.cpanel_preflight` و `python -m gamas_bot --check` (که مهاجرت‌های خودکار تا
-`007_payment_state_guards.sql` را بررسی می‌کند) و فعال‌سازی دوبارهٔ کران یا `touch tmp/restart.txt`
-در Passenger را انجام دهید.
+`python -m scripts.cpanel_preflight` و `python -m gamas_bot --check` را انجام دهید. بررسی `--check`
+آفلاین است و پایگاه‌داده را تغییر نمی‌دهد؛ مهاجرت‌های خودکار تا `008_payment_transition_integrity.sql`
+هنگام راه‌اندازی ربات اجرا می‌شوند. در پایان کران را فعال کنید یا در Passenger از `touch tmp/restart.txt`
+استفاده کنید.

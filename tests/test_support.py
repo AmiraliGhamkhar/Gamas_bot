@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from gamas_bot.bot import GamasBot
@@ -118,6 +119,7 @@ class SupportDatabaseTests(DatabaseTestCase):
         await self.db.close_ticket(c, ADMIN, admin=True)
         ids = lambda rows: sorted(r["id"] for r in rows)  # noqa: E731
         self.assertEqual(ids(await self.db.list_tickets(view="active")), sorted([a, b]))
+        self.assertEqual(ids(await self.db.list_tickets(view="open")), [a])
         self.assertEqual(ids(await self.db.list_tickets(view="wait")), [a])
         self.assertEqual(ids(await self.db.list_tickets(view="user")), [b])
         self.assertEqual(ids(await self.db.list_tickets(view="closed")), [c])
@@ -278,6 +280,12 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(ticket["public_ticket_id"] in r for r in event.replies))
         notified = [item["text"] for item in self.bot.client.texts if item["entity"] == ADMIN]
         self.assertTrue(any("درخواست پشتیبانی جدید" in t and ticket["public_ticket_id"] in t for t in notified))
+        new_queue = await self.press(ADMIN, "adm:sl:open:all:0")
+        self.assertIn("جدید: ۱", new_queue.edits[-1][0])
+        self.assertIn(
+            f"adm:sv:{ticket['id']}".encode(),
+            self.payloads(new_queue.edits[-1][1]),
+        )
 
     async def test_subject_prompt_requires_text_and_cancel_clears_it(self):
         await self.press(USER_A, "sup:cat:technical")
@@ -332,6 +340,36 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         user_texts = [item["text"] for item in self.bot.client.texts if item["entity"] == USER_A]
         self.assertTrue(any(f"پاسخ جدیدی برای درخواست {ticket['public_ticket_id']} ثبت شده است." in t
                             for t in user_texts))
+
+    async def test_multiple_admins_receive_alerts_and_can_reply_to_the_selected_ticket(self):
+        second_admin = 2
+        await self.db.ensure_user(second_admin)
+        self.bot.settings = replace(
+            self.settings, admin_ids=frozenset({ADMIN, second_admin})
+        )
+        await self.open_ticket()
+        ticket = await self.latest_ticket()
+        for admin_id in (ADMIN, second_admin):
+            self.assertTrue(any(
+                item["entity"] == admin_id and ticket["public_ticket_id"] in item["text"]
+                for item in self.bot.client.texts
+            ))
+
+        self.bot.client.texts.clear()
+        await self.press(USER_A, f"sup:r:{ticket['id']}")
+        await self.say(USER_A, "توضیح برای هر دو مدیر")
+        for admin_id in (ADMIN, second_admin):
+            self.assertTrue(any(
+                item["entity"] == admin_id and "پیام جدیدی" in item["text"]
+                for item in self.bot.client.texts
+            ))
+
+        await self.press(second_admin, f"adm:sr:{ticket['id']}")
+        await self.say(second_admin, "پاسخ مدیر دوم")
+        messages = await self.db.ticket_messages(ticket["id"], limit=10)
+        self.assertEqual(messages[-1]["sender_id"], second_admin)
+        self.assertEqual(messages[-1]["sender_role"], "admin")
+        self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "awaiting_user")
 
     async def test_non_admin_cannot_open_admin_support_or_reply(self):
         await self.open_ticket()
@@ -481,7 +519,7 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         # Open filter combined with payment category shows reopened ticket & preserves category across tabs.
         filtered = await self.press(ADMIN, "adm:sl:open:payment:0")
         rendered, buttons = filtered.edits[-1]
-        self.assertIn("جدید: ۱", rendered)
+        self.assertIn("جدید: ۴", rendered)
         self.assertIn("💳 پرداخت", rendered)
         callbacks = [
             (getattr(btn, "data", None) or btn.type.data).decode("utf-8", errors="ignore")

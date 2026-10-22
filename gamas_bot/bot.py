@@ -1126,18 +1126,18 @@ class GamasBot:
         greeting = "به گاماس خوش آمدید." if first_start else "منوی اصلی"
         if self.settings.note_configured:
             introduction = (
-                "برای ساخت جزوه، «📝 ساخت جزوه» را انتخاب کنید تا ابتدا متن گفتار و سپس جزوهٔ ورد "
-                "ارسال شود؛ یا برای دریافت متن تنها، «🎙️ تبدیل صدا به متن» را بزنید.\n"
+                "برای ساخت جزوه، «📝 ساخت جزوه» را انتخاب و فایل درس را بفرستید؛ "
+                "متن گفتار و سپس جزوهٔ ورد ارسال می‌شود.\n"
+                "برای دریافت فقط متن، «🎙️ تبدیل صدا به متن» را انتخاب کنید.\n"
             )
         else:
             introduction = (
-                "برای تبدیل صدا به متن، «🎙️ تبدیل صدا به متن» را انتخاب کنید و فایل صوتی، "
-                "ویدیویی یا پاورپوینت را بفرستید.\n"
+                "برای تبدیل صدا به متن، «🎙️ تبدیل صدا به متن» را انتخاب و فایل درس را بفرستید.\n"
                 "ساخت جزوهٔ ورد در حال حاضر فعال نیست.\n"
             )
         text = f"{greeting}\n\n{introduction}"
         if self.settings.office_enabled:
-            text += "برای ساخت سند از متن، از «📄 ساخت سند رایگان» استفاده کنید؛ اعتبار مصرف نمی‌شود.\n"
+            text += "برای ساخت سند از متن، «📄 ساخت سند رایگان» را انتخاب کنید؛ اعتبار مصرف نمی‌شود.\n"
         text += f"\n⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
 
@@ -1638,9 +1638,17 @@ class GamasBot:
         elif data == "adm:users":
             await self._ack(event)
             await self._show_admin_users(event)
-        elif data == "adm:pay":
+        elif data == "adm:pay" or data.startswith("adm:pay:"):
             await self._ack(event)
-            await self._show_admin_payments(event)
+            page = 0
+            if data != "adm:pay":
+                parts = data.split(":")
+                parsed_page = _to_int(parts[2]) if len(parts) == 3 else None
+                if parsed_page is None:
+                    await self._ack(event, "صفحهٔ سفارش‌ها نامعتبر است.", alert=True)
+                    return
+                page = max(0, parsed_page)
+            await self._show_admin_payments(event, page)
         elif data.startswith("adm:ph:"):
             await self._ack(event)
             page = _to_int(data.rsplit(":", 1)[-1])
@@ -2937,7 +2945,7 @@ class GamasBot:
         if not plans:
             lines.append("در حال حاضر بسته‌ای برای خرید موجود نیست.")
         else:
-            lines.append("بسته را انتخاب کنید. اعتبار هر خرید به موجودی شما اضافه می‌شود.")
+            lines.append("بسته را انتخاب کنید؛ اعتبار خریدها با موجودی شما جمع می‌شود.")
             for plan in plans:
                 hours = float(plan["hours"])
                 hours_text = to_persian_digits(
@@ -3022,19 +3030,21 @@ class GamasBot:
         payment = await self.db.payment(payment_id)
         if (payment is None or payment["user_id"] != event.sender_id
                 or not is_open_payment(payment["status"])):
-            await event.respond("این درخواست فعال نیست.")
-            return
-        if not self.settings.payment_card_number:
-            await event.respond("پرداخت کارت‌به‌کارت در حال حاضر فعال نیست؛ با مدیر تماس بگیرید.")
+            await event.respond(
+                "این سفارش فعال نیست؛ وضعیت آن را در «🧾 پرداخت‌های من» ببینید.",
+                buttons=[[Button.inline("🧾 پرداخت‌های من", b"payments")]],
+            )
             return
         if not payment["purchased_seconds"] or payment["purchased_price"] is None:
-            await event.respond("اطلاعات خرید کامل نیست؛ لطفاً با مدیر تماس بگیرید.")
+            await event.respond(
+                "اطلاعات این سفارش ناقص است؛ لطفاً درخواست پشتیبانی ثبت کنید.",
+                buttons=[[Button.inline("🎧 پشتیبانی", b"support")]],
+            )
             return
         # The request snapshot, not the mutable catalog, is the quote.
         plan = {"hours": payment["purchased_seconds"] / 3600,
                 "price": payment["purchased_price"],
                 "validity_days": payment["purchased_validity_days"]}
-        card = format_payment_card(self.settings.payment_card_number)
         hours = plan["hours"]
         hours_text = to_persian_digits(int(hours) if float(hours).is_integer() else hours)
         order_ref = to_persian_digits(payment_id)
@@ -3044,6 +3054,8 @@ class GamasBot:
             f"اعتبار بسته: {format_validity(plan['validity_days'])}"
         )
         if payment["receipt_path"]:
+            # Review status remains available even if new purchases are later
+            # disabled; removing the card configuration must not hide it.
             self._pending_payments.pop(event.sender_id, None)
             text = (
                 f"{summary}\n\n"
@@ -3051,16 +3063,23 @@ class GamasBot:
                 "پس از بررسی، نتیجه اطلاع‌رسانی می‌شود."
             )
             buttons = []
+        elif not self.settings.payment_card_number:
+            self._pending_payments.pop(event.sender_id, None)
+            text = (
+                f"{summary}\n\n"
+                "پرداخت کارت‌به‌کارت فعلاً در دسترس نیست؛ سفارش را لغو کنید یا بعداً دوباره بررسی کنید."
+            )
+            buttons = [[Button.inline("لغو سفارش", f"payc:{payment_id}".encode())]]
         else:
             self._pending_payments[event.sender_id] = payment_id
+            card = format_payment_card(self.settings.payment_card_number)
             text = (
                 f"{summary}\n\n"
                 "اطلاعات واریز:\n"
                 f"💳 شماره کارت: {card}\n"
                 f"به نام: {self.settings.payment_card_holder}\n"
                 f"بانک: {self.settings.payment_bank_name}\n\n"
-                "پس از واریز، تصویر رسید را مستقیماً ارسال کنید یا دکمهٔ زیر را بزنید. "
-                "اعتبار فقط پس از تأیید مدیر اضافه می‌شود."
+                "پس از واریز، تصویر رسید را بفرستید. اعتبار فقط پس از تأیید مدیر اضافه می‌شود."
             )
             buttons = [
                 [Button.inline("📤 ارسال رسید", f"payr:{payment_id}".encode())],
@@ -3387,7 +3406,7 @@ class GamasBot:
     # ----------------------------------------------------------------- admin
     async def _show_admin_overview(self, event) -> None:
         stats = await self.db.stats()
-        pending = len(await self.db.pending_review_payments())
+        pending = await self.db.count_pending_review_payments()
         text = (
             "🛠 پنل مدیریت | آمار و وضعیت\n\n"
             f"👥 کاربران ثبت‌شده: {to_persian_digits(stats['users'])}\n"
@@ -3451,13 +3470,27 @@ class GamasBot:
         )
         await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
 
-    async def _show_admin_payments(self, event) -> None:
-        """List only receipt-backed orders that actually need a decision."""
-        payments = await self.db.pending_review_payments()
+    PAYMENT_ADMIN_PAGE_SIZE = 8
+
+    async def _show_admin_payments(self, event, page: int = 0) -> None:
+        """Show a bounded page of receipt-backed orders awaiting a decision."""
+        page = max(0, int(page))
+        page_size = self.PAYMENT_ADMIN_PAGE_SIZE
+        payments = await self.db.pending_review_payments(
+            limit=page_size + 1, offset=page * page_size
+        )
+        has_more = len(payments) > page_size
+        payments = payments[:page_size]
+        total = await self.db.count_pending_review_payments()
         buttons: list[list] = [
             [Button.inline("📋 تاریخچه پرداخت‌ها", b"adm:ph:0")]
         ]
         if not payments:
+            if page > 0 and total:
+                # A stale «next» button after another admin cleared the queue
+                # must lead back to real orders, not a dead-end empty page.
+                await self._show_admin_payments(event, 0)
+                return
             buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
             await self._edit_or_reply(
                 event,
@@ -3466,8 +3499,8 @@ class GamasBot:
             )
             return
         lines = [
-            f"💳 پرداخت‌های در انتظار — {to_persian_digits(len(payments))} مورد",
-            "برای مشاهده رسید و تصمیم، سفارش را باز کنید.",
+            f"💳 پرداخت‌های در انتظار — {to_persian_digits(total)} مورد",
+            f"صفحهٔ {to_persian_digits(page + 1)}؛ برای بررسی، سفارش را باز کنید.",
         ]
         for payment in payments:
             number = to_persian_digits(payment["payment_id"])
@@ -3481,6 +3514,13 @@ class GamasBot:
             buttons.append([Button.inline(
                 f"🔎 جزئیات سفارش {number}", f"adm:pd:{payment['payment_id']}".encode()
             )])
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"adm:pay:{page - 1}".encode()))
+        if has_more:
+            nav.append(Button.inline("بعدی ▶️", f"adm:pay:{page + 1}".encode()))
+        if nav:
+            buttons.append(nav)
         buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
@@ -3524,6 +3564,12 @@ class GamasBot:
         seconds = payment.get("purchased_seconds")
         price = payment.get("purchased_price")
         validity_days = payment.get("purchased_validity_days")
+        if payment["receipt_path"]:
+            receipt_state = "ثبت شده"
+        elif payment["status"] in {"awaiting_payment", "pending", "cancelled"}:
+            receipt_state = "ثبت نشده"
+        else:
+            receipt_state = "در دسترس نیست"
         lines = [
             f"🔎 سفارش {to_persian_digits(payment_id)}",
             f"شناسه سفارش: #{to_persian_digits(payment_id)}",
@@ -3534,10 +3580,12 @@ class GamasBot:
             f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}",
             f"وضعیت: {self._payment_status_label(payment['status'])}",
             f"ثبت: {to_persian_digits(str(payment['created_at'])[:16].replace('T', ' '))}",
-            f"رسید: {'ثبت شده' if payment['receipt_path'] else 'ثبت نشده'}",
+            f"رسید: {receipt_state}",
         ]
         if payment.get("reviewed_at"):
-            lines.append(f"بررسی: {payment['reviewed_at']} | مدیر: {payment['reviewed_by']}")
+            lines.append(
+                f"بررسی: {self._support_when(payment['reviewed_at'])} | مدیر: {payment['reviewed_by']}"
+            )
         if payment.get("review_reason"):
             lines.append(f"دلیل: {payment['review_reason']}")
         if payment["status"] == "approved":
@@ -4211,10 +4259,11 @@ class GamasBot:
         has_more = len(rows) > self.SUPPORT_PAGE_SIZE
         rows = rows[: self.SUPPORT_PAGE_SIZE]
         open_count = counts.get("open", 0) + counts.get("awaiting_admin", 0) + counts.get("awaiting_user", 0)
+        new_open_count = counts.get("open", 0) + counts.get("awaiting_admin", 0)
         text = (
             "🎧 مدیریت پشتیبانی\n\n"
             f"فعال: {to_persian_digits(open_count)} | "
-            f"جدید: {to_persian_digits(counts.get('open', 0))} | "
+            f"جدید: {to_persian_digits(new_open_count)} | "
             f"منتظر پاسخ شما: {to_persian_digits(counts.get('awaiting_admin', 0))} | "
             f"بسته: {to_persian_digits(counts.get('closed', 0))}\n"
             f"فهرست: {VIEW_LABELS.get(view, view)} — دسته: {CATEGORY_FILTER_LABELS.get(category, category)}"
