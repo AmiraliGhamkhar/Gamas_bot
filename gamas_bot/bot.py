@@ -415,8 +415,140 @@ def _ensure_disk_headroom(
         )
 
 
+#: One MTProto ``upload.getFile`` request. Telethon clamps ``request_size`` to
+#: this ceiling (``telethon/client/downloads.py``), so it is also the unit of
+#: the range plan below.
+TELEGRAM_DOWNLOAD_CHUNK_BYTES = 512 * 1024
+
+
+def _message_file_size(message) -> int | None:
+    """The declared size of a message's file, or ``None`` when unknown."""
+    size = getattr(getattr(message, "file", None), "size", None)
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        return None
+    return size
+
+
+def plan_download_ranges(total_bytes: int, connections: int) -> list[tuple[int, int]]:
+    """Split a file into ``(offset, chunk_count)`` ranges Telethon fetches directly.
+
+    Telethon takes its *direct* iterator (one request per chunk) only when the
+    offset is a multiple of 4 KiB and ``offset % limit == 0``, where ``limit`` is
+    the number of chunks — otherwise it falls back to the re-aligning generic
+    iterator, which costs extra requests per yield. Every range count here is a
+    power of two (so it divides the 512 KiB chunk size) and every offset is a
+    multiple of that count, which keeps all of them on the direct path.
+
+    The first range absorbs the remainder so a 10-chunk file split three ways is
+    ``(4, 3, 3)`` rather than ``(3, 3, 4)``: offset ``0`` is divisible by any
+    count, later offsets only by their own power-of-two count.
+    """
+    chunk = TELEGRAM_DOWNLOAD_CHUNK_BYTES
+    total_chunks = max(1, math.ceil(total_bytes / chunk))
+    wanted = max(1, min(int(connections), total_chunks))
+    per = 1
+    while per * 2 <= max(1, total_chunks // wanted):
+        per *= 2
+    if wanted == 1:
+        return [(0, total_chunks)]
+    head = total_chunks - per * (wanted - 1)
+    ranges = [(0, head)]
+    for index in range(1, wanted):
+        ranges.append(((head + (index - 1) * per) * chunk, per))
+    return ranges
+
+
+async def _download_media_ranges(
+    client,
+    message,
+    target: Path,
+    limit_bytes: int,
+    *,
+    connections: int,
+    stall_seconds: float,
+) -> None:
+    """Download one file as concurrent byte ranges, each writing its own region.
+
+    ``os.pwrite`` is positional, so the ranges never coordinate and the file is
+    complete once every task is done. The callers' guarantees are unchanged:
+    the byte ceiling is enforced on the declared size and on the running total,
+    a stalled transfer is aborted, and any failure leaves no partial file (the
+    caller deletes it).
+    """
+    size = _message_file_size(message)
+    if size is None:
+        raise RuntimeError("telegram did not report a file size")
+    if size > limit_bytes:
+        raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+    ranges = plan_download_ranges(size, connections)
+    last_progress = [time.monotonic()]
+    written = [0]
+    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+
+    async def fetch(offset: int, chunks: int) -> None:
+        position = offset
+        async for piece in client.iter_download(
+            message.media,
+            offset=offset,
+            limit=chunks,
+            request_size=TELEGRAM_DOWNLOAD_CHUNK_BYTES,
+            file_size=size,
+        ):
+            payload = bytes(piece)
+            await asyncio.to_thread(os.pwrite, descriptor, payload, position)
+            position += len(payload)
+            written[0] += len(payload)
+            last_progress[0] = time.monotonic()
+            if written[0] > limit_bytes:
+                raise UploadTooLargeError(
+                    f"file exceeds limit ({limit_bytes} bytes)"
+                )
+
+    tasks = [
+        asyncio.create_task(fetch(offset, chunks)) for offset, chunks in ranges
+    ]
+    try:
+        if stall_seconds > 0:
+            tick = max(0.05, min(stall_seconds / 4, 15.0))
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, timeout=tick, return_when=asyncio.FIRST_COMPLETED
+                )
+                for finished in done:
+                    error = finished.exception()
+                    if error is not None:
+                        raise error
+                if pending and time.monotonic() - last_progress[0] > stall_seconds:
+                    raise DownloadStalledError(
+                        "دانلود فایل از تلگرام متوقف شد؛ لطفاً دوباره بفرستید."
+                    )
+        await asyncio.gather(*tasks)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        os.close(descriptor)
+    if target.stat().st_size != size:
+        # A short write would otherwise be "some file that plays".
+        raise RuntimeError(
+            f"ranged download produced {target.stat().st_size} of {size} bytes"
+        )
+    logger.info(
+        "ranged download done bytes=%d connections=%d ranges=%d",
+        size, connections, len(ranges),
+    )
+
+
 async def _download_media_limited(
-    message, target: Path, limit_bytes: int, *, stall_seconds: float = 0.0
+    message,
+    target: Path,
+    limit_bytes: int,
+    *,
+    stall_seconds: float = 0.0,
+    client=None,
+    connections: int = 1,
 ) -> Path:
     """Download Telegram media with live abort if it exceeds *limit_bytes*.
 
@@ -432,6 +564,36 @@ async def _download_media_limited(
     """
     if limit_bytes <= 0:
         raise ValueError("download limit must be positive")
+    # ``os.pwrite`` is POSIX-only; on Windows the proven single-stream path runs
+    # (the deployment target is cPanel/Linux, this keeps local runs intact).
+    ranged = (
+        client is not None
+        and connections > 1
+        and hasattr(os, "pwrite")
+        and _message_file_size(message)
+    )
+    if ranged:
+        try:
+            await _download_media_ranges(
+                client,
+                message,
+                target,
+                limit_bytes,
+                connections=connections,
+                stall_seconds=stall_seconds,
+            )
+            return target
+        except (UploadTooLargeError, DownloadStalledError):
+            target.unlink(missing_ok=True)
+            raise
+        except Exception as exc:  # noqa: BLE001 - any surprise means one stream
+            # A ranged transfer is an optimisation, never a prerequisite: prove
+            # it works on this host, otherwise the proven path runs.
+            logger.warning(
+                "ranged download failed (%s: %s); retrying single-stream",
+                type(exc).__name__, exc,
+            )
+            target.unlink(missing_ok=True)
     last_progress = [time.monotonic()]
 
     def _guard(received: int, total: int) -> None:
@@ -1707,17 +1869,24 @@ class GamasBot:
             reserve_bytes=self.settings.temp_min_free_bytes,
         )
         await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
+        download_started = time.monotonic()
         try:
             await _download_media_limited(
                 job.message,
                 source_path,
                 self.settings.max_file_size,
                 stall_seconds=self.settings.download_stall_seconds,
+                client=self.client,
+                connections=self.settings.telegram_download_connections,
             )
         except UploadTooLargeError as exc:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc
         if source_path.stat().st_size > self.settings.max_file_size:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
+        # The download is the only transfer rate this job measures for free, so
+        # it seeds the format decision below (``AUDIO_FORMAT_POLICY=auto``).
+        download_seconds = max(0.001, time.monotonic() - download_started)
+        egress_bytes_per_second = source_path.stat().st_size / download_seconds
 
         await progress.update(35, "🔍 فایل رسید؛ دارم صدا را بررسی می‌کنم")
         source_info = await self._run_media_operation(
@@ -1730,6 +1899,7 @@ class GamasBot:
             job.filename,
             job.kind,
             info=source_info,
+            egress_bytes_per_second=egress_bytes_per_second,
         )
         if audio_path.stat().st_size > self.settings.max_file_size:
             raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
@@ -1788,7 +1958,14 @@ class GamasBot:
         )
 
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
-        notes = await self._generate_notes(document.llm_document(), job, progress)
+        notes = await self._generate_notes(
+            document.llm_document(),
+            job,
+            progress,
+            workdir=workdir,
+            reference=reference,
+            meta=meta,
+        )
 
         await self.db.save_transcription(
             job.submission_id, engine=raw.engine, text=document.plain(),
@@ -1804,6 +1981,7 @@ class GamasBot:
         kind: str,
         *,
         info: MediaInfo | None = None,
+        egress_bytes_per_second: float | None = None,
     ) -> Path:
         if info is None:
             info = await probe_media(source_path, self.settings)
@@ -1834,6 +2012,7 @@ class GamasBot:
                 self.settings,
                 total_duration=info.duration,
                 max_output_bytes=budget,
+                egress_bytes_per_second=egress_bytes_per_second,
             )
         return source_path
 
@@ -2168,14 +2347,71 @@ class GamasBot:
         )
 
     # ----------------------------------------------------------- notes + docx
-    async def _generate_notes(self, document_text: str, job: Job, progress) -> StructuredNotes | None:
+    def _progressive_booklet_sender(
+        self,
+        job: Job,
+        workdir: Path,
+        reference: str,
+        meta: DocumentMeta,
+    ):
+        """A callback that delivers the deterministic merge as a draft booklet.
+
+        The editorial compile is a second full round trip; delivering the
+        audited merge first takes it off the user's critical path. A failure
+        here is logged and ignored — the compiled booklet is still delivered by
+        the normal path, so this can never lose a job.
+        """
+
+        async def send(merged: StructuredNotes) -> None:
+            try:
+                docx_bytes = await asyncio.to_thread(
+                    build_notes_docx,
+                    merged,
+                    fonts=resolve_fonts(),
+                    design=resolve_design(),
+                    meta=meta,
+                )
+                path = workdir / f"{reference}-draft.docx"
+                await asyncio.to_thread(path.write_bytes, docx_bytes)
+                await self._send_file(
+                    job, path, caption=f"📄 نسخهٔ نخست جزوه — {reference}"
+                )
+                logger.info("progressive booklet delivered reference=%s", reference)
+            except Exception:  # noqa: BLE001 - the final booklet still follows
+                logger.warning(
+                    "progressive booklet delivery failed reference=%s",
+                    reference,
+                    exc_info=True,
+                )
+
+        return send
+
+    async def _generate_notes(
+        self,
+        document_text: str,
+        job: Job,
+        progress,
+        *,
+        workdir: Path | None = None,
+        reference: str = "",
+        meta: DocumentMeta | None = None,
+    ) -> StructuredNotes | None:
         if not self.settings.note_configured:
             logger.info("note provider not configured; delivering raw only")
             return None
+        on_merged = None
+        if (
+            self.settings.note_progressive_booklet
+            and workdir is not None
+            and reference
+            and meta is not None
+        ):
+            on_merged = self._progressive_booklet_sender(job, workdir, reference, meta)
         try:
             return await structure_transcript(
                 document_text, self.settings, self._http_session(),
                 mode=self.settings.note_mode,
+                on_merged=on_merged,
             )
         except Exception as exc:
             logger.warning("note generation failed; raw already delivered: %s", exc)

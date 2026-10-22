@@ -211,7 +211,35 @@ PLAN_ENV_FIELDS = (
 
 #: Default failover order for speech-to-text. Only configured providers are
 #: ever attempted, so this default is safe with zero STT keys set.
-DEFAULT_STT_PROVIDERS = "speechmatics,deepgram,openai_compatible"
+#:
+#: The order is a *latency* policy, not a preference: the first configured
+#: provider is the one that runs, so listing a slow engine first makes the slow
+#: engine the default for every job. Deepgram's Nova-3 is the fastest engine
+#: this bot can reach (an independent benchmark measured ~351x real time against
+#: ~24x for Speechmatics ``enhanced``), and ``check`` rejects any
+#: ``DEEPGRAM_MODEL`` without a Persian pack, so leading with it is safe for the
+#: shipped Persian default. Speechmatics stays second, which means a deployment
+#: with only ``SPEECHMATICS_API_KEY`` set behaves exactly as before, and a
+#: Deepgram outage degrades to the old path instead of failing.
+DEFAULT_STT_PROVIDERS = "deepgram,speechmatics,openai_compatible"
+
+#: Speechmatics batch models that are slower than a configured Nova-3. Used only
+#: to warn about an inverted failover order; no behaviour depends on the value.
+SLOW_SPEECHMATICS_MODELS = frozenset({"enhanced", "standard"})
+
+#: Shipped note-layer performance defaults. Each is a documented trade-off, so
+#: they live here rather than as literals in ``from_env``:
+#:
+#: * ``NOTE_CONCURRENCY`` — the map phase never starts more requests than there
+#:   are chunks (capped at 8), so 6 only parallelises long lectures.
+#: * ``NOTE_TTFB_TIMEOUT_SECONDS`` — a route that has not produced a first byte
+#:   within 25 s is treated as hung and the chain fails over, instead of waiting
+#:   out the whole request timeout. Below the hedge delay on purpose.
+#: * ``NOTE_HEDGE_AFTER_SECONDS`` — if the first provider has not finished in
+#:   60 s, the second starts in parallel; at most one extra in-flight POST.
+DEFAULT_NOTE_CONCURRENCY = 6
+DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS = 25.0
+DEFAULT_NOTE_HEDGE_AFTER_SECONDS = 60.0
 
 #: Per-provider direct-upload ceilings (bytes). A file larger than a
 #: provider's ceiling is routed to the next configured provider instead of
@@ -320,6 +348,28 @@ def resolve_note_quality_gate(value: str | None) -> str:
     return resolved if resolved in NOTE_QUALITY_GATES else "repair"
 
 
+#: Container policies for the prepared STT audio. ``auto`` weighs encoder CPU
+#: against transfer time; the others force one container.
+AUDIO_FORMAT_POLICIES = ("auto", "wav", "opus")
+
+
+def resolve_audio_format_policy(value: str | None) -> str:
+    """Resolve ``AUDIO_FORMAT_POLICY``; an unknown value means ``auto``."""
+    resolved = (value or "").strip().lower()
+    return resolved if resolved in AUDIO_FORMAT_POLICIES else "auto"
+
+
+def normalize_note_compile_provider(value: str | None) -> str:
+    """Resolve ``NOTE_COMPILE_PROVIDER`` to a known note-provider slug.
+
+    An unknown slug resolves to empty (the configured route order) instead of
+    being forwarded: pinning the compile to a provider that does not exist
+    would otherwise silently disable the compile pass.
+    """
+    resolved = (value or "").strip().lower()
+    return resolved if resolved in NOTE_PROVIDER_LABELS else ""
+
+
 def resolve_note_mode(mode: str | None) -> str:
     """Resolve a note compression mode, defaulting to ``full``."""
     value = (mode or "").strip().lower()
@@ -400,6 +450,15 @@ class Settings:
     presentation_include_video_audio: bool
     presentation_include_unreferenced_media: bool
 
+    # --- Media preparation ---------------------------------------------------
+    #: Which container the prepared STT audio may use: ``auto`` lets the media
+    #: layer pick the cheapest of PCM WAV and Opus from the measured transfer
+    #: rate, ``wav``/``opus`` force one.
+    audio_format_policy: str
+    #: Concurrent byte-range downloads of one Telegram file. ``1`` is the
+    #: single-stream behaviour Telethon's ``download_media`` uses.
+    telegram_download_connections: int
+
     # --- Speech-to-text -----------------------------------------------------
     stt_providers: tuple[str, ...]
     stt_language: str
@@ -420,6 +479,11 @@ class Settings:
     #: Hard ceiling on an STT response body read into memory. A corrupted or
     #: hostile answer cannot exhaust the worker's memory.
     max_stt_response_bytes: int
+    #: Long-poll window, in seconds, requested from Speechmatics on the submit
+    #: and on each status read. The API holds the request open until the job
+    #: changes state, so a finished job costs one request instead of a poll
+    #: every ``stt_poll_interval``; ``0`` disables the parameter.
+    stt_status_long_poll: float
 
     # --- Note generation ----------------------------------------------------
     note_providers: tuple[str, ...]
@@ -460,6 +524,18 @@ class Settings:
     #: ``repair`` performs the one bounded repair request; ``warn`` only audits
     #: and logs, which is the safe first-week setting for a new deployment.
     note_quality_gate: str
+    #: Ask OpenRouter to route to the fastest upstream of the model
+    #: (``provider.sort=throughput``) instead of its price-weighted default.
+    note_openrouter_throughput: bool
+    #: Send a response schema alongside the JSON mime type so the provider
+    #: cannot answer with prose (which costs a whole second request).
+    note_structured_output: bool
+    #: Deliver the deterministic merge as a booklet immediately and the
+    #: editorial compile as a second, revised file.
+    note_progressive_booklet: bool
+    #: Slug of the note provider that should serve the editorial compile
+    #: (``""`` keeps the configured route order).
+    note_compile_provider: str
 
     # --- Raw text -----------------------------------------------------------
     raw_text_profile: str
@@ -510,14 +586,14 @@ class Settings:
     # --- Derived --------------------------------------------------------------
     plan_values: dict[str, int] = field(default_factory=dict, compare=False)
 
-    # --- LLM transport / performance (Phase 2/3; defaults = old behaviour) ---
+    # --- LLM transport / performance (see the DEFAULT_NOTE_* constants) ------
     llm_connector_limit: int = 32
     llm_connector_limit_per_host: int = 8
     llm_connector_ttl_dns_cache: int = 300
     llm_connector_keepalive: int = 300
     llm_prewarm: bool = True
-    note_ttfb_timeout: float = 0.0
-    note_hedge_after: float = 0.0
+    note_ttfb_timeout: float = DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS
+    note_hedge_after: float = DEFAULT_NOTE_HEDGE_AFTER_SECONDS
     office_ai_concurrency: int = 3
 
     # ------------------------------------------------------------------ views
@@ -936,11 +1012,18 @@ def from_env(env_file: str | None = None) -> Settings:
         convert_timeout=_env_float("CONVERT_TIMEOUT", 600.0, minimum=1.0),
         stt_job_timeout=_env_float("STT_JOB_TIMEOUT", 21600.0, minimum=60.0),
         stt_poll_interval=_env_float("STT_POLL_INTERVAL", 10.0, minimum=1.0),
+        stt_status_long_poll=_env_float(
+            "STT_STATUS_LONG_POLL", 25.0, minimum=0.0, maximum=120.0
+        ),
         temp_min_free_bytes=_env_int(
             "TEMP_MIN_FREE_BYTES", 2 * 1024**3, minimum=0
         ),
         download_stall_seconds=_env_float(
             "DOWNLOAD_STALL_SECONDS", 300.0, minimum=30.0
+        ),
+        audio_format_policy=resolve_audio_format_policy(_env("AUDIO_FORMAT_POLICY")),
+        telegram_download_connections=_env_int(
+            "TELEGRAM_DOWNLOAD_CONNECTIONS", 1, minimum=1, maximum=8
         ),
         presentation_max_clips=_env_int("PRESENTATION_MAX_CLIPS", 300, minimum=1),
         presentation_max_total_duration=_env_float(
@@ -1038,7 +1121,9 @@ def from_env(env_file: str | None = None) -> Settings:
         note_chunk_chars=_env_int(
             "NOTE_CHUNK_CHARS", DEFAULT_NOTE_CHUNK_CHARS, minimum=2000, maximum=200_000
         ),
-        note_concurrency=_env_int("NOTE_CONCURRENCY", 3, minimum=1, maximum=8),
+        note_concurrency=_env_int(
+            "NOTE_CONCURRENCY", DEFAULT_NOTE_CONCURRENCY, minimum=1, maximum=8
+        ),
         note_compile=_env_bool("NOTE_COMPILE", True),
         note_compile_max_chars=_env_int(
             "NOTE_COMPILE_MAX_CHARS", 0, minimum=0, maximum=2_000_000
@@ -1046,6 +1131,12 @@ def from_env(env_file: str | None = None) -> Settings:
         note_reasoning_effort=resolve_note_reasoning_effort(_env("NOTE_REASONING_EFFORT")),
         note_strict_grounding=_env_bool("NOTE_STRICT_GROUNDING", True),
         note_quality_gate=resolve_note_quality_gate(_env("NOTE_QUALITY_GATE")),
+        note_openrouter_throughput=_env_bool("NOTE_OPENROUTER_THROUGHPUT", True),
+        note_structured_output=_env_bool("NOTE_STRUCTURED_OUTPUT", True),
+        note_progressive_booklet=_env_bool("NOTE_PROGRESSIVE_BOOKLET", True),
+        note_compile_provider=normalize_note_compile_provider(
+            _env("NOTE_COMPILE_PROVIDER")
+        ),
         raw_text_profile=resolve_raw_text_profile(_env("RAW_TEXT_PROFILE")),
         raw_fallback_file_chars=_env_int(
             "RAW_FALLBACK_FILE_CHARS", 100_000, minimum=1_000, maximum=400_000
@@ -1094,10 +1185,16 @@ def from_env(env_file: str | None = None) -> Settings:
         llm_connector_keepalive=_env_int("LLM_CONNECTOR_KEEPALIVE", 300, minimum=0),
         llm_prewarm=_env_bool("LLM_PREWARM", True),
         note_ttfb_timeout=_env_float(
-            "NOTE_TTFB_TIMEOUT_SECONDS", 0.0, minimum=0.0, maximum=3600.0
+            "NOTE_TTFB_TIMEOUT_SECONDS",
+            DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS,
+            minimum=0.0,
+            maximum=3600.0,
         ),
         note_hedge_after=_env_float(
-            "NOTE_HEDGE_AFTER_SECONDS", 0.0, minimum=0.0, maximum=3600.0
+            "NOTE_HEDGE_AFTER_SECONDS",
+            DEFAULT_NOTE_HEDGE_AFTER_SECONDS,
+            minimum=0.0,
+            maximum=3600.0,
         ),
         office_ai_concurrency=_env_int(
             "OFFICE_AI_CONCURRENCY", 3, minimum=1, maximum=16
@@ -1115,11 +1212,31 @@ ADVISORY_PROBLEMS = (
     "does not support Persian",
     "no room for the transcript",
     "the note request will time out on a slow gateway",
+    "starts with speechmatics",
 )
 
 
 def is_advisory(problem: str) -> bool:
     return any(marker in problem for marker in ADVISORY_PROBLEMS)
+
+
+def first_configured_stt_provider(settings: Settings) -> str | None:
+    """The provider that will actually serve the next job, or ``None``.
+
+    Mirrors ``stt.transcribe``: walk ``STT_PROVIDERS`` in order and take the
+    first slug that has credentials, because an unconfigured slug is skipped
+    rather than attempted. Kept here so ``check`` can reason about the order
+    without importing the transcription layer.
+    """
+    configured = {
+        "speechmatics": settings.speechmatics_configured,
+        "deepgram": settings.deepgram_configured,
+        "openai_compatible": settings.stt_openai_configured,
+    }
+    for slug in settings.stt_providers:
+        if configured.get(slug, False):
+            return slug
+    return None
 
 
 def check(settings: Settings) -> list[str]:
@@ -1148,6 +1265,24 @@ def check(settings: Settings) -> list[str]:
             f"DEEPGRAM_MODEL={settings.deepgram_model} does not support Persian "
             f"(STT_LANGUAGE={settings.stt_language}); set DEEPGRAM_MODEL to one of: "
             f"{', '.join(sorted(DEEPGRAM_PERSIAN_MODELS))}."
+        )
+    # Failover *order* is the latency policy, and the first configured provider
+    # is the one that runs. A slower engine in that slot silently becomes the
+    # default for every job, which is invisible in a log that only names the
+    # provider it used. Advisory, never fatal: it is a measured preference, not
+    # a broken configuration.
+    if (
+        first_configured_stt_provider(settings) == "speechmatics"
+        and settings.speechmatics_model.strip().lower() in SLOW_SPEECHMATICS_MODELS
+        and settings.deepgram_configured
+    ):
+        problems.append(
+            "STT_PROVIDERS starts with speechmatics and SPEECHMATICS_MODEL="
+            f"{settings.speechmatics_model}, so every job waits for the slower engine "
+            "even though Deepgram is configured; put deepgram first "
+            "(STT_PROVIDERS=deepgram,speechmatics) unless Persian accuracy was "
+            "measured to be better on Speechmatics (or use SPEECHMATICS_MODEL=melia-1 "
+            "with a regional SPEECHMATICS_BASE_URL)."
         )
     if settings.note_provider not in NOTE_PROVIDER_SLUGS and _legacy_note_configured(settings):
         problems.append(

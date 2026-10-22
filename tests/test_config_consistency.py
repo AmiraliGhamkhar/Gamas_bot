@@ -56,6 +56,9 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("MAX_STT_RESPONSE_BYTES", "max_stt_response_bytes", "int"),
     ("TEMP_MIN_FREE_BYTES", "temp_min_free_bytes", "int"),
     ("DOWNLOAD_STALL_SECONDS", "download_stall_seconds", "float"),
+    ("TELEGRAM_DOWNLOAD_CONNECTIONS", "telegram_download_connections", "int"),
+    ("AUDIO_FORMAT_POLICY", "audio_format_policy", "str"),
+    ("STT_STATUS_LONG_POLL", "stt_status_long_poll", "float"),
     ("STT_PROVIDERS", "stt_providers", "csv"),
     ("STT_LANGUAGE", "stt_language", "str"),
     ("SPEECHMATICS_MODEL", "speechmatics_model", "str"),
@@ -84,6 +87,10 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_REQUEST_TIMEOUT_SECONDS", "note_request_timeout", "float"),
     ("NOTE_CHUNK_CHARS", "note_chunk_chars", "int"),
     ("NOTE_CONCURRENCY", "note_concurrency", "int"),
+    ("NOTE_OPENROUTER_THROUGHPUT", "note_openrouter_throughput", "bool"),
+    ("NOTE_STRUCTURED_OUTPUT", "note_structured_output", "bool"),
+    ("NOTE_PROGRESSIVE_BOOKLET", "note_progressive_booklet", "bool"),
+    ("NOTE_COMPILE_PROVIDER", "note_compile_provider", "str"),
     ("NOTE_COMPILE_MAX_CHARS", "note_compile_max_chars", "int"),
     ("NOTE_REASONING_EFFORT", "note_reasoning_effort", "str"),
     ("RAW_TEXT_PROFILE", "raw_text_profile", "str"),
@@ -205,6 +212,42 @@ class DocumentedDefaultsTests(unittest.TestCase):
             else:
                 ok = str(actual) == raw
             if not ok:
+                mismatches.append(f"{name}: .env.example={raw!r} code={actual!r}")
+        self.assertEqual(mismatches, [], "; ".join(mismatches))
+
+    #: Variables whose `.env.example` line must show the *shipped* default, not
+    #: merely some valid value. An operator who copies the file (or reads it as
+    #: documentation) must get the behaviour the code actually has, so a stale
+    #: number here is a documentation bug with a performance cost.
+    SHIPPED_DEFAULT_EXAMPLES = (
+        ("STT_PROVIDERS", "stt_providers", "csv"),
+        ("NOTE_CONCURRENCY", "note_concurrency", "int"),
+        ("NOTE_TTFB_TIMEOUT_SECONDS", "note_ttfb_timeout", "float"),
+        ("NOTE_HEDGE_AFTER_SECONDS", "note_hedge_after", "float"),
+        ("NOTE_STRUCTURED_OUTPUT", "note_structured_output", "bool"),
+        ("NOTE_PROGRESSIVE_BOOKLET", "note_progressive_booklet", "bool"),
+        ("NOTE_OPENROUTER_THROUGHPUT", "note_openrouter_throughput", "bool"),
+    )
+
+    def test_example_shows_the_shipped_default(self):
+        documented = example_values()
+        shipped = default_settings()
+        mismatches: list[str] = []
+        for name, attribute, kind in self.SHIPPED_DEFAULT_EXAMPLES:
+            raw = documented.get(name)
+            if raw is None:
+                mismatches.append(f"{name}: missing from .env.example")
+                continue
+            actual = getattr(shipped, attribute)
+            if kind == "csv":
+                shown = tuple(part.strip() for part in raw.split(",") if part.strip())
+            elif kind == "int":
+                shown = int(raw)
+            elif kind == "float":
+                shown = float(raw)
+            else:
+                shown = raw.strip().lower() in {"1", "true", "yes", "on"}
+            if shown != actual:
                 mismatches.append(f"{name}: .env.example={raw!r} code={actual!r}")
         self.assertEqual(mismatches, [], "; ".join(mismatches))
 

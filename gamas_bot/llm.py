@@ -538,13 +538,55 @@ def _openrouter_model_path(model: str) -> str:
     return "/".join(quote(part, safe=":-._~") for part in parts)
 
 
+def _gemini_schema(node: object) -> object:
+    """Convert a plain JSON schema to Gemini's ``responseSchema`` dialect.
+
+    Gemini spells ``type`` values in upper case and does not accept the parts of
+    JSON Schema that a strict-mode OpenAI request needs, so the same schema
+    cannot be sent verbatim to both.
+    """
+    if isinstance(node, list):
+        return [_gemini_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    converted: dict = {}
+    for key, value in node.items():
+        if key == "type" and isinstance(value, str):
+            converted[key] = value.upper()
+        elif key == "required":
+            continue  # Gemini infers required properties from the schema.
+        elif key in {"properties"} and isinstance(value, dict):
+            converted[key] = {name: _gemini_schema(item) for name, item in value.items()}
+        else:
+            converted[key] = _gemini_schema(value)
+    return converted
+
+
+def _openai_json_schema(schema: dict) -> dict:
+    """The documented OpenAI-compatible ``json_schema`` wrapper (non-strict).
+
+    ``strict: true`` demands that every property is listed in ``required`` and
+    that ``additionalProperties`` is false, which a note document (whose
+    sections legitimately omit empty fields) cannot truthfully declare. The
+    non-strict form still constrains the shape and is what gateways accept.
+    """
+    return {"name": "gamas_notes", "schema": schema}
+
+
 def _build_request_for(
-    route: NoteRoute, settings: Settings, system: str, user: str
+    route: NoteRoute,
+    settings: Settings,
+    system: str,
+    user: str,
+    *,
+    schema: dict | None = None,
 ) -> tuple[str, dict[str, str], dict]:
     """Build one provider's POST request from its own route.
 
     Authentication is never caller-overridable: each style sets its documented
-    header itself.
+    header itself. ``schema`` is attached only when a caller asks for
+    structured output; a provider that rejects the parameter drops it through
+    the generic rejected-parameter retry.
     """
     style = route.style
     key = _clean_api_key(route.api_key)
@@ -562,6 +604,8 @@ def _build_request_for(
             "maxOutputTokens": max_tokens,
             "responseMimeType": "application/json",
         }
+        if schema is not None:
+            generation_config["responseSchema"] = _gemini_schema(schema)
         if settings.gemini_thinking_budget >= 0:
             # ``0`` (the default) turns thinking off entirely: a note request is
             # extraction/organisation, so hidden reasoning tokens buy nothing
@@ -603,10 +647,20 @@ def _build_request_for(
         "temperature": NOTE_TEMPERATURE,
         "max_tokens": max_tokens,
     }
-    if route.json_object_mode:
+    if schema is not None:
+        payload["response_format"] = {
+            "type": "json_schema",
+            "json_schema": _openai_json_schema(schema),
+        }
+    elif route.json_object_mode:
         # Opt-in, and only for providers that document ``response_format``
         # (NaraRouter does not, so it is never asked for it).
         payload["response_format"] = {"type": "json_object"}
+    if getattr(settings, "note_openrouter_throughput", False) and route.slug == "openrouter":
+        # OpenRouter load-balances by *price* by default, which can pick a much
+        # slower upstream of the same model. Its documented throughput sort is
+        # the only per-request control over that choice.
+        payload["provider"] = {"sort": "throughput"}
     if settings.note_reasoning_effort and route.slug in (
         "nara", "openrouter", "groq", "cerebras"
     ):
@@ -1036,6 +1090,19 @@ def _adjust_rejected_request_param(payload: dict, error_text: str) -> str | None
     generation_config = payload.get("generationConfig")
     if isinstance(generation_config, dict):
         if (
+            "responseSchema" in generation_config
+            and any(
+                marker in lower
+                for marker in ("responseschema", "response_schema", "schema")
+            )
+            and any(marker in lower for marker in rejected_markers)
+        ):
+            # A model (or a gateway in front of it) that does not implement
+            # structured output drops the schema; the JSON mime type and the
+            # prompt's own rules still apply, so the answer stays parseable.
+            generation_config.pop("responseSchema", None)
+            return "generationConfig.responseSchema"
+        if (
             "responseMimeType" in generation_config
             and any(
                 marker in lower
@@ -1362,6 +1429,7 @@ async def _complete_on_route(
     system: str,
     user: str,
     retry_on_timeout: bool = True,
+    schema: dict | None = None,
 ) -> str:
     """One completion from one provider, with its own bounded retry budget.
 
@@ -1373,7 +1441,7 @@ async def _complete_on_route(
     identical request is simply re-waiting — while the next provider may
     answer in seconds.
     """
-    url, headers, payload = _build_request_for(route, settings, system, user)
+    url, headers, payload = _build_request_for(route, settings, system, user, schema=schema)
     timeout_seconds = float(settings.note_request_timeout or 0) or (
         LLM_REQUEST_TIMEOUT_SECONDS
     )
@@ -1712,6 +1780,7 @@ async def _complete_json_on_route(
     system: str,
     user: str,
     retry_on_timeout: bool,
+    schema: dict | None = None,
 ) -> dict:
     """One provider's two-attempt JSON turn (used by the hedged path)."""
     last_exc: LLMError | None = None
@@ -1719,7 +1788,7 @@ async def _complete_json_on_route(
         try:
             raw = await _complete_on_route(
                 route, session, settings, system=system, user=prompt,
-                retry_on_timeout=retry_on_timeout,
+                retry_on_timeout=retry_on_timeout, schema=schema,
             )
             return _parse_json_object(raw)
         except LLMRequestError:
@@ -1732,12 +1801,25 @@ async def _complete_json_on_route(
     raise last_exc
 
 
+def _ordered_routes(routes: tuple[NoteRoute, ...], prefer: str) -> tuple[NoteRoute, ...]:
+    """Move ``prefer`` to the front, keeping every other route as a fallback."""
+    slug = (prefer or "").strip().lower()
+    if not slug:
+        return routes
+    preferred = tuple(route for route in routes if route.slug == slug)
+    if not preferred:
+        return routes
+    return preferred + tuple(route for route in routes if route.slug != slug)
+
+
 async def complete_json(
     session: aiohttp.ClientSession,
     settings: Settings,
     *,
     system: str,
     user: str,
+    schema: dict | None = None,
+    prefer_provider: str = "",
 ) -> dict:
     """A completion parsed as strict JSON, with bounded per-provider recovery.
 
@@ -1749,7 +1831,7 @@ async def complete_json(
     already holds. A rejected request (4xx) is permanent for that provider and is
     never re-sent to it with the same content.
     """
-    routes = note_routes(settings)
+    routes = _ordered_routes(note_routes(settings), prefer_provider)
     if not routes:
         raise LLMAuthError(
             "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
@@ -1763,7 +1845,7 @@ async def complete_json(
         def _make_json(index: int):
             return lambda: _complete_json_on_route(
                 routes[index], session, settings, system=system, user=user,
-                retry_on_timeout=index == len(routes) - 1,
+                retry_on_timeout=index == len(routes) - 1, schema=schema,
             )
         try:
             return await _hedge_two(_make_json(0), _make_json(1), hedge_after)
@@ -1783,7 +1865,7 @@ async def complete_json(
             try:
                 raw = await _complete_on_route(
                     route, session, settings, system=system, user=prompt,
-                    retry_on_timeout=index == len(routes) - 1,
+                    retry_on_timeout=index == len(routes) - 1, schema=schema,
                 )
                 return _parse_json_object(raw)
             except LLMRequestError as exc:

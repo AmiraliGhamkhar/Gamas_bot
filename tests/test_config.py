@@ -31,6 +31,7 @@ from gamas_bot.config import (
     Settings,
     check,
     classify_note_provider,
+    first_configured_stt_provider,
     format_payment_card,
     from_env,
     is_advisory,
@@ -667,7 +668,130 @@ class CheckTests(unittest.TestCase):
             DEEPGRAM_API_KEY="dg",
             DEEPGRAM_MODEL="nova-2",
         )
-        self.assertFalse(any("Persian" in p for p in check(settings)))
+        # The slow-order advisory *is* expected here (speechmatics is first);
+        # what must not be reported is a problem with the inactive model.
+        self.assertFalse(any("does not support Persian" in p for p in check(settings)))
+
+    def test_slow_engine_first_is_reported_as_advisory(self):
+        """Order is latency policy, so a slow first engine must not be silent."""
+        settings = self.make(
+            STT_PROVIDERS="speechmatics,deepgram",
+            SPEECHMATICS_API_KEY="sm",
+            DEEPGRAM_API_KEY="dg",
+            SPEECHMATICS_MODEL="enhanced",
+        )
+        slow = [p for p in check(settings) if "starts with speechmatics" in p]
+        self.assertEqual(len(slow), 1, check(settings))
+        # The bot still runs: this is a measured preference, not a defect.
+        self.assertTrue(is_advisory(slow[0]))
+        self.assertIn("deepgram", slow[0])
+
+    def test_standard_model_first_is_reported_too(self):
+        """``standard`` is faster than ``enhanced`` but still slower than Nova-3."""
+        settings = self.make(
+            STT_PROVIDERS="speechmatics,deepgram",
+            DEEPGRAM_API_KEY="dg",
+            SPEECHMATICS_MODEL="standard",
+        )
+        self.assertTrue(any("starts with speechmatics" in p for p in check(settings)))
+
+    def test_fast_engine_first_is_not_reported(self):
+        """The shipped order leads with Deepgram, so nothing is flagged."""
+        settings = self.make(SPEECHMATICS_API_KEY="sm", DEEPGRAM_API_KEY="dg")
+        self.assertFalse(any("starts with speechmatics" in p for p in check(settings)))
+
+    def test_speechmatics_first_alone_is_not_reported(self):
+        """With no Deepgram key, Speechmatics *is* the deployment's engine."""
+        settings = self.make(
+            STT_PROVIDERS="speechmatics,deepgram",
+            SPEECHMATICS_API_KEY="sm",
+            DEEPGRAM_API_KEY="",
+        )
+        self.assertFalse(any("starts with speechmatics" in p for p in check(settings)))
+
+    def test_newer_speechmatics_model_first_is_not_reported(self):
+        """``melia-1`` is the documented fast batch model; no warning applies."""
+        settings = self.make(
+            STT_PROVIDERS="speechmatics,deepgram",
+            DEEPGRAM_API_KEY="dg",
+            SPEECHMATICS_MODEL="melia-1",
+        )
+        self.assertFalse(any("starts with speechmatics" in p for p in check(settings)))
+
+    def test_keyless_first_slug_does_not_hide_the_slow_engine(self):
+        """The warning follows the provider that *runs*, not the first entry.
+
+        ``deepgram`` listed first without a key is skipped by the chain, so
+        Speechmatics really does serve the job — but with no Deepgram key there
+        is nothing faster configured to compare against, so no warning is due.
+        """
+        settings = self.make(
+            STT_PROVIDERS="deepgram,speechmatics",
+            SPEECHMATICS_API_KEY="sm",
+            DEEPGRAM_API_KEY="",
+            SPEECHMATICS_MODEL="enhanced",
+        )
+        self.assertEqual(first_configured_stt_provider(settings), "speechmatics")
+        self.assertFalse(any("starts with speechmatics" in p for p in check(settings)))
+
+
+class ShippedDefaultTests(unittest.TestCase):
+    """The defaults an operator inherits when nothing is set."""
+
+    def setUp(self):
+        with mock.patch.dict(os.environ, env(), clear=False):
+            self.settings = from_env(env_file="/nonexistent")
+
+    def test_the_fast_engine_leads_the_failover_order(self):
+        """Order *is* the latency policy: the first configured provider runs.
+
+        Speechmatics stays in the list, so a deployment whose only key is
+        ``SPEECHMATICS_API_KEY`` keeps exactly the previous behaviour.
+        """
+        self.assertEqual(
+            self.settings.stt_providers,
+            ("deepgram", "speechmatics", "openai_compatible"),
+        )
+        self.assertEqual(first_configured_stt_provider(self.settings), "speechmatics")
+
+    def test_note_performance_defaults(self):
+        self.assertEqual(self.settings.note_ttfb_timeout, 25.0)
+        self.assertEqual(self.settings.note_hedge_after, 60.0)
+        self.assertEqual(self.settings.note_concurrency, 6)
+        self.assertTrue(self.settings.note_structured_output)
+        self.assertTrue(self.settings.note_progressive_booklet)
+        self.assertTrue(self.settings.note_openrouter_throughput)
+
+    def test_zero_still_turns_the_guards_off(self):
+        """An explicit ``0`` is how an operator opts back into plain waiting."""
+        with mock.patch.dict(
+            os.environ,
+            env(
+                NOTE_TTFB_TIMEOUT_SECONDS="0",
+                NOTE_HEDGE_AFTER_SECONDS="0",
+                NOTE_STRUCTURED_OUTPUT="false",
+                NOTE_PROGRESSIVE_BOOKLET="0",
+                NOTE_OPENROUTER_THROUGHPUT="0",
+                NOTE_CONCURRENCY="2",
+            ),
+            clear=False,
+        ):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.note_ttfb_timeout, 0.0)
+        self.assertEqual(settings.note_hedge_after, 0.0)
+        self.assertEqual(settings.note_concurrency, 2)
+        self.assertFalse(settings.note_structured_output)
+        self.assertFalse(settings.note_progressive_booklet)
+        self.assertFalse(settings.note_openrouter_throughput)
+
+    def test_first_configured_provider_skips_keyless_slugs(self):
+        """A listed-but-unconfigured provider never serves a job."""
+        with mock.patch.dict(
+            os.environ, env(STT_PROVIDERS="deepgram,speechmatics", SPEECHMATICS_API_KEY="sm"),
+            clear=False,
+        ):
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(first_configured_stt_provider(settings), "speechmatics")
 
 
 class SettingsSurfaceTests(unittest.TestCase):

@@ -442,7 +442,10 @@ class RawFallbackDeliveryTests(unittest.IsolatedAsyncioTestCase):
         def headroom(*_args, **_kwargs):
             order.append("headroom")
 
-        async def download(_message, _target, _limit, *, stall_seconds=0.0):
+        async def download(
+            _message, _target, _limit, *, stall_seconds=0.0, client=None,
+            connections=1,
+        ):
             order.append("download")
             stalls.append(stall_seconds)
             raise RuntimeError("stop the pipeline here")

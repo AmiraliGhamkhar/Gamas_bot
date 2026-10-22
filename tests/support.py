@@ -401,6 +401,8 @@ def make_settings(**overrides) -> Settings:
         stt_poll_interval=1.0,
         temp_min_free_bytes=0,
         download_stall_seconds=300.0,
+        audio_format_policy="auto",
+        telegram_download_connections=1,
         presentation_max_clips=50,
         presentation_max_total_duration=3600.0,
         presentation_max_unpacked_bytes=1024**3,
@@ -425,6 +427,7 @@ def make_settings(**overrides) -> Settings:
         stt_openai_max_upload=25_000_000,
         stt_transfer_timeout=600.0,
         max_stt_response_bytes=64 * 1024 * 1024,
+        stt_status_long_poll=25.0,
         note_providers=("openai_compatible", "nara", "openrouter"),
         note_provider="openai_compatible",
         note_api_key="note-key",
@@ -459,6 +462,15 @@ def make_settings(**overrides) -> Settings:
         note_reasoning_effort="",
         note_strict_grounding=False,
         note_quality_gate="repair",
+        note_openrouter_throughput=False,
+        note_structured_output=False,
+        note_progressive_booklet=False,
+        # Pinned to the pre-change behaviour on purpose: the shipped defaults
+        # (25 s first-byte guard, 60 s hedge) are covered by tests that build
+        # settings from the environment instead of this fixture.
+        note_ttfb_timeout=0.0,
+        note_hedge_after=0.0,
+        note_compile_provider="",
         raw_text_profile="plain",
         raw_fallback_file_chars=100_000,
         raw_fallback_max_files=8,

@@ -38,6 +38,7 @@ from .config import (
     OPENAI_STT_MAX_UPLOAD,
     SPEECHMATICS_MAX_UPLOAD,
     Settings,
+    first_configured_stt_provider,
 )
 from .http_util import (
     read_error_body,
@@ -426,6 +427,74 @@ def _speechmatics_words(results: object) -> tuple[str, list[Word]]:
     return text, tokens
 
 
+#: Terminal Speechmatics job states that are a failure, not a wait.
+SPEECHMATICS_FAILURE_STATES = frozenset({"rejected", "failed", "deleted", "expired"})
+
+
+def _speechmatics_wait_params(
+    settings: Settings, *, output_format: str | None = None
+) -> dict[str, str]:
+    """Query parameters that ask Speechmatics to hold the request open.
+
+    ``wait`` makes the endpoint long-poll until the job changes state (the API
+    caps the value server-side), and on ``POST /jobs`` it additionally returns
+    the finished transcript in the submit response, which removes both the
+    status poll and the transcript download for a job that finishes inside the
+    window. ``STT_STATUS_LONG_POLL=0`` sends nothing, restoring the plain
+    request this bot sent before.
+    """
+    params: dict[str, str] = {}
+    try:
+        wait_seconds = float(getattr(settings, "stt_status_long_poll", 0.0) or 0.0)
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        wait_seconds = 0.0
+    if math.isfinite(wait_seconds) and wait_seconds > 0:
+        params["wait"] = str(int(wait_seconds))
+    if output_format:
+        params["format"] = output_format
+    return params
+
+
+def _speechmatics_inline_transcript(payload: object) -> dict | None:
+    """The transcript a Speechmatics response carries inline, when it has one.
+
+    ``POST /jobs?format=json-v2`` embeds the finished transcript under the
+    format key (the same shape as the transcript endpoint answers). The
+    embedding is best-effort: a ``done`` job without the key is a normal
+    outcome, and the caller falls back to the transcript ``GET``.
+    """
+    if not isinstance(payload, dict):
+        return None
+    for key in ("json-v2", "json_v2", "transcript_document", "transcript"):
+        value = payload.get(key)
+        if isinstance(value, dict) and isinstance(value.get("results"), list):
+            return value
+        if isinstance(value, str) and value.strip().startswith("{"):
+            try:
+                parsed = _json_loads(value)
+            except (ValueError, TypeError):
+                continue
+            if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
+                return parsed
+    if isinstance(payload.get("results"), list):
+        return payload
+    return None
+
+
+def _speechmatics_result(result: dict, job_id: str) -> RawTranscript:
+    """Turn one json-v2 transcript document into a ``RawTranscript``."""
+    text, words = _speechmatics_words(result.get("results"))
+    if not _has_meaningful_text(text):
+        raise STTError("Speechmatics متن قابل‌استفاده‌ای تولید نکرد.")
+    duration = result.get("duration")
+    if isinstance(duration, (int, float)) and not isinstance(duration, bool):
+        logger.info(
+            "Speechmatics transcript ready job_id=%s words=%s duration=%.1fs",
+            job_id, len(words), float(duration),
+        )
+    return RawTranscript(words=words, text=text, confidence=None, engine="speechmatics")
+
+
 async def _speechmatics(
     session: aiohttp.ClientSession, audio_path: Path, settings: Settings
 ) -> RawTranscript:
@@ -449,6 +518,7 @@ async def _speechmatics(
         async with session.post(
             f"{settings.speechmatics_base_url}/jobs",
             headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
+            params=_speechmatics_wait_params(settings, output_format="json-v2"),
             data=form,
             timeout=_transfer_timeout(settings),
         ) as response:
@@ -465,9 +535,24 @@ async def _speechmatics(
     if not isinstance(job_id, (str, int)) or isinstance(job_id, bool) or not str(job_id):
         raise STTError("Speechmatics شناسهٔ پردازش را برنگرداند.")
 
+    status = str(payload.get("status", "")).strip().lower()
+    if status in SPEECHMATICS_FAILURE_STATES:
+        raise STTRequestError(f"Speechmatics کار را با وضعیت {status} پایان داد.")
+    inline = _speechmatics_inline_transcript(payload)
+    if status == "done" and inline is not None:
+        # The submit call carried the whole transcript: no status poll, no
+        # transcript download, one round trip for the entire job.
+        logger.info("Speechmatics transcript came back on submit job_id=%s", job_id)
+        return _speechmatics_result(inline, str(job_id))
+
     try:
         return await _speechmatics_poll(
-            session, settings, str(job_id), submitted_at=time.monotonic()
+            session,
+            settings,
+            str(job_id),
+            submitted_at=time.monotonic(),
+            first_status=status,
+            inline_transcript=inline,
         )
     except BaseException:
         # A rejected, timed-out or cancelled job keeps running (and billing)
@@ -568,10 +653,17 @@ async def _speechmatics_poll(
     job_id: str,
     *,
     submitted_at: float,
+    first_status: str = "",
+    inline_transcript: dict | None = None,
 ) -> RawTranscript:
     deadline = submitted_at + settings.stt_job_timeout
     poll_count = 0
-    while True:
+    if inline_transcript is not None:
+        return _speechmatics_result(inline_transcript, job_id)
+    # A submit that already reported ``done`` does not need a status read: the
+    # only thing left is the transcript document, which was not embedded.
+    polling = first_status != "done"
+    while polling:
         if time.monotonic() >= deadline:
             raise STTTransientError("زمان پردازش Speechmatics به پایان رسید.")
         status_data = await _get_json(
@@ -580,6 +672,7 @@ async def _speechmatics_poll(
             f"{settings.speechmatics_base_url}/jobs/{quote(str(job_id), safe='')}",
             settings=settings,
             headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
+            params=_speechmatics_wait_params(settings),
             deadline=deadline,
         )
         if not isinstance(status_data, dict):
@@ -591,7 +684,12 @@ async def _speechmatics_poll(
         if not status:
             raise STTError("Speechmatics وضعیت پردازش را برنگرداند.")
         if status == "done":
-            break
+            # ``first_status`` already told us the job is done; the loop only
+            # runs when it did not, so an inline document here is a bonus.
+            inline = _speechmatics_inline_transcript(status_data)
+            if inline is not None:
+                return _speechmatics_result(inline, job_id)
+            break  # status GET + transcript GET is the fallback
         if status in {"rejected", "failed", "deleted", "expired"}:
             raise STTRequestError(f"Speechmatics کار را با وضعیت {status} پایان داد.")
         poll_count += 1
@@ -613,17 +711,7 @@ async def _speechmatics_poll(
     )
     if not isinstance(result, dict):
         raise STTError("Speechmatics پاسخ متن را با ساختار قابل‌خواندن برنگرداند.")
-    text, words = _speechmatics_words(result.get("results"))
-    if not _has_meaningful_text(text):
-        raise STTError("Speechmatics متن قابل‌استفاده‌ای تولید نکرد.")
-    confidence = None
-    duration = result.get("duration")
-    if isinstance(duration, (int, float)):
-        logger.info(
-            "Speechmatics transcript ready job_id=%s words=%s duration=%.1fs",
-            job_id, len(words), float(duration),
-        )
-    return RawTranscript(words=words, text=text, confidence=confidence, engine="speechmatics")
+    return _speechmatics_result(result, job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -887,17 +975,19 @@ def largest_configured_upload(settings: Settings) -> int | None:
 
 
 def first_configured_stt_url(settings: Settings) -> str | None:
-    """Base URL of the first configured STT provider, for connection pre-warming."""
-    for slug in settings.stt_providers:
-        spec = PROVIDERS.get(slug)
-        if spec is None or not spec.configured(settings):
-            continue
-        if slug == "speechmatics":
-            return settings.speechmatics_base_url
-        if slug == "deepgram":
-            return settings.deepgram_base_url
-        if slug == "openai_compatible":
-            return settings.stt_openai_base_url
+    """Base URL of the first configured STT provider, for connection pre-warming.
+
+    Warm the host that will actually serve the job: the chosen slug comes from
+    the same helper ``config.check`` uses to warn about an inverted order, so
+    the pre-warm and the failover chain can never disagree.
+    """
+    slug = first_configured_stt_provider(settings)
+    if slug == "speechmatics":
+        return settings.speechmatics_base_url
+    if slug == "deepgram":
+        return settings.deepgram_base_url
+    if slug == "openai_compatible":
+        return settings.stt_openai_base_url
     return None
 
 
