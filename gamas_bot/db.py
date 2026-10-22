@@ -973,15 +973,36 @@ class Database:
             )
             return [dict(row) for row in rows]
 
-    async def pending_review_payments(self) -> list[dict[str, Any]]:
-        """Orders with a stored receipt that are ready for a human decision."""
+    async def pending_review_payments(
+        self, *, limit: int | None = None, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Receipt-backed orders ready for review, oldest first.
+
+        ``limit`` is optional for compatibility with maintenance callers that
+        need the complete set. Telegram screens always pass a small bounded
+        limit so a backlog cannot produce an oversized message or keyboard.
+        """
+        query = (
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments "
+            "WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL "
+            "ORDER BY payment_id"
+        )
+        params: tuple[Any, ...] = ()
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params = (max(0, int(limit)), max(0, int(offset)))
+        async with self._write_lock:
+            rows = await self.db.execute_fetchall(query, params)
+            return [dict(row) for row in rows]
+
+    async def count_pending_review_payments(self) -> int:
+        """Count reviewable orders without loading an unbounded backlog."""
         async with self._write_lock:
             rows = await self.db.execute_fetchall(
-                f"SELECT {self._PAYMENT_COLUMNS} FROM payments "
-                "WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL "
-                "ORDER BY payment_id"
+                "SELECT COUNT(*) FROM payments "
+                "WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL"
             )
-            return [dict(row) for row in rows]
+            return int(rows[0][0]) if rows else 0
 
     async def all_payments(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         async with self._write_lock:
@@ -1240,10 +1261,13 @@ class Database:
             )
             return [dict(row) for row in rows]
 
-    #: Admin list filters: ``active`` is every ticket not closed.
+    #: Admin list filters: ``active`` is every ticket not closed. ``open`` is
+    #: the new/open work queue: freshly created tickets already carry their
+    #: first user message and are therefore ``awaiting_admin``; reopened ones
+    #: remain ``open`` until the next message.
     SUPPORT_FILTERS = {
         "active": "status != 'closed'",
-        "open": "status = 'open'",
+        "open": "status IN ('open', 'awaiting_admin')",
         "wait": "status = 'awaiting_admin'",
         "user": "status = 'awaiting_user'",
         "closed": "status = 'closed'",

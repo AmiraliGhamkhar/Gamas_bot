@@ -276,6 +276,39 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         for expected in ("شناسه سفارش:", "طرح:", "بسته:", "مدت اعتبار:", "مبلغ:", "اعتبار متصل به سفارش: ثبت شده"):
             self.assertIn(expected, detail_text)
 
+    async def test_admin_pending_review_pages_keep_large_backlogs_reachable(self):
+        for index in range(10):
+            user_id = 1_000 + index
+            await self.db.ensure_user(user_id)
+            payment_id = await self.db.create_payment(user_id, PLAN)
+            await self.db.set_payment_receipt(
+                payment_id, f"receipt-{index}.jpg", user_id=user_id
+            )
+
+        first = await self.press(ADMIN, "adm:pay")
+        first_text, first_buttons = first.edits[-1]
+        self.assertIn("۱۰ مورد", first_text)
+        self.assertLessEqual(len(first_text.encode("utf-16-le")) // 2, 4096)
+        first_payloads = self.payloads(first_buttons)
+        self.assertIn(b"adm:pd:1", first_payloads)
+        self.assertIn(b"adm:pd:8", first_payloads)
+        self.assertNotIn(b"adm:pd:9", first_payloads)
+        self.assertIn(b"adm:pay:1", first_payloads)
+
+        second = await self.press(ADMIN, "adm:pay:1")
+        second_payloads = self.payloads(second.edits[-1][1])
+        self.assertIn(b"adm:pd:9", second_payloads)
+        self.assertIn(b"adm:pd:10", second_payloads)
+        self.assertIn(b"adm:pay:0", second_payloads)
+        self.assertNotIn(b"adm:pay:2", second_payloads)
+
+        for callback in ("adm:pay:not-a-page", "adm:pay:1:extra"):
+            invalid = await self.press(ADMIN, callback)
+            self.assertTrue(invalid.answers[-1][1])
+        forbidden = await self.press(OTHER_USER, "adm:pay:1")
+        self.assertTrue(forbidden.answers[-1][1])
+        self.assertFalse(forbidden.edits)
+
 
 if __name__ == "__main__":
     unittest.main()

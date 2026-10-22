@@ -41,13 +41,15 @@ Steps:
    checks the receipt, and explicitly confirms approval or selects a preset / custom rejection reason.
    An order without a receipt cannot be approved or rejected.
 4. Approval credits the saved snapshot in the same transaction as the status and audit updates.
-   Migrations `006_payment_entitlement_links.sql` and `007_payment_state_guards.sql` link the credit
-   to the payment and enforce valid statuses, terminal-state immutability, and one credit row per
+   Migrations `006_payment_entitlement_links.sql`, `007_payment_state_guards.sql` and
+   `008_payment_transition_integrity.sql` link the credit to the payment, enforce valid forward-only
+   transitions with reviewer metadata, keep terminal states immutable, and allow one credit row per
    payment across retries and concurrent reviewers.
 5. If activation fails, the entire transaction rolls back to `pending_review`; the admin can safely
    fix the database issue and retry. Notification failures never undo or repeat activation.
 6. A user may cancel an unsubmitted purchase. Only one request per user may be open. Users have a
-   paginated payment history, and admins have separate pending-review and full-history screens.
+   paginated payment history; admins have paginated pending-review and full-history screens, so a
+   large backlog remains reachable within Telegram's message and keyboard limits.
 
 Set `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER` and `PAYMENT_BANK_NAME` to enable purchases.
 Receipt images are removed after `RECEIPT_RETENTION_DAYS` (default 90); the payment row remains and
@@ -64,9 +66,9 @@ the deletion is audited (`receipt_expired`).
 ## Database upgrades
 
 Back up the database before upgrading. Migrations run automatically at startup; do not run an older
-bot against a migrated database. Migration 006 adds only a nullable ledger column and indexes; it
-does not rewrite existing payments, credits, balances or expiry dates. The v2 importer is a
-one-time, all-or-nothing operation:
+bot against a migrated database. Migration 006 adds only a nullable ledger column and indexes.
+Migration 008 replaces one status-update trigger and rewrites no rows. Existing payments, credits,
+balances and expiry dates are preserved. The v2 importer is a one-time, all-or-nothing operation:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\import_v2.py --help

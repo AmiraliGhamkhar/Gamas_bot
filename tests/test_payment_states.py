@@ -42,6 +42,27 @@ class PaymentStateTests(DatabaseTestCase):
         self.assertEqual(await self.status(pid), "approved")
         self.assertEqual(await self.db.available_seconds(100), 5 * 3600)
 
+    async def test_concurrent_connections_cannot_duplicate_entitlement(self):
+        pid = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.set_payment_receipt(pid, "r.jpg", user_id=100)
+        second = Database(self.path)
+        await second.connect()
+        try:
+            results = await asyncio.gather(
+                self.db.review_payment(pid, True, 1),
+                second.review_payment(pid, True, 2),
+            )
+            self.assertEqual(sorted(results), [False, True])
+            self.assertEqual(await self.status(pid), "approved")
+            self.assertEqual(await self.db.available_seconds(100), 5 * 3600)
+            rows = await self.db.db.execute_fetchall(
+                "SELECT COUNT(*) FROM ledger WHERE payment_id = ? AND kind = 'credit'",
+                (pid,),
+            )
+            self.assertEqual(rows[0][0], 1)
+        finally:
+            await second.close()
+
     async def test_rejection_from_pending_review_grants_nothing(self):
         pid = await self.db.create_payment(100, "paid_5h_30d")
         await self.db.set_payment_receipt(pid, "r.jpg")
@@ -118,6 +139,33 @@ class PaymentStateTests(DatabaseTestCase):
                 (pid,),
             )
         self.assertEqual(await self.db.available_seconds(100), 18_000)
+
+    async def test_sql_guards_block_backwards_and_unaudited_transitions(self):
+        pid = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.set_payment_receipt(pid, "r.jpg", user_id=100)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            await self.db.db.execute(
+                "UPDATE payments SET status = 'awaiting_payment' WHERE payment_id = ?",
+                (pid,),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            await self.db.db.execute(
+                "UPDATE payments SET status = 'approved' WHERE payment_id = ?",
+                (pid,),
+            )
+        with self.assertRaises(sqlite3.IntegrityError):
+            await self.db.db.execute(
+                "UPDATE payments SET status = 'rejected', reviewed_at = '2026-01-01', "
+                "reviewed_by = 1, review_reason = NULL WHERE payment_id = ?",
+                (pid,),
+            )
+
+        self.assertEqual(await self.status(pid), "pending_review")
+        self.assertEqual(await self.db.available_seconds(100), 0)
+        self.assertTrue(await self.db.review_payment(pid, False, 1, reason="رسید نامعتبر"))
+        self.assertEqual(await self.status(pid), "rejected")
+        self.assertEqual(await self.db.available_seconds(100), 0)
 
     async def test_history_and_credit_survive_restart(self):
         pid = await self.db.create_payment(100, "paid_5h_30d")
