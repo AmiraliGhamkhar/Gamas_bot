@@ -487,9 +487,10 @@ class Database:
         The ``transcriptions`` table grows forever (one row per finished job,
         both text and the notes JSON), so a long-lived deployment pays for every
         lecture it has ever transcribed. Only rows of *finished* submissions are
-        touched: a pending or processing job's row is what a retry or a support
-        ticket reads, and deleting it mid-flight would lose the only copy of the
-        work while it is still being delivered.
+        touched -- including ``partial`` ones, whose booklet failed after the raw
+        transcript was delivered -- because a pending or processing job's row is
+        what a retry or a support ticket reads, and deleting it mid-flight would
+        lose the only copy of the work while it is still being delivered.
 
         The caller loops over batches, so a large backlog is deleted in bounded
         transactions instead of one long write lock.
@@ -500,7 +501,8 @@ class Database:
         rows = await self.db.execute_fetchall(
             "SELECT t.submission_id FROM transcriptions t "
             "JOIN submissions s ON s.submission_id = t.submission_id "
-            "WHERE t.created_at < ? AND s.status IN ('done', 'failed', 'rejected') "
+            "WHERE t.created_at < ? AND s.status IN "
+            "('done', 'partial', 'failed', 'rejected') "
             "ORDER BY t.created_at LIMIT ?",
             (cutoff, max(1, batch)),
         )

@@ -613,6 +613,18 @@ class CheckTests(unittest.TestCase):
         problems = check(settings)
         self.assertTrue(any("speech-to-text" in p for p in problems))
 
+    def test_unknown_stt_provider_list_is_reported_as_such(self):
+        """A typo that empties STT_PROVIDERS must not read as 'no key set'."""
+        settings = self.make(STT_PROVIDERS="bogus")
+        problems = check(settings)
+        named = [p for p in problems if "STT_PROVIDERS" in p]
+        self.assertEqual(len(named), 1, problems)
+        self.assertIn("deepgram", named[0])
+        self.assertFalse(
+            any("No speech-to-text provider is configured" in p for p in problems),
+            problems,
+        )
+
     def test_note_not_configured_is_a_warning_only(self):
         settings = self.make(NOTE_API_KEY="")
         problems = check(settings)

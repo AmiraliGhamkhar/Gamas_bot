@@ -882,14 +882,18 @@ class TranscriptRetentionTests(unittest.IsolatedAsyncioTestCase):
     async def test_expired_finished_transcripts_are_deleted_and_audited(self):
         old_done = await self.transcript(status="done", age_days=40)
         old_failed = await self.transcript(status="failed", age_days=40)
+        # ``partial`` is terminal too: the booklet failed after the raw
+        # transcript was delivered, so its retained text expires as well.
+        old_partial = await self.transcript(status="partial", age_days=40)
         in_flight = await self.transcript(status="processing", age_days=40)
         fresh = await self.transcript(status="done", age_days=1)
 
         removed = await self.bot._cleanup_expired_transcripts()
 
-        self.assertEqual(removed, 2)
+        self.assertEqual(removed, 3)
         self.assertIsNone(await self.db.transcription(old_done))
         self.assertIsNone(await self.db.transcription(old_failed))
+        self.assertIsNone(await self.db.transcription(old_partial))
         # An in-flight job's row is the only copy of work being delivered.
         self.assertIsNotNone(await self.db.transcription(in_flight))
         self.assertIsNotNone(await self.db.transcription(fresh))

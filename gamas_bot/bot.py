@@ -648,8 +648,8 @@ async def _download_media_limited(
 # ---------------------------------------------------------------------------
 
 
-def _media_metadata(message) -> tuple[str | None, str | None, str | None, float | None]:
-    """Classify an incoming message as ('audio' | 'video' | None, name, mime, duration)."""
+def _media_metadata(message) -> tuple[str | None, str | None, float | None]:
+    """Classify an incoming message as ('audio' | 'video' | None, name, duration)."""
     file_obj = message.file
     filename = getattr(file_obj, "name", None)
     mime_type = getattr(file_obj, "mime_type", None)
@@ -676,11 +676,11 @@ def _media_metadata(message) -> tuple[str | None, str | None, str | None, float 
         elif extension in AUDIO_EXTENSIONS:
             kind = "audio"
     if kind is None:
-        return None, None, None, None
+        return None, None, None
     duration = getattr(file_obj, "duration", None)
     if duration is None and message.voice:
         duration = getattr(message.voice, "duration", None)
-    return kind, filename, mime_type, float(duration) if duration else None
+    return kind, filename, float(duration) if duration else None
 
 
 def _presentation_metadata(message) -> tuple[str | None, str | None]:
@@ -729,6 +729,7 @@ class GamasBot:
         self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
         self._receipt_cleanup_task: asyncio.Task | None = None
         self._transcript_cleanup_task: asyncio.Task | None = None
+        self._prewarm_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
         self._pending_broadcast: set[int] = set()
         # admin_id -> payment_id awaiting a rejection reason
@@ -826,10 +827,25 @@ class GamasBot:
             logger.info("removed %d stale temp dir(s) at startup", removed)
 
     async def shutdown(self) -> None:
-        if self._transcript_cleanup_task is not None:
-            self._transcript_cleanup_task.cancel()
-        if self._receipt_cleanup_task is not None:
-            self._receipt_cleanup_task.cancel()
+        background = [
+            task
+            for task in (
+                self._transcript_cleanup_task,
+                self._receipt_cleanup_task,
+                self._prewarm_task,
+            )
+            if task is not None
+        ]
+        for task in background:
+            task.cancel()
+        if background:
+            # Await the cancellation *before* the database closes: a sweep
+            # cancelled mid-transaction must finish its rollback against a live
+            # connection, not a closed one.
+            await asyncio.gather(*background, return_exceptions=True)
+        self._transcript_cleanup_task = None
+        self._receipt_cleanup_task = None
+        self._prewarm_task = None
 
         async def _fail_queued(job) -> None:
             # Audit F-H04: queued jobs never reached a worker; mark them failed
@@ -877,7 +893,11 @@ class GamasBot:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._prewarm_llm())
+        # Keep a reference: an unreferenced task can be garbage-collected
+        # before it runs, and shutdown waits for it explicitly. A warm-up that
+        # is still in flight is not started a second time.
+        if self._prewarm_task is None or self._prewarm_task.done():
+            self._prewarm_task = loop.create_task(self._prewarm_llm())
 
     async def _prewarm_llm(self) -> None:
         session = self._http
@@ -1594,7 +1614,7 @@ class GamasBot:
             return
 
         # Media.
-        kind, filename, mime, duration = _media_metadata(event.message)
+        kind, filename, duration = _media_metadata(event.message)
         if kind is not None:
             await self._accept_media(event, user_id, kind, filename, duration)
             return
@@ -2105,17 +2125,17 @@ class GamasBot:
         # MEDIA_ACTION_OMITTED). If the deck converted but has no audio clips,
         # surface that as a skip reason so the user understands why narration
         # is missing.
+        # Only add the generic note when no other explanation is present.
         if (
             job.meta.get("presentation_kind") == "legacy"
             and not content.clips
             and outline.strip()
+            and not skipped
         ):
-            # Only add the generic note when we have no other explanation.
-            if not skipped:
-                skipped.append(
-                    "برخی رسانه‌های قالب قدیمی در تبدیل به pptx حذف شدند (MEDIA_ACTION_OMITTED)؛ "
-                    "برای حفظ صدا، فایل را با PowerPoint جدید به‌صورت pptx ذخیره و دوباره بفرستید."
-                )
+            skipped.append(
+                "برخی رسانه‌های قالب قدیمی در تبدیل به pptx حذف شدند (MEDIA_ACTION_OMITTED)؛ "
+                "برای حفظ صدا، فایل را با PowerPoint جدید به‌صورت pptx ذخیره و دوباره بفرستید."
+            )
 
         raw_text_parts: list[str] = []
         if outline.strip():
@@ -2310,7 +2330,12 @@ class GamasBot:
         """
         limit = 500
         while len(self._office_last) > limit:
-            oldest = next(iter(self._office_last))
+            # Evict the least recently built document, not the first key ever
+            # inserted: a dict keeps its insertion position when a value is
+            # updated, so "first key" can be a user who just built a document.
+            oldest = min(
+                self._office_last, key=lambda user_id: self._office_last[user_id][3]
+            )
             self._office_last.pop(oldest, None)
 
     async def _build_office_excel(self, document, content: str) -> bytes:

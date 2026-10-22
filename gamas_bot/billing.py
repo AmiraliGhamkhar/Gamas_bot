@@ -47,13 +47,11 @@ class PlanSpec:
     """One canonical purchasable plan and the configuration keys behind it.
 
     ``key`` is the :meth:`gamas_bot.config.Settings.plan_values` prefix
-    (``plan_5_hours`` / ``plan_5_price_toman`` / ``plan_5_validity_days``) and
-    ``env_prefix`` the environment spelling of the same group.
+    (``plan_5_hours`` / ``plan_5_price_toman`` / ``plan_5_validity_days``).
     """
 
     code: str
     key: str
-    env_prefix: str
     hours: int
     price_toman: int
     validity_days: int
@@ -63,11 +61,11 @@ class PlanSpec:
 #: The purchasable catalogue, cheapest first. The free plan is not listed: it
 #: is granted by the database, never sold, and therefore has no price keys.
 PAID_PLAN_SPECS: tuple[PlanSpec, ...] = (
-    PlanSpec(PLAN_5_CODE, "plan_5", "PLAN_5", 5, 50_000, 30, 1),
-    PlanSpec(PLAN_10_CODE, "plan_10", "PLAN_10", 10, 75_000, 30, 2),
-    PlanSpec(PLAN_20_CODE, "plan_20", "PLAN_20", 20, 130_000, 30, 3),
-    PlanSpec(PLAN_25_CODE, "plan_25", "PLAN_25", 25, 150_000, 30, 4),
-    PlanSpec(PLAN_50_CODE, "plan_50", "PLAN_50", 50, 250_000, 30, 5),
+    PlanSpec(PLAN_5_CODE, "plan_5", 5, 50_000, 30, 1),
+    PlanSpec(PLAN_10_CODE, "plan_10", 10, 75_000, 30, 2),
+    PlanSpec(PLAN_20_CODE, "plan_20", 20, 130_000, 30, 3),
+    PlanSpec(PLAN_25_CODE, "plan_25", 25, 150_000, 30, 4),
+    PlanSpec(PLAN_50_CODE, "plan_50", 50, 250_000, 30, 5),
 )
 
 

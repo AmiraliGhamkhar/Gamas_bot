@@ -1,6 +1,6 @@
 """Local, offline benchmarks for the three slow layers of the pipeline.
 
-Every number in ``docs/PERFORMANCE_PLAN.md`` comes from this script. It never
+The figures in ``docs/PERFORMANCE.md`` come from this script. It never
 touches the network, never reads a user file and never needs a provider key: it
 synthesises its own audio and Persian text, so a result can be reproduced on any
 machine (a cPanel host included) before and after a change.

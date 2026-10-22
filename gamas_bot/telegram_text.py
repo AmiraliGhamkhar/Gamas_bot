@@ -36,9 +36,8 @@ MIN_CHUNK_SIZE = 400
 # strings (a plan name, a credential label), whose length no panel can promise.
 BUTTON_LABEL_LIMIT = 64
 TAG_PATTERN = re.compile(r"<[^>]+>")
-# A configuration error (unsupported language/model for the selected engine)
-# is actionable for the operator, so it is reported verbatim. Transient provider
-# failures are not: the tracking reference is what the user needs for those.
+
+
 def _utf16_length(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 

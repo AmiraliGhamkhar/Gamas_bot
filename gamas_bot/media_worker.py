@@ -48,7 +48,7 @@ OPUS_BIT_RATE = 32000
 #   trade because the encoder runs on the same 2 vCPUs that serve the bot.
 #
 # Measured with ``python -m scripts.perf_bench audio``; see
-# docs/PERFORMANCE_PLAN.md §1.1.
+# docs/PERFORMANCE.md.
 OPUS_CODEC_OPTIONS = {"application": "audio", "compression_level": "0"}
 
 LEGACY_EXTENSIONS = {".ppt", ".pps", ".pot"}

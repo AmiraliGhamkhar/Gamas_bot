@@ -1,10 +1,22 @@
 # Gamas Bot
 
-A Persian Telegram study assistant. Send lecture audio/video or a PowerPoint deck to get a raw transcript and an RTL Word booklet. The free Office menu turns text into Word, Excel, PowerPoint or PDF.
+Persian Telegram study assistant. Send lecture audio/video or a PowerPoint deck and get a raw
+transcript plus an RTL Word booklet. The free Office menu turns text into Word, Excel,
+PowerPoint or PDF.
 
-## Windows PowerShell: install and run
+Runs on Windows for local use and on Linux cPanel shared hosting for production.
 
-Use Python 3.11–3.13 and Git. From PowerShell (replace `3.12` below with your installed version if needed):
+## Requirements
+
+- Python 3.11–3.13. On cPanel, Terminal/SSH, Cron Jobs and outbound TCP 443.
+- Telegram API credentials and bot token from [my.telegram.org](https://my.telegram.org) and
+  [@BotFather](https://t.me/BotFather).
+- At least one STT key (Deepgram, Speechmatics, or an OpenAI-compatible endpoint). Note-provider
+  keys are optional; without them the bot delivers transcripts only.
+
+No system `ffmpeg`, `soffice`, Redis, Docker or external database is needed.
+
+## Windows PowerShell (local)
 
 ```powershell
 git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git
@@ -18,30 +30,49 @@ notepad .env
 .\.venv\Scripts\python.exe -m gamas_bot
 ```
 
-Set `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ADMIN_IDS`, and at least one STT key in `.env`. Note-generation keys are optional; without them, the bot delivers the transcript only. Stop a foreground run with **Ctrl+C**. Do not share or upload `.env`.
-
-To run tests on Windows, install the `.[dev]` extra and follow [Testing](docs/TESTING.md). Production cPanel hosting runs Linux; use its Terminal, not PowerShell, for the server steps.
+Fill `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, `ADMIN_IDS` and one STT key in
+`.env`. Stop with **Ctrl+C**. Never commit or share `.env`.
 
 ## cPanel shared hosting
 
-Follow [Deploy on cPanel](docs/DEPLOY_CPANEL.md). Keep the project, `.env`, database, session and receipts **outside `public_html`**. The host must allow Python 3.11+, outbound TCP 443 and a cron job. Shared-host limits may stop long-running jobs; use one active worker and test the host before relying on it.
+```bash
+cd "$HOME"
+git clone https://github.com/AmiraliGhamkhar/Gamas_bot.git gamas_bot
+cd "$HOME/gamas_bot"
+python3.11 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+cp .env.example .env && chmod 600 .env
+nano .env
+python -m scripts.cpanel_preflight
+python -m gamas_bot --check
+```
+
+Then add the once-per-minute cron job from [Deploy on cPanel](docs/DEPLOY_CPANEL.md). Keep the
+project, `.env`, database, session, logs and receipts **outside `public_html`**. Shared hosts may
+kill long processes; run one active worker and test the host before relying on it.
 
 ## What it supports
 
-- Audio, video, PowerPoint (`.pptx` and legacy `.ppt`) → transcript and RTL `.docx`.
-- Text or supported text files → free `.docx`, `.xlsx`, `.pptx` or `.pdf`.
-- STT: Speechmatics, Deepgram or an OpenAI-compatible endpoint. Note generation supports Gemini, NaraRouter, OpenRouter, Groq, Cerebras, Anthropic and OpenAI-compatible APIs.
-- No system `ffmpeg`, `soffice`, Redis, Docker or external database required. PyAV supplies the media libraries and `cryptg` accelerates Telegram MTProto transfers.
+- Audio, video, Telegram voice/video notes, `.pptx` and legacy `.ppt` → transcript + RTL `.docx`.
+- Text or text files → free `.docx`, `.xlsx`, `.pptx`, `.pdf`.
+- STT: Deepgram, Speechmatics, OpenAI-compatible.
+- Notes: Gemini, NaraRouter, OpenRouter, Groq, Cerebras, Anthropic, OpenAI-compatible.
+- SQLite billing ledger with card-to-card purchases reviewed by an admin.
 
-OCR for images and scanned PDFs is **not supported**. Free Office accepts text files, not source `.docx` or `.pdf` documents.
+OCR for images and scanned PDFs is **not** supported. Free Office accepts text, not uploaded
+`.docx`/`.pdf` sources.
 
-## Operations and help
+## Documentation
 
-- [Configuration](docs/CONFIGURATION.md) · [cPanel deployment](docs/DEPLOY_CPANEL.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
-- [Billing](docs/BILLING.md) · [Security](docs/SECURITY.md) · [All documentation](docs/README.md)
+[Documentation index](docs/README.md) · [Configuration](docs/CONFIGURATION.md) ·
+[cPanel deployment](docs/DEPLOY_CPANEL.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
 
-Back up the database, Telegram session and `.env` before upgrades. Database migrations run when the bot starts. Card-to-card payments require manual admin review; sending a receipt does not add credit.
+Back up `.env`, the database and the Telegram session before upgrades. Database migrations run at
+startup. Payments are manual; uploading a receipt does not add credit.
 
 ## License
 
-Proprietary — all rights reserved. See `assets/fonts/LICENSE.txt` for the bundled font license.
+Proprietary — all rights reserved. The bundled Vazirmatn font is licensed separately; see
+`assets/fonts/LICENSE.txt`.

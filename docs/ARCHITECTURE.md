@@ -1,18 +1,22 @@
 # Architecture
 
-Gamas Bot is one Python process with a Telethon client, bounded asyncio job queue and SQLite database. It needs no broker or separate media server. cPanel uses a cron watchdog; Windows PowerShell is suitable for local setup and testing.
+One Python process: a Telethon client, a bounded asyncio job queue and a SQLite database. No broker,
+separate media server or external database is required. Windows is for local use; cPanel uses a
+cron watchdog.
 
-## Main flows
+## Flows
 
 ```text
 Audio/video/deck → bounded queue → PyAV media worker → STT
-                 → transcript cleanup → raw text delivered
-                 → optional note provider → evidence checks → RTL Word file
+                 → raw transcript delivered → optional notes
+                 → evidence checks → RTL Word booklet
 
-Text → Free Office parser → DOCX/XLSX/PPTX/PDF
+Text → Free Office parser → DOCX / XLSX / PPTX / PDF
 ```
 
-The raw transcript is saved and delivered before note generation. PowerPoint narration is combined into one STT request and mapped to slides only when timestamps support the mapping. Free Office accepts text, not uploaded DOCX/PDF source documents.
+The raw transcript is saved and delivered before note generation. PowerPoint narration is merged
+into one STT request and mapped to slides only where timestamps support it. Free Office reads text,
+not uploaded `.docx`/`.pdf` files.
 
 ## Code map
 
@@ -25,12 +29,14 @@ The raw transcript is saved and delivered before note generation. PowerPoint nar
 | Documents | `docx_export.py`, `pdf_export.py`, `office.py`, `office_ai.py`, `mdblocks.py`, `bidi.py` |
 | Data and billing | `db.py`, `billing.py`, `migrations/v3/` |
 
-## Operating rules
+## Rules
 
-- The in-memory queue is bounded by `MAX_ACTIVE_JOBS` and `MAX_QUEUED_JOBS`; excess work is rejected. Dispatch is round-robin across users (a user's own jobs keep their order, and a user whose job just finished goes to the back), so one person's backlog cannot occupy every worker for hours.
-- Each user may hold at most `MAX_ACTIVE_JOBS_PER_USER` pending/processing submissions; the cap is checked in the same write transaction that creates the row, so two fast uploads cannot both pass.
-- The media worker runs with a timeout and no shell. `av` supplies media libraries; system FFmpeg is not required.
-- SQLite migrations run at startup. Billing writes are transactional; a job hold is settled or released according to the raw-transcript delivery milestone.
-- A lock on the Telegram session prevents duplicate polling. Keep the session and database on a local writable filesystem.
-- A lecture whose booklet exceeds one note request is compiled and repaired in bounded whole-section groups instead of skipping those passes; see [Note quality](NOTE_QUALITY.md).
-- Provider output is untrusted and is checked before a note is delivered. See [Billing](BILLING.md), [Security](SECURITY.md) and [Note quality](NOTE_QUALITY.md).
+- The queue is bounded by `MAX_ACTIVE_JOBS` and `MAX_QUEUED_JOBS`; dispatch is round-robin across
+  users, and a user's own jobs keep their order.
+- Each user may hold at most `MAX_ACTIVE_JOBS_PER_USER` pending/processing submissions; the check
+  and insert share one write transaction.
+- The media worker runs with a timeout and no shell. `av` supplies the media libraries.
+- SQLite migrations run at startup; billing writes are transactional.
+- A lock on the Telegram session prevents duplicate polling. Keep the session and database on a
+  local writable filesystem.
+- Provider output is untrusted and checked before delivery.

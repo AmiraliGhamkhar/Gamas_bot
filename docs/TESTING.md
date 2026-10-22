@@ -1,8 +1,9 @@
 # Testing
 
-Run tests from the repository root. Python 3.11–3.13 are exercised in CI. Replace `3.12` below with your installed version if needed.
+Tests use fake Telegram/provider responses: no API keys, no production data and no billable calls.
+CI runs them on Python 3.11, 3.12 and 3.13.
 
-## Windows PowerShell / local development
+## Windows PowerShell (local development)
 
 ```powershell
 py -3.12 -m venv .venv
@@ -16,15 +17,17 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m gamas_bot.media_worker check
 ```
 
-If the `ruff.exe` command is unavailable, run `ruff check .` after activating the virtual environment. Tests use fake Telegram/provider responses; they need no production keys and make no billable API calls.
+If `ruff.exe` is not on the path, activate the virtualenv and run `ruff check .`.
 
-## cPanel check
+## cPanel / Linux
 
-After installing runtime dependencies on the target account, run these from the project folder with the same Python executable used by cron:
+After installing `requirements.txt` with the interpreter cron uses:
 
 ```bash
 python -m gamas_bot --check
 python -m scripts.cpanel_preflight
+python -m gamas_bot.media_worker check
 ```
 
-The first checks local settings and packages. The preflight also tests disk, permissions, the lock and outbound network; it is the host-compatibility check. CI additionally checks dependency consistency and compiles the package. Do not run the test suite with production credentials or data.
+The first is offline; the preflight also tests disk, permissions, the lock and outbound network.
+Run the test suite only on a development machine, never with production `.env` or data.

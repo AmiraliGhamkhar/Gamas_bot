@@ -1,25 +1,26 @@
 # Documentation
 
-Start with the [main README](../README.md). Setup commands are split by platform: Windows PowerShell for local use and cPanel Terminal for shared hosting.
+Start with the [main README](../README.md). Commands are given for **Windows PowerShell** (local)
+and **cPanel Terminal** (Linux shared hosting).
 
 | Page | Use it for |
 | --- | --- |
-| [Deploy on cPanel](DEPLOY_CPANEL.md) | Install, preflight, cron watchdog, backups |
-| [Windows/cPanel configuration](CONFIGURATION.md) | `.env`, required keys, safe defaults |
-| [Operations](OPERATIONS.md) | Start, stop, update and back up |
+| [Deploy on cPanel](DEPLOY_CPANEL.md) | Upload, install, preflight, cron watchdog, updates |
+| [Configuration](CONFIGURATION.md) | `.env`, required keys, safe defaults |
+| [Operations](OPERATIONS.md) | Start, stop, logs, backups, retention |
 | [Troubleshooting](TROUBLESHOOTING.md) | Common failures and fixes |
 | [Testing](TESTING.md) | Local checks and CI commands |
 | [Security](SECURITY.md) | Data, uploads, credentials and privacy |
-| [Billing](BILLING.md) | Credit, receipts and admin review |
-| [Speech-to-text](STT_PROVIDERS.md) | STT provider settings and failover |
-| [Note providers](PROVIDERS.md) | Note generation and provider keys |
-| [Presentations](PRESENTATIONS.md) | PowerPoint audio, billing and limits |
-| [Media](MEDIA.md) | Audio/video processing requirements |
+| [Billing](BILLING.md) | Credit, plans, receipts and admin review |
+| [Speech-to-text](STT_PROVIDERS.md) | STT providers, failover and limits |
+| [Note providers](PROVIDERS.md) | Note generation, keys and model presets |
+| [Presentations](PRESENTATIONS.md) | PowerPoint narration and limits |
+| [Media](MEDIA.md) | Audio/video processing and disk limits |
 | [Free Office](OFFICE.md) | Text-to-document features |
 | [Word output](DOCX.md) | RTL Word behavior and fonts |
 | [Note quality](NOTE_QUALITY.md) | Grounding checks and limitations |
-| [Performance](PERFORMANCE_PLAN.md) | Measured latency budget and the speed-up plan |
+| [Performance](PERFORMANCE.md) | Measured defaults and how to re-measure |
 | [Architecture](ARCHITECTURE.md) | Short code and data-flow map |
 | [Changelog](CHANGELOG.md) | Recent user-visible changes |
 
-The Persian quick guide is [DEPLOY_FA.md](DEPLOY_FA.md). OCR is not implemented.
+Persian quick guide: [DEPLOY_FA.md](DEPLOY_FA.md). OCR is not implemented.

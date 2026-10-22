@@ -1,39 +1,62 @@
 # Billing
 
-## Credit and jobs
+Credit is an append-only ledger in **integer seconds**. A job reserves its measured source-audio
+duration before transcription starts.
 
-Credit is an append-only ledger measured in integer seconds. A job reserves its measured source-audio duration before STT starts.
+## Charges
 
-- Credit is charged after the complete raw transcript is delivered. A successful booklet completes as `done`; a later booklet failure is `partial` and the transcription remains billed.
-- Failures or cancellations before complete transcript delivery release the hold. A truncated text fallback is not billable. A crash before confirmed delivery favors the user.
-- PowerPoint billing uses source narration duration; inserted silence is not charged. A deck with no narration is free (nothing is reserved), but its delivery is still recorded, so it appears as delivered in statistics.
-- At most `MAX_ACTIVE_JOBS_PER_USER` submissions per user may be pending or processing at once. The balance check at intake cannot see work queued a moment earlier, so this cap is what stops a user from queueing several downloads their balance cannot cover.
-- Credits are tracked by lot and expire independently. New purchases are not reduced by old debits. Active holds keep their original allocations.
-- Startup recovery closes interrupted work and releases any active hold.
+- The charge is applied after the **complete raw transcript is delivered**. A later booklet failure
+  makes the job `partial` and keeps the transcription charge.
+- Failures or cancellations before transcript delivery release the hold. A truncated text fallback
+  is not billable. A crash before confirmed delivery favors the user.
+- PowerPoint bills the measured source narration. Inserted silence is not charged. A deck with no
+  narration reserves nothing (free), but delivery is still recorded.
+- Unknown source duration is reserved at a conservative floor at intake; a file whose duration
+  cannot be measured is refused rather than charged blindly.
+- A user may hold at most `MAX_ACTIVE_JOBS_PER_USER` pending/processing submissions; the cap is
+  enforced in the same transaction that creates the row.
+- Credit lots expire independently. New purchases are never reduced by older debits. Active holds
+  keep their original lot allocations.
+- Startup recovery fails interrupted work and releases its hold.
 
 ## Plans and payments
 
-The default catalog includes a free grant and paid hour bundles; prices and validity are configurable in `.env.example`. Admin changes to a plan are preserved. Payments are card-to-card and manually reviewed:
+The default catalog is a lifetime free grant plus paid hour bundles, configurable with the
+`FREE_PLAN_HOURS` and `PLAN_*` variables. A non-positive tariff value is reported by
+`--check` and the built-in default is used instead.
 
-1. A purchase stores a snapshot of its price, duration and validity. A non-positive `PLAN_*` value is reported by the startup self-check and the built-in default is used instead — it is never clamped to a 1-Toman price.
-2. A receipt upload does **not** grant credit. Receipt images are size-checked, validated and kept in the private receipt directory.
-3. An admin approves or rejects the request. Approval uses the saved snapshot and is idempotent; rejection requires a reason.
-4. Users may resume a pending purchase or cancel it before submitting a receipt. A submitted receipt must be reviewed by an admin.
+Purchases are card-to-card and manually reviewed:
 
-Set `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER` and `PAYMENT_BANK_NAME` to enable purchases. Receipt files are removed after `RECEIPT_RETENTION_DAYS`; the payment record remains for accounting, its receipt reference is cleared in the same pass, and the deletion is written to the audit log (`receipt_expired`).
+1. Creating a purchase stores a snapshot of its price, duration and validity.
+2. Uploading a receipt does **not** grant credit. The image is validated and stored privately.
+3. An admin approves or rejects. Approval credits the saved snapshot and is idempotent; rejection
+   requires a reason.
+4. A user may cancel an unsubmitted purchase. Only one request per user may be open.
+
+Set `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER` and `PAYMENT_BANK_NAME` to enable purchases.
+Receipt images are removed after `RECEIPT_RETENTION_DAYS` (default 90); the payment row remains and
+the deletion is audited (`receipt_expired`).
 
 ## Admin and user status
 
-- Unlimited users are not charged. Enabling unlimited status releases active holds; turning it off affects new work only. Admins cannot change their own or another admin's status.
-- Banned users cannot start new work. Queued jobs are checked before processing; already-processing work is not forcibly killed.
+- Unlimited users are never charged; enabling the flag releases active holds. Admins cannot change
+  their own status or another admin's.
+- Banned users cannot start new work. Queued jobs are rejected before processing; running work is
+  not killed.
 - Credit, ban and unlimited changes are audited and cooldown-limited.
 
 ## Database upgrades
 
-Stop the bot and back up the database before deploying an upgrade. Migrations run automatically at startup. The v2 importer is a one-time operation; check its help before use:
+Back up the database before upgrading. Migrations run automatically at startup; do not run an older
+bot against a migrated database. The v2 importer is a one-time, all-or-nothing operation:
 
 ```powershell
+.\.venv\Scripts\python.exe scripts\import_v2.py --help
+```
+
+```bash
 python scripts/import_v2.py --help
 ```
 
-Do not run an older bot against a database after its schema has been upgraded. Card transfers are verified by a human; this bot has no payment gateway and cannot reverse a charge after transcript delivery.
+There is no payment gateway: a human verifies each transfer, and a charge cannot be reversed after
+the transcript has been delivered.

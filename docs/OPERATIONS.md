@@ -2,35 +2,76 @@
 
 ## Start and stop
 
-**Windows PowerShell:** run the bot in a console and stop it with `Ctrl+C`.
+**Windows PowerShell** — run in a console, stop with **Ctrl+C**:
 
 ```powershell
 .\.venv\Scripts\python.exe -m gamas_bot --check
 .\.venv\Scripts\python.exe -m gamas_bot
 ```
 
-**cPanel:** use the once-per-minute Cron Jobs watchdog in [Deploy on cPanel](DEPLOY_CPANEL.md). It starts one process per Telegram session. Do not run another copy with the same token/session.
+**cPanel** — the once-per-minute cron watchdog in [Deploy on cPanel](DEPLOY_CPANEL.md) keeps the
+bot running. Start it manually once to test:
 
-## Health and logs
-
-```powershell
+```bash
+. .venv/bin/activate
 python -m gamas_bot --check
-python -m gamas_bot.media_worker check
+python -m gamas_bot
 ```
 
-On the cPanel server, also run `python -m scripts.cpanel_preflight`. The bot logs to `LOG_FILE` when configured; otherwise it writes to standard output. The cPanel launcher stores logs in `data/logs/bot.log` and startup errors in `data/logs/launcher.err`.
+Stop a background instance by the PID in its lock file (never with a broad `pkill` pattern):
 
-Use the job reference (`GMS-#####`) to find related log lines. Logs do not need transcripts, receipt images or API keys; do not attach those to support requests.
+```bash
+PID="$(cat data/gamas.lock 2>/dev/null)"
+ps -p "$PID" >/dev/null 2>&1 && kill "$PID"
+```
 
-## Update safely
+Pause the cron job while updating or stopping, otherwise it restarts the bot within a minute.
 
-1. Stop the bot and back up `.env`, the database, Telegram session and receipts.
-2. Update the source and install dependencies: `python -m pip install -r requirements.txt`.
+Only one process may use a Telegram session. The instance lock enforces this; a second copy exits
+instead of competing.
+
+## Logs and health
+
+```bash
+python -m gamas_bot --check                 # settings + dependencies
+python -m gamas_bot.media_worker check      # PyAV + ppt2pptx
+python -m scripts.cpanel_preflight          # full host check (cPanel)
+```
+
+Logs go to **stdout** unless `LOG_FILE` is set. The cPanel launcher sets `LOG_FILE` to
+`data/logs/bot.log` when it is empty and writes start-up errors to `data/logs/launcher.err`.
+Use the `GMS-#####` job reference to find log lines. Never attach transcripts, receipt images or
+API keys to support requests.
+
+## Update
+
+1. Pause the cron job, stop the bot, and back up (see below).
+2. Update source and dependencies: `git pull`, then `python -m pip install -r requirements.txt`.
 3. Run `python -m gamas_bot --check`.
-4. Start the bot again. Database migrations run at startup; do not run an older version against a database after it has been migrated.
+4. Re-enable the cron job or start the bot. Migrations run at startup.
 
-For cPanel, make sure the cron job does not start the bot during the update. See [Billing](BILLING.md) before migrating old databases.
+Do not run an older version against a database that has already been migrated.
 
-## Backups and capacity
+## Backups
 
-Transcript retention (`TRANSCRIPT_RETENTION_DAYS`, default `0` = keep forever) deletes the stored text of finished jobs older than the window, in bounded batches once a day, writing `transcript_expired` to the audit log (admin `0`). Pending and processing rows are never touched: that row is the only copy of work still being delivered. The receipt and transcript sweeps run at startup as well as daily, so a frequently restarted bot still expires data. Receipt retention (`RECEIPT_RETENTION_DAYS`) deletes the image **and** clears the reference on the payment record, writing `receipt_expired` to the audit log; a cleared reference means the picture is gone by policy, not that an approval is missing. Keep backups encrypted and outside the web root and Git. Stop the bot before copying the SQLite database, or use a SQLite-aware backup so WAL data is included. Shared hosting should use `MAX_ACTIVE_JOBS=1`, a short queue and upload/temp limits that fit the account. If the host kills the process or lacks disk/RAM, move to a VPS; cron cannot bypass provider limits.
+Back up these files after stopping the bot:
+
+- `.env`
+- `data/gamas_v3.db` (use a SQLite-aware backup if the bot is running, so WAL data is included)
+- `data/gamas.session`
+- `data/receipts/`
+
+Keep backups encrypted, outside `public_html` and out of Git.
+
+## Retention and disk
+
+- `RECEIPT_RETENTION_DAYS` (default `90`) deletes old receipt images and clears the payment
+  reference, writing `receipt_expired` to the audit log.
+- `TRANSCRIPT_RETENTION_DAYS` (default `0` = forever) deletes stored text of **finished** jobs
+  (`done`, `partial`, `failed`, `rejected`) in bounded daily batches and logs
+  `transcript_expired`. Pending/processing rows are never touched.
+- Startup removes stale temporary work directories. Temporary job folders are deleted when the
+  job ends.
+
+Shared hosting: keep `MAX_ACTIVE_JOBS=1`, a short queue and conservative file/temp limits. If the
+host kills the process or runs out of RAM/disk, move to a VPS; cron cannot bypass account limits.

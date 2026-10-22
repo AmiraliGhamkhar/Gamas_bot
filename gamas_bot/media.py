@@ -39,7 +39,7 @@ WAV_SAMPLE_RATE = 16000
 #: 2-vCPU host with ``python -m scripts.perf_bench audio`` (824x for PCM,
 #: 355x for Opus at the shipped flags). The values are deliberately derated:
 #: they only have to rank WAV against Opus, and an optimistic constant would
-#: pick the slower format. See docs/PERFORMANCE_PLAN.md §1.1.
+#: pick the slower format. See docs/PERFORMANCE.md.
 WAV_ENCODE_SPEED = 600.0
 OPUS_ENCODE_SPEED = 300.0
 

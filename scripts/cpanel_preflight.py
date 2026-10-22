@@ -27,6 +27,9 @@ sys.path.insert(0, str(ROOT))
 
 MIN_PYTHON = (3, 11)
 MIN_FREE_BYTES = 3 * 1024**3
+#: Directory names cPanel/Apache commonly serve. The project, receipts, logs
+#: and the database must live outside every one of them.
+WEB_ROOTS = frozenset({"public_html", "www", "htdocs", "httpdocs", "public_ftp"})
 #: One address per Telegram data center is enough to prove outbound MTProto works.
 TELEGRAM_PROBES = (("149.154.167.51", 443), ("149.154.175.53", 443))
 REQUIRED_PACKAGES = (
@@ -91,8 +94,7 @@ def check_packages() -> list[Result]:
 def check_private_receipt_directory(directory: Path) -> Result:
     """Ensure receipt files cannot be served from a web root or read by others."""
     path = directory.resolve()
-    web_roots = {"public_html", "www", "htdocs", "httpdocs"}
-    if any(part.lower() in web_roots for part in path.parts):
+    if any(part.lower() in WEB_ROOTS for part in path.parts):
         return Result(
             "FAIL", "Private receipt directory",
             f"{path} is inside a web document root; choose a private path outside it.",
@@ -118,7 +120,7 @@ def check_private_receipt_directory(directory: Path) -> Result:
 
 def check_location(root: Path = ROOT) -> Result:
     parts = {part.lower() for part in root.parts}
-    if "public_html" in parts or "www" in parts:
+    if parts & WEB_ROOTS:
         return Result(
             "FAIL", "Project location",
             f"{root} is inside the web root: .env, the database and the Telegram "
@@ -180,9 +182,19 @@ def check_settings() -> tuple[list[Result], object | None]:
     except ValueError as exc:
         results.append(Result("FAIL", "Configuration", str(exc)))
         return results, None
-    results.append(Result("PASS", "Configuration", "required settings are present and valid"))
-    if not settings.admin_ids:
-        results.append(Result("WARN", "ADMIN_IDS", "no administrator is configured"))
+    # ``from_env`` only parses values; ``config.check`` is the validation the
+    # bot itself runs at startup (``python -m gamas_bot --check``). Calling it
+    # here is what makes "the preflight checks the configuration" true, instead
+    # of reporting PASS for a deployment the bot would refuse to start.
+    from gamas_bot.config import check, is_advisory
+
+    problems = check(settings)
+    for problem in problems:
+        results.append(
+            Result("WARN" if is_advisory(problem) else "FAIL", "Configuration", problem)
+        )
+    if not problems:
+        results.append(Result("PASS", "Configuration", "no configuration problems"))
     if settings.max_active_jobs > 1:
         results.append(
             Result(
@@ -209,6 +221,7 @@ def check_stt_queue(settings) -> list[Result]:
         )
     return results
 
+
 def tcp_reachable(host: str, port: int, timeout: float = 6.0) -> str | None:
     """None when a TCP connection succeeds, otherwise the error text."""
     try:
@@ -222,28 +235,27 @@ def check_network(settings) -> list[Result]:
     from gamas_bot.config import note_routes
 
     results = []
-    if True:
-        probes = [(host, port, tcp_reachable(host, port)) for host, port in TELEGRAM_PROBES]
-        failures = [f"{host}:{port} ({error})" for host, port, error in probes if error is not None]
-        if len(failures) == len(TELEGRAM_PROBES):
-            results.append(
-                Result(
-                    "FAIL", "Telegram connectivity",
-                    "cannot open outbound TCP 443 to Telegram: " + "; ".join(failures)
-                    + ". Ask the host to allow it; this build has no proxy "
-                    "setting (TELEGRAM_PROXY was removed in v3).",
-                )
+    probes = [(host, port, tcp_reachable(host, port)) for host, port in TELEGRAM_PROBES]
+    failures = [f"{host}:{port} ({error})" for host, port, error in probes if error is not None]
+    if len(failures) == len(TELEGRAM_PROBES):
+        results.append(
+            Result(
+                "FAIL", "Telegram connectivity",
+                "cannot open outbound TCP 443 to Telegram: " + "; ".join(failures)
+                + ". Ask the host to allow it; this build has no proxy "
+                "setting (TELEGRAM_PROXY was removed in v3).",
             )
-        else:
-            results.append(Result("PASS", "Telegram connectivity", "MTProto servers reachable"))
+        )
+    else:
+        results.append(Result("PASS", "Telegram connectivity", "MTProto servers reachable"))
     hosts: list[tuple[str, str]] = []
     if settings is not None:
         if settings.speechmatics_api_key:
             hosts.append(("Speechmatics", settings.speechmatics_base_url))
         if settings.deepgram_api_key:
             hosts.append(("Deepgram", "https://api.deepgram.com"))
-        if settings.stt_openai_base_url or '':
-            hosts.append(("OpenAI-compatible STT", settings.stt_openai_base_url or ''))
+        if settings.stt_openai_api_key and settings.stt_openai_base_url:
+            hosts.append(("OpenAI-compatible STT", settings.stt_openai_base_url))
         # Probe exactly the note providers this deployment will call, in the
         # order it will call them (the configured chain — see
         # ``gamas_bot.config.note_routes``), not a guessed default host.

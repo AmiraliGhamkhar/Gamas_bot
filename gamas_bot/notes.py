@@ -2861,12 +2861,18 @@ async def structure_document(
         raise StructuringError("متن ورودی خالی بود.")
     semaphore = _note_semaphore(settings, len(chunks))
 
-    if len(chunks) == 1:
+    async def finish_single(chars_used: int) -> StructuredNotes:
+        """One chunk: a single note request, then the evidence gate.
+
+        Shared by both sizing passes so the short-lecture path cannot drift
+        between the first split and the re-split that reserves the orientation
+        context.
+        """
         logger.info(
             "note document sizing kind=%s chars=%d chunk_chars=%d chunks=1 context_digest=false",
             "presentation" if presentation else "transcript",
             len(document),
-            chunk_chars,
+            chars_used,
         )
         single = await _structure_piece(
             session, settings, chunks[0],
@@ -2881,6 +2887,9 @@ async def structure_document(
                 mode=resolved_mode, presentation=presentation, semaphore=semaphore,
             )
         )[0]
+
+    if len(chunks) == 1:
+        return await finish_single(chunk_chars)
 
     # A chunked request also carries the topic digest and the neighbour windows.
     # Reserve their worst-case size when it fits; for a narrow model window,
@@ -2901,25 +2910,7 @@ async def structure_document(
         )
     semaphore = _note_semaphore(settings, len(chunks))
     if len(chunks) == 1:
-        logger.info(
-            "note document sizing kind=%s chars=%d chunk_chars=%d chunks=1 context_digest=false",
-            "presentation" if presentation else "transcript",
-            len(document),
-            contextual_chunk_chars,
-        )
-        single = await _structure_piece(
-            session, settings, chunks[0],
-            system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
-            presentation=presentation,
-        )
-        if not settings.note_strict_grounding:
-            return single
-        return (
-            await _audit_and_repair(
-                single, document, settings, session,
-                mode=resolved_mode, presentation=presentation, semaphore=semaphore,
-            )
-        )[0]
+        return await finish_single(contextual_chunk_chars)
 
     context = build_context(chunks) if include_context else LectureContext()
     logger.info(

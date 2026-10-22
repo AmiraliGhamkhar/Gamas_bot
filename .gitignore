@@ -11,7 +11,6 @@ data/
 *.sqlite3
 *.db
 *.log
-stt-benchmark.csv
 .pytest_cache/
 .coverage
 
@@ -22,7 +21,7 @@ stt-benchmark.csv
 *.session-*
 .ruff_cache/
 
-# Rendered page images from scripts/render_docx_pages.py (visual inspection only)
+# Rendered page images from local visual inspection (not produced by the bot).
 .render/
 
 # Static type checker cache (mypy)

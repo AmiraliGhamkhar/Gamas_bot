@@ -1,17 +1,18 @@
-# Configuration for Windows and cPanel
+# Configuration
 
-`.env.example` is the full settings list. Copy it to `.env`, fill the required values and leave optional settings commented unless you need them. Keep `.env` private; never commit or send it to support.
+`.env.example` lists every setting with its default. Copy it to `.env`, fill the required values,
+leave the rest as shipped unless you have a reason to change them. Keep `.env` private.
 
 ## Create `.env`
 
-**Windows PowerShell** (from the repository folder):
+**Windows PowerShell**
 
 ```powershell
 Copy-Item .env.example .env
 notepad .env
 ```
 
-**cPanel Terminal** (from the project folder, outside `public_html`):
+**cPanel Terminal**
 
 ```bash
 cp .env.example .env
@@ -22,58 +23,58 @@ nano .env
 ## Required values
 
 ```dotenv
-TELEGRAM_BOT_TOKEN=your_bot_token
-TELEGRAM_API_ID=your_api_id
-TELEGRAM_API_HASH=your_api_hash
-ADMIN_IDS=123456789
-SPEECHMATICS_API_KEY=your_stt_key
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_API_ID=12345
+TELEGRAM_API_HASH=...
+ADMIN_IDS=111111111,222222222
+SPEECHMATICS_API_KEY=...       # or DEEPGRAM_API_KEY, or the STT_OPENAI_* trio
 ```
 
-Use a real numeric Telegram user ID for each admin, separated by commas. Configure one STT key whose provider appears in `STT_PROVIDERS`. Add note-provider keys (for example `GEMINI_API_KEY`, `NARA_API_KEY`, `OPENROUTER_API_KEY`, `GROQ_API_KEY` or `CEREBRAS_API_KEY`) to get structured booklets; without them, the bot still returns raw transcripts.
+`ADMIN_IDS` are numeric Telegram user IDs. A process environment variable overrides `.env`;
+otherwise the built-in default applies. Relative paths resolve from the project directory, so a
+cron job cannot create a second database or session.
 
-## Useful settings
+## Settings that matter most
 
 | Setting | What to do |
 | --- | --- |
-| `STT_PROVIDERS`, `STT_LANGUAGE` | Choose failover order and language; Persian defaults to `fa`. Order *is* latency policy: the first provider with a key is the one that runs, so the default leads with `deepgram` and keeps `speechmatics` as the fallback. See [STT providers](STT_PROVIDERS.md). |
-| `NOTE_PROVIDERS` | Set note-provider order. Each provider needs its own key. See [Note providers](PROVIDERS.md). |
-| `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS` | On cPanel, start with `1` active job and a small queue. |
-| `MAX_ACTIVE_JOBS_PER_USER` | Per-user admission cap (default `2`). Lower it to stop one user from queueing work their balance cannot cover. |
-| `OFFICE_MIN_INTERVAL_SECONDS` | Minimum gap between two Free Office documents for one user (default `10`; `0` disables). The section is free but may call the note model. |
-| `MAX_FILE_SIZE` | Lower it to fit the host's upload and temporary-disk limits. |
-| `TEMP_MIN_FREE_BYTES`, `DOWNLOAD_STALL_SECONDS` | Free space that must remain on `TEMP_DIR` before a download (default `2 GiB`) and the no-progress window that aborts a stalled download (default `300`). See [Media](MEDIA.md). |
-| `STT_TRANSFER_TIMEOUT_SECONDS`, `MAX_STT_RESPONSE_BYTES` | Deadline of one provider transfer (default `600`) and the response-body ceiling (default `64 MiB`). See [STT providers](STT_PROVIDERS.md). |
-| `RAW_FALLBACK_FILE_CHARS`, `RAW_FALLBACK_MAX_FILES` | Size of one raw-transcript file part (default `100 000` characters) and the maximum number of parts (default `8`) used when the single `.txt` upload fails. |
-| `TRANSCRIPT_RETENTION_DAYS` | Days to keep a finished transcript's text (`0` = keep forever). The daily sweep only deletes rows of `done`/`failed`/`rejected` jobs. |
-| `PRESENTATION_MAX_TEMP_BYTES` | Keep it below the available scratch-disk space. |
-| `DB_PATH`, `TELEGRAM_SESSION`, `TEMP_DIR`, `RECEIPT_DIR`, `LOG_FILE` | Relative paths resolve from the project directory, not the current shell directory. Keep data outside `public_html`. |
-| `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME` | Set these to enable card-to-card purchases. Admins review receipts manually. |
-| `NOTE_MAX_OUTPUT_TOKENS` | Measure real `output_tokens` p95 from the Phase 0 usage logs (with `ttfb_ms`/`elapsed_ms`) over at least one week, then set cap = p95 + 15% margin (example: 16384 → 8192). Never cut below observed p95 — booklet truncation risk. |
-| `NOTE_JSON_MODE` | Enable `true` only when the configured OpenRouter model documents `json_object`; the code already never sends it to Nara. |
-| `NOTE_REASONING_EFFORT` | If used, start at `low` (never `minimal` first) and A/B against the quality-gate report before keeping it; only Nara, OpenRouter, Groq and Cerebras accept it (never the generic slot or Gemini); on gpt-oss it also keeps hidden reasoning from eating output tokens. |
-| `NOTE_CONCURRENCY` | Default `6`. The map phase never starts more requests than there are chunks (capped at `8`), so a short lecture is unaffected; lower it to `2`–`3` when the provider has a low requests-per-minute quota (free Groq, shared gateways). |
-| `NOTE_STRUCTURED_OUTPUT` | Default `1`: the note request carries a `responseSchema` (Gemini) or `json_schema` (OpenAI-compatible) so the provider cannot answer with prose. A provider that rejects the field drops it and the same request is retried once, so an unsupported gateway costs at most one extra request. Set `0` to send the shape in the prompt only (سرویسِ داخلی را برای این حالت A/B کنید). |
-| `NOTE_OPENROUTER_THROUGHPUT` | Default `1`: OpenRouter requests carry `provider.sort=throughput` instead of the router's price-weighted default. Only the OpenRouter route is affected, and it can pick a pricier upstream — set `0` when cost dominates. |
-| `NOTE_PROGRESSIVE_BOOKLET` | Default `1`: the audited merge is delivered as a draft Word file («نسخهٔ نخست») while the editorial compile runs; the compiled booklet is then delivered as usual. The draft is skipped when the compile will not run (`NOTE_COMPILE=false`, a merge below the compile floor, or no room for it), because the final file would then be identical. Set `0` to deliver one file only. |
-| `NOTE_COMPILE_PROVIDER` | Slug of the note provider that should serve the editorial compile first (`gemini`, `nara`, `openrouter`, `groq`, `cerebras`, `openai_compatible`); empty keeps `NOTE_PROVIDERS` order, and the other providers remain fallbacks. |
-| `AUDIO_FORMAT_POLICY`, `TELEGRAM_DOWNLOAD_CONNECTIONS` | Container policy for the prepared STT audio (`auto`/`wav`/`opus`) and the number of concurrent range downloads of one Telegram file (default `1`). See [Media](MEDIA.md). |
-| `STT_STATUS_LONG_POLL` | Seconds of Speechmatics long-poll requested per call (default `25`, `0` disables). See [STT providers](STT_PROVIDERS.md). |
-| `NOTE_REQUEST_TIMEOUT_SECONDS` | Re-derive after any token-cap change: it must remain greater than the time to generate `NOTE_MAX_OUTPUT_TOKENS` on the slowest configured model. |
-| `LLM_CONNECTOR_LIMIT`, `LLM_CONNECTOR_LIMIT_PER_HOST`, `LLM_CONNECTOR_TTL_DNS_CACHE`, `LLM_CONNECTOR_KEEPALIVE` | Shared HTTP connector pool sizing (defaults `32`/`8`/`300`/`300`). |
-| `LLM_PREWARM` | Default `true`: quota-free concurrent `HEAD` requests to the first note provider's host and the first STT provider's host when the shared session is created, so the first real request skips DNS/TLS connection setup. Errors are ignored. |
-| `NOTE_TTFB_TIMEOUT_SECONDS` | Default `25`: streaming first-byte guard for OpenAI-style and Gemini routes. A silent provider is abandoned after this many seconds and the chain fails over, instead of waiting out the whole request timeout. `0` turns streaming off and restores plain blocking requests; see [Note providers](PROVIDERS.md). |
-| `NOTE_HEDGE_AFTER_SECONDS` | Default `60`: if the first provider has not finished after this delay, the second starts in parallel and the first answer wins; at most one extra in-flight POST per call, so it can spend extra quota. Needs two configured note providers to do anything. `0` off. |
-| `OFFICE_AI_CONCURRENCY` | Default `3`: how many deck-planning chunks may be planned concurrently (chunk order is preserved). |
+| `STT_PROVIDERS` | Ordered failover list; the first provider **with a key** serves every job. Default `deepgram,speechmatics,openai_compatible`. |
+| `STT_LANGUAGE` | Persian default `fa`. Deepgram requires `DEEPGRAM_MODEL=nova-3` for Persian. |
+| `NOTE_PROVIDERS` | Ordered note routes. Providers without their own key are skipped. See [Note providers](PROVIDERS.md). |
+| `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS` | Concurrency and queue. On cPanel start with `1` and a small queue. |
+| `MAX_ACTIVE_JOBS_PER_USER` | Per-user admission cap (default `2`); stops several uploads the balance cannot cover. |
+| `MAX_FILE_SIZE` | Download ceiling (default 2 GiB). Lower it to fit host disk/upload limits. |
+| `TEMP_MIN_FREE_BYTES` | Free space that must remain on `TEMP_DIR` before a download (default 2 GiB). |
+| `DOWNLOAD_STALL_SECONDS` | Abort a Telegram download with no progress for this long (default `300`). |
+| `MEDIA_WORKER_CONCURRENCY` | Heavy media jobs at once. Use `1` on shared hosting. |
+| `AUDIO_FORMAT_POLICY` | `auto` (default) picks WAV or Opus from encoder CPU + measured transfer rate; `wav`/`opus` force one. |
+| `STT_TRANSFER_TIMEOUT_SECONDS`, `MAX_STT_RESPONSE_BYTES` | One transfer deadline (default `600`) and response ceiling (default 64 MiB). |
+| `NOTE_MAX_OUTPUT_TOKENS`, `NOTE_REQUEST_TIMEOUT_SECONDS` | Output budget (default 16384) and request deadline (default 900). Keep the deadline longer than the time the budget needs on the slowest model. |
+| `NOTE_CONCURRENCY` | Parallel map requests (default `6`, capped at chunks and 8). Lower it for low-RPM providers. |
+| `NOTE_STRUCTURED_OUTPUT` | `1` asks for schema-constrained JSON; a provider that rejects it is retried once without it. |
+| `NOTE_PROGRESSIVE_BOOKLET` | `1` delivers the audited merge as a draft while the editorial compile runs. |
+| `NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE` | Evidence checks (`true`/`repair` by default). See [Note quality](NOTE_QUALITY.md). |
+| `RAW_FALLBACK_FILE_CHARS`, `RAW_FALLBACK_MAX_FILES` | Part size and count when a long raw `.txt` upload fails. |
+| `OFFICE_ENABLED`, `OFFICE_MAX_CHARS`, `OFFICE_MIN_INTERVAL_SECONDS` | Free Office on/off, document limit and per-user throttle. |
+| `PRESENTATION_MAX_*` | Deck clip/duration/unpacked/temp limits. |
+| `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME` | Set all three to enable card-to-card purchases. |
+| `RECEIPT_RETENTION_DAYS` | Delete receipt images after this many days (default `90`); the payment row remains. |
+| `TRANSCRIPT_RETENTION_DAYS` | Delete finished transcript text after this many days (`0` = keep forever). |
+| `DB_PATH`, `TELEGRAM_SESSION`, `TEMP_DIR`, `RECEIPT_DIR`, `LOG_FILE` | Keep all of them outside `public_html`. |
 
-On a VPS only, event-loop speed can optionally come from uvloop: `pip install uvloop` and run with `UVLOOP=1` handled by your own service wrapper. It is deliberately **not** a project dependency, nothing imports it by default, and the default (off) behaviour is unchanged without it.
-
-## Precedence and checks
-
-A real process environment variable overrides `.env`; otherwise the built-in default is used. Run this after editing configuration:
+## Validate
 
 ```powershell
 # Windows PowerShell
 .\.venv\Scripts\python.exe -m gamas_bot --check
 ```
 
-On cPanel, activate the virtual environment first, then run `python -m gamas_bot --check` and `python -m scripts.cpanel_preflight`. The first check is offline; the preflight tests the host's OS, disk, permissions and outbound network. See [.env.example](../.env.example) for every supported setting and default.
+```bash
+# cPanel Terminal (virtualenv active)
+python -m gamas_bot --check
+python -m scripts.cpanel_preflight
+```
+
+`--check` is offline and safe while the bot is running. The preflight also checks the host: OS,
+disk, permissions, lock, Telegram and provider connectivity. It reports `FAIL` for problems that
+would stop the bot and `WARN` for advisory ones.

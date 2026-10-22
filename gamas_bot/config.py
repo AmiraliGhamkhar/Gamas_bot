@@ -6,9 +6,8 @@ runtime (``load_dotenv`` is applied once, here).
 
 Design rules:
 
-* **One settings dataclass, not ~194 knobs.** Anything that existed only to
-  support the deleted provider platforms (routes, registries, quotas,
-  credentials) is gone.
+* **One settings dataclass.** Anything that existed only to support the deleted
+  provider platforms (routes, registries, quotas, credentials) is gone.
 * Provider order *is* failover policy: ``STT_PROVIDERS=speechmatics,deepgram``
   means "try Speechmatics, then Deepgram".
 * Relative paths are anchored to the project directory, so a cron job or a
@@ -1248,7 +1247,16 @@ def check(settings: Settings) -> list[str]:
         problems.append("TELEGRAM_API_ID is not a positive number.")
     if not settings.api_hash:
         problems.append("TELEGRAM_API_HASH is not set.")
-    if not settings.stt_configured:
+    if not settings.stt_providers:
+        # ``_parse_provider_order`` drops unknown slugs, so a typo can empty the
+        # list while every key is still set. ``stt.transcribe`` then refuses
+        # every upload; report the real mistake instead of claiming no key is
+        # configured.
+        problems.append(
+            "STT_PROVIDERS contains no known provider (known: "
+            f"{', '.join(STT_PROVIDER_ORDER)}); every upload would fail."
+        )
+    elif not settings.stt_configured:
         problems.append(
             "No speech-to-text provider is configured: set SPEECHMATICS_API_KEY, "
             "DEEPGRAM_API_KEY, or STT_OPENAI_BASE_URL + STT_OPENAI_API_KEY."

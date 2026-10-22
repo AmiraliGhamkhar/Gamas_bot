@@ -37,7 +37,7 @@ from gamas_bot.office import (
     office_title_from_filename,
     read_text_file,
 )
-from gamas_bot.office_ai import infer_table, plan_deck
+from gamas_bot.office_ai import _chunk_long_text, infer_table, plan_deck
 from gamas_bot.mdblocks import heading_level, parse_blocks
 from tests.support import (
     FakeCallbackEvent,
@@ -400,6 +400,20 @@ class _FakeResponse:
 
     async def read(self):
         return b"{}"
+
+
+class DeckChunkingTests(unittest.TestCase):
+    def test_oversized_section_is_not_appended_to_the_previous_chunk(self):
+        first = "# بخش الف\nیک سطر کوتاه"
+        second = "# بخش ب\n" + "\n".join(
+            f"line {index} " + "x" * 80 for index in range(60)
+        )
+        chunks = _chunk_long_text(first + "\n" + second, max_chars=500)
+
+        self.assertTrue(all(len(chunk) <= 500 for chunk in chunks), chunks)
+        # The short section stays byte-identical: its text must never absorb
+        # lines from the following (oversized) section.
+        self.assertEqual(chunks[0], first)
 
 
 class ModelValidationTests(unittest.IsolatedAsyncioTestCase):

@@ -113,14 +113,13 @@ def _ordered_source_lines(candidate: list[str], source: str) -> list[str]:
 
 
 def _split_text_by_headings(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) -> list[str]:
-    """Split long text at Markdown headings; fall back to paragraph chunks."""
+    """Split long text at Markdown headings and, at ``max_chars``, by length."""
     chunks: list[str] = []
     current_lines: list[str] = []
     current_len = 0
-    current_heading: str | None = None
 
     def flush() -> None:
-        nonlocal current_lines, current_len, current_heading
+        nonlocal current_lines, current_len
         if current_lines:
             chunk_text = "\n".join(current_lines).strip()
             if chunk_text:
@@ -130,22 +129,13 @@ def _split_text_by_headings(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) ->
 
     for line in text.splitlines():
         stripped = line.strip()
-        is_heading = HEADING_PATTERN.match(stripped) is not None
-        if is_heading:
-            current_heading = stripped
+        if HEADING_PATTERN.match(stripped) is not None:
             # Start a new chunk at each heading to keep slide structure intact.
             flush()
         current_lines.append(stripped)
         current_len += len(stripped) + 1
         if current_len >= max_chars:
             flush()
-            # When splitting due to length (not a new heading), preserve
-            # the current heading context in the new chunk.
-            if current_heading is not None and current_heading not in (current_lines or []):
-                pass  # The heading will stay with the previous chunk; next chunk
-                # continues with remaining content. This is acceptable because
-                # the model will process the section in two parts with the same
-                # structure.
     flush()
     return [chunk for chunk in chunks if chunk.strip()]
 
@@ -166,16 +156,19 @@ def _chunk_long_text(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) -> list[s
         if len(chunk) <= max_chars:
             result.append(chunk)
             continue
+        # Build sub-chunks *within* this chunk. Appending to ``result[-1]``
+        # would glue the start of an oversized section onto the previous
+        # section and hand the model a chunk that no longer matches its heading.
+        sub_chunks: list[str] = []
         for sub_line in chunk.splitlines():
             sub_stripped = sub_line.strip()
             if not sub_stripped:
                 continue
-            # Build sub-chunks from lines, keeping paragraphs together where
-            # possible but never exceeding max_chars.
-            if not result or len(result[-1]) + len(sub_stripped) + 1 > max_chars:
-                result.append(sub_stripped)
+            if not sub_chunks or len(sub_chunks[-1]) + len(sub_stripped) + 1 > max_chars:
+                sub_chunks.append(sub_stripped)
             else:
-                result[-1] += "\n" + sub_stripped
+                sub_chunks[-1] += "\n" + sub_stripped
+        result.extend(sub_chunks)
     return [c for c in result if c.strip()]
 
 
