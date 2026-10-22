@@ -144,12 +144,13 @@ tail -n 80 data/logs/bot.log
 
 Smoke test after the first start (use an admin account and a small test order):
 
-1. `/start` shows «💳 خرید اشتراک», «🧾 پرداخت‌های من» and «🎧 پشتیبانی».
-2. Create a ticket from «🎧 پشتیبانی», then reply to it from «🎧 مدیریت پشتیبانی». Confirm both
-   notifications and that the history remains after `/start`.
-3. Create an order, send a receipt, and open it from «💳 پرداخت‌های در انتظار». The first approval
-   tap must only show confirmation; «✅ تأیید نهایی» activates credit. A repeated tap must not change
-   the balance. Reject another test order and verify its reason reaches the user without credit.
+1. `/start` shows «🎙️ تبدیل صدا به متن», «📝 ساخت جزوه», «💳 خرید اشتراک», «🧾 پرداخت‌های من» and «🎧 پشتیبانی».
+2. Create a ticket from «🎧 پشتیبانی», filter it under «🎧 مدیریت پشتیبانی» (`📂 جدید` + category),
+   and reply to it. Confirm both notifications and that the history remains after `/start` and restart.
+3. Create an order, send a receipt directly (photo or PNG/JPEG/WebP file), and open it from
+   «💳 پرداخت‌های در انتظار». The first approval tap must only show confirmation; «✅ تأیید نهایی»
+   activates credit once. Reject another test order (preset or custom reason) and verify its reason
+   reaches the user without granting credit.
 
 **Rollback.** Pause cron and stop the bot. Set `BACKUP_DIR` to the actual pre-upgrade directory,
 move the current database aside (do not delete it), restore the matching backup, and only then start

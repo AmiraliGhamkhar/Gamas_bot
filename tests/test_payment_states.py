@@ -184,3 +184,64 @@ class PaymentMigrationTests(unittest.IsolatedAsyncioTestCase):
                 )
             finally:
                 await db.close()
+
+    async def test_payment_triggers_guard_statuses_and_allow_receipt_cleanup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            db = Database(Path(temp) / "triggers.db")
+            await db.connect()
+            try:
+                await db.ensure_user(100)
+                await db.db.execute(
+                    "INSERT INTO plans(code, hours, price, validity_days) "
+                    "VALUES ('paid_25h_30d', 25, 150000, 30)"
+                )
+                await db.db.commit()
+
+                # Invalid status on INSERT is rejected at SQLite trigger level.
+                with self.assertRaises(sqlite3.IntegrityError):
+                    await db.db.execute(
+                        "INSERT INTO payments(user_id, plan_code, status, created_at) "
+                        "VALUES (100, 'paid_25h_30d', 'bogus_status', '2026-01-01')"
+                    )
+
+                pid = await db.create_payment(100, "paid_25h_30d")
+
+                # Approving without a receipt is rejected even on raw SQL UPDATE.
+                with self.assertRaises(sqlite3.IntegrityError):
+                    await db.db.execute(
+                        "UPDATE payments SET status = 'approved' WHERE payment_id = ?",
+                        (pid,),
+                    )
+
+                # Once receipt is attached, raw cancellation is rejected.
+                await db.set_payment_receipt(pid, "receipt-1.jpg", user_id=100)
+                with self.assertRaises(sqlite3.IntegrityError):
+                    await db.db.execute(
+                        "UPDATE payments SET status = 'cancelled' WHERE payment_id = ?",
+                        (pid,),
+                    )
+
+                # Concurrent review race across multiple admins activates credit once.
+                results = await asyncio.gather(
+                    db.review_payment(pid, True, admin_id=1),
+                    db.review_payment(pid, True, admin_id=2),
+                    db.review_payment(pid, False, admin_id=2, reason="concurrent reject"),
+                )
+                self.assertEqual(results.count(True), 1)
+                self.assertEqual((await db.payment(pid))["status"], "approved")
+                self.assertEqual(await db.available_seconds(100), 25 * 3600)
+
+                # Mutating terminal status is rejected at SQLite trigger level.
+                with self.assertRaises(sqlite3.IntegrityError):
+                    await db.db.execute(
+                        "UPDATE payments SET status = 'rejected' WHERE payment_id = ?",
+                        (pid,),
+                    )
+
+                # Retention cleanup (forget_receipts) is permitted on terminal rows.
+                cleared = await db.forget_receipts(["receipt-1.jpg"])
+                self.assertEqual(cleared, 1)
+                self.assertIsNone((await db.payment(pid))["receipt_path"])
+            finally:
+                await db.close()
+

@@ -213,11 +213,27 @@ SUPPORT_STATUS_LABELS = {
 }
 VIEW_LABELS = {
     "active": "🆕 فعال",
+    "open": "📂 جدید",
     "wait": "⏳ منتظر پاسخ",
     "user": "💬 منتظر کاربر",
     "closed": "✅ بسته‌شده",
 }
-CATEGORY_FILTER_LABELS = {"all": "همه", **SUPPORT_CATEGORY_BUTTONS}
+CATEGORY_FILTER_LABELS = {"all": "همه دسته‌ها", **SUPPORT_CATEGORY_BUTTONS}
+_PERSIAN_CHAR_RE = re.compile(r"[\u0600-\u06FF]")
+_SECRET_TOKEN_RE = re.compile(r"(?i)\b(?:bearer\s+\S+|sk-[A-Za-z0-9_-]{8,})")
+
+
+def _safe_user_error_text(exc: BaseException, fallback: str) -> str:
+    """Return a clean, single-block Persian error without raw traces or secrets."""
+    raw = str(exc or "").strip()
+    if (
+        not raw
+        or "Traceback (most recent call last)" in raw
+        or not _PERSIAN_CHAR_RE.search(raw)
+    ):
+        return fallback
+    cleaned = _SECRET_TOKEN_RE.sub("[حذف شد]", raw)
+    return cleaned[:400]
 
 
 def _to_int(raw: str) -> int | None:
@@ -752,18 +768,25 @@ def is_pending_payment_review(payment: dict) -> bool:
     )
 
 
+RECEIPT_IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+
+
 def _is_receipt_image(message) -> bool:
     """Accept Telegram photos and image documents supported by the normalizer."""
     if getattr(message, "sticker", None) is not None or getattr(message, "gif", None) is not None:
         return False
-    mime = (getattr(getattr(message, "file", None), "mime_type", "") or "").lower()
+    file_obj = getattr(message, "file", None)
+    mime = (getattr(file_obj, "mime_type", "") or "").lower()
     if getattr(message, "photo", None) is not None:
-        return mime.startswith("image/")
-    return getattr(message, "document", None) is not None and mime in {
-        "image/jpeg",
-        "image/png",
-        "image/webp",
-    }
+        return mime == "" or mime.startswith("image/")
+    if getattr(message, "document", None) is None:
+        return False
+    if mime in {"image/jpeg", "image/png", "image/webp"}:
+        return True
+    filename = getattr(file_obj, "name", None) or ""
+    return mime in {"", "application/octet-stream"} and (
+        Path(filename).suffix.lower() in RECEIPT_IMAGE_EXTENSIONS
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -785,6 +808,7 @@ class GamasBot:
         self._transcript_cleanup_task: asyncio.Task | None = None
         self._prewarm_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
+        self._stt_only_users: set[int] = set()
         self._pending_broadcast: set[int] = set()
         # user_id -> ("new", category) or ("reply", ticket_id) awaiting the next text.
         self._support_states: dict[int, tuple[str, object]] = {}
@@ -1040,10 +1064,16 @@ class GamasBot:
         Admins get one extra entry row to their own panel; the admin panel
         never replaces this menu, so both panels stay separately reachable.
         """
-        make_label = (
-            "📝 ساخت جزوه" if self.settings.note_configured else "🎙️ تبدیل صدا به متن"
-        )
-        rows = [[Button.inline(make_label, b"make")]]
+        rows: list[list] = []
+        if self.settings.note_configured:
+            rows.append(
+                [
+                    Button.inline("🎙️ تبدیل صدا به متن", b"stt"),
+                    Button.inline("📝 ساخت جزوه", b"make"),
+                ]
+            )
+        else:
+            rows.append([Button.inline("🎙️ تبدیل صدا به متن", b"make")])
         if self.settings.office_enabled:
             rows.append([Button.inline("📄 ساخت سند رایگان", b"office")])
         rows.append([Button.inline("💳 خرید اشتراک", b"buy")])
@@ -1070,17 +1100,20 @@ class GamasBot:
         one tap from any section to any other, and one tap home.
         """
         return [
-            [Button.inline("📊 آمار و وضعیت", b"adm:home")],
             [
+                Button.inline("📊 آمار و وضعیت", b"adm:home"),
                 Button.inline("👥 کاربران", b"adm:users"),
-                Button.inline("🧾 پرداخت‌ها", b"adm:pay"),
+            ],
+            [
+                Button.inline("💳 پرداخت‌های در انتظار", b"adm:pay"),
+                Button.inline("📋 تاریخچه پرداخت‌ها", b"adm:ph:0"),
             ],
             [Button.inline("🎧 مدیریت پشتیبانی", b"adm:sup")],
             [
                 Button.inline("📣 ارسال پیام", b"adm:bcast"),
                 Button.inline("🛡 گزارش فعالیت‌ها", b"adm:audit"),
             ],
-            [Button.inline("🔙 پنل کاربری", b"menu:main")],
+            [Button.inline("↩️ پنل کاربری", b"menu:main")],
         ]
 
     async def _show_main(self, event, *, first_start: bool = False) -> None:
@@ -1093,8 +1126,8 @@ class GamasBot:
         greeting = "به گاماس خوش آمدید." if first_start else "منوی اصلی"
         if self.settings.note_configured:
             introduction = (
-                "برای ساخت جزوه، «📝 ساخت جزوه» را انتخاب کنید و فایل صوتی، ویدیویی یا "
-                "پاورپوینت درس را بفرستید. ابتدا متن گفتار و سپس جزوهٔ ورد ارسال می‌شود.\n"
+                "برای ساخت جزوه، «📝 ساخت جزوه» را انتخاب کنید تا ابتدا متن گفتار و سپس جزوهٔ ورد "
+                "ارسال شود؛ یا برای دریافت متن تنها، «🎙️ تبدیل صدا به متن» را بزنید.\n"
             )
         else:
             introduction = (
@@ -1140,9 +1173,9 @@ class GamasBot:
         """
         text = (
             "📄 ساخت سند رایگان\n\n"
-            "متن خودتان را بفرستید؛ من همان متن را به یک فایل واقعی تبدیل "
-            "می‌کنم — Word، Excel، PowerPoint یا PDF. متن شما عیناً در فایل می‌آید.\n"
-            "رایگان است و از اعتبار شما کم نمی‌کند.\n\n"
+            "متن خود را بفرستید تا به فایل Word، Excel، PowerPoint یا PDF تبدیل شود. "
+            "متن شما عیناً در فایل قرار می‌گیرد.\n"
+            "این بخش رایگان است و از اعتبار شما کم نمی‌کند.\n\n"
             "قالب را انتخاب کنید:"
         )
         if notice:
@@ -1152,7 +1185,7 @@ class GamasBot:
             [Button.inline(f"{FORMAT_EMOJI['excel']} {FORMAT_LABELS['excel']}", b"office:excel")],
             [Button.inline(f"{FORMAT_EMOJI['ppt']} {FORMAT_LABELS['ppt']}", b"office:ppt")],
             [Button.inline(f"{FORMAT_EMOJI['pdf']} {FORMAT_LABELS['pdf']}", b"office:pdf")],
-            [Button.inline("🔙 بازگشت", b"menu:main")],
+            [Button.inline("↩️ بازگشت", b"menu:main")],
         ]
         await self._edit_or_reply(event, text, buttons)
 
@@ -1262,7 +1295,8 @@ class GamasBot:
             if isinstance(reported, int) and reported > self.settings.office_max_input_bytes:
                 await event.reply(
                     "❌ فایل متنی از حد مجاز بزرگ‌تر است "
-                    f"({self.settings.office_max_input_bytes} بایت)."
+                    f"(حداکثر {to_persian_digits(self.settings.office_max_input_bytes // 1024)} کیلوبایت). "
+                    "فایل کوچک‌تری ارسال کنید."
                 )
                 return True
         if not is_text_file:
@@ -1283,6 +1317,7 @@ class GamasBot:
             except OfficeError as exc:
                 await event.reply(f"❌ {exc}")
                 return True
+            assert content is not None
             if len(session.text) + len(content) > self.settings.office_max_chars:
                 # Checked *after* reading: the byte ceiling of an upload and the
                 # character ceiling of a document are different limits, and the
@@ -1309,7 +1344,7 @@ class GamasBot:
             if len(session.text) + len(text) > self.settings.office_max_chars:
                 await event.reply(
                     "❌ متن شما از حد مجاز بیشتر است.\n"
-                    f"حداکثر {self.settings.office_max_chars} نویسه در هر سند؛ "
+                    f"حداکثر {to_persian_digits(self.settings.office_max_chars)} نویسه در هر سند؛ "
                     "متن را کوتاه‌تر کنید یا در چند سند بفرستید."
                 )
                 return True
@@ -1344,8 +1379,8 @@ class GamasBot:
             raise
         except ValueError as exc:
             raise OfficeError(
-                f"حجم فایل بیش از حد مجاز است (حداکثر "
-                f"{self.settings.office_max_input_bytes // 1024} کیلوبایت)."
+                "حجم فایل بیش از حد مجاز است (حداکثر "
+                f"{to_persian_digits(self.settings.office_max_input_bytes // 1024)} کیلوبایت)."
             ) from exc
         except Exception as exc:
             logger.warning("office upload could not be read: %s", exc)
@@ -1372,7 +1407,8 @@ class GamasBot:
         if len(content) > self.settings.office_max_chars:
             await event.reply(
                 "❌ متن شما از حد مجاز بیشتر است "
-                f"({self.settings.office_max_chars} نویسه)."
+                f"({to_persian_digits(self.settings.office_max_chars)} نویسه). "
+                "متن کوتاه‌تری ارسال کنید."
             )
             # The session must be closed: otherwise every later message keeps
             # appending to a document that can never be built.
@@ -1475,15 +1511,26 @@ class GamasBot:
             self._pending_reject_reason.pop(user_id, None)
         # Likewise, navigating away from the payment flow drops a waiting
         # receipt upload — a photo sent later belongs to the new screen.
-        if not data.startswith("payr:"):
+        if not data.startswith(("payr:", "plan:", "payopen:")):
             self._pending_payments.pop(user_id, None)
+        if not data.startswith("stt"):
+            self._stt_only_users.discard(user_id)
         # Support prompts are disarmed by any navigation except the prompt itself.
         if not data.startswith(("sup:cat:", "sup:r:")):
             self._support_states.pop(user_id, None)
         if not data.startswith("adm:sr:"):
             self._support_admin_states.pop(user_id, None)
 
-        if data == "make":
+        if data == "stt":
+            await self._ack(event)
+            self._stt_only_users.add(user_id)
+            await event.respond(
+                "🎙️ ارسال فایل برای تبدیل صدا به متن\n\n"
+                "فایل صوتی، ویدیویی یا پاورپوینت خود را همین‌جا ارسال کنید.\n"
+                "متن کامل گفتار به‌صورت فایل متنی و پیش‌نمایش ارسال می‌شود.",
+                buttons=[[Button.inline("↩️ منوی اصلی", b"menu:main")]],
+            )
+        elif data == "make":
             await self._ack(event)
             if self.settings.note_configured:
                 result_guide = "ابتدا متن گفتار و سپس جزوهٔ ورد برایتان ارسال می‌شود."
@@ -1499,10 +1546,9 @@ class GamasBot:
             await event.respond(
                 f"{prompt_title}\n\n"
                 "فایل صوتی یا ویدیویی کلاس، پیام صوتی یا ویدیویی تلگرام، یا فایل پاورپوینت را "
-                "همین‌جا بفرستید. قالب‌های رایج مانند MP3، MP4، WAV، OGG، M4A و PPTX/PPT پشتیبانی می‌شوند.\n"
-                "صدای ضبط‌شدهٔ داخل اسلایدهای پاورپوینت نیز قابل پردازش است.\n\n"
+                "همین‌جا بفرستید.\n\n"
                 f"{result_guide}",
-                buttons=[[Button.inline("🔙 منوی اصلی", b"menu:main")]],
+                buttons=[[Button.inline("↩️ منوی اصلی", b"menu:main")]],
             )
         elif data == "help":
             await self._ack(event)
@@ -1515,7 +1561,7 @@ class GamasBot:
                 "",
                 task_label,
                 f"۱. «{make_label}» را انتخاب کنید.",
-                "۲. فایل صوتی یا ویدیویی، پیام صوتی یا ویدیویی تلگرام یا پاورپوینت درس را بفرستید.",
+                "۲. فایل صوتی، ویدیویی یا پاورپوینت درس را بفرستید.",
                 "۳. ابتدا متن گفتار برایتان ارسال می‌شود.",
             ]
             if self.settings.note_configured:
@@ -1541,7 +1587,7 @@ class GamasBot:
                 )
             await event.respond(
                 "\n".join(guide),
-                buttons=[[Button.inline("🔙 منوی اصلی", b"menu:main")]],
+                buttons=[[Button.inline("↩️ منوی اصلی", b"menu:main")]],
             )
         elif data == "menu:main":
             await self._ack(event)
@@ -1601,11 +1647,11 @@ class GamasBot:
             await self._show_admin_payment_history(event, max(0, page or 0))
         elif data.startswith("adm:pd:"):
             await self._ack(event)
-            payment_id = _to_int(data.rsplit(":", 1)[-1])
-            if payment_id is None:
+            detail_payment_id = _to_int(data.rsplit(":", 1)[-1])
+            if detail_payment_id is None:
                 await self._ack(event, "شناسه سفارش نامعتبر است.", alert=True)
                 return
-            await self._show_admin_payment_detail(event, payment_id)
+            await self._show_admin_payment_detail(event, detail_payment_id)
         elif data == "adm:bcast":
             await self._ack(event)
             self._pending_broadcast.add(user_id)
@@ -1650,6 +1696,7 @@ class GamasBot:
             self._pending_reject_reason.pop(user_id, None)
             self._pending_broadcast.discard(user_id)
             self._pending_payments.pop(user_id, None)
+            self._stt_only_users.discard(user_id)
             self._office_sessions.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
@@ -1724,6 +1771,7 @@ class GamasBot:
 
         if command == "/cancel":
             self._pending_payments.pop(user_id, None)
+            self._stt_only_users.discard(user_id)
             self._office_sessions.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
@@ -1746,22 +1794,31 @@ class GamasBot:
         if await self._handle_office_message(event, user_id, text):
             return
 
+        # Direct/post-restart receipt image fallback when an open unpaid order exists.
+        if _is_receipt_image(event.message):
+            open_payment = await self.db.open_awaiting_payment_for_user(user_id)
+            if open_payment is not None:
+                await self._handle_receipt_upload(
+                    event, user_id, payment_id=int(open_payment["payment_id"])
+                )
+                return
+
         if _is_unsupported_attachment(event.message):
             if self.settings.office_enabled:
                 await event.reply(
-                    "⚠️ این نوع فایل را پشتیبانی نمی‌کنم. صدا، ویدیو یا پاورپوینت "
-                    "بفرستید — یا برای ساخت سند، یک فایل ‎.txt/‎.csv بفرستید."
+                    "⚠️ این نوع فایل پشتیبانی نمی‌شود. فایل صوتی، ویدیویی یا پاورپوینت "
+                    "بفرستید، یا در بخش ساخت سند فایل متنی ارسال کنید."
                 )
             else:
                 await event.reply(
-                    "⚠️ این نوع فایل را پشتیبانی نمی‌کنم. صدا، ویدیو یا پاورپوینت بفرستید."
+                    "⚠️ این نوع فایل پشتیبانی نمی‌شود. فایل صوتی، ویدیویی یا پاورپوینت بفرستید."
                 )
             return
         if text:
             # The Free Office section already had its chance above: it either
             # took the text (and asked for a format) or is switched off.
             await event.reply(
-                "برای پردازش فایل درس، از دکمهٔ اصلی منو استفاده کنید و فایل صوتی، "
+                "برای پردازش فایل درس، از دکمه‌های منوی اصلی استفاده کنید و فایل صوتی، "
                 "ویدیویی یا پاورپوینت را بفرستید."
             )
 
@@ -1774,9 +1831,9 @@ class GamasBot:
         # (audit F-M05). The post-download check remains as a second gate.
         reported_size = getattr(getattr(event.message, "file", None), "size", None)
         if isinstance(reported_size, int) and reported_size > self.settings.max_file_size:
+            max_mb = to_persian_digits(self.settings.max_file_size // (1024 * 1024))
             await event.reply(
-                "❌ حجم فایل ارسالی از سقف مجاز ربات بیشتر است. "
-                f"حد مجاز: {self.settings.max_file_size // (1024*1024)}MB"
+                f"❌ حجم فایل ارسالی از سقف مجاز ربات بیشتر است. حد مجاز: {max_mb} مگابایت"
             )
             return
         available = await self.db.available_seconds(user_id)
@@ -1811,6 +1868,8 @@ class GamasBot:
                 ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
             )
             return
+        stt_only = user_id in self._stt_only_users
+        self._stt_only_users.discard(user_id)
         progress = await JobProgress.create(event, submission_id=submission_id)
         job = Job(
             submission_id=submission_id,
@@ -1820,7 +1879,7 @@ class GamasBot:
             message=event.message,
             is_admin=self._is_admin(user_id),
             duration_hint=duration,
-            meta={"progress": progress},
+            meta={"progress": progress, "stt_only": stt_only},
         )
         try:
             self.queue.submit(job)
@@ -1849,9 +1908,9 @@ class GamasBot:
         # Pre-size check mirrors _accept_media (audit F-M05)
         reported_size = getattr(getattr(event.message, "file", None), "size", None)
         if isinstance(reported_size, int) and reported_size > self.settings.max_file_size:
+            max_mb = to_persian_digits(self.settings.max_file_size // (1024 * 1024))
             await event.reply(
-                "❌ حجم فایل ارسالی از سقف مجاز ربات بیشتر است. "
-                f"حد مجاز: {self.settings.max_file_size // (1024*1024)}MB"
+                f"❌ حجم فایل ارسالی از سقف مجاز ربات بیشتر است. حد مجاز: {max_mb} مگابایت"
             )
             return
         # Admission control for presentations: estimate cost up-front (audit F-H02)
@@ -1883,6 +1942,8 @@ class GamasBot:
                 ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
             )
             return
+        stt_only = user_id in self._stt_only_users
+        self._stt_only_users.discard(user_id)
         progress = await JobProgress.create(event, submission_id=submission_id)
         job = Job(
             submission_id=submission_id,
@@ -1891,7 +1952,7 @@ class GamasBot:
             filename=filename,
             message=event.message,
             is_admin=self._is_admin(user_id),
-            meta={"presentation_kind": kind, "progress": progress},
+            meta={"presentation_kind": kind, "progress": progress, "stt_only": stt_only},
         )
         try:
             self.queue.submit(job)
@@ -1950,7 +2011,10 @@ class GamasBot:
             )
             if progress:
                 await progress.fail(str(job.submission_id))
-            await self._reply(job, f"❌ {exc}")
+            safe_msg = _safe_user_error_text(
+                exc, "درخواست قابل پردازش نبود؛ لطفاً فایل را بررسی و دوباره ارسال کنید."
+            )
+            await self._reply(job, f"❌ {safe_msg}")
         except STTError as exc:
             await self._release(job, "stt failure")
             await self.db.set_submission_status(
@@ -1958,7 +2022,10 @@ class GamasBot:
             )
             if progress:
                 await progress.fail(str(job.submission_id))
-            await self._reply(job, f"❌ تبدیل گفتار به متن نشد: {exc}")
+            safe_msg = _safe_user_error_text(
+                exc, "خطای موقت در سرویس تبدیل گفتار رخ داد؛ لطفاً دوباره تلاش کنید."
+            )
+            await self._reply(job, f"❌ تبدیل گفتار به متن انجام نشد: {safe_msg}")
         except asyncio.CancelledError:
             await self._release(job, "cancelled")
             await self.db.set_submission_status(
@@ -1974,7 +2041,7 @@ class GamasBot:
             if progress:
                 await progress.fail(str(job.submission_id))
             await self._reply(
-                job, "❌ متأسفم، کار کامل نشد. لطفاً بعداً دوباره امتحان کنید."
+                job, "❌ خطای داخلی رخ داد و پردازش تکمیل نشد. لطفاً دوباره تلاش کنید."
             )
         finally:
             if progress:
@@ -1997,7 +2064,7 @@ class GamasBot:
     # ------------------------------------------------------- media pipeline
     async def _process_media(self, job: Job, workdir: Path, progress) -> None:
         assert progress is not None
-        await progress.update(10, "🚀 شروع کردم")
+        await progress.update(10, "آماده‌سازی پردازش")
         suffix = Path(job.filename).suffix.lower() if job.filename else (
             ".mp4" if job.kind == "video" else ".ogg"
         )
@@ -2011,7 +2078,7 @@ class GamasBot:
             upload_bytes * 2,
             reserve_bytes=self.settings.temp_min_free_bytes,
         )
-        await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
+        await progress.update(20, "دریافت فایل از تلگرام")
         download_started = time.monotonic()
         try:
             await _download_media_limited(
@@ -2031,7 +2098,7 @@ class GamasBot:
         download_seconds = max(0.001, time.monotonic() - download_started)
         egress_bytes_per_second = source_path.stat().st_size / download_seconds
 
-        await progress.update(35, "🔍 فایل رسید؛ دارم صدا را بررسی می‌کنم")
+        await progress.update(35, "بررسی و آماده‌سازی صدا")
         source_info = await self._run_media_operation(
             probe_media, source_path, self.settings
         )
@@ -2058,12 +2125,12 @@ class GamasBot:
             # Billing.md promises an unmeasurable duration is refused, not
             # reserved at a guess and settled at zero (audit F-21).
             raise ValueError(
-                "مدت این فایل مشخص نشد؛ نمی‌توانم آن را برای پیاده‌سازی بپذیرم."
+                "مدت فایل مشخص نشد؛ امکان پردازش آن وجود ندارد."
             )
         needed = self._reserve_estimate(duration)
         await self.db.reserve(job.user_id, job.submission_id, needed)
 
-        await progress.update(50, "🎙️ دارم صدا را به متن تبدیل می‌کنم")
+        await progress.update(50, "تبدیل گفتار به متن")
         try:
             raw = await transcribe(audio_path, self.settings, session=self._http_session())
         except BaseException:
@@ -2071,7 +2138,7 @@ class GamasBot:
             raise
         document = build_document(raw)
 
-        await progress.update(75, "📝 متن آماده شد؛ فایل خام را می‌فرستم")
+        await progress.update(75, "ارسال متن گفتار")
         await self.db.set_submission_status(
             job.submission_id, "processing", duration_seconds=duration
         )
@@ -2099,8 +2166,12 @@ class GamasBot:
             self._send_preview(job, raw_text),
             self._settle(job, duration),
         )
+        if job.meta.get("stt_only"):
+            await self.db.set_submission_status(job.submission_id, "done")
+            await progress.complete("متن کامل گفتار ارسال شد.")
+            return
 
-        await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
+        await progress.update(85, "تولید جزوهٔ ساختارمند")
         notes = await self._generate_notes(
             document.llm_document(),
             job,
@@ -2171,7 +2242,7 @@ class GamasBot:
     # ------------------------------------------------- presentation pipeline
     async def _process_presentation(self, job: Job, workdir: Path, progress) -> None:
         assert progress is not None
-        await progress.update(10, "🚀 شروع کردم")
+        await progress.update(10, "آماده‌سازی پردازش")
         suffix = Path(job.filename).suffix.lower() if job.filename else ".pptx"
         source_path = workdir / f"source{suffix}"
         upload_bytes = _reported_upload_bytes(job.message, self.settings.max_file_size)
@@ -2181,7 +2252,7 @@ class GamasBot:
             upload_bytes * 2,
             reserve_bytes=self.settings.temp_min_free_bytes,
         )
-        await progress.update(20, "📥 دارم فایل را از تلگرام می‌گیرم…")
+        await progress.update(20, "دریافت فایل از تلگرام")
         try:
             await _download_media_limited(
                 job.message,
@@ -2198,7 +2269,7 @@ class GamasBot:
 
         conversion_warnings: list[str] = []
         if job.meta.get("presentation_kind") == "legacy":
-            await progress.update(30, "🔁 دارم قالب قدیمی را تبدیل می‌کنم…")
+            await progress.update(30, "تبدیل قالب قدیمی ارائه")
             source_path = await self._run_media_operation(
                 convert_to_pptx,
                 source_path,
@@ -2209,7 +2280,7 @@ class GamasBot:
             if source_path.stat().st_size > self.settings.max_file_size:
                 raise PresentationError("ارائهٔ تبدیل‌شده از سقف حجم فایل بزرگ‌تر است.")
 
-        await progress.update(40, "🔍 دارم اسلایدها را می‌خوانم")
+        await progress.update(40, "بررسی اسلایدها")
         content = await self._run_media_operation(
             load_presentation, source_path, workdir, self.settings
         )
@@ -2276,7 +2347,7 @@ class GamasBot:
             duration = prepared.source_duration  # synthetic silence is not billed
             needed = self._reserve_estimate(duration)
             await self.db.reserve(job.user_id, job.submission_id, needed)
-            await progress.update(55, "🎙️ دارم صدای ارائه را به متن تبدیل می‌کنم")
+            await progress.update(55, "تبدیل صدای ارائه به متن")
             try:
                 raw = await transcribe(
                     prepared.path, self.settings, session=self._http_session()
@@ -2313,7 +2384,7 @@ class GamasBot:
         # The raw text is persisted and delivered before the credit is settled,
         # exactly like the media pipeline: a delivery failure must not leave a
         # billed job without its transcript in the user's chat.
-        await progress.update(70, "📝 متن خام را می‌فرستم")
+        await progress.update(70, "ارسال متن خام")
         raw_text = "\n\n\n".join(part for part in raw_text_parts if part.strip())
         # Include skip reasons when any clip was dropped, so the user knows
         # why a narration file did not make it into the transcript.
@@ -2345,8 +2416,12 @@ class GamasBot:
             self._send_preview(job, raw_text),
             self._settle(job, settled_duration),
         )
+        if job.meta.get("stt_only"):
+            await self.db.set_submission_status(job.submission_id, "done")
+            await progress.complete("متن کامل ارائه ارسال شد.")
+            return
 
-        await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
+        await progress.update(85, "تولید جزوهٔ ساختارمند")
         transcript_text = narration_text
         presentation_text = build_presentation_document(outline, transcript_text)
         notes = await self._generate_presentation_notes(
@@ -2380,7 +2455,7 @@ class GamasBot:
         admin panel can see how many documents were made.
         """
         assert progress is not None
-        await progress.update(15, "📄 دارم سند شما را می‌سازم")
+        await progress.update(15, "آماده‌سازی سند")
         kind = str(job.meta.get("office_kind") or "word")
         content = str(job.meta.get("office_text") or "")
         title = str(job.meta.get("office_title") or "")
@@ -2419,7 +2494,7 @@ class GamasBot:
                 heading_offset=OFFICE_HEADING_OFFSET,
             )
 
-        await progress.update(80, "📤 دارم فایل را می‌فرستم")
+        await progress.update(80, "ارسال فایل خروجی")
         path = workdir / office_filename(document.title, kind, reference)
         await asyncio.to_thread(path.write_bytes, payload)
         caption = (
@@ -2430,7 +2505,7 @@ class GamasBot:
         # Remember the document so «➕ افزودن متن» can extend it.
         self._office_last[job.user_id] = (kind, content, document.title, time.monotonic())
         self._trim_office_history()
-        await progress.complete("سند شما آماده شد ✅", "🎉 سند آماده شد! 🎉")
+        await progress.complete("فایل سند ارسال شد.", "✅ سند آماده شد")
         await self._offer_office_more(job)
 
     async def _offer_office_more(self, job: Job) -> None:
@@ -2439,7 +2514,7 @@ class GamasBot:
             return
         try:
             await job.message.reply(
-                "می‌خواهید متن دیگری هم به همین سند اضافه کنم؟",
+                "در صورت نیاز می‌توانید متن دیگری به همین سند اضافه کنید.",
                 buttons=[[Button.inline("➕ افزودن متن", b"office:more")]],
             )
         except Exception:
@@ -2565,7 +2640,7 @@ class GamasBot:
             logger.warning("note generation failed; raw already delivered: %s", exc)
             await self._reply(
                 job,
-                "ℹ️ این بار نتوانستم متن را به جزوهٔ ساختارمند دربیاورم؛ متن خام را دریافت کردید.",
+                "ℹ️ تولید جزوهٔ ساختارمند انجام نشد؛ فایل سادهٔ Word و متن خام ارسال می‌شود.",
             )
             return None
 
@@ -2595,7 +2670,7 @@ class GamasBot:
             logger.warning("presentation note generation failed: %s", exc)
             await self._reply(
                 job,
-                "ℹ️ این بار نتوانستم متن را به جزوهٔ ساختارمند دربیاورم؛ متن خام را دریافت کردید.",
+                "ℹ️ تولید جزوهٔ ساختارمند انجام نشد؛ فایل سادهٔ Word و متن خام ارسال می‌شود.",
             )
             return None
 
@@ -2612,7 +2687,7 @@ class GamasBot:
         plain_title: str = "جزوهٔ کلاس",
         plain_text: str | None = None,
     ) -> None:
-        await progress.update(94, "📑 جزوه آماده است؛ دارم فایل Word را می‌سازم")
+        await progress.update(94, "آماده‌سازی فایل Word")
         notice = ""
         docx_path: Path | None = None
         if notes is not None:
@@ -2865,7 +2940,9 @@ class GamasBot:
             lines.append("بسته را انتخاب کنید. اعتبار هر خرید به موجودی شما اضافه می‌شود.")
             for plan in plans:
                 hours = float(plan["hours"])
-                hours_text = to_persian_digits(int(hours) if hours.is_integer() else hours)
+                hours_text = to_persian_digits(
+                    int(hours) if hours.is_integer() else str(hours)
+                )
                 duration = format_duration(int(round(hours * 3600)))
                 validity = format_validity(plan["validity_days"])
                 lines.append(
@@ -2967,6 +3044,7 @@ class GamasBot:
             f"اعتبار بسته: {format_validity(plan['validity_days'])}"
         )
         if payment["receipt_path"]:
+            self._pending_payments.pop(event.sender_id, None)
             text = (
                 f"{summary}\n\n"
                 "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است؛ نیازی به واریز مجدد نیست. "
@@ -2974,13 +3052,15 @@ class GamasBot:
             )
             buttons = []
         else:
+            self._pending_payments[event.sender_id] = payment_id
             text = (
                 f"{summary}\n\n"
                 "اطلاعات واریز:\n"
                 f"💳 شماره کارت: {card}\n"
                 f"به نام: {self.settings.payment_card_holder}\n"
                 f"بانک: {self.settings.payment_bank_name}\n\n"
-                "پس از واریز، تصویر رسید را ارسال کنید. اعتبار فقط پس از تأیید مدیر اضافه می‌شود."
+                "پس از واریز، تصویر رسید را مستقیماً ارسال کنید یا دکمهٔ زیر را بزنید. "
+                "اعتبار فقط پس از تأیید مدیر اضافه می‌شود."
             )
             buttons = [
                 [Button.inline("📤 ارسال رسید", f"payr:{payment_id}".encode())],
@@ -3014,8 +3094,13 @@ class GamasBot:
             buttons=[[Button.inline("↩️ بازگشت", f"payopen:{payment_id}".encode())]],
         )
 
-    async def _handle_receipt_upload(self, event, user_id: int) -> None:
-        payment_id = self._pending_payments.pop(user_id, None)
+    async def _handle_receipt_upload(
+        self, event, user_id: int, *, payment_id: int | None = None
+    ) -> None:
+        if payment_id is None:
+            payment_id = self._pending_payments.pop(user_id, None)
+        else:
+            self._pending_payments.pop(user_id, None)
         if payment_id is None:
             return
         payment = await self.db.payment(payment_id)
@@ -3147,14 +3232,23 @@ class GamasBot:
                     admin_id,
                 )
 
+    REJECTION_REASON_PRESETS = {
+        "blur": "تصویر رسید ناخوانا است؛ تصویر واضح‌تری ارسال کنید.",
+        "amount": "مبلغ واریزی با مبلغ بسته مطابقت ندارد.",
+        "invalid": "اطلاعات تراکنش ناقص یا تکراری است.",
+    }
+
     async def _review_payment(self, event, data: str) -> None:
-        """Handle payv:<id>:a, payv:<id>:a:yes and payv:<id>:r safely."""
+        """Handle payv:<id>:a, payv:<id>:a:yes, payv:<id>:r and payv:<id>:rp:<code > safely."""
         parts = data.split(":")
         if (
             len(parts) not in (3, 4)
             or parts[0] != "payv"
-            or parts[2] not in ("a", "r")
-            or (len(parts) == 4 and (parts[2] != "a" or parts[3] != "yes"))
+            or parts[2] not in ("a", "r", "rp")
+            or (len(parts) == 4 and parts[2] == "a" and parts[3] != "yes")
+            or (len(parts) == 4 and parts[2] == "rp" and parts[3] not in self.REJECTION_REASON_PRESETS)
+            or (len(parts) == 3 and parts[2] == "rp")
+            or (len(parts) == 4 and parts[2] == "r")
         ):
             await self._ack(event, "درخواست نامعتبر است.", alert=True)
             return
@@ -3172,13 +3266,23 @@ class GamasBot:
             )
             await self._show_admin_payment_detail(event, payment_id)
             return
+        if verdict == "rp":
+            await self._ack(event)
+            preset_reason = self.REJECTION_REASON_PRESETS[parts[3]]
+            await self._reject_payment_with_reason(event, payment_id, preset_reason)
+            return
         if verdict == "r":
             self._pending_reject_reason[event.sender_id] = payment_id
             await self._ack(event, "برای رد پرداخت، دلیل لازم است.", alert=True)
             await event.respond(
-                f"دلیل رد سفارش {to_persian_digits(payment_id)} را بنویسید.\n"
+                f"دلیل رد سفارش {to_persian_digits(payment_id)} را انتخاب کنید یا در یک پیام بنویسید.\n"
                 "برای لغو، /cancel بفرستید.",
-                buttons=[[Button.inline("↩️ بازگشت", f"adm:pd:{payment_id}".encode())]],
+                buttons=[
+                    [Button.inline("📷 تصویر رسید ناخوانا", f"payv:{payment_id}:rp:blur".encode())],
+                    [Button.inline("💰 عدم تطابق مبلغ", f"payv:{payment_id}:rp:amount".encode())],
+                    [Button.inline("⚠️ اطلاعات ناقص یا تکراری", f"payv:{payment_id}:rp:invalid".encode())],
+                    [Button.inline("↩️ بازگشت", f"adm:pd:{payment_id}".encode())],
+                ],
             )
             return
         if len(parts) == 3:
@@ -3243,9 +3347,12 @@ class GamasBot:
     async def _reject_payment_with_reason(
         self, event, payment_id: int, reason: str
     ) -> None:
+        send_reply = event.reply if hasattr(event, "reply") else event.respond
         reason = reason.strip()
         if not reason:
-            await event.reply("برای رد پرداخت، واردکردن دلیل الزامی است.", buttons=self._admin_menu())
+            await send_reply(
+                "برای رد پرداخت، واردکردن دلیل الزامی است.", buttons=self._admin_menu()
+            )
             return
         payment = await self.db.payment(payment_id)
         try:
@@ -3254,13 +3361,13 @@ class GamasBot:
             )
         except sqlite3.Error:
             logger.exception("payment rejection failed payment_id=%s", payment_id)
-            await event.reply("رد پرداخت ثبت نشد؛ لطفاً دوباره تلاش کنید.")
+            await send_reply("رد پرداخت ثبت نشد؛ لطفاً دوباره تلاش کنید.")
             self._pending_reject_reason[event.sender_id] = payment_id
             return
         if not changed:
-            await event.reply("این سفارش قبلاً بررسی شده است یا رسید ندارد.")
+            await send_reply("این سفارش قبلاً بررسی شده است یا رسید ندارد.")
         else:
-            await event.reply(f"❌ سفارش {to_persian_digits(payment_id)} رد شد.")
+            await send_reply(f"❌ سفارش {to_persian_digits(payment_id)} رد شد.")
             if payment is not None:
                 try:
                     await self.client.send_message(
@@ -3416,13 +3523,17 @@ class GamasBot:
             return
         seconds = payment.get("purchased_seconds")
         price = payment.get("purchased_price")
+        validity_days = payment.get("purchased_validity_days")
         lines = [
             f"🔎 سفارش {to_persian_digits(payment_id)}",
+            f"شناسه سفارش: #{to_persian_digits(payment_id)}",
             f"کاربر: {payment['user_id']}",
+            f"طرح: {payment['plan_code']}",
             f"بسته: {format_duration(int(seconds)) if seconds is not None else payment['plan_code']}",
+            f"مدت اعتبار: {format_validity(validity_days)}",
             f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}",
             f"وضعیت: {self._payment_status_label(payment['status'])}",
-            f"ثبت: {payment['created_at']}",
+            f"ثبت: {to_persian_digits(str(payment['created_at'])[:16].replace('T', ' '))}",
             f"رسید: {'ثبت شده' if payment['receipt_path'] else 'ثبت نشده'}",
         ]
         if payment.get("reviewed_at"):
@@ -3506,6 +3617,10 @@ class GamasBot:
             "payment_approved": "تأیید پرداخت",
             "payment_rejected": "رد پرداخت",
             "broadcast": "ارسال پیام همگانی",
+            "ticket_closed": "بستن درخواست پشتیبانی",
+            "ticket_reopened": "بازگشایی درخواست پشتیبانی",
+            "receipt_expired": "حذف رسید منقضی‌شده",
+            "transcript_expired": "حذف متن منقضی‌شده",
         }
         lines = ["🛡 گزارش فعالیت مدیران", "", "آخرین ۱۵ اقدام ثبت‌شده:"]
         if not rows:
@@ -3767,7 +3882,7 @@ class GamasBot:
     def _support_when(value: str | None) -> str:
         if not value:
             return "—"
-        return to_persian_digits(value[:16].replace("T", " ")) + " به وقت جهانی"
+        return to_persian_digits(value[:16].replace("T", " "))
 
     @staticmethod
     def _support_status_label(status: str) -> str:
@@ -3831,7 +3946,7 @@ class GamasBot:
         buttons = [
             [Button.inline("➕ درخواست جدید", b"sup:new")],
             [Button.inline("📋 درخواست‌های من", b"sup:list")],
-            [Button.inline("🔙 منوی اصلی", b"menu:main")],
+            [Button.inline("↩️ منوی اصلی", b"menu:main")],
         ]
         await self._edit_or_reply(event, text, buttons)
 
@@ -3840,7 +3955,7 @@ class GamasBot:
             [Button.inline(label, f"sup:cat:{key}".encode())]
             for key, label in SUPPORT_CATEGORY_BUTTONS.items()
         ]
-        buttons.append([Button.inline("🔙 بازگشت", b"support")])
+        buttons.append([Button.inline("↩️ بازگشت", b"support")])
         await self._edit_or_reply(event, "دسته‌بندی درخواست را انتخاب کنید:", buttons)
 
     async def _show_user_tickets(self, event, user_id: int, page: int = 0) -> None:
@@ -3869,7 +3984,7 @@ class GamasBot:
         if nav:
             buttons.append(nav)
         buttons.append([Button.inline("➕ درخواست جدید", b"sup:new")])
-        buttons.append([Button.inline("🔙 بازگشت", b"support")])
+        buttons.append([Button.inline("↩️ بازگشت", b"support")])
         await self._edit_or_reply(event, text, buttons)
 
     async def _owned_ticket(self, user_id: int, ticket_id: int) -> dict | None:
@@ -4040,8 +4155,8 @@ class GamasBot:
             await event.reply("این درخواست دیگر پاسخ‌پذیر نیست؛ ابتدا آن را باز کنید.")
             return
         self._support_states.pop(user_id, None)
-        ticket = await self.db.get_ticket(value)
-        public_id = ticket["public_ticket_id"] if ticket else str(value)
+        refreshed_ticket = await self.db.get_ticket(value)
+        public_id = refreshed_ticket["public_ticket_id"] if refreshed_ticket else str(value)
         await event.reply(
             "✅ پیام شما ثبت شد.",
             buttons=[[Button.inline("📋 مشاهدهٔ درخواست", f"sup:v:{value}".encode())]],
@@ -4099,15 +4214,22 @@ class GamasBot:
         text = (
             "🎧 مدیریت پشتیبانی\n\n"
             f"فعال: {to_persian_digits(open_count)} | "
+            f"جدید: {to_persian_digits(counts.get('open', 0))} | "
             f"منتظر پاسخ شما: {to_persian_digits(counts.get('awaiting_admin', 0))} | "
             f"بسته: {to_persian_digits(counts.get('closed', 0))}\n"
             f"فهرست: {VIEW_LABELS.get(view, view)} — دسته: {CATEGORY_FILTER_LABELS.get(category, category)}"
         )
         buttons = [
-            [Button.inline(VIEW_LABELS["active"], b"adm:sl:active:all:0"),
-             Button.inline(VIEW_LABELS["wait"], b"adm:sl:wait:all:0")],
-            [Button.inline(VIEW_LABELS["user"], b"adm:sl:user:all:0"),
-             Button.inline(VIEW_LABELS["closed"], b"adm:sl:closed:all:0")],
+            [
+                Button.inline(VIEW_LABELS["active"], f"adm:sl:active:{category}:0".encode()),
+                Button.inline(VIEW_LABELS["open"], f"adm:sl:open:{category}:0".encode()),
+                Button.inline(VIEW_LABELS["wait"], f"adm:sl:wait:{category}:0".encode()),
+            ],
+            [
+                Button.inline(VIEW_LABELS["user"], f"adm:sl:user:{category}:0".encode()),
+                Button.inline(VIEW_LABELS["closed"], f"adm:sl:closed:{category}:0".encode()),
+            ],
+            [Button.inline("📂 همه دسته‌ها", f"adm:sl:{view}:all:0".encode())],
             [Button.inline(label, f"adm:sl:{view}:{key}:0".encode())
              for key, label in SUPPORT_CATEGORY_BUTTONS.items()][:2],
             [Button.inline(label, f"adm:sl:{view}:{key}:0".encode())
@@ -4128,7 +4250,7 @@ class GamasBot:
             buttons.append(nav)
         if not rows:
             text += "\n\nدرخواستی در این فهرست نیست."
-        buttons.append([Button.inline("🔙 پنل مدیریت", b"adm:home")])
+        buttons.append([Button.inline("↩️ پنل مدیریت", b"adm:home")])
         await self._edit_or_reply(event, text, buttons)
 
     async def _show_admin_ticket(self, event, ticket_id: int, page: int = 0) -> None:

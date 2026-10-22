@@ -1513,6 +1513,99 @@ class ReceiptPathAndImageTests(unittest.TestCase):
         self.assertIsNone(_parse_telegram_user_id("²"))
         self.assertEqual(_parse_telegram_user_id("۱۲۳۴۵"), 12345)
 
+    def test_safe_user_error_text_hides_raw_english_traces_and_tokens(self):
+        from gamas_bot.bot import _safe_user_error_text
+
+        fallback = "خطای موقت در پردازش رخ داد."
+        self.assertEqual(
+            _safe_user_error_text(RuntimeError("upstream 502 Bearer secret_abc"), fallback),
+            fallback,
+        )
+        self.assertEqual(
+            _safe_user_error_text(
+                ValueError("Traceback (most recent call last):\n  File 'x.py'"),
+                fallback,
+            ),
+            fallback,
+        )
+        redacted = _safe_user_error_text(
+            ValueError("خطا در سرویس sk-1234567890abcdef هنگام پردازش"),
+            fallback,
+        )
+        self.assertNotIn("sk-1234567890abcdef", redacted)
+        self.assertIn("[حذف شد]", redacted)
+
+
+class SttOnlyAndMenuTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "bot.db",
+            temp_dir=root / "tmp",
+        )
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.bot.client = FakeTelegramClient()
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def test_main_menu_includes_stt_and_booklet_and_stt_only_skips_booklet(self):
+        start_event = FakeCallbackEvent(501, b"menu:main")
+        await self.bot._handle_callback(start_event)
+        _text, buttons = start_event.edits[-1]
+        labels = [btn.text for row in buttons for btn in row]
+        self.assertIn("🎙️ تبدیل صدا به متن", labels)
+        self.assertIn("📝 ساخت جزوه", labels)
+        self.assertIn("📄 ساخت سند رایگان", labels)
+        self.assertIn("💳 خرید اشتراک", labels)
+        self.assertIn("📊 اعتبار من", labels)
+        self.assertIn("🧾 پرداخت‌های من", labels)
+        self.assertIn("🎧 پشتیبانی", labels)
+        self.assertIn("ℹ️ راهنما", labels)
+
+        # Pressing «🎙️ تبدیل صدا به متن» arms stt_only for the next submission.
+        stt_tap = FakeCallbackEvent(501, b"stt")
+        await self.bot._handle_callback(stt_tap)
+        self.assertIn(501, self.bot._stt_only_users)
+
+        # End-to-end execution of stt_only job delivers raw transcript, settles
+        # exact seconds once, marks submission done, and skips LLM note generation.
+        from unittest.mock import AsyncMock, patch
+        from gamas_bot.media import MediaInfo
+        from gamas_bot.stt import RawTranscript
+
+        audio_path = Path(self._tmp.name) / "lecture.ogg"
+        audio_path.write_bytes(b"OggS\x00\x02fake-audio-payload")
+        await self.db.ensure_user(501)
+        await self.db.grant_free_plan_once(501, 3600)
+        msg_event = FakeJobEvent(source=audio_path, chat_id=501)
+        msg_event.message.attach_voice(duration=12)
+
+        llm_mock = AsyncMock(side_effect=AssertionError("LLM must not run in stt_only mode"))
+        fake_raw = RawTranscript.from_text("سلام به همگی در جلسه اول", engine="deepgram")
+        with (
+            patch("gamas_bot.bot.probe_media", AsyncMock(return_value=MediaInfo(duration=12.0, has_audio=True))),
+            patch("gamas_bot.bot.needs_transcode", return_value=False),
+            patch("gamas_bot.bot.transcribe", AsyncMock(return_value=fake_raw)),
+            patch("gamas_bot.bot.structure_transcript", llm_mock),
+        ):
+            await self.bot._handle_message(msg_event)
+            job = self.bot.queue.pop_pending()
+            await self.bot._run_job(job)
+
+        llm_mock.assert_not_awaited()
+        self.assertEqual(await self.db.available_seconds(501), 3600 - 12)
+        row = (await self.db.db.execute_fetchall(
+            "SELECT status FROM submissions WHERE submission_id = ?", (job.submission_id,)
+        ))[0]
+        self.assertEqual(row["status"], "done")
+
 
 if __name__ == "__main__":
     unittest.main()
