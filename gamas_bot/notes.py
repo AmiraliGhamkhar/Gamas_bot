@@ -35,6 +35,11 @@ from dataclasses import dataclass, replace
 
 import aiohttp
 
+try:
+    import orjson as _orjson
+except ImportError:  # pragma: no cover - optional fast-path
+    _orjson = None  # type: ignore[assignment]
+
 from .config import NOTE_MODES, Settings, resolve_note_mode
 from .llm import (
     LLMContextOverflowError,
@@ -46,6 +51,7 @@ from .notes_evidence import (
     NoteQualityReport,
     SignalAudit,
     audit_notes,
+    build_source_index,
     content_words,
     coverage_thresholds,
     evidence_windows,
@@ -426,6 +432,8 @@ class StructuredNotes:
         }
 
     def to_json(self) -> str:
+        if _orjson is not None:
+            return _orjson.dumps(self.to_payload()).decode("utf-8")
         return json.dumps(self.to_payload(), ensure_ascii=False)
 
     def to_markdown(self) -> str:
@@ -1102,19 +1110,6 @@ def _dedupe_table_rows(rows: list[list[str]]) -> list[list[str]]:
     return result
 
 
-def _table_rows_as_bullets(table: NoteTable) -> tuple[str, ...]:
-    bullets: list[str] = []
-    for row in table.rows:
-        pairs = [
-            f"{header}: {value}"
-            for header, value in zip(table.headers, row, strict=False)
-            if value.strip()
-        ]
-        if pairs:
-            bullets.append("؛ ".join(pairs))
-    return tuple(bullets)
-
-
 def _merge_table_group(
     tables: Sequence[NoteTable],
 ) -> tuple[NoteTable | None, tuple[NoteTable, ...]]:
@@ -1710,10 +1705,9 @@ def gate_notes(
     question is filtered. That is the ``warn`` mode: an audit of the real
     deployment without any effect on what the user receives.
     """
-    from .notes_evidence import mask_structural  # local: keeps the import cycle-free
-
     resolved_mode = resolve_note_mode(mode)
-    source_words = content_words(mask_structural(source))
+    source_index = build_source_index(source)
+    source_words = source_index.masked_words
     tables_seen = tables_accepted = tips_seen = tips_accepted = 0
     dropped_cells: list[str] = []
     sections: list[NoteSection] = []
@@ -1721,7 +1715,7 @@ def gate_notes(
         accepted_tables: list[NoteTable] = []
         for table in section.all_tables:
             tables_seen += 1
-            verdict = validate_table(table, source)
+            verdict = validate_table(table, source, source_index=source_index)
             if not verdict.accepted:
                 dropped_cells.extend(verdict.failed_cells)
                 logger.info(
@@ -1746,7 +1740,7 @@ def gate_notes(
     tips: list[PracticalTip] = []
     for tip in notes.practical_tips:
         tips_seen += 1
-        if not validate_tip(tip, source):
+        if not validate_tip(tip, source, source_index=source_index):
             logger.info(
                 "note tip%s: basis not found in the source",
                 " dropped" if strict else " would be dropped",
@@ -1781,10 +1775,10 @@ def gate_notes(
         learning_objectives=objectives,
         review_questions=review_questions,
     )
-    audit = audit_notes(source, gated)
+    audit = audit_notes(source, gated, source_index=source_index)
     report = NoteQualityReport(
         audit=audit,
-        coverage=sentence_coverage(source, gated),
+        coverage=sentence_coverage(source, gated, source_index=source_index),
         tables_seen=tables_seen,
         tables_accepted=tables_accepted,
         tables_rejected=tables_seen - tables_accepted,
@@ -2500,8 +2494,9 @@ async def _compile_in_groups(
     mode: str,
     presentation: bool,
     budget: int,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> StructuredNotes:
-    """Level 1: compile whole-section groups; keep any group that fails."""
+    """Level 1: compile whole-section groups concurrently; keep any group that fails."""
     groups = compile_groups(merged, context, budget=budget)
     logger.warning(
         "compile pass grouped: merged_chars=%d budget=%d groups=%d",
@@ -2509,13 +2504,27 @@ async def _compile_in_groups(
         budget,
         len(groups),
     )
+    sem = semaphore or asyncio.Semaphore(max(1, settings.note_concurrency))
+
+    async def compile_group(group: StructuredNotes) -> StructuredNotes | None:
+        async with sem:
+            return await _compile_once(
+                session, settings, context, group,
+                mode=mode, presentation=presentation, budget=budget,
+            )
+
+    tasks = [asyncio.create_task(compile_group(group)) for group in groups]
+    try:
+        compiled_groups_list = await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
     sections: list[NoteSection] = []
     compiled_groups = 0
-    for group in groups:
-        compiled = await _compile_once(
-            session, settings, context, group,
-            mode=mode, presentation=presentation, budget=budget,
-        )
+    for group, compiled in zip(groups, compiled_groups_list, strict=True):
         if compiled is None:
             sections.extend(group.sections)
             continue
@@ -2551,6 +2560,7 @@ async def _compile_pass(
     *,
     mode: str,
     presentation: bool,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> StructuredNotes:
     """The editorial pass: one request when it fits, whole-section groups when not.
 
@@ -2590,6 +2600,7 @@ async def _compile_pass(
     assembled = await _compile_in_groups(
         merged, context, document, settings, session,
         mode=mode, presentation=presentation, budget=budget,
+        semaphore=semaphore,
     )
     accepted = _gate_compiled(
         assembled if assembled is not merged else None,
@@ -2763,7 +2774,7 @@ async def structure_document(
 
     return await _compile_pass(
         merged, merged_report, document, context, settings, session,
-        mode=resolved_mode, presentation=presentation,
+        mode=resolved_mode, presentation=presentation, semaphore=semaphore,
     )
 
 

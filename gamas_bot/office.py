@@ -35,13 +35,13 @@ import io
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .docx_export import ACCENT_HEX, ACCENT_SOFT_HEX, sanitize_filename_part
 from .mdblocks import TextBlock, parse_blocks
 from .progress import to_persian_digits
-from .textnorm import normalize_display, normalize_for_compare
+from .textnorm import normalize_display
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +79,6 @@ MAX_TABLE_COLUMNS = 40
 MAX_SLIDES = 40
 #: Lines per slide when the text has no headings of its own.
 FALLBACK_LINES_PER_SLIDE = 6
-#: A table needs at least this many rows (header included) to be a table.
-MIN_TABLE_ROWS = 2
 
 #: A cell that is *only* a number becomes a real number in the sheet, so the
 #: user can sum it. **ASCII digits only**: ``\d`` would also match Persian
@@ -89,11 +87,8 @@ MIN_TABLE_ROWS = 2
 _NUMBER_PATTERN = re.compile(r"^-?[0-9]+(?:\.[0-9]+)?$")
 
 #: The palette, shared with the Word engine (see ``gamas_bot.docx_export``).
-ACCENT_HEX = "1D3557"
-ACCENT_SOFT_HEX = "457B9D"
 ZEBRA_HEX = "F4F8FA"
 GRID_HEX = "C7D3DE"
-MUTED_HEX = "5C6B7A"
 ON_ACCENT_HEX = "FFFFFF"
 BODY_HEX = "333333"
 
@@ -706,8 +701,6 @@ def read_text_file(path: Path, *, max_bytes: int) -> str:
 
 def office_filename(title: str, kind: str, reference: str) -> str:
     """The delivered file name: ``<title> - <reference>.<ext>``."""
-    from .docx_export import sanitize_filename_part
-
     part = sanitize_filename_part(title) or DEFAULT_TITLE
     extension = FORMAT_EXTENSIONS.get(kind, ".docx")
     return f"{part} - {reference}{extension}"
@@ -720,15 +713,3 @@ def office_title_from_filename(filename: str | None) -> str:
     stem = Path(filename).stem.strip()
     stem = re.sub(r"[_]+", " ", stem)
     return stem[:120]
-
-
-def office_datetime_stamp(now: datetime | None = None) -> str:
-    """A human stamp for the document metadata (the Jalali date)."""
-    from .docx_export import jalali_date
-
-    return jalali_date(now or datetime.now())
-
-
-def normalized_source(text: str) -> str:
-    """The comparison form of a source text (used to validate model output)."""
-    return normalize_for_compare(text)

@@ -23,8 +23,9 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "Proprietary" }
 dependencies = [
-    # Telegram transport.
+    # Telegram transport (with C-accelerated MTProto AES-IGE via cryptg).
     "Telethon>=1.45,<2.0",
+    "cryptg>=0.4.0,<1.0",
     # Async HTTP (provider calls) and async SQLite.
     "aiohttp>=3.14,<4.0",
     "orjson>=3.10,<4.0",

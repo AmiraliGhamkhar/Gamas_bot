@@ -30,8 +30,8 @@ Follow [Deploy on cPanel](docs/DEPLOY_CPANEL.md). Keep the project, `.env`, data
 
 - Audio, video, PowerPoint (`.pptx` and legacy `.ppt`) → transcript and RTL `.docx`.
 - Text or supported text files → free `.docx`, `.xlsx`, `.pptx` or `.pdf`.
-- STT: Speechmatics, Deepgram or an OpenAI-compatible endpoint. Note generation supports NaraRouter, OpenRouter, Gemini, Anthropic and OpenAI-compatible APIs.
-- No system `ffmpeg`, `soffice`, Redis, Docker or external database required. PyAV supplies the media libraries.
+- STT: Speechmatics, Deepgram or an OpenAI-compatible endpoint. Note generation supports Gemini, NaraRouter, OpenRouter, Groq, Cerebras, Anthropic and OpenAI-compatible APIs.
+- No system `ffmpeg`, `soffice`, Redis, Docker or external database required. PyAV supplies the media libraries and `cryptg` accelerates Telegram MTProto transfers.
 
 OCR for images and scanned PDFs is **not supported**. Free Office accepts text files, not source `.docx` or `.pdf` documents.
 

@@ -74,10 +74,6 @@ class JobQueue:
     def pending(self) -> int:
         return self._pending
 
-    @property
-    def active_possible(self) -> int:
-        return self._max_active
-
     def ensure_workers(self) -> None:
         """Start the fixed worker pool once (idempotent)."""
         if self._workers or self._closed:

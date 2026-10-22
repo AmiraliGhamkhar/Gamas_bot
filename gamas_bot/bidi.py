@@ -47,11 +47,6 @@ _LTR_TOKEN_RE = re.compile(
     r"|[A-Za-z0-9]+(?:[./_+-][A-Za-z0-9]+)+"
 )
 
-#: Neutral characters that glue to the previous run instead of opening a new one.
-_NEUTRAL_RE = re.compile(
-    r"[^" + _RTL_CHARS + r"A-Za-z0-9]"  # everything not RTL and not Latin/digit
-)
-
 
 @dataclass(frozen=True, slots=True)
 class TextRun:

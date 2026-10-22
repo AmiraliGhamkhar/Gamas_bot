@@ -70,6 +70,7 @@ from .docx_export import (
 from .jobs import Job, JobQueue, QueueFullError
 from .logging_config import log_job_id
 from .media import (
+    MediaInfo,
     MediaToolError,
     convert_to_pptx,
     extract_audio_track,
@@ -109,13 +110,42 @@ from .presentations import (
     slides_outline,
 )
 from .progress import JobProgress, to_persian_digits
-from .stt import largest_configured_upload
-from .stt import STTError, STTConfigurationError, transcribe
+from .stt import (
+    STTConfigurationError,
+    STTError,
+    first_configured_stt_url,
+    largest_configured_upload,
+    transcribe,
+)
 from .telegram_text import button_label, render_pages, split_message
 from .transcript import build_document, render as render_transcript
 from .textnorm import normalize_display
 
 logger = logging.getLogger(__name__)
+
+
+def _max_mtproto_part_size_kb(file_size: int) -> int:
+    """Return 512 KiB (MTProto's maximum part size) for all positive file sizes.
+
+    Telethon's default ``get_appropriated_part_size`` uses 32–128 KiB parts for
+    files under 400 MB, causing 4x–16x more sequential RPC round-trips during
+    media downloads and document uploads.
+    """
+    if file_size <= 0:
+        return 64
+    return 512
+
+
+def _configure_telethon_part_size() -> None:
+    try:
+        from telethon import utils as telethon_utils
+
+        telethon_utils.get_appropriated_part_size = _max_mtproto_part_size_kb
+    except Exception:
+        logger.debug("could not configure Telethon MTProto part size", exc_info=True)
+
+
+_configure_telethon_part_size()
 
 AUDIO_EXTENSIONS = {
     ".aac", ".aif", ".aiff", ".amr", ".au", ".flac", ".m4a", ".m4b", ".mp3",
@@ -125,7 +155,7 @@ VIDEO_EXTENSIONS = {
     ".3gp", ".asf", ".avi", ".flv", ".m4v", ".mkv", ".mov", ".mp4", ".mpeg",
     ".mpg", ".ts", ".webm", ".wmv",
 }
-PRESENTATION_EXTENSIONS = {".ppt", ".pptx", ".pptm", ".ppsx", ".ppsm", ".potx", ".potm", ".pps", ".pot"}
+
 
 class UploadTooLargeError(ValueError):
     """A Telegram transfer exceeded its configured byte ceiling."""
@@ -421,9 +451,10 @@ async def _download_media_limited(
     task = asyncio.create_task(_download())
     try:
         if stall_seconds > 0:
-            tick = max(1.0, min(stall_seconds / 4, 15.0))
+            tick = max(0.05, min(stall_seconds / 4, 15.0))
+            wait_set = (task,)
             while True:
-                done, _pending = await asyncio.wait({task}, timeout=tick)
+                done, _pending = await asyncio.wait(wait_set, timeout=tick)
                 if done:
                     break
                 idle = time.monotonic() - last_progress[0]
@@ -679,7 +710,7 @@ class GamasBot:
         return self._http
 
     def _schedule_llm_prewarm(self) -> None:
-        """Warm one connection to the first note route's host (no quota used)."""
+        """Warm connections to the primary LLM and STT hosts (no quota used)."""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -690,18 +721,31 @@ class GamasBot:
         session = self._http
         if session is None:
             return
+        urls: list[str] = []
         try:
             routes = note_routes(self.settings)
-            if not routes:
-                return
-            url = routes[0].base_url
-            logger.debug("pre-warming LLM connection host=%s", url)
-            async with session.head(
-                url, timeout=aiohttp.ClientTimeout(total=10)
-            ) as response:
-                await response.read()
+            if routes:
+                urls.append(routes[0].base_url)
+            stt_url = first_configured_stt_url(self.settings)
+            if stt_url and stt_url not in urls:
+                urls.append(stt_url)
         except Exception:
-            logger.debug("LLM connection pre-warm failed (ignored)", exc_info=True)
+            logger.debug("HTTP pre-warm route lookup failed (ignored)", exc_info=True)
+            return
+        if not urls:
+            return
+
+        async def _warm_url(url: str) -> None:
+            try:
+                logger.debug("pre-warming HTTP connection host=%s", url)
+                async with session.head(
+                    url, timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    await response.read()
+            except Exception:
+                logger.debug("HTTP connection pre-warm failed (ignored)", exc_info=True)
+
+        await asyncio.gather(*(_warm_url(url) for url in urls))
 
     # -------------------------------------------------------------- handlers
     def _register_handlers(self) -> None:
@@ -1676,13 +1720,26 @@ class GamasBot:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
 
         await progress.update(35, "🔍 فایل رسید؛ دارم صدا را بررسی می‌کنم")
+        source_info = await self._run_media_operation(
+            probe_media, source_path, self.settings
+        )
         audio_path = await self._run_media_operation(
-            self._prepare_audio, source_path, workdir, job.filename, job.kind
+            self._prepare_audio,
+            source_path,
+            workdir,
+            job.filename,
+            job.kind,
+            info=source_info,
         )
         if audio_path.stat().st_size > self.settings.max_file_size:
             raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
 
-        info = await self._run_media_operation(probe_media, audio_path, self.settings)
+        if source_info.duration is not None or audio_path == source_path:
+            info = source_info
+        else:
+            info = await self._run_media_operation(
+                probe_media, audio_path, self.settings
+            )
         duration = info.duration or job.duration_hint
         if not duration or duration <= 0:
             # Billing.md promises an unmeasurable duration is refused, not
@@ -1715,15 +1772,20 @@ class GamasBot:
         raw_text = render_transcript(document, self.settings.raw_text_profile)
         # Persist before delivering: a Telegram outage must not lose a finished
         # transcription (the work is done, the row is what an operator disputes).
-        await self.db.save_transcription(
-            job.submission_id, engine=raw.engine, text=document.plain(), notes_json=""
-        )
         raw_path = workdir / raw_text_filename(reference)
-        raw_path.write_text(raw_text, encoding="utf-8", newline="\n")
+        await asyncio.gather(
+            self.db.save_transcription(
+                job.submission_id, engine=raw.engine, text=document.plain(), notes_json=""
+            ),
+            asyncio.to_thread(
+                raw_path.write_text, raw_text, encoding="utf-8", newline="\n"
+            ),
+        )
         await self._deliver_raw(job, raw_text, raw_path, reference)
-        await self._send_preview(job, raw_text)
-
-        await self._settle(job, duration)
+        await asyncio.gather(
+            self._send_preview(job, raw_text),
+            self._settle(job, duration),
+        )
 
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
         notes = await self._generate_notes(document.llm_document(), job, progress)
@@ -1735,9 +1797,16 @@ class GamasBot:
         await self._deliver_booklet(job, workdir, notes, document, reference, meta, progress)
 
     async def _prepare_audio(
-        self, source_path: Path, workdir: Path, filename: str | None, kind: str
+        self,
+        source_path: Path,
+        workdir: Path,
+        filename: str | None,
+        kind: str,
+        *,
+        info: MediaInfo | None = None,
     ) -> Path:
-        info = await probe_media(source_path, self.settings)
+        if info is None:
+            info = await probe_media(source_path, self.settings)
         if not info.has_audio:
             raise ValueError("این فایل شاخهٔ صوتی ندارد؛ چیزی برای پیاده‌سازی نیست.")
         # Media preparation and the STT upload are separated by the failover
@@ -1929,27 +1998,31 @@ class GamasBot:
         if skipped:
             raw_text += "\n\n---\nنکته: این موارد در پردازش نادیده گرفته شدند:\n" + "\n".join(f"• {reason}" for reason in skipped)
         engine_label = raw_engine or ("slides" if prepared is None else "stt")
-        await self.db.save_transcription(
-            job.submission_id,
-            engine=engine_label,
-            text=raw_text,
-            notes_json="",
-        )
         raw_path = workdir / raw_text_filename(reference)
-        raw_path.write_text(raw_text, encoding="utf-8", newline="\n")
+        await asyncio.gather(
+            self.db.save_transcription(
+                job.submission_id,
+                engine=engine_label,
+                text=raw_text,
+                notes_json="",
+            ),
+            asyncio.to_thread(
+                raw_path.write_text, raw_text, encoding="utf-8", newline="\n"
+            ),
+        )
         await self._deliver_raw(job, raw_text, raw_path, reference)
-        await self._send_preview(job, raw_text)
 
         # Settle only after the transcript has actually reached the user. The
         # source audio is measured by the worker; synthetic silence is excluded.
-        if prepared is not None:
-            await self._settle(job, prepared.source_duration)
-        else:
-            # A slide-only deck has no audio, so there is no hold and nothing
-            # to charge — but the delivery milestone still has to be recorded,
-            # otherwise the admin stats and the delivered/partial mapping miss
-            # every text-only deck.
-            await self._settle(job, 0)
+        # A slide-only deck has no audio, so there is no hold and nothing
+        # to charge — but the delivery milestone still has to be recorded,
+        # otherwise the admin stats and the delivered/partial mapping miss
+        # every text-only deck.
+        settled_duration = prepared.source_duration if prepared is not None else 0
+        await asyncio.gather(
+            self._send_preview(job, raw_text),
+            self._settle(job, settled_duration),
+        )
 
         await progress.update(85, "✍️ دارم جزوهٔ ساختارمند را می‌سازم")
         transcript_text = narration_text
@@ -2026,7 +2099,7 @@ class GamasBot:
 
         await progress.update(80, "📤 دارم فایل را می‌فرستم")
         path = workdir / office_filename(document.title, kind, reference)
-        path.write_bytes(payload)
+        await asyncio.to_thread(path.write_bytes, payload)
         caption = (
             f"{FORMAT_EMOJI.get(kind, '📄')} سند {FORMAT_LABELS.get(kind, '')} — {reference}"
         )
@@ -2167,7 +2240,7 @@ class GamasBot:
                     meta=meta,
                 )
                 docx_path = workdir / notes_docx_filename(notes, reference)
-                docx_path.write_bytes(docx_bytes)
+                await asyncio.to_thread(docx_path.write_bytes, docx_bytes)
             except Exception:
                 logger.exception("docx generation failed; falling back to chat message")
                 docx_path = None
@@ -2181,7 +2254,7 @@ class GamasBot:
                     fonts=resolve_fonts(), design=resolve_design(), meta=meta,
                 )
                 docx_path = workdir / plain_docx_filename(plain_title, reference)
-                docx_path.write_bytes(docx_bytes)
+                await asyncio.to_thread(docx_path.write_bytes, docx_bytes)
             except Exception:
                 logger.exception("plain docx generation failed too")
                 notice = "\n\nنکته: فایل Word ساخته نشد؛ متن خام ارسال شد."
@@ -2315,7 +2388,9 @@ class GamasBot:
         for index, part in enumerate(parts, start=1):
             part_path = raw_path.with_name(f"{raw_path.stem}.{index}{raw_path.suffix}")
             try:
-                part_path.write_text(part, encoding="utf-8", newline="\n")
+                await asyncio.to_thread(
+                    part_path.write_text, part, encoding="utf-8", newline="\n"
+                )
                 await self._send_file(
                     job,
                     part_path,

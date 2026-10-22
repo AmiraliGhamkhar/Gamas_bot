@@ -245,5 +245,172 @@ class PlanDeckConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(slides)
 
 
+class PipelinePerfOptimizationsTests(unittest.IsolatedAsyncioTestCase):
+    def test_mtproto_part_size_configured_to_512kb(self):
+        from telethon import utils as telethon_utils
+
+        from gamas_bot.bot import _max_mtproto_part_size_kb
+
+        self.assertEqual(_max_mtproto_part_size_kb(0), 64)
+        self.assertEqual(_max_mtproto_part_size_kb(1024), 512)
+        self.assertEqual(_max_mtproto_part_size_kb(50 * 1024 * 1024), 512)
+        self.assertEqual(telethon_utils.get_appropriated_part_size(1024 * 1024), 512)
+
+    def test_stt_adaptive_poll_interval_ramps_to_steady_state(self):
+        from gamas_bot.stt import _adaptive_poll_interval
+
+        self.assertAlmostEqual(_adaptive_poll_interval(2.0, 1), 0.5)
+        self.assertAlmostEqual(_adaptive_poll_interval(2.0, 2), 1.0)
+        self.assertAlmostEqual(_adaptive_poll_interval(2.0, 3), 1.5)
+        self.assertAlmostEqual(_adaptive_poll_interval(2.0, 4), 2.0)
+        self.assertAlmostEqual(_adaptive_poll_interval(2.0, 10), 2.0)
+
+    async def test_prewarm_warms_both_llm_and_stt_hosts_concurrently(self):
+        warmed: list[str] = []
+
+        class _HeadResp:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            async def read(self):
+                return b""
+
+        class _HeadSession:
+            def head(self, url, **_kwargs):
+                warmed.append(url)
+                return _HeadResp()
+
+        bot = GamasBot.__new__(GamasBot)
+        bot.settings = make_settings(
+            note_providers=("gemini",),
+            gemini_api_key="gem-key",
+            stt_providers=("deepgram",),
+            deepgram_api_key="dg-key",
+        )
+        bot._http = _HeadSession()  # type: ignore[assignment]
+        await bot._prewarm_llm()
+        self.assertEqual(len(warmed), 2)
+        self.assertTrue(any("generativelanguage.googleapis.com" in u for u in warmed))
+        self.assertTrue(any("deepgram.com" in u for u in warmed))
+
+    async def test_gemini_sse_streaming_collects_chunks_and_filters_thoughts(self):
+        lines = [
+            b'data: {"candidates":[{"content":{"parts":[{"thought":true,"text":"thinking..."}]}}]}\n',
+            b'data: {"candidates":[{"content":{"parts":[{"text":"hello "}]}}]}\n',
+            b'data: {"candidates":[{"content":{"parts":[{"text":"world"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":2}}\n',
+        ]
+        posted_urls: list[str] = []
+
+        class _GemStreamSession:
+            def post(self, url, **_kwargs):
+                posted_urls.append(url)
+                return _AsyncCM(StreamingResponse(lines))
+
+        settings = make_settings(
+            note_providers=("gemini",),
+            gemini_api_key="gem-key",
+            note_ttfb_timeout=2.0,
+        )
+        result = await complete(_GemStreamSession(), settings, system="S", user="U")
+        self.assertEqual(result, "hello world")
+        self.assertEqual(len(posted_urls), 1)
+        self.assertIn(":streamGenerateContent", posted_urls[0])
+        self.assertIn("alt=sse", posted_urls[0])
+
+    async def test_compile_in_groups_runs_concurrently_and_preserves_order(self):
+        from gamas_bot import notes as notes_mod
+        from gamas_bot.notes import LectureContext, NoteSection, StructuredNotes
+
+        sections = tuple(
+            NoteSection(
+                heading=f"بخش {i}",
+                paragraphs=(f"متن آموزشی بخش {i} دربارهٔ شبکه و پروتکل.",),
+            )
+            for i in range(1, 5)
+        )
+        merged = StructuredNotes(title="جزوه", sections=sections)
+        active = 0
+        max_active = 0
+
+        async def fake_compile_once(
+            _session, _settings, _context, group, *, mode, presentation, budget
+        ):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            first_heading = group.sections[0].heading
+            idx = int(first_heading.split()[-1])
+            await asyncio.sleep(0.03 * (5 - idx))
+            active -= 1
+            return group
+
+        settings = make_settings(note_concurrency=4, note_strict_grounding=False)
+        with (
+            mock.patch.object(
+                notes_mod,
+                "compile_groups",
+                return_value=[
+                    StructuredNotes(title="جزوه", sections=(s,)) for s in sections
+                ],
+            ),
+            mock.patch.object(notes_mod, "_compile_once", fake_compile_once),
+        ):
+            assembled = await notes_mod._compile_in_groups(
+                merged,
+                LectureContext(),
+                "متن منبع",
+                settings,
+                object(),  # type: ignore[arg-type]
+                mode="full",
+                presentation=False,
+                budget=500,
+            )
+        self.assertGreater(max_active, 1)
+        self.assertEqual(
+            [s.heading for s in assembled.sections],
+            ["بخش 1", "بخش 2", "بخش 3", "بخش 4"],
+        )
+
+    def test_source_evidence_index_cache_hits_and_matches_audit(self):
+        from gamas_bot.notes import NoteSection, NoteTable, PracticalTip, StructuredNotes, gate_notes
+        from gamas_bot.notes_evidence import build_source_index
+
+        build_source_index.cache_clear()
+        source = (
+            "بیمار باید روزانه 500 mg متفورمین مصرف کند و قند خون ناشتا زیر 110 mg/dL بماند."
+        )
+        notes = StructuredNotes(
+            title="جزوه",
+            sections=(
+                NoteSection(
+                    heading="درمان",
+                    paragraphs=(
+                        "بیمار باید روزانه 500 mg متفورمین مصرف کند و قند خون ناشتا زیر 110 mg/dL بماند.",
+                    ),
+                    table=NoteTable(
+                        headers=("دارو", "دوز"),
+                        rows=(("متفورمین", "500 mg"),),
+                    ),
+                ),
+            ),
+            practical_tips=(
+                PracticalTip(
+                    text="روزانه 500 mg متفورمین مصرف شود.",
+                    basis="بیمار باید روزانه 500 mg متفورمین مصرف کند",
+                ),
+            ),
+        )
+        gated1, report1 = gate_notes(notes, source, strict=True)
+        info_after_first = build_source_index.cache_info()
+        gated2, report2 = gate_notes(notes, source, strict=True)
+        info_after_second = build_source_index.cache_info()
+        self.assertEqual(gated1, gated2)
+        self.assertEqual(report1, report2)
+        self.assertGreater(info_after_second.hits, info_after_first.hits)
+
+
 if __name__ == "__main__":
     unittest.main()

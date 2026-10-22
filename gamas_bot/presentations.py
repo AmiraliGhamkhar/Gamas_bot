@@ -15,6 +15,7 @@ import math
 import posixpath
 import re
 import zipfile
+from bisect import bisect_right
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 
@@ -239,11 +240,13 @@ def _rels_part_for(part_name: str) -> str:
     return posixpath.join(directory, "_rels", f"{name}.rels")
 
 
+_XML_PARSER = etree.XMLParser(
+    resolve_entities=False, no_network=True, huge_tree=False, recover=False
+)
+
+
 def _parse_xml(payload: bytes) -> etree._Element:
-    parser = etree.XMLParser(
-        resolve_entities=False, no_network=True, huge_tree=False, recover=False
-    )
-    return etree.fromstring(payload, parser=parser)
+    return etree.fromstring(payload, parser=_XML_PARSER)
 
 
 def _zip_member_stream_complete(handle, info: zipfile.ZipInfo) -> bool:
@@ -591,12 +594,18 @@ def _shape_tree_lines(node) -> list[tuple[bool, str]]:
 
 
 def _related_part(
-    archive: zipfile.ZipFile, source_part: str, rel_id: str, rel_type: str
+    archive: zipfile.ZipFile,
+    source_part: str,
+    rel_id: str,
+    rel_type: str,
+    *,
+    rels: list[tuple[str, str, str]] | None = None,
 ) -> str | None:
     """The internal part ``rel_id`` of ``source_part`` names, if it matches."""
     if not rel_id:
         return None
-    for candidate_id, candidate_type, target in _relationships(archive, source_part):
+    entries = rels if rels is not None else _relationships(archive, source_part)
+    for candidate_id, candidate_type, target in entries:
         if candidate_id == rel_id and candidate_type == rel_type and target:
             name = _resolve_target(source_part, target)
             try:
@@ -730,7 +739,11 @@ def _chart_lines(archive: zipfile.ZipFile, part_name: str) -> list[str]:
 
 
 def _graphic_frame_lines(
-    archive: zipfile.ZipFile, slide_part: str, node
+    archive: zipfile.ZipFile,
+    slide_part: str,
+    node,
+    *,
+    rels: list[tuple[str, str, str]] | None = None,
 ) -> list[str]:
     """Diagram/chart text of every ``p:graphicFrame`` under ``node``.
 
@@ -748,6 +761,7 @@ def _graphic_frame_lines(
                         slide_part,
                         child.get(f"{{{OFFICE_REL_NS}}}dm") or "",
                         DIAGRAM_DATA_REL_TYPE,
+                        rels=rels,
                     )
                     if part:
                         lines.extend(_diagram_lines(archive, part))
@@ -757,23 +771,35 @@ def _graphic_frame_lines(
                         slide_part,
                         child.get(f"{{{OFFICE_REL_NS}}}id") or "",
                         CHART_REL_TYPE,
+                        rels=rels,
                     )
                     if part:
                         lines.extend(_chart_lines(archive, part))
     return list(dict.fromkeys(lines))
 
 
-def _notes_part_for(archive: zipfile.ZipFile, slide_part: str) -> str | None:
+def _notes_part_for(
+    archive: zipfile.ZipFile,
+    slide_part: str,
+    *,
+    rels: list[tuple[str, str, str]] | None = None,
+) -> str | None:
     """The notes part a slide points at through its relationships, if any."""
-    for _rel_id, rel_type, target in _relationships(archive, slide_part):
+    entries = rels if rels is not None else _relationships(archive, slide_part)
+    for _rel_id, rel_type, target in entries:
         if rel_type == NOTES_SLIDE_REL_TYPE and target:
             return _resolve_target(slide_part, target)
     return None
 
 
-def _notes_text_from_xml(archive: zipfile.ZipFile, slide_part: str) -> str:
+def _notes_text_from_xml(
+    archive: zipfile.ZipFile,
+    slide_part: str,
+    *,
+    rels: list[tuple[str, str, str]] | None = None,
+) -> str:
     """Speaker-note text of one slide, read from ``ppt/notesSlides/*.xml``."""
-    notes_part = _notes_part_for(archive, slide_part)
+    notes_part = _notes_part_for(archive, slide_part, rels=rels)
     if not notes_part:
         return ""
     payload = _read_member(archive, notes_part, 8_000_000)
@@ -796,7 +822,11 @@ def _notes_text_from_xml(archive: zipfile.ZipFile, slide_part: str) -> str:
 
 
 def _slide_text_from_xml(
-    archive: zipfile.ZipFile, slide_part: str, number: int
+    archive: zipfile.ZipFile,
+    slide_part: str,
+    number: int,
+    *,
+    rels: list[tuple[str, str, str]] | None = None,
 ) -> SlideText:
     """One slide's title, body, tables and speaker notes from its XML part."""
     payload = _read_member(archive, slide_part, 20_000_000)
@@ -807,6 +837,7 @@ def _slide_text_from_xml(
     except etree.XMLSyntaxError:
         logger.warning("Malformed slide part: %s", _safe_log_name(slide_part))
         return SlideText(number)
+    slide_rels = rels if rels is not None else _relationships(archive, slide_part)
     tree = root.find(f"{{{PML_NS}}}cSld/{{{PML_NS}}}spTree")
     entries = _shape_tree_lines(tree) if tree is not None else []
     title = " ".join(line for is_title, line in entries if is_title).strip()
@@ -817,18 +848,24 @@ def _slide_text_from_xml(
     ]
     body.extend(
         line
-        for line in _graphic_frame_lines(archive, slide_part, root)
+        for line in _graphic_frame_lines(archive, slide_part, root, rels=slide_rels)
         if line and line != title
     )
     return SlideText(
         number,
         title,
         tuple(dict.fromkeys(body)),
-        _notes_text_from_xml(archive, slide_part),
+        _notes_text_from_xml(archive, slide_part, rels=slide_rels),
     )
 
 
-def _extract_slide_text_from_xml(path: Path) -> list[SlideText]:
+def _extract_slide_text_from_xml(
+    path: Path,
+    *,
+    archive: zipfile.ZipFile | None = None,
+    slide_parts: list[str] | None = None,
+    slide_rels_by_part: dict[str, list[tuple[str, str, str]]] | None = None,
+) -> list[SlideText]:
     """Read every slide's text straight from the OPC package (no python-pptx).
 
     This is the fallback for a deck python-pptx cannot open (or an environment
@@ -836,21 +873,47 @@ def _extract_slide_text_from_xml(path: Path) -> list[SlideText]:
     model instead of the narration being the only input. Only text stored as
     ``a:t`` is read — text that exists only as a picture stays a picture.
     """
+    if archive is not None:
+        try:
+            parts = slide_parts if slide_parts is not None else _slide_parts_in_order(archive)
+            return [
+                _slide_text_from_xml(
+                    archive,
+                    part,
+                    number,
+                    rels=(slide_rels_by_part or {}).get(part),
+                )
+                for number, part in enumerate(parts, start=1)
+            ]
+        except Exception:  # a damaged package must not cost the narration
+            logger.warning("could not read slide text from the package XML", exc_info=True)
+            return []
     if not zipfile.is_zipfile(path):
         return []
     try:
-        with zipfile.ZipFile(path) as archive:
-            slide_parts = _slide_parts_in_order(archive)
+        with zipfile.ZipFile(path) as opened_archive:
+            parts = slide_parts if slide_parts is not None else _slide_parts_in_order(opened_archive)
             return [
-                _slide_text_from_xml(archive, part, number)
-                for number, part in enumerate(slide_parts, start=1)
+                _slide_text_from_xml(
+                    opened_archive,
+                    part,
+                    number,
+                    rels=(slide_rels_by_part or {}).get(part),
+                )
+                for number, part in enumerate(parts, start=1)
             ]
     except Exception:  # a damaged package must not cost the narration
         logger.warning("could not read slide text from the package XML", exc_info=True)
         return []
 
 
-def _extract_slide_text(path: Path) -> list[SlideText]:
+def _extract_slide_text(
+    path: Path,
+    *,
+    archive: zipfile.ZipFile | None = None,
+    slide_parts: list[str] | None = None,
+    slide_rels_by_part: dict[str, list[tuple[str, str, str]]] | None = None,
+) -> list[SlideText]:
     """Merge python-pptx text with XML fallback on each individual slide.
 
     The XML reader runs even when python-pptx succeeds: a deck can be only
@@ -860,7 +923,12 @@ def _extract_slide_text(path: Path) -> list[SlideText]:
     fallback for the entire deck.
     """
     primary = _extract_slide_text_with_pptx(path)
-    fallback = _extract_slide_text_from_xml(path)
+    fallback = _extract_slide_text_from_xml(
+        path,
+        archive=archive,
+        slide_parts=slide_parts,
+        slide_rels_by_part=slide_rels_by_part,
+    )
     primary_by_number = {slide.number: slide for slide in primary}
     fallback_by_number = {slide.number: slide for slide in fallback}
     numbers = sorted(set(primary_by_number) | set(fallback_by_number))
@@ -1006,9 +1074,12 @@ def read_presentation(
         slide_parts = _slide_parts_in_order(archive)
         references: list[tuple[int | None, str | None, str]] = []
         referenced_parts: set[str] = set()
+        slide_rels_by_part: dict[str, list[tuple[str, str, str]]] = {}
         for slide_number, slide_part in enumerate(slide_parts, start=1):
+            all_slide_rels = _relationships(archive, slide_part)
+            slide_rels_by_part[slide_part] = all_slide_rels
             slide_rels: list[tuple[str, str, str]] = []
-            for rel_id, rel_type, target in _relationships(archive, slide_part):
+            for rel_id, rel_type, target in all_slide_rels:
                 if not target or rel_type not in MEDIA_REL_TYPES:
                     continue
                 resolved = _resolve_target(slide_part, target)
@@ -1103,7 +1174,16 @@ def read_presentation(
                 )
             )
 
-    slides = _extract_slide_text(path) if settings.presentation_include_slide_text else []
+        slides = (
+            _extract_slide_text(
+                path,
+                archive=archive,
+                slide_parts=slide_parts,
+                slide_rels_by_part=slide_rels_by_part,
+            )
+            if settings.presentation_include_slide_text
+            else []
+        )
     if (
         settings.presentation_include_slide_text
         and slide_parts
@@ -1354,6 +1434,14 @@ def align_narration_to_slides(
     mapped_count = 0
     has_timing = False
     spans = sorted(prepared.clip_spans, key=lambda span: span.start_seconds)
+    # When clip spans are disjoint and sorted (always true for merged audio),
+    # narrow each word lookup to the O(1) adjacent window via binary search
+    # instead of scanning every clip span linearly on every word.
+    disjoint_sorted = len(spans) > 4 and all(
+        spans[i].start_seconds <= spans[i].end_seconds <= spans[i + 1].start_seconds
+        for i in range(len(spans) - 1)
+    )
+    span_starts = [span.start_seconds for span in spans] if disjoint_sorted else []
 
     for word in raw.words:
         if not word.text.strip():
@@ -1369,7 +1457,13 @@ def align_narration_to_slides(
             continue
         has_timing = True
         assert start is not None and end is not None
-        span = _match_clip_span(start, end, spans)
+        if disjoint_sorted:
+            lo = max(0, bisect_right(span_starts, start) - 1)
+            hi = min(len(spans), bisect_right(span_starts, end) + 1)
+            candidate_spans = spans[lo:hi]
+        else:
+            candidate_spans = spans
+        span = _match_clip_span(start, end, candidate_spans)
         slide_number = span.clip.slide_number if span is not None else None
         if slide_number is None:
             unassigned.append(word)
