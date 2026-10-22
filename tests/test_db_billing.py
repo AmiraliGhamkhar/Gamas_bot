@@ -224,6 +224,7 @@ class UnlimitedUserTests(DatabaseTestCase):
 class PaymentTests(DatabaseTestCase):
     async def test_approve_payment_credits_once(self):
         payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.set_payment_receipt(payment, "receipt.jpg", user_id=100)
         self.assertTrue(await self.db.review_payment(payment, True, 1))
         self.assertEqual(await self.db.available_seconds(100), 5 * 3600)
         # A second review is rejected (exactly-once).
@@ -232,6 +233,7 @@ class PaymentTests(DatabaseTestCase):
 
     async def test_reject_payment_credits_nothing(self):
         payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.set_payment_receipt(payment, "receipt.jpg", user_id=100)
         self.assertTrue(await self.db.review_payment(
             payment, False, 1, reason="رسید ناخوانا"
         ))
@@ -249,6 +251,7 @@ class PaymentTests(DatabaseTestCase):
     async def test_approval_uses_the_purchase_snapshot(self):
         """Deactivating or re-pricing the plan cannot change the credit (F-02/F-14)."""
         payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.set_payment_receipt(payment, "receipt.jpg", user_id=100)
         await self.db.db.execute("UPDATE plans SET active = 0, hours = 1 WHERE code = ?",
                                  ("paid_5h_30d",))
         await self.db.db.commit()
@@ -260,6 +263,7 @@ class PaymentTests(DatabaseTestCase):
 
     async def test_approval_without_snapshot_is_refused(self):
         payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.set_payment_receipt(payment, "receipt.jpg", user_id=100)
         await self.db.db.execute(
             "UPDATE payments SET purchased_seconds = NULL WHERE payment_id = ?",
             (payment,),
@@ -269,7 +273,7 @@ class PaymentTests(DatabaseTestCase):
             await self.db.review_payment(payment, True, 1)
         row = await self.db.payment(payment)
         assert row is not None
-        self.assertIn(row["status"], ("pending", "awaiting_payment"))
+        self.assertEqual(row["status"], "pending_review")
         self.assertEqual(await self.db.available_seconds(100), 0)
 
     async def test_second_tap_reuses_the_open_request(self):
@@ -288,6 +292,7 @@ class PaymentTests(DatabaseTestCase):
 
     async def test_review_and_audit_commit_together(self):
         payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.set_payment_receipt(payment, "receipt.jpg", user_id=100)
         await self.db.review_payment(payment, True, 7)
         audit = await self.db.recent_audit(limit=1)
         self.assertEqual(audit[0]["action"], "payment_approved")
@@ -296,6 +301,7 @@ class PaymentTests(DatabaseTestCase):
 
     async def test_revenue_uses_the_purchase_price(self):
         payment = await self.db.create_payment(100, "paid_5h_30d")
+        await self.db.set_payment_receipt(payment, "receipt.jpg", user_id=100)
         await self.db.review_payment(payment, True, 1)
         await self.db.sync_plans([
             {"code": "paid_5h_30d", "hours": 5, "price": 90000, "validity_days": 30},

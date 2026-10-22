@@ -1090,13 +1090,13 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         text, _buttons = event.edits[-1]
 
         self.assertIn("برای ساخت جزوه", text)
-        self.assertIn("«📎 ساخت جزوه»", text)
+        self.assertIn("«📝 ساخت جزوه»", text)
         self.assertIn("اعتبار باقی‌مانده", text)
         if self.settings.note_configured:
-            self.assertIn("متن گفتار و سپس جزوهٔ Word", text)
+            self.assertIn("متن گفتار و سپس جزوهٔ ورد", text)
         else:
-            self.assertIn("ساخت جزوهٔ Word در حال حاضر", text)
-        self.assertIn("از اعتبار شما کم نمی‌کند", text)
+            self.assertIn("ساخت جزوهٔ ورد در حال حاضر", text)
+        self.assertIn("اعتبار مصرف نمی‌شود", text)
 
     async def test_help_copy_explains_steps_and_billing_in_plain_language(self):
         event = FakeCallbackEvent(self.user_id, b"help")
@@ -1104,10 +1104,10 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         text, _buttons = event.responses[-1]
 
         self.assertIn("راهنمای استفاده", text)
-        self.assertIn("۱. «📎 ساخت جزوه» را انتخاب کنید.", text)
+        self.assertIn("۱. «📝 ساخت جزوه» را انتخاب کنید.", text)
         self.assertIn("پس از ارسال متن خام محاسبه می‌شود", text)
         self.assertIn("خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود", text)
-        self.assertIn("آفیس رایگان", text)
+        self.assertIn("ساخت سند رایگان", text)
 
     async def test_main_panel_is_clear_when_word_generation_is_not_configured(self):
         self.bot.settings = replace(
@@ -1121,9 +1121,9 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn("📎 تبدیل فایل به متن", text)
-        self.assertIn("ساخت جزوهٔ Word در حال حاضر روی این سرور فعال نیست", text)
-        self.assertNotIn("متن گفتار و سپس جزوهٔ Word", text)
+        self.assertIn("🎙️ تبدیل صدا به متن", text)
+        self.assertIn("ساخت جزوهٔ ورد در حال حاضر فعال نیست", text)
+        self.assertNotIn("متن گفتار و سپس جزوهٔ ورد", text)
 
     async def test_admin_guides_explain_user_actions_and_empty_states(self):
         users = FakeCallbackEvent(self.admin_id, b"adm:users")

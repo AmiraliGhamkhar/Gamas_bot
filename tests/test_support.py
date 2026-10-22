@@ -144,6 +144,33 @@ class SupportDatabaseTests(DatabaseTestCase):
         with self.assertRaises(ValueError):
             await self.db.add_ticket_message((await self.ticket())["id"], USER_A, "user", "   ")
 
+    async def test_ticket_and_initial_message_are_atomic(self):
+        await self.db._write(
+            "CREATE TEMP TRIGGER fail_initial_message BEFORE INSERT ON support_messages "
+            "BEGIN SELECT RAISE(ABORT, 'injected'); END"
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            await self.db.create_ticket(
+                USER_A, "technical", "مشکل تازه", initial_message="شرح مشکل"
+            )
+        self.assertEqual(await self.db.list_user_tickets(USER_A), [])
+        self.assertEqual(
+            (await self.db.db.execute_fetchall("SELECT COUNT(*) FROM support_ticket_seq"))[0][0],
+            0,
+        )
+        await self.db._write("DROP TRIGGER fail_initial_message")
+        ticket = await self.db.create_ticket(
+            USER_A,
+            "technical",
+            "مشکل تازه",
+            initial_message="شرح مشکل",
+            telegram_message_id=77,
+        )
+        self.assertEqual(ticket["status"], "awaiting_admin")
+        messages = await self.db.ticket_messages(ticket["id"])
+        self.assertEqual(messages[0]["message_text"], "شرح مشکل")
+        self.assertEqual(messages[0]["telegram_message_id"], 77)
+
 
 class SupportMigrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_legacy_pending_payments_migrate_and_tickets_table_is_created(self):
@@ -388,6 +415,48 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
             event = await self.press(ADMIN if data.startswith("adm") else USER_A, data)
             self.assertTrue(event.answers, data)
             self.assertTrue(event.answers[-1][1], data)
+
+    async def test_invalid_or_empty_input_keeps_the_support_prompt_active(self):
+        await self.press(USER_A, "sup:cat:technical")
+        await self.say(USER_A, "")
+        self.assertIn(USER_A, self.bot._support_states)
+        await self.say(USER_A, "x")
+        self.assertIn(USER_A, self.bot._support_states)
+        await self.say(USER_A, "شرح کامل مشکل")
+        self.assertNotIn(USER_A, self.bot._support_states)
+        self.assertEqual(len(await self.db.list_user_tickets(USER_A)), 1)
+
+    async def test_start_disarms_user_and_admin_reply_prompts(self):
+        await self.open_ticket()
+        ticket = await self.latest_ticket()
+        await self.press(USER_A, f"sup:r:{ticket['id']}")
+        await self.say(USER_A, "/start")
+        self.assertNotIn(USER_A, self.bot._support_states)
+        await self.say(USER_A, "متن unrelated")
+        self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 1)
+
+        await self.press(ADMIN, f"adm:sr:{ticket['id']}")
+        await self.say(ADMIN, "/start")
+        self.assertNotIn(ADMIN, self.bot._support_admin_states)
+        await self.say(ADMIN, "پاسخ unrelated")
+        self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 1)
+
+    async def test_long_history_is_complete_and_split_for_telegram(self):
+        await self.open_ticket()
+        ticket = await self.latest_ticket()
+        body = "ا" * self.db.SUPPORT_MESSAGE_MAX
+        await self.press(USER_A, f"sup:r:{ticket['id']}")
+        await self.say(USER_A, body)
+        view = await self.press(USER_A, f"sup:v:{ticket['id']}")
+        rendered_parts = [text for text, _buttons in view.edits]
+        rendered_parts += [text for text, _buttons in view.responses]
+        self.assertGreater(len(rendered_parts), 1)
+        self.assertIn(body, "".join(rendered_parts))
+        self.assertTrue(all(
+            len(part.encode("utf-16-le")) // 2 <= 4096 for part in rendered_parts
+        ))
+        self.assertTrue(view.responses, "navigation belongs on the final chunk")
+        self.assertIsNotNone(view.responses[-1][1])
 
 
 if __name__ == "__main__":

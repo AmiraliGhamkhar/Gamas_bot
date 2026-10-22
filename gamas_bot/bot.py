@@ -31,6 +31,7 @@ import re
 import secrets
 import stat
 import shutil
+import sqlite3
 import tempfile
 import time
 from datetime import datetime
@@ -42,7 +43,6 @@ from telethon.errors import FloodWaitError, MessageNotModifiedError
 from telethon.tl.types import MessageMediaWebPage
 
 from .billing import (
-    FREE_PLAN_NAME,
     format_duration,
     format_toman,
     format_validity,
@@ -744,11 +744,26 @@ def is_open_payment(status: object) -> bool:
     return str(status) in OPEN_PAYMENT_STATUSES
 
 
+def is_pending_payment_review(payment: dict) -> bool:
+    """Whether an order has a receipt and can receive an admin decision."""
+    return (
+        str(payment.get("status")) in {"pending_review", "pending"}
+        and bool(payment.get("receipt_path"))
+    )
+
+
 def _is_receipt_image(message) -> bool:
-    if getattr(message, "photo", None) is None:
+    """Accept Telegram photos and image documents supported by the normalizer."""
+    if getattr(message, "sticker", None) is not None or getattr(message, "gif", None) is not None:
         return False
-    mime = getattr(message.file, "mime_type", "") or ""
-    return mime.startswith("image/")
+    mime = (getattr(getattr(message, "file", None), "mime_type", "") or "").lower()
+    if getattr(message, "photo", None) is not None:
+        return mime.startswith("image/")
+    return getattr(message, "document", None) is not None and mime in {
+        "image/jpeg",
+        "image/png",
+        "image/webp",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1026,20 +1041,24 @@ class GamasBot:
         never replaces this menu, so both panels stay separately reachable.
         """
         make_label = (
-            "📎 ساخت جزوه" if self.settings.note_configured else "📎 تبدیل فایل به متن"
+            "📝 ساخت جزوه" if self.settings.note_configured else "🎙️ تبدیل صدا به متن"
         )
-        rows = [
-            [Button.inline(make_label, b"make")],
-        ]
+        rows = [[Button.inline(make_label, b"make")]]
         if self.settings.office_enabled:
-            rows.append([Button.inline("📄 آفیس رایگان", b"office")])
+            rows.append([Button.inline("📄 ساخت سند رایگان", b"office")])
+        rows.append([Button.inline("💳 خرید اشتراک", b"buy")])
         rows.append(
             [
-                Button.inline("💳 اعتبار و پرداخت", b"account"),
-                Button.inline("🎧 پشتیبانی", b"support"),
+                Button.inline("📊 اعتبار من", b"account"),
+                Button.inline("🧾 پرداخت‌های من", b"payments"),
             ]
         )
-        rows.append([Button.inline("❓ راهنما", b"help")])
+        rows.append(
+            [
+                Button.inline("🎧 پشتیبانی", b"support"),
+                Button.inline("ℹ️ راهنما", b"help"),
+            ]
+        )
         if is_admin:
             rows.append([Button.inline("🛠 پنل مدیریت", b"adm:home")])
         return rows
@@ -1071,24 +1090,21 @@ class GamasBot:
             user_id, self._free_plan_seconds()
         ):
             logger.info("free plan granted user=%s", user_id)
-        greeting = "سلام! به گاماس خوش آمدید 🌱" if first_start else "منوی اصلی"
+        greeting = "به گاماس خوش آمدید." if first_start else "منوی اصلی"
         if self.settings.note_configured:
             introduction = (
-                "برای ساخت جزوه، «📎 ساخت جزوه» را انتخاب کنید و فایل صوتی، ویدیویی یا "
-                "پاورپوینت کلاس را بفرستید. ابتدا متن گفتار و سپس جزوهٔ Word برایتان ارسال می‌شود.\n"
+                "برای ساخت جزوه، «📝 ساخت جزوه» را انتخاب کنید و فایل صوتی، ویدیویی یا "
+                "پاورپوینت درس را بفرستید. ابتدا متن گفتار و سپس جزوهٔ ورد ارسال می‌شود.\n"
             )
         else:
             introduction = (
-                "برای تبدیل فایل کلاس به متن، «📎 تبدیل فایل به متن» را انتخاب کنید و فایل صوتی، "
-                "ویدیویی یا پاورپوینت را بفرستید. متن گفتار برایتان ارسال می‌شود.\n"
-                "ساخت جزوهٔ Word در حال حاضر روی این سرور فعال نیست.\n"
+                "برای تبدیل صدا به متن، «🎙️ تبدیل صدا به متن» را انتخاب کنید و فایل صوتی، "
+                "ویدیویی یا پاورپوینت را بفرستید.\n"
+                "ساخت جزوهٔ ورد در حال حاضر فعال نیست.\n"
             )
         text = f"{greeting}\n\n{introduction}"
         if self.settings.office_enabled:
-            text += (
-                "برای تبدیل متن دلخواهتان به فایل Word، Excel، PowerPoint یا PDF، از "
-                "«📄 آفیس رایگان» استفاده کنید. این بخش رایگان است و از اعتبار شما کم نمی‌کند.\n"
-            )
+            text += "برای ساخت سند از متن، از «📄 ساخت سند رایگان» استفاده کنید؛ اعتبار مصرف نمی‌شود.\n"
         text += f"\n⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
 
@@ -1123,7 +1139,7 @@ class GamasBot:
         spend their balance.
         """
         text = (
-            "📄 آفیس رایگان\n\n"
+            "📄 ساخت سند رایگان\n\n"
             "متن خودتان را بفرستید؛ من همان متن را به یک فایل واقعی تبدیل "
             "می‌کنم — Word، Excel، PowerPoint یا PDF. متن شما عیناً در فایل می‌آید.\n"
             "رایگان است و از اعتبار شما کم نمی‌کند.\n\n"
@@ -1169,7 +1185,7 @@ class GamasBot:
         if action == "cancel":
             self._office_sessions.pop(user_id, None)
             await event.respond(
-                "لغو شد. هر وقت سندی خواستی، از «📄 آفیس رایگان» شروع کن."
+                "لغو شد. برای ساخت سند، از «📄 ساخت سند رایگان» شروع کنید."
             )
             return
         if action == "more":
@@ -1453,6 +1469,10 @@ class GamasBot:
         if data.startswith("adm:") and data != "adm:bcast":
             self._pending_broadcast.discard(user_id)
             self._pending_reject_reason.pop(user_id, None)
+        # A review action supersedes any older rejection-reason prompt. Only
+        # the new rejection action below is allowed to arm that prompt again.
+        if data.startswith("payv:"):
+            self._pending_reject_reason.pop(user_id, None)
         # Likewise, navigating away from the payment flow drops a waiting
         # receipt upload — a photo sent later belongs to the new screen.
         if not data.startswith("payr:"):
@@ -1466,15 +1486,15 @@ class GamasBot:
         if data == "make":
             await self._ack(event)
             if self.settings.note_configured:
-                result_guide = "ابتدا متن گفتار و سپس جزوهٔ Word برایتان ارسال می‌شود."
+                result_guide = "ابتدا متن گفتار و سپس جزوهٔ ورد برایتان ارسال می‌شود."
             else:
                 result_guide = (
-                    "متن گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ Word در حال حاضر فعال نیست."
+                    "متن گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ ورد در حال حاضر فعال نیست."
                 )
             prompt_title = (
-                "📎 ارسال فایل برای ساخت جزوه"
+                "📝 ارسال فایل برای ساخت جزوه"
                 if self.settings.note_configured
-                else "📎 ارسال فایل برای تبدیل به متن"
+                else "🎙️ ارسال فایل برای تبدیل صدا به متن"
             )
             await event.respond(
                 f"{prompt_title}\n\n"
@@ -1487,11 +1507,11 @@ class GamasBot:
         elif data == "help":
             await self._ack(event)
             make_label = (
-                "📎 ساخت جزوه" if self.settings.note_configured else "📎 تبدیل فایل به متن"
+                "📝 ساخت جزوه" if self.settings.note_configured else "🎙️ تبدیل صدا به متن"
             )
-            task_label = "ساخت جزوه:" if self.settings.note_configured else "تبدیل فایل به متن:"
+            task_label = "ساخت جزوه:" if self.settings.note_configured else "تبدیل صدا به متن:"
             guide = [
-                "❓ راهنمای استفاده",
+                "ℹ️ راهنمای استفاده",
                 "",
                 task_label,
                 f"۱. «{make_label}» را انتخاب کنید.",
@@ -1499,9 +1519,9 @@ class GamasBot:
                 "۳. ابتدا متن گفتار برایتان ارسال می‌شود.",
             ]
             if self.settings.note_configured:
-                guide.append("۴. سپس جزوهٔ Word آماده و ارسال می‌شود.")
+                guide.append("۴. سپس جزوهٔ ورد آماده و ارسال می‌شود.")
             else:
-                guide.append("ساخت جزوهٔ Word در حال حاضر روی این سرور فعال نیست.")
+                guide.append("ساخت جزوهٔ ورد در حال حاضر فعال نیست.")
             guide.extend(
                 [
                     "",
@@ -1514,8 +1534,8 @@ class GamasBot:
                 guide.extend(
                     [
                         "",
-                        "آفیس رایگان:",
-                        "«📄 آفیس رایگان» را انتخاب کنید، قالب موردنظر را بزنید و متن یا فایل متنی "
+                        "ساخت سند رایگان:",
+                        "«📄 ساخت سند رایگان» را انتخاب کنید، قالب را بزنید و متن یا فایل متنی "
                         "خود را بفرستید. این بخش رایگان است و از اعتبار شما کم نمی‌کند.",
                     ]
                 )
@@ -1541,6 +1561,13 @@ class GamasBot:
         elif data == "account":
             await self._ack(event)
             await self._show_account(event)
+        elif data == "buy":
+            await self._ack(event)
+            await self._show_plans(event)
+        elif data == "payments" or data.startswith("payments:"):
+            await self._ack(event)
+            page = _to_int(data.split(":", 1)[1]) if ":" in data else 0
+            await self._show_payment_history(event, user_id, max(0, page or 0))
         elif data.startswith("plan:"):
             await self._ack(event)
             await self._start_payment(event, data.split(":", 1)[1])
@@ -1568,6 +1595,17 @@ class GamasBot:
         elif data == "adm:pay":
             await self._ack(event)
             await self._show_admin_payments(event)
+        elif data.startswith("adm:ph:"):
+            await self._ack(event)
+            page = _to_int(data.rsplit(":", 1)[-1])
+            await self._show_admin_payment_history(event, max(0, page or 0))
+        elif data.startswith("adm:pd:"):
+            await self._ack(event)
+            payment_id = _to_int(data.rsplit(":", 1)[-1])
+            if payment_id is None:
+                await self._ack(event, "شناسه سفارش نامعتبر است.", alert=True)
+                return
+            await self._show_admin_payment_detail(event, payment_id)
         elif data == "adm:bcast":
             await self._ack(event)
             self._pending_broadcast.add(user_id)
@@ -1605,6 +1643,18 @@ class GamasBot:
             return
         text = (event.message.message or "").strip()
         command = _command_name(text)
+        if command == "/start":
+            # A fresh menu is a hard boundary for every conversational flow.
+            # In particular, a later photo must not unexpectedly complete an
+            # old receipt or ticket prompt after the user pressed /start.
+            self._pending_reject_reason.pop(user_id, None)
+            self._pending_broadcast.discard(user_id)
+            self._pending_payments.pop(user_id, None)
+            self._office_sessions.pop(user_id, None)
+            self._support_states.pop(user_id, None)
+            self._support_admin_states.pop(user_id, None)
+            await self._show_main(event, first_start=True)
+            return
 
         # Admin conversational states.
         if self._is_admin(user_id) and user_id in self._pending_reject_reason:
@@ -1640,9 +1690,13 @@ class GamasBot:
             await self._broadcast(event, text)
             return
         if self._is_admin(user_id) and user_id in self._support_admin_states and not command:
-            ticket_id = self._support_admin_states.pop(user_id)
+            ticket_id = self._support_admin_states[user_id]
             await self._handle_admin_support_text(event, user_id, ticket_id, text)
             return
+        if self._is_admin(user_id) and command:
+            # Any command leaves the conversational reply flow. In particular,
+            # /start must not leave a stale ticket id armed for the next text.
+            self._support_admin_states.pop(user_id, None)
         if self._is_admin(user_id) and command == "/grant":
             await self._admin_grant(event, text)
             return
@@ -1653,28 +1707,27 @@ class GamasBot:
             await self._admin_ban(event, text)
             return
 
-        if user_id in self._support_states and command in ("", ):
-            state = self._support_states.pop(user_id)
+        if user_id in self._support_states and not command:
+            state = self._support_states[user_id]
             await self._handle_support_text(event, user_id, state, text)
             return
-        if user_id in self._support_states and command and command != "/cancel" and not command == "/start":
-            # A command while a support prompt is open: the prompt is dropped, the command runs.
+        if user_id in self._support_states and command:
+            # Commands, including /start, always disarm the old prompt.
             self._support_states.pop(user_id, None)
 
-        # Payment receipt pending for this user?
-        if user_id in self._pending_payments and _is_receipt_image(event.message):
+        # While a receipt is expected, no ordinary text/media may fall through
+        # to Office or the paid lecture pipeline. Invalid input keeps the
+        # receipt prompt armed so the user can immediately retry.
+        if user_id in self._pending_payments and not command:
             await self._handle_receipt_upload(event, user_id)
             return
 
-        if command == "/start":
-            await self._show_main(event, first_start=True)
-            return
         if command == "/cancel":
             self._pending_payments.pop(user_id, None)
             self._office_sessions.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
-            await event.reply("ارسال لغو شد. برای لغو درخواست خرید از بخش اعتبار و پرداخت اقدام کنید.")
+            await event.reply("ارسال لغو شد. برای لغو سفارش، از «🧾 پرداخت‌های من» اقدام کنید.")
             return
 
         # Presentations.
@@ -1708,8 +1761,8 @@ class GamasBot:
             # The Free Office section already had its chance above: it either
             # took the text (and asked for a format) or is switched off.
             await event.reply(
-                "برای ساخت جزوه، فایل صوتی یا ویدیویی درس را بفرستید؛ "
-                "یا در منوی اصلی «📎 ساخت جزوه» را انتخاب کنید."
+                "برای پردازش فایل درس، از دکمهٔ اصلی منو استفاده کنید و فایل صوتی، "
+                "ویدیویی یا پاورپوینت را بفرستید."
             )
 
     # ---------------------------------------------------------------- intake
@@ -1743,7 +1796,7 @@ class GamasBot:
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
                 f"{measured} — لازم (دست‌کم): {format_duration(needed)} — "
                 f"اعتبار فعلی: {format_duration(available)}\n"
-                "از «💳 اعتبار و پرداخت» می‌توانید اعتبار بگیرید."
+                "از «💳 خرید اشتراک» می‌توانید اعتبار بگیرید."
             )
             return
         try:
@@ -1815,7 +1868,7 @@ class GamasBot:
                     f"⏳ اعتبار شما برای این ارائه کافی نیست.\n"
                     f"لازم (حداقل برآورد): {format_duration(needed)} — "
                     f"اعتبار فعلی: {format_duration(available)}\n"
-                    "از «💳 اعتبار و پرداخت» می‌توانید اعتبار بگیرید."
+                    "از «💳 خرید اشتراک» می‌توانید اعتبار بگیرید."
                 )
                 return
         try:
@@ -1888,7 +1941,7 @@ class GamasBot:
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
                 f"لازم: {format_duration(exc.required_seconds)} — "
                 f"موجودی: {format_duration(exc.available_seconds)}\n"
-                "از «💳 اعتبار و پرداخت» اعتبار بگیرید."
+                "از «💳 خرید اشتراک» اعتبار بگیرید."
             ))
         except USER_VISIBLE_ERRORS as exc:
             await self._release(job, "user-visible failure")
@@ -2766,57 +2819,105 @@ class GamasBot:
             logger.debug("preview send failed", exc_info=True)
 
     # ------------------------------------------------------------ accounting
+    @staticmethod
+    def _payment_status_label(status: str) -> str:
+        return {
+            "pending": "⏳ منتظر پرداخت",
+            "awaiting_payment": "⏳ منتظر پرداخت",
+            "pending_review": "🕒 در انتظار بررسی",
+            "approved": "✅ تأیید شده",
+            "rejected": "❌ رد شده",
+            "cancelled": "لغو شده",
+        }.get(status, "نامشخص")
+
     async def _show_account(self, event) -> None:
+        """Show balance separately from plans and payment history."""
         user_id = event.sender_id
         balance = await self._balance_text(user_id)
-        history = await self.db.payment_history(user_id, limit=5)
-        plans = await self.db.plans()
-        lines = [
-            "💳 اعتبار و پرداخت",
-            "",
-            f"⏳ اعتبار باقی‌مانده: {balance}",
-            "",
-            "برای افزایش اعتبار، یکی از بسته‌های زیر را انتخاب کنید:",
+        latest = await self.db.payment_history_paginated(user_id, limit=1)
+        buttons = [
+            [Button.inline("💳 خرید اشتراک", b"buy")],
+            [Button.inline("🧾 پرداخت‌های من", b"payments")],
         ]
-        plan_labels = {
-            plan["code"]: format_duration(int(round(float(plan["hours"]) * 3600)))
-            for plan in plans
-        }
-        buttons = []
-        for plan in plans:
-            if plan["price"] <= 0:
-                continue
-            hours = plan["hours"]
-            hours_text = to_persian_digits(int(hours) if float(hours).is_integer() else hours)
-            label = button_label(f"{hours_text} ساعت — {format_toman(plan['price'])}")
-            buttons.append([Button.inline(label, f"plan:{plan['code']}".encode())])
-        if history:
-            lines.append("")
-            lines.append("آخرین پرداخت‌ها:")
-            for item in history:
-                status = {
-                    "pending": "🕒 در انتظار بررسی",
-                    "awaiting_payment": "⏳ منتظر پرداخت",
-                    "pending_review": "🕒 در انتظار بررسی",
-                    "approved": "✅ تأیید شد",
-                    "rejected": "❌ رد شد",
-                    "cancelled": "لغو شد",
-                }.get(item["status"], item["status"])
+        if latest and is_open_payment(latest[0]["status"]):
+            order_buttons = [Button.inline(
+                "🔎 پیگیری سفارش باز", f"payopen:{latest[0]['payment_id']}".encode()
+            )]
+            if not latest[0]["receipt_path"]:
+                order_buttons.append(Button.inline(
+                    "لغو سفارش", f"payc:{latest[0]['payment_id']}".encode()
+                ))
+            buttons.insert(0, order_buttons)
+        buttons.append([Button.inline("↩️ منوی اصلی", b"menu:main")])
+        await self._edit_or_reply(
+            event,
+            f"📊 اعتبار من\n\n⏳ اعتبار باقی‌مانده: {balance}",
+            buttons,
+        )
+
+    async def _show_plans(self, event) -> None:
+        plans = [plan for plan in await self.db.plans() if plan["price"] > 0]
+        lines = ["💳 خرید اشتراک", ""]
+        buttons: list[list] = []
+        if not plans:
+            lines.append("در حال حاضر بسته‌ای برای خرید موجود نیست.")
+        else:
+            lines.append("بسته را انتخاب کنید. اعتبار هر خرید به موجودی شما اضافه می‌شود.")
+            for plan in plans:
+                hours = float(plan["hours"])
+                hours_text = to_persian_digits(int(hours) if hours.is_integer() else hours)
+                duration = format_duration(int(round(hours * 3600)))
+                validity = format_validity(plan["validity_days"])
                 lines.append(
-                    f"• {plan_labels.get(item['plan_code'], item['plan_code'])} — {status}"
+                    f"\n• {duration}\n  اعتبار: {validity} | مبلغ: {format_toman(plan['price'])}"
                 )
-                if is_open_payment(item["status"]):
-                    pending_buttons = [Button.inline(
-                        "ادامهٔ درخواست باز", f"payopen:{item['payment_id']}".encode()
-                    )]
-                    if not item["receipt_path"]:
-                        pending_buttons.append(Button.inline(
-                            "لغو درخواست خرید", f"payc:{item['payment_id']}".encode()
-                        ))
-                    buttons.insert(0, pending_buttons)
-        lines.append("")
-        lines.append(f"اعتبار اولیهٔ «{FREE_PLAN_NAME}» برای همهٔ کاربران فعال می‌شود.")
-        buttons.append([Button.inline("🔙 منوی اصلی", b"menu:main")])
+                if self.settings.payment_card_number:
+                    label = button_label(
+                        f"{hours_text} ساعت — {format_toman(plan['price'])}"
+                    )
+                    buttons.append([Button.inline(label, f"plan:{plan['code']}".encode())])
+            if not self.settings.payment_card_number:
+                lines.append("\nپرداخت کارت‌به‌کارت در حال حاضر غیرفعال است.")
+        buttons.append([Button.inline("🎧 پشتیبانی", b"support")])
+        buttons.append([Button.inline("↩️ منوی اصلی", b"menu:main")])
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_payment_history(self, event, user_id: int, page: int = 0) -> None:
+        page_size = 6
+        rows = await self.db.payment_history_paginated(
+            user_id, limit=page_size + 1, offset=page * page_size
+        )
+        has_more = len(rows) > page_size
+        rows = rows[:page_size]
+        lines = [f"🧾 پرداخت‌های من — صفحهٔ {to_persian_digits(page + 1)}"]
+        buttons: list[list] = []
+        if not rows:
+            lines.append("\nپرداختی ثبت نشده است." if page == 0 else "\nمورد دیگری وجود ندارد.")
+        for item in rows:
+            seconds = item.get("purchased_seconds")
+            plan = format_duration(int(seconds)) if seconds else item["plan_code"]
+            price = item.get("purchased_price")
+            amount = format_toman(int(price)) if price is not None else "مبلغ نامشخص"
+            lines.append(
+                f"\n#{to_persian_digits(item['payment_id'])} | {plan} | {amount}\n"
+                f"{self._payment_status_label(item['status'])}"
+            )
+            if item["status"] == "rejected" and item.get("review_reason"):
+                lines.append(f"دلیل: {item['review_reason']}")
+            if is_open_payment(item["status"]):
+                buttons.append([Button.inline(
+                    f"🔎 پیگیری سفارش {to_persian_digits(item['payment_id'])}",
+                    f"payopen:{item['payment_id']}".encode(),
+                )])
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"payments:{page - 1}".encode()))
+        if has_more:
+            nav.append(Button.inline("بعدی ▶️", f"payments:{page + 1}".encode()))
+        if nav:
+            buttons.append(nav)
+        buttons.append([Button.inline("💳 خرید اشتراک", b"buy")])
+        buttons.append([Button.inline("↩️ منوی اصلی", b"menu:main")])
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _start_payment(self, event, plan_code: str) -> None:
@@ -2831,8 +2932,8 @@ class GamasBot:
             payment_id = await self.db.create_payment(event.sender_id, plan_code)
         except OpenPaymentError:
             await event.respond(
-                "⚠️ شما یک درخواست پرداخت باز دارید؛ از بخش اعتبار و پرداخت آن را ادامه دهید "
-                "یا پیش از ارسال رسید، درخواست را لغو کنید."
+                "⚠️ یک سفارش باز دارید. ابتدا آن را پیگیری یا لغو کنید.",
+                buttons=[[Button.inline("🧾 پرداخت‌های من", b"payments")]],
             )
             return
         except ValueError:
@@ -2859,25 +2960,33 @@ class GamasBot:
         card = format_payment_card(self.settings.payment_card_number)
         hours = plan["hours"]
         hours_text = to_persian_digits(int(hours) if float(hours).is_integer() else hours)
-        text = (
-            f"🧾 خرید بستهٔ {hours_text} ساعته\n\n"
-            f"مبلغ قابل پرداخت: {format_toman(plan['price'])}\n"
-            f"اعتبار این بسته تا {format_validity(plan['validity_days'])} معتبر است.\n\n"
-            "اطلاعات واریز کارت‌به‌کارت:\n"
-            f"💳 شماره کارت: {card}\n"
-            f"👤 به نام: {self.settings.payment_card_holder}\n"
-            f"🏦 بانک: {self.settings.payment_bank_name}\n\n"
-            "پس از واریز، «واریز کردم؛ ارسال رسید» را انتخاب کنید و تصویر رسید را بفرستید. "
-            "پس از بررسی و تأیید مدیر، اعتبار به حساب شما اضافه می‌شود. بررسی ممکن است چند ساعت طول بکشد."
+        order_ref = to_persian_digits(payment_id)
+        summary = (
+            f"🧾 سفارش {order_ref}\n"
+            f"بسته: {hours_text} ساعت | مبلغ: {format_toman(plan['price'])}\n"
+            f"اعتبار بسته: {format_validity(plan['validity_days'])}"
         )
         if payment["receipt_path"]:
-            text += "\n\n✅ رسید ثبت شده و در انتظار بررسی است؛ نیازی به واریز مجدد نیست."
+            text = (
+                f"{summary}\n\n"
+                "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است؛ نیازی به واریز مجدد نیست. "
+                "پس از بررسی، نتیجه اطلاع‌رسانی می‌شود."
+            )
             buttons = []
         else:
-            buttons = [[Button.inline("📤 واریز کردم؛ ارسال رسید", f"payr:{payment_id}".encode())]]
-        if not payment["receipt_path"]:
-            buttons.append([Button.inline("لغو درخواست خرید", f"payc:{payment_id}".encode())])
-        buttons.append([Button.inline("🔙 بازگشت", b"account")])
+            text = (
+                f"{summary}\n\n"
+                "اطلاعات واریز:\n"
+                f"💳 شماره کارت: {card}\n"
+                f"به نام: {self.settings.payment_card_holder}\n"
+                f"بانک: {self.settings.payment_bank_name}\n\n"
+                "پس از واریز، تصویر رسید را ارسال کنید. اعتبار فقط پس از تأیید مدیر اضافه می‌شود."
+            )
+            buttons = [
+                [Button.inline("📤 ارسال رسید", f"payr:{payment_id}".encode())],
+                [Button.inline("لغو سفارش", f"payc:{payment_id}".encode())],
+            ]
+        buttons.append([Button.inline("↩️ بازگشت", b"payments")])
         await event.respond(text, buttons=buttons)
 
     async def _cancel_payment(self, event, payment_id: int) -> None:
@@ -2893,15 +3002,16 @@ class GamasBot:
         payment = await self.db.payment(payment_id)
         if (
             payment is None
-            or not is_open_payment(payment["status"])
+            or payment["status"] not in ("awaiting_payment", "pending")
+            or payment["receipt_path"]
             or payment["user_id"] != event.sender_id
         ):
-            await event.respond("این درخواست فعال نیست.")
+            await event.respond("این سفارش برای ارسال رسید فعال نیست.")
             return
         self._pending_payments[event.sender_id] = payment_id
         await event.respond(
-            "📷 لطفاً تصویر خوانای رسید را به‌صورت عکس، همین‌جا در گفت‌وگو بفرستید.",
-            buttons=[[Button.inline("↩️ بازگشت (فقط لغو ارسال تصویر)", b"account")]],
+            "📷 تصویر خوانای رسید را به‌صورت عکس یا فایل تصویری بفرستید.",
+            buttons=[[Button.inline("↩️ بازگشت", f"payopen:{payment_id}".encode())]],
         )
 
     async def _handle_receipt_upload(self, event, user_id: int) -> None:
@@ -2911,12 +3021,16 @@ class GamasBot:
         payment = await self.db.payment(payment_id)
         if (
             payment is None
-            or not is_open_payment(payment["status"])
+            or payment["status"] not in ("awaiting_payment", "pending")
+            or payment["receipt_path"]
             or payment["user_id"] != user_id
         ):
-            await event.respond("این درخواست فعال نیست.")
+            self._pending_payments.pop(user_id, None)
+            await event.respond("این سفارش برای ارسال رسید فعال نیست.")
             return
-        if event.message.photo is None:
+        if not _is_receipt_image(event.message):
+            self._pending_payments[user_id] = payment_id
+            await event.respond("رسید باید عکس یا فایل تصویری JPEG/PNG/WebP باشد.")
             return
         size = getattr(event.message.file, "size", None)
         if isinstance(size, int) and size > self.settings.max_payment_receipt_bytes:
@@ -2942,8 +3056,10 @@ class GamasBot:
         try:
             # Decode and re-encode so an image/polyglot is never persisted as
             # an executable-looking payload, regardless of its original format.
-            if not _normalize_receipt_image(
-                receipt_path, max_bytes=self.settings.max_payment_receipt_bytes
+            if not await asyncio.to_thread(
+                _normalize_receipt_image,
+                receipt_path,
+                max_bytes=self.settings.max_payment_receipt_bytes,
             ):
                 receipt_path.unlink(missing_ok=True)
                 await event.respond("فرمت رسید نامعتبر است؛ فقط JPEG/PNG/WebP پذیرفته می‌شود.")
@@ -2955,12 +3071,23 @@ class GamasBot:
             self._pending_payments[user_id] = payment_id
             await event.respond("ذخیرهٔ رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
             return
-        if not await self.db.set_payment_receipt(payment_id, str(receipt_path)):
+        try:
+            changed = await self.db.set_payment_receipt(
+                payment_id, str(receipt_path), user_id=user_id
+            )
+        except sqlite3.Error:
             receipt_path.unlink(missing_ok=True)
-            await event.respond("این درخواست دیگر فعال نیست.")
+            self._pending_payments[user_id] = payment_id
+            logger.exception("payment receipt storage failed payment_id=%s", payment_id)
+            await event.respond("ثبت رسید انجام نشد؛ لطفاً دوباره ارسال کنید.")
+            return
+        if not changed:
+            receipt_path.unlink(missing_ok=True)
+            await event.respond("این سفارش دیگر برای ارسال رسید فعال نیست.")
             return
         await event.respond(
-            "✅ رسید ثبت شد. پس از بررسی و تأیید مدیر، اعتبار به حسابتان اضافه می‌شود."
+            "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است. "
+            "پس از بررسی، نتیجه اطلاع‌رسانی می‌شود."
         )
         await self._notify_admins_of_payment(payment_id)
 
@@ -2968,70 +3095,150 @@ class GamasBot:
         payment = await self.db.payment(payment_id)
         if payment is None:
             return
+        seconds = int(payment.get("purchased_seconds") or 0)
+        price = payment.get("purchased_price")
         text = (
-            f"🧾 پرداخت جدید شمارهٔ {to_persian_digits(payment_id)}\n"
+            f"🧾 رسید سفارش {to_persian_digits(payment_id)}\n"
             f"کاربر: {payment['user_id']}\n"
-            f"طرح: {payment['plan_code']}\n"
-            "برای بررسی رسید، وارد پنل مدیریت شوید و بخش «پرداخت‌ها» را باز کنید."
+            f"بسته: {format_duration(seconds) if seconds else payment['plan_code']}\n"
+            f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}"
         )
-        for admin_id in self.settings.admin_ids:
+        buttons = [[Button.inline(
+            "🔎 جزئیات سفارش", f"adm:pd:{payment_id}".encode()
+        )]]
+        path = payment.get("receipt_path")
+        receipt_ready = bool(
+            path and _is_safe_receipt_path(self.settings.receipt_dir, path)
+        )
+        for admin_id in sorted(self.settings.admin_ids):
             try:
-                await self.client.send_message(
-                    admin_id, text,
-                    buttons=[[Button.inline("🧾 بررسی پرداخت", b"adm:pay")]],
-                )
+                if receipt_ready:
+                    try:
+                        await self.client.send_file(
+                            admin_id,
+                            path,
+                            caption=text[:TELEGRAM_CAPTION_LIMIT],
+                            buttons=buttons,
+                        )
+                    except Exception:
+                        # A temporary image-upload failure should not suppress
+                        # the review alert itself. The stored receipt remains
+                        # available from the order-detail screen.
+                        logger.warning(
+                            "payment receipt delivery failed payment_id=%s admin_id=%s",
+                            payment_id,
+                            admin_id,
+                        )
+                        await self.client.send_message(
+                            admin_id,
+                            text + "\n⚠️ رسید تصویری ارسال نشد؛ آن را از جزئیات سفارش ببینید.",
+                            buttons=buttons,
+                        )
+                else:
+                    await self.client.send_message(
+                        admin_id,
+                        text + "\n⚠️ فایل رسید در دسترس نیست.",
+                        buttons=buttons,
+                    )
             except Exception:
-                logger.warning("could not notify admin=%s", admin_id)
+                logger.warning(
+                    "payment notification not delivered payment_id=%s admin_id=%s",
+                    payment_id,
+                    admin_id,
+                )
 
     async def _review_payment(self, event, data: str) -> None:
-        # payv:<id>:a | payv:<id>:r
-        try:
-            _, raw_id, verdict = data.split(":", 2)
-            payment_id = int(raw_id)
-        except ValueError:
+        """Handle payv:<id>:a, payv:<id>:a:yes and payv:<id>:r safely."""
+        parts = data.split(":")
+        if (
+            len(parts) not in (3, 4)
+            or parts[0] != "payv"
+            or parts[2] not in ("a", "r")
+            or (len(parts) == 4 and (parts[2] != "a" or parts[3] != "yes"))
+        ):
             await self._ack(event, "درخواست نامعتبر است.", alert=True)
             return
-        approved = verdict == "a"
-        payment = await self.db.payment(payment_id)
-        if payment is None or not is_open_payment(payment["status"]):
-            await self._ack(event, "این پرداخت قبلاً بررسی شده است.", alert=True)
-            await self._show_admin_payments(event)
+        payment_id = _to_int(parts[1])
+        if payment_id is None:
+            await self._ack(event, "شناسه سفارش نامعتبر است.", alert=True)
             return
-        if not approved:
-            # A rejection must carry a reason, so ask for it before changing
-            # any row (audit F-15).
+        verdict = parts[2]
+        payment = await self.db.payment(payment_id)
+        if payment is None or not is_pending_payment_review(payment):
+            await self._ack(
+                event,
+                "سفارش قابل بررسی نیست؛ ابتدا رسید باید ثبت شود یا سفارش قبلاً بررسی شده است.",
+                alert=True,
+            )
+            await self._show_admin_payment_detail(event, payment_id)
+            return
+        if verdict == "r":
             self._pending_reject_reason[event.sender_id] = payment_id
-            await self._ack(event, "برای رد پرداخت، واردکردن دلیل الزامی است.", alert=True)
+            await self._ack(event, "برای رد پرداخت، دلیل لازم است.", alert=True)
             await event.respond(
-                f"✍️ دلیل رد پرداخت #{to_persian_digits(payment_id)} را در پیام بعدی بنویسید. "
-                "با ارسال دلیل، پرداخت رد می‌شود. برای لغو /cancel بفرستید یا دکمهٔ زیر را انتخاب کنید.",
-                buttons=[[Button.inline("↩️ لغو", b"adm:pay")]],
+                f"دلیل رد سفارش {to_persian_digits(payment_id)} را بنویسید.\n"
+                "برای لغو، /cancel بفرستید.",
+                buttons=[[Button.inline("↩️ بازگشت", f"adm:pd:{payment_id}".encode())]],
+            )
+            return
+        if len(parts) == 3:
+            # The first approval tap only renders a confirmation; it never
+            # changes payment or credit state.
+            await self._ack(event)
+            seconds = int(payment.get("purchased_seconds") or 0)
+            price = payment.get("purchased_price")
+            await self._edit_or_reply(
+                event,
+                f"✅ تأیید سفارش {to_persian_digits(payment_id)}\n\n"
+                f"کاربر: {payment['user_id']}\n"
+                f"اعتبار: {format_duration(seconds)}\n"
+                f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}\n\n"
+                "پس از تأیید نهایی، اعتبار به حساب کاربر اضافه می‌شود.",
+                [
+                    [Button.inline("✅ تأیید نهایی", f"payv:{payment_id}:a:yes".encode())],
+                    [Button.inline("↩️ بازگشت", f"adm:pd:{payment_id}".encode())],
+                ],
             )
             return
         try:
             changed = await self.db.review_payment(payment_id, True, event.sender_id)
         except PaymentSnapshotError:
-            logger.error("payment approval without a snapshot payment=%s", payment_id)
+            logger.error("payment approval without a valid snapshot payment_id=%s", payment_id)
             await self._ack(
                 event,
-                "اطلاعات خرید این پرداخت کامل نیست؛ تأیید انجام نشد. لطفاً جزئیات طرح را بررسی کنید.",
+                "اطلاعات بسته یا مبلغ ناقص است؛ تأیید انجام نشد.",
+                alert=True,
+            )
+            return
+        except sqlite3.Error:
+            # review_payment is atomic. The order remains pending_review and
+            # the same confirmation can be retried without duplicating credit.
+            logger.exception("payment activation failed payment_id=%s", payment_id)
+            await self._ack(
+                event,
+                "فعال‌سازی انجام نشد. سفارش همچنان در انتظار بررسی است؛ بعداً دوباره تلاش کنید.",
                 alert=True,
             )
             return
         if not changed:
-            await self._ack(event, "این پرداخت قبلاً بررسی شده است.", alert=True)
+            await self._ack(event, "این سفارش قبلاً بررسی شده است.", alert=True)
         else:
-            await self._ack(event, "ثبت شد.")
-            # The credited amount is the purchase snapshot, never the live plan.
+            await self._ack(event, "پرداخت تأیید و اعتبار فعال شد.")
             seconds = int(payment["purchased_seconds"] or 0)
-            user_text = (
-                f"✅ پرداخت شما تأیید شد؛ {format_duration(seconds)} اعتبار به حسابتان اضافه شد."
-            )
             try:
-                await self.client.send_message(payment["user_id"], user_text)
+                await self.client.send_message(
+                    payment["user_id"],
+                    "✅ پرداخت شما تأیید شد. اشتراک شما فعال است.\n"
+                    f"⏳ {format_duration(seconds)} اعتبار اضافه شد.",
+                    buttons=[[Button.inline("📊 اعتبار من", b"account")]],
+                )
             except Exception:
-                logger.warning("could not notify user=%s", payment["user_id"])
-        await self._show_admin_payments(event)
+                logger.warning(
+                    "payment approval notification not delivered payment_id=%s user_id=%s",
+                    payment_id,
+                    payment["user_id"],
+                )
+        await self._show_admin_payment_detail(event, payment_id)
 
     async def _reject_payment_with_reason(
         self, event, payment_id: int, reason: str
@@ -3041,27 +3248,39 @@ class GamasBot:
             await event.reply("برای رد پرداخت، واردکردن دلیل الزامی است.", buttons=self._admin_menu())
             return
         payment = await self.db.payment(payment_id)
-        changed = await self.db.review_payment(
-            payment_id, False, event.sender_id, reason=reason
-        )
+        try:
+            changed = await self.db.review_payment(
+                payment_id, False, event.sender_id, reason=reason
+            )
+        except sqlite3.Error:
+            logger.exception("payment rejection failed payment_id=%s", payment_id)
+            await event.reply("رد پرداخت ثبت نشد؛ لطفاً دوباره تلاش کنید.")
+            self._pending_reject_reason[event.sender_id] = payment_id
+            return
         if not changed:
-            await event.reply("این پرداخت قبلاً بررسی شده است.")
+            await event.reply("این سفارش قبلاً بررسی شده است یا رسید ندارد.")
         else:
-            await event.reply(f"پرداخت #{to_persian_digits(payment_id)} رد شد.")
+            await event.reply(f"❌ سفارش {to_persian_digits(payment_id)} رد شد.")
             if payment is not None:
                 try:
                     await self.client.send_message(
                         payment["user_id"],
-                        "❌ پرداخت شما تأیید نشد. برای پیگیری، لطفاً با پشتیبانی تماس بگیرید.",
+                        f"❌ پرداخت تأیید نشد.\nدلیل: {reason[:400]}\n"
+                        "برای پیگیری می‌توانید درخواست پشتیبانی ثبت کنید.",
+                        buttons=[[Button.inline("🎧 پشتیبانی", b"support")]],
                     )
                 except Exception:
-                    logger.warning("could not notify user=%s", payment["user_id"])
-        await self._show_admin_payments(event)
+                    logger.warning(
+                        "payment rejection notification not delivered payment_id=%s user_id=%s",
+                        payment_id,
+                        payment["user_id"],
+                    )
+        await self._show_admin_payment_detail(event, payment_id)
 
     # ----------------------------------------------------------------- admin
     async def _show_admin_overview(self, event) -> None:
         stats = await self.db.stats()
-        pending = len(await self.db.pending_payments())
+        pending = len(await self.db.pending_review_payments())
         text = (
             "🛠 پنل مدیریت | آمار و وضعیت\n\n"
             f"👥 کاربران ثبت‌شده: {to_persian_digits(stats['users'])}\n"
@@ -3126,51 +3345,106 @@ class GamasBot:
         await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
 
     async def _show_admin_payments(self, event) -> None:
-        payments = await self.db.pending_payments()
+        """List only receipt-backed orders that actually need a decision."""
+        payments = await self.db.pending_review_payments()
+        buttons: list[list] = [
+            [Button.inline("📋 تاریخچه پرداخت‌ها", b"adm:ph:0")]
+        ]
         if not payments:
+            buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
             await self._edit_or_reply(
                 event,
-                "🧾 پرداخت‌ها\n\nدر حال حاضر پرداختی برای بررسی وجود ندارد.",
-                self._admin_menu(),
+                "💳 پرداخت‌های در انتظار\n\nدر حال حاضر پرداختی برای بررسی وجود ندارد.",
+                buttons,
             )
             return
-        buttons = []
         lines = [
-            f"🧾 پرداخت‌های در انتظار بررسی — {to_persian_digits(len(payments))} مورد",
-            "",
-            "در صورت نیاز رسید را مشاهده کنید؛ سپس «تأیید پرداخت» یا «رد پرداخت» را انتخاب کنید.",
-            "برای رد پرداخت، در پیام بعدی واردکردن دلیل الزامی است.",
-            "",
+            f"💳 پرداخت‌های در انتظار — {to_persian_digits(len(payments))} مورد",
+            "برای مشاهده رسید و تصمیم، سفارش را باز کنید.",
         ]
         for payment in payments:
             number = to_persian_digits(payment["payment_id"])
-            receipt_row = [Button.inline(
-                "📷 مشاهدهٔ رسید", f"adm:rcpt:{payment['payment_id']}".encode()
-            )]
-            receipt_status = "ثبت شده ✅" if payment["receipt_path"] else "ثبت نشده ❌"
-            purchased_seconds = payment.get("purchased_seconds")
-            purchased_price = payment.get("purchased_price")
-            package = (
-                format_duration(int(purchased_seconds))
-                if purchased_seconds is not None
-                else payment["plan_code"]
-            )
-            price = (
-                format_toman(int(purchased_price))
-                if purchased_price is not None
-                else "نامشخص"
-            )
+            seconds = payment.get("purchased_seconds")
+            price = payment.get("purchased_price")
+            package = format_duration(int(seconds)) if seconds is not None else payment["plan_code"]
+            amount = format_toman(int(price)) if price is not None else "نامشخص"
             lines.append(
-                f"#{number} | شناسهٔ کاربر: {payment['user_id']} | "
-                f"بسته: {package} | مبلغ: {price} | رسید: {receipt_status}"
+                f"\n#{number} | کاربر: {payment['user_id']}\n{package} | {amount}"
             )
+            buttons.append([Button.inline(
+                f"🔎 جزئیات سفارش {number}", f"adm:pd:{payment['payment_id']}".encode()
+            )])
+        buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_payment_history(self, event, page: int = 0) -> None:
+        page_size = 8
+        payments = await self.db.all_payments(
+            limit=page_size + 1, offset=page * page_size
+        )
+        has_more = len(payments) > page_size
+        payments = payments[:page_size]
+        lines = [f"📋 تاریخچه پرداخت‌ها — صفحهٔ {to_persian_digits(page + 1)}"]
+        buttons: list[list] = []
+        if not payments:
+            lines.append("\nسفارشی ثبت نشده است." if page == 0 else "\nمورد دیگری وجود ندارد.")
+        for payment in payments:
+            number = to_persian_digits(payment["payment_id"])
+            lines.append(
+                f"\n#{number} | کاربر: {payment['user_id']} | "
+                f"{self._payment_status_label(payment['status'])}"
+            )
+            buttons.append([Button.inline(
+                f"🔎 جزئیات سفارش {number}", f"adm:pd:{payment['payment_id']}".encode()
+            )])
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"adm:ph:{page - 1}".encode()))
+        if has_more:
+            nav.append(Button.inline("بعدی ▶️", f"adm:ph:{page + 1}".encode()))
+        if nav:
+            buttons.append(nav)
+        buttons.append([Button.inline("💳 پرداخت‌های در انتظار", b"adm:pay")])
+        buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_payment_detail(self, event, payment_id: int) -> None:
+        payment = await self.db.payment(payment_id)
+        if payment is None:
+            await self._ack(event, "سفارش پیدا نشد.", alert=True)
+            await self._show_admin_payments(event)
+            return
+        seconds = payment.get("purchased_seconds")
+        price = payment.get("purchased_price")
+        lines = [
+            f"🔎 سفارش {to_persian_digits(payment_id)}",
+            f"کاربر: {payment['user_id']}",
+            f"بسته: {format_duration(int(seconds)) if seconds is not None else payment['plan_code']}",
+            f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}",
+            f"وضعیت: {self._payment_status_label(payment['status'])}",
+            f"ثبت: {payment['created_at']}",
+            f"رسید: {'ثبت شده' if payment['receipt_path'] else 'ثبت نشده'}",
+        ]
+        if payment.get("reviewed_at"):
+            lines.append(f"بررسی: {payment['reviewed_at']} | مدیر: {payment['reviewed_by']}")
+        if payment.get("review_reason"):
+            lines.append(f"دلیل: {payment['review_reason']}")
+        if payment["status"] == "approved":
+            credit_state = "ثبت شده" if payment.get("credit_ledger_id") else "سابقهٔ قدیمی"
+            lines.append(f"اعتبار متصل به سفارش: {credit_state}")
+        buttons: list[list] = []
+        if payment["receipt_path"]:
+            buttons.append([Button.inline(
+                "📷 مشاهده رسید", f"adm:rcpt:{payment_id}".encode()
+            )])
+        if is_pending_payment_review(payment):
             buttons.append([
-                Button.inline("✅ تأیید پرداخت", f"payv:{payment['payment_id']}:a".encode()),
-                Button.inline("❌ رد پرداخت", f"payv:{payment['payment_id']}:r".encode()),
+                Button.inline("✅ تأیید پرداخت", f"payv:{payment_id}:a".encode()),
+                Button.inline("❌ رد پرداخت", f"payv:{payment_id}:r".encode()),
             ])
-            if payment["receipt_path"]:
-                buttons.append(receipt_row)
-        buttons.append([Button.inline("🔙 بازگشت به پنل مدیریت", b"adm:home")])
+        buttons.append([Button.inline("💳 پرداخت‌های در انتظار", b"adm:pay")])
+        buttons.append([Button.inline("📋 تاریخچه پرداخت‌ها", b"adm:ph:0")])
+        buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _show_receipt(self, event, data: str) -> None:
@@ -3192,8 +3466,10 @@ class GamasBot:
         if (
             not path
             or not _is_safe_receipt_path(self.settings.receipt_dir, path)
-            or not _normalize_receipt_image(
-                Path(path), max_bytes=self.settings.max_payment_receipt_bytes
+            or not await asyncio.to_thread(
+                _normalize_receipt_image,
+                Path(path),
+                max_bytes=self.settings.max_payment_receipt_bytes,
             )
         ):
             await self._ack(event, "برای این پرداخت رسید معتبری ثبت نشده است.", alert=True)
@@ -3201,12 +3477,12 @@ class GamasBot:
         await self._ack(event)
         number = to_persian_digits(payment_id)
         buttons: list[list] = []
-        if is_open_payment(payment["status"]):
+        if is_pending_payment_review(payment):
             buttons.append([
                 Button.inline("✅ تأیید پرداخت", f"payv:{payment_id}:a".encode()),
                 Button.inline("❌ رد پرداخت", f"payv:{payment_id}:r".encode()),
             ])
-        buttons.append([Button.inline("🔙 فهرست پرداخت‌ها", b"adm:pay")])
+        buttons.append([Button.inline("↩️ جزئیات سفارش", f"adm:pd:{payment_id}".encode())])
         # The same supported file API as every other delivery, as a photo
         # (no ``force_document``): receipts are viewed in the app, not filed.
         await self.client.send_file(
@@ -3486,14 +3762,12 @@ class GamasBot:
     # ------------------------------------------------------------- support
     SUPPORT_PAGE_SIZE = 8
     SUPPORT_HISTORY_PAGE = 6
-    #: Longest part of one message shown on a history screen (the stored text is complete).
-    SUPPORT_VIEW_CHARS = 900
 
     @staticmethod
     def _support_when(value: str | None) -> str:
         if not value:
             return "—"
-        return to_persian_digits(value[:16].replace("T", " ")) + " (UTC)"
+        return to_persian_digits(value[:16].replace("T", " ")) + " به وقت جهانی"
 
     @staticmethod
     def _support_status_label(status: str) -> str:
@@ -3503,17 +3777,36 @@ class GamasBot:
     def _support_category_label(category: str) -> str:
         return SUPPORT_CATEGORY_BUTTONS.get(category, category)
 
-    def _support_history_text(self, messages: list[dict], total: int, offset: int) -> str:
+    def _support_history_text(
+        self, messages: list[dict], total: int, offset: int, *, viewer: str = "user"
+    ) -> str:
+        """Render complete messages; Telegram-sized chunks are handled later."""
         lines: list[str] = []
         if total > offset + len(messages):
             lines.append("… پیام‌های قدیمی‌تر در صفحهٔ بعدی")
         for message in messages:
-            who = "👤 شما" if message["sender_role"] == "user" else "🎧 پشتیبانی"
-            body = message["message_text"]
-            if len(body) > self.SUPPORT_VIEW_CHARS:
-                body = body[: self.SUPPORT_VIEW_CHARS] + " …"
-            lines.append(f"{who} · {self._support_when(message['created_at'])}\n{body}")
+            if message["sender_role"] == "admin":
+                who = "🎧 پشتیبانی"
+            elif viewer == "admin":
+                who = f"👤 کاربر {message['sender_id']}"
+            else:
+                who = "👤 شما"
+            lines.append(
+                f"{who} · {self._support_when(message['created_at'])}\n"
+                f"{message['message_text']}"
+            )
         return "\n\n".join(lines) if lines else "هنوز پیامی ثبت نشده است."
+
+    async def _show_ticket_screen(self, event, text: str, buttons) -> None:
+        """Send every character of a history without exceeding Telegram limits."""
+        pages = split_message(text)
+        await self._edit_or_reply(
+            event, pages[0], buttons if len(pages) == 1 else None
+        )
+        for index, page in enumerate(pages[1:], start=1):
+            await event.respond(
+                page, buttons=buttons if index == len(pages) - 1 else None
+            )
 
     async def _notify_admins(self, text: str, buttons=None) -> None:
         """Tell every administrator something happened. Failures are logged, never raised."""
@@ -3617,8 +3910,8 @@ class GamasBot:
             buttons.append([Button.inline("پیام‌های قدیمی‌تر ▶️", f"sup:v:{ticket_id}:{page + 1}".encode())])
         if page > 0:
             buttons.append([Button.inline("◀️ پیام‌های جدیدتر", f"sup:v:{ticket_id}:{page - 1}".encode())])
-        buttons.append([Button.inline("🔙 درخواست‌های من", b"sup:list")])
-        await self._edit_or_reply(event, text, buttons)
+        buttons.append([Button.inline("↩️ درخواست‌های من", b"sup:list")])
+        await self._show_ticket_screen(event, text, buttons)
 
     async def _handle_support_callback(self, event, user_id: int, data: str) -> None:
         parts = data.split(":")
@@ -3706,15 +3999,17 @@ class GamasBot:
             return
         if kind == "new":
             try:
-                ticket = await self.db.create_ticket(user_id, value, text)
+                ticket = await self.db.create_ticket(
+                    user_id,
+                    value,
+                    text,
+                    initial_message=text,
+                    telegram_message_id=getattr(event.message, "id", None),
+                )
             except ValueError:
                 await event.reply("موضوع باید بین ۲ تا ۴۰۰ نویسه باشد؛ دوباره بنویسید.")
                 return
             self._support_states.pop(user_id, None)
-            await self.db.add_ticket_message(
-                ticket["id"], user_id, "user", text,
-                telegram_message_id=getattr(event.message, "id", None),
-            )
             logger.info("support ticket created ticket=%s category=%s", ticket["id"], value)
             await event.reply(
                 "✅ درخواست شما ثبت شد.\n"
@@ -3732,15 +4027,19 @@ class GamasBot:
             )
             return
         # kind == "reply": the ticket id came from a verified ownership check.
-        self._support_states.pop(user_id, None)
+        if len(text) > self.db.SUPPORT_MESSAGE_MAX:
+            await event.reply("پیام باید حداکثر ۴۰۰۰ نویسه باشد؛ کوتاه‌تر بنویسید.")
+            return
         try:
             await self.db.add_ticket_message(
                 value, user_id, "user", text,
                 telegram_message_id=getattr(event.message, "id", None),
             )
         except (ValueError, PermissionError, TicketStateError):
+            self._support_states.pop(user_id, None)
             await event.reply("این درخواست دیگر پاسخ‌پذیر نیست؛ ابتدا آن را باز کنید.")
             return
+        self._support_states.pop(user_id, None)
         ticket = await self.db.get_ticket(value)
         public_id = ticket["public_ticket_id"] if ticket else str(value)
         await event.reply(
@@ -3753,16 +4052,25 @@ class GamasBot:
         )
 
     async def _handle_admin_support_text(self, event, admin_id: int, ticket_id: int, text: str) -> None:
-        self._support_admin_states.pop(admin_id, None)
         if not text:
             await event.reply("پاسخ باید متن داشته باشد؛ دوباره متن را بفرستید یا /cancel بزنید.")
-            self._support_admin_states[admin_id] = ticket_id
+            return
+        if len(text) > self.db.SUPPORT_MESSAGE_MAX:
+            await event.reply("پاسخ باید حداکثر ۴۰۰۰ نویسه باشد؛ کوتاه‌تر بنویسید.")
             return
         try:
-            await self.db.add_ticket_message(ticket_id, admin_id, "admin", text)
+            await self.db.add_ticket_message(
+                ticket_id,
+                admin_id,
+                "admin",
+                text,
+                telegram_message_id=getattr(event.message, "id", None),
+            )
         except (ValueError, TicketStateError):
+            self._support_admin_states.pop(admin_id, None)
             await event.reply("این درخواست دیگر پاسخ‌پذیر نیست؛ ابتدا آن را باز کنید.", buttons=self._admin_menu())
             return
+        self._support_admin_states.pop(admin_id, None)
         ticket = await self.db.get_ticket(ticket_id)
         public_id = ticket["public_ticket_id"] if ticket else str(ticket_id)
         logger.info("support admin reply ticket=%s admin=%s", ticket_id, admin_id)
@@ -3844,7 +4152,7 @@ class GamasBot:
             f"ثبت: {self._support_when(ticket['created_at'])} | "
             f"آخرین تغییر: {self._support_when(ticket['updated_at'])}\n"
         )
-        text = f"{head}\n{self._support_history_text(messages, total, offset)}"
+        text = f"{head}\n{self._support_history_text(messages, total, offset, viewer='admin')}"
         buttons = []
         if ticket["status"] != "closed":
             buttons.append([Button.inline("✍️ پاسخ به کاربر", f"adm:sr:{ticket_id}".encode())])
@@ -3855,8 +4163,8 @@ class GamasBot:
             buttons.append([Button.inline("پیام‌های قدیمی‌تر ▶️", f"adm:sv:{ticket_id}:{page + 1}".encode())])
         if page > 0:
             buttons.append([Button.inline("◀️ پیام‌های جدیدتر", f"adm:sv:{ticket_id}:{page - 1}".encode())])
-        buttons.append([Button.inline("🔙 فهرست پشتیبانی", b"adm:sup")])
-        await self._edit_or_reply(event, text, buttons)
+        buttons.append([Button.inline("↩️ فهرست پشتیبانی", b"adm:sup")])
+        await self._show_ticket_screen(event, text, buttons)
 
     async def _handle_admin_support_callback(self, event, admin_id: int, data: str) -> None:
         parts = data.split(":")
@@ -3978,10 +4286,19 @@ class GamasBot:
         from datetime import timedelta
 
         cutoff = datetime.now() - timedelta(days=self.settings.receipt_retention_days)
+        # Retention applies to reviewed receipts. A slow admin review must never
+        # delete the only evidence and leave an unverifiable pending order.
+        protected = {
+            payment["receipt_path"]
+            for payment in await self.db.pending_payments()
+            if payment.get("receipt_path")
+        }
         removed: list[str] = []
         for path in self.settings.receipt_dir.glob("receipt-*.jpg"):
             # Safety: only touch files strictly inside receipt_dir (audit F-H01)
             try:
+                if str(path) in protected:
+                    continue
                 if not _is_safe_receipt_path(self.settings.receipt_dir, path):
                     logger.warning("skipping unsafe receipt path=%s", _sanitize_log_value(path))
                     continue

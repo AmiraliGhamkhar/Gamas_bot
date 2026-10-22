@@ -162,6 +162,7 @@ class TransactionAndPaymentTests(DatabaseTestCase):
 
     async def test_approval_on_two_connections_credits_once(self):
         pid = await self.payment()
+        await self.db.set_payment_receipt(pid, "receipt.jpg", user_id=100)
         other = Database(self.path)
         await other.connect()
         try:
@@ -175,11 +176,12 @@ class TransactionAndPaymentTests(DatabaseTestCase):
 
     async def test_approval_failure_rolls_back_status_credit_and_audit(self):
         pid = await self.payment()
+        await self.db.set_payment_receipt(pid, "receipt.jpg", user_id=100)
         await self.fail_inserts("audit")
         with self.assertRaises(sqlite3.IntegrityError):
             await self.db.review_payment(pid, True, 1)
         await self.db.ensure_user(200)
-        self.assertEqual((await self.db.payment(pid))["status"], "awaiting_payment")
+        self.assertEqual((await self.db.payment(pid))["status"], "pending_review")
         self.assertEqual(await self.db.available_seconds(100), 0)
         await self.db._write("DROP TRIGGER fail_insert")
         self.assertTrue(await self.db.review_payment(pid, True, 1))
@@ -187,6 +189,7 @@ class TransactionAndPaymentTests(DatabaseTestCase):
 
     async def test_approval_cancelled_mid_transaction_rolls_back(self):
         pid = await self.payment()
+        await self.db.set_payment_receipt(pid, "receipt.jpg", user_id=100)
         execute = self.db.db.execute
 
         async def cancel_on_audit(sql, parameters=()):
@@ -198,7 +201,7 @@ class TransactionAndPaymentTests(DatabaseTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await self.db.review_payment(pid, True, 1)
         await self.db.ensure_user(200)
-        self.assertEqual((await self.db.payment(pid))["status"], "awaiting_payment")
+        self.assertEqual((await self.db.payment(pid))["status"], "pending_review")
         self.assertEqual(await self.db.available_seconds(100), 0)
 
     async def test_settlement_allocation_failure_rolls_back_debit_and_hold(self):
@@ -304,6 +307,7 @@ class WorkflowBotTests(BotPipelineTestCase):
         self.assertIn(format_toman(50000), text)
         self.assertNotIn(format_toman(75000), text)
         self.assertIn(f"payc:{pid}".encode(), menu_payloads(buttons))
+        await self.db.set_payment_receipt(pid, "receipt.jpg", user_id=USER_ID)
         await self.db.review_payment(pid, True, 1)
         self.assertEqual(await self.db.available_seconds(USER_ID), 18000)
 
