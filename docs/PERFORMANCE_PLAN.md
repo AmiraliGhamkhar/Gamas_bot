@@ -1,430 +1,535 @@
-# Performance plan: intake, transcode, transcription, notes
+# Performance plan, second pass: intake, transcode, transcription, notes
 
-This is a measured plan, not a wish list. Every number below is either produced by
-`python -m scripts.perf_bench` on the project's own code, or quoted from a published
-benchmark/provider document (linked). Pipeline times are modelled from those measured
-throughputs with the assumption stated next to each table, because provider latency
-depends on your keys, region and plan.
+This replaces the first pass with numbers from a deeper code read and a second benchmark
+round. Every figure is either produced by `python -m scripts.perf_bench` on this code, or
+quoted from a provider document or published benchmark (linked inline). Pipeline totals are
+modelled from those measured throughputs; the assumption is stated next to every table,
+because provider latency depends on your keys, region and plan.
 
-**Headline:** for a 2-hour lecture the wall-clock today is ≈7 minutes; ≈65–70 % of it can
-be removed without changing what the user receives (same transcript, same booklet), and
-another ~5 % is available through optional quality/latency trades. The three levers that
-matter are (1) Telegram has a single-connection download ceiling, (2) the STT *upload* is
-10× bigger than it needs to be and the STT *job* is processed serially, (3) the note layer
-sends a per-chunk-varying system prompt that defeats provider prefix caching.
+**Headline:** a 2-hour lecture takes **~7 minutes** today (405–534 s depending on which
+published speed factor you trust for the default model). **~75 % of that can be removed**,
+but the ranking of levers changed completely in this pass: the largest win is a
+**configuration choice** (STT model and provider order), not new code, and the
+segmentation work the first pass called "the big one" is now *not* worth building.
+The note layer, which the first pass dismissed, becomes the frontier for short jobs.
+
+---
+
+## 0. What changed from the first pass
+
+| First pass said | Second pass found | Why it matters |
+| --- | --- | --- |
+| STT compute ≈ 176 s; fix it by segmenting into K≤6 parallel requests | The default (`SPEECHMATICS_MODEL=enhanced`, first in `STT_PROVIDERS`) is the **slowest** route available. Speechmatics publishes speed factor **24.1× for enhanced vs 43.9× for standard vs 206× for melia-1**; Deepgram Nova-3 measures 351×. Compute is 171–300 s and **model/order choice removes 50–90 % of it with one env var** | The biggest lever was configuration. Segmentation added stitching risk to fix a problem that a config change fixes better and cheaper |
+| "Add `wait=5` to the Speechmatics status GET" | The GET endpoints **already apply a 5 s default wait**. The real feature is `wait` **on `POST /jobs`**, which returns the finished transcript inside the submission response — the status and transcript GETs disappear for short jobs | Correct mechanism, different endpoint: it removes a whole round trip instead of tightening a poll |
+| Prefix caching: "−10–25 % TTFT, −50–90 % input cost" | Measured prompt sizes: the stable rule block is **4 200 tokens** against a **21–32 k token** chunk, so it is ~10–15 % of map input. The compile prompt (1 200 tokens) is **below the 2 048-token cache floor** and can never be cached | Real but small: ~10–13 % of input cost and well under a second. Demoted from a latency lever to cost hygiene |
+| Default transcode target should be AAC 48 kbit/s | With the right libopus flags, **Opus is now both faster and smaller than AAC**: `application=audio, compression_level=0` encodes at **355×** (vs 338× AAC-fast, 106× for the shipped Opus settings) and produces **13.5 MB/h vs 21.9 MB/h** | AAC is demoted to a fallback. The shipped Opus flags are the worst tested combination on *both* axes |
+| Parallel download needs "N sockets" | Telethon pipelines concurrent requests: `MTProtoSender` keeps `_pending_state` per message id and `MessagePacker` batches them, so **4 concurrent `iter_download` iterators on one client** should already break the round-trip serialisation | Start with one connection (safer for flood waits), add borrowed senders only if the spike shows a ceiling |
+| `orjson` / response reader are micro-optimisation candidates | Measured: 3.3 MB transcript body → `orjson` 12 ms, stdlib 47 ms; bounded 256 KiB read 1 ms | Confirmed irrelevant. Do not touch |
 
 ---
 
 ## 1. What was measured, and how
 
-`scripts/perf_bench.py` (added with this plan) synthesises its own audio and Persian text,
-so it runs offline on the cPanel host before and after a change:
+`scripts/perf_bench.py` synthesises its own audio and Persian text, so it runs offline on
+the cPanel host before and after a change:
 
 ```bash
-python -m scripts.perf_bench audio --minutes 10   # decode/encode cost + output size
-python -m scripts.perf_bench cpu   --chars 108000 # note layer deterministic work
-python -m scripts.perf_bench prompts --chars 108000
+python -m scripts.perf_bench audio   --minutes 10   # format / encoder matrix
+python -m scripts.perf_bench frames  --minutes 10   # decode vs resample vs encode
+python -m scripts.perf_bench cpu     --chars 108000 # note layer deterministic work
+python -m scripts.perf_bench json                   # STT response parsing
+python -m scripts.perf_bench prompts --chars 108000 # prompt size and chunk count
 ```
 
-### 1.1 Media layer (10 min stereo AAC source, 9.7 MB)
+### 1.1 Format matrix, per audio hour (measured, 2-core sandbox)
 
-| Output | Time | Speed | Size (10 min) | Size (2 h) |
+| Target | Encode speed | Size per hour | 2 h output | 2 h encode CPU |
 | --- | ---: | ---: | ---: | ---: |
-| WAV 16 kHz mono PCM (shipped default) | 1.04 s | 574× | 19.2 MB | **230 MB** |
-| Opus 32k VoIP `compression_level=5` (shipped) | 5.85 s | 103× | 1.94 MB | **29 MB** |
-| Opus 32k VoIP `compression_level=0` | 3.72 s | 161× | 2.05 MB | 30 MB |
-| Opus 24k VoIP `compression_level=5` | 5.56 s | 108× | 1.43 MB | 21 MB |
-| AAC 48k in MP4 (16 kHz mono) | 2.78 s | 216× | 3.65 MB | **44 MB** |
-| AAC 32k in MP4 | 2.85 s | 210× | 2.45 MB | 29 MB |
-| FLAC 16 kHz | 1.15 s | 520× | 13.45 MB | 161 MB |
-| probe (separate worker process) | 0.08 s | — | — | — |
-| worker `check` (interpreter + PyAV import) | 0.09 s | — | — | — |
+| WAV 16 kHz mono PCM (today's default) | **824×** | 115 MB | 230 MB | 9 s |
+| **Opus 32k, `application=audio`, `compression_level=0`** | **355×** | **13.5 MB** | **27 MB** | **20 s** |
+| AAC 48k in MP4 (`aac_coder=fast`) | 338× | 21.9 MB | 44 MB | 21 s |
+| AAC 48k in MP4 (default `twoloop`) | 243× | 21.9 MB | 44 MB | 30 s |
+| Opus 16k, voip, cl=0 | 251× | 6.9 MB | 14 MB | 29 s |
+| Opus 24k, voip, cl=0 | 210× | 10.2 MB | 20 MB | 34 s |
+| Opus 32k, voip, cl=0 | 207× | 13.5 MB | 27 MB | 35 s |
+| **Opus 32k, voip, cl=5 — shipped today** | **106×** | 12.6 MB | 25 MB | **68 s** |
+| FLAC 16 kHz | 564× | 112 MB | 224 MB | 13 s |
 
-Three facts follow and they drive §3.2:
+Three facts drive §3.3:
 
-* WAV is 8× faster to produce than Opus but **8–10× larger**, so the choice is a pure
-  bandwidth trade, not a CPU trade.
-* **AAC is ~2× faster to encode than Opus** at one third of the WAV size. The shipped
-  Opus default is the most expensive of the three options per second of audio.
-* Extraction is never the bottleneck by itself (12 s of CPU for 2 h); it only matters when
-  it sits on the critical path in front of a slow upload.
+* The shipped `OPUS_CODEC_OPTIONS` (`voip`, `compression_level=5`) is **3.3× slower than
+  necessary**; `application=audio, compression_level=0` is faster *and* better for speech
+  recognition (libopus `voip` uses the SILK-only path; `audio` keeps the hybrid
+  SILK+CELT path, so more of the 4–8 kHz band that carries fricatives survives).
+* WAV is still the fastest to produce and 8–10× larger. It is a bandwidth trade, not a CPU
+  trade — worth ~0 s on a fast pipe, ~70 s on a 10 Mbit/s one.
+* `frame_duration=60` and `compression_level` between 0 and 5 buy nothing measurable; the
+  only flag that matters is `application`.
 
-### 1.2 Note layer CPU (108 000 characters ≈ 2 h of Persian speech)
+### 1.2 Where transcode time actually goes (null muxer, 4 min source)
 
-| Operation | Time |
+| Stage | Speed |
 | --- | ---: |
-| `build_source_index` (first call) | 0.11 s |
-| `build_source_index` (cached, `lru_cache(maxsize=16)`) | 0.000 s |
-| `split_transcript(64k)` | 0.001 s |
-| `gate_notes` (validate + audit + coverage) | **0.023 s** |
-| `build_notes_docx` (30 sections, 48 KB output) | **0.17 s** |
-| `json.dumps` of a compact payload | <0.001 s |
+| decode only (AAC → frames) | 1 985× |
+| decode + resample 48 kHz → 16 kHz mono | 947× |
+| … + PCM encode | 821× |
+| … + AAC 48k (`aac_coder=fast`) | 345× |
+| … + Opus 32k (`audio`, cl=0) | 353× |
+| … + Opus 32k (`voip`, cl=5) | 104× |
 
-The note layer's *local* work is noise next to one LLM round-trip (tens of seconds).
-`gate_notes` is synchronous on the event loop, but 23 ms is not worth moving to a thread —
-it is listed here so nobody "optimises" it instead of the network.
+Decoding is free (0.6 s per hour); the sample-rate converter adds ~50 %; **the encoder is
+the whole cost**, and only for lossy targets. So the choice of target format is the only
+lever that matters, and it must be made from *cardinality of bytes on the wire*, not from
+CPU alone.
 
-### 1.3 Prompt sizes (default settings)
+### 1.3 Note layer, deterministic work (measured)
+
+| Operation | 2 h lecture (102 k chars) | 6 h lecture (307 k chars) |
+| --- | ---: | ---: |
+| `build_source_index` (first call) | 0.11 s | 0.37 s |
+| `build_source_index` (cached) | 0.000 s | 0.000 s |
+| `split_transcript(64k)` | 0.001 s | 0.001 s |
+| `build_document` (timed words → paragraphs) | 0.02 s | 0.06 s |
+| `gate_notes` (validate + audit + coverage) | **0.014 s** | 0.015 s |
+| `build_notes_docx` (30 sections) | **0.19 s** | 0.15 s |
+
+All linear, all noise next to one LLM round trip. `gate_notes` is synchronous on the event
+loop and could be moved to a thread, but 14 ms does not justify the change.
+
+### 1.4 STT response handling (measured)
+
+| Operation | 2 h transcript (3.3 MB, 18 k words) |
+| --- | ---: |
+| `_read_bounded` (256 KiB chunk loop + join) | 1 ms |
+| `json.loads` | 47 ms |
+| `orjson.loads` (shipped) | **12 ms** |
+| `_deepgram_transcript` (build `Word` list) | 11 ms |
+
+### 1.5 Prompt sizes and rounds
 
 | Prompt | Size |
 | --- | ---: |
-| `build_system_prompt("full")` (stable rules) | 8 385 chars ≈ 4 200 tokens |
-| same + one chunk's context block | 17 840 chars ≈ 8 900 tokens |
+| `build_system_prompt("full")` — the stable rule block | 8 385 chars ≈ 4 200 tokens |
+| same + one chunk's context block (today: inside the system prompt) | 17 840 chars ≈ 8 900 tokens |
+| `COMPILE_SYSTEM_PROMPT` | 2 405 chars ≈ **1 200 tokens** (below the 2 048-token implicit-cache floor) |
 
-`effective_chunk_chars = 64 000`, `NOTE_CONCURRENCY = 3`, `NOTE_CONTEXT_TOKENS = 131 072`.
-A 2-hour lecture is **2 map requests + 1 compile request** — i.e. two serial LLM round
-trips, not ten.
-
----
-
-## 2. Where the time actually goes
-
-Model assumptions: 2-hour lecture; egress 10 Mbit/s (1.25 MB/s) from the bot host to the
-provider; Telegram ingress 1.5 MB/s on one MTProto connection (measured range in the
-Telethon community: 0.3–1.5 MB/s single, 4.7–5.6 MB/s with four connections); STT
-throughput from the September 2026 independent benchmark
-([Speechmatics 42×RT](https://echosaw.com/curated-lists/best-speech-to-text-apis/),
-[Deepgram Nova-3 351×RT](https://echosaw.com/curated-lists/best-speech-to-text-apis/)),
-note generation at ~200 output tok/s with ~3 000 output tokens per request.
-
-### Scenario A — 2 h audio, 115 MB `.m4a`, default providers (`speechmatics,deepgram,…`)
-
-| Stage | Today | Optimised | Change |
-| --- | ---: | ---: | ---: |
-| Telegram download | 77 s | 24 s | −69 % |
-| Probe | 0.1 s | 0.1 s | — |
-| Normalise/encode | 0 s (passthrough) | ~20 s on the path (segmented) | +20 s |
-| **STT POST (upload)** | **92 s** | **23 s** | **−75 %** |
-| **STT compute + polling** | **176 s** | **31 s** | **−82 %** |
-| Transcript GET | 21 s | 12 s | −43 % |
-| Raw `.txt` delivery | 2 s | 2 s | — |
-| Note generation (map+compile) | 40 s | 25 s | −38 % |
-| Word build + upload | 2 s | 2 s | — |
-| **Total** | **≈ 410 s** | **≈ 139 s** | **−66 %** |
-
-### Scenario B — 2 h video, 1 GB `.mp4` (audio extracted, WAV today)
-
-| Stage | Today | Optimised | Change |
-| --- | ---: | ---: | ---: |
-| Telegram download | 667 s | 213 s | −68 % |
-| Extract + encode | 12 s CPU → 230 MB WAV | 70 s CPU → 29 MB Opus, ~25 s on the path | −87 % bytes |
-| STT POST | 184 s | 23 s | −87 % |
-| STT compute | 176 s | 31 s | −82 % |
-| Transcript GET + notes + delivery | 65 s | 41 s | −37 % |
-| **Total** | **≈ 1 104 s** | **≈ 333 s** | **−70 %** |
-
-### Scenario C — 40 min audio with an already-fast provider (Deepgram-class)
-
-| Stage | Today | Optimised | Change |
-| --- | ---: | ---: | ---: |
-| Download + upload | 27 + 32 s | 8 + 8 s | −73 % |
-| STT compute | 12 s | 4 s | −67 % |
-| Notes + delivery | 38 s | 30 s | −21 % |
-| **Total** | **≈ 111 s** | **≈ 58 s** | **−48 %** |
-
-The lesson: **short jobs are dominated by fixed costs** (two serial LLM calls, one
-download, one upload), so the same work buys half as much. Percentages in §4 are quoted
-per phase for Scenario A unless stated otherwise.
+With `NOTE_CHUNK_CHARS=64 000` (measured): a 2 h lecture is **2 chunks → 1 map round** at
+any concurrency ≥2; a 6 h lecture is **6 chunks → 2 rounds at `NOTE_CONCURRENCY=3`, 1 round at
+6**. So the map phase is already one or two rounds, and the other round trip a real job pays
+is the **compile pass** — which is why Phase 4 attacks the compile rather than the map.
 
 ---
 
-## 3. Layer-by-layer analysis
+## 2. Where the time goes (revised)
 
-### 3.1 Telegram ingress — the ceiling is one socket, not the file
+Assumptions: 2 h lecture; bot→provider egress 10 Mbit/s (1.25 MB/s); Telegram ingress
+1.5 MB/s on one MTProto connection; note output 3 000 tokens per request at 92–887 tok/s
+(the published spread for Gemini 2.5 Flash-Lite). STT compute uses **published speed
+factors**: enhanced 24.1×, standard 43.9×, melia-1 206× (Speechmatics/Artificial Analysis),
+Deepgram Nova-3 351× (independent benchmark).
 
-`bot._download_media_limited` calls `message.download_media(file=..., progress_callback=...)`.
-Telethon's `download_media` exposes **no** `request_size`, `offset` or worker count, and the
-iterator clamps every request to `MAX_CHUNK_SIZE = 512 KiB` and awaits it before requesting
-the next range. Throughput is therefore bounded by `512 KiB / RTT`: ~8.5 MB/s at 60 ms,
-~3.4 MB/s at 150 ms, and lower still on a loaded shared host. `cryptg` is already installed,
-so AES-IGE is not the limiter — round-trips are.
+### Scenario A — 2 h audio, 115 MB `.m4a`, default providers, `enhanced`
 
-Measured community results for splitting one file over several MTProto connections:
+| Stage | Today | Revised target | How |
+| --- | ---: | ---: | --- |
+| Telegram download | 77 s | 24 s | 4 pipelined range downloads |
+| Upload (115 MB passthrough today; 27 MB Opus) | 92 s | 22 s | Opus 32k `audio`/cl0 |
+| Encode (only when not passthrough) | 0 s | 20 s, hidden | encode segment *i+1* while *i* uploads |
+| **STT compute** | **171–300 s** | **~35 s** | `melia-1` (206×) — or Nova-3 first (351×) |
+| Status polling + transcript GET | 21 s | ~2 s | `wait` on `POST /jobs` (transcript embedded) |
+| Raw `.txt` delivery | 4 s | 4 s | — |
+| Notes (map + compile) | 40 s | 25 s | progressive booklet, fast compile route |
+| **Total** | **405–534 s** | **≈ 112 s** | **−72…−79 %** |
+
+The first pass reached −66 % by building segmentation. This reaches −75 % mostly by
+configuring the chain correctly, and it keeps one contiguous transcription (no seams).
+
+### Scenario B — 2 h video, 1 GB `.mp4` (extraction required)
+
+| Stage | Today | Revised target |
+| --- | ---: | ---: |
+| Telegram download (1 GB at 1.5 MB/s, one stream) | 683 s | 208 s |
+| Extract 2 h → WAV 230 MB → upload | 11 s + 184 s | — |
+| Extract 2 h → Opus 27 MB → upload | — | 20 s (hidden) + 22 s |
+| STT compute | 171–300 s | 35 s |
+| Fetch + notes + delivery | 65 s | 31 s |
+| **Total** | **1 114–1 243 s** | **≈ 291 s** (**−74…−77 %**) |
+
+### Scenario C — 40 min audio, Deepgram-class provider first
+
+| Stage | Today | Revised target |
+| --- | ---: | ---: |
+| Download + upload + compute + fetch | 66 s | 24 s |
+| Notes + delivery | 45 s | 24 s |
+| **Total** | **111 s** | **≈ 50 s** (**−55 %**) |
+
+**The lesson of the second pass:** once the STT side is fixed, the note layer is **about half
+of a 40-minute job** and a fifth of a 2-hour job. That is where the remaining latency lives.
+
+---
+
+## 3. Layer analysis: the best available method for each
+
+### 3.1 The largest lever is configuration — model and provider order
+
+`stt.transcribe` walks `STT_PROVIDERS` in order, and `config.DEFAULT_STT_PROVIDERS` is
+`speechmatics,deepgram,openai_compatible` with `SPEECHMATICS_MODEL=enhanced`. The module
+docstring is explicit: *"The provider order in `STT_PROVIDERS` is the failover policy."*
+That means the default deployment routes every job to the **slowest** configured engine.
+
+Speaking of the models, Speechmatics' own comparison table (batch: `enhanced`, `standard`,
+`melia-1`, `oak-1`):
+
+| Model | Turnaround (vendor words) | Speed factor | Batch features this bot consumes |
+| --- | --- | --- | --- |
+| `enhanced` (today's default) | "Fast" | **24.1×** | all |
+| `standard` | "Fastest" | **43.9×** | all |
+| `melia-1` | **"Fastest on Batch"** | **206×** | word timings ✔, punctuation ✔, notifications ✔; **no confidence scores, no custom dictionary** — this bot uses neither |
+| `oak-1` (medical) | "Fastest" | — | batch only, healthcare |
+
+Additional facts that make `melia-1` the natural default here:
+
+* It is **cheaper**: $0.12–0.24/h against $0.38–0.75/h for `enhanced`.
+* It requires `language=multi` (not `auto`) — **already implemented**: `stt._normalize_language`
+  returns `multi` for `melia-1`/`oak-1`.
+* The request body this bot sends is exactly
+  `{"type": "transcription", "transcription_config": {"language": …, "model": …}}`
+  (`stt._speechmatics`) — no diarization, custom dictionary, entities, partials or
+  notifications — and `_speechmatics_poll` sets `confidence = None` rather than reading a
+  score. Every field the bot actually uses is supported by Melia-1 on Batch, so switching
+  models changes no request or response handling.
+* It is multilingual with code-switching, which fits Persian lectures peppered with English
+  terms — the exact content this bot transcribes.
+* Vendor claim: a 60-minute recording in **under 20 s**, 10 minutes in under 5 s. An
+  independent benchmark put Melia-1 at 12.1 s average per file against 22.6 s for enhanced.
+* Batch endpoints are regional: `eu1.asr.api.speechmatics.com`, `us1...`, `au1...`. The
+  shipped default `https://asr.api.speechmatics.com/v2` is not listed for Melia batch, so
+  `SPEECHMATICS_BASE_URL` must be set to the nearest regional host when switching.
+
+**Method, in order of preference (all zero-code):**
+
+1. If Deepgram is configured: `STT_PROVIDERS=deepgram,speechmatics` — Nova-3 measured 351×
+   by an independent benchmark, i.e. ~2 h in ~20 s, and Persian is supported by `nova-3`.
+   Keep Speechmatics as the validated fallback.
+2. Otherwise: `SPEECHMATICS_MODEL=melia-1` + `SPEECHMATICS_BASE_URL=https://eu1.asr.api.speechmatics.com/v2`.
+3. If Melia's Persian quality fails the A/B (§4, gate E1): `SPEECHMATICS_MODEL=standard`
+   (43.9× vs 24.1×, i.e. −44 % compute, same features, ~40 % cheaper).
+
+**Guard rails:** add a `--check` warning when `speechmatics` is first *and* `enhanced` is
+selected *and* another configured provider is known-fast, so the default cannot silently be
+the slow one. Also log the chosen model plus the observed seconds-per-audio-minute at the
+end of `transcribe` — the ratio is the only provider-independent speed signal the bot can
+collect itself.
+
+### 3.2 Telegram ingress — serialised 512 KiB round trips
+
+`bot._download_media_limited` uses `message.download_media(...)`, which exposes no
+`request_size`, `offset` or worker count. Reading the installed Telethon 1.45:
+
+* `_DirectDownloadIter._load_next_chunk` issues **one** `GetFileRequest` and awaits it
+  before the next; `request_size` is clamped to
+  `MAX_CHUNK_SIZE = 512 KiB` (`MIN_CHUNK_SIZE = 4 KiB`).
+* Throughput is therefore `512 KiB / RTT` in theory (~8.5 MB/s at 60 ms), but **1.5 MB/s in
+  measured practice** — Telegram throttles per connection and the client serialises one
+  request at a time. `cryptg` is installed, so AES-IGE is not the limit; round trips are.
+* `MTProtoSender` keeps `_pending_state` keyed by message id and `MessagePacker` batches
+  messages into containers, so **several concurrent RPCs on one client are pipelined over
+  the same connection**. Concurrent `iter_download` iterators at different offsets should
+  therefore multiply throughput without opening sockets.
+
+Measured community results for range-splitting one file:
 
 | Configuration | Throughput |
 | --- | ---: |
 | sequential (Telethon default) | 1.50 MB/s |
-| 4 sockets × 2 workers (default in that project) | 4.67–5.56 MB/s |
-| 1 stream vs 4 streams, 251 MB file | 481 s → 145 s (**3.33×**) |
-| free account, multi-connection tooling | 7+ MB/s claimed |
+| 4 sockets × 2 workers | 4.67–5.56 MB/s |
+| 1 stream → 4 streams, 251 MB file | 481 s → 145 s (**3.33×**) |
 
-**Plan:** replace `download_media` with N `iter_download(offset=…, limit=…, request_size=…)`
-streams writing at their own file offsets (`aiofiles` not needed — `os.pwrite` via
-`asyncio.to_thread`), default N = 4, clamped 1–8. Keep every existing guarantee: the byte
-limit and the stall watchdog stay in the progress path, and the partial file is still
-unlinked on abort. Risk: Telegram `FloodWaitError` appears sooner with more requests
-(Telethon's own FAQ says parallel transfers only make it happen sooner); pair it with a
-proactive per-account rate gate and fall back to the single stream on the first flood wait.
+**Method:**
 
-Second, smaller win: **download at intake, not at worker pickup.** Today the download
-happens inside `_process_media`, so it occupies one of the three workers while a queue of
-other jobs waits. Starting the transfer in the message handler (bounded by a download
-semaphore and the existing disk-headroom check) overlaps ingress with other jobs' CPU/LLM
-work and removes queue wait from the user's clock — worth 20–50 % of *perceived* latency
-under load, 0 % when idle.
+1. **Spike first (half a day):** four concurrent iterators on **one** client, each owning a
+   contiguous byte range:
 
-### 3.2 Audio extraction and normalisation — the format decision is a bandwidth equation
+   ```python
+   chunks = range_bytes // request_size          # limit counts chunks, not bytes
+   async for chunk in client.iter_download(
+       message.media,
+       offset=start,                              # byte offset, multiple of 4 KiB
+       limit=chunks,                              # chunk count (Telethon's `limit`)
+       request_size=512 * 1024,                   # == MAX_CHUNK_SIZE, keep == chunk_size
+       file_size=total,                           # avoids an extra probe request
+   ):
+       await asyncio.to_thread(os.pwrite, fd, chunk, written)
+   ```
 
-Today `media.choose_merge_format` returns WAV unless the estimate exceeds
-`presentation_wav_limit_bytes` or the largest configured STT ceiling. For a 2-hour lecture
-that means a **230 MB** upload, while 29 MB of Opus (or 44 MB of AAC) carries the same
-speech: ASR accuracy is flat from ~32 kbit/s upward (Opus 24–32 kbit/s is within
-0.5–1.5 pp WER of WAV, "statistically insignificant" at 32 kbit/s; IBM measured Ogg/Opus
-within 2 % WER of WAV/FLAC). Speechmatics recommends 16 kHz mono PCM WAV *for server-side
-speed*, which is the opposite trade — worth knowing, and the reason the choice must be
-computed rather than hard-coded.
+   Keep `chunk_size == request_size` (otherwise Telethon re-slices and does more work) and
+   keep offsets on 4 KiB boundaries. Measure MB/s against the current single-stream path on
+   the real host; if it reaches ≥2.5×, ship it, if not, try borrowed exported senders
+   (`_borrow_exported_sender`) as step 2.
+2. Keep every existing guarantee: byte ceiling, stall watchdog, partial-file cleanup.
+3. Handle `FloodWaitError` explicitly — the current download path does not, and parallel
+   transfer makes floods arrive sooner, per Telethon's own FAQ. On the first flood wait:
+   sleep the advertised time, drop to one stream for the rest of the job.
+4. Move the transfer to intake (bounded by a download semaphore) so it overlaps other jobs'
+   CPU/LLM work instead of holding one of the three workers.
 
-Cost model for 2 h (measured encode times, `E` = egress in MB/s):
+### 3.3 Transcode — one constant is 3.3× too slow
+
+`media_worker.OPUS_CODEC_OPTIONS = {"application": "voip", "compression_level": "5"}` is the
+most expensive of everything measured (§1.1): 106× while `{"application": "audio",
+"compression_level": "0"}` is 355× at the same bitrate and slightly *better* spectrum for
+ASR. `media.choose_merge_format` then decides WAV-vs-Opus from a *size* estimate only.
+
+**Method:**
+
+1. Change the constant (one line, no behaviour change beyond speed and quality).
+2. Replace the size-only decision with a time model, using the job's own measured Telegram
+   download rate as the egress estimate (already observed by the progress callback — no new
+   probe):
 
 ```
-T_wav  = 230/E                     (12 s of CPU)
-T_opus =  58 +  29/E               (70 s of CPU)
-T_aac  =  21 +  44/E               (33 s of CPU)
-break-even WAV vs Opus: E = 201 MB / 58 s ≈ 3.5 MB/s  (28 Mbit/s)
-break-even WAV vs AAC : E = 186 MB / 21 s ≈ 8.9 MB/s  (71 Mbit/s)
+cost(format) = encode_seconds(format, duration) + bytes(format, duration) / egress
 ```
 
-**Plan:**
+   For a 2 h lecture and `E` = egress in MB/s: `wav = 9 + 230/E`, `opus32 = 20 + 27/E`,
+   `opus24 = 34 + 20/E`. Break-even WAV→Opus is `E = 203 MB / 11 s ≈ 18 MB/s` — i.e. **WAV
+   is only worth it above ~145 Mbit/s**, which no shared host has. Make Opus the default and
+   expose `AUDIO_FORMAT_POLICY=auto|wav|opus|aac` for the exceptions (a provider that
+   prefers PCM, a link that is genuinely local).
+3. Keep AAC 48k as the fallback where a provider rejects Ogg or where per-request transfer
+   overhead dominates (AAC in MP4 is also 2× faster than the *shipped* Opus settings).
+4. Encode segment *i+1* while segment *i* uploads, so encoder CPU leaves the critical path.
+5. Note the one counter-argument and keep it inside the policy, not the default:
+   Speechmatics recommends 16 kHz mono PCM for *server-side* speed, so a deployment that
+   measures a slow upload but unusually fast processing may legitimately prefer WAV. That is
+   what `AUDIO_FORMAT_POLICY=wav` is for; it should not be the default for a 10 Mbit/s host.
+6. Optional, off by default: VAD-based silence trimming. Lecture audio commonly contains
+   10–25 % silence; cutting it shortens upload *and* provider compute by the same share, but
+   it changes inter-paragraph gaps.
 
-1. Add an `AUDIO_TARGET_BPS`/`AUDIO_FORMAT_POLICY=auto|wav|aac|opus` setting and choose in
-   `choose_merge_format` from `(measured encode speed × duration, expected bytes ÷ measured
-   egress)`, taking the minimum. Seed the egress estimate from the actual Telegram download
-   rate of the same job (already observable in the progress callback) — no new probing.
-2. Make **AAC 48 kbit/s mono in MP4 the default for transcoded long audio**: 2× faster to
-   encode than Opus and it moves the break-even from 28 Mbit/s to ~71 Mbit/s, so it wins on
-   almost every shared host. Keep Opus 24 kbit/s as the small-pipe option (it is the best
-   quality per byte and both Speechmatics and Deepgram accept Ogg/Opus).
-3. Drop Opus `compression_level` from `5` to `0–2` in `media_worker.OPUS_CODEC_OPTIONS`
-   (1.6× faster, +5 % size). This ships independently and changes nothing else.
-4. **Overlap** instead of serialise: encode segment *i+1* while segment *i* uploads (`§3.3`),
-   so the 33–70 s of encoder CPU mostly disappears from the critical path.
-5. Optional, needs sign-off: VAD-based silence trimming before transcription. Lecture
-   recordings commonly contain 10–25 % silence; cutting it shortens upload *and* provider
-   compute by the same share. It changes inter-paragraph gaps, so it must be off by default.
+### 3.4 STT POST/GET — `wait` on the submit, not a tighter poll
 
-### 3.3 STT POST — upload 10× more bytes than the audio contains
+`_speechmatics` submits and returns; `_speechmatics_poll` then sleeps 0.5 → 2.5 → 5 → 7.5 s and then a flat
+10 s between `GET /jobs/{id}` calls. Two corrections to the first pass:
 
-`stt._speechmatics` / `_deepgram` / `_openai_compatible` each stream the prepared file from
-disk in 1 MiB buffered reads inside a multipart or raw-body POST. Verified locally:
+* **The GETs already long-poll for 5 s** by default (`wait=0` disables it), so tightening our
+  own cadence buys little; the remaining cost is the detection granularity of the sleep.
+* **`wait` works on `POST /jobs` too**: `POST /jobs/?wait=60&format=json-v2` holds the
+  request until the job reaches a terminal state and returns the finished transcript nested
+  under `json-v2`, with `status` reporting the outcome. If `wait` elapses first, `status` is
+  `created` and the normal polling path continues — the documented fallback, and providers
+  cap the wait server-side.
 
-* `aiohttp.FormData` with a file object **does** set `Content-Length` (3 000 312 bytes for a
-  3 MB file), so providers can reject an oversized body early and no chunked-encoding
-  penalty applies — nothing to fix here.
-* `aiohttp` sends `Accept-Encoding: gzip, deflate` by default, so response compression is
-  already negotiated wherever the provider supports it.
+**Method:** submit with `params={"wait": "120", "format": "json-v2"}`. On `status == done`
+and a `json-v2` payload, parse the words straight out of the POST response and **skip both
+the status loop and the transcript GET** (removes ~20 s and one 3.3 MB transfer for a 2 h
+job). Otherwise fall back to the current loop unchanged. Bound the response with the
+existing `max_stt_response_bytes`. Do not build a webhook receiver: it needs public HTTPS,
+which cPanel shared hosting does not provide, and `wait` already removes the polling.
 
-Two things are wrong: the volume, and what a failover costs.
+The upload itself needs no protocol work: verified locally that `aiohttp.FormData` with a
+file object emits `Content-Length` (3 000 312 for a 3 MB file) and that the client sends
+`Accept-Encoding: gzip, deflate`. What is left is *volume* (§3.3) and the fact that a
+failover re-uploads the whole file (§3.8).
 
-| File | Bytes |
-| --- | ---: |
-| WAV 16 kHz mono, 2 h | 230 MB |
-| AAC 48k, 2 h | 44 MB |
-| Opus 32k, 2 h | 29 MB |
-| Opus 24k, 2 h | 21 MB |
+### 3.5 Segmentation — demoted, and only for the pathological case
 
-At 1.25 MB/s that is 184 s versus 23 s of transfer for the same speech. Second, the failover
-chain re-uploads the whole file to the next provider on any transient failure
-(`_attempt_provider` deliberately never re-POSTs, so a failover = a second full upload);
-segmenting fixes that too — a retry costs one segment, not the lecture.
+With a 200×-class model, a 20-minute segment finishes in ~6 s, so segmenting a 2 h lecture
+into 6 requests saves **under 10 s** over a single 35 s request, while introducing seam
+deduplication, per-segment failover and a stitching test matrix. The economics only work
+when the fastest reachable engine is slow — e.g. a self-hosted endpoint, `enhanced`-only
+access, or a queue-heavy region.
 
-There is also a latent timeout trap that the same arithmetic exposes: `STT_TRANSFER_TIMEOUT_SECONDS`
-defaults to 600 s, which a 230 MB WAV cannot finish on a host with less than ~3 Mbit/s of
-egress. The upload is then killed *after ten minutes*, the chain fails over, and the next
-provider burns the same ten minutes on the same file. Either derive the transfer deadline
-from `bytes / measured egress` (with a 2× margin) or keep the payload small enough that the
-default cannot be hit — both are Phase 2 changes.
+**Method (only if the timing line shows upload ≫ compute):** segment at 20 minutes — the
+same window Speechmatics reports as its accelerated path for `standard`/`enhanced` — with
+2–5 s overlap, submit with `wait` as above, offset word timings per segment, dedupe the
+overlap on `(normalised text, offset)`. Keep `media` on AAC/Opus; never materialise WAV per
+segment. Ship behind `STT_SEGMENT_MINUTES=0` (off) and enable only where it measures faster.
 
-**Plan:** (a) the adaptive format from §3.2; (b) segment uploads in flight, 2–4 concurrent,
-each with its own `_transfer_timeout` and its own bounded retry; (c) keep the existing rule
-that a *submit* is never retried inside one provider.
+### 3.6 Notes — now the frontier
 
-### 3.4 STT GET — 10-second polling and 25 MB of JSON
+Measured: local work is negligible, and a 2 h lecture is one map round plus one compile
+round. So latency is `(output tokens) / (tokens per second)`, twice over.
 
-`_speechmatics` submits, then `_speechmatics_poll` waits with
-`_adaptive_poll_interval(10 s)`: 2.5 s, 5 s, 7.5 s, then a flat 10 s forever. Detection
-granularity therefore costs 0–10 s per job (≈5 s average) and, since a 2-hour lecture at
-42×RT finishes in ~171 s, it also costs ~17–20 status requests per job — and a queued job
-polls for as long as it queues. The transcript itself is then read as one body
-(`stt._read_bounded` accumulates chunks and `b"".join`s them) — a second full copy of up to
-25–40 MB, then parsed with `orjson`.
+1. **Route for throughput, per provider.** The strongest zero-code lever: on an OpenRouter
+   route, add `"provider": {"sort": "throughput"}` (or the `:nitro` model suffix) — the
+   default is *price-weighted* load balancing, which can pick a much slower upstream of the
+   same model. On Groq/Cerebras routes, `NOTE_REASONING_EFFORT=low` keeps reasoning tokens
+   out of the output budget (already implemented). On Gemini, `NOTE_GEMINI_THINKING_BUDGET=0`
+   (the default) is correct — thinking would be pure latency.
+2. **Progressive booklet.** Deliver the deterministic merge immediately, then the compiled
+   edition as a second file ("نسخهٔ ویرایششده"). The compile is a full extra round trip;
+   this removes it from the user's critical path instead of guessing whether it is worth it.
+3. **Adaptive concurrency and chunking.** `NOTE_CONCURRENCY=6` (cap 8, and
+   `min(8, chunks)` so it never over-subscribes) takes a 6 h lecture from 2 map rounds to 1
+   (measured, §1.5).
+   For very long lectures, raising `NOTE_CHUNK_CHARS` toward the context budget (≈96 k for a
+   131 k-token window) turns 5 chunks into 3 and 2 rounds into 1 — verify the
+   `finish_reason=length` rate (already surfaced as `LLMOutputBudgetError`) before and after.
+4. **Enable the tail-latency machinery that already exists.** `NOTE_TTFB_TIMEOUT_SECONDS`
+   and `NOTE_HEDGE_AFTER_SECONDS` (streaming first-byte guard + one hedged attempt) are
+   implemented in `llm.py` and default to `0`. Setting 25 s / 60 s cuts P95 for at most one
+   extra request.
+5. **Schema-constrained output.** `responseMimeType: application/json` is a request, not a
+   guarantee; a provider that answers with prose costs a **full second request** with
+   `JSON_ONLY_REMINDER`. Gemini's `responseSchema` and OpenAI-compatible `json_schema` make
+   the answer structurally valid at <10 % per-call overhead.
+6. **Prefix hygiene (cost, not speed).** Move the per-chunk context block out of the system
+   prompt into the user message so the 4 200-token rule block is byte-identical across every
+   chunk and job: it exceeds the 2 048-token implicit-cache floor on Gemini 2.5 Flash, so
+   cached reads bill at ~0.1× — about 10–13 % of map input. Never insert a timestamp, job id
+   or reordered keys into that block.
+7. **Meta:** `llm._log_usage` already prints `input_tokens`, `output_tokens`, `ttfb_ms` and
+   `elapsed_ms` per request. Use the collected distribution — not this document — to decide
+   between (2) and (3) on your own traffic, and `python -m scripts.probe_note_providers
+   --generate lecture.txt` to rank your configured routes.
 
-Provider-side capabilities that exist today and are unused:
+### 3.7 Delivery, export and the rest — nothing to win
 
-* Speechmatics **long-polls** `GET /jobs/{id}` for up to 5 s before answering
-  (`wait=0` disables it) and now offers a *synchronous* transcription mode; their release
-  notes (2026-09-22) also report significantly faster processing for files up to 20 minutes.
-  Their documented latency guidance is **micro-batching at 25–35 s** per request, 10 POST/s,
-  50 GET/s, and "use the notifications webhook instead of polling"
-  ([limits](https://docs.speechmatics.com/speech-to-text/batch/limits),
-  [microbatching](https://www.speechmatics.com/company/articles-and-news/how-to-build-a-microbatching-workflow-with-the-speechmatics-api)).
-* Deepgram offers a `callback` URL for pre-recorded jobs, 100+ concurrent requests on the
-  standard tier, and recommends 5–10 minute chunks for large files.
+`build_notes_docx` is 0.15–0.19 s for a 30-section booklet and already runs in
+`asyncio.to_thread`; the `.docx` is ~50 KB and the raw `.txt` 100–200 KB, so Telegram
+uploads are sub-second. Leave them.
 
-**Plan:** (1) add `wait=5` to the Speechmatics status GET (one-line change, removes the
-10 s blind spot); (2) make the poll cadence 0.5 → 1 → 2 → 3 s with jitter instead of a 10 s
-floor; (3) optional webhook receiver (`notifications`) for deployments that already expose
-HTTPS — it removes polling entirely; (4) read the transcript with a `bytearray` and parse
-incrementally per `results` batch for long files.
+The one thing worth a small change is not throughput but *Telegram API pressure*:
+`progress.JobProgress._animate` publishes an edit every `ANIMATION_INTERVAL_SECONDS` for the
+whole job, with a flood streak backoff. On a job that now spends minutes in download, encode
+and provider compute, that ticker — not the pipeline — is the largest source of API calls,
+and a flood wait there stalls the update path. Throttle to a slower cadence during the long
+stages (and on the first `FloodWaitError`, drop to a 30 s cadence rather than per-frame
+backoff). Cheap, and it protects the speedups above from being masked by rate limiting.
 
-### 3.5 Note generation — two serial requests, and a prompt that can't be cached
+### 3.8 Three traps the arithmetic exposes
 
-Measured (§1.2, §1.3): local work is negligible; the cost is **two serial LLM round trips**
-(2 map chunks in one round at concurrency 3, then one compile). Published throughput for the
-default model is 92–359 output tok/s depending on measurement
-([Artificial Analysis/Google](https://venturebeat.com/technology/googles-gemini-2-5-flash-lite-is-now-the-fastest-proprietary-model-and);
-[benchmarks](https://www.kunalganglani.com/blog/llm-api-latency-benchmarks-2026)); a
-3 000-token chunk at 200 tok/s is ≈15 s of pure generation, so per-request latency is
-output-token-bound, not prompt-bound.
+These are not optimisations; they are ways the current defaults can *cost* minutes.
 
-Six concrete improvements:
-
-1. **Stable prefix.** `build_system_prompt(mode, context_block=block)` appends the
-   per-chunk context to the *end* of the 4 200-token rule block. Providers cache on an
-   exact byte prefix (Gemini implicit caching: 2 048-token minimum on 2.5 Flash, hits billed
-   at ~0.1×; OpenAI: 1 024 tokens, ~0.5×). Move the context block into the **user** message
-   so the whole system prompt is byte-identical across every chunk *and every job*. Gain:
-   10–25 % lower TTFT and 50–90 % input cost on the cached part.
-2. **Concurrency.** `NOTE_CONCURRENCY` defaults to 3 and is capped at 8, but a 2-hour
-   lecture is 2 chunks, so raising it does nothing there. It matters for 3 h+ lectures and
-   for compile groups: at 6, a 4-chunk job drops from 2 rounds to 1 (−45 % of the map phase,
-   ~−20 s). Recommend `NOTE_CONCURRENCY=6` and making it adaptive
-   (`min(8, max(3, chunks))`) so it never exceeds provider limits.
-3. **Schema-constrained output** instead of `responseMimeType: application/json` alone:
-   Gemini `responseSchema`, OpenAI `json_schema` where the gateway documents it. Constrained
-   decoding costs <10 % per call and removes the 2–10 % of calls that currently pay for a
-   full second request with `JSON_ONLY_REMINDER` ([latency/retry trade-offs](https://nisai.dev/guides/structured-outputs-guide/)).
-4. **Compile strategy.** The editorial compile is a third serial request over the whole
-   booklet (~15–25 s at 200 tok/s). Two options, both cheap: (a) build and send the
-   deterministic merge as the booklet *immediately*, then send the compiled edition as a
-   second file ("نسخهٔ ویرایش‌شده") — perceived latency drops by the whole compile request;
-   (b) keep one request but route it to the fastest configured provider
-   (`Cerebras gpt-oss-120B ≈1 750 tok/s`, `Groq ≈480 tok/s` vs `≈200 tok/s` for Gemini
-   Flash-Lite — Artificial Analysis data, 2026), since editorial work tolerates a different
-   model than extraction. Rank your own routes with
-   `python -m scripts.probe_note_providers --generate lecture.txt` instead of trusting a
-   published number: it sends one real map-style request per configured route and reports
-   elapsed time.
-5. **Tail latency, already implemented, currently off.** `NOTE_TTFB_TIMEOUT_SECONDS` and
-   `NOTE_HEDGE_AFTER_SECONDS` (streaming TTFB guard + one hedged second attempt) exist in
-   `llm.py` but default to `0`. Setting 25 s / 60 s cuts the P95 note phase substantially for
-   at most one extra request. Turn on in `.env` and document the cost.
-6. **Micro:** `_deliver_raw` blocks the start of note generation for ~2 s of Telegram upload;
-   start both with `asyncio.gather` (the raw text is already persisted first, so the
-   ordering guarantee is preserved).
-
-### 3.6 Delivery and export — nothing to win
-
-`build_notes_docx` is 0.17 s for a 30-section booklet (measured) and runs in
-`asyncio.to_thread`; the `.docx` is ~50 KB and the raw `.txt` ~100–200 KB, so Telegram
-uploads are sub-second. Do not touch this layer.
+1. **The transfer deadline cannot fit the file.** `STT_TRANSFER_TIMEOUT_SECONDS` is 600 s,
+   and a 2 h lecture encoded as WAV is 230 MB, which needs ~3 Mbit/s of egress to clear
+   inside ten minutes. On a slower host the upload is killed at 600 s, the chain fails over,
+   and the next provider spends another 600 s on the same bytes. Fix: derive the transfer
+   deadline from `bytes / measured egress` with a 2× margin (the egress estimate already
+   exists, §3.3), and keep the default payload small enough that it is rarely reached.
+2. **The failover chain re-uploads.** `_attempt_provider` deliberately never re-POSTs, so a
+   transient submit failure costs a **full second upload**. Segmenting would bound that to one
+   segment, which is one more reason segmentation matters for slow/pathological links — but
+   it is not a reason to build it for links that work.
+3. **One media slot, three workers.** `MAX_ACTIVE_JOBS=3` and `MEDIA_WORKER_CONCURRENCY=1`
+   mean a single `ffmpeg` at a time. On a 2-vCPU host that is the correct cap, but during the
+   encode the other two jobs sit in `_media_semaphore`. Two consequences: encoding must be
+   *overlapped with upload* (it is network-idle, CPU-busy), and the download must happen at
+   intake so it never consumes one of the three job slots.
 
 ---
 
 ## 4. The plan
 
-### Phase 0 — Instrument before changing (0.5 day, no risk)
+### Phase 0 — Instrument and decide (1 day, no risk)
 
-Add one structured `pipeline timing` log line per stage (`download`, `probe`, `encode`,
-`upload`, `stt`, `fetch`, `notes_map`, `notes_compile`, `docx`, `send`) carrying
-`submission_id`, bytes, seconds and engine. Everything below is verified against it; the
-percentages in this document are predictions until this line exists.
+1. One structured `pipeline timing` line per stage (`download`, `probe`, `encode`, `upload`,
+   `stt`, `fetch`, `notes_map`, `notes_compile`, `docx`, `send`) with `submission_id`,
+   bytes, seconds, engine and model. Every percentage below is a prediction until this
+   exists, and each phase's gate is read from it.
+2. Run the two probes that already exist:
+   `python -m scripts.perf_bench all` and
+   `python -m scripts.probe_note_providers --generate lecture.txt`.
+3. **Gate E1 — Persian quality A/B:** transcribe two real lectures with `melia-1` and
+   `enhanced`; compare word error spot checks *and* the note gate metrics
+   (`coverage`, fabrications, dropped tables/tips). Melia ships only if it is not worse.
+   Same for `standard` as the safety fallback.
 
-Two free measurements are already in the tree and should be run before any change:
-
-```bash
-python -m scripts.probe_note_providers --generate lecture.txt   # per-route note latency
-python -m scripts.perf_bench all                                # local encode/CPU baselines
-```
-
-### Phase 1 — Zero-risk configuration and polling wins (1–2 days, −15 % e2e)
-
-| Change | Where | Expected |
-| --- | --- | --- |
-| `wait=5` on the Speechmatics status GET; 0.5→3 s poll cadence with jitter | `stt._speechmatics_poll` | −5 s/job |
-| Start notes concurrently with raw delivery | `bot._process_media` | −2 s |
-| `NOTE_CONCURRENCY=6` (adaptive to chunk count) | `config`, `notes.structure_document` | −20 s on 3 h+ |
-| `NOTE_TTFB_TIMEOUT_SECONDS=25`, `NOTE_HEDGE_AFTER_SECONDS=60` | `.env.example` + docs | P95 −20–40 % |
-| Region-nearest base URLs (`DEEPGRAM_BASE_URL`, `SPEECHMATICS_BASE_URL`) | ops | −RTT per request |
-| Parallel Telegram download, N=4, flood-wait fallback | `bot._download_media_limited` | ingress −69 % |
-
-Cumulative: ≈410 s → ≈350 s (**−15 %**).
-
-### Phase 2 — Payload intelligence (2–3 days, −27 % e2e, upload −75 %)
+### Phase 1 — Configuration (same day as E1, −40…−53 % e2e)
 
 | Change | Where | Expected |
 | --- | --- | --- |
-| `AUDIO_FORMAT_POLICY=auto` costing WAV/AAC/Opus from measured egress | `media.choose_merge_format` | upload 92 s → 23 s |
-| AAC 48k mono as the default transcode target; Opus only for small pipes | `media_worker` | encode 70 s → 33 s |
-| Opus `compression_level` 5 → 2 | `media_worker.OPUS_CODEC_OPTIONS` | encode −35 % |
-| Downsample-only fast path for 8 kHz voice notes (no 16 kHz up-conversion) | `media_worker` | −bytes, free |
+| `STT_PROVIDERS=deepgram,speechmatics` if Deepgram is configured | `.env` | compute 171–300 s → ~20 s |
+| else `SPEECHMATICS_MODEL=melia-1` + regional `SPEECHMATICS_BASE_URL` | `.env` | compute → ~35 s |
+| else `SPEECHMATICS_MODEL=standard` | `.env` | compute −44 % |
+| `NOTE_TTFB_TIMEOUT_SECONDS=25`, `NOTE_HEDGE_AFTER_SECONDS=60` | `.env` | P95 −20…40 % of the note phase |
+| `NOTE_CONCURRENCY=6` | `.env` | map rounds halved for ≥3 h |
+| `--check` warning when the slow default combination is detected | `config` | prevents regression |
 
-Cumulative: ≈350 s → ≈300 s (**−27 %**), plus a 10× smaller upload, which also makes
-failover cheap.
+Scenario A after Phase 1: ≈ 405–534 s → **≈ 250 s (−40…−53 %)**. All of it is
+configuration; nothing in this phase can regress correctness.
 
-### Phase 3 — Segmented parallel transcription (1–2 weeks, −63 % e2e: the largest single win)
-
-This is the change that removes the dominant term. It is also the only one that needs new
-tests around stitching.
-
-1. **Segment** the prepared audio into `K` parts (default `K = min(6, max(1, ceil(minutes/20)))`,
-   each ≥10 min) with a 2–5 s overlap, produced by the media worker (one process per
-   segment, `--start`/`--duration`, encode straight to AAC/Opus — never through WAV).
-2. **Submit in parallel** to the *same* provider (Speechmatics documents microbatching and
-   allows 10 POST/s and 20 000 concurrent jobs; Deepgram's standard tier allows 100+
-   concurrent requests). Keep the existing provider failover, but per segment.
-3. **Stitch** word timings with a per-segment offset; drop the duplicated overlap by
-   timestamp and by normalised-text match at the seam; keep the existing paragraphing engine
-   unchanged (it only needs monotonic word timings).
-4. **Overlap** the pipeline: download → segment → (encode ‖ upload ‖ transcribe) per segment,
-   so encoder CPU and transport disappear behind provider compute.
-
-Expected: STT wall 176 s → ~31 s at K=6; transcript GET 21 s → 12 s; pipeline down to
-≈152 s (**−63 %**) before the note-layer work. Reliability improves too: a failure costs one
-20-minute segment, not the lecture.
-
-### Phase 4 — Note layer (2–3 days, −66 % e2e)
+### Phase 2 — I/O (2–3 days, −64…−73 % cumulative)
 
 | Change | Where | Expected |
 | --- | --- | --- |
-| Context block moved from system prompt into the user message (byte-stable prefix) | `notes.build_system_prompt`, `map_chunk` | TTFT −10–25 %, input cost −50–90 % |
-| `responseSchema` / `json_schema` structured output | `llm._build_request_for` | removes the retry path (P95) |
-| Progressive booklet: deterministic merge first, compiled edition second | `bot._deliver_booklet` | perceived −15–25 s |
-| Compile routed to the fastest provider, or skipped for `fast` mode | `config`, `llm` | −10–20 s |
-| `asyncio.to_thread` for `gate_notes` (hygiene, not speed — 23 ms) | `notes` | 0 |
+| Opus `application=audio`, `compression_level=0` | `media_worker.OPUS_CODEC_OPTIONS` | encode 106× → 355× |
+| Time-based format choice (`encode + bytes/egress`) | `media.choose_merge_format` | upload 92 s → 19 s |
+| 4 pipelined `iter_download` ranges + FloodWait fallback | `bot._download_media_limited` | download 77 s → 24 s |
+| Download at intake, bounded by a semaphore | `bot` handler | queue wait off the user's clock |
+| Encode segment *i+1* while *i* uploads | `bot._process_media` | encoder off the critical path |
 
-Cumulative: ≈152 s → ≈139 s (**−66 %** e2e for Scenario A).
+Scenario A after Phase 2: ≈ 250 s → **≈ 146 s (−64…−73 %)**. The download spike is the
+gate: if it does not reach 2.5×, keep the single stream and the phase still lands at
+**≈ 200 s**.
 
-### Phase 5 — Optional / experimental (only with measured benefit, −70 to −75 % e2e)
+### Phase 3 — STT call shape (1–2 days, −70…−77 % cumulative, +robustness)
 
-* Webhook (`notifications`) instead of polling; removes the GET loop entirely.
-* VAD silence trimming (−10–25 % of audio ⇒ −10–25 % of upload *and* STT time).
-* Additional STT provider behind the existing OpenAI-compatible slot: **Groq
-  `whisper-large-v3-turbo` (216×RT, $0.04/h, word timestamps via `verbose_json`)**, or a
-  native Soniox adapter ($0.10/h async, Persian support, word timings) as a cheaper/faster
-  second engine than Speechmatics Enhanced (42×RT, $0.50/h).
-* gzip-tolerant transcript parsing and per-result streaming (only if the provider compresses).
+| Change | Where | Expected |
+| --- | --- | --- |
+| `wait=120&format=json-v2` on `POST /jobs`, parse embedded transcript | `stt._speechmatics` | removes 21 s and one 3.3 MB GET |
+| Keep the polling fallback and the existing deadline budget | `stt` | no regression |
+| Adaptive poll cadence 0.5 → 3 s with jitter **only** for the fallback path | `stt._speechmatics_poll` | −5 s when `wait` times out |
+
+Scenario A after Phase 3: ≈ **121 s (−70…−77 %)**.
+
+### Phase 4 — Notes (2–3 days, −74…−80 % cumulative; the whole win on short jobs)
+
+| Change | Where | Expected |
+| --- | --- | --- |
+| Progressive booklet (merge first, compiled edition second) | `bot._deliver_booklet` | perceived −15…25 s |
+| Compile routed to the fastest configured route | `config`, `llm` | −10…20 s |
+| `provider.sort=throughput` / `:nitro` on OpenRouter routes | `llm._build_request_for` | upstream-dependent, often 2–5× output speed |
+| `responseSchema` / `json_schema` structured output | `llm._build_request_for` | removes the retry path |
+| Context block moved to the user message (cache-stable prefix) | `notes.build_system_prompt` | ~10–13 % input cost |
+| Adaptive concurrency `min(8, chunks)` | `notes.structure_document` | no over-subscription |
+
+Scenario C after Phase 4: ≈ 111 s → **≈ 35 s (−68 %)**. That is the point of the second
+pass: on a short job almost everything left is the note layer.
+
+### Phase 5 — Only if measured (not planned work)
+
+| Candidate | Trigger to consider it |
+| --- | --- |
+| Segmented parallel transcription | timing line shows upload ≫ compute (e.g. self-hosted engine, `enhanced`-only access) |
+| VAD silence trim | timing line shows a large silence share in the source |
+| Webhook/callback instead of polling | the host gets public HTTPS and `wait` proves insufficient |
+| Second engine in the `openai_compatible` slot (Groq `whisper-large-v3-turbo`, 216×, 25 MB free-tier cap, 7 200 audio-s/h free-tier ceiling) | a cheaper/faster fallback is worth a quality A/B |
+
+### Rejected, with the reason
+
+| Candidate | Why not |
+| --- | --- |
+| Self-hosted ASR (faster-whisper, Nemotron, transcribe.cpp) | measured at **0.5× real time** for faster-whisper large-v3 int8 on 2 vCPUs, and this deployment is 2-core shared hosting with no GPU; a 2 h lecture would take 4 h. Nemotron 3.5 needs a GPU to reach sub-real-time |
+| Streaming WebSocket STT for batch files | total time is provider compute, not first-token latency |
+| Response gzip / `Content-Length` work | already emitted/negotiated (verified) |
+| `orjson`, `_read_bounded`, `build_notes_docx`, `gate_notes` rewrites | measured at 1–160 ms |
+| Shrinking `NOTE_MAX_OUTPUT_TOKENS` | caps truncation, not generation time; risks losing content |
+| Segmentation as a default | saves <10 s with a 200×-class model, costs seam risk |
+| Extra connection pooling / pre-warm work | `LLM_PREWARM`, keep-alive and DNS caching already exist |
 
 ---
 
 ## 5. Expected outcome
 
-| Scenario | Today | After Phase 1–4 | Improvement |
-| --- | ---: | ---: | ---: |
-| A — 2 h audio, 115 MB, batch provider | 410 s | ~139 s | **−66 %** |
-| B — 2 h video, 1 GB | 1 104 s | ~333 s | **−70 %** |
-| C — 40 min audio, fast provider | 111 s | ~58 s | **−48 %** |
-| 6 h lecture, batch provider | ~1 140 s | ~345 s | **−70 %** |
+| Scenario | Today | After Phase 1 | After 1–2 | After 1–3 | After 1–4 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| A — 2 h audio, defaults | 405–534 s | ~250 s (−40…−53 %) | ~146 s (−64…−73 %) | ~121 s (−70…−77 %) | ~106 s (**−74…−80 %**) |
+| B — 2 h video, 1 GB | 1 114–1 243 s | ~978 s (−12…−21 %) | ~350 s (−69…−72 %) | ~306 s (−73…−75 %) | ~291 s (**−74…−77 %**) |
+| C — 40 min, fast provider | 111 s | ~90 s (−19 %) | ~50 s (−55 %) | ~47 s (−58 %) | ~35 s (**−68 %**) |
+| 6 h lecture | ~1 170 s | ~696 s (−41 %) | ~324 s (−72 %) | ~300 s (−74 %) | ~285 s (**−76 %**) |
 
-Per-stage improvement, for the "which number do I quote?" question:
+Per-stage improvement, with confidence:
 
 | Stage | Improvement | Confidence |
 | --- | ---: | --- |
-| Telegram download (per MB) | −69 % (−3.3×) | High — measured by third parties, needs FloodWait care |
-| Audio encode | −50 % (AAC) / −35 % (Opus cl=2) | High — measured here |
-| STT upload bytes | −87 % (WAV→Opus 24k) / −81 % (WAV→AAC 48k) | High — arithmetic |
-| STT compute wall-clock | −80 % at K=6 | Medium — depends on provider concurrency |
-| Transcript fetch | −43 % (per-segment, gzip) | Medium |
-| Note generation | −30 to −45 % | Medium — depends on provider/model |
+| STT compute (`enhanced` → `melia-1`/Nova-3) | **−80…−93 %** | High — vendor-published and independently benchmarked; verify Persian quality (E1) |
+| STT upload bytes | −88 % (230 → 27 MB per 2 h) | High — arithmetic on measured sizes |
+| Encode CPU | −70 % (106× → 355×) | High — measured here |
+| Telegram download | −69 % | Medium — needs the Phase 0 spike and FloodWait care |
+| Status/transcript fetch | −90 % (`wait` on POST) | Medium — depends on the server-side cap |
+| Notes | −35…−45 % (progressive + throughput routing) | Medium — provider/model dependent |
 
 ---
 
@@ -432,71 +537,73 @@ Per-stage improvement, for the "which number do I quote?" question:
 
 | Risk | Mitigation |
 | --- | --- |
-| Telegram `FloodWaitError` from parallel downloads | Cap at 4 sockets, back off to 1 on the first flood wait, keep the existing stall watchdog |
-| Segment seams duplicate or drop words | 2–5 s overlap, dedupe on `(normalised text, offset)` window, assert monotonic timings and total word count vs. duration in tests |
-| Lower bitrate hurts Persian accuracy | Stay ≥24 kbit/s Opus / ≥48 kbit/s AAC; keep WAV for providers that require it; A/B two real lectures before switching the default |
-| Provider concurrency limits (429) | Segment count ≤ provider concurrency, keep `MAX_RETRY_AFTER_SECONDS` and cooldowns; a 429 on one segment must not fail the job |
-| Prefix cache misses | The cached prefix must be byte-identical: no timestamps, no per-job ids, no reordered keys in the system prompt |
-| Compile skipped ⇒ quality drop | Deliver the compiled edition as a second file; never silently degrade NOTE_QUALITY |
-| More moving parts | Every phase ships behind a setting with the old path as default until the timing line proves the win |
+| Melia-1 Persian quality is worse than `enhanced` | Gate E1 compares WER spot checks *and* the note gate metrics; fall back to `standard` (still −44 % compute) |
+| Melia lacks custom dictionary / confidence | This bot uses neither; it does use word timings and punctuation, which Melia supports on Batch |
+| Melia batch needs a regional endpoint | Set `SPEECHMATICS_BASE_URL` to `eu1`/`us1`/`au1`; add it to `--check` |
+| `wait` on POST holds a socket | Explicit, bounded `wait` (≤120 s) inside the existing `STT_TRANSFER_TIMEOUT_SECONDS`; treat `status=created` as the normal fallback |
+| FloodWait from parallel download | Pipelined ranges on one client first, cap at 4, back off to 1 on the first flood, keep the stall watchdog |
+| Lower bitrate hurts accuracy | 32 kbit/s Opus `audio` is essentially transparent for speech; keep `AUDIO_FORMAT_POLICY=wav` available; A/B two lectures |
+| Opus `application=audio` behaves differently | It is the hybrid speech+music path; for lecture speech it preserves more high band than `voip`. Verify one transcript |
+| `provider.sort=throughput` costs more | It can pick a pricier upstream; run it for the compile call (the long one) and keep price sorting where cost dominates |
+| Progressive booklet confuses users | Deliver the merge as the booklet and the compiled edition as an explicit, labelled second file |
+| Longer chunk budget truncates output | Watch `LLMOutputBudgetError`; raise `NOTE_MAX_OUTPUT_TOKENS` or revert the chunk size |
+| More moving parts | Each change ships behind a setting, with the old path as the default until the timing line proves the win |
 
-Tests to add: segment stitching (offset, overlap, single-word seam), `choose_merge_format`
-costing table, parallel-download abort/limit paths, `wait=5` polling, prompt-prefix
-stability (hash the system prompt across chunks), and a golden-file check that the same
-lecture still produces the same paragraph count.
-
----
-
-## 7. New settings this plan introduces
-
-| Setting | Default | Purpose |
-| --- | --- | --- |
-| `TELEGRAM_DOWNLOAD_CONNECTIONS` | `4` (1–8) | parallel MTProto range download |
-| `DOWNLOAD_AT_INTAKE` | `false` (then `true`) | overlap ingress with the queue |
-| `AUDIO_FORMAT_POLICY` | `auto` | `wav` / `aac` / `opus` / `auto` costing |
-| `AUDIO_TARGET_KBPS` | `48` | AAC/Opus bitrate for speech |
-| `STT_SEGMENT_MINUTES` | `20` | segment length for parallel transcription |
-| `STT_SEGMENT_CONCURRENCY` | `3` (1–8) | segments in flight |
-| `STT_STATUS_LONG_POLL` | `5` | Speechmatics `wait` seconds |
-| `NOTE_CONCURRENCY` (existing) | `3` → `6` | map/compile parallelism |
-| `NOTE_PROGRESSIVE_BOOKLET` | `false` | merge first, compiled edition second |
+Tests to add: `wait`-path parsing and its fallback; format-choice costing table; parallel
+download abort/limit/FloodWait paths; prompt-prefix stability (hash the rule block across
+chunks); and a golden test that the same lecture still produces the same paragraph count.
 
 ---
 
-## 8. What this plan deliberately does *not* do
+## 7. Settings this plan touches
 
-| Candidate | Why not |
-| --- | --- |
-| Optimise `build_notes_docx` / PDF export | 0.17 s measured |
-| Off-load `gate_notes` to a thread | 0.023 s measured |
-| Replace `orjson`, batch media-worker processes, cache probes | 0.08–0.09 s per process; already batched for decks |
-| Add `Content-Length` to the STT upload | Already sent by `aiohttp` (verified) |
-| Add response compression | Already requested (`Accept-Encoding` verified) |
-| Shrink `NOTE_MAX_OUTPUT_TOKENS` | Caps truncation, not generation time; risks losing content |
-| Prefetch/pool provider connections harder | `LLM_PREWARM`, keep-alive and DNS caching already exist |
-| Streaming STT over WebSocket for batch files | Total time is provider compute, not first-token latency |
+| Setting | Now | Recommended | Purpose |
+| --- | --- | --- | --- |
+| `STT_PROVIDERS` | `speechmatics,deepgram,…` | `deepgram,speechmatics` when Deepgram is configured | order *is* the latency policy |
+| `SPEECHMATICS_MODEL` | `enhanced` | `melia-1` (or `standard`) | 24.1× → 206× / 43.9× |
+| `SPEECHMATICS_BASE_URL` | global host | nearest regional host | Melia batch endpoints |
+| `OPUS_CODEC_OPTIONS` (constant) | `voip`, `cl=5` | `audio`, `cl=0` | 106× → 355× |
+| `AUDIO_FORMAT_POLICY` (new) | — | `auto` | choose from measured egress |
+| `TELEGRAM_DOWNLOAD_CONNECTIONS` (new) | — | `4` (1–8) | pipelined range download |
+| `NOTE_CONCURRENCY` | `3` | `6`, adaptive | halve map rounds |
+| `NOTE_TTFB_TIMEOUT_SECONDS` | `0` | `25` | first-byte guard |
+| `NOTE_HEDGE_AFTER_SECONDS` | `0` | `60` | one hedged attempt |
+| `NOTE_CHUNK_CHARS` | `64 000` | `64 000`…`96 000` | rounds vs output budget |
+| `NOTE_PROGRESSIVE_BOOKLET` (new) | — | `false` → `true` after A/B | perceived latency |
 
 ---
 
-## 9. References
+## 8. References
 
-* Speechmatics batch limits and microbatching:
+* Speechmatics models (turnaround, features, `melia-1` needs `language=multi`):
+  <https://docs.speechmatics.com/speech-to-text/models>
+* Speechmatics synchronous transcription (`wait` on POST/GET/transcript, 5 s default on GETs):
+  <https://docs.speechmatics.com/speech-to-text/batch/synchronous>
+* Speechmatics speed factors (standard 43.9×, enhanced 24.1×):
+  <https://www.speechmatics.com/company/articles-and-news/speed-you-can-trust-the-stt-metrics-that-matter-for-voice-agents>
+* Melia 1 at 206× and "a 60-minute recording in under 20 seconds":
+  <https://www.speechmatics.com/company/articles-and-news/melia-fastest-speech-to-text-artificial-analysis>
+* Melia-1 vs enhanced per-file wall clock (12.1 s vs 22.6 s):
+  <https://novascribe.ai/how-accurate-is-speechmatics>
+* Speechmatics batch limits (10 POST/s, 50 GET/s, 20 000 concurrent) and microbatching:
   <https://docs.speechmatics.com/speech-to-text/batch/limits> ·
-  <https://www.speechmatics.com/company/articles-and-news/how-to-build-a-microbatching-workflow-with-the-speechmatics-api> ·
-  status long-poll/synchronous mode: <https://speechmatics.featurebase.app/en/changelog>
-* Speechmatics input guidance (16 kHz mono WAV): <https://docs.speechmatics.com/speech-to-text/batch/input>
-* Independent STT speed/WER benchmark (Sept 2026, Deepgram 351×RT, Speechmatics 42×RT):
+  <https://www.speechmatics.com/company/articles-and-news/how-to-build-a-microbatching-workflow-with-the-speechmatics-api>
+* Independent STT speed benchmark (Deepgram Nova-3 351×, Speechmatics enhanced 42×):
   <https://echosaw.com/curated-lists/best-speech-to-text-apis/>
-* Groq Whisper limits and 216×RT: <https://console.groq.com/docs/speech-to-text>
-* Opus/AAC bitrate vs ASR accuracy: <https://team-connect.co.uk/info/audio-codecs-explained> ·
-  <https://github.com/ibm-cloud-docs/speech-to-text/blob/master/audio-formats.md>
-* Telethon downloads (512 KiB clamp, `iter_download` offsets):
+* Deepgram callback (retries 10× / 30 s) — why a webhook needs public HTTPS:
+  <https://developers.deepgram.com/docs/callback>
+* Groq Whisper limits (216×, 25 MB free / 100 MB dev, 7 200 audio-s/h free tier):
+  <https://console.groq.com/docs/speech-to-text>
+* OpenRouter throughput routing (`provider.sort`, `:nitro`):
+  <https://openrouter.ai/docs/guides/routing/provider-selection>
+* Gemini implicit caching (2 048-token minimum on 2.5 Flash, cached reads ~0.1×):
+  <https://ai.google.dev/gemini-api/docs/caching>
+* Telethon downloads (512 KiB clamp, `iter_download` offsets) and MTProto pipelining:
   <https://docs.telethon.dev/en/stable/modules/client.html> ·
   parallel-download measurements: <https://github.com/julienfroidefond/stripstream-librarian/pull/85>
-* Gemini implicit caching (2 048-token minimum, 0.1× reads):
-  <https://ai.google.dev/gemini-api/docs/caching>
-* OpenAI/Anthropic caching and the exact-prefix rule:
-  <https://machinelearningmastery.com/the-complete-guide-to-inference-caching-in-llms/>
-* Structured outputs vs JSON mode (retry cost): <https://nisai.dev/guides/structured-outputs-guide/>
-* Output-token throughput (Cerebras ~1 750 tok/s, Groq ~480 tok/s, Gemini Flash-Lite ~92–359):
-  <https://tokendyno.com/blog/llm-speed-comparison/>
+* Opus/AAC bitrate vs ASR accuracy: <https://team-connect.co.uk/info/audio-codecs-explained> ·
+  <https://github.com/ibm-cloud-docs/speech-to-text/blob/master/audio-formats.md>
+* Self-hosted ASR throughput on 2 CPU vCPUs (faster-whisper large-v3 int8 at 0.5× real time):
+  <https://echosaw.com/curated-lists/best-speech-to-text-apis/>
+* Nemotron 3.5 ASR (GPU-class streaming model, for context only):
+  <https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b>
