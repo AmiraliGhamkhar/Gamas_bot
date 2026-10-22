@@ -172,10 +172,16 @@ of a 40-minute job** and a fifth of a 2-hour job. That is where the remaining la
 
 ### 3.1 The largest lever is configuration — model and provider order
 
-`stt.transcribe` walks `STT_PROVIDERS` in order, and `config.DEFAULT_STT_PROVIDERS` is
+`stt.transcribe` walks `STT_PROVIDERS` in order, and `config.DEFAULT_STT_PROVIDERS` was
 `speechmatics,deepgram,openai_compatible` with `SPEECHMATICS_MODEL=enhanced`. The module
 docstring is explicit: *"The provider order in `STT_PROVIDERS` is the failover policy."*
-That means the default deployment routes every job to the **slowest** configured engine.
+That meant the default deployment routed every job to the **slowest** configured engine.
+
+**Update:** the order now ships as `deepgram,speechmatics,openai_compatible` (see §8), so a
+deployment with a Deepgram key gets the compute win without any configuration. The *model*
+for the Speechmatics slot is unchanged — that part of Phase 1 stays an operator decision,
+because it trades Persian accuracy for speed and only the E1 A/B can settle it. The rest of
+this section is the evidence for both halves.
 
 Speaking of the models, Speechmatics' own comparison table (batch: `enhanced`, `standard`,
 `melia-1`, `oak-1`):
@@ -520,6 +526,10 @@ pass: on a short job almost everything left is the note layer.
 | C — 40 min, fast provider | 111 s | ~90 s (−19 %) | ~50 s (−55 %) | ~47 s (−58 %) | ~35 s (**−68 %**) |
 | 6 h lecture | ~1 170 s | ~696 s (−41 %) | ~324 s (−72 %) | ~300 s (−74 %) | ~285 s (**−76 %**) |
 
+Read the columns as *provider* choices: `After Phase 1` assumes the fastest reachable engine
+serves the job. With a Deepgram key that is now the shipped order, so column 2 applies to a
+default install today; without one it still requires `SPEECHMATICS_MODEL=melia-1`.
+
 Per-stage improvement, with confidence:
 
 | Stage | Improvement | Confidence |
@@ -557,21 +567,21 @@ chunks); and a golden test that the same lecture still produces the same paragra
 
 ## 7. Settings this plan touches
 
-| Setting | Now | Recommended | Purpose |
+| Setting | Before this work | Shipped now | Purpose |
 | --- | --- | --- | --- |
-| `STT_PROVIDERS` | `speechmatics,deepgram,…` | `deepgram,speechmatics` when Deepgram is configured | order *is* the latency policy |
-| `SPEECHMATICS_MODEL` | `enhanced` | `melia-1` (or `standard`) | 24.1× → 206× / 43.9× |
-| `SPEECHMATICS_BASE_URL` | global host | nearest regional host | Melia batch endpoints |
+| `STT_PROVIDERS` | `speechmatics,deepgram,…` | **`deepgram,speechmatics,…`** | order *is* the latency policy: the first provider with a key runs |
+| `SPEECHMATICS_MODEL` | `enhanced` | `enhanced` — **unchanged on purpose** | `melia-1` (206×) and `standard` (43.9× vs 24.1×) stay an operator decision, because no Persian WER is published; the `--check` guard warns when a slow model serves first |
+| `SPEECHMATICS_BASE_URL` | global host | unchanged | only required *if* `SPEECHMATICS_MODEL=melia-1`/`oak-1` (regional batch hosts) |
 | `OPUS_CODEC_OPTIONS` (constant) | `audio`, `cl=0` (changed) | `audio`, `cl=0` | 106× → 355× |
 | `AUDIO_FORMAT_POLICY` | `auto` | `auto` | choose from the measured rate |
 | `TELEGRAM_DOWNLOAD_CONNECTIONS` | `1` | `1` → raise after the host measurement | pipelined range download |
-| `NOTE_CONCURRENCY` | `3` | `6`, adaptive | halve map rounds |
-| `NOTE_TTFB_TIMEOUT_SECONDS` | `0` | `25` | first-byte guard |
-| `NOTE_HEDGE_AFTER_SECONDS` | `0` | `60` | one hedged attempt |
+| `NOTE_CONCURRENCY` | `3` | **`6`** | halve map rounds for ≥3 h lectures |
+| `NOTE_TTFB_TIMEOUT_SECONDS` | `0` | **`25`** | first-byte guard, below the hedge |
+| `NOTE_HEDGE_AFTER_SECONDS` | `0` | **`60`** | one hedged attempt (extra quota) |
 | `NOTE_CHUNK_CHARS` | `64 000` | `64 000`…`96 000` | rounds vs output budget |
-| `NOTE_PROGRESSIVE_BOOKLET` | `0` | `1` after a look at the draft | perceived latency |
-| `NOTE_STRUCTURED_OUTPUT` | `0` | `1` when the provider documents it | removes the retry path |
-| `NOTE_OPENROUTER_THROUGHPUT` | `0` | `1` on an OpenRouter route | fastest upstream |
+| `NOTE_PROGRESSIVE_BOOKLET` | `0` | **`1`** | perceived latency |
+| `NOTE_STRUCTURED_OUTPUT` | `0` | **`1`** (drops itself if a provider rejects it) | removes the retry path |
+| `NOTE_OPENROUTER_THROUGHPUT` | `0` | **`1`** (OpenRouter route only) | fastest upstream |
 | `NOTE_COMPILE_PROVIDER` | empty | the fastest configured slug | compile off the slow route |
 
 ---
@@ -590,14 +600,24 @@ phase 5 is the measured-only fallback list.
 | 3 | `wait` long-poll on submit + inline transcript | `stt._speechmatics_wait_params`, `_speechmatics`, `_speechmatics_poll` | `STT_STATUS_LONG_POLL=25` |
 | 4 | Cache-stable system prompt (context moved to the user message) | `notes.build_chunk_message`, `structure_document.map_chunk` | on |
 | 4 | Map concurrency `min(NOTE_CONCURRENCY, chunks, 8)` | `notes._note_semaphore` | on |
-| 4 | Response schema / `json_schema` | `notes.notes_response_schema`, `llm._build_request_for` | `NOTE_STRUCTURED_OUTPUT=0` |
-| 4 | OpenRouter throughput routing | `llm._build_request_for` | `NOTE_OPENROUTER_THROUGHPUT=0` |
+| 4 | Response schema / `json_schema` | `notes.notes_response_schema`, `llm._build_request_for` | `NOTE_STRUCTURED_OUTPUT=1` (on) |
+| 4 | OpenRouter throughput routing | `llm._build_request_for` | `NOTE_OPENROUTER_THROUGHPUT=1` (on) |
 | 4 | Compile routed to a chosen provider first | `llm._ordered_routes`, `notes._compile_once` | `NOTE_COMPILE_PROVIDER=` (empty) |
-| 4 | Progressive booklet (merge delivered before the compile) | `notes.structure_document(on_merged=…)`, `bot._progressive_booklet_sender` | `NOTE_PROGRESSIVE_BOOKLET=0` |
+| 4 | Progressive booklet (merge delivered before the compile) | `notes.structure_document(on_merged=…)`, `bot._progressive_booklet_sender` | `NOTE_PROGRESSIVE_BOOKLET=1` (on) |
+| 1 | Fast engine first in the failover order | `config.DEFAULT_STT_PROVIDERS` | `deepgram,speechmatics,openai_compatible` |
+| 1 | Warning when a slow model serves first | `config.check`, `config.first_configured_stt_provider` | on (advisory) |
+| 2/4 | First-byte guard, hedged second provider, map concurrency 6 | `llm._complete_on_route`, `llm._hedge_two`, `notes._note_semaphore` | `25 s` / `60 s` / `6` |
 
-Why the two download/encode flags ship off or at `1`: neither can be verified in a sandbox
-without Telegram, so the proven path stays the default. Turn them on after one measurement
-on the host — `python -m scripts.perf_bench audio` plus the download timing line.
+What is **not** switched on by default, and why:
+
+* `TELEGRAM_DOWNLOAD_CONNECTIONS` stays `1`. The encode flags were measured here, but a
+  range download can only be measured against Telegram from the host itself, so the proven
+  single-stream path remains the default; turn it on after one timing run on the host.
+* `SPEECHMATICS_MODEL` stays `enhanced` and `SPEECHMATICS_BASE_URL` stays global. Switching
+  the model is a Persian-accuracy decision, not a speed one — the `--check` guard makes the
+  slow combination visible instead of silently flipping it.
+* `NOTE_COMPILE_PROVIDER` stays empty: it must name whichever slug measured fastest for this
+  deployment, so it is an operator value, not a default.
 
 **Deliberately not implemented, with the reason:**
 

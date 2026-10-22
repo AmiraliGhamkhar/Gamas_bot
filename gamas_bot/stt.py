@@ -38,6 +38,7 @@ from .config import (
     OPENAI_STT_MAX_UPLOAD,
     SPEECHMATICS_MAX_UPLOAD,
     Settings,
+    first_configured_stt_provider,
 )
 from .http_util import (
     read_error_body,
@@ -974,17 +975,19 @@ def largest_configured_upload(settings: Settings) -> int | None:
 
 
 def first_configured_stt_url(settings: Settings) -> str | None:
-    """Base URL of the first configured STT provider, for connection pre-warming."""
-    for slug in settings.stt_providers:
-        spec = PROVIDERS.get(slug)
-        if spec is None or not spec.configured(settings):
-            continue
-        if slug == "speechmatics":
-            return settings.speechmatics_base_url
-        if slug == "deepgram":
-            return settings.deepgram_base_url
-        if slug == "openai_compatible":
-            return settings.stt_openai_base_url
+    """Base URL of the first configured STT provider, for connection pre-warming.
+
+    Warm the host that will actually serve the job: the chosen slug comes from
+    the same helper ``config.check`` uses to warn about an inverted order, so
+    the pre-warm and the failover chain can never disagree.
+    """
+    slug = first_configured_stt_provider(settings)
+    if slug == "speechmatics":
+        return settings.speechmatics_base_url
+    if slug == "deepgram":
+        return settings.deepgram_base_url
+    if slug == "openai_compatible":
+        return settings.stt_openai_base_url
     return None
 
 

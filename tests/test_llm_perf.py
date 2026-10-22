@@ -7,17 +7,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import unittest
 from unittest import mock
 
 from gamas_bot import llm, office_ai
 from gamas_bot.office_ai import plan_deck
 from gamas_bot.bot import GamasBot
-from gamas_bot.config import note_routes
+from gamas_bot.config import from_env, note_routes
 from gamas_bot.llm import (
     LLMOutputBudgetError,
     LLMTransientError,
     complete,
+    complete_json,
 )
 from tests.support import make_settings
 from tests.test_llm import FakeResponse, routed_settings
@@ -116,6 +118,38 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         # Streaming was requested only on this opted-in path.
         self.assertTrue(session.calls[0]["json"]["stream"])
 
+    async def test_structured_output_composes_with_streaming(self):
+        """Both halves are shipped defaults, so the pair must work together.
+
+        A fresh install has ``NOTE_TTFB_TIMEOUT_SECONDS=25`` *and*
+        ``NOTE_STRUCTURED_OUTPUT=1``; a note request is therefore streamed and
+        schema-constrained at the same time. This pins that combination: the
+        streamed POST still carries ``response_format``, and the reassembled
+        deltas parse as the JSON object the schema describes.
+        """
+        expected = {"sections": [{"heading": "مقدمه"}]}
+        lines = [sse(delta(json.dumps(expected, ensure_ascii=False))), b"data: [DONE]"]
+        session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
+        schema = {
+            "type": "object",
+            "properties": {
+                "sections": {"type": "array", "items": {"type": "object"}},
+            },
+            "required": ["sections"],
+        }
+        result = await complete_json(
+            session,
+            self.settings(note_structured_output=True),
+            system="S",
+            user="U",
+            schema=schema,
+        )
+        self.assertEqual(result, expected)
+        sent = session.calls[0]["json"]
+        self.assertTrue(sent["stream"])
+        self.assertEqual(sent["response_format"]["type"], "json_schema")
+        self.assertEqual(sent["response_format"]["json_schema"]["name"], "gamas_notes")
+
     async def test_length_finish_reason_is_output_budget_error(self):
         lines = [sse(delta("partial", finish="length")), b"data: [DONE]"]
         session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
@@ -145,6 +179,56 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "backup")
         nara_calls = [c for c in session.calls if "bynara" in c["url"]]
         self.assertEqual(len(nara_calls), 1)
+
+
+class ShippedDefaultWiringTests(unittest.IsolatedAsyncioTestCase):
+    """The defaults a fresh install really has must reach the transport.
+
+    ``ShippedDefaultTests`` pins the numbers; these tests prove the numbers are
+    wired: a default install streams (25 s first-byte guard) while still asking
+    for the schema, and a cheap first provider is *not* doubled by the 60 s
+    hedge because it finishes long before the delay.
+    """
+
+    def settings(self, **extra):
+        environment = {
+            "NOTE_PROVIDERS": "openai_compatible,nara",
+            "NOTE_API_KEY": "note-key",
+            "NOTE_BASE_URL": "https://note.example/v1",
+            "NOTE_MODEL": "test-model",
+            "NARA_API_KEY": "nara-key",
+            **extra,
+        }
+        with mock.patch.dict(os.environ, environment, clear=True):
+            return from_env(env_file="/nonexistent")
+
+    async def test_a_fresh_install_streams_and_sends_the_schema(self):
+        settings = self.settings()
+        self.assertEqual(settings.note_ttfb_timeout, 25.0)
+        expected = {"sections": [{"heading": "مقدمه"}]}
+        lines = [sse(delta(json.dumps(expected, ensure_ascii=False))), b"data: [DONE]"]
+        session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
+        result = await complete_json(
+            session,
+            settings,
+            system="S",
+            user="U",
+            schema={"type": "object", "properties": {"sections": {"type": "array"}}},
+        )
+        self.assertEqual(result, expected)
+        sent = session.calls[0]["json"]
+        self.assertTrue(sent["stream"])
+        self.assertEqual(sent["response_format"]["type"], "json_schema")
+
+    async def test_the_default_hedge_does_not_double_a_healthy_request(self):
+        """Hedging exists for tail latency, not for every call."""
+        settings = self.settings()
+        self.assertEqual(settings.note_hedge_after, 60.0)
+        lines = [sse(delta("fast", finish="stop")), b"data: [DONE]"]
+        session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
+        result = await complete(session, settings, system="S", user="U")
+        self.assertEqual(result, "fast")
+        self.assertEqual(len(session.calls), 1)
 
 
 class HedgeResponse(FakeResponse):

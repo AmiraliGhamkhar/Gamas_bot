@@ -465,6 +465,11 @@ def make_settings(**overrides) -> Settings:
         note_openrouter_throughput=False,
         note_structured_output=False,
         note_progressive_booklet=False,
+        # Pinned to the pre-change behaviour on purpose: the shipped defaults
+        # (25 s first-byte guard, 60 s hedge) are covered by tests that build
+        # settings from the environment instead of this fixture.
+        note_ttfb_timeout=0.0,
+        note_hedge_after=0.0,
         note_compile_provider="",
         raw_text_profile="plain",
         raw_fallback_file_chars=100_000,

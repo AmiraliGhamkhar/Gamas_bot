@@ -2686,6 +2686,47 @@ async def _compile_in_groups(
     return assembled
 
 
+def _merged_chars(notes: StructuredNotes) -> int:
+    """Serialized size of the merged booklet, the compile budget's unit."""
+    return len(json.dumps(compact_notes_payload(notes), ensure_ascii=False))
+
+
+def compile_skip_reason(
+    notes: StructuredNotes,
+    settings: Settings,
+    *,
+    mode: str,
+    presentation: bool,
+) -> str | None:
+    """Why the editorial pass will not run, or ``None`` when it will.
+
+    One predicate for two callers that must never disagree: ``_compile_pass``
+    decides whether to send the request, and the progressive-booklet callback
+    decides whether a *draft* is worth delivering. When the compile is skipped
+    the pass returns the merge unchanged, so a draft would be byte-identical to
+    the booklet the user is about to receive — a second file that says nothing
+    new.
+    """
+    if not settings.note_compile:
+        return "disabled"
+    if _merged_chars(notes) < COMPILE_MIN_NOTES_CHARS:
+        return "small"
+    if effective_compile_max_chars(settings, mode=mode, presentation=presentation) <= 0:
+        return "no-budget"
+    return None
+
+
+def compile_will_run(
+    notes: StructuredNotes,
+    settings: Settings,
+    *,
+    mode: str,
+    presentation: bool,
+) -> bool:
+    """Whether the editorial compile will produce a different booklet."""
+    return compile_skip_reason(notes, settings, mode=mode, presentation=presentation) is None
+
+
 async def _compile_pass(
     merged: StructuredNotes,
     merged_report: NoteQualityReport | None,
@@ -2705,11 +2746,20 @@ async def _compile_pass(
     compiled in groups so the pass still runs; a booklet that fits one request
     keeps the original single-request behaviour and cost.
     """
-    if not settings.note_compile:
+    skip = compile_skip_reason(merged, settings, mode=mode, presentation=presentation)
+    if skip == "no-budget":
+        # A zero budget means the configured window cannot hold the merged
+        # booklet plus the compile prompt. Skipping silently made a
+        # misconfiguration look like a normal, unedited merge.
+        logger.warning(
+            "compile pass disabled: NOTE_CONTEXT_TOKENS leaves no room for the "
+            "merged booklet (merged_chars=%d, NOTE_MAX_OUTPUT_TOKENS=%d)",
+            _merged_chars(merged), settings.note_max_output_tokens,
+        )
         return merged
-    merged_chars = len(json.dumps(compact_notes_payload(merged), ensure_ascii=False))
-    if merged_chars < COMPILE_MIN_NOTES_CHARS:
+    if skip is not None:
         return merged
+    merged_chars = _merged_chars(merged)
     budget = effective_compile_max_chars(
         settings, mode=mode, presentation=presentation
     )
@@ -2914,9 +2964,13 @@ async def structure_document(
             merged, document, settings, session,
             mode=resolved_mode, presentation=presentation, semaphore=semaphore,
         )
-    if on_merged is not None:
+    if on_merged is not None and compile_will_run(
+        merged, settings, mode=resolved_mode, presentation=presentation
+    ):
         # Deliberately after the repair: the provisional booklet is the same
-        # audited content the compile starts from, never the raw merge.
+        # audited content the compile starts from, never the raw merge. Skipped
+        # when the compile will not run, because the final booklet would then be
+        # this exact file.
         try:
             await on_merged(merged)
         except Exception:  # noqa: BLE001 - delivery is never a note failure

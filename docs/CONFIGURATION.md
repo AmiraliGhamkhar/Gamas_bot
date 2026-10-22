@@ -35,7 +35,7 @@ Use a real numeric Telegram user ID for each admin, separated by commas. Configu
 
 | Setting | What to do |
 | --- | --- |
-| `STT_PROVIDERS`, `STT_LANGUAGE` | Choose failover order and language; Persian defaults to `fa`. See [STT providers](STT_PROVIDERS.md). |
+| `STT_PROVIDERS`, `STT_LANGUAGE` | Choose failover order and language; Persian defaults to `fa`. Order *is* latency policy: the first provider with a key is the one that runs, so the default leads with `deepgram` and keeps `speechmatics` as the fallback. See [STT providers](STT_PROVIDERS.md). |
 | `NOTE_PROVIDERS` | Set note-provider order. Each provider needs its own key. See [Note providers](PROVIDERS.md). |
 | `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS` | On cPanel, start with `1` active job and a small queue. |
 | `MAX_ACTIVE_JOBS_PER_USER` | Per-user admission cap (default `2`). Lower it to stop one user from queueing work their balance cannot cover. |
@@ -51,18 +51,18 @@ Use a real numeric Telegram user ID for each admin, separated by commas. Configu
 | `NOTE_MAX_OUTPUT_TOKENS` | Measure real `output_tokens` p95 from the Phase 0 usage logs (with `ttfb_ms`/`elapsed_ms`) over at least one week, then set cap = p95 + 15% margin (example: 16384 → 8192). Never cut below observed p95 — booklet truncation risk. |
 | `NOTE_JSON_MODE` | Enable `true` only when the configured OpenRouter model documents `json_object`; the code already never sends it to Nara. |
 | `NOTE_REASONING_EFFORT` | If used, start at `low` (never `minimal` first) and A/B against the quality-gate report before keeping it; only Nara, OpenRouter, Groq and Cerebras accept it (never the generic slot or Gemini); on gpt-oss it also keeps hidden reasoning from eating output tokens. |
-| `NOTE_CONCURRENCY` | Keep `3` on cPanel; a VPS may use `6-8`. The map phase never starts more requests than there are chunks (capped at `8`), so a higher value cannot over-subscribe a short lecture. |
-| `NOTE_STRUCTURED_OUTPUT` | Default `0`: when on, the note request carries a `responseSchema` (Gemini) or `json_schema` (OpenAI-compatible) so the provider cannot answer with prose. A provider that rejects the field drops it and the same request is retried once (سرویسِ داخلی را برای این حالت A/B کنید). |
-| `NOTE_OPENROUTER_THROUGHPUT` | Default `0`: when on, OpenRouter requests carry `provider.sort=throughput` instead of the router's price-weighted default. Only the OpenRouter route is affected. |
-| `NOTE_PROGRESSIVE_BOOKLET` | Default `0`: when on, the deterministic merge is delivered as a draft Word file («نسخهٔ نخست») while the editorial compile runs; the compiled booklet is then delivered as usual. |
+| `NOTE_CONCURRENCY` | Default `6`. The map phase never starts more requests than there are chunks (capped at `8`), so a short lecture is unaffected; lower it to `2`–`3` when the provider has a low requests-per-minute quota (free Groq, shared gateways). |
+| `NOTE_STRUCTURED_OUTPUT` | Default `1`: the note request carries a `responseSchema` (Gemini) or `json_schema` (OpenAI-compatible) so the provider cannot answer with prose. A provider that rejects the field drops it and the same request is retried once, so an unsupported gateway costs at most one extra request. Set `0` to send the shape in the prompt only (سرویسِ داخلی را برای این حالت A/B کنید). |
+| `NOTE_OPENROUTER_THROUGHPUT` | Default `1`: OpenRouter requests carry `provider.sort=throughput` instead of the router's price-weighted default. Only the OpenRouter route is affected, and it can pick a pricier upstream — set `0` when cost dominates. |
+| `NOTE_PROGRESSIVE_BOOKLET` | Default `1`: the audited merge is delivered as a draft Word file («نسخهٔ نخست») while the editorial compile runs; the compiled booklet is then delivered as usual. The draft is skipped when the compile will not run (`NOTE_COMPILE=false`, a merge below the compile floor, or no room for it), because the final file would then be identical. Set `0` to deliver one file only. |
 | `NOTE_COMPILE_PROVIDER` | Slug of the note provider that should serve the editorial compile first (`gemini`, `nara`, `openrouter`, `groq`, `cerebras`, `openai_compatible`); empty keeps `NOTE_PROVIDERS` order, and the other providers remain fallbacks. |
 | `AUDIO_FORMAT_POLICY`, `TELEGRAM_DOWNLOAD_CONNECTIONS` | Container policy for the prepared STT audio (`auto`/`wav`/`opus`) and the number of concurrent range downloads of one Telegram file (default `1`). See [Media](MEDIA.md). |
 | `STT_STATUS_LONG_POLL` | Seconds of Speechmatics long-poll requested per call (default `25`, `0` disables). See [STT providers](STT_PROVIDERS.md). |
 | `NOTE_REQUEST_TIMEOUT_SECONDS` | Re-derive after any token-cap change: it must remain greater than the time to generate `NOTE_MAX_OUTPUT_TOKENS` on the slowest configured model. |
 | `LLM_CONNECTOR_LIMIT`, `LLM_CONNECTOR_LIMIT_PER_HOST`, `LLM_CONNECTOR_TTL_DNS_CACHE`, `LLM_CONNECTOR_KEEPALIVE` | Shared HTTP connector pool sizing (defaults `32`/`8`/`300`/`300`). |
 | `LLM_PREWARM` | Default `true`: quota-free concurrent `HEAD` requests to the first note provider's host and the first STT provider's host when the shared session is created, so the first real request skips DNS/TLS connection setup. Errors are ignored. |
-| `NOTE_TTFB_TIMEOUT_SECONDS` | Default `0` (off): streaming first-byte guard for OpenAI-style and Gemini routes; see [Note providers](PROVIDERS.md). |
-| `NOTE_HEDGE_AFTER_SECONDS` | Default `0` (off): start the second provider in parallel after this delay; at most one extra in-flight POST per call. |
+| `NOTE_TTFB_TIMEOUT_SECONDS` | Default `25`: streaming first-byte guard for OpenAI-style and Gemini routes. A silent provider is abandoned after this many seconds and the chain fails over, instead of waiting out the whole request timeout. `0` turns streaming off and restores plain blocking requests; see [Note providers](PROVIDERS.md). |
+| `NOTE_HEDGE_AFTER_SECONDS` | Default `60`: if the first provider has not finished after this delay, the second starts in parallel and the first answer wins; at most one extra in-flight POST per call, so it can spend extra quota. Needs two configured note providers to do anything. `0` off. |
 | `OFFICE_AI_CONCURRENCY` | Default `3`: how many deck-planning chunks may be planned concurrently (chunk order is preserved). |
 
 On a VPS only, event-loop speed can optionally come from uvloop: `pip install uvloop` and run with `UVLOOP=1` handled by your own service wrapper. It is deliberately **not** a project dependency, nothing imports it by default, and the default (off) behaviour is unchanged without it.

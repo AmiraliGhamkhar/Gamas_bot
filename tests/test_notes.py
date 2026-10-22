@@ -629,6 +629,85 @@ class ProgressiveBookletTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(notes.title, "جزوهٔ نهایی")
         self.assertEqual(seen, [("جزوهٔ 0", len(chunks))])
 
+    async def test_no_draft_when_the_compile_is_disabled(self):
+        """With the editorial pass off, the draft would be the final file."""
+        from gamas_bot.transcript import split_transcript
+
+        settings = make_settings(note_chunk_chars=400, note_compile=False)
+        document = "\n\n".join(
+            f"موضوع {index}: " + "جمله‌های بسیار زیاد برای پر کردن حجم. " * 20
+            for index in range(4)
+        )
+        chunks = split_transcript(document, 400)
+        session = FakeSession([big_notes_json(f"جزوهٔ {i}") for i in range(len(chunks))])
+        seen: list[str] = []
+
+        async def on_merged(merged):
+            seen.append(merged.title)
+
+        notes = await structure_transcript(document, settings, session, on_merged=on_merged)
+        self.assertEqual(seen, [])
+        # No compile request was sent, and the merge is the deliverable.
+        self.assertEqual(len(session.calls), len(chunks))
+        self.assertEqual(notes.title, "جزوهٔ 0")
+
+    async def test_no_draft_for_a_booklet_below_the_compile_floor(self):
+        """A merge too small to compile is already the final booklet."""
+        from gamas_bot import notes as notes_module
+
+        settings = make_settings(note_compile=True)
+        answer = {
+            "title": "کوتاه",
+            "sections": [{"heading": "یک", "paragraphs": ["متن کوتاه."]}],
+        }
+        payload = json.dumps(answer, ensure_ascii=False)
+        self.assertLess(len(payload), notes_module.COMPILE_MIN_NOTES_CHARS * 4)
+        session = FakeSession([payload])
+        seen: list[str] = []
+
+        async def on_merged(merged):
+            seen.append(merged.title)
+
+        notes = await structure_transcript(
+            "یک متن کوتاه برای جزوه.", settings, session, on_merged=on_merged
+        )
+        self.assertEqual(seen, [])
+        self.assertEqual(len(session.calls), 1)
+        self.assertEqual(notes.title, "کوتاه")
+
+    async def test_the_draft_gate_matches_the_compile_pass(self):
+        """The predicate the callback uses is the one the pass uses."""
+        from gamas_bot import notes as notes_module
+
+        merged = notes_module.StructuredNotes.from_payload(
+            {
+                "title": "منبع",
+                "sections": [
+                    {"heading": f"بخش {number}", "paragraphs": ["متن کافی برای عبور از آستانه."]}
+                    for number in range(6)
+                ],
+            }
+        )
+        compile_on = make_settings(note_compile=True)
+        self.assertTrue(
+            notes_module.compile_will_run(merged, compile_on, mode="full", presentation=False)
+        )
+        self.assertIsNone(
+            notes_module.compile_skip_reason(
+                merged, compile_on, mode="full", presentation=False
+            )
+        )
+        compile_off = make_settings(note_compile=False)
+        self.assertFalse(
+            notes_module.compile_will_run(merged, compile_off, mode="full", presentation=False)
+        )
+        self.assertEqual(
+            notes_module.compile_skip_reason(
+                merged, compile_off, mode="full", presentation=False
+            ),
+            "disabled",
+        )
+
     async def test_a_failing_callback_never_fails_the_notes(self):
         from gamas_bot.transcript import split_transcript
 

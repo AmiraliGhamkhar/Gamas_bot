@@ -8,7 +8,9 @@
 | Deepgram | `deepgram` | `DEEPGRAM_API_KEY`, `DEEPGRAM_MODEL=nova-3` | `DEEPGRAM_BASE_URL`; Nova-2 does not support Persian. |
 | OpenAI-compatible | `openai_compatible` | `STT_OPENAI_API_KEY`, `STT_OPENAI_MODEL` | Set `STT_OPENAI_BASE_URL`; upload cap is `STT_OPENAI_MAX_UPLOAD_BYTES` (25 MB by default). The gateway must support audio transcription. |
 
-The default language is `STT_LANGUAGE=fa`; the default provider order is `speechmatics,deepgram,openai_compatible`. Review exact URLs and limits in `.env.example`.
+The default language is `STT_LANGUAGE=fa`; the default provider order is `deepgram,speechmatics,openai_compatible`. Review exact URLs and limits in `.env.example`.
+
+**Order is latency policy, not preference.** Only providers with a key are attempted, and the first one that qualifies serves the job — so an unconfigured slug is skipped, and listing a slow engine first makes it the default for every upload. The shipped order therefore leads with Deepgram (Nova-3, an independent benchmark measured ~351× real time against ~24× for Speechmatics `enhanced`) and keeps Speechmatics second: a deployment whose only key is `SPEECHMATICS_API_KEY` behaves exactly as before, and a Deepgram outage degrades to the previous path instead of failing. `python -m gamas_bot --check` prints an advisory warning when `STT_PROVIDERS` starts with `speechmatics` while `SPEECHMATICS_MODEL` is `enhanced` or `standard` and Deepgram is also configured — the bot still runs, but every job would wait for the slower engine.
 
 ## Failover behavior
 
