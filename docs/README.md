@@ -18,6 +18,7 @@ Start with the [main README](../README.md). Setup commands are split by platform
 | [Free Office](OFFICE.md) | Text-to-document features |
 | [Word output](DOCX.md) | RTL Word behavior and fonts |
 | [Note quality](NOTE_QUALITY.md) | Grounding checks and limitations |
+| [Performance](PERFORMANCE_PLAN.md) | Measured latency budget and the speed-up plan |
 | [Architecture](ARCHITECTURE.md) | Short code and data-flow map |
 | [Changelog](CHANGELOG.md) | Recent user-visible changes |
 
