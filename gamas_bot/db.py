@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import re
+import sqlite3
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -30,6 +31,8 @@ from pathlib import Path
 from typing import Any
 
 import aiosqlite
+
+from .metrics import METRICS
 
 logger = logging.getLogger(__name__)
 
@@ -234,8 +237,12 @@ class Database:
                 await self.db.execute("BEGIN IMMEDIATE")
                 yield
                 await self.db.commit()
-            except BaseException:
+            except BaseException as exc:
                 await self.db.rollback()
+                if isinstance(exc, sqlite3.Error):
+                    # Counted for the admin health panel («خطاهای پایگاه‌داده») so a
+                    # failing disk/lock does not stay invisible outside the log.
+                    METRICS.record_db_error()
                 raise
 
     async def _credit_lots(
@@ -498,26 +505,60 @@ class Database:
         *,
         error: str | None = None,
         duration_seconds: float | None = None,
+        error_kind: str | None = None,
     ) -> None:
-        finished = iso(utc_now()) if status in TERMINAL_SUBMISSION_STATUSES else None
+        """Move a submission through its lifecycle, recording reporting facts.
+
+        Two facts are stamped here rather than at every call site:
+
+        * ``started_at`` on the first transition to ``processing`` — it is the
+          only record of when the worker actually picked the job up, and it is
+          what makes queue wait and processing time measurable per job;
+        * ``error_kind``, the bounded failure category the admin report groups
+          by (``COALESCE`` keeps the first value, so a terminal category is
+          never overwritten by a later, vaguer one).
+        """
+        now = iso(utc_now())
+        finished = now if status in TERMINAL_SUBMISSION_STATUSES else None
+        started = now if status == "processing" else None
         await self._write(
             "UPDATE submissions SET status = CASE WHEN ? = 'failed' AND delivered_at IS NOT NULL "
             "THEN 'partial' ELSE ? END, error = ?, "
+            "error_kind = COALESCE(error_kind, ?), "
             "duration_seconds = COALESCE(?, duration_seconds), "
+            "started_at = CASE WHEN ? = 'processing' THEN COALESCE(started_at, ?) ELSE started_at END, "
             "finished_at = COALESCE(?, finished_at) "
             "WHERE submission_id = ?",
-            (status, status, error, duration_seconds, finished, submission_id),
+            (
+                status, status, error, error_kind, duration_seconds,
+                status, started, finished, submission_id,
+            ),
         )
 
     async def save_transcription(
         self, submission_id: int, engine: str, text: str, notes_json: str
     ) -> None:
-        await self._write(
-            "INSERT INTO transcriptions(submission_id, engine, text, notes_json, created_at) "
-            "VALUES (?, ?, ?, ?, ?) "
-            "ON CONFLICT(submission_id) DO UPDATE SET engine = excluded.engine, "
-            "text = excluded.text, notes_json = excluded.notes_json",
-            (submission_id, engine, text, notes_json, iso(utc_now())),
+        """Store the transcript and remember which engine produced it.
+
+        The engine is duplicated onto ``submissions`` in the same transaction:
+        the retention sweep deletes transcript rows, and provider-usage
+        reporting must outlive that (see migration 009).
+        """
+        await self._write_many(
+            [
+                (
+                    "INSERT INTO transcriptions(submission_id, engine, text, notes_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(submission_id) DO UPDATE SET engine = excluded.engine, "
+                    "text = excluded.text, notes_json = excluded.notes_json",
+                    (submission_id, engine, text, notes_json, iso(utc_now())),
+                ),
+                (
+                    "UPDATE submissions SET stt_engine = COALESCE(?, stt_engine) "
+                    "WHERE submission_id = ?",
+                    (engine or None, submission_id),
+                ),
+            ]
         )
 
     async def expire_transcriptions(
@@ -617,6 +658,309 @@ class Database:
             "toman_approved": int(revenue[0][0]) if revenue else 0,
         }
 
+    # ------------------------------------------------------- admin reporting
+    #: Terminal statuses that mean the user actually received the raw
+    #: transcript. ``partial`` delivered it too, with a failed booklet on top.
+    DELIVERED_STATUSES = ("done", "partial")
+    #: Terminal statuses that mean the user received nothing.
+    UNDELIVERED_STATUSES = ("failed", "rejected")
+    #: Longest single series (days) one report returns, so an "all time"
+    #: selection can never build an unbounded list on a shared host.
+    REPORT_SERIES_MAX_DAYS = 93
+
+    @staticmethod
+    def _period_clause(period_start: str | None, column: str = "created_at") -> tuple[str, tuple]:
+        """A ``created_at`` lower bound, or nothing at all for "all history".
+
+        ``created_at`` values are written by :func:`iso` as UTC ISO-8601 with an
+        explicit ``+00:00`` offset and a fixed width, so a lexicographic
+        comparison is exactly a chronological one. The predicate is *omitted*
+        when there is no window: spelling it as ``(COALESCE(?, '') = '' OR
+        created_at >= ?)`` made it non-sargable, so SQLite could not use the
+        reporting index and every window scanned the whole table.
+        """
+        if not period_start:
+            return "", ()
+        return f"{column} >= ?", (period_start,)
+
+    async def _period_duration(
+        self, expression: str, where: str, params: tuple
+    ) -> dict[str, float | int | None]:
+        """Count/average/median/p95/max of one SQL duration expression.
+
+        Percentiles are computed inside SQLite (row numbers over the ordered
+        sample) so the rows never travel to Python: one aggregate query per
+        series instead of loading every job of the period.
+
+        ``expression`` and ``where`` are internal SQL fragments, never user
+        input; every value is bound as a parameter.
+        """
+        query = (
+            f"WITH s AS (SELECT {expression} AS v FROM submissions WHERE {where}), "
+            "st AS (SELECT COUNT(*) AS n, AVG(v) AS avg_v, MAX(v) AS max_v FROM s), "
+            "r AS (SELECT v, ROW_NUMBER() OVER (ORDER BY v) AS rn FROM s) "
+            "SELECT st.n, st.avg_v, st.max_v, "
+            "(SELECT v FROM r WHERE rn = (st.n + 1) / 2), "
+            "(SELECT v FROM r WHERE rn = (st.n * 95 + 99) / 100) FROM st"
+        )
+        rows = await self.read_db.execute_fetchall(query, params)
+        count = int(rows[0][0] or 0) if rows else 0
+        if not count:
+            # No samples is "not measured", not a zero-second duration.
+            return {
+                "count": 0, "avg_seconds": None, "median_seconds": None,
+                "p95_seconds": None, "max_seconds": None,
+            }
+
+        def _round(value: object) -> float | None:
+            return None if value is None else round(float(value), 3)
+
+        return {
+            "count": count,
+            "avg_seconds": _round(rows[0][1]),
+            "median_seconds": _round(rows[0][3]),
+            "p95_seconds": _round(rows[0][4]),
+            "max_seconds": _round(rows[0][2]),
+        }
+
+    async def admin_health(self) -> dict[str, Any]:
+        """Storage and last-success facts for the system screen.
+
+        Deliberately two cheap statements: the health screen must stay
+        responsive even when a period report over a large ledger would not.
+        ``last_success`` is ``None`` when nothing has ever completed, which the
+        screens render as "not recorded" rather than as an epoch or a zero.
+        """
+        last_rows = await self.read_db.execute_fetchall(
+            "SELECT MAX(finished_at) FROM submissions WHERE status IN ('done','partial')"
+        )
+        db_bytes = 0
+        wal_bytes = 0
+        if str(self.path) != ":memory:":
+            try:
+                db_bytes = self.path.stat().st_size
+                wal_path = Path(f"{self.path}-wal")
+                if wal_path.exists():
+                    wal_bytes = wal_path.stat().st_size
+            except OSError:
+                db_bytes = 0
+        return {
+            "last_success": (
+                str(last_rows[0][0]) if last_rows and last_rows[0][0] else None
+            ),
+            "db_bytes": int(db_bytes),
+            "wal_bytes": int(wal_bytes),
+        }
+
+    async def admin_report(
+        self,
+        *,
+        period_start: str | None,
+        now: datetime | None = None,
+        expiring_within_days: int = 7,
+        with_timings: bool = True,
+    ) -> dict[str, Any]:
+        """Every figure the admin dashboard shows, from authoritative rows.
+
+        The scope of each number is explicit: ``period`` figures filter on the
+        UTC ``created_at`` of the row, ``snapshot`` figures are the current
+        state (pending reviews, expiring credit), and lifetime totals are named
+        as such. Nothing is estimated and a metric that cannot be measured is
+        returned as ``None``, never as zero.
+
+        One statement per figure (≈14 indexed aggregates) keeps the dashboard
+        responsive without an N+1 pattern; a caller that shows several sections
+        should reuse the one returned dict.
+
+        ``with_timings=False`` skips the three duration series (the costliest
+        part: they sort every finished row of the window). The timing keys are
+        then ``None`` — explicitly "not measured here", which is different from
+        a series that was measured and had no rows. Screens that do not display
+        timings must pass ``False``.
+        """
+        now = now or utc_now()
+        now_iso = iso(now)
+        series_floor = iso(now - timedelta(days=self.REPORT_SERIES_MAX_DAYS))
+        series_since = max(period_start, series_floor) if period_start else series_floor
+        period_where, period_params = self._period_clause(period_start)
+        where = period_where or "1 = 1"
+
+        # ---------------------------------------------------------- users
+        new_users_where, new_users_params = self._period_clause(period_start, "joined_at")
+        user_rows = await self.read_db.execute_fetchall(
+            "SELECT "
+            "(SELECT COUNT(*) FROM users), "
+            f"(SELECT COUNT(*) FROM users WHERE {new_users_where or '1 = 1'}), "
+            f"(SELECT COUNT(DISTINCT user_id) FROM submissions WHERE {where}), "
+            "(SELECT COUNT(DISTINCT user_id) FROM submissions WHERE "
+            f"  status IN ('done','partial') AND {where}), "
+            "(SELECT COUNT(*) FROM users WHERE banned = 1), "
+            "(SELECT COUNT(*) FROM users WHERE is_unlimited = 1)",
+            (*new_users_params, *period_params, *period_params),
+        )
+        users_row = user_rows[0] if user_rows else (0, 0, 0, 0, 0, 0)
+
+        # ----------------------------------------------------- processing
+        status_rows = await self.read_db.execute_fetchall(
+            f"SELECT status, COUNT(*) FROM submissions WHERE {where} GROUP BY status",
+            period_params,
+        )
+        by_status = {str(row[0]): int(row[1]) for row in status_rows}
+
+        kind_rows = await self.read_db.execute_fetchall(
+            f"SELECT kind, COUNT(*) FROM submissions WHERE {where} GROUP BY kind",
+            period_params,
+        )
+        by_kind = {str(row[0]): int(row[1]) for row in kind_rows}
+
+        delivered = sum(by_status.get(status, 0) for status in self.DELIVERED_STATUSES)
+        undelivered = sum(by_status.get(status, 0) for status in self.UNDELIVERED_STATUSES)
+        terminal = delivered + undelivered
+
+        error_rows = await self.read_db.execute_fetchall(
+            # Group by the expression, not the alias: ``kind`` is also a real
+            # column of ``submissions`` and SQLite resolves the bare name to it
+            # (which silently grouped every failure under its media kind).
+            "SELECT COALESCE(error_kind, 'unclassified') AS error_kind, COUNT(*) "
+            f"FROM submissions WHERE status IN ('failed','rejected') AND {where} "
+            "GROUP BY COALESCE(error_kind, 'unclassified') "
+            "ORDER BY COUNT(*) DESC LIMIT 12",
+            period_params,
+        )
+
+        day_rows = await self.read_db.execute_fetchall(
+            "SELECT substr(created_at, 1, 10) AS day, COUNT(*), "
+            "SUM(CASE WHEN status IN ('done','partial') THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN status IN ('failed','rejected') THEN 1 ELSE 0 END) "
+            f"FROM submissions WHERE created_at >= ? AND {where} "
+            "GROUP BY day ORDER BY day DESC LIMIT ?",
+            (series_since, *period_params, self.REPORT_SERIES_MAX_DAYS),
+        )
+        new_user_rows = await self.read_db.execute_fetchall(
+            "SELECT substr(joined_at, 1, 10) AS day, COUNT(*) FROM users "
+            f"WHERE joined_at >= ? AND {new_users_where or '1 = 1'} "
+            "GROUP BY day ORDER BY day DESC LIMIT ?",
+            (series_since, *new_users_params, self.REPORT_SERIES_MAX_DAYS),
+        )
+        new_by_day = {str(row[0]): int(row[1]) for row in new_user_rows}
+        job_by_day = {
+            str(row[0]): (int(row[1]), int(row[2] or 0), int(row[3] or 0))
+            for row in day_rows
+        }
+        series = [
+            {
+                "day": day,
+                "new_users": new_by_day.get(day, 0),
+                "jobs": job_by_day.get(day, (0, 0, 0))[0],
+                "delivered": job_by_day.get(day, (0, 0, 0))[1],
+                "undelivered": job_by_day.get(day, (0, 0, 0))[2],
+            }
+            for day in sorted(set(new_by_day) | set(job_by_day))
+        ]
+
+        queue_wait = processing_time = end_to_end = None
+        if with_timings:
+            queue_wait = await self._period_duration(
+                "(julianday(started_at) - julianday(created_at)) * 86400.0",
+                f"started_at IS NOT NULL AND {where}",
+                period_params,
+            )
+            processing_time = await self._period_duration(
+                "(julianday(finished_at) - julianday(started_at)) * 86400.0",
+                f"started_at IS NOT NULL AND finished_at IS NOT NULL AND {where}",
+                period_params,
+            )
+            end_to_end = await self._period_duration(
+                "(julianday(finished_at) - julianday(created_at)) * 86400.0",
+                f"finished_at IS NOT NULL AND {where}",
+                period_params,
+            )
+
+        # ------------------------------------------------------- payments
+        payment_rows = await self.read_db.execute_fetchall(
+            "SELECT status, COUNT(*), COALESCE(SUM(COALESCE(purchased_price, 0)), 0) "
+            f"FROM payments WHERE {where} GROUP BY status",
+            period_params,
+        )
+        payments_by_status = {
+            str(row[0]): {"count": int(row[1]), "toman": int(row[2] or 0)}
+            for row in payment_rows
+        }
+        pending_rows = await self.read_db.execute_fetchall(
+            "SELECT COUNT(*) FROM payments "
+            "WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL"
+        )
+        future = iso(now + timedelta(days=max(1, expiring_within_days)))
+        expiring_rows = await self.read_db.execute_fetchall(
+            "SELECT COUNT(*), COALESCE(SUM(seconds), 0) FROM ledger "
+            "WHERE kind = 'credit' AND expires_at IS NOT NULL "
+            "AND julianday(expires_at) > julianday(?) AND julianday(expires_at) <= julianday(?)",
+            (now_iso, future),
+        )
+
+        # --------------------------------------------------------- health
+        health = await self.admin_health()
+
+        return {
+            "period": {
+                "start": period_start,
+                "end": now_iso,
+                "series_since": series_since,
+            },
+            "users": {
+                "total": int(users_row[0] or 0),
+                "new": int(users_row[1] or 0),
+                "active": int(users_row[2] or 0),
+                "delivered": int(users_row[3] or 0),
+                "banned": int(users_row[4] or 0),
+                "unlimited": int(users_row[5] or 0),
+            },
+            "processing": {
+                "by_status": by_status,
+                "by_kind": by_kind,
+                "delivered": delivered,
+                "undelivered": undelivered,
+                "terminal": terminal,
+                "success_rate": (delivered / terminal) if terminal else None,
+                "errors": [
+                    {"kind": str(row[0]), "count": int(row[1])} for row in error_rows
+                ],
+                "queue_wait": queue_wait,
+                "processing_time": processing_time,
+                "end_to_end": end_to_end,
+                "series": series,
+            },
+            "payments": {
+                "by_status": payments_by_status,
+                "pending_review": int(pending_rows[0][0]) if pending_rows else 0,
+                "expiring": {
+                    "within_days": max(1, expiring_within_days),
+                    "count": int(expiring_rows[0][0]) if expiring_rows else 0,
+                    "seconds": int(expiring_rows[0][1] or 0) if expiring_rows else 0,
+                },
+            },
+            "health": health,
+        }
+
+    async def admin_stt_engines(
+        self, *, period_start: str | None
+    ) -> list[dict[str, Any]]:
+        """Which STT engine produced each transcript of the period.
+
+        ``submissions.stt_engine`` is written next to the transcript, so this
+        survives the transcript-retention sweep (which would otherwise erase
+        the only record of provider usage).
+        """
+        period_where, params = self._period_clause(period_start)
+        rows = await self.read_db.execute_fetchall(
+            "SELECT COALESCE(stt_engine, 'unrecorded') AS engine, COUNT(*) "
+            f"FROM submissions WHERE {period_where or '1 = 1'} "
+            "GROUP BY COALESCE(stt_engine, 'unrecorded') "
+            "ORDER BY COUNT(*) DESC",
+            params,
+        )
+        return [{"engine": str(row[0]), "count": int(row[1])} for row in rows]
+
     async def recover_interrupted(self) -> int:
         """Startup recovery: fail interrupted work and release its credit holds.
 
@@ -634,6 +978,7 @@ class Database:
                 await self.db.execute(
                     "UPDATE submissions SET status = CASE WHEN delivered_at IS NOT NULL "
                     "THEN 'partial' ELSE 'failed' END, error = 'interrupted by restart', "
+                    "error_kind = COALESCE(error_kind, 'cancelled'), "
                     "finished_at = ? WHERE submission_id = ?",
                     (now, row[0]),
                 )

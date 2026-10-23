@@ -12,6 +12,7 @@ and **cPanel Terminal** (Linux shared hosting).
 | [Testing](TESTING.md) | Local checks and CI commands |
 | [Security](SECURITY.md) | Data, uploads, credentials and privacy |
 | [Billing](BILLING.md) | Credit, plans, receipts and admin review |
+| [Admin panel](ADMIN.md) | Dashboard, statistic definitions, windows and health checks |
 | [Speech-to-text](STT_PROVIDERS.md) | STT providers, failover and limits |
 | [Note providers](PROVIDERS.md) | Note generation, keys and model presets |
 | [Presentations](PRESENTATIONS.md) | PowerPoint narration and limits |

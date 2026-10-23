@@ -69,12 +69,29 @@ class STTQuotaError(STTAuthenticationError):
     """The provider reported quota or credit exhaustion — cooldown, then failover."""
 
 
-class STTTransientError(STTError):
-    """Network/server failure that can be retried within the bounded budget."""
+#: Reason codes an ``STTTransientError`` may carry; they are the metric buckets.
+_TRANSIENT_KINDS = frozenset({"server_error", "timeout", "connection_error", "rate_limit"})
 
-    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
+
+class STTTransientError(STTError):
+    """Network/server failure that can be retried within the bounded budget.
+
+    ``kind`` says *why* it was transient. The admin dashboard reports provider
+    timeouts and rate limits as separate counts, and deriving that from the
+    Persian message text (the previous approach, which matched the word «زمان»)
+    misclassified any message that happened to contain it.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+        kind: str = "server_error",
+    ):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+        self.kind = kind if kind in _TRANSIENT_KINDS else "server_error"
 
 
 class STTRequestError(STTError):
@@ -735,7 +752,9 @@ async def _speechmatics_poll(
     polling = first_status != "done"
     while polling:
         if time.monotonic() >= deadline:
-            raise STTTransientError("زمان پردازش Speechmatics به پایان رسید.")
+            raise STTTransientError(
+                "زمان پردازش Speechmatics به پایان رسید.", kind="timeout"
+            )
         status_data = await _get_json(
             "Speechmatics",
             session,
@@ -1122,11 +1141,8 @@ async def _attempt_provider(
                 MAX_RETRY_AFTER_SECONDS,
                 max(1.0, exc.retry_after_seconds),
             )
-        elif "زمان" in str(exc):
-            METRICS.record_provider_event("stt", spec.slug, "timeout")
-            cooldown = TRANSIENT_COOLDOWN_SECONDS
         else:
-            METRICS.record_provider_event("stt", spec.slug, "server_error")
+            METRICS.record_provider_event("stt", spec.slug, exc.kind)
             cooldown = TRANSIENT_COOLDOWN_SECONDS
         _set_cooldown(spec.slug, cooldown)
         raise

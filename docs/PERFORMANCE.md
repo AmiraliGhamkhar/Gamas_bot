@@ -138,6 +138,46 @@ These are local synthetic measurements, not tests of a real cPanel account, Tele
 Speechmatics/Deepgram account, model-provider latency, or production traffic. No live-provider or
 cPanel verification was performed.
 
+## Admin dashboard queries
+
+The admin dashboard is the one screen whose cost grows with the size of the database, so it has its
+own reproducible benchmark. It is a pure SQLite measurement (one process, no concurrent writers); it
+is not a capacity test:
+
+```bash
+python -m scripts.admin_report_bench
+python -m scripts.admin_report_bench --jobs 50000 --users 10000 --repeat 5
+```
+
+Synthetic dataset: 5 000 users, 20 000 submissions over 180 days, 2 000 payments, 2 500 credit
+lots; medians of 5 repeats on this checkout's machine:
+
+| Measurement | Median |
+| --- | ---: |
+| Previous overview (lifetime aggregates only) | 6.36 ms |
+| Dashboard, 7-day window | 29.53 ms |
+| Dashboard, 30-day window | 66.26 ms |
+| Dashboard, all history | 171.42 ms |
+| Users / payments screens, 7-day (no timing series) | 22.11 ms |
+| Users / payments screens, all history | 35.34 ms |
+| STT engine usage, 7-day | 0.59 ms |
+| System health | 4.66 ms |
+| Dashboard, 7-day, non-sargable window predicate | 50.01 ms |
+| Dashboard, 7-day, with the 009 indexes dropped | 46.70 ms |
+| Dashboard, all history, with the 009 indexes dropped | 180.13 ms |
+
+Reading these numbers: the dashboard does more than the old overview did (windows, percentiles,
+categories, provider usage), so it is slower than six lifetime aggregates — the comparison is
+scope, not a regression. Within the new code the only measured optimisation is the index-usable
+window predicate: the first version's `(COALESCE(?, '') = '' OR created_at >= ?)` measured 50.01 ms
+for a 7-day window, and the sargable `created_at >= ?` measures 29.53 ms (41% faster); dropping the
+009 indexes returns it to 46.70 ms, which shows the earlier figure was an unused index, not a
+missing one. Wider windows are statistically unchanged, because there the row set dominates. The all-history figure is
+dominated by the three timing series, each of which sorts every finished row in the window to get
+median/p95; the users and payments screens skip them (`with_timings=False`) and stay at ~35 ms even
+for all history. No caching layer was added: a 30–170 ms read on the dedicated read-only connection
+was judged preferable to serving stale operational numbers.
+
 ## Tuning guidance
 
 - On shared hosting, start with the defaults above, `MEDIA_WORKER_CONCURRENCY=1`, and

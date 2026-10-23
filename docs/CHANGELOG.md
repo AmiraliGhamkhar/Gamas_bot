@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+Admin statistics dashboard (migration 009):
+
+- Replaced the flat lifetime overview with a period-aware dashboard: users / processing /
+  payments / system health, each with `امروز | ۷ روز | ۳۰ روز | کل` windows and a drill-down
+  screen, plus an explicit «نیازمند توجه» list (pending receipts, failures by category, credit
+  expiring within 7 days, database errors, provider timeouts/rate limits). Metric definitions are
+  in [Admin panel](ADMIN.md).
+- Submissions now record `started_at`, `error_kind` and `stt_engine`. That makes queue wait,
+  processing time, failure categories and STT provider usage measurable from authoritative rows for
+  a chosen window; provider usage also survives transcript retention, which previously erased the
+  only record of it. Pre-upgrade rows keep NULL and are excluded from those figures rather than
+  counted as zero.
+- Failures are categorised once (input/download/media/stt/notes/delivery/billing/database/
+  cancelled/capacity/banned/internal) at the point they are recorded, so a period report no longer
+  has to guess from error text.
+- New reporting indexes (submissions by `created_at`/`finished_at`/`kind`, users by `joined_at`,
+  payments by `created_at`, credit ledger by `kind, expires_at`). Windows are a sargable
+  `created_at >= ?` bound; the first version used `(COALESCE(?, '') = '' OR created_at >= ?)`,
+  which is not index-usable, so the same 7-day report measured 50.0 ms instead of 29.5 ms at
+  20 000 submissions (see [Performance](PERFORMANCE.md)).
+- `python -m scripts.admin_report_bench` reproduces the dashboard timings on synthetic data.
+- Fixed a stale changelog line that claimed the shipped STT order leads with Deepgram; the default
+  remains Speechmatics primary (`DEFAULT_STT_PROVIDERS`).
+
 Concurrency and capacity-wait fixes:
 
 - Fixed single-provider capacity starvation: with only Speechmatics configured (2 in-flight

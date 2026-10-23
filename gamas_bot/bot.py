@@ -34,7 +34,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import aiohttp
@@ -56,6 +56,7 @@ from .db import (
     PaymentSnapshotError,
     TicketStateError,
     TooManyActiveJobsError,
+    utc_now,
 )
 from .fileio import (
     AsyncFileReader,
@@ -68,6 +69,7 @@ from .docx_export import (
     DocumentMeta,
     build_notes_docx,
     build_plain_docx,
+    jalali_date,
     notes_docx_filename,
     plain_docx_filename,
     raw_text_filename,
@@ -184,6 +186,58 @@ USER_VISIBLE_ERRORS = (
     MediaToolError,
     OfficeError,
 )
+
+#: Bounded failure categories written to ``submissions.error_kind`` (migration
+#: 009). The admin dashboard groups a period's failures by these; a value added
+#: later without a label is still shown, under its raw key.
+FAILURE_KIND_LABELS_FA: dict[str, str] = {
+    "input": "فایل یا درخواست نامعتبر",
+    "download": "دریافت فایل از تلگرام",
+    "media": "پردازش رسانه",
+    "stt": "تبدیل گفتار به متن",
+    "notes": "ساخت جزوه / فایل Word",
+    "delivery": "ارسال به تلگرام",
+    "billing": "اعتبار ناکافی",
+    "database": "پایگاه‌داده",
+    "cancelled": "لغو یا خاموشی",
+    "capacity": "تکمیل ظرفیت صف",
+    "banned": "حساب مسدود",
+    "internal": "خطای داخلی",
+}
+
+#: Where a job was when it raised is the most reliable category signal for the
+#: failures that do not have their own exception type (a download timeout is a
+#: ``ValueError`` exactly like an unsupported file).
+_FAILURE_KIND_BY_STATE: dict[str, str] = {
+    "downloading": "download",
+    "extracting": "media",
+    "transcribing": "stt",
+    "generating_notes": "notes",
+    "uploading": "delivery",
+}
+
+
+def classify_failure(state: str, exc: BaseException) -> str:
+    """Map a failed job to one reporting category (never raises).
+
+    Explicit exception types win over the stage, because an ``STTError`` raised
+    while uploading is still an STT failure, while a ``ValueError`` is a user
+    input problem wherever it happens. Anything unrecognized falls back to the
+    stage the job was in and finally to ``internal``.
+    """
+    if isinstance(exc, InsufficientBalanceError):
+        return "billing"
+    if isinstance(exc, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(exc, STTError):
+        return "stt"
+    if isinstance(exc, MediaToolError):
+        return "media"
+    if isinstance(exc, sqlite3.Error):
+        return "database"
+    if isinstance(exc, (ValueError, PresentationError, OfficeError)):
+        return "input"
+    return _FAILURE_KIND_BY_STATE.get(state, "internal")
 
 RAW_PREVIEW_CHARS = 800
 MAX_RAW_PREVIEW_LINES = 12
@@ -982,7 +1036,8 @@ class GamasBot:
             # so recover_interrupted is not the only path and users are told.
             try:
                 await self.db.set_submission_status(
-                    job.submission_id, "failed", error="interrupted by restart"
+                    job.submission_id, "failed", error="interrupted by restart",
+                    error_kind="cancelled",
                 )
                 if job.message is not None:
                     try:
@@ -1518,7 +1573,9 @@ class GamasBot:
         try:
             self.office_queue.submit(job)
         except QueueFullError as exc:
-            await self.db.set_submission_status(submission_id, "rejected", error=str(exc))
+            await self.db.set_submission_status(
+                submission_id, "rejected", error=str(exc), error_kind="capacity"
+            )
             await progress.fail(str(submission_id))
             await event.reply(f"⏸ {exc}")
             return
@@ -1686,6 +1743,29 @@ class GamasBot:
         elif data == "adm:home":
             await self._ack(event)
             await self._show_admin_overview(event)
+        elif data.startswith("adm:ov"):
+            # Dashboard navigation. The window is part of the callback data and
+            # is validated here, so a forged or stale value opens the default
+            # window instead of an arbitrary one (and never reaches SQL).
+            await self._ack(event)
+            parts = data.split(":")
+            section = parts[1] if len(parts) > 1 else "ov"
+            period = parts[2] if len(parts) > 2 else "7d"
+            if period not in self.ADMIN_PERIOD_KEYS:
+                await self._ack(event, "بازهٔ زمانی نامعتبر است.", alert=True)
+                return
+            if section == "ov":
+                await self._show_admin_overview(event, period)
+            elif section == "ovu":
+                await self._show_admin_users_report(event, period)
+            elif section == "ovp":
+                await self._show_admin_processing_report(event, period)
+            elif section == "ovpay":
+                await self._show_admin_payments_report(event, period)
+            elif section == "ovs":
+                await self._show_admin_system_report(event, period)
+            else:
+                await self._ack(event, "بخش گزارش نامعتبر است.", alert=True)
         elif data == "adm:users":
             await self._ack(event)
             await self._show_admin_users(event)
@@ -1954,7 +2034,9 @@ class GamasBot:
         try:
             self.queue.submit(job)
         except QueueFullError as exc:
-            await self.db.set_submission_status(submission_id, "rejected", error=str(exc))
+            await self.db.set_submission_status(
+                submission_id, "rejected", error=str(exc), error_kind="capacity"
+            )
             await progress.fail(str(submission_id))
             await event.reply(f"⏸ {exc}")
             return
@@ -2027,7 +2109,9 @@ class GamasBot:
         try:
             self.queue.submit(job)
         except QueueFullError as exc:
-            await self.db.set_submission_status(submission_id, "rejected", error=str(exc))
+            await self.db.set_submission_status(
+                submission_id, "rejected", error=str(exc), error_kind="capacity"
+            )
             await progress.fail(str(submission_id))
             await event.reply(f"⏸ {exc}")
             return
@@ -2116,7 +2200,9 @@ class GamasBot:
             if await self.db.is_banned(job.user_id):
                 job.transition_to("cancelled")
                 await self._release(job, "user banned before processing")
-                await self.db.set_submission_status(job.submission_id, "rejected", error="user banned")
+                await self.db.set_submission_status(
+                job.submission_id, "rejected", error="user banned", error_kind="banned"
+            )
                 await self._reply(job, "⛔ درخواست صف‌شده به دلیل مسدودی حساب لغو شد.")
                 return
             await self.db.set_submission_status(job.submission_id, "processing")
@@ -2141,6 +2227,7 @@ class GamasBot:
             await self.db.set_submission_status(
                 job.submission_id, "failed",
                 error=f"insufficient balance: {exc}",
+                error_kind="billing",
             )
             if progress:
                 await progress.fail(str(job.submission_id))
@@ -2151,10 +2238,11 @@ class GamasBot:
                 "از «💳 خرید اشتراک» اعتبار بگیرید."
             ))
         except USER_VISIBLE_ERRORS as exc:
+            kind = classify_failure(job.state, exc)
             job.transition_to("failed")
             await self._release(job, "user-visible failure")
             await self.db.set_submission_status(
-                job.submission_id, "failed", error=str(exc)[:500]
+                job.submission_id, "failed", error=str(exc)[:500], error_kind=kind
             )
             if progress:
                 await progress.fail(str(job.submission_id))
@@ -2166,7 +2254,7 @@ class GamasBot:
             job.transition_to("failed")
             await self._release(job, "stt failure")
             await self.db.set_submission_status(
-                job.submission_id, "failed", error=str(exc)[:500]
+                job.submission_id, "failed", error=str(exc)[:500], error_kind="stt"
             )
             if progress:
                 await progress.fail(str(job.submission_id))
@@ -2178,14 +2266,17 @@ class GamasBot:
             job.transition_to("cancelled")
             await self._release(job, "cancelled")
             await self.db.set_submission_status(
-                job.submission_id, "failed", error="cancelled"
+                job.submission_id, "failed", error="cancelled", error_kind="cancelled"
             )
             raise
         except Exception as exc:
+            kind = classify_failure(job.state, exc)
             job.transition_to("failed")
             await self._release(job, f"unexpected: {type(exc).__name__}")
             await self.db.set_submission_status(
-                job.submission_id, "failed", error=f"{type(exc).__name__}: {exc}"[:500]
+                job.submission_id, "failed",
+                error=f"{type(exc).__name__}: {exc}"[:500],
+                error_kind=kind,
             )
             logger.exception("job failed job_id=%s submission=%s", job.job_id, job.submission_id)
             if progress:
@@ -2887,6 +2978,7 @@ class GamasBot:
     ) -> None:
         await progress.update(94, "آماده‌سازی فایل Word")
         notice = ""
+        notice_kind = ""
         docx_path: Path | None = None
         if notes is not None:
             try:
@@ -2915,6 +3007,7 @@ class GamasBot:
             except Exception:
                 logger.exception("plain docx generation failed too")
                 notice = "\n\nنکته: فایل Word ساخته نشد؛ متن خام ارسال شد."
+                notice_kind = "notes"
 
         if docx_path is not None:
             caption = f"📖 جزوهٔ Word — {reference}"
@@ -2923,9 +3016,12 @@ class GamasBot:
             except Exception:
                 logger.exception("docx delivery failed")
                 notice = "\n\nنکته: ارسال فایل Word ناموفق بود؛ متن خام ارسال شد."
+                notice_kind = "delivery"
 
         await self.db.set_submission_status(
-            job.submission_id, "partial" if notice else "done", error=notice.strip() or None
+            job.submission_id, "partial" if notice else "done",
+            error=notice.strip() or None,
+            error_kind=notice_kind or None,
         )
         if notice:
             job.meta["outcome"] = "partial"
@@ -3631,37 +3727,541 @@ class GamasBot:
         await self._show_admin_payment_detail(event, payment_id)
 
     # ----------------------------------------------------------------- admin
-    async def _show_admin_overview(self, event) -> None:
-        stats = await self.db.stats()
-        pending = await self.db.count_pending_review_payments()
+    #: Reporting windows the dashboard offers. "7d"/"30d" are rolling windows
+    #: ending now, "today" is the current UTC day and "all" is the whole history;
+    #: every screen names the window it is showing.
+    ADMIN_PERIODS: tuple[tuple[str, str], ...] = (
+        ("today", "امروز"),
+        ("7d", "۷ روز"),
+        ("30d", "۳۰ روز"),
+        ("all", "کل"),
+    )
+    ADMIN_PERIOD_DAYS: dict[str, int] = {"7d": 7, "30d": 30}
+    #: Rows of the day chart one screen may render (Telegram messages are bounded).
+    ADMIN_SERIES_LIMIT = 10
+    #: p95 over fewer samples than this is noise; the screens show the sample
+    #: count and the median instead of a misleading tail figure.
+    ADMIN_P95_MIN_SAMPLES = 20
+    #: Clock the dashboard uses for its windows. Reporting is UTC end to end:
+    #: rows store UTC ISO-8601, so a "day" is a UTC day everywhere.
+    ADMIN_PERIOD_KEYS = frozenset(key for key, _label in ADMIN_PERIODS)
+
+    def _admin_period_start(self, period: str) -> str | None:
+        """UTC ISO start of one reporting window, or ``None`` for all history."""
+        now = utc_now()
+        if period == "today":
+            return now.replace(hour=0, minute=0, second=0, microsecond=0).isoformat(
+                timespec="seconds"
+            )
+        days = self.ADMIN_PERIOD_DAYS.get(period)
+        if days is None:
+            return None
+        return (now - timedelta(days=days)).isoformat(timespec="seconds")
+
+    def _admin_period_label(self, period: str, report: dict) -> str:
+        """Human window label; the dashboard is UTC everywhere, so it says so."""
+        title = dict(self.ADMIN_PERIODS).get(period, "کل")
+        start = report.get("period", {}).get("start")
+        if not start:
+            return f"{title} (از آغاز، UTC)"
+        try:
+            return f"{title} — از {jalali_date(datetime.fromisoformat(start))} (UTC)"
+        except ValueError:
+            return f"{title} (UTC)"
+
+    def _admin_period_row(self, prefix: str, period: str) -> list:
+        """The window selector shown on every dashboard screen."""
+        row = []
+        for key, label in self.ADMIN_PERIODS:
+            marker = "• " if key == period else ""
+            row.append(Button.inline(f"{marker}{label}", f"{prefix}:{key}".encode()))
+        return row
+
+    @staticmethod
+    def _rate_text(rate: float | None) -> str:
+        if rate is None:
+            return "—"
+        return to_persian_digits(f"{round(rate * 100)}٪")
+
+    @staticmethod
+    def _duration_text(seconds: float | None) -> str:
+        if seconds is None:
+            return "—"
+        return format_duration(int(round(seconds)))
+
+    def _timing_line(self, label: str, summary: dict) -> str:
+        """One average/median/p95 line that always states its sample count."""
+        count = int(summary.get("count") or 0)
+        if count <= 0:
+            return f"{label}: داده‌ای ثبت نشده"
+        parts = [f"میانگین {self._duration_text(summary.get('avg_seconds'))}"]
+        if summary.get("median_seconds") is not None:
+            parts.append(f"میانه {self._duration_text(summary['median_seconds'])}")
+        if count >= self.ADMIN_P95_MIN_SAMPLES and summary.get("p95_seconds") is not None:
+            parts.append(f"p95 {self._duration_text(summary['p95_seconds'])}")
+        return f"{label}: " + " | ".join(parts) + f" (n={to_persian_digits(count)})"
+
+    @staticmethod
+    def _day_label(day: str) -> str:
+        try:
+            return jalali_date(datetime.fromisoformat(day))
+        except ValueError:
+            return day
+
+    @staticmethod
+    def _series_bar(value: int, maximum: int, width: int = 5) -> str:
+        if value <= 0 or maximum <= 0:
+            return "·"
+        filled = max(1, round(width * min(value, maximum) / maximum))
+        return "▇" * filled
+
+    @staticmethod
+    def _bytes_text(value: int) -> str:
+        size = float(max(0, int(value)))
+        for unit in ("KB", "MB", "GB"):
+            size /= 1024.0
+            if size < 1024 or unit == "GB":
+                return f"{to_persian_digits(f'{size:.1f}')} {unit}"
+        return f"{to_persian_digits(int(value))} بایت"
+
+    @staticmethod
+    def _timestamp_text(value: str | None) -> str:
+        if not value:
+            return "ثبت نشده"
+        try:
+            at = datetime.fromisoformat(value)
+        except ValueError:
+            return value
+        return f"{jalali_date(at)} — {to_persian_digits(at.strftime('%H:%M'))} UTC"
+
+    def _admin_error_label(self, kind: str) -> str:
+        return FAILURE_KIND_LABELS_FA.get(kind, kind)
+
+    def _admin_attention_lines(self, report: dict, runtime: dict) -> list[str]:
+        """What needs an administrator now, in priority order.
+
+        Each item is derived from a count the dashboard already computed; a
+        line only appears when the count is non-zero, so an empty list means
+        "nothing to do", not "not measured".
+        """
+        payments = report["payments"]
+        processing = report["processing"]
+        items: list[str] = []
+        if payments["pending_review"]:
+            items.append(
+                f"🧾 {to_persian_digits(payments['pending_review'])} سفارش در انتظار بررسی رسید"
+            )
+        if processing["undelivered"]:
+            top = processing["errors"][0] if processing["errors"] else None
+            suffix = f" — بیشترین: {self._admin_error_label(top['kind'])}" if top else ""
+            items.append(
+                f"❌ {to_persian_digits(processing['undelivered'])} درخواست ناموفق در این بازه{suffix}"
+            )
+        expiring = payments["expiring"]
+        if expiring["count"]:
+            items.append(
+                f"⏳ {to_persian_digits(expiring['count'])} بستهٔ اعتبار تا "
+                f"{to_persian_digits(expiring['within_days'])} روز آینده منقضی می‌شود "
+                f"({format_duration(expiring['seconds'])})"
+            )
+        db_errors = int(runtime.get("db_errors", 0) or 0)  # type: ignore[arg-type]
+        if db_errors:
+            items.append(
+                f"🗄 {to_persian_digits(db_errors)} خطای پایگاه‌داده از شروع اجرای این نسخه"
+            )
+        transient = 0
+        providers = runtime.get("providers", {}) or {}
+        for layer in ("stt", "llm"):
+            for stats in (providers.get(layer, {}) or {}).values():  # type: ignore[union-attr]
+                transient += sum(
+                    int(stats.get(key, 0) or 0)
+                    for key in ("timeouts", "rate_limits", "server_errors")
+                )
+        if transient:
+            items.append(
+                f"🌐 {to_persian_digits(transient)} خطای موقت ارائه‌دهنده "
+                "(timeout / محدودیت نرخ / خطای سرور) از شروع اجرا"
+            )
+        if not items:
+            items.append("✅ مورد فوری‌ای در انتظار نیست.")
+        return items
+
+    async def _show_admin_overview(self, event, period: str = "7d") -> None:
+        """The dashboard: three questions answered before any drill-down."""
+        period = period if period in self.ADMIN_PERIOD_KEYS else "7d"
+        report = await self.db.admin_report(period_start=self._admin_period_start(period))
+        processing = report["processing"]
+        users = report["users"]
+        payments = report["payments"]
+        approved = payments["by_status"].get("approved", {"count": 0, "toman": 0})
+        rejected = payments["by_status"].get("rejected", {"count": 0, "toman": 0})
+        total_jobs = sum(processing["by_status"].values())
+        active_now = self.queue.active_count + self.office_queue.active_count
+        queued_now = self.queue.pending + self.office_queue.pending
+        lines = [
+            "🛠 پنل مدیریت — نمای کلی",
+            f"🗓 بازه: {self._admin_period_label(period, report)}",
+            "",
+            "👥 کاربران",
+            f"• کل ثبت‌شده: {to_persian_digits(users['total'])}"
+            f" | جدید در بازه: {to_persian_digits(users['new'])}"
+            f" | فعال در بازه: {to_persian_digits(users['active'])}",
+            "",
+            "⚙️ پردازش",
+            f"• درخواست در بازه: {to_persian_digits(total_jobs)}"
+            f" | تحویل‌شده: {to_persian_digits(processing['delivered'])}"
+            f" | ناموفق: {to_persian_digits(processing['undelivered'])}"
+            f" | نرخ موفقیت: {self._rate_text(processing['success_rate'])}",
+            "• " + self._timing_line("زمان پاسخ", processing["end_to_end"]),
+            f"• اکنون: {to_persian_digits(active_now)} فعال"
+            f" | {to_persian_digits(queued_now)} در صف",
+            "",
+            "💳 پرداخت و اعتبار",
+            f"• در انتظار بررسی: {to_persian_digits(payments['pending_review'])}"
+            f" | تأیید در بازه: {to_persian_digits(approved['count'])}"
+            f" | رد در بازه: {to_persian_digits(rejected['count'])}",
+            f"• مبلغ تأییدشده در بازه: {format_toman(approved['toman'])}",
+            "",
+            "🚨 نیازمند توجه",
+        ]
+        lines.extend(f"• {item}" for item in self._admin_attention_lines(report, self.runtime_metrics()))
+        buttons = [self._admin_period_row("adm:ov", period)]
+        buttons.append([
+            Button.inline("👥 جزئیات کاربران", f"adm:ovu:{period}".encode()),
+            Button.inline("⚙️ جزئیات پردازش", f"adm:ovp:{period}".encode()),
+        ])
+        buttons.append([
+            Button.inline("💳 پرداخت و اعتبار", f"adm:ovpay:{period}".encode()),
+            Button.inline("🩺 سلامت سیستم", f"adm:ovs:{period}".encode()),
+        ])
+        buttons.extend(self._admin_menu())
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    ADMIN_STATUS_LABELS_FA: dict[str, str] = {
+        "pending": "در انتظار",
+        "awaiting_payment": "در انتظار پرداخت",
+        "pending_review": "در انتظار بررسی",
+        "processing": "در حال پردازش",
+        "done": "موفق",
+        "partial": "ناقص (متن تحویل شد)",
+        "failed": "ناموفق",
+        "rejected": "ردشده",
+        "approved": "تأییدشده",
+    }
+    ADMIN_KIND_LABELS_FA: dict[str, str] = {
+        "audio": "صدا",
+        "video": "ویدیو",
+        "presentation": "ارائه / پاورپوینت",
+        "office": "سند رایگان",
+        "text": "متن",
+    }
+    ADMIN_ENGINE_LABELS_FA: dict[str, str] = {
+        "speechmatics": "Speechmatics",
+        "deepgram": "Deepgram",
+        "openai_compatible": "OpenAI-compatible",
+        "slides": "فقط اسلاید (بدون صدا)",
+        "stt": "STT (بدون برچسب موتور)",
+        "unrecorded": "ثبت‌نشده",
+    }
+    ADMIN_STAGE_LABELS_FA: dict[str, str] = {
+        "downloading": "دریافت فایل",
+        "extracting": "استخراج و آماده‌سازی صدا",
+        "transcribing": "تبدیل گفتار",
+        "generating_notes": "ساخت جزوه",
+        "uploading": "ساخت و ارسال فایل",
+    }
+
+    def _admin_status_label(self, status: str) -> str:
+        return self.ADMIN_STATUS_LABELS_FA.get(status, status)
+
+    def _admin_kind_label(self, kind: str) -> str:
+        return self.ADMIN_KIND_LABELS_FA.get(kind, kind)
+
+    def _admin_engine_label(self, engine: str) -> str:
+        return self.ADMIN_ENGINE_LABELS_FA.get(engine, engine)
+
+    def _admin_screen_header(self, title: str, period: str, report: dict) -> list[str]:
+        return [title, f"🗓 بازه: {self._admin_period_label(period, report)}", ""]
+
+    def _admin_series_lines(self, series: list[dict], *, limit: int | None = None) -> list[str]:
+        """A bounded day chart: one line per day, newest last."""
+        rows = series[-int(limit or self.ADMIN_SERIES_LIMIT):]
+        if not rows:
+            return ["📈 در این بازه فعالیتی ثبت نشده است."]
+        maximum = max(
+            [max(int(row["jobs"]), int(row["new_users"])) for row in rows] + [1]
+        )
+        lines = ["📈 روند روزانه (UTC):"]
+        for row in rows:
+            lines.append(
+                f"{self._day_label(row['day'])} {self._series_bar(int(row['jobs']), maximum)} "
+                f"درخواست {to_persian_digits(int(row['jobs']))} "
+                f"(✅ {to_persian_digits(int(row['delivered']))} / "
+                f"❌ {to_persian_digits(int(row['undelivered']))}) "
+                f"| کاربر جدید {to_persian_digits(int(row['new_users']))}"
+            )
+        return lines
+
+    async def _show_admin_users_report(self, event, period: str = "7d") -> None:
+        period = period if period in self.ADMIN_PERIOD_KEYS else "7d"
+        report = await self.db.admin_report(
+            period_start=self._admin_period_start(period), with_timings=False
+        )
+        users = report["users"]
+        lines = self._admin_screen_header("👥 کاربران — جزئیات", period, report)
+        lines.extend(
+            [
+                f"• کل ثبت‌شده: {to_persian_digits(users['total'])}",
+                f"• جدید در بازه: {to_persian_digits(users['new'])}",
+                f"• فعال در بازه (دست‌کم یک درخواست): {to_persian_digits(users['active'])}",
+                f"• تحویل‌گرفته در بازه (دست‌کم یک خروجی): {to_persian_digits(users['delivered'])}",
+                f"• مسدود: {to_persian_digits(users['banned'])}"
+                f" | ویژه (بدون محدودیت): {to_persian_digits(users['unlimited'])}",
+                "",
+            ]
+        )
+        lines.extend(self._admin_series_lines(report["processing"]["series"]))
+        lines.extend(
+            [
+                "",
+                "ℹ️ «فعال» = کاربری که در بازه دست‌کم یک درخواست ثبت کرده است.",
+                "ℹ️ «تحویل‌گرفته» = کاربری که در بازه دست‌کم یک خروجی موفق داشته است.",
+                "ℹ️ درآمد و مصرف هر کاربر در بخش «پرداخت و اعتبار» است.",
+            ]
+        )
+        buttons = [
+            self._admin_period_row("adm:ovu", period),
+            [Button.inline("↩️ نمای کلی", b"adm:home")],
+        ]
+        buttons.extend(self._admin_menu())
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_processing_report(self, event, period: str = "7d") -> None:
+        period = period if period in self.ADMIN_PERIOD_KEYS else "7d"
+        period_start = self._admin_period_start(period)
+        report = await self.db.admin_report(period_start=period_start)
+        engines = await self.db.admin_stt_engines(period_start=period_start)
+        processing = report["processing"]
         runtime = self.runtime_metrics()
-        stt_providers = runtime.get("providers", {}).get("stt", {})  # type: ignore[union-attr]
-        llm_providers = runtime.get("providers", {}).get("llm", {})  # type: ignore[union-attr]
-        stt_failovers = sum(
-            int(v.get("failovers_in", 0)) for v in stt_providers.values()
+        lines = self._admin_screen_header("⚙️ پردازش — جزئیات", period, report)
+
+        total_jobs = sum(processing["by_status"].values())
+        lines.extend(
+            [
+                "📦 حجم",
+                f"• کل در بازه: {to_persian_digits(total_jobs)}"
+                f" | تحویل‌شده: {to_persian_digits(processing['delivered'])}"
+                f" | ناموفق/ردشده: {to_persian_digits(processing['undelivered'])}"
+                f" | نرخ موفقیت: {self._rate_text(processing['success_rate'])}",
+            ]
         )
-        llm_failovers = sum(
-            int(v.get("failovers_in", 0)) for v in llm_providers.values()
+        if processing["by_status"]:
+            statuses = " | ".join(
+                f"{self._admin_status_label(status)}: {to_persian_digits(count)}"
+                for status, count in sorted(processing["by_status"].items())
+            )
+            lines.append(f"• وضعیت‌ها: {statuses}")
+        if processing["by_kind"]:
+            kinds = " | ".join(
+                f"{self._admin_kind_label(kind)}: {to_persian_digits(count)}"
+                for kind, count in sorted(processing["by_kind"].items())
+            )
+            lines.append(f"• نوع: {kinds}")
+
+        lines.extend(
+            [
+                "",
+                "⏱ زمان (فقط کارهای پایان‌یافته)",
+                "• " + self._timing_line("پایان به پایان", processing["end_to_end"]),
+                "• " + self._timing_line("پردازش خالص", processing["processing_time"]),
+                "• " + self._timing_line("انتظار در صف", processing["queue_wait"]),
+            ]
         )
-        text = (
-            "🛠 پنل مدیریت | آمار و وضعیت\n\n"
-            f"👥 کاربران ثبت‌شده: {to_persian_digits(stats['users'])}\n"
-            f"✅ درخواست‌های تکمیل‌شده: {to_persian_digits(stats['submissions_done'])}\n"
-            f"❌ درخواست‌های ناموفق / ناقص: {to_persian_digits(stats['submissions_failed'])}\n"
-            f"📝 متن تحویل‌شده با جزوهٔ ناقص: {to_persian_digits(stats['submissions_partial'])}\n"
-            f"⏳ در حال پردازش یا منتظر در صف: "
-            f"{to_persian_digits(stats['submissions_active'])}\n"
-            f"⏱ مدت کل فایل‌های پیاده‌سازی‌شده: "
-            f"{format_duration(stats['seconds_transcribed'])}\n"
-            f"💰 مجموع مبالغ پرداختیِ تأییدشده: "
-            f"{format_toman(stats['toman_approved'])}\n"
-            f"🧾 پرداخت‌های نیازمند بررسی: {to_persian_digits(pending)}\n\n"
-            f"📥 درخواست‌های منتظر در صف فعلی: {to_persian_digits(self.queue.pending + self.office_queue.pending)}\n"
-            f"⚙️ کارهای هم‌زمان فعال: {to_persian_digits(self.queue.active_count + self.office_queue.active_count)} | "
-            f"جایگزینی خودکار STT: {to_persian_digits(stt_failovers)} | "
-            f"جایگزینی خودکار LLM: {to_persian_digits(llm_failovers)}"
+        if 0 < processing["end_to_end"]["count"] < self.ADMIN_P95_MIN_SAMPLES:
+            lines.append(
+                f"ℹ️ برای p95 دست‌کم {to_persian_digits(self.ADMIN_P95_MIN_SAMPLES)} "
+                "نمونه لازم است؛ تا آن حد فقط میانه نمایش داده می‌شود."
+            )
+
+        stage_lines = []
+        stages = runtime.get("stages", {}) or {}
+        for stage_key, label in self.ADMIN_STAGE_LABELS_FA.items():
+            summary = (stages.get(stage_key, {}) or {})  # type: ignore[union-attr]
+            count = int(summary.get("count", 0) or 0)
+            if count <= 0:
+                continue
+            stage_lines.append(
+                f"• {label}: میانه {self._duration_text(summary.get('p50_seconds'))}"
+                f" | p95 {self._duration_text(summary.get('p95_seconds'))}"
+                f" (n={to_persian_digits(count)})"
+            )
+        if stage_lines:
+            lines.extend(
+                ["", "🧩 زمان مرحله‌ها (از شروع اجرای این نسخه):", *stage_lines]
+            )
+
+        if processing["errors"]:
+            lines.extend(["", "🚨 خطاهای بازه (بر اساس دستهٔ ثبت‌شده):"])
+            for item in processing["errors"]:
+                lines.append(
+                    f"• {self._admin_error_label(str(item['kind']))}: "
+                    f"{to_persian_digits(int(item['count']))}"
+                )
+        else:
+            lines.extend(["", "🚨 در این بازه خطای ثبت‌شده‌ای وجود ندارد."])
+
+        if engines:
+            usage = " | ".join(
+                f"{self._admin_engine_label(str(item['engine']))}: "
+                f"{to_persian_digits(int(item['count']))}"
+                for item in engines
+                if item["count"]
+            )
+            if usage:
+                lines.extend(["", f"🎙 موتور تبدیل گفتار در بازه: {usage}"])
+
+        failovers = {"stt": 0, "llm": 0}
+        providers = runtime.get("providers", {}) or {}
+        for layer in failovers:
+            for stats in (providers.get(layer, {}) or {}).values():  # type: ignore[union-attr]
+                failovers[layer] += int(stats.get("failovers_in", 0) or 0)
+        lines.append(
+            "🔁 جایگزینی خودکار (از شروع اجرا): "
+            f"STT {to_persian_digits(failovers['stt'])}"
+            f" | LLM {to_persian_digits(failovers['llm'])}"
         )
-        await self._edit_or_reply(event, text, self._admin_menu())
+        lines.append("")
+        lines.extend(self._admin_series_lines(processing["series"]))
+        buttons = [
+            self._admin_period_row("adm:ovp", period),
+            [Button.inline("↩️ نمای کلی", b"adm:home")],
+        ]
+        buttons.extend(self._admin_menu())
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_payments_report(self, event, period: str = "7d") -> None:
+        period = period if period in self.ADMIN_PERIOD_KEYS else "7d"
+        report = await self.db.admin_report(
+            period_start=self._admin_period_start(period), with_timings=False
+        )
+        payments = report["payments"]
+        by_status = payments["by_status"]
+        approved = by_status.get("approved", {"count": 0, "toman": 0})
+        rejected = by_status.get("rejected", {"count": 0, "toman": 0})
+        created = sum(int(entry["count"]) for entry in by_status.values())
+        decided = int(approved["count"]) + int(rejected["count"])
+        approval_rate = (int(approved["count"]) / decided) if decided else None
+        lines = self._admin_screen_header("💳 پرداخت و اعتبار — جزئیات", period, report)
+        lines.extend(
+            [
+                f"• در انتظار بررسی رسید (اکنون): {to_persian_digits(payments['pending_review'])}",
+                f"• سفارش‌های ایجادشده در بازه: {to_persian_digits(created)}",
+                f"• تأییدشده در بازه: {to_persian_digits(approved['count'])}"
+                f" — {format_toman(int(approved['toman']))}",
+                f"• ردشده در بازه: {to_persian_digits(rejected['count'])}",
+                f"• نرخ تأیید در بازه: {self._rate_text(approval_rate)}",
+            ]
+        )
+        expiring = payments["expiring"]
+        lines.append(
+            f"• اعتبار در حال انقضا (تا {to_persian_digits(expiring['within_days'])} روز آینده): "
+            f"{to_persian_digits(expiring['count'])} بسته"
+            f" — {format_duration(expiring['seconds'])}"
+        )
+        open_statuses = {
+            status: entry
+            for status, entry in by_status.items()
+            if status not in ("approved", "rejected")
+        }
+        if open_statuses:
+            lines.append(
+                "• سفارش‌های باز در بازه: "
+                + " | ".join(
+                    f"{self._admin_status_label(status)}: {to_persian_digits(entry['count'])}"
+                    for status, entry in sorted(open_statuses.items())
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "ℹ️ مبلغ فقط از سفارش‌های تأییدشده محاسبه می‌شود؛ رسیدهای در انتظار",
+                "   در هیچ عددی به‌عنوان درآمد شمرده نمی‌شوند.",
+                "ℹ️ «اعتبار در حال انقضا» بسته‌های اعتباری دارای تاریخ انقضاست.",
+                "   بستهٔ بدون انقضا هرگز در این شمارش نیست.",
+            ]
+        )
+        buttons = [
+            self._admin_period_row("adm:ovpay", period),
+            [
+                Button.inline("💳 صف بررسی", b"adm:pay"),
+                Button.inline("📋 تاریخچه", b"adm:ph:0"),
+            ],
+            [Button.inline("↩️ نمای کلی", b"adm:home")],
+        ]
+        buttons.extend(self._admin_menu())
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_system_report(self, event, period: str = "7d") -> None:
+        period = period if period in self.ADMIN_PERIOD_KEYS else "7d"
+        runtime = self.runtime_metrics()
+        health = await self.db.admin_health()
+        uptime = max(0.0, time.time() - self._started_at)
+        lines = [
+            "🩺 سلامت سیستم",
+            "🗓 وضعیت اکنون (آمار پردازش در نمای کلی و بخش پردازش است)",
+            "",
+            f"• زمان اجرای این نسخه: {format_duration(int(uptime))}",
+            f"• کارها: {to_persian_digits(self.queue.active_count + self.office_queue.active_count)} فعال"
+            f" (اوج {to_persian_digits(int(runtime.get('peak_active_jobs', 0) or 0))})"
+            f" | {to_persian_digits(self.queue.pending + self.office_queue.pending)} در صف"
+            f" (اوج {to_persian_digits(int(runtime.get('peak_queued_jobs', 0) or 0))})",
+            f"• حافظهٔ اوج: {self._bytes_text(int(int(runtime.get('peak_rss_mb', 0) or 0) * 1024 * 1024))}",
+            f"• پایگاه‌داده: {self._bytes_text(int(health['db_bytes']))}"
+            f" | WAL: {self._bytes_text(int(health['wal_bytes']))}",
+            f"• خطاهای پایگاه‌داده از شروع اجرا: "
+            f"{to_persian_digits(int(runtime.get('db_errors', 0) or 0))}",
+            f"• آخرین پردازش موفق: {self._timestamp_text(health['last_success'])}",
+            f"• به‌روزرسانی‌های تکراری حذف‌شده: "
+            f"{to_persian_digits(int(runtime.get('deduplicated_updates', 0) or 0))}",
+        ]
+        providers = runtime.get("providers", {}) or {}
+        provider_lines: list[str] = []
+        for layer, layer_label in (("stt", "STT"), ("llm", "LLM")):
+            entries = providers.get(layer, {}) or {}
+            for slug, stats in sorted(entries.items()):  # type: ignore[union-attr]
+                provider_lines.append(
+                    f"• {layer_label} {slug}: در حال اجرا "
+                    f"{to_persian_digits(int(stats.get('in_flight', 0) or 0))}/"
+                    f"{to_persian_digits(int(stats.get('peak_in_flight', 0) or 0))} اوج"
+                    f" | موفقیت {self._rate_text(stats.get('success_rate'))}"
+                    f" | timeout {to_persian_digits(int(stats.get('timeouts', 0) or 0))}"
+                    f" | rate-limit {to_persian_digits(int(stats.get('rate_limits', 0) or 0))}"
+                    f" | خطای سرور {to_persian_digits(int(stats.get('server_errors', 0) or 0))}"
+                )
+        if provider_lines:
+            lines.extend(["", "🌐 ارائه‌دهنده‌ها (از شروع اجرا):", *provider_lines])
+        else:
+            lines.extend(["", "🌐 از شروع اجرا هنوز درخواستی به ارائه‌دهنده‌ها نرفته است."])
+        lines.extend(
+            [
+                "",
+                "🧹 نگهداری",
+                f"• رسید پرداخت: {to_persian_digits(self.settings.receipt_retention_days)} روز",
+                "• رونوشت گفتار: "
+                + (
+                    "غیرفعال"
+                    if self.settings.transcript_retention_days <= 0
+                    else f"{to_persian_digits(self.settings.transcript_retention_days)} روز"
+                ),
+                "• فایل‌های موقت هر کار پس از پایان همان کار پاک می‌شوند.",
+            ]
+        )
+        buttons = [
+            self._admin_period_row("adm:ovs", period),
+            [Button.inline("↩️ نمای کلی", b"adm:home")],
+        ]
+        buttons.extend(self._admin_menu())
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _show_admin_users(self, event) -> None:
         users = await self.db.list_users(limit=25)

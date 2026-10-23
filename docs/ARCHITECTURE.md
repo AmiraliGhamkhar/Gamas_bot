@@ -27,7 +27,7 @@ not uploaded `.docx`/`.pdf` files.
 | Media and decks | `media.py`, `media_worker.py`, `presentations.py` |
 | Providers and notes | `stt.py`, `llm.py`, `http_util.py`, `transcript.py`, `textnorm.py`, `notes.py`, `notes_evidence.py` |
 | Documents | `docx_export.py`, `pdf_export.py`, `office.py`, `office_ai.py`, `mdblocks.py`, `bidi.py` |
-| Data and billing | `db.py`, `billing.py`, `migrations/v3/` |
+| Data, billing and reporting | `db.py`, `billing.py`, `metrics.py`, `migrations/v3/` |
 
 ## Rules
 
@@ -43,3 +43,9 @@ not uploaded `.docx`/`.pdf` files.
 - A lock on the Telegram session prevents duplicate polling. Keep the session and database on a
   local writable filesystem.
 - Provider output is untrusted and checked before delivery.
+- The admin dashboard reads only authoritative rows: each submission records `started_at` (the
+  worker pickup), `error_kind` (one bounded failure category) and `stt_engine` (written beside the
+  transcript, so provider usage survives transcript retention). Windows filter `created_at` with a
+  sargable `>= ?` bound so the reporting indexes are used; see [Admin panel](ADMIN.md).
+- Reporting never mutates state and runs on the read-only connection; a dashboard tap cannot take
+  the write lock away from a job.
