@@ -126,17 +126,33 @@ async def run_command(
     communication = asyncio.create_task(process.communicate())
 
     async def terminate() -> None:
-        # A worker may still be spinning up. Kill its process group on POSIX so
-        # nothing outlives a cancelled/timed-out job.
-        try:
-            if os.name == "posix":
+        # A worker may still be spinning up. Kill both its process group on POSIX
+        # and the direct process handle so nothing outlives a cancelled/timed-out job.
+        if os.name == "posix":
+            try:
                 os.killpg(process.pid, signal.SIGKILL)
-            else:
-                process.kill()
-        except ProcessLookupError:
-            pass  # The process may have exited between the timeout and kill.
-        # Drain pipes too; wait() alone can hang on a full stdout/stderr pipe.
-        await communication
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
+        try:
+            process.kill()
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        # Drain pipes and reap child before closing the subprocess transport so
+        # rapid event-loop teardown never trips BaseSubprocessTransport.__del__.
+        try:
+            await asyncio.wait_for(asyncio.shield(communication), timeout=5.0)
+        except Exception:
+            communication.cancel()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2.0)
+        except Exception:
+            pass
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            try:
+                transport.close()
+            except Exception:
+                pass
 
     try:
         stdout, stderr = await asyncio.wait_for(asyncio.shield(communication), timeout=timeout)

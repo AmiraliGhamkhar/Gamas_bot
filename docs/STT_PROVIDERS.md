@@ -5,19 +5,23 @@ eligible one serves the job.
 
 | Provider | Slug | Settings |
 | --- | --- | --- |
-| Deepgram | `deepgram` | `DEEPGRAM_API_KEY`, `DEEPGRAM_MODEL=nova-3`, `DEEPGRAM_BASE_URL` |
-| Speechmatics | `speechmatics` | `SPEECHMATICS_API_KEY`, `SPEECHMATICS_MODEL=enhanced`, `SPEECHMATICS_BASE_URL` |
-| OpenAI-compatible | `openai_compatible` | `STT_OPENAI_BASE_URL`, `STT_OPENAI_API_KEY`, `STT_OPENAI_MODEL`, `STT_OPENAI_MAX_UPLOAD_BYTES` |
+| Speechmatics (Primary) | `speechmatics` | `SPEECHMATICS_API_KEY`, `SPEECHMATICS_MODEL=enhanced`, `SPEECHMATICS_BASE_URL`, `SPEECHMATICS_MAX_IN_FLIGHT=2` |
+| Deepgram (Overflow / Fallback) | `deepgram` | `DEEPGRAM_API_KEY`, `DEEPGRAM_MODEL=nova-3`, `DEEPGRAM_BASE_URL`, `DEEPGRAM_MAX_IN_FLIGHT=4` |
+| OpenAI-compatible | `openai_compatible` | `STT_OPENAI_BASE_URL`, `STT_OPENAI_API_KEY`, `STT_OPENAI_MODEL`, `STT_OPENAI_MAX_UPLOAD_BYTES`, `STT_OPENAI_MAX_IN_FLIGHT=2` |
 
-Default language: `STT_LANGUAGE=fa`. Default order: `deepgram,speechmatics,openai_compatible`.
+Default language: `STT_LANGUAGE=fa`. Default order: `speechmatics,deepgram,openai_compatible` (`STT_FALLBACK_ENABLED=true`).
 Deepgram needs Nova-3 for Persian; Nova-2 has no `fa` pack, so `--check` reports that pairing (advisory: another configured provider may still transcribe).
 
-## Order is latency policy
+## Non-blocking capacity overflow & automatic failover
 
-The first provider with a key is the one that runs. A slow engine placed first becomes the default
-for every upload, so `--check` prints an advisory warning when `speechmatics` leads with a slow
-model while Deepgram is also configured. Only providers with a key are attempted, so the shipped
-order still degrades safely for a Speechmatics-only deployment.
+- **Local capacity overflow (zero-wait)**: Each provider enforces a local slot cap via `CapacityPool` (`SPEECHMATICS_MAX_IN_FLIGHT=2`, `DEEPGRAM_MAX_IN_FLIGHT=4`). When Speechmatics has free capacity, jobs use Speechmatics. When all Speechmatics slots are occupied, new jobs **immediately route to Deepgram without waiting** instead of queuing behind Speechmatics or triggering upstream `HTTP 429` concurrency errors.
+- **All-saturated bounded wait**: A job waits up to `STT_SLOT_WAIT_TIMEOUT_SECONDS` (`15` s default) **only** when every configured STT provider is simultaneously at max capacity.
+- **Error-triggered failover**:
+  - `HTTP 429` rate limit / concurrency limit -> short `Retry-After` cooldown on primary + immediate Deepgram failover.
+  - `HTTP 402` / quota exhaustion (`STTQuotaError`) -> 300 s primary cooldown + immediate Deepgram failover.
+  - `HTTP 401` / `403` auth failure -> 300 s cooldown + immediate Deepgram failover.
+  - `HTTP 5xx`, network error (`aiohttp.ClientError`), or `STT_PROVIDER_TIMEOUT_SECONDS` (`1800` s) timeout -> short transient cooldown + immediate Deepgram failover without re-uploading to primary.
+  - **Permanent invalid audio input (`STTInvalidInputError`, e.g., empty/corrupt file or `HTTP 400` invalid media)** -> fails fast cleanly **without** wasting fallback uploads on broken audio.
 
 ## Failover behavior
 

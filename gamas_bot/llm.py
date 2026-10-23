@@ -26,17 +26,21 @@ import json
 import logging
 import re
 import time
-from typing import Any
+from collections.abc import Awaitable, Callable
+from typing import Any, TypeVar
 from urllib.parse import quote, urlsplit, urlunsplit
+import weakref
 
 import aiohttp
 
+from .capacity import CapacityOverloadError, pool_for, reset_pools
 from .config import NoteRoute, Settings, note_routes
 from .http_util import (
     read_error_body,
     retry_after_seconds as _retry_after_seconds,
     sanitize_error_text as _sanitize_error_text,
 )
+from .metrics import METRICS
 
 try:
     import orjson as _orjson
@@ -49,8 +53,11 @@ except ModuleNotFoundError:  # stdlib fallback: identical parsing contract
         return json.loads(body.decode("utf-8", "replace"))
 
 
+MAX_LLM_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
 async def _read_json_body(response: Any) -> Any:
-    """Parse a response body from ``read()`` bytes via :data:`_loads`.
+    """Parse a bounded response body from ``read()`` bytes via :data:`_loads`.
 
     One narrow compatibility fallback: if the bytes parse to an empty
     object, ``response.json()`` is consulted and used only when it yields
@@ -58,7 +65,10 @@ async def _read_json_body(response: Any) -> Any:
     production results are identical; this only keeps test doubles whose
     ``read()`` is a stub (but whose ``json()`` is faithful) working.
     """
-    result = _loads(await response.read())
+    raw = await response.read()
+    if len(raw) > MAX_LLM_RESPONSE_BYTES:
+        raise LLMResponseError("حجم پاسخ سرویس تولید جزوه بیش از حد مجاز بود.")
+    result = _loads(raw)
     if isinstance(result, dict) and not result:
         json_method = getattr(response, "json", None)
         if json_method is not None:
@@ -86,6 +96,55 @@ LLM_REQUEST_TIMEOUT_SECONDS = 300.0
 #: Bounded retries for transient LLM failures (5xx, 429, network).
 MAX_TRANSIENT_RETRIES = 2
 
+_T = TypeVar("_T")
+
+#: Loop- and session-scoped route cooldown map so concurrent requests sharing
+#: a client session immediately bypass a rate-limited/depleted primary without
+#: colliding across separate sessions or test cases.
+_LLM_COOLDOWNS: weakref.WeakKeyDictionary[
+    asyncio.AbstractEventLoop, dict[tuple[int, str], float]
+] = weakref.WeakKeyDictionary()
+
+LLM_RATE_LIMIT_COOLDOWN_SECONDS = 15.0
+LLM_AUTH_COOLDOWN_SECONDS = 60.0
+
+
+def _set_route_cooldown(session: object, slug: str, seconds: float) -> None:
+    if seconds <= 0:
+        return
+    loop = asyncio.get_running_loop()
+    table = _LLM_COOLDOWNS.setdefault(loop, {})
+    table[(id(session), slug)] = time.monotonic() + seconds
+
+
+def _route_cooldown_remaining(session: object, slug: str) -> float:
+    loop = asyncio.get_running_loop()
+    table = _LLM_COOLDOWNS.get(loop)
+    if not table:
+        return 0.0
+    key = (id(session), slug)
+    deadline = table.get(key)
+    if deadline is None:
+        return 0.0
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        table.pop(key, None)
+        return 0.0
+    return remaining
+
+
+def reset_cooldowns() -> None:
+    """Clear LLM route cooldowns and local capacity pools."""
+    _LLM_COOLDOWNS.clear()
+    reset_pools()
+
+
+def route_max_in_flight(index: int, settings: Settings) -> int:
+    """Local concurrency limit for route position *index* (0 = primary)."""
+    if index <= 0:
+        return max(1, int(getattr(settings, "llm_primary_max_in_flight", 4)))
+    return max(1, int(getattr(settings, "llm_fallback_max_in_flight", 4)))
+
 
 class LLMError(RuntimeError):
     """Base class; the message is safe to show the user."""
@@ -94,9 +153,16 @@ class LLMError(RuntimeError):
 class LLMTransientError(LLMError):
     """Network/rate-limit/server failure after the bounded retry budget."""
 
-    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+        rate_limited: bool = False,
+    ):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+        self.rate_limited = rate_limited
 
 
 class LLMAuthError(LLMError):
@@ -349,6 +415,7 @@ def _error_from_payload(
         return LLMTransientError(
             f"{label} موقتاً در دسترس نیست (HTTP {status}){suffix}",
             retry_after_seconds=_retry_after_seconds(headers, payload),
+            rate_limited=True,
         )
 
     # OpenRouter uses HTTP 403 with error_type="content_policy_violation" or
@@ -397,9 +464,13 @@ def _error_from_payload(
         or status >= 500
         or bool(marker_set & TRANSIENT_ERROR_CODES)
     ):
+        is_rl = status == 429 or bool(
+            marker_set & {"RATE_LIMITED", "RESOURCE_EXHAUSTED", "TOO_MANY_REQUESTS"}
+        )
         return LLMTransientError(
             f"{label} موقتاً در دسترس نیست (HTTP {status}){suffix}",
             retry_after_seconds=_retry_after_seconds(headers, payload),
+            rate_limited=is_rl,
         )
     return LLMRequestError(f"{label} درخواست را رد کرد (HTTP {status}){suffix}")
 
@@ -1514,12 +1585,41 @@ async def _complete_on_route(
                     )
                     continue
             raise
+        except LLMAuthError as exc:
+            event = "quota_exhausted" if "HTTP 402" in str(exc) else "auth_error"
+            METRICS.record_provider_event("llm", route.slug, event)
+            _set_route_cooldown(session, route.slug, LLM_AUTH_COOLDOWN_SECONDS)
+            raise
         except (LLMTransientError, aiohttp.ClientError, asyncio.TimeoutError) as exc:
             timed_out = isinstance(exc, (asyncio.TimeoutError, _TTFBTimeoutError))
+            is_rate_limit = isinstance(exc, LLMTransientError) and exc.rate_limited
+            retry_after = (
+                exc.retry_after_seconds if isinstance(exc, LLMTransientError) else None
+            )
+            if timed_out:
+                METRICS.record_provider_event("llm", route.slug, "timeout")
+            elif is_rate_limit:
+                METRICS.record_provider_event("llm", route.slug, "rate_limit")
+            elif isinstance(exc, aiohttp.ClientError):
+                METRICS.record_provider_event("llm", route.slug, "connection_error")
+            else:
+                METRICS.record_provider_event("llm", route.slug, "server_error")
+
+            if is_rate_limit and not retry_on_timeout and retry_after != 0.0:
+                cooldown = min(
+                    LLM_RATE_LIMIT_COOLDOWN_SECONDS,
+                    max(1.0, retry_after if retry_after is not None else 5.0),
+                )
+                _set_route_cooldown(session, route.slug, cooldown)
+                logger.warning(
+                    "LLM provider rate-limited provider=%s cooldown_seconds=%.1f; "
+                    "failing over immediately without sleeping",
+                    route.slug,
+                    cooldown,
+                )
+                raise
+
             if timed_out and not retry_on_timeout:
-                # The provider did not answer inside the deadline. Asking the
-                # same (expensive) request again only repeats the wait, so the
-                # provider is left behind and the chain moves on.
                 logger.warning(
                     "LLM request timed out provider=%s; trying the next provider "
                     "instead of repeating the request (timeout_seconds=%.0f)",
@@ -1531,6 +1631,12 @@ async def _complete_on_route(
                     "NOTE_MAX_OUTPUT_TOKENS را کم کنید)."
                 ) from exc
             if attempt >= MAX_TRANSIENT_RETRIES:
+                if is_rate_limit:
+                    _set_route_cooldown(
+                        session,
+                        route.slug,
+                        min(LLM_RATE_LIMIT_COOLDOWN_SECONDS, max(1.0, retry_after or 5.0)),
+                    )
                 if isinstance(exc, LLMTransientError):
                     raise
                 if timed_out:
@@ -1543,9 +1649,7 @@ async def _complete_on_route(
                     "سرویس تولید جزوه پس از چند تلاش در دسترس نبود."
                 ) from exc
             attempt += 1
-            retry_after = (
-                exc.retry_after_seconds if isinstance(exc, LLMTransientError) else None
-            )
+            METRICS.record_provider_event("llm", route.slug, "retry")
             delay = retry_after if retry_after is not None else min(2.0**attempt, 15.0)
             logger.warning(
                 "LLM transient failure provider=%s (attempt %d/%d; %s); retrying in %.1fs",
@@ -1621,68 +1725,161 @@ async def get_json(
             await asyncio.sleep(delay)
 
 
-async def complete(
-    session: aiohttp.ClientSession,
-    settings: Settings,
-    *,
-    system: str,
-    user: str,
-) -> str:
-    """One completion from the first eligible provider that answers.
-
-    Providers are tried in the configured order. Each one gets its own bounded
-    retry budget for transient failures only; an authentication problem, a
-    rejected request or an unusable answer moves on to the next provider
-    immediately. The failure class of the *first* provider is preserved, so a
-    context overflow still reaches the caller as one.
-    """
-    routes = note_routes(settings)
-    if not routes:
-        raise LLMAuthError(
-            "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
-            "NARA_API_KEY / OPENROUTER_API_KEY)."
+async def _run_with_lease(
+    route: NoteRoute,
+    lease: Any,
+    fn: Callable[[], Awaitable[_T]],
+) -> _T:
+    METRICS.record_provider_acquire("llm", route.slug)
+    ok = False
+    cancelled = False
+    try:
+        result = await fn()
+        ok = True
+        return result
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    finally:
+        held = lease.release()
+        METRICS.record_provider_release(
+            "llm", route.slug, elapsed_seconds=held, ok=ok, cancelled=cancelled
         )
+
+
+async def _dispatch_across_routes(
+    routes: tuple[NoteRoute, ...],
+    session: object,
+    settings: Settings,
+    call_route: Callable[[NoteRoute, bool], Awaitable[_T]],
+    *,
+    hedge_route: Callable[[NoteRoute, bool], Awaitable[_T]] | None = None,
+) -> _T:
+    """Execute *call_route* across *routes* with non-blocking capacity reservation."""
+    pool = pool_for("llm", settings)
     failures: list[LLMError] = []
     descriptions: list[str] = []
-    start_index = 0
+    indexed_routes: list[tuple[int, NoteRoute]] = list(enumerate(routes))
     hedge_after = float(getattr(settings, "note_hedge_after", 0.0) or 0.0)
-    if hedge_after > 0 and len(routes) >= 2:
-        def _make(index: int):
-            return lambda: _complete_on_route(
-                routes[index], session, settings, system=system, user=user,
-                retry_on_timeout=index == len(routes) - 1,
-            )
-        try:
-            return await _hedge_two(_make(0), _make(1), hedge_after)
-        except _PrimaryEarlyFailure as early:
-            failures.append(early.exc)
-            descriptions.append(f"{routes[0].label}: {early.exc}")
-            logger.warning(
-                "note provider failed; trying the next one provider=%s error=%s detail=%s",
-                routes[0].slug, type(early.exc).__name__, early.exc,
-            )
-            start_index = 1
-        except _HedgedFailures as both:
-            for route, exc in ((routes[0], both.first), (routes[1], both.second)):
-                failures.append(exc)
-                descriptions.append(f"{route.label}: {exc}")
+
+    if (
+        hedge_after > 0
+        and len(indexed_routes) >= 2
+        and hedge_route is not None
+        and _route_cooldown_remaining(session, routes[0].slug) <= 0
+    ):
+        primary_lease = pool.try_acquire(
+            routes[0].slug, route_max_in_flight(0, settings)
+        )
+        if primary_lease is not None:
+            def _make_primary() -> Awaitable[_T]:
+                return _run_with_lease(
+                    routes[0],
+                    primary_lease,
+                    lambda: hedge_route(routes[0], len(routes) == 1),
+                )
+
+            async def _run_backup() -> _T:
+                backup_limit = route_max_in_flight(1, settings)
+                acquired_b = await pool.acquire_any(
+                    [(routes[1].slug, backup_limit)],
+                    timeout=getattr(settings, "llm_slot_wait_timeout", 30.0),
+                )
+                if acquired_b is None:
+                    raise LLMTransientError(
+                        "ظرفیت هم‌زمان سرویس پشتیبان تولید جزوه تکمیل است."
+                    )
+                _, backup_lease, _ = acquired_b
+                METRICS.record_failover("llm", routes[0].slug, routes[1].slug)
+                return await _run_with_lease(
+                    routes[1],
+                    backup_lease,
+                    lambda: hedge_route(routes[1], len(routes) == 2),
+                )
+
+            try:
+                return await _hedge_two(_make_primary, _run_backup, hedge_after)
+            except _PrimaryEarlyFailure as early:
+                failures.append(early.exc)
+                descriptions.append(f"{routes[0].label}: {early.exc}")
                 logger.warning(
                     "note provider failed; trying the next one provider=%s error=%s detail=%s",
-                    route.slug, type(exc).__name__, exc,
+                    routes[0].slug, type(early.exc).__name__, early.exc,
                 )
-            start_index = 2
-    for index, route in enumerate(routes):
-        if index < start_index:
-            continue
+                indexed_routes = indexed_routes[1:]
+            except _HedgedFailures as both:
+                for route, exc in ((routes[0], both.first), (routes[1], both.second)):
+                    failures.append(exc)
+                    descriptions.append(f"{route.label}: {exc}")
+                    logger.warning(
+                        "note provider failed; trying the next one provider=%s error=%s detail=%s",
+                        route.slug, type(exc).__name__, exc,
+                    )
+                indexed_routes = indexed_routes[2:]
+
+    previous_failed_slug: str | None = failures and routes[0].slug or None  # type: ignore[assignment]
+    wait_timeout = float(getattr(settings, "llm_slot_wait_timeout", 30.0))
+
+    while indexed_routes:
+        # Uncooled routes lead; cooled routes stay as last-resort fallbacks so
+        # single-provider deployments still get their bounded attempt.
+        ordered = sorted(
+            indexed_routes,
+            key=lambda item: (
+                1 if _route_cooldown_remaining(session, item[1].slug) > 0 else 0,
+                item[0],
+            ),
+        )
+        candidates = [
+            (route.slug, route_max_in_flight(orig_idx, settings))
+            for orig_idx, route in ordered
+        ]
         try:
-            text = await _complete_on_route(
-                route, session, settings, system=system, user=user,
-                # A provider that ran out of time is left behind when a
-                # successor is still available: re-sending the same request
-                # would only wait for the same deadline again.
-                retry_on_timeout=index == len(routes) - 1,
+            acquired = await pool.acquire_any(
+                candidates,
+                timeout=wait_timeout,
+                max_waiters=max(16, sum(lim for _, lim in candidates) * 8),
+            )
+        except CapacityOverloadError as exc:
+            raise LLMTransientError(str(exc)) from exc
+
+        if acquired is None:
+            raise LLMTransientError(
+                "ظرفیت هم‌زمان سرویس تولید جزوه تکمیل است؛ لطفاً چند لحظه بعد دوباره تلاش کنید."
+            )
+
+        chosen_slug, lease, _waited = acquired
+        picked_pos = next(
+            pos for pos, (_idx, r) in enumerate(ordered) if r.slug == chosen_slug
+        )
+        orig_idx, route = ordered[picked_pos]
+        indexed_routes = [
+            item for item in indexed_routes if item[1].slug != chosen_slug
+        ]
+        if picked_pos > 0:
+            for _b_idx, bypassed_route in ordered[:picked_pos]:
+                METRICS.record_provider_event("llm", bypassed_route.slug, "overflow_skip")
+                METRICS.record_failover("llm", bypassed_route.slug, chosen_slug)
+                logger.info(
+                    "LLM route %s saturated (%d/%d in flight); overflowing "
+                    "immediately without wait to %s",
+                    bypassed_route.slug,
+                    pool.in_flight(bypassed_route.slug),
+                    route_max_in_flight(_b_idx, settings),
+                    chosen_slug,
+                )
+        elif previous_failed_slug is not None:
+            METRICS.record_failover("llm", previous_failed_slug, chosen_slug)
+
+        is_last_route = len(indexed_routes) == 0
+        try:
+            result = await _run_with_lease(
+                route,
+                lease,
+                lambda r=route, last=is_last_route: call_route(r, last),  # type: ignore[misc]
             )
         except LLMError as exc:
+            previous_failed_slug = route.slug
             failures.append(exc)
             descriptions.append(f"{route.label}: {exc}")
             logger.warning(
@@ -1695,10 +1892,41 @@ async def complete(
                 "note generation succeeded after %d provider failure(s) provider=%s",
                 len(failures), route.slug,
             )
-        return text
+        return result
+
     if len(descriptions) > 1:
         logger.error("every configured note provider failed: %s", " | ".join(descriptions))
     raise type(failures[0])("؛ ".join(descriptions))
+
+
+async def complete(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    *,
+    system: str,
+    user: str,
+) -> str:
+    """One completion from the first eligible provider with capacity that answers."""
+    routes = note_routes(settings)
+    if not routes:
+        raise LLMAuthError(
+            "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
+            "NARA_API_KEY / OPENROUTER_API_KEY)."
+        )
+
+    async def _call(route: NoteRoute, is_last: bool) -> str:
+        return await _complete_on_route(
+            route,
+            session,
+            settings,
+            system=system,
+            user=user,
+            retry_on_timeout=is_last,
+        )
+
+    return await _dispatch_across_routes(
+        routes, session, settings, _call, hedge_route=_call
+    )
 
 
 def extract_json_object(text: str) -> str:
@@ -1837,57 +2065,18 @@ async def complete_json(
             "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
             "NARA_API_KEY / OPENROUTER_API_KEY)."
         )
-    failures: list[LLMError] = []
-    descriptions: list[str] = []
-    start_index = 0
-    hedge_after = float(getattr(settings, "note_hedge_after", 0.0) or 0.0)
-    if hedge_after > 0 and len(routes) >= 2:
-        def _make_json(index: int):
-            return lambda: _complete_json_on_route(
-                routes[index], session, settings, system=system, user=user,
-                retry_on_timeout=index == len(routes) - 1, schema=schema,
-            )
-        try:
-            return await _hedge_two(_make_json(0), _make_json(1), hedge_after)
-        except _PrimaryEarlyFailure as early:
-            failures.append(early.exc)
-            descriptions.append(f"{routes[0].label}: {early.exc}")
-            start_index = 1
-        except _HedgedFailures as both:
-            for route, exc in ((routes[0], both.first), (routes[1], both.second)):
-                failures.append(exc)
-                descriptions.append(f"{route.label}: {exc}")
-            start_index = 2
-    for index, route in enumerate(routes):
-        if index < start_index:
-            continue
-        for attempt, prompt in enumerate((user, JSON_ONLY_REMINDER + user)):
-            try:
-                raw = await _complete_on_route(
-                    route, session, settings, system=system, user=prompt,
-                    retry_on_timeout=index == len(routes) - 1, schema=schema,
-                )
-                return _parse_json_object(raw)
-            except LLMRequestError as exc:
-                # Permanent for this provider: another provider's model or
-                # parameters may still accept the request, this one will not.
-                failures.append(exc)
-                descriptions.append(f"{route.label}: {exc}")
-                logger.warning(
-                    "note provider rejected the request provider=%s error=%s",
-                    route.slug, exc,
-                )
-                break
-            except LLMError as exc:
-                failures.append(exc)
-                descriptions.append(f"{route.label}: {exc}")
-                logger.warning(
-                    "note request failed provider=%s attempt=%d error=%s detail=%s",
-                    route.slug, attempt + 1, type(exc).__name__, exc,
-                )
-                if not isinstance(exc, LLMResponseError) or attempt:
-                    # Transient and authentication failures already exhausted
-                    # their own budget; a second unusable answer ends this
-                    # provider's turn.
-                    break
-    raise type(failures[0])("؛ ".join(descriptions))
+
+    async def _call_json(route: NoteRoute, is_last: bool) -> dict:
+        return await _complete_json_on_route(
+            route,
+            session,
+            settings,
+            system=system,
+            user=user,
+            retry_on_timeout=is_last,
+            schema=schema,
+        )
+
+    return await _dispatch_across_routes(
+        routes, session, settings, _call_json, hedge_route=_call_json
+    )

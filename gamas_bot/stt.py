@@ -33,6 +33,7 @@ try:
 except ImportError:  # pragma: no cover - optional fast-path
     _orjson = None  # type: ignore[assignment]
 
+from .capacity import CapacityOverloadError, pool_for, reset_pools
 from .config import (
     DEEPGRAM_MAX_UPLOAD,
     OPENAI_STT_MAX_UPLOAD,
@@ -45,6 +46,7 @@ from .http_util import (
     retry_after_seconds as _retry_after_seconds,
     sanitize_error_text as _sanitize_error,
 )
+from .metrics import METRICS
 from .transcript import RawTranscript, Word
 
 logger = logging.getLogger(__name__)
@@ -62,6 +64,10 @@ class STTAuthenticationError(STTError):
     """The provider rejected our credentials — cooldown, then failover."""
 
 
+class STTQuotaError(STTAuthenticationError):
+    """The provider reported quota or credit exhaustion — cooldown, then failover."""
+
+
 class STTTransientError(STTError):
     """Network/server failure that can be retried within the bounded budget."""
 
@@ -74,6 +80,10 @@ class STTRequestError(STTError):
     """A definitive 4xx rejection (bad request, unsupported media)."""
 
 
+class STTInvalidInputError(STTRequestError):
+    """Permanent input problem (empty/corrupt audio) no STT provider can salvage."""
+
+
 # ---------------------------------------------------------------------------
 # Cooldowns (in-memory, bounded)
 # ---------------------------------------------------------------------------
@@ -82,6 +92,8 @@ _COOLDOWNS: dict[str, float] = {}
 
 #: How long a provider is skipped after an authentication failure.
 AUTH_COOLDOWN_SECONDS = 900.0
+#: How long a provider is skipped after quota/credit exhaustion.
+QUOTA_COOLDOWN_SECONDS = 300.0
 #: How long a provider is skipped after repeated server errors.
 TRANSIENT_COOLDOWN_SECONDS = 60.0
 
@@ -111,8 +123,39 @@ def _cooldown_remaining(slug: str) -> float:
 
 
 def reset_cooldowns() -> None:
-    """Test hook: clear every provider cooldown."""
+    """Test hook: clear every provider cooldown and local capacity state."""
     _COOLDOWNS.clear()
+    reset_pools()
+
+
+_QUOTA_MARKERS = (
+    "insufficient_quota",
+    "insufficient credits",
+    "out of credits",
+    "quota exceeded",
+    "quota exhausted",
+    "credit balance",
+    "payment required",
+    "billing hard limit",
+)
+
+_PERMANENT_BAD_AUDIO_MARKERS = (
+    "invalid audio",
+    "corrupt",
+    "malformed audio",
+    "unable to decode",
+    "could not decode",
+    "damaged",
+    "empty audio",
+    "no audio stream",
+)
+
+
+def _contains_any(text: str | None, markers: tuple[str, ...]) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in markers)
 
 
 # ---------------------------------------------------------------------------
@@ -151,11 +194,19 @@ async def _error_from_response(
                 detail = _sanitize_error(error)
             elif isinstance(payload.get("message"), str):
                 detail = _sanitize_error(payload["message"])
+            elif isinstance(payload.get("err_msg"), str):
+                detail = _sanitize_error(payload["err_msg"])
     except (ValueError, TypeError):
         pass
     if detail and api_key:
         detail = detail.replace(api_key, "***")
     suffix = f": {detail}" if detail else ""
+    if response.status == 402 or (
+        response.status in (401, 403, 429) and _contains_any(detail, _QUOTA_MARKERS)
+    ):
+        return STTQuotaError(
+            f"سهمیه یا اعتبار {label} به پایان رسیده است (HTTP {response.status}){suffix}"
+        )
     if response.status in (401, 403):
         return STTAuthenticationError(f"{label} اعتبارنامه را نپذیرفت (HTTP {response.status}){suffix}")
     if response.status in (408, 425, 429) or response.status >= 500:
@@ -166,6 +217,12 @@ async def _error_from_response(
         return STTTransientError(
             message,
             retry_after_seconds=_retry_after_seconds(response.headers),
+        )
+    if response.status in (400, 415, 422) and _contains_any(
+        detail, _PERMANENT_BAD_AUDIO_MARKERS
+    ):
+        return STTInvalidInputError(
+            f"{label} فایل صوتی را نامعتبر یا آسیب‌دیده تشخیص داد (HTTP {response.status}){suffix}"
         )
     return STTRequestError(f"{label} درخواست را رد کرد (HTTP {response.status}){suffix}")
 
@@ -632,6 +689,7 @@ async def _get_json(
                 else min(retry_after, MAX_RETRY_AFTER_SECONDS)
             )
             delay = min(delay, remaining)
+            METRICS.record_provider_event("stt", label.lower(), "retry")
             logger.warning(
                 "%s read failed (attempt %d/%d); retrying in %.1fs (%s)",
                 label, attempt, MAX_TRANSIENT_RETRIES + 1, delay, type(exc).__name__,
@@ -656,7 +714,9 @@ async def _speechmatics_poll(
     first_status: str = "",
     inline_transcript: dict | None = None,
 ) -> RawTranscript:
-    deadline = submitted_at + settings.stt_job_timeout
+    deadline = submitted_at + min(
+        settings.stt_job_timeout, settings.stt_provider_timeout
+    )
     poll_count = 0
     if inline_transcript is not None:
         return _speechmatics_result(inline_transcript, job_id)
@@ -999,6 +1059,17 @@ def first_configured_stt_url(settings: Settings) -> str | None:
 MAX_TRANSIENT_RETRIES = 2
 
 
+def provider_max_in_flight(slug: str, settings: Settings) -> int:
+    """Configured local concurrency limit for *slug*."""
+    if slug == "speechmatics":
+        return settings.speechmatics_max_in_flight
+    if slug == "deepgram":
+        return settings.deepgram_max_in_flight
+    if slug == "openai_compatible":
+        return settings.stt_openai_max_in_flight
+    return 1
+
+
 async def _attempt_provider(
     spec: ProviderSpec, session: aiohttp.ClientSession, audio_path: Path, settings: Settings
 ) -> RawTranscript:
@@ -1008,17 +1079,53 @@ async def _attempt_provider(
     chain passes a copy narrowed to the time it has left, so every attempt in
     the chain shares one budget instead of each getting a fresh one.
     """
+    attempt_deadline = min(
+        float(settings.stt_job_timeout),
+        float(getattr(settings, "stt_provider_timeout", settings.stt_job_timeout)),
+    )
     try:
-        return await spec.run(session, audio_path, settings)
+        return await asyncio.wait_for(
+            spec.run(session, audio_path, settings),
+            timeout=max(0.01, attempt_deadline),
+        )
+    except STTQuotaError:
+        METRICS.record_provider_event("stt", spec.slug, "quota_exhausted")
+        _set_cooldown(spec.slug, QUOTA_COOLDOWN_SECONDS)
+        raise
     except STTAuthenticationError:
+        METRICS.record_provider_event("stt", spec.slug, "auth_error")
         _set_cooldown(spec.slug, AUTH_COOLDOWN_SECONDS)
         raise
-    except (STTTransientError, aiohttp.ClientError, asyncio.TimeoutError):
-        # The provider is degraded, not the audio: rest it briefly and let the
-        # chain try the next engine with a *fresh* submit (the upload already
-        # happened once).
-        _set_cooldown(spec.slug, TRANSIENT_COOLDOWN_SECONDS)
+    except STTInvalidInputError:
+        METRICS.record_provider_event("stt", spec.slug, "invalid_input")
         raise
+    except STTTransientError as exc:
+        if exc.retry_after_seconds is not None:
+            METRICS.record_provider_event("stt", spec.slug, "rate_limit")
+            cooldown = min(
+                MAX_RETRY_AFTER_SECONDS,
+                max(1.0, exc.retry_after_seconds),
+            )
+        elif "زمان" in str(exc):
+            METRICS.record_provider_event("stt", spec.slug, "timeout")
+            cooldown = TRANSIENT_COOLDOWN_SECONDS
+        else:
+            METRICS.record_provider_event("stt", spec.slug, "server_error")
+            cooldown = TRANSIENT_COOLDOWN_SECONDS
+        _set_cooldown(spec.slug, cooldown)
+        raise
+    except asyncio.TimeoutError as exc:
+        METRICS.record_provider_event("stt", spec.slug, "timeout")
+        _set_cooldown(spec.slug, TRANSIENT_COOLDOWN_SECONDS)
+        raise STTTransientError(
+            f"مهلت پاسخ سرویس {spec.label} ({int(attempt_deadline)}s) به پایان رسید."
+        ) from exc
+    except aiohttp.ClientError as exc:
+        METRICS.record_provider_event("stt", spec.slug, "connection_error")
+        _set_cooldown(spec.slug, TRANSIENT_COOLDOWN_SECONDS)
+        raise STTTransientError(
+            f"ارتباط شبکه‌ای با سرویس {spec.label} قطع شد: {exc}"
+        ) from exc
 
 
 async def transcribe(
@@ -1027,14 +1134,18 @@ async def transcribe(
     *,
     session: aiohttp.ClientSession | None = None,
 ) -> RawTranscript:
-    """Transcribe one audio file through the configured failover chain."""
+    """Transcribe one audio file with non-blocking capacity reservation & failover."""
     if not settings.stt_providers:
         raise STTConfigurationError("هیچ سرویس تبدیل گفتاری پیکربندی نشده است.")
-    size = audio_path.stat().st_size
+    try:
+        size = audio_path.stat().st_size
+    except OSError as exc:
+        raise STTInvalidInputError("فایل صوتی برای تبدیل گفتار قابل‌خواندن نیست.") from exc
+    if size <= 0:
+        raise STTInvalidInputError("فایل صوتی خالی است و قابل تبدیل به متن نیست.")
+
     owned_session = session is None
     if session is None:
-        # Every request also carries ``_transfer_timeout``; this is the
-        # session-level default for anything that is added later.
         session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(
                 total=None,
@@ -1042,25 +1153,37 @@ async def transcribe(
                 sock_connect=min(60.0, settings.stt_transfer_timeout),
             )
         )
+    pool = pool_for("stt", settings)
     try:
         failures: list[str] = []
-        # One budget for the whole chain: every eligible provider shares it, and
-        # each attempt sees only what is left of it. Previously each attempt
-        # restarted the full ``STT_JOB_TIMEOUT``, so a chain of retries could run
-        # for days on a multi-hour lecture.
         deadline = time.monotonic() + settings.stt_job_timeout
-        # Skips (cooldown, upload ceiling) are not failures: they must not be
-        # reported as if the provider had tried and rejected the audio.
         skipped: list[str] = []
         logger.info(
-            "STT failover chain providers=%s bytes=%s language=%s",
-            ",".join(settings.stt_providers), size, settings.stt_language or "auto",
+            "STT failover chain providers=%s fallback_enabled=%s bytes=%s language=%s",
+            ",".join(settings.stt_providers),
+            settings.stt_fallback_enabled,
+            size,
+            settings.stt_language or "auto",
         )
+        configured_specs: list[ProviderSpec] = []
         for slug in settings.stt_providers:
             spec = PROVIDERS.get(slug)
             if spec is None or not spec.configured(settings):
                 logger.info("STT provider %s has no credentials; skipped", slug)
                 continue
+            configured_specs.append(spec)
+            if not settings.stt_fallback_enabled:
+                break
+
+        if not configured_specs:
+            raise STTConfigurationError(
+                "هیچ سرویس تبدیل گفتاری پیکربندی نشده است "
+                "(SPEECHMATICS_API_KEY، DEEPGRAM_API_KEY یا STT_OPENAI_BASE_URL+STT_OPENAI_API_KEY)."
+            )
+
+        pending_specs: list[ProviderSpec] = []
+        for spec in configured_specs:
+            slug = spec.slug
             remaining = _cooldown_remaining(slug)
             if remaining > 0:
                 logger.warning(
@@ -1077,68 +1200,151 @@ async def transcribe(
                 )
                 skipped.append(f"{spec.label} سقف حجم {limit_mb}MB دارد")
                 continue
+            pending_specs.append(spec)
+
+        previous_failed_slug: str | None = None
+        while pending_specs:
             remaining_budget = deadline - time.monotonic()
             if remaining_budget <= 0:
                 logger.warning(
                     "STT chain deadline exhausted before provider %s (budget=%.0fs)",
-                    slug, settings.stt_job_timeout,
+                    pending_specs[0].slug, settings.stt_job_timeout,
                 )
                 failures.append(
                     f"مهلت زنجیرهٔ تبدیل گفتار ({int(settings.stt_job_timeout)}s) به پایان رسید"
                 )
                 break
-            logger.info(
-                "STT attempt provider=%s bytes=%s model=%s language=%s",
-                slug, size, _provider_model(slug, settings), settings.stt_language or "auto",
+
+            candidates = [
+                (spec.slug, provider_max_in_flight(spec.slug, settings))
+                for spec in pending_specs
+            ]
+            wait_budget = min(remaining_budget, settings.stt_slot_wait_timeout)
+            try:
+                acquired = await pool.acquire_any(
+                    candidates,
+                    timeout=wait_budget,
+                    max_waiters=max(8, sum(limit for _, limit in candidates) * 8),
+                )
+            except CapacityOverloadError:
+                acquired = None
+
+            if acquired is None:
+                labels = "، ".join(spec.label for spec in pending_specs)
+                logger.warning(
+                    "STT local concurrency saturated across all eligible providers: %s",
+                    labels,
+                )
+                skipped.append(f"تکمیل ظرفیت هم‌زمان ({labels})")
+                break
+
+            chosen_slug, lease, _waited = acquired
+            chosen_index = next(
+                idx for idx, s in enumerate(pending_specs) if s.slug == chosen_slug
             )
+            bypassed = list(pending_specs[:chosen_index])
+            spec = pending_specs.pop(chosen_index)
+            if bypassed:
+                for saturated in bypassed:
+                    METRICS.record_provider_event("stt", saturated.slug, "overflow_skip")
+                    METRICS.record_failover("stt", saturated.slug, chosen_slug)
+                    logger.info(
+                        "STT primary %s saturated (%d/%d in flight); overflowing "
+                        "immediately without wait to %s",
+                        saturated.slug,
+                        pool.in_flight(saturated.slug),
+                        provider_max_in_flight(saturated.slug, settings),
+                        chosen_slug,
+                    )
+            elif previous_failed_slug is not None:
+                METRICS.record_failover("stt", previous_failed_slug, chosen_slug)
+
+            remaining_budget = deadline - time.monotonic()
             attempt_settings = (
                 settings
                 if remaining_budget >= settings.stt_job_timeout
-                else replace(settings, stt_job_timeout=remaining_budget)
+                else replace(settings, stt_job_timeout=max(1.0, remaining_budget))
             )
+            logger.info(
+                "STT attempt provider=%s bytes=%s model=%s language=%s in_flight=%d/%d",
+                chosen_slug,
+                size,
+                _provider_model(chosen_slug, settings),
+                settings.stt_language or "auto",
+                pool.in_flight(chosen_slug),
+                provider_max_in_flight(chosen_slug, settings),
+            )
+            METRICS.record_provider_acquire("stt", chosen_slug)
             started = time.monotonic()
+            ok = False
+            cancelled = False
             try:
                 result = await _attempt_provider(
                     spec, session, audio_path, attempt_settings
                 )
+                ok = True
                 logger.info(
                     "STT done provider=%s bytes=%s elapsed_seconds=%.1f",
-                    result.engine or slug, size, time.monotonic() - started,
+                    result.engine or chosen_slug, size, time.monotonic() - started,
                 )
                 return result
-            except STTAuthenticationError as exc:
+            except asyncio.CancelledError:
+                cancelled = True
+                raise
+            except STTInvalidInputError as exc:
+                # Permanent job-specific input error: do not waste fallback
+                # uploads on an unreadable or corrupted audio stream.
                 logger.warning(
-                    "STT provider %s auth failure after %.1fs: %s",
-                    slug, time.monotonic() - started, exc,
+                    "STT permanent invalid input on %s after %.1fs (no fallback): %s",
+                    chosen_slug, time.monotonic() - started, exc,
+                )
+                raise
+            except STTAuthenticationError as exc:
+                previous_failed_slug = chosen_slug
+                logger.warning(
+                    "STT provider %s auth/quota failure after %.1fs: %s",
+                    chosen_slug, time.monotonic() - started, exc,
                 )
                 failures.append(str(exc))
             except STTRequestError as exc:
+                previous_failed_slug = chosen_slug
                 logger.warning(
                     "STT provider %s rejected the request after %.1fs: %s",
-                    slug, time.monotonic() - started, exc,
+                    chosen_slug, time.monotonic() - started, exc,
                 )
                 failures.append(str(exc))
             except STTTransientError as exc:
+                previous_failed_slug = chosen_slug
                 logger.warning(
                     "STT provider %s transient failure after %.1fs; failing over "
                     "without re-uploading: %s",
-                    slug, time.monotonic() - started, exc,
+                    chosen_slug, time.monotonic() - started, exc,
                 )
                 failures.append(str(exc))
             except STTError as exc:
-                # Provider payload/schema errors are definitive for this engine,
-                # but another configured engine may still transcribe the audio.
+                previous_failed_slug = chosen_slug
                 logger.warning(
                     "STT provider %s returned an unusable response after %.1fs: %s",
-                    slug, time.monotonic() - started, exc,
+                    chosen_slug, time.monotonic() - started, exc,
                 )
                 failures.append(str(exc))
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                previous_failed_slug = chosen_slug
                 logger.warning(
                     "STT provider %s network failure after %.1fs: %s",
-                    slug, time.monotonic() - started, exc,
+                    chosen_slug, time.monotonic() - started, exc,
                 )
                 failures.append(f"{spec.label} در دسترس نبود")
+            finally:
+                held = lease.release()
+                METRICS.record_provider_release(
+                    "stt",
+                    chosen_slug,
+                    elapsed_seconds=held,
+                    ok=ok,
+                    cancelled=cancelled,
+                )
+
         if failures:
             logger.error(
                 "STT exhausted every eligible provider (%d attempted, %d skipped): %s",
@@ -1146,9 +1352,6 @@ async def transcribe(
             )
             raise STTError("؛ ".join(failures))
         if skipped:
-            # Every provider was skipped without a single attempt: a cooldown
-            # or an upload ceiling. That is temporary/operational, not a
-            # transcription failure, and the wording must say so.
             logger.warning("STT skipped every eligible provider: %s", " | ".join(skipped))
             raise STTTransientError(
                 "سرویس تبدیل گفتار همین حالا در دسترس نیست؛ چند دقیقهٔ دیگر "

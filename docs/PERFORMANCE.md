@@ -28,7 +28,12 @@ for the job's own download rate. A PCM upload only wins on a very fast link.
 These are already shipped in `.env.example`:
 
 ```dotenv
-STT_PROVIDERS=deepgram,speechmatics,openai_compatible
+STT_PROVIDERS=speechmatics,deepgram,openai_compatible
+STT_FALLBACK_ENABLED=true
+SPEECHMATICS_MAX_IN_FLIGHT=2
+DEEPGRAM_MAX_IN_FLIGHT=4
+LLM_PRIMARY_MAX_IN_FLIGHT=4
+LLM_FALLBACK_MAX_IN_FLIGHT=4
 NOTE_CONCURRENCY=6
 NOTE_TTFB_TIMEOUT_SECONDS=25
 NOTE_HEDGE_AFTER_SECONDS=60
@@ -37,7 +42,12 @@ NOTE_PROGRESSIVE_BOOKLET=1
 NOTE_OPENROUTER_THROUGHPUT=1
 ```
 
-- Deepgram Nova-3 is markedly faster than Speechmatics `enhanced`; the order is a latency policy.
+- Speechmatics runs first up to `SPEECHMATICS_MAX_IN_FLIGHT`, and excess concurrent jobs overflow
+  immediately (`0 ms` wait) to Deepgram Nova-3 (`DEEPGRAM_MAX_IN_FLIGHT`) without waiting or triggering `429`s.
+- Primary LLM routes likewise overflow immediately (`0 ms` wait) to secondary `NOTE_PROVIDERS` routes
+  when `LLM_PRIMARY_MAX_IN_FLIGHT` is full or when upstream returns `429`/quota errors.
+- Benchmark multi-user concurrency & failover directly offline with:
+  `python -m scripts.concurrency_bench`
 - The first-byte guard abandons a silent route after 25 s instead of waiting out the deadline.
 - Hedging starts a second provider after 60 s; it can spend extra quota.
 - Progressive delivery sends the audited merge while the editorial compile runs. It is skipped

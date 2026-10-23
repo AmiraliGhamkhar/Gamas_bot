@@ -684,67 +684,36 @@ class CheckTests(unittest.TestCase):
         # what must not be reported is a problem with the inactive model.
         self.assertFalse(any("does not support Persian" in p for p in check(settings)))
 
-    def test_slow_engine_first_is_reported_as_advisory(self):
-        """Order is latency policy, so a slow first engine must not be silent."""
+    def test_speechmatics_primary_deepgram_overflow_is_valid_without_warning(self):
+        """Speechmatics primary + Deepgram overflow is the shipped policy."""
         settings = self.make(
             STT_PROVIDERS="speechmatics,deepgram",
             SPEECHMATICS_API_KEY="sm",
             DEEPGRAM_API_KEY="dg",
             SPEECHMATICS_MODEL="enhanced",
         )
-        slow = [p for p in check(settings) if "starts with speechmatics" in p]
-        self.assertEqual(len(slow), 1, check(settings))
-        # The bot still runs: this is a measured preference, not a defect.
-        self.assertTrue(is_advisory(slow[0]))
-        self.assertIn("deepgram", slow[0])
+        self.assertEqual(check(settings), [])
 
-    def test_standard_model_first_is_reported_too(self):
-        """``standard`` is faster than ``enhanced`` but still slower than Nova-3."""
-        settings = self.make(
-            STT_PROVIDERS="speechmatics,deepgram",
-            DEEPGRAM_API_KEY="dg",
-            SPEECHMATICS_MODEL="standard",
-        )
-        self.assertTrue(any("starts with speechmatics" in p for p in check(settings)))
-
-    def test_fast_engine_first_is_not_reported(self):
-        """The shipped order leads with Deepgram, so nothing is flagged."""
-        settings = self.make(SPEECHMATICS_API_KEY="sm", DEEPGRAM_API_KEY="dg")
-        self.assertFalse(any("starts with speechmatics" in p for p in check(settings)))
-
-    def test_speechmatics_first_alone_is_not_reported(self):
-        """With no Deepgram key, Speechmatics *is* the deployment's engine."""
-        settings = self.make(
-            STT_PROVIDERS="speechmatics,deepgram",
-            SPEECHMATICS_API_KEY="sm",
-            DEEPGRAM_API_KEY="",
-        )
-        self.assertFalse(any("starts with speechmatics" in p for p in check(settings)))
-
-    def test_newer_speechmatics_model_first_is_not_reported(self):
-        """``melia-1`` is the documented fast batch model; no warning applies."""
-        settings = self.make(
-            STT_PROVIDERS="speechmatics,deepgram",
-            DEEPGRAM_API_KEY="dg",
-            SPEECHMATICS_MODEL="melia-1",
-        )
-        self.assertFalse(any("starts with speechmatics" in p for p in check(settings)))
-
-    def test_keyless_first_slug_does_not_hide_the_slow_engine(self):
-        """The warning follows the provider that *runs*, not the first entry.
-
-        ``deepgram`` listed first without a key is skipped by the chain, so
-        Speechmatics really does serve the job — but with no Deepgram key there
-        is nothing faster configured to compare against, so no warning is due.
-        """
-        settings = self.make(
-            STT_PROVIDERS="deepgram,speechmatics",
-            SPEECHMATICS_API_KEY="sm",
-            DEEPGRAM_API_KEY="",
-            SPEECHMATICS_MODEL="enhanced",
-        )
-        self.assertEqual(first_configured_stt_provider(settings), "speechmatics")
-        self.assertFalse(any("starts with speechmatics" in p for p in check(settings)))
+    def test_stage_and_provider_concurrency_bounds_clamp_safely(self):
+        with mock.patch.dict(
+            os.environ,
+            env(
+                SPEECHMATICS_MAX_IN_FLIGHT="0",
+                DEEPGRAM_MAX_IN_FLIGHT="99",
+                MAX_CONCURRENT_DOWNLOADS="0",
+                MAX_CONCURRENT_UPLOADS="99",
+                LLM_PRIMARY_MAX_IN_FLIGHT="0",
+                STT_PROVIDER_TIMEOUT_SECONDS="1",
+            ),
+            clear=False,
+        ):
+            clamped = from_env(env_file="/nonexistent")
+        self.assertEqual(clamped.speechmatics_max_in_flight, 1)
+        self.assertEqual(clamped.deepgram_max_in_flight, 32)
+        self.assertEqual(clamped.max_concurrent_downloads, 1)
+        self.assertEqual(clamped.max_concurrent_uploads, 8)
+        self.assertEqual(clamped.llm_primary_max_in_flight, 1)
+        self.assertEqual(clamped.stt_provider_timeout, 5.0)
 
 
 class ShippedDefaultTests(unittest.TestCase):
@@ -754,17 +723,20 @@ class ShippedDefaultTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env(), clear=False):
             self.settings = from_env(env_file="/nonexistent")
 
-    def test_the_fast_engine_leads_the_failover_order(self):
-        """Order *is* the latency policy: the first configured provider runs.
-
-        Speechmatics stays in the list, so a deployment whose only key is
-        ``SPEECHMATICS_API_KEY`` keeps exactly the previous behaviour.
-        """
+    def test_speechmatics_leads_with_deepgram_overflow(self):
+        """Speechmatics is primary; Deepgram is non-blocking overflow/backup."""
         self.assertEqual(
             self.settings.stt_providers,
-            ("deepgram", "speechmatics", "openai_compatible"),
+            ("speechmatics", "deepgram", "openai_compatible"),
         )
         self.assertEqual(first_configured_stt_provider(self.settings), "speechmatics")
+        self.assertTrue(self.settings.stt_fallback_enabled)
+        self.assertEqual(self.settings.speechmatics_max_in_flight, 2)
+        self.assertEqual(self.settings.deepgram_max_in_flight, 4)
+        self.assertEqual(self.settings.max_concurrent_downloads, 2)
+        self.assertEqual(self.settings.max_concurrent_uploads, 2)
+        self.assertEqual(self.settings.llm_primary_max_in_flight, 4)
+        self.assertEqual(self.settings.llm_fallback_max_in_flight, 4)
 
     def test_note_performance_defaults(self):
         self.assertEqual(self.settings.note_ttfb_timeout, 25.0)

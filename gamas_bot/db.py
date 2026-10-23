@@ -116,6 +116,7 @@ class Database:
     def __init__(self, path: Path | str):
         self.path = Path(path)
         self._db: aiosqlite.Connection | None = None
+        self._read_db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
 
     @property
@@ -124,16 +125,31 @@ class Database:
             raise RuntimeError("Database.connect() must be awaited first")
         return self._db
 
+    @property
+    def read_db(self) -> aiosqlite.Connection:
+        """Read-only WAL connection so concurrent reads never stall behind writes."""
+        if self._read_db is not None:
+            return self._read_db
+        return self.db
+
     async def connect(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._db.execute("PRAGMA synchronous=NORMAL")
+        await self._db.execute("PRAGMA temp_store=MEMORY")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._apply_migrations()
         await self._db.commit()
         await self._backfill_allocations()
+        if str(self.path) != ":memory:":
+            self._read_db = await aiosqlite.connect(self.path)
+            self._read_db.row_factory = aiosqlite.Row
+            await self._read_db.execute("PRAGMA query_only=ON")
+            await self._read_db.execute("PRAGMA temp_store=MEMORY")
+            await self._read_db.execute("PRAGMA busy_timeout=5000")
         self._secure_file_permissions()
 
     def _secure_file_permissions(self) -> None:
@@ -152,6 +168,9 @@ class Database:
                 logger.warning("could not restrict permissions on %s", candidate)
 
     async def close(self) -> None:
+        if self._read_db is not None:
+            await self._read_db.close()
+            self._read_db = None
         if self._db is not None:
             await self._db.close()
             self._db = None
@@ -217,8 +236,16 @@ class Database:
                 await self.db.rollback()
                 raise
 
-    async def _credit_lots(self, user_id: int, at: str, before_id: int | None = None):
-        return await self.db.execute_fetchall(
+    async def _credit_lots(
+        self,
+        user_id: int,
+        at: str,
+        before_id: int | None = None,
+        *,
+        conn: aiosqlite.Connection | None = None,
+    ):
+        handle = conn if conn is not None else self.db
+        return await handle.execute_fetchall(
             "SELECT l.id, l.seconds "
             "- COALESCE((SELECT SUM(a.seconds) FROM debit_allocations a "
             "WHERE a.credit_id = l.id), 0) "
@@ -334,45 +361,55 @@ class Database:
                 )
 
     async def is_banned(self, telegram_id: int) -> bool:
-        async with self._write_lock:
-            rows = await self.db.execute_fetchall(
-                "SELECT banned FROM users WHERE telegram_id = ?", (telegram_id,)
-            )
-            return bool(rows and rows[0][0])
+        rows = await self.read_db.execute_fetchall(
+            "SELECT banned FROM users WHERE telegram_id = ?", (telegram_id,)
+        )
+        return bool(rows and rows[0][0])
 
     async def user_ids(self) -> list[int]:
         """Every user id, without the per-row balance work of ``list_users``."""
-        rows = await self.db.execute_fetchall(
+        rows = await self.read_db.execute_fetchall(
             "SELECT telegram_id FROM users ORDER BY telegram_id"
         )
         return [int(row[0]) for row in rows]
 
     async def list_users(self, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
-            "SELECT telegram_id, joined_at, banned, is_unlimited FROM users "
-            "ORDER BY joined_at DESC LIMIT ? OFFSET ?",
-            (limit, offset),
+        now = iso(utc_now())
+        rows = await self.read_db.execute_fetchall(
+            "SELECT u.telegram_id, u.joined_at, u.banned, u.is_unlimited, "
+            "COALESCE(("
+            "  SELECT SUM(MAX(0, l.seconds "
+            "    - COALESCE((SELECT SUM(a.seconds) FROM debit_allocations a "
+            "                WHERE a.credit_id = l.id), 0) "
+            "    - COALESCE((SELECT SUM(a.seconds) FROM hold_allocations a "
+            "                JOIN holds h ON h.submission_id = a.submission_id "
+            "                WHERE a.credit_id = l.id AND h.released_at IS NULL), 0)"
+            "  )) "
+            "  FROM ledger l "
+            "  WHERE l.user_id = u.telegram_id AND l.kind = 'credit' "
+            "    AND julianday(l.created_at) <= julianday(?) "
+            "    AND (l.expires_at IS NULL OR julianday(l.expires_at) > julianday(?))"
+            "), 0) AS available_seconds "
+            "FROM users u "
+            "ORDER BY u.joined_at DESC LIMIT ? OFFSET ?",
+            (now, now, limit, offset),
         )
-        result = []
-        for row in rows:
-            available = await self.available_seconds(row[0])
-            result.append(
-                {
-                    "telegram_id": row[0],
-                    "joined_at": row[1],
-                    "banned": bool(row[2]),
-                    "is_unlimited": bool(row[3]),
-                    "available_seconds": available,
-                }
-            )
-        return result
+        return [
+            {
+                "telegram_id": row[0],
+                "joined_at": row[1],
+                "banned": bool(row[2]),
+                "is_unlimited": bool(row[3]),
+                "available_seconds": int(row[4]),
+            }
+            for row in rows
+        ]
 
     async def is_unlimited(self, user_id: int) -> bool:
-        async with self._write_lock:
-            rows = await self.db.execute_fetchall(
-                "SELECT is_unlimited FROM users WHERE telegram_id = ?", (user_id,)
-            )
-            return bool(rows and rows[0][0])
+        rows = await self.read_db.execute_fetchall(
+            "SELECT is_unlimited FROM users WHERE telegram_id = ?", (user_id,)
+        )
+        return bool(rows and rows[0][0])
 
     async def set_unlimited(
         self,
@@ -412,14 +449,14 @@ class Database:
             )
 
     async def unlimited_users(self) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
+        rows = await self.read_db.execute_fetchall(
             "SELECT telegram_id, unlimited_reason, unlimited_granted_by, unlimited_granted_at "
             "FROM users WHERE is_unlimited = 1 ORDER BY unlimited_granted_at DESC, telegram_id"
         )
         return [dict(row) for row in rows]
 
     async def count_users(self) -> int:
-        row = await self.db.execute_fetchall("SELECT COUNT(*) FROM users")
+        row = await self.read_db.execute_fetchall("SELECT COUNT(*) FROM users")
         return int(row[0][0]) if row else 0
 
     # ----------------------------------------------------------- submissions
@@ -521,7 +558,7 @@ class Database:
 
     async def transcription(self, submission_id: int) -> dict | None:
         """The persisted transcript (engine, text, notes JSON) for auditing."""
-        rows = await self.db.execute_fetchall(
+        rows = await self.read_db.execute_fetchall(
             "SELECT engine, text, notes_json FROM transcriptions "
             "WHERE submission_id = ?",
             (submission_id,),
@@ -532,7 +569,7 @@ class Database:
         return {"engine": engine, "text": text, "notes_json": notes_json}
 
     async def submission(self, submission_id: int) -> SubmissionRow | None:
-        rows = await self.db.execute_fetchall(
+        rows = await self.read_db.execute_fetchall(
             "SELECT submission_id, user_id, kind, filename, status, error, "
             "duration_seconds, created_at, finished_at FROM submissions "
             "WHERE submission_id = ?",
@@ -544,7 +581,7 @@ class Database:
         return SubmissionRow(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8])
 
     async def user_submissions(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
+        rows = await self.read_db.execute_fetchall(
             "SELECT submission_id, kind, filename, status, duration_seconds, created_at, "
             "finished_at FROM submissions WHERE user_id = ? "
             "ORDER BY submission_id DESC LIMIT ?",
@@ -553,17 +590,17 @@ class Database:
         return [dict(row) for row in rows]
 
     async def stats(self) -> dict[str, Any]:
-        totals = await self.db.execute_fetchall(
+        totals = await self.read_db.execute_fetchall(
             "SELECT status, COUNT(*) FROM submissions GROUP BY status"
         )
         by_status = {row[0]: int(row[1]) for row in totals}
         users = await self.count_users()
-        seconds = await self.db.execute_fetchall(
+        seconds = await self.read_db.execute_fetchall(
             "SELECT COALESCE(SUM(duration_seconds), 0) FROM submissions WHERE delivered_at IS NOT NULL OR status = 'done'"
         )
         # Revenue is the sum of what each user was actually quoted at purchase,
         # never the plan's current price (audit F-14).
-        revenue = await self.db.execute_fetchall(
+        revenue = await self.read_db.execute_fetchall(
             "SELECT COALESCE(SUM(COALESCE(p.purchased_price, "
             "  (SELECT price FROM plans pl WHERE pl.code = p.plan_code), 0)), 0) "
             "FROM payments p WHERE p.status = 'approved'"
@@ -599,7 +636,8 @@ class Database:
                     (now, row[0]),
                 )
                 await self.db.execute(
-                    "UPDATE holds SET released_at = ? "
+                    "UPDATE holds SET released_at = ?, "
+                    "release_reason = COALESCE(release_reason, 'interrupted by restart') "
                     "WHERE submission_id = ? AND released_at IS NULL",
                     (now, row[0]),
                 )
@@ -610,6 +648,13 @@ class Database:
     # ---------------------------------------------------------------- billing
     async def available_seconds(self, user_id: int) -> int:
         """Unexpired lot remainders, excluding their active reservations."""
+        if self._read_db is not None:
+            return sum(
+                max(0, int(row[1]))
+                for row in await self._credit_lots(
+                    user_id, iso(utc_now()), conn=self._read_db
+                )
+            )
         async with self._write_lock:
             return await self._available_seconds_locked(user_id)
 

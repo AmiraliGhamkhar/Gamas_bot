@@ -212,19 +212,24 @@ PLAN_ENV_FIELDS = (
 #: ever attempted, so this default is safe with zero STT keys set.
 #:
 #: The order is a *latency* policy, not a preference: the first configured
-#: provider is the one that runs, so listing a slow engine first makes the slow
-#: engine the default for every job. Deepgram's Nova-3 is the fastest engine
-#: this bot can reach (an independent benchmark measured ~351x real time against
-#: ~24x for Speechmatics ``enhanced``), and ``check`` rejects any
-#: ``DEEPGRAM_MODEL`` without a Persian pack, so leading with it is safe for the
-#: shipped Persian default. Speechmatics stays second, which means a deployment
-#: with only ``SPEECHMATICS_API_KEY`` set behaves exactly as before, and a
-#: Deepgram outage degrades to the old path instead of failing.
-DEFAULT_STT_PROVIDERS = "deepgram,speechmatics,openai_compatible"
+#: Speechmatics leads the default chain (Persian accuracy primary), with
+#: Deepgram as immediate non-blocking overflow and failover when Speechmatics
+#: reaches ``SPEECHMATICS_MAX_IN_FLIGHT`` or returns a recoverable error.
+DEFAULT_STT_PROVIDERS = "speechmatics,deepgram,openai_compatible"
 
-#: Speechmatics batch models that are slower than a configured Nova-3. Used only
-#: to warn about an inverted failover order; no behaviour depends on the value.
-SLOW_SPEECHMATICS_MODELS = frozenset({"enhanced", "standard"})
+#: Default stage and provider concurrency controls tuned conservatively for
+#: shared cPanel hosting (1 GB RAM, 10 MB/s disk I/O, 1 vCPU).
+DEFAULT_MAX_CONCURRENT_DOWNLOADS = 2
+DEFAULT_MAX_CONCURRENT_UPLOADS = 2
+DEFAULT_SPEECHMATICS_MAX_IN_FLIGHT = 2
+DEFAULT_DEEPGRAM_MAX_IN_FLIGHT = 4
+DEFAULT_STT_OPENAI_MAX_IN_FLIGHT = 2
+DEFAULT_STT_PROVIDER_TIMEOUT_SECONDS = 1800.0
+DEFAULT_STT_SLOT_WAIT_TIMEOUT_SECONDS = 15.0
+DEFAULT_LLM_PRIMARY_MAX_IN_FLIGHT = 4
+DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT = 4
+DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS = 30.0
+DEFAULT_DEDUP_WINDOW_SECONDS = 120.0
 
 #: Shipped note-layer performance defaults. Each is a documented trade-off, so
 #: they live here rather than as literals in ``from_env``:
@@ -581,6 +586,22 @@ class Settings:
     plan_50_hours: int
     plan_50_price_toman: int
     plan_50_validity_days: int
+
+    # --- Stage concurrency, non-blocking provider capacity & deduplication ---
+    max_concurrent_downloads: int = DEFAULT_MAX_CONCURRENT_DOWNLOADS
+    max_concurrent_uploads: int = DEFAULT_MAX_CONCURRENT_UPLOADS
+    download_timeout: float = 900.0
+    upload_timeout: float = 600.0
+    stt_fallback_enabled: bool = True
+    speechmatics_max_in_flight: int = DEFAULT_SPEECHMATICS_MAX_IN_FLIGHT
+    deepgram_max_in_flight: int = DEFAULT_DEEPGRAM_MAX_IN_FLIGHT
+    stt_openai_max_in_flight: int = DEFAULT_STT_OPENAI_MAX_IN_FLIGHT
+    stt_provider_timeout: float = DEFAULT_STT_PROVIDER_TIMEOUT_SECONDS
+    stt_slot_wait_timeout: float = DEFAULT_STT_SLOT_WAIT_TIMEOUT_SECONDS
+    llm_primary_max_in_flight: int = DEFAULT_LLM_PRIMARY_MAX_IN_FLIGHT
+    llm_fallback_max_in_flight: int = DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT
+    llm_slot_wait_timeout: float = DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS
+    dedup_window_seconds: float = DEFAULT_DEDUP_WINDOW_SECONDS
 
     # --- Derived --------------------------------------------------------------
     plan_values: dict[str, int] = field(default_factory=dict, compare=False)
@@ -1199,6 +1220,85 @@ def from_env(env_file: str | None = None) -> Settings:
             "OFFICE_AI_CONCURRENCY", 3, minimum=1, maximum=16
         ),
         plan_values=plan_values,
+        max_concurrent_downloads=_env_int(
+            "MAX_CONCURRENT_DOWNLOADS",
+            DEFAULT_MAX_CONCURRENT_DOWNLOADS,
+            minimum=1,
+            maximum=8,
+        ),
+        max_concurrent_uploads=_env_int(
+            "MAX_CONCURRENT_UPLOADS",
+            DEFAULT_MAX_CONCURRENT_UPLOADS,
+            minimum=1,
+            maximum=8,
+        ),
+        download_timeout=_env_float(
+            "DOWNLOAD_TIMEOUT_SECONDS",
+            900.0,
+            minimum=10.0,
+            maximum=14400.0,
+        ),
+        upload_timeout=_env_float(
+            "UPLOAD_TIMEOUT_SECONDS",
+            600.0,
+            minimum=10.0,
+            maximum=14400.0,
+        ),
+        stt_fallback_enabled=_env_bool("STT_FALLBACK_ENABLED", True),
+        speechmatics_max_in_flight=_env_int(
+            "SPEECHMATICS_MAX_IN_FLIGHT",
+            DEFAULT_SPEECHMATICS_MAX_IN_FLIGHT,
+            minimum=1,
+            maximum=32,
+        ),
+        deepgram_max_in_flight=_env_int(
+            "DEEPGRAM_MAX_IN_FLIGHT",
+            DEFAULT_DEEPGRAM_MAX_IN_FLIGHT,
+            minimum=1,
+            maximum=32,
+        ),
+        stt_openai_max_in_flight=_env_int(
+            "STT_OPENAI_MAX_IN_FLIGHT",
+            DEFAULT_STT_OPENAI_MAX_IN_FLIGHT,
+            minimum=1,
+            maximum=32,
+        ),
+        stt_provider_timeout=_env_float(
+            "STT_PROVIDER_TIMEOUT_SECONDS",
+            DEFAULT_STT_PROVIDER_TIMEOUT_SECONDS,
+            minimum=5.0,
+            maximum=86400.0,
+        ),
+        stt_slot_wait_timeout=_env_float(
+            "STT_SLOT_WAIT_TIMEOUT_SECONDS",
+            DEFAULT_STT_SLOT_WAIT_TIMEOUT_SECONDS,
+            minimum=0.0,
+            maximum=600.0,
+        ),
+        llm_primary_max_in_flight=_env_int(
+            "LLM_PRIMARY_MAX_IN_FLIGHT",
+            DEFAULT_LLM_PRIMARY_MAX_IN_FLIGHT,
+            minimum=1,
+            maximum=64,
+        ),
+        llm_fallback_max_in_flight=_env_int(
+            "LLM_FALLBACK_MAX_IN_FLIGHT",
+            DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT,
+            minimum=1,
+            maximum=64,
+        ),
+        llm_slot_wait_timeout=_env_float(
+            "LLM_SLOT_WAIT_TIMEOUT_SECONDS",
+            DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS,
+            minimum=0.0,
+            maximum=600.0,
+        ),
+        dedup_window_seconds=_env_float(
+            "DEDUP_WINDOW_SECONDS",
+            DEFAULT_DEDUP_WINDOW_SECONDS,
+            minimum=0.0,
+            maximum=3600.0,
+        ),
         **plan_values,
     )
 
@@ -1211,7 +1311,6 @@ ADVISORY_PROBLEMS = (
     "does not support Persian",
     "no room for the transcript",
     "the note request will time out on a slow gateway",
-    "starts with speechmatics",
 )
 
 
@@ -1273,24 +1372,6 @@ def check(settings: Settings) -> list[str]:
             f"DEEPGRAM_MODEL={settings.deepgram_model} does not support Persian "
             f"(STT_LANGUAGE={settings.stt_language}); set DEEPGRAM_MODEL to one of: "
             f"{', '.join(sorted(DEEPGRAM_PERSIAN_MODELS))}."
-        )
-    # Failover *order* is the latency policy, and the first configured provider
-    # is the one that runs. A slower engine in that slot silently becomes the
-    # default for every job, which is invisible in a log that only names the
-    # provider it used. Advisory, never fatal: it is a measured preference, not
-    # a broken configuration.
-    if (
-        first_configured_stt_provider(settings) == "speechmatics"
-        and settings.speechmatics_model.strip().lower() in SLOW_SPEECHMATICS_MODELS
-        and settings.deepgram_configured
-    ):
-        problems.append(
-            "STT_PROVIDERS starts with speechmatics and SPEECHMATICS_MODEL="
-            f"{settings.speechmatics_model}, so every job waits for the slower engine "
-            "even though Deepgram is configured; put deepgram first "
-            "(STT_PROVIDERS=deepgram,speechmatics) unless Persian accuracy was "
-            "measured to be better on Speechmatics (or use SPEECHMATICS_MODEL=melia-1 "
-            "with a regional SPEECHMATICS_BASE_URL)."
         )
     if settings.note_provider not in NOTE_PROVIDER_SLUGS and _legacy_note_configured(settings):
         problems.append(
