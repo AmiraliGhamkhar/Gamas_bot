@@ -31,7 +31,7 @@ NOTE_PROVIDERS=gemini,nara,openrouter,groq,cerebras
 GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-2.5-flash-lite
 NOTE_GEMINI_THINKING_BUDGET=0
-NOTE_CONCURRENCY=6
+NOTE_CONCURRENCY=3
 NOTE_REQUEST_TIMEOUT_SECONDS=900
 NOTE_STRICT_GROUNDING=true
 ```
@@ -41,16 +41,25 @@ a positive value caps it and `-1` sends no thinking field.
 
 ## Failover and guards
 
-Transient network, timeout and rate-limit errors get bounded retries, then the next eligible route
-is tried. Oversized input is split within the configured limits. An answer cut off at the output
-limit is not resent unchanged.
+The first configured route with a credential and a free local slot is selected. If the primary is
+saturated, an available configured secondary is selected immediately; a bounded wait applies only
+when every candidate route is full. `LLM_PRIMARY_MAX_IN_FLIGHT`, `LLM_FALLBACK_MAX_IN_FLIGHT`, and
+`LLM_SLOT_WAIT_TIMEOUT_SECONDS` (default `4`, `4`, and `30` seconds) control those local limits.
 
+- HTTP 429 and recognized provider-capacity limits cool down the route briefly and fail over
+  immediately without sleeping or replaying that completion. Authentication/quota errors also
+  cool down and move to the next eligible route.
+- Transient network/server errors receive at most two retries on that route. A normal request
+  timeout fails over rather than repeating a potentially costly request; the last route can use its
+  bounded retry path. An output-truncated answer is not resent unchanged.
 - **First-byte guard** (`NOTE_TTFB_TIMEOUT_SECONDS`, default 25, `0` off): on OpenAI-style and
   Gemini routes the request is streamed; a route that sends no byte in time is abandoned and the
   chain fails over instead of waiting out the full deadline.
 - **Hedged racing** (`NOTE_HEDGE_AFTER_SECONDS`, default 60, `0` off): if the first route has not
-  finished after the delay, the second starts in parallel and the first answer wins. At most one
-  extra in-flight request; it can consume extra quota.
+  finished after the delay, the second starts in parallel. At most one extra request is active; it
+  can spend extra quota. Both tasks are cancelled/joined and leases released if the caller is
+  cancelled.
+- Non-streaming JSON and SSE response bodies are incrementally bounded at 16 MiB.
 - **Structured output** (`NOTE_STRUCTURED_OUTPUT=1`): the request carries a response schema. A
   provider that rejects the field is retried once without it.
 

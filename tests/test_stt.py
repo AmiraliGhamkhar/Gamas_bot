@@ -6,10 +6,12 @@ import asyncio
 import json
 import unittest
 from dataclasses import replace
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
 from gamas_bot import config, stt
+from gamas_bot.fileio import AsyncFilePayload
 from gamas_bot.stt import (
     PROVIDERS,
     STTAuthenticationError,
@@ -146,7 +148,11 @@ class SpeechmaticsFlowTests(unittest.IsolatedAsyncioTestCase):
             {"type": "punctuation", "alternatives": [{"content": ".", "attaches_to": "previous"}]},
         ]
         session = speechmatics_flow(results)
-        raw = await stt._speechmatics(session, audio_file(), settings)
+        path = audio_file()
+        raw = await stt._speechmatics(session, path, settings)
+        audio_payload = session.post_kwargs[0]["data"]._fields[1][2]
+        self.assertIsInstance(audio_payload, AsyncFilePayload)
+        self.assertEqual(await audio_payload.as_bytes(), path.read_bytes())
         self.assertEqual(raw.text, "درس.")
         self.assertEqual(raw.engine, "speechmatics")
         self.assertEqual(raw.words[0].start, 0.0)
@@ -181,6 +187,39 @@ class SpeechmaticsFlowTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession(posts=[FakeResponse(401, {"error": {"message": "bad key"}})])
         with self.assertRaises(STTAuthenticationError):
             await stt._speechmatics(session, audio_file(), settings)
+
+
+
+    async def test_speechmatics_job_cancellation_has_a_short_deadline(self):
+        started = asyncio.Event()
+        cancelled: list[bool] = []
+
+        class HangingDelete:
+            async def __aenter__(self):
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.append(True)
+                    raise
+
+            async def __aexit__(self, *_exc):
+                return False
+
+        class DeleteSession:
+            def __init__(self):
+                self.kwargs = None
+
+            def delete(self, _url, **kwargs):
+                self.kwargs = kwargs
+                return HangingDelete()
+
+        session = DeleteSession()
+        with mock.patch.object(stt, "SPEECHMATICS_DELETE_TIMEOUT_SECONDS", 0.01):
+            await stt._cancel_speechmatics_job(session, make_settings(), "job-cancel")
+        self.assertTrue(started.is_set())
+        self.assertEqual(cancelled, [True])
+        self.assertAlmostEqual(session.kwargs["timeout"].total, 0.01)
 
 
 class DeepgramParsingTests(unittest.TestCase):
@@ -447,7 +486,10 @@ class ProviderRequestTests(unittest.IsolatedAsyncioTestCase):
             "results": {"channels": [{"alternatives": [{"transcript": "متن", "words": []}]}]}
         }
         session = FakeSession(posts=[FakeResponse(200, payload)])
-        await stt._deepgram(session, audio_file("deepgram.wav"), settings)
+        path = audio_file("deepgram.wav")
+        await stt._deepgram(session, path, settings)
+        self.assertIsInstance(session.post_kwargs[0]["data"], AsyncFilePayload)
+        self.assertEqual(await session.post_kwargs[0]["data"].as_bytes(), path.read_bytes())
         self.assertEqual(
             session.post_calls[0], "https://dg.example/v1/listen?tenant=course"
         )
@@ -476,9 +518,14 @@ class ProviderRequestTests(unittest.IsolatedAsyncioTestCase):
             stt_language="auto",
         )
         session = FakeSession([FakeResponse(200, {"text": "متن"})])
-        await stt._openai_compatible(session, audio_file("openai.wav"), settings)
-        names = [field[0].get("name") for field in session.post_kwargs[0]["data"]._fields]
+        path = audio_file("openai.wav")
+        await stt._openai_compatible(session, path, settings)
+        fields = session.post_kwargs[0]["data"]._fields
+        names = [field[0].get("name") for field in fields]
         self.assertNotIn("language", names)
+        file_value = next(field[2] for field in fields if field[0].get("name") == "file")
+        self.assertIsInstance(file_value, AsyncFilePayload)
+        self.assertEqual(await file_value.as_bytes(), path.read_bytes())
 
     async def test_openai_does_not_retry_unrelated_bad_request(self):
         settings = make_settings(
@@ -883,7 +930,7 @@ class ProviderFailureTests(unittest.IsolatedAsyncioTestCase):
             # deadline = 0.0 + 60; the second loop check is already past it.
             return next(ticks, 200.0)
 
-        with mock.patch("gamas_bot.stt.time.monotonic", new=clock):
+        with mock.patch.object(stt, "time", SimpleNamespace(monotonic=clock)):
             with mock.patch.object(asyncio, "sleep", new=_noop_sleep):
                 with self.assertRaises(STTTransientError):
                     await stt._speechmatics(session, audio_file("slow.wav"), settings)

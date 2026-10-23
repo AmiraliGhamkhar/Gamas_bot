@@ -34,18 +34,32 @@ shipped stage-gated defaults:
 
 ```dotenv
 MAX_ACTIVE_JOBS=3
-MAX_QUEUED_JOBS=8
 MAX_ACTIVE_JOBS_PER_USER=2
+MAX_QUEUED_JOBS=8
 MAX_CONCURRENT_DOWNLOADS=2
 MEDIA_WORKER_CONCURRENCY=1
 MAX_CONCURRENT_UPLOADS=2
+MAX_FILE_SIZE=134217728
+MAX_MEDIA_DURATION_SECONDS=7200
+TEMP_MIN_FREE_BYTES=67108864
+TELEGRAM_DOWNLOAD_CONNECTIONS=1
 SPEECHMATICS_MAX_IN_FLIGHT=2
 DEEPGRAM_MAX_IN_FLIGHT=4
 LLM_PRIMARY_MAX_IN_FLIGHT=4
 LLM_FALLBACK_MAX_IN_FLIGHT=4
+NOTE_CONCURRENCY=3
+NOTE_HEDGE_AFTER_SECONDS=60
+PRESENTATION_MAX_CLIPS=50
+PRESENTATION_MAX_TOTAL_DURATION=7200
+PRESENTATION_MAX_UNPACKED_BYTES=134217728
+PRESENTATION_MAX_TEMP_BYTES=268435456
 ```
 
-Lower `MAX_FILE_SIZE`, `TEMP_MIN_FREE_BYTES` and the presentation limits to fit the plan.
+These are conservative application ceilings, not a guarantee that every cPanel plan can hold a
+128 MiB upload plus its working copies. Reduce `MAX_FILE_SIZE` and the presentation limits if your
+quota is smaller; keep a positive `TEMP_MIN_FREE_BYTES` reserve. There are no worker processes or
+external queue services: Telegram, provider HTTP, extraction, and media subprocesses remain subject
+to the host's CPU, process, network, disk-I/O, and runtime limits.
 
 ## 3. Test before going live
 

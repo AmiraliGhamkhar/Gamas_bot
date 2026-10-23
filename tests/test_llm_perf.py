@@ -15,8 +15,10 @@ from gamas_bot import llm, office_ai
 from gamas_bot.office_ai import plan_deck
 from gamas_bot.bot import GamasBot
 from gamas_bot.config import from_env, note_routes
+from gamas_bot.capacity import pool_for
 from gamas_bot.llm import (
     LLMOutputBudgetError,
+    LLMResponseError,
     LLMTransientError,
     complete,
     complete_json,
@@ -46,11 +48,13 @@ class _StreamContent:
     def __init__(self, lines, hang_first: bool = False):
         self._lines = list(lines)
         self._hang_first = hang_first
+        self.read_count = 0
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
+        self.read_count += 1
         if self._hang_first:
             await asyncio.sleep(30)
         if not self._lines:
@@ -66,6 +70,28 @@ class StreamingResponse:
 
     async def read(self):
         return b""
+
+
+class _BoundedContent:
+    def __init__(self, body: bytes):
+        self.body = body
+        self.position = 0
+        self.read_sizes: list[int] = []
+
+    async def read(self, size: int) -> bytes:
+        self.read_sizes.append(size)
+        start = self.position
+        self.position = min(len(self.body), start + size)
+        return self.body[start:self.position]
+
+
+class _BoundedBodyResponse:
+    def __init__(self, body: bytes):
+        self.content = _BoundedContent(body)
+        self.headers = {}
+
+    async def read(self):
+        raise AssertionError("bounded stream reader should be used")
 
 
 def sse(obj) -> bytes:
@@ -117,6 +143,52 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("elapsed_ms=", usage_lines[0])
         # Streaming was requested only on this opted-in path.
         self.assertTrue(session.calls[0]["json"]["stream"])
+
+    async def test_streaming_stops_reading_as_soon_as_the_body_cap_is_crossed(self):
+        settings = routed_settings(note_ttfb_timeout=0.5, note_hedge_after=0.0)
+        route = note_routes(settings)[0]
+        response = StreamingResponse([
+            sse(delta("first")),
+            sse(delta("never read")),
+        ])
+        session = DispatchSession([("router.bynara.id", response)])
+        with mock.patch.object(llm, "MAX_LLM_RESPONSE_BYTES", 4):
+            with self.assertRaises(LLMResponseError):
+                await llm._complete_streaming_on_route(
+                    route,
+                    session,
+                    settings,
+                    url="https://router.bynara.id/v1/chat/completions",
+                    headers={},
+                    payload={},
+                    timeout_seconds=10.0,
+                )
+        self.assertEqual(response.content.read_count, 1)
+
+    async def test_zero_ttfb_timeout_disables_the_first_byte_guard(self):
+        settings = routed_settings(note_ttfb_timeout=0.0, note_hedge_after=0.0)
+        route = note_routes(settings)[0]
+        session = DispatchSession([
+            ("router.bynara.id", StreamingResponse([sse(delta("fast")), b"data: [DONE]"]))
+        ])
+        result = await llm._complete_streaming_on_route(
+            route,
+            session,
+            settings,
+            url="https://router.bynara.id/v1/chat/completions",
+            headers={},
+            payload={},
+            timeout_seconds=10.0,
+        )
+        self.assertEqual(result, "fast")
+
+    async def test_nonstreaming_body_reader_stops_at_one_byte_over_the_cap(self):
+        response = _BoundedBodyResponse(b"{\"content\":\"too large\"}")
+        with mock.patch.object(llm, "MAX_LLM_RESPONSE_BYTES", 5):
+            with self.assertRaises(LLMResponseError):
+                await llm._read_json_body(response)
+        self.assertEqual(response.content.position, 6)
+        self.assertEqual(response.content.read_sizes, [6])
 
     async def test_structured_output_composes_with_streaming(self):
         """Both halves are shipped defaults, so the pair must work together.
@@ -224,6 +296,7 @@ class ShippedDefaultWiringTests(unittest.IsolatedAsyncioTestCase):
         """Hedging exists for tail latency, not for every call."""
         settings = self.settings()
         self.assertEqual(settings.note_hedge_after, 60.0)
+        self.assertEqual(settings.note_concurrency, 3)
         lines = [sse(delta("fast", finish="stop")), b"data: [DONE]"]
         session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
         result = await complete(session, settings, system="S", user="U")
@@ -268,6 +341,46 @@ class HedgingTests(unittest.IsolatedAsyncioTestCase):
         result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "backup")
         self.assertEqual(len(session.calls), 2)  # one per provider, no race
+
+    async def test_outer_cancellation_cancels_both_hedged_requests_and_releases_slots(self):
+        started = {"nara": asyncio.Event(), "openrouter": asyncio.Event()}
+        cancelled: list[str] = []
+
+        class BlockingResponse(FakeResponse):
+            def __init__(self, provider: str):
+                super().__init__(200, {"choices": [{"message": {"content": "unused"}}]})
+                self.provider = provider
+
+            async def read(self):
+                started[self.provider].set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancelled.append(self.provider)
+                    raise
+
+        session = DispatchSession([
+            ("bynara", lambda: BlockingResponse("nara")),
+            ("openrouter", lambda: BlockingResponse("openrouter")),
+        ])
+        settings = routed_settings(
+            note_hedge_after=0.01,
+            note_ttfb_timeout=0.0,
+            note_request_timeout=30.0,
+        )
+        pool = pool_for("llm", settings)
+        task = asyncio.create_task(complete(session, settings, system="S", user="U"))
+        await asyncio.wait_for(
+            asyncio.gather(started["nara"].wait(), started["openrouter"].wait()),
+            timeout=2.0,
+        )
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertCountEqual(cancelled, ["nara", "openrouter"])
+        self.assertEqual(pool.in_flight("nara"), 0)
+        self.assertEqual(pool.in_flight("openrouter"), 0)
+        self.assertEqual(pool.waiters, 0)
 
 
 class TransportTests(unittest.TestCase):

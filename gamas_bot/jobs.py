@@ -129,10 +129,9 @@ class Job:
             self.finished_monotonic = now
 
         logger.info(
-            "job_state_transition job_id=%s submission=%s user=%s prev=%s state=%s prev_elapsed_s=%.3f",
+            "job_state_transition job_id=%s submission=%s prev=%s state=%s prev_elapsed_s=%.3f",
             self.job_id,
             self.submission_id,
-            self.user_id,
             prev_state,
             new_state,
             elapsed,
@@ -193,7 +192,6 @@ class JobQueue:
         return {
             jid: {
                 "submission_id": job.submission_id,
-                "user_id": job.user_id,
                 "kind": job.kind,
                 "state": job.state,
                 "state_fa": JOB_STATE_LABELS_FA.get(job.state, job.state),
@@ -236,10 +234,9 @@ class JobQueue:
         self._pending += 1
         METRICS.record_job_queued(self._pending)
         logger.info(
-            "job_queued job_id=%s submission=%s user=%s kind=%s pending=%d/%d",
+            "job_queued job_id=%s submission=%s kind=%s pending=%d/%d",
             job.job_id,
             job.submission_id,
-            job.user_id,
             job.kind,
             self._pending,
             self._max_queued,
@@ -303,7 +300,12 @@ class JobQueue:
                     await self._worker(job)
                     if job.state not in TERMINAL_JOB_STATES:
                         job.transition_to("completed")
-                    outcome = job.state if job.state in TERMINAL_JOB_STATES else "completed"
+                    requested_outcome = job.meta.get("outcome")
+                    outcome = (
+                        requested_outcome
+                        if requested_outcome in {"partial", "completed"}
+                        else job.state if job.state in TERMINAL_JOB_STATES else "completed"
+                    )
                 except asyncio.CancelledError:
                     if job.state not in TERMINAL_JOB_STATES:
                         job.transition_to("cancelled")

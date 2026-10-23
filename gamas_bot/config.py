@@ -217,8 +217,18 @@ PLAN_ENV_FIELDS = (
 #: reaches ``SPEECHMATICS_MAX_IN_FLIGHT`` or returns a recoverable error.
 DEFAULT_STT_PROVIDERS = "speechmatics,deepgram,openai_compatible"
 
+#: Conservative disk and media ceilings for a small shared-hosting account.
+#: Operators can raise them after checking their actual disk quota and CPU plan.
+DEFAULT_MAX_FILE_SIZE_BYTES = 128 * 1024**2
+DEFAULT_TEMP_MIN_FREE_BYTES = 64 * 1024**2
+DEFAULT_MAX_MEDIA_DURATION_SECONDS = 2 * 60 * 60
+DEFAULT_PRESENTATION_MAX_CLIPS = 50
+DEFAULT_PRESENTATION_MAX_DURATION_SECONDS = 2 * 60 * 60
+DEFAULT_PRESENTATION_MAX_UNPACKED_BYTES = 128 * 1024**2
+DEFAULT_PRESENTATION_MAX_TEMP_BYTES = 256 * 1024**2
+
 #: Default stage and provider concurrency controls tuned conservatively for
-#: shared cPanel hosting (1 GB RAM, 10 MB/s disk I/O, 1 vCPU).
+#: shared cPanel hosting (1 GB RAM, limited CPU, disk I/O and process slots).
 DEFAULT_MAX_CONCURRENT_DOWNLOADS = 2
 DEFAULT_MAX_CONCURRENT_UPLOADS = 2
 DEFAULT_SPEECHMATICS_MAX_IN_FLIGHT = 2
@@ -235,13 +245,13 @@ DEFAULT_DEDUP_WINDOW_SECONDS = 120.0
 #: they live here rather than as literals in ``from_env``:
 #:
 #: * ``NOTE_CONCURRENCY`` — the map phase never starts more requests than there
-#:   are chunks (capped at 8), so 6 only parallelises long lectures.
+#:   are chunks (capped at 8); 3 keeps per-job request bursts modest on shared hosts.
 #: * ``NOTE_TTFB_TIMEOUT_SECONDS`` — a route that has not produced a first byte
 #:   within 25 s is treated as hung and the chain fails over, instead of waiting
 #:   out the whole request timeout. Below the hedge delay on purpose.
 #: * ``NOTE_HEDGE_AFTER_SECONDS`` — if the first provider has not finished in
 #:   60 s, the second starts in parallel; at most one extra in-flight POST.
-DEFAULT_NOTE_CONCURRENCY = 6
+DEFAULT_NOTE_CONCURRENCY = 3
 DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS = 25.0
 DEFAULT_NOTE_HEDGE_AFTER_SECONDS = 60.0
 
@@ -425,6 +435,9 @@ class Settings:
 
     # --- Limits -------------------------------------------------------------
     max_file_size: int
+    #: Hard ceiling for measured audio/video duration, in seconds. Telegram's
+    #: duration hint is checked at intake and PyAV's probe is checked again.
+    max_media_duration_seconds: float
     max_active_jobs: int
     max_active_jobs_per_user: int
     max_queued_jobs: int
@@ -1014,7 +1027,15 @@ def from_env(env_file: str | None = None) -> Settings:
         log_format=_env("LOG_FORMAT", "plain"),
         log_max_bytes=_env_int("LOG_MAX_BYTES", 5 * 1024 * 1024, minimum=100_000),
         log_backup_count=_env_int("LOG_BACKUP_COUNT", 5, minimum=1),
-        max_file_size=_env_int("MAX_FILE_SIZE", 2 * 1024**3, minimum=1024),
+        max_file_size=_env_int(
+            "MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE_BYTES, minimum=1024
+        ),
+        max_media_duration_seconds=_env_float(
+            "MAX_MEDIA_DURATION_SECONDS",
+            DEFAULT_MAX_MEDIA_DURATION_SECONDS,
+            minimum=1.0,
+            maximum=12 * 60 * 60,
+        ),
         max_active_jobs=_env_int("MAX_ACTIVE_JOBS", 3, minimum=1, maximum=32),
         # Per-user admission: a balance check at intake cannot see the jobs a
         # user queued one second earlier, so N uploads each individually
@@ -1036,7 +1057,7 @@ def from_env(env_file: str | None = None) -> Settings:
             "STT_STATUS_LONG_POLL", 25.0, minimum=0.0, maximum=120.0
         ),
         temp_min_free_bytes=_env_int(
-            "TEMP_MIN_FREE_BYTES", 2 * 1024**3, minimum=0
+            "TEMP_MIN_FREE_BYTES", DEFAULT_TEMP_MIN_FREE_BYTES, minimum=0
         ),
         download_stall_seconds=_env_float(
             "DOWNLOAD_STALL_SECONDS", 300.0, minimum=30.0
@@ -1045,15 +1066,23 @@ def from_env(env_file: str | None = None) -> Settings:
         telegram_download_connections=_env_int(
             "TELEGRAM_DOWNLOAD_CONNECTIONS", 1, minimum=1, maximum=8
         ),
-        presentation_max_clips=_env_int("PRESENTATION_MAX_CLIPS", 300, minimum=1),
+        presentation_max_clips=_env_int(
+            "PRESENTATION_MAX_CLIPS", DEFAULT_PRESENTATION_MAX_CLIPS, minimum=1
+        ),
         presentation_max_total_duration=_env_float(
-            "PRESENTATION_MAX_TOTAL_DURATION", 21600.0, minimum=1.0
+            "PRESENTATION_MAX_TOTAL_DURATION",
+            DEFAULT_PRESENTATION_MAX_DURATION_SECONDS,
+            minimum=1.0,
         ),
         presentation_max_unpacked_bytes=_env_int(
-            "PRESENTATION_MAX_UNPACKED_BYTES", 4 * 1024**3, minimum=1024
+            "PRESENTATION_MAX_UNPACKED_BYTES",
+            DEFAULT_PRESENTATION_MAX_UNPACKED_BYTES,
+            minimum=1024,
         ),
         presentation_max_temp_bytes=_env_int(
-            "PRESENTATION_MAX_TEMP_BYTES", 8 * 1024**3, minimum=1024
+            "PRESENTATION_MAX_TEMP_BYTES",
+            DEFAULT_PRESENTATION_MAX_TEMP_BYTES,
+            minimum=1024,
         ),
         presentation_min_clip_seconds=_env_float(
             "PRESENTATION_MIN_CLIP_SECONDS", 0.5, minimum=0.0
@@ -1062,7 +1091,7 @@ def from_env(env_file: str | None = None) -> Settings:
             "PRESENTATION_SILENCE_SECONDS", 0.25, minimum=0.0, maximum=60.0
         ),
         presentation_wav_limit_bytes=_env_int(
-            "PRESENTATION_WAV_LIMIT_BYTES", 2 * 1024**3, minimum=1024
+            "PRESENTATION_WAV_LIMIT_BYTES", DEFAULT_MAX_FILE_SIZE_BYTES, minimum=1024
         ),
         presentation_include_slide_text=_env_bool("PRESENTATION_INCLUDE_SLIDE_TEXT", True),
         presentation_include_video_audio=_env_bool("PRESENTATION_INCLUDE_VIDEO_AUDIO", True),

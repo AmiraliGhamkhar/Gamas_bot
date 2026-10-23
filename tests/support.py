@@ -102,7 +102,8 @@ class FakeTelegramClient:
         bound.apply_defaults()
         arguments = dict(bound.arguments)
         entity = arguments.pop("entity")
-        path = str(arguments.pop("file"))
+        file_value = arguments.pop("file")
+        path = str(getattr(file_value, "name", file_value))
         if self.fail_file_delivery:
             raise RuntimeError("Telegram refused the upload (simulated)")
         record = {"entity": entity, "path": path, **arguments}
@@ -110,7 +111,18 @@ class FakeTelegramClient:
         if self.recorder is not None:
             caption = arguments.get("caption") or ""
             try:
-                payload = Path(path).read_bytes()
+                if isinstance(file_value, (str, Path)):
+                    payload = Path(file_value).read_bytes()
+                else:
+                    chunks = []
+                    while True:
+                        chunk = file_value.read(64 * 1024)
+                        if inspect.isawaitable(chunk):
+                            chunk = await chunk
+                        if not chunk:
+                            break
+                        chunks.append(chunk)
+                    payload = b"".join(chunks)
             except OSError:
                 payload = b""
             self.recorder.files.append((caption, path))
@@ -391,6 +403,7 @@ def make_settings(**overrides) -> Settings:
         log_max_bytes=100_000,
         log_backup_count=1,
         max_file_size=2_000_000_000,
+        max_media_duration_seconds=7200.0,
         max_active_jobs=2,
         max_active_jobs_per_user=8,
         max_queued_jobs=8,

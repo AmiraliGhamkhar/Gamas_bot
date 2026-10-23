@@ -57,6 +57,12 @@ from .db import (
     TicketStateError,
     TooManyActiveJobsError,
 )
+from .fileio import (
+    AsyncFileReader,
+    AsyncFileWriter,
+    run_file_io,
+    run_file_io_resource,
+)
 from .docx_export import (
     OFFICE_HEADING_OFFSET,
     DocumentMeta,
@@ -517,10 +523,8 @@ async def _download_media_ranges(
     """Download one file as concurrent byte ranges, each writing its own region.
 
     ``os.pwrite`` is positional, so the ranges never coordinate and the file is
-    complete once every task is done. The callers' guarantees are unchanged:
-    the byte ceiling is enforced on the declared size and on the running total,
-    a stalled transfer is aborted, and any failure leaves no partial file (the
-    caller deletes it).
+    complete once every task is done. Each blocking filesystem operation runs
+    in the shared executor; descriptor acquisition and close are cancellation-safe.
     """
     size = _message_file_size(message)
     if size is None:
@@ -530,7 +534,13 @@ async def _download_media_ranges(
     ranges = plan_download_ranges(size, connections)
     last_progress = [time.monotonic()]
     written = [0]
-    descriptor = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor = await run_file_io_resource(
+        os.open,
+        os.close,
+        target,
+        os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+        0o600,
+    )
 
     async def fetch(offset: int, chunks: int) -> None:
         position = offset
@@ -542,7 +552,7 @@ async def _download_media_ranges(
             file_size=size,
         ):
             payload = bytes(piece)
-            await asyncio.to_thread(os.pwrite, descriptor, payload, position)
+            await run_file_io(os.pwrite, descriptor, payload, position)
             position += len(payload)
             written[0] += len(payload)
             last_progress[0] = time.monotonic()
@@ -576,11 +586,12 @@ async def _download_media_ranges(
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        os.close(descriptor)
-    if target.stat().st_size != size:
+        await run_file_io(os.close, descriptor)
+    actual_size = (await run_file_io(target.stat)).st_size
+    if actual_size != size:
         # A short write would otherwise be "some file that plays".
         raise RuntimeError(
-            f"ranged download produced {target.stat().st_size} of {size} bytes"
+            f"ranged download produced {actual_size} of {size} bytes"
         )
     logger.info(
         "ranged download done bytes=%d connections=%d ranges=%d",
@@ -597,27 +608,29 @@ async def _download_media_limited(
     client=None,
     connections: int = 1,
 ) -> Path:
-    """Download Telegram media with live abort if it exceeds *limit_bytes*.
+    """Download Telegram media with size, stall and event-loop I/O bounds.
 
-    Telegram may report ``file.size`` as None or as a thumbnail size, so
-    pre-check alone is insufficient. The progress callback aborts the download
-    as soon as the declared total or the running total exceeds the limit,
-    preventing a multi-GB disk-fill before the post-download stat check.
-
-    A download that produces no bytes for ``stall_seconds`` is also aborted
-    (``0`` disables the watchdog). There is no job-level timeout by design, so
-    a half-open socket used to hold a worker — and its temporary directory —
-    indefinitely on a multi-gigabyte lecture.
+    Known-size files use Telethon's async byte-range iterator on POSIX, even
+    with one connection; each disk write runs in the bounded thread pool. If
+    that optimization is unavailable or fails, Telethon receives an async
+    file-like writer instead of a path, so its normal synchronous ``write``
+    path cannot block the event loop. Minimal test clients without
+    ``iter_download`` retain the ordinary path API.
     """
     if limit_bytes <= 0:
         raise ValueError("download limit must be positive")
-    # ``os.pwrite`` is POSIX-only; on Windows the proven single-stream path runs
-    # (the deployment target is cPanel/Linux, this keeps local runs intact).
+    declared_size = _message_file_size(message)
+    if declared_size is not None and declared_size > limit_bytes:
+        raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+
+    supports_async_download = client is not None and callable(
+        getattr(client, "iter_download", None)
+    )
     ranged = (
-        client is not None
-        and connections > 1
+        supports_async_download
+        and connections >= 1
         and hasattr(os, "pwrite")
-        and _message_file_size(message)
+        and declared_size is not None
     )
     if ranged:
         try:
@@ -631,16 +644,17 @@ async def _download_media_limited(
             )
             return target
         except (UploadTooLargeError, DownloadStalledError):
-            target.unlink(missing_ok=True)
+            await run_file_io(target.unlink, missing_ok=True)
             raise
         except Exception as exc:  # noqa: BLE001 - any surprise means one stream
-            # A ranged transfer is an optimisation, never a prerequisite: prove
-            # it works on this host, otherwise the proven path runs.
+            # A ranged transfer is an optimization, never a prerequisite: prove
+            # it works on this host, otherwise the async single-stream path runs.
             logger.warning(
                 "ranged download failed (%s: %s); retrying single-stream",
                 type(exc).__name__, exc,
             )
-            target.unlink(missing_ok=True)
+            await run_file_io(target.unlink, missing_ok=True)
+
     last_progress = [time.monotonic()]
 
     def _guard(received: int, total: int) -> None:
@@ -652,18 +666,20 @@ async def _download_media_limited(
         if received > limit_bytes:
             raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
 
-    async def _download():
-        return await message.download_media(
-            file=str(target), progress_callback=_guard
-        )
-
-    task = asyncio.create_task(_download())
+    writer = await AsyncFileWriter.open(target) if supports_async_download else None
+    file_target = writer if writer is not None else str(target)
+    task: asyncio.Task | None = None
     try:
+        async def _download():
+            return await message.download_media(
+                file=file_target, progress_callback=_guard
+            )
+
+        task = asyncio.create_task(_download())
         if stall_seconds > 0:
             tick = max(0.05, min(stall_seconds / 4, 15.0))
-            wait_set = (task,)
             while True:
-                done, _pending = await asyncio.wait(wait_set, timeout=tick)
+                done, _pending = await asyncio.wait((task,), timeout=tick)
                 if done:
                     break
                 idle = time.monotonic() - last_progress[0]
@@ -672,22 +688,35 @@ async def _download_media_limited(
                         "دانلود فایل از تلگرام متوقف شد؛ لطفاً دوباره بفرستید."
                     )
         downloaded = await task
-        if not downloaded or not target.is_file():
+        try:
+            file_stat = await run_file_io(target.stat)
+        except OSError as exc:
+            raise RuntimeError("download did not produce a file") from exc
+        if not downloaded or not stat.S_ISREG(file_stat.st_mode):
             raise RuntimeError("download did not produce a file")
-        if target.stat().st_size > limit_bytes:
+        if file_stat.st_size > limit_bytes:
             raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
         return target
     except BaseException:
         # This includes cancellation, a stalled transfer and progress-callback
         # failures: never keep a partial upload in private storage.
-        if not task.done():
+        if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        if writer is not None:
+            try:
+                await writer.aclose()
+            except OSError:
+                pass
+            writer = None
         try:
-            target.unlink(missing_ok=True)
+            await run_file_io(target.unlink, missing_ok=True)
         except OSError:
             pass
         raise
+    finally:
+        if writer is not None:
+            await writer.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -833,7 +862,6 @@ class GamasBot:
         # section is free and may call the note model, so it needs its own
         # per-user throttle (``OFFICE_MIN_INTERVAL_SECONDS``).
         self._office_request_times: dict[int, float] = {}
-        settings.session_path.parent.mkdir(parents=True, exist_ok=True)
         self.client = TelegramClient(
             str(settings.session_path), settings.api_id, settings.api_hash
         )
@@ -856,9 +884,13 @@ class GamasBot:
                 os.chmod(directory, 0o700)
             except OSError:
                 logger.warning("could not prepare private directory %s", directory)
+        try:
+            self.settings.session_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            logger.warning("could not prepare Telegram session directory")
 
     async def run(self) -> None:
-        self._prepare_private_dirs()
+        await run_file_io(self._prepare_private_dirs)
         await self.db.connect()
         await self.db.sync_plans(
             [
@@ -873,7 +905,7 @@ class GamasBot:
             ]
         )
         await self.db.recover_interrupted()
-        self._sweep_stale_temp_dirs()
+        await run_file_io(self._sweep_stale_temp_dirs)
         self.queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
         self._transcript_cleanup_task = asyncio.create_task(
@@ -1027,7 +1059,7 @@ class GamasBot:
             except MessageNotModifiedError:
                 pass
             except Exception:
-                logger.exception("callback failed data=%r", event.data)
+                logger.exception("callback failed")
                 await self._ack(event, "خطایی رخ داد؛ دوباره امتحان کنید.", alert=True)
 
         @client.on(events.NewMessage)
@@ -1127,7 +1159,7 @@ class GamasBot:
         if await self.db.grant_free_plan_once(
             user_id, self._free_plan_seconds()
         ):
-            logger.info("free plan granted user=%s", user_id)
+            logger.info("free plan granted")
         greeting = "به گاماس خوش آمدید." if first_start else "منوی اصلی"
         if self.settings.note_configured:
             introduction = (
@@ -1370,15 +1402,17 @@ class GamasBot:
         the session, and the bot's promise is that temporary files do not
         outlive the work.
         """
-        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        await run_file_io(
+            self.settings.temp_dir.mkdir, parents=True, exist_ok=True
+        )
         token = secrets.token_hex(6)
         target = self.settings.temp_dir / f"office-{token}{Path(filename).suffix.lower()}"
         try:
-            await _download_media_limited(
+            await self._download_telegram_media(
                 message, target, self.settings.office_max_input_bytes
             )
-            return read_text_file(
-                target, max_bytes=self.settings.office_max_input_bytes
+            return await run_file_io(
+                read_text_file, target, max_bytes=self.settings.office_max_input_bytes
             )
         except OfficeError:
             raise
@@ -1392,7 +1426,7 @@ class GamasBot:
             raise OfficeError("فایل ارسالی خوانده نشد.") from exc
         finally:
             try:
-                target.unlink(missing_ok=True)
+                await run_file_io(target.unlink, missing_ok=True)
             except OSError:  # pragma: no cover - defensive
                 pass
 
@@ -1480,8 +1514,8 @@ class GamasBot:
         # later, unrelated message is never mistaken for more content.
         self._office_sessions.pop(user_id, None)
         logger.info(
-            "accepted office request submission=%s user=%s kind=%s chars=%d",
-            submission_id, user_id, kind, len(content),
+            "accepted office request submission=%s kind=%s chars=%d",
+            submission_id, kind, len(content),
         )
 
     # ------------------------------------------------------------- callbacks
@@ -1853,6 +1887,13 @@ class GamasBot:
                 f"❌ حجم فایل ارسالی از سقف مجاز ربات بیشتر است. حد مجاز: {max_mb} مگابایت"
             )
             return
+        if duration is not None and duration > self.settings.max_media_duration_seconds:
+            limit_minutes = int(self.settings.max_media_duration_seconds // 60)
+            await event.reply(
+                "❌ مدت فایل صوتی یا ویدیویی از سقف مجاز ربات بیشتر است "
+                f"(حداکثر {to_persian_digits(limit_minutes)} دقیقه)."
+            )
+            return
         available = await self.db.available_seconds(user_id)
         # ``duration is None`` is not an exemption: an unknown duration used to
         # skip the balance check entirely, so a 2 GiB upload could be downloaded
@@ -1906,8 +1947,8 @@ class GamasBot:
             await event.reply(f"⏸ {exc}")
             return
         logger.info(
-            "accepted media submission=%s kind=%s user=%s duration=%s",
-            submission_id, _sanitize_log_value(kind), user_id, duration,
+            "accepted media submission=%s kind=%s duration=%s",
+            submission_id, _sanitize_log_value(kind), duration,
         )
 
     async def _accept_presentation(
@@ -1978,7 +2019,7 @@ class GamasBot:
             await progress.fail(str(submission_id))
             await event.reply(f"⏸ {exc}")
             return
-        logger.info("accepted presentation submission=%s user=%s", submission_id, user_id)
+        logger.info("accepted presentation submission=%s", submission_id)
 
     def _prune_dedup_maps(self, now: float) -> None:
         expired = [key for key, exp in self._seen_messages.items() if exp <= now]
@@ -2015,12 +2056,7 @@ class GamasBot:
             msg_key = (int(chat_id), msg_id)
             if self._seen_messages.get(msg_key, 0.0) > now:
                 METRICS.record_deduplicated()
-                logger.info(
-                    "deduplicated repeated telegram update user=%s chat=%s msg=%s",
-                    user_id,
-                    chat_id,
-                    msg_id,
-                )
+                logger.info("deduplicated repeated telegram update")
                 return True
             self._seen_messages[msg_key] = now + window
 
@@ -2028,8 +2064,7 @@ class GamasBot:
         if fp is not None and (user_id, fp) in self._active_upload_keys:
             METRICS.record_deduplicated()
             logger.info(
-                "deduplicated concurrent identical file user=%s existing_job=%s",
-                user_id,
+                "deduplicated concurrent identical file existing_job=%s",
                 self._active_upload_keys[(user_id, fp)],
             )
             await event.reply(
@@ -2068,9 +2103,14 @@ class GamasBot:
                 await self._reply(job, "⛔ درخواست صف‌شده به دلیل مسدودی حساب لغو شد.")
                 return
             await self.db.set_submission_status(job.submission_id, "processing")
-            self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-            workdir = Path(tempfile.mkdtemp(
-                prefix=f"submission-{job.submission_id}-", dir=self.settings.temp_dir
+            await run_file_io(
+                self.settings.temp_dir.mkdir, parents=True, exist_ok=True
+            )
+            workdir = Path(await run_file_io_resource(
+                tempfile.mkdtemp,
+                lambda path: shutil.rmtree(path, ignore_errors=True),
+                prefix=f"submission-{job.submission_id}-",
+                dir=self.settings.temp_dir,
             ))
             if job.kind == "presentation":
                 await self._process_presentation(job, workdir, progress)
@@ -2139,11 +2179,17 @@ class GamasBot:
         finally:
             if fp is not None:
                 self._active_upload_keys.pop((job.user_id, fp), None)
-            if progress:
-                await progress.aclose()
-            if workdir is not None:
-                await asyncio.to_thread(shutil.rmtree, workdir, True)
-            log_job_id.reset(log_token)
+            try:
+                if progress:
+                    await progress.aclose()
+            finally:
+                try:
+                    if workdir is not None:
+                        await run_file_io(shutil.rmtree, workdir, True)
+                except OSError:
+                    logger.warning("could not remove job work directory")
+                finally:
+                    log_job_id.reset(log_token)
 
     async def _release(self, job: Job, reason: str) -> bool:
         return await self.db.release_hold(job.submission_id, reason)
@@ -2166,37 +2212,20 @@ class GamasBot:
         if not re.fullmatch(r"\.[a-z0-9]{1,8}", suffix):
             suffix = ".media"
         source_path = workdir / f"source{suffix}"
-        upload_bytes = _reported_upload_bytes(job.message, self.settings.max_file_size)
-        # The download and the prepared audio can both exist at once.
-        await asyncio.to_thread(
-            _ensure_disk_headroom,
-            self.settings.temp_dir,
-            upload_bytes * 2,
-            reserve_bytes=self.settings.temp_min_free_bytes,
-        )
         job.transition_to("downloading")
         await progress.update(20, "دریافت فایل از تلگرام")
         download_started = time.monotonic()
         try:
-            async with self._download_semaphore:
-                await asyncio.wait_for(
-                    _download_media_limited(
-                        job.message,
-                        source_path,
-                        self.settings.max_file_size,
-                        stall_seconds=self.settings.download_stall_seconds,
-                        client=self.client,
-                        connections=self.settings.telegram_download_connections,
-                    ),
-                    timeout=self.settings.download_timeout,
-                )
+            await self._download_telegram_media(
+                job.message, source_path, self.settings.max_file_size
+            )
         except asyncio.TimeoutError as exc:
             raise ValueError(
                 "مهلت دریافت فایل از تلگرام به پایان رسید؛ لطفاً دوباره تلاش کنید."
             ) from exc
         except UploadTooLargeError as exc:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc
-        source_size = await asyncio.to_thread(lambda p=source_path: p.stat().st_size)
+        source_size = (await run_file_io(source_path.stat)).st_size
         if source_size > self.settings.max_file_size:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
         # The download is the only transfer rate this job measures for free, so
@@ -2209,6 +2238,15 @@ class GamasBot:
         source_info = await self._run_media_operation(
             probe_media, source_path, self.settings
         )
+        if (
+            source_info.duration is not None
+            and source_info.duration > self.settings.max_media_duration_seconds
+        ):
+            limit_minutes = int(self.settings.max_media_duration_seconds // 60)
+            raise ValueError(
+                "مدت فایل صوتی یا ویدیویی از سقف مجاز ربات بیشتر است "
+                f"(حداکثر {to_persian_digits(limit_minutes)} دقیقه)."
+            )
         audio_path = await self._run_media_operation(
             self._prepare_audio,
             source_path,
@@ -2218,7 +2256,7 @@ class GamasBot:
             info=source_info,
             egress_bytes_per_second=egress_bytes_per_second,
         )
-        audio_size = await asyncio.to_thread(lambda p=audio_path: p.stat().st_size)
+        audio_size = (await run_file_io(audio_path.stat)).st_size
         if audio_size > self.settings.max_file_size:
             raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
 
@@ -2232,6 +2270,12 @@ class GamasBot:
         if not duration or duration <= 0:
             raise ValueError(
                 "مدت فایل مشخص نشد؛ امکان پردازش آن وجود ندارد."
+            )
+        if duration > self.settings.max_media_duration_seconds:
+            limit_minutes = int(self.settings.max_media_duration_seconds // 60)
+            raise ValueError(
+                "مدت فایل صوتی یا ویدیویی از سقف مجاز ربات بیشتر است "
+                f"(حداکثر {to_persian_digits(limit_minutes)} دقیقه)."
             )
         needed = self._reserve_estimate(duration)
         await self.db.reserve(job.user_id, job.submission_id, needed)
@@ -2263,7 +2307,7 @@ class GamasBot:
             self.db.save_transcription(
                 job.submission_id, engine=raw.engine, text=document.plain(), notes_json=""
             ),
-            asyncio.to_thread(
+            run_file_io(
                 raw_path.write_text, raw_text, encoding="utf-8", newline="\n"
             ),
         )
@@ -2320,7 +2364,7 @@ class GamasBot:
             else min(self.settings.max_file_size, ceiling)
         )
         try:
-            oversized = source_path.stat().st_size > budget
+            oversized = (await run_file_io(source_path.stat)).st_size > budget
         except OSError:
             oversized = False
         if kind == "video" or needs_transcode(filename, info) or oversized:
@@ -2343,6 +2387,34 @@ class GamasBot:
         async with self._media_semaphore:
             return await operation(*args, **kwargs)
 
+    async def _download_telegram_media(
+        self, message, target: Path, limit_bytes: int
+    ) -> Path:
+        """Apply the shared download gate, disk check, transfer and deadline."""
+        target = Path(target)
+        await run_file_io(target.parent.mkdir, parents=True, exist_ok=True)
+        async with self._download_semaphore:
+            reported_bytes = _reported_upload_bytes(message, limit_bytes)
+            if reported_bytes > limit_bytes:
+                raise UploadTooLargeError(f"file exceeds limit ({limit_bytes} bytes)")
+            await run_file_io(
+                _ensure_disk_headroom,
+                target.parent,
+                reported_bytes * 2,
+                reserve_bytes=self.settings.temp_min_free_bytes,
+            )
+            return await asyncio.wait_for(
+                _download_media_limited(
+                    message,
+                    target,
+                    limit_bytes,
+                    stall_seconds=self.settings.download_stall_seconds,
+                    client=self.client,
+                    connections=self.settings.telegram_download_connections,
+                ),
+                timeout=self.settings.download_timeout,
+            )
+
     async def _settle(self, job: Job, duration: float | None) -> None:
         measured = int(math.ceil(duration)) if duration else 0
         await self.db.settle_hold(job.submission_id, measured)
@@ -2353,34 +2425,19 @@ class GamasBot:
         await progress.update(10, "آماده‌سازی پردازش")
         suffix = Path(job.filename).suffix.lower() if job.filename else ".pptx"
         source_path = workdir / f"source{suffix}"
-        upload_bytes = _reported_upload_bytes(job.message, self.settings.max_file_size)
-        # The deck and the clips unpacked from it coexist in the workdir.
-        await asyncio.to_thread(
-            _ensure_disk_headroom,
-            self.settings.temp_dir,
-            upload_bytes * 2,
-            reserve_bytes=self.settings.temp_min_free_bytes,
-        )
         job.transition_to("downloading")
         await progress.update(20, "دریافت فایل از تلگرام")
         try:
-            async with self._download_semaphore:
-                await asyncio.wait_for(
-                    _download_media_limited(
-                        job.message,
-                        source_path,
-                        self.settings.max_file_size,
-                        stall_seconds=self.settings.download_stall_seconds,
-                    ),
-                    timeout=self.settings.download_timeout,
-                )
+            await self._download_telegram_media(
+                job.message, source_path, self.settings.max_file_size
+            )
         except asyncio.TimeoutError as exc:
             raise ValueError(
                 "مهلت دریافت فایل از تلگرام به پایان رسید؛ لطفاً دوباره تلاش کنید."
             ) from exc
         except UploadTooLargeError as exc:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc
-        deck_size = await asyncio.to_thread(lambda p=source_path: p.stat().st_size)
+        deck_size = (await run_file_io(source_path.stat)).st_size
         if deck_size > self.settings.max_file_size:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
         if deck_size > self.settings.presentation_max_temp_bytes:
@@ -2397,7 +2454,7 @@ class GamasBot:
                 self.settings,
                 warnings_out=conversion_warnings,
             )
-            if source_path.stat().st_size > self.settings.max_file_size:
+            if (await run_file_io(source_path.stat)).st_size > self.settings.max_file_size:
                 raise PresentationError("ارائهٔ تبدیل‌شده از سقف حجم فایل بزرگ‌تر است.")
 
         await progress.update(40, "بررسی اسلایدها")
@@ -2462,7 +2519,7 @@ class GamasBot:
             # prepare_audio has already measured the merged output and retained
             # exact per-clip spans, so another probe would only add latency and
             # could return a codec/container duration that includes padding.
-            if prepared.path.stat().st_size > self.settings.max_file_size:
+            if (await run_file_io(prepared.path.stat)).st_size > self.settings.max_file_size:
                 raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
             duration = prepared.source_duration  # synthetic silence is not billed
             needed = self._reserve_estimate(duration)
@@ -2521,7 +2578,7 @@ class GamasBot:
                 text=raw_text,
                 notes_json="",
             ),
-            asyncio.to_thread(
+            run_file_io(
                 raw_path.write_text, raw_text, encoding="utf-8", newline="\n"
             ),
         )
@@ -2620,7 +2677,7 @@ class GamasBot:
 
         await progress.update(80, "ارسال فایل خروجی")
         path = workdir / office_filename(document.title, kind, reference)
-        await asyncio.to_thread(path.write_bytes, payload)
+        await run_file_io(path.write_bytes, payload)
         caption = (
             f"{FORMAT_EMOJI.get(kind, '📄')} سند {FORMAT_LABELS.get(kind, '')} — {reference}"
         )
@@ -2719,7 +2776,7 @@ class GamasBot:
                     meta=meta,
                 )
                 path = workdir / f"{reference}-draft.docx"
-                await asyncio.to_thread(path.write_bytes, docx_bytes)
+                await run_file_io(path.write_bytes, docx_bytes)
                 await self._send_file(
                     job, path, caption=f"📄 نسخهٔ نخست جزوه — {reference}"
                 )
@@ -2823,7 +2880,7 @@ class GamasBot:
                     meta=meta,
                 )
                 docx_path = workdir / notes_docx_filename(notes, reference)
-                await asyncio.to_thread(docx_path.write_bytes, docx_bytes)
+                await run_file_io(docx_path.write_bytes, docx_bytes)
             except Exception:
                 logger.exception("docx generation failed; falling back to chat message")
                 docx_path = None
@@ -2837,7 +2894,7 @@ class GamasBot:
                     fonts=resolve_fonts(), design=resolve_design(), meta=meta,
                 )
                 docx_path = workdir / plain_docx_filename(plain_title, reference)
-                await asyncio.to_thread(docx_path.write_bytes, docx_bytes)
+                await run_file_io(docx_path.write_bytes, docx_bytes)
             except Exception:
                 logger.exception("plain docx generation failed too")
                 notice = "\n\nنکته: فایل Word ساخته نشد؛ متن خام ارسال شد."
@@ -2854,9 +2911,26 @@ class GamasBot:
             job.submission_id, "partial" if notice else "done", error=notice.strip() or None
         )
         if notice:
+            job.meta["outcome"] = "partial"
             await progress.complete("متن خام ارسال شد. " + notice.strip())
         else:
             await progress.complete()
+
+    async def _send_telegram_file(self, entity, path: Path, **kwargs):
+        """Send one path through Telethon's awaitable-read stream interface."""
+        path = Path(path)
+        file_size = (await run_file_io(path.stat)).st_size
+        async with self._upload_semaphore:
+            stream = await AsyncFileReader.open(path)
+            try:
+                return await asyncio.wait_for(
+                    self.client.send_file(
+                        entity, stream, file_size=file_size, **kwargs
+                    ),
+                    timeout=self.settings.upload_timeout,
+                )
+            finally:
+                await stream.aclose()
 
     async def _send_file(self, job: Job, path: Path, *, caption: str = "") -> None:
         """Deliver one generated artifact as a Telegram document.
@@ -2880,30 +2954,26 @@ class GamasBot:
             raise RuntimeError("پیام کاربر برای ارسال فایل در دسترس نیست.")
         target = await job.message.get_input_chat()
         caption_arg = caption[:TELEGRAM_CAPTION_LIMIT] or None
-        async with self._upload_semaphore:
-            for attempt in range(2):
-                try:
-                    await asyncio.wait_for(
-                        self.client.send_file(
-                            target,
-                            str(path),
-                            caption=caption_arg,
-                            force_document=True,
-                            reply_to=job.message.id,
-                        ),
-                        timeout=self.settings.upload_timeout,
+        for attempt in range(2):
+            try:
+                await self._send_telegram_file(
+                    target,
+                    path,
+                    caption=caption_arg,
+                    force_document=True,
+                    reply_to=job.message.id,
+                )
+                return
+            except FloodWaitError as exc:
+                wait_seconds = float(getattr(exc, "seconds", 0) or 0)
+                if attempt == 0 and 0 < wait_seconds <= 15.0:
+                    logger.warning(
+                        "Telegram FloodWait %.1fs on send_file; retrying once",
+                        wait_seconds,
                     )
-                    return
-                except FloodWaitError as exc:
-                    wait_seconds = float(getattr(exc, "seconds", 0) or 0)
-                    if attempt == 0 and 0 < wait_seconds <= 15.0:
-                        logger.warning(
-                            "Telegram FloodWait %.1fs on send_file; retrying once",
-                            wait_seconds,
-                        )
-                        await asyncio.sleep(wait_seconds)
-                        continue
-                    raise
+                    await asyncio.sleep(wait_seconds)
+                    continue
+                raise
 
     async def _deliver_raw(
         self, job: Job, raw_text: str, raw_path: Path, reference: str
@@ -2990,7 +3060,7 @@ class GamasBot:
         for index, part in enumerate(parts, start=1):
             part_path = raw_path.with_name(f"{raw_path.stem}.{index}{raw_path.suffix}")
             try:
-                await asyncio.to_thread(
+                await run_file_io(
                     part_path.write_text, part, encoding="utf-8", newline="\n"
                 )
                 await self._send_file(
@@ -3008,7 +3078,7 @@ class GamasBot:
                 )
                 break
             finally:
-                part_path.unlink(missing_ok=True)
+                await run_file_io(part_path.unlink, missing_ok=True)
             delivered += 1
         if delivered != len(parts):
             # Partial text is not the billable delivery milestone.
@@ -3276,13 +3346,19 @@ class GamasBot:
             await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
             self._pending_payments[user_id] = payment_id
             return
-        self.settings.receipt_dir.mkdir(parents=True, exist_ok=True)
+        await run_file_io(
+            self.settings.receipt_dir.mkdir, parents=True, exist_ok=True
+        )
         token = secrets.token_hex(8)
         receipt_path = self.settings.receipt_dir / f"receipt-{payment_id}-{token}.jpg"
         try:
-            await _download_media_limited(
+            await self._download_telegram_media(
                 event.message, receipt_path, self.settings.max_payment_receipt_bytes
             )
+        except DiskSpaceError:
+            self._pending_payments[user_id] = payment_id
+            await event.respond("فضای موقت سرور کافی نیست؛ رسید را کمی بعد دوباره بفرستید.")
+            return
         except ValueError:
             self._pending_payments[user_id] = payment_id
             await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
@@ -3295,18 +3371,18 @@ class GamasBot:
         try:
             # Decode and re-encode so an image/polyglot is never persisted as
             # an executable-looking payload, regardless of its original format.
-            if not await asyncio.to_thread(
+            if not await run_file_io(
                 _normalize_receipt_image,
                 receipt_path,
                 max_bytes=self.settings.max_payment_receipt_bytes,
             ):
-                receipt_path.unlink(missing_ok=True)
+                await run_file_io(receipt_path.unlink, missing_ok=True)
                 await event.respond("فرمت رسید نامعتبر است؛ فقط JPEG/PNG/WebP پذیرفته می‌شود.")
                 self._pending_payments[user_id] = payment_id
                 return
-            receipt_path.chmod(0o600)
+            await run_file_io(receipt_path.chmod, 0o600)
         except OSError:
-            receipt_path.unlink(missing_ok=True)
+            await run_file_io(receipt_path.unlink, missing_ok=True)
             self._pending_payments[user_id] = payment_id
             await event.respond("ذخیرهٔ رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
             return
@@ -3315,13 +3391,13 @@ class GamasBot:
                 payment_id, str(receipt_path), user_id=user_id
             )
         except sqlite3.Error:
-            receipt_path.unlink(missing_ok=True)
+            await run_file_io(receipt_path.unlink, missing_ok=True)
             self._pending_payments[user_id] = payment_id
             logger.exception("payment receipt storage failed payment_id=%s", payment_id)
             await event.respond("ثبت رسید انجام نشد؛ لطفاً دوباره ارسال کنید.")
             return
         if not changed:
-            receipt_path.unlink(missing_ok=True)
+            await run_file_io(receipt_path.unlink, missing_ok=True)
             await event.respond("این سفارش دیگر برای ارسال رسید فعال نیست.")
             return
         await event.respond(
@@ -3347,15 +3423,18 @@ class GamasBot:
         )]]
         path = payment.get("receipt_path")
         receipt_ready = bool(
-            path and _is_safe_receipt_path(self.settings.receipt_dir, path)
+            path
+            and await run_file_io(
+                _is_safe_receipt_path, self.settings.receipt_dir, path
+            )
         )
         for admin_id in sorted(self.settings.admin_ids):
             try:
                 if receipt_ready:
                     try:
-                        await self.client.send_file(
+                        await self._send_telegram_file(
                             admin_id,
-                            path,
+                            Path(str(path)),
                             caption=text[:TELEGRAM_CAPTION_LIMIT],
                             buttons=buttons,
                         )
@@ -3364,9 +3443,8 @@ class GamasBot:
                         # the review alert itself. The stored receipt remains
                         # available from the order-detail screen.
                         logger.warning(
-                            "payment receipt delivery failed payment_id=%s admin_id=%s",
+                            "payment receipt delivery failed payment_id=%s",
                             payment_id,
-                            admin_id,
                         )
                         await self.client.send_message(
                             admin_id,
@@ -3381,9 +3459,8 @@ class GamasBot:
                     )
             except Exception:
                 logger.warning(
-                    "payment notification not delivered payment_id=%s admin_id=%s",
+                    "payment notification not delivered payment_id=%s",
                     payment_id,
-                    admin_id,
                 )
 
     REJECTION_REASON_PRESETS = {
@@ -3492,9 +3569,8 @@ class GamasBot:
                 )
             except Exception:
                 logger.warning(
-                    "payment approval notification not delivered payment_id=%s user_id=%s",
+                    "payment approval notification not delivered payment_id=%s",
                     payment_id,
-                    payment["user_id"],
                 )
         await self._show_admin_payment_detail(event, payment_id)
 
@@ -3532,9 +3608,8 @@ class GamasBot:
                     )
                 except Exception:
                     logger.warning(
-                        "payment rejection notification not delivered payment_id=%s user_id=%s",
+                        "payment rejection notification not delivered payment_id=%s",
                         payment_id,
-                        payment["user_id"],
                     )
         await self._show_admin_payment_detail(event, payment_id)
 
@@ -3771,10 +3846,12 @@ class GamasBot:
         # re-check the magic bytes before forwarding it (audit F-20).
         if (
             not path
-            or not _is_safe_receipt_path(self.settings.receipt_dir, path)
-            or not await asyncio.to_thread(
+            or not await run_file_io(
+                _is_safe_receipt_path, self.settings.receipt_dir, path
+            )
+            or not await run_file_io(
                 _normalize_receipt_image,
-                Path(path),
+                Path(str(path)),
                 max_bytes=self.settings.max_payment_receipt_bytes,
             )
         ):
@@ -3791,9 +3868,9 @@ class GamasBot:
         buttons.append([Button.inline("↩️ جزئیات سفارش", f"adm:pd:{payment_id}".encode())])
         # The same supported file API as every other delivery, as a photo
         # (no ``force_document``): receipts are viewed in the app, not filed.
-        await self.client.send_file(
+        await self._send_telegram_file(
             await event.get_input_chat(),
-            path,
+            Path(str(path)),
             caption=(
                 f"📷 رسید پرداخت #{number}\n"
                 f"شناسهٔ کاربر: {payment['user_id']} — طرح: {payment['plan_code']}"
@@ -3943,9 +4020,7 @@ class GamasBot:
             return
         await self.db.ensure_user(target)
         await self.db.set_banned(target, banning, admin_id=event.sender_id)
-        logger.info(
-            "ban flag changed user=%s banned=%s by=%s", target, banning, event.sender_id
-        )
+        logger.info("ban flag changed banned=%s", banning)
         await event.reply(
             f"🚫 حساب کاربر {target} مسدود شد."
             if banning
@@ -4001,7 +4076,7 @@ class GamasBot:
             return
         await self.db.ensure_user(target)
         await self.db.set_unlimited(target, enable, admin_id=event.sender_id, reason=reason)
-        logger.info("unlimited set user=%s enabled=%s by=%s", target, enable, event.sender_id)
+        logger.info("unlimited access updated enabled=%s", enable)
         if enable:
             message = f"⭐ کاربر {target} به فهرست کاربران ویژه افزوده شد؛ اعتبار او نامحدود است."
         else:
@@ -4054,7 +4129,7 @@ class GamasBot:
                     logger.warning("broadcast flood wait seconds=%s", exc.seconds)
                     await asyncio.sleep(min(exc.seconds, 60))
                 except Exception:
-                    logger.debug("broadcast to %s failed", user_id)
+                    logger.debug("broadcast delivery failed")
                 if idx % self.BROADCAST_BATCH_PROGRESS_EVERY == 0:
                     logger.info("broadcast progress sent=%d/%d", sent, len(user_ids))
             await self.db.audit(admin_id, "broadcast", f"text:{len(text)} users:{sent}")
@@ -4124,14 +4199,14 @@ class GamasBot:
             try:
                 await self.client.send_message(admin_id, text, buttons=buttons)
             except Exception:
-                logger.warning("support notification not delivered admin=%s", admin_id)
+                logger.warning("support notification not delivered to an administrator")
 
     async def _notify_user(self, user_id: int, text: str, buttons=None) -> None:
         try:
             await self.client.send_message(user_id, text, buttons=buttons)
         except Exception:
             # The state change is already stored; a blocked bot must not undo it.
-            logger.warning("support notification not delivered user=%s", user_id)
+            logger.warning("support notification not delivered to the account")
 
     async def _show_support_home(self, event) -> None:
         text = (
@@ -4383,7 +4458,7 @@ class GamasBot:
         self._support_admin_states.pop(admin_id, None)
         ticket = await self.db.get_ticket(ticket_id)
         public_id = ticket["public_ticket_id"] if ticket else str(ticket_id)
-        logger.info("support admin reply ticket=%s admin=%s", ticket_id, admin_id)
+        logger.info("support admin reply ticket=%s", ticket_id)
         await event.reply(
             f"✅ پاسخ به درخواست {public_id} ثبت شد.",
             buttons=[[Button.inline("🔎 مشاهدهٔ درخواست", f"adm:sv:{ticket_id}".encode())]],
@@ -4599,7 +4674,7 @@ class GamasBot:
         return removed
 
     async def _cleanup_expired_receipts(self) -> None:
-        if not self.settings.receipt_dir.is_dir():
+        if not await run_file_io(self.settings.receipt_dir.is_dir):
             return
         from datetime import timedelta
 
@@ -4612,16 +4687,21 @@ class GamasBot:
             if payment.get("receipt_path")
         }
         removed: list[str] = []
-        for path in self.settings.receipt_dir.glob("receipt-*.jpg"):
+        paths = await run_file_io(
+            lambda: list(self.settings.receipt_dir.glob("receipt-*.jpg"))
+        )
+        for path in paths:
             # Safety: only touch files strictly inside receipt_dir (audit F-H01)
             try:
                 if str(path) in protected:
                     continue
-                if not _is_safe_receipt_path(self.settings.receipt_dir, path):
+                if not await run_file_io(
+                    _is_safe_receipt_path, self.settings.receipt_dir, path
+                ):
                     logger.warning("skipping unsafe receipt path=%s", _sanitize_log_value(path))
                     continue
-                if datetime.fromtimestamp(path.stat().st_mtime) < cutoff:
-                    path.unlink(missing_ok=True)
+                if datetime.fromtimestamp((await run_file_io(path.stat)).st_mtime) < cutoff:
+                    await run_file_io(path.unlink, missing_ok=True)
                     removed.append(str(path))
             except OSError:
                 continue
