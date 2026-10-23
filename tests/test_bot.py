@@ -1388,13 +1388,16 @@ class _RangedMessage:
         self.file = SimpleNamespace(size=size)
         self.media = "media"
         self.payload = payload
-        self.download_calls: list[str] = []
+        self.download_calls: list[object] = []
 
     async def download_media(self, *, file, progress_callback=None):
         self.download_calls.append(file)
+        if isinstance(file, (str, Path)):
+            Path(file).write_bytes(self.payload)
+        else:
+            await file.write(self.payload)
         if progress_callback is not None:
             progress_callback(len(self.payload), len(self.payload))
-        Path(file).write_bytes(self.payload)
         return file
 
 
@@ -1417,7 +1420,7 @@ class RangedDownloadTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(offset % count, 0)
                 self.assertLessEqual(count * chunk, total)
 
-    def test_one_connection_is_the_untouched_single_stream_path(self):
+    def test_one_connection_uses_one_async_range_without_path_based_writes(self):
         target = self.root / "single.bin"
         payload = b"a" * 4096
         message = _RangedMessage(len(payload), payload)
@@ -1428,8 +1431,8 @@ class RangedDownloadTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.assertEqual(target.read_bytes(), payload)
-        self.assertEqual(client.calls, [])
-        self.assertTrue(message.download_calls)
+        self.assertEqual(client.calls, [{"offset": 0, "limit": 1}])
+        self.assertEqual(message.download_calls, [])
 
     def test_ranges_are_written_at_their_own_offsets(self):
         target = self.root / "ranged.bin"
@@ -1453,6 +1456,22 @@ class RangedDownloadTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(target.read_bytes(), payload)
         self.assertEqual(len(message.download_calls), 1)
+
+    def test_unknown_size_uses_the_async_writer_without_buffering_the_file(self):
+        target = self.root / "unknown.bin"
+        payload = b"u" * 8192
+        message = _RangedMessage(len(payload), payload)
+        message.file.size = None
+        client = _RangedClient(payload)
+        asyncio.run(
+            _download_media_limited(
+                message, target, 10_000, client=client, connections=1
+            )
+        )
+        self.assertEqual(target.read_bytes(), payload)
+        self.assertEqual(client.calls, [])
+        self.assertEqual(len(message.download_calls), 1)
+        self.assertNotIsInstance(message.download_calls[0], (str, Path))
 
     def test_a_declared_oversize_file_is_refused_before_any_transfer(self):
         target = self.root / "big.bin"

@@ -177,6 +177,27 @@ class JobQueueTests(unittest.IsolatedAsyncioTestCase):
         blocked.set()
         await queue.shutdown()
 
+    async def test_active_snapshot_does_not_expose_user_ids(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def worker(_job: Job) -> None:
+            started.set()
+            await release.wait()
+
+        queue = JobQueue(max_queued=2, max_active=1, worker=worker)
+        queue.ensure_workers()
+        with self.assertLogs("gamas_bot.jobs", level="INFO") as captured:
+            queue.submit(make_job(7, user_id=987654321))
+        self.assertNotIn("987654321", " ".join(captured.output))
+        await asyncio.wait_for(started.wait(), timeout=5)
+        snapshot = queue.active_snapshot()
+        self.assertEqual(len(snapshot), 1)
+        self.assertNotIn("user_id", next(iter(snapshot.values())))
+        self.assertNotIn("987654321", repr(snapshot))
+        release.set()
+        await queue.shutdown()
+
     async def test_active_bound_respected(self):
         concurrent = 0
         peak = 0

@@ -133,7 +133,9 @@ class Database:
         return self.db
 
     async def connect(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(
+            self.path.parent.mkdir, parents=True, exist_ok=True
+        )
         self._db = await aiosqlite.connect(self.path)
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
@@ -1153,10 +1155,9 @@ class Database:
                 ),
             )
         logger.info(
-            "payment reviewed payment_id=%s decision=%s admin_id=%s",
+            "payment reviewed payment_id=%s decision=%s",
             payment_id,
             "approved" if approved else "rejected",
-            admin_id,
         )
         return True
 

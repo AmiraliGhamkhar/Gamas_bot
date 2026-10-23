@@ -56,18 +56,47 @@ except ModuleNotFoundError:  # stdlib fallback: identical parsing contract
 MAX_LLM_RESPONSE_BYTES = 16 * 1024 * 1024
 
 
-async def _read_json_body(response: Any) -> Any:
-    """Parse a bounded response body from ``read()`` bytes via :data:`_loads`.
-
-    One narrow compatibility fallback: if the bytes parse to an empty
-    object, ``response.json()`` is consulted and used only when it yields
-    a different value. Real aiohttp parses the same (cached) body, so
-    production results are identical; this only keeps test doubles whose
-    ``read()`` is a stub (but whose ``json()`` is faithful) working.
-    """
-    raw = await response.read()
-    if len(raw) > MAX_LLM_RESPONSE_BYTES:
+async def _read_bounded_body(response: Any, max_bytes: int) -> bytes:
+    """Read at most ``max_bytes + 1`` bytes, using the response stream if present."""
+    headers = getattr(response, "headers", None) or {}
+    try:
+        declared = int(headers.get("Content-Length", ""))
+    except (TypeError, ValueError):
+        declared = None
+    if declared is not None and declared > max_bytes:
         raise LLMResponseError("حجم پاسخ سرویس تولید جزوه بیش از حد مجاز بود.")
+
+    content = getattr(response, "content", None)
+    reader = getattr(content, "read", None)
+    if not callable(reader):
+        # Compatibility for tiny test doubles; a real aiohttp response always
+        # exposes ``content.read`` and follows the bounded streaming branch.
+        body = await response.read()
+        if len(body) > max_bytes:
+            raise LLMResponseError("حجم پاسخ سرویس تولید جزوه بیش از حد مجاز بود.")
+        return body
+
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await reader(min(64 * 1024, max_bytes + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
+            raise LLMResponseError("حجم پاسخ سرویس تولید جزوه بیش از حد مجاز بود.")
+    return b"".join(chunks)
+
+
+async def _read_json_body(response: Any) -> Any:
+    """Parse a bounded response body via :data:`_loads`.
+
+    One narrow compatibility fallback: if the bytes parse to an empty object,
+    ``response.json()`` is consulted for test doubles whose ``read()`` is a
+    stub. Real aiohttp parses the same cached bytes.
+    """
+    raw = await _read_bounded_body(response, MAX_LLM_RESPONSE_BYTES)
     result = _loads(raw)
     if isinstance(result, dict) and not result:
         json_method = getattr(response, "json", None)
@@ -1250,59 +1279,47 @@ class _HedgedFailures(Exception):
 
 
 async def _hedge_two(first_factory, second_factory, hedge_after: float):
-    """Race two route attempts, starting the second only after a delay.
-
-    A first attempt that finishes (success *or* failure) before the hedge
-    delay is returned/raised unchanged via :class:`_PrimaryEarlyFailure`
-    for failures, so sub-threshold behaviour is exactly the sequential
-    path. Once both run, the first success wins and the loser is cancelled.
-    At most one extra in-flight POST per pipeline call is added.
-    """
+    """Race two route attempts and always cancel/join unfinished siblings."""
     first_task = asyncio.ensure_future(first_factory())
-    done, _pending = await asyncio.wait({first_task}, timeout=hedge_after)
-    if first_task in done:
-        try:
-            return first_task.result()
-        except LLMError as exc:
-            raise _PrimaryEarlyFailure(exc) from exc
-    second_task = asyncio.ensure_future(second_factory())
-    pending = {first_task, second_task}
-    errors: dict = {}
-
-    async def _settle_losers() -> None:
-        for loser in list(pending):
-            if loser.done():
-                continue
-            loser.cancel()
+    tasks = {first_task}
+    second_task = None
+    try:
+        done, _pending = await asyncio.wait({first_task}, timeout=hedge_after)
+        if first_task in done:
             try:
-                await loser
-            except (asyncio.CancelledError, LLMError):
-                pass
-            except Exception:  # pragma: no cover - a loser's own error is moot
-                pass
-
-    while pending:
-        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            try:
-                result = task.result()
-            except asyncio.CancelledError:
-                # The task was cancelled from outside: treat it as a failure of
-                # this attempt rather than crashing the race.
-                errors[task] = LLMError("درخواست لغو شد.")
-                continue
+                return first_task.result()
             except LLMError as exc:
-                errors[task] = exc
-                continue
-            except Exception:
-                # A non-LLMError (a bug, a malformed local gateway) must not be
-                # swallowed by the hedged path: stop the sibling and surface it
-                # exactly as the sequential path would.
-                await _settle_losers()
-                raise
-            await _settle_losers()
-            return result
-    raise _HedgedFailures(errors[first_task], errors[second_task])
+                raise _PrimaryEarlyFailure(exc) from exc
+
+        second_task = asyncio.ensure_future(second_factory())
+        tasks.add(second_task)
+        pending = {first_task, second_task}
+        errors: dict[asyncio.Task, LLMError] = {}
+        while pending:
+            done, pending = await asyncio.wait(
+                pending, return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in done:
+                try:
+                    result = task.result()
+                except asyncio.CancelledError:
+                    # The task was cancelled from outside: treat it as a failure
+                    # of this attempt rather than crashing the race.
+                    errors[task] = LLMError("درخواست لغو شد.")
+                    continue
+                except LLMError as exc:
+                    errors[task] = exc
+                    continue
+                # Returning from the try still runs the finally block below,
+                # which cancels and joins the loser before releasing this call.
+                return result
+        raise _HedgedFailures(errors[first_task], errors[second_task])
+    finally:
+        unfinished = [task for task in tasks if not task.done()]
+        for task in unfinished:
+            task.cancel()
+        if unfinished:
+            await asyncio.gather(*unfinished, return_exceptions=True)
 
 
 def _parse_sse_line(line: bytes | str) -> dict | None:
@@ -1352,7 +1369,7 @@ async def _complete_streaming_on_route(
     payload: dict,
     timeout_seconds: float,
 ) -> str:
-    """OpenAI- or Gemini-style streaming completion guarded by a first-byte deadline."""
+    """Parse an SSE response incrementally under a hard body-size ceiling."""
     ttfb_timeout = float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0)
     is_gemini = route.style == "gemini"
     if is_gemini:
@@ -1371,6 +1388,9 @@ async def _complete_streaming_on_route(
     saw_thought = False
     model_version = ""
     raw_fallback_body: bytes | None = None
+    parsed_chunks = 0
+    response_bytes = 0
+
     async with session.post(
         stream_url,
         headers=headers,
@@ -1380,39 +1400,27 @@ async def _complete_streaming_on_route(
         if response.status != 200:
             raise await _error_from_response(route.label, response, route.api_key or None)
         resp_headers = getattr(response, "headers", None)
-        content = getattr(response, "content", None)
-        iterator = content.__aiter__() if hasattr(content, "__aiter__") else None
-        lines: list = []
-        if iterator is not None:
-            try:
-                first_line = await asyncio.wait_for(iterator.__anext__(), timeout=ttfb_timeout)
-            except asyncio.TimeoutError as exc:
-                raise _TTFBTimeoutError(
-                    f"{route.label} در مهلت نخستین بایت پاسخ نداد."
-                ) from exc
-            except StopAsyncIteration:
-                first_line = None
-            ttfb_ms = (time.perf_counter() - started) * 1000.0
-            if first_line is not None:
-                lines.append(first_line)
-                async for line in iterator:
-                    lines.append(line)
-        else:  # Fallback for doubles exposing only read()
-            body = await response.read()
-            raw_fallback_body = body
-            ttfb_ms = (time.perf_counter() - started) * 1000.0
-            lines = body.splitlines()
-        parsed_chunks = 0
-        for line in lines:
+
+        def consume_line(line: bytes | str, *, count_bytes: bool = True) -> None:
+            nonlocal parsed_chunks, response_bytes, finish_reason, usage
+            nonlocal saw_thought, model_version
+            if count_bytes:
+                line_bytes = len(line) if isinstance(line, bytes) else len(str(line).encode("utf-8"))
+                response_bytes += line_bytes
+                if response_bytes > MAX_LLM_RESPONSE_BYTES:
+                    raise LLMResponseError(
+                        "حجم پاسخ سرویس تولید جزوه بیش از حد مجاز بود."
+                    )
             chunk = _parse_sse_line(line)
             if chunk is None:
-                continue
+                return
             parsed_chunks += 1
             error_obj = chunk.get("error")
             if _has_error_content(error_obj):
                 status = _infer_in_body_error_status(error_obj)
                 raise _error_from_payload(
-                    route.label, status, {"error": error_obj}, resp_headers, route.api_key or None
+                    route.label, status, {"error": error_obj}, resp_headers,
+                    route.api_key or None,
                 )
             if is_gemini:
                 if isinstance(chunk.get("usageMetadata"), dict):
@@ -1435,7 +1443,8 @@ async def _complete_streaming_on_route(
                                 continue
                             if "text" in part and part.get("text") is not None:
                                 text_parts.append(str(part.get("text", "")))
-                continue
+                return
+
             if isinstance(chunk.get("usage"), dict):
                 usage = chunk["usage"]
             choices = chunk.get("choices")
@@ -1454,6 +1463,41 @@ async def _complete_streaming_on_route(
                     text_parts.append(str(delta["content"]))
                 elif isinstance(choice.get("message"), dict) and choice["message"].get("content"):
                     text_parts.append(str(choice["message"]["content"]))
+
+        content = getattr(response, "content", None)
+        iterator = (
+            content.__aiter__()
+            if content is not None and hasattr(content, "__aiter__")
+            else None
+        )
+        if iterator is not None:
+            try:
+                if ttfb_timeout > 0:
+                    first_line = await asyncio.wait_for(
+                        iterator.__anext__(), timeout=ttfb_timeout
+                    )
+                else:
+                    first_line = await iterator.__anext__()
+            except asyncio.TimeoutError as exc:
+                raise _TTFBTimeoutError(
+                    f"{route.label} در مهلت نخستین بایت پاسخ نداد."
+                ) from exc
+            except StopAsyncIteration:
+                first_line = None
+            ttfb_ms = (time.perf_counter() - started) * 1000.0
+            if first_line is not None:
+                consume_line(first_line)
+                async for line in iterator:
+                    consume_line(line)
+        else:  # Compatibility for doubles exposing only read().
+            raw_fallback_body = await _read_bounded_body(
+                response, MAX_LLM_RESPONSE_BYTES
+            )
+            response_bytes = len(raw_fallback_body)
+            ttfb_ms = (time.perf_counter() - started) * 1000.0
+            for line in raw_fallback_body.splitlines():
+                consume_line(line, count_bytes=False)
+
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     if parsed_chunks == 0 and raw_fallback_body:
         try:
@@ -1817,7 +1861,7 @@ async def _dispatch_across_routes(
                     )
                 indexed_routes = indexed_routes[2:]
 
-    previous_failed_slug: str | None = failures and routes[0].slug or None  # type: ignore[assignment]
+    previous_failed_slug: str | None = routes[0].slug if failures else None
     wait_timeout = float(getattr(settings, "llm_slot_wait_timeout", 30.0))
 
     while indexed_routes:

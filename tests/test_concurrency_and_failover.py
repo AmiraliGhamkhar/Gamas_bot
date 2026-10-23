@@ -556,13 +556,14 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
         events: dict[int, FakeJobEvent] = {}
 
         class _RoutingClient:
-            async def send_file(self, chat_id, path: str, *, caption=None, force_document=False, reply_to=None, buttons=None):  # noqa: ARG002
+            async def send_file(self, chat_id, file, *, caption=None, force_document=False, file_size=None, reply_to=None, buttons=None):  # noqa: ARG002
                 target_ev = events[int(chat_id)]
                 await target_ev.client.send_file(
                     chat_id,
-                    path,
+                    file,
                     caption=caption,
                     force_document=force_document,
+                    file_size=file_size,
                     reply_to=reply_to,
                     buttons=buttons,
                 )

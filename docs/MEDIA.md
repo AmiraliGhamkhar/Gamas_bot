@@ -5,11 +5,14 @@ LibreOffice is used; install the Python packages from `requirements.txt`.
 
 ## Limits
 
-- `MAX_FILE_SIZE` caps downloads; the bot checks the reported size, the download progress and the
-  final file size.
+- `MAX_FILE_SIZE` caps downloads (default 128 MiB); the bot checks the reported size, the download
+  progress and the final file size. `MAX_MEDIA_DURATION_SECONDS` defaults to 7,200 seconds and is
+  checked from Telegram metadata and the media probe before transcription.
 - `DOWNLOAD_STALL_SECONDS` (default 300) aborts a Telegram download that produces no bytes.
-- `TEMP_MIN_FREE_BYTES` (default 2 GiB) must remain free on `TEMP_DIR` before a download starts.
-  The check counts the source and the prepared audio.
+- `TEMP_MIN_FREE_BYTES` (default 64 MiB) must remain free on `TEMP_DIR` before a download starts.
+  The check also reserves room for the source and its prepared-audio working copy.
+- Telegram downloads and generated uploads use async file streams; disk reads/writes run in bounded
+  thread-pool operations rather than blocking the event loop.
 - `MEDIA_TIMEOUT` bounds one media operation, `CONVERT_TIMEOUT` bounds legacy `.ppt` conversion.
   `--check` warns when `MEDIA_TIMEOUT` is too short for a multi-hour lecture.
 - `MEDIA_WORKER_CONCURRENCY` limits CPU/disk-heavy jobs at once. Use `1` on shared hosting.

@@ -741,7 +741,7 @@ class ShippedDefaultTests(unittest.TestCase):
     def test_note_performance_defaults(self):
         self.assertEqual(self.settings.note_ttfb_timeout, 25.0)
         self.assertEqual(self.settings.note_hedge_after, 60.0)
-        self.assertEqual(self.settings.note_concurrency, 6)
+        self.assertEqual(self.settings.note_concurrency, 3)
         self.assertTrue(self.settings.note_structured_output)
         self.assertTrue(self.settings.note_progressive_booklet)
         self.assertTrue(self.settings.note_openrouter_throughput)

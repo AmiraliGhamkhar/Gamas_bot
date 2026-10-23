@@ -50,20 +50,22 @@ cron job cannot create a second database or session.
 | `DOWNLOAD_TIMEOUT_SECONDS`, `UPLOAD_TIMEOUT_SECONDS` | Stage deadlines for Telegram download (`900` s) and upload (`600` s). |
 | `DEDUP_WINDOW_SECONDS` | Duplicate Telegram update & duplicate active file suppression window (`120` s). |
 | `MAX_ACTIVE_JOBS_PER_USER` | Per-user admission cap (default `2`); stops several uploads the balance cannot cover. |
-| `MAX_FILE_SIZE` | Download ceiling (default 2 GiB). Lower it to fit host disk/upload limits. |
-| `TEMP_MIN_FREE_BYTES` | Free space that must remain on `TEMP_DIR` before a download (default 2 GiB). |
+| `MAX_FILE_SIZE` | Download ceiling (default 128 MiB) so one upload plus working copies fits modest shared hosting. Raise only after checking Telegram and disk limits. |
+| `TEMP_MIN_FREE_BYTES` | Free space that must remain on `TEMP_DIR` before a download (default 64 MiB); the downloader also reserves room for copies. |
 | `DOWNLOAD_STALL_SECONDS` | Abort a Telegram download with no progress for this long (default `300`). |
 | `MEDIA_WORKER_CONCURRENCY` | Heavy media jobs at once. Use `1` on shared hosting. |
 | `AUDIO_FORMAT_POLICY` | `auto` (default) picks WAV or Opus from encoder CPU + measured transfer rate; `wav`/`opus` force one. |
-| `STT_TRANSFER_TIMEOUT_SECONDS`, `MAX_STT_RESPONSE_BYTES` | One transfer deadline (default `600`) and response ceiling (default 64 MiB). |
-| `NOTE_MAX_OUTPUT_TOKENS`, `NOTE_REQUEST_TIMEOUT_SECONDS` | Output budget (default 16384) and request deadline (default 900). Keep the deadline longer than the time the budget needs on the slowest model. |
-| `NOTE_CONCURRENCY` | Parallel map requests (default `6`, capped at chunks and 8). Lower it for low-RPM providers. |
+| `STT_TRANSFER_TIMEOUT_SECONDS`, `MAX_STT_RESPONSE_BYTES` | One transfer deadline (default `600`) and response ceiling (default 64 MiB); file uploads stream from disk. |
+| `NOTE_MAX_OUTPUT_TOKENS`, `NOTE_REQUEST_TIMEOUT_SECONDS` | Output budget (default 16384) and request deadline (default 900). LLM response bodies are capped at 16 MiB and streamed incrementally. |
+| `NOTE_CONCURRENCY` | Parallel note-map requests (default `3`, capped at chunks and 8). Lower it for low-RPM providers or shared hosting. |
+| `NOTE_HEDGE_AFTER_SECONDS` | Start a second configured route only after this delay (default `60` seconds); this can spend extra provider quota. |
 | `NOTE_STRUCTURED_OUTPUT` | `1` asks for schema-constrained JSON; a provider that rejects it is retried once without it. |
 | `NOTE_PROGRESSIVE_BOOKLET` | `1` delivers the audited merge as a draft while the editorial compile runs. |
 | `NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE` | Evidence checks (`true`/`repair` by default). See [Note quality](NOTE_QUALITY.md). |
 | `RAW_FALLBACK_FILE_CHARS`, `RAW_FALLBACK_MAX_FILES` | Part size and count when a long raw `.txt` upload fails. |
 | `OFFICE_ENABLED`, `OFFICE_MAX_CHARS`, `OFFICE_MIN_INTERVAL_SECONDS` | Free Office on/off, document limit and per-user throttle. |
-| `PRESENTATION_MAX_*` | Deck clip/duration/unpacked/temp limits. |
+| `MAX_MEDIA_DURATION_SECONDS` | Maximum accepted audio/video duration (default 7,200 seconds / 2 hours), checked from Telegram metadata and media probes. |
+| `PRESENTATION_MAX_*` | Deck limits (defaults: 50 clips, 2 hours total, 128 MiB unpacked, 256 MiB temporary). |
 | `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME` | Set all three to enable card-to-card purchases. |
 | `RECEIPT_RETENTION_DAYS` | Delete receipt images after this many days (default `90`); the payment row remains. |
 | `TRANSCRIPT_RETENTION_DAYS` | Delete finished transcript text after this many days (`0` = keep forever). |

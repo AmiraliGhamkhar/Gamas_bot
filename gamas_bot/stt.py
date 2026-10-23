@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover - optional fast-path
     _orjson = None  # type: ignore[assignment]
 
 from .capacity import CapacityOverloadError, pool_for, reset_pools
+from .fileio import AsyncFilePayload, run_file_io
 from .config import (
     DEEPGRAM_MAX_UPLOAD,
     OPENAI_STT_MAX_UPLOAD,
@@ -243,10 +244,10 @@ def _transfer_timeout(settings: Settings) -> aiohttp.ClientTimeout:
 #: value explicitly.
 DEFAULT_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
-#: Read/upload buffer size for large audio and JSON streams (matches aiohttp's
-#: 256 KiB payload chunk size while reducing OS read syscalls).
-AUDIO_UPLOAD_BUFFER_BYTES = 1024 * 1024
+#: Provider response read chunks; audio upload chunks use ``fileio.FILE_IO_CHUNK_BYTES``.
 RESPONSE_READ_CHUNK_BYTES = 256 * 1024
+#: Best-effort Speechmatics job cancellation must not pin a provider slot.
+SPEECHMATICS_DELETE_TIMEOUT_SECONDS = 5.0
 
 
 def _json_loads(raw: bytes | str) -> object:
@@ -321,7 +322,7 @@ async def _json_response(
 
 def _optional_float(value: object) -> float | None:
     """Convert finite numeric timing/confidence values; ignore invalid values."""
-    if value is None or isinstance(value, bool):
+    if value is None or isinstance(value, bool) or not isinstance(value, (int, float, str)):
         return None
     try:
         result = float(value)
@@ -567,25 +568,27 @@ async def _speechmatics(
     }
     form = aiohttp.FormData()
     form.add_field("config", _json_dumps_str(config), content_type="application/json")
-    with audio_path.open("rb", buffering=AUDIO_UPLOAD_BUFFER_BYTES) as audio:
-        form.add_field(
-            "data_file", audio, filename=audio_path.name,
-            content_type="application/octet-stream",
-        )
-        async with session.post(
-            f"{settings.speechmatics_base_url}/jobs",
-            headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
-            params=_speechmatics_wait_params(settings, output_format="json-v2"),
-            data=form,
-            timeout=_transfer_timeout(settings),
-        ) as response:
-            if response.status not in (200, 201, 202):
-                raise await _error_from_response(
-                    "Speechmatics", response, api_key=settings.speechmatics_api_key
-                )
-            payload = await _json_response(
-                "Speechmatics", response, max_bytes=settings.max_stt_response_bytes
+    audio_payload = await AsyncFilePayload.from_path(
+        audio_path, content_type="application/octet-stream"
+    )
+    form.add_field(
+        "data_file", audio_payload, filename=audio_path.name,
+        content_type="application/octet-stream",
+    )
+    async with session.post(
+        f"{settings.speechmatics_base_url}/jobs",
+        headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
+        params=_speechmatics_wait_params(settings, output_format="json-v2"),
+        data=form,
+        timeout=_transfer_timeout(settings),
+    ) as response:
+        if response.status not in (200, 201, 202):
+            raise await _error_from_response(
+                "Speechmatics", response, api_key=settings.speechmatics_api_key
             )
+        payload = await _json_response(
+            "Speechmatics", response, max_bytes=settings.max_stt_response_bytes
+        )
     if not isinstance(payload, dict):
         raise STTError("Speechmatics پاسخ ایجاد پردازش را با ساختار قابل‌خواندن برنگرداند.")
     job_id = payload.get("id")
@@ -629,16 +632,23 @@ async def _cancel_speechmatics_job(
     delete = getattr(session, "delete", None)
     if delete is None:
         return
+    timeout = SPEECHMATICS_DELETE_TIMEOUT_SECONDS
     try:
-        async with delete(
-            f"{settings.speechmatics_base_url}/jobs/{quote(job_id, safe='')}",
-            headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
-        ) as response:
-            logger.info(
-                "Speechmatics job cancelled job_id=%s status=%s", job_id, response.status
-            )
-    except Exception:
-        logger.warning("could not cancel Speechmatics job_id=%s", job_id, exc_info=True)
+        async with asyncio.timeout(timeout):
+            async with delete(
+                f"{settings.speechmatics_base_url}/jobs/{quote(job_id, safe='')}",
+                headers={"Authorization": f"Bearer {settings.speechmatics_api_key}"},
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as response:
+                logger.info(
+                    "Speechmatics job cancelled job_id=%s status=%s",
+                    job_id, response.status,
+                )
+    except Exception as exc:
+        logger.warning(
+            "could not cancel Speechmatics job_id=%s error=%s",
+            job_id, type(exc).__name__,
+        )
 
 
 async def _get_json(
@@ -829,24 +839,26 @@ async def _deepgram(
         params["detect_language"] = "true"
     elif language:
         params["language"] = language
-    with audio_path.open("rb", buffering=AUDIO_UPLOAD_BUFFER_BYTES) as audio:
-        async with session.post(
-            _endpoint(settings.deepgram_base_url, "listen"),
-            params=params,
-            headers={
-                "Authorization": f"Token {settings.deepgram_api_key}",
-                "Content-Type": _audio_content_type(audio_path),
-            },
-            data=audio,
-            timeout=_transfer_timeout(settings),
-        ) as response:
-            if response.status != 200:
-                raise await _error_from_response(
-                    "Deepgram", response, api_key=settings.deepgram_api_key
-                )
-            payload = await _json_response(
-                "Deepgram", response, max_bytes=settings.max_stt_response_bytes
+    audio_payload = await AsyncFilePayload.from_path(
+        audio_path, content_type=_audio_content_type(audio_path)
+    )
+    async with session.post(
+        _endpoint(settings.deepgram_base_url, "listen"),
+        params=params,
+        headers={
+            "Authorization": f"Token {settings.deepgram_api_key}",
+            "Content-Type": _audio_content_type(audio_path),
+        },
+        data=audio_payload,
+        timeout=_transfer_timeout(settings),
+    ) as response:
+        if response.status != 200:
+            raise await _error_from_response(
+                "Deepgram", response, api_key=settings.deepgram_api_key
             )
+        payload = await _json_response(
+            "Deepgram", response, max_bytes=settings.max_stt_response_bytes
+        )
     return _deepgram_transcript(payload)
 
 
@@ -908,31 +920,33 @@ async def _openai_compatible(
     form.add_field("response_format", "verbose_json")
     retry_plain = False
     payload: object = None
-    with audio_path.open("rb", buffering=AUDIO_UPLOAD_BUFFER_BYTES) as audio:
-        form.add_field(
-            "file", audio, filename=audio_path.name,
-            content_type=_audio_content_type(audio_path),
-        )
-        async with session.post(
-            _endpoint(settings.stt_openai_base_url, "audio/transcriptions"),
-            headers={"Authorization": f"Bearer {settings.stt_openai_api_key}"},
-            data=form,
-            timeout=_transfer_timeout(settings),
-        ) as response:
-            if response.status != 200:
-                body = await read_error_body(response)
-                retry_plain = response.status == 400 and _rejects_verbose_json(body)
-                if not retry_plain:
-                    raise await _error_from_response(
-                        "سرویس تبدیل گفتار", response,
-                        api_key=settings.stt_openai_api_key, body=body,
-                    )
-            else:
-                payload = await _json_response(
-                    "سرویس تبدیل گفتار",
-                    response,
-                    max_bytes=settings.max_stt_response_bytes,
+    audio_payload = await AsyncFilePayload.from_path(
+        audio_path, content_type=_audio_content_type(audio_path)
+    )
+    form.add_field(
+        "file", audio_payload, filename=audio_path.name,
+        content_type=_audio_content_type(audio_path),
+    )
+    async with session.post(
+        _endpoint(settings.stt_openai_base_url, "audio/transcriptions"),
+        headers={"Authorization": f"Bearer {settings.stt_openai_api_key}"},
+        data=form,
+        timeout=_transfer_timeout(settings),
+    ) as response:
+        if response.status != 200:
+            body = await read_error_body(response)
+            retry_plain = response.status == 400 and _rejects_verbose_json(body)
+            if not retry_plain:
+                raise await _error_from_response(
+                    "سرویس تبدیل گفتار", response,
+                    api_key=settings.stt_openai_api_key, body=body,
                 )
+        else:
+            payload = await _json_response(
+                "سرویس تبدیل گفتار",
+                response,
+                max_bytes=settings.max_stt_response_bytes,
+            )
     if retry_plain:
         logger.info("openai_compatible rejected verbose_json; retrying plain")
         return await _openai_plain(session, audio_path, settings, language)
@@ -950,24 +964,26 @@ async def _openai_plain(
     if language:
         form.add_field("language", language)
     form.add_field("response_format", "json")
-    with audio_path.open("rb", buffering=AUDIO_UPLOAD_BUFFER_BYTES) as audio:
-        form.add_field(
-            "file", audio, filename=audio_path.name,
-            content_type=_audio_content_type(audio_path),
-        )
-        async with session.post(
-            _endpoint(settings.stt_openai_base_url, "audio/transcriptions"),
-            headers={"Authorization": f"Bearer {settings.stt_openai_api_key}"},
-            data=form,
-            timeout=_transfer_timeout(settings),
-        ) as response:
-            if response.status != 200:
-                raise await _error_from_response(
-                    "سرویس تبدیل گفتار", response, api_key=settings.stt_openai_api_key
-                )
-            payload = await _json_response(
-                "سرویس تبدیل گفتار", response, max_bytes=settings.max_stt_response_bytes
+    audio_payload = await AsyncFilePayload.from_path(
+        audio_path, content_type=_audio_content_type(audio_path)
+    )
+    form.add_field(
+        "file", audio_payload, filename=audio_path.name,
+        content_type=_audio_content_type(audio_path),
+    )
+    async with session.post(
+        _endpoint(settings.stt_openai_base_url, "audio/transcriptions"),
+        headers={"Authorization": f"Bearer {settings.stt_openai_api_key}"},
+        data=form,
+        timeout=_transfer_timeout(settings),
+    ) as response:
+        if response.status != 200:
+            raise await _error_from_response(
+                "سرویس تبدیل گفتار", response, api_key=settings.stt_openai_api_key
             )
+        payload = await _json_response(
+            "سرویس تبدیل گفتار", response, max_bytes=settings.max_stt_response_bytes
+        )
     return _openai_transcript(payload)
 
 
@@ -1138,7 +1154,7 @@ async def transcribe(
     if not settings.stt_providers:
         raise STTConfigurationError("هیچ سرویس تبدیل گفتاری پیکربندی نشده است.")
     try:
-        size = audio_path.stat().st_size
+        size = (await run_file_io(audio_path.stat)).st_size
     except OSError as exc:
         raise STTInvalidInputError("فایل صوتی برای تبدیل گفتار قابل‌خواندن نیست.") from exc
     if size <= 0:
