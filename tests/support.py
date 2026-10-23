@@ -503,6 +503,18 @@ def make_settings(**overrides) -> Settings:
         plan_50_hours=50,
         plan_50_price_toman=250_000,
         plan_50_validity_days=30,
+        max_concurrent_downloads=2,
+        max_concurrent_uploads=2,
+        stt_fallback_enabled=True,
+        speechmatics_max_in_flight=2,
+        deepgram_max_in_flight=4,
+        stt_openai_max_in_flight=2,
+        stt_provider_timeout=1800.0,
+        stt_slot_wait_timeout=15.0,
+        llm_primary_max_in_flight=4,
+        llm_fallback_max_in_flight=4,
+        llm_slot_wait_timeout=30.0,
+        dedup_window_seconds=120.0,
         plan_values={},
     )
     return replace(base, **overrides) if overrides else base

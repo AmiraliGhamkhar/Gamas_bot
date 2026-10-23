@@ -70,6 +70,7 @@ from .docx_export import (
 )
 from .jobs import Job, JobQueue, QueueFullError
 from .logging_config import log_job_id
+from .metrics import METRICS
 from .media import (
     MediaInfo,
     MediaToolError,
@@ -803,7 +804,11 @@ class GamasBot:
             max_active=settings.max_active_jobs,
             worker=self._run_job,
         )
+        self._download_semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
         self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
+        self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_uploads)
+        self._seen_messages: dict[tuple[int, int], float] = {}
+        self._active_upload_keys: dict[tuple[int, str], str] = {}
         self._receipt_cleanup_task: asyncio.Task | None = None
         self._transcript_cleanup_task: asyncio.Task | None = None
         self._prewarm_task: asyncio.Task | None = None
@@ -1789,12 +1794,16 @@ class GamasBot:
         # Presentations.
         pkind, pfilename = _presentation_metadata(event.message)
         if pkind is not None:
+            if await self._is_duplicate_upload(event, user_id):
+                return
             await self._accept_presentation(event, user_id, pkind, pfilename)
             return
 
         # Media.
         kind, filename, duration = _media_metadata(event.message)
         if kind is not None:
+            if await self._is_duplicate_upload(event, user_id):
+                return
             await self._accept_media(event, user_id, kind, filename, duration)
             return
 
@@ -1971,6 +1980,72 @@ class GamasBot:
             return
         logger.info("accepted presentation submission=%s user=%s", submission_id, user_id)
 
+    def _prune_dedup_maps(self, now: float) -> None:
+        expired = [key for key, exp in self._seen_messages.items() if exp <= now]
+        for key in expired:
+            self._seen_messages.pop(key, None)
+        while len(self._seen_messages) > 2048:
+            oldest = next(iter(self._seen_messages))
+            self._seen_messages.pop(oldest, None)
+
+    @staticmethod
+    def _upload_fingerprint(message: object) -> str | None:
+        if message is None:
+            return None
+        doc = getattr(message, "document", None)
+        doc_id = getattr(doc, "id", None) if doc is not None else None
+        if isinstance(doc_id, int) and doc_id > 0:
+            return f"doc:{doc_id}"
+        photo = getattr(message, "photo", None)
+        photo_id = getattr(photo, "id", None) if photo is not None else None
+        if isinstance(photo_id, int) and photo_id > 0:
+            return f"photo:{photo_id}"
+        return None
+
+    async def _is_duplicate_upload(self, event, user_id: int) -> bool:
+        window = float(self.settings.dedup_window_seconds)
+        if window <= 0:
+            return False
+        now = time.monotonic()
+        self._prune_dedup_maps(now)
+        msg = getattr(event, "message", None)
+        msg_id = getattr(msg, "id", None)
+        chat_id = getattr(event, "chat_id", None) or user_id
+        if isinstance(msg_id, int) and msg_id > 0:
+            msg_key = (int(chat_id), msg_id)
+            if self._seen_messages.get(msg_key, 0.0) > now:
+                METRICS.record_deduplicated()
+                logger.info(
+                    "deduplicated repeated telegram update user=%s chat=%s msg=%s",
+                    user_id,
+                    chat_id,
+                    msg_id,
+                )
+                return True
+            self._seen_messages[msg_key] = now + window
+
+        fp = self._upload_fingerprint(msg)
+        if fp is not None and (user_id, fp) in self._active_upload_keys:
+            METRICS.record_deduplicated()
+            logger.info(
+                "deduplicated concurrent identical file user=%s existing_job=%s",
+                user_id,
+                self._active_upload_keys[(user_id, fp)],
+            )
+            await event.reply(
+                "⏳ این فایل هم‌اکنون در صف پردازش شما قرار دارد؛ لطفاً تا پایان پردازش منتظر بمانید."
+            )
+            return True
+        return False
+
+    def runtime_metrics(self) -> dict[str, object]:
+        """Point-in-time snapshot combining pipeline telemetry and live queue state."""
+        snap = METRICS.snapshot()
+        snap["queue_pending"] = self.queue.pending
+        snap["queue_active"] = self.queue.active_count
+        snap["in_flight_jobs"] = self.queue.active_snapshot()
+        return snap
+
     @staticmethod
     def _reserve_estimate(duration: float | None) -> int:
         if duration is None or duration <= 0:
@@ -1980,10 +2055,14 @@ class GamasBot:
     # ------------------------------------------------------------ job worker
     async def _run_job(self, job: Job) -> None:
         progress: JobProgress | None = job.meta.get("progress")
-        log_token = log_job_id.set(f"GMS-{job.submission_id}")
+        log_token = log_job_id.set(job.job_id)
+        fp = self._upload_fingerprint(job.message)
+        if fp is not None:
+            self._active_upload_keys[(job.user_id, fp)] = job.job_id
         workdir: Path | None = None
         try:
             if await self.db.is_banned(job.user_id):
+                job.transition_to("cancelled")
                 await self._release(job, "user banned before processing")
                 await self.db.set_submission_status(job.submission_id, "rejected", error="user banned")
                 await self._reply(job, "⛔ درخواست صف‌شده به دلیل مسدودی حساب لغو شد.")
@@ -1999,7 +2078,9 @@ class GamasBot:
                 await self._process_office(job, workdir, progress)
             else:
                 await self._process_media(job, workdir, progress)
+            job.transition_to("completed")
         except InsufficientBalanceError as exc:
+            job.transition_to("failed")
             await self.db.set_submission_status(
                 job.submission_id, "failed",
                 error=f"insufficient balance: {exc}",
@@ -2013,6 +2094,7 @@ class GamasBot:
                 "از «💳 خرید اشتراک» اعتبار بگیرید."
             ))
         except USER_VISIBLE_ERRORS as exc:
+            job.transition_to("failed")
             await self._release(job, "user-visible failure")
             await self.db.set_submission_status(
                 job.submission_id, "failed", error=str(exc)[:500]
@@ -2024,6 +2106,7 @@ class GamasBot:
             )
             await self._reply(job, f"❌ {safe_msg}")
         except STTError as exc:
+            job.transition_to("failed")
             await self._release(job, "stt failure")
             await self.db.set_submission_status(
                 job.submission_id, "failed", error=str(exc)[:500]
@@ -2035,27 +2118,31 @@ class GamasBot:
             )
             await self._reply(job, f"❌ تبدیل گفتار به متن انجام نشد: {safe_msg}")
         except asyncio.CancelledError:
+            job.transition_to("cancelled")
             await self._release(job, "cancelled")
             await self.db.set_submission_status(
                 job.submission_id, "failed", error="cancelled"
             )
             raise
         except Exception as exc:
+            job.transition_to("failed")
             await self._release(job, f"unexpected: {type(exc).__name__}")
             await self.db.set_submission_status(
                 job.submission_id, "failed", error=f"{type(exc).__name__}: {exc}"[:500]
             )
-            logger.exception("job failed submission=%s", job.submission_id)
+            logger.exception("job failed job_id=%s submission=%s", job.job_id, job.submission_id)
             if progress:
                 await progress.fail(str(job.submission_id))
             await self._reply(
                 job, "❌ خطای داخلی رخ داد و پردازش تکمیل نشد. لطفاً دوباره تلاش کنید."
             )
         finally:
+            if fp is not None:
+                self._active_upload_keys.pop((job.user_id, fp), None)
             if progress:
                 await progress.aclose()
             if workdir is not None:
-                shutil.rmtree(workdir, ignore_errors=True)
+                await asyncio.to_thread(shutil.rmtree, workdir, True)
             log_job_id.reset(log_token)
 
     async def _release(self, job: Job, reason: str) -> bool:
@@ -2081,31 +2168,43 @@ class GamasBot:
         source_path = workdir / f"source{suffix}"
         upload_bytes = _reported_upload_bytes(job.message, self.settings.max_file_size)
         # The download and the prepared audio can both exist at once.
-        _ensure_disk_headroom(
+        await asyncio.to_thread(
+            _ensure_disk_headroom,
             self.settings.temp_dir,
             upload_bytes * 2,
             reserve_bytes=self.settings.temp_min_free_bytes,
         )
+        job.transition_to("downloading")
         await progress.update(20, "دریافت فایل از تلگرام")
         download_started = time.monotonic()
         try:
-            await _download_media_limited(
-                job.message,
-                source_path,
-                self.settings.max_file_size,
-                stall_seconds=self.settings.download_stall_seconds,
-                client=self.client,
-                connections=self.settings.telegram_download_connections,
-            )
+            async with self._download_semaphore:
+                await asyncio.wait_for(
+                    _download_media_limited(
+                        job.message,
+                        source_path,
+                        self.settings.max_file_size,
+                        stall_seconds=self.settings.download_stall_seconds,
+                        client=self.client,
+                        connections=self.settings.telegram_download_connections,
+                    ),
+                    timeout=self.settings.download_timeout,
+                )
+        except asyncio.TimeoutError as exc:
+            raise ValueError(
+                "مهلت دریافت فایل از تلگرام به پایان رسید؛ لطفاً دوباره تلاش کنید."
+            ) from exc
         except UploadTooLargeError as exc:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc
-        if source_path.stat().st_size > self.settings.max_file_size:
+        source_size = await asyncio.to_thread(lambda p=source_path: p.stat().st_size)
+        if source_size > self.settings.max_file_size:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
         # The download is the only transfer rate this job measures for free, so
         # it seeds the format decision below (``AUDIO_FORMAT_POLICY=auto``).
         download_seconds = max(0.001, time.monotonic() - download_started)
-        egress_bytes_per_second = source_path.stat().st_size / download_seconds
+        egress_bytes_per_second = source_size / download_seconds
 
+        job.transition_to("extracting")
         await progress.update(35, "بررسی و آماده‌سازی صدا")
         source_info = await self._run_media_operation(
             probe_media, source_path, self.settings
@@ -2119,7 +2218,8 @@ class GamasBot:
             info=source_info,
             egress_bytes_per_second=egress_bytes_per_second,
         )
-        if audio_path.stat().st_size > self.settings.max_file_size:
+        audio_size = await asyncio.to_thread(lambda p=audio_path: p.stat().st_size)
+        if audio_size > self.settings.max_file_size:
             raise ValueError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
 
         if source_info.duration is not None or audio_path == source_path:
@@ -2130,14 +2230,13 @@ class GamasBot:
             )
         duration = info.duration or job.duration_hint
         if not duration or duration <= 0:
-            # Billing.md promises an unmeasurable duration is refused, not
-            # reserved at a guess and settled at zero (audit F-21).
             raise ValueError(
                 "مدت فایل مشخص نشد؛ امکان پردازش آن وجود ندارد."
             )
         needed = self._reserve_estimate(duration)
         await self.db.reserve(job.user_id, job.submission_id, needed)
 
+        job.transition_to("transcribing")
         await progress.update(50, "تبدیل گفتار به متن")
         try:
             raw = await transcribe(audio_path, self.settings, session=self._http_session())
@@ -2146,6 +2245,7 @@ class GamasBot:
             raise
         document = build_document(raw)
 
+        job.transition_to("uploading")
         await progress.update(75, "ارسال متن گفتار")
         await self.db.set_submission_status(
             job.submission_id, "processing", duration_seconds=duration
@@ -2158,8 +2258,6 @@ class GamasBot:
         )
         # ---- PROGRESSIVE DELIVERY: the raw text goes out before the notes. ----
         raw_text = render_transcript(document, self.settings.raw_text_profile)
-        # Persist before delivering: a Telegram outage must not lose a finished
-        # transcription (the work is done, the row is what an operator disputes).
         raw_path = workdir / raw_text_filename(reference)
         await asyncio.gather(
             self.db.save_transcription(
@@ -2179,6 +2277,7 @@ class GamasBot:
             await progress.complete("متن کامل گفتار ارسال شد.")
             return
 
+        job.transition_to("generating_notes")
         await progress.update(85, "تولید جزوهٔ ساختارمند")
         notes = await self._generate_notes(
             document.llm_document(),
@@ -2193,6 +2292,7 @@ class GamasBot:
             job.submission_id, engine=raw.engine, text=document.plain(),
             notes_json=notes.to_json() if notes else "",
         )
+        job.transition_to("uploading")
         await self._deliver_booklet(job, workdir, notes, document, reference, meta, progress)
 
     async def _prepare_audio(
@@ -2255,26 +2355,38 @@ class GamasBot:
         source_path = workdir / f"source{suffix}"
         upload_bytes = _reported_upload_bytes(job.message, self.settings.max_file_size)
         # The deck and the clips unpacked from it coexist in the workdir.
-        _ensure_disk_headroom(
+        await asyncio.to_thread(
+            _ensure_disk_headroom,
             self.settings.temp_dir,
             upload_bytes * 2,
             reserve_bytes=self.settings.temp_min_free_bytes,
         )
+        job.transition_to("downloading")
         await progress.update(20, "دریافت فایل از تلگرام")
         try:
-            await _download_media_limited(
-                job.message,
-                source_path,
-                self.settings.max_file_size,
-                stall_seconds=self.settings.download_stall_seconds,
-            )
+            async with self._download_semaphore:
+                await asyncio.wait_for(
+                    _download_media_limited(
+                        job.message,
+                        source_path,
+                        self.settings.max_file_size,
+                        stall_seconds=self.settings.download_stall_seconds,
+                    ),
+                    timeout=self.settings.download_timeout,
+                )
+        except asyncio.TimeoutError as exc:
+            raise ValueError(
+                "مهلت دریافت فایل از تلگرام به پایان رسید؛ لطفاً دوباره تلاش کنید."
+            ) from exc
         except UploadTooLargeError as exc:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.") from exc
-        if source_path.stat().st_size > self.settings.max_file_size:
+        deck_size = await asyncio.to_thread(lambda p=source_path: p.stat().st_size)
+        if deck_size > self.settings.max_file_size:
             raise ValueError("این فایل از سقف حجم ربات بزرگ‌تر است.")
-        if source_path.stat().st_size > self.settings.presentation_max_temp_bytes:
+        if deck_size > self.settings.presentation_max_temp_bytes:
             raise PresentationError("حجم فایل موقت ارائه از سقف تعیین‌شده بیشتر است.")
 
+        job.transition_to("extracting")
         conversion_warnings: list[str] = []
         if job.meta.get("presentation_kind") == "legacy":
             await progress.update(30, "تبدیل قالب قدیمی ارائه")
@@ -2355,6 +2467,7 @@ class GamasBot:
             duration = prepared.source_duration  # synthetic silence is not billed
             needed = self._reserve_estimate(duration)
             await self.db.reserve(job.user_id, job.submission_id, needed)
+            job.transition_to("transcribing")
             await progress.update(55, "تبدیل صدای ارائه به متن")
             try:
                 raw = await transcribe(
@@ -2392,6 +2505,7 @@ class GamasBot:
         # The raw text is persisted and delivered before the credit is settled,
         # exactly like the media pipeline: a delivery failure must not leave a
         # billed job without its transcript in the user's chat.
+        job.transition_to("uploading")
         await progress.update(70, "ارسال متن خام")
         raw_text = "\n\n\n".join(part for part in raw_text_parts if part.strip())
         # Include skip reasons when any clip was dropped, so the user knows
@@ -2429,6 +2543,7 @@ class GamasBot:
             await progress.complete("متن کامل ارائه ارسال شد.")
             return
 
+        job.transition_to("generating_notes")
         await progress.update(85, "تولید جزوهٔ ساختارمند")
         transcript_text = narration_text
         presentation_text = build_presentation_document(outline, transcript_text)
@@ -2441,6 +2556,7 @@ class GamasBot:
             text=raw_text,
             notes_json=notes.to_json() if notes else "",
         )
+        job.transition_to("uploading")
         await self._deliver_booklet(
             job,
             workdir,
@@ -2762,13 +2878,32 @@ class GamasBot:
         """
         if job.message is None:
             raise RuntimeError("پیام کاربر برای ارسال فایل در دسترس نیست.")
-        await self.client.send_file(
-            await job.message.get_input_chat(),
-            str(path),
-            caption=caption[:TELEGRAM_CAPTION_LIMIT] or None,
-            force_document=True,
-            reply_to=job.message.id,
-        )
+        target = await job.message.get_input_chat()
+        caption_arg = caption[:TELEGRAM_CAPTION_LIMIT] or None
+        async with self._upload_semaphore:
+            for attempt in range(2):
+                try:
+                    await asyncio.wait_for(
+                        self.client.send_file(
+                            target,
+                            str(path),
+                            caption=caption_arg,
+                            force_document=True,
+                            reply_to=job.message.id,
+                        ),
+                        timeout=self.settings.upload_timeout,
+                    )
+                    return
+                except FloodWaitError as exc:
+                    wait_seconds = float(getattr(exc, "seconds", 0) or 0)
+                    if attempt == 0 and 0 < wait_seconds <= 15.0:
+                        logger.warning(
+                            "Telegram FloodWait %.1fs on send_file; retrying once",
+                            wait_seconds,
+                        )
+                        await asyncio.sleep(wait_seconds)
+                        continue
+                    raise
 
     async def _deliver_raw(
         self, job: Job, raw_text: str, raw_path: Path, reference: str
@@ -3407,6 +3542,15 @@ class GamasBot:
     async def _show_admin_overview(self, event) -> None:
         stats = await self.db.stats()
         pending = await self.db.count_pending_review_payments()
+        runtime = self.runtime_metrics()
+        stt_providers = runtime.get("providers", {}).get("stt", {})  # type: ignore[union-attr]
+        llm_providers = runtime.get("providers", {}).get("llm", {})  # type: ignore[union-attr]
+        stt_failovers = sum(
+            int(v.get("failovers_in", 0)) for v in stt_providers.values()
+        )
+        llm_failovers = sum(
+            int(v.get("failovers_in", 0)) for v in llm_providers.values()
+        )
         text = (
             "🛠 پنل مدیریت | آمار و وضعیت\n\n"
             f"👥 کاربران ثبت‌شده: {to_persian_digits(stats['users'])}\n"
@@ -3420,7 +3564,10 @@ class GamasBot:
             f"💰 مجموع مبالغ پرداختیِ تأییدشده: "
             f"{format_toman(stats['toman_approved'])}\n"
             f"🧾 پرداخت‌های نیازمند بررسی: {to_persian_digits(pending)}\n\n"
-            f"📥 درخواست‌های منتظر در صف فعلی: {to_persian_digits(self.queue.pending)}"
+            f"📥 درخواست‌های منتظر در صف فعلی: {to_persian_digits(self.queue.pending)}\n"
+            f"⚙️ کارهای هم‌زمان فعال: {to_persian_digits(self.queue.active_count)} | "
+            f"جایگزینی خودکار STT: {to_persian_digits(stt_failovers)} | "
+            f"جایگزینی خودکار LLM: {to_persian_digits(llm_failovers)}"
         )
         await self._edit_or_reply(event, text, self._admin_menu())
 

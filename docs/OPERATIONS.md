@@ -73,5 +73,7 @@ Keep backups encrypted, outside `public_html` and out of Git.
 - Startup removes stale temporary work directories. Temporary job folders are deleted when the
   job ends.
 
-Shared hosting: keep `MAX_ACTIVE_JOBS=1`, a short queue and conservative file/temp limits. If the
-host kills the process or runs out of RAM/disk, move to a VPS; cron cannot bypass account limits.
+Shared hosting: keep `MEDIA_WORKER_CONCURRENCY=1` (1 child PyAV process max), `MAX_ACTIVE_JOBS=2..3`,
+a bounded queue (`MAX_QUEUED_JOBS=8`), and conservative file/temp limits so network-bound STT/LLM
+stages run concurrently across users while RAM stays well under 1 GB. If the host kills the
+process or runs out of RAM/disk, move to a VPS; cron cannot bypass account limits.

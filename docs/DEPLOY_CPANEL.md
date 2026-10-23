@@ -28,13 +28,21 @@ nano .env
 ```
 
 Required: `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, numeric `ADMIN_IDS`, and
-one STT key. For shared hosting start with:
+at least one STT key (`SPEECHMATICS_API_KEY` primary + `DEEPGRAM_API_KEY` overflow/failover recommended).
+For a typical cPanel account (1 GB RAM, 100 max processes, 10 MB/s disk I/O), start with the
+shipped stage-gated defaults:
 
 ```dotenv
-MAX_ACTIVE_JOBS=1
-MAX_QUEUED_JOBS=4
-MAX_ACTIVE_JOBS_PER_USER=1
+MAX_ACTIVE_JOBS=3
+MAX_QUEUED_JOBS=8
+MAX_ACTIVE_JOBS_PER_USER=2
+MAX_CONCURRENT_DOWNLOADS=2
 MEDIA_WORKER_CONCURRENCY=1
+MAX_CONCURRENT_UPLOADS=2
+SPEECHMATICS_MAX_IN_FLIGHT=2
+DEEPGRAM_MAX_IN_FLIGHT=4
+LLM_PRIMARY_MAX_IN_FLIGHT=4
+LLM_FALLBACK_MAX_IN_FLIGHT=4
 ```
 
 Lower `MAX_FILE_SIZE`, `TEMP_MIN_FREE_BYTES` and the presentation limits to fit the plan.

@@ -1300,10 +1300,11 @@ async def prepare_audio(
     if len(usable) == 1:
         clip = usable[0]
         info = probes[str(clip.path)]
+        clip_size = await asyncio.to_thread(lambda p=clip.path: p.stat().st_size)
         if (
             clip.kind == "audio"
             and clip.duration is not None
-            and clip.path.stat().st_size <= upload_budget
+            and clip_size <= upload_budget
             and not needs_transcode(clip.path.name, info)
         ):
             output_duration = clip.duration
@@ -1311,9 +1312,9 @@ async def prepare_audio(
                 raise PresentationError(
                     "مدت صدای ارائه از سقف تعیین‌شدهٔ ربات بیشتر است."
                 )
-            if clip.path.stat().st_size > settings.max_file_size:
+            if clip_size > settings.max_file_size:
                 raise PresentationError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
-            if _directory_size(workdir) > settings.presentation_max_temp_bytes:
+            if await asyncio.to_thread(_directory_size, workdir) > settings.presentation_max_temp_bytes:
                 raise PresentationError("حجم فایل‌های موقت ارائه از سقف تعیین‌شده بیشتر است.")
             return PreparedAudio(
                 path=clip.path,
@@ -1332,7 +1333,9 @@ async def prepare_audio(
         if estimated_output is not None
         else settings.presentation_max_total_duration
     )
-    available_temp_bytes = settings.presentation_max_temp_bytes - _directory_size(workdir)
+    available_temp_bytes = settings.presentation_max_temp_bytes - await asyncio.to_thread(
+        _directory_size, workdir
+    )
     if available_temp_bytes <= 0:
         raise PresentationError("برای آماده‌سازی صدای ارائه فضای موقت کافی نیست.")
     result = await merge_audio_tracks(
@@ -1347,9 +1350,10 @@ async def prepare_audio(
         raise PresentationError(
             "مدت صدای ادغام‌شدهٔ این ارائه (با فاصله‌های بین کلیپ‌ها) از سقف ربات بیشتر است."
         )
-    if result.path.stat().st_size > settings.max_file_size:
+    result_size = await asyncio.to_thread(lambda p=result.path: p.stat().st_size)
+    if result_size > settings.max_file_size:
         raise PresentationError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
-    if _directory_size(workdir) > settings.presentation_max_temp_bytes:
+    if await asyncio.to_thread(_directory_size, workdir) > settings.presentation_max_temp_bytes:
         raise PresentationError("حجم فایل‌های موقت ارائه از سقف تعیین‌شده بیشتر است.")
 
     spans = tuple(

@@ -195,12 +195,12 @@ def check_settings() -> tuple[list[Result], object | None]:
         )
     if not problems:
         results.append(Result("PASS", "Configuration", "no configuration problems"))
-    if settings.max_active_jobs > 1:
+    if settings.max_active_jobs > 3:
         results.append(
             Result(
                 "WARN", "MAX_ACTIVE_JOBS",
                 f"{settings.max_active_jobs}: shared hosting usually limits memory "
-                "to 1-2 GB; start with 1.",
+                "to 1-2 GB; keep MAX_ACTIVE_JOBS at 1-3 with MEDIA_WORKER_CONCURRENCY=1.",
             )
         )
     results.extend(check_stt_queue(settings))
