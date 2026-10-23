@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+Concurrency and capacity-wait fixes:
+
+- Fixed single-provider capacity starvation: with only Speechmatics configured (2 in-flight
+  slots against `MAX_ACTIVE_JOBS=3`), the third concurrent job waited just 15 s for a slot and
+  then failed outright even though running transcriptions hold slots for minutes. The
+  all-providers-full waits are now sized against attempt durations
+  (`STT_SLOT_WAIT_TIMEOUT_SECONDS` 15 -> 600, `LLM_SLOT_WAIT_TIMEOUT_SECONDS` 30 -> 300); the
+  zero-wait overflow pass is unchanged. `config.check` now emits a startup advisory when
+  `MAX_ACTIVE_JOBS` exceeds the configured STT slots or `NOTE_CONCURRENCY` exceeds the
+  configured LLM slots.
+- A job arriving while every size-eligible STT provider is in a short post-error cooldown now
+  waits out the shortest cooldown once (bounded by `STT_SLOT_WAIT_TIMEOUT_SECONDS` and the chain
+  deadline, holding no slot) instead of failing instantly; counted as `cooldown_waits` in metrics.
+- Free Office builds run on a dedicated bounded lane (`OFFICE_JOB_CONCURRENCY`, default 2), so a
+  seconds-long text->document build no longer queues behind multi-hour transcription jobs.
+- Capped the shared `asyncio.to_thread` executor at 8 threads: on shared hosting
+  `os.cpu_count()` reports host cores and the default pool could spawn up to 32 threads.
+
 - Added `tests/test_acceptance_mission.py`: post-merge acceptance coverage mapping the manual
   payment workflow, the two-way support tickets and the main-menu copy to one executable check
   each, including the exact Persian messages users and administrators see.

@@ -98,6 +98,7 @@ class _ProviderStats:
     auth_errors: int = 0
     invalid_inputs: int = 0
     retries: int = 0
+    cooldown_waits: int = 0
     cancellations: int = 0
     overflow_skips: int = 0
     failovers_out: int = 0
@@ -126,6 +127,7 @@ class _ProviderStats:
             "auth_errors": self.auth_errors,
             "invalid_inputs": self.invalid_inputs,
             "retries": self.retries,
+            "cooldown_waits": self.cooldown_waits,
             "cancellations": self.cancellations,
             "overflow_skips": self.overflow_skips,
             "failovers_out": self.failovers_out,
@@ -323,6 +325,8 @@ class MetricsCollector:
                 stats.invalid_inputs += 1
             elif event == "retry":
                 stats.retries += 1
+            elif event == "cooldown_wait":
+                stats.cooldown_waits += 1
             elif event == "overflow_skip":
                 stats.overflow_skips += 1
 

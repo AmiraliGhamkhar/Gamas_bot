@@ -114,6 +114,7 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("OFFICE_MAX_CHARS", "office_max_chars", "int"),
     ("OFFICE_MAX_SLIDES", "office_max_slides", "int"),
     ("OFFICE_SESSION_TTL_MINUTES", "office_session_ttl_minutes", "int"),
+    ("OFFICE_JOB_CONCURRENCY", "office_job_concurrency", "int"),
     ("OFFICE_MIN_INTERVAL_SECONDS", "office_min_interval_seconds", "float"),
     ("PRESENTATION_MAX_CLIPS", "presentation_max_clips", "int"),
     ("PRESENTATION_MAX_TOTAL_DURATION", "presentation_max_total_duration", "float"),

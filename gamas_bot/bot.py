@@ -833,6 +833,16 @@ class GamasBot:
             max_active=settings.max_active_jobs,
             worker=self._run_job,
         )
+        # Free Office builds get their own small lane: a text->document job
+        # (seconds of CPU, no download/media/STT slots) must not queue behind
+        # multi-hour transcription jobs occupying every media worker. Both
+        # lanes share the same per-job worker, stage semaphores, LLM capacity
+        # pools, and per-user admission limit, so global bounds still apply.
+        self.office_queue = JobQueue(
+            max_queued=settings.max_queued_jobs,
+            max_active=settings.office_job_concurrency,
+            worker=self._run_job,
+        )
         self._download_semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
         self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_uploads)
@@ -907,6 +917,7 @@ class GamasBot:
         await self.db.recover_interrupted()
         await run_file_io(self._sweep_stale_temp_dirs)
         self.queue.ensure_workers()
+        self.office_queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
         self._transcript_cleanup_task = asyncio.create_task(
             self._transcript_cleanup_loop()
@@ -984,6 +995,7 @@ class GamasBot:
                 logger.warning("failed to mark queued job as failed submission=%s", job.submission_id)
 
         await self.queue.shutdown(on_reject=_fail_queued)
+        await self.office_queue.shutdown(on_reject=_fail_queued)
         if self._http is not None:
             await self._http.close()
             self._http = None
@@ -1504,7 +1516,7 @@ class GamasBot:
             },
         )
         try:
-            self.queue.submit(job)
+            self.office_queue.submit(job)
         except QueueFullError as exc:
             await self.db.set_submission_status(submission_id, "rejected", error=str(exc))
             await progress.fail(str(submission_id))
@@ -2078,7 +2090,12 @@ class GamasBot:
         snap = METRICS.snapshot()
         snap["queue_pending"] = self.queue.pending
         snap["queue_active"] = self.queue.active_count
-        snap["in_flight_jobs"] = self.queue.active_snapshot()
+        snap["office_queue_pending"] = self.office_queue.pending
+        snap["office_queue_active"] = self.office_queue.active_count
+        snap["in_flight_jobs"] = {
+            **self.queue.active_snapshot(),
+            **self.office_queue.active_snapshot(),
+        }
         return snap
 
     @staticmethod
@@ -3639,8 +3656,8 @@ class GamasBot:
             f"💰 مجموع مبالغ پرداختیِ تأییدشده: "
             f"{format_toman(stats['toman_approved'])}\n"
             f"🧾 پرداخت‌های نیازمند بررسی: {to_persian_digits(pending)}\n\n"
-            f"📥 درخواست‌های منتظر در صف فعلی: {to_persian_digits(self.queue.pending)}\n"
-            f"⚙️ کارهای هم‌زمان فعال: {to_persian_digits(self.queue.active_count)} | "
+            f"📥 درخواست‌های منتظر در صف فعلی: {to_persian_digits(self.queue.pending + self.office_queue.pending)}\n"
+            f"⚙️ کارهای هم‌زمان فعال: {to_persian_digits(self.queue.active_count + self.office_queue.active_count)} | "
             f"جایگزینی خودکار STT: {to_persian_digits(stt_failovers)} | "
             f"جایگزینی خودکار LLM: {to_persian_digits(llm_failovers)}"
         )

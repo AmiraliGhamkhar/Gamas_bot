@@ -32,6 +32,7 @@ not uploaded `.docx`/`.pdf` files.
 ## Rules
 
 - Every job receives a unique `job_id` (`job-<submission_id>-<hex>`), isolated per-job state, and explicit lifecycle transitions (`queued` → `downloading` → `extracting` → `transcribing` → `generating_notes` → `uploading` → `completed` / `failed` / `cancelled`).
+- Free Office document builds run on a dedicated small lane (`OFFICE_JOB_CONCURRENCY`, default 2) so they never queue behind multi-hour transcription jobs; both lanes share the same stage gates and provider pools below.
 - Concurrency is decoupled by pipeline stage rather than a single global lock: `MAX_CONCURRENT_DOWNLOADS`, `MEDIA_WORKER_CONCURRENCY`, per-provider STT pools (`SPEECHMATICS_MAX_IN_FLIGHT` / `DEEPGRAM_MAX_IN_FLIGHT`), per-route LLM pools (`LLM_PRIMARY_MAX_IN_FLIGHT` / `LLM_FALLBACK_MAX_IN_FLIGHT`), and `MAX_CONCURRENT_UPLOADS`. No stage slot is held while waiting for another stage.
 - Primary saturation on either STT (`speechmatics`) or LLM (`routes[0]`) immediately overflows in `0 ms` to secondary capacity (`deepgram` / `routes[1]`) without waiting.
 - SQLite runs in WAL mode with serialized `BEGIN IMMEDIATE` writes on `self.db` and lock-free MVCC reads on `self.read_db` (`PRAGMA query_only=ON`).

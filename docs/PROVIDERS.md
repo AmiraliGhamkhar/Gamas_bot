@@ -44,7 +44,7 @@ a positive value caps it and `-1` sends no thinking field.
 The first configured route with a credential and a free local slot is selected. If the primary is
 saturated, an available configured secondary is selected immediately; a bounded wait applies only
 when every candidate route is full. `LLM_PRIMARY_MAX_IN_FLIGHT`, `LLM_FALLBACK_MAX_IN_FLIGHT`, and
-`LLM_SLOT_WAIT_TIMEOUT_SECONDS` (default `4`, `4`, and `30` seconds) control those local limits.
+`LLM_SLOT_WAIT_TIMEOUT_SECONDS` (default `4`, `4`, and `300` seconds) control those local limits.
 
 - HTTP 429 and recognized provider-capacity limits cool down the route briefly and fail over
   immediately without sleeping or replaying that completion. Authentication/quota errors also

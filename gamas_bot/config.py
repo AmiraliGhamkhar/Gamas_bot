@@ -235,11 +235,34 @@ DEFAULT_SPEECHMATICS_MAX_IN_FLIGHT = 2
 DEFAULT_DEEPGRAM_MAX_IN_FLIGHT = 4
 DEFAULT_STT_OPENAI_MAX_IN_FLIGHT = 2
 DEFAULT_STT_PROVIDER_TIMEOUT_SECONDS = 1800.0
-DEFAULT_STT_SLOT_WAIT_TIMEOUT_SECONDS = 15.0
+#: How long a job may wait for *any* STT provider slot when every configured
+#: provider is simultaneously at its local in-flight cap. The non-blocking
+#: overflow pass runs first, so this bound is only reached when there is no
+#: provider left to overflow to. It must be comparable to how long an attempt
+#: legitimately holds a slot (up to ``STT_PROVIDER_TIMEOUT_SECONDS``): the old
+#: 15 s default guaranteed that a job arriving while the default two
+#: Speechmatics slots were busy transcribing (minutes, not seconds) failed
+#: outright instead of taking the first freed slot. 600 s stays bounded —
+#: waiter count and active-job count are separately capped — while covering
+#: the ordinary "one of the running transcriptions finishes soon" case.
+#: Lower it for deliberate fail-fast behaviour.
+DEFAULT_STT_SLOT_WAIT_TIMEOUT_SECONDS = 600.0
 DEFAULT_LLM_PRIMARY_MAX_IN_FLIGHT = 4
 DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT = 4
-DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS = 30.0
+#: Same reasoning as the STT slot wait, against note requests that may
+#: legitimately run for minutes (``NOTE_REQUEST_TIMEOUT_SECONDS`` allows
+#: 900 s): a 30 s bound made excess chunk requests fail whenever a single
+#: configured route's slots were busy with slow completions. 300 s is the
+#: bounded wait; primary saturation still overflows to a secondary route in
+#: 0 ms whenever one has a free slot.
+DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS = 300.0
 DEFAULT_DEDUP_WINDOW_SECONDS = 120.0
+#: Free Office builds (text -> Word/Excel/PowerPoint/PDF) run on their own
+#: small lane so a seconds-long document build never queues behind multi-hour
+#: transcription jobs sharing ``MAX_ACTIVE_JOBS``. Office work holds no media,
+#: download, or STT slots and its text is capped at 20000 characters, so two
+#: lanes are cheap on a 1 GB host.
+DEFAULT_OFFICE_JOB_CONCURRENCY = 2
 
 #: Shipped note-layer performance defaults. Each is a documented trade-off, so
 #: they live here rather than as literals in ``from_env``:
@@ -615,6 +638,7 @@ class Settings:
     llm_fallback_max_in_flight: int = DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT
     llm_slot_wait_timeout: float = DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS
     dedup_window_seconds: float = DEFAULT_DEDUP_WINDOW_SECONDS
+    office_job_concurrency: int = DEFAULT_OFFICE_JOB_CONCURRENCY
 
     # --- Derived --------------------------------------------------------------
     plan_values: dict[str, int] = field(default_factory=dict, compare=False)
@@ -1302,7 +1326,7 @@ def from_env(env_file: str | None = None) -> Settings:
             "STT_SLOT_WAIT_TIMEOUT_SECONDS",
             DEFAULT_STT_SLOT_WAIT_TIMEOUT_SECONDS,
             minimum=0.0,
-            maximum=600.0,
+            maximum=3600.0,
         ),
         llm_primary_max_in_flight=_env_int(
             "LLM_PRIMARY_MAX_IN_FLIGHT",
@@ -1320,7 +1344,13 @@ def from_env(env_file: str | None = None) -> Settings:
             "LLM_SLOT_WAIT_TIMEOUT_SECONDS",
             DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS,
             minimum=0.0,
-            maximum=600.0,
+            maximum=1800.0,
+        ),
+        office_job_concurrency=_env_int(
+            "OFFICE_JOB_CONCURRENCY",
+            DEFAULT_OFFICE_JOB_CONCURRENCY,
+            minimum=1,
+            maximum=8,
         ),
         dedup_window_seconds=_env_float(
             "DEDUP_WINDOW_SECONDS",
@@ -1340,6 +1370,8 @@ ADVISORY_PROBLEMS = (
     "does not support Persian",
     "no room for the transcript",
     "the note request will time out on a slow gateway",
+    "will wait for a transcription slot",
+    "will wait for a note-provider slot",
 )
 
 
@@ -1402,6 +1434,43 @@ def check(settings: Settings) -> list[str]:
             f"(STT_LANGUAGE={settings.stt_language}); set DEEPGRAM_MODEL to one of: "
             f"{', '.join(sorted(DEEPGRAM_PERSIAN_MODELS))}."
         )
+    # Capacity coherence: active jobs beyond the configured providers' total
+    # in-flight slots cannot overflow anywhere — they wait for a slot (bounded
+    # by STT_SLOT_WAIT_TIMEOUT_SECONDS) and then fail. That is routine, not
+    # exceptional, in a Speechmatics-only deployment (default 2 slots against
+    # MAX_ACTIVE_JOBS=3), so say so at startup where the fix is one line of
+    # .env instead of a failed paid job.
+    stt_in_flight = {
+        "speechmatics": settings.speechmatics_max_in_flight,
+        "deepgram": settings.deepgram_max_in_flight,
+        "openai_compatible": settings.stt_openai_max_in_flight,
+    }
+    stt_configured_flags = {
+        "speechmatics": settings.speechmatics_configured,
+        "deepgram": settings.deepgram_configured,
+        "openai_compatible": settings.stt_openai_configured,
+    }
+    eligible_stt = [
+        slug for slug in settings.stt_providers if stt_configured_flags.get(slug, False)
+    ]
+    if eligible_stt:
+        # Mirror ``stt.transcribe``: with fallback disabled only the first
+        # configured provider is ever attempted, so only its slots count.
+        stt_capacity = (
+            sum(stt_in_flight[slug] for slug in eligible_stt)
+            if settings.stt_fallback_enabled
+            else stt_in_flight[eligible_stt[0]]
+        )
+        if stt_capacity < settings.max_active_jobs:
+            problems.append(
+                f"MAX_ACTIVE_JOBS={settings.max_active_jobs} exceeds the configured "
+                f"transcription capacity ({stt_capacity} in-flight slot(s) across "
+                f"{', '.join(eligible_stt)}); additional jobs will wait for a "
+                "transcription slot and fail if none frees within "
+                f"STT_SLOT_WAIT_TIMEOUT_SECONDS={settings.stt_slot_wait_timeout:.0f}. "
+                "Raise the provider *_MAX_IN_FLIGHT limit, configure a Deepgram "
+                "overflow key (DEEPGRAM_API_KEY), or lower MAX_ACTIVE_JOBS."
+            )
     if settings.note_provider not in NOTE_PROVIDER_SLUGS and _legacy_note_configured(settings):
         problems.append(
             f"NOTE_PROVIDER must be one of: {', '.join(NOTE_PROVIDER_SLUGS)} "
@@ -1415,6 +1484,25 @@ def check(settings: Settings) -> list[str]:
         )
     # A listed provider with a credential but no model can never build a request.
     problems.extend(note_route_diagnostics(settings))
+    # Same coherence check for notes, at single-job granularity: if the total
+    # LLM slot capacity is below one job's own chunk fan-out, every long
+    # lecture's later chunks wait (bounded by LLM_SLOT_WAIT_TIMEOUT_SECONDS)
+    # even when no other user is active.
+    configured_routes = note_routes(settings)
+    if configured_routes:
+        llm_capacity = settings.llm_primary_max_in_flight + (
+            settings.llm_fallback_max_in_flight * (len(configured_routes) - 1)
+        )
+        if llm_capacity < settings.note_concurrency:
+            problems.append(
+                f"NOTE_CONCURRENCY={settings.note_concurrency} exceeds the configured "
+                f"note-provider capacity ({llm_capacity} in-flight slot(s) across "
+                f"{len(configured_routes)} route(s)); chunk requests from a single "
+                "job will wait for a note-provider slot and fail if none frees within "
+                f"LLM_SLOT_WAIT_TIMEOUT_SECONDS={settings.llm_slot_wait_timeout:.0f}. "
+                "Raise LLM_PRIMARY_MAX_IN_FLIGHT / LLM_FALLBACK_MAX_IN_FLIGHT, add a "
+                "fallback route to NOTE_PROVIDERS, or lower NOTE_CONCURRENCY."
+            )
     # One request must fit the transcript, the system prompt and the output.
     required_note_tokens = MIN_NOTE_INPUT_TOKENS + MIN_NOTE_PROMPT_TOKENS
     if settings.note_context_tokens - settings.note_max_output_tokens < required_note_tokens:

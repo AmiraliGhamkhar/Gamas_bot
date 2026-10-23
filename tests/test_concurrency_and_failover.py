@@ -15,8 +15,10 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from gamas_bot import llm, media, stt
+from gamas_bot import config, llm, media, stt
 from gamas_bot.bot import GamasBot
+from gamas_bot.config import check as check_config
+from gamas_bot.config import is_advisory
 from gamas_bot.db import Database
 from gamas_bot.jobs import JOB_STATES, Job, JobQueue, QueueFullError
 from gamas_bot.logging_config import JsonFormatter, log_job_id
@@ -816,6 +818,225 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
+
+
+class SlotWaitCooldownAndLaneRegressionTests(unittest.IsolatedAsyncioTestCase):
+    """Regressions for capacity waits that used to fail otherwise-healthy jobs.
+
+    Covered defects (all reproduced against the previous behaviour):
+
+    * a Speechmatics-only deployment (2 in-flight slots) with the default
+      ``MAX_ACTIVE_JOBS=3`` failed the third concurrent job after a 15 s slot
+      wait even though running transcriptions hold slots for minutes;
+    * a job arriving while its only provider sat in a short post-429 cooldown
+      failed instantly instead of waiting out the remaining seconds;
+    * Free Office document builds shared the media job lane, so a
+      seconds-long build queued behind multi-hour transcription jobs.
+    """
+
+    def setUp(self) -> None:
+        METRICS.reset()
+        stt.reset_cooldowns()
+        llm.reset_cooldowns()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.audio = Path(self._tmp.name) / "sample.ogg"
+        self.audio.write_bytes(b"OggS" + b"\x00" * 128)
+
+    def tearDown(self) -> None:
+        stt.reset_cooldowns()
+        llm.reset_cooldowns()
+        self._tmp.cleanup()
+
+    def test_slot_wait_defaults_are_coherent_with_attempt_durations(self):
+        # The all-providers-full wait must be long enough for a legitimately
+        # running attempt to plausibly finish and free its slot, yet stay a
+        # bounded fraction of one attempt's own ceiling (fail-fast remains
+        # available by lowering the env vars).
+        self.assertGreaterEqual(config.DEFAULT_STT_SLOT_WAIT_TIMEOUT_SECONDS, 600.0)
+        self.assertLessEqual(
+            config.DEFAULT_STT_SLOT_WAIT_TIMEOUT_SECONDS,
+            config.DEFAULT_STT_PROVIDER_TIMEOUT_SECONDS,
+        )
+        self.assertGreaterEqual(config.DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS, 300.0)
+        self.assertLessEqual(config.DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS, 900.0)
+        self.assertGreaterEqual(config.DEFAULT_OFFICE_JOB_CONCURRENCY, 1)
+
+    def test_config_check_flags_stt_capacity_below_active_jobs(self):
+        marker = "will wait for a transcription slot"
+        speechmatics_only = make_settings(
+            max_active_jobs=3,
+            stt_providers=("speechmatics", "deepgram"),
+            deepgram_api_key="",
+        )
+        flagged = [p for p in check_config(speechmatics_only) if marker in p]
+        self.assertEqual(len(flagged), 1)
+        # The bot still runs in this configuration — it is a warning, never a
+        # startup failure.
+        self.assertTrue(is_advisory(flagged[0]))
+
+        # Both providers configured: 2 + 4 slots cover 3 active jobs.
+        both = make_settings(max_active_jobs=3)
+        self.assertFalse([p for p in check_config(both) if marker in p])
+
+        # Fallback disabled mirrors ``transcribe``: only the first configured
+        # provider's slots count, so the same keys become incoherent.
+        no_fallback = make_settings(max_active_jobs=3, stt_fallback_enabled=False)
+        self.assertTrue([p for p in check_config(no_fallback) if marker in p])
+
+    def test_config_check_flags_llm_capacity_below_note_concurrency(self):
+        marker = "will wait for a note-provider slot"
+        cramped = make_settings(llm_primary_max_in_flight=1, note_concurrency=2)
+        flagged = [p for p in check_config(cramped) if marker in p]
+        self.assertEqual(len(flagged), 1)
+        self.assertTrue(is_advisory(flagged[0]))
+
+        roomy = make_settings()
+        self.assertFalse([p for p in check_config(roomy) if marker in p])
+
+    async def test_single_stt_provider_extra_job_waits_for_freed_slot(self):
+        release = asyncio.Event()
+        first_entered = asyncio.Event()
+        calls = 0
+
+        async def blocking_first(_session, _path, _settings):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                first_entered.set()
+                await release.wait()
+            return RawTranscript.from_text("متن دقیق", engine="speechmatics")
+
+        settings = make_settings(
+            stt_providers=("speechmatics",),
+            speechmatics_max_in_flight=1,
+            stt_slot_wait_timeout=2.0,
+        )
+        patched = {
+            "speechmatics": replace(stt.PROVIDERS["speechmatics"], run=blocking_first)
+        }
+        with mock.patch.dict(stt.PROVIDERS, patched):
+            first = asyncio.create_task(
+                stt.transcribe(self.audio, settings, session=object())
+            )
+            await first_entered.wait()
+            second = asyncio.create_task(
+                stt.transcribe(self.audio, settings, session=object())
+            )
+            # The second job must be *waiting* for the slot — not failed, not
+            # submitted twice to the provider.
+            await asyncio.sleep(0.15)
+            self.assertFalse(second.done())
+            self.assertEqual(calls, 1)
+
+            release.set()
+            r1, r2 = await asyncio.gather(first, second)
+        self.assertEqual((r1.engine, r2.engine), ("speechmatics", "speechmatics"))
+        self.assertEqual(calls, 2)
+        snap = METRICS.snapshot()["providers"]["stt"]["speechmatics"]
+        self.assertEqual(snap["in_flight"], 0)
+
+    async def test_stt_waits_out_short_cooldown_when_no_alternative_exists(self):
+        calls = 0
+
+        async def ok_sm(_session, _path, _settings):
+            nonlocal calls
+            calls += 1
+            return RawTranscript.from_text("بعد از استراحت", engine="speechmatics")
+
+        settings = make_settings(
+            stt_providers=("speechmatics",), stt_slot_wait_timeout=2.0
+        )
+        stt._set_cooldown("speechmatics", 0.3)
+        patched = {"speechmatics": replace(stt.PROVIDERS["speechmatics"], run=ok_sm)}
+        with mock.patch.dict(stt.PROVIDERS, patched):
+            t0 = time.monotonic()
+            result = await stt.transcribe(self.audio, settings, session=object())
+            elapsed = time.monotonic() - t0
+        self.assertEqual(result.engine, "speechmatics")
+        self.assertGreaterEqual(elapsed, 0.25)
+        self.assertEqual(calls, 1, "provider must be attempted once, after the wait")
+        snap = METRICS.snapshot()["providers"]["stt"]["speechmatics"]
+        self.assertGreaterEqual(snap["cooldown_waits"], 1)
+
+    async def test_stt_cooldown_beyond_wait_budget_still_fails_fast(self):
+        calls = 0
+
+        async def ok_sm(_session, _path, _settings):
+            nonlocal calls
+            calls += 1
+            return RawTranscript.from_text("نباید برسد", engine="speechmatics")
+
+        settings = make_settings(
+            stt_providers=("speechmatics",), stt_slot_wait_timeout=0.2
+        )
+        stt._set_cooldown("speechmatics", 30.0)
+        patched = {"speechmatics": replace(stt.PROVIDERS["speechmatics"], run=ok_sm)}
+        with mock.patch.dict(stt.PROVIDERS, patched):
+            t0 = time.monotonic()
+            with self.assertRaises(stt.STTTransientError):
+                await stt.transcribe(self.audio, settings, session=object())
+            self.assertLess(time.monotonic() - t0, 2.0)
+        self.assertEqual(calls, 0)
+
+    async def test_office_lane_progresses_while_media_lane_is_saturated(self):
+        root = Path(self._tmp.name)
+        settings = make_settings(
+            db_path=root / "gamas.db",
+            temp_dir=root / "temp",
+            receipt_dir=root / "receipts",
+            max_active_jobs=2,
+            max_queued_jobs=4,
+            office_job_concurrency=1,
+        )
+        settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        db = Database(settings.db_path)
+        await db.connect()
+        bot = GamasBot(settings)
+        bot.db = db
+        media_release = asyncio.Event()
+        media_started: list[int] = []
+        office_done = asyncio.Event()
+
+        async def fake_worker(job: Job) -> None:
+            if job.kind == "office":
+                office_done.set()
+                return
+            media_started.append(job.submission_id)
+            await media_release.wait()
+
+        # Drive the bot's real queue objects (and their configured lane
+        # sizes) with a controllable worker; handler routing onto
+        # ``office_queue`` itself is covered by the Office test-suite.
+        bot.queue._worker = fake_worker
+        bot.office_queue._worker = fake_worker
+        try:
+            self.assertIsNot(bot.queue, bot.office_queue)
+            bot.queue.ensure_workers()
+            bot.office_queue.ensure_workers()
+            for index in range(2):
+                bot.queue.submit(
+                    Job(
+                        submission_id=500 + index,
+                        user_id=700 + index,
+                        kind="audio",
+                        filename="lecture.mp3",
+                    )
+                )
+            while len(media_started) < 2:
+                await asyncio.sleep(0.01)
+            bot.office_queue.submit(
+                Job(submission_id=600, user_id=799, kind="office", filename=None)
+            )
+            await asyncio.wait_for(office_done.wait(), timeout=1.0)
+            # Both media jobs are still running; the office job did not wait.
+            self.assertEqual(bot.queue.active_count, 2)
+            snap = bot.runtime_metrics()
+            self.assertEqual(snap["queue_active"], 2)
+            self.assertIn("office_queue_pending", snap)
+        finally:
+            media_release.set()
+            await bot.shutdown()
+            await db.close()
 
 
 if __name__ == "__main__":  # pragma: no cover
