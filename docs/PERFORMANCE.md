@@ -11,6 +11,7 @@ The shipped profile is deliberately modest for shared cPanel hosting:
 | Resource | Default | Guard |
 | --- | ---: | --- |
 | Active jobs / queued jobs | 3 / 8 | Fixed workers, bounded pending queue, fair per-user dispatch |
+| Free Office lane | 2 | `OFFICE_JOB_CONCURRENCY`; text->document builds never queue behind transcription jobs |
 | Active jobs per user | 2 | Admission check before enqueue |
 | Telegram downloads / uploads | 2 / 2 | Independent semaphores and stage deadlines |
 | Media worker concurrency | 1 | Heavy extraction and conversion do not fan out across jobs |
@@ -41,7 +42,10 @@ credentials are skipped; fallback credentials are optional and do not prevent st
 - If Speechmatics has a free local slot, the job uses it. If its slots are full and a configured,
   eligible Deepgram slot is available, the capacity pool reserves Deepgram immediately without
   waiting for the primary. If every eligible provider is full, the chain waits at most
-  `STT_SLOT_WAIT_TIMEOUT_SECONDS` (15 seconds by default), then returns a bounded capacity error.
+  `STT_SLOT_WAIT_TIMEOUT_SECONDS` (600 seconds by default, sized against the 1800-second attempt
+  ceiling so a job can take the first freed slot instead of failing), then returns a bounded
+  capacity error. If every eligible provider is instead in a post-error cooldown, the job waits
+  out the shortest remaining cooldown once, under the same bound.
 - A provider is skipped if it is cooling down or the prepared audio exceeds its upload ceiling.
 - `HTTP 429`, `408`, `425`, `5xx`, network errors, and per-provider timeouts fail over without
   repeating the upload. `Retry-After` is bounded; transient failures use a 60-second local
@@ -59,7 +63,8 @@ credentials are skipped; fallback credentials are optional and do not prevent st
 
 `NOTE_PROVIDERS` controls route order; providers without their own credentials are skipped. If the
 primary route is saturated, a configured secondary with capacity is selected immediately. The
-bounded all-full wait is `LLM_SLOT_WAIT_TIMEOUT_SECONDS` (30 seconds by default).
+bounded all-full wait is `LLM_SLOT_WAIT_TIMEOUT_SECONDS` (300 seconds by default, sized against
+note requests that may legitimately run for minutes).
 
 - `HTTP 429` and qualifying provider-limit responses fail over without sleeping or replaying the
   primary request; the route enters a short local cooldown. Authentication/quota failures also
@@ -99,6 +104,16 @@ simulated provider limits. No external APIs or paid keys are used. Results from 
 | After edits, cPanel sample B (latest) | 6 | 4.6763 s | 1.283 jobs/s | 2.2888 s | 5.34 MiB | 111.07 MiB |
 | After edits, one active worker | 6 | 13.9475 s | 0.430 jobs/s | 2.3246 s | 4.36 MiB | 101.52 MiB |
 | After edits, stress profile (6 active) | 6 | 2.6502 s | 2.264 jobs/s | 2.5520 s | 9.77 MiB | 126.98 MiB |
+| Slot-wait/cooldown/office-lane change, before (this checkout's machine) | 6 | 4.4336 s | 1.353 jobs/s | 2.1764 s | 6.46 MiB | 112.08 MiB |
+| Same change, after sample A | 6 | 4.5812 s | 1.310 jobs/s | 2.2768 s | 6.50 MiB | 111.48 MiB |
+| Same change, after sample B | 6 | 4.4701 s | 1.342 jobs/s | 2.1951 s | 5.59 MiB | 110.66 MiB |
+
+For the slot-wait/cooldown/office-lane rows, before/after wall times on the same machine were
+4.4336 s vs 4.4701–4.5812 s (mean end-to-end 2.1764 s vs 2.1951–2.2768 s): within run-to-run
+variance, i.e. no throughput change is claimed. That change targets *failure avoidance* when
+provider slots are fewer than concurrent jobs — a case this profile (6 configured STT slots,
+3 active jobs) does not exercise; it is covered by the saturated-single-provider tests in
+«tests/test_concurrency_and_failover.py» instead.
 
 The latest post-change cPanel sample measured mean download/extract/transcribe/note/upload stages of
 `0.1188 / 0.3483 / 0.7526 / 0.9625 / 0.1036` seconds. The recorded before-edit run measured

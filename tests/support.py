@@ -518,6 +518,7 @@ def make_settings(**overrides) -> Settings:
         plan_50_validity_days=30,
         max_concurrent_downloads=2,
         max_concurrent_uploads=2,
+        office_job_concurrency=2,
         stt_fallback_enabled=True,
         speechmatics_max_in_flight=2,
         deepgram_max_in_flight=4,

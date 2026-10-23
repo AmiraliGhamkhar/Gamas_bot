@@ -41,10 +41,10 @@ cron job cannot create a second database or session.
 | `STT_PROVIDERS` | Ordered failover list; default `speechmatics,deepgram,openai_compatible` (Speechmatics primary, immediate non-blocking overflow/failover to Deepgram). |
 | `STT_FALLBACK_ENABLED` | Enable automatic STT overflow/failover across configured providers (default `true`). |
 | `SPEECHMATICS_MAX_IN_FLIGHT`, `DEEPGRAM_MAX_IN_FLIGHT`, `STT_OPENAI_MAX_IN_FLIGHT` | Local concurrent slot caps per STT provider (`2` / `4` / `2`). When primary slots are full, new jobs overflow immediately to Deepgram without waiting. |
-| `STT_PROVIDER_TIMEOUT_SECONDS`, `STT_SLOT_WAIT_TIMEOUT_SECONDS` | Per-provider wall-clock attempt ceiling (`1800` s) and max wait (`15` s) only when **all** configured STT providers are simultaneously saturated. |
+| `STT_PROVIDER_TIMEOUT_SECONDS`, `STT_SLOT_WAIT_TIMEOUT_SECONDS` | Per-provider wall-clock attempt ceiling (`1800` s) and max wait (`600` s) only when **all** configured STT providers are simultaneously saturated (or briefly cooling down). The wait is bounded, and overflow to a provider with a free slot still happens with zero wait. |
 | `STT_LANGUAGE` | Persian default `fa`. Deepgram requires `DEEPGRAM_MODEL=nova-3` for Persian. |
 | `NOTE_PROVIDERS` | Ordered note routes. Providers without their own key are skipped. See [Note providers](PROVIDERS.md). |
-| `LLM_PRIMARY_MAX_IN_FLIGHT`, `LLM_FALLBACK_MAX_IN_FLIGHT`, `LLM_SLOT_WAIT_TIMEOUT_SECONDS` | Local concurrent slot caps for primary (`4`) and secondary (`4`) note routes plus all-full wait bound (`30` s); primary saturation overflows immediately in `0 ms` to secondary routes. |
+| `LLM_PRIMARY_MAX_IN_FLIGHT`, `LLM_FALLBACK_MAX_IN_FLIGHT`, `LLM_SLOT_WAIT_TIMEOUT_SECONDS` | Local concurrent slot caps for primary (`4`) and secondary (`4`) note routes plus all-full wait bound (`300` s); primary saturation overflows immediately in `0 ms` to secondary routes. Startup (`--check`) warns when `MAX_ACTIVE_JOBS` exceeds the configured STT slots or `NOTE_CONCURRENCY` exceeds the configured LLM slots. |
 | `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS` | Active stage-gated pipeline workers (default `3`) and pending queue ceiling (default `8`). |
 | `MAX_CONCURRENT_DOWNLOADS`, `MAX_CONCURRENT_UPLOADS` | Independent stage semaphores for Telegram downloads (`2`) and uploads (`2`). |
 | `DOWNLOAD_TIMEOUT_SECONDS`, `UPLOAD_TIMEOUT_SECONDS` | Stage deadlines for Telegram download (`900` s) and upload (`600` s). |

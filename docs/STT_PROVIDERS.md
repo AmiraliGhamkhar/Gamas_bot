@@ -15,11 +15,12 @@ Deepgram needs Nova-3 for Persian; Nova-2 has no `fa` pack, so `--check` reports
 ## Non-blocking capacity overflow & automatic failover
 
 - **Local capacity overflow (zero-wait)**: Each provider enforces a local slot cap via `CapacityPool` (`SPEECHMATICS_MAX_IN_FLIGHT=2`, `DEEPGRAM_MAX_IN_FLIGHT=4`). When Speechmatics has free capacity, jobs use Speechmatics. When all Speechmatics slots are occupied, new jobs **immediately route to Deepgram without waiting** instead of queuing behind Speechmatics or triggering upstream `HTTP 429` concurrency errors.
-- **All-saturated bounded wait**: A job waits up to `STT_SLOT_WAIT_TIMEOUT_SECONDS` (`15` s default) **only** when every configured STT provider is simultaneously at max capacity.
+- **All-saturated bounded wait**: A job waits up to `STT_SLOT_WAIT_TIMEOUT_SECONDS` (`600` s default) **only** when every configured STT provider is simultaneously at max capacity. The default is sized against how long attempts legitimately hold slots (up to the 1800 s attempt ceiling): the previous 15 s default failed the third concurrent job in a Speechmatics-only deployment (2 slots vs `MAX_ACTIVE_JOBS=3`) instead of letting it take the first freed slot. Lower it for fail-fast behaviour.
+- **All-cooling-down bounded wait**: If every size-eligible configured provider is in a post-error cooldown (e.g. a 429 moments ago), the job waits out the *shortest* remaining cooldown exactly once, capped by the same `STT_SLOT_WAIT_TIMEOUT_SECONDS` and the chain deadline, then re-scans. No provider slot is held while waiting, and the wait is counted in metrics as `cooldown_waits`.
 - **Error-triggered failover**:
   - `HTTP 429` rate limit / concurrency limit -> short `Retry-After` cooldown on primary + immediate Deepgram failover.
   - `HTTP 402` / quota exhaustion (`STTQuotaError`) -> 300 s primary cooldown + immediate Deepgram failover.
-  - `HTTP 401` / `403` auth failure -> 300 s cooldown + immediate Deepgram failover.
+  - `HTTP 401` / `403` auth failure -> 900 s cooldown + immediate Deepgram failover.
   - `HTTP 5xx`, network error (`aiohttp.ClientError`), or `STT_PROVIDER_TIMEOUT_SECONDS` (`1800` s) timeout -> short transient cooldown + immediate Deepgram failover without re-uploading to primary.
   - **Permanent invalid audio input (`STTInvalidInputError`, e.g., empty/corrupt file or `HTTP 400` invalid media)** -> fails fast cleanly **without** wasting fallback uploads on broken audio.
 

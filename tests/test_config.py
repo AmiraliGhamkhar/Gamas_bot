@@ -73,7 +73,11 @@ class FromEnvTests(unittest.TestCase):
         self.assertEqual(settings.note_model, "gpt-4o-mini")
         self.assertEqual(settings.stt_openai_max_upload, 25_000_000)
         self.assertEqual(settings.stt_providers, tuple(DEFAULT_STT_PROVIDERS.split(",")))
-        self.assertEqual(check(settings), [])
+        # No *fatal* problems: a Speechmatics-only env legitimately earns
+        # the capacity-coherence advisory (2 slots < 3 active jobs).
+        self.assertEqual(
+            [p for p in check(settings) if not is_advisory(p)], []
+        )
 
     def test_provider_order_parsed_and_deduplicated(self):
         with mock.patch.dict(
@@ -243,7 +247,11 @@ class NoteProviderOrderTests(unittest.TestCase):
         self.assertEqual(routes[4].base_url, "https://api.cerebras.ai/v1")
         self.assertEqual(routes[4].model, "gpt-oss-120b")
         self.assertTrue(settings.note_configured)
-        self.assertEqual(check(settings), [])
+        # No *fatal* problems: a Speechmatics-only env legitimately earns
+        # the capacity-coherence advisory (2 slots < 3 active jobs).
+        self.assertEqual(
+            [p for p in check(settings) if not is_advisory(p)], []
+        )
 
     def test_the_default_chain_degrades_to_the_credentialed_legs(self):
         """A deployment with only the old keys keeps exactly its old legs."""

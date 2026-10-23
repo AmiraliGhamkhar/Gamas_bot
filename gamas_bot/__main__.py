@@ -8,6 +8,7 @@ lock, so it is safe to run while a healthy instance is serving traffic.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import logging
 import os
@@ -86,6 +87,16 @@ async def main(settings: Settings) -> None:
     if hasattr(os, "umask"):
         os.umask(0o077)
     loop = asyncio.get_running_loop()
+    # ``asyncio.to_thread`` powers every file, document-build, and image call
+    # (see ``fileio.run_file_io``). The default executor sizes itself from
+    # ``os.cpu_count()``, which on shared cPanel reports the *host's* cores
+    # and can spawn up to 32 threads against a 10 MB/s I/O budget. The stage
+    # semaphores (2 downloads + 2 uploads + media + document builds) never
+    # need more than a handful concurrently, so cap the pool explicitly.
+    # ``asyncio.run`` shuts the default executor down with the loop.
+    loop.set_default_executor(
+        ThreadPoolExecutor(max_workers=8, thread_name_prefix="gamas-io")
+    )
     install_asyncio_exception_handler(loop)
     main_task = asyncio.current_task()
     if main_task is not None and hasattr(loop, "add_signal_handler"):

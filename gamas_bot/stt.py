@@ -1173,7 +1173,6 @@ async def transcribe(
     try:
         failures: list[str] = []
         deadline = time.monotonic() + settings.stt_job_timeout
-        skipped: list[str] = []
         logger.info(
             "STT failover chain providers=%s fallback_enabled=%s bytes=%s language=%s",
             ",".join(settings.stt_providers),
@@ -1197,26 +1196,68 @@ async def transcribe(
                 "(SPEECHMATICS_API_KEY، DEEPGRAM_API_KEY یا STT_OPENAI_BASE_URL+STT_OPENAI_API_KEY)."
             )
 
-        pending_specs: list[ProviderSpec] = []
-        for spec in configured_specs:
-            slug = spec.slug
-            remaining = _cooldown_remaining(slug)
-            if remaining > 0:
-                logger.warning(
-                    "STT provider %s in cooldown for %.0fs more; skipped", slug, remaining
+        def _eligible_specs() -> tuple[
+            list[ProviderSpec], list[str], tuple[str, float] | None
+        ]:
+            """Split configured providers into runnable / skipped / cooling-down.
+
+            Size eligibility is checked before cooldown so the returned
+            ``(slug, seconds)`` wait candidate names the soonest provider that
+            could actually accept this file once its cooldown expires.
+            """
+            runnable: list[ProviderSpec] = []
+            reasons: list[str] = []
+            soonest: tuple[str, float] | None = None
+            for spec in configured_specs:
+                slug = spec.slug
+                max_upload = provider_upload_limit(slug, settings)
+                if size > max_upload:
+                    limit_mb = max(1, math.ceil(max_upload / 1_000_000))
+                    logger.warning(
+                        "STT provider %s skipped: file is %s bytes, over its %s byte ceiling",
+                        slug, size, max_upload,
+                    )
+                    reasons.append(f"{spec.label} سقف حجم {limit_mb}MB دارد")
+                    continue
+                remaining = _cooldown_remaining(slug)
+                if remaining > 0:
+                    logger.warning(
+                        "STT provider %s in cooldown for %.0fs more; skipped",
+                        slug, remaining,
+                    )
+                    reasons.append(
+                        f"{spec.label} در حال استراحت ({max(1, math.ceil(remaining))}s)"
+                    )
+                    if soonest is None or remaining < soonest[1]:
+                        soonest = (slug, remaining)
+                    continue
+                runnable.append(spec)
+            return runnable, reasons, soonest
+
+        pending_specs, skipped, cooldown_candidate = _eligible_specs()
+        if not pending_specs and cooldown_candidate is not None:
+            # Every configured provider that could take this file is cooling
+            # down (typically a 429 moments ago, from this or another job).
+            # Failing the job on the spot throws away its completed download
+            # and extraction for a recovery measured in seconds, so wait out
+            # the *shortest* cooldown exactly once — bounded by both the
+            # operator's slot-wait budget and the chain deadline — then
+            # re-scan. One round only: a provider that fails again sets a
+            # fresh cooldown and the normal failover/error path applies.
+            wait_slug, wait_seconds = cooldown_candidate
+            wait_cap = min(
+                deadline - time.monotonic(),
+                float(settings.stt_slot_wait_timeout),
+            )
+            if 0 < wait_seconds <= wait_cap:
+                logger.info(
+                    "all eligible STT providers in cooldown; waiting %.1fs for %s "
+                    "(bounded by STT_SLOT_WAIT_TIMEOUT_SECONDS=%.0fs)",
+                    wait_seconds, wait_slug, float(settings.stt_slot_wait_timeout),
                 )
-                skipped.append(f"{spec.label} در حال استراحت ({int(remaining)}s)")
-                continue
-            max_upload = provider_upload_limit(slug, settings)
-            if size > max_upload:
-                limit_mb = max(1, math.ceil(max_upload / 1_000_000))
-                logger.warning(
-                    "STT provider %s skipped: file is %s bytes, over its %s byte ceiling",
-                    slug, size, max_upload,
-                )
-                skipped.append(f"{spec.label} سقف حجم {limit_mb}MB دارد")
-                continue
-            pending_specs.append(spec)
+                METRICS.record_provider_event("stt", wait_slug, "cooldown_wait")
+                await asyncio.sleep(wait_seconds)
+                pending_specs, skipped, _ = _eligible_specs()
 
         previous_failed_slug: str | None = None
         while pending_specs:
