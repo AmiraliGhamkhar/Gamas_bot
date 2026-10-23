@@ -24,6 +24,7 @@ import logging
 import os
 import re
 import sqlite3
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,21 @@ from .metrics import METRICS
 logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations" / "v3"
+
+
+async def _rows(
+    connection: aiosqlite.Connection,
+    sql: str,
+    parameters: Iterable[Any] | None = None,
+) -> list[sqlite3.Row]:
+    """Fetch every row of ``sql`` as a list.
+
+    ``aiosqlite`` 0.22 types ``execute_fetchall`` as returning a bare
+    ``Iterable`` although it always returns the fully materialised list from
+    ``Cursor.fetchall()``. Callers index into and measure the result, so the
+    widening happens once here instead of a cast at every call site.
+    """
+    return list(await connection.execute_fetchall(sql, parameters))
 
 TERMINAL_SUBMISSION_STATUSES = ("done", "partial", "failed", "rejected")
 
@@ -189,7 +205,7 @@ class Database:
         )
         applied = {
             row[0]
-            for row in await self.db.execute_fetchall("SELECT name FROM schema_migrations")
+            for row in await _rows(self.db, "SELECT name FROM schema_migrations")
         }
         for path in sorted(MIGRATIONS_DIR.glob("*.sql")):
             if path.name in applied:
@@ -216,7 +232,7 @@ class Database:
             if match:
                 table, column = match.group(1), match.group(2)
                 if table not in known:
-                    rows = await self.db.execute_fetchall(f"PRAGMA table_info({table})")
+                    rows = await _rows(self.db, f"PRAGMA table_info({table})")
                     known[table] = {row[1] for row in rows}
                 if column in known[table]:
                     continue
@@ -254,7 +270,7 @@ class Database:
         conn: aiosqlite.Connection | None = None,
     ):
         handle = conn if conn is not None else self.db
-        return await handle.execute_fetchall(
+        return await _rows(handle,
             "SELECT l.id, l.seconds "
             "- COALESCE((SELECT SUM(a.seconds) FROM debit_allocations a "
             "WHERE a.credit_id = l.id), 0) "
@@ -277,11 +293,11 @@ class Database:
         audit but cannot become debt against future grants.
         """
         async with self._transaction():
-            if await self.db.execute_fetchall(
+            if await _rows(self.db,
                 "SELECT 1 FROM billing_migrations WHERE name = 'credit_lots_v1'"
             ):
                 return
-            events = await self.db.execute_fetchall(
+            events = await _rows(self.db,
                 "SELECT l.id, l.user_id, l.seconds, COALESCE("
                 "(SELECT h.created_at FROM holds h WHERE l.note = "
                 "'submission:' || h.submission_id AND h.settled = 1), l.created_at) "
@@ -344,7 +360,7 @@ class Database:
             "INSERT OR IGNORE INTO users(telegram_id, joined_at) VALUES (?, ?)",
             (telegram_id, iso(utc_now())),
         )
-        row = await self.db.execute_fetchall(
+        row = await _rows(self.db,
             "SELECT telegram_id, joined_at, banned FROM users WHERE telegram_id = ?",
             (telegram_id,),
         )
@@ -370,21 +386,21 @@ class Database:
                 )
 
     async def is_banned(self, telegram_id: int) -> bool:
-        rows = await self.read_db.execute_fetchall(
+        rows = await _rows(self.read_db,
             "SELECT banned FROM users WHERE telegram_id = ?", (telegram_id,)
         )
         return bool(rows and rows[0][0])
 
     async def user_ids(self) -> list[int]:
         """Every user id, without the per-row balance work of ``list_users``."""
-        rows = await self.read_db.execute_fetchall(
+        rows = await _rows(self.read_db,
             "SELECT telegram_id FROM users ORDER BY telegram_id"
         )
         return [int(row[0]) for row in rows]
 
     async def list_users(self, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
         now = iso(utc_now())
-        rows = await self.read_db.execute_fetchall(
+        rows = await _rows(self.read_db,
             "SELECT u.telegram_id, u.joined_at, u.banned, u.is_unlimited, "
             "COALESCE(("
             "  SELECT SUM(MAX(0, l.seconds "
@@ -415,7 +431,7 @@ class Database:
         ]
 
     async def is_unlimited(self, user_id: int) -> bool:
-        rows = await self.read_db.execute_fetchall(
+        rows = await _rows(self.read_db,
             "SELECT is_unlimited FROM users WHERE telegram_id = ?", (user_id,)
         )
         return bool(rows and rows[0][0])
@@ -458,14 +474,14 @@ class Database:
             )
 
     async def unlimited_users(self) -> list[dict[str, Any]]:
-        rows = await self.read_db.execute_fetchall(
+        rows = await _rows(self.read_db,
             "SELECT telegram_id, unlimited_reason, unlimited_granted_by, unlimited_granted_at "
             "FROM users WHERE is_unlimited = 1 ORDER BY unlimited_granted_at DESC, telegram_id"
         )
         return [dict(row) for row in rows]
 
     async def count_users(self) -> int:
-        row = await self.read_db.execute_fetchall("SELECT COUNT(*) FROM users")
+        row = await _rows(self.read_db, "SELECT COUNT(*) FROM users")
         return int(row[0][0]) if row else 0
 
     # ----------------------------------------------------------- submissions
@@ -484,7 +500,7 @@ class Database:
         """
         async with self._transaction():
             if active_limit is not None:
-                rows = await self.db.execute_fetchall(
+                rows = await _rows(self.db,
                     "SELECT COUNT(*) FROM submissions WHERE user_id = ? "
                     "AND status IN ('pending', 'processing')",
                     (user_id,),
@@ -580,7 +596,7 @@ class Database:
         if older_than_days <= 0:
             return 0
         cutoff = iso(utc_now() - timedelta(days=older_than_days))
-        rows = await self.db.execute_fetchall(
+        rows = await _rows(self.db,
             "SELECT t.submission_id FROM transcriptions t "
             "JOIN submissions s ON s.submission_id = t.submission_id "
             "WHERE t.created_at < ? AND s.status IN "
@@ -601,7 +617,7 @@ class Database:
 
     async def transcription(self, submission_id: int) -> dict | None:
         """The persisted transcript (engine, text, notes JSON) for auditing."""
-        rows = await self.read_db.execute_fetchall(
+        rows = await _rows(self.read_db,
             "SELECT engine, text, notes_json FROM transcriptions "
             "WHERE submission_id = ?",
             (submission_id,),
@@ -612,7 +628,7 @@ class Database:
         return {"engine": engine, "text": text, "notes_json": notes_json}
 
     async def submission(self, submission_id: int) -> SubmissionRow | None:
-        rows = await self.read_db.execute_fetchall(
+        rows = await _rows(self.read_db,
             "SELECT submission_id, user_id, kind, filename, status, error, "
             "duration_seconds, created_at, finished_at FROM submissions "
             "WHERE submission_id = ?",
@@ -624,7 +640,7 @@ class Database:
         return SubmissionRow(row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8])
 
     async def user_submissions(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
-        rows = await self.read_db.execute_fetchall(
+        rows = await _rows(self.read_db,
             "SELECT submission_id, kind, filename, status, duration_seconds, created_at, "
             "finished_at FROM submissions WHERE user_id = ? "
             "ORDER BY submission_id DESC LIMIT ?",
@@ -633,17 +649,17 @@ class Database:
         return [dict(row) for row in rows]
 
     async def stats(self) -> dict[str, Any]:
-        totals = await self.read_db.execute_fetchall(
+        totals = await _rows(self.read_db,
             "SELECT status, COUNT(*) FROM submissions GROUP BY status"
         )
         by_status = {row[0]: int(row[1]) for row in totals}
         users = await self.count_users()
-        seconds = await self.read_db.execute_fetchall(
+        seconds = await _rows(self.read_db,
             "SELECT COALESCE(SUM(duration_seconds), 0) FROM submissions WHERE delivered_at IS NOT NULL OR status = 'done'"
         )
         # Revenue is the sum of what each user was actually quoted at purchase,
         # never the plan's current price (audit F-14).
-        revenue = await self.read_db.execute_fetchall(
+        revenue = await _rows(self.read_db,
             "SELECT COALESCE(SUM(COALESCE(p.purchased_price, "
             "  (SELECT price FROM plans pl WHERE pl.code = p.plan_code), 0)), 0) "
             "FROM payments p WHERE p.status = 'approved'"
@@ -703,7 +719,7 @@ class Database:
             "(SELECT v FROM r WHERE rn = (st.n + 1) / 2), "
             "(SELECT v FROM r WHERE rn = (st.n * 95 + 99) / 100) FROM st"
         )
-        rows = await self.read_db.execute_fetchall(query, params)
+        rows = await _rows(self.read_db, query, params)
         count = int(rows[0][0] or 0) if rows else 0
         if not count:
             # No samples is "not measured", not a zero-second duration.
@@ -712,7 +728,7 @@ class Database:
                 "p95_seconds": None, "max_seconds": None,
             }
 
-        def _round(value: object) -> float | None:
+        def _round(value: Any) -> float | None:
             return None if value is None else round(float(value), 3)
 
         return {
@@ -731,7 +747,7 @@ class Database:
         ``last_success`` is ``None`` when nothing has ever completed, which the
         screens render as "not recorded" rather than as an epoch or a zero.
         """
-        last_rows = await self.read_db.execute_fetchall(
+        last_rows = await _rows(self.read_db,
             "SELECT MAX(finished_at) FROM submissions WHERE status IN ('done','partial')"
         )
         db_bytes = 0
@@ -787,7 +803,7 @@ class Database:
 
         # ---------------------------------------------------------- users
         new_users_where, new_users_params = self._period_clause(period_start, "joined_at")
-        user_rows = await self.read_db.execute_fetchall(
+        user_rows = await _rows(self.read_db,
             "SELECT "
             "(SELECT COUNT(*) FROM users), "
             f"(SELECT COUNT(*) FROM users WHERE {new_users_where or '1 = 1'}), "
@@ -801,13 +817,13 @@ class Database:
         users_row = user_rows[0] if user_rows else (0, 0, 0, 0, 0, 0)
 
         # ----------------------------------------------------- processing
-        status_rows = await self.read_db.execute_fetchall(
+        status_rows = await _rows(self.read_db,
             f"SELECT status, COUNT(*) FROM submissions WHERE {where} GROUP BY status",
             period_params,
         )
         by_status = {str(row[0]): int(row[1]) for row in status_rows}
 
-        kind_rows = await self.read_db.execute_fetchall(
+        kind_rows = await _rows(self.read_db,
             f"SELECT kind, COUNT(*) FROM submissions WHERE {where} GROUP BY kind",
             period_params,
         )
@@ -817,7 +833,7 @@ class Database:
         undelivered = sum(by_status.get(status, 0) for status in self.UNDELIVERED_STATUSES)
         terminal = delivered + undelivered
 
-        error_rows = await self.read_db.execute_fetchall(
+        error_rows = await _rows(self.read_db,
             # Group by the expression, not the alias: ``kind`` is also a real
             # column of ``submissions`` and SQLite resolves the bare name to it
             # (which silently grouped every failure under its media kind).
@@ -828,7 +844,7 @@ class Database:
             period_params,
         )
 
-        day_rows = await self.read_db.execute_fetchall(
+        day_rows = await _rows(self.read_db,
             "SELECT substr(created_at, 1, 10) AS day, COUNT(*), "
             "SUM(CASE WHEN status IN ('done','partial') THEN 1 ELSE 0 END), "
             "SUM(CASE WHEN status IN ('failed','rejected') THEN 1 ELSE 0 END) "
@@ -836,7 +852,7 @@ class Database:
             "GROUP BY day ORDER BY day DESC LIMIT ?",
             (series_since, *period_params, self.REPORT_SERIES_MAX_DAYS),
         )
-        new_user_rows = await self.read_db.execute_fetchall(
+        new_user_rows = await _rows(self.read_db,
             "SELECT substr(joined_at, 1, 10) AS day, COUNT(*) FROM users "
             f"WHERE joined_at >= ? AND {new_users_where or '1 = 1'} "
             "GROUP BY day ORDER BY day DESC LIMIT ?",
@@ -877,7 +893,7 @@ class Database:
             )
 
         # ------------------------------------------------------- payments
-        payment_rows = await self.read_db.execute_fetchall(
+        payment_rows = await _rows(self.read_db,
             "SELECT status, COUNT(*), COALESCE(SUM(COALESCE(purchased_price, 0)), 0) "
             f"FROM payments WHERE {where} GROUP BY status",
             period_params,
@@ -886,12 +902,12 @@ class Database:
             str(row[0]): {"count": int(row[1]), "toman": int(row[2] or 0)}
             for row in payment_rows
         }
-        pending_rows = await self.read_db.execute_fetchall(
+        pending_rows = await _rows(self.read_db,
             "SELECT COUNT(*) FROM payments "
             "WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL"
         )
         future = iso(now + timedelta(days=max(1, expiring_within_days)))
-        expiring_rows = await self.read_db.execute_fetchall(
+        expiring_rows = await _rows(self.read_db,
             "SELECT COUNT(*), COALESCE(SUM(seconds), 0) FROM ledger "
             "WHERE kind = 'credit' AND expires_at IS NOT NULL "
             "AND julianday(expires_at) > julianday(?) AND julianday(expires_at) <= julianday(?)",
@@ -952,7 +968,7 @@ class Database:
         the only record of provider usage).
         """
         period_where, params = self._period_clause(period_start)
-        rows = await self.read_db.execute_fetchall(
+        rows = await _rows(self.read_db,
             "SELECT COALESCE(stt_engine, 'unrecorded') AS engine, COUNT(*) "
             f"FROM submissions WHERE {period_where or '1 = 1'} "
             "GROUP BY COALESCE(stt_engine, 'unrecorded') "
@@ -970,7 +986,7 @@ class Database:
         """
         now = iso(utc_now())
         async with self._transaction():
-            recovered = await self.db.execute_fetchall(
+            recovered = await _rows(self.db,
                 "SELECT submission_id, user_id FROM submissions "
                 "WHERE status IN ('pending', 'processing')"
             )
@@ -1059,12 +1075,12 @@ class Database:
         async with self._transaction():
             # Re-check inside the lock to close TOCTOU with set_unlimited
             # happening concurrently (audit F-M01).
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT is_unlimited, banned FROM users WHERE telegram_id = ?", (user_id,)
             )
             if rows and rows[0][1]:
                 raise UserBannedError("⛔ دسترسی شما به ربات مسدود شده است.")
-            owner = await self.db.execute_fetchall(
+            owner = await _rows(self.db,
                 "SELECT 1 FROM submissions WHERE submission_id = ? AND user_id = ?",
                 (submission_id, user_id),
             )
@@ -1102,7 +1118,7 @@ class Database:
     async def settle_hold(self, submission_id: int, measured_seconds: int) -> None:
         """Exactly-once billing and raw-delivery milestone in one transaction."""
         async with self._transaction():
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT h.user_id, h.seconds, u.is_unlimited FROM holds h "
                 "JOIN users u ON u.telegram_id = h.user_id "
                 "WHERE h.submission_id = ? AND h.released_at IS NULL",
@@ -1122,7 +1138,7 @@ class Database:
                 return
             user_id, reserved, unlimited = rows[0]
             if not unlimited:
-                allocations = await self.db.execute_fetchall(
+                allocations = await _rows(self.db,
                     "SELECT a.credit_id, a.seconds FROM hold_allocations a "
                     "JOIN ledger l ON l.id = a.credit_id WHERE a.submission_id = ? "
                     "ORDER BY l.expires_at IS NULL, l.expires_at, l.id", (submission_id,),
@@ -1188,14 +1204,14 @@ class Database:
         await self._write_many(statements)
 
     async def plans(self) -> list[dict[str, Any]]:
-        rows = await self.db.execute_fetchall(
+        rows = await _rows(self.db,
             "SELECT code, hours, price, validity_days, is_custom, active FROM plans "
             "WHERE active = 1 ORDER BY price"
         )
         return [dict(row) for row in rows]
 
     async def plan(self, code: str) -> dict[str, Any] | None:
-        rows = await self.db.execute_fetchall(
+        rows = await _rows(self.db,
             "SELECT code, hours, price, validity_days, is_custom, active FROM plans "
             "WHERE code = ? AND active = 1",
             (code,),
@@ -1219,7 +1235,7 @@ class Database:
         only one request per user may be open (audit F-16).
         """
         async with self._transaction():
-            open_rows = await self.db.execute_fetchall(
+            open_rows = await _rows(self.db,
                 "SELECT payment_id, plan_code FROM payments "
                 "WHERE user_id = ? AND status IN ('pending','awaiting_payment','pending_review') "
                 "ORDER BY payment_id LIMIT 1",
@@ -1229,7 +1245,7 @@ class Database:
                 if str(open_rows[0][1]) == plan_code:
                     return int(open_rows[0][0])
                 raise OpenPaymentError(str(open_rows[0][1]))
-            plan = await self.db.execute_fetchall(
+            plan = await _rows(self.db,
                 "SELECT hours, price, validity_days FROM plans "
                 "WHERE code = ? AND active = 1 AND price > 0",
                 (plan_code,),
@@ -1331,7 +1347,7 @@ class Database:
 
     async def payment(self, payment_id: int) -> dict[str, Any] | None:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE payment_id = ?",
                 (payment_id,),
             )
@@ -1340,7 +1356,7 @@ class Database:
     async def open_awaiting_payment_for_user(self, user_id: int) -> dict[str, Any] | None:
         """Return the user's open unsubmitted order awaiting a receipt, if any."""
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 f"SELECT {self._PAYMENT_COLUMNS} FROM payments "
                 "WHERE user_id = ? AND status IN ('awaiting_payment', 'pending') "
                 "AND receipt_path IS NULL ORDER BY payment_id DESC LIMIT 1",
@@ -1351,7 +1367,7 @@ class Database:
     async def pending_payments(self) -> list[dict[str, Any]]:
         # For backward compat, includes legacy 'pending' and new explicit states.
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status IN ('pending','awaiting_payment','pending_review') "
                 "ORDER BY payment_id"
             )
@@ -1359,7 +1375,7 @@ class Database:
 
     async def awaiting_payments(self) -> list[dict[str, Any]]:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE status = 'awaiting_payment' "
                 "ORDER BY payment_id"
             )
@@ -1384,13 +1400,13 @@ class Database:
             query += " LIMIT ? OFFSET ?"
             params = (max(0, int(limit)), max(0, int(offset)))
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(query, params)
+            rows = await _rows(self.db, query, params)
             return [dict(row) for row in rows]
 
     async def count_pending_review_payments(self) -> int:
         """Count reviewable orders without loading an unbounded backlog."""
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT COUNT(*) FROM payments "
                 "WHERE status IN ('pending_review','pending') AND receipt_path IS NOT NULL"
             )
@@ -1398,7 +1414,7 @@ class Database:
 
     async def all_payments(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 f"SELECT {self._PAYMENT_COLUMNS} FROM payments ORDER BY payment_id DESC LIMIT ? OFFSET ?",
                 (limit, offset),
             )
@@ -1406,7 +1422,7 @@ class Database:
 
     async def payment_history_paginated(self, user_id: int, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 f"SELECT {self._PAYMENT_COLUMNS} FROM payments WHERE user_id = ? ORDER BY payment_id DESC LIMIT ? OFFSET ?",
                 (user_id, limit, offset),
             )
@@ -1414,7 +1430,7 @@ class Database:
 
     async def count_payments_by_status(self) -> dict[str, int]:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall("SELECT status, COUNT(*) FROM payments GROUP BY status")
+            rows = await _rows(self.db, "SELECT status, COUNT(*) FROM payments GROUP BY status")
             return {row[0]: int(row[1]) for row in rows}
 
     async def review_payment(
@@ -1440,7 +1456,7 @@ class Database:
         if not approved and not reason.strip():
             raise ValueError("rejecting a payment requires a reason")
         async with self._transaction():
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT status, user_id, plan_code, purchased_seconds, "
                 "purchased_validity_days, receipt_path, purchased_price "
                 "FROM payments WHERE payment_id = ?",
@@ -1508,7 +1524,7 @@ class Database:
 
     async def payment_history(self, user_id: int, limit: int = 10) -> list[dict[str, Any]]:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT payment_id, plan_code, status, receipt_path, created_at, reviewed_at FROM payments "
                 "WHERE user_id = ? ORDER BY payment_id DESC LIMIT ?",
                 (user_id, limit),
@@ -1527,7 +1543,7 @@ class Database:
 
     async def recent_audit(self, limit: int = 30) -> list[dict[str, Any]]:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT admin_id, action, detail, subject_user, created_at FROM audit "
                 "ORDER BY id DESC LIMIT ?",
                 (limit,),
@@ -1544,7 +1560,7 @@ class Database:
     #: The single place where ticket status changes are defined. Every handler
     #: goes through :meth:`_transition`; no caller writes a status directly.
     #: ``event`` -> status it leads to, for the status the ticket is in now.
-    SUPPORT_TRANSITIONS = {
+    SUPPORT_TRANSITIONS: dict[str, dict[str | None, str]] = {
         "create": {None: "open"},
         "user_message": {"open": "awaiting_admin", "awaiting_admin": "awaiting_admin",
                          "awaiting_user": "awaiting_admin"},
@@ -1631,21 +1647,21 @@ class Database:
 
     async def get_ticket(self, ticket_id: int) -> dict[str, Any] | None:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT * FROM support_tickets WHERE id = ?", (ticket_id,)
             )
             return dict(rows[0]) if rows else None
 
     async def get_ticket_by_public_id(self, public_id: str) -> dict[str, Any] | None:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT * FROM support_tickets WHERE public_ticket_id = ?", (public_id,)
             )
             return dict(rows[0]) if rows else None
 
     async def list_user_tickets(self, user_id: int, limit: int = 10, offset: int = 0) -> list[dict[str, Any]]:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT * FROM support_tickets WHERE user_id = ? "
                 "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
                 (user_id, limit, offset),
@@ -1679,7 +1695,7 @@ class Database:
             clause += " AND category = ?"
             params.append(category)
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 f"SELECT * FROM support_tickets WHERE {clause} "
                 "ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
@@ -1688,7 +1704,7 @@ class Database:
 
     async def count_tickets_by_status(self) -> dict[str, int]:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT status, COUNT(*) FROM support_tickets GROUP BY status"
             )
             return {row[0]: int(row[1]) for row in rows}
@@ -1713,7 +1729,7 @@ class Database:
             raise ValueError("message length out of range")
         now = iso(utc_now())
         async with self._transaction():
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT user_id, status FROM support_tickets WHERE id = ?", (ticket_id,)
             )
             if not rows:
@@ -1749,7 +1765,7 @@ class Database:
     async def ticket_messages(self, ticket_id: int, *, limit: int = 6, offset: int = 0) -> list[dict[str, Any]]:
         """One page of a history, newest first offset, returned oldest-first."""
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT * FROM (SELECT * FROM support_messages WHERE ticket_id = ? "
                 "ORDER BY id DESC LIMIT ? OFFSET ?) ORDER BY id ASC",
                 (ticket_id, limit, offset),
@@ -1758,7 +1774,7 @@ class Database:
 
     async def count_ticket_messages(self, ticket_id: int) -> int:
         async with self._write_lock:
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT COUNT(*) FROM support_messages WHERE ticket_id = ?", (ticket_id,)
             )
             return int(rows[0][0]) if rows else 0
@@ -1767,7 +1783,7 @@ class Database:
         """Close a ticket. Returns False when it is already closed."""
         now = iso(utc_now())
         async with self._transaction():
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT user_id, status FROM support_tickets WHERE id = ?", (ticket_id,)
             )
             if not rows:
@@ -1801,7 +1817,7 @@ class Database:
         """Reopen a closed ticket; its earlier messages are kept untouched."""
         now = iso(utc_now())
         async with self._transaction():
-            rows = await self.db.execute_fetchall(
+            rows = await _rows(self.db,
                 "SELECT user_id, status FROM support_tickets WHERE id = ?", (ticket_id,)
             )
             if not rows:

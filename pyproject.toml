@@ -93,22 +93,42 @@ testpaths = ["tests"]
 
 [tool.mypy]
 python_version = "3.11"
-# Incremental typing gate. These modules are fully annotated and stay clean;
-# the list grows as the rest of the package is annotated rather than being
+# Typing gate: every module in the package. Modules whose functions are still
+# partially unannotated are checked at signature level (mypy skips untyped
+# bodies by default); whatever is annotated must stay correct, and no module is
 # silenced with a blanket ignore.
 files = [
     "gamas_bot/__init__.py",
     "gamas_bot/bidi.py",
     "gamas_bot/billing.py",
+    "gamas_bot/bot.py",
     "gamas_bot/config.py",
+    "gamas_bot/db.py",
+    "gamas_bot/docx_export.py",
     "gamas_bot/instance_lock.py",
     "gamas_bot/launcher.py",
+    "gamas_bot/llm.py",
     "gamas_bot/logging_config.py",
     "gamas_bot/media.py",
     "gamas_bot/media_worker.py",
+    "gamas_bot/notes.py",
+    "gamas_bot/presentations.py",
     "gamas_bot/progress.py",
     "gamas_bot/telegram_text.py",
     "gamas_bot/textnorm.py",
+    "gamas_bot/__main__.py",
+    "gamas_bot/capacity.py",
+    "gamas_bot/fileio.py",
+    "gamas_bot/http_util.py",
+    "gamas_bot/jobs.py",
+    "gamas_bot/mdblocks.py",
+    "gamas_bot/metrics.py",
+    "gamas_bot/notes_evidence.py",
+    "gamas_bot/office.py",
+    "gamas_bot/office_ai.py",
+    "gamas_bot/pdf_export.py",
+    "gamas_bot/stt.py",
+    "gamas_bot/transcript.py",
 ]
 ignore_missing_imports = true
 warn_unused_ignores = true

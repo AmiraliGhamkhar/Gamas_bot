@@ -18,6 +18,7 @@ import zipfile
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
+from typing import Any, cast
 
 from lxml import etree
 
@@ -269,6 +270,27 @@ def _zip_member_stream_complete(handle, info: zipfile.ZipInfo) -> bool:
     )
 
 
+def _set_zip_read_budget(handle: object, budget: int) -> None:
+    """Let a ``ZipExtFile`` deliver ``budget`` bytes instead of the declared size.
+
+    ``ZipExtFile._left`` is the counter that stops a member at the
+    central-directory ``file_size``. Raising it one byte past that declaration
+    (never past the caller's hard limit) makes a forged *smaller* declaration
+    surface as an error instead of silently hiding decompressed bytes.
+
+    ``_left`` is a per-instance CPython implementation detail (set in
+    ``ZipExtFile.__init__``, undeclared by typeshed), so the write goes through
+    an ``Any`` cast — the same plain attribute write the original statement
+    performed.
+    """
+    cast("Any", handle)._left = budget
+
+
+def _path_size(path: Path) -> int:
+    """``Path.stat().st_size`` as a named function for :func:`asyncio.to_thread`."""
+    return path.stat().st_size
+
+
 def _read_member(archive: zipfile.ZipFile, name: str, limit: int) -> bytes | None:
     """Read one ZIP member under a hard output limit; never silently truncate."""
     try:
@@ -284,7 +306,7 @@ def _read_member(archive: zipfile.ZipFile, name: str, limit: int) -> bytes | Non
             # a forged smaller value is detected instead of silently hiding
             # decompressed bytes.
             member_cap = min(limit, info.file_size)
-            handle._left = member_cap + 1
+            _set_zip_read_budget(handle, member_cap + 1)
             payload = handle.read(member_cap + 1)
             complete = _zip_member_stream_complete(handle, info)
     except (zipfile.BadZipFile, EOFError, OSError, RuntimeError) as exc:
@@ -978,18 +1000,40 @@ def _preflight_zip_directory(path: Path) -> None:
     the advertised count/size first and reject pathological indexes early.
     """
     try:
-        with path.open("rb") as source:
-            end_record = zipfile._EndRecData(source)
+        advertised = _zip_directory_advertisement(path)
     except OSError as exc:
         raise PresentationError("فایل ارائه قابل‌خواندن نیست.") from exc
-    if end_record is None:
+    if advertised is None:
         return  # ``is_zipfile``/``ZipFile`` below will report malformed input.
-    entries = int(end_record[zipfile._ECD_ENTRIES_TOTAL])
-    directory_size = int(end_record[zipfile._ECD_SIZE])
+    entries, directory_size = advertised
     if entries > MAX_ZIP_ENTRIES:
         raise PresentationError("تعداد بخش‌های داخل فایل ارائه بیش از حد مجاز است.")
     if directory_size < 0 or directory_size > MAX_ZIP_CENTRAL_DIRECTORY_BYTES:
         raise PresentationError("فهرست داخلی فایل ارائه بیش از حد بزرگ است.")
+
+
+def _zip_directory_advertisement(path: Path) -> tuple[int, int] | None:
+    """``(advertised entries, central-directory size)`` from a zip's EOCD record.
+
+    ``zipfile._EndRecData`` and the ``_ECD_*`` index constants are CPython
+    implementation details (typeshed does not declare them and the stdlib has
+    no public early-count API), so they are fetched with ``getattr`` here, in
+    one place. ``None`` means "no EOCD record" — what ``_EndRecData`` itself
+    returns for non-zip data; the caller lets the real ``ZipFile`` open below
+    report malformed input.
+    """
+    end_rec_data = getattr(zipfile, "_EndRecData", None)
+    entries_index = getattr(zipfile, "_ECD_ENTRIES_TOTAL", None)
+    size_index = getattr(zipfile, "_ECD_SIZE", None)
+    if end_rec_data is None or entries_index is None or size_index is None:
+        # Not CPython, or a future stdlib that dropped the helper: the entry
+        # cap is still enforced when ZipFile materialises the directory.
+        return None
+    with path.open("rb") as source:
+        end_record = end_rec_data(source)
+    if end_record is None:
+        return None
+    return int(end_record[entries_index]), int(end_record[size_index])
 
 
 def _directory_size(directory: Path) -> int:
@@ -1020,7 +1064,7 @@ def _copy_zip_member_bounded(
         with archive.open(info) as source, destination.open("wb") as target:
             # Read at most one byte past the declared size to detect a forged
             # small file_size; the independent resource limit is checked too.
-            source._left = min(limit, info.file_size) + 1
+            _set_zip_read_budget(source, min(limit, info.file_size) + 1)
             while True:
                 chunk = source.read(min(1024 * 1024, min(limit, info.file_size) - copied + 1))
                 if not chunk:
@@ -1117,7 +1161,7 @@ def read_presentation(
                 f"رسانهٔ بدون پیوند مستقیم به اسلاید نادیده گرفته شد ({len(unreferenced)} فایل)"
             )
 
-        for slide_number, rel_id, part_name in references:
+        for ref_slide, ref_rel_id, part_name in references:
             kind = media_kind(part_name)
             if kind is None:
                 reason = f"{posixpath.basename(part_name)}: قالب رسانه پشتیبانی‌نشده"
@@ -1166,11 +1210,11 @@ def read_presentation(
             clips.append(
                 MediaClip(
                     order=len(clips) + 1,
-                    slide_number=slide_number,
+                    slide_number=ref_slide,
                     part_name=part_name,
                     path=destination,
                     kind=kind,
-                    relationship_id=rel_id,
+                    relationship_id=ref_rel_id,
                 )
             )
 
@@ -1266,9 +1310,10 @@ async def prepare_audio(
         logger.info("No usable narration in the deck skipped=%s", len(skipped))
         return None
 
+    durations = [clip.duration for clip in usable]
     measured_source = (
-        sum(clip.duration for clip in usable)
-        if all(clip.duration is not None for clip in usable)
+        sum(duration for duration in durations if duration is not None)
+        if all(duration is not None for duration in durations)
         else None
     )
     estimated_output = (
@@ -1300,7 +1345,7 @@ async def prepare_audio(
     if len(usable) == 1:
         clip = usable[0]
         info = probes[str(clip.path)]
-        clip_size = await asyncio.to_thread(lambda p=clip.path: p.stat().st_size)
+        clip_size = await asyncio.to_thread(_path_size, clip.path)
         if (
             clip.kind == "audio"
             and clip.duration is not None
@@ -1350,7 +1395,7 @@ async def prepare_audio(
         raise PresentationError(
             "مدت صدای ادغام‌شدهٔ این ارائه (با فاصله‌های بین کلیپ‌ها) از سقف ربات بیشتر است."
         )
-    result_size = await asyncio.to_thread(lambda p=result.path: p.stat().st_size)
+    result_size = await asyncio.to_thread(_path_size, result.path)
     if result_size > settings.max_file_size:
         raise PresentationError("صدای آماده‌شده از سقف حجم ربات بزرگ‌تر است.")
     if await asyncio.to_thread(_directory_size, workdir) > settings.presentation_max_temp_bytes:

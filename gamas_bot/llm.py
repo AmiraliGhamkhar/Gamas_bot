@@ -49,7 +49,7 @@ try:
 except ModuleNotFoundError:  # stdlib fallback: identical parsing contract
     _orjson = None  # type: ignore[assignment]
 
-    def _loads(body):  # type: ignore[no-redef]
+    def _loads(body):
         return json.loads(body.decode("utf-8", "replace"))
 
 
@@ -688,6 +688,9 @@ def _build_request_for(
     structured output; a provider that rejects the parameter drops it through
     the generic rejected-parameter retry.
     """
+    # One JSON request body per provider style, declared once: mypy otherwise
+    # unifies the three branch literals into a single wrong value type.
+    payload: dict[str, Any]
     style = route.style
     key = _clean_api_key(route.api_key)
     model = route.model.strip()

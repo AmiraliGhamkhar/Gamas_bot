@@ -50,6 +50,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from docx import Document
+from docx.document import Document as DocumentType
 from docx.enum.section import WD_SECTION
 from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.table import WD_ALIGN_VERTICAL, WD_TABLE_DIRECTION
@@ -57,6 +58,7 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
+from docx.text.paragraph import Paragraph
 from docx.text.run import Run
 from lxml import etree
 
@@ -969,7 +971,7 @@ def _add_rtl_paragraph(
     space_before: float = 0,
     line_spacing: float = 1.5,
     style: str | None = None,
-) -> object:
+) -> Paragraph:
     paragraph = container.add_paragraph()
     if style:
         _apply_paragraph_style(paragraph, container, style)
@@ -1001,7 +1003,7 @@ def _fill_paragraph(
     space_after: float = 10,
     space_before: float = 0,
     line_spacing: float = 1.5,
-) -> object:
+) -> Paragraph:
     """Apply RTL styling to an existing (possibly pre-created) paragraph."""
     _set_paragraph_alignment(paragraph, align)
     # The base direction is decided in ``_add_directional_text``, the single
@@ -1537,7 +1539,7 @@ def _inject_font_fallbacks(docx_bytes: bytes, fonts: DocumentFonts) -> bytes:
     return _rewrite_docx_part(docx_bytes, "word/fontTable.xml", transform)
 
 
-def _new_document(meta: DocumentMeta, title: str) -> Document:
+def _new_document(meta: DocumentMeta, title: str) -> DocumentType:
     document = Document()
     document.core_properties.title = xml_safe(title)
     document.core_properties.author = "Gamas Bot"
@@ -2140,7 +2142,7 @@ def _add_heading(
     size: float | None = None,
     space_before: float | None = None,
     space_after: float | None = None,
-) -> object:
+) -> Paragraph:
     """A *real* Word heading: ``w:pStyle`` Heading 1/2/3, not a styled Normal.
 
     The explicit run formatting keeps the Persian complex-script face and the

@@ -36,6 +36,7 @@ import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import aiohttp
 from telethon import Button, TelegramClient, events
@@ -2169,7 +2170,7 @@ class GamasBot:
             return True
         return False
 
-    def runtime_metrics(self) -> dict[str, object]:
+    def runtime_metrics(self) -> dict[str, Any]:
         """Point-in-time snapshot combining pipeline telemetry and live queue state."""
         snap = METRICS.snapshot()
         snap["queue_pending"] = self.queue.pending
@@ -3864,7 +3865,7 @@ class GamasBot:
                 f"{to_persian_digits(expiring['within_days'])} روز آینده منقضی می‌شود "
                 f"({format_duration(expiring['seconds'])})"
             )
-        db_errors = int(runtime.get("db_errors", 0) or 0)  # type: ignore[arg-type]
+        db_errors = int(runtime.get("db_errors", 0) or 0)
         if db_errors:
             items.append(
                 f"🗄 {to_persian_digits(db_errors)} خطای پایگاه‌داده از شروع اجرای این نسخه"
@@ -3872,7 +3873,7 @@ class GamasBot:
         transient = 0
         providers = runtime.get("providers", {}) or {}
         for layer in ("stt", "llm"):
-            for stats in (providers.get(layer, {}) or {}).values():  # type: ignore[union-attr]
+            for stats in (providers.get(layer, {}) or {}).values():
                 transient += sum(
                     int(stats.get(key, 0) or 0)
                     for key in ("timeouts", "rate_limits", "server_errors")
@@ -4086,7 +4087,7 @@ class GamasBot:
         stage_lines = []
         stages = runtime.get("stages", {}) or {}
         for stage_key, label in self.ADMIN_STAGE_LABELS_FA.items():
-            summary = (stages.get(stage_key, {}) or {})  # type: ignore[union-attr]
+            summary = (stages.get(stage_key, {}) or {})
             count = int(summary.get("count", 0) or 0)
             if count <= 0:
                 continue
@@ -4123,7 +4124,7 @@ class GamasBot:
         failovers = {"stt": 0, "llm": 0}
         providers = runtime.get("providers", {}) or {}
         for layer in failovers:
-            for stats in (providers.get(layer, {}) or {}).values():  # type: ignore[union-attr]
+            for stats in (providers.get(layer, {}) or {}).values():
                 failovers[layer] += int(stats.get("failovers_in", 0) or 0)
         lines.append(
             "🔁 جایگزینی خودکار (از شروع اجرا): "
@@ -4228,7 +4229,7 @@ class GamasBot:
         provider_lines: list[str] = []
         for layer, layer_label in (("stt", "STT"), ("llm", "LLM")):
             entries = providers.get(layer, {}) or {}
-            for slug, stats in sorted(entries.items()):  # type: ignore[union-attr]
+            for slug, stats in sorted(entries.items()):
                 provider_lines.append(
                     f"• {layer_label} {slug}: در حال اجرا "
                     f"{to_persian_digits(int(stats.get('in_flight', 0) or 0))}/"

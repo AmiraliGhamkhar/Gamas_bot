@@ -1843,13 +1843,13 @@ def gate_notes(
             else:
                 tables_accepted += 1
             accepted_tables.append(table)
-        gated = replace(
+        cleaned_section = replace(
             section,
             table=accepted_tables[0] if accepted_tables else None,
             tables=tuple(accepted_tables[1:]),
         )
-        if gated.has_content:
-            sections.append(gated)
+        if cleaned_section.has_content:
+            sections.append(cleaned_section)
 
     tips: list[PracticalTip] = []
     for tip in notes.practical_tips:
@@ -1993,7 +1993,7 @@ def build_repair_document(
     carries only those sections and is merged back by heading.
     """
     targeted = sections is not None
-    booklet = _subset_notes(notes, sections) if targeted else notes
+    booklet = _subset_notes(notes, sections) if sections is not None else notes
     parts: list[str] = []
     parts.append(
         "### جزوهٔ فعلی\n" + json.dumps(compact_notes_payload(booklet), ensure_ascii=False)
@@ -2134,10 +2134,10 @@ def scrub_fabricated_numbers(
         if text.strip():
             tips.append(replace(tip, text=text))
     glossary = []
-    for entry in notes.glossary:
-        definition = scrub(entry.definition)
+    for glossary_entry in notes.glossary:
+        definition = scrub(glossary_entry.definition)
         if definition.strip():
-            glossary.append(replace(entry, definition=definition))
+            glossary.append(replace(glossary_entry, definition=definition))
     scrubbed = replace(
         notes,
         title=scrub(notes.title),
@@ -2444,8 +2444,8 @@ def merge_repaired_sections(
     placed: set[int] = set()
     unplaced = 0
     for section in repaired:
-        index = indexes.get(heading_topic_key(section.heading))
-        if index is None:
+        match = indexes.get(heading_topic_key(section.heading))
+        if match is None:
             # A reworded heading still refers to one topic: accept the unique
             # unplaced section it clearly overlaps, never an ambiguous one.
             candidates = [
@@ -2454,12 +2454,12 @@ def merge_repaired_sections(
                 if position not in placed
                 and headings_overlap(section.heading, original.heading)
             ]
-            index = candidates[0] if len(candidates) == 1 else None
-        if index is None or index in placed:
+            match = candidates[0] if len(candidates) == 1 else None
+        if match is None or match in placed:
             unplaced += 1
             continue
-        merged[index] = section
-        placed.add(index)
+        merged[match] = section
+        placed.add(match)
     return replace(notes, sections=tuple(merged)), unplaced
 
 
@@ -3077,7 +3077,7 @@ def build_presentation_document(outline: str, transcript: str) -> str:
             )
         return "\n\n".join(sections)
 
-    sections: list[str] = []
+    sections = []
     if outline.strip():
         sections.append("## متن اسلایدها\n\n" + outline.strip())
     if transcript.strip():
