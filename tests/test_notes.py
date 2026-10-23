@@ -280,6 +280,26 @@ class PromptTests(unittest.TestCase):
         self.assertIn("SUMMARY", summary)
         self.assertIn("JSON", full)
 
+    def test_full_mode_is_compact_but_lossless(self):
+        """The full-mode contract: compact wording, no dropped facts, no added facts.
+
+        Regression guard for the prompt-edit that made `full` produce a compact
+        booklet. If someone reintroduces the old verbose rule, or a garbled
+        forbid-list bullet, this fails.
+        """
+        full = build_system_prompt("full")
+        # Compaction is instructed explicitly…
+        self.assertIn("جزوه باید «فشرده» باشد", full)
+        # …but only in wording: facts may not be dropped for brevity…
+        self.assertIn("فشرده‌سازی فقط در بیان است", full)
+        self.assertIn("هیچ مطلب علمیِ متن حذف نشود", full)
+        # …and nothing may be invented.
+        self.assertIn("هیچ مطلب تازه‌ای اضافه نکنید", full)
+        # The forbid-list bullet is clean Persian, not the old garbled text, and
+        # no bullet is glued onto its neighbour by a missing newline.
+        self.assertNotIn("similares", full)
+        self.assertNotIn("نیاورید.-", full)
+
     def test_context_block_appended(self):
         prompt = build_system_prompt("full", context_block="موضوع همین بخش: «تست»")
         self.assertIn("موضوع همین بخش", prompt)
