@@ -116,6 +116,7 @@ class UserRow:
     telegram_id: int
     joined_at: str
     banned: bool
+    first_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,18 +358,36 @@ class Database:
                 await self.db.execute(sql, params)
 
     # ------------------------------------------------------------------ users
-    async def ensure_user(self, telegram_id: int) -> UserRow:
+    async def ensure_user(
+        self, telegram_id: int, first_name: str | None = None
+    ) -> UserRow:
         await self._write(
             "INSERT OR IGNORE INTO users(telegram_id, joined_at) VALUES (?, ?)",
             (telegram_id, iso(utc_now())),
         )
+        # The leaderboard renders first names only, never ids or usernames, so
+        # the name is refreshed opportunistically whenever the dispatch layer
+        # has one. An empty/None argument must never blank a stored name.
+        if first_name:
+            await self.set_first_name(telegram_id, first_name)
         row = await _rows(self.db,
-            "SELECT telegram_id, joined_at, banned FROM users WHERE telegram_id = ?",
+            "SELECT telegram_id, joined_at, banned, first_name "
+            "FROM users WHERE telegram_id = ?",
             (telegram_id,),
         )
         if not row:
             raise RuntimeError(f"user {telegram_id} vanished after insert")
-        return UserRow(row[0][0], row[0][1], bool(row[0][2]))
+        return UserRow(row[0][0], row[0][1], bool(row[0][2]), str(row[0][3] or ""))
+
+    async def set_first_name(self, user_id: int, first_name: str) -> None:
+        """Store the bounded display name used by the public leaderboard."""
+        bounded = " ".join(str(first_name).split())[:64]
+        if not bounded:
+            return
+        await self._write(
+            "UPDATE users SET first_name = ? WHERE telegram_id = ?",
+            (bounded, int(user_id)),
+        )
 
     async def set_banned(
         self, telegram_id: int, banned: bool, *, admin_id: int | None = None
@@ -706,6 +725,35 @@ class Database:
             (int(user_id), int(item_id)),
         )
         return dict(rows[0]) if rows else None
+
+    async def library_item_detail(
+        self, user_id: int, item_id: int
+    ) -> dict[str, Any] | None:
+        """Fetch one artifact *with* its archived learning text.
+
+        The list/forward queries deliberately omit ``content_text`` (up to
+        60 KB per row) so paging never hauls whole booklets; the learning
+        screens are the only readers that need it.
+        """
+        rows = await _rows(
+            self.read_db,
+            "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+            "title, created_at, unavailable, content_text FROM library_items "
+            "WHERE user_id = ? AND item_id = ?",
+            (int(user_id), int(item_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def library_set_content(self, item_id: int, content_text: str) -> None:
+        """Persist the bounded plain text a quiz/flashcard run is grounded in.
+
+        Best-effort by contract: callers wrap this in the same delivery
+        try/except boundary as the library insert so it can never fail a send.
+        """
+        await self._write(
+            "UPDATE library_items SET content_text = ? WHERE item_id = ?",
+            (str(content_text), int(item_id)),
+        )
 
     async def library_count(self, user_id: int) -> int:
         rows = await _rows(

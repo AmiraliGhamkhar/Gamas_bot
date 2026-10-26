@@ -76,6 +76,7 @@ from .docx_export import (
     resolve_fonts,
 )
 from .jobs import Job, JobQueue, QueueFullError
+from .learning import bound_content_text
 from .logging_config import log_job_id
 from .metrics import METRICS
 from .media import (
@@ -1195,6 +1196,28 @@ class GamasBot:
     def _is_admin(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.settings.admin_ids
 
+    async def _capture_sender_name(self, event) -> None:
+        """Best-effort leaderboard name capture; a lookup failure is invisible.
+
+        Telethon only guarantees ``sender_id`` on every event; ``sender`` may
+        be uncached and ``get_sender()`` is a network call that can fail. The
+        leaderboard shows first names only and falls back to «کاربر گاماس», so
+        this path must never break message dispatch (and is skipped entirely on
+        test doubles without a sender).
+        """
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        try:
+            sender = getattr(event, "sender", None)
+            if sender is None and hasattr(event, "get_sender"):
+                sender = await event.get_sender()
+            first_name = getattr(sender, "first_name", None)
+            if first_name:
+                await self.db.set_first_name(user_id, first_name)
+        except Exception:
+            logger.debug("could not capture sender name", exc_info=True)
+
     async def _balance_text(self, user_id: int) -> str:
         """The balance as users see it: a special user has no limit to show."""
         if await self.db.is_unlimited(user_id):
@@ -1483,6 +1506,7 @@ class GamasBot:
         if user.banned:
             await event.reply("⛔ دسترسی شما به ربات مسدود شده است.")
             return
+        await self._capture_sender_name(event)
         text = (event.message.message or "").strip()
         command = _command_name(text)
         if command == "/start":
@@ -2516,10 +2540,24 @@ class GamasBot:
 
         if docx_path is not None:
             caption = f"📖 جزوهٔ Word — {reference}\n📚 در کتابخانهٔ شما ذخیره شد"
+            # Presentations pass their built document as plain_text and have no
+            # transcript object; media jobs carry the LLM-source transcript.
+            learning_source = (
+                plain_text
+                if plain_text is not None
+                else (document.llm_document() if document is not None else "")
+            )
+            learning_text = bound_content_text(learning_source)
             try:
                 message = await self._send_file(job, docx_path, caption=caption)
                 if message is not None:
-                    await self._save_library_item(job, "booklet", message, caption)
+                    await self._save_library_item(
+                        job,
+                        "booklet",
+                        message,
+                        caption,
+                        content_text=learning_text or None,
+                    )
             except Exception:
                 logger.exception("docx delivery failed")
                 notice = "\n\nنکته: ارسال فایل Word ناموفق بود؛ متن خام ارسال شد."
@@ -2555,14 +2593,22 @@ class GamasBot:
                 await stream.aclose()
 
     async def _save_library_item(
-        self, job: Job, kind: str, message: Message, title: str
+        self,
+        job: Job,
+        kind: str,
+        message: Message,
+        title: str,
+        *,
+        content_text: str | None = None,
     ) -> None:
         """Best-effort library index: a database hiccup can never fail delivery.
 
         Telegram owns the file; this stores only its message reference. Pruning
         follows insertion and is deliberately inside the same best-effort
         boundary, so a successful transcript/booklet always completes billing
-        and progress even if either write is temporarily unavailable.
+        and progress even if either write is temporarily unavailable. The
+        bounded learning text (quiz/flashcard source) is archived in the same
+        boundary; legacy rows simply keep ``content_text = NULL``.
         """
         chat_id = getattr(message, "chat_id", None)
         message_id = getattr(message, "id", None)
@@ -2573,7 +2619,7 @@ class GamasBot:
             )
             return
         try:
-            await self.db.library_add(
+            item_id = await self.db.library_add(
                 job.user_id,
                 kind,
                 chat_id,
@@ -2581,6 +2627,8 @@ class GamasBot:
                 job.submission_id,
                 title=title,
             )
+            if content_text:
+                await self.db.library_set_content(item_id, content_text)
             await self.db.library_prune(
                 job.user_id, self.settings.library_max_items
             )
@@ -2653,7 +2701,13 @@ class GamasBot:
             caption = f"📝 متن خام — {reference}"
             message = await self._send_file(job, raw_path, caption=caption)
             if message is not None:
-                await self._save_library_item(job, "transcript", message, caption)
+                await self._save_library_item(
+                    job,
+                    "transcript",
+                    message,
+                    caption,
+                    content_text=bound_content_text(raw_text) or None,
+                )
             return
         except Exception:
             logger.exception(
