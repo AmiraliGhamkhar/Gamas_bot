@@ -2744,6 +2744,11 @@ class GamasBot:
             # Any command leaves the conversational reply flow. In particular,
             # /start must not leave a stale ticket id armed for the next text.
             self._support_admin_states.pop(user_id, None)
+            # Disarm a manual flashcard prompt before the early-returning admin
+            # commands below, so /grant or /ban cannot leave it armed to swallow
+            # the admin's next plain message.
+            self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
         if self._is_admin(user_id) and command == "/grant":
             await self._admin_grant(event, text)
             return

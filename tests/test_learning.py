@@ -629,6 +629,23 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(stray)
         self.assertEqual(len(await self.db.deck_cards(deck_id)), 1)
 
+    async def test_admin_command_disarms_an_armed_manual_flashcard_prompt(self):
+        admin_id = next(iter(self.settings.admin_ids))
+        await self.db.ensure_user(admin_id)
+        await self.bot._handle_callback(self._event(b"fc:man", user_id=admin_id))
+        self.assertEqual(self.bot._pending_flashcard[admin_id][1], "front")
+        # The admin command branches return before the generic disarm block;
+        # a malformed /grant (usage reply, no writes) must still disarm first.
+        await self.bot._handle_message(FakeMessageEvent(admin_id, "/grant"))
+        self.assertNotIn(admin_id, self.bot._pending_flashcard)
+        # The admin's next plain message must not be swallowed as a card.
+        follow_up = FakeMessageEvent(admin_id, "پیام مدیریتی معمولی")
+        await self.bot._handle_message(follow_up)
+        self.assertNotIn(admin_id, self.bot._pending_flashcard)
+        decks = await self.db.decks_list(admin_id)
+        self.assertEqual(len(decks), 1)  # the armed manual deck itself
+        self.assertEqual(await self.db.deck_cards(decks[0]["deck_id"]), [])
+
     async def test_study_flip_next_persists_cursor_and_restarts(self):
         deck_id = await self.db.deck_create(OWNER, None, "دسته دستی", "manual")
         for index in range(3):
