@@ -336,6 +336,7 @@ class FakeCallbackEvent:
         self.client = client
         self.data = data
         self.sender_id = chat_id
+        self.chat_id = chat_id
         self.message = FakeTelegramMessage(client, chat_id=chat_id, message_id=message_id)
         self.answers: list[tuple[str | None, bool]] = []
         self.edits: list[dict] = []

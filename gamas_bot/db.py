@@ -1099,6 +1099,166 @@ class Database:
             "is_unlimited": bool(rows[0][3]),
         }
 
+    # ----------------------------------------------------- learning: flashcards
+    async def deck_count(self, user_id: int) -> int:
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM flashcard_decks WHERE user_id = ?",
+            (int(user_id),),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    async def deck_create(
+        self,
+        user_id: int,
+        item_id: int | None,
+        title: str,
+        source: str,
+    ) -> int:
+        if source not in ("ai", "manual"):
+            raise ValueError(f"invalid deck source {source!r}")
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "INSERT INTO flashcard_decks(user_id, item_id, title, source, "
+                "study_cursor, created_at) VALUES (?, ?, ?, ?, 0, ?)",
+                (int(user_id), item_id, str(title), source, iso(utc_now())),
+            )
+            return int(cursor.lastrowid or 0)
+
+    async def deck_create_with_cards(
+        self,
+        user_id: int,
+        item_id: int,
+        title: str,
+        cards: list[dict[str, str]],
+    ) -> int:
+        """An AI deck and every card it contains, inserted atomically."""
+        if not cards:
+            raise ValueError("a deck needs at least one card")
+        now = iso(utc_now())
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "INSERT INTO flashcard_decks(user_id, item_id, title, source, "
+                "study_cursor, created_at) VALUES (?, ?, ?, 'ai', 0, ?)",
+                (int(user_id), int(item_id), str(title), now),
+            )
+            deck_id = int(cursor.lastrowid or 0)
+            for idx, card in enumerate(cards):
+                await self.db.execute(
+                    "INSERT INTO flashcards(deck_id, idx, front, back) "
+                    "VALUES (?, ?, ?, ?)",
+                    (deck_id, idx, str(card["front"]), str(card["back"])),
+                )
+            return deck_id
+
+    async def manual_deck_get_or_create(self, user_id: int) -> int:
+        """The single per-user manual deck, created once and reused."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT deck_id FROM flashcard_decks WHERE user_id = ? "
+            "AND source = 'manual' ORDER BY deck_id LIMIT 1",
+            (int(user_id),),
+        )
+        if rows:
+            return int(rows[0][0])
+        return await self.deck_create(
+            user_id, None, "فلش‌کارت‌های دستی من", "manual"
+        )
+
+    async def deck_add_card(self, deck_id: int, front: str, back: str) -> int:
+        """Append a card and return the deck's new card count."""
+        async with self._transaction():
+            count_rows = await _rows(self.db,
+                "SELECT COUNT(*) FROM flashcards WHERE deck_id = ?",
+                (int(deck_id),),
+            )
+            idx = int(count_rows[0][0]) if count_rows else 0
+            await self.db.execute(
+                "INSERT INTO flashcards(deck_id, idx, front, back) "
+                "VALUES (?, ?, ?, ?)",
+                (int(deck_id), idx, str(front), str(back)),
+            )
+            return idx + 1
+
+    async def deck_get(self, deck_id: int, user_id: int) -> dict[str, Any] | None:
+        """Fetch one deck only when it belongs to ``user_id``."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT deck_id, user_id, item_id, title, source, study_cursor, "
+            "created_at FROM flashcard_decks WHERE deck_id = ? AND user_id = ?",
+            (int(deck_id), int(user_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def deck_cards(self, deck_id: int) -> list[dict[str, Any]]:
+        rows = await _rows(
+            self.read_db,
+            "SELECT card_id, deck_id, idx, front, back FROM flashcards "
+            "WHERE deck_id = ? ORDER BY idx",
+            (int(deck_id),),
+        )
+        return [dict(row) for row in rows]
+
+    async def deck_card(self, deck_id: int, card_id: int) -> dict[str, Any] | None:
+        rows = await _rows(
+            self.read_db,
+            "SELECT card_id, idx, front, back FROM flashcards "
+            "WHERE deck_id = ? AND card_id = ?",
+            (int(deck_id), int(card_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def deck_set_cursor(self, deck_id: int, cursor: int) -> None:
+        await self._write(
+            "UPDATE flashcard_decks SET study_cursor = ? WHERE deck_id = ?",
+            (max(0, int(cursor)), int(deck_id)),
+        )
+
+    async def deck_delete(self, deck_id: int, user_id: int) -> bool:
+        """Delete a deck; cards cascade via the foreign-key action."""
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "DELETE FROM flashcard_decks WHERE deck_id = ? AND user_id = ?",
+                (int(deck_id), int(user_id)),
+            )
+            return cursor.rowcount == 1
+
+    async def decks_list(
+        self, user_id: int, *, limit: int = 6, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Newest decks first, each annotated with its card count."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT d.deck_id, d.item_id, d.title, d.source, d.study_cursor, "
+            "d.created_at, (SELECT COUNT(*) FROM flashcards c WHERE c.deck_id = d.deck_id) "
+            "AS card_count FROM flashcard_decks d WHERE d.user_id = ? "
+            "ORDER BY d.deck_id DESC LIMIT ? OFFSET ?",
+            (int(user_id), max(1, int(limit)), max(0, int(offset))),
+        )
+        return [dict(row) for row in rows]
+
+    async def library_list_kind(
+        self, user_id: int, kind: str, *, limit: int = 6, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """One newest-first page of one artifact kind (flashcard picker)."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+            "title, created_at, unavailable FROM library_items "
+            "WHERE user_id = ? AND kind = ? "
+            "ORDER BY item_id DESC LIMIT ? OFFSET ?",
+            (int(user_id), str(kind), max(1, int(limit)), max(0, int(offset))),
+        )
+        return [dict(row) for row in rows]
+
+    async def library_count_kind(self, user_id: int, kind: str) -> int:
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM library_items WHERE user_id = ? AND kind = ?",
+            (int(user_id), str(kind)),
+        )
+        return int(rows[0][0]) if rows else 0
+
     # ------------------------------------------------------- admin reporting
     #: Terminal statuses that mean the user actually received the raw
     #: transcript. ``partial`` delivered it too, with a failed booklet on top.

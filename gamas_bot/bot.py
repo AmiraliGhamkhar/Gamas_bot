@@ -77,11 +77,17 @@ from .docx_export import (
 )
 from .jobs import Job, JobQueue, QueueFullError
 from .learning import (
+    FLASHCARD_SCHEMA,
+    MAX_MANUAL_BACK_CHARS,
+    MAX_MANUAL_FRONT_CHARS,
     MAX_MODEL_INPUT_CHARS,
+    MIN_VALID_CARDS,
     MIN_VALID_QUESTIONS,
     OPTION_LABELS,
     QUIZ_SCHEMA,
     bound_content_text,
+    flashcard_system_prompt,
+    parse_flashcard_payload,
     parse_quiz_payload,
     quiz_system_prompt,
 )
@@ -1830,6 +1836,506 @@ class GamasBot:
             logger.warning("gift DM failed user=%s", target_id, exc_info=True)
         await self._admin_board(event, notice="✅ هدیه ثبت شد.")
 
+    # --------------------------------------------------------------- flashcards
+    @staticmethod
+    def _deck_stale_alert() -> str:
+        return "این فلش‌کارت دیگر معتبر نیست."
+
+    def _item_display_title(self, item: dict) -> str:
+        """A clean one-line title for learning screens and generated decks."""
+        raw = " ".join(str(item.get("title") or "").split())
+        if not raw:
+            return "جزوهٔ Word" if item.get("kind") == "booklet" else "متن گفتار"
+        return raw
+
+    async def _flashcard_start_screen(
+        self, event, user_id: int, item_id: int
+    ) -> None:
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None or item.get("kind") != "booklet":
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        if not item.get("content_text"):
+            await self._edit(
+                event,
+                "🃏 فلش‌کارت\n\n" + LEARNING_LEGACY_NOTICE,
+                [[Button.inline("↩️ بازگشت", b"library")]],
+            )
+            return
+        size = self.settings.flashcard_ai_deck_size
+        cost = self.settings.flashcard_ai_cost_seconds
+        text = (
+            "ساخت فلش‌کارت با هوش مصنوعی از این جزوه. مجموعه‌ای از "
+            f"{to_persian_digits(size)} پرسش و پاسخ ساخته می‌شود.\n"
+            f"هزینه: {format_duration(cost)} اعتبار"
+        )
+        await self._edit(event, text, [
+            [Button.inline(
+                "🤖 ساخت فلش‌کارت", f"fc:go:{item_id}".encode("ascii")
+            )],
+            [self._learning_back_button(item_id)],
+        ])
+
+    async def _flashcard_generate(
+        self, event, user_id: int, item_id: int
+    ) -> None:
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None or item.get("kind") != "booklet":
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        content = item.get("content_text")
+        if not content:
+            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
+            return
+        if not self.settings.note_configured:
+            await event.respond("سرویس ساخت فلش‌کارت در حال حاضر فعال نیست.")
+            return
+        if await self.db.deck_count(user_id) >= self.settings.flashcard_max_decks_per_user:
+            await event.respond(
+                "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ برای ساخت مجموعهٔ جدید "
+                "یک مجموعهٔ قدیمی را حذف کنید."
+            )
+            return
+        if user_id in self._learning_in_flight:
+            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
+            return
+        self._learning_in_flight.add(user_id)
+        async with self._learning_lock(user_id):
+            try:
+                cost = self.settings.flashcard_ai_cost_seconds
+                size = self.settings.flashcard_ai_deck_size
+                note = f"fc-pending:{item_id}"
+                try:
+                    charged = await self.db.spend_seconds(user_id, cost, note)
+                except InsufficientBalanceError:
+                    await event.respond(
+                        LEARNING_NO_CREDIT,
+                        buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+                    )
+                    return
+                placeholder = await event.respond("در حال ساخت فلش‌کارت‌ها… ⏳")
+                try:
+                    model_input = bound_content_text(
+                        content, limit=MAX_MODEL_INPUT_CHARS
+                    )
+                    payload = await complete_json(
+                        self._http_session(),
+                        self.settings,
+                        system=flashcard_system_prompt(size),
+                        user=model_input,
+                        schema=FLASHCARD_SCHEMA,
+                    )
+                    cards = parse_flashcard_payload(payload, size)
+                    if len(cards) < MIN_VALID_CARDS:
+                        raise RuntimeError("flashcard generation yielded too few cards")
+                    title = self._item_display_title(item) + " — فلش‌کارت"
+                    deck_id = await self.db.deck_create_with_cards(
+                        user_id, item_id, title[:200], cards
+                    )
+                except BaseException as exc:
+                    if charged:
+                        try:
+                            await self.db.refund_seconds(user_id, cost, note)
+                        except Exception:
+                            logger.exception(
+                                "flashcard refund failed user=%s cost=%s", user_id, cost
+                            )
+                    try:
+                        await placeholder.edit(LEARNING_GENERATION_FAILED)
+                    except Exception:
+                        logger.warning("could not edit flashcard placeholder", exc_info=True)
+                    if isinstance(
+                        exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+                    ):
+                        raise
+                    logger.warning("flashcard generation failed", exc_info=exc)
+                    return
+                deck = await self.db.deck_get(deck_id, user_id)
+                await placeholder.edit(
+                    f"🃏 مجموعهٔ فلش‌کارت ساخته شد — {title[:200]}",
+                )
+                if deck is None:
+                    await event.respond("مجموعه ساخته شد؛ از «کتابخانه من» بازش کنید.")
+                    return
+                await event.respond(
+                    self._deck_screen_text(deck, len(cards)),
+                    buttons=self._deck_keyboard(deck_id, bool(cards)),
+                )
+            finally:
+                self._learning_in_flight.discard(user_id)
+
+    async def _show_flashcard_hub(self, event, *, page: int = 0) -> None:
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        page_size = 6
+        count = await self.db.deck_count(user_id)
+        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
+        decks = await self.db.decks_list(
+            user_id, limit=page_size, offset=page * page_size
+        )
+        if count == 0:
+            text = FLASHCARD_EMPTY
+            buttons: list[list] = []
+        else:
+            text = (
+                "🃏 فلش‌کارت‌ها\n\n"
+                f"تعداد مجموعه‌ها: {to_persian_digits(count)}"
+            )
+            buttons = []
+            for deck in decks:
+                label = button_label(
+                    f"{deck['title']} ({to_persian_digits(deck['card_count'])} کارت)"
+                )
+                buttons.append([
+                    Button.inline(
+                        label, f"fc:deck:{deck['deck_id']}".encode("ascii")
+                    )
+                ])
+            nav = []
+            if page > 0:
+                nav.append(Button.inline(
+                    "◀️ قبلی", f"fc:hub:{page - 1}".encode("ascii")
+                ))
+            if (page + 1) * page_size < count:
+                nav.append(Button.inline(
+                    "بعدی ▶️", f"fc:hub:{page + 1}".encode("ascii")
+                ))
+            if nav:
+                buttons.append(nav)
+        buttons.extend([
+            [Button.inline("✍️ ساخت دستی", b"fc:man")],
+            [Button.inline("🤖 از یک جزوه بساز", b"fc:pick:0")],
+            [
+                Button.inline("📖 جزوه‌ها", b"library"),
+                Button.inline("↩️ منوی اصلی", b"menu:main"),
+            ],
+        ])
+        await self._edit_or_reply(event, text, buttons)
+
+    async def _show_booklet_picker(self, event, *, page: int = 0) -> None:
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        page_size = 6
+        count = await self.db.library_count_kind(user_id, "booklet")
+        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
+        items = await self.db.library_list_kind(
+            user_id, "booklet", limit=page_size, offset=page * page_size
+        )
+        buttons: list[list] = []
+        if not items:
+            text = (
+                "🤖 ساخت فلش‌کارت از جزوه\n\n"
+                "هنوز جزوه‌ای در کتابخانهٔ شما ذخیره نشده است."
+            )
+        else:
+            text = "یک جزوه را برای ساخت فلش‌کارت انتخاب کنید:"
+            for item in items:
+                title = self._item_display_title(item)
+                buttons.append([
+                    Button.inline(
+                        button_label(f"📖 {title}"),
+                        f"fc:ai:{item['item_id']}".encode("ascii"),
+                    )
+                ])
+            nav = []
+            if page > 0:
+                nav.append(Button.inline(
+                    "◀️ قبلی", f"fc:pick:{page - 1}".encode("ascii")
+                ))
+            if (page + 1) * page_size < count:
+                nav.append(Button.inline(
+                    "بعدی ▶️", f"fc:pick:{page + 1}".encode("ascii")
+                ))
+            if nav:
+                buttons.append(nav)
+        buttons.append([Button.inline("↩️ بازگشت", b"fc:hub")])
+        await self._edit(event, text, buttons)
+
+    async def _start_manual_deck(self, event, user_id: int) -> None:
+        if await self.db.deck_count(user_id) >= self.settings.flashcard_max_decks_per_user:
+            await event.respond(
+                "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ یک مجموعهٔ قدیمی را حذف کنید."
+            )
+            return
+        deck_id = await self.db.manual_deck_get_or_create(user_id)
+        self._pending_flashcard[user_id] = (deck_id, "front")
+        self._pending_flashcard_front.pop(user_id, None)
+        await event.respond(
+            FLASHCARD_ASK_FRONT,
+            buttons=[[Button.inline("✅ پایان", b"fc:man:done")]],
+        )
+
+    async def _handle_flashcard_text(self, event, user_id: int, text: str) -> None:
+        """One step of the guided manual-card conversation (armed by fc:man)."""
+        deck_id, phase = self._pending_flashcard[user_id]
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
+            await event.reply("این مجموعه دیگر در دسترس نیست.")
+            return
+        end_button = [[Button.inline("✅ پایان", b"fc:man:done")]]
+        if not text:
+            await event.reply("لطفاً متن را در یک پیام متنی بفرستید.")
+            return
+        if phase == "front":
+            self._pending_flashcard_front[user_id] = text[:MAX_MANUAL_FRONT_CHARS]
+            self._pending_flashcard[user_id] = (deck_id, "back")
+            await event.reply(FLASHCARD_ASK_BACK, buttons=end_button)
+            return
+        front = self._pending_flashcard_front.pop(user_id, "")
+        if not front:
+            # Defensive: a stale back-phase with no stored front restarts cleanly.
+            self._pending_flashcard[user_id] = (deck_id, "front")
+            await event.reply(FLASHCARD_ASK_FRONT, buttons=end_button)
+            return
+        count = await self.db.deck_add_card(
+            deck_id, front, text[:MAX_MANUAL_BACK_CHARS]
+        )
+        self._pending_flashcard[user_id] = (deck_id, "front")
+        await event.reply(
+            f"کارت اضافه شد ({to_persian_digits(count)} کارت). "
+            "پرسش کارت بعدی را بفرستید.",
+            buttons=end_button,
+        )
+
+    def _deck_screen_text(self, deck: dict, card_count: int) -> str:
+        return (
+            f"🃏 {deck['title']}\n\n"
+            f"تعداد کارت‌ها: {to_persian_digits(card_count)}"
+        )
+
+    def _deck_keyboard(self, deck_id: int, has_cards: bool) -> list[list]:
+        buttons: list[list] = []
+        if has_cards:
+            buttons.append([Button.inline(
+                "▶️ مرور فلش‌کارت‌ها", f"fc:study:{deck_id}".encode("ascii")
+            )])
+        buttons.append([Button.inline(
+            "📄 خروجی Word", f"fc:exp:{deck_id}".encode("ascii")
+        )])
+        buttons.append([Button.inline(
+            "🗑 حذف دسته", f"fc:del:{deck_id}".encode("ascii")
+        )])
+        buttons.append([Button.inline("↩️ بازگشت", b"fc:hub")])
+        return buttons
+
+    async def _show_deck_screen(self, event, user_id: int, deck_id: int) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        cards = await self.db.deck_cards(deck_id)
+        await self._edit(
+            event,
+            self._deck_screen_text(deck, len(cards)),
+            self._deck_keyboard(deck_id, bool(cards)),
+        )
+
+    async def _study_front(
+        self, event, user_id: int, deck_id: int, *, restart: bool = False
+    ) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        cards = await self.db.deck_cards(deck_id)
+        if not cards:
+            await self._ack(event, "این مجموعه هنوز کارتی ندارد.", alert=True)
+            return
+        cursor = 0 if restart else min(int(deck["study_cursor"]), len(cards) - 1)
+        if restart:
+            await self.db.deck_set_cursor(deck_id, 0)
+        card = cards[cursor]
+        await self._edit(event, "پرسش:\n\n" + card["front"], [
+            [Button.inline(
+                "👁 نمایش پاسخ",
+                f"fc:flip:{deck_id}:{card['card_id']}".encode("ascii"),
+            )],
+            [Button.inline(
+                "⏹ پایان مرور", f"fc:done:{deck_id}".encode("ascii")
+            )],
+        ])
+
+    async def _flip_card(
+        self, event, user_id: int, deck_id: int, card_id: int
+    ) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        card = await self.db.deck_card(deck_id, card_id)
+        if card is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        await self._edit(event, "پاسخ:\n\n" + card["back"], [
+            [Button.inline(
+                "➡️ کارت بعدی", f"fc:next:{deck_id}".encode("ascii")
+            )],
+            [Button.inline(
+                "⏹ پایان مرور", f"fc:done:{deck_id}".encode("ascii")
+            )],
+        ])
+
+    async def _next_card(self, event, user_id: int, deck_id: int) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        total = len(await self.db.deck_cards(deck_id))
+        if total == 0:
+            await self._ack(event, "این مجموعه هنوز کارتی ندارد.", alert=True)
+            return
+        new_cursor = int(deck["study_cursor"]) + 1
+        await self.db.deck_set_cursor(deck_id, new_cursor)
+        if new_cursor >= total:
+            await self._edit(event, (
+                "مرور تمام شد — "
+                f"{to_persian_digits(total)} کارت مرور شد."
+            ), [
+                [Button.inline(
+                    "🔁 از ابتدا", f"fc:restart:{deck_id}".encode("ascii")
+                )],
+                [Button.inline("↩️ بازگشت", b"fc:hub")],
+            ])
+            return
+        await self._study_front(event, user_id, deck_id)
+
+    async def _export_deck_docx(
+        self, event, user_id: int, deck_id: int
+    ) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        cards = await self.db.deck_cards(deck_id)
+        if not cards:
+            await self._ack(event, "این مجموعه هنوز کارتی ندارد.", alert=True)
+            return
+        body_parts = [
+            f"پرسش {to_persian_digits(index)}: {card['front']}\nپاسخ: {card['back']}"
+            for index, card in enumerate(cards, start=1)
+        ]
+        meta = DocumentMeta(
+            reference=f"flashcard-{deck_id}",
+            source_name="flashcards",
+            created_at=datetime.now(),
+        )
+        docx_bytes = await asyncio.to_thread(
+            build_plain_docx,
+            deck["title"],
+            "\n\n".join(body_parts),
+            fonts=resolve_fonts(),
+            design=resolve_design(),
+            meta=meta,
+        )
+        workdir = Path(await run_file_io_resource(
+            tempfile.mkdtemp,
+            lambda path: shutil.rmtree(path, ignore_errors=True),
+            prefix="deck-",
+            dir=self.settings.temp_dir,
+        ))
+        path = workdir / f"flashcard-{deck_id}.docx"
+        try:
+            await run_file_io(path.write_bytes, docx_bytes)
+            await self._send_telegram_file(
+                event.chat_id,
+                path,
+                caption=f"🃏 فلش‌کارت‌ها — {deck['title']}"[:TELEGRAM_CAPTION_LIMIT],
+                force_document=True,
+            )
+        finally:
+            await run_file_io(shutil.rmtree, workdir, ignore_errors=True)
+
+    async def _route_flashcard_callback(
+        self, event, user_id: int, data: str
+    ) -> None:
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "hub":
+            page = _to_int(parts[2]) if len(parts) == 3 else 0
+            await self._show_flashcard_hub(event, page=max(0, page or 0))
+            return
+        if action == "pick":
+            page = _to_int(parts[2]) if len(parts) == 3 else 0
+            await self._show_booklet_picker(event, page=max(0, page or 0))
+            return
+        if action == "man" and len(parts) == 2:
+            await self._start_manual_deck(event, user_id)
+            return
+        if action == "man" and len(parts) == 3 and parts[2] == "done":
+            state = self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
+            if state is None:
+                await self._show_flashcard_hub(event)
+            else:
+                await event.respond("✅ ساخت کارت پایان یافت.")
+                await self._show_deck_screen(event, user_id, state[0])
+            return
+        if action == "ai" and len(parts) == 3:
+            item_id = _to_int(parts[2])
+            if item_id is None:
+                await self._ack(event, self._deck_stale_alert(), alert=True)
+                return
+            await self._flashcard_start_screen(event, user_id, item_id)
+            return
+        if action == "go" and len(parts) == 3:
+            item_id = _to_int(parts[2])
+            if item_id is None:
+                await self._ack(event, self._deck_stale_alert(), alert=True)
+                return
+            await self._flashcard_generate(event, user_id, item_id)
+            return
+        if action in {"deck", "study", "exp", "del", "delok", "done",
+                      "restart", "next"} and len(parts) == 3:
+            deck_id = _to_int(parts[2])
+            if deck_id is None:
+                await self._ack(event, self._deck_stale_alert(), alert=True)
+                return
+            if action == "deck":
+                await self._show_deck_screen(event, user_id, deck_id)
+            elif action == "study":
+                await self._study_front(event, user_id, deck_id)
+            elif action == "exp":
+                await self._export_deck_docx(event, user_id, deck_id)
+            elif action == "del":
+                deck = await self.db.deck_get(deck_id, user_id)
+                if deck is None:
+                    await self._ack(event, self._deck_stale_alert(), alert=True)
+                    return
+                await self._edit(event, "آیا مطمئنید؟", [
+                    [Button.inline(
+                        "✅ بله، حذف کن", f"fc:delok:{deck_id}".encode("ascii")
+                    )],
+                    [Button.inline(
+                        "↩️ بازگشت", f"fc:deck:{deck_id}".encode("ascii")
+                    )],
+                ])
+            elif action == "delok":
+                deleted = await self.db.deck_delete(deck_id, user_id)
+                if not deleted:
+                    await self._ack(event, self._deck_stale_alert(), alert=True)
+                else:
+                    await self._show_flashcard_hub(event)
+            elif action == "done":
+                await self._show_deck_screen(event, user_id, deck_id)
+            elif action == "restart":
+                await self._study_front(event, user_id, deck_id, restart=True)
+            elif action == "next":
+                await self._next_card(event, user_id, deck_id)
+            return
+        if action == "flip" and len(parts) == 4:
+            deck_id = _to_int(parts[2])
+            card_id = _to_int(parts[3])
+            if deck_id is None or card_id is None:
+                await self._ack(event, self._deck_stale_alert(), alert=True)
+                return
+            await self._flip_card(event, user_id, deck_id, card_id)
+            return
+        await self._ack(event, self._deck_stale_alert(), alert=True)
+
     async def _route_quiz_callback(self, event, user_id: int, data: str) -> None:
         """Parse and dispatch every ``quiz:`` callback, failing closed."""
         parts = data.split(":")
@@ -1909,6 +2415,10 @@ class GamasBot:
             self._support_states.pop(user_id, None)
         if not data.startswith("adm:sr:"):
             self._support_admin_states.pop(user_id, None)
+        # A manual-flashcard conversation likewise ends at any navigation;
+        # fc:man re-arms itself inside its own branch.
+        self._pending_flashcard.pop(user_id, None)
+        self._pending_flashcard_front.pop(user_id, None)
 
         if data == "help":
             await self._ack(event)
@@ -1934,6 +2444,9 @@ class GamasBot:
         elif data == "library":
             await self._ack(event)
             await self._show_library(event)
+        elif data == "library:fc":
+            await self._ack(event)
+            await self._show_flashcard_hub(event)
         elif data == "board":
             await self._ack(event)
             await self._show_leaderboard(event)
@@ -2075,6 +2588,9 @@ class GamasBot:
         elif data.startswith("quiz:"):
             await self._ack(event)
             await self._route_quiz_callback(event, user_id, data)
+        elif data.startswith("fc:"):
+            await self._ack(event)
+            await self._route_flashcard_callback(event, user_id, data)
         else:
             await self._ack(event)
 
@@ -2101,6 +2617,8 @@ class GamasBot:
             self._pending_payments.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
+            self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
             await self._show_main(event, first_start=True)
             return
 
@@ -2174,8 +2692,21 @@ class GamasBot:
             self._pending_payments.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
+            self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
             await event.reply("ارسال لغو شد. برای لغو سفارش، از «💳 حساب من» اقدام کنید.")
             return
+
+        # Manual flashcard conversation: armed by fc:man and disarmed by any
+        # command or navigation callback. It must sit before media intake so a
+        # plain text answer can never fall through to the lecture pipeline.
+        if user_id in self._pending_flashcard:
+            if command:
+                self._pending_flashcard.pop(user_id, None)
+                self._pending_flashcard_front.pop(user_id, None)
+            else:
+                await self._handle_flashcard_text(event, user_id, text)
+                return
 
         # Presentations.
         pkind, pfilename = _presentation_metadata(event.message)

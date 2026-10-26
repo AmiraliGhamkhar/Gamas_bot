@@ -12,6 +12,7 @@ import random
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from gamas_bot.bot import GamasBot, LEARNING_GENERATION_FAILED, LEARNING_NO_CREDIT
@@ -23,8 +24,13 @@ from gamas_bot.learning import (
     parse_quiz_payload,
 )
 from gamas_bot.llm import LLMError
-from tests.support import FakeCallbackEvent, FakeTelegramClient, make_settings
-from tests.test_bot import menu_payloads
+from tests.support import (
+    FakeCallbackEvent,
+    FakeTelegramClient,
+    docx_text,
+    make_settings,
+)
+from tests.test_bot import FakeMessageEvent, menu_payloads
 
 OWNER = 555
 OTHER = 999
@@ -388,6 +394,255 @@ class LeaderboardAndGiftTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(event)
         self.assertEqual(event.answers[-1][1], True)
         self.assertFalse(event.edits)
+
+
+class FlashcardDatabaseTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self._tmp.name) / "fc.db")
+        await self.db.connect()
+        await self.db.ensure_user(OWNER)
+        await self.db.ensure_user(OTHER)
+        self.item_id = await self.db.library_add(
+            OWNER, "booklet", 10, 20, None, title="جزوه"
+        )
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def test_deck_lifecycle_and_cascade(self):
+        deck_id = await self.db.deck_create(OWNER, self.item_id, "دسته", "ai")
+        for index in range(3):
+            count = await self.db.deck_add_card(deck_id, f"پرسش {index}", f"پاسخ {index}")
+        self.assertEqual(count, 3)
+        self.assertEqual(len(await self.db.deck_cards(deck_id)), 3)
+        await self.db.deck_set_cursor(deck_id, 2)
+        decks = await self.db.decks_list(OWNER)
+        self.assertEqual(decks[0]["card_count"], 3)
+        self.assertEqual(decks[0]["study_cursor"], 2)
+        self.assertIsNone(await self.db.deck_get(deck_id, OTHER))
+        self.assertTrue(await self.db.deck_delete(deck_id, OWNER))
+        cards = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM flashcards WHERE deck_id=?", (deck_id,)
+        )
+        self.assertEqual(cards[0][0], 0)
+
+    async def test_manual_deck_is_singular_and_itemless(self):
+        first = await self.db.manual_deck_get_or_create(OWNER)
+        second = await self.db.manual_deck_get_or_create(OWNER)
+        self.assertEqual(first, second)
+        deck = await self.db.deck_get(first, OWNER)
+        self.assertEqual(deck["source"], "manual")
+        self.assertIsNone(deck["item_id"])
+
+    async def test_deck_survives_library_prune_but_quiz_sessions_do_not(self):
+        deck_id = await self.db.deck_create(OWNER, self.item_id, "دسته", "ai")
+        await self.db.deck_add_card(deck_id, "پ", "پا")
+        questions = [{
+            "question": "سؤال", "options": ["الف", "ب", "ج", "د"],
+            "correct_index": 0, "explanation": "چرا",
+        }]
+        session_id = await self.db.quiz_create_session(OWNER, self.item_id, questions)
+        await self.db.library_prune(OWNER, keep=0)
+        deck = await self.db.deck_get(deck_id, OWNER)
+        self.assertIsNotNone(deck)
+        self.assertIsNone(deck["item_id"])  # SET NULL, deck retained
+        self.assertIsNone(await self.db.quiz_get_session(session_id, OWNER))  # CASCADE
+
+
+class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "fc.db",
+            temp_dir=root / "tmp",
+            flashcard_ai_cost_seconds=300,
+            flashcard_ai_deck_size=6,
+            flashcard_max_decks_per_user=2,
+        )
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.recorder = SimpleNamespace(files=[], file_payloads=[], replies=[], edits=[])
+        self.client = FakeTelegramClient(self.recorder)
+        self.bot.client = self.client
+        await self.db.ensure_user(OWNER)
+        await self.db.add_credit(OWNER, 3600, note="test", validity_days=30)
+        self.item_id = await self.db.library_add(
+            OWNER, "booklet", 10, 20, None, title="📖 جزوهٔ Word — GMS-9"
+        )
+        await self.db.library_set_content(self.item_id, "متن جزوه برای فلش‌کارت")
+        # A transcript that must never appear in the booklet picker.
+        await self.db.library_add(OWNER, "transcript", 11, 21, None, title="متن خام")
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    def _event(self, data: bytes, user_id: int = OWNER) -> FakeCallbackEvent:
+        event = FakeCallbackEvent(self.client, data=data, chat_id=user_id)
+        event.client = self.client
+        return event
+
+    @staticmethod
+    def _cards_payload(count: int) -> dict:
+        return {
+            "cards": [
+                {"front": f"پرسش {index}", "back": f"پاسخ {index}"}
+                for index in range(count)
+            ]
+        }
+
+    async def test_ai_generation_debits_and_builds_deck(self):
+        event = self._event(f"fc:go:{self.item_id}".encode())
+        with mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=self._cards_payload(6)),
+        ) as generator:
+            await self.bot._handle_callback(event)
+            generator.assert_awaited_once()
+        self.assertEqual(await self.db.available_seconds(OWNER), 3300)
+        decks = await self.db.decks_list(OWNER)
+        self.assertEqual(len(decks), 1)
+        self.assertEqual(decks[0]["card_count"], 6)
+        self.assertTrue(decks[0]["title"].endswith("— فلش‌کارت"))
+        cards = await self.db.deck_cards(decks[0]["deck_id"])
+        self.assertEqual(cards[0]["front"], "پرسش 0")
+
+    async def test_start_screen_shows_cost_and_size(self):
+        event = self._event(f"fc:ai:{self.item_id}".encode())
+        await self.bot._handle_callback(event)
+        text = event.edits[-1]["text"]
+        self.assertIn("هزینه: ۵ دقیقه اعتبار", text)
+        self.assertIn("۶ پرسش و پاسخ", text)
+
+    async def test_failure_refunds_and_short_output_refunds(self):
+        event = self._event(f"fc:go:{self.item_id}".encode())
+        with mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=self._cards_payload(2)),  # < 5 valid
+        ):
+            await self.bot._handle_callback(event)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertIn(LEARNING_GENERATION_FAILED, self.client.texts[-1]["text"])
+
+    async def test_insufficient_balance_denies_without_generation(self):
+        await self.db.db.execute("DELETE FROM ledger WHERE user_id=?", (OWNER,))
+        await self.db.db.commit()
+        event = self._event(f"fc:go:{self.item_id}".encode())
+        with mock.patch("gamas_bot.bot.complete_json") as generator:
+            await self.bot._handle_callback(event)
+            generator.assert_not_called()
+        self.assertIn(LEARNING_NO_CREDIT, self.client.texts[-1]["text"])
+
+    async def test_hub_empty_state_and_manual_guided_flow_with_disarm(self):
+        hub = self._event(b"fc:hub")
+        await self.bot._handle_callback(hub)
+        self.assertIn("هنوز مجموعه‌ای نساخته‌اید", hub.edits[-1]["text"])
+        # Arm the manual conversation.
+        await self.bot._handle_callback(self._event(b"fc:man"))
+        self.assertEqual(self.bot._pending_flashcard[OWNER][1], "front")
+        front = FakeMessageEvent(OWNER, "پرسش دستی یکم؟")
+        await self.bot._handle_message(front)
+        self.assertEqual(self.bot._pending_flashcard[OWNER][1], "back")
+        self.assertIn("پاسخ کارت", front.replies[-1])
+        back = FakeMessageEvent(OWNER, "پاسخ دستی یکم.")
+        await self.bot._handle_message(back)
+        self.assertIn("کارت اضافه شد (۱ کارت)", back.replies[-1])
+        deck_id = self.bot._pending_flashcard[OWNER][0]
+        # Finishing disarms.
+        done = self._event(b"fc:man:done")
+        await self.bot._handle_callback(done)
+        self.assertNotIn(OWNER, self.bot._pending_flashcard)
+        cards = await self.db.deck_cards(deck_id)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["front"], "پرسش دستی یکم؟")
+        # A stray text after a navigation tap never becomes a card.
+        await self.bot._handle_callback(self._event(b"fc:man"))
+        await self.bot._handle_callback(self._event(b"library"))
+        stray = FakeMessageEvent(OWNER, "این متن نباید کارت شود")
+        await self.bot._handle_message(stray)
+        self.assertEqual(len(await self.db.deck_cards(deck_id)), 1)
+
+    async def test_study_flip_next_persists_cursor_and_restarts(self):
+        deck_id = await self.db.deck_create(OWNER, None, "دسته دستی", "manual")
+        for index in range(3):
+            await self.db.deck_add_card(deck_id, f"پرسش {index}", f"پاسخ {index}")
+        study = self._event(f"fc:study:{deck_id}".encode())
+        await self.bot._handle_callback(study)
+        self.assertIn("پرسش:", study.edits[-1]["text"])
+        card = (await self.db.deck_cards(deck_id))[0]
+        flip = self._event(f"fc:flip:{deck_id}:{card['card_id']}".encode())
+        await self.bot._handle_callback(flip)
+        self.assertIn("پاسخ 0", flip.edits[-1]["text"])
+        nxt = self._event(f"fc:next:{deck_id}".encode())
+        await self.bot._handle_callback(nxt)
+        self.assertEqual((await self.db.deck_get(deck_id, OWNER))["study_cursor"], 1)
+        # Walk to the end summary.
+        await self.bot._handle_callback(self._event(f"fc:next:{deck_id}".encode()))
+        await self.bot._handle_callback(self._event(f"fc:next:{deck_id}".encode()))
+        end = self._event(f"fc:next:{deck_id}".encode())
+        await self.bot._handle_callback(end)
+        self.assertIn("مرور تمام شد — ۳ کارت مرور شد", end.edits[-1]["text"])
+        restart = self._event(f"fc:restart:{deck_id}".encode())
+        await self.bot._handle_callback(restart)
+        self.assertEqual((await self.db.deck_get(deck_id, OWNER))["study_cursor"], 0)
+
+    async def test_word_export_delivers_rtl_docx_and_removes_the_temp_file(self):
+        deck_id = await self.db.deck_create(OWNER, None, "دسته آزمون", "manual")
+        await self.db.deck_add_card(deck_id, "پرسش مهم؟", "پاسخ کامل")
+        export = self._event(f"fc:exp:{deck_id}".encode())
+        await self.bot._handle_callback(export)
+        docx_paths = [
+            record["path"] for record in self.client.deliveries
+            if str(record["path"]).endswith(".docx")
+        ]
+        self.assertTrue(docx_paths)
+        # The temp file is removed after delivery.
+        self.assertFalse(Path(docx_paths[-1]).exists())
+        payload = self.recorder.file_payloads[-1][1]
+        text = docx_text(payload)
+        self.assertIn("پرسش مهم؟", text)
+        self.assertIn("پاسخ کامل", text)
+
+    async def test_delete_needs_confirmation_and_cascades(self):
+        deck_id = await self.db.deck_create(OWNER, None, "دسته", "manual")
+        await self.db.deck_add_card(deck_id, "پ", "پا")
+        confirm = self._event(f"fc:del:{deck_id}".encode())
+        await self.bot._handle_callback(confirm)
+        self.assertIn("آیا مطمئنید؟", confirm.edits[-1]["text"])
+        self.assertIsNotNone(await self.db.deck_get(deck_id, OWNER))
+        ok = self._event(f"fc:delok:{deck_id}".encode())
+        await self.bot._handle_callback(ok)
+        self.assertIsNone(await self.db.deck_get(deck_id, OWNER))
+
+    async def test_picker_lists_booklets_only(self):
+        picker = self._event(b"fc:pick:0")
+        await self.bot._handle_callback(picker)
+        payloads = menu_payloads(picker.edits[-1]["buttons"])
+        self.assertIn(f"fc:ai:{self.item_id}".encode(), payloads)
+        self.assertFalse(any(b"transcript" in payload for payload in payloads))
+
+    async def test_deck_cap_is_enforced(self):
+        await self.db.deck_create(OWNER, self.item_id, "یک", "ai")
+        await self.db.deck_create(OWNER, self.item_id, "دو", "ai")
+        event = self._event(f"fc:go:{self.item_id}".encode())
+        with mock.patch("gamas_bot.bot.complete_json") as generator:
+            await self.bot._handle_callback(event)
+            generator.assert_not_called()
+        self.assertTrue(any("حداکثر" in t["text"] for t in self.client.texts))
+
+    async def test_foreign_deck_callbacks_fail_closed(self):
+        deck_id = await self.db.deck_create(OWNER, None, "دسته", "manual")
+        event = self._event(f"fc:deck:{deck_id}".encode(), user_id=OTHER)
+        await self.bot._handle_callback(event)
+        self.assertEqual(event.answers[-1][1], True)
 
 
 class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
