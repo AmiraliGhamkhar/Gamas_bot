@@ -106,6 +106,7 @@ files = [
     "gamas_bot/docx_export.py",
     "gamas_bot/instance_lock.py",
     "gamas_bot/launcher.py",
+    "gamas_bot/learning.py",
     "gamas_bot/llm.py",
     "gamas_bot/logging_config.py",
     "gamas_bot/media.py",
