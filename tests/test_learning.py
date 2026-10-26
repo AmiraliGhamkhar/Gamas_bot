@@ -275,6 +275,121 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 10)
 
 
+class LeaderboardAndGiftTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(db_path=root / "board.db", temp_dir=root / "tmp")
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.client = FakeTelegramClient()
+        self.bot.client = self.client
+        self.admin_id = next(iter(self.settings.admin_ids))
+        for uid in (OWNER, OTHER, 777):
+            await self.db.ensure_user(uid)
+        await self.db.sync_plans([
+            {"code": "paid_5h_30d", "hours": 5, "price": 50000, "validity_days": 30},
+        ])
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    def _event(self, data: bytes, user_id: int) -> FakeCallbackEvent:
+        event = FakeCallbackEvent(self.client, data=data, chat_id=user_id)
+        event.client = self.client
+        return event
+
+    async def test_empty_board_uses_persian_empty_state(self):
+        event = self._event(b"board", OWNER)
+        await self.bot._handle_callback(event)
+        self.assertIn("هنوز امتیازی ثبت نشده است", event.edits[-1]["text"])
+
+    async def test_board_shows_medals_names_and_own_rank_footer(self):
+        await self.db.set_first_name(OWNER, "نگار")
+        await self.db.set_first_name(777, "سارا")
+        await self.db.db.execute("UPDATE users SET quiz_points=50 WHERE telegram_id=?", (777,))
+        await self.db.db.execute("UPDATE users SET quiz_points=30 WHERE telegram_id=?", (OWNER,))
+        await self.db.db.commit()
+        event = self._event(b"board", OWNER)
+        await self.bot._handle_callback(event)
+        text = event.edits[-1]["text"]
+        self.assertIn("🥇 سارا", text)
+        self.assertIn("🥈 نگار", text)
+        self.assertIn("رتبهٔ شما: ۲ با ۳۰ امتیاز", text)
+        # No telegram id ever reaches the public board.
+        self.assertNotIn(str(OWNER), text)
+
+    async def test_missing_name_renders_fallback_only(self):
+        await self.db.db.execute("UPDATE users SET quiz_points=10 WHERE telegram_id=?", (OWNER,))
+        await self.db.db.commit()
+        event = self._event(b"board", OTHER)
+        await self.bot._handle_callback(event)
+        self.assertIn("کاربر گاماس", event.edits[-1]["text"])
+
+    async def test_admin_gift_flow_credits_audits_and_dms(self):
+        await self.db.set_first_name(OWNER, "نگار")
+        await self.db.db.execute("UPDATE users SET quiz_points=40 WHERE telegram_id=?", (OWNER,))
+        await self.db.db.commit()
+        board = self._event(b"adm:board", self.admin_id)
+        await self.bot._handle_callback(board)
+        board_text = board.edits[-1]["text"]
+        self.assertIn("نگار", board_text)
+        gift_payloads = menu_payloads(board.edits[-1]["buttons"])
+        self.assertIn(f"adm:bg:{OWNER}".encode(), gift_payloads)
+        # Plan picker.
+        pick = self._event(f"adm:bg:{OWNER}".encode(), self.admin_id)
+        await self.bot._handle_callback(pick)
+        pick_payloads = menu_payloads(pick.edits[-1]["buttons"])
+        self.assertIn(f"adm:bg:{OWNER}:paid_5h_30d".encode(), pick_payloads)
+        # Confirmation screen §6.13.
+        confirm = self._event(
+            f"adm:bg:{OWNER}:paid_5h_30d".encode(), self.admin_id
+        )
+        await self.bot._handle_callback(confirm)
+        confirm_text = confirm.edits[-1]["text"]
+        self.assertIn("ثبت شود؟", confirm_text)
+        self.assertIn("نگار", confirm_text)
+        # Execute.
+        ok = self._event(
+            f"adm:bgok:{OWNER}:paid_5h_30d".encode(), self.admin_id
+        )
+        await self.bot._handle_callback(ok)
+        self.assertEqual(await self.db.available_seconds(OWNER), 5 * 3600)
+        audit = await self.db.db.execute_fetchall(
+            "SELECT action, subject_user FROM audit WHERE subject_user=?", (OWNER,)
+        )
+        self.assertTrue(any(row[0] == "grant_credit" for row in audit))
+        # DM delivered with §6.8 wording.
+        dm = [record["text"] for record in self.client.texts if record["entity"] == OWNER]
+        self.assertTrue(dm and "تبریک" in dm[-1] and "اعتبار رایگان" in dm[-1])
+        # Board re-rendered with the success notice.
+        self.assertIn("هدیه ثبت شد", ok.edits[-1]["text"])
+
+    async def test_gift_to_another_admin_is_refused(self):
+        ok = self._event(
+            f"adm:bgok:{self.admin_id}:paid_5h_30d".encode(), self.admin_id
+        )
+        await self.bot._handle_callback(ok)
+        self.assertEqual(await self.db.available_seconds(self.admin_id), 0)
+
+    async def test_gift_to_banned_user_is_refused(self):
+        await self.db.set_banned(OWNER, True)
+        pick = self._event(f"adm:bg:{OWNER}".encode(), self.admin_id)
+        await self.bot._handle_callback(pick)
+        self.assertTrue(pick.answers[-1][1])  # alert
+
+    async def test_non_admin_cannot_open_gift_screens(self):
+        event = self._event(b"adm:board", OWNER)
+        await self.bot._handle_callback(event)
+        self.assertEqual(event.answers[-1][1], True)
+        self.assertFalse(event.edits)
+
+
 class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._tmp = tempfile.TemporaryDirectory()

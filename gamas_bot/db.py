@@ -1064,6 +1064,41 @@ class Database:
         )
         return {"rank": (int(higher[0][0]) if higher else 0) + 1, "points": points}
 
+    async def leaderboard_admin_top(self, limit: int = 5) -> list[dict[str, Any]]:
+        """Top earners *with* ids — admin gift screens only, never the user board."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT telegram_id, first_name, quiz_points FROM users "
+            "WHERE banned = 0 AND quiz_points > 0 "
+            "ORDER BY quiz_points DESC, telegram_id ASC LIMIT ?",
+            (max(1, int(limit)),),
+        )
+        return [
+            {
+                "telegram_id": int(row[0]),
+                "first_name": str(row[1] or ""),
+                "quiz_points": int(row[2]),
+            }
+            for row in rows
+        ]
+
+    async def user_identity(self, user_id: int) -> dict[str, Any] | None:
+        """Display identity + flags for admin screens and gift validation."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT telegram_id, first_name, banned, is_unlimited "
+            "FROM users WHERE telegram_id = ?",
+            (int(user_id),),
+        )
+        if not rows:
+            return None
+        return {
+            "telegram_id": int(rows[0][0]),
+            "first_name": str(rows[0][1] or ""),
+            "banned": bool(rows[0][2]),
+            "is_unlimited": bool(rows[0][3]),
+        }
+
     # ------------------------------------------------------- admin reporting
     #: Terminal statuses that mean the user actually received the raw
     #: transcript. ``partial`` delivered it too, with a failed booklet on top.

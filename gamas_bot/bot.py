@@ -1221,6 +1221,7 @@ class GamasBot:
                 Button.inline("📣 ارسال پیام", b"adm:bcast"),
                 Button.inline("🛡 گزارش فعالیت‌ها", b"adm:audit"),
             ],
+            [Button.inline("🏆 برترین کاربران", b"adm:board")],
             [Button.inline("↩️ پنل کاربری", b"menu:main")],
         ]
 
@@ -1671,6 +1672,164 @@ class GamasBot:
         )
         await self._edit(event, text, self._learning_done_buttons())
 
+    # -------------------------------------------------------------- leaderboard
+    async def _show_leaderboard(self, event) -> None:
+        """All-time top 20 with the caller's own rank always visible."""
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        rows = await self.db.leaderboard_top(20)
+        if not rows:
+            await self._edit_or_reply(event, LEADERBOARD_EMPTY, [
+                [Button.inline("↩️ منوی اصلی", b"menu:main")],
+            ])
+            return
+        medals = ("🥇", "🥈", "🥉")
+        lines = ["🏆 لیدربورد", ""]
+        for index, row in enumerate(rows):
+            rank_label = medals[index] if index < 3 else to_persian_digits(index + 1)
+            name = row["first_name"] or LEADERBOARD_FALLBACK_NAME
+            lines.append(
+                f"{rank_label} {name} — "
+                f"{to_persian_digits(row['quiz_points'])} امتیاز"
+            )
+        rank = await self.db.leaderboard_rank(user_id)
+        lines.append("")
+        lines.append(
+            f"رتبهٔ شما: {to_persian_digits(rank['rank'])} با "
+            f"{to_persian_digits(rank['points'])} امتیاز"
+        )
+        await self._edit_or_reply(event, "\n".join(lines), [
+            [Button.inline("↩️ منوی اصلی", b"menu:main")],
+        ])
+
+    async def _admin_board(self, event, *, notice: str = "") -> None:
+        """Top 5 earners with one-tap free-credit gift entry points."""
+        rows = await self.db.leaderboard_admin_top(5)
+        lines = ["🏆 برترین کاربران", ""]
+        buttons: list[list] = []
+        if not rows:
+            lines.append("هنوز کاربری امتیازی کسب نکرده است.")
+        for index, row in enumerate(rows):
+            name = row["first_name"] or LEADERBOARD_FALLBACK_NAME
+            lines.append(
+                f"{to_persian_digits(index + 1)}. {name} — "
+                f"{to_persian_digits(row['quiz_points'])} امتیاز"
+            )
+            buttons.append([
+                Button.inline(
+                    button_label(
+                        f"{to_persian_digits(index + 1)}. {name} — "
+                        f"{to_persian_digits(row['quiz_points'])} امتیاز"
+                    ),
+                    b"adm:board",
+                ),
+                Button.inline(
+                    "🎁 هدیه",
+                    f"adm:bg:{row['telegram_id']}".encode("ascii"),
+                ),
+            ])
+        if notice:
+            lines.extend(["", notice])
+        buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
+        await self._edit(event, "\n".join(lines), buttons)
+
+    async def _admin_gift_pick(self, event, target_id: int) -> None:
+        """Choose which paid plan's credit to gift (free plan is not offered)."""
+        identity = await self.db.user_identity(target_id)
+        if identity is None or identity["banned"]:
+            await self._ack(event, "این کاربر در دسترس نیست.", alert=True)
+            return
+        plans = [plan for plan in await self.db.plans() if plan["price"] > 0]
+        lines = [
+            "🎁 هدیه به کاربر",
+            f"کاربر: {identity['first_name'] or LEADERBOARD_FALLBACK_NAME}",
+            "",
+            "یکی از بسته‌های اعتباری را انتخاب کنید:",
+        ]
+        buttons: list[list] = []
+        for plan in plans:
+            hours = float(plan["hours"])
+            hours_text = to_persian_digits(
+                int(hours) if hours.is_integer() else str(hours)
+            )
+            buttons.append([
+                Button.inline(
+                    button_label(f"{hours_text} ساعت — {format_duration(int(round(hours * 3600)))}"),
+                    f"adm:bg:{target_id}:{plan['code']}".encode("utf-8"),
+                )
+            ])
+        buttons.append([Button.inline("↩️ بازگشت", b"adm:board")])
+        await self._edit(event, "\n".join(lines), buttons)
+
+    async def _admin_gift_confirm(
+        self, event, target_id: int, plan_code: str
+    ) -> None:
+        plan = await self._gift_plan(target_id, plan_code)
+        identity = await self.db.user_identity(target_id)
+        if plan is None or identity is None or identity["banned"]:
+            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
+            return
+        name = identity["first_name"] or LEADERBOARD_FALLBACK_NAME
+        seconds = int(round(float(plan["hours"]) * 3600))
+        text = (
+            "هدیه به "
+            f"{name} با اعتبار {format_duration(seconds)} ثبت شود؟"
+        )
+        await self._edit(event, text, [
+            [Button.inline(
+                "✅ تأیید هدیه",
+                f"adm:bgok:{target_id}:{plan_code}".encode("utf-8"),
+            )],
+            [Button.inline("↩️ بازگشت", f"adm:bg:{target_id}".encode("utf-8"))],
+        ])
+
+    async def _gift_plan(self, target_id: int, plan_code: str) -> dict | None:
+        """Validate a gift target/plan pair exactly as execution will see it."""
+        identity = await self.db.user_identity(target_id)
+        if identity is None or identity["banned"]:
+            return None
+        for plan in await self.db.plans():
+            if plan["code"] == plan_code and plan["price"] > 0:
+                return plan
+        return None
+
+    async def _admin_gift_execute(
+        self, event, admin_id: int, target_id: int, plan_code: str
+    ) -> None:
+        if not self._check_admin_cooldown(
+            event, "gift", self.ADMIN_COMMAND_COOLDOWN_SECONDS
+        ):
+            return
+        plan = await self._gift_plan(target_id, plan_code)
+        if plan is None:
+            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
+            return
+        # Separation of duties, matching /grant: an admin cannot mint credit
+        # for a peer through the leaderboard either.
+        if self._is_admin(target_id):
+            await event.respond(
+                "برای حفظ تفکیک دسترسی‌ها، امکان افزودن اعتبار به حساب مدیر دیگر وجود ندارد."
+            )
+            return
+        seconds = int(round(float(plan["hours"]) * 3600))
+        await self.db.add_credit(
+            target_id,
+            seconds,
+            note="leaderboard gift",
+            validity_days=None,
+            admin_id=admin_id,
+        )
+        message = (
+            "🎁 تبریک! شما جزو ۵ کاربر برتر گاماس هستید و "
+            f"{format_duration(seconds)} اعتبار رایگان به حساب شما اضافه شد."
+        )
+        try:
+            await self.client.send_message(target_id, message)
+        except Exception:
+            logger.warning("gift DM failed user=%s", target_id, exc_info=True)
+        await self._admin_board(event, notice="✅ هدیه ثبت شد.")
+
     async def _route_quiz_callback(self, event, user_id: int, data: str) -> None:
         """Parse and dispatch every ``quiz:`` callback, failing closed."""
         parts = data.split(":")
@@ -1775,6 +1934,9 @@ class GamasBot:
         elif data == "library":
             await self._ack(event)
             await self._show_library(event)
+        elif data == "board":
+            await self._ack(event)
+            await self._show_leaderboard(event)
         elif data.startswith("lib:f:"):
             await self._ack(event)
             item_id = _to_int(data.rsplit(":", 1)[-1])
@@ -1880,6 +2042,27 @@ class GamasBot:
         elif data == "adm:audit":
             await self._ack(event)
             await self._show_admin_audit(event)
+        elif data == "adm:board":
+            await self._ack(event)
+            await self._admin_board(event)
+        elif data.startswith("adm:bgok:"):
+            await self._ack(event)
+            parts = data.split(":", 3)
+            target_id = _to_int(parts[2]) if len(parts) == 4 else None
+            if target_id is None:
+                await self._ack(event, "درخواست هدیه نامعتبر است.", alert=True)
+            else:
+                await self._admin_gift_execute(event, user_id, target_id, parts[3])
+        elif data.startswith("adm:bg:"):
+            await self._ack(event)
+            parts = data.split(":")
+            target_id = _to_int(parts[2]) if len(parts) in (3, 4) else None
+            if target_id is None:
+                await self._ack(event, "درخواست هدیه نامعتبر است.", alert=True)
+            elif len(parts) == 3:
+                await self._admin_gift_pick(event, target_id)
+            else:
+                await self._admin_gift_confirm(event, target_id, parts[3])
         elif data.startswith("adm:rcpt:"):
             await self._ack(event)
             await self._show_receipt(event, data)
