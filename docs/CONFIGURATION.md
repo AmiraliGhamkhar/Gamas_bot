@@ -64,6 +64,8 @@ cron job cannot create a second database or session.
 | `NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE` | Evidence checks (`true`/`repair` by default). See [Note quality](NOTE_QUALITY.md). |
 | `RAW_FALLBACK_FILE_CHARS`, `RAW_FALLBACK_MAX_FILES` | Part size and count when a long raw `.txt` upload fails. |
 | `LIBRARY_MAX_ITEMS` | Newest transcript/booklet message references retained per user (default `50`); files remain in Telegram. |
+| `QUIZ_COST_SECONDS_PER_QUESTION`, `QUIZ_MAX_SESSIONS_PER_HOUR`, `QUIZ_MAX_ACTIVE_HOURS` | Quiz pricing, hourly start limit (default `3`) and the abandonment window (default `6` hours) for an untouched quiz. |
+| `FLASHCARD_AI_COST_SECONDS`, `FLASHCARD_AI_DECK_SIZE`, `FLASHCARD_MAX_DECKS_PER_USER` | AI deck charge, requested card count and the per-user deck ceiling (defaults: `300` seconds, `10` cards, `30` decks). |
 | `OFFICE_ENABLED` and `OFFICE_*` | Retired Free Office UI compatibility settings; bot menu and job wiring are removed, and `OFFICE_ENABLED` defaults to `false`. |
 | `MAX_MEDIA_DURATION_SECONDS` | Maximum accepted audio/video duration (default 7,200 seconds / 2 hours), checked from Telegram metadata and media probes. |
 | `PRESENTATION_MAX_*` | Deck limits (defaults: 50 clips, 2 hours total, 128 MiB unpacked, 256 MiB temporary). |

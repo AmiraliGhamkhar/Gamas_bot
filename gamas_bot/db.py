@@ -22,6 +22,7 @@ success and retain the transcription charge.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -58,6 +59,19 @@ async def _rows(
 
 TERMINAL_SUBMISSION_STATUSES = ("done", "partial", "failed", "rejected")
 
+#: Points a quiz awards per correct answer. Denormalised into ``users.quiz_points``
+#: so the leaderboard is one indexed sort instead of an aggregate over every
+#: answer ever recorded. Kept here (not in the bot) because the scoring write and
+#: the leaderboard read must agree on the unit.
+QUIZ_POINTS_PER_CORRECT = 10
+
+#: Columns every quiz/deck read returns; kept in one place so a new caller cannot
+#: silently drop the ownership column the guards depend on.
+_QUIZ_SESSION_COLUMNS = (
+    "session_id, user_id, item_id, question_count, current_index, "
+    "score, status, created_at, updated_at"
+)
+
 ADD_COLUMN_RE = re.compile(
     r"(?i)^\s*ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
     r"[\"'`]?([A-Za-z_][A-Za-z0-9_]*)[\"'`]?"
@@ -70,6 +84,19 @@ def utc_now() -> datetime:
 
 def iso(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def clean_first_name(value: str | None) -> str:
+    """Normalise a Telegram first name into a safe display label.
+
+    Collapsing whitespace keeps a label on one leaderboard line; the 64-character
+    bound is a display budget, not a security control, but it also removes any
+    chance of a pathological name bloating a message. Names are rendered as
+    plain text (never HTML), so no escaping is needed here.
+    """
+    if not value:
+        return ""
+    return " ".join(str(value).split())[:64]
 
 
 class InsufficientBalanceError(RuntimeError):
@@ -116,6 +143,10 @@ class UserRow:
     telegram_id: int
     joined_at: str
     banned: bool
+    #: Bounded display label captured from Telegram; the leaderboard's only name.
+    first_name: str = ""
+    #: All-time quiz score (see :data:`QUIZ_POINTS_PER_CORRECT`).
+    quiz_points: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -357,18 +388,42 @@ class Database:
                 await self.db.execute(sql, params)
 
     # ------------------------------------------------------------------ users
-    async def ensure_user(self, telegram_id: int) -> UserRow:
+    async def ensure_user(self, telegram_id: int, first_name: str | None = None) -> UserRow:
+        """Create the user on first sight and refresh the display label.
+
+        ``first_name`` is display-only: it is captured from the Telegram sender
+        so the leaderboard can show something friendlier than an id, and it is
+        bounded here rather than at every call site. A missing name never clears
+        one already stored — a client that omits ``first_name`` must not erase
+        the label of a user who has one.
+        """
         await self._write(
             "INSERT OR IGNORE INTO users(telegram_id, joined_at) VALUES (?, ?)",
             (telegram_id, iso(utc_now())),
         )
+        label = clean_first_name(first_name)
+        if label:
+            await self.set_first_name(telegram_id, label)
         row = await _rows(self.db,
-            "SELECT telegram_id, joined_at, banned FROM users WHERE telegram_id = ?",
+            "SELECT telegram_id, joined_at, banned, first_name, quiz_points "
+            "FROM users WHERE telegram_id = ?",
             (telegram_id,),
         )
         if not row:
             raise RuntimeError(f"user {telegram_id} vanished after insert")
-        return UserRow(row[0][0], row[0][1], bool(row[0][2]))
+        return UserRow(
+            row[0][0], row[0][1], bool(row[0][2]), str(row[0][3] or ""), int(row[0][4] or 0)
+        )
+
+    async def set_first_name(self, telegram_id: int, first_name: str) -> None:
+        """Store a bounded display label (no-op for an empty one)."""
+        label = clean_first_name(first_name)
+        if not label:
+            return
+        await self._write(
+            "UPDATE users SET first_name = ? WHERE telegram_id = ? AND first_name != ?",
+            (label, telegram_id, label),
+        )
 
     async def set_banned(
         self, telegram_id: int, banned: bool, *, admin_id: int | None = None
@@ -660,17 +715,24 @@ class Database:
         submission_id: int | None = None,
         *,
         title: str = "",
+        content_text: str | None = None,
     ) -> int:
         """Save a Telegram message reference, not a local copy of the artifact.
 
         The message is written only after Telegram accepted its delivery. Its
         source chat and message id are enough for a later ``forward_messages``;
         the library therefore adds no persistent file storage or retention risk.
+
+        ``content_text`` is the generated artifact's bounded plain text. It is
+        written in the same statement as the reference so a fresh item is never
+        observed without its text — a ``NULL`` here is exactly what marks a
+        pre-learning-loop row as legacy.
         """
         async with self._transaction():
             cursor = await self.db.execute(
                 "INSERT INTO library_items(user_id, submission_id, kind, chat_id, "
-                "message_id, title, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "message_id, title, created_at, content_text) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     int(user_id),
                     submission_id,
@@ -679,6 +741,7 @@ class Database:
                     int(message_id),
                     str(title),
                     iso(utc_now()),
+                    content_text,
                 ),
             )
             return int(cursor.lastrowid or 0)
@@ -697,15 +760,39 @@ class Database:
         return [dict(row) for row in rows]
 
     async def library_item(self, user_id: int, item_id: int) -> dict[str, Any] | None:
-        """Fetch one artifact only when it belongs to ``user_id``."""
+        """Fetch one artifact only when it belongs to ``user_id``.
+
+        ``content_text`` is included because the detail screen has to tell a
+        learning-capable booklet from a legacy row that predates text capture.
+        """
         rows = await _rows(
             self.read_db,
             "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
-            "title, created_at, unavailable FROM library_items "
+            "title, created_at, unavailable, content_text FROM library_items "
             "WHERE user_id = ? AND item_id = ?",
             (int(user_id), int(item_id)),
         )
         return dict(rows[0]) if rows else None
+
+    async def library_set_content(self, item_id: int, content_text: str | None) -> bool:
+        """Attach (or replace) the artifact text a quiz/deck generator reads."""
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "UPDATE library_items SET content_text = ? WHERE item_id = ?",
+                (content_text, int(item_id)),
+            )
+            return cursor.rowcount == 1
+
+    async def library_get_content(self, user_id: int, item_id: int) -> str | None:
+        """The archived text, read only through the owner's id."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT content_text FROM library_items WHERE user_id = ? AND item_id = ?",
+            (int(user_id), int(item_id)),
+        )
+        if not rows:
+            return None
+        return rows[0][0]
 
     async def library_count(self, user_id: int) -> int:
         rows = await _rows(
@@ -735,6 +822,517 @@ class Database:
                 (int(user_id), int(user_id), keep),
             )
             return max(0, int(cursor.rowcount))
+
+    # ---------------------------------------------------------- learning spend
+    async def spend_seconds(self, user_id: int, seconds: int, *, note: str) -> None:
+        """Charge a one-off generation cost directly from the credit lots.
+
+        Quizzes and AI flashcards are not submissions, so they never create a
+        hold: the charge *is* the whole lifecycle. What stays identical to
+        :meth:`settle_hold` is the audit shape — one ``debit`` ledger row plus
+        the ``debit_allocations`` rows that name each consumed lot, earliest
+        expiry first — because that is the only form the balance query trusts.
+
+        Insufficient credit raises before anything is written, so a failed
+        charge can never leave a partial debit behind.
+        """
+        seconds = int(seconds)
+        if seconds <= 0:
+            raise ValueError("charge must be positive")
+        async with self._transaction():
+            rows = await _rows(
+                self.db,
+                "SELECT is_unlimited, banned FROM users WHERE telegram_id = ?",
+                (user_id,),
+            )
+            if rows and rows[0][1]:
+                raise UserBannedError("⛔ دسترسی شما به ربات مسدود شده است.")
+            if rows and rows[0][0]:
+                # A special user has no limit to charge; the quiz still works.
+                return
+            available = await self._available_seconds_locked(user_id)
+            if available < seconds:
+                raise InsufficientBalanceError(available, seconds)
+            now = iso(utc_now())
+            cursor = await self.db.execute(
+                "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
+                "VALUES (?, ?, 'debit', ?, ?)",
+                (int(user_id), seconds, note, now),
+            )
+            remaining = seconds
+            for credit_id, lot in await self._credit_lots(user_id, now):
+                used = min(remaining, max(0, int(lot)))
+                if used:
+                    await self.db.execute(
+                        "INSERT INTO debit_allocations(debit_id, credit_id, seconds) "
+                        "VALUES (?, ?, ?)",
+                        (cursor.lastrowid, credit_id, used),
+                    )
+                    remaining -= used
+                if not remaining:
+                    break
+            if remaining:
+                # Defensive: the lot scan and the sum above are the same query,
+                # so a shortfall here means the data changed under us. Raising
+                # rolls the debit back rather than recording an unfunded charge.
+                raise InsufficientBalanceError(seconds - remaining, seconds)
+
+    async def refund_seconds(self, user_id: int, seconds: int, *, note: str) -> None:
+        """Return a failed charge as a fresh, non-expiring credit lot.
+
+        A refund never rewinds the ledger: the original debit stays as the audit
+        record of what happened, and the compensation is an ordinary credit.
+        Refunds therefore never expire, unlike a purchased plan.
+        """
+        seconds = int(seconds)
+        if seconds <= 0:
+            return
+        await self.add_credit(
+            user_id, seconds, note=f"refund: {note}", validity_days=None
+        )
+
+    # ---------------------------------------------------------------- quizzes
+    async def quiz_create_session(
+        self, user_id: int, item_id: int, questions: list[dict[str, Any]]
+    ) -> int:
+        """Persist a session and its immutable question set in one transaction.
+
+        A half-written quiz would be unresumable (the cursor would point at a
+        question that does not exist), so the session row is only useful once
+        every question is present — hence one transaction.
+        """
+        async with self._transaction():
+            now = iso(utc_now())
+            cursor = await self.db.execute(
+                "INSERT INTO quiz_sessions(user_id, item_id, question_count, "
+                "created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (int(user_id), int(item_id), len(questions), now, now),
+            )
+            session_id = int(cursor.lastrowid or 0)
+            for idx, question in enumerate(questions):
+                await self.db.execute(
+                    "INSERT INTO quiz_questions(session_id, idx, question, "
+                    "options_json, correct_index, explanation) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        idx,
+                        str(question["question"]),
+                        json.dumps(
+                            list(question["options"]), ensure_ascii=False
+                        ),
+                        int(question["correct"]),
+                        str(question.get("explanation") or ""),
+                    ),
+                )
+            return session_id
+
+    async def quiz_get_session(
+        self, user_id: int, session_id: int
+    ) -> dict[str, Any] | None:
+        """One session, only when it belongs to ``user_id``."""
+        rows = await _rows(
+            self.read_db,
+            f"SELECT {_QUIZ_SESSION_COLUMNS} FROM quiz_sessions "
+            "WHERE session_id = ? AND user_id = ?",
+            (int(session_id), int(user_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def quiz_active_session(self, user_id: int) -> dict[str, Any] | None:
+        """The user's in-flight quiz, if any (one active session at a time)."""
+        rows = await _rows(
+            self.read_db,
+            f"SELECT {_QUIZ_SESSION_COLUMNS} FROM quiz_sessions "
+            "WHERE user_id = ? AND status = 'active' "
+            "ORDER BY session_id DESC LIMIT 1",
+            (int(user_id),),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def quiz_expire_stale(self, user_id: int, max_age_hours: int) -> int:
+        """Abandon sessions untouched for longer than the configured window.
+
+        Expiry is lazy (checked when the user starts or resumes a quiz) so no
+        sweeper process is needed; an abandoned quiz must not block the next one.
+        """
+        cutoff = iso(utc_now() - timedelta(hours=max(1, int(max_age_hours))))
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "UPDATE quiz_sessions SET status = 'expired', updated_at = ? "
+                "WHERE user_id = ? AND status = 'active' AND updated_at < ?",
+                (iso(utc_now()), int(user_id), cutoff),
+            )
+            return max(0, int(cursor.rowcount))
+
+    async def quiz_sessions_since(self, user_id: int, since_iso: str) -> int:
+        """How many quizzes the user started at/after ``since_iso`` (rate limit)."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM quiz_sessions WHERE user_id = ? AND created_at >= ?",
+            (int(user_id), since_iso),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    async def quiz_current_question(
+        self, session_id: int
+    ) -> dict[str, Any] | None:
+        """The question the session's cursor points at, with its position."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT q.question_id, q.idx, q.question, q.options_json, "
+            "q.correct_index, q.explanation, s.current_index, s.question_count "
+            "FROM quiz_questions q JOIN quiz_sessions s "
+            "ON s.session_id = q.session_id "
+            "WHERE q.session_id = ? AND q.idx = s.current_index",
+            (int(session_id),),
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        try:
+            row["options"] = json.loads(row["options_json"])
+        except (TypeError, ValueError):
+            row["options"] = []
+        return row
+
+    async def quiz_question(
+        self, session_id: int, question_id: int
+    ) -> dict[str, Any] | None:
+        """One question of a session, with its options decoded for rendering."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT question_id, idx, question, options_json, correct_index, "
+            "explanation FROM quiz_questions WHERE session_id = ? "
+            "AND question_id = ?",
+            (int(session_id), int(question_id)),
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        try:
+            row["options"] = json.loads(row["options_json"])
+        except (TypeError, ValueError):
+            row["options"] = []
+        return row
+
+    async def quiz_record_answer(
+        self, user_id: int, session_id: int, question_id: int, chosen_index: int
+    ) -> dict[str, Any]:
+        """Score one answer exactly once, or report why the tap was ignored.
+
+        Ownership, the session being active, the question being the cursor's
+        question and the answer not existing yet are all re-checked here under
+        the write lock — a callback's payload is user input and cannot be
+        trusted to have been validated by whoever rendered the button.
+
+        The unique index on ``quiz_answers.question_id`` is the last line of
+        defence: a duplicate tap loses the ``INSERT OR IGNORE`` race instead of
+        scoring twice.
+        """
+        chosen = int(chosen_index)
+        if not 0 <= chosen <= 3:
+            return {"ok": False, "reason": "bad_option"}
+        async with self._transaction():
+            rows = await _rows(
+                self.db,
+                "SELECT user_id, question_count, current_index, score, status "
+                "FROM quiz_sessions WHERE session_id = ? AND user_id = ?",
+                (int(session_id), int(user_id)),
+            )
+            if not rows:
+                return {"ok": False, "reason": "not_found"}
+            _, total, current, score, status = rows[0]
+            if status != "active":
+                return {"ok": False, "reason": "inactive"}
+            questions = await _rows(
+                self.db,
+                "SELECT idx, correct_index, explanation FROM quiz_questions "
+                "WHERE question_id = ? AND session_id = ?",
+                (int(question_id), int(session_id)),
+            )
+            if not questions:
+                return {"ok": False, "reason": "not_found"}
+            idx, correct_index, explanation = questions[0]
+            # Check the answer row before the cursor. A double tap arrives after
+            # the cursor has moved on, so testing the cursor first would report
+            # a stale button instead of the friendly "already answered" re-ack
+            # the user actually needs.
+            answered = await _rows(
+                self.db,
+                "SELECT 1 FROM quiz_answers WHERE question_id = ?",
+                (int(question_id),),
+            )
+            if answered:
+                return {
+                    "ok": False,
+                    "reason": "already_answered",
+                    "correct_index": int(correct_index),
+                    "explanation": str(explanation or ""),
+                }
+            if int(idx) != int(current):
+                # A stale or forged button: the message it came from is no
+                # longer the question the cursor points at.
+                return {"ok": False, "reason": "out_of_turn"}
+            now = iso(utc_now())
+            correct = chosen == int(correct_index)
+            cursor = await self.db.execute(
+                "INSERT OR IGNORE INTO quiz_answers(session_id, question_id, "
+                "chosen_index, is_correct, answered_at) VALUES (?, ?, ?, ?, ?)",
+                (int(session_id), int(question_id), chosen, int(correct), now),
+            )
+            if cursor.rowcount == 0:
+                return {
+                    "ok": False,
+                    "reason": "already_answered",
+                    "correct_index": int(correct_index),
+                    "explanation": str(explanation or ""),
+                }
+            finished = int(current) + 1 >= int(total)
+            if correct:
+                await self.db.execute(
+                    "UPDATE quiz_sessions SET score = score + ?, "
+                    "current_index = current_index + 1, updated_at = ?, "
+                    "status = CASE WHEN current_index + 1 >= question_count "
+                    "THEN 'done' ELSE status END WHERE session_id = ?",
+                    (QUIZ_POINTS_PER_CORRECT, now, int(session_id)),
+                )
+                await self.db.execute(
+                    "UPDATE users SET quiz_points = quiz_points + ? "
+                    "WHERE telegram_id = ?",
+                    (QUIZ_POINTS_PER_CORRECT, int(user_id)),
+                )
+                score = int(score) + QUIZ_POINTS_PER_CORRECT
+            else:
+                await self.db.execute(
+                    "UPDATE quiz_sessions SET current_index = current_index + 1, "
+                    "updated_at = ?, status = CASE WHEN current_index + 1 >= "
+                    "question_count THEN 'done' ELSE status END "
+                    "WHERE session_id = ?",
+                    (now, int(session_id)),
+                )
+            return {
+                "ok": True,
+                "correct": correct,
+                "correct_index": int(correct_index),
+                "explanation": str(explanation or ""),
+                "finished": finished,
+                "score": int(score),
+                "index": int(current),
+                "total": int(total),
+            }
+
+    async def quiz_finish(self, session_id: int, status: str = "quit") -> None:
+        """Close a session without touching the points it already earned."""
+        if status not in ("done", "quit", "expired"):
+            raise ValueError("invalid quiz status")
+        async with self._transaction():
+            await self.db.execute(
+                "UPDATE quiz_sessions SET status = ?, updated_at = ? "
+                "WHERE session_id = ? AND status = 'active'",
+                (status, iso(utc_now()), int(session_id)),
+            )
+
+    # ------------------------------------------------------------ leaderboard
+    async def leaderboard_top(self, limit: int = 20) -> list[dict[str, Any]]:
+        """All-time board: scored, unbanned users by points then id for ties."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT first_name, telegram_id, quiz_points FROM users "
+            "WHERE banned = 0 AND quiz_points > 0 "
+            "ORDER BY quiz_points DESC, telegram_id ASC LIMIT ?",
+            (max(0, int(limit)),),
+        )
+        return [
+            {
+                "first_name": str(row[0] or ""),
+                "telegram_id": int(row[1]),
+                "quiz_points": int(row[2] or 0),
+            }
+            for row in rows
+        ]
+
+    async def user_points(self, user_id: int) -> int:
+        """The user's all-time quiz points (0 for an unknown user)."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT COALESCE(quiz_points, 0) FROM users WHERE telegram_id = ?",
+            (int(user_id),),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    async def leaderboard_rank(self, user_id: int) -> int:
+        """1-based all-time rank; a user with no points ranks behind everyone."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT COALESCE(quiz_points, 0) FROM users WHERE telegram_id = ?",
+            (int(user_id),),
+        )
+        mine = int(rows[0][0]) if rows else 0
+        ahead = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM users WHERE banned = 0 AND quiz_points > ?",
+            (mine,),
+        )
+        return 1 + (int(ahead[0][0]) if ahead else 0)
+
+    # ------------------------------------------------------------- flashcards
+    async def deck_create(
+        self,
+        user_id: int,
+        title: str,
+        *,
+        source: str,
+        item_id: int | None = None,
+    ) -> int:
+        """Create an empty deck; ``source`` is ``ai`` or ``manual``."""
+        if source not in ("ai", "manual"):
+            raise ValueError("invalid deck source")
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "INSERT INTO flashcard_decks(user_id, item_id, title, source, "
+                "created_at) VALUES (?, ?, ?, ?, ?)",
+                (int(user_id), item_id, str(title)[:200], source, iso(utc_now())),
+            )
+            return int(cursor.lastrowid or 0)
+
+    async def deck_add_card(self, deck_id: int, front: str, back: str) -> int:
+        """Append one card; ``idx`` is assigned inside the transaction."""
+        async with self._transaction():
+            rows = await _rows(
+                self.db,
+                "SELECT COALESCE(MAX(idx), -1) + 1 FROM flashcards WHERE deck_id = ?",
+                (int(deck_id),),
+            )
+            idx = int(rows[0][0]) if rows else 0
+            cursor = await self.db.execute(
+                "INSERT INTO flashcards(deck_id, idx, front, back) VALUES (?, ?, ?, ?)",
+                (int(deck_id), idx, str(front), str(back)),
+            )
+            return int(cursor.lastrowid or 0)
+
+    async def deck_get(self, user_id: int, deck_id: int) -> dict[str, Any] | None:
+        """One deck (with its card count) only when it belongs to ``user_id``."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT d.deck_id, d.user_id, d.item_id, d.title, d.source, "
+            "d.study_cursor, d.created_at, "
+            "(SELECT COUNT(*) FROM flashcards f WHERE f.deck_id = d.deck_id) AS card_count "
+            "FROM flashcard_decks d WHERE d.deck_id = ? AND d.user_id = ?",
+            (int(deck_id), int(user_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def deck_cards(self, deck_id: int) -> list[dict[str, Any]]:
+        """Every card of a deck in its stored order."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT card_id, idx, front, back FROM flashcards "
+            "WHERE deck_id = ? ORDER BY idx, card_id",
+            (int(deck_id),),
+        )
+        return [dict(row) for row in rows]
+
+    async def deck_card_at(self, deck_id: int, cursor: int) -> dict[str, Any] | None:
+        """One card by position, used by the flip view's persisted cursor."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT card_id, idx, front, back FROM flashcards "
+            "WHERE deck_id = ? ORDER BY idx, card_id LIMIT 1 OFFSET ?",
+            (int(deck_id), max(0, int(cursor))),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def deck_set_cursor(self, deck_id: int, cursor: int) -> None:
+        """Persist study position so a restart resumes the same card."""
+        await self._write(
+            "UPDATE flashcard_decks SET study_cursor = ? WHERE deck_id = ?",
+            (max(0, int(cursor)), int(deck_id)),
+        )
+
+    async def deck_delete(self, user_id: int, deck_id: int) -> bool:
+        """Delete a deck and its cards; cards go first so no orphan survives.
+
+        SQLite only enforces ``ON DELETE CASCADE`` when foreign keys are enabled
+        per connection, so the child rows are removed explicitly instead of
+        depending on a connection pragma.
+        """
+        async with self._transaction():
+            owned = await _rows(
+                self.db,
+                "SELECT 1 FROM flashcard_decks WHERE deck_id = ? AND user_id = ?",
+                (int(deck_id), int(user_id)),
+            )
+            if not owned:
+                return False
+            await self.db.execute(
+                "DELETE FROM flashcards WHERE deck_id = ?", (int(deck_id),)
+            )
+            await self.db.execute(
+                "DELETE FROM flashcard_decks WHERE deck_id = ? AND user_id = ?",
+                (int(deck_id), int(user_id)),
+            )
+            return True
+
+    async def decks_list(
+        self, user_id: int, limit: int = 6, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """One newest-first page of decks, scoped to the requesting user."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT d.deck_id, d.item_id, d.title, d.source, d.study_cursor, "
+            "d.created_at, "
+            "(SELECT COUNT(*) FROM flashcards f WHERE f.deck_id = d.deck_id) AS card_count "
+            "FROM flashcard_decks d WHERE d.user_id = ? "
+            "ORDER BY d.deck_id DESC LIMIT ? OFFSET ?",
+            (int(user_id), max(0, int(limit)), max(0, int(offset))),
+        )
+        return [dict(row) for row in rows]
+
+    async def decks_count(self, user_id: int) -> int:
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM flashcard_decks WHERE user_id = ?",
+            (int(user_id),),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    async def manual_deck(self, user_id: int) -> dict[str, Any] | None:
+        """The user's single hand-written deck, if it has been created yet."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT deck_id, title, study_cursor FROM flashcard_decks "
+            "WHERE user_id = ? AND source = 'manual' ORDER BY deck_id LIMIT 1",
+            (int(user_id),),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def library_items_with_content(
+        self, user_id: int, limit: int = 6, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Booklets a quiz/deck can be generated from (text captured).
+
+        Legacy rows are excluded here rather than filtered in the screen: the
+        picker's pages would otherwise be mostly unselectable.
+        """
+        rows = await _rows(
+            self.read_db,
+            "SELECT item_id, kind, title, created_at FROM library_items "
+            "WHERE user_id = ? AND kind = 'booklet' AND content_text IS NOT NULL "
+            "ORDER BY item_id DESC LIMIT ? OFFSET ?",
+            (int(user_id), max(0, int(limit)), max(0, int(offset))),
+        )
+        return [dict(row) for row in rows]
+
+    async def library_content_count(self, user_id: int) -> int:
+        """How many booklets of this user carry archived text (picker paging)."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM library_items WHERE user_id = ? "
+            "AND kind = 'booklet' AND content_text IS NOT NULL",
+            (int(user_id),),
+        )
+        return int(rows[0][0]) if rows else 0
 
     async def stats(self) -> dict[str, Any]:
         totals = await _rows(self.read_db,

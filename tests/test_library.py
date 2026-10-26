@@ -130,7 +130,11 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("📚 کتابخانه من", first_text)
         self.assertIn("تعداد موارد: ۸", first_text)
         self.assertIn(b"lib:1", first_payloads)
-        self.assertEqual(sum(payload.startswith(b"lib:f:") for payload in first_payloads), 6)
+        # Every row now opens the detail screen; re-forwarding moved one tap
+        # deeper and is asserted in the learning-loop suite.
+        self.assertEqual(
+            sum(payload.startswith(b"lib:it:") for payload in first_payloads), 6
+        )
         first_labels = " ".join(button.text for row in first_buttons for button in row)
         self.assertIn("درس 7", first_text + " " + first_labels)
         self.assertNotIn("خصوصی", first_text + " " + first_labels)
@@ -141,7 +145,9 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         _second_text, second_buttons = second.edits[-1]
         second_payloads = menu_payloads(second_buttons)
         self.assertIn(b"lib:0", second_payloads)
-        self.assertEqual(sum(payload.startswith(b"lib:f:") for payload in second_payloads), 2)
+        self.assertEqual(
+            sum(payload.startswith(b"lib:it:") for payload in second_payloads), 2
+        )
         labels = [button.text for row in second_buttons for button in row]
         self.assertTrue(any(label.startswith("📖 ") for label in labels))
 
