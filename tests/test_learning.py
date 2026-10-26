@@ -1,0 +1,540 @@
+"""Tests for the learning loop: quiz engine, leaderboard and content helpers.
+
+The LLM is faked at the ``gamas_bot.bot.complete_json`` seam exactly like the
+note pipeline tests fake their generators, so every billing/refund guarantee
+runs against a real temporary database with no network.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import random
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from gamas_bot.bot import GamasBot, LEARNING_GENERATION_FAILED, LEARNING_NO_CREDIT
+from gamas_bot.db import Database
+from gamas_bot.learning import (
+    MAX_CONTENT_CHARS,
+    bound_content_text,
+    parse_flashcard_payload,
+    parse_quiz_payload,
+)
+from gamas_bot.llm import LLMError
+from tests.support import FakeCallbackEvent, FakeTelegramClient, make_settings
+from tests.test_bot import menu_payloads
+
+OWNER = 555
+OTHER = 999
+
+
+def quiz_payload(count: int = 5) -> dict:
+    return {
+        "questions": [
+            {
+                "question": f"سؤال شماره {index}؟",
+                "options": [
+                    f"گزینه درست {index}",
+                    f"انحرافی الف {index}",
+                    f"انحرافی ب {index}",
+                    f"انحرافی ج {index}",
+                ],
+                "correct": 0,
+                "explain": f"زیرا نکته {index} این‌گونه است.",
+            }
+            for index in range(count)
+        ]
+    }
+
+
+class LearningHelperTests(unittest.TestCase):
+    def test_bound_content_text_cuts_on_paragraph_boundary(self):
+        text = "پاراگراف نخست.\n\n" + ("کلمه " * 20_000)
+        bounded = bound_content_text(text)
+        self.assertLessEqual(len(bounded), MAX_CONTENT_CHARS)
+        self.assertTrue(bounded.startswith("پاراگراف نخست."))
+
+    def test_bound_content_text_passes_short_text_through(self):
+        self.assertEqual(bound_content_text("  متن کوتاه  "), "متن کوتاه")
+        self.assertEqual(bound_content_text(None), "")
+
+    def test_quiz_payload_validation_drops_malformed_and_remaps_shuffle(self):
+        payload = {
+            "questions": [
+                {  # valid
+                    "question": "سؤال سالم",
+                    "options": ["یک", "دو", "سه", "چهار"],
+                    "correct": 2,
+                    "explain": "توضیح",
+                },
+                {  # only three options -> dropped
+                    "question": "ناقص",
+                    "options": ["یک", "دو", "سه"],
+                    "correct": 0,
+                    "explain": "توضیح",
+                },
+                {  # duplicate options -> dropped
+                    "question": "تکراری",
+                    "options": ["یک", "یک", "سه", "چهار"],
+                    "correct": 0,
+                    "explain": "توضیح",
+                },
+                {  # correct out of range -> dropped
+                    "question": "کلید اشتباه",
+                    "options": ["یک", "دو", "سه", "چهار"],
+                    "correct": 9,
+                    "explain": "توضیح",
+                },
+                {  # bool is not an int index -> dropped
+                    "question": "کلید بولین",
+                    "options": ["یک", "دو", "سه", "چهار"],
+                    "correct": True,
+                    "explain": "توضیح",
+                },
+            ]
+        }
+        rng = random.Random(2026)
+        parsed = parse_quiz_payload(payload, 5, rng=rng)
+        self.assertEqual(len(parsed), 1)
+        question = parsed[0]
+        # The correct *text* must follow the shuffle, whatever its new index.
+        self.assertEqual(question["options"][question["correct_index"]], "سه")
+        self.assertEqual(len(question["options"]), 4)
+
+    def test_quiz_payload_respects_requested_count(self):
+        parsed = parse_quiz_payload(quiz_payload(10), 3, rng=random.Random(1))
+        self.assertEqual(len(parsed), 3)
+
+    def test_flashcard_payload_validation(self):
+        payload = {
+            "cards": [
+                {"front": "پرسش یک", "back": "پاسخ یک"},
+                {"front": "", "back": "پاسخ بدون پرسش"},  # dropped
+                {"front": "پرسش دو", "back": "پاسخ دو"},
+            ]
+        }
+        cards = parse_flashcard_payload(payload, 10)
+        self.assertEqual(cards, [
+            {"front": "پرسش یک", "back": "پاسخ یک"},
+            {"front": "پرسش دو", "back": "پاسخ دو"},
+        ])
+
+
+class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self._tmp.name) / "quiz.db")
+        await self.db.connect()
+        await self.db.ensure_user(OWNER)
+        await self.db.ensure_user(OTHER)
+        self.item_id = await self.db.library_add(
+            OWNER, "booklet", 10, 20, None, title="جزوه"
+        )
+        await self.db.library_set_content(self.item_id, "متن جزوه برای آزمون")
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def _create_session(self, count: int = 3) -> int:
+        questions = [
+            {
+                "question": f"سؤال {index}",
+                "options": ["الف", "ب", "ج", "د"],
+                "correct_index": index % 4,
+                "explanation": "چرا",
+            }
+            for index in range(count)
+        ]
+        return await self.db.quiz_create_session(OWNER, self.item_id, questions)
+
+    async def test_full_answer_flow_scores_points_and_ranks(self):
+        session_id = await self._create_session()
+        first = await self.db.quiz_current_question(session_id)
+        self.assertEqual(first["idx"], 0)
+        # Correct answer on question 0 (correct_index 0).
+        result = await self.db.quiz_record_answer(session_id, first["question_id"], 0)
+        self.assertEqual(result["status"], "ok")
+        self.assertTrue(result["correct"])
+        self.assertFalse(result["finished"])
+        rank = await self.db.leaderboard_rank(OWNER)
+        self.assertEqual(rank["points"], 10)
+        self.assertEqual(rank["rank"], 1)
+        # Second answer, intentionally wrong.
+        second = await self.db.quiz_current_question(session_id)
+        result = await self.db.quiz_record_answer(
+            session_id, second["question_id"], 3
+        )
+        self.assertFalse(result["correct"])
+        rank = await self.db.leaderboard_rank(OWNER)
+        self.assertEqual(rank["points"], 10)  # wrong answer adds nothing
+        # Third answer correct -> session finishes.
+        third = await self.db.quiz_current_question(session_id)
+        result = await self.db.quiz_record_answer(session_id, third["question_id"], 2)
+        self.assertTrue(result["finished"])
+        self.assertEqual(result["score"], 20)
+        session = await self.db.quiz_get_session(session_id, OWNER)
+        self.assertEqual(session["status"], "done")
+        self.assertIsNone(await self.db.quiz_current_question(session_id))
+        # Exactly one answer row per question.
+        rows = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM quiz_answers WHERE session_id = ?", (session_id,)
+        )
+        self.assertEqual(rows[0][0], 3)
+
+    async def test_double_answer_is_rejected_once_and_never_double_scores(self):
+        session_id = await self._create_session()
+        question = await self.db.quiz_current_question(session_id)
+        first = await self.db.quiz_record_answer(
+            session_id, question["question_id"], 0
+        )
+        self.assertEqual(first["status"], "ok")
+        second = await self.db.quiz_record_answer(
+            session_id, question["question_id"], 1
+        )
+        self.assertEqual(second["status"], "already")
+        rank = await self.db.leaderboard_rank(OWNER)
+        self.assertEqual(rank["points"], 10)
+
+    async def test_out_of_turn_question_is_stale(self):
+        session_id = await self._create_session()
+        questions = await self.db.db.execute_fetchall(
+            "SELECT question_id FROM quiz_questions WHERE session_id = ? ORDER BY idx",
+            (session_id,),
+        )
+        # Question idx=1 while current_index is 0.
+        result = await self.db.quiz_record_answer(session_id, questions[1][0], 0)
+        self.assertEqual(result["status"], "stale")
+
+    async def test_ownership_is_enforced(self):
+        session_id = await self._create_session()
+        self.assertIsNone(await self.db.quiz_get_session(session_id, OTHER))
+
+    async def test_admission_blocks_active_rate_limited_and_expired(self):
+        await self._create_session()
+        reason = await self.db.quiz_admission(
+            OWNER, max_active_hours=6, max_sessions_per_hour=3
+        )
+        self.assertEqual(reason, "active")
+        # Finish it; the hourly cap then applies.
+        await self.db.db.execute(
+            "UPDATE quiz_sessions SET status='done' WHERE user_id=?", (OWNER,)
+        )
+        await self.db.db.commit()
+        reason = await self.db.quiz_admission(
+            OWNER, max_active_hours=6, max_sessions_per_hour=1
+        )
+        self.assertEqual(reason, "rate")
+        reason = await self.db.quiz_admission(
+            OWNER, max_active_hours=6, max_sessions_per_hour=3
+        )
+        self.assertIsNone(reason)
+        # A stale active session is lazily expired.
+        await self.db.db.execute(
+            "UPDATE quiz_sessions SET status='active', updated_at=? WHERE user_id=?",
+            ("2000-01-01T00:00:00+00:00", OWNER),
+        )
+        await self.db.db.commit()
+        reason = await self.db.quiz_admission(
+            OWNER, max_active_hours=6, max_sessions_per_hour=3
+        )
+        self.assertIsNone(reason)
+        statuses = await self.db.db.execute_fetchall(
+            "SELECT DISTINCT status FROM quiz_sessions WHERE user_id=?", (OWNER,)
+        )
+        self.assertIn("expired", {row[0] for row in statuses})
+
+    async def test_leaderboard_orders_and_excludes_banned_and_zeros(self):
+        await self.db.set_first_name(OWNER, "نگار")
+        await self.db.ensure_user(777)
+        await self.db.set_first_name(777, "سارا")
+        await self.db.db.execute("UPDATE users SET quiz_points=30 WHERE telegram_id=?", (OWNER,))
+        await self.db.db.execute("UPDATE users SET quiz_points=50 WHERE telegram_id=?", (777,))
+        await self.db.db.execute("UPDATE users SET banned=1, quiz_points=99 WHERE telegram_id=?", (OTHER,))
+        await self.db.db.commit()
+        board = await self.db.leaderboard_top(20)
+        self.assertEqual([row["quiz_points"] for row in board], [50, 30])
+        self.assertEqual(board[1]["first_name"], "نگار")
+        # Banned user cannot outrank anyone.
+        self.assertTrue(all(row["first_name"] != "" for row in board))
+        rank_other = await self.db.leaderboard_rank(OTHER)
+        # Banned users still get a numeric rank from the points table; the user
+        # screen itself is ban-gated before this is ever shown.
+        self.assertIsInstance(rank_other["rank"], int)
+
+    async def test_quit_keeps_earned_points(self):
+        session_id = await self._create_session()
+        question = await self.db.quiz_current_question(session_id)
+        await self.db.quiz_record_answer(session_id, question["question_id"], 0)
+        await self.db.quiz_finish(session_id, "quit")
+        session = await self.db.quiz_get_session(session_id, OWNER)
+        self.assertEqual(session["status"], "quit")
+        self.assertEqual(session["score"], 10)
+        self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 10)
+
+
+class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "flow.db",
+            temp_dir=root / "tmp",
+            quiz_cost_seconds_per_question=60,
+        )
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.client = FakeTelegramClient()
+        await self.db.ensure_user(OWNER)
+        await self.db.add_credit(OWNER, 3600, note="test", validity_days=30)
+        self.item_id = await self.db.library_add(
+            OWNER, "booklet", 10, 20, None, title="جزوهٔ آزمون"
+        )
+        await self.db.library_set_content(self.item_id, "متن کامل جزوه برای ساخت آزمون")
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    def _event(self, data: bytes, user_id: int = OWNER) -> FakeCallbackEvent:
+        event = FakeCallbackEvent(self.client, data=data, chat_id=user_id)
+        event.client = self.client
+        return event
+
+    @staticmethod
+    def _payloads(buttons) -> set[bytes]:
+        return menu_payloads(buttons)
+
+    @staticmethod
+    def _labels(buttons) -> list[str]:
+        return [button.text for row in buttons for button in row]
+
+    async def test_quiz_start_screen_shows_three_costs(self):
+        event = self._event(f"quiz:new:{self.item_id}".encode())
+        await self.bot._handle_callback(event)
+        record = event.edits[-1]
+        self.assertIn("آزمون از جزوه", record["text"])
+        for count in (5, 10, 15):
+            self.assertIn(
+                f"quiz:go:{self.item_id}:{count}".encode(),
+                self._payloads(record["buttons"]),
+            )
+
+    async def test_generation_debits_then_full_quiz_completes_with_rank(self):
+        with mock.patch("gamas_bot.learning.random.shuffle"):
+            with mock.patch(
+                "gamas_bot.bot.complete_json",
+                new=mock.AsyncMock(return_value=quiz_payload(5)),
+            ) as generator:
+                event = self._event(f"quiz:go:{self.item_id}:5".encode())
+                await self.bot._handle_callback(event)
+                generator.assert_awaited_once()
+        # A lot-aware debit exists with allocations.
+        debits = await self.db.db.execute_fetchall(
+            "SELECT id, seconds, note FROM ledger WHERE user_id=? AND kind='debit'",
+            (OWNER,),
+        )
+        self.assertEqual(len(debits), 1)
+        self.assertEqual(debits[0][1], 300)
+        allocations = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*), SUM(seconds) FROM debit_allocations WHERE debit_id=?",
+            (debits[0][0],),
+        )
+        self.assertEqual(tuple(allocations[0]), (1, 300))
+        self.assertEqual(await self.db.available_seconds(OWNER), 3300)
+        session_rows = await self.db.db.execute_fetchall(
+            "SELECT session_id FROM quiz_sessions WHERE user_id=?", (OWNER,)
+        )
+        session_id = session_rows[0][0]
+        # Answer all five questions, alternating correct (option 0, no shuffle).
+        for index in range(5):
+            question = await self.db.quiz_current_question(session_id)
+            answer = self._event(
+                f"quiz:ans:{session_id}:{question['question_id']}:0".encode()
+            )
+            await self.bot._handle_callback(answer)
+            reveal = answer.edits[-1]
+            self.assertIn("✅ پاسخ درست", reveal["text"])
+            if index < 4:
+                self.assertTrue(
+                    any("سؤال بعدی" in label for label in self._labels(reveal["buttons"]))
+                )
+                next_event = self._event(f"quiz:next:{session_id}".encode())
+                await self.bot._handle_callback(next_event)
+        # Finish screen on the last reveal's next tap.
+        next_event = self._event(f"quiz:next:{session_id}".encode())
+        await self.bot._handle_callback(next_event)
+        finish = next_event.edits[-1]
+        self.assertIn("آزمون تمام شد", finish["text"])
+        self.assertIn("امتیاز کسب‌شده: ۵۰", finish["text"])
+        self.assertIn(b"board", self._payloads(finish["buttons"]))
+        self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 50)
+
+    async def test_llm_failure_refunds_in_full_and_shows_notice(self):
+        with mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(side_effect=LLMError("boom")),
+        ):
+            event = self._event(f"quiz:go:{self.item_id}:5".encode())
+            await self.bot._handle_callback(event)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
+        self.assertIn(LEARNING_GENERATION_FAILED, self.client.texts[-1]["text"])
+        sessions = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM quiz_sessions")
+        self.assertEqual(sessions[0][0], 0)
+        refund = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE note LIKE 'refund:%'"
+        )
+        self.assertEqual(refund[0][0], 1)
+
+    async def test_validation_shortfall_refunds(self):
+        short = {"questions": quiz_payload(2)["questions"][:2]}
+        with mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=short)
+        ):
+            event = self._event(f"quiz:go:{self.item_id}:5".encode())
+            await self.bot._handle_callback(event)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
+        self.assertIn(LEARNING_GENERATION_FAILED, self.client.texts[-1]["text"])
+
+    async def test_insufficient_balance_denies_without_debit(self):
+        await self.db.db.execute(
+            "DELETE FROM ledger WHERE user_id=?", (OWNER,)
+        )
+        await self.db.db.commit()
+        event = self._event(f"quiz:go:{self.item_id}:5".encode())
+        with mock.patch("gamas_bot.bot.complete_json") as generator:
+            await self.bot._handle_callback(event)
+            generator.assert_not_called()
+        self.assertIn(LEARNING_NO_CREDIT, self.client.texts[-1]["text"])
+        debits = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
+        )
+        self.assertEqual(debits[0][0], 0)
+
+    async def test_double_tap_answer_gets_friendly_ack_and_one_row(self):
+        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=quiz_payload(5)),
+        ):
+            await self.bot._handle_callback(
+                self._event(f"quiz:go:{self.item_id}:5".encode())
+            )
+        session_id = (await self.db.db.execute_fetchall(
+            "SELECT session_id FROM quiz_sessions"
+        ))[0][0]
+        question = await self.db.quiz_current_question(session_id)
+        data = f"quiz:ans:{session_id}:{question['question_id']}:0".encode()
+        await self.bot._handle_callback(self._event(data))
+        second = self._event(data)
+        await self.bot._handle_callback(second)
+        self.assertEqual(second.answers[-1], ("پاسخ شما ثبت شده بود.", False))
+        rows = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM quiz_answers WHERE question_id=?",
+            (question["question_id"],),
+        )
+        self.assertEqual(rows[0][0], 1)
+
+    async def test_foreign_user_and_stale_callbacks_fail_closed(self):
+        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=quiz_payload(5)),
+        ):
+            await self.bot._handle_callback(
+                self._event(f"quiz:go:{self.item_id}:5".encode())
+            )
+        session_id = (await self.db.db.execute_fetchall(
+            "SELECT session_id FROM quiz_sessions"
+        ))[0][0]
+        question = await self.db.quiz_current_question(session_id)
+        foreign = self._event(
+            f"quiz:ans:{session_id}:{question['question_id']}:0".encode(),
+            user_id=OTHER,
+        )
+        await self.bot._handle_callback(foreign)
+        self.assertEqual(foreign.answers[-1][1], True)  # alert
+        self.assertIn("معتبر نیست", foreign.answers[-1][0])
+        # Malformed callback data.
+        bogus = self._event(b"quiz:ans:abc:def:0")
+        await self.bot._handle_callback(bogus)
+        self.assertEqual(bogus.answers[-1][1], True)
+
+    async def test_quit_shows_partial_summary_and_keeps_points(self):
+        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=quiz_payload(5)),
+        ):
+            await self.bot._handle_callback(
+                self._event(f"quiz:go:{self.item_id}:5".encode())
+            )
+        session_id = (await self.db.db.execute_fetchall(
+            "SELECT session_id FROM quiz_sessions"
+        ))[0][0]
+        question = await self.db.quiz_current_question(session_id)
+        await self.bot._handle_callback(
+            self._event(f"quiz:ans:{session_id}:{question['question_id']}:0".encode())
+        )
+        quit_event = self._event(f"quiz:quit:{session_id}".encode())
+        await self.bot._handle_callback(quit_event)
+        text = quit_event.edits[-1]["text"]
+        self.assertIn("آزمون پایان یافت", text)
+        self.assertIn("امتیاز کسب‌شده: ۱۰", text)
+        self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 10)
+
+    async def test_legacy_item_without_content_shows_notice(self):
+        legacy = await self.db.library_add(
+            OWNER, "booklet", 11, 21, None, title="جزوهٔ قدیمی"
+        )
+        event = self._event(f"quiz:new:{legacy}".encode())
+        await self.bot._handle_callback(event)
+        self.assertIn("قدیمی ذخیره نشده است", event.edits[-1]["text"])
+
+    async def test_unlimited_user_quizzes_for_free(self):
+        await self.db.set_unlimited(OWNER, True, admin_id=1, reason="vip")
+        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=quiz_payload(5)),
+        ):
+            event = self._event(f"quiz:go:{self.item_id}:5".encode())
+            await self.bot._handle_callback(event)
+        debits = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
+        )
+        self.assertEqual(debits[0][0], 0)
+        sessions = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM quiz_sessions WHERE status='active'"
+        )
+        self.assertEqual(sessions[0][0], 1)
+
+    async def test_concurrent_tap_is_rejected_before_a_second_debit(self):
+        async def hold_then_answer(*_args, **_kwargs):
+            await asyncio.sleep(0.05)
+            return quiz_payload(5)
+
+        with mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=hold_then_answer)
+        ):
+            first = self._event(f"quiz:go:{self.item_id}:5".encode())
+            second = self._event(f"quiz:go:{self.item_id}:5".encode())
+            await asyncio.gather(
+                self.bot._handle_callback(first),
+                self.bot._handle_callback(second),
+            )
+        # Only one generation and one debit; the second tap was rejected.
+        debits = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
+        )
+        self.assertEqual(debits[0][0], 1)
+        sessions = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM quiz_sessions")
+        self.assertEqual(sessions[0][0], 1)
+        self.assertTrue(
+            any(
+                answer is not None and "در حال پردازش" in answer
+                for answer, _alert in second.answers
+            )
+        )

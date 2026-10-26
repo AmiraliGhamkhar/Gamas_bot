@@ -76,7 +76,16 @@ from .docx_export import (
     resolve_fonts,
 )
 from .jobs import Job, JobQueue, QueueFullError
-from .learning import bound_content_text
+from .learning import (
+    MAX_MODEL_INPUT_CHARS,
+    MIN_VALID_QUESTIONS,
+    OPTION_LABELS,
+    QUIZ_SCHEMA,
+    bound_content_text,
+    parse_quiz_payload,
+    quiz_system_prompt,
+)
+from .llm import complete_json
 from .logging_config import log_job_id
 from .metrics import METRICS
 from .media import (
@@ -249,6 +258,52 @@ SUPPORT_CATEGORY_BUTTONS = {
     "subscription": "📦 اشتراک و اعتبار",
     "other": "📌 سایر موارد",
 }
+
+# ------------------------------------------------------------- learning loop
+#: Shown on booklets delivered before content archiving existed.
+LEARNING_LEGACY_NOTICE = (
+    "متن این جزوهٔ قدیمی ذخیره نشده است؛ آزمون و فلش‌کارت فقط برای جزوه‌های جدید فعال است."
+)
+#: §6.1 quiz start guidance.
+QUIZ_START_GUIDANCE = (
+    "با این آزمون دانش خود را از این جزوه بسنجید؛ هر پاسخ درست ۱۰ امتیاز دارد. "
+    "ابتدا تعداد سؤال‌ها را انتخاب کنید:"
+)
+#: §6.3 empty leaderboard.
+LEADERBOARD_EMPTY = (
+    "🏆 لیدربورد\n\n"
+    "هنوز امتیازی ثبت نشده است.\n"
+    "اولین آزمون خود را از «📚 کتابخانه من» شروع کنید."
+)
+#: §6.5 no flashcard decks yet.
+FLASHCARD_EMPTY = (
+    "🃏 فلش‌کارت‌ها\n\n"
+    "هنوز مجموعه‌ای نساخته‌اید.\n"
+    "از یک جزوه بسازید یا کارت‌های دستی خودتان را اضافه کنید."
+)
+#: §6.10 the balance denial shared by quiz and AI flashcard generation.
+LEARNING_NO_CREDIT = (
+    "اعتبار شما برای این کار کافی نیست. از «💳 حساب من» می‌توانید اعتبار خریداری کنید."
+)
+#: §6.11 every refunded generation failure.
+LEARNING_GENERATION_FAILED = (
+    "ساخت محتوا ناموفق بود؛ اعتبار شما کامل برگشت داده شد. "
+    "لطفاً کمی بعد دوباره امتحان کنید."
+)
+#: Appended to booklet captions (§6.12); the stored library title stays clean.
+LEARNING_DELIVERY_CTA = (
+    "\n🧪 از همین جزوه آزمون بده یا 🃏 فلش‌کارت بساز: «کتابخانه من»"
+)
+#: Manual flashcard conversation prompts (§6.14).
+FLASHCARD_ASK_FRONT = "پرسش کارت را بفرستید:"
+FLASHCARD_ASK_BACK = "پاسخ کارت را بفرستید:"
+#: Stale learning callbacks (old keyboards, finished sessions, foreign owners).
+LEARNING_STALE_ALERT = "این آزمون دیگر معتبر نیست."
+LEARNING_BUSY_ALERT = "درخواست قبلی شما در حال پردازش است؛ کمی صبر کنید."
+#: Leaderboard display name when a user never exposed a first name.
+LEADERBOARD_FALLBACK_NAME = "کاربر گاماس"
+QUIZ_COUNTS = (5, 10, 15)
+QUIZ_POINTS_PER_ANSWER = 10
 SUPPORT_STATUS_LABELS = {
     "open": "🆕 باز",
     "awaiting_admin": "⏳ در انتظار پاسخ پشتیبانی",
@@ -886,6 +941,15 @@ class GamasBot:
         self._support_admin_states: dict[int, int] = {}
         # admin_id -> payment_id awaiting a rejection reason
         self._pending_reject_reason: dict[int, int] = {}
+        # user_id -> (deck_id, phase) while a manual flashcard conversation is armed
+        self._pending_flashcard: dict[int, tuple[int, str]] = {}
+        # user_id -> front text waiting for its back in the manual-card flow
+        self._pending_flashcard_front: dict[int, str] = {}
+        # Per-user generation guards: a second quiz/deck tap while the LLM is
+        # running must not deduct twice (the DB session row does not exist yet
+        # during generation, so the guard has to live in process memory).
+        self._learning_locks: dict[int, asyncio.Lock] = {}
+        self._learning_in_flight: set[int] = set()
         self._admin_action_times: dict[tuple[int, str], float] = {}
         self._broadcast_running: set[int] = set()
         self._started_at = time.time()
@@ -1314,6 +1378,339 @@ class GamasBot:
                 )
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
 
+    # --------------------------------------------------------------- learning
+    def _learning_lock(self, user_id: int) -> asyncio.Lock:
+        """The per-user lock serialising quiz/deck generation in this process.
+
+        The instance lock guarantees one bot process, so an in-memory lock is
+        sufficient; the database constraints remain the durable defence.
+        """
+        lock = self._learning_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._learning_locks[user_id] = lock
+        return lock
+
+    def _learning_back_button(self, item_id: int):
+        return Button.inline(
+            "↩️ بازگشت", f"lib:it:{item_id}".encode("ascii")
+        )
+
+    async def _quiz_start_screen(self, event, user_id: int, item_id: int) -> None:
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None:
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        if not item.get("content_text"):
+            await self._edit(
+                event,
+                "🧪 آزمون از جزوه\n\n" + LEARNING_LEGACY_NOTICE,
+                [[Button.inline("↩️ بازگشت", b"library")]],
+            )
+            return
+        per_question = self.settings.quiz_cost_seconds_per_question
+        buttons: list[list] = []
+        for count in QUIZ_COUNTS:
+            label = button_label(
+                f"{to_persian_digits(count)} سؤال — "
+                f"{format_duration(count * per_question)} اعتبار"
+            )
+            buttons.append([
+                Button.inline(
+                    label, f"quiz:go:{item_id}:{count}".encode("ascii")
+                )
+            ])
+        buttons.append([self._learning_back_button(item_id)])
+        await self._edit(
+            event, "🧪 آزمون از جزوه\n\n" + QUIZ_START_GUIDANCE, buttons
+        )
+
+    async def _quiz_generate(
+        self, event, user_id: int, item_id: int, count: int
+    ) -> None:
+        if count not in QUIZ_COUNTS:
+            await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)
+            return
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None or item.get("kind") != "booklet":
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        content = item.get("content_text")
+        if not content:
+            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
+            return
+        if not self.settings.note_configured:
+            await event.respond("سرویس ساخت آزمون در حال حاضر فعال نیست.")
+            return
+        # Synchronous gate: no await between the membership test and the add,
+        # so two queued callbacks can never both pass before generation ends.
+        if user_id in self._learning_in_flight:
+            # Second tap while the first generation is still charging/awaiting
+            # the model: reject before any second debit.
+            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
+            return
+        self._learning_in_flight.add(user_id)
+        async with self._learning_lock(user_id):
+            try:
+                reason = await self.db.quiz_admission(
+                    user_id,
+                    max_active_hours=self.settings.quiz_max_active_hours,
+                    max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
+                )
+                if reason == "active":
+                    await event.respond(
+                        "یک آزمون فعال دیگر دارید؛ ابتدا آن را تمام کنید یا "
+                        "دکمهٔ «پایان آزمون» را بزنید."
+                    )
+                    return
+                if reason == "rate":
+                    await event.respond(
+                        "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز "
+                        "رسیده است؛ کمی بعد دوباره تلاش کنید."
+                    )
+                    return
+                cost = count * self.settings.quiz_cost_seconds_per_question
+                note = f"quiz-pending:{item_id}"
+                try:
+                    charged = await self.db.spend_seconds(user_id, cost, note)
+                except InsufficientBalanceError:
+                    await event.respond(
+                        LEARNING_NO_CREDIT,
+                        buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+                    )
+                    return
+                placeholder = await event.respond("در حال ساخت سؤال‌ها… ⏳")
+                session_id: int | None = None
+                try:
+                    model_input = bound_content_text(
+                        content, limit=MAX_MODEL_INPUT_CHARS
+                    )
+                    payload = await complete_json(
+                        self._http_session(),
+                        self.settings,
+                        system=quiz_system_prompt(count),
+                        user=model_input,
+                        schema=QUIZ_SCHEMA,
+                    )
+                    questions = parse_quiz_payload(payload, count)
+                    if len(questions) < MIN_VALID_QUESTIONS:
+                        raise RuntimeError("quiz generation yielded too few questions")
+                    session_id = await self.db.quiz_create_session(
+                        user_id, item_id, questions
+                    )
+                except BaseException as exc:
+                    # Every failure path after the debit refunds in full:
+                    # LLM errors, malformed/short output, DB errors and even
+                    # cancellation during shutdown. Unlimited users were never
+                    # charged, so their refund is skipped.
+                    if charged:
+                        try:
+                            await self.db.refund_seconds(user_id, cost, note)
+                        except Exception:
+                            logger.exception(
+                                "quiz refund failed user=%s cost=%s", user_id, cost
+                            )
+                    try:
+                        await placeholder.edit(LEARNING_GENERATION_FAILED)
+                    except Exception:
+                        logger.warning("could not edit quiz placeholder", exc_info=True)
+                    if isinstance(
+                        exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+                    ):
+                        raise
+                    logger.warning("quiz generation failed", exc_info=exc)
+                    return
+                await self._render_question_message(placeholder, user_id, session_id)
+            finally:
+                self._learning_in_flight.discard(user_id)
+
+    def _question_keyboard(self, session_id: int, question_id: int) -> list[list]:
+        option_row = [
+            Button.inline(
+                OPTION_LABELS[index],
+                f"quiz:ans:{session_id}:{question_id}:{index}".encode("ascii"),
+            )
+            for index in range(4)
+        ]
+        return [
+            option_row,
+            [Button.inline(
+                "⏹ پایان آزمون", f"quiz:quit:{session_id}".encode("ascii")
+            )],
+        ]
+
+    async def _render_question_message(
+        self, message, user_id: int, session_id: int
+    ) -> None:
+        """Render the current question into an editable Message-like object."""
+        question = await self.db.quiz_current_question(session_id)
+        if question is None:
+            await self._finish_after_question(message, user_id, session_id)
+            return
+        number = int(question["idx"]) + 1
+        lines = [
+            f"سؤال {to_persian_digits(number)} از "
+            f"{to_persian_digits(question['question_count'])}",
+            "",
+            str(question["question"]),
+            "",
+        ]
+        for index, option in enumerate(question["options"]):
+            lines.append(f"{OPTION_LABELS[index]}) {option}")
+        await message.edit(
+            "\n".join(lines),
+            buttons=self._question_keyboard(session_id, int(question["question_id"])),
+        )
+
+    async def _finish_after_question(
+        self, message, user_id: int, session_id: int
+    ) -> None:
+        session = await self.db.quiz_get_session(session_id, user_id)
+        if session is None:
+            await message.edit(LEARNING_STALE_ALERT)
+            return
+        await self._show_finish_screen(message, user_id, session)
+
+    async def _show_finish_screen(self, message, user_id: int, session) -> None:
+        """The §6.2 celebration screen for a quiz answered to its last question."""
+        rank = await self.db.leaderboard_rank(user_id)
+        correct = int(session["score"]) // QUIZ_POINTS_PER_ANSWER
+        text = (
+            "🎉 آزمون تمام شد!\n\n"
+            f"پاسخ‌های درست: {to_persian_digits(correct)} از "
+            f"{to_persian_digits(session['question_count'])}\n"
+            f"امتیاز کسب‌شده: {to_persian_digits(session['score'])}\n"
+            "رتبهٔ شما در لیدربورد: "
+            f"{to_persian_digits(rank['rank'])}"
+        )
+        await message.edit(text, buttons=self._learning_done_buttons())
+
+    def _learning_done_buttons(self) -> list[list]:
+        return [
+            [Button.inline("🏆 لیدربورد", b"board")],
+            [Button.inline("📚 کتابخانه من", b"library")],
+            [Button.inline("↩️ منوی اصلی", b"menu:main")],
+        ]
+
+    async def _quiz_answer(
+        self,
+        event,
+        user_id: int,
+        session_id: int,
+        question_id: int,
+        option: int,
+    ) -> None:
+        session = await self.db.quiz_get_session(session_id, user_id)
+        if session is None:
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+            return
+        result = await self.db.quiz_record_answer(session_id, question_id, option)
+        if result["status"] == "stale":
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+            return
+        if result["status"] == "already":
+            # Friendly re-ack on a double tap: no second answer row, no points.
+            await self._ack(event, "پاسخ شما ثبت شده بود.")
+            return
+        correct_text = result["options"][result["correct_index"]]
+        if result["correct"]:
+            lines = [f"✅ پاسخ درست: {correct_text}"]
+        else:
+            lines = [
+                "❌ پاسخ شما درست نبود.",
+                f"✅ پاسخ درست: {correct_text}",
+            ]
+        if result["explanation"]:
+            lines.append(f"💡 {result['explanation']}")
+        next_label = (
+            "مشاهدهٔ نتیجه ➡️" if result["finished"] else "سؤال بعدی ➡️"
+        )
+        await self._edit(
+            event,
+            "\n".join(lines),
+            [[Button.inline(
+                next_label, f"quiz:next:{session_id}".encode("ascii")
+            )]],
+        )
+
+    async def _quiz_next(self, event, user_id: int, session_id: int) -> None:
+        session = await self.db.quiz_get_session(session_id, user_id)
+        if session is None:
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+            return
+        if session["status"] == "done":
+            await self._show_finish_screen(event, user_id, session)
+            return
+        if session["status"] != "active":
+            # quit/expired: the partial summary, points already earned stay.
+            await self._show_quiz_summary(event, user_id, session)
+            return
+        await self._render_question_message(event, user_id, session_id)
+
+    async def _quiz_quit(self, event, user_id: int, session_id: int) -> None:
+        session = await self.db.quiz_get_session(session_id, user_id)
+        if session is None:
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+            return
+        if session["status"] == "active":
+            await self.db.quiz_finish(session_id, "quit")
+            session = await self.db.quiz_get_session(session_id, user_id)
+        await self._show_quiz_summary(event, user_id, session)
+
+    async def _show_quiz_summary(self, event, user_id: int, session) -> None:
+        """Partial (quit) or terminal summary; earned points are never clawed back."""
+        answered = min(int(session["current_index"]), int(session["question_count"]))
+        correct = int(session["score"]) // QUIZ_POINTS_PER_ANSWER
+        rank = await self.db.leaderboard_rank(user_id)
+        text = (
+            "⏹ آزمون پایان یافت.\n\n"
+            f"پاسخ‌های درست: {to_persian_digits(correct)} از "
+            f"{to_persian_digits(answered)}\n"
+            f"امتیاز کسب‌شده: {to_persian_digits(session['score'])}\n"
+            f"رتبهٔ شما در لیدربورد: {to_persian_digits(rank['rank'])}"
+        )
+        await self._edit(event, text, self._learning_done_buttons())
+
+    async def _route_quiz_callback(self, event, user_id: int, data: str) -> None:
+        """Parse and dispatch every ``quiz:`` callback, failing closed."""
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "new" and len(parts) == 3:
+            item_id = _to_int(parts[2])
+            if item_id is None:
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+                return
+            await self._quiz_start_screen(event, user_id, item_id)
+            return
+        if action == "go" and len(parts) == 4:
+            item_id = _to_int(parts[2])
+            count = _to_int(parts[3])
+            if item_id is None or count is None:
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+                return
+            await self._quiz_generate(event, user_id, item_id, count)
+            return
+        if action == "ans" and len(parts) == 5:
+            session_id = _to_int(parts[2])
+            question_id = _to_int(parts[3])
+            option = _to_int(parts[4])
+            if session_id is None or question_id is None or option is None:
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+                return
+            await self._quiz_answer(event, user_id, session_id, question_id, option)
+            return
+        if action in ("next", "quit") and len(parts) == 3:
+            session_id = _to_int(parts[2])
+            if session_id is None:
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+                return
+            if action == "next":
+                await self._quiz_next(event, user_id, session_id)
+            else:
+                await self._quiz_quit(event, user_id, session_id)
+            return
+        await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+
     # ------------------------------------------------------------- callbacks
     async def _handle_callback(self, event) -> None:
         data = (event.data or b"").decode("utf-8", "replace").strip()
@@ -1492,6 +1889,9 @@ class GamasBot:
         elif data == "support" or data.startswith("sup:"):
             await self._ack(event)
             await self._handle_support_callback(event, user_id, data)
+        elif data.startswith("quiz:"):
+            await self._ack(event)
+            await self._route_quiz_callback(event, user_id, data)
         else:
             await self._ack(event)
 

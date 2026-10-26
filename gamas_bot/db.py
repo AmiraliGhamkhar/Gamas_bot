@@ -22,6 +22,7 @@ success and retain the transcription charge.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -809,6 +810,259 @@ class Database:
             "seconds_transcribed": float(seconds[0][0]) if seconds else 0.0,
             "toman_approved": int(revenue[0][0]) if revenue else 0,
         }
+
+    # ---------------------------------------------------------- learning: quiz
+    async def quiz_admission(
+        self,
+        user_id: int,
+        *,
+        max_active_hours: int,
+        max_sessions_per_hour: int,
+    ) -> str | None:
+        """Serialise the start-quiz guards in one write transaction.
+
+        Returns ``None`` when the user may start, or a machine reason:
+        ``"active"`` (an unfinished quiz exists) or ``"rate"`` (the hourly
+        session cap is reached). Stale active sessions are expired here first,
+        so a quiz abandoned mid-flow never blocks the user forever.
+        """
+        now = utc_now()
+        cutoff = iso(now - timedelta(hours=max_active_hours))
+        hour_ago = iso(now - timedelta(hours=1))
+        async with self._transaction():
+            await self.db.execute(
+                "UPDATE quiz_sessions SET status = 'expired', updated_at = ? "
+                "WHERE user_id = ? AND status = 'active' AND updated_at < ?",
+                (iso(now), int(user_id), cutoff),
+            )
+            active = await _rows(self.db,
+                "SELECT 1 FROM quiz_sessions WHERE user_id = ? AND status = 'active' "
+                "LIMIT 1",
+                (int(user_id),),
+            )
+            if active:
+                return "active"
+            recent = await _rows(self.db,
+                "SELECT COUNT(*) FROM quiz_sessions WHERE user_id = ? "
+                "AND julianday(created_at) >= julianday(?)",
+                (int(user_id), hour_ago),
+            )
+            if recent and int(recent[0][0]) >= int(max_sessions_per_hour):
+                return "rate"
+            return None
+
+    async def quiz_create_session(
+        self,
+        user_id: int,
+        item_id: int,
+        questions: list[dict[str, Any]],
+    ) -> int:
+        """Insert a session and all its questions atomically."""
+        if not questions:
+            raise ValueError("quiz session needs at least one question")
+        now = iso(utc_now())
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "INSERT INTO quiz_sessions(user_id, item_id, question_count, "
+                "current_index, score, status, created_at, updated_at) "
+                "VALUES (?, ?, ?, 0, 0, 'active', ?, ?)",
+                (int(user_id), int(item_id), len(questions), now, now),
+            )
+            session_id = int(cursor.lastrowid or 0)
+            for idx, question in enumerate(questions):
+                await self.db.execute(
+                    "INSERT INTO quiz_questions(session_id, idx, question, "
+                    "options_json, correct_index, explanation) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        idx,
+                        str(question["question"]),
+                        json.dumps(question["options"], ensure_ascii=False),
+                        int(question["correct_index"]),
+                        str(question.get("explanation", "")),
+                    ),
+                )
+            return session_id
+
+    async def quiz_get_session(
+        self, session_id: int, user_id: int
+    ) -> dict[str, Any] | None:
+        """Fetch a session only when it belongs to ``user_id``."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT session_id, user_id, item_id, question_count, current_index, "
+            "score, status, created_at, updated_at FROM quiz_sessions "
+            "WHERE session_id = ? AND user_id = ?",
+            (int(session_id), int(user_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def quiz_current_question(self, session_id: int) -> dict[str, Any] | None:
+        """The next unanswered question of an active session, or ``None``."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT q.question_id, q.idx, q.question, q.options_json, "
+            "q.correct_index, q.explanation, s.current_index, s.question_count "
+            "FROM quiz_questions q JOIN quiz_sessions s ON s.session_id = q.session_id "
+            "WHERE q.session_id = ? AND s.status = 'active' "
+            "AND q.idx = s.current_index",
+            (int(session_id),),
+        )
+        if not rows:
+            return None
+        row = dict(rows[0])
+        row["options"] = json.loads(row.pop("options_json"))
+        return row
+
+    async def quiz_record_answer(
+        self, session_id: int, question_id: int, chosen_index: int
+    ) -> dict[str, Any]:
+        """Record exactly one answer and advance the session.
+
+        Return shapes:
+        * ``{"status": "already"}`` — a second tap on an answered question;
+        * ``{"status": "stale"}`` — wrong session/question/order or inactive;
+        * ``{"status": "ok", ...}`` — the reveal payload and finished flag.
+
+        The unique ``quiz_answers(question_id)`` index is the race-proof
+        exactly-once guard; its IntegrityError is caught *inside* the
+        transaction so the caller can show a friendly re-ack instead of the
+        generic crash alert (sqlite keeps the transaction usable after a
+        statement-level constraint failure).
+        """
+        now = iso(utc_now())
+        async with self._transaction():
+            session_rows = await _rows(self.db,
+                "SELECT question_count, current_index, status FROM quiz_sessions "
+                "WHERE session_id = ?",
+                (int(session_id),),
+            )
+            if not session_rows or session_rows[0]["status"] != "active":
+                return {"status": "stale"}
+            question_count = int(session_rows[0]["question_count"])
+            current_index = int(session_rows[0]["current_index"])
+            question_rows = await _rows(self.db,
+                "SELECT question_id, idx, options_json, correct_index, explanation "
+                "FROM quiz_questions WHERE question_id = ? AND session_id = ?",
+                (int(question_id), int(session_id)),
+            )
+            if not question_rows or not 0 <= int(chosen_index) <= 3:
+                return {"status": "stale"}
+            # Check the exactly-once guard before the index check: a rapid
+            # double tap on the still-on-screen question arrives after the
+            # first answer already advanced current_index, and must report
+            # "already answered" rather than the generic stale-callback alert.
+            existing = await _rows(self.db,
+                "SELECT 1 FROM quiz_answers WHERE question_id = ?",
+                (int(question_id),),
+            )
+            if existing:
+                return {"status": "already"}
+            if int(question_rows[0]["idx"]) != current_index:
+                return {"status": "stale"}
+            question = question_rows[0]
+            correct_index = int(question["correct_index"])
+            is_correct = int(chosen_index) == correct_index
+            try:
+                await self.db.execute(
+                    "INSERT INTO quiz_answers(session_id, question_id, "
+                    "chosen_index, is_correct, answered_at) VALUES (?, ?, ?, ?, ?)",
+                    (
+                        int(session_id),
+                        int(question_id),
+                        int(chosen_index),
+                        int(is_correct),
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # Concurrent inserts racing on the unique index: same friendly
+                # outcome as the pre-check above.
+                return {"status": "already"}
+            if is_correct:
+                await self.db.execute(
+                    "UPDATE quiz_sessions SET score = score + 10, "
+                    "current_index = current_index + 1, updated_at = ? "
+                    "WHERE session_id = ?",
+                    (now, int(session_id)),
+                )
+                # The all-time leaderboard total lives on the user row; quiz
+                # answers remain the per-question audit trail.
+                await self.db.execute(
+                    "UPDATE users SET quiz_points = quiz_points + 10 "
+                    "WHERE telegram_id = (SELECT user_id FROM quiz_sessions "
+                    "WHERE session_id = ?)",
+                    (int(session_id),),
+                )
+            else:
+                await self.db.execute(
+                    "UPDATE quiz_sessions SET current_index = current_index + 1, "
+                    "updated_at = ? WHERE session_id = ?",
+                    (now, int(session_id)),
+                )
+            finished = current_index + 1 >= question_count
+            if finished:
+                await self.db.execute(
+                    "UPDATE quiz_sessions SET status = 'done', updated_at = ? "
+                    "WHERE session_id = ?",
+                    (now, int(session_id)),
+                )
+            score_rows = await _rows(self.db,
+                "SELECT score FROM quiz_sessions WHERE session_id = ?",
+                (int(session_id),),
+            )
+            return {
+                "status": "ok",
+                "correct": is_correct,
+                "chosen_index": int(chosen_index),
+                "correct_index": correct_index,
+                "options": json.loads(question["options_json"]),
+                "explanation": str(question["explanation"] or ""),
+                "finished": finished,
+                "score": int(score_rows[0]["score"]) if score_rows else 0,
+                "total": question_count,
+            }
+
+    async def quiz_finish(self, session_id: int, status: str) -> None:
+        """Move an active session to a terminal status (quit path)."""
+        if status not in ("quit", "expired", "done"):
+            raise ValueError(f"invalid terminal quiz status {status!r}")
+        await self._write(
+            "UPDATE quiz_sessions SET status = ?, updated_at = ? "
+            "WHERE session_id = ? AND status = 'active'",
+            (status, iso(utc_now()), int(session_id)),
+        )
+
+    # ----------------------------------------------------- learning: leaderboard
+    async def leaderboard_top(self, limit: int = 20) -> list[dict[str, Any]]:
+        """Top point earners among active users; first names only, never ids."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT first_name, quiz_points FROM users "
+            "WHERE banned = 0 AND quiz_points > 0 "
+            "ORDER BY quiz_points DESC, telegram_id ASC LIMIT ?",
+            (max(1, int(limit)),),
+        )
+        return [
+            {"first_name": str(row[0] or ""), "quiz_points": int(row[1])}
+            for row in rows
+        ]
+
+    async def leaderboard_rank(self, user_id: int) -> dict[str, int]:
+        """All-time rank (1-based, ties broken by points only) and own points."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT quiz_points FROM users WHERE telegram_id = ?",
+            (int(user_id),),
+        )
+        points = int(rows[0][0]) if rows else 0
+        higher = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM users WHERE banned = 0 AND quiz_points > ?",
+            (points,),
+        )
+        return {"rank": (int(higher[0][0]) if higher else 0) + 1, "points": points}
 
     # ------------------------------------------------------- admin reporting
     #: Terminal statuses that mean the user actually received the raw
