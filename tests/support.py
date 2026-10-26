@@ -14,6 +14,7 @@ import wave
 import zipfile
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 from telethon import TelegramClient
 
@@ -258,9 +259,17 @@ class FakeJobEvent:
     #: The bot only answers private chats.
     is_private = True
 
-    def __init__(self, source: Path | None = None, *, chat_id: int = 555, message_id: int = 77):
+    def __init__(
+        self,
+        source: Path | None = None,
+        *,
+        chat_id: int = 555,
+        message_id: int = 77,
+        sender: SimpleNamespace | None = None,
+    ):
         self.source = source
         self.sender_id = chat_id
+        self.sender = sender
         self.replies: list[str] = []
         self.responses: list[str] = []
         self.files: list[tuple[str, str]] = []
@@ -332,11 +341,15 @@ class FakeCallbackEvent:
         data: bytes,
         chat_id: int = 555,
         message_id: int = 77,
+        sender: SimpleNamespace | None = None,
     ):
         self.client = client
         self.data = data
         self.sender_id = chat_id
         self.chat_id = chat_id
+        # Telethon only guarantees sender_id; the name-capture helper reads
+        # first_name best-effort and tolerates a missing sender.
+        self.sender = sender
         self.message = FakeTelegramMessage(client, chat_id=chat_id, message_id=message_id)
         self.answers: list[tuple[str | None, bool]] = []
         self.edits: list[dict] = []

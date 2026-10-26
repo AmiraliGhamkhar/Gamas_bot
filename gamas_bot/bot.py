@@ -1201,7 +1201,8 @@ class GamasBot:
         """
         rows = [
             [Button.inline("📚 کتابخانه من", b"library"), Button.inline("💳 حساب من", b"wallet")],
-            [Button.inline("🎧 پشتیبانی", b"support"), Button.inline("ℹ️ راهنما", b"help")],
+            [Button.inline("🏆 لیدربورد", b"board"), Button.inline("🎧 پشتیبانی", b"support")],
+            [Button.inline("ℹ️ راهنما", b"help")],
         ]
         if is_admin:
             rows.append([Button.inline("🛠 پنل مدیریت", b"adm:home")])
@@ -1334,7 +1335,7 @@ class GamasBot:
                     [
                         Button.inline(
                             button_label(label),
-                            f"lib:f:{item['item_id']}".encode("ascii"),
+                            f"lib:it:{item['item_id']}".encode("ascii"),
                         )
                     ]
                 )
@@ -1347,6 +1348,10 @@ class GamasBot:
                 buttons.append(nav)
             buttons.extend(
                 [
+                    [
+                        Button.inline("📖 جزوه‌ها", b"library"),
+                        Button.inline("🃏 فلش‌کارت‌ها", b"library:fc"),
+                    ],
                     [Button.inline("💳 حساب من", b"wallet")],
                     [Button.inline("↩️ منوی اصلی", b"menu:main")],
                 ]
@@ -1357,10 +1362,49 @@ class GamasBot:
             event,
             text,
             [
+                [
+                    Button.inline("📖 جزوه‌ها", b"library"),
+                    Button.inline("🃏 فلش‌کارت‌ها", b"library:fc"),
+                ],
                 [Button.inline("💳 حساب من", b"wallet")],
                 [Button.inline("↩️ منوی اصلی", b"menu:main")],
             ],
         )
+
+    async def _show_library_item(self, event, item_id: int) -> None:
+        """Booklet/transcript detail: re-download plus learning entry points."""
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None:
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        title = self._item_display_title(item)
+        try:
+            date_label = jalali_date(datetime.fromisoformat(item["created_at"]))
+        except (TypeError, ValueError):
+            date_label = ""
+        header = f"📖 {title}" + (f"\n📅 {date_label}" if date_label else "")
+        buttons: list[list] = [
+            [Button.inline(
+                "📥 دریافت مجدد", f"lib:f:{item_id}".encode("ascii")
+            )],
+        ]
+        if item["kind"] == "booklet":
+            if item.get("content_text"):
+                buttons.append([Button.inline(
+                    "🧪 آزمون از این جزوه",
+                    f"quiz:new:{item_id}".encode("ascii"),
+                )])
+                buttons.append([Button.inline(
+                    "🃏 فلش‌کارت از این جزوه",
+                    f"fc:ai:{item_id}".encode("ascii"),
+                )])
+            else:
+                header += "\n\n" + LEARNING_LEGACY_NOTICE
+        buttons.append([Button.inline("↩️ بازگشت", b"lib:0")])
+        await self._edit(event, header, buttons)
 
     async def _forward_library_item(self, event, user_id: int, item_id: int) -> None:
         """Re-forward one artifact only after an owner-scoped lookup."""
@@ -2430,6 +2474,10 @@ class GamasBot:
                 "۴. همهٔ متن‌ها و جزوه‌ها در «📚 کتابخانه من» می‌مانند و هر زمان می‌توانید دوباره دریافت‌شان کنید.\n\n"
                 "«💳 حساب من»: موجودی، خرید اشتراک و پرداخت‌های شما در یک صفحه.\n"
                 "«🎧 پشتیبانی»: اگر مشکل یا سؤالی داشتید، تیکت بزنید.\n\n"
+                "🧪 از هر جزوه می‌توانید آزمون چندگزینه‌ای بگیرید؛ هر پاسخ درست ۱۰ امتیاز دارد "
+                "و امتیازها در «🏆 لیدربورد» جمع می‌شود. 🃏 همچنین می‌توانید از جزوه‌ها فلش‌کارت "
+                "بسازید (با هوش مصنوعی یا دستی) و آن‌ها را کارت‌به‌کارت مرور کنید. ساخت آزمون و "
+                "فلش‌کارت هوش مصنوعی از اعتبار شما کم می‌کند و در صورت خطا برمی‌گردد.\n\n"
                 "اعتبار بر اساس مدت فایل صوتی و پس از ارسال متن خام محاسبه می‌شود. "
                 "اگر ارسال متن خام ناموفق باشد، اعتبار مصرف نمی‌شود. "
                 "پس از دریافت متن خام، خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود."
@@ -2457,6 +2505,13 @@ class GamasBot:
                 await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             else:
                 await self._forward_library_item(event, user_id, item_id)
+        elif data.startswith("lib:it:"):
+            await self._ack(event)
+            item_id = _to_int(data.rsplit(":", 1)[-1])
+            if item_id is None:
+                await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            else:
+                await self._show_library_item(event, item_id)
         elif data.startswith("lib:"):
             await self._ack(event)
             page = _to_int(data.split(":", 1)[1])
@@ -3653,7 +3708,13 @@ class GamasBot:
                 notice_kind = "notes"
 
         if docx_path is not None:
-            caption = f"📖 جزوهٔ Word — {reference}\n📚 در کتابخانهٔ شما ذخیره شد"
+            # The library stores the clean one-line title; the learning CTA
+            # lives only in the Telegram caption (which _send_file caps at the
+            # 1024-char limit, truncating the trailing guide before the title).
+            title = f"📖 جزوهٔ Word — {reference}"
+            caption = (
+                title + "\n📚 در کتابخانهٔ شما ذخیره شد" + LEARNING_DELIVERY_CTA
+            )
             # Presentations pass their built document as plain_text and have no
             # transcript object; media jobs carry the LLM-source transcript.
             learning_source = (
@@ -3669,7 +3730,7 @@ class GamasBot:
                         job,
                         "booklet",
                         message,
-                        caption,
+                        title,
                         content_text=learning_text or None,
                     )
             except Exception:

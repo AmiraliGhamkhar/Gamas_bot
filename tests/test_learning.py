@@ -128,6 +128,48 @@ class LearningHelperTests(unittest.TestCase):
         ])
 
 
+class NameCaptureTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(db_path=root / "names.db", temp_dir=root / "tmp")
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def test_first_name_is_captured_bounded_and_optional(self):
+        event = FakeMessageEvent(OWNER, "سلام", first_name="  نگار  ")
+        await self.bot._handle_message(event)
+        identity = await self.db.user_identity(OWNER)
+        self.assertEqual(identity["first_name"], "نگار")
+        # An event without a sender (older Telethon, test doubles) never breaks.
+        bare = FakeMessageEvent(OTHER, "سلام")
+        bare.sender = None
+        await self.bot._handle_message(bare)
+        identity = await self.db.user_identity(OTHER)
+        self.assertEqual(identity["first_name"], "")
+        # The board falls back to the generic Persian name.
+        await self.db.db.execute(
+            "UPDATE users SET quiz_points=10 WHERE telegram_id=?", (OTHER,)
+        )
+        await self.db.db.commit()
+        board = await self.db.leaderboard_top(5)
+        self.assertEqual(board[0]["first_name"], "")
+
+    async def test_long_name_is_bounded(self):
+        event = FakeMessageEvent(OWNER, "سلام", first_name="گ" * 100)
+        await self.bot._handle_message(event)
+        identity = await self.db.user_identity(OWNER)
+        self.assertEqual(len(identity["first_name"]), 64)
+
+
 class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._tmp = tempfile.TemporaryDirectory()

@@ -863,9 +863,12 @@ class FakeMessageEvent:
     production.
     """
 
-    def __init__(self, sender_id: int, text: str):
+    def __init__(self, sender_id: int, text: str, *, first_name: str | None = None):
         self.sender_id = sender_id
         self.is_private = True
+        self.sender = (
+            SimpleNamespace(first_name=first_name) if first_name is not None else None
+        )
         self.record = SimpleNamespace(replies=[], files=[], file_payloads=[], edits=[])
         self.client = FakeTelegramClient(self.record)
         self.message = _FakeIncomingTextMessage(
@@ -1062,13 +1065,16 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self._tmp.cleanup()
 
-    def test_user_menu_is_the_four_action_root_for_everyone(self):
+    def test_user_menu_is_the_five_action_root_for_everyone(self):
         user_menu = menu_payloads(self.bot._user_menu(is_admin=False))
         admin_menu = menu_payloads(self.bot._user_menu(is_admin=True))
-        self.assertEqual(user_menu, {b"library", b"wallet", b"support", b"help"})
+        self.assertEqual(
+            user_menu,
+            {b"library", b"wallet", b"support", b"help", b"board"},
+        )
         self.assertEqual(
             admin_menu,
-            {b"library", b"wallet", b"support", b"help", b"adm:home"},
+            {b"library", b"wallet", b"support", b"help", b"board", b"adm:home"},
         )
 
     def test_admin_menu_is_its_own_panel_with_way_back(self):
@@ -1089,7 +1095,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"library", payloads)
         self.assertIn(b"wallet", payloads)
         self.assertIn(b"adm:home", payloads)
-        self.assertEqual(len(payloads), 5)
+        self.assertEqual(len(payloads), 6)
 
     async def test_main_panel_copy_uses_the_no_notes_variant_and_wallet_balance(self):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
@@ -1118,6 +1124,10 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
             "۴. همهٔ متن‌ها و جزوه‌ها در «📚 کتابخانه من» می‌مانند و هر زمان می‌توانید دوباره دریافت‌شان کنید.\n\n"
             "«💳 حساب من»: موجودی، خرید اشتراک و پرداخت‌های شما در یک صفحه.\n"
             "«🎧 پشتیبانی»: اگر مشکل یا سؤالی داشتید، تیکت بزنید.\n\n"
+            "🧪 از هر جزوه می‌توانید آزمون چندگزینه‌ای بگیرید؛ هر پاسخ درست ۱۰ امتیاز دارد "
+            "و امتیازها در «🏆 لیدربورد» جمع می‌شود. 🃏 همچنین می‌توانید از جزوه‌ها فلش‌کارت "
+            "بسازید (با هوش مصنوعی یا دستی) و آن‌ها را کارت‌به‌کارت مرور کنید. ساخت آزمون و "
+            "فلش‌کارت هوش مصنوعی از اعتبار شما کم می‌کند و در صورت خطا برمی‌گردد.\n\n"
             "اعتبار بر اساس مدت فایل صوتی و پس از ارسال متن خام محاسبه می‌شود. "
             "اگر ارسال متن خام ناموفق باشد، اعتبار مصرف نمی‌شود. "
             "پس از دریافت متن خام، خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود."
@@ -1589,7 +1599,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self._tmp.cleanup()
 
-    async def test_start_and_every_menu_use_the_four_button_layout(self):
+    async def test_start_and_every_menu_use_the_five_button_layout(self):
         start = FakeMessageEvent(501, "/start")
         await self.bot._handle_message(start)
         self.assertTrue(start.replies[0].startswith(
@@ -1599,14 +1609,14 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         start_payloads = menu_payloads(start.client.texts[0].get("buttons"))
         self.assertEqual(
             start_payloads,
-            {b"library", b"wallet", b"support", b"help"},
+            {b"library", b"wallet", b"support", b"help", b"board"},
         )
 
         menu = FakeCallbackEvent(501, b"menu:main")
         await self.bot._handle_callback(menu)
         self.assertEqual(
             menu_payloads(menu.edits[-1][1]),
-            {b"library", b"wallet", b"support", b"help"},
+            {b"library", b"wallet", b"support", b"help", b"board"},
         )
 
     async def test_bare_text_retriggers_file_upload_with_the_main_menu(self):
@@ -1619,7 +1629,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             menu_payloads(self.bot._user_menu()),
-            {b"library", b"wallet", b"support", b"help"},
+            {b"library", b"wallet", b"support", b"help", b"board"},
         )
 
     async def test_media_upload_without_a_mode_tap_runs_transcript_then_booklet(self):

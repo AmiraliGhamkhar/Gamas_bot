@@ -404,14 +404,24 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         flat_labels = [button.text for row in menu for button in row]
         self.assertEqual(
             flat_labels,
-            ["📚 کتابخانه من", "💳 حساب من", "🎧 پشتیبانی", "ℹ️ راهنما"],
+            [
+                "📚 کتابخانه من",
+                "💳 حساب من",
+                "🏆 لیدربورد",
+                "🎧 پشتیبانی",
+                "ℹ️ راهنما",
+            ],
         )
-        self.assertEqual(payloads, {b"library", b"wallet", b"support", b"help"})
+        self.assertEqual(
+            payloads,
+            {b"library", b"wallet", b"support", b"help", b"board"},
+        )
 
         admin_labels = [button.text for row in self.bot._admin_menu() for button in row]
         self.assertIn("💳 پرداخت‌های در انتظار", admin_labels)
         self.assertIn("📋 تاریخچه پرداخت‌ها", admin_labels)
         self.assertIn("🎧 مدیریت پشتیبانی", admin_labels)
+        self.assertIn("🏆 برترین کاربران", admin_labels)
         self.assertIn("↩️ پنل کاربری", admin_labels)
 
         self.assertEqual(
