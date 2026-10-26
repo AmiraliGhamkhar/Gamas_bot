@@ -1322,6 +1322,77 @@ class Database:
             )
             return bool(cursor.rowcount)
 
+    async def spend_seconds(self, user_id: int, seconds: int, note: str) -> bool:
+        """Charge credit for a hold-free feature (quiz/AI flashcard generation).
+
+        Returns ``True`` when a lot-aware debit was written and ``False`` for a
+        special unlimited user, who is never billed — the same invariant
+        :meth:`reserve` enforces for jobs, so the caller must skip the matching
+        refund when this returns ``False``.
+
+        The debit mirrors :meth:`settle_hold` exactly: one ``BEGIN IMMEDIATE``
+        transaction, earliest-expiring lots first, every consumed second backed
+        by a ``debit_allocations`` row. The ``holds`` tables are never touched:
+        quizzes are not submissions and reserve nothing ahead of time.
+        """
+        if seconds <= 0:
+            raise ValueError("spend must be positive")
+        async with self._transaction():
+            rows = await _rows(self.db,
+                "SELECT is_unlimited, banned FROM users WHERE telegram_id = ?",
+                (user_id,),
+            )
+            if not rows:
+                raise ValueError("unknown user")
+            if rows[0][1]:
+                raise UserBannedError("⛔ دسترسی شما به ربات مسدود شده است.")
+            if rows[0][0]:
+                return False
+            available = await self._available_seconds_locked(user_id)
+            if available < seconds:
+                raise InsufficientBalanceError(available, seconds)
+            now = iso(utc_now())
+            cursor = await self.db.execute(
+                "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
+                "VALUES (?, ?, 'debit', ?, ?)",
+                (user_id, int(seconds), note[:200], now),
+            )
+            remaining = seconds
+            for credit_id, lot_seconds in await self._credit_lots(user_id, now):
+                used = min(remaining, max(0, lot_seconds))
+                if used:
+                    await self.db.execute(
+                        "INSERT INTO debit_allocations(debit_id, credit_id, seconds) "
+                        "VALUES (?, ?, ?)",
+                        (cursor.lastrowid, credit_id, used),
+                    )
+                    remaining -= used
+                if not remaining:
+                    break
+            # The balance check and the allocation run under one write lock; a
+            # shortfall here is still a defensive guard, never an expected path.
+            if remaining:
+                raise InsufficientBalanceError(seconds - remaining, seconds)
+            return True
+
+    async def refund_seconds(
+        self, user_id: int, seconds: int, note: str
+    ) -> None:
+        """Return a failed feature charge as a non-expiring credit lot.
+
+        A refund deliberately has no expiry even when it consumed expiring
+        credit: the user is made whole, and the ``refund:`` note keeps the two
+        grant kinds distinguishable in the ledger and audit tooling.
+        """
+        if seconds <= 0:
+            return
+        await self.add_credit(
+            user_id,
+            int(seconds),
+            note="refund: " + note[:180],
+            validity_days=None,
+        )
+
     # ------------------------------------------------------------------ plans
     async def sync_plans(self, catalog: list[dict[str, Any]]) -> None:
         """Upsert the tariff catalog; admin-created custom plans are untouched."""
