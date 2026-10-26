@@ -2910,6 +2910,11 @@ class GamasBot:
             return
         text = (event.message.message or "").strip()
         command = _command_name(text)
+        if command:
+            # Any command ends a guided text prompt. This sits before the
+            # early-returning admin commands, so /grant or /ban cannot leave a
+            # card prompt armed to swallow the next message the admin sends.
+            self._pending_flashcard.pop(user_id, None)
         if command == "/start":
             # A fresh menu is a hard boundary for every conversational flow.
             # In particular, a later photo must not unexpectedly complete an
@@ -2919,7 +2924,6 @@ class GamasBot:
             self._pending_payments.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
-            self._pending_flashcard.pop(user_id, None)
             await self._show_main(event, first_start=True)
             return
 
@@ -2984,8 +2988,6 @@ class GamasBot:
         if user_id in self._pending_flashcard and not command:
             await self._handle_flashcard_text(event, user_id, text)
             return
-        if user_id in self._pending_flashcard and command:
-            self._pending_flashcard.pop(user_id, None)
 
         # While a receipt is expected, no ordinary text/media may fall through
         # to the paid lecture pipeline. Invalid input keeps the

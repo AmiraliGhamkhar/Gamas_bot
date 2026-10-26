@@ -1037,6 +1037,22 @@ class GuardTests(LearningTestCase):
         )
         self.assertIsNone(await self.db.quiz_active_session(OWNER))
 
+    async def test_an_admin_command_disarms_the_manual_card_prompt(self):
+        """An early-returning admin command must not leave a card prompt armed."""
+        await self._press(ADMIN, "fc:man")
+        self.assertIn(ADMIN, self.bot._pending_flashcard)
+
+        await self.bot._handle_message(FakeMessageEvent(ADMIN, "/grant 555 5"))
+        self.assertNotIn(ADMIN, self.bot._pending_flashcard)
+
+        # The next ordinary message is a re-trigger, not a card question.
+        stray = FakeMessageEvent(ADMIN, "یک پیام عادی")
+        await self.bot._handle_message(stray)
+        deck = await self.db.manual_deck(ADMIN)
+        assert deck is not None
+        self.assertEqual(await self.db.deck_cards(int(deck["deck_id"])), [])
+        self.assertIn("برای شروع", stray.replies[-1])
+
     async def test_the_deck_ceiling_refuses_a_new_manual_deck(self):
         from dataclasses import replace
 
