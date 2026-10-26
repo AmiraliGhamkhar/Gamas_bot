@@ -1,20 +1,18 @@
-"""Gamas Bot v3 — Telegram handlers, job pipeline, delivery.
+"""Gamas Bot v4 — one-action lecture processing, Telegram delivery and library.
 
 One file, three concerns, in order:
 
-* **Intake** — classify an upload (audio / video / presentation), record it,
-  enqueue it on the bounded queue with explicit back-pressure.
+* **Intake** — a user sends an audio/video lecture or PowerPoint directly; no
+  mode button is required. The upload is recorded and placed on the bounded
+  queue with explicit back-pressure.
 * **The pipeline** — download → media worker → STT → raw-text engine →
   **deliver the transcript immediately** → note generation → RTL Word booklet.
-  The transcript is delivered before note generation starts: an LLM outage can
-  delay the booklet, never the raw text.
-* **The screens** — two separated panels with their own navigation. The
-  **user panel** is the root for every account: one button for the main
-  flow, one account screen (balance, plans, payment), help. The **admin
-  panel** (overview, users, payments, broadcast, audit) is a separate
-  screen tree entered from its own button — admins get both panels, the
-  user menu never turns into the admin menu, and admin-only callbacks are
-  enforced server-side.
+  The transcript is always the first reward and is delivered before note
+  generation starts: an LLM outage can delay the booklet, never the raw text.
+* **The screens** — the user panel leads with the 📚 library and 💳 wallet. Each
+  delivered Telegram document is saved as a source-message reference in that
+  user's library (the file itself stays in Telegram); the admin panel remains a
+  separate screen tree with its own server-side callback guard.
 
 Everything provider-related lives in ``stt.py`` / ``llm.py``; everything text
 lives in ``transcript.py`` / ``notes.py``; everything layout in
@@ -41,6 +39,7 @@ from typing import Any
 import aiohttp
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.tl.custom.message import Message
 from telethon.tl.types import MessageMediaWebPage
 
 from .billing import (
@@ -66,7 +65,6 @@ from .fileio import (
     run_file_io_resource,
 )
 from .docx_export import (
-    OFFICE_HEADING_OFFSET,
     DocumentMeta,
     build_notes_docx,
     build_plain_docx,
@@ -94,24 +92,7 @@ from .notes import (
     structure_presentation,
     structure_transcript,
 )
-from .pdf_export import build_office_pdf
-from .office import (
-    FORMAT_EMOJI,
-    FORMAT_LABELS,
-    OFFICE_FORMATS,
-    OFFICE_MODE_LABELS,
-    TEXT_FILE_EXTENSIONS,
-    OfficeError,
-    OfficeSession,
-    build_office_document,
-    build_office_pptx,
-    build_office_xlsx,
-    fallback_slides,
-    office_filename,
-    office_title_from_filename,
-    read_text_file,
-)
-from .office_ai import infer_table, plan_deck
+from .office import OfficeError
 from .presentations import (
     PresentationError,
     align_narration_to_slides,
@@ -888,16 +869,6 @@ class GamasBot:
             max_active=settings.max_active_jobs,
             worker=self._run_job,
         )
-        # Free Office builds get their own small lane: a text->document job
-        # (seconds of CPU, no download/media/STT slots) must not queue behind
-        # multi-hour transcription jobs occupying every media worker. Both
-        # lanes share the same per-job worker, stage semaphores, LLM capacity
-        # pools, and per-user admission limit, so global bounds still apply.
-        self.office_queue = JobQueue(
-            max_queued=settings.max_queued_jobs,
-            max_active=settings.office_job_concurrency,
-            worker=self._run_job,
-        )
         self._download_semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
         self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_uploads)
@@ -907,7 +878,6 @@ class GamasBot:
         self._transcript_cleanup_task: asyncio.Task | None = None
         self._prewarm_task: asyncio.Task | None = None
         self._pending_payments: dict[int, int] = {}  # user_id -> payment_id awaiting receipt
-        self._stt_only_users: set[int] = set()
         self._pending_broadcast: set[int] = set()
         # user_id -> ("new", category) or ("reply", ticket_id) awaiting the next text.
         self._support_states: dict[int, tuple[str, object]] = {}
@@ -918,15 +888,6 @@ class GamasBot:
         self._admin_action_times: dict[tuple[int, str], float] = {}
         self._broadcast_running: set[int] = set()
         self._started_at = time.time()
-        # Free Office: the in-flight request of every user, and the last
-        # document each of them built (so «افزودن متن» can extend it).
-        self._office_sessions: dict[int, OfficeSession] = {}
-        # user_id -> (kind, text, title, built_at monotonic timestamp)
-        self._office_last: dict[int, tuple[str, str, str, float]] = {}
-        # user_id -> monotonic time of the last *accepted* build request. The
-        # section is free and may call the note model, so it needs its own
-        # per-user throttle (``OFFICE_MIN_INTERVAL_SECONDS``).
-        self._office_request_times: dict[int, float] = {}
         self.client = TelegramClient(
             str(settings.session_path), settings.api_id, settings.api_hash
         )
@@ -972,7 +933,6 @@ class GamasBot:
         await self.db.recover_interrupted()
         await run_file_io(self._sweep_stale_temp_dirs)
         self.queue.ensure_workers()
-        self.office_queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
         self._transcript_cleanup_task = asyncio.create_task(
             self._transcript_cleanup_loop()
@@ -999,7 +959,7 @@ class GamasBot:
         for entry in root.iterdir():
             if not entry.is_dir() or entry.is_symlink():
                 continue
-            if not entry.name.startswith(("submission-", "deck-", "office-")):
+            if not entry.name.startswith(("submission-", "deck-")):
                 continue
             try:
                 if entry.stat().st_mtime >= self._started_at:
@@ -1051,7 +1011,6 @@ class GamasBot:
                 logger.warning("failed to mark queued job as failed submission=%s", job.submission_id)
 
         await self.queue.shutdown(on_reject=_fail_queued)
-        await self.office_queue.shutdown(on_reject=_fail_queued)
         if self._http is not None:
             await self._http.close()
             self._http = None
@@ -1164,36 +1123,15 @@ class GamasBot:
 
     # ----------------------------------------------------------------- menus
     def _user_menu(self, *, is_admin: bool = False) -> list:
-        """The user panel — the root screen every account starts from.
+        """The user panel's two value loops: saved artifacts and account credit.
 
-        Admins get one extra entry row to their own panel; the admin panel
-        never replaces this menu, so both panels stay separately reachable.
+        Admins get one extra row to their separate panel; every other user sees
+        this same four-button menu, regardless of provider configuration.
         """
-        rows: list[list] = []
-        if self.settings.note_configured:
-            rows.append(
-                [
-                    Button.inline("🎙️ تبدیل صدا به متن", b"stt"),
-                    Button.inline("📝 ساخت جزوه", b"make"),
-                ]
-            )
-        else:
-            rows.append([Button.inline("🎙️ تبدیل صدا به متن", b"make")])
-        if self.settings.office_enabled:
-            rows.append([Button.inline("📄 ساخت سند رایگان", b"office")])
-        rows.append([Button.inline("💳 خرید اشتراک", b"buy")])
-        rows.append(
-            [
-                Button.inline("📊 اعتبار من", b"account"),
-                Button.inline("🧾 پرداخت‌های من", b"payments"),
-            ]
-        )
-        rows.append(
-            [
-                Button.inline("🎧 پشتیبانی", b"support"),
-                Button.inline("ℹ️ راهنما", b"help"),
-            ]
-        )
+        rows = [
+            [Button.inline("📚 کتابخانه من", b"library"), Button.inline("💳 حساب من", b"wallet")],
+            [Button.inline("🎧 پشتیبانی", b"support"), Button.inline("ℹ️ راهنما", b"help")],
+        ]
         if is_admin:
             rows.append([Button.inline("🛠 پنل مدیریت", b"adm:home")])
         return rows
@@ -1228,22 +1166,23 @@ class GamasBot:
             user_id, self._free_plan_seconds()
         ):
             logger.info("free plan granted")
-        greeting = "به گاماس خوش آمدید." if first_start else "منوی اصلی"
+        greeting = "به گاماس خوش آمدید. 🎓" if first_start else "منوی اصلی"
+        introduction = (
+            "فایل درس‌تان را همین‌جا بفرستید؛ دکمه لازم نیست:\n"
+            "• فایل صوتی یا ویدیویی کلاس، یا پیام صوتی/ویدیویی تلگرام\n"
+            "• یا فایل پاورپوینت (.pptx)\n\n"
+        )
         if self.settings.note_configured:
-            introduction = (
-                "برای ساخت جزوه، «📝 ساخت جزوه» را انتخاب و فایل درس را بفرستید؛ "
-                "متن گفتار و سپس جزوهٔ ورد ارسال می‌شود.\n"
-                "برای دریافت فقط متن، «🎙️ تبدیل صدا به متن» را انتخاب کنید.\n"
+            introduction += (
+                "ابتدا متن کامل گفتار و بلافاصله پس از آن جزوهٔ ورد برایتان ارسال می‌شود.\n"
+                "هر متن و جزوه به‌صورت خودکار در «📚 کتابخانه من» ذخیره می‌شود."
             )
         else:
-            introduction = (
-                "برای تبدیل صدا به متن، «🎙️ تبدیل صدا به متن» را انتخاب و فایل درس را بفرستید.\n"
-                "ساخت جزوهٔ ورد در حال حاضر فعال نیست.\n"
-            )
-        text = f"{greeting}\n\n{introduction}"
-        if self.settings.office_enabled:
-            text += "برای ساخت سند از متن، «📄 ساخت سند رایگان» را انتخاب کنید؛ اعتبار مصرف نمی‌شود.\n"
-        text += f"\n⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
+            introduction += "متن کامل گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ ورد در حال حاضر فعال نیست."
+        text = (
+            f"{greeting}\n\n{introduction}\n\n"
+            f"⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
+        )
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
 
     async def _edit_or_reply(self, event, text: str, buttons=None) -> None:
@@ -1268,325 +1207,89 @@ class GamasBot:
                 return plan.included_seconds
         return 3600
 
-    # ------------------------------------------------------------- free office
-    async def _show_office_menu(self, event, *, notice: str = "") -> None:
-        """The Free Office screen: the four formats, and what they cost.
-
-        The section is free, and the screen says so: a user who does not know
-        the bot's credit rules must not wonder whether a document is going to
-        spend their balance.
-        """
-        text = (
-            "📄 ساخت سند رایگان\n\n"
-            "متن خود را بفرستید تا به فایل Word، Excel، PowerPoint یا PDF تبدیل شود. "
-            "متن شما عیناً در فایل قرار می‌گیرد.\n"
-            "این بخش رایگان است و از اعتبار شما کم نمی‌کند.\n\n"
-            "قالب را انتخاب کنید:"
-        )
-        if notice:
-            text = f"{notice}\n\n{text}"
-        buttons = [
-            [Button.inline(f"{FORMAT_EMOJI['word']} {FORMAT_LABELS['word']}", b"office:word")],
-            [Button.inline(f"{FORMAT_EMOJI['excel']} {FORMAT_LABELS['excel']}", b"office:excel")],
-            [Button.inline(f"{FORMAT_EMOJI['ppt']} {FORMAT_LABELS['ppt']}", b"office:ppt")],
-            [Button.inline(f"{FORMAT_EMOJI['pdf']} {FORMAT_LABELS['pdf']}", b"office:pdf")],
-            [Button.inline("↩️ بازگشت", b"menu:main")],
-        ]
-        await self._edit_or_reply(event, text, buttons)
-
-    def _office_session(self, user_id: int, *, create: bool = False) -> OfficeSession | None:
-        """The user's live Office session, or ``None``.
-
-        A session that has been idle for longer than the configured window is
-        dropped: the content of a request is not kept for the user to find
-        hours later.
-        """
-        session = self._office_sessions.get(user_id)
-        if session is not None:
-            age = time.monotonic() - session.updated_at
-            if age > self.settings.office_session_ttl_minutes * 60:
-                self._office_sessions.pop(user_id, None)
-                self._office_last.pop(user_id, None)
-                return None
-        if session is None and create:
-            session = OfficeSession()
-            self._office_sessions[user_id] = session
-        if session is not None:
-            session.updated_at = time.monotonic()
-        return session
-
-    async def _handle_office_action(self, event, action: str) -> None:
-        """A button of the Free Office section."""
+    async def _show_library(self, event, *, page: int = 0) -> None:
+        """Show six newest Telegram artifacts; the user's id scopes every read."""
         user_id = event.sender_id
         if user_id is None:
             return
-        if action == "cancel":
-            self._office_sessions.pop(user_id, None)
-            await event.respond(
-                "لغو شد. برای ساخت سند، از «📄 ساخت سند رایگان» شروع کنید."
-            )
-            return
-        if action == "more":
-            # Extend the document that was just built: the previous content
-            # stays, and whatever arrives next is added to it.
-            previous = self._office_last.get(user_id)
-            if previous is not None:
-                kind, text, title, built_at = previous
-                age = time.monotonic() - built_at
-                if age > self.settings.office_session_ttl_minutes * 60:
-                    # The document is too old to extend; it is forgotten with
-                    # the same window as the rest of the request.
-                    self._office_last.pop(user_id, None)
-                    previous = None
-            if previous is None:
-                await self._show_office_menu(event, notice="سندی برای ادامه ندارم.")
-                return
-            kind, text, title, _built_at = previous
-            session = self._office_session(user_id, create=True) or OfficeSession()
-            session.kind = kind
-            session.parts = [text]
-            session.title = title
-            await event.respond(
-                "متن تازه را بفرستید؛ به سند قبلی اضافه می‌شود و سند تازه‌ای "
-                "برایتان می‌سازم.",
-                buttons=[[Button.inline("↩️ انصراف", b"office:cancel")]],
-            )
-            return
-        if action not in OFFICE_FORMATS:
-            return
-        session = self._office_session(user_id, create=True) or OfficeSession()
-        session.kind = action
-        if session.text.strip():
-            # The content arrived first: the document can be built right away.
-            await self._start_office_job(event, user_id, session)
-            return
-        await event.respond(
-            "متن سند را بفرستید (یا یک فایل ‎.txt / .md / .markdown / .csv بفرستید).\n"
-            "محتوای متن شما تغییر نمی‌کند؛ فقط نوشتار یکسان‌سازی می‌شود "
-            "(حروف عربی به فارسی و فاصله‌های اضافی). سطرهای جدول را با Tab جدا کنید.\n"
-            "حداکثر {limit} نویسه در هر سند پذیرفته می‌شود؛ متن بلندتر را در چند "
-            "سند بفرستید. سند خودکار به بخش‌های منسجم تقسیم می‌شود.\n"
-            "اگر متن بیشتری دارید، بعد از ساخت دکمهٔ «➕ افزودن متن» را بزنید.".format(
-                limit=to_persian_digits(self.settings.office_max_chars)
-            ),
-            buttons=[[Button.inline("↩️ انصراف", b"office:cancel")]],
+        page_size = 6
+        count = await self.db.library_count(user_id)
+        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
+        items = await self.db.library_list(
+            user_id, limit=page_size, offset=page * page_size
         )
-
-    async def _handle_office_message(self, event, user_id: int, text: str) -> bool:
-        """Route an incoming message into the Free Office section.
-
-        Returns ``True`` when the message *was* the section's content, so the
-        caller must not treat it as anything else. A lecture upload is never
-        office content, and a command is never content either.
-        """
-        if not self.settings.office_enabled:
-            return False
-        message = event.message
-        if message is None:
-            return False
-        # A lecture upload belongs to the lecture pipeline, not here.
-        if _presentation_metadata(message)[0] is not None:
-            return False
-        if _media_metadata(message)[0] is not None:
-            return False
-        filename = getattr(message.file, "name", None) if message.file else None
-        extension = Path(filename or "").suffix.lower()
-        is_text_file = message.document is not None and extension in TEXT_FILE_EXTENSIONS
-        if is_text_file:
-            # Size before bytes: a document is downloaded by the Telethon task,
-            # outside the bounded job queue, so an unchecked 2 GB upload would
-            # bypass MAX_QUEUED_JOBS entirely (audit F-10).
-            reported = getattr(message.file, "size", None)
-            if isinstance(reported, int) and reported > self.settings.office_max_input_bytes:
-                await event.reply(
-                    "❌ فایل متنی از حد مجاز بزرگ‌تر است "
-                    f"(حداکثر {to_persian_digits(self.settings.office_max_input_bytes // 1024)} کیلوبایت). "
-                    "فایل کوچک‌تری ارسال کنید."
-                )
-                return True
-        if not is_text_file:
-            # Any other attachment (a photo, a sticker) is not office content:
-            # only a message and a text file are.
-            if (
-                getattr(message, "photo", None) is not None
-                or getattr(message, "sticker", None) is not None
-                or getattr(message, "gif", None) is not None
-            ):
-                return False
-            if not text or text.startswith("/"):
-                return False
-        session = self._office_session(user_id, create=True) or OfficeSession()
-        if is_text_file:
-            try:
-                content = await self._download_office_text(message, filename or "")
-            except OfficeError as exc:
-                await event.reply(f"❌ {exc}")
-                return True
-            assert content is not None
-            if len(session.text) + len(content) > self.settings.office_max_chars:
-                # Checked *after* reading: the byte ceiling of an upload and the
-                # character ceiling of a document are different limits, and the
-                # old flow accepted a 1 MB file only to reject it later forever
-                # (the session was never cleared, so every retry failed too).
-                await event.reply(
-                    "❌ متن این فایل از حد مجاز سند بیشتر است.\n"
-                    f"حداکثر {to_persian_digits(self.settings.office_max_chars)} نویسه؛ "
-                    "فایل را کوتاه‌تر کنید یا در چند سند بفرستید."
-                )
-                self._office_sessions.pop(user_id, None)
-                return True
-            # Appending (not replacing) keeps text the user typed before the
-            # file arrived; a file used to silently discard it.
-            session.add(content)
-            session.filename = filename
-            # A short caption is a better title than the file name.
-            caption = (message.message or "").strip()
-            session.title = (
-                caption[:120] if 0 < len(caption) <= 90
-                else office_title_from_filename(filename)
+        if count == 0:
+            text = (
+                "📚 کتابخانه من\n\n"
+                "کتابخانهٔ شما خالی است.\n"
+                "اولین فایل درس را بفرستید؛ متن و جزوه به‌صورت خودکار اینجا ذخیره می‌شوند."
             )
         else:
-            if len(session.text) + len(text) > self.settings.office_max_chars:
-                await event.reply(
-                    "❌ متن شما از حد مجاز بیشتر است.\n"
-                    f"حداکثر {to_persian_digits(self.settings.office_max_chars)} نویسه در هر سند؛ "
-                    "متن را کوتاه‌تر کنید یا در چند سند بفرستید."
+            lines = [
+                "📚 کتابخانه من",
+                "",
+                f"تعداد موارد: {to_persian_digits(count)}",
+            ]
+            buttons: list[list] = []
+            for item in items:
+                title = " ".join(str(item.get("title") or "").split())
+                if not title:
+                    title = "جزوهٔ Word" if item["kind"] == "booklet" else "متن گفتار"
+                label = title if title.startswith("📖 ") else f"📖 {title}"
+                buttons.append(
+                    [
+                        Button.inline(
+                            button_label(label),
+                            f"lib:f:{item['item_id']}".encode("ascii"),
+                        )
+                    ]
                 )
-                return True
-            session.add(text)
-        session.message = message
-        if session.kind:
-            await self._start_office_job(event, user_id, session)
-        else:
-            await self._show_office_menu(
-                event, notice="متن شما آماده است؛ حالا قالب فایل را انتخاب کنید."
+            nav = []
+            if page > 0:
+                nav.append(Button.inline("◀️ قبلی", f"lib:{page - 1}".encode("ascii")))
+            if (page + 1) * page_size < count:
+                nav.append(Button.inline("بعدی ▶️", f"lib:{page + 1}".encode("ascii")))
+            if nav:
+                buttons.append(nav)
+            buttons.extend(
+                [
+                    [Button.inline("💳 حساب من", b"wallet")],
+                    [Button.inline("↩️ منوی اصلی", b"menu:main")],
+                ]
             )
-        return True
-
-    async def _download_office_text(self, message, filename: str) -> str | None:
-        """Download an uploaded text file and read it.
-
-        The file is removed as soon as it has been read: the content lives in
-        the session, and the bot's promise is that temporary files do not
-        outlive the work.
-        """
-        await run_file_io(
-            self.settings.temp_dir.mkdir, parents=True, exist_ok=True
+            await self._edit_or_reply(event, "\n".join(lines), buttons)
+            return
+        await self._edit_or_reply(
+            event,
+            text,
+            [
+                [Button.inline("💳 حساب من", b"wallet")],
+                [Button.inline("↩️ منوی اصلی", b"menu:main")],
+            ],
         )
-        token = secrets.token_hex(6)
-        target = self.settings.temp_dir / f"office-{token}{Path(filename).suffix.lower()}"
+
+    async def _forward_library_item(self, event, user_id: int, item_id: int) -> None:
+        """Re-forward one artifact only after an owner-scoped lookup."""
+        item = await self.db.library_item(user_id, item_id)
+        if item is None:
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
         try:
-            await self._download_telegram_media(
-                message, target, self.settings.office_max_input_bytes
+            if item["unavailable"]:
+                raise RuntimeError("Telegram source was already marked unavailable")
+            await self.client.forward_messages(
+                event.chat_id,
+                [int(item["message_id"])],
+                from_peer=int(item["chat_id"]),
             )
-            return await run_file_io(
-                read_text_file, target, max_bytes=self.settings.office_max_input_bytes
-            )
-        except OfficeError:
-            raise
-        except ValueError as exc:
-            raise OfficeError(
-                "حجم فایل بیش از حد مجاز است (حداکثر "
-                f"{to_persian_digits(self.settings.office_max_input_bytes // 1024)} کیلوبایت)."
-            ) from exc
-        except Exception as exc:
-            logger.warning("office upload could not be read: %s", exc)
-            raise OfficeError("فایل ارسالی خوانده نشد.") from exc
-        finally:
+        except Exception:
             try:
-                await run_file_io(target.unlink, missing_ok=True)
-            except OSError:  # pragma: no cover - defensive
-                pass
-
-    async def _start_office_job(self, event, user_id: int, session: OfficeSession) -> None:
-        """Queue the build of a Free Office document.
-
-        The document is built by the job queue, exactly like a lecture: the
-        chat handler only records the request and returns. The section never
-        reserves credit — it is free — so no hold is created and nothing is
-        charged when the build succeeds or fails.
-        """
-        content = session.text
-        kind = session.kind or "word"
-        if not content.strip():
-            await event.reply("متنی برای ساخت سند نیست؛ متن را بفرستید.")
-            return
-        if len(content) > self.settings.office_max_chars:
-            await event.reply(
-                "❌ متن شما از حد مجاز بیشتر است "
-                f"({to_persian_digits(self.settings.office_max_chars)} نویسه). "
-                "متن کوتاه‌تری ارسال کنید."
-            )
-            # The session must be closed: otherwise every later message keeps
-            # appending to a document that can never be built.
-            self._office_sessions.pop(user_id, None)
-            return
-        # Free does not mean unmetered: the xlsx/pptx build may call the note
-        # model, so a single user cannot drive it in a loop.
-        interval = self.settings.office_min_interval_seconds
-        if interval > 0:
-            now = time.monotonic()
-            last = self._office_request_times.get(user_id)
-            if last is not None and now - last < interval:
-                wait = int(math.ceil(interval - (now - last)))
-                await event.reply(
-                    "⏳ برای ساخت سند بعدی کمی صبر کنید "
-                    f"({to_persian_digits(max(1, wait))} ثانیه)."
+                await self.db.library_mark_unavailable(item_id)
+            except Exception:
+                logger.warning(
+                    "could not mark unavailable library item=%s", item_id, exc_info=True
                 )
-                return
-            self._office_request_times[user_id] = now
-            for stale in [
-                key for key, value in self._office_request_times.items()
-                if now - value > max(interval * 10, 600.0)
-            ]:
-                self._office_request_times.pop(stale, None)
-        # A title the user gave (a file caption) wins; otherwise the document
-        # itself finds one from the text when the job runs.
-        title = session.title or ""
-        try:
-            submission_id = await self.db.create_submission(
-                user_id,
-                "office",
-                session.filename or f"office-{kind}",
-                active_limit=self.settings.max_active_jobs_per_user,
-            )
-        except TooManyActiveJobsError as exc:
-            await event.reply(
-                ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
-            )
-            return
-        anchor = session.message or getattr(event, "message", None)
-        progress = await JobProgress.create(anchor, submission_id=submission_id)
-        job = Job(
-            submission_id=submission_id,
-            user_id=user_id,
-            kind="office",
-            filename=session.filename,
-            message=anchor,
-            is_admin=self._is_admin(user_id),
-            meta={
-                "progress": progress,
-                "office_kind": kind,
-                "office_title": title,
-                "office_text": content,
-            },
-        )
-        try:
-            self.office_queue.submit(job)
-        except QueueFullError as exc:
-            await self.db.set_submission_status(
-                submission_id, "rejected", error=str(exc), error_kind="capacity"
-            )
-            await progress.fail(str(submission_id))
-            await event.reply(f"⏸ {exc}")
-            return
-        # The request is now the job's business; the session is closed so a
-        # later, unrelated message is never mistaken for more content.
-        self._office_sessions.pop(user_id, None)
-        logger.info(
-            "accepted office request submission=%s kind=%s chars=%d",
-            submission_id, kind, len(content),
-        )
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
 
     # ------------------------------------------------------------- callbacks
     async def _handle_callback(self, event) -> None:
@@ -1622,107 +1325,60 @@ class GamasBot:
         # receipt upload — a photo sent later belongs to the new screen.
         if not data.startswith(("payr:", "plan:", "payopen:")):
             self._pending_payments.pop(user_id, None)
-        if not data.startswith("stt"):
-            self._stt_only_users.discard(user_id)
         # Support prompts are disarmed by any navigation except the prompt itself.
         if not data.startswith(("sup:cat:", "sup:r:")):
             self._support_states.pop(user_id, None)
         if not data.startswith("adm:sr:"):
             self._support_admin_states.pop(user_id, None)
 
-        if data == "stt":
+        if data == "help":
             await self._ack(event)
-            self._stt_only_users.add(user_id)
-            await event.respond(
-                "🎙️ ارسال فایل برای تبدیل صدا به متن\n\n"
-                "فایل صوتی، ویدیویی یا پاورپوینت خود را همین‌جا ارسال کنید.\n"
-                "متن کامل گفتار به‌صورت فایل متنی و پیش‌نمایش ارسال می‌شود.",
-                buttons=[[Button.inline("↩️ منوی اصلی", b"menu:main")]],
-            )
-        elif data == "make":
-            await self._ack(event)
-            if self.settings.note_configured:
-                result_guide = "ابتدا متن گفتار و سپس جزوهٔ ورد برایتان ارسال می‌شود."
-            else:
-                result_guide = (
-                    "متن گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ ورد در حال حاضر فعال نیست."
-                )
-            prompt_title = (
-                "📝 ارسال فایل برای ساخت جزوه"
-                if self.settings.note_configured
-                else "🎙️ ارسال فایل برای تبدیل صدا به متن"
+            guide = (
+                "ℹ️ راهنمای گاماس\n\n"
+                "۱. فایل صوتی، ویدیویی یا پاورپوینت درس را در همین چت بفرستید؛ دکمه لازم نیست.\n"
+                "۲. ابتدا متن کامل گفتار به‌صورت فایل متنی ارسال می‌شود.\n"
+                "۳. سپس جزوهٔ ورد (Word) آماده و ارسال می‌شود.\n"
+                "۴. همهٔ متن‌ها و جزوه‌ها در «📚 کتابخانه من» می‌مانند و هر زمان می‌توانید دوباره دریافت‌شان کنید.\n\n"
+                "«💳 حساب من»: موجودی، خرید اشتراک و پرداخت‌های شما در یک صفحه.\n"
+                "«🎧 پشتیبانی»: اگر مشکل یا سؤالی داشتید، تیکت بزنید.\n\n"
+                "اعتبار بر اساس مدت فایل صوتی و پس از ارسال متن خام محاسبه می‌شود. "
+                "اگر ارسال متن خام ناموفق باشد، اعتبار مصرف نمی‌شود. "
+                "پس از دریافت متن خام، خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود."
             )
             await event.respond(
-                f"{prompt_title}\n\n"
-                "فایل صوتی یا ویدیویی کلاس، پیام صوتی یا ویدیویی تلگرام، یا فایل پاورپوینت را "
-                "همین‌جا بفرستید.\n\n"
-                f"{result_guide}",
-                buttons=[[Button.inline("↩️ منوی اصلی", b"menu:main")]],
-            )
-        elif data == "help":
-            await self._ack(event)
-            make_label = (
-                "📝 ساخت جزوه" if self.settings.note_configured else "🎙️ تبدیل صدا به متن"
-            )
-            task_label = "ساخت جزوه:" if self.settings.note_configured else "تبدیل صدا به متن:"
-            guide = [
-                "ℹ️ راهنمای استفاده",
-                "",
-                task_label,
-                f"۱. «{make_label}» را انتخاب کنید.",
-                "۲. فایل صوتی، ویدیویی یا پاورپوینت درس را بفرستید.",
-                "۳. ابتدا متن گفتار برایتان ارسال می‌شود.",
-            ]
-            if self.settings.note_configured:
-                guide.append("۴. سپس جزوهٔ ورد آماده و ارسال می‌شود.")
-            else:
-                guide.append("ساخت جزوهٔ ورد در حال حاضر فعال نیست.")
-            guide.extend(
-                [
-                    "",
-                    "اعتبار بر اساس مدت فایل صوتی و پس از ارسال متن خام محاسبه می‌شود. "
-                    "اگر ارسال متن خام ناموفق باشد، اعتبار مصرف نمی‌شود. "
-                    "پس از دریافت متن خام، خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود.",
-                ]
-            )
-            if self.settings.office_enabled:
-                guide.extend(
-                    [
-                        "",
-                        "ساخت سند رایگان:",
-                        "«📄 ساخت سند رایگان» را انتخاب کنید، قالب را بزنید و متن یا فایل متنی "
-                        "خود را بفرستید. این بخش رایگان است و از اعتبار شما کم نمی‌کند.",
-                    ]
-                )
-            await event.respond(
-                "\n".join(guide),
+                guide,
                 buttons=[[Button.inline("↩️ منوی اصلی", b"menu:main")]],
             )
         elif data == "menu:main":
             await self._ack(event)
             await self._show_main(event)
-        elif data == "office":
+        elif data == "library":
             await self._ack(event)
-            if not self.settings.office_enabled:
-                await event.respond("این بخش روی این سرور فعال نیست.")
-                return
-            await self._show_office_menu(event)
-        elif data.startswith("office:"):
+            await self._show_library(event)
+        elif data.startswith("lib:f:"):
             await self._ack(event)
-            if not self.settings.office_enabled:
-                await event.respond("این بخش روی این سرور فعال نیست.")
-                return
-            await self._handle_office_action(event, data.split(":", 1)[1])
-        elif data == "account":
+            item_id = _to_int(data.rsplit(":", 1)[-1])
+            if item_id is None:
+                await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            else:
+                await self._forward_library_item(event, user_id, item_id)
+        elif data.startswith("lib:"):
             await self._ack(event)
-            await self._show_account(event)
-        elif data == "buy":
+            page = _to_int(data.split(":", 1)[1])
+            if page is None:
+                await self._ack(event, "صفحهٔ کتابخانه نامعتبر است.", alert=True)
+            else:
+                await self._show_library(event, page=max(0, page))
+        elif data == "wallet":
             await self._ack(event)
-            await self._show_plans(event)
-        elif data == "payments" or data.startswith("payments:"):
+            await self._show_wallet(event)
+        elif data.startswith("walletp:"):
             await self._ack(event)
-            page = _to_int(data.split(":", 1)[1]) if ":" in data else 0
-            await self._show_payment_history(event, user_id, max(0, page or 0))
+            page = _to_int(data.split(":", 1)[1])
+            if page is None:
+                await self._ack(event, "صفحهٔ پرداخت‌ها نامعتبر است.", alert=True)
+            else:
+                await self._show_wallet(event, payments_page=max(0, page))
         elif data.startswith("plan:"):
             await self._ack(event)
             await self._start_payment(event, data.split(":", 1)[1])
@@ -1836,8 +1492,6 @@ class GamasBot:
             self._pending_reject_reason.pop(user_id, None)
             self._pending_broadcast.discard(user_id)
             self._pending_payments.pop(user_id, None)
-            self._stt_only_users.discard(user_id)
-            self._office_sessions.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
             await self._show_main(event, first_start=True)
@@ -1903,7 +1557,7 @@ class GamasBot:
             self._support_states.pop(user_id, None)
 
         # While a receipt is expected, no ordinary text/media may fall through
-        # to Office or the paid lecture pipeline. Invalid input keeps the
+        # to the paid lecture pipeline. Invalid input keeps the
         # receipt prompt armed so the user can immediately retry.
         if user_id in self._pending_payments and not command:
             await self._handle_receipt_upload(event, user_id)
@@ -1911,11 +1565,9 @@ class GamasBot:
 
         if command == "/cancel":
             self._pending_payments.pop(user_id, None)
-            self._stt_only_users.discard(user_id)
-            self._office_sessions.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
-            await event.reply("ارسال لغو شد. برای لغو سفارش، از «🧾 پرداخت‌های من» اقدام کنید.")
+            await event.reply("ارسال لغو شد. برای لغو سفارش، از «💳 حساب من» اقدام کنید.")
             return
 
         # Presentations.
@@ -1934,10 +1586,6 @@ class GamasBot:
             await self._accept_media(event, user_id, kind, filename, duration)
             return
 
-        # Free Office: the user's own text becomes a document.
-        if await self._handle_office_message(event, user_id, text):
-            return
-
         # Direct/post-restart receipt image fallback when an open unpaid order exists.
         if _is_receipt_image(event.message):
             open_payment = await self.db.open_awaiting_payment_for_user(user_id)
@@ -1948,22 +1596,15 @@ class GamasBot:
                 return
 
         if _is_unsupported_attachment(event.message):
-            if self.settings.office_enabled:
-                await event.reply(
-                    "⚠️ این نوع فایل پشتیبانی نمی‌شود. فایل صوتی، ویدیویی یا پاورپوینت "
-                    "بفرستید، یا در بخش ساخت سند فایل متنی ارسال کنید."
-                )
-            else:
-                await event.reply(
-                    "⚠️ این نوع فایل پشتیبانی نمی‌شود. فایل صوتی، ویدیویی یا پاورپوینت بفرستید."
-                )
+            await event.reply(
+                "⚠️ این نوع فایل پشتیبانی نمی‌شود. فایل صوتی، ویدیویی یا پاورپوینت بفرستید."
+            )
             return
         if text:
-            # The Free Office section already had its chance above: it either
-            # took the text (and asked for a format) or is switched off.
             await event.reply(
-                "برای پردازش فایل درس، از دکمه‌های منوی اصلی استفاده کنید و فایل صوتی، "
-                "ویدیویی یا پاورپوینت را بفرستید."
+                "برای شروع، فایل صوتی، ویدیویی یا پاورپوینت درس را بفرستید؛ "
+                "متن گفتار و جزوهٔ ورد به‌صورت خودکار ارسال می‌شود.",
+                buttons=self._user_menu(is_admin=self._is_admin(user_id)),
             )
 
     # ---------------------------------------------------------------- intake
@@ -2004,7 +1645,7 @@ class GamasBot:
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
                 f"{measured} — لازم (دست‌کم): {format_duration(needed)} — "
                 f"اعتبار فعلی: {format_duration(available)}\n"
-                "از «💳 خرید اشتراک» می‌توانید اعتبار بگیرید."
+                "از «💳 حساب من» می‌توانید اعتبار بگیرید."
             )
             return
         try:
@@ -2019,8 +1660,6 @@ class GamasBot:
                 ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
             )
             return
-        stt_only = user_id in self._stt_only_users
-        self._stt_only_users.discard(user_id)
         progress = await JobProgress.create(event, submission_id=submission_id)
         job = Job(
             submission_id=submission_id,
@@ -2030,7 +1669,7 @@ class GamasBot:
             message=event.message,
             is_admin=self._is_admin(user_id),
             duration_hint=duration,
-            meta={"progress": progress, "stt_only": stt_only},
+            meta={"progress": progress},
         )
         try:
             self.queue.submit(job)
@@ -2080,7 +1719,7 @@ class GamasBot:
                     f"⏳ اعتبار شما برای این ارائه کافی نیست.\n"
                     f"لازم (حداقل برآورد): {format_duration(needed)} — "
                     f"اعتبار فعلی: {format_duration(available)}\n"
-                    "از «💳 خرید اشتراک» می‌توانید اعتبار بگیرید."
+                    "از «💳 حساب من» می‌توانید اعتبار بگیرید."
                 )
                 return
         try:
@@ -2095,8 +1734,6 @@ class GamasBot:
                 ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
             )
             return
-        stt_only = user_id in self._stt_only_users
-        self._stt_only_users.discard(user_id)
         progress = await JobProgress.create(event, submission_id=submission_id)
         job = Job(
             submission_id=submission_id,
@@ -2105,7 +1742,7 @@ class GamasBot:
             filename=filename,
             message=event.message,
             is_admin=self._is_admin(user_id),
-            meta={"presentation_kind": kind, "progress": progress, "stt_only": stt_only},
+            meta={"presentation_kind": kind, "progress": progress},
         )
         try:
             self.queue.submit(job)
@@ -2175,12 +1812,7 @@ class GamasBot:
         snap = METRICS.snapshot()
         snap["queue_pending"] = self.queue.pending
         snap["queue_active"] = self.queue.active_count
-        snap["office_queue_pending"] = self.office_queue.pending
-        snap["office_queue_active"] = self.office_queue.active_count
-        snap["in_flight_jobs"] = {
-            **self.queue.active_snapshot(),
-            **self.office_queue.active_snapshot(),
-        }
+        snap["in_flight_jobs"] = self.queue.active_snapshot()
         return snap
 
     @staticmethod
@@ -2218,8 +1850,6 @@ class GamasBot:
             ))
             if job.kind == "presentation":
                 await self._process_presentation(job, workdir, progress)
-            elif job.kind == "office":
-                await self._process_office(job, workdir, progress)
             else:
                 await self._process_media(job, workdir, progress)
             job.transition_to("completed")
@@ -2236,7 +1866,7 @@ class GamasBot:
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
                 f"لازم: {format_duration(exc.required_seconds)} — "
                 f"موجودی: {format_duration(exc.available_seconds)}\n"
-                "از «💳 خرید اشتراک» اعتبار بگیرید."
+                "از «💳 حساب من» اعتبار بگیرید."
             ))
         except USER_VISIBLE_ERRORS as exc:
             kind = classify_failure(job.state, exc)
@@ -2425,11 +2055,10 @@ class GamasBot:
             self._send_preview(job, raw_text),
             self._settle(job, duration),
         )
-        if job.meta.get("stt_only"):
+        if not self.settings.note_configured:
             await self.db.set_submission_status(job.submission_id, "done")
             await progress.complete("متن کامل گفتار ارسال شد.")
             return
-
         job.transition_to("generating_notes")
         await progress.update(85, "تولید جزوهٔ ساختارمند")
         notes = await self._generate_notes(
@@ -2704,11 +2333,10 @@ class GamasBot:
             self._send_preview(job, raw_text),
             self._settle(job, settled_duration),
         )
-        if job.meta.get("stt_only"):
+        if not self.settings.note_configured:
             await self.db.set_submission_status(job.submission_id, "done")
             await progress.complete("متن کامل ارائه ارسال شد.")
             return
-
         job.transition_to("generating_notes")
         await progress.update(85, "تولید جزوهٔ ساختارمند")
         transcript_text = narration_text
@@ -2733,130 +2361,6 @@ class GamasBot:
             progress,
             plain_title="جزوهٔ ارائه",
             plain_text=presentation_text,
-        )
-
-    # ------------------------------------------------------- free office job
-    async def _process_office(self, job: Job, workdir: Path, progress) -> None:
-        """Build and deliver a Free Office document.
-
-        This path never touches the credit ledger: the section is free, so a
-        document costs the user nothing, and a failed build costs them
-        nothing either. The only thing recorded is the submission row, so the
-        admin panel can see how many documents were made.
-        """
-        assert progress is not None
-        await progress.update(15, "آماده‌سازی سند")
-        kind = str(job.meta.get("office_kind") or "word")
-        content = str(job.meta.get("office_text") or "")
-        title = str(job.meta.get("office_title") or "")
-        if not content.strip():
-            raise OfficeError("متنی برای ساخت سند نبود.")
-        document = build_office_document(content, title=title)
-        reference = f"GMS-{job.submission_id}"
-        meta = DocumentMeta(
-            reference=reference,
-            source_name=job.filename,
-            created_at=datetime.now(),
-        )
-
-        if kind == "excel":
-            payload = await self._build_office_excel(document, content)
-        elif kind == "ppt":
-            payload = await self._build_office_pptx(document, content)
-        elif kind == "pdf":
-            # The PDF path is fully deterministic: no model call, no network,
-            # so it stays as fast and reliable as the Word path.
-            payload = await asyncio.to_thread(
-                build_office_pdf,
-                document,
-                meta=meta,
-                mode_label=OFFICE_MODE_LABELS["pdf"],
-            )
-        else:
-            payload = await asyncio.to_thread(
-                build_plain_docx,
-                document.title,
-                document.text,
-                fonts=resolve_fonts(),
-                design=resolve_design(),
-                meta=meta,
-                mode_label=OFFICE_MODE_LABELS["word"],
-                heading_offset=OFFICE_HEADING_OFFSET,
-            )
-
-        await progress.update(80, "ارسال فایل خروجی")
-        path = workdir / office_filename(document.title, kind, reference)
-        await run_file_io(path.write_bytes, payload)
-        caption = (
-            f"{FORMAT_EMOJI.get(kind, '📄')} سند {FORMAT_LABELS.get(kind, '')} — {reference}"
-        )
-        await self._send_file(job, path, caption=caption)
-        await self.db.set_submission_status(job.submission_id, "done")
-        # Remember the document so «➕ افزودن متن» can extend it.
-        self._office_last[job.user_id] = (kind, content, document.title, time.monotonic())
-        self._trim_office_history()
-        await progress.complete("فایل سند ارسال شد.", "✅ سند آماده شد")
-        await self._offer_office_more(job)
-
-    async def _offer_office_more(self, job: Job) -> None:
-        """Offer to extend the document that was just delivered."""
-        if job.message is None:
-            return
-        try:
-            await job.message.reply(
-                "در صورت نیاز می‌توانید متن دیگری به همین سند اضافه کنید.",
-                buttons=[[Button.inline("➕ افزودن متن", b"office:more")]],
-            )
-        except Exception:
-            logger.debug("could not offer the 'add more' button", exc_info=True)
-
-    def _trim_office_history(self) -> None:
-        """Keep the «last document» cache bounded.
-
-        The cache holds the text of the last document per user, so it is
-        dropped for the oldest users once it grows past the limit.
-        """
-        limit = 500
-        while len(self._office_last) > limit:
-            # Evict the least recently built document, not the first key ever
-            # inserted: a dict keeps its insertion position when a value is
-            # updated, so "first key" can be a user who just built a document.
-            oldest = min(
-                self._office_last, key=lambda user_id: self._office_last[user_id][3]
-            )
-            self._office_last.pop(oldest, None)
-
-    async def _build_office_excel(self, document, content: str) -> bytes:
-        """The sheet: the user's own table, or a table the model arranges."""
-        tables = list(document.tables)
-        if not tables:
-            # No grid in the text: the model may arrange the prose into one.
-            # Every cell it proposes is checked against the source, and a
-            # rejected plan falls back to a plain one-column sheet.
-            table = await infer_table(
-                content, settings=self.settings, session=self._http_session()
-            )
-            if table is not None:
-                tables = [table]
-        return await asyncio.to_thread(build_office_xlsx, document, tables)
-
-    async def _build_office_pptx(self, document, content: str) -> bytes:
-        """The deck: the model's slide order, or the user's own headings."""
-        slides = await plan_deck(
-            content,
-            settings=self.settings,
-            session=self._http_session(),
-            max_sections=self.settings.office_max_slides,
-        )
-        if not slides:
-            slides = fallback_slides(
-                document, max_slides=self.settings.office_max_slides
-            )
-        return await asyncio.to_thread(
-            build_office_pptx,
-            document,
-            slides,
-            max_slides=self.settings.office_max_slides,
         )
 
     # ----------------------------------------------------------- notes + docx
@@ -3011,9 +2515,11 @@ class GamasBot:
                 notice_kind = "notes"
 
         if docx_path is not None:
-            caption = f"📖 جزوهٔ Word — {reference}"
+            caption = f"📖 جزوهٔ Word — {reference}\n📚 در کتابخانهٔ شما ذخیره شد"
             try:
-                await self._send_file(job, docx_path, caption=caption)
+                message = await self._send_file(job, docx_path, caption=caption)
+                if message is not None:
+                    await self._save_library_item(job, "booklet", message, caption)
             except Exception:
                 logger.exception("docx delivery failed")
                 notice = "\n\nنکته: ارسال فایل Word ناموفق بود؛ متن خام ارسال شد."
@@ -3030,7 +2536,9 @@ class GamasBot:
         else:
             await progress.complete()
 
-    async def _send_telegram_file(self, entity, path: Path, **kwargs):
+    async def _send_telegram_file(
+        self, entity, path: Path, **kwargs
+    ) -> Message | None:
         """Send one path through Telethon's awaitable-read stream interface."""
         path = Path(path)
         file_size = (await run_file_io(path.stat)).st_size
@@ -3046,7 +2554,47 @@ class GamasBot:
             finally:
                 await stream.aclose()
 
-    async def _send_file(self, job: Job, path: Path, *, caption: str = "") -> None:
+    async def _save_library_item(
+        self, job: Job, kind: str, message: Message, title: str
+    ) -> None:
+        """Best-effort library index: a database hiccup can never fail delivery.
+
+        Telegram owns the file; this stores only its message reference. Pruning
+        follows insertion and is deliberately inside the same best-effort
+        boundary, so a successful transcript/booklet always completes billing
+        and progress even if either write is temporarily unavailable.
+        """
+        chat_id = getattr(message, "chat_id", None)
+        message_id = getattr(message, "id", None)
+        if not isinstance(chat_id, int) or not isinstance(message_id, int):
+            logger.warning(
+                "delivered library item has no Telegram message reference submission=%s",
+                job.submission_id,
+            )
+            return
+        try:
+            await self.db.library_add(
+                job.user_id,
+                kind,
+                chat_id,
+                message_id,
+                job.submission_id,
+                title=title,
+            )
+            await self.db.library_prune(
+                job.user_id, self.settings.library_max_items
+            )
+        except Exception:
+            logger.warning(
+                "could not save delivered artifact to the library submission=%s kind=%s",
+                job.submission_id,
+                kind,
+                exc_info=True,
+            )
+
+    async def _send_file(
+        self, job: Job, path: Path, *, caption: str = ""
+    ) -> Message | None:
         """Deliver one generated artifact as a Telegram document.
 
         ``TelegramClient.send_file`` is the supported API for a captioned file.
@@ -3070,14 +2618,13 @@ class GamasBot:
         caption_arg = caption[:TELEGRAM_CAPTION_LIMIT] or None
         for attempt in range(2):
             try:
-                await self._send_telegram_file(
+                return await self._send_telegram_file(
                     target,
                     path,
                     caption=caption_arg,
                     force_document=True,
                     reply_to=job.message.id,
                 )
-                return
             except FloodWaitError as exc:
                 wait_seconds = float(getattr(exc, "seconds", 0) or 0)
                 if attempt == 0 and 0 < wait_seconds <= 15.0:
@@ -3088,6 +2635,7 @@ class GamasBot:
                     await asyncio.sleep(wait_seconds)
                     continue
                 raise
+        return None
 
     async def _deliver_raw(
         self, job: Job, raw_text: str, raw_path: Path, reference: str
@@ -3102,7 +2650,10 @@ class GamasBot:
         its reservation released, with the transcript already in the database.
         """
         try:
-            await self._send_file(job, raw_path, caption=f"📝 متن خام — {reference}")
+            caption = f"📝 متن خام — {reference}"
+            message = await self._send_file(job, raw_path, caption=caption)
+            if message is not None:
+                await self._save_library_item(job, "transcript", message, caption)
             return
         except Exception:
             logger.exception(
@@ -3232,35 +2783,44 @@ class GamasBot:
             "cancelled": "لغو شده",
         }.get(status, "نامشخص")
 
-    async def _show_account(self, event) -> None:
-        """Show balance separately from plans and payment history."""
+    async def _show_wallet(self, event, *, payments_page: int = 0) -> None:
+        """One scrollable account view: balance, purchase options and history."""
         user_id = event.sender_id
-        balance = await self._balance_text(user_id)
-        latest = await self.db.payment_history_paginated(user_id, limit=1)
-        buttons = [
-            [Button.inline("💳 خرید اشتراک", b"buy")],
-            [Button.inline("🧾 پرداخت‌های من", b"payments")],
+        if user_id is None:
+            return
+        page_size = 5
+        payments_page = max(0, int(payments_page))
+        lines = [
+            "💳 حساب من",
+            "",
+            f"⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}",
+            "",
+            "🛒 خرید اشتراک",
+            "",
         ]
-        if latest and is_open_payment(latest[0]["status"]):
-            order_buttons = [Button.inline(
-                "🔎 پیگیری سفارش باز", f"payopen:{latest[0]['payment_id']}".encode()
-            )]
-            if not latest[0]["receipt_path"]:
-                order_buttons.append(Button.inline(
-                    "لغو سفارش", f"payc:{latest[0]['payment_id']}".encode()
-                ))
-            buttons.insert(0, order_buttons)
-        buttons.append([Button.inline("↩️ منوی اصلی", b"menu:main")])
-        await self._edit_or_reply(
-            event,
-            f"📊 اعتبار من\n\n⏳ اعتبار باقی‌مانده: {balance}",
-            buttons,
-        )
-
-    async def _show_plans(self, event) -> None:
-        plans = [plan for plan in await self.db.plans() if plan["price"] > 0]
-        lines = ["💳 خرید اشتراک", ""]
         buttons: list[list] = []
+
+        # The active order is the first keyboard row so a pending purchase can
+        # be resumed or cancelled without paging through the history.
+        latest = await self.db.payment_history_paginated(user_id, limit=1)
+        if latest and is_open_payment(latest[0]["status"]):
+            payment = latest[0]
+            order_buttons = [
+                Button.inline(
+                    "🔎 پیگیری سفارش باز",
+                    f"payopen:{payment['payment_id']}".encode("ascii"),
+                )
+            ]
+            if not payment["receipt_path"]:
+                order_buttons.append(
+                    Button.inline(
+                        "لغو سفارش",
+                        f"payc:{payment['payment_id']}".encode("ascii"),
+                    )
+                )
+            buttons.append(order_buttons)
+
+        plans = [plan for plan in await self.db.plans() if plan["price"] > 0]
         if not plans:
             lines.append("در حال حاضر بسته‌ای برای خرید موجود نیست.")
         else:
@@ -3279,49 +2839,49 @@ class GamasBot:
                     label = button_label(
                         f"{hours_text} ساعت — {format_toman(plan['price'])}"
                     )
-                    buttons.append([Button.inline(label, f"plan:{plan['code']}".encode())])
+                    buttons.append(
+                        [Button.inline(label, f"plan:{plan['code']}".encode("utf-8"))]
+                    )
             if not self.settings.payment_card_number:
                 lines.append("\nپرداخت کارت‌به‌کارت در حال حاضر غیرفعال است.")
-        buttons.append([Button.inline("🎧 پشتیبانی", b"support")])
-        buttons.append([Button.inline("↩️ منوی اصلی", b"menu:main")])
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
 
-    async def _show_payment_history(self, event, user_id: int, page: int = 0) -> None:
-        page_size = 6
-        rows = await self.db.payment_history_paginated(
-            user_id, limit=page_size + 1, offset=page * page_size
+        lines.extend(["", "🧾 پرداخت‌های اخیر"])
+        payments = await self.db.payment_history_paginated(
+            user_id, limit=page_size + 1, offset=payments_page * page_size
         )
-        has_more = len(rows) > page_size
-        rows = rows[:page_size]
-        lines = [f"🧾 پرداخت‌های من — صفحهٔ {to_persian_digits(page + 1)}"]
-        buttons: list[list] = []
-        if not rows:
-            lines.append("\nپرداختی ثبت نشده است." if page == 0 else "\nمورد دیگری وجود ندارد.")
-        for item in rows:
+        has_more = len(payments) > page_size
+        payments = payments[:page_size]
+        if not payments:
+            lines.append("پرداختی ثبت نشده است." if payments_page == 0 else "مورد دیگری وجود ندارد.")
+        for item in payments:
             seconds = item.get("purchased_seconds")
-            plan = format_duration(int(seconds)) if seconds else item["plan_code"]
+            plan_text = format_duration(int(seconds)) if seconds else item["plan_code"]
             price = item.get("purchased_price")
             amount = format_toman(int(price)) if price is not None else "مبلغ نامشخص"
             lines.append(
-                f"\n#{to_persian_digits(item['payment_id'])} | {plan} | {amount}\n"
+                f"\n#{to_persian_digits(item['payment_id'])} | {plan_text} | {amount}\n"
                 f"{self._payment_status_label(item['status'])}"
             )
             if item["status"] == "rejected" and item.get("review_reason"):
                 lines.append(f"دلیل: {item['review_reason']}")
-            if is_open_payment(item["status"]):
-                buttons.append([Button.inline(
-                    f"🔎 پیگیری سفارش {to_persian_digits(item['payment_id'])}",
-                    f"payopen:{item['payment_id']}".encode(),
-                )])
+
         nav = []
-        if page > 0:
-            nav.append(Button.inline("◀️ قبلی", f"payments:{page - 1}".encode()))
+        if payments_page > 0:
+            nav.append(
+                Button.inline("◀️ قبلی", f"walletp:{payments_page - 1}".encode("ascii"))
+            )
         if has_more:
-            nav.append(Button.inline("بعدی ▶️", f"payments:{page + 1}".encode()))
+            nav.append(
+                Button.inline("بعدی ▶️", f"walletp:{payments_page + 1}".encode("ascii"))
+            )
         if nav:
             buttons.append(nav)
-        buttons.append([Button.inline("💳 خرید اشتراک", b"buy")])
-        buttons.append([Button.inline("↩️ منوی اصلی", b"menu:main")])
+        buttons.extend(
+            [
+                [Button.inline("🎧 پشتیبانی", b"support")],
+                [Button.inline("↩️ منوی اصلی", b"menu:main")],
+            ]
+        )
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _start_payment(self, event, plan_code: str) -> None:
@@ -3337,7 +2897,7 @@ class GamasBot:
         except OpenPaymentError:
             await event.respond(
                 "⚠️ یک سفارش باز دارید. ابتدا آن را پیگیری یا لغو کنید.",
-                buttons=[[Button.inline("🧾 پرداخت‌های من", b"payments")]],
+                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
             )
             return
         except ValueError:
@@ -3350,8 +2910,8 @@ class GamasBot:
         if (payment is None or payment["user_id"] != event.sender_id
                 or not is_open_payment(payment["status"])):
             await event.respond(
-                "این سفارش فعال نیست؛ وضعیت آن را در «🧾 پرداخت‌های من» ببینید.",
-                buttons=[[Button.inline("🧾 پرداخت‌های من", b"payments")]],
+                "این سفارش فعال نیست؛ وضعیت آن را در «💳 حساب من» ببینید.",
+                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
             )
             return
         if not payment["purchased_seconds"] or payment["purchased_price"] is None:
@@ -3404,7 +2964,7 @@ class GamasBot:
                 [Button.inline("📤 ارسال رسید", f"payr:{payment_id}".encode())],
                 [Button.inline("لغو سفارش", f"payc:{payment_id}".encode())],
             ]
-        buttons.append([Button.inline("↩️ بازگشت", b"payments")])
+        buttons.append([Button.inline("↩️ حساب من", b"wallet")])
         await event.respond(text, buttons=buttons)
 
     async def _cancel_payment(self, event, payment_id: int) -> None:
@@ -3414,7 +2974,7 @@ class GamasBot:
             "درخواست خرید لغو شد." if changed else
             "این درخواست قابل لغو نیست؛ رسید ارسال‌شده باید توسط مدیر بررسی شود."
         )
-        await self._show_account(event)
+        await self._show_wallet(event)
 
     async def _await_receipt(self, event, payment_id: int) -> None:
         payment = await self.db.payment(payment_id)
@@ -3679,7 +3239,7 @@ class GamasBot:
                     payment["user_id"],
                     "✅ پرداخت شما تأیید شد. اشتراک شما فعال است.\n"
                     f"⏳ {format_duration(seconds)} اعتبار اضافه شد.",
-                    buttons=[[Button.inline("📊 اعتبار من", b"account")]],
+                    buttons=[[Button.inline("💳 حساب من", b"wallet")]],
                 )
             except Exception:
                 logger.warning(
@@ -3897,8 +3457,8 @@ class GamasBot:
         approved = payments["by_status"].get("approved", {"count": 0, "toman": 0})
         rejected = payments["by_status"].get("rejected", {"count": 0, "toman": 0})
         total_jobs = sum(processing["by_status"].values())
-        active_now = self.queue.active_count + self.office_queue.active_count
-        queued_now = self.queue.pending + self.office_queue.pending
+        active_now = self.queue.active_count
+        queued_now = self.queue.pending
         lines = [
             "🛠 پنل مدیریت — نمای کلی",
             f"🗓 بازه: {self._admin_period_label(period, report)}",
@@ -4212,9 +3772,9 @@ class GamasBot:
             "🗓 وضعیت اکنون (آمار پردازش در نمای کلی و بخش پردازش است)",
             "",
             f"• زمان اجرای این نسخه: {format_duration(int(uptime))}",
-            f"• کارها: {to_persian_digits(self.queue.active_count + self.office_queue.active_count)} فعال"
+            f"• کارها: {to_persian_digits(self.queue.active_count)} فعال"
             f" (اوج {to_persian_digits(int(runtime.get('peak_active_jobs', 0) or 0))})"
-            f" | {to_persian_digits(self.queue.pending + self.office_queue.pending)} در صف"
+            f" | {to_persian_digits(self.queue.pending)} در صف"
             f" (اوج {to_persian_digits(int(runtime.get('peak_queued_jobs', 0) or 0))})",
             f"• حافظهٔ اوج: {self._bytes_text(int(int(runtime.get('peak_rss_mb', 0) or 0) * 1024 * 1024))}",
             f"• پایگاه‌داده: {self._bytes_text(int(health['db_bytes']))}"

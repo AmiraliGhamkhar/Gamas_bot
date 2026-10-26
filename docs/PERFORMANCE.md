@@ -11,7 +11,6 @@ The shipped profile is deliberately modest for shared cPanel hosting:
 | Resource | Default | Guard |
 | --- | ---: | --- |
 | Active jobs / queued jobs | 3 / 8 | Fixed workers, bounded pending queue, fair per-user dispatch |
-| Free Office lane | 2 | `OFFICE_JOB_CONCURRENCY`; text->document builds never queue behind transcription jobs |
 | Active jobs per user | 2 | Admission check before enqueue |
 | Telegram downloads / uploads | 2 / 2 | Independent semaphores and stage deadlines |
 | Media worker concurrency | 1 | Heavy extraction and conversion do not fan out across jobs |
@@ -104,11 +103,11 @@ simulated provider limits. No external APIs or paid keys are used. Results from 
 | After edits, cPanel sample B (latest) | 6 | 4.6763 s | 1.283 jobs/s | 2.2888 s | 5.34 MiB | 111.07 MiB |
 | After edits, one active worker | 6 | 13.9475 s | 0.430 jobs/s | 2.3246 s | 4.36 MiB | 101.52 MiB |
 | After edits, stress profile (6 active) | 6 | 2.6502 s | 2.264 jobs/s | 2.5520 s | 9.77 MiB | 126.98 MiB |
-| Slot-wait/cooldown/office-lane change, before (this checkout's machine) | 6 | 4.4336 s | 1.353 jobs/s | 2.1764 s | 6.46 MiB | 112.08 MiB |
+| Slot-wait/cooldown change, before (this checkout's machine) | 6 | 4.4336 s | 1.353 jobs/s | 2.1764 s | 6.46 MiB | 112.08 MiB |
 | Same change, after sample A | 6 | 4.5812 s | 1.310 jobs/s | 2.2768 s | 6.50 MiB | 111.48 MiB |
 | Same change, after sample B | 6 | 4.4701 s | 1.342 jobs/s | 2.1951 s | 5.59 MiB | 110.66 MiB |
 
-For the slot-wait/cooldown/office-lane rows, before/after wall times on the same machine were
+For the slot-wait/cooldown rows, before/after wall times on the same machine were
 4.4336 s vs 4.4701–4.5812 s (mean end-to-end 2.1764 s vs 2.1951–2.2768 s): within run-to-run
 variance, i.e. no throughput change is claimed. That change targets *failure avoidance* when
 provider slots are fewer than concurrent jobs — a case this profile (6 configured STT slots,

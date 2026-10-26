@@ -38,16 +38,15 @@ dependencies = [
     "python-pptx>=1.0.2,<2.0",
     "python-docx>=1.2,<2.0",
     "ppt2pptx>=0.4.2,<0.5",
-    # The Free Office section writes .xlsx (the same pure-Python stack as
-    # python-docx and python-pptx; no office suite is required).
+    # Standalone document-export modules write .xlsx (the same pure-Python
+    # stack as python-docx and python-pptx; no office suite is required).
     "openpyxl>=3.1,<4.0",
     # Bounded image decoding and canonical re-encoding for uploaded receipts.
     "Pillow>=10.0,<13.0",
     # XML rewriting of OOXML parts.
     "lxml>=6.1,<7.0",
-    # The Free Office section writes .pdf: reportlab is pure Python (no
-    # office suite, no system libraries), and Persian text is shaped with
-    # arabic-reshaper + python-bidi before it reaches the renderer.
+    # The standalone PDF exporter uses reportlab (pure Python, no office
+    # suite/system libraries); Persian text is shaped before rendering.
     "reportlab>=4.0,<5.0",
     "arabic-reshaper>=3.0,<4.0",
     "python-bidi>=0.4,<1.0",
@@ -58,7 +57,7 @@ dev = [
     "ruff>=0.6",
     "pytest>=8.0",
     "mypy>=1.11",
-    # Reads the Free Office section's produced PDFs in the tests.
+    # Reads PDFs produced by the standalone document-export tests.
     "pypdf>=4.0,<7.0",
 ]
 

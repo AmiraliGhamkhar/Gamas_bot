@@ -1,6 +1,6 @@
-"""The Free Office PDF renderer: the user's text becomes a real right-to-left PDF.
+"""The standalone PDF renderer produces a real right-to-left PDF from text.
 
-The tests cover the same contracts the section promises for its other formats:
+The tests cover the pure export contract shared with the other document helpers:
 
 * the file is a real PDF package a reader can open;
 * the user's words end up in the document **verbatim** — nothing is rewritten

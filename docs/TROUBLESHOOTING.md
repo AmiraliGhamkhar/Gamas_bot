@@ -31,13 +31,13 @@ Find the `GMS-#####` reference in the log first.
 | `av` / `ppt2pptx` import fails | Reinstall `requirements.txt`; on cPanel check OS/Python in the preflight |
 | `DiskSpaceError` / temp failures | Free space on `TEMP_DIR`; lower `MAX_FILE_SIZE` or `TEMP_MIN_FREE_BYTES` |
 | Duplicate replies | Stop the extra bot process; one instance per token/session |
-| "Credit is not enough" | Balance is measured in seconds; buy a plan or grant credit as admin |
+| "Credit is not enough" | Balance is measured in seconds; open «💳 حساب من» to buy a plan or grant credit as admin |
 | Receipt sent but no credit | Expected: an admin must approve the payment |
 
 ## Document issues
 
 - OCR on images and scanned PDFs is not supported.
-- Free Office reads text, not uploaded `.docx` or `.pdf` documents.
+- The Free Office bot UI is retired; bare text messages show the lecture-upload guide instead.
 - The Word topic list uses links, not page numbers; the server does not run a Word layout engine.
 - If Word offers to repair a generated file, save it and report the `GMS-#####` reference, Word and
   Windows versions. Do not send `.env`, API keys or transcripts.

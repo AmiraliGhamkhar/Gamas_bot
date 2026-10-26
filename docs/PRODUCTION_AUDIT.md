@@ -157,9 +157,10 @@ acceptance item against the real handlers and the exact user-visible Persian cop
 - Forged verdicts, non-admin `adm:`/`payv:` callbacks and cross-user ticket access are refused.
 - A simulated Telegram outage loses nothing: stored tickets/messages and the approved credit stay
   intact and repeated approval still credits once.
-- The user menu offers the mission buttons («🎙️ تبدیل صدا به متن», «📝 ساخت جزوه» when note
-  generation is configured, «💳 خرید اشتراک», «📊 اعتبار من», «🧾 پرداخت‌های من», «🎧 پشتیبانی»,
-  «ℹ️ راهنما») and the admin menu keeps the payment queue, history and support sections.
+- This v4 UI replaces the earlier mission-button menu with one direct lecture-upload action and
+  four user buttons: «📚 کتابخانه من», «💳 حساب من», «🎧 پشتیبانی» and «ℹ️ راهنما». Admins retain
+  their separate payment, history and support panel; the library forwards only the requesting user's
+  Telegram-backed artifacts.
 
 No runtime code changes were required by this verification; production data, tariffs, expiry
 rules and existing entitlements are untouched.
@@ -197,5 +198,6 @@ was attempted.
 5. Create a ticket in each category, exchange user/admin replies, close and reopen it, and confirm the
    complete earlier history and correct status remain. Repeat with a second authorized admin.
 6. Simulate/block Telegram delivery where possible and confirm stored payment/ticket state survives.
-7. Process a short audio file, generate a booklet where configured, export a Free Office document, and
-   check an existing admin user-management command to catch regressions.
+7. Send a short audio file without pressing a mode button; verify transcript → booklet delivery and
+   both library references. Open the wallet and check its balance/plans/history, then run an existing
+   admin user-management command to catch regressions.

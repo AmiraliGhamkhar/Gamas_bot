@@ -116,7 +116,7 @@ so that is visible; nothing is reported as zero for those rows.
 
 - **Per-user balances and quota consumption by plan.** Balances are derived per user from the
   ledger; aggregating them for every user on a dashboard tap is a full ledger scan for a number
-  that changes with every job. The user's own balance is on «📊 اعتبار من», and the ledger is
+  that changes with every job. The user's own balance is on «💳 حساب من», and the ledger is
   authoritative in the database.
 - **LLM token usage and cost.** Provider responses include usage, and the client logs it for
   debugging, but it is not persisted per request, so no period total can be computed. Making this a

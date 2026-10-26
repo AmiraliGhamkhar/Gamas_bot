@@ -257,11 +257,8 @@ DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT = 4
 #: 0 ms whenever one has a free slot.
 DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS = 300.0
 DEFAULT_DEDUP_WINDOW_SECONDS = 120.0
-#: Free Office builds (text -> Word/Excel/PowerPoint/PDF) run on their own
-#: small lane so a seconds-long document build never queues behind multi-hour
-#: transcription jobs sharing ``MAX_ACTIVE_JOBS``. Office work holds no media,
-#: download, or STT slots and its text is capped at 20000 characters, so two
-#: lanes are cheap on a 1 GB host.
+#: Legacy Free Office UI compatibility setting. The bot no longer starts an
+#: Office job lane; the standalone export modules remain available to callers.
 DEFAULT_OFFICE_JOB_CONCURRENCY = 2
 
 #: Shipped note-layer performance defaults. Each is a documented trade-off, so
@@ -588,7 +585,9 @@ class Settings:
     #: into. A transcript that needs more is refused instead of truncated.
     raw_fallback_max_files: int
 
-    # --- Free Office --------------------------------------------------------
+    # --- Retired Free Office compatibility ---------------------------------
+    #: Legacy UI/job settings remain environment-readable; the bot no longer
+    #: routes user messages or starts jobs through this surface.
     office_enabled: bool
     office_max_input_bytes: int
     office_max_chars: int
@@ -638,7 +637,10 @@ class Settings:
     llm_fallback_max_in_flight: int = DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT
     llm_slot_wait_timeout: float = DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS
     dedup_window_seconds: float = DEFAULT_DEDUP_WINDOW_SECONDS
+    #: Legacy compatibility value; no Office job queue is started by the bot.
     office_job_concurrency: int = DEFAULT_OFFICE_JOB_CONCURRENCY
+    #: Maximum number of delivered transcript/booklet references retained per user.
+    library_max_items: int = 50
 
     # --- Derived --------------------------------------------------------------
     plan_values: dict[str, int] = field(default_factory=dict, compare=False)
@@ -1217,7 +1219,7 @@ def from_env(env_file: str | None = None) -> Settings:
         raw_fallback_max_files=_env_int(
             "RAW_FALLBACK_MAX_FILES", 8, minimum=1, maximum=20
         ),
-        office_enabled=_env_bool("OFFICE_ENABLED", True),
+        office_enabled=_env_bool("OFFICE_ENABLED", False),
         office_max_input_bytes=_env_int(
             "OFFICE_MAX_INPUT_BYTES", 1_000_000, minimum=1024, maximum=50_000_000
         ),
@@ -1352,6 +1354,7 @@ def from_env(env_file: str | None = None) -> Settings:
             minimum=1,
             maximum=8,
         ),
+        library_max_items=_env_int("LIBRARY_MAX_ITEMS", 50, minimum=1, maximum=10_000),
         dedup_window_seconds=_env_float(
             "DEDUP_WINDOW_SECONDS",
             DEFAULT_DEDUP_WINDOW_SECONDS,

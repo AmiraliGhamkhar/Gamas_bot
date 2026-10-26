@@ -12,14 +12,18 @@ import re
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
 from gamas_bot.billing import PLAN_25_CODE, PLAN_50_CODE, plan_catalog
 from gamas_bot.bot import GamasBot, SUPPORT_CATEGORY_BUTTONS
 from gamas_bot.db import Database
+from gamas_bot.media import MediaInfo
+from gamas_bot.notes import StructuredNotes
 from gamas_bot.progress import to_persian_digits
-from tests.support import FakeJobEvent, FakeTelegramClient, make_settings
+from gamas_bot.transcript import RawTranscript
+from tests.support import FakeJobEvent, FakeTelegramClient, make_settings, wav_bytes
 from tests.test_bot import FakeCallbackEvent, FakeMessageEvent
 
 ADMIN = 1
@@ -100,7 +104,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
 
     # ------------------------------------------------------------- payments
     async def test_approval_flow_activates_once_with_the_expected_copy(self):
-        buy = await self.press(USER, "buy")
+        buy = await self.press(USER, "wallet")
         screen = buy.edits[-1][0]
         self.assertIn("۲۵ ساعت", screen)
         self.assertIn("۱۵۰٬۰۰۰ تومان", screen)
@@ -173,7 +177,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rows[0][0], 1)
 
         # Both histories report the final state.
-        user_history = await self.press(USER, "payments")
+        user_history = await self.press(USER, "wallet")
         self.assertIn("تأیید شده", user_history.edits[-1][0])
         admin_history = await self.press(ADMIN, "adm:ph:0")
         self.assertIn("تأیید شده", admin_history.edits[-1][0])
@@ -200,7 +204,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.available_seconds(USER), 0)
 
         # The user-visible history shows the rejection and its reason.
-        history = await self.press(USER, "payments")
+        history = await self.press(USER, "wallet")
         self.assertIn("رد شده", history.edits[-1][0])
         self.assertIn("دلیل: مبلغ واریزی کمتر از مبلغ بسته است", history.edits[-1][0])
 
@@ -209,7 +213,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         await self.press(USER, f"payc:{order_id}")
         self.assertEqual((await self.db.payment(order_id))["status"], "cancelled")
         self.assertEqual(await self.db.available_seconds(USER), 0)
-        history = await self.press(USER, "payments")
+        history = await self.press(USER, "wallet")
         self.assertIn("لغو شده", history.edits[-1][0])
 
         second_id = await self.new_order()
@@ -353,27 +357,56 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.available_seconds(USER), 50 * 3600)
 
     # ------------------------------------------------------------ main menu
+    async def test_upload_without_mode_button_runs_full_pipeline_and_saves_both_artifacts(self):
+        await self.say(USER, "/start")
+        source = self.root / "lecture.ogg"
+        source.write_bytes(wav_bytes(0.2))
+        event = FakeJobEvent(source=source, chat_id=USER)
+        event.message.attach_voice(duration=12)
+        self.bot.client = event.client
+        raw = RawTranscript.from_text("متن کامل جلسه", engine="deepgram")
+        notes = StructuredNotes(title="جزوهٔ خودکار", summary="خلاصهٔ جلسه")
+
+        with (
+            mock.patch(
+                "gamas_bot.bot.probe_media",
+                new=mock.AsyncMock(return_value=MediaInfo(
+                    has_audio=True, duration=12.0, audio_codec="opus"
+                )),
+            ),
+            mock.patch("gamas_bot.bot.needs_transcode", return_value=False),
+            mock.patch("gamas_bot.bot.transcribe", new=mock.AsyncMock(return_value=raw)),
+            mock.patch(
+                "gamas_bot.bot.structure_transcript",
+                new=mock.AsyncMock(return_value=notes),
+            ) as generate_notes,
+            mock.patch.object(self.bot, "_http_session", return_value=None),
+        ):
+            await self.bot._handle_message(event)
+            job = self.bot.queue.pop_pending()
+            await self.bot._run_job(job)
+
+        generate_notes.assert_awaited_once()
+        self.assertTrue(event.file_bytes(".txt"))
+        self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
+        self.assertIn("متن خام", event.files[0][0])
+        self.assertIn("جزوهٔ Word", event.files[1][0])
+        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", event.files[1][0])
+        items = await self.db.library_list(USER, limit=6)
+        self.assertEqual([item["kind"] for item in items], ["booklet", "transcript"])
+        self.assertEqual((await self.db.submission(job.submission_id)).status, "done")
+
     async def test_main_menu_matches_the_mission_buttons(self):
         from tests.test_bot import menu_payloads
 
-        payloads = menu_payloads(self.bot._user_menu())
-        labels = self.bot._user_menu()
-        flat_labels = [button.text for row in labels for button in row]
-        self.assertIn("💳 خرید اشتراک", flat_labels)
-        self.assertIn("📊 اعتبار من", flat_labels)
-        self.assertIn("🧾 پرداخت‌های من", flat_labels)
-        self.assertIn("🎧 پشتیبانی", flat_labels)
-        self.assertIn("ℹ️ راهنما", flat_labels)
-        self.assertIn("🎙️ تبدیل صدا به متن", flat_labels)
-        self.assertIn(b"support", payloads)
-        self.assertIn(b"buy", payloads)
-
-        # Note generation configured -> both pipeline entries are offered.
-        from dataclasses import replace
-        self.bot.settings = replace(self.settings, note_api_key="note-key")
-        configured_labels = [button.text for row in self.bot._user_menu() for button in row]
-        self.assertIn("📝 ساخت جزوه", configured_labels)
-        self.assertIn("🎙️ تبدیل صدا به متن", configured_labels)
+        menu = self.bot._user_menu()
+        payloads = menu_payloads(menu)
+        flat_labels = [button.text for row in menu for button in row]
+        self.assertEqual(
+            flat_labels,
+            ["📚 کتابخانه من", "💳 حساب من", "🎧 پشتیبانی", "ℹ️ راهنما"],
+        )
+        self.assertEqual(payloads, {b"library", b"wallet", b"support", b"help"})
 
         admin_labels = [button.text for row in self.bot._admin_menu() for button in row]
         self.assertIn("💳 پرداخت‌های در انتظار", admin_labels)

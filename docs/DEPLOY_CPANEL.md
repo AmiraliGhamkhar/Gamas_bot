@@ -168,16 +168,21 @@ tail -n 80 data/logs/bot.log
 
 Smoke test after the first start (use an admin account and a small test order):
 
-1. `/start` shows «🎙️ تبدیل صدا به متن», «📝 ساخت جزوه», «💳 خرید اشتراک», «🧾 پرداخت‌های من» and «🎧 پشتیبانی».
-2. Create a ticket from «🎧 پشتیبانی», filter it under «🎧 مدیریت پشتیبانی» (`📂 جدید` + category),
+1. `/start` shows the one-tap lecture guide and exactly four user buttons: «📚 کتابخانه من»,
+   «💳 حساب من», «🎧 پشتیبانی» and «ℹ️ راهنما» (admins also see «🛠 پنل مدیریت»). No mode button is
+   required before sending a test audio file; verify the transcript arrives before the Word booklet
+   and that both Telegram documents appear in the library.
+2. Open a library item and verify the bot forwards the saved Telegram message. A deleted source should
+   show «این فایل دیگر در دسترس نیست.» and mark the library row unavailable.
+3. Create a ticket from «🎧 پشتیبانی», filter it under «🎧 مدیریت پشتیبانی» (`📂 جدید` + category),
    and reply to it. Confirm both notifications and that the history remains after `/start` and restart.
-3. Create an order, send a receipt directly (photo or PNG/JPEG/WebP file), and open it from
-   «💳 پرداخت‌های در انتظار». The first approval tap must only show confirmation; «✅ تأیید نهایی»
-   activates credit once. Reject another test order (preset or custom reason) and verify its reason
-   reaches the user without granting credit.
-4. Tap the stale approval button again and confirm the balance and payment-linked ledger credit do
-   not change. Check the approved/rejected states in «🧾 پرداخت‌های من» after a restart.
-5. Reply from both sides of a ticket, close and reopen it, and confirm the earlier messages remain.
+4. Open «💳 حساب من»: confirm balance, plan options and recent payments share the same screen. Create
+   an order, send a receipt directly (photo or PNG/JPEG/WebP file), and open it from the wallet or
+   `payopen`. The first approval tap must only show confirmation; «✅ تأیید نهایی» activates credit
+   once. Reject another test order and verify its reason reaches the user without granting credit.
+5. Tap the stale approval button again and confirm the balance and payment-linked ledger credit do
+   not change. Check approved/rejected status in the wallet after a restart.
+6. Reply from both sides of a ticket, close and reopen it, and confirm the earlier messages remain.
    If Telegram is temporarily unavailable, confirm the stored history is still intact after recovery.
 
 **Rollback.** Pause cron and stop the bot. Set `BACKUP_DIR` to the actual pre-upgrade directory,

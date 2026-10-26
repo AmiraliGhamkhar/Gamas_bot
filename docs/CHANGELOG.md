@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+One-tap flow, wallet and Telegram-backed library (v4):
+
+- `/start` and every return to the user panel explain that a lecture file is the only action; audio,
+  video and PowerPoint uploads now always run the full configured pipeline without an `stt`/`make`
+  mode state. Transcript delivery remains before note generation, and absent note providers mean a
+  transcript-only job.
+- The user menu is now Library, Wallet, Support and Help (plus the separate admin entry for admins).
+  The wallet combines balance, plan purchase and recent payments; the library stores Telegram
+  message references for each delivered transcript/booklet and prunes to `LIBRARY_MAX_ITEMS`.
+- Migration 010 adds the library reference table without copying generated files to the server.
+  The former Free Office bot UI and queue are retired; its pure export modules remain covered by
+  offline tests, and `OFFICE_ENABLED` now defaults to `false`.
+
 Admin statistics dashboard (migration 009):
 
 - Replaced the flat lifetime overview with a period-aware dashboard: users / processing /

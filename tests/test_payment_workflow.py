@@ -87,7 +87,7 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         return event
 
     async def test_complete_photo_receipt_confirmation_and_duplicate_protection(self):
-        plans = await self.press(USER, "buy")
+        plans = await self.press(USER, "wallet")
         self.assertIn("۲۵ ساعت", plans.edits[-1][0])
         self.assertIn("۱۵۰٬۰۰۰ تومان", plans.edits[-1][0])
         await self.press(USER, f"plan:{PLAN}")
@@ -152,10 +152,33 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(rows[0][0], 1)
 
-        history = await self.press(USER, "payments")
+        history = await self.press(USER, "wallet")
         self.assertIn("تأیید شده", history.edits[-1][0])
         admin_history = await self.press(ADMIN, "adm:ph:0")
         self.assertIn("تأیید شده", admin_history.edits[-1][0])
+
+    async def test_wallet_keeps_recent_payments_on_the_account_screen_with_pagination(self):
+        payment_ids = []
+        for _ in range(7):
+            payment_id = await self.new_order()
+            payment_ids.append(payment_id)
+            self.assertTrue(await self.db.cancel_payment(payment_id, USER))
+
+        wallet = await self.press(USER, "wallet")
+        text, buttons = wallet.edits[-1]
+        self.assertIn("💳 حساب من", text)
+        self.assertIn("اعتبار باقی‌مانده", text)
+        self.assertIn("🛒 خرید اشتراک", text)
+        self.assertIn("🧾 پرداخت‌های اخیر", text)
+        self.assertIn("۲۵ ساعت", text)
+        self.assertIn(f"#{to_persian_digits(payment_ids[-1])}", text)
+        self.assertNotIn(f"#{to_persian_digits(payment_ids[0])}", text)
+        self.assertIn(b"walletp:1", self.payloads(buttons))
+
+        older = await self.press(USER, "walletp:1")
+        older_text, older_buttons = older.edits[-1]
+        self.assertIn(f"#{to_persian_digits(payment_ids[0])}", older_text)
+        self.assertIn(b"walletp:0", self.payloads(older_buttons))
 
     async def test_image_document_receipt_is_supported(self):
         payment_id = await self.new_order()

@@ -1,7 +1,9 @@
 """SQLite storage for Gamas Bot v3.
 
-Eight tables, one connection, WAL mode, ``BEGIN IMMEDIATE`` writes. The v2
-database is not migrated in place: v3 opens a fresh file (``DB_PATH``, default
+One WAL database, serialized ``BEGIN IMMEDIATE`` writes, and numbered additive
+migrations. The library stores Telegram message references only; it never
+copies generated artifacts to local storage. The v2 database is not migrated in
+place: v3 opens a fresh file (``DB_PATH``, default
 ``data/gamas_v3.db``) and :mod:`scripts.import_v2` can copy users, credit and
 the ledger across from a v2 database.
 
@@ -647,6 +649,92 @@ class Database:
             (user_id, limit),
         )
         return [dict(row) for row in rows]
+
+    # --------------------------------------------------------------- library
+    async def library_add(
+        self,
+        user_id: int,
+        kind: str,
+        chat_id: int,
+        message_id: int,
+        submission_id: int | None = None,
+        *,
+        title: str = "",
+    ) -> int:
+        """Save a Telegram message reference, not a local copy of the artifact.
+
+        The message is written only after Telegram accepted its delivery. Its
+        source chat and message id are enough for a later ``forward_messages``;
+        the library therefore adds no persistent file storage or retention risk.
+        """
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "INSERT INTO library_items(user_id, submission_id, kind, chat_id, "
+                "message_id, title, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    int(user_id),
+                    submission_id,
+                    kind,
+                    int(chat_id),
+                    int(message_id),
+                    str(title),
+                    iso(utc_now()),
+                ),
+            )
+            return int(cursor.lastrowid or 0)
+
+    async def library_list(
+        self, user_id: int, limit: int = 6, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Return one newest-first page, always scoped to the requesting user."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+            "title, created_at, unavailable FROM library_items WHERE user_id = ? "
+            "ORDER BY item_id DESC LIMIT ? OFFSET ?",
+            (int(user_id), max(0, int(limit)), max(0, int(offset))),
+        )
+        return [dict(row) for row in rows]
+
+    async def library_item(self, user_id: int, item_id: int) -> dict[str, Any] | None:
+        """Fetch one artifact only when it belongs to ``user_id``."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT item_id, user_id, submission_id, kind, chat_id, message_id, "
+            "title, created_at, unavailable FROM library_items "
+            "WHERE user_id = ? AND item_id = ?",
+            (int(user_id), int(item_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def library_count(self, user_id: int) -> int:
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM library_items WHERE user_id = ?",
+            (int(user_id),),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    async def library_mark_unavailable(self, item_id: int) -> bool:
+        """Remember that Telegram no longer retains a referenced source message."""
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "UPDATE library_items SET unavailable = 1 WHERE item_id = ?",
+                (int(item_id),),
+            )
+            return cursor.rowcount == 1
+
+    async def library_prune(self, user_id: int, keep: int) -> int:
+        """Delete this user's oldest references, keeping at most ``keep`` items."""
+        keep = max(0, int(keep))
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "DELETE FROM library_items WHERE user_id = ? AND item_id NOT IN ("
+                "SELECT item_id FROM library_items WHERE user_id = ? "
+                "ORDER BY item_id DESC LIMIT ?)",
+                (int(user_id), int(user_id), keep),
+            )
+            return max(0, int(cursor.rowcount))
 
     async def stats(self) -> dict[str, Any]:
         totals = await _rows(self.read_db,
