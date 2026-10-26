@@ -64,6 +64,12 @@ cron job cannot create a second database or session.
 | `NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE` | Evidence checks (`true`/`repair` by default). See [Note quality](NOTE_QUALITY.md). |
 | `RAW_FALLBACK_FILE_CHARS`, `RAW_FALLBACK_MAX_FILES` | Part size and count when a long raw `.txt` upload fails. |
 | `LIBRARY_MAX_ITEMS` | Newest transcript/booklet message references retained per user (default `50`); files remain in Telegram. |
+| `QUIZ_COST_SECONDS_PER_QUESTION` | Credit seconds charged per generated quiz question (default `60`). A 5/10/15-question quiz therefore costs 5/10/15× this value; debited before generation and fully refunded on any non-durable failure. Bounded to 1–86,400. |
+| `QUIZ_MAX_ACTIVE_HOURS` | An active quiz untouched for longer (default `6` h) is lazily expired on the next quiz start, freeing the one-active-quiz admission slot. |
+| `QUIZ_MAX_SESSIONS_PER_HOUR` | Per-user cap on new quiz sessions in any rolling hour (default `3`); checked before the debit. |
+| `FLASHCARD_AI_COST_SECONDS` | Flat credit charge for one AI flashcard deck (default `300`), debited before generation and fully refunded on failure. Manual decks and Word export are free. |
+| `FLASHCARD_AI_DECK_SIZE` | Question/answer pairs requested per AI deck (default `10`, allowed 5–50). Output shorter than five valid cards fails validation and refunds the charge. |
+| `FLASHCARD_MAX_DECKS_PER_USER` | Stored decks per user, AI and manual counted together (default `30`). New generation is refused at the cap. |
 | `OFFICE_ENABLED` and `OFFICE_*` | Retired Free Office UI compatibility settings; bot menu and job wiring are removed, and `OFFICE_ENABLED` defaults to `false`. |
 | `MAX_MEDIA_DURATION_SECONDS` | Maximum accepted audio/video duration (default 7,200 seconds / 2 hours), checked from Telegram metadata and media probes. |
 | `PRESENTATION_MAX_*` | Deck limits (defaults: 50 clips, 2 hours total, 128 MiB unpacked, 256 MiB temporary). |
