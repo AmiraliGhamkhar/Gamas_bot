@@ -2,7 +2,7 @@
 
 Every case here failed (or would have failed) before the corresponding fix:
 blank rendered pages counted as a lost delivery, an unbounded per-user queue,
-an unmetered Free Office loop, dangling receipt references, cooldown skips
+a formerly unmetered Free Office loop, dangling receipt references, cooldown skips
 reported as transcription failures, a hedged race that swallowed unexpected
 exceptions, a renderer that raised on a wide table row, ignored tariff
 overrides, and a tip cap that reordered the model's advice.
@@ -119,7 +119,7 @@ class RawFallbackTests(_BotHarness):
 
 
 # ---------------------------------------------------------------------------
-# Admission and Free Office metering
+# Admission control
 # ---------------------------------------------------------------------------
 
 
@@ -149,23 +149,6 @@ class AdmissionTests(_BotHarness):
         )
 
 
-class OfficeThrottleTests(_BotHarness):
-    async def test_two_rapid_office_requests_are_throttled(self):
-        from gamas_bot.office import OfficeSession
-
-        event = self.wire()
-        self.bot.settings = replace(
-            self.bot.settings,
-            office_min_interval_seconds=60.0,
-            office_session_ttl_minutes=30,
-        )
-        first = OfficeSession(kind="word", parts=["متن کوتاه برای ساخت سند."])
-        await self.bot._start_office_job(event, self.user_id, first)
-        second = OfficeSession(kind="word", parts=["متن دوم برای ساخت سند."])
-        await self.bot._start_office_job(event, self.user_id, second)
-        self.assertTrue(
-            any("صبر کنید" in reply for reply in event.replies), event.replies
-        )
 
 
 # ---------------------------------------------------------------------------

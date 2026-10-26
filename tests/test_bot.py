@@ -154,15 +154,13 @@ class BotPipelineTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class HappyPathTests(BotPipelineTestCase):
-    async def test_raw_and_docx_delivered_and_ledger_settled(self):
+    async def test_raw_only_delivery_and_ledger_settlement_without_note_provider(self):
         event = self.media_event()
         submission = await self.run_media_job(event, transcribe=self._raw())
 
-        # The raw text file and the Word booklet were both delivered.
         raw_text = event.file_bytes(".txt").decode("utf-8")
         self.assertIn("سلام دوستان. امروز", raw_text)
-        self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
-        # A preview was sent to the chat.
+        self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
         self.assertTrue(any("پیش‌نمایش" in r for r in event.replies))
 
         row = await self.db.submission(submission)
@@ -172,6 +170,8 @@ class HappyPathTests(BotPipelineTestCase):
         assert transcript is not None
         self.assertEqual(transcript["engine"], "speechmatics")
         self.assertIn("سلام دوستان. امروز", transcript["text"])
+        self.assertEqual(await self.db.library_count(USER_ID), 1)
+        self.assertEqual((await self.db.library_list(USER_ID))[0]["kind"], "transcript")
         # The measured duration (100s) is what got charged.
         self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
 
@@ -310,7 +310,7 @@ class RealSttStackTests(BotPipelineTestCase):
 
         raw_text = event.file_bytes(".txt").decode("utf-8")
         self.assertIn("سلام دوستان. امروز درس شبکه است.", raw_text)
-        self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
+        self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
         row = await self.db.submission(submission)
         assert row is not None
         self.assertEqual(row.status, "done")
@@ -428,7 +428,19 @@ class FileDeliveryTests(BotPipelineTestCase):
 
     async def test_raw_and_docx_use_send_file_with_caption_and_reply(self):
         event = self.media_event()
-        submission = await self.run_media_job(event, transcribe=self._raw())
+        self.bot.settings = replace(
+            self.settings,
+            note_api_key="note-key",
+            note_api_base_url="https://note.example/v1",
+        )
+        self.bot._http_session = lambda: None  # type: ignore[method-assign]
+        with mock.patch(
+            "gamas_bot.bot.structure_transcript",
+            new=mock.AsyncMock(return_value=StructuredNotes(
+                title="جزوهٔ فایل", summary="خلاصهٔ کلاس"
+            )),
+        ):
+            submission = await self.run_media_job(event, transcribe=self._raw())
 
         # ``Message.reply`` has no ``caption`` parameter — only
         # ``TelegramClient.send_file`` accepts a captioned document. The double
@@ -468,7 +480,7 @@ class FileDeliveryTests(BotPipelineTestCase):
 
         row = await self.db.submission(submission)
         assert row is not None
-        self.assertEqual(row.status, "partial")
+        self.assertEqual(row.status, "done")
         # No file was delivered, but the transcript reached the chat as text.
         self.assertEqual(event.files, [])
         fallback = [text for text in event.replies if "سلام دوستان" in text]
@@ -563,7 +575,7 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
 
 
 class PresentationNotesDeliveryTests(BotPipelineTestCase):
-    async def test_slide_only_deck_keeps_source_in_plain_booklet_without_provider(self):
+    async def test_slide_only_deck_delivers_transcript_without_note_provider(self):
         source = Path(self._tmp.name) / "slides.pptx"
         source.write_bytes(b"test deck")
         event = self.wire(FakeJobEvent(source=source))
@@ -598,12 +610,9 @@ class PresentationNotesDeliveryTests(BotPipelineTestCase):
             await self.bot._run_job(job)
 
         raw_text = event.file_bytes(".txt").decode("utf-8")
-        booklet_text = docx_text(event.file_bytes(".docx"))
         self.assertIn("موضوع ارائه", raw_text)
         self.assertIn("توضیح تکمیلی گوینده", raw_text)
-        self.assertIn("موضوع ارائه", booklet_text)
-        self.assertIn("نکتهٔ روی اسلاید", booklet_text)
-        self.assertIn("توضیح تکمیلی گوینده", booklet_text)
+        self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
         row = await self.db.submission(submission)
         assert row is not None
         self.assertEqual(row.status, "done")
@@ -800,7 +809,8 @@ class UnlimitedUserBotTests(BotPipelineTestCase):
         submission = await self.run_media_job(
             event, duration=7200.0, credit=0, transcribe=self._raw()
         )
-        self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
+        self.assertTrue(event.file_bytes(".txt"))
+        self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
         row = await self.db.submission(submission)
         assert row is not None
         self.assertEqual(row.status, "done")
@@ -941,7 +951,7 @@ class UnlimitedCommandTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_main_menu_and_account_show_unlimited(self):
         await self.db.set_unlimited(self.user_id, True, admin_id=self.admin_id, reason="استاد")
-        for data in (b"menu:main", b"account"):
+        for data in (b"menu:main", b"wallet"):
             event = FakeCallbackEvent(self.user_id, data)
             await self.bot._handle_callback(event)
             text, _buttons = event.edits[-1]
@@ -1006,6 +1016,7 @@ class FakeCallbackEvent:
 
     def __init__(self, sender_id: int, data: bytes):
         self.sender_id = sender_id
+        self.chat_id = sender_id
         self.data = data
         self.answers: list[tuple] = []    # (text, alert)
         self.edits: list[tuple] = []      # (text, buttons)
@@ -1036,6 +1047,8 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
             db_path=root / "bot.db",
             temp_dir=root / "tmp",
             note_api_key="",
+            note_api_base_url="",
+            note_providers=(),
         )
         self.db = Database(self.settings.db_path)
         await self.db.connect()
@@ -1049,30 +1062,22 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self._tmp.cleanup()
 
-    def test_user_menu_is_the_root_for_everyone(self):
+    def test_user_menu_is_the_four_action_root_for_everyone(self):
         user_menu = menu_payloads(self.bot._user_menu(is_admin=False))
         admin_menu = menu_payloads(self.bot._user_menu(is_admin=True))
-        # A regular user sees only the user actions.
-        self.assertIn(b"make", user_menu)
-        self.assertIn(b"account", user_menu)
-        self.assertIn(b"help", user_menu)
-        self.assertFalse(any(d.startswith(b"adm:") for d in user_menu))
-        # An admin gets one extra entry into their own panel — and only that.
-        self.assertIn(b"adm:home", admin_menu)
+        self.assertEqual(user_menu, {b"library", b"wallet", b"support", b"help"})
         self.assertEqual(
-            {d for d in admin_menu if d.startswith(b"adm:")},
-            {b"adm:home"},
+            admin_menu,
+            {b"library", b"wallet", b"support", b"help", b"adm:home"},
         )
 
     def test_admin_menu_is_its_own_panel_with_way_back(self):
         payloads = menu_payloads(self.bot._admin_menu())
         for section in (b"adm:home", b"adm:users", b"adm:pay", b"adm:bcast", b"adm:audit"):
             self.assertIn(section, payloads)
-        # The panel returns to the user panel…
         self.assertIn(b"menu:main", payloads)
-        # …and never mixes the user flow into itself.
-        self.assertNotIn(b"make", payloads)
-        self.assertNotIn(b"account", payloads)
+        self.assertNotIn(b"library", payloads)
+        self.assertNotIn(b"wallet", payloads)
 
     async def test_admin_root_screen_is_the_user_panel(self):
         event = FakeCallbackEvent(self.admin_id, b"menu:main")
@@ -1081,33 +1086,43 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         text, buttons = event.edits[-1]
         payloads = menu_payloads(buttons)
         self.assertIn("منوی اصلی", text)
-        self.assertIn(b"make", payloads)      # admin keeps the user flow
-        self.assertIn(b"adm:home", payloads)  # …plus the separate admin entry
+        self.assertIn(b"library", payloads)
+        self.assertIn(b"wallet", payloads)
+        self.assertIn(b"adm:home", payloads)
+        self.assertEqual(len(payloads), 5)
 
-    async def test_main_panel_copy_gives_clear_first_steps(self):
+    async def test_main_panel_copy_uses_the_no_notes_variant_and_wallet_balance(self):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
 
-        self.assertIn("برای ساخت جزوه", text)
-        self.assertIn("«📝 ساخت جزوه»", text)
-        self.assertIn("اعتبار باقی‌مانده", text)
-        if self.settings.note_configured:
-            self.assertIn("متن گفتار و سپس جزوهٔ ورد", text)
-        else:
-            self.assertIn("ساخت جزوهٔ ورد در حال حاضر", text)
-        self.assertIn("اعتبار مصرف نمی‌شود", text)
+        self.assertTrue(text.startswith(
+            "منوی اصلی\n\n"
+            "فایل درس‌تان را همین‌جا بفرستید؛ دکمه لازم نیست:\n"
+            "• فایل صوتی یا ویدیویی کلاس، یا پیام صوتی/ویدیویی تلگرام\n"
+            "• یا فایل پاورپوینت (.pptx)\n\n"
+            "متن کامل گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ ورد در حال حاضر فعال نیست."
+        ))
+        self.assertIn("⏳ اعتبار باقی‌مانده", text)
 
-    async def test_help_copy_explains_steps_and_billing_in_plain_language(self):
+    async def test_help_copy_is_the_one_tap_guide_followed_by_billing_contract(self):
         event = FakeCallbackEvent(self.user_id, b"help")
         await self.bot._handle_callback(event)
         text, _buttons = event.responses[-1]
 
-        self.assertIn("راهنمای استفاده", text)
-        self.assertIn("۱. «📝 ساخت جزوه» را انتخاب کنید.", text)
-        self.assertIn("پس از ارسال متن خام محاسبه می‌شود", text)
-        self.assertIn("خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود", text)
-        self.assertIn("ساخت سند رایگان", text)
+        expected = (
+            "ℹ️ راهنمای گاماس\n\n"
+            "۱. فایل صوتی، ویدیویی یا پاورپوینت درس را در همین چت بفرستید؛ دکمه لازم نیست.\n"
+            "۲. ابتدا متن کامل گفتار به‌صورت فایل متنی ارسال می‌شود.\n"
+            "۳. سپس جزوهٔ ورد (Word) آماده و ارسال می‌شود.\n"
+            "۴. همهٔ متن‌ها و جزوه‌ها در «📚 کتابخانه من» می‌مانند و هر زمان می‌توانید دوباره دریافت‌شان کنید.\n\n"
+            "«💳 حساب من»: موجودی، خرید اشتراک و پرداخت‌های شما در یک صفحه.\n"
+            "«🎧 پشتیبانی»: اگر مشکل یا سؤالی داشتید، تیکت بزنید.\n\n"
+            "اعتبار بر اساس مدت فایل صوتی و پس از ارسال متن خام محاسبه می‌شود. "
+            "اگر ارسال متن خام ناموفق باشد، اعتبار مصرف نمی‌شود. "
+            "پس از دریافت متن خام، خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود."
+        )
+        self.assertEqual(text, expected)
 
     async def test_main_panel_is_clear_when_word_generation_is_not_configured(self):
         self.bot.settings = replace(
@@ -1121,8 +1136,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn("🎙️ تبدیل صدا به متن", text)
-        self.assertIn("ساخت جزوهٔ ورد در حال حاضر فعال نیست", text)
+        self.assertIn("متن کامل گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ ورد در حال حاضر فعال نیست.", text)
         self.assertNotIn("متن گفتار و سپس جزوهٔ ورد", text)
 
     async def test_admin_guides_explain_user_actions_and_empty_states(self):
@@ -1200,7 +1214,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_navigating_disarms_receipt_upload(self):
         self.bot._pending_payments[self.user_id] = 42
-        event = FakeCallbackEvent(self.user_id, b"account")
+        event = FakeCallbackEvent(self.user_id, b"wallet")
         await self.bot._handle_callback(event)
         self.assertNotIn(self.user_id, self.bot._pending_payments)
         self.assertTrue(event.edits)
@@ -1555,7 +1569,7 @@ class ReceiptPathAndImageTests(unittest.TestCase):
         self.assertIn("[حذف شد]", redacted)
 
 
-class SttOnlyAndMenuTests(unittest.IsolatedAsyncioTestCase):
+class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
@@ -1563,6 +1577,7 @@ class SttOnlyAndMenuTests(unittest.IsolatedAsyncioTestCase):
             db_path=root / "bot.db",
             temp_dir=root / "tmp",
         )
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.settings.db_path)
         await self.db.connect()
         self.bot = GamasBot(self.settings)
@@ -1574,56 +1589,121 @@ class SttOnlyAndMenuTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self._tmp.cleanup()
 
-    async def test_main_menu_includes_stt_and_booklet_and_stt_only_skips_booklet(self):
-        start_event = FakeCallbackEvent(501, b"menu:main")
-        await self.bot._handle_callback(start_event)
-        _text, buttons = start_event.edits[-1]
-        labels = [btn.text for row in buttons for btn in row]
-        self.assertIn("🎙️ تبدیل صدا به متن", labels)
-        self.assertIn("📝 ساخت جزوه", labels)
-        self.assertIn("📄 ساخت سند رایگان", labels)
-        self.assertIn("💳 خرید اشتراک", labels)
-        self.assertIn("📊 اعتبار من", labels)
-        self.assertIn("🧾 پرداخت‌های من", labels)
-        self.assertIn("🎧 پشتیبانی", labels)
-        self.assertIn("ℹ️ راهنما", labels)
+    async def test_start_and_every_menu_use_the_four_button_layout(self):
+        start = FakeMessageEvent(501, "/start")
+        await self.bot._handle_message(start)
+        self.assertTrue(start.replies[0].startswith(
+            "به گاماس خوش آمدید. 🎓\n\n"
+            "فایل درس‌تان را همین‌جا بفرستید؛ دکمه لازم نیست:"
+        ))
+        start_payloads = menu_payloads(start.client.texts[0].get("buttons"))
+        self.assertEqual(
+            start_payloads,
+            {b"library", b"wallet", b"support", b"help"},
+        )
 
-        # Pressing «🎙️ تبدیل صدا به متن» arms stt_only for the next submission.
-        stt_tap = FakeCallbackEvent(501, b"stt")
-        await self.bot._handle_callback(stt_tap)
-        self.assertIn(501, self.bot._stt_only_users)
+        menu = FakeCallbackEvent(501, b"menu:main")
+        await self.bot._handle_callback(menu)
+        self.assertEqual(
+            menu_payloads(menu.edits[-1][1]),
+            {b"library", b"wallet", b"support", b"help"},
+        )
 
-        # End-to-end execution of stt_only job delivers raw transcript, settles
-        # exact seconds once, marks submission done, and skips LLM note generation.
-        from unittest.mock import AsyncMock, patch
-        from gamas_bot.media import MediaInfo
-        from gamas_bot.stt import RawTranscript
+    async def test_bare_text_retriggers_file_upload_with_the_main_menu(self):
+        event = FakeMessageEvent(501, "سلام")
+        await self.bot._handle_message(event)
+        self.assertEqual(
+            event.replies[0],
+            "برای شروع، فایل صوتی، ویدیویی یا پاورپوینت درس را بفرستید؛ "
+            "متن گفتار و جزوهٔ ورد به‌صورت خودکار ارسال می‌شود.",
+        )
+        self.assertEqual(
+            menu_payloads(self.bot._user_menu()),
+            {b"library", b"wallet", b"support", b"help"},
+        )
+
+    async def test_media_upload_without_a_mode_tap_runs_transcript_then_booklet(self):
+        """The file alone starts the complete pipeline; transcript remains first."""
+        from gamas_bot.stt import RawTranscript as STTRawTranscript
+
+        user_id = 501
+        start = FakeMessageEvent(user_id, "/start")
+        await self.bot._handle_message(start)  # grants the once-only free plan
 
         audio_path = Path(self._tmp.name) / "lecture.ogg"
         audio_path.write_bytes(b"OggS\x00\x02fake-audio-payload")
-        await self.db.ensure_user(501)
-        await self.db.grant_free_plan_once(501, 3600)
-        msg_event = FakeJobEvent(source=audio_path, chat_id=501)
-        msg_event.message.attach_voice(duration=12)
-
-        llm_mock = AsyncMock(side_effect=AssertionError("LLM must not run in stt_only mode"))
-        fake_raw = RawTranscript.from_text("سلام به همگی در جلسه اول", engine="deepgram")
+        event = FakeJobEvent(source=audio_path, chat_id=user_id)
+        event.message.attach_voice(duration=12)
+        self.bot.client = event.client
+        notes = StructuredNotes(title="جزوهٔ خودکار", summary="خلاصهٔ درس")
+        raw = STTRawTranscript.from_text("سلام به همگی در جلسهٔ نخست", engine="deepgram")
         with (
-            patch("gamas_bot.bot.probe_media", AsyncMock(return_value=MediaInfo(duration=12.0, has_audio=True))),
-            patch("gamas_bot.bot.needs_transcode", return_value=False),
-            patch("gamas_bot.bot.transcribe", AsyncMock(return_value=fake_raw)),
-            patch("gamas_bot.bot.structure_transcript", llm_mock),
+            mock.patch(
+                "gamas_bot.bot.probe_media",
+                new=mock.AsyncMock(return_value=MediaInfo(
+                    duration=12.0, has_audio=True, audio_codec="opus"
+                )),
+            ),
+            mock.patch("gamas_bot.bot.needs_transcode", return_value=False),
+            mock.patch("gamas_bot.bot.transcribe", new=mock.AsyncMock(return_value=raw)),
+            mock.patch("gamas_bot.bot.structure_transcript", new=mock.AsyncMock(return_value=notes)) as generate,
+            mock.patch.object(self.bot, "_http_session", return_value=None),
         ):
-            await self.bot._handle_message(msg_event)
+            await self.bot._handle_message(event)
             job = self.bot.queue.pop_pending()
             await self.bot._run_job(job)
 
-        llm_mock.assert_not_awaited()
-        self.assertEqual(await self.db.available_seconds(501), 3600 - 12)
-        row = (await self.db.db.execute_fetchall(
-            "SELECT status FROM submissions WHERE submission_id = ?", (job.submission_id,)
-        ))[0]
-        self.assertEqual(row["status"], "done")
+        generate.assert_awaited_once()
+        self.assertTrue(event.file_bytes(".txt"))
+        self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
+        captions = [caption for caption, _path in event.files]
+        self.assertIn("متن خام", captions[0])
+        self.assertIn("جزوهٔ Word", captions[1])
+        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", captions[1])
+        items = await self.db.library_list(user_id, limit=6)
+        self.assertEqual([item["kind"] for item in items], ["booklet", "transcript"])
+        row = await self.db.submission(job.submission_id)
+        self.assertIsNotNone(row)
+        self.assertEqual(row.status, "done")
+
+    async def test_without_note_providers_the_same_upload_delivers_only_transcript(self):
+        from gamas_bot.stt import RawTranscript as STTRawTranscript
+
+        self.bot.settings = replace(
+            self.settings,
+            note_api_key="",
+            note_api_base_url="",
+            note_providers=(),
+        )
+        user_id = 502
+        await self.db.ensure_user(user_id)
+        await self.db.grant_free_plan_once(user_id, 3600)
+        audio_path = Path(self._tmp.name) / "raw-only.ogg"
+        audio_path.write_bytes(b"OggS\x00\x02fake-audio-payload")
+        event = FakeJobEvent(source=audio_path, chat_id=user_id)
+        event.message.attach_voice(duration=8)
+        self.bot.client = event.client
+        raw = STTRawTranscript.from_text("متن گفتار", engine="deepgram")
+        with (
+            mock.patch(
+                "gamas_bot.bot.probe_media",
+                new=mock.AsyncMock(return_value=MediaInfo(
+                    duration=8.0, has_audio=True, audio_codec="opus"
+                )),
+            ),
+            mock.patch("gamas_bot.bot.needs_transcode", return_value=False),
+            mock.patch("gamas_bot.bot.transcribe", new=mock.AsyncMock(return_value=raw)),
+            mock.patch("gamas_bot.bot.structure_transcript", new=mock.AsyncMock()) as generate,
+        ):
+            await self.bot._handle_message(event)
+            job = self.bot.queue.pop_pending()
+            await self.bot._run_job(job)
+
+        generate.assert_not_awaited()
+        self.assertTrue(event.file_bytes(".txt"))
+        self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
+        self.assertEqual(await self.db.library_count(user_id), 1)
+        self.assertEqual((await self.db.library_list(user_id))[0]["kind"], "transcript")
 
 
 if __name__ == "__main__":

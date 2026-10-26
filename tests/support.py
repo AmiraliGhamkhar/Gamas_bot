@@ -55,15 +55,26 @@ class FakeTelegramClient:
     def __init__(self, recorder: "FakeJobEvent | None" = None, *, fail_file_delivery: bool = False):
         self.recorder = recorder
         self.fail_file_delivery = fail_file_delivery
+        self.fail_forward = False
+        self._next_message_id = 10_000
         #: every text message, as the arguments it was sent with.
         self.texts: list[dict] = []
         #: every document/photo delivery, as the arguments it was sent with.
         self.deliveries: list[dict] = []
+        self.forwarded: list[dict] = []
         self.disconnected = False
 
     async def disconnect(self) -> None:
         """The shutdown path calls this on the real client."""
         self.disconnected = True
+
+    async def forward_messages(self, entity, messages, *, from_peer=None):
+        """Record the library's one-message re-forward operation."""
+        if self.fail_forward:
+            raise RuntimeError("Telegram source message is unavailable")
+        record = {"entity": entity, "messages": list(messages), "from_peer": from_peer}
+        self.forwarded.append(record)
+        return [FakeSentMessage(self, record)]
 
     @staticmethod
     def _bind(signature, name: str, *args, **kwargs):
@@ -136,6 +147,9 @@ class FakeSentMessage:
     def __init__(self, client: FakeTelegramClient, record: dict):
         self.client = client
         self.record = record
+        self.id = client._next_message_id
+        client._next_message_id += 1
+        self.chat_id = record.get("entity")
 
     async def edit(self, text: str = "", buttons=None) -> "FakeSentMessage":
         self.record["text"] = text

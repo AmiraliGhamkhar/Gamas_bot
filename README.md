@@ -1,8 +1,12 @@
 # Gamas Bot
 
-Persian Telegram study assistant. Send lecture audio/video or a PowerPoint deck and get a raw
-transcript plus an RTL Word booklet. The free Office menu turns text into Word, Excel,
-PowerPoint or PDF.
+Persian Telegram study assistant. Send lecture audio/video or a PowerPoint deck—no mode button
+needed—and get the transcript first, followed by an RTL Word booklet when note generation is
+configured. Delivered transcript and booklet files are saved to the Telegram-backed personal
+library; balance, subscription purchase and recent payments live together in «💳 حساب من».
+
+The former Free Office bot UI is retired. Its standalone export modules remain available to code
+and their offline tests, but text-to-document jobs are no longer accepted by the bot.
 
 Runs on Windows for local use and on Linux cPanel shared hosting for production.
 
@@ -53,16 +57,28 @@ Then add the once-per-minute cron job from [Deploy on cPanel](docs/DEPLOY_CPANEL
 project, `.env`, database, session, logs and receipts **outside `public_html`**. Shared hosts may
 kill long processes; run one active worker and test the host before relying on it.
 
-## What it supports
+## User flow
 
-- Audio, video, Telegram voice/video notes, `.pptx` and legacy `.ppt` → transcript + RTL `.docx`.
-- Text or text files → free `.docx`, `.xlsx`, `.pptx`, `.pdf`.
+- `/start` explains the one-action flow and shows 📚 Library, 💳 Wallet, 🎧 Support and ℹ️ Help
+  (admins also see their separate admin panel).
+- Send audio, video, a Telegram voice/video note or a PowerPoint deck directly in the chat. The bot
+  delivers the transcript first, then the RTL Word booklet when note generation is configured.
+- Delivered transcript and booklet messages are indexed in the personal library as Telegram message
+  references, not copied to local disk. Users can forward a saved file back to themselves later.
+- The Wallet combines remaining balance, plan purchase and recent payment history. Card-to-card
+  receipts remain subject to administrator review.
+
+## Processing support
+
+- Audio, video, Telegram voice/video notes, `.pptx` and legacy `.ppt` → transcript, then notes/booklet
+  when a note provider is configured. Without one, the bot delivers the transcript only.
 - STT: Deepgram, Speechmatics, OpenAI-compatible.
 - Notes: Gemini, NaraRouter, OpenRouter, Groq, Cerebras, Anthropic, OpenAI-compatible.
 - SQLite billing ledger with card-to-card purchases reviewed by an admin.
 
-OCR for images and scanned PDFs is **not** supported. Free Office accepts text, not uploaded
-`.docx`/`.pdf` sources.
+OCR for images and scanned PDFs is **not** supported. The former Free Office bot UI is retired;
+plain text and text-file submissions no longer start document jobs. `OFFICE_ENABLED` defaults to
+`false`; the pure export modules remain in the repository for reuse and testing.
 
 ## Documentation
 

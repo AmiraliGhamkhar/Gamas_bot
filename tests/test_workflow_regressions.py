@@ -291,7 +291,15 @@ class WorkflowBotTests(BotPipelineTestCase):
 
     async def test_exception_after_raw_delivery_preserves_billed_usage(self):
         event = self.media_event()
-        with mock.patch.object(self.bot, "_deliver_booklet", side_effect=RuntimeError("booklet failed")):
+        self.bot.settings = replace(
+            self.settings,
+            note_api_key="note-key",
+            note_api_base_url="https://note.example/v1",
+        )
+        with (
+            mock.patch.object(self.bot, "_generate_notes", new=mock.AsyncMock(return_value=None)),
+            mock.patch.object(self.bot, "_deliver_booklet", side_effect=RuntimeError("booklet failed")),
+        ):
             sid = await self.run_media_job(event, transcribe=self._raw())
         self.assertEqual((await self.db.submission(sid)).status, "partial")
         self.assertEqual(await self.db.available_seconds(USER_ID), 3500)
@@ -314,7 +322,7 @@ class WorkflowBotTests(BotPipelineTestCase):
     async def test_resume_and_cancel_from_account_after_restart(self):
         self.bot.settings = replace(self.settings, payment_card_number="6037991234567890")
         pid = await self.db.create_payment(USER_ID, "paid_5h_30d")
-        event = FakeCallbackEvent(USER_ID, b"account")
+        event = FakeCallbackEvent(USER_ID, b"wallet")
         await self.bot._handle_callback(event)
         self.assertIn(f"payopen:{pid}".encode(), menu_payloads(event.edits[-1][1]))
         event = FakeCallbackEvent(USER_ID, f"payc:{pid}".encode())
@@ -347,7 +355,7 @@ class WorkflowBotTests(BotPipelineTestCase):
     async def test_cancel_button_available_without_payment_card(self):
         pid = await self.db.create_payment(USER_ID, "paid_5h_30d")
         self.bot.settings = replace(self.settings, payment_card_number="")
-        event = FakeCallbackEvent(USER_ID, b"account")
+        event = FakeCallbackEvent(USER_ID, b"wallet")
         await self.bot._handle_callback(event)
         self.assertIn(f"payc:{pid}".encode(), menu_payloads(event.edits[-1][1]))
         await self.bot._handle_callback(FakeCallbackEvent(USER_ID, f"payc:{pid}".encode()))

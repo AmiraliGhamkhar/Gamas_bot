@@ -539,6 +539,9 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
             media_worker_concurrency=2,
             max_concurrent_uploads=2,
             dedup_window_seconds=60.0,
+            note_api_key="",
+            note_api_base_url="",
+            note_providers=(),
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.settings.db_path)
@@ -560,7 +563,7 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
         class _RoutingClient:
             async def send_file(self, chat_id, file, *, caption=None, force_document=False, file_size=None, reply_to=None, buttons=None):  # noqa: ARG002
                 target_ev = events[int(chat_id)]
-                await target_ev.client.send_file(
+                return await target_ev.client.send_file(
                     chat_id,
                     file,
                     caption=caption,
@@ -613,7 +616,6 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
              mock.patch("gamas_bot.bot.needs_transcode", return_value=False), \
              mock.patch("gamas_bot.bot.transcribe", new=fake_transcribe):
             for uid in users:
-                self.bot._stt_only_users.add(uid)
                 await self.bot._accept_media(
                     events[uid], uid, "audio", f"lecture-{uid}.ogg", 60.0
                 )
@@ -820,7 +822,7 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
             await task
 
 
-class SlotWaitCooldownAndLaneRegressionTests(unittest.IsolatedAsyncioTestCase):
+class SlotWaitCooldownRegressionTests(unittest.IsolatedAsyncioTestCase):
     """Regressions for capacity waits that used to fail otherwise-healthy jobs.
 
     Covered defects (all reproduced against the previous behaviour):
@@ -829,9 +831,7 @@ class SlotWaitCooldownAndLaneRegressionTests(unittest.IsolatedAsyncioTestCase):
       ``MAX_ACTIVE_JOBS=3`` failed the third concurrent job after a 15 s slot
       wait even though running transcriptions hold slots for minutes;
     * a job arriving while its only provider sat in a short post-429 cooldown
-      failed instantly instead of waiting out the remaining seconds;
-    * Free Office document builds shared the media job lane, so a
-      seconds-long build queued behind multi-hour transcription jobs.
+      failed instantly instead of waiting out the remaining seconds.
     """
 
     def setUp(self) -> None:
@@ -859,7 +859,6 @@ class SlotWaitCooldownAndLaneRegressionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertGreaterEqual(config.DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS, 300.0)
         self.assertLessEqual(config.DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS, 900.0)
-        self.assertGreaterEqual(config.DEFAULT_OFFICE_JOB_CONCURRENCY, 1)
 
     def test_config_check_flags_stt_capacity_below_active_jobs(self):
         marker = "will wait for a transcription slot"
@@ -978,65 +977,6 @@ class SlotWaitCooldownAndLaneRegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertLess(time.monotonic() - t0, 2.0)
         self.assertEqual(calls, 0)
 
-    async def test_office_lane_progresses_while_media_lane_is_saturated(self):
-        root = Path(self._tmp.name)
-        settings = make_settings(
-            db_path=root / "gamas.db",
-            temp_dir=root / "temp",
-            receipt_dir=root / "receipts",
-            max_active_jobs=2,
-            max_queued_jobs=4,
-            office_job_concurrency=1,
-        )
-        settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        db = Database(settings.db_path)
-        await db.connect()
-        bot = GamasBot(settings)
-        bot.db = db
-        media_release = asyncio.Event()
-        media_started: list[int] = []
-        office_done = asyncio.Event()
-
-        async def fake_worker(job: Job) -> None:
-            if job.kind == "office":
-                office_done.set()
-                return
-            media_started.append(job.submission_id)
-            await media_release.wait()
-
-        # Drive the bot's real queue objects (and their configured lane
-        # sizes) with a controllable worker; handler routing onto
-        # ``office_queue`` itself is covered by the Office test-suite.
-        bot.queue._worker = fake_worker
-        bot.office_queue._worker = fake_worker
-        try:
-            self.assertIsNot(bot.queue, bot.office_queue)
-            bot.queue.ensure_workers()
-            bot.office_queue.ensure_workers()
-            for index in range(2):
-                bot.queue.submit(
-                    Job(
-                        submission_id=500 + index,
-                        user_id=700 + index,
-                        kind="audio",
-                        filename="lecture.mp3",
-                    )
-                )
-            while len(media_started) < 2:
-                await asyncio.sleep(0.01)
-            bot.office_queue.submit(
-                Job(submission_id=600, user_id=799, kind="office", filename=None)
-            )
-            await asyncio.wait_for(office_done.wait(), timeout=1.0)
-            # Both media jobs are still running; the office job did not wait.
-            self.assertEqual(bot.queue.active_count, 2)
-            snap = bot.runtime_metrics()
-            self.assertEqual(snap["queue_active"], 2)
-            self.assertIn("office_queue_pending", snap)
-        finally:
-            media_release.set()
-            await bot.shutdown()
-            await db.close()
 
 
 if __name__ == "__main__":  # pragma: no cover

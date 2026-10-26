@@ -32,9 +32,10 @@ provider. Review each provider's retention and privacy terms before enabling it.
 is delivered before note generation; once delivered, its transcription charge stands even if the
 booklet later fails.
 
-The database stores submissions, transcripts, notes, billing and audit records. Free Office request
-text is held in an in-memory session that expires; an administrative submission row remains.
-Retention is configurable in `.env` (see [Operations](OPERATIONS.md)).
+The database stores submissions, transcripts, notes, billing, audit records and the Telegram
+chat/message references used by each user's library; generated files themselves stay in Telegram.
+`LIBRARY_MAX_ITEMS` bounds the retained references per user. No Free Office request session is wired
+into the bot. Transcript retention is configurable in `.env` (see [Operations](OPERATIONS.md)).
 
 ## Report a vulnerability
 

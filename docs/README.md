@@ -17,7 +17,7 @@ and **cPanel Terminal** (Linux shared hosting).
 | [Note providers](PROVIDERS.md) | Note generation, keys and model presets |
 | [Presentations](PRESENTATIONS.md) | PowerPoint narration and limits |
 | [Media](MEDIA.md) | Audio/video processing and disk limits |
-| [Free Office](OFFICE.md) | Text-to-document features |
+| [Retired Free Office UI](OFFICE.md) | Retirement note; standalone export modules and tests remain |
 | [Word output](DOCX.md) | RTL Word behavior and fonts |
 | [Note quality](NOTE_QUALITY.md) | Grounding checks and limitations |
 | [Performance](PERFORMANCE.md) | Measured defaults and how to re-measure |

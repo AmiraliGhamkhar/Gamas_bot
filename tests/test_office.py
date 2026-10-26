@@ -1,11 +1,9 @@
-"""The Free Office section: the user's text becomes a real Office file.
+"""Pure Office export modules retained after the bot UI retirement.
 
-The tests cover the three contracts the section promises:
-
-* the user's words end up in the document **verbatim** — nothing is
-  rewritten, and a model answer that is not in the source is dropped;
-* the three files are real Office packages a reader can open;
-* the section is **free**: no credit is reserved, charged or released.
+These tests keep the standalone builders honest: source wording stays intact,
+model-proposed content must be grounded in that source, and every export is a
+real package a reader can open. The Telegram UI and job lane are no longer part
+of the product surface.
 """
 
 from __future__ import annotations
@@ -13,19 +11,14 @@ from __future__ import annotations
 import io
 import json as json_lib
 import tempfile
-import time
 import unittest
 import zipfile
-from dataclasses import replace
 from pathlib import Path
-from unittest import mock
 
 import docx as docx_library
 import openpyxl
 from pptx import Presentation
 
-from gamas_bot.bot import GamasBot
-from gamas_bot.db import Database
 from gamas_bot.office import (
     OfficeError,
     build_office_document,
@@ -40,14 +33,9 @@ from gamas_bot.office import (
 from gamas_bot.office_ai import _chunk_long_text, infer_table, plan_deck
 from gamas_bot.mdblocks import heading_level, parse_blocks
 from tests.support import (
-    FakeCallbackEvent,
-    FakeJobEvent,
-    FakeTelegramClient,
     docx_text,
     make_settings,
 )
-
-USER_ID = 555
 
 SAMPLE = (
     "# گزارش عملکرد\n"
@@ -515,290 +503,6 @@ class ModelValidationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await infer_table(SAMPLE, settings=settings, session=session))
 
 
-# ---------------------------------------------------------------------------
-# The bot: the section's screens and its job
-# ---------------------------------------------------------------------------
-
-
-class OfficeBotTestCase(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
-        root = Path(self._tmp.name)
-        self.settings = make_settings(
-            db_path=root / "bot.db",
-            temp_dir=root / "tmp",
-            # No note provider: the section must work without one.
-            note_api_key="",
-            note_api_base_url="",
-            nara_api_key="",
-            openrouter_api_key="",
-        )
-        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        self.db = Database(self.settings.db_path)
-        await self.db.connect()
-        await self.db.ensure_user(USER_ID)
-        self.bot = GamasBot(self.settings)
-        self.bot.db = self.db
-
-    async def asyncTearDown(self):
-        await self.bot.shutdown()
-        await self.db.close()
-        self._tmp.cleanup()
-
-    def wire(self, event) -> FakeJobEvent:
-        self.bot.client = event.client
-        return event
-
-    def callback(self, data: bytes, *, client=None) -> FakeCallbackEvent:
-        client = client or FakeTelegramClient()
-        return FakeCallbackEvent(client, data=data, chat_id=USER_ID)
-
-    async def run_queued_job(self):
-        """Run the job the handler queued, the way the worker pool would."""
-        job = self.bot.office_queue.pop_pending()
-        await self.bot._run_job(job)
-        return job
-
-
-class OfficeScreenTests(OfficeBotTestCase):
-    async def test_the_user_menu_has_the_office_entry(self):
-        menu = self.bot._user_menu()
-        labels = [button.text for row in menu for button in row]
-        self.assertIn("📄 ساخت سند رایگان", labels)
-
-    async def test_the_office_entry_is_hidden_when_the_section_is_off(self):
-        self.bot.settings = replace(self.settings, office_enabled=False)
-        labels = [button.text for row in self.bot._user_menu() for button in row]
-        self.assertNotIn("📄 ساخت سند رایگان", labels)
-
-    async def test_the_button_does_nothing_when_the_section_is_off(self):
-        self.bot.settings = replace(self.settings, office_enabled=False)
-        event = self.wire(FakeJobEvent())
-        callback = self.callback(b"office", client=event.client)
-        await self.bot._handle_callback(callback)
-        self.assertTrue(any("فعال نیست" in reply for reply in event.replies))
-
-    async def test_an_old_document_cannot_be_extended(self):
-        event = self.wire(FakeJobEvent())
-        self.bot._office_last[USER_ID] = (
-            "word", "متن", "گزارش", time.monotonic() - 10_000,
-        )
-        callback = self.callback(b"office:more", client=event.client)
-        await self.bot._handle_office_action(callback, "more")
-        self.assertTrue(
-            any("ادامه ندارم" in edit["text"] for edit in callback.edits),
-            callback.edits,
-        )
-
-    async def test_a_text_message_opens_the_office_menu(self):
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        event.message.message = "متن آزمایشی"
-        await self.bot._handle_message(event)
-        self.assertTrue(any("ساخت سند رایگان" in reply for reply in event.replies))
-
-    async def test_the_office_button_shows_the_four_formats(self):
-        event = self.wire(FakeJobEvent())
-        callback = self.callback(b"office", client=event.client)
-        await self.bot._handle_callback(callback)
-        # The panel is a screen tree: the menu is edited, not sent again.
-        self.assertTrue(callback.edits)
-        screen = callback.edits[-1]["text"]
-        self.assertIn("ساخت سند رایگان", screen)
-        self.assertIn("Word", screen)
-        self.assertIn("Excel", screen)
-        self.assertIn("PowerPoint", screen)
-        self.assertIn("PDF", screen)
-        labels = [button.text for row in callback.edits[-1]["buttons"] for button in row]
-        self.assertIn("📕 PDF", labels)
-
-    async def test_cancelling_clears_the_session(self):
-        self.bot._office_sessions[USER_ID] = mock.Mock()
-        event = self.wire(FakeJobEvent())
-        callback = self.callback(b"office:cancel", client=event.client)
-        await self.bot._handle_callback(callback)
-        self.assertNotIn(USER_ID, self.bot._office_sessions)
-
-
-class OfficeJobTests(OfficeBotTestCase):
-    async def test_a_word_document_is_delivered_and_costs_no_credit(self):
-        await self.db.add_credit(USER_ID, 3600, note="test")
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        await self.bot._handle_office_message(event, USER_ID, SAMPLE)
-        # The format is asked for first: the content arrived before it.
-        self.assertTrue(any("ساخت سند رایگان" in reply for reply in event.replies))
-
-        callback = self.callback(b"office:word", client=event.client)
-        await self.bot._handle_office_action(callback, "word")
-        job = await self.run_queued_job()
-
-        payload = event.file_bytes(".docx")
-        self.assertTrue(payload.startswith(b"PK"))
-        self.assertIn("این متن عیناً در سند می‌آید.", docx_text(payload))
-        # The section is free: the balance is untouched.
-        self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
-        row = await self.db.submission(job.submission_id)
-        assert row is not None
-        self.assertEqual(row.status, "done")
-        self.assertEqual(row.kind, "office")
-
-    async def test_a_pdf_document_is_delivered_and_costs_no_credit(self):
-        await self.db.add_credit(USER_ID, 3600, note="test")
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        await self.bot._handle_office_message(event, USER_ID, SAMPLE)
-        callback = self.callback(b"office:pdf", client=event.client)
-        await self.bot._handle_office_action(callback, "pdf")
-        job = await self.run_queued_job()
-
-        payload = event.file_bytes(".pdf")
-        self.assertTrue(payload.startswith(b"%PDF"))
-        self.assertTrue(payload.rstrip().endswith(b"%%EOF"))
-        # The section is free: the balance is untouched.
-        self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
-        row = await self.db.submission(job.submission_id)
-        assert row is not None
-        self.assertEqual(row.status, "done")
-        self.assertEqual(row.kind, "office")
-
-    async def test_an_excel_document_is_delivered(self):
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        await self.bot._handle_office_message(event, USER_ID, SAMPLE)
-        callback = self.callback(b"office:excel", client=event.client)
-        await self.bot._handle_office_action(callback, "excel")
-        await self.run_queued_job()
-        payload = event.file_bytes(".xlsx")
-        workbook = openpyxl.load_workbook(io.BytesIO(payload))
-        self.assertEqual(workbook.active["A1"].value, "نام")
-
-    async def test_a_powerpoint_document_is_delivered(self):
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        await self.bot._handle_office_message(event, USER_ID, SAMPLE)
-        callback = self.callback(b"office:ppt", client=event.client)
-        await self.bot._handle_office_action(callback, "ppt")
-        await self.run_queued_job()
-        payload = event.file_bytes(".pptx")
-        presentation = Presentation(io.BytesIO(payload))
-        self.assertEqual(len(presentation.slides), 5)
-
-    async def test_an_uploaded_text_file_becomes_a_document(self):
-        source = Path(self._tmp.name) / "گزارش.txt"
-        source.write_text(SAMPLE, encoding="utf-8")
-        event = self.wire(FakeJobEvent(source=source))
-        event.message._chat_id = USER_ID
-        event.message.attach_document("گزارش.txt", mime_type="text/plain")
-        await self.bot._handle_office_message(event, USER_ID, "")
-        callback = self.callback(b"office:word", client=event.client)
-        await self.bot._handle_office_action(callback, "word")
-        await self.run_queued_job()
-        self.assertIn("این متن عیناً در سند می‌آید.", docx_text(event.file_bytes(".docx")))
-
-    async def test_the_temporary_upload_is_removed_after_reading(self):
-        source = Path(self._tmp.name) / "a.txt"
-        source.write_text("متن", encoding="utf-8")
-        event = self.wire(FakeJobEvent(source=source))
-        event.message._chat_id = USER_ID
-        event.message.attach_document("a.txt", mime_type="text/plain")
-        await self.bot._handle_office_message(event, USER_ID, "")
-        leftovers = list(self.settings.temp_dir.glob("office-*"))
-        self.assertEqual(leftovers, [])
-
-    async def test_text_over_the_limit_is_refused(self):
-        self.bot.settings = replace(self.settings, office_max_chars=50)
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        await self.bot._handle_office_message(event, USER_ID, "متن " * 100)
-        self.assertTrue(any("حد مجاز" in reply for reply in event.replies))
-
-    async def test_an_oversize_text_file_is_refused_before_download(self):
-        """The upload is rejected on Telegram's size, not after writing it (F-10)."""
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        event.message.attach_document(
-            "big.txt",
-            mime_type="text/plain",
-            size=self.settings.office_max_input_bytes + 1,
-        )
-        handled = await self.bot._handle_office_message(event, USER_ID, "")
-        self.assertTrue(handled)
-        self.assertTrue(any("بزرگ" in reply for reply in event.replies))
-        # Nothing was downloaded, so no temporary file exists.
-        self.assertEqual(list(self.settings.temp_dir.glob("office-*")), [])
-
-    async def test_a_lecture_upload_is_never_office_content(self):
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        handled = await self.bot._handle_office_message(event, USER_ID, "")
-        self.assertFalse(handled)
-
-    async def test_a_photo_is_not_office_content(self):
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        event.message.photo = object()
-        event.message.message = "متن کنار عکس"
-        handled = await self.bot._handle_office_message(event, USER_ID, "متن کنار عکس")
-        self.assertFalse(handled)
-
-    async def test_a_short_caption_becomes_the_title(self):
-        source = Path(self._tmp.name) / "a.txt"
-        source.write_text(SAMPLE, encoding="utf-8")
-        event = self.wire(FakeJobEvent(source=source))
-        event.message._chat_id = USER_ID
-        event.message.attach_document("a.txt", mime_type="text/plain")
-        event.message.message = "گزارش ماهانه"
-        await self.bot._handle_office_message(event, USER_ID, "")
-        session = self.bot._office_sessions[USER_ID]
-        self.assertEqual(session.title, "گزارش ماهانه")
-
-    async def test_adding_more_text_keeps_the_previous_content(self):
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        await self.bot._handle_office_message(event, USER_ID, "سطر نخست")
-        callback = self.callback(b"office:word", client=event.client)
-        await self.bot._handle_office_action(callback, "word")
-        await self.run_queued_job()
-
-        # «افزودن متن» reopens the request with the previous content.
-        callback = self.callback(b"office:more", client=event.client)
-        await self.bot._handle_office_action(callback, "more")
-        more = self.wire(FakeJobEvent())
-        more.message._chat_id = USER_ID
-        await self.bot._handle_office_message(more, USER_ID, "سطر دوم")
-        await self.run_queued_job()
-        text = docx_text(more.file_bytes(".docx"))
-        self.assertIn("سطر نخست", text)
-        self.assertIn("سطر دوم", text)
-
-    async def test_the_office_job_never_reserves_credit(self):
-        """The submission is recorded, but no hold is ever created."""
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        await self.bot._handle_office_message(event, USER_ID, SAMPLE)
-        callback = self.callback(b"office:word", client=event.client)
-        await self.bot._handle_office_action(callback, "word")
-        job = await self.run_queued_job()
-        holds = await self.db.db.execute_fetchall(
-            "SELECT COUNT(*) FROM holds WHERE submission_id = ?", (job.submission_id,)
-        )
-        self.assertEqual(holds[0][0], 0)
-
-    async def test_a_failed_build_fails_the_submission_without_charging(self):
-        event = self.wire(FakeJobEvent())
-        event.message._chat_id = USER_ID
-        await self.bot._handle_office_message(event, USER_ID, SAMPLE)
-        callback = self.callback(b"office:word", client=event.client)
-        await self.bot._handle_office_action(callback, "word")
-        with mock.patch(
-            "gamas_bot.bot.build_plain_docx", side_effect=OfficeError("سند ساخته نشد.")
-        ):
-            job = await self.run_queued_job()
-        row = await self.db.submission(job.submission_id)
-        assert row is not None
-        self.assertEqual(row.status, "failed")
-        self.assertEqual(await self.db.available_seconds(USER_ID), 0)
 
 
 if __name__ == "__main__":

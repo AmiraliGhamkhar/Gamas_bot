@@ -109,6 +109,7 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("RAW_TEXT_PROFILE", "raw_text_profile", "str"),
     ("RAW_FALLBACK_FILE_CHARS", "raw_fallback_file_chars", "int"),
     ("RAW_FALLBACK_MAX_FILES", "raw_fallback_max_files", "int"),
+    ("LIBRARY_MAX_ITEMS", "library_max_items", "int"),
     ("OFFICE_ENABLED", "office_enabled", "bool"),
     ("OFFICE_MAX_INPUT_BYTES", "office_max_input_bytes", "int"),
     ("OFFICE_MAX_CHARS", "office_max_chars", "int"),
