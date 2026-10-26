@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import random
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
+
+from gamas_bot.db import MIGRATIONS_DIR
 
 from gamas_bot.bot import GamasBot, LEARNING_GENERATION_FAILED, LEARNING_NO_CREDIT
 from gamas_bot.db import Database
@@ -556,6 +559,20 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         cards = await self.db.deck_cards(decks[0]["deck_id"])
         self.assertEqual(cards[0]["front"], "پرسش 0")
 
+    async def test_unlimited_user_generates_decks_for_free(self):
+        await self.db.set_unlimited(OWNER, True, admin_id=1, reason="vip")
+        event = self._event(f"fc:go:{self.item_id}".encode())
+        with mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=self._cards_payload(6)),
+        ):
+            await self.bot._handle_callback(event)
+        debits = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
+        )
+        self.assertEqual(debits[0][0], 0)
+        self.assertEqual(len(await self.db.decks_list(OWNER)), 1)
+
     async def test_start_screen_shows_cost_and_size(self):
         event = self._event(f"fc:ai:{self.item_id}".encode())
         await self.bot._handle_callback(event)
@@ -804,6 +821,27 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(refund[0][0], 1)
 
+    async def test_cancellation_refunds_clears_the_in_flight_marker_and_retries(self):
+        with mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(side_effect=asyncio.CancelledError()),
+        ):
+            event = self._event(f"quiz:go:{self.item_id}:5".encode())
+            with self.assertRaises(asyncio.CancelledError):
+                await self.bot._handle_callback(event)
+        # Full refund, no durable session, and the marker is gone so the user
+        # is not permanently locked out of generation.
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
+        self.assertEqual(self.bot._learning_in_flight, set())
+        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=quiz_payload(5)),
+        ):
+            retry = self._event(f"quiz:go:{self.item_id}:5".encode())
+            await self.bot._handle_callback(retry)
+        sessions = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM quiz_sessions")
+        self.assertEqual(sessions[0][0], 1)
+
     async def test_validation_shortfall_refunds(self):
         short = {"questions": quiz_payload(2)["questions"][:2]}
         with mock.patch(
@@ -950,3 +988,155 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
                 for answer, _alert in second.answers
             )
         )
+
+    async def test_quiz_start_rejects_a_transcript_item(self):
+        transcript = await self.db.library_add(
+            OWNER, "transcript", 12, 22, None, title="متن خام"
+        )
+        await self.db.library_set_content(transcript, "حتی با متن")
+        event = self._event(f"quiz:new:{transcript}".encode())
+        await self.bot._handle_callback(event)
+        self.assertEqual(event.answers[-1][1], True)
+        self.assertFalse(event.edits)
+
+    async def test_next_after_quit_shows_the_partial_summary(self):
+        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=quiz_payload(5)),
+        ):
+            await self.bot._handle_callback(
+                self._event(f"quiz:go:{self.item_id}:5".encode())
+            )
+        session_id = (await self.db.db.execute_fetchall(
+            "SELECT session_id FROM quiz_sessions"
+        ))[0][0]
+        question = await self.db.quiz_current_question(session_id)
+        await self.bot._handle_callback(
+            self._event(f"quiz:ans:{session_id}:{question['question_id']}:0".encode())
+        )
+        await self.bot._handle_callback(
+            self._event(f"quiz:quit:{session_id}".encode())
+        )
+        next_event = self._event(f"quiz:next:{session_id}".encode())
+        await self.bot._handle_callback(next_event)
+        self.assertIn("آزمون پایان یافت", next_event.edits[-1]["text"])
+
+
+class LearningMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_011_012_upgrade_a_post_v1_database_and_keep_legacy_defaults(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = Path(tmp.name) / "pre-learning.db"
+        connection = sqlite3.connect(path)
+        try:
+            connection.execute(
+                "CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)"
+            )
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name >= "011_learning_content.sql":
+                    break
+                connection.executescript(migration.read_text(encoding="utf-8"))
+                connection.execute(
+                    "INSERT INTO schema_migrations(name, applied_at) VALUES (?, ?)",
+                    (migration.name, "2026-10-01T00:00:00+00:00"),
+                )
+            connection.execute(
+                "INSERT INTO users(telegram_id, joined_at) VALUES (?, ?)",
+                (313, "2026-10-01T00:00:00+00:00"),
+            )
+            connection.execute(
+                "INSERT INTO library_items(user_id, kind, chat_id, message_id, title, created_at) "
+                "VALUES (313, 'booklet', 10, 20, 'جزوهٔ قدیمی', '2026-10-02T00:00:00+00:00')"
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        upgraded = Database(path)
+        await upgraded.connect()
+        try:
+            for table in (
+                "quiz_sessions", "quiz_questions", "quiz_answers",
+                "flashcard_decks", "flashcards",
+            ):
+                rows = await upgraded.db.execute_fetchall(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+                    (table,),
+                )
+                self.assertEqual(len(rows), 1, table)
+            identity = await upgraded.user_identity(313)
+            self.assertEqual(identity["first_name"], "")
+            legacy = (await upgraded.library_list(313))[0]
+            detail = await upgraded.library_item_detail(313, legacy["item_id"])
+            self.assertIsNone(detail["content_text"])
+            # The upgraded schema is fully usable.
+            await upgraded.set_first_name(313, "نگار")
+            await upgraded.library_set_content(legacy["item_id"], "متن تازه")
+            session_id = await upgraded.quiz_create_session(313, legacy["item_id"], [{
+                "question": "سؤال", "options": ["الف", "ب", "ج", "د"],
+                "correct_index": 1, "explanation": "چرا",
+            }])
+            question = await upgraded.quiz_current_question(session_id)
+            result = await upgraded.quiz_record_answer(
+                session_id, question["question_id"], 1
+            )
+            self.assertTrue(result["correct"])
+        finally:
+            await upgraded.close()
+
+
+class CallbackBudgetTests(unittest.TestCase):
+    def test_every_learning_callback_fits_the_64_byte_budget(self):
+        big = 10**18  # 19-digit ids are the Telegram ceiling
+        samples = [
+            f"quiz:ans:{big}:{big}:3",
+            f"quiz:next:{big}",
+            f"fc:flip:{big}:{big}",
+            f"fc:delok:{big}",
+            f"adm:bgok:{big}:paid_50h_30d",
+            f"lib:it:{big}",
+        ]
+        for sample in samples:
+            self.assertLessEqual(len(sample.encode("ascii")), 64, sample)
+
+
+class GiftCooldownTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(db_path=root / "gift.db", temp_dir=root / "tmp")
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.client = FakeTelegramClient()
+        self.bot.client = self.client
+        self.admin_id = next(iter(self.settings.admin_ids))
+        await self.db.ensure_user(OWNER)
+        await self.db.sync_plans([
+            {"code": "paid_5h_30d", "hours": 5, "price": 50000, "validity_days": 30},
+        ])
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    def _event(self, data: bytes) -> FakeCallbackEvent:
+        event = FakeCallbackEvent(self.client, data=data, chat_id=self.admin_id)
+        event.client = self.client
+        return event
+
+    async def test_a_second_confirm_tap_within_cooldown_grants_nothing_twice(self):
+        first = self._event(f"adm:bgok:{OWNER}:paid_5h_30d".encode())
+        await self.bot._handle_callback(first)
+        self.assertEqual(await self.db.available_seconds(OWNER), 5 * 3600)
+        second = self._event(f"adm:bgok:{OWNER}:paid_5h_30d".encode())
+        await self.bot._handle_callback(second)
+        # The cooldown message replaces the gift; balance is unchanged.
+        self.assertEqual(await self.db.available_seconds(OWNER), 5 * 3600)
+        credits = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE user_id=? AND kind='credit'", (OWNER,)
+        )
+        self.assertEqual(credits[0][0], 1)

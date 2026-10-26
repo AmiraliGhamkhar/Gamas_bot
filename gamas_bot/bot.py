@@ -1449,7 +1449,7 @@ class GamasBot:
 
     async def _quiz_start_screen(self, event, user_id: int, item_id: int) -> None:
         item = await self.db.library_item_detail(user_id, item_id)
-        if item is None:
+        if item is None or item.get("kind") != "booklet":
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
         if not item.get("content_text"):
@@ -1501,79 +1501,91 @@ class GamasBot:
             await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
             return
         self._learning_in_flight.add(user_id)
-        async with self._learning_lock(user_id):
-            try:
-                reason = await self.db.quiz_admission(
-                    user_id,
-                    max_active_hours=self.settings.quiz_max_active_hours,
-                    max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
+        try:
+            async with self._learning_lock(user_id):
+                await self._quiz_generate_locked(
+                    event, user_id, item_id, count, content
                 )
-                if reason == "active":
-                    await event.respond(
-                        "یک آزمون فعال دیگر دارید؛ ابتدا آن را تمام کنید یا "
-                        "دکمهٔ «پایان آزمون» را بزنید."
-                    )
-                    return
-                if reason == "rate":
-                    await event.respond(
-                        "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز "
-                        "رسیده است؛ کمی بعد دوباره تلاش کنید."
-                    )
-                    return
-                cost = count * self.settings.quiz_cost_seconds_per_question
-                note = f"quiz-pending:{item_id}"
+        finally:
+            # Discard even when cancellation strikes while waiting on the lock.
+            self._learning_in_flight.discard(user_id)
+
+    async def _quiz_generate_locked(
+        self,
+        event,
+        user_id: int,
+        item_id: int,
+        count: int,
+        content: str,
+    ) -> None:
+        reason = await self.db.quiz_admission(
+            user_id,
+            max_active_hours=self.settings.quiz_max_active_hours,
+            max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
+        )
+        if reason == "active":
+            await event.respond(
+                "یک آزمون فعال دیگر دارید؛ ابتدا آن را تمام کنید یا "
+                "دکمهٔ «پایان آزمون» را بزنید."
+            )
+            return
+        if reason == "rate":
+            await event.respond(
+                "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز "
+                "رسیده است؛ کمی بعد دوباره تلاش کنید."
+            )
+            return
+        cost = count * self.settings.quiz_cost_seconds_per_question
+        note = f"quiz-pending:{item_id}"
+        try:
+            charged = await self.db.spend_seconds(user_id, cost, note)
+        except InsufficientBalanceError:
+            await event.respond(
+                LEARNING_NO_CREDIT,
+                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+            )
+            return
+        placeholder = await event.respond("در حال ساخت سؤال‌ها… ⏳")
+        session_id: int | None = None
+        try:
+            model_input = bound_content_text(
+                content, limit=MAX_MODEL_INPUT_CHARS
+            )
+            payload = await complete_json(
+                self._http_session(),
+                self.settings,
+                system=quiz_system_prompt(count),
+                user=model_input,
+                schema=QUIZ_SCHEMA,
+            )
+            questions = parse_quiz_payload(payload, count)
+            if len(questions) < MIN_VALID_QUESTIONS:
+                raise RuntimeError("quiz generation yielded too few questions")
+            session_id = await self.db.quiz_create_session(
+                user_id, item_id, questions
+            )
+        except BaseException as exc:
+            # Every failure path after the debit refunds in full: LLM errors,
+            # malformed/short output, DB errors and even cancellation during
+            # shutdown. Unlimited users were never charged (charged=False).
+            if charged:
                 try:
-                    charged = await self.db.spend_seconds(user_id, cost, note)
-                except InsufficientBalanceError:
-                    await event.respond(
-                        LEARNING_NO_CREDIT,
-                        buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+                    await self.db.refund_seconds(user_id, cost, note)
+                except Exception:
+                    logger.exception(
+                        "quiz refund failed user=%s cost=%s", user_id, cost
                     )
-                    return
-                placeholder = await event.respond("در حال ساخت سؤال‌ها… ⏳")
-                session_id: int | None = None
-                try:
-                    model_input = bound_content_text(
-                        content, limit=MAX_MODEL_INPUT_CHARS
-                    )
-                    payload = await complete_json(
-                        self._http_session(),
-                        self.settings,
-                        system=quiz_system_prompt(count),
-                        user=model_input,
-                        schema=QUIZ_SCHEMA,
-                    )
-                    questions = parse_quiz_payload(payload, count)
-                    if len(questions) < MIN_VALID_QUESTIONS:
-                        raise RuntimeError("quiz generation yielded too few questions")
-                    session_id = await self.db.quiz_create_session(
-                        user_id, item_id, questions
-                    )
-                except BaseException as exc:
-                    # Every failure path after the debit refunds in full:
-                    # LLM errors, malformed/short output, DB errors and even
-                    # cancellation during shutdown. Unlimited users were never
-                    # charged, so their refund is skipped.
-                    if charged:
-                        try:
-                            await self.db.refund_seconds(user_id, cost, note)
-                        except Exception:
-                            logger.exception(
-                                "quiz refund failed user=%s cost=%s", user_id, cost
-                            )
-                    try:
-                        await placeholder.edit(LEARNING_GENERATION_FAILED)
-                    except Exception:
-                        logger.warning("could not edit quiz placeholder", exc_info=True)
-                    if isinstance(
-                        exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
-                    ):
-                        raise
-                    logger.warning("quiz generation failed", exc_info=exc)
-                    return
-                await self._render_question_message(placeholder, user_id, session_id)
-            finally:
-                self._learning_in_flight.discard(user_id)
+            try:
+                await placeholder.edit(LEARNING_GENERATION_FAILED)
+            except Exception:
+                logger.warning("could not edit quiz placeholder", exc_info=True)
+            if isinstance(
+                exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+            ):
+                raise
+            logger.warning("quiz generation failed", exc_info=exc)
+            return
+        await self._render_question_message(placeholder, user_id, session_id)
 
     def _question_keyboard(self, session_id: int, question_id: int) -> list[list]:
         option_row = [
@@ -1847,7 +1859,7 @@ class GamasBot:
     async def _admin_gift_execute(
         self, event, admin_id: int, target_id: int, plan_code: str
     ) -> None:
-        if not self._check_admin_cooldown(
+        if not await self._check_admin_cooldown(
             event, "gift", self.ADMIN_COMMAND_COOLDOWN_SECONDS
         ):
             return
@@ -1944,69 +1956,83 @@ class GamasBot:
             await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
             return
         self._learning_in_flight.add(user_id)
-        async with self._learning_lock(user_id):
+        try:
+            async with self._learning_lock(user_id):
+                await self._flashcard_generate_locked(
+                    event, user_id, item_id, content,
+                    self._item_display_title(item),
+                )
+        finally:
+            # Discard even when cancellation strikes while waiting on the lock.
+            self._learning_in_flight.discard(user_id)
+
+    async def _flashcard_generate_locked(
+        self,
+        event,
+        user_id: int,
+        item_id: int,
+        content: str,
+        item_title: str,
+    ) -> None:
+        cost = self.settings.flashcard_ai_cost_seconds
+        size = self.settings.flashcard_ai_deck_size
+        note = f"fc-pending:{item_id}"
+        try:
+            charged = await self.db.spend_seconds(user_id, cost, note)
+        except InsufficientBalanceError:
+            await event.respond(
+                LEARNING_NO_CREDIT,
+                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+            )
+            return
+        placeholder = await event.respond("در حال ساخت فلش‌کارت‌ها… ⏳")
+        try:
+            model_input = bound_content_text(
+                content, limit=MAX_MODEL_INPUT_CHARS
+            )
+            payload = await complete_json(
+                self._http_session(),
+                self.settings,
+                system=flashcard_system_prompt(size),
+                user=model_input,
+                schema=FLASHCARD_SCHEMA,
+            )
+            cards = parse_flashcard_payload(payload, size)
+            if len(cards) < MIN_VALID_CARDS:
+                raise RuntimeError("flashcard generation yielded too few cards")
+            title = item_title + " — فلش‌کارت"
+            deck_id = await self.db.deck_create_with_cards(
+                user_id, item_id, title[:200], cards
+            )
+        except BaseException as exc:
+            if charged:
+                try:
+                    await self.db.refund_seconds(user_id, cost, note)
+                except Exception:
+                    logger.exception(
+                        "flashcard refund failed user=%s cost=%s", user_id, cost
+                    )
             try:
-                cost = self.settings.flashcard_ai_cost_seconds
-                size = self.settings.flashcard_ai_deck_size
-                note = f"fc-pending:{item_id}"
-                try:
-                    charged = await self.db.spend_seconds(user_id, cost, note)
-                except InsufficientBalanceError:
-                    await event.respond(
-                        LEARNING_NO_CREDIT,
-                        buttons=[[Button.inline("💳 حساب من", b"wallet")]],
-                    )
-                    return
-                placeholder = await event.respond("در حال ساخت فلش‌کارت‌ها… ⏳")
-                try:
-                    model_input = bound_content_text(
-                        content, limit=MAX_MODEL_INPUT_CHARS
-                    )
-                    payload = await complete_json(
-                        self._http_session(),
-                        self.settings,
-                        system=flashcard_system_prompt(size),
-                        user=model_input,
-                        schema=FLASHCARD_SCHEMA,
-                    )
-                    cards = parse_flashcard_payload(payload, size)
-                    if len(cards) < MIN_VALID_CARDS:
-                        raise RuntimeError("flashcard generation yielded too few cards")
-                    title = self._item_display_title(item) + " — فلش‌کارت"
-                    deck_id = await self.db.deck_create_with_cards(
-                        user_id, item_id, title[:200], cards
-                    )
-                except BaseException as exc:
-                    if charged:
-                        try:
-                            await self.db.refund_seconds(user_id, cost, note)
-                        except Exception:
-                            logger.exception(
-                                "flashcard refund failed user=%s cost=%s", user_id, cost
-                            )
-                    try:
-                        await placeholder.edit(LEARNING_GENERATION_FAILED)
-                    except Exception:
-                        logger.warning("could not edit flashcard placeholder", exc_info=True)
-                    if isinstance(
-                        exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
-                    ):
-                        raise
-                    logger.warning("flashcard generation failed", exc_info=exc)
-                    return
-                deck = await self.db.deck_get(deck_id, user_id)
-                await placeholder.edit(
-                    f"🃏 مجموعهٔ فلش‌کارت ساخته شد — {title[:200]}",
-                )
-                if deck is None:
-                    await event.respond("مجموعه ساخته شد؛ از «کتابخانه من» بازش کنید.")
-                    return
-                await event.respond(
-                    self._deck_screen_text(deck, len(cards)),
-                    buttons=self._deck_keyboard(deck_id, bool(cards)),
-                )
-            finally:
-                self._learning_in_flight.discard(user_id)
+                await placeholder.edit(LEARNING_GENERATION_FAILED)
+            except Exception:
+                logger.warning("could not edit flashcard placeholder", exc_info=True)
+            if isinstance(
+                exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+            ):
+                raise
+            logger.warning("flashcard generation failed", exc_info=exc)
+            return
+        deck = await self.db.deck_get(deck_id, user_id)
+        await placeholder.edit(
+            f"🃏 مجموعهٔ فلش‌کارت ساخته شد — {title[:200]}",
+        )
+        if deck is None:
+            await event.respond("مجموعه ساخته شد؛ از «کتابخانه من» بازش کنید.")
+            return
+        await event.respond(
+            self._deck_screen_text(deck, len(cards)),
+            buttons=self._deck_keyboard(deck_id, bool(cards)),
+        )
 
     async def _show_flashcard_hub(self, event, *, page: int = 0) -> None:
         user_id = event.sender_id
