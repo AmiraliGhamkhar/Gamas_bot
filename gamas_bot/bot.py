@@ -50,7 +50,6 @@ from .billing import (
 )
 from .config import Settings, format_payment_card, note_routes
 from .db import (
-    QUIZ_POINTS_PER_CORRECT,
     Database,
     InsufficientBalanceError,
     OpenPaymentError,
@@ -58,15 +57,6 @@ from .db import (
     TicketStateError,
     TooManyActiveJobsError,
     utc_now,
-)
-from .learning import (
-    MAX_CARD_BACK_CHARS,
-    MAX_CARD_FRONT_CHARS,
-    LearningContentError,
-    bound_content,
-    deck_document_body,
-    generate_flashcards,
-    generate_quiz,
 )
 from .fileio import (
     AsyncFileReader,
@@ -86,6 +76,22 @@ from .docx_export import (
     resolve_fonts,
 )
 from .jobs import Job, JobQueue, QueueFullError
+from .learning import (
+    FLASHCARD_SCHEMA,
+    MAX_MANUAL_BACK_CHARS,
+    MAX_MANUAL_FRONT_CHARS,
+    MAX_MODEL_INPUT_CHARS,
+    MIN_VALID_CARDS,
+    MIN_VALID_QUESTIONS,
+    OPTION_LABELS,
+    QUIZ_SCHEMA,
+    bound_content_text,
+    flashcard_system_prompt,
+    parse_flashcard_payload,
+    parse_quiz_payload,
+    quiz_system_prompt,
+)
+from .llm import complete_json
 from .logging_config import log_job_id
 from .metrics import METRICS
 from .media import (
@@ -258,6 +264,52 @@ SUPPORT_CATEGORY_BUTTONS = {
     "subscription": "📦 اشتراک و اعتبار",
     "other": "📌 سایر موارد",
 }
+
+# ------------------------------------------------------------- learning loop
+#: Shown on booklets delivered before content archiving existed.
+LEARNING_LEGACY_NOTICE = (
+    "متن این جزوهٔ قدیمی ذخیره نشده است؛ آزمون و فلش‌کارت فقط برای جزوه‌های جدید فعال است."
+)
+#: §6.1 quiz start guidance.
+QUIZ_START_GUIDANCE = (
+    "با این آزمون دانش خود را از این جزوه بسنجید؛ هر پاسخ درست ۱۰ امتیاز دارد. "
+    "ابتدا تعداد سؤال‌ها را انتخاب کنید:"
+)
+#: §6.3 empty leaderboard.
+LEADERBOARD_EMPTY = (
+    "🏆 لیدربورد\n\n"
+    "هنوز امتیازی ثبت نشده است.\n"
+    "اولین آزمون خود را از «📚 کتابخانه من» شروع کنید."
+)
+#: §6.5 no flashcard decks yet.
+FLASHCARD_EMPTY = (
+    "🃏 فلش‌کارت‌ها\n\n"
+    "هنوز مجموعه‌ای نساخته‌اید.\n"
+    "از یک جزوه بسازید یا کارت‌های دستی خودتان را اضافه کنید."
+)
+#: §6.10 the balance denial shared by quiz and AI flashcard generation.
+LEARNING_NO_CREDIT = (
+    "اعتبار شما برای این کار کافی نیست. از «💳 حساب من» می‌توانید اعتبار خریداری کنید."
+)
+#: §6.11 every refunded generation failure.
+LEARNING_GENERATION_FAILED = (
+    "ساخت محتوا ناموفق بود؛ اعتبار شما کامل برگشت داده شد. "
+    "لطفاً کمی بعد دوباره امتحان کنید."
+)
+#: Appended to booklet captions (§6.12); the stored library title stays clean.
+LEARNING_DELIVERY_CTA = (
+    "\n🧪 از همین جزوه آزمون بده یا 🃏 فلش‌کارت بساز: «کتابخانه من»"
+)
+#: Manual flashcard conversation prompts (§6.14).
+FLASHCARD_ASK_FRONT = "پرسش کارت را بفرستید:"
+FLASHCARD_ASK_BACK = "پاسخ کارت را بفرستید:"
+#: Stale learning callbacks (old keyboards, finished sessions, foreign owners).
+LEARNING_STALE_ALERT = "این آزمون دیگر معتبر نیست."
+LEARNING_BUSY_ALERT = "درخواست قبلی شما در حال پردازش است؛ کمی صبر کنید."
+#: Leaderboard display name when a user never exposed a first name.
+LEADERBOARD_FALLBACK_NAME = "کاربر گاماس"
+QUIZ_COUNTS = (5, 10, 15)
+QUIZ_POINTS_PER_ANSWER = 10
 SUPPORT_STATUS_LABELS = {
     "open": "🆕 باز",
     "awaiting_admin": "⏳ در انتظار پاسخ پشتیبانی",
@@ -895,12 +947,15 @@ class GamasBot:
         self._support_admin_states: dict[int, int] = {}
         # admin_id -> payment_id awaiting a rejection reason
         self._pending_reject_reason: dict[int, int] = {}
-        # user_id -> (deck_id, stage, front) while a manual card is being
-        # written. ``stage`` is "front" or "back"; ``front`` holds the
-        # question text until its answer arrives. Disarmed by any
-        # navigation callback exactly like the broadcast prompt, so a
-        # stray later message can never become a flashcard.
-        self._pending_flashcard: dict[int, tuple[int, str, str]] = {}
+        # user_id -> (deck_id, phase) while a manual flashcard conversation is armed
+        self._pending_flashcard: dict[int, tuple[int, str]] = {}
+        # user_id -> front text waiting for its back in the manual-card flow
+        self._pending_flashcard_front: dict[int, str] = {}
+        # Per-user generation guards: a second quiz/deck tap while the LLM is
+        # running must not deduct twice (the DB session row does not exist yet
+        # during generation, so the guard has to live in process memory).
+        self._learning_locks: dict[int, asyncio.Lock] = {}
+        self._learning_in_flight: set[int] = set()
         self._admin_action_times: dict[tuple[int, str], float] = {}
         self._broadcast_running: set[int] = set()
         self._started_at = time.time()
@@ -1213,6 +1268,28 @@ class GamasBot:
     def _is_admin(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.settings.admin_ids
 
+    async def _capture_sender_name(self, event) -> None:
+        """Best-effort leaderboard name capture; a lookup failure is invisible.
+
+        Telethon only guarantees ``sender_id`` on every event; ``sender`` may
+        be uncached and ``get_sender()`` is a network call that can fail. The
+        leaderboard shows first names only and falls back to «کاربر گاماس», so
+        this path must never break message dispatch (and is skipped entirely on
+        test doubles without a sender).
+        """
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        try:
+            sender = getattr(event, "sender", None)
+            if sender is None and hasattr(event, "get_sender"):
+                sender = await event.get_sender()
+            first_name = getattr(sender, "first_name", None)
+            if first_name:
+                await self.db.set_first_name(user_id, first_name)
+        except Exception:
+            logger.debug("could not capture sender name", exc_info=True)
+
     async def _balance_text(self, user_id: int) -> str:
         """The balance as users see it: a special user has no limit to show."""
         if await self.db.is_unlimited(user_id):
@@ -1271,7 +1348,10 @@ class GamasBot:
                 buttons.append(nav)
             buttons.extend(
                 [
-                    *self._library_tabs(),
+                    [
+                        Button.inline("📖 جزوه‌ها", b"library"),
+                        Button.inline("🃏 فلش‌کارت‌ها", b"library:fc"),
+                    ],
                     [Button.inline("💳 حساب من", b"wallet")],
                     [Button.inline("↩️ منوی اصلی", b"menu:main")],
                 ]
@@ -1282,1212 +1362,49 @@ class GamasBot:
             event,
             text,
             [
-                *self._library_tabs(),
+                [
+                    Button.inline("📖 جزوه‌ها", b"library"),
+                    Button.inline("🃏 فلش‌کارت‌ها", b"library:fc"),
+                ],
                 [Button.inline("💳 حساب من", b"wallet")],
                 [Button.inline("↩️ منوی اصلی", b"menu:main")],
             ],
         )
 
-    def _library_tabs(self) -> list[list]:
-        """The library section's two tabs, rendered by every screen inside it.
-
-        The tabs are a row rather than two top-level menu buttons because they
-        are two views of the same investment (artifacts and the decks built
-        from them), not two independent features.
-        """
-        return [
-            [
-                Button.inline("📖 جزوه‌ها", b"library"),
-                Button.inline("🃏 فلش‌کارت‌ها", b"library:fc"),
-            ]
-        ]
-
-    @staticmethod
-    def _library_item_title(item) -> str:
-        """A stored title, or a kind-based fallback for an untitled artifact."""
-        title = " ".join(str(item.get("title") or "").split())
-        if title:
-            return title
-        return "جزوهٔ Word" if item.get("kind") == "booklet" else "متن گفتار"
-
     async def _show_library_item(self, event, item_id: int) -> None:
-        """One artifact's detail screen: re-forward it, or learn from it.
-
-        A legacy row (delivered before text capture existed) keeps only the
-        re-forward action: offering a quiz that cannot be generated would be a
-        dead button, and re-deriving the text would re-run the paid pipeline.
-        """
+        """Booklet/transcript detail: re-download plus learning entry points."""
         user_id = event.sender_id
         if user_id is None:
             return
-        item = await self.db.library_item(user_id, item_id)
+        item = await self.db.library_item_detail(user_id, item_id)
         if item is None:
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
-        lines = [f"📖 {self._library_item_title(item)}"]
+        title = self._item_display_title(item)
         try:
-            created = datetime.fromisoformat(str(item.get("created_at") or ""))
-        except ValueError:
-            created = None
-        if created is not None:
-            lines.append(f"🗓 {jalali_date(created)}")
-        learnable = item.get("kind") == "booklet" and bool(item.get("content_text"))
-        if not learnable:
-            lines.extend(
-                [
-                    "",
-                    "متن این جزوهٔ قدیمی ذخیره نشده است؛ آزمون و فلش‌کارت فقط "
-                    "برای جزوه‌های جدید فعال است.",
-                ]
-            )
-        buttons = [
-            [
-                Button.inline(
-                    "📥 دریافت مجدد",
-                    f"lib:f:{int(item['item_id'])}".encode("ascii"),
-                )
-            ]
+            date_label = jalali_date(datetime.fromisoformat(item["created_at"]))
+        except (TypeError, ValueError):
+            date_label = ""
+        header = f"📖 {title}" + (f"\n📅 {date_label}" if date_label else "")
+        buttons: list[list] = [
+            [Button.inline(
+                "📥 دریافت مجدد", f"lib:f:{item_id}".encode("ascii")
+            )],
         ]
-        if learnable:
-            buttons.append(
-                [
-                    Button.inline(
-                        "🧪 آزمون از این جزوه",
-                        f"quiz:new:{int(item['item_id'])}".encode("ascii"),
-                    )
-                ]
-            )
-            buttons.append(
-                [
-                    Button.inline(
-                        "🃏 فلش‌کارت از این جزوه",
-                        f"fc:ai:{int(item['item_id'])}".encode("ascii"),
-                    )
-                ]
-            )
-        buttons.append([Button.inline("↩️ بازگشت", b"lib:0")])
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
-
-    async def _deliver_screen(self, event, text: str, buttons, target=None) -> None:
-        """Paint a screen, preferring the placeholder this flow already sent.
-
-        Quiz start sends one "building…" message and then keeps editing it, so
-        the chat holds one evolving quiz instead of a new message per step.
-        """
-        if target is not None:
-            await self._edit_message(target, text, buttons)
-            return
-        await self._edit_or_reply(event, text, buttons)
-
-    async def _edit_message(self, message, text: str, buttons=None) -> None:
-        """Edit a message this flow sent, tolerating a concurrent edit."""
-        try:
-            await message.edit(text, buttons=buttons)
-        except MessageNotModifiedError:
-            pass
-        except Exception:
-            logger.warning("could not edit learning screen", exc_info=True)
-
-    async def _show_quiz_start(self, event, item_id: int) -> None:
-        """Pick a question count; the per-question cost is rendered from config."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        item = await self.db.library_item(user_id, item_id)
-        if item is None or not item.get("content_text"):
-            await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            await self._edit_or_reply(
-                event,
-                "متن این جزوهٔ قدیمی ذخیره نشده است؛ آزمون و فلش‌کارت فقط "
-                "برای جزوه‌های جدید فعال است.",
-                [[Button.inline("↩️ بازگشت", b"lib:0")]],
-            )
-            return
-        per_question = self.settings.quiz_cost_seconds_per_question
-        lines = [
-            "🧪 آزمون از جزوه",
-            "",
-            self._library_item_title(item),
-            "",
-            "با این آزمون دانش خود را از این جزوه بسنجید؛ هر پاسخ درست ۱۰ امتیاز "
-            "دارد. ابتدا تعداد سؤال‌ها را انتخاب کنید:",
-        ]
-        buttons = []
-        for count in (5, 10, 15):
-            cost = format_duration(count * per_question)
-            buttons.append(
-                [
-                    Button.inline(
-                        button_label(
-                            f"{to_persian_digits(count)} سؤال — {cost} اعتبار"
-                        ),
-                        f"quiz:go:{int(item_id)}:{count}".encode("ascii"),
-                    )
-                ]
-            )
-        buttons.append(
-            [Button.inline("↩️ بازگشت", f"lib:it:{int(item_id)}".encode("ascii"))]
-        )
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
-
-    async def _start_quiz(self, event, item_id: int, count: int) -> None:
-        """Charge, generate and open a quiz session.
-
-        The charge happens before the provider call and is refunded on every
-        failure path: a provider outage must never cost the user credit, and the
-        user must never receive a quiz that was not paid for either.
-        """
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        if count not in (5, 10, 15):
-            await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            return
-        item = await self.db.library_item(user_id, item_id)
-        if item is None or not item.get("content_text"):
-            await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            return
-        if not self.settings.note_configured:
-            await self._ack(event, "ساخت آزمون در حال حاضر فعال نیست.", alert=True)
-            return
-
-        # Lazy expiry first, so an abandoned quiz cannot block this one.
-        await self.db.quiz_expire_stale(user_id, self.settings.quiz_max_active_hours)
-        active = await self.db.quiz_active_session(user_id)
-        if active is not None:
-            await self._ack(event)
-            await self._show_quiz_question(event, int(active["session_id"]))
-            return
-        cutoff = (utc_now() - timedelta(hours=1)).isoformat(timespec="seconds")
-        recent = await self.db.quiz_sessions_since(user_id, cutoff)
-        if recent >= self.settings.quiz_max_sessions_per_hour:
-            await self._ack(
-                event,
-                "تعداد آزمون‌های شما در این ساعت زیاد است؛ کمی بعد دوباره تلاش کنید.",
-                alert=True,
-            )
-            return
-
-        cost = count * self.settings.quiz_cost_seconds_per_question
-        # A configured cost of zero means free: skip the charge entirely rather
-        # than asking spend_seconds to record a zero debit it rejects.
-        charged = cost > 0 and not await self.db.is_unlimited(user_id)
-        if charged:
-            try:
-                await self.db.spend_seconds(
-                    user_id, cost, note=f"quiz-pending:{int(item_id)}"
-                )
-            except InsufficientBalanceError:
-                await self._edit_or_reply(
-                    event,
-                    "اعتبار شما برای این کار کافی نیست. از «💳 حساب من» می‌توانید "
-                    "اعتبار خریداری کنید.",
-                    [[Button.inline("💳 حساب من", b"wallet")]],
-                )
-                return
-        try:
-            placeholder = await event.respond("در حال ساخت سؤال‌ها… ⏳")
-        except Exception:
-            placeholder = None
-        try:
-            questions = await generate_quiz(
-                self._http_session(),
-                self.settings,
-                str(item["content_text"]),
-                count,
-            )
-        except LearningContentError as exc:
-            logger.warning("quiz generation returned unusable content: %s", exc)
-            await self._refund_quiz(user_id, cost, item_id, charged)
-            await self._quiz_failed(event, item_id, placeholder)
-            return
-        except Exception:
-            logger.warning("quiz generation failed", exc_info=True)
-            await self._refund_quiz(user_id, cost, item_id, charged)
-            await self._quiz_failed(event, item_id, placeholder)
-            return
-        session_id = await self.db.quiz_create_session(user_id, item_id, questions)
-        await self._show_quiz_question(event, session_id, target=placeholder)
-
-    async def _refund_quiz(
-        self, user_id: int, cost: int, item_id: int, charged: bool
-    ) -> None:
-        """Return a failed generation's charge; a refund failure is only logged.
-
-        The refund is best-effort on purpose: the user is already being told the
-        attempt did not work, and a database hiccup on the compensation must not
-        turn that into an exception that skips the notice.
-        """
-        if not charged or cost <= 0:
-            return
-        try:
-            await self.db.refund_seconds(user_id, cost, note=f"quiz:{int(item_id)}")
-        except Exception:
-            logger.error(
-                "quiz refund failed user=%s item=%s seconds=%s",
-                user_id,
-                item_id,
-                cost,
-                exc_info=True,
-            )
-
-    async def _quiz_failed(self, event, item_id: int, placeholder) -> None:
-        """Show the refund notice on the placeholder (or as a fresh message)."""
-        text = (
-            "ساخت محتوا ناموفق بود؛ اعتبار شما کامل برگشت داده شد. "
-            "لطفاً کمی بعد دوباره امتحان کنید."
-        )
-        buttons = [
-            [Button.inline("↩️ بازگشت", f"lib:it:{int(item_id)}".encode("ascii"))]
-        ]
-        if placeholder is not None:
-            await self._edit_message(placeholder, text, buttons)
-            return
-        try:
-            await event.respond(text, buttons=buttons)
-        except Exception:
-            logger.warning("could not send quiz failure notice", exc_info=True)
-
-    async def _show_quiz_question(self, event, session_id: int, *, target=None) -> None:
-        """Render the session's current question, or its summary when done."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        session = await self.db.quiz_get_session(user_id, session_id)
-        if session is None:
-            await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            return
-        if session["status"] != "active":
-            await self._render_quiz_summary(event, session, target=target)
-            return
-        question = await self.db.quiz_current_question(session_id)
-        if question is None:
-            await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            return
-        options = question.get("options") or []
-        lines = [
-            f"🧪 سؤال {to_persian_digits(int(question['idx']) + 1)} از "
-            f"{to_persian_digits(int(question['question_count']))}",
-            "",
-            str(question["question"]),
-        ]
-        buttons = []
-        for index, label in enumerate(("الف", "ب", "ج", "د")):
-            if index >= len(options):
-                break
-            buttons.append(
-                [
-                    Button.inline(
-                        label,
-                        f"quiz:ans:{int(session_id)}:"
-                        f"{int(question['question_id'])}:{index}".encode("ascii"),
-                    )
-                ]
-            )
-        buttons.append(
-            [
-                Button.inline(
-                    "⏹ پایان آزمون", f"quiz:quit:{int(session_id)}".encode("ascii")
-                )
-            ]
-        )
-        await self._deliver_screen(event, "\n".join(lines), buttons, target)
-
-    async def _answer_quiz(
-        self, event, session_id: int, question_id: int, chosen_index: int
-    ) -> None:
-        """Score one answer and reveal the correct option in place."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        result = await self.db.quiz_record_answer(
-            user_id, session_id, question_id, chosen_index
-        )
-        if not result.get("ok"):
-            if result.get("reason") == "already_answered":
-                await self._ack(event, "پاسخ شما ثبت شده بود.")
+        if item["kind"] == "booklet":
+            if item.get("content_text"):
+                buttons.append([Button.inline(
+                    "🧪 آزمون از این جزوه",
+                    f"quiz:new:{item_id}".encode("ascii"),
+                )])
+                buttons.append([Button.inline(
+                    "🃏 فلش‌کارت از این جزوه",
+                    f"fc:ai:{item_id}".encode("ascii"),
+                )])
             else:
-                await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            return
-        question = await self.db.quiz_question(session_id, question_id)
-        if question is None:
-            await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            return
-        options = question.get("options") or []
-        correct_index = int(result["correct_index"])
-        correct_text = (
-            str(options[correct_index]) if 0 <= correct_index < len(options) else ""
-        )
-        lines = [
-            f"🧪 سؤال {to_persian_digits(int(result['index']) + 1)} از "
-            f"{to_persian_digits(int(result['total']))}",
-            "",
-            str(question["question"]),
-            "",
-        ]
-        if result["correct"]:
-            lines.append(f"✅ پاسخ درست: {correct_text}")
-        else:
-            lines.append("❌ پاسخ شما درست نبود.")
-            lines.append(f"✅ پاسخ درست: {correct_text}")
-        explanation = str(result.get("explanation") or "")
-        if explanation:
-            lines.append(f"💡 {explanation}")
-        if result["finished"]:
-            buttons = [
-                [
-                    Button.inline(
-                        "🏁 مشاهدهٔ نتیجه",
-                        f"quiz:next:{int(session_id)}".encode("ascii"),
-                    )
-                ]
-            ]
-        else:
-            buttons = [
-                [
-                    Button.inline(
-                        "سؤال بعدی ➡️",
-                        f"quiz:next:{int(session_id)}".encode("ascii"),
-                    )
-                ]
-            ]
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
-
-    async def _next_quiz_question(self, event, session_id: int) -> None:
-        """Advance to the next question, or show the summary when finished."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        session = await self.db.quiz_get_session(user_id, session_id)
-        if session is None:
-            await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            return
-        await self._show_quiz_question(event, session_id)
-
-    async def _render_quiz_summary(self, event, session, *, target=None) -> None:
-        """The finish screen: score, points and the user's all-time rank."""
-        total = int(session["question_count"])
-        score = int(session["score"])
-        correct = score // QUIZ_POINTS_PER_CORRECT if QUIZ_POINTS_PER_CORRECT else 0
-        rank = await self.db.leaderboard_rank(int(session["user_id"]))
-        text = (
-            "🎉 آزمون تمام شد!\n\n"
-            f"پاسخ‌های درست: {to_persian_digits(min(correct, total))} از "
-            f"{to_persian_digits(total)}\n"
-            f"امتیاز کسب‌شده: {to_persian_digits(score)}\n"
-            f"رتبهٔ شما در لیدربورد: {to_persian_digits(rank)}"
-        )
-        buttons = [
-            [Button.inline("🏆 لیدربورد", b"board")],
-            [Button.inline("📚 کتابخانه من", b"library")],
-            [Button.inline("↩️ منوی اصلی", b"menu:main")],
-        ]
-        await self._deliver_screen(event, text, buttons, target)
-
-    async def _quit_quiz(self, event, session_id: int) -> None:
-        """Close a quiz early; points already earned are never clawed back."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        session = await self.db.quiz_get_session(user_id, session_id)
-        if session is None:
-            await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            return
-        if session["status"] == "active":
-            await self.db.quiz_finish(session_id, "quit")
-            session = await self.db.quiz_get_session(user_id, session_id)
-        if session is None:
-            await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            return
-        await self._render_quiz_summary(event, session)
-
-    async def _show_leaderboard(self, event) -> None:
-        """All-time top 20 plus the requester's own rank.
-
-        Only the captured first name is rendered: a board is public inside the
-        bot, so ids, usernames and full names never reach it.
-        """
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        top = await self.db.leaderboard_top(20)
-        if not top:
-            await self._edit_or_reply(
-                event,
-                "🏆 لیدربورد\n\nهنوز امتیازی ثبت نشده است.\n"
-                "اولین آزمون خود را از «📚 کتابخانه من» شروع کنید.",
-                [[Button.inline("↩️ منوی اصلی", b"menu:main")]],
-            )
-            return
-        medals = {0: "🥇", 1: "🥈", 2: "🥉"}
-        lines = ["🏆 لیدربورد", ""]
-        for index, row in enumerate(top):
-            name = " ".join(str(row["first_name"]).split()) or "کاربر گاماس"
-            badge = medals.get(index, to_persian_digits(index + 1))
-            lines.append(
-                f"{badge} {name} — {to_persian_digits(int(row['quiz_points']))} امتیاز"
-            )
-        rank = await self.db.leaderboard_rank(user_id)
-        points = await self.db.user_points(user_id)
-        lines.extend(
-            [
-                "",
-                f"رتبهٔ شما: {to_persian_digits(rank)} با "
-                f"{to_persian_digits(points)} امتیاز",
-            ]
-        )
-        await self._edit_or_reply(
-            event, "\n".join(lines), [[Button.inline("↩️ منوی اصلی", b"menu:main")]]
-        )
-
-    @staticmethod
-    def _board_name(row) -> str:
-        """The public label for one board row; never an id or a full name."""
-        name = " ".join(str(row.get("first_name") or "").split())
-        return name or "کاربر گاماس"
-
-    async def _show_admin_leaderboard(self, event, *, notice: str = "") -> None:
-        """Admin view of the top five, each with a one-tap gift action."""
-        top = await self.db.leaderboard_top(5)
-        lines = ["🏆 برترین کاربران"]
-        if notice:
-            lines.extend(["", notice])
-        lines.append("")
-        buttons = []
-        if not top:
-            lines.append("هنوز امتیازی ثبت نشده است.")
-        for index, row in enumerate(top):
-            name = self._board_name(row)
-            lines.append(
-                f"{to_persian_digits(index + 1)}. {name} — "
-                f"{to_persian_digits(int(row['quiz_points']))} امتیاز"
-            )
-            buttons.append(
-                [
-                    Button.inline(
-                        button_label(f"🎁 هدیه به {name}"),
-                        f"adm:bg:{int(row['telegram_id'])}".encode("ascii"),
-                    )
-                ]
-            )
-        buttons.append([Button.inline("↩️ پنل مدیریت", b"adm:home")])
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
-
-    async def _gift_target(self, target_id: int):
-        """A gift recipient from the current top five, or ``None``.
-
-        Resolving the target through the board — instead of trusting the id in
-        the callback payload — means a forged or stale ``adm:bg:`` button cannot
-        credit an arbitrary account.
-        """
-        for row in await self.db.leaderboard_top(5):
-            if int(row["telegram_id"]) == int(target_id):
-                return row
-        return None
-
-    async def _show_admin_gift(self, event, target_id: int) -> None:
-        """Choose which plan's credit to gift to one board member."""
-        target = await self._gift_target(target_id)
-        if target is None:
-            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
-            return
-        name = self._board_name(target)
-        plans = [
-            plan
-            for plan in plan_catalog(self.settings.tariff_values())
-            if not plan.is_free
-        ]
-        lines = [f"🎁 هدیه به {name}", ""]
-        buttons = []
-        for plan in plans:
-            credit = format_duration(plan.included_seconds)
-            lines.append(f"• {plan.name} — {credit}")
-            buttons.append(
-                [
-                    Button.inline(
-                        button_label(plan.name),
-                        f"adm:bg:{int(target_id)}:{plan.code}".encode("ascii"),
-                    )
-                ]
-            )
-        if not plans:
-            lines.append("بسته‌ای برای هدیه موجود نیست.")
-        buttons.append([Button.inline("↩️ بازگشت", b"adm:board")])
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
-
-    async def _confirm_admin_gift(
-        self, event, target_id: int, plan_code: str
-    ) -> None:
-        """Ask for confirmation before writing a credit lot and an audit row."""
-        target = await self._gift_target(target_id)
-        plan = next(
-            (
-                candidate
-                for candidate in plan_catalog(self.settings.tariff_values())
-                if candidate.code == plan_code and not candidate.is_free
-            ),
-            None,
-        )
-        if target is None or plan is None:
-            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
-            return
-        text = (
-            f"هدیه به {self._board_name(target)} با اعتبار "
-            f"{format_duration(plan.included_seconds)} ثبت شود؟"
-        )
-        await self._edit_or_reply(
-            event,
-            text,
-            [
-                [
-                    Button.inline(
-                        "✅ تأیید هدیه",
-                        f"adm:bgok:{int(target_id)}:{plan_code}".encode("ascii"),
-                    )
-                ],
-                [
-                    Button.inline(
-                        "↩️ بازگشت",
-                        f"adm:bg:{int(target_id)}".encode("ascii"),
-                    )
-                ],
-            ],
-        )
-
-    async def _apply_admin_gift(
-        self, event, target_id: int, plan_code: str
-    ) -> None:
-        """Write the gift credit, notify the recipient, and re-render the board.
-
-        ``add_credit`` already writes the audit row, so the ledger and the record
-        of who granted what are one atomic act. The notification is best-effort:
-        a recipient who blocked the bot must not turn a recorded gift into an
-        admin-side error.
-        """
-        admin_id = event.sender_id
-        if admin_id is None or not self._is_admin(admin_id):
-            return
-        target = await self._gift_target(target_id)
-        plan = next(
-            (
-                candidate
-                for candidate in plan_catalog(self.settings.tariff_values())
-                if candidate.code == plan_code and not candidate.is_free
-            ),
-            None,
-        )
-        if target is None or plan is None:
-            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
-            return
-        await self.db.add_credit(
-            int(target_id),
-            plan.included_seconds,
-            note="leaderboard gift",
-            admin_id=admin_id,
-        )
-        try:
-            await self.client.send_message(
-                int(target_id),
-                "🎁 تبریک! شما جزو ۵ کاربر برتر گاماس هستید و "
-                f"{format_duration(plan.included_seconds)} اعتبار رایگان "
-                "به حساب شما اضافه شد.",
-            )
-        except Exception:
-            logger.warning(
-                "could not notify gift recipient user=%s", target_id, exc_info=True
-            )
-        await self._ack(event, "هدیه ثبت شد.")
-        await self._show_admin_leaderboard(event, notice="هدیه ثبت شد.")
-
-    async def _show_flashcards(self, event, page: int = 0) -> None:
-        """The flashcard tab: the user's decks, newest first."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        page_size = 6
-        count = await self.db.decks_count(user_id)
-        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
-        decks = await self.db.decks_list(
-            user_id, limit=page_size, offset=page * page_size
-        )
-        lines = ["🃏 فلش‌کارت‌ها"]
-        buttons: list[list] = []
-        if count == 0:
-            lines.extend(
-                [
-                    "",
-                    "هنوز مجموعه‌ای نساخته‌اید.",
-                    "از یک جزوه بسازید یا کارت‌های دستی خودتان را اضافه کنید.",
-                ]
-            )
-        else:
-            lines.extend(["", f"تعداد مجموعه‌ها: {to_persian_digits(count)}"])
-            for deck in decks:
-                cards = to_persian_digits(int(deck["card_count"]))
-                lines.append(f"• {deck['title']} ({cards} کارت)")
-                buttons.append(
-                    [
-                        Button.inline(
-                            button_label(f"🃏 {deck['title']}"),
-                            f"fc:deck:{int(deck['deck_id'])}".encode("ascii"),
-                        )
-                    ]
-                )
-            nav = []
-            if page > 0:
-                nav.append(
-                    Button.inline("◀️ قبلی", f"fc:hub:{page - 1}".encode("ascii"))
-                )
-            if (page + 1) * page_size < count:
-                nav.append(
-                    Button.inline("بعدی ▶️", f"fc:hub:{page + 1}".encode("ascii"))
-                )
-            if nav:
-                buttons.append(nav)
-        buttons.append(
-            [
-                Button.inline("✍️ ساخت دستی", b"fc:man"),
-                Button.inline("🤖 از یک جزوه بساز", b"fc:pick:0"),
-            ]
-        )
-        buttons.extend(self._library_tabs())
-        buttons.append([Button.inline("↩️ منوی اصلی", b"menu:main")])
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
-
-    async def _show_flashcard_picker(self, event, page: int = 0) -> None:
-        """Pick a booklet to generate a deck from (legacy items excluded)."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        page_size = 6
-        count = await self.db.library_content_count(user_id)
-        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
-        items = await self.db.library_items_with_content(
-            user_id, limit=page_size, offset=page * page_size
-        )
-        lines = ["🃏 ساخت فلش‌کارت از جزوه", ""]
-        buttons: list[list] = []
-        if not items:
-            lines.append(
-                "جزوه‌ای با متن ذخیره‌شده ندارید. اول یک فایل درس بفرستید تا "
-                "جزوه‌اش ساخته و ذخیره شود."
-            )
-            buttons.append([Button.inline("↩️ بازگشت", b"library:fc")])
-        else:
-            for item in items:
-                buttons.append(
-                    [
-                        Button.inline(
-                            button_label(
-                                f"📖 {self._library_item_title(item)}"
-                            ),
-                            f"fc:ai:{int(item['item_id'])}".encode("ascii"),
-                        )
-                    ]
-                )
-            nav = []
-            if page > 0:
-                nav.append(
-                    Button.inline("◀️ قبلی", f"fc:pick:{page - 1}".encode("ascii"))
-                )
-            if (page + 1) * page_size < count:
-                nav.append(
-                    Button.inline("بعدی ▶️", f"fc:pick:{page + 1}".encode("ascii"))
-                )
-            if nav:
-                buttons.append(nav)
-            buttons.append([Button.inline("↩️ بازگشت", b"library:fc")])
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
-
-    async def _show_flashcard_ai(self, event, item_id: int) -> None:
-        """The AI deck start screen: what will be built and what it costs."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        item = await self.db.library_item(user_id, item_id)
-        if item is None or not item.get("content_text"):
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            return
-        lines = [
-            f"🃏 فلش‌کارت — {self._library_item_title(item)}",
-            "",
-            "ساخت فلش‌کارت با هوش مصنوعی از این جزوه. مجموعه‌ای از "
-            f"{to_persian_digits(self.settings.flashcard_ai_deck_size)} پرسش و "
-            "پاسخ ساخته می‌شود.",
-            f"هزینه: {format_duration(self.settings.flashcard_ai_cost_seconds)} اعتبار",
-        ]
-        await self._edit_or_reply(
-            event,
-            "\n".join(lines),
-            [
-                [
-                    Button.inline(
-                        "🤖 ساخت فلش‌کارت",
-                        f"fc:go:{int(item_id)}".encode("ascii"),
-                    )
-                ],
-                [
-                    Button.inline(
-                        "↩️ بازگشت", f"lib:it:{int(item_id)}".encode("ascii")
-                    )
-                ],
-            ],
-        )
-
-    async def _start_flashcard_ai(self, event, item_id: int) -> None:
-        """Charge, generate and persist an AI deck for one booklet."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        item = await self.db.library_item(user_id, item_id)
-        if item is None or not item.get("content_text"):
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            return
-        if not self.settings.note_configured:
-            await self._ack(
-                event, "ساخت فلش‌کارت در حال حاضر فعال نیست.", alert=True
-            )
-            return
-        if await self.db.decks_count(user_id) >= self.settings.flashcard_max_decks_per_user:
-            await self._ack(
-                event,
-                "تعداد مجموعه‌های شما به سقف رسیده است؛ ابتدا یک مجموعه را حذف کنید.",
-                alert=True,
-            )
-            return
-        cost = self.settings.flashcard_ai_cost_seconds
-        charged = cost > 0 and not await self.db.is_unlimited(user_id)
-        if charged:
-            try:
-                await self.db.spend_seconds(
-                    user_id, cost, note=f"fc-pending:{int(item_id)}"
-                )
-            except InsufficientBalanceError:
-                await self._edit_or_reply(
-                    event,
-                    "اعتبار شما برای این کار کافی نیست. از «💳 حساب من» می‌توانید "
-                    "اعتبار خریداری کنید.",
-                    [[Button.inline("💳 حساب من", b"wallet")]],
-                )
-                return
-        await self._edit_or_reply(event, "در حال ساخت فلش‌کارت‌ها… ⏳")
-        try:
-            cards = await generate_flashcards(
-                self._http_session(),
-                self.settings,
-                str(item["content_text"]),
-                self.settings.flashcard_ai_deck_size,
-            )
-        except Exception:
-            logger.warning("flashcard generation failed", exc_info=True)
-            if charged and cost > 0:
-                try:
-                    await self.db.refund_seconds(
-                        user_id, cost, note=f"fc:{int(item_id)}"
-                    )
-                except Exception:
-                    logger.error(
-                        "flashcard refund failed user=%s item=%s",
-                        user_id,
-                        item_id,
-                        exc_info=True,
-                    )
-            await self._edit_or_reply(
-                event,
-                "ساخت محتوا ناموفق بود؛ اعتبار شما کامل برگشت داده شد. "
-                "لطفاً کمی بعد دوباره امتحان کنید.",
-                [
-                    [
-                        Button.inline(
-                            "↩️ بازگشت", f"lib:it:{int(item_id)}".encode("ascii")
-                        )
-                    ]
-                ],
-            )
-            return
-        title = f"{self._library_item_title(item)} — فلش‌کارت"
-        deck_id = 0
-        try:
-            deck_id = await self.db.deck_create(
-                user_id, title, source="ai", item_id=int(item_id)
-            )
-            for card in cards:
-                await self.db.deck_add_card(deck_id, card["front"], card["back"])
-        except Exception:
-            # Generation succeeded but the deck could not be stored: the user
-            # has nothing to show for the charge, so it is returned. A partial
-            # deck is removed rather than left as a half-built artifact.
-            logger.error("flashcard persistence failed", exc_info=True)
-            if deck_id:
-                try:
-                    await self.db.deck_delete(user_id, deck_id)
-                except Exception:
-                    logger.warning("could not clean up partial deck", exc_info=True)
-            if charged and cost > 0:
-                try:
-                    await self.db.refund_seconds(
-                        user_id, cost, note=f"fc:{int(item_id)}"
-                    )
-                except Exception:
-                    logger.error("flashcard refund failed", exc_info=True)
-            await self._edit_or_reply(
-                event,
-                "ساخت محتوا ناموفق بود؛ اعتبار شما کامل برگشت داده شد. "
-                "لطفاً کمی بعد دوباره امتحان کنید.",
-                [
-                    [
-                        Button.inline(
-                            "↩️ بازگشت", f"lib:it:{int(item_id)}".encode("ascii")
-                        )
-                    ]
-                ],
-            )
-            return
-        await self._ack(event)
-        await self._show_deck(event, deck_id)
-
-    async def _show_deck(self, event, deck_id: int) -> None:
-        """One deck's screen: study, export or delete it."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        deck = await self.db.deck_get(user_id, deck_id)
-        if deck is None:
-            await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            return
-        total = int(deck["card_count"])
-        lines = [
-            f"🃏 {deck['title']}",
-            "",
-            f"تعداد کارت: {to_persian_digits(total)}",
-        ]
-        buttons: list[list] = []
-        if total:
-            buttons.append(
-                [
-                    Button.inline(
-                        "▶️ مرور فلش‌کارت‌ها",
-                        f"fc:study:{int(deck_id)}".encode("ascii"),
-                    )
-                ]
-            )
-        buttons.append(
-            [
-                Button.inline(
-                    "📄 خروجی Word", f"fc:exp:{int(deck_id)}".encode("ascii")
-                )
-            ]
-        )
-        buttons.append(
-            [
-                Button.inline(
-                    "🗑 حذف دسته", f"fc:del:{int(deck_id)}".encode("ascii")
-                )
-            ]
-        )
-        buttons.append([Button.inline("↩️ بازگشت", b"library:fc")])
-        await self._edit_or_reply(event, "\n".join(lines), buttons)
-
-    async def _study_card(self, event, deck_id: int) -> None:
-        """Show the card at the deck's persisted cursor (front face only)."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        deck = await self.db.deck_get(user_id, deck_id)
-        if deck is None:
-            await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            return
-        total = int(deck["card_count"])
-        if total == 0:
-            await self._ack(event, "این دسته کارتی ندارد.", alert=True)
-            return
-        cursor = min(max(0, int(deck["study_cursor"])), total - 1)
-        card = await self.db.deck_card_at(deck_id, cursor)
-        if card is None:
-            await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            return
-        lines = [
-            f"🃏 {deck['title']}",
-            "",
-            f"کارت {to_persian_digits(cursor + 1)} از {to_persian_digits(total)}",
-            "",
-            "پرسش:",
-            str(card["front"]),
-        ]
-        await self._edit_or_reply(
-            event,
-            "\n".join(lines),
-            [
-                [
-                    Button.inline(
-                        "👁 نمایش پاسخ",
-                        f"fc:flip:{int(deck_id)}:{int(card['card_id'])}".encode(
-                            "ascii"
-                        ),
-                    )
-                ],
-                [
-                    Button.inline(
-                        "⏹ پایان مرور", f"fc:done:{int(deck_id)}".encode("ascii")
-                    )
-                ],
-            ],
-        )
-
-    async def _flip_card(self, event, deck_id: int, card_id: int) -> None:
-        """Reveal the answer of exactly the card the user is looking at."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        deck = await self.db.deck_get(user_id, deck_id)
-        if deck is None:
-            await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            return
-        cards = await self.db.deck_cards(deck_id)
-        position = next(
-            (index for index, card in enumerate(cards) if card["card_id"] == card_id),
-            None,
-        )
-        if position is None:
-            await self._ack(event, "این کارت دیگر معتبر نیست.", alert=True)
-            return
-        card = cards[position]
-        lines = [
-            f"🃏 {deck['title']}",
-            "",
-            f"کارت {to_persian_digits(position + 1)} از {to_persian_digits(len(cards))}",
-            "",
-            "پرسش:",
-            str(card["front"]),
-            "",
-            "پاسخ:",
-            str(card["back"]),
-        ]
-        await self._edit_or_reply(
-            event,
-            "\n".join(lines),
-            [
-                [
-                    Button.inline(
-                        "➡️ کارت بعدی", f"fc:next:{int(deck_id)}".encode("ascii")
-                    )
-                ],
-                [
-                    Button.inline(
-                        "⏹ پایان مرور", f"fc:done:{int(deck_id)}".encode("ascii")
-                    )
-                ],
-            ],
-        )
-
-    async def _next_card(self, event, deck_id: int) -> None:
-        """Advance the persisted cursor or close the study session."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        deck = await self.db.deck_get(user_id, deck_id)
-        if deck is None:
-            await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            return
-        total = int(deck["card_count"])
-        cursor = int(deck["study_cursor"]) + 1
-        if cursor >= total:
-            await self._finish_study(event, deck_id, total)
-            return
-        await self.db.deck_set_cursor(deck_id, cursor)
-        await self._study_card(event, deck_id)
-
-    async def _finish_study(self, event, deck_id: int, total: int) -> None:
-        """The end-of-review screen with a restart action."""
-        text = f"مرور تمام شد — {to_persian_digits(total)} کارت مرور شد."
-        await self._edit_or_reply(
-            event,
-            text,
-            [
-                [
-                    Button.inline(
-                        "🔁 از ابتدا", f"fc:restart:{int(deck_id)}".encode("ascii")
-                    )
-                ],
-                [
-                    Button.inline(
-                        "↩️ بازگشت", f"fc:deck:{int(deck_id)}".encode("ascii")
-                    )
-                ],
-            ],
-        )
-
-    async def _restart_study(self, event, deck_id: int) -> None:
-        """Rewind the cursor and show the first card again."""
-        user_id = event.sender_id
-        deck = await self.db.deck_get(user_id, deck_id) if user_id else None
-        if deck is None:
-            await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            return
-        await self.db.deck_set_cursor(deck_id, 0)
-        await self._study_card(event, deck_id)
-
-    async def _delete_deck(self, event, deck_id: int, *, confirmed: bool) -> None:
-        """Confirm, then delete a deck with its cards."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        deck = await self.db.deck_get(user_id, deck_id)
-        if deck is None:
-            await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            return
-        if not confirmed:
-            await self._edit_or_reply(
-                event,
-                f"🗑 حذف «{deck['title']}»\n\nآیا مطمئنید؟",
-                [
-                    [
-                        Button.inline(
-                            "✅ حذف",
-                            f"fc:delok:{int(deck_id)}".encode("ascii"),
-                        )
-                    ],
-                    [
-                        Button.inline(
-                            "↩️ بازگشت",
-                            f"fc:deck:{int(deck_id)}".encode("ascii"),
-                        )
-                    ],
-                ],
-            )
-            return
-        await self.db.deck_delete(user_id, deck_id)
-        self._pending_flashcard.pop(user_id, None)
-        await self._ack(event, "مجموعه حذف شد.")
-        await self._show_flashcards(event)
-
-    async def _export_deck(self, event, deck_id: int) -> None:
-        """Deliver the deck as an RTL Word document (free of charge)."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        deck = await self.db.deck_get(user_id, deck_id)
-        if deck is None:
-            await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            return
-        cards = await self.db.deck_cards(deck_id)
-        if not cards:
-            await self._ack(event, "این دسته کارتی ندارد.", alert=True)
-            return
-        await self._ack(event)
-        meta = DocumentMeta(
-            reference=f"deck-{int(deck_id)}",
-            source_name=str(deck["title"]),
-            created_at=datetime.now(),
-        )
-        try:
-            docx_bytes = await asyncio.to_thread(
-                build_plain_docx,
-                str(deck["title"]),
-                deck_document_body(cards),
-                fonts=resolve_fonts(),
-                design=resolve_design(),
-                meta=meta,
-            )
-            with tempfile.TemporaryDirectory(
-                prefix="deck-", dir=self.settings.temp_dir
-            ) as workdir:
-                path = Path(workdir) / f"فلش‌کارت - {int(deck_id)}.docx"
-                await run_file_io(path.write_bytes, docx_bytes)
-                caption = f"🃏 فلش‌کارت‌ها — {deck['title']}"
-                await self._send_telegram_file(
-                    event.chat_id or user_id,
-                    path,
-                    caption=caption[:TELEGRAM_CAPTION_LIMIT],
-                    force_document=True,
-                )
-        except Exception:
-            logger.warning(
-                "deck export failed deck=%s", deck_id, exc_info=True
-            )
-            await event.respond("ساخت فایل Word ناموفق بود؛ لطفاً دوباره تلاش کنید.")
-
-    async def _arm_manual_deck(self, event) -> None:
-        """Open (or create once) the manual deck and ask for the first question."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        deck = await self.db.manual_deck(user_id)
-        if deck is None:
-            if (
-                await self.db.decks_count(user_id)
-                >= self.settings.flashcard_max_decks_per_user
-            ):
-                await self._ack(
-                    event,
-                    "تعداد مجموعه‌های شما به سقف رسیده است؛ ابتدا یک مجموعه را حذف کنید.",
-                    alert=True,
-                )
-                return
-            deck_id = await self.db.deck_create(
-                user_id, "فلش‌کارت‌های دستی من", source="manual"
-            )
-        else:
-            deck_id = int(deck["deck_id"])
-        self._pending_flashcard[user_id] = (deck_id, "front", "")
-        await self._edit_or_reply(
-            event,
-            "پرسش کارت را بفرستید:",
-            [[Button.inline("✅ پایان", b"fc:man:done")]],
-        )
-
-    async def _finish_manual(self, event) -> None:
-        """Leave the card-writing loop and show the deck it built."""
-        user_id = event.sender_id
-        if user_id is None:
-            return
-        state = self._pending_flashcard.pop(user_id, None)
-        if state is None:
-            await self._ack(event)
-            await self._show_flashcards(event)
-            return
-        await self._show_deck(event, state[0])
-
-    async def _handle_flashcard_text(self, event, user_id: int, text: str) -> None:
-        """One text message of the manual card loop: question, then answer.
-
-        The state is re-read from the database each time, so a deck deleted from
-        another screen mid-entry ends the loop instead of writing into nothing.
-        """
-        state = self._pending_flashcard.get(user_id)
-        if state is None:
-            return
-        deck_id, stage, front = state
-        if await self.db.deck_get(user_id, deck_id) is None:
-            self._pending_flashcard.pop(user_id, None)
-            await event.reply("این مجموعه دیگر موجود نیست.")
-            return
-        value = " ".join((text or "").split())
-        if not value:
-            await event.reply(
-                "متن خالی پذیرفته نمی‌شود؛ پرسش کارت را دوباره بفرستید."
-                if stage == "front"
-                else "متن خالی پذیرفته نمی‌شود؛ پاسخ کارت را دوباره بفرستید."
-            )
-            return
-        if stage == "front":
-            self._pending_flashcard[user_id] = (
-                deck_id,
-                "back",
-                value[:MAX_CARD_FRONT_CHARS],
-            )
-            await event.reply("پاسخ کارت را بفرستید:")
-            return
-        await self.db.deck_add_card(
-            deck_id, front, value[:MAX_CARD_BACK_CHARS]
-        )
-        cards = await self.db.deck_cards(deck_id)
-        self._pending_flashcard[user_id] = (deck_id, "front", "")
-        await event.reply(
-            f"کارت اضافه شد ({to_persian_digits(len(cards))} کارت). "
-            "پرسش کارت بعدی را بفرستید.",
-            buttons=[[Button.inline("✅ پایان", b"fc:man:done")]],
-        )
+                header += "\n\n" + LEARNING_LEGACY_NOTICE
+        buttons.append([Button.inline("↩️ بازگشت", b"lib:0")])
+        await self._edit(event, header, buttons)
 
     async def _forward_library_item(self, event, user_id: int, item_id: int) -> None:
         """Re-forward one artifact only after an owner-scoped lookup."""
@@ -2511,6 +1428,1023 @@ class GamasBot:
                     "could not mark unavailable library item=%s", item_id, exc_info=True
                 )
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+
+    # --------------------------------------------------------------- learning
+    def _learning_lock(self, user_id: int) -> asyncio.Lock:
+        """The per-user lock serialising quiz/deck generation in this process.
+
+        The instance lock guarantees one bot process, so an in-memory lock is
+        sufficient; the database constraints remain the durable defence.
+        """
+        lock = self._learning_locks.get(user_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._learning_locks[user_id] = lock
+        return lock
+
+    def _learning_back_button(self, item_id: int):
+        return Button.inline(
+            "↩️ بازگشت", f"lib:it:{item_id}".encode("ascii")
+        )
+
+    async def _quiz_start_screen(self, event, user_id: int, item_id: int) -> None:
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None or item.get("kind") != "booklet":
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        if not item.get("content_text"):
+            await self._edit(
+                event,
+                "🧪 آزمون از جزوه\n\n" + LEARNING_LEGACY_NOTICE,
+                [[Button.inline("↩️ بازگشت", b"library")]],
+            )
+            return
+        per_question = self.settings.quiz_cost_seconds_per_question
+        buttons: list[list] = []
+        for count in QUIZ_COUNTS:
+            label = button_label(
+                f"{to_persian_digits(count)} سؤال — "
+                f"{format_duration(count * per_question)} اعتبار"
+            )
+            buttons.append([
+                Button.inline(
+                    label, f"quiz:go:{item_id}:{count}".encode("ascii")
+                )
+            ])
+        buttons.append([self._learning_back_button(item_id)])
+        await self._edit(
+            event, "🧪 آزمون از جزوه\n\n" + QUIZ_START_GUIDANCE, buttons
+        )
+
+    async def _quiz_generate(
+        self, event, user_id: int, item_id: int, count: int
+    ) -> None:
+        if count not in QUIZ_COUNTS:
+            await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)
+            return
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None or item.get("kind") != "booklet":
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        content = item.get("content_text")
+        if not content:
+            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
+            return
+        if not self.settings.note_configured:
+            await event.respond("سرویس ساخت آزمون در حال حاضر فعال نیست.")
+            return
+        # Synchronous gate: no await between the membership test and the add,
+        # so two queued callbacks can never both pass before generation ends.
+        if user_id in self._learning_in_flight:
+            # Second tap while the first generation is still charging/awaiting
+            # the model: reject before any second debit.
+            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
+            return
+        self._learning_in_flight.add(user_id)
+        try:
+            async with self._learning_lock(user_id):
+                await self._quiz_generate_locked(
+                    event, user_id, item_id, count, content
+                )
+        finally:
+            # Discard even when cancellation strikes while waiting on the lock.
+            self._learning_in_flight.discard(user_id)
+
+    async def _quiz_generate_locked(
+        self,
+        event,
+        user_id: int,
+        item_id: int,
+        count: int,
+        content: str,
+    ) -> None:
+        reason = await self.db.quiz_admission(
+            user_id,
+            max_active_hours=self.settings.quiz_max_active_hours,
+            max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
+        )
+        if reason == "active":
+            await event.respond(
+                "یک آزمون فعال دیگر دارید؛ ابتدا آن را تمام کنید یا "
+                "دکمهٔ «پایان آزمون» را بزنید."
+            )
+            return
+        if reason == "rate":
+            await event.respond(
+                "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز "
+                "رسیده است؛ کمی بعد دوباره تلاش کنید."
+            )
+            return
+        cost = count * self.settings.quiz_cost_seconds_per_question
+        note = f"quiz-pending:{item_id}"
+        try:
+            charged = await self.db.spend_seconds(user_id, cost, note)
+        except InsufficientBalanceError:
+            await event.respond(
+                LEARNING_NO_CREDIT,
+                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+            )
+            return
+        placeholder = await event.respond("در حال ساخت سؤال‌ها… ⏳")
+        session_id: int | None = None
+        try:
+            model_input = bound_content_text(
+                content, limit=MAX_MODEL_INPUT_CHARS
+            )
+            payload = await complete_json(
+                self._http_session(),
+                self.settings,
+                system=quiz_system_prompt(count),
+                user=model_input,
+                schema=QUIZ_SCHEMA,
+            )
+            questions = parse_quiz_payload(payload, count)
+            if len(questions) < MIN_VALID_QUESTIONS:
+                raise RuntimeError("quiz generation yielded too few questions")
+            session_id = await self.db.quiz_create_session(
+                user_id, item_id, questions
+            )
+        except BaseException as exc:
+            # Every failure path after the debit refunds in full: LLM errors,
+            # malformed/short output, DB errors and even cancellation during
+            # shutdown. Unlimited users were never charged (charged=False).
+            if charged:
+                try:
+                    await self.db.refund_seconds(user_id, cost, note)
+                except Exception:
+                    logger.exception(
+                        "quiz refund failed user=%s cost=%s", user_id, cost
+                    )
+            try:
+                await placeholder.edit(LEARNING_GENERATION_FAILED)
+            except Exception:
+                logger.warning("could not edit quiz placeholder", exc_info=True)
+            if isinstance(
+                exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+            ):
+                raise
+            logger.warning("quiz generation failed", exc_info=exc)
+            return
+        await self._render_question_message(placeholder, user_id, session_id)
+
+    def _question_keyboard(self, session_id: int, question_id: int) -> list[list]:
+        option_row = [
+            Button.inline(
+                OPTION_LABELS[index],
+                f"quiz:ans:{session_id}:{question_id}:{index}".encode("ascii"),
+            )
+            for index in range(4)
+        ]
+        return [
+            option_row,
+            [Button.inline(
+                "⏹ پایان آزمون", f"quiz:quit:{session_id}".encode("ascii")
+            )],
+        ]
+
+    async def _render_question_message(
+        self, message, user_id: int, session_id: int
+    ) -> None:
+        """Render the current question into an editable Message-like object."""
+        question = await self.db.quiz_current_question(session_id)
+        if question is None:
+            await self._finish_after_question(message, user_id, session_id)
+            return
+        number = int(question["idx"]) + 1
+        lines = [
+            f"سؤال {to_persian_digits(number)} از "
+            f"{to_persian_digits(question['question_count'])}",
+            "",
+            str(question["question"]),
+            "",
+        ]
+        for index, option in enumerate(question["options"]):
+            lines.append(f"{OPTION_LABELS[index]}) {option}")
+        await message.edit(
+            "\n".join(lines),
+            buttons=self._question_keyboard(session_id, int(question["question_id"])),
+        )
+
+    async def _finish_after_question(
+        self, message, user_id: int, session_id: int
+    ) -> None:
+        session = await self.db.quiz_get_session(session_id, user_id)
+        if session is None:
+            await message.edit(LEARNING_STALE_ALERT)
+            return
+        await self._show_finish_screen(message, user_id, session)
+
+    async def _show_finish_screen(self, message, user_id: int, session) -> None:
+        """The §6.2 celebration screen for a quiz answered to its last question."""
+        rank = await self.db.leaderboard_rank(user_id)
+        correct = int(session["score"]) // QUIZ_POINTS_PER_ANSWER
+        text = (
+            "🎉 آزمون تمام شد!\n\n"
+            f"پاسخ‌های درست: {to_persian_digits(correct)} از "
+            f"{to_persian_digits(session['question_count'])}\n"
+            f"امتیاز کسب‌شده: {to_persian_digits(session['score'])}\n"
+            "رتبهٔ شما در لیدربورد: "
+            f"{to_persian_digits(rank['rank'])}"
+        )
+        await message.edit(text, buttons=self._learning_done_buttons())
+
+    def _learning_done_buttons(self) -> list[list]:
+        return [
+            [Button.inline("🏆 لیدربورد", b"board")],
+            [Button.inline("📚 کتابخانه من", b"library")],
+            [Button.inline("↩️ منوی اصلی", b"menu:main")],
+        ]
+
+    async def _quiz_answer(
+        self,
+        event,
+        user_id: int,
+        session_id: int,
+        question_id: int,
+        option: int,
+    ) -> None:
+        session = await self.db.quiz_get_session(session_id, user_id)
+        if session is None:
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+            return
+        result = await self.db.quiz_record_answer(session_id, question_id, option)
+        if result["status"] == "stale":
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+            return
+        if result["status"] == "already":
+            # Friendly re-ack on a double tap: no second answer row, no points.
+            await self._ack(event, "پاسخ شما ثبت شده بود.")
+            return
+        correct_text = result["options"][result["correct_index"]]
+        if result["correct"]:
+            lines = [f"✅ پاسخ درست: {correct_text}"]
+        else:
+            lines = [
+                "❌ پاسخ شما درست نبود.",
+                f"✅ پاسخ درست: {correct_text}",
+            ]
+        if result["explanation"]:
+            lines.append(f"💡 {result['explanation']}")
+        next_label = (
+            "مشاهدهٔ نتیجه ➡️" if result["finished"] else "سؤال بعدی ➡️"
+        )
+        await self._edit(
+            event,
+            "\n".join(lines),
+            [[Button.inline(
+                next_label, f"quiz:next:{session_id}".encode("ascii")
+            )]],
+        )
+
+    async def _quiz_next(self, event, user_id: int, session_id: int) -> None:
+        session = await self.db.quiz_get_session(session_id, user_id)
+        if session is None:
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+            return
+        if session["status"] == "done":
+            await self._show_finish_screen(event, user_id, session)
+            return
+        if session["status"] != "active":
+            # quit/expired: the partial summary, points already earned stay.
+            await self._show_quiz_summary(event, user_id, session)
+            return
+        await self._render_question_message(event, user_id, session_id)
+
+    async def _quiz_quit(self, event, user_id: int, session_id: int) -> None:
+        session = await self.db.quiz_get_session(session_id, user_id)
+        if session is None:
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+            return
+        if session["status"] == "active":
+            await self.db.quiz_finish(session_id, "quit")
+            session = await self.db.quiz_get_session(session_id, user_id)
+        await self._show_quiz_summary(event, user_id, session)
+
+    async def _show_quiz_summary(self, event, user_id: int, session) -> None:
+        """Partial (quit) or terminal summary; earned points are never clawed back."""
+        answered = min(int(session["current_index"]), int(session["question_count"]))
+        correct = int(session["score"]) // QUIZ_POINTS_PER_ANSWER
+        rank = await self.db.leaderboard_rank(user_id)
+        text = (
+            "⏹ آزمون پایان یافت.\n\n"
+            f"پاسخ‌های درست: {to_persian_digits(correct)} از "
+            f"{to_persian_digits(answered)}\n"
+            f"امتیاز کسب‌شده: {to_persian_digits(session['score'])}\n"
+            f"رتبهٔ شما در لیدربورد: {to_persian_digits(rank['rank'])}"
+        )
+        await self._edit(event, text, self._learning_done_buttons())
+
+    # -------------------------------------------------------------- leaderboard
+    async def _show_leaderboard(self, event) -> None:
+        """All-time top 20 with the caller's own rank always visible."""
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        rows = await self.db.leaderboard_top(20)
+        if not rows:
+            await self._edit_or_reply(event, LEADERBOARD_EMPTY, [
+                [Button.inline("↩️ منوی اصلی", b"menu:main")],
+            ])
+            return
+        medals = ("🥇", "🥈", "🥉")
+        lines = ["🏆 لیدربورد", ""]
+        for index, row in enumerate(rows):
+            rank_label = medals[index] if index < 3 else to_persian_digits(index + 1)
+            name = row["first_name"] or LEADERBOARD_FALLBACK_NAME
+            lines.append(
+                f"{rank_label} {name} — "
+                f"{to_persian_digits(row['quiz_points'])} امتیاز"
+            )
+        rank = await self.db.leaderboard_rank(user_id)
+        lines.append("")
+        lines.append(
+            f"رتبهٔ شما: {to_persian_digits(rank['rank'])} با "
+            f"{to_persian_digits(rank['points'])} امتیاز"
+        )
+        await self._edit_or_reply(event, "\n".join(lines), [
+            [Button.inline("↩️ منوی اصلی", b"menu:main")],
+        ])
+
+    async def _admin_board(self, event, *, notice: str = "") -> None:
+        """Top 5 earners with one-tap free-credit gift entry points."""
+        rows = await self.db.leaderboard_admin_top(5)
+        lines = ["🏆 برترین کاربران", ""]
+        buttons: list[list] = []
+        if not rows:
+            lines.append("هنوز کاربری امتیازی کسب نکرده است.")
+        for index, row in enumerate(rows):
+            name = row["first_name"] or LEADERBOARD_FALLBACK_NAME
+            lines.append(
+                f"{to_persian_digits(index + 1)}. {name} — "
+                f"{to_persian_digits(row['quiz_points'])} امتیاز"
+            )
+            buttons.append([
+                Button.inline(
+                    button_label(
+                        f"{to_persian_digits(index + 1)}. {name} — "
+                        f"{to_persian_digits(row['quiz_points'])} امتیاز"
+                    ),
+                    b"adm:board",
+                ),
+                Button.inline(
+                    "🎁 هدیه",
+                    f"adm:bg:{row['telegram_id']}".encode("ascii"),
+                ),
+            ])
+        if notice:
+            lines.extend(["", notice])
+        buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
+        await self._edit(event, "\n".join(lines), buttons)
+
+    async def _admin_gift_pick(self, event, target_id: int) -> None:
+        """Choose which paid plan's credit to gift (free plan is not offered)."""
+        identity = await self.db.user_identity(target_id)
+        if identity is None or identity["banned"]:
+            await self._ack(event, "این کاربر در دسترس نیست.", alert=True)
+            return
+        plans = [plan for plan in await self.db.plans() if plan["price"] > 0]
+        lines = [
+            "🎁 هدیه به کاربر",
+            f"کاربر: {identity['first_name'] or LEADERBOARD_FALLBACK_NAME}",
+            "",
+            "یکی از بسته‌های اعتباری را انتخاب کنید:",
+        ]
+        buttons: list[list] = []
+        for plan in plans:
+            hours = float(plan["hours"])
+            hours_text = to_persian_digits(
+                int(hours) if hours.is_integer() else str(hours)
+            )
+            buttons.append([
+                Button.inline(
+                    button_label(f"{hours_text} ساعت — {format_duration(int(round(hours * 3600)))}"),
+                    f"adm:bg:{target_id}:{plan['code']}".encode("utf-8"),
+                )
+            ])
+        buttons.append([Button.inline("↩️ بازگشت", b"adm:board")])
+        await self._edit(event, "\n".join(lines), buttons)
+
+    async def _admin_gift_confirm(
+        self, event, target_id: int, plan_code: str
+    ) -> None:
+        plan = await self._gift_plan(target_id, plan_code)
+        identity = await self.db.user_identity(target_id)
+        if plan is None or identity is None or identity["banned"]:
+            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
+            return
+        name = identity["first_name"] or LEADERBOARD_FALLBACK_NAME
+        seconds = int(round(float(plan["hours"]) * 3600))
+        text = (
+            "هدیه به "
+            f"{name} با اعتبار {format_duration(seconds)} ثبت شود؟"
+        )
+        await self._edit(event, text, [
+            [Button.inline(
+                "✅ تأیید هدیه",
+                f"adm:bgok:{target_id}:{plan_code}".encode("utf-8"),
+            )],
+            [Button.inline("↩️ بازگشت", f"adm:bg:{target_id}".encode("utf-8"))],
+        ])
+
+    async def _gift_plan(self, target_id: int, plan_code: str) -> dict | None:
+        """Validate a gift target/plan pair exactly as execution will see it."""
+        identity = await self.db.user_identity(target_id)
+        if identity is None or identity["banned"]:
+            return None
+        for plan in await self.db.plans():
+            if plan["code"] == plan_code and plan["price"] > 0:
+                return plan
+        return None
+
+    async def _admin_gift_execute(
+        self, event, admin_id: int, target_id: int, plan_code: str
+    ) -> None:
+        if not await self._check_admin_cooldown(
+            event, "gift", self.ADMIN_COMMAND_COOLDOWN_SECONDS
+        ):
+            return
+        plan = await self._gift_plan(target_id, plan_code)
+        if plan is None:
+            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
+            return
+        # Separation of duties, matching /grant: an admin cannot mint credit
+        # for a peer through the leaderboard either.
+        if self._is_admin(target_id):
+            await event.respond(
+                "برای حفظ تفکیک دسترسی‌ها، امکان افزودن اعتبار به حساب مدیر دیگر وجود ندارد."
+            )
+            return
+        seconds = int(round(float(plan["hours"]) * 3600))
+        await self.db.add_credit(
+            target_id,
+            seconds,
+            note="leaderboard gift",
+            validity_days=None,
+            admin_id=admin_id,
+        )
+        message = (
+            "🎁 تبریک! شما جزو ۵ کاربر برتر گاماس هستید و "
+            f"{format_duration(seconds)} اعتبار رایگان به حساب شما اضافه شد."
+        )
+        try:
+            await self.client.send_message(target_id, message)
+        except Exception:
+            logger.warning("gift DM failed user=%s", target_id, exc_info=True)
+        await self._admin_board(event, notice="✅ هدیه ثبت شد.")
+
+    # --------------------------------------------------------------- flashcards
+    @staticmethod
+    def _deck_stale_alert() -> str:
+        return "این فلش‌کارت دیگر معتبر نیست."
+
+    def _item_display_title(self, item: dict) -> str:
+        """A clean one-line title for learning screens and generated decks."""
+        raw = " ".join(str(item.get("title") or "").split())
+        if not raw:
+            return "جزوهٔ Word" if item.get("kind") == "booklet" else "متن گفتار"
+        return raw
+
+    async def _flashcard_start_screen(
+        self, event, user_id: int, item_id: int
+    ) -> None:
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None or item.get("kind") != "booklet":
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        if not item.get("content_text"):
+            await self._edit(
+                event,
+                "🃏 فلش‌کارت\n\n" + LEARNING_LEGACY_NOTICE,
+                [[Button.inline("↩️ بازگشت", b"library")]],
+            )
+            return
+        size = self.settings.flashcard_ai_deck_size
+        cost = self.settings.flashcard_ai_cost_seconds
+        text = (
+            "ساخت فلش‌کارت با هوش مصنوعی از این جزوه. مجموعه‌ای از "
+            f"{to_persian_digits(size)} پرسش و پاسخ ساخته می‌شود.\n"
+            f"هزینه: {format_duration(cost)} اعتبار"
+        )
+        await self._edit(event, text, [
+            [Button.inline(
+                "🤖 ساخت فلش‌کارت", f"fc:go:{item_id}".encode("ascii")
+            )],
+            [self._learning_back_button(item_id)],
+        ])
+
+    async def _flashcard_generate(
+        self, event, user_id: int, item_id: int
+    ) -> None:
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None or item.get("kind") != "booklet":
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        content = item.get("content_text")
+        if not content:
+            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
+            return
+        if not self.settings.note_configured:
+            await event.respond("سرویس ساخت فلش‌کارت در حال حاضر فعال نیست.")
+            return
+        if await self.db.deck_count(user_id) >= self.settings.flashcard_max_decks_per_user:
+            await event.respond(
+                "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ برای ساخت مجموعهٔ جدید "
+                "یک مجموعهٔ قدیمی را حذف کنید."
+            )
+            return
+        if user_id in self._learning_in_flight:
+            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
+            return
+        self._learning_in_flight.add(user_id)
+        try:
+            async with self._learning_lock(user_id):
+                await self._flashcard_generate_locked(
+                    event, user_id, item_id, content,
+                    self._item_display_title(item),
+                )
+        finally:
+            # Discard even when cancellation strikes while waiting on the lock.
+            self._learning_in_flight.discard(user_id)
+
+    async def _flashcard_generate_locked(
+        self,
+        event,
+        user_id: int,
+        item_id: int,
+        content: str,
+        item_title: str,
+    ) -> None:
+        cost = self.settings.flashcard_ai_cost_seconds
+        size = self.settings.flashcard_ai_deck_size
+        note = f"fc-pending:{item_id}"
+        try:
+            charged = await self.db.spend_seconds(user_id, cost, note)
+        except InsufficientBalanceError:
+            await event.respond(
+                LEARNING_NO_CREDIT,
+                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+            )
+            return
+        placeholder = await event.respond("در حال ساخت فلش‌کارت‌ها… ⏳")
+        try:
+            model_input = bound_content_text(
+                content, limit=MAX_MODEL_INPUT_CHARS
+            )
+            payload = await complete_json(
+                self._http_session(),
+                self.settings,
+                system=flashcard_system_prompt(size),
+                user=model_input,
+                schema=FLASHCARD_SCHEMA,
+            )
+            cards = parse_flashcard_payload(payload, size)
+            if len(cards) < MIN_VALID_CARDS:
+                raise RuntimeError("flashcard generation yielded too few cards")
+            title = item_title + " — فلش‌کارت"
+            deck_id = await self.db.deck_create_with_cards(
+                user_id, item_id, title[:200], cards
+            )
+        except BaseException as exc:
+            if charged:
+                try:
+                    await self.db.refund_seconds(user_id, cost, note)
+                except Exception:
+                    logger.exception(
+                        "flashcard refund failed user=%s cost=%s", user_id, cost
+                    )
+            try:
+                await placeholder.edit(LEARNING_GENERATION_FAILED)
+            except Exception:
+                logger.warning("could not edit flashcard placeholder", exc_info=True)
+            if isinstance(
+                exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+            ):
+                raise
+            logger.warning("flashcard generation failed", exc_info=exc)
+            return
+        deck = await self.db.deck_get(deck_id, user_id)
+        await placeholder.edit(
+            f"🃏 مجموعهٔ فلش‌کارت ساخته شد — {title[:200]}",
+        )
+        if deck is None:
+            await event.respond("مجموعه ساخته شد؛ از «کتابخانه من» بازش کنید.")
+            return
+        await event.respond(
+            self._deck_screen_text(deck, len(cards)),
+            buttons=self._deck_keyboard(deck_id, bool(cards)),
+        )
+
+    async def _show_flashcard_hub(self, event, *, page: int = 0) -> None:
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        page_size = 6
+        count = await self.db.deck_count(user_id)
+        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
+        decks = await self.db.decks_list(
+            user_id, limit=page_size, offset=page * page_size
+        )
+        if count == 0:
+            text = FLASHCARD_EMPTY
+            buttons: list[list] = []
+        else:
+            text = (
+                "🃏 فلش‌کارت‌ها\n\n"
+                f"تعداد مجموعه‌ها: {to_persian_digits(count)}"
+            )
+            buttons = []
+            for deck in decks:
+                label = button_label(
+                    f"{deck['title']} ({to_persian_digits(deck['card_count'])} کارت)"
+                )
+                buttons.append([
+                    Button.inline(
+                        label, f"fc:deck:{deck['deck_id']}".encode("ascii")
+                    )
+                ])
+            nav = []
+            if page > 0:
+                nav.append(Button.inline(
+                    "◀️ قبلی", f"fc:hub:{page - 1}".encode("ascii")
+                ))
+            if (page + 1) * page_size < count:
+                nav.append(Button.inline(
+                    "بعدی ▶️", f"fc:hub:{page + 1}".encode("ascii")
+                ))
+            if nav:
+                buttons.append(nav)
+        buttons.extend([
+            [Button.inline("✍️ ساخت دستی", b"fc:man")],
+            [Button.inline("🤖 از یک جزوه بساز", b"fc:pick:0")],
+            [
+                Button.inline("📖 جزوه‌ها", b"library"),
+                Button.inline("↩️ منوی اصلی", b"menu:main"),
+            ],
+        ])
+        await self._edit_or_reply(event, text, buttons)
+
+    async def _show_booklet_picker(self, event, *, page: int = 0) -> None:
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        page_size = 6
+        count = await self.db.library_count_kind(user_id, "booklet")
+        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
+        items = await self.db.library_list_kind(
+            user_id, "booklet", limit=page_size, offset=page * page_size
+        )
+        buttons: list[list] = []
+        if not items:
+            text = (
+                "🤖 ساخت فلش‌کارت از جزوه\n\n"
+                "هنوز جزوه‌ای در کتابخانهٔ شما ذخیره نشده است."
+            )
+        else:
+            text = "یک جزوه را برای ساخت فلش‌کارت انتخاب کنید:"
+            for item in items:
+                title = self._item_display_title(item)
+                buttons.append([
+                    Button.inline(
+                        button_label(f"📖 {title}"),
+                        f"fc:ai:{item['item_id']}".encode("ascii"),
+                    )
+                ])
+            nav = []
+            if page > 0:
+                nav.append(Button.inline(
+                    "◀️ قبلی", f"fc:pick:{page - 1}".encode("ascii")
+                ))
+            if (page + 1) * page_size < count:
+                nav.append(Button.inline(
+                    "بعدی ▶️", f"fc:pick:{page + 1}".encode("ascii")
+                ))
+            if nav:
+                buttons.append(nav)
+        buttons.append([Button.inline("↩️ بازگشت", b"fc:hub")])
+        await self._edit(event, text, buttons)
+
+    async def _start_manual_deck(self, event, user_id: int) -> None:
+        if await self.db.deck_count(user_id) >= self.settings.flashcard_max_decks_per_user:
+            await event.respond(
+                "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ یک مجموعهٔ قدیمی را حذف کنید."
+            )
+            return
+        deck_id = await self.db.manual_deck_get_or_create(user_id)
+        self._pending_flashcard[user_id] = (deck_id, "front")
+        self._pending_flashcard_front.pop(user_id, None)
+        await event.respond(
+            FLASHCARD_ASK_FRONT,
+            buttons=[[Button.inline("✅ پایان", b"fc:man:done")]],
+        )
+
+    async def _handle_flashcard_text(self, event, user_id: int, text: str) -> None:
+        """One step of the guided manual-card conversation (armed by fc:man)."""
+        deck_id, phase = self._pending_flashcard[user_id]
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
+            await event.reply("این مجموعه دیگر در دسترس نیست.")
+            return
+        end_button = [[Button.inline("✅ پایان", b"fc:man:done")]]
+        if not text:
+            await event.reply("لطفاً متن را در یک پیام متنی بفرستید.")
+            return
+        if phase == "front":
+            self._pending_flashcard_front[user_id] = text[:MAX_MANUAL_FRONT_CHARS]
+            self._pending_flashcard[user_id] = (deck_id, "back")
+            await event.reply(FLASHCARD_ASK_BACK, buttons=end_button)
+            return
+        front = self._pending_flashcard_front.pop(user_id, "")
+        if not front:
+            # Defensive: a stale back-phase with no stored front restarts cleanly.
+            self._pending_flashcard[user_id] = (deck_id, "front")
+            await event.reply(FLASHCARD_ASK_FRONT, buttons=end_button)
+            return
+        count = await self.db.deck_add_card(
+            deck_id, front, text[:MAX_MANUAL_BACK_CHARS]
+        )
+        self._pending_flashcard[user_id] = (deck_id, "front")
+        await event.reply(
+            f"کارت اضافه شد ({to_persian_digits(count)} کارت). "
+            "پرسش کارت بعدی را بفرستید.",
+            buttons=end_button,
+        )
+
+    def _deck_screen_text(self, deck: dict, card_count: int) -> str:
+        return (
+            f"🃏 {deck['title']}\n\n"
+            f"تعداد کارت‌ها: {to_persian_digits(card_count)}"
+        )
+
+    def _deck_keyboard(self, deck_id: int, has_cards: bool) -> list[list]:
+        buttons: list[list] = []
+        if has_cards:
+            buttons.append([Button.inline(
+                "▶️ مرور فلش‌کارت‌ها", f"fc:study:{deck_id}".encode("ascii")
+            )])
+        buttons.append([Button.inline(
+            "📄 خروجی Word", f"fc:exp:{deck_id}".encode("ascii")
+        )])
+        buttons.append([Button.inline(
+            "🗑 حذف دسته", f"fc:del:{deck_id}".encode("ascii")
+        )])
+        buttons.append([Button.inline("↩️ بازگشت", b"fc:hub")])
+        return buttons
+
+    async def _show_deck_screen(self, event, user_id: int, deck_id: int) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        cards = await self.db.deck_cards(deck_id)
+        await self._edit(
+            event,
+            self._deck_screen_text(deck, len(cards)),
+            self._deck_keyboard(deck_id, bool(cards)),
+        )
+
+    async def _study_front(
+        self, event, user_id: int, deck_id: int, *, restart: bool = False
+    ) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        cards = await self.db.deck_cards(deck_id)
+        if not cards:
+            await self._ack(event, "این مجموعه هنوز کارتی ندارد.", alert=True)
+            return
+        cursor = 0 if restart else min(int(deck["study_cursor"]), len(cards) - 1)
+        if restart:
+            await self.db.deck_set_cursor(deck_id, 0)
+        card = cards[cursor]
+        await self._edit(event, "پرسش:\n\n" + card["front"], [
+            [Button.inline(
+                "👁 نمایش پاسخ",
+                f"fc:flip:{deck_id}:{card['card_id']}".encode("ascii"),
+            )],
+            [Button.inline(
+                "⏹ پایان مرور", f"fc:done:{deck_id}".encode("ascii")
+            )],
+        ])
+
+    async def _flip_card(
+        self, event, user_id: int, deck_id: int, card_id: int
+    ) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        card = await self.db.deck_card(deck_id, card_id)
+        if card is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        await self._edit(event, "پاسخ:\n\n" + card["back"], [
+            [Button.inline(
+                "➡️ کارت بعدی", f"fc:next:{deck_id}".encode("ascii")
+            )],
+            [Button.inline(
+                "⏹ پایان مرور", f"fc:done:{deck_id}".encode("ascii")
+            )],
+        ])
+
+    async def _next_card(self, event, user_id: int, deck_id: int) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        total = len(await self.db.deck_cards(deck_id))
+        if total == 0:
+            await self._ack(event, "این مجموعه هنوز کارتی ندارد.", alert=True)
+            return
+        new_cursor = int(deck["study_cursor"]) + 1
+        await self.db.deck_set_cursor(deck_id, new_cursor)
+        if new_cursor >= total:
+            await self._edit(event, (
+                "مرور تمام شد — "
+                f"{to_persian_digits(total)} کارت مرور شد."
+            ), [
+                [Button.inline(
+                    "🔁 از ابتدا", f"fc:restart:{deck_id}".encode("ascii")
+                )],
+                [Button.inline("↩️ بازگشت", b"fc:hub")],
+            ])
+            return
+        await self._study_front(event, user_id, deck_id)
+
+    async def _export_deck_docx(
+        self, event, user_id: int, deck_id: int
+    ) -> None:
+        deck = await self.db.deck_get(deck_id, user_id)
+        if deck is None:
+            await self._ack(event, self._deck_stale_alert(), alert=True)
+            return
+        cards = await self.db.deck_cards(deck_id)
+        if not cards:
+            await self._ack(event, "این مجموعه هنوز کارتی ندارد.", alert=True)
+            return
+        body_parts = [
+            f"پرسش {to_persian_digits(index)}: {card['front']}\nپاسخ: {card['back']}"
+            for index, card in enumerate(cards, start=1)
+        ]
+        meta = DocumentMeta(
+            reference=f"flashcard-{deck_id}",
+            source_name="flashcards",
+            created_at=datetime.now(),
+        )
+        docx_bytes = await asyncio.to_thread(
+            build_plain_docx,
+            deck["title"],
+            "\n\n".join(body_parts),
+            fonts=resolve_fonts(),
+            design=resolve_design(),
+            meta=meta,
+        )
+        workdir = Path(await run_file_io_resource(
+            tempfile.mkdtemp,
+            lambda path: shutil.rmtree(path, ignore_errors=True),
+            prefix="deck-",
+            dir=self.settings.temp_dir,
+        ))
+        path = workdir / f"flashcard-{deck_id}.docx"
+        try:
+            await run_file_io(path.write_bytes, docx_bytes)
+            await self._send_telegram_file(
+                event.chat_id,
+                path,
+                caption=f"🃏 فلش‌کارت‌ها — {deck['title']}"[:TELEGRAM_CAPTION_LIMIT],
+                force_document=True,
+            )
+        finally:
+            await run_file_io(shutil.rmtree, workdir, ignore_errors=True)
+
+    async def _route_flashcard_callback(
+        self, event, user_id: int, data: str
+    ) -> None:
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "hub":
+            page = _to_int(parts[2]) if len(parts) == 3 else 0
+            await self._show_flashcard_hub(event, page=max(0, page or 0))
+            return
+        if action == "pick":
+            page = _to_int(parts[2]) if len(parts) == 3 else 0
+            await self._show_booklet_picker(event, page=max(0, page or 0))
+            return
+        if action == "man" and len(parts) == 2:
+            await self._start_manual_deck(event, user_id)
+            return
+        if action == "man" and len(parts) == 3 and parts[2] == "done":
+            state = self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
+            if state is None:
+                await self._show_flashcard_hub(event)
+            else:
+                await event.respond("✅ ساخت کارت پایان یافت.")
+                await self._show_deck_screen(event, user_id, state[0])
+            return
+        if action == "ai" and len(parts) == 3:
+            item_id = _to_int(parts[2])
+            if item_id is None:
+                await self._ack(event, self._deck_stale_alert(), alert=True)
+                return
+            await self._flashcard_start_screen(event, user_id, item_id)
+            return
+        if action == "go" and len(parts) == 3:
+            item_id = _to_int(parts[2])
+            if item_id is None:
+                await self._ack(event, self._deck_stale_alert(), alert=True)
+                return
+            await self._flashcard_generate(event, user_id, item_id)
+            return
+        if action in {"deck", "study", "exp", "del", "delok", "done",
+                      "restart", "next"} and len(parts) == 3:
+            deck_id = _to_int(parts[2])
+            if deck_id is None:
+                await self._ack(event, self._deck_stale_alert(), alert=True)
+                return
+            if action == "deck":
+                await self._show_deck_screen(event, user_id, deck_id)
+            elif action == "study":
+                await self._study_front(event, user_id, deck_id)
+            elif action == "exp":
+                await self._export_deck_docx(event, user_id, deck_id)
+            elif action == "del":
+                deck = await self.db.deck_get(deck_id, user_id)
+                if deck is None:
+                    await self._ack(event, self._deck_stale_alert(), alert=True)
+                    return
+                await self._edit(event, "آیا مطمئنید؟", [
+                    [Button.inline(
+                        "✅ بله، حذف کن", f"fc:delok:{deck_id}".encode("ascii")
+                    )],
+                    [Button.inline(
+                        "↩️ بازگشت", f"fc:deck:{deck_id}".encode("ascii")
+                    )],
+                ])
+            elif action == "delok":
+                deleted = await self.db.deck_delete(deck_id, user_id)
+                if not deleted:
+                    await self._ack(event, self._deck_stale_alert(), alert=True)
+                else:
+                    await self._show_flashcard_hub(event)
+            elif action == "done":
+                await self._show_deck_screen(event, user_id, deck_id)
+            elif action == "restart":
+                await self._study_front(event, user_id, deck_id, restart=True)
+            elif action == "next":
+                await self._next_card(event, user_id, deck_id)
+            return
+        if action == "flip" and len(parts) == 4:
+            deck_id = _to_int(parts[2])
+            card_id = _to_int(parts[3])
+            if deck_id is None or card_id is None:
+                await self._ack(event, self._deck_stale_alert(), alert=True)
+                return
+            await self._flip_card(event, user_id, deck_id, card_id)
+            return
+        await self._ack(event, self._deck_stale_alert(), alert=True)
+
+    async def _route_quiz_callback(self, event, user_id: int, data: str) -> None:
+        """Parse and dispatch every ``quiz:`` callback, failing closed."""
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "new" and len(parts) == 3:
+            item_id = _to_int(parts[2])
+            if item_id is None:
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+                return
+            await self._quiz_start_screen(event, user_id, item_id)
+            return
+        if action == "go" and len(parts) == 4:
+            item_id = _to_int(parts[2])
+            count = _to_int(parts[3])
+            if item_id is None or count is None:
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+                return
+            await self._quiz_generate(event, user_id, item_id, count)
+            return
+        if action == "ans" and len(parts) == 5:
+            session_id = _to_int(parts[2])
+            question_id = _to_int(parts[3])
+            option = _to_int(parts[4])
+            if session_id is None or question_id is None or option is None:
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+                return
+            await self._quiz_answer(event, user_id, session_id, question_id, option)
+            return
+        if action in ("next", "quit") and len(parts) == 3:
+            session_id = _to_int(parts[2])
+            if session_id is None:
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
+                return
+            if action == "next":
+                await self._quiz_next(event, user_id, session_id)
+            else:
+                await self._quiz_quit(event, user_id, session_id)
+            return
+        await self._ack(event, LEARNING_STALE_ALERT, alert=True)
 
     # ------------------------------------------------------------- callbacks
     async def _handle_callback(self, event) -> None:
@@ -2551,10 +2485,10 @@ class GamasBot:
             self._support_states.pop(user_id, None)
         if not data.startswith("adm:sr:"):
             self._support_admin_states.pop(user_id, None)
-        # Manual flashcard entry survives only its own actions; any
-        # navigation drops it so a later text cannot become a card.
-        if not data.startswith("fc:man"):
-            self._pending_flashcard.pop(user_id, None)
+        # A manual-flashcard conversation likewise ends at any navigation;
+        # fc:man re-arms itself inside its own branch.
+        self._pending_flashcard.pop(user_id, None)
+        self._pending_flashcard_front.pop(user_id, None)
 
         if data == "help":
             await self._ack(event)
@@ -2566,7 +2500,10 @@ class GamasBot:
                 "۴. همهٔ متن‌ها و جزوه‌ها در «📚 کتابخانه من» می‌مانند و هر زمان می‌توانید دوباره دریافت‌شان کنید.\n\n"
                 "«💳 حساب من»: موجودی، خرید اشتراک و پرداخت‌های شما در یک صفحه.\n"
                 "«🎧 پشتیبانی»: اگر مشکل یا سؤالی داشتید، تیکت بزنید.\n\n"
-                "🧪 از هر جزوه می‌توانید آزمون چندگزینه‌ای بگیرید؛ هر پاسخ درست ۱۰ امتیاز دارد و امتیازها در «🏆 لیدربورد» جمع می‌شود. 🃏 همچنین می‌توانید از جزوه‌ها فلش‌کارت بسازید (با هوش مصنوعی یا دستی) و آن‌ها را کارت‌به‌کارت مرور کنید. ساخت آزمون و فلش‌کارت هوش مصنوعی از اعتبار شما کم می‌کند و در صورت خطا برمی‌گردد.\n\n"
+                "🧪 از هر جزوه می‌توانید آزمون چندگزینه‌ای بگیرید؛ هر پاسخ درست ۱۰ امتیاز دارد "
+                "و امتیازها در «🏆 لیدربورد» جمع می‌شود. 🃏 همچنین می‌توانید از جزوه‌ها فلش‌کارت "
+                "بسازید (با هوش مصنوعی یا دستی) و آن‌ها را کارت‌به‌کارت مرور کنید. ساخت آزمون و "
+                "فلش‌کارت هوش مصنوعی از اعتبار شما کم می‌کند و در صورت خطا برمی‌گردد.\n\n"
                 "اعتبار بر اساس مدت فایل صوتی و پس از ارسال متن خام محاسبه می‌شود. "
                 "اگر ارسال متن خام ناموفق باشد، اعتبار مصرف نمی‌شود. "
                 "پس از دریافت متن خام، خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود."
@@ -2578,19 +2515,15 @@ class GamasBot:
         elif data == "menu:main":
             await self._ack(event)
             await self._show_main(event)
-        elif data == "library:fc":
-            await self._ack(event)
-            await self._show_flashcards(event)
-        elif data.startswith("lib:it:"):
-            await self._ack(event)
-            item_id = _to_int(data.rsplit(":", 1)[-1])
-            if item_id is None:
-                await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            else:
-                await self._show_library_item(event, item_id)
         elif data == "library":
             await self._ack(event)
             await self._show_library(event)
+        elif data == "library:fc":
+            await self._ack(event)
+            await self._show_flashcard_hub(event)
+        elif data == "board":
+            await self._ack(event)
+            await self._show_leaderboard(event)
         elif data.startswith("lib:f:"):
             await self._ack(event)
             item_id = _to_int(data.rsplit(":", 1)[-1])
@@ -2598,6 +2531,13 @@ class GamasBot:
                 await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             else:
                 await self._forward_library_item(event, user_id, item_id)
+        elif data.startswith("lib:it:"):
+            await self._ack(event)
+            item_id = _to_int(data.rsplit(":", 1)[-1])
+            if item_id is None:
+                await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            else:
+                await self._show_library_item(event, item_id)
         elif data.startswith("lib:"):
             await self._ack(event)
             page = _to_int(data.split(":", 1)[1])
@@ -2605,168 +2545,6 @@ class GamasBot:
                 await self._ack(event, "صفحهٔ کتابخانه نامعتبر است.", alert=True)
             else:
                 await self._show_library(event, page=max(0, page))
-        elif data == "board":
-            await self._ack(event)
-            await self._show_leaderboard(event)
-        elif data.startswith("quiz:new:"):
-            await self._ack(event)
-            item_id = _to_int(data.rsplit(":", 1)[-1])
-            if item_id is None:
-                await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            else:
-                await self._show_quiz_start(event, item_id)
-        elif data.startswith("quiz:go:"):
-            await self._ack(event)
-            parts = data.split(":")
-            item_id = _to_int(parts[2]) if len(parts) == 4 else None
-            count = _to_int(parts[3]) if len(parts) == 4 else None
-            if item_id is None or count is None:
-                await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            else:
-                await self._start_quiz(event, item_id, count)
-        elif data.startswith("quiz:ans:"):
-            await self._ack(event)
-            parts = data.split(":")
-            # The option index is part of the payload, so every field is parsed
-            # and range-checked before it can reach the database.
-            session_id = _to_int(parts[2]) if len(parts) == 5 else None
-            question_id = _to_int(parts[3]) if len(parts) == 5 else None
-            chosen = _to_int(parts[4]) if len(parts) == 5 else None
-            if session_id is None or question_id is None or chosen is None:
-                await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            elif not 0 <= chosen <= 3:
-                await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            else:
-                await self._answer_quiz(
-                    event, session_id, question_id, chosen
-                )
-        elif data.startswith("quiz:next:"):
-            await self._ack(event)
-            session_id = _to_int(data.rsplit(":", 1)[-1])
-            if session_id is None:
-                await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            else:
-                await self._next_quiz_question(event, session_id)
-        elif data.startswith("quiz:quit:"):
-            await self._ack(event)
-            session_id = _to_int(data.rsplit(":", 1)[-1])
-            if session_id is None:
-                await self._ack(event, "این آزمون دیگر معتبر نیست.", alert=True)
-            else:
-                await self._quit_quiz(event, session_id)
-        elif data == "fc:hub" or data.startswith("fc:hub:"):
-            await self._ack(event)
-            page = 0
-            if data != "fc:hub":
-                parsed = _to_int(data.rsplit(":", 1)[-1])
-                if parsed is None:
-                    await self._ack(event, "این صفحه معتبر نیست.", alert=True)
-                    return
-                page = parsed
-            await self._show_flashcards(event, max(0, page))
-        elif data == "fc:pick" or data.startswith("fc:pick:"):
-            await self._ack(event)
-            page = 0
-            if data != "fc:pick":
-                parsed = _to_int(data.rsplit(":", 1)[-1])
-                if parsed is None:
-                    await self._ack(event, "این صفحه معتبر نیست.", alert=True)
-                    return
-                page = parsed
-            await self._show_flashcard_picker(event, max(0, page))
-        elif data == "fc:man":
-            await self._ack(event)
-            await self._arm_manual_deck(event)
-        elif data == "fc:man:done":
-            await self._ack(event)
-            await self._finish_manual(event)
-        elif data.startswith("fc:ai:"):
-            await self._ack(event)
-            item_id = _to_int(data.rsplit(":", 1)[-1])
-            if item_id is None:
-                await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            else:
-                await self._show_flashcard_ai(event, item_id)
-        elif data.startswith("fc:go:"):
-            await self._ack(event)
-            item_id = _to_int(data.rsplit(":", 1)[-1])
-            if item_id is None:
-                await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
-            else:
-                await self._start_flashcard_ai(event, item_id)
-        elif data.startswith("fc:deck:"):
-            await self._ack(event)
-            deck_id = _to_int(data.rsplit(":", 1)[-1])
-            if deck_id is None:
-                await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            else:
-                await self._show_deck(event, deck_id)
-        elif data.startswith("fc:study:"):
-            await self._ack(event)
-            deck_id = _to_int(data.rsplit(":", 1)[-1])
-            if deck_id is None:
-                await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            else:
-                await self._study_card(event, deck_id)
-        elif data.startswith("fc:flip:"):
-            await self._ack(event)
-            parts = data.split(":")
-            deck_id = _to_int(parts[2]) if len(parts) == 4 else None
-            card_id = _to_int(parts[3]) if len(parts) == 4 else None
-            if deck_id is None or card_id is None:
-                await self._ack(event, "این کارت دیگر معتبر نیست.", alert=True)
-            else:
-                await self._flip_card(event, deck_id, card_id)
-        elif data.startswith("fc:next:"):
-            await self._ack(event)
-            deck_id = _to_int(data.rsplit(":", 1)[-1])
-            if deck_id is None:
-                await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            else:
-                await self._next_card(event, deck_id)
-        elif data.startswith("fc:done:"):
-            await self._ack(event)
-            deck_id = _to_int(data.rsplit(":", 1)[-1])
-            if deck_id is None:
-                await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            else:
-                deck = await self.db.deck_get(user_id, deck_id)
-                if deck is None:
-                    await self._ack(
-                        event, "این مجموعه در دسترس نیست.", alert=True
-                    )
-                else:
-                    await self._finish_study(
-                        event, deck_id, int(deck["card_count"])
-                    )
-        elif data.startswith("fc:restart:"):
-            await self._ack(event)
-            deck_id = _to_int(data.rsplit(":", 1)[-1])
-            if deck_id is None:
-                await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            else:
-                await self._restart_study(event, deck_id)
-        elif data.startswith("fc:exp:"):
-            await self._ack(event)
-            deck_id = _to_int(data.rsplit(":", 1)[-1])
-            if deck_id is None:
-                await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            else:
-                await self._export_deck(event, deck_id)
-        elif data.startswith("fc:delok:"):
-            await self._ack(event)
-            deck_id = _to_int(data.rsplit(":", 1)[-1])
-            if deck_id is None:
-                await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            else:
-                await self._delete_deck(event, deck_id, confirmed=True)
-        elif data.startswith("fc:del:"):
-            await self._ack(event)
-            deck_id = _to_int(data.rsplit(":", 1)[-1])
-            if deck_id is None:
-                await self._ack(event, "این مجموعه در دسترس نیست.", alert=True)
-            else:
-                await self._delete_deck(event, deck_id, confirmed=False)
         elif data == "wallet":
             await self._ack(event)
             await self._show_wallet(event)
@@ -2795,27 +2573,6 @@ class GamasBot:
                 await self._await_receipt(event, payment_id)
         elif data.startswith("payv:"):
             await self._review_payment(event, data)
-        elif data == "adm:board":
-            await self._ack(event)
-            await self._show_admin_leaderboard(event)
-        elif data.startswith("adm:bgok:"):
-            await self._ack(event)
-            parts = data.split(":")
-            target_id = _to_int(parts[2]) if len(parts) == 4 else None
-            if target_id is None or len(parts) != 4:
-                await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
-            else:
-                await self._apply_admin_gift(event, target_id, parts[3])
-        elif data.startswith("adm:bg:"):
-            await self._ack(event)
-            parts = data.split(":")
-            target_id = _to_int(parts[2]) if len(parts) >= 3 else None
-            if target_id is None:
-                await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
-            elif len(parts) >= 4:
-                await self._confirm_admin_gift(event, target_id, parts[3])
-            else:
-                await self._show_admin_gift(event, target_id)
         elif data == "adm:home":
             await self._ack(event)
             await self._show_admin_overview(event)
@@ -2879,6 +2636,27 @@ class GamasBot:
         elif data == "adm:audit":
             await self._ack(event)
             await self._show_admin_audit(event)
+        elif data == "adm:board":
+            await self._ack(event)
+            await self._admin_board(event)
+        elif data.startswith("adm:bgok:"):
+            await self._ack(event)
+            parts = data.split(":", 3)
+            target_id = _to_int(parts[2]) if len(parts) == 4 else None
+            if target_id is None:
+                await self._ack(event, "درخواست هدیه نامعتبر است.", alert=True)
+            else:
+                await self._admin_gift_execute(event, user_id, target_id, parts[3])
+        elif data.startswith("adm:bg:"):
+            await self._ack(event)
+            parts = data.split(":")
+            target_id = _to_int(parts[2]) if len(parts) in (3, 4) else None
+            if target_id is None:
+                await self._ack(event, "درخواست هدیه نامعتبر است.", alert=True)
+            elif len(parts) == 3:
+                await self._admin_gift_pick(event, target_id)
+            else:
+                await self._admin_gift_confirm(event, target_id, parts[3])
         elif data.startswith("adm:rcpt:"):
             await self._ack(event)
             await self._show_receipt(event, data)
@@ -2888,6 +2666,12 @@ class GamasBot:
         elif data == "support" or data.startswith("sup:"):
             await self._ack(event)
             await self._handle_support_callback(event, user_id, data)
+        elif data.startswith("quiz:"):
+            await self._ack(event)
+            await self._route_quiz_callback(event, user_id, data)
+        elif data.startswith("fc:"):
+            await self._ack(event)
+            await self._route_flashcard_callback(event, user_id, data)
         else:
             await self._ack(event)
 
@@ -2898,23 +2682,13 @@ class GamasBot:
         user_id = event.sender_id
         if user_id is None:
             return
-        # The leaderboard's only human label is captured here, on the one
-        # path every private message takes. ``event.sender`` is Telethon's
-        # already-resolved attribute, so this never triggers an API call.
-        sender = getattr(event, "sender", None)
-        user = await self.db.ensure_user(
-            user_id, getattr(sender, "first_name", None)
-        )
+        user = await self.db.ensure_user(user_id)
         if user.banned:
             await event.reply("⛔ دسترسی شما به ربات مسدود شده است.")
             return
+        await self._capture_sender_name(event)
         text = (event.message.message or "").strip()
         command = _command_name(text)
-        if command:
-            # Any command ends a guided text prompt. This sits before the
-            # early-returning admin commands, so /grant or /ban cannot leave a
-            # card prompt armed to swallow the next message the admin sends.
-            self._pending_flashcard.pop(user_id, None)
         if command == "/start":
             # A fresh menu is a hard boundary for every conversational flow.
             # In particular, a later photo must not unexpectedly complete an
@@ -2924,6 +2698,8 @@ class GamasBot:
             self._pending_payments.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
+            self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
             await self._show_main(event, first_start=True)
             return
 
@@ -2968,6 +2744,11 @@ class GamasBot:
             # Any command leaves the conversational reply flow. In particular,
             # /start must not leave a stale ticket id armed for the next text.
             self._support_admin_states.pop(user_id, None)
+            # Disarm a manual flashcard prompt before the early-returning admin
+            # commands below, so /grant or /ban cannot leave it armed to swallow
+            # the admin's next plain message.
+            self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
         if self._is_admin(user_id) and command == "/grant":
             await self._admin_grant(event, text)
             return
@@ -2985,9 +2766,6 @@ class GamasBot:
         if user_id in self._support_states and command:
             # Commands, including /start, always disarm the old prompt.
             self._support_states.pop(user_id, None)
-        if user_id in self._pending_flashcard and not command:
-            await self._handle_flashcard_text(event, user_id, text)
-            return
 
         # While a receipt is expected, no ordinary text/media may fall through
         # to the paid lecture pipeline. Invalid input keeps the
@@ -3000,8 +2778,21 @@ class GamasBot:
             self._pending_payments.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
+            self._pending_flashcard.pop(user_id, None)
+            self._pending_flashcard_front.pop(user_id, None)
             await event.reply("ارسال لغو شد. برای لغو سفارش، از «💳 حساب من» اقدام کنید.")
             return
+
+        # Manual flashcard conversation: armed by fc:man and disarmed by any
+        # command or navigation callback. It must sit before media intake so a
+        # plain text answer can never fall through to the lecture pipeline.
+        if user_id in self._pending_flashcard:
+            if command:
+                self._pending_flashcard.pop(user_id, None)
+                self._pending_flashcard_front.pop(user_id, None)
+            else:
+                await self._handle_flashcard_text(event, user_id, text)
+                return
 
         # Presentations.
         pkind, pfilename = _presentation_metadata(event.message)
@@ -3948,13 +3739,30 @@ class GamasBot:
                 notice_kind = "notes"
 
         if docx_path is not None:
-            caption = self._booklet_caption(reference)
+            # The library stores the clean one-line title; the learning CTA
+            # lives only in the Telegram caption (which _send_file caps at the
+            # 1024-char limit, truncating the trailing guide before the title).
+            title = f"📖 جزوهٔ Word — {reference}"
+            caption = (
+                title + "\n📚 در کتابخانهٔ شما ذخیره شد" + LEARNING_DELIVERY_CTA
+            )
+            # Presentations pass their built document as plain_text and have no
+            # transcript object; media jobs carry the LLM-source transcript.
+            learning_source = (
+                plain_text
+                if plain_text is not None
+                else (document.llm_document() if document is not None else "")
+            )
+            learning_text = bound_content_text(learning_source)
             try:
                 message = await self._send_file(job, docx_path, caption=caption)
                 if message is not None:
                     await self._save_library_item(
-                        job, "booklet", message, caption,
-                        content=self._artifact_text(document, plain_text),
+                        job,
+                        "booklet",
+                        message,
+                        title,
+                        content_text=learning_text or None,
                     )
             except Exception:
                 logger.exception("docx delivery failed")
@@ -3990,51 +3798,23 @@ class GamasBot:
             finally:
                 await stream.aclose()
 
-    @staticmethod
-    def _booklet_caption(reference: str) -> str:
-        """Booklet caption: reference, library cue and the learning CTA.
-
-        The reference identifies the artifact, so it is never the part that gets
-        cut: when an unusually long reference would overflow Telegram's caption
-        cap, the CTA gives way first.
-        """
-        head = f"📖 جزوهٔ Word — {reference}\n📚 در کتابخانهٔ شما ذخیره شد"
-        tail = "\n🧪 از همین جزوه آزمون بده یا 🃏 فلش‌کارت بساز: «کتابخانه من»"
-        if len(head) + len(tail) <= TELEGRAM_CAPTION_LIMIT:
-            return head + tail
-        return head[:TELEGRAM_CAPTION_LIMIT]
-
-    @staticmethod
-    def _artifact_text(document, plain_text: str | None) -> str:
-        """The bounded plain text a quiz or deck can later be generated from.
-
-        The transcript document is preferred when present because it is the
-        grounded source the booklet was built from; a presentation passes its
-        assembled text as ``plain_text`` instead. Either way the value is clamped
-        so one pathological artifact cannot bloat the library row.
-        """
-        text = ""
-        getter = getattr(document, "llm_document", None)
-        if callable(getter):
-            try:
-                text = str(getter())
-            except Exception:
-                logger.debug("could not render artifact text", exc_info=True)
-                text = ""
-        if not text:
-            text = str(plain_text or "")
-        return bound_content(text)
-
     async def _save_library_item(
-        self, job: Job, kind: str, message: Message, title: str,
-        *, content: str = ""
+        self,
+        job: Job,
+        kind: str,
+        message: Message,
+        title: str,
+        *,
+        content_text: str | None = None,
     ) -> None:
         """Best-effort library index: a database hiccup can never fail delivery.
 
         Telegram owns the file; this stores only its message reference. Pruning
         follows insertion and is deliberately inside the same best-effort
         boundary, so a successful transcript/booklet always completes billing
-        and progress even if either write is temporarily unavailable.
+        and progress even if either write is temporarily unavailable. The
+        bounded learning text (quiz/flashcard source) is archived in the same
+        boundary; legacy rows simply keep ``content_text = NULL``.
         """
         chat_id = getattr(message, "chat_id", None)
         message_id = getattr(message, "id", None)
@@ -4045,15 +3825,16 @@ class GamasBot:
             )
             return
         try:
-            await self.db.library_add(
+            item_id = await self.db.library_add(
                 job.user_id,
                 kind,
                 chat_id,
                 message_id,
                 job.submission_id,
                 title=title,
-                content_text=content or None,
             )
+            if content_text:
+                await self.db.library_set_content(item_id, content_text)
             await self.db.library_prune(
                 job.user_id, self.settings.library_max_items
             )
@@ -4127,8 +3908,11 @@ class GamasBot:
             message = await self._send_file(job, raw_path, caption=caption)
             if message is not None:
                 await self._save_library_item(
-                    job, "transcript", message, caption,
-                    content=bound_content(raw_text),
+                    job,
+                    "transcript",
+                    message,
+                    caption,
+                    content_text=bound_content_text(raw_text) or None,
                 )
             return
         except Exception:

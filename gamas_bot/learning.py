@@ -1,72 +1,73 @@
-"""Content generation for the learning loop: quizzes and flashcard decks.
+"""Learning-loop content: prompts, strict JSON shapes and validation.
 
-This module owns everything between "the user asked for a quiz" and "the
-database has a validated question set": the two Persian prompts, the JSON
-schemas sent as structured-output hints, and — most importantly — the
-validation that turns whatever a provider returned into something the bot is
-willing to charge for.
+The quiz and AI-flashcard features both turn an archived booklet text into
+strictly validated Persian JSON through :mod:`gamas_bot.llm`. This module keeps
+every prompt, schema and clamp in one place so the bot layer only orchestrates
+billing and screens, and the rules can be unit-tested without Telethon.
 
-Two rules shape the validation:
-
-* **Nothing unvalidated is persisted.** A model answer is untrusted input. A
-  question with three options, an out-of-range correct index or a blank stem is
-  dropped rather than repaired, because a quiz the user paid for must never
-  contain a question that cannot be answered.
-* **Options are shuffled before storage.** Providers tend to put the correct
-  answer first; shuffling here (and remapping the index) is what makes the
-  stored order the order the user saw, so ``correct_index`` stays meaningful
-  without a second "was it shuffled?" flag.
-
-Generation itself stays in this module so the bot's handlers only deal with
-screens and credit — the same separation ``notes.py`` uses for booklets.
+Nothing here performs I/O: functions are pure validators/parsers, which keeps
+the billing-then-generation discipline in ``bot.py`` easy to follow.
 """
 
 from __future__ import annotations
 
-import logging
 import random
 from typing import Any
 
-import aiohttp
+#: Archived learning text is capped before it is stored and again before it is
+#: sent to a model, so a multi-hour lecture can never bloat the library row or
+#: overflow a provider context (one LLM call, no chunking, by design).
+MAX_CONTENT_CHARS = 60_000
+#: Input sent to the learning generators is slightly tighter than the stored
+#: cap to leave room for the prompt envelope inside NOTE_CHUNK_CHARS budgets.
+MAX_MODEL_INPUT_CHARS = 56_000
 
-from .config import Settings
-from .llm import complete_json
-
-logger = logging.getLogger(__name__)
-
-#: Upper bound on the artifact text handed to the model. A booklet is normally
-#: far smaller; the cap exists so one pathological transcript cannot turn a quiz
-#: request into a context-overflow retry storm.
-CONTENT_TEXT_LIMIT = 60_000
-
-#: Minimum usable items below which generation is considered failed (and the
-#: credit is refunded) rather than delivered half-empty.
-MIN_QUIZ_QUESTIONS = 3
-MIN_FLASHCARDS = 5
-
-#: Field budgets. These bound the rendered Telegram message, not the model's
-#: context: a 3 000-character "question" is unusable in a chat bubble.
+#: Validation ceilings for model output, mirrored in the prompt wording.
 MAX_QUESTION_CHARS = 300
 MAX_OPTION_CHARS = 120
-MAX_EXPLANATION_CHARS = 400
+MAX_EXPLAIN_CHARS = 400
 MAX_CARD_FRONT_CHARS = 160
 MAX_CARD_BACK_CHARS = 400
+#: Manual cards are user-typed in chat, so they get the slightly larger chat
+#: budgets from the feature spec rather than the model-output ceilings.
+MAX_MANUAL_FRONT_CHARS = 200
+MAX_MANUAL_BACK_CHARS = 500
 
-QUIZ_SYSTEM_PROMPT = (
-    "شما طرّاح آزمون فارسی «گاماس» هستید. ورودی شما متن یک جزوهٔ درسی است و خروجی شما "
-    "فقط یک شیء JSON معتبر، بدون هیچ متن اضافه، با این ساختار است: "
-    '{"questions":[{"question":"...","options":["...","...","...","..."],'
-    '"correct":0,"explain":"..."}]}\n\n'
-    "قواعد:\n"
-    "- دقیقاً به همان تعدادی که خواسته شده سؤال بسازید.\n"
-    "- هر سؤال چهار گزینه داشته باشد و فقط یکی از آن‌ها بی‌ابهام درست باشد.\n"
-    "- سؤال و گزینه‌ها و توضیح کاملاً فارسی و کوتاه باشند؛ گزینه‌ها هم‌طول و هم‌جنس باشند.\n"
-    "- سؤال‌ها فقط از همین متن ساخته شوند؛ هیچ دانش بیرونی، عدد تازه یا حدس اضافه نکنید.\n"
-    "- «correct» شمارهٔ گزینهٔ درست از صفر است (۰ تا ۳).\n"
-    "- «explain» یک جملهٔ کوتاه توضیح می‌دهد که چرا آن گزینه درست است و به متن جزوه تکیه دارد.\n"
-    "- سؤال‌های تکراری یا سؤال‌هایی که پاسخشان در متن نیست نسازید.\n"
-    "- گزینه‌ها را با شماره یا حرف («۱)»، «الف») شروع نکنید؛ فقط متن گزینه را بنویسید."
-)
+#: A generation that yields fewer usable units is a failure the caller refunds.
+MIN_VALID_QUESTIONS = 3
+MIN_VALID_CARDS = 5
+
+#: Persian option labels, indexed exactly like ``correct_index``.
+OPTION_LABELS = ("الف", "ب", "ج", "د")
+
+
+def bound_content_text(text: str | None, *, limit: int = MAX_CONTENT_CHARS) -> str:
+    """Trim archived text to ``limit`` chars on a paragraph boundary.
+
+    Cutting at the last blank line (falling back to the last whitespace, then a
+    hard slice) never leaves a half-written paragraph as the quiz source.
+    """
+    if not text:
+        return ""
+    normalized = str(text).strip()
+    if len(normalized) <= limit:
+        return normalized
+    window = normalized[:limit]
+    paragraph_cut = window.rfind("\n\n")
+    if paragraph_cut >= limit // 2:
+        return window[:paragraph_cut].rstrip()
+    line_cut = window.rfind("\n")
+    if line_cut >= limit // 2:
+        return window[:line_cut].rstrip()
+    word_cut = window.rfind(" ")
+    if word_cut >= limit // 2:
+        return window[:word_cut].rstrip()
+    return window.rstrip()
+
+
+# ---------------------------------------------------------------------------
+# Quiz
+# ---------------------------------------------------------------------------
 
 QUIZ_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -80,30 +81,97 @@ QUIZ_SCHEMA: dict[str, Any] = {
                     "options": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "minItems": 4,
-                        "maxItems": 4,
                     },
-                    "correct": {"type": "integer", "minimum": 0, "maximum": 3},
+                    "correct": {"type": "integer"},
                     "explain": {"type": "string"},
                 },
-                "required": ["question", "options", "correct"],
+                "required": ["question", "options", "correct", "explain"],
             },
         }
     },
     "required": ["questions"],
 }
 
-FLASHCARD_SYSTEM_PROMPT = (
-    "شما سازندهٔ فلش‌کارت فارسی «گاماس» هستید. ورودی شما متن یک جزوهٔ درسی است و خروجی شما "
-    "فقط یک شیء JSON معتبر، بدون هیچ متن اضافه، با این ساختار است: "
-    '{"cards":[{"front":"...","back":"..."}]}\n\n'
-    "قواعد:\n"
-    "- دقیقاً به همان تعدادی که خواسته شده کارت بسازید.\n"
-    "- «front» یک پرسش کوتاه و روشن از متن جزوه است و «back» پاسخ کامل اما فشردهٔ همان پرسش.\n"
-    "- هر کارت فقط یک نکته را بپرسد؛ پرسش‌های بله/خیر و پرسش‌های چندبخشی نسازید.\n"
-    "- همهٔ کارت‌ها فقط از همین متن ساخته شوند؛ هیچ دانش بیرونی یا حدس اضافه نکنید.\n"
-    "- کارت‌های تکراری نسازید و پاسخ را داخل «front» لو ندهید."
-)
+
+def quiz_system_prompt(count: int) -> str:
+    """The Persian system prompt demanding ``count`` grounded MCQs."""
+    return (
+        "تو یک طراح سؤال آموزشی فارسی‌زبان هستی. فقط بر پایهٔ متن جزوه‌ای که در "
+        "پیام کاربر می‌آید سؤال طرح کن؛ هیچ اطلاعات بیرونی وارد نکن.\n"
+        f"دقیقاً {int(count)} سؤال چهارگزینه‌ای بساز.\n"
+        "قوانین:\n"
+        "- هر سؤال دقیقاً چهار گزینه دارد و فقط یک گزینه کاملاً درست است.\n"
+        "- گزینه‌ها کوتاه و بدون ابهام باشند؛ پاسخ درست نباید با حذف گزینه‌ها "
+        "قابل حدس باشد.\n"
+        "- برای هر سؤال یک توضیح یک‌خطی فارسی بنویس که چرا گزینهٔ درست، درست است.\n"
+        "- همهٔ متن‌ها فارسی و روان باشد.\n"
+        "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
+        '{"questions":[{"question": "متن سؤال", '
+        '"options": ["گزینه الف", "گزینه ب", "گزینه ج", "گزینه د"], '
+        '"correct": 0, "explain": "توضیح یک‌خطی"}]}'
+    )
+
+
+def _clean_str(value: Any, limit: int) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.split())[:limit].strip()
+
+
+def parse_quiz_payload(
+    payload: dict[str, Any], count: int, *, rng: random.Random | None = None
+) -> list[dict[str, Any]]:
+    """Validate/clamp a model answer and return at most ``count`` questions.
+
+    Malformed questions are dropped rather than failing the whole generation.
+    Surviving options are shuffled and ``correct`` is remapped, so a model that
+    favours option 0 cannot create a predictable answer key.
+    """
+    raw_questions = payload.get("questions")
+    if not isinstance(raw_questions, list):
+        return []
+    validated: list[dict[str, Any]] = []
+    for entry in raw_questions:
+        if not isinstance(entry, dict):
+            continue
+        question = _clean_str(entry.get("question"), MAX_QUESTION_CHARS)
+        explain = _clean_str(entry.get("explain"), MAX_EXPLAIN_CHARS)
+        raw_options = entry.get("options")
+        correct = entry.get("correct")
+        if not question or not explain or not isinstance(raw_options, list):
+            continue
+        options = [
+            _clean_str(option, MAX_OPTION_CHARS) for option in raw_options
+        ]
+        if len(options) != 4 or any(not option for option in options):
+            continue
+        if len(set(options)) != 4:
+            # Duplicate options make "single correct answer" ambiguous.
+            continue
+        if not isinstance(correct, int) or isinstance(correct, bool) or not 0 <= correct <= 3:
+            continue
+        order = list(range(4))
+        if rng is None:
+            random.shuffle(order)
+        else:
+            rng.shuffle(order)
+        shuffled = [options[index] for index in order]
+        validated.append(
+            {
+                "question": question,
+                "options": shuffled,
+                "correct_index": order.index(correct),
+                "explanation": explain,
+            }
+        )
+        if len(validated) >= int(count):
+            break
+    return validated
+
+
+# ---------------------------------------------------------------------------
+# Flashcards
+# ---------------------------------------------------------------------------
 
 FLASHCARD_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -124,169 +192,37 @@ FLASHCARD_SCHEMA: dict[str, Any] = {
 }
 
 
-class LearningContentError(RuntimeError):
-    """The provider answered, but not with content worth charging for."""
+def flashcard_system_prompt(count: int) -> str:
+    """The Persian system prompt demanding ``count`` grounded Q/A pairs."""
+    return (
+        "تو یک طراح فلش‌کارت آموزشی فارسی‌زبان هستی. فقط از متن جزوه‌ای که در "
+        "پیام کاربر می‌آید کارت بساز؛ هیچ اطلاعات بیرونی وارد نکن.\n"
+        f"دقیقاً {int(count)} کارت پرسش‌وپاسخ بساز.\n"
+        "قوانین:\n"
+        "- «front» پرسش کوتاه و «back» پاسخ کامل در یک پاراگراف کوتاه است.\n"
+        "- کارت‌ها روی نکات کلیدی، تعریف‌ها و مفاهیم مهم تمرکز کنند.\n"
+        "- همهٔ متن‌ها فارسی و روان باشد.\n"
+        "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
+        '{"cards":[{"front": "پرسش", "back": "پاسخ"}]}'
+    )
 
 
-def bound_content(text: str | None, limit: int = CONTENT_TEXT_LIMIT) -> str:
-    """Clamp archived text, cutting on a paragraph boundary when possible.
-
-    Cutting mid-sentence is what makes a generated question unanswerable, so the
-    last paragraph break before the limit wins; a single huge paragraph falls
-    back to a hard cut rather than keeping nothing.
-    """
-    if not text:
-        return ""
-    value = str(text).strip()
-    if len(value) <= limit:
-        return value
-    window = value[:limit]
-    for separator in ("\n\n", "\n", "。"):
-        cut = window.rfind(separator)
-        if cut >= limit // 2:
-            return window[:cut].rstrip()
-    return window.rstrip()
-
-
-def _clean(value: object, limit: int) -> str:
-    """Collapse whitespace and clamp one provider-supplied string."""
-    if not isinstance(value, str):
-        return ""
-    return " ".join(value.split())[:limit].strip()
-
-
-def normalize_questions(
-    payload: object,
-    count: int,
-    *,
-    rng: random.Random | None = None,
-) -> list[dict[str, Any]]:
-    """Validate, clamp, shuffle and truncate a provider's quiz payload.
-
-    Anything malformed is dropped; the result is then cut to ``count`` so a
-    chatty provider cannot quietly hand the user (or charge them for) more
-    questions than they picked.
-    """
-    raw = payload.get("questions") if isinstance(payload, dict) else None
-    if not isinstance(raw, list):
+def parse_flashcard_payload(
+    payload: dict[str, Any], count: int
+) -> list[dict[str, str]]:
+    """Validate/clamp a model answer into at most ``count`` Q/A cards."""
+    raw_cards = payload.get("cards")
+    if not isinstance(raw_cards, list):
         return []
-    chooser = rng or random.Random()
-    questions: list[dict[str, Any]] = []
-    for entry in raw:
+    validated: list[dict[str, str]] = []
+    for entry in raw_cards:
         if not isinstance(entry, dict):
             continue
-        question = _clean(entry.get("question"), MAX_QUESTION_CHARS)
-        options_raw = entry.get("options")
-        if not isinstance(options_raw, list) or len(options_raw) != 4:
-            continue
-        options = [_clean(option, MAX_OPTION_CHARS) for option in options_raw]
-        if not question or any(not option for option in options):
-            continue
-        # Duplicate options make more than one answer defensible, which is
-        # exactly the ambiguity the prompt asks the model to avoid.
-        if len(set(options)) != 4:
-            continue
-        correct_raw = entry.get("correct")
-        if isinstance(correct_raw, bool) or not isinstance(correct_raw, int):
-            continue
-        if not 0 <= correct_raw <= 3:
-            continue
-        explanation = _clean(entry.get("explain"), MAX_EXPLANATION_CHARS)
-        # Remap the index across the shuffle: options and ``correct`` are always
-        # written together, so the stored index refers to the stored order.
-        indices = list(range(4))
-        chooser.shuffle(indices)
-        questions.append(
-            {
-                "question": question,
-                "options": [options[index] for index in indices],
-                "correct": indices.index(correct_raw),
-                "explanation": explanation,
-            }
-        )
-        if len(questions) >= max(0, int(count)):
-            break
-    return questions
-
-
-def normalize_cards(payload: object) -> list[dict[str, str]]:
-    """Validate and clamp a provider's flashcard payload, dropping malformed cards."""
-    raw = payload.get("cards") if isinstance(payload, dict) else None
-    if not isinstance(raw, list):
-        return []
-    cards: list[dict[str, str]] = []
-    seen: set[str] = set()
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        front = _clean(entry.get("front"), MAX_CARD_FRONT_CHARS)
-        back = _clean(entry.get("back"), MAX_CARD_BACK_CHARS)
+        front = _clean_str(entry.get("front"), MAX_CARD_FRONT_CHARS)
+        back = _clean_str(entry.get("back"), MAX_CARD_BACK_CHARS)
         if not front or not back:
             continue
-        key = front.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        cards.append({"front": front, "back": back})
-    return cards
-
-
-async def generate_quiz(
-    session: aiohttp.ClientSession,
-    settings: Settings,
-    text: str,
-    count: int,
-    *,
-    rng: random.Random | None = None,
-) -> list[dict[str, Any]]:
-    """Ask the note provider for ``count`` questions grounded in ``text``.
-
-    Raises :class:`LearningContentError` when the usable result is below
-    :data:`MIN_QUIZ_QUESTIONS`; the caller refunds the charge in that case, so a
-    weak provider answer never costs the user credit.
-    """
-    payload = await complete_json(
-        session,
-        settings,
-        system=QUIZ_SYSTEM_PROMPT,
-        user=f"تعداد سؤال: {int(count)}\n\nمتن جزوه:\n{bound_content(text)}",
-        schema=QUIZ_SCHEMA,
-    )
-    questions = normalize_questions(payload, count, rng=rng)
-    if len(questions) < min(MIN_QUIZ_QUESTIONS, int(count)):
-        raise LearningContentError(
-            f"only {len(questions)} usable questions of {count} requested"
-        )
-    logger.info("quiz generated questions=%d requested=%d", len(questions), count)
-    return questions
-
-
-async def generate_flashcards(
-    session: aiohttp.ClientSession,
-    settings: Settings,
-    text: str,
-    size: int,
-) -> list[dict[str, str]]:
-    """Ask the note provider for a flashcard deck grounded in ``text``."""
-    payload = await complete_json(
-        session,
-        settings,
-        system=FLASHCARD_SYSTEM_PROMPT,
-        user=f"تعداد کارت: {int(size)}\n\nمتن جزوه:\n{bound_content(text)}",
-        schema=FLASHCARD_SCHEMA,
-    )
-    cards = normalize_cards(payload)
-    if len(cards) < MIN_FLASHCARDS:
-        raise LearningContentError(
-            f"only {len(cards)} usable cards of {size} requested"
-        )
-    return cards[: max(MIN_FLASHCARDS, int(size))]
-
-
-def deck_document_body(cards: list[dict[str, Any]]) -> str:
-    """Render a deck as the plain Markdown the RTL export understands."""
-    blocks = [
-        f"پرسش {index}: {card['front']}\nپاسخ: {card['back']}"
-        for index, card in enumerate(cards, start=1)
-    ]
-    return "\n\n".join(blocks)
+        validated.append({"front": front, "back": back})
+        if len(validated) >= int(count):
+            break
+    return validated

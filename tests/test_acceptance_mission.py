@@ -414,7 +414,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             payloads,
-            {b"library", b"wallet", b"board", b"support", b"help"},
+            {b"library", b"wallet", b"support", b"help", b"board"},
         )
 
         admin_labels = [button.text for row in self.bot._admin_menu() for button in row]

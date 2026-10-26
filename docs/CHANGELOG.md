@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+Learning loop add-on — quizzes, leaderboard and flashcards:
+
+- Booklets with extracted text gain an in-bot quiz (5/10/15 questions, `QUIZ_COST_SECONDS_PER_QUESTION`
+  debited per question before generation) and AI flashcard decks (`FLASHCARD_AI_COST_SECONDS` flat
+  charge, `FLASHCARD_AI_DECK_SIZE` pairs), plus manual decks, flip study mode and Word export.
+  Every non-durable generation path — model failure, malformed/short output, database error or
+  cancellation — refunds the full debit; unlimited users are never charged. A per-user in-flight
+  guard and lock reject parallel generations before any second debit, and admission caps
+  (`QUIZ_MAX_ACTIVE_HOURS`, `QUIZ_MAX_SESSIONS_PER_HOUR`, `FLASHCARD_MAX_DECKS_PER_USER`) are
+  enforced before charging.
+- All-time leaderboard (`🏆 برترین‌ها`) ranks users by quiz points (+10 per correct answer),
+  hides Telegram identifiers and excludes banned users. Admins can gift a paid plan's credit from
+  the board; the gift is audited, cooldown-limited against double taps, refused for admins/banned
+  users, and announced by best-effort DM.
+- Migrations 011 and 012 add display names, extracted booklet text and the quiz/flashcard tables.
+  Foreign keys cascade quiz rows when a library item is pruned while flashcard decks survive with
+  a nulled item reference, so library pruning can never raise an integrity error. Manual flashcard
+  conversations are disarmed at every navigation, `/start`, `/cancel` or other command.
+
 One-tap flow, wallet and Telegram-backed library (v4):
 
 - `/start` and every return to the user panel explain that a lecture file is the only action; audio,

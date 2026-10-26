@@ -100,11 +100,14 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({item["chat_id"] for item in items}, {OWNER})
         self.assertEqual(len({item["message_id"] for item in items}), 2)
         self.assertTrue(all(item["message_id"] != event.message.id for item in items))
-        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", items[0]["title"])
+        # The stored title stays clean; the storage line and learning CTA live
+        # in the Telegram caption only.
+        self.assertEqual(items[0]["title"], "📖 جزوهٔ Word — GMS-1")
         booklet_delivery = next(
             delivery for delivery in self.client.deliveries if str(delivery["path"]).endswith(".docx")
         )
         self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", booklet_delivery["caption"])
+        self.assertIn("آزمون بده", booklet_delivery["caption"])
 
     async def test_empty_library_uses_the_persian_empty_state(self):
         event = FakeCallbackEvent(OWNER, b"library")
@@ -130,11 +133,9 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("📚 کتابخانه من", first_text)
         self.assertIn("تعداد موارد: ۸", first_text)
         self.assertIn(b"lib:1", first_payloads)
-        # Every row now opens the detail screen; re-forwarding moved one tap
-        # deeper and is asserted in the learning-loop suite.
-        self.assertEqual(
-            sum(payload.startswith(b"lib:it:") for payload in first_payloads), 6
-        )
+        self.assertEqual(sum(payload.startswith(b"lib:it:") for payload in first_payloads), 6)
+        # The flashcard tab toggle is part of every populated library screen.
+        self.assertIn(b"library:fc", first_payloads)
         first_labels = " ".join(button.text for row in first_buttons for button in row)
         self.assertIn("درس 7", first_text + " " + first_labels)
         self.assertNotIn("خصوصی", first_text + " " + first_labels)
@@ -145,9 +146,7 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         _second_text, second_buttons = second.edits[-1]
         second_payloads = menu_payloads(second_buttons)
         self.assertIn(b"lib:0", second_payloads)
-        self.assertEqual(
-            sum(payload.startswith(b"lib:it:") for payload in second_payloads), 2
-        )
+        self.assertEqual(sum(payload.startswith(b"lib:it:") for payload in second_payloads), 2)
         labels = [button.text for row in second_buttons for button in row]
         self.assertTrue(any(label.startswith("📖 ") for label in labels))
 
@@ -301,6 +300,51 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         newest = (await self.db.library_list(OWNER, limit=1))[0]
         self.assertTrue(await self.db.library_mark_unavailable(newest["item_id"]))
         self.assertTrue((await self.db.library_item(OWNER, newest["item_id"]))["unavailable"])
+
+    async def _booklet(self, *, with_content: bool) -> int:
+        item_id = await self.db.library_add(
+            OWNER, "booklet", OWNER, 4321, None, title="📖 جزوهٔ Word — GMS-77"
+        )
+        if with_content:
+            await self.db.library_set_content(item_id, "متن کامل جزوه برای آزمون")
+        return item_id
+
+    async def test_detail_screen_offers_learning_actions_for_archived_booklet(self):
+        item_id = await self._booklet(with_content=True)
+        event = FakeCallbackEvent(OWNER, f"lib:it:{item_id}".encode())
+        await self.bot._handle_callback(event)
+        text, buttons = event.edits[-1]
+        self.assertIn("GMS-77", text)
+        payloads = menu_payloads(buttons)
+        self.assertIn(f"lib:f:{item_id}".encode(), payloads)
+        self.assertIn(f"quiz:new:{item_id}".encode(), payloads)
+        self.assertIn(f"fc:ai:{item_id}".encode(), payloads)
+        self.assertIn(b"lib:0", payloads)
+
+    async def test_detail_screen_legacy_booklet_shows_notice_without_learning_buttons(self):
+        item_id = await self._booklet(with_content=False)
+        event = FakeCallbackEvent(OWNER, f"lib:it:{item_id}".encode())
+        await self.bot._handle_callback(event)
+        text, buttons = event.edits[-1]
+        self.assertIn("قدیمی ذخیره نشده است", text)
+        payloads = menu_payloads(buttons)
+        self.assertIn(f"lib:f:{item_id}".encode(), payloads)
+        self.assertFalse(any(p.startswith(b"quiz:") or p.startswith(b"fc:") for p in payloads))
+
+    async def test_detail_screen_for_transcript_only_offers_redownload(self):
+        item_id = await self._add_item(OWNER, "متن خام", message_id=8800)
+        event = FakeCallbackEvent(OWNER, f"lib:it:{item_id}".encode())
+        await self.bot._handle_callback(event)
+        payloads = menu_payloads(event.edits[-1][1])
+        self.assertIn(f"lib:f:{item_id}".encode(), payloads)
+        self.assertFalse(any(p.startswith(b"quiz:") for p in payloads))
+
+    async def test_detail_screen_is_owner_scoped(self):
+        item_id = await self._booklet(with_content=True)
+        event = FakeCallbackEvent(OTHER, f"lib:it:{item_id}".encode())
+        await self.bot._handle_callback(event)
+        self.assertEqual(event.answers[-1][1], True)
+        self.assertFalse(event.edits)
 
 
 if __name__ == "__main__":

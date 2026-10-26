@@ -642,18 +642,19 @@ class Settings:
     #: Maximum number of delivered transcript/booklet references retained per user.
     library_max_items: int = 50
 
-    # --- Learning loop (quiz / leaderboard / flashcards) ---------------------
-    #: Credit seconds charged per quiz question, deducted before generation.
+    # --- Learning loop (quiz / flashcards) -----------------------------------
+    #: Credit (seconds) charged per generated quiz question, before generation.
     quiz_cost_seconds_per_question: int = 60
-    #: An untouched quiz is abandoned after this many hours so it cannot block a new one.
+    #: An active quiz untouched for longer is lazily expired on the next start.
     quiz_max_active_hours: int = 6
-    #: Quizzes a user may start within one rolling hour (per-user throttle).
+    #: Per-user cap on quiz sessions created in any rolling hour.
     quiz_max_sessions_per_hour: int = 3
-    #: Credit seconds charged for one AI-generated flashcard deck.
+    #: Credit (seconds) charged for one AI flashcard deck, before generation.
     flashcard_ai_cost_seconds: int = 300
-    #: Cards requested from the model for one AI deck.
+    #: Number of Q/A pairs requested for an AI deck (minimum 5: the validation
+    #: gate refunds a generation that cannot produce at least five cards).
     flashcard_ai_deck_size: int = 10
-    #: Decks retained per user; creating beyond this is refused, not silently pruned.
+    #: Per-user cap on stored flashcard decks (AI and manual counted together).
     flashcard_max_decks_per_user: int = 30
 
     # --- Derived --------------------------------------------------------------
@@ -1370,7 +1371,7 @@ def from_env(env_file: str | None = None) -> Settings:
         ),
         library_max_items=_env_int("LIBRARY_MAX_ITEMS", 50, minimum=1, maximum=10_000),
         quiz_cost_seconds_per_question=_env_int(
-            "QUIZ_COST_SECONDS_PER_QUESTION", 60, minimum=0, maximum=3600
+            "QUIZ_COST_SECONDS_PER_QUESTION", 60, minimum=1, maximum=86_400
         ),
         quiz_max_active_hours=_env_int(
             "QUIZ_MAX_ACTIVE_HOURS", 6, minimum=1, maximum=168
@@ -1379,13 +1380,13 @@ def from_env(env_file: str | None = None) -> Settings:
             "QUIZ_MAX_SESSIONS_PER_HOUR", 3, minimum=1, maximum=100
         ),
         flashcard_ai_cost_seconds=_env_int(
-            "FLASHCARD_AI_COST_SECONDS", 300, minimum=0, maximum=86_400
+            "FLASHCARD_AI_COST_SECONDS", 300, minimum=1, maximum=86_400
         ),
         flashcard_ai_deck_size=_env_int(
-            "FLASHCARD_AI_DECK_SIZE", 10, minimum=5, maximum=40
+            "FLASHCARD_AI_DECK_SIZE", 10, minimum=5, maximum=50
         ),
         flashcard_max_decks_per_user=_env_int(
-            "FLASHCARD_MAX_DECKS_PER_USER", 30, minimum=1, maximum=1000
+            "FLASHCARD_MAX_DECKS_PER_USER", 30, minimum=1, maximum=500
         ),
         dedup_window_seconds=_env_float(
             "DEDUP_WINDOW_SECONDS",
