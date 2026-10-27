@@ -768,6 +768,16 @@ class ReserveEstimateTests(unittest.TestCase):
         self.assertEqual(GamasBot._reserve_estimate(10.2), 11)
 
 
+class ByteTextTests(unittest.TestCase):
+    def test_zero_is_a_byte_count_not_a_kilobyte(self):
+        self.assertEqual(GamasBot._bytes_text(0), "۰ بایت")
+        self.assertEqual(GamasBot._bytes_text(-5), "۰ بایت")
+
+    def test_values_below_a_kilobyte_round_down(self):
+        self.assertEqual(GamasBot._bytes_text(1), "۰.۰ KB")
+        self.assertEqual(GamasBot._bytes_text(2048), "۲.۰ KB")
+
+
 class AdminDetectionTests(unittest.TestCase):
     def test_admin_membership(self):
         bot = GamasBot(make_settings(admin_ids=frozenset({1, 2})))

@@ -10,6 +10,7 @@ from dataclasses import replace
 from gamas_bot.db import Database, InsufficientBalanceError, OpenPaymentError, UserBannedError
 from gamas_bot.billing import format_toman
 from gamas_bot.jobs import Job
+from gamas_bot.progress import JobProgress
 from tests.test_db_billing import DatabaseTestCase
 from tests.test_bot import BotPipelineTestCase, FakeCallbackEvent, USER_ID, menu_payloads
 
@@ -288,6 +289,29 @@ class WorkflowBotTests(BotPipelineTestCase):
             await self.bot._run_job(job)
         process.assert_not_awaited()
         self.assertEqual((await self.db.submission(sid)).status, "rejected")
+
+    async def test_queued_banned_job_closes_its_progress_message(self):
+        # The banned-before-processing branch used to reject the job without
+        # touching the queue progress message, leaving it (and the animation
+        # ticker) alive next to the "cancelled" reply.
+        event = self.media_event()
+        await self.db.set_banned(USER_ID, True)
+        sid = await self.db.create_submission(USER_ID, "audio", "a")
+        progress = await JobProgress.create(event, submission_id=sid)
+        job = Job(
+            sid, USER_ID, "audio", "a",
+            message=event.message, meta={"progress": progress},
+        )
+        with mock.patch.object(self.bot, "_process_media", new_callable=mock.AsyncMock) as process:
+            await self.bot._run_job(job)
+        process.assert_not_awaited()
+        self.assertEqual((await self.db.submission(sid)).status, "rejected")
+        self.assertTrue(
+            any(
+                "پردازش تکمیل نشد" in text for text in event.edits + event.responses
+            ),
+            "the stale progress message must be replaced by a failure notice",
+        )
 
     async def test_exception_after_raw_delivery_preserves_billed_usage(self):
         event = self.media_event()

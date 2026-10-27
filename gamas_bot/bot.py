@@ -2941,7 +2941,7 @@ class GamasBot:
             if available < needed:
                 await event.reply(
                     f"⏳ اعتبار شما برای این ارائه کافی نیست.\n"
-                    f"لازم (حداقل برآورد): {format_duration(needed)} — "
+                    f"حداقل اعتبار برای برقراری در صف: {format_duration(needed)} — "
                     f"اعتبار فعلی: {format_duration(available)}\n"
                     "از «💳 حساب من» می‌توانید اعتبار بگیرید."
                 )
@@ -3058,8 +3058,13 @@ class GamasBot:
                 job.transition_to("cancelled")
                 await self._release(job, "user banned before processing")
                 await self.db.set_submission_status(
-                job.submission_id, "rejected", error="user banned", error_kind="banned"
-            )
+                    job.submission_id,
+                    "rejected",
+                    error="user banned",
+                    error_kind="banned",
+                )
+                if progress:
+                    await progress.fail(str(job.submission_id))
                 await self._reply(job, "⛔ درخواست صف‌شده به دلیل مسدودی حساب لغو شد.")
                 return
             await self.db.set_submission_status(job.submission_id, "processing")
@@ -4639,6 +4644,10 @@ class GamasBot:
     @staticmethod
     def _bytes_text(value: int) -> str:
         size = float(max(0, int(value)))
+        if size == 0:
+            # A zero byte count is a byte count, not a fractional kilobyte.
+            # ``size`` is the clamped value, so a negative input stays "۰ بایت".
+            return f"{to_persian_digits(int(size))} بایت"
         for unit in ("KB", "MB", "GB"):
             size /= 1024.0
             if size < 1024 or unit == "GB":
@@ -5228,6 +5237,11 @@ class GamasBot:
             receipt_state = "ثبت شده"
         elif payment["status"] in {"awaiting_payment", "pending", "cancelled"}:
             receipt_state = "ثبت نشده"
+        elif payment["status"] in {"approved", "rejected", "pending_review"}:
+            # A reviewed order whose receipt file was removed by retention is
+            # not "never submitted"; the prior audit separated those for the
+            # user copy and the admin detail must not conflate them either.
+            receipt_state = "پاسخ‌شده؛ رسید موجود نیست"
         else:
             receipt_state = "در دسترس نیست"
         lines = [
