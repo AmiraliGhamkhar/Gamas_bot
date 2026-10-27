@@ -976,7 +976,9 @@ class UnlimitedCommandTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.admin_id, b"adm:users")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn(f"⭐ ویژه | شناسه: {self.user_id}", text)
+        # R2.2: the identity line is `@username · شناسه: <id> · name`, with an
+        # em dash in place of a username Telegram never reported.
+        self.assertIn(f"⭐ ویژه | — · شناسه: {self.user_id} · —", text)
         self.assertIn("دستورهای مدیریت", text)
         self.assertIn("/unlimited <شناسه کاربر> on", text)
         self.assertIn("مثال: /grant 123456789 2", text)
@@ -1089,8 +1091,15 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
     def test_admin_menu_is_its_own_panel_with_way_back(self):
         payloads = menu_payloads(self.bot._admin_menu())
-        for section in (b"adm:home", b"adm:users", b"adm:pay", b"adm:bcast", b"adm:audit"):
+        # R1: payments/users/system collapsed into three single-entry hubs…
+        for section in (b"adm:home", b"adm:hub:pay", b"adm:hub:usr", b"adm:hub:sys"):
             self.assertIn(section, payloads)
+        # …while the sections that belong to no merge group are unchanged.
+        for section in (b"adm:bcast", b"adm:audit", b"adm:sup", b"adm:board"):
+            self.assertIn(section, payloads)
+        # The nine old top-level entries are gone from the menu itself…
+        for retired in (b"adm:users", b"adm:pay", b"adm:ph:0", b"adm:ovu:7d", b"adm:ovp:7d"):
+            self.assertNotIn(retired, payloads)
         self.assertIn(b"menu:main", payloads)
         self.assertNotIn(b"library", payloads)
         self.assertNotIn(b"wallet", payloads)

@@ -28,7 +28,7 @@ only Telegram chat/message references, never a server-side copy of the artifact.
 | Telegram, queue & stage gates | `bot.py`, `jobs.py`, `capacity.py`, `progress.py`, `telegram_text.py` |
 | Media and decks | `media.py`, `media_worker.py`, `presentations.py` |
 | Providers and notes | `stt.py`, `llm.py`, `http_util.py`, `transcript.py`, `textnorm.py`, `notes.py`, `notes_evidence.py` |
-| Documents | `docx_export.py`, `pdf_export.py`, `office.py`, `office_ai.py` (pure exports; retired UI), `mdblocks.py`, `bidi.py` |
+| Documents | `doc_extract.py` (PDF/Word/PowerPoint → locator-tagged sections → chunks), `docx_export.py`, `pdf_export.py`, `office.py`, `office_ai.py` (pure exports; retired UI), `mdblocks.py`, `bidi.py` |
 | Data, billing and reporting | `db.py`, `billing.py`, `metrics.py`, `migrations/v3/` |
 
 ## Rules

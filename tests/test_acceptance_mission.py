@@ -418,8 +418,12 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         )
 
         admin_labels = [button.text for row in self.bot._admin_menu() for button in row]
-        self.assertIn("💳 پرداخت‌های در انتظار", admin_labels)
-        self.assertIn("📋 تاریخچه پرداخت‌ها", admin_labels)
+        # R1: the nine payment/user/health buttons are three hubs now.
+        self.assertIn("💳 پرداخت‌ها", admin_labels)
+        self.assertIn("👥 کاربران", admin_labels)
+        self.assertIn("🩺 سامانه", admin_labels)
+        self.assertNotIn("💳 پرداخت‌های در انتظار", admin_labels)
+        self.assertNotIn("📋 تاریخچه پرداخت‌ها", admin_labels)
         self.assertIn("🎧 مدیریت پشتیبانی", admin_labels)
         self.assertIn("🏆 برترین کاربران", admin_labels)
         self.assertIn("↩️ پنل کاربری", admin_labels)

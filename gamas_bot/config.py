@@ -650,6 +650,10 @@ class Settings:
     office_job_concurrency: int = DEFAULT_OFFICE_JOB_CONCURRENCY
     #: Maximum number of delivered transcript/booklet references retained per user.
     library_max_items: int = 50
+    #: Ceiling for an ingested study document (PDF/DOCX/PPTX), in bytes. Kept
+    #: separate from ``max_file_size`` because a document is parsed into memory
+    #: instead of streamed through the media worker.
+    doc_max_bytes: int = 50 * 1024 * 1024
 
     # --- Learning loop (quiz / flashcards) -----------------------------------
     #: Credit (seconds) charged per generated quiz question, before generation.
@@ -665,6 +669,9 @@ class Settings:
     flashcard_ai_deck_size: int = 10
     #: Per-user cap on stored flashcard decks (AI and manual counted together).
     flashcard_max_decks_per_user: int = 30
+    #: Parallel per-chunk model calls used by one generation (3–5 is the useful
+    #: range; higher starts tripping provider per-minute limits).
+    learning_chunk_concurrency: int = 4
 
     # --- Derived --------------------------------------------------------------
     plan_values: dict[str, int] = field(default_factory=dict, compare=False)
@@ -1085,6 +1092,9 @@ def from_env(env_file: str | None = None) -> Settings:
         max_file_size=_env_int(
             "MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE_BYTES, minimum=1024
         ),
+        doc_max_bytes=_env_int(
+            "DOC_MAX_BYTES", 50 * 1024 * 1024, minimum=1024, maximum=1024**3
+        ),
         max_media_duration_seconds=_env_float(
             "MAX_MEDIA_DURATION_SECONDS",
             DEFAULT_MAX_MEDIA_DURATION_SECONDS,
@@ -1402,6 +1412,9 @@ def from_env(env_file: str | None = None) -> Settings:
         ),
         flashcard_max_decks_per_user=_env_int(
             "FLASHCARD_MAX_DECKS_PER_USER", 30, minimum=1, maximum=500
+        ),
+        learning_chunk_concurrency=_env_int(
+            "LEARNING_CHUNK_CONCURRENCY", 4, minimum=1, maximum=8
         ),
         dedup_window_seconds=_env_float(
             "DEDUP_WINDOW_SECONDS",

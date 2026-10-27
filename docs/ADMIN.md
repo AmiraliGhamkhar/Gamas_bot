@@ -27,15 +27,60 @@ The dashboard answers three questions before anything else:
 3. **What needs attention now?** Pending receipt reviews, failures in the window by category,
    credit expiring within 7 days, database errors, and provider timeouts / rate limits.
 
-Under it are four drill-downs. Each one carries the same window selector and a way back.
+## Three hubs (`adm:hub:*`)
 
-| Screen | Callback | Shows |
+The panel used to expose nine sibling buttons for payments, users and system health. They are now
+three single-entry hubs. Each hub opens on its most-used view and keeps the rest one tap deeper.
+
+| Hub | Callback | Default view | Deeper |
+| --- | --- | --- | --- |
+| 💳 پرداخت‌ها | `adm:hub:pay` | Pending-receipt orders (order id · user identity · amount · date); tap a row for the order detail with ✅ تأیید / ❌ رد با دلیل | `adm:hub:pay:hist:<status>[:<page>]` (history, filtered by همه / در انتظار / تأییدشده / ردشده), `adm:hub:pay:stats` (the old `adm:ovpay:` statistics) |
+| 👥 کاربران | `adm:hub:usr` | Search box: send a numeric id or `@username`; the recent-user list is under it | `adm:hub:usr:stats` (old `adm:ovu:` report), `adm:hub:usr:pending` (users with receipts awaiting review), `adm:hub:usr:banned` (blocked list), `adm:hub:usr:card:<id>` (user card) |
+| 🩺 سامانه | `adm:hub:sys` | Live status: uptime, live jobs, peak memory, database/WAL size, last successful processing, provider state | `adm:hub:sys:proc` (stage timings, failure categories, STT engine usage, failover counts, daily chart) |
+
+Broadcast, support management, the audit trail and the leaderboard belong to none of those groups
+and are unchanged at the top level. The admin menu is exactly:
+
+```
+📊 آمار و وضعیت   💳 پرداخت‌ها
+👥 کاربران        🩺 سامانه
+🎧 مدیریت پشتیبانی
+📣 ارسال پیام     🛡 گزارش فعالیت‌ها
+🏆 برترین کاربران
+↩️ پنل کاربری
+```
+
+**Old callbacks still work.** `adm:ovpay:<window>`, `adm:ovu:<window>`, `adm:ovp:<window>`,
+`adm:ovs`, `adm:pay[:page]`, `adm:ph:<page>`, `adm:users` and `adm:pd:<id>` are all still routed, so
+an admin whose keyboard was rendered before the deploy never hits a dead button. The four report
+screens keep their window selector (`adm:ov*:<window>`) and a way back to the dashboard.
+
+The dashboard (`adm:home`) itself keeps the three questions and the window selector, and offers the
+three hubs instead of the four old drill-down buttons.
+
+## User identity everywhere
+
+Every admin list and card renders `@username · شناسه: <id> · <name>`, with an em dash where
+Telegram never reported a username. The numeric id is always present next to the handle: a
+`@username` can be renamed or reused, so it is never shown without the id that owns the row.
+
+The user card (`adm:hub:usr:card:<id>`) shows the handle, the id, the display name, credit,
+order count, deck count, both free-gift states, join and last-seen timestamps, and four actions:
+
+| Button | Callback | Effect |
 | --- | --- | --- |
-| نمای کلی | `adm:ov:<window>` | The three questions above |
-| کاربران | `adm:ovu:<window>` | Totals, new/active/delivered users, blocked and unlimited counts, daily chart |
-| پردازش | `adm:ovp:<window>` | Status and type breakdown, timing series, per-stage times, failure categories, STT engine usage, failover counts, daily chart |
-| پرداخت و اعتبار | `adm:ovpay:<window>` | Pending reviews, orders created/approved/rejected in the window, approved amount, approval rate, credit expiring soon |
-| سلامت سیستم | `adm:ovs` | Uptime, live jobs, peak memory, database/WAL size, last successful processing, provider state, retention settings |
+| 🔄 بازنشانی هدیه رایگان | `adm:hub:usr:fr:<id>` → `adm:hub:usr:frx:<id>` | Restores the user's free first flashcard deck and free first quiz (confirmation first), audited as `free_use_reset` |
+| 🚫 مسدودکردن / ✅ رفع مسدودی | `adm:hub:usr:tg:<id>` | Toggles the ban flag, audited |
+
+Search accepts both forms: a numeric id resolves exactly, `@username` resolves case-insensitively
+and offers a choice when several accounts share the handle. Billing state transitions, ledger writes
+and the `ADMIN_IDS` check are untouched by all of this.
+
+## Users (identity columns)
+
+Migration 013 adds `users.username`, `users.last_name` and `users.last_seen_at`. The upsert on every
+authorised interaction refreshes them; `username` is nullable because Telegram users may have none.
+`telegram_id` is SQLite `INTEGER` end to end, so ids above 2^53 round-trip exactly.
 
 Windows: **امروز** is the current UTC day; **۷ روز / ۳۰ روز** are rolling windows ending now; **کل**
 is the whole history. Reporting is UTC end to end, because every timestamp is stored as UTC

@@ -154,6 +154,10 @@ class FakeSentMessage:
 
     async def edit(self, text: str = "", buttons=None) -> "FakeSentMessage":
         self.record["text"] = text
+        # Telegram replaces the keyboard on edit; recording it keeps assertions
+        # on a screen that is delivered by editing a progress message honest.
+        if buttons is not None:
+            self.record["buttons"] = buttons
         if self.client.recorder is not None:
             self.client.recorder.edits.append(text)
         return self

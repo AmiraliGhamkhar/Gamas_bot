@@ -67,6 +67,16 @@ kill long processes; run one active worker and test the host before relying on i
   references, not copied to local disk. Users can forward a saved file back to themselves later.
 - The Wallet combines remaining balance, plan purchase and recent payment history. Card-to-card
   receipts remain subject to administrator review.
+- Send a study document (PDF, Word `.docx`, PowerPoint) to extract its text instead of transcribing
+  it: the bot stores the extraction in the library under **📄 اسناد**, shows a short preview, and
+  offers **🃏 ساخت فلش‌کارت** / **❓ ساخت سؤالات** from exactly that file. Extraction is pure Python,
+  per page or per slide, and re-uploading an identical file reuses the stored extraction (deduped by
+  SHA-256). Files up to `DOC_MAX_BYTES` (default 50 MB) are accepted.
+- Quizzes and AI flashcard decks offer three size presets — «⚡ سریع ۱۰» (10 cards / 5 questions),
+  «⭐ استاندارد ۲۰», «🎯 کامل ۴۰» — generated in parallel chunks with live progress, then shown as a
+  preview where every unwanted item can be deleted before the deck or quiz is saved.
+- The first flashcard deck and the first quiz are free of charge for every user (full quality, same
+  models). Once used, the paywall offers the wallet.
 
 ## Processing support
 
@@ -76,7 +86,8 @@ kill long processes; run one active worker and test the host before relying on i
 - Notes: Gemini, NaraRouter, OpenRouter, Groq, Cerebras, Anthropic, OpenAI-compatible.
 - SQLite billing ledger with card-to-card purchases reviewed by an admin.
 
-OCR for images and scanned PDFs is **not** supported. The former Free Office bot UI is retired;
+OCR for images and scanned PDFs is **not** supported: a PDF that yields less than ~10 characters per
+page is refused with a Persian explanation instead of storing an empty document. The former Free Office bot UI is retired;
 plain text and text-file submissions no longer start document jobs. `OFFICE_ENABLED` defaults to
 `false`; the pure export modules remain in the repository for reuse and testing.
 

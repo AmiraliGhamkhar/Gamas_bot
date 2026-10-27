@@ -24,13 +24,29 @@ duration before transcription starts.
 Learning features bill the same integer-second ledger, per user, from booklets with extracted
 text. Legacy items whose text was never stored cannot start a generation and are never charged.
 
-- **Quiz.** The start screen offers 5, 10 or 15 questions. The price is
-  `count × QUIZ_COST_SECONDS_PER_QUESTION` (default 60 s), i.e. 5, 10 or 15 credit minutes at the
-  shipped tariff. The debit happens **before** the model call, with ledger note
-  `quiz-pending:{item_id}`.
-- **AI flashcard deck.** One flat charge of `FLASHCARD_AI_COST_SECONDS` (default 300 s = 5 minutes)
-  per generated deck, regardless of its size (`FLASHCARD_AI_DECK_SIZE`, default 10 pairs).
-  Manual decks and the Word export are free.
+- **Quiz.** The start screen offers three size presets — «⚡ سریع ۱۰» (10 questions), «⭐ استاندارد ۲۰»
+  (20) and «🎯 کامل ۴۰» (20 questions) — and the price is `count × QUIZ_COST_SECONDS_PER_QUESTION`
+  (default 60 s), i.e. 10, 20 or 20 credit minutes at the shipped tariff. The debit happens
+  **before** the model call, with ledger note `quiz-pending:{item_id}` (or
+  `quiz-pending:doc:{document_id}` for a document).
+- **AI flashcard deck.** One charge of `FLASHCARD_AI_COST_SECONDS` (default 300 s = 5 minutes),
+  **scaled by the requested size**: the presets ask for 10, 20 or 40 cards
+  (`FLASHCARD_AI_DECK_SIZE`, default 10 pairs, is the reference size), so a «⚡ سریع ۱۰» deck costs
+  the base charge, «⭐ استاندارد ۲۰» costs twice it and «🎯 کامل ۴۰» four times it. Manual decks and
+  the Word export are free.
+- **Curation is free and reversible.** Generated items are shown in a preview where each one can be
+  deleted before saving. Nothing is charged twice, and «❌ انصراف» behaves exactly like a failed
+  generation: the debit is refunded and a claimed free first try is restored, because nothing was
+  delivered.
+- **First try is free (R3).** Every user's *first* AI flashcard deck and *first* quiz are free, at
+  full quality and with the same models; the wallet is only opened from the second one. The gift is
+  claimed **before** any model call by one atomic, row-locked claim
+  (`free_uses`, one row per user, `UPDATE … WHERE used = 0` with `rowcount == 1`), so two concurrent
+  taps can never both run free. A generation that fails, the model output that stays below the
+  validity floor, or a cancelled preview restores the gift (and the credit, if any was spent); the
+  gift stays consumed only once a valid deck/quiz was generated **and** delivered. Unlimited users
+  are never charged and therefore never consume the gift. Administrators can restore it from the
+  user card (🔄 بازنشانی هدیه رایگان, audited as `free_use_reset`).
 - **Full refund on every non-durable path.** If the model fails, returns malformed or too-short
   output (fewer than five valid questions/cards), the database write fails, or the task is
   cancelled (including shutdown), the full debit is refunded in one transaction

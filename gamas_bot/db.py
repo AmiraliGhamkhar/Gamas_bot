@@ -118,6 +118,7 @@ class UserRow:
     joined_at: str
     banned: bool
     first_name: str = ""
+    username: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -360,25 +361,83 @@ class Database:
 
     # ------------------------------------------------------------------ users
     async def ensure_user(
-        self, telegram_id: int, first_name: str | None = None
+        self,
+        telegram_id: int,
+        first_name: str | None = None,
+        *,
+        username: str | None = None,
+        last_name: str | None = None,
     ) -> UserRow:
+        """Upsert the user and refresh the identity fields we were given.
+
+        ``telegram_id`` is bound as a Python ``int`` and the column is SQLite
+        ``INTEGER``, so a 64-bit Telegram id (well above 2**53) round-trips
+        exactly: nothing here converts it to float or formats it as a string.
+        A double ``/start`` therefore hits the primary key instead of creating a
+        second row, and a username change overwrites the previous value.
+        """
+        telegram_id = int(telegram_id)
+        now = iso(utc_now())
         await self._write(
-            "INSERT OR IGNORE INTO users(telegram_id, joined_at) VALUES (?, ?)",
-            (telegram_id, iso(utc_now())),
+            "INSERT OR IGNORE INTO users(telegram_id, joined_at, last_seen_at) "
+            "VALUES (?, ?, ?)",
+            (telegram_id, now, now),
         )
-        # The leaderboard renders first names only, never ids or usernames, so
-        # the name is refreshed opportunistically whenever the dispatch layer
-        # has one. An empty/None argument must never blank a stored name.
-        if first_name:
-            await self.set_first_name(telegram_id, first_name)
+        await self.update_identity(
+            telegram_id,
+            first_name=first_name,
+            username=username,
+            last_name=last_name,
+        )
         row = await _rows(self.db,
-            "SELECT telegram_id, joined_at, banned, first_name "
+            "SELECT telegram_id, joined_at, banned, first_name, username "
             "FROM users WHERE telegram_id = ?",
             (telegram_id,),
         )
         if not row:
             raise RuntimeError(f"user {telegram_id} vanished after insert")
-        return UserRow(row[0][0], row[0][1], bool(row[0][2]), str(row[0][3] or ""))
+        return UserRow(
+            int(row[0][0]),
+            row[0][1],
+            bool(row[0][2]),
+            str(row[0][3] or ""),
+            str(row[0][4] or ""),
+        )
+
+    async def update_identity(
+        self,
+        user_id: int,
+        *,
+        first_name: str | None = None,
+        username: str | None = None,
+        last_name: str | None = None,
+    ) -> None:
+        """Refresh the latest-known identity and stamp ``last_seen_at``.
+
+        ``username=None`` means "Telegram did not tell us this time", so the
+        stored value is kept; an empty string means "the user has no username
+        now" and clears it. Names are bounded because they are rendered in the
+        admin panel and on the public leaderboard.
+        """
+        sets = ["last_seen_at = ?"]
+        params: list[Any] = [iso(utc_now())]
+        if first_name is not None:
+            bounded = " ".join(str(first_name).split())[:64]
+            if bounded:
+                sets.append("first_name = ?")
+                params.append(bounded)
+        if last_name is not None:
+            sets.append("last_name = ?")
+            params.append(" ".join(str(last_name).split())[:64])
+        if username is not None:
+            cleaned = " ".join(str(username).split()).lstrip("@")[:64]
+            sets.append("username = ?")
+            params.append(cleaned or None)
+        params.append(int(user_id))
+        await self._write(
+            f"UPDATE users SET {', '.join(sets)} WHERE telegram_id = ?",
+            tuple(params),
+        )
 
     async def set_first_name(self, user_id: int, first_name: str) -> None:
         """Store the bounded display name used by the public leaderboard."""
@@ -424,6 +483,8 @@ class Database:
         now = iso(utc_now())
         rows = await _rows(self.read_db,
             "SELECT u.telegram_id, u.joined_at, u.banned, u.is_unlimited, "
+            "COALESCE(u.username, '') AS username, "
+            "COALESCE(u.first_name, '') AS first_name, "
             "COALESCE(("
             "  SELECT SUM(MAX(0, l.seconds "
             "    - COALESCE((SELECT SUM(a.seconds) FROM debit_allocations a "
@@ -443,14 +504,162 @@ class Database:
         )
         return [
             {
-                "telegram_id": row[0],
+                "telegram_id": int(row[0]),
                 "joined_at": row[1],
                 "banned": bool(row[2]),
                 "is_unlimited": bool(row[3]),
-                "available_seconds": int(row[4]),
+                "username": str(row["username"] or ""),
+                "first_name": str(row["first_name"] or ""),
+                "available_seconds": int(row["available_seconds"] or 0),
             }
             for row in rows
         ]
+
+    async def search_users(self, query: str, limit: int = 5) -> list[dict[str, Any]]:
+        """Find users by exact numeric id or by ``@username`` (case-insensitive).
+
+        Both lookups are parameterised and return the same row shape as
+        ``list_users``, so every admin screen can render one identity line
+        without branching on how the user was found.
+        """
+        token = " ".join(str(query or "").split()).lstrip("@")
+        if not token:
+            return []
+        columns = (
+            "u.telegram_id, u.joined_at, u.banned, u.is_unlimited, "
+            "COALESCE(u.username, '') AS username, "
+            "COALESCE(u.first_name, '') AS first_name, "
+            "COALESCE(u.last_name, '') AS last_name, "
+            "u.last_seen_at"
+        )
+        if token.isdigit():
+            rows = await _rows(
+                self.read_db,
+                f"SELECT {columns} FROM users u WHERE u.telegram_id = ?",
+                (int(token),),
+            )
+        else:
+            rows = await _rows(
+                self.read_db,
+                f"SELECT {columns} FROM users u "
+                "WHERE LOWER(COALESCE(u.username, '')) = LOWER(?) "
+                "ORDER BY u.last_seen_at DESC, u.telegram_id LIMIT ?",
+                (token, int(limit)),
+            )
+        return [
+            {
+                "telegram_id": int(row[0]),
+                "joined_at": row[1],
+                "banned": bool(row[2]),
+                "is_unlimited": bool(row[3]),
+                "username": str(row[4] or ""),
+                "first_name": str(row[5] or ""),
+                "last_name": str(row[6] or ""),
+                "last_seen_at": row[7],
+            }
+            for row in rows
+        ]
+
+    async def blocked_users(self, limit: int = 50) -> list[dict[str, Any]]:
+        """Users currently blocked from the bot, newest identity first."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT telegram_id, COALESCE(username, ''), COALESCE(first_name, ''), "
+            "COALESCE(last_name, ''), banned, last_seen_at FROM users "
+            "WHERE banned = 1 ORDER BY last_seen_at DESC, telegram_id DESC LIMIT ?",
+            (int(limit),),
+        )
+        return [
+            {
+                "telegram_id": int(row[0]),
+                "username": str(row[1] or ""),
+                "first_name": str(row[2] or ""),
+                "last_name": str(row[3] or ""),
+                "banned": bool(row[4]),
+                "last_seen_at": row[5],
+            }
+            for row in rows
+        ]
+
+    # -------------------------------------------------------------- free uses
+    FREE_USE_COLUMNS: dict[str, str] = {
+        "deck": "free_deck_used",
+        "quiz": "free_quiz_used",
+    }
+
+    def _free_use_column(self, kind: str) -> str:
+        column = self.FREE_USE_COLUMNS.get(str(kind))
+        if column is None:
+            raise ValueError(f"unknown free-use kind {kind!r}")
+        return column
+
+    async def free_use_state(self, user_id: int) -> dict[str, bool]:
+        """Which free first tries this user still has (missing row = both free)."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT free_deck_used, free_quiz_used FROM free_uses WHERE user_id = ?",
+            (int(user_id),),
+        )
+        if not rows:
+            return {"deck": True, "quiz": True}
+        return {"deck": not int(rows[0][0]), "quiz": not int(rows[0][1])}
+
+    async def consume_free_use(self, user_id: int, kind: str) -> bool:
+        """Atomically claim one free first try; ``False`` when already used.
+
+        The claim is a single ``UPDATE ... WHERE free_x_used = 0`` whose rowcount
+        decides the winner, so two concurrent generations can never both take
+        the same gift (the loser sees ``False`` and falls through to the normal
+        credit path). Runs before any model call, never after.
+        """
+        column = self._free_use_column(kind)
+        now = iso(utc_now())
+        async with self._transaction():
+            await self.db.execute(
+                "INSERT OR IGNORE INTO free_uses(user_id, free_deck_used, "
+                "free_quiz_used, updated_at) VALUES (?, 0, 0, ?)",
+                (int(user_id), now),
+            )
+            cursor = await self.db.execute(
+                f"UPDATE free_uses SET {column} = 1, updated_at = ? "
+                f"WHERE user_id = ? AND {column} = 0",
+                (now, int(user_id)),
+            )
+            claimed = cursor.rowcount == 1
+        return claimed
+
+    async def refund_free_use(self, user_id: int, kind: str) -> bool:
+        """Give a claimed free try back after a provider/system fault."""
+        column = self._free_use_column(kind)
+        async with self._transaction():
+            cursor = await self.db.execute(
+                f"UPDATE free_uses SET {column} = 0, updated_at = ? "
+                f"WHERE user_id = ? AND {column} = 1",
+                (iso(utc_now()), int(user_id)),
+            )
+            return cursor.rowcount == 1
+
+    async def reset_free_uses(
+        self, user_id: int, *, admin_id: int, detail: str = "free gift reset"
+    ) -> None:
+        """Admin action: restore both free first tries and audit the change."""
+        now = iso(utc_now())
+        async with self._transaction():
+            await self.db.execute(
+                "INSERT OR IGNORE INTO free_uses(user_id, free_deck_used, "
+                "free_quiz_used, updated_at) VALUES (?, 0, 0, ?)",
+                (int(user_id), now),
+            )
+            await self.db.execute(
+                "UPDATE free_uses SET free_deck_used = 0, free_quiz_used = 0, "
+                "updated_at = ? WHERE user_id = ?",
+                (now, int(user_id)),
+            )
+            await self.db.execute(
+                "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (admin_id, "free_use_reset", str(detail)[:200], int(user_id), now),
+            )
 
     async def is_unlimited(self, user_id: int) -> bool:
         rows = await _rows(self.read_db,
@@ -872,8 +1081,8 @@ class Database:
             for idx, question in enumerate(questions):
                 await self.db.execute(
                     "INSERT INTO quiz_questions(session_id, idx, question, "
-                    "options_json, correct_index, explanation) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    "options_json, correct_index, explanation, source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         session_id,
                         idx,
@@ -881,6 +1090,7 @@ class Database:
                         json.dumps(question["options"], ensure_ascii=False),
                         int(question["correct_index"]),
                         str(question.get("explanation", "")),
+                        str(question.get("source", ""))[:120],
                     ),
                 )
             return session_id
@@ -903,7 +1113,7 @@ class Database:
         rows = await _rows(
             self.read_db,
             "SELECT q.question_id, q.idx, q.question, q.options_json, "
-            "q.correct_index, q.explanation, s.current_index, s.question_count "
+            "q.correct_index, q.explanation, q.source, s.current_index, s.question_count "
             "FROM quiz_questions q JOIN quiz_sessions s ON s.session_id = q.session_id "
             "WHERE q.session_id = ? AND s.status = 'active' "
             "AND q.idx = s.current_index",
@@ -1083,21 +1293,216 @@ class Database:
         ]
 
     async def user_identity(self, user_id: int) -> dict[str, Any] | None:
-        """Display identity + flags for admin screens and gift validation."""
+        """Display identity + flags for admin screens and gift validation.
+
+        ``username`` is the latest known one (empty string when Telegram never
+        reported one) and is always shown next to the numeric id, so a renamed
+        account can never be mistaken for a different user.
+        """
         rows = await _rows(
             self.read_db,
-            "SELECT telegram_id, first_name, banned, is_unlimited "
+            "SELECT telegram_id, first_name, banned, is_unlimited, "
+            "COALESCE(username, ''), COALESCE(last_name, ''), last_seen_at, joined_at "
             "FROM users WHERE telegram_id = ?",
             (int(user_id),),
         )
         if not rows:
             return None
-        return {
+        identity = {
             "telegram_id": int(rows[0][0]),
             "first_name": str(rows[0][1] or ""),
             "banned": bool(rows[0][2]),
             "is_unlimited": bool(rows[0][3]),
+            "username": str(rows[0][4] or ""),
+            "last_name": str(rows[0][5] or ""),
+            "last_seen_at": rows[0][6],
+            "joined_at": rows[0][7],
         }
+        identity["free_uses"] = await self.free_use_state(int(user_id))
+        return identity
+
+    async def identities_for(self, user_ids: Iterable[int]) -> dict[int, dict[str, Any]]:
+        """Identities for a batch of ids, for admin lists that name many owners.
+
+        One query per screen instead of one per row; ids that were never seen
+        are simply absent and the caller falls back to the bare number.
+        """
+        wanted = sorted({int(value) for value in user_ids})
+        if not wanted:
+            return {}
+        placeholders = ",".join("?" for _ in wanted)
+        rows = await _rows(
+            self.read_db,
+            "SELECT telegram_id, COALESCE(username, ''), COALESCE(first_name, ''), "
+            "COALESCE(last_name, '') FROM users "
+            f"WHERE telegram_id IN ({placeholders})",
+            tuple(wanted),
+        )
+        return {
+            int(row[0]): {
+                "telegram_id": int(row[0]),
+                "username": str(row[1] or ""),
+                "first_name": str(row[2] or ""),
+                "last_name": str(row[3] or ""),
+            }
+            for row in rows
+        }
+
+    # -------------------------------------------------------------- documents
+    async def document_add(
+        self,
+        user_id: int,
+        *,
+        file_msg_ref: str,
+        title: str,
+        source_type: str,
+        page_count: int,
+        sha256: str,
+        text: str,
+        chunks_json: str,
+        library_item_id: int | None = None,
+    ) -> tuple[int, bool]:
+        """Store one extracted document; returns ``(id, created)``.
+
+        ``created=False`` means this exact file (same ``sha256``) was already
+        ingested by this user, so the caller reuses the stored extraction
+        instead of paying for a second download/parse.
+        """
+        user_id = int(user_id)
+        existing = await self.document_by_hash(user_id, sha256)
+        if existing is not None:
+            return int(existing["id"]), False
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "INSERT INTO documents(user_id, file_msg_ref, title, source_type, "
+                "page_count, sha256, text, chunks_json, library_item_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(user_id, sha256) DO NOTHING",
+                (
+                    user_id,
+                    str(file_msg_ref)[:200],
+                    str(title)[:200],
+                    str(source_type),
+                    int(page_count),
+                    str(sha256),
+                    str(text),
+                    str(chunks_json),
+                    int(library_item_id) if library_item_id else None,
+                    iso(utc_now()),
+                ),
+            )
+            created = cursor.rowcount == 1
+            row_id = int(cursor.lastrowid or 0)
+        if not created:
+            again = await self.document_by_hash(user_id, sha256)
+            if again is None:  # pragma: no cover - conflict then vanished
+                raise RuntimeError("document insert conflicted but row is missing")
+            return int(again["id"]), False
+        return row_id, True
+
+    async def document_by_hash(self, user_id: int, sha256: str) -> dict[str, Any] | None:
+        rows = await _rows(
+            self.read_db,
+            "SELECT id, user_id, file_msg_ref, title, source_type, page_count, "
+            "sha256, text, chunks_json, library_item_id, created_at FROM documents "
+            "WHERE user_id = ? AND sha256 = ?",
+            (int(user_id), str(sha256)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def document_get(self, user_id: int, document_id: int) -> dict[str, Any] | None:
+        """Owner-scoped document lookup: a foreign id is invisible."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT id, user_id, file_msg_ref, title, source_type, page_count, "
+            "sha256, text, chunks_json, library_item_id, created_at FROM documents "
+            "WHERE id = ? AND user_id = ?",
+            (int(document_id), int(user_id)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def documents_list(
+        self, user_id: int, limit: int = 6, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Library listing without the (potentially huge) extracted text."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT id, user_id, file_msg_ref, title, source_type, page_count, "
+            "sha256, library_item_id, created_at FROM documents "
+            "WHERE user_id = ? ORDER BY id DESC LIMIT ? OFFSET ?",
+            (int(user_id), int(limit), int(offset)),
+        )
+        return [dict(row) for row in rows]
+
+    async def document_set_library_item(
+        self, document_id: int, library_item_id: int
+    ) -> None:
+        """Link a document to its mirrored library item (created lazily)."""
+        await self._write(
+            "UPDATE documents SET library_item_id = ? WHERE id = ?",
+            (int(library_item_id), int(document_id)),
+        )
+
+    async def document_count(self, user_id: int) -> int:
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM documents WHERE user_id = ?",
+            (int(user_id),),
+        )
+        return int(rows[0][0]) if rows else 0
+
+    # ----------------------------------------------------------- integrity
+    #: Every column in the schema that must reference ``users(telegram_id)``.
+    #: The integrity check below walks them all, so a new table that forgets the
+    #: reference shows up as a violation instead of as a silent orphan.
+    USER_REFERENCE_COLUMNS: tuple[tuple[str, str], ...] = (
+        ("submissions", "user_id"),
+        ("library_items", "user_id"),
+        ("ledger", "user_id"),
+        ("holds", "user_id"),
+        ("payments", "user_id"),
+        ("quiz_sessions", "user_id"),
+        ("flashcard_decks", "user_id"),
+        ("free_uses", "user_id"),
+        ("documents", "user_id"),
+        ("audit", "subject_user"),
+    )
+
+    async def user_reference_integrity(self) -> list[str]:
+        """Return human-readable violations of the ``users`` references.
+
+        Runs ``PRAGMA foreign_key_check`` (which validates every declared
+        foreign key) plus an explicit orphan scan of each user-referencing
+        column, and asserts ``telegram_id`` is stored with INTEGER affinity —
+        the three properties requirement R2.3 asks to be *provable*.
+        """
+        problems: list[str] = []
+        fk_rows = await _rows(self.read_db, "PRAGMA foreign_key_check")
+        for row in fk_rows:
+            problems.append(
+                f"foreign_key_check: table={row[0]} rowid={row[1]} parent={row[2]}"
+            )
+        for table, column in self.USER_REFERENCE_COLUMNS:
+            try:
+                orphans = await _rows(
+                    self.read_db,
+                    f"SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL "
+                    f"AND {column} NOT IN (SELECT telegram_id FROM users)",
+                )
+            except sqlite3.Error:
+                # A deployment that has not created the table yet is not a
+                # violation of the invariant; it simply has nothing to check.
+                continue
+            count = int(orphans[0][0]) if orphans else 0
+            if count:
+                problems.append(f"orphan rows: {table}.{column} = {count}")
+        affinity = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM users WHERE typeof(telegram_id) != 'integer'",
+        )
+        if affinity and int(affinity[0][0]):
+            problems.append(f"users.telegram_id not stored as INTEGER: {affinity[0][0]}")
+        return problems
 
     # ----------------------------------------------------- learning: flashcards
     async def deck_count(self, user_id: int) -> int:
@@ -1145,9 +1550,15 @@ class Database:
             deck_id = int(cursor.lastrowid or 0)
             for idx, card in enumerate(cards):
                 await self.db.execute(
-                    "INSERT INTO flashcards(deck_id, idx, front, back) "
-                    "VALUES (?, ?, ?, ?)",
-                    (deck_id, idx, str(card["front"]), str(card["back"])),
+                    "INSERT INTO flashcards(deck_id, idx, front, back, source) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        deck_id,
+                        idx,
+                        str(card["front"]),
+                        str(card["back"]),
+                        str(card.get("source", ""))[:120],
+                    ),
                 )
             return deck_id
 
@@ -1193,7 +1604,7 @@ class Database:
     async def deck_cards(self, deck_id: int) -> list[dict[str, Any]]:
         rows = await _rows(
             self.read_db,
-            "SELECT card_id, deck_id, idx, front, back FROM flashcards "
+            "SELECT card_id, deck_id, idx, front, back, source FROM flashcards "
             "WHERE deck_id = ? ORDER BY idx",
             (int(deck_id),),
         )
@@ -1202,7 +1613,7 @@ class Database:
     async def deck_card(self, deck_id: int, card_id: int) -> dict[str, Any] | None:
         rows = await _rows(
             self.read_db,
-            "SELECT card_id, idx, front, back FROM flashcards "
+            "SELECT card_id, idx, front, back, source FROM flashcards "
             "WHERE deck_id = ? AND card_id = ?",
             (int(deck_id), int(card_id)),
         )
@@ -2068,11 +2479,20 @@ class Database:
             )
             return int(rows[0][0]) if rows else 0
 
-    async def all_payments(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+    async def all_payments(
+        self, limit: int = 50, offset: int = 0, status: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Newest orders first, optionally narrowed to one status (audit filter)."""
+        where = ""
+        params: tuple[Any, ...] = (int(limit), int(offset))
+        if status:
+            where = "WHERE status = ? "
+            params = (str(status), int(limit), int(offset))
         async with self._write_lock:
             rows = await _rows(self.db,
-                f"SELECT {self._PAYMENT_COLUMNS} FROM payments ORDER BY payment_id DESC LIMIT ? OFFSET ?",
-                (limit, offset),
+                f"SELECT {self._PAYMENT_COLUMNS} FROM payments {where}"
+                "ORDER BY payment_id DESC LIMIT ? OFFSET ?",
+                params,
             )
             return [dict(row) for row in rows]
 
