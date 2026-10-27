@@ -268,12 +268,13 @@ SUPPORT_CATEGORY_BUTTONS = {
 # ------------------------------------------------------------- learning loop
 #: Shown on booklets delivered before content archiving existed.
 LEARNING_LEGACY_NOTICE = (
-    "متن این جزوهٔ قدیمی ذخیره نشده است؛ آزمون و فلش‌کارت فقط برای جزوه‌های جدید فعال است."
+    "متن این جزوهٔ قدیمی ذخیره نشده است.\n"
+    "🧪 آزمون و 🃏 فلش‌کارت فقط برای جزوه‌های تازه کار می‌کند."
 )
 #: §6.1 quiz start guidance.
 QUIZ_START_GUIDANCE = (
-    "با این آزمون دانش خود را از این جزوه بسنجید؛ هر پاسخ درست ۱۰ امتیاز دارد. "
-    "ابتدا تعداد سؤال‌ها را انتخاب کنید:"
+    "تعداد سؤال‌ها را انتخاب کنید.\n"
+    "هر پاسخ درست ۱۰ امتیاز دارد."
 )
 #: §6.3 empty leaderboard.
 LEADERBOARD_EMPTY = (
@@ -289,16 +290,17 @@ FLASHCARD_EMPTY = (
 )
 #: §6.10 the balance denial shared by quiz and AI flashcard generation.
 LEARNING_NO_CREDIT = (
-    "اعتبار شما برای این کار کافی نیست. از «🛒 خرید اشتراک» می‌توانید اعتبار خریداری کنید."
+    "💳 اعتبار شما کافی نیست.\n"
+    "از «🛒 خرید اشتراک» اعتبار بگیرید."
 )
 #: §6.11 every refunded generation failure.
 LEARNING_GENERATION_FAILED = (
-    "ساخت محتوا ناموفق بود؛ اعتبار شما کامل برگشت داده شد. "
-    "لطفاً کمی بعد دوباره امتحان کنید."
+    "ساخت محتوا ناموفق بود؛ اعتبار شما کامل برگشت داده شد.\n"
+    "کمی بعد دوباره امتحان کنید."
 )
 #: Appended to booklet captions (§6.12); the stored library title stays clean.
 LEARNING_DELIVERY_CTA = (
-    "\n🧪 از همین جزوه آزمون بده یا 🃏 فلش‌کارت بساز: «کتابخانه من»"
+    "\n🧪 از همین جزوه آزمون بده یا 🃏 فلش‌کارت بساز: «📚 کتابخانه من»"
 )
 #: Manual flashcard conversation prompts (§6.14).
 FLASHCARD_ASK_FRONT = "پرسش کارت را بفرستید:"
@@ -1239,22 +1241,16 @@ class GamasBot:
             user_id, self._free_plan_seconds()
         ):
             logger.info("free plan granted")
-        greeting = "به گاماس خوش آمدید. 🎓" if first_start else "منوی اصلی"
-        introduction = (
-            "فایل درس‌تان را همین‌جا بفرستید؛ دکمه لازم نیست:\n"
-            "• فایل صوتی یا ویدیویی کلاس، یا پیام صوتی/ویدیویی تلگرام\n"
-            "• یا فایل پاورپوینت (.pptx)\n\n"
-        )
+        greeting = "🎓 به گاماس خوش آمدید" if first_start else "منوی اصلی"
+        upload_line = "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 پاورپوینت."
         if self.settings.note_configured:
-            introduction += (
-                "ابتدا متن کامل گفتار و بلافاصله پس از آن جزوهٔ ورد برایتان ارسال می‌شود.\n"
-                "هر متن و جزوه به‌صورت خودکار در «📚 کتابخانه من» ذخیره می‌شود."
-            )
+            delivery = "متن گفتار، سپس 📄 جزوهٔ ورد می‌آید؛ در «📚 کتابخانه من» ذخیره می‌شود."
         else:
-            introduction += "متن کامل گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ ورد در حال حاضر فعال نیست."
+            delivery = "متن گفتار می‌آید؛ ساخت جزوهٔ ورد فعلاً فعال نیست."
         text = (
-            f"{greeting}\n\n{introduction}\n\n"
-            f"⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
+            f"{greeting}\n\n"
+            f"{upload_line}\n{delivery}\n\n"
+            f"💳 اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
         )
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
 
@@ -2494,19 +2490,14 @@ class GamasBot:
             await self._ack(event)
             guide = (
                 "ℹ️ راهنمای گاماس\n\n"
-                "۱. فایل صوتی، ویدیویی یا پاورپوینت درس را در همین چت بفرستید؛ دکمه لازم نیست.\n"
-                "۲. ابتدا متن کامل گفتار به‌صورت فایل متنی ارسال می‌شود.\n"
-                "۳. سپس جزوهٔ ورد (Word) آماده و ارسال می‌شود.\n"
-                "۴. همهٔ متن‌ها و جزوه‌ها در «📚 کتابخانه من» می‌مانند و هر زمان می‌توانید دوباره دریافت‌شان کنید.\n\n"
-                "«🛒 خرید اشتراک»: موجودی، خرید اشتراک و پرداخت‌های شما در یک صفحه.\n"
-                "«🎧 پشتیبانی»: اگر مشکل یا سؤالی داشتید، تیکت بزنید.\n\n"
-                "🧪 از هر جزوه می‌توانید آزمون چندگزینه‌ای بگیرید؛ هر پاسخ درست ۱۰ امتیاز دارد "
-                "و امتیازها در «🏆 لیدربورد» جمع می‌شود. 🃏 همچنین می‌توانید از جزوه‌ها فلش‌کارت "
-                "بسازید (با هوش مصنوعی یا دستی) و آن‌ها را کارت‌به‌کارت مرور کنید. ساخت آزمون و "
-                "فلش‌کارت هوش مصنوعی از اعتبار شما کم می‌کند و در صورت خطا برمی‌گردد.\n\n"
-                "اعتبار بر اساس مدت فایل صوتی و پس از ارسال متن خام محاسبه می‌شود. "
-                "اگر ارسال متن خام ناموفق باشد، اعتبار مصرف نمی‌شود. "
-                "پس از دریافت متن خام، خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود."
+                "🎧 فایل صوت/ویدیو یا 📄 پاورپوینت درس را همین‌جا بفرستید.\n"
+                "📄 متن گفتار و جزوهٔ ورد می‌آید و در «📚 کتابخانه من» ذخیره می‌شود.\n"
+                "🧪 آزمون و 🃏 فلش‌کارت از همان جزوه ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
+                "🛒 خرید اشتراک: بسته‌ها و موجودی. 🎧 پشتیبانی: تیکت بزنید.\n\n"
+                "💳 اعتبار بر حسب ثانیه است و پس از ارسال متن خام محاسبه می‌شود.\n"
+                "اگر متن خام نرسد، اعتباری کم نمی‌شود.\n"
+                "ساخت 🧪 آزمون و 🃏 فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق بود، اعتبار کامل برمی‌گردد.\n"
+                "پس از دریافت متن خام، خطای ساخت جزوه اعتبار را برنمی‌گرداند."
             )
             await event.respond(
                 guide,
@@ -2780,7 +2771,7 @@ class GamasBot:
             self._support_admin_states.pop(user_id, None)
             self._pending_flashcard.pop(user_id, None)
             self._pending_flashcard_front.pop(user_id, None)
-            await event.reply("ارسال لغو شد. برای لغو سفارش، از «🛒 خرید اشتراک» اقدام کنید.")
+            await event.reply("ارسال لغو شد. لغو سفارش از «🛒 خرید اشتراک».")
             return
 
         # Manual flashcard conversation: armed by fc:man and disarmed by any
@@ -2826,8 +2817,7 @@ class GamasBot:
             return
         if text:
             await event.reply(
-                "برای شروع، فایل صوتی، ویدیویی یا پاورپوینت درس را بفرستید؛ "
-                "متن گفتار و جزوهٔ ورد به‌صورت خودکار ارسال می‌شود.",
+                "همین‌جا فایل 🎧 صوت/ویدیو یا 📄 پاورپوینت درس را بفرستید؛ متن و جزوه می‌آید.",
                 buttons=self._user_menu(is_admin=self._is_admin(user_id)),
             )
 
@@ -2866,10 +2856,9 @@ class GamasBot:
                 else "مدت فایل نامشخص است"
             )
             await event.reply(
-                f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
-                f"{measured} — لازم (دست‌کم): {format_duration(needed)} — "
-                f"اعتبار فعلی: {format_duration(available)}\n"
-                "از «🛒 خرید اشتراک» می‌توانید اعتبار بگیرید."
+                f"💳 اعتبار شما کافی نیست.\n"
+                f"{measured} | لازم: {format_duration(needed)} | شما: {format_duration(available)}\n"
+                "از «🛒 خرید اشتراک» اعتبار بگیرید."
             )
             return
         try:
@@ -2940,10 +2929,9 @@ class GamasBot:
             needed = self._reserve_estimate(None)
             if available < needed:
                 await event.reply(
-                    f"⏳ اعتبار شما برای این ارائه کافی نیست.\n"
-                    f"حداقل اعتبار برای برقراری در صف: {format_duration(needed)} — "
-                    f"اعتبار فعلی: {format_duration(available)}\n"
-                    "از «🛒 خرید اشتراک» می‌توانید اعتبار بگیرید."
+                    f"💳 اعتبار شما کافی نیست.\n"
+                    f"لازم: {format_duration(needed)} | شما: {format_duration(available)}\n"
+                    "از «🛒 خرید اشتراک» اعتبار بگیرید."
                 )
                 return
         try:
@@ -3092,9 +3080,8 @@ class GamasBot:
             if progress:
                 await progress.fail(str(job.submission_id))
             await self._reply(job, (
-                f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
-                f"لازم: {format_duration(exc.required_seconds)} — "
-                f"موجودی: {format_duration(exc.available_seconds)}\n"
+                f"💳 اعتبار شما کافی نیست.\n"
+                f"لازم: {format_duration(exc.required_seconds)} | شما: {format_duration(exc.available_seconds)}\n"
                 "از «🛒 خرید اشتراک» اعتبار بگیرید."
             ))
         except USER_VISIBLE_ERRORS as exc:
@@ -4087,9 +4074,9 @@ class GamasBot:
 
         plans = [plan for plan in await self.db.plans() if plan["price"] > 0]
         if not plans:
-            lines.append("در حال حاضر بسته‌ای برای خرید موجود نیست.")
+            lines.append("فعلاً بسته‌ای برای خرید موجود نیست.")
         else:
-            lines.append("بسته را انتخاب کنید؛ اعتبار خریدها با موجودی شما جمع می‌شود.")
+            lines.append("بسته را انتخاب کنید؛ اعتبار خرید به موجودی شما اضافه می‌شود.")
             for plan in plans:
                 hours = float(plan["hours"])
                 hours_text = to_persian_digits(
@@ -4108,7 +4095,7 @@ class GamasBot:
                         [Button.inline(label, f"plan:{plan['code']}".encode("utf-8"))]
                     )
             if not self.settings.payment_card_number:
-                lines.append("\nپرداخت کارت‌به‌کارت در حال حاضر غیرفعال است.")
+                lines.append("\n🛒 پرداخت کارت‌به‌کارت فعلاً غیرفعال است.")
 
         # Balance and history follow the plans (purchase-first ordering).
         lines.extend([
@@ -4160,14 +4147,14 @@ class GamasBot:
             # Never create a payable request the user cannot pay for: without
             # a configured card there is nowhere to send the money.
             await event.respond(
-                "پرداخت کارت‌به‌کارت در حال حاضر فعال نیست؛ لطفاً بعداً دوباره امتحان کنید."
+                "🛒 پرداخت کارت‌به‌کارت فعلاً فعال نیست؛ کمی بعد دوباره امتحان کنید."
             )
             return
         try:
             payment_id = await self.db.create_payment(event.sender_id, plan_code)
         except OpenPaymentError:
             await event.respond(
-                "⚠️ یک سفارش باز دارید. ابتدا آن را پیگیری یا لغو کنید.",
+                "⚠️ یک سفارش باز دارید؛ اول آن را پیگیری یا لغو کنید.",
                 buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
             )
             return
@@ -4181,7 +4168,7 @@ class GamasBot:
         if (payment is None or payment["user_id"] != event.sender_id
                 or not is_open_payment(payment["status"])):
             await event.respond(
-                "این سفارش فعال نیست؛ وضعیت آن را در «🛒 خرید اشتراک» ببینید.",
+                "این سفارش فعال نیست. وضعیت را در «🛒 خرید اشتراک» ببینید.",
                 buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
             )
             return
@@ -4209,15 +4196,15 @@ class GamasBot:
             self._pending_payments.pop(event.sender_id, None)
             text = (
                 f"{summary}\n\n"
-                "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است؛ نیازی به واریز مجدد نیست. "
-                "پس از بررسی، نتیجه اطلاع‌رسانی می‌شود."
+                "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است.\n"
+                "نیازی به واریز مجدد نیست؛ پس از بررسی مدیر، نتیجه اطلاع‌رسانی می‌شود."
             )
             buttons = []
         elif not self.settings.payment_card_number:
             self._pending_payments.pop(event.sender_id, None)
             text = (
                 f"{summary}\n\n"
-                "پرداخت کارت‌به‌کارت فعلاً در دسترس نیست؛ سفارش را لغو کنید یا بعداً دوباره بررسی کنید."
+                "پرداخت کارت‌به‌کارت فعلاً در دسترس نیست؛ سفارش را لغو کنید یا بعداً امتحان کنید."
             )
             buttons = [[Button.inline("لغو سفارش", f"payc:{payment_id}".encode())]]
         else:
@@ -4242,8 +4229,8 @@ class GamasBot:
         changed = await self.db.cancel_payment(payment_id, event.sender_id)
         self._pending_payments.pop(event.sender_id, None)
         await event.respond(
-            "درخواست خرید لغو شد." if changed else
-            "این درخواست قابل لغو نیست؛ رسید ارسال‌شده باید توسط مدیر بررسی شود."
+            "سفارش لغو شد." if changed else
+            "این سفارش قابل لغو نیست؛ رسید ارسال‌شده باید توسط مدیر بررسی شود."
         )
         await self._show_wallet(event)
 
@@ -4346,8 +4333,8 @@ class GamasBot:
             await event.respond("این سفارش دیگر برای ارسال رسید فعال نیست.")
             return
         await event.respond(
-            "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است. "
-            "پس از بررسی، نتیجه اطلاع‌رسانی می‌شود."
+            "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است.\n"
+            "پس از بررسی مدیر، نتیجه اطلاع‌رسانی می‌شود."
         )
         await self._notify_admins_of_payment(payment_id)
 
@@ -4509,7 +4496,7 @@ class GamasBot:
                 await self.client.send_message(
                     payment["user_id"],
                     "✅ پرداخت شما تأیید شد. اشتراک شما فعال است.\n"
-                    f"⏳ {format_duration(seconds)} اعتبار اضافه شد.",
+                    f"💳 {format_duration(seconds)} اعتبار اضافه شد.",
                     buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
                 )
             except Exception:
