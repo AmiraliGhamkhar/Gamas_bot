@@ -289,7 +289,7 @@ FLASHCARD_EMPTY = (
 )
 #: §6.10 the balance denial shared by quiz and AI flashcard generation.
 LEARNING_NO_CREDIT = (
-    "اعتبار شما برای این کار کافی نیست. از «💳 حساب من» می‌توانید اعتبار خریداری کنید."
+    "اعتبار شما برای این کار کافی نیست. از «🛒 خرید اشتراک» می‌توانید اعتبار خریداری کنید."
 )
 #: §6.11 every refunded generation failure.
 LEARNING_GENERATION_FAILED = (
@@ -1200,7 +1200,7 @@ class GamasBot:
         this same four-button menu, regardless of provider configuration.
         """
         rows = [
-            [Button.inline("📚 کتابخانه من", b"library"), Button.inline("💳 حساب من", b"wallet")],
+            [Button.inline("📚 کتابخانه من", b"library"), Button.inline("🛒 خرید اشتراک", b"wallet")],
             [Button.inline("🏆 لیدربورد", b"board"), Button.inline("🎧 پشتیبانی", b"support")],
             [Button.inline("ℹ️ راهنما", b"help")],
         ]
@@ -1352,7 +1352,7 @@ class GamasBot:
                         Button.inline("📖 جزوه‌ها", b"library"),
                         Button.inline("🃏 فلش‌کارت‌ها", b"library:fc"),
                     ],
-                    [Button.inline("💳 حساب من", b"wallet")],
+                    [Button.inline("🛒 خرید اشتراک", b"wallet")],
                     [Button.inline("↩️ منوی اصلی", b"menu:main")],
                 ]
             )
@@ -1366,7 +1366,7 @@ class GamasBot:
                     Button.inline("📖 جزوه‌ها", b"library"),
                     Button.inline("🃏 فلش‌کارت‌ها", b"library:fc"),
                 ],
-                [Button.inline("💳 حساب من", b"wallet")],
+                [Button.inline("🛒 خرید اشتراک", b"wallet")],
                 [Button.inline("↩️ منوی اصلی", b"menu:main")],
             ],
         )
@@ -1542,7 +1542,7 @@ class GamasBot:
         except InsufficientBalanceError:
             await event.respond(
                 LEARNING_NO_CREDIT,
-                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+                buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
             )
             return
         placeholder = await event.respond("در حال ساخت سؤال‌ها… ⏳")
@@ -1982,7 +1982,7 @@ class GamasBot:
         except InsufficientBalanceError:
             await event.respond(
                 LEARNING_NO_CREDIT,
-                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+                buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
             )
             return
         placeholder = await event.respond("در حال ساخت فلش‌کارت‌ها… ⏳")
@@ -2498,7 +2498,7 @@ class GamasBot:
                 "۲. ابتدا متن کامل گفتار به‌صورت فایل متنی ارسال می‌شود.\n"
                 "۳. سپس جزوهٔ ورد (Word) آماده و ارسال می‌شود.\n"
                 "۴. همهٔ متن‌ها و جزوه‌ها در «📚 کتابخانه من» می‌مانند و هر زمان می‌توانید دوباره دریافت‌شان کنید.\n\n"
-                "«💳 حساب من»: موجودی، خرید اشتراک و پرداخت‌های شما در یک صفحه.\n"
+                "«🛒 خرید اشتراک»: موجودی، خرید اشتراک و پرداخت‌های شما در یک صفحه.\n"
                 "«🎧 پشتیبانی»: اگر مشکل یا سؤالی داشتید، تیکت بزنید.\n\n"
                 "🧪 از هر جزوه می‌توانید آزمون چندگزینه‌ای بگیرید؛ هر پاسخ درست ۱۰ امتیاز دارد "
                 "و امتیازها در «🏆 لیدربورد» جمع می‌شود. 🃏 همچنین می‌توانید از جزوه‌ها فلش‌کارت "
@@ -2780,7 +2780,7 @@ class GamasBot:
             self._support_admin_states.pop(user_id, None)
             self._pending_flashcard.pop(user_id, None)
             self._pending_flashcard_front.pop(user_id, None)
-            await event.reply("ارسال لغو شد. برای لغو سفارش، از «💳 حساب من» اقدام کنید.")
+            await event.reply("ارسال لغو شد. برای لغو سفارش، از «🛒 خرید اشتراک» اقدام کنید.")
             return
 
         # Manual flashcard conversation: armed by fc:man and disarmed by any
@@ -2869,7 +2869,7 @@ class GamasBot:
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
                 f"{measured} — لازم (دست‌کم): {format_duration(needed)} — "
                 f"اعتبار فعلی: {format_duration(available)}\n"
-                "از «💳 حساب من» می‌توانید اعتبار بگیرید."
+                "از «🛒 خرید اشتراک» می‌توانید اعتبار بگیرید."
             )
             return
         try:
@@ -2943,7 +2943,7 @@ class GamasBot:
                     f"⏳ اعتبار شما برای این ارائه کافی نیست.\n"
                     f"حداقل اعتبار برای برقراری در صف: {format_duration(needed)} — "
                     f"اعتبار فعلی: {format_duration(available)}\n"
-                    "از «💳 حساب من» می‌توانید اعتبار بگیرید."
+                    "از «🛒 خرید اشتراک» می‌توانید اعتبار بگیرید."
                 )
                 return
         try:
@@ -3095,7 +3095,7 @@ class GamasBot:
                 f"⏳ اعتبار شما برای این فایل کافی نیست.\n"
                 f"لازم: {format_duration(exc.required_seconds)} — "
                 f"موجودی: {format_duration(exc.available_seconds)}\n"
-                "از «💳 حساب من» اعتبار بگیرید."
+                "از «🛒 خرید اشتراک» اعتبار بگیرید."
             ))
         except USER_VISIBLE_ERRORS as exc:
             kind = classify_failure(job.state, exc)
@@ -4049,17 +4049,17 @@ class GamasBot:
         }.get(status, "نامشخص")
 
     async def _show_wallet(self, event, *, payments_page: int = 0) -> None:
-        """One scrollable account view: balance, purchase options and history."""
+        """One scrollable purchase view: plans, then balance, then history.
+
+        CR-1: the purchase block leads the screen; balance and recent payments
+        stay on the same single screen, only moved below the plans.
+        """
         user_id = event.sender_id
         if user_id is None:
             return
         page_size = 5
         payments_page = max(0, int(payments_page))
         lines = [
-            "💳 حساب من",
-            "",
-            f"⏳ اعتبار باقی‌مانده: {await self._balance_text(user_id)}",
-            "",
             "🛒 خرید اشتراک",
             "",
         ]
@@ -4110,7 +4110,13 @@ class GamasBot:
             if not self.settings.payment_card_number:
                 lines.append("\nپرداخت کارت‌به‌کارت در حال حاضر غیرفعال است.")
 
-        lines.extend(["", "🧾 پرداخت‌های اخیر"])
+        # Balance and history follow the plans (purchase-first ordering).
+        lines.extend([
+            "",
+            f"💳 اعتبار باقی‌مانده: {await self._balance_text(user_id)}",
+            "",
+            "🧾 پرداخت‌های اخیر",
+        ])
         payments = await self.db.payment_history_paginated(
             user_id, limit=page_size + 1, offset=payments_page * page_size
         )
@@ -4162,7 +4168,7 @@ class GamasBot:
         except OpenPaymentError:
             await event.respond(
                 "⚠️ یک سفارش باز دارید. ابتدا آن را پیگیری یا لغو کنید.",
-                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+                buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
             )
             return
         except ValueError:
@@ -4175,8 +4181,8 @@ class GamasBot:
         if (payment is None or payment["user_id"] != event.sender_id
                 or not is_open_payment(payment["status"])):
             await event.respond(
-                "این سفارش فعال نیست؛ وضعیت آن را در «💳 حساب من» ببینید.",
-                buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+                "این سفارش فعال نیست؛ وضعیت آن را در «🛒 خرید اشتراک» ببینید.",
+                buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
             )
             return
         if not payment["purchased_seconds"] or payment["purchased_price"] is None:
@@ -4229,7 +4235,7 @@ class GamasBot:
                 [Button.inline("📤 ارسال رسید", f"payr:{payment_id}".encode())],
                 [Button.inline("لغو سفارش", f"payc:{payment_id}".encode())],
             ]
-        buttons.append([Button.inline("↩️ حساب من", b"wallet")])
+        buttons.append([Button.inline("🛒 خرید اشتراک", b"wallet")])
         await event.respond(text, buttons=buttons)
 
     async def _cancel_payment(self, event, payment_id: int) -> None:
@@ -4504,7 +4510,7 @@ class GamasBot:
                     payment["user_id"],
                     "✅ پرداخت شما تأیید شد. اشتراک شما فعال است.\n"
                     f"⏳ {format_duration(seconds)} اعتبار اضافه شد.",
-                    buttons=[[Button.inline("💳 حساب من", b"wallet")]],
+                    buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
                 )
             except Exception:
                 logger.warning(

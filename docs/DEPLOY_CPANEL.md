@@ -169,14 +169,14 @@ tail -n 80 data/logs/bot.log
 Smoke test after the first start (use an admin account and a small test order):
 
 1. `/start` shows the one-tap lecture guide and exactly four user buttons: «📚 کتابخانه من»,
-   «💳 حساب من», «🎧 پشتیبانی» and «ℹ️ راهنما» (admins also see «🛠 پنل مدیریت»). No mode button is
+   «🛒 خرید اشتراک», «🎧 پشتیبانی» and «ℹ️ راهنما» (admins also see «🛠 پنل مدیریت»). No mode button is
    required before sending a test audio file; verify the transcript arrives before the Word booklet
    and that both Telegram documents appear in the library.
 2. Open a library item and verify the bot forwards the saved Telegram message. A deleted source should
    show «این فایل دیگر در دسترس نیست.» and mark the library row unavailable.
 3. Create a ticket from «🎧 پشتیبانی», filter it under «🎧 مدیریت پشتیبانی» (`📂 جدید` + category),
    and reply to it. Confirm both notifications and that the history remains after `/start` and restart.
-4. Open «💳 حساب من»: confirm balance, plan options and recent payments share the same screen. Create
+4. Open «🛒 خرید اشتراک»: confirm plan options come first, then balance and recent payments on the same screen. Create
    an order, send a receipt directly (photo or PNG/JPEG/WebP file), and open it from the wallet or
    `payopen`. The first approval tap must only show confirmation; «✅ تأیید نهایی» activates credit
    once. Reject another test order and verify its reason reaches the user without granting credit.
