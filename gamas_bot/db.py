@@ -42,6 +42,39 @@ logger = logging.getLogger(__name__)
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations" / "v3"
 
+#: Every application table a fully migrated database must contain (the
+#: ``schema_migrations`` bookkeeping table excluded). CI's migration gate and
+#: ``tests/test_migration_schema.py`` both compare against this one set, so a
+#: new migration that adds a table cannot silently drift from the gate.
+APPLICATION_TABLES: frozenset[str] = frozenset(
+    {
+        "users",
+        "submissions",
+        "transcriptions",
+        "plans",
+        "payments",
+        "ledger",
+        "holds",
+        "audit",
+        "debit_allocations",
+        "hold_allocations",
+        "billing_migrations",
+        "support_tickets",
+        "support_messages",
+        "support_ticket_seq",
+        # Migration 010 (library), 012 (learning loop) and 013 (admin hubs,
+        # free first try, documents).
+        "library_items",
+        "quiz_sessions",
+        "quiz_questions",
+        "quiz_answers",
+        "flashcard_decks",
+        "flashcards",
+        "free_uses",
+        "documents",
+    }
+)
+
 
 async def _rows(
     connection: aiosqlite.Connection,

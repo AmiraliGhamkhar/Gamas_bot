@@ -47,7 +47,7 @@ jobs:
           import tempfile
           from pathlib import Path
 
-          from gamas_bot.db import Database, MIGRATIONS_DIR
+          from gamas_bot.db import APPLICATION_TABLES, Database, MIGRATIONS_DIR
 
           async def main() -> None:
               with tempfile.TemporaryDirectory() as tmp:
@@ -68,17 +68,9 @@ jobs:
                           "AND name != 'schema_migrations'"
                       )
                       tables = {row["name"] for row in rows}
-                      expected_tables = {
-                          "users", "submissions", "transcriptions", "plans",
-                          "payments", "ledger", "holds", "audit",
-                          "debit_allocations", "hold_allocations", "billing_migrations",
-                          "support_tickets", "support_messages", "support_ticket_seq",
-                          # Migration 010 (library) and 012 (learning loop).
-                          "library_items",
-                          "quiz_sessions", "quiz_questions", "quiz_answers",
-                          "flashcard_decks", "flashcards",
-                      }
-                      assert tables == expected_tables, f"unexpected application tables: {tables}"
+                      assert tables == set(APPLICATION_TABLES), (
+                          f"unexpected application tables: {tables ^ set(APPLICATION_TABLES)}"
+                      )
                       print(f"applied {len(applied)} migration(s); verified {len(tables)} application tables")
                   finally:
                       await db.close()
