@@ -550,7 +550,18 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
             ]
         }
 
+    async def spend_free_try(self, kind: str = "deck") -> None:
+        """Claim the gift up-front, so a test can exercise the paid path."""
+        self.assertTrue(await self.db.consume_free_use(OWNER, kind))
+
+    async def save_curation(self, kind: str = "deck") -> None:
+        prefix = "fc" if kind == "deck" else "quiz"
+        await self.bot._handle_callback(self._event(f"{prefix}:cur:save".encode()))
+
     async def test_ai_generation_debits_and_builds_deck(self):
+        # The paid path: the free first try is already spent, so this deck is
+        # charged, previewed, and only written after «✅ ذخیره» (R5.1 curation).
+        await self.spend_free_try("deck")
         event = self._event(f"fc:go:{self.item_id}".encode())
         with mock.patch(
             "gamas_bot.bot.complete_json",
@@ -558,6 +569,8 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         ) as generator:
             await self.bot._handle_callback(event)
             generator.assert_awaited_once()
+        self.assertEqual(await self.db.deck_count(OWNER), 0)  # nothing saved yet
+        await self.save_curation("deck")
         self.assertEqual(await self.db.available_seconds(OWNER), 3300)
         decks = await self.db.decks_list(OWNER)
         self.assertEqual(len(decks), 1)
@@ -574,6 +587,7 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
             new=mock.AsyncMock(return_value=self._cards_payload(6)),
         ):
             await self.bot._handle_callback(event)
+        await self.save_curation("deck")
         debits = await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
         )
@@ -599,6 +613,7 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(LEARNING_GENERATION_FAILED, self.client.texts[-1]["text"])
 
     async def test_insufficient_balance_denies_without_generation(self):
+        await self.spend_free_try("deck")
         await self.db.db.execute("DELETE FROM ledger WHERE user_id=?", (OWNER,))
         await self.db.db.commit()
         event = self._event(f"fc:go:{self.item_id}".encode())
@@ -760,6 +775,14 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         event.client = self.client
         return event
 
+    async def spend_free_try(self, kind: str = "quiz") -> None:
+        """Claim the gift up-front, so a test can exercise the paid path."""
+        self.assertTrue(await self.db.consume_free_use(OWNER, kind))
+
+    async def save_curation(self, kind: str = "quiz") -> None:
+        prefix = "fc" if kind == "deck" else "quiz"
+        await self.bot._handle_callback(self._event(f"{prefix}:cur:save".encode()))
+
     @staticmethod
     def _payloads(buttons) -> set[bytes]:
         return menu_payloads(buttons)
@@ -773,13 +796,15 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(event)
         record = event.edits[-1]
         self.assertIn("آزمون از جزوه", record["text"])
-        for count in (5, 10, 15):
+        # R5.3 size presets: سریع ۵ سؤال · استاندارد ۱۰ · کامل ۲۰.
+        for count in (5, 10, 20):
             self.assertIn(
                 f"quiz:go:{self.item_id}:{count}".encode(),
                 self._payloads(record["buttons"]),
             )
 
     async def test_generation_debits_then_full_quiz_completes_with_rank(self):
+        await self.spend_free_try("quiz")
         with mock.patch("gamas_bot.learning.random.shuffle"):
             with mock.patch(
                 "gamas_bot.bot.complete_json",
@@ -788,6 +813,8 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
                 event = self._event(f"quiz:go:{self.item_id}:5".encode())
                 await self.bot._handle_callback(event)
                 generator.assert_awaited_once()
+        # Generation ends on the curation preview; the session exists after save.
+        await self.save_curation("quiz")
         # A lot-aware debit exists with allocations.
         debits = await self.db.db.execute_fetchall(
             "SELECT id, seconds, note FROM ledger WHERE user_id=? AND kind='debit'",
@@ -830,6 +857,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 50)
 
     async def test_llm_failure_refunds_in_full_and_shows_notice(self):
+        await self.spend_free_try("quiz")
         with mock.patch(
             "gamas_bot.bot.complete_json",
             new=mock.AsyncMock(side_effect=LLMError("boom")),
@@ -846,6 +874,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(refund[0][0], 1)
 
     async def test_cancellation_refunds_clears_the_in_flight_marker_and_retries(self):
+        await self.spend_free_try("quiz")
         with mock.patch(
             "gamas_bot.bot.complete_json",
             new=mock.AsyncMock(side_effect=asyncio.CancelledError()),
@@ -863,6 +892,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         ):
             retry = self._event(f"quiz:go:{self.item_id}:5".encode())
             await self.bot._handle_callback(retry)
+        await self.save_curation("quiz")
         sessions = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM quiz_sessions")
         self.assertEqual(sessions[0][0], 1)
 
@@ -877,6 +907,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(LEARNING_GENERATION_FAILED, self.client.texts[-1]["text"])
 
     async def test_insufficient_balance_denies_without_debit(self):
+        await self.spend_free_try("quiz")
         await self.db.db.execute(
             "DELETE FROM ledger WHERE user_id=?", (OWNER,)
         )
@@ -899,6 +930,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(
                 self._event(f"quiz:go:{self.item_id}:5".encode())
             )
+        await self.save_curation("quiz")
         session_id = (await self.db.db.execute_fetchall(
             "SELECT session_id FROM quiz_sessions"
         ))[0][0]
@@ -922,6 +954,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(
                 self._event(f"quiz:go:{self.item_id}:5".encode())
             )
+        await self.save_curation("quiz")
         session_id = (await self.db.db.execute_fetchall(
             "SELECT session_id FROM quiz_sessions"
         ))[0][0]
@@ -946,6 +979,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(
                 self._event(f"quiz:go:{self.item_id}:5".encode())
             )
+        await self.save_curation("quiz")
         session_id = (await self.db.db.execute_fetchall(
             "SELECT session_id FROM quiz_sessions"
         ))[0][0]
@@ -976,6 +1010,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         ):
             event = self._event(f"quiz:go:{self.item_id}:5".encode())
             await self.bot._handle_callback(event)
+        await self.save_curation("quiz")
         debits = await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
         )
@@ -990,6 +1025,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             return quiz_payload(5)
 
+        await self.spend_free_try("quiz")
         with mock.patch(
             "gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=hold_then_answer)
         ):
@@ -999,6 +1035,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
                 self.bot._handle_callback(first),
                 self.bot._handle_callback(second),
             )
+        await self.save_curation("quiz")
         # Only one generation and one debit; the second tap was rejected.
         debits = await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM ledger WHERE kind='debit'"
@@ -1031,6 +1068,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(
                 self._event(f"quiz:go:{self.item_id}:5".encode())
             )
+        await self.save_curation("quiz")
         session_id = (await self.db.db.execute_fetchall(
             "SELECT session_id FROM quiz_sessions"
         ))[0][0]
@@ -1482,6 +1520,8 @@ class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
             and not any(c in question for c in cues)
 
     async def test_10_harder_questions_generated_over_fixture_booklet(self):
+        # Spend the free first try so this test keeps asserting the paid path.
+        self.assertTrue(await self.db.consume_free_use(OWNER, "quiz"))
         event = FakeCallbackEvent(
             self.client,
             data=f"quiz:go:{self.item_id}:10".encode(),
@@ -1494,6 +1534,11 @@ class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
         ) as generator:
             await self.bot._handle_callback(event)
         generator.assert_awaited_once()
+        save = FakeCallbackEvent(
+            self.client, data=b"quiz:cur:save", chat_id=OWNER
+        )
+        save.client = self.client
+        await self.bot._handle_callback(save)
 
         # 1) The harder prompt and the real fixture booklet reach the model.
         call = generator.await_args

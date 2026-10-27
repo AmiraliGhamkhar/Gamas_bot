@@ -45,6 +45,9 @@ dependencies = [
     "Pillow>=10.0,<13.0",
     # XML rewriting of OOXML parts.
     "lxml>=6.1,<7.0",
+    # PDF text extraction for uploaded study documents (pure Python, no poppler
+    # and no system libraries; OCR stays out of scope by design).
+    "pypdf>=5.0,<7.0",
     # The standalone PDF exporter uses reportlab (pure Python, no office
     # suite/system libraries); Persian text is shaped before rendering.
     "reportlab>=4.0,<5.0",

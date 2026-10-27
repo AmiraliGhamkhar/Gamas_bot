@@ -76,8 +76,26 @@ from .docx_export import (
     resolve_fonts,
 )
 from .jobs import Job, JobQueue, QueueFullError
+from .doc_extract import (
+    DocChunk,
+    DocExtractError,
+    ExtractedDoc,
+    ScannedPdfError,
+    chunk_sections,
+    chunk_text,
+    chunks_from_json,
+    chunks_to_json,
+    classify_document,
+    document_title,
+    extract_document,
+    preview_text,
+    sections_from_slides,
+    sha256_file,
+    SOURCE_TYPE_LABELS_FA,
+)
 from .learning import (
     FLASHCARD_SCHEMA,
+    MAX_CONTENT_CHARS,
     MAX_MANUAL_BACK_CHARS,
     MAX_MANUAL_FRONT_CHARS,
     MAX_MODEL_INPUT_CHARS,
@@ -85,10 +103,15 @@ from .learning import (
     MIN_VALID_QUESTIONS,
     OPTION_LABELS,
     QUIZ_SCHEMA,
+    SIZE_PRESETS,
     bound_content_text,
+    dedupe_cards,
+    dedupe_questions,
+    distribute_counts,
     flashcard_system_prompt,
     parse_flashcard_payload,
     parse_quiz_payload,
+    preset_cards,
     quiz_system_prompt,
 )
 from .llm import complete_json
@@ -310,8 +333,34 @@ LEARNING_STALE_ALERT = "این آزمون دیگر معتبر نیست."
 LEARNING_BUSY_ALERT = "درخواست قبلی شما در حال پردازش است؛ کمی صبر کنید."
 #: Leaderboard display name when a user never exposed a first name.
 LEADERBOARD_FALLBACK_NAME = "کاربر گاماس"
-QUIZ_COUNTS = (5, 10, 15)
+QUIZ_COUNTS = (5, 10, 15, 20)
 QUIZ_POINTS_PER_ANSWER = 10
+#: The gift badge shown while a user still has their free first try (R3.6).
+FREE_TRY_BADGE = "🎁 اولین بار رایگان"
+#: Shown when the free try for that mode is already used up.
+FREE_TRY_USED_NOTICE = (
+    "🎁 هدیهٔ اولین بار شما برای این بخش استفاده شده است؛ "
+    "برای ساخت بعدی به اعتبار نیاز دارید."
+)
+#: Shown when a provider fault after claiming the gift gives it back (R3.4).
+FREE_TRY_RESTORED = "🎁 هدیهٔ اولین بار شما برگشت؛ دوباره تلاش کنید."
+#: Generation preview/curation strings (R5.1).
+CURATION_GUIDANCE = (
+    "هر مورد را که نمی‌خواهید حذف کنید، بعد «✅ ذخیره» را بزنید."
+)
+CURATION_STALE_ALERT = "این پیش‌نمایش دیگر معتبر نیست؛ دوباره بسازید."
+#: A document upload that is not a supported document type.
+DOC_UNSUPPORTED_HINT = (
+    "⚠️ فقط PDF، Word (docx) یا PowerPoint (pptx) به‌عنوان سند پذیرفته می‌شود."
+)
+#: A photo sent instead of a document (edge case in §7).
+DOC_PHOTO_HINT = (
+    "📷 عکس سند به‌تنهایی خوانده نمی‌شود (OCR پشتیبانی نمی‌شود).\n"
+    "لطفاً فایل را با گزینهٔ «ارسال به‌صورت فایل» و در قالب PDF/DOCX/PPTX بفرستید."
+)
+#: Document card buttons.
+DOC_GENERATE_CARDS = "🃏 ساخت فلش‌کارت"
+DOC_GENERATE_QUESTIONS = "❓ ساخت سؤالات"
 SUPPORT_STATUS_LABELS = {
     "open": "🆕 باز",
     "awaiting_admin": "⏳ در انتظار پاسخ پشتیبانی",
@@ -871,6 +920,23 @@ def _presentation_metadata(message) -> tuple[str | None, str | None]:
     return kind, filename
 
 
+def _document_metadata(message) -> tuple[str | None, str | None]:
+    """Return (source_type, filename) for a PDF/Word document upload.
+
+    PowerPoint is deliberately excluded here: a .pptx may carry narration, so
+    it keeps going to the lecture pipeline, which also caches its slide text as
+    a document for flashcard/question generation.
+    """
+    if message.document is None or message.voice or message.audio:
+        return None, None
+    filename = getattr(message.file, "name", None)
+    mime_type = getattr(message.file, "mime_type", None)
+    source_type = classify_document(filename, mime_type)
+    if source_type != "pdf" and source_type != "docx":
+        return None, None
+    return source_type, filename
+
+
 def _is_unsupported_attachment(message) -> bool:
     """True for a real file the bot cannot use — never for links or text."""
     media = getattr(message, "media", None)
@@ -958,6 +1024,15 @@ class GamasBot:
         # during generation, so the guard has to live in process memory).
         self._learning_locks: dict[int, asyncio.Lock] = {}
         self._learning_in_flight: set[int] = set()
+        #: Preview/curation state of a generation that is validated but not yet
+        #: saved: ``{kind, items, page, title, item_id, doc_id, cost, free,
+        #: note, created_at}``. Kept in memory because the instance lock
+        #: guarantees a single bot process (same argument as the learning locks).
+        self._curation: dict[int, dict[str, Any]] = {}
+        #: Admins waiting for the "search user by id or @username" answer.
+        self._pending_user_search: set[int] = set()
+        #: Admins waiting for a confirmation of "reset free gift".
+        self._pending_free_reset: dict[int, int] = {}
         self._admin_action_times: dict[tuple[int, str], float] = {}
         self._broadcast_running: set[int] = set()
         self._started_at = time.time()
@@ -1211,19 +1286,22 @@ class GamasBot:
         return rows
 
     def _admin_menu(self) -> list:
-        """The admin panel: section tabs plus the way back to the user panel.
+        """The admin panel: three hubs, the unrelated sections, and the way back.
 
-        Rendered on every admin screen so the panel behaves like a tab bar —
-        one tap from any section to any other, and one tap home.
+        Payments, users and system-health used to be nine sibling buttons. They
+        are now three single-entry hubs (``adm:hub:pay``, ``adm:hub:usr``,
+        ``adm:hub:sys``) that each open on the most-used view and keep the rest
+        one tap deeper. Broadcast, support, audit and the leaderboard belong to
+        none of those groups and stay exactly where they were.
         """
         return [
             [
                 Button.inline("📊 آمار و وضعیت", b"adm:home"),
-                Button.inline("👥 کاربران", b"adm:users"),
+                Button.inline("💳 پرداخت‌ها", b"adm:hub:pay"),
             ],
             [
-                Button.inline("💳 پرداخت‌های در انتظار", b"adm:pay"),
-                Button.inline("📋 تاریخچه پرداخت‌ها", b"adm:ph:0"),
+                Button.inline("👥 کاربران", b"adm:hub:usr"),
+                Button.inline("🩺 سامانه", b"adm:hub:sys"),
             ],
             [Button.inline("🎧 مدیریت پشتیبانی", b"adm:sup")],
             [
@@ -1280,9 +1358,17 @@ class GamasBot:
             sender = getattr(event, "sender", None)
             if sender is None and hasattr(event, "get_sender"):
                 sender = await event.get_sender()
+            if sender is None:
+                return
             first_name = getattr(sender, "first_name", None)
-            if first_name:
-                await self.db.set_first_name(user_id, first_name)
+            username = getattr(sender, "username", None)
+            last_name = getattr(sender, "last_name", None)
+            await self.db.update_identity(
+                user_id,
+                first_name=(" ".join(str(first_name).split())[:64] if first_name else None),
+                username=(username if username is not None else None),
+                last_name=(" ".join(str(last_name).split())[:64] if last_name is not None else None),
+            )
         except Exception:
             logger.debug("could not capture sender name", exc_info=True)
 
@@ -1346,8 +1432,9 @@ class GamasBot:
                 [
                     [
                         Button.inline("📖 جزوه‌ها", b"library"),
-                        Button.inline("🃏 فلش‌کارت‌ها", b"library:fc"),
+                        Button.inline("📄 اسناد", b"lib:docs:0"),
                     ],
+                    [Button.inline("🃏 فلش‌کارت‌ها", b"library:fc")],
                     [Button.inline("🛒 خرید اشتراک", b"wallet")],
                     [Button.inline("↩️ منوی اصلی", b"menu:main")],
                 ]
@@ -1425,6 +1512,411 @@ class GamasBot:
                 )
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
 
+    # ------------------------------------------------------------- documents
+    async def _document_library_item(self, user_id: int, document: dict) -> int:
+        """The library item that mirrors a document (created on first need).
+
+        ``quiz_sessions`` and ``flashcard_decks`` reference ``library_items``, so
+        a document needs one row there to be a learning source. Creating it
+        lazily keeps a presentation-sourced document (whose lecture job already
+        owns an item) from duplicating rows.
+        """
+        existing = document.get("library_item_id")
+        if existing:
+            return int(existing)
+        item_id = await self.db.library_add(
+            user_id,
+            "booklet",
+            0,
+            0,
+            None,
+            title=f"📄 {str(document.get('title') or 'سند')[:120]}",
+        )
+        await self.db.library_set_content(item_id, str(document.get("text") or ""))
+        await self.db.document_set_library_item(int(document["id"]), item_id)
+        return int(item_id)
+
+    async def _save_document(
+        self,
+        user_id: int,
+        *,
+        source_type: str,
+        title: str,
+        file_msg_ref: str,
+        sha256: str,
+        page_count: int,
+        text: str,
+        chunks,
+        library_item_id: int | None = None,
+    ) -> tuple[dict, bool]:
+        """Persist one extraction (deduplicated by ``sha256`` per user)."""
+        document_id, created = await self.db.document_add(
+            user_id,
+            file_msg_ref=file_msg_ref,
+            title=title,
+            source_type=source_type,
+            page_count=page_count,
+            sha256=sha256,
+            text=text,
+            chunks_json=chunks_to_json(chunks),
+            library_item_id=library_item_id,
+        )
+        document = await self.db.document_get(user_id, document_id)
+        if document is None:  # pragma: no cover - just written
+            raise RuntimeError("document vanished after insert")
+        return document, created
+
+    async def _ingest_document(
+        self,
+        user_id: int,
+        path: Path,
+        *,
+        source_type: str,
+        filename: str | None,
+        file_msg_ref: str,
+    ) -> tuple[dict, bool]:
+        """Hash → (dedupe) → extract → chunk → store. Blocking work is off-loop."""
+        digest = await run_file_io(sha256_file, path)
+        existing = await self.db.document_by_hash(user_id, digest)
+        if existing is not None:
+            # Identical re-upload: reuse the stored extraction, no second parse.
+            return existing, False
+        extracted: ExtractedDoc = await run_file_io(extract_document, path, source_type)
+        text = bound_content_text(extracted.text, limit=MAX_CONTENT_CHARS)
+        if not text.strip():
+            raise DocExtractError(
+                "متنی از این سند استخراج نشد؛ OCR پشتیبانی نمی‌شود."
+            )
+        chunks = chunk_sections(extracted.sections, max_chars=MAX_MODEL_INPUT_CHARS)
+        title = document_title(filename, source_type)
+        item_id = await self.db.library_add(
+            user_id,
+            "booklet",
+            0,
+            0,
+            None,
+            title=f"📄 {title[:120]}",
+        )
+        await self.db.library_set_content(item_id, text)
+        document, created = await self._save_document(
+            user_id,
+            source_type=source_type,
+            title=title,
+            file_msg_ref=file_msg_ref,
+            sha256=digest,
+            page_count=int(extracted.page_count),
+            text=text,
+            chunks=chunks,
+            library_item_id=item_id,
+        )
+        logger.info(
+            "document ingested user=%s type=%s pages=%s chars=%s chunks=%s created=%s",
+            user_id, source_type, extracted.page_count, len(text), len(chunks), created,
+        )
+        return document, created
+
+    def _document_card_text(self, document: dict) -> str:
+        """Type, size and a text preview — the "extraction succeeded" proof."""
+        label = SOURCE_TYPE_LABELS_FA.get(str(document["source_type"]), "سند")
+        unit = "صفحه" if document["source_type"] in ("pdf", "docx") else "اسلاید"
+        lines = [
+            f"📄 {document.get('title') or 'سند'}",
+            f"نوع: {label} | {to_persian_digits(int(document.get('page_count') or 0))} {unit}",
+            f"متن استخراج‌شده: {to_persian_digits(len(str(document.get('text') or '')))} نویسه",
+            "",
+            "پیش‌نمایش متن:",
+            preview_text(str(document.get("text") or "")),
+        ]
+        return "\n".join(lines)
+
+    def _document_buttons(self, document_id: int) -> list[list]:
+        return [
+            [
+                Button.inline(
+                    DOC_GENERATE_CARDS, f"doc:fc:{document_id}".encode("ascii")
+                ),
+                Button.inline(
+                    DOC_GENERATE_QUESTIONS, f"doc:quiz:{document_id}".encode("ascii")
+                ),
+            ],
+            [Button.inline("📥 دریافت فایل", f"doc:f:{document_id}".encode("ascii"))],
+            [Button.inline("📚 کتابخانه", b"lib:docs:0")],
+        ]
+
+    async def _accept_document(
+        self, event, user_id: int, source_type: str, filename: str | None
+    ) -> None:
+        """Download, extract and store an uploaded PDF/DOCX, then preview it."""
+        max_bytes = int(self.settings.doc_max_bytes)
+        reported_size = getattr(getattr(event.message, "file", None), "size", None)
+        if isinstance(reported_size, int) and reported_size > max_bytes:
+            await event.reply(
+                "❌ حجم فایل بیشتر از سقف مجاز اسناد است. حد مجاز: "
+                f"{to_persian_digits(max_bytes // (1024 * 1024))} مگابایت"
+            )
+            return
+        progress = await event.respond("⏳ در حال استخراج متن…")
+        workdir = Path(tempfile.mkdtemp(dir=self.settings.temp_dir, prefix="doc-"))
+        try:
+            suffix = Path(filename).suffix.lower() if filename else f".{source_type}"
+            path = workdir / f"source{suffix}"
+            try:
+                await self._download_telegram_media(event.message, path, max_bytes)
+            except (asyncio.TimeoutError, UploadTooLargeError):
+                await self._edit(progress, "❌ دریافت فایل ناموفق بود؛ دوباره بفرستید.")
+                return
+            chat_id = getattr(event, "chat_id", None) or user_id
+            message_id = getattr(getattr(event, "message", None), "id", None)
+            try:
+                document, created = await self._ingest_document(
+                    user_id,
+                    path,
+                    source_type=source_type,
+                    filename=filename,
+                    file_msg_ref=f"{chat_id}:{message_id}" if message_id else "",
+                )
+            except ScannedPdfError as exc:
+                await self._edit(progress, str(exc))
+                return
+            except DocExtractError as exc:
+                await self._edit(progress, f"⚠️ {exc}")
+                return
+        except Exception:
+            logger.exception("document ingestion failed user=%s", user_id)
+            await self._edit(
+                progress,
+                "⚠️ استخراج متن این سند ناموفق بود؛ فایل دیگری بفرستید.",
+            )
+            return
+        finally:
+            await run_file_io(shutil.rmtree, workdir, True)
+        header = "" if created else "ℹ️ این فایل قبلاً استخراج شده بود؛ همان متن ذخیره‌شده استفاده می‌شود.\n\n"
+        await self._edit(
+            progress,
+            header + self._document_card_text(document),
+            self._document_buttons(int(document["id"])),
+        )
+
+    async def _forward_document(self, event, user_id: int, document_id: int) -> None:
+        """Re-forward the original upload, only after an owner-scoped lookup."""
+        document = await self.db.document_get(user_id, document_id)
+        if document is None or not document.get("file_msg_ref"):
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        try:
+            chat_raw, message_raw = str(document["file_msg_ref"]).split(":", 1)
+            await self.client.forward_messages(
+                event.chat_id, [int(message_raw)], from_peer=int(chat_raw)
+            )
+        except Exception:
+            logger.warning(
+                "could not forward document=%s", document_id, exc_info=True
+            )
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+
+    async def _show_documents(self, event, *, page: int = 0) -> None:
+        """The «📄 اسناد» section of the personal library."""
+        user_id = event.sender_id
+        if user_id is None:
+            return
+        page_size = 6
+        count = await self.db.document_count(user_id)
+        page = min(max(0, int(page)), max(0, (count - 1) // page_size))
+        documents = await self.db.documents_list(
+            user_id, limit=page_size, offset=page * page_size
+        )
+        if count == 0:
+            await self._edit(
+                event,
+                "📄 اسناد\n\n"
+                "هنوز سندی ذخیره نکرده‌اید.\n"
+                "فایل PDF، Word یا PowerPoint را همین‌جا بفرستید تا متنش استخراج و "
+                "از آن فلش‌کارت و سؤال ساخته شود.",
+                [[Button.inline("↩️ کتابخانه", b"library")]],
+            )
+            return
+        lines = ["📄 اسناد", "", f"تعداد: {to_persian_digits(count)}"]
+        buttons: list[list] = []
+        for document in documents:
+            label = SOURCE_TYPE_LABELS_FA.get(str(document["source_type"]), "سند")
+            buttons.append([
+                Button.inline(
+                    button_label(f"📄 {document.get('title') or label}"),
+                    f"doc:show:{document['id']}".encode("ascii"),
+                )
+            ])
+        nav: list = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"lib:docs:{page - 1}".encode("ascii")))
+        if (page + 1) * page_size < count:
+            nav.append(Button.inline("بعدی ▶️", f"lib:docs:{page + 1}".encode("ascii")))
+        if nav:
+            buttons.append(nav)
+        buttons.append([Button.inline("↩️ کتابخانه", b"library")])
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_document_card(self, event, user_id: int, document_id: int) -> None:
+        document = await self.db.document_get(user_id, document_id)
+        if document is None:
+            await self._ack(event, "این سند پیدا نشد.", alert=True)
+            await self._show_documents(event)
+            return
+        await self._edit(
+            event, self._document_card_text(document), self._document_buttons(document_id)
+        )
+
+    async def _show_document_generate_screen(
+        self, event, user_id: int, document_id: int, kind: str
+    ) -> None:
+        """Size presets for a document-sourced generation (R5.3)."""
+        document = await self.db.document_get(user_id, document_id)
+        if document is None:
+            await self._ack(event, "این سند پیدا نشد.", alert=True)
+            return
+        deck_label = "فلش‌کارت"
+        buttons: list[list] = []
+        free_kind = "deck" if kind == "deck" else "quiz"
+        free = await self._free_try_available(user_id, free_kind)
+        if kind == "deck":
+            base_size = int(self.settings.flashcard_ai_deck_size)
+            base_cost = int(self.settings.flashcard_ai_cost_seconds)
+            for code, label, cards, _questions in SIZE_PRESETS:
+                buttons.append([Button.inline(
+                    button_label(
+                        f"{label} — {to_persian_digits(cards)} کارت — "
+                        f"{format_duration(self._preset_cost(base_cost, cards, base_size))} اعتبار"
+                    ),
+                    f"doc:gen:fc:{document_id}:{code}".encode("ascii"),
+                )])
+        else:
+            per_question = int(self.settings.quiz_cost_seconds_per_question)
+            for _code, label, _cards, questions in SIZE_PRESETS:
+                buttons.append([Button.inline(
+                    button_label(
+                        f"{label} — {to_persian_digits(questions)} سؤال — "
+                        f"{format_duration(questions * per_question)} اعتبار"
+                    ),
+                    f"doc:gen:quiz:{document_id}:{questions}".encode("ascii"),
+                )])
+        header = (
+            f"🃏 ساخت فلش‌کارت از «{document.get('title') or 'سند'}»"
+            if kind == "deck"
+            else f"❓ ساخت سؤال از «{document.get('title') or 'سند'}»"
+        )
+        lines = [header, "", "اندازهٔ مجموعه را انتخاب کنید."]
+        if free:
+            lines.append(f"\n{FREE_TRY_BADGE} — اولین {deck_label} شما رایگان است.")
+        buttons.append([Button.inline(
+            "↩️ سند", f"doc:show:{document_id}".encode("ascii")
+        )])
+        await self._edit(event, "\n".join(lines), buttons)
+
+    async def _generate_from_document(
+        self, event, user_id: int, document_id: int, kind: str, choice: str
+    ) -> None:
+        if not self.settings.note_configured:
+            await event.respond("سرویس تولید محتوا در حال حاضر فعال نیست.")
+            return
+        source = await self._source_from_document(user_id, document_id)
+        if source is None:
+            await self._ack(event, "این سند پیدا نشد.", alert=True)
+            return
+        if kind == "deck":
+            if await self.db.deck_count(user_id) >= self.settings.flashcard_max_decks_per_user:
+                await event.respond(
+                    "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ یک مجموعهٔ قدیمی را "
+                    "حذف کنید."
+                )
+                return
+            wanted, cost = self._deck_size_and_cost(choice or None)
+            note = f"fc-pending:doc:{document_id}"
+        else:
+            wanted = _to_int(choice) or 5
+            if wanted not in QUIZ_COUNTS:
+                await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)
+                return
+            cost = wanted * int(self.settings.quiz_cost_seconds_per_question)
+            note = f"quiz-pending:doc:{document_id}"
+        if user_id in self._learning_in_flight:
+            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
+            return
+        self._learning_in_flight.add(user_id)
+        try:
+            async with self._learning_lock(user_id):
+                if kind != "deck":
+                    reason = await self.db.quiz_admission(
+                        user_id,
+                        max_active_hours=self.settings.quiz_max_active_hours,
+                        max_sessions_per_hour=self.settings.quiz_max_sessions_per_hour,
+                    )
+                    if reason == "active":
+                        await event.respond(
+                            "یک آزمون فعال دیگر دارید؛ ابتدا آن را تمام کنید."
+                        )
+                        return
+                    if reason == "rate":
+                        await event.respond(
+                            "تعداد آزمون‌های شما در یک ساعت اخیر به حداکثر مجاز رسیده است."
+                        )
+                        return
+                await self._generate_learning(
+                    event,
+                    user_id=user_id,
+                    kind="deck" if kind == "deck" else "quiz",
+                    source=source,
+                    wanted=wanted,
+                    cost=cost,
+                    note=note,
+                    title=(
+                        f"{source['title']} — فلش‌کارت"
+                        if kind == "deck"
+                        else f"{source['title']} — آزمون"
+                    ),
+                )
+        finally:
+            self._learning_in_flight.discard(user_id)
+
+    async def _store_presentation_document(
+        self, job: Job, source_path: Path, content
+    ) -> None:
+        """Cache a lecture deck's slide text as a document (best effort).
+
+        A PowerPoint upload keeps going through the lecture pipeline (it may
+        carry narration), and its slide text is stored here so the user can also
+        generate flashcards/questions from it — the same «📄 اسناد» entry a PDF
+        or Word upload creates.
+        """
+        try:
+            sections = sections_from_slides(content.slides)
+            if not sections:
+                return
+            text = bound_content_text(
+                "\n\n".join(section.render() for section in sections),
+                limit=MAX_CONTENT_CHARS,
+            )
+            if not text.strip():
+                return
+            digest = await run_file_io(sha256_file, source_path)
+            await self._save_document(
+                int(job.user_id),
+                source_type="pptx",
+                title=document_title(job.filename, "pptx"),
+                file_msg_ref=(
+                    f"{getattr(job.message, 'chat_id', job.user_id)}:"
+                    f"{getattr(job.message, 'id', 0) or 0}"
+                ),
+                sha256=digest,
+                page_count=len(sections),
+                text=text,
+                chunks=chunk_sections(sections, max_chars=MAX_MODEL_INPUT_CHARS),
+            )
+        except Exception:
+            logger.warning(
+                "could not cache presentation text as a document submission=%s",
+                job.submission_id,
+                exc_info=True,
+            )
+
     # --------------------------------------------------------------- learning
     def _learning_lock(self, user_id: int) -> asyncio.Lock:
         """The per-user lock serialising quiz/deck generation in this process.
@@ -1443,6 +1935,483 @@ class GamasBot:
             "↩️ بازگشت", f"lib:it:{item_id}".encode("ascii")
         )
 
+    # --------------------------------------------------- generation pipeline
+    #: How long a validated-but-unsaved generation stays open for curation.
+    CURATION_TTL_SECONDS = 1800
+    #: Items shown per curation page (Telegram keyboards have finite width).
+    CURATION_PAGE_SIZE = 6
+
+    async def _free_try_available(self, user_id: int, kind: str) -> bool:
+        """True when the gift badge applies (never for unlimited accounts)."""
+        if await self.db.is_unlimited(user_id):
+            return False
+        return bool((await self.db.free_use_state(user_id)).get(kind, False))
+
+    def _preset_cost(self, base_cost: int, cards: int, base_size: int) -> int:
+        """Scale the flat deck price by size, so «کامل ۴۰» is not the same price."""
+        base_size = max(1, int(base_size))
+        return max(1, int(round(int(base_cost) * int(cards) / base_size)))
+
+    def _learning_chunks(self, content: str) -> list[DocChunk]:
+        """Chunk a stored booklet text for chunk-parallel generation."""
+        return chunk_text(content, max_chars=MAX_MODEL_INPUT_CHARS)
+
+    async def _source_from_item(self, user_id: int, item_id: int) -> dict[str, Any] | None:
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None or item.get("kind") != "booklet" or not item.get("content_text"):
+            return None
+        return {
+            "item_id": int(item["item_id"]),
+            "doc_id": None,
+            "title": self._item_display_title(item),
+            "chunks": self._learning_chunks(str(item["content_text"])),
+        }
+
+    async def _source_from_document(
+        self, user_id: int, document_id: int
+    ) -> dict[str, Any] | None:
+        document = await self.db.document_get(user_id, document_id)
+        if document is None or not document.get("text"):
+            return None
+        chunks = chunks_from_json(
+            document.get("chunks_json"), max_chars=MAX_MODEL_INPUT_CHARS
+        ) or chunk_text(str(document["text"]), max_chars=MAX_MODEL_INPUT_CHARS)
+        # Every document owns a mirrored library item (see _ingest_document) so
+        # the existing quiz/deck tables have a valid source row to reference.
+        item_id = int(document.get("item_id") or 0) or None
+        if item_id is None:
+            item_id = await self._document_library_item(user_id, document)
+        return {
+            "item_id": int(item_id),
+            "doc_id": int(document["id"]),
+            "title": str(document.get("title") or "سند"),
+            "chunks": chunks,
+        }
+
+    async def _claim_generation_budget(
+        self, event, user_id: int, kind: str, cost: int, note: str
+    ) -> tuple[bool, bool] | None:
+        """Claim the free first try, else charge credit — before any model call.
+
+        Returns ``(free_used, charged)`` or ``None`` when the user is denied (the
+        paywall message has already been sent). The free claim is a single
+        atomic UPDATE inside ``consume_free_use``, so two concurrent generations
+        cannot both take the gift (R3.3).
+        """
+        if await self.db.is_unlimited(user_id):
+            return (False, False)
+        if await self.db.consume_free_use(user_id, kind):
+            return (True, False)
+        try:
+            await self.db.spend_seconds(user_id, cost, note)
+        except InsufficientBalanceError:
+            await event.respond(
+                LEARNING_NO_CREDIT,
+                buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
+            )
+            return None
+        return (False, True)
+
+    async def _refund_generation(
+        self,
+        user_id: int,
+        *,
+        cost: int,
+        charged: bool,
+        free: bool,
+        kind: str,
+        note: str,
+    ) -> None:
+        """Give back whatever the failed/cancelled generation cost the user.
+
+        ``kind`` is passed in rather than inferred from the ledger note: the
+        note is a free-form string shared with the ledger, and a deleted deck
+        from a document must still restore the *deck* gift, not the quiz one.
+        """
+        if charged:
+            try:
+                await self.db.refund_seconds(user_id, cost, note)
+            except Exception:
+                logger.exception("learning refund failed user=%s cost=%s", user_id, cost)
+        if free:
+            try:
+                await self.db.refund_free_use(user_id, kind)
+            except Exception:
+                logger.exception("free-use rollback failed user=%s", user_id)
+
+    async def _progress_edit(self, message, done: int, total: int) -> None:
+        """Live chunk progress («در حال تولید… بخش ۳ از ۷»); never fatal."""
+        try:
+            await message.edit(
+                "در حال تولید… "
+                f"بخش {to_persian_digits(done)} از {to_persian_digits(total)}"
+            )
+        except Exception:
+            logger.debug("generation progress edit failed", exc_info=True)
+
+    async def _generate_chunks(
+        self,
+        *,
+        kind: str,
+        chunks: list[DocChunk],
+        counts: list[int],
+        placeholder,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Generate per chunk CONCURRENTLY and merge, in chunk order.
+
+        Model calls go through ``llm.complete_json`` (provider failover lives
+        there) behind a semaphore, so at most ``LEARNING_CHUNK_CONCURRENCY``
+        requests are in flight. A chunk that yields nothing gets exactly one
+        repair retry with the parse error fed back; after that it is counted as
+        a failed part and reported to the user instead of failing everything.
+        """
+        schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
+        concurrency = max(1, int(self.settings.learning_chunk_concurrency))
+        semaphore = asyncio.Semaphore(concurrency)
+        total = len(chunks)
+        state = {"done": 0, "failed": 0}
+        session = self._http_session()
+
+        def prompt_for(chunk: DocChunk, count: int) -> str:
+            if kind == "deck":
+                return flashcard_system_prompt(count, source=chunk.locator)
+            return quiz_system_prompt(count, source=chunk.locator)
+
+        def parse(payload: dict[str, Any], count: int) -> list[dict[str, Any]]:
+            if kind == "deck":
+                return parse_flashcard_payload(payload, count)
+            return parse_quiz_payload(payload, count)
+
+        async def one(index: int) -> list[dict[str, Any]]:
+            chunk = chunks[index]
+            count = counts[index]
+            if count <= 0:
+                return []
+            async with semaphore:
+                items: list[dict[str, Any]] = []
+                try:
+                    payload = await complete_json(
+                        session,
+                        self.settings,
+                        system=prompt_for(chunk, count),
+                        user=chunk.text,
+                        schema=schema,
+                    )
+                    items = parse(payload, count)
+                    if not items:
+                        # One repair retry: the same chunk, with the failure
+                        # named, is usually enough to get strict JSON back.
+                        payload = await complete_json(
+                            session,
+                            self.settings,
+                            system=prompt_for(chunk, count),
+                            user=(
+                                chunk.text
+                                + "\n\n(خروجی قبلی JSON معتبر یا کامل نبود؛ "
+                                "این بار فقط JSON با ساختار خواسته‌شده و تعداد "
+                                "دقیق موارد بده.)"
+                            ),
+                            schema=schema,
+                        )
+                        items = parse(payload, count)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.warning(
+                        "chunk generation failed kind=%s chunk=%s", kind, index, exc_info=True
+                    )
+                    items = []
+                for item in items:
+                    # Source anchoring (R5.1): the model's own locator wins; when
+                    # it forgot one, the chunk it was reading is the answer.
+                    item["source"] = str(item.get("source") or chunk.locator)[:120]
+                if not items:
+                    state["failed"] += 1
+                state["done"] += 1
+                await self._progress_edit(placeholder, state["done"], total)
+                return items
+
+        results = await asyncio.gather(
+            *(one(index) for index in range(total)), return_exceptions=True
+        )
+        merged: list[dict[str, Any]] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            merged.extend(result)
+        return merged, state["failed"]
+
+    async def _generate_learning(
+        self,
+        event,
+        *,
+        user_id: int,
+        kind: str,
+        source: dict[str, Any],
+        wanted: int,
+        cost: int,
+        note: str,
+        title: str,
+    ) -> None:
+        """The one generation pipeline behind both flashcards and quizzes."""
+        chunks = [chunk for chunk in source["chunks"] if chunk.text.strip()]
+        if not chunks:
+            await event.respond(
+                "متنی برای ساخت محتوا پیدا نشد. فایل دیگری بفرستید."
+            )
+            return
+        budget = await self._claim_generation_budget(
+            event, user_id, "deck" if kind == "deck" else "quiz", cost, note
+        )
+        if budget is None:
+            return
+        free, charged = budget
+        wanted = max(1, int(wanted))
+        counts = distribute_counts(wanted, [len(chunk.text) for chunk in chunks])
+        placeholder = await event.respond(
+            "در حال ساخت… ⏳"
+        )
+        try:
+            items, failures = await self._generate_chunks(
+                kind=kind, chunks=chunks, counts=counts, placeholder=placeholder
+            )
+            if kind == "deck":
+                items = dedupe_cards(items)
+                minimum = MIN_VALID_CARDS
+            else:
+                items = dedupe_questions(items)
+                minimum = MIN_VALID_QUESTIONS
+            if len(items) < minimum:
+                raise RuntimeError(
+                    f"{kind} generation yielded too few items ({len(items)})"
+                )
+        except BaseException as exc:
+            await self._refund_generation(
+                user_id, cost=cost, charged=charged, free=free, kind=kind, note=note
+            )
+            try:
+                await placeholder.edit(
+                    LEARNING_GENERATION_FAILED
+                    + (f"\n{FREE_TRY_RESTORED}" if free else "")
+                )
+            except Exception:
+                logger.warning("could not edit generation placeholder", exc_info=True)
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            logger.warning("%s generation failed", kind, exc_info=exc)
+            return
+        self._curation[user_id] = {
+            "kind": kind,
+            "items": items[:wanted],
+            "page": 0,
+            "title": title[:200],
+            "item_id": int(source["item_id"]),
+            "doc_id": source.get("doc_id"),
+            "cost": cost,
+            "free": free,
+            "charged": charged,
+            "note": note,
+            "failures": failures,
+            "created_at": time.monotonic(),
+        }
+        await self._render_curation(placeholder, user_id)
+
+    # ------------------------------------------------------------- curation
+    def _curation_prefix(self, kind: str) -> str:
+        return "fc" if kind == "deck" else "quiz"
+
+    def _curation_stale(self, state: dict[str, Any] | None) -> bool:
+        if not state:
+            return True
+        age = time.monotonic() - float(state.get("created_at") or 0)
+        return age > self.CURATION_TTL_SECONDS
+
+    def _curation_keyboard(self, state: dict[str, Any], page: int) -> list[list]:
+        prefix = self._curation_prefix(str(state["kind"]))
+        items = state["items"]
+        size = self.CURATION_PAGE_SIZE
+        start = page * size
+        buttons: list[list] = []
+        row: list = []
+        for offset in range(start, min(start + size, len(items))):
+            row.append(Button.inline(
+                f"🗑 {to_persian_digits(offset + 1)}",
+                f"{prefix}:cur:del:{offset}".encode("ascii"),
+            ))
+            if len(row) == 4:
+                buttons.append(row)
+                row = []
+        if row:
+            buttons.append(row)
+        pages = max(1, (len(items) + size - 1) // size)
+        nav: list = []
+        if page > 0:
+            nav.append(Button.inline(
+                "◀️", f"{prefix}:cur:p:{page - 1}".encode("ascii")
+            ))
+        if page + 1 < pages:
+            nav.append(Button.inline(
+                "▶️", f"{prefix}:cur:p:{page + 1}".encode("ascii")
+            ))
+        if nav:
+            buttons.append(nav)
+        buttons.append([
+            Button.inline(
+                "✅ ذخیره", f"{prefix}:cur:save".encode("ascii")
+            ),
+            Button.inline(
+                "❌ انصراف", f"{prefix}:cur:cancel".encode("ascii")
+            ),
+        ])
+        return buttons
+
+    async def _render_curation(self, message, user_id: int) -> None:
+        """The preview/curation screen: item list, per-item delete, save."""
+        state = self._curation.get(user_id)
+        if state is None:
+            return
+        items = state["items"]
+        kind = str(state["kind"])
+        label = "فلش‌کارت" if kind == "deck" else "سؤال"
+        pages = max(1, (len(items) + self.CURATION_PAGE_SIZE - 1) // self.CURATION_PAGE_SIZE)
+        page = min(int(state.get("page") or 0), pages - 1)
+        state["page"] = page
+        start = page * self.CURATION_PAGE_SIZE
+        lines = [
+            f"🧐 پیش‌نمایش {label} — {to_persian_digits(len(items))} مورد "
+            f"(صفحهٔ {to_persian_digits(page + 1)} از {to_persian_digits(pages)})",
+            f"📄 منبع: {state['title']}",
+        ]
+        if state.get("failures"):
+            lines.append(
+                f"⚠️ {to_persian_digits(int(state['failures']))} بخش پردازش نشد."
+            )
+        lines.append(CURATION_GUIDANCE)
+        for offset, item in enumerate(
+            items[start:start + self.CURATION_PAGE_SIZE], start=start
+        ):
+            number = to_persian_digits(offset + 1)
+            source = item.get("source") or "—"
+            if kind == "deck":
+                lines.append(
+                    f"\n{number}) {item['front']}\n   ← {item['back']}\n   📍 {source}"
+                )
+            else:
+                lines.append(f"\n{number}) {item['question']}\n   📍 {source}")
+        try:
+            await message.edit(
+                "\n".join(lines), buttons=self._curation_keyboard(state, page)
+            )
+        except Exception:
+            logger.warning("could not render curation preview", exc_info=True)
+
+    async def _cancel_curation(self, event, user_id: int) -> None:
+        state = self._curation.pop(user_id, None)
+        if state is None:
+            await self._ack(event, CURATION_STALE_ALERT, alert=True)
+            return
+        # Nothing was delivered, so nothing is charged: the credit comes back
+        # and a claimed free first try is restored (R3.4).
+        await self._refund_generation(
+            user_id,
+            cost=int(state.get("cost") or 0),
+            charged=bool(state.get("charged")),
+            free=bool(state.get("free")),
+            kind=str(state.get("kind") or "deck"),
+            note=str(state.get("note") or ""),
+        )
+        await self._ack(event, "لغو شد.")
+        await self._edit(
+            event,
+            "❌ ساخت لغو شد؛ "
+            + ("اعتبار شما برگشت." if state.get("charged") else "هدیهٔ رایگان شما حفظ شد."),
+            [[Button.inline("📚 کتابخانه من", b"library")]],
+        )
+
+    async def _save_curation(self, event, user_id: int) -> None:
+        state = self._curation.get(user_id)
+        if self._curation_stale(state):
+            self._curation.pop(user_id, None)
+            await self._ack(event, CURATION_STALE_ALERT, alert=True)
+            return
+        assert state is not None
+        items = state["items"]
+        if state["kind"] == "deck":
+            if len(items) < 1:
+                await self._ack(event, "هیچ کارتی برای ذخیره نمانده است.", alert=True)
+                return
+            self._curation.pop(user_id, None)
+            deck_id = await self.db.deck_create_with_cards(
+                user_id, int(state["item_id"]), str(state["title"])[:200], items
+            )
+            deck = await self.db.deck_get(deck_id, user_id)
+            await self._ack(event, "✅ مجموعه ذخیره شد.")
+            if deck is None:
+                await self._edit(
+                    event,
+                    "✅ مجموعه ذخیره شد؛ از «کتابخانه من» بازش کنید.",
+                    [[Button.inline("↩️ فلش‌کارت‌ها", b"fc:hub")]],
+                )
+                return
+            await self._edit(
+                event,
+                self._deck_screen_text(deck, len(items)),
+                self._deck_keyboard(deck_id, bool(items)),
+            )
+            return
+        if len(items) < 1:
+            await self._ack(event, "هیچ سؤالی برای ذخیره نمانده است.", alert=True)
+            return
+        self._curation.pop(user_id, None)
+        session_id = await self.db.quiz_create_session(
+            user_id, int(state["item_id"]), items
+        )
+        await self._ack(event, "✅ آزمون آماده است.")
+        await self._render_question_message(event, user_id, session_id)
+
+    async def _handle_curation_callback(self, event, user_id: int, data: str) -> None:
+        """``fc:cur:*`` / ``quiz:cur:*``: delete an item, page, save or cancel."""
+        parts = data.split(":")
+        kind = "deck" if parts[0] == "fc" else "quiz"
+        action = parts[2] if len(parts) > 2 else ""
+        state = self._curation.get(user_id)
+        if self._curation_stale(state) or state is None or state["kind"] != kind:
+            self._curation.pop(user_id, None)
+            await self._ack(event, CURATION_STALE_ALERT, alert=True)
+            return
+        if action == "save":
+            await self._save_curation(event, user_id)
+            return
+        if action == "cancel":
+            await self._cancel_curation(event, user_id)
+            return
+        if action == "del":
+            index = _to_int(parts[3]) if len(parts) > 3 else None
+            if index is None or not 0 <= index < len(state["items"]):
+                await self._ack(event, CURATION_STALE_ALERT, alert=True)
+                return
+            state["items"].pop(index)
+            if not state["items"]:
+                await self._ack(event, "آخرین مورد حذف شد؛ ساخت لغو می‌شود.")
+                await self._cancel_curation(event, user_id)
+                return
+            await self._ack(
+                event, f"حذف شد؛ {to_persian_digits(len(state['items']))} مورد ماند."
+            )
+            await self._render_curation(event, user_id)
+            return
+        if action in ("p", "page"):
+            page = _to_int(parts[3]) if len(parts) > 3 else None
+            if page is None:
+                await self._ack(event, CURATION_STALE_ALERT, alert=True)
+                return
+            state["page"] = max(0, page)
+            await self._ack(event)
+            await self._render_curation(event, user_id)
+            return
+        await self._ack(event, CURATION_STALE_ALERT, alert=True)
+
+    # ------------------------------------------------------------------ quiz
     async def _quiz_start_screen(self, event, user_id: int, item_id: int) -> None:
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None or item.get("kind") != "booklet":
@@ -1457,19 +2426,24 @@ class GamasBot:
             return
         per_question = self.settings.quiz_cost_seconds_per_question
         buttons: list[list] = []
-        for count in QUIZ_COUNTS:
-            label = button_label(
-                f"{to_persian_digits(count)} سؤال — "
-                f"{format_duration(count * per_question)} اعتبار"
-            )
+        for _code, label, _cards, questions in SIZE_PRESETS:
             buttons.append([
                 Button.inline(
-                    label, f"quiz:go:{item_id}:{count}".encode("ascii")
+                    button_label(
+                        f"{label} — {to_persian_digits(questions)} سؤال — "
+                        f"{format_duration(questions * per_question)} اعتبار"
+                    ),
+                    f"quiz:go:{item_id}:{questions}".encode("ascii"),
                 )
             ])
         buttons.append([self._learning_back_button(item_id)])
+        badge = ""
+        if await self._free_try_available(user_id, "quiz"):
+            badge = f"\n\n{FREE_TRY_BADGE} — اولین آزمون شما بدون کسر اعتبار ساخته می‌شود."
         await self._edit(
-            event, "🧪 آزمون از جزوه\n\n" + QUIZ_START_GUIDANCE, buttons
+            event,
+            "🧪 آزمون از جزوه\n\n" + QUIZ_START_GUIDANCE + badge,
+            buttons,
         )
 
     async def _quiz_generate(
@@ -1531,57 +2505,25 @@ class GamasBot:
                 "رسیده است؛ کمی بعد دوباره تلاش کنید."
             )
             return
-        cost = count * self.settings.quiz_cost_seconds_per_question
-        note = f"quiz-pending:{item_id}"
-        try:
-            charged = await self.db.spend_seconds(user_id, cost, note)
-        except InsufficientBalanceError:
-            await event.respond(
-                LEARNING_NO_CREDIT,
-                buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
-            )
+        item = await self.db.library_item_detail(user_id, item_id)
+        if item is None:
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
-        placeholder = await event.respond("در حال ساخت سؤال‌ها… ⏳")
-        session_id: int | None = None
-        try:
-            model_input = bound_content_text(
-                content, limit=MAX_MODEL_INPUT_CHARS
-            )
-            payload = await complete_json(
-                self._http_session(),
-                self.settings,
-                system=quiz_system_prompt(count),
-                user=model_input,
-                schema=QUIZ_SCHEMA,
-            )
-            questions = parse_quiz_payload(payload, count)
-            if len(questions) < MIN_VALID_QUESTIONS:
-                raise RuntimeError("quiz generation yielded too few questions")
-            session_id = await self.db.quiz_create_session(
-                user_id, item_id, questions
-            )
-        except BaseException as exc:
-            # Every failure path after the debit refunds in full: LLM errors,
-            # malformed/short output, DB errors and even cancellation during
-            # shutdown. Unlimited users were never charged (charged=False).
-            if charged:
-                try:
-                    await self.db.refund_seconds(user_id, cost, note)
-                except Exception:
-                    logger.exception(
-                        "quiz refund failed user=%s cost=%s", user_id, cost
-                    )
-            try:
-                await placeholder.edit(LEARNING_GENERATION_FAILED)
-            except Exception:
-                logger.warning("could not edit quiz placeholder", exc_info=True)
-            if isinstance(
-                exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
-            ):
-                raise
-            logger.warning("quiz generation failed", exc_info=exc)
-            return
-        await self._render_question_message(placeholder, user_id, session_id)
+        await self._generate_learning(
+            event,
+            user_id=user_id,
+            kind="quiz",
+            source={
+                "item_id": int(item_id),
+                "doc_id": None,
+                "title": self._item_display_title(item),
+                "chunks": self._learning_chunks(content),
+            },
+            wanted=int(count),
+            cost=int(count) * self.settings.quiz_cost_seconds_per_question,
+            note=f"quiz-pending:{item_id}",
+            title=self._item_display_title(item) + " — آزمون",
+        )
 
     def _question_keyboard(self, session_id: int, question_id: int) -> list[list]:
         option_row = [
@@ -1921,15 +2863,36 @@ class GamasBot:
             f"{to_persian_digits(size)} پرسش و پاسخ ساخته می‌شود.\n"
             f"هزینه: {format_duration(cost)} اعتبار"
         )
-        await self._edit(event, text, [
+        badge = ""
+        if await self._free_try_available(user_id, "deck"):
+            badge = (
+                f"\n\n{FREE_TRY_BADGE} — اولین مجموعهٔ فلش‌کارت شما بدون کسر "
+                "اعتبار ساخته می‌شود."
+            )
+        buttons: list[list] = [
             [Button.inline(
                 "🤖 ساخت فلش‌کارت", f"fc:go:{item_id}".encode("ascii")
-            )],
-            [self._learning_back_button(item_id)],
-        ])
+            )]
+        ]
+        for code, label, cards, _questions in SIZE_PRESETS:
+            buttons.append([
+                Button.inline(
+                    button_label(
+                        f"{label} — {to_persian_digits(cards)} کارت — "
+                        f"{format_duration(self._preset_cost(cost, cards, size))} اعتبار"
+                    ),
+                    f"fc:go:{item_id}:{code}".encode("ascii"),
+                )
+            ])
+        buttons.append([self._learning_back_button(item_id)])
+        await self._edit(
+            event,
+            text + badge + "\n\nاندازهٔ مجموعه را انتخاب کنید:",
+            buttons,
+        )
 
     async def _flashcard_generate(
-        self, event, user_id: int, item_id: int
+        self, event, user_id: int, item_id: int, preset: str | None = None
     ) -> None:
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None or item.get("kind") != "booklet":
@@ -1956,11 +2919,27 @@ class GamasBot:
             async with self._learning_lock(user_id):
                 await self._flashcard_generate_locked(
                     event, user_id, item_id, content,
-                    self._item_display_title(item),
+                    self._item_display_title(item), preset,
                 )
         finally:
             # Discard even when cancellation strikes while waiting on the lock.
             self._learning_in_flight.discard(user_id)
+
+    def _deck_size_and_cost(self, preset: str | None) -> tuple[int, int]:
+        """Resolve the requested size preset (or the configured default).
+
+        The bare «ساخت فلش‌کارت» button keeps the historical behaviour: the
+        configured deck size and price. Presets scale the price with the card
+        count, so «کامل ۴۰» costs what forty cards cost.
+        """
+        base_size = int(self.settings.flashcard_ai_deck_size)
+        base_cost = int(self.settings.flashcard_ai_cost_seconds)
+        if not preset:
+            return base_size, base_cost
+        cards = preset_cards(str(preset))
+        if cards is None:
+            return base_size, base_cost
+        return cards, self._preset_cost(base_cost, cards, base_size)
 
     async def _flashcard_generate_locked(
         self,
@@ -1969,65 +2948,23 @@ class GamasBot:
         item_id: int,
         content: str,
         item_title: str,
+        preset: str | None = None,
     ) -> None:
-        cost = self.settings.flashcard_ai_cost_seconds
-        size = self.settings.flashcard_ai_deck_size
-        note = f"fc-pending:{item_id}"
-        try:
-            charged = await self.db.spend_seconds(user_id, cost, note)
-        except InsufficientBalanceError:
-            await event.respond(
-                LEARNING_NO_CREDIT,
-                buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
-            )
-            return
-        placeholder = await event.respond("در حال ساخت فلش‌کارت‌ها… ⏳")
-        try:
-            model_input = bound_content_text(
-                content, limit=MAX_MODEL_INPUT_CHARS
-            )
-            payload = await complete_json(
-                self._http_session(),
-                self.settings,
-                system=flashcard_system_prompt(size),
-                user=model_input,
-                schema=FLASHCARD_SCHEMA,
-            )
-            cards = parse_flashcard_payload(payload, size)
-            if len(cards) < MIN_VALID_CARDS:
-                raise RuntimeError("flashcard generation yielded too few cards")
-            title = item_title + " — فلش‌کارت"
-            deck_id = await self.db.deck_create_with_cards(
-                user_id, item_id, title[:200], cards
-            )
-        except BaseException as exc:
-            if charged:
-                try:
-                    await self.db.refund_seconds(user_id, cost, note)
-                except Exception:
-                    logger.exception(
-                        "flashcard refund failed user=%s cost=%s", user_id, cost
-                    )
-            try:
-                await placeholder.edit(LEARNING_GENERATION_FAILED)
-            except Exception:
-                logger.warning("could not edit flashcard placeholder", exc_info=True)
-            if isinstance(
-                exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
-            ):
-                raise
-            logger.warning("flashcard generation failed", exc_info=exc)
-            return
-        deck = await self.db.deck_get(deck_id, user_id)
-        await placeholder.edit(
-            f"🃏 مجموعهٔ فلش‌کارت ساخته شد — {title[:200]}",
-        )
-        if deck is None:
-            await event.respond("مجموعه ساخته شد؛ از «کتابخانه من» بازش کنید.")
-            return
-        await event.respond(
-            self._deck_screen_text(deck, len(cards)),
-            buttons=self._deck_keyboard(deck_id, bool(cards)),
+        size, cost = self._deck_size_and_cost(preset)
+        await self._generate_learning(
+            event,
+            user_id=user_id,
+            kind="deck",
+            source={
+                "item_id": int(item_id),
+                "doc_id": None,
+                "title": item_title,
+                "chunks": self._learning_chunks(content),
+            },
+            wanted=size,
+            cost=cost,
+            note=f"fc-pending:{item_id}",
+            title=item_title + " — فلش‌کارت",
         )
 
     async def _show_flashcard_hub(self, event, *, page: int = 0) -> None:
@@ -2320,6 +3257,9 @@ class GamasBot:
     ) -> None:
         parts = data.split(":")
         action = parts[1] if len(parts) > 1 else ""
+        if action == "cur":
+            await self._handle_curation_callback(event, user_id, data)
+            return
         if action == "hub":
             page = _to_int(parts[2]) if len(parts) == 3 else 0
             await self._show_flashcard_hub(event, page=max(0, page or 0))
@@ -2347,12 +3287,13 @@ class GamasBot:
                 return
             await self._flashcard_start_screen(event, user_id, item_id)
             return
-        if action == "go" and len(parts) == 3:
+        if action == "go" and len(parts) in (3, 4):
             item_id = _to_int(parts[2])
             if item_id is None:
                 await self._ack(event, self._deck_stale_alert(), alert=True)
                 return
-            await self._flashcard_generate(event, user_id, item_id)
+            preset = parts[3] if len(parts) == 4 else None
+            await self._flashcard_generate(event, user_id, item_id, preset)
             return
         if action in {"deck", "study", "exp", "del", "delok", "done",
                       "restart", "next"} and len(parts) == 3:
@@ -2406,6 +3347,10 @@ class GamasBot:
         """Parse and dispatch every ``quiz:`` callback, failing closed."""
         parts = data.split(":")
         action = parts[1] if len(parts) > 1 else ""
+        if action == "cur":
+            # Preview/curation of a validated-but-unsaved generation.
+            await self._handle_curation_callback(event, user_id, data)
+            return
         if action == "new" and len(parts) == 3:
             item_id = _to_int(parts[2])
             if item_id is None:
@@ -2442,6 +3387,133 @@ class GamasBot:
             return
         await self._ack(event, LEARNING_STALE_ALERT, alert=True)
 
+    # --------------------------------------------------------- document routes
+    async def _route_document_callback(
+        self, event, user_id: int, data: str
+    ) -> None:
+        """``doc:*`` callbacks: show a document, forward it, or generate from it."""
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if action == "show" and len(parts) == 3:
+            document_id = _to_int(parts[2])
+            if document_id is None:
+                await self._ack(event, "این سند پیدا نشد.", alert=True)
+                return
+            await self._show_document_card(event, user_id, document_id)
+            return
+        if action == "f" and len(parts) == 3:
+            document_id = _to_int(parts[2])
+            if document_id is None:
+                await self._ack(event, "این سند پیدا نشد.", alert=True)
+                return
+            await self._forward_document(event, user_id, document_id)
+            return
+        if action in ("fc", "quiz") and len(parts) == 3:
+            document_id = _to_int(parts[2])
+            if document_id is None:
+                await self._ack(event, "این سند پیدا نشد.", alert=True)
+                return
+            await self._show_document_generate_screen(
+                event, user_id, document_id, "deck" if action == "fc" else "quiz"
+            )
+            return
+        if action == "gen" and len(parts) == 5:
+            kind = "deck" if parts[2] == "fc" else "quiz"
+            document_id = _to_int(parts[3])
+            if document_id is None:
+                await self._ack(event, "این سند پیدا نشد.", alert=True)
+                return
+            await self._generate_from_document(
+                event, user_id, document_id, kind, parts[4]
+            )
+            return
+        await self._ack(event, "درخواست نامعتبر است.", alert=True)
+
+    # ------------------------------------------------------------- admin hubs
+    async def _route_admin_hub(self, event, admin_id: int, data: str) -> None:
+        """Dispatch ``adm:hub:<hub>[:action[:arg]]`` to the merged screens.
+
+        Every branch validates its arguments before touching the database, so a
+        forged or stale callback opens the hub's default view instead of an
+        arbitrary page — the same discipline the old ``adm:ov*`` routes used.
+        """
+        parts = data.split(":")
+        hub = parts[2] if len(parts) > 2 else ""
+        rest = parts[3:]
+        action = rest[0] if rest else ""
+        if hub == "pay":
+            if not action:
+                await self._show_admin_payments(event, 0)
+                return
+            if action == "hist":
+                # adm:hub:pay:hist[:<status>[:<page>]]
+                status = rest[1] if len(rest) > 1 else "all"
+                if status not in dict(self.PAYMENT_HISTORY_FILTERS):
+                    await self._ack(event, "فیلتر تاریخچه نامعتبر است.", alert=True)
+                    return
+                page = _to_int(rest[2]) if len(rest) > 2 else 0
+                if page is None:
+                    await self._ack(event, "صفحهٔ تاریخچه نامعتبر است.", alert=True)
+                    return
+                await self._show_admin_payment_history(event, max(0, page), status)
+                return
+            if action == "stats":
+                period = rest[1] if len(rest) > 1 else "7d"
+                if period not in self.ADMIN_PERIOD_KEYS:
+                    await self._ack(event, "بازهٔ زمانی نامعتبر است.", alert=True)
+                    return
+                await self._show_admin_payments_report(event, period)
+                return
+            await self._ack(event, "بخش پرداخت نامعتبر است.", alert=True)
+            return
+        if hub == "usr":
+            if not action:
+                await self._show_admin_users(event)
+                return
+            if action == "stats":
+                period = rest[1] if len(rest) > 1 else "7d"
+                if period not in self.ADMIN_PERIOD_KEYS:
+                    await self._ack(event, "بازهٔ زمانی نامعتبر است.", alert=True)
+                    return
+                await self._show_admin_users_report(event, period)
+                return
+            if action == "pending":
+                await self._show_admin_pending_receipt_users(event)
+                return
+            if action == "banned":
+                await self._show_admin_blocked_users(event)
+                return
+            if action in {"card", "fr", "frx", "tg"}:
+                target = _to_int(rest[1]) if len(rest) > 1 else None
+                if target is None:
+                    await self._ack(event, "شناسهٔ کاربر نامعتبر است.", alert=True)
+                    return
+                if action == "card":
+                    await self._show_admin_user_card(event, target)
+                elif action == "fr":
+                    await self._show_admin_free_reset_confirm(event, target)
+                elif action == "frx":
+                    await self._reset_user_free_gift(event, admin_id, target)
+                else:
+                    await self._toggle_admin_block(event, admin_id, target)
+                return
+            await self._ack(event, "بخش کاربران نامعتبر است.", alert=True)
+            return
+        if hub == "sys":
+            if not action:
+                await self._show_admin_system_report(event, "7d")
+                return
+            if action == "proc":
+                period = rest[1] if len(rest) > 1 else "7d"
+                if period not in self.ADMIN_PERIOD_KEYS:
+                    await self._ack(event, "بازهٔ زمانی نامعتبر است.", alert=True)
+                    return
+                await self._show_admin_processing_report(event, period)
+                return
+            await self._ack(event, "بخش سامانه نامعتبر است.", alert=True)
+            return
+        await self._ack(event, "بخش مدیریت نامعتبر است.", alert=True)
+
     # ------------------------------------------------------------- callbacks
     async def _handle_callback(self, event) -> None:
         data = (event.data or b"").decode("utf-8", "replace").strip()
@@ -2468,6 +3540,16 @@ class GamasBot:
         if data.startswith("adm:") and data != "adm:bcast":
             self._pending_broadcast.discard(user_id)
             self._pending_reject_reason.pop(user_id, None)
+        # A hub tap is a new intent: it disarms the "send me an id/@username"
+        # prompt and the free-gift confirmation. The users hub re-arms search
+        # itself when the admin lands on its default screen.
+        if not data.startswith("adm:hub:usr"):
+            self._pending_user_search.discard(user_id)
+            self._pending_free_reset.pop(user_id, None)
+        else:
+            self._pending_free_reset.pop(user_id, None)
+            if not data.startswith("adm:hub:usr:card"):
+                self._pending_user_search.discard(user_id)
         # A review action supersedes any older rejection-reason prompt. Only
         # the new rejection action below is allowed to arm that prompt again.
         if data.startswith("payv:"):
@@ -2515,6 +3597,24 @@ class GamasBot:
         elif data == "board":
             await self._ack(event)
             await self._show_leaderboard(event)
+        elif data.startswith("lib:docs"):
+            await self._ack(event)
+            parts = data.split(":")
+            page = _to_int(parts[2]) if len(parts) > 2 else 0
+            if page is None:
+                await self._ack(event, "صفحهٔ اسناد نامعتبر است.", alert=True)
+                return
+            await self._show_documents(event, page=max(0, page))
+        elif data.startswith("lib:doc:"):
+            await self._ack(event)
+            document_id = _to_int(data.rsplit(":", 1)[-1])
+            if document_id is None:
+                await self._ack(event, "این سند پیدا نشد.", alert=True)
+            else:
+                await self._show_document_card(event, user_id, document_id)
+        elif data.startswith("doc:"):
+            await self._ack(event)
+            await self._route_document_callback(event, user_id, data)
         elif data.startswith("lib:f:"):
             await self._ack(event)
             item_id = _to_int(data.rsplit(":", 1)[-1])
@@ -2590,6 +3690,9 @@ class GamasBot:
                 await self._show_admin_system_report(event, period)
             else:
                 await self._ack(event, "بخش گزارش نامعتبر است.", alert=True)
+        elif data.startswith("adm:hub:"):
+            await self._ack(event)
+            await self._route_admin_hub(event, user_id, data)
         elif data == "adm:users":
             await self._ack(event)
             await self._show_admin_users(event)
@@ -2673,7 +3776,16 @@ class GamasBot:
         user_id = event.sender_id
         if user_id is None:
             return
-        user = await self.db.ensure_user(user_id)
+        # ``ensure_user`` is the single upsert: it stores the id exactly (int64),
+        # never duplicates a row on a second /start, and refreshes the identity
+        # fields the admin panel renders.
+        sender = getattr(event, "sender", None)
+        user = await self.db.ensure_user(
+            user_id,
+            first_name=getattr(sender, "first_name", None) if sender else None,
+            username=getattr(sender, "username", None) if sender else None,
+            last_name=getattr(sender, "last_name", None) if sender else None,
+        )
         if user.banned:
             await event.reply("⛔ دسترسی شما به ربات مسدود شده است.")
             return
@@ -2691,6 +3803,8 @@ class GamasBot:
             self._support_admin_states.pop(user_id, None)
             self._pending_flashcard.pop(user_id, None)
             self._pending_flashcard_front.pop(user_id, None)
+            self._pending_user_search.discard(user_id)
+            self._pending_free_reset.pop(user_id, None)
             await self._show_main(event, first_start=True)
             return
 
@@ -2740,6 +3854,16 @@ class GamasBot:
             # the admin's next plain message.
             self._pending_flashcard.pop(user_id, None)
             self._pending_flashcard_front.pop(user_id, None)
+        if (
+            self._is_admin(user_id)
+            and user_id in self._pending_user_search
+            and not command
+        ):
+            # The users hub asked for an id or @username; this message is the
+            # answer. Commands fall through so /grant etc. still work.
+            self._pending_user_search.discard(user_id)
+            await self._admin_user_search(event, user_id, text)
+            return
         if self._is_admin(user_id) and command == "/grant":
             await self._admin_grant(event, text)
             return
@@ -2771,6 +3895,8 @@ class GamasBot:
             self._support_admin_states.pop(user_id, None)
             self._pending_flashcard.pop(user_id, None)
             self._pending_flashcard_front.pop(user_id, None)
+            self._pending_user_search.discard(user_id)
+            self._pending_free_reset.pop(user_id, None)
             await event.reply("ارسال لغو شد. لغو سفارش از «🛒 خرید اشتراک».")
             return
 
@@ -2793,6 +3919,14 @@ class GamasBot:
             await self._accept_presentation(event, user_id, pkind, pfilename)
             return
 
+        # Documents (PDF / Word): extracted into text for flashcards/questions.
+        dkind, dfilename = _document_metadata(event.message)
+        if dkind is not None:
+            if await self._is_duplicate_upload(event, user_id):
+                return
+            await self._accept_document(event, user_id, dkind, dfilename)
+            return
+
         # Media.
         kind, filename, duration = _media_metadata(event.message)
         if kind is not None:
@@ -2811,8 +3945,14 @@ class GamasBot:
                 return
 
         if _is_unsupported_attachment(event.message):
+            if getattr(event.message, "photo", None) is not None:
+                # Sending a document as a compressed photo is a common mistake:
+                # without OCR the bot cannot read it, so it says so explicitly.
+                await event.reply(DOC_PHOTO_HINT)
+                return
             await event.reply(
-                "⚠️ این نوع فایل پشتیبانی نمی‌شود. فایل صوتی، ویدیویی یا پاورپوینت بفرستید."
+                "⚠️ این نوع فایل پشتیبانی نمی‌شود. فایل صوتی، ویدیویی، پاورپوینت یا "
+                "سند PDF/Word بفرستید."
             )
             return
         if text:
@@ -3416,6 +4556,10 @@ class GamasBot:
             load_presentation, source_path, workdir, self.settings
         )
         outline = slides_outline(content.slides)
+        # The deck is study material as well as a lecture: cache its slide text
+        # as a document so flashcards/questions can be generated from it without
+        # a second upload (R4.4). Best effort: a failure here never fails a job.
+        await self._store_presentation_document(job, source_path, content)
         # The note model is only as good as this input, so record what was
         # actually read from the deck: a deck whose text silently extracted as
         # empty is otherwise indistinguishable from a deck without text.
@@ -4648,6 +5792,16 @@ class GamasBot:
         return f"{to_persian_digits(int(value))} بایت"
 
     @staticmethod
+    def _date_text(value: str | None) -> str:
+        """Jalali date only, for one-line admin list rows."""
+        if not value:
+            return "—"
+        try:
+            return jalali_date(datetime.fromisoformat(value))
+        except ValueError:
+            return str(value)
+
+    @staticmethod
     def _timestamp_text(value: str | None) -> str:
         if not value:
             return "ثبت نشده"
@@ -4750,13 +5904,10 @@ class GamasBot:
         lines.extend(f"• {item}" for item in self._admin_attention_lines(report, self.runtime_metrics()))
         buttons = [self._admin_period_row("adm:ov", period)]
         buttons.append([
-            Button.inline("👥 جزئیات کاربران", f"adm:ovu:{period}".encode()),
-            Button.inline("⚙️ جزئیات پردازش", f"adm:ovp:{period}".encode()),
+            Button.inline("💳 پرداخت‌ها", b"adm:hub:pay"),
+            Button.inline("👥 کاربران", b"adm:hub:usr"),
         ])
-        buttons.append([
-            Button.inline("💳 پرداخت و اعتبار", f"adm:ovpay:{period}".encode()),
-            Button.inline("🩺 سلامت سیستم", f"adm:ovs:{period}".encode()),
-        ])
+        buttons.append([Button.inline("🩺 سامانه", b"adm:hub:sys")])
         buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
@@ -4854,6 +6005,7 @@ class GamasBot:
         )
         buttons = [
             self._admin_period_row("adm:ovu", period),
+            [Button.inline("👥 کاربران", b"adm:hub:usr")],
             [Button.inline("↩️ نمای کلی", b"adm:home")],
         ]
         buttons.extend(self._admin_menu())
@@ -4957,6 +6109,7 @@ class GamasBot:
         lines.extend(self._admin_series_lines(processing["series"]))
         buttons = [
             self._admin_period_row("adm:ovp", period),
+            [Button.inline("🩺 وضعیت اکنون", b"adm:hub:sys")],
             [Button.inline("↩️ نمای کلی", b"adm:home")],
         ]
         buttons.extend(self._admin_menu())
@@ -5016,8 +6169,8 @@ class GamasBot:
         buttons = [
             self._admin_period_row("adm:ovpay", period),
             [
-                Button.inline("💳 صف بررسی", b"adm:pay"),
-                Button.inline("📋 تاریخچه", b"adm:ph:0"),
+                Button.inline("💳 صف بررسی", b"adm:hub:pay"),
+                Button.inline("📋 تاریخچه", b"adm:hub:pay:hist"),
             ],
             [Button.inline("↩️ نمای کلی", b"adm:home")],
         ]
@@ -5081,12 +6234,46 @@ class GamasBot:
         )
         buttons = [
             self._admin_period_row("adm:ovs", period),
+            [Button.inline("⚙️ جزئیات پردازش", f"adm:hub:sys:proc:{period}".encode("ascii"))],
             [Button.inline("↩️ نمای کلی", b"adm:home")],
         ]
         buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
+    # ---------------------------------------------------------------- hubs
+    #: The three single-entry admin hubs (R1). Old callback prefixes keep
+    #: working as aliases and land on the same screens (R1.4).
+    ADMIN_HUB_TITLES = {
+        "pay": "💳 پرداخت‌ها",
+        "usr": "👥 کاربران",
+        "sys": "🩺 سامانه",
+    }
+
+    @staticmethod
+    def _identity_line(
+        *,
+        username: str | None,
+        telegram_id: int | str | None,
+        display_name: str = "",
+    ) -> str:
+        """``@username · شناسه: <id> · <name>`` — with «—» for a missing username.
+
+        The numeric id is always present: an @username can be renamed or reused,
+        so it is never shown without the id that actually owns the row.
+        """
+        handle = f"@{str(username).lstrip('@')}" if username else "—"
+        identifier = "—" if telegram_id in (None, "") else str(telegram_id)
+        name = " ".join(str(display_name or "").split()) or "—"
+        return f"{handle} · شناسه: {identifier} · {name}"
+
+    def _user_display_name(self, first_name: str = "", last_name: str = "") -> str:
+        return " ".join(part for part in (str(first_name).strip(), str(last_name).strip()) if part)
+
+    def _hub_back_row(self, hub: str) -> list:
+        return [Button.inline(f"↩️ {self.ADMIN_HUB_TITLES.get(hub, 'بازگشت')}", f"adm:hub:{hub}".encode())]
+
     async def _show_admin_users(self, event) -> None:
+        """The Users hub: search box, the four sub-views and the recent list."""
         users = await self.db.list_users(limit=25)
         total = await self.db.count_users()
         heading = (
@@ -5113,11 +6300,18 @@ class GamasBot:
                 else format_duration(user["available_seconds"])
             )
             joined = (user["joined_at"] or "")[:10] or "—"
+            identity = self._identity_line(
+                username=user.get("username"),
+                telegram_id=user["telegram_id"],
+                display_name=user.get("first_name", ""),
+            )
             lines.append(
-                f"{status} | شناسه: {user['telegram_id']} | اعتبار: {balance} | عضویت: {joined}"
+                f"{status} | {identity} | اعتبار: {balance} | عضویت: {joined}"
             )
         lines.extend(
             [
+                "",
+                "🔎 جست‌وجوی کاربر: شناسهٔ عددی یا @نام‌کاربری را در پیام بعدی بفرستید.",
                 "",
                 "دستورهای مدیریت (در همین گفت‌وگو ارسال کنید):",
                 "• افزودن اعتبار برحسب ساعت: /grant <شناسه کاربر> <ساعت>",
@@ -5130,7 +6324,217 @@ class GamasBot:
                 "شناسهٔ هر کاربر در فهرست بالا نمایش داده شده است.",
             ]
         )
-        await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
+        self._pending_user_search.add(int(event.sender_id or 0))
+        buttons: list[list] = []
+        for user in users[:8]:
+            label = f"🔎 {user.get('username') or user['telegram_id']}"
+            buttons.append([
+                Button.inline(
+                    button_label(label),
+                    f"adm:hub:usr:card:{user['telegram_id']}".encode("ascii"),
+                )
+            ])
+        buttons.append([
+            Button.inline("📊 آمار", b"adm:hub:usr:stats"),
+            Button.inline("🧾 رسیدهای در انتظار", b"adm:hub:usr:pending"),
+        ])
+        buttons.append([Button.inline("🚫 مسدودشده‌ها", b"adm:hub:usr:banned")])
+        buttons.extend(self._admin_menu())
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_user_card(self, event, target_id: int) -> None:
+        """One user, everything an admin needs, and the free-gift reset."""
+        identity = await self.db.user_identity(int(target_id))
+        if identity is None:
+            await self._edit(
+                event,
+                "کاربری با این شناسه ثبت نشده است.",
+                self._hub_back_row("usr") + self._admin_menu(),
+            )
+            return
+        balance = (
+            "نامحدود ⭐"
+            if identity["is_unlimited"]
+            else format_duration(await self.db.available_seconds(int(target_id)))
+        )
+        order_rows = list(
+            await self.db.db.execute_fetchall(
+                "SELECT COUNT(*) FROM payments WHERE user_id = ?", (int(target_id),)
+            )
+        )
+        orders = int(order_rows[0][0]) if order_rows else 0
+        decks = await self.db.deck_count(int(target_id))
+        free = identity.get("free_uses", {"deck": True, "quiz": True})
+        status = (
+            "🚫 مسدود"
+            if identity["banned"]
+            else ("⭐ ویژه (اعتبار نامحدود)" if identity["is_unlimited"] else "👤 عادی")
+        )
+        name = self._user_display_name(identity["first_name"], identity["last_name"])
+        lines = [
+            "👤 کارت کاربر",
+            self._identity_line(
+                username=identity["username"],
+                telegram_id=identity["telegram_id"],
+                display_name=name,
+            ),
+            f"وضعیت: {status}",
+            f"اعتبار: {balance}",
+            f"سفارش‌ها: {to_persian_digits(orders)} | مجموعهٔ فلش‌کارت: {to_persian_digits(decks)}",
+            "هدیهٔ اولین بار: "
+            + (
+                "🎁 فلش‌کارت رایگان مانده"
+                if free.get("deck")
+                else "فلش‌کارت استفاده شده"
+            )
+            + " | "
+            + ("🎁 آزمون رایگان مانده" if free.get("quiz") else "آزمون استفاده شده"),
+            f"عضویت: {self._timestamp_text(identity.get('joined_at'))}",
+            f"آخرین بازدید: {self._timestamp_text(identity.get('last_seen_at'))}",
+            "",
+            "💡 اعتبار و سفارش‌ها در «💳 پرداخت‌ها» بررسی می‌شوند.",
+        ]
+        buttons: list[list] = [
+            [Button.inline(
+                "🔄 بازنشانی هدیه رایگان",
+                f"adm:hub:usr:fr:{int(target_id)}".encode("ascii"),
+            )],
+            [
+                Button.inline(
+                    "🚫 مسدودکردن" if not identity["banned"] else "✅ رفع مسدودی",
+                    f"adm:hub:usr:tg:{int(target_id)}".encode("ascii"),
+                )
+            ],
+            self._hub_back_row("usr"),
+        ]
+        buttons.extend(self._admin_menu())
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_pending_receipt_users(self, event) -> None:
+        """Users whose receipt is waiting: one tap lands on the order detail."""
+        payments = await self.db.pending_review_payments(limit=15, offset=0)
+        lines = ["🧾 رسیدهای در انتظار بررسی"]
+        buttons: list[list] = []
+        if not payments:
+            lines.append("")
+            lines.append("در حال حاضر رسیدی در انتظار بررسی نیست.")
+        for payment in payments:
+            identity = await self.db.user_identity(int(payment["user_id"]))
+            who = self._identity_line(
+                username=(identity or {}).get("username"),
+                telegram_id=payment["user_id"],
+                display_name=self._user_display_name(
+                    (identity or {}).get("first_name", ""),
+                    (identity or {}).get("last_name", ""),
+                ),
+            )
+            number = to_persian_digits(payment["payment_id"])
+            lines.append("")
+            lines.append(f"#{number} | {who}")
+            lines.append(f"وضعیت: {self._payment_status_label(payment['status'])}")
+            buttons.append([Button.inline(
+                f"🔎 جزئیات سفارش {number}",
+                f"adm:pd:{payment['payment_id']}".encode("ascii"),
+            )])
+        buttons.append([Button.inline("💳 صف پرداخت‌ها", b"adm:hub:pay")])
+        buttons.append(self._hub_back_row("usr"))
+        buttons.extend(self._admin_menu())
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_blocked_users(self, event) -> None:
+        users = await self.db.blocked_users(limit=30)
+        lines = ["🚫 کاربران مسدود"]
+        if not users:
+            lines.append("")
+            lines.append("هیچ کاربری مسدود نیست.")
+        buttons: list[list] = []
+        for user in users:
+            who = self._identity_line(
+                username=user.get("username"),
+                telegram_id=user["telegram_id"],
+                display_name=self._user_display_name(
+                    user.get("first_name", ""), user.get("last_name", "")
+                ),
+            )
+            lines.append(f"• {who}")
+            buttons.append([Button.inline(
+                button_label(f"🔎 {user.get('username') or user['telegram_id']}"),
+                f"adm:hub:usr:card:{user['telegram_id']}".encode("ascii"),
+            )])
+        buttons.append(self._hub_back_row("usr"))
+        buttons.extend(self._admin_menu())
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
+
+    async def _show_admin_free_reset_confirm(self, event, target_id: int) -> None:
+        identity = await self.db.user_identity(int(target_id))
+        who = self._identity_line(
+            username=(identity or {}).get("username"),
+            telegram_id=target_id,
+            display_name=self._user_display_name(
+                (identity or {}).get("first_name", ""),
+                (identity or {}).get("last_name", ""),
+            ),
+        )
+        await self._edit(
+            event,
+            "🔄 بازنشانی هدیهٔ رایگان\n\n"
+            f"{who}\n\n"
+            "با تأیید، هر دو هدیهٔ «اولین بار رایگان» (فلش‌کارت و آزمون) برای این "
+            "کاربر برمی‌گردد.",
+            [
+                [Button.inline("✅ تأیید بازنشانی", f"adm:hub:usr:frx:{int(target_id)}".encode("ascii"))],
+                [Button.inline("↩️ انصراف", f"adm:hub:usr:card:{int(target_id)}".encode("ascii"))],
+            ],
+        )
+
+    async def _reset_user_free_gift(self, event, admin_id: int, target_id: int) -> None:
+        identity = await self.db.user_identity(int(target_id))
+        if identity is None:
+            await self._ack(event, "این کاربر پیدا نشد.", alert=True)
+            return
+        await self.db.reset_free_uses(int(target_id), admin_id=admin_id)
+        await self._ack(event, "هدیهٔ رایگان بازنشانی شد.")
+        await self._show_admin_user_card(event, target_id)
+
+    async def _toggle_admin_block(self, event, admin_id: int, target_id: int) -> None:
+        identity = await self.db.user_identity(int(target_id))
+        if identity is None:
+            await self._ack(event, "این کاربر پیدا نشد.", alert=True)
+            return
+        await self.db.set_banned(int(target_id), not identity["banned"], admin_id=admin_id)
+        await self._ack(
+            event, "مسدود شد." if not identity["banned"] else "مسدودی برداشته شد."
+        )
+        await self._show_admin_user_card(event, target_id)
+
+    async def _admin_user_search(self, event, admin_id: int, query: str) -> None:
+        """Resolve an admin's search text to a user card (id or @username)."""
+        matches = await self.db.search_users(query, limit=5)
+        if not matches:
+            await event.reply(
+                "کاربری با این شناسه یا نام‌کاربری پیدا نشد. "
+                "شناسهٔ عددی یا @نام‌کاربری را دقیق بفرستید.",
+                buttons=[[Button.inline("↩️ کاربران", b"adm:hub:usr")]],
+            )
+            return
+        if len(matches) == 1:
+            await self._show_admin_user_card(event, int(matches[0]["telegram_id"]))
+            return
+        buttons = []
+        for match in matches:
+            who = self._identity_line(
+                username=match.get("username"),
+                telegram_id=match["telegram_id"],
+                display_name=match.get("first_name", ""),
+            )
+            buttons.append([Button.inline(
+                button_label(who),
+                f"adm:hub:usr:card:{match['telegram_id']}".encode("ascii"),
+            )])
+        await event.reply(
+            "چند کاربر با این نام‌کاربری پیدا شد؛ یکی را انتخاب کنید:",
+            buttons=buttons,
+        )
 
     PAYMENT_ADMIN_PAGE_SIZE = 8
 
@@ -5145,7 +6549,10 @@ class GamasBot:
         payments = payments[:page_size]
         total = await self.db.count_pending_review_payments()
         buttons: list[list] = [
-            [Button.inline("📋 تاریخچه پرداخت‌ها", b"adm:ph:0")]
+            [
+                Button.inline("📋 تاریخچه", b"adm:hub:pay:hist"),
+                Button.inline("📊 آمار", b"adm:hub:pay:stats"),
+            ]
         ]
         if not payments:
             if page > 0 and total:
@@ -5160,6 +6567,9 @@ class GamasBot:
                 buttons,
             )
             return
+        identities = await self.db.identities_for(
+            [int(payment["user_id"]) for payment in payments]
+        )
         lines = [
             f"💳 پرداخت‌های در انتظار — {to_persian_digits(total)} مورد",
             f"صفحهٔ {to_persian_digits(page + 1)}؛ برای بررسی، سفارش را باز کنید.",
@@ -5170,8 +6580,16 @@ class GamasBot:
             price = payment.get("purchased_price")
             package = format_duration(int(seconds)) if seconds is not None else payment["plan_code"]
             amount = format_toman(int(price)) if price is not None else "نامشخص"
+            identity = identities.get(int(payment["user_id"]), {})
+            who = self._identity_line(
+                username=identity.get("username"),
+                telegram_id=int(payment["user_id"]),
+                display_name=self._user_display_name(
+                    identity.get("first_name", ""), identity.get("last_name", "")
+                ),
+            )
             lines.append(
-                f"\n#{number} | کاربر: {payment['user_id']}\n{package} | {amount}"
+                f"\n#{number} · {who}\n{package} | {amount} | {self._date_text(payment.get('created_at'))}"
             )
             buttons.append([Button.inline(
                 f"🔎 جزئیات سفارش {number}", f"adm:pd:{payment['payment_id']}".encode()
@@ -5186,34 +6604,93 @@ class GamasBot:
         buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
-    async def _show_admin_payment_history(self, event, page: int = 0) -> None:
+    #: Status filters of the payment history, in the order the buttons appear.
+    PAYMENT_HISTORY_FILTERS: tuple[tuple[str, str], ...] = (
+        ("all", "همه"),
+        ("pending_review", "در انتظار"),
+        ("approved", "تأییدشده"),
+        ("rejected", "ردشده"),
+    )
+
+    async def _show_admin_payment_history(
+        self, event, page: int = 0, status: str = "all"
+    ) -> None:
+        """Orders, newest first, one status filter at a time.
+
+        The filter is part of the callback data (``adm:hub:pay:hist:<status>:<page>``)
+        so a filtered page survives a reload and cannot be forged into an
+        unknown status: anything outside the table falls back to «همه».
+        """
+        page = max(0, int(page))
+        filters = dict(self.PAYMENT_HISTORY_FILTERS)
+        if status not in filters:
+            status = "all"
         page_size = 8
         payments = await self.db.all_payments(
-            limit=page_size + 1, offset=page * page_size
+            limit=page_size + 1,
+            offset=page * page_size,
+            status=None if status == "all" else status,
         )
         has_more = len(payments) > page_size
         payments = payments[:page_size]
-        lines = [f"📋 تاریخچه پرداخت‌ها — صفحهٔ {to_persian_digits(page + 1)}"]
-        buttons: list[list] = []
+        active = filters[status]
+        lines = [
+            "📋 تاریخچه پرداخت‌ها — " + active,
+            f"صفحهٔ {to_persian_digits(page + 1)}",
+        ]
+        buttons: list[list] = [
+            [
+                Button.inline(
+                    button_label(f"✅ {label}" if code == status else label),
+                    f"adm:hub:pay:hist:{code}".encode(),
+                )
+                for code, label in self.PAYMENT_HISTORY_FILTERS[:2]
+            ],
+            [
+                Button.inline(
+                    button_label(f"✅ {label}" if code == status else label),
+                    f"adm:hub:pay:hist:{code}".encode(),
+                )
+                for code, label in self.PAYMENT_HISTORY_FILTERS[2:]
+            ],
+        ]
+        identities = await self.db.identities_for(
+            [int(payment["user_id"]) for payment in payments]
+        )
         if not payments:
-            lines.append("\nسفارشی ثبت نشده است." if page == 0 else "\nمورد دیگری وجود ندارد.")
+            lines.append(
+                "\nدر این وضعیت سفارشی نیست." if page == 0 else "\nمورد دیگری وجود ندارد."
+            )
         for payment in payments:
             number = to_persian_digits(payment["payment_id"])
+            identity = identities.get(int(payment["user_id"]), {})
+            who = self._identity_line(
+                username=identity.get("username"),
+                telegram_id=int(payment["user_id"]),
+                display_name=self._user_display_name(
+                    identity.get("first_name", ""), identity.get("last_name", "")
+                ),
+            )
             lines.append(
-                f"\n#{number} | کاربر: {payment['user_id']} | "
-                f"{self._payment_status_label(payment['status'])}"
+                f"\n#{number} · {who}\n"
+                f"{self._payment_status_label(payment['status'])} | "
+                f"{self._date_text(payment.get('created_at'))}"
             )
             buttons.append([Button.inline(
                 f"🔎 جزئیات سفارش {number}", f"adm:pd:{payment['payment_id']}".encode()
             )])
         nav = []
         if page > 0:
-            nav.append(Button.inline("◀️ قبلی", f"adm:ph:{page - 1}".encode()))
+            nav.append(Button.inline(
+                "◀️ قبلی", f"adm:hub:pay:hist:{status}:{page - 1}".encode()
+            ))
         if has_more:
-            nav.append(Button.inline("بعدی ▶️", f"adm:ph:{page + 1}".encode()))
+            nav.append(Button.inline(
+                "بعدی ▶️", f"adm:hub:pay:hist:{status}:{page + 1}".encode()
+            ))
         if nav:
             buttons.append(nav)
-        buttons.append([Button.inline("💳 پرداخت‌های در انتظار", b"adm:pay")])
+        buttons.append([Button.inline("💳 پرداخت‌های در انتظار", b"adm:hub:pay")])
         buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
@@ -5237,10 +6714,20 @@ class GamasBot:
             receipt_state = "پاسخ‌شده؛ رسید موجود نیست"
         else:
             receipt_state = "در دسترس نیست"
+        owner = await self.db.user_identity(int(payment["user_id"]))
+        owner_line = (
+            self._identity_line(
+                username=owner["username"],
+                telegram_id=int(payment["user_id"]),
+                display_name=self._user_display_name(owner["first_name"], owner["last_name"]),
+            )
+            if owner
+            else f"شناسه: {to_persian_digits(int(payment['user_id']))}"
+        )
         lines = [
             f"🔎 سفارش {to_persian_digits(payment_id)}",
             f"شناسه سفارش: #{to_persian_digits(payment_id)}",
-            f"کاربر: {payment['user_id']}",
+            f"کاربر: {owner_line}",
             f"طرح: {payment['plan_code']}",
             f"بسته: {format_duration(int(seconds)) if seconds is not None else payment['plan_code']}",
             f"مدت اعتبار: {format_validity(validity_days)}",
@@ -5268,8 +6755,8 @@ class GamasBot:
                 Button.inline("✅ تأیید پرداخت", f"payv:{payment_id}:a".encode()),
                 Button.inline("❌ رد پرداخت", f"payv:{payment_id}:r".encode()),
             ])
-        buttons.append([Button.inline("💳 پرداخت‌های در انتظار", b"adm:pay")])
-        buttons.append([Button.inline("📋 تاریخچه پرداخت‌ها", b"adm:ph:0")])
+        buttons.append([Button.inline("💳 پرداخت‌های در انتظار", b"adm:hub:pay")])
+        buttons.append([Button.inline("📋 تاریخچه پرداخت‌ها", b"adm:hub:pay:hist")])
         buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
