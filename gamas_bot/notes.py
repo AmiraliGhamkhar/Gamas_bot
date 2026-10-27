@@ -40,7 +40,7 @@ try:
 except ImportError:  # pragma: no cover - optional fast-path
     _orjson = None  # type: ignore[assignment]
 
-from .config import NOTE_MODES, Settings, resolve_note_mode
+from .config import Settings, resolve_note_mode
 from .llm import (
     LLMContextOverflowError,
     LLMError,
@@ -385,7 +385,9 @@ class StructuredNotes:
         return {
             "title": self.title,
             "summary": self.summary,
-            "note_mode": self.note_mode if self.note_mode in NOTE_MODES else "full",
+            # CR-3: the field stays for backward compatibility with archived
+            # booklets, but is always emitted as "full" (legacy values normalise).
+            "note_mode": "full",
             "learning_objectives": list(self.learning_objectives),
             "sections": [
                 {
@@ -525,12 +527,10 @@ class StructuredNotes:
         glossary = tuple(
             filter(None, (GlossaryEntry.from_payload(item) for item in glossary_items))
         )
-        raw_mode = payload.get("note_mode")
-        note_mode = (
-            raw_mode
-            if isinstance(raw_mode, str) and raw_mode in NOTE_MODES
-            else resolve_note_mode(default_mode)
-        )
+        # CR-3: FULL is the only mode. Any legacy compression-mode value or
+        # junk in an archived payload is normalised to "full" and never crashes
+        # parsing. ``default_mode`` is kept for a compatible signature.
+        note_mode = "full"
         raw_tips = payload.get("practical_tips")
         practical_tips = tuple(
             filter(
@@ -771,6 +771,10 @@ def headings_overlap(first: str, second: str, *, threshold: float = 0.5) -> bool
 # Prompts (ported verbatim — the content-preservation contract)
 # ===========================================================================
 
+#: CR-3: FULL is the single source of truth. The note-generation ``mode``
+#: parameter is kept on the public builders for backward compatibility,
+#: but every call resolves to this one rule set; the legacy compression
+#: modes were removed.
 MODE_RULES = {
     "full": (
         "- حالت خروجی: FULL. شما «گردآورندهٔ جزوهٔ درس» هستید، نه خلاصه‌ساز. جزوه باید جایگزین قابل‌اتکای حضار در کلاس باشد و هیچ مطلب علمیِ متن حذف نشود.\n"
@@ -778,12 +782,6 @@ MODE_RULES = {
         "- فشرده‌سازی فقط در بیان است: هر تعریف، دلیل، مکانیزم، مثال، روند گام‌به‌گام، مقایسه، هشدار، استثنا، فرمول، عدد و واحد باید کامل و عیناً در جزوه بیاید؛ یک توضیح چندجمله‌ای را برای کوتاه‌شدن جزوه به یک خط یا یک بولت فشرده تبدیل نکنید — همان معنا را با جمله‌های کمتر و کامل‌تر بیان کنید.\n"
         "- تکرارهای سرهم و عین‌هم را یک بار بنویسید؛ تکراری که گوینده آگاهانه برای تأکید یا روشن‌شدن به‌کار برده نگه دارید.\n"
         "- هیچ مطلب تازه‌ای اضافه نکنید: هر جمله، عدد و اصطلاح باید پشتوانهٔ لفظی در متن منبع داشته باشد.\n"
-    ),
-    "standard": (
-        "- حالت خروجی: STANDARD. میان حفظ کامل مطالب و روانی جزوه تعادل برقرار کنید؛ توضیح‌های اصلی و مثال‌های مهم را نگه دارید و فقط پرگویی‌های آشکار را حذف کنید.\n"
-    ),
-    "summary": (
-        "- حالت خروجی: SUMMARY. جزوهٔ کوتاه و فشرده بنویسید؛ فقط موضوع‌های اصلی، تعریف‌های کلیدی و اعداد مهم را بیاورید. مثال‌های فرعی و توضیح‌های طولانی را مختصر کنید.\n"
     ),
 }
 
@@ -965,7 +963,8 @@ _PRESENTATION_CONTENT_RULES = (
 
 def build_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
     """The Persian system prompt for one note mode (lecture-to-notes compiler)."""
-    mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
+    # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
+    mode_rule = MODE_RULES["full"]
     prompt = (
         "شما دستیار آموزشی فارسی «گاماس» هستید و نقش شما «گردآورندهٔ جزوهٔ درس» است، نه خلاصه‌ساز. "
         "ورودی شما متن پیاده‌سازی‌شدهٔ خام یک کلاس درسی است و خروجی شما باید یک جزوهٔ ساختارمند، کامل و "
@@ -1102,7 +1101,8 @@ def build_chunk_message(block: str, body: str) -> str:
 
 def build_presentation_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
     """The Persian system prompt for presentation material in one note mode."""
-    mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
+    # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
+    mode_rule = MODE_RULES["full"]
     prompt = (
         "شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما محتوای یک فایل ارائهٔ درسی (PowerPoint) است — "
         "شامل متن اسلایدها، یادداشت‌های گوینده و متن پیاده‌سازی‌شدهٔ صدای ضبط‌شدهٔ همان ارائه — و خروجی شما "
@@ -1158,7 +1158,8 @@ def build_compile_system_prompt(
     mode: str = "full", *, presentation: bool = False
 ) -> str:
     """Build the editorial compile system prompt for a note mode and source kind."""
-    mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
+    # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
+    mode_rule = MODE_RULES["full"]
     prompt = COMPILE_SYSTEM_PROMPT + "\n\nقواعد حالت خروجی:\n" + mode_rule.rstrip()
     if presentation:
         prompt += "\n" + _PRESENTATION_CONTENT_RULES.strip()
@@ -1441,9 +1442,8 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
             [point for item in notes for point in item.key_points], _compare_key
         ),
         glossary=_dedupe_glossary(notes),
-        note_mode=next(
-            (item.note_mode for item in notes if item.note_mode in NOTE_MODES), "full"
-        ),
+        # CR-3: every merged booklet is FULL, regardless of legacy stored values.
+        note_mode="full",
         learning_objectives=_dedupe_by_key(
             [item for note in notes for item in note.learning_objectives], _compare_key
         ),

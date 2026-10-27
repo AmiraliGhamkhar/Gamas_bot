@@ -10,6 +10,7 @@ from unittest import mock
 from gamas_bot.llm import LLMContextOverflowError, LLMError
 from gamas_bot.notes import (
     COMPILE_HARD_MAX_CHARS,
+    MODE_RULES,
     MAX_PRACTICAL_TIPS,
     CONTEXT_DIGEST_MAX_CHARS,
     MAX_CONTEXT_SPLITS,
@@ -273,12 +274,18 @@ class ContextTests(unittest.TestCase):
 
 
 class PromptTests(unittest.TestCase):
-    def test_mode_rules_selected(self):
+    def test_only_full_mode_is_available(self):
+        # CR-3: standard/summary were deleted; every mode value now resolves
+        # to the single FULL rule set (no SUMMARY/STANDARD prompt exists).
         full = build_system_prompt("full")
-        summary = build_system_prompt("summary")
+        for legacy in ("standard", "summary", "bogus", None):
+            with self.subTest(mode=legacy):
+                self.assertEqual(build_system_prompt(legacy), full)
         self.assertIn("FULL", full)
-        self.assertIn("SUMMARY", summary)
         self.assertIn("JSON", full)
+        self.assertNotIn("SUMMARY", full)
+        self.assertNotIn("STANDARD", full)
+        self.assertEqual(tuple(MODE_RULES), ("full",))
 
     def test_full_mode_is_compact_but_lossless(self):
         """The full-mode contract: compact wording, no dropped facts, no added facts.
@@ -1110,12 +1117,13 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
             big_notes_json("نیمهٔ نخست"),
             big_notes_json("نیمهٔ دوم"),
         ])
+        # CR-3: a legacy "summary" mode is accepted but always behaves as full.
         notes = await structure_presentation(outline, "", settings, session, mode="summary")
         self.assertEqual(len(session.calls), 3)
         self.assertTrue(
             session.calls[0]["json"]["messages"][1]["content"].startswith(PRESENTATION_PROMPT)
         )
-        self.assertEqual(notes.note_mode, "summary")
+        self.assertEqual(notes.note_mode, "full")
 
 
 if __name__ == "__main__":

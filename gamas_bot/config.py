@@ -35,7 +35,11 @@ TRUTHY = {"1", "true", "yes", "on"}
 #: Project directory: the folder that contains this package's parent.
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 
-NOTE_MODES = ("full", "standard", "summary")
+#: CR-3: the booklet is always produced in FULL (class-replacement) mode.
+#: The tuple is kept (with a single value) because the note model still
+#: normalises the stored ``note_mode`` field through it for backward
+#: compatibility with previously archived booklets.
+NOTE_MODES = ("full",)
 RAW_TEXT_PROFILES = ("plain", "timestamped")
 
 STT_PROVIDER_ORDER = ("speechmatics", "deepgram", "openai_compatible")
@@ -405,9 +409,14 @@ def normalize_note_compile_provider(value: str | None) -> str:
 
 
 def resolve_note_mode(mode: str | None) -> str:
-    """Resolve a note compression mode, defaulting to ``full``."""
-    value = (mode or "").strip().lower()
-    return value if value in NOTE_MODES else "full"
+    """Resolve the sole note mode to ``"full"`` for *any* input.
+
+    CR-3 removed the two legacy compression modes. This is deliberately a
+    total function: old ``NOTE_MODE`` env values, junk, stored DB values and
+    ``None`` all resolve to ``"full"`` so startup and archived booklets never
+    crash. ``mode`` is accepted for backward-compatible call sites only.
+    """
+    return "full"
 
 
 def resolve_note_reasoning_effort(effort: str | None) -> str:

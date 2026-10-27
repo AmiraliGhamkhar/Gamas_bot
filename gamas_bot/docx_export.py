@@ -2626,11 +2626,10 @@ def _add_section(document, index: int, section: NoteSection, *, fonts: DocumentF
         _add_table(document, table, fonts=fonts)
 
 
-#: Persian labels for the note modes, shown on the cover.
+#: Persian label for the single note mode, shown on the cover (CR-3).
+#: ``note_mode`` on archived booklets always normalises to "full".
 MODE_LABELS = {
     "full": "حالت تولید: کامل (حفظ کامل محتوای درس)",
-    "standard": "حالت تولید: استاندارد",
-    "summary": "حالت تولید: خلاصه",
 }
 
 

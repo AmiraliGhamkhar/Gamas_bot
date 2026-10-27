@@ -3,6 +3,10 @@
 The booklet reorganizes the lecture; it must not invent facts or change names, terms, numbers or
 units.
 
+Every booklet is produced in a single **FULL** mode — a complete, standalone replacement for
+attending the class. The former `standard`/`summary` modes were removed; `NOTE_MODE` is now a
+no-op and any value (including values on archived booklets) is normalised to `full`.
+
 ## Checks
 
 With `NOTE_STRICT_GROUNDING=true` (default), a deterministic evidence gate indexes the source once

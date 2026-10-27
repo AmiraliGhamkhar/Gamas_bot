@@ -448,15 +448,16 @@ def extract_signals(text: str, *, mask: bool = True) -> frozenset[Signal]:
     return frozenset(signals)
 
 
-#: Recall floors per note mode. Numbers are the hard facts of a lecture, so
-#: even a summary keeps nearly all of them; terms are allowed to be rewritten
-#: or dropped when a summary is explicitly requested.
-NUMBER_COVERAGE_FLOORS = {"full": 0.95, "standard": 0.90, "summary": 0.70}
-TERM_COVERAGE_FLOORS = {"full": 0.95, "standard": 0.85, "summary": 0.60}
+#: CR-3: FULL is the only note mode, so there is a single recall floor. Numbers
+#: are the hard facts of a lecture (0.95); terms are held to the same floor.
+#: ``mode`` is accepted on :func:`coverage_thresholds` for backward-compatible
+#: callers but no longer selects between different floors.
+NUMBER_COVERAGE_FLOORS = {"full": 0.95}
+TERM_COVERAGE_FLOORS = {"full": 0.95}
 
 
 def coverage_thresholds(mode: str) -> tuple[float, float]:
-    """The ``(number, term)`` recall floors for a note mode."""
+    """The ``(number, term)`` recall floors; always the FULL floors."""
     key = mode if mode in NUMBER_COVERAGE_FLOORS else "full"
     return NUMBER_COVERAGE_FLOORS[key], TERM_COVERAGE_FLOORS[key]
 
@@ -576,9 +577,9 @@ def _payload_strings(value: object) -> Iterator[str]:
 def _payload_of(notes: object) -> object:
     """The note payload without its metadata.
 
-    ``note_mode`` is a producer setting (``full``/``standard``/``summary``), not
-    a fact about the lecture; auditing it would report the word ``full`` as a
-    fabrication in every document.
+    ``note_mode`` is a producer setting (now always ``full``), not a fact about
+    the lecture; auditing it would report the word ``full`` as a fabrication in
+    every document.
     """
     payload = notes.to_payload() if hasattr(notes, "to_payload") else notes
     if isinstance(payload, dict) and "note_mode" in payload:
