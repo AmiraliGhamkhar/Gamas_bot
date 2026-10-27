@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Booklet quizzes now generate mid-to-hard scenario questions (~40% `medium`, ~60% `hard`) at the
+  Apply/Analyze/Evaluate level, with misconception-based homogeneous distractors and no giveaway
+  cues. The optional `difficulty` output tag never invalidates a question, so the existing
+  short-output refund path still holds. The quiz start screen states «سؤال‌های متوسط تا سخت».
+
 Learning loop add-on — quizzes, leaderboard and flashcards:
 
 - Booklets with extracted text gain an in-bot quiz (5/10/15 questions, `QUIZ_COST_SECONDS_PER_QUESTION`

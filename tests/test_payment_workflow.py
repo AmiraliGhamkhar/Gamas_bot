@@ -166,10 +166,12 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         wallet = await self.press(USER, "wallet")
         text, buttons = wallet.edits[-1]
-        self.assertIn("💳 حساب من", text)
+        self.assertIn("🛒 خرید اشتراک", text)  # CR-1: purchase CTA is the title
         self.assertIn("اعتبار باقی‌مانده", text)
-        self.assertIn("🛒 خرید اشتراک", text)
         self.assertIn("🧾 پرداخت‌های اخیر", text)
+        # CR-1: plans lead the screen; balance and history stay on it too.
+        self.assertLess(text.index("بسته را انتخاب کنید"),
+                        text.index("اعتبار باقی‌مانده"))
         self.assertIn("۲۵ ساعت", text)
         self.assertIn(f"#{to_persian_digits(payment_ids[-1])}", text)
         self.assertNotIn(f"#{to_persian_digits(payment_ids[0])}", text)

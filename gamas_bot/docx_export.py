@@ -2626,12 +2626,35 @@ def _add_section(document, index: int, section: NoteSection, *, fonts: DocumentF
         _add_table(document, table, fonts=fonts)
 
 
-#: Persian labels for the note modes, shown on the cover.
+#: Persian label for the single note mode, shown on the cover (CR-3).
+#: ``note_mode`` on archived booklets always normalises to "full".
 MODE_LABELS = {
     "full": "حالت تولید: کامل (حفظ کامل محتوای درس)",
-    "standard": "حالت تولید: استاندارد",
-    "summary": "حالت تولید: خلاصه",
 }
+
+
+
+def _glossary_rows(notes) -> list[tuple[str, str]]:
+    """Glossary entries, falling back to section definitions.
+
+    CR-4: a complete booklet always carries an English-term glossary. When the
+    model supplied one it is used verbatim; otherwise it is derived strictly
+    from the definitions already present in the source-grounded sections (no
+    invented terms). Duplicate terms keep the first, source-order definition.
+    """
+    if notes.glossary:
+        return [(entry.term, entry.definition) for entry in notes.glossary]
+    rows: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for section in notes.sections:
+        for definition in section.definitions:
+            term = (definition.term_en or definition.term or "").strip()
+            key = term.lower()
+            if not term or key in seen:
+                continue
+            seen.add(key)
+            rows.append((term, definition.definition))
+    return rows
 
 
 def build_notes_docx(
@@ -2731,9 +2754,24 @@ def build_notes_docx(
         _add_heading(document, "پرسش‌های مرور", fonts=resolved, level=1)
         _add_numbered_steps(document, notes.review_questions, fonts=resolved)
 
-    if notes.glossary:
-        _add_heading(document, "واژه‌نامه", fonts=resolved, level=1)
-        glossary_table = document.add_table(rows=len(notes.glossary) + 1, cols=2)
+    # CR-4: an explicit, one-page end-of-booklet «جمع‌بندی». It is a grounded
+    # recap of the source summary/key points — never an invented conclusion.
+    recap = notes.summary.strip()
+    if recap or notes.key_points:
+        _add_heading(document, "جمع‌بندی", fonts=resolved, level=1, space_before=6)
+        if recap:
+            para = _add_rtl_paragraph(document, recap, fonts=resolved, size=11.5, space_after=8)
+            _shade_paragraph(para, SUMMARY_SHADE)
+            _paragraph_borders(para, SUMMARY_BORDER)
+        if notes.key_points:
+            _add_bullets(document, notes.key_points, fonts=resolved)
+
+    # CR-4: the glossary is derived from section definitions when the model did
+    # not supply one, so a complete booklet always carries this final section.
+    glossary_rows = _glossary_rows(notes)
+    if glossary_rows:
+        _add_heading(document, "واژه‌نامهٔ اصطلاح‌ها", fonts=resolved, level=1)
+        glossary_table = document.add_table(rows=len(glossary_rows) + 1, cols=2)
         _prepare_content_table(glossary_table)
         header = glossary_table.rows[0]
         _repeat_table_header(header)
@@ -2748,20 +2786,20 @@ def build_notes_docx(
             _apply_paragraph_style(paragraph, document, TABLE_TEXT_STYLE)
             _shade_paragraph(paragraph, ACCENT_HEX)
             _shade_cell(cell, ACCENT_HEX)
-        for row_index, entry in enumerate(notes.glossary, start=1):
+        for row_index, (g_term, g_def) in enumerate(glossary_rows, start=1):
             stripe = ZEBRA_SHADE if row_index % 2 == 0 else ""
             term_cell = glossary_table.cell(row_index, 0)
             if stripe:
                 _shade_cell(term_cell, stripe)
             _fill_paragraph(
-                term_cell.paragraphs[0], _table_cell_text(entry.term), fonts=resolved, size=10.5,
+                term_cell.paragraphs[0], _table_cell_text(g_term), fonts=resolved, size=10.5,
                 bold=True, align=WD_ALIGN_PARAGRAPH.RIGHT, space_after=0,
             )
             definition_cell = glossary_table.cell(row_index, 1)
             if stripe:
                 _shade_cell(definition_cell, stripe)
             _fill_paragraph(
-                definition_cell.paragraphs[0], _table_cell_text(entry.definition), fonts=resolved,
+                definition_cell.paragraphs[0], _table_cell_text(g_def), fonts=resolved,
                 size=10.5, align=WD_ALIGN_PARAGRAPH.RIGHT, space_after=0,
             )
         # A term is short and its explanation is long: the glossary keeps its

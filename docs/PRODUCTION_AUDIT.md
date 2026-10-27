@@ -158,7 +158,7 @@ acceptance item against the real handlers and the exact user-visible Persian cop
 - A simulated Telegram outage loses nothing: stored tickets/messages and the approved credit stay
   intact and repeated approval still credits once.
 - This v4 UI replaces the earlier mission-button menu with one direct lecture-upload action and
-  four user buttons: «📚 کتابخانه من», «💳 حساب من», «🎧 پشتیبانی» and «ℹ️ راهنما». Admins retain
+  four user buttons: «📚 کتابخانه من», «🛒 خرید اشتراک», «🎧 پشتیبانی» and «ℹ️ راهنما». Admins retain
   their separate payment, history and support panel; the library forwards only the requesting user's
   Telegram-backed artifacts.
 

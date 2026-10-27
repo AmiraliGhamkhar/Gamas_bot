@@ -103,6 +103,7 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_OPENROUTER_THROUGHPUT", "note_openrouter_throughput", "bool"),
     ("NOTE_STRUCTURED_OUTPUT", "note_structured_output", "bool"),
     ("NOTE_PROGRESSIVE_BOOKLET", "note_progressive_booklet", "bool"),
+    ("NOTE_COMPLETENESS_FILL", "note_completeness_fill", "bool"),
     ("NOTE_COMPILE_PROVIDER", "note_compile_provider", "str"),
     ("NOTE_COMPILE_MAX_CHARS", "note_compile_max_chars", "int"),
     ("NOTE_REASONING_EFFORT", "note_reasoning_effort", "str"),

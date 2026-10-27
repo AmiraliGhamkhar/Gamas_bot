@@ -3,7 +3,7 @@
 Persian Telegram study assistant. Send lecture audio/video or a PowerPoint deck—no mode button
 needed—and get the transcript first, followed by an RTL Word booklet when note generation is
 configured. Delivered transcript and booklet files are saved to the Telegram-backed personal
-library; balance, subscription purchase and recent payments live together in «💳 حساب من».
+library; the «🛒 خرید اشتراک» CTA opens a purchase-first screen (plans, then balance and recent payments).
 
 The former Free Office bot UI is retired. Its standalone export modules remain available to code
 and their offline tests, but text-to-document jobs are no longer accepted by the bot.

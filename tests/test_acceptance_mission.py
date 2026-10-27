@@ -406,7 +406,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
             flat_labels,
             [
                 "📚 کتابخانه من",
-                "💳 حساب من",
+                "🛒 خرید اشتراک",
                 "🏆 لیدربورد",
                 "🎧 پشتیبانی",
                 "ℹ️ راهنما",

@@ -40,7 +40,7 @@ try:
 except ImportError:  # pragma: no cover - optional fast-path
     _orjson = None  # type: ignore[assignment]
 
-from .config import NOTE_MODES, Settings, resolve_note_mode
+from .config import Settings, resolve_note_mode
 from .llm import (
     LLMContextOverflowError,
     LLMError,
@@ -57,6 +57,7 @@ from .notes_evidence import (
     evidence_windows,
     extract_signals,
     sentence_coverage,
+    split_sentences,
     validate_table,
     validate_tip,
 )
@@ -385,7 +386,9 @@ class StructuredNotes:
         return {
             "title": self.title,
             "summary": self.summary,
-            "note_mode": self.note_mode if self.note_mode in NOTE_MODES else "full",
+            # CR-3: the field stays for backward compatibility with archived
+            # booklets, but is always emitted as "full" (legacy values normalise).
+            "note_mode": "full",
             "learning_objectives": list(self.learning_objectives),
             "sections": [
                 {
@@ -525,12 +528,10 @@ class StructuredNotes:
         glossary = tuple(
             filter(None, (GlossaryEntry.from_payload(item) for item in glossary_items))
         )
-        raw_mode = payload.get("note_mode")
-        note_mode = (
-            raw_mode
-            if isinstance(raw_mode, str) and raw_mode in NOTE_MODES
-            else resolve_note_mode(default_mode)
-        )
+        # CR-3: FULL is the only mode. Any legacy compression-mode value or
+        # junk in an archived payload is normalised to "full" and never crashes
+        # parsing. ``default_mode`` is kept for a compatible signature.
+        note_mode = "full"
         raw_tips = payload.get("practical_tips")
         practical_tips = tuple(
             filter(
@@ -771,6 +772,10 @@ def headings_overlap(first: str, second: str, *, threshold: float = 0.5) -> bool
 # Prompts (ported verbatim — the content-preservation contract)
 # ===========================================================================
 
+#: CR-3: FULL is the single source of truth. The note-generation ``mode``
+#: parameter is kept on the public builders for backward compatibility,
+#: but every call resolves to this one rule set; the legacy compression
+#: modes were removed.
 MODE_RULES = {
     "full": (
         "- حالت خروجی: FULL. شما «گردآورندهٔ جزوهٔ درس» هستید، نه خلاصه‌ساز. جزوه باید جایگزین قابل‌اتکای حضار در کلاس باشد و هیچ مطلب علمیِ متن حذف نشود.\n"
@@ -778,12 +783,6 @@ MODE_RULES = {
         "- فشرده‌سازی فقط در بیان است: هر تعریف، دلیل، مکانیزم، مثال، روند گام‌به‌گام، مقایسه، هشدار، استثنا، فرمول، عدد و واحد باید کامل و عیناً در جزوه بیاید؛ یک توضیح چندجمله‌ای را برای کوتاه‌شدن جزوه به یک خط یا یک بولت فشرده تبدیل نکنید — همان معنا را با جمله‌های کمتر و کامل‌تر بیان کنید.\n"
         "- تکرارهای سرهم و عین‌هم را یک بار بنویسید؛ تکراری که گوینده آگاهانه برای تأکید یا روشن‌شدن به‌کار برده نگه دارید.\n"
         "- هیچ مطلب تازه‌ای اضافه نکنید: هر جمله، عدد و اصطلاح باید پشتوانهٔ لفظی در متن منبع داشته باشد.\n"
-    ),
-    "standard": (
-        "- حالت خروجی: STANDARD. میان حفظ کامل مطالب و روانی جزوه تعادل برقرار کنید؛ توضیح‌های اصلی و مثال‌های مهم را نگه دارید و فقط پرگویی‌های آشکار را حذف کنید.\n"
-    ),
-    "summary": (
-        "- حالت خروجی: SUMMARY. جزوهٔ کوتاه و فشرده بنویسید؛ فقط موضوع‌های اصلی، تعریف‌های کلیدی و اعداد مهم را بیاورید. مثال‌های فرعی و توضیح‌های طولانی را مختصر کنید.\n"
     ),
 }
 
@@ -963,9 +962,32 @@ _PRESENTATION_CONTENT_RULES = (
 )
 
 
+#: CR-4: the mandatory, ordered skeleton of a class-replacement booklet.
+#: It maps each required block onto an existing JSON field, so no schema change
+#: is needed; the exporter renders the TOC/جمع‌بندی/glossary sections.
+_BOOKLET_SKELETON_RULES = (
+    "\n### اسکلت لازم جزوهٔ کامل (هیچ بلوکی حذف نشود)\n"
+    "جزوه باید یک کتابچهٔ درسی کامل و جایگزین حضور در کلاس باشد، نه خلاصه. ترتیب بلوک‌ها: "
+    "جلد و عنوان درس → فهرست مطالب → هدف کلی درس → بخش‌بندی منطقی مطابق ترتیب منبع → "
+    "تعریف‌ها، مثال‌ها، گام‌ها، فرمول‌ها، جدول‌ها، نکته‌ها و هشدارها در جای خود → "
+    "جمع‌بندی یک‌صفحه‌ای پایان جزوه → واژه‌نامهٔ اصطلاح‌های انگلیسی.\n"
+    "- جلد و عنوان درس را در title بگذارید؛ هدف کلی درس را در learning_objectives بنویسید "
+    "(فقط اگر متن منبع پشتوانه‌ای دارد). فهرست مطالب از heading بخش‌ها ساخته می‌شود؛ "
+    "پس بخش‌ها را با عنوان‌های کوتاه، گویا و به ترتیب منبع بچینید.\n"
+    "- داخل هر بخش: تعریف‌ها در definitions، مثال‌های کامل در examples، روند گام‌به‌گام در steps، "
+    "صورت دقیق فرمول‌ها در formulas، مقایسه‌ها در tables، هشدارها در callouts و نکته‌های مهم در key_points.\n"
+    "- جمع‌بندی پایان جزوه را در summary و key_points سطح کل درس بنویسید (یک صفحه، بدون مطلب تازه)؛ "
+    "واژه‌نامه را در glossary فقط با اصطلاح‌های انگلیسی‌ای پر کنید که عیناً در همین متن منبع آمده‌اند.\n"
+    "- قانون پوشش (بدون استثنا): هر واحد آموزشی متن منبع — تعریف، دلیل، مکانیزم، مثال، مرحله، فرمول، عدد، "
+    "واحد، هشدار و استثنا — باید دست‌کم یک‌بار در یکی از بخش‌ها بیاید؛ هیچ واحدی را به بهانهٔ "
+    "فشرده‌سازی یا تکراری‌بودن حذف نکنید.\n"
+)
+
+
 def build_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
     """The Persian system prompt for one note mode (lecture-to-notes compiler)."""
-    mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
+    # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
+    mode_rule = MODE_RULES["full"]
     prompt = (
         "شما دستیار آموزشی فارسی «گاماس» هستید و نقش شما «گردآورندهٔ جزوهٔ درس» است، نه خلاصه‌ساز. "
         "ورودی شما متن پیاده‌سازی‌شدهٔ خام یک کلاس درسی است و خروجی شما باید یک جزوهٔ ساختارمند، کامل و "
@@ -973,6 +995,7 @@ def build_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
         + _JSON_RULES
         + "\n\nقواعد محتوا:\n"
         + mode_rule
+        + _BOOKLET_SKELETON_RULES
         + _SEMANTIC_RULES
         + _CONTENT_RULES
         + _FORBIDDEN_ADDITIONS
@@ -1102,7 +1125,8 @@ def build_chunk_message(block: str, body: str) -> str:
 
 def build_presentation_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
     """The Persian system prompt for presentation material in one note mode."""
-    mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
+    # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
+    mode_rule = MODE_RULES["full"]
     prompt = (
         "شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما محتوای یک فایل ارائهٔ درسی (PowerPoint) است — "
         "شامل متن اسلایدها، یادداشت‌های گوینده و متن پیاده‌سازی‌شدهٔ صدای ضبط‌شدهٔ همان ارائه — و خروجی شما "
@@ -1111,6 +1135,7 @@ def build_presentation_system_prompt(mode: str = "full", *, context_block: str =
         + _JSON_RULES
         + "\n\nقواعد محتوا:\n"
         + mode_rule
+        + _BOOKLET_SKELETON_RULES
         + _SEMANTIC_RULES
         + _CONTENT_RULES
         + _FORBIDDEN_ADDITIONS
@@ -1152,13 +1177,16 @@ COMPILE_SYSTEM_PROMPT = (
     "- اطلاعات تازه اضافه نکنید. اگر چیزی در ورودی نیست، حدس نزنید.\n\n"
     "ساختار خروجی — فقط یک شیء JSON معتبر، بدون هیچ متن اضافه، با همان ساختار ورودی؛ "
     "«sections» هرگز خالی نمی‌شود و در callouts مقدار kind فقط «نکته»، «هشدار» یا «یادآوری» است."
+    # CR-4: the editorial pass must preserve the full booklet skeleton too.
+    + _BOOKLET_SKELETON_RULES
 )
 
 def build_compile_system_prompt(
     mode: str = "full", *, presentation: bool = False
 ) -> str:
     """Build the editorial compile system prompt for a note mode and source kind."""
-    mode_rule = MODE_RULES.get(mode, MODE_RULES["full"])
+    # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
+    mode_rule = MODE_RULES["full"]
     prompt = COMPILE_SYSTEM_PROMPT + "\n\nقواعد حالت خروجی:\n" + mode_rule.rstrip()
     if presentation:
         prompt += "\n" + _PRESENTATION_CONTENT_RULES.strip()
@@ -1441,9 +1469,8 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
             [point for item in notes for point in item.key_points], _compare_key
         ),
         glossary=_dedupe_glossary(notes),
-        note_mode=next(
-            (item.note_mode for item in notes if item.note_mode in NOTE_MODES), "full"
-        ),
+        # CR-3: every merged booklet is FULL, regardless of legacy stored values.
+        note_mode="full",
         learning_objectives=_dedupe_by_key(
             [item for note in notes for item in note.learning_objectives], _compare_key
         ),
@@ -1596,6 +1623,254 @@ def context_block_for(
         if next_head:
             lines.append("چند جملهٔ آغاز بخش بعدی (فقط برای پیوند): " + next_head + " …")
     return "\n".join(lines)
+
+
+# ===========================================================================
+# Completeness validator & coverage-gap fill (CR-4)
+# ===========================================================================
+
+#: Minimum share of source instructional units the draft must cover.
+COMPLETENESS_THRESHOLD = 0.60
+#: A source unit counts as covered when at least this share of its content words
+#: appear in the draft (or its topic clearly overlaps a section heading).
+COMPLETENESS_UNIT_RATIO = 0.5
+#: Hard bound on targeted fill requests per booklet (a cost/loop guard).
+MAX_COVERAGE_GAPS = 6
+#: Characters of source text handed to one targeted fill request.
+COVERAGE_GAP_CHARS = 700
+
+#: Skeleton blocks that must all be present for a booklet to be "complete".
+#: Structural blocks (cover, objectives, TOC, sections, key points, end summary,
+#: glossary) are mandatory; the instructional block types (formulas, tables,
+#: ...) are reported but optional because not every lecture contains all of them.
+REQUIRED_SKELETON_BLOCKS: tuple[str, ...] = (
+    "cover_title", "objectives", "toc", "sections",
+    "key_points", "end_summary", "glossary",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CompletenessReport:
+    """A pure, deterministic assessment of a booklet against its source."""
+
+    total_units: int
+    covered_units: int
+    coverage: float
+    threshold: float
+    skeleton: dict
+    skeleton_complete: bool
+    missing_units: tuple[str, ...]
+
+    @property
+    def meets_threshold(self) -> bool:
+        return self.skeleton_complete and self.coverage >= self.threshold
+
+    def summary(self) -> str:
+        return (
+            f"units={self.covered_units}/{self.total_units} "
+            f"coverage={self.coverage:.2f} threshold={self.threshold:.2f} "
+            f"skeleton={'ok' if self.skeleton_complete else 'incomplete'} "
+            f"gaps={len(self.missing_units)}"
+        )
+
+
+def booklet_skeleton(notes: StructuredNotes) -> dict[str, bool]:
+    """Report which skeleton blocks are present in a structured booklet."""
+    sections = list(notes.sections)
+    headings = [section.heading.strip() for section in sections if section.heading.strip()]
+    return {
+        # cover + lesson title
+        "cover_title": bool(notes.title.strip()),
+        # overall lesson objective
+        "objectives": bool(notes.learning_objectives) or bool(notes.summary.strip()),
+        # table of contents (derived from section headings by the exporter)
+        "toc": bool(headings),
+        # logical sections in source order
+        "sections": bool(sections),
+        "definitions": any(section.definitions for section in sections),
+        "examples": any(section.examples for section in sections),
+        "steps": any(section.steps for section in sections),
+        "formulas": any(section.formulas for section in sections),
+        "tables": any(section.all_tables for section in sections),
+        "callouts": any(section.callouts for section in sections),
+        "key_points": bool(notes.key_points) or any(s.key_points for s in sections),
+        # final one-page «جمع‌بندی» is rendered from summary / key_points
+        "end_summary": bool(notes.summary.strip()) or bool(notes.key_points),
+        # English-term glossary is rendered from glossary or section definitions
+        "glossary": bool(notes.glossary) or any(s.definitions for s in sections),
+    }
+
+
+def _drafted_text(notes: StructuredNotes) -> str:
+    parts: list[str] = [notes.title, notes.summary]
+    parts.extend(notes.learning_objectives)
+    parts.extend(notes.key_points)
+    parts.extend(notes.review_questions)
+    parts.extend(f"{entry.term} {entry.definition}" for entry in notes.glossary)
+    parts.extend(section_plain_text(section) for section in notes.sections)
+    return "\n".join(part for part in parts if part)
+
+
+def _unit_is_covered(
+    unit: str,
+    drafted_words: frozenset[str],
+    section_headings: list[str],
+    *,
+    unit_ratio: float,
+) -> bool:
+    words = content_words(unit)
+    if not words:
+        return True
+    if len(words & drafted_words) / len(words) >= unit_ratio:
+        return True
+    # Reuse the topic-overlap helper: a section heading that clearly shares the
+    # unit's topic still counts as coverage under heavy (grounded) paraphrase.
+    lead = " ".join(unit.split()[:12])
+    return any(headings_overlap(lead, heading) for heading in section_headings)
+
+
+def _coverage_inputs(notes: StructuredNotes, unit_ratio: float):
+    drafted_words = content_words(_drafted_text(notes))
+    section_headings = [s.heading for s in notes.sections if s.heading.strip()]
+    def covered(unit: str) -> bool:
+        return _unit_is_covered(unit, drafted_words, section_headings, unit_ratio=unit_ratio)
+    return covered
+
+
+def find_coverage_gaps(
+    source: str,
+    notes: StructuredNotes,
+    *,
+    max_gaps: int = MAX_COVERAGE_GAPS,
+    unit_ratio: float = COMPLETENESS_UNIT_RATIO,
+) -> tuple[str, ...]:
+    """Source instructional units that the drafted sections do not represent."""
+    covered = _coverage_inputs(notes, unit_ratio)
+    gaps: list[str] = []
+    for unit in split_sentences(source):
+        if not covered(unit):
+            gaps.append(unit)
+        if len(gaps) >= max_gaps * 3:  # bounded detection, still informative
+            break
+    return tuple(gaps)
+
+
+def assess_completeness(
+    source: str,
+    notes: StructuredNotes,
+    *,
+    threshold: float = COMPLETENESS_THRESHOLD,
+    unit_ratio: float = COMPLETENESS_UNIT_RATIO,
+) -> CompletenessReport:
+    """Validate a draft's skeleton and source coverage (pure, no LLM)."""
+    units = split_sentences(source)
+    covered = _coverage_inputs(notes, unit_ratio)
+    missing = tuple(unit for unit in units if not covered(unit))
+    covered_count = len(units) - len(missing)
+    coverage = 1.0 if not units else covered_count / len(units)
+    skeleton = booklet_skeleton(notes)
+    skeleton_complete = all(skeleton[name] for name in REQUIRED_SKELETON_BLOCKS)
+    return CompletenessReport(
+        total_units=len(units),
+        covered_units=covered_count,
+        coverage=coverage,
+        threshold=threshold,
+        skeleton=skeleton,
+        skeleton_complete=skeleton_complete,
+        missing_units=missing,
+    )
+
+
+def meets_completeness_threshold(
+    report: CompletenessReport, *, threshold: float | None = None
+) -> bool:
+    """True when both the skeleton and the coverage floor are satisfied."""
+    floor = report.threshold if threshold is None else threshold
+    return report.skeleton_complete and report.coverage >= floor
+
+
+#: System prompt for one bounded, strictly grounded coverage-fill request.
+COVERAGE_FILL_SYSTEM_PROMPT = (
+    "شما «گردآورندهٔ جزوهٔ درس» فارسی گاماس هستید. یک واحد آموزشی از متن منبع در پیام "
+    "کاربر آمده که در پیش‌نویس جزوه جا افتاده است. وظیفه: فقط همان واحد را، با همان اطلاعات و "
+    "بدون هیچ افزوده، به صورت یک بخش کوتاه (heading + paragraphs/bullets) برگردان.\\n\\n"
+    + _FORBIDDEN_ADDITIONS
+    + "\\n" + _JSON_RULES
+    + "\\n\\nقواعد:\\n"
+    "- فقط از جمله‌هایی استفاده کنید که در پیام کاربر (متن منبع) هست؛ هیچ عدد، نام، اصطلاح، "
+    "مثال، فرمول یا نتیجه‌گیری تازه نسازید و از دانش بیرونی نیاورید.\\n"
+    "- پاسخ فقط یک شیء JSON معتبر با همان ساختار جزوه و «sections» غیرخالی است؛ متن اضافه ننویسید.\\n"
+)
+
+
+def build_fill_document(gaps, notes: StructuredNotes) -> str:
+    """Targeted, source-only fill request for the given missing units."""
+    units = "\n".join(
+        "- " + str(gap)[:COVERAGE_GAP_CHARS] for gap in list(gaps)[:MAX_COVERAGE_GAPS]
+    )
+    headings = "، ".join(s.heading for s in notes.sections if s.heading.strip())[:600]
+    return (
+        "### واحد آموزشی جاافتاده (عیناً از متن منبع)\\n" + units + "\n\n"
+        "### عنوان بخش‌های فعلی جزوه\\n" + (headings or "(هنوز بخشی نیست)") + "\n\n"
+        "### دستور\\n"
+        "فقط همین واحد را — همان‌گونه که در متن منبع آمده — در قالب JSON جزوه برگردان تا به "
+        "بخش‌ها افزوده شود. هیچ مطلب تازه‌ای اضافه نکن."
+    )
+
+
+async def fill_coverage_gaps(
+    session: aiohttp.ClientSession,
+    settings: Settings,
+    source: str,
+    notes: StructuredNotes,
+    *,
+    semaphore: asyncio.Semaphore | None = None,
+) -> StructuredNotes:
+    """Fill detected coverage gaps with grounded LLM calls; re-validate after.
+
+    One bounded request per gap. Failures are non-fatal: the audited draft is
+    kept (the same degrade-instead-of-discard rule as the editorial compile), so
+    a transport error never turns a good booklet into a refunded failure.
+    """
+    report = assess_completeness(source, notes)
+    if report.meets_threshold:
+        return notes
+    gaps = report.missing_units[:MAX_COVERAGE_GAPS]
+    if not gaps:
+        # Skeleton-only shortfall: an LLM would have to invent structure. Keep
+        # the grounded draft; never fabricate a glossary/summary to pass a gate.
+        logger.info("note completeness %s (skeleton-only shortfall; no fill)", report.summary())
+        return notes
+    merged = notes
+    for gap in gaps:
+        message = build_fill_document([gap], merged)
+        try:
+            if semaphore is not None:
+                async with semaphore:
+                    payload = await complete_json(
+                        session, settings,
+                        system=COVERAGE_FILL_SYSTEM_PROMPT,
+                        user=message,
+                        schema=_response_schema(settings),
+                    )
+            else:
+                payload = await complete_json(
+                    session, settings,
+                    system=COVERAGE_FILL_SYSTEM_PROMPT,
+                    user=message,
+                    schema=_response_schema(settings),
+                )
+            filled = _load_json_payload(payload)
+        except Exception as exc:  # noqa: BLE001 - a fill failure never fails the job
+            logger.warning("coverage fill request failed: %s", exc)
+            break
+        if not filled.has_content:
+            continue
+        merged = merge_structured_notes([merged, filled])
+        if meets_completeness_threshold(assess_completeness(source, merged)):
+            break
+    logger.info("note completeness after fill: %s", assess_completeness(source, merged).summary())
+    return merged
 
 
 # ===========================================================================
@@ -2862,6 +3137,14 @@ async def structure_document(
         raise StructuringError("متن ورودی خالی بود.")
     semaphore = _note_semaphore(settings, len(chunks))
 
+    async def finalize(result: StructuredNotes) -> StructuredNotes:
+        """CR-4: optionally run the bounded coverage-gap fill pass."""
+        if getattr(settings, "note_completeness_fill", False):
+            return await fill_coverage_gaps(
+                session, settings, document, result, semaphore=semaphore
+            )
+        return result
+
     async def finish_single(chars_used: int) -> StructuredNotes:
         """One chunk: a single note request, then the evidence gate.
 
@@ -2890,7 +3173,7 @@ async def structure_document(
         )[0]
 
     if len(chunks) == 1:
-        return await finish_single(chunk_chars)
+        return await finalize(await finish_single(chunk_chars))
 
     # A chunked request also carries the topic digest and the neighbour windows.
     # Reserve their worst-case size when it fits; for a narrow model window,
@@ -2911,7 +3194,7 @@ async def structure_document(
         )
     semaphore = _note_semaphore(settings, len(chunks))
     if len(chunks) == 1:
-        return await finish_single(contextual_chunk_chars)
+        return await finalize(await finish_single(contextual_chunk_chars))
 
     context = build_context(chunks) if include_context else LectureContext()
     logger.info(
@@ -2968,10 +3251,10 @@ async def structure_document(
         except Exception:  # noqa: BLE001 - delivery is never a note failure
             logger.warning("progressive booklet delivery failed", exc_info=True)
 
-    return await _compile_pass(
+    return await finalize(await _compile_pass(
         merged, merged_report, document, context, settings, session,
         mode=resolved_mode, presentation=presentation, semaphore=semaphore,
-    )
+    ))
 
 
 _SLIDE_NUMBER_CHARS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"

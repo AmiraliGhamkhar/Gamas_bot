@@ -163,9 +163,15 @@ class FromEnvTests(unittest.TestCase):
             self.assertIn(attribute, values)
 
     def test_note_mode_resolution(self):
-        self.assertEqual(resolve_note_mode("summary"), "summary")
+        # CR-3: full is the only mode; every legacy/junk value resolves to it
+        # and must never crash startup.
+        self.assertEqual(resolve_note_mode("full"), "full")
+        self.assertEqual(resolve_note_mode("standard"), "full")
+        self.assertEqual(resolve_note_mode("summary"), "full")
+        self.assertEqual(resolve_note_mode("SuMmArY"), "full")
         self.assertEqual(resolve_note_mode("bogus"), "full")
         self.assertEqual(resolve_note_mode(None), "full")
+        self.assertEqual(resolve_note_mode(""), "full")
 
     def test_raw_text_profile_resolution(self):
         self.assertEqual(resolve_raw_text_profile("timestamped"), "timestamped")

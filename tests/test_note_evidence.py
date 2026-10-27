@@ -17,7 +17,12 @@ import json
 import unittest
 from pathlib import Path
 
-from gamas_bot.notes import NoteTable, PracticalTip, StructuredNotes
+from gamas_bot.notes import (
+    COMPLETENESS_THRESHOLD,
+    NoteTable, PracticalTip, StructuredNotes,
+    assess_completeness,
+    booklet_skeleton,
+)
 from gamas_bot.notes_evidence import (
     STANDARD_EQUIVALENTS,
     UNIT_ALIASES,
@@ -443,3 +448,26 @@ class SchemaCompatibilityTests(unittest.TestCase):
         self.assertEqual(notes.practical_tips[1].kind, "کاربردی")
         restored = StructuredNotes.from_payload(notes.to_payload())
         self.assertEqual(restored.practical_tips, notes.practical_tips)
+
+
+class BookletCompletenessCorpusTests(unittest.TestCase):
+    """CR-4: every fixture reference booklet is a complete, grounded booklet."""
+
+    def test_every_fixture_meets_the_completeness_threshold(self):
+        for entry in CORPUS["fixtures"]:
+            with self.subTest(fixture=entry["id"]):
+                transcript, reference = load_fixture(entry)
+                notes = StructuredNotes.from_payload(reference)
+                report = assess_completeness(transcript, notes)
+                self.assertTrue(report.skeleton_complete, report.summary())
+                self.assertGreaterEqual(report.coverage, COMPLETENESS_THRESHOLD)
+                self.assertTrue(report.meets_threshold, report.summary())
+
+    def test_every_fixture_contains_toc_end_summary_and_glossary(self):
+        for entry in CORPUS["fixtures"]:
+            with self.subTest(fixture=entry["id"]):
+                _transcript, reference = load_fixture(entry)
+                skeleton = booklet_skeleton(StructuredNotes.from_payload(reference))
+                for block in ("cover_title", "objectives", "toc", "sections",
+                              "key_points", "end_summary", "glossary"):
+                    self.assertTrue(skeleton[block], f"{entry['id']}: missing {block}")

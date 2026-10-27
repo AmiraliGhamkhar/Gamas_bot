@@ -1114,12 +1114,10 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(text.startswith(
             "منوی اصلی\n\n"
-            "فایل درس‌تان را همین‌جا بفرستید؛ دکمه لازم نیست:\n"
-            "• فایل صوتی یا ویدیویی کلاس، یا پیام صوتی/ویدیویی تلگرام\n"
-            "• یا فایل پاورپوینت (.pptx)\n\n"
-            "متن کامل گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ ورد در حال حاضر فعال نیست."
+            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 پاورپوینت.\n"
+            "متن گفتار می‌آید؛ ساخت جزوهٔ ورد فعلاً فعال نیست."
         ))
-        self.assertIn("⏳ اعتبار باقی‌مانده", text)
+        self.assertIn("💳 اعتبار باقی‌مانده", text)
 
     async def test_help_copy_is_the_one_tap_guide_followed_by_billing_contract(self):
         event = FakeCallbackEvent(self.user_id, b"help")
@@ -1128,19 +1126,14 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
         expected = (
             "ℹ️ راهنمای گاماس\n\n"
-            "۱. فایل صوتی، ویدیویی یا پاورپوینت درس را در همین چت بفرستید؛ دکمه لازم نیست.\n"
-            "۲. ابتدا متن کامل گفتار به‌صورت فایل متنی ارسال می‌شود.\n"
-            "۳. سپس جزوهٔ ورد (Word) آماده و ارسال می‌شود.\n"
-            "۴. همهٔ متن‌ها و جزوه‌ها در «📚 کتابخانه من» می‌مانند و هر زمان می‌توانید دوباره دریافت‌شان کنید.\n\n"
-            "«💳 حساب من»: موجودی، خرید اشتراک و پرداخت‌های شما در یک صفحه.\n"
-            "«🎧 پشتیبانی»: اگر مشکل یا سؤالی داشتید، تیکت بزنید.\n\n"
-            "🧪 از هر جزوه می‌توانید آزمون چندگزینه‌ای بگیرید؛ هر پاسخ درست ۱۰ امتیاز دارد "
-            "و امتیازها در «🏆 لیدربورد» جمع می‌شود. 🃏 همچنین می‌توانید از جزوه‌ها فلش‌کارت "
-            "بسازید (با هوش مصنوعی یا دستی) و آن‌ها را کارت‌به‌کارت مرور کنید. ساخت آزمون و "
-            "فلش‌کارت هوش مصنوعی از اعتبار شما کم می‌کند و در صورت خطا برمی‌گردد.\n\n"
-            "اعتبار بر اساس مدت فایل صوتی و پس از ارسال متن خام محاسبه می‌شود. "
-            "اگر ارسال متن خام ناموفق باشد، اعتبار مصرف نمی‌شود. "
-            "پس از دریافت متن خام، خطای ساخت جزوه باعث برگشت اعتبار نمی‌شود."
+            "🎧 فایل صوت/ویدیو یا 📄 پاورپوینت درس را همین‌جا بفرستید.\n"
+            "📄 متن گفتار و جزوهٔ ورد می‌آید و در «📚 کتابخانه من» ذخیره می‌شود.\n"
+            "🧪 آزمون و 🃏 فلش‌کارت از همان جزوه ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
+            "🛒 خرید اشتراک: بسته‌ها و موجودی. 🎧 پشتیبانی: تیکت بزنید.\n\n"
+            "💳 اعتبار بر حسب ثانیه است و پس از ارسال متن خام محاسبه می‌شود.\n"
+            "اگر متن خام نرسد، اعتباری کم نمی‌شود.\n"
+            "ساخت 🧪 آزمون و 🃏 فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق بود، اعتبار کامل برمی‌گردد.\n"
+            "پس از دریافت متن خام، خطای ساخت جزوه اعتبار را برنمی‌گرداند."
         )
         self.assertEqual(text, expected)
 
@@ -1156,7 +1149,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn("متن کامل گفتار برایتان ارسال می‌شود؛ ساخت جزوهٔ ورد در حال حاضر فعال نیست.", text)
+        self.assertIn("ساخت جزوهٔ ورد فعلاً فعال نیست.", text)
         self.assertNotIn("متن گفتار و سپس جزوهٔ ورد", text)
 
     async def test_admin_guides_explain_user_actions_and_empty_states(self):
@@ -1613,8 +1606,8 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         start = FakeMessageEvent(501, "/start")
         await self.bot._handle_message(start)
         self.assertTrue(start.replies[0].startswith(
-            "به گاماس خوش آمدید. 🎓\n\n"
-            "فایل درس‌تان را همین‌جا بفرستید؛ دکمه لازم نیست:"
+            "🎓 به گاماس خوش آمدید\n\n"
+            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 پاورپوینت."
         ))
         start_payloads = menu_payloads(start.client.texts[0].get("buttons"))
         self.assertEqual(
@@ -1634,8 +1627,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(event)
         self.assertEqual(
             event.replies[0],
-            "برای شروع، فایل صوتی، ویدیویی یا پاورپوینت درس را بفرستید؛ "
-            "متن گفتار و جزوهٔ ورد به‌صورت خودکار ارسال می‌شود.",
+            "همین‌جا فایل 🎧 صوت/ویدیو یا 📄 پاورپوینت درس را بفرستید؛ متن و جزوه می‌آید.",
         )
         self.assertEqual(
             menu_payloads(self.bot._user_menu()),

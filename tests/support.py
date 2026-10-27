@@ -506,6 +506,9 @@ def make_settings(**overrides) -> Settings:
         note_openrouter_throughput=False,
         note_structured_output=False,
         note_progressive_booklet=False,
+        # CR-4: offline tests keep a fixed LLM request count; the coverage-gap
+        # fill pass is exercised explicitly by tests that opt in.
+        note_completeness_fill=False,
         # Pinned to the pre-change behaviour on purpose: the shipped defaults
         # (25 s first-byte guard, 60 s hedge) are covered by tests that build
         # settings from the environment instead of this fixture.
