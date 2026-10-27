@@ -112,13 +112,14 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_library_uses_the_persian_empty_state(self):
         event = FakeCallbackEvent(OWNER, b"library")
         await self.bot._handle_callback(event)
-        text, _buttons = event.edits[-1]
+        text, buttons = event.edits[-1]
         self.assertEqual(
             text,
             "📚 کتابخانه من\n\n"
             "کتابخانهٔ شما خالی است.\n"
             "اولین فایل درس را بفرستید؛ متن و جزوه به‌صورت خودکار اینجا ذخیره می‌شوند.",
         )
+        self.assertIn(b"lib:docs:0", menu_payloads(buttons))
 
     async def test_library_screen_paginates_six_newest_items_and_counts_in_persian(self):
         for index in range(8):
@@ -163,16 +164,36 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse((await self.db.library_item(OWNER, item_id))["unavailable"])
 
-    async def test_forward_failure_marks_item_unavailable_and_alerts(self):
+    async def test_deleted_source_marks_item_unavailable_and_alerts(self):
+        from telethon.errors import MessageIdInvalidError
+
         item_id = await self._add_item(OWNER, "فایل حذف‌شده", message_id=4322)
-        self.client.fail_forward = True
         event = FakeCallbackEvent(OWNER, f"lib:f:{item_id}".encode())
         event.client = self.client
 
-        await self.bot._handle_callback(event)
+        with mock.patch.object(
+            self.client, "forward_messages", new=mock.AsyncMock(side_effect=MessageIdInvalidError(request=None))
+        ):
+            await self.bot._handle_callback(event)
 
         self.assertTrue((await self.db.library_item(OWNER, item_id))["unavailable"])
         self.assertEqual(event.answers[-1], ("این فایل دیگر در دسترس نیست.", True))
+
+    async def test_temporary_forward_failure_is_retryable_even_with_an_old_flag(self):
+        item_id = await self._add_item(OWNER, "فایل", message_id=4322)
+        self.client.fail_forward = True
+        event = FakeCallbackEvent(OWNER, f"lib:f:{item_id}".encode())
+        await self.bot._handle_callback(event)
+        self.assertFalse((await self.db.library_item(OWNER, item_id))["unavailable"])
+        self.assertIn("موقتاً", event.answers[-1][0])
+
+        # Old releases marked every exception permanently. Those records can
+        # now be retried, and a successful forward repairs the stale flag.
+        await self.db.library_mark_unavailable(item_id)
+        self.client.fail_forward = False
+        await self.bot._handle_callback(FakeCallbackEvent(OWNER, f"lib:f:{item_id}".encode()))
+        self.assertEqual(len(self.client.forwarded), 1)
+        self.assertFalse((await self.db.library_item(OWNER, item_id))["unavailable"])
 
     async def test_library_item_isolated_from_other_users(self):
         item_id = await self._add_item(OWNER, "یادداشت خصوصی", message_id=5001)
@@ -300,6 +321,24 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         newest = (await self.db.library_list(OWNER, limit=1))[0]
         self.assertTrue(await self.db.library_mark_unavailable(newest["item_id"]))
         self.assertTrue((await self.db.library_item(OWNER, newest["item_id"]))["unavailable"])
+
+    async def test_prune_keeps_newest_items_and_a_paid_quiz_source_until_it_ends(self):
+        source = await self._add_item(OWNER, "منبع آزمون", message_id=50)
+        questions = [{
+            "question": "سؤال", "options": ["الف", "ب", "ج", "د"],
+            "correct_index": 0, "explanation": "توضیح",
+        }]
+        session = await self.db.quiz_create_session(OWNER, source, questions)
+        for index in range(4):
+            await self._add_item(OWNER, f"جدید {index}", message_id=100 + index)
+        await self.db.library_prune(OWNER, keep=3)
+        self.assertEqual(await self.db.library_count(OWNER), 4)  # newest three plus active source
+        self.assertIsNotNone(await self.db.quiz_get_session(session, OWNER))
+        self.assertIsNotNone(await self.db.quiz_current_question(session))
+        await self.db.quiz_finish(session, "quit")
+        await self.db.library_prune(OWNER, keep=3)
+        self.assertEqual(await self.db.library_count(OWNER), 3)
+        self.assertIsNone(await self.db.quiz_get_session(session, OWNER))
 
     async def _booklet(self, *, with_content: bool) -> int:
         item_id = await self.db.library_add(

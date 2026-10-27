@@ -76,6 +76,8 @@ PREVIEW_CHARS = 300
 #: Office files are ZIP containers. Bound expansion before python-docx/pptx
 #: opens them, independently of the 50 MB compressed-upload limit.
 OFFICE_UNPACKED_MAX_BYTES = 200 * 1024 * 1024
+#: Bound stored text and generated chunk metadata for highly compressed files.
+MAX_EXTRACTED_DOCUMENT_CHARS = 5_000_000
 
 
 class DocExtractError(RuntimeError):
@@ -84,6 +86,17 @@ class DocExtractError(RuntimeError):
 
 class ScannedPdfError(DocExtractError):
     """Raised when a PDF has no text layer (OCR is out of scope)."""
+
+
+class EmptyPresentationTextError(DocExtractError):
+    """A valid presentation has no slide text, but may still contain audio."""
+
+
+def _check_extracted_text_size(characters: int) -> None:
+    if characters > MAX_EXTRACTED_DOCUMENT_CHARS:
+        raise DocExtractError(
+            "متن استخراج‌شده از سقف ربات بیشتر است؛ سند را به چند بخش تقسیم و جداگانه ارسال کنید."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,9 +136,8 @@ class ExtractedDoc:
 
     @property
     def text(self) -> str:
-        return "\n\n".join(
-            section.render() for section in self.sections if section.render().strip()
-        )
+        rendered = (section.render() for section in self.sections)
+        return "\n\n".join(text for text in rendered if text.strip())
 
     @property
     def char_count(self) -> int:
@@ -208,6 +220,7 @@ def _pdf_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
         pages = list(reader.pages)
     except Exception as exc:
         raise DocExtractError("خواندن صفحه‌های PDF ناموفق بود.") from exc
+    total_chars = 0
     for number, page in enumerate(pages, start=1):
         try:
             text = page.extract_text() or ""
@@ -215,6 +228,8 @@ def _pdf_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
             logger.warning("pdf page %s could not be parsed", number, exc_info=True)
             text = ""
         cleaned = _clean_block(text)
+        total_chars += len(cleaned)
+        _check_extracted_text_size(total_chars)
         if cleaned:
             sections.append(
                 DocSection(f"صفحهٔ {to_persian_digits(number)}", "", cleaned)
@@ -266,6 +281,12 @@ def _docx_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
     heading = ""
     heading_level: int | None = None
     buffer: list[str] = []
+    total_chars = 0
+
+    def count_text(text: str) -> None:
+        nonlocal total_chars
+        total_chars += len(text)
+        _check_extracted_text_size(total_chars)
 
     def flush() -> None:
         nonlocal buffer
@@ -299,7 +320,9 @@ def _docx_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
                     if text:
                         cells.append(text)
                 if cells:
-                    buffer.append(" | ".join(cells))
+                    row_text = " | ".join(cells)
+                    count_text(row_text)
+                    buffer.append(row_text)
             continue
         if not isinstance(block, CT_P):
             continue
@@ -307,6 +330,7 @@ def _docx_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
         text = _clean_block(paragraph.text or "")
         if not text:
             continue
+        count_text(text)
         if _is_heading(paragraph):
             flush()
             heading = text
@@ -355,6 +379,7 @@ def sections_from_slides(
     deck's slide text as a document after it builds the booklet.
     """
     sections: list[DocSection] = []
+    total_chars = 0
     for slide in slides:
         body_lines = [
             str(line).strip()
@@ -368,13 +393,14 @@ def sections_from_slides(
         title = _clean_block(getattr(slide, "title", "") or "")
         if not body and not title:
             continue  # an empty slide is skipped, not an error
-        sections.append(
-            DocSection(
-                f"اسلاید {to_persian_digits(getattr(slide, 'number', len(sections) + 1))}",
-                title,
-                body,
-            )
+        section = DocSection(
+            f"اسلاید {to_persian_digits(getattr(slide, 'number', len(sections) + 1))}",
+            title,
+            body,
         )
+        total_chars += len(section.render()) + (2 if sections else 0)
+        _check_extracted_text_size(total_chars)
+        sections.append(section)
     return tuple(sections)
 
 
@@ -398,7 +424,7 @@ def _pptx_sections(path: Path, *, max_chars: int) -> tuple[tuple[DocSection, ...
         raise DocExtractError("خواندن متن اسلایدهای این ارائه ناموفق بود.") from exc
     sections = list(sections_from_slides(slides, max_chars=max_chars))
     if not sections:
-        raise DocExtractError(
+        raise EmptyPresentationTextError(
             "این ارائه متن قابل‌استفاده‌ای ندارد؛ OCR پشتیبانی نمی‌شود."
         )
     return tuple(sections), len(slides)
@@ -422,8 +448,18 @@ def extract_document(
         sections, page_count = _pptx_sections(path, max_chars=max_chars)
     else:  # pragma: no cover - guarded by classify_document
         raise DocExtractError("این نوع سند پشتیبانی نمی‌شود.")
-    # Preserve the complete extraction.  The chunker, not the extractor, bounds
-    # model inputs, so a long page or slide cannot silently lose its tail.
+    # Account for heading rendering and separators as well as raw section text;
+    # otherwise many small sections could exceed the stored-text limit.
+    total_chars = 0
+    nonempty = 0
+    for section in sections:
+        rendered = section.render()
+        if rendered.strip():
+            total_chars += len(rendered) + (2 if nonempty else 0)
+            nonempty += 1
+            _check_extracted_text_size(total_chars)
+    # The chunker bounds model inputs; oversized documents are refused rather
+    # than silently losing the end of a long page or slide.
     return ExtractedDoc(source_type, page_count, sections)
 
 
@@ -442,9 +478,10 @@ def _split_paragraphs(text: str, limit: int) -> list[str]:
     if len(text) <= limit:
         return [text]
     pieces: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        window = remaining[:limit]
+    start = 0
+    length = len(text)
+    while length - start > limit:
+        window = text[start:start + limit]
         cut = window.rfind("\n\n")
         if cut < limit // 2:
             cut = window.rfind("\n")
@@ -452,10 +489,14 @@ def _split_paragraphs(text: str, limit: int) -> list[str]:
             cut = window.rfind(" ")
         if cut < limit // 2:
             cut = limit
-        pieces.append(remaining[:cut].strip())
-        remaining = remaining[cut:].strip()
-    if remaining:
-        pieces.append(remaining)
+        pieces.append(window[:cut].strip())
+        start += cut
+        # Avoid repeatedly copying the entire remaining document. Only the
+        # bounded window and whitespace at its boundary need to be inspected.
+        while start < length and text[start].isspace():
+            start += 1
+    if start < length:
+        pieces.append(text[start:])
     return [piece for piece in pieces if piece]
 
 

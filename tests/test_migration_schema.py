@@ -144,5 +144,52 @@ class PopulatedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             await db.close()
 
 
+class LearningChargeUpgradeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_populated_014_upgrade_and_interrupted_015_replay(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "before-015.sqlite3"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name >= "015":
+                    break
+                conn.executescript(migration.read_text(encoding="utf-8"))
+                conn.execute("INSERT INTO schema_migrations VALUES (?, '2026-01-01')", (migration.name,))
+            conn.execute("INSERT INTO users(telegram_id, joined_at) VALUES (111, '2026-01-01')")
+            conn.execute(
+                "INSERT INTO ledger(user_id,seconds,kind,note,created_at) "
+                "VALUES (111,1000,'credit','old credit','2026-01-01')"
+            )
+            conn.execute(
+                "INSERT INTO ledger(user_id,seconds,kind,note,created_at) "
+                "VALUES (111,300,'debit','fc-pending:legacy','2026-01-02')"
+            )
+            conn.commit()
+            conn.close()
+
+            db = Database(path)
+            await db.connect()
+            await db.assert_user_reference_integrity()
+            self.assertEqual(await db.available_seconds(111), 700)
+            # An old debit cannot be safely identified as an interrupted job.
+            self.assertEqual(await db.recover_pending_learning_charges(), 0)
+            await db.spend_seconds(111, 100, "new generation", operation_id="new")
+            # Simulate a crash after migration DDL but before its bookkeeping.
+            await db._write("DELETE FROM schema_migrations WHERE name='015_learning_charge_recovery.sql'")
+            await db.close()
+
+            db = Database(path)
+            await db.connect()
+            await db.assert_user_reference_integrity()
+            self.assertEqual(await db.recover_pending_learning_charges(), 1)
+            self.assertEqual(await db.recover_pending_learning_charges(), 0)
+            self.assertEqual(await db.available_seconds(111), 700)
+            self.assertEqual(
+                (await db.db.execute_fetchall("SELECT status FROM learning_charges WHERE operation_id='new'"))[0][0],
+                "refunded",
+            )
+            await db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

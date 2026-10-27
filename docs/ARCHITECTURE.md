@@ -17,8 +17,9 @@ Wallet → balance + plan purchase + recent payments
 
 The raw transcript is saved and delivered before note generation. When notes are not configured the
 job ends after transcript delivery; it never offers a mode choice. PowerPoint narration is merged
-into one STT request and mapped to slides only where timestamps support it. Library entries contain
-only Telegram chat/message references, never a server-side copy of the artifact.
+into one STT request and mapped to slides only where timestamps support it. Generated files remain
+in Telegram, and library entries index their chat/message references; extracted booklet and uploaded
+document text is also cached in SQLite for learning features.
 
 ## Code map
 
@@ -38,7 +39,11 @@ only Telegram chat/message references, never a server-side copy of the artifact.
 - Primary saturation on either STT (`speechmatics`) or LLM (`routes[0]`) immediately overflows in `0 ms` to secondary capacity (`deepgram` / `routes[1]`) without waiting.
 - SQLite runs in WAL mode with serialized `BEGIN IMMEDIATE` writes on `self.db` and lock-free MVCC reads on `self.read_db` (`PRAGMA query_only=ON`).
 - Each user may hold at most `MAX_ACTIVE_JOBS_PER_USER` pending/processing submissions; the check
-  and insert share one write transaction.
+  and insert share one write transaction. Shutdown joins in-flight upload/document/receipt admission
+  before closing SQLite, and fails jobs that never reached a worker.
+- Document parsing has its own semaphore sized by `MEDIA_WORKER_CONCURRENCY` and reuses a same-user,
+  same-hash extraction even for simultaneous uploads. Extracted text is capped at 5,000,000
+  characters; parsing still runs in a worker thread rather than an OS-isolated process.
 - The media worker runs with a timeout and no shell. `av` supplies the media libraries.
 - SQLite migrations run at startup; billing writes are transactional.
 - A lock on the Telegram session prevents duplicate polling. Keep the session and database on a

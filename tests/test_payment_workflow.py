@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from PIL import Image
 
@@ -85,6 +87,68 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
             event.message.file.size = source.stat().st_size
         await self.bot._handle_message(event)
         return event
+
+    def receipt_event(self):
+        source = self.root / "receipt-input.png"
+        Image.new("RGB", (24, 24), "white").save(source)
+        event = FakeJobEvent(source=source, chat_id=USER)
+        event.message.photo = object()
+        event.message.file.mime_type = "image/png"
+        event.message.file.size = source.stat().st_size
+        return event
+
+    async def test_cancelled_receipt_download_removes_partial_file(self):
+        payment_id = await self.new_order()
+        entered = asyncio.Event()
+
+        async def interrupted(message, target, limit):
+            target.write_bytes(b"partial private receipt")
+            entered.set()
+            await asyncio.Event().wait()
+
+        with mock.patch.object(self.bot, "_download_telegram_media", side_effect=interrupted):
+            task = asyncio.create_task(
+                self.bot._handle_receipt_upload(self.receipt_event(), USER, payment_id=payment_id)
+            )
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertEqual(list(self.settings.receipt_dir.glob("receipt-*.jpg")), [])
+        self.assertEqual((await self.db.payment(payment_id))["status"], "awaiting_payment")
+
+    async def test_cancel_after_receipt_commit_keeps_the_referenced_image(self):
+        payment_id = await self.new_order()
+        committed, release = asyncio.Event(), asyncio.Event()
+        original = self.db.set_payment_receipt
+
+        async def delayed(*args, **kwargs):
+            changed = await original(*args, **kwargs)
+            committed.set()
+            await release.wait()
+            return changed
+
+        with mock.patch.object(self.db, "set_payment_receipt", side_effect=delayed):
+            task = asyncio.create_task(
+                self.bot._handle_receipt_upload(self.receipt_event(), USER, payment_id=payment_id)
+            )
+            await asyncio.wait_for(committed.wait(), 2)
+            task.cancel()
+            await asyncio.sleep(0)
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        payment = await self.db.payment(payment_id)
+        self.assertEqual(payment["status"], "pending_review")
+        self.assertTrue(Path(payment["receipt_path"]).is_file())
+
+    async def test_user_confirmation_failure_does_not_suppress_admin_review_alert(self):
+        payment_id = await self.new_order()
+        event = self.receipt_event()
+        with mock.patch.object(event, "respond", side_effect=RuntimeError("temporary send failure")):
+            await self.bot._handle_receipt_upload(event, USER, payment_id=payment_id)
+        self.assertEqual((await self.db.payment(payment_id))["status"], "pending_review")
+        self.assertTrue(any(item["entity"] == ADMIN for item in self.bot.client.deliveries))
 
     async def test_complete_photo_receipt_confirmation_and_duplicate_protection(self):
         plans = await self.press(USER, "wallet")

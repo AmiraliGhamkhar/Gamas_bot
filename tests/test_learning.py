@@ -490,7 +490,7 @@ class FlashcardDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(deck["source"], "manual")
         self.assertIsNone(deck["item_id"])
 
-    async def test_deck_survives_library_prune_but_quiz_sessions_do_not(self):
+    async def test_library_prune_preserves_active_quiz_then_retains_deck(self):
         deck_id = await self.db.deck_create(OWNER, self.item_id, "دسته", "ai")
         await self.db.deck_add_card(deck_id, "پ", "پا")
         questions = [{
@@ -499,10 +499,14 @@ class FlashcardDatabaseTests(unittest.IsolatedAsyncioTestCase):
         }]
         session_id = await self.db.quiz_create_session(OWNER, self.item_id, questions)
         await self.db.library_prune(OWNER, keep=0)
+        self.assertIsNotNone(await self.db.quiz_get_session(session_id, OWNER))
+        self.assertIsNotNone(await self.db.quiz_current_question(session_id))
+        await self.db.quiz_finish(session_id, "quit")
+        await self.db.library_prune(OWNER, keep=0)
         deck = await self.db.deck_get(deck_id, OWNER)
         self.assertIsNotNone(deck)
         self.assertIsNone(deck["item_id"])  # SET NULL, deck retained
-        self.assertIsNone(await self.db.quiz_get_session(session_id, OWNER))  # CASCADE
+        self.assertIsNone(await self.db.quiz_get_session(session_id, OWNER))  # terminal session cascades
 
 
 class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):

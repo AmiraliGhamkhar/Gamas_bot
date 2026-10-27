@@ -40,13 +40,16 @@ text. Legacy items whose text was never stored cannot start a generation and are
   existing credit/paywall behavior applies, including the separate free-plan credit grant if present.
   Unlimited users are never charged and do not consume a gift. A confirmed admin reset restores
   both and writes `free_use_reset` to the audit log.
-- **Recovery and refunds.** Startup, after the singleton lock, restores token-bearing unfinished
-  free claims; committed artifacts have already finalized their tokens in the same transaction.
-  Graceful shutdown cancels active learning work and compensates pending previews before closing
-  SQLite. Paid failures/cancellations/expiry refund the debit through the existing lot-aware ledger.
-  Ungraceful crash recovery covers free claims; it does not introduce a new durable reservation for
-  paid previews. A valid result requires at least five cards or three questions. Partial coverage is
-  reported so a user may cancel rather than save a short set. Refund errors are logged.
+- **Recovery and refunds.** Startup, after the singleton lock, restores unfinished free claims and
+  refunds unfinished paid claims. A paid debit, its lot allocations and a `learning_charges` pending
+  record are committed together; saving the deck or quiz finalizes that record in the artifact
+  transaction. Cancel, failure, preview expiry and startup recovery refund a pending record at most
+  once. Graceful shutdown also joins active learning work before closing SQLite. If a refund write
+  fails, the pending record remains recoverable on restart, the error is logged, and the user is
+  directed to support rather than told the refund succeeded. A valid result requires at least five
+  cards or three questions; partial coverage is reported so a user may cancel rather than save.
+  Historical paid debits from before migration 015 have no durable operation identity and cannot be
+  reliably or automatically distinguished from completed generations.
 - **One generation at a time per user.** A synchronous in-flight guard plus a per-user async lock
   reject a second tap while a generation is charging or awaiting the model, before any second
   debit. The guard is always released, even when cancellation strikes while waiting on the lock.
@@ -55,8 +58,8 @@ text. Legacy items whose text was never stored cannot start a generation and are
   `QUIZ_MAX_SESSIONS_PER_HOUR` (default 3) new sessions in any rolling hour. Flashcard decks
   (AI and manual counted together) are capped at `FLASHCARD_MAX_DECKS_PER_USER` (default 30).
   A rejected admission costs nothing.
-- Charges use the same lot-aware, earliest-expiry-first allocations as transcription, so refunds
-  restore credit without disturbing other lots.
+- Charges use the same lot-aware, earliest-expiry-first allocations as transcription. Refunds are
+  issued as a new non-expiring credit lot; the original debit allocations remain in the ledger.
 
 ## Leaderboard and admin credit gift
 
@@ -121,11 +124,14 @@ bot against a migrated database. Migration 006 adds only a nullable ledger colum
 Migration 008 replaces one status-update trigger and rewrites no rows. Migrations 011 and 012 add
 the learning-loop columns and tables (quiz sessions/questions/answers, flashcard decks/cards);
 their foreign keys cascade quiz data with a pruned library item while flashcard decks are retained
-with a nulled item reference. Migration 013 adds identity, document caches and free-use flags;
-014 adds owned recovery tokens, quiz difficulty, and rebuilds `library_items` to declare its user
-foreign key while preserving ids, content and child links. Legacy library rows missing an owner get
-an exact-id placeholder user during the rebuild. The ledger and payment transitions are not
-redesigned. The v2 importer is a one-time, all-or-nothing operation:
+with a nulled item reference. Pruning preserves sources of active quizzes (temporarily allowing the
+library to exceed its configured reference cap); ended/expired quizzes may cascade on a later prune.
+Migration 013 adds identity, document caches and free-use flags; 014 adds owned recovery tokens,
+quiz difficulty, and rebuilds `library_items` to declare its user foreign key while preserving ids,
+content and child links. Legacy library rows missing an owner get an exact-id placeholder user.
+Migration 015 adds `learning_charges` for paid generation recovery without rewriting existing ledger
+or payment rows; old debits cannot be reconstructed automatically. The v2 importer is a one-time,
+all-or-nothing operation:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\import_v2.py --help

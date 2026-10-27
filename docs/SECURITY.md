@@ -32,10 +32,14 @@ provider. Review each provider's retention and privacy terms before enabling it.
 is delivered before note generation; once delivered, its transcription charge stands even if the
 booklet later fails.
 
-The database stores submissions, transcripts, notes, billing, audit records and the Telegram
-chat/message references used by each user's library; generated files themselves stay in Telegram.
-`LIBRARY_MAX_ITEMS` bounds the retained references per user. No Free Office request session is wired
-into the bot. Transcript retention is configurable in `.env` (see [Operations](OPERATIONS.md)).
+The database stores submissions, transcripts, notes, billing, audit records, extracted booklet and
+uploaded-document text, and the Telegram chat/message references used by each user's library;
+generated files themselves stay in Telegram. `LIBRARY_MAX_ITEMS` bounds normal retained references
+per user, except sources protected by active quizzes. It does **not** bound the separate document
+text cache: uploaded-document extracts currently have no automatic retention or self-service delete
+policy, even if their library mirror is pruned. Plan disk and privacy procedures accordingly.
+No Free Office request session is wired into the bot. Transcript retention is configurable in
+`.env` (see [Operations](OPERATIONS.md)); it does not delete cached document text.
 
 ## Report a vulnerability
 

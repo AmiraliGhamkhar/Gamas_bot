@@ -1,3 +1,65 @@
+# Workflow re-audit — current working tree
+
+Date: 2026-10-27. Base revision: `cb511f01ac5145bbd89b7ab01c129b682af67c17`;
+branch: `arena/62447c17-gamas-bot`. The findings and verification below refer to the
+working-tree changes in this session, not a deployed instance. The previous report is retained
+below as historical context; its revision, line references and conclusions do not describe this
+working tree.
+
+## Corrected findings
+
+- **Paid learning recovery:** unsaved paid generations could remain charged after a crash, and
+  cancellation around artifact commit could race compensation. Migration 015 persists one pending
+  operation with its debit and finalizes it with the saved quiz/deck; cancellation, expiry and
+  startup refund an unfinished charge exactly once. Failures to refund are shown honestly.
+- **Telegram callbacks:** a blank answer could consume Telethon's one callback acknowledgment before
+  a later alert. Answers now wait for a specific response where appropriate, with an early blank
+  acknowledgment only for long-running generation.
+- **Presentation and transfers:** a valid textless narrated presentation now offers explicit audio
+  processing; ranged downloads verify each range and handle short positional writes, falling back to
+  the single-stream path on failure.
+- **Queue, shutdown and receipts:** queued duplicate uploads now retain their fingerprint claim;
+  cancellation during admission closes the pending row, and shutdown joins admission/intake and
+  terminates queued progress. A cancelled receipt upload is removed unless the database committed
+  its reference; a failed user confirmation does not suppress the admin review notification.
+- **Library and quizzes:** active quiz sources are protected from pruning, which otherwise cascaded
+  an unfinished session; temporary forwarding errors no longer permanently mark files unavailable.
+  Existing stale unavailable flags are cleared after a successful retry.
+- **Performance and resource usage:** chunk splitting avoids repeated suffix copies. Simultaneous
+  identical document uploads share extraction, separate document parsing concurrency is bounded,
+  output is capped at 5,000,000 extracted characters, and stalled progress edits no longer hold model
+  slots. The full configured learning concurrency range is now honored. Synthetic timings and
+  their limitations are in `docs/PERFORMANCE.md`.
+
+## Remaining operational limitations
+
+- Uploaded-document text is stored in SQLite without an automatic per-user count, expiry, or
+  self-service deletion policy. Library reference pruning and transcript retention do not remove
+  that cache. A retention/deletion policy needs a product decision; no existing documents were
+  deleted during this audit.
+- Paid learning debits written **before** migration 015 cannot be identified reliably as interrupted
+  versus completed; operators must reconcile any historical disputes using available records.
+- PDF/Office parsing still runs in a thread, not an independently time- or memory-limited process;
+  a pathological individual file can consume significant resources before the text cap is enforced.
+- Exactly-once atomicity across Telegram delivery and SQLite cannot be guaranteed. A crash after
+  remote delivery but before the local settlement commits intentionally favors the user.
+- The automated tests, synthetic benchmarks and media-worker check are offline. They do not verify
+  live Telegram, STT or LLM providers, real receipts, cPanel limits, or production traffic.
+
+## Verification
+
+- `python -m pytest -q`: **1,184 passed, 62 subtests passed**.
+- `python -m unittest discover -s tests -q -b`: **1,184 passed**.
+- `ruff check .`, `python -m mypy`, `pip check`, requirements synchronization, and the local media
+  worker check passed on Python 3.11. The cPanel-profile benchmark used simulated providers.
+
+See `docs/TESTING.md` and `docs/PERFORMANCE.md` for commands and reproducible local measurements.
+Back up the database before applying migrations; do not run an older bot against a migrated database.
+
+---
+
+## Historical report (previous revision)
+
 # Gamas Bot — Workflow & Logic Re-audit
 
 Date: 2026-10-27

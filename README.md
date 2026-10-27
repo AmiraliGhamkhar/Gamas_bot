@@ -60,8 +60,8 @@ kill long processes; run one active worker and test the host before relying on i
 
 ## User flow
 
-- `/start` explains the one-action flow and shows 📚 Library, 💳 Wallet, 🎧 Support and ℹ️ Help
-  (admins also see their separate admin panel).
+- `/start` explains the one-action flow and shows 📚 Library, 💳 Wallet, 🏆 Leaderboard,
+  🎧 Support and ℹ️ Help (admins also see their separate admin panel).
 - Send audio, video or a Telegram voice/video note. The bot delivers the transcript first, then the
   RTL Word booklet when note generation is configured. After sending a presentation, select
   «🎧 پردازش صدای ارائه» on its document card to run the existing presentation/audio pipeline.
@@ -74,8 +74,10 @@ kill long processes; run one active worker and test the host before relying on i
   offers **🃏 ساخت فلش‌کارت** / **❓ ساخت سؤالات** from exactly that file. PDF pages, Word sections
   and PowerPoint slides retain their locators. Re-uploading an identical file reuses the cached
   extraction per user (SHA-256) and refreshes its Telegram message reference. Files up to
-  `DOC_MAX_BYTES` (default 50 MB) are accepted; extracted text is stored in SQLite. Legacy `.ppt`
-  uses the existing converter; for unsupported `.doc`, save as `.docx` and resend.
+  `DOC_MAX_BYTES` (default 50 MB) are accepted, with a separate 5,000,000-character extracted-text
+  limit; extracted text is stored in SQLite. The document cache has no automatic retention or
+  self-service deletion yet. Legacy `.ppt` uses the existing converter; for unsupported `.doc`, save
+  as `.docx` and resend. A textless presentation can still offer explicit audio processing.
 - Quizzes and AI flashcard decks offer «⚡ سریع» (10 cards / 5 questions), «⭐ استاندارد» (20/10)
   and «🎯 کامل» (40/20). Source-anchored items are generated in parallel chunks with live progress,
   then shown for review and deletion before saving. Incomplete coverage and shortfalls are reported.

@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased — workflow re-audit
+
+- Migration 015 records paid quiz/deck operations atomically with their debits. Artifact save
+  finalizes them transactionally; cancellation, expiry and startup recover an unsaved charge once.
+  Legacy pre-migration paid debits cannot be automatically matched to interrupted previews.
+- Telegram callback answers now preserve specific alerts; textless narrated presentations expose an
+  explicit audio-processing action; ranged downloads validate every range and complete short writes.
+- Admission fingerprints cover queued/running uploads; shutdown joins admission and stops queued
+  progress. Partial receipts are removed on cancellation, while a committed receipt remains attached.
+- Active quiz sources survive library pruning; transient Telegram forwarding failures no longer
+  permanently disable a library item. Old unavailable flags are repaired after a successful retry.
+- Document splitting is linear in the extracted text size; identical concurrent uploads share an
+  extraction, document parsers are concurrency-limited, extracted text is capped at 5,000,000
+  characters, and progress edits cannot occupy a model slot. Learning chunk concurrency now honors
+  its full configured 1–8 range. The separate document cache still has no retention/delete policy.
+
 ## Unreleased — v2 (hubs, identity, free first try, document ingestion, quality)
 
 - **Admin hubs (R1).** The nine sibling admin buttons collapse into three hubs with new callback
@@ -33,7 +49,7 @@
 - **Quality and speed (R5).** Prompts now demand atomic one-fact cards, cloze-first phrasing, no
   yes/no items, four-option MCQs with misconception distractors, a short explanation, a difficulty
   tag, and a `source` locator per item; items that cannot be anchored are discarded. Generation
-  parses once, chunks the text, runs `LEARNING_CHUNK_CONCURRENCY` calls (default 4, clamped to 3–5) through
+  parses once, chunks the text, runs `LEARNING_CHUNK_CONCURRENCY` calls (default 4, range 1–8) through
   `llm.complete_json` with `asyncio.gather`, retries an invalid chunk once, skips it after a second
   failure, retains valid partial results, dedupes near-duplicates and reports incomplete coverage instead of failing the
   run. A preview/curation screen lets the user delete unwanted items before saving, with live
@@ -60,8 +76,8 @@ Learning loop add-on — quizzes, leaderboard and flashcards:
   the board; the gift is audited, cooldown-limited against double taps, refused for admins/banned
   users, and announced by best-effort DM.
 - Migrations 011 and 012 add display names, extracted booklet text and the quiz/flashcard tables.
-  Foreign keys cascade quiz rows when a library item is pruned while flashcard decks survive with
-  a nulled item reference, so library pruning can never raise an integrity error. Manual flashcard
+  Foreign keys cascade ended quiz rows when a library item is pruned while flashcard decks survive
+  with a nulled item reference; active quiz sources are protected from pruning. Manual flashcard
   conversations are disarmed at every navigation, `/start`, `/cancel` or other command.
 
 One-tap flow, wallet and Telegram-backed library (v4):
@@ -72,7 +88,8 @@ One-tap flow, wallet and Telegram-backed library (v4):
   transcript-only job.
 - The user menu is now Library, Wallet, Support and Help (plus the separate admin entry for admins).
   The wallet combines balance, plan purchase and recent payments; the library stores Telegram
-  message references for each delivered transcript/booklet and prunes to `LIBRARY_MAX_ITEMS`.
+  message references for each delivered transcript/booklet and normally prunes to `LIBRARY_MAX_ITEMS`
+  while preserving active quiz sources.
 - Migration 010 adds the library reference table without copying generated files to the server.
   The former Free Office bot UI and queue are retired; its pure export modules remain covered by
   offline tests, and `OFFICE_ENABLED` now defaults to `false`.

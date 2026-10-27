@@ -40,7 +40,8 @@ Run the test suite only on a development machine, never with production `.env` o
 | `tests/test_document_ingestion.py` | PDF/DOCX/PPTX upload → cached extraction → source-anchored generation; legacy PPT conversion and presentation queue; size boundary/stream gate, per-user and concurrent dedupe, ownership, retry, coverage and bounded concurrency |
 | `tests/test_free_uses.py` | Independent gifts, owned claim/reset races, failed/cancelled/undeliverable/expired previews, startup recovery, shutdown/save races, paid refunds, curation and paywall behavior |
 | `tests/test_admin_hubs.py` | Three hubs and legacy aliases, admin authorization, identity in payment/support/audit views, peer-admin protection, confirmation and approval/rejection ledger paths |
-| `tests/test_migration_schema.py` | Fresh migration gate plus populated 013 → 014 upgrade, legacy orphan repair, preserved child links, FK enforcement and interrupted migration replay |
+| `tests/test_migration_schema.py` | Fresh migration gate, populated 013 → 014 and 014 → 015 upgrades, legacy orphan repair, preserved child links, FK enforcement and interrupted migration replay |
+| `tests/test_reaudit_workflows.py` | Durable paid recovery and save/cancel races, one-shot callback alerts, narrated textless PPTX, range integrity, admission/shutdown, concurrent document extraction and text limits, progress backpressure, exact split regressions |
 | `tests/test_user_identity.py` | Signed int64 boundaries, no float IDs, updated identity on duplicate `/start` and callbacks, username search/removal and strict user-reference integrity checks |
 | `tests/test_learning.py` | Source and difficulty validation, prompts, 10/5–20/10–40/20 presets, weighted coverage and normalized near-deduplication |
 
@@ -74,8 +75,9 @@ are stubbed, so these tests do not verify live providers or the Telegram client 
    بزنید. تلاش دوم هر نوع باید به خرید اعتبار برسد. اگر کاربر اعتبار طرح رایگان قبلی دارد، ابتدا
    از همان اعتبار مصرف می‌شود؛ این اعتبار جدا از دو هدیه است.
 6. خطای سرویس، قطع تولید، شکست ارسال پیش‌نمایش، انصراف و انقضای پیش‌نمایش (۳۰ دقیقه) را جداگانه
-   امتحان کنید؛ هدیه/اعتبار مناسب باید برگردد. پیش‌نمایش ذخیره‌نشدهٔ رایگان را با توقف و راه‌اندازی
-   مجدد ربات آزمایشی بررسی کنید. با مکث پاسخ سرویس آزمایشی، مدیر هدیه را بازنشانی کند و سپس کار
+   امتحان کنید؛ هدیه/اعتبار مناسب باید برگردد. پیش‌نمایش ذخیره‌نشدهٔ رایگان و پولی را با توقف و
+   راه‌اندازی مجدد ربات آزمایشی بررسی کنید؛ مورد ذخیره‌شده نباید بازپرداخت شود. با مکث پاسخ
+   سرویس آزمایشی، مدیر هدیه را بازنشانی کند و سپس کار
    قدیمی را کامل/ناموفق کنید؛ نتیجه نباید هدیهٔ جدید را مصرف یا برگرداند.
 7. مدیر هر سه مرکز پرداخت، کاربران و سامانه، دکمه‌های بازگشت و صفحه‌کلیدهای قدیمی را باز کند؛
    کاربر عادی نباید هیچ زیرصفحهٔ مدیریتی را باز کند. سفارش آزمایشی با رسید ثبت کنید: تأیید نخست
