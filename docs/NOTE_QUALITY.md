@@ -11,10 +11,10 @@ no-op and any value (including values on archived booklets) is normalised to `fu
 
 The generation prompts mandate a full skeleton: cover/lesson title → table of contents → overall
 lesson objective → logical sections in source order (definitions, examples, steps, formulas,
-tables, callouts, key points) → a one-page final «جمع\u200cبندی» → an English-term glossary drawn
+tables, callouts, key points) → a one-page final «جمع‌بندی» → an English-term glossary drawn
 only from the source. A coverage rule requires every instructional unit of the transcript to appear
 at least once. The Word exporter auto-builds the TOC from section headings, appends the final
-«جمع\u200cبندی» recap and a glossary (derived from section definitions when the model supplies
+«جمع‌بندی» recap and a glossary (derived from section definitions when the model supplies
 none), and numbers the headings.
 
 After the map-reduce draft a deterministic completeness validator (`assess_completeness`) checks
@@ -22,6 +22,23 @@ both the skeleton and the share of source units represented (a topic-overlap pro
 `NOTE_COMPLETENESS_FILL=true` (default), any gap triggers one bounded, strictly grounded fill
 request per missing unit (max 6), then re-validates. A fill failure keeps the audited draft rather
 than discarding the booklet; fills only re-organise source text and can never invent facts.
+
+## Quiz questions
+
+Quizzes generated from a booklet are deliberately **mid-to-hard**, not recall tests. The quiz
+system prompt asks for roughly 40% `medium` and 60% `hard` questions (computed per requested
+count), each at the Apply / Analyze / Evaluate level and grounded strictly in the booklet text.
+Every item is a short scenario followed by a question ending in «کدام گزینه …؟»; direct recall
+stems («X چیست؟», «X را تعریف کن», «چه کسی/چه سالی …؟», name/number/date lookups) are forbidden.
+
+Each question has exactly four options with one correct answer: distractors come from plausible
+student misconceptions, all four options are similar in style and length, and giveaway absolutes
+(«همیشه», «هرگز», «هیچ‌کدام», «همهٔ موارد فوق») plus the «همهٔ موارد فوق» option are banned.
+A one-line Persian explanation accompanies each answer. The output schema adds an **optional**
+`difficulty` tag (`medium` | `hard`); `parse_quiz_payload()` records it when present but never
+rejects a question that omits it, so the `MIN_VALID_QUESTIONS = 3` refund path is unchanged.
+Question stems may now use up to `MAX_QUESTION_CHARS = 400` characters to fit a scenario; option
+shuffling is unchanged. Billing (debit before generation, automatic refund on failure) is untouched.
 
 ## Checks
 

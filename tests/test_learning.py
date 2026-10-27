@@ -8,6 +8,7 @@ runs against a real temporary database with no network.
 from __future__ import annotations
 
 import asyncio
+import json
 import random
 import sqlite3
 import tempfile
@@ -18,13 +19,19 @@ from unittest import mock
 
 from gamas_bot.db import MIGRATIONS_DIR
 
-from gamas_bot.bot import GamasBot, LEARNING_GENERATION_FAILED, LEARNING_NO_CREDIT
+from gamas_bot.bot import (
+    GamasBot, LEARNING_GENERATION_FAILED, LEARNING_NO_CREDIT, QUIZ_START_GUIDANCE,
+)
 from gamas_bot.db import Database
 from gamas_bot.learning import (
     MAX_CONTENT_CHARS,
+    MAX_QUESTION_CHARS,
+    MIN_VALID_QUESTIONS,
+    QUIZ_SCHEMA,
     bound_content_text,
     parse_flashcard_payload,
     parse_quiz_payload,
+    quiz_system_prompt,
 )
 from gamas_bot.llm import LLMError
 from tests.support import (
@@ -1157,3 +1164,375 @@ class GiftCooldownTests(unittest.IsolatedAsyncioTestCase):
             "SELECT COUNT(*) FROM ledger WHERE user_id=? AND kind='credit'", (OWNER,)
         )
         self.assertEqual(credits[0][0], 1)
+
+
+# ===========================================================================
+# CR-5: harder, scenario-based multiple-choice questions
+# ===========================================================================
+
+def harder_payload(count: int = 10) -> dict:
+    """A representative harder-question payload (what the new prompt asks for).
+
+    40% medium / 60% hard, each item a short scenario followed by an
+    Apply/Analyze/Evaluate question, misconception-based homogeneous
+    distractors, and a one-line explanation.
+    """
+    stems = [
+        ("اگر بیماری با HbA1c برابر ۶.۴ درصد به کلینیک بیاید و قند ناشتای او یک بار ۱۳۰ باشد، "
+         "کدام گزینه معتبرترین تفسیر را برای تشخیص دیابت ارائه می‌کند؟"),
+        ("دانشجویی ادعا می‌کند چون Metformin خط اول درمان است، برای بیمار مبتلا به نارسایی "
+         "شدید کلیوی هم بی‌خطر است. کدام گزینه بهترین ارزیابی این ادعاست؟"),
+        ("فرض کنید دو بیمار HbA1c یکسان ۷ درصد دارند ولی یکی افت قند مکرر دارد. کدام گزینه "
+         "محتمل‌ترین توضیح تحلیلی این تفاوت است؟"),
+        ("در یک پژوهش، گروهی انسولین و گروهی داروی خوراکی گرفته‌اند. نتیجه تفاوت معناداری "
+         "نشان نمی‌دهد. کدام گزینه درست‌ترین برداشت آماری است؟"),
+        ("اگر هدف درمان رساندن HbA1c به زیر ۷ درصد باشد و بیماری ۸.۲ درصد داشته باشد، کدام "
+         "گزینه مناسب‌ترین گام بعدی را پیشنهاد می‌کند؟"),
+        ("بیماری هم‌زمان Metformin و مادهٔ حاجب یددار دریافت کرده است. کدام گزینه درست‌ترین "
+         "اقدام پیشگیرانه است؟"),
+        ("پزشکی بر پایهٔ یک اندازه‌گیری تصادفی قند خون، دیابت را رد کرده است. کدام گزینه "
+         "بهترین نقد این استدلال است؟"),
+        ("دو دارو عوارض گوارشی مشابهی دارند ولی یکی در بارداری مجاز است. کدام گزینه معیار "
+         "درستی برای انتخاب در بارداری ارائه می‌دهد؟"),
+        ("اگر شیب کاهش قند خون پس از دوز ثابت دارو کمتر از انتظار باشد، کدام گزینه محتمل‌ترین "
+         "توضیح مکانیزمی است؟"),
+        ("دانشجویی می‌گوید «چون همهٔ بیماران دیابتی Metformin می‌گیرند، پس این دارو "
+         "همیشه بی‌خطر است». کدام گزینه بهترین ارزیابی این نتیجه‌گیری است؟"),
+    ]
+    # Balanced, homogeneous distractor sets of comparable length/style.
+    option_sets = [
+        ["HbA1c همچنان معیار تشخیصی اصلی است و نیاز به تأیید دارد",
+         "قند ناشتای تکی برای تشخیص کافی و قطعی است",
+         "هیچ‌کدام آزمایشی ارزش تشخیصی ندارد",
+         "بیمار قطعاً دیابت دارد و درمان فوری لازم است"],
+        ["ادعا درست است و محدودیت کلیوی وجود ندارد",
+         "ادعا نادرست است؛ نارسایی کلیوی از موارد منع مصرف است",
+         "ادعا فقط در افراد مسن صادق است",
+         "ادعا به‌کلی فاقد پشتوانهٔ علمی است"],
+        ["تفاوت در تعداد گلبول‌های قرمز بیماران است",
+         "تفاوت در میانگین قند و افت‌های پنهان بیمار دوم است",
+         "تفاوت ناشی از خطای آزمایشگاهی حتمی است",
+         "تفاوتی وجود ندارد و numbers اشتباه ثبت شده‌اند"],
+        ["نتیجه ثابت می‌کند دو درمان دقیقاً هم‌ارزند",
+         "نبود تفاوت معنادار لزوماً به معنی برابری نیست",
+         "نمونه حتماً بیش از حد کوچک بوده است",
+         "داروی خوراکی قطعاً قوی‌تر است"],
+        ["افزایش دوز یا بازنگری درمان طبق پروتکل",
+         "قطع کامل همهٔ داروها بدون پیگیری",
+         "تکیه بر همان درمان بدون تغییر تا شش ماه",
+         "تجویز انسولین بدون بررسی علت"],
+        ["قطع موقت Metformin و پایش عملکرد کلیه",
+         "ادامهٔ دارو بدون هیچ اقدامی",
+         "جایگزینی خودسرانه با آنتی‌بیوتیک",
+         "کاهش ناگهانی مایعات بدن بیمار"],
+        ["تشخیص قطعی است و نیازی به آزمایش دوم نیست",
+         "اندازه‌گیری تصادفی می‌تواند گمراه‌کننده باشد",
+         "پزشک هیچ خطایی مرتکب نشده و نتیجه نهایی است",
+         "بیمار حتماً سالم است و پیگیری لازم نیست"],
+        ["صرفاً قیمت پایین‌تر دارو",
+         "ایمنی مستند در بارداری و پایش عوارض",
+         "شباهت عوارض گوارشی دو دارو",
+         "رنگ و شکل ظاهری قرص‌ها"],
+        ["کاهش جذب گوارشی یا مقاومت به دارو",
+         "افزایش ناگهانی تعداد گلبول‌های سفید",
+         "تغییر رنگ ادرار بیمار",
+         "کاهش دمای اتاق آزمایش"],
+        ["نتیجه‌گیری درست است و دارو بی‌خطر مطلق است",
+         "تعمیم از «همه» و «همیشه» نادرست است؛ پایش لازم است",
+         "دارو فقط زیر نظر پزشک مجاز است",
+         "هیچ‌کدام گزینه پاسخ درستی نیست"],
+    ]
+    questions = []
+    for i in range(count):
+        difficulty = "medium" if i < round(count * 0.4) else "hard"
+        questions.append({
+            "question": stems[i % len(stems)],
+            "options": option_sets[i % len(option_sets)],
+            "correct": 0,
+            "explain": "این گزینه با معیار تشخیصی و ایمنی همخوان است و بقیه نادرست‌اند.",
+            "difficulty": difficulty,
+        })
+    return {"questions": questions}
+
+
+class QuizDifficultyPromptTests(unittest.TestCase):
+    """The prompt itself must mandate mid-to-hard, non-recall questions."""
+
+    def test_question_ceiling_is_400(self):
+        self.assertEqual(MAX_QUESTION_CHARS, 400)
+
+    def test_schema_adds_optional_difficulty_enum(self):
+        items = QUIZ_SCHEMA["properties"]["questions"]["items"]
+        self.assertEqual(items["properties"]["difficulty"]["enum"], ["medium", "hard"])
+        # difficulty is OPTIONAL — required still only the four legacy keys.
+        self.assertEqual(
+            set(items["required"]),
+            {"question", "options", "correct", "explain"},
+        )
+        self.assertNotIn("difficulty", items["required"])
+
+    def test_prompt_demands_40_medium_60_hard(self):
+        prompt = quiz_system_prompt(10)
+        self.assertIn("۴۰٪", prompt)
+        self.assertIn("متوسط", prompt)
+        self.assertIn("۶۰٪", prompt)
+        self.assertIn("سخت", prompt)
+        # 40% of 10 = 4 medium, 6 hard (Persian digits).
+        self.assertIn("۴ متوسط", prompt)
+        self.assertIn("۶ سخت", prompt)
+
+    def test_prompt_uses_apply_analyze_evaluate_and_bans_recall(self):
+        prompt = quiz_system_prompt(5)
+        for phrase in ("به‌کاربستن", "تحلیل", "ارزیابی"):
+            self.assertIn(phrase, prompt)
+        self.assertIn("حافظه‌ای ممنوع", prompt)
+        self.assertIn("چیست؟", prompt)            # banned recall stem is named
+        self.assertIn("تعریف کن", prompt)
+
+    def test_prompt_mandates_scenario_structure_and_json(self):
+        prompt = quiz_system_prompt(5)
+        self.assertIn("سناریو", prompt)
+        self.assertIn("کدام گزینه", prompt)
+        self.assertIn("difficulty", prompt)
+        self.assertIn(
+            "medium",
+            QUIZ_SCHEMA["properties"]["questions"]["items"]["properties"]
+            ["difficulty"]["enum"],
+        )
+        self.assertIn("hard", prompt)   # the JSON example is tagged hard
+        self.assertIn("JSON", prompt)
+        # The embedded JSON example is valid strict JSON.
+        example = prompt[prompt.rindex('{"questions"'):]
+        parsed = json.loads(example.strip())
+        self.assertIn("questions", parsed)
+        self.assertEqual(parsed["questions"][0]["difficulty"], "hard")
+
+    def test_prompt_bans_giveaways_and_requires_homogeneous_options(self):
+        prompt = quiz_system_prompt(5)
+        self.assertIn("هم‌سبک", prompt)
+        self.assertIn("هم‌طول", prompt)
+        self.assertIn("بدفهمی", prompt)
+        self.assertIn("همهٔ موارد فوق", prompt)     # explicitly forbidden
+        self.assertIn("مطلق‌نما", prompt)
+        self.assertIn("فقط یک گزینه", prompt)
+
+    def test_prompt_is_deterministic_and_count_aware(self):
+        self.assertEqual(quiz_system_prompt(5), quiz_system_prompt(5))
+        self.assertIn("۵ سؤال", quiz_system_prompt(5))
+        self.assertIn("۱۵ سؤال", quiz_system_prompt(15))
+
+
+class QuizDifficultyParserTests(unittest.TestCase):
+    """Parsing records difficulty but never rejects an item that omits it."""
+
+    def test_difficulty_is_recorded_when_present(self):
+        payload = {"questions": [
+            {"question": "اگر X رخ دهد کدام گزینه درست است؟",
+             "options": ["الف", "ب", "ج", "د"],
+             "correct": 0, "explain": "چرا", "difficulty": "hard"},
+            {"question": "در شرایط Y کدام گزینه درست است؟",
+             "options": ["الف", "ب", "ج", "د"],
+             "correct": 1, "explain": "چرا", "difficulty": "medium"},
+        ]}
+        parsed = parse_quiz_payload(payload, 2, rng=random.Random(7))
+        self.assertEqual([q["difficulty"] for q in parsed], ["hard", "medium"])
+
+    def test_missing_or_invalid_difficulty_never_drops_a_question(self):
+        base = {"question": "سناریو: کدام گزینه درست است؟",
+                "options": ["الف", "ب", "ج", "د"], "correct": 0, "explain": "چرا"}
+        payload = {"questions": [
+            dict(base),                                   # no difficulty at all
+            {**base, "difficulty": "easy"},               # invalid enum
+            {**base, "difficulty": 42},                   # wrong type
+            {**base, "difficulty": "hard"},               # valid
+        ]}
+        parsed = parse_quiz_payload(payload, 4, rng=random.Random(3))
+        self.assertEqual(len(parsed), 4)  # nothing dropped
+        self.assertEqual([q.get("difficulty") for q in parsed],
+                         [None, None, None, "hard"])
+        # MIN_VALID_QUESTIONS path still holds: all four survive.
+        self.assertGreaterEqual(len(parsed), MIN_VALID_QUESTIONS)
+
+    def test_option_shuffle_is_unchanged(self):
+        payload = {"questions": [
+            {"question": "سناریو: کدام گزینه درست است؟",
+             "options": ["درست", "غلط۱", "غلط۲", "غلط۳"],
+             "correct": 0, "explain": "چرا", "difficulty": "hard"},
+        ]}
+        parsed = parse_quiz_payload(payload, 1, rng=random.Random(1))
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["options"][parsed[0]["correct_index"]], "درست")
+        self.assertEqual(parsed[0]["difficulty"], "hard")
+
+    def test_longer_scenario_stems_fit_the_new_ceiling(self):
+        stem = "اگر بیماری با شرایط خاص مراجعه کند " * 12
+        payload = {"questions": [
+            {"question": stem, "options": ["الف", "ب", "ج", "د"],
+             "correct": 0, "explain": "چرا", "difficulty": "hard"},
+        ]}
+        parsed = parse_quiz_payload(payload, 1, rng=random.Random(0))
+        self.assertEqual(len(parsed), 1)
+        self.assertLessEqual(len(parsed[0]["question"]), 400)
+        self.assertGreater(len(parsed[0]["question"]), 300)  # > old ceiling
+
+
+class QuizDifficultySmokeTests(unittest.TestCase):
+    """Smoke generation over a fixture booklet: no pure-recall in a 10-item sample."""
+
+    @staticmethod
+    def _recall_stems():
+        return ("چیست؟", "تعریف کنید", "تعریف کن", "چه کسی", "چه سالی",
+                "چند است؟", "به چه معناست", "کدام یک عدد", "نام ", "تاریخ ")
+
+    def _is_pure_recall(self, question: str) -> bool:
+        # A pure-recall item is a short definition/lookup question with no
+        # scenario cue and no Apply/Analyze/Evaluate verb.
+        short = len(question) < 45
+        has_stem = any(stem in question for stem in self._recall_stems())
+        scenario_cues = ("اگر", "فرض", "بیمار", "دانشجو", "در صورتی", "کلینیک",
+                         "پژوهش", "درمان", "دارو", "آزمایش", "نتیجه", "گروه",
+                         "تشخیص", "عوارض", "اقدام", "ارزیابی", "تفسیر")
+        has_cue = any(cue in question for cue in scenario_cues)
+        return (short or has_stem) and not has_cue
+
+    def test_10_question_sample_over_fixture_has_no_pure_recall(self):
+        fixture = Path("tests/fixtures/notes/references/01_medical_endocrinology.json")
+        reference = json.loads(fixture.read_text(encoding="utf-8"))
+        # The source booklet must be real and non-trivial.
+        self.assertGreaterEqual(len(reference.get("sections", [])), 1)
+        source_text = json.dumps(reference, ensure_ascii=False)
+        self.assertIn("HbA1c", source_text)
+
+        payload = harder_payload(10)
+        # Simulate the generation boundary: the harder prompt governs the model,
+        # and parse_quiz_payload validates its answer.
+        prompt = quiz_system_prompt(10)
+        self.assertIn("متوسط", prompt)
+        parsed = parse_quiz_payload(payload, 10, rng=random.Random(11))
+        self.assertEqual(len(parsed), 10)
+
+        difficulties = [q.get("difficulty") for q in parsed]
+        self.assertEqual(difficulties.count("medium"), 4)
+        self.assertEqual(difficulties.count("hard"), 6)
+        for q in parsed:
+            self.assertEqual(len(q["options"]), 4)          # exactly four options
+            self.assertEqual(len(set(q["options"])), 4)
+            self.assertTrue(q["explanation"])               # one-line explanation
+            self.assertFalse(self._is_pure_recall(q["question"]), q["question"])
+            # Homogeneous options: comparable length (no giveaway long answer).
+            lengths = [len(o) for o in q["options"]]
+            # No single option is a giveaway by being far longer.
+            self.assertLessEqual(max(lengths) - min(lengths), 25)
+
+    def test_start_screen_announces_mid_to_hard(self):
+        self.assertIn("متوسط تا سخت", QUIZ_START_GUIDANCE)
+
+
+class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
+    """End-to-end smoke generation over a real fixture booklet.
+
+    The LLM is faked at ``gamas_bot.bot.complete_json`` (no network), but the
+    whole production path runs: the CR-5 system prompt, the real fixture
+    booklet as source, ``parse_quiz_payload``, the debit, and the durable quiz
+    session. No pure-recall item survives in the 10-question sample.
+    """
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.settings = make_settings(
+            db_path=root / "smoke.db",
+            temp_dir=root / "tmp",
+            quiz_cost_seconds_per_question=60,
+        )
+        self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+        self.db = Database(self.settings.db_path)
+        await self.db.connect()
+        self.bot = GamasBot(self.settings)
+        self.bot.db = self.db
+        self.client = FakeTelegramClient()
+        await self.db.ensure_user(OWNER)
+        await self.db.add_credit(OWNER, 3600, note="test", validity_days=30)
+        reference = json.loads(
+            Path("tests/fixtures/notes/references/01_medical_endocrinology.json")
+            .read_text(encoding="utf-8")
+        )
+        self.source_text = json.dumps(reference, ensure_ascii=False)
+        self.item_id = await self.db.library_add(
+            OWNER, "booklet", 10, 20, None, title="جزوهٔ غدد"
+        )
+        await self.db.library_set_content(self.item_id, self.source_text)
+
+    async def asyncTearDown(self):
+        await self.bot.shutdown()
+        await self.db.close()
+        self._tmp.cleanup()
+
+    def _is_pure_recall(self, question: str) -> bool:
+        recall_stems = (
+            "چیست؟", "تعریف کنید", "تعریف کن", "چه کسی", "چه سالی",
+            "چند است؟", "به چه معناست", "کدام یک عدد", "تاریخ ",
+        )
+        cues = (
+            "اگر", "فرض", "بیمار", "دانشجو", "در صورتی", "کلینیک", "پژوهش",
+            "درمان", "دارو", "آزمایش", "نتیجه", "گروه", "تشخیص", "عوارض",
+            "اقدام", "ارزیابی", "تفسیر",
+        )
+        return (len(question) < 45 or any(s in question for s in recall_stems)) \
+            and not any(c in question for c in cues)
+
+    async def test_10_harder_questions_generated_over_fixture_booklet(self):
+        event = FakeCallbackEvent(
+            self.client,
+            data=f"quiz:go:{self.item_id}:10".encode(),
+            chat_id=OWNER,
+        )
+        event.client = self.client
+        with mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(return_value=harder_payload(10)),
+        ) as generator:
+            await self.bot._handle_callback(event)
+        generator.assert_awaited_once()
+
+        # 1) The harder prompt and the real fixture booklet reach the model.
+        call = generator.await_args
+        self.assertIn("متوسط تا سخت", call.kwargs["system"])
+        self.assertIn("۴ متوسط", call.kwargs["system"])
+        self.assertIn("۶ سخت", call.kwargs["system"])
+        self.assertIn("سناریو", call.kwargs["system"])
+        self.assertIn("همهٔ موارد فوق", call.kwargs["system"])
+        self.assertIn("difficulty", call.kwargs["schema"]["properties"]
+                      ["questions"]["items"]["properties"])
+        self.assertIn("HbA1c", call.kwargs["user"])  # real fixture content
+
+        # 2) Billing is untouched: 10 questions x 60s.
+        debits = await self.db.db.execute_fetchall(
+            "SELECT seconds FROM ledger WHERE user_id=? AND kind='debit'", (OWNER,)
+        )
+        self.assertEqual(len(debits), 1)
+        self.assertEqual(debits[0][0], 600)
+
+        # 3) A full 10-question session is durable, with no pure-recall item.
+        rows = await self.db.db.execute_fetchall(
+            "SELECT question, options_json, explanation FROM quiz_questions "
+            "ORDER BY idx"
+        )
+        self.assertEqual(len(rows), 10)
+        for question, options_json, explanation in rows:
+            options = json.loads(options_json)
+            self.assertFalse(self._is_pure_recall(question), question)
+            self.assertEqual(len(options), 4)
+            self.assertTrue(explanation.strip())
+            lengths = [len(o) for o in options]
+            self.assertLessEqual(max(lengths) - min(lengths), 25)
+
+        # 4) The quiz start screen announces the difficulty band.
+        start = FakeCallbackEvent(
+            self.client,
+            data=f"quiz:new:{self.item_id}".encode(),
+            chat_id=OWNER,
+        )
+        start.client = self.client
+        await self.bot._handle_callback(start)
+        self.assertIn("متوسط تا سخت", start.edits[-1]["text"])

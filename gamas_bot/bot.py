@@ -273,7 +273,7 @@ LEARNING_LEGACY_NOTICE = (
 )
 #: §6.1 quiz start guidance.
 QUIZ_START_GUIDANCE = (
-    "تعداد سؤال‌ها را انتخاب کنید.\n"
+    "سؤال‌های متوسط تا سخت؛ تعداد را انتخاب کنید.\n"
     "هر پاسخ درست ۱۰ امتیاز دارد."
 )
 #: §6.3 empty leaderboard.

@@ -14,6 +14,8 @@ from __future__ import annotations
 import random
 from typing import Any
 
+from .progress import to_persian_digits
+
 #: Archived learning text is capped before it is stored and again before it is
 #: sent to a model, so a multi-hour lecture can never bloat the library row or
 #: overflow a provider context (one LLM call, no chunking, by design).
@@ -23,7 +25,9 @@ MAX_CONTENT_CHARS = 60_000
 MAX_MODEL_INPUT_CHARS = 56_000
 
 #: Validation ceilings for model output, mirrored in the prompt wording.
-MAX_QUESTION_CHARS = 300
+#: CR-5: scenario-based Apply/Analyze/Evaluate stems need a little more room
+#: than a bare recall question, so the question ceiling is 400 chars.
+MAX_QUESTION_CHARS = 400
 MAX_OPTION_CHARS = 120
 MAX_EXPLAIN_CHARS = 400
 MAX_CARD_FRONT_CHARS = 160
@@ -84,6 +88,10 @@ QUIZ_SCHEMA: dict[str, Any] = {
                     },
                     "correct": {"type": "integer"},
                     "explain": {"type": "string"},
+                    # CR-5: optional difficulty tag. ``required`` is left
+                    # unchanged so a model that omits it is never rejected —
+                    # that protects the MIN_VALID_QUESTIONS refund path.
+                    "difficulty": {"type": "string", "enum": ["medium", "hard"]},
                 },
                 "required": ["question", "options", "correct", "explain"],
             },
@@ -94,21 +102,40 @@ QUIZ_SCHEMA: dict[str, Any] = {
 
 
 def quiz_system_prompt(count: int) -> str:
-    """The Persian system prompt demanding ``count`` grounded MCQs."""
+    """The Persian system prompt demanding ``count`` grounded, harder MCQs.
+
+    CR-5: questions move from pure recall to mid-to-hard Apply/Analyze/Evaluate
+    items built around a short scenario, with homogeneous, misconception-based
+    distractors and no giveaway cues. Pure (no I/O) so it is unit-testable.
+    """
+    total = int(count)
+    medium = max(1, round(total * 0.4))
+    hard = max(0, total - medium)
     return (
-        "تو یک طراح سؤال آموزشی فارسی‌زبان هستی. فقط بر پایهٔ متن جزوه‌ای که در "
-        "پیام کاربر می‌آید سؤال طرح کن؛ هیچ اطلاعات بیرونی وارد نکن.\n"
-        f"دقیقاً {int(count)} سؤال چهارگزینه‌ای بساز.\n"
-        "قوانین:\n"
-        "- هر سؤال دقیقاً چهار گزینه دارد و فقط یک گزینه کاملاً درست است.\n"
-        "- گزینه‌ها کوتاه و بدون ابهام باشند؛ پاسخ درست نباید با حذف گزینه‌ها "
-        "قابل حدس باشد.\n"
+        "تو طراح سؤال‌های چهارگزینه‌ای سطح «متوسط تا سخت» برای یک جزوهٔ فارسی هستی. "
+        "فقط بر پایهٔ متن جزوه‌ای که در پیام کاربر می‌آید سؤال بساز؛ هیچ اطلاعات بیرونی وارد نکن.\n"
+        f"دقیقاً {to_persian_digits(total)} سؤال بنویس.\n\n"
+        "سطح دشواری:\n"
+        f"- حدود ۴۰٪ سؤال‌ها «متوسط» و ۶۰٪ «سخت» باشند (برای {to_persian_digits(total)} سؤال، "
+        f"تقریباً {to_persian_digits(medium)} متوسط و {to_persian_digits(hard)} سخت).\n"
+        "- سؤال‌ها باید در سطح «به‌کاربستن»، «تحلیل» یا «ارزیابی» باشند، نه یادآوری صرف.\n"
+        "- سؤال حافظه‌ای ممنوع است: مستقیم نپرس «X چیست؟»، «X را تعریف کن»، «X چند است؟»، "
+        "«چه کسی/چه سالی …؟» یا «کدام گزینه نام/عدد/تاریخ درست را می‌گوید؟».\n"
+        "- ساختار هر سؤال: یک سناریوی کوتاه (مثلاً «اگر …»، «بیماری …»، «دانشجویی …») ← "
+        "پرسش ← پایان با «کدام گزینه …؟».\n\n"
+        "قوانین گزینه‌ها:\n"
+        "- هر سؤال دقیقاً ۴ گزینه دارد و فقط یک گزینه کاملاً درست است.\n"
+        "- گزینه‌های نادرست باید برآمده از خطای رایج یا بدفهمی دانشجو، باورپذیر و نزدیک به پاسخ درست باشند.\n"
+        "- هر ۴ گزینه هم‌سبک و تقریباً هم‌طول باشند؛ پاسخ درست نباید بلندتر، دقیق‌تر یا "
+        "از نظر ساختار متفاوت باشد.\n"
+        "- از مطلق‌نماهای لو‌دهنده («همیشه»، «هرگز»، «هیچ‌کدام»، «همهٔ موارد فوق») پرهیز کن؛ "
+        "گزینهٔ «همهٔ موارد فوق» به‌کلی ممنوع است و پاسخ درست نباید با حذف گزینه‌ها قابل حدس باشد.\n"
         "- برای هر سؤال یک توضیح یک‌خطی فارسی بنویس که چرا گزینهٔ درست، درست است.\n"
-        "- همهٔ متن‌ها فارسی و روان باشد.\n"
+        "- همهٔ متن‌ها فارسی و روان باشد.\n\n"
         "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
-        '{"questions":[{"question": "متن سؤال", '
+        '{"questions":[{"question": "متن سؤال سناریومحور", '
         '"options": ["گزینه الف", "گزینه ب", "گزینه ج", "گزینه د"], '
-        '"correct": 0, "explain": "توضیح یک‌خطی"}]}'
+        '"correct": 0, "explain": "توضیح یک‌خطی", "difficulty": "hard"}]}'
     )
 
 
@@ -156,14 +183,20 @@ def parse_quiz_payload(
         else:
             rng.shuffle(order)
         shuffled = [options[index] for index in order]
-        validated.append(
-            {
-                "question": question,
-                "options": shuffled,
-                "correct_index": order.index(correct),
-                "explanation": explain,
-            }
-        )
+        # CR-5: record the optional difficulty tag when the model supplies a
+        # valid one. It is deliberately *not* required — a missing/invalid tag
+        # must never drop a question (that would break MIN_VALID_QUESTIONS and
+        # the refund path). The option shuffle above is unchanged.
+        record: dict[str, Any] = {
+            "question": question,
+            "options": shuffled,
+            "correct_index": order.index(correct),
+            "explanation": explain,
+        }
+        difficulty = entry.get("difficulty")
+        if difficulty in ("medium", "hard"):
+            record["difficulty"] = difficulty
+        validated.append(record)
         if len(validated) >= int(count):
             break
     return validated
