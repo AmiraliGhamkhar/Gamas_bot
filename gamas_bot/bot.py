@@ -95,7 +95,6 @@ from .doc_extract import (
 )
 from .learning import (
     FLASHCARD_SCHEMA,
-    MAX_CONTENT_CHARS,
     MAX_MANUAL_BACK_CHARS,
     MAX_MANUAL_FRONT_CHARS,
     MAX_MODEL_INPUT_CHARS,
@@ -921,18 +920,13 @@ def _presentation_metadata(message) -> tuple[str | None, str | None]:
 
 
 def _document_metadata(message) -> tuple[str | None, str | None]:
-    """Return (source_type, filename) for a PDF/Word document upload.
-
-    PowerPoint is deliberately excluded here: a .pptx may carry narration, so
-    it keeps going to the lecture pipeline, which also caches its slide text as
-    a document for flashcard/question generation.
-    """
+    """Return the PDF/Word/PowerPoint document type and original filename."""
     if message.document is None or message.voice or message.audio:
         return None, None
     filename = getattr(message.file, "name", None)
     mime_type = getattr(message.file, "mime_type", None)
     source_type = classify_document(filename, mime_type)
-    if source_type != "pdf" and source_type != "docx":
+    if source_type not in {"pdf", "docx", "pptx"}:
         return None, None
     return source_type, filename
 
@@ -1029,6 +1023,9 @@ class GamasBot:
         #: note, created_at}``. Kept in memory because the instance lock
         #: guarantees a single bot process (same argument as the learning locks).
         self._curation: dict[int, dict[str, Any]] = {}
+        self._curation_tasks: dict[int, asyncio.Task] = {}
+        self._learning_tasks: dict[int, asyncio.Task] = {}
+        self._shutting_down = False
         #: Admins waiting for the "search user by id or @username" answer.
         self._pending_user_search: set[int] = set()
         #: Admins waiting for a confirmation of "reset free gift".
@@ -1079,6 +1076,9 @@ class GamasBot:
             ]
         )
         await self.db.recover_interrupted()
+        recovered = await self.db.recover_pending_free_uses()
+        if recovered:
+            logger.info("restored %s interrupted free learning claims", recovered)
         await run_file_io(self._sweep_stale_temp_dirs)
         self.queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
@@ -1120,6 +1120,28 @@ class GamasBot:
             logger.info("removed %d stale temp dir(s) at startup", removed)
 
     async def shutdown(self) -> None:
+        self._shutting_down = True
+        # Stop active LLM callbacks while SQLite is still open so their
+        # cancellation handlers can compensate any claimed gift or debit.
+        current = asyncio.current_task()
+        learning = [task for task in set(self._learning_tasks.values()) if task is not current and not task.done()]
+        for task in learning:
+            task.cancel()
+        if learning:
+            await asyncio.gather(*learning, return_exceptions=True)
+        # An unsaved preview is not a delivery. Refund it before closing SQLite;
+        # ungraceful termination is covered by recover_pending_free_uses().
+        timers = list(self._curation_tasks.values())
+        self._curation_tasks.clear()
+        for task in timers:
+            task.cancel()
+        if timers:
+            await asyncio.gather(*timers, return_exceptions=True)
+        for user_id, state in list(self._curation.items()):
+            # A simultaneous save/cancel must finish first; otherwise shutdown
+            # could refund a preview whose artifact is being committed.
+            async with self._learning_lock(user_id):
+                await self._release_curation(user_id, state)
         background = [
             task
             for task in (
@@ -1320,11 +1342,11 @@ class GamasBot:
         ):
             logger.info("free plan granted")
         greeting = "🎓 به گاماس خوش آمدید" if first_start else "منوی اصلی"
-        upload_line = "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 پاورپوینت."
+        upload_line = "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت."
         if self.settings.note_configured:
-            delivery = "متن گفتار، سپس 📄 جزوهٔ ورد می‌آید؛ در «📚 کتابخانه من» ذخیره می‌شود."
+            delivery = "متن گفتار و جزوهٔ ورد یا متن سند در «📚 کتابخانه من» ذخیره می‌شود."
         else:
-            delivery = "متن گفتار می‌آید؛ ساخت جزوهٔ ورد فعلاً فعال نیست."
+            delivery = "متن گفتار و سند ذخیره می‌شود؛ ساخت محتوای هوشمند فعلاً فعال نیست."
         text = (
             f"{greeting}\n\n"
             f"{upload_line}\n{delivery}\n\n"
@@ -1365,9 +1387,11 @@ class GamasBot:
             last_name = getattr(sender, "last_name", None)
             await self.db.update_identity(
                 user_id,
-                first_name=(" ".join(str(first_name).split())[:64] if first_name else None),
-                username=(username if username is not None else None),
-                last_name=(" ".join(str(last_name).split())[:64] if last_name is not None else None),
+                first_name=" ".join(str(first_name or "").split())[:64],
+                # A resolved Telegram entity with username=None means the user
+                # removed their handle; do not retain a stale one indefinitely.
+                username=username or "",
+                last_name=" ".join(str(last_name or "").split())[:64],
             )
         except Exception:
             logger.debug("could not capture sender name", exc_info=True)
@@ -1463,6 +1487,10 @@ class GamasBot:
         if item is None:
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
+        document = await self.db.document_by_library_item(user_id, item_id)
+        if document:
+            await self._show_document_card(event, user_id, int(document["id"]))
+            return
         title = self._item_display_title(item)
         try:
             date_label = jalali_date(datetime.fromisoformat(item["created_at"]))
@@ -1524,17 +1552,8 @@ class GamasBot:
         existing = document.get("library_item_id")
         if existing:
             return int(existing)
-        item_id = await self.db.library_add(
-            user_id,
-            "booklet",
-            0,
-            0,
-            None,
-            title=f"📄 {str(document.get('title') or 'سند')[:120]}",
-        )
-        await self.db.library_set_content(item_id, str(document.get("text") or ""))
-        await self.db.document_set_library_item(int(document["id"]), item_id)
-        return int(item_id)
+        content = await run_file_io(bound_content_text, str(document.get("text") or ""))
+        return await self.db.document_ensure_library_item(user_id, int(document["id"]), content)
 
     async def _save_document(
         self,
@@ -1558,7 +1577,7 @@ class GamasBot:
             page_count=page_count,
             sha256=sha256,
             text=text,
-            chunks_json=chunks_to_json(chunks),
+            chunks_json=await run_file_io(chunks_to_json, chunks),
             library_item_id=library_item_id,
         )
         document = await self.db.document_get(user_id, document_id)
@@ -1579,25 +1598,29 @@ class GamasBot:
         digest = await run_file_io(sha256_file, path)
         existing = await self.db.document_by_hash(user_id, digest)
         if existing is not None:
-            # Identical re-upload: reuse the stored extraction, no second parse.
-            return existing, False
-        extracted: ExtractedDoc = await run_file_io(extract_document, path, source_type)
-        text = bound_content_text(extracted.text, limit=MAX_CONTENT_CHARS)
+            # Reuse the extraction, but retain the newest Telegram reference in
+            # case the older upload has since been deleted.
+            await self.db.document_update_reference(user_id, int(existing["id"]), file_msg_ref)
+            await self._document_library_item(user_id, existing)
+            return (await self.db.document_get(user_id, int(existing["id"]))) or existing, False
+        extract_path = path
+        if source_type == "pptx" and path.suffix.lower() in {".ppt", ".pps", ".pot"}:
+            try:
+                extract_path = await self._run_media_operation(
+                    convert_to_pptx, path, path.parent / "converted", self.settings
+                )
+            except MediaToolError as exc:
+                raise DocExtractError(
+                    "تبدیل ارائهٔ قدیمی ناموفق بود؛ لطفاً نسخهٔ pptx را بفرستید."
+                ) from exc
+        extracted: ExtractedDoc = await run_file_io(extract_document, extract_path, source_type)
+        text = await run_file_io(lambda: extracted.text)
         if not text.strip():
             raise DocExtractError(
                 "متنی از این سند استخراج نشد؛ OCR پشتیبانی نمی‌شود."
             )
-        chunks = chunk_sections(extracted.sections, max_chars=MAX_MODEL_INPUT_CHARS)
+        chunks = await run_file_io(chunk_sections, extracted.sections, max_chars=MAX_MODEL_INPUT_CHARS)
         title = document_title(filename, source_type)
-        item_id = await self.db.library_add(
-            user_id,
-            "booklet",
-            0,
-            0,
-            None,
-            title=f"📄 {title[:120]}",
-        )
-        await self.db.library_set_content(item_id, text)
         document, created = await self._save_document(
             user_id,
             source_type=source_type,
@@ -1607,8 +1630,11 @@ class GamasBot:
             page_count=int(extracted.page_count),
             text=text,
             chunks=chunks,
-            library_item_id=item_id,
         )
+        if not created:
+            await self.db.document_update_reference(user_id, int(document["id"]), file_msg_ref)
+        await self._document_library_item(user_id, document)
+        document = (await self.db.document_get(user_id, int(document["id"]))) or document
         logger.info(
             "document ingested user=%s type=%s pages=%s chars=%s chunks=%s created=%s",
             user_id, source_type, extracted.page_count, len(text), len(chunks), created,
@@ -1618,7 +1644,7 @@ class GamasBot:
     def _document_card_text(self, document: dict) -> str:
         """Type, size and a text preview — the "extraction succeeded" proof."""
         label = SOURCE_TYPE_LABELS_FA.get(str(document["source_type"]), "سند")
-        unit = "صفحه" if document["source_type"] in ("pdf", "docx") else "اسلاید"
+        unit = {"pdf": "صفحه", "docx": "بخش", "pptx": "اسلاید"}.get(document["source_type"], "بخش")
         lines = [
             f"📄 {document.get('title') or 'سند'}",
             f"نوع: {label} | {to_persian_digits(int(document.get('page_count') or 0))} {unit}",
@@ -1629,24 +1655,25 @@ class GamasBot:
         ]
         return "\n".join(lines)
 
-    def _document_buttons(self, document_id: int) -> list[list]:
-        return [
+    def _document_buttons(self, document_id: int, source_type: str = "") -> list[list]:
+        buttons = [
             [
-                Button.inline(
-                    DOC_GENERATE_CARDS, f"doc:fc:{document_id}".encode("ascii")
-                ),
-                Button.inline(
-                    DOC_GENERATE_QUESTIONS, f"doc:quiz:{document_id}".encode("ascii")
-                ),
+                Button.inline(DOC_GENERATE_CARDS, f"doc:fc:{document_id}".encode("ascii")),
+                Button.inline(DOC_GENERATE_QUESTIONS, f"doc:quiz:{document_id}".encode("ascii")),
             ],
             [Button.inline("📥 دریافت فایل", f"doc:f:{document_id}".encode("ascii"))],
-            [Button.inline("📚 کتابخانه", b"lib:docs:0")],
         ]
+        if source_type == "pptx":
+            buttons.append([Button.inline(
+                "🎧 پردازش صدای ارائه", f"doc:lecture:{document_id}".encode("ascii")
+            )])
+        buttons.append([Button.inline("📚 کتابخانه", b"lib:docs:0")])
+        return buttons
 
     async def _accept_document(
         self, event, user_id: int, source_type: str, filename: str | None
     ) -> None:
-        """Download, extract and store an uploaded PDF/DOCX, then preview it."""
+        """Download, extract and store an uploaded document, then preview it."""
         max_bytes = int(self.settings.doc_max_bytes)
         reported_size = getattr(getattr(event.message, "file", None), "size", None)
         if isinstance(reported_size, int) and reported_size > max_bytes:
@@ -1662,7 +1689,10 @@ class GamasBot:
             path = workdir / f"source{suffix}"
             try:
                 await self._download_telegram_media(event.message, path, max_bytes)
-            except (asyncio.TimeoutError, UploadTooLargeError):
+            except UploadTooLargeError:
+                await self._edit(progress, "❌ حجم فایل از سقف مجاز اسناد بیشتر است.")
+                return
+            except asyncio.TimeoutError:
                 await self._edit(progress, "❌ دریافت فایل ناموفق بود؛ دوباره بفرستید.")
                 return
             chat_id = getattr(event, "chat_id", None) or user_id
@@ -1694,7 +1724,7 @@ class GamasBot:
         await self._edit(
             progress,
             header + self._document_card_text(document),
-            self._document_buttons(int(document["id"])),
+            self._document_buttons(int(document["id"]), str(document["source_type"])),
         )
 
     async def _forward_document(self, event, user_id: int, document_id: int) -> None:
@@ -1713,6 +1743,32 @@ class GamasBot:
                 "could not forward document=%s", document_id, exc_info=True
             )
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+
+    async def _start_document_presentation(self, event, user_id: int, document_id: int) -> None:
+        """Opt into the unchanged narrated-presentation job from its cached file."""
+        from types import SimpleNamespace
+
+        document = await self.db.document_get(user_id, document_id)
+        if not document or document["source_type"] != "pptx":
+            await event.respond("این ارائه در دسترس نیست.")
+            return
+        try:
+            chat_id, message_id = (int(part) for part in str(document["file_msg_ref"]).split(":", 1))
+            message = await self.client.get_messages(chat_id, ids=message_id)
+            if message is None:
+                raise ValueError("source message missing")
+            kind, filename = _presentation_metadata(message)
+            if kind not in {"native", "legacy"}:
+                raise ValueError("source is not a supported presentation")
+        except Exception:
+            logger.warning("presentation source unavailable document=%s", document_id, exc_info=True)
+            await event.respond("فایل اصلی ارائه در دسترس نیست؛ لطفاً دوباره آن را بفرستید.")
+            return
+        job_event = SimpleNamespace(
+            message=message, sender_id=user_id, chat_id=event.chat_id,
+            reply=event.respond, respond=event.respond,
+        )
+        await self._accept_presentation(job_event, user_id, kind, filename)
 
     async def _show_documents(self, event, *, page: int = 0) -> None:
         """The «📄 اسناد» section of the personal library."""
@@ -1762,7 +1818,8 @@ class GamasBot:
             await self._show_documents(event)
             return
         await self._edit(
-            event, self._document_card_text(document), self._document_buttons(document_id)
+            event, self._document_card_text(document),
+            self._document_buttons(document_id, str(document["source_type"]))
         )
 
     async def _show_document_generate_screen(
@@ -1773,7 +1830,7 @@ class GamasBot:
         if document is None:
             await self._ack(event, "این سند پیدا نشد.", alert=True)
             return
-        deck_label = "فلش‌کارت"
+        deck_label = "مجموعهٔ فلش‌کارت" if kind == "deck" else "آزمون"
         buttons: list[list] = []
         free_kind = "deck" if kind == "deck" else "quiz"
         free = await self._free_try_available(user_id, free_kind)
@@ -1822,6 +1879,9 @@ class GamasBot:
             await self._ack(event, "این سند پیدا نشد.", alert=True)
             return
         if kind == "deck":
+            if choice and preset_cards(choice) is None:
+                await self._ack(event, "اندازهٔ انتخاب‌شده نامعتبر است.", alert=True)
+                return
             if await self.db.deck_count(user_id) >= self.settings.flashcard_max_decks_per_user:
                 await event.respond(
                     "به حداکثر تعداد مجموعه‌های فلش‌کارت رسیده‌اید؛ یک مجموعهٔ قدیمی را "
@@ -1840,7 +1900,13 @@ class GamasBot:
         if user_id in self._learning_in_flight:
             await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
             return
+        if self._shutting_down:
+            await self._ack(event, "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.", alert=True)
+            return
         self._learning_in_flight.add(user_id)
+        task = asyncio.current_task()
+        if task is not None:
+            self._learning_tasks[user_id] = task
         try:
             async with self._learning_lock(user_id):
                 if kind != "deck":
@@ -1875,29 +1941,27 @@ class GamasBot:
                 )
         finally:
             self._learning_in_flight.discard(user_id)
+            if self._learning_tasks.get(user_id) is task:
+                self._learning_tasks.pop(user_id, None)
 
     async def _store_presentation_document(
         self, job: Job, source_path: Path, content
     ) -> None:
         """Cache a lecture deck's slide text as a document (best effort).
 
-        A PowerPoint upload keeps going through the lecture pipeline (it may
-        carry narration), and its slide text is stored here so the user can also
-        generate flashcards/questions from it — the same «📄 اسناد» entry a PDF
-        or Word upload creates.
+        Reuse the document created at intake, or cache older queued decks using
+        the original upload hash (not a converted legacy file's different hash).
         """
         try:
-            sections = sections_from_slides(content.slides)
+            sections = await run_file_io(sections_from_slides, content.slides)
             if not sections:
                 return
-            text = bound_content_text(
-                "\n\n".join(section.render() for section in sections),
-                limit=MAX_CONTENT_CHARS,
-            )
+            text = await run_file_io(lambda: "\n\n".join(section.render() for section in sections))
             if not text.strip():
                 return
+            chunks = await run_file_io(chunk_sections, sections, max_chars=MAX_MODEL_INPUT_CHARS)
             digest = await run_file_io(sha256_file, source_path)
-            await self._save_document(
+            document, _created = await self._save_document(
                 int(job.user_id),
                 source_type="pptx",
                 title=document_title(job.filename, "pptx"),
@@ -1906,10 +1970,11 @@ class GamasBot:
                     f"{getattr(job.message, 'id', 0) or 0}"
                 ),
                 sha256=digest,
-                page_count=len(sections),
+                page_count=len(content.slides),
                 text=text,
-                chunks=chunk_sections(sections, max_chars=MAX_MODEL_INPUT_CHARS),
+                chunks=chunks,
             )
+            await self._document_library_item(int(job.user_id), document)
         except Exception:
             logger.warning(
                 "could not cache presentation text as a document submission=%s",
@@ -1939,7 +2004,7 @@ class GamasBot:
     #: How long a validated-but-unsaved generation stays open for curation.
     CURATION_TTL_SECONDS = 1800
     #: Items shown per curation page (Telegram keyboards have finite width).
-    CURATION_PAGE_SIZE = 6
+    CURATION_PAGE_SIZE = 4
 
     async def _free_try_available(self, user_id: int, kind: str) -> bool:
         """True when the gift badge applies (never for unlimited accounts)."""
@@ -1973,12 +2038,14 @@ class GamasBot:
         document = await self.db.document_get(user_id, document_id)
         if document is None or not document.get("text"):
             return None
-        chunks = chunks_from_json(
-            document.get("chunks_json"), max_chars=MAX_MODEL_INPUT_CHARS
-        ) or chunk_text(str(document["text"]), max_chars=MAX_MODEL_INPUT_CHARS)
+        chunks = await run_file_io(
+            chunks_from_json, document.get("chunks_json"), max_chars=MAX_MODEL_INPUT_CHARS
+        )
+        if not chunks:
+            chunks = await run_file_io(chunk_text, str(document["text"]), max_chars=MAX_MODEL_INPUT_CHARS)
         # Every document owns a mirrored library item (see _ingest_document) so
         # the existing quiz/deck tables have a valid source row to reference.
-        item_id = int(document.get("item_id") or 0) or None
+        item_id = int(document.get("library_item_id") or 0) or None
         if item_id is None:
             item_id = await self._document_library_item(user_id, document)
         return {
@@ -1990,27 +2057,22 @@ class GamasBot:
 
     async def _claim_generation_budget(
         self, event, user_id: int, kind: str, cost: int, note: str
-    ) -> tuple[bool, bool] | None:
-        """Claim the free first try, else charge credit — before any model call.
-
-        Returns ``(free_used, charged)`` or ``None`` when the user is denied (the
-        paywall message has already been sent). The free claim is a single
-        atomic UPDATE inside ``consume_free_use``, so two concurrent generations
-        cannot both take the gift (R3.3).
-        """
+    ) -> tuple[bool, bool, str | None] | None:
+        """Claim an owned free attempt or charge credit, before any model call."""
         if await self.db.is_unlimited(user_id):
-            return (False, False)
-        if await self.db.consume_free_use(user_id, kind):
-            return (True, False)
+            return (False, False, None)
+        claim_id = secrets.token_hex(16)
+        if await self.db.consume_free_use(user_id, kind, claim_id=claim_id):
+            return (True, False, claim_id)
         try:
-            await self.db.spend_seconds(user_id, cost, note)
+            charged = await self.db.spend_seconds(user_id, cost, note)
         except InsufficientBalanceError:
             await event.respond(
                 LEARNING_NO_CREDIT,
                 buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
             )
             return None
-        return (False, True)
+        return (False, bool(charged), None)
 
     async def _refund_generation(
         self,
@@ -2021,6 +2083,7 @@ class GamasBot:
         free: bool,
         kind: str,
         note: str,
+        claim_id: str | None = None,
     ) -> None:
         """Give back whatever the failed/cancelled generation cost the user.
 
@@ -2035,7 +2098,7 @@ class GamasBot:
                 logger.exception("learning refund failed user=%s cost=%s", user_id, cost)
         if free:
             try:
-                await self.db.refund_free_use(user_id, kind)
+                await self.db.refund_free_use(user_id, kind, claim_id=claim_id)
             except Exception:
                 logger.exception("free-use rollback failed user=%s", user_id)
 
@@ -2057,89 +2120,74 @@ class GamasBot:
         counts: list[int],
         placeholder,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Generate per chunk CONCURRENTLY and merge, in chunk order.
-
-        Model calls go through ``llm.complete_json`` (provider failover lives
-        there) behind a semaphore, so at most ``LEARNING_CHUNK_CONCURRENCY``
-        requests are in flight. A chunk that yields nothing gets exactly one
-        repair retry with the parse error fed back; after that it is counted as
-        a failed part and reported to the user instead of failing everything.
-        """
+        """Generate concurrently; retry an invalid chunk once, then report it."""
         schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
-        concurrency = max(1, int(self.settings.learning_chunk_concurrency))
+        concurrency = min(5, max(3, int(self.settings.learning_chunk_concurrency)))
         semaphore = asyncio.Semaphore(concurrency)
-        total = len(chunks)
+        progress_lock = asyncio.Lock()
+        active = [index for index, count in enumerate(counts) if count > 0]
+        total = len(active)
         state = {"done": 0, "failed": 0}
         session = self._http_session()
-
-        def prompt_for(chunk: DocChunk, count: int) -> str:
-            if kind == "deck":
-                return flashcard_system_prompt(count, source=chunk.locator)
-            return quiz_system_prompt(count, source=chunk.locator)
-
-        def parse(payload: dict[str, Any], count: int) -> list[dict[str, Any]]:
-            if kind == "deck":
-                return parse_flashcard_payload(payload, count)
-            return parse_quiz_payload(payload, count)
 
         async def one(index: int) -> list[dict[str, Any]]:
             chunk = chunks[index]
             count = counts[index]
-            if count <= 0:
-                return []
+            allowed = tuple(dict.fromkeys(
+                " ".join(str(locator).split())[:120]
+                for locator in (chunk.sources or (chunk.locator,)) if locator
+            ))
             async with semaphore:
                 items: list[dict[str, Any]] = []
-                try:
-                    payload = await complete_json(
-                        session,
-                        self.settings,
-                        system=prompt_for(chunk, count),
-                        user=chunk.text,
-                        schema=schema,
-                    )
-                    items = parse(payload, count)
-                    if not items:
-                        # One repair retry: the same chunk, with the failure
-                        # named, is usually enough to get strict JSON back.
+                system = (
+                    flashcard_system_prompt(count, sources=allowed)
+                    if kind == "deck" else quiz_system_prompt(count, sources=allowed)
+                )
+                for attempt in range(2):
+                    try:
+                        repair = (
+                            "\nخروجی قبلی نامعتبر، ناقص یا بدون منبع مجاز بود؛ "
+                            "همهٔ فیلدهای لازم و یک منبع دقیق از فهرست را وارد کن."
+                            if attempt else ""
+                        )
                         payload = await complete_json(
                             session,
                             self.settings,
-                            system=prompt_for(chunk, count),
-                            user=(
-                                chunk.text
-                                + "\n\n(خروجی قبلی JSON معتبر یا کامل نبود؛ "
-                                "این بار فقط JSON با ساختار خواسته‌شده و تعداد "
-                                "دقیق موارد بده.)"
-                            ),
+                            system=system + repair,
+                            user=chunk.text[:MAX_MODEL_INPUT_CHARS],
                             schema=schema,
                         )
-                        items = parse(payload, count)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.warning(
-                        "chunk generation failed kind=%s chunk=%s", kind, index, exc_info=True
-                    )
-                    items = []
-                for item in items:
-                    # Source anchoring (R5.1): the model's own locator wins; when
-                    # it forgot one, the chunk it was reading is the answer.
-                    item["source"] = str(item.get("source") or chunk.locator)[:120]
-                if not items:
-                    state["failed"] += 1
-                state["done"] += 1
-                await self._progress_edit(placeholder, state["done"], total)
+                        if kind == "deck":
+                            parsed = parse_flashcard_payload(payload, count, require_source=True)
+                        else:
+                            parsed = parse_quiz_payload(
+                                payload, count, require_source=True, require_difficulty=True
+                            )
+                        # A nonempty string is not enough: it must be a real
+                        # locator mapped to the section the model actually read.
+                        valid = [item for item in parsed if item.get("source") in allowed]
+                        # Repair incomplete/partially invalid arrays too. Retain
+                        # the best valid partial result if the retry also fails.
+                        if len(valid) > len(items):
+                            items = valid
+                        if len(items) >= count:
+                            break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "chunk generation failed kind=%s chunk=%s attempt=%s",
+                            kind, index, attempt + 1, exc_info=True,
+                        )
+                async with progress_lock:
+                    if len(items) < count:
+                        state["failed"] += 1
+                    state["done"] += 1
+                    await self._progress_edit(placeholder, state["done"], total)
                 return items
 
-        results = await asyncio.gather(
-            *(one(index) for index in range(total)), return_exceptions=True
-        )
-        merged: list[dict[str, Any]] = []
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-            merged.extend(result)
-        return merged, state["failed"]
+        results = await asyncio.gather(*(one(index) for index in active))
+        return [item for group in results for item in group], state["failed"]
 
     async def _generate_learning(
         self,
@@ -2153,68 +2201,84 @@ class GamasBot:
         note: str,
         title: str,
     ) -> None:
-        """The one generation pipeline behind both flashcards and quizzes."""
+        """Claim → parallel generation → validated, delivered curation preview."""
+        existing = self._curation.get(user_id)
+        if existing is not None:
+            if self._curation_stale(existing):
+                await self._release_curation(user_id, existing)
+            else:
+                prefix = self._curation_prefix(str(existing["kind"]))
+                await event.respond(
+                    "یک پیش‌نمایش در انتظار بررسی دارید؛ ابتدا آن را ذخیره یا لغو کنید.",
+                    buttons=[[Button.inline("🧐 ادامهٔ بررسی", f"{prefix}:cur:resume".encode("ascii"))]],
+                )
+                return
         chunks = [chunk for chunk in source["chunks"] if chunk.text.strip()]
         if not chunks:
-            await event.respond(
-                "متنی برای ساخت محتوا پیدا نشد. فایل دیگری بفرستید."
-            )
+            await event.respond("متنی برای ساخت محتوا پیدا نشد. فایل دیگری بفرستید.")
             return
-        budget = await self._claim_generation_budget(
-            event, user_id, "deck" if kind == "deck" else "quiz", cost, note
-        )
+        # Let a claim/debit transaction finish even if its caller is cancelled
+        # at COMMIT, then compensate the exact result before propagating it.
+        budget_task = asyncio.create_task(self._claim_generation_budget(event, user_id, kind, cost, note))
+        try:
+            budget = await asyncio.shield(budget_task)
+        except asyncio.CancelledError:
+            try:
+                budget = await budget_task
+                if budget is not None:
+                    free, charged, claim_id = budget
+                    await self._refund_generation(
+                        user_id, cost=cost, charged=charged, free=free, kind=kind,
+                        note=note, claim_id=claim_id,
+                    )
+            except Exception:
+                logger.exception("could not compensate cancelled admission user=%s", user_id)
+            raise
         if budget is None:
             return
-        free, charged = budget
-        wanted = max(1, int(wanted))
-        counts = distribute_counts(wanted, [len(chunk.text) for chunk in chunks])
-        placeholder = await event.respond(
-            "در حال ساخت… ⏳"
-        )
+        free, charged, claim_id = budget
+        placeholder = None
+        state = None
         try:
+            wanted = max(1, int(wanted))
+            counts = distribute_counts(wanted, [len(chunk.text) for chunk in chunks])
+            placeholder = await event.respond("در حال ساخت… ⏳")
             items, failures = await self._generate_chunks(
                 kind=kind, chunks=chunks, counts=counts, placeholder=placeholder
             )
-            if kind == "deck":
-                items = dedupe_cards(items)
-                minimum = MIN_VALID_CARDS
-            else:
-                items = dedupe_questions(items)
-                minimum = MIN_VALID_QUESTIONS
+            items = dedupe_cards(items) if kind == "deck" else dedupe_questions(items)
+            minimum = MIN_VALID_CARDS if kind == "deck" else MIN_VALID_QUESTIONS
             if len(items) < minimum:
-                raise RuntimeError(
-                    f"{kind} generation yielded too few items ({len(items)})"
-                )
+                raise RuntimeError(f"{kind} generation yielded too few items ({len(items)})")
+            state = {
+                "kind": kind, "items": items[:wanted], "page": 0,
+                "title": title[:200], "item_id": int(source["item_id"]),
+                "doc_id": source.get("doc_id"), "cost": cost, "free": free,
+                "charged": charged, "claim_id": claim_id, "note": note,
+                "failures": failures, "skipped": sum(count == 0 for count in counts),
+                "requested": wanted, "created_at": time.monotonic(),
+            }
+            self._curation[user_id] = state
+            if not await self._render_curation(placeholder, user_id):
+                raise RuntimeError("curation preview was not delivered")
+            self._schedule_curation_expiry(user_id, state)
         except BaseException as exc:
+            if state is not None and self._curation.get(user_id) is state:
+                self._curation.pop(user_id, None)
             await self._refund_generation(
-                user_id, cost=cost, charged=charged, free=free, kind=kind, note=note
+                user_id, cost=cost, charged=charged, free=free, kind=kind,
+                note=note, claim_id=claim_id,
             )
-            try:
-                await placeholder.edit(
-                    LEARNING_GENERATION_FAILED
-                    + (f"\n{FREE_TRY_RESTORED}" if free else "")
-                )
-            except Exception:
-                logger.warning("could not edit generation placeholder", exc_info=True)
+            if placeholder is not None:
+                try:
+                    await placeholder.edit(
+                        LEARNING_GENERATION_FAILED + (f"\n{FREE_TRY_RESTORED}" if free else "")
+                    )
+                except Exception:
+                    logger.warning("could not edit generation placeholder", exc_info=True)
             if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                 raise
             logger.warning("%s generation failed", kind, exc_info=exc)
-            return
-        self._curation[user_id] = {
-            "kind": kind,
-            "items": items[:wanted],
-            "page": 0,
-            "title": title[:200],
-            "item_id": int(source["item_id"]),
-            "doc_id": source.get("doc_id"),
-            "cost": cost,
-            "free": free,
-            "charged": charged,
-            "note": note,
-            "failures": failures,
-            "created_at": time.monotonic(),
-        }
-        await self._render_curation(placeholder, user_id)
 
     # ------------------------------------------------------------- curation
     def _curation_prefix(self, kind: str) -> str:
@@ -2225,6 +2289,38 @@ class GamasBot:
             return True
         age = time.monotonic() - float(state.get("created_at") or 0)
         return age > self.CURATION_TTL_SECONDS
+
+    async def _refund_curation_state(self, user_id: int, state: dict[str, Any]) -> None:
+        await self._refund_generation(
+            user_id, cost=int(state.get("cost") or 0),
+            charged=bool(state.get("charged")), free=bool(state.get("free")),
+            kind=str(state.get("kind") or "deck"), note=str(state.get("note") or ""),
+            claim_id=state.get("claim_id"),
+        )
+
+    async def _release_curation(self, user_id: int, state: dict[str, Any]) -> bool:
+        """Remove and compensate one preview exactly once."""
+        if self._curation.get(user_id) is not state:
+            return False
+        self._curation.pop(user_id, None)
+        timer = self._curation_tasks.pop(user_id, None)
+        if timer is not None and timer is not asyncio.current_task():
+            timer.cancel()
+        await self._refund_curation_state(user_id, state)
+        return True
+
+    def _schedule_curation_expiry(self, user_id: int, state: dict[str, Any]) -> None:
+        async def expire() -> None:
+            try:
+                await asyncio.sleep(self.CURATION_TTL_SECONDS)
+                async with self._learning_lock(user_id):
+                    await self._release_curation(user_id, state)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("could not expire curation user=%s", user_id)
+
+        self._curation_tasks[user_id] = asyncio.create_task(expire())
 
     def _curation_keyboard(self, state: dict[str, Any], page: int) -> list[list]:
         prefix = self._curation_prefix(str(state["kind"]))
@@ -2265,11 +2361,11 @@ class GamasBot:
         ])
         return buttons
 
-    async def _render_curation(self, message, user_id: int) -> None:
-        """The preview/curation screen: item list, per-item delete, save."""
+    async def _render_curation(self, message, user_id: int) -> bool:
+        """Render the single preview; False means Telegram did not deliver it."""
         state = self._curation.get(user_id)
         if state is None:
-            return
+            return False
         items = state["items"]
         kind = str(state["kind"])
         label = "فلش‌کارت" if kind == "deck" else "سؤال"
@@ -2284,7 +2380,17 @@ class GamasBot:
         ]
         if state.get("failures"):
             lines.append(
-                f"⚠️ {to_persian_digits(int(state['failures']))} بخش پردازش نشد."
+                f"⚠️ {to_persian_digits(int(state['failures']))} بخش به‌طور کامل پردازش نشد."
+            )
+        if int(state.get("requested") or len(items)) > len(items):
+            lines.append(
+                f"ℹ️ از {to_persian_digits(int(state['requested']))} مورد درخواست‌شده، "
+                f"{to_persian_digits(len(items))} مورد معتبر و غیرتکراری آماده شد."
+            )
+        if state.get("skipped"):
+            lines.append(
+                f"ℹ️ {to_persian_digits(int(state['skipped']))} بخش به‌دلیل اندازهٔ "
+                "انتخاب‌شده بررسی نشد؛ برای پوشش بیشتر اندازهٔ بزرگ‌تر را انتخاب کنید."
             )
         lines.append(CURATION_GUIDANCE)
         for offset, item in enumerate(
@@ -2294,32 +2400,38 @@ class GamasBot:
             source = item.get("source") or "—"
             if kind == "deck":
                 lines.append(
-                    f"\n{number}) {item['front']}\n   ← {item['back']}\n   📍 {source}"
+                    f"\n{number}) {preview_text(item['front'], 150)}\n"
+                    f"   ← {preview_text(item['back'], 240)}\n   📍 {source}"
                 )
             else:
-                lines.append(f"\n{number}) {item['question']}\n   📍 {source}")
+                options = item["options"]
+                option_lines = " | ".join(
+                    f"{OPTION_LABELS[i]}) {preview_text(option, 55)}"
+                    for i, option in enumerate(options)
+                )
+                correct = OPTION_LABELS[int(item["correct_index"])]
+                difficulty = "سخت" if item.get("difficulty") == "hard" else "متوسط"
+                lines.append(
+                    f"\n{number}) {preview_text(item['question'], 180)}\n"
+                    f"   {option_lines}\n   پاسخ: {correct} | دشواری: {difficulty}\n"
+                    f"   {preview_text(item['explanation'], 100)}\n   📍 {source}"
+                )
         try:
             await message.edit(
                 "\n".join(lines), buttons=self._curation_keyboard(state, page)
             )
+            return True
+        except MessageNotModifiedError:
+            return True
         except Exception:
             logger.warning("could not render curation preview", exc_info=True)
+            return False
 
     async def _cancel_curation(self, event, user_id: int) -> None:
-        state = self._curation.pop(user_id, None)
-        if state is None:
+        state = self._curation.get(user_id)
+        if state is None or not await self._release_curation(user_id, state):
             await self._ack(event, CURATION_STALE_ALERT, alert=True)
             return
-        # Nothing was delivered, so nothing is charged: the credit comes back
-        # and a claimed free first try is restored (R3.4).
-        await self._refund_generation(
-            user_id,
-            cost=int(state.get("cost") or 0),
-            charged=bool(state.get("charged")),
-            free=bool(state.get("free")),
-            kind=str(state.get("kind") or "deck"),
-            note=str(state.get("note") or ""),
-        )
         await self._ack(event, "لغو شد.")
         await self._edit(
             event,
@@ -2331,91 +2443,119 @@ class GamasBot:
     async def _save_curation(self, event, user_id: int) -> None:
         state = self._curation.get(user_id)
         if self._curation_stale(state):
-            self._curation.pop(user_id, None)
+            if state is not None:
+                await self._release_curation(user_id, state)
             await self._ack(event, CURATION_STALE_ALERT, alert=True)
             return
         assert state is not None
         items = state["items"]
-        if state["kind"] == "deck":
-            if len(items) < 1:
-                await self._ack(event, "هیچ کارتی برای ذخیره نمانده است.", alert=True)
-                return
-            self._curation.pop(user_id, None)
-            deck_id = await self.db.deck_create_with_cards(
-                user_id, int(state["item_id"]), str(state["title"])[:200], items
+        minimum = MIN_VALID_CARDS if state["kind"] == "deck" else MIN_VALID_QUESTIONS
+        if len(items) < minimum:
+            await self._ack(
+                event, f"برای ذخیره حداقل {to_persian_digits(minimum)} مورد لازم است.", alert=True
             )
-            deck = await self.db.deck_get(deck_id, user_id)
+            return
+        try:
+            if state["kind"] == "deck":
+                artifact_id = await self.db.deck_create_with_cards(
+                    user_id, int(state["item_id"]), str(state["title"])[:200], items,
+                    free_claim_id=state.get("claim_id"),
+                )
+            else:
+                artifact_id = await self.db.quiz_create_session(
+                    user_id, int(state["item_id"]), items,
+                    free_claim_id=state.get("claim_id"),
+                )
+        except BaseException as exc:
+            await self._release_curation(user_id, state)
+            if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            logger.exception("could not save curated learning content")
+            await self._edit(
+                event, LEARNING_GENERATION_FAILED + (f"\n{FREE_TRY_RESTORED}" if state.get("free") else ""),
+                [[Button.inline("📚 کتابخانه من", b"library")]],
+            )
+            return
+        # The artifact and claim finalization were committed together. The
+        # validated preview had already been delivered before this save tap.
+        self._curation.pop(user_id, None)
+        timer = self._curation_tasks.pop(user_id, None)
+        if timer is not None:
+            timer.cancel()
+        if state["kind"] == "deck":
+            deck = await self.db.deck_get(artifact_id, user_id)
             await self._ack(event, "✅ مجموعه ذخیره شد.")
             if deck is None:
                 await self._edit(
-                    event,
-                    "✅ مجموعه ذخیره شد؛ از «کتابخانه من» بازش کنید.",
+                    event, "✅ مجموعه ذخیره شد؛ از «کتابخانه من» بازش کنید.",
                     [[Button.inline("↩️ فلش‌کارت‌ها", b"fc:hub")]],
                 )
-                return
-            await self._edit(
-                event,
-                self._deck_screen_text(deck, len(items)),
-                self._deck_keyboard(deck_id, bool(items)),
-            )
-            return
-        if len(items) < 1:
-            await self._ack(event, "هیچ سؤالی برای ذخیره نمانده است.", alert=True)
-            return
-        self._curation.pop(user_id, None)
-        session_id = await self.db.quiz_create_session(
-            user_id, int(state["item_id"]), items
-        )
-        await self._ack(event, "✅ آزمون آماده است.")
-        await self._render_question_message(event, user_id, session_id)
+            else:
+                await self._edit(
+                    event, self._deck_screen_text(deck, len(items)),
+                    self._deck_keyboard(artifact_id, bool(items)),
+                )
+        else:
+            await self._ack(event, "✅ آزمون آماده است.")
+            await self._render_question_message(event, user_id, artifact_id)
 
     async def _handle_curation_callback(self, event, user_id: int, data: str) -> None:
-        """``fc:cur:*`` / ``quiz:cur:*``: delete an item, page, save or cancel."""
+        """Serialize save, deletion, cancellation and expiry for this preview."""
         parts = data.split(":")
         kind = "deck" if parts[0] == "fc" else "quiz"
         action = parts[2] if len(parts) > 2 else ""
-        state = self._curation.get(user_id)
-        if self._curation_stale(state) or state is None or state["kind"] != kind:
-            self._curation.pop(user_id, None)
-            await self._ack(event, CURATION_STALE_ALERT, alert=True)
-            return
-        if action == "save":
-            await self._save_curation(event, user_id)
-            return
-        if action == "cancel":
-            await self._cancel_curation(event, user_id)
-            return
-        if action == "del":
-            index = _to_int(parts[3]) if len(parts) > 3 else None
-            if index is None or not 0 <= index < len(state["items"]):
+        async with self._learning_lock(user_id):
+            state = self._curation.get(user_id)
+            if state is None or state["kind"] != kind:
                 await self._ack(event, CURATION_STALE_ALERT, alert=True)
                 return
-            state["items"].pop(index)
-            if not state["items"]:
-                await self._ack(event, "آخرین مورد حذف شد؛ ساخت لغو می‌شود.")
+            if self._curation_stale(state):
+                await self._release_curation(user_id, state)
+                await self._ack(event, CURATION_STALE_ALERT, alert=True)
+                return
+            if action == "save":
+                await self._save_curation(event, user_id)
+                return
+            if action == "cancel":
                 await self._cancel_curation(event, user_id)
                 return
-            await self._ack(
-                event, f"حذف شد؛ {to_persian_digits(len(state['items']))} مورد ماند."
-            )
-            await self._render_curation(event, user_id)
-            return
-        if action in ("p", "page"):
-            page = _to_int(parts[3]) if len(parts) > 3 else None
-            if page is None:
-                await self._ack(event, CURATION_STALE_ALERT, alert=True)
+            if action == "resume":
+                await self._render_curation(event, user_id)
                 return
-            state["page"] = max(0, page)
-            await self._ack(event)
-            await self._render_curation(event, user_id)
-            return
-        await self._ack(event, CURATION_STALE_ALERT, alert=True)
+            if action == "del":
+                index = _to_int(parts[3]) if len(parts) > 3 else None
+                if index is None or not 0 <= index < len(state["items"]):
+                    await self._ack(event, CURATION_STALE_ALERT, alert=True)
+                    return
+                state["items"].pop(index)
+                if not state["items"]:
+                    await self._cancel_curation(event, user_id)
+                    return
+                await self._ack(
+                    event, f"حذف شد؛ {to_persian_digits(len(state['items']))} مورد ماند."
+                )
+                await self._render_curation(event, user_id)
+                return
+            if action in ("p", "page"):
+                page = _to_int(parts[3]) if len(parts) > 3 else None
+                if page is None:
+                    await self._ack(event, CURATION_STALE_ALERT, alert=True)
+                    return
+                state["page"] = max(0, page)
+                await self._ack(event)
+                await self._render_curation(event, user_id)
+                return
+            await self._ack(event, CURATION_STALE_ALERT, alert=True)
 
     # ------------------------------------------------------------------ quiz
     async def _quiz_start_screen(self, event, user_id: int, item_id: int) -> None:
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None or item.get("kind") != "booklet":
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        document = await self.db.document_by_library_item(user_id, item_id)
+        if document:
+            await self._show_document_generate_screen(event, user_id, int(document["id"]), "quiz")
             return
         if not item.get("content_text"):
             await self._edit(
@@ -2452,6 +2592,10 @@ class GamasBot:
         if count not in QUIZ_COUNTS:
             await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)
             return
+        document = await self.db.document_by_library_item(user_id, item_id)
+        if document:
+            await self._generate_from_document(event, user_id, int(document["id"]), "quiz", str(count))
+            return
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None or item.get("kind") != "booklet":
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
@@ -2470,7 +2614,13 @@ class GamasBot:
             # the model: reject before any second debit.
             await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
             return
+        if self._shutting_down:
+            await self._ack(event, "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.", alert=True)
+            return
         self._learning_in_flight.add(user_id)
+        task = asyncio.current_task()
+        if task is not None:
+            self._learning_tasks[user_id] = task
         try:
             async with self._learning_lock(user_id):
                 await self._quiz_generate_locked(
@@ -2479,6 +2629,8 @@ class GamasBot:
         finally:
             # Discard even when cancellation strikes while waiting on the lock.
             self._learning_in_flight.discard(user_id)
+            if self._learning_tasks.get(user_id) is task:
+                self._learning_tasks.pop(user_id, None)
 
     async def _quiz_generate_locked(
         self,
@@ -2558,6 +2710,8 @@ class GamasBot:
         ]
         for index, option in enumerate(question["options"]):
             lines.append(f"{OPTION_LABELS[index]}) {option}")
+        if question.get("source"):
+            lines.append(f"\n📍 منبع: {question['source']}")
         await message.edit(
             "\n".join(lines),
             buttons=self._question_keyboard(session_id, int(question["question_id"])),
@@ -2706,12 +2860,17 @@ class GamasBot:
     async def _admin_board(self, event, *, notice: str = "") -> None:
         """Top 5 earners with one-tap free-credit gift entry points."""
         rows = await self.db.leaderboard_admin_top(5)
+        identities = await self.db.identities_for(row["telegram_id"] for row in rows)
         lines = ["🏆 برترین کاربران", ""]
         buttons: list[list] = []
         if not rows:
             lines.append("هنوز کاربری امتیازی کسب نکرده است.")
         for index, row in enumerate(rows):
-            name = row["first_name"] or LEADERBOARD_FALLBACK_NAME
+            identity = identities.get(row["telegram_id"], {})
+            name = self._identity_line(
+                username=identity.get("username"), telegram_id=row["telegram_id"],
+                display_name=self._user_display_name(identity.get("first_name", ""), identity.get("last_name", "")),
+            )
             lines.append(
                 f"{to_persian_digits(index + 1)}. {name} — "
                 f"{to_persian_digits(row['quiz_points'])} امتیاز"
@@ -2743,7 +2902,7 @@ class GamasBot:
         plans = [plan for plan in await self.db.plans() if plan["price"] > 0]
         lines = [
             "🎁 هدیه به کاربر",
-            f"کاربر: {identity['first_name'] or LEADERBOARD_FALLBACK_NAME}",
+            f"کاربر: {await self._identity_for_id(target_id)}",
             "",
             "یکی از بسته‌های اعتباری را انتخاب کنید:",
         ]
@@ -2770,7 +2929,7 @@ class GamasBot:
         if plan is None or identity is None or identity["banned"]:
             await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
             return
-        name = identity["first_name"] or LEADERBOARD_FALLBACK_NAME
+        name = await self._identity_for_id(target_id)
         seconds = int(round(float(plan["hours"]) * 3600))
         text = (
             "هدیه به "
@@ -2849,6 +3008,10 @@ class GamasBot:
         if item is None or item.get("kind") != "booklet":
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
+        document = await self.db.document_by_library_item(user_id, item_id)
+        if document:
+            await self._show_document_generate_screen(event, user_id, int(document["id"]), "deck")
+            return
         if not item.get("content_text"):
             await self._edit(
                 event,
@@ -2894,6 +3057,10 @@ class GamasBot:
     async def _flashcard_generate(
         self, event, user_id: int, item_id: int, preset: str | None = None
     ) -> None:
+        document = await self.db.document_by_library_item(user_id, item_id)
+        if document:
+            await self._generate_from_document(event, user_id, int(document["id"]), "deck", preset or "")
+            return
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None or item.get("kind") != "booklet":
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
@@ -2914,7 +3081,13 @@ class GamasBot:
         if user_id in self._learning_in_flight:
             await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
             return
+        if self._shutting_down:
+            await self._ack(event, "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.", alert=True)
+            return
         self._learning_in_flight.add(user_id)
+        task = asyncio.current_task()
+        if task is not None:
+            self._learning_tasks[user_id] = task
         try:
             async with self._learning_lock(user_id):
                 await self._flashcard_generate_locked(
@@ -2924,6 +3097,8 @@ class GamasBot:
         finally:
             # Discard even when cancellation strikes while waiting on the lock.
             self._learning_in_flight.discard(user_id)
+            if self._learning_tasks.get(user_id) is task:
+                self._learning_tasks.pop(user_id, None)
 
     def _deck_size_and_cost(self, preset: str | None) -> tuple[int, int]:
         """Resolve the requested size preset (or the configured default).
@@ -3152,7 +3327,8 @@ class GamasBot:
         if restart:
             await self.db.deck_set_cursor(deck_id, 0)
         card = cards[cursor]
-        await self._edit(event, "پرسش:\n\n" + card["front"], [
+        source = f"\n\n📍 منبع: {card['source']}" if card.get("source") else ""
+        await self._edit(event, "پرسش:\n\n" + card["front"] + source, [
             [Button.inline(
                 "👁 نمایش پاسخ",
                 f"fc:flip:{deck_id}:{card['card_id']}".encode("ascii"),
@@ -3173,7 +3349,8 @@ class GamasBot:
         if card is None:
             await self._ack(event, self._deck_stale_alert(), alert=True)
             return
-        await self._edit(event, "پاسخ:\n\n" + card["back"], [
+        source = f"\n\n📍 منبع: {card['source']}" if card.get("source") else ""
+        await self._edit(event, "پاسخ:\n\n" + card["back"] + source, [
             [Button.inline(
                 "➡️ کارت بعدی", f"fc:next:{deck_id}".encode("ascii")
             )],
@@ -3219,6 +3396,7 @@ class GamasBot:
             return
         body_parts = [
             f"پرسش {to_persian_digits(index)}: {card['front']}\nپاسخ: {card['back']}"
+            + (f"\nمنبع: {card['source']}" if card.get("source") else "")
             for index, card in enumerate(cards, start=1)
         ]
         meta = DocumentMeta(
@@ -3408,6 +3586,13 @@ class GamasBot:
                 return
             await self._forward_document(event, user_id, document_id)
             return
+        if action == "lecture" and len(parts) == 3:
+            document_id = _to_int(parts[2])
+            if document_id is None:
+                await self._ack(event, "این سند پیدا نشد.", alert=True)
+                return
+            await self._start_document_presentation(event, user_id, document_id)
+            return
         if action in ("fc", "quiz") and len(parts) == 3:
             document_id = _to_int(parts[2])
             if document_id is None:
@@ -3418,6 +3603,9 @@ class GamasBot:
             )
             return
         if action == "gen" and len(parts) == 5:
+            if parts[2] not in {"fc", "quiz"}:
+                await self._ack(event, "درخواست نامعتبر است.", alert=True)
+                return
             kind = "deck" if parts[2] == "fc" else "quiz"
             document_id = _to_int(parts[3])
             if document_id is None:
@@ -3481,7 +3669,11 @@ class GamasBot:
                 await self._show_admin_pending_receipt_users(event)
                 return
             if action == "banned":
-                await self._show_admin_blocked_users(event)
+                page = _to_int(rest[1]) if len(rest) > 1 else 0
+                if page is None or page < 0:
+                    await self._ack(event, "صفحهٔ کاربران مسدود نامعتبر است.", alert=True)
+                    return
+                await self._show_admin_blocked_users(event, page)
                 return
             if action in {"card", "fr", "frx", "tg"}:
                 target = _to_int(rest[1]) if len(rest) > 1 else None
@@ -3503,12 +3695,15 @@ class GamasBot:
             if not action:
                 await self._show_admin_system_report(event, "7d")
                 return
-            if action == "proc":
+            if action in {"proc", "status"}:
                 period = rest[1] if len(rest) > 1 else "7d"
                 if period not in self.ADMIN_PERIOD_KEYS:
                     await self._ack(event, "بازهٔ زمانی نامعتبر است.", alert=True)
                     return
-                await self._show_admin_processing_report(event, period)
+                if action == "proc":
+                    await self._show_admin_processing_report(event, period)
+                else:
+                    await self._show_admin_system_report(event, period)
                 return
             await self._ack(event, "بخش سامانه نامعتبر است.", alert=True)
             return
@@ -3516,6 +3711,9 @@ class GamasBot:
 
     # ------------------------------------------------------------- callbacks
     async def _handle_callback(self, event) -> None:
+        if self._shutting_down:
+            await self._ack(event, "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.", alert=True)
+            return
         data = (event.data or b"").decode("utf-8", "replace").strip()
         user_id = event.sender_id
         if user_id is None:
@@ -3535,6 +3733,8 @@ class GamasBot:
         if not self._is_admin(user_id) and data.startswith(("adm:", "payv:")):
             await self._ack(event, "دسترسی به این بخش فقط برای مدیران مجاز است.", alert=True)
             return
+        await self.db.ensure_user(user_id)
+        await self._capture_sender_name(event)
         # Opening any panel screen disarms a half-finished broadcast prompt,
         # so a stray "انصراف"/navigation tap can never send stale text later.
         if data.startswith("adm:") and data != "adm:bcast":
@@ -3547,9 +3747,10 @@ class GamasBot:
             self._pending_user_search.discard(user_id)
             self._pending_free_reset.pop(user_id, None)
         else:
-            self._pending_free_reset.pop(user_id, None)
-            if not data.startswith("adm:hub:usr:card"):
-                self._pending_user_search.discard(user_id)
+            if not data.startswith("adm:hub:usr:frx:"):
+                self._pending_free_reset.pop(user_id, None)
+            # Only the users landing page re-arms search after it renders.
+            self._pending_user_search.discard(user_id)
         # A review action supersedes any older rejection-reason prompt. Only
         # the new rejection action below is allowed to arm that prompt again.
         if data.startswith("payv:"):
@@ -3572,9 +3773,10 @@ class GamasBot:
             await self._ack(event)
             guide = (
                 "ℹ️ راهنمای گاماس\n\n"
-                "🎧 فایل صوت/ویدیو یا 📄 پاورپوینت درس را همین‌جا بفرستید.\n"
-                "📄 متن گفتار و جزوهٔ ورد می‌آید و در «📚 کتابخانه من» ذخیره می‌شود.\n"
-                "🧪 آزمون و 🃏 فلش‌کارت از همان جزوه ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
+                "🎧 فایل صوت/ویدیو یا 📄 سند PDF، Word و پاورپوینت را همین‌جا بفرستید.\n"
+                "📚 متن اسناد در کتابخانه ذخیره می‌شود؛ برای ارائه، پردازش صدا نیز انتخاب‌پذیر است.\n"
+                "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
+                "🎁 نخستین مجموعهٔ فلش‌کارت و نخستین آزمون جداگانه رایگان‌اند.\n"
                 "🛒 خرید اشتراک: بسته‌ها و موجودی. 🎧 پشتیبانی: تیکت بزنید.\n\n"
                 "💳 اعتبار بر حسب ثانیه است و پس از ارسال متن خام محاسبه می‌شود.\n"
                 "اگر متن خام نرسد، اعتباری کم نمی‌شود.\n"
@@ -3680,14 +3882,14 @@ class GamasBot:
                 return
             if section == "ov":
                 await self._show_admin_overview(event, period)
-            elif section == "ovu":
-                await self._show_admin_users_report(event, period)
-            elif section == "ovp":
-                await self._show_admin_processing_report(event, period)
-            elif section == "ovpay":
-                await self._show_admin_payments_report(event, period)
-            elif section == "ovs":
-                await self._show_admin_system_report(event, period)
+            elif section in {"ovu", "ovp", "ovpay", "ovs"}:
+                # Stale report buttons remain aliases to their corresponding
+                # new hub views, including the original selected period.
+                aliases = {
+                    "ovu": "usr:stats", "ovp": "sys:proc",
+                    "ovpay": "pay:stats", "ovs": "sys:status",
+                }
+                await self._route_admin_hub(event, user_id, f"adm:hub:{aliases[section]}:{period}")
             else:
                 await self._ack(event, "بخش گزارش نامعتبر است.", alert=True)
         elif data.startswith("adm:hub:"):
@@ -3727,9 +3929,13 @@ class GamasBot:
                 "برای لغو، /cancel بفرستید یا دکمهٔ زیر را انتخاب کنید.",
                 buttons=[[Button.inline("↩️ لغو", b"adm:home")]],
             )
-        elif data == "adm:audit":
-            await self._ack(event)
-            await self._show_admin_audit(event)
+        elif data == "adm:audit" or data.startswith("adm:audit:"):
+            page = _to_int(data.rsplit(":", 1)[-1]) if data != "adm:audit" else 0
+            if page is None or page < 0:
+                await self._ack(event, "صفحهٔ گزارش نامعتبر است.", alert=True)
+            else:
+                await self._ack(event)
+                await self._show_admin_audit(event, page)
         elif data == "adm:board":
             await self._ack(event)
             await self._admin_board(event)
@@ -3772,6 +3978,9 @@ class GamasBot:
     # -------------------------------------------------------------- messages
     async def _handle_message(self, event) -> None:
         if event.message is None or not event.is_private:
+            return
+        if self._shutting_down:
+            await event.reply("ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.")
             return
         user_id = event.sender_id
         if user_id is None:
@@ -3911,20 +4120,21 @@ class GamasBot:
                 await self._handle_flashcard_text(event, user_id, text)
                 return
 
-        # Presentations.
-        pkind, pfilename = _presentation_metadata(event.message)
-        if pkind is not None:
-            if await self._is_duplicate_upload(event, user_id):
-                return
-            await self._accept_presentation(event, user_id, pkind, pfilename)
-            return
-
-        # Documents (PDF / Word): extracted into text for flashcards/questions.
+        # Study documents, including PowerPoint, are cached before generation.
+        # A PowerPoint card also offers the existing narrated-lecture pipeline.
         dkind, dfilename = _document_metadata(event.message)
         if dkind is not None:
             if await self._is_duplicate_upload(event, user_id):
                 return
             await self._accept_document(event, user_id, dkind, dfilename)
+            return
+
+        # Other presentation variants retain their existing lecture path.
+        pkind, pfilename = _presentation_metadata(event.message)
+        if pkind is not None:
+            if await self._is_duplicate_upload(event, user_id):
+                return
+            await self._accept_presentation(event, user_id, pkind, pfilename)
             return
 
         # Media.
@@ -3957,7 +4167,7 @@ class GamasBot:
             return
         if text:
             await event.reply(
-                "همین‌جا فایل 🎧 صوت/ویدیو یا 📄 پاورپوینت درس را بفرستید؛ متن و جزوه می‌آید.",
+                "همین‌جا فایل 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت درس را بفرستید.",
                 buttons=self._user_menu(is_admin=self._is_admin(user_id)),
             )
 
@@ -4539,6 +4749,7 @@ class GamasBot:
 
         job.transition_to("extracting")
         conversion_warnings: list[str] = []
+        original_source_path = source_path
         if job.meta.get("presentation_kind") == "legacy":
             await progress.update(30, "تبدیل قالب قدیمی ارائه")
             source_path = await self._run_media_operation(
@@ -4559,7 +4770,7 @@ class GamasBot:
         # The deck is study material as well as a lecture: cache its slide text
         # as a document so flashcards/questions can be generated from it without
         # a second upload (R4.4). Best effort: a failure here never fails a job.
-        await self._store_presentation_document(job, source_path, content)
+        await self._store_presentation_document(job, original_source_path, content)
         # The note model is only as good as this input, so record what was
         # actually read from the deck: a deck whose text silently extracted as
         # empty is otherwise indistinguishable from a deck without text.
@@ -5488,9 +5699,10 @@ class GamasBot:
             return
         seconds = int(payment.get("purchased_seconds") or 0)
         price = payment.get("purchased_price")
+        owner = await self._identity_for_id(int(payment["user_id"]))
         text = (
             f"🧾 رسید سفارش {to_persian_digits(payment_id)}\n"
-            f"کاربر: {payment['user_id']}\n"
+            f"کاربر: {owner}\n"
             f"بسته: {format_duration(seconds) if seconds else payment['plan_code']}\n"
             f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}"
         )
@@ -5598,10 +5810,11 @@ class GamasBot:
             await self._ack(event)
             seconds = int(payment.get("purchased_seconds") or 0)
             price = payment.get("purchased_price")
+            owner = await self._identity_for_id(int(payment["user_id"]))
             await self._edit_or_reply(
                 event,
                 f"✅ تأیید سفارش {to_persian_digits(payment_id)}\n\n"
-                f"کاربر: {payment['user_id']}\n"
+                f"کاربر: {owner}\n"
                 f"اعتبار: {format_duration(seconds)}\n"
                 f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}\n\n"
                 "پس از تأیید نهایی، اعتبار به حساب کاربر اضافه می‌شود.",
@@ -5857,7 +6070,7 @@ class GamasBot:
         if transient:
             items.append(
                 f"🌐 {to_persian_digits(transient)} خطای موقت ارائه‌دهنده "
-                "(timeout / محدودیت نرخ / خطای سرور) از شروع اجرا"
+                "(پایان مهلت / محدودیت نرخ / خطای سرور) از شروع اجرا"
             )
         if not items:
             items.append("✅ مورد فوری‌ای در انتظار نیست.")
@@ -5903,11 +6116,6 @@ class GamasBot:
         ]
         lines.extend(f"• {item}" for item in self._admin_attention_lines(report, self.runtime_metrics()))
         buttons = [self._admin_period_row("adm:ov", period)]
-        buttons.append([
-            Button.inline("💳 پرداخت‌ها", b"adm:hub:pay"),
-            Button.inline("👥 کاربران", b"adm:hub:usr"),
-        ])
-        buttons.append([Button.inline("🩺 سامانه", b"adm:hub:sys")])
         buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
@@ -6210,8 +6418,8 @@ class GamasBot:
                     f"{to_persian_digits(int(stats.get('in_flight', 0) or 0))}/"
                     f"{to_persian_digits(int(stats.get('peak_in_flight', 0) or 0))} اوج"
                     f" | موفقیت {self._rate_text(stats.get('success_rate'))}"
-                    f" | timeout {to_persian_digits(int(stats.get('timeouts', 0) or 0))}"
-                    f" | rate-limit {to_persian_digits(int(stats.get('rate_limits', 0) or 0))}"
+                    f" | پایان مهلت {to_persian_digits(int(stats.get('timeouts', 0) or 0))}"
+                    f" | محدودیت نرخ {to_persian_digits(int(stats.get('rate_limits', 0) or 0))}"
                     f" | خطای سرور {to_persian_digits(int(stats.get('server_errors', 0) or 0))}"
                 )
         if provider_lines:
@@ -6269,19 +6477,27 @@ class GamasBot:
     def _user_display_name(self, first_name: str = "", last_name: str = "") -> str:
         return " ".join(part for part in (str(first_name).strip(), str(last_name).strip()) if part)
 
+    async def _identity_for_id(self, user_id: int) -> str:
+        identity = await self.db.user_identity(int(user_id)) or {}
+        return self._identity_line(
+            username=identity.get("username"), telegram_id=user_id,
+            display_name=self._user_display_name(identity.get("first_name", ""), identity.get("last_name", "")),
+        )
+
     def _hub_back_row(self, hub: str) -> list:
         return [Button.inline(f"↩️ {self.ADMIN_HUB_TITLES.get(hub, 'بازگشت')}", f"adm:hub:{hub}".encode())]
 
     async def _show_admin_users(self, event) -> None:
         """The Users hub: search box, the four sub-views and the recent list."""
-        users = await self.db.list_users(limit=25)
+        # Full identities can be long; keep the screen below Telegram's limit.
+        users = await self.db.list_users(limit=12)
         total = await self.db.count_users()
         heading = (
             f"👥 فهرست کاربران — {to_persian_digits(len(users))} از "
             f"{to_persian_digits(total)} نفر"
         )
         if total > len(users):
-            heading += " (۲۵ کاربر اخیر)"
+            heading += " (۱۲ کاربر اخیر)"
         lines = [
             heading,
             "",
@@ -6303,7 +6519,7 @@ class GamasBot:
             identity = self._identity_line(
                 username=user.get("username"),
                 telegram_id=user["telegram_id"],
-                display_name=user.get("first_name", ""),
+                display_name=self._user_display_name(user.get("first_name", ""), user.get("last_name", "")),
             )
             lines.append(
                 f"{status} | {identity} | اعتبار: {balance} | عضویت: {joined}"
@@ -6327,10 +6543,13 @@ class GamasBot:
         self._pending_user_search.add(int(event.sender_id or 0))
         buttons: list[list] = []
         for user in users[:8]:
-            label = f"🔎 {user.get('username') or user['telegram_id']}"
+            label = self._identity_line(
+                username=user.get("username"), telegram_id=user["telegram_id"],
+                display_name=self._user_display_name(user.get("first_name", ""), user.get("last_name", "")),
+            )
             buttons.append([
                 Button.inline(
-                    button_label(label),
+                    button_label(f"🔎 {label}"),
                     f"adm:hub:usr:card:{user['telegram_id']}".encode("ascii"),
                 )
             ])
@@ -6352,11 +6571,11 @@ class GamasBot:
                 self._hub_back_row("usr") + self._admin_menu(),
             )
             return
-        balance = (
-            "نامحدود ⭐"
-            if identity["is_unlimited"]
-            else format_duration(await self.db.available_seconds(int(target_id)))
-        )
+        if identity["is_unlimited"]:
+            balance = "نامحدود ⭐"
+        else:
+            seconds = await self.db.available_seconds(int(target_id))
+            balance = f"{format_duration(seconds)} ({to_persian_digits(seconds)} ثانیه)"
         order_rows = list(
             await self.db.db.execute_fetchall(
                 "SELECT COUNT(*) FROM payments WHERE user_id = ?", (int(target_id),)
@@ -6394,25 +6613,21 @@ class GamasBot:
             "",
             "💡 اعتبار و سفارش‌ها در «💳 پرداخت‌ها» بررسی می‌شوند.",
         ]
-        buttons: list[list] = [
-            [Button.inline(
-                "🔄 بازنشانی هدیه رایگان",
-                f"adm:hub:usr:fr:{int(target_id)}".encode("ascii"),
-            )],
-            [
-                Button.inline(
-                    "🚫 مسدودکردن" if not identity["banned"] else "✅ رفع مسدودی",
-                    f"adm:hub:usr:tg:{int(target_id)}".encode("ascii"),
-                )
-            ],
-            self._hub_back_row("usr"),
-        ]
+        buttons: list[list] = [[Button.inline(
+            "🔄 بازنشانی هدیه رایگان", f"adm:hub:usr:fr:{int(target_id)}".encode("ascii"),
+        )]]
+        if not self._is_admin(target_id):
+            buttons.append([Button.inline(
+                "🚫 مسدودکردن" if not identity["banned"] else "✅ رفع مسدودی",
+                f"adm:hub:usr:tg:{int(target_id)}".encode("ascii"),
+            )])
+        buttons.append(self._hub_back_row("usr"))
         buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _show_admin_pending_receipt_users(self, event) -> None:
         """Users whose receipt is waiting: one tap lands on the order detail."""
-        payments = await self.db.pending_review_payments(limit=15, offset=0)
+        payments = await self.db.pending_review_payments(limit=10, offset=0)
         lines = ["🧾 رسیدهای در انتظار بررسی"]
         buttons: list[list] = []
         if not payments:
@@ -6441,9 +6656,13 @@ class GamasBot:
         buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
-    async def _show_admin_blocked_users(self, event) -> None:
-        users = await self.db.blocked_users(limit=30)
-        lines = ["🚫 کاربران مسدود"]
+    async def _show_admin_blocked_users(self, event, page: int = 0) -> None:
+        page_size = 12
+        page = max(0, int(page))
+        users = await self.db.blocked_users(limit=page_size + 1, offset=page * page_size)
+        has_more = len(users) > page_size
+        users = users[:page_size]
+        lines = ["🚫 کاربران مسدود", f"صفحهٔ {to_persian_digits(page + 1)}"]
         if not users:
             lines.append("")
             lines.append("هیچ کاربری مسدود نیست.")
@@ -6458,15 +6677,26 @@ class GamasBot:
             )
             lines.append(f"• {who}")
             buttons.append([Button.inline(
-                button_label(f"🔎 {user.get('username') or user['telegram_id']}"),
+                button_label(f"🔎 {who}"),
                 f"adm:hub:usr:card:{user['telegram_id']}".encode("ascii"),
             )])
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"adm:hub:usr:banned:{page - 1}".encode("ascii")))
+        if has_more:
+            nav.append(Button.inline("بعدی ▶️", f"adm:hub:usr:banned:{page + 1}".encode("ascii")))
+        if nav:
+            buttons.append(nav)
         buttons.append(self._hub_back_row("usr"))
         buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _show_admin_free_reset_confirm(self, event, target_id: int) -> None:
         identity = await self.db.user_identity(int(target_id))
+        if identity is None:
+            await self._ack(event, "این کاربر پیدا نشد.", alert=True)
+            return
+        self._pending_free_reset[int(event.sender_id)] = int(target_id)
         who = self._identity_line(
             username=(identity or {}).get("username"),
             telegram_id=target_id,
@@ -6488,6 +6718,9 @@ class GamasBot:
         )
 
     async def _reset_user_free_gift(self, event, admin_id: int, target_id: int) -> None:
+        if self._pending_free_reset.pop(admin_id, None) != int(target_id):
+            await self._ack(event, "ابتدا بازنشانی را در کارت کاربر تأیید کنید.", alert=True)
+            return
         identity = await self.db.user_identity(int(target_id))
         if identity is None:
             await self._ack(event, "این کاربر پیدا نشد.", alert=True)
@@ -6497,6 +6730,9 @@ class GamasBot:
         await self._show_admin_user_card(event, target_id)
 
     async def _toggle_admin_block(self, event, admin_id: int, target_id: int) -> None:
+        if self._is_admin(target_id):
+            await self._ack(event, "حساب مدیران را نمی‌توان مسدود کرد.", alert=True)
+            return
         identity = await self.db.user_identity(int(target_id))
         if identity is None:
             await self._ack(event, "این کاربر پیدا نشد.", alert=True)
@@ -6521,20 +6757,19 @@ class GamasBot:
             await self._show_admin_user_card(event, int(matches[0]["telegram_id"]))
             return
         buttons = []
+        lines = ["چند کاربر با این نام‌کاربری پیدا شد؛ یکی را انتخاب کنید:"]
         for match in matches:
             who = self._identity_line(
                 username=match.get("username"),
                 telegram_id=match["telegram_id"],
-                display_name=match.get("first_name", ""),
+                display_name=self._user_display_name(match.get("first_name", ""), match.get("last_name", "")),
             )
+            lines.append(f"• {who}")
             buttons.append([Button.inline(
                 button_label(who),
                 f"adm:hub:usr:card:{match['telegram_id']}".encode("ascii"),
             )])
-        await event.reply(
-            "چند کاربر با این نام‌کاربری پیدا شد؛ یکی را انتخاب کنید:",
-            buttons=buttons,
-        )
+        await event.reply("\n".join(lines), buttons=buttons)
 
     PAYMENT_ADMIN_PAGE_SIZE = 8
 
@@ -6722,7 +6957,7 @@ class GamasBot:
                 display_name=self._user_display_name(owner["first_name"], owner["last_name"]),
             )
             if owner
-            else f"شناسه: {to_persian_digits(int(payment['user_id']))}"
+            else self._identity_line(username=None, telegram_id=int(payment["user_id"]))
         )
         lines = [
             f"🔎 سفارش {to_persian_digits(payment_id)}",
@@ -6800,18 +7035,23 @@ class GamasBot:
         buttons.append([Button.inline("↩️ جزئیات سفارش", f"adm:pd:{payment_id}".encode())])
         # The same supported file API as every other delivery, as a photo
         # (no ``force_document``): receipts are viewed in the app, not filed.
+        owner = await self._identity_for_id(int(payment["user_id"]))
         await self._send_telegram_file(
             await event.get_input_chat(),
             Path(str(path)),
             caption=(
                 f"📷 رسید پرداخت #{number}\n"
-                f"شناسهٔ کاربر: {payment['user_id']} — طرح: {payment['plan_code']}"
+                f"کاربر: {owner} — طرح: {payment['plan_code']}"
             )[:TELEGRAM_CAPTION_LIMIT],
             buttons=buttons,
         )
 
-    async def _show_admin_audit(self, event) -> None:
-        rows = await self.db.recent_audit(limit=15)
+    async def _show_admin_audit(self, event, page: int = 0) -> None:
+        page_size = 7
+        page = max(0, int(page))
+        rows = await self.db.recent_audit(limit=page_size + 1, offset=page * page_size)
+        has_more = len(rows) > page_size
+        rows = rows[:page_size]
         action_labels = {
             "grant_credit": "افزودن اعتبار",
             "unlimited_on": "فعال‌کردن کاربر ویژه",
@@ -6825,21 +7065,33 @@ class GamasBot:
             "ticket_reopened": "بازگشایی درخواست پشتیبانی",
             "receipt_expired": "حذف رسید منقضی‌شده",
             "transcript_expired": "حذف متن منقضی‌شده",
+            "free_use_reset": "بازنشانی هدیهٔ رایگان",
         }
-        lines = ["🛡 گزارش فعالیت مدیران", "", "آخرین ۱۵ اقدام ثبت‌شده:"]
+        lines = ["🛡 گزارش فعالیت مدیران", "", f"صفحهٔ {to_persian_digits(page + 1)}:"]
         if not rows:
             lines.append("هنوز فعالیتی ثبت نشده است.")
+        ids = [int(row["admin_id"]) for row in rows]
+        ids.extend(int(row["subject_user"]) for row in rows if row["subject_user"] is not None)
+        identities = await self.db.identities_for(ids)
+
+        def who(user_id: int) -> str:
+            identity = identities.get(int(user_id), {})
+            return self._identity_line(
+                username=identity.get("username"), telegram_id=user_id,
+                display_name=self._user_display_name(identity.get("first_name", ""), identity.get("last_name", "")),
+            )
+
         for row in rows:
             action = action_labels.get(row["action"], row["action"].replace("_", " "))
-            subject = (
-                f" — شناسهٔ کاربر: {row['subject_user']}"
-                if row["subject_user"] is not None
-                else ""
-            )
-            lines.append(
-                f"• {row['created_at']} — مدیر {row['admin_id']} — {action}{subject}"
-            )
-        await self._edit_or_reply(event, "\n".join(lines), self._admin_menu())
+            subject = f" — کاربر: {who(row['subject_user'])}" if row["subject_user"] is not None else ""
+            lines.append(f"• {row['created_at']} — مدیر: {who(row['admin_id'])} — {action}{subject}")
+        nav = []
+        if page > 0:
+            nav.append(Button.inline("◀️ قبلی", f"adm:audit:{page - 1}".encode("ascii")))
+        if has_more:
+            nav.append(Button.inline("بعدی ▶️", f"adm:audit:{page + 1}".encode("ascii")))
+        buttons = ([nav] if nav else []) + self._admin_menu()
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     ADMIN_COMMAND_COOLDOWN_SECONDS = 30.0
     BROADCAST_COOLDOWN_SECONDS = 60.0
@@ -6916,8 +7168,9 @@ class GamasBot:
             target, hours * 3600, note=f"admin grant by {event.sender_id}",
             validity_days=None, admin_id=event.sender_id,
         )
+        owner = await self._identity_for_id(target)
         await event.reply(
-            f"✅ {format_duration(hours * 3600)} اعتبار به حساب کاربر {target} اضافه شد.",
+            f"✅ {format_duration(hours * 3600)} اعتبار به حساب کاربر {owner} اضافه شد.",
             buttons=self._admin_menu(),
         )
 
@@ -6953,10 +7206,11 @@ class GamasBot:
         await self.db.ensure_user(target)
         await self.db.set_banned(target, banning, admin_id=event.sender_id)
         logger.info("ban flag changed banned=%s", banning)
+        owner = await self._identity_for_id(target)
         await event.reply(
-            f"🚫 حساب کاربر {target} مسدود شد."
+            f"🚫 حساب کاربر {owner} مسدود شد."
             if banning
-            else f"✅ مسدودی حساب کاربر {target} برداشته شد.",
+            else f"✅ مسدودی حساب کاربر {owner} برداشته شد.",
             buttons=self._admin_menu(),
         )
 
@@ -7009,10 +7263,11 @@ class GamasBot:
         await self.db.ensure_user(target)
         await self.db.set_unlimited(target, enable, admin_id=event.sender_id, reason=reason)
         logger.info("unlimited access updated enabled=%s", enable)
+        owner = await self._identity_for_id(target)
         if enable:
-            message = f"⭐ کاربر {target} به فهرست کاربران ویژه افزوده شد؛ اعتبار او نامحدود است."
+            message = f"⭐ کاربر {owner} به فهرست کاربران ویژه افزوده شد؛ اعتبار او نامحدود است."
         else:
-            message = f"وضعیت ویژهٔ کاربر {target} لغو شد؛ از این پس استفاده از ربات به اعتبار او وابسته است."
+            message = f"وضعیت ویژهٔ کاربر {owner} لغو شد؛ از این پس استفاده از ربات به اعتبار او وابسته است."
         await event.reply(message, buttons=self._admin_menu())
 
     BROADCAST_THROTTLE_SECONDS = 0.05  # ~20 msg/sec (audit F-M02)
@@ -7285,8 +7540,9 @@ class GamasBot:
             except (ValueError, PermissionError, TicketStateError):
                 closed = False
             if closed:
+                owner = await self._identity_for_id(user_id)
                 await self._notify_admins(
-                    f"🔒 کاربر {user_id} درخواست {ticket['public_ticket_id']} را بست."
+                    f"🔒 کاربر {owner} درخواست {ticket['public_ticket_id']} را بست."
                 )
                 logger.info("support ticket closed by user ticket=%s", ticket_id)
             await self._show_user_ticket(event, user_id, ticket_id)
@@ -7300,8 +7556,9 @@ class GamasBot:
             except (ValueError, PermissionError, TicketStateError):
                 reopened = False
             if reopened:
+                owner = await self._identity_for_id(user_id)
                 await self._notify_admins(
-                    f"🔁 کاربر {user_id} درخواست {ticket['public_ticket_id']} را دوباره باز کرد."
+                    f"🔁 کاربر {owner} درخواست {ticket['public_ticket_id']} را دوباره باز کرد."
                 )
                 logger.info("support ticket reopened by user ticket=%s", ticket_id)
             await self._show_user_ticket(event, user_id, ticket_id)
@@ -7334,10 +7591,11 @@ class GamasBot:
                 "از همین بخش می‌توانید پاسخ‌ها را پیگیری کنید.",
                 buttons=[[Button.inline("📋 مشاهدهٔ درخواست", f"sup:v:{ticket['id']}".encode())]],
             )
+            owner = await self._identity_for_id(user_id)
             await self._notify_admins(
                 "🎧 درخواست پشتیبانی جدید\n"
                 f"شماره: {ticket['public_ticket_id']}\n"
-                f"کاربر: {user_id}\n"
+                f"کاربر: {owner}\n"
                 f"دسته: {self._support_category_label(value)}\n"
                 f"موضوع: {ticket['subject']}",
                 buttons=[[Button.inline("🔎 بررسی درخواست", f"adm:sv:{ticket['id']}".encode())]],
@@ -7363,8 +7621,9 @@ class GamasBot:
             "✅ پیام شما ثبت شد.",
             buttons=[[Button.inline("📋 مشاهدهٔ درخواست", f"sup:v:{value}".encode())]],
         )
+        owner = await self._identity_for_id(user_id)
         await self._notify_admins(
-            f"💬 پیام جدیدی در درخواست {public_id} ثبت شد.\nکاربر: {user_id}",
+            f"💬 پیام جدیدی در درخواست {public_id} ثبت شد.\nکاربر: {owner}",
             buttons=[[Button.inline("🔎 بررسی درخواست", f"adm:sv:{value}".encode())]],
         )
 
@@ -7438,7 +7697,14 @@ class GamasBot:
             [Button.inline(label, f"adm:sl:{view}:{key}:0".encode())
              for key, label in SUPPORT_CATEGORY_BUTTONS.items()][2:],
         ]
+        identities = await self.db.identities_for(int(row["user_id"]) for row in rows)
         for row in rows:
+            identity = identities.get(int(row["user_id"]), {})
+            owner = self._identity_line(
+                username=identity.get("username"), telegram_id=row["user_id"],
+                display_name=self._user_display_name(identity.get("first_name", ""), identity.get("last_name", "")),
+            )
+            text += f"\n• {row['public_ticket_id']} · {owner}"
             buttons.append([Button.inline(
                 f"{row['public_ticket_id']} · {self._support_category_label(row['category'])} · "
                 f"{self._support_status_label(row['status'])}",
@@ -7468,9 +7734,10 @@ class GamasBot:
         messages = await self.db.ticket_messages(
             ticket_id, limit=self.SUPPORT_HISTORY_PAGE, offset=offset,
         )
+        owner = await self._identity_for_id(int(ticket["user_id"]))
         head = (
             f"🎫 درخواست {ticket['public_ticket_id']}\n"
-            f"کاربر: {ticket['user_id']}\n"
+            f"کاربر: {owner}\n"
             f"دسته: {self._support_category_label(ticket['category'])}\n"
             f"وضعیت: {self._support_status_label(ticket['status'])}\n"
             f"موضوع: {ticket['subject']}\n"

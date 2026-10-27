@@ -69,10 +69,13 @@ SOURCE_TYPE_LABELS_FA = {"pdf": "PDF", "docx": "Word", "pptx": "PowerPoint"}
 #: A page holding fewer than this many characters is treated as image-only when
 #: the *whole* document is text-poor (see :func:`looks_scanned`).
 SCANNED_CHARS_PER_PAGE = 10
-SCANNED_MIN_CHARS = 100
 
 #: Preview length shown in the confirmation message after extraction.
 PREVIEW_CHARS = 300
+
+#: Office files are ZIP containers. Bound expansion before python-docx/pptx
+#: opens them, independently of the 50 MB compressed-upload limit.
+OFFICE_UNPACKED_MAX_BYTES = 200 * 1024 * 1024
 
 
 class DocExtractError(RuntimeError):
@@ -90,6 +93,7 @@ class DocSection:
     locator: str
     heading: str
     text: str
+    heading_level: int | None = None
 
     def render(self) -> str:
         heading = self.heading.strip()
@@ -171,12 +175,11 @@ def sha256_file(path: Path) -> str:
 def looks_scanned(sections: Iterable[DocSection], page_count: int) -> bool:
     """True when the text layer is too thin to be real content.
 
-    The rule is a floor of 100 characters *and* a rate of ten characters per
-    page: a slide deck with one short title per slide is legitimate, while a
-    30-page scan yields a handful of stamps and nothing else.
+    The threshold is roughly 100 characters per ten pages. A genuinely short
+    one-page document is therefore not incorrectly classified as a scan.
     """
     total = sum(len(section.text.strip()) for section in sections)
-    threshold = max(SCANNED_MIN_CHARS, int(page_count) * SCANNED_CHARS_PER_PAGE)
+    threshold = max(1, int(page_count)) * SCANNED_CHARS_PER_PAGE
     return total < threshold
 
 
@@ -219,7 +222,34 @@ def _pdf_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
     return tuple(sections), len(pages)
 
 
+def _check_office_package(path: Path) -> None:
+    """Reject malformed or excessively expanded OOXML before parsing it."""
+    import zipfile
+
+    from . import presentations
+
+    try:
+        if not zipfile.is_zipfile(path):
+            raise DocExtractError(
+                "فایل Office معتبر نیست؛ اگر قالب قدیمی است آن را به docx یا pptx تبدیل کنید."
+            )
+        presentations._preflight_zip_directory(path)
+        with zipfile.ZipFile(path) as archive:
+            total = 0
+            for info in archive.infolist():
+                if info.flag_bits & 1 or info.file_size < 0:
+                    raise DocExtractError("فایل Office رمزدار یا آسیب‌دیده است.")
+                total += info.file_size
+                if total > OFFICE_UNPACKED_MAX_BYTES:
+                    raise DocExtractError("حجم بازشدهٔ فایل Office بیش از حد مجاز است.")
+    except DocExtractError:
+        raise
+    except Exception as exc:
+        raise DocExtractError("ساختار فایل Office قابل‌خواندن نیست.") from exc
+
+
 def _docx_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
+    _check_office_package(path)
     try:
         import docx
     except ImportError as exc:  # pragma: no cover - declared dependency
@@ -234,26 +264,53 @@ def _docx_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
 
     sections: list[DocSection] = []
     heading = ""
+    heading_level: int | None = None
     buffer: list[str] = []
 
     def flush() -> None:
         nonlocal buffer
         block = _clean_block("\n".join(buffer))
-        if block:
+        if block or heading:
             number = len(sections) + 1
             locator = (
                 f"بخش «{heading[:60]}»" if heading else f"بخش {to_persian_digits(number)}"
             )
-            sections.append(DocSection(locator, heading, block))
+            sections.append(DocSection(locator, heading, block, heading_level))
         buffer = []
 
-    for paragraph in getattr(document, "paragraphs", []):
-        text = _clean_block(getattr(paragraph, "text", "") or "")
+    # document.paragraphs alone omits tables, which can hold an entire handout.
+    # Iterate body blocks in order so table content retains its heading locator.
+    from docx.oxml.table import CT_Tbl
+    from docx.oxml.text.paragraph import CT_P
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    for block in document.element.body.iterchildren():
+        if isinstance(block, CT_Tbl):
+            table = Table(block, document)
+            for row in table.rows:
+                seen_cells: set[object] = set()
+                cells: list[str] = []
+                for cell in row.cells:
+                    if cell._tc in seen_cells:  # merged cells appear repeatedly
+                        continue
+                    seen_cells.add(cell._tc)
+                    text = _clean_block(cell.text)
+                    if text:
+                        cells.append(text)
+                if cells:
+                    buffer.append(" | ".join(cells))
+            continue
+        if not isinstance(block, CT_P):
+            continue
+        paragraph = Paragraph(block, document)
+        text = _clean_block(paragraph.text or "")
         if not text:
             continue
         if _is_heading(paragraph):
             flush()
             heading = text
+            heading_level = _heading_level(paragraph)
             continue
         buffer.append(text)
     flush()
@@ -276,6 +333,17 @@ def _is_heading(paragraph) -> bool:
     if not name:
         return False
     return name.startswith(("heading", "title", "subtitle", "عنوان", "سرعنوان"))
+
+
+def _heading_level(paragraph) -> int | None:
+    """Preserve the Word heading level where the style supplies one."""
+    import re
+
+    name = str(getattr(getattr(paragraph, "style", None), "name", "") or "")
+    match = re.search(r"([1-9])\s*$", name)
+    if match:
+        return int(match.group(1))
+    return 1 if _is_heading(paragraph) else None
 
 
 def sections_from_slides(
@@ -304,7 +372,7 @@ def sections_from_slides(
             DocSection(
                 f"اسلاید {to_persian_digits(getattr(slide, 'number', len(sections) + 1))}",
                 title,
-                body[:max_chars],
+                body,
             )
         )
     return tuple(sections)
@@ -322,8 +390,10 @@ def _pptx_sections(path: Path, *, max_chars: int) -> tuple[tuple[DocSection, ...
             "این فایل یک ارائهٔ معتبر PowerPoint نیست یا آسیب دیده است."
         )
     try:
-        presentations._preflight_zip_directory(path)
+        _check_office_package(path)
         slides = presentations._extract_slide_text(path)
+    except DocExtractError:
+        raise
     except Exception as exc:
         raise DocExtractError("خواندن متن اسلایدهای این ارائه ناموفق بود.") from exc
     sections = list(sections_from_slides(slides, max_chars=max_chars))
@@ -352,13 +422,9 @@ def extract_document(
         sections, page_count = _pptx_sections(path, max_chars=max_chars)
     else:  # pragma: no cover - guarded by classify_document
         raise DocExtractError("این نوع سند پشتیبانی نمی‌شود.")
-    # Hard-trim every section so a pathological single page cannot exceed the
-    # provider budget; chunking below cuts on paragraph boundaries anyway.
-    bounded = tuple(
-        DocSection(section.locator, section.heading, section.text[:max_chars])
-        for section in sections
-    )
-    return ExtractedDoc(source_type, page_count, bounded)
+    # Preserve the complete extraction.  The chunker, not the extractor, bounds
+    # model inputs, so a long page or slide cannot silently lose its tail.
+    return ExtractedDoc(source_type, page_count, sections)
 
 
 def _clean_block(text: str) -> str:
@@ -402,7 +468,9 @@ def chunk_sections(
     resulting pieces share the same locator ("صفحهٔ ۴ (۱/۲)"), so an item built
     from any piece still cites the right page.
     """
-    budget = max(500, int(max_chars))
+    budget = int(max_chars)
+    if budget < 64:
+        raise ValueError("chunk budget must be at least 64 characters")
     chunks: list[DocChunk] = []
     buffer: list[str] = []
     sources: list[str] = []
@@ -410,41 +478,40 @@ def chunk_sections(
 
     def flush() -> None:
         nonlocal buffer, sources, size
-        text = "\n\n".join(part for part in buffer if part).strip()
+        text = "\n\n".join(buffer)
         if text:
-            chunks.append(
-                DocChunk(
-                    index=len(chunks),
-                    locator=_chunk_locator(tuple(sources)),
-                    sources=tuple(dict.fromkeys(sources)),
-                    text=text,
-                )
-            )
-        buffer = []
-        sources = []
-        size = 0
+            chunks.append(DocChunk(
+                index=len(chunks),
+                locator=_chunk_locator(tuple(sources)),
+                sources=tuple(dict.fromkeys(sources)),
+                text=text,
+            ))
+        buffer, sources, size = [], [], 0
 
     for section in sections:
         rendered = section.render().strip()
         if not rendered:
             continue
-        pieces = _split_paragraphs(rendered, budget)
+        # Each section is explicitly labelled *inside* the text the model sees.
+        # Reserve room for its locator, part numbering and separator; otherwise
+        # long headings could make an ostensibly bounded chunk exceed the limit.
+        base_locator = " ".join(section.locator.split())[:min(100, budget // 3)] or "سند"
+        overhead = len(base_locator) + 32
+        pieces = _split_paragraphs(rendered, budget - overhead)
         for piece_index, piece in enumerate(pieces, start=1):
-            locator = section.locator
+            locator = base_locator
             if len(pieces) > 1:
                 locator = f"{locator} ({to_persian_digits(piece_index)}/{to_persian_digits(len(pieces))})"
-            piece_len = len(piece)
-            entry = f"{locator}\n{piece}" if section.heading.strip() else piece
-            if size and size + piece_len + 2 > budget:
+            entry = f"[{locator}]\n{piece}"
+            if len(entry) > budget:
+                raise ValueError("section locator exceeds the chunk budget")
+            separator = 2 if buffer else 0
+            if size + separator + len(entry) > budget:
                 flush()
-            if piece_len > budget:
-                # A single paragraph longer than the budget is hard-trimmed; the
-                # locator still points at the right place.
-                entry = f"{locator}\n{piece[:budget]}"
-                piece_len = budget
+                separator = 0
             buffer.append(entry)
             sources.append(locator)
-            size += piece_len + 2
+            size += separator + len(entry)
     flush()
     return chunks
 
@@ -453,12 +520,13 @@ def chunk_text(
     text: str, *, max_chars: int = MAX_MODEL_INPUT_CHARS, label: str = "بخش"
 ) -> list[DocChunk]:
     """Chunk a flat text (a booklet without page numbers) into labelled parts."""
-    paragraphs = _split_paragraphs(str(text or ""), max(500, int(max_chars)))
-    sections = [
-        DocSection(f"{label} {to_persian_digits(index)}", "", piece)
-        for index, piece in enumerate(paragraphs, start=1)
-    ]
-    return chunk_sections(sections, max_chars=max_chars)
+    content = str(text or "").strip()
+    if not content:
+        return []
+    return chunk_sections(
+        [DocSection(f"{label} {to_persian_digits(1)}", "", content)],
+        max_chars=max_chars,
+    )
 
 
 def _chunk_locator(sources: tuple[str, ...]) -> str:
@@ -518,16 +586,14 @@ def chunks_from_json(payload: str | None, *, max_chars: int = MAX_MODEL_INPUT_CH
             if not text:
                 continue
             sources = entry.get("sources")
-            chunks.append(
-                DocChunk(
-                    index=len(chunks),
-                    locator=str(entry.get("locator") or "سند")[:200],
-                    sources=tuple(
-                        str(item)[:200] for item in sources
-                    )
-                    if isinstance(sources, list)
-                    else (),
-                    text=text[:max_chars],
-                )
-            )
+            locator = str(entry.get("locator") or "سند")[:120]
+            source_list = tuple(str(item)[:120] for item in sources) if isinstance(sources, list) else ()
+            if len(text) > max_chars:
+                # Old caches may be oversized. Split them; never silently lose
+                # their tail or send an over-context request to a provider.
+                repaired = chunk_sections([DocSection(locator, "", text)], max_chars=max_chars)
+                for part in repaired:
+                    chunks.append(DocChunk(len(chunks), part.locator, part.sources, part.text))
+            else:
+                chunks.append(DocChunk(len(chunks), locator, source_list or (locator,), text))
     return chunks

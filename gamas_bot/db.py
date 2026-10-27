@@ -202,6 +202,13 @@ class Database:
         await self._db.execute("PRAGMA busy_timeout=5000")
         await self._apply_migrations()
         await self._db.commit()
+        await self._db.execute("PRAGMA foreign_keys=ON")
+        problems = await self.user_reference_integrity()
+        if problems:
+            # Some old databases predate a plan catalog and sync_plans runs
+            # immediately after connect. Report legacy inconsistencies without
+            # blocking that repair; deployment/CI can run the strict assertion.
+            logger.warning("SQLite reference integrity: %s", "; ".join(problems[:20]))
         await self._backfill_allocations()
         if str(self.path) != ":memory:":
             self._read_db = await aiosqlite.connect(self.path)
@@ -409,7 +416,10 @@ class Database:
         A double ``/start`` therefore hits the primary key instead of creating a
         second row, and a username change overwrites the previous value.
         """
-        telegram_id = int(telegram_id)
+        if isinstance(telegram_id, bool) or not isinstance(telegram_id, int):
+            raise TypeError("Telegram user IDs must be exact integers")
+        if not -(1 << 63) <= telegram_id < (1 << 63):
+            raise ValueError("Telegram user ID is outside SQLite's int64 range")
         now = iso(utc_now())
         await self._write(
             "INSERT OR IGNORE INTO users(telegram_id, joined_at, last_seen_at) "
@@ -455,10 +465,8 @@ class Database:
         sets = ["last_seen_at = ?"]
         params: list[Any] = [iso(utc_now())]
         if first_name is not None:
-            bounded = " ".join(str(first_name).split())[:64]
-            if bounded:
-                sets.append("first_name = ?")
-                params.append(bounded)
+            sets.append("first_name = ?")
+            params.append(" ".join(str(first_name).split())[:64])
         if last_name is not None:
             sets.append("last_name = ?")
             params.append(" ".join(str(last_name).split())[:64])
@@ -518,6 +526,7 @@ class Database:
             "SELECT u.telegram_id, u.joined_at, u.banned, u.is_unlimited, "
             "COALESCE(u.username, '') AS username, "
             "COALESCE(u.first_name, '') AS first_name, "
+            "COALESCE(u.last_name, '') AS last_name, "
             "COALESCE(("
             "  SELECT SUM(MAX(0, l.seconds "
             "    - COALESCE((SELECT SUM(a.seconds) FROM debit_allocations a "
@@ -543,6 +552,7 @@ class Database:
                 "is_unlimited": bool(row[3]),
                 "username": str(row["username"] or ""),
                 "first_name": str(row["first_name"] or ""),
+                "last_name": str(row["last_name"] or ""),
                 "available_seconds": int(row["available_seconds"] or 0),
             }
             for row in rows
@@ -565,11 +575,17 @@ class Database:
             "COALESCE(u.last_name, '') AS last_name, "
             "u.last_seen_at"
         )
-        if token.isdigit():
+        if token.lstrip("+-").isdigit():
+            try:
+                numeric_id = int(token)
+            except ValueError:
+                return []
+            if not -(1 << 63) <= numeric_id < (1 << 63):
+                return []
             rows = await _rows(
                 self.read_db,
                 f"SELECT {columns} FROM users u WHERE u.telegram_id = ?",
-                (int(token),),
+                (numeric_id,),
             )
         else:
             rows = await _rows(
@@ -593,14 +609,14 @@ class Database:
             for row in rows
         ]
 
-    async def blocked_users(self, limit: int = 50) -> list[dict[str, Any]]:
+    async def blocked_users(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         """Users currently blocked from the bot, newest identity first."""
         rows = await _rows(
             self.read_db,
             "SELECT telegram_id, COALESCE(username, ''), COALESCE(first_name, ''), "
             "COALESCE(last_name, ''), banned, last_seen_at FROM users "
-            "WHERE banned = 1 ORDER BY last_seen_at DESC, telegram_id DESC LIMIT ?",
-            (int(limit),),
+            "WHERE banned = 1 ORDER BY last_seen_at DESC, telegram_id DESC LIMIT ? OFFSET ?",
+            (int(limit), int(offset)),
         )
         return [
             {
@@ -619,6 +635,7 @@ class Database:
         "deck": "free_deck_used",
         "quiz": "free_quiz_used",
     }
+    FREE_CLAIM_COLUMNS: dict[str, str] = {"deck": "deck_claim", "quiz": "quiz_claim"}
 
     def _free_use_column(self, kind: str) -> str:
         column = self.FREE_USE_COLUMNS.get(str(kind))
@@ -637,15 +654,18 @@ class Database:
             return {"deck": True, "quiz": True}
         return {"deck": not int(rows[0][0]), "quiz": not int(rows[0][1])}
 
-    async def consume_free_use(self, user_id: int, kind: str) -> bool:
-        """Atomically claim one free first try; ``False`` when already used.
+    async def consume_free_use(
+        self, user_id: int, kind: str, *, claim_id: str | None = None
+    ) -> bool:
+        """Claim with one conditional UPDATE, optionally marking it in-flight.
 
-        The claim is a single ``UPDATE ... WHERE free_x_used = 0`` whose rowcount
-        decides the winner, so two concurrent generations can never both take
-        the same gift (the loser sees ``False`` and falls through to the normal
-        credit path). Runs before any model call, never after.
+        A unique claim token lets a failure refund only *its own* attempt.  This
+        matters if an admin resets the gift while an older generation runs.
+        Calls without a token represent an already-finalized use, preserving the
+        original API for administrative callers and existing databases.
         """
         column = self._free_use_column(kind)
+        claim_column = self.FREE_CLAIM_COLUMNS[kind]
         now = iso(utc_now())
         async with self._transaction():
             await self.db.execute(
@@ -654,23 +674,61 @@ class Database:
                 (int(user_id), now),
             )
             cursor = await self.db.execute(
-                f"UPDATE free_uses SET {column} = 1, updated_at = ? "
+                f"UPDATE free_uses SET {column} = 1, {claim_column} = ?, updated_at = ? "
                 f"WHERE user_id = ? AND {column} = 0",
-                (now, int(user_id)),
-            )
-            claimed = cursor.rowcount == 1
-        return claimed
-
-    async def refund_free_use(self, user_id: int, kind: str) -> bool:
-        """Give a claimed free try back after a provider/system fault."""
-        column = self._free_use_column(kind)
-        async with self._transaction():
-            cursor = await self.db.execute(
-                f"UPDATE free_uses SET {column} = 0, updated_at = ? "
-                f"WHERE user_id = ? AND {column} = 1",
-                (iso(utc_now()), int(user_id)),
+                (claim_id, now, int(user_id)),
             )
             return cursor.rowcount == 1
+
+    async def refund_free_use(
+        self, user_id: int, kind: str, *, claim_id: str | None = None
+    ) -> bool:
+        """Restore only the matching claim, never a newer post-reset attempt."""
+        column = self._free_use_column(kind)
+        claim_column = self.FREE_CLAIM_COLUMNS[kind]
+        async with self._transaction():
+            cursor = await self.db.execute(
+                f"UPDATE free_uses SET {column} = 0, {claim_column} = NULL, updated_at = ? "
+                f"WHERE user_id = ? AND {column} = 1 AND {claim_column} IS ?",
+                (iso(utc_now()), int(user_id), claim_id),
+            )
+            return cursor.rowcount == 1
+
+    async def _finalize_free_use_locked(
+        self, user_id: int, kind: str, claim_id: str | None
+    ) -> None:
+        """Finalize a matching claim inside the artifact's write transaction.
+
+        A reset may have invalidated this token; in that case the newly granted
+        free use remains available instead of being consumed by an older job.
+        """
+        if claim_id is None:
+            return
+        column = self._free_use_column(kind)
+        claim_column = self.FREE_CLAIM_COLUMNS[kind]
+        await self.db.execute(
+            f"UPDATE free_uses SET {claim_column} = NULL, updated_at = ? "
+            f"WHERE user_id = ? AND {column} = 1 AND {claim_column} = ?",
+            (iso(utc_now()), int(user_id), claim_id),
+        )
+
+    async def recover_pending_free_uses(self) -> int:
+        """Restore unfinished claims at bot startup, after its instance lock.
+
+        Saved artifacts and claim finalization share a transaction, so a claim
+        still carrying a token after a crash cannot be a completed generation.
+        """
+        recovered = 0
+        async with self._transaction():
+            for kind, column in self.FREE_USE_COLUMNS.items():
+                claim_column = self.FREE_CLAIM_COLUMNS[kind]
+                cursor = await self.db.execute(
+                    f"UPDATE free_uses SET {column} = 0, {claim_column} = NULL, "
+                    f"updated_at = ? WHERE {claim_column} IS NOT NULL",
+                    (iso(utc_now()),),
+                )
+                recovered += max(0, cursor.rowcount)
+        return recovered
 
     async def reset_free_uses(
         self, user_id: int, *, admin_id: int, detail: str = "free gift reset"
@@ -685,7 +743,7 @@ class Database:
             )
             await self.db.execute(
                 "UPDATE free_uses SET free_deck_used = 0, free_quiz_used = 0, "
-                "updated_at = ? WHERE user_id = ?",
+                "deck_claim = NULL, quiz_claim = NULL, updated_at = ? WHERE user_id = ?",
                 (now, int(user_id)),
             )
             await self.db.execute(
@@ -1098,8 +1156,10 @@ class Database:
         user_id: int,
         item_id: int,
         questions: list[dict[str, Any]],
+        *,
+        free_claim_id: str | None = None,
     ) -> int:
-        """Insert a session and all its questions atomically."""
+        """Insert the questions and finalize their free claim atomically."""
         if not questions:
             raise ValueError("quiz session needs at least one question")
         now = iso(utc_now())
@@ -1114,8 +1174,8 @@ class Database:
             for idx, question in enumerate(questions):
                 await self.db.execute(
                     "INSERT INTO quiz_questions(session_id, idx, question, "
-                    "options_json, correct_index, explanation, source) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "options_json, correct_index, explanation, source, difficulty) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         session_id,
                         idx,
@@ -1124,8 +1184,10 @@ class Database:
                         int(question["correct_index"]),
                         str(question.get("explanation", "")),
                         str(question.get("source", ""))[:120],
+                        str(question.get("difficulty", ""))[:20],
                     ),
                 )
+            await self._finalize_free_use_locked(user_id, "quiz", free_claim_id)
             return session_id
 
     async def quiz_get_session(
@@ -1146,7 +1208,7 @@ class Database:
         rows = await _rows(
             self.read_db,
             "SELECT q.question_id, q.idx, q.question, q.options_json, "
-            "q.correct_index, q.explanation, q.source, s.current_index, s.question_count "
+            "q.correct_index, q.explanation, q.source, q.difficulty, s.current_index, s.question_count "
             "FROM quiz_questions q JOIN quiz_sessions s ON s.session_id = q.session_id "
             "WHERE q.session_id = ? AND s.status = 'active' "
             "AND q.idx = s.current_index",
@@ -1454,6 +1516,15 @@ class Database:
         )
         return dict(rows[0]) if rows else None
 
+    async def document_by_library_item(self, user_id: int, item_id: int) -> dict[str, Any] | None:
+        """Resolve a mirror to its full, locator-preserving cached document."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT id FROM documents WHERE user_id = ? AND library_item_id = ? LIMIT 1",
+            (int(user_id), int(item_id)),
+        )
+        return dict(rows[0]) if rows else None
+
     async def documents_list(
         self, user_id: int, limit: int = 6, offset: int = 0
     ) -> list[dict[str, Any]]:
@@ -1475,6 +1546,58 @@ class Database:
             "UPDATE documents SET library_item_id = ? WHERE id = ?",
             (int(library_item_id), int(document_id)),
         )
+
+    async def document_update_reference(self, user_id: int, document_id: int, ref: str) -> None:
+        """Use the latest upload after deduplication, including its library mirror."""
+        if not ref:
+            return
+        try:
+            chat_id, message_id = (int(part) for part in ref.split(":", 1))
+        except (ValueError, TypeError):
+            return
+        async with self._transaction():
+            await self.db.execute(
+                "UPDATE documents SET file_msg_ref = ? WHERE id = ? AND user_id = ?",
+                (ref[:200], int(document_id), int(user_id)),
+            )
+            await self.db.execute(
+                "UPDATE library_items SET chat_id = ?, message_id = ?, unavailable = 0 "
+                "WHERE item_id = (SELECT library_item_id FROM documents "
+                "WHERE id = ? AND user_id = ?)",
+                (chat_id, message_id, int(document_id), int(user_id)),
+            )
+
+    async def document_ensure_library_item(
+        self, user_id: int, document_id: int, content_text: str
+    ) -> int:
+        """Create exactly one owner-scoped library mirror, even on concurrent uploads."""
+        async with self._transaction():
+            rows = await _rows(
+                self.db,
+                "SELECT library_item_id, file_msg_ref, title FROM documents "
+                "WHERE id = ? AND user_id = ?",
+                (int(document_id), int(user_id)),
+            )
+            if not rows:
+                raise ValueError("document not found")
+            if rows[0][0] is not None:
+                return int(rows[0][0])
+            try:
+                chat_id, message_id = (int(part) for part in str(rows[0][1]).split(":", 1))
+            except (ValueError, TypeError):
+                chat_id, message_id = 0, 0
+            cursor = await self.db.execute(
+                "INSERT INTO library_items(user_id, kind, chat_id, message_id, title, "
+                "created_at, content_text) VALUES (?, 'booklet', ?, ?, ?, ?, ?)",
+                (int(user_id), chat_id, message_id, f"📄 {str(rows[0][2])[:120]}",
+                 iso(utc_now()), content_text),
+            )
+            item_id = int(cursor.lastrowid or 0)
+            await self.db.execute(
+                "UPDATE documents SET library_item_id = ? WHERE id = ? AND user_id = ?",
+                (item_id, int(document_id), int(user_id)),
+            )
+            return item_id
 
     async def document_count(self, user_id: int) -> int:
         rows = await _rows(
@@ -1498,37 +1621,63 @@ class Database:
         ("flashcard_decks", "user_id"),
         ("free_uses", "user_id"),
         ("documents", "user_id"),
-        ("audit", "subject_user"),
+        ("support_tickets", "user_id"),
+    )
+    # Learning and lot-allocation children reach users through their parent.
+    REFERENCE_LINKS: tuple[tuple[str, str, str, str], ...] = (
+        ("quiz_sessions", "item_id", "library_items", "item_id"),
+        ("quiz_questions", "session_id", "quiz_sessions", "session_id"),
+        ("quiz_answers", "session_id", "quiz_sessions", "session_id"),
+        ("quiz_answers", "question_id", "quiz_questions", "question_id"),
+        ("flashcard_decks", "item_id", "library_items", "item_id"),
+        ("flashcards", "deck_id", "flashcard_decks", "deck_id"),
+        ("debit_allocations", "debit_id", "ledger", "id"),
+        ("debit_allocations", "credit_id", "ledger", "id"),
+        ("hold_allocations", "submission_id", "holds", "submission_id"),
+        ("hold_allocations", "credit_id", "ledger", "id"),
+        ("holds", "submission_id", "submissions", "submission_id"),
+        ("ledger", "payment_id", "payments", "payment_id"),
+        ("documents", "library_item_id", "library_items", "item_id"),
     )
 
     async def user_reference_integrity(self) -> list[str]:
-        """Return human-readable violations of the ``users`` references.
-
-        Runs ``PRAGMA foreign_key_check`` (which validates every declared
-        foreign key) plus an explicit orphan scan of each user-referencing
-        column, and asserts ``telegram_id`` is stored with INTEGER affinity —
-        the three properties requirement R2.3 asks to be *provable*.
-        """
+        """Check declarations *and* rows, including indirect learning/billing links."""
         problems: list[str] = []
-        fk_rows = await _rows(self.read_db, "PRAGMA foreign_key_check")
-        for row in fk_rows:
-            problems.append(
-                f"foreign_key_check: table={row[0]} rowid={row[1]} parent={row[2]}"
-            )
-        for table, column in self.USER_REFERENCE_COLUMNS:
-            try:
-                orphans = await _rows(
-                    self.read_db,
-                    f"SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL "
-                    f"AND {column} NOT IN (SELECT telegram_id FROM users)",
+        try:
+            fk_rows = await _rows(self.read_db, "PRAGMA foreign_key_check")
+            for row in fk_rows:
+                problems.append(
+                    f"foreign_key_check: table={row[0]} rowid={row[1]} parent={row[2]}"
                 )
-            except sqlite3.Error:
-                # A deployment that has not created the table yet is not a
-                # violation of the invariant; it simply has nothing to check.
+        except sqlite3.Error as exc:
+            problems.append(f"foreign_key_check failed: {exc}")
+        links = [
+            (table, column, "users", "telegram_id")
+            for table, column in self.USER_REFERENCE_COLUMNS
+        ] + list(self.REFERENCE_LINKS)
+        for table, column, parent, parent_column in links:
+            info = await _rows(self.read_db, f"PRAGMA table_info({table})")
+            declared = {str(row[1]): str(row[2]).upper() for row in info}
+            if declared.get(column) != "INTEGER":
+                problems.append(f"missing INTEGER column: {table}.{column}")
                 continue
+            fks = await _rows(self.read_db, f"PRAGMA foreign_key_list({table})")
+            if not any(
+                row[2] == parent and row[3] == column and row[4] == parent_column
+                for row in fks
+            ):
+                problems.append(f"missing foreign key: {table}.{column} -> {parent}.{parent_column}")
+            orphans = await _rows(
+                self.read_db,
+                f"SELECT COUNT(*) FROM {table} WHERE {column} IS NOT NULL "
+                f"AND {column} NOT IN (SELECT {parent_column} FROM {parent})",
+            )
             count = int(orphans[0][0]) if orphans else 0
             if count:
                 problems.append(f"orphan rows: {table}.{column} = {count}")
+        info = await _rows(self.read_db, "PRAGMA table_info(users)")
+        if not any(row[1] == "telegram_id" and str(row[2]).upper() == "INTEGER" and row[5] for row in info):
+            problems.append("users.telegram_id is not an INTEGER primary key")
         affinity = await _rows(
             self.read_db,
             "SELECT COUNT(*) FROM users WHERE typeof(telegram_id) != 'integer'",
@@ -1536,6 +1685,12 @@ class Database:
         if affinity and int(affinity[0][0]):
             problems.append(f"users.telegram_id not stored as INTEGER: {affinity[0][0]}")
         return problems
+
+    async def assert_user_reference_integrity(self) -> None:
+        """Strict deployment/CI check of every user and learning/billing link."""
+        problems = await self.user_reference_integrity()
+        if problems:
+            raise RuntimeError("SQLite reference integrity failed: " + "; ".join(problems))
 
     # ----------------------------------------------------- learning: flashcards
     async def deck_count(self, user_id: int) -> int:
@@ -1569,8 +1724,10 @@ class Database:
         item_id: int,
         title: str,
         cards: list[dict[str, str]],
+        *,
+        free_claim_id: str | None = None,
     ) -> int:
-        """An AI deck and every card it contains, inserted atomically."""
+        """Insert an AI deck, its cards and its finalized claim atomically."""
         if not cards:
             raise ValueError("a deck needs at least one card")
         now = iso(utc_now())
@@ -1593,6 +1750,7 @@ class Database:
                         str(card.get("source", ""))[:120],
                     ),
                 )
+            await self._finalize_free_use_locked(user_id, "deck", free_claim_id)
             return deck_id
 
     async def manual_deck_get_or_create(self, user_id: int) -> int:
@@ -2650,12 +2808,12 @@ class Database:
             (admin_id, action, detail[:400], subject_user, iso(utc_now())),
         )
 
-    async def recent_audit(self, limit: int = 30) -> list[dict[str, Any]]:
+    async def recent_audit(self, limit: int = 30, offset: int = 0) -> list[dict[str, Any]]:
         async with self._write_lock:
             rows = await _rows(self.db,
                 "SELECT admin_id, action, detail, subject_user, created_at FROM audit "
-                "ORDER BY id DESC LIMIT ?",
-                (limit,),
+                "ORDER BY id DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             )
             return [dict(row) for row in rows]
 

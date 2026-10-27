@@ -1123,8 +1123,8 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(text.startswith(
             "منوی اصلی\n\n"
-            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 پاورپوینت.\n"
-            "متن گفتار می‌آید؛ ساخت جزوهٔ ورد فعلاً فعال نیست."
+            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت.\n"
+            "متن گفتار و سند ذخیره می‌شود؛ ساخت محتوای هوشمند فعلاً فعال نیست."
         ))
         self.assertIn("💳 اعتبار باقی‌مانده", text)
 
@@ -1135,9 +1135,10 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
         expected = (
             "ℹ️ راهنمای گاماس\n\n"
-            "🎧 فایل صوت/ویدیو یا 📄 پاورپوینت درس را همین‌جا بفرستید.\n"
-            "📄 متن گفتار و جزوهٔ ورد می‌آید و در «📚 کتابخانه من» ذخیره می‌شود.\n"
-            "🧪 آزمون و 🃏 فلش‌کارت از همان جزوه ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
+            "🎧 فایل صوت/ویدیو یا 📄 سند PDF، Word و پاورپوینت را همین‌جا بفرستید.\n"
+            "📚 متن اسناد در کتابخانه ذخیره می‌شود؛ برای ارائه، پردازش صدا نیز انتخاب‌پذیر است.\n"
+            "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
+            "🎁 نخستین مجموعهٔ فلش‌کارت و نخستین آزمون جداگانه رایگان‌اند.\n"
             "🛒 خرید اشتراک: بسته‌ها و موجودی. 🎧 پشتیبانی: تیکت بزنید.\n\n"
             "💳 اعتبار بر حسب ثانیه است و پس از ارسال متن خام محاسبه می‌شود.\n"
             "اگر متن خام نرسد، اعتباری کم نمی‌شود.\n"
@@ -1158,7 +1159,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn("ساخت جزوهٔ ورد فعلاً فعال نیست.", text)
+        self.assertIn("ساخت محتوای هوشمند فعلاً فعال نیست.", text)
         self.assertNotIn("متن گفتار و سپس جزوهٔ ورد", text)
 
     async def test_admin_guides_explain_user_actions_and_empty_states(self):
@@ -1616,7 +1617,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(start)
         self.assertTrue(start.replies[0].startswith(
             "🎓 به گاماس خوش آمدید\n\n"
-            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 پاورپوینت."
+            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت."
         ))
         start_payloads = menu_payloads(start.client.texts[0].get("buttons"))
         self.assertEqual(
@@ -1636,7 +1637,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(event)
         self.assertEqual(
             event.replies[0],
-            "همین‌جا فایل 🎧 صوت/ویدیو یا 📄 پاورپوینت درس را بفرستید؛ متن و جزوه می‌آید.",
+            "همین‌جا فایل 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت درس را بفرستید.",
         )
         self.assertEqual(
             menu_payloads(self.bot._user_menu()),

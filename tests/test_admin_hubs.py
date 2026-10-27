@@ -256,5 +256,100 @@ class AdminHubTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("مدیران", event.answers[-1][0])
 
 
+    async def test_legacy_report_callbacks_alias_hub_views(self):
+        for legacy, current in (
+            (b"adm:ovu:7d", b"adm:hub:usr:stats:7d"),
+            (b"adm:ovp:7d", b"adm:hub:sys:proc:7d"),
+            (b"adm:ovpay:7d", b"adm:hub:pay:stats:7d"),
+        ):
+            old_event, new_event = self.press(legacy), self.press(current)
+            await self.bot._handle_callback(old_event)
+            await self.bot._handle_callback(new_event)
+            self.assertEqual(old_event.edits[-1]["text"], new_event.edits[-1]["text"])
+            forbidden = self.press(legacy, user_id=USER_ID)
+            await self.bot._handle_callback(forbidden)
+            self.assertFalse(forbidden.edits)
+            self.assertTrue(forbidden.answers[-1][1])
+
+    async def test_payment_queue_history_and_detail_show_complete_identity(self):
+        await self.db.sync_plans(
+            [{"code": "paid_5h_30d", "hours": 5, "price": 50_000, "validity_days": 30}]
+        )
+        payment_id = await self.db.create_payment(USER_ID, "paid_5h_30d")
+        await self.db.set_payment_receipt(payment_id, "receipt.jpg", USER_ID)
+        for data in (b"adm:hub:pay", b"adm:hub:usr:pending", f"adm:pd:{payment_id}".encode(),
+                     f"payv:{payment_id}:a".encode()):
+            event = self.press(data)
+            await self.bot._handle_callback(event)
+            text = event.edits[-1]["text"]
+            for part in ("@student", str(USER_ID), "دانشجو رضایی"):
+                self.assertIn(part, text, data)
+        await self.bot._handle_callback(self.press(f"payv:{payment_id}:a:yes".encode()))
+        history = self.press(b"adm:hub:pay:hist")
+        await self.bot._handle_callback(history)
+        for part in ("@student", str(USER_ID), "دانشجو رضایی"):
+            self.assertIn(part, history.edits[-1]["text"])
+
+    async def test_support_and_audit_views_show_complete_identity(self):
+        ticket = await self.db.create_ticket(USER_ID, "payment", "پرسش دربارهٔ پرداخت")
+        await self.db.audit(ADMIN_ID, "user_banned", "آزمون", subject_user=USER_ID)
+        for data in (b"adm:sup", f"adm:sv:{ticket['id']}".encode(), b"adm:audit"):
+            event = self.press(data)
+            await self.bot._handle_callback(event)
+            text = event.edits[-1]["text"]
+            for part in ("@student", str(USER_ID), "دانشجو رضایی"):
+                self.assertIn(part, text, data)
+
+    async def test_an_admin_cannot_block_another_admin_from_the_hub(self):
+        from dataclasses import replace
+
+        peer = 12
+        self.bot.settings = replace(self.settings, admin_ids=frozenset({ADMIN_ID, peer}))
+        await self.db.ensure_user(peer, "مدیر دیگر")
+        event = self.press(f"adm:hub:usr:tg:{peer}".encode())
+        await self.bot._handle_callback(event)
+        self.assertFalse(await self.db.is_banned(peer))
+        self.assertTrue(event.answers[-1][1])
+
+    async def test_hub_rejection_preserves_ledger_and_reason(self):
+        await self.db.sync_plans(
+            [{"code": "paid_5h_30d", "hours": 5, "price": 50_000, "validity_days": 30}]
+        )
+        payment_id = await self.db.create_payment(USER_ID, "paid_5h_30d")
+        await self.db.set_payment_receipt(payment_id, "receipt.jpg", USER_ID)
+        await self.bot._handle_callback(self.press(f"adm:pd:{payment_id}".encode()))
+        await self.bot._handle_callback(self.press(f"payv:{payment_id}:r".encode()))
+        await self.bot._handle_callback(self.press(f"payv:{payment_id}:rp:blur".encode()))
+        payment = await self.db.payment(payment_id)
+        self.assertEqual(payment["status"], "rejected")
+        self.assertIn("ناخوانا", payment["review_reason"])
+        self.assertEqual(await self.db.available_seconds(USER_ID), 0)
+        self.assertEqual((await self.db.db.execute_fetchall("SELECT COUNT(*) FROM ledger"))[0][0], 0)
+
+
+    async def test_long_identity_lists_and_audit_are_paginated_under_telegram_limit(self):
+        await self.db.ensure_user(ADMIN_ID, "الف" * 64, username="b" * 64, last_name="ب" * 64)
+        for index in range(15):
+            user_id = 10_000 + index
+            await self.db.ensure_user(user_id, "ن" * 64, username="u" * 64, last_name="خ" * 64)
+            await self.db.set_banned(user_id, True)
+            await self.db.audit(ADMIN_ID, "user_banned", "test", subject_user=user_id)
+        for data, next_page in (
+            (b"adm:hub:usr:banned", b"adm:hub:usr:banned:1"),
+            (b"adm:audit", b"adm:audit:1"),
+        ):
+            first = self.press(data)
+            await self.bot._handle_callback(first)
+            self.assertLessEqual(len(first.edits[-1]["text"]), 4096)
+            self.assertIn(next_page, self.payloads(first))
+            second = self.press(next_page)
+            await self.bot._handle_callback(second)
+            self.assertLessEqual(len(second.edits[-1]["text"]), 4096)
+            self.assertIn("شناسه:", second.edits[-1]["text"])
+        hub = self.press(b"adm:hub:usr")
+        await self.bot._handle_callback(hub)
+        self.assertLessEqual(len(hub.edits[-1]["text"]), 4096)
+
+
 if __name__ == "__main__":
     unittest.main()

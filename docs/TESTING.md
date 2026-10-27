@@ -36,12 +36,48 @@ Run the test suite only on a development machine, never with production `.env` o
 
 | File | Covers |
 | --- | --- |
-| `tests/test_doc_extract.py` | PDF/Word/PowerPoint text extraction with page and slide locators, the scanned-PDF guard, encrypted PDFs, chunking (including a split page's `(۱/۲)` marker), SHA-256 dedupe, corrupt cache entries and the ~300-character preview |
-| `tests/test_document_ingestion.py` | Upload → extract → store → preview → generate for a real PDF and a real DOCX, oversized uploads, identical re-uploads, the photo-instead-of-file hint, the library «📄 اسناد» section, document cards, chunk failures and coverage reporting |
-| `tests/test_free_uses.py` | Atomic first-try claim, per-kind independence, refunds, the admin reset and its audit row, badges, the second deck/quiz hitting the paywall without a model call, refund on provider errors, curation delete-then-save, size presets and their prices |
-| `tests/test_admin_hubs.py` | The three hubs, their defaults, the deep views kept from the old panel, the legacy `adm:pay`/`adm:ovpay`/`adm:ovu`/`adm:ovp`/`adm:ovs` aliases, forged sub-pages, and the approve path |
-| `tests/test_migration_schema.py` | The CI migration gate run locally: every `migrations/v3/*.sql` file is applied, `schema_migrations` matches the directory, and the resulting tables equal `db.APPLICATION_TABLES` (so a new migration cannot silently drift from CI) |
-| `tests/test_user_identity.py` | Identity columns, `@username · شناسه · name` rendering, an int64 id (`770000000123456789`), no duplicates on double `/start`, username changes, foreign-key integrity of user references, and `@username` admin search |
+| `tests/test_doc_extract.py` | Real PDF/Word/PowerPoint extraction, Word tables and heading levels, malformed/encrypted/scanned/empty files, long sections, exact chunk budgets, locators and SHA-256 |
+| `tests/test_document_ingestion.py` | PDF/DOCX/PPTX upload → cached extraction → source-anchored generation; legacy PPT conversion and presentation queue; size boundary/stream gate, per-user and concurrent dedupe, ownership, retry, coverage and bounded concurrency |
+| `tests/test_free_uses.py` | Independent gifts, owned claim/reset races, failed/cancelled/undeliverable/expired previews, startup recovery, shutdown/save races, paid refunds, curation and paywall behavior |
+| `tests/test_admin_hubs.py` | Three hubs and legacy aliases, admin authorization, identity in payment/support/audit views, peer-admin protection, confirmation and approval/rejection ledger paths |
+| `tests/test_migration_schema.py` | Fresh migration gate plus populated 013 → 014 upgrade, legacy orphan repair, preserved child links, FK enforcement and interrupted migration replay |
+| `tests/test_user_identity.py` | Signed int64 boundaries, no float IDs, updated identity on duplicate `/start` and callbacks, username search/removal and strict user-reference integrity checks |
+| `tests/test_learning.py` | Source and difficulty validation, prompts, 10/5–20/10–40/20 presets, weighted coverage and normalized near-deduplication |
 
-Fixtures build real documents in memory (reportlab, `python-docx`, `python-pptx`), so extraction is
-exercised against the same libraries the bot uses at runtime — no binary fixtures are committed.
+Fixtures build real documents in memory (reportlab, `python-docx`, `python-pptx`); legacy PPT
+conversion also uses the curated fixtures documented in `tests/fixtures/README.md`. Provider calls
+are stubbed, so these tests do not verify live providers or the Telegram client UX.
+
+## آزمون دستی فارسی در محیط آزمایشی
+
+این مراحل را فقط با ربات، حساب‌ها و نسخهٔ پشتیبان پایگاه‌دادهٔ **آزمایشی** انجام دهید؛ برای
+آزمون پرداخت از رسید یا اطلاعات واقعی استفاده نکنید. نتایج آزمون خودکار جایگزین بررسی ظاهر
+تلگرام و کیفیت پاسخ سرویس واقعی نیست.
+
+1. با کاربری که اعتبارش صفر است `/start` بزنید؛ سپس با نام و نام‌کاربری تغییرکرده دوباره وارد
+   شوید. مدیر در «👥 کاربران» با شناسه و `@نام‌کاربری` جست‌وجو کند: فقط یک رکورد، نام کامل،
+   شناسهٔ عددی دقیق و آخرین زمان مشاهده باید دیده شود. نمایش بدون نام‌کاربری و چینش راست‌به‌چپ
+   و کپی شناسه را هم بررسی کنید.
+2. PDF متنی، DOCX دارای عنوان و جدول، و PPTX متنی بفرستید. پیش‌نمایش، شمارهٔ صفحه/بخش/اسلاید،
+   دکمه‌های ساخت و دریافت فایل و مدخل کتابخانه را ببینید. ارائهٔ دارای صدا را جداگانه با
+   «🎧 پردازش صدای ارائه» به صف قدیمی بفرستید. `.ppt` را در صورت امکان امتحان کنید؛ برای `.doc`
+   نامعتبر راهنمای تبدیل به `.docx` باید نمایش داده شود.
+3. PDF اسکن‌شده یا رمزدار، فایل خالی/خراب، عکس به‌جای فایل و سند بیش از `DOC_MAX_BYTES` را
+   امتحان کنید؛ پیام فارسی مناسب و عدم ایجاد سند خالی را بررسی کنید. یک فایل دقیقاً در سقف
+   مجاز باید پذیرفته شود. یک سند تکراری را دو بار و نیز با کاربر دوم بفرستید: اولی همان رکورد
+   و ارجاع تازه، دومی رکورد مستقل دارد.
+4. از سند موجود در کتابخانه، هر سه اندازهٔ ۱۰/۵، ۲۰/۱۰ و ۴۰/۲۰ را انتخاب کنید. پیشرفت، منبع
+   دقیق هر کارت/سؤال، گزینه‌ها، پاسخ و دشواری را بررسی کنید؛ موردی را حذف کنید، صفحات پیش‌نمایش
+   را ورق بزنید و سپس ذخیره کنید. اگر بخشی ناموفق یا بررسی‌نشده است، هشدار پوشش و تعداد واقعی
+   باید دیده شود؛ انصراف باید ممکن باشد.
+5. برای همان کاربر بدون اعتبار، یک مجموعه و یک آزمون مستقل را رایگان ذخیره کنید و پایان آزمون را
+   بزنید. تلاش دوم هر نوع باید به خرید اعتبار برسد. اگر کاربر اعتبار طرح رایگان قبلی دارد، ابتدا
+   از همان اعتبار مصرف می‌شود؛ این اعتبار جدا از دو هدیه است.
+6. خطای سرویس، قطع تولید، شکست ارسال پیش‌نمایش، انصراف و انقضای پیش‌نمایش (۳۰ دقیقه) را جداگانه
+   امتحان کنید؛ هدیه/اعتبار مناسب باید برگردد. پیش‌نمایش ذخیره‌نشدهٔ رایگان را با توقف و راه‌اندازی
+   مجدد ربات آزمایشی بررسی کنید. با مکث پاسخ سرویس آزمایشی، مدیر هدیه را بازنشانی کند و سپس کار
+   قدیمی را کامل/ناموفق کنید؛ نتیجه نباید هدیهٔ جدید را مصرف یا برگرداند.
+7. مدیر هر سه مرکز پرداخت، کاربران و سامانه، دکمه‌های بازگشت و صفحه‌کلیدهای قدیمی را باز کند؛
+   کاربر عادی نباید هیچ زیرصفحهٔ مدیریتی را باز کند. سفارش آزمایشی با رسید ثبت کنید: تأیید نخست
+   نباید اعتبار بدهد، تأیید نهایی باید دقیقاً یک‌بار اعتبار و سابقه ثبت کند، و رد با دلیل نباید
+   اعتبار بدهد. بازنشانی هدیه باید تأیید بخواهد و در گزارش فعالیت ثبت شود.

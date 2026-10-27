@@ -191,6 +191,31 @@ class DocxExtractionTests(TempFileMixin):
         self.assertIn("گلیکولیز", extracted.text)
         self.assertIn("ماتریکس", extracted.text)
 
+    def test_tables_and_heading_levels_are_preserved_in_order(self):
+        import docx
+
+        document = docx.Document()
+        document.add_heading("مقایسه", level=2)
+        table = document.add_table(rows=2, cols=2)
+        table.cell(0, 0).text = "سلول الف"
+        table.cell(0, 1).text = "سلول ب"
+        table.cell(1, 0).text = "سلول ج"
+        table.cell(1, 1).text = "سلول د"
+        document.add_paragraph("پس از جدول")
+        out = io.BytesIO()
+        document.save(out)
+        extracted = extract_document(self.write("tables.docx", out.getvalue()), "docx")
+        self.assertEqual(extracted.sections[0].heading_level, 2)
+        self.assertIn("بخش «مقایسه»", extracted.sections[0].locator)
+        self.assertLess(extracted.text.index("سلول الف"), extracted.text.index("پس از جدول"))
+        self.assertIn("سلول ب", extracted.text)
+        self.assertIn("سلول د", extracted.text)
+
+    def test_legacy_doc_is_best_effort_with_clear_error(self):
+        with self.assertRaises(DocExtractError) as caught:
+            extract_document(self.write("old.doc", b"legacy binary format"), "docx")
+        self.assertIn("docx", str(caught.exception))
+
     def test_image_only_docx_is_refused(self):
         path = self.write("empty.docx", make_image_only_docx_bytes())
         with self.assertRaises(DocExtractError) as caught:
@@ -210,6 +235,15 @@ class PptxExtractionTests(TempFileMixin):
         # The empty third slide is skipped, not an error.
         self.assertNotIn("اسلاید ۳", locators)
         self.assertIn("گلیکولیز", extracted.text)
+
+    def test_empty_presentation_is_refused_with_ocr_message(self):
+        from pptx import Presentation
+
+        out = io.BytesIO()
+        Presentation().save(out)
+        with self.assertRaises(DocExtractError) as caught:
+            extract_document(self.write("empty.pptx", out.getvalue()), "pptx")
+        self.assertIn("OCR", str(caught.exception))
 
     def test_sections_from_slides_is_the_shared_shape(self):
         from types import SimpleNamespace
@@ -262,6 +296,28 @@ class ChunkingTests(unittest.TestCase):
         chunks = chunk_text("متن " * 2000, max_chars=MAX_MODEL_INPUT_CHARS)
         self.assertGreaterEqual(len(chunks), 1)
         self.assertTrue(all("بخش" in chunk.locator for chunk in chunks))
+
+    def test_long_section_has_no_silent_tail_loss_and_exact_budget(self):
+        text = "BEGINMARK " + ("بخش‌متنی " * 14000) + " MIDDLETOKEN " + ("ادامه " * 9000) + " ENDMARK"
+        chunks = chunk_sections([DocSection("صفحهٔ ۱۲", "عنوان", text)], max_chars=4096)
+        self.assertGreater(len(chunks), 30)
+        combined = " ".join(chunk.text for chunk in chunks)
+        for marker in ("BEGINMARK", "MIDDLETOKEN", "ENDMARK"):
+            self.assertEqual(combined.count(marker), 1)
+        self.assertTrue(all(len(chunk.text) <= 4096 for chunk in chunks))
+        self.assertTrue(all("صفحهٔ ۱۲" in source for chunk in chunks for source in chunk.sources))
+        self.assertEqual(sum(chunk.text.count("بخش‌متنی") for chunk in chunks), 14000)
+        restored = chunks_from_json(chunks_to_json(chunks), max_chars=4096)
+        self.assertEqual(restored, chunks)
+
+    def test_heading_and_page_breaks_survive_multi_section_packing(self):
+        sections = [DocSection("صفحهٔ ۱", "آغاز", "الف" * 45),
+                    DocSection("صفحهٔ ۲", "پایان", "ب" * 45)]
+        chunks = chunk_sections(sections, max_chars=128)
+        joined = " ".join(chunk.text for chunk in chunks)
+        for text in ("صفحهٔ ۱", "صفحهٔ ۲", "آغاز", "پایان"):
+            self.assertIn(text, joined)
+        self.assertTrue(all(len(chunk.text) <= 128 for chunk in chunks))
 
     def test_json_round_trip_and_repair(self):
         chunks = chunk_text("یک متن کوتاه برای آزمون", max_chars=MAX_MODEL_INPUT_CHARS)

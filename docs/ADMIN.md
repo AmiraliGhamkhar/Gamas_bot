@@ -65,7 +65,7 @@ Telegram never reported a username. The numeric id is always present next to the
 `@username` can be renamed or reused, so it is never shown without the id that owns the row.
 
 The user card (`adm:hub:usr:card:<id>`) shows the handle, the id, the display name, credit,
-order count, deck count, both free-gift states, join and last-seen timestamps, and four actions:
+order count, deck count, both free-gift states, join and last-seen timestamps, and actions:
 
 | Button | Callback | Effect |
 | --- | --- | --- |
@@ -73,14 +73,21 @@ order count, deck count, both free-gift states, join and last-seen timestamps, a
 | 🚫 مسدودکردن / ✅ رفع مسدودی | `adm:hub:usr:tg:<id>` | Toggles the ban flag, audited |
 
 Search accepts both forms: a numeric id resolves exactly, `@username` resolves case-insensitively
-and offers a choice when several accounts share the handle. Billing state transitions, ledger writes
-and the `ADMIN_IDS` check are untouched by all of this.
+and offers a choice when several accounts share the handle. Reset confirmation is required and a
+reset invalidates old in-flight claim tokens; an older success or refund cannot consume the new
+entitlement. Blocking another administrator is refused. Payment status transitions, ledger writes
+and the `ADMIN_IDS` check are unchanged.
 
 ## Users (identity columns)
 
 Migration 013 adds `users.username`, `users.last_name` and `users.last_seen_at`. The upsert on every
 authorised interaction refreshes them; `username` is nullable because Telegram users may have none.
 `telegram_id` is SQLite `INTEGER` end to end, so ids above 2^53 round-trip exactly.
+Migration 014 adds the missing library-owner foreign key while keeping library ids and learning links.
+`Database.assert_user_reference_integrity()` checks declared user/learning/billing relationships,
+orphans and SQLite `foreign_key_check`. Startup logs violations rather than blocking old deployments
+whose plan catalog may not yet have been synchronised; run the strict check after catalog sync when
+verifying an upgrade. Back up the database before migration.
 
 Windows: **امروز** is the current UTC day; **۷ روز / ۳۰ روز** are rolling windows ending now; **کل**
 is the whole history. Reporting is UTC end to end, because every timestamp is stored as UTC

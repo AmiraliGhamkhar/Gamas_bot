@@ -17,12 +17,14 @@
   guards user references, and a double `/start` never creates a second row.
 - **Free first try (R3).** The first AI flashcard deck and the first quiz are free for every user —
   full quality, same models, claimed by one atomic `UPDATE … WHERE used = 0` before any model call.
-  Failures, invalid output and a cancelled preview restore both the credit and the gift; the gift is
-  consumed permanently only after a valid artifact is delivered. Admins can restore it from the user
-  card (audited), and both entry screens carry a «🎁 اولین بار رایگان» badge.
+  Failures, cancellation, preview expiry and failed delivery restore the matching claim; a unique
+  token prevents stale refunds after reset. Migration 014 atomically finalizes claims with artifact
+  persistence and recovers unfinished free claims at startup. Admin reset is confirmed and audited,
+  and both entry screens carry a «🎁 اولین بار رایگان» badge.
 - **Document ingestion (R4).** PDF, `.docx` and PowerPoint text (plus best-effort legacy `.doc`/
   `.ppt` by extension) is extracted into locator-tagged sections by the new
-  `gamas_bot/doc_extract.py`, capped at `DOC_MAX_BYTES` (default 50 MB). Encrypted PDFs and
+  `gamas_bot/doc_extract.py`, capped at `DOC_MAX_BYTES` (default 50 MB). PowerPoint extraction now
+  precedes the optional original presentation/audio pipeline. Encrypted PDFs and
   image-only documents get Persian explanations, a PDF with less than ~10 characters per page is
   refused as scanned instead of storing an empty row, and an identical file is deduped by SHA-256
   and reuses the stored extraction. Documents live in the new `documents` table, appear under
@@ -31,21 +33,21 @@
 - **Quality and speed (R5).** Prompts now demand atomic one-fact cards, cloze-first phrasing, no
   yes/no items, four-option MCQs with misconception distractors, a short explanation, a difficulty
   tag, and a `source` locator per item; items that cannot be anchored are discarded. Generation
-  parses once, chunks the text, runs up to `CHUNK_CONCURRENCY` (4) chunk calls through
+  parses once, chunks the text, runs `LEARNING_CHUNK_CONCURRENCY` calls (default 4, clamped to 3–5) through
   `llm.complete_json` with `asyncio.gather`, retries an invalid chunk once, skips it after a second
-  failure, merges, dedupes near-duplicates and reports «۲ بخش پردازش نشد» instead of failing the
+  failure, retains valid partial results, dedupes near-duplicates and reports incomplete coverage instead of failing the
   run. A preview/curation screen lets the user delete unwanted items before saving, with live
   progress («در حال تولید… بخش ۳ از ۷») and three size presets: «⚡ سریع» (10/5),
   «⭐ استاندارد» (20/10), «🎯 کامل» (40/20), distributed proportionally across chunks.
 
-- Booklet quizzes now generate mid-to-hard scenario questions (~40% `medium`, ~60% `hard`) at the
-  Apply/Analyze/Evaluate level, with misconception-based homogeneous distractors and no giveaway
-  cues. The optional `difficulty` output tag never invalidates a question, so the existing
-  short-output refund path still holds. The quiz start screen states «سؤال‌های متوسط تا سخت».
+- Quiz prompts mix recall, comprehension and application (~40% `medium`, ~60% `hard`) with plausible
+  misconception distractors. New generation requires a valid difficulty and an exact locator from
+  its input chunk; legacy stored questions without these fields remain readable.
 
 Learning loop add-on — quizzes, leaderboard and flashcards:
 
-- Booklets with extracted text gain an in-bot quiz (5/10/15 questions, `QUIZ_COST_SECONDS_PER_QUESTION`
+- Booklets with extracted text gain an in-bot quiz (5/10/20 presets, legacy 15-question callbacks,
+  `QUIZ_COST_SECONDS_PER_QUESTION`
   debited per question before generation) and AI flashcard decks (`FLASHCARD_AI_COST_SECONDS` flat
   charge, `FLASHCARD_AI_DECK_SIZE` pairs), plus manual decks, flip study mode and Word export.
   Every non-durable generation path — model failure, malformed/short output, database error or
