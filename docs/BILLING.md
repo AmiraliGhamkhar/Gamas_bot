@@ -24,35 +24,29 @@ duration before transcription starts.
 Learning features bill the same integer-second ledger, per user, from booklets with extracted
 text. Legacy items whose text was never stored cannot start a generation and are never charged.
 
-- **Quiz.** The start screen offers three size presets — «⚡ سریع ۱۰» (10 questions), «⭐ استاندارد ۲۰»
-  (20) and «🎯 کامل ۴۰» (20 questions) — and the price is `count × QUIZ_COST_SECONDS_PER_QUESTION`
-  (default 60 s), i.e. 10, 20 or 20 credit minutes at the shipped tariff. The debit happens
-  **before** the model call, with ledger note `quiz-pending:{item_id}` (or
-  `quiz-pending:doc:{document_id}` for a document).
-- **AI flashcard deck.** One charge of `FLASHCARD_AI_COST_SECONDS` (default 300 s = 5 minutes),
-  **scaled by the requested size**: the presets ask for 10, 20 or 40 cards
-  (`FLASHCARD_AI_DECK_SIZE`, default 10 pairs, is the reference size), so a «⚡ سریع ۱۰» deck costs
-  the base charge, «⭐ استاندارد ۲۰» costs twice it and «🎯 کامل ۴۰» four times it. Manual decks and
-  the Word export are free.
-- **Curation is free and reversible.** Generated items are shown in a preview where each one can be
-  deleted before saving. Nothing is charged twice, and «❌ انصراف» behaves exactly like a failed
-  generation: the debit is refunded and a claimed free first try is restored, because nothing was
-  delivered.
-- **First try is free (R3).** Every user's *first* AI flashcard deck and *first* quiz are free, at
-  full quality and with the same models; the wallet is only opened from the second one. The gift is
-  claimed **before** any model call by one atomic, row-locked claim
-  (`free_uses`, one row per user, `UPDATE … WHERE used = 0` with `rowcount == 1`), so two concurrent
-  taps can never both run free. A generation that fails, the model output that stays below the
-  validity floor, or a cancelled preview restores the gift (and the credit, if any was spent); the
-  gift stays consumed only once a valid deck/quiz was generated **and** delivered. Unlimited users
-  are never charged and therefore never consume the gift. Administrators can restore it from the
-  user card (🔄 بازنشانی هدیه رایگان, audited as `free_use_reset`).
-- **Full refund on every non-durable path.** If the model fails, returns malformed or too-short
-  output (fewer than five valid questions/cards), the database write fails, or the task is
-  cancelled (including shutdown), the full debit is refunded in one transaction
-  (`refund: …` note) and the placeholder message is replaced with a failure notice. Refund errors
-  are logged but never crash the handler. Unlimited users are never debited, so no refund is
-  attempted for them.
+- **Quiz.** The three presets request 5, 10 or 20 questions, priced at `count ×
+  QUIZ_COST_SECONDS_PER_QUESTION` (default 60 s), i.e. 5, 10 or 20 credit minutes. The debit happens
+  before model calls, with ledger note `quiz-pending:{item_id}` (or `quiz-pending:doc:{document_id}`).
+  The old 15-question callback remains valid for existing keyboards.
+- **AI flashcard deck.** The 10, 20 and 40-card presets scale `FLASHCARD_AI_COST_SECONDS` (default
+  300 s) relative to `FLASHCARD_AI_DECK_SIZE` (default 10), i.e. 5, 10 and 20 credit minutes with
+  defaults. Manual decks and Word export are free; the legacy default-size button is retained.
+- **First try and curation.** Each user has an independent free AI deck and free quiz, using the same
+  models, presets and validation as paid generations. A conditional SQLite update atomically claims
+  the appropriate gift with a unique token before the LLM. The preview is delivered before save;
+  the artifact and claim finalization are committed together. Cancel, an undeliverable or expired
+  preview (30 minutes), provider failure, insufficient valid content or cancellation restore the
+  matching gift; a reset or newer claim cannot be undone by an older job's refund. After the gift,
+  existing credit/paywall behavior applies, including the separate free-plan credit grant if present.
+  Unlimited users are never charged and do not consume a gift. A confirmed admin reset restores
+  both and writes `free_use_reset` to the audit log.
+- **Recovery and refunds.** Startup, after the singleton lock, restores token-bearing unfinished
+  free claims; committed artifacts have already finalized their tokens in the same transaction.
+  Graceful shutdown cancels active learning work and compensates pending previews before closing
+  SQLite. Paid failures/cancellations/expiry refund the debit through the existing lot-aware ledger.
+  Ungraceful crash recovery covers free claims; it does not introduce a new durable reservation for
+  paid previews. A valid result requires at least five cards or three questions. Partial coverage is
+  reported so a user may cancel rather than save a short set. Refund errors are logged.
 - **One generation at a time per user.** A synchronous in-flight guard plus a per-user async lock
   reject a second tap while a generation is charging or awaiting the model, before any second
   debit. The guard is always released, even when cancellation strikes while waiting on the lock.
@@ -127,9 +121,11 @@ bot against a migrated database. Migration 006 adds only a nullable ledger colum
 Migration 008 replaces one status-update trigger and rewrites no rows. Migrations 011 and 012 add
 the learning-loop columns and tables (quiz sessions/questions/answers, flashcard decks/cards);
 their foreign keys cascade quiz data with a pruned library item while flashcard decks are retained
-with a nulled item reference. All of them are additive: existing payments, credits, balances,
-expiry dates, users and library rows are preserved, and legacy users default to an empty display
-name and null extracted text. The v2 importer is a one-time, all-or-nothing operation:
+with a nulled item reference. Migration 013 adds identity, document caches and free-use flags;
+014 adds owned recovery tokens, quiz difficulty, and rebuilds `library_items` to declare its user
+foreign key while preserving ids, content and child links. Legacy library rows missing an owner get
+an exact-id placeholder user during the rebuild. The ledger and payment transitions are not
+redesigned. The v2 importer is a one-time, all-or-nothing operation:
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\import_v2.py --help

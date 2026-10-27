@@ -149,6 +149,7 @@ class UserIdentityTests(unittest.IsolatedAsyncioTestCase):
             library_item_id=item,
         )
         self.assertEqual(await self.db.user_reference_integrity(), [])
+        await self.db.assert_user_reference_integrity()
 
     async def test_integrity_check_detects_an_orphan(self):
         # Foreign keys are ON, so create the orphan with them off to prove the
@@ -163,6 +164,8 @@ class UserIdentityTests(unittest.IsolatedAsyncioTestCase):
         await self.db.db.execute("PRAGMA foreign_keys=ON")
         problems = await self.db.user_reference_integrity()
         self.assertTrue(any("library_items.user_id" in problem for problem in problems))
+        with self.assertRaisesRegex(RuntimeError, "reference integrity"):
+            await self.db.assert_user_reference_integrity()
 
     async def test_admin_user_card_shows_username_id_and_name(self):
         await self.db.ensure_user(ADMIN_ID, "مدیر", username="boss")
@@ -193,6 +196,47 @@ class UserIdentityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("@ali_user", sent)
         self.assertIn(f"شناسه: {HUGE_ID}", sent)
+
+
+    async def test_signed_int64_boundaries_and_lossy_inputs(self):
+        for value in (-(1 << 63), (1 << 63) - 1):
+            await self.db.ensure_user(value, "نام", username="boundary")
+            self.assertEqual((await self.db.search_users(str(value)))[0]["telegram_id"], value)
+        for invalid in (float(HUGE_ID), str(HUGE_ID), True):
+            with self.assertRaises(TypeError):
+                await self.db.ensure_user(invalid)
+        for invalid in (-(1 << 63) - 1, 1 << 63):
+            with self.assertRaises(ValueError):
+                await self.db.ensure_user(invalid)
+            self.assertEqual(await self.db.search_users(str(invalid)), [])
+
+    async def test_repeated_start_refreshes_identity_without_duplicate(self):
+        from types import SimpleNamespace
+
+        first = FakeMessageEvent(HUGE_ID, "/start")
+        first.sender = SimpleNamespace(first_name="نام قدیمی", last_name="پیشین", username="old")
+        await self.bot._handle_message(first)
+        await self.db._write("UPDATE users SET last_seen_at='2020-01-01' WHERE telegram_id=?", (HUGE_ID,))
+        second = FakeMessageEvent(HUGE_ID, "/start")
+        second.sender = SimpleNamespace(first_name="نام تازه", last_name="جدید", username="new")
+        await self.bot._handle_message(second)
+        identity = await self.db.user_identity(HUGE_ID)
+        self.assertEqual((identity["username"], identity["first_name"], identity["last_name"]),
+                         ("new", "نام تازه", "جدید"))
+        self.assertGreater(identity["last_seen_at"], "2020-01-01")
+        self.assertEqual(await self.db.count_users(), 1)
+
+    async def test_callback_refreshes_identity_and_clears_removed_handle(self):
+        from types import SimpleNamespace
+
+        await self.db.ensure_user(HUGE_ID, "نام", username="old", last_name="قدیمی")
+        await self.db._write("UPDATE users SET last_seen_at='2020-01-01' WHERE telegram_id=?", (HUGE_ID,))
+        event = FakeCallbackEvent(self.client, data=b"menu:main", chat_id=HUGE_ID)
+        event.sender = SimpleNamespace(first_name="تازه", last_name=None, username=None)
+        await self.bot._handle_callback(event)
+        identity = await self.db.user_identity(HUGE_ID)
+        self.assertEqual((identity["username"], identity["first_name"], identity["last_name"]), ("", "تازه", ""))
+        self.assertGreater(identity["last_seen_at"], "2020-01-01")
 
 
 if __name__ == "__main__":

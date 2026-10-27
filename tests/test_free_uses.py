@@ -34,7 +34,7 @@ OTHER = 619
 def cards_payload(count: int) -> dict:
     return {
         "cards": [
-            {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "صفحهٔ ۱"}
+            {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "بخش ۱"}
             for index in range(count)
         ]
     }
@@ -53,7 +53,8 @@ def quiz_payload(count: int) -> dict:
                 ],
                 "correct": 0,
                 "explain": "توضیح یک‌خطی",
-                "source": "صفحهٔ ۱",
+                "difficulty": "medium",
+                "source": "بخش ۱",
             }
             for index in range(count)
         ]
@@ -116,6 +117,63 @@ class FreeUseDatabaseTests(unittest.IsolatedAsyncioTestCase):
         audit = await self.db.recent_audit(limit=1)
         self.assertEqual(audit[0]["action"], "free_use_reset")
         self.assertEqual(audit[0]["subject_user"], OWNER)
+
+
+    async def test_token_claim_race_has_one_winner(self):
+        claims = await asyncio.gather(*(
+            self.db.consume_free_use(OWNER, "deck", claim_id=f"token-{i}") for i in range(12)
+        ))
+        self.assertEqual(sum(claims), 1)
+        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue((await self.db.free_use_state(OWNER))["quiz"])
+
+    async def test_reset_during_generation_does_not_let_old_refund_touch_new_claim(self):
+        old = "old-token"
+        self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=old))
+        await self.db.reset_free_uses(OWNER, admin_id=1)
+        new = "new-token"
+        self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=new))
+        self.assertNotEqual(old, new)
+        self.assertFalse(await self.db.refund_free_use(OWNER, "deck", claim_id=old))
+        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue(await self.db.refund_free_use(OWNER, "deck", claim_id=new))
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+
+    async def test_old_success_after_reset_cannot_finalize_a_newer_claim(self):
+        old = "old-token"
+        self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=old))
+        await self.db.reset_free_uses(OWNER, admin_id=1)
+        new = "new-token"
+        self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=new))
+        item = await self.db.library_add(OWNER, "booklet", 1, 2, None, title="سند")
+        await self.db.deck_create_with_cards(
+            OWNER, item, "کار قدیمی", [{"front": "پرسش", "back": "پاسخ"}], free_claim_id=old
+        )
+        # The old success neither spends nor clears the replacement token.
+        self.assertTrue(await self.db.refund_free_use(OWNER, "deck", claim_id=new))
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertEqual(await self.db.deck_count(OWNER), 1)
+
+    async def test_artifact_and_finalization_roll_back_together(self):
+        claim = "pending-token"
+        self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=claim))
+        item = await self.db.library_add(OWNER, "booklet", 1, 2, None, title="سند")
+        with self.assertRaises(KeyError):
+            await self.db.deck_create_with_cards(
+                OWNER, item, "ناقص", [{"front": "بدون پاسخ"}], free_claim_id=claim
+            )
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertTrue(await self.db.refund_free_use(OWNER, "deck", claim_id=claim))
+
+    async def test_interrupted_claims_recover_but_delivered_gifts_stay_consumed(self):
+        await self.db.ensure_user(OTHER)
+        await self.db.consume_free_use(OWNER, "deck", claim_id="pending-deck")
+        await self.db.consume_free_use(OWNER, "quiz", claim_id="pending-quiz")
+        await self.db.consume_free_use(OTHER, "deck")  # finalized legacy claim
+        self.assertEqual(await self.db.recover_pending_free_uses(), 2)
+        self.assertEqual(await self.db.free_use_state(OWNER), {"deck": True, "quiz": True})
+        self.assertFalse((await self.db.free_use_state(OTHER))["deck"])
+        self.assertEqual(await self.db.recover_pending_free_uses(), 0)
 
 
 class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
@@ -354,6 +412,143 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         execute = self.press(f"adm:hub:usr:frx:{OWNER}".encode(), user_id=admin_id)
         await self.bot._handle_callback(execute)
         self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+
+
+    async def test_expiry_refunds_unsaved_free_preview(self):
+        self.bot.CURATION_TTL_SECONDS = 0.02
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
+            await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
+        timer = self.bot._curation_tasks[OWNER]
+        await asyncio.wait_for(timer, 2)
+        self.assertNotIn(OWNER, self.bot._curation)
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+
+    async def test_expiry_refunds_a_paid_preview_once(self):
+        self.bot.CURATION_TTL_SECONDS = 0.02
+        await self.db.consume_free_use(OWNER, "deck")
+        await self.db.add_credit(OWNER, 600, note="اعتبار", validity_days=30)
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
+            await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
+        self.assertEqual(await self.db.available_seconds(OWNER), 300)
+        await asyncio.wait_for(self.bot._curation_tasks[OWNER], 2)
+        self.assertEqual(await self.db.available_seconds(OWNER), 600)
+        await self.bot._handle_callback(self.press(b"fc:cur:cancel"))
+        self.assertEqual(await self.db.available_seconds(OWNER), 600)
+
+    async def test_undeliverable_preview_refunds_the_gift(self):
+        from tests.support import FakeSentMessage
+
+        with mock.patch.object(FakeSentMessage, "edit", new=mock.AsyncMock(side_effect=RuntimeError("blocked"))), \
+             mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
+            await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertNotIn(OWNER, self.bot._curation)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+
+    async def test_task_cancellation_restores_free_gift(self):
+        started = asyncio.Event()
+        async def blocked(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=blocked)):
+            task = asyncio.create_task(self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode())))
+            await asyncio.wait_for(started.wait(), 2)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertNotIn(OWNER, self.bot._learning_in_flight)
+
+    async def test_simultaneous_save_and_cancel_is_exactly_once(self):
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
+            await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
+        await asyncio.gather(
+            self.bot._handle_callback(self.press(b"fc:cur:save")),
+            self.bot._handle_callback(self.press(b"fc:cur:cancel")),
+        )
+        decks = await self.db.deck_count(OWNER)
+        self.assertIn(decks, (0, 1))
+        self.assertEqual((await self.db.free_use_state(OWNER))["deck"], decks == 0)
+        self.assertNotIn(OWNER, self.bot._curation)
+
+    async def test_quiz_second_attempt_without_credit_reaches_paywall(self):
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
+            await self.bot._handle_callback(self.press(f"quiz:go:{self.item_id}:5".encode()))
+        await self.bot._handle_callback(self.press(b"quiz:cur:save"))
+        row = (await self.db.db.execute_fetchall("SELECT session_id FROM quiz_sessions"))[0]
+        await self.db.quiz_finish(int(row[0]), "quit")
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock()) as generator:
+            await self.bot._handle_callback(self.press(f"quiz:go:{self.item_id}:5".encode()))
+        generator.assert_not_awaited()
+        self.assertTrue(any(LEARNING_NO_CREDIT in record["text"] for record in self.client.texts))
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+
+    async def test_reset_execute_requires_a_fresh_confirmation(self):
+        admin = next(iter(self.settings.admin_ids))
+        await self.db.ensure_user(admin)
+        await self.db.consume_free_use(OWNER, "deck")
+        forged = self.press(f"adm:hub:usr:frx:{OWNER}".encode(), user_id=admin)
+        await self.bot._handle_callback(forged)
+        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertTrue(forged.answers[-1][1])
+        await self.bot._handle_callback(self.press(f"adm:hub:usr:fr:{OWNER}".encode(), user_id=admin))
+        await self.bot._handle_callback(self.press(b"adm:home", user_id=admin))
+        await self.bot._handle_callback(self.press(f"adm:hub:usr:frx:{OWNER}".encode(), user_id=admin))
+        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+
+
+    async def test_shutdown_cancels_active_generation_and_compensates_before_db_close(self):
+        started = asyncio.Event()
+        async def provider(*args, **kwargs):
+            started.set()
+            await asyncio.Event().wait()
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
+            task = asyncio.create_task(self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode())))
+            await asyncio.wait_for(started.wait(), 2)
+            await self.bot.shutdown()
+        self.assertTrue(task.cancelled())
+        await self.db.connect()  # shutdown closed SQLite; inspect durable state
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertFalse(self.bot._learning_tasks)
+
+    async def test_cancel_during_committed_admission_refunds_its_token(self):
+        admitted, release = asyncio.Event(), asyncio.Event()
+        original = self.bot._claim_generation_budget
+        async def claim(*args, **kwargs):
+            result = await original(*args, **kwargs)
+            admitted.set()
+            await release.wait()
+            return result
+        with mock.patch.object(self.bot, "_claim_generation_budget", side_effect=claim):
+            task = asyncio.create_task(self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode())))
+            await asyncio.wait_for(admitted.wait(), 2)
+            task.cancel()
+            release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        self.assertNotIn(OWNER, self.bot._learning_in_flight)
+
+    async def test_shutdown_racing_save_never_refunds_a_committed_artifact(self):
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
+            await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
+        saving, release = asyncio.Event(), asyncio.Event()
+        original = self.db.deck_create_with_cards
+        async def delayed_save(*args, **kwargs):
+            saving.set()
+            await release.wait()
+            return await original(*args, **kwargs)
+        with mock.patch.object(self.db, "deck_create_with_cards", side_effect=delayed_save):
+            save_task = asyncio.create_task(self.bot._handle_callback(self.press(b"fc:cur:save")))
+            await asyncio.wait_for(saving.wait(), 2)
+            shutdown_task = asyncio.create_task(self.bot.shutdown())
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(save_task, shutdown_task)
+        await self.db.connect()
+        self.assertEqual(await self.db.deck_count(OWNER), 1)
+        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
 
 
 if __name__ == "__main__":

@@ -73,5 +73,76 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class PopulatedUpgradeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_upgrade_and_interrupted_replay_preserve_all_references(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "before-014.db"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name >= "014":
+                    continue
+                conn.executescript(migration.read_text(encoding="utf-8"))
+                conn.execute("INSERT INTO schema_migrations VALUES (?, '2026-01-01')", (migration.name,))
+            owner, missing_owner = 770000000123456789, 770000000123456790
+            conn.execute("INSERT INTO users(telegram_id, joined_at) VALUES (?, '2026-01-01')", (owner,))
+            conn.execute(
+                "INSERT INTO library_items(item_id,user_id,kind,chat_id,message_id,title,created_at,content_text) "
+                "VALUES (100,?,'booklet',1,2,'درس','2026-01-01','متن')", (owner,)
+            )
+            # A legacy row without an owner was possible before the FK existed.
+            conn.execute(
+                "INSERT INTO library_items(item_id,user_id,kind,chat_id,message_id,title,created_at) "
+                "VALUES (101,?,'booklet',1,3,'قدیمی','2026-01-01')", (missing_owner,)
+            )
+            conn.execute(
+                "INSERT INTO flashcard_decks(deck_id,user_id,item_id,title,source,created_at) "
+                "VALUES (10,?,100,'کارت','ai','2026-01-01')", (owner,)
+            )
+            conn.execute("INSERT INTO flashcards(deck_id,idx,front,back,source) VALUES (10,0,'پ','ج','صفحهٔ ۱')")
+            conn.execute(
+                "INSERT INTO quiz_sessions(session_id,user_id,item_id,question_count,created_at,updated_at) "
+                "VALUES (20,?,100,1,'2026-01-01','2026-01-01')", (owner,)
+            )
+            conn.execute(
+                "INSERT INTO quiz_questions(question_id,session_id,idx,question,options_json,correct_index,source) "
+                "VALUES (30,20,0,'پرسش','[\"a\",\"b\",\"c\",\"d\"]',0,'صفحهٔ ۱')"
+            )
+            conn.execute(
+                "INSERT INTO quiz_answers(session_id,question_id,chosen_index,is_correct,answered_at) "
+                "VALUES (20,30,0,1,'2026-01-01')"
+            )
+            conn.execute(
+                "INSERT INTO documents(user_id,file_msg_ref,title,source_type,page_count,sha256,text,chunks_json,"
+                "library_item_id,created_at) VALUES (?, '1:2','سند','pdf',1,'hash','متن','[]',100,'2026-01-01')", (owner,)
+            )
+            conn.execute("INSERT INTO free_uses(user_id,free_deck_used,updated_at) VALUES (?,1,'2026-01-01')", (owner,))
+            conn.commit()
+            conn.close()
+
+            for replay in (False, True):
+                db = Database(path)
+                await db.connect()
+                await db.assert_user_reference_integrity()
+                self.assertEqual((await db.user_identity(missing_owner))["telegram_id"], missing_owner)
+                self.assertEqual((await db.library_item_detail(owner, 100))["content_text"], "متن")
+                self.assertEqual((await db.deck_cards(10))[0]["source"], "صفحهٔ ۱")
+                self.assertEqual((await db.db.execute_fetchall("SELECT COUNT(*) FROM quiz_answers"))[0][0], 1)
+                self.assertEqual((await db.document_get(owner, 1))["library_item_id"], 100)
+                self.assertFalse((await db.free_use_state(owner))["deck"])
+                self.assertEqual((await db.db.execute_fetchall("PRAGMA foreign_keys"))[0][0], 1)
+                if not replay:
+                    # Simulate a crash after the rebuild COMMIT but before the
+                    # migration bookkeeping row was durable.
+                    await db._write("DELETE FROM schema_migrations WHERE name='014_free_use_recovery.sql'")
+                await db.close()
+            db = Database(path)
+            await db.connect()
+            new_id = await db.library_add(owner, "booklet", 1, 4, None, title="جدید")
+            self.assertGreater(new_id, 101)
+            await db.assert_user_reference_integrity()
+            await db.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -11,17 +11,20 @@ the billing-then-generation discipline in ``bot.py`` easy to follow.
 
 from __future__ import annotations
 
+import json
 import random
+import re
+import unicodedata
+from difflib import SequenceMatcher
 from typing import Any
 
 from .progress import to_persian_digits
 
-#: Archived learning text is capped before it is stored and again before it is
-#: sent to a model, so a multi-hour lecture can never bloat the library row or
-#: overflow a provider context (one LLM call, no chunking, by design).
+#: Generated booklet mirrors retain a bounded preview in the legacy library.
+#: Uploaded documents retain their full extracted text and chunk cache instead.
 MAX_CONTENT_CHARS = 60_000
-#: Input sent to the learning generators is slightly tighter than the stored
-#: cap to leave room for the prompt envelope inside NOTE_CHUNK_CHARS budgets.
+#: Each learning chunk leaves room for the prompt envelope inside the model's
+#: context budget; the generator can process multiple such chunks concurrently.
 MAX_MODEL_INPUT_CHARS = 56_000
 
 #: Validation ceilings for model output, mirrored in the prompt wording.
@@ -86,7 +89,28 @@ def distribute_counts(total: int, weights: list[int]) -> list[int]:
     if not weights:
         return []
     if total <= len(weights):
-        return [1 if index < total else 0 for index in range(len(weights))]
+        # Spread a small preset across the whole document rather than silently
+        # taking only its first pages. Select weighted midpoint quantiles.
+        clean = [max(1, int(weight)) for weight in weights]
+        pool = sum(clean)
+        counts = [0] * len(clean)
+        cumulative = 0
+        index = 0
+        for slot in range(total):
+            target = (slot + 0.5) * pool / total
+            while index < len(clean) - 1 and cumulative + clean[index] < target:
+                cumulative += clean[index]
+                index += 1
+            # One item per selected chunk when there are more chunks than
+            # items; choose the nearest remaining position for heavy pages.
+            candidate = index
+            if counts[candidate]:
+                candidate = min(
+                    (i for i, value in enumerate(counts) if not value),
+                    key=lambda i: (abs(i - index), i),
+                )
+            counts[candidate] = 1
+        return counts
     clean = [max(1, int(weight)) for weight in weights]
     pool = sum(clean)
     exact = [total * weight / pool for weight in clean]
@@ -111,35 +135,41 @@ def distribute_counts(total: int, weights: list[int]) -> list[int]:
 
 
 def normalize_front(text: str) -> str:
-    """A comparison key for deduplicating card fronts (case/space/punct blind)."""
-    cleaned = " ".join(str(text or "").split()).casefold()
+    """Normalize Persian/Arabic letter variants, digits, punctuation and case."""
+    cleaned = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    cleaned = cleaned.translate(str.maketrans("يكى٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "یکی01234567890123456789"))
     return "".join(char for char in cleaned if char.isalnum())
 
 
-def dedupe_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop cards whose normalized front already appeared (order preserved)."""
-    seen: set[str] = set()
+def _dedupe_items(items: list[dict[str, Any]], field: str) -> list[dict[str, Any]]:
+    """Drop exact and near-identical stems while preserving meaningful numbers."""
+    seen: list[str] = []
     unique: list[dict[str, Any]] = []
-    for card in cards:
-        key = normalize_front(str(card.get("front", "")))
-        if not key or key in seen:
+    for item in items:
+        key = normalize_front(str(item.get(field, "")))
+        if not key:
             continue
-        seen.add(key)
-        unique.append(card)
+        numbers = re.findall(r"\d+", key)
+        duplicate = any(
+            key == previous or (
+                len(key) >= 12 and len(previous) >= 12
+                and numbers == re.findall(r"\d+", previous)
+                and SequenceMatcher(None, key, previous, autojunk=False).ratio() >= 0.92
+            )
+            for previous in seen
+        )
+        if not duplicate:
+            seen.append(key)
+            unique.append(item)
     return unique
+
+
+def dedupe_cards(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _dedupe_items(cards, "front")
 
 
 def dedupe_questions(questions: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Drop questions whose normalized stem already appeared."""
-    seen: set[str] = set()
-    unique: list[dict[str, Any]] = []
-    for question in questions:
-        key = normalize_front(str(question.get("question", "")))
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        unique.append(question)
-    return unique
+    return _dedupe_items(questions, "question")
 
 #: Persian option labels, indexed exactly like ``correct_index``.
 OPTION_LABELS = ("الف", "ب", "ج", "د")
@@ -188,17 +218,14 @@ QUIZ_SCHEMA: dict[str, Any] = {
                     },
                     "correct": {"type": "integer"},
                     "explain": {"type": "string"},
-                    # CR-5: optional difficulty tag. ``required`` is left
-                    # unchanged so a model that omits it is never rejected —
-                    # that protects the MIN_VALID_QUESTIONS refund path.
+                    # Generated questions require both tags. The parser can
+                    # still read legacy rows when strict flags are disabled.
                     "difficulty": {"type": "string", "enum": ["medium", "hard"]},
-                    # Source anchoring: the page/slide/section locator the
-                    # question was built from. Optional in the schema for the
-                    # same reason as ``difficulty`` (never reject a whole item);
-                    # the caller back-fills the chunk locator when it is absent.
+                    # The generator verifies the locator belongs to the chunk;
+                    # it never invents or back-fills an unverified source.
                     "source": {"type": "string"},
                 },
-                "required": ["question", "options", "correct", "explain"],
+                "required": ["question", "options", "correct", "explain", "difficulty", "source"],
             },
         }
     },
@@ -206,59 +233,50 @@ QUIZ_SCHEMA: dict[str, Any] = {
 }
 
 
-def quiz_system_prompt(count: int, *, source: str | None = None) -> str:
-    """The Persian system prompt demanding ``count`` grounded, harder MCQs.
+def _source_rule(source: str | None, sources: tuple[str, ...] | None) -> str:
+    choices = tuple(dict.fromkeys(
+        " ".join(str(value).split())[:MAX_SOURCE_CHARS]
+        for value in (sources or ((source,) if source else ())) if value
+    ))
+    if not choices:
+        return ""
+    allowed = "، ".join(f"«{locator}»" for locator in choices)
+    return (
+        "منبع‌دهی: هر مورد باید فقط از متن همان بخش ساخته شود. "
+        "مقدار source را دقیقاً از فهرست نشانگرهای زیر انتخاب کن؛ "
+        "اگر نمی‌توانی آن را به یکی از این بخش‌ها نسبت دهی، آن مورد را نساز:\n"
+        f"{allowed}\n\n"
+    )
 
-    CR-5: questions move from pure recall to mid-to-hard Apply/Analyze/Evaluate
-    items built around a short scenario, with homogeneous, misconception-based
-    distractors and no giveaway cues.
 
-    ``source`` names the page/slide/section the model is reading in this call
-    (chunk-parallel generation feeds one chunk at a time). When it is given, the
-    prompt asks the model to copy that locator into ``source`` on every item; the
-    caller still back-fills it, so a forgetful model never breaks anchoring.
-    """
+def quiz_system_prompt(
+    count: int, *, source: str | None = None, sources: tuple[str, ...] | None = None
+) -> str:
+    """Persian four-option, source-anchored MCQs across cognitive levels."""
     total = int(count)
     medium = max(1, round(total * 0.4))
     hard = max(0, total - medium)
-    locator = " ".join(str(source or "").split())[:MAX_SOURCE_CHARS]
-    source_rule = (
-        "منبع‌دهی: هر سؤال فقط از متن همین بخش ساخته شود و مقدار \"source\" دقیقاً "
-        f"همان نشانگر «{locator}» باشد.\n\n"
-        if locator
-        else ""
-    )
+    example_source = json.dumps((sources or (source or "صفحهٔ ۳",))[0], ensure_ascii=False)
     return (
-        "تو طراح سؤال‌های چهارگزینه‌ای سطح «متوسط تا سخت» برای یک جزوهٔ فارسی هستی. "
-        "فقط بر پایهٔ متن جزوه‌ای که در پیام کاربر می‌آید سؤال بساز؛ هیچ اطلاعات بیرونی وارد نکن.\n"
+        "تو طراح سؤال‌های چهارگزینه‌ای فارسی در سطح متوسط تا سخت هستی. فقط بر پایهٔ متن داده‌شده "
+        "سؤال بساز؛ اطلاعات بیرونی یا ادعاهای بدون پشتوانه اضافه نکن.\n"
         f"دقیقاً {to_persian_digits(total)} سؤال بنویس.\n\n"
-        "سطح دشواری:\n"
-        f"- حدود ۴۰٪ سؤال‌ها «متوسط» و ۶۰٪ «سخت» باشند (برای {to_persian_digits(total)} سؤال، "
-        f"تقریباً {to_persian_digits(medium)} متوسط و {to_persian_digits(hard)} سخت).\n"
-        "- سؤال‌ها باید در سطح «به‌کاربستن»، «تحلیل» یا «ارزیابی» باشند، نه یادآوری صرف.\n"
-        "- سؤال حافظه‌ای ممنوع است: مستقیم نپرس «X چیست؟»، «X را تعریف کن»، «X چند است؟»، "
-        "«چه کسی/چه سالی …؟» یا «کدام گزینه نام/عدد/تاریخ درست را می‌گوید؟».\n"
-        "- ساختار هر سؤال: یک سناریوی کوتاه (مثلاً «اگر …»، «بیماری …»، «دانشجویی …») ← "
-        "پرسش ← پایان با «کدام گزینه …؟».\n\n"
-        "قوانین گزینه‌ها:\n"
+        "ترکیب آموزشی:\n"
+        "- ترکیبی متعادل از یادآوری، درک مفهوم و به‌کاربستن بساز. "
+        "برای به‌کاربستن، تحلیل و ارزیابی از سناریو کوتاه و «کدام گزینه» استفاده کن.\n"
+        f"- حدود ۴۰٪ سؤال‌ها متوسط و ۶۰٪ سخت باشند؛ تقریباً {to_persian_digits(medium)} متوسط "
+        f"و {to_persian_digits(hard)} سخت.\n"
+        "- دشواری هر سؤال را در difficulty با medium یا hard مشخص کن.\n"
         "- هر سؤال دقیقاً ۴ گزینه دارد و فقط یک گزینه کاملاً درست است.\n"
-        "- گزینه‌های نادرست باید برآمده از خطای رایج یا بدفهمی دانشجو، باورپذیر و نزدیک به پاسخ درست باشند.\n"
-        "- هر ۴ گزینه هم‌سبک و تقریباً هم‌طول باشند؛ پاسخ درست نباید بلندتر، دقیق‌تر یا "
-        "از نظر ساختار متفاوت باشد.\n"
-        "- از مطلق‌نماهای لو‌دهنده («همیشه»، «هرگز»، «هیچ‌کدام»، «همهٔ موارد فوق») پرهیز کن؛ "
-        "گزینهٔ «همهٔ موارد فوق» به‌کلی ممنوع است و پاسخ درست نباید با حذف گزینه‌ها قابل حدس باشد.\n"
-        "- برای هر سؤال یک توضیح یک‌خطی فارسی بنویس که چرا گزینهٔ درست، درست است.\n"
-        "- همهٔ متن‌ها فارسی و روان باشد.\n\n"
-        "ترکیب سطوح شناختی:\n"
-        "- حدود یک‌سوم سؤال‌ها «یادآوری»، یک‌سوم «درک» و یک‌سوم «به‌کاربستن» باشند؛ "
-        "هیچ سطحی بیش از نیمی از سؤال‌ها را نگیرد.\n"
-        "- گزینه‌های نادرست از خطاهای رایج همان مبحث انتخاب شوند، نه از موضوعی دیگر.\n\n"
-        + source_rule
+        "- سه گزینهٔ نادرست باید باورپذیر، هم‌موضوع و بر پایهٔ بدفهمی‌های رایج باشند.\n"
+        "- گزینه‌ها هم‌سبک و تقریباً هم‌طول باشند و پاسخ درست با نشانهٔ ظاهری لو نرود.\n"
+        "- از «همهٔ موارد فوق»، مطلق‌نماها و گزینه‌های گمراه‌کنندهٔ بی‌ارتباط پرهیز کن.\n"
+        "- برای هر پاسخ یک توضیح کوتاه و مستند به متن بنویس.\n\n"
+        + _source_rule(source, sources)
         + "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
-        '{"questions":[{"question": "متن سؤال سناریومحور", '
-        '"options": ["گزینه الف", "گزینه ب", "گزینه ج", "گزینه د"], '
-        '"correct": 0, "explain": "توضیح یک‌خطی", "difficulty": "hard", '
-        '"source": "صفحهٔ ۳"}]}'
+        '{"questions":[{"question":"متن سؤال", "options":["الف", "ب", "ج", "د"], '
+        '"correct":0, "explain":"توضیح کوتاه", "difficulty":"hard", '
+        '"source":' + example_source + '}]}'
     )
 
 
@@ -274,6 +292,7 @@ def parse_quiz_payload(
     *,
     rng: random.Random | None = None,
     require_source: bool = False,
+    require_difficulty: bool = False,
 ) -> list[dict[str, Any]]:
     """Validate/clamp a model answer and return at most ``count`` questions.
 
@@ -281,9 +300,8 @@ def parse_quiz_payload(
     Surviving options are shuffled and ``correct`` is remapped, so a model that
     favours option 0 cannot create a predictable answer key.
 
-    ``require_source`` is used for document-sourced generation, where an item
-    the model could not anchor is discarded rather than delivered unattributed;
-    booklet generation leaves it off and the caller back-fills the chunk locator.
+    Generation from either documents or booklets requires source and difficulty;
+    the optional flags let legacy callers parse pre-existing untagged content.
     """
     raw_questions = payload.get("questions")
     if not isinstance(raw_questions, list):
@@ -314,10 +332,8 @@ def parse_quiz_payload(
         else:
             rng.shuffle(order)
         shuffled = [options[index] for index in order]
-        # CR-5: record the optional difficulty tag when the model supplies a
-        # valid one. It is deliberately *not* required — a missing/invalid tag
-        # must never drop a question (that would break MIN_VALID_QUESTIONS and
-        # the refund path). The option shuffle above is unchanged.
+        # Legacy callers may read older items without difficulty, whereas the
+        # generation boundary explicitly requires a valid tag and source.
         record: dict[str, Any] = {
             "question": question,
             "options": shuffled,
@@ -327,6 +343,8 @@ def parse_quiz_payload(
         difficulty = entry.get("difficulty")
         if difficulty in ("medium", "hard"):
             record["difficulty"] = difficulty
+        elif require_difficulty:
+            continue
         source = _clean_str(entry.get("source"), MAX_SOURCE_CHARS)
         if source:
             record["source"] = source
@@ -356,7 +374,7 @@ FLASHCARD_SCHEMA: dict[str, Any] = {
                     # Source anchoring (page/slide/section locator).
                     "source": {"type": "string"},
                 },
-                "required": ["front", "back"],
+                "required": ["front", "back", "source"],
             },
         }
     },
@@ -364,43 +382,26 @@ FLASHCARD_SCHEMA: dict[str, Any] = {
 }
 
 
-def flashcard_system_prompt(count: int, *, source: str | None = None) -> str:
-    """The Persian system prompt demanding ``count`` grounded, atomic cards.
-
-    Encodes the two rules that separate a deck people actually finish from a
-    wall of paragraphs: **minimum information** (one fact per card, lists longer
-    than five items split into enumeration cards) and **cloze-first** phrasing
-    for terms and formulas, Q/A for concepts and cause → effect. ``source``
-    names the page/slide/section of the chunk being read.
-    """
+def flashcard_system_prompt(
+    count: int, *, source: str | None = None, sources: tuple[str, ...] | None = None
+) -> str:
+    """Persian minimum-information, cloze-first and source-anchored cards."""
     total = int(count)
-    locator = " ".join(str(source or "").split())[:MAX_SOURCE_CHARS]
-    source_rule = (
-        "منبع‌دهی: هر کارت فقط از متن همین بخش ساخته شود و مقدار \"source\" دقیقاً "
-        f"همان نشانگر «{locator}» باشد؛ اگر مطلبی در این بخش نیست، کارت نساز.\n"
-        if locator
-        else ""
-    )
+    example_source = json.dumps((sources or (source or "صفحهٔ ۳",))[0], ensure_ascii=False)
     return (
-        "تو یک طراح فلش‌کارت آموزشی فارسی‌زبان هستی. فقط از متنی که در "
-        "پیام کاربر می‌آید کارت بساز؛ هیچ اطلاعات بیرونی وارد نکن.\n"
+        "تو طراح فلش‌کارت آموزشی فارسی هستی. فقط از متن داده‌شده کارت بساز؛ "
+        "اطلاعات بیرونی یا ادعاهای بدون پشتوانه اضافه نکن.\n"
         f"دقیقاً {to_persian_digits(total)} کارت بساز.\n\n"
-        "قانون طلایی (کمینه‌سازی اطلاعات):\n"
-        "- هر کارت فقط یک واقعیت را بپرسد؛ اگر جواب چند نکته دارد، آن را به چند کارت بشکن.\n"
-        "- فهرست‌های بیش از ۵ مورد را به کارت‌های شمارشی جداگانه بشکن "
-        "(مثلاً «سه نوع … کدام‌اند؟» ← یک کارت برای هر نوع).\n"
-        "- پرسش بله/خیر ممنوع است.\n"
-        "- هر روی کارت حداکثر حدود ۳۲۰ نویسه باشد؛ پاسخ بلندتر را خلاصه کن.\n"
-        "- هیچ کارتی دو مفهوم بی‌ربط را با هم نپرسد.\n\n"
-        "قالب کارت:\n"
-        "- برای اصطلاح‌ها، تعریف‌ها، فرمول‌ها و اعداد ← کارت جای‌خالی (cloze): "
-        "«…… چیست؟» یا «در فرمول ……، نماد X نشانهٔ چیست؟»\n"
-        "- برای مفاهیم، روابط علت و معلولی و مقایسه ← پرسش‌وپاسخ کوتاه.\n"
-        "- پاسخ باید از متن قابل استناد باشد، نه دانش عمومی.\n"
-        "- همهٔ متن‌ها فارسی و روان باشد.\n\n"
-        + source_rule
+        "قانون کمینه‌سازی اطلاعات:\n"
+        "- هر کارت فقط یک واقعیت را بپرسد؛ پاسخ چندنکته‌ای را به چند کارت جدا بشکن.\n"
+        "- فهرست‌های بیش از ۵ مورد را به کارت‌های شمارشی جداگانه تقسیم کن.\n"
+        "- پرسش بله/خیر ممنوع است؛ هیچ کارت دو مفهوم بی‌ربط را نپرسد.\n"
+        "- هر روی کارت حداکثر ۱۶۰ نویسه باشد و پاسخ بلند را خلاصه کن.\n"
+        "- برای اصطلاح، تعریف و فرمول ابتدا از قالب جای‌خالی استفاده کن؛ "
+        "برای مفهوم و رابطهٔ علت و معلول از پرسش‌وپاسخ کوتاه.\n\n"
+        + _source_rule(source, sources)
         + "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
-        '{"cards":[{"front": "پرسش کوتاه", "back": "پاسخ یک‌خطی", "source": "صفحهٔ ۳"}]}'
+        '{"cards":[{"front":"پرسش کوتاه", "back":"پاسخ یک‌خطی", "source":' + example_source + '}]}'
     )
 
 
@@ -409,9 +410,8 @@ def parse_flashcard_payload(
 ) -> list[dict[str, str]]:
     """Validate/clamp a model answer into at most ``count`` Q/A cards.
 
-    ``source`` is kept when present (it is optional, exactly like a quiz
-    question's difficulty) and required only for document-sourced generation.
-    A yes/no front is dropped: it is never a useful card.
+    ``source`` is required for newly generated document and booklet cards;
+    legacy callers may still parse older untagged items. A yes/no front is dropped.
     """
     raw_cards = payload.get("cards")
     if not isinstance(raw_cards, list):

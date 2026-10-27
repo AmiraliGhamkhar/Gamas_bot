@@ -46,7 +46,7 @@ OWNER = 555
 OTHER = 999
 
 
-def quiz_payload(count: int = 5) -> dict:
+def quiz_payload(count: int = 5, *, source: str = "بخش ۱") -> dict:
     return {
         "questions": [
             {
@@ -59,6 +59,8 @@ def quiz_payload(count: int = 5) -> dict:
                 ],
                 "correct": 0,
                 "explain": f"زیرا نکته {index} این‌گونه است.",
+                "source": source,
+                "difficulty": "medium",
             }
             for index in range(count)
         ]
@@ -545,7 +547,7 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
     def _cards_payload(count: int) -> dict:
         return {
             "cards": [
-                {"front": f"پرسش {index}", "back": f"پاسخ {index}"}
+                {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "بخش ۱"}
                 for index in range(count)
             ]
         }
@@ -1289,6 +1291,7 @@ def harder_payload(count: int = 10) -> dict:
             "correct": 0,
             "explain": "این گزینه با معیار تشخیصی و ایمنی همخوان است و بقیه نادرست‌اند.",
             "difficulty": difficulty,
+            "source": "بخش ۱",
         })
     return {"questions": questions}
 
@@ -1302,12 +1305,10 @@ class QuizDifficultyPromptTests(unittest.TestCase):
     def test_schema_adds_optional_difficulty_enum(self):
         items = QUIZ_SCHEMA["properties"]["questions"]["items"]
         self.assertEqual(items["properties"]["difficulty"]["enum"], ["medium", "hard"])
-        # difficulty is OPTIONAL — required still only the four legacy keys.
         self.assertEqual(
             set(items["required"]),
-            {"question", "options", "correct", "explain"},
+            {"question", "options", "correct", "explain", "difficulty", "source"},
         )
-        self.assertNotIn("difficulty", items["required"])
 
     def test_prompt_demands_40_medium_60_hard(self):
         prompt = quiz_system_prompt(10)
@@ -1319,13 +1320,11 @@ class QuizDifficultyPromptTests(unittest.TestCase):
         self.assertIn("۴ متوسط", prompt)
         self.assertIn("۶ سخت", prompt)
 
-    def test_prompt_uses_apply_analyze_evaluate_and_bans_recall(self):
+    def test_prompt_mixes_recall_comprehension_and_application(self):
         prompt = quiz_system_prompt(5)
-        for phrase in ("به‌کاربستن", "تحلیل", "ارزیابی"):
+        for phrase in ("یادآوری", "درک", "به‌کاربستن", "تحلیل", "ارزیابی"):
             self.assertIn(phrase, prompt)
-        self.assertIn("حافظه‌ای ممنوع", prompt)
-        self.assertIn("چیست؟", prompt)            # banned recall stem is named
-        self.assertIn("تعریف کن", prompt)
+        self.assertNotIn("حافظه‌ای ممنوع", prompt)
 
     def test_prompt_mandates_scenario_structure_and_json(self):
         prompt = quiz_system_prompt(5)
@@ -1581,3 +1580,51 @@ class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
         start.client = self.client
         await self.bot._handle_callback(start)
         self.assertIn("متوسط تا سخت", start.edits[-1]["text"])
+
+
+class AnchoredQualityTests(unittest.TestCase):
+    def test_presets_and_weighted_coverage(self):
+        from gamas_bot.learning import SIZE_PRESETS, distribute_counts
+
+        self.assertEqual([(entry[2], entry[3]) for entry in SIZE_PRESETS], [(10, 5), (20, 10), (40, 20)])
+        counts = distribute_counts(40, [1, 2, 3, 4])
+        self.assertEqual(sum(counts), 40)
+        self.assertTrue(all(count >= 1 for count in counts))
+        self.assertGreater(counts[-1], counts[0])
+        counts = distribute_counts(5, [1] * 20)
+        self.assertEqual(sum(counts), 5)
+        self.assertEqual(sum(count == 0 for count in counts), 15)
+        self.assertGreater(max(i for i, count in enumerate(counts) if count), 15)
+
+    def test_normalized_near_duplicates_drop_but_distinct_numbers_survive(self):
+        from gamas_bot.learning import dedupe_cards, dedupe_questions
+
+        cards = [
+            {"front": "کدام مولکول در مرحله ۱۲ تولید می‌شود؟", "back": "الف"},
+            {"front": "كدام مولكول در مرحله ۱۲ توليد مي شود؟", "back": "الف"},
+            {"front": "کدام مولکول در مرحله ۱۳ تولید می‌شود؟", "back": "ب"},
+        ]
+        self.assertEqual([card["back"] for card in dedupe_cards(cards)], ["الف", "ب"])
+        questions = [{"question": card["front"]} for card in cards]
+        self.assertEqual(len(dedupe_questions(questions)), 2)
+
+    def test_new_generation_strictly_requires_sources_and_quiz_difficulty(self):
+        card = {"cards": [{"front": "یک پرسش", "back": "یک پاسخ"}]}
+        self.assertEqual(parse_flashcard_payload(card, 1, require_source=True), [])
+        legacy = quiz_payload(1)
+        legacy["questions"][0].pop("difficulty")
+        self.assertEqual(parse_quiz_payload(legacy, 1, require_difficulty=True, require_source=True), [])
+        legacy["questions"][0]["difficulty"] = "easy"
+        self.assertEqual(parse_quiz_payload(legacy, 1, require_difficulty=True, require_source=True), [])
+        legacy["questions"][0]["difficulty"] = "hard"
+        self.assertEqual(len(parse_quiz_payload(legacy, 1, require_difficulty=True, require_source=True)), 1)
+
+    def test_json_examples_use_only_the_allowed_source(self):
+        from gamas_bot.learning import flashcard_system_prompt
+
+        for key, prompt in (
+            ("cards", flashcard_system_prompt(10, sources=("اسلاید ۲",))),
+            ("questions", quiz_system_prompt(5, sources=("بخش «مبحث»",))),
+        ):
+            example = json.loads(prompt[prompt.rindex('{"' + key + '"'):])
+            self.assertEqual(example[key][0]["source"], "اسلاید ۲" if key == "cards" else "بخش «مبحث»")
