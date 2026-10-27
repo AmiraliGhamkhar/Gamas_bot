@@ -32,13 +32,14 @@ import shutil
 import sqlite3
 import tempfile
 import time
+import weakref
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import aiohttp
 from telethon import Button, TelegramClient, events
-from telethon.errors import FloodWaitError, MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
 from telethon.tl.custom.message import Message
 from telethon.tl.types import MessageMediaWebPage
 
@@ -79,6 +80,7 @@ from .jobs import Job, JobQueue, QueueFullError
 from .doc_extract import (
     DocChunk,
     DocExtractError,
+    EmptyPresentationTextError,
     ExtractedDoc,
     ScannedPdfError,
     chunk_sections,
@@ -315,11 +317,9 @@ LEARNING_NO_CREDIT = (
     "💳 اعتبار شما کافی نیست.\n"
     "از «🛒 خرید اشتراک» اعتبار بگیرید."
 )
-#: §6.11 every refunded generation failure.
-LEARNING_GENERATION_FAILED = (
-    "ساخت محتوا ناموفق بود؛ اعتبار شما کامل برگشت داده شد.\n"
-    "کمی بعد دوباره امتحان کنید."
-)
+#: A failure notice is kept separate from the actual refund result.
+LEARNING_GENERATION_FAILED = "ساخت محتوا ناموفق بود.\nکمی بعد دوباره امتحان کنید."
+LEARNING_CREDIT_RESTORED = "💳 اعتبار شما کامل برگشت داده شد."
 #: Appended to booklet captions (§6.12); the stored library title stays clean.
 LEARNING_DELIVERY_CTA = (
     "\n🧪 از همین جزوه آزمون بده یا 🃏 فلش‌کارت بساز: «📚 کتابخانه من»"
@@ -343,11 +343,15 @@ FREE_TRY_USED_NOTICE = (
 )
 #: Shown when a provider fault after claiming the gift gives it back (R3.4).
 FREE_TRY_RESTORED = "🎁 هدیهٔ اولین بار شما برگشت؛ دوباره تلاش کنید."
+LEARNING_REFUND_PENDING_NOTICE = "بازگشت اعتبار یا هدیه فعلاً ناموفق بود؛ لطفاً با پشتیبانی تماس بگیرید."
 #: Generation preview/curation strings (R5.1).
 CURATION_GUIDANCE = (
     "هر مورد را که نمی‌خواهید حذف کنید، بعد «✅ ذخیره» را بزنید."
 )
 CURATION_STALE_ALERT = "این پیش‌نمایش دیگر معتبر نیست؛ دوباره بسازید."
+#: Progress is decorative: a slow Telegram edit must not hold a model slot or
+#: delay the finished preview indefinitely.
+LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS = 1.0
 #: A document upload that is not a supported document type.
 DOC_UNSUPPORTED_HINT = (
     "⚠️ فقط PDF، Word (docx) یا PowerPoint (pptx) به‌عنوان سند پذیرفته می‌شود."
@@ -433,7 +437,7 @@ def raw_parts(
     An empty list means the text cannot be delivered within ``max_parts``: the
     caller refuses it instead of shipping a truncated transcript.
     """
-    body = text.strip("\n")
+    body = text
     if not body.strip():
         return []
     if max_chars <= 0 or max_parts <= 0:
@@ -457,12 +461,11 @@ def raw_parts(
             if index >= max_chars // 2:
                 cut = index + len(boundary)
                 break
-        # The part keeps its boundary characters and the remainder drops only
-        # the newlines the boundary already ended with: rejoining the parts
-        # reproduces the transcript exactly, including between words.
+        # Keep every boundary character, including consecutive newlines, so
+        # rejoining delivered parts reproduces the full transcript exactly.
         parts.append(rest[:cut])
-        rest = rest[cut:].lstrip("\n")
-    return [part for part in parts if part.strip()]
+        rest = rest[cut:]
+    return parts
 
 
 def _is_safe_receipt_path(receipt_dir: Path, receipt_path: str | Path) -> bool:
@@ -659,6 +662,17 @@ def plan_download_ranges(total_bytes: int, connections: int) -> list[tuple[int, 
     return ranges
 
 
+def _pwrite_all(descriptor: int, payload: bytes, offset: int) -> None:
+    """Write an entire range chunk, including on a short positional write."""
+    view = memoryview(payload)
+    written = 0
+    while written < len(view):
+        count = os.pwrite(descriptor, view[written:], offset + written)
+        if count <= 0:
+            raise OSError("short positional write while saving Telegram download")
+        written += count
+
+
 async def _download_media_ranges(
     client,
     message,
@@ -692,6 +706,7 @@ async def _download_media_ranges(
 
     async def fetch(offset: int, chunks: int) -> None:
         position = offset
+        end = min(size, offset + chunks * TELEGRAM_DOWNLOAD_CHUNK_BYTES)
         async for piece in client.iter_download(
             message.media,
             offset=offset,
@@ -700,7 +715,9 @@ async def _download_media_ranges(
             file_size=size,
         ):
             payload = bytes(piece)
-            await run_file_io(os.pwrite, descriptor, payload, position)
+            if not payload or position + len(payload) > end:
+                raise RuntimeError("Telegram download returned an invalid range")
+            await run_file_io(_pwrite_all, descriptor, payload, position)
             position += len(payload)
             written[0] += len(payload)
             last_progress[0] = time.monotonic()
@@ -708,6 +725,10 @@ async def _download_media_ranges(
                 raise UploadTooLargeError(
                     f"file exceeds limit ({limit_bytes} bytes)"
                 )
+        # A later range can extend the file to its expected size even when an
+        # earlier one stopped short. Checking stat().st_size alone misses holes.
+        if position != end:
+            raise RuntimeError(f"Telegram download ended at {position}, expected {end}")
 
     tasks = [
         asyncio.create_task(fetch(offset, chunks)) for offset, chunks in ranges
@@ -995,6 +1016,11 @@ class GamasBot:
         )
         self._download_semaphore = asyncio.Semaphore(settings.max_concurrent_downloads)
         self._media_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
+        # Bound memory-heavy PDF/Office parsing separately from media workers.
+        self._document_semaphore = asyncio.Semaphore(settings.media_worker_concurrency)
+        self._document_locks: weakref.WeakValueDictionary[tuple[int, str], asyncio.Lock] = (
+            weakref.WeakValueDictionary()
+        )
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_uploads)
         self._seen_messages: dict[tuple[int, int], float] = {}
         self._active_upload_keys: dict[tuple[int, str], str] = {}
@@ -1016,7 +1042,7 @@ class GamasBot:
         # Per-user generation guards: a second quiz/deck tap while the LLM is
         # running must not deduct twice (the DB session row does not exist yet
         # during generation, so the guard has to live in process memory).
-        self._learning_locks: dict[int, asyncio.Lock] = {}
+        self._learning_locks: weakref.WeakValueDictionary[int, asyncio.Lock] = weakref.WeakValueDictionary()
         self._learning_in_flight: set[int] = set()
         #: Preview/curation state of a generation that is validated but not yet
         #: saved: ``{kind, items, page, title, item_id, doc_id, cost, free,
@@ -1025,6 +1051,8 @@ class GamasBot:
         self._curation: dict[int, dict[str, Any]] = {}
         self._curation_tasks: dict[int, asyncio.Task] = {}
         self._learning_tasks: dict[int, asyncio.Task] = {}
+        self._admission_tasks: set[asyncio.Task[Any]] = set()
+        self._intake_tasks: set[asyncio.Task[Any]] = set()
         self._shutting_down = False
         #: Admins waiting for the "search user by id or @username" answer.
         self._pending_user_search: set[int] = set()
@@ -1079,6 +1107,9 @@ class GamasBot:
         recovered = await self.db.recover_pending_free_uses()
         if recovered:
             logger.info("restored %s interrupted free learning claims", recovered)
+        refunded = await self.db.recover_pending_learning_charges()
+        if refunded:
+            logger.info("refunded %s interrupted paid learning charges", refunded)
         await run_file_io(self._sweep_stale_temp_dirs)
         self.queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
@@ -1107,7 +1138,7 @@ class GamasBot:
         for entry in root.iterdir():
             if not entry.is_dir() or entry.is_symlink():
                 continue
-            if not entry.name.startswith(("submission-", "deck-")):
+            if not entry.name.startswith(("submission-", "deck-", "doc-")):
                 continue
             try:
                 if entry.stat().st_mtime >= self._started_at:
@@ -1121,16 +1152,24 @@ class GamasBot:
 
     async def shutdown(self) -> None:
         self._shutting_down = True
+        current = asyncio.current_task()
+        admissions = [
+            task for task in self._admission_tasks | self._intake_tasks
+            if task is not current and not task.done()
+        ]
+        for task in admissions:
+            task.cancel()
+        if admissions:
+            await asyncio.gather(*admissions, return_exceptions=True)
         # Stop active LLM callbacks while SQLite is still open so their
         # cancellation handlers can compensate any claimed gift or debit.
-        current = asyncio.current_task()
         learning = [task for task in set(self._learning_tasks.values()) if task is not current and not task.done()]
         for task in learning:
             task.cancel()
         if learning:
             await asyncio.gather(*learning, return_exceptions=True)
         # An unsaved preview is not a delivery. Refund it before closing SQLite;
-        # ungraceful termination is covered by recover_pending_free_uses().
+        # startup recovery also compensates interrupted free and paid claims.
         timers = list(self._curation_tasks.values())
         self._curation_tasks.clear()
         for task in timers:
@@ -1172,13 +1211,22 @@ class GamasBot:
                 )
                 if job.message is not None:
                     try:
-                        await job.message.reply(
-                            "⏸ ربات در حال راه‌اندازی مجدد است؛ کار شما لغو شد. لطفاً دوباره بفرستید."
+                        await asyncio.wait_for(
+                            job.message.reply(
+                                "⏸ ربات در حال راه‌اندازی مجدد است؛ کار شما لغو شد. لطفاً دوباره بفرستید."
+                            ),
+                            timeout=2.0,
                         )
                     except Exception:
                         pass
             except Exception:
                 logger.warning("failed to mark queued job as failed submission=%s", job.submission_id)
+            finally:
+                fp = self._upload_fingerprint(job.message)
+                key = (job.user_id, fp) if fp is not None else None
+                if key is not None and self._active_upload_keys.get(key) == job.job_id:
+                    self._active_upload_keys.pop(key, None)
+                await self._close_cancelled_progress(job)
 
         await self.queue.shutdown(on_reject=_fail_queued)
         if self._http is not None:
@@ -1273,7 +1321,13 @@ class GamasBot:
                     pass
 
     async def _ack(self, event, text: str | None = None, *, alert: bool = False) -> None:
+        # Telethon permits one answer per callback, and its edit/respond methods
+        # can also answer automatically. Track explicit answers for test doubles
+        # and consult Telethon's own flag for auto-answered callbacks.
+        if getattr(event, "_gamas_answered", False) or getattr(event, "_answered", False):
+            return
         try:
+            event._gamas_answered = True
             await event.answer(text, alert=alert)
         except Exception:
             logger.debug("callback answer failed", exc_info=True)
@@ -1471,8 +1525,9 @@ class GamasBot:
             [
                 [
                     Button.inline("📖 جزوه‌ها", b"library"),
-                    Button.inline("🃏 فلش‌کارت‌ها", b"library:fc"),
+                    Button.inline("📄 اسناد", b"lib:docs:0"),
                 ],
+                [Button.inline("🃏 فلش‌کارت‌ها", b"library:fc")],
                 [Button.inline("🛒 خرید اشتراک", b"wallet")],
                 [Button.inline("↩️ منوی اصلی", b"menu:main")],
             ],
@@ -1524,14 +1579,14 @@ class GamasBot:
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
         try:
-            if item["unavailable"]:
-                raise RuntimeError("Telegram source was already marked unavailable")
-            await self.client.forward_messages(
+            forwarded = await self.client.forward_messages(
                 event.chat_id,
                 [int(item["message_id"])],
                 from_peer=int(item["chat_id"]),
             )
-        except Exception:
+            if not forwarded or (isinstance(forwarded, (list, tuple)) and not any(forwarded)):
+                raise MessageIdInvalidError(request=None)
+        except MessageIdInvalidError:
             try:
                 await self.db.library_mark_unavailable(item_id)
             except Exception:
@@ -1539,6 +1594,18 @@ class GamasBot:
                     "could not mark unavailable library item=%s", item_id, exc_info=True
                 )
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        except Exception:
+            # Flood waits, temporary network errors, and other ambiguous errors
+            # do not prove that the message was deleted. Keep it retryable.
+            logger.warning("library forward failed item=%s", item_id, exc_info=True)
+            await self._ack(event, "ارسال فایل موقتاً ناموفق بود؛ دوباره تلاش کنید.", alert=True)
+            return
+        if item["unavailable"]:
+            try:
+                await self.db.library_mark_available(item_id)
+            except Exception:
+                logger.warning("could not clear library unavailable flag item=%s", item_id, exc_info=True)
 
     # ------------------------------------------------------------- documents
     async def _document_library_item(self, user_id: int, document: dict) -> int:
@@ -1585,6 +1652,15 @@ class GamasBot:
             raise RuntimeError("document vanished after insert")
         return document, created
 
+    def _document_lock(self, user_id: int, digest: str) -> asyncio.Lock:
+        """Share extraction for simultaneous identical uploads by one owner."""
+        key = (user_id, digest)
+        lock = self._document_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._document_locks[key] = lock
+        return lock
+
     async def _ingest_document(
         self,
         user_id: int,
@@ -1596,50 +1672,52 @@ class GamasBot:
     ) -> tuple[dict, bool]:
         """Hash → (dedupe) → extract → chunk → store. Blocking work is off-loop."""
         digest = await run_file_io(sha256_file, path)
-        existing = await self.db.document_by_hash(user_id, digest)
-        if existing is not None:
-            # Reuse the extraction, but retain the newest Telegram reference in
-            # case the older upload has since been deleted.
-            await self.db.document_update_reference(user_id, int(existing["id"]), file_msg_ref)
-            await self._document_library_item(user_id, existing)
-            return (await self.db.document_get(user_id, int(existing["id"]))) or existing, False
-        extract_path = path
-        if source_type == "pptx" and path.suffix.lower() in {".ppt", ".pps", ".pot"}:
-            try:
-                extract_path = await self._run_media_operation(
-                    convert_to_pptx, path, path.parent / "converted", self.settings
-                )
-            except MediaToolError as exc:
+        async with self._document_lock(user_id, digest):
+            existing = await self.db.document_by_hash(user_id, digest)
+            if existing is not None:
+                # Reuse the extraction, but retain the newest Telegram reference in
+                # case the older upload has since been deleted.
+                await self.db.document_update_reference(user_id, int(existing["id"]), file_msg_ref)
+                await self._document_library_item(user_id, existing)
+                return (await self.db.document_get(user_id, int(existing["id"]))) or existing, False
+            extract_path = path
+            if source_type == "pptx" and path.suffix.lower() in {".ppt", ".pps", ".pot"}:
+                try:
+                    extract_path = await self._run_media_operation(
+                        convert_to_pptx, path, path.parent / "converted", self.settings
+                    )
+                except MediaToolError as exc:
+                    raise DocExtractError(
+                        "تبدیل ارائهٔ قدیمی ناموفق بود؛ لطفاً نسخهٔ pptx را بفرستید."
+                    ) from exc
+            async with self._document_semaphore:
+                extracted: ExtractedDoc = await run_file_io(extract_document, extract_path, source_type)
+            text = await run_file_io(lambda: extracted.text)
+            if not text.strip():
                 raise DocExtractError(
-                    "تبدیل ارائهٔ قدیمی ناموفق بود؛ لطفاً نسخهٔ pptx را بفرستید."
-                ) from exc
-        extracted: ExtractedDoc = await run_file_io(extract_document, extract_path, source_type)
-        text = await run_file_io(lambda: extracted.text)
-        if not text.strip():
-            raise DocExtractError(
-                "متنی از این سند استخراج نشد؛ OCR پشتیبانی نمی‌شود."
+                    "متنی از این سند استخراج نشد؛ OCR پشتیبانی نمی‌شود."
+                )
+            chunks = await run_file_io(chunk_sections, extracted.sections, max_chars=MAX_MODEL_INPUT_CHARS)
+            title = document_title(filename, source_type)
+            document, created = await self._save_document(
+                user_id,
+                source_type=source_type,
+                title=title,
+                file_msg_ref=file_msg_ref,
+                sha256=digest,
+                page_count=int(extracted.page_count),
+                text=text,
+                chunks=chunks,
             )
-        chunks = await run_file_io(chunk_sections, extracted.sections, max_chars=MAX_MODEL_INPUT_CHARS)
-        title = document_title(filename, source_type)
-        document, created = await self._save_document(
-            user_id,
-            source_type=source_type,
-            title=title,
-            file_msg_ref=file_msg_ref,
-            sha256=digest,
-            page_count=int(extracted.page_count),
-            text=text,
-            chunks=chunks,
-        )
-        if not created:
-            await self.db.document_update_reference(user_id, int(document["id"]), file_msg_ref)
-        await self._document_library_item(user_id, document)
-        document = (await self.db.document_get(user_id, int(document["id"]))) or document
-        logger.info(
-            "document ingested user=%s type=%s pages=%s chars=%s chunks=%s created=%s",
-            user_id, source_type, extracted.page_count, len(text), len(chunks), created,
-        )
-        return document, created
+            if not created:
+                await self.db.document_update_reference(user_id, int(document["id"]), file_msg_ref)
+            await self._document_library_item(user_id, document)
+            document = (await self.db.document_get(user_id, int(document["id"]))) or document
+            logger.info(
+                "document ingested user=%s type=%s pages=%s chars=%s chunks=%s created=%s",
+                user_id, source_type, extracted.page_count, len(text), len(chunks), created,
+            )
+            return document, created
 
     def _document_card_text(self, document: dict) -> str:
         """Type, size and a text preview — the "extraction succeeded" proof."""
@@ -1670,7 +1748,28 @@ class GamasBot:
         buttons.append([Button.inline("📚 کتابخانه", b"lib:docs:0")])
         return buttons
 
+    async def _guard_file_intake(self, event, operation) -> None:
+        """Join document/receipt handlers before shutdown closes SQLite."""
+        if self._shutting_down:
+            await event.respond("ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.")
+            return
+        task = asyncio.current_task()
+        if task is not None:
+            self._intake_tasks.add(task)
+        try:
+            await operation()
+        finally:
+            if task is not None:
+                self._intake_tasks.discard(task)
+
     async def _accept_document(
+        self, event, user_id: int, source_type: str, filename: str | None
+    ) -> None:
+        await self._guard_file_intake(
+            event, lambda: self._accept_document_inner(event, user_id, source_type, filename)
+        )
+
+    async def _accept_document_inner(
         self, event, user_id: int, source_type: str, filename: str | None
     ) -> None:
         """Download, extract and store an uploaded document, then preview it."""
@@ -1683,7 +1782,12 @@ class GamasBot:
             )
             return
         progress = await event.respond("⏳ در حال استخراج متن…")
-        workdir = Path(tempfile.mkdtemp(dir=self.settings.temp_dir, prefix="doc-"))
+        workdir = Path(await run_file_io_resource(
+            tempfile.mkdtemp,
+            lambda path: shutil.rmtree(path, ignore_errors=True),
+            dir=self.settings.temp_dir,
+            prefix="doc-",
+        ))
         try:
             suffix = Path(filename).suffix.lower() if filename else f".{source_type}"
             path = workdir / f"source{suffix}"
@@ -1707,6 +1811,22 @@ class GamasBot:
                 )
             except ScannedPdfError as exc:
                 await self._edit(progress, str(exc))
+                return
+            except EmptyPresentationTextError as exc:
+                # A textless slide can still contain narration. Offer the
+                # original audio pipeline without inventing an empty document
+                # or charging until the user explicitly chooses it. The source
+                # message id is scoped to their own private chat on callback.
+                buttons = None
+                if isinstance(message_id, int) and message_id > 0:
+                    buttons = [[Button.inline(
+                        "🎧 پردازش صدای ارائه", f"doc:lecturemsg:{message_id}".encode("ascii")
+                    )]]
+                await self._edit(
+                    progress,
+                    f"⚠️ {exc}\nاگر ارائه صدای ضبط‌شده دارد، می‌توانید آن را پردازش کنید.",
+                    buttons,
+                )
                 return
             except DocExtractError as exc:
                 await self._edit(progress, f"⚠️ {exc}")
@@ -1745,23 +1865,38 @@ class GamasBot:
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
 
     async def _start_document_presentation(self, event, user_id: int, document_id: int) -> None:
-        """Opt into the unchanged narrated-presentation job from its cached file."""
-        from types import SimpleNamespace
-
+        """Opt into the narrated-presentation job from its owner-scoped cache."""
         document = await self.db.document_get(user_id, document_id)
         if not document or document["source_type"] != "pptx":
             await event.respond("این ارائه در دسترس نیست.")
             return
         try:
             chat_id, message_id = (int(part) for part in str(document["file_msg_ref"]).split(":", 1))
-            message = await self.client.get_messages(chat_id, ids=message_id)
-            if message is None:
-                raise ValueError("source message missing")
+        except (ValueError, TypeError):
+            await event.respond("فایل اصلی ارائه در دسترس نیست؛ لطفاً دوباره آن را بفرستید.")
+            return
+        await self._start_presentation_from_message(event, user_id, chat_id, message_id)
+
+    async def _start_presentation_from_message(
+        self, event, user_id: int, chat_id: int, message_id: int
+    ) -> None:
+        """Queue an original upload only from the requesting user's private chat."""
+        from types import SimpleNamespace
+
+        try:
+            if chat_id != user_id or message_id <= 0:
+                raise ValueError("presentation source is not in the user's private chat")
+            message = await self.client.get_messages(user_id, ids=message_id)
+            if message is None or getattr(message, "out", False):
+                raise ValueError("source upload missing")
+            sender_id = getattr(message, "sender_id", None)
+            if sender_id is not None and sender_id != user_id:
+                raise ValueError("source upload belongs to another sender")
             kind, filename = _presentation_metadata(message)
             if kind not in {"native", "legacy"}:
                 raise ValueError("source is not a supported presentation")
         except Exception:
-            logger.warning("presentation source unavailable document=%s", document_id, exc_info=True)
+            logger.warning("presentation source unavailable user=%s", user_id, exc_info=True)
             await event.respond("فایل اصلی ارائه در دسترس نیست؛ لطفاً دوباره آن را بفرستید.")
             return
         job_event = SimpleNamespace(
@@ -2062,17 +2197,21 @@ class GamasBot:
         if await self.db.is_unlimited(user_id):
             return (False, False, None)
         claim_id = secrets.token_hex(16)
-        if await self.db.consume_free_use(user_id, kind, claim_id=claim_id):
+        if await self.db.consume_free_use(
+            user_id, kind, claim_id=claim_id, require_limited=True
+        ):
             return (True, False, claim_id)
         try:
-            charged = await self.db.spend_seconds(user_id, cost, note)
+            charged = await self.db.spend_seconds(
+                user_id, cost, note, operation_id=claim_id
+            )
         except InsufficientBalanceError:
             await event.respond(
                 LEARNING_NO_CREDIT,
                 buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
             )
             return None
-        return (False, bool(charged), None)
+        return (False, bool(charged), claim_id if charged else None)
 
     async def _refund_generation(
         self,
@@ -2084,23 +2223,31 @@ class GamasBot:
         kind: str,
         note: str,
         claim_id: str | None = None,
-    ) -> None:
+    ) -> bool:
         """Give back whatever the failed/cancelled generation cost the user.
 
         ``kind`` is passed in rather than inferred from the ledger note: the
         note is a free-form string shared with the ledger, and a deleted deck
         from a document must still restore the *deck* gift, not the quiz one.
         """
+        refunded = True
         if charged:
             try:
-                await self.db.refund_seconds(user_id, cost, note)
+                if not claim_id:
+                    raise ValueError("paid learning charge has no operation id")
+                await self.db.refund_learning_charge(user_id, claim_id)
             except Exception:
+                # A still-pending charge remains durable and is retried by
+                # startup recovery even if a transient database error strikes.
                 logger.exception("learning refund failed user=%s cost=%s", user_id, cost)
+                refunded = False
         if free:
             try:
                 await self.db.refund_free_use(user_id, kind, claim_id=claim_id)
             except Exception:
                 logger.exception("free-use rollback failed user=%s", user_id)
+                refunded = False
+        return refunded
 
     async def _progress_edit(self, message, done: int, total: int) -> None:
         """Live chunk progress («در حال تولید… بخش ۳ از ۷»); never fatal."""
@@ -2122,15 +2269,33 @@ class GamasBot:
     ) -> tuple[list[dict[str, Any]], int]:
         """Generate concurrently; retry an invalid chunk once, then report it."""
         schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
-        concurrency = min(5, max(3, int(self.settings.learning_chunk_concurrency)))
+        concurrency = min(8, max(1, int(self.settings.learning_chunk_concurrency)))
         semaphore = asyncio.Semaphore(concurrency)
-        progress_lock = asyncio.Lock()
         active = [index for index, count in enumerate(counts) if count > 0]
         total = len(active)
         state = {"done": 0, "failed": 0}
         session = self._http_session()
+        progress_task: asyncio.Task[None] | None = None
+
+        async def report_progress() -> None:
+            # Coalesce completions while an edit is in flight. Only one edit
+            # can run at a time, and a stalled Telegram request is bounded.
+            while True:
+                done = state["done"]
+                try:
+                    await asyncio.wait_for(
+                        self._progress_edit(placeholder, done, total),
+                        timeout=LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("learning progress edit timed out")
+                except Exception:
+                    logger.debug("learning progress edit failed", exc_info=True)
+                if done == state["done"]:
+                    return
 
         async def one(index: int) -> list[dict[str, Any]]:
+            nonlocal progress_task
             chunk = chunks[index]
             count = counts[index]
             allowed = tuple(dict.fromkeys(
@@ -2179,14 +2344,35 @@ class GamasBot:
                             "chunk generation failed kind=%s chunk=%s attempt=%s",
                             kind, index, attempt + 1, exc_info=True,
                         )
-                async with progress_lock:
-                    if len(items) < count:
-                        state["failed"] += 1
-                    state["done"] += 1
-                    await self._progress_edit(placeholder, state["done"], total)
-                return items
+            # Release the LLM semaphore before any Telegram activity; a slow
+            # progress edit must not prevent the next chunk from starting.
+            if len(items) < count:
+                state["failed"] += 1
+            state["done"] += 1
+            if progress_task is None or progress_task.done():
+                progress_task = asyncio.create_task(report_progress())
+            return items
 
-        results = await asyncio.gather(*(one(index) for index in active))
+        tasks = [asyncio.create_task(one(index)) for index in active]
+        try:
+            results = await asyncio.gather(*tasks)
+            if progress_task is not None:
+                try:
+                    # Join before rendering the final curation screen so a
+                    # late progress edit cannot overwrite it.
+                    await asyncio.wait_for(
+                        progress_task, timeout=LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("final learning progress edit timed out")
+        except BaseException:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if progress_task is not None:
+                progress_task.cancel()
+                await asyncio.gather(progress_task, return_exceptions=True)
+            raise
         return [item for group in results for item in group], state["failed"]
 
     async def _generate_learning(
@@ -2217,6 +2403,9 @@ class GamasBot:
         if not chunks:
             await event.respond("متنی برای ساخت محتوا پیدا نشد. فایل دیگری بفرستید.")
             return
+        # This can run for minutes; stop Telegram's button spinner only after
+        # the fast validation paths had a chance to report a specific alert.
+        await self._ack(event)
         # Let a claim/debit transaction finish even if its caller is cancelled
         # at COMMIT, then compensate the exact result before propagating it.
         budget_task = asyncio.create_task(self._claim_generation_budget(event, user_id, kind, cost, note))
@@ -2265,14 +2454,19 @@ class GamasBot:
         except BaseException as exc:
             if state is not None and self._curation.get(user_id) is state:
                 self._curation.pop(user_id, None)
-            await self._refund_generation(
+            refund_ok = await self._refund_generation(
                 user_id, cost=cost, charged=charged, free=free, kind=kind,
                 note=note, claim_id=claim_id,
             )
             if placeholder is not None:
                 try:
+                    notice = (
+                        LEARNING_REFUND_PENDING_NOTICE if not refund_ok
+                        else LEARNING_CREDIT_RESTORED if charged
+                        else FREE_TRY_RESTORED if free else ""
+                    )
                     await placeholder.edit(
-                        LEARNING_GENERATION_FAILED + (f"\n{FREE_TRY_RESTORED}" if free else "")
+                        LEARNING_GENERATION_FAILED + (f"\n{notice}" if notice else "")
                     )
                 except Exception:
                     logger.warning("could not edit generation placeholder", exc_info=True)
@@ -2290,8 +2484,8 @@ class GamasBot:
         age = time.monotonic() - float(state.get("created_at") or 0)
         return age > self.CURATION_TTL_SECONDS
 
-    async def _refund_curation_state(self, user_id: int, state: dict[str, Any]) -> None:
-        await self._refund_generation(
+    async def _refund_curation_state(self, user_id: int, state: dict[str, Any]) -> bool:
+        return await self._refund_generation(
             user_id, cost=int(state.get("cost") or 0),
             charged=bool(state.get("charged")), free=bool(state.get("free")),
             kind=str(state.get("kind") or "deck"), note=str(state.get("note") or ""),
@@ -2306,7 +2500,7 @@ class GamasBot:
         timer = self._curation_tasks.pop(user_id, None)
         if timer is not None and timer is not asyncio.current_task():
             timer.cancel()
-        await self._refund_curation_state(user_id, state)
+        state["refund_ok"] = await self._refund_curation_state(user_id, state)
         return True
 
     def _schedule_curation_expiry(self, user_id: int, state: dict[str, Any]) -> None:
@@ -2433,10 +2627,16 @@ class GamasBot:
             await self._ack(event, CURATION_STALE_ALERT, alert=True)
             return
         await self._ack(event, "لغو شد.")
+        if not state.get("refund_ok", True):
+            result = LEARNING_REFUND_PENDING_NOTICE
+        elif state.get("charged"):
+            result = "اعتبار شما برگشت."
+        elif state.get("free"):
+            result = "هدیهٔ رایگان شما حفظ شد."
+        else:
+            result = "هزینه‌ای کسر نشده است."
         await self._edit(
-            event,
-            "❌ ساخت لغو شد؛ "
-            + ("اعتبار شما برگشت." if state.get("charged") else "هدیهٔ رایگان شما حفظ شد."),
+            event, "❌ ساخت لغو شد؛ " + result,
             [[Button.inline("📚 کتابخانه من", b"library")]],
         )
 
@@ -2459,20 +2659,27 @@ class GamasBot:
             if state["kind"] == "deck":
                 artifact_id = await self.db.deck_create_with_cards(
                     user_id, int(state["item_id"]), str(state["title"])[:200], items,
-                    free_claim_id=state.get("claim_id"),
+                    free_claim_id=state.get("claim_id") if state.get("free") else None,
+                    paid_charge_id=state.get("claim_id") if state.get("charged") else None,
                 )
             else:
                 artifact_id = await self.db.quiz_create_session(
                     user_id, int(state["item_id"]), items,
-                    free_claim_id=state.get("claim_id"),
+                    free_claim_id=state.get("claim_id") if state.get("free") else None,
+                    paid_charge_id=state.get("claim_id") if state.get("charged") else None,
                 )
         except BaseException as exc:
             await self._release_curation(user_id, state)
             if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                 raise
             logger.exception("could not save curated learning content")
+            notice = (
+                LEARNING_REFUND_PENDING_NOTICE if not state.get("refund_ok", True)
+                else LEARNING_CREDIT_RESTORED if state.get("charged")
+                else FREE_TRY_RESTORED if state.get("free") else ""
+            )
             await self._edit(
-                event, LEARNING_GENERATION_FAILED + (f"\n{FREE_TRY_RESTORED}" if state.get("free") else ""),
+                event, LEARNING_GENERATION_FAILED + (f"\n{notice}" if notice else ""),
                 [[Button.inline("📚 کتابخانه من", b"library")]],
             )
             return
@@ -3593,6 +3800,13 @@ class GamasBot:
                 return
             await self._start_document_presentation(event, user_id, document_id)
             return
+        if action == "lecturemsg" and len(parts) == 3:
+            message_id = _to_int(parts[2])
+            if message_id is None or message_id <= 0:
+                await self._ack(event, "این ارائه پیدا نشد.", alert=True)
+                return
+            await self._start_presentation_from_message(event, user_id, user_id, message_id)
+            return
         if action in ("fc", "quiz") and len(parts) == 3:
             document_id = _to_int(parts[2])
             if document_id is None:
@@ -3711,19 +3925,32 @@ class GamasBot:
 
     # ------------------------------------------------------------- callbacks
     async def _handle_callback(self, event) -> None:
+        """Answer each callback once, after specific alerts have had priority.
+
+        Telethon ignores all answers after the first one. A blanket empty answer
+        before routing therefore hides stale/invalid/busy alerts. Screen edits
+        answer automatically; long generation explicitly answers once it starts.
+        """
+        try:
+            await self._dispatch_callback(event)
+        except Exception:
+            await self._ack(event, "خطایی رخ داد؛ دوباره امتحان کنید.", alert=True)
+            raise
+        finally:
+            await self._ack(event)
+
+    async def _dispatch_callback(self, event) -> None:
         if self._shutting_down:
             await self._ack(event, "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.", alert=True)
             return
         data = (event.data or b"").decode("utf-8", "replace").strip()
         user_id = event.sender_id
         if user_id is None:
-            await self._ack(event)
             return
         # Ignore callbacks outside private chats before touching per-user state.
         # CallbackQuery may report None on older Telethon builds; treating only
         # literal False as group context would let those events through.
         if not getattr(event, "is_private", False):
-            await self._ack(event)
             return
         # The ban gate is enforced on callbacks as well as messages: a blocked
         # user must not be able to act on a stale keyboard (audit F-05).
@@ -3770,7 +3997,6 @@ class GamasBot:
         self._pending_flashcard_front.pop(user_id, None)
 
         if data == "help":
-            await self._ack(event)
             guide = (
                 "ℹ️ راهنمای گاماس\n\n"
                 "🎧 فایل صوت/ویدیو یا 📄 سند PDF، Word و پاورپوینت را همین‌جا بفرستید.\n"
@@ -3788,19 +4014,14 @@ class GamasBot:
                 buttons=[[Button.inline("↩️ منوی اصلی", b"menu:main")]],
             )
         elif data == "menu:main":
-            await self._ack(event)
             await self._show_main(event)
         elif data == "library":
-            await self._ack(event)
             await self._show_library(event)
         elif data == "library:fc":
-            await self._ack(event)
             await self._show_flashcard_hub(event)
         elif data == "board":
-            await self._ack(event)
             await self._show_leaderboard(event)
         elif data.startswith("lib:docs"):
-            await self._ack(event)
             parts = data.split(":")
             page = _to_int(parts[2]) if len(parts) > 2 else 0
             if page is None:
@@ -3808,51 +4029,42 @@ class GamasBot:
                 return
             await self._show_documents(event, page=max(0, page))
         elif data.startswith("lib:doc:"):
-            await self._ack(event)
             document_id = _to_int(data.rsplit(":", 1)[-1])
             if document_id is None:
                 await self._ack(event, "این سند پیدا نشد.", alert=True)
             else:
                 await self._show_document_card(event, user_id, document_id)
         elif data.startswith("doc:"):
-            await self._ack(event)
             await self._route_document_callback(event, user_id, data)
         elif data.startswith("lib:f:"):
-            await self._ack(event)
             item_id = _to_int(data.rsplit(":", 1)[-1])
             if item_id is None:
                 await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             else:
                 await self._forward_library_item(event, user_id, item_id)
         elif data.startswith("lib:it:"):
-            await self._ack(event)
             item_id = _to_int(data.rsplit(":", 1)[-1])
             if item_id is None:
                 await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             else:
                 await self._show_library_item(event, item_id)
         elif data.startswith("lib:"):
-            await self._ack(event)
             page = _to_int(data.split(":", 1)[1])
             if page is None:
                 await self._ack(event, "صفحهٔ کتابخانه نامعتبر است.", alert=True)
             else:
                 await self._show_library(event, page=max(0, page))
         elif data == "wallet":
-            await self._ack(event)
             await self._show_wallet(event)
         elif data.startswith("walletp:"):
-            await self._ack(event)
             page = _to_int(data.split(":", 1)[1])
             if page is None:
                 await self._ack(event, "صفحهٔ پرداخت‌ها نامعتبر است.", alert=True)
             else:
                 await self._show_wallet(event, payments_page=max(0, page))
         elif data.startswith("plan:"):
-            await self._ack(event)
             await self._start_payment(event, data.split(":", 1)[1])
         elif data.startswith(("payr:", "payc:", "payopen:")):
-            await self._ack(event)
             try:
                 payment_id = int(data.split(":", 1)[1])
             except ValueError:
@@ -3867,13 +4079,11 @@ class GamasBot:
         elif data.startswith("payv:"):
             await self._review_payment(event, data)
         elif data == "adm:home":
-            await self._ack(event)
             await self._show_admin_overview(event)
         elif data.startswith("adm:ov"):
             # Dashboard navigation. The window is part of the callback data and
             # is validated here, so a forged or stale value opens the default
             # window instead of an arbitrary one (and never reaches SQL).
-            await self._ack(event)
             parts = data.split(":")
             section = parts[1] if len(parts) > 1 else "ov"
             period = parts[2] if len(parts) > 2 else "7d"
@@ -3893,13 +4103,10 @@ class GamasBot:
             else:
                 await self._ack(event, "بخش گزارش نامعتبر است.", alert=True)
         elif data.startswith("adm:hub:"):
-            await self._ack(event)
             await self._route_admin_hub(event, user_id, data)
         elif data == "adm:users":
-            await self._ack(event)
             await self._show_admin_users(event)
         elif data == "adm:pay" or data.startswith("adm:pay:"):
-            await self._ack(event)
             page = 0
             if data != "adm:pay":
                 parts = data.split(":")
@@ -3910,18 +4117,15 @@ class GamasBot:
                 page = max(0, parsed_page)
             await self._show_admin_payments(event, page)
         elif data.startswith("adm:ph:"):
-            await self._ack(event)
             page = _to_int(data.rsplit(":", 1)[-1])
             await self._show_admin_payment_history(event, max(0, page or 0))
         elif data.startswith("adm:pd:"):
-            await self._ack(event)
             detail_payment_id = _to_int(data.rsplit(":", 1)[-1])
             if detail_payment_id is None:
                 await self._ack(event, "شناسه سفارش نامعتبر است.", alert=True)
                 return
             await self._show_admin_payment_detail(event, detail_payment_id)
         elif data == "adm:bcast":
-            await self._ack(event)
             self._pending_broadcast.add(user_id)
             await event.respond(
                 "📣 ارسال پیام به کاربران\n\n"
@@ -3934,13 +4138,10 @@ class GamasBot:
             if page is None or page < 0:
                 await self._ack(event, "صفحهٔ گزارش نامعتبر است.", alert=True)
             else:
-                await self._ack(event)
                 await self._show_admin_audit(event, page)
         elif data == "adm:board":
-            await self._ack(event)
             await self._admin_board(event)
         elif data.startswith("adm:bgok:"):
-            await self._ack(event)
             parts = data.split(":", 3)
             target_id = _to_int(parts[2]) if len(parts) == 4 else None
             if target_id is None:
@@ -3948,7 +4149,6 @@ class GamasBot:
             else:
                 await self._admin_gift_execute(event, user_id, target_id, parts[3])
         elif data.startswith("adm:bg:"):
-            await self._ack(event)
             parts = data.split(":")
             target_id = _to_int(parts[2]) if len(parts) in (3, 4) else None
             if target_id is None:
@@ -3958,19 +4158,14 @@ class GamasBot:
             else:
                 await self._admin_gift_confirm(event, target_id, parts[3])
         elif data.startswith("adm:rcpt:"):
-            await self._ack(event)
             await self._show_receipt(event, data)
         elif data == "adm:sup" or data.startswith(("adm:sl:", "adm:sv:", "adm:sr:", "adm:sc:", "adm:so:")):
-            await self._ack(event)
             await self._handle_admin_support_callback(event, user_id, data)
         elif data == "support" or data.startswith("sup:"):
-            await self._ack(event)
             await self._handle_support_callback(event, user_id, data)
         elif data.startswith("quiz:"):
-            await self._ack(event)
             await self._route_quiz_callback(event, user_id, data)
         elif data.startswith("fc:"):
-            await self._ack(event)
             await self._route_flashcard_callback(event, user_id, data)
         else:
             await self._ack(event)
@@ -4172,8 +4367,124 @@ class GamasBot:
             )
 
     # ---------------------------------------------------------------- intake
+    async def _guard_upload_admission(self, event, user_id: int, operation) -> None:
+        """Own a file fingerprint from intake through queued/active completion."""
+        if self._shutting_down:
+            await event.reply("ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.")
+            return
+        task = asyncio.current_task()
+        if task is not None:
+            self._admission_tasks.add(task)
+        try:
+            fp = self._upload_fingerprint(getattr(event, "message", None))
+            if fp is None or self.settings.dedup_window_seconds <= 0:
+                await operation(None)
+                return
+            key = (user_id, fp)
+            if key in self._active_upload_keys:
+                METRICS.record_deduplicated()
+                await event.reply(
+                    "⏳ این فایل هم‌اکنون در صف پردازش شما قرار دارد؛ لطفاً تا پایان پردازش منتظر بمانید."
+                )
+                return
+            # No await between checking and claiming, so concurrent uploads cannot
+            # both pass admission while a database/network operation is in progress.
+            token = f"intake-{secrets.token_hex(8)}"
+            self._active_upload_keys[key] = token
+            try:
+                await operation(token)
+            finally:
+                # On success the worker owns the key under job_id; on any early
+                # return, queue rejection or cancellation the temporary claim ends.
+                if self._active_upload_keys.get(key) == token:
+                    self._active_upload_keys.pop(key, None)
+        finally:
+            if task is not None:
+                self._admission_tasks.discard(task)
+
+    def _track_queued_upload(self, job: Job, token: str | None) -> None:
+        if token is None:
+            return
+        fp = self._upload_fingerprint(job.message)
+        key = (job.user_id, fp) if fp is not None else None
+        if key is not None and self._active_upload_keys.get(key) == token:
+            self._active_upload_keys[key] = job.job_id
+
+    async def _abandon_admission(self, submission_id: int) -> None:
+        try:
+            await self.db.set_submission_status(
+                submission_id, "failed", error="interrupted during admission",
+                error_kind="cancelled",
+            )
+        except Exception:
+            logger.warning("failed to close interrupted admission=%s", submission_id, exc_info=True)
+
+    async def _create_admission_submission(
+        self, user_id: int, kind: str, filename: str | None
+    ) -> int:
+        # Shield and join the SQLite operation. Cancellation during COMMIT may
+        # otherwise leave a committed pending row whose id was never returned.
+        task = asyncio.create_task(self.db.create_submission(
+            user_id, kind, filename, active_limit=self.settings.max_active_jobs_per_user
+        ))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                submission_id = await task
+            except Exception:
+                logger.debug("cancelled admission did not create a row", exc_info=True)
+            else:
+                await self._abandon_admission(submission_id)
+            raise
+
+    async def _queue_admitted_submission(
+        self, event, user_id: int, submission_id: int, *, kind: str,
+        filename: str | None, duration: float | None, token: str | None,
+        presentation_kind: str | None = None,
+    ) -> None:
+        progress = None
+        enqueued = False
+        try:
+            progress = await JobProgress.create(event, submission_id=submission_id)
+            meta: dict[str, Any] = {"progress": progress}
+            if presentation_kind is not None:
+                meta["presentation_kind"] = presentation_kind
+            job = Job(
+                submission_id=submission_id, user_id=user_id, kind=kind,
+                filename=filename, message=event.message, is_admin=self._is_admin(user_id),
+                duration_hint=duration, meta=meta,
+            )
+            try:
+                self.queue.submit(job)
+                enqueued = True
+                self._track_queued_upload(job, token)
+            except QueueFullError as exc:
+                await self.db.set_submission_status(
+                    submission_id, "rejected", error=str(exc), error_kind="capacity"
+                )
+                await progress.fail(str(submission_id))
+                await event.reply(f"⏸ {exc}")
+                return
+            logger.info("accepted %s submission=%s", _sanitize_log_value(kind), submission_id)
+        except BaseException:
+            if not enqueued:
+                await self._abandon_admission(submission_id)
+                if progress is not None:
+                    await progress.aclose()
+            raise
+
     async def _accept_media(
         self, event, user_id: int, kind: str, filename: str | None, duration: float | None
+    ) -> None:
+        await self._guard_upload_admission(
+            event, user_id,
+            lambda token: self._accept_media_claimed(event, user_id, kind, filename, duration, token),
+        )
+
+    async def _accept_media_claimed(
+        self, event, user_id: int, kind: str, filename: str | None,
+        duration: float | None, token: str | None,
     ) -> None:
         # Defense-in-depth: Telegram reports file.size before download; reject
         # obviously oversized uploads immediately without consuming disk/time
@@ -4212,44 +4523,27 @@ class GamasBot:
             )
             return
         try:
-            submission_id = await self.db.create_submission(
-                user_id,
-                kind,
-                filename,
-                active_limit=self.settings.max_active_jobs_per_user,
-            )
+            submission_id = await self._create_admission_submission(user_id, kind, filename)
         except TooManyActiveJobsError as exc:
             await event.reply(
                 ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
             )
             return
-        progress = await JobProgress.create(event, submission_id=submission_id)
-        job = Job(
-            submission_id=submission_id,
-            user_id=user_id,
-            kind=kind,
-            filename=filename,
-            message=event.message,
-            is_admin=self._is_admin(user_id),
-            duration_hint=duration,
-            meta={"progress": progress},
-        )
-        try:
-            self.queue.submit(job)
-        except QueueFullError as exc:
-            await self.db.set_submission_status(
-                submission_id, "rejected", error=str(exc), error_kind="capacity"
-            )
-            await progress.fail(str(submission_id))
-            await event.reply(f"⏸ {exc}")
-            return
-        logger.info(
-            "accepted media submission=%s kind=%s duration=%s",
-            submission_id, _sanitize_log_value(kind), duration,
+        await self._queue_admitted_submission(
+            event, user_id, submission_id, kind=kind, filename=filename,
+            duration=duration, token=token,
         )
 
     async def _accept_presentation(
         self, event, user_id: int, kind: str, filename: str | None
+    ) -> None:
+        await self._guard_upload_admission(
+            event, user_id,
+            lambda token: self._accept_presentation_claimed(event, user_id, kind, filename, token),
+        )
+
+    async def _accept_presentation_claimed(
+        self, event, user_id: int, kind: str, filename: str | None, token: str | None
     ) -> None:
         if kind == "unsupported":
             # Classified as a presentation we cannot read (ODP/OTP). Refusing
@@ -4285,37 +4579,16 @@ class GamasBot:
                 )
                 return
         try:
-            submission_id = await self.db.create_submission(
-                user_id,
-                "presentation",
-                filename,
-                active_limit=self.settings.max_active_jobs_per_user,
-            )
+            submission_id = await self._create_admission_submission(user_id, "presentation", filename)
         except TooManyActiveJobsError as exc:
             await event.reply(
                 ACTIVE_LIMIT_MESSAGE.format(limit=to_persian_digits(exc.limit))
             )
             return
-        progress = await JobProgress.create(event, submission_id=submission_id)
-        job = Job(
-            submission_id=submission_id,
-            user_id=user_id,
-            kind="presentation",
-            filename=filename,
-            message=event.message,
-            is_admin=self._is_admin(user_id),
-            meta={"presentation_kind": kind, "progress": progress},
+        await self._queue_admitted_submission(
+            event, user_id, submission_id, kind="presentation", filename=filename,
+            duration=None, token=token, presentation_kind=kind,
         )
-        try:
-            self.queue.submit(job)
-        except QueueFullError as exc:
-            await self.db.set_submission_status(
-                submission_id, "rejected", error=str(exc), error_kind="capacity"
-            )
-            await progress.fail(str(submission_id))
-            await event.reply(f"⏸ {exc}")
-            return
-        logger.info("accepted presentation submission=%s", submission_id)
 
     def _prune_dedup_maps(self, now: float) -> None:
         expired = [key for key, exp in self._seen_messages.items() if exp <= now]
@@ -4384,12 +4657,25 @@ class GamasBot:
         return int(math.ceil(duration))
 
     # ------------------------------------------------------------ job worker
+    async def _close_cancelled_progress(self, job: Job) -> None:
+        """Stop a rejected/cancelled job's ticker and best-effort edit its bar."""
+        progress = job.meta.get("progress")
+        if progress is None:
+            return
+        try:
+            await asyncio.wait_for(progress.fail(str(job.submission_id)), timeout=2.0)
+        except Exception:
+            logger.warning("could not close cancelled progress submission=%s", job.submission_id)
+        finally:
+            await progress.aclose()
+
     async def _run_job(self, job: Job) -> None:
         progress: JobProgress | None = job.meta.get("progress")
         log_token = log_job_id.set(job.job_id)
         fp = self._upload_fingerprint(job.message)
-        if fp is not None:
-            self._active_upload_keys[(job.user_id, fp)] = job.job_id
+        key = (job.user_id, fp) if fp is not None else None
+        if key is not None:
+            self._active_upload_keys.setdefault(key, job.job_id)
         workdir: Path | None = None
         try:
             if await self.db.is_banned(job.user_id):
@@ -4465,6 +4751,7 @@ class GamasBot:
             await self.db.set_submission_status(
                 job.submission_id, "failed", error="cancelled", error_kind="cancelled"
             )
+            await self._close_cancelled_progress(job)
             raise
         except Exception as exc:
             kind = classify_failure(job.state, exc)
@@ -4482,8 +4769,8 @@ class GamasBot:
                 job, "❌ خطای داخلی رخ داد و پردازش تکمیل نشد. لطفاً دوباره تلاش کنید."
             )
         finally:
-            if fp is not None:
-                self._active_upload_keys.pop((job.user_id, fp), None)
+            if key is not None and self._active_upload_keys.get(key) == job.job_id:
+                self._active_upload_keys.pop(key, None)
             try:
                 if progress:
                     await progress.aclose()
@@ -5608,6 +5895,13 @@ class GamasBot:
     async def _handle_receipt_upload(
         self, event, user_id: int, *, payment_id: int | None = None
     ) -> None:
+        await self._guard_file_intake(
+            event, lambda: self._handle_receipt_upload_inner(event, user_id, payment_id=payment_id)
+        )
+
+    async def _handle_receipt_upload_inner(
+        self, event, user_id: int, *, payment_id: int | None = None
+    ) -> None:
         if payment_id is None:
             payment_id = self._pending_payments.pop(user_id, None)
         else:
@@ -5638,60 +5932,86 @@ class GamasBot:
         )
         token = secrets.token_hex(8)
         receipt_path = self.settings.receipt_dir / f"receipt-{payment_id}-{token}.jpg"
+        committed = False
         try:
-            await self._download_telegram_media(
-                event.message, receipt_path, self.settings.max_payment_receipt_bytes
-            )
-        except DiskSpaceError:
-            self._pending_payments[user_id] = payment_id
-            await event.respond("فضای موقت سرور کافی نیست؛ رسید را کمی بعد دوباره بفرستید.")
-            return
-        except ValueError:
-            self._pending_payments[user_id] = payment_id
-            await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
-            return
-        except Exception:
-            self._pending_payments[user_id] = payment_id
-            await event.respond("دریافت رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
-            return
-        # The bounded downloader checks both the live transfer and final size.
-        try:
-            # Decode and re-encode so an image/polyglot is never persisted as
-            # an executable-looking payload, regardless of its original format.
-            if not await run_file_io(
-                _normalize_receipt_image,
-                receipt_path,
-                max_bytes=self.settings.max_payment_receipt_bytes,
-            ):
-                await run_file_io(receipt_path.unlink, missing_ok=True)
-                await event.respond("فرمت رسید نامعتبر است؛ فقط JPEG/PNG/WebP پذیرفته می‌شود.")
+            try:
+                await self._download_telegram_media(
+                    event.message, receipt_path, self.settings.max_payment_receipt_bytes
+                )
+            except DiskSpaceError:
                 self._pending_payments[user_id] = payment_id
+                await event.respond("فضای موقت سرور کافی نیست؛ رسید را کمی بعد دوباره بفرستید.")
                 return
-            await run_file_io(receipt_path.chmod, 0o600)
-        except OSError:
-            await run_file_io(receipt_path.unlink, missing_ok=True)
-            self._pending_payments[user_id] = payment_id
-            await event.respond("ذخیرهٔ رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
-            return
-        try:
-            changed = await self.db.set_payment_receipt(
-                payment_id, str(receipt_path), user_id=user_id
-            )
-        except sqlite3.Error:
-            await run_file_io(receipt_path.unlink, missing_ok=True)
-            self._pending_payments[user_id] = payment_id
-            logger.exception("payment receipt storage failed payment_id=%s", payment_id)
-            await event.respond("ثبت رسید انجام نشد؛ لطفاً دوباره ارسال کنید.")
-            return
-        if not changed:
-            await run_file_io(receipt_path.unlink, missing_ok=True)
-            await event.respond("این سفارش دیگر برای ارسال رسید فعال نیست.")
-            return
-        await event.respond(
-            "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است.\n"
-            "پس از بررسی مدیر، نتیجه اطلاع‌رسانی می‌شود."
-        )
-        await self._notify_admins_of_payment(payment_id)
+            except ValueError:
+                self._pending_payments[user_id] = payment_id
+                await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
+                return
+            except Exception:
+                self._pending_payments[user_id] = payment_id
+                await event.respond("دریافت رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
+                return
+            # The bounded downloader checks both the live transfer and final size.
+            try:
+                # Decode and re-encode so an image/polyglot is never persisted as
+                # an executable-looking payload, regardless of its original format.
+                if not await run_file_io(
+                    _normalize_receipt_image,
+                    receipt_path,
+                    max_bytes=self.settings.max_payment_receipt_bytes,
+                ):
+                    await run_file_io(receipt_path.unlink, missing_ok=True)
+                    await event.respond("فرمت رسید نامعتبر است؛ فقط JPEG/PNG/WebP پذیرفته می‌شود.")
+                    self._pending_payments[user_id] = payment_id
+                    return
+                await run_file_io(receipt_path.chmod, 0o600)
+            except OSError:
+                await run_file_io(receipt_path.unlink, missing_ok=True)
+                self._pending_payments[user_id] = payment_id
+                await event.respond("ذخیرهٔ رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
+                return
+            try:
+                attach = asyncio.create_task(self.db.set_payment_receipt(
+                    payment_id, str(receipt_path), user_id=user_id
+                ))
+                try:
+                    changed = await asyncio.shield(attach)
+                except asyncio.CancelledError:
+                    # The transaction may already have committed. Join it so a
+                    # committed payment never points to a file we delete on cancel.
+                    try:
+                        committed = await attach
+                    except Exception:
+                        logger.debug("cancelled receipt attachment failed", exc_info=True)
+                    raise
+            except sqlite3.Error:
+                await run_file_io(receipt_path.unlink, missing_ok=True)
+                self._pending_payments[user_id] = payment_id
+                logger.exception("payment receipt storage failed payment_id=%s", payment_id)
+                await event.respond("ثبت رسید انجام نشد؛ لطفاً دوباره ارسال کنید.")
+                return
+            if not changed:
+                await run_file_io(receipt_path.unlink, missing_ok=True)
+                await event.respond("این سفارش دیگر برای ارسال رسید فعال نیست.")
+                return
+            committed = True
+            try:
+                await event.respond(
+                    "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است.\n"
+                    "پس از بررسی مدیر، نتیجه اطلاع‌رسانی می‌شود."
+                )
+            except Exception:
+                # A transient failure to notify the user must not suppress the
+                # separate admin review alert for a committed receipt.
+                logger.warning("receipt confirmation not delivered payment_id=%s", payment_id)
+            await self._notify_admins_of_payment(payment_id)
+        finally:
+            if not committed:
+                # The name is unique to this upload. A failed or cancelled
+                # download/normalization cannot leave a private orphan behind.
+                try:
+                    await run_file_io(receipt_path.unlink, missing_ok=True)
+                except OSError:
+                    logger.warning("could not remove incomplete receipt payment_id=%s", payment_id)
 
     async def _notify_admins_of_payment(self, payment_id: int) -> None:
         payment = await self.db.payment(payment_id)

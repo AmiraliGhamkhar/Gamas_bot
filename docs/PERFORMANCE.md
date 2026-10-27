@@ -13,7 +13,8 @@ The shipped profile is deliberately modest for shared cPanel hosting:
 | Active jobs / queued jobs | 3 / 8 | Fixed workers, bounded pending queue, fair per-user dispatch |
 | Active jobs per user | 2 | Admission check before enqueue |
 | Telegram downloads / uploads | 2 / 2 | Independent semaphores and stage deadlines |
-| Media worker concurrency | 1 | Heavy extraction and conversion do not fan out across jobs |
+| Media worker concurrency | 1 | Media workers and, separately, document parsers each obey this concurrency setting |
+| Extracted document text | 5,000,000 characters | PDF/Office text is refused above the cap; compressed upload size is also bounded |
 | Ranges per Telegram download | 1 | `TELEGRAM_DOWNLOAD_CONNECTIONS`; increase only after measuring the host |
 | General upload size / duration | 128 MiB / 2 hours | Metadata checks plus post-download and media-probe checks |
 | Minimum free temporary space | 64 MiB | Headroom check reserves room for working copies before transfer |
@@ -24,9 +25,12 @@ The shipped profile is deliberately modest for shared cPanel hosting:
 | STT / LLM response bodies | 64 MiB / 16 MiB | Incremental reads stop at the configured limit plus one byte |
 
 Generated Telegram downloads and uploads use asynchronous file-like adapters backed by the shared
-thread pool; STT file uploads stream from disk in bounded chunks. Temporary files, extraction, media
-subprocesses, provider attempts, and Telegram transfers all have explicit limits. A cPanel plan can
-still impose tighter disk, CPU, process, network, or runtime ceilings than the application can
+thread pool; STT file uploads stream from disk in bounded chunks. Media subprocesses, provider
+attempts and Telegram transfers have explicit deadlines. Document parsing is concurrency- and
+text-size-limited, but runs in a thread and has no independent CPU-time or memory sandbox: a
+pathological individual PDF/Office file can still consume substantial resources before its text
+limit is checked. The separate document cache has no automatic count or retention limit. A cPanel
+plan can impose tighter disk, CPU, process, network, or runtime ceilings than the application can
 observe; lower `MAX_FILE_SIZE` and presentation limits to fit the actual account.
 
 ## Provider routing policy
@@ -82,6 +86,21 @@ note requests that may legitimately run for minutes).
 All limits are local to one bot process; they do not coordinate multiple cPanel accounts, servers,
 or provider keys shared by unrelated applications.
 
+## Document chunking
+
+The splitter scans bounded windows instead of repeatedly copying the unprocessed suffix. Run the
+local, deterministic synthetic benchmark with `python -m scripts.document_chunk_bench`. On this
+checkout's machine, one before/after sample for a single 20 Mi-character Persian section was
+37.6641 s / 0.0683 s; 1 Mi characters measured 0.0270 s / 0.0036 s. These are individual samples,
+not production throughput predictions. The benchmark calls the chunker directly, intentionally
+beyond the 5,000,000-character intake limit; it excludes PDF/Office extraction, SQLite, network,
+and model time. Identical whitespace/split behavior is covered by an offline regression.
+
+Simultaneous identical uploads by the same user share the first extraction, while different
+PDF/Office parses are gated separately by `MEDIA_WORKER_CONCURRENCY`. Learning progress edits are
+coalesced and bounded; they no longer occupy a model-concurrency slot. The configured chunk
+concurrency is honored from 1 through 8, in addition to the provider's own slot limits.
+
 ## Reproducible measurements
 
 Run with the project virtual environment and installed requirements:
@@ -106,6 +125,7 @@ simulated provider limits. No external APIs or paid keys are used. Results from 
 | Slot-wait/cooldown change, before (this checkout's machine) | 6 | 4.4336 s | 1.353 jobs/s | 2.1764 s | 6.46 MiB | 112.08 MiB |
 | Same change, after sample A | 6 | 4.5812 s | 1.310 jobs/s | 2.2768 s | 6.50 MiB | 111.48 MiB |
 | Same change, after sample B | 6 | 4.4701 s | 1.342 jobs/s | 2.1951 s | 5.59 MiB | 110.66 MiB |
+| Workflow re-audit, after fixes | 6 | 4.5121 s | 1.330 jobs/s | 2.2136 s | 5.70 MiB | 113.17 MiB |
 
 For the slot-wait/cooldown rows, before/after wall times on the same machine were
 4.4336 s vs 4.4701–4.5812 s (mean end-to-end 2.1764 s vs 2.1951–2.2768 s): within run-to-run

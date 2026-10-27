@@ -168,12 +168,13 @@ tail -n 80 data/logs/bot.log
 
 Smoke test after the first start (use an admin account and a small test order):
 
-1. `/start` shows the one-tap lecture guide and exactly four user buttons: «📚 کتابخانه من»,
-   «🛒 خرید اشتراک», «🎧 پشتیبانی» and «ℹ️ راهنما» (admins also see «🛠 پنل مدیریت»). No mode button is
+1. `/start` shows the one-tap lecture guide and five user buttons: «📚 کتابخانه من»,
+   «🛒 خرید اشتراک», «🏆 لیدربورد», «🎧 پشتیبانی» and «ℹ️ راهنما» (admins also see «🛠 پنل مدیریت»). No mode button is
    required before sending a test audio file; verify the transcript arrives before the Word booklet
    and that both Telegram documents appear in the library.
-2. Open a library item and verify the bot forwards the saved Telegram message. A deleted source should
-   show «این فایل دیگر در دسترس نیست.» and mark the library row unavailable.
+2. Open a library item and verify the bot forwards the saved Telegram message. A definitively deleted
+   source should show «این فایل دیگر در دسترس نیست.»; temporary Telegram errors remain retryable.
+   A successful retry also clears a stale unavailable flag from earlier versions.
 3. Create a ticket from «🎧 پشتیبانی», filter it under «🎧 مدیریت پشتیبانی» (`📂 جدید` + category),
    and reply to it. Confirm both notifications and that the history remains after `/start` and restart.
 4. Open «🛒 خرید اشتراک»: confirm plan options come first, then balance and recent payments on the same screen. Create

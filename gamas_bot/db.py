@@ -72,6 +72,7 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "flashcards",
         "free_uses",
         "documents",
+        "learning_charges",
     }
 )
 
@@ -655,7 +656,8 @@ class Database:
         return {"deck": not int(rows[0][0]), "quiz": not int(rows[0][1])}
 
     async def consume_free_use(
-        self, user_id: int, kind: str, *, claim_id: str | None = None
+        self, user_id: int, kind: str, *, claim_id: str | None = None,
+        require_limited: bool = False,
     ) -> bool:
         """Claim with one conditional UPDATE, optionally marking it in-flight.
 
@@ -663,6 +665,8 @@ class Database:
         matters if an admin resets the gift while an older generation runs.
         Calls without a token represent an already-finalized use, preserving the
         original API for administrative callers and existing databases.
+        ``require_limited`` rechecks account status in the same transaction as
+        a generation's claim, closing the race with an administrator's update.
         """
         column = self._free_use_column(kind)
         claim_column = self.FREE_CLAIM_COLUMNS[kind]
@@ -673,10 +677,18 @@ class Database:
                 "free_quiz_used, updated_at) VALUES (?, 0, 0, ?)",
                 (int(user_id), now),
             )
+            guard = (
+                " AND EXISTS (SELECT 1 FROM users WHERE telegram_id = ? "
+                "AND is_unlimited = 0 AND banned = 0)"
+                if require_limited else ""
+            )
+            params: tuple[Any, ...] = (claim_id, now, int(user_id))
+            if require_limited:
+                params += (int(user_id),)
             cursor = await self.db.execute(
                 f"UPDATE free_uses SET {column} = 1, {claim_column} = ?, updated_at = ? "
-                f"WHERE user_id = ? AND {column} = 0",
-                (claim_id, now, int(user_id)),
+                f"WHERE user_id = ? AND {column} = 0{guard}",
+                params,
             )
             return cursor.rowcount == 1
 
@@ -1073,14 +1085,28 @@ class Database:
             )
             return cursor.rowcount == 1
 
+    async def library_mark_available(self, item_id: int) -> None:
+        """Clear an old unavailable flag after Telegram successfully forwards it."""
+        await self._write(
+            "UPDATE library_items SET unavailable = 0 WHERE item_id = ?", (int(item_id),)
+        )
+
     async def library_prune(self, user_id: int, keep: int) -> int:
-        """Delete this user's oldest references, keeping at most ``keep`` items."""
+        """Keep newest references plus any source needed by an active quiz.
+
+        Quiz rows cascade when their source disappears. Retain active sources so
+        a new delivery cannot erase a paid, unfinished quiz; the next prune can
+        remove them after the session ends or expires.
+        """
         keep = max(0, int(keep))
         async with self._transaction():
             cursor = await self.db.execute(
                 "DELETE FROM library_items WHERE user_id = ? AND item_id NOT IN ("
                 "SELECT item_id FROM library_items WHERE user_id = ? "
-                "ORDER BY item_id DESC LIMIT ?)",
+                "ORDER BY item_id DESC LIMIT ?) "
+                "AND NOT EXISTS (SELECT 1 FROM quiz_sessions q "
+                "WHERE q.user_id = library_items.user_id AND q.item_id = library_items.item_id "
+                "AND q.status = 'active')",
                 (int(user_id), int(user_id), keep),
             )
             return max(0, int(cursor.rowcount))
@@ -1158,8 +1184,9 @@ class Database:
         questions: list[dict[str, Any]],
         *,
         free_claim_id: str | None = None,
+        paid_charge_id: str | None = None,
     ) -> int:
-        """Insert the questions and finalize their free claim atomically."""
+        """Insert the questions and finalize their learning budget atomically."""
         if not questions:
             raise ValueError("quiz session needs at least one question")
         now = iso(utc_now())
@@ -1188,6 +1215,7 @@ class Database:
                     ),
                 )
             await self._finalize_free_use_locked(user_id, "quiz", free_claim_id)
+            await self._finalize_learning_charge_locked(user_id, paid_charge_id)
             return session_id
 
     async def quiz_get_session(
@@ -1621,6 +1649,7 @@ class Database:
         ("flashcard_decks", "user_id"),
         ("free_uses", "user_id"),
         ("documents", "user_id"),
+        ("learning_charges", "user_id"),
         ("support_tickets", "user_id"),
     )
     # Learning and lot-allocation children reach users through their parent.
@@ -1638,6 +1667,7 @@ class Database:
         ("holds", "submission_id", "submissions", "submission_id"),
         ("ledger", "payment_id", "payments", "payment_id"),
         ("documents", "library_item_id", "library_items", "item_id"),
+        ("learning_charges", "debit_id", "ledger", "id"),
     )
 
     async def user_reference_integrity(self) -> list[str]:
@@ -1726,8 +1756,9 @@ class Database:
         cards: list[dict[str, str]],
         *,
         free_claim_id: str | None = None,
+        paid_charge_id: str | None = None,
     ) -> int:
-        """Insert an AI deck, its cards and its finalized claim atomically."""
+        """Insert an AI deck, its cards and its learning budget atomically."""
         if not cards:
             raise ValueError("a deck needs at least one card")
         now = iso(utc_now())
@@ -1751,6 +1782,7 @@ class Database:
                     ),
                 )
             await self._finalize_free_use_locked(user_id, "deck", free_claim_id)
+            await self._finalize_learning_charge_locked(user_id, paid_charge_id)
             return deck_id
 
     async def manual_deck_get_or_create(self, user_id: int) -> int:
@@ -2373,18 +2405,18 @@ class Database:
             )
             return bool(cursor.rowcount)
 
-    async def spend_seconds(self, user_id: int, seconds: int, note: str) -> bool:
+    async def spend_seconds(
+        self, user_id: int, seconds: int, note: str, *, operation_id: str | None = None
+    ) -> bool:
         """Charge credit for a hold-free feature (quiz/AI flashcard generation).
 
-        Returns ``True`` when a lot-aware debit was written and ``False`` for a
-        special unlimited user, who is never billed — the same invariant
-        :meth:`reserve` enforces for jobs, so the caller must skip the matching
-        refund when this returns ``False``.
+        Returns ``True`` when a lot-aware debit was written and ``False`` for an
+        unlimited user. If ``operation_id`` is supplied, the debit and a durable
+        pending learning charge are inserted in the same transaction. The caller
+        must finalize it alongside the artifact or refund it on failure.
 
-        The debit mirrors :meth:`settle_hold` exactly: one ``BEGIN IMMEDIATE``
-        transaction, earliest-expiring lots first, every consumed second backed
-        by a ``debit_allocations`` row. The ``holds`` tables are never touched:
-        quizzes are not submissions and reserve nothing ahead of time.
+        Credit lots are consumed earliest-expiry-first, with every consumed
+        second backed by a ``debit_allocations`` row.
         """
         if seconds <= 0:
             raise ValueError("spend must be positive")
@@ -2424,7 +2456,78 @@ class Database:
             # shortfall here is still a defensive guard, never an expected path.
             if remaining:
                 raise InsufficientBalanceError(seconds - remaining, seconds)
+            if operation_id is not None:
+                if not operation_id:
+                    raise ValueError("learning charge operation_id must not be empty")
+                await self.db.execute(
+                    "INSERT INTO learning_charges(operation_id, user_id, debit_id, seconds, "
+                    "note, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?)",
+                    (operation_id, int(user_id), cursor.lastrowid, int(seconds), note[:200], now, now),
+                )
             return True
+
+    async def _finalize_learning_charge_locked(
+        self, user_id: int, operation_id: str | None
+    ) -> None:
+        """Finalize a paid generation inside the artifact's transaction."""
+        if operation_id is None:
+            return
+        cursor = await self.db.execute(
+            "UPDATE learning_charges SET status = 'finalized', updated_at = ? "
+            "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
+            (iso(utc_now()), operation_id, int(user_id)),
+        )
+        if cursor.rowcount != 1:
+            # Never save an artifact against a missing, refunded, or other
+            # user's charge. Raising rolls back both the artifact and charge.
+            raise ValueError("learning charge is not pending for this user")
+
+    async def refund_learning_charge(self, user_id: int, operation_id: str) -> bool:
+        """Refund the exact pending paid attempt once, even across retries."""
+        async with self._transaction():
+            rows = await _rows(
+                self.db,
+                "SELECT seconds, note FROM learning_charges "
+                "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
+                (operation_id, int(user_id)),
+            )
+            if not rows:
+                return False
+            now = iso(utc_now())
+            await self.db.execute(
+                "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
+                "VALUES (?, ?, 'credit', ?, ?)",
+                (int(user_id), int(rows[0][0]), "refund: " + str(rows[0][1])[:180], now),
+            )
+            await self.db.execute(
+                "UPDATE learning_charges SET status = 'refunded', updated_at = ? "
+                "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
+                (now, operation_id, int(user_id)),
+            )
+            return True
+
+    async def recover_pending_learning_charges(self) -> int:
+        """Refund unsaved paid generations after acquiring the instance lock.
+
+        Insertion of the credit and the status transition share one transaction.
+        A saved artifact finalized its charge in its own transaction, so it is
+        never eligible for this recovery, including after an interrupted COMMIT.
+        """
+        async with self._transaction():
+            now = iso(utc_now())
+            cursor = await self.db.execute(
+                "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
+                "SELECT user_id, seconds, 'credit', 'refund: ' || substr(note, 1, 180), ? "
+                "FROM learning_charges WHERE status = 'pending'",
+                (now,),
+            )
+            recovered = max(0, cursor.rowcount)
+            await self.db.execute(
+                "UPDATE learning_charges SET status = 'refunded', updated_at = ? "
+                "WHERE status = 'pending'",
+                (now,),
+            )
+            return recovered
 
     async def refund_seconds(
         self, user_id: int, seconds: int, note: str
