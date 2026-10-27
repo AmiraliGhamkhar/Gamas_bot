@@ -7,6 +7,22 @@ Every booklet is produced in a single **FULL** mode — a complete, standalone r
 attending the class. The former `standard`/`summary` modes were removed; `NOTE_MODE` is now a
 no-op and any value (including values on archived booklets) is normalised to `full`.
 
+## Completeness (class-replacement booklets)
+
+The generation prompts mandate a full skeleton: cover/lesson title → table of contents → overall
+lesson objective → logical sections in source order (definitions, examples, steps, formulas,
+tables, callouts, key points) → a one-page final «جمع\u200cبندی» → an English-term glossary drawn
+only from the source. A coverage rule requires every instructional unit of the transcript to appear
+at least once. The Word exporter auto-builds the TOC from section headings, appends the final
+«جمع\u200cبندی» recap and a glossary (derived from section definitions when the model supplies
+none), and numbers the headings.
+
+After the map-reduce draft a deterministic completeness validator (`assess_completeness`) checks
+both the skeleton and the share of source units represented (a topic-overlap proxy). With
+`NOTE_COMPLETENESS_FILL=true` (default), any gap triggers one bounded, strictly grounded fill
+request per missing unit (max 6), then re-validates. A fill failure keeps the audited draft rather
+than discarding the booklet; fills only re-organise source text and can never invent facts.
+
 ## Checks
 
 With `NOTE_STRICT_GROUNDING=true` (default), a deterministic evidence gate indexes the source once

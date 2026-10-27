@@ -678,6 +678,11 @@ class Settings:
     note_ttfb_timeout: float = DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS
     note_hedge_after: float = DEFAULT_NOTE_HEDGE_AFTER_SECONDS
     office_ai_concurrency: int = 3
+    #: CR-4: after the map-reduce draft, re-scan the source and fill detected
+    #: coverage gaps with bounded, strictly grounded LLM requests. Enabled in
+    #: production by default; tests use the dataclass default (``False``) so
+    #: offline fixtures keep a fixed request count.
+    note_completeness_fill: bool = False
 
     # ------------------------------------------------------------------ views
     @property
@@ -1233,6 +1238,7 @@ def from_env(env_file: str | None = None) -> Settings:
         note_openrouter_throughput=_env_bool("NOTE_OPENROUTER_THROUGHPUT", True),
         note_structured_output=_env_bool("NOTE_STRUCTURED_OUTPUT", True),
         note_progressive_booklet=_env_bool("NOTE_PROGRESSIVE_BOOKLET", True),
+        note_completeness_fill=_env_bool("NOTE_COMPLETENESS_FILL", True),
         note_compile_provider=normalize_note_compile_provider(
             _env("NOTE_COMPILE_PROVIDER")
         ),

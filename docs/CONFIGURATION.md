@@ -62,6 +62,7 @@ cron job cannot create a second database or session.
 | `NOTE_STRUCTURED_OUTPUT` | `1` asks for schema-constrained JSON; a provider that rejects it is retried once without it. |
 | `NOTE_PROGRESSIVE_BOOKLET` | `1` delivers the audited merge as a draft while the editorial compile runs. |
 | `NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE` | Evidence checks (`true`/`repair` by default). See [Note quality](NOTE_QUALITY.md). |
+| `NOTE_COMPLETENESS_FILL` | `1` (default) re-scans the source after the draft and fills coverage gaps with bounded, source-grounded requests (max 6). `0` disables the extra pass. See [Note quality](NOTE_QUALITY.md). |
 | `NOTE_MODE` | Deprecated / no-op. Only FULL booklets (complete, class-replacement) are produced; `standard` and `summary` were removed and any value is safely ignored. |
 | `RAW_FALLBACK_FILE_CHARS`, `RAW_FALLBACK_MAX_FILES` | Part size and count when a long raw `.txt` upload fails. |
 | `LIBRARY_MAX_ITEMS` | Newest transcript/booklet message references retained per user (default `50`); files remain in Telegram. |

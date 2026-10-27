@@ -677,5 +677,45 @@ class BookletPaletteTests(unittest.TestCase):
         self.assertEqual(centred, 4)  # 2 content-table + 2 glossary header cells
 
 
+
+
+class BookletSkeletonDocxTests(unittest.TestCase):
+    """CR-4: the exporter appends a final «جمع‌بندی» and a glossary section."""
+
+    def test_end_summary_and_glossary_are_rendered(self):
+        text = docx_text(build_notes_docx(full_notes(), meta=META))
+        self.assertIn("جمع‌بندی", text)
+        self.assertIn("واژه‌نامه", text)
+        self.assertIn("HbA1c", text)
+
+    def test_glossary_is_derived_from_definitions_when_absent(self):
+        notes = StructuredNotes.from_payload(json.loads(
+            '{"title": "درس", "summary": "خلاصه", "sections": [{"heading": "بخش", '
+            '"paragraphs": ["متن درس"], "definitions": ['
+            '{"term": "آنزیم", "term_en": "Enzyme", "definition": "کاتالیزگر زیستی"}]}]}'
+        ))
+        text = docx_text(build_notes_docx(notes, meta=META))
+        self.assertIn("واژه‌نامه", text)
+        self.assertIn("Enzyme", text)          # derived from the section definition
+        self.assertIn("کاتالیزگر زیستی", text)
+        self.assertIn("جمع‌بندی", text)       # end recap from summary
+
+    def test_toc_is_generated_for_a_multi_section_booklet(self):
+        notes = full_notes()
+        # add sibling sections so the long-document TOC gate is satisfied
+        from gamas_bot.notes import NoteSection
+        notes = StructuredNotes(
+            title=notes.title, summary=notes.summary, learning_objectives=notes.learning_objectives,
+            key_points=notes.key_points, glossary=notes.glossary,
+            sections=tuple(notes.sections) + tuple(
+                NoteSection(heading=f"بخش {i}", paragraphs=["توضیح بلند فارسی برای فهرست مطالب. " * 4])
+                for i in range(2, 6)
+            ),
+        )
+        text = docx_text(build_notes_docx(notes, meta=META))
+        self.assertIn("فهرست مطالب", text)
+
+
+
 if __name__ == "__main__":
     unittest.main()

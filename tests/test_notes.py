@@ -12,6 +12,17 @@ from gamas_bot.notes import (
     COMPILE_HARD_MAX_CHARS,
     MODE_RULES,
     MAX_PRACTICAL_TIPS,
+    COMPLETENESS_THRESHOLD,
+    MAX_COVERAGE_GAPS,
+    REQUIRED_SKELETON_BLOCKS,
+    COVERAGE_FILL_SYSTEM_PROMPT,
+    COMPILE_SYSTEM_PROMPT,
+    CompletenessReport,
+    assess_completeness,
+    booklet_skeleton,
+    build_fill_document,
+    find_coverage_gaps,
+    meets_completeness_threshold,
     CONTEXT_DIGEST_MAX_CHARS,
     MAX_CONTEXT_SPLITS,
     PRESENTATION_PROMPT,
@@ -1447,3 +1458,151 @@ class StrictPipelineTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([json.dumps(self.LOSSY, ensure_ascii=False)])
         await structure_transcript(self.SOURCE, settings, session)
         self.assertEqual(len(session.calls), 1)
+
+
+# ===========================================================================
+# CR-4: booklet completeness validator + coverage-gap fill
+# ===========================================================================
+
+class CompletenessValidatorTests(unittest.TestCase):
+    """Pure, deterministic skeleton + source-coverage validation."""
+
+    def full_notes(self) -> StructuredNotes:
+        return StructuredNotes.from_payload({
+            "title": "فارماکولوژی دیابت",
+            "summary": "مرور داروهای کاهندهٔ قند خون.",
+            "learning_objectives": ["آشنایی با Metformin"],
+            "glossary": [{"term": "HbA1c", "definition": "هموگلوبین گلیکوزیله"}],
+            "key_points": ["HbA1c هدف زیر ۷ درصد"],
+            "sections": [{
+                "heading": "Metformin",
+                "paragraphs": ["خط اول درمان دیابت نوع ۲ است."],
+                "definitions": [{"term": "Metformin", "definition": "داروی کاهندهٔ قند خون"}],
+            }],
+        })
+
+    def test_skeleton_reports_every_block(self):
+        skeleton = booklet_skeleton(self.full_notes())
+        for key in (
+            "cover_title", "objectives", "toc", "sections", "definitions",
+            "examples", "steps", "formulas", "tables", "callouts",
+            "key_points", "end_summary", "glossary",
+        ):
+            self.assertIn(key, skeleton)
+        for key in REQUIRED_SKELETON_BLOCKS:
+            self.assertTrue(skeleton[key], f"required skeleton block missing: {key}")
+
+    def test_complete_booklet_meets_threshold(self):
+        source = "خط اول درمان دیابت نوع ۲ است. HbA1c هدف زیر ۷ درصد است."
+        report = assess_completeness(source, self.full_notes())
+        self.assertIsInstance(report, CompletenessReport)
+        self.assertTrue(report.skeleton_complete)
+        self.assertGreaterEqual(report.coverage, COMPLETENESS_THRESHOLD)
+        self.assertTrue(report.meets_threshold)
+        self.assertTrue(meets_completeness_threshold(report))
+        self.assertIn("coverage=", report.summary())
+
+    def test_gutted_booklet_fails_skeleton_and_coverage(self):
+        source = " ".join(
+            f"مطلب آموزشی شمارهٔ {i} دربارهٔ الگوریتم و ساختمان داده است." for i in range(8)
+        )
+        gutted = StructuredNotes(title="جزوه")  # no sections/summary/glossary
+        report = assess_completeness(source, gutted)
+        self.assertFalse(report.skeleton_complete)
+        self.assertLess(report.coverage, COMPLETENESS_THRESHOLD)
+        self.assertFalse(report.meets_threshold)
+        self.assertTrue(report.missing_units)
+
+    def test_meets_threshold_honours_a_higher_floor(self):
+        report = assess_completeness("متن کوتاه", self.full_notes())
+        self.assertTrue(meets_completeness_threshold(report, threshold=0.0))
+        self.assertFalse(meets_completeness_threshold(report, threshold=1.01))
+
+    def test_coverage_gaps_are_detected_and_bounded(self):
+        source = " ".join(
+            f"نکتهٔ مستقل {i} دربارهٔ پردازش سیگنال دیجیتال و فیلترها است." for i in range(14)
+        )
+        notes = StructuredNotes(
+            title="درس", summary="خلاصه", key_points=["نکته"],
+            sections=[one_section("مقدمه", paragraphs=["سلام به کلاس"])],
+            glossary=[GlossaryEntry("DSP", "پردازش سیگنال دیجیتال")],
+        )
+        gaps = find_coverage_gaps(source, notes, max_gaps=3)
+        self.assertTrue(gaps)
+        self.assertLessEqual(len(gaps), 9)  # bounded at max_gaps * 3
+        self.assertTrue(all(isinstance(gap, str) for gap in gaps))
+
+    def test_fill_prompt_and_document_enforce_grounding(self):
+        # The no-hallucination contract is literally embedded in the fill prompt.
+        for phrase in ("ممنوعیت افزودن", "متن منبع", "sections", "عدد"):
+            self.assertIn(phrase, COVERAGE_FILL_SYSTEM_PROMPT)
+        self.assertIn("هیچ ادعایی", COVERAGE_FILL_SYSTEM_PROMPT)
+        doc = build_fill_document(["یک جملهٔ منبع"], StructuredNotes())
+        self.assertIn("یک جملهٔ منبع", doc)  # source unit passed through verbatim
+        self.assertIn("متن منبع", doc)
+        self.assertIn("هیچ مطلب تازه", doc)
+
+
+class SkeletonPromptTests(unittest.TestCase):
+    def test_generation_prompts_mandate_the_complete_skeleton(self):
+        for prompt in (build_system_prompt("full"), build_presentation_system_prompt("full")):
+            for phrase in (
+                "جلد و عنوان درس", "فهرست مطالب", "هدف کلی درس",
+                "جمع‌بندی", "واژه‌نامه", "قانون پوشش",
+                "learning_objectives", "glossary", "definitions",
+                "examples", "steps", "formulas", "tables", "callouts",
+            ):
+                self.assertIn(phrase, prompt)
+        self.assertIn("اسکلت لازم جزوه", COMPILE_SYSTEM_PROMPT)
+
+
+class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
+    """The fill pass is opt-in, bounded, grounded and non-fatal."""
+
+    SOURCE = " ".join(
+        f"جملهٔ مستقل شمارهٔ {i} دربارهٔ ترمودینامیک و آنتروپی و تعادل گرمایی است."
+        for i in range(6)
+    )
+    DRAFT = json.dumps({
+        "title": "درس", "summary": "خلاصه", "key_points": ["نکته"],
+        "glossary": [{"term": "entropy", "definition": "آنتروپی"}],
+        "sections": [{"heading": "مقدمه", "paragraphs": ["سلام به کلاس"]}],
+    }, ensure_ascii=False)
+    FILL = json.dumps({
+        "title": "درس",
+        "sections": [{"heading": "ترمودینامیک", "paragraphs": [
+            "جملهٔ مستقل شمارهٔ ۰ دربارهٔ ترمودینامیک و آنتروپی و تعادل گرمایی است."
+        ]}],
+    }, ensure_ascii=False)
+
+    async def test_fill_disabled_keeps_a_single_request(self):
+        settings = make_settings(note_chunk_chars=100_000, note_compile=False,
+                                 note_strict_grounding=False)  # fill defaults off
+        session = FakeSession([self.DRAFT])
+        await structure_transcript(self.SOURCE, settings, session)
+        self.assertEqual(len(session.calls), 1)
+
+    async def test_fill_enabled_issues_grounded_bounded_requests_and_merges(self):
+        settings = make_settings(note_chunk_chars=100_000, note_compile=False,
+                                 note_strict_grounding=False, note_completeness_fill=True)
+        session = FakeSession([self.DRAFT] + [self.FILL] * (MAX_COVERAGE_GAPS + 2))
+        notes = await structure_transcript(self.SOURCE, settings, session)
+        # one map call + at least one fill, never more than the bounded budget
+        self.assertGreater(len(session.calls), 1)
+        self.assertLessEqual(len(session.calls), 1 + MAX_COVERAGE_GAPS)
+        self.assertGreater(len(notes.sections), 1)
+        fill_call = session.calls[1]["json"]["messages"]
+        system = fill_call[0]["content"]
+        user = fill_call[1]["content"]
+        self.assertIn("ممنوعیت افزودن", system)      # forbidden-additions contract
+        self.assertIn("متن منبع", user)              # grounded, source-only input
+
+    async def test_fill_failure_is_non_fatal(self):
+        settings = make_settings(note_chunk_chars=100_000, note_compile=False,
+                                 note_strict_grounding=False, note_completeness_fill=True)
+        # only the map answer is available; the fill request raises and must be
+        # swallowed so the audited draft is still delivered (never a refunded job).
+        session = FakeSession([self.DRAFT])
+        notes = await structure_transcript(self.SOURCE, settings, session)
+        self.assertEqual(len(session.calls), 2)  # map + one failing fill
+        self.assertEqual(notes.title, "درس")
