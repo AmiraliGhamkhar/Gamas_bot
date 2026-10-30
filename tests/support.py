@@ -564,6 +564,14 @@ def make_settings(**overrides) -> Settings:
         llm_fallback_max_in_flight=4,
         llm_slot_wait_timeout=30.0,
         dedup_window_seconds=120.0,
+        subscription_channel="@gamas_AI",
+        # The gate is opt-in in the offline fixture: the existing suite must
+        # never reach api.telegram.org. tests/test_subscription.py enables it
+        # and injects a resolver, so it stays fully offline.
+        subscription_required=False,
+        subscription_cache_seconds=0.0,
+        subscription_timeout_seconds=20.0,
+        telegram_api_base_url="https://api.telegram.org",
         plan_values={},
     )
     return replace(base, **overrides) if overrides else base

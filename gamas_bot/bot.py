@@ -149,6 +149,7 @@ from .stt import (
     largest_configured_upload,
     transcribe,
 )
+from .subscription import SUBSCRIPTION_PREFIX, SubscriptionService
 from .telegram_text import button_label, render_pages, split_message
 from .transcript import build_document, render as render_transcript
 from .textnorm import normalize_display
@@ -1066,6 +1067,9 @@ class GamasBot:
         )
         self.client.parse_mode = None
         self._http: aiohttp.ClientSession | None = None
+        # Mandatory channel subscription gate. Created before the handlers are
+        # registered so the very first event is already gated.
+        self.subscription = SubscriptionService(self, settings, self.db)
         self._register_handlers()
 
     # ------------------------------------------------------------------ boot
@@ -1118,6 +1122,10 @@ class GamasBot:
         )
         await self.client.start(bot_token=self.settings.bot_token)
         logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
+        # Verify (once, offline-safe) that the bot can actually check channel
+        # membership; a misconfigured administrator role is an operational
+        # error, not a crash.
+        await self.subscription.startup_self_check()
         if not self.settings.payment_card_number:
             logger.warning(
                 "PAYMENT_CARD_NUMBER is not set; card-to-card payments are disabled"
@@ -1232,6 +1240,7 @@ class GamasBot:
         if self._http is not None:
             await self._http.close()
             self._http = None
+        await self.subscription.close()
         await self.client.disconnect()
         await self.db.close()
 
@@ -3962,6 +3971,15 @@ class GamasBot:
             return
         await self.db.ensure_user(user_id)
         await self._capture_sender_name(event)
+        # Mandatory channel subscription gate. Administrators are exempt (they
+        # are operators, not customers); the subscription callbacks themselves
+        # must reach their handler, so they are routed before the gate. A denied
+        # callback has already been answered with the join prompt.
+        if data.startswith(SUBSCRIPTION_PREFIX):
+            await self.subscription.handle_callback(event, user_id, data)
+            return
+        if not self._is_admin(user_id) and not await self.subscription.require_access(event):
+            return
         # Opening any panel screen disarms a half-finished broadcast prompt,
         # so a stray "انصراف"/navigation tap can never send stale text later.
         if data.startswith("adm:") and data != "adm:bcast":
@@ -4194,6 +4212,11 @@ class GamasBot:
             await event.reply("⛔ دسترسی شما به ربات مسدود شده است.")
             return
         await self._capture_sender_name(event)
+        # Mandatory channel subscription gate (administrators exempt). A denied
+        # message has already been answered with the join prompt, so the rest of
+        # the intake pipeline is never reached by a non-member.
+        if not self._is_admin(user_id) and not await self.subscription.require_access(event):
+            return
         text = (event.message.message or "").strip()
         command = _command_name(text)
         if command == "/start":
@@ -6746,6 +6769,16 @@ class GamasBot:
             lines.extend(["", "🌐 ارائه‌دهنده‌ها (از شروع اجرا):", *provider_lines])
         else:
             lines.extend(["", "🌐 از شروع اجرا هنوز درخواستی به ارائه‌دهنده‌ها نرفته است."])
+        # Mandatory channel subscription status (observability only).
+        if self.settings.subscription_required and self.settings.subscription_channel:
+            lines.extend(
+                [
+                    "",
+                    f"🔒 کانال الزامی: {self.settings.subscription_channel}",
+                ]
+            )
+        else:
+            lines.extend(["", "🔒 کانال الزامی: غیرفعال"])
         lines.extend(
             [
                 "",
@@ -6930,9 +6963,19 @@ class GamasBot:
             + ("🎁 آزمون رایگان مانده" if free.get("quiz") else "آزمون استفاده شده"),
             f"عضویت: {self._timestamp_text(identity.get('joined_at'))}",
             f"آخرین بازدید: {self._timestamp_text(identity.get('last_seen_at'))}",
+        ]
+        subscription_status = identity.get("subscription_status")
+        if subscription_status:
+            sub_line = f"عضویت کانال: {subscription_status}"
+            if subscription_status == "member" and identity.get("subscription_verified_at"):
+                sub_line += f" ({self._timestamp_text(identity.get('subscription_verified_at'))})"
+            lines.append(sub_line)
+        else:
+            lines.append("عضویت کانال: بررسی نشده")
+        lines.extend([
             "",
             "💡 اعتبار و سفارش‌ها در «💳 پرداخت‌ها» بررسی می‌شوند.",
-        ]
+        ])
         buttons: list[list] = [[Button.inline(
             "🔄 بازنشانی هدیه رایگان", f"adm:hub:usr:fr:{int(target_id)}".encode("ascii"),
         )]]
