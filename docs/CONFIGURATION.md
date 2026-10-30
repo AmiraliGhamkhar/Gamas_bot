@@ -49,6 +49,7 @@ cron job cannot create a second database or session.
 | `MAX_CONCURRENT_DOWNLOADS`, `MAX_CONCURRENT_UPLOADS` | Independent stage semaphores for Telegram downloads (`2`) and uploads (`2`). |
 | `DOWNLOAD_TIMEOUT_SECONDS`, `UPLOAD_TIMEOUT_SECONDS` | Stage deadlines for Telegram download (`900` s) and upload (`600` s). |
 | `DEDUP_WINDOW_SECONDS` | Duplicate Telegram update & duplicate active file suppression window (`120` s). |
+| `SUBSCRIPTION_CHANNEL`, `SUBSCRIPTION_REQUIRED`, `SUBSCRIPTION_CACHE_SECONDS`, `SUBSCRIPTION_TIMEOUT_SECONDS`, `TELEGRAM_API_BASE_URL` | Mandatory channel subscription gate. Every user must be a member of `SUBSCRIPTION_CHANNEL` (default `@gamas_AI`) before protected features; the bot must be an administrator of that channel. `SUBSCRIPTION_CACHE_SECONDS=0` re-checks on every interaction. See [Mandatory channel subscription](TELEGRAM_SUBSCRIPTION.md). |
 | `MAX_ACTIVE_JOBS_PER_USER` | Per-user admission cap (default `2`); stops several uploads the balance cannot cover. |
 | `MAX_FILE_SIZE` | Download ceiling (default 128 MiB) so one upload plus working copies fits modest shared hosting. Raise only after checking Telegram and disk limits. |
 | `TEMP_MIN_FREE_BYTES` | Free space that must remain on `TEMP_DIR` before a download (default 64 MiB); the downloader also reserves room for copies. |

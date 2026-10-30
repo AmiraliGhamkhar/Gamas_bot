@@ -7,6 +7,7 @@ and **cPanel Terminal** (Linux shared hosting).
 | --- | --- |
 | [Deploy on cPanel](DEPLOY_CPANEL.md) | Upload, install, preflight, cron watchdog, updates |
 | [Configuration](CONFIGURATION.md) | `.env`, required keys, safe defaults |
+| [Mandatory channel subscription](TELEGRAM_SUBSCRIPTION.md) | Require every user to join `@gamas_AI`; setup, behavior, cPanel steps |
 | [Operations](OPERATIONS.md) | Start, stop, logs, backups, retention |
 | [Troubleshooting](TROUBLESHOOTING.md) | Common failures and fixes |
 | [Testing](TESTING.md) | Local checks and CI commands |

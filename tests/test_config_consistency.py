@@ -138,6 +138,11 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("RECEIPT_RETENTION_DAYS", "receipt_retention_days", "int"),
     ("MAX_PAYMENT_RECEIPT_BYTES", "max_payment_receipt_bytes", "int"),
     ("TRANSCRIPT_RETENTION_DAYS", "transcript_retention_days", "int"),
+    ("SUBSCRIPTION_CHANNEL", "subscription_channel", "str"),
+    ("SUBSCRIPTION_REQUIRED", "subscription_required", "bool"),
+    ("SUBSCRIPTION_CACHE_SECONDS", "subscription_cache_seconds", "float"),
+    ("SUBSCRIPTION_TIMEOUT_SECONDS", "subscription_timeout_seconds", "float"),
+    ("TELEGRAM_API_BASE_URL", "telegram_api_base_url", "str"),
 )
 
 #: v2 provider-platform settings that no longer exist in the code. Documentation

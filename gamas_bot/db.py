@@ -514,6 +514,25 @@ class Database:
         )
         return bool(rows and rows[0][0])
 
+    async def set_subscription_state(
+        self,
+        telegram_id: int,
+        status: str,
+        *,
+        verified_at: str | None = None,
+    ) -> None:
+        """Record the last observed membership status (observability only).
+
+        The gate never trusts this value: :meth:`SubscriptionService` re-checks
+        Telegram on every protected interaction. Writing it on every check keeps
+        the admin panel honest without deleting or restricting any user.
+        """
+        await self._write(
+            "UPDATE users SET subscription_status = ?, subscription_verified_at = ? "
+            "WHERE telegram_id = ?",
+            (str(status), verified_at, telegram_id),
+        )
+
     async def user_ids(self) -> list[int]:
         """Every user id, without the per-row balance work of ``list_users``."""
         rows = await _rows(self.read_db,
@@ -1425,7 +1444,8 @@ class Database:
         rows = await _rows(
             self.read_db,
             "SELECT telegram_id, first_name, banned, is_unlimited, "
-            "COALESCE(username, ''), COALESCE(last_name, ''), last_seen_at, joined_at "
+            "COALESCE(username, ''), COALESCE(last_name, ''), last_seen_at, joined_at, "
+            "subscription_status, subscription_verified_at "
             "FROM users WHERE telegram_id = ?",
             (int(user_id),),
         )
@@ -1440,6 +1460,8 @@ class Database:
             "last_name": str(rows[0][5] or ""),
             "last_seen_at": rows[0][6],
             "joined_at": rows[0][7],
+            "subscription_status": rows[0][8],
+            "subscription_verified_at": rows[0][9],
         }
         identity["free_uses"] = await self.free_use_state(int(user_id))
         return identity
@@ -1457,7 +1479,8 @@ class Database:
         rows = await _rows(
             self.read_db,
             "SELECT telegram_id, COALESCE(username, ''), COALESCE(first_name, ''), "
-            "COALESCE(last_name, '') FROM users "
+            "COALESCE(last_name, ''), subscription_status, subscription_verified_at "
+            "FROM users "
             f"WHERE telegram_id IN ({placeholders})",
             tuple(wanted),
         )
@@ -1467,6 +1490,8 @@ class Database:
                 "username": str(row[1] or ""),
                 "first_name": str(row[2] or ""),
                 "last_name": str(row[3] or ""),
+                "subscription_status": row[4],
+                "subscription_verified_at": row[5],
             }
             for row in rows
         }

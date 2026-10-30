@@ -655,6 +655,22 @@ class Settings:
     #: instead of streamed through the media worker.
     doc_max_bytes: int = 50 * 1024 * 1024
 
+    # --- Mandatory channel subscription --------------------------------------
+    #: Telegram channel (``@username`` or ``-100...``) whose current members
+    #: gate every user-facing feature. Defaults to the official @gamas_AI.
+    subscription_channel: str = "@gamas_AI"
+    #: Whether the subscription gate is enforced. An operator emergency
+    #: off-switch; leave it on in production.
+    subscription_required: bool = True
+    #: Short-lived cache for a *confirmed* membership, in seconds. ``0``
+    #: re-checks on every interaction — the strict, fail-safe default, because
+    #: a leaver must be restricted on their very next interaction.
+    subscription_cache_seconds: float = 0.0
+    #: Per-request timeout of one ``getChatMember`` call, in seconds.
+    subscription_timeout_seconds: float = 20.0
+    #: Bot API base URL (overridable for a mirror or an offline test).
+    telegram_api_base_url: str = "https://api.telegram.org"
+
     # --- Learning loop (quiz / flashcards) -----------------------------------
     #: Credit (seconds) charged per generated quiz question, before generation.
     quiz_cost_seconds_per_question: int = 60
@@ -734,6 +750,21 @@ class Settings:
     def tariff_values(self) -> dict[str, int]:
         """The resolved tariff mapping consumed by ``billing.plan_catalog``."""
         return dict(self.plan_values)
+
+    @property
+    def subscription_channel_url(self) -> str:
+        """The public ``https://t.me/...`` link for the mandatory channel.
+
+        A username becomes ``https://t.me/<name>``; a numeric channel id
+        becomes the ``/c/`` form. Empty when no channel is configured.
+        """
+        ref = (self.subscription_channel or "").strip().lstrip("@")
+        if not ref:
+            return ""
+        digits = ref.lstrip("-")
+        if digits.isdigit():
+            return f"https://t.me/c/{digits}"
+        return f"https://t.me/{ref}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1395,6 +1426,17 @@ def from_env(env_file: str | None = None) -> Settings:
             maximum=8,
         ),
         library_max_items=_env_int("LIBRARY_MAX_ITEMS", 50, minimum=1, maximum=10_000),
+        subscription_channel=_env("SUBSCRIPTION_CHANNEL", "@gamas_AI").strip(),
+        subscription_required=_env_bool("SUBSCRIPTION_REQUIRED", True),
+        subscription_cache_seconds=_env_float(
+            "SUBSCRIPTION_CACHE_SECONDS", 0.0, minimum=0.0, maximum=3600.0
+        ),
+        subscription_timeout_seconds=_env_float(
+            "SUBSCRIPTION_TIMEOUT_SECONDS", 20.0, minimum=1.0, maximum=120.0
+        ),
+        telegram_api_base_url=_env(
+            "TELEGRAM_API_BASE_URL", "https://api.telegram.org"
+        ).rstrip("/"),
         quiz_cost_seconds_per_question=_env_int(
             "QUIZ_COST_SECONDS_PER_QUESTION", 60, minimum=1, maximum=86_400
         ),
@@ -1606,6 +1648,27 @@ def check(settings: Settings) -> list[str]:
         )
     if not settings.admin_ids:
         problems.append("ADMIN_IDS is empty; nobody will be able to approve payments.")
+    # Mandatory-channel gate. Offline we can only validate the channel
+    # reference, not the bot's administrator rights; the runtime self-check
+    # reports those, and docs/TELEGRAM_SUBSCRIPTION.md is the setup guide.
+    if settings.subscription_required:
+        subscription_ref = (settings.subscription_channel or "").strip()
+        if not subscription_ref:
+            problems.append(
+                "SUBSCRIPTION_CHANNEL is required while SUBSCRIPTION_REQUIRED is on; "
+                "set it to @gamas_AI (or the channel id) and make the bot an "
+                "administrator of that channel."
+            )
+        else:
+            body = subscription_ref[1:] if subscription_ref.startswith("@") else subscription_ref
+            if not (
+                subscription_ref.lstrip("-").isdigit()
+                or re.fullmatch(r"[A-Za-z0-9_]{5,32}", body)
+            ):
+                problems.append(
+                    f"SUBSCRIPTION_CHANNEL={subscription_ref!r} is neither a channel "
+                    "username (@name) nor a numeric channel id."
+                )
     # A non-positive tariff override is silently ignored by ``billing._resolved``
     # (the canonical default wins), so an operator typo would quote a price they
     # never chose. Say so at startup instead of hiding it.
