@@ -1,4 +1,115 @@
-# Document-export and model-output audit — current working tree
+# Whole-repo re-audit (ponytail audit) — current working tree
+
+Date: 2026-10-31, merge of PR #105 (`d8bfa73`), committed tree. This round re-ran the whole-repo
+audit after installing the ponytail skill (`/ponytail-audit` methodology: map first, then ordered
+checks for bugs → risk → scale → untested logic → speed → lean, smallest fix, no new layers).
+Change no code: this round edits only this report.
+
+What this repo does: a Persian Telegram study bot. One long-running Telethon process on cPanel
+shared (or Windows local). Users send lecture audio/video/decks and study PDF/Word/PowerPoint and
+plain-text files; the bot sells transcription seconds from an integer-seconds credit ledger paid
+by reviewed card-to-card receipts. Everything durable lives in one SQLite WAL database (users,
+ledger, holds, payments, library, documents, learning, tickets); everything else stays in memory
+or Telegram references. Load assumed: hundreds of users, one bot instance (instance lock),
+single-digit concurrent jobs, SQLite on one disk. Not a website.
+
+## Verification run in this checkout
+
+- 44 test files exercised on the sandbox (Python 3.10 wheels, `pip install -r requirements.txt`
+  plus pytest, ruff, mypy and the optional `curl-cffi` OCR extra). **Zero code failures.**
+  Four failure groups are environmental, none is a defect:
+  1. `tomllib` (1 test) — sandbox is Python 3.10; the project requires ≥3.11 where `tomllib` exists.
+  2. `asyncio.timeout` (1 test, Speechmatics cancellation) — same 3.11-only API.
+  3. 4 GB temp-disk headroom (~20 tests: `test_bot` 16, acceptance 1, workflow-regressions 1,
+     multi-user 1 + 1 hang) — the sandbox disk holds 0.8 GB free; the bar & hammer tests fake a
+     2 GB upload and `_download_telegram_media` requires `2 × reported + floor` free. On any host
+     with ≥4 GB free these pass; CI runs such hosts.
+  4. `tests/test_concurrency_and_failover.py::...::test_queue_backpressure_and_cancellation_cleanup...
+     hangs for the same reason (the fake STT never starts because the download gate refuses first,
+     so `entered_stt.wait()` has no timeout).
+- `ruff check gamas_bot tests scripts` — clean (fresh py3.10-bin wheel install, same rule set).
+- `mypy` over the 34-file typing gate — `Success: no issues found in 34 source files`.
+- The previous round's two claimed fixes are present and covered by passing tests: the Office
+  ingestion point normalizes control characters before every export (`office.py:284`), and a model
+  table plan with an unnamed column is refused, not reshaped (`office_ai.py:252–282`).
+- Full reads (not skims): `db.py` (all 3,264 lines), `billing.py`, `subscription.py`, `jobs.py`,
+  `capacity.py`, `http_util.py`, `office.py`, `launcher.py`/`passenger_wsgi.py`/`__main__.py`,
+  module heads and targeted hot paths of `notes.py`/`notes_evidence.py`/`ocr.py`/`doc_extract.py`;
+  targeted reads of the 9,795-line `bot.py` (dispatch, gates, admission, dedup, `_run_job`, media
+  pipeline, settle/release/refund); greps for secrets-in-logs (none), unbounded response reads
+  (all bounded, one minor exception below), duplicate helper names, and `shortcut:`/`ponytail:`
+  decision comments (none in source).
+
+## Findings — Must fix
+
+None. No data-loss path, no billing double-charging or lost-credit path, no owner-scope leak, no
+unbounded or unauthorized callback route was found in this round. Owner scoping is enforced at the
+SQL layer everywhere it matters (`library_item(user_id, item_id)`, `document_get`, `quiz_get_session`,
+`deck_get`, payment ownership in receipts and cancel tickets); admin callbacks are prefix-gated
+(`adm:`/`payv:`) before any per-user state; banned and non-member users are gated on both message
+and callback paths; the ledger keeps holds/allocations/debits in single `BEGIN IMMEDIATE`
+transactions with exactly-once settlement and startup recovery for every interrupted path.
+
+## Findings — Should fix
+
+1. **Fifteen payment/ticket/audit read methods still take the write lock — db.py:~2990–3260.**
+   - *What this is:* `payment`, `pending_payments`, `pending_review_payments`, `all_payments`,
+     `payment_history(+_paginated)`, `count_payments_by_status`, `open_awaiting_payment_for_user`,
+     `recent_audit`, `get_ticket`, `get_ticket_by_public_id`, `list_user_tickets`, `list_tickets`,
+     `count_tickets_by_status`, `ticket_messages`, `count_ticket_messages` sit on the write
+     connection under `self._write_lock`, while everything else the module reads (ledger,
+     submissions, library, learning screens) runs on the lock-free, query-only connection.   - *Problem:* Reads contend with serialized job writes. Under WAL this is safe but slow: a
+     payment-history tap while three jobs settle waits its turn, and the lock-free read-only
+     connection is already there but unused for these screens.
+   - *Fix:* Route each one through `self.read_db` and drop the lock (all of them only SELECT). A
+     handful of the them (`_PAYMENT_COLUMNS...` subquery) needs no other change.
+   - *If we skip it:* Screens age into contention ranges only as users outgrow the initial few
+     hundred; users feel it only under load; no data is lost.
+
+2. **No guard on a test waiter that can wedge one concurrency test on a small-disk sandbox.**
+      (`tests/test_concurrency_and_failover.py:692`)
+   - *What this is:* The failing-by-environment test uses `await entered_stt.wait()` forever.
+   - *Problem:* On a disk smaller than 4 GB the file greys up the suite more than a real machine needs.
+   - *Fix:* Wait with `asyncio.wait_for(..., 5)` and assert after.
+   - *If we skip it:* The suite has one more environment-dependent hang; production is untouched.
+
+## Findings — Nice to have (i.e. when they are already being touched, not on their own)
+
+3. **`subscription.py:138` `_now_iso` duplicates `db.iso(utc_now())`** (5 lines); a one-liner trim
+   if the two modules ever share a util moon.
+4. **`subscription.py:startup_self_check` alert text hardcodes `@gamas_AI`** instead of
+   `self.channel_ref`; an operator who renamed the channel sees a stale instruction.
+5. **`subscription.py:217` `response.text()` is unbounded** while every other provider call in the
+   repo reads bounded; the Bot API answers are tiny so this is posture, not risk.
+6. **`db.py:document_ensure_library_item` falls back to chat 0/message 0** when a legacy document
+   row's `file_msg_ref` fails to parse, which produces a library row whose “forward me” action can
+   never work. Replace with an explicit “source unavailable” mark, i.e. `unavailable = 1`.
+
+## An audit of the audit claims
+
+The existing prior round (below) claims 1,246 tests + 62 subtests green and CI gates clean. This
+round could rerun `ruff` and `mypy` clean and every non-environmental test green on a much weaker
+sandbox (Python 3.10, 0.8 GB disk). The prior two Office fixes are verifiably in tree. The report
+below stands as history for those numbers.
+
+Verdict: healthy. No must-fix. The billing, admission, dedup, settlement, recovery and
+authorization layers are the same well-audited machinery the two prior rounds left behind, and
+the latest merge (PR #105) neither regressed them nor added a new risky surface.
+
+**Status update, same day:** the two Should-fix and all four Nice-to-have findings above were
+applied (read screens on the query-only connection, bounded subscription read, configured channel
+name, dead `_now_iso`, the unavailable library mirror, the bounded test waiter), plus a ponytail
+deletion sweep (`is_supported_image_name` + `SUPPORTED_IMAGE_SUFFIXES`, `preset_questions`,
+unreferenced `docs/SUBSCRIPTION_REPORT.md`). Details in `docs/CHANGELOG.md`.
+Lean: −~30 lines and one documentation page removed in total, 0 dependencies removable.
+Not checked: `llm.py`/`stt.py` per-provider failover bodies (checked at macro level, not every
+line), `media_worker`/`presentations` internals, `docx_export`/`pdf_export` rendering internals,
+the full `config.py` env matrix, live Telegram/provider behavior, cron/watchdog behavior under
+real cPanel, and anything only reachable with production `.env` data.
+
+---
+
+# Document-export and model-output audit — current working tree (previous round)
 
 Date: 2026-10-31. Base revision reviewed: `4a9280f7856a622d18ddc8a0523330d80300e570`
 (`main`, merge of PR #99), branch `arena/a03132e9-gamas-bot`, working tree clean at start

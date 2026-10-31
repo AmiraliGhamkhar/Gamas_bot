@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — audit fixes and dead-code trim (ponytail re-audit)
+
+- **Payment/ticket/audit read screens no longer contend with job writes.** Fifteen Database read
+  methods (`payment`, `pending_payments`, `pending_review_payments`, `all_payments`,
+  `payment_history(+_paginated)`, `count_payments_by_status`, `count_pending_review_payments`,
+  `open_awaiting_payment_for_user`, `recent_audit` and the six support-ticket read helpers) ran on
+  the write connection under `Database._write_lock`; they only ever SELECT, so they now run on the
+  lock-free query-only connection like every other reporting read. No schema, callback or
+  permission change. Covered by the existing payment/support/admin test groups.
+- **The subscription gate's Bot API read is bounded.** `getChatMember` now reads through
+  `http_util.read_error_body` (64 KB ceiling) like every other provider call, so a hostile relay
+  behind `TELEGRAM_API_BASE_URL` cannot stream an unbounded body into memory. The bot-not-admin
+  alert and the startup self-check name the *configured* channel instead of a hard-coded
+  `@gamas_AI`, and `_now_iso()` was deleted as a duplicate of `db.iso(utc_now())`.
+- **A legacy document without a parsable `chat:message` reference no longer creates a fake
+  forwardable library row.** `document_ensure_library_item` still returns an item id but marks it
+  `unavailable` instead of storing chat id 0 / message id 0.
+- **One concurrency test cannot wedge a small-disk host.**
+  `test_concurrency_and_failover.MultiUserPipelineIsolationAndCleanupTests`
+  waits for its fake STT with a bounded `asyncio.wait_for`; previously a head-room refusal
+  (< 4 GB temp free) left the waiter running forever instead of failing fast.
+- **Dead code removed.** `ocr.is_supported_image_name` + `SUPPORTED_IMAGE_SUFFIXES` and
+  `learning.preset_questions` had zero references in source or tests; deleted. The finished
+  one-off report `docs/SUBSCRIPTION_REPORT.md` (unreferenced; superseded by
+  `docs/TELEGRAM_SUBSCRIPTION.md`) was deleted.
+
 ## Unreleased — reliable broadcast retries and a working console entry point
 
 - **Flood waits no longer skip the recipient that triggered them.** A broadcast retries the same

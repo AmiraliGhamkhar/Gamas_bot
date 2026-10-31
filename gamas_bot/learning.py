@@ -71,13 +71,6 @@ def preset_cards(code: str) -> int | None:
     return None
 
 
-def preset_questions(code: str) -> int | None:
-    for preset_code, _label, _cards, questions in SIZE_PRESETS:
-        if preset_code == code:
-            return questions
-    return None
-
-
 def distribute_counts(total: int, weights: list[int]) -> list[int]:
     """Split ``total`` items across chunks proportionally to their ``weights``.
 

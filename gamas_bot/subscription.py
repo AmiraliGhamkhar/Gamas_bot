@@ -35,11 +35,13 @@ import json
 import logging
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 import aiohttp
 from telethon import Button
+
+from .db import iso, utc_now
+from .http_util import read_error_body
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +83,13 @@ SUBSCRIPTION_CONFIRMED_TEXT = (
     "✅ عضویت شما در کانال گاماس تأیید شد.\n"
     "اکنون می‌توانید از ربات استفاده کنید."
 )
+#: Rendered when the check could not be completed (infrastructure/permission).
+#: It deliberately does not claim the user is (or is not) a member.
+SUBSCRIPTION_UNAVAILABLE_TEXT = (
+    "⚠️ در حال حاضر توانایی بررسی عضویت موقتاً در دسترس نیست.\n"
+    "یک لحظه دیگر دوباره امتحان کنید."
+)
+
 #: Rendered when the check could not be completed (infrastructure/permission).
 #: It deliberately does not claim the user is (or is not) a member.
 SUBSCRIPTION_UNAVAILABLE_TEXT = (
@@ -133,10 +142,6 @@ class MembershipResult:
     @property
     def is_unknown(self) -> bool:
         return self.state == STATE_UNKNOWN
-
-
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class SubscriptionService:
@@ -214,7 +219,10 @@ class SubscriptionService:
         url = f"{self.settings.telegram_api_base_url.rstrip('/')}/bot{token}/getChatMember"
         payload = {"chat_id": self.channel_ref, "user_id": int(user_id)}
         async with session.post(url, json=payload) as response:
-            text = await response.text()
+            # The Bot API answers in small JSON, but the read is bounded like
+            # every other provider read in the repo: a hostile relay pointing
+            # ``telegram_api_base_url`` at a large stream cannot fill memory.
+            text = (await read_error_body(response)).decode("utf-8", "replace")
         try:
             data = json.loads(text)
         except ValueError as exc:
@@ -376,7 +384,7 @@ class SubscriptionService:
     async def _record(self, user_id: int, result: MembershipResult) -> None:
         if result.state == STATE_MEMBER:
             status = "member"
-            verified_at = _now_iso()
+            verified_at = iso(utc_now())
         else:
             status = result.status or result.state
             verified_at = None
@@ -533,7 +541,7 @@ class SubscriptionService:
             await self._alert_admins(
                 "⚠️ بررسی خودکار کانال گاماس ناموفق بود.\n"
                 f"دلیل: {exc}\n"
-                "ربات باید administrator کانال @gamas_AI باشد."
+                "ربات باید administrator کانال {channel} باشد.".format(channel=self.channel_ref)
             )
             return False
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as exc:

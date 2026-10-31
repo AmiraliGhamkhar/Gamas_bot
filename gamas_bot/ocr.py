@@ -122,11 +122,6 @@ MAX_FILENAME_CHARS = 96
 #: Default upload ceiling; the bot passes its own ``DOC_MAX_BYTES``.
 DEFAULT_MAX_BYTES = 50 * 1024 * 1024
 
-#: Images i2ocr documents as input (its Features page).
-SUPPORTED_IMAGE_SUFFIXES = frozenset(
-    {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
-)
-
 #: Every recognition language i2ocr.com documents (``/features``), as the slug
 #: the ``ocr_lang`` parameter expects.
 I2OCR_LANGUAGES = frozenset(
@@ -270,11 +265,6 @@ def curl_cffi_available() -> bool:
     except Exception:  # pragma: no cover - depends on the deployment
         return False
     return True
-
-
-def is_supported_image_name(name: str | None) -> bool:
-    """Whether *name* carries an image suffix the service documents."""
-    return Path(str(name or "")).suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
 
 
 def _js_unescape(raw: str) -> str:

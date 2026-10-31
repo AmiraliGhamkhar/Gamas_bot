@@ -698,7 +698,10 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
         ), mock.patch("gamas_bot.bot.needs_transcode", return_value=False), \
              mock.patch("gamas_bot.bot.transcribe", new=slow_stt):
             run_task = asyncio.create_task(self.bot._run_job(job))
-            await entered_stt.wait()
+            # The STT stub only starts when the download gate passes; on a host
+            # with a small temp disk the gate refuses first, so this must be
+            # bounded or the test wedges forever instead of failing fast.
+            await asyncio.wait_for(entered_stt.wait(), 5.0)
             run_task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await run_task
