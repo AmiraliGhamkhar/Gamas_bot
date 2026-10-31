@@ -3,6 +3,9 @@
 Start with the [main README](../README.md). Commands are given for **Windows PowerShell** (local)
 and **cPanel Terminal** (Linux shared hosting).
 
+AI coding agents: read [`../AGENTS.md`](../AGENTS.md) first — it is the system prompt /
+maintainer contract (invariants R/B/P/S/D, billing rules, and the full test gate) for this repo.
+
 | Page | Use it for |
 | --- | --- |
 | [Deploy on cPanel](DEPLOY_CPANEL.md) | Upload, install, preflight, cron watchdog, updates |
