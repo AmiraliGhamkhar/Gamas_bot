@@ -75,13 +75,25 @@ cron job cannot create a second database or session.
 | `LEARNING_CHUNK_CONCURRENCY` | Parallel model calls while generating a quiz/deck (default `4`, allowed 1–8). If there are more chunks than requested items, some chunks receive zero items and the preview reports incomplete coverage. |
 | `FLASHCARD_MAX_DECKS_PER_USER` | Stored decks per user, AI and manual counted together (default `30`). New generation is refused at the cap. |
 | `DOC_MAX_BYTES` | Largest accepted study document (default `52_428_800` = 50 MB), checked before and during download. Extracted text is separately limited to 5,000,000 characters; larger texts must be split. PDF, `.docx` and PowerPoint are supported; `.doc`/`.ppt` are best-effort by extension. OCR is not available. |
-| `OFFICE_ENABLED` and `OFFICE_*` | Retired Free Office UI compatibility settings; bot menu and job wiring are removed, and `OFFICE_ENABLED` defaults to `false`. |
+| `OFFICE_ENABLED` | Free Office user menu and document-note/export actions (`true` by default); `false` hides the menu and rejects stale callbacks. |
+| `OFFICE_MAX_INPUT_BYTES`, `OFFICE_MAX_CHARS` | Per-upload text-file cap (default 1,000,000 bytes) and per-draft pasted-text cap (100,000 characters); oversized inputs are rejected whole. |
+| `OFFICE_MAX_SLIDES`, XLSX table limits | Maximum total generated slides (30 by default, minimum 4, including title/agenda/closing); XLSX limits are 2,000 data rows and 40 columns per table. Overflow is an error, never silent truncation. |
+| `OFFICE_SESSION_TTL_MINUTES` | In-memory text-draft lifetime (30 minutes by default); drafts are swept periodically, on navigation/use and at shutdown. |
+| `OFFICE_JOB_CONCURRENCY`, `OFFICE_AI_CONCURRENCY` | Bounded concurrent Office build/note/delivery operations (2) and PPT planning chunks (3). |
+| `OFFICE_MIN_INTERVAL_SECONDS` | Per-user delay between Office creations (10 seconds; `0` disables the throttle). This is resource protection, not a charge. |
+| Document Office note/export source ceiling | Fixed at 250,000 characters. Longer extracted documents remain downloadable but note/export actions refuse rather than truncate. |
 | `MAX_MEDIA_DURATION_SECONDS` | Maximum accepted audio/video duration (default 7,200 seconds / 2 hours), checked from Telegram metadata and media probes. |
 | `PRESENTATION_MAX_*` | Deck limits (defaults: 50 clips, 2 hours total, 128 MiB unpacked, 256 MiB temporary). |
 | `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME` | Set all three to enable card-to-card purchases. |
 | `RECEIPT_RETENTION_DAYS` | Delete receipt images after this many days (default `90`); the payment row remains. |
 | `TRANSCRIPT_RETENTION_DAYS` | Delete finished transcript text after this many days (`0` = keep forever). |
 | `DB_PATH`, `TELEGRAM_SESSION`, `TEMP_DIR`, `RECEIPT_DIR`, `LOG_FILE` | Keep all of them outside `public_html`. |
+
+Free Office uses the existing configured note routes only. Without note-provider credentials it still
+works with deterministic source-preserving exports and notes. Provider requests can have operator-side
+API costs, but no Office or document-note action debits user wallet credit or the existing quiz/
+flashcard free-use allowances. `TEMP_DIR` must be private and outside `public_html`; drafts themselves
+are in memory and expire after `OFFICE_SESSION_TTL_MINUTES`.
 
 ## Validate
 

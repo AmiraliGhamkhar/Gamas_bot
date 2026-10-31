@@ -1077,17 +1077,19 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self._tmp.cleanup()
 
-    def test_user_menu_is_the_five_action_root_for_everyone(self):
+    def test_user_menu_includes_optional_free_office_for_everyone(self):
         user_menu = menu_payloads(self.bot._user_menu(is_admin=False))
         admin_menu = menu_payloads(self.bot._user_menu(is_admin=True))
         self.assertEqual(
             user_menu,
-            {b"library", b"wallet", b"support", b"help", b"board"},
+            {b"library", b"wallet", b"support", b"help", b"board", b"office:start"},
         )
         self.assertEqual(
             admin_menu,
-            {b"library", b"wallet", b"support", b"help", b"board", b"adm:home"},
+            {b"library", b"wallet", b"support", b"help", b"board", b"office:start", b"adm:home"},
         )
+        self.bot.settings = replace(self.settings, office_enabled=False)
+        self.assertNotIn(b"office:start", menu_payloads(self.bot._user_menu()))
 
     def test_admin_menu_is_its_own_panel_with_way_back(self):
         payloads = menu_payloads(self.bot._admin_menu())
@@ -1114,9 +1116,10 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"library", payloads)
         self.assertIn(b"wallet", payloads)
         self.assertIn(b"adm:home", payloads)
-        self.assertEqual(len(payloads), 6)
+        self.assertIn(b"office:start", payloads)
+        self.assertEqual(len(payloads), 7)
 
-    async def test_main_panel_copy_uses_the_no_notes_variant_and_wallet_balance(self):
+    async def test_main_panel_copy_explains_free_office_and_wallet_balance(self):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
@@ -1124,7 +1127,8 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(text.startswith(
             "منوی اصلی\n\n"
             "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت.\n"
-            "متن گفتار و سند ذخیره می‌شود؛ ساخت محتوای هوشمند فعلاً فعال نیست."
+            "🗂 آفیس رایگان: پیام یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار.\n"
+            "متن گفتار و سند ذخیره می‌شود. آفیس رایگان حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند."
         ))
         self.assertIn("💳 اعتبار باقی‌مانده", text)
 
@@ -1136,6 +1140,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         expected = (
             "ℹ️ راهنمای گاماس\n\n"
             "🎧 فایل صوت/ویدیو یا 📄 سند PDF، Word و پاورپوینت را همین‌جا بفرستید.\n"
+            "🗂 آفیس رایگان: متن یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار.\n"
             "📚 متن اسناد در کتابخانه ذخیره می‌شود؛ برای ارائه، پردازش صدا نیز انتخاب‌پذیر است.\n"
             "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
             "🎁 نخستین مجموعهٔ فلش‌کارت و نخستین آزمون جداگانه رایگان‌اند.\n"
@@ -1159,8 +1164,9 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn("ساخت محتوای هوشمند فعلاً فعال نیست.", text)
-        self.assertNotIn("متن گفتار و سپس جزوهٔ ورد", text)
+        self.assertIn("آفیس رایگان حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند.", text)
+        self.assertIn("رایگان و بدون کسر اعتبار", text)
+        self.assertNotIn("متن گفتار و جزوهٔ ورد", text)
 
     async def test_admin_guides_explain_user_actions_and_empty_states(self):
         users = FakeCallbackEvent(self.admin_id, b"adm:users")
@@ -1622,14 +1628,14 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         start_payloads = menu_payloads(start.client.texts[0].get("buttons"))
         self.assertEqual(
             start_payloads,
-            {b"library", b"wallet", b"support", b"help", b"board"},
+            {b"library", b"wallet", b"support", b"help", b"board", b"office:start"},
         )
 
         menu = FakeCallbackEvent(501, b"menu:main")
         await self.bot._handle_callback(menu)
         self.assertEqual(
             menu_payloads(menu.edits[-1][1]),
-            {b"library", b"wallet", b"support", b"help", b"board"},
+            {b"library", b"wallet", b"support", b"help", b"board", b"office:start"},
         )
 
     async def test_bare_text_retriggers_file_upload_with_the_main_menu(self):
@@ -1641,7 +1647,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             menu_payloads(self.bot._user_menu()),
-            {b"library", b"wallet", b"support", b"help", b"board"},
+            {b"library", b"wallet", b"support", b"help", b"board", b"office:start"},
         )
 
     async def test_media_upload_without_a_mode_tap_runs_transcript_then_booklet(self):

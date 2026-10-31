@@ -34,10 +34,19 @@ Find the `GMS-#####` reference in the log first.
 | "Credit is not enough" | Balance is measured in seconds; open «🛒 خرید اشتراک» to buy a plan or grant credit as admin |
 | Receipt sent but no credit | Expected: an admin must approve the payment |
 
-## Document issues
+## Document and Free Office issues
 
-- OCR on images and scanned PDFs is not supported.
-- The Free Office bot UI is retired; bare text messages show the lecture-upload guide instead.
+- If **🗂 آفیس رایگان** is missing, check `OFFICE_ENABLED=true`; the menu intentionally hides it when disabled.
+- Only `.txt`, `.md`, `.markdown`, `.csv` and `.tsv` are accepted as Free Office input files. Check
+  the file size (`OFFICE_MAX_INPUT_BYTES`) and that its MIME type agrees with the extension. A CSV
+  with malformed quoting is rejected rather than partly imported.
+- If an export is refused for size, split the source: direct drafts are limited by `OFFICE_MAX_CHARS`,
+  while document note/export actions have a hard 250,000-character source ceiling. The original
+  extracted document and original Telegram file remain available; the bot does not silently trim.
+- Without note-provider keys, Office and document notes still use deterministic fallbacks. A
+  provider failure can produce a fallback or a clear refusal if safe compacting is impossible.
+- PowerPoint output is a new deck from text, not a pixel-perfect conversion. Narration/audio runs
+  only when the explicit source-card button is pressed. No OCR is available for scanned PDFs.
 - The Word topic list uses links, not page numbers; the server does not run a Word layout engine.
 - If Word offers to repair a generated file, save it and report the `GMS-#####` reference, Word and
   Windows versions. Do not send `.env`, API keys or transcripts.

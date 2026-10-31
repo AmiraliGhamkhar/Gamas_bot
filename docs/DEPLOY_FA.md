@@ -32,6 +32,11 @@ MAX_ACTIVE_JOBS=1
 MAX_QUEUED_JOBS=4
 MAX_ACTIVE_JOBS_PER_USER=1
 MEDIA_WORKER_CONCURRENCY=1
+OFFICE_ENABLED=true
+OFFICE_MAX_INPUT_BYTES=1000000
+OFFICE_MAX_CHARS=100000
+OFFICE_MAX_SLIDES=30
+OFFICE_JOB_CONCURRENCY=2
 ```
 
 ## آزمایش
@@ -56,6 +61,12 @@ python -m gamas_bot
 موقتاً غیرفعال کنید، ربات را متوقف کنید، از `.env`، `data/gamas_v3.db` (و فایل‌های `-wal`/`-shm`)
 و `data/receipts` نسخهٔ پشتیبان بگیرید، سپس `git pull`، نصب `requirements.txt`، اجرای
 `python -m scripts.cpanel_preflight` و `python -m gamas_bot --check` را انجام دهید. بررسی `--check`
-آفلاین است و پایگاه‌داده را تغییر نمی‌دهد؛ مهاجرت‌های خودکار تا `008_payment_transition_integrity.sql`
-هنگام راه‌اندازی ربات اجرا می‌شوند. در پایان کران را فعال کنید یا در Passenger از `touch tmp/restart.txt`
-استفاده کنید.
+آفلاین است و پایگاه‌داده را تغییر نمی‌دهد؛ مهاجرت‌های خودکار هنگام راه‌اندازی اجرا می‌شوند. پیش از
+ارتقا نسخهٔ پشتیبان SQLite بگیرید؛ migration 016 فقط جدول موجود کتابخانه را برای ذخیرهٔ ارجاع
+فایل‌های Office بازسازی می‌کند و ردیف‌ها را نگه می‌دارد. در پایان کران را فعال کنید یا در Passenger
+از `touch tmp/restart.txt` استفاده کنید. گزینهٔ
+**🗂 آفیس رایگان** به‌طور پیش‌فرض فعال است؛ پیام یا فایل‌های `.txt`، `.md`، `.markdown`، `.csv` و
+`.tsv` را به Word/Excel/PowerPoint/PDF تبدیل می‌کند و از اعتبار کاربر کم نمی‌کند. بدون کلید یادداشت
+نیز خروجی‌های ایمنِ پایه ساخته می‌شوند؛ هزینهٔ احتمالی ارائه‌دهنده فقط هزینهٔ عملیاتی مدیر است.
+پوشهٔ `TEMP_DIR` باید خصوصی و بیرون از `public_html` باشد. جزئیات سقف‌ها و آزمون را در
+[Free Office](OFFICE.md) ببینید.

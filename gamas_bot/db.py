@@ -2,7 +2,8 @@
 
 One WAL database, serialized ``BEGIN IMMEDIATE`` writes, and numbered additive
 migrations. The library stores Telegram message references only; it never
-copies generated artifacts to local storage. The v2 database is not migrated in
+copies generated artifacts to local storage. Free Office exports use the same
+library index as booklets and transcripts. The v2 database is not migrated in
 place: v3 opens a fresh file (``DB_PATH``, default
 ``data/gamas_v3.db``) and :mod:`scripts.import_v2` can copy users, credit and
 the ledger across from a v2 database.

@@ -69,6 +69,7 @@ logger = logging.getLogger(__name__)
 
 MAX_TITLE_CHARS = 200
 MAX_TEXT_CHARS = 20000
+MAX_SOURCE_LOCATORS_PER_SECTION = 100
 VALID_CALLOUT_KINDS = ("نکته", "هشدار", "یادآوری")
 
 #: A merge below this size is not worth an editorial compile call.
@@ -287,6 +288,9 @@ class NoteSection:
     #: so every existing renderer and the legacy payload keep working; a model
     #: answer with ``tables`` is normalised into both fields.
     tables: tuple[NoteTable, ...] = ()
+    #: Exact page/slide/section labels from an extracted source. Populated only
+    #: by document-note generation; audio-note output remains unchanged.
+    source_locators: tuple[str, ...] = ()
 
     @property
     def all_tables(self) -> tuple[NoteTable, ...]:
@@ -333,6 +337,13 @@ class NoteSection:
             table=primary,
             callouts=callouts,
             tables=extra,
+            source_locators=tuple(
+                dict.fromkeys(
+                    " ".join(value.split())[:120]
+                    for value in _string_list(payload.get("source_locators"))
+                    if value.strip()
+                )
+            )[:MAX_SOURCE_LOCATORS_PER_SECTION],
         )
         return section if section.has_content else None
 
@@ -419,6 +430,7 @@ class StructuredNotes:
                         {"kind": callout.kind, "text": callout.text}
                         for callout in section.callouts
                     ],
+                    "source_locators": list(section.source_locators),
                 }
                 for section in self.sections
             ],
@@ -449,6 +461,8 @@ class StructuredNotes:
             parts.extend(f"- {objective}" for objective in self.learning_objectives)
         for section in self.sections:
             parts.append(f"## {section.heading}")
+            if section.source_locators:
+                parts.append("منبع: " + "، ".join(section.source_locators))
             parts.extend(section.paragraphs)
             if section.definitions:
                 parts.append("**تعریف‌ها**")
@@ -984,7 +998,19 @@ _BOOKLET_SKELETON_RULES = (
 )
 
 
-def build_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
+_SOURCE_LOCATOR_RULES = (
+    "\nقواعد مکان‌یاب منبع:\n"
+    "- متن‌های داخل کروشه مانند [صفحهٔ ۲] یا [اسلاید ۳] مکان‌یاب واقعی منبع‌اند.\n"
+    "- در source_locators هر بخش، فقط همان برچسب‌های کامل و عیناً موجود در ورودی را بیاورید که "
+    "از محتوای همان بخش پشتیبانی می‌کنند؛ برچسب را نسازید، تغییر ندهید یا حدس نزنید.\n"
+    "- اگر هیچ برچسبی با اطمینان پشتیبان نیست، source_locators را خالی بگذارید.\n"
+    "- متن مکان‌یاب را به محتوای آموزشی تبدیل نکنید."
+)
+
+
+def build_system_prompt(
+    mode: str = "full", *, context_block: str = "", source_locators: bool = False
+) -> str:
     """The Persian system prompt for one note mode (lecture-to-notes compiler)."""
     # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
     mode_rule = MODE_RULES["full"]
@@ -1005,6 +1031,8 @@ def build_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
         + _ACADEMIC_RULES
         + _TRANSITION_RULES
     )
+    if source_locators:
+        prompt += _SOURCE_LOCATOR_RULES
     if context_block:
         prompt += "\n\n" + _CHUNKED_CONTENT_RULES + "\n" + context_block
     return prompt
@@ -1025,6 +1053,11 @@ def notes_response_schema() -> dict:
         "type": "object",
         "properties": {
             "heading": {"type": "string"},
+            "source_locators": {
+                "type": "array",
+                "items": {"type": "string"},
+                "maxItems": MAX_SOURCE_LOCATORS_PER_SECTION,
+            },
             "paragraphs": text_array,
             "bullets": text_array,
             "definitions": {
@@ -1182,7 +1215,7 @@ COMPILE_SYSTEM_PROMPT = (
 )
 
 def build_compile_system_prompt(
-    mode: str = "full", *, presentation: bool = False
+    mode: str = "full", *, presentation: bool = False, source_locators: bool = False
 ) -> str:
     """Build the editorial compile system prompt for a note mode and source kind."""
     # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
@@ -1190,6 +1223,8 @@ def build_compile_system_prompt(
     prompt = COMPILE_SYSTEM_PROMPT + "\n\nقواعد حالت خروجی:\n" + mode_rule.rstrip()
     if presentation:
         prompt += "\n" + _PRESENTATION_CONTENT_RULES.strip()
+    if source_locators:
+        prompt += _SOURCE_LOCATOR_RULES
     return prompt
 
 
@@ -1304,6 +1339,9 @@ def _combine_sections(first: NoteSection, second: NoteSection) -> NoteSection:
         callouts=_dedupe_callouts(first.callouts + second.callouts),
         table=table,
         tables=tables,
+        source_locators=tuple(
+            dict.fromkeys(first.source_locators + second.source_locators)
+        )[:MAX_SOURCE_LOCATORS_PER_SECTION],
     )
 
 
@@ -1881,6 +1919,8 @@ async def fill_coverage_gaps(
 def section_payload(section: NoteSection) -> dict:
     """One section as the compact payload: empty fields are omitted."""
     item: dict = {"heading": section.heading}
+    if section.source_locators:
+        item["source_locators"] = list(section.source_locators)
     if section.paragraphs:
         item["paragraphs"] = list(section.paragraphs)
     if section.bullets:
@@ -2618,6 +2658,7 @@ async def _audit_and_repair(
     mode: str,
     presentation: bool,
     semaphore: asyncio.Semaphore,
+    source_locators: bool = False,
 ) -> tuple[StructuredNotes, NoteQualityReport]:
     """Gate the notes, then make at most one bounded repair request.
 
@@ -2646,6 +2687,7 @@ async def _audit_and_repair(
         gated, report = await _repair_once(
             gated, report, source, settings, session,
             mode=mode, presentation=presentation, semaphore=semaphore,
+            source_locators=source_locators,
         )
     if report.audit.fabricated:
         scrubbed, removed = scrub_fabricated_numbers(gated, report.audit)
@@ -2748,6 +2790,7 @@ async def _repair_once(
     mode: str,
     presentation: bool,
     semaphore: asyncio.Semaphore,
+    source_locators: bool = False,
 ) -> tuple[StructuredNotes, NoteQualityReport]:
     """One bounded repair request; the caller keeps its state on any failure."""
     budget = effective_compile_max_chars(settings, mode=mode, presentation=presentation)
@@ -2756,7 +2799,9 @@ async def _repair_once(
         return notes, report
     repair_document, repaired_sections = request
     targeted = len(repaired_sections) < len(notes.sections)
-    system_prompt = build_compile_system_prompt(mode, presentation=presentation)
+    system_prompt = build_compile_system_prompt(
+        mode, presentation=presentation, source_locators=source_locators
+    )
     try:
         async with semaphore:
             payload = await complete_json(
@@ -2790,6 +2835,7 @@ async def _compile_once(
     mode: str,
     presentation: bool,
     budget: int,
+    source_locators: bool = False,
 ) -> StructuredNotes | None:
     """One editorial compile request, or ``None`` when it cannot be sent.
 
@@ -2807,8 +2853,12 @@ async def _compile_once(
     compile_system = (
         COMPILE_SYSTEM_PROMPT
         if mode == "full" and not presentation
-        else build_compile_system_prompt(mode, presentation=presentation)
+        else build_compile_system_prompt(
+            mode, presentation=presentation, source_locators=source_locators
+        )
     )
+    if source_locators and mode == "full" and not presentation:
+        compile_system += _SOURCE_LOCATOR_RULES
     try:
         payload = await complete_json(
             session,
@@ -2907,6 +2957,7 @@ async def _compile_in_groups(
     presentation: bool,
     budget: int,
     semaphore: asyncio.Semaphore | None = None,
+    source_locators: bool = False,
 ) -> StructuredNotes:
     """Level 1: compile whole-section groups concurrently; keep any group that fails."""
     groups = compile_groups(merged, context, budget=budget)
@@ -2923,6 +2974,7 @@ async def _compile_in_groups(
             return await _compile_once(
                 session, settings, context, group,
                 mode=mode, presentation=presentation, budget=budget,
+                source_locators=source_locators,
             )
 
     tasks = [asyncio.create_task(compile_group(group)) for group in groups]
@@ -3014,6 +3066,7 @@ async def _compile_pass(
     mode: str,
     presentation: bool,
     semaphore: asyncio.Semaphore | None = None,
+    source_locators: bool = False,
 ) -> StructuredNotes:
     """The editorial pass: one request when it fits, whole-section groups when not.
 
@@ -3053,6 +3106,7 @@ async def _compile_pass(
         compiled = await _compile_once(
             session, settings, context, merged,
             mode=mode, presentation=presentation, budget=budget,
+            source_locators=source_locators,
         )
         accepted = _gate_compiled(
             compiled, merged, merged_report, document, settings, mode=mode
@@ -3063,6 +3117,7 @@ async def _compile_pass(
         merged, context, document, settings, session,
         mode=mode, presentation=presentation, budget=budget,
         semaphore=semaphore,
+        source_locators=source_locators,
     )
     accepted = _gate_compiled(
         assembled if assembled is not merged else None,
@@ -3083,6 +3138,7 @@ async def _compile_pass(
         final = await _compile_once(
             session, settings, context, accepted,
             mode=mode, presentation=presentation, budget=budget,
+            source_locators=source_locators,
         )
         merged_final = _gate_compiled(
             final, merged, merged_report, document, settings, mode=mode
@@ -3105,6 +3161,7 @@ async def structure_document(
     mode: str = "full",
     presentation: bool = False,
     on_merged: MergedCallback | None = None,
+    source_locators: bool = False,
 ) -> StructuredNotes:
     """Map-reduce a prepared LLM document into one structured booklet.
 
@@ -3128,8 +3185,10 @@ async def structure_document(
     base_system = (
         build_presentation_system_prompt(resolved_mode)
         if presentation
-        else build_system_prompt(resolved_mode)
+        else build_system_prompt(resolved_mode, source_locators=source_locators)
     )
+    if presentation and source_locators:
+        base_system += _SOURCE_LOCATOR_RULES
     splitter = split_presentation_document if presentation else split_transcript
     chunk_chars = effective_chunk_chars(settings, system_prompt=base_system)
     chunks = splitter(document, chunk_chars)
@@ -3169,6 +3228,7 @@ async def structure_document(
             await _audit_and_repair(
                 single, document, settings, session,
                 mode=resolved_mode, presentation=presentation, semaphore=semaphore,
+                source_locators=source_locators,
             )
         )[0]
 
@@ -3238,6 +3298,7 @@ async def structure_document(
         merged, merged_report = await _audit_and_repair(
             merged, document, settings, session,
             mode=resolved_mode, presentation=presentation, semaphore=semaphore,
+            source_locators=source_locators,
         )
     if on_merged is not None and compile_will_run(
         merged, settings, mode=resolved_mode, presentation=presentation
@@ -3254,6 +3315,7 @@ async def structure_document(
     return await finalize(await _compile_pass(
         merged, merged_report, document, context, settings, session,
         mode=resolved_mode, presentation=presentation, semaphore=semaphore,
+        source_locators=source_locators,
     ))
 
 

@@ -10,6 +10,8 @@ py -3.12 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 .\.venv\Scripts\python.exe -m pip check
 .\.venv\Scripts\python.exe -m scripts.sync_requirements --check
+.\.venv\Scripts\python.exe -m gamas_bot --check
+.\.venv\Scripts\python.exe -m scripts.cpanel_preflight
 .\.venv\Scripts\ruff.exe check .
 .\.venv\Scripts\python.exe -m mypy
 .\.venv\Scripts\python.exe -m pytest -q
@@ -24,13 +26,20 @@ If `ruff.exe` is not on the path, activate the virtualenv and run `ruff check .`
 After installing `requirements.txt` with the interpreter cron uses:
 
 ```bash
+python -m scripts.sync_requirements --check
 python -m gamas_bot --check
 python -m scripts.cpanel_preflight
+ruff check .
+mypy
+pytest -q
+python -m unittest discover -s tests -q
 python -m gamas_bot.media_worker check
 ```
 
-The first is offline; the preflight also tests disk, permissions, the lock and outbound network.
-Run the test suite only on a development machine, never with production `.env` or data.
+`--check` is offline but still validates required Telegram/STT/admin settings; cPanel preflight also
+tests disk, permissions, the lock and outbound network. Use a development `.env` with disposable
+credentials when running them. Run the test suite only on a development machine, never with
+production `.env` or data.
 
 ## What the suite covers
 
@@ -38,9 +47,10 @@ Run the test suite only on a development machine, never with production `.env` o
 | --- | --- |
 | `tests/test_doc_extract.py` | Real PDF/Word/PowerPoint extraction, Word tables and heading levels, malformed/encrypted/scanned/empty files, long sections, exact chunk budgets, locators and SHA-256 |
 | `tests/test_document_ingestion.py` | PDF/DOCX/PPTX upload → cached extraction → source-anchored generation; legacy PPT conversion and presentation queue; size boundary/stream gate, per-user and concurrent dedupe, ownership, retry, coverage and bounded concurrency |
+| `tests/test_office.py`, `tests/test_office_notes.py`, `tests/test_office_flow.py` | Real DOCX/XLSX/PPTX/selectable-PDF builders; quoted CSV/TSV, MIME/signature and literal formula-looking-cell guards; source/locator fidelity; menu/session callbacks; document full/compact Word+PDF, owner checks, no-provider fallback, library indexing and unchanged wallet/free-use state |
 | `tests/test_free_uses.py` | Independent gifts, owned claim/reset races, failed/cancelled/undeliverable/expired previews, startup recovery, shutdown/save races, paid refunds, curation and paywall behavior |
 | `tests/test_admin_hubs.py` | Three hubs and legacy aliases, admin authorization, identity in payment/support/audit views, peer-admin protection, confirmation and approval/rejection ledger paths |
-| `tests/test_migration_schema.py` | Fresh migration gate, populated 013 → 014 and 014 → 015 upgrades, legacy orphan repair, preserved child links, FK enforcement and interrupted migration replay |
+| `tests/test_migration_schema.py` | Fresh migration gate, populated migration upgrades including the library-kind expansion for Office, legacy orphan repair, preserved child links, FK enforcement and interrupted migration replay |
 | `tests/test_reaudit_workflows.py` | Durable paid recovery and save/cancel races, one-shot callback alerts, narrated textless PPTX, range integrity, admission/shutdown, concurrent document extraction and text limits, progress backpressure, exact split regressions |
 | `tests/test_user_identity.py` | Signed int64 boundaries, no float IDs, updated identity on duplicate `/start` and callbacks, username search/removal and strict user-reference integrity checks |
 | `tests/test_learning.py` | Source and difficulty validation, prompts, 10/5–20/10–40/20 presets, weighted coverage and normalized near-deduplication |
@@ -55,31 +65,39 @@ are stubbed, so these tests do not verify live providers or the Telegram client 
 آزمون پرداخت از رسید یا اطلاعات واقعی استفاده نکنید. نتایج آزمون خودکار جایگزین بررسی ظاهر
 تلگرام و کیفیت پاسخ سرویس واقعی نیست.
 
-1. با کاربری که اعتبارش صفر است `/start` بزنید؛ سپس با نام و نام‌کاربری تغییرکرده دوباره وارد
-   شوید. مدیر در «👥 کاربران» با شناسه و `@نام‌کاربری` جست‌وجو کند: فقط یک رکورد، نام کامل،
+1. با کاربری که اعتبارش صفر است `/start` بزنید؛ نمایش **🗂 آفیس رایگان** را با `OFFICE_ENABLED=true`
+   بررسی کنید و مطمئن شوید مدیر و کاربر عادی هر دو دسترسی خصوصی و owner-scoped دارند. سپس با نام
+   و نام‌کاربری تغییرکرده دوباره وارد شوید. مدیر در «👥 کاربران» با شناسه و `@نام‌کاربری` جست‌وجو
+   کند: فقط یک رکورد، نام کامل،
    شناسهٔ عددی دقیق و آخرین زمان مشاهده باید دیده شود. نمایش بدون نام‌کاربری و چینش راست‌به‌چپ
    و کپی شناسه را هم بررسی کنید.
-2. PDF متنی، DOCX دارای عنوان و جدول، و PPTX متنی بفرستید. پیش‌نمایش، شمارهٔ صفحه/بخش/اسلاید،
-   دکمه‌های ساخت و دریافت فایل و مدخل کتابخانه را ببینید. ارائهٔ دارای صدا را جداگانه با
-   «🎧 پردازش صدای ارائه» به صف قدیمی بفرستید. `.ppt` را در صورت امکان امتحان کنید؛ برای `.doc`
-   نامعتبر راهنمای تبدیل به `.docx` باید نمایش داده شود.
-3. PDF اسکن‌شده یا رمزدار، فایل خالی/خراب، عکس به‌جای فایل و سند بیش از `DOC_MAX_BYTES` را
+2. در آفیس رایگان چند پیام بفرستید و هر چهار خروجی Word/Excel/PowerPoint/PDF را باز کنید؛ متن PDF
+   باید قابل انتخاب باشد و هیچ خطای ساختاری نباید به کوتاه‌شدن خاموش متن منجر شود. یک CSV نقل‌قول‌دار
+   با کامای درون فیلد و سلول `=1+2` بفرستید؛ سلول Excel باید متن ساده بماند. موجودی کیف پول و
+   وضعیت هدیه‌های quiz/flashcard را قبل و بعد مقایسه کنید. پیش‌نویس را لغو کنید و انقضای TTL را هم
+   در محیط آزمایش بررسی کنید.
+3. PDF متنی، DOCX دارای عنوان و جدول، و PPTX متنی بفرستید. پیش‌نمایش، شمارهٔ صفحه/بخش/اسلاید،
+   دکمه‌های جزوهٔ کامل، مرور سریع، خروجی و دریافت فایل اصلی را ببینید. Word/PDF هر دو حالت را
+   بررسی کنید؛ محتوا و مکان‌یاب‌ها باید بمانند و مرور سریع باید واقعاً از جزوهٔ کامل متفاوت باشد.
+   ارائهٔ دارای صدا را فقط با «🎧 پردازش صدای ارائه» اجرا کنید. `.ppt` را در صورت امکان امتحان کنید؛
+   برای `.doc` نامعتبر راهنمای تبدیل به `.docx` باید نمایش داده شود.
+4. PDF اسکن‌شده یا رمزدار، فایل خالی/خراب، عکس به‌جای فایل و سند بیش از `DOC_MAX_BYTES` را
    امتحان کنید؛ پیام فارسی مناسب و عدم ایجاد سند خالی را بررسی کنید. یک فایل دقیقاً در سقف
    مجاز باید پذیرفته شود. یک سند تکراری را دو بار و نیز با کاربر دوم بفرستید: اولی همان رکورد
    و ارجاع تازه، دومی رکورد مستقل دارد.
-4. از سند موجود در کتابخانه، هر سه اندازهٔ ۱۰/۵، ۲۰/۱۰ و ۴۰/۲۰ را انتخاب کنید. پیشرفت، منبع
+5. از سند موجود در کتابخانه، هر سه اندازهٔ ۱۰/۵، ۲۰/۱۰ و ۴۰/۲۰ را انتخاب کنید. پیشرفت، منبع
    دقیق هر کارت/سؤال، گزینه‌ها، پاسخ و دشواری را بررسی کنید؛ موردی را حذف کنید، صفحات پیش‌نمایش
    را ورق بزنید و سپس ذخیره کنید. اگر بخشی ناموفق یا بررسی‌نشده است، هشدار پوشش و تعداد واقعی
    باید دیده شود؛ انصراف باید ممکن باشد.
-5. برای همان کاربر بدون اعتبار، یک مجموعه و یک آزمون مستقل را رایگان ذخیره کنید و پایان آزمون را
+6. برای همان کاربر بدون اعتبار، یک مجموعه و یک آزمون مستقل را رایگان ذخیره کنید و پایان آزمون را
    بزنید. تلاش دوم هر نوع باید به خرید اعتبار برسد. اگر کاربر اعتبار طرح رایگان قبلی دارد، ابتدا
    از همان اعتبار مصرف می‌شود؛ این اعتبار جدا از دو هدیه است.
-6. خطای سرویس، قطع تولید، شکست ارسال پیش‌نمایش، انصراف و انقضای پیش‌نمایش (۳۰ دقیقه) را جداگانه
+7. خطای سرویس، قطع تولید، شکست ارسال پیش‌نمایش، انصراف و انقضای پیش‌نمایش (۳۰ دقیقه) را جداگانه
    امتحان کنید؛ هدیه/اعتبار مناسب باید برگردد. پیش‌نمایش ذخیره‌نشدهٔ رایگان و پولی را با توقف و
    راه‌اندازی مجدد ربات آزمایشی بررسی کنید؛ مورد ذخیره‌شده نباید بازپرداخت شود. با مکث پاسخ
    سرویس آزمایشی، مدیر هدیه را بازنشانی کند و سپس کار
    قدیمی را کامل/ناموفق کنید؛ نتیجه نباید هدیهٔ جدید را مصرف یا برگرداند.
-7. مدیر هر سه مرکز پرداخت، کاربران و سامانه، دکمه‌های بازگشت و صفحه‌کلیدهای قدیمی را باز کند؛
+8. مدیر هر سه مرکز پرداخت، کاربران و سامانه، دکمه‌های بازگشت و صفحه‌کلیدهای قدیمی را باز کند؛
    کاربر عادی نباید هیچ زیرصفحهٔ مدیریتی را باز کند. سفارش آزمایشی با رسید ثبت کنید: تأیید نخست
    نباید اعتبار بدهد، تأیید نهایی باید دقیقاً یک‌بار اعتبار و سابقه ثبت کند، و رد با دلیل نباید
    اعتبار بدهد. بازنشانی هدیه باید تأیید بخواهد و در گزارش فعالیت ثبت شود.

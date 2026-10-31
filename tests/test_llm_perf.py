@@ -533,7 +533,7 @@ class PipelinePerfOptimizationsTests(unittest.IsolatedAsyncioTestCase):
         max_active = 0
 
         async def fake_compile_once(
-            _session, _settings, _context, group, *, mode, presentation, budget
+            _session, _settings, _context, group, *, mode, presentation, budget, source_locators=None
         ):
             nonlocal active, max_active
             active += 1

@@ -2588,6 +2588,16 @@ def _numbered_heading(index: int, heading: str) -> str:
 
 def _add_section(document, index: int, section: NoteSection, *, fonts: DocumentFonts) -> None:
     _add_heading(document, _numbered_heading(index, section.heading), fonts=fonts, level=1)
+    if section.source_locators:
+        _add_rtl_paragraph(
+            document,
+            "منبع: " + "، ".join(section.source_locators),
+            fonts=fonts,
+            size=8.5,
+            color=MUTED,
+            space_after=6,
+            line_spacing=1.0,
+        )
     for paragraph_text in section.paragraphs:
         _add_rtl_paragraph(document, paragraph_text, fonts=fonts)
     _add_definitions(document, section, fonts=fonts)

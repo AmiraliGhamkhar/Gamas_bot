@@ -48,6 +48,18 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
             "the schema and db.APPLICATION_TABLES disagree",
         )
 
+    async def test_office_exports_use_the_existing_owner_scoped_library(self):
+        await self.db.ensure_user(12)
+        item_id = await self.db.library_add(
+            12, "office", 12, 44, None, title="سند آزاد — Word"
+        )
+        item = await self.db.library_item(12, item_id)
+        self.assertIsNotNone(item)
+        self.assertEqual(item["kind"], "office")
+        self.assertIsNone(await self.db.library_item(13, item_id))
+        with self.assertRaises(sqlite3.IntegrityError):
+            await self.db.library_add(12, "unknown", 12, 45, None, title="نامعتبر")
+
     async def test_migration_013_tables_exist_with_their_guards(self):
         for table in ("free_uses", "documents"):
             self.assertIn(table, APPLICATION_TABLES)
@@ -142,6 +154,53 @@ class PopulatedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(new_id, 101)
             await db.assert_user_reference_integrity()
             await db.close()
+
+
+class OfficeLibraryUpgradeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_populated_015_library_survives_office_kind_migration_and_replay(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "before-office.sqlite3"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name >= "016_office_library_kind.sql":
+                    break
+                conn.executescript(migration.read_text(encoding="utf-8"))
+                conn.execute("INSERT INTO schema_migrations VALUES (?, '2026-01-01')", (migration.name,))
+            conn.execute("INSERT INTO users(telegram_id, joined_at) VALUES (123, '2026-01-01')")
+            conn.execute(
+                "INSERT INTO library_items(item_id,user_id,kind,chat_id,message_id,title,created_at,content_text) "
+                "VALUES (10,123,'booklet',123,44,'جزوه','2026-01-01','متن قدیمی')"
+            )
+            conn.execute(
+                "INSERT INTO library_items(item_id,user_id,kind,chat_id,message_id,title,created_at) "
+                "VALUES (11,123,'transcript',123,45,'گفتار','2026-01-02')"
+            )
+            conn.commit()
+            conn.close()
+
+            for replay in (False, True):
+                db = Database(path)
+                try:
+                    await db.connect()
+                    await db.assert_user_reference_integrity()
+                    first = await db.library_item_detail(123, 10)
+                    second = await db.library_item(123, 11)
+                    self.assertEqual(
+                        (first["kind"], first["title"], first["content_text"]),
+                        ("booklet", "جزوه", "متن قدیمی"),
+                    )
+                    self.assertEqual((second["kind"], second["title"]), ("transcript", "گفتار"))
+                    office_id = await db.library_add(123, "office", 123, 46, None, title="آزاد")
+                    self.assertEqual((await db.library_item(123, office_id))["kind"], "office")
+                    if not replay:
+                        # Simulate interruption after the table rebuild committed
+                        # but before its migration marker was recorded.
+                        await db._write(
+                            "DELETE FROM schema_migrations WHERE name='016_office_library_kind.sql'"
+                        )
+                finally:
+                    await db.close()
 
 
 class LearningChargeUpgradeTests(unittest.IsolatedAsyncioTestCase):

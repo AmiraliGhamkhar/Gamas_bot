@@ -1,9 +1,8 @@
-"""Pure Office export modules retained after the bot UI retirement.
+"""Pure Office builder tests; Telegram integration is covered separately.
 
 These tests keep the standalone builders honest: source wording stays intact,
 model-proposed content must be grounded in that source, and every export is a
-real package a reader can open. The Telegram UI and job lane are no longer part
-of the product surface.
+real package a reader can open.
 """
 
 from __future__ import annotations
@@ -21,7 +20,9 @@ from pptx import Presentation
 
 from gamas_bot.office import (
     OfficeError,
+    OfficeSlide,
     build_office_document,
+    classify_text_file,
     build_office_pptx,
     build_office_xlsx,
     fallback_slides,
@@ -48,6 +49,7 @@ SAMPLE = (
     "علی\t۲۰\tتهران\n"
     "سارا\t25\tشیراز\n"
 )
+SIMPLE_DECK_SOURCE = "## بخش اول\nاین متن عیناً در سند می‌آید.\n"
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +186,16 @@ class OfficeDocumentTests(unittest.TestCase):
             with self.assertRaises(OfficeError):
                 read_text_file(path, max_bytes=10)
 
+    def test_text_file_requires_matching_mime_and_rejects_binary_signatures(self):
+        self.assertEqual(classify_text_file("notes.md", "text/plain; charset=utf-8"), ".md")
+        with self.assertRaises(OfficeError):
+            classify_text_file("notes.md", "application/pdf")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "picture.txt"
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"image data")
+            with self.assertRaises(OfficeError):
+                read_text_file(path, max_bytes=10_000)
+
 
 # ---------------------------------------------------------------------------
 # The three documents
@@ -245,6 +257,19 @@ class WordDocumentTests(unittest.TestCase):
 
 
 class ExcelDocumentTests(unittest.TestCase):
+    def test_formula_like_csv_cells_are_kept_as_literal_text(self):
+        document = build_office_document(
+            "نام,مقدار\n=1+1,عادی\n",
+            title="آزمون تزریق فرمول",
+            delimiter=",",
+        )
+        payload = build_office_xlsx(document, list(document.tables))
+        workbook = openpyxl.load_workbook(io.BytesIO(payload), data_only=False)
+        cell = workbook.active["A2"]
+        self.assertEqual(cell.value, "=1+1")
+        self.assertEqual(cell.data_type, "s")
+        self.assertIsNone(cell.hyperlink)
+
     def test_the_sheet_is_right_to_left_with_a_frozen_header(self):
         document = build_office_document(SAMPLE)
         payload = build_office_xlsx(document, list(document.tables))
@@ -300,6 +325,20 @@ class PowerPointDocumentTests(unittest.TestCase):
         presentation = Presentation(io.BytesIO(payload))
         # title + agenda + one slide per section + closing
         self.assertEqual(len(presentation.slides), 5)
+
+    def test_configured_slide_limit_includes_title_agenda_and_closing(self):
+        document = build_office_document("متن اصلی")
+        one_content_slide = [OfficeSlide(title="بخش", bullets=("متن اصلی",))]
+        payload = build_office_pptx(document, one_content_slide, max_slides=4)
+        self.assertEqual(len(Presentation(io.BytesIO(payload)).slides), 4)
+        with self.assertRaises(OfficeError):
+            build_office_pptx(
+                document,
+                one_content_slide + [OfficeSlide(title="بخش دوم", bullets=("بیشتر",))],
+                max_slides=4,
+            )
+        with self.assertRaises(OfficeError):
+            build_office_pptx(document, one_content_slide, max_slides=3)
 
     def test_every_paragraph_is_right_to_left(self):
         document = build_office_document(SAMPLE)
@@ -410,7 +449,7 @@ class ModelValidationTests(unittest.IsolatedAsyncioTestCase):
     def settings(self):
         return make_settings()
 
-    async def test_a_valid_plan_is_accepted(self):
+    async def test_a_complete_grounded_plan_is_accepted(self):
         session = _FakeLLMSession(
             {
                 "sections": [
@@ -419,23 +458,24 @@ class ModelValidationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         slides = await plan_deck(
-            SAMPLE, settings=self.settings(), session=session
+            SIMPLE_DECK_SOURCE, settings=self.settings(), session=session
         )
         assert slides is not None
         self.assertEqual(slides[0].title, "بخش اول")
         self.assertEqual(slides[0].bullets, ("این متن عیناً در سند می‌آید.",))
         self.assertEqual(slides[0].notes, "این متن عیناً در سند می‌آید.")
 
-        document = build_office_document(SAMPLE)
+        document = build_office_document(SIMPLE_DECK_SOURCE)
         presentation = Presentation(
             io.BytesIO(build_office_pptx(document, slides))
         )
-        self.assertIn(
-            "این متن عیناً در سند می‌آید.",
-            presentation.slides[2].notes_slide.notes_text_frame.text,
-        )
+        self.assertTrue(any(
+            "این متن عیناً در سند می‌آید."
+            in slide.notes_slide.notes_text_frame.text
+            for slide in presentation.slides
+        ))
 
-    async def test_a_line_that_is_not_in_the_source_is_dropped(self):
+    async def test_unsupported_model_lines_are_dropped_but_source_is_kept(self):
         session = _FakeLLMSession(
             {
                 "sections": [
@@ -450,10 +490,17 @@ class ModelValidationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         slides = await plan_deck(
-            SAMPLE, settings=self.settings(), session=session
+            SIMPLE_DECK_SOURCE, settings=self.settings(), session=session
         )
         assert slides is not None
         self.assertEqual(slides[0].bullets, ("این متن عیناً در سند می‌آید.",))
+
+    async def test_partial_plan_is_rejected_to_prevent_silent_source_truncation(self):
+        session = _FakeLLMSession(
+            {"sections": [{"title": "بخش اول", "lines": ["این متن عیناً در سند می‌آید."]}]}
+        )
+        slides = await plan_deck(SAMPLE, settings=self.settings(), session=session)
+        self.assertIsNone(slides)
 
     async def test_a_plan_that_invents_everything_is_refused(self):
         session = _FakeLLMSession(
@@ -492,6 +539,14 @@ class ModelValidationTests(unittest.IsolatedAsyncioTestCase):
         table = await infer_table(
             SAMPLE, settings=self.settings(), session=session
         )
+        self.assertIsNone(table)
+
+    async def test_an_invented_column_label_is_refused(self):
+        source = "مقدار ۱۲۵ واحد در متن آمده است."
+        session = _FakeLLMSession(
+            {"headers": ["سطح اطمینان"], "rows": [["مقدار ۱۲۵ واحد"]]}
+        )
+        table = await infer_table(source, settings=self.settings(), session=session)
         self.assertIsNone(table)
 
     async def test_without_a_provider_the_planner_is_skipped(self):
