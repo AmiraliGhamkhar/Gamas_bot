@@ -309,6 +309,35 @@ class GateTests(SubscriptionTestCase):
         self.assertTrue(await self.bot.subscription.require_access(event))
         self.assertEqual(notify.await_count, 1)
 
+    async def test_first_admin_alert_is_delivered_on_a_freshly_booted_host(self):
+        """``0.0`` is a real ``time.monotonic()`` value, not "never".
+
+        Audit F-2: ``_last_admin_alert`` started at ``0.0`` and was compared
+        with the boot-relative monotonic clock, so on a host whose uptime is
+        below ``ADMIN_ALERT_INTERVAL_SECONDS`` the first — and most important —
+        alert about a broken channel configuration was silently swallowed.
+        """
+        await self.use_resolver(SubscriptionApiError(403, "bot is not an administrator"))
+        notify = AsyncMock()
+        self.bot._notify_admins = notify
+        clock = mock.Mock()
+        clock.monotonic.return_value = 5.0  # a host booted five seconds ago
+        with mock.patch("gamas_bot.subscription.time", clock):
+            event = FakeJobEvent(chat_id=USER_ID)
+            self.assertTrue(await self.bot.subscription.require_access(event))
+        self.assertEqual(notify.await_count, 1)
+
+    async def test_admin_alerts_stay_throttled_within_the_interval(self):
+        notify = AsyncMock()
+        self.bot._notify_admins = notify
+        clock = mock.Mock()
+        clock.monotonic.side_effect = [5.0, 6.0, 400.0]
+        with mock.patch("gamas_bot.subscription.time", clock):
+            await self.bot.subscription._alert_admins("first")
+            await self.bot.subscription._alert_admins("second")
+            await self.bot.subscription._alert_admins("third")
+        self.assertEqual(notify.await_count, 2)
+
     async def test_disabled_gate_allows(self):
         await self.use_resolver("left")
         self.bot.subscription.settings = replace(
@@ -326,6 +355,89 @@ class GateTests(SubscriptionTestCase):
         event = FakeJobEvent(chat_id=USER_ID)
         self.assertTrue(await self.bot.subscription.require_access(event))
         self.assertFalse(any(JOIN_PROMPT_MARKER in text for text in event.replies))
+
+
+class InflightSharingTests(SubscriptionTestCase):
+    """Cancellation safety of the one-request-per-user sharing.
+
+    Audit F-1: ``check_membership`` shared a bare ``asyncio.Future`` between the
+    owner of the request and every concurrent waiter. Two defects followed:
+    a cancelled owner never resolved the future, so a waiter awaited it forever,
+    and a cancelled waiter cancelled the future its task was awaiting, which
+    killed the verification for the owner and for unrelated co-waiters.
+    """
+
+    def _blocking_resolver(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def resolver(_user_id):
+            started.set()
+            await release.wait()
+            return "member"
+
+        self.bot.subscription._resolver = resolver
+        return started, release
+
+    async def test_cancelled_owner_releases_waiters_without_hanging(self):
+        started, release = self._blocking_resolver()
+        owner = asyncio.create_task(self.bot.subscription.check_membership(USER_ID))
+        await started.wait()
+        waiter = asyncio.create_task(self.bot.subscription.check_membership(USER_ID))
+        await asyncio.sleep(0.05)
+        self.assertIn(USER_ID, self.bot.subscription._inflight)
+
+        owner.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await owner
+        # The waiter must finish instead of waiting on a future nobody resolves.
+        result = await asyncio.wait_for(waiter, 2.0)
+        self.assertEqual(result.state, STATE_UNKNOWN)
+        self.assertEqual(result.detail, "cancelled")
+        self.assertFalse(result.is_denied, "a cancelled check is never a denial")
+        release.set()
+
+    async def test_cancelled_waiter_does_not_cancel_the_shared_check(self):
+        started, release = self._blocking_resolver()
+        owner = asyncio.create_task(self.bot.subscription.check_membership(USER_ID))
+        await started.wait()
+        first = asyncio.create_task(self.bot.subscription.check_membership(USER_ID))
+        await asyncio.sleep(0.02)
+        second = asyncio.create_task(self.bot.subscription.check_membership(USER_ID))
+        await asyncio.sleep(0.02)
+
+        first.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        shared = self.bot.subscription._inflight.get(USER_ID)
+        self.assertIsNotNone(shared)
+        self.assertFalse(shared.cancelled(), "a waiter cancelled the shared request")
+
+        release.set()
+        owner_result = await asyncio.wait_for(owner, 2.0)
+        second_result = await asyncio.wait_for(second, 2.0)
+        self.assertEqual(owner_result.state, STATE_MEMBER)
+        self.assertEqual(second_result.state, STATE_MEMBER)
+
+    async def test_waiter_gets_the_same_result_as_the_owner(self):
+        started, release = self._blocking_resolver()
+        calls: list[int] = []
+
+        async def counting_resolver(user_id):
+            calls.append(user_id)
+            started.set()
+            await release.wait()
+            return "member"
+
+        self.bot.subscription._resolver = counting_resolver
+        owner = asyncio.create_task(self.bot.subscription.check_membership(USER_ID))
+        await started.wait()
+        waiter = asyncio.create_task(self.bot.subscription.check_membership(USER_ID))
+        await asyncio.sleep(0.02)
+        release.set()
+        self.assertEqual((await asyncio.wait_for(owner, 2.0)).state, STATE_MEMBER)
+        self.assertEqual((await asyncio.wait_for(waiter, 2.0)).state, STATE_MEMBER)
+        self.assertEqual(calls, [USER_ID], "concurrent checks must share one request")
 
 
 class CallbackHandlerTests(SubscriptionTestCase):

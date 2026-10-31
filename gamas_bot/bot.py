@@ -2181,8 +2181,11 @@ class GamasBot:
         if user_id not in self._office_last_use and len(self._office_last_use) >= MAX_OFFICE_SESSIONS:
             oldest = min(self._office_last_use, key=lambda owner: self._office_last_use[owner])
             self._office_last_use.pop(oldest, None)
-        last = self._office_last_use.get(user_id, 0.0)
-        if interval and now - last < interval:
+        # ``None`` means "no previous export", because ``0.0`` is a *valid*
+        # ``time.monotonic()`` reading on a freshly booted host and would
+        # throttle a brand-new user's first export.
+        last = self._office_last_use.get(user_id)
+        if interval and last is not None and now - last < interval:
             remaining = max(1, int(interval - (now - last) + 0.999))
             await self._ack(
                 event,

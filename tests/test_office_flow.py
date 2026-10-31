@@ -5,10 +5,12 @@ from __future__ import annotations
 import hashlib
 import io
 import tempfile
+import time as real_time
 import unittest
 import unicodedata
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 import openpyxl
 from pptx import Presentation
@@ -219,6 +221,60 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(await self.billing_snapshot(), before)
         self.assertEqual(list(self.settings.temp_dir.iterdir()), [])
+
+    async def test_first_export_is_not_throttled_when_the_host_just_booted(self):
+        """Audit F-3: ``0.0`` is a real ``time.monotonic()`` value, not "never".
+
+        The per-user throttle read ``self._office_last_use.get(user_id, 0.0)``,
+        so a host whose uptime was below ``OFFICE_MIN_INTERVAL_SECONDS`` refused
+        the very first export of every user and told them to wait. The fake
+        clock is injected into ``gamas_bot.bot`` only, so the event loop keeps
+        its own real clock.
+        """
+
+        class FreshBootClock:
+            value = 5.0
+
+            def monotonic(self):
+                return self.value
+
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+        self.settings = replace(self.settings, office_min_interval_seconds=10.0)
+        self.bot.settings = self.settings
+        self.bot._office_last_use.clear()
+        fresh_clock = FreshBootClock()
+
+        await self.enter_office()
+        self.bot._office_add_source(
+            self.bot._office_sessions[self.user_id], "متن آزمایشی برای شمارش زمان"
+        )
+        with mock.patch("gamas_bot.bot.time", fresh_clock):
+            first = self.callback("office:fmt:word")
+            await self.bot._handle_callback(first)
+        texts = [edit["text"] for edit in first.edits]
+        throttle_seen = [
+            text
+            for text, _alert in first.answers
+            if "ثانیه دیگر دوباره تلاش کنید" in (text or "")
+        ]
+        self.assertEqual(
+            throttle_seen, [], "a fresh boot must not throttle the first export"
+        )
+        self.assertTrue(any("فایل ساخته شد" in text for text in texts))
+
+        # The throttle itself is unchanged: an immediate second export waits.
+        with mock.patch("gamas_bot.bot.time", fresh_clock):
+            second = self.callback("office:fmt:word")
+            await self.bot._handle_callback(second)
+        self.assertTrue(
+            any(
+                "ثانیه دیگر دوباره تلاش کنید" in (text or "")
+                for text, _alert in second.answers
+            ),
+            "the per-user throttle must still apply after the first export",
+        )
 
     async def test_uploaded_document_gets_full_and_compact_word_pdf_with_source_locations(self):
         source = (

@@ -43,6 +43,11 @@ Key properties:
 - **`SUBSCRIPTION_CACHE_SECONDS=0` (default) re-checks on every interaction.**
   A positive value caches only *confirmed members* for that many seconds;
   failures are never cached.
+- **Simultaneous interactions of one user share a single `getChatMember`
+  call**, and that sharing is cancellation-safe: a cancelled interaction cannot
+  cancel the check for a sibling interaction, and if the call that owns the
+  shared request is itself cancelled its waiters are released as *unknown*
+  (allowed, never a denial) instead of waiting forever.
 
 ## Configuration
 

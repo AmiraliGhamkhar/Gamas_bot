@@ -20,6 +20,7 @@ from pptx import Presentation
 
 from gamas_bot.office import (
     OfficeError,
+    OfficeSession,
     OfficeSlide,
     build_office_document,
     classify_text_file,
@@ -254,6 +255,19 @@ class WordDocumentTests(unittest.TestCase):
         xml = zipfile.ZipFile(io.BytesIO(payload)).read("word/document.xml").decode("utf-8")
         self.assertIn("w:bidi", xml)
         self.assertIn("<w:rtl", xml)
+
+
+class OfficeSessionTests(unittest.TestCase):
+    def test_a_new_draft_carries_a_live_timestamp(self):
+        """Audit F-3: ``updated_at`` defaulted to ``0.0``, i.e. "expired".
+
+        ``_office_sweep_sessions`` compares it with ``time.monotonic()``, whose
+        epoch is the system uptime, so a draft built without an explicit stamp
+        vanished on the next sweep of any host that had been up for longer than
+        ``OFFICE_SESSION_TTL_MINUTES``.
+        """
+        session = OfficeSession()
+        self.assertGreater(session.updated_at, 0.0)
 
 
 class ExcelDocumentTests(unittest.TestCase):
