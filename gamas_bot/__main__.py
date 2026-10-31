@@ -83,7 +83,7 @@ def from_env_safe() -> Settings | None:
         return None
 
 
-async def main(settings: Settings) -> None:
+async def _run_bot(settings: Settings) -> None:
     if hasattr(os, "umask"):
         os.umask(0o077)
     loop = asyncio.get_running_loop()
@@ -138,7 +138,7 @@ def run() -> None:
             raise SystemExit(2)
         # Held for the life of the process; the OS releases it on any exit.
         with InstanceLock(lock_path(settings)):
-            asyncio.run(main(settings))
+            asyncio.run(_run_bot(settings))
     except AlreadyRunningError as exc:
         # Cron watchdogs start the bot every few minutes; a live instance is
         # the normal case, not a failure.
@@ -153,5 +153,10 @@ def run() -> None:
         raise SystemExit(2) from exc
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Synchronous console-script entry point (``gamas-bot``)."""
     run()
+
+
+if __name__ == "__main__":
+    main()
