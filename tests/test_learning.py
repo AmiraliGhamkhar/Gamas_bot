@@ -20,7 +20,7 @@ from unittest import mock
 from gamas_bot.db import MIGRATIONS_DIR
 
 from gamas_bot.bot import (
-    GamasBot, LEARNING_GENERATION_FAILED, LEARNING_NO_CREDIT, QUIZ_START_GUIDANCE,
+    GamasBot, LEARNING_NO_CREDIT, QUIZ_START_GUIDANCE,
 )
 from gamas_bot.db import Database
 from gamas_bot.learning import (
@@ -560,9 +560,54 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         """Claim the gift up-front, so a test can exercise the paid path."""
         self.assertTrue(await self.db.consume_free_use(OWNER, kind))
 
+    def _assert_failure_frame(self, text: str) -> None:
+        """A failed generation ends on the bar: fail headline, 🛑 and the hint."""
+        self.assertIn("ساخت محتوا ناموفق بود", text)
+        self.assertIn("🛑", text)
+        self.assertIn("کمی بعد دوباره امتحان کنید", text)
+
     async def save_curation(self, kind: str = "deck") -> None:
         prefix = "fc" if kind == "deck" else "quiz"
         await self.bot._handle_callback(self._event(f"{prefix}:cur:save".encode()))
+
+    async def test_booklet_cards_with_a_retyped_locator_are_not_discarded(self):
+        """The production failure: «بخش 1» was not byte-identical to «بخش ۱».
+
+        A booklet is chunked as «بخش ۱», so a model that re-types the locator
+        with Latin digits (or brackets) had *every* card rejected; the retry
+        failed the same way and the user got «ساخت محتوا ناموفق بود» after a
+        full generation. The comparison now folds digit shape and punctuation.
+        """
+        payload = {
+            "cards": [
+                {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "بخش 1"}
+                for index in range(10)
+            ]
+        }
+        with mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)
+        ) as generator:
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}:quick".encode()))
+        self.assertEqual(generator.await_count, 1)
+        state = self.bot._curation[OWNER]
+        self.assertEqual(len(state["items"]), 10)
+        self.assertEqual(state["failures"], 0)
+
+    async def test_booklet_cards_with_a_fabricated_locator_are_still_refused(self):
+        payload = {
+            "cards": [
+                {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "صفحهٔ ۹۹"}
+                for index in range(10)
+            ]
+        }
+        with mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)
+        ) as generator:
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}:quick".encode()))
+        self.assertEqual(generator.await_count, 2)  # one repair attempt, then give up
+        self.assertNotIn(OWNER, self.bot._curation)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
 
     async def test_ai_generation_debits_and_builds_deck(self):
         # The paid path: the free first try is already spent, so this deck is
@@ -616,7 +661,7 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(event)
         self.assertEqual(await self.db.available_seconds(OWNER), 3600)
         self.assertEqual(await self.db.deck_count(OWNER), 0)
-        self.assertIn(LEARNING_GENERATION_FAILED, self.client.texts[-1]["text"])
+        self._assert_failure_frame(self.client.texts[-1]["text"])
 
     async def test_insufficient_balance_denies_without_generation(self):
         await self.spend_free_try("deck")
@@ -785,6 +830,12 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         """Claim the gift up-front, so a test can exercise the paid path."""
         self.assertTrue(await self.db.consume_free_use(OWNER, kind))
 
+    def _assert_failure_frame(self, text: str) -> None:
+        """A failed generation ends on the bar: fail headline, 🛑 and the hint."""
+        self.assertIn("ساخت محتوا ناموفق بود", text)
+        self.assertIn("🛑", text)
+        self.assertIn("کمی بعد دوباره امتحان کنید", text)
+
     async def save_curation(self, kind: str = "quiz") -> None:
         prefix = "fc" if kind == "deck" else "quiz"
         await self.bot._handle_callback(self._event(f"{prefix}:cur:save".encode()))
@@ -808,6 +859,23 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
                 f"quiz:go:{self.item_id}:{count}".encode(),
                 self._payloads(record["buttons"]),
             )
+
+    async def test_booklet_quiz_with_persian_difficulty_reaches_the_preview(self):
+        """«سخت»/«متوسط» are recorded as hard/medium instead of voiding the quiz."""
+        payload = quiz_payload(5, source="بخش 1")
+        for index, question in enumerate(payload["questions"]):
+            question["difficulty"] = "سخت" if index % 2 else "متوسط"
+        with mock.patch(
+            "gamas_bot.learning.random.shuffle"
+        ), mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)
+        ) as generator:
+            await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
+        self.assertEqual(generator.await_count, 1)
+        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 5)
+        await self.save_curation("quiz")
+        rows = await self.db.db.execute_fetchall("SELECT difficulty FROM quiz_questions")
+        self.assertEqual({row[0] for row in rows}, {"hard", "medium"})
 
     async def test_generation_debits_then_full_quiz_completes_with_rank(self):
         await self.spend_free_try("quiz")
@@ -871,7 +939,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             event = self._event(f"quiz:go:{self.item_id}:5".encode())
             await self.bot._handle_callback(event)
         self.assertEqual(await self.db.available_seconds(OWNER), 3600)
-        self.assertIn(LEARNING_GENERATION_FAILED, self.client.texts[-1]["text"])
+        self._assert_failure_frame(self.client.texts[-1]["text"])
         sessions = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM quiz_sessions")
         self.assertEqual(sessions[0][0], 0)
         refund = await self.db.db.execute_fetchall(
@@ -910,7 +978,7 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             event = self._event(f"quiz:go:{self.item_id}:5".encode())
             await self.bot._handle_callback(event)
         self.assertEqual(await self.db.available_seconds(OWNER), 3600)
-        self.assertIn(LEARNING_GENERATION_FAILED, self.client.texts[-1]["text"])
+        self._assert_failure_frame(self.client.texts[-1]["text"])
 
     async def test_insufficient_balance_denies_without_debit(self):
         await self.spend_free_try("quiz")
@@ -1632,3 +1700,83 @@ class AnchoredQualityTests(unittest.TestCase):
         ):
             example = json.loads(prompt[prompt.rindex('{"' + key + '"'):])
             self.assertEqual(example[key][0]["source"], "اسلاید ۲" if key == "cards" else "بخش «مبحث»")
+
+    def test_difficulty_is_recorded_but_never_causes_rejection(self):
+        """S5: the tag is metadata. A Persian label is mapped, an unknown one ignored."""
+        from gamas_bot.learning import parse_difficulty
+
+        self.assertEqual(parse_difficulty("hard"), "hard")
+        self.assertEqual(parse_difficulty("سخت"), "hard")
+        self.assertEqual(parse_difficulty("متوسط"), "medium")
+        self.assertIsNone(parse_difficulty("آسان"))
+        self.assertIsNone(parse_difficulty(None))
+
+        payload = quiz_payload(1)
+        payload["questions"][0]["difficulty"] = "سخت"
+        parsed = parse_quiz_payload(payload, 1, require_source=True)
+        self.assertEqual(parsed[0]["difficulty"], "hard")
+
+        payload["questions"][0]["difficulty"] = "نامشخص"
+        parsed = parse_quiz_payload(payload, 1, require_source=True)
+        self.assertEqual(len(parsed), 1)
+        self.assertNotIn("difficulty", parsed[0])
+
+        payload["questions"][0].pop("difficulty")
+        self.assertEqual(len(parse_quiz_payload(payload, 1, require_source=True)), 1)
+
+    def test_a_retyped_locator_still_names_its_own_section(self):
+        """Digit shape, brackets and spacing are cosmetic — not a new place."""
+        from gamas_bot.learning import source_key, source_matches
+
+        allowed = ("بخش ۱ (۱/۳)", "صفحهٔ ۴")
+        for retyped in (
+            "بخش ۱ (۱/۳)",
+            "بخش 1 (1/3)",
+            "[بخش ۱]",
+            "بخش ۱ ۱ ۳",
+            "«صفحهٔ ۴»",
+            "صفحه 4",
+            "صفحهٔ ۴",
+        ):
+            self.assertTrue(source_matches(retyped, allowed), retyped)
+        self.assertEqual(source_key("صفحهٔ ۴"), "صفحه 4")
+        self.assertEqual(source_key("صفحهٔ ۴"), source_key("صفحه 4"))
+
+    def test_an_invented_or_vague_locator_is_still_rejected(self):
+        from gamas_bot.learning import source_matches
+
+        allowed = ("بخش ۱", "بخش ۲")
+        self.assertFalse(source_matches("بخش ۹", allowed))
+        self.assertFalse(source_matches("بخش", allowed))
+        self.assertFalse(source_matches("", allowed))
+        self.assertFalse(source_matches(None, allowed))
+        # «بخش ۱» must never swallow «بخش ۱۰» (token-aligned prefix only).
+        self.assertFalse(source_matches("بخش 10", allowed))
+        self.assertFalse(source_matches("بخش ۱۰", ("بخش ۱",)))
+        # A specific part of an allowed section is that section, not a new one.
+        self.assertTrue(source_matches("بخش ۱ (۲/۳)", allowed))
+        # A chunk with no locator at all has nothing to verify against, so it
+        # must not reject every item.
+        self.assertTrue(source_matches("هرچیز", ()))
+
+    def test_a_numeric_source_is_read_instead_of_dropped(self):
+        card = {"cards": [{"front": "پرسش", "back": "پاسخ", "source": 3}]}
+        self.assertEqual(
+            parse_flashcard_payload(card, 1, require_source=True)[0]["source"], "3"
+        )
+        quiz = quiz_payload(1)
+        quiz["questions"][0]["source"] = 3
+        self.assertEqual(
+            parse_quiz_payload(quiz, 1, require_source=True)[0]["source"], "3"
+        )
+
+    def test_an_inner_page_marker_of_the_chunk_is_verifiable(self):
+        """A booklet carries its own «[صفحهٔ ۲]» markers; citing one is grounded."""
+        from gamas_bot.learning import source_grounded_in
+
+        chunk = "[بخش ۱ (۱/۲)]\n[صفحهٔ ۲]\nمتن فیزیولوژی قلب"
+        self.assertTrue(source_grounded_in("صفحهٔ ۲", chunk))
+        self.assertTrue(source_grounded_in("صفحه 2", chunk))  # Latin digits
+        self.assertFalse(source_grounded_in("صفحهٔ ۹۹", chunk))
+        # A bare number in prose can never anchor an item.
+        self.assertFalse(source_grounded_in("۲", chunk))

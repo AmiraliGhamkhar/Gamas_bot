@@ -11,9 +11,12 @@ configured note routes and never enables paid transcription.
 1. Open **🗂 آفیس رایگان** before sending text. Paste one or more messages, or upload `.txt`, `.md`,
    `.markdown`, `.csv` or `.tsv` files. Each accepted part is appended to that user's in-memory draft
    in arrival order.
-2. Choose Word, Excel, PowerPoint or PDF. The bot delivers a real `.docx`, `.xlsx`, `.pptx` or
-   selectable-text `.pdf` and indexes the Telegram file message in the existing personal library.
-   Any format can be generated separately from the same draft.
+2. Choose Word, Excel, PowerPoint or PDF. The tapped message becomes a progress bar before the work
+   starts and advances through build and delivery («ساخت فایل Word» → «ارسال فایل خروجی»), ending on a
+   full bar with the outcome or a 🛑 frame where a refused build stopped. The bot delivers a real
+   `.docx`, `.xlsx`, `.pptx` or selectable-text `.pdf` and indexes the Telegram file message in the
+   existing personal library under a 2–4-word name («گزارش فروش — Word»). Any format can be generated
+   separately from the same draft.
 3. Use **➕ افزودن پیام** to continue, **📦 انتخاب خروجی** to build another format, or
    **❌ پایان و پاک‌کردن متن** to discard the draft. `/cancel`, leaving the Office screen, expiry and
    process shutdown also clear the in-memory draft.

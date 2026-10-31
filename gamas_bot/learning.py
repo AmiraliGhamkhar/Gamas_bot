@@ -15,6 +15,7 @@ import json
 import random
 import re
 import unicodedata
+from collections.abc import Iterable
 from difflib import SequenceMatcher
 from typing import Any
 
@@ -286,6 +287,121 @@ def _clean_str(value: Any, limit: int) -> str:
     return " ".join(value.split())[:limit].strip()
 
 
+def _clean_source(value: Any) -> str:
+    """Read a locator the model may have emitted as a string *or* a number.
+
+    Providers that ignore the JSON schema sometimes answer ``"source": 3`` for
+    «صفحهٔ ۳». Treating that as "no source" silently discarded a perfectly
+    anchored item and could empty a whole generation.
+    """
+    if isinstance(value, bool) or value is None:
+        return ""
+    if isinstance(value, (int, float)):
+        return _clean_str(str(value), MAX_SOURCE_CHARS)
+    return _clean_str(value, MAX_SOURCE_CHARS)
+
+
+#: Persian/English spellings of the two allowed difficulty tags. The schema asks
+#: for ``medium``/``hard``, but a route without structured-output enforcement
+#: answers in the language of the prompt; an unrecognized label used to reject
+#: the whole question (S5: the tag is metadata and never causes rejection).
+_DIFFICULTY_ALIASES: dict[str, str] = {
+    "medium": "medium",
+    "med": "medium",
+    "moderate": "medium",
+    "متوسط": "medium",
+    "میانه": "medium",
+    "hard": "hard",
+    "harder": "hard",
+    "difficult": "hard",
+    "سخت": "hard",
+    "دشوار": "hard",
+    "سختتر": "hard",
+    "پیشرفته": "hard",
+}
+
+
+def parse_difficulty(value: Any) -> str | None:
+    """Map a model's difficulty label to ``medium``/``hard`` (or ``None``).
+
+    ``normalize_front`` drops ZWNJ and punctuation and case-folds, so «سخت‌تر»,
+    «HARD.» and «hard» all reach the same alias entry.
+    """
+    return _DIFFICULTY_ALIASES.get(normalize_front(value)) or None
+
+
+#: Locator punctuation is cosmetic: «[بخش ۱]»، «بخش (۱/۳)» and «بخش 1 3» name
+#: the same place. Comparison folds it, rendering never does.
+_SOURCE_PUNCTUATION = re.compile(r"[^\w\s]+", re.UNICODE)
+_DIGIT_FOLDING = str.maketrans(
+    "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789"
+)
+
+
+def source_key(value: Any) -> str:
+    """A comparison key for a page/slide/section locator.
+
+    Digit shape, Persian/Arabic letter variants, brackets, quotes, slashes and
+    spacing are all folded away, because a model re-types the locator it read
+    («بخش ۱ (۱/۳)» can come back as «بخش 1 (1/3)» or «[بخش ۱]»). This is the
+    comparison-only normalization P1 allows; the rendered locator keeps its
+    original spelling.
+    """
+    text = unicodedata.normalize("NFKC", str(value or "")).translate(_DIGIT_FOLDING)
+    text = text.replace("ي", "ی").replace("ك", "ک").replace("ى", "ی").replace("ة", "ه")
+    text = text.replace("\u200c", " ")
+    text = _SOURCE_PUNCTUATION.sub(" ", text)
+    return " ".join(text.split()).casefold()
+
+
+def source_matches(source: Any, allowed: Iterable[str]) -> bool:
+    """True when ``source`` names one of the chunk's own locators.
+
+    A locator is never invented or repaired here: an item that names a section
+    the model did not read stays invalid (the caller retries, then refunds).
+    What *is* accepted is the same locator written differently, and a more
+    specific variant of an allowed one («بخش ۱» vs «بخش ۱ (۲/۳)»), because a
+    model that adds the part number of a split section is still citing that
+    section. Prefix matching is token-aligned, so «بخش ۱» can never swallow
+    «بخش ۱۰».
+    """
+    key = source_key(source)
+    if not key:
+        return False
+    keys = {source_key(item) for item in allowed}
+    keys.discard("")
+    if not keys:
+        # A chunk with no locator at all (legacy content) has nothing to verify
+        # against; requiring a match here rejected *every* item and failed the
+        # whole generation.
+        return True
+    for candidate in keys:
+        if candidate == key:
+            return True
+        shorter, longer = (
+            (candidate, key) if len(candidate) <= len(key) else (key, candidate)
+        )
+        if longer.startswith(shorter + " ") and len(shorter.split()) >= 2:
+            return True
+    return False
+
+
+def source_grounded_in(source: Any, text: str) -> bool:
+    """True when the cited locator literally occurs in the chunk that was read.
+
+    A booklet keeps its own page/slide markers inside the archived text
+    («[صفحهٔ ۲]»), so a model may cite that inner marker instead of the chunk
+    label it was offered. Accepting it is not an invention: the string can be
+    verified inside the very text the item was generated from. Matching is
+    token-aligned and needs at least two tokens, so a bare «۱» in prose can
+    never anchor an item.
+    """
+    key = source_key(source)
+    if not key or len(key.split()) < 2:
+        return False
+    return f" {key} " in f" {source_key(text)} "
+
+
 def parse_quiz_payload(
     payload: dict[str, Any],
     count: int,
@@ -340,12 +456,14 @@ def parse_quiz_payload(
             "correct_index": order.index(correct),
             "explanation": explain,
         }
-        difficulty = entry.get("difficulty")
-        if difficulty in ("medium", "hard"):
+        difficulty = parse_difficulty(entry.get("difficulty"))
+        if difficulty is not None:
             record["difficulty"] = difficulty
         elif require_difficulty:
+            # Legacy strictness only: generation records the tag when present
+            # and never rejects a question over it (S5).
             continue
-        source = _clean_str(entry.get("source"), MAX_SOURCE_CHARS)
+        source = _clean_source(entry.get("source"))
         if source:
             record["source"] = source
         elif require_source:
@@ -427,7 +545,7 @@ def parse_flashcard_payload(
         if _is_yes_no(front):
             continue
         card = {"front": front, "back": back}
-        source = _clean_str(entry.get("source"), MAX_SOURCE_CHARS)
+        source = _clean_source(entry.get("source"))
         if source:
             card["source"] = source
         elif require_source:

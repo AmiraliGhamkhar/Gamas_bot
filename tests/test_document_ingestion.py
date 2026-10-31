@@ -410,22 +410,46 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.deck_count(OWNER), 0)
         self.assertNotIn(OWNER, self.bot._curation)
 
-    async def test_invalid_quiz_difficulty_is_repaired_before_preview(self):
+    async def test_missing_quiz_difficulty_never_rejects_a_valid_question(self):
+        """S5: the difficulty tag is metadata, not an admission requirement.
+
+        It used to be enforced at the generation boundary, so a route that
+        answers «سخت»/«متوسط» in Persian (or omits the tag entirely) produced
+        zero valid questions and the user paid for a failed generation.
+        """
         await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
         doc_id = (await self.db.documents_list(OWNER))[0]["id"]
-        good = quiz_payload(5, source="صفحهٔ ۱")
-        bad = quiz_payload(5, source="صفحهٔ ۱")
-        for question in bad["questions"]:
+        payload = quiz_payload(5, source="صفحهٔ ۱")
+        for question in payload["questions"]:
             question.pop("difficulty")
-        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=[bad, good])) as generator:
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)) as generator:
             await self.bot._handle_callback(self.press(f"doc:gen:quiz:{doc_id}:5".encode()))
-        self.assertEqual(generator.await_count, 2)
-        self.assertIn("خروجی قبلی نامعتبر", generator.await_args.kwargs["system"])
+        self.assertEqual(generator.await_count, 1)
         self.assertIn(OWNER, self.bot._curation)
         await self.bot._handle_callback(self.press(b"quiz:cur:save"))
         rows = await self.db.db.execute_fetchall("SELECT difficulty,source FROM quiz_questions")
         self.assertEqual(len(rows), 5)
-        self.assertTrue(all(row[0] == "medium" and row[1] == "صفحهٔ ۱" for row in rows))
+        self.assertTrue(all(row[0] == "" and row[1] == "صفحهٔ ۱" for row in rows))
+
+    async def test_persian_difficulty_and_retyped_locator_still_produce_a_preview(self):
+        """A re-typed locator («صفحه 1» vs «صفحهٔ ۱») cites the same page.
+
+        Byte-identical matching used to discard every item the model returned,
+        which ended as «ساخت محتوا ناموفق بود» for a perfectly grounded answer.
+        """
+        await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
+        doc_id = (await self.db.documents_list(OWNER))[0]["id"]
+        payload = quiz_payload(5, source="صفحه 1")
+        for index, question in enumerate(payload["questions"]):
+            question["difficulty"] = "سخت" if index % 2 else "متوسط"
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)) as generator:
+            await self.bot._handle_callback(self.press(f"doc:gen:quiz:{doc_id}:5".encode()))
+        self.assertEqual(generator.await_count, 1)
+        state = self.bot._curation[OWNER]
+        self.assertEqual(len(state["items"]), 5)
+        self.assertEqual(state["failures"], 0)
+        self.assertTrue(all(item["difficulty"] in {"medium", "hard"} for item in state["items"]))
+        self.assertTrue(all(item["source"] == "صفحه 1" for item in state["items"]))
 
     async def test_parallel_chunk_calls_are_bounded_and_report_progress(self):
         from gamas_bot.doc_extract import DocChunk

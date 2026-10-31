@@ -187,6 +187,37 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["kind"] == "office" for item in items))
         self.assertEqual(list(self.settings.temp_dir.iterdir()), [])
 
+    async def test_office_build_shows_a_bar_and_saves_a_short_library_title(self):
+        """The build is a bar from the first frame, and the row is a short name."""
+        from gamas_bot.titles import word_count
+
+        await self.enter_office()
+        source = (
+            "گزارش فروش ماهانه فروردین\n"
+            "این متن برای بررسی نوار پیشرفت و عنوان کتابخانه است."
+        )
+        await self.bot._handle_message(
+            PlainMessageEvent(self.capture.client, self.user_id, source)
+        )
+        callback = self.callback("office:fmt:word")
+        await self.bot._handle_callback(callback)
+
+        frames = [edit["text"] for edit in callback.edits]
+        self.assertTrue(frames)
+        # A bar exists before the file is built (the 4 % frame) and the final
+        # screen still carries the outcome on a full bar.
+        self.assertIn("٪", frames[0])
+        self.assertTrue(any("٪" in frame for frame in frames))
+        self.assertIn("فایل ساخته شد", frames[-1])
+        self.assertIn("۱۰۰٪", frames[-1])
+
+        items = await self.db.library_list(self.user_id, limit=5)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["kind"], "office")
+        self.assertGreaterEqual(word_count(items[0]["title"]), 2)
+        self.assertLessEqual(word_count(items[0]["title"]), 4)
+        self.assertIn("Word", items[0]["title"])
+
     async def test_uploaded_csv_is_parsed_and_formula_like_cells_are_literal(self):
         source_file = self.root / "report.csv"
         source_file.write_text(
