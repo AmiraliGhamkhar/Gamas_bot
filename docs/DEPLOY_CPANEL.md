@@ -197,7 +197,8 @@ Smoke test after the first start (use an admin account and a small test order):
 3. Upload a text PDF, DOCX and PPTX. Confirm the original remains downloadable, page/section/slide
    locators survive into note outputs, full and compact notes differ, both are available as Word and
    PDF, and return-to-library works. A PPTX must not start audio/STT until the explicit audio button
-   is pressed. A scanned PDF must be refused with no OCR claim. Repeat Office/document-note actions
+   is pressed. With `OCR_ENABLED=false` a scanned PDF must be refused with no OCR claim; with it
+   enabled, run the smoke test in [OCR](OCR.md) first. Repeat Office/document-note actions
    with no note provider configured; deterministic fallback should still produce safe files.
 4. Open a library item and verify the bot forwards the saved Telegram message. A definitively deleted
    source should show «این فایل دیگر در دسترس نیست.»; temporary Telegram errors remain retryable.

@@ -69,9 +69,10 @@ of truth — flag the mismatch in your report instead of silently picking a side
 
 Rules: dependencies are declared with **bounded ranges** in `pyproject.toml [project].dependencies`
 (single source of truth); `requirements.txt` is **generated** by `python -m scripts.sync_requirements`
-— never edit it by hand. Never introduce: system binaries, OCR engines, formula-calculation
+— never edit it by hand. Never introduce: system binaries, local OCR engines, formula-calculation
 engines, brokers/queues/external DBs, web frameworks, new payment gateways, or heavyweight
-packages. Any genuinely unavoidable new dependency needs a bounded range, a docstring justification,
+packages. (The opt-in `.[ocr]` extra — `curl-cffi` — is an HTTP client for the third-party service,
+not a recognition engine; it stays optional and `OCR_ENABLED=false` by default.) Any genuinely unavoidable new dependency needs a bounded range, a docstring justification,
 and an entry in `docs/CHANGELOG.md`.
 
 ---
@@ -265,10 +266,13 @@ answers, flashcard decks/cards), document caches, `library_items`, credit alloca
   established terminology exact: جزوه (booklet), آفیس رایگان (Free Office), فلش‌کارت (flashcard),
   جمع‌بندی (final recap), کدام گزینه…؟ (quiz stem), مکان‌یاب (source locator). Callout kinds are
   exactly «نکته», «هشدار», «یادآوری»; tip kinds «کاربردی», «آزمونی», «هشدار».
-- **P8 — No OCR, ever.** Scanned/image-only PDFs (< ~10 chars/page) are **refused** with a Persian
-  explanation — never stored as empty. Encrypted, malformed and over-limit files are refused too.
-  `.doc`/`.ppt` are best-effort by extension (`ppt2pptx` in-process); users are told to resend
-  `.doc` as `.docx`.
+- **P8 — OCR is opt-in and third-party.** Scanned/image-only PDFs (< ~10 chars/page) and photos are
+  **refused** with a Persian explanation — never stored as empty — unless the deployment sets
+  `OCR_ENABLED=true`, in which case only the text-poor pages are recognised through
+  `gamas_bot/ocr.py` (i2ocr.com) and stored as ordinary page sections (`docs/OCR.md`). There is no
+  local OCR engine and no system binary either way, and a document that already has a text layer is
+  never uploaded. Encrypted, malformed and over-limit files are refused too. `.doc`/`.ppt` are
+  best-effort by extension (`ppt2pptx` in-process); users are told to resend `.doc` as `.docx`.
 - **P9 — Dates.** Store UTC; display Jalali via `gregorian_to_jalali`; admin reporting windows are
   UTC («امروز» = current UTC day, rolling 7/30-day windows).
 
@@ -421,8 +425,8 @@ only on infrastructure errors (admins alerted, throttled to 1 per 5 min) and is 
 ## 14) Never do
 
 Never bill without delivery · never guess a duration to charge · never truncate content silently ·
-never store or reverse BiDi visual order · never strip ZWNJ · never OCR · never add a system-binary
-or service dependency · never hold a stage slot across stages · never block the event loop on file
+never store or reverse BiDi visual order · never strip ZWNJ · never run a local OCR engine, and
+never send a page anywhere without `OCR_ENABLED` · never add a system-binary or service dependency · never hold a stage slot across stages · never block the event loop on file
 I/O · never write secrets/keys to SQLite · never log transcripts/receipts/document text · never
 trust a callback without an owner check · never reformat unrelated code · never hand-edit
 `requirements.txt` · never send `.env`/keys/transcripts in support output · never weaken an

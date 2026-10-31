@@ -29,7 +29,11 @@
 
 Audio is sent to the configured STT provider. Lecture transcripts, document notes and optional
 Office AI planning are sent only to the existing configured note-provider routes. Office never starts
-STT/transcription. Review each provider's retention and privacy terms before enabling it. The raw
+STT/transcription. Review each provider's retention and privacy terms before enabling it.
+With `OCR_ENABLED=true` (off by default) the rendered page images of a text-poor document, or an
+uploaded photo, are uploaded to i2ocr.com; its published policy deletes them within 30 minutes.
+Pages that already have a text layer, and every `.docx`/`.pptx`, never leave the host. See
+[OCR](OCR.md). The raw
 transcript is delivered before lecture note generation; once delivered, its transcription charge
 stands even if the booklet later fails. Free Office/document-note operations themselves have no user
 wallet or free-use charge; configured provider use may still incur operator-side costs.

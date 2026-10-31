@@ -79,7 +79,8 @@ kill long processes; run one active worker and test the host before relying on i
   to `DOC_MAX_BYTES` (default 50 MB) are accepted, with a separate 5,000,000-character extraction
   limit; Office note/export work refuses oversized source text rather than silently truncating it.
   `.ppt` uses the existing converter; for unsupported `.doc`, save as `.docx` and resend. Scanned
-  PDFs are refused; no OCR is performed. PowerPoint narration/audio is separate and starts only when
+  PDFs are refused and, with `OCR_ENABLED=true`, their text-poor pages are read by the opt-in OCR
+  service ([docs/OCR.md](docs/OCR.md)); PowerPoint narration/audio is separate and starts only when
   its explicit button is pressed.
 - **🗂 آفیس رایگان** accepts pasted text/messages or `.txt`, `.md`, `.markdown`, `.csv` and `.tsv`
   files and creates real `.docx`, `.xlsx`, `.pptx` or selectable-text `.pdf` outputs. The default
@@ -109,8 +110,11 @@ kill long processes; run one active worker and test the host before relying on i
 - Notes: Gemini, NaraRouter, OpenRouter, Groq, Cerebras, Anthropic, OpenAI-compatible.
 - SQLite billing ledger with card-to-card purchases reviewed by an admin.
 
-OCR for images and scanned PDFs is **not** supported: a PDF that yields less than ~10 characters per
-page is refused with a Persian explanation instead of storing an empty document. Free Office is an
+OCR is **opt-in and third-party**: by default a PDF that yields less than ~10 characters per page,
+and any photo, is refused with a Persian explanation instead of storing an empty document. With
+`OCR_ENABLED=true` (and `pip install 'gamas-bot[ocr]'`) the text-poor pages of a scan, or an
+uploaded photo, are recognised by i2ocr.com and stored like any other document — see
+[docs/OCR.md](docs/OCR.md) for the protocol review, limits and privacy trade-off. Free Office is an
 explicit menu workflow (`OFFICE_ENABLED=true` by default); plain text is collected only after a user
 starts that workflow. Its temporary text drafts expire after `OFFICE_SESSION_TTL_MINUTES` and are
 cleared on cancel, navigation or shutdown.

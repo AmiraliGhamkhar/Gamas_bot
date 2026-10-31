@@ -2,7 +2,8 @@
 
 The bot reads slide text and extracts linked audio/video narration from `.pptx` files. Legacy
 `.ppt`/`.pps`/`.pot` decks are converted in-process with `ppt2pptx`. ODP/OTP and text that exists
-only inside images are not supported (no OCR).
+only inside images are not supported by the deck reader; a slide that is a picture needs the opt-in
+OCR path ([OCR.md](OCR.md)), which reads images, not decks.
 
 ## How it works
 

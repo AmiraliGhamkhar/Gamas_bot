@@ -22,11 +22,12 @@ maintainer contract (invariants R/B/P/S/D, billing rules, and the full test gate
 | [Presentations](PRESENTATIONS.md) | PowerPoint narration and limits |
 | [Media](MEDIA.md) | Audio/video processing and disk limits |
 | [Free Office (آفیس رایگان) and document notes](OFFICE.md) | Text/file exports, source-grounded document notes, limits, fallbacks and billing isolation |
+| [OCR for scans and photos](OCR.md) | Opt-in i2ocr path, review of the upstream client, limits and privacy |
 | [Word output](DOCX.md) | RTL Word behavior and fonts |
 | [Note quality](NOTE_QUALITY.md) | Grounding checks and limitations |
 | [Performance](PERFORMANCE.md) | Measured defaults and how to re-measure |
 | [Architecture](ARCHITECTURE.md) | Short code and data-flow map |
 | [Changelog](CHANGELOG.md) | Recent user-visible changes |
 
-Persian quick guide: [DEPLOY_FA.md](DEPLOY_FA.md). OCR is not implemented.
+Persian quick guide: [DEPLOY_FA.md](DEPLOY_FA.md). OCR for scans/photos is opt-in (`OCR_ENABLED`), see [OCR.md](OCR.md).
 - [Support tickets](SUPPORT.md) — user and admin support flow, statuses, notifications.

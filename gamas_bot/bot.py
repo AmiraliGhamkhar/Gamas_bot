@@ -33,6 +33,7 @@ import sqlite3
 import tempfile
 import time
 import weakref
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -90,6 +91,7 @@ from .doc_extract import (
     chunks_from_json,
     chunks_to_json,
     classify_document,
+    classify_image,
     document_title,
     extract_document,
     preview_text,
@@ -97,6 +99,7 @@ from .doc_extract import (
     sha256_file,
     SOURCE_TYPE_LABELS_FA,
 )
+from .ocr import I2OCRClient, OcrError, extract_text_problem
 from .learning import (
     FLASHCARD_SCHEMA,
     MAX_MANUAL_BACK_CHARS,
@@ -408,11 +411,20 @@ LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS = 1.0
 DOC_UNSUPPORTED_HINT = (
     "⚠️ فقط PDF، Word (docx) یا PowerPoint (pptx) به‌عنوان سند پذیرفته می‌شود."
 )
-#: A photo sent instead of a document (edge case in §7).
+#: A photo sent instead of a document (edge case in §7). Shown only when the
+#: deployment has not enabled the opt-in OCR service.
 DOC_PHOTO_HINT = (
     "📷 عکس سند به‌تنهایی خوانده نمی‌شود (OCR پشتیبانی نمی‌شود).\n"
     "لطفاً فایل را با گزینهٔ «ارسال به‌صورت فایل» و در قالب PDF/DOCX/PPTX بفرستید."
 )
+#: OCR is enabled but the third-party service failed. The document is fine, so
+#: the advice is to retry later, not to reformat the file.
+DOC_OCR_FAILED = (
+    "⚠️ خواندن تصویری سند ناموفق بود (سرویس OCR در دسترس نیست یا پاسخ نداد).\n"
+    "کمی بعد دوباره تلاش کنید یا نسخهٔ متنی/Word فایل را بفرستید."
+)
+#: Suffix used when a Telegram photo arrives without a file name.
+DEFAULT_INTAKE_SUFFIX = {"image": ".jpg"}
 #: Document card buttons.
 DOC_GENERATE_CARDS = "🃏 ساخت فلش‌کارت"
 DOC_GENERATE_QUESTIONS = "❓ ساخت سؤالات"
@@ -1014,6 +1026,28 @@ def _text_file_metadata(message) -> tuple[str | None, str | None]:
     return (suffix, filename) if suffix is not None else (None, filename)
 
 
+def _image_metadata(message) -> tuple[str | None, str | None]:
+    """``("image", name)`` for a photo or image file the OCR flow can read.
+
+    The name is ``None`` for a Telegram photo, which carries no file name; the
+    intake then stores the download under its default image suffix.
+    """
+    if getattr(message, "sticker", None) is not None or getattr(message, "gif", None) is not None:
+        return None, None
+    if getattr(message, "voice", None) is not None or getattr(message, "audio", None) is not None:
+        return None, None
+    file_obj = getattr(message, "file", None)
+    name = getattr(file_obj, "name", None)
+    mime = getattr(file_obj, "mime_type", None)
+    if getattr(message, "photo", None) is not None:
+        if mime and not str(mime).lower().startswith("image/"):
+            return None, None
+        return "image", name
+    if getattr(message, "document", None) is None:
+        return None, None
+    return ("image", name) if classify_image(name, mime) else (None, None)
+
+
 def _is_unsupported_attachment(message) -> bool:
     """True for a real file the bot cannot use — never for links or text."""
     media = getattr(message, "media", None)
@@ -1128,6 +1162,8 @@ class GamasBot:
         self._pending_free_reset: dict[int, int] = {}
         self._admin_action_times: dict[tuple[int, str], float] = {}
         self._broadcast_running: set[int] = set()
+        #: Lazily created OCR transport (only when OCR_ENABLED is on).
+        self._ocr_client: I2OCRClient | None = None
         self._started_at = time.time()
         self.client = TelegramClient(
             str(settings.session_path), settings.api_id, settings.api_hash
@@ -1291,6 +1327,11 @@ class GamasBot:
         self._receipt_cleanup_task = None
         self._prewarm_task = None
         self._office_session_cleanup_task = None
+        # Close the OCR HTTP session while a worker thread can still join it;
+        # the client owns no database or Telegram state.
+        if self._ocr_client is not None:
+            await run_file_io(self._ocr_client.close)
+            self._ocr_client = None
 
         async def _fail_queued(job) -> None:
             # Audit F-H04: queued jobs never reached a worker; mark them failed
@@ -1789,6 +1830,40 @@ class GamasBot:
             raise RuntimeError("document vanished after insert")
         return document, created
 
+    def _ocr_client_instance(self) -> I2OCRClient:
+        """The process-wide OCR client, created on first use.
+
+        Construction performs no network I/O (the session is lazy), so this is
+        cheap inside the extraction thread.
+        """
+        if self._ocr_client is None:
+            self._ocr_client = I2OCRClient(max_bytes=int(self.settings.doc_max_bytes))
+        return self._ocr_client
+
+    def _ocr_extractor(self) -> Callable[[Path, Sequence[int]], Sequence[str | None]] | None:
+        """The blocking OCR hook for :func:`extract_document`, or ``None``.
+
+        ``extract_document`` already runs in a bounded worker thread; the hook
+        reuses that thread, and the client serializes service calls, so two
+        scans arriving together queue up instead of racing the free tier.
+        """
+        if not self.settings.ocr_enabled:
+            return None
+        settings = self.settings
+
+        def run(path: Path, pages: Sequence[int]) -> list[str | None]:
+            client = self._ocr_client_instance()
+            recognised = client.extract_pages(
+                path,
+                pages,
+                language=settings.ocr_language,
+                budget_seconds=settings.ocr_timeout_seconds,
+            )
+            by_page = {page.number: page.text for page in recognised}
+            return [by_page.get(number) for number in pages]
+
+        return run
+
     def _document_lock(self, user_id: int, digest: str) -> asyncio.Lock:
         """Share extraction for simultaneous identical uploads by one owner."""
         key = (user_id, digest)
@@ -1828,7 +1903,13 @@ class GamasBot:
                         "تبدیل ارائهٔ قدیمی ناموفق بود؛ لطفاً نسخهٔ pptx را بفرستید."
                     ) from exc
             async with self._document_semaphore:
-                extracted: ExtractedDoc = await run_file_io(extract_document, extract_path, source_type)
+                extracted: ExtractedDoc = await run_file_io(
+                    extract_document,
+                    extract_path,
+                    source_type,
+                    ocr=self._ocr_extractor(),
+                    ocr_max_pages=int(self.settings.ocr_max_pages),
+                )
             text = await run_file_io(lambda: extracted.text)
             if not text.strip():
                 raise DocExtractError(
@@ -1859,7 +1940,9 @@ class GamasBot:
     def _document_card_text(self, document: dict) -> str:
         """Type, size and a text preview — the "extraction succeeded" proof."""
         label = SOURCE_TYPE_LABELS_FA.get(str(document["source_type"]), "سند")
-        unit = {"pdf": "صفحه", "docx": "بخش", "pptx": "اسلاید"}.get(document["source_type"], "بخش")
+        unit = {"pdf": "صفحه", "docx": "بخش", "pptx": "اسلاید", "image": "صفحه"}.get(
+            document["source_type"], "بخش"
+        )
         lines = [
             f"📄 {document.get('title') or 'سند'}",
             f"نوع: {label} | {to_persian_digits(int(document.get('page_count') or 0))} {unit}",
@@ -2772,7 +2855,11 @@ class GamasBot:
             prefix="doc-",
         ))
         try:
-            suffix = Path(filename).suffix.lower() if filename else f".{source_type}"
+            suffix = (
+                Path(filename).suffix.lower()
+                if filename
+                else DEFAULT_INTAKE_SUFFIX.get(source_type, f".{source_type}")
+            )
             path = workdir / f"source{suffix}"
             try:
                 await self._download_telegram_media(event.message, path, max_bytes)
@@ -2829,6 +2916,15 @@ class GamasBot:
                     progress,
                     f"⚠️ {exc}\nاگر ارائه صدای ضبط‌شده دارد، می‌توانید آن را پردازش کنید.",
                     buttons,
+                )
+                return
+            except OcrError as exc:
+                logger.warning("ocr failed user=%s: %s", user_id, extract_text_problem(exc))
+                await self._edit(
+                    progress,
+                    failed_progress_text(
+                        progress.percent, DOC_OCR_FAILED, headline=DOC_EXTRACTION_STOPPED
+                    ),
                 )
                 return
             except DocExtractError as exc:
@@ -5697,6 +5793,17 @@ class GamasBot:
                 await self._handle_receipt_upload(
                     event, user_id, payment_id=int(open_payment["payment_id"])
                 )
+                return
+
+        # With OCR enabled, a photo or an image file is a study document: the
+        # text is recognised and stored exactly like a PDF page. Receipts are
+        # already claimed above, so an open payment still wins.
+        if self.settings.ocr_enabled:
+            image_kind, image_name = _image_metadata(event.message)
+            if image_kind is not None:
+                if await self._is_duplicate_upload(event, user_id):
+                    return
+                await self._accept_document(event, user_id, image_kind, image_name)
                 return
 
         if _is_unsupported_attachment(event.message):

@@ -56,6 +56,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Opt-in OCR transport. i2ocr.com fronts its API with a TLS-fingerprint check,
+# so a plain aiohttp request is refused before it reaches the endpoint; curl_cffi
+# is the only pure-wheel client that passes it. It stays out of the mandatory
+# dependency list (cPanel shared hosting installs requirements.txt and may not
+# have a matching wheel) and is only needed when OCR_ENABLED=true.
+ocr = ["curl-cffi>=0.6,<0.18"]
 dev = [
     "ruff>=0.6",
     "pytest>=8.0",
@@ -107,6 +113,8 @@ files = [
     "gamas_bot/config.py",
     "gamas_bot/db.py",
     "gamas_bot/docx_export.py",
+    "gamas_bot/doc_extract.py",
+    "gamas_bot/ocr.py",
     "gamas_bot/instance_lock.py",
     "gamas_bot/launcher.py",
     "gamas_bot/learning.py",

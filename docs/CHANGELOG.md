@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — opt-in OCR for scans and photos (i2ocr), reviewed and hardened
+
+- **A scanned PDF or a photo can now become a study document — if the operator opts in.** The
+  document pipeline stays text-layer only by default: with `OCR_ENABLED=false` (the default) a
+  text-poor PDF and every photo are refused exactly as before. With `OCR_ENABLED=true`, only the
+  text-poor pages of a document (never a page that already has text, never a `.docx`/`.pptx`) are
+  sent to i2ocr.com and the recognised text is stored as ordinary page sections; an uploaded photo
+  becomes a one-page document (`source_type='image'`, migration 017). The transport is the optional
+  `.[ocr]` extra (`curl-cffi`), so `requirements.txt` and a plain cPanel install are unchanged, and
+  `check()` refuses to start when the switch is on without it. See `docs/OCR.md`.
+- **The upstream `i2ocr-py` client was replaced, not vendored.** Fourteen defects are fixed and
+  pinned by tests: the `unicode_escape` fallback that turned Persian into `Ø³` garbage whenever a
+  page contained a lone backslash, HTML entities leaking out of the textarea variant, one-page-only
+  PDFs (one upload now serves every page and the service's own page name is honoured), no retries,
+  mute CAPTCHA failures, an unsanitised file name in the multipart header, unbounded uploads,
+  opaque JSON errors, a trusted CAPTCHA range, a fabricated `took`, an eager unretried session, no
+  throttling, a hard-coded `kazakh` default, and blocking calls with no thread contract.
+- **Bounded by construction.** `OCR_LANGUAGE` (`persian` default, `fa`/`farsi` aliased),
+  `OCR_MAX_PAGES` (20) and `OCR_TIMEOUT_SECONDS` (600) cap what leaves the host and how long it may
+  take; one client serializes requests with a 1.5 s floor between them, so two scans queue instead
+  of racing the free tier. A failed service call stores nothing and says
+  «خواندن تصویری سند ناموفق بود…», so a resend is clean; a successful but empty recognition asks
+  for a clearer photo instead of saving an empty document.
+
 ## Unreleased — learning generation never loses a paid answer to an anchor mismatch
 
 - **An item is anchored, not discarded, when its locator cannot be verified.** The remaining way a

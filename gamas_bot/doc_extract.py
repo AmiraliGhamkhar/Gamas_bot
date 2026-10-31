@@ -11,9 +11,12 @@ Design rules:
 * **Pure-ish and blocking.** Every ``extract_*`` function is synchronous and
   CPU/disk bound; callers run them through ``fileio.run_file_io`` so the
   Telethon event loop never stalls.
-* **No OCR.** A scanned PDF (a text-less image container) is refused with an
-  explicit Persian message instead of producing an empty deck. OCR stays out of
-  scope by decision, not by accident.
+* **OCR is an injected dependency.** A scanned PDF (a text-less image
+  container) and an uploaded photo are refused by default with an explicit
+  Persian message. When the deployment enables ``OCR_ENABLED``, the caller
+  passes ``ocr=`` — a blocking callable from :mod:`gamas_bot.ocr` — and the
+  text-poor pages are recognised page by page. Extraction itself never talks
+  to the network, so a deployment without OCR behaves exactly as before.
 * **Reuse, never duplicate.** PowerPoint text comes from
   :mod:`gamas_bot.presentations` (the same reader the lecture pipeline uses), so
   a deck parses identically in both flows. Chunk sizes come from
@@ -28,6 +31,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
@@ -64,7 +68,25 @@ DOC_EXTENSIONS: dict[str, str] = {
     ".doc": "docx",
 }
 
-SOURCE_TYPE_LABELS_FA = {"pdf": "PDF", "docx": "Word", "pptx": "PowerPoint"}
+#: Image uploads are accepted only for OCR (a photo of a textbook page).
+IMAGE_MIME_TYPES = frozenset(
+    {"image/jpeg", "image/png", "image/webp", "image/tiff", "image/bmp", "image/gif"}
+)
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".tif", ".tiff", ".bmp", ".gif"})
+
+#: Refuse absurd pixel counts before Pillow allocates anything: a 300 MP image
+#: is neither a study page nor a safe decode.
+MAX_IMAGE_PIXELS = 50_000_000
+
+#: Blocking OCR hook: ``(path, page_numbers) -> text or None per page``.
+OcrPages = Callable[[Path, Sequence[int]], Sequence[str | None]]
+
+SOURCE_TYPE_LABELS_FA = {
+    "pdf": "PDF",
+    "docx": "Word",
+    "pptx": "PowerPoint",
+    "image": "تصویر",
+}
 
 #: A page holding fewer than this many characters is treated as image-only when
 #: the *whole* document is text-poor (see :func:`looks_scanned`).
@@ -85,7 +107,13 @@ class DocExtractError(RuntimeError):
 
 
 class ScannedPdfError(DocExtractError):
-    """Raised when a PDF has no text layer (OCR is out of scope)."""
+    """Raised when a PDF has no text layer and OCR is unavailable or empty."""
+
+    def __init__(self, message: str, *, ocr_attempted: bool = False) -> None:
+        super().__init__(message)
+        #: True when OCR ran and still produced nothing, so the caller can say
+        #: "the service could not read it" instead of "OCR is not supported".
+        self.ocr_attempted = ocr_attempted
 
 
 class EmptyPresentationTextError(DocExtractError):
@@ -166,6 +194,16 @@ def classify_document(filename: str | None, mime_type: str | None) -> str | None
     return DOC_EXTENSIONS.get(Path(filename).suffix.lower())
 
 
+def classify_image(filename: str | None, mime_type: str | None) -> bool:
+    """Whether an upload is a photo/scan the OCR flow can read."""
+    mime = normalize_mime(mime_type)
+    if mime in IMAGE_MIME_TYPES:
+        return True
+    if mime and mime != "application/octet-stream":
+        return False
+    return bool(filename) and Path(str(filename)).suffix.lower() in IMAGE_EXTENSIONS
+
+
 def document_title(filename: str | None, source_type: str) -> str:
     """A clean, bounded title for the library row and the document card."""
     raw = Path(filename).name if filename else ""
@@ -195,7 +233,12 @@ def looks_scanned(sections: Iterable[DocSection], page_count: int) -> bool:
     return total < threshold
 
 
-def _pdf_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
+def _read_pdf_pages(path: Path) -> list[str]:
+    """Cleaned text of every PDF page, index 0 holding page 1.
+
+    Empty strings are kept (one entry per page) because the OCR fallback must
+    know *which* page has no text layer, not just how many pages have one.
+    """
     try:
         from pypdf import PdfReader
     except ImportError as exc:  # pragma: no cover - declared dependency
@@ -215,11 +258,11 @@ def _pdf_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
             raise DocExtractError(
                 "این PDF با رمز محافظت شده است؛ نسخهٔ بدون رمز را بفرستید."
             )
-    sections: list[DocSection] = []
     try:
         pages = list(reader.pages)
     except Exception as exc:
         raise DocExtractError("خواندن صفحه‌های PDF ناموفق بود.") from exc
+    texts: list[str] = []
     total_chars = 0
     for number, page in enumerate(pages, start=1):
         try:
@@ -230,11 +273,21 @@ def _pdf_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
         cleaned = _clean_block(text)
         total_chars += len(cleaned)
         _check_extracted_text_size(total_chars)
-        if cleaned:
-            sections.append(
-                DocSection(f"صفحهٔ {to_persian_digits(number)}", "", cleaned)
-            )
-    return tuple(sections), len(pages)
+        texts.append(cleaned)
+    return texts
+
+
+def _pdf_sections_from_pages(texts: Sequence[str]) -> tuple[DocSection, ...]:
+    return tuple(
+        DocSection(f"صفحهٔ {to_persian_digits(number)}", "", text)
+        for number, text in enumerate(texts, start=1)
+        if text.strip()
+    )
+
+
+def _pdf_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
+    texts = _read_pdf_pages(path)
+    return _pdf_sections_from_pages(texts), len(texts)
 
 
 def _check_office_package(path: Path) -> None:
@@ -430,18 +483,122 @@ def _pptx_sections(path: Path, *, max_chars: int) -> tuple[tuple[DocSection, ...
     return tuple(sections), len(slides)
 
 
+#: The message used when a scan is refused because OCR is switched off.
+SCANNED_PDF_MESSAGE = (
+    "این PDF لایهٔ متنی ندارد (ظاهراً اسکن‌شده است)؛ OCR پشتیبانی "
+    "نمی‌شود. لطفاً نسخهٔ متنی یا Word فایل را بفرستید."
+)
+#: The message used when OCR ran but found nothing readable on the page(s).
+SCANNED_PDF_OCR_EMPTY_MESSAGE = (
+    "این PDF لایهٔ متنی ندارد و خواندن تصویری آن هم متنی پیدا نکرد؛ "
+    "لطفاً از صفحه عکس واضح‌تری بگیرید یا نسخهٔ متنی فایل را بفرستید."
+)
+IMAGE_EMPTY_MESSAGE = (
+    "متنی در این تصویر شناسایی نشد؛ عکس واضح‌تر و صاف‌تری بفرستید "
+    "(نور کافی، بدون تاری و کج‌شدگی)."
+)
+
+
+def _ocr_pdf_pages(
+    path: Path,
+    texts: Sequence[str],
+    ocr: OcrPages,
+    max_pages: int,
+) -> tuple[DocSection, ...]:
+    """Recognise the text-poor pages of a PDF and merge them back in order."""
+    targets = [
+        number
+        for number, text in enumerate(texts, start=1)
+        if len(text.strip()) < SCANNED_CHARS_PER_PAGE
+    ]
+    if max_pages > 0:
+        targets = targets[:max_pages]
+    if not targets:  # pragma: no cover - looks_scanned guarantees at least one
+        raise ScannedPdfError(SCANNED_PDF_MESSAGE)
+    logger.info("ocr pdf pages=%s total=%s", len(targets), len(texts))
+    recognised = list(ocr(path, targets))
+    position_of = {number: index for index, number in enumerate(targets)}
+    merged: list[str] = []
+    total_chars = 0
+    for number, text in enumerate(texts, start=1):
+        replacement: str | None = None
+        if number in position_of:
+            position = position_of[number]
+            value = recognised[position] if position < len(recognised) else None
+            # A short or partially-typed answer means "no text for this page",
+            # never a crash in the middle of a document.
+            if isinstance(value, str) and value.strip():
+                replacement = _clean_block(value)
+        if len(text.strip()) >= SCANNED_CHARS_PER_PAGE:
+            chosen = text
+        else:
+            chosen = replacement or text
+        total_chars += len(chosen)
+        _check_extracted_text_size(total_chars)
+        merged.append(chosen)
+    sections = _pdf_sections_from_pages(merged)
+    if not sections:
+        raise ScannedPdfError(SCANNED_PDF_OCR_EMPTY_MESSAGE, ocr_attempted=True)
+    return sections
+
+
+def _verify_image(path: Path) -> None:
+    """Refuse a file that is not a decodable, reasonably sized image."""
+    try:
+        from PIL import Image
+    except ImportError:  # pragma: no cover - declared dependency
+        return
+    try:
+        with Image.open(path) as image:
+            width, height = image.size
+            image.verify()
+    except Exception as exc:
+        raise DocExtractError("این فایل یک تصویر قابل‌خواندن نیست.") from exc
+    if int(width) * int(height) > MAX_IMAGE_PIXELS:
+        raise DocExtractError(
+            "ابعاد این تصویر بیش از حد بزرگ است؛ نسخهٔ کوچک‌تری از عکس را بفرستید."
+        )
+
+
+def _image_sections(path: Path, ocr: OcrPages) -> tuple[tuple[DocSection, ...], int]:
+    """OCR an uploaded photo/scan into a one-page document."""
+    _verify_image(path)
+    recognised = list(ocr(path, [1]))
+    text = _clean_block(recognised[0] or "") if recognised else ""
+    _check_extracted_text_size(len(text))
+    if not text:
+        raise DocExtractError(IMAGE_EMPTY_MESSAGE)
+    return (DocSection(f"صفحهٔ {to_persian_digits(1)}", "", text),), 1
+
+
 def extract_document(
-    path: Path, source_type: str, *, max_chars: int = MAX_MODEL_INPUT_CHARS
+    path: Path,
+    source_type: str,
+    *,
+    max_chars: int = MAX_MODEL_INPUT_CHARS,
+    ocr: OcrPages | None = None,
+    ocr_max_pages: int = 0,
 ) -> ExtractedDoc:
-    """Extract a PDF/DOCX/PPTX into locator-tagged sections (blocking)."""
+    """Extract a PDF/DOCX/PPTX/photo into locator-tagged sections (blocking).
+
+    ``ocr`` is the optional :mod:`gamas_bot.ocr` hook. It is only consulted for
+    a text-poor PDF or an image, and it runs in this (already off-loop) thread;
+    a failure inside it propagates as :class:`gamas_bot.ocr.OcrError` so the
+    caller can tell "service down" from "nothing readable".
+    """
     source_type = (source_type or "").strip().lower()
     if source_type == "pdf":
-        sections, page_count = _pdf_sections(path)
+        texts = _read_pdf_pages(path)
+        sections = _pdf_sections_from_pages(texts)
+        page_count = len(texts)
         if looks_scanned(sections, page_count):
-            raise ScannedPdfError(
-                "این PDF لایهٔ متنی ندارد (ظاهراً اسکن‌شده است)؛ OCR پشتیبانی "
-                "نمی‌شود. لطفاً نسخهٔ متنی یا Word فایل را بفرستید."
-            )
+            if ocr is None:
+                raise ScannedPdfError(SCANNED_PDF_MESSAGE)
+            sections = _ocr_pdf_pages(path, texts, ocr, ocr_max_pages)
+    elif source_type == "image":
+        if ocr is None:
+            raise DocExtractError("خواندن تصویری این فایل در این نسخه فعال نیست.")
+        sections, page_count = _image_sections(path, ocr)
     elif source_type == "docx":
         sections, page_count = _docx_sections(path)
     elif source_type == "pptx":
