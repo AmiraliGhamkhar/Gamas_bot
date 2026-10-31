@@ -2,7 +2,7 @@
 
 ## Unreleased — Free Office restoration
 
-- Restored the optional **🗂 دفتر آزاد** menu and private, owner-scoped message/text-file drafts for
+- Restored the optional **🗂 آفیس رایگان** menu and private, owner-scoped message/text-file drafts for
   `.txt`, `.md`, `.markdown`, `.csv` and `.tsv`; generated files use the existing RTL Word/Excel/
   PowerPoint/PDF builders and library references. `OFFICE_ENABLED` is `true` by default.
 - Reconnected uploaded PDF/DOCX/PPTX cards to full source-grounded booklets, separate compact

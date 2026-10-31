@@ -1127,8 +1127,8 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(text.startswith(
             "منوی اصلی\n\n"
             "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت.\n"
-            "🗂 دفتر آزاد: پیام یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار.\n"
-            "متن گفتار و سند ذخیره می‌شود. دفتر آزاد حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند."
+            "🗂 آفیس رایگان: پیام یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار.\n"
+            "متن گفتار و سند ذخیره می‌شود. آفیس رایگان حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند."
         ))
         self.assertIn("💳 اعتبار باقی‌مانده", text)
 
@@ -1140,7 +1140,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         expected = (
             "ℹ️ راهنمای گاماس\n\n"
             "🎧 فایل صوت/ویدیو یا 📄 سند PDF، Word و پاورپوینت را همین‌جا بفرستید.\n"
-            "🗂 دفتر آزاد: متن یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار.\n"
+            "🗂 آفیس رایگان: متن یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار.\n"
             "📚 متن اسناد در کتابخانه ذخیره می‌شود؛ برای ارائه، پردازش صدا نیز انتخاب‌پذیر است.\n"
             "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
             "🎁 نخستین مجموعهٔ فلش‌کارت و نخستین آزمون جداگانه رایگان‌اند.\n"
@@ -1164,7 +1164,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn("دفتر آزاد حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند.", text)
+        self.assertIn("آفیس رایگان حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند.", text)
         self.assertIn("رایگان و بدون کسر اعتبار", text)
         self.assertNotIn("متن گفتار و جزوهٔ ورد", text)
 

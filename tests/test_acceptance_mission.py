@@ -407,7 +407,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
             [
                 "📚 کتابخانه من",
                 "🛒 خرید اشتراک",
-                "🗂 دفتر آزاد",
+                "🗂 آفیس رایگان",
                 "🏆 لیدربورد",
                 "🎧 پشتیبانی",
                 "ℹ️ راهنما",

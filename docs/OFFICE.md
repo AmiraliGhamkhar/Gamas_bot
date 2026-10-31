@@ -1,6 +1,6 @@
-# Free Office and document notes
+# Free Office (آفیس رایگان) and document notes
 
-Free Office is a user-facing Telegram feature again. The main menu shows **🗂 دفتر آزاد** when
+Free Office is a user-facing Telegram feature again. The main menu shows **🗂 آفیس رایگان** when
 `OFFICE_ENABLED=true` (the default). Every user-facing Office/document-note operation is free from
 the user's wallet and does not consume either of the separate free quiz/flashcard allowances.
 Configured model providers may still have operator-side API costs; provider use is limited to the
@@ -8,7 +8,7 @@ configured note routes and never enables paid transcription.
 
 ## Pasted text and text files
 
-1. Open **🗂 دفتر آزاد** before sending text. Paste one or more messages, or upload `.txt`, `.md`,
+1. Open **🗂 آفیس رایگان** before sending text. Paste one or more messages, or upload `.txt`, `.md`,
    `.markdown`, `.csv` or `.tsv` files. Each accepted part is appended to that user's in-memory draft
    in arrival order.
 2. Choose Word, Excel, PowerPoint or PDF. The bot delivers a real `.docx`, `.xlsx`, `.pptx` or

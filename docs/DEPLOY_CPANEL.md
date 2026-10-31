@@ -185,11 +185,11 @@ tail -n 80 data/logs/bot.log
 
 Smoke test after the first start (use an admin account and a small test order):
 
-1. `/start` shows the lecture guide and the **🗂 دفتر آزاد** button when `OFFICE_ENABLED=true`,
+1. `/start` shows the lecture guide and the **🗂 آفیس رایگان** button when `OFFICE_ENABLED=true`,
    alongside Library, Wallet, Leaderboard, Support and Help (admins also see their separate panel).
    No mode button is required before sending a test audio file; verify the transcript arrives before
    the Word booklet and both Telegram documents appear in the library.
-2. Open Free Office and paste a short Persian message; build Word, Excel, PowerPoint and PDF in turn.
+2. Open **آفیس رایگان** (Free Office) and paste a short Persian message; build Word, Excel, PowerPoint and PDF in turn.
    Check that the files open, the PDF text can be selected/copied, the Excel text remains literal,
    each Telegram file is in the user's library, and wallet/free-use balances are unchanged. Repeat
    with a `.csv` containing a quoted comma and a formula-looking value. Cancel an unexported draft

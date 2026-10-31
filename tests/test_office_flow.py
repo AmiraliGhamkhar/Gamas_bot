@@ -307,7 +307,7 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(b"office:start", payloads)
         callback = self.callback("office:start")
         await self.bot._handle_callback(callback)
-        self.assertEqual(callback.answers[-1], ("دفتر آزاد در تنظیمات سرور غیرفعال است.", True))
+        self.assertEqual(callback.answers[-1], ("آفیس رایگان در تنظیمات سرور غیرفعال است.", True))
         self.assertNotIn(self.user_id, self.bot._office_sessions)
 
 

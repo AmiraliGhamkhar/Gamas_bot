@@ -1,8 +1,8 @@
 # Gamas Bot
 
 Persian Telegram study assistant. Send lecture audio/video for transcription and an RTL Word
-booklet, send PDF/Word/PowerPoint documents for text extraction and study notes, or open «🗂 دفتر
-آزاد» to turn messages and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv` files into real Word, Excel,
+booklet, send PDF/Word/PowerPoint documents for text extraction and study notes, or open **🗂 آفیس رایگان**
+to turn messages and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv` files into real Word, Excel,
 PowerPoint and selectable-text PDF files. Free Office and document-note actions do not consume wallet
 credit or the existing free quiz/flashcard uses. Saved outputs and source references are available in
 the personal library; PowerPoint narration remains a separate explicit action on the source card.
@@ -59,7 +59,7 @@ kill long processes; run one active worker and test the host before relying on i
 
 ## User flow
 
-- `/start` explains the lecture flow and shows 📚 Library, 💳 Wallet, 🗂 Free Office,
+- `/start` explains the lecture flow and shows 📚 Library, 💳 Wallet, 🗂 آفیس رایگان,
   🏆 Leaderboard, 🎧 Support and ℹ️ Help (admins also see their separate admin panel). The Office
   button is hidden when `OFFICE_ENABLED=false`.
 - Send audio, video or a Telegram voice/video note. The bot delivers the transcript first, then the
@@ -81,7 +81,7 @@ kill long processes; run one active worker and test the host before relying on i
   `.ppt` uses the existing converter; for unsupported `.doc`, save as `.docx` and resend. Scanned
   PDFs are refused; no OCR is performed. PowerPoint narration/audio is separate and starts only when
   its explicit button is pressed.
-- **🗂 Free Office** accepts pasted text/messages or `.txt`, `.md`, `.markdown`, `.csv` and `.tsv`
+- **🗂 آفیس رایگان** accepts pasted text/messages or `.txt`, `.md`, `.markdown`, `.csv` and `.tsv`
   files and creates real `.docx`, `.xlsx`, `.pptx` or selectable-text `.pdf` outputs. The default
   per-draft limit is 100,000 characters, uploaded text files are limited to 1,000,000 bytes, and
   office-like table/slide limits reject overflow instead of trimming content. Excel stores user text

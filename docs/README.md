@@ -18,7 +18,7 @@ and **cPanel Terminal** (Linux shared hosting).
 | [Note providers](PROVIDERS.md) | Note generation, keys and model presets |
 | [Presentations](PRESENTATIONS.md) | PowerPoint narration and limits |
 | [Media](MEDIA.md) | Audio/video processing and disk limits |
-| [Free Office and document notes](OFFICE.md) | Text/file exports, source-grounded document notes, limits, fallbacks and billing isolation |
+| [Free Office (آفیس رایگان) and document notes](OFFICE.md) | Text/file exports, source-grounded document notes, limits, fallbacks and billing isolation |
 | [Word output](DOCX.md) | RTL Word behavior and fonts |
 | [Note quality](NOTE_QUALITY.md) | Grounding checks and limitations |
 | [Performance](PERFORMANCE.md) | Measured defaults and how to re-measure |

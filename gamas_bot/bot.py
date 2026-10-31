@@ -1421,7 +1421,7 @@ class GamasBot:
         ]
         if self.settings.office_enabled:
             rows.append(
-                [Button.inline("🗂 دفتر آزاد", b"office:start"), Button.inline("🏆 لیدربورد", b"board")]
+                [Button.inline("🗂 آفیس رایگان", b"office:start"), Button.inline("🏆 لیدربورد", b"board")]
             )
         else:
             rows.append([Button.inline("🏆 لیدربورد", b"board")])
@@ -1472,14 +1472,14 @@ class GamasBot:
         ]
         if self.settings.office_enabled:
             upload_lines.append(
-                "🗂 دفتر آزاد: پیام یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار."
+                "🗂 آفیس رایگان: پیام یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار."
             )
         if self.settings.note_configured:
             delivery = "متن گفتار و جزوهٔ ورد یا متن سند در «📚 کتابخانه من» ذخیره می‌شود."
         else:
             delivery = "متن گفتار و سند ذخیره می‌شود."
             if self.settings.office_enabled:
-                delivery += " دفتر آزاد حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند."
+                delivery += " آفیس رایگان حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند."
         upload_line = "\n".join(upload_lines)
         text = (
             f"{greeting}\n\n"
@@ -1928,16 +1928,16 @@ class GamasBot:
 
     async def _office_start(self, event, user_id: int) -> None:
         if not self.settings.office_enabled:
-            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            await self._ack(event, "آفیس رایگان در تنظیمات سرور غیرفعال است.", alert=True)
             return
         session = self._office_new_session(user_id, getattr(event, "message", None))
         if session is None:
-            await self._ack(event, "دفتر آزاد مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.", alert=True)
+            await self._ack(event, "آفیس رایگان مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.", alert=True)
             return
         session.updated_at = time.monotonic()
         await self._edit_or_reply(
             event,
-            "🗂 دفتر آزاد — رایگان\n\n"
+            "🗂 آفیس رایگان\n\n"
             "متن را اینجا بچسبانید یا چند پیام بفرستید؛ فایل‌های .txt، .md، .markdown، .csv و .tsv هم پذیرفته می‌شوند.\n"
             f"سقف هر سند {to_persian_digits(self.settings.office_max_chars)} نویسه است.\n"
             "پس از پایان، قالب Word، Excel، PowerPoint یا PDF را انتخاب کنید. "
@@ -1948,7 +1948,7 @@ class GamasBot:
     async def _office_show_formats(self, event, user_id: int) -> None:
         session = self._office_get_session(user_id)
         if session is None or not session.text.strip():
-            await self._ack(event, "ابتدا متن یا یک فایل متنی به دفتر آزاد بفرستید.", alert=True)
+            await self._ack(event, "ابتدا متن یا یک فایل متنی به آفیس رایگان بفرستید.", alert=True)
             return
         session.updated_at = time.monotonic()
         await self._edit_or_reply(
@@ -1963,7 +1963,7 @@ class GamasBot:
     async def _office_add_message(self, event, user_id: int, text: str) -> None:
         session = self._office_get_session(user_id)
         if session is None:
-            await event.reply("زمان دفتر آزاد تمام شده است؛ از منو دوباره شروع کنید.")
+            await event.reply("زمان آفیس رایگان تمام شده است؛ از منو دوباره شروع کنید.")
             return
         try:
             self._office_add_source(session, text, message=getattr(event, "message", None))
@@ -1984,7 +1984,7 @@ class GamasBot:
         reported_size = getattr(getattr(event.message, "file", None), "size", None)
         if isinstance(reported_size, int) and not isinstance(reported_size, bool) and reported_size > max_bytes:
             await event.reply(
-                "❌ فایل متنی از سقف حجم دفتر آزاد بیشتر است. حد: "
+                "❌ فایل متنی از سقف حجم آفیس رایگان بیشتر است. حد: "
                 f"{to_persian_digits(max_bytes // 1024)} کیلوبایت"
             )
             return
@@ -2003,7 +2003,7 @@ class GamasBot:
                     await self._download_telegram_media(event.message, source, max_bytes)
                     content = await run_file_io(read_text_file, source, max_bytes=max_bytes)
                 except UploadTooLargeError:
-                    await self._edit(progress, "❌ فایل متنی از سقف حجم دفتر آزاد بیشتر است.")
+                    await self._edit(progress, "❌ فایل متنی از سقف حجم آفیس رایگان بیشتر است.")
                     return
                 except asyncio.TimeoutError:
                     await self._edit(progress, "❌ دریافت فایل متنی ناموفق بود؛ دوباره بفرستید.")
@@ -2013,7 +2013,7 @@ class GamasBot:
                     return
                 session = self._office_get_session(user_id) or self._office_new_session(user_id, event.message)
                 if session is None:
-                    await self._edit(progress, "دفتر آزاد مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.")
+                    await self._edit(progress, "آفیس رایگان مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.")
                     return
                 try:
                     self._office_add_source(
@@ -2050,7 +2050,7 @@ class GamasBot:
     ) -> tuple[str, bytes, str, str]:
         """Build one real Office file with the existing RTL exporters."""
         if kind not in OFFICE_FORMATS:
-            raise OfficeError("قالب خروجی دفتر آزاد نامعتبر است.")
+            raise OfficeError("قالب خروجی آفیس رایگان نامعتبر است.")
         suffix = Path(source_name).suffix.lower() if source_name else ""
         delimiter = "," if suffix == ".csv" else "\t" if suffix == ".tsv" else None
         document = await run_file_io(
@@ -2071,7 +2071,7 @@ class GamasBot:
                 fonts=resolve_fonts(),
                 design=resolve_design(),
                 meta=meta,
-                mode_label=f"دفتر آزاد — {label}",
+                mode_label=f"آفیس رایگان — {label}",
                 heading_offset=OFFICE_HEADING_OFFSET,
             )
             caption = f"🗂 سند آزاد — {label} | {document.title}"
@@ -2128,7 +2128,7 @@ class GamasBot:
                 build_office_pdf,
                 document,
                 meta=meta,
-                mode_label=f"دفتر آزاد — {label}",
+                mode_label=f"آفیس رایگان — {label}",
             )
             caption = f"🗂 سند آزاد — {label} | {document.title}"
         return filename, payload, caption, f"🗂 {document.title} — {label}"
@@ -2167,10 +2167,10 @@ class GamasBot:
     ) -> None:
         """Run one bounded, free Office operation with private temp cleanup."""
         if not self.settings.office_enabled:
-            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            await self._ack(event, "آفیس رایگان در تنظیمات سرور غیرفعال است.", alert=True)
             return
         if user_id in self._office_in_flight:
-            await self._ack(event, "یک خروجی دفتر آزاد برای شما در حال ساخت است.", alert=True)
+            await self._ack(event, "یک خروجی آفیس رایگان برای شما در حال ساخت است.", alert=True)
             return
         now = time.monotonic()
         interval = max(0.0, float(self.settings.office_min_interval_seconds))
@@ -2213,7 +2213,7 @@ class GamasBot:
                 for filename, payload, caption, library_title in outputs:
                     if not payload or len(payload) > MAX_OFFICE_OUTPUT_BYTES:
                         raise OfficeError(
-                            "حجم خروجی از سقف دفتر آزاد بیشتر است؛ سند را کوچک‌تر کنید."
+                            "حجم خروجی از سقف آفیس رایگان بیشتر است؛ سند را کوچک‌تر کنید."
                         )
                     path = workdir / filename
                     await run_file_io(path.write_bytes, payload)
@@ -2258,7 +2258,7 @@ class GamasBot:
     ) -> None:
         session = self._office_get_session(user_id)
         if session is None or not session.text.strip():
-            await self._ack(event, "متن دفتر آزاد پیدا نشد؛ از منو دوباره شروع کنید.", alert=True)
+            await self._ack(event, "متن آفیس رایگان پیدا نشد؛ از منو دوباره شروع کنید.", alert=True)
             return
         if kind not in OFFICE_FORMATS:
             await self._ack(event, "قالب خروجی نامعتبر است.", alert=True)
@@ -2309,7 +2309,7 @@ class GamasBot:
         self, event, user_id: int, document_id: int
     ) -> None:
         if not self.settings.office_enabled:
-            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            await self._ack(event, "آفیس رایگان در تنظیمات سرور غیرفعال است.", alert=True)
             return
         document = await self.db.document_get(user_id, document_id)
         if document is None:
@@ -2327,7 +2327,7 @@ class GamasBot:
         self, event, user_id: int, document_id: int, kind: str
     ) -> None:
         if not self.settings.office_enabled:
-            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            await self._ack(event, "آفیس رایگان در تنظیمات سرور غیرفعال است.", alert=True)
             return
         document = await self.db.document_get(user_id, document_id)
         if document is None:
@@ -2340,7 +2340,7 @@ class GamasBot:
         if len(original_text) > MAX_OFFICE_NOTE_SOURCE_CHARS:
             await self._ack(
                 event,
-                "متن از سقف خروجی دفتر آزاد بیشتر است؛ فایل اصلی را دریافت و به چند سند تقسیم کنید. "
+                "متن از سقف خروجی آفیس رایگان بیشتر است؛ فایل اصلی را دریافت و به چند سند تقسیم کنید. "
                 "هیچ بخشی از متن در خروجی کوتاه نمی‌شود.",
                 alert=True,
             )
@@ -2357,7 +2357,7 @@ class GamasBot:
         if len(source) > MAX_OFFICE_NOTE_SOURCE_CHARS:
             await self._ack(
                 event,
-                "متن کامل با مکان‌یاب‌ها از سقف خروجی دفتر آزاد بیشتر است؛ فایل اصلی را دریافت کنید و سند را تقسیم کنید. هیچ بخشی کوتاه نمی‌شود.",
+                "متن کامل با مکان‌یاب‌ها از سقف خروجی آفیس رایگان بیشتر است؛ فایل اصلی را دریافت کنید و سند را تقسیم کنید. هیچ بخشی کوتاه نمی‌شود.",
                 alert=True,
             )
             return
@@ -2395,7 +2395,7 @@ class GamasBot:
         self, event, user_id: int, document_id: int, mode: str
     ) -> None:
         if not self.settings.office_enabled:
-            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            await self._ack(event, "آفیس رایگان در تنظیمات سرور غیرفعال است.", alert=True)
             return
         document = await self.db.document_get(user_id, document_id)
         if document is None:
@@ -4554,17 +4554,17 @@ class GamasBot:
         parts = data.split(":")
         action = parts[1] if len(parts) > 1 else ""
         if not self.settings.office_enabled:
-            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            await self._ack(event, "آفیس رایگان در تنظیمات سرور غیرفعال است.", alert=True)
             return
         if user_id in self._office_in_flight:
-            await self._ack(event, "خروجی دفتر آزاد شما در حال ساخت است.", alert=True)
+            await self._ack(event, "خروجی آفیس رایگان شما در حال ساخت است.", alert=True)
             return
         if action == "start" and len(parts) == 2:
             await self._office_start(event, user_id)
             return
         if action == "continue" and len(parts) == 2:
             if self._office_new_session(user_id, getattr(event, "message", None)) is None:
-                await self._ack(event, "دفتر آزاد مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.", alert=True)
+                await self._ack(event, "آفیس رایگان مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.", alert=True)
                 return
             await self._office_start(event, user_id)
             return
@@ -4575,14 +4575,14 @@ class GamasBot:
             self._office_sessions.pop(user_id, None)
             await self._edit(
                 event,
-                "پیش‌نویس دفتر آزاد پاک شد. فایل‌های خروجیِ قبلی در کتابخانه می‌مانند.",
+                "پیش‌نویس آفیس رایگان پاک شد. فایل‌های خروجیِ قبلی در کتابخانه می‌مانند.",
                 self._user_menu(is_admin=self._is_admin(user_id)),
             )
             return
         if action == "fmt" and len(parts) == 3 and parts[2] in OFFICE_FORMATS:
             await self._run_office_session_export(event, user_id, parts[2])
             return
-        await self._ack(event, "درخواست دفتر آزاد نامعتبر است.", alert=True)
+        await self._ack(event, "درخواست آفیس رایگان نامعتبر است.", alert=True)
 
     # --------------------------------------------------------- document routes
     async def _route_document_callback(
@@ -4850,7 +4850,7 @@ class GamasBot:
             ]
             if self.settings.office_enabled:
                 guide_lines.append(
-                    "🗂 دفتر آزاد: متن یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار."
+                    "🗂 آفیس رایگان: متن یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار."
                 )
             guide_lines.extend(
                 [
@@ -5190,7 +5190,7 @@ class GamasBot:
             return
         if text_suffix is not None:
             if not self.settings.office_enabled:
-                await event.reply("دفتر آزاد در تنظیمات سرور غیرفعال است.")
+                await event.reply("آفیس رایگان در تنظیمات سرور غیرفعال است.")
                 return
             if await self._is_duplicate_upload(event, user_id):
                 return
@@ -5204,7 +5204,7 @@ class GamasBot:
             return
         if office_session is not None and _is_unsupported_attachment(event.message):
             await event.reply(
-                "یک پیش‌نویس دفتر آزاد باز دارید. ابتدا خروجی را بسازید یا «پایان و پاک‌کردن متن» را بزنید؛ "
+                "یک پیش‌نویس آفیس رایگان باز دارید. ابتدا خروجی را بسازید یا «پایان و پاک‌کردن متن» را بزنید؛ "
                 "سپس فایل دیگری را بفرستید تا با جریان مناسب خودش پردازش شود.",
                 buttons=self._office_session_keyboard(),
             )

@@ -36,7 +36,7 @@ Find the `GMS-#####` reference in the log first.
 
 ## Document and Free Office issues
 
-- If **🗂 دفتر آزاد** is missing, check `OFFICE_ENABLED=true`; the menu intentionally hides it when disabled.
+- If **🗂 آفیس رایگان** is missing, check `OFFICE_ENABLED=true`; the menu intentionally hides it when disabled.
 - Only `.txt`, `.md`, `.markdown`, `.csv` and `.tsv` are accepted as Free Office input files. Check
   the file size (`OFFICE_MAX_INPUT_BYTES`) and that its MIME type agrees with the extension. A CSV
   with malformed quoting is rejected rather than partly imported.
