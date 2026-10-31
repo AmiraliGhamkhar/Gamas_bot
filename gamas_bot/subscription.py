@@ -23,7 +23,9 @@ Design rules
   channel requirement is a user-facing product rule. Their existing
   ``ADMIN_IDS`` authorization is untouched; no administrator id is hardcoded.
 * **One in-flight check per user.** Simultaneous verifications share a single
-  Telegram request instead of racing.
+  Telegram request instead of racing, and that sharing is cancellation-safe: a
+  cancelled interaction can neither cancel a sibling's check nor leave a waiter
+  awaiting a future nobody will resolve (see ``check_membership``).
 """
 
 from __future__ import annotations
@@ -158,7 +160,12 @@ class SubscriptionService:
         #: user_id -> future, so concurrent checks share one request.
         self._inflight: dict[int, asyncio.Future[MembershipResult]] = {}
         self._channel_resolved = False
-        self._last_admin_alert = 0.0
+        #: Monotonic timestamp of the last administrator alert, or ``None``
+        #: when none has been sent yet. ``time.monotonic()`` has an arbitrary
+        #: epoch (system uptime), so ``0.0`` cannot mean "never": on a freshly
+        #: booted host it is less than the throttle interval and the very
+        #: first, most important alert would be swallowed.
+        self._last_admin_alert: float | None = None
 
     # ------------------------------------------------------------------ config
     @property
@@ -282,13 +289,24 @@ class SubscriptionService:
 
         existing = self._inflight.get(user_id)
         if existing is not None:
-            return await existing
+            # Shield the shared request: cancelling a task cancels the future
+            # it is awaiting, so a plain ``await existing`` would let one
+            # cancelled interaction cancel the verification for the owner and
+            # for every other waiter of the same user.
+            return await asyncio.shield(existing)
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[MembershipResult] = loop.create_future()
         self._inflight[user_id] = future
         try:
             result = await self._check_uncached(user_id)
+        except asyncio.CancelledError:
+            # The shared request died with this task. Release the waiters with
+            # an inconclusive result — never a denial — so no interaction can
+            # wait forever on a future that nothing will resolve (fail open).
+            if not future.done():
+                future.set_result(MembershipResult(STATE_UNKNOWN, None, "cancelled"))
+            raise
         finally:
             self._inflight.pop(user_id, None)
 
@@ -483,7 +501,8 @@ class SubscriptionService:
     # -------------------------------------------------------- operational
     async def _alert_admins(self, text: str) -> None:
         now = time.monotonic()
-        if now - self._last_admin_alert < ADMIN_ALERT_INTERVAL_SECONDS:
+        last = self._last_admin_alert
+        if last is not None and now - last < ADMIN_ALERT_INTERVAL_SECONDS:
             return
         self._last_admin_alert = now
         try:

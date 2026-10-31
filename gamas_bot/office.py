@@ -35,6 +35,7 @@ import csv
 import io
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -191,7 +192,10 @@ class OfficeSession:
     filename: str | None = None
     title: str = ""
     message: Any = None
-    updated_at: float = 0.0
+    #: ``time.monotonic()`` of the last change. It defaults to *now* rather
+    #: than ``0.0`` so a draft can never look expired on a host whose uptime
+    #: is already larger than the configured TTL.
+    updated_at: float = field(default_factory=time.monotonic)
 
     @property
     def text(self) -> str:

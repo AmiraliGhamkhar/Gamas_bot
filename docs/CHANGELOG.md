@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — reliability re-audit
+
+- **Cancellation-safe membership checks.** The one-request-per-user sharing in
+  `SubscriptionService.check_membership` awaited a bare `asyncio.Future`. A
+  cancelled owner never resolved it, so a concurrent interaction of the same
+  user waited forever, and a cancelled waiter cancelled the future — killing the
+  verification for the owner and for unrelated co-waiters. Waiters now await the
+  shared request under `asyncio.shield`, and a cancelled owner releases its
+  waiters with an *unknown* result (fail open, never a denial).
+- **Monotonic-sentinel fixes.** `time.monotonic()` has an arbitrary epoch (the
+  host's uptime), so `0.0` cannot mean "never happened". The subscription admin
+  alert throttle no longer swallows the first alert — the most important one,
+  "the bot is not a channel administrator" — on a freshly booted host, and the
+  Free Office per-user throttle no longer refuses a new user's first export
+  there. `OfficeSession.updated_at` likewise defaults to the current monotonic
+  time instead of `0.0`, so a draft can never look expired on creation.
+- Regression tests for both classes were added; the changed tests fail against
+  the previous code and pass with these fixes.
+
 ## Unreleased — Free Office restoration
 
 - Restored the optional **🗂 آفیس رایگان** menu and private, owner-scoped message/text-file drafts for
