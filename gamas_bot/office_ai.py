@@ -25,7 +25,7 @@ from typing import Any
 
 from .config import Settings
 from .llm import complete_json
-from .mdblocks import HEADING_PATTERN
+from .mdblocks import BULLET_PATTERN, HEADING_PATTERN, RULE_PATTERN
 from .office import OfficeSlide, OfficeTable
 from .textnorm import normalize_for_compare
 
@@ -98,7 +98,9 @@ def _ordered_source_lines(candidate: list[str], source: str) -> list[str]:
     kept: list[str] = []
     cursor = 0
     for line in candidate:
-        text = _bounded_text(line, 2000)
+        if not isinstance(line, str) or len(line) > MAX_DECK_CHUNK_CHARS:
+            continue
+        text = " ".join(line.split())
         if not text:
             continue
         needle = normalize_for_compare(text)
@@ -110,6 +112,33 @@ def _ordered_source_lines(candidate: list[str], source: str) -> list[str]:
         kept.append(text)
         cursor = position + len(needle)
     return kept
+
+
+def _plan_covers_source(text: str, slides: list[OfficeSlide]) -> bool:
+    """Require every source line to survive the plan; partial decks fall back."""
+    rendered = normalize_for_compare(
+        "\n".join(
+            line
+            for slide in slides
+            for line in (slide.title, *slide.bullets)
+            if line.strip()
+        )
+    )
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or RULE_PATTERN.match(line):
+            continue
+        heading = HEADING_PATTERN.match(line)
+        if heading:
+            line = heading.group(2).strip()
+        else:
+            bullet = BULLET_PATTERN.match(line)
+            if bullet:
+                line = bullet.group(1).strip()
+        normalized = normalize_for_compare(line)
+        if normalized and normalized not in rendered:
+            return False
+    return True
 
 
 def _split_text_by_headings(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) -> list[str]:
@@ -140,6 +169,25 @@ def _split_text_by_headings(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) ->
     return [chunk for chunk in chunks if chunk.strip()]
 
 
+def _split_oversized_line(line: str, max_chars: int) -> list[str]:
+    """Split one long line at whitespace (or a hard boundary) without loss."""
+    if max_chars < 1:
+        raise ValueError("max_chars must be positive")
+    pieces: list[str] = []
+    remaining = line
+    while len(remaining) > max_chars:
+        cut = remaining.rfind(" ", 0, max_chars + 1)
+        if cut < max_chars // 2:
+            cut = max_chars
+        else:
+            cut += 1
+        pieces.append(remaining[:cut])
+        remaining = remaining[cut:]
+    if remaining:
+        pieces.append(remaining)
+    return pieces
+
+
 def _chunk_long_text(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) -> list[str]:
     """Split very long input into model-sized chunks for presentation planning.
 
@@ -164,7 +212,11 @@ def _chunk_long_text(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) -> list[s
             sub_stripped = sub_line.strip()
             if not sub_stripped:
                 continue
-            if not sub_chunks or len(sub_chunks[-1]) + len(sub_stripped) + 1 > max_chars:
+            if len(sub_stripped) > max_chars:
+                result.extend(sub_chunks)
+                sub_chunks = []
+                result.extend(_split_oversized_line(sub_stripped, max_chars))
+            elif not sub_chunks or len(sub_chunks[-1]) + len(sub_stripped) + 1 > max_chars:
                 sub_chunks.append(sub_stripped)
             else:
                 sub_chunks[-1] += "\n" + sub_stripped
@@ -175,17 +227,24 @@ def _chunk_long_text(text: str, max_chars: int = MAX_DECK_CHUNK_CHARS) -> list[s
 def _slide_sections(payload: dict) -> list[tuple[str, list[str]]]:
     """The ``(title, lines)`` pairs of a slide plan payload."""
     raw = payload.get("sections")
-    if not isinstance(raw, (list, tuple)):
+    if not isinstance(raw, (list, tuple)) or len(raw) > MAX_SECTIONS:
+        return []
+    if any(
+        isinstance(entry, dict)
+        and isinstance(entry.get("lines"), (list, tuple))
+        and len(entry["lines"]) > MAX_LINES_PER_SECTION
+        for entry in raw
+    ):
         return []
     sections: list[tuple[str, list[str]]] = []
-    for entry in raw[:MAX_SECTIONS]:
+    for entry in raw:
         if not isinstance(entry, dict):
             continue
         title = _bounded_text(entry.get("title"), MAX_SECTION_TITLE_CHARS)
         lines = entry.get("lines")
         if not isinstance(lines, (list, tuple)):
             lines = []
-        sections.append((title, [str(line) for line in lines[:MAX_LINES_PER_SECTION]]))
+        sections.append((title, [str(line) for line in lines]))
     return sections
 
 
@@ -193,19 +252,23 @@ def _table_payload(payload: dict) -> tuple[list[str], list[list[str]]]:
     """The ``(headers, rows)`` of a table payload."""
     raw_headers = payload.get("headers")
     headers: list[str] = []
-    if isinstance(raw_headers, (list, tuple)):
-        for value in raw_headers[:MAX_TABLE_COLUMNS]:
-            text = _bounded_text(value, MAX_HEADER_CHARS)
-            headers.append(text)
+    if not isinstance(raw_headers, (list, tuple)) or len(raw_headers) > MAX_TABLE_COLUMNS:
+        return [], []
+    for value in raw_headers:
+        if not isinstance(value, str) or len(value) > MAX_HEADER_CHARS:
+            return [], []
+        headers.append(_bounded_text(value, MAX_HEADER_CHARS))
     raw_rows = payload.get("rows")
     rows: list[list[str]] = []
-    if isinstance(raw_rows, (list, tuple)):
-        for row in raw_rows[:MAX_TABLE_ROWS]:
-            if isinstance(row, (list, tuple)):
-                cells = [_bounded_text(cell, 2000) for cell in row]
-            else:
-                cells = [_bounded_text(row, 2000)]
-            rows.append(cells)
+    if not isinstance(raw_rows, (list, tuple)) or len(raw_rows) > MAX_TABLE_ROWS:
+        return [], []
+    for row in raw_rows:
+        raw_cells = row if isinstance(row, (list, tuple)) else (row,)
+        if len(raw_cells) > MAX_TABLE_COLUMNS or any(
+            not isinstance(cell, str) or len(cell) > 2000 for cell in raw_cells
+        ):
+            return [], []
+        rows.append([_bounded_text(cell, 2000) for cell in raw_cells])
     return headers, rows
 
 
@@ -240,20 +303,26 @@ async def plan_deck(
                 session, settings, system=DECK_SYSTEM_PROMPT, user=user_prompt
             )
         except Exception as exc:
-            logger.warning("office deck planning chunk failed; skipping chunk: %s", exc)
+            logger.warning(
+                "office deck planning chunk failed; skipping chunk error=%s",
+                type(exc).__name__,
+            )
             return None
         sections = _slide_sections(payload)
         if not sections:
             return None
         proposed = sum(len(lines) for _title, lines in sections)
         chunk_slides: list[OfficeSlide] = []
+        source_key = normalize_for_compare(chunk_text)
         for title, lines in sections:
             kept = _ordered_source_lines(lines, chunk_text)
             if not kept:
                 continue
+            title_key = normalize_for_compare(title)
+            safe_title = title if title_key and title_key in source_key else "بخش"
             chunk_slides.append(
                 OfficeSlide(
-                    title=title or "بخش",
+                    title=safe_title,
                     bullets=tuple(kept),
                     notes="\n".join(kept),
                 )
@@ -267,7 +336,7 @@ async def plan_deck(
             > MAX_DROPPED_LINE_RATIO
         ):
             return None
-        return chunk_slides[:max_sections]
+        return chunk_slides if len(chunk_slides) <= max_sections else None
 
     # For very long messages or .txt / .markdown uploads, split at headings
     # so the model never receives more context than it can handle.
@@ -279,38 +348,35 @@ async def plan_deck(
         async with semaphore:
             return await _process_chunk(chunk_text)
 
-    # gather preserves chunk order, so the merged deck is unchanged.
-    for result in await asyncio.gather(*(_bounded(chunk) for chunk in chunks)):
-        if result is not None:
-            slides.extend(result)
+    # gather preserves chunk order. If any chunk failed validation, return None
+    # so the caller rebuilds from the complete source instead of a partial deck.
+    results = await asyncio.gather(*(_bounded(chunk) for chunk in chunks))
+    if any(result is None for result in results):
+        return None
+    for result in results:
+        slides.extend(result or ())
     if slides:
-        # Deduplicate by slide title, keeping the first occurrence's content.
-        seen_titles: set[str] = set()
-        unique_slides: list[OfficeSlide] = []
+        # Preserve chunk and source order. Only adjacent duplicate headings are
+        # combined; a later recurrence remains a separate section.
+        ordered: list[OfficeSlide] = []
         for slide in slides:
-            key = slide.title.strip().lower()
-            if key not in seen_titles:
-                seen_titles.add(key)
-                unique_slides.append(slide)
+            if ordered and ordered[-1].title == slide.title:
+                previous = ordered[-1]
+                ordered[-1] = OfficeSlide(
+                    title=previous.title,
+                    bullets=previous.bullets + slide.bullets,
+                    notes="\n".join(part for part in (previous.notes, slide.notes) if part),
+                )
             else:
-                # Merge bullets from duplicate slides rather than dropping them.
-                existing_index = next(
-                    i for i, s in enumerate(unique_slides) if s.title.strip().lower() == key
-                )
-                existing = unique_slides[existing_index]
-                merged_bullets = list(existing.bullets) + list(slide.bullets)
-                unique_slides[existing_index] = OfficeSlide(
-                    title=existing.title,
-                    bullets=tuple(merged_bullets),
-                    notes=existing.notes + "\n" + slide.notes,
-                )
-        slides = unique_slides[:max_sections]
-        return slides[:max_sections] if slides else None
+                ordered.append(slide)
+        if len(ordered) > max_sections:
+            return None
+        if not _plan_covers_source(text, ordered):
+            logger.warning("office deck plan dropped source lines; using the complete deterministic fallback")
+            return None
+        return ordered
 
-    # If chunking produced nothing, fall back to a single attempt with the
-    # full text (useful for medium-length inputs that don't need splitting).
-    full_result = await _process_chunk(text)
-    return full_result
+    return None
 
 
 async def infer_table(
@@ -341,7 +407,10 @@ async def infer_table(
             session, settings, system=TABLE_SYSTEM_PROMPT, user=user_prompt
         )
     except Exception as exc:
-        logger.warning("office table inference failed; using the plain sheet: %s", exc)
+        logger.warning(
+            "office table inference failed; using the plain sheet error=%s",
+            type(exc).__name__,
+        )
         return None
 
     headers, rows = _table_payload(payload)
@@ -350,6 +419,10 @@ async def infer_table(
         return None
 
     source = normalize_for_compare(text)
+    if any(normalize_for_compare(header) not in source for header in headers):
+        # A column label can change the meaning of a row just as an invented
+        # cell can; unsupported labels fall back to the plain source sheet.
+        return None
     width = len(headers)
     kept_rows: list[tuple[str, ...]] = []
     for row in rows:

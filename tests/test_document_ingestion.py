@@ -173,7 +173,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(card)
         text = card.edits[-1]["text"]
         self.assertIn("پیش‌نمایش متن", text)
-        self.assertIn("📥 دریافت فایل", [b.text for row in card.edits[-1]["buttons"] for b in row])
+        self.assertIn("📥 دریافت فایل اصلی", [b.text for row in card.edits[-1]["buttons"] for b in row])
 
     # ------------------------------------------------------------ generation
     async def test_flashcards_from_a_document_carry_source_locators(self):

@@ -31,6 +31,7 @@ Two rules run through the whole module:
 
 from __future__ import annotations
 
+import csv
 import io
 import logging
 import re
@@ -66,9 +67,19 @@ OFFICE_MODE_LABELS = {
 }
 
 #: Uploads the section accepts as *content* (a document, not a lecture).
-TEXT_FILE_EXTENSIONS = frozenset(
-    {".txt", ".text", ".csv", ".tsv", ".md", ".markdown", ".log"}
-)
+TEXT_FILE_EXTENSIONS = frozenset({".txt", ".md", ".markdown", ".csv", ".tsv"})
+
+#: Only MIME types that describe text are accepted for the corresponding
+#: extension. Empty/octet-stream MIME values are tolerated because Telegram
+#: clients sometimes omit a useful type; content signatures are checked after
+#: download before decoding.
+_TEXT_MIME_TYPES = {
+    ".txt": frozenset({"text/plain"}),
+    ".md": frozenset({"text/markdown", "text/plain"}),
+    ".markdown": frozenset({"text/markdown", "text/plain"}),
+    ".csv": frozenset({"text/csv", "application/csv", "text/plain"}),
+    ".tsv": frozenset({"text/tab-separated-values", "text/plain"}),
+}
 
 #: The title of a document that has no better one.
 DEFAULT_TITLE = "سند"
@@ -77,6 +88,7 @@ DEFAULT_TITLE = "سند"
 MAX_TABLE_ROWS = 2000
 MAX_TABLE_COLUMNS = 40
 MAX_SLIDES = 40
+MAX_OFFICE_SESSION_PARTS = 200
 #: Lines per slide when the text has no headings of its own.
 FALLBACK_LINES_PER_SLIDE = 6
 
@@ -131,13 +143,22 @@ class OfficeDocument:
 
     @property
     def tables(self) -> tuple[OfficeTable, ...]:
-        """Every table the user's own text already contains."""
+        """Every table the user's own text already contains, without truncation."""
         found: list[OfficeTable] = []
         for block in self.blocks:
             if not block.is_table or not block.rows:
                 continue
-            rows = block.rows[:MAX_TABLE_ROWS]
-            found.append(OfficeTable(headers=rows[0], rows=tuple(rows[1:])))
+            if len(block.rows) > MAX_TABLE_ROWS + 1:
+                raise OfficeError(
+                    f"جدول بیش از سقف مجاز {MAX_TABLE_ROWS} ردیف دارد؛ "
+                    "فایل را کوچک‌تر یا به چند بخش تقسیم کنید."
+                )
+            if len(block.rows[0]) > MAX_TABLE_COLUMNS:
+                raise OfficeError(
+                    f"جدول بیش از سقف مجاز {MAX_TABLE_COLUMNS} ستون دارد؛ "
+                    "فایل را کوچک‌تر کنید."
+                )
+            found.append(OfficeTable(headers=block.rows[0], rows=tuple(block.rows[1:])))
         return tuple(found)
 
     @property
@@ -178,9 +199,14 @@ class OfficeSession:
         return "\n".join(part for part in self.parts if part.strip())
 
     def add(self, content: str) -> None:
-        """Append one piece of content to the session."""
-        if content and content.strip():
-            self.parts.append(content)
+        """Append one piece of content without allowing an unbounded part list."""
+        if not content or not content.strip():
+            return
+        if len(self.parts) >= MAX_OFFICE_SESSION_PARTS:
+            raise OfficeError(
+                f"یک سند حداکثر {MAX_OFFICE_SESSION_PARTS} پیام یا فایل متنی می‌پذیرد."
+            )
+        self.parts.append(content)
 
 
 def detect_title(blocks: list[TextBlock], text: str) -> str:
@@ -207,10 +233,44 @@ def detect_title(blocks: list[TextBlock], text: str) -> str:
     return DEFAULT_TITLE
 
 
-def build_office_document(text: str, *, title: str = "") -> OfficeDocument:
-    """Parse the user's text into the document the renderers work on."""
-    cleaned = normalize_display(text or "")
-    blocks = parse_blocks(cleaned)
+def _csv_block(text: str, delimiter: str) -> list[TextBlock]:
+    """Parse an explicitly delimited file with Python's quoted-field parser."""
+    rows: list[tuple[str, ...]] = []
+    try:
+        for row in csv.reader(io.StringIO(text, newline=""), delimiter=delimiter, strict=True):
+            if not any(cell.strip() for cell in row):
+                continue
+            if len(row) > MAX_TABLE_COLUMNS:
+                raise OfficeError(
+                    f"جدول بیش از سقف مجاز {MAX_TABLE_COLUMNS} ستون دارد؛ فایل را کوچک‌تر کنید."
+                )
+            rows.append(tuple(row))
+            if len(rows) > MAX_TABLE_ROWS + 1:
+                raise OfficeError(
+                    f"جدول بیش از سقف مجاز {MAX_TABLE_ROWS} ردیف داده دارد؛ "
+                    "فایل را به چند بخش تقسیم کنید."
+                )
+    except csv.Error as exc:
+        raise OfficeError("ساختار فایل CSV/TSV معتبر نیست؛ نقل‌قول‌ها یا جداکننده‌ها را بررسی کنید.") from exc
+    if not rows:
+        return []
+    width = max(len(row) for row in rows)
+    padded = [row + ("",) * (width - len(row)) for row in rows]
+    if len(padded) == 1:
+        headers = tuple(f"ستون {to_persian_digits(index)}" for index in range(1, width + 1))
+        table_rows = [headers, padded[0]]
+    else:
+        table_rows = padded
+    return [TextBlock(kind="table", rows=tuple(table_rows))]
+
+
+def build_office_document(
+    text: str, *, title: str = "", delimiter: str | None = None
+) -> OfficeDocument:
+    """Parse user text; explicit CSV/TSV input keeps quoted commas intact."""
+    original = text or ""
+    cleaned = normalize_display(original)
+    blocks = _csv_block(original, delimiter) if delimiter in {",", "\t"} else parse_blocks(cleaned)
     resolved = (title or "").strip() or detect_title(blocks, cleaned)
     return OfficeDocument(title=resolved[:120], text=cleaned, blocks=tuple(blocks))
 
@@ -264,7 +324,7 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
             continue
         if block.kind == "table":
             for row in block.rows:
-                current_lines.append(" | ".join(cell for cell in row if cell))
+                current_lines.append(" | ".join(row))
             continue
         if block.text:
             current_lines.append(block.text)
@@ -295,26 +355,66 @@ def fallback_slides(document: OfficeDocument, *, max_slides: int = MAX_SLIDES) -
     if not slides:
         # No headings and no lines: one slide carrying the whole text.
         return [OfficeSlide(title=document.title or DEFAULT_TITLE, bullets=(), notes=document.text)]
+    if max_slides < 1:
+        raise OfficeError("حد مجاز اسلاید باید دست‌کم یک باشد.")
     if len(slides) > max_slides:
-        logger.warning(
-            "deck truncated slides=%d max_slides=%d; tail kept only in the source text",
-            len(slides),
-            max_slides,
+        raise OfficeError(
+            f"متن به {len(slides)} اسلاید محتوایی نیاز دارد؛ سقف بخش‌های محتوا "
+            f"{max_slides} است. متن را کوتاه‌تر یا OFFICE_MAX_SLIDES را بیشتر کنید."
         )
-    return slides[:max_slides]
+    return slides
 
 
 def fallback_table(document: OfficeDocument) -> OfficeTable:
-    """A one-column sheet built from the user's lines.
-
-    The fallback keeps the content: every line of the text becomes a row, so
-    an Excel file is always produced, even when the text was prose.
-    """
-    lines = document.lines
+    """A one-column sheet containing every nonempty source block in order."""
+    lines: list[str] = []
+    for block in document.blocks:
+        if block.kind == "table":
+            lines.extend(" | ".join(row) for row in block.rows if any(row))
+        elif block.text:
+            lines.append(block.text)
     if not lines:
         return OfficeTable(headers=("متن",), rows=())
-    rows = tuple((line,) for line in lines[:MAX_TABLE_ROWS])
+    if len(lines) > MAX_TABLE_ROWS:
+        raise OfficeError(
+            f"متن بیش از سقف مجاز {MAX_TABLE_ROWS} ردیف برای Excel دارد؛ "
+            "متن را به چند بخش تقسیم کنید."
+        )
+    rows = tuple((line,) for line in lines)
     return OfficeTable(headers=("متن",), rows=rows)
+
+
+def office_document_tables(document: OfficeDocument) -> list[OfficeTable]:
+    """Represent all document blocks as ordered Excel sheets, without dropping prose."""
+    tables: list[OfficeTable] = []
+    text_lines: list[str] = []
+
+    def flush_text() -> None:
+        if not text_lines:
+            return
+        if len(text_lines) > MAX_TABLE_ROWS:
+            raise OfficeError(
+                f"متن بیش از سقف مجاز {MAX_TABLE_ROWS} ردیف برای Excel دارد؛ "
+                "سند را به چند بخش تقسیم کنید."
+            )
+        tables.append(OfficeTable(("متن",), tuple((line,) for line in text_lines)))
+        text_lines.clear()
+
+    for block in document.blocks:
+        if block.kind != "table":
+            if block.text:
+                text_lines.append(block.text)
+            continue
+        flush_text()
+        if not block.rows:
+            continue
+        if len(block.rows) > MAX_TABLE_ROWS + 1 or len(block.rows[0]) > MAX_TABLE_COLUMNS:
+            raise OfficeError("جدول از سقف ردیف یا ستون Excel بیشتر است.")
+        tables.append(OfficeTable(block.rows[0], tuple(block.rows[1:])))
+    flush_text()
+    if not tables:
+        tables.append(fallback_table(document))
+    return tables
 
 
 # ---------------------------------------------------------------------------
@@ -408,26 +508,42 @@ def build_office_xlsx(document: OfficeDocument, tables: list[OfficeTable]) -> by
     header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
     body_alignment = Alignment(horizontal="right", vertical="center", wrap_text=True)
 
+    if len(tables) > 50:
+        raise OfficeError("سند بیش از ۵۰ جدول دارد؛ آن را به چند فایل تقسیم کنید.")
+
     taken: set[str] = set()
     for index, table in enumerate(tables):
+        if table.width > MAX_TABLE_COLUMNS or len(table.rows) > MAX_TABLE_ROWS:
+            raise OfficeError(
+                f"جدول از سقف {MAX_TABLE_COLUMNS} ستون یا {MAX_TABLE_ROWS} ردیف بیشتر است."
+            )
+        if not table.headers or any(len(row) > table.width for row in table.rows):
+            raise OfficeError("ساختار ستون‌های جدول Excel سازگار نیست؛ هیچ سلولی حذف نشد.")
         sheet = workbook.create_sheet(title=_sheet_name(document.title, index, taken))
         sheet.sheet_view.rightToLeft = True
         sheet.sheet_properties.tabColor = ACCENT_HEX
         width = max(1, table.width)
 
-        for column, label in enumerate(table.headers[:width], start=1):
+        for column, label in enumerate(table.headers, start=1):
             cell = sheet.cell(row=1, column=column, value=label)
+            if isinstance(label, str):
+                cell.data_type = "s"
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = header_alignment
             cell.border = border
         sheet.row_dimensions[1].height = 26
 
-        for row_index, row in enumerate(table.rows[:MAX_TABLE_ROWS], start=2):
+        for row_index, row in enumerate(table.rows, start=2):
             stripe = (row_index % 2) == 1
             for column in range(1, width + 1):
                 value = row[column - 1] if column - 1 < len(row) else ""
-                cell = sheet.cell(row=row_index, column=column, value=_cell_value(value))
+                safe_value = _cell_value(value)
+                cell = sheet.cell(row=row_index, column=column, value=safe_value)
+                if isinstance(safe_value, str):
+                    # User text, especially a leading '=', is stored as a
+                    # literal string and never as an executable formula.
+                    cell.data_type = "s"
                 cell.font = body_font
                 cell.alignment = body_alignment
                 cell.border = border
@@ -589,11 +705,16 @@ def build_office_pptx(
         raise OfficeError("کتابخانهٔ ساخت PowerPoint روی سرور نصب نیست.") from exc
 
     sections = list(slides)
-    if len(sections) > max_slides:
-        logger.warning(
-            "deck truncated at build slides=%d max_slides=%d", len(sections), max_slides
+    fixed_slides = 3  # title, agenda and closing
+    if max_slides < fixed_slides + 1:
+        raise OfficeError("سقف ارائه باید دست‌کم ۴ اسلاید باشد (عنوان، فهرست، محتوا و پایان).")
+    max_content_slides = max_slides - fixed_slides
+    if len(sections) > max_content_slides:
+        required = len(sections) + fixed_slides
+        raise OfficeError(
+            f"ارائه با اسلایدهای عنوان، فهرست و پایان به {required} اسلاید نیاز دارد؛ "
+            f"سقف فعلی {max_slides} است. متن را کوتاه‌تر یا OFFICE_MAX_SLIDES را بیشتر کنید."
         )
-        sections = sections[:max_slides]
     if not sections:
         sections = [OfficeSlide(title=document.title or DEFAULT_TITLE, bullets=())]
 
@@ -673,6 +794,43 @@ def build_office_pptx(
 #: Encodings an uploaded text file may use. UTF-8 first (with and without a
 #: BOM), then the Persian Windows encoding, then Latin-1 as a last resort.
 _TEXT_ENCODINGS = ("utf-8-sig", "utf-8", "cp1256", "latin-1")
+_BINARY_TEXT_SIGNATURES = (
+    b"%PDF-",
+    b"PK\x03\x04",
+    b"PK\x05\x06",
+    b"PK\x07\x08",
+    b"\xd0\xcf\x11\xe0",  # OLE compound document
+    b"\x89PNG\r\n\x1a\n",
+    b"\xff\xd8\xff",  # JPEG
+    b"GIF87a",
+    b"GIF89a",
+    b"RIFF",  # WAV/AVI/WebP containers
+    b"ID3",
+    b"\x1aE\xdf\xa3",  # Matroska/WebM
+    b"\x1f\x8b",  # gzip
+    b"Rar!\x1a\x07",
+    b"7z\xbc\xaf\x27\x1c",
+    b"\x7fELF",
+    b"MZ",  # Windows executable
+)
+
+
+def classify_text_file(filename: str | None, mime_type: str | None) -> str | None:
+    """Return an allowed text-file suffix, rejecting mismatched MIME metadata."""
+    if not filename:
+        return None
+    suffix = Path(filename).suffix.lower()
+    if suffix not in TEXT_FILE_EXTENSIONS:
+        return None
+    mime = (mime_type or "").split(";", 1)[0].strip().lower()
+    if mime in {"", "application/octet-stream", "binary/octet-stream"}:
+        return suffix
+    allowed = _TEXT_MIME_TYPES[suffix]
+    if suffix in {".csv", ".tsv"}:
+        allowed = allowed | frozenset({"application/vnd.ms-excel"})
+    if mime not in allowed:
+        raise OfficeError("نوع فایل با پسوند آن سازگار نیست؛ فایل متنی درست را دوباره بفرستید.")
+    return suffix
 
 
 def read_text_file(path: Path, *, max_bytes: int) -> str:
@@ -691,6 +849,18 @@ def read_text_file(path: Path, *, max_bytes: int) -> str:
             f"حجم فایل بیش از حد مجاز است (حداکثر {max_bytes // 1024} کیلوبایت)."
         )
     payload = path.read_bytes()
+    if payload.startswith(_BINARY_TEXT_SIGNATURES):
+        raise OfficeError("این فایل محتوای متنی نیست؛ فایل متنی یا CSV/TSV معتبر بفرستید.")
+    if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            decoded = payload.decode("utf-16")
+        except UnicodeDecodeError as exc:
+            raise OfficeError("کدگذاری فایل متنی معتبر نیست.") from exc
+        if "\x00" in decoded:
+            raise OfficeError("فایل دارای محتوای دودویی است و به‌عنوان متن پذیرفته نمی‌شود.")
+        return decoded
+    if b"\x00" in payload:
+        raise OfficeError("فایل دارای محتوای دودویی است و به‌عنوان متن پذیرفته نمی‌شود.")
     for encoding in _TEXT_ENCODINGS:
         try:
             return payload.decode(encoding)

@@ -27,10 +27,12 @@
 
 ## Data sent to providers
 
-Audio is sent to the configured STT provider. The transcript may be sent to the configured note
-provider. Review each provider's retention and privacy terms before enabling it. The raw transcript
-is delivered before note generation; once delivered, its transcription charge stands even if the
-booklet later fails.
+Audio is sent to the configured STT provider. Lecture transcripts, document notes and optional
+Office AI planning are sent only to the existing configured note-provider routes. Office never starts
+STT/transcription. Review each provider's retention and privacy terms before enabling it. The raw
+transcript is delivered before lecture note generation; once delivered, its transcription charge
+stands even if the booklet later fails. Free Office/document-note operations themselves have no user
+wallet or free-use charge; configured provider use may still incur operator-side costs.
 
 The database stores submissions, transcripts, notes, billing, audit records, extracted booklet and
 uploaded-document text, and the Telegram chat/message references used by each user's library;
@@ -38,8 +40,13 @@ generated files themselves stay in Telegram. `LIBRARY_MAX_ITEMS` bounds normal r
 per user, except sources protected by active quizzes. It does **not** bound the separate document
 text cache: uploaded-document extracts currently have no automatic retention or self-service delete
 policy, even if their library mirror is pruned. Plan disk and privacy procedures accordingly.
-No Free Office request session is wired into the bot. Transcript retention is configurable in
-`.env` (see [Operations](OPERATIONS.md)); it does not delete cached document text.
+Free Office drafts are held only in the bot process's memory, keyed by the private Telegram user id,
+limited to 128 concurrent users/200 parts each, and swept after `OFFICE_SESSION_TTL_MINUTES` (default
+30 minutes), on navigation and at shutdown. Temporary source/output files live under the private
+`TEMP_DIR` and are removed in `finally`; Office code does not log document text or contents. The
+existing extracted-document text is cached in SQLite and currently has no automatic retention or
+self-service deletion policy; transcript retention is separate and configurable in `.env` (see
+[Operations](OPERATIONS.md)).
 
 ## Report a vulnerability
 

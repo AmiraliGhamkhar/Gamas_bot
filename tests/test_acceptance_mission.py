@@ -407,6 +407,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
             [
                 "📚 کتابخانه من",
                 "🛒 خرید اشتراک",
+                "🗂 دفتر آزاد",
                 "🏆 لیدربورد",
                 "🎧 پشتیبانی",
                 "ℹ️ راهنما",
@@ -414,7 +415,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             payloads,
-            {b"library", b"wallet", b"support", b"help", b"board"},
+            {b"library", b"wallet", b"support", b"help", b"board", b"office:start"},
         )
 
         admin_labels = [button.text for row in self.bot._admin_menu() for button in row]

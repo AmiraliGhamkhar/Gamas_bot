@@ -53,13 +53,28 @@ PRESENTATION_MAX_CLIPS=50
 PRESENTATION_MAX_TOTAL_DURATION=7200
 PRESENTATION_MAX_UNPACKED_BYTES=134217728
 PRESENTATION_MAX_TEMP_BYTES=268435456
+# Free Office: small, bounded, and independent of wallet billing.
+OFFICE_ENABLED=true
+OFFICE_MAX_INPUT_BYTES=1000000
+OFFICE_MAX_CHARS=100000
+OFFICE_MAX_SLIDES=30
+OFFICE_SESSION_TTL_MINUTES=30
+OFFICE_JOB_CONCURRENCY=2
+OFFICE_AI_CONCURRENCY=3
+OFFICE_MIN_INTERVAL_SECONDS=10
 ```
 
 These are conservative application ceilings, not a guarantee that every cPanel plan can hold a
 128 MiB upload plus its working copies. Reduce `MAX_FILE_SIZE` and the presentation limits if your
 quota is smaller; keep a positive `TEMP_MIN_FREE_BYTES` reserve. There are no worker processes or
 external queue services: Telegram, provider HTTP, extraction, and media subprocesses remain subject
-to the host's CPU, process, network, disk-I/O, and runtime limits.
+to the host's CPU, process, network, disk-I/O, and runtime limits. Free Office creates no worker
+process or external service; it uses a bounded asyncio semaphore and private temporary files under
+`TEMP_DIR`. It works without note-provider credentials by using deterministic, source-safe fallbacks.
+A configured provider may incur operator-side API costs, but Office does not debit users. The document
+source limit for note/export actions is 250,000 characters; larger extracted documents remain in the
+library and are never silently shortened. PowerPoint narration/audio remains a separate explicit
+button and is not started by document upload.
 
 ## 3. Test before going live
 
@@ -105,8 +120,10 @@ python -m gamas_bot --check
 
 Re-enable the cron job; it starts the bot within a minute.
 
-Database migrations run at startup. Never run an older version against a migrated database. The
-cron job restarts the bot within a minute.
+Database migrations run at startup. Migration 016 rebuilds only the existing library table to allow
+Office message references and preserves item ids, rows and content; still take a SQLite-aware backup
+before upgrading. Never run an older version against a migrated database. The cron job restarts the
+bot within a minute.
 
 ## 6. Back up
 
@@ -168,22 +185,32 @@ tail -n 80 data/logs/bot.log
 
 Smoke test after the first start (use an admin account and a small test order):
 
-1. `/start` shows the one-tap lecture guide and five user buttons: «📚 کتابخانه من»,
-   «🛒 خرید اشتراک», «🏆 لیدربورد», «🎧 پشتیبانی» and «ℹ️ راهنما» (admins also see «🛠 پنل مدیریت»). No mode button is
-   required before sending a test audio file; verify the transcript arrives before the Word booklet
-   and that both Telegram documents appear in the library.
-2. Open a library item and verify the bot forwards the saved Telegram message. A definitively deleted
+1. `/start` shows the lecture guide and the **🗂 دفتر آزاد** button when `OFFICE_ENABLED=true`,
+   alongside Library, Wallet, Leaderboard, Support and Help (admins also see their separate panel).
+   No mode button is required before sending a test audio file; verify the transcript arrives before
+   the Word booklet and both Telegram documents appear in the library.
+2. Open Free Office and paste a short Persian message; build Word, Excel, PowerPoint and PDF in turn.
+   Check that the files open, the PDF text can be selected/copied, the Excel text remains literal,
+   each Telegram file is in the user's library, and wallet/free-use balances are unchanged. Repeat
+   with a `.csv` containing a quoted comma and a formula-looking value. Cancel an unexported draft
+   and verify it is not reused; leave a draft idle and confirm it expires after the configured TTL.
+3. Upload a text PDF, DOCX and PPTX. Confirm the original remains downloadable, page/section/slide
+   locators survive into note outputs, full and compact notes differ, both are available as Word and
+   PDF, and return-to-library works. A PPTX must not start audio/STT until the explicit audio button
+   is pressed. A scanned PDF must be refused with no OCR claim. Repeat Office/document-note actions
+   with no note provider configured; deterministic fallback should still produce safe files.
+4. Open a library item and verify the bot forwards the saved Telegram message. A definitively deleted
    source should show «این فایل دیگر در دسترس نیست.»; temporary Telegram errors remain retryable.
    A successful retry also clears a stale unavailable flag from earlier versions.
-3. Create a ticket from «🎧 پشتیبانی», filter it under «🎧 مدیریت پشتیبانی» (`📂 جدید` + category),
+5. Create a ticket from «🎧 پشتیبانی», filter it under «🎧 مدیریت پشتیبانی» (`📂 جدید` + category),
    and reply to it. Confirm both notifications and that the history remains after `/start` and restart.
-4. Open «🛒 خرید اشتراک»: confirm plan options come first, then balance and recent payments on the same screen. Create
+6. Open «🛒 خرید اشتراک»: confirm plan options come first, then balance and recent payments on the same screen. Create
    an order, send a receipt directly (photo or PNG/JPEG/WebP file), and open it from the wallet or
    `payopen`. The first approval tap must only show confirmation; «✅ تأیید نهایی» activates credit
    once. Reject another test order and verify its reason reaches the user without granting credit.
-5. Tap the stale approval button again and confirm the balance and payment-linked ledger credit do
+7. Tap the stale approval button again and confirm the balance and payment-linked ledger credit do
    not change. Check approved/rejected status in the wallet after a restart.
-6. Reply from both sides of a ticket, close and reopen it, and confirm the earlier messages remain.
+8. Reply from both sides of a ticket, close and reopen it, and confirm the earlier messages remain.
    If Telegram is temporarily unavailable, confirm the stored history is still intact after recovery.
 
 **Rollback.** Pause cron and stop the bot. Set `BACKUP_DIR` to the actual pre-upgrade directory,

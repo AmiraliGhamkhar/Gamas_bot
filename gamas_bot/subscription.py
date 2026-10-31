@@ -219,10 +219,12 @@ class SubscriptionService:
             if isinstance(data, dict):
                 parameters = data.get("parameters") or {}
                 if isinstance(parameters, dict):
-                    try:
-                        retry_after = float(parameters.get("retry_after"))
-                    except (TypeError, ValueError):
-                        retry_after = None
+                    raw_retry_after = parameters.get("retry_after")
+                    if raw_retry_after is not None:
+                        try:
+                            retry_after = float(raw_retry_after)
+                        except (TypeError, ValueError):
+                            retry_after = None
             raise SubscriptionApiError(code, description, retry_after)
         result = data.get("result")
         if not isinstance(result, dict):

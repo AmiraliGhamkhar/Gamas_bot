@@ -1,13 +1,11 @@
 # Gamas Bot
 
 Persian Telegram study assistant. Send lecture audio/video for transcription and an RTL Word
-booklet, or send PDF, Word or PowerPoint documents to extract study text. Saved material is available
-in the personal library. PowerPoint uploads first show their extracted text; narrated-presentation
-processing remains available from the document card. The «🛒 خرید اشتراک» screen contains plans,
-balance and recent payments.
-
-The former Free Office bot UI is retired. Its standalone export modules remain available to code
-and their offline tests, but text-to-document jobs are no longer accepted by the bot.
+booklet, send PDF/Word/PowerPoint documents for text extraction and study notes, or open «🗂 دفتر
+آزاد» to turn messages and `.txt`, `.md`, `.markdown`, `.csv`, `.tsv` files into real Word, Excel,
+PowerPoint and selectable-text PDF files. Free Office and document-note actions do not consume wallet
+credit or the existing free quiz/flashcard uses. Saved outputs and source references are available in
+the personal library; PowerPoint narration remains a separate explicit action on the source card.
 
 Runs on Windows for local use and on Linux cPanel shared hosting for production.
 
@@ -17,7 +15,8 @@ Runs on Windows for local use and on Linux cPanel shared hosting for production.
 - Telegram API credentials and bot token from [my.telegram.org](https://my.telegram.org) and
   [@BotFather](https://t.me/BotFather).
 - At least one STT key (Deepgram, Speechmatics, or an OpenAI-compatible endpoint). Note-provider
-  keys are optional; without them the bot delivers transcripts only.
+  keys are optional: without them audio still delivers transcripts, while Free Office and document
+  notes use deterministic, source-preserving fallbacks.
 
 No system `ffmpeg`, `soffice`, Redis, Docker or external database is needed.
 
@@ -60,8 +59,9 @@ kill long processes; run one active worker and test the host before relying on i
 
 ## User flow
 
-- `/start` explains the one-action flow and shows 📚 Library, 💳 Wallet, 🏆 Leaderboard,
-  🎧 Support and ℹ️ Help (admins also see their separate admin panel).
+- `/start` explains the lecture flow and shows 📚 Library, 💳 Wallet, 🗂 Free Office,
+  🏆 Leaderboard, 🎧 Support and ℹ️ Help (admins also see their separate admin panel). The Office
+  button is hidden when `OFFICE_ENABLED=false`.
 - Send audio, video or a Telegram voice/video note. The bot delivers the transcript first, then the
   RTL Word booklet when note generation is configured. After sending a presentation, select
   «🎧 پردازش صدای ارائه» on its document card to run the existing presentation/audio pipeline.
@@ -70,14 +70,27 @@ kill long processes; run one active worker and test the host before relying on i
 - The Wallet combines remaining balance, plan purchase and recent payment history. Card-to-card
   receipts remain subject to administrator review.
 - Send a study document (PDF, Word `.docx`, PowerPoint) to extract its text instead of transcribing
-  it: the bot stores the extraction in the library under **📄 اسناد**, shows a short preview, and
-  offers **🃏 ساخت فلش‌کارت** / **❓ ساخت سؤالات** from exactly that file. PDF pages, Word sections
-  and PowerPoint slides retain their locators. Re-uploading an identical file reuses the cached
-  extraction per user (SHA-256) and refreshes its Telegram message reference. Files up to
-  `DOC_MAX_BYTES` (default 50 MB) are accepted, with a separate 5,000,000-character extracted-text
-  limit; extracted text is stored in SQLite. The document cache has no automatic retention or
-  self-service deletion yet. Legacy `.ppt` uses the existing converter; for unsupported `.doc`, save
-  as `.docx` and resend. A textless presentation can still offer explicit audio processing.
+  it: the bot stores the extraction in the library under **📄 اسناد**, shows a preview, and offers a
+  complete source-grounded booklet, distinct compact revision notes, Word/PDF exports from the full
+  extracted text, the original-file download, plus the existing **🃏 فلش‌کارت** / **❓ سؤالات**.
+  PDF page, Word section and PowerPoint slide locators are retained in cached chunks and note
+  outputs. Original files remain in Telegram and are never overwritten. Re-uploading an identical
+  file reuses the cached extraction per user (SHA-256) and refreshes its Telegram reference. Files up
+  to `DOC_MAX_BYTES` (default 50 MB) are accepted, with a separate 5,000,000-character extraction
+  limit; Office note/export work refuses oversized source text rather than silently truncating it.
+  `.ppt` uses the existing converter; for unsupported `.doc`, save as `.docx` and resend. Scanned
+  PDFs are refused; no OCR is performed. PowerPoint narration/audio is separate and starts only when
+  its explicit button is pressed.
+- **🗂 Free Office** accepts pasted text/messages or `.txt`, `.md`, `.markdown`, `.csv` and `.tsv`
+  files and creates real `.docx`, `.xlsx`, `.pptx` or selectable-text `.pdf` outputs. The default
+  per-draft limit is 100,000 characters, uploaded text files are limited to 1,000,000 bytes, and
+  office-like table/slide limits reject overflow instead of trimming content. Excel stores user text
+  as literal strings (including formula-looking cells); it does not calculate formulas. Generated
+  PowerPoint is a new deck from text, not a pixel-perfect conversion of an arbitrary source deck.
+  `OFFICE_ENABLED` defaults to `true`; see [Free Office](docs/OFFICE.md) for limits and behavior.
+  With no note provider, Office still works using deterministic extractive notes and a basic
+  source-grounded booklet. Configured provider calls may incur operator-side API costs, but users are
+  never charged wallet credit or free quiz/flashcard allowances for Office.
 - Quizzes and AI flashcard decks offer «⚡ سریع» (10 cards / 5 questions), «⭐ استاندارد» (20/10)
   and «🎯 کامل» (40/20). Source-anchored items are generated in parallel chunks with live progress,
   then shown for review and deletion before saving. Incomplete coverage and shortfalls are reported.
@@ -90,15 +103,17 @@ kill long processes; run one active worker and test the host before relying on i
 
 - Audio, video and Telegram voice/video notes → transcript, then notes/booklet when a note provider
   is configured. `.pptx` / legacy `.ppt` → document extraction first; narrated presentation
-  processing is optional from the document card. Without a note provider, audio yields transcript only.
+  processing is optional from the document card. Without a note provider, audio yields transcript only,
+  while document notes and Free Office use bounded deterministic fallbacks.
 - STT: Deepgram, Speechmatics, OpenAI-compatible.
 - Notes: Gemini, NaraRouter, OpenRouter, Groq, Cerebras, Anthropic, OpenAI-compatible.
 - SQLite billing ledger with card-to-card purchases reviewed by an admin.
 
 OCR for images and scanned PDFs is **not** supported: a PDF that yields less than ~10 characters per
-page is refused with a Persian explanation instead of storing an empty document. The former Free Office bot UI is retired;
-plain text and text-file submissions no longer start document jobs. `OFFICE_ENABLED` defaults to
-`false`; the pure export modules remain in the repository for reuse and testing.
+page is refused with a Persian explanation instead of storing an empty document. Free Office is an
+explicit menu workflow (`OFFICE_ENABLED=true` by default); plain text is collected only after a user
+starts that workflow. Its temporary text drafts expire after `OFFICE_SESSION_TTL_MINUTES` and are
+cleared on cancel, navigation or shutdown.
 
 ## Documentation
 

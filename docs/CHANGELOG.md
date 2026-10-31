@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased — Free Office restoration
+
+- Restored the optional **🗂 دفتر آزاد** menu and private, owner-scoped message/text-file drafts for
+  `.txt`, `.md`, `.markdown`, `.csv` and `.tsv`; generated files use the existing RTL Word/Excel/
+  PowerPoint/PDF builders and library references. `OFFICE_ENABLED` is `true` by default.
+- Reconnected uploaded PDF/DOCX/PPTX cards to full source-grounded booklets, separate compact
+  revision notes, all-text exports, original download and library navigation. Full and compact notes
+  offer both Word and selectable-text PDF. PowerPoint audio remains explicit and separate.
+- Added strict source-completeness fallback for planned decks, lossless source limits, formula-like
+  XLSX cells stored as text, private draft expiry, bounded Office work and a library migration that
+  preserves existing rows. Free Office/document-note operations do not write billing or free-use
+  state; deterministic fallbacks remain available with no note provider.
+- Updated README and Office/architecture/configuration/cPanel/testing/security documentation and
+  added end-to-end Office flow and CSV formula-injection regression coverage.
+
 ## Unreleased — workflow re-audit
 
 - Migration 015 records paid quiz/deck operations atomically with their debits. Artifact save

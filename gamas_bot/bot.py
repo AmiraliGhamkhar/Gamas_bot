@@ -66,6 +66,7 @@ from .fileio import (
     run_file_io_resource,
 )
 from .docx_export import (
+    OFFICE_HEADING_OFFSET,
     DocumentMeta,
     build_notes_docx,
     build_plain_docx,
@@ -132,7 +133,30 @@ from .notes import (
     structure_presentation,
     structure_transcript,
 )
-from .office import OfficeError
+from .office import (
+    OFFICE_FORMATS,
+    FORMAT_LABELS,
+    OfficeError,
+    OfficeSession,
+    build_office_document,
+    build_office_pptx,
+    build_office_xlsx,
+    classify_text_file,
+    fallback_slides,
+    office_document_tables,
+    office_filename,
+    office_title_from_filename,
+    read_text_file,
+)
+from .office_ai import MAX_DECK_CHUNK_CHARS, infer_table, plan_deck
+from .office_notes import (
+    MAX_OFFICE_NOTE_SOURCE_CHARS,
+    generate_compact_notes,
+    generate_full_booklet,
+    office_source_chunks,
+)
+from .notes import StructuringError
+from .pdf_export import build_office_pdf
 from .presentations import (
     PresentationError,
     align_narration_to_slides,
@@ -152,11 +176,14 @@ from .stt import (
 from .subscription import SUBSCRIPTION_PREFIX, SubscriptionService
 from .telegram_text import button_label, render_pages, split_message
 from .transcript import build_document, render as render_transcript
-from .textnorm import normalize_display
+from .textnorm import normalize_display, normalize_for_compare
 
 logger = logging.getLogger(__name__)
 
-
+#: At most this many in-memory Office drafts can await a user choice.
+MAX_OFFICE_SESSIONS = 128
+#: Generated files are kept comfortably below Telegram's deployment limits.
+MAX_OFFICE_OUTPUT_BYTES = 50 * 1024 * 1024
 def _max_mtproto_part_size_kb(file_size: int) -> int:
     """Return 512 KiB (MTProto's maximum part size) for all positive file sizes.
 
@@ -953,6 +980,16 @@ def _document_metadata(message) -> tuple[str | None, str | None]:
     return source_type, filename
 
 
+def _text_file_metadata(message) -> tuple[str | None, str | None]:
+    """Return an allowed Free Office text suffix and original filename."""
+    if message.document is None or message.voice or message.audio:
+        return None, None
+    filename = getattr(message.file, "name", None)
+    mime_type = getattr(message.file, "mime_type", None)
+    suffix = classify_text_file(filename, mime_type)
+    return (suffix, filename) if suffix is not None else (None, filename)
+
+
 def _is_unsupported_attachment(message) -> bool:
     """True for a real file the bot cannot use — never for links or text."""
     media = getattr(message, "media", None)
@@ -1022,6 +1059,12 @@ class GamasBot:
         self._document_locks: weakref.WeakValueDictionary[tuple[int, str], asyncio.Lock] = (
             weakref.WeakValueDictionary()
         )
+        self._office_semaphore = asyncio.Semaphore(max(1, settings.office_job_concurrency))
+        self._office_sessions: dict[int, OfficeSession] = {}
+        self._office_in_flight: set[int] = set()
+        self._office_tasks: set[asyncio.Task[Any]] = set()
+        self._office_last_use: dict[int, float] = {}
+        self._office_session_cleanup_task: asyncio.Task | None = None
         self._upload_semaphore = asyncio.Semaphore(settings.max_concurrent_uploads)
         self._seen_messages: dict[tuple[int, int], float] = {}
         self._active_upload_keys: dict[tuple[int, str], str] = {}
@@ -1120,6 +1163,10 @@ class GamasBot:
         self._transcript_cleanup_task = asyncio.create_task(
             self._transcript_cleanup_loop()
         )
+        if self.settings.office_enabled:
+            self._office_session_cleanup_task = asyncio.create_task(
+                self._office_session_cleanup_loop()
+            )
         await self.client.start(bot_token=self.settings.bot_token)
         logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
         # Verify (once, offline-safe) that the bot can actually check channel
@@ -1176,6 +1223,16 @@ class GamasBot:
             task.cancel()
         if learning:
             await asyncio.gather(*learning, return_exceptions=True)
+        # Free Office has no billing state to compensate. Stop its bounded
+        # generation/delivery tasks while SQLite and the shared HTTP session
+        # are still open so each operation can remove its private temp files.
+        office = [task for task in self._office_tasks if task is not current and not task.done()]
+        for task in office:
+            task.cancel()
+        if office:
+            await asyncio.gather(*office, return_exceptions=True)
+        self._office_sessions.clear()
+        self._office_last_use.clear()
         # An unsaved preview is not a delivery. Refund it before closing SQLite;
         # startup recovery also compensates interrupted free and paid claims.
         timers = list(self._curation_tasks.values())
@@ -1195,6 +1252,7 @@ class GamasBot:
                 self._transcript_cleanup_task,
                 self._receipt_cleanup_task,
                 self._prewarm_task,
+                self._office_session_cleanup_task,
             )
             if task is not None
         ]
@@ -1208,6 +1266,7 @@ class GamasBot:
         self._transcript_cleanup_task = None
         self._receipt_cleanup_task = None
         self._prewarm_task = None
+        self._office_session_cleanup_task = None
 
         async def _fail_queued(job) -> None:
             # Audit F-H04: queued jobs never reached a worker; mark them failed
@@ -1356,16 +1415,19 @@ class GamasBot:
 
     # ----------------------------------------------------------------- menus
     def _user_menu(self, *, is_admin: bool = False) -> list:
-        """The user panel's two value loops: saved artifacts and account credit.
-
-        Admins get one extra row to their separate panel; every other user sees
-        this same four-button menu, regardless of provider configuration.
-        """
+        """The user panel: library, wallet, optional free Office, support and help."""
         rows = [
             [Button.inline("📚 کتابخانه من", b"library"), Button.inline("🛒 خرید اشتراک", b"wallet")],
-            [Button.inline("🏆 لیدربورد", b"board"), Button.inline("🎧 پشتیبانی", b"support")],
-            [Button.inline("ℹ️ راهنما", b"help")],
         ]
+        if self.settings.office_enabled:
+            rows.append(
+                [Button.inline("🗂 دفتر آزاد", b"office:start"), Button.inline("🏆 لیدربورد", b"board")]
+            )
+        else:
+            rows.append([Button.inline("🏆 لیدربورد", b"board")])
+        rows.append(
+            [Button.inline("🎧 پشتیبانی", b"support"), Button.inline("ℹ️ راهنما", b"help")]
+        )
         if is_admin:
             rows.append([Button.inline("🛠 پنل مدیریت", b"adm:home")])
         return rows
@@ -1405,11 +1467,20 @@ class GamasBot:
         ):
             logger.info("free plan granted")
         greeting = "🎓 به گاماس خوش آمدید" if first_start else "منوی اصلی"
-        upload_line = "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت."
+        upload_lines = [
+            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت."
+        ]
+        if self.settings.office_enabled:
+            upload_lines.append(
+                "🗂 دفتر آزاد: پیام یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار."
+            )
         if self.settings.note_configured:
             delivery = "متن گفتار و جزوهٔ ورد یا متن سند در «📚 کتابخانه من» ذخیره می‌شود."
         else:
-            delivery = "متن گفتار و سند ذخیره می‌شود؛ ساخت محتوای هوشمند فعلاً فعال نیست."
+            delivery = "متن گفتار و سند ذخیره می‌شود."
+            if self.settings.office_enabled:
+                delivery += " دفتر آزاد حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند."
+        upload_line = "\n".join(upload_lines)
         text = (
             f"{greeting}\n\n"
             f"{upload_line}\n{delivery}\n\n"
@@ -1736,26 +1807,720 @@ class GamasBot:
             f"📄 {document.get('title') or 'سند'}",
             f"نوع: {label} | {to_persian_digits(int(document.get('page_count') or 0))} {unit}",
             f"متن استخراج‌شده: {to_persian_digits(len(str(document.get('text') or '')))} نویسه",
-            "",
-            "پیش‌نمایش متن:",
-            preview_text(str(document.get("text") or "")),
         ]
+        if self.settings.office_enabled:
+            lines.append("جزوه، مرور سریع و خروجی‌های Office رایگان‌اند و از اعتبار کم نمی‌کنند.")
+        if document.get("source_type") == "pptx":
+            lines.append("پردازش صدای ارائه عملیات جداگانه‌ای است و فقط با انتخاب دکمهٔ صوت آغاز می‌شود.")
+        lines.extend(("", "پیش‌نمایش متن:", preview_text(str(document.get("text") or ""))))
         return "\n".join(lines)
 
     def _document_buttons(self, document_id: int, source_type: str = "") -> list[list]:
-        buttons = [
+        buttons: list[list] = []
+        if self.settings.office_enabled:
+            buttons.extend(
+                [
+                    [
+                        Button.inline("📘 جزوهٔ کامل — Word + PDF", f"doc:note:{document_id}:full".encode("ascii")),
+                        Button.inline("⚡ مرور سریع — Word + PDF", f"doc:note:{document_id}:compact".encode("ascii")),
+                    ],
+                    [Button.inline("📦 خروجی از متن استخراج‌شده", f"doc:export:{document_id}".encode("ascii"))],
+                ]
+            )
+        buttons.extend(
             [
-                Button.inline(DOC_GENERATE_CARDS, f"doc:fc:{document_id}".encode("ascii")),
-                Button.inline(DOC_GENERATE_QUESTIONS, f"doc:quiz:{document_id}".encode("ascii")),
-            ],
-            [Button.inline("📥 دریافت فایل", f"doc:f:{document_id}".encode("ascii"))],
-        ]
+                [
+                    Button.inline(DOC_GENERATE_CARDS, f"doc:fc:{document_id}".encode("ascii")),
+                    Button.inline(DOC_GENERATE_QUESTIONS, f"doc:quiz:{document_id}".encode("ascii")),
+                ],
+                [Button.inline("📥 دریافت فایل اصلی", f"doc:f:{document_id}".encode("ascii"))],
+            ]
+        )
         if source_type == "pptx":
             buttons.append([Button.inline(
                 "🎧 پردازش صدای ارائه", f"doc:lecture:{document_id}".encode("ascii")
             )])
         buttons.append([Button.inline("📚 کتابخانه", b"lib:docs:0")])
         return buttons
+
+    def _office_sweep_sessions(self, now: float | None = None) -> None:
+        """Erase expired in-memory drafts on use and on the periodic sweeper."""
+        current = time.monotonic() if now is None else now
+        ttl = max(1, int(self.settings.office_session_ttl_minutes)) * 60
+        for owner, session in list(self._office_sessions.items()):
+            if current - float(session.updated_at or 0.0) > ttl:
+                self._office_sessions.pop(owner, None)
+
+    def _office_get_session(self, user_id: int) -> OfficeSession | None:
+        """Return a live in-memory Office draft and sweep expired drafts."""
+        self._office_sweep_sessions()
+        return self._office_sessions.get(int(user_id))
+
+    async def _office_session_cleanup_loop(self) -> None:
+        """Periodically erase abandoned drafts even when users never return."""
+        while True:
+            await asyncio.sleep(30)
+            self._office_sweep_sessions()
+
+    def _office_new_session(self, user_id: int, message=None) -> OfficeSession | None:
+        """Create an owner-scoped draft, refusing an unbounded session map."""
+        existing = self._office_get_session(user_id)
+        if existing is not None:
+            return existing
+        if len(self._office_sessions) >= MAX_OFFICE_SESSIONS:
+            return None
+        session = OfficeSession(message=message, updated_at=time.monotonic())
+        self._office_sessions[int(user_id)] = session
+        return session
+
+    @staticmethod
+    def _office_session_keyboard() -> list[list]:
+        return [
+            [
+                Button.inline("➕ افزودن پیام", b"office:continue"),
+                Button.inline("📦 انتخاب خروجی", b"office:formats"),
+            ],
+            [Button.inline("❌ پایان و پاک‌کردن متن", b"office:cancel")],
+        ]
+
+    @staticmethod
+    def _office_format_keyboard() -> list[list]:
+        return [
+            [
+                Button.inline("📝 Word", b"office:fmt:word"),
+                Button.inline("📊 Excel", b"office:fmt:excel"),
+            ],
+            [
+                Button.inline("📖 PowerPoint", b"office:fmt:ppt"),
+                Button.inline("📕 PDF", b"office:fmt:pdf"),
+            ],
+            [Button.inline("↩️ افزودن متن", b"office:continue")],
+            [Button.inline("❌ پایان و پاک‌کردن متن", b"office:cancel")],
+        ]
+
+    def _office_add_source(
+        self,
+        session: OfficeSession,
+        content: str,
+        *,
+        filename: str | None = None,
+        message=None,
+    ) -> None:
+        """Append one bounded text part without silently trimming its content."""
+        if not content or not content.strip():
+            raise OfficeError("متن خالی است؛ پیام یا فایل متنی دیگری بفرستید.")
+        existing = session.text
+        added_chars = len(content) + (1 if existing else 0)
+        limit = int(self.settings.office_max_chars)
+        if len(existing) + added_chars > limit:
+            raise OfficeError(
+                f"حجم متن از سقف {to_persian_digits(limit)} نویسه بیشتر می‌شود؛ "
+                "متن را به چند سند کوچک‌تر تقسیم کنید. هیچ بخشی حذف نشده است."
+            )
+        session.add(content)
+        if filename and not session.filename and not existing:
+            safe_name = Path(filename).name[:255]
+            session.filename = safe_name
+            session.title = session.title or office_title_from_filename(safe_name)
+        if message is not None:
+            session.message = message
+        session.updated_at = time.monotonic()
+
+    async def _office_start(self, event, user_id: int) -> None:
+        if not self.settings.office_enabled:
+            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            return
+        session = self._office_new_session(user_id, getattr(event, "message", None))
+        if session is None:
+            await self._ack(event, "دفتر آزاد مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.", alert=True)
+            return
+        session.updated_at = time.monotonic()
+        await self._edit_or_reply(
+            event,
+            "🗂 دفتر آزاد — رایگان\n\n"
+            "متن را اینجا بچسبانید یا چند پیام بفرستید؛ فایل‌های .txt، .md، .markdown، .csv و .tsv هم پذیرفته می‌شوند.\n"
+            f"سقف هر سند {to_persian_digits(self.settings.office_max_chars)} نویسه است.\n"
+            "پس از پایان، قالب Word، Excel، PowerPoint یا PDF را انتخاب کنید. "
+            "هر خروجی جداگانه قابل ساخت است و از اعتبار یا سهمیهٔ رایگان کم نمی‌کند.",
+            self._office_session_keyboard(),
+        )
+
+    async def _office_show_formats(self, event, user_id: int) -> None:
+        session = self._office_get_session(user_id)
+        if session is None or not session.text.strip():
+            await self._ack(event, "ابتدا متن یا یک فایل متنی به دفتر آزاد بفرستید.", alert=True)
+            return
+        session.updated_at = time.monotonic()
+        await self._edit_or_reply(
+            event,
+            "قالب خروجی را انتخاب کنید. متن کامل سند در خروجی می‌ماند؛ "
+            "برای Excel/PowerPoint اگر محدودیت ساختاری وجود داشته باشد، پیام روشن می‌گیرید و محتوا کوتاه نمی‌شود.\n\n"
+            f"عنوان: {session.title or 'از متن انتخاب می‌شود'} | "
+            f"{to_persian_digits(len(session.text))} نویسه",
+            self._office_format_keyboard(),
+        )
+
+    async def _office_add_message(self, event, user_id: int, text: str) -> None:
+        session = self._office_get_session(user_id)
+        if session is None:
+            await event.reply("زمان دفتر آزاد تمام شده است؛ از منو دوباره شروع کنید.")
+            return
+        try:
+            self._office_add_source(session, text, message=getattr(event, "message", None))
+        except OfficeError as exc:
+            await event.reply(str(exc), buttons=self._office_session_keyboard())
+            return
+        await event.reply(
+            f"✅ پیام اضافه شد؛ مجموع متن {to_persian_digits(len(session.text))} نویسه است.\n"
+            "می‌توانید پیام دیگری بفرستید یا قالب خروجی را انتخاب کنید.",
+            buttons=self._office_session_keyboard(),
+        )
+
+    async def _accept_office_text_file(
+        self, event, user_id: int, filename: str, suffix: str
+    ) -> None:
+        """Download one allowed text file to private temp storage and append it."""
+        max_bytes = int(self.settings.office_max_input_bytes)
+        reported_size = getattr(getattr(event.message, "file", None), "size", None)
+        if isinstance(reported_size, int) and not isinstance(reported_size, bool) and reported_size > max_bytes:
+            await event.reply(
+                "❌ فایل متنی از سقف حجم دفتر آزاد بیشتر است. حد: "
+                f"{to_persian_digits(max_bytes // 1024)} کیلوبایت"
+            )
+            return
+
+        async def operation() -> None:
+            progress = await event.respond("⏳ در حال دریافت و بررسی فایل متنی…")
+            workdir = Path(await run_file_io_resource(
+                tempfile.mkdtemp,
+                lambda path: shutil.rmtree(path, ignore_errors=True),
+                dir=self.settings.temp_dir,
+                prefix="office-",
+            ))
+            try:
+                source = workdir / f"source{suffix}"
+                try:
+                    await self._download_telegram_media(event.message, source, max_bytes)
+                    content = await run_file_io(read_text_file, source, max_bytes=max_bytes)
+                except UploadTooLargeError:
+                    await self._edit(progress, "❌ فایل متنی از سقف حجم دفتر آزاد بیشتر است.")
+                    return
+                except asyncio.TimeoutError:
+                    await self._edit(progress, "❌ دریافت فایل متنی ناموفق بود؛ دوباره بفرستید.")
+                    return
+                if not content.strip():
+                    await self._edit(progress, "فایل متن قابل‌استفاده‌ای ندارد؛ فایل دیگری بفرستید.")
+                    return
+                session = self._office_get_session(user_id) or self._office_new_session(user_id, event.message)
+                if session is None:
+                    await self._edit(progress, "دفتر آزاد مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.")
+                    return
+                try:
+                    self._office_add_source(
+                        session,
+                        content,
+                        filename=filename,
+                        message=event.message,
+                    )
+                except OfficeError as exc:
+                    await self._edit(progress, str(exc), self._office_session_keyboard())
+                    return
+                await self._edit(
+                    progress,
+                    f"✅ فایل متنی بررسی شد و افزوده شد؛ مجموع متن "
+                    f"{to_persian_digits(len(session.text))} نویسه است.\n"
+                    "فایل اصلیِ پیام شما دست‌نخورده می‌ماند. حالا قالب خروجی را انتخاب کنید یا متن دیگری بفرستید.",
+                    self._office_session_keyboard(),
+                )
+            except OfficeError as exc:
+                await self._edit(progress, str(exc))
+            finally:
+                await run_file_io(shutil.rmtree, workdir, ignore_errors=True)
+
+        await self._guard_file_intake(event, operation)
+
+    async def _build_office_export(
+        self,
+        source_text: str,
+        *,
+        title: str,
+        source_name: str | None,
+        kind: str,
+        reference: str,
+    ) -> tuple[str, bytes, str, str]:
+        """Build one real Office file with the existing RTL exporters."""
+        if kind not in OFFICE_FORMATS:
+            raise OfficeError("قالب خروجی دفتر آزاد نامعتبر است.")
+        suffix = Path(source_name).suffix.lower() if source_name else ""
+        delimiter = "," if suffix == ".csv" else "\t" if suffix == ".tsv" else None
+        document = await run_file_io(
+            build_office_document, source_text, title=title, delimiter=delimiter
+        )
+        meta = DocumentMeta(
+            reference=reference,
+            source_name=source_name,
+            created_at=datetime.now(),
+        )
+        label = FORMAT_LABELS[kind]
+        filename = office_filename(document.title, kind, reference)
+        if kind == "word":
+            payload = await run_file_io(
+                build_plain_docx,
+                document.title,
+                document.text,
+                fonts=resolve_fonts(),
+                design=resolve_design(),
+                meta=meta,
+                mode_label=f"دفتر آزاد — {label}",
+                heading_offset=OFFICE_HEADING_OFFSET,
+            )
+            caption = f"🗂 سند آزاد — {label} | {document.title}"
+        elif kind == "excel":
+            tables = await run_file_io(office_document_tables, document)
+            source_has_table = any(block.kind == "table" for block in document.blocks)
+            if not source_has_table and self.settings.note_configured and len(document.text) <= MAX_DECK_CHUNK_CHARS:
+                inferred = await infer_table(
+                    document.text,
+                    settings=self.settings,
+                    session=self._http_session(),
+                )
+                if inferred is not None:
+                    inferred_cells = " ".join(
+                        [*inferred.headers, *(cell for row in inferred.rows for cell in row)]
+                    )
+                    corpus = normalize_for_compare(inferred_cells)
+                    source_lines = [block.text for block in document.blocks if block.text.strip()]
+                    if source_lines and all(
+                        normalize_for_compare(line) in corpus for line in source_lines
+                    ):
+                        tables = [inferred]
+            payload = await run_file_io(build_office_xlsx, document, tables)
+            caption = f"🗂 سند آزاد — {label} | {document.title}"
+        elif kind == "ppt":
+            slides = None
+            max_content_slides = self.settings.office_max_slides - 3
+            if self.settings.note_configured:
+                slides = await plan_deck(
+                    document.text,
+                    settings=self.settings,
+                    session=self._http_session(),
+                    max_sections=max_content_slides,
+                )
+            if slides is None:
+                slides = await run_file_io(
+                    fallback_slides,
+                    document,
+                    max_slides=max_content_slides,
+                )
+            payload = await run_file_io(
+                build_office_pptx,
+                document,
+                slides,
+                subtitle="ارائهٔ تازه از متن؛ قالب‌بندی فایل اصلی تبدیل نمی‌شود",
+                max_slides=self.settings.office_max_slides,
+            )
+            caption = (
+                f"🗂 ارائهٔ تازه از متن «{document.title}»؛ "
+                "فایل اصلی دست‌نخورده مانده است."
+            )
+        else:
+            payload = await run_file_io(
+                build_office_pdf,
+                document,
+                meta=meta,
+                mode_label=f"دفتر آزاد — {label}",
+            )
+            caption = f"🗂 سند آزاد — {label} | {document.title}"
+        return filename, payload, caption, f"🗂 {document.title} — {label}"
+
+    async def _save_office_library_item(
+        self, user_id: int, message: Message, title: str
+    ) -> None:
+        """Index a delivered Office file by its Telegram message reference only."""
+        chat_id = getattr(message, "chat_id", None)
+        message_id = getattr(message, "id", None)
+        if not isinstance(chat_id, int) or not isinstance(message_id, int):
+            logger.warning("Office file delivered without a library message reference")
+            return
+        try:
+            await self.db.library_add(
+                user_id,
+                "office",
+                chat_id,
+                message_id,
+                None,
+                title=title[:200],
+            )
+            await self.db.library_prune(user_id, self.settings.library_max_items)
+        except Exception as exc:
+            logger.warning("could not index Office file error=%s", type(exc).__name__)
+
+    async def _office_run_operation(
+        self,
+        event,
+        user_id: int,
+        *,
+        progress_text: str,
+        success_text: str,
+        buttons: list[list],
+        operation,
+    ) -> None:
+        """Run one bounded, free Office operation with private temp cleanup."""
+        if not self.settings.office_enabled:
+            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            return
+        if user_id in self._office_in_flight:
+            await self._ack(event, "یک خروجی دفتر آزاد برای شما در حال ساخت است.", alert=True)
+            return
+        now = time.monotonic()
+        interval = max(0.0, float(self.settings.office_min_interval_seconds))
+        throttle_ttl = max(60.0, interval * 2)
+        for owner, used_at in list(self._office_last_use.items()):
+            if now - used_at > throttle_ttl:
+                self._office_last_use.pop(owner, None)
+        if user_id not in self._office_last_use and len(self._office_last_use) >= MAX_OFFICE_SESSIONS:
+            oldest = min(self._office_last_use, key=lambda owner: self._office_last_use[owner])
+            self._office_last_use.pop(oldest, None)
+        last = self._office_last_use.get(user_id, 0.0)
+        if interval and now - last < interval:
+            remaining = max(1, int(interval - (now - last) + 0.999))
+            await self._ack(
+                event,
+                f"برای حفظ ظرفیت سرویس، {to_persian_digits(remaining)} ثانیه دیگر دوباره تلاش کنید.",
+                alert=True,
+            )
+            return
+        self._office_last_use[user_id] = now
+        self._office_in_flight.add(user_id)
+        task = asyncio.current_task()
+        if task is not None:
+            self._office_tasks.add(task)
+        workdir: Path | None = None
+        delivered = 0
+        try:
+            await self._edit(event, progress_text, buttons=[])
+            async with self._office_semaphore:
+                workdir = Path(await run_file_io_resource(
+                    tempfile.mkdtemp,
+                    lambda path: shutil.rmtree(path, ignore_errors=True),
+                    dir=self.settings.temp_dir,
+                    prefix="office-",
+                ))
+                outputs = await operation(workdir)
+                reply_to = getattr(event, "message_id", None)
+                if not isinstance(reply_to, int):
+                    reply_to = getattr(getattr(event, "message", None), "id", None)
+                for filename, payload, caption, library_title in outputs:
+                    if not payload or len(payload) > MAX_OFFICE_OUTPUT_BYTES:
+                        raise OfficeError(
+                            "حجم خروجی از سقف دفتر آزاد بیشتر است؛ سند را کوچک‌تر کنید."
+                        )
+                    path = workdir / filename
+                    await run_file_io(path.write_bytes, payload)
+                    try:
+                        sent = await self._send_telegram_file(
+                            user_id,
+                            path,
+                            caption=caption[:TELEGRAM_CAPTION_LIMIT],
+                            reply_to=reply_to,
+                            force_document=True,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Office Telegram delivery failed format=%s error=%s",
+                            Path(filename).suffix.lower(),
+                            type(exc).__name__,
+                        )
+                        if delivered:
+                            await self._edit(
+                                event,
+                                "⚠️ بخشی از خروجی‌ها ارسال و در کتابخانه ذخیره شد؛ ارسال فایل بعدی ناموفق بود.",
+                                buttons,
+                            )
+                            return
+                        raise OfficeError("ارسال فایل خروجی ناموفق بود؛ دوباره تلاش کنید.") from exc
+                    if sent is None:
+                        raise OfficeError("تلگرام فایل خروجی را تأیید نکرد؛ دوباره تلاش کنید.")
+                    delivered += 1
+                    await self._save_office_library_item(user_id, sent, library_title)
+            await self._edit(event, success_text, buttons)
+        except (OfficeError, StructuringError) as exc:
+            await self._edit(event, str(exc), buttons)
+        finally:
+            if workdir is not None:
+                await run_file_io(shutil.rmtree, workdir, ignore_errors=True)
+            self._office_in_flight.discard(user_id)
+            if task is not None:
+                self._office_tasks.discard(task)
+
+    async def _run_office_session_export(
+        self, event, user_id: int, kind: str
+    ) -> None:
+        session = self._office_get_session(user_id)
+        if session is None or not session.text.strip():
+            await self._ack(event, "متن دفتر آزاد پیدا نشد؛ از منو دوباره شروع کنید.", alert=True)
+            return
+        if kind not in OFFICE_FORMATS:
+            await self._ack(event, "قالب خروجی نامعتبر است.", alert=True)
+            return
+        source_text = session.text
+        title = session.title
+        source_name = session.filename
+        reference = f"OFF-{secrets.token_hex(4).upper()}"
+
+        async def build(_workdir: Path):
+            return [
+                await self._build_office_export(
+                    source_text,
+                    title=title,
+                    source_name=source_name,
+                    kind=kind,
+                    reference=reference,
+                )
+            ]
+
+        session.updated_at = time.monotonic()
+        await self._office_run_operation(
+            event,
+            user_id,
+            progress_text=f"⏳ در حال ساخت فایل {FORMAT_LABELS[kind]} از متن شما…",
+            success_text=(
+                "✅ فایل ساخته شد و در کتابخانهٔ شما ذخیره شد.\n"
+                "می‌توانید قالب دیگری هم از همین متن بسازید یا متن بیشتری اضافه کنید."
+            ),
+            buttons=self._office_session_keyboard(),
+            operation=build,
+        )
+
+    def _document_export_keyboard(self, document_id: int) -> list[list]:
+        return [
+            [
+                Button.inline("📝 Word", f"doc:ex:{document_id}:word".encode("ascii")),
+                Button.inline("📊 Excel", f"doc:ex:{document_id}:excel".encode("ascii")),
+            ],
+            [
+                Button.inline("📖 PowerPoint", f"doc:ex:{document_id}:ppt".encode("ascii")),
+                Button.inline("📕 PDF", f"doc:ex:{document_id}:pdf".encode("ascii")),
+            ],
+            [Button.inline("↩️ بازگشت به سند", f"doc:show:{document_id}".encode("ascii"))],
+        ]
+
+    async def _show_document_export_screen(
+        self, event, user_id: int, document_id: int
+    ) -> None:
+        if not self.settings.office_enabled:
+            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            return
+        document = await self.db.document_get(user_id, document_id)
+        if document is None:
+            await self._ack(event, "این سند پیدا نشد.", alert=True)
+            return
+        await self._edit(
+            event,
+            "قالب خروجی را از متن استخراج‌شده انتخاب کنید. فایل اصلی دست‌نخورده می‌ماند.\n"
+            "PowerPoint تازه‌ای از متن ساخته می‌شود و تبدیل پیکسلی/ظاهری ارائهٔ اصلی نیست.\n"
+            "همهٔ عملیات رایگان‌اند و از اعتبار کم نمی‌کنند.",
+            self._document_export_keyboard(document_id),
+        )
+
+    async def _run_document_export(
+        self, event, user_id: int, document_id: int, kind: str
+    ) -> None:
+        if not self.settings.office_enabled:
+            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            return
+        document = await self.db.document_get(user_id, document_id)
+        if document is None:
+            await self._ack(event, "این سند پیدا نشد.", alert=True)
+            return
+        if kind not in OFFICE_FORMATS:
+            await self._ack(event, "قالب خروجی نامعتبر است.", alert=True)
+            return
+        original_text = str(document.get("text") or "")
+        if len(original_text) > MAX_OFFICE_NOTE_SOURCE_CHARS:
+            await self._ack(
+                event,
+                "متن از سقف خروجی دفتر آزاد بیشتر است؛ فایل اصلی را دریافت و به چند سند تقسیم کنید. "
+                "هیچ بخشی از متن در خروجی کوتاه نمی‌شود.",
+                alert=True,
+            )
+            return
+        cached = await run_file_io(
+            chunks_from_json,
+            document.get("chunks_json"),
+            max_chars=MAX_MODEL_INPUT_CHARS,
+        )
+        if cached:
+            source = "\n\n".join(chunk.text for chunk in cached)
+        else:
+            source = original_text
+        if len(source) > MAX_OFFICE_NOTE_SOURCE_CHARS:
+            await self._ack(
+                event,
+                "متن کامل با مکان‌یاب‌ها از سقف خروجی دفتر آزاد بیشتر است؛ فایل اصلی را دریافت کنید و سند را تقسیم کنید. هیچ بخشی کوتاه نمی‌شود.",
+                alert=True,
+            )
+            return
+        reference = f"DOC-{document_id}-{secrets.token_hex(3).upper()}"
+        title = str(document.get("title") or "سند")
+
+        async def build(_workdir: Path):
+            return [
+                await self._build_office_export(
+                    source,
+                    title=title,
+                    source_name=None,
+                    kind=kind,
+                    reference=reference,
+                )
+            ]
+
+        buttons = [
+            [Button.inline("↩️ بازگشت به سند", f"doc:show:{document_id}".encode("ascii"))],
+            [Button.inline("📚 بازگشت به کتابخانه", b"lib:docs:0")],
+        ]
+        await self._office_run_operation(
+            event,
+            user_id,
+            progress_text=f"⏳ در حال ساخت خروجی {FORMAT_LABELS[kind]} از متن سند…",
+            success_text=(
+                "✅ خروجی ساخته شد و در کتابخانه ذخیره شد.\n"
+                "فایل اصلی و مکان‌یاب‌های متن دست‌نخورده‌اند؛ ارائهٔ تازه جایگزین ارائهٔ اصلی نیست."
+            ),
+            buttons=buttons,
+            operation=build,
+        )
+
+    async def _run_document_notes(
+        self, event, user_id: int, document_id: int, mode: str
+    ) -> None:
+        if not self.settings.office_enabled:
+            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            return
+        document = await self.db.document_get(user_id, document_id)
+        if document is None:
+            await self._ack(event, "این سند پیدا نشد.", alert=True)
+            return
+        if mode not in {"full", "compact"}:
+            await self._ack(event, "نوع جزوه نامعتبر است.", alert=True)
+            return
+        source_text = str(document.get("text") or "")
+        title = str(document.get("title") or "جزوهٔ منبع‌محور")
+        if not source_text.strip():
+            await self._ack(event, "متن قابل‌استفاده‌ای برای جزوه پیدا نشد.", alert=True)
+            return
+        if len(source_text) > MAX_OFFICE_NOTE_SOURCE_CHARS:
+            await self._ack(
+                event,
+                "متن استخراج‌شده از سقف تولید جزوهٔ آزاد بیشتر است؛ فایل اصلی را دریافت کنید و سند را به چند بخش کوچک‌تر تقسیم کنید. هیچ بخشی کوتاه یا حذف نشده است.",
+                alert=True,
+            )
+            return
+        cached = await run_file_io(
+            chunks_from_json,
+            document.get("chunks_json"),
+            max_chars=MAX_MODEL_INPUT_CHARS,
+        )
+        chunks = await run_file_io(
+            office_source_chunks,
+            source_text,
+            cached or None,
+            max_chars=MAX_MODEL_INPUT_CHARS,
+        )
+        if not chunks:
+            await self._ack(event, "متن قابل‌استفاده‌ای برای جزوه پیدا نشد.", alert=True)
+            return
+        reference = f"DOC-{document_id}-{mode.upper()}-{secrets.token_hex(3).upper()}"
+        meta = DocumentMeta(
+            reference=reference,
+            source_name=title,
+            created_at=datetime.now(),
+        )
+        mode_label = "جزوهٔ کاملِ منبع‌محور" if mode == "full" else "یادداشت مرور سریع"
+        buttons = [
+            [Button.inline("↩️ بازگشت به سند", f"doc:show:{document_id}".encode("ascii"))],
+            [Button.inline("📚 بازگشت به کتابخانه", b"lib:docs:0")],
+        ]
+
+        async def build(_workdir: Path):
+            fallback_used = False
+            if mode == "full":
+                notes, fallback_used = await generate_full_booklet(
+                    chunks,
+                    title=title,
+                    settings=self.settings,
+                    session=self._http_session() if self.settings.note_configured else None,
+                )
+                markdown = notes.to_markdown()
+                word_payload = await run_file_io(
+                    build_notes_docx,
+                    notes,
+                    fonts=resolve_fonts(),
+                    design=resolve_design(),
+                    meta=meta,
+                )
+            else:
+                compact, fallback_used = await generate_compact_notes(
+                    chunks,
+                    title=title,
+                    settings=self.settings,
+                    session=self._http_session() if self.settings.note_configured else None,
+                )
+                markdown = compact.to_markdown()
+                word_payload = await run_file_io(
+                    build_plain_docx,
+                    compact.title,
+                    markdown,
+                    fonts=resolve_fonts(),
+                    design=resolve_design(),
+                    meta=meta,
+                    mode_label="حالت خروجی: یادداشت مرور سریع",
+                    heading_offset=OFFICE_HEADING_OFFSET,
+                )
+            pdf_document = await run_file_io(
+                build_office_document,
+                markdown,
+                title=title,
+            )
+            pdf_payload = await run_file_io(
+                build_office_pdf,
+                pdf_document,
+                meta=meta,
+                mode_label=mode_label,
+            )
+            variant = "کامل" if mode == "full" else "مرور سریع"
+            if fallback_used:
+                logger.info("Office document notes used deterministic source fallback mode=%s", mode)
+            return [
+                (
+                    office_filename(title, "word", reference),
+                    word_payload,
+                    f"📘 {variant} — Word | {title}",
+                    f"🗂 {title} — {variant} — Word",
+                ),
+                (
+                    office_filename(title, "pdf", reference),
+                    pdf_payload,
+                    f"📕 {variant} — PDF | {title}",
+                    f"🗂 {title} — {variant} — PDF",
+                ),
+            ]
+
+        await self._office_run_operation(
+            event,
+            user_id,
+            progress_text=(
+                "⏳ در حال ساخت جزوهٔ کاملِ منبع‌محور و نسخهٔ Word/PDF…"
+                if mode == "full"
+                else "⏳ در حال استخراج نکته‌های فشرده و ساخت Word/PDF…"
+            ),
+            success_text=(
+                f"✅ {mode_label} ساخته شد و هر دو فایل Word و PDF در کتابخانه ذخیره شدند.\n"
+                "برچسب‌های صفحه/اسلاید از سند استخراج‌شده حفظ شده‌اند؛ فایل اصلی هم همچنان قابل دریافت است."
+            ),
+            buttons=buttons,
+            operation=build,
+        )
 
     async def _guard_file_intake(self, event, operation) -> None:
         """Join document/receipt handlers before shutdown closes SQLite."""
@@ -3781,6 +4546,44 @@ class GamasBot:
             return
         await self._ack(event, LEARNING_STALE_ALERT, alert=True)
 
+    # ---------------------------------------------------------- Office routes
+    async def _route_office_callback(
+        self, event, user_id: int, data: str
+    ) -> None:
+        """Dispatch owner-authorized, private-chat Free Office controls."""
+        parts = data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        if not self.settings.office_enabled:
+            await self._ack(event, "دفتر آزاد در تنظیمات سرور غیرفعال است.", alert=True)
+            return
+        if user_id in self._office_in_flight:
+            await self._ack(event, "خروجی دفتر آزاد شما در حال ساخت است.", alert=True)
+            return
+        if action == "start" and len(parts) == 2:
+            await self._office_start(event, user_id)
+            return
+        if action == "continue" and len(parts) == 2:
+            if self._office_new_session(user_id, getattr(event, "message", None)) is None:
+                await self._ack(event, "دفتر آزاد مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.", alert=True)
+                return
+            await self._office_start(event, user_id)
+            return
+        if action == "formats" and len(parts) == 2:
+            await self._office_show_formats(event, user_id)
+            return
+        if action == "cancel" and len(parts) == 2:
+            self._office_sessions.pop(user_id, None)
+            await self._edit(
+                event,
+                "پیش‌نویس دفتر آزاد پاک شد. فایل‌های خروجیِ قبلی در کتابخانه می‌مانند.",
+                self._user_menu(is_admin=self._is_admin(user_id)),
+            )
+            return
+        if action == "fmt" and len(parts) == 3 and parts[2] in OFFICE_FORMATS:
+            await self._run_office_session_export(event, user_id, parts[2])
+            return
+        await self._ack(event, "درخواست دفتر آزاد نامعتبر است.", alert=True)
+
     # --------------------------------------------------------- document routes
     async def _route_document_callback(
         self, event, user_id: int, data: str
@@ -3794,6 +4597,29 @@ class GamasBot:
                 await self._ack(event, "این سند پیدا نشد.", alert=True)
                 return
             await self._show_document_card(event, user_id, document_id)
+            return
+        if action == "export" and len(parts) == 3:
+            document_id = _to_int(parts[2])
+            if document_id is None:
+                await self._ack(event, "این سند پیدا نشد.", alert=True)
+                return
+            await self._show_document_export_screen(event, user_id, document_id)
+            return
+        if action == "ex" and len(parts) == 4:
+            document_id = _to_int(parts[2])
+            kind = parts[3]
+            if document_id is None or kind not in OFFICE_FORMATS:
+                await self._ack(event, "قالب خروجی یا سند نامعتبر است.", alert=True)
+                return
+            await self._run_document_export(event, user_id, document_id, kind)
+            return
+        if action == "note" and len(parts) == 4:
+            document_id = _to_int(parts[2])
+            mode = parts[3]
+            if document_id is None or mode not in {"full", "compact"}:
+                await self._ack(event, "نوع جزوه یا سند نامعتبر است.", alert=True)
+                return
+            await self._run_document_notes(event, user_id, document_id, mode)
             return
         if action == "f" and len(parts) == 3:
             document_id = _to_int(parts[2])
@@ -4013,20 +4839,33 @@ class GamasBot:
         # fc:man re-arms itself inside its own branch.
         self._pending_flashcard.pop(user_id, None)
         self._pending_flashcard_front.pop(user_id, None)
+        if not data.startswith("office:"):
+            self._office_sessions.pop(user_id, None)
 
         if data == "help":
-            guide = (
-                "ℹ️ راهنمای گاماس\n\n"
-                "🎧 فایل صوت/ویدیو یا 📄 سند PDF، Word و پاورپوینت را همین‌جا بفرستید.\n"
-                "📚 متن اسناد در کتابخانه ذخیره می‌شود؛ برای ارائه، پردازش صدا نیز انتخاب‌پذیر است.\n"
-                "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
-                "🎁 نخستین مجموعهٔ فلش‌کارت و نخستین آزمون جداگانه رایگان‌اند.\n"
-                "🛒 خرید اشتراک: بسته‌ها و موجودی. 🎧 پشتیبانی: تیکت بزنید.\n\n"
-                "💳 اعتبار بر حسب ثانیه است و پس از ارسال متن خام محاسبه می‌شود.\n"
-                "اگر متن خام نرسد، اعتباری کم نمی‌شود.\n"
-                "ساخت 🧪 آزمون و 🃏 فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق بود، اعتبار کامل برمی‌گردد.\n"
-                "پس از دریافت متن خام، خطای ساخت جزوه اعتبار را برنمی‌گرداند."
+            guide_lines = [
+                "ℹ️ راهنمای گاماس",
+                "",
+                "🎧 فایل صوت/ویدیو یا 📄 سند PDF، Word و پاورپوینت را همین‌جا بفرستید.",
+            ]
+            if self.settings.office_enabled:
+                guide_lines.append(
+                    "🗂 دفتر آزاد: متن یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار."
+                )
+            guide_lines.extend(
+                [
+                    "📚 متن اسناد در کتابخانه ذخیره می‌شود؛ برای ارائه، پردازش صدا نیز انتخاب‌پذیر است.",
+                    "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.",
+                    "🎁 نخستین مجموعهٔ فلش‌کارت و نخستین آزمون جداگانه رایگان‌اند.",
+                    "🛒 خرید اشتراک: بسته‌ها و موجودی. 🎧 پشتیبانی: تیکت بزنید.",
+                    "",
+                    "💳 اعتبار بر حسب ثانیه است و پس از ارسال متن خام محاسبه می‌شود.",
+                    "اگر متن خام نرسد، اعتباری کم نمی‌شود.",
+                    "ساخت 🧪 آزمون و 🃏 فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق بود، اعتبار کامل برمی‌گردد.",
+                    "پس از دریافت متن خام، خطای ساخت جزوه اعتبار را برنمی‌گرداند.",
+                ]
             )
+            guide = "\n".join(guide_lines)
             await event.respond(
                 guide,
                 buttons=[[Button.inline("↩️ منوی اصلی", b"menu:main")]],
@@ -4052,6 +4891,8 @@ class GamasBot:
                 await self._ack(event, "این سند پیدا نشد.", alert=True)
             else:
                 await self._show_document_card(event, user_id, document_id)
+        elif data.startswith("office:"):
+            await self._route_office_callback(event, user_id, data)
         elif data.startswith("doc:"):
             await self._route_document_callback(event, user_id, data)
         elif data.startswith("lib:f:"):
@@ -4232,6 +5073,7 @@ class GamasBot:
             self._pending_flashcard_front.pop(user_id, None)
             self._pending_user_search.discard(user_id)
             self._pending_free_reset.pop(user_id, None)
+            self._office_sessions.pop(user_id, None)
             await self._show_main(event, first_start=True)
             return
 
@@ -4318,6 +5160,7 @@ class GamasBot:
 
         if command == "/cancel":
             self._pending_payments.pop(user_id, None)
+            self._office_sessions.pop(user_id, None)
             self._support_states.pop(user_id, None)
             self._support_admin_states.pop(user_id, None)
             self._pending_flashcard.pop(user_id, None)
@@ -4337,6 +5180,35 @@ class GamasBot:
             else:
                 await self._handle_flashcard_text(event, user_id, text)
                 return
+
+        # Free Office accepts only explicit text drafts and approved plain-text
+        # file types. A draft stays owner-scoped until the user exports or clears it.
+        try:
+            text_suffix, text_filename = _text_file_metadata(event.message)
+        except OfficeError as exc:
+            await event.reply(str(exc))
+            return
+        if text_suffix is not None:
+            if not self.settings.office_enabled:
+                await event.reply("دفتر آزاد در تنظیمات سرور غیرفعال است.")
+                return
+            if await self._is_duplicate_upload(event, user_id):
+                return
+            await self._accept_office_text_file(
+                event, user_id, text_filename or f"source{text_suffix}", text_suffix
+            )
+            return
+        office_session = self._office_get_session(user_id) if self.settings.office_enabled else None
+        if office_session is not None and text and not command:
+            await self._office_add_message(event, user_id, text)
+            return
+        if office_session is not None and _is_unsupported_attachment(event.message):
+            await event.reply(
+                "یک پیش‌نویس دفتر آزاد باز دارید. ابتدا خروجی را بسازید یا «پایان و پاک‌کردن متن» را بزنید؛ "
+                "سپس فایل دیگری را بفرستید تا با جریان مناسب خودش پردازش شود.",
+                buttons=self._office_session_keyboard(),
+            )
+            return
 
         # Study documents, including PowerPoint, are cached before generation.
         # A PowerPoint card also offers the existing narrated-lecture pipeline.
