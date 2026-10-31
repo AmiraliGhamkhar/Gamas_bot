@@ -1185,7 +1185,8 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.admin_id, b"adm:bcast")
         await self.bot._handle_callback(event)
         text, _buttons = event.responses[-1]
-        self.assertIn("همان متن برای همهٔ کاربران ارسال می‌شود", text)
+        self.assertIn("همهٔ کاربران ثبت‌شده در ربات", text)
+        self.assertIn("ربات را مسدود کرده‌اند", text)
         self.assertIn("/cancel", text)
 
     async def test_broadcast_is_literal_text_and_rate_limited(self):
@@ -1206,6 +1207,49 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._broadcast(next_event, "second broadcast")
         self.assertFalse(any(item["text"] == "second broadcast" for item in event.client.texts))
         self.assertTrue(any("محدود" in item["text"] for item in event.client.texts))
+
+    async def test_broadcast_retries_flooded_user_and_reports_permanent_failures(self):
+        await self.db.ensure_user(self.admin_id)
+        await self.db.ensure_user(self.user_id)
+        failed_user = 777
+        await self.db.ensure_user(failed_user)
+        event = FakeMessageEvent(self.admin_id, "")
+        self.bot.client = event.client
+        original_send_message = event.client.send_message
+        attempts: dict[int, int] = {}
+
+        class FakeFloodWaitError(Exception):
+            def __init__(self, seconds: int):
+                self.seconds = seconds
+
+        async def send_with_one_flood_wait(entity, message, **kwargs):
+            if message == "announcement":
+                attempts[entity] = attempts.get(entity, 0) + 1
+                if entity == self.user_id and attempts[entity] == 1:
+                    raise FakeFloodWaitError(2)
+                if entity == failed_user:
+                    raise RuntimeError("recipient blocked the bot")
+            return await original_send_message(entity, message, **kwargs)
+
+        with (
+            mock.patch.object(
+                event.client, "send_message", side_effect=send_with_one_flood_wait
+            ),
+            mock.patch("gamas_bot.bot.FloodWaitError", FakeFloodWaitError),
+            mock.patch("gamas_bot.bot.asyncio.sleep", new_callable=mock.AsyncMock) as sleep,
+        ):
+            await self.bot._broadcast(event, "announcement")
+
+        delivered = [
+            item["entity"] for item in event.client.texts
+            if item["text"] == "announcement"
+        ]
+        self.assertEqual(set(delivered), {self.admin_id, self.user_id})
+        self.assertEqual(attempts[self.user_id], 2)
+        sleep.assert_any_await(3.0)  # flood wait plus the boundary safety second
+        summary = event.client.texts[-1]["text"]
+        self.assertIn("۲ نفر از ۳ کاربر", summary)
+        self.assertIn("۱ کاربر ناموفق", summary)
 
     async def test_oversized_broadcast_is_rejected(self):
         event = FakeMessageEvent(self.admin_id, "")

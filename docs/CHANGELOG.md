@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased — reliable broadcast retries and a working console entry point
+
+- **Flood waits no longer skip the recipient that triggered them.** A broadcast retries the same
+  Telegram message after the full server-specified wait (with a small clock-boundary margin) and
+  keeps going after permanent per-user failures. The admin now sees delivered and failed totals;
+  the audit record stores counts without storing broadcast text.
+- **The installed `gamas-bot` command now starts correctly.** Its setuptools entry point is
+  synchronous and no-argument, as console scripts require; the async bot lifecycle remains an
+  internal coroutine. `python -m gamas_bot` is unchanged.
+
 ## Unreleased — opt-in OCR for scans and photos (i2ocr), reviewed and hardened
 
 - **A scanned PDF or a photo can now become a study document — if the operator opts in.** The

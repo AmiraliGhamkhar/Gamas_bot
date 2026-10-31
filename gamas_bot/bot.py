@@ -5539,7 +5539,8 @@ class GamasBot:
             self._pending_broadcast.add(user_id)
             await event.respond(
                 "📣 ارسال پیام به کاربران\n\n"
-                "متن موردنظر را در پیام بعدی بفرستید؛ همان متن برای همهٔ کاربران ارسال می‌شود.\n"
+                "متن موردنظر را در پیام بعدی بفرستید؛ برای همهٔ کاربران ثبت‌شده در ربات تلاش می‌شود ارسال شود.\n"
+                "کاربرانی که ربات را مسدود کرده‌اند ممکن است پیام را دریافت نکنند.\n"
                 "برای لغو، /cancel بفرستید یا دکمهٔ زیر را انتخاب کنید.",
                 buttons=[[Button.inline("↩️ لغو", b"adm:home")]],
             )
@@ -9087,6 +9088,46 @@ class GamasBot:
 
     BROADCAST_THROTTLE_SECONDS = 0.05  # ~20 msg/sec (audit F-M02)
     BROADCAST_BATCH_PROGRESS_EVERY = 100
+    BROADCAST_MAX_FLOOD_WAIT_RETRIES = 3
+
+    async def _send_broadcast_page(self, user_id: int, page: str) -> bool:
+        """Send one page, retrying Telegram's explicit flood-wait instruction.
+
+        A flood wait is not a delivery failure: Telegram tells us when the same
+        request may be retried. Moving straight to the next user silently
+        skipped the recipient that triggered the wait, so retry this page before
+        advancing. Retries remain bounded; permanent errors (for example, a
+        user who blocked the bot) are logged by error type and reported to the
+        administrator in the final delivery totals.
+        """
+        for retry in range(self.BROADCAST_MAX_FLOOD_WAIT_RETRIES + 1):
+            try:
+                await self.client.send_message(user_id, page, parse_mode=None)
+            except FloodWaitError as exc:
+                if retry >= self.BROADCAST_MAX_FLOOD_WAIT_RETRIES:
+                    logger.warning(
+                        "broadcast flood wait retries exhausted after=%d",
+                        self.BROADCAST_MAX_FLOOD_WAIT_RETRIES,
+                    )
+                    return False
+                wait_seconds = max(0.0, float(exc.seconds))
+                logger.warning(
+                    "broadcast flood wait seconds=%s retry=%d/%d",
+                    exc.seconds,
+                    retry + 1,
+                    self.BROADCAST_MAX_FLOOD_WAIT_RETRIES,
+                )
+                # Respect Telegram's full wait rather than retrying early and
+                # receiving another FloodWaitError. One extra second absorbs
+                # clock/rounding differences at the server boundary.
+                await asyncio.sleep(wait_seconds + 1.0)
+                continue
+            except Exception as exc:
+                logger.warning("broadcast delivery failed error=%s", type(exc).__name__)
+                return False
+            await asyncio.sleep(self.BROADCAST_THROTTLE_SECONDS)
+            return True
+        return False
 
     async def _broadcast(self, event, text: str) -> None:
         text = text.strip()
@@ -9120,25 +9161,43 @@ class GamasBot:
             # failure/fallback ambiguity.
             pages = split_message(text)
             sent = 0
+            failed = 0
             for idx, user_id in enumerate(user_ids, 1):
-                try:
-                    for page in pages:
-                        await self.client.send_message(user_id, page, parse_mode=None)
-                        # Limit message rate per page, not merely per recipient.
-                        await asyncio.sleep(self.BROADCAST_THROTTLE_SECONDS)
+                delivered = True
+                for page in pages:
+                    if not await self._send_broadcast_page(user_id, page):
+                        delivered = False
+                        break
+                if delivered:
                     sent += 1
-                except FloodWaitError as exc:
-                    logger.warning("broadcast flood wait seconds=%s", exc.seconds)
-                    await asyncio.sleep(min(exc.seconds, 60))
-                except Exception:
-                    logger.debug("broadcast delivery failed")
+                else:
+                    failed += 1
                 if idx % self.BROADCAST_BATCH_PROGRESS_EVERY == 0:
-                    logger.info("broadcast progress sent=%d/%d", sent, len(user_ids))
-            await self.db.audit(admin_id, "broadcast", f"text:{len(text)} users:{sent}")
-            await event.reply(
-                f"📣 پیام به {to_persian_digits(sent)} کاربر رسید.",
-                buttons=self._admin_menu(),
+                    logger.info(
+                        "broadcast progress sent=%d failed=%d total=%d",
+                        sent,
+                        failed,
+                        len(user_ids),
+                    )
+            await self.db.audit(
+                admin_id,
+                "broadcast",
+                f"text:{len(text)} delivered:{sent} failed:{failed} targets:{len(user_ids)}",
             )
+            if user_ids:
+                summary = (
+                    f"📣 پیام به {to_persian_digits(sent)} نفر از "
+                    f"{to_persian_digits(len(user_ids))} کاربر ارسال شد."
+                )
+                if failed:
+                    summary += (
+                        "\n⚠️ ارسال برای "
+                        f"{to_persian_digits(failed)} کاربر ناموفق بود؛ "
+                        "ممکن است ربات را مسدود کرده باشند."
+                    )
+            else:
+                summary = "📣 هنوز کاربری در فهرست ربات ثبت نشده است؛ پیامی ارسال نشد."
+            await event.reply(summary, buttons=self._admin_menu())
         finally:
             self._broadcast_running.discard(admin_id)
             # A long-running broadcast must also wait the full cooldown after
