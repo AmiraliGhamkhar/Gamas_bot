@@ -222,6 +222,68 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.billing_snapshot(), before)
         self.assertEqual(list(self.settings.temp_dir.iterdir()), [])
 
+    async def test_a_text_upload_with_control_characters_still_exports_excel(self):
+        """A verbose ``.txt`` may carry VT/FF; the Excel export must still build.
+
+        ``read_text_file`` accepts every non-NUL byte of a text upload, so a
+        form feed from a printer dump or a stray ``\\x01`` reached the builders.
+        Excel refused the whole file (``IllegalCharacterError``) and the generic
+        callback error was the only thing the user ever saw, while Word,
+        PowerPoint and PDF of the same text worked.
+        """
+        source_text = (
+            "گزارش کنترل\x01نویسه\n"
+            "این سطر \x0c باید با فاصله جدا بماند\n"
+            "نام\tمقدار\n"
+            "علی\t۲۰\n"
+        )
+        source_file = self.root / "verbose.txt"
+        source_file.write_text(source_text, encoding="utf-8")
+        upload = FakeJobEvent(source=source_file, chat_id=self.user_id)
+        upload.message.attach_document(
+            "verbose.txt", mime_type="text/plain", size=source_file.stat().st_size
+        )
+        self.bot.client = upload.client
+        before = await self.billing_snapshot()
+
+        await self.bot._handle_message(upload)
+        self.assertIn(self.user_id, self.bot._office_sessions)
+
+        callback = self.callback("office:fmt:excel", client=upload.client)
+        await self.bot._handle_callback(callback)
+        self.assertTrue(
+            any(path.endswith(".xlsx") for path, _payload in upload.file_payloads),
+            f"no Excel file was delivered: {upload.file_paths}",
+        )
+        self.assertIn("فایل ساخته شد", callback.edits[-1]["text"])
+
+        workbook = openpyxl.load_workbook(
+            io.BytesIO(upload.file_bytes(".xlsx")), data_only=False
+        )
+        cells = [
+            str(value)
+            for sheet in workbook.worksheets
+            for row in sheet.values
+            for value in row
+            if value
+        ]
+        joined = "\n".join(cells)
+        self.assertIn("گزارش کنترل", joined)
+        self.assertIn("نویسه", joined)
+        # The soft line break still separates the two words.
+        self.assertIn("این سطر", joined)
+        self.assertIn("باید با فاصله جدا بماند", joined)
+        self.assertIn("علی", cells)
+        for value in cells:
+            self.assertFalse(
+                any(ord(char) < 0x20 and char not in "\t\n\r" for char in value),
+                f"a control character reached the sheet: {value!r}",
+            )
+        # The source file is the user's; it is never rewritten.
+        self.assertEqual(source_file.read_text(encoding="utf-8"), source_text)
+        self.assertEqual(await self.billing_snapshot(), before)
+        self.assertEqual(list(self.settings.temp_dir.iterdir()), [])
+
     async def test_first_export_is_not_throttled_when_the_host_just_booted(self):
         """Audit F-3: ``0.0`` is a real ``time.monotonic()`` value, not "never".
 

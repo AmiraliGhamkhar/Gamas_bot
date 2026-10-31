@@ -40,7 +40,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .docx_export import ACCENT_HEX, ACCENT_SOFT_HEX, sanitize_filename_part
+from .docx_export import ACCENT_HEX, ACCENT_SOFT_HEX, portable_text, sanitize_filename_part
 from .mdblocks import TextBlock, parse_blocks
 from .progress import to_persian_digits
 from .textnorm import normalize_display
@@ -271,11 +271,20 @@ def _csv_block(text: str, delimiter: str) -> list[TextBlock]:
 def build_office_document(
     text: str, *, title: str = "", delimiter: str | None = None
 ) -> OfficeDocument:
-    """Parse user text; explicit CSV/TSV input keeps quoted commas intact."""
-    original = text or ""
+    """Parse user text; explicit CSV/TSV input keeps quoted commas intact.
+
+    Control characters are normalized once here, at the section's single
+    ingestion point, the same way the Word engine has always normalized them
+    (:func:`gamas_bot.docx_export.portable_text`). A ``.txt``/``.csv``/``.tsv``
+    upload is read verbatim, and every builder below — Word, Excel, PowerPoint
+    and PDF — must receive text it can actually store, so one unstoreable byte
+    can no longer fail the Excel export of an otherwise readable file while the
+    other three formats succeed.
+    """
+    original = portable_text(text or "")
     cleaned = normalize_display(original)
     blocks = _csv_block(original, delimiter) if delimiter in {",", "\t"} else parse_blocks(cleaned)
-    resolved = (title or "").strip() or detect_title(blocks, cleaned)
+    resolved = portable_text(title or "").strip() or detect_title(blocks, cleaned)
     return OfficeDocument(title=resolved[:120], text=cleaned, blocks=tuple(blocks))
 
 

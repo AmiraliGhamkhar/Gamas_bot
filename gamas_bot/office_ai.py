@@ -249,7 +249,14 @@ def _slide_sections(payload: dict) -> list[tuple[str, list[str]]]:
 
 
 def _table_payload(payload: dict) -> tuple[list[str], list[list[str]]]:
-    """The ``(headers, rows)`` of a table payload."""
+    """The ``(headers, rows)`` of a table payload.
+
+    A column without a name is a rejected plan, not a column to remove: dropping
+    it would shift every following cell into the wrong column and silently
+    discard the cells that no longer fit, which is exactly the "the user's text
+    quietly stopped being the user's text" failure this module exists to avoid.
+    The caller falls back to the deterministic sheet, which keeps every line.
+    """
     raw_headers = payload.get("headers")
     headers: list[str] = []
     if not isinstance(raw_headers, (list, tuple)) or len(raw_headers) > MAX_TABLE_COLUMNS:
@@ -257,7 +264,10 @@ def _table_payload(payload: dict) -> tuple[list[str], list[list[str]]]:
     for value in raw_headers:
         if not isinstance(value, str) or len(value) > MAX_HEADER_CHARS:
             return [], []
-        headers.append(_bounded_text(value, MAX_HEADER_CHARS))
+        text = _bounded_text(value, MAX_HEADER_CHARS)
+        if not text:
+            return [], []
+        headers.append(text)
     raw_rows = payload.get("rows")
     rows: list[list[str]] = []
     if not isinstance(raw_rows, (list, tuple)) or len(raw_rows) > MAX_TABLE_ROWS:
@@ -414,7 +424,6 @@ async def infer_table(
         return None
 
     headers, rows = _table_payload(payload)
-    headers = [header for header in headers if header]
     if not headers:
         return None
 

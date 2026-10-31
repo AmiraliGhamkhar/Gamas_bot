@@ -241,16 +241,37 @@ SECTPR_SUCCESSORS = (
 SECTPR_AFTER_MARGINS = ("w:paperSrc", "w:pgBorders") + SECTPR_SUCCESSORS
 
 
+def portable_text(text: str) -> str:
+    """Make text storable by any document container, without reflowing it.
+
+    Two deterministic steps, in this order:
+
+    1. Word-processing soft line breaks (VT/FF) become ordinary spaces — they
+       are legal in an uploaded ``.txt``/``.csv`` and they separate words, so
+       dropping them would join ``c\\x0cd`` into ``cd``;
+    2. characters XML 1.0 cannot store are dropped, because python-docx raises
+       ``ValueError`` and openpyxl raises ``IllegalCharacterError`` on them,
+       which used to cost the user the whole document.
+
+    This is the container-safety half of :func:`xml_safe`; it is exported
+    separately for producers whose rendered value must stay byte-for-byte the
+    user's own text (a Free Office CSV cell, a sheet name, a workbook title),
+    where the Persian letter normalization of :func:`xml_safe` would be a
+    rewrite of the user's words rather than a rendering detail.
+    """
+    if not text:
+        return text
+    return XML_INVALID_CHARS.sub("", SOFT_BREAK_CHARS.sub(" ", text))
+
+
 def xml_safe(text: str) -> str:
     """Prepare text for storage in a .docx part.
 
     Three deterministic steps, in this order:
 
-    1. PowerPoint soft line breaks (VT/FF) become ordinary spaces — they are
-       legal in a transcript but would break a Word paragraph;
-    2. characters XML 1.0 cannot store are dropped, because python-docx raises
-       ``ValueError`` on them and that used to cost the user the whole document;
-    3. Persian letter/whitespace normalization folds the Arabic KAF/YEH that a
+    1. :func:`portable_text` makes the text storable at all (soft line breaks
+       become spaces, XML-invalid characters are dropped);
+    2. Persian letter/whitespace normalization folds the Arabic KAF/YEH that a
        second keyboard or an STT engine emits to their Persian equivalents
        (IANA fa-IR table), so one document is not a mix of two alphabets.
 
@@ -260,7 +281,7 @@ def xml_safe(text: str) -> str:
     # NBSP is intentional typography in compact Latin table terms; normalize
     # each run between NBSPs independently, then put the original nonbreaking
     # separators back. This avoids sentinels that could collide with user text.
-    safe = XML_INVALID_CHARS.sub("", SOFT_BREAK_CHARS.sub(" ", text))
+    safe = portable_text(text)
     return "\u00a0".join(normalize_display(part) for part in safe.split("\u00a0"))
 
 

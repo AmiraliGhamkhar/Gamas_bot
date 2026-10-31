@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased — Free Office and model-output hardening
+
+- **Excel no longer refuses a text file with control characters.** A `.txt`, `.csv` or `.tsv` upload is
+  read verbatim, so a form feed, vertical tab or stray `\x01` reached the builders unchanged. Word,
+  PowerPoint and PDF normalized them, but the spreadsheet writer raised
+  `openpyxl.IllegalCharacterError` for the whole document and the workbook metadata raised
+  `ValueError` for such a character in the title — the user saw only the generic callback error and
+  never received the file. Text and title are now normalized once at the section's single ingestion
+  point (`docx_export.portable_text`, also used by the Word engine), so every format renders the same
+  wording: VT/FF become a space, unstorable characters are removed. The same fix removes the
+  `_x000C_`-style escape artifacts python-pptx used to show in a slide title.
+- **A model table with an unnamed column is refused instead of shifting cells.** `office_ai` filtered
+  the empty header out, which pulled every later cell one column left and silently discarded the cells
+  that no longer fit — a sheet that no longer said what the user's text said. Such a plan now falls
+  back to the deterministic sheet, which keeps every line.
+- Regression tests for both: three builder-level tests and one end-to-end upload→Excel test fail
+  against the previous code, as does the unnamed-column test.
+
 ## Unreleased — reliability re-audit
 
 - **Cancellation-safe membership checks.** The one-request-per-user sharing in

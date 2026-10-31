@@ -402,6 +402,87 @@ class PowerPointDocumentTests(unittest.TestCase):
         self.assertTrue(any("علی | ۲۰ | تهران" in note for note in notes))
 
 
+class ControlCharacterTests(unittest.TestCase):
+    """A text file or a paste may contain control bytes; no export may fail.
+
+    A ``.txt``/``.csv``/``.tsv`` upload is read verbatim, so C0 control
+    characters other than ``\\t``/``\\n``/``\\r`` reach the builders exactly as
+    the user's file contained them. The Word engine has always normalised them
+    (``docx_export.xml_safe``), but the spreadsheet writer refused the whole
+    file with an ``IllegalCharacterError`` and the workbook metadata raised a
+    ``ValueError`` — so an Excel export of a perfectly readable text failed
+    while the same text exported to Word, PowerPoint and PDF.
+    """
+
+    #: ``\\x01``/``\\x08``/``\\x1f`` are stored by no OOXML editor at all and
+    #: are dropped; ``\\x0b`` (VT) and ``\\x0c`` (FF) are legal in a text file
+    #: and separate words, so they must become a space rather than join them.
+    #: Both rules are the ones ``docx_export.xml_safe`` has always applied.
+    CONTROL_TEXT = "نام\tمقدار\na\x01b\tc\x0cd\ne\x08f\tg\x1fh\n"
+
+    def build_xlsx(self, document) -> bytes:
+        """Build the workbook, reporting a refusal without a control-char repr.
+
+        ``openpyxl`` quotes the offending cell in its own exception message, and
+        rendering that message makes an unrelated pytest/CPython AST bug abort
+        the report. A plain assertion keeps the regression readable.
+        """
+        try:
+            return build_office_xlsx(document, list(document.tables))
+        except Exception as exc:  # noqa: BLE001 - the reason is re-raised as a failure
+            self.fail(
+                f"Excel export refused a user text ({type(exc).__name__}); "
+                "the same text must not fail one format while the others build"
+            )
+
+    def test_excel_export_survives_control_characters_from_a_text_upload(self):
+        document = build_office_document(self.CONTROL_TEXT)
+        payload = self.build_xlsx(document)
+        sheet = openpyxl.load_workbook(io.BytesIO(payload)).active
+        self.assertEqual(sheet["A2"].value, "ab")
+        # A soft line break separates the words; it must not join them.
+        self.assertEqual(sheet["B2"].value, "c d")
+        self.assertEqual(sheet["A3"].value, "ef")
+        self.assertEqual(sheet["B3"].value, "gh")
+
+    def test_a_control_character_in_the_title_does_not_break_the_workbook(self):
+        document = build_office_document("متن سند", title="عنوان\x01سند\x0cآزمون")
+        payload = self.build_xlsx(document)
+        workbook = openpyxl.load_workbook(io.BytesIO(payload))
+        title = workbook.properties.title or ""
+        self.assertIn("عنوان", title)
+        self.assertIn("آزمون", title)
+        self.assertNotIn("\x01", title)
+        self.assertNotIn("\x0c", title)
+        self.assertNotIn("\x01", "".join(workbook.sheetnames))
+
+    def test_csv_cells_keep_their_words_when_they_carry_control_characters(self):
+        document = build_office_document(
+            'نام,مقدار\n"a\x01b","c\x0cd"\n', title="آزمون", delimiter=","
+        )
+        payload = self.build_xlsx(document)
+        sheet = openpyxl.load_workbook(io.BytesIO(payload)).active
+        self.assertEqual(sheet["A2"].value, "ab")
+        self.assertEqual(sheet["B2"].value, "c d")
+
+    def test_powerpoint_shows_no_escape_artifacts_for_control_characters(self):
+        document = build_office_document("متن اصلی\x01", title="عنوان\x0cآزمون")
+        payload = build_office_pptx(document, fallback_slides(document))
+        presentation = Presentation(io.BytesIO(payload))
+        texts = [
+            shape.text_frame.text
+            for slide in presentation.slides
+            for shape in slide.shapes
+            if shape.has_text_frame
+        ]
+        joined = "\n".join(texts)
+        self.assertIn("عنوان", joined)
+        self.assertIn("متن اصلی", joined)
+        # python-pptx escapes an unrepresentable character as ``_x0001_``; a
+        # user must never read that in their own deck.
+        self.assertNotIn("_x000", joined)
+
+
 # ---------------------------------------------------------------------------
 # The model layer
 # ---------------------------------------------------------------------------
@@ -545,6 +626,24 @@ class ModelValidationTests(unittest.IsolatedAsyncioTestCase):
         assert table is not None
         self.assertEqual(table.headers, ("نام", "سن"))
         self.assertEqual(table.rows, (("علی", "۲۰"),))
+
+    async def test_a_table_with_an_unnamed_column_is_refused_not_shifted(self):
+        """An unnamed column must not shift the following cells into place.
+
+        The payload below used to be accepted with the blank header filtered
+        out: the sheet became two columns, «۲۰» moved under «شهر» and the real
+        «تهران» cell was dropped — a sheet that no longer said what the user's
+        text said. The plan is now refused and the deterministic sheet (which
+        contains every line) is used instead.
+        """
+        session = _FakeLLMSession(
+            {
+                "headers": ["نام", "   ", "شهر"],
+                "rows": [["علی", "۲۰", "تهران"]],
+            }
+        )
+        table = await infer_table(SAMPLE, settings=self.settings(), session=session)
+        self.assertIsNone(table)
 
     async def test_a_table_of_invented_cells_is_refused(self):
         session = _FakeLLMSession(
