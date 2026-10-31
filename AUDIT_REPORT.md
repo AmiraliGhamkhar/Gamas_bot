@@ -1,4 +1,327 @@
-# Reliability, security and production-readiness audit — current working tree
+# Document-export and model-output audit — current working tree
+
+Date: 2026-10-31. Base revision reviewed: `4a9280f7856a622d18ddc8a0523330d80300e570`
+(`main`, merge of PR #99), branch `arena/a03132e9-gamas-bot`, working tree clean at start
+(`git status`: nothing to commit). Everything below refers to this checkout, its offline test
+suite and controlled local reproductions — **not** to a deployed instance. The previous round's
+report follows this one as history; its revision (`b526c4e`, PR #98) no longer describes this tree.
+
+## 1. Executive summary
+
+The checkout is in good condition and the previous round's conclusions still hold for the parts it
+covered. The baseline was **green before any change**: 1,246 tests and 62 subtests passed, and
+`ruff`, `mypy`, `compileall`, the dependency-sync check, `pip check` and the media-worker check were
+all clean. No P0 (data loss, billing integrity, authorization) and no P1 defect was found. Twenty-three
+areas were re-verified from the code (billing holds and settlement, payment review, owner scoping of
+documents/library/learning/payments/support, receipt path safety, STT failover and cancellation,
+provider-slot release, queue shutdown, migrations, filename handling) without finding a defect; the
+pure text/document layer was additionally fuzzed (≈2,000 adversarial cases across seven invariants)
+with zero failures.
+
+Two genuine defects were found, both in the Free Office / model-output layer, and both are fixed:
+
+1. **Excel export refused a valid text file** containing an ordinary C0 control character (a form
+   feed, a vertical tab, a stray `\x01`) — which a verbatim `.txt`/`.csv`/`.tsv` upload legitimately
+   contains — while Word, PowerPoint and PDF of the same text built normally. The user saw only the
+   generic callback error and never received the file; the same input also broke the workbook
+   metadata when the character appeared in the document title. Root cause: the Word engine has always
+   normalized such characters (`docx_export.xml_safe`), but the Office ingestion point did not, so the
+   spreadsheet writer received text it cannot store.
+2. **A model-proposed table with an unnamed column was silently reshaped.** `office_ai` filtered the
+   empty header out, shifting every following cell one column left and discarding the cells that no
+   longer fit — a sheet that no longer said what the user's text said, contradicting the module's
+   documented "no cell is ever lost" rule. The plan is now refused and the deterministic,
+   complete-source sheet is used instead.
+
+Both fixes are small, localized and covered by six new regression tests that fail against the pre-fix
+code and pass after it. No schema, migration, price, plan, callback identifier, environment default,
+provider route or user-facing copy changed. The measurable cost is one extra regular-expression pass
+per Office document build (≈+0.25 ms on a 31,600-character document, ≈0.5% of the 52 ms export).
+
+## 2. Repository architecture (as verified)
+
+One Python 3.11+ process: a Telethon client, a bounded asyncio job queue, provider HTTP clients and
+one SQLite database in WAL mode. No broker, no external database, no Office suite, no system FFmpeg.
+
+```text
+Telegram update ─┬─ NewMessage  → ban gate → ensure_user → subscription gate → text/file classification
+                 │                 ├─ audio/video/voice/deck → Database.create_submission (one write txn,
+                 │                 │     per-user admission) → JobQueue.submit
+                 │                 │     → worker: download (bounded, stall-checked) → media_worker child
+                 │                 │     → STT (capacity pool + ordered failover) → transcript delivered
+                 │                 │     → settle_hold (exactly-once debit) → notes (LLM hedge/failover)
+                 │                 │     → evidence gate → DOCX/PDF → library reference → prune
+                 │                 ├─ PDF/DOCX/PPTX → doc_extract (ZIP preflight, per-page caps)
+                 │                 │     → documents + chunks cache → full/compact notes, Word/Excel/
+                 │                 │       PowerPoint/PDF exports, original download, quiz/deck
+                 │                 └─ .txt/.md/.csv/.tsv → in-memory Office draft → build_office_document
+                 │                       → DOCX/XLSX/PPTX/PDF → Telegram file + library reference
+                 └─ CallbackQuery → private-chat check → ban → admin prefix (adm:/payv:) →
+                       subscription gate → callback-route table → owner-scoped DB query → screen
+```
+
+Module map (unchanged by this round): `bot.py` (Telegram routing, screens, orchestration),
+`jobs.py`/`capacity.py`/`progress.py` (queue, stage slots, progress), `media.py`/`media_worker.py`/
+`presentations.py` (media and decks), `stt.py`/`llm.py`/`http_util.py`/`notes.py`/
+`notes_evidence.py`/`transcript.py` (providers and notes), `doc_extract.py`/`office.py`/
+`office_ai.py`/`office_notes.py`/`docx_export.py`/`pdf_export.py`/`mdblocks.py`/`bidi.py`/`fileio.py`
+(documents and Free Office), `db.py`/`billing.py`/`migrations/v3` (data, billing, reporting),
+`config.py`/`launcher.py`/`instance_lock.py`/`logging_config.py`/`metrics.py` (startup and
+operations).
+
+## 3. Existing functionality verified in this checkout
+
+Read and traced (not merely listed): audio/video/voice/video-note intake and the transcript-first
+ordering; presentation narration as an explicit action; STT provider chain (size ceilings, cooldowns,
+zero-wait overflow, ordered failover, no re-upload of a non-idempotent submission, cancellation);
+LLM routing with hedging, cooldowns, route pools and untrusted-output validation; PDF/DOCX/PPTX
+extraction with locators and SHA-256 per-user deduplication; full versus compact document notes;
+Free Office drafts and all four exports; Excel literal-string cell policy; quiz/flashcard generation,
+free first use, paid charges and refunds; the credit ledger, holds, allocations and settlement;
+manual card-to-card payments with receipt validation and admin review; support tickets; the admin
+hubs; and the channel-subscription gate (administrators exempt, confirmed non-members denied on both
+message and callback routes, infrastructure failures fail **open** with an operator alert, database
+subscription fields observational only).
+
+## 4. Findings
+
+Severity: **P0** security/data-loss/billing-integrity, **P1** serious functional or reliability
+defect, **P2** meaningful functional/performance issue, **P3** minor.
+
+| ID | Severity | Description | Affected modules | Evidence | Status |
+| --- | --- | --- | --- | --- | --- |
+| F-1 | P2 | Excel export refused the whole document when user text (or its title) contained a C0 control character; other formats succeeded and the user only saw the generic callback error | `gamas_bot/office.py` (`build_office_document`, `build_office_xlsx`), reachable from `bot._build_office_export` via `read_text_file` | Reproduced: `openpyxl.utils.exceptions.IllegalCharacterError: a\u0001b cannot be used in worksheets`; with the character only in the title, `ValueError: All strings must be XML compatible` | **Fixed** |
+| F-2 | P3 | A slide title/body containing a control character was shown to the user as python-pptx's `_x0001_`/`_x000C_` escape artifact (same root cause as F-1) | `gamas_bot/office.py` → `build_office_pptx` | Reproduced: extracted deck text contained `عنوان_x000C_آزمون` and `▪ متن اصلی_x0001_` | **Fixed** (by the F-1 change) |
+| F-3 | P3 | A model table with an unnamed column was accepted with the blank header removed: later cells shifted one column left and the overflowing cells were silently dropped | `gamas_bot/office_ai.py` (`_table_payload`, `infer_table`) | Reproduced: payload `headers=["نام","   ","شهر"], rows=[["علی","۲۰","تهران"]]` produced `OfficeTable(headers=('نام','شهر'), rows=(('علی','۲۰'),))` — «تهران» lost, «۲۰» under «شهر» | **Fixed** |
+| F-4 | P3 (risk, not a defect) | `docx_export.build_plain_docx` raises `ValueError` if `DocumentMeta.reference` or a similar metadata string contains a control character | `gamas_bot/docx_export.py` | Reproduced with `reference="R\x011"` | **Not changed** — every reference is generated internally (`GMS-…`, `OFF-…`, `DOC-…`); no user input reaches it. Recorded so a future caller does not introduce the reachability |
+
+### F-1 — detail
+
+* **Files / functions:** `gamas_bot/office.py::build_office_document` (the section's single ingestion
+  point) and `build_office_xlsx`; the same text reaches `bot._build_office_export` from
+  `office:fmt:excel` (Free Office draft) and `doc:ex:<id>:excel` (extracted document text).
+* **Mechanism:** `office.read_text_file` accepts every non-NUL byte of a text upload, and a pasted
+  message is equally verbatim, so VT/FF and other C0 characters arrive intact. `build_office_document`
+  applied only `normalize_display` (letters and horizontal whitespace), so openpyxl's
+  `ILLEGAL_CHARACTERS_RE` (`[\x00-\x08]|[\x0b-\x0c]|[\x0e-\x1f]`) rejected the first such cell. The
+  workbook title took a second, independent path (`workbook.properties.title`), which lxml rejects.
+  The raised types are not `OfficeError`, so `_office_run_operation`'s
+  `except (OfficeError, StructuringError)` did not catch them: the callback fell through to the
+  generic "خطایی رخ داد" answer and no file was delivered.
+* **Reproduction:** `python -m pytest tests/test_office.py -k ControlCharacter` against the base
+  revision → 4 failures (`IllegalCharacterError`, `ValueError`, and the `_x000` artifact),
+  `tests/test_office_flow.py::…::test_a_text_upload_with_control_characters_exports_every_format` →
+  no `.xlsx` delivered. Against this tree all six pass.
+* **Actual impact:** a deterministic, repeatable failure to deliver one advertised format for a valid
+  input class; Word/PowerPoint/PDF of the same text worked. No charge, no data loss (the draft
+  survived), no cross-user effect.
+* **Correction:** one sanitizer, one place. `docx_export.portable_text` was extracted from the
+  existing `xml_safe` (same two steps, no behaviour change there) and is applied to the source text
+  and the title in `build_office_document`. VT/FF become a space — they separate words — and
+  characters XML 1.0 cannot store are removed, which is exactly the rule the Word engine already
+  applied. Every builder and every label the export derives (sheet name, workbook title, PDF cover,
+  slide titles) therefore receives text it can store.
+* **Regression tests:** `tests/test_office.py::ControlCharacterTests` (4 tests: text upload, title,
+  CSV cells, PowerPoint artifacts) and
+  `tests/test_office_flow.py::…::test_a_text_upload_with_control_characters_exports_every_format`
+  (end-to-end upload → Excel download, asserting the words survive, no control character reaches a
+  cell, the source file is untouched, billing is unchanged and the temp directory is cleaned).
+
+### F-3 — detail
+
+* **Files / functions:** `gamas_bot/office_ai.py::_table_payload`, `infer_table`.
+* **Mechanism:** `_table_payload` accepted an empty/whitespace-only header and `infer_table` then
+  filtered it out, so `width = len(headers)` shrank while the validated row still had the original
+  width; `cells = list(row[:width]) + …` truncated the row. Alignment and content both changed
+  silently, which is the failure mode the module's docstring exists to prevent.
+* **Reproduction:** the payload above against the base revision returns a two-column table missing a
+  real source cell; `tests/test_office.py::ModelValidationTests::test_a_table_with_an_unnamed_column_is_refused_not_shifted`
+  fails on the base revision and passes now.
+* **Impact:** an arrangement error, model-dependent, never a fabricated fact (cells are still checked
+  against the source) and never a charge. The deterministic fallback sheet is complete.
+* **Correction:** an unnamed column now rejects the plan (`infer_table` returns `None`), so the
+  caller uses the deterministic sheet that contains every line. The redundant filter in
+  `infer_table` was removed.
+* **Regression test:** the test above.
+
+### 4.1 Checked and found clean (do not re-litigate without new evidence)
+
+* **Billing.** `reserve`/`settle_hold`/`release_hold` run inside one `BEGIN IMMEDIATE` transaction
+  each; settlement charges at most the reservation and at most the allocated lots; a released hold is
+  never charged twice (`WHERE released_at IS NULL` + the no-hold branch excludes released rows);
+  `spend_seconds` writes its `debit_allocations` and its pending `learning_charge` in the same
+  transaction; `refund_learning_charge` is status-guarded. `_credit_lots` subtracts both debit and
+  active-hold allocations and honours expiry with `julianday()` comparisons.
+* **Payments.** `review_payment` re-reads status and receipt inside the transaction and the unique
+  `ledger.payment_id` index backs it up; `_is_safe_receipt_path` rejects symlinks, hard links and
+  paths outside the receipt directory and re-validates the image before forwarding.
+* **Authorization.** `document_get`, `document_by_library_item`, `library_item*`, `documents_list`,
+  quiz/deck/payment/support reads all bind `user_id`; `doc:*`, `lib:*`, `office:*` routes resolve
+  through them, so a forged id is "not found". Callbacks require a private chat, a non-banned sender,
+  an admin id for `adm:`/`payv:` and the subscription gate; the presentation-from-message route
+  re-fetches the message from the requester's own private chat and checks the sender.
+* **Cancellation and slots.** `_office_in_flight`, `_learning_in_flight`, `_intake_tasks`,
+  `_office_tasks`, `_document_locks`, `_document_semaphore`, the STT/LLM `SlotLease`s and the queue's
+  per-user counters are all released in `finally`; `run_file_io` shields and joins a bounded system
+  call before re-raising `CancelledError`; `_download_media_ranges` cancels and joins its range tasks
+  and closes its descriptor.
+* **File safety.** OOXML entry-count and expanded-size preflight, encrypted-entry rejection before
+  python-docx/pptx open a package, forged-size detection while copying members, encrypted-PDF
+  detection, 50 MB upload cap, per-user temp directories under `TEMP_DIR` removed in `finally`.
+  Filenames pass `sanitize_filename_part` (separators and control characters removed), so no user
+  title can traverse out of the work directory or escape `TEMP_DIR` — verified against
+  `../../etc/passwd`, `..\\..\\x`, `%2e%2e`, NUL and `/`.
+* **Excel/CSV payloads.** Formula-looking cells (`=`, `+`, `-`, `@`, `=cmd|…`) are written with
+  `data_type="s"`; the produced sheet XML contains no `<f>` element. Zero-padded identifiers stay
+  strings; only ASCII-digit cells become numbers.
+* **Pure text layer (fuzz).** Over ~2,000 adversarial strings: `split_message`/`render_pages` never
+  exceed the UTF-16 budget and never lose content; `chunk_sections` never exceeds its budget;
+  `parse_blocks` drops no line content; `normalize_display` is idempotent; `split_direction_runs`
+  reproduces its input; `office_source_chunks` round-trips the text it is given.
+* **Migrations.** No migration was added or edited; the CI migration gate (fresh database, exact
+  table set, unique `016_*` ordering) passes untouched, so `017_…` remains the next free sequence.
+* **Single-instance.** `InstanceLock` is an advisory `flock` (kernel-released on any death), the
+  launcher serializes watchdogs with a second lock and re-checks the session lock immediately before
+  spawning. Two instances remain unsupported by design and are prevented, not merely discouraged.
+
+## 5. Changes implemented
+
+| File | Why it changed |
+| --- | --- |
+| `gamas_bot/docx_export.py` | Extracted `portable_text()` (soft-break → space, XML-invalid characters removed) out of `xml_safe()`; `xml_safe` now calls it, so its behaviour and all Word output are unchanged |
+| `gamas_bot/office.py` | `build_office_document` normalizes the source text and the title once with `portable_text`, so every Office builder (DOCX/XLSX/PPTX/PDF) and every derived label receives storable text (F-1, F-2) |
+| `gamas_bot/office_ai.py` | `_table_payload` rejects a plan with an unnamed column; `infer_table` no longer filters headers (F-3) |
+| `tests/test_office.py` | `ControlCharacterTests` (4 regression tests) and `test_a_table_with_an_unnamed_column_is_refused_not_shifted` |
+| `tests/test_office_flow.py` | End-to-end `.txt` upload with control characters → Excel export must deliver a real file |
+| `docs/OFFICE.md`, `docs/CHANGELOG.md` | Document the normalization rule and record the fixes |
+
+No other module was touched. `bot.py`, `db.py`, all migrations, `config.py`, `stt.py`, `llm.py`,
+`notes.py` and the deployment files are byte-identical to the base revision.
+
+## 6. Database and migration changes
+
+**None.** No table, column, index or migration was added, reordered or edited. Both fixes are pure
+functions over text. Data-preservation guarantees are therefore unchanged and the upgrade is
+schema-compatible in both directions.
+
+## 7. Security review
+
+* No new input reaches SQL, a shell, a path or a network request. The sanitizer only removes
+  characters; it never rewrites words (`normalize_display` remains the only letter normalization, and
+  it stays in the Word path where it already was).
+* F-1's fix removes a state where a valid user file produced an unhandled exception inside the
+  callback dispatcher — a small robustness gain, not a security fix: the generic handler already
+  contained it and no exception text reached the user.
+* Re-verified, unchanged: callback authorization at the server boundary (not from callback data),
+  owner-scoped queries for every `doc:`/`lib:`/`office:` resource, receipt path containment and
+  re-validation, secrets kept out of logs (the LLM error path redacts the key and `Bearer` tokens),
+  private `0600`/`0700` database, session, receipt and temp paths.
+* **Still open by policy:** the subscription gate fails **open** on infrastructure failure. This is
+  deliberate and documented; switching it to fail-closed would deny paying members during a Telegram
+  Bot API outage and requires an explicit product decision (§10.1).
+
+## 8. Performance review
+
+No performance improvement is claimed and none is needed. The only added work is one
+`str`-level regex pass per Office document build.
+
+Measured in this sandbox (Python 3.11.2, 2 vCPU, 31,600-character document with a 400-row table,
+best of 7 builds per run, three runs per side):
+
+| Stage | Base `4a9280f` | This tree | Delta |
+| --- | --- | --- | --- |
+| `build_office_document` (parse) | 3.18–3.26 ms | 3.41–3.47 ms | +0.2 ms (+6%) |
+| `office_document_tables` + `build_office_xlsx` | 50.0–51.6 ms | 51.9–53.0 ms | within run-to-run noise |
+
+That is ≈0.5% of a spreadsheet export and ≈0.02% of the end-to-end Office operation (download,
+build, Telegram upload). Peak memory is unchanged: the sanitizer builds one extra string of the same
+order as the input, and the input is already bounded (100,000 pasted characters / 1 MB text file).
+The F-3 change makes a rare model response fall back to the deterministic sheet, which is *cheaper*
+than the model call it replaces. No concurrency variable, timeout, pool size, buffer or chunk size
+was altered.
+
+## 9. Testing results
+
+Every command below was executed in this checkout. Nothing here is a live-environment claim.
+
+| Command | Executed | Result (base → this tree) |
+| --- | --- | --- |
+| `python -m pytest -q` | yes | **1,246 passed** + 62 subtests (69.8 s) → **1,252 passed** + 62 subtests (71.2 s) |
+| `python -m unittest discover -s tests -q` | yes | **Ran 1,252 tests — OK** (67.7 s) |
+| `ruff check .` | yes | All checks passed (both sides) |
+| `python -m mypy` | yes | Success, no issues in 32 source files (both sides) |
+| `python -m compileall -q gamas_bot scripts tests passenger_wsgi.py` | yes | OK (both sides) |
+| `python -m scripts.sync_requirements --check` | yes | `requirements.txt is up to date` |
+| `python -m pip check` | yes | No broken requirements |
+| `python -m gamas_bot.media_worker check` | yes | `{"av": "18.1.0", "ppt2pptx": "0.4.2"}` |
+| `coverage run -m pytest` | yes | TOTAL 83% (snapshot; unchanged shape) |
+| New tests against the **base** revision | yes | 4 `ControlCharacterTests` + 1 end-to-end Excel export + 1 unnamed-column test **fail**; all 6 pass here |
+
+Not executed (no environment): live Telegram Bot API/MTProto, real STT/LLM providers, real payment
+receipts, cPanel/Passenger, the cron watchdog, and a production-sized database. The fuzzing,
+sanitizer and export probes were local and synthetic.
+
+## 10. Remaining risks and decisions requiring authorization
+
+1. **Subscription fail-open policy (product decision).** Unchanged. A confirmed infrastructure
+   failure admits the user and alerts the administrators. Making it fail-closed is a one-line change
+   with a large access-control consequence and is **not** made here.
+2. **Document text retention (product decision).** Extracted PDF/DOCX/PPTX text is stored in SQLite
+   with no per-user count, expiry or self-service deletion, and `library_prune` does not remove it —
+   deleting a library mirror sets `documents.library_item_id` to `NULL` (via
+   `ON DELETE SET NULL`), so the extracted text and its chunks remain. This audit did not delete or
+   migrate any document data. Implementing a lifecycle needs an approved policy first.
+3. **Parser resource isolation (infrastructure decision).** Parsing runs in a worker *thread* with
+   size and expansion caps, not in a CPU/memory-limited process. A per-file process would help a
+   pathological file but may not be viable on the supported cPanel target.
+4. **Single-process assumptions.** Instance lock, stage semaphores, provider cooldowns, Office drafts,
+   curation previews, dedupe locks and admission fingerprints are process-local. Horizontal scaling
+   is not implemented and is not claimed.
+5. **`DocumentMeta.reference` (F-4).** Metadata strings are not sanitized; only internally generated
+   references reach them today. A future caller passing user text there would reintroduce a
+   `ValueError`, so the internal-only invariant is recorded here.
+6. **`bot.py` size.** Still ~9.2k lines with routing, screens and orchestration interleaved. No
+   extraction was performed: no defect required it, and the seams (callback routing, document
+   orchestration, Office orchestration, payments, support, reporting) remain future work.
+
+## 11. Deployment instructions (unchanged model)
+
+No migration and no dependency change, so this is the standard cPanel procedure
+(`docs/DEPLOY_CPANEL.md`):
+
+1. `cp .env .env.bak`; keep both `0600` and outside `public_html`.
+2. Stop the worker (the launcher's instance lock prevents a second copy from starting).
+3. Back up the SQLite database **while stopped**, including `-wal`/`-shm` sidecars if present.
+4. `git fetch && git checkout <this revision>`; `. .venv/bin/activate`;
+   `python -m pip install -r requirements.txt` (expected no-op).
+5. `python -m scripts.cpanel_preflight` and `python -m gamas_bot --check` (offline, side-effect free).
+6. Start the bot; the cron watchdog entry is unchanged and startup re-applies no migration.
+7. Confirm in the log: queue workers started, `subscription self-check` (if enabled), no
+   `SQLite reference integrity` warning. Optionally generate one Excel export from a text draft to
+   confirm the fixed path.
+8. **Rollback:** revert the checkout and restart. The changed code is schema-compatible in both
+   directions, so no database restore is needed for this change.
+
+## 12. Final engineering assessment
+
+**Ready with documented operational limitations.**
+
+Evidence: the baseline was green and stayed green; the two defects found are real, reproduced before
+the fix and covered by tests that fail against the base revision; no P0/P1 issue was found in the
+re-verified billing, authorization, cancellation, file-safety and migration paths; static gates,
+dependency consistency and the media-worker smoke test are clean; no schema, price, callback,
+configuration or deployment contract changed; and the only measurable cost is a sub-millisecond text
+pass.
+
+The qualifiers are real and unchanged: verification is **offline only**, document text retention and
+the subscription fail-open policy still need product decisions, document parsing is thread-isolated
+rather than process-isolated, and the deployment remains single-instance by design.
+
+---
+
+# Previous round (historical)
+
+# Reliability, security and production-readiness audit — round of `b526c4e`
 
 Date: 2026-10-31. Base revision reviewed: `b526c4e5d0e05b85091de12b20704472afbd31f7`
 (`main`, merge of PR #98), branch `arena/2703e486-gamas-bot`, working tree clean at start.

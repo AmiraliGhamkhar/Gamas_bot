@@ -23,6 +23,13 @@ Persian error instead of being partially parsed. Formula-looking values are writ
 in XLSX cells. `openpyxl` does not calculate formulas; the workbook contains values, not a formula
 calculation engine.
 
+Uploaded and pasted text is read verbatim, so it can carry C0 control characters (a form feed from a
+printer dump, a stray `\x01`). They are normalized once, when the draft is parsed, exactly as the Word
+engine has always normalized them: vertical tab and form feed become a space (they separate words),
+and characters XML 1.0 cannot store are removed. The visible wording is unchanged, and no format can
+refuse a text that another format accepts — before this rule, Excel rejected the whole file
+(`openpyxl.IllegalCharacterError`) while Word, PowerPoint and PDF of the same text built normally.
+
 ## Uploaded study documents
 
 PDF, `.docx` and `.pptx` uploads retain their original Telegram message and the existing
