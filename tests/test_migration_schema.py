@@ -60,6 +60,27 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             await self.db.library_add(12, "unknown", 12, 45, None, title="نامعتبر")
 
+    async def test_documents_accept_the_ocr_image_source_only(self):
+        """Migration 017 widens the source types by exactly one value."""
+        await self.db.ensure_user(13)
+        await self.db._write(
+            "INSERT INTO documents(user_id, file_msg_ref, title, source_type, "
+            "page_count, sha256, text, chunks_json, created_at) "
+            "VALUES (?, '', 'عکس', 'image', 1, 'image-hash', 'متن', '[]', '2026-01-01')",
+            (13,),
+        )
+        rows = await self.db.db.execute_fetchall(
+            "SELECT source_type FROM documents WHERE user_id = ?", (13,)
+        )
+        self.assertEqual([row["source_type"] for row in rows], ["image"])
+        with self.assertRaises(sqlite3.IntegrityError):
+            await self.db._write(
+                "INSERT INTO documents(user_id, file_msg_ref, title, source_type, "
+                "page_count, sha256, text, chunks_json, created_at) "
+                "VALUES (?, '', 'x', 'xlsx', 1, 'h', 't', '[]', '2026-01-01')",
+                (13,),
+            )
+
     async def test_migration_013_tables_exist_with_their_guards(self):
         for table in ("free_uses", "documents"):
             self.assertIn(table, APPLICATION_TABLES)

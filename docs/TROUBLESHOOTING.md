@@ -46,7 +46,9 @@ Find the `GMS-#####` reference in the log first.
 - Without note-provider keys, Office and document notes still use deterministic fallbacks. A
   provider failure can produce a fallback or a clear refusal if safe compacting is impossible.
 - PowerPoint output is a new deck from text, not a pixel-perfect conversion. Narration/audio runs
-  only when the explicit source-card button is pressed. No OCR is available for scanned PDFs.
+  only when the explicit source-card button is pressed. A scanned PDF or a photo is refused unless
+  `OCR_ENABLED=true`; when OCR is on and the service fails, the bot says so and stores nothing, so
+  resending is safe ([OCR.md](OCR.md)).
 - The Word topic list uses links, not page numbers; the server does not run a Word layout engine.
 - If Word offers to repair a generated file, save it and report the `GMS-#####` reference, Word and
   Windows versions. Do not send `.env`, API keys or transcripts.

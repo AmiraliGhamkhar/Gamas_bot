@@ -51,8 +51,9 @@ start STT or consume a speech quota.
 
 A generated PowerPoint is a new deck arranged from extracted text, not pixel-perfect conversion of
 an arbitrary uploaded presentation. PDF output is a new selectable-text document. Scanned/image-only
-PDFs are not OCR-supported: they are refused by the existing extractor with a clear explanation.
-Encrypted, malformed and over-limit source files are also refused rather than treated as empty.
+PDFs are refused by the existing extractor with a clear explanation unless the deployment enables the
+opt-in OCR path ([OCR.md](OCR.md)); encrypted, malformed and over-limit source files are always
+refused rather than treated as empty.
 
 ## Providers, grounding and fallbacks
 

@@ -13,6 +13,7 @@ Audio/video/deck → bounded queue → PyAV media worker → STT
                  → transcript/booklet Telegram message references saved to the user's library
 
 PDF/DOCX/PPTX → owner-scoped extraction → locator-tagged SQLite document cache
+               (text-poor pages and photos: opt-in OCR, OCR_ENABLED)
                → full booklet / distinct compact notes / text exports
                → original download + generated Word/Excel/PowerPoint/selectable PDF in library
 

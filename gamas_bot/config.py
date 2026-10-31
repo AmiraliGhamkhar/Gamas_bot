@@ -431,6 +431,25 @@ def resolve_note_reasoning_effort(effort: str | None) -> str:
     return value if value in NOTE_REASONING_EFFORTS else ""
 
 
+def _ocr_language(value: str | None) -> str:
+    """Normalise ``OCR_LANGUAGE``; an unusable value falls back to Persian.
+
+    Config parsing clamps and defaults everywhere else (``resolve_*`` helpers),
+    so a typo must not take the whole process down. It is logged loudly and
+    reported by :func:`check` through the resulting value being the default.
+    """
+    from .ocr import DEFAULT_LANGUAGE, normalize_ocr_language
+
+    try:
+        return normalize_ocr_language(value)
+    except ValueError:
+        logger.warning(
+            "OCR_LANGUAGE=%r is not an i2ocr language; using %s",
+            value, DEFAULT_LANGUAGE,
+        )
+        return DEFAULT_LANGUAGE
+
+
 def resolve_raw_text_profile(profile: str | None) -> str:
     value = (profile or "").strip().lower()
     return value if value in RAW_TEXT_PROFILES else "plain"
@@ -653,6 +672,16 @@ class Settings:
     #: separate from ``max_file_size`` because a document is parsed into memory
     #: instead of streamed through the media worker.
     doc_max_bytes: int = 50 * 1024 * 1024
+    #: OCR (third-party, opt-in). A text-poor PDF page, or an uploaded photo,
+    #: is sent to i2ocr.com and read there. Off by default: the document leaves
+    #: the host, so the deployment owner has to accept that trade-off.
+    ocr_enabled: bool = False
+    #: Recognition language as an i2ocr slug (``persian``, ``english``, …).
+    ocr_language: str = "persian"
+    #: Most pages of one document sent to the service; 0 means every page.
+    ocr_max_pages: int = 20
+    #: Wall-clock budget for one document's OCR run, in seconds.
+    ocr_timeout_seconds: float = 600.0
 
     # --- Mandatory channel subscription --------------------------------------
     #: Telegram channel (``@username`` or ``-100...``) whose current members
@@ -1308,6 +1337,15 @@ def from_env(env_file: str | None = None) -> Settings:
         office_min_interval_seconds=_env_float(
             "OFFICE_MIN_INTERVAL_SECONDS", 10.0, minimum=0.0, maximum=3600.0
         ),
+        # OCR is a third-party round trip: the page images leave the host. It
+        # stays off unless the operator accepts that, and it never runs for a
+        # document that already carries a text layer.
+        ocr_enabled=_env_bool("OCR_ENABLED", False),
+        ocr_language=_ocr_language(_env("OCR_LANGUAGE")),
+        ocr_max_pages=_env_int("OCR_MAX_PAGES", 20, minimum=0, maximum=200),
+        ocr_timeout_seconds=_env_float(
+            "OCR_TIMEOUT_SECONDS", 600.0, minimum=30.0, maximum=7200.0
+        ),
         # No fallback card: a deployment that forgets PAYMENT_CARD_* must not
         # silently direct its users' money to a card baked into the source.
         # ``_start_payment`` refuses to open a payment while this is empty.
@@ -1512,6 +1550,16 @@ def check(settings: Settings) -> list[str]:
         problems.append("TELEGRAM_API_ID is not a positive number.")
     if not settings.api_hash:
         problems.append("TELEGRAM_API_HASH is not set.")
+    if settings.ocr_enabled:
+        # The OCR transport is an optional extra: without it every scan and
+        # photo fails at the first upload, which is a worse way to learn.
+        from .ocr import curl_cffi_available
+
+        if not curl_cffi_available():
+            problems.append(
+                "OCR_ENABLED=true but the optional 'curl-cffi' package is not "
+                "installed; run pip install 'gamas-bot[ocr]' or set OCR_ENABLED=false."
+            )
     if not settings.stt_providers:
         # ``_parse_provider_order`` drops unknown slugs, so a typo can empty the
         # list while every key is still set. ``stt.transcribe`` then refuses
