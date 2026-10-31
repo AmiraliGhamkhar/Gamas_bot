@@ -76,7 +76,16 @@ before the first model call and keeping a 🛑 frame where a failed action stopp
 - SQLite migrations run at startup; billing writes are transactional.
 - A lock on the Telegram session prevents duplicate polling. Keep the session and database on a
   local writable filesystem.
-- Provider output is untrusted and checked before delivery.
+- Provider output is untrusted and checked before delivery. Quiz/flashcard generation anchors each
+  item to the chunk it was built from (`learning.anchor_items`): a re-typed locator is stored in the
+  chunk's own spelling, an inner page/slide marker is kept when it occurs in the text, and an
+  invented or missing one is replaced by the chunk label — never stored as the model wrote it. A
+  short answer is topped up by a second, bounded request for the items that are still missing, so
+  the requested count is a target rather than a reason to fail a paid generation; a minimum of 5
+  cards / 3 questions still applies (B4) and a shortfall refunds exactly once.
+- Every library row (booklet, transcript, Office export, document mirror) is a 2–4-word name derived
+  by `gamas_bot/titles.short_title`, and that one name is the artifact's own title, file name, caption
+  and row. The Telegram reference code and icons live in the message, never in the row.
 - The admin dashboard reads only authoritative rows: each submission records `started_at` (the
   worker pickup), `error_kind` (one bounded failure category) and `stt_engine` (written beside the
   transcript, so provider usage survives transcript retention). Windows filter `created_at` with a

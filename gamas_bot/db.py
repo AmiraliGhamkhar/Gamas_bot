@@ -1622,9 +1622,19 @@ class Database:
             )
 
     async def document_ensure_library_item(
-        self, user_id: int, document_id: int, content_text: str
+        self,
+        user_id: int,
+        document_id: int,
+        content_text: str,
+        *,
+        title: str | None = None,
     ) -> int:
-        """Create exactly one owner-scoped library mirror, even on concurrent uploads."""
+        """Create exactly one owner-scoped library mirror, even on concurrent uploads.
+
+        ``title`` is the caller's display name for the row (the 2–4-word title
+        contract); without it the document's own stored title is used, so a
+        caller that predates the contract still gets the old row.
+        """
         async with self._transaction():
             rows = await _rows(
                 self.db,
@@ -1640,10 +1650,11 @@ class Database:
                 chat_id, message_id = (int(part) for part in str(rows[0][1]).split(":", 1))
             except (ValueError, TypeError):
                 chat_id, message_id = 0, 0
+            display_title = title if title else f"📄 {str(rows[0][2])[:120]}"
             cursor = await self.db.execute(
                 "INSERT INTO library_items(user_id, kind, chat_id, message_id, title, "
                 "created_at, content_text) VALUES (?, 'booklet', ?, ?, ?, ?, ?)",
-                (int(user_id), chat_id, message_id, f"📄 {str(rows[0][2])[:120]}",
+                (int(user_id), chat_id, message_id, str(display_title)[:200],
                  iso(utc_now()), content_text),
             )
             item_id = int(cursor.lastrowid or 0)

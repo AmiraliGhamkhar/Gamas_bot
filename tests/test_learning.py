@@ -593,21 +593,34 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state["items"]), 10)
         self.assertEqual(state["failures"], 0)
 
-    async def test_booklet_cards_with_a_fabricated_locator_are_still_refused(self):
+    async def test_a_fabricated_locator_is_never_stored_and_never_fails_the_deck(self):
+        """The chunk the model read *is* the source; the invented place is not.
+
+        A model that cites «صفحهٔ ۹۹» for a booklet with one part used to lose
+        every card and refund a billed generation. The card is now anchored to
+        the chunk label it was generated from, and the fabricated locator is
+        never written anywhere.
+        """
         payload = {
             "cards": [
                 {"front": f"پرسش {index}", "back": f"پاسخ {index}", "source": "صفحهٔ ۹۹"}
-                for index in range(10)
+                for index in range(6)
             ]
         }
         with mock.patch(
             "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)
         ) as generator:
             await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}:quick".encode()))
-        self.assertEqual(generator.await_count, 2)  # one repair attempt, then give up
-        self.assertNotIn(OWNER, self.bot._curation)
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
+        # The second call is the top-up for the four cards still missing, not a
+        # rejection of the first answer.
+        self.assertEqual(generator.await_count, 2)
+        state = self.bot._curation[OWNER]
+        self.assertEqual(len(state["items"]), 6)
+        self.assertEqual({item["source"] for item in state["items"]}, {"بخش ۱"})
+        await self.save_curation("deck")
+        cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
+        self.assertTrue(all(card["source"] == "بخش ۱" for card in cards))
+        self.assertNotIn("صفحهٔ ۹۹", " ".join(card["source"] for card in cards))
 
     async def test_ai_generation_debits_and_builds_deck(self):
         # The paid path: the free first try is already spent, so this deck is
@@ -748,6 +761,11 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.db.deck_add_card(deck_id, "پرسش مهم؟", "پاسخ کامل")
         export = self._event(f"fc:exp:{deck_id}".encode())
         await self.bot._handle_callback(export)
+        # The export is a bar from the first frame, not a frozen screen.
+        frames = [edit["text"] for edit in export.edits]
+        self.assertTrue(frames)
+        self.assertIn("٪", frames[0])
+        self.assertIn("۱۰۰٪", frames[-1])
         docx_paths = [
             record["path"] for record in self.client.deliveries
             if str(record["path"]).endswith(".docx")
@@ -979,6 +997,85 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(event)
         self.assertEqual(await self.db.available_seconds(OWNER), 3600)
         self._assert_failure_frame(self.client.texts[-1]["text"])
+
+    async def test_a_quiz_without_any_source_is_anchored_not_failed(self):
+        """A model that omits `source` no longer zeroes out a paid quiz."""
+        payload = quiz_payload(5)
+        for question in payload["questions"]:
+            question.pop("source")
+        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)
+        ) as generator:
+            await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
+        self.assertEqual(generator.await_count, 1)
+        state = self.bot._curation[OWNER]
+        self.assertEqual(len(state["items"]), 5)
+        self.assertEqual({item["source"] for item in state["items"]}, {"بخش ۱"})
+        await self.save_curation("quiz")
+        saved = await self.db.db.execute_fetchall("SELECT source FROM quiz_questions")
+        self.assertTrue(all(row[0] == "بخش ۱" for row in saved))
+
+    async def test_a_short_answer_is_topped_up_instead_of_failing(self):
+        """3 of 5 questions: the retry asks only for the 2 still missing."""
+        first = {"questions": quiz_payload(5)["questions"][:3]}
+        rest = quiz_payload(5)["questions"][:2]
+        for index, question in enumerate(rest):
+            question["question"] = f"پرسش تکمیلی {index}"
+        second = {"questions": rest}
+        calls: list[dict] = []
+
+        async def provider(*_args, **kwargs):
+            calls.append(kwargs)
+            return first if len(calls) == 1 else second
+
+        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)
+        ):
+            await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
+        self.assertEqual(len(calls), 2)
+        # The repair prompt asks for the missing two, not for five again.
+        self.assertIn("۲ سؤال", calls[1]["system"])
+        state = self.bot._curation[OWNER]
+        self.assertEqual(len(state["items"]), 5)
+        self.assertEqual(state["failures"], 0)
+
+    async def test_a_provider_that_rejects_structured_output_still_answers(self):
+        """The repair attempt drops the schema instead of repeating a rejection.
+
+        A route that refuses ``response_format``/``responseSchema`` used to fail
+        every quiz/flashcard call while note generation (which honours
+        NOTE_STRUCTURED_OUTPUT) kept working.
+        """
+        payload = quiz_payload(5)
+        seen: list[object] = []
+
+        async def provider(*_args, **kwargs):
+            seen.append(kwargs.get("schema"))
+            if kwargs.get("schema") is not None:
+                raise LLMError("response_format is not supported by this model")
+            return payload
+
+        with mock.patch("gamas_bot.learning.random.shuffle"), mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)
+        ):
+            await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
+        self.assertIsNotNone(seen[0])
+        self.assertIsNone(seen[1])
+        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 5)
+
+    async def test_a_zero_result_failure_says_why(self):
+        """«ناموفق» alone is not diagnosable; the frame names the reason."""
+        await self.spend_free_try("quiz")
+        with mock.patch(
+            "gamas_bot.bot.complete_json",
+            new=mock.AsyncMock(side_effect=LLMError("boom")),
+        ):
+            event = self._event(f"quiz:go:{self.item_id}:5".encode())
+            await self.bot._handle_callback(event)
+        text = self.client.texts[-1]["text"]
+        self._assert_failure_frame(text)
+        self.assertIn("سرویس هوش مصنوعی پاسخ معتبری نداد", text)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
 
     async def test_insufficient_balance_denies_without_debit(self):
         await self.spend_free_try("quiz")
@@ -1769,6 +1866,88 @@ class AnchoredQualityTests(unittest.TestCase):
         self.assertEqual(
             parse_quiz_payload(quiz, 1, require_source=True)[0]["source"], "3"
         )
+
+    def test_anchor_items_never_stores_an_unverified_locator(self):
+        """A mismatch is anchored to the chunk, a match keeps the chunk's name.
+
+        This is the contract that replaced "drop the item": the stored locator is
+        always either verified against the chunk or the chunk's own label.
+        """
+        from gamas_bot.learning import anchor_items
+
+        chunk = "[بخش ۱]\n[صفحهٔ ۲]\nمتن درس"
+        items = [
+            {"front": "الف", "back": "۱", "source": "بخش 1"},       # re-typed
+            {"front": "ب", "back": "۲", "source": "صفحهٔ ۲"},        # inner marker
+            {"front": "ج", "back": "۳", "source": "صفحهٔ ۹۹"},       # invented
+            {"front": "د", "back": "۴"},                            # missing
+        ]
+        anchored = anchor_items(items, ("بخش ۱",), "بخش ۱", chunk)
+        self.assertEqual(
+            [item["source"] for item in anchored],
+            ["بخش ۱", "صفحهٔ ۲", "بخش ۱", "بخش ۱"],
+        )
+        # A chunk without any locator keeps whatever the model supplied.
+        legacy = anchor_items([{"front": "ه", "back": "۵", "source": "۳"}], (), "", "")
+        self.assertEqual(legacy[0]["source"], "۳")
+
+    def test_a_letter_or_one_based_answer_key_is_not_misgraded(self):
+        """A provider that ignores the schema may answer «ب» or 1..4."""
+        from gamas_bot.learning import parse_quiz_payload
+
+        def question(correct, text="گزینهٔ درست"):
+            return {
+                "question": "کدام گزینه درست است؟",
+                "options": ["یکی", "دومی", "سومی", "چهارمی"],
+                "correct": correct,
+                "explain": "چون متن همین را می‌گوید.",
+                "source": "بخش ۱",
+            }
+
+        by_letter = {"questions": [question("ب"), question("الف")]}
+        parsed = parse_quiz_payload(by_letter, 2, rng=random.Random(3))
+        self.assertEqual(
+            [record["options"][record["correct_index"]] for record in parsed],
+            ["دومی", "یکی"],
+        )
+
+        # A 4 can only be a 1-based index; the whole payload is shifted once.
+        one_based = {"questions": [question(2), question(4)]}
+        parsed = parse_quiz_payload(one_based, 2, rng=random.Random(4))
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(
+            [record["options"][record["correct_index"]] for record in parsed],
+            ["دومی", "چهارمی"],
+        )
+
+        # A 0-based payload whose key never points at the first option is NOT
+        # shifted: the presence of a 0 anywhere proves the 0-based style.
+        zero_based = {"questions": [question(2), question(0)]}
+        parsed = parse_quiz_payload(zero_based, 2, rng=random.Random(5))
+        self.assertEqual(
+            [record["options"][record["correct_index"]] for record in parsed],
+            ["سومی", "یکی"],
+        )
+
+    def test_renamed_fields_are_read_instead_of_dropped(self):
+        """«explanation»/«question»/«answer» are the same fields by another name."""
+        quiz = {"questions": [{
+            "question": "کدام گزینه درست است؟",
+            "options": ["الف", "ب", "ج", "د"],
+            "correct": 1,
+            "explanation": "توضیح کوتاه.",
+            "source": "بخش ۱",
+        }]}
+        parsed = parse_quiz_payload(quiz, 1, rng=random.Random(7))
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["explanation"], "توضیح کوتاه.")
+        cards = {"cards": [
+            {"question": "پرسش یک", "answer": "پاسخ یک", "منبع": "بخش ۱"},
+        ]}
+        parsed_cards = parse_flashcard_payload(cards, 1)
+        self.assertEqual(parsed_cards, [
+            {"front": "پرسش یک", "back": "پاسخ یک", "source": "بخش ۱"},
+        ])
 
     def test_an_inner_page_marker_of_the_chunk_is_verifiable(self):
         """A booklet carries its own «[صفحهٔ ۲]» markers; citing one is grounded."""

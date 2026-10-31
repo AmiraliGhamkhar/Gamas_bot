@@ -372,6 +372,14 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
                           mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
         document = (await self.db.documents_list(OWNER))[0]
         item_id = document["library_item_id"]
+        # The mirrored row carries the same 2–4-word name the document card shows
+        # (never the upload file name and never an icon/reference caption).
+        from gamas_bot.titles import word_count
+
+        mirrored = await self.db.library_item(OWNER, item_id)
+        self.assertGreaterEqual(word_count(mirrored["title"]), 2, mirrored["title"])
+        self.assertLessEqual(word_count(mirrored["title"]), 4, mirrored["title"])
+        self.assertNotIn("📄", mirrored["title"])
         library = self.press(f"lib:it:{item_id}".encode())
         await self.bot._handle_callback(library)
         self.assertIn(f"doc:quiz:{document['id']}".encode(), self.button_payloads(library.edits))
@@ -387,6 +395,19 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("چرخهٔ کربس", user_prompt)
         self.assertIn("بخش «تنفس سلولی»", generator.await_args.kwargs["system"])
 
+    async def test_forwarding_the_original_document_shows_a_bar(self):
+        """Re-sending an original file is work; the panel must show it."""
+        await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
+        doc_id = (await self.db.documents_list(OWNER))[0]["id"]
+        self.client.forward_messages = mock.AsyncMock(return_value=[object()])
+        event = self.press(f"doc:f:{doc_id}".encode())
+        await self.bot._handle_callback(event)
+        frames = [edit["text"] for edit in event.edits]
+        self.assertTrue(frames)
+        self.assertIn("٪", frames[0])
+        self.assertIn("۱۰۰٪", frames[-1])
+        self.assertIn("دوباره در همین گفتگو ارسال شد", frames[-1])
+
     async def test_foreign_user_cannot_read_or_generate_another_users_document(self):
         await self.ingest("private.pdf", make_pdf_bytes(), mime="application/pdf")
         doc_id = (await self.db.documents_list(OWNER))[0]["id"]
@@ -397,7 +418,13 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             generator.assert_not_awaited()
             self.assertTrue(any(alert for _, alert in event.answers))
 
-    async def test_invalid_source_is_repaired_once_then_refunded(self):
+    async def test_a_fabricated_source_is_anchored_and_never_stored(self):
+        """The chunk a card came from is its source; an invented page is not.
+
+        Refusing every card over an invented locator lost a whole paid
+        generation. The card keeps the page it was actually built from, and the
+        fabricated string is never written.
+        """
         await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
         doc_id = (await self.db.documents_list(OWNER))[0]["id"]
         bad = cards_payload(6)
@@ -405,10 +432,20 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             card["source"] = "صفحهٔ ساختگی"
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=bad)) as generator:
             await self.bot._handle_callback(self.press(f"doc:gen:fc:{doc_id}:quick".encode()))
+        # A top-up was requested for the four cards still missing after the
+        # first six arrived; the answer is not thrown away.
         self.assertEqual(generator.await_count, 2)
-        self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
-        self.assertEqual(await self.db.deck_count(OWNER), 0)
-        self.assertNotIn(OWNER, self.bot._curation)
+        state = self.bot._curation[OWNER]
+        self.assertTrue(state["items"])
+        self.assertTrue(
+            all(item["source"].startswith("صفحهٔ") for item in state["items"])
+        )
+        self.assertNotIn(
+            "ساختگی", " ".join(item["source"] for item in state["items"])
+        )
+        await self.bot._handle_callback(self.press(b"fc:cur:save"))
+        cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
+        self.assertTrue(all(card["source"] and "ساختگی" not in card["source"] for card in cards))
 
     async def test_missing_quiz_difficulty_never_rejects_a_valid_question(self):
         """S5: the difficulty tag is metadata, not an admission requirement.
@@ -449,7 +486,9 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state["items"]), 5)
         self.assertEqual(state["failures"], 0)
         self.assertTrue(all(item["difficulty"] in {"medium", "hard"} for item in state["items"]))
-        self.assertTrue(all(item["source"] == "صفحه 1" for item in state["items"]))
+        # The stored locator is the document's own spelling, so two cards from
+        # one page cannot disagree about its name.
+        self.assertTrue(all(item["source"] == "صفحهٔ ۱" for item in state["items"]))
 
     async def test_parallel_chunk_calls_are_bounded_and_report_progress(self):
         from gamas_bot.doc_extract import DocChunk

@@ -107,6 +107,8 @@ from .learning import (
     OPTION_LABELS,
     QUIZ_SCHEMA,
     SIZE_PRESETS,
+    GenerationShortfallError,
+    anchor_items,
     bound_content_text,
     dedupe_cards,
     dedupe_questions,
@@ -116,8 +118,6 @@ from .learning import (
     parse_quiz_payload,
     preset_cards,
     quiz_system_prompt,
-    source_grounded_in,
-    source_matches,
 )
 from .llm import complete_json
 from .logging_config import log_job_id
@@ -190,6 +190,7 @@ from .titles import (
     FALLBACK_BOOKLET,
     FALLBACK_DOCUMENT,
     FALLBACK_OFFICE,
+    FALLBACK_TRANSCRIPT,
     short_title,
 )
 from .transcript import build_document, render as render_transcript
@@ -1679,11 +1680,23 @@ class GamasBot:
         await self._edit(event, header, buttons)
 
     async def _forward_library_item(self, event, user_id: int, item_id: int) -> None:
-        """Re-forward one artifact only after an owner-scoped lookup."""
+        """Re-forward one artifact only after an owner-scoped lookup.
+
+        A re-send is a Telegram round trip for a possibly large file, so the
+        tapped screen shows a bar before the first request and ends on either
+        the finished frame or the reason it failed — never on a frozen panel.
+        """
         item = await self.db.library_item(user_id, item_id)
         if item is None:
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
+        back = [[Button.inline("↩️ بازگشت", f"lib:it:{item_id}".encode("ascii"))]]
+        progress = WorkProgress.for_editor(
+            lambda text: self._edit(event, text, back),
+            headline="📥 دریافت مجدد فایل",
+            done_headline="✅ فایل ارسال شد",
+        )
+        await progress.update(35, "ارسال فایل", "فایل از تلگرام دوباره ارسال می‌شود…")
         try:
             forwarded = await self.client.forward_messages(
                 event.chat_id,
@@ -1699,12 +1712,20 @@ class GamasBot:
                 logger.warning(
                     "could not mark unavailable library item=%s", item_id, exc_info=True
                 )
+            await progress.fail(
+                "این فایل دیگر در دسترس نیست.",
+                headline="❌ دریافت فایل ناموفق بود.",
+            )
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
         except Exception:
             # Flood waits, temporary network errors, and other ambiguous errors
             # do not prove that the message was deleted. Keep it retryable.
             logger.warning("library forward failed item=%s", item_id, exc_info=True)
+            await progress.fail(
+                "ارسال فایل موقتاً ناموفق بود؛ دوباره تلاش کنید.",
+                headline="❌ دریافت فایل ناموفق بود.",
+            )
             await self._ack(event, "ارسال فایل موقتاً ناموفق بود؛ دوباره تلاش کنید.", alert=True)
             return
         if item["unavailable"]:
@@ -1712,6 +1733,7 @@ class GamasBot:
                 await self.db.library_mark_available(item_id)
             except Exception:
                 logger.warning("could not clear library unavailable flag item=%s", item_id, exc_info=True)
+        await progress.complete("✅ فایل دوباره در همین گفتگو ارسال شد.")
 
     # ------------------------------------------------------------- documents
     async def _document_library_item(self, user_id: int, document: dict) -> int:
@@ -1726,7 +1748,16 @@ class GamasBot:
         if existing:
             return int(existing)
         content = await run_file_io(bound_content_text, str(document.get("text") or ""))
-        return await self.db.document_ensure_library_item(user_id, int(document["id"]), content)
+        # The mirror row carries the same 2–4-word name the document card and the
+        # learning screens use, so a document is named once, not per screen.
+        return await self.db.document_ensure_library_item(
+            user_id,
+            int(document["id"]),
+            content,
+            title=short_title(
+                str(document.get("title") or ""), fallback=FALLBACK_DOCUMENT
+            ),
+        )
 
     async def _save_document(
         self,
@@ -2123,8 +2154,18 @@ class GamasBot:
             raise OfficeError("قالب خروجی آفیس رایگان نامعتبر است.")
         suffix = Path(source_name).suffix.lower() if source_name else ""
         delimiter = "," if suffix == ".csv" else "\t" if suffix == ".tsv" else None
+        # The file's own title is the same 2–4-word name the library row uses
+        # (the product contract for a name), so a document opened from the list,
+        # its cover, its file name and its row cannot disagree. The raw upload
+        # name or the user's first line is only a *candidate* for that name.
+        artifact_title = short_title(
+            title, max_words=3, fallback=FALLBACK_OFFICE
+        )
         document = await run_file_io(
-            build_office_document, source_text, title=title, delimiter=delimiter
+            build_office_document,
+            source_text,
+            title=artifact_title,
+            delimiter=delimiter,
         )
         meta = DocumentMeta(
             reference=reference,
@@ -2201,13 +2242,10 @@ class GamasBot:
                 mode_label=f"آفیس رایگان — {label}",
             )
             caption = f"🗂 سند آزاد — {label} | {document.title}"
-        # The library row keeps the 2–4-word title contract: the document's own
-        # name (shortened) plus the one-token format, so four exports of the
-        # same text stay distinguishable without a paragraph on a button.
-        library_title = (
-            f"{short_title(document.title, fallback=FALLBACK_OFFICE, max_words=3)}"
-            f" — {label}"
-        )
+        # The library row keeps the 2–4-word title contract: the artifact's own
+        # name plus the one-token format, so four exports of the same text stay
+        # distinguishable without a paragraph on a button.
+        library_title = f"{document.title} — {label}"
         return filename, payload, caption, library_title
 
     async def _save_office_library_item(
@@ -2534,7 +2572,12 @@ class GamasBot:
             await self._ack(event, "نوع جزوه نامعتبر است.", alert=True)
             return
         source_text = str(document.get("text") or "")
-        title = str(document.get("title") or "جزوهٔ منبع‌محور")
+        # The booklet is named by the same 2–4-word title as its library rows, so
+        # the cover, the Word/PDF files, the captions and the list agree. The
+        # upload name is only the candidate for that name.
+        title = short_title(
+            str(document.get("title") or ""), fallback=FALLBACK_OFFICE, max_words=2
+        )
         if not source_text.strip():
             await self._ack(event, "متن قابل‌استفاده‌ای برای جزوه پیدا نشد.", alert=True)
             return
@@ -2592,6 +2635,9 @@ class GamasBot:
                     settings=self.settings,
                     session=self._http_session() if self.settings.note_configured else None,
                 )
+                # The cover is the name the library row shows (the same rule a
+                # media booklet follows), never the model's long lesson sentence.
+                notes = replace(notes, title=title)
                 markdown = notes.to_markdown()
                 word_payload = await run_file_io(
                     build_notes_docx,
@@ -2615,7 +2661,7 @@ class GamasBot:
                 markdown = compact.to_markdown()
                 word_payload = await run_file_io(
                     build_plain_docx,
-                    compact.title,
+                    title,
                     markdown,
                     fonts=resolve_fonts(),
                     design=resolve_design(),
@@ -2814,11 +2860,23 @@ class GamasBot:
         )
 
     async def _forward_document(self, event, user_id: int, document_id: int) -> None:
-        """Re-forward the original upload, only after an owner-scoped lookup."""
+        """Re-forward the original upload, only after an owner-scoped lookup.
+
+        The re-send is a Telegram round trip for an original file that may be
+        large, so the tapped screen shows a bar before the request and ends on
+        the reason if it fails (the panel never just freezes).
+        """
         document = await self.db.document_get(user_id, document_id)
         if document is None or not document.get("file_msg_ref"):
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
+        back = [[Button.inline("↩️ بازگشت", f"doc:show:{document_id}".encode("ascii"))]]
+        progress = WorkProgress.for_editor(
+            lambda text: self._edit(event, text, back),
+            headline="📥 دریافت فایل اصلی",
+            done_headline="✅ فایل ارسال شد",
+        )
+        await progress.update(35, "ارسال فایل", "فایل اصلی از تلگرام دوباره ارسال می‌شود…")
         try:
             chat_raw, message_raw = str(document["file_msg_ref"]).split(":", 1)
             await self.client.forward_messages(
@@ -2828,7 +2886,13 @@ class GamasBot:
             logger.warning(
                 "could not forward document=%s", document_id, exc_info=True
             )
+            await progress.fail(
+                "این فایل دیگر در دسترس نیست.",
+                headline="❌ دریافت فایل ناموفق بود.",
+            )
             await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            return
+        await progress.complete("✅ فایل اصلی دوباره در همین گفتگو ارسال شد.")
 
     async def _start_document_presentation(self, event, user_id: int, document_id: int) -> None:
         """Opt into the narrated-presentation job from its owner-scoped cache."""
@@ -3265,7 +3329,17 @@ class GamasBot:
         placeholder,
         stage: str = "در حال تولید محتوا",
     ) -> tuple[list[dict[str, Any]], int]:
-        """Generate concurrently; retry an invalid chunk once, then report it."""
+        """Generate concurrently; repair a short chunk once, then report it.
+
+        Two rules keep a paid generation from being lost to cosmetics:
+
+        * an item is **anchored**, never discarded, for a locator mismatch
+          (``learning.anchor_items``): the chunk the model read is itself the
+          source, so a re-typed or missing locator cannot zero out a chunk;
+        * the repair attempt asks only for the items that are still **missing**
+          (and never repeats an existing one), because a model that answers
+          with fewer items than requested used to fail the chunk outright.
+        """
         schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
         concurrency = min(8, max(1, int(self.settings.learning_chunk_concurrency)))
         semaphore = asyncio.Semaphore(concurrency)
@@ -3302,57 +3376,70 @@ class GamasBot:
                 " ".join(str(locator).split())[:120]
                 for locator in (chunk.sources or (chunk.locator,)) if locator
             ))
+            # A chunk with no locator at all can still be cited: the model's own
+            # cleaned locator is kept, because there is nothing to verify it
+            # against (legacy content).
+            fallback_locator = allowed[0] if allowed else ""
+            dedupe = dedupe_cards if kind == "deck" else dedupe_questions
             async with semaphore:
                 items: list[dict[str, Any]] = []
-                system = (
-                    flashcard_system_prompt(count, sources=allowed)
-                    if kind == "deck" else quiz_system_prompt(count, sources=allowed)
-                )
                 for attempt in range(2):
-                    try:
+                    missing = int(count) - len(items)
+                    if missing <= 0:
+                        break
+                    system = (
+                        flashcard_system_prompt(missing, sources=allowed)
+                        if kind == "deck" else quiz_system_prompt(missing, sources=allowed)
+                    )
+                    if attempt:
                         repair = (
                             "\nخروجی قبلی نامعتبر، ناقص یا بدون منبع مجاز بود؛ "
                             "همهٔ فیلدهای لازم و یک منبع دقیق از فهرست را وارد کن."
-                            if attempt else ""
                         )
+                        if items:
+                            repair += " موردی را که قبلاً ساخته‌ای تکرار نکن."
+                        system += repair
+                    try:
                         payload = await complete_json(
                             session,
                             self.settings,
-                            system=system + repair,
+                            system=system,
                             user=chunk.text[:MAX_MODEL_INPUT_CHARS],
-                            schema=schema,
+                            # A provider that rejects structured output still
+                            # answers the prompt's own JSON shape, and the parser
+                            # enforces that shape either way — so the bounded
+                            # repair attempt never repeats a rejected parameter.
+                            schema=schema if attempt == 0 else None,
                         )
                         if kind == "deck":
-                            parsed = parse_flashcard_payload(payload, count, require_source=True)
+                            parsed = parse_flashcard_payload(payload, missing)
                         else:
                             # The difficulty tag is metadata (S5): it is recorded
                             # when present and never rejects an otherwise valid
                             # question, because a route without structured-output
                             # enforcement answers «سخت»/«متوسط» in Persian.
                             parsed = parse_quiz_payload(
-                                payload, count, require_source=True, require_difficulty=False
+                                payload, missing, require_difficulty=False
                             )
-                        # A nonempty string is not enough: it must be a real
-                        # locator mapped to the section the model actually read.
-                        # The comparison folds digit shape, brackets and spacing,
-                        # so «[بخش ۱]» or «بخش 1 (1/3)» still cite «بخش ۱ (۱/۳)»
-                        # instead of discarding every generated item; an inner
-                        # page/slide marker the chunk itself carries is equally
-                        # verifiable.
-                        valid = [
-                            item for item in parsed
-                            if source_matches(item.get("source"), allowed)
-                            or source_grounded_in(item.get("source"), chunk.text)
-                        ]
-                        if len(valid) < len(parsed):
+                        # A nonempty string is not enough: a cited locator must be
+                        # one of the chunk's own labels (compared with digit
+                        # shape, brackets and spacing folded) or a marker that
+                        # literally occurs in the very text the model read.
+                        # Anything else is anchored to the chunk it came from by
+                        # ``anchor_items`` instead of being thrown away.
+                        anchored = anchor_items(
+                            parsed, allowed, fallback_locator, chunk.text
+                        )
+                        if len(anchored) < len(parsed):
                             logger.debug(
-                                "dropped %s unanchored %s item(s) chunk=%s",
-                                len(parsed) - len(valid), kind, index,
+                                "dropped %s malformed %s item(s) chunk=%s",
+                                len(parsed) - len(anchored), kind, index,
                             )
-                        # Repair incomplete/partially invalid arrays too. Retain
-                        # the best valid partial result if the retry also fails.
-                        if len(valid) > len(items):
-                            items = valid
+                        # Repair incomplete arrays too, and keep the best partial
+                        # result if the top-up attempt also falls short.
+                        merged = dedupe([*items, *anchored])
+                        if len(merged) > len(items):
+                            items = merged[: int(count)]
                         if len(items) >= count:
                             break
                     except asyncio.CancelledError:
@@ -3481,7 +3568,14 @@ class GamasBot:
             )
             minimum = MIN_VALID_CARDS if kind == "deck" else MIN_VALID_QUESTIONS
             if len(items) < minimum:
-                raise RuntimeError(f"{kind} generation yielded too few items ({len(items)})")
+                raise GenerationShortfallError(
+                    kind=kind,
+                    produced=len(items),
+                    required=minimum,
+                    requested=wanted,
+                    failures=failures,
+                    chunks=len(chunks),
+                )
             state = {
                 "kind": kind, "items": items[:wanted], "page": 0,
                 "title": title[:200], "item_id": int(source["item_id"]),
@@ -3511,10 +3605,12 @@ class GamasBot:
                     )
                     # The failure frame keeps the bar where the work stopped
                     # instead of silently replacing it with a sentence. The
-                    # headline names the failure; the detail adds the retry hint
-                    # and the refund outcome, so neither is said twice.
+                    # headline names the failure; the detail says *why* (a short
+                    # answer is a different problem from a provider failure) and
+                    # the refund outcome, so neither is said twice.
+                    detail = self._generation_failure_detail(exc)
                     await placeholder.fail(
-                        LEARNING_GENERATION_RETRY + (f"\n{notice}" if notice else ""),
+                        detail + (f"\n{notice}" if notice else ""),
                         headline="❌ ساخت محتوا ناموفق بود.",
                     )
                 except Exception:
@@ -3522,6 +3618,32 @@ class GamasBot:
             if isinstance(exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
                 raise
             logger.warning("%s generation failed", kind, exc_info=exc)
+
+    @staticmethod
+    def _generation_failure_detail(exc: BaseException) -> str:
+        """The Persian reason a generation was not saved (never a bare «ناموفق»).
+
+        Three cases read differently to a user: the model never answered, the
+        model answered but nothing survived validation, or a short answer. The
+        retry hint stays the same, but the first line has to be actionable —
+        «یک اندازهٔ بزرگ‌تر» helps only in the third case.
+        """
+        if not isinstance(exc, GenerationShortfallError):
+            return LEARNING_GENERATION_RETRY
+        if exc.produced <= 0 and exc.failures >= max(1, exc.chunks):
+            reason = "سرویس هوش مصنوعی پاسخ معتبری نداد."
+        elif exc.produced <= 0:
+            reason = "از این بخش‌ها هیچ مورد معتبری ساخته نشد."
+        else:
+            reason = (
+                f"فقط {to_persian_digits(exc.produced)} مورد معتبر از "
+                f"{to_persian_digits(exc.requested)} مورد ساخته شد؛ حداقل "
+                f"{to_persian_digits(exc.required)} مورد لازم است. یک اندازهٔ "
+                "بزرگ‌تر یا جزوهٔ کامل‌تری را امتحان کنید."
+            )
+        # The retry hint always follows the reason, so the frame keeps the one
+        # sentence every failure screen has always carried.
+        return f"{reason}\n{LEARNING_GENERATION_RETRY}"
 
     # ------------------------------------------------------------- curation
     def _curation_prefix(self, kind: str) -> str:
@@ -4675,11 +4797,24 @@ class GamasBot:
         if not cards:
             await self._ack(event, "این مجموعه هنوز کارتی ندارد.", alert=True)
             return
+        # The export is work too: the tapped screen becomes a bar before the
+        # first card is rendered, and ends on the finished frame with the deck's
+        # own buttons, so a slow upload never looks like a dead screen.
+        progress = WorkProgress.for_editor(
+            lambda text: self._edit(event, text, []),
+            headline="🃏 خروجی فلش‌کارت",
+            done_headline="✅ فایل آماده شد",
+        )
+        await progress.update(
+            15, "ساخت فایل Word", f"{to_persian_digits(len(cards))} کارت در حال قالب‌بندی است…"
+        )
         body_parts = [
             f"پرسش {to_persian_digits(index)}: {card['front']}\nپاسخ: {card['back']}"
             + (f"\nمنبع: {card['source']}" if card.get("source") else "")
             for index, card in enumerate(cards, start=1)
         ]
+        # One name for the file and its cover, per the library title contract.
+        deck_title = short_title(str(deck["title"] or ""), fallback=FALLBACK_BOOKLET)
         meta = DocumentMeta(
             reference=f"flashcard-{deck_id}",
             source_name="flashcards",
@@ -4687,7 +4822,7 @@ class GamasBot:
         )
         docx_bytes = await asyncio.to_thread(
             build_plain_docx,
-            deck["title"],
+            deck_title,
             "\n\n".join(body_parts),
             fonts=resolve_fonts(),
             design=resolve_design(),
@@ -4702,14 +4837,34 @@ class GamasBot:
         path = workdir / f"flashcard-{deck_id}.docx"
         try:
             await run_file_io(path.write_bytes, docx_bytes)
+            await progress.update(70, "ارسال فایل", "فایل Word در حال ارسال است…")
             await self._send_telegram_file(
                 event.chat_id,
                 path,
-                caption=f"🃏 فلش‌کارت‌ها — {deck['title']}"[:TELEGRAM_CAPTION_LIMIT],
+                caption=f"🃏 فلش‌کارت‌ها — {deck_title}"[:TELEGRAM_CAPTION_LIMIT],
                 force_document=True,
             )
+        except Exception:
+            await self._edit(
+                event,
+                failed_progress_text(
+                    progress.percent,
+                    "ارسال فایل Word ناموفق بود؛ دوباره تلاش کنید.",
+                    headline="❌ خروجی فلش‌کارت ناموفق بود.",
+                ),
+                self._deck_keyboard(deck_id, True),
+            )
+            raise
         finally:
             await run_file_io(shutil.rmtree, workdir, ignore_errors=True)
+        await self._edit(
+            event,
+            completed_progress_text(
+                f"✅ فایل Word شامل {to_persian_digits(len(cards))} کارت ارسال شد.",
+                headline="✅ فایل آماده شد",
+            ),
+            self._deck_keyboard(deck_id, True),
+        )
 
     async def _route_flashcard_callback(
         self, event, user_id: int, data: str
@@ -6752,11 +6907,13 @@ class GamasBot:
             caption = f"📝 متن خام — {reference}"
             message = await self._send_file(job, raw_path, caption=caption)
             if message is not None:
+                # A row is a *name*, not the caption: the reference code and the
+                # icon live in the Telegram message, never in the library.
                 await self._save_library_item(
                     job,
                     "transcript",
                     message,
-                    caption,
+                    short_title(caption, fallback=FALLBACK_TRANSCRIPT),
                     content_text=bound_content_text(raw_text) or None,
                 )
             return
