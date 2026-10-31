@@ -1,5 +1,53 @@
 # Changelog
 
+## Unreleased — learning generation never loses a paid answer to an anchor mismatch
+
+- **An item is anchored, not discarded, when its locator cannot be verified.** The remaining way a
+  fully-populated, fully-grounded model answer still ended as «ساخت محتوا ناموفق بود» was the
+  locator check in the chunk generator: a model that omitted `source`, invented one, or named the
+  section in its own words lost **every** item in every chunk, both attempts failed and a billed
+  generation was refunded. The chunk an item was generated from *is* its source, so
+  `learning.anchor_items` now stores either (1) the chunk's own spelling of a locator the model
+  actually named, (2) a page/slide marker that literally occurs in the text the model read, or
+  (3) the chunk's own label. Nothing the model invented is ever stored, and
+  `learning.verified_source` is the single place that decides this, so the parser and the generator
+  cannot disagree. The stored spelling is canonical: two cards from one page now cite it identically.
+- **A short answer is topped up instead of failing the chunk.** A model that returned 3 of 5
+  questions used to leave the chunk short (that count was the result). The second, still-bounded
+  attempt now asks only for the items that are **still missing** («دقیقاً ۲ سؤال») and explicitly
+  tells the model not to repeat what it already produced; the merge is de-duplicated per chunk.
+- **A failed generation says why.** `learning.GenerationShortfallError` carries the counts, and the
+  failure frame now reads «سرویس هوش مصنوعی پاسخ معتبری نداد» / «از این بخش‌ها هیچ مورد معتبری ساخته
+  نشد» / «فقط ۲ مورد معتبر از ۶ مورد ساخته شد؛ حداقل ۵ مورد لازم است» above the unchanged retry
+  hint and the refund notice. «ناموفق بود» alone was not diagnosable for a user or an operator.
+- **A provider that rejects structured output still answers.** The learning calls always sent
+  `response_format`/`responseSchema`; a route that refuses it failed *every* quiz/flashcard request
+  while note generation — which honours `NOTE_STRUCTURED_OUTPUT` and retries without the schema —
+  kept working, which is exactly the asymmetry a user reports as "booklets work, quizzes do not".
+  The bounded repair attempt now sends no schema (the prompt's own JSON shape and the parser's
+  validation still apply), so a rejected parameter is never repeated.
+- **Tolerant field reading, never tolerant grading.** Providers that ignore the JSON schema answer
+  `explanation`, `question`/`answer`, or «منبع» instead of the example's field names; those are
+  read now. An answer key written as a letter («ب», `B`) or counted from 1 is mapped exactly once —
+  and only when the payload actually contains a `4` **and** no `0`, so a legitimate 0-based quiz
+  whose key never points at the first option is never shifted by one (a silently wrong answer key
+  is worse than a dropped question).
+- **The one short title is used by the artifact itself, in every section.** Media booklets already
+  carried it; document-note booklets, Free Office exports and flashcard Word exports now do too: the
+  file's own cover/title, its file name, its caption and its library row are the same 2–4-word name
+  (`short_title`), instead of a library row that disagreed with the file it opened. Transcript and
+  document-mirror library rows store that name as well, so no row is a Telegram caption
+  («📝 متن خام — GMS-000123») any more.
+- **The remaining actions show a bar before they start.** Deck → Word export, library «دریافت مجدد»
+  and document «دریافت فایل اصلی» are Telegram round trips for possibly-large files; each now shows
+  a `WorkProgress` frame before the first request, ends on the completed frame (with its own
+  buttons) or on the 🛑 frame with the reason, and never leaves a frozen panel.
+- Offline regression tests: `anchor_items`/`verified_source` (invented locator never stored, inner
+  marker kept, missing locator anchored), letter/one-based/key-shift grading, renamed fields, a
+  quiz with no `source` at all reaching the preview, a 3+2 top-up reaching the full count, the
+  reason line on a zero result, and the bar/title assertions in `tests/test_library.py`,
+  `tests/test_learning.py`, `tests/test_document_ingestion.py` and `tests/test_office_flow.py`.
+
 ## Unreleased — quiz/flashcard reliability, short library titles, action progress bars
 
 - **Flashcard and question generation no longer fail on a cosmetic mismatch.** Two strict checks sat
@@ -11,9 +59,9 @@
   same way, and the user saw «ساخت محتوا ناموفق بود» after a billed generation.
   `learning.parse_difficulty` now maps English and Persian labels (an unknown/missing tag is simply
   not recorded, per S5) and `learning.source_matches`/`source_key` fold digit shape, Arabic letter
-  variants, brackets, quotes, slashes and spacing for comparison only — the stored locator keeps its
-  original spelling, a fabricated locator is still refused, and prefix matching is token-aligned so
-  «بخش ۱» can never swallow «بخش ۱۰». A page/slide marker that the chunk itself carries
+  variants, brackets, quotes, slashes and spacing for comparison only; a fabricated locator is never
+  stored (see the entry above, which anchors such an item to its chunk), and prefix matching is
+  token-aligned so «بخش ۱» can never swallow «بخش ۱۰». A page/slide marker that the chunk itself carries
   (`learning.source_grounded_in`, e.g. «[صفحهٔ ۲]» inside a booklet) is accepted as well, because it
   can be verified in the very text the item was generated from. A chunk with no locator at all
   (legacy content) no longer rejects everything, and a numeric `source` is read instead of

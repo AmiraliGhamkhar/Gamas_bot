@@ -106,3 +106,12 @@ python -m pytest -q tests/test_office.py tests/test_office_notes.py tests/test_o
 The flow tests open real DOCX/XLSX/PPTX/PDF outputs, cover CSV formula safety, document-note mode
 differences, locators, billing isolation, owner-scoped callbacks and no-provider fallbacks. They use
 fake Telegram/provider responses, not a live user account or paid provider.
+
+## Naming (the 2–4-word title contract)
+
+A Free Office export and a document-note booklet are named by `gamas_bot/titles.short_title`, the same
+rule every library row uses: the pasted text's / uploaded file's own name is only the *candidate*, and
+the result is 2–4 words (the format token is appended to the library row, e.g. «گزارش فروش — Word»).
+That one name is the cover title of the generated document, the delivered file name, the Telegram
+caption and the library row, so a file opened from the list is the file the list named. The uploaded
+or pasted source is never renamed on disk or in the database.

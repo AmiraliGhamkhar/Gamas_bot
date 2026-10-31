@@ -217,6 +217,11 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(word_count(items[0]["title"]), 2)
         self.assertLessEqual(word_count(items[0]["title"]), 4)
         self.assertIn("Word", items[0]["title"])
+        # The file itself is named by the same title as its library row: the
+        # row, the cover and the file name cannot disagree.
+        base = items[0]["title"].split(" — ")[0]
+        delivered = [str(record["path"]) for record in self.capture.deliveries]
+        self.assertTrue(any(base in path for path in delivered), delivered)
 
     async def test_uploaded_csv_is_parsed_and_formula_like_cells_are_literal(self):
         source_file = self.root / "report.csv"
@@ -426,6 +431,18 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         items = await self.db.library_list(self.user_id, limit=10)
         self.assertEqual(len(items), 4)
         self.assertTrue(all(item["kind"] == "office" for item in items))
+        # A document-note booklet is named by the same short title: the cover,
+        # both files and all four rows share it.
+        from gamas_bot.titles import word_count
+
+        for item in items:
+            self.assertGreaterEqual(word_count(item["title"]), 2, item["title"])
+            self.assertLessEqual(word_count(item["title"]), 4, item["title"])
+        base = items[0]["title"].split(" — ")[0]
+        self.assertEqual(base, "راهنمای سامانه")
+        self.assertIn(base, full_text)
+        self.assertIn(base, compact_text)
+        self.assertNotIn("راهنمای سامانه.pdf", items[0]["title"])
 
     async def test_foreign_document_callback_is_owner_scoped(self):
         other = self.user_id + 1

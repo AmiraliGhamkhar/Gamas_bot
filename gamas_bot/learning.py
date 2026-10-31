@@ -402,6 +402,176 @@ def source_grounded_in(source: Any, text: str) -> bool:
     return f" {key} " in f" {source_key(text)} "
 
 
+def verified_source(
+    source: Any, allowed: Iterable[str], text: str = ""
+) -> str | None:
+    """The locator to store for one item, or ``None`` when it is unverifiable.
+
+    Preference order, so nothing invented is ever stored:
+
+    1. the chunk's own spelling of a locator the model actually named — a
+       re-typed «بخش 1 (1/3)» is stored as the chunk label it means;
+    2. a marker the model quoted that literally occurs in the text it read
+       (a booklet's inner «[صفحهٔ ۲]»);
+    3. ``None`` — the caller then anchors the item to the chunk it was
+       generated from (see :func:`anchor_items`).
+
+    This is the single place where a model-supplied locator becomes a stored
+    one, so the generator and the parser can never disagree about what counts
+    as verified.
+    """
+    if not source_key(source):
+        return None
+    for candidate in allowed:
+        if candidate and source_matches(source, (candidate,)):
+            return " ".join(str(candidate).split())[:MAX_SOURCE_CHARS]
+    if text and source_grounded_in(source, text):
+        return _clean_source(source)
+    return None
+
+
+def anchor_items(
+    items: Iterable[dict[str, Any]],
+    allowed: Iterable[str],
+    fallback: str,
+    text: str = "",
+) -> list[dict[str, Any]]:
+    """Attach a *verified* source to each generated item.
+
+    An item was generated from exactly one chunk, so that chunk is itself a
+    verifiable source: when the model's own locator cannot be checked, the
+    item is anchored to the chunk label instead of being discarded. Losing a
+    whole paid generation over a cosmetic locator disagreement was the failure
+    mode this replaces, and it is still never fabrication — the stored locator
+    is either verified against the chunk (1 and 2 above) or is the chunk's own
+    label, never an unchecked model string.
+
+    A chunk that carries no locator at all (legacy content) keeps the model's
+    cleaned locator when it supplied one, because there is nothing to verify it
+    against.
+    """
+    choices = tuple(allowed)
+    fallback = " ".join(str(fallback or "").split())[:MAX_SOURCE_CHARS]
+    anchored: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        locator = verified_source(item.get("source"), choices, text) or fallback
+        if not locator:
+            locator = _clean_source(item.get("source"))
+        record = dict(item)
+        if locator:
+            record["source"] = locator
+        anchored.append(record)
+    return anchored
+
+
+class GenerationShortfallError(RuntimeError):
+    """A model answered, but with too few valid items to save (B4 minimums).
+
+    Carries the counts so the caller can tell the user *why* the generation was
+    not saved («۳ مورد از ۱۰») instead of a generic "unsuccessful", while the
+    billing layer still refunds exactly once.
+    """
+
+    def __init__(
+        self,
+        *,
+        kind: str,
+        produced: int,
+        required: int,
+        requested: int,
+        failures: int = 0,
+        chunks: int = 0,
+    ) -> None:
+        super().__init__(
+            f"{kind} produced {produced} valid item(s) of {requested} "
+            f"({required} required, {failures}/{chunks} chunk(s) failed)"
+        )
+        self.kind = kind
+        self.produced = int(produced)
+        self.required = int(required)
+        self.requested = int(requested)
+        self.failures = int(failures)
+        self.chunks = int(chunks)
+
+
+#: Persian/latin option letters a model may use as the answer key. Only the
+#: Persian set the product renders (OPTION_LABELS) and the latin equivalents.
+_OPTION_LETTERS: dict[str, int] = {
+    "a": 0, "b": 1, "c": 2, "d": 3,
+    "الف": 0, "ب": 1, "ج": 2, "د": 3,
+}
+
+
+def _one_based_correct(raw_questions: list[Any]) -> bool:
+    """True when a payload counts answer indexes from ``1`` instead of ``0``.
+
+    A ``4`` cannot be a 0-based index, and a payload that also contains a ``0``
+    is 0-based. Requiring both signals keeps a legitimate 0-based quiz whose
+    key never points at the first option («correct: 2» ten times) from being
+    shifted by one — a silently wrong answer key is worse than a dropped item.
+    """
+    values: list[int] = []
+    for entry in raw_questions:
+        if not isinstance(entry, dict):
+            continue
+        value = entry.get("correct")
+        if isinstance(value, bool) or value is None:
+            continue
+        if isinstance(value, int):
+            values.append(value)
+        elif isinstance(value, str):
+            folded = value.strip().translate(_DIGIT_FOLDING)
+            if folded.isdigit():
+                values.append(int(folded))
+    return bool(values) and 4 in values and 0 not in values
+
+
+def _parse_correct(value: Any, *, one_based: bool) -> int | None:
+    """Read an answer key as a 0-based option index, or ``None``.
+
+    Providers that ignore the JSON schema answer with the *letter* («ب», "B")
+    or a 1-based position; both are unambiguous once the payload's own style is
+    known, and silently mis-grading is not an option.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        token = normalize_front(value)
+        if token in _OPTION_LETTERS:
+            return _OPTION_LETTERS[token]
+        folded = value.strip().translate(_DIGIT_FOLDING)
+        if not folded.isdigit():
+            return None
+        index = int(folded)
+    elif isinstance(value, int):
+        index = value
+    else:
+        return None
+    if one_based:
+        index -= 1
+    return index if 0 <= index <= 3 else None
+
+
+def _entry_text(entry: dict[str, Any], *keys: str) -> str:
+    """The first non-empty string among ``keys`` (models rename fields)."""
+    for key in keys:
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
+
+
+def _source_field(entry: dict[str, Any]) -> Any:
+    """The item's locator field, whatever the model called it."""
+    for key in ("source", "منبع", "locator"):
+        value = entry.get(key)
+        if value is not None and value != "":
+            return value
+    return None
+
+
 def parse_quiz_payload(
     payload: dict[str, Any],
     count: int,
@@ -422,14 +592,21 @@ def parse_quiz_payload(
     raw_questions = payload.get("questions")
     if not isinstance(raw_questions, list):
         return []
+    one_based = _one_based_correct(raw_questions)
     validated: list[dict[str, Any]] = []
     for entry in raw_questions:
         if not isinstance(entry, dict):
             continue
-        question = _clean_str(entry.get("question"), MAX_QUESTION_CHARS)
-        explain = _clean_str(entry.get("explain"), MAX_EXPLAIN_CHARS)
+        question = _clean_str(
+            _entry_text(entry, "question", "q", "stem"), MAX_QUESTION_CHARS
+        )
+        # «explanation» is what a model writes when it paraphrases the example
+        # instead of copying it; the field name is cosmetic, the text is not.
+        explain = _clean_str(
+            _entry_text(entry, "explain", "explanation"), MAX_EXPLAIN_CHARS
+        )
         raw_options = entry.get("options")
-        correct = entry.get("correct")
+        correct = _parse_correct(entry.get("correct"), one_based=one_based)
         if not question or not explain or not isinstance(raw_options, list):
             continue
         options = [
@@ -463,7 +640,7 @@ def parse_quiz_payload(
             # Legacy strictness only: generation records the tag when present
             # and never rejects a question over it (S5).
             continue
-        source = _clean_source(entry.get("source"))
+        source = _clean_source(_source_field(entry))
         if source:
             record["source"] = source
         elif require_source:
@@ -538,14 +715,20 @@ def parse_flashcard_payload(
     for entry in raw_cards:
         if not isinstance(entry, dict):
             continue
-        front = _clean_str(entry.get("front"), MAX_CARD_FRONT_CHARS)
-        back = _clean_str(entry.get("back"), MAX_CARD_BACK_CHARS)
+        # «question»/«answer» is a common paraphrase of the example's
+        # «front»/«back»; a field name is cosmetic, losing a valid card is not.
+        front = _clean_str(
+            _entry_text(entry, "front", "question"), MAX_CARD_FRONT_CHARS
+        )
+        back = _clean_str(
+            _entry_text(entry, "back", "answer"), MAX_CARD_BACK_CHARS
+        )
         if not front or not back:
             continue
         if _is_yes_no(front):
             continue
         card = {"front": front, "back": back}
-        source = _clean_source(entry.get("source"))
+        source = _clean_source(_source_field(entry))
         if source:
             card["source"] = source
         elif require_source:
