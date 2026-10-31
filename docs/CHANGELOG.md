@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — agent system prompt
+
+- Added `AGENTS.md` at the repository root: the model-agnostic system prompt / maintainer contract
+  for AI coding agents, engineered from a full audit of v3.0.0. It records the non-negotiable
+  invariants (R/B/P/S/D), billing-integrity rules, Persian/RTL rules, provider rules, coding
+  conventions and the full offline test gate (T1), plus the §16 task-intake template. Documentation
+  only; no runtime behavior, configuration, schema or dependency change. Linked from
+  `docs/README.md`.
+
 ## Unreleased — Free Office and model-output hardening
 
 - **Excel no longer refuses a text file with control characters.** A `.txt`, `.csv` or `.tsv` upload is
