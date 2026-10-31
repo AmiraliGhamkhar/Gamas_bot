@@ -33,6 +33,7 @@ import sqlite3
 import tempfile
 import time
 import weakref
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -115,6 +116,8 @@ from .learning import (
     parse_quiz_payload,
     preset_cards,
     quiz_system_prompt,
+    source_grounded_in,
+    source_matches,
 )
 from .llm import complete_json
 from .logging_config import log_job_id
@@ -165,7 +168,15 @@ from .presentations import (
     prepare_audio,
     slides_outline,
 )
-from .progress import JobProgress, to_persian_digits
+from .progress import (
+    WORK_PROGRESS_HEADLINE,
+    JobProgress,
+    WorkProgress,
+    completed_progress_text,
+    failed_progress_text,
+    progress_text,
+    to_persian_digits,
+)
 from .stt import (
     STTConfigurationError,
     STTError,
@@ -175,6 +186,12 @@ from .stt import (
 )
 from .subscription import SUBSCRIPTION_PREFIX, SubscriptionService
 from .telegram_text import button_label, render_pages, split_message
+from .titles import (
+    FALLBACK_BOOKLET,
+    FALLBACK_DOCUMENT,
+    FALLBACK_OFFICE,
+    short_title,
+)
 from .transcript import build_document, render as render_transcript
 from .textnorm import normalize_display, normalize_for_compare
 
@@ -347,7 +364,13 @@ LEARNING_NO_CREDIT = (
 )
 #: A failure notice is kept separate from the actual refund result.
 LEARNING_GENERATION_FAILED = "ساخت محتوا ناموفق بود.\nکمی بعد دوباره امتحان کنید."
+#: The failure frame renders the headline itself, so a bar needs only the hint.
+LEARNING_GENERATION_RETRY = "کمی بعد دوباره امتحان کنید."
 LEARNING_CREDIT_RESTORED = "💳 اعتبار شما کامل برگشت داده شد."
+#: Failure headlines for the bar of a stopped short action (the detail line
+#: below keeps the exact Persian reason, so only the frame around it is new).
+DOC_EXTRACTION_STOPPED = "📄 استخراج متن سند متوقف شد."
+OFFICE_UPLOAD_STOPPED = "🗂 آفیس رایگان متوقف شد."
 #: Appended to booklet captions (§6.12); the stored library title stays clean.
 LEARNING_DELIVERY_CTA = (
     "\n🧪 از همین جزوه آزمون بده یا 🃏 فلش‌کارت بساز: «📚 کتابخانه من»"
@@ -1567,10 +1590,10 @@ class GamasBot:
             ]
             buttons: list[list] = []
             for item in items:
-                title = " ".join(str(item.get("title") or "").split())
-                if not title:
-                    title = "جزوهٔ Word" if item["kind"] == "booklet" else "متن گفتار"
-                label = title if title.startswith("📖 ") else f"📖 {title}"
+                title = self._item_display_title(item)
+                # The icon says what the row is; the stored title is only the
+                # name (a booklet's name is its 2–4-word title).
+                label = f"{self._library_icon(str(item['kind']))} {title}"
                 buttons.append(
                     [
                         Button.inline(
@@ -1631,7 +1654,10 @@ class GamasBot:
             date_label = jalali_date(datetime.fromisoformat(item["created_at"]))
         except (TypeError, ValueError):
             date_label = ""
-        header = f"📖 {title}" + (f"\n📅 {date_label}" if date_label else "")
+        header = (
+            f"{self._library_icon(str(item['kind']))} {title}"
+            + (f"\n📅 {date_label}" if date_label else "")
+        )
         buttons: list[list] = [
             [Button.inline(
                 "📥 دریافت مجدد", f"lib:f:{item_id}".encode("ascii")
@@ -1990,7 +2016,13 @@ class GamasBot:
             return
 
         async def operation() -> None:
-            progress = await event.respond("⏳ در حال دریافت و بررسی فایل متنی…")
+            progress = await WorkProgress.start(
+                event,
+                headline="🗂 آفیس رایگان",
+                done_headline="✅ فایل متنی افزوده شد",
+                stage="دریافت فایل متنی",
+                detail="فایل بررسی می‌شود و به متن شما افزوده می‌شود…",
+            )
             workdir = Path(await run_file_io_resource(
                 tempfile.mkdtemp,
                 lambda path: shutil.rmtree(path, ignore_errors=True),
@@ -2001,19 +2033,48 @@ class GamasBot:
                 source = workdir / f"source{suffix}"
                 try:
                     await self._download_telegram_media(event.message, source, max_bytes)
+                    await progress.update(60, "خواندن متن فایل")
                     content = await run_file_io(read_text_file, source, max_bytes=max_bytes)
                 except UploadTooLargeError:
-                    await self._edit(progress, "❌ فایل متنی از سقف حجم آفیس رایگان بیشتر است.")
+                    await self._edit(
+                        progress,
+                        failed_progress_text(
+                            progress.percent,
+                            "❌ فایل متنی از سقف حجم آفیس رایگان بیشتر است.",
+                            headline=OFFICE_UPLOAD_STOPPED,
+                        ),
+                    )
                     return
                 except asyncio.TimeoutError:
-                    await self._edit(progress, "❌ دریافت فایل متنی ناموفق بود؛ دوباره بفرستید.")
+                    await self._edit(
+                        progress,
+                        failed_progress_text(
+                            progress.percent,
+                            "❌ دریافت فایل متنی ناموفق بود؛ دوباره بفرستید.",
+                            headline=OFFICE_UPLOAD_STOPPED,
+                        ),
+                    )
                     return
                 if not content.strip():
-                    await self._edit(progress, "فایل متن قابل‌استفاده‌ای ندارد؛ فایل دیگری بفرستید.")
+                    await self._edit(
+                        progress,
+                        failed_progress_text(
+                            progress.percent,
+                            "فایل متن قابل‌استفاده‌ای ندارد؛ فایل دیگری بفرستید.",
+                            headline=OFFICE_UPLOAD_STOPPED,
+                        ),
+                    )
                     return
                 session = self._office_get_session(user_id) or self._office_new_session(user_id, event.message)
                 if session is None:
-                    await self._edit(progress, "آفیس رایگان مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.")
+                    await self._edit(
+                        progress,
+                        failed_progress_text(
+                            progress.percent,
+                            "آفیس رایگان مشغول است؛ چند دقیقهٔ دیگر دوباره تلاش کنید.",
+                            headline=OFFICE_UPLOAD_STOPPED,
+                        ),
+                    )
                     return
                 try:
                     self._office_add_source(
@@ -2027,13 +2088,22 @@ class GamasBot:
                     return
                 await self._edit(
                     progress,
-                    f"✅ فایل متنی بررسی شد و افزوده شد؛ مجموع متن "
-                    f"{to_persian_digits(len(session.text))} نویسه است.\n"
-                    "فایل اصلیِ پیام شما دست‌نخورده می‌ماند. حالا قالب خروجی را انتخاب کنید یا متن دیگری بفرستید.",
+                    completed_progress_text(
+                        "✅ فایل متنی بررسی شد و افزوده شد؛ مجموع متن "
+                        f"{to_persian_digits(len(session.text))} نویسه است.\n"
+                        "فایل اصلیِ پیام شما دست‌نخورده می‌ماند. حالا قالب خروجی را "
+                        "انتخاب کنید یا متن دیگری بفرستید.",
+                        headline="✅ فایل متنی افزوده شد",
+                    ),
                     self._office_session_keyboard(),
                 )
             except OfficeError as exc:
-                await self._edit(progress, str(exc))
+                await self._edit(
+                    progress,
+                    failed_progress_text(
+                        progress.percent, str(exc), headline=OFFICE_UPLOAD_STOPPED
+                    ),
+                )
             finally:
                 await run_file_io(shutil.rmtree, workdir, ignore_errors=True)
 
@@ -2131,7 +2201,14 @@ class GamasBot:
                 mode_label=f"آفیس رایگان — {label}",
             )
             caption = f"🗂 سند آزاد — {label} | {document.title}"
-        return filename, payload, caption, f"🗂 {document.title} — {label}"
+        # The library row keeps the 2–4-word title contract: the document's own
+        # name (shortened) plus the one-token format, so four exports of the
+        # same text stay distinguishable without a paragraph on a button.
+        library_title = (
+            f"{short_title(document.title, fallback=FALLBACK_OFFICE, max_words=3)}"
+            f" — {label}"
+        )
+        return filename, payload, caption, library_title
 
     async def _save_office_library_item(
         self, user_id: int, message: Message, title: str
@@ -2155,17 +2232,28 @@ class GamasBot:
         except Exception as exc:
             logger.warning("could not index Office file error=%s", type(exc).__name__)
 
+    #: Percent bands shared by every Free Office build: the operation fills the
+    #: build band, the caller fills the delivery band.
+    OFFICE_BUILD_PERCENT = 55
+    OFFICE_DELIVERY_PERCENT = 40
+
     async def _office_run_operation(
         self,
         event,
         user_id: int,
         *,
-        progress_text: str,
+        stage: str,
         success_text: str,
         buttons: list[list],
         operation,
     ) -> None:
-        """Run one bounded, free Office operation with private temp cleanup."""
+        """Run one bounded, free Office operation with private temp cleanup.
+
+        The tapped panel message becomes a real progress bar before any work
+        starts, so an Office build (a long note generation in particular) never
+        looks frozen. ``operation`` receives the reporter so its own steps can
+        advance the bar; the delivery band below is filled by this function.
+        """
         if not self.settings.office_enabled:
             await self._ack(event, "آفیس رایگان در تنظیمات سرور غیرفعال است.", alert=True)
             return
@@ -2200,8 +2288,14 @@ class GamasBot:
             self._office_tasks.add(task)
         workdir: Path | None = None
         delivered = 0
+        progress = WorkProgress.for_editor(
+            lambda text: self._edit(event, text, []),
+            headline="🗂 آفیس رایگان",
+            done_headline="✅ فایل آماده شد",
+            submission_id=None,
+        )
         try:
-            await self._edit(event, progress_text, buttons=[])
+            await progress.update(4, stage, "درخواست ثبت شد؛ ساخت به‌زودی آغاز می‌شود.")
             async with self._office_semaphore:
                 workdir = Path(await run_file_io_resource(
                     tempfile.mkdtemp,
@@ -2209,16 +2303,23 @@ class GamasBot:
                     dir=self.settings.temp_dir,
                     prefix="office-",
                 ))
-                outputs = await operation(workdir)
+                outputs = await operation(workdir, progress)
                 reply_to = getattr(event, "message_id", None)
                 if not isinstance(reply_to, int):
                     reply_to = getattr(getattr(event, "message", None), "id", None)
-                for filename, payload, caption, library_title in outputs:
+                total = max(1, len(outputs))
+                for index, (filename, payload, caption, library_title) in enumerate(outputs):
                     if not payload or len(payload) > MAX_OFFICE_OUTPUT_BYTES:
                         raise OfficeError(
                             "حجم خروجی از سقف آفیس رایگان بیشتر است؛ سند را کوچک‌تر کنید."
                         )
                     path = workdir / filename
+                    await progress.update(
+                        self.OFFICE_BUILD_PERCENT
+                        + round(self.OFFICE_DELIVERY_PERCENT * index / total),
+                        "ارسال فایل خروجی",
+                        f"{Path(filename).suffix.lower()} در حال ارسال است…",
+                    )
                     await run_file_io(path.write_bytes, payload)
                     try:
                         sent = await self._send_telegram_file(
@@ -2237,7 +2338,12 @@ class GamasBot:
                         if delivered:
                             await self._edit(
                                 event,
-                                "⚠️ بخشی از خروجی‌ها ارسال و در کتابخانه ذخیره شد؛ ارسال فایل بعدی ناموفق بود.",
+                                failed_progress_text(
+                                    progress.percent,
+                                    "⚠️ بخشی از خروجی‌ها ارسال و در کتابخانه ذخیره شد؛ "
+                                    "ارسال فایل بعدی ناموفق بود.",
+                                    headline="⚠️ ارسال کامل نشد.",
+                                ),
                                 buttons,
                             )
                             return
@@ -2246,9 +2352,19 @@ class GamasBot:
                         raise OfficeError("تلگرام فایل خروجی را تأیید نکرد؛ دوباره تلاش کنید.")
                     delivered += 1
                     await self._save_office_library_item(user_id, sent, library_title)
-            await self._edit(event, success_text, buttons)
+            await self._edit(
+                event, completed_progress_text(success_text, headline="✅ فایل آماده شد"), buttons
+            )
         except (OfficeError, StructuringError) as exc:
-            await self._edit(event, str(exc), buttons)
+            # A refused build ends on the bar too: it shows where the work
+            # stopped and keeps the reason and the buttons in one screen.
+            await self._edit(
+                event,
+                failed_progress_text(
+                    progress.percent, str(exc), headline="❌ ساخت فایل ناموفق بود."
+                ),
+                buttons,
+            )
         finally:
             if workdir is not None:
                 await run_file_io(shutil.rmtree, workdir, ignore_errors=True)
@@ -2271,7 +2387,12 @@ class GamasBot:
         source_name = session.filename
         reference = f"OFF-{secrets.token_hex(4).upper()}"
 
-        async def build(_workdir: Path):
+        async def build(_workdir: Path, progress: WorkProgress):
+            await progress.update(
+                self.OFFICE_BUILD_PERCENT // 2,
+                f"ساخت فایل {FORMAT_LABELS[kind]}",
+                "متن شما در حال قالب‌بندی است…",
+            )
             return [
                 await self._build_office_export(
                     source_text,
@@ -2286,7 +2407,7 @@ class GamasBot:
         await self._office_run_operation(
             event,
             user_id,
-            progress_text=f"⏳ در حال ساخت فایل {FORMAT_LABELS[kind]} از متن شما…",
+            stage=f"ساخت فایل {FORMAT_LABELS[kind]} از متن شما",
             success_text=(
                 "✅ فایل ساخته شد و در کتابخانهٔ شما ذخیره شد.\n"
                 "می‌توانید قالب دیگری هم از همین متن بسازید یا متن بیشتری اضافه کنید."
@@ -2367,7 +2488,12 @@ class GamasBot:
         reference = f"DOC-{document_id}-{secrets.token_hex(3).upper()}"
         title = str(document.get("title") or "سند")
 
-        async def build(_workdir: Path):
+        async def build(_workdir: Path, progress: WorkProgress):
+            await progress.update(
+                self.OFFICE_BUILD_PERCENT // 2,
+                f"ساخت خروجی {FORMAT_LABELS[kind]}",
+                "متن استخراج‌شدهٔ سند در حال قالب‌بندی است…",
+            )
             return [
                 await self._build_office_export(
                     source,
@@ -2385,7 +2511,7 @@ class GamasBot:
         await self._office_run_operation(
             event,
             user_id,
-            progress_text=f"⏳ در حال ساخت خروجی {FORMAT_LABELS[kind]} از متن سند…",
+            stage=f"ساخت خروجی {FORMAT_LABELS[kind]} از متن سند",
             success_text=(
                 "✅ خروجی ساخته شد و در کتابخانه ذخیره شد.\n"
                 "فایل اصلی و مکان‌یاب‌های متن دست‌نخورده‌اند؛ ارائهٔ تازه جایگزین ارائهٔ اصلی نیست."
@@ -2445,9 +2571,21 @@ class GamasBot:
             [Button.inline("📚 بازگشت به کتابخانه", b"lib:docs:0")],
         ]
 
-        async def build(_workdir: Path):
+        async def build(_workdir: Path, progress: WorkProgress):
             fallback_used = False
+            # Note generation is the long step of this section: the bar moves
+            # here so a multi-minute generation never looks like a dead screen.
+            await progress.update(
+                10,
+                "آماده‌سازی بخش‌های سند",
+                f"{to_persian_digits(len(chunks))} بخش منبع آماده شد.",
+            )
             if mode == "full":
+                await progress.update(
+                    20,
+                    "تولید جزوهٔ منبع‌محور",
+                    "ساخت متن ممکن است چند دقیقه طول بکشد…",
+                )
                 notes, fallback_used = await generate_full_booklet(
                     chunks,
                     title=title,
@@ -2463,6 +2601,11 @@ class GamasBot:
                     meta=meta,
                 )
             else:
+                await progress.update(
+                    20,
+                    "استخراج نکته‌های فشرده",
+                    "ساخت یادداشت ممکن است چند دقیقه طول بکشد…",
+                )
                 compact, fallback_used = await generate_compact_notes(
                     chunks,
                     title=title,
@@ -2480,6 +2623,11 @@ class GamasBot:
                     mode_label="حالت خروجی: یادداشت مرور سریع",
                     heading_offset=OFFICE_HEADING_OFFSET,
                 )
+            await progress.update(
+                self.OFFICE_BUILD_PERCENT - 10,
+                "ساخت فایل‌های Word و PDF",
+                "خروجی‌ها با همان مکان‌یاب‌های سند ساخته می‌شوند…",
+            )
             pdf_document = await run_file_io(
                 build_office_document,
                 markdown,
@@ -2491,31 +2639,35 @@ class GamasBot:
                 meta=meta,
                 mode_label=mode_label,
             )
-            variant = "کامل" if mode == "full" else "مرور سریع"
+            variant = "کامل" if mode == "full" else "مرور"
             if fallback_used:
                 logger.info("Office document notes used deterministic source fallback mode=%s", mode)
+            # Two files come out of one build, so each library row needs its
+            # format *and* the variant to be distinguishable — still within the
+            # 2–4-word contract (2-word name + one two-token suffix).
+            base_title = short_title(title, fallback=FALLBACK_OFFICE, max_words=2)
             return [
                 (
                     office_filename(title, "word", reference),
                     word_payload,
                     f"📘 {variant} — Word | {title}",
-                    f"🗂 {title} — {variant} — Word",
+                    f"{base_title} — {variant} Word",
                 ),
                 (
                     office_filename(title, "pdf", reference),
                     pdf_payload,
                     f"📕 {variant} — PDF | {title}",
-                    f"🗂 {title} — {variant} — PDF",
+                    f"{base_title} — {variant} PDF",
                 ),
             ]
 
         await self._office_run_operation(
             event,
             user_id,
-            progress_text=(
-                "⏳ در حال ساخت جزوهٔ کاملِ منبع‌محور و نسخهٔ Word/PDF…"
+            stage=(
+                "ساخت جزوهٔ کاملِ منبع‌محور و نسخهٔ Word/PDF"
                 if mode == "full"
-                else "⏳ در حال استخراج نکته‌های فشرده و ساخت Word/PDF…"
+                else "استخراج نکته‌های فشرده و ساخت Word/PDF"
             ),
             success_text=(
                 f"✅ {mode_label} ساخته شد و هر دو فایل Word و PDF در کتابخانه ذخیره شدند.\n"
@@ -2558,7 +2710,15 @@ class GamasBot:
                 f"{to_persian_digits(max_bytes // (1024 * 1024))} مگابایت"
             )
             return
-        progress = await event.respond("⏳ در حال استخراج متن…")
+        # The bar is on screen before the download starts: extraction of a big
+        # PDF is a minutes-long operation on a single message.
+        progress = await WorkProgress.start(
+            event,
+            headline="📄 استخراج متن سند",
+            done_headline="✅ متن استخراج شد",
+            stage="دریافت فایل",
+            detail="فایل از تلگرام دریافت می‌شود…",
+        )
         workdir = Path(await run_file_io_resource(
             tempfile.mkdtemp,
             lambda path: shutil.rmtree(path, ignore_errors=True),
@@ -2570,11 +2730,30 @@ class GamasBot:
             path = workdir / f"source{suffix}"
             try:
                 await self._download_telegram_media(event.message, path, max_bytes)
+                await progress.update(
+                    40,
+                    "استخراج متن",
+                    "متن سند خوانده و به بخش‌های قابل ارجاع تقسیم می‌شود…",
+                )
             except UploadTooLargeError:
-                await self._edit(progress, "❌ حجم فایل از سقف مجاز اسناد بیشتر است.")
+                await self._edit(
+                    progress,
+                    failed_progress_text(
+                        progress.percent,
+                        "❌ حجم فایل از سقف مجاز اسناد بیشتر است.",
+                        headline=DOC_EXTRACTION_STOPPED,
+                    ),
+                )
                 return
             except asyncio.TimeoutError:
-                await self._edit(progress, "❌ دریافت فایل ناموفق بود؛ دوباره بفرستید.")
+                await self._edit(
+                    progress,
+                    failed_progress_text(
+                        progress.percent,
+                        "❌ دریافت فایل ناموفق بود؛ دوباره بفرستید.",
+                        headline=DOC_EXTRACTION_STOPPED,
+                    ),
+                )
                 return
             chat_id = getattr(event, "chat_id", None) or user_id
             message_id = getattr(getattr(event, "message", None), "id", None)
@@ -2586,6 +2765,7 @@ class GamasBot:
                     filename=filename,
                     file_msg_ref=f"{chat_id}:{message_id}" if message_id else "",
                 )
+                await progress.update(90, "آماده‌سازی پیش‌نمایش سند")
             except ScannedPdfError as exc:
                 await self._edit(progress, str(exc))
                 return
@@ -2606,13 +2786,22 @@ class GamasBot:
                 )
                 return
             except DocExtractError as exc:
-                await self._edit(progress, f"⚠️ {exc}")
+                await self._edit(
+                    progress,
+                    failed_progress_text(
+                        progress.percent, f"⚠️ {exc}", headline=DOC_EXTRACTION_STOPPED
+                    ),
+                )
                 return
         except Exception:
             logger.exception("document ingestion failed user=%s", user_id)
             await self._edit(
                 progress,
-                "⚠️ استخراج متن این سند ناموفق بود؛ فایل دیگری بفرستید.",
+                failed_progress_text(
+                    progress.percent,
+                    "⚠️ استخراج متن این سند ناموفق بود؛ فایل دیگری بفرستید.",
+                    headline=DOC_EXTRACTION_STOPPED,
+                ),
             )
             return
         finally:
@@ -2846,9 +3035,9 @@ class GamasBot:
                     cost=cost,
                     note=note,
                     title=(
-                        f"{source['title']} — فلش‌کارت"
+                        f"{short_title(source['title'], fallback=FALLBACK_BOOKLET)} — فلش‌کارت"
                         if kind == "deck"
-                        else f"{source['title']} — آزمون"
+                        else f"{short_title(source['title'], fallback=FALLBACK_BOOKLET)} — آزمون"
                     ),
                 )
         finally:
@@ -2940,7 +3129,9 @@ class GamasBot:
         return {
             "item_id": int(item["item_id"]),
             "doc_id": None,
-            "title": self._item_display_title(item),
+            "title": short_title(
+                self._item_display_title(item), fallback=FALLBACK_BOOKLET
+            ),
             "chunks": self._learning_chunks(str(item["content_text"])),
         }
 
@@ -2963,7 +3154,9 @@ class GamasBot:
         return {
             "item_id": int(item_id),
             "doc_id": int(document["id"]),
-            "title": str(document.get("title") or "سند"),
+            "title": short_title(
+                str(document.get("title") or ""), fallback=FALLBACK_DOCUMENT
+            ),
             "chunks": chunks,
         }
 
@@ -3026,12 +3219,39 @@ class GamasBot:
                 refunded = False
         return refunded
 
-    async def _progress_edit(self, message, done: int, total: int) -> None:
-        """Live chunk progress («در حال تولید… بخش ۳ از ۷»); never fatal."""
+    #: Chunk generation owns this slice of the bar; claiming, validation and
+    #: the preview fill the rest, so one bar describes the whole action.
+    CHUNK_PROGRESS_START = 6
+    CHUNK_PROGRESS_END = 88
+
+    async def _progress_edit(
+        self,
+        placeholder,
+        done: int,
+        total: int,
+        *,
+        stage: str,
+        headline: str = WORK_PROGRESS_HEADLINE,
+    ) -> None:
+        """Publish one chunk frame («بخش ۳ از ۷») as a real progress bar.
+
+        ``placeholder`` is a :class:`WorkProgress` in the production flow and a
+        plain Telegram message in older call sites; both take exactly one frame.
+        The edit is decorative: a slow or refused edit must never cost the user
+        their generation or hold a model slot.
+        """
+        done = max(0, int(done))
+        total = max(1, int(total))
+        percent = self.CHUNK_PROGRESS_START + round(
+            (self.CHUNK_PROGRESS_END - self.CHUNK_PROGRESS_START) * done / total
+        )
+        detail = f"بخش {to_persian_digits(done)} از {to_persian_digits(total)}"
         try:
-            await message.edit(
-                "در حال تولید… "
-                f"بخش {to_persian_digits(done)} از {to_persian_digits(total)}"
+            if callable(getattr(placeholder, "update", None)):
+                await placeholder.update(percent, stage, detail)
+                return
+            await placeholder.edit(
+                progress_text(percent, stage, detail, headline=headline)
             )
         except Exception:
             logger.debug("generation progress edit failed", exc_info=True)
@@ -3043,6 +3263,7 @@ class GamasBot:
         chunks: list[DocChunk],
         counts: list[int],
         placeholder,
+        stage: str = "در حال تولید محتوا",
     ) -> tuple[list[dict[str, Any]], int]:
         """Generate concurrently; retry an invalid chunk once, then report it."""
         schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
@@ -3061,7 +3282,9 @@ class GamasBot:
                 done = state["done"]
                 try:
                     await asyncio.wait_for(
-                        self._progress_edit(placeholder, done, total),
+                        self._progress_edit(
+                            placeholder, done, total, stage=stage
+                        ),
                         timeout=LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS,
                     )
                 except asyncio.TimeoutError:
@@ -3102,12 +3325,30 @@ class GamasBot:
                         if kind == "deck":
                             parsed = parse_flashcard_payload(payload, count, require_source=True)
                         else:
+                            # The difficulty tag is metadata (S5): it is recorded
+                            # when present and never rejects an otherwise valid
+                            # question, because a route without structured-output
+                            # enforcement answers «سخت»/«متوسط» in Persian.
                             parsed = parse_quiz_payload(
-                                payload, count, require_source=True, require_difficulty=True
+                                payload, count, require_source=True, require_difficulty=False
                             )
                         # A nonempty string is not enough: it must be a real
                         # locator mapped to the section the model actually read.
-                        valid = [item for item in parsed if item.get("source") in allowed]
+                        # The comparison folds digit shape, brackets and spacing,
+                        # so «[بخش ۱]» or «بخش 1 (1/3)» still cite «بخش ۱ (۱/۳)»
+                        # instead of discarding every generated item; an inner
+                        # page/slide marker the chunk itself carries is equally
+                        # verifiable.
+                        valid = [
+                            item for item in parsed
+                            if source_matches(item.get("source"), allowed)
+                            or source_grounded_in(item.get("source"), chunk.text)
+                        ]
+                        if len(valid) < len(parsed):
+                            logger.debug(
+                                "dropped %s unanchored %s item(s) chunk=%s",
+                                len(parsed) - len(valid), kind, index,
+                            )
                         # Repair incomplete/partially invalid arrays too. Retain
                         # the best valid partial result if the retry also fails.
                         if len(valid) > len(items):
@@ -3205,14 +3446,39 @@ class GamasBot:
         free, charged, claim_id = budget
         placeholder = None
         state = None
+        # The bar exists *before* the first model call: a user who just paid
+        # sees work start immediately, and the same message becomes the
+        # curation preview, so no orphan «در حال ساخت…» message is left behind.
+        label = "فلش‌کارت" if kind == "deck" else "سؤال"
+        stage = f"آماده‌سازی {label}"
         try:
             wanted = max(1, int(wanted))
             counts = distribute_counts(wanted, [len(chunk.text) for chunk in chunks])
-            placeholder = await event.respond("در حال ساخت… ⏳")
+            progress = await WorkProgress.start(
+                event,
+                headline="🧠 در حال ساخت محتوا",
+                done_headline="✅ محتوا آماده شد",
+                stage=stage,
+                detail=(
+                    "درخواست شما ثبت شد؛ "
+                    f"{to_persian_digits(wanted)} مورد در "
+                    f"{to_persian_digits(len(chunks))} بخش ساخته می‌شود."
+                ),
+            )
+            placeholder = progress
             items, failures = await self._generate_chunks(
-                kind=kind, chunks=chunks, counts=counts, placeholder=placeholder
+                kind=kind,
+                chunks=chunks,
+                counts=counts,
+                placeholder=progress,
+                stage=f"در حال تولید {label}",
             )
             items = dedupe_cards(items) if kind == "deck" else dedupe_questions(items)
+            await progress.update(
+                94,
+                "اعتبارسنجی و آماده‌سازی پیش‌نمایش",
+                f"{to_persian_digits(len(items))} مورد معتبر آماده شد.",
+            )
             minimum = MIN_VALID_CARDS if kind == "deck" else MIN_VALID_QUESTIONS
             if len(items) < minimum:
                 raise RuntimeError(f"{kind} generation yielded too few items ({len(items)})")
@@ -3225,7 +3491,8 @@ class GamasBot:
                 "requested": wanted, "created_at": time.monotonic(),
             }
             self._curation[user_id] = state
-            if not await self._render_curation(placeholder, user_id):
+            # _render_curation edits the same message the bar lived on.
+            if not await self._render_curation(progress.message, user_id):
                 raise RuntimeError("curation preview was not delivered")
             self._schedule_curation_expiry(user_id, state)
         except BaseException as exc:
@@ -3242,8 +3509,13 @@ class GamasBot:
                         else LEARNING_CREDIT_RESTORED if charged
                         else FREE_TRY_RESTORED if free else ""
                     )
-                    await placeholder.edit(
-                        LEARNING_GENERATION_FAILED + (f"\n{notice}" if notice else "")
+                    # The failure frame keeps the bar where the work stopped
+                    # instead of silently replacing it with a sentence. The
+                    # headline names the failure; the detail adds the retry hint
+                    # and the refund outcome, so neither is said twice.
+                    await placeholder.fail(
+                        LEARNING_GENERATION_RETRY + (f"\n{notice}" if notice else ""),
+                        headline="❌ ساخت محتوا ناموفق بود.",
                     )
                 except Exception:
                     logger.warning("could not edit generation placeholder", exc_info=True)
@@ -3658,7 +3930,9 @@ class GamasBot:
             wanted=int(count),
             cost=int(count) * self.settings.quiz_cost_seconds_per_question,
             note=f"quiz-pending:{item_id}",
-            title=self._item_display_title(item) + " — آزمون",
+            title=short_title(
+                self._item_display_title(item), fallback=FALLBACK_BOOKLET
+            ) + " — آزمون",
         )
 
     def _question_keyboard(self, session_id: int, question_id: int) -> list[list]:
@@ -3978,12 +4252,33 @@ class GamasBot:
     def _deck_stale_alert() -> str:
         return "این فلش‌کارت دیگر معتبر نیست."
 
+    @staticmethod
+    def _library_icon(kind: str) -> str:
+        """The emoji a library row starts with, per artifact kind."""
+        return {
+            "booklet": "📖",
+            "transcript": "📝",
+            "office": "🗂",
+            "document": "📄",
+        }.get(kind, "📄")
+
     def _item_display_title(self, item: dict) -> str:
-        """A clean one-line title for learning screens and generated decks."""
+        """A clean 2–4-word title for library rows and learning screens.
+
+        Older rows stored whole captions («📖 جزوهٔ Word — GMS-1»), so the icon
+        and the reference code are dropped here and the name is put through the
+        same shortener as a fresh delivery: a legacy row and a new one render
+        alike, which is what the library contract says a row is — a *name*.
+        """
+        kind = str(item.get("kind") or "")
+        fallback = {
+            "booklet": FALLBACK_BOOKLET,
+            "office": FALLBACK_OFFICE,
+            "transcript": "متن گفتار",
+        }.get(kind, FALLBACK_DOCUMENT)
         raw = " ".join(str(item.get("title") or "").split())
-        if not raw:
-            return "جزوهٔ Word" if item.get("kind") == "booklet" else "متن گفتار"
-        return raw
+        raw = raw.lstrip("📖📝🗂📄✅ ").strip()
+        return short_title(raw, fallback=fallback)
 
     async def _flashcard_start_screen(
         self, event, user_id: int, item_id: int
@@ -4123,7 +4418,9 @@ class GamasBot:
             wanted=size,
             cost=cost,
             note=f"fc-pending:{item_id}",
-            title=item_title + " — فلش‌کارت",
+            # The deck inherits the artifact's short name for the same reason
+            # the booklet does: a deck list is a list of names.
+            title=short_title(item_title, fallback=FALLBACK_BOOKLET) + " — فلش‌کارت",
         )
 
     async def _show_flashcard_hub(self, event, *, page: int = 0) -> None:
@@ -6241,6 +6538,21 @@ class GamasBot:
         notice = ""
         notice_kind = ""
         docx_path: Path | None = None
+        # One short name for the whole artifact: the cover, the Word filename,
+        # the Telegram caption and the library row must all say the same thing,
+        # and a library button is no place for a full lesson sentence. The
+        # model's own title is the first candidate, so the user's lesson name
+        # survives — it is only shortened to the 2–4-word library contract.
+        booklet_title = short_title(
+            getattr(notes, "title", "") if notes is not None else "",
+            plain_title,
+            fallback=FALLBACK_BOOKLET,
+        )
+        if notes is not None:
+            # Rendering the cover and the file name from the same value keeps
+            # «عنوان جزوه» and «نام فایل» from drifting apart (the booklet is
+            # this title by default for the user).
+            notes = replace(notes, title=booklet_title)
         if notes is not None:
             try:
                 docx_bytes = await asyncio.to_thread(
@@ -6260,10 +6572,10 @@ class GamasBot:
                 fallback_text = document.llm_document() if document is not None else ""
             try:
                 docx_bytes = await asyncio.to_thread(
-                    build_plain_docx, plain_title, fallback_text,
+                    build_plain_docx, booklet_title, fallback_text,
                     fonts=resolve_fonts(), design=resolve_design(), meta=meta,
                 )
-                docx_path = workdir / plain_docx_filename(plain_title, reference)
+                docx_path = workdir / plain_docx_filename(booklet_title, reference)
                 await run_file_io(docx_path.write_bytes, docx_bytes)
             except Exception:
                 logger.exception("plain docx generation failed too")
@@ -6271,12 +6583,13 @@ class GamasBot:
                 notice_kind = "notes"
 
         if docx_path is not None:
-            # The library stores the clean one-line title; the learning CTA
-            # lives only in the Telegram caption (which _send_file caps at the
-            # 1024-char limit, truncating the trailing guide before the title).
-            title = f"📖 جزوهٔ Word — {reference}"
+            # The library stores the clean 2–4-word title (the screen paints the
+            # 📖 icon itself); the reference and the learning CTA live only in
+            # the Telegram caption, which _send_file caps at 1024 chars.
+            title = booklet_title
             caption = (
-                title + "\n📚 در کتابخانهٔ شما ذخیره شد" + LEARNING_DELIVERY_CTA
+                f"📖 {booklet_title} — {reference}"
+                "\n📚 در کتابخانهٔ شما ذخیره شد" + LEARNING_DELIVERY_CTA
             )
             # Presentations pass their built document as plain_text and have no
             # transcript object; media jobs carry the LLM-source transcript.

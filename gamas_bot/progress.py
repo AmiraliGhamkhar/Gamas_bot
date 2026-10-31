@@ -17,7 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 from telethon.errors import FloodWaitError
 
@@ -45,6 +45,17 @@ STAGE_EMOJI: tuple[tuple[int, str], ...] = (
 
 BAR_WIDTH = 12
 PERSIAN_DIGIT_TABLE = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+#: First line of the bar.  File jobs and short user actions (quiz, flashcards,
+#: document extraction, Free Office) are different products, so each one gets
+#: its own headline instead of telling a user that a «فایل» is being processed
+#: while a quiz is being generated.
+DEFAULT_PROGRESS_HEADLINE = "⏳ در حال پردازش فایل"
+WORK_PROGRESS_HEADLINE = "⏳ در حال پردازش"
+DEFAULT_DONE_HEADLINE = "✅ پردازش تکمیل شد"
+WORK_DONE_HEADLINE = "✅ آماده شد"
+DEFAULT_FAIL_HEADLINE = "❌ پردازش تکمیل نشد."
+WORK_FAIL_HEADLINE = "❌ انجام نشد."
 
 #: How often the ticker re-edits the message while a stage is running.
 ANIMATION_INTERVAL_SECONDS = 5.0
@@ -90,14 +101,44 @@ def progress_text(
     *,
     frame: int = 0,
     head: str = DEFAULT_HEAD,
+    headline: str = DEFAULT_PROGRESS_HEADLINE,
 ) -> str:
     """One rendered progress frame: bar, animated spinner, stage and detail."""
     value = max(0, min(100, int(percent)))
     spinner = SPINNER_FRAMES[frame % len(SPINNER_FRAMES)]
     text = (
-        f"⏳ در حال پردازش فایل {stage_emoji(value)}\n\n"
+        f"{headline} {stage_emoji(value)}\n\n"
         f"{progress_bar(value, head=head)}  {to_persian_digits(value)}٪  {spinner}\n"
         f"{stage.strip()}"
+    )
+    if detail.strip():
+        text += "\n" + detail.strip()
+    return text
+
+
+def completed_progress_text(
+    detail: str = "", *, headline: str = DEFAULT_DONE_HEADLINE
+) -> str:
+    """The finished frame: a full bar plus the outcome line.
+
+    Shared by the file pipeline and the short actions that show the same bar
+    (quiz/flashcard generation, document extraction, Free Office builds), so a
+    screen can keep its own buttons instead of being overwritten by a bar.
+    """
+    text = f"{headline}\n\n{progress_bar(100)}  ۱۰۰٪  ✅"
+    if detail.strip():
+        text += "\n" + detail.strip()
+    return text
+
+
+def failed_progress_text(
+    percent: int, detail: str = "", *, headline: str = DEFAULT_FAIL_HEADLINE
+) -> str:
+    """The failure frame: the bar stops where the work stopped (never removed)."""
+    value = max(0, min(100, int(percent)))
+    text = (
+        f"{headline}\n\n"
+        f"{progress_bar(value, head=FAILED_HEAD)}  {to_persian_digits(value)}٪"
     )
     if detail.strip():
         text += "\n" + detail.strip()
@@ -114,10 +155,14 @@ class JobProgress:
         *,
         submission_id: int | None = None,
         animation_interval: float = ANIMATION_INTERVAL_SECONDS,
+        headline: str = DEFAULT_PROGRESS_HEADLINE,
+        done_headline: str = DEFAULT_DONE_HEADLINE,
     ):
         self.event = event
         self.message = message
         self.submission_id = submission_id
+        self.headline = headline
+        self.done_headline = done_headline
         self.percent = 0
         self._last_text = ""
         self._lock = asyncio.Lock()
@@ -138,8 +183,12 @@ class JobProgress:
         stage: str = "در صف پردازش",
         animate: bool = True,
         animation_interval: float = ANIMATION_INTERVAL_SECONDS,
+        headline: str = DEFAULT_PROGRESS_HEADLINE,
+        done_headline: str = DEFAULT_DONE_HEADLINE,
     ) -> "JobProgress":
-        text = progress_text(0, stage, "پردازش به‌زودی آغاز می‌شود.")
+        text = progress_text(
+            0, stage, "پردازش به‌زودی آغاز می‌شود.", headline=headline
+        )
         try:
             message = await event.reply(text)
         except Exception:
@@ -148,7 +197,12 @@ class JobProgress:
             )
             message = None
         reporter = cls(
-            event, message, submission_id=submission_id, animation_interval=animation_interval
+            event,
+            message,
+            submission_id=submission_id,
+            animation_interval=animation_interval,
+            headline=headline,
+            done_headline=done_headline,
         )
         reporter._last_text = text
         reporter._stage = stage
@@ -203,7 +257,11 @@ class JobProgress:
 
     def _render(self) -> str:
         return progress_text(
-            self.percent, self._stage, self._detail, frame=self._frame
+            self.percent,
+            self._stage,
+            self._detail,
+            frame=self._frame,
+            headline=self.headline,
         )
 
     def _finish(self) -> None:
@@ -234,26 +292,22 @@ class JobProgress:
     async def complete(
         self,
         detail: str = "متن گفتار و فایل خروجی ارسال شد.",
-        headline: str = "✅ پردازش تکمیل شد",
+        headline: str | None = None,
     ) -> None:
         self._finish()
         self.percent = 100
-        text = (
-            f"{headline}\n\n"
-            f"{progress_bar(100)}  ۱۰۰٪  ✅\n"
-            f"{detail.strip()}"
+        await self._publish(
+            completed_progress_text(detail, headline=headline or self.done_headline)
         )
-        await self._publish(text)
 
     async def fail(self, reference: str) -> None:
         self._finish()
-        text = (
-            "❌ پردازش تکمیل نشد.\n\n"
-            f"{progress_bar(self.percent, head=FAILED_HEAD)}  "
-            f"{to_persian_digits(self.percent)}٪\n"
-            f"کد پیگیری: {to_persian_digits(reference)}"
+        await self._publish(
+            failed_progress_text(
+                self.percent,
+                f"کد پیگیری: {to_persian_digits(reference)}",
+            )
         )
-        await self._publish(text)
 
     async def _publish(self, text: str) -> None:
         if text == self._last_text:
@@ -305,3 +359,137 @@ class JobProgress:
             await self.message.edit(text)
         else:
             await self.event.respond(text)
+
+
+class WorkProgress:
+    """A single-message progress bar for one short, user-initiated action.
+
+    Quiz/flashcard generation, document extraction and Free Office builds are
+    seconds-to-minutes operations on **one** screen. They deserve the same bar
+    the file pipeline shows, but not its animation ticker: the operation
+    publishes a frame per step, and only one edit can be in flight, so the
+    animation would cost edits without adding information.
+
+    Everything here is best-effort by contract: a slow or refused Telegram edit
+    must never hold a generation slot, fail an Office build, or change what the
+    user is charged. ``editor`` is any ``async (text) -> None`` callable (the
+    bot passes its callback-edit helper or a message's own ``edit``); ``message``
+    is recorded when the caller wants to replace the bar with its final screen.
+    """
+
+    def __init__(
+        self,
+        editor: Callable[[str], Awaitable[None]],
+        *,
+        message: Any = None,
+        headline: str = WORK_PROGRESS_HEADLINE,
+        done_headline: str = WORK_DONE_HEADLINE,
+        submission_id: int | None = None,
+    ):
+        self.editor = editor
+        self.message = message
+        self.headline = headline
+        self.done_headline = done_headline
+        self.submission_id = submission_id
+        self.percent = 0
+        self.stage = ""
+        self._last_text = ""
+
+    @classmethod
+    async def start(
+        cls,
+        event: Any,
+        *,
+        stage: str,
+        detail: str = "",
+        headline: str = WORK_PROGRESS_HEADLINE,
+        done_headline: str = WORK_DONE_HEADLINE,
+        submission_id: int | None = None,
+    ) -> "WorkProgress":
+        """Send the 0 % frame, then edit it as the work advances.
+
+        The send itself is **not** swallowed: if Telegram refuses a new message
+        the caller must stop and compensate (the learning flow refunds), rather
+        than run a long generation behind a bar nobody can see.
+        """
+        text = progress_text(0, stage, detail, headline=headline)
+        message = await event.respond(text)
+        reporter = cls(
+            message.edit,
+            message=message,
+            headline=headline,
+            done_headline=done_headline,
+            submission_id=submission_id,
+        )
+        reporter._last_text = text
+        reporter.stage = stage
+        return reporter
+
+    @classmethod
+    def for_editor(
+        cls,
+        editor: Callable[[str], Awaitable[None]],
+        *,
+        headline: str = WORK_PROGRESS_HEADLINE,
+        done_headline: str = WORK_DONE_HEADLINE,
+        stage: str = "",
+        submission_id: int | None = None,
+    ) -> "WorkProgress":
+        """Drive a bar on a screen that is edited in place (a panel message)."""
+        reporter = cls(
+            editor,
+            headline=headline,
+            done_headline=done_headline,
+            submission_id=submission_id,
+        )
+        reporter.stage = stage
+        return reporter
+
+    async def edit(self, text: str = "", buttons: Any = None) -> None:
+        """Message-like passthrough, so ``_edit(progress, ...)`` keeps working."""
+        if self.message is not None and callable(getattr(self.message, "edit", None)):
+            await self.message.edit(text, buttons=buttons)
+            return
+        await self.editor(text)
+
+    async def update(self, percent: int, stage: str, detail: str = "") -> None:
+        """Publish one frame; the percent only ever moves forward."""
+        self.percent = max(self.percent, min(100, int(percent)))
+        self.stage = stage
+        await self._publish(
+            progress_text(self.percent, stage, detail, headline=self.headline)
+        )
+
+    async def complete(self, detail: str = "") -> None:
+        self.percent = 100
+        await self._publish(
+            completed_progress_text(detail, headline=self.done_headline)
+        )
+
+    async def fail(self, detail: str = "", *, headline: str = WORK_FAIL_HEADLINE) -> None:
+        """Leave the bar on screen where the work stopped (never silently removed)."""
+        await self._publish(failed_progress_text(self.percent, detail, headline=headline))
+
+    async def aclose(self) -> None:
+        """Symmetry with :class:`JobProgress`; there is no ticker to stop."""
+
+    async def _publish(self, text: str) -> None:
+        if text == self._last_text:
+            return
+        try:
+            await self.editor(text)
+            self._last_text = text
+        except FloodWaitError as exc:
+            # A decorative frame is never worth blocking a worker or a
+            # generation slot; the next frame carries the newer state anyway.
+            logger.warning(
+                "work progress skipped due to flood wait submission_id=%s seconds=%s",
+                self.submission_id,
+                exc.seconds,
+            )
+        except Exception:
+            logger.debug(
+                "work progress edit failed submission_id=%s",
+                self.submission_id,
+                exc_info=True,
+            )

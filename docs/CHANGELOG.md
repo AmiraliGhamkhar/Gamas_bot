@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased — quiz/flashcard reliability, short library titles, action progress bars
+
+- **Flashcard and question generation no longer fail on a cosmetic mismatch.** Two strict checks sat
+  between a fully grounded model answer and the user's preview: the quiz parser demanded
+  `difficulty` to be exactly `medium`/`hard` (a route without structured-output enforcement answers
+  «سخت»/«متوسط» in the prompt's language), and the chunk generator required the model's `source`
+  locator to be *byte-identical* to the chunk's own label (a re-typed «بخش 1 (1/3)» or «[بخش ۱]»
+  did not match «بخش ۱ (۱/۳)»). Both dropped **every** item, the single repair retry failed the
+  same way, and the user saw «ساخت محتوا ناموفق بود» after a billed generation.
+  `learning.parse_difficulty` now maps English and Persian labels (an unknown/missing tag is simply
+  not recorded, per S5) and `learning.source_matches`/`source_key` fold digit shape, Arabic letter
+  variants, brackets, quotes, slashes and spacing for comparison only — the stored locator keeps its
+  original spelling, a fabricated locator is still refused, and prefix matching is token-aligned so
+  «بخش ۱» can never swallow «بخش ۱۰». A page/slide marker that the chunk itself carries
+  (`learning.source_grounded_in`, e.g. «[صفحهٔ ۲]» inside a booklet) is accepted as well, because it
+  can be verified in the very text the item was generated from. A chunk with no locator at all
+  (legacy content) no longer rejects everything, and a numeric `source` is read instead of
+  discarded.
+- **Every library row now has a real name.** A booklet was indexed as
+  «📖 جزوهٔ Word — GMS-000123», which is not a title. `gamas_bot/titles.py` derives a deterministic
+  2–4-word title from the model's lesson title (falling back to the upload name, `جزوهٔ درسی` last),
+  and that one name is used for the booklet cover, the Word filename, the Telegram caption and the
+  library row — so the booklet a user opens from the list is the booklet that was named in the list.
+  Free Office rows follow the same contract with their format token («گزارش فروش — Word»), and the
+  library screen paints the row icon per kind (📖 booklet, 📝 transcript, 🗂 Office, 📄 document)
+  instead of putting 📖 in front of every artifact.
+- **Quiz, flashcards, document extraction and Free Office builds show a progress bar.** They used to
+  post one plain sentence («در حال ساخت…») and then sit still for minutes. `progress.WorkProgress`
+  sends a 0 % bar *before* the first model call, advances per chunk/step
+  («در حال تولید سؤال‌ها · بخش ۳ از ۷»), keeps the last frame on failure with a 🛑 bar, and its edits
+  are strictly decorative — a refused or flood-waited edit can never hold a model slot, fail an
+  Office build or change a charge. `progress_text` gained a `headline`, and the shared
+  `completed_progress_text`/`failed_progress_text` frames let a screen keep its own buttons on a
+  finished bar. The file pipeline's own bar is unchanged.
+- Offline regression tests: `tests/test_titles.py`, `tests/test_progress_bars.py`, plus new cases in
+  `tests/test_learning.py` (retyped locator accepted, fabricated locator refused, Persian difficulty
+  recorded), `tests/test_document_ingestion.py`, `tests/test_office_flow.py` and
+  `tests/test_library.py`.
+
 ## Unreleased — agent system prompt
 
 - Added `AGENTS.md` at the repository root: the model-agnostic system prompt / maintainer contract

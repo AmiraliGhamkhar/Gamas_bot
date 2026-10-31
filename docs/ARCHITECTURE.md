@@ -33,12 +33,19 @@ Office drafts are in-memory only, user-scoped, bounded to 128 concurrent drafts 
 configured TTL. Office operations never enter billing, the ledger, subscriptions or quiz/flashcard
 free-use counters.
 
+A library row stores a **name**, not a caption: `titles.short_title` derives a deterministic 2–4-word
+title from the artifact's own title (booklet cover, document name, upload name) and the same value
+names the booklet file, its Telegram caption and its library row. `progress.JobProgress` animates the
+long file pipeline; `progress.WorkProgress` drives the bar for the short actions on one screen (quiz
+and flashcard generation, document extraction, Free Office builds), always publishing a 0 % frame
+before the first model call and keeping a 🛑 frame where a failed action stopped.
+
 ## Code map
 
 | Area | Files |
 | --- | --- |
 | Startup/configuration | `__main__.py`, `config.py`, `launcher.py`, `instance_lock.py`, `logging_config.py`, `metrics.py` |
-| Telegram, queue & stage gates | `bot.py`, `jobs.py`, `capacity.py`, `progress.py`, `telegram_text.py` |
+| Telegram, queue & stage gates | `bot.py`, `jobs.py`, `capacity.py`, `progress.py` (job + action bars), `telegram_text.py`, `titles.py` (2–4-word library names) |
 | Media and decks | `media.py`, `media_worker.py`, `presentations.py` |
 | Providers and notes | `stt.py`, `llm.py`, `http_util.py`, `transcript.py`, `textnorm.py`, `notes.py`, `notes_evidence.py` |
 | Documents and Free Office | `doc_extract.py` (PDF/Word/PowerPoint → locator-tagged sections → chunks), `docx_export.py`, `pdf_export.py`, `office.py` (bounded text/CSV parsing and builders), `office_ai.py` (optional source-checked deck/table planning), `office_notes.py` (full and compact note modes), `mdblocks.py`, `bidi.py` |

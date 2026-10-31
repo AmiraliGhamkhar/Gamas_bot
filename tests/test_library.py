@@ -100,13 +100,17 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({item["chat_id"] for item in items}, {OWNER})
         self.assertEqual(len({item["message_id"] for item in items}), 2)
         self.assertTrue(all(item["message_id"] != event.message.id for item in items))
-        # The stored title stays clean; the storage line and learning CTA live
-        # in the Telegram caption only.
-        self.assertEqual(items[0]["title"], "📖 جزوهٔ Word — GMS-1")
+        # The stored title is the booklet's own short name (2–4 words, no emoji
+        # and no reference code); the storage line and the learning CTA live in
+        # the Telegram caption only.
+        self.assertEqual(items[0]["title"], "جزوهٔ آزمایشی")
+        self.assertIn(len(items[0]["title"].split()), (2, 3, 4))
         booklet_delivery = next(
             delivery for delivery in self.client.deliveries if str(delivery["path"]).endswith(".docx")
         )
         self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", booklet_delivery["caption"])
+        # The Word filename uses the same short title as the library row.
+        self.assertIn("جزوهٔ آزمایشی", str(booklet_delivery["path"]))
         self.assertIn("آزمون بده", booklet_delivery["caption"])
 
     async def test_empty_library_uses_the_persian_empty_state(self):
@@ -149,7 +153,10 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"lib:0", second_payloads)
         self.assertEqual(sum(payload.startswith(b"lib:it:") for payload in second_payloads), 2)
         labels = [button.text for row in second_buttons for button in row]
-        self.assertTrue(any(label.startswith("📖 ") for label in labels))
+        # Each row is labelled by what it is, not by one icon for everything.
+        self.assertEqual(
+            sum(label.startswith("📝 ") for label in labels), 2, labels
+        )
 
     async def test_forward_success_reuses_the_saved_source_message(self):
         item_id = await self._add_item(OWNER, "متن کلاس", message_id=4321, chat_id=777)
@@ -353,7 +360,10 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(OWNER, f"lib:it:{item_id}".encode())
         await self.bot._handle_callback(event)
         text, buttons = event.edits[-1]
-        self.assertIn("GMS-77", text)
+        # A legacy row («📖 جزوهٔ Word — GMS-77») is shown by its name: the icon
+        # is painted by the screen and the reference code is not part of a name.
+        self.assertIn("جزوهٔ Word", text)
+        self.assertNotIn("GMS-77", text)
         payloads = menu_payloads(buttons)
         self.assertIn(f"lib:f:{item_id}".encode(), payloads)
         self.assertIn(f"quiz:new:{item_id}".encode(), payloads)

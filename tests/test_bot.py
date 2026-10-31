@@ -1686,8 +1686,14 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
         captions = [caption for caption, _path in event.files]
         self.assertIn("متن خام", captions[0])
-        self.assertIn("جزوهٔ Word", captions[1])
+        # The booklet caption carries the booklet's own 2–4-word title (the
+        # library row uses the same name), not a generic «جزوهٔ Word» label.
+        self.assertIn("جزوهٔ خودکار", captions[1])
         self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", captions[1])
+        # «عنوان جزوه» is the same 2–4-word name by default: the cover of the
+        # Word file carries it, so the booklet a user opens is the one the list
+        # named.
+        self.assertIn("جزوهٔ خودکار", docx_text(event.file_bytes(".docx")))
         items = await self.db.library_list(user_id, limit=6)
         self.assertEqual([item["kind"] for item in items], ["booklet", "transcript"])
         row = await self.db.submission(job.submission_id)

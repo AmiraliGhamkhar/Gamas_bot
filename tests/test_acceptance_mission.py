@@ -390,7 +390,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.file_bytes(".txt"))
         self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
         self.assertIn("متن خام", event.files[0][0])
-        self.assertIn("جزوهٔ Word", event.files[1][0])
+        self.assertIn("جزوهٔ خودکار", event.files[1][0])
         self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", event.files[1][0])
         items = await self.db.library_list(USER, limit=6)
         self.assertEqual([item["kind"] for item in items], ["booklet", "transcript"])
