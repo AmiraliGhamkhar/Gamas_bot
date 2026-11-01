@@ -417,6 +417,10 @@ class GamasBot(
                 await self._close_cancelled_progress(job)
 
         await self.queue.shutdown(on_reject=_fail_queued)
+        if self._prewarm_task is not None:
+            self._prewarm_task.cancel()
+            await asyncio.gather(self._prewarm_task, return_exceptions=True)
+            self._prewarm_task = None
         if self._http is not None:
             await self._http.close()
             self._http = None
@@ -425,7 +429,7 @@ class GamasBot(
         await self.db.close()
 
     def _http_session(self) -> aiohttp.ClientSession:
-        if self._http is None or self._http.closed:
+        if self._http is None or getattr(self._http, "closed", False):
             aiohttp_mod = deps_for(self).aiohttp_module
             connector = aiohttp_mod.TCPConnector(
                 limit=self.settings.llm_connector_limit,
@@ -439,12 +443,14 @@ class GamasBot(
                 ),
                 connector=connector,
             )
-            if self.settings.llm_prewarm:
+            if self.settings.llm_prewarm and not self._shutting_down:
                 self._schedule_llm_prewarm()
         return self._http
 
     def _schedule_llm_prewarm(self) -> None:
         """Warm connections to the primary LLM and STT hosts (no quota used)."""
+        if self._shutting_down:
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:

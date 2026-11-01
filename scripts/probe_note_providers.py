@@ -222,6 +222,41 @@ def _check_gemini(route) -> bool:
     return True
 
 
+def _check_openai_models(route) -> bool:
+    """OpenAI-compatible /v1/models check for Groq, Cerebras, and generic gateways."""
+    url, headers = _build_get_request_for(route, "models")
+    status, payload = _get_json(url, route.api_key, headers=headers)
+    if status != 200 or not isinstance(payload, dict):
+        detail = _redact_secrets(str(payload)[:200], route.api_key)
+        print(f"[FAIL] {route.slug} /v1/models: HTTP {status}: {detail}")
+        return False
+    entries = payload.get("data")
+    if not isinstance(entries, list):
+        print(f"[FAIL] {route.slug} /v1/models: unexpected response shape (no data list)")
+        return False
+    ids = [entry.get("id") for entry in entries if isinstance(entry, dict)]
+    entitled = route.model in ids
+    print(
+        f"[{'PASS' if entitled else 'FAIL'}] {route.slug} model {route.model!r} "
+        f"{'is' if entitled else 'is NOT'} listed ({len(ids)} model(s) returned)"
+    )
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("id") == route.model:
+            limits = {
+                key: entry[key]
+                for key in (
+                    "context_window",
+                    "context_length",
+                    "max_completion_tokens",
+                    "max_tokens",
+                )
+                if key in entry
+            }
+            if limits:
+                print(f"       published metadata: {limits}")
+    return entitled
+
+
 async def _generate(route, settings, text: str) -> bool:
     """One map-style note request against exactly ``route``.
 
@@ -236,17 +271,24 @@ async def _generate(route, settings, text: str) -> bool:
     from gamas_bot.notes import (
         TRANSCRIPT_PROMPT,
         _load_json_payload,
+        _response_schema,
         build_system_prompt,
         effective_chunk_chars,
     )
 
     system = build_system_prompt(settings.note_mode)
+    schema = _response_schema(settings)
     started = time.monotonic()
     try:
         excerpt = text[: effective_chunk_chars(settings, system_prompt=system)]
         async with aiohttp.ClientSession() as session:
             raw = await _complete_on_route(
-                route, session, settings, system=system, user=TRANSCRIPT_PROMPT + excerpt
+                route,
+                session,
+                settings,
+                system=system,
+                user=TRANSCRIPT_PROMPT + excerpt,
+                schema=schema,
             )
         notes = _load_json_payload(_parse_json_object(raw))
     except Exception as exc:  # noqa: BLE001 - report any provider failure verbatim
@@ -294,6 +336,8 @@ def main(argv: list[str] | None = None) -> int:
             ok = _check_openrouter(route) and ok
         elif route.slug == "gemini":
             ok = _check_gemini(route) and ok
+        elif route.slug in ("groq", "cerebras", "openai_compatible"):
+            ok = _check_openai_models(route) and ok
         else:
             print(f"[WARN] {route.slug}: no metadata probe; generation stage still applies")
 

@@ -44,6 +44,11 @@ from .http_util import (
     retry_after_seconds as _retry_after_seconds,
     sanitize_error_text as _sanitize_error_text,
 )
+from .llm_profiles import (
+    get_provider_profile,
+    to_gemini_schema,
+    to_non_strict_openai_json_schema,
+)
 from .metrics import METRICS
 from .protocols import LLMProviderDialect
 
@@ -626,38 +631,13 @@ def _openrouter_model_path(model: str) -> str:
 
 
 def _gemini_schema(node: object) -> object:
-    """Convert a plain JSON schema to Gemini's ``responseSchema`` dialect.
-
-    Gemini spells ``type`` values in upper case and does not accept the parts of
-    JSON Schema that a strict-mode OpenAI request needs, so the same schema
-    cannot be sent verbatim to both.
-    """
-    if isinstance(node, list):
-        return [_gemini_schema(item) for item in node]
-    if not isinstance(node, dict):
-        return node
-    converted: dict = {}
-    for key, value in node.items():
-        if key == "type" and isinstance(value, str):
-            converted[key] = value.upper()
-        elif key == "required":
-            continue  # Gemini infers required properties from the schema.
-        elif key in {"properties"} and isinstance(value, dict):
-            converted[key] = {name: _gemini_schema(item) for name, item in value.items()}
-        else:
-            converted[key] = _gemini_schema(value)
-    return converted
+    """Convert a JSON Schema to Gemini's OpenAPI 3.0 ``responseSchema`` dialect."""
+    return to_gemini_schema(node)
 
 
 def _openai_json_schema(schema: dict) -> dict:
-    """The documented OpenAI-compatible ``json_schema`` wrapper (non-strict).
-
-    ``strict: true`` demands that every property is listed in ``required`` and
-    that ``additionalProperties`` is false, which a note document (whose
-    sections legitimately omit empty fields) cannot truthfully declare. The
-    non-strict form still constrains the shape and is what gateways accept.
-    """
-    return {"name": "gamas_notes", "schema": schema}
+    """The portable non-strict OpenAI-compatible ``json_schema`` wrapper."""
+    return to_non_strict_openai_json_schema(schema)
 
 
 #: Gemini FinishReason values that report safety, policy or recitation blocks
@@ -729,7 +709,9 @@ class OpenAIDialect:
     ) -> tuple[str, dict[str, str], dict[str, Any]]:
         key = _clean_api_key(route.api_key)
         model = route.model.strip()
-        max_tokens = settings.note_max_output_tokens
+        profile = get_provider_profile(route.slug)
+        streaming = float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0) > 0
+        max_tokens = profile.clamp_output_tokens(route, settings.note_max_output_tokens)
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         payload: dict[str, Any] = {
             "model": model,
@@ -740,25 +722,12 @@ class OpenAIDialect:
             "temperature": NOTE_TEMPERATURE,
             "max_tokens": max_tokens,
         }
-        if schema is not None:
-            payload["response_format"] = {
-                "type": "json_schema",
-                "json_schema": _openai_json_schema(schema),
-            }
-        elif route.json_object_mode:
-            payload["response_format"] = {"type": "json_object"}
-        if (
-            getattr(settings, "note_openrouter_throughput", False)
-            and route.slug == "openrouter"
-        ):
-            payload["provider"] = {"sort": "throughput"}
-        if settings.note_reasoning_effort and route.slug in (
-            "nara",
-            "openrouter",
-            "groq",
-            "cerebras",
-        ):
-            payload["reasoning_effort"] = settings.note_reasoning_effort
+        response_format = profile.build_response_format(
+            route, settings, schema, streaming=streaming
+        )
+        if response_format is not None:
+            payload["response_format"] = response_format
+        profile.apply_openai_extras(payload, route, settings)
         return _endpoint(route.base_url, "chat/completions"), headers, payload
 
     def build_get_request(
@@ -906,7 +875,9 @@ class GeminiDialect:
             "maxOutputTokens": settings.note_max_output_tokens,
             "responseMimeType": "application/json",
         }
-        if schema is not None:
+        if schema is not None and bool(
+            getattr(settings, "note_structured_output", True)
+        ):
             generation_config["responseSchema"] = _gemini_schema(schema)
         if settings.gemini_thinking_budget >= 0:
             generation_config["thinkingConfig"] = {
@@ -1068,14 +1039,38 @@ class AnthropicDialect:
             return False
 
     def is_reasoning_exhausted(self, payload: dict[str, Any]) -> bool:
-        return OpenAIDialect().is_reasoning_exhausted(payload)
+        content = payload.get("content")
+        if isinstance(content, list):
+            return any(
+                isinstance(part, dict)
+                and part.get("type") in ("thinking", "redacted_thinking")
+                for part in content
+            )
+        return False
 
     def parse_response(self, payload: dict[str, Any]) -> str:
-        return "".join(
+        stop_reason = str(payload.get("stop_reason") or "").strip().lower()
+        if stop_reason == "model_context_window_exceeded":
+            raise LLMContextOverflowError(
+                "پنجرهٔ زمینهٔ مدل برای این درخواست کافی نبود "
+                "(model_context_window_exceeded)."
+            )
+        if stop_reason == "refusal":
+            raise LLMRequestError("پاسخ سرویس تولید جزوه مسدود شد (refusal).")
+        content = payload["content"]
+        if not isinstance(content, list):
+            raise TypeError("Anthropic content is not a list")
+        text = "".join(
             str(part.get("text", ""))
-            for part in payload["content"]
-            if part.get("type") == "text"
+            for part in content
+            if isinstance(part, dict) and part.get("type") == "text"
         )
+        if not text.strip() and self.is_reasoning_exhausted(payload):
+            raise LLMOutputBudgetError(
+                "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
+                "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
+            )
+        return text
 
     def extract_usage(
         self, payload: dict[str, Any]
@@ -1211,8 +1206,21 @@ def _log_usage(
     )
 
 
-def _adjust_rejected_request_param(payload: dict, error_text: str) -> str | None:
-    """Adjust a request field after an explicit 400/422 parameter rejection."""
+_OUTPUT_CAP_ERROR_RE = re.compile(
+    r"(?:max_tokens|max_completion_tokens)[^0-9]{1,80}?"
+    r"(?:<=|less than or equal to|at most|cannot exceed|must not exceed|maximum[^\d]{0,15}is)"
+    r"\s*(\d{3,6})\b",
+    re.IGNORECASE,
+)
+
+
+def _adjust_rejected_request_param(
+    payload: dict,
+    error_text: str,
+    *,
+    allow_json_object_fallback: bool = True,
+) -> str | None:
+    """Adjust a request field after an explicit 400/404/422 parameter rejection."""
     lower = error_text.lower()
     rejected_markers = (
         "unsupported parameter",
@@ -1227,12 +1235,76 @@ def _adjust_rejected_request_param(payload: dict, error_text: str) -> str | None
         "only supports",
         "must be 1",
         "must equal 1",
+        "invalid_request",
+        "invalid json schema",
     )
-    if "response_format" in payload and any(
-        marker in lower for marker in ("response_format", "json_object", "structured_output")
+    if "no endpoints found" in lower:
+        resp_fmt = payload.get("response_format")
+        if isinstance(resp_fmt, dict) and resp_fmt.get("type") == "json_schema":
+            if allow_json_object_fallback:
+                payload["response_format"] = {"type": "json_object"}
+                return "response_format.json_schema_to_json_object"
+            payload.pop("response_format", None)
+            return "response_format"
+        if "provider" in payload:
+            payload.pop("provider", None)
+            return "provider"
+        if "reasoning_effort" in payload:
+            payload.pop("reasoning_effort", None)
+            return "reasoning_effort"
+        if "response_format" in payload:
+            payload.pop("response_format", None)
+            return "response_format"
+
+    if "response_format" in payload:
+        resp_fmt = payload.get("response_format")
+        is_schema_fmt = isinstance(resp_fmt, dict) and resp_fmt.get("type") == "json_schema"
+        schema_specific_markers = (
+            "json_schema",
+            "structured_output",
+            "structured output",
+            "additionalproperties",
+            "additional_properties",
+            "minitems",
+            "maxitems",
+            "generated json does not match",
+            "invalid json schema",
+            "response_schema",
+        )
+        if (
+            is_schema_fmt
+            and allow_json_object_fallback
+            and "json_object" not in lower
+            and (
+                any(marker in lower for marker in schema_specific_markers)
+                or ("strict" in lower and "schema" in lower)
+            )
+        ):
+            payload["response_format"] = {"type": "json_object"}
+            return "response_format.json_schema_to_json_object"
+        if any(
+            marker in lower
+            for marker in (
+                "response_format",
+                "json_object",
+                "structured_output",
+                "structured output",
+                "json_schema",
+                "json mode",
+                "json_validate_failed",
+                "failed to generate json",
+                "generated json does not match",
+            )
+        ):
+            payload.pop("response_format", None)
+            return "response_format"
+
+    if "reasoning_format" in payload and any(
+        marker in lower for marker in ("reasoning_format", "reasoning format")
     ):
-        payload.pop("response_format", None)
-        return "response_format"
+        payload.pop("reasoning_format", None)
+        return "reasoning_format"
+
     if "reasoning_effort" in payload and any(
         marker in lower
         for marker in (
@@ -1246,6 +1318,15 @@ def _adjust_rejected_request_param(payload: dict, error_text: str) -> str | None
     ):
         payload.pop("reasoning_effort", None)
         return "reasoning_effort"
+
+    if (
+        "provider" in payload
+        and "provider" in lower
+        and any(marker in lower for marker in rejected_markers)
+    ):
+        payload.pop("provider", None)
+        return "provider"
+
     generation_config = payload.get("generationConfig")
     if isinstance(generation_config, dict):
         if (
@@ -1312,6 +1393,23 @@ def _adjust_rejected_request_param(payload: dict, error_text: str) -> str | None
     ):
         payload["max_completion_tokens"] = payload.pop("max_tokens")
         return "max_tokens_to_max_completion_tokens"
+    if (
+        "max_completion_tokens" in payload
+        and "max_completion_tokens" in lower
+        and any(marker in lower for marker in rejected_markers)
+        and "max_tokens" not in payload
+    ):
+        payload["max_tokens"] = payload.pop("max_completion_tokens")
+        return "max_completion_tokens_to_max_tokens"
+    for budget_key in ("max_tokens", "max_completion_tokens"):
+        current_budget = payload.get(budget_key)
+        if isinstance(current_budget, int) and not isinstance(current_budget, bool):
+            cap_match = _OUTPUT_CAP_ERROR_RE.search(error_text)
+            if cap_match is not None:
+                cap_val = int(cap_match.group(1))
+                if 0 < cap_val < current_budget:
+                    payload[budget_key] = cap_val
+                    return f"{budget_key}_clamped"
     if (
         "temperature" in payload
         and "temperature" in lower
@@ -1427,26 +1525,54 @@ async def _complete_streaming_on_route(
     headers: dict[str, str],
     payload: dict,
     timeout_seconds: float,
+    include_stream_options: bool | None = None,
 ) -> str:
     """Parse an SSE response incrementally under a hard body-size ceiling."""
     ttfb_timeout = float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0)
+    profile = get_provider_profile(route.slug)
     is_gemini = route.style == "gemini"
+    is_anthropic = route.style == "anthropic"
     if is_gemini:
         stream_url = _gemini_sse_url(url)
         stream_payload = payload
+    elif is_anthropic:
+        stream_url = url
+        stream_payload = dict(payload)
+        stream_payload["stream"] = True
     else:
         stream_url = url
         stream_payload = dict(payload)
         stream_payload["stream"] = True
-        stream_payload["stream_options"] = {"include_usage": True}
+        if (
+            not profile.supports_streaming_with_json_schema
+            and isinstance(stream_payload.get("response_format"), dict)
+            and stream_payload["response_format"].get("type") == "json_schema"
+        ):
+            stream_payload["response_format"] = {"type": "json_object"}
+        use_stream_opts = (
+            profile.supports_stream_options(route)
+            if include_stream_options is None
+            else include_stream_options
+        )
+        if use_stream_opts:
+            stream_payload["stream_options"] = {"include_usage": True}
+
     started = time.perf_counter()
     ttfb_ms = 0.0
     text_parts: list[str] = []
+    refusal_parts: list[str] = []
     finish_reason = ""
-    usage: dict = {}
+    native_finish_reason = ""
+    usage: dict[str, Any] = {}
     saw_thought = False
+    saw_reasoning = False
+    saw_candidate = False
+    prompt_feedback: dict[str, Any] | None = None
     model_version = ""
+    served_model = ""
     raw_fallback_body: bytes | None = None
+    non_sse_buffer = bytearray()
+    saw_sse_prefix = False
     parsed_chunks = 0
     response_bytes = 0
 
@@ -1461,15 +1587,27 @@ async def _complete_streaming_on_route(
         resp_headers = getattr(response, "headers", None)
 
         def consume_line(line: bytes | str, *, count_bytes: bool = True) -> None:
-            nonlocal parsed_chunks, response_bytes, finish_reason, usage
-            nonlocal saw_thought, model_version
+            nonlocal parsed_chunks, response_bytes, finish_reason, native_finish_reason
+            nonlocal usage, saw_thought, saw_reasoning, saw_candidate, prompt_feedback
+            nonlocal model_version, served_model, saw_sse_prefix
+            line_bytes_obj = (
+                bytes(line)
+                if isinstance(line, (bytes, bytearray))
+                else str(line).encode("utf-8")
+            )
             if count_bytes:
-                line_bytes = len(line) if isinstance(line, bytes) else len(str(line).encode("utf-8"))
-                response_bytes += line_bytes
+                response_bytes += len(line_bytes_obj)
                 if response_bytes > MAX_LLM_RESPONSE_BYTES:
                     raise LLMResponseError(
                         "حجم پاسخ سرویس تولید جزوه بیش از حد مجاز بود."
                     )
+            stripped_raw = line_bytes_obj.lstrip()
+            if stripped_raw.startswith((b"data:", b"event:", b":")):
+                saw_sse_prefix = True
+            elif parsed_chunks == 0 and not saw_sse_prefix and len(non_sse_buffer) < 2 * 1024 * 1024:
+                non_sse_buffer.extend(line_bytes_obj)
+                non_sse_buffer.append(ord("\n"))
+
             chunk = _parse_sse_line(line)
             if chunk is None:
                 return
@@ -1486,8 +1624,11 @@ async def _complete_streaming_on_route(
                     usage = chunk["usageMetadata"]
                 if isinstance(chunk.get("modelVersion"), str):
                     model_version = chunk["modelVersion"]
+                if isinstance(chunk.get("promptFeedback"), dict):
+                    prompt_feedback = chunk["promptFeedback"]
                 candidates = chunk.get("candidates")
                 if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+                    saw_candidate = True
                     first_cand = candidates[0]
                     if first_cand.get("finishReason"):
                         finish_reason = str(first_cand["finishReason"])
@@ -1504,6 +1645,41 @@ async def _complete_streaming_on_route(
                                 text_parts.append(str(part.get("text", "")))
                 return
 
+            if is_anthropic:
+                ev_type = str(chunk.get("type") or "")
+                if ev_type == "message_start":
+                    msg_obj = chunk.get("message")
+                    if isinstance(msg_obj, dict):
+                        if isinstance(msg_obj.get("model"), str):
+                            served_model = msg_obj["model"]
+                        if isinstance(msg_obj.get("usage"), dict):
+                            usage.update(msg_obj["usage"])
+                elif ev_type == "content_block_start":
+                    cb = chunk.get("content_block")
+                    if isinstance(cb, dict):
+                        cb_type = cb.get("type")
+                        if cb_type in ("thinking", "redacted_thinking"):
+                            saw_thought = True
+                        elif cb_type == "text" and cb.get("text"):
+                            text_parts.append(str(cb["text"]))
+                elif ev_type == "content_block_delta":
+                    delta = chunk.get("delta")
+                    if isinstance(delta, dict):
+                        d_type = delta.get("type")
+                        if d_type == "text_delta" and delta.get("text"):
+                            text_parts.append(str(delta["text"]))
+                        elif d_type in ("thinking_delta", "signature_delta"):
+                            saw_thought = True
+                elif ev_type == "message_delta":
+                    delta = chunk.get("delta")
+                    if isinstance(delta, dict) and delta.get("stop_reason"):
+                        finish_reason = str(delta["stop_reason"])
+                    if isinstance(chunk.get("usage"), dict):
+                        usage.update(chunk["usage"])
+                return
+
+            if isinstance(chunk.get("model"), str) and chunk["model"]:
+                served_model = chunk["model"]
             if isinstance(chunk.get("usage"), dict):
                 usage = chunk["usage"]
             choices = chunk.get("choices")
@@ -1517,19 +1693,75 @@ async def _complete_streaming_on_route(
                     )
                 if choice.get("finish_reason"):
                     finish_reason = str(choice["finish_reason"])
+                if choice.get("native_finish_reason"):
+                    native_finish_reason = str(choice["native_finish_reason"])
                 delta = choice.get("delta")
-                if isinstance(delta, dict) and delta.get("content"):
-                    text_parts.append(str(delta["content"]))
-                elif isinstance(choice.get("message"), dict) and choice["message"].get("content"):
-                    text_parts.append(str(choice["message"]["content"]))
+                if isinstance(delta, dict):
+                    if delta.get("content"):
+                        text_parts.append(str(delta["content"]))
+                    for r_key in ("reasoning", "reasoning_content"):
+                        r_val = delta.get(r_key)
+                        if isinstance(r_val, str) and r_val.strip():
+                            saw_reasoning = True
+                    refusal_val = delta.get("refusal")
+                    if isinstance(refusal_val, str) and refusal_val:
+                        refusal_parts.append(refusal_val)
+                elif isinstance(choice.get("message"), dict):
+                    msg_dict = choice["message"]
+                    if msg_dict.get("content"):
+                        text_parts.append(str(msg_dict["content"]))
+                    for r_key in ("reasoning", "reasoning_content"):
+                        r_val = msg_dict.get(r_key)
+                        if isinstance(r_val, str) and r_val.strip():
+                            saw_reasoning = True
+                    refusal_val = msg_dict.get("refusal")
+                    if isinstance(refusal_val, str) and refusal_val:
+                        refusal_parts.append(refusal_val)
 
         content = getattr(response, "content", None)
-        iterator = (
-            content.__aiter__()
-            if content is not None and hasattr(content, "__aiter__")
-            else None
-        )
-        if iterator is not None:
+        iter_chunked = getattr(content, "iter_chunked", None) if content is not None else None
+        if callable(iter_chunked):
+            chunk_iter = iter_chunked(16384).__aiter__()
+            try:
+                if ttfb_timeout > 0:
+                    first_raw = await asyncio.wait_for(
+                        chunk_iter.__anext__(), timeout=ttfb_timeout
+                    )
+                else:
+                    first_raw = await chunk_iter.__anext__()
+            except asyncio.TimeoutError as exc:
+                raise _TTFBTimeoutError(
+                    f"{route.label} در مهلت نخستین بایت پاسخ نداد."
+                ) from exc
+            except StopAsyncIteration:
+                first_raw = None
+            ttfb_ms = (time.perf_counter() - started) * 1000.0
+            line_buf = bytearray()
+
+            def _feed_chunk(raw_bytes: bytes) -> None:
+                nonlocal response_bytes
+                response_bytes += len(raw_bytes)
+                if response_bytes > MAX_LLM_RESPONSE_BYTES:
+                    raise LLMResponseError(
+                        "حجم پاسخ سرویس تولید جزوه بیش از حد مجاز بود."
+                    )
+                line_buf.extend(raw_bytes)
+                while True:
+                    nl = line_buf.find(b"\n")
+                    if nl < 0:
+                        break
+                    one_line = bytes(line_buf[:nl])
+                    del line_buf[: nl + 1]
+                    consume_line(one_line, count_bytes=False)
+
+            if first_raw is not None:
+                _feed_chunk(first_raw)
+                async for raw_chunk in chunk_iter:
+                    _feed_chunk(raw_chunk)
+                if line_buf:
+                    consume_line(bytes(line_buf), count_bytes=False)
+        elif content is not None and hasattr(content, "__aiter__"):
+            iterator = content.__aiter__()
             try:
                 if ttfb_timeout > 0:
                     first_line = await asyncio.wait_for(
@@ -1558,38 +1790,64 @@ async def _complete_streaming_on_route(
                 consume_line(line, count_bytes=False)
 
     elapsed_ms = (time.perf_counter() - started) * 1000.0
-    if parsed_chunks == 0 and raw_fallback_body:
+    fallback_bytes = raw_fallback_body or (bytes(non_sse_buffer) if non_sse_buffer else None)
+    if parsed_chunks == 0 and fallback_bytes:
         try:
-            fallback_dict = _loads(raw_fallback_body)
+            fallback_dict = _loads(fallback_bytes)
             if isinstance(fallback_dict, dict):
                 _log_usage(route, fallback_dict, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms)
                 _raise_if_in_body_error(route.label, fallback_dict, resp_headers, route.api_key or None)
                 return _parse_response(fallback_dict, route.style)
         except (ValueError, TypeError):
             pass
+
     if is_gemini:
         assembled_parts: list[dict[str, object]] = []
         if saw_thought:
             assembled_parts.append({"thought": True, "text": ""})
         if text_parts:
             assembled_parts.append({"text": "".join(text_parts)})
-        assembled = {
-            "candidates": [{
+        assembled: dict[str, Any] = {"usageMetadata": usage}
+        if saw_candidate or not prompt_feedback:
+            assembled["candidates"] = [{
                 "content": {"parts": assembled_parts},
                 "finishReason": finish_reason or "STOP",
-            }],
-            "usageMetadata": usage,
-        }
+            }]
+        if prompt_feedback:
+            assembled["promptFeedback"] = prompt_feedback
         if model_version:
             assembled["modelVersion"] = model_version
-    else:
+    elif is_anthropic:
+        anth_blocks: list[dict[str, object]] = []
+        if saw_thought:
+            anth_blocks.append({"type": "thinking", "thinking": "[present]"})
+        if text_parts:
+            anth_blocks.append({"type": "text", "text": "".join(text_parts)})
         assembled = {
-            "choices": [{
-                "message": {"content": "".join(text_parts)},
-                "finish_reason": finish_reason or "stop",
-            }],
+            "content": anth_blocks,
+            "stop_reason": finish_reason or "end_turn",
             "usage": usage,
         }
+        if served_model:
+            assembled["model"] = served_model
+    else:
+        assembled_msg: dict[str, Any] = {"content": "".join(text_parts)}
+        if saw_reasoning:
+            assembled_msg["reasoning"] = "[present]"
+        if refusal_parts:
+            assembled_msg["refusal"] = "".join(refusal_parts)
+        assembled_choice: dict[str, Any] = {
+            "message": assembled_msg,
+            "finish_reason": finish_reason or "stop",
+        }
+        if native_finish_reason:
+            assembled_choice["native_finish_reason"] = native_finish_reason
+        assembled = {
+            "choices": [assembled_choice],
+            "usage": usage,
+        }
+        if served_model:
+            assembled["model"] = served_model
     _log_usage(route, assembled, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms)
     _raise_if_in_body_error(route.label, assembled, resp_headers, route.api_key or None)
     return _parse_response(assembled, route.style)
@@ -1616,6 +1874,9 @@ async def _complete_on_route(
     answer in seconds.
     """
     url, headers, payload = _build_request_for(route, settings, system, user, schema=schema)
+    profile = get_provider_profile(route.slug)
+    allow_streaming = True
+    include_stream_options = profile.supports_stream_options(route)
     timeout_seconds = float(settings.note_request_timeout or 0) or (
         LLM_REQUEST_TIMEOUT_SECONDS
     )
@@ -1638,14 +1899,17 @@ async def _complete_on_route(
         started = time.perf_counter()
         ttfb_ms = 0.0
         elapsed_ms = 0.0
+        streaming_active = (
+            allow_streaming
+            and float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0) > 0
+            and route.style in ("openai", "gemini", "anthropic")
+        )
         try:
-            if (
-                float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0) > 0
-                and route.style in ("openai", "gemini")
-            ):
+            if streaming_active:
                 return await _complete_streaming_on_route(
                     route, session, settings, url=url, headers=headers,
                     payload=payload, timeout_seconds=timeout_seconds,
+                    include_stream_options=include_stream_options,
                 )
             async with session.post(
                 url,
@@ -1678,7 +1942,36 @@ async def _complete_on_route(
             return _parse_response(result, route.style)
         except LLMRequestError as exc:
             if not isinstance(exc, (LLMContextOverflowError, LLMOutputBudgetError)):
-                adjustment = _adjust_rejected_request_param(payload, str(exc))
+                err_lower = str(exc).lower()
+                if streaming_active and include_stream_options and any(
+                    marker in err_lower for marker in ("stream_options", "include_usage")
+                ):
+                    include_stream_options = False
+                    logger.info(
+                        "Adjusting rejected stream_options and retrying provider=%s",
+                        route.slug,
+                    )
+                    continue
+                if streaming_active and any(
+                    marker in err_lower
+                    for marker in (
+                        "streaming is not supported",
+                        "stream is not supported",
+                        "streaming not supported",
+                        "cannot stream",
+                    )
+                ):
+                    allow_streaming = False
+                    logger.info(
+                        "Disabling unsupported streaming and retrying provider=%s",
+                        route.slug,
+                    )
+                    continue
+                adjustment = _adjust_rejected_request_param(
+                    payload,
+                    str(exc),
+                    allow_json_object_fallback=profile.supports_response_format(route),
+                )
                 if adjustment is not None:
                     logger.info(
                         "Adjusting rejected request parameter and retrying "
@@ -2032,19 +2325,22 @@ async def complete(
     )
 
 
-def extract_json_object(text: str) -> str:
-    """Extract the outermost JSON object from a model answer.
+_THINK_TAG_RE = re.compile(
+    r"<think(?:ing)?>.*?</think(?:ing)?>",
+    re.IGNORECASE | re.DOTALL,
+)
+_ORPHAN_THINK_END_RE = re.compile(
+    r"^.*?</think(?:ing)?>\s*",
+    re.IGNORECASE | re.DOTALL,
+)
+_JSON_FENCE_RE = re.compile(
+    r"```(?:json|JSON)?\s*(.*?)```",
+    re.DOTALL,
+)
 
-    Models wrap JSON in prose or code fences despite instructions; the
-    extraction is bracket-balanced from the first ``{`` to its matching ``}``.
-    """
-    text = text.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    start = text.find("{")
-    if start < 0:
-        raise LLMResponseError("پاسخ مدل شامل هیچ شیء JSON نبود.")
+
+def _balanced_object_end(text: str, start: int) -> int | None:
+    """Return the index past the matching ``}`` for ``text[start] == '{'``."""
     depth = 0
     in_string = False
     escaped = False
@@ -2065,8 +2361,59 @@ def extract_json_object(text: str) -> str:
         elif char == "}":
             depth -= 1
             if depth == 0:
-                return text[start : index + 1]
-    raise LLMResponseError("شیء JSON در پاسخ مدل کامل نبود.")
+                return index + 1
+    return None
+
+
+def extract_json_object(text: str) -> str:
+    """Extract the outermost valid JSON object from a model answer.
+
+    Strips inline ``<think>...</think>`` reasoning blocks, prioritizes fenced
+    JSON blocks, and skips non-JSON ``{...}`` prose fragments (e.g. set notation
+    before the real payload) in favor of the first balanced JSON ``dict``.
+    """
+    cleaned = _THINK_TAG_RE.sub("", text or "").strip()
+    if "</think" in cleaned.lower():
+        cleaned = _ORPHAN_THINK_END_RE.sub("", cleaned).strip()
+
+    regions: list[str] = [
+        m.group(1).strip() for m in _JSON_FENCE_RE.finditer(cleaned) if m.group(1).strip()
+    ]
+    if cleaned.startswith("```"):
+        unfenced = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", cleaned)
+        unfenced = re.sub(r"\s*```$", "", unfenced).strip()
+        regions.append(unfenced)
+    regions.append(cleaned)
+
+    first_balanced: str | None = None
+    saw_opening_brace = False
+    for region in regions:
+        search_from = 0
+        while True:
+            brace_idx = region.find("{", search_from)
+            if brace_idx < 0:
+                break
+            saw_opening_brace = True
+            end_idx = _balanced_object_end(region, brace_idx)
+            if end_idx is None:
+                search_from = brace_idx + 1
+                continue
+            candidate = region[brace_idx:end_idx]
+            if first_balanced is None:
+                first_balanced = candidate
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return candidate
+            except ValueError:
+                pass
+            search_from = brace_idx + 1
+
+    if first_balanced is not None:
+        return first_balanced
+    if saw_opening_brace:
+        raise LLMResponseError("شیء JSON در پاسخ مدل کامل نبود.")
+    raise LLMResponseError("پاسخ مدل شامل هیچ شیء JSON نبود.")
 
 
 def _parse_json_object(text: str) -> dict:

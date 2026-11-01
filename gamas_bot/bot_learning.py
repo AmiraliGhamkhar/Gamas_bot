@@ -11,6 +11,7 @@ import asyncio
 from collections.abc import MutableMapping
 from datetime import datetime
 import logging
+import math
 from pathlib import Path
 import secrets
 import shutil
@@ -18,7 +19,7 @@ import tempfile
 from typing import TYPE_CHECKING, Any
 
 from telethon import Button
-from telethon.errors import MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
 
 from .billing import format_duration
 from .bot_ui import (
@@ -75,6 +76,7 @@ from .learning import (
     preset_cards,
     quiz_system_prompt,
 )
+from .llm import LLMContextOverflowError, LLMOutputBudgetError
 from .progress import (
     WORK_PROGRESS_HEADLINE,
     WorkProgress,
@@ -137,8 +139,17 @@ class LearningWorkflowMixin:
         base_size = max(1, int(base_size))
         return max(1, int(round(int(base_cost) * int(cards) / base_size)))
 
+    MAX_ITEMS_PER_CALL = 20
+
+    def _learning_max_chars(self) -> int:
+        context_tokens = int(getattr(self.settings, "note_context_tokens", 131_072) or 131_072)
+        output_tokens = int(getattr(self.settings, "note_max_output_tokens", 16_384) or 16_384)
+        reserved_output = min(output_tokens, context_tokens // 2)
+        available_tokens = max(1_000, context_tokens - reserved_output - 2_000)
+        return min(MAX_MODEL_INPUT_CHARS, max(2_000, int(available_tokens * 2.0)))
+
     def _learning_chunks(self, content: str) -> list[DocChunk]:
-        return chunk_text(content, max_chars=MAX_MODEL_INPUT_CHARS)
+        return chunk_text(content, max_chars=self._learning_max_chars())
 
     async def _source_from_item(
         self, user_id: int, item_id: int
@@ -165,14 +176,15 @@ class LearningWorkflowMixin:
         document = await self.db.document_get(user_id, document_id)
         if document is None or not document.get("text"):
             return None
+        max_chars = self._learning_max_chars()
         chunks = await run_file_io(
             chunks_from_json,
             document.get("chunks_json"),
-            max_chars=MAX_MODEL_INPUT_CHARS,
+            max_chars=max_chars,
         )
         if not chunks:
             chunks = await run_file_io(
-                chunk_text, str(document["text"]), max_chars=MAX_MODEL_INPUT_CHARS
+                chunk_text, str(document["text"]), max_chars=max_chars
             )
         item_id = int(document.get("library_item_id") or 0) or None
         if item_id is None:
@@ -297,77 +309,149 @@ class LearningWorkflowMixin:
                 if done == state["done"]:
                     return
 
-        async def one(index: int) -> list[dict[str, Any]]:
-            nonlocal progress_task
-            chunk = chunks[index]
-            count = counts[index]
+        max_input_chars = self._learning_max_chars()
+        dedupe = dedupe_cards if kind == "deck" else dedupe_questions
+        stem_key = "front" if kind == "deck" else "question"
+
+        async def _generate_piece(
+            target_chunk: DocChunk,
+            target_count: int,
+            *,
+            chunk_idx: int,
+            split_depth: int = 0,
+        ) -> list[dict[str, Any]]:
             allowed = tuple(
                 dict.fromkeys(
                     " ".join(str(locator).split())[:120]
-                    for locator in (chunk.sources or (chunk.locator,))
+                    for locator in (target_chunk.sources or (target_chunk.locator,))
                     if locator
                 )
             )
             fallback_locator = allowed[0] if allowed else ""
-            dedupe = dedupe_cards if kind == "deck" else dedupe_questions
-            async with semaphore:
-                items: list[dict[str, Any]] = []
-                for attempt in range(2):
-                    missing = int(count) - len(items)
-                    if missing <= 0:
-                        break
-                    system = (
-                        flashcard_system_prompt(missing, sources=allowed)
-                        if kind == "deck"
-                        else quiz_system_prompt(missing, sources=allowed)
+            items: list[dict[str, Any]] = []
+            max_attempts = max(2, math.ceil(int(target_count) / self.MAX_ITEMS_PER_CALL) + 1)
+            use_schema = True
+            had_shortfall = False
+
+            for attempt in range(max_attempts):
+                missing = int(target_count) - len(items)
+                if missing <= 0:
+                    break
+                batch = min(missing, self.MAX_ITEMS_PER_CALL)
+                system = (
+                    flashcard_system_prompt(batch, sources=allowed)
+                    if kind == "deck"
+                    else quiz_system_prompt(batch, sources=allowed)
+                )
+                if had_shortfall:
+                    system += (
+                        "\nخروجی قبلی نامعتبر، ناقص یا بدون منبع مجاز بود؛ "
+                        "همهٔ فیلدهای لازم و یک منبع دقیق از فهرست را وارد کن."
                     )
-                    if attempt:
-                        repair = (
-                            "\nخروجی قبلی نامعتبر، ناقص یا بدون منبع مجاز بود؛ "
-                            "همهٔ فیلدهای لازم و یک منبع دقیق از فهرست را وارد کن."
+                if items:
+                    prior_stems = [
+                        str(it.get(stem_key) or "").strip()[:90]
+                        for it in items[-25:]
+                        if str(it.get(stem_key) or "").strip()
+                    ]
+                    if prior_stems:
+                        system += (
+                            "\nموردهای زیر قبلاً ساخته شده‌اند؛ هیچ‌کدام را تکرار یا بازنویسی نکن:\n- "
+                            + "\n- ".join(prior_stems)
                         )
-                        if items:
-                            repair += " موردی را که قبلاً ساخته‌ای تکرار نکن."
-                        system += repair
-                    try:
+                try:
+                    async with semaphore:
                         payload = await self.deps.complete_json(
                             session,
                             self.settings,
                             system=system,
-                            user=chunk.text[:MAX_MODEL_INPUT_CHARS],
-                            schema=schema if attempt == 0 else None,
+                            user=target_chunk.text[:max_input_chars],
+                            schema=schema if use_schema else None,
                         )
-                        if kind == "deck":
-                            parsed = parse_flashcard_payload(payload, missing)
-                        else:
-                            parsed = parse_quiz_payload(
-                                payload, missing, require_difficulty=False
-                            )
-                        anchored = anchor_items(
-                            parsed, allowed, fallback_locator, chunk.text
+                    if kind == "deck":
+                        parsed = parse_flashcard_payload(payload, batch)
+                    else:
+                        parsed = parse_quiz_payload(
+                            payload, batch, require_difficulty=False
                         )
-                        if len(anchored) < len(parsed):
-                            logger.debug(
-                                "dropped %s malformed %s item(s) chunk=%s",
-                                len(parsed) - len(anchored),
-                                kind,
-                                index,
-                            )
-                        merged = dedupe([*items, *anchored])
-                        if len(merged) > len(items):
-                            items = merged[: int(count)]
-                        if len(items) >= count:
-                            break
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        logger.warning(
-                            "chunk generation failed kind=%s chunk=%s attempt=%s",
+                    anchored = anchor_items(
+                        parsed, allowed, fallback_locator, target_chunk.text
+                    )
+                    if len(anchored) < len(parsed):
+                        logger.debug(
+                            "dropped %s malformed %s item(s) chunk=%s",
+                            len(parsed) - len(anchored),
                             kind,
-                            index,
-                            attempt + 1,
-                            exc_info=True,
+                            chunk_idx,
                         )
+                    prev_count = len(items)
+                    merged = dedupe([*items, *anchored])
+                    if len(merged) > prev_count:
+                        items = merged[: int(target_count)]
+                    if len(items) >= target_count:
+                        break
+                    if len(items) - prev_count < batch:
+                        had_shortfall = True
+                        if int(target_count) <= self.MAX_ITEMS_PER_CALL:
+                            use_schema = False
+                except asyncio.CancelledError:
+                    raise
+                except (LLMContextOverflowError, LLMOutputBudgetError):
+                    if split_depth < 2 and len(target_chunk.text) >= 1_600:
+                        sub_raw = chunk_text(
+                            target_chunk.text,
+                            max_chars=max(800, len(target_chunk.text) // 2),
+                        )
+                        if len(sub_raw) >= 2:
+                            sub_chunks = [
+                                DocChunk(
+                                    idx,
+                                    sc.locator or fallback_locator,
+                                    sc.sources or allowed,
+                                    sc.text,
+                                )
+                                for idx, sc in enumerate(sub_raw)
+                            ]
+                            sub_counts = distribute_counts(
+                                missing, [len(sc.text) for sc in sub_chunks]
+                            )
+                            for sc, sc_count in zip(sub_chunks, sub_counts, strict=True):
+                                if sc_count <= 0:
+                                    continue
+                                sub_items = await _generate_piece(
+                                    sc,
+                                    sc_count,
+                                    chunk_idx=chunk_idx,
+                                    split_depth=split_depth + 1,
+                                )
+                                items = dedupe([*items, *sub_items])[: int(target_count)]
+                            break
+                    had_shortfall = True
+                    use_schema = False
+                    logger.warning(
+                        "chunk budget exceeded kind=%s chunk=%s attempt=%s",
+                        kind,
+                        chunk_idx,
+                        attempt + 1,
+                        exc_info=True,
+                    )
+                except Exception:
+                    had_shortfall = True
+                    use_schema = False
+                    logger.warning(
+                        "chunk generation failed kind=%s chunk=%s attempt=%s",
+                        kind,
+                        chunk_idx,
+                        attempt + 1,
+                        exc_info=True,
+                    )
+            return items
+
+        async def one(index: int) -> list[dict[str, Any]]:
+            nonlocal progress_task
+            chunk = chunks[index]
+            count = counts[index]
+            items = await _generate_piece(chunk, count, chunk_idx=index)
             if len(items) < count:
                 state["failed"] += 1
             state["done"] += 1
@@ -720,13 +804,34 @@ class LearningWorkflowMixin:
                     f"   {option_lines}\n   پاسخ: {correct} | دشواری: {difficulty}\n"
                     f"   {preview_text(item['explanation'], 100)}\n   📍 {source}"
                 )
+        rendered_text = "\n".join(lines)
+        keyboard = self._curation_keyboard(state, page)
         try:
-            await message.edit(
-                "\n".join(lines), buttons=self._curation_keyboard(state, page)
-            )
+            await message.edit(rendered_text, buttons=keyboard)
             return True
         except MessageNotModifiedError:
             return True
+        except FloodWaitError as exc:
+            wait_seconds = float(getattr(exc, "seconds", 0) or 0)
+            if 0 < wait_seconds <= 5:
+                await asyncio.sleep(wait_seconds)
+                try:
+                    await message.edit(rendered_text, buttons=keyboard)
+                    return True
+                except MessageNotModifiedError:
+                    return True
+                except Exception:
+                    logger.warning("could not render curation preview after flood wait", exc_info=True)
+                    return False
+            logger.warning("curation preview rate-limited seconds=%s", wait_seconds)
+            return False
+        except MessageIdInvalidError:
+            try:
+                await self.client.send_message(user_id, rendered_text, buttons=keyboard)
+                return True
+            except Exception:
+                logger.warning("could not send fallback curation preview", exc_info=True)
+                return False
         except Exception:
             logger.warning("could not render curation preview", exc_info=True)
             return False

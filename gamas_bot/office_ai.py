@@ -43,8 +43,8 @@ DECK_SYSTEM_PROMPT = (
     "۱. هیچ جمله‌ای را بازنویسی، خلاصه، ترجمه یا اضافه نکن.\n"
     "۲. هر سطری که برمی‌گردانی باید عیناً در متن کاربر باشد.\n"
     "۳. ترتیب سطرها همان ترتیب متن کاربر است.\n"
-    "۴. عنوان بخش‌ها می‌تواند کوتاه و گویا باشد، ولی محتوا را تغییر نده.\n"
-    "۵. اگر متن کاربر عنوان بخش دارد، از همان عنوان استفاده کن.\n"
+    "۴. عنوان هر بخش را عیناً از عنوان یا عبارت کوتاهِ موجود در همان بخشِ متن کاربر انتخاب کن.\n"
+    "۵. هیچ سطر معناداری از متن کاربر را جا نینداز.\n"
     "پاسخ فقط و فقط یک شیء JSON معتبر باشد، بدون هیچ توضیح دیگری."
 )
 
@@ -54,12 +54,45 @@ TABLE_SYSTEM_PROMPT = (
     "را به یک جدول ساده تبدیل می‌کنی.\n"
     "قواعد سخت‌گیرانه:\n"
     "۱. هر خانه‌ای که در سطرهای داده می‌نویسی باید عیناً در متن کاربر باشد.\n"
-    "۲. عنوان ستون‌ها کوتاه و گویا باشد (می‌توانی خودت انتخاب کنی).\n"
+    "۲. عنوان ستون‌ها نیز باید عیناً از واژه‌ها یا برچسب‌های موجود در متن کاربر انتخاب شود؛ عنوان تازه از خودت نساز.\n"
     "۳. هیچ داده‌ای را از خودت نساز و چیزی را خلاصه نکن.\n"
     "۴. اگر متن کاربر سطرهای کامل ندارد، فقط سطرهایی را بیاور که واقعاً در "
     "متن هستند.\n"
     "پاسخ فقط و فقط یک شیء JSON معتبر باشد، بدون هیچ توضیح دیگری."
 )
+
+DECK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "sections": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "lines": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["title", "lines"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["sections"],
+    "additionalProperties": False,
+}
+
+TABLE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "headers": {"type": "array", "items": {"type": "string"}},
+        "rows": {
+            "type": "array",
+            "items": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "required": ["headers", "rows"],
+    "additionalProperties": False,
+}
 
 #: Bounds on what a model may answer with.
 MAX_SECTIONS = 40
@@ -309,9 +342,21 @@ async def plan_deck(
             f"حداکثر {max_sections} بخش."
         )
         try:
-            payload = await complete_json(
-                session, settings, system=DECK_SYSTEM_PROMPT, user=user_prompt
-            )
+            if getattr(settings, "note_structured_output", False):
+                payload = await complete_json(
+                    session,
+                    settings,
+                    system=DECK_SYSTEM_PROMPT,
+                    user=user_prompt,
+                    schema=DECK_SCHEMA,
+                )
+            else:
+                payload = await complete_json(
+                    session,
+                    settings,
+                    system=DECK_SYSTEM_PROMPT,
+                    user=user_prompt,
+                )
         except Exception as exc:
             logger.warning(
                 "office deck planning chunk failed; skipping chunk error=%s",
@@ -413,9 +458,21 @@ async def infer_table(
         "هر سطر داده باید عیناً از متن کاربر باشد."
     )
     try:
-        payload = await complete_json(
-            session, settings, system=TABLE_SYSTEM_PROMPT, user=user_prompt
-        )
+        if getattr(settings, "note_structured_output", False):
+            payload = await complete_json(
+                session,
+                settings,
+                system=TABLE_SYSTEM_PROMPT,
+                user=user_prompt,
+                schema=TABLE_SCHEMA,
+            )
+        else:
+            payload = await complete_json(
+                session,
+                settings,
+                system=TABLE_SYSTEM_PROMPT,
+                user=user_prompt,
+            )
     except Exception as exc:
         logger.warning(
             "office table inference failed; using the plain sheet error=%s",
