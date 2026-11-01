@@ -33,14 +33,13 @@ try:
 except ImportError:  # pragma: no cover - optional fast-path
     _orjson = None  # type: ignore[assignment]
 
-from .capacity import CapacityOverloadError, pool_for, reset_pools
+from .capacity import CapacityOverloadError, CooldownRegistry, pool_for, reset_pools
 from .fileio import AsyncFilePayload, run_file_io
 from .config import (
     DEEPGRAM_MAX_UPLOAD,
     OPENAI_STT_MAX_UPLOAD,
     SPEECHMATICS_MAX_UPLOAD,
     Settings,
-    first_configured_stt_provider,
 )
 from .http_util import (
     read_error_body,
@@ -106,7 +105,8 @@ class STTInvalidInputError(STTRequestError):
 # Cooldowns (in-memory, bounded)
 # ---------------------------------------------------------------------------
 
-_COOLDOWNS: dict[str, float] = {}
+_COOLDOWN_REGISTRY = CooldownRegistry(clock=lambda: time.monotonic())
+_COOLDOWNS = _COOLDOWN_REGISTRY._deadlines
 
 #: How long a provider is skipped after an authentication failure.
 AUTH_COOLDOWN_SECONDS = 900.0
@@ -126,23 +126,19 @@ _AUTO_LANGUAGE = "auto"
 
 
 def _set_cooldown(slug: str, seconds: float) -> None:
-    _COOLDOWNS[slug] = time.monotonic() + max(0.0, seconds)
+    if seconds <= 0:
+        _COOLDOWN_REGISTRY.set(slug, 0.0)
+        return
+    _COOLDOWN_REGISTRY.set(slug, max(0.0, seconds))
 
 
 def _cooldown_remaining(slug: str) -> float:
-    deadline = _COOLDOWNS.get(slug)
-    if deadline is None:
-        return 0.0
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        _COOLDOWNS.pop(slug, None)
-        return 0.0
-    return remaining
+    return _COOLDOWN_REGISTRY.remaining(slug)
 
 
 def reset_cooldowns() -> None:
     """Test hook: clear every provider cooldown and local capacity state."""
-    _COOLDOWNS.clear()
+    _COOLDOWN_REGISTRY.clear()
     reset_pools()
 
 
@@ -419,10 +415,9 @@ def _normalize_language(provider: str, language: str, *, model: str = "") -> str
 
 def _provider_model(slug: str, settings: Settings) -> str:
     """The model configured for one provider (for logs; never a secret)."""
-    if slug == "speechmatics":
-        return settings.speechmatics_model
-    if slug == "deepgram":
-        return settings.deepgram_model
+    spec = PROVIDERS.get(slug)
+    if spec is not None:
+        return spec.resolve_model(settings)
     return settings.stt_openai_model
 
 
@@ -1013,11 +1008,34 @@ async def _openai_plain(
 
 @dataclass(frozen=True, slots=True)
 class ProviderSpec:
+    """Self-contained STT backend descriptor satisfying :class:`STTProviderAdapter` (OCP/LSP)."""
+
     slug: str
     label: str
     configured: Callable[[Settings], bool]
     max_upload: int
     run: Callable[[aiohttp.ClientSession, Path, Settings], Awaitable[RawTranscript]]
+    model_getter: Callable[[Settings], str] = lambda s: s.stt_openai_model
+    base_url_getter: Callable[[Settings], str] = lambda _s: ""
+    upload_limit_getter: Callable[[Settings], int] | None = None
+    max_in_flight_getter: Callable[[Settings], int] = lambda _s: 1
+
+    def is_configured(self, settings: Settings) -> bool:
+        return self.configured(settings)
+
+    def resolve_model(self, settings: Settings) -> str:
+        return self.model_getter(settings)
+
+    def resolve_base_url(self, settings: Settings) -> str:
+        return self.base_url_getter(settings)
+
+    def resolve_upload_limit(self, settings: Settings) -> int:
+        if self.upload_limit_getter is not None:
+            return self.upload_limit_getter(settings)
+        return self.max_upload
+
+    def resolve_max_in_flight(self, settings: Settings) -> int:
+        return self.max_in_flight_getter(settings)
 
 
 PROVIDERS: dict[str, ProviderSpec] = {
@@ -1027,6 +1045,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
         configured=lambda s: s.speechmatics_configured,
         max_upload=SPEECHMATICS_MAX_UPLOAD,
         run=_speechmatics,
+        model_getter=lambda s: s.speechmatics_model,
+        base_url_getter=lambda s: s.speechmatics_base_url,
+        max_in_flight_getter=lambda s: s.speechmatics_max_in_flight,
     ),
     "deepgram": ProviderSpec(
         slug="deepgram",
@@ -1034,6 +1055,9 @@ PROVIDERS: dict[str, ProviderSpec] = {
         configured=lambda s: s.deepgram_configured,
         max_upload=DEEPGRAM_MAX_UPLOAD,
         run=_deepgram,
+        model_getter=lambda s: s.deepgram_model,
+        base_url_getter=lambda s: s.deepgram_base_url,
+        max_in_flight_getter=lambda s: s.deepgram_max_in_flight,
     ),
     "openai_compatible": ProviderSpec(
         slug="openai_compatible",
@@ -1041,15 +1065,23 @@ PROVIDERS: dict[str, ProviderSpec] = {
         configured=lambda s: s.stt_openai_configured,
         max_upload=OPENAI_STT_MAX_UPLOAD,
         run=_openai_compatible,
+        model_getter=lambda s: s.stt_openai_model,
+        base_url_getter=lambda s: s.stt_openai_base_url,
+        upload_limit_getter=lambda s: s.stt_openai_max_upload,
+        max_in_flight_getter=lambda s: s.stt_openai_max_in_flight,
     ),
 }
 
+
+def register_stt_provider(spec: ProviderSpec) -> None:
+    """Register or override an STT provider adapter (OCP extension point)."""
+    PROVIDERS[spec.slug] = spec
+
+
 def provider_upload_limit(slug: str, settings: Settings) -> int:
-    """The upload ceiling of one provider, honouring the configurable one."""
-    if slug == "openai_compatible":
-        return settings.stt_openai_max_upload
+    """The upload ceiling of one provider, honouring its configured adapter."""
     spec = PROVIDERS.get(slug)
-    return spec.max_upload if spec is not None else settings.max_file_size
+    return spec.resolve_upload_limit(settings) if spec is not None else settings.max_file_size
 
 
 def largest_configured_upload(settings: Settings) -> int | None:
@@ -1061,28 +1093,20 @@ def largest_configured_upload(settings: Settings) -> int | None:
     not fit) turns that late failure into a format choice that can succeed.
     """
     limits = [
-        provider_upload_limit(slug, settings)
+        spec.resolve_upload_limit(settings)
         for slug in settings.stt_providers
-        if (PROVIDERS.get(slug) is not None
-            and PROVIDERS[slug].configured(settings))
+        if (spec := PROVIDERS.get(slug)) is not None and spec.is_configured(settings)
     ]
     return max(limits) if limits else None
 
 
 def first_configured_stt_url(settings: Settings) -> str | None:
-    """Base URL of the first configured STT provider, for connection pre-warming.
-
-    Warm the host that will actually serve the job: the chosen slug comes from
-    the same helper ``config.check`` uses to warn about an inverted order, so
-    the pre-warm and the failover chain can never disagree.
-    """
-    slug = first_configured_stt_provider(settings)
-    if slug == "speechmatics":
-        return settings.speechmatics_base_url
-    if slug == "deepgram":
-        return settings.deepgram_base_url
-    if slug == "openai_compatible":
-        return settings.stt_openai_base_url
+    """Base URL of the first configured STT provider, for connection pre-warming."""
+    for slug in settings.stt_providers:
+        spec = PROVIDERS.get(slug)
+        if spec is not None and spec.is_configured(settings):
+            url = spec.resolve_base_url(settings)
+            return url or None
     return None
 
 
@@ -1096,13 +1120,8 @@ MAX_TRANSIENT_RETRIES = 2
 
 def provider_max_in_flight(slug: str, settings: Settings) -> int:
     """Configured local concurrency limit for *slug*."""
-    if slug == "speechmatics":
-        return settings.speechmatics_max_in_flight
-    if slug == "deepgram":
-        return settings.deepgram_max_in_flight
-    if slug == "openai_compatible":
-        return settings.stt_openai_max_in_flight
-    return 1
+    spec = PROVIDERS.get(slug)
+    return spec.resolve_max_in_flight(settings) if spec is not None else 1
 
 
 async def _attempt_provider(

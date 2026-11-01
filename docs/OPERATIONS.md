@@ -18,30 +18,35 @@ python -m gamas_bot --check
 python -m gamas_bot
 ```
 
-Stop a background instance by the PID in its lock file (never with a broad `pkill` pattern):
+Stop, inspect, or restart a background instance via `scripts/ensure_running.py` (never with a broad
+`pkill` pattern):
 
 ```bash
-PID="$(cat data/gamas.lock 2>/dev/null)"
-ps -p "$PID" >/dev/null 2>&1 && kill "$PID"
+python scripts/ensure_running.py status     # running (pid=...), stopped, or misconfigured
+python scripts/ensure_running.py stop       # graceful SIGTERM using the locked PID
+python scripts/ensure_running.py restart    # stop + immediate verified start
+python scripts/ensure_running.py --force    # bypass the 45s spawn throttle after fixing .env
 ```
 
 Pause the cron job while updating or stopping, otherwise it restarts the bot within a minute.
 
 Only one process may use a Telegram session. The instance lock enforces this; a second copy exits
-instead of competing.
+with code `3` instead of competing, while configuration/startup errors exit with code `2`.
 
 ## Logs and health
 
 ```bash
-python -m gamas_bot --check                 # settings + dependencies
+python -m gamas_bot --check                 # settings + runtime packages + media worker
 python -m gamas_bot.media_worker check      # PyAV + ppt2pptx
 python -m scripts.cpanel_preflight          # full host check (cPanel)
 ```
 
-Logs go to **stdout** unless `LOG_FILE` is set. The cPanel launcher sets `LOG_FILE` to
-`data/logs/bot.log` when it is empty and writes start-up errors to `data/logs/launcher.err`.
-Use the `GMS-#####` job reference to find log lines. Never attach transcripts, receipt images or
-API keys to support requests.
+Logs go to **stdout** unless `LOG_FILE` is set. When `LOG_FILE` is configured (or defaulted by the
+background launcher to `data/logs/bot.log`), logs rotate automatically at `LOG_MAX_BYTES` (default
+5 MiB) across `LOG_BACKUP_COUNT` private (`0600`) files with configured tokens/API keys redacted.
+Pre-spawn validation failures and early child crashes are recorded in `data/logs/launcher.err`
+(bounded at 1 MiB, `0600`) as well as `stderr`. Use the `GMS-#####` job reference to find log
+lines. Never attach transcripts, receipt images or API keys to support requests.
 
 ## Update
 
