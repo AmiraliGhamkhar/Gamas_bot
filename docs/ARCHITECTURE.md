@@ -1,96 +1,47 @@
 # Architecture
 
-One Python process: a Telethon client, a bounded asyncio job queue and a SQLite database. No broker,
-separate media server or external database is required. Windows is for local use; cPanel uses a
-cron watchdog.
+One Telethon client, bounded asyncio work and SQLite WAL. PyAV media work uses
+bounded child processes. No broker, web framework, external DB or system Office/media
+binary is needed.
 
 ## Flows
 
 ```text
-Audio/video/deck → bounded queue → PyAV media worker → STT
-                 → raw transcript delivered → optional notes
-                 → evidence checks → RTL Word booklet
-                 → transcript/booklet Telegram message references saved to the user's library
-
-PDF/DOCX/PPTX → owner-scoped extraction → locator-tagged SQLite document cache
-               (text-poor pages and photos: opt-in OCR, OCR_ENABLED)
-               → full booklet / distinct compact notes / text exports
-               → original download + generated Word/Excel/PowerPoint/selectable PDF in library
-
-Pasted text or .txt/.md/.markdown/.csv/.tsv → private in-memory Office draft
-               → bounded Office semaphore → DOCX/XLSX/PPTX/selectable PDF
-               → Telegram file references in the same per-user library
-
-Wallet → balance + plan purchase + recent payments
+Audio/video → admission + hold → queue → media → STT → transcript delivered
+            → optional grounded notes → RTL Word → Telegram-backed library
+PDF/DOCX/PPTX → owner-scoped extraction → SQLite text cache → notes/exports
+             → narration only on explicit action
+Text/CSV/Markdown → private Office draft → bounded build → Word/Excel/PPT/PDF
+Wallet → order + receipt → admin review → transactional credit
 ```
-
-The raw transcript is saved and delivered before lecture-note generation. When note providers are
-not configured, audio jobs still deliver transcripts; Free Office remains usable with deterministic
-fallbacks. PowerPoint narration is merged into one STT request only after the user explicitly selects
-the audio action on a source document. Uploading a presentation or exporting a deck never starts STT.
-Generated files remain in Telegram and the existing library indexes their chat/message references;
-extracted booklet and uploaded-document text remain in SQLite for learning/document actions. Free
-Office drafts are in-memory only, user-scoped, bounded to 128 concurrent drafts and swept after their
-configured TTL. Office operations never enter billing, the ledger, subscriptions or quiz/flashcard
-free-use counters.
-
-A library row stores a **name**, not a caption: `titles.short_title` derives a deterministic 2–4-word
-title from the artifact's own title (booklet cover, document name, upload name) and the same value
-names the booklet file, its Telegram caption and its library row. `progress.JobProgress` animates the
-long file pipeline; `progress.WorkProgress` drives the bar for the short actions on one screen (quiz
-and flashcard generation, document extraction, Free Office builds), always publishing a 0 % frame
-before the first model call and keeping a 🛑 frame where a failed action stopped.
 
 ## Code map
 
-| Area | Files |
+Modules are under `gamas_bot/`.
+
+| Area | Modules |
 | --- | --- |
-| Startup/configuration | `__main__.py`, `config.py`, `launcher.py`, `instance_lock.py`, `logging_config.py`, `metrics.py` |
-| Contracts & DI | `protocols.py` (segregated store/provider/clock `Protocol`s), `bot_deps.py` (`BotDependencies`), `routing.py` (`CallbackRouter`), `conversation_state.py` (`ConversationStateStore`) |
-| Telegram orchestrator & workflows | `bot.py` (`GamasBot`), `bot_ui.py`, `bot_jobs.py`, `bot_documents.py`, `bot_learning.py`, `bot_wallet.py`, `bot_support.py`, `bot_admin.py`, `intake.py`, `telegram_transfer.py`, `jobs.py`, `capacity.py`, `progress.py`, `telegram_text.py`, `titles.py` |
-| Media and decks | `media.py`, `media_worker.py`, `presentations.py` |
-| Providers and notes | `stt.py` (`ProviderSpec` / `register_stt_provider`), `llm.py` (`LLMProviderDialect` / `register_llm_dialect`), `http_util.py`, `transcript.py`, `textnorm.py`, `notes.py`, `notes_evidence.py` |
-| Documents, OCR & Free Office | `doc_extract.py` (PDF/Word/PowerPoint → locator-tagged sections → chunks), `ocr.py`, `docx_export.py`, `pdf_export.py`, `office.py`, `office_ai.py`, `office_notes.py`, `mdblocks.py`, `bidi.py` |
-| Data, billing and reporting | `db.py` (facade + ISP facets) and `db_{core,users,library,documents,billing,learning,payments,support,reporting}.py`, `billing.py`, `subscription.py`, `migrations/v3/` |
+| Startup/config | `__main__`, `config`, `launcher`, `instance_lock`, `logging_config` |
+| Telegram workflows | `bot`, `bot_ui`, `bot_jobs`, `bot_documents`, `bot_learning`, `bot_wallet`, `bot_support`, `bot_admin` |
+| Contracts/routing | `protocols`, `bot_deps`, `routing`, `conversation_state`, `intake` |
+| Queue/transfers | `jobs`, `capacity`, `progress`, `telegram_transfer`, `telegram_text` |
+| Media/providers | `media`, `media_worker`, `presentations`, `stt`, `llm`, `http_util` |
+| Notes/documents | `transcript`, `notes`, `notes_evidence`, `doc_extract`, `ocr`, `office*`, `docx_export`, `pdf_export` |
+| Storage/billing | `db` facade, `db_*` facets, `billing`, `subscription`, `learning` |
 
-## Rules
+## Boundaries
 
-- Every job receives a unique `job_id` (`job-<submission_id>-<hex>`), isolated per-job state, and explicit lifecycle transitions (`queued` → `downloading` → `extracting` → `transcribing` → `generating_notes` → `uploading` → `completed` / `failed` / `cancelled`).
-- Concurrency is decoupled by pipeline stage rather than a single global lock: `MAX_CONCURRENT_DOWNLOADS`, `MEDIA_WORKER_CONCURRENCY`, per-provider STT pools (`SPEECHMATICS_MAX_IN_FLIGHT` / `DEEPGRAM_MAX_IN_FLIGHT`), per-route LLM pools (`LLM_PRIMARY_MAX_IN_FLIGHT` / `LLM_FALLBACK_MAX_IN_FLIGHT`), and `MAX_CONCURRENT_UPLOADS`. No stage slot is held while waiting for another stage.
-- Primary saturation on either STT (`speechmatics`) or LLM (`routes[0]`) immediately overflows in `0 ms` to secondary capacity (`deepgram` / `routes[1]`) without waiting.
-- SQLite runs in WAL mode with serialized `BEGIN IMMEDIATE` writes on `self.db` and lock-free MVCC reads on `self.read_db` (`PRAGMA query_only=ON`).
-- Each user may hold at most `MAX_ACTIVE_JOBS_PER_USER` pending/processing submissions; the check
-  and insert share one write transaction. Shutdown joins in-flight upload/document/receipt admission
-  before closing SQLite, and fails jobs that never reached a worker.
-- Document parsing has its own semaphore sized by `MEDIA_WORKER_CONCURRENCY` and reuses a same-user,
-  same-hash extraction even for simultaneous uploads. Extracted text is capped at 5,000,000
-  characters; parsing still runs in a worker thread rather than an OS-isolated process.
-- Free Office is independently gated by `OFFICE_ENABLED`; one user has at most one in-memory draft,
-  100,000 pasted characters by default, 1 MB per text-file upload, 200 parts and the configured
-  TTL. Its build/note/delivery work has its own bounded semaphore, per-user throttle and 50 MiB
-  output cap. Document notes/exports accept at most 250,000 source characters and refuse overflow
-  rather than truncating; compact notes use a dedicated compact-only prompt/schema and shared source
-  evidence checks. Office callbacks are private and document callbacks always query by owner id.
-- File parsing/rendering uses `run_file_io` and temporary files under the private `TEMP_DIR`; Office
-  tasks are canceled and joined before SQLite/HTTP shutdown, and temporary artifacts are removed in
-  `finally`. No Office suite or new external service is required.
-- The media worker runs with a timeout and no shell. `av` supplies the media libraries.
-- SQLite migrations run at startup; billing writes are transactional.
-- A lock on the Telegram session prevents duplicate polling. Keep the session and database on a
-  local writable filesystem.
-- Provider output is untrusted and checked before delivery. Quiz/flashcard generation anchors each
-  item to the chunk it was built from (`learning.anchor_items`): a re-typed locator is stored in the
-  chunk's own spelling, an inner page/slide marker is kept when it occurs in the text, and an
-  invented or missing one is replaced by the chunk label — never stored as the model wrote it. A
-  short answer is topped up by a second, bounded request for the items that are still missing, so
-  the requested count is a target rather than a reason to fail a paid generation; a minimum of 5
-  cards / 3 questions still applies (B4) and a shortfall refunds exactly once.
-- Every library row (booklet, transcript, Office export, document mirror) is a 2–4-word name derived
-  by `gamas_bot/titles.short_title`, and that one name is the artifact's own title, file name, caption
-  and row. The Telegram reference code and icons live in the message, never in the row.
-- The admin dashboard reads only authoritative rows: each submission records `started_at` (the
-  worker pickup), `error_kind` (one bounded failure category) and `stt_engine` (written beside the
-  transcript, so provider usage survives transcript retention). Windows filter `created_at` with a
-  sargable `>= ?` bound so the reporting indexes are used; see [Admin panel](ADMIN.md).
-- Reporting never mutates state and runs on the read-only connection; a dashboard tap cannot take
-  the write lock away from a job.
+- Serialize `BEGIN IMMEDIATE` writes; use the query-only connection for reporting.
+  Reports must not mutate state or take the write lock.
+- Atomic admission, bounded queues/stages and owner checks. Release one stage slot
+  before waiting on another.
+- Transcript delivery determines transcription billing; learning uses durable
+  pending/finalized/refunded recovery. See [Billing](BILLING.md).
+- SQLite holds text/metadata; Telegram holds generated files. Library pruning does
+  not erase the separate document-text cache.
+- Shutdown stops intake and joins/rejects work before closing SQLite. Startup
+  recovery follows the singleton lock.
+- `migrations/v3/` runs at startup. Add numbered migrations; never edit applied SQL.
+  Test fresh databases, populated upgrades and replay safety.
+- Preserve private drafts/files, bounded provider bodies, output validation and
+  metadata-only logs. See [Security](SECURITY.md) and [AGENTS.md](../AGENTS.md).

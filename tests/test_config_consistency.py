@@ -174,7 +174,8 @@ STT_DOC_PAGES = (
     "docs/CONFIGURATION.md",
     "docs/TROUBLESHOOTING.md",
     "docs/PROVIDERS.md",
-    "docs/DEPLOY_FA.md",
+    "docs/DEPLOY_CPANEL.md",
+    "docs/DEPLOY_WINDOWS.md",
     ".env.example",
 )
 
@@ -320,6 +321,30 @@ class SttDocumentationTests(unittest.TestCase):
             "STT_OPENAI_MAX_UPLOAD_BYTES",
         ):
             self.assertIn(name, text, f"docs/STT_PROVIDERS.md does not document {name}")
+
+
+class DocumentationNavigationTests(unittest.TestCase):
+    """Keep the operator guides navigable after consolidation or removal."""
+
+    def test_local_markdown_links_resolve(self):
+        pages = [REPO_ROOT / "README.md", REPO_ROOT / "AGENTS.md"]
+        pages.extend((REPO_ROOT / "docs").glob("*.md"))
+        pages.extend((REPO_ROOT / "tests" / "fixtures").rglob("*.md"))
+        for page in pages:
+            text = page.read_text(encoding="utf-8")
+            for target in re.findall(r"\[[^\]]+\]\(([^)]+)\)", text):
+                if "://" in target or target.startswith(("#", "mailto:")):
+                    continue
+                path = target.split("#", 1)[0]
+                with self.subTest(page=str(page.relative_to(REPO_ROOT)), target=target):
+                    self.assertTrue((page.parent / path).exists(), "broken local link")
+
+    def test_setup_guides_are_linked_from_both_indexes(self):
+        for index in (REPO_ROOT / "README.md", REPO_ROOT / "docs" / "README.md"):
+            text = index.read_text(encoding="utf-8")
+            for guide in ("DEPLOY_WINDOWS.md", "DEPLOY_CPANEL.md"):
+                with self.subTest(index=index.name, guide=guide):
+                    self.assertIn(guide, text)
 
 
 class VersionConsistencyTests(unittest.TestCase):

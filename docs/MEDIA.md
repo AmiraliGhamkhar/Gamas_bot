@@ -1,50 +1,28 @@
-# Audio and video processing
+# Audio and video
 
-Media is decoded by PyAV inside a child Python process. No system `ffmpeg`, `ffprobe` or
-LibreOffice is used; install the Python packages from `requirements.txt`.
+Send audio, video or a Telegram voice/video note. The bot delivers the transcript
+first, then a Word booklet if a note provider is available.
 
-## Limits
+## Processing limits
 
-- `MAX_FILE_SIZE` caps downloads (default 128 MiB); the bot checks the reported size, the download
-  progress and the final file size. `MAX_MEDIA_DURATION_SECONDS` defaults to 7,200 seconds and is
-  checked from Telegram metadata and the media probe before transcription.
-- `DOWNLOAD_STALL_SECONDS` (default 300) aborts a Telegram download that produces no bytes.
-- `TEMP_MIN_FREE_BYTES` (default 64 MiB) must remain free on `TEMP_DIR` before a download starts.
-  The check also reserves room for the source and its prepared-audio working copy.
-- Telegram downloads and generated uploads use async file streams; disk reads/writes run in bounded
-  thread-pool operations rather than blocking the event loop.
-- `MEDIA_TIMEOUT` bounds one media operation, `CONVERT_TIMEOUT` bounds legacy `.ppt` conversion.
-  `--check` warns when `MEDIA_TIMEOUT` is too short for a multi-hour lecture.
-- `MEDIA_WORKER_CONCURRENCY` limits CPU/disk-heavy jobs at once. Use `1` on shared hosting.
-- A file with no measurable audio duration is refused instead of being charged at a guess.
-- Only the first audio track of a file is transcribed.
+- Upload: `MAX_FILE_SIZE=134217728` (128 MiB); duration:
+  `MAX_MEDIA_DURATION_SECONDS=7200` (2 hours).
+- Unmeasurable audio duration is refused before charging. Only the first audio track is used.
+- PyAV supplies media libraries; no system `ffmpeg`/`ffprobe` is required.
+- Media runs in bounded child processes. Keep `MEDIA_WORKER_CONCURRENCY=1` on cPanel.
+- `AUDIO_FORMAT_POLICY=auto` chooses WAV/Opus within file/provider limits using
+  encoding and transfer costs. Change only after measured tests.
+- `TEMP_MIN_FREE_BYTES=67108864` leaves a 64 MiB reserve; downloads also account
+  for working copies. Default stall timeout is 300 seconds.
+- `TELEGRAM_DOWNLOAD_CONNECTIONS=1` is safest on shared hosting; measure before raising it.
 
-## Prepared audio
+## Transcript delivery
 
-- An already-supported audio file is sent unchanged when no transcode is needed.
-- Otherwise the first audio track is extracted to mono 16 kHz WAV or Opus 48 kHz.
-- `AUDIO_FORMAT_POLICY=auto` (default) compares **encoder CPU + upload time** using the transfer
-  rate measured during this job's Telegram download, and picks the cheaper container. `wav` and
-  `opus` force one, still bounded by `PRESENTATION_WAV_LIMIT_BYTES`, `MAX_FILE_SIZE` and the
-  largest configured provider ceiling.
-- Opus uses `application=audio, compression_level=0`: the speech+music path keeps the 4–8 kHz band
-  that matters for word identity and encodes about 3× faster than the older setting.
+Raw text is sent as `.txt`, with chat/numbered-file fallback when needed.
+Defaults allow at most 8 fallback files of 100000 characters. Oversized output
+is refused, not truncated. Charging requires complete delivery: [Billing](BILLING.md).
 
-## Telegram transfers
-
-- MTProto transfers use `cryptg` and 512 KiB chunks.
-- `TELEGRAM_DOWNLOAD_CONNECTIONS` (default `1`) can download one file as concurrent byte ranges on
-  the same client. Any failure falls back to the single stream automatically. Measure on your host
-  before raising it; parallel transfers reach flood waits sooner.
-
-## Raw transcript delivery
-
-The raw transcript is one `.txt` file. If that upload fails and the text is too long for the
-paginated chat fallback, it is re-sent as numbered parts (`RAW_FALLBACK_FILE_CHARS`, default
-100 000 characters; at most `RAW_FALLBACK_MAX_FILES`, default 8). A transcript needing more parts is
-refused rather than truncated.
-
-## Check the media stack
+## Check dependencies
 
 ```powershell
 .\.venv\Scripts\python.exe -m gamas_bot.media_worker check
@@ -54,4 +32,5 @@ refused rather than truncated.
 python -m gamas_bot.media_worker check
 ```
 
-PowerPoint-specific limits are in [Presentations](PRESENTATIONS.md).
+These checks do not contact providers.
+[STT setup](STT_PROVIDERS.md) · [Presentations](PRESENTATIONS.md)
