@@ -29,11 +29,15 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any, TypeVar
 from urllib.parse import quote, urlsplit, urlunsplit
-import weakref
 
 import aiohttp
 
-from .capacity import CapacityOverloadError, pool_for, reset_pools
+from .capacity import (
+    CapacityOverloadError,
+    LoopCooldownRegistry,
+    pool_for,
+    reset_pools,
+)
 from .config import NoteRoute, Settings, note_routes
 from .http_util import (
     read_error_body,
@@ -41,6 +45,7 @@ from .http_util import (
     sanitize_error_text as _sanitize_error_text,
 )
 from .metrics import METRICS
+from .protocols import LLMProviderDialect
 
 try:
     import orjson as _orjson
@@ -130,36 +135,18 @@ _T = TypeVar("_T")
 #: Loop- and session-scoped route cooldown map so concurrent requests sharing
 #: a client session immediately bypass a rate-limited/depleted primary without
 #: colliding across separate sessions or test cases.
-_LLM_COOLDOWNS: weakref.WeakKeyDictionary[
-    asyncio.AbstractEventLoop, dict[tuple[int, str], float]
-] = weakref.WeakKeyDictionary()
+_LLM_COOLDOWNS = LoopCooldownRegistry(clock=lambda: time.monotonic())
 
 LLM_RATE_LIMIT_COOLDOWN_SECONDS = 15.0
 LLM_AUTH_COOLDOWN_SECONDS = 60.0
 
 
 def _set_route_cooldown(session: object, slug: str, seconds: float) -> None:
-    if seconds <= 0:
-        return
-    loop = asyncio.get_running_loop()
-    table = _LLM_COOLDOWNS.setdefault(loop, {})
-    table[(id(session), slug)] = time.monotonic() + seconds
+    _LLM_COOLDOWNS.set(session, slug, seconds)
 
 
 def _route_cooldown_remaining(session: object, slug: str) -> float:
-    loop = asyncio.get_running_loop()
-    table = _LLM_COOLDOWNS.get(loop)
-    if not table:
-        return 0.0
-    key = (id(session), slug)
-    deadline = table.get(key)
-    if deadline is None:
-        return 0.0
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        table.pop(key, None)
-        return 0.0
-    return remaining
+    return _LLM_COOLDOWNS.remaining(session, slug)
 
 
 def reset_cooldowns() -> None:
@@ -673,179 +660,6 @@ def _openai_json_schema(schema: dict) -> dict:
     return {"name": "gamas_notes", "schema": schema}
 
 
-def _build_request_for(
-    route: NoteRoute,
-    settings: Settings,
-    system: str,
-    user: str,
-    *,
-    schema: dict | None = None,
-) -> tuple[str, dict[str, str], dict]:
-    """Build one provider's POST request from its own route.
-
-    Authentication is never caller-overridable: each style sets its documented
-    header itself. ``schema`` is attached only when a caller asks for
-    structured output; a provider that rejects the parameter drops it through
-    the generic rejected-parameter retry.
-    """
-    # One JSON request body per provider style, declared once: mypy otherwise
-    # unifies the three branch literals into a single wrong value type.
-    payload: dict[str, Any]
-    style = route.style
-    key = _clean_api_key(route.api_key)
-    model = route.model.strip()
-    max_tokens = settings.note_max_output_tokens
-
-    if style == "gemini":
-        if not key:
-            raise LLMAuthError("کلید سرویس تولید جزوه تنظیم نشده است.")
-        # Accept the documented "models/<name>" spelling without doubling it.
-        model_id = _gemini_model_id(model)
-        url = _endpoint(route.base_url, f"models/{model_id}:generateContent")
-        generation_config = {
-            "temperature": NOTE_TEMPERATURE,
-            "maxOutputTokens": max_tokens,
-            "responseMimeType": "application/json",
-        }
-        if schema is not None:
-            generation_config["responseSchema"] = _gemini_schema(schema)
-        if settings.gemini_thinking_budget >= 0:
-            # ``0`` (the default) turns thinking off entirely: a note request is
-            # extraction/organisation, so hidden reasoning tokens buy nothing
-            # and cost latency. A positive value caps them; ``-1`` sends no
-            # ``thinkingConfig`` at all (the pre-flag behaviour). A model that
-            # rejects the field is handled by the generic rejected-parameter
-            # retry below, so no model-name sniffing is needed here.
-            generation_config["thinkingConfig"] = {
-                "thinkingBudget": settings.gemini_thinking_budget,
-            }
-        payload = {
-            "contents": [{"role": "user", "parts": [{"text": user}]}],
-            "systemInstruction": {"parts": [{"text": system}]},
-            "generationConfig": generation_config,
-        }
-        return url, {"x-goog-api-key": key}, payload
-
-    if style == "anthropic":
-        if not key:
-            raise LLMAuthError("برای Anthropic باید NOTE_API_KEY تنظیم شود.")
-        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
-        payload = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "system": system,
-            "messages": [{"role": "user", "content": user}],
-            "temperature": NOTE_TEMPERATURE,
-        }
-        return _endpoint(route.base_url, "messages"), headers, payload
-
-    # openai: NaraRouter, OpenRouter and any OpenAI-compatible gateway.
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "temperature": NOTE_TEMPERATURE,
-        "max_tokens": max_tokens,
-    }
-    if schema is not None:
-        payload["response_format"] = {
-            "type": "json_schema",
-            "json_schema": _openai_json_schema(schema),
-        }
-    elif route.json_object_mode:
-        # Opt-in, and only for providers that document ``response_format``
-        # (NaraRouter does not, so it is never asked for it).
-        payload["response_format"] = {"type": "json_object"}
-    if getattr(settings, "note_openrouter_throughput", False) and route.slug == "openrouter":
-        # OpenRouter load-balances by *price* by default, which can pick a much
-        # slower upstream of the same model. Its documented throughput sort is
-        # the only per-request control over that choice.
-        payload["provider"] = {"sort": "throughput"}
-    if settings.note_reasoning_effort and route.slug in (
-        "nara", "openrouter", "groq", "cerebras"
-    ):
-        # Only the gateways whose contracts were verified for this field:
-        # NaraRouter documents ``reasoning_effort`` and clamps unsupported
-        # levels instead of erroring, OpenRouter accepts it for the models
-        # that support it, and Groq and Cerebras document
-        # ``reasoning_effort`` on their OpenAI-compatible gpt-oss endpoints
-        # (where ``low`` keeps the model from spending output tokens on
-        # hidden reasoning). A generic OpenAI-compatible gateway (whose model
-        # may reject the parameter outright) and the Gemini/Anthropic styles
-        # above never receive it. Unset (the default) sends nothing, so the
-        # provider's own reasoning default applies.
-        payload["reasoning_effort"] = settings.note_reasoning_effort
-    return _endpoint(route.base_url, "chat/completions"), headers, payload
-
-
-def _build_request(
-    settings: Settings, system: str, user: str, *, route: NoteRoute | None = None
-) -> tuple[str, dict[str, str], dict]:
-    """Build the POST request for one route — by default the first eligible one."""
-    if route is None:
-        routes = note_routes(settings)
-        if not routes:
-            raise LLMAuthError(
-                "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
-                "NARA_API_KEY / OPENROUTER_API_KEY)."
-            )
-        route = routes[0]
-    return _build_request_for(route, settings, system, user)
-
-
-def _build_get_request_for(
-    route: NoteRoute, target: str = "models"
-) -> tuple[str, dict[str, str]]:
-    """Build one provider's documented GET metadata request ``(url, headers)``.
-
-    Supported ``target`` values across providers:
-    * ``"models"``: ``GET /v1/models`` (NaraRouter / OpenAI-compatible),
-      ``GET /api/v1/models`` (OpenRouter), ``GET /v1beta/models`` (Gemini).
-    * ``"model"``: ``GET /v1beta/models/{model}`` (Gemini single-model resource)
-      or ``GET {base}/models/{model}`` (OpenAI-compatible).
-    * ``"model_endpoints"``: ``GET /api/v1/models/{author}/{slug}/endpoints``
-      (OpenRouter per-model endpoint capacities and parameters).
-    * ``"key"``: ``GET /api/v1/key`` (OpenRouter API key limits and free-tier
-      daily request counter).
-    * ``"plans"``: ``GET https://router.bynara.id/api/plans`` (NaraRouter public
-      plan & model catalogue; no authentication header is sent).
-    """
-    style = route.style
-    key = _clean_api_key(route.api_key)
-    clean_target = target.strip().strip("/")
-
-    if style == "gemini":
-        if not key:
-            raise LLMAuthError("کلید سرویس تولید جزوه تنظیم نشده است.")
-        headers = {"x-goog-api-key": key}
-        if clean_target == "model":
-            model_id = _gemini_model_id(route.model)
-            return _endpoint(route.base_url, f"models/{model_id}"), headers
-        return _endpoint(route.base_url, clean_target or "models"), headers
-
-    if style == "anthropic":
-        if not key:
-            raise LLMAuthError("برای Anthropic باید NOTE_API_KEY تنظیم شود.")
-        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
-        return _endpoint(route.base_url, clean_target or "models"), headers
-
-    if clean_target in ("plans", "api/plans"):
-        parsed = urlsplit(route.base_url)
-        return urlunsplit((parsed.scheme, parsed.netloc, "/api/plans", "", "")), {}
-
-    headers = {"Authorization": f"Bearer {key}"} if key else {}
-    if clean_target == "model_endpoints":
-        model_path = _openrouter_model_path(route.model)
-        return _endpoint(route.base_url, f"models/{model_path}/endpoints"), headers
-    if clean_target == "model":
-        model_path = _openrouter_model_path(route.model)
-        return _endpoint(route.base_url, f"models/{model_path}"), headers
-    return _endpoint(route.base_url, clean_target or "models"), headers
-
-
 #: Gemini FinishReason values that report safety, policy or recitation blocks
 #: (https://ai.google.dev/api/generate-content#FinishReason).
 GEMINI_BLOCKED_FINISH_REASONS = frozenset(
@@ -888,188 +702,471 @@ OPENAI_BLOCKED_FINISH_REASONS = frozenset(
 )
 
 
-def _output_truncated(payload: dict, provider: str) -> bool:
-    """True when the provider says the answer hit its output budget.
+def _usage_count(value: object) -> int | None:
+    """One token count from a provider usage block, or ``None`` if unusable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and value.is_integer():
+        return int(value)
+    return None
 
-    Each request style spells this differently: ``finish_reason: "length"``
-    (OpenAI-compatible, which is what NaraRouter and OpenRouter speak;
-    OpenRouter also exposes the raw upstream reason in ``native_finish_reason``),
-    ``finishReason: "MAX_TOKENS"`` or ``"CONTINUATION"`` (Gemini), and
-    ``stop_reason: "max_tokens"`` (Anthropic).
-    """
-    try:
-        if provider == "gemini":
-            reason = str(payload["candidates"][0].get("finishReason") or "").strip().upper()
-            return reason in ("MAX_TOKENS", "CONTINUATION", "LENGTH")
-        if provider == "anthropic":
-            return payload.get("stop_reason") == "max_tokens"
-        choice = payload["choices"][0]
-        finish = str(choice.get("finish_reason") or "").strip().lower()
-        native = str(choice.get("native_finish_reason") or "").strip().lower()
-        return finish in ("length", "max_tokens", "continuation") or native in (
-            "length",
-            "max_tokens",
-            "continuation",
-        )
-    except (AttributeError, KeyError, IndexError, TypeError):
+
+class OpenAIDialect:
+    """OpenAI-compatible wire-format dialect (OpenRouter, NaraRouter, Groq, Cerebras)."""
+
+    style = "openai"
+
+    def build_post_request(
+        self,
+        route: NoteRoute,
+        settings: Settings,
+        system: str,
+        user: str,
+        *,
+        schema: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        key = _clean_api_key(route.api_key)
+        model = route.model.strip()
+        max_tokens = settings.note_max_output_tokens
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": NOTE_TEMPERATURE,
+            "max_tokens": max_tokens,
+        }
+        if schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": _openai_json_schema(schema),
+            }
+        elif route.json_object_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if (
+            getattr(settings, "note_openrouter_throughput", False)
+            and route.slug == "openrouter"
+        ):
+            payload["provider"] = {"sort": "throughput"}
+        if settings.note_reasoning_effort and route.slug in (
+            "nara",
+            "openrouter",
+            "groq",
+            "cerebras",
+        ):
+            payload["reasoning_effort"] = settings.note_reasoning_effort
+        return _endpoint(route.base_url, "chat/completions"), headers, payload
+
+    def build_get_request(
+        self,
+        route: NoteRoute,
+        target: str = "models",
+    ) -> tuple[str, dict[str, str]]:
+        key = _clean_api_key(route.api_key)
+        clean_target = target.strip().strip("/")
+        if clean_target in ("plans", "api/plans"):
+            parsed = urlsplit(route.base_url)
+            return urlunsplit((parsed.scheme, parsed.netloc, "/api/plans", "", "")), {}
+        headers = {"Authorization": f"Bearer {key}"} if key else {}
+        if clean_target == "model_endpoints":
+            model_path = _openrouter_model_path(route.model)
+            return _endpoint(route.base_url, f"models/{model_path}/endpoints"), headers
+        if clean_target == "model":
+            model_path = _openrouter_model_path(route.model)
+            return _endpoint(route.base_url, f"models/{model_path}"), headers
+        return _endpoint(route.base_url, clean_target or "models"), headers
+
+    def is_output_truncated(self, payload: dict[str, Any]) -> bool:
+        try:
+            choice = payload["choices"][0]
+            finish = str(choice.get("finish_reason") or "").strip().lower()
+            native = str(choice.get("native_finish_reason") or "").strip().lower()
+            return finish in ("length", "max_tokens", "continuation") or native in (
+                "length",
+                "max_tokens",
+                "continuation",
+            )
+        except (AttributeError, KeyError, IndexError, TypeError):
+            return False
+
+    def is_reasoning_exhausted(self, payload: dict[str, Any]) -> bool:
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            details = usage.get("completion_tokens_details")
+            if isinstance(details, dict):
+                reasoning = _usage_count(details.get("reasoning_tokens"))
+                completion = _usage_count(usage.get("completion_tokens"))
+                if reasoning is not None and reasoning > 0 and (
+                    completion is None or reasoning >= completion
+                ):
+                    return True
+        try:
+            message = payload["choices"][0]["message"]
+            if isinstance(message, dict):
+                for key in ("reasoning", "reasoning_content"):
+                    val = message.get(key)
+                    if isinstance(val, str) and val.strip():
+                        return True
+        except (AttributeError, KeyError, IndexError, TypeError):
+            pass
         return False
 
+    def parse_response(self, payload: dict[str, Any]) -> str:
+        choice = payload["choices"][0]
+        if not isinstance(choice, dict):
+            raise TypeError("choice is not a dict")
+        finish_reason_lower = str(choice.get("finish_reason") or "").strip().lower()
+        native_reason_lower = str(choice.get("native_finish_reason") or "").strip().lower()
+        blocked_reason = (
+            finish_reason_lower
+            if finish_reason_lower in OPENAI_BLOCKED_FINISH_REASONS
+            else (
+                native_reason_lower
+                if native_reason_lower in OPENAI_BLOCKED_FINISH_REASONS
+                else ""
+            )
+        )
+        message = choice.get("message")
+        if not isinstance(message, dict):
+            if blocked_reason:
+                raise LLMResponseError(
+                    f"پاسخ سرویس تولید جزوه مسدود شد ({_sanitize_error_text(blocked_reason)})."
+                )
+            message = choice["message"]
+        content = (
+            message.get("content")
+            if isinstance(message, dict)
+            else choice["message"]["content"]
+        )
+        if isinstance(content, list):
+            text = "".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict)
+                and part.get("type") not in ("thinking", "reasoning")
+                and part.get("thought") is not True
+            )
+        else:
+            text = "" if content is None else str(content)
+        if not text.strip():
+            if blocked_reason:
+                raise LLMResponseError(
+                    f"پاسخ سرویس تولید جزوه مسدود شد ({_sanitize_error_text(blocked_reason)})."
+                )
+            refusal = message.get("refusal") if isinstance(message, dict) else None
+            if isinstance(refusal, str) and refusal.strip():
+                raise LLMResponseError("پاسخ سرویس تولید جزوه مسدود شد (refusal).")
+            if self.is_reasoning_exhausted(payload):
+                raise LLMOutputBudgetError(
+                    "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
+                    "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
+                )
+        return text
 
-def _reasoning_exhausted_output(payload: dict, provider: str) -> bool:
-    """True when a thinking/reasoning model spent its output tokens on thoughts
-    and left zero visible answer text."""
-    if provider == "gemini":
+    def extract_usage(
+        self, payload: dict[str, Any]
+    ) -> tuple[str, int | None, int | None, int | None]:
+        model = payload.get("model") or payload.get("modelVersion") or ""
+        input_tokens = output_tokens = total_tokens = None
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            input_tokens = _usage_count(usage.get("prompt_tokens"))
+            output_tokens = _usage_count(usage.get("completion_tokens"))
+            total_tokens = _usage_count(usage.get("total_tokens"))
+        if total_tokens is None and input_tokens is not None and output_tokens is not None:
+            total_tokens = input_tokens + output_tokens
+        return str(model), input_tokens, output_tokens, total_tokens
+
+
+class GeminiDialect:
+    """Google Gemini ``generateContent`` wire-format dialect."""
+
+    style = "gemini"
+
+    def build_post_request(
+        self,
+        route: NoteRoute,
+        settings: Settings,
+        system: str,
+        user: str,
+        *,
+        schema: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        key = _clean_api_key(route.api_key)
+        if not key:
+            raise LLMAuthError("کلید سرویس تولید جزوه تنظیم نشده است.")
+        model_id = _gemini_model_id(route.model.strip())
+        url = _endpoint(route.base_url, f"models/{model_id}:generateContent")
+        generation_config: dict[str, Any] = {
+            "temperature": NOTE_TEMPERATURE,
+            "maxOutputTokens": settings.note_max_output_tokens,
+            "responseMimeType": "application/json",
+        }
+        if schema is not None:
+            generation_config["responseSchema"] = _gemini_schema(schema)
+        if settings.gemini_thinking_budget >= 0:
+            generation_config["thinkingConfig"] = {
+                "thinkingBudget": settings.gemini_thinking_budget,
+            }
+        payload: dict[str, Any] = {
+            "contents": [{"role": "user", "parts": [{"text": user}]}],
+            "systemInstruction": {"parts": [{"text": system}]},
+            "generationConfig": generation_config,
+        }
+        return url, {"x-goog-api-key": key}, payload
+
+    def build_get_request(
+        self,
+        route: NoteRoute,
+        target: str = "models",
+    ) -> tuple[str, dict[str, str]]:
+        key = _clean_api_key(route.api_key)
+        if not key:
+            raise LLMAuthError("کلید سرویس تولید جزوه تنظیم نشده است.")
+        clean_target = target.strip().strip("/")
+        headers = {"x-goog-api-key": key}
+        if clean_target == "model":
+            model_id = _gemini_model_id(route.model)
+            return _endpoint(route.base_url, f"models/{model_id}"), headers
+        return _endpoint(route.base_url, clean_target or "models"), headers
+
+    def is_output_truncated(self, payload: dict[str, Any]) -> bool:
+        try:
+            reason = str(payload["candidates"][0].get("finishReason") or "").strip().upper()
+            return reason in ("MAX_TOKENS", "CONTINUATION", "LENGTH")
+        except (AttributeError, KeyError, IndexError, TypeError):
+            return False
+
+    def is_reasoning_exhausted(self, payload: dict[str, Any]) -> bool:
         usage = payload.get("usageMetadata")
         if isinstance(usage, dict):
             thoughts = _usage_count(usage.get("thoughtsTokenCount"))
             if thoughts is not None and thoughts > 0:
                 return True
         return False
-    usage = payload.get("usage")
-    if isinstance(usage, dict):
-        details = usage.get("completion_tokens_details")
-        if isinstance(details, dict):
-            reasoning = _usage_count(details.get("reasoning_tokens"))
-            completion = _usage_count(usage.get("completion_tokens"))
-            if reasoning is not None and reasoning > 0 and (
-                completion is None or reasoning >= completion
+
+    def parse_response(self, payload: dict[str, Any]) -> str:
+        candidates = payload.get("candidates")
+        if not candidates:
+            feedback = payload.get("promptFeedback")
+            if isinstance(feedback, dict) and isinstance(feedback.get("blockReason"), str):
+                reason = _sanitize_error_text(feedback["blockReason"])
+                raise LLMResponseError(f"پاسخ سرویس تولید جزوه مسدود شد ({reason}).")
+            raise LLMResponseError("پاسخ سرویس تولید جزوه خالی یا نامعتبر است.")
+        first_candidate = candidates[0]
+        if not isinstance(first_candidate, dict):
+            raise TypeError("candidate is not a dict")
+        finish_reason = str(first_candidate.get("finishReason") or "").strip().upper()
+        if finish_reason in GEMINI_BLOCKED_FINISH_REASONS:
+            raise LLMResponseError(
+                f"پاسخ سرویس تولید جزوه مسدود شد ({_sanitize_error_text(finish_reason)})."
+            )
+        if finish_reason in GEMINI_MALFORMED_FINISH_REASONS:
+            raise LLMResponseError(
+                f"پاسخ سرویس تولید جزوه ناقص یا نامعتبر بود ({_sanitize_error_text(finish_reason)})."
+            )
+        content_obj = first_candidate.get("content")
+        if not isinstance(content_obj, dict) or not isinstance(
+            content_obj.get("parts"), list
+        ):
+            feedback = payload.get("promptFeedback")
+            if isinstance(feedback, dict) and isinstance(feedback.get("blockReason"), str):
+                reason = _sanitize_error_text(feedback["blockReason"])
+                raise LLMResponseError(f"پاسخ سرویس تولید جزوه مسدود شد ({reason}).")
+            if self.is_reasoning_exhausted(payload):
+                raise LLMOutputBudgetError(
+                    "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
+                    "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
+                )
+            if content_obj is None or (
+                isinstance(content_obj, dict) and "parts" not in content_obj
             ):
-                return True
-    try:
-        message = payload["choices"][0]["message"]
-        if isinstance(message, dict):
-            for key in ("reasoning", "reasoning_content"):
-                val = message.get(key)
-                if isinstance(val, str) and val.strip():
-                    return True
-    except (AttributeError, KeyError, IndexError, TypeError):
-        pass
-    return False
+                raise LLMResponseError("پاسخ سرویس تولید جزوه خالی بود.")
+            raise KeyError("parts")
+        parts = content_obj["parts"]
+        answer_chunks: list[str] = []
+        saw_thought = False
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            if part.get("thought") is True:
+                saw_thought = True
+                continue
+            if "text" in part and part.get("text") is not None:
+                answer_chunks.append(str(part.get("text", "")))
+        text = "".join(answer_chunks)
+        if not text.strip() and (saw_thought or self.is_reasoning_exhausted(payload)):
+            raise LLMOutputBudgetError(
+                "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
+                "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
+            )
+        return text
+
+    def extract_usage(
+        self, payload: dict[str, Any]
+    ) -> tuple[str, int | None, int | None, int | None]:
+        model = payload.get("model") or payload.get("modelVersion") or ""
+        input_tokens = output_tokens = total_tokens = None
+        usage = payload.get("usageMetadata")
+        if isinstance(usage, dict):
+            input_tokens = _usage_count(usage.get("promptTokenCount"))
+            output_tokens = _usage_count(usage.get("candidatesTokenCount"))
+            total_tokens = _usage_count(usage.get("totalTokenCount"))
+        if total_tokens is None and input_tokens is not None and output_tokens is not None:
+            total_tokens = input_tokens + output_tokens
+        return str(model), input_tokens, output_tokens, total_tokens
+
+
+class AnthropicDialect:
+    """Anthropic Messages API wire-format dialect."""
+
+    style = "anthropic"
+
+    def build_post_request(
+        self,
+        route: NoteRoute,
+        settings: Settings,
+        system: str,
+        user: str,
+        *,
+        schema: dict[str, Any] | None = None,
+    ) -> tuple[str, dict[str, str], dict[str, Any]]:
+        _ = schema
+        key = _clean_api_key(route.api_key)
+        if not key:
+            raise LLMAuthError("برای Anthropic باید NOTE_API_KEY تنظیم شود.")
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+        payload: dict[str, Any] = {
+            "model": route.model.strip(),
+            "max_tokens": settings.note_max_output_tokens,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+            "temperature": NOTE_TEMPERATURE,
+        }
+        return _endpoint(route.base_url, "messages"), headers, payload
+
+    def build_get_request(
+        self,
+        route: NoteRoute,
+        target: str = "models",
+    ) -> tuple[str, dict[str, str]]:
+        key = _clean_api_key(route.api_key)
+        if not key:
+            raise LLMAuthError("برای Anthropic باید NOTE_API_KEY تنظیم شود.")
+        clean_target = target.strip().strip("/")
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+        return _endpoint(route.base_url, clean_target or "models"), headers
+
+    def is_output_truncated(self, payload: dict[str, Any]) -> bool:
+        try:
+            return payload.get("stop_reason") == "max_tokens"
+        except (AttributeError, KeyError, IndexError, TypeError):
+            return False
+
+    def is_reasoning_exhausted(self, payload: dict[str, Any]) -> bool:
+        return OpenAIDialect().is_reasoning_exhausted(payload)
+
+    def parse_response(self, payload: dict[str, Any]) -> str:
+        return "".join(
+            str(part.get("text", ""))
+            for part in payload["content"]
+            if part.get("type") == "text"
+        )
+
+    def extract_usage(
+        self, payload: dict[str, Any]
+    ) -> tuple[str, int | None, int | None, int | None]:
+        model = payload.get("model") or payload.get("modelVersion") or ""
+        input_tokens = output_tokens = total_tokens = None
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            input_tokens = _usage_count(usage.get("input_tokens"))
+            output_tokens = _usage_count(usage.get("output_tokens"))
+        if input_tokens is not None and output_tokens is not None:
+            total_tokens = input_tokens + output_tokens
+        return str(model), input_tokens, output_tokens, total_tokens
+
+
+_DEFAULT_DIALECT: LLMProviderDialect = OpenAIDialect()
+
+DIALECTS: dict[str, LLMProviderDialect] = {
+    "openai": _DEFAULT_DIALECT,
+    "gemini": GeminiDialect(),
+    "anthropic": AnthropicDialect(),
+}
+
+
+def register_llm_dialect(dialect: LLMProviderDialect) -> None:
+    """Register or override a wire-format dialect strategy (OCP extension point)."""
+    DIALECTS[dialect.style] = dialect
+
+
+def get_dialect(style: str) -> LLMProviderDialect:
+    """Return the wire-format dialect strategy for *style* (defaults to OpenAI)."""
+    return DIALECTS.get(style, _DEFAULT_DIALECT)
+
+
+def _build_request_for(
+    route: NoteRoute,
+    settings: Settings,
+    system: str,
+    user: str,
+    *,
+    schema: dict | None = None,
+) -> tuple[str, dict[str, str], dict]:
+    """Build one provider's POST request from its own route dialect."""
+    return get_dialect(route.style).build_post_request(
+        route, settings, system, user, schema=schema
+    )
+
+
+def _build_request(
+    settings: Settings, system: str, user: str, *, route: NoteRoute | None = None
+) -> tuple[str, dict[str, str], dict]:
+    """Build the POST request for one route — by default the first eligible one."""
+    if route is None:
+        routes = note_routes(settings)
+        if not routes:
+            raise LLMAuthError(
+                "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
+                "NARA_API_KEY / OPENROUTER_API_KEY)."
+            )
+        route = routes[0]
+    return _build_request_for(route, settings, system, user)
+
+
+def _build_get_request_for(
+    route: NoteRoute, target: str = "models"
+) -> tuple[str, dict[str, str]]:
+    """Build one provider's documented GET metadata request ``(url, headers)``."""
+    return get_dialect(route.style).build_get_request(route, target)
+
+
+def _output_truncated(payload: dict, provider: str) -> bool:
+    """True when the provider says the answer hit its output budget."""
+    return get_dialect(provider).is_output_truncated(payload)
+
+
+def _reasoning_exhausted_output(payload: dict, provider: str) -> bool:
+    """True when a thinking/reasoning model spent its output tokens on thoughts
+    and left zero visible answer text."""
+    return get_dialect(provider).is_reasoning_exhausted(payload)
 
 
 def _parse_response(payload: dict, provider: str) -> str:
     """Normalize a provider response to plain text."""
-    # Checked before indexing into candidate/message content: when Gemini or a
-    # reasoning gateway hits MAX_TOKENS / length while still thinking, the
-    # response candidate often omits ``content.parts`` altogether.
-    if _output_truncated(payload, provider):
+    dialect = get_dialect(provider)
+    if dialect.is_output_truncated(payload):
         raise LLMOutputBudgetError(
             "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
             "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
         )
     try:
-        if provider == "gemini":
-            candidates = payload.get("candidates")
-            if not candidates:
-                feedback = payload.get("promptFeedback")
-                if isinstance(feedback, dict) and isinstance(feedback.get("blockReason"), str):
-                    reason = _sanitize_error_text(feedback["blockReason"])
-                    raise LLMResponseError(f"پاسخ سرویس تولید جزوه مسدود شد ({reason}).")
-                raise LLMResponseError("پاسخ سرویس تولید جزوه خالی یا نامعتبر است.")
-            first_candidate = candidates[0]
-            if not isinstance(first_candidate, dict):
-                raise TypeError("candidate is not a dict")
-            finish_reason = str(first_candidate.get("finishReason") or "").strip().upper()
-            if finish_reason in GEMINI_BLOCKED_FINISH_REASONS:
-                raise LLMResponseError(
-                    f"پاسخ سرویس تولید جزوه مسدود شد ({_sanitize_error_text(finish_reason)})."
-                )
-            if finish_reason in GEMINI_MALFORMED_FINISH_REASONS:
-                raise LLMResponseError(
-                    f"پاسخ سرویس تولید جزوه ناقص یا نامعتبر بود ({_sanitize_error_text(finish_reason)})."
-                )
-            content_obj = first_candidate.get("content")
-            if not isinstance(content_obj, dict) or not isinstance(
-                content_obj.get("parts"), list
-            ):
-                feedback = payload.get("promptFeedback")
-                if isinstance(feedback, dict) and isinstance(feedback.get("blockReason"), str):
-                    reason = _sanitize_error_text(feedback["blockReason"])
-                    raise LLMResponseError(f"پاسخ سرویس تولید جزوه مسدود شد ({reason}).")
-                if _reasoning_exhausted_output(payload, provider):
-                    raise LLMOutputBudgetError(
-                        "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
-                        "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
-                    )
-                if content_obj is None or (
-                    isinstance(content_obj, dict) and "parts" not in content_obj
-                ):
-                    raise LLMResponseError("پاسخ سرویس تولید جزوه خالی بود.")
-                raise KeyError("parts")
-            parts = content_obj["parts"]
-            # Gemini thinking models mark thought-summary parts with
-            # ``"thought": true`` (https://ai.google.dev/gemini-api/docs/thinking);
-            # never concatenate internal thought summaries into the answer text.
-            answer_chunks: list[str] = []
-            saw_thought = False
-            for part in parts:
-                if not isinstance(part, dict):
-                    continue
-                if part.get("thought") is True:
-                    saw_thought = True
-                    continue
-                if "text" in part and part.get("text") is not None:
-                    answer_chunks.append(str(part.get("text", "")))
-            text = "".join(answer_chunks)
-            if not text.strip() and (saw_thought or _reasoning_exhausted_output(payload, provider)):
-                raise LLMOutputBudgetError(
-                    "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
-                    "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
-                )
-        elif provider == "anthropic":
-            text = "".join(
-                str(part.get("text", ""))
-                for part in payload["content"]
-                if part.get("type") == "text"
-            )
-        else:
-            choice = payload["choices"][0]
-            if not isinstance(choice, dict):
-                raise TypeError("choice is not a dict")
-            finish_reason_lower = str(choice.get("finish_reason") or "").strip().lower()
-            native_reason_lower = str(choice.get("native_finish_reason") or "").strip().lower()
-            blocked_reason = (
-                finish_reason_lower
-                if finish_reason_lower in OPENAI_BLOCKED_FINISH_REASONS
-                else (
-                    native_reason_lower
-                    if native_reason_lower in OPENAI_BLOCKED_FINISH_REASONS
-                    else ""
-                )
-            )
-            message = choice.get("message")
-            if not isinstance(message, dict):
-                if blocked_reason:
-                    raise LLMResponseError(
-                        f"پاسخ سرویس تولید جزوه مسدود شد ({_sanitize_error_text(blocked_reason)})."
-                    )
-                message = choice["message"]
-            content = message.get("content") if isinstance(message, dict) else choice["message"]["content"]
-            if isinstance(content, list):
-                text = "".join(
-                    str(part.get("text", ""))
-                    for part in content
-                    if isinstance(part, dict)
-                    and part.get("type") not in ("thinking", "reasoning")
-                    and part.get("thought") is not True
-                )
-            else:
-                text = "" if content is None else str(content)
-            if not text.strip():
-                if blocked_reason:
-                    raise LLMResponseError(
-                        f"پاسخ سرویس تولید جزوه مسدود شد ({_sanitize_error_text(blocked_reason)})."
-                    )
-                refusal = message.get("refusal") if isinstance(message, dict) else None
-                if isinstance(refusal, str) and refusal.strip():
-                    raise LLMResponseError(
-                        "پاسخ سرویس تولید جزوه مسدود شد (refusal)."
-                    )
-                if _reasoning_exhausted_output(payload, provider):
-                    raise LLMOutputBudgetError(
-                        "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
-                        "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
-                    )
+        text = dialect.parse_response(payload)
     except (AttributeError, KeyError, IndexError, TypeError) as exc:
         logger.warning(
             "Note provider returned an unexpected response schema provider=%s error=%s",
@@ -1085,50 +1182,9 @@ def _parse_response(payload: dict, provider: str) -> str:
     return text
 
 
-def _usage_count(value: object) -> int | None:
-    """One token count from a provider usage block, or ``None`` if unusable."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return None
-
-
 def _usage_summary(payload: dict, style: str) -> tuple[str, int | None, int | None, int | None]:
-    """``(served_model, input_tokens, output_tokens, total_tokens)`` of a reply.
-
-    Each request style reports usage under its own names: OpenAI-compatible
-    ``usage.prompt_tokens``/``completion_tokens``, Gemini ``usageMetadata``
-    (served model arrives as ``modelVersion``) and Anthropic ``usage``
-    ``input_tokens``/``output_tokens`` with no total of its own. Anything a
-    provider omits stays ``None``: the summary is for calibrating the
-    character-to-token estimate against real Persian traffic, never for
-    billing, so a partial report is logged as-is instead of being guessed.
-    """
-    model = payload.get("model") or payload.get("modelVersion") or ""
-    input_tokens = output_tokens = total_tokens = None
-    if style == "gemini":
-        usage = payload.get("usageMetadata")
-        if isinstance(usage, dict):
-            input_tokens = _usage_count(usage.get("promptTokenCount"))
-            output_tokens = _usage_count(usage.get("candidatesTokenCount"))
-            total_tokens = _usage_count(usage.get("totalTokenCount"))
-    elif style == "anthropic":
-        usage = payload.get("usage")
-        if isinstance(usage, dict):
-            input_tokens = _usage_count(usage.get("input_tokens"))
-            output_tokens = _usage_count(usage.get("output_tokens"))
-    else:
-        usage = payload.get("usage")
-        if isinstance(usage, dict):
-            input_tokens = _usage_count(usage.get("prompt_tokens"))
-            output_tokens = _usage_count(usage.get("completion_tokens"))
-            total_tokens = _usage_count(usage.get("total_tokens"))
-    if total_tokens is None and input_tokens is not None and output_tokens is not None:
-        total_tokens = input_tokens + output_tokens
-    return str(model), input_tokens, output_tokens, total_tokens
+    """``(served_model, input_tokens, output_tokens, total_tokens)`` of a reply."""
+    return get_dialect(style).extract_usage(payload)
 
 
 def _log_usage(

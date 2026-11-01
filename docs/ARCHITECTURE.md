@@ -46,11 +46,12 @@ before the first model call and keeping a 🛑 frame where a failed action stopp
 | Area | Files |
 | --- | --- |
 | Startup/configuration | `__main__.py`, `config.py`, `launcher.py`, `instance_lock.py`, `logging_config.py`, `metrics.py` |
-| Telegram, queue & stage gates | `bot.py`, `jobs.py`, `capacity.py`, `progress.py` (job + action bars), `telegram_text.py`, `titles.py` (2–4-word library names) |
+| Contracts & DI | `protocols.py` (segregated store/provider/clock `Protocol`s), `bot_deps.py` (`BotDependencies`), `routing.py` (`CallbackRouter`), `conversation_state.py` (`ConversationStateStore`) |
+| Telegram orchestrator & workflows | `bot.py` (`GamasBot`), `bot_ui.py`, `bot_jobs.py`, `bot_documents.py`, `bot_learning.py`, `bot_wallet.py`, `bot_support.py`, `bot_admin.py`, `intake.py`, `telegram_transfer.py`, `jobs.py`, `capacity.py`, `progress.py`, `telegram_text.py`, `titles.py` |
 | Media and decks | `media.py`, `media_worker.py`, `presentations.py` |
-| Providers and notes | `stt.py`, `llm.py`, `http_util.py`, `transcript.py`, `textnorm.py`, `notes.py`, `notes_evidence.py` |
-| Documents and Free Office | `doc_extract.py` (PDF/Word/PowerPoint → locator-tagged sections → chunks), `docx_export.py`, `pdf_export.py`, `office.py` (bounded text/CSV parsing and builders), `office_ai.py` (optional source-checked deck/table planning), `office_notes.py` (full and compact note modes), `mdblocks.py`, `bidi.py` |
-| Data, billing and reporting | `db.py`, `billing.py`, `metrics.py`, `migrations/v3/` |
+| Providers and notes | `stt.py` (`ProviderSpec` / `register_stt_provider`), `llm.py` (`LLMProviderDialect` / `register_llm_dialect`), `http_util.py`, `transcript.py`, `textnorm.py`, `notes.py`, `notes_evidence.py` |
+| Documents, OCR & Free Office | `doc_extract.py` (PDF/Word/PowerPoint → locator-tagged sections → chunks), `ocr.py`, `docx_export.py`, `pdf_export.py`, `office.py`, `office_ai.py`, `office_notes.py`, `mdblocks.py`, `bidi.py` |
+| Data, billing and reporting | `db.py` (facade + ISP facets) and `db_{core,users,library,documents,billing,learning,payments,support,reporting}.py`, `billing.py`, `subscription.py`, `migrations/v3/` |
 
 ## Rules
 

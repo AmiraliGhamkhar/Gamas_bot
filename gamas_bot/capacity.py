@@ -20,7 +20,7 @@ backup LLM route could start immediately.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
 import time
 from types import TracebackType
@@ -201,3 +201,65 @@ def pool_for(namespace: str, owner: object) -> CapacityPool:
 def reset_pools() -> None:
     """Clear cached pools across loops (test helper)."""
     _LOOP_POOLS.clear()
+
+
+class CooldownRegistry:
+    """In-memory monotonic deadline tracker for provider/route cooldowns (S2).
+
+    Accepts an injectable monotonic clock (DIP) so callers or tests can drive
+    time deterministically without duplicating deadline arithmetic across STT
+    and LLM layers.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._deadlines: dict[Hashable, float] = {}
+
+    def set(self, key: Hashable, seconds: float) -> None:
+        if seconds <= 0:
+            self._deadlines.pop(key, None)
+            return
+        self._deadlines[key] = self._clock() + seconds
+
+    def remaining(self, key: Hashable) -> float:
+        deadline = self._deadlines.get(key)
+        if deadline is None:
+            return 0.0
+        left = deadline - self._clock()
+        if left <= 0:
+            self._deadlines.pop(key, None)
+            return 0.0
+        return left
+
+    def clear(self) -> None:
+        self._deadlines.clear()
+
+
+class LoopCooldownRegistry:
+    """Event-loop-scoped cooldown tracker isolating sessions per asyncio loop."""
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+        self._clock = clock
+        self._by_loop: weakref.WeakKeyDictionary[
+            asyncio.AbstractEventLoop, CooldownRegistry
+        ] = weakref.WeakKeyDictionary()
+
+    def set(self, owner: object, slug: str, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        loop = asyncio.get_running_loop()
+        registry = self._by_loop.get(loop)
+        if registry is None:
+            registry = CooldownRegistry(clock=self._clock)
+            self._by_loop[loop] = registry
+        registry.set((id(owner), slug), seconds)
+
+    def remaining(self, owner: object, slug: str) -> float:
+        loop = asyncio.get_running_loop()
+        registry = self._by_loop.get(loop)
+        if registry is None:
+            return 0.0
+        return registry.remaining((id(owner), slug))
+
+    def clear(self) -> None:
+        self._by_loop.clear()

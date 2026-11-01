@@ -18,12 +18,17 @@ Environment=PYTHONUNBUFFERED=1
 # system account.
 Environment=HOME=/opt/gamas-bot/data
 Environment=XDG_CACHE_HOME=/opt/gamas-bot/data/.cache
+# Ensure the private data directory exists (0700) before strict mount
+# namespacing runs, and do not restart-loop on fatal misconfiguration (2) or
+# duplicate-instance lock exit (3).
+ExecStartPre=+/usr/bin/install -d -m 0700 -o bot -g bot /opt/gamas-bot/data
 ExecStart=/opt/gamas-bot/.venv/bin/python -m gamas_bot
-Restart=always
+Restart=on-failure
+RestartPreventExitStatus=2 3
 RestartSec=5
 TimeoutStartSec=60
 TimeoutStopSec=45
-KillSignal=SIGINT
+KillSignal=SIGTERM
 UMask=0077
 
 # Basic hardening. The bot only needs write access to data/.
@@ -32,7 +37,7 @@ PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/gamas-bot/data
+ReadWritePaths=-/opt/gamas-bot/data
 
 # Output is collected by journald. Keep LOG_FILE empty unless a rotated file is desired.
 StandardOutput=journal

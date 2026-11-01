@@ -108,14 +108,14 @@ Optionally point an uptime monitor at `passenger_wsgi.py` if you enabled a Pytho
 
 ```bash
 cd "$HOME/gamas_bot"
-# Pause the cron job in cPanel so it does not restart the bot mid-update,
-# then stop the bot only if the PID recorded in the lock is still alive:
-PID="$(cat data/gamas.lock 2>/dev/null)"
-ps -p "$PID" >/dev/null 2>&1 && kill "$PID"
 . .venv/bin/activate
+# Pause the cron job in cPanel so it does not restart the bot mid-update,
+# then gracefully stop the live instance holding the session lock:
+python scripts/ensure_running.py stop
 git pull
 python -m pip install -r requirements.txt
 python -m gamas_bot --check
+python scripts/ensure_running.py --force
 ```
 
 Re-enable the cron job; it starts the bot within a minute.

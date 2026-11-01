@@ -9,11 +9,15 @@
    ```bash
    python -m gamas_bot --check
    ```
-2. On cPanel run `python -m scripts.cpanel_preflight` and check `data/logs/bot.log` and
-   `data/logs/launcher.err`.
-3. Confirm `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` and numeric `ADMIN_IDS`.
-4. Ensure outbound TCP 443 works and only one process uses the token/session. Check the lock:
-   `ps -p "$(cat data/gamas.lock)"`.
+2. On cPanel run `python -m scripts.cpanel_preflight`, `python scripts/ensure_running.py status`,
+   and check `data/logs/bot.log` and `data/logs/launcher.err` (which records pre-spawn validation
+   errors and immediate startup exits even when cron redirects output to `/dev/null`).
+3. Confirm `TELEGRAM_BOT_TOKEN`, `TELEGRAM_API_ID`, `TELEGRAM_API_HASH`, numeric `ADMIN_IDS`, and a
+   valid `LOG_LEVEL` (`DEBUG`, `INFO`, `WARNING`, `ERROR`, `CRITICAL`) / `LOG_FORMAT` (`plain`, `json`).
+   After fixing `.env`, run `python scripts/ensure_running.py --force` to start immediately without
+   waiting for the 45-second watchdog throttle.
+4. Ensure outbound TCP 443 works and only one process uses the token/session. Check or stop the
+   holder via `python scripts/ensure_running.py status` / `stop`.
 
 ## Upload or processing fails
 

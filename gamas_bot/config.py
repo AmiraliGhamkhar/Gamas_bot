@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
@@ -1144,8 +1145,8 @@ def from_env(env_file: str | None = None) -> Settings:
             if (value := _env("LOG_FILE")) not in ("", "-")
             else None
         ),
-        log_level=_env("LOG_LEVEL", "INFO").upper(),
-        log_format=_env("LOG_FORMAT", "plain"),
+        log_level=_env("LOG_LEVEL", "INFO").strip().upper() or "INFO",
+        log_format=_env("LOG_FORMAT", "plain").strip().lower() or "plain",
         log_max_bytes=_env_int("LOG_MAX_BYTES", 5 * 1024 * 1024, minimum=100_000),
         log_backup_count=_env_int("LOG_BACKUP_COUNT", 5, minimum=1),
         max_file_size=_env_int(
@@ -1515,7 +1516,19 @@ ADVISORY_PROBLEMS = (
     "the note request will time out on a slow gateway",
     "will wait for a transcription slot",
     "will wait for a note-provider slot",
+    "is short for a multi-hour lecture",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class ConfigDiagnostic:
+    """Single configuration check outcome carrying its explicit severity."""
+
+    message: str
+    advisory: bool = False
+
+
+ConfigCheckRule = Callable[[Settings], list[ConfigDiagnostic]]
 
 
 def is_advisory(problem: str) -> bool:
@@ -1541,38 +1554,74 @@ def first_configured_stt_provider(settings: Settings) -> str | None:
     return None
 
 
-def check(settings: Settings) -> list[str]:
-    """Human-readable configuration problems; empty list means ready."""
-    problems: list[str] = []
+def _check_telegram_credentials(settings: Settings) -> list[ConfigDiagnostic]:
+    items: list[ConfigDiagnostic] = []
     if not settings.bot_token:
-        problems.append("TELEGRAM_BOT_TOKEN is not set.")
+        items.append(ConfigDiagnostic("TELEGRAM_BOT_TOKEN is not set."))
     if settings.api_id <= 0:
-        problems.append("TELEGRAM_API_ID is not a positive number.")
+        items.append(ConfigDiagnostic("TELEGRAM_API_ID is not a positive number."))
     if not settings.api_hash:
-        problems.append("TELEGRAM_API_HASH is not set.")
-    if settings.ocr_enabled:
-        # The OCR transport is an optional extra: without it every scan and
-        # photo fails at the first upload, which is a worse way to learn.
-        from .ocr import curl_cffi_available
+        items.append(ConfigDiagnostic("TELEGRAM_API_HASH is not set."))
+    return items
 
-        if not curl_cffi_available():
-            problems.append(
+
+def _check_logging_settings(settings: Settings) -> list[ConfigDiagnostic]:
+    from .logging_config import VALID_LOG_FORMATS, is_valid_log_level
+
+    items: list[ConfigDiagnostic] = []
+    if not is_valid_log_level(settings.log_level):
+        items.append(
+            ConfigDiagnostic(
+                f"LOG_LEVEL={settings.log_level!r} is invalid; set it to one of "
+                "DEBUG, INFO, WARNING, ERROR, or CRITICAL."
+            )
+        )
+    if (settings.log_format or "").strip().lower() not in VALID_LOG_FORMATS:
+        items.append(
+            ConfigDiagnostic(
+                f"LOG_FORMAT={settings.log_format!r} must be one of: "
+                f"{', '.join(VALID_LOG_FORMATS)}."
+            )
+        )
+    return items
+
+
+def _check_ocr_settings(settings: Settings) -> list[ConfigDiagnostic]:
+    if not settings.ocr_enabled:
+        return []
+    # The OCR transport is an optional extra: without it every scan and
+    # photo fails at the first upload, which is a worse way to learn.
+    from .ocr import curl_cffi_available
+
+    if not curl_cffi_available():
+        return [
+            ConfigDiagnostic(
                 "OCR_ENABLED=true but the optional 'curl-cffi' package is not "
                 "installed; run pip install 'gamas-bot[ocr]' or set OCR_ENABLED=false."
             )
+        ]
+    return []
+
+
+def _check_stt_settings(settings: Settings) -> list[ConfigDiagnostic]:
+    items: list[ConfigDiagnostic] = []
     if not settings.stt_providers:
         # ``_parse_provider_order`` drops unknown slugs, so a typo can empty the
         # list while every key is still set. ``stt.transcribe`` then refuses
         # every upload; report the real mistake instead of claiming no key is
         # configured.
-        problems.append(
-            "STT_PROVIDERS contains no known provider (known: "
-            f"{', '.join(STT_PROVIDER_ORDER)}); every upload would fail."
+        items.append(
+            ConfigDiagnostic(
+                "STT_PROVIDERS contains no known provider (known: "
+                f"{', '.join(STT_PROVIDER_ORDER)}); every upload would fail."
+            )
         )
     elif not settings.stt_configured:
-        problems.append(
-            "No speech-to-text provider is configured: set SPEECHMATICS_API_KEY, "
-            "DEEPGRAM_API_KEY, or STT_OPENAI_BASE_URL + STT_OPENAI_API_KEY."
+        items.append(
+            ConfigDiagnostic(
+                "No speech-to-text provider is configured: set SPEECHMATICS_API_KEY, "
+                "DEEPGRAM_API_KEY, or STT_OPENAI_BASE_URL + STT_OPENAI_API_KEY."
+            )
         )
     # A language/model pairing that the provider documents as unsupported would
     # only surface as a per-job HTTP 400; report it before any upload happens.
@@ -1582,17 +1631,17 @@ def check(settings: Settings) -> list[str]:
         and (settings.stt_language or "").strip().lower().split("-")[0] == "fa"
         and settings.deepgram_model.strip().lower() not in DEEPGRAM_PERSIAN_MODELS
     ):
-        problems.append(
-            f"DEEPGRAM_MODEL={settings.deepgram_model} does not support Persian "
-            f"(STT_LANGUAGE={settings.stt_language}); set DEEPGRAM_MODEL to one of: "
-            f"{', '.join(sorted(DEEPGRAM_PERSIAN_MODELS))}."
+        items.append(
+            ConfigDiagnostic(
+                f"DEEPGRAM_MODEL={settings.deepgram_model} does not support Persian "
+                f"(STT_LANGUAGE={settings.stt_language}); set DEEPGRAM_MODEL to one of: "
+                f"{', '.join(sorted(DEEPGRAM_PERSIAN_MODELS))}.",
+                advisory=True,
+            )
         )
     # Capacity coherence: active jobs beyond the configured providers' total
     # in-flight slots cannot overflow anywhere — they wait for a slot (bounded
-    # by STT_SLOT_WAIT_TIMEOUT_SECONDS) and then fail. That is routine, not
-    # exceptional, in a Speechmatics-only deployment (default 2 slots against
-    # MAX_ACTIVE_JOBS=3), so say so at startup where the fix is one line of
-    # .env instead of a failed paid job.
+    # by STT_SLOT_WAIT_TIMEOUT_SECONDS) and then fail.
     stt_in_flight = {
         "speechmatics": settings.speechmatics_max_in_flight,
         "deepgram": settings.deepgram_max_in_flight,
@@ -1607,104 +1656,125 @@ def check(settings: Settings) -> list[str]:
         slug for slug in settings.stt_providers if stt_configured_flags.get(slug, False)
     ]
     if eligible_stt:
-        # Mirror ``stt.transcribe``: with fallback disabled only the first
-        # configured provider is ever attempted, so only its slots count.
         stt_capacity = (
             sum(stt_in_flight[slug] for slug in eligible_stt)
             if settings.stt_fallback_enabled
             else stt_in_flight[eligible_stt[0]]
         )
         if stt_capacity < settings.max_active_jobs:
-            problems.append(
-                f"MAX_ACTIVE_JOBS={settings.max_active_jobs} exceeds the configured "
-                f"transcription capacity ({stt_capacity} in-flight slot(s) across "
-                f"{', '.join(eligible_stt)}); additional jobs will wait for a "
-                "transcription slot and fail if none frees within "
-                f"STT_SLOT_WAIT_TIMEOUT_SECONDS={settings.stt_slot_wait_timeout:.0f}. "
-                "Raise the provider *_MAX_IN_FLIGHT limit, configure a Deepgram "
-                "overflow key (DEEPGRAM_API_KEY), or lower MAX_ACTIVE_JOBS."
+            items.append(
+                ConfigDiagnostic(
+                    f"MAX_ACTIVE_JOBS={settings.max_active_jobs} exceeds the configured "
+                    f"transcription capacity ({stt_capacity} in-flight slot(s) across "
+                    f"{', '.join(eligible_stt)}); additional jobs will wait for a "
+                    "transcription slot and fail if none frees within "
+                    f"STT_SLOT_WAIT_TIMEOUT_SECONDS={settings.stt_slot_wait_timeout:.0f}. "
+                    "Raise the provider *_MAX_IN_FLIGHT limit, configure a Deepgram "
+                    "overflow key (DEEPGRAM_API_KEY), or lower MAX_ACTIVE_JOBS.",
+                    advisory=True,
+                )
             )
+    return items
+
+
+def _check_note_settings(settings: Settings) -> list[ConfigDiagnostic]:
+    items: list[ConfigDiagnostic] = []
     if settings.note_provider not in NOTE_PROVIDER_SLUGS and _legacy_note_configured(settings):
-        problems.append(
-            f"NOTE_PROVIDER must be one of: {', '.join(NOTE_PROVIDER_SLUGS)} "
-            f"(got {settings.note_provider!r})."
+        items.append(
+            ConfigDiagnostic(
+                f"NOTE_PROVIDER must be one of: {', '.join(NOTE_PROVIDER_SLUGS)} "
+                f"(got {settings.note_provider!r})."
+            )
         )
     if not settings.note_configured:
-        problems.append(
-            "Note generation is not configured (NOTE_PROVIDERS / NOTE_API_KEY / "
-            "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GROQ_API_KEY / "
-            "CEREBRAS_API_KEY); the bot will deliver raw transcripts only."
+        items.append(
+            ConfigDiagnostic(
+                "Note generation is not configured (NOTE_PROVIDERS / NOTE_API_KEY / "
+                "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / GROQ_API_KEY / "
+                "CEREBRAS_API_KEY); the bot will deliver raw transcripts only.",
+                advisory=True,
+            )
         )
-    # A listed provider with a credential but no model can never build a request.
-    problems.extend(note_route_diagnostics(settings))
-    # Same coherence check for notes, at single-job granularity: if the total
-    # LLM slot capacity is below one job's own chunk fan-out, every long
-    # lecture's later chunks wait (bounded by LLM_SLOT_WAIT_TIMEOUT_SECONDS)
-    # even when no other user is active.
+    for diag in note_route_diagnostics(settings):
+        items.append(ConfigDiagnostic(diag))
+
     configured_routes = note_routes(settings)
     if configured_routes:
         llm_capacity = settings.llm_primary_max_in_flight + (
             settings.llm_fallback_max_in_flight * (len(configured_routes) - 1)
         )
         if llm_capacity < settings.note_concurrency:
-            problems.append(
-                f"NOTE_CONCURRENCY={settings.note_concurrency} exceeds the configured "
-                f"note-provider capacity ({llm_capacity} in-flight slot(s) across "
-                f"{len(configured_routes)} route(s)); chunk requests from a single "
-                "job will wait for a note-provider slot and fail if none frees within "
-                f"LLM_SLOT_WAIT_TIMEOUT_SECONDS={settings.llm_slot_wait_timeout:.0f}. "
-                "Raise LLM_PRIMARY_MAX_IN_FLIGHT / LLM_FALLBACK_MAX_IN_FLIGHT, add a "
-                "fallback route to NOTE_PROVIDERS, or lower NOTE_CONCURRENCY."
+            items.append(
+                ConfigDiagnostic(
+                    f"NOTE_CONCURRENCY={settings.note_concurrency} exceeds the configured "
+                    f"note-provider capacity ({llm_capacity} in-flight slot(s) across "
+                    f"{len(configured_routes)} route(s)); chunk requests from a single "
+                    "job will wait for a note-provider slot and fail if none frees within "
+                    f"LLM_SLOT_WAIT_TIMEOUT_SECONDS={settings.llm_slot_wait_timeout:.0f}. "
+                    "Raise LLM_PRIMARY_MAX_IN_FLIGHT / LLM_FALLBACK_MAX_IN_FLIGHT, add a "
+                    "fallback route to NOTE_PROVIDERS, or lower NOTE_CONCURRENCY.",
+                    advisory=True,
+                )
             )
-    # One request must fit the transcript, the system prompt and the output.
     required_note_tokens = MIN_NOTE_INPUT_TOKENS + MIN_NOTE_PROMPT_TOKENS
     if settings.note_context_tokens - settings.note_max_output_tokens < required_note_tokens:
-        problems.append(
-            f"NOTE_CONTEXT_TOKENS={settings.note_context_tokens} leaves no room for the "
-            f"transcript and system prompt in one note request (NOTE_MAX_OUTPUT_TOKENS="
-            f"{settings.note_max_output_tokens}); lower NOTE_MAX_OUTPUT_TOKENS or raise "
-            "NOTE_CONTEXT_TOKENS."
+        items.append(
+            ConfigDiagnostic(
+                f"NOTE_CONTEXT_TOKENS={settings.note_context_tokens} leaves no room for the "
+                f"transcript and system prompt in one note request (NOTE_MAX_OUTPUT_TOKENS="
+                f"{settings.note_max_output_tokens}); lower NOTE_MAX_OUTPUT_TOKENS or raise "
+                "NOTE_CONTEXT_TOKENS.",
+                advisory=True,
+            )
         )
-    # The context window decides whether a request *fits*; the request deadline
-    # decides whether it *finishes*. A free or shared-pool gateway that cannot
-    # emit the configured output budget inside the deadline answers nothing at
-    # all — the request is not rejected, it simply times out. Warn the operator
-    # before that happens instead of after a 25-minute stall.
     seconds_needed = (
         settings.note_max_output_tokens / MIN_NOTE_OUTPUT_TOKENS_PER_SECOND
     )
     if seconds_needed > settings.note_request_timeout:
-        problems.append(
-            f"NOTE_MAX_OUTPUT_TOKENS={settings.note_max_output_tokens} needs about "
-            f"{seconds_needed:.0f}s of output at "
-            f"{MIN_NOTE_OUTPUT_TOKENS_PER_SECOND:.0f} tokens/s, which is more than "
-            f"NOTE_REQUEST_TIMEOUT_SECONDS={settings.note_request_timeout:.0f}; the note "
-            "request will time out on a slow gateway. Lower NOTE_MAX_OUTPUT_TOKENS, raise "
-            "NOTE_REQUEST_TIMEOUT_SECONDS, or lower NOTE_REASONING_EFFORT."
+        items.append(
+            ConfigDiagnostic(
+                f"NOTE_MAX_OUTPUT_TOKENS={settings.note_max_output_tokens} needs about "
+                f"{seconds_needed:.0f}s of output at "
+                f"{MIN_NOTE_OUTPUT_TOKENS_PER_SECOND:.0f} tokens/s, which is more than "
+                f"NOTE_REQUEST_TIMEOUT_SECONDS={settings.note_request_timeout:.0f}; the note "
+                "request will time out on a slow gateway. Lower NOTE_MAX_OUTPUT_TOKENS, raise "
+                "NOTE_REQUEST_TIMEOUT_SECONDS, or lower NOTE_REASONING_EFFORT.",
+                advisory=True,
+            )
         )
-    # Media extraction runs before transcription and has its own deadline. A
-    # six-hour video needs minutes of decoding even at many times real time, so
-    # a short MEDIA_TIMEOUT fails a lecture whose transcription budget is huge.
+    return items
+
+
+def _check_media_deadlines(settings: Settings) -> list[ConfigDiagnostic]:
     media_floor = max(600.0, settings.stt_job_timeout / 12)
     if settings.media_timeout < media_floor:
-        problems.append(
-            f"MEDIA_TIMEOUT={settings.media_timeout:.0f}s is short for a multi-hour "
-            f"lecture (STT_JOB_TIMEOUT={settings.stt_job_timeout:.0f}s allows one); "
-            f"media extraction would be killed at {settings.media_timeout:.0f}s. "
-            "Raise MEDIA_TIMEOUT or lower STT_JOB_TIMEOUT."
-        )
+        return [
+            ConfigDiagnostic(
+                f"MEDIA_TIMEOUT={settings.media_timeout:.0f}s is short for a multi-hour "
+                f"lecture (STT_JOB_TIMEOUT={settings.stt_job_timeout:.0f}s allows one); "
+                f"media extraction would be killed at {settings.media_timeout:.0f}s. "
+                "Raise MEDIA_TIMEOUT or lower STT_JOB_TIMEOUT.",
+                advisory=True,
+            )
+        ]
+    return []
+
+
+def _check_admin_and_subscription(settings: Settings) -> list[ConfigDiagnostic]:
+    items: list[ConfigDiagnostic] = []
     if not settings.admin_ids:
-        problems.append("ADMIN_IDS is empty; nobody will be able to approve payments.")
-    # Mandatory-channel gate. Offline we can only validate the channel
-    # reference, not the bot's administrator rights; the runtime self-check
-    # reports those, and docs/TELEGRAM_SUBSCRIPTION.md is the setup guide.
+        items.append(
+            ConfigDiagnostic("ADMIN_IDS is empty; nobody will be able to approve payments.")
+        )
     if settings.subscription_required:
         subscription_ref = (settings.subscription_channel or "").strip()
         if not subscription_ref:
-            problems.append(
-                "SUBSCRIPTION_CHANNEL is required while SUBSCRIPTION_REQUIRED is on; "
-                "set it to @gamas_AI (or the channel id) and make the bot an "
-                "administrator of that channel."
+            items.append(
+                ConfigDiagnostic(
+                    "SUBSCRIPTION_CHANNEL is required while SUBSCRIPTION_REQUIRED is on; "
+                    "set it to @gamas_AI (or the channel id) and make the bot an "
+                    "administrator of that channel."
+                )
             )
         else:
             body = subscription_ref[1:] if subscription_ref.startswith("@") else subscription_ref
@@ -1712,19 +1782,52 @@ def check(settings: Settings) -> list[str]:
                 subscription_ref.lstrip("-").isdigit()
                 or re.fullmatch(r"[A-Za-z0-9_]{5,32}", body)
             ):
-                problems.append(
-                    f"SUBSCRIPTION_CHANNEL={subscription_ref!r} is neither a channel "
-                    "username (@name) nor a numeric channel id."
+                items.append(
+                    ConfigDiagnostic(
+                        f"SUBSCRIPTION_CHANNEL={subscription_ref!r} is neither a channel "
+                        "username (@name) nor a numeric channel id."
+                    )
                 )
-    # A non-positive tariff override is silently ignored by ``billing._resolved``
-    # (the canonical default wins), so an operator typo would quote a price they
-    # never chose. Say so at startup instead of hiding it.
-    if settings.plan_values:
-        for name, attribute, default in PLAN_ENV_FIELDS:
-            value = settings.plan_values.get(attribute)
-            if value is None or value <= 0:
-                problems.append(
+    return items
+
+
+def _check_tariff_overrides(settings: Settings) -> list[ConfigDiagnostic]:
+    if not settings.plan_values:
+        return []
+    items: list[ConfigDiagnostic] = []
+    for name, attribute, default in PLAN_ENV_FIELDS:
+        value = settings.plan_values.get(attribute)
+        if value is None or value <= 0:
+            items.append(
+                ConfigDiagnostic(
                     f"{name}={value!r} is not a positive number; the built-in "
                     f"{attribute}={default} is used instead. Fix or remove {name}."
                 )
-    return problems
+            )
+    return items
+
+
+#: Ordered validation pipeline (OCP: add a new rule without editing ``check``).
+CONFIG_CHECK_RULES: tuple[ConfigCheckRule, ...] = (
+    _check_telegram_credentials,
+    _check_logging_settings,
+    _check_ocr_settings,
+    _check_stt_settings,
+    _check_note_settings,
+    _check_media_deadlines,
+    _check_admin_and_subscription,
+    _check_tariff_overrides,
+)
+
+
+def check_diagnostics(settings: Settings) -> list[ConfigDiagnostic]:
+    """Structured configuration diagnostics preserving rule order and severity."""
+    diagnostics: list[ConfigDiagnostic] = []
+    for rule in CONFIG_CHECK_RULES:
+        diagnostics.extend(rule(settings))
+    return diagnostics
+
+
+def check(settings: Settings) -> list[str]:
+    """Human-readable configuration problems; empty list means ready."""
+    return [item.message for item in check_diagnostics(settings)]
