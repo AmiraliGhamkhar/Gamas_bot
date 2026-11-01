@@ -17,10 +17,17 @@ from gamas_bot.config import NoteRoute
 from gamas_bot.conversation_state import ConversationStateStore
 from gamas_bot.db import Database
 from gamas_bot.media import MediaInfo
+from gamas_bot.llm_profiles import (
+    PROVIDER_PROFILES,
+    ProviderCapabilityProfile,
+    get_provider_profile,
+    register_provider_profile,
+)
 from gamas_bot.protocols import (
     BillingStoreProtocol,
     DocumentStoreProtocol,
     LLMProviderDialect,
+    LLMProviderProfileProtocol,
     LearningStoreProtocol,
     LibraryStoreProtocol,
     PaymentStoreProtocol,
@@ -251,6 +258,37 @@ class BotDependencyInjectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(bot.client, client)
             self.assertIs(bot.deps, deps)
             _ = asyncio.sleep
+
+
+class ProviderProfileProtocolTests(unittest.TestCase):
+    def test_all_builtin_profiles_satisfy_llm_provider_profile_protocol(self) -> None:
+        for slug, profile in PROVIDER_PROFILES.items():
+            with self.subTest(slug=slug):
+                self.assertIsInstance(profile, LLMProviderProfileProtocol)
+
+    def test_register_provider_profile_extends_registry_without_modifying_dialects(self) -> None:
+        custom = ProviderCapabilityProfile(
+            slug="custom_test_gateway",
+            max_output_tokens_cap=4096,
+            documented_stream_options=False,
+        )
+        try:
+            register_provider_profile(custom)
+            self.assertIs(get_provider_profile("custom_test_gateway"), custom)
+            route = NoteRoute(
+                slug="custom_test_gateway",
+                label="Custom",
+                base_url="https://custom.example/v1",
+                api_key="k",
+                model="custom-model",
+                style="openai",
+                json_object_mode=True,
+            )
+            settings = make_settings(note_max_output_tokens=16384, note_ttfb_timeout=0.0)
+            _url, _headers, payload = llm._build_request_for(route, settings, "S", "U")
+            self.assertEqual(payload["max_tokens"], 4096)
+        finally:
+            PROVIDER_PROFILES.pop("custom_test_gateway", None)
 
 
 if __name__ == "__main__":

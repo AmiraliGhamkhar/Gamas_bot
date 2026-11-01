@@ -302,14 +302,22 @@ _DIFFICULTY_ALIASES: dict[str, str] = {
     "medium": "medium",
     "med": "medium",
     "moderate": "medium",
+    "normal": "medium",
+    "intermediate": "medium",
     "متوسط": "medium",
     "میانه": "medium",
+    "معمولی": "medium",
+    "متوسطروبهسخت": "medium",
     "hard": "hard",
     "harder": "hard",
     "difficult": "hard",
+    "advanced": "hard",
+    "challenging": "hard",
     "سخت": "hard",
     "دشوار": "hard",
     "سختتر": "hard",
+    "خیلیسخت": "hard",
+    "بسیارسخت": "hard",
     "پیشرفته": "hard",
 }
 
@@ -494,7 +502,34 @@ class GenerationShortfallError(RuntimeError):
 _OPTION_LETTERS: dict[str, int] = {
     "a": 0, "b": 1, "c": 2, "d": 3,
     "الف": 0, "ب": 1, "ج": 2, "د": 3,
+    "گزینهالف": 0, "گزینهب": 1, "گزینهج": 2, "گزینهد": 3,
+    "optiona": 0, "optionb": 1, "optionc": 2, "optiond": 3,
 }
+
+_QUIZ_LIST_KEYS: tuple[str, ...] = (
+    "questions", "quiz", "items", "mcqs", "سوالات", "سؤالات", "پرسش‌ها", "پرسشها",
+)
+_CARD_LIST_KEYS: tuple[str, ...] = (
+    "cards", "flashcards", "items", "فلش‌کارت‌ها", "فلش کارت ها", "کارت‌ها", "کارتها",
+)
+_CORRECT_KEYS: tuple[str, ...] = (
+    "correct", "correct_index", "answer", "correct_option", "پاسخ", "گزینه_صحیح",
+)
+_SEQUENTIAL_OPTION_PREFIXES: tuple[tuple[str, str, str, str], ...] = (
+    ("الف", "ب", "ج", "د"),
+    ("a", "b", "c", "d"),
+    ("1", "2", "3", "4"),
+)
+_OPTION_LABEL_PREFIX_RE = re.compile(
+    r"^\s*[\(\[]?\s*(الف|ب|ج|د|[a-dA-D]|[1-4۱-۴١-٤])\s*[\)\].:،\-–—]+\s*(.+)$"
+)
+
+
+def _correct_field(entry: dict[str, Any]) -> Any:
+    for key in _CORRECT_KEYS:
+        if key in entry and entry[key] is not None and entry[key] != "":
+            return entry[key]
+    return None
 
 
 def _one_based_correct(raw_questions: list[Any]) -> bool:
@@ -509,7 +544,7 @@ def _one_based_correct(raw_questions: list[Any]) -> bool:
     for entry in raw_questions:
         if not isinstance(entry, dict):
             continue
-        value = entry.get("correct")
+        value = _correct_field(entry)
         if isinstance(value, bool) or value is None:
             continue
         if isinstance(value, int):
@@ -521,12 +556,18 @@ def _one_based_correct(raw_questions: list[Any]) -> bool:
     return bool(values) and 4 in values and 0 not in values
 
 
-def _parse_correct(value: Any, *, one_based: bool) -> int | None:
+def _parse_correct(
+    value: Any,
+    *,
+    one_based: bool,
+    options: list[str] | None = None,
+) -> int | None:
     """Read an answer key as a 0-based option index, or ``None``.
 
-    Providers that ignore the JSON schema answer with the *letter* («ب», "B")
-    or a 1-based position; both are unambiguous once the payload's own style is
-    known, and silently mis-grading is not an option.
+    Providers that ignore the JSON schema answer with the *letter* («ب», "B"),
+    a 1-based position, or the exact option text itself; each is unambiguous
+    once the payload's own style is known, and silently mis-grading is not an
+    option.
     """
     if isinstance(value, bool) or value is None:
         return None
@@ -535,16 +576,64 @@ def _parse_correct(value: Any, *, one_based: bool) -> int | None:
         if token in _OPTION_LETTERS:
             return _OPTION_LETTERS[token]
         folded = value.strip().translate(_DIGIT_FOLDING)
-        if not folded.isdigit():
-            return None
-        index = int(folded)
-    elif isinstance(value, int):
-        index = value
-    else:
+        if folded.isdigit():
+            index = int(folded)
+            if one_based:
+                index -= 1
+            return index if 0 <= index <= 3 else None
+        if options and len(options) == 4 and token:
+            matches = [i for i, opt in enumerate(options) if normalize_front(opt) == token]
+            if len(matches) == 1:
+                return matches[0]
         return None
-    if one_based:
-        index -= 1
-    return index if 0 <= index <= 3 else None
+    if isinstance(value, int):
+        index = value
+        if one_based:
+            index -= 1
+        return index if 0 <= index <= 3 else None
+    return None
+
+
+def _strip_sequential_option_prefixes(items: list[str]) -> list[str]:
+    matched = [_OPTION_LABEL_PREFIX_RE.match(opt) for opt in items]
+    if all(m is not None for m in matched):
+        labels = tuple(
+            m.group(1).translate(_DIGIT_FOLDING).casefold()
+            for m in matched if m is not None
+        )
+        if labels in _SEQUENTIAL_OPTION_PREFIXES:
+            return [_clean_str(m.group(2), MAX_OPTION_CHARS) for m in matched if m is not None]
+    return items
+
+
+def _extract_options(entry: dict[str, Any]) -> list[str] | None:
+    """Normalize 4 options from a list of strings/dicts or a 4-key dict."""
+    raw: Any = None
+    for key in ("options", "choices", "گزینه‌ها", "گزینه ها"):
+        if key in entry and entry[key] is not None:
+            raw = entry[key]
+            break
+    if isinstance(raw, dict):
+        ordered: list[str] = []
+        for group in (("الف", "ب", "ج", "د"), ("A", "B", "C", "D"), ("a", "b", "c", "d"), ("1", "2", "3", "4")):
+            if all(k in raw for k in group):
+                ordered = [_clean_str(raw[k], MAX_OPTION_CHARS) for k in group]
+                break
+        if not ordered and len(raw) == 4:
+            ordered = [_clean_str(val, MAX_OPTION_CHARS) for val in raw.values()]
+        return _strip_sequential_option_prefixes(ordered) if len(ordered) == 4 else None
+    if not isinstance(raw, list):
+        return None
+    items: list[str] = []
+    for item in raw:
+        if isinstance(item, dict):
+            text_val = _entry_text(item, "text", "option", "label", "value", "متن")
+            items.append(_clean_str(text_val, MAX_OPTION_CHARS))
+        else:
+            items.append(_clean_str(item, MAX_OPTION_CHARS))
+    if len(items) != 4:
+        return None
+    return _strip_sequential_option_prefixes(items)
 
 
 def _entry_text(entry: dict[str, Any], *keys: str) -> str:
@@ -558,9 +647,19 @@ def _entry_text(entry: dict[str, Any], *keys: str) -> str:
 
 def _source_field(entry: dict[str, Any]) -> Any:
     """The item's locator field, whatever the model called it."""
-    for key in ("source", "منبع", "locator"):
+    for key in ("source", "منبع", "locator", "page", "section"):
         value = entry.get(key)
         if value is not None and value != "":
+            return value
+    return None
+
+
+def _list_from_payload(payload: dict[str, Any], keys: tuple[str, ...]) -> list[Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    for key in keys:
+        value = payload.get(key)
+        if isinstance(value, list):
             return value
     return None
 
@@ -582,7 +681,7 @@ def parse_quiz_payload(
     Generation from either documents or booklets requires source and difficulty;
     the optional flags let legacy callers parse pre-existing untagged content.
     """
-    raw_questions = payload.get("questions")
+    raw_questions = _list_from_payload(payload, _QUIZ_LIST_KEYS)
     if not isinstance(raw_questions, list):
         return []
     one_based = _one_based_correct(raw_questions)
@@ -591,25 +690,27 @@ def parse_quiz_payload(
         if not isinstance(entry, dict):
             continue
         question = _clean_str(
-            _entry_text(entry, "question", "q", "stem"), MAX_QUESTION_CHARS
+            _entry_text(entry, "question", "q", "stem", "prompt", "سوال", "سؤال", "پرسش"),
+            MAX_QUESTION_CHARS,
         )
         # «explanation» is what a model writes when it paraphrases the example
         # instead of copying it; the field name is cosmetic, the text is not.
         explain = _clean_str(
-            _entry_text(entry, "explain", "explanation"), MAX_EXPLAIN_CHARS
+            _entry_text(entry, "explain", "explanation", "rationale", "reason", "توضیح", "پاسخ_تشریحی"),
+            MAX_EXPLAIN_CHARS,
         )
-        raw_options = entry.get("options")
-        correct = _parse_correct(entry.get("correct"), one_based=one_based)
-        if not question or not explain or not isinstance(raw_options, list):
+        options = _extract_options(entry)
+        if not question or not explain or options is None:
             continue
-        options = [
-            _clean_str(option, MAX_OPTION_CHARS) for option in raw_options
-        ]
         if len(options) != 4 or any(not option for option in options):
             continue
-        if len(set(options)) != 4:
+        option_keys = [normalize_front(option) for option in options]
+        if any(not key for key in option_keys) or len(set(option_keys)) != 4:
             # Duplicate options make "single correct answer" ambiguous.
             continue
+        correct = _parse_correct(
+            _correct_field(entry), one_based=one_based, options=options
+        )
         if not isinstance(correct, int) or isinstance(correct, bool) or not 0 <= correct <= 3:
             continue
         order = list(range(4))
@@ -626,7 +727,9 @@ def parse_quiz_payload(
             "correct_index": order.index(correct),
             "explanation": explain,
         }
-        difficulty = parse_difficulty(entry.get("difficulty"))
+        difficulty = parse_difficulty(
+            entry.get("difficulty") if "difficulty" in entry else entry.get("سطح")
+        )
         if difficulty is not None:
             record["difficulty"] = difficulty
         elif require_difficulty:
@@ -701,7 +804,7 @@ def parse_flashcard_payload(
     ``source`` is required for newly generated document and booklet cards;
     legacy callers may still parse older untagged items. A yes/no front is dropped.
     """
-    raw_cards = payload.get("cards")
+    raw_cards = _list_from_payload(payload, _CARD_LIST_KEYS)
     if not isinstance(raw_cards, list):
         return []
     validated: list[dict[str, str]] = []
@@ -711,14 +814,24 @@ def parse_flashcard_payload(
         # «question»/«answer» is a common paraphrase of the example's
         # «front»/«back»; a field name is cosmetic, losing a valid card is not.
         front = _clean_str(
-            _entry_text(entry, "front", "question"), MAX_CARD_FRONT_CHARS
+            _entry_text(
+                entry,
+                "front", "question", "q", "prompt", "term",
+                "روی_کارت", "پرسش", "سوال", "سؤال",
+            ),
+            MAX_CARD_FRONT_CHARS,
         )
         back = _clean_str(
-            _entry_text(entry, "back", "answer"), MAX_CARD_BACK_CHARS
+            _entry_text(
+                entry,
+                "back", "answer", "a", "definition",
+                "پشت_کارت", "پاسخ", "جواب",
+            ),
+            MAX_CARD_BACK_CHARS,
         )
         if not front or not back:
             continue
-        if _is_yes_no(front):
+        if _is_yes_no(front, back):
             continue
         card = {"front": front, "back": back}
         source = _clean_source(_source_field(entry))
@@ -732,8 +845,26 @@ def parse_flashcard_payload(
     return validated
 
 
-def _is_yes_no(front: str) -> bool:
-    """True for a card whose whole answer is «بله»/«خیر» (banned by R5.1)."""
+_ALTERNATIVE_CHOICE_RE = re.compile(r"\sیا\s")
+_YES_NO_ANSWERS: frozenset[str] = frozenset(
+    {"بله", "خیر", "نه", "آری", "بلی", "درست", "نادرست", "صحیح", "غلط", "yes", "no", "true", "false"}
+)
+
+
+def _is_yes_no(front: str, back: str = "") -> bool:
+    """True for a card whose whole answer is «بله»/«خیر» (banned by R5.1).
+
+    Comparative «آیا A است یا B؟» cards are kept unless the answer itself is
+    literally a yes/no word.
+    """
+    if back:
+        norm_back = normalize_front(back)
+        if norm_back in _YES_NO_ANSWERS:
+            return True
     stripped = front.strip()
     starters = ("آیا ", "آیا‌", "ایا ")
-    return stripped.startswith(starters)
+    if not stripped.startswith(starters):
+        return False
+    if _ALTERNATIVE_CHOICE_RE.search(stripped):
+        return False
+    return True

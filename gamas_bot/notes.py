@@ -1831,13 +1831,13 @@ def meets_completeness_threshold(
 COVERAGE_FILL_SYSTEM_PROMPT = (
     "شما «گردآورندهٔ جزوهٔ درس» فارسی گاماس هستید. یک واحد آموزشی از متن منبع در پیام "
     "کاربر آمده که در پیش‌نویس جزوه جا افتاده است. وظیفه: فقط همان واحد را، با همان اطلاعات و "
-    "بدون هیچ افزوده، به صورت یک بخش کوتاه (heading + paragraphs/bullets) برگردان.\\n\\n"
+    "بدون هیچ افزوده، به صورت یک بخش کوتاه (heading + paragraphs/bullets) برگردان.\n\n"
     + _FORBIDDEN_ADDITIONS
-    + "\\n" + _JSON_RULES
-    + "\\n\\nقواعد:\\n"
+    + "\n" + _JSON_RULES
+    + "\n\nقواعد:\n"
     "- فقط از جمله‌هایی استفاده کنید که در پیام کاربر (متن منبع) هست؛ هیچ عدد، نام، اصطلاح، "
-    "مثال، فرمول یا نتیجه‌گیری تازه نسازید و از دانش بیرونی نیاورید.\\n"
-    "- پاسخ فقط یک شیء JSON معتبر با همان ساختار جزوه و «sections» غیرخالی است؛ متن اضافه ننویسید.\\n"
+    "مثال، فرمول یا نتیجه‌گیری تازه نسازید و از دانش بیرونی نیاورید.\n"
+    "- پاسخ فقط یک شیء JSON معتبر با همان ساختار جزوه و «sections» غیرخالی است؛ متن اضافه ننویسید.\n"
 )
 
 
@@ -1848,9 +1848,9 @@ def build_fill_document(gaps, notes: StructuredNotes) -> str:
     )
     headings = "، ".join(s.heading for s in notes.sections if s.heading.strip())[:600]
     return (
-        "### واحد آموزشی جاافتاده (عیناً از متن منبع)\\n" + units + "\n\n"
-        "### عنوان بخش‌های فعلی جزوه\\n" + (headings or "(هنوز بخشی نیست)") + "\n\n"
-        "### دستور\\n"
+        "### واحد آموزشی جاافتاده (عیناً از متن منبع)\n" + units + "\n\n"
+        "### عنوان بخش‌های فعلی جزوه\n" + (headings or "(هنوز بخشی نیست)") + "\n\n"
+        "### دستور\n"
         "فقط همین واحد را — همان‌گونه که در متن منبع آمده — در قالب JSON جزوه برگردان تا به "
         "بخش‌ها افزوده شود. هیچ مطلب تازه‌ای اضافه نکن."
     )
@@ -1904,6 +1904,21 @@ async def fill_coverage_gaps(
             break
         if not filled.has_content:
             continue
+        if getattr(settings, "note_strict_grounding", False):
+            filled, filled_report = gate_notes(
+                filled, source, strict=True, mode=settings.note_mode
+            )
+            if filled_report.audit.fabricated:
+                filled, _ = scrub_fabricated_numbers(filled, filled_report.audit)
+                filled, filled_report = gate_notes(
+                    filled, source, strict=True, mode=settings.note_mode
+                )
+            if not filled.has_content or filled_report.audit.fabricated:
+                logger.warning(
+                    "coverage fill piece rejected by grounding gate: %s",
+                    filled_report.summary(),
+                )
+                continue
         merged = merge_structured_notes([merged, filled])
         if meets_completeness_threshold(assess_completeness(source, merged)):
             break
@@ -2805,7 +2820,11 @@ async def _repair_once(
     try:
         async with semaphore:
             payload = await complete_json(
-                session, settings, system=system_prompt, user=repair_document
+                session,
+                settings,
+                system=system_prompt,
+                user=repair_document,
+                schema=_response_schema(settings),
             )
         candidate = _load_json_payload(payload, mode=mode)
     except (LLMError, StructuringError) as exc:

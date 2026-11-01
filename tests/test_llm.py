@@ -81,8 +81,12 @@ class StructuredOutputAndRoutingTests(unittest.TestCase):
         section = generation["responseSchema"]["properties"]["sections"]
         self.assertEqual(section["type"], "ARRAY")
         self.assertEqual(section["items"]["type"], "OBJECT")
-        # Gemini infers required-ness; the key itself is not in its dialect.
-        self.assertNotIn("required", section["items"])
+        # Gemini requires explicit `required` arrays (properties are optional by
+        # default) and forbids `additionalProperties` inside `responseSchema`.
+        self.assertEqual(generation["responseSchema"]["required"], ["sections"])
+        self.assertEqual(section["items"]["required"], ["heading"])
+        self.assertNotIn("additionalProperties", generation["responseSchema"])
+        self.assertNotIn("additionalProperties", section["items"])
 
     def test_openai_style_uses_json_schema_not_strict_mode(self):
         settings = make_settings(note_structured_output=True)

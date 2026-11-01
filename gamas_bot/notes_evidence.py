@@ -49,7 +49,7 @@ and never talks to the network.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from functools import lru_cache
 from typing import Iterable, Iterator, Sequence
 
@@ -137,10 +137,12 @@ _LATIN_STOPWORDS = frozenset(
     }
 )
 
-#: Structural numbering: a slide/figure/step number is not a content number.
+#: Structural numbering: a slide/page/figure/step number is not a content number.
 _STRUCTURAL_NUMBER = re.compile(
-    r"(?:[Ss]lide|اسلاید|بخش|گام|مرحله|جدول|شکل|نمودار|فصل|درس|جلسه|تمرین|پرسش|سوال|سؤال)"
-    r"\s*[‌ ]?\s*[0-9۰-۹٠-٩]+(?:\s*(?:از|از کل)\s*[0-9۰-۹٠-٩]+)?"
+    r"(?:[Ss]lide|[Pp]age|اسلاید|صفحه(?:ٔ|\s+ی)?|برگ|بخش|گام|مرحله|جدول|شکل|نمودار|فصل|درس|جلسه|تمرین|پرسش|سوال|سؤال)"
+    r"\s*[‌ ]?\s*[0-9۰-۹٠-٩]+"
+    r"(?:\s*(?:از|از کل)\s*[0-9۰-۹٠-٩]+)?"
+    r"(?:\s*\(\s*[0-9۰-۹٠-٩]+\s*/\s*[0-9۰-۹٠-٩]+\s*\))?"
 )
 _CHUNK_MARKER = re.compile(r"\[[^\]\n]{0,120}?(?:بخش|part)[^\]\n]{0,120}\]", re.IGNORECASE)
 _MARKDOWN_HEADING = re.compile(r"^#{1,6}\s*", re.MULTILINE)
@@ -563,11 +565,16 @@ def build_source_index(source: str) -> SourceEvidenceIndex:
 # ===========================================================================
 
 
+_METADATA_KEYS: frozenset[str] = frozenset({"note_mode", "source_locators"})
+
+
 def _payload_strings(value: object) -> Iterator[str]:
     if isinstance(value, str):
         yield value
     elif isinstance(value, dict):
-        for item in value.values():
+        for key, item in value.items():
+            if key in _METADATA_KEYS:
+                continue
             yield from _payload_strings(item)
     elif isinstance(value, (list, tuple)):
         for item in value:
@@ -575,15 +582,22 @@ def _payload_strings(value: object) -> Iterator[str]:
 
 
 def _payload_of(notes: object) -> object:
-    """The note payload without its metadata.
+    """The note payload without non-prose metadata.
 
-    ``note_mode`` is a producer setting (now always ``full``), not a fact about
-    the lecture; auditing it would report the word ``full`` as a fabrication in
-    every document.
+    ``note_mode`` and ``source_locators`` are producer/citation metadata rather
+    than prose assertions, and a bare dataclass section (e.g. ``NoteSection``)
+    is wrapped under ``sections`` so both text extraction and equivalence-slot
+    checks inspect it identically to a full ``StructuredNotes`` payload.
     """
-    payload = notes.to_payload() if hasattr(notes, "to_payload") else notes
-    if isinstance(payload, dict) and "note_mode" in payload:
-        payload = {key: value for key, value in payload.items() if key != "note_mode"}
+    if hasattr(notes, "to_payload"):
+        payload: object = notes.to_payload()
+    elif is_dataclass(notes) and not isinstance(notes, type):
+        raw_dc = asdict(notes)
+        payload = {"sections": [raw_dc]} if "sections" not in raw_dc and "heading" in raw_dc else raw_dc
+    else:
+        payload = notes
+    if isinstance(payload, dict) and any(k in payload for k in _METADATA_KEYS):
+        payload = {key: value for key, value in payload.items() if key not in _METADATA_KEYS}
     return payload
 
 

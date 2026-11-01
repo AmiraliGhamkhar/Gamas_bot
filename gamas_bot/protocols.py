@@ -61,6 +61,25 @@ class STTProviderAdapter(Protocol):
 
 
 @runtime_checkable
+class LLMProviderProfileProtocol(Protocol):
+    """Per-provider capability & schema policy contract (SRP / OCP)."""
+
+    @property
+    def slug(self) -> str: ...
+
+    def supports_response_format(self, route: NoteRoute) -> bool: ...
+    def supports_stream_options(self, route: NoteRoute) -> bool: ...
+    def build_response_format(
+        self,
+        route: NoteRoute,
+        settings: Settings,
+        schema: dict[str, Any] | None,
+        *,
+        streaming: bool,
+    ) -> dict[str, Any] | None: ...
+
+
+@runtime_checkable
 class LLMProviderDialect(Protocol):
     """Wire-format strategy for one LLM provider family (OpenAI, Gemini, Anthropic)."""
 

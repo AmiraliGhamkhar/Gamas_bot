@@ -26,7 +26,7 @@ from .notes import (
     gate_notes,
     structure_document,
 )
-from .notes_evidence import audit_notes, content_words, extract_signals, split_sentences
+from .notes_evidence import SignalAudit, audit_notes, content_words, extract_signals, split_sentences
 
 logger = logging.getLogger(__name__)
 
@@ -349,6 +349,27 @@ def _locator_source_map(chunks: Iterable[OfficeSourceChunk]) -> dict[str, str]:
     return {label: "\n\n".join(parts) for label, parts in fragments.items()}
 
 
+def _audit_meets_office_floor(audit: SignalAudit, *, compact: bool = False) -> bool:
+    """Enforce zero fabrications, numeric preservation, and realistic signal recall."""
+    if audit.fabricated:
+        return False
+    if audit.number_coverage < 0.98:
+        return False
+    min_coverage = 1.0 if audit.total < 4 else (0.85 if compact else 0.95)
+    return audit.coverage >= min_coverage
+
+
+def _valid_section_locators(locators: tuple[str, ...], allowed: set[str]) -> bool:
+    """Require genuine non-empty locators when source has locators, none otherwise."""
+    if not allowed:
+        return len(locators) == 0
+    return (
+        bool(locators)
+        and len(locators) <= MAX_SOURCE_LOCATORS_PER_SECTION
+        and set(locators) <= allowed
+    )
+
+
 def _full_result_is_grounded(
     notes: StructuredNotes,
     source: str,
@@ -358,16 +379,14 @@ def _full_result_is_grounded(
     if not notes.has_content or not notes.sections:
         return False
     _, report = gate_notes(notes, source, strict=True, mode="full")
-    if report.audit.fabricated or report.audit.missing:
+    if not _audit_meets_office_floor(report.audit, compact=False):
         logger.warning("Office full booklet rejected by evidence gate %s", report.audit.summary())
         return False
-    cited: set[str] = set()
+    allowed_set = set(allowed_locators)
     for section in notes.sections:
-        for locator in section.source_locators:
-            if locator not in allowed_locators:
-                logger.warning("Office full booklet rejected an unknown source locator")
-                return False
-            cited.add(locator)
+        if not _valid_section_locators(section.source_locators, allowed_set):
+            logger.warning("Office full booklet rejected invalid section source locators")
+            return False
         if section.source_locators:
             locator_source = "\n\n".join(
                 locator_sources.get(locator, "") for locator in section.source_locators
@@ -375,12 +394,6 @@ def _full_result_is_grounded(
             if locator_source and audit_notes(locator_source, section).fabricated:
                 logger.warning("Office full booklet section failed its locator-local audit")
                 return False
-        if allowed_locators and not section.source_locators:
-            logger.warning("Office full booklet section has no source locator")
-            return False
-    if allowed_locators and set(allowed_locators) - cited:
-        logger.warning("Office full booklet omitted source locators count=%d", len(set(allowed_locators) - cited))
-        return False
     return True
 
 
@@ -418,7 +431,7 @@ async def generate_full_booklet(
     if not _full_result_is_grounded(generated, source, allowed, locator_sources):
         return fallback, True
     gated, report = gate_notes(generated, source, strict=True, mode="full")
-    if report.audit.fabricated or report.audit.missing or not gated.has_content:
+    if not _audit_meets_office_floor(report.audit, compact=False) or not gated.has_content:
         logger.warning("Office full booklet using source fallback after final audit")
         return fallback, True
     return gated, False
@@ -454,9 +467,7 @@ def _parse_compact_payload(
     if not isinstance(raw_locators, (list, tuple)):
         return None
     locators = tuple(dict.fromkeys(str(value).strip() for value in raw_locators if str(value).strip()))
-    if len(locators) > MAX_SOURCE_LOCATORS_PER_SECTION or any(locator not in allowed for locator in locators):
-        return None
-    if set(locators) != allowed:
+    if not _valid_section_locators(locators, allowed):
         return None
     raw_heading = payload.get("heading")
     if not isinstance(raw_heading, str) or len(raw_heading) > 120:
@@ -470,7 +481,7 @@ def _parse_compact_payload(
     candidate = CompactSection(heading, tuple(points), locators)
     adapted = CompactNotes("", (candidate,)).as_structured_notes()
     report = audit_notes(source.text, adapted)
-    if report.fabricated or report.missing:
+    if not _audit_meets_office_floor(report, compact=True):
         return None
     return candidate
 
@@ -517,11 +528,18 @@ def _extractive_compact_section(
 def _compact_section_grounded(section: CompactSection, source: OfficeSourceChunk) -> bool:
     if not section.points or any(not point.strip() for point in section.points):
         return False
-    if set(section.source_locators) != set(source.locators):
+    if not _valid_section_locators(section.source_locators, set(source.locators)):
         return False
     adapted = CompactNotes("", (section,)).as_structured_notes()
+    if section.source_locators:
+        locator_map = _locator_source_map((source,))
+        locator_source = "\n\n".join(
+            locator_map.get(locator, "") for locator in section.source_locators
+        )
+        if locator_source and audit_notes(locator_source, adapted).fabricated:
+            return False
     report = audit_notes(source.text, adapted)
-    return not report.fabricated and not report.missing
+    return _audit_meets_office_floor(report, compact=True)
 
 
 def _compact_prompt(source: OfficeSourceChunk, title: str, index: int) -> str:
@@ -610,12 +628,12 @@ async def generate_compact_notes(
     adapted = result.as_structured_notes()
     complete_source = source_text(chunks, include_locators=True)
     report = audit_notes(complete_source, adapted)
-    if report.fabricated or report.missing:
+    if not _audit_meets_office_floor(report, compact=True):
         logger.warning("Office compact output failed final evidence audit; using extractive fallback")
         result = fallback
         used_fallback = True
         report = audit_notes(complete_source, result.as_structured_notes())
-        if report.fabricated or report.missing:
+        if not _audit_meets_office_floor(report, compact=True):
             raise StructuringError("یادداشت فشرده نتوانست عددها و اصطلاح‌های منبع را کامل حفظ کند.")
     if source_length >= MIN_SOURCE_CHARS_FOR_RATIO and len(result.point_text) > source_length * MAX_COMPACT_SOURCE_RATIO:
         raise StructuringError(

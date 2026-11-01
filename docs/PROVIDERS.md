@@ -37,8 +37,17 @@ quota and rate limits can cool down a route and trigger failover. Transient retr
 are bounded; responses are capped at 16 MiB.
 
 `NOTE_HEDGE_AFTER_SECONDS=60` can start one extra route while a slow request is
-pending; `0` disables that extra quota use. A provider rejecting structured output
-can retry once without the schema. Size budgets for the smallest configured model.
+pending; `0` disables that extra quota use. Per-provider request profiles
+(`gamas_bot/llm_profiles.py`) normalize wire schemas and parameters automatically:
+Gemini `responseSchema` keeps `required` and strips `additionalProperties`;
+Cerebras uses `strict: true` schemas (capping completion tokens at `40,960` and
+setting `reasoning_format: "parsed"`); Groq switches to `json_object` while SSE
+streaming is active (`stream: true` + `json_schema` is rejected by Groq) and uses
+`max_completion_tokens` + `reasoning_format: "parsed"`; OpenRouter `:free` routes
+use `json_object` so endpoint filtering does not 404; and Nara omits undocumented
+`response_format` and `stream_options` fields unless explicitly opted in. Any
+rejected parameter downgrades (`json_schema` → `json_object` → plain prompt) and
+retries once. Size budgets for the smallest configured model.
 Keep grounding enabled: [Note quality](NOTE_QUALITY.md).
 
 ## Verify
