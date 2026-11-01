@@ -1,33 +1,35 @@
 # Documentation
 
-Start with the [main README](../README.md). Commands are given for **Windows PowerShell** (local)
-and **cPanel Terminal** (Linux shared hosting).
+Use **PowerShell on Windows** and **Bash in cPanel Terminal**. Run commands from the
+repository root. Examples use `.venv`; Setup Python App users must substitute the
+interpreter shown by cPanel.
 
-AI coding agents: read [`../AGENTS.md`](../AGENTS.md) first — it is the system prompt /
-maintainer contract (invariants R/B/P/S/D, billing rules, and the full test gate) for this repo.
+## Setup and maintenance
 
-| Page | Use it for |
+| Guide | Purpose |
 | --- | --- |
-| [Deploy on cPanel](DEPLOY_CPANEL.md) | Upload, install, preflight, cron watchdog, updates |
-| [Configuration](CONFIGURATION.md) | `.env`, required keys, safe defaults |
-| [Mandatory channel subscription](TELEGRAM_SUBSCRIPTION.md) | Require every user to join `@gamas_AI`; setup, behavior, cPanel steps |
-| [Operations](OPERATIONS.md) | Start, stop, logs, backups, retention |
+| [Windows PowerShell](DEPLOY_WINDOWS.md) | Install, check, run and update locally |
+| [cPanel](DEPLOY_CPANEL.md) | Install, cron and optional Passenger |
+| [Configuration](CONFIGURATION.md) | Required values, paths and safe defaults |
+| [Operations](OPERATIONS.md) | Lifecycle, logs, backups, restore and retention |
 | [Troubleshooting](TROUBLESHOOTING.md) | Common failures and fixes |
-| [Testing](TESTING.md) | Local checks and CI commands |
-| [Security](SECURITY.md) | Data, uploads, credentials and privacy |
-| [Billing](BILLING.md) | Credit, plans, receipts and admin review |
-| [Admin panel](ADMIN.md) | Dashboard, statistic definitions, windows and health checks |
-| [Speech-to-text](STT_PROVIDERS.md) | STT providers, failover and limits |
-| [Note providers](PROVIDERS.md) | Note generation, keys and model presets |
-| [Presentations](PRESENTATIONS.md) | PowerPoint narration and limits |
-| [Media](MEDIA.md) | Audio/video processing and disk limits |
-| [Free Office (آفیس رایگان) and document notes](OFFICE.md) | Text/file exports, source-grounded document notes, limits, fallbacks and billing isolation |
-| [OCR for scans and photos](OCR.md) | Opt-in i2ocr path, review of the upstream client, limits and privacy |
-| [Word output](DOCX.md) | RTL Word behavior and fonts |
-| [Note quality](NOTE_QUALITY.md) | Grounding checks and limitations |
-| [Performance](PERFORMANCE.md) | Measured defaults and how to re-measure |
-| [Architecture](ARCHITECTURE.md) | Short code and data-flow map |
-| [Changelog](CHANGELOG.md) | Recent user-visible changes |
+| [Security](SECURITY.md) | Secrets, uploads and privacy |
+| [Testing](TESTING.md) | Offline checks and manual smoke tests |
 
-Persian quick guide: [DEPLOY_FA.md](DEPLOY_FA.md). OCR for scans/photos is opt-in (`OCR_ENABLED`), see [OCR.md](OCR.md).
-- [Support tickets](SUPPORT.md) — user and admin support flow, statuses, notifications.
+## Features and internals
+
+| Guide | Purpose |
+| --- | --- |
+| [STT providers](STT_PROVIDERS.md) / [Note providers](PROVIDERS.md) | Credentials and routing |
+| [Free Office and documents](OFFICE.md) / [OCR](OCR.md) | Exports, scans and limits |
+| [Media](MEDIA.md) / [Presentations](PRESENTATIONS.md) | Audio and narration |
+| [Word output](DOCX.md) / [Note quality](NOTE_QUALITY.md) | RTL and accuracy limits |
+| [Billing](BILLING.md) / [Admin](ADMIN.md) / [Support](SUPPORT.md) | Credit, payments and tickets |
+| [Channel membership](TELEGRAM_SUBSCRIPTION.md) | Required subscription setup |
+| [Performance](PERFORMANCE.md) / [Architecture](ARCHITECTURE.md) | Resources and code map |
+| [Changelog](CHANGELOG.md) | Concise change history |
+
+Maintainers: read [AGENTS.md](../AGENTS.md). Settings are defined in
+[`config.py`](../gamas_bot/config.py) and listed in [`.env.example`](../.env.example).
+Revision-specific audit reports and the duplicate Persian deployment guide were
+removed; use the current guides above. Earlier documents remain in Git history.

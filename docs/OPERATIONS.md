@@ -1,84 +1,96 @@
 # Operations
 
+Run one instance per token/session. Paths below assume the default configuration;
+include custom paths in backups and log commands.
+
 ## Start and stop
 
-**Windows PowerShell** — run in a console, stop with **Ctrl+C**:
+**Windows PowerShell:**
 
 ```powershell
 .\.venv\Scripts\python.exe -m gamas_bot --check
 .\.venv\Scripts\python.exe -m gamas_bot
 ```
 
-**cPanel** — the once-per-minute cron watchdog in [Deploy on cPanel](DEPLOY_CPANEL.md) keeps the
-bot running. Start it manually once to test:
+Stop with **Ctrl+C** and wait for shutdown. Keep the foreground console open.
+
+**cPanel Terminal** (virtualenv active):
 
 ```bash
-. .venv/bin/activate
-python -m gamas_bot --check
-python -m gamas_bot
+python scripts/ensure_running.py status
+python scripts/ensure_running.py stop
+python scripts/ensure_running.py restart
 ```
 
-Stop, inspect, or restart a background instance via `scripts/ensure_running.py` (never with a broad
-`pkill` pattern):
+Pause cron and Passenger/monitor triggers before maintenance, or they can restart
+the bot. Stop must report `stopped` before copying data. After fixing a startup
+error, `python scripts/ensure_running.py --force` bypasses the spawn throttle.
+Never delete an active lock or use broad process-kill commands.
+
+## Logs
+
+Foreground uses stdout unless `LOG_FILE` is set. The background launcher defaults
+to `data/logs/bot.log`; startup diagnostics go to `data/logs/launcher.err`.
+`LOG_MAX_BYTES` defaults to 5 MiB, `LOG_BACKUP_COUNT` to 5 rotating backups.
+
+```powershell
+Get-Content .\data\logs\bot.log -Tail 80 -Wait
+```
 
 ```bash
-python scripts/ensure_running.py status     # running (pid=...), stopped, or misconfigured
-python scripts/ensure_running.py stop       # graceful SIGTERM using the locked PID
-python scripts/ensure_running.py restart    # stop + immediate verified start
-python scripts/ensure_running.py --force    # bypass the 45s spawn throttle after fixing .env
+tail -n 80 data/logs/bot.log
+tail -n 80 data/logs/launcher.err
 ```
 
-Pause the cron job while updating or stopping, otherwise it restarts the bot within a minute.
+Use the `GMS-#####` job reference. Share only redacted metadata, never private content.
 
-Only one process may use a Telegram session. The instance lock enforces this; a second copy exits
-with code `3` instead of competing, while configuration/startup errors exit with code `2`.
+## Backups and restore
 
-## Logs and health
+Disable start triggers, stop the bot and verify shutdown first. Store backups
+encrypted, outside web roots and Git. Never share a session file.
+
+Back up `.env` and the entire private `data/` directory: database, any SQLite
+sidecars, Telegram session and receipts. Include configured paths outside `data/`.
+Copying a live SQLite file alone can lose WAL transactions. Live backups need
+SQLite's backup API plus coordinated session/receipt handling.
+
+**Windows PowerShell** (bot stopped):
+
+```powershell
+$Backup = Join-Path $HOME ("Gamas-backups/" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+New-Item -ItemType Directory -Path $Backup -Force | Out-Null
+Copy-Item .env -Destination $Backup
+Copy-Item data -Destination $Backup -Recurse
+```
+
+**cPanel Terminal** (bot stopped):
 
 ```bash
-python -m gamas_bot --check                 # settings + runtime packages + media worker
-python -m gamas_bot.media_worker check      # PyAV + ppt2pptx
-python -m scripts.cpanel_preflight          # full host check (cPanel)
+umask 077
+BACKUP="$HOME/backups/gamas-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP"
+cp -p .env "$BACKUP/"
+cp -a data "$BACKUP/"
 ```
 
-Logs go to **stdout** unless `LOG_FILE` is set. When `LOG_FILE` is configured (or defaulted by the
-background launcher to `data/logs/bot.log`), logs rotate automatically at `LOG_MAX_BYTES` (default
-5 MiB) across `LOG_BACKUP_COUNT` private (`0600`) files with configured tokens/API keys redacted.
-Pre-spawn validation failures and early child crashes are recorded in `data/logs/launcher.err`
-(bounded at 1 MiB, `0600`) as well as `stderr`. Use the `GMS-#####` job reference to find log
-lines. Never attach transcripts, receipt images or API keys to support requests.
+Verify the copy succeeded; restrict Windows backup access to the operator account.
+Record `git rev-parse HEAD` and the Python version alongside the backup.
 
-## Update
+To restore: stop triggers and the bot, preserve current files separately, restore
+matching code, `.env` and the **complete** data set, reinstall dependencies, run
+`--check`, start and inspect logs. Never mix a restored DB with stale WAL/SHM files
+or run older code against a newer schema. Test recovery on an isolated copy;
+never connect two copies of the same Telegram session.
 
-1. Pause the cron job, stop the bot, and back up (see below).
-2. Update source and dependencies: `git pull`, then `python -m pip install -r requirements.txt`.
-3. Run `python -m gamas_bot --check`.
-4. Re-enable the cron job or start the bot. Migrations run at startup.
+## Updates and retention
 
-Do not run an older version against a database that has already been migrated.
+Use [Windows update steps](DEPLOY_WINDOWS.md#3-update) or
+[cPanel update steps](DEPLOY_CPANEL.md#5-update-safely). Migrations run at startup.
 
-## Backups
-
-Back up these files after stopping the bot:
-
-- `.env`
-- `data/gamas_v3.db` (use a SQLite-aware backup if the bot is running, so WAL data is included)
-- `data/gamas.session`
-- `data/receipts/`
-
-Keep backups encrypted, outside `public_html` and out of Git.
-
-## Retention and disk
-
-- `RECEIPT_RETENTION_DAYS` (default `90`) deletes old receipt images and clears the payment
-  reference, writing `receipt_expired` to the audit log.
-- `TRANSCRIPT_RETENTION_DAYS` (default `0` = forever) deletes stored text of **finished** jobs
-  (`done`, `partial`, `failed`, `rejected`) in bounded daily batches and logs
-  `transcript_expired`. Pending/processing rows are never touched.
-- Startup removes stale temporary work directories. Temporary job folders are deleted when the
-  job ends.
-
-Shared hosting: keep `MEDIA_WORKER_CONCURRENCY=1` (1 child PyAV process max), `MAX_ACTIVE_JOBS=2..3`,
-a bounded queue (`MAX_QUEUED_JOBS=8`), and conservative file/temp limits so network-bound STT/LLM
-stages run concurrently across users while RAM stays well under 1 GB. If the host kills the
-process or runs out of RAM/disk, move to a VPS; cron cannot bypass account limits.
+- Reviewed receipt images expire after 90 days by default; pending-review receipts,
+  payment rows and ledger history remain.
+- `TRANSCRIPT_RETENTION_DAYS=0` keeps transcript text forever. A positive value
+  removes old finished-job text in bounded batches, not active work.
+- Job temporary files are cleaned after work; startup sweeps stale work directories.
+- Uploaded-document text has no automatic retention policy. Library pruning does
+  not delete this cache. Monitor disk use and plan a privacy policy.

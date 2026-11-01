@@ -1,7 +1,8 @@
-# STT test data
+# STT fixtures
 
-No audio samples are committed. `tests/test_stt.py` uses scripted HTTP responses to test request
-format, language mapping, retries and failover without keys or network calls.
+No audio is committed. `tests/test_stt.py` uses scripted HTTP responses to check
+formats, language mapping, retries and failover without keys or network calls.
 
-For manual testing, keep local audio private and out of Git unless it is synthetic or cleared for
-redistribution. Never commit a lecture recording with personal, medical or student data.
+Keep manual samples private and out of Git unless synthetic or explicitly cleared
+for redistribution. Never commit identifiable student, medical or lecture data.
+See [Testing](../../../docs/TESTING.md) for PowerShell and cPanel/Linux commands.

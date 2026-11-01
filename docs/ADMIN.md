@@ -1,202 +1,43 @@
-# Admin panel and statistics
+# Admin panel
 
-The admin experience is the bot's Telegram panel — there is no separate web dashboard. This page
-documents what each screen shows, how every number is defined, and what the data cannot answer.
+Set numeric IDs in `ADMIN_IDS`; open **🛠 پنل مدیریت** in the bot's private chat.
+There is no web dashboard. Every admin action is authorized; stale keyboards
+do not grant access.
 
-## Opening the panel
+## Daily workflow
 
-Administrators (the numeric ids in `ADMIN_IDS`) see **🛠 پنل مدیریت** in the main menu; it opens the
-dashboard. Every `adm:` callback is authorised against `ADMIN_IDS` before any screen renders, and a
-non-administrator who taps a stale keyboard gets an alert, never data.
+1. Check the dashboard: queue, delivered/failed work and pending receipts.
+2. Open **Payments**, inspect the receipt and frozen order. Verify the transfer
+   outside the bot, then approve explicitly or reject with a reason.
+3. Open **Users** to search by numeric ID/username and inspect status.
+4. Use **System** for provider errors, health and audit history.
+5. Handle tickets in support management: [Support](SUPPORT.md).
 
-Command lines that stay available (sent as ordinary messages):
+Changes are audited/cooldown-limited. Protected actions cannot target yourself or
+another admin. Gift reset restores the quiz and AI-deck gifts, not ledger history.
 
-| Command | Effect |
+## Message commands
+
+| Command | Purpose |
 | --- | --- |
-| `/grant <user id> <hours>` | Add credit hours to a user, audited |
-| `/unlimited <user id> on <reason>` / `off` | Toggle unlimited (special) status, audited |
-| `/ban <user id>` / `/unban <user id>` | Block or restore a user, audited |
+| `/grant <user_id> <hours>` | Add credit |
+| `/unlimited <user_id> on <reason>` | Enable unlimited |
+| `/unlimited <user_id> off` | Disable unlimited |
+| `/ban <user_id>` / `/unban <user_id>` | Block/restore new work |
 
-## Dashboard (`adm:home`)
+Double-check IDs and amounts. Prefer panel details/confirmations to guessed callbacks.
 
-The dashboard answers three questions before anything else:
+## Reading statistics
 
-1. **How many users use the bot?** Registered total, new in the window, active in the window.
-2. **Is processing working and fast?** Requests in the window, delivered vs failed, success rate,
-   end-to-end response time (average / median, p95 once there are samples), and the live queue.
-3. **What needs attention now?** Pending receipt reviews, failures in the window by category,
-   credit expiring within 7 days, database errors, and provider timeouts / rate limits.
+- Reporting windows use **UTC**, not the operator's local timezone.
+- Delivered means `done` + `partial`. Partial delivered a transcript but not a
+  complete booklet; it is not a pre-delivery failure.
+- Request windows use submission creation time; `started_at` records worker pickup.
+- Missing samples are unavailable, not proof of instant work or zero failures.
+- Provider history uses the recorded STT engine. Text/receipt retention does not
+  erase submissions, payments or ledger totals.
+- Reports are read-only and must not mutate billing state.
 
-## Three hubs (`adm:hub:*`)
-
-The panel used to expose nine sibling buttons for payments, users and system health. They are now
-three single-entry hubs. Each hub opens on its most-used view and keeps the rest one tap deeper.
-
-| Hub | Callback | Default view | Deeper |
-| --- | --- | --- | --- |
-| 💳 پرداخت‌ها | `adm:hub:pay` | Pending-receipt orders (order id · user identity · amount · date); tap a row for the order detail with ✅ تأیید / ❌ رد با دلیل | `adm:hub:pay:hist:<status>[:<page>]` (history, filtered by همه / در انتظار / تأییدشده / ردشده), `adm:hub:pay:stats` (the old `adm:ovpay:` statistics) |
-| 👥 کاربران | `adm:hub:usr` | Search box: send a numeric id or `@username`; the recent-user list is under it | `adm:hub:usr:stats` (old `adm:ovu:` report), `adm:hub:usr:pending` (users with receipts awaiting review), `adm:hub:usr:banned` (blocked list), `adm:hub:usr:card:<id>` (user card) |
-| 🩺 سامانه | `adm:hub:sys` | Live status: uptime, live jobs, peak memory, database/WAL size, last successful processing, provider state | `adm:hub:sys:proc` (stage timings, failure categories, STT engine usage, failover counts, daily chart) |
-
-Broadcast, support management, the audit trail and the leaderboard belong to none of those groups
-and are unchanged at the top level. The admin menu is exactly:
-
-```
-📊 آمار و وضعیت   💳 پرداخت‌ها
-👥 کاربران        🩺 سامانه
-🎧 مدیریت پشتیبانی
-📣 ارسال پیام     🛡 گزارش فعالیت‌ها
-🏆 برترین کاربران
-↩️ پنل کاربری
-```
-
-**Old callbacks still work.** `adm:ovpay:<window>`, `adm:ovu:<window>`, `adm:ovp:<window>`,
-`adm:ovs`, `adm:pay[:page]`, `adm:ph:<page>`, `adm:users` and `adm:pd:<id>` are all still routed, so
-an admin whose keyboard was rendered before the deploy never hits a dead button. The four report
-screens keep their window selector (`adm:ov*:<window>`) and a way back to the dashboard.
-
-The dashboard (`adm:home`) itself keeps the three questions and the window selector, and offers the
-three hubs instead of the four old drill-down buttons.
-
-## User identity everywhere
-
-Every admin list and card renders `@username · شناسه: <id> · <name>`, with an em dash where
-Telegram never reported a username. The numeric id is always present next to the handle: a
-`@username` can be renamed or reused, so it is never shown without the id that owns the row.
-
-The user card (`adm:hub:usr:card:<id>`) shows the handle, the id, the display name, credit,
-order count, deck count, both free-gift states, join and last-seen timestamps, and actions:
-
-| Button | Callback | Effect |
-| --- | --- | --- |
-| 🔄 بازنشانی هدیه رایگان | `adm:hub:usr:fr:<id>` → `adm:hub:usr:frx:<id>` | Restores the user's free first flashcard deck and free first quiz (confirmation first), audited as `free_use_reset` |
-| 🚫 مسدودکردن / ✅ رفع مسدودی | `adm:hub:usr:tg:<id>` | Toggles the ban flag, audited |
-
-Search accepts both forms: a numeric id resolves exactly, `@username` resolves case-insensitively
-and offers a choice when several accounts share the handle. Reset confirmation is required and a
-reset invalidates old in-flight claim tokens; an older success or refund cannot consume the new
-entitlement. Blocking another administrator is refused. Payment status transitions, ledger writes
-and the `ADMIN_IDS` check are unchanged.
-
-## Users (identity columns)
-
-Migration 013 adds `users.username`, `users.last_name` and `users.last_seen_at`. The upsert on every
-authorised interaction refreshes them; `username` is nullable because Telegram users may have none.
-`telegram_id` is SQLite `INTEGER` end to end, so ids above 2^53 round-trip exactly.
-Migration 014 adds the missing library-owner foreign key while keeping library ids and learning links.
-`Database.assert_user_reference_integrity()` checks declared user/learning/billing relationships,
-orphans and SQLite `foreign_key_check`. Startup logs violations rather than blocking old deployments
-whose plan catalog may not yet have been synchronised; run the strict check after catalog sync when
-verifying an upgrade. Back up the database before migration.
-
-Windows: **امروز** is the current UTC day; **۷ روز / ۳۰ روز** are rolling windows ending now; **کل**
-is the whole history. Reporting is UTC end to end, because every timestamp is stored as UTC
-ISO-8601. A Persian (Jalali) label is shown for the window start; the boundary itself is UTC.
-
-## Metric definitions
-
-Period figures filter on the row's `submissions.created_at` or `payments.created_at`. "Snapshot"
-figures describe the current state and ignore the window. Every figure below is computed from
-authoritative rows — nothing is estimated, extrapolated, or filled in.
-
-### Users
-
-| Metric | Definition |
-| --- | --- |
-| کل ثبت‌شده | `COUNT(*)` of `users` |
-| جدید در بازه | Users whose `joined_at` is inside the window |
-| فعال در بازه | Distinct `submissions.user_id` for rows created in the window |
-| تحویل‌گرفته در بازه | Distinct user ids with at least one submission in the window in status `done` or `partial` |
-| مسدود | `users.banned = 1` (snapshot) |
-| ویژه | `users.is_unlimited = 1` (snapshot) |
-
-A user who only opens the menu and never uploads is counted as registered but not active: the bot
-does not persist a "last seen" timestamp.
-
-### Processing
-
-| Metric | Definition |
-| --- | --- |
-| درخواست در بازه | Submissions created in the window, all statuses |
-| تحویل‌شده | `done` + `partial` — the raw transcript reached the user. `partial` means the booklet failed after the transcript was delivered |
-| ناموفق/ردشده | `failed` + `rejected` — the user received nothing. `rejected` covers admission refusals (queue full, active-jobs limit, banned account) |
-| نرخ موفقیت | `delivered / (delivered + failed + rejected)`; blank (`—`) when nothing reached a terminal state yet |
-| انتظار در صف | `started_at − created_at` per job (average, median, p95, max) |
-| پردازش خالص | `finished_at − started_at` |
-| پایان به پایان | `finished_at − created_at` |
-| p95 | Shown only when the sample has at least 20 rows; below that the median and the sample count are shown instead, because a p95 over a handful of jobs is noise |
-| زمان مرحله‌ها | Per-stage seconds from the in-process collector, i.e. since this process started, not for the window |
-| خطاهای بازه | Failed/rejected rows in the window grouped by their recorded category |
-| موتور تبدیل گفتار | `submissions.stt_engine`, so the count survives transcript retention |
-| جایگزینی خودکار | Provider failover counts from the in-process collector (since process start) |
-
-Failure categories are recorded once, when the job fails, and never overwritten:
-
-`input` (rejected file/request), `download`, `media`, `stt`, `notes`, `delivery`, `billing`,
-`database`, `cancelled`, `capacity` (admission refusal), `banned`, `internal`, `unclassified`
-(rows written before migration 009).
-
-Rows created before migration 009 have no `started_at`, so they are counted in volume but excluded
-from queue-wait and processing-time figures. The screens show the sample count next to every timing
-so that is visible; nothing is reported as zero for those rows.
-
-### Payments and credit
-
-| Metric | Definition |
-| --- | --- |
-| در انتظار بررسی | Receipt-backed orders in `pending`/`pending_review` (snapshot) |
-| ایجادشده در بازه | Orders created in the window, by status |
-| تأییدشده / ردشده در بازه | Orders decided in the window, by `status` |
-| مبلغ تأییدشده | Sum of `purchased_price` (the price frozen at purchase) over approved orders in the window — never the plan's current price, never a pending or rejected order |
-| نرخ تأیید | Approved / (approved + rejected) in the window |
-| اعتبار در حال انقضا | Credit ledger lots with an `expires_at` within the next 7 days (count and total seconds). Lots without an expiry never appear |
-
-### System health
-
-| Metric | Definition |
-| --- | --- |
-| زمان اجرا | Seconds since this process started |
-| کارها | Live active/queued job counts and their peaks since start |
-| حافظهٔ اوج | Process high-water RSS from the OS |
-| پایگاه‌داده / WAL | Size of the SQLite file and its `-wal` sidecar |
-| خطاهای پایگاه‌داده | Failed SQLite transactions since start |
-| آخرین پردازش موفق | `MAX(finished_at)` over `done`/`partial`, or «ثبت نشده» |
-| ارائه‌دهنده‌ها | Per-provider in-flight/peak, success rate, timeouts, rate limits, server errors since start |
-| نگهداری | Configured `RECEIPT_RETENTION_DAYS` and `TRANSCRIPT_RETENTION_DAYS` |
-
-## What the panel deliberately does not show
-
-- **Per-user balances and quota consumption by plan.** Balances are derived per user from the
-  ledger; aggregating them for every user on a dashboard tap is a full ledger scan for a number
-  that changes with every job. The user's own balance is on «🛒 خرید اشتراک», and the ledger is
-  authoritative in the database.
-- **LLM token usage and cost.** Provider responses include usage, and the client logs it for
-  debugging, but it is not persisted per request, so no period total can be computed. Making this a
-  panel metric would need a new table.
-- **LLM per-request latency for a window.** Stage timings are in-process only (since start).
-- **Queue wait for jobs that started before migration 009.** Not recorded, so those rows are
-  excluded rather than counted as instantaneous.
-- **Revenue from pending receipts.** Deliberately excluded everywhere.
-
-## Cost and freshness
-
-The dashboard runs one `SELECT` per figure (about 14, plus three timing series) against the
-read-only WAL connection. There is no per-row query and no cached copy, so every screen shows the
-state as of the moment it is opened. Two consequences worth knowing:
-
-- A figure is internally consistent, but two figures on the same screen come from separate
-  statements; a job that finishes in between can move one number and not the other.
-- Picking «کل» sorts every finished job to compute median/p95. On a large database that is the most
-  expensive screen in the panel. `python -m scripts.admin_report_bench` measures it on synthetic
-  data (see [Performance](PERFORMANCE.md)); on 20 000 submissions the whole dashboard is ~30 ms for
-  a 7-day window and ~170 ms for all history, while the user/payment screens skip the sorting
-  entirely (~35 ms).
-
-The screens that do not display timings pass `with_timings=False`, so they never pay for them.
-
-## Retention interaction
-
-`TRANSCRIPT_RETENTION_DAYS` deletes transcript rows; it does not delete submissions, payments, the
-ledger or the recorded STT engine, so processing history and payment totals remain complete. What
-does expire: the transcript text itself, and reviewed receipt images after `RECEIPT_RETENTION_DAYS`
-(pending receipts are never deleted).
+Telemetry is not a provider invoice. Investigate with job references and redacted
+logs. Never broadcast private content or keys.
+[Billing](BILLING.md) · [Host operations](OPERATIONS.md)

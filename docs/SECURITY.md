@@ -2,57 +2,41 @@
 
 ## Operator checklist
 
-- Keep the project, `.env`, database, Telegram session, logs, temporary files and receipts
-  **outside `public_html`**. Run `python -m scripts.cpanel_preflight` on cPanel.
-- `chmod 600 .env`; `chmod 700 data/`. Never commit or share secrets, sessions or backups.
-- Run one bot process per token/session. The instance lock enforces it.
-- Limit uploads, queue size and temporary storage to what the plan can handle.
-- Back up encrypted and store backups outside the web root.
+- Keep `.env`, DB, session, logs, receipts, backups and temporary files outside
+  `public_html` and every web root, on a private local filesystem.
+- On cPanel use owner-only permissions: files `600`, private directories `700`.
+  On Windows restrict folder access to the operator account.
+- Never commit keys or user files. Rotate exposed keys; treat sessions as credentials.
+- Use one process per token/session; never bypass an active lock.
+- Back up before updates. Use audited credit operations, not ledger-history edits.
 
-## What the bot enforces
+## Data handling
 
-- No user input reaches a shell. Media runs in a bounded child process with no shell and no
-  network protocols.
-- Downloads are size-checked before and after transfer and abort when they stop making progress.
-- Receipts must be valid JPEG/PNG/WebP images, decoded under a pixel limit and re-encoded before
-  storage. Paths are validated before reads/deletes.
-- PowerPoint ZIPs are checked for entry count, names, expanded size, symlinks and compression;
-  members are streamed under limits.
-- Admin actions require an admin ID and a private chat; callbacks fail closed; admin writes and
-  broadcasts are cooldown-limited.
-- API keys come from the environment or `.env`, never SQLite, and are redacted from error text.
-- Logs contain job references and metadata, not transcripts, receipt content or keys.
-- The database, session, receipt directory and logs are created owner-only where the filesystem
-  supports it.
+Audio goes to configured STT providers; text to configured note/learning providers.
+OCR is off by default; enabling it sends scans/photos to **i2ocr.com**. Review
+provider policies and obtain appropriate consent before sensitive processing.
+Do not promise third-party confidentiality or deletion guarantees.
 
-## Data sent to providers
+SQLite stores text, learning, billing, tickets and audit data. Generated files stay
+in Telegram; the library stores message references. Library pruning does **not**
+erase the document-text cache, which has no automatic retention or self-service
+deletion policy. See [retention](OPERATIONS.md#updates-and-retention).
 
-Audio is sent to the configured STT provider. Lecture transcripts, document notes and optional
-Office AI planning are sent only to the existing configured note-provider routes. Office never starts
-STT/transcription. Review each provider's retention and privacy terms before enabling it.
-With `OCR_ENABLED=true` (off by default) the rendered page images of a text-poor document, or an
-uploaded photo, are uploaded to i2ocr.com; its published policy deletes them within 30 minutes.
-Pages that already have a text layer, and every `.docx`/`.pptx`, never leave the host. See
-[OCR](OCR.md). The raw
-transcript is delivered before lecture note generation; once delivered, its transcription charge
-stands even if the booklet later fails. Free Office/document-note operations themselves have no user
-wallet or free-use charge; configured provider use may still incur operator-side costs.
+Office drafts stay in memory, expire after TTL and clear on navigation/shutdown.
+Temporary files are private and cleaned after work. Office is free to users,
+but configured AI calls may cost the operator.
 
-The database stores submissions, transcripts, notes, billing, audit records, extracted booklet and
-uploaded-document text, and the Telegram chat/message references used by each user's library;
-generated files themselves stay in Telegram. `LIBRARY_MAX_ITEMS` bounds normal retained references
-per user, except sources protected by active quizzes. It does **not** bound the separate document
-text cache: uploaded-document extracts currently have no automatic retention or self-service delete
-policy, even if their library mirror is pruned. Plan disk and privacy procedures accordingly.
-Free Office drafts are held only in the bot process's memory, keyed by the private Telegram user id,
-limited to 128 concurrent users/200 parts each, and swept after `OFFICE_SESSION_TTL_MINUTES` (default
-30 minutes), on navigation and at shutdown. Temporary source/output files live under the private
-`TEMP_DIR` and are removed in `finally`; Office code does not log document text or contents. The
-existing extracted-document text is cached in SQLite and currently has no automatic retention or
-self-service deletion policy; transcript retention is separate and configurable in `.env` (see
-[Operations](OPERATIONS.md)).
+## Boundaries
 
-## Report a vulnerability
+- Admin authorization fails closed; private callbacks check ownership.
+- Only channel-membership infrastructure errors deliberately fail open. Confirmed
+  non-membership blocks access; billing, bans and admin checks still apply.
+- Receipts are validated, pixel-limited and re-encoded before private storage.
+  Paths are validated before reads/deletion.
+- Media uses fixed arguments, no shell and bounded child processes. Document parsing
+  uses bounded threads, not an OS memory/CPU sandbox.
+- Logs contain metadata/references, never keys, transcript/document text or receipts.
+  Review redaction before sharing diagnostics.
 
-Contact the repository maintainer privately. Do not publish exploits, user data or credentials in
-a public issue.
+Report vulnerabilities privately to the maintainer. Do not publish credentials,
+user data or exploit details in public issues.
