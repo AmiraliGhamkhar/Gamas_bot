@@ -11,6 +11,7 @@ from typing import Any
 
 from telethon import Button
 
+from . import texts
 from .bot_ui import (
     CATEGORY_FILTER_LABELS,
     SUPPORT_CATEGORY_BUTTONS,
@@ -57,19 +58,21 @@ class SupportWorkflowMixin:
         """Render complete messages; Telegram-sized chunks are handled later."""
         lines: list[str] = []
         if total > offset + len(messages):
-            lines.append("… پیام‌های قدیمی‌تر در صفحهٔ بعدی")
+            lines.append(texts.SUPPORT_OLDER_MESSAGES)
         for message in messages:
             if message["sender_role"] == "admin":
-                who = "🎧 پشتیبانی"
+                who = texts.SUPPORT_WHO_STAFF
             elif viewer == "admin":
-                who = f"👤 کاربر {message['sender_id']}"
+                who = texts.SUPPORT_WHO_USER_TEMPLATE.format(
+                    sender_id=message["sender_id"]
+                )
             else:
-                who = "👤 شما"
+                who = texts.SUPPORT_WHO_YOU
             lines.append(
                 f"{who} · {self._support_when(message['created_at'])}\n"
                 f"{message['message_text']}"
             )
-        return "\n\n".join(lines) if lines else "هنوز پیامی ثبت نشده است."
+        return "\n\n".join(lines) if lines else texts.SUPPORT_EMPTY_THREAD
 
     async def _show_ticket_screen(self, event: Any, text: str, buttons: Any) -> None:
         """Send every character of a history without exceeding Telegram limits."""
@@ -99,14 +102,11 @@ class SupportWorkflowMixin:
             logger.warning("support notification not delivered to the account")
 
     async def _show_support_home(self, event: Any) -> None:
-        text = (
-            "🎧 پشتیبانی\n\n"
-            "برای ثبت درخواست جدید یا پیگیری درخواست‌های قبلی، یکی از گزینه‌ها را انتخاب کنید."
-        )
+        text = texts.SUPPORT_MENU
         buttons = [
-            [Button.inline("➕ درخواست جدید", b"sup:new")],
-            [Button.inline("📋 درخواست‌های من", b"sup:list")],
-            [Button.inline("↩️ منوی اصلی", b"menu:main")],
+            [Button.inline(texts.BTN_NEW_TICKET, b"sup:new")],
+            [Button.inline(texts.BTN_MY_TICKETS, b"sup:list")],
+            [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
         ]
         await self._edit_or_reply(event, text, buttons)  # type: ignore[attr-defined]
 
@@ -115,9 +115,9 @@ class SupportWorkflowMixin:
             [Button.inline(label, f"sup:cat:{key}".encode())]
             for key, label in SUPPORT_CATEGORY_BUTTONS.items()
         ]
-        buttons.append([Button.inline("↩️ بازگشت", b"support")])
+        buttons.append([Button.inline(texts.BTN_BACK, b"support")])
         await self._edit_or_reply(  # type: ignore[attr-defined]
-            event, "دسته‌بندی درخواست را انتخاب کنید:", buttons
+            event, texts.SUPPORT_CHOOSE_CATEGORY, buttons
         )
 
     async def _show_user_tickets(
@@ -132,9 +132,11 @@ class SupportWorkflowMixin:
         has_more = len(rows) > self.SUPPORT_PAGE_SIZE
         rows = rows[: self.SUPPORT_PAGE_SIZE]
         if not rows and page == 0:
-            text = "شما هنوز درخواستی ثبت نکرده‌اید."
+            text = texts.SUPPORT_NO_TICKETS
         else:
-            text = f"📋 درخواست‌های شما — صفحهٔ {to_persian_digits(page + 1)}"
+            text = texts.SUPPORT_LIST_TITLE_TEMPLATE.format(
+                page=to_persian_digits(page + 1)
+            )
         buttons = [
             [
                 Button.inline(
@@ -146,13 +148,13 @@ class SupportWorkflowMixin:
         ]
         nav = []
         if page > 0:
-            nav.append(Button.inline("◀️ قبلی", f"sup:lp:{page - 1}".encode()))
+            nav.append(Button.inline(texts.BTN_PREV, f"sup:lp:{page - 1}".encode()))
         if has_more:
-            nav.append(Button.inline("بعدی ▶️", f"sup:lp:{page + 1}".encode()))
+            nav.append(Button.inline(texts.BTN_NEXT, f"sup:lp:{page + 1}".encode()))
         if nav:
             buttons.append(nav)
-        buttons.append([Button.inline("➕ درخواست جدید", b"sup:new")])
-        buttons.append([Button.inline("↩️ بازگشت", b"support")])
+        buttons.append([Button.inline(texts.BTN_NEW_TICKET, b"sup:new")])
+        buttons.append([Button.inline(texts.BTN_BACK, b"support")])
         await self._edit_or_reply(event, text, buttons)  # type: ignore[attr-defined]
 
     async def _owned_ticket(self, user_id: int, ticket_id: int) -> dict | None:
@@ -167,7 +169,7 @@ class SupportWorkflowMixin:
     ) -> None:
         ticket = await self._owned_ticket(user_id, ticket_id)
         if ticket is None:
-            await self._ack(event, "این درخواست پیدا نشد.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, texts.SUPPORT_TICKET_NOT_FOUND, alert=True)  # type: ignore[attr-defined]
             await self._show_user_tickets(event, user_id)
             return
         page = max(0, page)
@@ -176,32 +178,32 @@ class SupportWorkflowMixin:
         messages = await self.db.ticket_messages(
             ticket_id, limit=self.SUPPORT_HISTORY_PAGE, offset=offset
         )
-        head = (
-            f"🎫 درخواست {ticket['public_ticket_id']}\n"
-            f"دسته: {self._support_category_label(ticket['category'])}\n"
-            f"وضعیت: {self._support_status_label(ticket['status'])}\n"
-            f"موضوع: {ticket['subject']}\n"
-            f"ثبت: {self._support_when(ticket['created_at'])}\n"
-        )
+        head = texts.SUPPORT_TICKET_HEADER_TEMPLATE.format(
+            ticket_id=ticket["public_ticket_id"],
+            category=self._support_category_label(ticket["category"]),
+            status=self._support_status_label(ticket["status"]),
+            subject=ticket["subject"],
+            created=self._support_when(ticket["created_at"]),
+        ) + "\n"
         history = self._support_history_text(messages, total, offset)
         text = f"{head}\n{history}"
         buttons = []
         if ticket["status"] != "closed":
             buttons.append(
-                [Button.inline("✍️ پاسخ به پشتیبانی", f"sup:r:{ticket_id}".encode())]
+                [Button.inline(texts.BTN_REPLY_STAFF, f"sup:r:{ticket_id}".encode())]
             )
             buttons.append(
-                [Button.inline("✅ بستن درخواست", f"sup:c:{ticket_id}".encode())]
+                [Button.inline(texts.BTN_CLOSE_TICKET, f"sup:c:{ticket_id}".encode())]
             )
         else:
             buttons.append(
-                [Button.inline("🔁 باز کردن دوباره", f"sup:o:{ticket_id}".encode())]
+                [Button.inline(texts.BTN_REOPEN_TICKET, f"sup:o:{ticket_id}".encode())]
             )
         if total > offset + self.SUPPORT_HISTORY_PAGE:
             buttons.append(
                 [
                     Button.inline(
-                        "پیام‌های قدیمی‌تر ▶️",
+                        texts.BTN_OLDER_MESSAGES,
                         f"sup:v:{ticket_id}:{page + 1}".encode(),
                     )
                 ]
@@ -210,12 +212,12 @@ class SupportWorkflowMixin:
             buttons.append(
                 [
                     Button.inline(
-                        "◀️ پیام‌های جدیدتر",
+                        texts.BTN_NEWER_MESSAGES,
                         f"sup:v:{ticket_id}:{page - 1}".encode(),
                     )
                 ]
             )
-        buttons.append([Button.inline("↩️ درخواست‌های من", b"sup:list")])
+        buttons.append([Button.inline(texts.BTN_BACK_SUPPORT, b"sup:list")])
         await self._show_ticket_screen(event, text, buttons)
 
     async def _handle_support_callback(
@@ -231,14 +233,12 @@ class SupportWorkflowMixin:
         if data.startswith("sup:cat:"):
             category = parts[2] if len(parts) == 3 else ""
             if category not in SUPPORT_CATEGORY_BUTTONS:
-                await self._ack(event, "این دسته معتبر نیست.", alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, texts.SUPPORT_BAD_CATEGORY, alert=True)  # type: ignore[attr-defined]
                 return
             self._support_states[user_id] = ("new", category)
             await event.respond(
-                f"{SUPPORT_CATEGORY_BUTTONS[category]}\n\n"
-                "موضوع یا شرح کوتاه مشکل را در یک پیام بفرستید (حداکثر ۴۰۰ نویسه).\n"
-                "برای لغو، /cancel بفرستید.",
-                buttons=[[Button.inline("🔙 بازگشت", b"sup:new")]],
+                f"{SUPPORT_CATEGORY_BUTTONS[category]}\n\n{texts.SUPPORT_SUBJECT_PROMPT}",
+                buttons=[[Button.inline(texts.BTN_BACK, b"sup:new")]],
             )
             return
         if data == "sup:list":
@@ -249,7 +249,7 @@ class SupportWorkflowMixin:
             return
         ticket_id = _to_int(parts[2]) if len(parts) >= 3 else None
         if ticket_id is None:
-            await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, texts.SUPPORT_INVALID_REQUEST, alert=True)  # type: ignore[attr-defined]
             return
         if parts[1] == "v":
             page = (_to_int(parts[3]) or 0) if len(parts) > 3 else 0
@@ -259,20 +259,21 @@ class SupportWorkflowMixin:
             if ticket is None or ticket["status"] == "closed":
                 await self._ack(  # type: ignore[attr-defined]
                     event,
-                    "این درخواست پاسخ‌پذیر نیست؛ ابتدا آن را باز کنید.",
+                    texts.SUPPORT_TICKET_NOT_REPLYABLE,
                     alert=True,
                 )
                 return
             self._support_states[user_id] = ("reply", ticket_id)
             await event.respond(
-                f"پیام خود را برای درخواست {ticket['public_ticket_id']} بفرستید.\n"
-                "برای لغو، /cancel بفرستید.",
-                buttons=[[Button.inline("🔙 بازگشت", f"sup:v:{ticket_id}".encode())]],
+                texts.SUPPORT_REPLY_PROMPT_TEMPLATE.format(
+                    ticket_id=ticket["public_ticket_id"]
+                ),
+                buttons=[[Button.inline(texts.BTN_BACK, f"sup:v:{ticket_id}".encode())]],
             )
         elif parts[1] == "c":
             ticket = await self._owned_ticket(user_id, ticket_id)
             if ticket is None:
-                await self._ack(event, "این درخواست پیدا نشد.", alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, texts.SUPPORT_TICKET_NOT_FOUND, alert=True)  # type: ignore[attr-defined]
                 return
             try:
                 closed = await self.db.close_ticket(ticket_id, user_id, admin=False)
@@ -281,14 +282,16 @@ class SupportWorkflowMixin:
             if closed:
                 owner = await self._identity_for_id(user_id)  # type: ignore[attr-defined]
                 await self._notify_admins(
-                    f"🔒 کاربر {owner} درخواست {ticket['public_ticket_id']} را بست."
+                    texts.SUPPORT_CLOSED_BY_USER_TEMPLATE.format(
+                        owner=owner, ticket_id=ticket["public_ticket_id"]
+                    )
                 )
                 logger.info("support ticket closed by user ticket=%s", ticket_id)
             await self._show_user_ticket(event, user_id, ticket_id)
         elif parts[1] == "o":
             ticket = await self._owned_ticket(user_id, ticket_id)
             if ticket is None:
-                await self._ack(event, "این درخواست پیدا نشد.", alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, texts.SUPPORT_TICKET_NOT_FOUND, alert=True)  # type: ignore[attr-defined]
                 return
             try:
                 reopened = await self.db.reopen_ticket(ticket_id, user_id, admin=False)
@@ -297,12 +300,14 @@ class SupportWorkflowMixin:
             if reopened:
                 owner = await self._identity_for_id(user_id)  # type: ignore[attr-defined]
                 await self._notify_admins(
-                    f"🔁 کاربر {owner} درخواست {ticket['public_ticket_id']} را دوباره باز کرد."
+                    texts.SUPPORT_REOPENED_BY_USER_TEMPLATE.format(
+                        owner=owner, ticket_id=ticket["public_ticket_id"]
+                    )
                 )
                 logger.info("support ticket reopened by user ticket=%s", ticket_id)
             await self._show_user_ticket(event, user_id, ticket_id)
         else:
-            await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, texts.SUPPORT_INVALID_REQUEST, alert=True)  # type: ignore[attr-defined]
 
     async def _handle_support_text(
         self, event: Any, user_id: int, state: tuple, text: str
@@ -310,9 +315,7 @@ class SupportWorkflowMixin:
         """The next plain message of a user who opened a support prompt."""
         kind, value = state
         if not text:
-            await event.reply(
-                "لطفاً پیام خود را به‌صورت متن بفرستید؛ برای لغو /cancel بفرستید."
-            )
+            await event.reply(texts.SUPPORT_TEXT_ONLY)
             return
         if kind == "new":
             try:
@@ -324,42 +327,41 @@ class SupportWorkflowMixin:
                     telegram_message_id=getattr(event.message, "id", None),
                 )
             except ValueError:
-                await event.reply("موضوع باید بین ۲ تا ۴۰۰ نویسه باشد؛ دوباره بنویسید.")
+                await event.reply(texts.SUPPORT_SUBJECT_LENGTH)
                 return
             self._support_states.pop(user_id, None)
             logger.info(
                 "support ticket created ticket=%s category=%s", ticket["id"], value
             )
             await event.reply(
-                "✅ درخواست شما ثبت شد.\n"
-                f"شماره پیگیری: {ticket['public_ticket_id']}\n"
-                "از همین بخش می‌توانید پاسخ‌ها را پیگیری کنید.",
+                texts.SUPPORT_CREATED.format(ticket_id=ticket["public_ticket_id"]),
                 buttons=[
                     [
                         Button.inline(
-                            "📋 مشاهدهٔ درخواست", f"sup:v:{ticket['id']}".encode()
+                            texts.BTN_VIEW_TICKET, f"sup:v:{ticket['id']}".encode()
                         )
                     ]
                 ],
             )
             owner = await self._identity_for_id(user_id)  # type: ignore[attr-defined]
             await self._notify_admins(
-                "🎧 درخواست پشتیبانی جدید\n"
-                f"شماره: {ticket['public_ticket_id']}\n"
-                f"کاربر: {owner}\n"
-                f"دسته: {self._support_category_label(value)}\n"
-                f"موضوع: {ticket['subject']}",
+                texts.SUPPORT_ADMIN_NEW_TICKET.format(
+                    ticket_id=ticket["public_ticket_id"],
+                    owner=owner,
+                    category=self._support_category_label(value),
+                    subject=ticket["subject"],
+                ),
                 buttons=[
                     [
                         Button.inline(
-                            "🔎 بررسی درخواست", f"adm:sv:{ticket['id']}".encode()
+                            texts.BTN_REVIEW_TICKET, f"adm:sv:{ticket['id']}".encode()
                         )
                     ]
                 ],
             )
             return
         if len(text) > self.db.SUPPORT_MESSAGE_MAX:
-            await event.reply("پیام باید حداکثر ۴۰۰۰ نویسه باشد؛ کوتاه‌تر بنویسید.")
+            await event.reply(texts.SUPPORT_MESSAGE_TOO_LONG)
             return
         try:
             await self.db.add_ticket_message(
@@ -371,9 +373,7 @@ class SupportWorkflowMixin:
             )
         except (ValueError, PermissionError, TicketStateError):
             self._support_states.pop(user_id, None)
-            await event.reply(
-                "این درخواست دیگر پاسخ‌پذیر نیست؛ ابتدا آن را باز کنید."
-            )
+            await event.reply(texts.SUPPORT_TICKET_NOT_REPLYABLE)
             return
         self._support_states.pop(user_id, None)
         refreshed_ticket = await self.db.get_ticket(value)
@@ -381,25 +381,29 @@ class SupportWorkflowMixin:
             refreshed_ticket["public_ticket_id"] if refreshed_ticket else str(value)
         )
         await event.reply(
-            "✅ پیام شما ثبت شد.",
-            buttons=[[Button.inline("📋 مشاهدهٔ درخواست", f"sup:v:{value}".encode())]],
+            texts.SUPPORT_MESSAGE_SAVED,
+            buttons=[
+                [Button.inline(texts.BTN_VIEW_TICKET, f"sup:v:{value}".encode())]
+            ],
         )
         owner = await self._identity_for_id(user_id)  # type: ignore[attr-defined]
         await self._notify_admins(
-            f"💬 پیام جدیدی در درخواست {public_id} ثبت شد.\nکاربر: {owner}",
-            buttons=[[Button.inline("🔎 بررسی درخواست", f"adm:sv:{value}".encode())]],
+            texts.SUPPORT_NEW_MESSAGE_ADMIN.format(
+                ticket_id=public_id, owner=owner
+            ),
+            buttons=[
+                [Button.inline(texts.BTN_REVIEW_TICKET, f"adm:sv:{value}".encode())]
+            ],
         )
 
     async def _handle_admin_support_text(
         self, event: Any, admin_id: int, ticket_id: int, text: str
     ) -> None:
         if not text:
-            await event.reply(
-                "پاسخ باید متن داشته باشد؛ دوباره متن را بفرستید یا /cancel بزنید."
-            )
+            await event.reply(texts.SUPPORT_REPLY_NEEDS_TEXT)
             return
         if len(text) > self.db.SUPPORT_MESSAGE_MAX:
-            await event.reply("پاسخ باید حداکثر ۴۰۰۰ نویسه باشد؛ کوتاه‌تر بنویسید.")
+            await event.reply(texts.SUPPORT_MESSAGE_TOO_LONG)
             return
         try:
             await self.db.add_ticket_message(
@@ -412,7 +416,7 @@ class SupportWorkflowMixin:
         except (ValueError, TicketStateError):
             self._support_admin_states.pop(admin_id, None)
             await event.reply(
-                "این درخواست دیگر پاسخ‌پذیر نیست؛ ابتدا آن را باز کنید.",
+                texts.SUPPORT_TICKET_NOT_REPLYABLE,
                 buttons=self._admin_menu(),  # type: ignore[attr-defined]
             )
             return
@@ -421,17 +425,17 @@ class SupportWorkflowMixin:
         public_id = ticket["public_ticket_id"] if ticket else str(ticket_id)
         logger.info("support admin reply ticket=%s", ticket_id)
         await event.reply(
-            f"✅ پاسخ به درخواست {public_id} ثبت شد.",
+            texts.SUPPORT_REPLY_SAVED_ADMIN.format(ticket_id=public_id),
             buttons=[
-                [Button.inline("🔎 مشاهدهٔ درخواست", f"adm:sv:{ticket_id}".encode())]
+                [Button.inline(texts.BTN_REVIEW_TICKET, f"adm:sv:{ticket_id}".encode())]
             ],
         )
         if ticket is not None:
             await self._notify_user(
                 int(ticket["user_id"]),
-                f"📩 پاسخ جدیدی برای درخواست {public_id} ثبت شده است.",
+                texts.SUPPORT_REPLY_NOTICE_USER.format(ticket_id=public_id),
                 buttons=[
-                    [Button.inline("📋 مشاهدهٔ پاسخ", f"sup:v:{ticket_id}".encode())]
+                    [Button.inline(texts.BTN_VIEW_REPLY, f"sup:v:{ticket_id}".encode())]
                 ],
             )
 
@@ -459,13 +463,13 @@ class SupportWorkflowMixin:
             + counts.get("awaiting_user", 0)
         )
         new_open_count = counts.get("open", 0) + counts.get("awaiting_admin", 0)
-        text = (
-            "🎧 مدیریت پشتیبانی\n\n"
-            f"فعال: {to_persian_digits(open_count)} | "
-            f"جدید: {to_persian_digits(new_open_count)} | "
-            f"منتظر پاسخ شما: {to_persian_digits(counts.get('awaiting_admin', 0))} | "
-            f"بسته: {to_persian_digits(counts.get('closed', 0))}\n"
-            f"فهرست: {VIEW_LABELS.get(view, view)} — دسته: {CATEGORY_FILTER_LABELS.get(category, category)}"
+        text = texts.SUPPORT_ADMIN_HEADER_TEMPLATE.format(
+            open_count=to_persian_digits(open_count),
+            new_count=to_persian_digits(new_open_count),
+            waiting_count=to_persian_digits(counts.get("awaiting_admin", 0)),
+            closed_count=to_persian_digits(counts.get("closed", 0)),
+            view=VIEW_LABELS.get(view, view),
+            category=CATEGORY_FILTER_LABELS.get(category, category),
         )
         buttons = [
             [
@@ -487,7 +491,7 @@ class SupportWorkflowMixin:
                     VIEW_LABELS["closed"], f"adm:sl:closed:{category}:0".encode()
                 ),
             ],
-            [Button.inline("📂 همه دسته‌ها", f"adm:sl:{view}:all:0".encode())],
+            [Button.inline(texts.BTN_ALL_CATEGORIES, f"adm:sl:{view}:all:0".encode())],
             [
                 Button.inline(label, f"adm:sl:{view}:{key}:0".encode())
                 for key, label in SUPPORT_CATEGORY_BUTTONS.items()
@@ -521,20 +525,20 @@ class SupportWorkflowMixin:
         if page > 0:
             nav.append(
                 Button.inline(
-                    "◀️ قبلی", f"adm:sl:{view}:{category}:{page - 1}".encode()
+                    texts.BTN_PREV, f"adm:sl:{view}:{category}:{page - 1}".encode()
                 )
             )
         if has_more:
             nav.append(
                 Button.inline(
-                    "بعدی ▶️", f"adm:sl:{view}:{category}:{page + 1}".encode()
+                    texts.BTN_NEXT, f"adm:sl:{view}:{category}:{page + 1}".encode()
                 )
             )
         if nav:
             buttons.append(nav)
         if not rows:
-            text += "\n\nدرخواستی در این فهرست نیست."
-        buttons.append([Button.inline("↩️ پنل مدیریت", b"adm:home")])
+            text += texts.SUPPORT_EMPTY_LIST
+        buttons.append([Button.inline(texts.BTN_BACK_ADMIN, b"adm:home")])
         await self._edit_or_reply(event, text, buttons)  # type: ignore[attr-defined]
 
     async def _show_admin_ticket(
@@ -542,7 +546,7 @@ class SupportWorkflowMixin:
     ) -> None:
         ticket = await self.db.get_ticket(ticket_id)
         if ticket is None:
-            await self._ack(event, "این درخواست پیدا نشد.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, texts.SUPPORT_TICKET_NOT_FOUND, alert=True)  # type: ignore[attr-defined]
             await self._show_admin_support(event)
             return
         page = max(0, page)
@@ -554,15 +558,15 @@ class SupportWorkflowMixin:
             offset=offset,
         )
         owner = await self._identity_for_id(int(ticket["user_id"]))  # type: ignore[attr-defined]
-        head = (
-            f"🎫 درخواست {ticket['public_ticket_id']}\n"
-            f"کاربر: {owner}\n"
-            f"دسته: {self._support_category_label(ticket['category'])}\n"
-            f"وضعیت: {self._support_status_label(ticket['status'])}\n"
-            f"موضوع: {ticket['subject']}\n"
-            f"ثبت: {self._support_when(ticket['created_at'])} | "
-            f"آخرین تغییر: {self._support_when(ticket['updated_at'])}\n"
-        )
+        head = texts.SUPPORT_ADMIN_TICKET_TEMPLATE.format(
+            ticket_id=ticket["public_ticket_id"],
+            owner=owner,
+            category=self._support_category_label(ticket["category"]),
+            status=self._support_status_label(ticket["status"]),
+            subject=ticket["subject"],
+            created=self._support_when(ticket["created_at"]),
+            updated=self._support_when(ticket["updated_at"]),
+        ) + "\n"
         text = (
             f"{head}\n"
             f"{self._support_history_text(messages, total, offset, viewer='admin')}"
@@ -570,20 +574,20 @@ class SupportWorkflowMixin:
         buttons = []
         if ticket["status"] != "closed":
             buttons.append(
-                [Button.inline("✍️ پاسخ به کاربر", f"adm:sr:{ticket_id}".encode())]
+                [Button.inline(texts.BTN_REPLY_USER, f"adm:sr:{ticket_id}".encode())]
             )
             buttons.append(
-                [Button.inline("✅ بستن درخواست", f"adm:sc:{ticket_id}".encode())]
+                [Button.inline(texts.BTN_CLOSE_TICKET, f"adm:sc:{ticket_id}".encode())]
             )
         else:
             buttons.append(
-                [Button.inline("🔁 باز کردن دوباره", f"adm:so:{ticket_id}".encode())]
+                [Button.inline(texts.BTN_REOPEN_TICKET, f"adm:so:{ticket_id}".encode())]
             )
         if total > offset + self.SUPPORT_HISTORY_PAGE:
             buttons.append(
                 [
                     Button.inline(
-                        "پیام‌های قدیمی‌تر ▶️",
+                        texts.BTN_OLDER_MESSAGES,
                         f"adm:sv:{ticket_id}:{page + 1}".encode(),
                     )
                 ]
@@ -592,12 +596,12 @@ class SupportWorkflowMixin:
             buttons.append(
                 [
                     Button.inline(
-                        "◀️ پیام‌های جدیدتر",
+                        texts.BTN_NEWER_MESSAGES,
                         f"adm:sv:{ticket_id}:{page - 1}".encode(),
                     )
                 ]
             )
-        buttons.append([Button.inline("↩️ فهرست پشتیبانی", b"adm:sup")])
+        buttons.append([Button.inline(texts.BTN_BACK_ADMIN_SUPPORT, b"adm:sup")])
         await self._show_ticket_screen(event, text, buttons)
 
     async def _handle_admin_support_callback(
@@ -612,7 +616,7 @@ class SupportWorkflowMixin:
             if view not in VIEW_LABELS or (
                 category != "all" and category not in SUPPORT_CATEGORY_BUTTONS
             ):
-                await self._ack(event, "فهرست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, texts.SUPPORT_BAD_LIST, alert=True)  # type: ignore[attr-defined]
                 return
             await self._show_admin_support(
                 event, view, category, _to_int(parts[4]) or 0
@@ -620,11 +624,11 @@ class SupportWorkflowMixin:
             return
         ticket_id = _to_int(parts[2]) if len(parts) >= 3 else None
         if ticket_id is None:
-            await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, texts.SUPPORT_INVALID_REQUEST, alert=True)  # type: ignore[attr-defined]
             return
         ticket = await self.db.get_ticket(ticket_id)
         if ticket is None:
-            await self._ack(event, "این درخواست پیدا نشد.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, texts.SUPPORT_TICKET_NOT_FOUND, alert=True)  # type: ignore[attr-defined]
             return
         if parts[1] == "sv":
             await self._show_admin_ticket(
@@ -636,15 +640,16 @@ class SupportWorkflowMixin:
             if ticket["status"] == "closed":
                 await self._ack(  # type: ignore[attr-defined]
                     event,
-                    "این درخواست بسته است؛ ابتدا آن را باز کنید.",
+                    texts.SUPPORT_TICKET_CLOSED,
                     alert=True,
                 )
                 return
             self._support_admin_states[admin_id] = ticket_id
             await event.respond(
-                f"پاسخ خود را برای درخواست {ticket['public_ticket_id']} بنویسید.\n"
-                "پس از ارسال، کاربر از پاسخ شما مطلع می‌شود. برای لغو /cancel بفرستید.",
-                buttons=[[Button.inline("↩️ بازگشت", f"adm:sv:{ticket_id}".encode())]],
+                texts.SUPPORT_ADMIN_REPLY_PROMPT.format(
+                    ticket_id=ticket["public_ticket_id"]
+                ),
+                buttons=[[Button.inline(texts.BTN_BACK, f"adm:sv:{ticket_id}".encode())]],
             )
         elif parts[1] == "sc":
             try:
@@ -654,12 +659,13 @@ class SupportWorkflowMixin:
             if closed:
                 await self._notify_user(
                     int(ticket["user_id"]),
-                    f"✅ درخواست {ticket['public_ticket_id']} بسته شد. "
-                    "اگر مشکل شما هنوز باقی است، می‌توانید درخواست را دوباره باز کنید.",
+                    texts.SUPPORT_CLOSED_NOTICE.format(
+                        ticket_id=ticket["public_ticket_id"]
+                    ),
                     buttons=[
                         [
                             Button.inline(
-                                "📋 مشاهدهٔ درخواست", f"sup:v:{ticket_id}".encode()
+                                texts.BTN_VIEW_TICKET, f"sup:v:{ticket_id}".encode()
                             )
                         ]
                     ],
@@ -675,15 +681,17 @@ class SupportWorkflowMixin:
             if reopened:
                 await self._notify_user(
                     int(ticket["user_id"]),
-                    f"🔁 درخواست {ticket['public_ticket_id']} دوباره باز شد.",
+                    texts.SUPPORT_REOPENED_NOTICE.format(
+                        ticket_id=ticket["public_ticket_id"]
+                    ),
                     buttons=[
                         [
                             Button.inline(
-                                "📋 مشاهدهٔ درخواست", f"sup:v:{ticket_id}".encode()
+                                texts.BTN_VIEW_TICKET, f"sup:v:{ticket_id}".encode()
                             )
                         ]
                     ],
                 )
             await self._show_admin_ticket(event, ticket_id)
         else:
-            await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, texts.SUPPORT_INVALID_REQUEST, alert=True)  # type: ignore[attr-defined]

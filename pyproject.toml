@@ -146,6 +146,7 @@ files = [
     "gamas_bot/progress.py",
     "gamas_bot/protocols.py",
     "gamas_bot/routing.py",
+    "gamas_bot/texts.py",
     "gamas_bot/telegram_text.py",
     "gamas_bot/telegram_transfer.py",
     "gamas_bot/textnorm.py",

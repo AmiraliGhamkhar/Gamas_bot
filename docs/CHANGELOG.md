@@ -2,6 +2,17 @@
 
 Concise history; detailed patches and earlier notes remain in Git history.
 
+## Unreleased — centralized Persian UX copy (2026-11-02)
+
+- Added `gamas_bot/texts.py` as the single source for start/help screens,
+  library states, wallet and receipt copy, support tickets, the channel gate,
+  progress headlines and shared delivery errors.
+- Rewrote the start and help screens as short, sectioned, Persian-first guides;
+  button labels, gate wording and progress headlines now follow one glossary.
+- Added copy-contract tests and a guard that prevents Persian string literals
+  from returning to the migrated handler modules.
+- No billing, schema, provider or gate behavior changed.
+
 ## Unreleased — documentation refresh (2026-11-01)
 
 - Short, practical guides for cPanel Terminal and Windows PowerShell; dedicated

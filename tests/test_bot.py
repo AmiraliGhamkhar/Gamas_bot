@@ -1126,9 +1126,11 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(text.startswith(
             "منوی اصلی\n\n"
-            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت.\n"
-            "🗂 آفیس رایگان: پیام یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار.\n"
-            "متن گفتار و سند ذخیره می‌شود. آفیس رایگان حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند."
+            "📤 فایل درس را همین‌جا بفرستید:\n"
+            "🎧 صوت یا ویدیو\n"
+            "📄 PDF، Word یا PowerPoint\n\n"
+            "📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.\n"
+            "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ بدون کسر اعتبار."
         ))
         self.assertIn("💳 اعتبار باقی‌مانده", text)
 
@@ -1139,16 +1141,16 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
         expected = (
             "ℹ️ راهنمای گاماس\n\n"
-            "🎧 فایل صوت/ویدیو یا 📄 سند PDF، Word و پاورپوینت را همین‌جا بفرستید.\n"
-            "🗂 آفیس رایگان: متن یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار.\n"
-            "📚 متن اسناد در کتابخانه ذخیره می‌شود؛ برای ارائه، پردازش صدا نیز انتخاب‌پذیر است.\n"
+            "📤 فایل درس: صوت، ویدیو، PDF، Word یا PowerPoint را همین‌جا بفرستید.\n"
+            "📚 متن خام و جزوه در «📚 کتابخانه من» ذخیره می‌شود.\n"
             "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
-            "🎁 نخستین مجموعهٔ فلش‌کارت و نخستین آزمون جداگانه رایگان‌اند.\n"
-            "🛒 خرید اشتراک: بسته‌ها و موجودی. 🎧 پشتیبانی: تیکت بزنید.\n\n"
-            "💳 اعتبار بر حسب ثانیه است و پس از ارسال متن خام محاسبه می‌شود.\n"
+            "🎁 نخستین آزمون و نخستین مجموعهٔ فلش‌کارت جداگانه رایگان‌اند.\n"
+            "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ بدون کسر اعتبار.\n"
+            "🛒 خرید اشتراک و 🎧 پشتیبانی از منوی اصلی در دسترس است.\n\n"
+            "💳 اعتبار بر حسب ثانیه و پس از ارسال متن خام محاسبه می‌شود.\n"
             "اگر متن خام نرسد، اعتباری کم نمی‌شود.\n"
-            "ساخت 🧪 آزمون و 🃏 فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق بود، اعتبار کامل برمی‌گردد.\n"
-            "پس از دریافت متن خام، خطای ساخت جزوه اعتبار را برنمی‌گرداند."
+            "ساخت آزمون و فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق باشد، کامل برمی‌گردد.\n"
+            "خطای ساخت جزوه پس از دریافت متن خام، اعتبار را برنمی‌گرداند."
         )
         self.assertEqual(text, expected)
 
@@ -1164,9 +1166,9 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn("آفیس رایگان حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند.", text)
-        self.assertIn("رایگان و بدون کسر اعتبار", text)
-        self.assertNotIn("متن گفتار و جزوهٔ ورد", text)
+        self.assertIn("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.", text)
+        self.assertIn("بدون کسر اعتبار", text)
+        self.assertNotIn("متن گفتار و جزوه در", text)
 
     async def test_admin_guides_explain_user_actions_and_empty_states(self):
         users = FakeCallbackEvent(self.admin_id, b"adm:users")
@@ -1667,7 +1669,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(start)
         self.assertTrue(start.replies[0].startswith(
             "🎓 به گاماس خوش آمدید\n\n"
-            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت."
+            "📤 فایل درس را همین‌جا بفرستید:"
         ))
         start_payloads = menu_payloads(start.client.texts[0].get("buttons"))
         self.assertEqual(

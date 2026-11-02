@@ -17,6 +17,7 @@ from typing import Any
 
 from telethon import Button
 
+from . import texts
 from .billing import format_duration, format_toman, format_validity
 from .bot_ui import TELEGRAM_CAPTION_LIMIT
 from .config import format_payment_card
@@ -47,23 +48,12 @@ class WalletWorkflowMixin:
     _pending_payments: dict[int, int]
     _pending_reject_reason: dict[int, int]
 
-    REJECTION_REASON_PRESETS: dict[str, str] = {
-        "blur": "تصویر رسید ناخوانا است؛ تصویر واضح‌تری ارسال کنید.",
-        "amount": "مبلغ واریزی با مبلغ بسته مطابقت ندارد.",
-        "invalid": "اطلاعات تراکنش ناقص یا تکراری است.",
-    }
+    REJECTION_REASON_PRESETS: dict[str, str] = texts.RECEIPT_REJECT_REASONS
     TRANSCRIPT_CLEANUP_BATCHES = 25
 
     @staticmethod
     def _payment_status_label(status: str) -> str:
-        return {
-            "pending": "⏳ منتظر پرداخت",
-            "awaiting_payment": "⏳ منتظر پرداخت",
-            "pending_review": "🕒 در انتظار بررسی",
-            "approved": "✅ تأیید شده",
-            "rejected": "❌ رد شده",
-            "cancelled": "لغو شده",
-        }.get(status, "نامشخص")
+        return texts.PAYMENT_STATUS_LABELS.get(status, texts.PAYMENT_STATUS_UNKNOWN)
 
     async def _show_wallet(self, event: Any, *, payments_page: int = 0) -> None:
         """One scrollable purchase view: plans, then balance, then history."""
@@ -73,7 +63,7 @@ class WalletWorkflowMixin:
         page_size = 5
         payments_page = max(0, int(payments_page))
         lines = [
-            "🛒 خرید اشتراک",
+            texts.WALLET_TITLE,
             "",
         ]
         buttons: list[list] = []
@@ -83,14 +73,14 @@ class WalletWorkflowMixin:
             payment = latest[0]
             order_buttons = [
                 Button.inline(
-                    "🔎 پیگیری سفارش باز",
+                    texts.BTN_TRACK_OPEN_ORDER,
                     f"payopen:{payment['payment_id']}".encode("ascii"),
                 )
             ]
             if not payment["receipt_path"]:
                 order_buttons.append(
                     Button.inline(
-                        "لغو سفارش",
+                        texts.BTN_CANCEL_ORDER,
                         f"payc:{payment['payment_id']}".encode("ascii"),
                     )
                 )
@@ -98,9 +88,9 @@ class WalletWorkflowMixin:
 
         plans = [plan for plan in await self.db.plans() if plan["price"] > 0]
         if not plans:
-            lines.append("فعلاً بسته‌ای برای خرید موجود نیست.")
+            lines.append(texts.WALLET_NO_PLANS)
         else:
-            lines.append("بسته را انتخاب کنید؛ اعتبار خرید به موجودی شما اضافه می‌شود.")
+            lines.append(texts.WALLET_CHOOSE_PLAN)
             for plan in plans:
                 hours = float(plan["hours"])
                 hours_text = to_persian_digits(
@@ -109,24 +99,33 @@ class WalletWorkflowMixin:
                 duration = format_duration(int(round(hours * 3600)))
                 validity = format_validity(plan["validity_days"])
                 lines.append(
-                    f"\n• {duration}\n  اعتبار: {validity} | مبلغ: {format_toman(plan['price'])}"
+                    "\n"
+                    + texts.WALLET_PLAN_ROW_TEMPLATE.format(
+                        duration=duration,
+                        validity=validity,
+                        price=format_toman(plan["price"]),
+                    )
                 )
                 if self.settings.payment_card_number:
                     label = button_label(
-                        f"{hours_text} ساعت — {format_toman(plan['price'])}"
+                        texts.WALLET_PLAN_BUTTON_TEMPLATE.format(
+                            hours=hours_text, price=format_toman(plan["price"])
+                        )
                     )
                     buttons.append(
                         [Button.inline(label, f"plan:{plan['code']}".encode("utf-8"))]
                     )
             if not self.settings.payment_card_number:
-                lines.append("\n🛒 پرداخت کارت‌به‌کارت فعلاً غیرفعال است.")
+                lines.append("\n" + texts.WALLET_CARD_DISABLED)
 
         lines.extend(
             [
                 "",
-                f"💳 اعتبار باقی‌مانده: {await self._balance_text(user_id)}",  # type: ignore[attr-defined]
+                texts.WALLET_BALANCE_TEMPLATE.format(
+                    balance=await self._balance_text(user_id)  # type: ignore[attr-defined]
+                ),
                 "",
-                "🧾 پرداخت‌های اخیر",
+                texts.WALLET_RECENT_PAYMENTS,
             ]
         )
         payments = await self.db.payment_history_paginated(
@@ -136,37 +135,41 @@ class WalletWorkflowMixin:
         payments = payments[:page_size]
         if not payments:
             lines.append(
-                "پرداختی ثبت نشده است."
+                texts.WALLET_NO_PAYMENTS
                 if payments_page == 0
-                else "مورد دیگری وجود ندارد."
+                else texts.WALLET_NO_MORE_PAYMENTS
             )
         for item in payments:
             seconds = item.get("purchased_seconds")
             plan_text = format_duration(int(seconds)) if seconds else item["plan_code"]
             price = item.get("purchased_price")
-            amount = format_toman(int(price)) if price is not None else "مبلغ نامشخص"
+            amount = (
+                format_toman(int(price)) if price is not None else texts.UNKNOWN_AMOUNT
+            )
             lines.append(
                 f"\n#{to_persian_digits(item['payment_id'])} | {plan_text} | {amount}\n"
                 f"{self._payment_status_label(item['status'])}"
             )
             if item["status"] == "rejected" and item.get("review_reason"):
-                lines.append(f"دلیل: {item['review_reason']}")
+                lines.append(
+                    texts.REASON_PREFIX_TEMPLATE.format(reason=item["review_reason"])
+                )
 
         nav = []
         if payments_page > 0:
             nav.append(
-                Button.inline("◀️ قبلی", f"walletp:{payments_page - 1}".encode("ascii"))
+                Button.inline(texts.BTN_PREV, f"walletp:{payments_page - 1}".encode("ascii"))
             )
         if has_more:
             nav.append(
-                Button.inline("بعدی ▶️", f"walletp:{payments_page + 1}".encode("ascii"))
+                Button.inline(texts.BTN_NEXT, f"walletp:{payments_page + 1}".encode("ascii"))
             )
         if nav:
             buttons.append(nav)
         buttons.extend(
             [
-                [Button.inline("🎧 پشتیبانی", b"support")],
-                [Button.inline("↩️ منوی اصلی", b"menu:main")],
+                [Button.inline(texts.BTN_SUPPORT, b"support")],
+                [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
             ]
         )
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
@@ -174,19 +177,19 @@ class WalletWorkflowMixin:
     async def _start_payment(self, event: Any, plan_code: str) -> None:
         if not self.settings.payment_card_number:
             await event.respond(
-                "🛒 پرداخت کارت‌به‌کارت فعلاً فعال نیست؛ کمی بعد دوباره امتحان کنید."
+                texts.WALLET_CLOSED
             )
             return
         try:
             payment_id = await self.db.create_payment(event.sender_id, plan_code)
         except OpenPaymentError:
             await event.respond(
-                "⚠️ یک سفارش باز دارید؛ اول آن را پیگیری یا لغو کنید.",
-                buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
+                texts.WALLET_OPEN_ORDER,
+                buttons=[[Button.inline(texts.BTN_WALLET, b"wallet")]],
             )
             return
         except ValueError:
-            await event.respond("این طرح در دسترس نیست.")
+            await event.respond(texts.PLAN_NOT_AVAILABLE)
             return
         await self._show_payment(event, payment_id)
 
@@ -198,14 +201,14 @@ class WalletWorkflowMixin:
             or not is_open_payment(payment["status"])
         ):
             await event.respond(
-                "این سفارش فعال نیست. وضعیت را در «🛒 خرید اشتراک» ببینید.",
-                buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
+                texts.ORDER_NOT_ACTIVE,
+                buttons=[[Button.inline(texts.BTN_WALLET, b"wallet")]],
             )
             return
         if not payment["purchased_seconds"] or payment["purchased_price"] is None:
             await event.respond(
-                "اطلاعات این سفارش ناقص است؛ لطفاً درخواست پشتیبانی ثبت کنید.",
-                buttons=[[Button.inline("🎧 پشتیبانی", b"support")]],
+                texts.ORDER_INCOMPLETE,
+                buttons=[[Button.inline(texts.BTN_SUPPORT, b"support")]],
             )
             return
         plan = {
@@ -218,51 +221,42 @@ class WalletWorkflowMixin:
             int(hours) if float(hours).is_integer() else hours
         )
         order_ref = to_persian_digits(payment_id)
-        summary = (
-            f"🧾 سفارش {order_ref}\n"
-            f"بسته: {hours_text} ساعت | مبلغ: {format_toman(plan['price'])}\n"
-            f"اعتبار بسته: {format_validity(plan['validity_days'])}"
+        summary = texts.ORDER_HEADER_TEMPLATE.format(
+            order_ref=order_ref,
+            hours=hours_text,
+            price=format_toman(plan["price"]),
+            validity=format_validity(plan["validity_days"]),
         )
         if payment["receipt_path"]:
             self._pending_payments.pop(event.sender_id, None)
-            text = (
-                f"{summary}\n\n"
-                "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است.\n"
-                "نیازی به واریز مجدد نیست؛ پس از بررسی مدیر، نتیجه اطلاع‌رسانی می‌شود."
-            )
+            text = f"{summary}\n\n{texts.RECEIPT_PENDING}"
             buttons = []
         elif not self.settings.payment_card_number:
             self._pending_payments.pop(event.sender_id, None)
-            text = (
-                f"{summary}\n\n"
-                "پرداخت کارت‌به‌کارت فعلاً در دسترس نیست؛ سفارش را لغو کنید یا بعداً امتحان کنید."
-            )
-            buttons = [[Button.inline("لغو سفارش", f"payc:{payment_id}".encode())]]
+            text = f"{summary}\n\n{texts.CARD_UNAVAILABLE}"
+            buttons = [[Button.inline(texts.BTN_CANCEL_ORDER, f"payc:{payment_id}".encode())]]
         else:
             self._pending_payments[event.sender_id] = payment_id
             card = format_payment_card(self.settings.payment_card_number)
-            text = (
-                f"{summary}\n\n"
-                "اطلاعات واریز:\n"
-                f"💳 شماره کارت: {card}\n"
-                f"به نام: {self.settings.payment_card_holder}\n"
-                f"بانک: {self.settings.payment_bank_name}\n\n"
-                "پس از واریز، تصویر رسید را بفرستید. اعتبار فقط پس از تأیید مدیر اضافه می‌شود."
+            text = f"{summary}\n\n" + texts.CARD_DETAILS_TEMPLATE.format(
+                card=card,
+                holder=self.settings.payment_card_holder,
+                bank=self.settings.payment_bank_name,
             )
             buttons = [
-                [Button.inline("📤 ارسال رسید", f"payr:{payment_id}".encode())],
-                [Button.inline("لغو سفارش", f"payc:{payment_id}".encode())],
+                [Button.inline(texts.BTN_SEND_RECEIPT, f"payr:{payment_id}".encode())],
+                [Button.inline(texts.BTN_CANCEL_ORDER, f"payc:{payment_id}".encode())],
             ]
-        buttons.append([Button.inline("🛒 خرید اشتراک", b"wallet")])
+        buttons.append([Button.inline(texts.BTN_WALLET, b"wallet")])
         await event.respond(text, buttons=buttons)
 
     async def _cancel_payment(self, event: Any, payment_id: int) -> None:
         changed = await self.db.cancel_payment(payment_id, event.sender_id)
         self._pending_payments.pop(event.sender_id, None)
         await event.respond(
-            "سفارش لغو شد."
+            texts.ORDER_CANCELLED_OK
             if changed
-            else "این سفارش قابل لغو نیست؛ رسید ارسال‌شده باید توسط مدیر بررسی شود."
+            else texts.ORDER_NOT_CANCELLABLE
         )
         await self._show_wallet(event)
 
@@ -274,12 +268,12 @@ class WalletWorkflowMixin:
             or payment["receipt_path"]
             or payment["user_id"] != event.sender_id
         ):
-            await event.respond("این سفارش برای ارسال رسید فعال نیست.")
+            await event.respond(texts.ORDER_RECEIPT_CLOSED)
             return
         self._pending_payments[event.sender_id] = payment_id
         await event.respond(
-            "📷 تصویر خوانای رسید را به‌صورت عکس یا فایل تصویری بفرستید.",
-            buttons=[[Button.inline("↩️ بازگشت", f"payopen:{payment_id}".encode())]],
+            texts.RECEIPT_ASK_IMAGE,
+            buttons=[[Button.inline(texts.BTN_BACK, f"payopen:{payment_id}".encode())]],
         )
 
     async def _handle_receipt_upload(
@@ -309,15 +303,15 @@ class WalletWorkflowMixin:
             or payment["user_id"] != user_id
         ):
             self._pending_payments.pop(user_id, None)
-            await event.respond("این سفارش برای ارسال رسید فعال نیست.")
+            await event.respond(texts.ORDER_RECEIPT_CLOSED)
             return
         if not _is_receipt_image(event.message):
             self._pending_payments[user_id] = payment_id
-            await event.respond("رسید باید عکس یا فایل تصویری JPEG/PNG/WebP باشد.")
+            await event.respond(texts.RECEIPT_BAD_TYPE)
             return
         size = getattr(event.message.file, "size", None)
         if isinstance(size, int) and size > self.settings.max_payment_receipt_bytes:
-            await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
+            await event.respond(texts.RECEIPT_TOO_LARGE)
             self._pending_payments[user_id] = payment_id
             return
         await run_file_io(self.settings.receipt_dir.mkdir, parents=True, exist_ok=True)
@@ -331,17 +325,15 @@ class WalletWorkflowMixin:
                 )
             except DiskSpaceError:
                 self._pending_payments[user_id] = payment_id
-                await event.respond(
-                    "فضای موقت سرور کافی نیست؛ رسید را کمی بعد دوباره بفرستید."
-                )
+                await event.respond(texts.RECEIPT_NO_SPACE)
                 return
             except ValueError:
                 self._pending_payments[user_id] = payment_id
-                await event.respond("حجم تصویر رسید زیاد است؛ فشرده‌تر بفرستید.")
+                await event.respond(texts.RECEIPT_TOO_LARGE)
                 return
             except Exception:
                 self._pending_payments[user_id] = payment_id
-                await event.respond("دریافت رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
+                await event.respond(texts.RECEIPT_DOWNLOAD_FAILED)
                 return
             try:
                 if not await run_file_io(
@@ -350,16 +342,14 @@ class WalletWorkflowMixin:
                     max_bytes=self.settings.max_payment_receipt_bytes,
                 ):
                     await run_file_io(receipt_path.unlink, missing_ok=True)
-                    await event.respond(
-                        "فرمت رسید نامعتبر است؛ فقط JPEG/PNG/WebP پذیرفته می‌شود."
-                    )
+                    await event.respond(texts.RECEIPT_BAD_FORMAT)
                     self._pending_payments[user_id] = payment_id
                     return
                 await run_file_io(receipt_path.chmod, 0o600)
             except OSError:
                 await run_file_io(receipt_path.unlink, missing_ok=True)
                 self._pending_payments[user_id] = payment_id
-                await event.respond("ذخیرهٔ رسید ناموفق بود؛ لطفاً دوباره ارسال کنید.")
+                await event.respond(texts.RECEIPT_SAVE_FAILED)
                 return
             try:
                 attach = asyncio.create_task(
@@ -383,18 +373,15 @@ class WalletWorkflowMixin:
                 logger.exception(
                     "payment receipt storage failed payment_id=%s", payment_id
                 )
-                await event.respond("ثبت رسید انجام نشد؛ لطفاً دوباره ارسال کنید.")
+                await event.respond(texts.RECEIPT_RECORD_FAILED)
                 return
             if not changed:
                 await run_file_io(receipt_path.unlink, missing_ok=True)
-                await event.respond("این سفارش دیگر برای ارسال رسید فعال نیست.")
+                await event.respond(texts.RECEIPT_ORDER_CLOSED)
                 return
             committed = True
             try:
-                await event.respond(
-                    "🕒 رسید پرداخت شما ثبت شد و در انتظار بررسی است.\n"
-                    "پس از بررسی مدیر، نتیجه اطلاع‌رسانی می‌شود."
-                )
+                await event.respond(texts.RECEIPT_PENDING_SHORT)
             except Exception:
                 logger.warning(
                     "receipt confirmation not delivered payment_id=%s", payment_id
@@ -416,14 +403,14 @@ class WalletWorkflowMixin:
         seconds = int(payment.get("purchased_seconds") or 0)
         price = payment.get("purchased_price")
         owner = await self._identity_for_id(int(payment["user_id"]))  # type: ignore[attr-defined]
-        text = (
-            f"🧾 رسید سفارش {to_persian_digits(payment_id)}\n"
-            f"کاربر: {owner}\n"
-            f"بسته: {format_duration(seconds) if seconds else payment['plan_code']}\n"
-            f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}"
+        text = texts.ADMIN_RECEIPT_HEADER_TEMPLATE.format(
+            payment_id=to_persian_digits(payment_id),
+            owner=owner,
+            plan=format_duration(seconds) if seconds else payment["plan_code"],
+            price=format_toman(int(price)) if price is not None else texts.UNKNOWN_AMOUNT,
         )
         buttons = [
-            [Button.inline("🔎 جزئیات سفارش", f"adm:pd:{payment_id}".encode())]
+            [Button.inline(texts.BTN_ORDER_DETAILS, f"adm:pd:{payment_id}".encode())]
         ]
         path = payment.get("receipt_path")
         receipt_ready = bool(
@@ -449,14 +436,13 @@ class WalletWorkflowMixin:
                         )
                         await self.client.send_message(
                             admin_id,
-                            text
-                            + "\n⚠️ رسید تصویری ارسال نشد؛ آن را از جزئیات سفارش ببینید.",
+                            text + texts.ADMIN_RECEIPT_MISSING_IMAGE,
                             buttons=buttons,
                         )
                 else:
                     await self.client.send_message(
                         admin_id,
-                        text + "\n⚠️ فایل رسید در دسترس نیست.",
+                        text + texts.ADMIN_RECEIPT_MISSING_FILE,
                         buttons=buttons,
                     )
             except Exception:
@@ -481,18 +467,20 @@ class WalletWorkflowMixin:
             or (len(parts) == 3 and parts[2] == "rp")
             or (len(parts) == 4 and parts[2] == "r")
         ):
-            await self._ack(event, "درخواست نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, texts.INVALID_REQUEST, alert=True)  # type: ignore[attr-defined]
             return
         payment_id = _to_int(parts[1])
         if payment_id is None:
-            await self._ack(event, "شناسه سفارش نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(  # type: ignore[attr-defined]
+                event, texts.PAYMENT_INVALID_ID, alert=True
+            )
             return
         verdict = parts[2]
         payment = await self.db.payment(payment_id)
         if payment is None or not is_pending_payment_review(payment):
             await self._ack(  # type: ignore[attr-defined]
                 event,
-                "سفارش قابل بررسی نیست؛ ابتدا رسید باید ثبت شود یا سفارش قبلاً بررسی شده است.",
+                texts.PAYMENT_NOT_REVIEWABLE,
                 alert=True,
             )
             await self._show_admin_payment_detail(event, payment_id)  # type: ignore[attr-defined]
@@ -504,30 +492,33 @@ class WalletWorkflowMixin:
             return
         if verdict == "r":
             self._pending_reject_reason[event.sender_id] = payment_id
-            await self._ack(event, "برای رد پرداخت، دلیل لازم است.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(  # type: ignore[attr-defined]
+                event, texts.REJECT_NEEDS_REASON, alert=True
+            )
             await event.respond(
-                f"دلیل رد سفارش {to_persian_digits(payment_id)} را انتخاب کنید یا در یک پیام بنویسید.\n"
-                "برای لغو، /cancel بفرستید.",
+                texts.REJECT_REASON_CHOOSE_TEMPLATE.format(
+                    payment_id=to_persian_digits(payment_id)
+                ),
                 buttons=[
                     [
                         Button.inline(
-                            "📷 تصویر رسید ناخوانا",
+                            texts.REJECT_BLUR,
                             f"payv:{payment_id}:rp:blur".encode(),
                         )
                     ],
                     [
                         Button.inline(
-                            "💰 عدم تطابق مبلغ",
+                            texts.REJECT_AMOUNT,
                             f"payv:{payment_id}:rp:amount".encode(),
                         )
                     ],
                     [
                         Button.inline(
-                            "⚠️ اطلاعات ناقص یا تکراری",
+                            texts.REJECT_INCOMPLETE,
                             f"payv:{payment_id}:rp:invalid".encode(),
                         )
                     ],
-                    [Button.inline("↩️ بازگشت", f"adm:pd:{payment_id}".encode())],
+                    [Button.inline(texts.BTN_BACK, f"adm:pd:{payment_id}".encode())],
                 ],
             )
             return
@@ -538,18 +529,24 @@ class WalletWorkflowMixin:
             owner = await self._identity_for_id(int(payment["user_id"]))  # type: ignore[attr-defined]
             await self._edit_or_reply(  # type: ignore[attr-defined]
                 event,
-                f"✅ تأیید سفارش {to_persian_digits(payment_id)}\n\n"
-                f"کاربر: {owner}\n"
-                f"اعتبار: {format_duration(seconds)}\n"
-                f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}\n\n"
-                "پس از تأیید نهایی، اعتبار به حساب کاربر اضافه می‌شود.",
+                texts.APPROVE_CONFIRM_TEMPLATE.format(
+                    payment_id=to_persian_digits(payment_id),
+                    owner=owner,
+                    seconds=format_duration(seconds),
+                    price=(
+                        format_toman(int(price))
+                        if price is not None
+                        else texts.UNKNOWN_AMOUNT
+                    ),
+                ),
                 [
                     [
                         Button.inline(
-                            "✅ تأیید نهایی", f"payv:{payment_id}:a:yes".encode()
+                            texts.BTN_CONFIRM_APPROVE,
+                            f"payv:{payment_id}:a:yes".encode(),
                         )
                     ],
-                    [Button.inline("↩️ بازگشت", f"adm:pd:{payment_id}".encode())],
+                    [Button.inline(texts.BTN_BACK, f"adm:pd:{payment_id}".encode())],
                 ],
             )
             return
@@ -561,7 +558,7 @@ class WalletWorkflowMixin:
             )
             await self._ack(  # type: ignore[attr-defined]
                 event,
-                "اطلاعات بسته یا مبلغ ناقص است؛ تأیید انجام نشد.",
+                texts.APPROVE_INCOMPLETE,
                 alert=True,
             )
             return
@@ -569,21 +566,26 @@ class WalletWorkflowMixin:
             logger.exception("payment activation failed payment_id=%s", payment_id)
             await self._ack(  # type: ignore[attr-defined]
                 event,
-                "فعال‌سازی انجام نشد. سفارش همچنان در انتظار بررسی است؛ بعداً دوباره تلاش کنید.",
+                texts.ACTIVATION_FAILED,
                 alert=True,
             )
             return
         if not changed:
-            await self._ack(event, "این سفارش قبلاً بررسی شده است.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(  # type: ignore[attr-defined]
+                event, texts.PAYMENT_ALREADY_REVIEWED, alert=True
+            )
         else:
-            await self._ack(event, "پرداخت تأیید و اعتبار فعال شد.")  # type: ignore[attr-defined]
+            await self._ack(  # type: ignore[attr-defined]
+                event, texts.PAYMENT_APPROVED
+            )
             seconds = int(payment["purchased_seconds"] or 0)
             try:
                 await self.client.send_message(
                     payment["user_id"],
-                    "✅ پرداخت شما تأیید شد. اشتراک شما فعال است.\n"
-                    f"💳 {format_duration(seconds)} اعتبار اضافه شد.",
-                    buttons=[[Button.inline("🛒 خرید اشتراک", b"wallet")]],
+                    texts.PAYMENT_APPROVED_USER_TEMPLATE.format(
+                        seconds=format_duration(seconds)
+                    ),
+                    buttons=[[Button.inline(texts.BTN_WALLET, b"wallet")]],
                 )
             except Exception:
                 logger.warning(
@@ -599,7 +601,7 @@ class WalletWorkflowMixin:
         reason = reason.strip()
         if not reason:
             await send_reply(
-                "برای رد پرداخت، واردکردن دلیل الزامی است.",
+                texts.REJECT_REASON_REQUIRED,
                 buttons=self._admin_menu(),  # type: ignore[attr-defined]
             )
             return
@@ -610,20 +612,23 @@ class WalletWorkflowMixin:
             )
         except sqlite3.Error:
             logger.exception("payment rejection failed payment_id=%s", payment_id)
-            await send_reply("رد پرداخت ثبت نشد؛ لطفاً دوباره تلاش کنید.")
+            await send_reply(texts.REJECT_FAILED)
             self._pending_reject_reason[event.sender_id] = payment_id
             return
         if not changed:
-            await send_reply("این سفارش قبلاً بررسی شده است یا رسید ندارد.")
+            await send_reply(texts.REJECT_ALREADY_DONE)
         else:
-            await send_reply(f"❌ سفارش {to_persian_digits(payment_id)} رد شد.")
+            await send_reply(
+                texts.REJECTED_USER_TEMPLATE.format(
+                    payment_id=to_persian_digits(payment_id)
+                )
+            )
             if payment is not None:
                 try:
                     await self.client.send_message(
                         payment["user_id"],
-                        f"❌ پرداخت تأیید نشد.\nدلیل: {reason[:400]}\n"
-                        "برای پیگیری می‌توانید درخواست پشتیبانی ثبت کنید.",
-                        buttons=[[Button.inline("🎧 پشتیبانی", b"support")]],
+                        texts.REJECTED_NOTICE_TEMPLATE.format(reason=reason[:400]),
+                        buttons=[[Button.inline(texts.BTN_SUPPORT, b"support")]],
                     )
                 except Exception:
                     logger.warning(

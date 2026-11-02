@@ -137,6 +137,7 @@ from .routing import CallbackRouter
 from .stt import first_configured_stt_url, transcribe
 from .subscription import SUBSCRIPTION_PREFIX, SubscriptionService
 from .telegram_text import button_label, render_pages
+from . import texts
 from .telegram_transfer import (
     TELEGRAM_DOWNLOAD_CHUNK_BYTES,
     DiskSpaceError,
@@ -399,7 +400,7 @@ class GamasBot(
                     try:
                         await asyncio.wait_for(
                             job.message.reply(
-                                "⏸ ربات در حال راه‌اندازی مجدد است؛ کار شما لغو شد. لطفاً دوباره بفرستید."
+                                texts.RESTARTING_JOB_CANCELLED
                             ),
                             timeout=2.0,
                         )
@@ -502,7 +503,7 @@ class GamasBot(
                 pass
             except Exception:
                 logger.exception("callback failed")
-                await self._ack(event, "خطایی رخ داد؛ دوباره امتحان کنید.", alert=True)
+                await self._ack(event, texts.CALLBACK_FAILED, alert=True)
 
         @client.on(events.NewMessage)
         async def handle_message(event):
@@ -513,7 +514,7 @@ class GamasBot(
             except Exception:
                 logger.exception("message handler failed")
                 try:
-                    await event.reply("⚠️ خطای غیرمنتظره‌ای رخ داد. لطفاً دوباره امتحان کنید.")
+                    await event.reply(texts.UNEXPECTED_ERROR)
                 except Exception:
                     pass
 
@@ -544,44 +545,47 @@ class GamasBot(
         """The user panel: library, wallet, optional free Office, support and help."""
         rows = [
             [
-                Button.inline("📚 کتابخانه من", b"library"),
-                Button.inline("🛒 خرید اشتراک", b"wallet"),
+                Button.inline(texts.BTN_LIBRARY, b"library"),
+                Button.inline(texts.BTN_WALLET, b"wallet"),
             ],
         ]
         if self.settings.office_enabled:
             rows.append(
                 [
-                    Button.inline("🗂 آفیس رایگان", b"office:start"),
-                    Button.inline("🏆 لیدربورد", b"board"),
+                    Button.inline(texts.BTN_OFFICE, b"office:start"),
+                    Button.inline(texts.BTN_LEADERBOARD, b"board"),
                 ]
             )
         else:
-            rows.append([Button.inline("🏆 لیدربورد", b"board")])
+            rows.append([Button.inline(texts.BTN_LEADERBOARD, b"board")])
         rows.append(
-            [Button.inline("🎧 پشتیبانی", b"support"), Button.inline("ℹ️ راهنما", b"help")]
+            [
+                Button.inline(texts.BTN_SUPPORT, b"support"),
+                Button.inline(texts.BTN_HELP, b"help"),
+            ]
         )
         if is_admin:
-            rows.append([Button.inline("🛠 پنل مدیریت", b"adm:home")])
+            rows.append([Button.inline(texts.BTN_ADMIN, b"adm:home")])
         return rows
 
     def _admin_menu(self) -> list:
         """The admin panel: three hubs, unrelated sections, and the way back."""
         return [
             [
-                Button.inline("📊 آمار و وضعیت", b"adm:home"),
-                Button.inline("💳 پرداخت‌ها", b"adm:hub:pay"),
+                Button.inline(texts.BTN_ADMIN_STATS, b"adm:home"),
+                Button.inline(texts.BTN_ADMIN_PAYMENTS, b"adm:hub:pay"),
             ],
             [
-                Button.inline("👥 کاربران", b"adm:hub:usr"),
-                Button.inline("🩺 سامانه", b"adm:hub:sys"),
+                Button.inline(texts.BTN_ADMIN_USERS, b"adm:hub:usr"),
+                Button.inline(texts.BTN_ADMIN_SYSTEM, b"adm:hub:sys"),
             ],
-            [Button.inline("🎧 مدیریت پشتیبانی", b"adm:sup")],
+            [Button.inline(texts.BTN_ADMIN_SUPPORT, b"adm:sup")],
             [
-                Button.inline("📣 ارسال پیام", b"adm:bcast"),
-                Button.inline("🛡 گزارش فعالیت‌ها", b"adm:audit"),
+                Button.inline(texts.BTN_ADMIN_BROADCAST, b"adm:bcast"),
+                Button.inline(texts.BTN_ADMIN_AUDIT, b"adm:audit"),
             ],
-            [Button.inline("🏆 برترین کاربران", b"adm:board")],
-            [Button.inline("↩️ پنل کاربری", b"menu:main")],
+            [Button.inline(texts.BTN_ADMIN_TOP_USERS, b"adm:board")],
+            [Button.inline(texts.BTN_ADMIN_BACK_USER, b"menu:main")],
         ]
 
     async def _show_main(self, event, *, first_start: bool = False) -> None:
@@ -589,25 +593,11 @@ class GamasBot(
         await self.db.ensure_user(user_id)
         if await self.db.grant_free_plan_once(user_id, self._free_plan_seconds()):
             logger.info("free plan granted")
-        greeting = "🎓 به گاماس خوش آمدید" if first_start else "منوی اصلی"
-        upload_lines = [
-            "همین‌جا فایل درس‌تان را بفرستید: 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت."
-        ]
-        if self.settings.office_enabled:
-            upload_lines.append(
-                "🗂 آفیس رایگان: پیام یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار."
-            )
-        if self.settings.note_configured:
-            delivery = "متن گفتار و جزوهٔ ورد یا متن سند در «📚 کتابخانه من» ذخیره می‌شود."
-        else:
-            delivery = "متن گفتار و سند ذخیره می‌شود."
-            if self.settings.office_enabled:
-                delivery += " آفیس رایگان حتی بدون ارائه‌دهندهٔ یادداشت هم کار می‌کند."
-        upload_line = "\n".join(upload_lines)
-        text = (
-            f"{greeting}\n\n"
-            f"{upload_line}\n{delivery}\n\n"
-            f"💳 اعتبار باقی‌مانده: {await self._balance_text(user_id)}"
+        text = texts.main_screen(
+            first_start=first_start,
+            balance=await self._balance_text(user_id),
+            office_enabled=self.settings.office_enabled,
+            notes_configured=self.settings.note_configured,
         )
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
 
@@ -647,7 +637,7 @@ class GamasBot(
     async def _balance_text(self, user_id: int) -> str:
         """The balance as users see it: a special user has no limit to show."""
         if await self.db.is_unlimited(user_id):
-            return "نامحدود ⭐ (کاربر ویژه)"
+            return texts.UNLIMITED_BALANCE
         return format_duration(await self.db.available_seconds(user_id))
 
     def _free_plan_seconds(self) -> int:
@@ -667,30 +657,26 @@ class GamasBot(
         page = min(max(0, int(page)), max(0, (count - 1) // page_size))
         items = await self.db.library_list(user_id, limit=page_size, offset=page * page_size)
         if count == 0:
-            text = (
-                "📚 کتابخانه من\n\n"
-                "کتابخانهٔ شما خالی است.\n"
-                "اولین فایل درس را بفرستید؛ متن و جزوه به‌صورت خودکار اینجا ذخیره می‌شوند."
-            )
+            text = texts.LIBRARY_EMPTY
             await self._edit_or_reply(
                 event,
                 text,
                 [
                     [
-                        Button.inline("📖 جزوه‌ها", b"library"),
-                        Button.inline("📄 اسناد", b"lib:docs:0"),
+                        Button.inline(texts.BTN_BOOKLETS, b"library"),
+                        Button.inline(texts.BTN_DOCUMENTS, b"lib:docs:0"),
                     ],
-                    [Button.inline("🃏 فلش‌کارت‌ها", b"library:fc")],
-                    [Button.inline("🛒 خرید اشتراک", b"wallet")],
-                    [Button.inline("↩️ منوی اصلی", b"menu:main")],
+                    [Button.inline(texts.BTN_FLASHCARDS, b"library:fc")],
+                    [Button.inline(texts.BTN_WALLET, b"wallet")],
+                    [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
                 ],
             )
             return
 
         lines = [
-            "📚 کتابخانه من",
+            texts.LIBRARY_TITLE,
             "",
-            f"تعداد موارد: {to_persian_digits(count)}",
+            texts.LIBRARY_COUNT_TEMPLATE.format(count=to_persian_digits(count)),
         ]
         buttons: list[list] = []
         for item in items:
@@ -706,20 +692,20 @@ class GamasBot(
             )
         nav = []
         if page > 0:
-            nav.append(Button.inline("◀️ قبلی", f"lib:{page - 1}".encode("ascii")))
+            nav.append(Button.inline(texts.BTN_PREV, f"lib:{page - 1}".encode("ascii")))
         if (page + 1) * page_size < count:
-            nav.append(Button.inline("بعدی ▶️", f"lib:{page + 1}".encode("ascii")))
+            nav.append(Button.inline(texts.BTN_NEXT, f"lib:{page + 1}".encode("ascii")))
         if nav:
             buttons.append(nav)
         buttons.extend(
             [
                 [
-                    Button.inline("📖 جزوه‌ها", b"library"),
-                    Button.inline("📄 اسناد", b"lib:docs:0"),
+                    Button.inline(texts.BTN_BOOKLETS, b"library"),
+                    Button.inline(texts.BTN_DOCUMENTS, b"lib:docs:0"),
                 ],
-                [Button.inline("🃏 فلش‌کارت‌ها", b"library:fc")],
-                [Button.inline("🛒 خرید اشتراک", b"wallet")],
-                [Button.inline("↩️ منوی اصلی", b"menu:main")],
+                [Button.inline(texts.BTN_FLASHCARDS, b"library:fc")],
+                [Button.inline(texts.BTN_WALLET, b"wallet")],
+                [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
             ]
         )
         await self._edit_or_reply(event, "\n".join(lines), buttons)
@@ -731,7 +717,7 @@ class GamasBot(
             return
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None:
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
             return
         document = await self.db.document_by_library_item(user_id, item_id)
         if document:
@@ -747,34 +733,46 @@ class GamasBot(
             + (f"\n📅 {date_label}" if date_label else "")
         )
         buttons: list[list] = [
-            [Button.inline("📥 دریافت مجدد", f"lib:f:{item_id}".encode("ascii"))],
+            [Button.inline(texts.BTN_REDOWNLOAD, f"lib:f:{item_id}".encode("ascii"))],
         ]
         if item["kind"] == "booklet":
             if item.get("content_text"):
                 buttons.append(
-                    [Button.inline("🧪 آزمون از این جزوه", f"quiz:new:{item_id}".encode("ascii"))]
+                    [
+                        Button.inline(
+                            texts.BTN_QUIZ_FROM_BOOKLET,
+                            f"quiz:new:{item_id}".encode("ascii"),
+                        )
+                    ]
                 )
                 buttons.append(
-                    [Button.inline("🃏 فلش‌کارت از این جزوه", f"fc:ai:{item_id}".encode("ascii"))]
+                    [
+                        Button.inline(
+                            texts.BTN_CARDS_FROM_BOOKLET,
+                            f"fc:ai:{item_id}".encode("ascii"),
+                        )
+                    ]
                 )
             else:
                 header += "\n\n" + LEARNING_LEGACY_NOTICE
-        buttons.append([Button.inline("↩️ بازگشت", b"lib:0")])
+        buttons.append([Button.inline(texts.BTN_BACK, b"lib:0")])
         await self._edit(event, header, buttons)
 
     async def _forward_library_item(self, event, user_id: int, item_id: int) -> None:
         """Re-forward one artifact only after an owner-scoped lookup."""
         item = await self.db.library_item(user_id, item_id)
         if item is None:
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
             return
-        back = [[Button.inline("↩️ بازگشت", f"lib:it:{item_id}".encode("ascii"))]]
+        back = [[Button.inline(texts.BTN_BACK, f"lib:it:{item_id}".encode("ascii"))]]
         progress = WorkProgress.for_editor(
             lambda text: self._edit(event, text, back),
-            headline="📥 دریافت مجدد فایل",
-            done_headline="✅ فایل ارسال شد",
+            headline=texts.ITEM_FORWARD_HEADLINE,
+            done_headline=texts.ITEM_FORWARDED_HEADLINE,
         )
-        await progress.update(35, "ارسال فایل", "فایل از تلگرام دوباره ارسال می‌شود…")
+        await progress.update(
+            35, texts.ITEM_FORWARDING_STEP, texts.ITEM_FORWARDING_DETAIL
+        )
         try:
             forwarded = await self.client.forward_messages(
                 event.chat_id,
@@ -791,20 +789,18 @@ class GamasBot(
                     "could not mark unavailable library item=%s", item_id, exc_info=True
                 )
             await progress.fail(
-                "این فایل دیگر در دسترس نیست.",
-                headline="❌ دریافت فایل ناموفق بود.",
+                texts.ITEM_UNAVAILABLE,
+                headline=texts.ITEM_UNAVAILABLE_FAILED,
             )
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
             return
         except Exception:
             logger.warning("library forward failed item=%s", item_id, exc_info=True)
             await progress.fail(
-                "ارسال فایل موقتاً ناموفق بود؛ دوباره تلاش کنید.",
-                headline="❌ دریافت فایل ناموفق بود.",
+                texts.ITEM_FORWARD_FAILED,
+                headline=texts.ITEM_UNAVAILABLE_FAILED,
             )
-            await self._ack(
-                event, "ارسال فایل موقتاً ناموفق بود؛ دوباره تلاش کنید.", alert=True
-            )
+            await self._ack(event, texts.ITEM_FORWARD_FAILED, alert=True)
             return
         if item["unavailable"]:
             try:
@@ -813,7 +809,7 @@ class GamasBot(
                 logger.warning(
                     "could not clear library unavailable flag item=%s", item_id, exc_info=True
                 )
-        await progress.complete("✅ فایل دوباره در همین گفتگو ارسال شد.")
+        await progress.complete(texts.ITEM_FORWARD_DONE)
 
     # -------------------------------------------------------- callback router
     def _configure_callback_routes(self) -> None:
@@ -864,73 +860,51 @@ class GamasBot(
         r.register_prefix("fc:", self._route_flashcard_callback)
 
     async def _cb_help(self, event, _user_id: int, _data: str) -> None:
-        guide_lines = [
-            "ℹ️ راهنمای گاماس",
-            "",
-            "🎧 فایل صوت/ویدیو یا 📄 سند PDF، Word و پاورپوینت را همین‌جا بفرستید.",
-        ]
-        if self.settings.office_enabled:
-            guide_lines.append(
-                "🗂 آفیس رایگان: متن یا فایل متنی را به Word، Excel، PowerPoint یا PDF تبدیل کنید؛ رایگان و بدون کسر اعتبار."
-            )
-        guide_lines.extend(
-            [
-                "📚 متن اسناد در کتابخانه ذخیره می‌شود؛ برای ارائه، پردازش صدا نیز انتخاب‌پذیر است.",
-                "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.",
-                "🎁 نخستین مجموعهٔ فلش‌کارت و نخستین آزمون جداگانه رایگان‌اند.",
-                "🛒 خرید اشتراک: بسته‌ها و موجودی. 🎧 پشتیبانی: تیکت بزنید.",
-                "",
-                "💳 اعتبار بر حسب ثانیه است و پس از ارسال متن خام محاسبه می‌شود.",
-                "اگر متن خام نرسد، اعتباری کم نمی‌شود.",
-                "ساخت 🧪 آزمون و 🃏 فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق بود، اعتبار کامل برمی‌گردد.",
-                "پس از دریافت متن خام، خطای ساخت جزوه اعتبار را برنمی‌گرداند.",
-            ]
-        )
         await event.respond(
-            "\n".join(guide_lines),
-            buttons=[[Button.inline("↩️ منوی اصلی", b"menu:main")]],
+            texts.help_screen(office_enabled=self.settings.office_enabled),
+            buttons=[[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]],
         )
 
     async def _cb_lib_docs(self, event, _user_id: int, data: str) -> None:
         parts = data.split(":")
         page = _to_int(parts[2]) if len(parts) > 2 else 0
         if page is None:
-            await self._ack(event, "صفحهٔ اسناد نامعتبر است.", alert=True)
+            await self._ack(event, texts.DOCS_INVALID_PAGE, alert=True)
             return
         await self._show_documents(event, page=max(0, page))
 
     async def _cb_lib_doc(self, event, user_id: int, data: str) -> None:
         document_id = _to_int(data.rsplit(":", 1)[-1])
         if document_id is None:
-            await self._ack(event, "این سند پیدا نشد.", alert=True)
+            await self._ack(event, texts.DOCUMENT_NOT_FOUND, alert=True)
         else:
             await self._show_document_card(event, user_id, document_id)
 
     async def _cb_lib_forward(self, event, user_id: int, data: str) -> None:
         item_id = _to_int(data.rsplit(":", 1)[-1])
         if item_id is None:
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
         else:
             await self._forward_library_item(event, user_id, item_id)
 
     async def _cb_lib_item(self, event, _user_id: int, data: str) -> None:
         item_id = _to_int(data.rsplit(":", 1)[-1])
         if item_id is None:
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
+            await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
         else:
             await self._show_library_item(event, item_id)
 
     async def _cb_lib_page(self, event, _user_id: int, data: str) -> None:
         page = _to_int(data.split(":", 1)[1])
         if page is None:
-            await self._ack(event, "صفحهٔ کتابخانه نامعتبر است.", alert=True)
+            await self._ack(event, texts.LIBRARY_INVALID_PAGE, alert=True)
         else:
             await self._show_library(event, page=max(0, page))
 
     async def _cb_wallet_page(self, event, _user_id: int, data: str) -> None:
         page = _to_int(data.split(":", 1)[1])
         if page is None:
-            await self._ack(event, "صفحهٔ پرداخت‌ها نامعتبر است.", alert=True)
+            await self._ack(event, texts.INVALID_PAYMENTS_PAGE, alert=True)
         else:
             await self._show_wallet(event, payments_page=max(0, page))
 
@@ -938,7 +912,7 @@ class GamasBot(
         try:
             payment_id = int(data.split(":", 1)[1])
         except ValueError:
-            await event.respond("درخواست نامعتبر است.")
+            await event.respond(texts.INVALID_REQUEST)
             return
         if data.startswith("payc:"):
             await self._cancel_payment(event, payment_id)
@@ -952,7 +926,7 @@ class GamasBot(
         section = parts[1] if len(parts) > 1 else "ov"
         period = parts[2] if len(parts) > 2 else "7d"
         if period not in self.ADMIN_PERIOD_KEYS:
-            await self._ack(event, "بازهٔ زمانی نامعتبر است.", alert=True)
+            await self._ack(event, texts.INVALID_PERIOD, alert=True)
             return
         if section == "ov":
             await self._show_admin_overview(event, period)
@@ -965,13 +939,13 @@ class GamasBot(
             }
             await self._route_admin_hub(event, user_id, f"adm:hub:{aliases[section]}:{period}")
         else:
-            await self._ack(event, "بخش گزارش نامعتبر است.", alert=True)
+            await self._ack(event, texts.INVALID_REPORT, alert=True)
 
     async def _cb_admin_pay_page(self, event, _user_id: int, data: str) -> None:
         parts = data.split(":")
         parsed_page = _to_int(parts[2]) if len(parts) == 3 else None
         if parsed_page is None:
-            await self._ack(event, "صفحهٔ سفارش‌ها نامعتبر است.", alert=True)
+            await self._ack(event, texts.INVALID_ORDERS_PAGE, alert=True)
             return
         await self._show_admin_payments(event, max(0, parsed_page))
 
@@ -982,24 +956,21 @@ class GamasBot(
     async def _cb_admin_pay_detail(self, event, _user_id: int, data: str) -> None:
         detail_payment_id = _to_int(data.rsplit(":", 1)[-1])
         if detail_payment_id is None:
-            await self._ack(event, "شناسه سفارش نامعتبر است.", alert=True)
+            await self._ack(event, texts.INVALID_ORDER_ID, alert=True)
             return
         await self._show_admin_payment_detail(event, detail_payment_id)
 
     async def _cb_admin_broadcast(self, event, user_id: int, _data: str) -> None:
         self._pending_broadcast.add(user_id)
         await event.respond(
-            "📣 ارسال پیام به کاربران\n\n"
-            "متن موردنظر را در پیام بعدی بفرستید؛ برای همهٔ کاربران ثبت‌شده در ربات تلاش می‌شود ارسال شود.\n"
-            "کاربرانی که ربات را مسدود کرده‌اند ممکن است پیام را دریافت نکنند.\n"
-            "برای لغو، /cancel بفرستید یا دکمهٔ زیر را انتخاب کنید.",
-            buttons=[[Button.inline("↩️ لغو", b"adm:home")]],
+            texts.BROADCAST_PROMPT,
+            buttons=[[Button.inline(texts.BTN_CANCEL, b"adm:home")]],
         )
 
     async def _cb_admin_audit_page(self, event, _user_id: int, data: str) -> None:
         page = _to_int(data.rsplit(":", 1)[-1])
         if page is None or page < 0:
-            await self._ack(event, "صفحهٔ گزارش نامعتبر است.", alert=True)
+            await self._ack(event, texts.INVALID_REPORT_PAGE, alert=True)
         else:
             await self._show_admin_audit(event, page)
 
@@ -1007,7 +978,7 @@ class GamasBot(
         parts = data.split(":", 3)
         target_id = _to_int(parts[2]) if len(parts) == 4 else None
         if target_id is None:
-            await self._ack(event, "درخواست هدیه نامعتبر است.", alert=True)
+            await self._ack(event, texts.INVALID_GIFT, alert=True)
         else:
             await self._admin_gift_execute(event, user_id, target_id, parts[3])
 
@@ -1015,7 +986,7 @@ class GamasBot(
         parts = data.split(":")
         target_id = _to_int(parts[2]) if len(parts) in (3, 4) else None
         if target_id is None:
-            await self._ack(event, "درخواست هدیه نامعتبر است.", alert=True)
+            await self._ack(event, texts.INVALID_GIFT, alert=True)
         elif len(parts) == 3:
             await self._admin_gift_pick(event, target_id)
         else:
@@ -1027,7 +998,7 @@ class GamasBot(
         try:
             await self._dispatch_callback(event)
         except Exception:
-            await self._ack(event, "خطایی رخ داد؛ دوباره امتحان کنید.", alert=True)
+            await self._ack(event, texts.CALLBACK_FAILED, alert=True)
             raise
         finally:
             await self._ack(event)
@@ -1035,7 +1006,7 @@ class GamasBot(
     async def _dispatch_callback(self, event) -> None:
         if self._shutting_down:
             await self._ack(
-                event, "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.", alert=True
+                event, texts.RESTARTING, alert=True
             )
             return
         data = (event.data or b"").decode("utf-8", "replace").strip()
@@ -1045,10 +1016,10 @@ class GamasBot(
         if not getattr(event, "is_private", False):
             return
         if await self.db.is_banned(user_id):
-            await self._ack(event, "⛔ دسترسی شما به ربات مسدود شده است.", alert=True)
+            await self._ack(event, texts.ACCESS_BANNED, alert=True)
             return
         if not self._is_admin(user_id) and data.startswith(("adm:", "payv:")):
-            await self._ack(event, "دسترسی به این بخش فقط برای مدیران مجاز است.", alert=True)
+            await self._ack(event, texts.ADMIN_ONLY, alert=True)
             return
         await self.db.ensure_user(user_id)
         await self._capture_sender_name(event)
@@ -1068,7 +1039,7 @@ class GamasBot(
         if event.message is None or not event.is_private:
             return
         if self._shutting_down:
-            await event.reply("ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.")
+            await event.reply(texts.RESTARTING)
             return
         user_id = event.sender_id
         if user_id is None:
@@ -1081,7 +1052,7 @@ class GamasBot(
             last_name=getattr(sender, "last_name", None) if sender else None,
         )
         if user.banned:
-            await event.reply("⛔ دسترسی شما به ربات مسدود شده است.")
+            await event.reply(texts.ACCESS_BANNED)
             return
         await self._capture_sender_name(event)
         if not self._is_admin(user_id) and not await self.subscription.require_access(event):
@@ -1099,35 +1070,31 @@ class GamasBot(
             payment_id = self._pending_reject_reason.pop(user_id, None)
             if payment_id is not None:
                 if command == "/cancel":
-                    await event.reply("رد پرداخت لغو شد.")
+                    await event.reply(texts.REJECT_CANCELLED)
                     await self._show_admin_payments(event)
                     return
                 if not text:
                     self._pending_reject_reason[user_id] = payment_id
-                    await event.reply(
-                        "لطفاً دلیل رد را در یک پیام متنی بنویسید؛ برای لغو /cancel بفرستید."
-                    )
+                    await event.reply(texts.REJECT_REASON_PROMPT)
                     return
                 if text.startswith("/"):
                     self._pending_reject_reason[user_id] = payment_id
-                    await event.reply(
-                        "دستور نامعتبر است؛ دلیل را بنویسید یا برای لغو /cancel بفرستید."
-                    )
+                    await event.reply(texts.REJECT_REASON_INVALID)
                     return
                 await self._reject_payment_with_reason(event, payment_id, text)
                 return
         if self._is_admin(user_id) and user_id in self._pending_broadcast:
             if command == "/cancel":
                 self._pending_broadcast.discard(user_id)
-                await event.reply("پیام همگانی لغو شد.")
+                await event.reply(texts.BROADCAST_CANCELLED)
                 return
             if not text:
                 await event.reply(
-                    "پیام همگانی باید متن داشته باشد؛ متن را بفرستید یا /cancel بزنید."
+                    texts.BROADCAST_NEEDS_TEXT
                 )
                 return
             if text.startswith("/"):
-                await event.reply("دستور نامعتبر است؛ متن پیام را بفرستید یا /cancel بزنید.")
+                await event.reply(texts.INVALID_COMMAND_TEXT)
                 return
             self._pending_broadcast.discard(user_id)
             await self._broadcast(event, text)
@@ -1170,7 +1137,7 @@ class GamasBot(
         if command == "/cancel":
             self.conversations.reset_on_cancel(user_id)
             self._office_sessions.pop(user_id, None)
-            await event.reply("ارسال لغو شد. لغو سفارش از «🛒 خرید اشتراک».")
+            await event.reply(texts.ORDER_CANCELLED)
             return
 
         if user_id in self._pending_flashcard:
@@ -1188,7 +1155,7 @@ class GamasBot(
             return
         if text_suffix is not None:
             if not self.settings.office_enabled:
-                await event.reply("آفیس رایگان در تنظیمات سرور غیرفعال است.")
+                await event.reply(texts.OFFICE_DISABLED)
                 return
             if await self._is_duplicate_upload(event, user_id):
                 return
@@ -1204,8 +1171,7 @@ class GamasBot(
             return
         if office_session is not None and _is_unsupported_attachment(event.message):
             await event.reply(
-                "یک پیش‌نویس آفیس رایگان باز دارید. ابتدا خروجی را بسازید یا «پایان و پاک‌کردن متن» را بزنید؛ "
-                "سپس فایل دیگری را بفرستید تا با جریان مناسب خودش پردازش شود.",
+                texts.OFFICE_DRAFT_OPEN,
                 buttons=self._office_session_keyboard(),
             )
             return
@@ -1251,14 +1217,11 @@ class GamasBot(
             if getattr(event.message, "photo", None) is not None:
                 await event.reply(DOC_PHOTO_HINT)
                 return
-            await event.reply(
-                "⚠️ این نوع فایل پشتیبانی نمی‌شود. فایل صوتی، ویدیویی، پاورپوینت یا "
-                "سند PDF/Word بفرستید."
-            )
+            await event.reply(texts.UNSUPPORTED_FILE)
             return
         if text:
             await event.reply(
-                "همین‌جا فایل 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت درس را بفرستید.",
+                texts.UPLOAD_HINT,
                 buttons=self._user_menu(is_admin=self._is_admin(user_id)),
             )
 

@@ -21,6 +21,8 @@ from typing import Any, Awaitable, Callable
 
 from telethon.errors import FloodWaitError
 
+from . import texts
+
 logger = logging.getLogger(__name__)
 
 #: Spinner rendered next to the percentage; one frame per published update.
@@ -50,12 +52,12 @@ PERSIAN_DIGIT_TABLE = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
 #: document extraction, Free Office) are different products, so each one gets
 #: its own headline instead of telling a user that a «فایل» is being processed
 #: while a quiz is being generated.
-DEFAULT_PROGRESS_HEADLINE = "⏳ در حال پردازش فایل"
-WORK_PROGRESS_HEADLINE = "⏳ در حال پردازش"
-DEFAULT_DONE_HEADLINE = "✅ پردازش تکمیل شد"
-WORK_DONE_HEADLINE = "✅ آماده شد"
-DEFAULT_FAIL_HEADLINE = "❌ پردازش تکمیل نشد."
-WORK_FAIL_HEADLINE = "❌ انجام نشد."
+DEFAULT_PROGRESS_HEADLINE = texts.PROGRESS_DEFAULT_HEADLINE
+WORK_PROGRESS_HEADLINE = texts.PROGRESS_WORK_HEADLINE
+DEFAULT_DONE_HEADLINE = texts.PROGRESS_DEFAULT_DONE
+WORK_DONE_HEADLINE = texts.PROGRESS_WORK_DONE
+DEFAULT_FAIL_HEADLINE = texts.PROGRESS_DEFAULT_FAIL
+WORK_FAIL_HEADLINE = texts.PROGRESS_WORK_FAIL
 
 #: How often the ticker re-edits the message while a stage is running.
 ANIMATION_INTERVAL_SECONDS = 5.0
@@ -180,14 +182,14 @@ class JobProgress:
         event: Any,
         *,
         submission_id: int | None = None,
-        stage: str = "در صف پردازش",
+        stage: str = texts.QUEUED_STAGE,
         animate: bool = True,
         animation_interval: float = ANIMATION_INTERVAL_SECONDS,
         headline: str = DEFAULT_PROGRESS_HEADLINE,
         done_headline: str = DEFAULT_DONE_HEADLINE,
     ) -> "JobProgress":
         text = progress_text(
-            0, stage, "پردازش به‌زودی آغاز می‌شود.", headline=headline
+            0, stage, texts.QUEUED_DETAIL, headline=headline
         )
         try:
             message = await event.reply(text)
@@ -206,7 +208,7 @@ class JobProgress:
         )
         reporter._last_text = text
         reporter._stage = stage
-        reporter._detail = "پردازش به‌زودی آغاز می‌شود."
+        reporter._detail = texts.QUEUED_DETAIL
         if animate:
             reporter.start_animation()
         return reporter
@@ -291,7 +293,7 @@ class JobProgress:
 
     async def complete(
         self,
-        detail: str = "متن گفتار و فایل خروجی ارسال شد.",
+        detail: str = texts.DELIVERY_DONE_DETAIL,
         headline: str | None = None,
     ) -> None:
         self._finish()
@@ -305,7 +307,9 @@ class JobProgress:
         await self._publish(
             failed_progress_text(
                 self.percent,
-                f"کد پیگیری: {to_persian_digits(reference)}",
+                texts.TRACKING_CODE_TEMPLATE.format(
+                    reference=to_persian_digits(reference)
+                ),
             )
         )
 

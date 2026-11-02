@@ -136,7 +136,7 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
             text,
             "📚 کتابخانه من\n\n"
             "کتابخانهٔ شما خالی است.\n"
-            "اولین فایل درس را بفرستید؛ متن و جزوه به‌صورت خودکار اینجا ذخیره می‌شوند.",
+            "اولین فایل درس را بفرستید؛ متن و جزوه به‌صورت خودکار این‌جا ذخیره می‌شوند.",
         )
         self.assertIn(b"lib:docs:0", menu_payloads(buttons))
 

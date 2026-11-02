@@ -40,6 +40,7 @@ from typing import Awaitable, Callable
 import aiohttp
 from telethon import Button
 
+from . import texts
 from .db import iso, utc_now
 from .http_util import read_error_body
 
@@ -67,43 +68,22 @@ MAX_NETWORK_RETRY_DELAY_SECONDS = 1.0
 
 #: Rendered for a user who is confirmed not to be a member. ``{channel_url}``
 #: is the configured channel's public link, so a numeric channel id works too.
-SUBSCRIPTION_REQUIRED_TEMPLATE = (
-    "🔒 استفاده از ربات گاماس فقط برای اعضای کانال رسمی آن مجاز است.\n\n"
-    "برای دسترسی به خدمات ربات، ابتدا به کانال گاماس بپیوندید:\n"
-    "{channel_url}\n\n"
-    "پس از عضویت، دکمهٔ «🔍 بررسی عضویت» را بزنید."
-)
+SUBSCRIPTION_REQUIRED_TEMPLATE = texts.SUBSCRIPTION_REQUIRED_TEMPLATE
 #: Rendered after a failed re-verification.
-SUBSCRIPTION_STILL_REQUIRED_TEXT = (
-    "🤔 عضویت شما در کانال گاماس هنوز تأیید نشده است.\n"
-    "برای ادامه، ابتدا به کانال بپیوندید و سپس «🔍 بررسی عضویت» را بزنید."
-)
+SUBSCRIPTION_STILL_REQUIRED_TEXT = texts.SUBSCRIPTION_STILL_REQUIRED
 #: Rendered after a successful re-verification.
-SUBSCRIPTION_CONFIRMED_TEXT = (
-    "✅ عضویت شما در کانال گاماس تأیید شد.\n"
-    "اکنون می‌توانید از ربات استفاده کنید."
-)
+SUBSCRIPTION_CONFIRMED_TEXT = texts.SUBSCRIPTION_CONFIRMED
 #: Rendered when the check could not be completed (infrastructure/permission).
 #: It deliberately does not claim the user is (or is not) a member.
-SUBSCRIPTION_UNAVAILABLE_TEXT = (
-    "⚠️ در حال حاضر توانایی بررسی عضویت موقتاً در دسترس نیست.\n"
-    "یک لحظه دیگر دوباره امتحان کنید."
-)
-
-#: Rendered when the check could not be completed (infrastructure/permission).
-#: It deliberately does not claim the user is (or is not) a member.
-SUBSCRIPTION_UNAVAILABLE_TEXT = (
-    "⚠️ در حال حاضر توانایی بررسی عضویت موقتاً در دسترس نیست.\n"
-    "یک لحظه دیگر دوباره امتحان کنید."
-)
+SUBSCRIPTION_UNAVAILABLE_TEXT = texts.SUBSCRIPTION_UNAVAILABLE
 
 #: The join action (opens the channel) plus the re-verification action. Built
 #: per render so the button opens the configured channel's real link.
 def _join_buttons(channel_url: str) -> list[list]:
     return [
         [
-            Button.url("🌟 عضویت در کانال گاماس", channel_url),
-            Button.inline("🔍 بررسی عضویت", b"sub:check"),
+            Button.url(texts.BTN_CHANNEL_JOIN, channel_url),
+            Button.inline(texts.BTN_CHANNEL_CHECK, b"sub:check"),
         ]
     ]
 
@@ -417,10 +397,7 @@ class SubscriptionService:
         # Unknown: infrastructure or permission. Never claim non-membership.
         if "bot-not-admin" in result.detail or "channel-unavailable" in result.detail:
             await self._alert_admins(
-                "⚠️ بررسی عضویت کانال گاماس ناموفق است.\n"
-                f"دلیل: {result.detail}\n"
-                "ربات باید administrator کانال باشد؛ "
-                "راهنمای تنظیم در docs/TELEGRAM_SUBSCRIPTION.md را ببینید."
+                texts.SUBSCRIPTION_ADMIN_PERMISSION_ALERT.format(detail=result.detail)
             )
         return result
 
@@ -469,7 +446,7 @@ class SubscriptionService:
         await self.bot._edit_or_reply(
             event,
             SUBSCRIPTION_UNAVAILABLE_TEXT,
-            [[Button.inline("🔍 بررسی عضویت", b"sub:check")]],
+            [[Button.inline(texts.BTN_CHANNEL_CHECK, b"sub:check")]],
         )
 
     # ------------------------------------------------------------- callbacks
@@ -494,7 +471,7 @@ class SubscriptionService:
             await self.bot._edit_or_reply(
                 event,
                 SUBSCRIPTION_CONFIRMED_TEXT,
-                [[Button.inline("↩️ منوی اصلی", b"menu:main")]],
+                [[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]],
             )
             return
         if result.is_denied:
@@ -539,9 +516,9 @@ class SubscriptionService:
                 "subscription self-check failed (bot may not be channel admin): %s", exc
             )
             await self._alert_admins(
-                "⚠️ بررسی خودکار کانال گاماس ناموفق بود.\n"
-                f"دلیل: {exc}\n"
-                "ربات باید administrator کانال {channel} باشد.".format(channel=self.channel_ref)
+                texts.SUBSCRIPTION_SELF_CHECK_FAILED.format(
+                    error=exc, channel=self.channel_ref
+                )
             )
             return False
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as exc:
@@ -556,7 +533,6 @@ class SubscriptionService:
             status,
         )
         await self._alert_admins(
-            "⚠️ ربات در کانال گاماس administrator نیست؛ بررسی عضویت کاربران "
-            f"ممکن نیست (وضعیت: {status!r}). ربات را administrator کانال کنید."
+            texts.SUBSCRIPTION_NOT_ADMIN_ALERT.format(status=status)
         )
         return False
