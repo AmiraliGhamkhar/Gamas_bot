@@ -111,6 +111,12 @@ class DocumentOfficeWorkflowMixin:
     _ocr_client: I2OCRClient | None
     _document_locks: MutableMapping[tuple[int, str], asyncio.Lock]
     _document_semaphore: asyncio.Semaphore
+
+    async def _require_membership(
+        self, event: Any, user_id: int, *, kind: str, callback_data: str = ""
+    ) -> bool:
+        """Provided by the composed bot; gates one value-delivery action."""
+        raise NotImplementedError
     _office_sessions: dict[int, OfficeSession]
     _office_semaphore: asyncio.Semaphore
     _office_in_flight: set[int]
@@ -1252,6 +1258,8 @@ class DocumentOfficeWorkflowMixin:
     async def _accept_document(
         self, event: Any, user_id: int, source_type: str, filename: str | None
     ) -> None:
+        if not await self._require_membership(event, user_id, kind="document"):
+            return
         await self._guard_file_intake(
             event,
             lambda: self._accept_document_inner(event, user_id, source_type, filename),
@@ -1807,6 +1815,10 @@ class DocumentOfficeWorkflowMixin:
                 await self._ack(  # type: ignore[attr-defined]
                     event, "نوع جزوه یا سند نامعتبر است.", alert=True
                 )
+                return
+            if not await self._require_membership(
+                event, user_id, kind="callback", callback_data=data
+            ):
                 return
             await self._run_document_notes(event, user_id, document_id, mode)
             return

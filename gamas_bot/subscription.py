@@ -61,6 +61,17 @@ STATE_UNKNOWN = "unknown"
 
 #: How often a permission/configuration failure is raised to the administrators.
 ADMIN_ALERT_INTERVAL_SECONDS = 300.0
+#: Bounded background sweep: a small batch, one check at a time, then a pause.
+#: It is resumable through ``users.subscription_checked_at`` (oldest first).
+SWEEP_INTERVAL_SECONDS = 6 * 3600.0
+SWEEP_START_DELAY_SECONDS = 300.0
+SWEEP_BATCH_SIZE = 20
+SWEEP_PAUSE_SECONDS = 1.0
+SWEEP_ACTIVE_DAYS = 30
+
+#: How long a gate-blocked request stays resumable.
+PENDING_GATE_TTL_DAYS = 7
+
 #: Cap applied to a Telegram ``retry_after`` so a flood wait cannot stall a worker.
 MAX_FLOOD_WAIT_SECONDS = 60.0
 #: A malformed ``retry_after`` must not become an unbounded sleep.
@@ -361,6 +372,10 @@ class SubscriptionService:
         )
         return MembershipResult(STATE_UNKNOWN, None, detail or last_error or "unavailable")
 
+    async def record_result(self, user_id: int, result: MembershipResult) -> None:
+        """Persist one observed membership result (used by the sweep too)."""
+        await self._record(user_id, result)
+
     async def _record(self, user_id: int, result: MembershipResult) -> None:
         if result.state == STATE_MEMBER:
             status = "member"
@@ -473,6 +488,15 @@ class SubscriptionService:
                 SUBSCRIPTION_CONFIRMED_TEXT,
                 [[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]],
             )
+            # Resume the request that was blocked before joining, if one exists.
+            try:
+                await self.bot._resume_pending_gate_action(user_id)
+            except Exception:  # noqa: BLE001 - resuming must never break the check
+                logger.warning(
+                    "could not resume a gate-blocked request user=%s",
+                    user_id,
+                    exc_info=True,
+                )
             return
         if result.is_denied:
             await self._record(user_id, result)

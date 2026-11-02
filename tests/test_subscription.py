@@ -470,29 +470,79 @@ class CallbackHandlerTests(SubscriptionTestCase):
 
 
 class MessageGateIntegrationTests(SubscriptionTestCase):
-    async def test_message_gate_blocks_non_member(self):
+    async def test_plain_text_and_menu_are_not_gated(self):
         await self.use_resolver("left")
-        event = FakeJobEvent(chat_id=USER_ID)
-        event.message.message = "hello"
-        await self.bot._handle_message(event)
-        self.assertTrue(any(JOIN_PROMPT_MARKER in text for text in event.replies))
-
-    async def test_message_gate_allows_member(self):
-        await self.use_resolver("member")
         event = FakeJobEvent(chat_id=USER_ID)
         event.message.message = "hello"
         await self.bot._handle_message(event)
         self.assertFalse(any(JOIN_PROMPT_MARKER in text for text in event.replies))
 
-    async def test_message_gate_allows_admin(self):
+    async def test_document_intake_is_gated_and_remembered(self):
+        await self.use_resolver("left")
+        await self.db.ensure_user(USER_ID)
+        event = FakeJobEvent(chat_id=USER_ID)
+        allowed = await self.bot._require_membership(
+            event, USER_ID, kind="document"
+        )
+        self.assertFalse(allowed)
+        self.assertTrue(any(JOIN_PROMPT_MARKER in text for text in event.replies))
+        pending = await self.db.take_pending_gate_action(USER_ID)
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["kind"], "document")
+        self.assertEqual(pending["message_id"], event.message.id)
+
+    async def test_member_is_allowed_without_prompt(self):
+        await self.use_resolver("member")
+        event = FakeJobEvent(chat_id=USER_ID)
+        self.assertTrue(
+            await self.bot._require_membership(event, USER_ID, kind="document")
+        )
+        self.assertFalse(any(JOIN_PROMPT_MARKER in text for text in event.replies))
+
+    async def test_admin_is_exempt(self):
         await self.use_resolver("left")
         self.bot.subscription.settings = replace(
             self.bot.subscription.settings, admin_ids={USER_ID}
         )
         event = FakeJobEvent(chat_id=USER_ID)
-        event.message.message = "hello"
-        await self.bot._handle_message(event)
+        self.assertTrue(
+            await self.bot._require_membership(event, USER_ID, kind="document")
+        )
         self.assertFalse(any(JOIN_PROMPT_MARKER in text for text in event.replies))
+
+
+class PendingResumeTests(SubscriptionTestCase):
+    async def test_a_blocked_request_is_replayed_without_resubmission(self):
+        await self.db.ensure_user(USER_ID)
+        await self.db.save_pending_gate_action(
+            USER_ID, chat_id=USER_ID, message_id=55, kind="document"
+        )
+        self.bot.client.get_messages = AsyncMock(return_value=mock.Mock(id=55))
+        self.bot._handle_message = AsyncMock()
+        self.assertTrue(await self.bot._resume_pending_gate_action(USER_ID))
+        self.bot._handle_message.assert_awaited_once()
+        self.assertIsNone(await self.db.take_pending_gate_action(USER_ID))
+
+    async def test_a_lost_message_does_not_crash_the_resume(self):
+        await self.db.ensure_user(USER_ID)
+        await self.db.save_pending_gate_action(
+            USER_ID, chat_id=USER_ID, message_id=55, kind="media"
+        )
+        self.bot.client.get_messages = AsyncMock(return_value=None)
+        self.assertFalse(await self.bot._resume_pending_gate_action(USER_ID))
+
+    async def test_sweep_selection_skips_banned_and_starts_with_oldest_check(self):
+        await self.db.ensure_user(1)
+        await self.db.ensure_user(2)
+        await self.db.ensure_user(3)
+        await self.db.set_subscription_state(1, "member", checked_at="2026-01-01T00:00:00+00:00")
+        await self.db.set_subscription_state(2, "member", checked_at="2026-02-01T00:00:00+00:00")
+        await self.db.set_banned(3, True, admin_id=9)
+        users = await self.db.users_for_membership_sweep(
+            10, active_since="2000-01-01T00:00:00+00:00"
+        )
+        self.assertEqual(users[:2], [1, 2])
+        self.assertNotIn(3, users)
 
 
 class CallbackGateIntegrationTests(SubscriptionTestCase):
@@ -506,9 +556,15 @@ class CallbackGateIntegrationTests(SubscriptionTestCase):
         # The gate must not prompt; the subscription handler owns the reply.
         self.assertEqual(event.edits, [])
 
-    async def test_other_callback_is_gated(self):
+    async def test_menu_callback_is_not_gated(self):
         await self.use_resolver("left")
         event = CallbackEvent(USER_ID, b"menu:main")
+        await self.bot._dispatch_callback(event)
+        self.assertFalse(any(JOIN_PROMPT_MARKER in text for text, _ in event.edits))
+
+    async def test_generation_callback_is_gated(self):
+        await self.use_resolver("left")
+        event = CallbackEvent(USER_ID, b"quiz:go:1:5")
         await self.bot._dispatch_callback(event)
         self.assertTrue(any(JOIN_PROMPT_MARKER in text for text, _ in event.edits))
 

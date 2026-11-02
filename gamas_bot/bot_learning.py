@@ -108,6 +108,12 @@ class LearningWorkflowMixin:
     deps: BotDependencies
     _shutting_down: bool
     _learning_locks: MutableMapping[int, asyncio.Lock]
+
+    async def _require_membership(
+        self, event: Any, user_id: int, *, kind: str, callback_data: str = ""
+    ) -> bool:
+        """Provided by the composed bot; gates one value-delivery action."""
+        raise NotImplementedError
     _learning_in_flight: set[int]
     _learning_tasks: dict[int, asyncio.Task[Any]]
     _pending_flashcard: dict[int, tuple[int, str]]
@@ -2023,6 +2029,10 @@ class LearningWorkflowMixin:
                 await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
                 return
             preset = parts[3] if len(parts) == 4 else None
+            if not await self._require_membership(
+                event, user_id, kind="callback", callback_data=data
+            ):
+                return
             await self._flashcard_generate(event, user_id, item_id, preset)
             return
         if (
@@ -2114,6 +2124,10 @@ class LearningWorkflowMixin:
             count = _to_int(parts[3])
             if item_id is None or count is None:
                 await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+                return
+            if not await self._require_membership(
+                event, user_id, kind="callback", callback_data=data
+            ):
                 return
             await self._quiz_generate(event, user_id, item_id, count)
             return

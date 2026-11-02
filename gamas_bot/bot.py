@@ -27,11 +27,12 @@ composes six single-responsibility domain workflow mixins:
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 import shutil
 import time
+from types import SimpleNamespace
 from typing import Any
 import weakref
 
@@ -45,6 +46,7 @@ from .bot_deps import DEFAULT_BOT_DEPS, BotDependencies, deps_for
 from .bot_documents import DocumentOfficeWorkflowMixin
 from .bot_jobs import JobPipelineMixin
 from .bot_learning import LearningWorkflowMixin
+from .bot_referrals import ReferralWorkflowMixin
 from .bot_support import SupportWorkflowMixin
 from .bot_ui import (
     ACTIVE_LIMIT_MESSAGE,
@@ -93,10 +95,11 @@ from .bot_ui import (
 from .bot_wallet import WalletWorkflowMixin
 from .config import Settings, note_routes
 from .conversation_state import ConversationStateStore
-from .db import Database
+from .db import Database, iso
 from .doc_extract import extract_document
 from .docx_export import jalali_date
 from .fileio import run_file_io
+from .gate_resume import ResumedEvent
 from .intake import (
     AUDIO_EXTENSIONS,
     FAILURE_KIND_LABELS_FA,
@@ -135,7 +138,16 @@ from .presentations import load_presentation, prepare_audio
 from .progress import JobProgress, WorkProgress, to_persian_digits
 from .routing import CallbackRouter
 from .stt import first_configured_stt_url, transcribe
-from .subscription import SUBSCRIPTION_PREFIX, SubscriptionService
+from .subscription import (
+    PENDING_GATE_TTL_DAYS,
+    SUBSCRIPTION_PREFIX,
+    SWEEP_ACTIVE_DAYS,
+    SWEEP_BATCH_SIZE,
+    SWEEP_INTERVAL_SECONDS,
+    SWEEP_PAUSE_SECONDS,
+    SWEEP_START_DELAY_SECONDS,
+    SubscriptionService,
+)
 from .telegram_text import button_label, render_pages
 from . import texts
 from .telegram_transfer import (
@@ -163,6 +175,7 @@ class GamasBot(
     JobPipelineMixin,
     DocumentOfficeWorkflowMixin,
     LearningWorkflowMixin,
+    ReferralWorkflowMixin,
 ):
     """Main Telegram bot orchestrator composing single-responsibility workflows."""
 
@@ -200,6 +213,7 @@ class GamasBot(
         self._seen_messages: dict[tuple[int, int], float] = {}
         self._active_upload_keys: dict[tuple[int, str], str] = {}
         self._receipt_cleanup_task: asyncio.Task[Any] | None = None
+        self._membership_sweep_task: asyncio.Task[Any] | None = None
         self._transcript_cleanup_task: asyncio.Task[Any] | None = None
         self._prewarm_task: asyncio.Task[Any] | None = None
 
@@ -283,6 +297,9 @@ class GamasBot(
         if refunded:
             logger.info("refunded %s interrupted paid learning charges", refunded)
         await run_file_io(self._sweep_stale_temp_dirs)
+        await self.db.clear_expired_pending_gate_actions(
+            iso(datetime.now(timezone.utc) - timedelta(days=PENDING_GATE_TTL_DAYS))
+        )
         self.queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
         self._transcript_cleanup_task = asyncio.create_task(self._transcript_cleanup_loop())
@@ -297,6 +314,10 @@ class GamasBot(
         await self.client.start(bot_token=self.settings.bot_token)
         logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
         await self.subscription.startup_self_check()
+        if self.subscription.required and self.subscription.configured:
+            self._membership_sweep_task = asyncio.create_task(
+                self._membership_sweep_loop()
+            )
         if not self.settings.payment_card_number:
             logger.warning("PAYMENT_CARD_NUMBER is not set; card-to-card payments are disabled")
         await self.client.run_until_disconnected()
@@ -372,6 +393,7 @@ class GamasBot(
                 self._receipt_cleanup_task,
                 self._prewarm_task,
                 self._office_session_cleanup_task,
+                self._membership_sweep_task,
             )
             if task is not None
         ]
@@ -383,6 +405,7 @@ class GamasBot(
         self._receipt_cleanup_task = None
         self._prewarm_task = None
         self._office_session_cleanup_task = None
+        self._membership_sweep_task = None
 
         if self._ocr_client is not None:
             await run_file_io(self._ocr_client.close)
@@ -564,6 +587,7 @@ class GamasBot(
                 Button.inline(texts.BTN_HELP, b"help"),
             ]
         )
+        rows.append([Button.inline(texts.BTN_REFERRALS, b"ref:home")])
         if is_admin:
             rows.append([Button.inline(texts.BTN_ADMIN, b"adm:home")])
         return rows
@@ -585,6 +609,7 @@ class GamasBot(
                 Button.inline(texts.BTN_ADMIN_AUDIT, b"adm:audit"),
             ],
             [Button.inline(texts.BTN_ADMIN_TOP_USERS, b"adm:board")],
+            [Button.inline(texts.BTN_ADMIN_REFERRALS, b"adm:ref")],
             [Button.inline(texts.BTN_ADMIN_BACK_USER, b"menu:main")],
         ]
 
@@ -600,6 +625,144 @@ class GamasBot(
             notes_configured=self.settings.note_configured,
         )
         await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
+
+    # -------------------------------------------------------- membership gate
+    async def _require_membership(
+        self,
+        event,
+        user_id: int,
+        *,
+        kind: str,
+        callback_data: str = "",
+    ) -> bool:
+        """Gate one value-delivery action; keep the request if it is blocked.
+
+        Help, wallet, support, library browsing and receipt upload never call
+        this. Intake and generation do. A blocked request is remembered so the
+        successful ``sub:check`` resumes exactly what the user started.
+        """
+        if self._is_admin(user_id):
+            return True
+        if await self.subscription.require_access(event):
+            return True
+        await self._remember_pending_gate(
+            event, user_id, kind=kind, callback_data=callback_data
+        )
+        return False
+
+    async def _remember_pending_gate(
+        self, event, user_id: int, *, kind: str, callback_data: str = ""
+    ) -> None:
+        message_id = getattr(getattr(event, "message", None), "id", None)
+        if not isinstance(message_id, int):
+            message_id = getattr(event, "message_id", 0)
+        chat_id = getattr(event, "chat_id", None)
+        if not isinstance(chat_id, int):
+            chat_id = getattr(getattr(event, "message", None), "chat_id", None)
+        if not isinstance(chat_id, int):
+            chat_id = user_id
+        if not isinstance(message_id, int):
+            return
+        try:
+            await self.db.save_pending_gate_action(
+                user_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                kind=kind,
+                callback_data=callback_data[:64],
+            )
+        except Exception:  # noqa: BLE001 - remembering is best effort
+            logger.warning("could not remember a gate-blocked request", exc_info=True)
+
+    async def _resume_pending_gate_action(self, user_id: int) -> bool:
+        """Re-enter a blocked request after a successful membership check."""
+        pending = await self.db.take_pending_gate_action(user_id)
+        if not pending:
+            return False
+        try:
+            created = datetime.fromisoformat(pending["created_at"])
+        except (TypeError, ValueError):
+            created = datetime.now(timezone.utc)
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        if created < datetime.now(timezone.utc) - timedelta(
+            days=PENDING_GATE_TTL_DAYS
+        ):
+            return False
+        if int(pending["message_id"]) > 0:
+            try:
+                message = await self.client.get_messages(
+                    int(pending["chat_id"]), ids=int(pending["message_id"])
+                )
+            except Exception:  # noqa: BLE001 - a lost message is not a crash
+                logger.warning("could not reload a gate-blocked message", exc_info=True)
+                message = None
+        else:
+            # Callback actions need no message content; the button can be
+            # dispatched directly from the stored callback data.
+            message = SimpleNamespace(id=0)
+        if message is None:
+            return False
+        resumed = ResumedEvent(
+            client=self.client,
+            chat_id=int(pending["chat_id"]),
+            sender_id=user_id,
+            message=message,
+            data=(
+                pending["callback_data"].encode("utf-8")
+                if pending["kind"] == "callback" and pending["callback_data"]
+                else None
+            ),
+        )
+        logger.info("resuming a gate-blocked request kind=%s", pending["kind"])
+        if pending["kind"] == "callback":
+            await self._handle_callback(resumed)
+        else:
+            await self._handle_message(resumed)
+        return True
+
+    # ------------------------------------------------------ membership sweep
+    async def _membership_sweep_loop(self) -> None:
+        """Bounded, resumable re-checks of recently active users."""
+        await asyncio.sleep(SWEEP_START_DELAY_SECONDS)
+        while True:
+            try:
+                await self._membership_sweep_batch()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - a sweep must never stop the bot
+                logger.warning("membership sweep batch failed", exc_info=True)
+            await asyncio.sleep(SWEEP_INTERVAL_SECONDS)
+
+    async def _membership_sweep_batch(self) -> int:
+        """Check one small batch; an inconclusive result ends the batch."""
+        active_since = iso(
+            datetime.now(timezone.utc) - timedelta(days=SWEEP_ACTIVE_DAYS)
+        )
+        user_ids = await self.db.users_for_membership_sweep(
+            SWEEP_BATCH_SIZE, active_since=active_since
+        )
+        checked = 0
+        for user_id in user_ids:
+            if self._shutting_down:
+                break
+            result = await self.subscription.check_membership(
+                user_id, force=True, allow_cache=False
+            )
+            checked_at = iso(datetime.now(timezone.utc))
+            await self.subscription.record_result(user_id, result)
+            await self.db.set_subscription_state(
+                user_id,
+                result.status or result.state,
+                verified_at=checked_at if result.is_member else None,
+                checked_at=checked_at,
+            )
+            checked += 1
+            if result.is_unknown:
+                logger.warning("membership sweep paused on an inconclusive check")
+                break
+            await asyncio.sleep(SWEEP_PAUSE_SECONDS)
+        return checked
 
     async def _edit_or_reply(self, event, text: str, buttons=None) -> None:
         """Render a screen: edit when triggered by a button, reply when by a message."""
@@ -829,6 +992,8 @@ class GamasBot(
         r.register_exact("adm:bcast", self._cb_admin_broadcast)
         r.register_exact("adm:audit", lambda e, _u, _d: self._show_admin_audit(e, 0))
         r.register_exact("adm:board", lambda e, _u, _d: self._admin_board(e))
+        r.register_exact("ref:home", lambda e, u, _d: self._show_referrals(e, u))
+        r.register_exact("adm:ref", lambda e, _u, _d: self._show_admin_referrals(e))
         r.register_exact("adm:sup", self._handle_admin_support_callback)
 
         r.register_prefix("lib:docs", self._cb_lib_docs)
@@ -1026,8 +1191,6 @@ class GamasBot(
         if data.startswith(SUBSCRIPTION_PREFIX):
             await self.subscription.handle_callback(event, user_id, data)
             return
-        if not self._is_admin(user_id) and not await self.subscription.require_access(event):
-            return
 
         self.conversations.on_callback_navigation(user_id, data)
 
@@ -1045,6 +1208,7 @@ class GamasBot(
         if user_id is None:
             return
         sender = getattr(event, "sender", None)
+        existed = await self.db.user_exists(user_id)
         user = await self.db.ensure_user(
             user_id,
             first_name=getattr(sender, "first_name", None) if sender else None,
@@ -1055,13 +1219,16 @@ class GamasBot(
             await event.reply(texts.ACCESS_BANNED)
             return
         await self._capture_sender_name(event)
-        if not self._is_admin(user_id) and not await self.subscription.require_access(event):
-            return
         text = (event.message.message or "").strip()
         command = _command_name(text)
         if command == "/start":
             self.conversations.reset_on_start(user_id)
             self._office_sessions.pop(user_id, None)
+            if not existed:
+                parts = text.split(maxsplit=1)
+                payload = parts[1].strip() if len(parts) == 2 else ""
+                if payload.lower().startswith("ref_"):
+                    await self._apply_referral(event, user_id, payload[4:])
             await self._show_main(event, first_start=True)
             return
 

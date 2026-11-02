@@ -91,6 +91,13 @@ class JobPipelineMixin:
     _active_upload_keys: dict[tuple[int, str], str]
     _seen_messages: dict[tuple[int, int], float]
     _media_semaphore: asyncio.Semaphore
+
+    async def _require_membership(
+        self, event: Any, user_id: int, *, kind: str, callback_data: str = ""
+    ) -> bool:
+        """Provided by the composed bot; gates one value-delivery action."""
+        raise NotImplementedError
+
     _download_semaphore: asyncio.Semaphore
     _upload_semaphore: asyncio.Semaphore
 
@@ -230,6 +237,8 @@ class JobPipelineMixin:
         filename: str | None,
         duration: float | None,
     ) -> None:
+        if not await self._require_membership(event, user_id, kind="media"):
+            return
         await self._guard_upload_admission(
             event,
             user_id,
@@ -304,6 +313,10 @@ class JobPipelineMixin:
     async def _accept_presentation(
         self, event: Any, user_id: int, kind: str, filename: str | None
     ) -> None:
+        if not await self._require_membership(
+            event, user_id, kind="presentation"
+        ):
+            return
         await self._guard_upload_admission(
             event,
             user_id,

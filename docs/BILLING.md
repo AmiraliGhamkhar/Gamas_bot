@@ -54,6 +54,17 @@ Users may cancel before receipt upload; one open order per user. Payment history
 remains. Reviewed receipt images expire after 90 days by default; pending-review
 receipts are not automatically deleted.
 
+## Referral rewards
+
+A first-ever `/start ref_<code>` attributes the invite once. The referrer earns
+20 minutes when the invite is attributed and 1 hour when the invited user's first
+payment is approved. Both are ordinary non-expiring ledger credits; the reward
+table's unique key makes replayed starts and approvals idempotent, and the payment
+reward commits inside the approval transaction. Receipt upload alone pays nothing.
+Banned referrers are recorded but not paid. The invite screen and the admin
+referral report show attributed users and reward seconds; no wallet operation or
+learning gift is involved.
+
 ## Admin and upgrades
 
 Grants, unlimited status, bans and gift resets are audited/cooldown-limited.

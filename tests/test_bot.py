@@ -1082,11 +1082,17 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         admin_menu = menu_payloads(self.bot._user_menu(is_admin=True))
         self.assertEqual(
             user_menu,
-            {b"library", b"wallet", b"support", b"help", b"board", b"office:start"},
+            {
+                b"library", b"wallet", b"support", b"help", b"board",
+                b"office:start", b"ref:home",
+            },
         )
         self.assertEqual(
             admin_menu,
-            {b"library", b"wallet", b"support", b"help", b"board", b"office:start", b"adm:home"},
+            {
+                b"library", b"wallet", b"support", b"help", b"board",
+                b"office:start", b"ref:home", b"adm:home",
+            },
         )
         self.bot.settings = replace(self.settings, office_enabled=False)
         self.assertNotIn(b"office:start", menu_payloads(self.bot._user_menu()))
@@ -1117,7 +1123,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"wallet", payloads)
         self.assertIn(b"adm:home", payloads)
         self.assertIn(b"office:start", payloads)
-        self.assertEqual(len(payloads), 7)
+        self.assertEqual(len(payloads), 8)
 
     async def test_main_panel_copy_explains_free_office_and_wallet_balance(self):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
@@ -1674,14 +1680,20 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         start_payloads = menu_payloads(start.client.texts[0].get("buttons"))
         self.assertEqual(
             start_payloads,
-            {b"library", b"wallet", b"support", b"help", b"board", b"office:start"},
+            {
+                b"library", b"wallet", b"support", b"help", b"board",
+                b"office:start", b"ref:home",
+            },
         )
 
         menu = FakeCallbackEvent(501, b"menu:main")
         await self.bot._handle_callback(menu)
         self.assertEqual(
             menu_payloads(menu.edits[-1][1]),
-            {b"library", b"wallet", b"support", b"help", b"board", b"office:start"},
+            {
+                b"library", b"wallet", b"support", b"help", b"board",
+                b"office:start", b"ref:home",
+            },
         )
 
     async def test_bare_text_retriggers_file_upload_with_the_main_menu(self):
@@ -1693,7 +1705,10 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             menu_payloads(self.bot._user_menu()),
-            {b"library", b"wallet", b"support", b"help", b"board", b"office:start"},
+            {
+                b"library", b"wallet", b"support", b"help", b"board",
+                b"office:start", b"ref:home",
+            },
         )
 
     async def test_media_upload_without_a_mode_tap_runs_transcript_then_booklet(self):

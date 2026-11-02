@@ -18,6 +18,12 @@ logger = logging.getLogger("gamas_bot.db.payments")
 
 
 class PaymentsRepositoryMixin(DatabaseCore):
+    async def _credit_referral_for_payment(
+        self, referred_user_id: int, payment_id: int
+    ) -> bool:
+        """Provided by the referrals slice; overridden by the composed database."""
+        raise NotImplementedError
+
     """Single-responsibility persistence slice for plans and manual payments."""
 
     PAYMENT_OPEN_STATUSES = ("awaiting_payment", "pending_review", "pending")
@@ -316,6 +322,9 @@ class PaymentsRepositoryMixin(DatabaseCore):
                     "payment_id) VALUES (?, ?, 'credit', ?, ?, ?, ?)",
                     (user_id, seconds, f"plan:{plan_code}", expires, now, payment_id),
                 )
+                # The referrer's reward commits with the approval itself, so a
+                # rollback can never pay it without the buyer's credit.
+                await self._credit_referral_for_payment(user_id, payment_id)
             await self.db.execute(
                 "INSERT INTO audit(admin_id, action, detail, subject_user, created_at) "
                 "VALUES (?, ?, ?, ?, ?)",

@@ -17,6 +17,15 @@ class UsersRepositoryMixin(DatabaseCore):
     }
     FREE_CLAIM_COLUMNS: dict[str, str] = {"deck": "deck_claim", "quiz": "quiz_claim"}
 
+    async def user_exists(self, telegram_id: int) -> bool:
+        """Whether this Telegram account has ever used the bot."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT 1 FROM users WHERE telegram_id = ?",
+            (telegram_id,),
+        )
+        return bool(rows)
+
     async def ensure_user(
         self,
         telegram_id: int,
@@ -131,13 +140,91 @@ class UsersRepositoryMixin(DatabaseCore):
         status: str,
         *,
         verified_at: str | None = None,
+        checked_at: str | None = None,
     ) -> None:
         """Record the last observed membership status (observability only)."""
         await self._write(
-            "UPDATE users SET subscription_status = ?, subscription_verified_at = ? "
+            "UPDATE users SET subscription_status = ?, subscription_verified_at = ?, "
+            "subscription_checked_at = COALESCE(?, subscription_checked_at) "
             "WHERE telegram_id = ?",
-            (str(status), verified_at, telegram_id),
+            (str(status), verified_at, checked_at, telegram_id),
         )
+
+    async def users_for_membership_sweep(
+        self, limit: int, *, active_since: str
+    ) -> list[int]:
+        """Active, unbanned users ordered by the least-recently-checked first.
+
+        ``subscription_checked_at`` makes the sweep resumable: after a restart
+        it continues with the users whose membership has gone longest without
+        a fresh check instead of starting over at the first id.
+        """
+        rows = await _rows(
+            self.read_db,
+            "SELECT telegram_id FROM users "
+            "WHERE banned = 0 AND last_seen_at >= ? "
+            "ORDER BY (subscription_checked_at IS NOT NULL), "
+            "subscription_checked_at ASC, telegram_id ASC LIMIT ?",
+            (active_since, max(1, int(limit))),
+        )
+        return [int(row[0]) for row in rows]
+
+    async def save_pending_gate_action(
+        self,
+        user_id: int,
+        *,
+        chat_id: int,
+        message_id: int,
+        kind: str,
+        callback_data: str = "",
+    ) -> None:
+        """Remember one blocked request; a newer blocked request replaces it."""
+        await self._write(
+            "INSERT INTO pending_gate_actions"
+            "(user_id, chat_id, message_id, kind, callback_data, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET chat_id=excluded.chat_id, "
+            "message_id=excluded.message_id, kind=excluded.kind, "
+            "callback_data=excluded.callback_data, created_at=excluded.created_at",
+            (user_id, chat_id, message_id, kind, callback_data, iso(self._now())),
+        )
+
+    async def take_pending_gate_action(self, user_id: int) -> dict[str, Any] | None:
+        """Return and remove the user's pending blocked request, if any."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT user_id, chat_id, message_id, kind, callback_data, created_at "
+            "FROM pending_gate_actions WHERE user_id = ?",
+            (user_id,),
+        )
+        if not rows:
+            return None
+        row = rows[0]
+        await self._write(
+            "DELETE FROM pending_gate_actions WHERE user_id = ?", (user_id,)
+        )
+        return {
+            "user_id": int(row[0]),
+            "chat_id": int(row[1]),
+            "message_id": int(row[2]),
+            "kind": str(row[3]),
+            "callback_data": str(row[4] or ""),
+            "created_at": str(row[5]),
+        }
+
+    async def clear_expired_pending_gate_actions(self, cutoff: str) -> int:
+        """Drop requests older than the resume window; return how many."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM pending_gate_actions WHERE created_at < ?",
+            (cutoff,),
+        )
+        count = int(rows[0][0]) if rows else 0
+        if count:
+            await self._write(
+                "DELETE FROM pending_gate_actions WHERE created_at < ?", (cutoff,)
+            )
+        return count
 
     async def user_ids(self) -> list[int]:
         rows = await _rows(

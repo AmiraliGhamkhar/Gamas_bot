@@ -53,6 +53,9 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "free_uses",
         "documents",
         "learning_charges",
+        "pending_gate_actions",
+        "referrals",
+        "referral_rewards",
     }
 )
 

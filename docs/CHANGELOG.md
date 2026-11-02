@@ -2,6 +2,25 @@
 
 Concise history; detailed patches and earlier notes remain in Git history.
 
+## Unreleased — providers, membership and referrals (2026-11-02)
+
+- Removed the Groq and Cerebras note integrations from every registry, request
+  profile, config diagnostic and provider test. A legacy `NOTE_PROVIDERS` value
+  naming them is skipped with one explicit startup warning; startup continues.
+- Added DeepSeek V4.1 Flash as `deepseek` (`deepseek-flash` at
+  `https://api.deepseek.com`) with JSON Output only, no undocumented strict
+  schema, and bounded retries through the existing failover chain.
+- Deferred the channel gate from every interaction to value delivery. Blocked
+  files are stored in `pending_gate_actions` (migration 018) and resume after a
+  successful check without resubmission; a bounded, resumable sweep re-checks
+  active users oldest-first and stops on an inconclusive result.
+- Added first-start referral attribution and idempotent 20-minute/1-hour ledger
+  rewards (migration 019), an invite screen, and an admin referral report. The
+  payment reward commits with approval; receipt upload pays nothing.
+- `.env.example` still needs an operator edit because the workspace file guard
+  blocks env-family files: set `NOTE_PROVIDERS` without the removed providers and
+  document the `DEEPSEEK_*` keys.
+
 ## Unreleased — centralized Persian UX copy (2026-11-02)
 
 - Added `gamas_bot/texts.py` as the single source for start/help screens,

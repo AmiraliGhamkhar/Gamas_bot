@@ -47,6 +47,7 @@ from .db_documents import DocumentsRepositoryMixin
 from .db_learning import LearningRepositoryMixin
 from .db_library import LibraryRepositoryMixin
 from .db_payments import PaymentsRepositoryMixin
+from .db_referrals import ReferralsRepositoryMixin
 from .db_reporting import ReportingRepositoryMixin
 from .db_support import SupportRepositoryMixin
 from .db_users import UsersRepositoryMixin
@@ -65,6 +66,7 @@ logger = logging.getLogger(__name__)
 
 
 class Database(
+    ReferralsRepositoryMixin,
     LibraryRepositoryMixin,
     DocumentsRepositoryMixin,
     LearningRepositoryMixin,

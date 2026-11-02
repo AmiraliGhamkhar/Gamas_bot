@@ -1,10 +1,13 @@
-"""Single source of Persian user-facing and administrator-facing copy.
+"""Central source for the migrated Persian UX copy.
 
-Every message, button label, acknowledgement and progress headline a user or an
-operator reads lives here. Handlers own layout, state and routing; this module
-owns wording, emoji and the glossary (جزوه، فلش‌کارت، آزمون، اشتراک، کیف پول،
-رسید). Keeping the copy out of handlers makes it reviewable as one document and
-lets tests assert screens instead of scattered literals.
+Start/help, library, wallet and receipts, support, membership, progress and the
+referral screens read their wording from here. Handlers own layout, state and
+routing; this module owns wording, emoji and the glossary (جزوه، فلش‌کارت،
+آزمون، اشتراک، کیف پول، رسید). Keeping copy out of handlers makes it reviewable
+as one document and lets tests assert screens instead of scattered literals.
+
+The administrator report tables and the document/Office/learning workflow copy
+are not migrated yet; they are tracked as the remaining part of the same work.
 
 Rules followed here:
 
@@ -217,6 +220,37 @@ SUBSCRIPTION_SELF_CHECK_FAILED: Final = (
     "دلیل: {error}\n"
     "ربات باید administrator کانال {channel} باشد."
 )
+
+# ------------------------------------------------------------------- referrals
+BTN_REFERRALS: Final = "🤝 دعوت دوستان"
+BTN_ADMIN_REFERRALS: Final = "🤝 آمار دعوت"
+BTN_SHARE_INVITE: Final = "📤 اشتراک لینک دعوت"
+REFERRALS_TITLE: Final = "🤝 دعوت دوستان"
+REFERRALS_RULES: Final = (
+    "با هر دعوت موفق اعتبار هدیه بگیرید:\n"
+    "• ورود دوست با لینک شما: ۲۰ دقیقه اعتبار\n"
+    "• اولین خرید تأییدشدهٔ او: ۱ ساعت اعتبار"
+)
+REFERRALS_LINK_TEMPLATE: Final = "لینک اختصاصی شما:\n{link}"
+REFERRALS_CODE_TEMPLATE: Final = "کد دعوت شما: {code}"
+REFERRALS_STATS_TEMPLATE: Final = "دعوت‌شده‌ها: {invited} | اعتبار هدیه: {seconds}"
+REFERRALS_SELF: Final = "نمی‌توانید با لینک خودتان دعوت شوید."
+REFERRALS_DUPLICATE: Final = "این دعوت قبلاً ثبت شده است."
+REFERRALS_UNAVAILABLE: Final = (
+    "ساخت لینک دعوت موقتاً در دسترس نیست؛ کمی بعد دوباره تلاش کنید."
+)
+REFERRAL_JOIN_REWARD_TEMPLATE: Final = (
+    "🎁 هدیهٔ دعوت ثبت شد: {seconds} اعتبار به دوست شما اضافه شد."
+)
+REFERRAL_REFERRER_NOTICE_TEMPLATE: Final = (
+    "🎉 یک دوست با لینک شما به گاماس پیوست؛ {seconds} اعتبار هدیه گرفتید."
+)
+ADMIN_REFERRALS_HEADER: Final = "🤝 آمار دعوت"
+ADMIN_REFERRALS_TOTALS_TEMPLATE: Final = (
+    "مجموع هدیه‌ها: {rewards} | اعتبار پرداخت‌شده: {seconds}"
+)
+ADMIN_REFERRALS_ROW_TEMPLATE: Final = "{rank}. {who} — {invited} دعوت | {seconds}"
+ADMIN_REFERRALS_EMPTY: Final = "هنوز دعوتی ثبت نشده است."
 
 # --------------------------------------------------------------------- progress
 QUEUED_STAGE: Final = "در صف پردازش"
