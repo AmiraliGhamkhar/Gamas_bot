@@ -9,8 +9,7 @@ and flashcards need a working note route.
 | `gemini` | `GEMINI_API_KEY` | `gemini-2.5-flash-lite` |
 | `nara` | `NARA_API_KEY` | `agnes-2.5-flash` |
 | `openrouter` | `OPENROUTER_API_KEY` | `google/gemma-4-31b-it:free` |
-| `groq` | `GROQ_API_KEY` | `openai/gpt-oss-120b` |
-| `cerebras` | `CEREBRAS_API_KEY` | `gpt-oss-120b` |
+| `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-flash` |
 | `openai_compatible` | `NOTE_API_KEY` | `gpt-4o-mini` |
 | `anthropic` | `NOTE_API_KEY` | Explicit `NOTE_MODEL` required |
 
@@ -20,7 +19,7 @@ model access, context limits and pricing with your provider account.
 ## Setup
 
 ```dotenv
-NOTE_PROVIDERS=gemini,nara,openrouter,groq,cerebras
+NOTE_PROVIDERS=gemini,nara,openrouter,deepseek
 NOTE_CONCURRENCY=3
 NOTE_STRICT_GROUNDING=true
 ```
@@ -40,12 +39,11 @@ are bounded; responses are capped at 16 MiB.
 pending; `0` disables that extra quota use. Per-provider request profiles
 (`gamas_bot/llm_profiles.py`) normalize wire schemas and parameters automatically:
 Gemini `responseSchema` keeps `required` and strips `additionalProperties`;
-Cerebras uses `strict: true` schemas (capping completion tokens at `40,960` and
-setting `reasoning_format: "parsed"`); Groq switches to `json_object` while SSE
-streaming is active (`stream: true` + `json_schema` is rejected by Groq) and uses
-`max_completion_tokens` + `reasoning_format: "parsed"`; OpenRouter `:free` routes
-use `json_object` so endpoint filtering does not 404; and Nara omits undocumented
-`response_format` and `stream_options` fields unless explicitly opted in. Any
+OpenRouter `:free` routes use `json_object` so endpoint filtering does not 404;
+DeepSeek receives documented JSON Output (`json_object`) but never an
+undocumented strict `json_schema`; and Nara omits undocumented `response_format`
+and `stream_options` fields unless explicitly opted in. Groq and Cerebras were removed from the integration; a
+legacy `NOTE_PROVIDERS` value naming them is skipped with a startup warning. Any
 rejected parameter downgrades (`json_schema` → `json_object` → plain prompt) and
 retries once. Size budgets for the smallest configured model.
 Keep grounding enabled: [Note quality](NOTE_QUALITY.md).

@@ -100,8 +100,6 @@ def collect_configured_secrets(settings: Settings | None) -> tuple[str, ...]:
                 settings.note_api_key,
                 settings.nara_api_key,
                 settings.openrouter_api_key,
-                settings.groq_api_key,
-                settings.cerebras_api_key,
                 settings.gemini_api_key,
             ]
         )
@@ -115,8 +113,6 @@ def collect_configured_secrets(settings: Settings | None) -> tuple[str, ...]:
             "NOTE_API_KEY",
             "NARA_API_KEY",
             "OPENROUTER_API_KEY",
-            "GROQ_API_KEY",
-            "CEREBRAS_API_KEY",
             "GEMINI_API_KEY",
         ):
             raw = os.environ.get(env_key, "").strip()

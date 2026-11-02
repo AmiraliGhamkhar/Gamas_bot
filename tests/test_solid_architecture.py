@@ -57,11 +57,11 @@ class CooldownRegistryTests(unittest.TestCase):
         s2 = object()
 
         async def check_within_loop() -> tuple[float, float]:
-            reg.set(s1, "groq:0", 60.0)
-            return reg.remaining(s1, "groq:0"), reg.remaining(s2, "groq:0")
+            reg.set(s1, "note:0", 60.0)
+            return reg.remaining(s1, "note:0"), reg.remaining(s2, "note:0")
 
         async def check_other_loop() -> float:
-            return reg.remaining(s1, "groq:0")
+            return reg.remaining(s1, "note:0")
 
         rem_s1, rem_s2 = asyncio.run(check_within_loop())
         self.assertGreater(rem_s1, 0.0)

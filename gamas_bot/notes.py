@@ -578,7 +578,7 @@ class StructuredNotes:
 
 _BACKEND_NAMES = (
     "OpenAI", "GPT", "ChatGPT", "Gemini", "Google", "Anthropic", "Claude",
-    "Groq", "Mistral", "Cohere", "Deepgram", "Speechmatics", "Whisper",
+    "Mistral", "Cohere", "Deepgram", "Speechmatics", "Whisper",
     "OpenRouter", "Cloudflare", "NVIDIA", "Hugging Face", "HuggingFace",
 )
 _BACKEND_NAME_ALT = "|".join(re.escape(name) for name in _BACKEND_NAMES)

@@ -28,17 +28,13 @@ from gamas_bot.llm import (
     LLMRequestError,
     extract_json_object,
 )
-from gamas_bot.llm_profiles import (
-    to_cerebras_json_schema,
-    to_gemini_schema,
-)
+from gamas_bot.llm_profiles import to_gemini_schema
 from gamas_bot.notes import (
     COVERAGE_FILL_SYSTEM_PROMPT,
     NoteSection,
     StructuredNotes,
     build_fill_document,
     fill_coverage_gaps,
-    notes_response_schema,
 )
 from gamas_bot.notes_evidence import audit_notes, extract_signals, mask_structural
 from gamas_bot.office_notes import (
@@ -103,7 +99,7 @@ class _FakeHTTPSession:
 
 
 class ProviderDialectContractTests(unittest.TestCase):
-    """Official 2026 provider dialect contracts across Gemini, Cerebras, Groq, OpenRouter, Nara, OpenAI, Anthropic."""
+    """Official 2026 provider dialect contracts across Gemini, OpenRouter, Nara, OpenAI, Anthropic."""
 
     def test_gemini_schema_preserves_required_strips_additional_properties_and_handles_nullable(self) -> None:
         raw = {
@@ -143,63 +139,23 @@ class ProviderDialectContractTests(unittest.TestCase):
         self.assertNotIn("responseSchema", payload["generationConfig"])
         self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
 
-    def test_cerebras_strict_schema_strips_max_items_and_sets_parsed_reasoning_format(self) -> None:
-        for raw_schema in (notes_response_schema(), COMPACT_NOTE_SCHEMA, QUIZ_SCHEMA, FLASHCARD_SCHEMA):
-            converted = to_cerebras_json_schema(raw_schema)
-            dumped = json.dumps(converted)
-            self.assertNotIn('"maxItems"', dumped)
-            self.assertNotIn('"minItems"', dumped)
-            self.assertEqual(converted["schema"]["additionalProperties"], False)
-
+    def test_deepseek_uses_documented_json_object_and_never_strict_schema(self) -> None:
         settings = make_settings(
-            note_providers=("cerebras",),
-            cerebras_api_key="csk-test",
-            cerebras_model="gpt-oss-120b",
-            note_max_output_tokens=65_536,
+            note_providers=("deepseek",),
+            deepseek_api_key="ds-test",
+            deepseek_model="deepseek-flash",
             note_structured_output=True,
         )
         route = note_routes(settings)[0]
-        _url, _headers, payload = llm._build_request_for(
+        url, headers, payload = llm._build_request_for(
             route, settings, "S", "U", schema=COMPACT_NOTE_SCHEMA
         )
-        self.assertEqual(payload["max_tokens"], 40_960)
-        self.assertEqual(payload["reasoning_format"], "parsed")
-        self.assertEqual(payload["response_format"]["type"], "json_schema")
-        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
-
-    def test_groq_uses_json_object_when_streaming_and_strict_nullable_schema_when_not_streaming(self) -> None:
-        streaming_settings = make_settings(
-            note_providers=("groq",),
-            groq_api_key="gsk-test",
-            groq_model="openai/gpt-oss-120b",
-            note_structured_output=True,
-            note_ttfb_timeout=15.0,
-        )
-        route = note_routes(streaming_settings)[0]
-        _url, _headers, stream_payload = llm._build_request_for(
-            route, streaming_settings, "S", "U", schema=notes_response_schema()
-        )
-        self.assertEqual(stream_payload["response_format"], {"type": "json_object"})
-        self.assertEqual(stream_payload["max_completion_tokens"], streaming_settings.note_max_output_tokens)
-        self.assertNotIn("max_tokens", stream_payload)
-        self.assertEqual(stream_payload["reasoning_format"], "parsed")
-
-        non_stream_settings = make_settings(
-            note_providers=("groq",),
-            groq_api_key="gsk-test",
-            groq_model="openai/gpt-oss-120b",
-            note_structured_output=True,
-            note_ttfb_timeout=0.0,
-        )
-        _url2, _headers2, non_stream_payload = llm._build_request_for(
-            route, non_stream_settings, "S", "U", schema=notes_response_schema()
-        )
-        rf = non_stream_payload["response_format"]
-        self.assertEqual(rf["type"], "json_schema")
-        self.assertTrue(rf["json_schema"]["strict"])
-        strict_root = rf["json_schema"]["schema"]
-        self.assertEqual(set(strict_root["required"]), set(strict_root["properties"].keys()))
-        self.assertEqual(strict_root["properties"]["title"]["type"], ["string", "null"])
+        self.assertEqual(url, "https://api.deepseek.com/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer ds-test")
+        self.assertEqual(payload["model"], "deepseek-flash")
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+        self.assertNotIn("json_schema", json.dumps(payload["response_format"]))
+        self.assertNotIn("stream_options", payload)
 
     def test_openrouter_free_model_avoids_json_schema_routing_404_and_downgrades_gracefully(self) -> None:
         free_settings = make_settings(

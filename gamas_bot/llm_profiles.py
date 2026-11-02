@@ -23,15 +23,6 @@ Verified provider rules:
   endpoint capability filter (returning HTTP 404 when no upstream endpoint for
   a ``:free`` model advertises ``structured_outputs``); ``json_object`` avoids
   filtering out free-pool endpoints.
-* **Groq**: forbids ``stream: true`` with ``json_schema`` Structured Outputs,
-  requires ``strict: true`` schemas to list all properties in ``required`` with
-  ``additionalProperties: false``, and forbids ``reasoning_format: "raw"`` with
-  JSON or Structured Outputs.
-* **Cerebras**: supports ``strict: true`` JSON Schema with streaming, requires
-  ``additionalProperties: false`` on every object (optional properties omitted
-  from ``required`` are allowed), rejects ``minItems``/``maxItems``/``oneOf``/
-  ``allOf``/``pattern``, caps ``gpt-oss-120b`` completion tokens at 40,960, and
-  forbids ``reasoning_format: "raw"`` with JSON or Structured Outputs.
 * **OpenAI** (``api.openai.com``): ``strict: true`` requires
   ``additionalProperties: false`` and all properties in ``required``; ``o1``/
   ``o3``/``o4``/``gpt-5`` reasoning families require ``max_completion_tokens``.
@@ -69,7 +60,7 @@ _GEMINI_UNSUPPORTED_SCHEMA_KEYS = frozenset(
     }
 )
 
-#: JSON Schema keywords rejected by strict-mode grammars on Cerebras / Groq / OpenAI.
+#: JSON Schema keywords rejected by strict-mode grammars on OpenAI.
 _STRICT_UNSUPPORTED_SCHEMA_KEYS = frozenset(
     {
         "minItems",
@@ -93,18 +84,7 @@ _STRICT_UNSUPPORTED_SCHEMA_KEYS = frozenset(
     }
 )
 
-#: Groq model prefixes/ids documented as supporting ``json_schema`` with ``strict: true``.
-_GROQ_STRICT_SCHEMA_PREFIXES = (
-    "openai/gpt-oss-120b",
-    "openai/gpt-oss-20b",
-    "gpt-oss-120b",
-    "gpt-oss-20b",
-    "qwen/qwen3",
-    "qwen3",
-    "moonshotai/kimi-k2",
-)
-
-#: Model families on Groq / Cerebras that emit reasoning tokens and forbid
+#: Model families that emit reasoning tokens and must not receive
 #: ``reasoning_format="raw"`` alongside ``json_object`` / ``json_schema``.
 _REASONING_FORMAT_MODEL_MARKERS = (
     "gpt-oss",
@@ -250,20 +230,10 @@ def _transform_strict_schema_node(
     return converted
 
 
-def to_cerebras_json_schema(
-    schema: dict[str, Any], *, name: str = "gamas_notes"
-) -> dict[str, Any]:
-    """Build Cerebras's documented ``strict: true`` ``json_schema`` envelope."""
-    transformed = _transform_strict_schema_node(
-        schema, require_all_properties=False
-    )
-    return {"name": name, "strict": True, "schema": transformed}
-
-
 def to_strict_openai_json_schema(
     schema: dict[str, Any], *, name: str = "gamas_notes"
 ) -> dict[str, Any]:
-    """Build OpenAI/Groq's ``strict: true`` ``json_schema`` envelope."""
+    """Build OpenAI's ``strict: true`` ``json_schema`` envelope."""
     transformed = _transform_strict_schema_node(
         schema, require_all_properties=True
     )
@@ -293,14 +263,6 @@ def _is_openai_reasoning_model(model: str) -> bool:
 def _needs_parsed_reasoning_format(model: str) -> bool:
     lower = model.strip().lower()
     return any(marker in lower for marker in _REASONING_FORMAT_MODEL_MARKERS)
-
-
-def _groq_supports_strict_schema(model: str) -> bool:
-    lower = model.strip().lower()
-    return any(
-        lower == prefix or lower.startswith(prefix)
-        for prefix in _GROQ_STRICT_SCHEMA_PREFIXES
-    )
 
 
 def _openrouter_prefers_json_object(model: str) -> bool:
@@ -334,12 +296,6 @@ class ProviderCapabilityProfile:
         capped = max(1, int(budget))
         if self.max_output_tokens_cap is not None:
             capped = min(capped, self.max_output_tokens_cap)
-        if self.slug == "groq":
-            lower_model = route.model.strip().lower()
-            if "qwen" in lower_model or "llama" in lower_model:
-                capped = min(capped, 32_768)
-            else:
-                capped = min(capped, 65_536)
         return capped
 
     def build_response_format(
@@ -354,22 +310,19 @@ class ProviderCapabilityProfile:
             getattr(settings, "note_structured_output", True)
         )
         if use_schema and schema is not None:
-            if not self.supports_response_format(route) or not self.documented_json_schema:
+            if not self.documented_json_schema:
+                # DeepSeek documents JSON Output but not strict ``json_schema``;
+                # Nara and Anthropic document neither, so they get no field.
+                if (
+                    self.documented_json_object
+                    and route.slug in NOTE_JSON_OBJECT_PROVIDERS
+                ):
+                    return {"type": "json_object"}
+                return None
+            if not self.supports_response_format(route):
                 return None
             if self.slug == "openrouter" and _openrouter_prefers_json_object(route.model):
                 return {"type": "json_object"}
-            if self.slug == "groq":
-                if streaming or not _groq_supports_strict_schema(route.model):
-                    return {"type": "json_object"}
-                return {
-                    "type": "json_schema",
-                    "json_schema": to_strict_openai_json_schema(schema),
-                }
-            if self.slug == "cerebras":
-                return {
-                    "type": "json_schema",
-                    "json_schema": to_cerebras_json_schema(schema),
-                }
             if self.slug == "openai_compatible" and _is_openai_official_host(
                 route.base_url
             ):
@@ -392,9 +345,6 @@ class ProviderCapabilityProfile:
         settings: Settings,
     ) -> None:
         """Attach provider-specific OpenAI-compatible extensions safely."""
-        if self.slug == "groq" and "max_tokens" in payload:
-            payload["max_completion_tokens"] = payload.pop("max_tokens")
-
         if (
             self.slug == "openai_compatible"
             and _is_openai_official_host(route.base_url)
@@ -447,25 +397,6 @@ PROVIDER_PROFILES: dict[str, ProviderCapabilityProfile] = {
         documented_stream_options=True,
         documented_reasoning_effort=True,
     ),
-    "groq": ProviderCapabilityProfile(
-        slug="groq",
-        documented_json_object=True,
-        documented_json_schema=True,
-        supports_streaming_with_json_schema=False,
-        documented_stream_options=True,
-        documented_reasoning_effort=True,
-        parsed_reasoning_for_json=True,
-    ),
-    "cerebras": ProviderCapabilityProfile(
-        slug="cerebras",
-        documented_json_object=True,
-        documented_json_schema=True,
-        supports_streaming_with_json_schema=True,
-        documented_stream_options=True,
-        documented_reasoning_effort=True,
-        parsed_reasoning_for_json=True,
-        max_output_tokens_cap=40_960,
-    ),
     "openai_compatible": _DEFAULT_PROFILE,
     "gemini": ProviderCapabilityProfile(
         slug="gemini",
@@ -474,6 +405,15 @@ PROVIDER_PROFILES: dict[str, ProviderCapabilityProfile] = {
         supports_streaming_with_json_schema=True,
         documented_stream_options=False,
         documented_reasoning_effort=False,
+    ),
+    "deepseek": ProviderCapabilityProfile(
+        slug="deepseek",
+        documented_json_object=True,
+        # Only JSON Output is documented; strict json_schema is not.
+        documented_json_schema=False,
+        supports_streaming_with_json_schema=False,
+        documented_stream_options=False,
+        documented_reasoning_effort=True,
     ),
     "anthropic": ProviderCapabilityProfile(
         slug="anthropic",

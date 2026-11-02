@@ -19,12 +19,10 @@ from types import SimpleNamespace
 from telethon import TelegramClient
 
 from gamas_bot.config import (
-    DEFAULT_CEREBRAS_BASE_URL,
-    DEFAULT_CEREBRAS_MODEL,
+    DEFAULT_DEEPSEEK_BASE_URL,
+    DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_GEMINI_MODEL,
     DEFAULT_GEMINI_THINKING_BUDGET,
-    DEFAULT_GROQ_BASE_URL,
-    DEFAULT_GROQ_MODEL,
     Settings,
 )
 
@@ -484,14 +482,11 @@ def make_settings(**overrides) -> Settings:
         openrouter_api_key="",
         openrouter_base_url="https://openrouter.ai/api/v1",
         openrouter_model="google/gemma-4-31b-it:free",
-        groq_api_key="",
-        groq_base_url=DEFAULT_GROQ_BASE_URL,
-        groq_model=DEFAULT_GROQ_MODEL,
-        cerebras_api_key="",
-        cerebras_base_url=DEFAULT_CEREBRAS_BASE_URL,
-        cerebras_model=DEFAULT_CEREBRAS_MODEL,
         gemini_api_key="",
         gemini_model=DEFAULT_GEMINI_MODEL,
+        deepseek_api_key="",
+        deepseek_base_url=DEFAULT_DEEPSEEK_BASE_URL,
+        deepseek_model=DEFAULT_DEEPSEEK_MODEL,
         # Zero by default, matching the shipped configuration: note requests
         # must never wait on hidden reasoning tokens.
         gemini_thinking_budget=DEFAULT_GEMINI_THINKING_BUDGET,

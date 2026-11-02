@@ -107,27 +107,27 @@ class LoggingConfigTests(unittest.TestCase):
 
     def test_secret_redaction_scrubs_configured_secrets_and_bearer_tokens_in_plain_and_json(self) -> None:
         bot_tok = "123456789:AAHxyz_SecretBotTokenValue1234567890"
-        groq_key = "gsk_abcdefghijklmnopqrstuvwxyz123456"
+        api_key = "sk_abcdefghijklmnopqrstuvwxyz123456"
         redacted = redact_log_secrets(
-            f"https://api.telegram.org/bot{bot_tok}/getMe Authorization: Bearer {groq_key}",
-            (bot_tok, groq_key),
+            f"https://api.telegram.org/bot{bot_tok}/getMe Authorization: Bearer {api_key}",
+            (bot_tok, api_key),
         )
         self.assertNotIn(bot_tok, redacted)
-        self.assertNotIn(groq_key, redacted)
+        self.assertNotIn(api_key, redacted)
 
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "json.log"
             buf = io.StringIO()
             settings = make_settings(
                 bot_token=bot_tok,
-                stt_openai_api_key=groq_key,
+                stt_openai_api_key=api_key,
                 log_format="json",
                 log_file=log_path,
             )
             configure_logging(settings, stream=buf)
             log = logging.getLogger("gamas_bot.scrub_test")
             try:
-                raise RuntimeError(f"upstream failed key={groq_key} url=bot{bot_tok}")
+                raise RuntimeError(f"upstream failed key={api_key} url=bot{bot_tok}")
             except RuntimeError:
                 log.exception("caught error with %s", bot_tok)
 
@@ -135,7 +135,7 @@ class LoggingConfigTests(unittest.TestCase):
                 handler.flush()
             raw = log_path.read_text(encoding="utf-8").strip()
             self.assertNotIn(bot_tok, raw)
-            self.assertNotIn(groq_key, raw)
+            self.assertNotIn(api_key, raw)
             parsed = json.loads(raw.splitlines()[-1])
             self.assertEqual(parsed["level"], "ERROR")
             self.assertEqual(parsed["job_id"], "-")

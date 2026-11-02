@@ -1,8 +1,8 @@
 """The single LLM client for note generation: ordered providers, bounded retries.
 
-``NOTE_PROVIDERS`` *is* the failover policy (``gemini,nara,openrouter,groq,
-cerebras`` by default — Gemini flash-lite first, then each further provider
-only when it is listed *and* has its own credential). For every route the
+``NOTE_PROVIDERS`` *is* the failover policy (``gemini,nara,openrouter`` by
+default — Gemini flash-lite first, then each further provider only when it is
+listed *and* has its own credential). For every route the
 client builds that provider's own request
 (base URL, authentication, model, supported parameters), parses its own response
 shape, retries only transient failures — a bounded budget per provider — and
@@ -694,7 +694,7 @@ def _usage_count(value: object) -> int | None:
 
 
 class OpenAIDialect:
-    """OpenAI-compatible wire-format dialect (OpenRouter, NaraRouter, Groq, Cerebras)."""
+    """OpenAI-compatible wire-format dialect (OpenRouter, NaraRouter, generic)."""
 
     style = "openai"
 

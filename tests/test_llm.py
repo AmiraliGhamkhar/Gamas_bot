@@ -184,23 +184,20 @@ class RequestBuildingTests(unittest.TestCase):
         _url, _headers, payload = _build_request(settings, "S", "U")
         self.assertNotIn("reasoning_effort", payload)
 
-    def test_reasoning_effort_sent_on_the_gpt_oss_routes(self):
-        """Groq and Cerebras document ``reasoning_effort`` on gpt-oss."""
+    def test_reasoning_effort_sent_on_a_documented_route(self):
+        """NaraRouter documents ``reasoning_effort`` for its hosted models."""
         settings = routed_settings(
-            note_providers=("groq", "cerebras"),
-            nara_api_key="",
+            note_providers=("nara",),
+            nara_api_key="nara-key",
             openrouter_api_key="",
-            groq_api_key="gsk-key",
-            cerebras_api_key="csk-key",
             note_reasoning_effort="low",
         )
-        groq, cerebras = note_routes(settings)
-        for route in (groq, cerebras):
-            url, headers, payload = _build_request(settings, "S", "U", route=route)
-            self.assertEqual(payload["reasoning_effort"], "low")
-            self.assertEqual(payload["model"], route.model)
-            self.assertTrue(url.endswith("/chat/completions"))
-            self.assertEqual(headers["Authorization"], f"Bearer {route.api_key}")
+        route = note_routes(settings)[0]
+        url, headers, payload = _build_request(settings, "S", "U", route=route)
+        self.assertEqual(payload["reasoning_effort"], "low")
+        self.assertEqual(payload["model"], route.model)
+        self.assertTrue(url.endswith("/chat/completions"))
+        self.assertEqual(headers["Authorization"], f"Bearer {route.api_key}")
 
     def test_gemini_thinking_budget_is_zero_by_default(self):
         settings = make_settings(
