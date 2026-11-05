@@ -27,7 +27,6 @@ from gamas_bot.notes import (
     MAX_CONTEXT_SPLITS,
     PRESENTATION_PROMPT,
     PROMPT_RESERVE_TOKENS,
-    TRANSCRIPT_PROMPT,
     StructuringError,
     effective_chunk_chars,
     effective_compile_max_chars,
@@ -38,6 +37,11 @@ from gamas_bot.notes import (
     StructuredNotes,
     MAX_NOTE_CONCURRENCY,
     build_chunk_message,
+    build_compile_system_prompt,
+    build_edit_message,
+    edit_system_prompt,
+    notes_system_prompt,
+    notes_response_schema,
     build_context,
     _note_semaphore,
     _response_schema,
@@ -55,13 +59,25 @@ from gamas_bot.notes import (
     headings_overlap,
     headings_share_a_topic,
     merge_structured_notes,
-    notes_response_schema,
     scrub_backend_artifacts,
     split_presentation_document,
     structure_presentation,
     structure_transcript,
 )
 from tests.support import make_settings, sample_notes_json
+
+
+def _recovered_body(call: dict) -> str:
+    """The source text of one map request, exactly as the template carried it.
+
+    The one-part template is ``header`` + blank line + text; the multi-part one
+    adds the topic line after the text, so the text is what sits between the
+    header and that line.
+    """
+    content = call["json"]["messages"][1]["content"]
+    body = content.split("\n\n", 1)[-1]
+    marker = "\n\nموضوع همین بخش: "
+    return body.split(marker, 1)[0]
 
 
 def notes_from_dict(payload: dict) -> StructuredNotes:
@@ -264,11 +280,13 @@ class ContextTests(unittest.TestCase):
         self.assertIn("شبکه‌های عصبی", context.topics[0])
         self.assertIn("الگوریتم‌های یادگیری", context.topics[1])
 
-    def test_context_block_mentions_topic_and_neighbours(self):
+    def test_context_block_carries_the_map_and_neighbours_only(self):
+        """The part's own topic is appended by the template, not repeated here."""
         chunks = ["اول این درس است. ادامه دارد.", "دوم این درس است.", "سوم این درس است."]
         context = build_context(chunks)
         block = context_block_for(context, chunks, 2)
-        self.assertIn("موضوع همین بخش", block)
+        self.assertIn("موضوع‌های درس به ترتیب", block)  # the map
+        self.assertNotIn("موضوع همین بخش", block)       # lives in the template
         self.assertIn("اول این درس است", block)      # previous tail
         self.assertIn("سوم این درس است", block)       # next head
 
@@ -292,36 +310,107 @@ class PromptTests(unittest.TestCase):
         for legacy in ("standard", "summary", "bogus", None):
             with self.subTest(mode=legacy):
                 self.assertEqual(build_system_prompt(legacy), full)
-        self.assertIn("FULL", full)
         self.assertIn("JSON", full)
         self.assertNotIn("SUMMARY", full)
         self.assertNotIn("STANDARD", full)
         self.assertEqual(tuple(MODE_RULES), ("full",))
 
-    def test_full_mode_is_compact_but_lossless(self):
-        """The full-mode contract: compact wording, no dropped facts, no added facts.
+    def test_the_system_prompt_ignores_every_per_request_argument(self):
+        """The cache contract: one prompt, byte-identical, for every request.
 
-        Regression guard for the prompt-edit that made `full` produce a compact
-        booklet. If someone reintroduces the old verbose rule, or a garbled
-        forbid-list bullet, this fails.
+        A system prompt that changes with the source kind or the chunk context
+        can never be served from a prefix cache, and the cached-input price is
+        a fraction of the uncached one.
         """
-        full = build_system_prompt("full")
-        # Compaction is instructed explicitly…
-        self.assertIn("جزوه باید «فشرده» باشد", full)
-        # …but only in wording: facts may not be dropped for brevity…
-        self.assertIn("فشرده‌سازی فقط در بیان است", full)
-        self.assertIn("هیچ مطلب علمیِ متن حذف نشود", full)
-        # …and nothing may be invented.
-        self.assertIn("هیچ مطلب تازه‌ای اضافه نکنید", full)
-        # The forbid-list bullet is clean Persian, not the old garbled text, and
-        # no bullet is glued onto its neighbour by a missing newline.
-        self.assertNotIn("similares", full)
-        self.assertNotIn("نیاورید.-", full)
+        static = build_system_prompt("full")
+        self.assertEqual(build_system_prompt("full", source_locators=True), static)
+        self.assertEqual(
+            build_system_prompt("full", context_block="موضوع همین بخش: «تست»"), static
+        )
+        self.assertEqual(build_presentation_system_prompt("full"), static)
+        self.assertEqual(build_compile_system_prompt("full"), edit_system_prompt())
+        self.assertEqual(
+            build_compile_system_prompt("full", presentation=True, source_locators=True),
+            edit_system_prompt(),
+        )
+        # Nothing per-job may leak into either prompt: a sentinel that exists
+        # only in this test must not survive a single call.
+        sentinel = "SENTINEL-CONTEXT-9f2c"
+        self.assertNotIn(sentinel, build_system_prompt("full", context_block=sentinel))
+        self.assertNotIn(sentinel, build_presentation_system_prompt("full", context_block=sentinel))
+        for prompt in (static, edit_system_prompt(), build_compile_system_prompt("full")):
+            self.assertNotIn(sentinel, prompt)
+            self.assertNotIn("موضوع‌های درس به ترتیب", prompt)
 
-    def test_context_block_appended(self):
-        prompt = build_system_prompt("full", context_block="موضوع همین بخش: «تست»")
-        self.assertIn("موضوع همین بخش", prompt)
-        self.assertIn("قواعد نوشتن یک «بخش»", prompt)
+    def test_the_booklet_agent_contract_is_complete(self):
+        """The Persian booklet-agent specification is present, clause by clause.
+
+        Each phrase below is one of the contract's absolute rules; removing one
+        is a behaviour change, not a wording change.
+        """
+        prompt = build_system_prompt("full")
+        for phrase in (
+            "عامل تولید جزوهٔ گاماس",
+            "گردآورندهٔ جزوهٔ درس",  # not a summariser
+            "وفاداری به منبع",  # ۱-۱
+            "پوشش کامل",  # ۱-۲
+            "انسجام ساختاری",  # ۱-۳
+            "خروجی JSON مطلق",  # ۱-۴
+            "فشرده‌سازی: در بیان، نه در محتوا",  # ۲
+            "هیچ عدد، واحد، درصد، دوز، بازه، تاریخ یا علامت اختصاری",  # ۳-۱
+            "مقدار مشتق‌شده",  # ۳-۱ / ۸-۴
+            "نیم‌فاصله (U+200C)",  # ۳-۳
+            "ساختار JSON",  # ۴
+            "sections هرگز خالی نمی‌ماند",  # ۴-۳
+            "مکان‌یاب منبع",  # ۵
+            "source_locators",  # ۵-۲
+            "رفتار چندبخشی",  # ۶
+            "لحن دانشگاهی",  # ۷
+            "ممنوعیت‌های مطلق",  # ۸
+            "هر خروجی غیر JSON",  # ۸-۷
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prompt)
+
+    def test_the_json_contract_matches_the_response_schema(self):
+        """The prompt's JSON shape and the enforced schema name the same keys.
+
+        The exporter, the gates and the schema all bind to this contract; a key
+        that exists in one and not the other is a silent data loss.
+        """
+        prompt = build_system_prompt("full")
+        schema = notes_response_schema()
+        for key in schema["properties"]:
+            self.assertIn(f'"{key}"', prompt, key)
+        for key in schema["properties"]["sections"]["items"]["properties"]:
+            self.assertIn(f'"{key}"', prompt, key)
+        # The kind vocabularies the prompt names are the ones the parser accepts.
+        self.assertIn("«نکته»، «هشدار»، «یادآوری»", prompt)
+        self.assertIn("«کاربردی»، «آزمونی»، «هشدار»", prompt)
+
+    def test_chunk_context_lives_in_the_user_message(self):
+        message = build_chunk_message(
+            "متن بخش", index=2, total=3, topic="انتقال فعال",
+            context_block="موضوع‌های درس به ترتیب: (۱) مقدمه، (۲) انتقال فعال",
+        )
+        # The documented chunk template: position, source text, topic.
+        self.assertTrue(message.startswith("متن پیاده‌سازی‌شدهٔ خام (بخش ۲ از ۳):"))
+        self.assertIn("\n\nمتن بخش\n\n", message)  # the text is passed verbatim
+        self.assertTrue(message.endswith("موضوع همین بخش: انتقال فعال"))
+        self.assertIn("موضوع‌های درس به ترتیب", message)
+        # A one-part lesson has no part number to announce; the header says so,
+        # which is what lets the model fill the lesson-level keys.
+        single = build_chunk_message("کل درس", index=1, total=1)
+        self.assertTrue(single.startswith("متن پیاده‌سازی‌شدهٔ خام (درس تک‌بخشی):"))
+        self.assertTrue(single.endswith("کل درس"))
+        self.assertNotIn("موضوع همین بخش", single)
+
+    def test_the_chunk_rules_are_static_and_named_by_the_system_prompt(self):
+        """Per-part behaviour is instructed once, in the static prompt."""
+        prompt = notes_system_prompt()
+        for phrase in ("بخش i از n", "موضوع همین بخش", "ادامه", "عنوان بخش پیشین"):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prompt)
 
 
 class CompileAcceptanceTests(unittest.TestCase):
@@ -409,13 +498,13 @@ class CompileBudgetTests(unittest.TestCase):
             effective_compile_max_chars(narrow), effective_compile_max_chars(wide)
         )
 
-    def test_budget_reserves_the_selected_mode_and_presentation_compile_prompt(self):
+    def test_the_editorial_budget_is_the_same_for_every_source_kind(self):
+        """One static editorial prompt means one budget (and one cached prefix)."""
         settings = make_settings(note_context_tokens=40_000, note_max_output_tokens=4096)
         full = effective_compile_max_chars(settings)
-        summary = effective_compile_max_chars(settings, mode="summary")
-        presentation = effective_compile_max_chars(settings, presentation=True)
-        self.assertLess(summary, full)
-        self.assertLess(presentation, full)
+        self.assertEqual(effective_compile_max_chars(settings, mode="summary"), full)
+        self.assertEqual(effective_compile_max_chars(settings, presentation=True), full)
+        self.assertGreater(full, 0)
 
     def test_the_derived_budget_is_bounded_by_the_hard_ceiling(self):
         settings = make_settings(
@@ -464,8 +553,8 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         notes = await structure_transcript(document, settings, session)
         # The oversized request was replaced by two smaller ones…
         self.assertEqual(len(session.calls), 3)
-        first = session.calls[1]["json"]["messages"][1]["content"].removeprefix(TRANSCRIPT_PROMPT)
-        second = session.calls[2]["json"]["messages"][1]["content"].removeprefix(TRANSCRIPT_PROMPT)
+        first = _recovered_body(session.calls[1])
+        second = _recovered_body(session.calls[2])
         self.assertNotEqual(first, second)
         # …and no content was lost between them (the splitter trims boundary
         # whitespace only, never words).
@@ -493,8 +582,8 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         ])
         notes = await structure_transcript(document, settings, session)
         self.assertEqual(len(session.calls), 3)
-        first = session.calls[1]["json"]["messages"][1]["content"].removeprefix(TRANSCRIPT_PROMPT)
-        second = session.calls[2]["json"]["messages"][1]["content"].removeprefix(TRANSCRIPT_PROMPT)
+        first = _recovered_body(session.calls[1])
+        second = _recovered_body(session.calls[2])
         self.assertNotEqual(first, second)
         self.assertEqual(
             " ".join((first + " " + second).split()), " ".join(document.split())
@@ -585,18 +674,35 @@ class CacheStablePrefixTests(unittest.TestCase):
 
     def test_the_rules_block_is_identical_for_every_chunk(self):
         full = build_system_prompt("full")
-        # What the map phase sends: the same string for chunk 1, 2 and 3.
+        # What the map phase sends: the same string for chunk 1, 2 and 3 — and
+        # for a slides job, a one-part lesson and a repair pass of the same job.
         self.assertEqual(len({full, build_system_prompt("full")}), 1)
-        self.assertNotIn("موضوع همین بخش", full)
+        self.assertEqual(build_presentation_system_prompt("full"), full)
+        self.assertNotIn("موضوع همین بخش: ", full)
+        self.assertNotIn("بخش ۱ از", full)
 
     def test_the_varying_context_moves_into_the_user_message(self):
-        block = "موضوع همین بخش: «انتقال فعال»"
-        message = build_chunk_message(block, "متن این بخش")
-        self.assertTrue(message.startswith("\nقواعد نوشتن یک «بخش»"))
-        self.assertIn(block, message)
-        self.assertTrue(message.endswith("متن این بخش"))
-        # No block, no wrapper: the message is exactly the chunk.
-        self.assertEqual(build_chunk_message("", "متن"), "متن")
+        message = build_chunk_message(
+            "متن این بخش", index=2, total=3, topic="انتقال فعال",
+        )
+        self.assertTrue(message.startswith("متن پیاده‌سازی‌شدهٔ خام (بخش ۲ از ۳):"))
+        self.assertIn("متن این بخش", message)
+        self.assertTrue(message.endswith("موضوع همین بخش: انتقال فعال"))
+        # The topic map of the lesson travels here too, never in the prompt.
+        with_map = build_chunk_message(
+            "متن این بخش", index=2, total=3, topic="انتقال فعال",
+            context_block="موضوع‌های درس به ترتیب: (۱) مقدمه، (۲) انتقال فعال",
+        )
+        self.assertIn("موضوع‌های درس به ترتیب", with_map)
+        self.assertNotIn("موضوع‌های درس به ترتیب", build_system_prompt("full"))
+
+    def test_the_editorial_message_puts_the_source_before_the_draft(self):
+        message = build_edit_message("موضوع‌های درس به ترتیب: انتقال فعال", '{"sections": []}')
+        self.assertTrue(message.startswith("متن منبع کامل:"))
+        self.assertLess(message.index("متن منبع کامل"), message.index("پیش‌نویس جزوه"))
+        # The editor prompt may *name* its two inputs; what must not travel in
+        # the static part is the source itself.
+        self.assertNotIn("موضوع‌های درس به ترتیب: انتقال فعال", edit_system_prompt())
 
 
 class ConcurrencyBoundTests(unittest.TestCase):
@@ -919,7 +1025,8 @@ class PresentationPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("یادداشت گوینده: هر لایه ویژگی‌ها را", user_content)
         self.assertIn("## متن پیاده‌سازی‌شدهٔ صدای ارائه", user_content)
         self.assertIn(transcript, user_content)
-        self.assertIn("یادداشت گویندهٔ هر اسلاید جزو محتوای آموزشی است", request["messages"][0]["content"])
+        self.assertIn("یادداشت گوینده", request["messages"][0]["content"])
+        self.assertIn("متن اسلاید", request["messages"][0]["content"])
 
     def test_presentation_document_keeps_both_sources_separate(self):
         document = build_presentation_document("### اسلاید ۱\nیادداشت گوینده: نکته", "صدای کلاس")
@@ -1533,10 +1640,13 @@ class CompletenessValidatorTests(unittest.TestCase):
         self.assertTrue(all(isinstance(gap, str) for gap in gaps))
 
     def test_fill_prompt_and_document_enforce_grounding(self):
-        # The no-hallucination contract is literally embedded in the fill prompt.
-        for phrase in ("ممنوعیت افزودن", "متن منبع", "sections", "عدد"):
+        # The fill prompt is the static booklet contract plus the fill rules, so
+        # it shares the cached prefix and keeps the no-hallucination clauses.
+        self.assertTrue(COVERAGE_FILL_SYSTEM_PROMPT.startswith(notes_system_prompt()))
+        for phrase in ("زیرحالت «پرکردن جاافتاده»", "متن منبع", "sections", "عدد"):
             self.assertIn(phrase, COVERAGE_FILL_SYSTEM_PROMPT)
-        self.assertIn("هیچ ادعایی", COVERAGE_FILL_SYSTEM_PROMPT)
+        self.assertIn("از دانش بیرونی نیاورید", COVERAGE_FILL_SYSTEM_PROMPT)
+        self.assertIn("پشتوانهٔ لفظی در متن", COVERAGE_FILL_SYSTEM_PROMPT)
         doc = build_fill_document(["یک جملهٔ منبع"], StructuredNotes())
         self.assertIn("یک جملهٔ منبع", doc)  # source unit passed through verbatim
         self.assertIn("متن منبع", doc)
@@ -1544,16 +1654,27 @@ class CompletenessValidatorTests(unittest.TestCase):
 
 
 class SkeletonPromptTests(unittest.TestCase):
-    def test_generation_prompts_mandate_the_complete_skeleton(self):
-        for prompt in (build_system_prompt("full"), build_presentation_system_prompt("full")):
-            for phrase in (
-                "جلد و عنوان درس", "فهرست مطالب", "هدف کلی درس",
-                "جمع‌بندی", "واژه‌نامه", "قانون پوشش",
-                "learning_objectives", "glossary", "definitions",
-                "examples", "steps", "formulas", "tables", "callouts",
-            ):
+    def test_the_single_prompt_mandates_the_complete_skeleton(self):
+        """One prompt serves audio, slides and documents, so it carries every block.
+
+        The exporter renders the TOC, the end-of-booklet recap and the glossary
+        from these fields; a prompt that stopped naming them would ship a
+        booklet with empty blocks.
+        """
+        prompt = build_system_prompt("full")
+        for phrase in (
+            "هدف یادگیری", "جمع‌بندی", "واژه‌نامه", "پوشش کامل",
+            "learning_objectives", "glossary", "definitions",
+            "examples", "steps", "formulas", "tables", "callouts",
+        ):
+            with self.subTest(phrase=phrase):
                 self.assertIn(phrase, prompt)
-        self.assertIn("اسکلت لازم جزوه", COMPILE_SYSTEM_PROMPT)
+        # Both source kinds are covered by the same static contract.
+        self.assertIn("متن اسلاید", prompt)
+        self.assertIn("یادداشت گوینده", prompt)
+        # The editorial pass keeps the same skeleton contract.
+        self.assertIn("sections", COMPILE_SYSTEM_PROMPT)
+        self.assertIn("حذف نکنید", COMPILE_SYSTEM_PROMPT)
 
 
 class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
@@ -1594,7 +1715,7 @@ class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
         fill_call = session.calls[1]["json"]["messages"]
         system = fill_call[0]["content"]
         user = fill_call[1]["content"]
-        self.assertIn("ممنوعیت افزودن", system)      # forbidden-additions contract
+        self.assertIn("ممنوعیت‌های مطلق", system)     # forbidden-additions contract
         self.assertIn("متن منبع", user)              # grounded, source-only input
 
     async def test_fill_failure_is_non_fatal(self):

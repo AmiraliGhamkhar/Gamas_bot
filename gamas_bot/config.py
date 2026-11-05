@@ -55,6 +55,7 @@ NOTE_PROVIDER_SLUGS = (
     "gemini",
     "deepseek",
     "anthropic",
+    "avalai",
 )
 #: Provider slugs that were removed from the integration. They are kept only so
 #: a legacy ``NOTE_PROVIDERS`` value is skipped with one explicit warning instead
@@ -67,6 +68,7 @@ NOTE_REQUEST_STYLE = {
     "gemini": "gemini",
     "deepseek": "openai",
     "anthropic": "anthropic",
+    "avalai": "openai",
 }
 NOTE_PROVIDER_LABELS = {
     "nara": "NaraRouter",
@@ -75,12 +77,13 @@ NOTE_PROVIDER_LABELS = {
     "gemini": "Gemini",
     "deepseek": "DeepSeek",
     "anthropic": "Anthropic",
+    "avalai": "AvalAI",
 }
 #: OpenAI ``response_format`` JSON mode is only sent to providers whose public
 #: API documents it (NaraRouter does not document it, so asking for it there
 #: would be an unsupported parameter).
 NOTE_JSON_OBJECT_PROVIDERS = frozenset(
-    {"openrouter", "openai_compatible", "deepseek"}
+    {"openrouter", "openai_compatible", "deepseek", "avalai"}
 )
 #: Provider hostnames, so a deployment that configures one OpenAI-compatible
 #: slot with a ``NOTE_BASE_URL`` pointing at a documented provider keeps that
@@ -94,6 +97,7 @@ NOTE_HOST_PROVIDERS = (
     ("openrouter.ai", "openrouter"),
     ("generativelanguage.googleapis.com", "gemini"),
     ("deepseek.com", "deepseek"),
+    ("avalai.ir", "avalai"),
 )
 
 #: Documented API defaults per provider. Nara's free plan currently lists
@@ -117,6 +121,14 @@ DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
 #: (https://api-docs.deepseek.com/api/list-models/).
 DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
+#: AvalAI is a hosted OpenAI-compatible gateway (documented base URL
+#: ``https://api.avalai.ir/v1``) that re-serves the upstream vendors' models
+#: under its own ids (https://docs.avalai.ir/en/api-reference/chat). Its
+#: DeepSeek entry is ``deepseek-v4.1-flash``: 1M-token input, documented JSON
+#: output *and* ``json_schema`` structured output, and implicit prompt caching
+#: (https://docs.avalai.ir/en/providers/deepseek).
+DEFAULT_AVALAI_BASE_URL = "https://api.avalai.ir/v1"
+DEFAULT_AVALAI_MODEL = "deepseek-v4.1-flash"
 #: Gemini thinking budget sent as ``generationConfig.thinkingConfig.thinkingBudget``:
 #:
 #: * ``0`` (default) disables thinking outright — the note task is extraction
@@ -132,14 +144,16 @@ NOTE_BASE_URL_DEFAULTS = {
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
     "deepseek": DEFAULT_DEEPSEEK_BASE_URL,
     "anthropic": "https://api.anthropic.com/v1",
+    "avalai": DEFAULT_AVALAI_BASE_URL,
 }
 
 #: Default note failover order: Gemini flash-lite first (fastest documented
-#: route), then NaraRouter and OpenRouter. A slug without its own credential
-#: is skipped silently, so this default degrades safely for every existing
-#: deployment. The order in ``NOTE_PROVIDERS`` *is* the failover policy,
-#: exactly like ``STT_PROVIDERS``.
-DEFAULT_NOTE_PROVIDERS = "gemini,nara,openrouter,deepseek"
+#: route), then NaraRouter, OpenRouter, DeepSeek and AvalAI. A slug without its
+#: own credential is skipped silently, so this default degrades safely for
+#: every existing deployment — an operator who never sets ``AVALAI_API_KEY``
+#: gets exactly the previous chain. The order in ``NOTE_PROVIDERS`` *is* the
+#: failover policy, exactly like ``STT_PROVIDERS``.
+DEFAULT_NOTE_PROVIDERS = "gemini,nara,openrouter,deepseek,avalai"
 
 DEFAULT_NOTE_MODELS = {
     "openai_compatible": "gpt-4o-mini",
@@ -147,6 +161,7 @@ DEFAULT_NOTE_MODELS = {
     "nara": DEFAULT_NARA_MODEL,
     "openrouter": DEFAULT_OPENROUTER_MODEL,
     "deepseek": DEFAULT_DEEPSEEK_MODEL,
+    "avalai": DEFAULT_AVALAI_MODEL,
 }
 
 #: Context window assumed for one note request when the operator does not say.
@@ -565,6 +580,9 @@ class Settings:
     deepseek_api_key: str
     deepseek_base_url: str
     deepseek_model: str
+    avalai_api_key: str
+    avalai_base_url: str
+    avalai_model: str
     #: ``0`` disables Gemini thinking, a positive value caps it, ``-1`` sends no
     #: ``thinkingConfig`` field at all (see ``DEFAULT_GEMINI_THINKING_BUDGET``).
     gemini_thinking_budget: int
@@ -762,6 +780,10 @@ class Settings:
         return bool(self.deepseek_api_key)
 
     @property
+    def avalai_configured(self) -> bool:
+        return bool(self.avalai_api_key)
+
+    @property
     def note_configured(self) -> bool:
         """Whether at least one provider in the active order is usable."""
         return bool(note_routes(self))
@@ -856,6 +878,7 @@ def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
     )
     is_openrouter_host = host == "openrouter.ai" or host.endswith(".openrouter.ai")
     is_gemini_host = host == "generativelanguage.googleapis.com"
+    is_avalai_host = host == "avalai.ir" or host.endswith(".avalai.ir")
 
     if (slug == "gemini" or is_gemini_host) and path.endswith("/models"):
         path = path[: -len("/models")].rstrip("/")
@@ -867,6 +890,8 @@ def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
             path = "/api/v1"
         elif slug == "gemini" or is_gemini_host:
             path = "/v1beta"
+        elif slug == "avalai" or is_avalai_host:
+            path = "/v1"
     elif path == "/api" and (slug == "openrouter" or is_openrouter_host):
         path = "/api/v1"
 
@@ -952,6 +977,9 @@ def note_slot_credentials(settings: Settings, slug: str) -> tuple[str, str, str]
     elif slug == "deepseek":
         key = settings.deepseek_api_key
         base, model = settings.deepseek_base_url, settings.deepseek_model
+    elif slug == "avalai":
+        key = settings.avalai_api_key
+        base, model = settings.avalai_base_url, settings.avalai_model
     else:  # openai_compatible / anthropic: configured through the v2-era slot
         key, base, model = "", "", ""
     if slug == settings.note_provider and _legacy_note_configured(settings):
@@ -965,7 +993,8 @@ def note_route_order(settings: Settings) -> tuple[str, ...]:
     """The explicit provider order: the declared chain, then the v2-era slot.
 
     ``NOTE_PROVIDERS`` is the policy (default
-    ``gemini,nara,openrouter,deepseek``; uncredentialed slugs are skipped).
+    ``gemini,nara,openrouter,deepseek,avalai``; uncredentialed slugs are
+    skipped).
     A configured
     ``NOTE_PROVIDER`` slot (the v2 spelling, still honoured) keeps its place when
     it is already a member of that chain — a NaraRouter deployment is the Nara
@@ -1253,6 +1282,11 @@ def from_env(env_file: str | None = None) -> Settings:
             _env("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL), "deepseek"
         ),
         deepseek_model=_env("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
+        avalai_api_key=_normalize_api_key(_env("AVALAI_API_KEY")),
+        avalai_base_url=normalize_note_base_url(
+            _env("AVALAI_BASE_URL", DEFAULT_AVALAI_BASE_URL), "avalai"
+        ),
+        avalai_model=_env("AVALAI_MODEL", DEFAULT_AVALAI_MODEL),
         gemini_thinking_budget=_env_int(
             "NOTE_GEMINI_THINKING_BUDGET",
             DEFAULT_GEMINI_THINKING_BUDGET,
@@ -1672,7 +1706,7 @@ def _check_note_settings(settings: Settings) -> list[ConfigDiagnostic]:
             ConfigDiagnostic(
                 "Note generation is not configured (NOTE_PROVIDERS / NOTE_API_KEY / "
                 "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / "
-                "DEEPSEEK_API_KEY); "
+                "DEEPSEEK_API_KEY / AVALAI_API_KEY); "
                 "the bot will deliver raw transcripts only.",
                 advisory=True,
             )

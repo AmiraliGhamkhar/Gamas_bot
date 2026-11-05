@@ -442,6 +442,7 @@ def bench_json(minutes: float = 120) -> None:
 def bench_prompts(chars: int) -> None:
     from gamas_bot.notes import (
         CHUNK_CONTEXT_RESERVE_CHARS,
+        build_chunk_message,
         build_compile_system_prompt,
         build_system_prompt,
         effective_chunk_chars,
@@ -457,7 +458,12 @@ def bench_prompts(chars: int) -> None:
         return
     settings = make_settings()
     system = build_system_prompt("full")
-    contextual = build_system_prompt("full", context_block="x" * CHUNK_CONTEXT_RESERVE_CHARS)
+    # The prompt is static, so the per-chunk orientation block is measured where
+    # it actually travels: in the user message.
+    user_message = build_chunk_message(
+        "متن نمونه", index=1, total=2, topic="موضوع نمونه",
+        context_block="x" * CHUNK_CONTEXT_RESERVE_CHARS,
+    )
     compile_prompt = build_compile_system_prompt("full")
     print(f"transcript: {len(text)} chars (~{len(text) / 900:.0f} min of speech)")
     print(f"NOTE_CHUNK_CHARS={settings.note_chunk_chars}  NOTE_CONCURRENCY={settings.note_concurrency}")
@@ -466,7 +472,7 @@ def bench_prompts(chars: int) -> None:
         f"  NOTE_MAX_OUTPUT_TOKENS={settings.note_max_output_tokens}"
     )
     print(f"\n{'system prompt (stable rules)':46s} {len(system):6d} chars  ~{len(system) / 2:5.0f} tokens")
-    print(f"{'system prompt + chunk context':46s} {len(contextual):6d} chars  ~{len(contextual) / 2:5.0f} tokens")
+    print(f"{'user message (chunk + context)':46s} {len(user_message):6d} chars  ~{len(user_message) / 2:5.0f} tokens")
     print(f"{'compile system prompt':46s} {len(compile_prompt):6d} chars  ~{len(compile_prompt) / 2:5.0f} tokens")
     chunk_chars = effective_chunk_chars(settings, system_prompt=system)
     with_context = effective_chunk_chars(

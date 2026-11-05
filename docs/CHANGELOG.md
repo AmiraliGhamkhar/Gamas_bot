@@ -2,6 +2,33 @@
 
 Concise history; detailed patches and earlier notes remain in Git history.
 
+## Unreleased — one static booklet prompt and the AvalAI route (2026-11-06)
+
+- Replaced the assembled per-mode note prompt with one static agent contract
+  (`gamas_bot/_prompt_block.py`, 8 principles, byte-identical for every request)
+  and moved every per-job datum into the user message. The system prompt is now
+  the same string for every chunk, source kind, mode and job, so a provider with
+  implicit prefix caching bills it once; `PromptTests` asserts the bytes and the
+  absence of per-job data instead of the old per-mode phrasing.
+- The documented per-request templates are now the real ones: chunk requests are
+  `متن پیاده‌سازی‌شدهٔ خام (بخش i از n)` + text + `موضوع همین بخش`, the single-part
+  path says `(درس تک‌بخشی)`, and the editorial compile is `متن منبع کامل` + digest
+  then `پیش‌نویس جزوه` + draft. Overflow recovery re-renders both halves from the
+  raw text instead of cutting a rendered message, and the repair/compile passes
+  share one message shape.
+- The prompt carries the full booklet skeleton the exporter already renders
+  (cover/title, contents from headings, objectives, per-section definitions,
+  examples, steps, formulas, tables, callouts and key points, a one-page summary
+  and an English-term glossary) plus the no-drop coverage rule.
+- Added AvalAI as a note route: `AVALAI_API_KEY`, `AVALAI_BASE_URL`
+  (default `https://api.avalai.ir/v1`) and `AVALAI_MODEL` (default
+  `deepseek-v4.1-flash`), last in the default chain so an unconfigured key
+  changes nothing. It sends the documented `json_schema` envelope and keeps the
+  `json_object` → drop degradation ladder.
+- `.env.example` now documents the `DEEPSEEK_*` and `AVALAI_*` keys, lists the
+  real `NOTE_PROVIDERS` default and no longer advertises the removed Groq and
+  Cerebras settings.
+
 ## Unreleased — providers, membership and referrals (2026-11-02)
 
 - Removed the Groq and Cerebras note integrations from every registry, request

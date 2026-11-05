@@ -1,8 +1,8 @@
 """The single LLM client for note generation: ordered providers, bounded retries.
 
-``NOTE_PROVIDERS`` *is* the failover policy (``gemini,nara,openrouter`` by
-default — Gemini flash-lite first, then each further provider only when it is
-listed *and* has its own credential). For every route the
+``NOTE_PROVIDERS`` *is* the failover policy (``gemini,nara,openrouter,deepseek,
+avalai`` by default — Gemini flash-lite first, then each further provider only
+when it is listed *and* has its own credential). For every route the
 client builds that provider's own request
 (base URL, authentication, model, supported parameters), parses its own response
 shape, retries only transient failures — a bounded budget per provider — and
@@ -1128,7 +1128,8 @@ def _build_request(
         if not routes:
             raise LLMAuthError(
                 "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
-                "NARA_API_KEY / OPENROUTER_API_KEY)."
+                "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY / "
+                "AVALAI_API_KEY)."
             )
         route = routes[0]
     return _build_request_for(route, settings, system, user)
@@ -2307,7 +2308,8 @@ async def complete(
     if not routes:
         raise LLMAuthError(
             "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
-            "NARA_API_KEY / OPENROUTER_API_KEY)."
+            "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY / "
+            "AVALAI_API_KEY)."
         )
 
     async def _call(route: NoteRoute, is_last: bool) -> str:
@@ -2513,7 +2515,8 @@ async def complete_json(
     if not routes:
         raise LLMAuthError(
             "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
-            "NARA_API_KEY / OPENROUTER_API_KEY)."
+            "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY / "
+            "AVALAI_API_KEY)."
         )
 
     async def _call_json(route: NoteRoute, is_last: bool) -> dict:

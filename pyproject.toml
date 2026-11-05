@@ -143,6 +143,7 @@ files = [
     "gamas_bot/logging_config.py",
     "gamas_bot/media.py",
     "gamas_bot/media_worker.py",
+    "gamas_bot/_prompt_block.py",
     "gamas_bot/notes.py",
     "gamas_bot/presentations.py",
     "gamas_bot/progress.py",

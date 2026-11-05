@@ -1410,6 +1410,57 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertTrue(probe._check_gemini(gemini))
 
+    def test_smoke_avalai_reports_a_missing_key_without_a_network_call(self):
+        """The smoke script's first stage is configuration, never a request."""
+        from scripts import smoke_avalai
+
+        settings = make_settings(
+            note_providers=("avalai",),
+            avalai_api_key="",
+        )
+        with mock.patch.object(smoke_avalai, "_check_metadata") as metadata:
+            self.assertEqual(smoke_avalai.main([]), 1)
+        metadata.assert_not_called()
+        self.assertIsNone(smoke_avalai._print_config(settings))
+
+    def test_smoke_avalai_names_the_route_it_would_use(self):
+        from scripts import smoke_avalai
+
+        settings = make_settings(
+            note_providers=("avalai",),
+            avalai_api_key="av-secret",
+            avalai_model="deepseek-v4.1-flash",
+        )
+        route = smoke_avalai._print_config(settings)
+        self.assertIsNotNone(route)
+        assert route is not None
+        self.assertEqual(route.slug, "avalai")
+        self.assertEqual(route.base_url, "https://api.avalai.ir/v1")
+        self.assertEqual(route.model, "deepseek-v4.1-flash")
+
+    async def test_smoke_avalai_metadata_check_reads_the_models_listing(self):
+        from scripts import smoke_avalai
+
+        settings = make_settings(note_providers=("avalai",), avalai_api_key="av-secret")
+        route = note_routes(settings)[0]
+
+        class ModelsSession(FakeSession):
+            def get(self, url, **kwargs):
+                self.calls.append({"url": url, **kwargs})
+                return _AsyncCM(FakeResponse(200, {
+                    "data": [{
+                        "id": "deepseek-v4.1-flash",
+                        "context_window": 1000000,
+                        "max_output_tokens": 393216,
+                    }]
+                }))
+
+        session = ModelsSession([])
+        with mock.patch.object(aiohttp, "ClientSession", return_value=_AsyncCM(session)):
+            self.assertTrue(await smoke_avalai._check_metadata(route, settings))
+        self.assertEqual(session.calls[0]["url"], "https://api.avalai.ir/v1/models")
+        self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer av-secret")
+
     async def test_probe_reports_an_unusable_context_budget_as_a_failure(self):
         from scripts import probe_note_providers as probe
 

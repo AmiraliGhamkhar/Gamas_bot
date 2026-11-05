@@ -157,6 +157,51 @@ class ProviderDialectContractTests(unittest.TestCase):
         self.assertNotIn("json_schema", json.dumps(payload["response_format"]))
         self.assertNotIn("stream_options", payload)
 
+    def test_avalai_sends_documented_json_schema_with_a_json_object_fallback(self) -> None:
+        """AvalAI documents ``json_schema``; a refusal degrades, never fails.
+
+        https://docs.avalai.ir/en/guides/structured-outputs — the gateway warns
+        that support is per-model, and the request builder already downgrades a
+        rejected ``json_schema`` to ``json_object`` before dropping the field.
+        """
+        settings = make_settings(
+            note_providers=("avalai",),
+            avalai_api_key="av-test",
+            avalai_model="deepseek-v4.1-flash",
+            note_structured_output=True,
+        )
+        route = note_routes(settings)[0]
+        url, headers, payload = llm._build_request_for(
+            route, settings, "S", "U", schema=COMPACT_NOTE_SCHEMA
+        )
+        self.assertEqual(url, "https://api.avalai.ir/v1/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer av-test")
+        self.assertEqual(payload["model"], "deepseek-v4.1-flash")
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertEqual(
+            payload["response_format"]["json_schema"]["name"],
+            "gamas_notes",
+        )
+        # The documented degradation ladder: a refused schema becomes
+        # ``json_object``, and a refused ``json_object`` is dropped — so an
+        # unsupported model still answers instead of failing the booklet.
+        rejected = {
+            "model": payload["model"],
+            "response_format": payload["response_format"],
+        }
+        adjustment = llm._adjust_rejected_request_param(
+            rejected, "unsupported parameter: response_format.json_schema"
+        )
+        self.assertEqual(adjustment, "response_format.json_schema_to_json_object")
+        self.assertEqual(rejected["response_format"], {"type": "json_object"})
+
+        dropped = {"model": payload["model"], "response_format": {"type": "json_object"}}
+        adjustment = llm._adjust_rejected_request_param(
+            dropped, "response_format is not supported for this model"
+        )
+        self.assertEqual(adjustment, "response_format")
+        self.assertNotIn("response_format", dropped)
+
     def test_openrouter_free_model_avoids_json_schema_routing_404_and_downgrades_gracefully(self) -> None:
         free_settings = make_settings(
             note_providers=("openrouter",),
