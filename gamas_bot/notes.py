@@ -40,6 +40,33 @@ try:
 except ImportError:  # pragma: no cover - optional fast-path
     _orjson = None  # type: ignore[assignment]
 
+# The public prompt surface of the note pipeline. It is re-exported here (not
+# only imported) because callers, benchmarks and tests address it through this
+# module: ``build_system_prompt``, ``build_compile_system_prompt``,
+# ``MODE_RULES``, ``COMPILE_SYSTEM_PROMPT`` and the message builders. The text
+# itself lives in ``_prompt_block`` so that it cannot be assembled differently
+# per call site — see that module's docstring for the cache contract.
+from ._prompt_block import (  # noqa: F401  (re-exported public prompt surface)
+    CHUNK_CONTEXT_RESERVE_CHARS,
+    COMPILE_SYSTEM_PROMPT,
+    CONTEXT_DIGEST_MAX_CHARS,
+    CONTEXT_HEAD_CHARS,
+    COVERAGE_FILL_RULES,
+    DRAFT_HEADING,
+    MODE_RULES,
+    NEIGHBOUR_CONTEXT_CHARS,
+    PRESENTATION_CHUNK_TOPIC_MAX_CHARS,
+    PRESENTATION_PROMPT,
+    SOURCE_DIGEST_HEADING,
+    build_chunk_message,
+    build_compile_system_prompt,
+    build_edit_message,
+    build_system_prompt,
+    build_presentation_system_prompt,
+    edit_system_prompt,
+    notes_system_prompt,
+)
+
 from .config import Settings, resolve_note_mode
 from .llm import (
     LLMContextOverflowError,
@@ -74,6 +101,11 @@ VALID_CALLOUT_KINDS = ("نکته", "هشدار", "یادآوری")
 
 #: A merge below this size is not worth an editorial compile call.
 COMPILE_MIN_NOTES_CHARS = 400
+#: Worst-case size of the editorial message scaffolding (headings, separators,
+#: the digest wrapper and the JSON envelope) that is neither the system prompt
+#: nor the booklet body. The compile budget reserves it explicitly instead of
+#: assuming the topic digest is the only other material in the window.
+EDIT_MESSAGE_RESERVE_CHARS = 4096
 #: Absolute ceiling on the compile request, however large the configured
 #: window is: a larger merged booklet is delivered as the deterministic merge
 #: rather than re-sent as one enormous request. The operative budget below
@@ -87,14 +119,12 @@ COMPILE_MIN_SECTION_RATIO = 0.5
 COMPILE_MIN_CONTENT_RATIO = 0.35
 #: Average body characters per section above which prose-loss gating applies.
 COMPILE_SUBSTANTIVE_SECTION_CHARS = 400
-#: The neighbour window handed to a chunk as context only.
-NEIGHBOUR_CONTEXT_CHARS = 260
-#: Characters of each chunk opening used for the deterministic topic digest.
-CONTEXT_HEAD_CHARS = 220
-#: Maximum characters for a multi-slide chunk's topic summary in the digest.
-PRESENTATION_CHUNK_TOPIC_MAX_CHARS = 440
-#: Hard bound on the deterministic digest.
-CONTEXT_DIGEST_MAX_CHARS = 6000
+#: The deterministic digest/neighbour bounds. They live in the prompt module
+#: because the chunk-context reserve is derived from them; ``notes`` re-exports
+#: them so existing callers keep one import site.
+#: (see ``gamas_bot._prompt_block``: CONTEXT_HEAD_CHARS,
+#: PRESENTATION_CHUNK_TOPIC_MAX_CHARS, CONTEXT_DIGEST_MAX_CHARS,
+#: NEIGHBOUR_CONTEXT_CHARS)
 
 #: Conservative characters-per-token ratio for a Persian/English lecture.
 #: Persian tokenizes less efficiently than English on every mainstream
@@ -783,260 +813,18 @@ def headings_overlap(first: str, second: str, *, threshold: float = 0.5) -> bool
 
 
 # ===========================================================================
-# Prompts (ported verbatim — the content-preservation contract)
+# Prompt-facing helpers and the response schema
 # ===========================================================================
 
-#: CR-3: FULL is the single source of truth. The note-generation ``mode``
-#: parameter is kept on the public builders for backward compatibility,
-#: but every call resolves to this one rule set; the legacy compression
-#: modes were removed.
-MODE_RULES = {
-    "full": (
-        "- حالت خروجی: FULL. شما «گردآورندهٔ جزوهٔ درس» هستید، نه خلاصه‌ساز. جزوه باید جایگزین قابل‌اتکای حضار در کلاس باشد و هیچ مطلب علمیِ متن حذف نشود.\n"
-        "- جزوه باید «فشرده» باشد: جملهٔ کوتاه و پرمعنا، بدون پرگویی، بدون جملهٔ تزئینی، بدون مقدمه و جمع‌بندیِ تکراری. فشردگی از نگارش می‌آید، نه از حذف مطلب.\n"
-        "- فشرده‌سازی فقط در بیان است: هر تعریف، دلیل، مکانیزم، مثال، روند گام‌به‌گام، مقایسه، هشدار، استثنا، فرمول، عدد و واحد باید کامل و عیناً در جزوه بیاید؛ یک توضیح چندجمله‌ای را برای کوتاه‌شدن جزوه به یک خط یا یک بولت فشرده تبدیل نکنید — همان معنا را با جمله‌های کمتر و کامل‌تر بیان کنید.\n"
-        "- تکرارهای سرهم و عین‌هم را یک بار بنویسید؛ تکراری که گوینده آگاهانه برای تأکید یا روشن‌شدن به‌کار برده نگه دارید.\n"
-        "- هیچ مطلب تازه‌ای اضافه نکنید: هر جمله، عدد و اصطلاح باید پشتوانهٔ لفظی در متن منبع داشته باشد.\n"
-    ),
-}
-
-_CONTENT_RULES = (
-    "\nقواعد حفظ محتوا — مهم‌ترین بخش دستور است:\n"
-    "- فقط بر پایهٔ متن داده‌شده بنویسید؛ اگر بخشی نامفهوم است، آن را حدس نزنید و همان‌قدر که فهمیده‌اید بنویسید.\n"
-    "- هیچ عدد، واحد، درصد، دوز، مقدار آزمایشگاهی، بازه یا علامت اختصاری را حذف یا تغییر ندهید؛ صورت دقیق آن‌ها را عیناً بیاورید.\n"
-    "- اصطلاح‌های تخصصی و عبارت‌های انگلیسی (نام دارو، دستگاه، مفهوم علمی و مخفف‌ها) را به همان شکل انگلیسی و بدون ترجمهٔ اجباری داخل متن فارسی حفظ کنید؛ ترجمهٔ فارسی رایج را می‌توانید در پرانتز بیاورید.\n"
-    "- تعریف‌ها را در definitions بیاورید (term، term_en اختیاری، definition)؛ مثال‌ها را در examples؛ روند گام‌به‌گام را در steps؛ فرمول‌ها را با صورت دقیق‌شان در formulas.\n"
-    "- توضیح‌های مهم گوینده را به‌جای یک خط کوتاه، پاراگراف کامل بنویسید؛ جزوه باید درس را بدون شنیدن صدا قابل فهم کند.\n"
-    "- نکته‌های کلیدی، یادآوری‌ها و هشدارهای مهم را در callouts یا key_points جداگانه برجسته کنید.\n"
-    "- مطالب را با عنوان‌های بخش کوتاه و گویا مرتب کنید و ترتیب منطقی متن اصلی را نگه دارید.\n"
-    "- اگر چند مورد قابل مقایسه یا دسته‌بندی وجود دارد، از tables استفاده کنید؛ جدول را بی‌دلیل به کار نبرید.\n"
-    "- فقط حذف‌های مجاز: پرگویی بی‌محتوا، اصطلاح‌های گفتاری تصادفی، نویزِ پیاده‌سازی صدا و تکرار عین‌هم. هیچ توضیح آموزشی را به‌خاطر کوتاهی حذف نکنید.\n"
-)
-
-#: The explicit forbid-list: the additions this bot must never make. Each line
-#: is a failure mode observed in note generation, not a stylistic preference.
-_FORBIDDEN_ADDITIONS = (
-    "\nقواعد ممنوعیت افزودن — این فهرست استثنا ندارد:\n"
-    "- آمار، مرجع، راهنما، توصیهٔ درمانی، دوز، مثال یا تشبیه تازه نسازید.\n"
-    "- عدد، واحد، بازه، تاریخ یا نامی که در متن نیست ننویسید.\n"
-    "- اصطلاح تخصصی را ترجمه نکنید و مخفف را باز نکنید، مگر خود متن آن را گفته باشد.\n"
-    "- تبدیل واحد، گرد کردن، محاسبه و مقدار مشتق‌شده (BMI، eGFR، درصد) ننویسید.\n"
-    "- جملهٔ کلیشه‌ای، نصیحت مطالعه یا لحن تبلیغاتی اضافه نکنید.\n"
-    "- جملهٔ مبهم را «بهتر» یا «منطقی‌تر» بازنویسی نکنید؛ همان ابهام را نگه دارید.\n"
-    "- یادداشت پایانیِ تکراری، جملهٔ انگیزشیِ بی‌محتوا و نصیحت مطالعه ننویسید.\n"
-    "- هیچ ادعایی که در متن منبع نیست، حتی اگر درست یا مشهور باشد، نیاورید.\n"
-)
-
-_SEMANTIC_RULES = (
-    "\nقرارداد معنایی — چه چیزی باید در جزوه حاضر باشد:\n"
-    "- شما ویرایشگر جزوه هستید، نه خلاصه‌ساز: هر واحد آموزشی که در متن منبع آمده باید در جزوه هم بیاید. "
-    "واحد آموزشی یعنی: تعریف، توضیح، مکانیزم و چرایی، مثال، مثال نقض، روند گام‌به‌گام، مقایسه، "
-    "هشدار، استثنا، فرمول، عدد و اندازه‌گیری، تاریخ، نام‌های خاص، اصطلاح انگلیسی، مخفف، و نتیجه‌ای "
-    "که گوینده صریحاً بیان کرده است.\n"
-    "- پیش از نوشتن، فهرست واحدهای آموزشی متن را در ذهن مرور کنید و مطمئن شوید هر کدام جایی در جزوه آمده است.\n"
-    "- فقط این چهار چیز را می‌توانید حذف کنید: پرگویی و مکث، گفت‌وگوی حاشیه‌ای بی‌محتوا، نویزِ آشکار "
-    "پیاده‌سازی صدا، و تکرار عیناً لفظ‌به‌لفظ.\n"
-    "- این‌ها را هرگز حذف نکنید: توضیح آموزشی، مثال، زمینه‌ای که گفته برای فهم آن لازم است، جزئیات "
-    "عددی، اصطلاح تخصصی؛ و هرگز یک توضیح چندجمله‌ای را فقط برای کوتاه‌شدن جزوه با یک جملهٔ کوتاه "
-    "جایگزین نکنید.\n"
-    "- اگر نکته‌ای را با کلمات خودتان می‌نویسید، باید دقیقاً همان معنا و همان روابط متن اصلی باشد؛ "
-    "هیچ ادعا، آمار، مرجع یا توصیهٔ تازه‌ای اضافه نکنید.\n"
-)
-
-_STYLE_RULES = (
-    "\nقواعد نگارش (لحن جزوهٔ یک استاد):\n"
-    "- مفهوم را معرفی کنید، اگر گوینده دلیل یا ضرورتش را گفته همان را توضیح دهید، بعد مکانیزم و "
-    "جزئیات را بیاورید، بعد پیوند آن را با مفهوم پیشین نشان دهید و در پایان — فقط اگر گوینده گفته — "
-    "یک نتیجهٔ کوتاه بنویسید.\n"
-    "- هر بخش باید در همان جملهٔ اول بگوید موضوعش چیست و چگونه به مطلب قبلی وصل می‌شود؛ شروع بخش‌ها "
-    "را قالبی و یکسان تکرار نکنید.\n"
-    "- توضیح‌ها را در پاراگراف کامل و روان بنویسید؛ هر جمله را به یک بولت تبدیل نکنید. "
-    "بولت را فقط برای فهرست‌های واقعی (اقلام هم‌رده، مراحل، ویژگی‌ها) به کار ببرید.\n"
-    "- عبارت‌های کلیشه‌ای مثل «نکتهٔ مهم»، «در ادامه»، «همان‌طور که گفته شد» را بی‌دلیل تکرار نکنید؛ "
-    "فقط وقتی خواندن را روان‌تر می‌کنند به کار ببرید.\n"
-    "- جزئیات را ناگهانی و بی‌مقدمه نیاورید؛ اگر گوینده اول دلیل یا زمینه را گفته، همان ترتیب را حفظ کنید.\n"
-    "- ادعای علمی، آمار، مرجع، توصیهٔ درمانی یا مثال تازه از خود اضافه نکنید؛ هرچه در متن نیست، نوشته نمی‌شود.\n"
-    "- اگر بخشی از متن مبهم یا ناقص است، همان ابهام را حفظ کنید؛ معنای احتمالی را حدس نزنید و آن را "
-    "«بهتر» یا «منطقی‌تر» بازنویسی نکنید.\n"
-    "- اصطلاح تخصصی و انگلیسی را داخل جملهٔ فارسی به همان صورت اصلی بنویسید.\n"
-)
-
-#: Academic register. A booklet is a study document, not a chat reply.
-_ACADEMIC_RULES = (
-    "\nقواعد لحن دانشگاهی و حرفه‌ای:\n"
-    "- سوم‌شخص، بی‌طرف و فشرده بنویسید؛ از «شما»، «بیایید»، «در این جزوه خواهیم دید» و لحن گفتاری پرهیز کنید.\n"
-    "- جمله‌های خبری و روشن بنویسید؛ تعجب، هیجان، ایموجی و تعارف ننویسید.\n"
-    "- هر اصطلاح را در همهٔ جزوه یکدست بنویسید و برای یک مفهوم دو نام متفاوت نسازید.\n"
-    "- اگر گوینده احتمال یا تردید داده، همان را نگه دارید (ممکن است، احتمالاً، شواهد محدود است)؛ "
-    "آن را به قطعیت تبدیل نکنید.\n"
-)
-
-_TABLES_RULES = (
-    "\nقواعد جدول:\n"
-    "- جدول فقط وقتی که متن حداقل دو مورد قابل‌مقایسه با حداقل دو ویژگی داشته باشد.\n"
-    "- هر خانه باید عیناً از متن منبع آمده باشد (یا عدد و واحدِ موجود در متن)؛ محاسبه، میانگین، "
-    "رتبه‌بندی و خانهٔ استنتاجی ممنوع است.\n"
-    "- عنوان ستون‌ها را خودتان انتخاب کنید؛ محتوای خانه‌ها را نسازید و خانهٔ خالی را با حدس پر نکنید.\n"
-    "- حداکثر دو جدول در هر بخش، حداکثر ۸ سطر و ۶ ستون؛ اگر مطمئن نیستید، به‌جای جدول فهرست بنویسید.\n"
-    "- برای هر جدول یک caption کوتاه بنویسید که بگوید جدول چه چیزی را مقایسه می‌کند.\n"
-)
-
-_TIPS_RULES = (
-    "\nقواعد نکته‌های کاربردی:\n"
-    "- فقط توصیه، هشدار و تأکید عملیِ خودِ گوینده را بیاورید؛ نصیحت مطالعه و انگیزه‌بخشی ممنوع است.\n"
-    "- برای هر نکته، «basis» را عیناً از متن منبع کپی کنید (۵ تا ۳۰ واژه).\n"
-    "- نکته‌ای که پشتوانهٔ لفظی در متن ندارد، نوشته نمی‌شود؛ حداکثر ۸ نکته.\n"
-    "- اگر متن توصیهٔ عملی ندارد، آرایهٔ practical_tips خالی می‌ماند.\n"
-)
-
-_TRANSITION_RULES = (
-    "\nقواعد پیوند و انسجام:\n"
-    "- روابط متن را با همان کلمات ربط منبع حفظ کنید: علت و معلول (چون، زیرا، بنابراین، در نتیجه)، "
-    "تضاد (اما، در مقابل، برخلاف)، مثال (برای نمونه، برای مثال)، ترتیب زمانی (نخست، اول، سپس، "
-    "در پایان).\n"
-    "- اگر دو مفهوم پشت‌سرهم به یک موضوع واحد تعلق دارند، آن‌ها را در یک بخش با یک گذر طبیعی بنویسید؛ "
-    "اگر گوینده به موضوع تازه‌ای رفته، بخش تازه بسازید و دو موضوع بی‌ربط را در یک بخش قاطی نکنید.\n"
-    "- ترتیب موضوع‌ها را جابه‌جا نکنید و از خودتان گذار تازه نسازید.\n"
-    "- اگر موضوعی ادامهٔ موضوع قبلی است، پیوند را با یک جملهٔ کوتاه نشان دهید؛ اگر موضوع تازه است، "
-    "بخش تازه بسازید و دو موضوع را در یک بخش قاطی نکنید.\n"
-)
-
-_JSON_RULES = (
-    "\nقواعد خروجی — مطلق‌اند و استثنا ندارند:\n"
-    "۱) پاسخ فقط و فقط یک شیء JSON معتبر است. هیچ متن، عنوان، توضیح، علامت نقل‌قول بلوکی یا خنده‌کد (code fence) قبل یا بعد از آن ننویسید.\n"
-    "۲) ساختار دقیق JSON این است:\n"
-    "{\n"
-    "  \"title\": \"عنوان کوتاه جزوه\",\n"
-    "  \"summary\": \"خلاصهٔ چند جمله‌ایِ موضوع و هدف جزوه\",\n"
-    "  \"learning_objectives\": [\"هدف یادگیری که خود متن صریحاً پشتیبانی می‌کند (اختیاری)\"],\n"
-    "  \"sections\": [\n"
-    "    {\n"
-    "      \"heading\": \"عنوان بخش\",\n"
-    "      \"paragraphs\": [\"پاراگراف توضیحی\"],\n"
-    "      \"bullets\": [\"مورد فهرستی\"],\n"
-    "      \"definitions\": [{\"term\": \"اصطلاح\", \"term_en\": \"English term\", \"definition\": \"تعریف کامل\"}],\n"
-    "      \"examples\": [\"مثال کامل همراه با توضیح\"],\n"
-    "      \"steps\": [\"گام ۱ …\", \"گام ۲ …\"],\n"
-    "      \"formulas\": [\"صورت دقیق فرمول\"],\n"
-    "      \"key_points\": [\"نکتهٔ کلیدی همین بخش\"],\n"
-    "      \"tables\": [{\"caption\": \"جدول چه چیزی را مقایسه می‌کند\", \"headers\": [\"ستون ۱\", \"ستون ۲\"], \"rows\": [[\"مقدار\", \"مقدار\"]]}],\n"
-    "      \"callouts\": [{\"kind\": \"نکته\", \"text\": \"متن برجسته\"}]\n"
-    "    }\n"
-    "  ],\n"
-    "  \"practical_tips\": [{\"text\": \"توصیهٔ عملی برگرفته از متن\", \"basis\": \"عین جملهٔ منبع\", \"kind\": \"کاربردی\"}],\n"
-    "  \"key_points\": [\"نکته‌های کلیدی کل جزوه\"],\n"
-    "  \"review_questions\": [\"پرسش مرور که خود متن صریحاً پشتیبانی می‌کند (اختیاری)\"],\n"
-    "  \"glossary\": [{\"term\": \"اصطلاح\", \"definition\": \"تعریف کوتاه\"}]\n"
-    "}\n"
-    "۳) هر کلید اختیاری است؛ اگر محتوایی برایش ندارید آن را حذف کنید یا آرایه/رشتهٔ خالی بدهید. کلید تازه‌ای از خودتان نسازید.\n"
-    "۳-۱) «learning_objectives» و «review_questions» را فقط وقتی بنویسید که خودِ متن صریحاً پشتوانهٔ آن‌ها باشد؛ "
-    "هدف یا پرسشی که در متن نیست، نسازید.\n"
-    "۴) «sections» را خالی نگذارید؛ دست‌کم یک بخش با عنوان معنادار و محتوای واقعی بسازید.\n"
-    "۵) در callouts مقدار kind فقط یکی از این سه باشد: «نکته»، «هشدار» یا «یادآوری». "
-    "در practical_tips مقدار kind فقط یکی از این سه باشد: «کاربردی»، «آزمونی» یا «هشدار».\n"
-    "۶) JSON باید بدون خطا قابل خواندن باشد: از نقل‌قول دوگانه استفاده کنید، کامای اضافی نگذارید و خط جدید داخل رشته‌ها را با \\n بنویسید.\n"
-)
-
-_CHUNKED_CONTENT_RULES = (
-    "\nقواعد نوشتن یک «بخش» از یک درس بلند:\n"
-    "- شما فقط همین بخش را می‌نویسید؛ بخش‌های دیگر را ویرایشگران دیگر می‌نویسند. "
-    "فهرست موضوع‌های بالا نقشهٔ راه است، نه متنی که باید بازنویسی شود.\n"
-    "- خط «موضوع همین بخش» از همان فهرست برداشته شده و مسئولیت همین بخش است: آن موضوع را "
-    "کامل پوشش دهید و موضوع‌های بخش‌های دیگر را در جزوهٔ خود تکرار نکنید.\n"
-    "- مقدمه، معرفی و جمع‌بندی کل درس را دوباره ننویسید؛ مستقیم سر موضوع همین بخش بروید.\n"
-    "- اگر این بخش وسط یک موضوعِ نیمه‌تمام شروع می‌شود (متن با ادامهٔ توضیح قبلی آغاز شده)، "
-    "اولین بخش خود را با عیناً همان عنوان بخش پیشین بنویسید — نه عنوان تازه و نه عنوان با "
-    "کلمهٔ «ادامه» — چون جزوهٔ نهایی این دو را یک بخش می‌داند.\n"
-    "- کلیدهای «summary» و «key_points» و «glossary» سطح کل درس را فقط زمانی پر کنید که درس تک‌بخشی است؛ "
-    "در درس چندبخشی، نکته‌های کلیدی را در «key_points» همان بخش بگذارید و بقیه را خالی بگذارید.\n"
-    "- انتهای بخش را طوری بنویسید که به موضوع بعدی وصل شود (بدون افزودن ادعأ تازه).\n"
-    "- اصطلاح‌های تخصصی و نام‌های انگلیسی را عیناً مثل بقیهٔ بخش‌ها بنویسید.\n"
-)
-
-#: Maximum prompt material added when chunk context is enabled: the bounded
-#: topic digest, the current topic, both neighbour windows, labels and rules.
-CHUNK_CONTEXT_RESERVE_CHARS = (
-    CONTEXT_DIGEST_MAX_CHARS
-    + PRESENTATION_CHUNK_TOPIC_MAX_CHARS
-    + (2 * NEIGHBOUR_CONTEXT_CHARS)
-    + len(_CHUNKED_CONTENT_RULES)
-    + 512
-)
-
-_PRESENTATION_CONTENT_RULES = (
-    "\nقواعد ویژهٔ ارائه:\n"
-    "- ورودی شامل متن اسلایدها (با شمارهٔ اسلاید و یادداشت گوینده) و متن پیاده‌سازی‌شدهٔ صدای ارائه است.\n"
-    "- ترتیب بخش‌ها را از ترتیب اسلایدها بگیرید و توضیح‌های صوتی هر اسلاید را زیر همان موضوع ادغام کنید.\n"
-    "- اگر صدا مطلبی فراتر از متن اسلاید دارد، آن را به‌عنوان توضیح کامل‌کننده بیاورید؛ اسلاید و صدا هر دو را پوشش دهید، نه فقط یکی را.\n"
-    "- یادداشت گویندهٔ هر اسلاید جزو محتوای آموزشی است؛ آن را حذف نکنید.\n"
-    "- تعریف‌ها را در definitions، مثال‌ها را در examples، روند گام‌به‌گام را در steps و فرمول‌ها را در formulas هر بخش بیاورید.\n"
-    "- نکته‌های کلیدی، یادآوری‌ها و هشدارهای مهم گوینده را در callouts یا key_points جداگانه برجسته کنید.\n"
-    "- اگر چند مورد قابل مقایسه یا دسته‌بندی وجود دارد، از table استفاده کنید؛ جدول را بی‌دلیل به کار نبرید.\n"
-    "- برای فرمول‌ها و اصطلاح‌های تخصصی، صورت اصلی را حفظ کنید و متن را به فارسی روان بنویسید.\n"
-)
-
-
-#: CR-4: the mandatory, ordered skeleton of a class-replacement booklet.
-#: It maps each required block onto an existing JSON field, so no schema change
-#: is needed; the exporter renders the TOC/جمع‌بندی/glossary sections.
-_BOOKLET_SKELETON_RULES = (
-    "\n### اسکلت لازم جزوهٔ کامل (هیچ بلوکی حذف نشود)\n"
-    "جزوه باید یک کتابچهٔ درسی کامل و جایگزین حضور در کلاس باشد، نه خلاصه. ترتیب بلوک‌ها: "
-    "جلد و عنوان درس → فهرست مطالب → هدف کلی درس → بخش‌بندی منطقی مطابق ترتیب منبع → "
-    "تعریف‌ها، مثال‌ها، گام‌ها، فرمول‌ها، جدول‌ها، نکته‌ها و هشدارها در جای خود → "
-    "جمع‌بندی یک‌صفحه‌ای پایان جزوه → واژه‌نامهٔ اصطلاح‌های انگلیسی.\n"
-    "- جلد و عنوان درس را در title بگذارید؛ هدف کلی درس را در learning_objectives بنویسید "
-    "(فقط اگر متن منبع پشتوانه‌ای دارد). فهرست مطالب از heading بخش‌ها ساخته می‌شود؛ "
-    "پس بخش‌ها را با عنوان‌های کوتاه، گویا و به ترتیب منبع بچینید.\n"
-    "- داخل هر بخش: تعریف‌ها در definitions، مثال‌های کامل در examples، روند گام‌به‌گام در steps، "
-    "صورت دقیق فرمول‌ها در formulas، مقایسه‌ها در tables، هشدارها در callouts و نکته‌های مهم در key_points.\n"
-    "- جمع‌بندی پایان جزوه را در summary و key_points سطح کل درس بنویسید (یک صفحه، بدون مطلب تازه)؛ "
-    "واژه‌نامه را در glossary فقط با اصطلاح‌های انگلیسی‌ای پر کنید که عیناً در همین متن منبع آمده‌اند.\n"
-    "- قانون پوشش (بدون استثنا): هر واحد آموزشی متن منبع — تعریف، دلیل، مکانیزم، مثال، مرحله، فرمول، عدد، "
-    "واحد، هشدار و استثنا — باید دست‌کم یک‌بار در یکی از بخش‌ها بیاید؛ هیچ واحدی را به بهانهٔ "
-    "فشرده‌سازی یا تکراری‌بودن حذف نکنید.\n"
-)
-
-
-_SOURCE_LOCATOR_RULES = (
-    "\nقواعد مکان‌یاب منبع:\n"
-    "- متن‌های داخل کروشه مانند [صفحهٔ ۲] یا [اسلاید ۳] مکان‌یاب واقعی منبع‌اند.\n"
-    "- در source_locators هر بخش، فقط همان برچسب‌های کامل و عیناً موجود در ورودی را بیاورید که "
-    "از محتوای همان بخش پشتیبانی می‌کنند؛ برچسب را نسازید، تغییر ندهید یا حدس نزنید.\n"
-    "- اگر هیچ برچسبی با اطمینان پشتیبان نیست، source_locators را خالی بگذارید.\n"
-    "- متن مکان‌یاب را به محتوای آموزشی تبدیل نکنید."
-)
-
-
-def build_system_prompt(
-    mode: str = "full", *, context_block: str = "", source_locators: bool = False
-) -> str:
-    """The Persian system prompt for one note mode (lecture-to-notes compiler)."""
-    # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
-    mode_rule = MODE_RULES["full"]
-    prompt = (
-        "شما دستیار آموزشی فارسی «گاماس» هستید و نقش شما «گردآورندهٔ جزوهٔ درس» است، نه خلاصه‌ساز. "
-        "ورودی شما متن پیاده‌سازی‌شدهٔ خام یک کلاس درسی است و خروجی شما باید یک جزوهٔ ساختارمند، کامل و "
-        "روان فارسی باشد که دانشجو بتواند جای شنیدن صدا، آن را بخواند و درس را بفهمد.\n\n"
-        + _JSON_RULES
-        + "\n\nقواعد محتوا:\n"
-        + mode_rule
-        + _BOOKLET_SKELETON_RULES
-        + _SEMANTIC_RULES
-        + _CONTENT_RULES
-        + _FORBIDDEN_ADDITIONS
-        + _TABLES_RULES
-        + _TIPS_RULES
-        + _STYLE_RULES
-        + _ACADEMIC_RULES
-        + _TRANSITION_RULES
-    )
-    if source_locators:
-        prompt += _SOURCE_LOCATOR_RULES
-    if context_block:
-        prompt += "\n\n" + _CHUNKED_CONTENT_RULES + "\n" + context_block
-    return prompt
-
+#: CR-3: FULL is the single source of truth, and the note-generation ``mode``
+#: parameter is kept on the public builders for backward compatibility.
+#:
+#: The prompt text itself lives in :mod:`gamas_bot._prompt_block`: one static
+#: agent prompt, one static editorial prompt, and the two user-message
+#: builders. It is deliberately not assembled here any more — the assembled
+#: form differed per chunk (context block, source locators) and per source
+#: kind, which made every request of a job an uncached prompt on a provider
+#: that caches by prefix. See that module for the contract itself.
 
 def notes_response_schema() -> dict:
     """A JSON schema for the note document the prompts already describe.
@@ -1140,92 +928,6 @@ def notes_response_schema() -> dict:
 def _response_schema(settings: Settings) -> dict | None:
     """The schema to send, or ``None`` when structured output is off."""
     return notes_response_schema() if getattr(settings, "note_structured_output", False) else None
-
-
-def build_chunk_message(block: str, body: str) -> str:
-    """The user message of one map request: orientation block, then its text.
-
-    The block used to be appended to the **system** prompt, which made that
-    prompt different for every chunk. Providers cache on a byte-identical
-    prefix, so per-chunk text in the system prompt disabled the cache for the
-    4 200-token rule block on every request. Keeping the rules constant and
-    putting the varying material here is what makes the prefix cacheable.
-    """
-    if not block:
-        return body
-    return _CHUNKED_CONTENT_RULES + "\n" + block + "\n\n" + body
-
-
-def build_presentation_system_prompt(mode: str = "full", *, context_block: str = "") -> str:
-    """The Persian system prompt for presentation material in one note mode."""
-    # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
-    mode_rule = MODE_RULES["full"]
-    prompt = (
-        "شما دستیار آموزشی فارسی «گاماس» هستید. ورودی شما محتوای یک فایل ارائهٔ درسی (PowerPoint) است — "
-        "شامل متن اسلایدها، یادداشت‌های گوینده و متن پیاده‌سازی‌شدهٔ صدای ضبط‌شدهٔ همان ارائه — و خروجی شما "
-        "یک جزوهٔ ساختارمند و کامل فارسی است؛ نقش شما «گردآورندهٔ جزوهٔ درس» است که محتوای ارائه را منظم و "
-        "کامل نگه می‌دارد، نه خلاصه‌سازی که حذف می‌کند.\n"
-        + _JSON_RULES
-        + "\n\nقواعد محتوا:\n"
-        + mode_rule
-        + _BOOKLET_SKELETON_RULES
-        + _SEMANTIC_RULES
-        + _CONTENT_RULES
-        + _FORBIDDEN_ADDITIONS
-        + _PRESENTATION_CONTENT_RULES
-        + _TABLES_RULES
-        + _TIPS_RULES
-        + _STYLE_RULES
-        + _ACADEMIC_RULES
-        + _TRANSITION_RULES
-    )
-    if context_block:
-        prompt += "\n\n" + _CHUNKED_CONTENT_RULES + "\n" + context_block
-    return prompt
-
-
-TRANSCRIPT_PROMPT = "متن پیاده‌سازی‌شدهٔ خام:\n\n"
-PRESENTATION_PROMPT = "محتوای ارائه (متن اسلایدها و گفتار):\n\n"
-
-COMPILE_SYSTEM_PROMPT = (
-    "شما ویراستار نهایی جزوهٔ فارسی «گاماس» هستید. ورودی شما «زمینهٔ کلی درس» و «جزوهٔ فعلی» "
-    "به شکل JSON است؛ جزوهٔ فعلی از چند بخش جداگانه ساخته شده و ممکن است ناپیوسته یا تکراری باشد. "
-    "خروجی شما همان جزوهٔ واحد است، نه خلاصه‌ای از آن.\n\n"
-    "قانون بنیادی: شما اجازهٔ بازنویسی سبکی و افزودن دانش بیرونی ندارید؛ کارتان ویرایش ساختاری است.\n\n"
-    "کار شما:\n"
-    "- جمله‌ها را تا حد امکان عیناً نگه دارید؛ فقط نقطه‌گذاری، فاصله و پیوندهای لازم را اصلاح کنید.\n"
-    "- بخش‌هایی که به یک موضوع واحد تعلق دارند را در یک بخش منسجم ادغام کنید؛ ترتیب منطقی متن را نگه دارید.\n"
-    "- عنوان بخش‌ها را روشن، گویا و هماهنگ با «موضوع‌های درس» بنویسید؛ بخش‌های هم‌موضوع یا دنباله‌دار را ادغام کنید، اما موضوع‌های متمایز را در یک بخش واحد ادغام نکنید.\n"
-    "- تکرار لفظ‌به‌لفظ را یک‌بار بنویسید؛ دو جمله که یک مفهوم را با کلمات متفاوت می‌گویند تکرار نیستند و هر دو می‌مانند.\n"
-    "- هیچ توضیح، تعریف، مثال، مرحله، مقایسه، هشدار، استثنا، فرمول، عدد، واحد، تاریخ، اصطلاح یا نکتهٔ کاربردی را حذف نکنید.\n"
-    "- هیچ ادعا، عدد، واحد، مرجع، توصیه یا مثال تازه‌ای اضافه نکنید و هیچ عددی را تبدیل، گرد یا دوباره محاسبه نکنید.\n"
-    "- تعریف‌ها را در definitions، مثال‌ها را در examples، مراحل را در steps، فرمول‌ها را در formulas، "
-    "جدول‌ها را در tables و هشدارها را در callouts نگه دارید.\n"
-    "- نکته‌های کاربردی را با متن و «basis» خودشان نگه دارید؛ نکته‌ای نسازید و پشتوانه‌ای را عوض نکنید.\n"
-    "- اگر دستور، فهرست «موارد جامانده» دارد، هر مورد را فقط با همان جملهٔ منبعی که همراه آن آمده در "
-    "جای درست خودش برگردانید و هیچ چیز دیگری اضافه نکنید.\n"
-    "- خلاصهٔ کل درس را در summary و مهم‌ترین نکته‌های کل درس را در key_points بنویسید.\n"
-    "- «learning_objectives» و «review_questions» را فقط اگر همان متن مدرک روشنی دارد نگه دارید؛ "
-    "در غیر این صورت حذف کنید.\n"
-    "- اطلاعات تازه اضافه نکنید. اگر چیزی در ورودی نیست، حدس نزنید.\n\n"
-    "ساختار خروجی — فقط یک شیء JSON معتبر، بدون هیچ متن اضافه، با همان ساختار ورودی؛ "
-    "«sections» هرگز خالی نمی‌شود و در callouts مقدار kind فقط «نکته»، «هشدار» یا «یادآوری» است."
-    # CR-4: the editorial pass must preserve the full booklet skeleton too.
-    + _BOOKLET_SKELETON_RULES
-)
-
-def build_compile_system_prompt(
-    mode: str = "full", *, presentation: bool = False, source_locators: bool = False
-) -> str:
-    """Build the editorial compile system prompt for a note mode and source kind."""
-    # CR-3: full is the only mode; ``mode`` is accepted for API compatibility.
-    mode_rule = MODE_RULES["full"]
-    prompt = COMPILE_SYSTEM_PROMPT + "\n\nقواعد حالت خروجی:\n" + mode_rule.rstrip()
-    if presentation:
-        prompt += "\n" + _PRESENTATION_CONTENT_RULES.strip()
-    if source_locators:
-        prompt += _SOURCE_LOCATOR_RULES
-    return prompt
 
 
 # ===========================================================================
@@ -1609,34 +1311,16 @@ def build_context(chunks: list[str]) -> LectureContext:
     return LectureContext(title="", topics=tuple(topics))
 
 
-def _chunk_prefix(index: int, total: int) -> str:
-    """Positional context prepended to every chunk sent to the model."""
-    if total <= 1:
-        return ""
-    if index == 1:
-        return (
-            f"[بخش {to_persian_digits(index)} از {to_persian_digits(total)} این درس — "
-            "ادامهٔ درس در بخش بعدی می‌آید]\n\n"
-        )
-    if index == total:
-        return (
-            f"[بخش {to_persian_digits(index)} از {to_persian_digits(total)} این درس — "
-            "این آخرین بخش درس است]\n\n"
-        )
-    return (
-        f"[بخش {to_persian_digits(index)} از {to_persian_digits(total)} این درس — "
-        "این بخش ادامهٔ بخش قبل است و ادامهٔ آن در بخش بعد می‌آید]\n\n"
-    )
-
-
 def context_block_for(
     context: LectureContext, documents: list[str], index: int
 ) -> str:
-    """The context block for part ``index``: position, topic, neighbours.
+    """The orientation block for part ``index``: the topic map and neighbours.
 
-    The neighbour windows are short sentences so a boundary sentence can be
-    continued rather than restarted; they are never long enough to be noted
-    again.
+    The topic of *this* part is not repeated here — the chunk template appends
+    it after the text (``build_chunk_message``), so it appears exactly once in
+    the request. The neighbour windows are short sentences so a boundary
+    sentence can be continued rather than restarted; they are never long enough
+    to be noted again.
     """
     total = len(documents)
     lines: list[str] = []
@@ -1646,12 +1330,6 @@ def context_block_for(
             for position, topic in enumerate(context.topics, start=1)
         )
         lines.append("موضوع‌های درس به ترتیب: " + listed)
-    topic = context.topic_for(index, total)
-    if topic:
-        lines.append(
-            f"موضوع همین بخش: «{topic}» — تمام مطالب همین بخش را پوشش دهید و عنوان بخش‌های "
-            "خود را متناسب با همین موضوع‌ها انتخاب کنید."
-        )
     if index > 1:
         previous_tail = documents[index - 2].strip()[-NEIGHBOUR_CONTEXT_CHARS:].strip()
         if previous_tail:
@@ -1827,19 +1505,10 @@ def meets_completeness_threshold(
     return report.skeleton_complete and report.coverage >= floor
 
 
-#: System prompt for one bounded, strictly grounded coverage-fill request.
-COVERAGE_FILL_SYSTEM_PROMPT = (
-    "شما «گردآورندهٔ جزوهٔ درس» فارسی گاماس هستید. یک واحد آموزشی از متن منبع در پیام "
-    "کاربر آمده که در پیش‌نویس جزوه جا افتاده است. وظیفه: فقط همان واحد را، با همان اطلاعات و "
-    "بدون هیچ افزوده، به صورت یک بخش کوتاه (heading + paragraphs/bullets) برگردان.\n\n"
-    + _FORBIDDEN_ADDITIONS
-    + "\n" + _JSON_RULES
-    + "\n\nقواعد:\n"
-    "- فقط از جمله‌هایی استفاده کنید که در پیام کاربر (متن منبع) هست؛ هیچ عدد، نام، اصطلاح، "
-    "مثال، فرمول یا نتیجه‌گیری تازه نسازید و از دانش بیرونی نیاورید.\n"
-    "- پاسخ فقط یک شیء JSON معتبر با همان ساختار جزوه و «sections» غیرخالی است؛ متن اضافه ننویسید.\n"
-)
-
+#: System prompt for one bounded, strictly grounded coverage-fill request. It is
+#: the static booklet contract plus the fill rules, so the fill request shares
+#: the cached prefix of every other note request.
+COVERAGE_FILL_SYSTEM_PROMPT = notes_system_prompt() + COVERAGE_FILL_RULES
 
 def build_fill_document(gaps, notes: StructuredNotes) -> str:
     """Targeted, source-only fill request for the given missing units."""
@@ -2012,29 +1681,36 @@ def compact_notes_payload(notes: StructuredNotes) -> dict:
 
 
 def build_compile_document(context: LectureContext, notes: StructuredNotes) -> str:
-    """The editorial compile input: topic digest + the merged notes."""
-    parts: list[str] = []
-    if context.topics:
-        listed = "، ".join(
-            f"({to_persian_digits(position)}) {topic}"
-            for position, topic in enumerate(context.topics, start=1)
-        )
-        parts.append("### زمینهٔ کلی درس\nموضوع‌های درس به ترتیب: " + listed)
-    parts.append(
-        "### جزوهٔ فعلی (ساختهٔ بخش‌های جداگانه)\n"
-        + json.dumps(compact_notes_payload(notes), ensure_ascii=False)
+    """The editorial compile input: the source digest, then the merged notes.
+
+    The order is the template order of the booklet agent: the transcript-like
+    material first, the artifact being edited last, so the mutable scaffolding
+    stays a stable prefix and the model reads the draft immediately before it
+    starts writing. The edit instructions live in the system prompt; the
+    per-request "leave these out / put these back" material is appended by the
+    repair builder.
+    """
+    return build_edit_message(build_source_digest(context), _notes_draft_json(notes))
+
+
+def build_source_digest(context: LectureContext) -> str:
+    """The source side of the editorial request: the lesson's topic map.
+
+    The compile request does not re-send the whole transcript (it would blow
+    the budget); it sends the deterministic topic map of the lesson, which is
+    what the merged draft is edited *against*.
+    """
+    if not context.topics:
+        return "موضوع‌های درس به ترتیب در دسترس نیست."
+    listed = "، ".join(
+        f"({to_persian_digits(position)}) {topic}"
+        for position, topic in enumerate(context.topics, start=1)
     )
-    parts.append(
-        "### دستور\n"
-        "این بخش‌ها را به یک متن واحد و روان تبدیل کنید. هیچ مطلبی را حذف نکنید؛ "
-        "فقط تکرارهای لفظ‌به‌لفظ را یک‌بار بنویسید، بخش‌های هم‌موضوع را ادغام کنید، گذارها را درست کنید و "
-        "یکدستی اصطلاح‌ها را برقرار کنید.\n"
-        "- ترتیب موضوع‌های درس را نگه دارید؛ هر موضوع یک بار و در جای خودش بیاید.\n"
-        "- اگر جمله‌ای از بخش‌ها بریده یا ناقص است، آن را با همان اطلاعاتِ همین جزوه کامل و روان کنید؛ "
-        "هیچ اطلاع تازه‌ای از خودتان اضافه نکنید.\n"
-        "- خروجی فقط JSON با همان ساختار است و «sections» هرگز خالی نمی‌شود."
-    )
-    return "\n\n".join(parts)
+    return "موضوع‌های درس به ترتیب: " + listed
+
+
+def _notes_draft_json(notes: StructuredNotes) -> str:
+    return json.dumps(compact_notes_payload(notes), ensure_ascii=False)
 
 
 def _notes_structured_item_count(notes: StructuredNotes) -> int:
@@ -2321,13 +1997,18 @@ def build_repair_document(
     ``sections`` restricts the request to a bounded subset of the booklet (used
     when the whole booklet does not fit the repair budget). The answer then
     carries only those sections and is merged back by heading.
+
+    Unlike the compile request this one does not carry the whole source: only
+    the lost units and the source sentence under each of them travel here, so
+    the request stays inside the repair budget however long the lecture is.
+    The draft is last, immediately before the model's own output.
     """
     targeted = sections is not None
     booklet = _subset_notes(notes, sections) if sections is not None else notes
-    parts: list[str] = []
-    parts.append(
-        "### جزوهٔ فعلی\n" + json.dumps(compact_notes_payload(booklet), ensure_ascii=False)
+    draft = (
+        DRAFT_HEADING + "\n" + json.dumps(compact_notes_payload(booklet), ensure_ascii=False)
     )
+    parts: list[str] = []
     audit = report.audit
     if audit.missing:
         windows = evidence_windows(
@@ -2366,6 +2047,7 @@ def build_repair_document(
         "- مواردی را که در منبع نیست حذف کنید.\n"
         "هیچ جملهٔ تازه، عدد تازه، تعریف تازه یا نکتهٔ تازه‌ای نسازید؛ هیچ بخشی را حذف نکنید."
     )
+    parts.append(draft)
     return "\n\n".join(parts)
 
 
@@ -2553,12 +2235,7 @@ def effective_compile_max_chars(
     unbounded request. A merged booklet above this budget is compiled in whole
     section groups instead of being skipped (see :func:`_compile_pass`).
     """
-    compile_system = (
-        COMPILE_SYSTEM_PROMPT
-        if mode == "full" and not presentation
-        else build_compile_system_prompt(mode, presentation=presentation)
-    )
-    reserve_characters = len(compile_system) + CONTEXT_DIGEST_MAX_CHARS
+    reserve_characters = len(edit_system_prompt()) + EDIT_MESSAGE_RESERVE_CHARS
     reserve_tokens = math.ceil(reserve_characters / CHARS_PER_TOKEN) + PROMPT_RESERVE_TOKENS
     available_tokens = (
         settings.note_context_tokens - settings.note_max_output_tokens - reserve_tokens
@@ -2598,8 +2275,14 @@ async def _structure_piece(
     semaphore: asyncio.Semaphore,
     depth: int = 0,
     presentation: bool = False,
+    render: Callable[[str], str],
 ) -> StructuredNotes:
     """One note request, with bounded recovery from an oversized or dense input.
+
+    ``document`` is raw source text, never a rendered message: ``render`` turns
+    it into the user message (see ``build_chunk_message``) so that a split can
+    re-render both halves with the same header and topic instead of cutting a
+    message in two.
 
     A context overflow or output-budget truncation is the provider failure that
     smaller input chunks can fix, so the input is cut at a slide/paragraph/
@@ -2607,14 +2290,13 @@ async def _structure_piece(
     bounded and an input with no safe cut point is given up: an unchanged
     oversized request is never re-sent.
     """
-    prompt_prefix = PRESENTATION_PROMPT if presentation else TRANSCRIPT_PROMPT
     try:
         async with semaphore:
             payload = await complete_json(
                 session,
                 settings,
                 system=system_prompt,
-                user=prompt_prefix + document,
+                user=render(document),
                 schema=_response_schema(settings),
             )
         return _load_json_payload(payload, mode=mode)
@@ -2645,7 +2327,7 @@ async def _structure_piece(
                     session, settings, piece,
                     system_prompt=system_prompt, mode=mode,
                     semaphore=semaphore, depth=depth + 1,
-                    presentation=presentation,
+                    presentation=presentation, render=render,
                 )
             )
             for piece in pieces
@@ -2814,9 +2496,8 @@ async def _repair_once(
         return notes, report
     repair_document, repaired_sections = request
     targeted = len(repaired_sections) < len(notes.sections)
-    system_prompt = build_compile_system_prompt(
-        mode, presentation=presentation, source_locators=source_locators
-    )
+    _ = source_locators
+    system_prompt = edit_system_prompt()
     try:
         async with semaphore:
             payload = await complete_json(
@@ -2869,20 +2550,15 @@ async def _compile_once(
             len(document), budget, len(notes.sections),
         )
         return None
-    compile_system = (
-        COMPILE_SYSTEM_PROMPT
-        if mode == "full" and not presentation
-        else build_compile_system_prompt(
-            mode, presentation=presentation, source_locators=source_locators
-        )
-    )
-    if source_locators and mode == "full" and not presentation:
-        compile_system += _SOURCE_LOCATOR_RULES
+    # One static editorial prompt for every source kind (see
+    # ``_prompt_block.edit_system_prompt``): the digest, the draft and the
+    # locator contract all live in the user message.
+    _ = source_locators
     try:
         payload = await complete_json(
             session,
             settings,
-            system=compile_system,
+            system=edit_system_prompt(),
             user=document,
             schema=_response_schema(settings),
             prefer_provider=getattr(settings, "note_compile_provider", ""),
@@ -3201,13 +2877,11 @@ async def structure_document(
     if not document:
         raise StructuringError("متن ورودی خالی بود.")
     resolved_mode = resolve_note_mode(mode)
-    base_system = (
-        build_presentation_system_prompt(resolved_mode)
-        if presentation
-        else build_system_prompt(resolved_mode, source_locators=source_locators)
-    )
-    if presentation and source_locators:
-        base_system += _SOURCE_LOCATOR_RULES
+    # One static prompt for every source kind: the source kind and the source
+    # locators are carried by the user message, never by this string. A prompt
+    # that changed with the source kind could not be prefix-cached, and a job
+    # that mixes audio and slides would pay for two different prefixes.
+    base_system = notes_system_prompt()
     splitter = split_presentation_document if presentation else split_transcript
     chunk_chars = effective_chunk_chars(settings, system_prompt=base_system)
     chunks = splitter(document, chunk_chars)
@@ -3223,6 +2897,14 @@ async def structure_document(
             )
         return result
 
+    # A presentation says so in the user message: its source is slides plus
+    # narration, not a transcript. The rest of the template is shared.
+    source_header = PRESENTATION_PROMPT.rstrip("\n") if presentation else ""
+
+    def single_render(text: str) -> str:
+        """The user message of a one-part request."""
+        return build_chunk_message(text, index=1, total=1, header=source_header)
+
     async def finish_single(chars_used: int) -> StructuredNotes:
         """One chunk: a single note request, then the evidence gate.
 
@@ -3237,9 +2919,10 @@ async def structure_document(
             chars_used,
         )
         single = await _structure_piece(
-            session, settings, chunks[0],
+            session, settings,
+            chunks[0],
             system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
-            presentation=presentation,
+            presentation=presentation, render=single_render,
         )
         if not settings.note_strict_grounding:
             return single
@@ -3287,14 +2970,20 @@ async def structure_document(
 
     async def map_chunk(index: int, chunk: str) -> StructuredNotes:
         block = context_block_for(context, chunks, index) if include_context else ""
-        prefixed = _chunk_prefix(index, len(chunks)) + chunk
-        # ``base_system`` is byte-identical for every chunk (and every job), so
+        topic = context.topic_for(index, len(chunks)) if include_context else ""
+        # ``base_system`` is byte-identical for every chunk, pass and job, so
         # the provider can serve it from its prefix cache; only the user
         # message differs. See ``build_chunk_message``.
+        def render(text: str) -> str:
+            return build_chunk_message(
+                text, index=index, total=len(chunks), topic=topic,
+                context_block=block, header=source_header,
+            )
+
         return await _structure_piece(
-            session, settings, build_chunk_message(block, prefixed),
+            session, settings, chunk,
             system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
-            presentation=presentation,
+            presentation=presentation, render=render,
         )
 
     # Cancel the siblings when one chunk fails: ``gather`` propagates the first

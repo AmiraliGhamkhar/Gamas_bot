@@ -19,6 +19,8 @@ from types import SimpleNamespace
 from telethon import TelegramClient
 
 from gamas_bot.config import (
+    DEFAULT_AVALAI_BASE_URL,
+    DEFAULT_AVALAI_MODEL,
     DEFAULT_DEEPSEEK_BASE_URL,
     DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_GEMINI_MODEL,
@@ -487,6 +489,9 @@ def make_settings(**overrides) -> Settings:
         deepseek_api_key="",
         deepseek_base_url=DEFAULT_DEEPSEEK_BASE_URL,
         deepseek_model=DEFAULT_DEEPSEEK_MODEL,
+        avalai_api_key="",
+        avalai_base_url=DEFAULT_AVALAI_BASE_URL,
+        avalai_model=DEFAULT_AVALAI_MODEL,
         # Zero by default, matching the shipped configuration: note requests
         # must never wait on hidden reasoning tokens.
         gemini_thinking_budget=DEFAULT_GEMINI_THINKING_BUDGET,

@@ -40,7 +40,7 @@ Keep shipped defaults unless measurements justify changes.
 | `STT_PROVIDER_TIMEOUT_SECONDS`, `STT_SLOT_WAIT_TIMEOUT_SECONDS` | 1800 / 600 seconds |
 | `LLM_PRIMARY_MAX_IN_FLIGHT`, `LLM_FALLBACK_MAX_IN_FLIGHT` | 4 / 4 slots |
 | `LLM_SLOT_WAIT_TIMEOUT_SECONDS` | 300 seconds |
-| `NOTE_CONCURRENCY` | 3 requests |
+| `NOTE_CONCURRENCY` | 3 requests (lower it on an AvalAI low-tier account) |
 | `NOTE_HEDGE_AFTER_SECONDS` | 60 seconds (0 disables hedging) |
 | `NOTE_STRICT_GROUNDING`, `NOTE_QUALITY_GATE`, `NOTE_COMPLETENESS_FILL` | true / repair / true |
 | `OFFICE_MAX_CHARS`, `OFFICE_MAX_INPUT_BYTES`, `OFFICE_MAX_SLIDES` | 100000 / 1000000 / 30 |
@@ -49,7 +49,10 @@ Keep shipped defaults unless measurements justify changes.
 | `LIBRARY_MAX_ITEMS` | 50 references/user; active-quiz sources may be retained longer |
 | `RECEIPT_RETENTION_DAYS`, `TRANSCRIPT_RETENTION_DAYS` | 90 / 0 (keep transcript text forever) |
 
-The template lists additional model, timeout, tariff and presentation settings.
+Per-provider keys and models — including `AVALAI_API_KEY`, `AVALAI_BASE_URL` and
+`AVALAI_MODEL` — are listed in [Note-generation providers](PROVIDERS.md) and in the
+template. The template lists additional model, timeout, tariff and presentation
+settings.
 `NOTE_MODE` is a legacy no-op; audio booklets use full mode. Compact document
 notes are separate. See [Billing](BILLING.md) for learning prices.
 

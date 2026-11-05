@@ -89,6 +89,8 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("GEMINI_MODEL", "gemini_model", "str"),
     ("DEEPSEEK_BASE_URL", "deepseek_base_url", "str"),
     ("DEEPSEEK_MODEL", "deepseek_model", "str"),
+    ("AVALAI_BASE_URL", "avalai_base_url", "str"),
+    ("AVALAI_MODEL", "avalai_model", "str"),
     ("NOTE_GEMINI_THINKING_BUDGET", "gemini_thinking_budget", "int"),
     ("NOTE_CONTEXT_TOKENS", "note_context_tokens", "int"),
     ("NOTE_MODE", "note_mode", "str"),

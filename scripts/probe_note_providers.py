@@ -223,7 +223,7 @@ def _check_gemini(route) -> bool:
 
 
 def _check_openai_models(route) -> bool:
-    """OpenAI-compatible /v1/models check for Groq, Cerebras, and generic gateways."""
+    """OpenAI-compatible ``/models`` check for gateway routes (AvalAI, DeepSeek, …)."""
     url, headers = _build_get_request_for(route, "models")
     status, payload = _get_json(url, route.api_key, headers=headers)
     if status != 200 or not isinstance(payload, dict):
@@ -269,9 +269,9 @@ async def _generate(route, settings, text: str) -> bool:
 
     from gamas_bot.llm import _complete_on_route, _parse_json_object
     from gamas_bot.notes import (
-        TRANSCRIPT_PROMPT,
         _load_json_payload,
         _response_schema,
+        build_chunk_message,
         build_system_prompt,
         effective_chunk_chars,
     )
@@ -281,13 +281,16 @@ async def _generate(route, settings, text: str) -> bool:
     started = time.monotonic()
     try:
         excerpt = text[: effective_chunk_chars(settings, system_prompt=system)]
+        # The same user message the bot sends for a one-part lesson, so the pass
+        # proves the real request shape, not an approximation of it.
+        user = build_chunk_message(excerpt, index=1, total=1)
         async with aiohttp.ClientSession() as session:
             raw = await _complete_on_route(
                 route,
                 session,
                 settings,
                 system=system,
-                user=TRANSCRIPT_PROMPT + excerpt,
+                user=user,
                 schema=schema,
             )
         notes = _load_json_payload(_parse_json_object(raw))
@@ -336,7 +339,7 @@ def main(argv: list[str] | None = None) -> int:
             ok = _check_openrouter(route) and ok
         elif route.slug == "gemini":
             ok = _check_gemini(route) and ok
-        elif route.slug in ("groq", "cerebras", "openai_compatible"):
+        elif route.slug in ("avalai", "deepseek", "openai_compatible"):
             ok = _check_openai_models(route) and ok
         else:
             print(f"[WARN] {route.slug}: no metadata probe; generation stage still applies")

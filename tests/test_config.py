@@ -234,7 +234,7 @@ class NoteProviderOrderTests(unittest.TestCase):
             ["gemini", "nara", "openrouter"],
         )
         self.assertEqual(tuple(settings.note_providers), (
-            "gemini", "nara", "openrouter", "deepseek",
+            "gemini", "nara", "openrouter", "deepseek", "avalai",
         ))
         # Each provider keeps its own documented base URL and model.
         self.assertEqual(routes[0].base_url, "https://generativelanguage.googleapis.com/v1beta")
@@ -599,6 +599,50 @@ class DeepSeekRouteTests(unittest.TestCase):
         self.assertFalse(settings.deepseek_configured)
         self.assertEqual(
             [route.slug for route in note_routes(settings)], ["gemini"]
+        )
+
+
+class AvalaiRouteTests(unittest.TestCase):
+    """AvalAI is an OpenAI-compatible gateway with documented JSON schema output."""
+
+    def settings(self, **values):
+        with mock.patch.dict(os.environ, note_env(**values), clear=True):
+            return from_env(env_file="/nonexistent")
+
+    def test_defaults_match_the_documented_gateway_and_model(self):
+        settings = self.settings(AVALAI_API_KEY="av-key")
+        routes = [route for route in note_routes(settings) if route.slug == "avalai"]
+        self.assertEqual(len(routes), 1)
+        self.assertEqual(routes[0].base_url, "https://api.avalai.ir/v1")
+        self.assertEqual(routes[0].model, "deepseek-v4.1-flash")
+        self.assertEqual(routes[0].api_key, "av-key")
+        self.assertTrue(settings.avalai_configured)
+        self.assertIn("avalai", NOTE_JSON_OBJECT_PROVIDERS)
+        self.assertEqual(NOTE_PROVIDER_LABELS["avalai"], "AvalAI")
+        self.assertEqual(NOTE_REQUEST_STYLE["avalai"], "openai")
+
+    def test_a_bare_host_gains_the_documented_version_prefix(self):
+        for raw in ("https://api.avalai.ir", "https://api.avalai.ir/",
+                    "https://api.avalai.ir/v1/chat/completions"):
+            with self.subTest(raw=raw):
+                self.assertEqual(
+                    normalize_note_base_url(raw, "avalai"), "https://api.avalai.ir/v1"
+                )
+
+    def test_the_chain_places_it_after_deepseek_and_skips_it_without_a_key(self):
+        settings = self.settings(DEEPSEEK_API_KEY="ds", AVALAI_API_KEY="av")
+        slugs = [route.slug for route in note_routes(settings)]
+        self.assertEqual(slugs, ["deepseek", "avalai"])
+        self.assertEqual(tuple(settings.note_providers), (
+            "gemini", "nara", "openrouter", "deepseek", "avalai",
+        ))
+        without = self.settings(DEEPSEEK_API_KEY="ds", AVALAI_API_KEY="")
+        self.assertEqual([route.slug for route in note_routes(without)], ["deepseek"])
+
+    def test_a_legacy_slot_pointing_at_avalai_keeps_its_place(self):
+        self.assertEqual(
+            classify_note_provider("openai_compatible", "https://api.avalai.ir/v1"),
+            "avalai",
         )
 
 

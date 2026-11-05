@@ -415,6 +415,19 @@ PROVIDER_PROFILES: dict[str, ProviderCapabilityProfile] = {
         documented_stream_options=False,
         documented_reasoning_effort=True,
     ),
+    "avalai": ProviderCapabilityProfile(
+        slug="avalai",
+        # AvalAI documents JSON mode and ``json_schema`` structured output on
+        # its chat-completions route (https://docs.avalai.ir/en/guides/
+        # structured-outputs), but warns that support is per-model — the
+        # request builder already downgrades a rejected ``json_schema`` to
+        # ``json_object`` and then drops it (llm.py::_adjust_rejected_request_param).
+        documented_json_object=True,
+        documented_json_schema=True,
+        supports_streaming_with_json_schema=True,
+        documented_stream_options=False,
+        documented_reasoning_effort=False,
+    ),
     "anthropic": ProviderCapabilityProfile(
         slug="anthropic",
         documented_json_object=False,

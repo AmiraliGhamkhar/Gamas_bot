@@ -55,8 +55,11 @@ from tests.support import (
     make_settings,
 )
 
-#: The booklet block of a compile or repair request (both embed it verbatim).
-_BOOKLET_RE = re.compile(r"### جزوهٔ فعلی[^\n]*\n(\{.*?\})\n\n### ", re.DOTALL)
+#: The draft block of a compile or repair request (both embed it verbatim).
+#: The draft is the last block of the message, so it runs to the end.
+_BOOKLET_RE = re.compile(
+    r"پیش‌نویس جزوه که باید ویرایش و یکدست شود:\n\n?(\{.*\})\Z", re.DOTALL
+)
 
 
 class _FakeResponse:
