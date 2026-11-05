@@ -36,7 +36,6 @@ import argparse
 import asyncio
 import json
 import sys
-import tempfile
 import time
 from pathlib import Path
 
@@ -96,11 +95,10 @@ async def _check_metadata(route, settings) -> bool:
     """``GET /models`` with the real key: is the model entitled, and how big is it?"""
     import aiohttp
 
-    from gamas_bot.llm import _build_get_request_for, _clean_api_key, _endpoint
+    from gamas_bot.llm import _clean_api_key, _endpoint
 
     url = _endpoint(route.base_url, "models")
     headers = {"Authorization": f"Bearer {_clean_api_key(route.api_key)}"}
-    _ = _build_get_request_for  # same builder the bot uses for metadata calls
     started = time.monotonic()
     try:
         async with aiohttp.ClientSession() as session:
@@ -220,21 +218,19 @@ async def _full_pipeline(route, settings, text: str) -> bool:
             print(f"[FAIL] pipeline ({elapsed:.1f}s): {type(exc).__name__}: {exc}")
             return False
     elapsed = time.monotonic() - started
-    with tempfile.TemporaryDirectory() as tmpdir:
-        # Rendering the DOCX proves the answer survives the exporter too; the
-        # file itself is discarded — this is a diagnostic, not a viewer.
-        try:
-            from gamas_bot.docx_export import DocumentMeta, build_notes_docx
+    # Rendering the DOCX proves the answer survives the exporter too; nothing is
+    # written to disk — this is a diagnostic, not a viewer.
+    try:
+        from gamas_bot.docx_export import DocumentMeta, build_notes_docx
 
-            docx = build_notes_docx(
-                notes,
-                meta=DocumentMeta(reference="smoke", source_name="smoke"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            print(f"[FAIL] export: {type(exc).__name__}: {exc}")
-            return False
-        size = len(docx)
-        _ = tmpdir
+        docx = build_notes_docx(
+            notes,
+            meta=DocumentMeta(reference="smoke", source_name="smoke"),
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"[FAIL] export: {type(exc).__name__}: {exc}")
+        return False
+    size = len(docx)
     print(
         f"[PASS] pipeline ({elapsed:.1f}s) title={notes.display_title!r} "
         f"sections={len(notes.sections)} docx={size} bytes"
