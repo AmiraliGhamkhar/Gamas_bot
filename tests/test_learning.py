@@ -13,6 +13,7 @@ import random
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -766,6 +767,19 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         restart = self._event(f"fc:restart:{deck_id}".encode())
         await self.bot._handle_callback(restart)
         self.assertEqual((await self.db.deck_get(deck_id, OWNER))["study_cursor"], 0)
+
+    async def test_flashcard_export_requires_membership(self):
+        self.bot.subscription.settings = replace(self.bot.subscription.settings, subscription_required=True)
+        self.bot.subscription.db = self.db
+        async def nonmember(_user_id):
+            return "left"
+        self.bot.subscription._resolver = nonmember
+        deck_id = await self.db.deck_create(OWNER, None, "deck", "manual")
+        await self.db.deck_add_card(deck_id, "front", "back")
+        export = self._event(f"fc:exp:{deck_id}".encode())
+        await self.bot._handle_callback(export)
+        self.assertFalse(self.client.deliveries)
+        self.assertTrue(any("عضویت" in edit["text"] for edit in export.edits))
 
     async def test_word_export_delivers_rtl_docx_and_removes_the_temp_file(self):
         deck_id = await self.db.deck_create(OWNER, None, "دسته آزمون", "manual")

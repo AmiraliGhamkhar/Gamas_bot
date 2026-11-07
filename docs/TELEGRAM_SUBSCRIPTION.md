@@ -6,7 +6,8 @@ separate from credit, bans and admin authorization.
 The gate is **deferred**, not global: `/start`, help, wallet, purchases, support,
 library browsing and receipt upload stay available, so a non-member can pay and
 ask for help. File submissions, booklet generation, quizzes and flashcards are
-gated at the moment work would begin. A blocked file is remembered for up to
+gated at the moment work would begin; flashcard DOCX export is also gated.
+Answering an already-paid quiz session remains ungated. A blocked file is remembered for up to
 seven days and resumes automatically after **✅ بررسی عضویت** succeeds; the user
 does not send the file again.
 

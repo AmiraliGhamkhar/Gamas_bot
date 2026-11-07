@@ -5,6 +5,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 ## Unreleased — hardening
 
 - WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
+- WO-LRN-10: gate flashcard DOCX delivery while keeping paid quiz answers accessible.
 - WO-LRN-11: reject invalid flashcard presets rather than silently charging the base cost.
 - WO-LRN-3: bound learning calls for small presets on many chunks.
 - WO-LRN-5: preserve manual-card state through the finish callback.

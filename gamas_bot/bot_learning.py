@@ -2062,6 +2062,10 @@ class LearningWorkflowMixin:
             elif action == "study":
                 await self._study_front(event, user_id, deck_id)
             elif action == "exp":
+                if not await self._require_membership(
+                    event, user_id, kind="callback", callback_data=data
+                ):
+                    return
                 await self._export_deck_docx(event, user_id, deck_id)
             elif action == "del":
                 deck = await self.db.deck_get(deck_id, user_id)
