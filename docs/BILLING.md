@@ -47,7 +47,9 @@ be reconstructed as unfinished operations.
 ## Manual purchases
 
 Set `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME`. Configure
-plans with `FREE_PLAN_HOURS` and `PLAN_*` in `.env`.
+plans with `FREE_PLAN_HOURS` and `PLAN_*` in `.env`. In v4, plan editing is
+environment-only; there is no in-bot plan editor. Existing `is_custom` data
+protection is retained for legacy records.
 
 1. Selecting a plan freezes the order's price, duration and validity.
 2. A validated receipt moves `awaiting_payment` to `pending_review`; it adds no credit.

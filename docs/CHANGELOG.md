@@ -6,6 +6,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 
 - WO-SUB-2: record sweep membership and check timestamp in one update.
 - WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
+- WO-PAY-6: document environment-only plan editing and legacy custom-plan protection.
 - WO-PAY-5: edit the wallet screen in place when opening an existing order.
 - WO-PAY-3: surface older open orders and clamp wallet history pages.
 - WO-PAY-4: record cancellation actors, expose cancelled orders and use UTC receipt retention.
