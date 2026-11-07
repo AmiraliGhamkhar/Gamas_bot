@@ -391,7 +391,7 @@ class WorkflowBotTests(BotPipelineTestCase):
         await self.db.set_payment_receipt(pid, "receipt.jpg")
         event = FakeCallbackEvent(USER_ID, f"payopen:{pid}".encode())
         await self.bot._handle_callback(event)
-        text, buttons = event.responses[-1]
+        text, buttons = event.edits[-1]
         self.assertIn("نیازی به واریز مجدد نیست", text)
         self.assertNotIn(f"payc:{pid}".encode(), menu_payloads(buttons))
         self.assertNotIn(f"payr:{pid}".encode(), menu_payloads(buttons))
@@ -402,7 +402,7 @@ class WorkflowBotTests(BotPipelineTestCase):
         self.bot.settings = replace(self.settings, payment_card_number="")
         event = FakeCallbackEvent(USER_ID, f"payopen:{pid}".encode())
         await self.bot._handle_callback(event)
-        text, buttons = event.responses[-1]
+        text, buttons = event.edits[-1]
         self.assertIn("در انتظار بررسی", text)
         self.assertNotIn("اطلاعات واریز", text)
         self.assertNotIn(f"payr:{pid}".encode(), menu_payloads(buttons))
