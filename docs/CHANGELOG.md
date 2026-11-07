@@ -13,6 +13,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-PAY-4: record cancellation actors, expose cancelled orders and use UTC receipt retention.
 - WO-CAP-3: include the original Telegram message ID in queued-job restart notices.
 - WO-CAP-1: lower document upload and cumulative Office expansion defaults.
+- WO-SUP-4: expire abandoned support prompts and handle admin reply permission errors.
 - WO-SUP-1: atomically limit open support tickets and enforce a creation cooldown.
 - WO-SUP-3: confirm user ticket closures before closing or notifying staff.
 - WO-SUP-2: retain full support openers while deriving a bounded first-line subject.

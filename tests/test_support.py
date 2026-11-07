@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -358,6 +359,30 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.answers[-1][1])
         self.assertNotIn(USER_B, self.bot._support_states)
         await self.say(USER_B, "نفوذ")
+        self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 1)
+
+    async def test_abandoned_support_prompts_expire(self):
+        await self.open_ticket()
+        ticket = await self.latest_ticket()
+        await self.press(USER_A, f"sup:r:{ticket['id']}")
+        await self.press(ADMIN, f"adm:sr:{ticket['id']}")
+        user_at = self.bot._support_states[USER_A][2]
+        admin_at = self.bot._support_admin_states[ADMIN][1]
+        self.bot.conversations.sweep_support_states(min(user_at, admin_at) + 1799)
+        self.assertIn(USER_A, self.bot._support_states)
+        self.assertIn(ADMIN, self.bot._support_admin_states)
+        self.bot.conversations.sweep_support_states(max(user_at, admin_at) + 1800)
+        self.assertNotIn(USER_A, self.bot._support_states)
+        self.assertNotIn(ADMIN, self.bot._support_admin_states)
+
+    async def test_admin_reply_permission_error_is_handled(self):
+        await self.open_ticket()
+        ticket = await self.latest_ticket()
+        await self.press(ADMIN, f"adm:sr:{ticket['id']}")
+        with mock.patch.object(self.db, "add_ticket_message", side_effect=PermissionError):
+            event = await self.say(ADMIN, "reply")
+        self.assertNotIn(ADMIN, self.bot._support_admin_states)
+        self.assertTrue(event.replies)
         self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 1)
 
     async def test_admin_reply_routes_to_selected_ticket_and_notifies_user(self):

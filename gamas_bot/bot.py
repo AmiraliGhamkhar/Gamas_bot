@@ -303,10 +303,10 @@ class GamasBot(
         self.queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
         self._transcript_cleanup_task = asyncio.create_task(self._transcript_cleanup_loop())
-        if self.settings.office_enabled:
-            self._office_session_cleanup_task = asyncio.create_task(
-                self._office_session_cleanup_loop()
-            )
+        # Support prompts share this bounded periodic sweep even when Office is disabled.
+        self._office_session_cleanup_task = asyncio.create_task(
+            self._office_session_cleanup_loop()
+        )
         if not self.settings.bot_token:
             raise RuntimeError(
                 "TELEGRAM_BOT_TOKEN is not set; refusing interactive Telethon login."
@@ -1204,6 +1204,7 @@ class GamasBot(
         user_id = event.sender_id
         if user_id is None:
             return
+        self.conversations.sweep_support_states(self.deps.monotonic())
         sender = getattr(event, "sender", None)
         existed = await self.db.user_exists(user_id)
         user = await self.db.ensure_user(
@@ -1272,7 +1273,7 @@ class GamasBot(
             await self._broadcast(event, text)
             return
         if self._is_admin(user_id) and user_id in self._support_admin_states and not command:
-            ticket_id = self._support_admin_states[user_id]
+            ticket_id, _armed_at = self._support_admin_states[user_id]
             await self._handle_admin_support_text(event, user_id, ticket_id, text)
             return
         if self._is_admin(user_id) and command:

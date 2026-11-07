@@ -21,6 +21,7 @@ from .bot_ui import (
 from .db import TicketStateError
 from .db_support import TicketLimitError
 from .intake import _to_int
+from .metrics import METRICS
 from .progress import to_persian_digits
 from .telegram_text import split_message
 
@@ -33,8 +34,8 @@ class SupportWorkflowMixin:
     db: Any
     settings: Any
     client: Any
-    _support_states: dict[int, tuple[str, object]]
-    _support_admin_states: dict[int, int]
+    _support_states: dict[int, tuple[str, object, float]]
+    _support_admin_states: dict[int, tuple[int, float]]
 
     SUPPORT_PAGE_SIZE = 8
     SUPPORT_HISTORY_PAGE = 6
@@ -236,7 +237,7 @@ class SupportWorkflowMixin:
             if category not in SUPPORT_CATEGORY_BUTTONS:
                 await self._ack(event, texts.SUPPORT_BAD_CATEGORY, alert=True)  # type: ignore[attr-defined]
                 return
-            self._support_states[user_id] = ("new", category)
+            self._support_states[user_id] = ("new", category, self.deps.monotonic())
             await event.respond(
                 f"{SUPPORT_CATEGORY_BUTTONS[category]}\n\n{texts.SUPPORT_SUBJECT_PROMPT}",
                 buttons=[[Button.inline(texts.BTN_BACK, b"sup:new")]],
@@ -264,7 +265,7 @@ class SupportWorkflowMixin:
                     alert=True,
                 )
                 return
-            self._support_states[user_id] = ("reply", ticket_id)
+            self._support_states[user_id] = ("reply", ticket_id, self.deps.monotonic())
             await event.respond(
                 texts.SUPPORT_REPLY_PROMPT_TEMPLATE.format(
                     ticket_id=ticket["public_ticket_id"]
@@ -327,7 +328,7 @@ class SupportWorkflowMixin:
         self, event: Any, user_id: int, state: tuple, text: str
     ) -> None:
         """The next plain message of a user who opened a support prompt."""
-        kind, value = state
+        kind, value, _armed_at = state
         if not text:
             await event.reply(texts.SUPPORT_TEXT_ONLY)
             return
@@ -439,7 +440,8 @@ class SupportWorkflowMixin:
                 text,
                 telegram_message_id=getattr(event.message, "id", None),
             )
-        except (ValueError, TicketStateError):
+        except (ValueError, PermissionError, TicketStateError):
+            METRICS.record_support_reply_failure()
             self._support_admin_states.pop(admin_id, None)
             await event.reply(
                 texts.SUPPORT_TICKET_NOT_REPLYABLE,
@@ -670,7 +672,7 @@ class SupportWorkflowMixin:
                     alert=True,
                 )
                 return
-            self._support_admin_states[admin_id] = ticket_id
+            self._support_admin_states[admin_id] = (ticket_id, self.deps.monotonic())
             await event.respond(
                 texts.SUPPORT_ADMIN_REPLY_PROMPT.format(
                     ticket_id=ticket["public_ticket_id"]

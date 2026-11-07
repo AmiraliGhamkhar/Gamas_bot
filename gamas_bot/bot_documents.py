@@ -376,6 +376,7 @@ class DocumentOfficeWorkflowMixin:
         while True:
             await asyncio.sleep(30)
             self._office_sweep_sessions()
+            self.conversations.sweep_support_states(self.deps.monotonic())
 
     def _office_new_session(
         self, user_id: int, message: Any = None
