@@ -285,6 +285,10 @@ class DocumentStoreProtocol(Protocol):
         self, user_id: int, document_id: int
     ) -> dict[str, Any] | None: ...
 
+    async def document_meta(
+        self, user_id: int, document_id: int
+    ) -> dict[str, Any] | None: ...
+
     async def documents_list(
         self, user_id: int, limit: int = 6, offset: int = 0
     ) -> list[dict[str, Any]]: ...

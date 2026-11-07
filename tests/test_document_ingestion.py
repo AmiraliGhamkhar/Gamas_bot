@@ -129,6 +129,17 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         sent = "\n".join(item["text"] for item in self.client.texts)
         self.assertIn("OCR پشتیبانی نمی‌شود", sent)
 
+    async def test_document_screen_metadata_excludes_full_text_and_chunks(self):
+        _, documents = await self.ingest("first.pdf", make_pdf_bytes(), mime="application/pdf")
+        document = documents[0]
+        metadata = await self.db.document_meta(OWNER, document["id"])
+        self.assertNotIn("text", metadata)
+        self.assertNotIn("chunks_json", metadata)
+        self.assertGreater(metadata["text_chars"], 0)
+        with mock.patch.object(self.db, "document_get", side_effect=AssertionError("large read")):
+            await self.bot._show_document_generate_screen(self.press(b"menu:main"), OWNER, document["id"], "deck")
+            await self.bot._show_document_card(self.press(b"menu:main"), OWNER, document["id"])
+
     async def test_oversized_document_is_rejected_before_download(self):
         self.assertEqual(self.settings.doc_max_bytes, 20 * 1024 * 1024)
         event = self.upload(
