@@ -366,12 +366,14 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         ticket = await self.latest_ticket()
         await self.press(USER_A, f"sup:r:{ticket['id']}")
         await self.press(ADMIN, f"adm:sr:{ticket['id']}")
-        user_at = self.bot._support_states[USER_A][2]
-        admin_at = self.bot._support_admin_states[ADMIN][1]
-        self.bot.conversations.sweep_support_states(min(user_at, admin_at) + 1799)
+        state = self.bot._support_states[USER_A]
+        admin_state = self.bot._support_admin_states[ADMIN]
+        self.bot._support_states[USER_A] = (state[0], state[1], 100.0)
+        self.bot._support_admin_states[ADMIN] = (admin_state[0], 101.0)
+        self.bot.conversations.sweep_support_states(1899.0)
         self.assertIn(USER_A, self.bot._support_states)
         self.assertIn(ADMIN, self.bot._support_admin_states)
-        self.bot.conversations.sweep_support_states(max(user_at, admin_at) + 1800)
+        self.bot.conversations.sweep_support_states(1901.0)
         self.assertNotIn(USER_A, self.bot._support_states)
         self.assertNotIn(ADMIN, self.bot._support_admin_states)
 
