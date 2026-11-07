@@ -149,7 +149,10 @@ class LearningWorkflowMixin:
 
     def _preset_cost(self, base_cost: int, cards: int, base_size: int) -> int:
         base_size = max(1, int(base_size))
-        return max(1, int(round(int(base_cost) * int(cards) / base_size)))
+        quotient, remainder = divmod(int(base_cost) * int(cards), base_size)
+        # Match round-to-even without converting integer seconds to float.
+        rounded = quotient + int(2 * remainder > base_size or (2 * remainder == base_size and quotient % 2 == 1))
+        return max(1, rounded)
 
     MAX_ITEMS_PER_CALL = 20
 

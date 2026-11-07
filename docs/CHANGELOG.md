@@ -28,7 +28,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-LRN-7: log and reject malformed three-option questions rather than mis-grade them.
 - WO-LRN-15: use bounded document metadata and previews for screens.
 - WO-LRN-12: index quiz admission and answers; terminal-session retention defaults off per WO-DB-7.
-- WO-LRN-6: refund paid learning shortfalls pro rata in the artifact transaction; test quiz shortfalls and atomic rollback for both artifact types.
+- WO-LRN-6: use integer preset pricing and refund paid learning shortfalls pro rata in the artifact transaction; test quiz shortfalls and atomic rollback for both artifact types.
 - WO-LRN-8: protect live curation sources from library pruning and refund missing sources cleanly.
 - WO-LRN-4: retain source locators when splitting overflowed learning chunks.
 - WO-LRN-1: retain undelivered paid previews until their normal expiry and offer resume.

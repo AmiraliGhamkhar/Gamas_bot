@@ -725,6 +725,11 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("حداکثر تعداد کارت" in reply for reply in event.replies))
         self.assertEqual(len(await self.db.deck_cards(deck)), 1)
 
+    def test_preset_cost_uses_exact_integer_rounding(self):
+        self.assertEqual(self.bot._preset_cost(5, 1, 2), 2)
+        self.assertEqual(self.bot._preset_cost(7, 1, 2), 4)
+        self.assertEqual(self.bot._preset_cost(10**20 + 1, 2, 2), 10**20 + 1)
+
     async def test_global_learning_generation_concurrency_is_bounded(self):
         from gamas_bot.doc_extract import DocChunk
 
