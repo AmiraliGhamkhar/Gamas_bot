@@ -116,11 +116,11 @@ class PaymentsRepositoryMixin(DatabaseCore):
     async def cancel_payment(self, payment_id: int, user_id: int) -> bool:
         async with self._transaction():
             cursor = await self.db.execute(
-                "UPDATE payments SET status = 'cancelled', reviewed_at = ?, "
+                "UPDATE payments SET status = 'cancelled', reviewed_at = ?, reviewed_by = ?, "
                 "review_reason = 'cancelled by owner before receipt' "
                 "WHERE payment_id = ? AND user_id = ? AND status IN ('pending','awaiting_payment') "
                 "AND receipt_path IS NULL",
-                (iso(self._now()), payment_id, user_id),
+                (iso(self._now()), user_id, payment_id, user_id),
             )
             changed = bool(cursor.rowcount)
         if changed:

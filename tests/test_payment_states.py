@@ -76,6 +76,7 @@ class PaymentStateTests(DatabaseTestCase):
         pid = await self.db.create_payment(100, "paid_5h_30d")
         self.assertTrue(await self.db.cancel_payment(pid, 100))
         self.assertEqual(await self.status(pid), "cancelled")
+        self.assertEqual((await self.db.payment(pid))["reviewed_by"], 100)
         self.assertEqual(await self.db.available_seconds(100), 0)
 
         pid2 = await self.db.create_payment(100, "paid_5h_30d")

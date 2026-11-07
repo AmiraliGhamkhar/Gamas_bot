@@ -98,6 +98,16 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         event.message.file.size = source.stat().st_size
         return event
 
+    async def test_cancelled_payment_history_filter(self):
+        cancelled = await self.new_order()
+        await self.db.cancel_payment(cancelled, USER)
+        pending = await self.new_order()
+        view = await self.press(ADMIN, "adm:hub:pay:hist:cancelled")
+        rendered = " ".join(text for text, _ in view.edits)
+        self.assertIn(to_persian_digits(cancelled), rendered)
+        self.assertNotIn("#" + to_persian_digits(pending), rendered)
+        self.assertEqual([row["payment_id"] for row in await self.db.all_payments(status="cancelled")], [cancelled])
+
     async def test_viewing_receipt_preserves_bytes_and_mtime(self):
         payment_id = await self.new_order()
         await self.submit_receipt(payment_id)

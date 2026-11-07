@@ -8,7 +8,7 @@ retention sweeps.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
 import secrets
@@ -684,7 +684,7 @@ class WalletWorkflowMixin:
     async def _cleanup_expired_receipts(self) -> None:
         if not await run_file_io(self.settings.receipt_dir.is_dir):
             return
-        cutoff = datetime.now() - timedelta(days=self.settings.receipt_retention_days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.settings.receipt_retention_days)
         protected = {
             payment["receipt_path"]
             for payment in await self.db.pending_payments()
@@ -706,7 +706,7 @@ class WalletWorkflowMixin:
                     )
                     continue
                 if (
-                    datetime.fromtimestamp((await run_file_io(path.stat)).st_mtime)
+                    datetime.fromtimestamp((await run_file_io(path.stat)).st_mtime, timezone.utc)
                     < cutoff
                 ):
                     await run_file_io(path.unlink, missing_ok=True)

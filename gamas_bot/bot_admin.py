@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 
 from telethon import Button
 
+from . import texts
 from .billing import format_duration, format_toman, format_validity
 from .bot_ui import TELEGRAM_CAPTION_LIMIT
 from .db import utc_now
@@ -110,6 +111,7 @@ class AdminWorkflowMixin:
         ("pending_review", "در انتظار"),
         ("approved", "تأییدشده"),
         ("rejected", "ردشده"),
+        ("cancelled", texts.PAYMENT_HISTORY_CANCELLED),
     )
 
     ADMIN_COMMAND_COOLDOWN_SECONDS = 30.0

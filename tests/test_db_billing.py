@@ -70,6 +70,11 @@ class LedgerTests(DatabaseTestCase):
         self.assertEqual(rows[0][0], rows[1][0])
         self.assertEqual(await self.db.available_seconds(100), 3600)
 
+    async def test_nonpositive_refund_is_logged(self):
+        with self.assertLogs("gamas_bot.db.billing", level="WARNING") as logs:
+            await self.db.refund_seconds(100, 0, "test")
+        self.assertIn("user=100 seconds=0", logs.output[0])
+
     async def test_free_plan_granted_once(self):
         self.assertTrue(await self.db.grant_free_plan_once(100, 3600))
         self.assertFalse(await self.db.grant_free_plan_once(100, 3600))

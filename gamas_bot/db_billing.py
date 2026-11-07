@@ -442,6 +442,7 @@ class BillingRepositoryMixin(DatabaseCore):
         self, user_id: int, seconds: int, note: str, *, debit_id: int | None = None
     ) -> Any:
         if seconds <= 0:
+            logger.warning("refund ignored user=%s seconds=%s", user_id, seconds)
             return
         if debit_id is None:
             METRICS.record_db_error()

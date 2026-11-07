@@ -6,6 +6,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 
 - WO-SUB-2: record sweep membership and check timestamp in one update.
 - WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
+- WO-PAY-4: record cancellation actors, expose cancelled orders and use UTC receipt retention.
 - WO-CAP-1: lower document upload and cumulative Office expansion defaults.
 - WO-SUP-1: atomically limit open support tickets and enforce a creation cooldown.
 - WO-SUP-3: confirm user ticket closures before closing or notifying staff.
