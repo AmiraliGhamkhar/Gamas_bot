@@ -28,8 +28,9 @@ all eligible routes are full/cooling down.
 5. Change hosting if the account kills permitted work; cron cannot bypass quotas.
 
 Document parsing uses threads, not a separate CPU/memory sandbox. Pathological
-files may still consume substantial resources. The document cache has no automatic
-retention cap; monitor it separately from library references.
+files may still consume substantial resources. Document-cache retention defaults
+to off; optionally enable `DOCUMENT_RETENTION_DAYS` for old unlinked caches, and
+monitor live library references separately.
 
 ## Measure offline
 

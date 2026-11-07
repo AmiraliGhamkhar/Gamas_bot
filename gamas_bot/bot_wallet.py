@@ -667,11 +667,12 @@ class WalletWorkflowMixin:
                 await self.db.maintenance(optimize=optimize)
                 if optimize:
                     last_optimize = now
-                await asyncio.sleep(24 * 3600)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.warning("receipt cleanup failed", exc_info=True)
+                METRICS.record_retention_error()
+                logger.warning("receipt cleanup or maintenance failed", exc_info=True)
+            await asyncio.sleep(24 * 3600)
 
     async def _cleanup_retained_data(self) -> dict[str, int]:
         totals = {}
