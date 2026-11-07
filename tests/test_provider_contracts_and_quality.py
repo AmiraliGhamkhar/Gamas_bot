@@ -563,7 +563,7 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(bot._learning_max_chars(), 56_000)
                 calls: list[dict] = []
 
-                async def fake_complete_json(_session, _settings, *, system, user, schema=None):
+                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None):
                     batch_no = len(calls)
                     calls.append({"system": system, "user": user, "schema": schema})
                     start = batch_no * 20
@@ -591,7 +591,8 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(calls), 2)
                 self.assertIsNotNone(calls[0]["schema"])
                 self.assertIsNotNone(calls[1]["schema"])
-                self.assertIn("مفهوم شماره 0 چیست؟", calls[1]["system"])
+                self.assertEqual(calls[0]["system"], calls[1]["system"])
+                self.assertIn("مفهوم شماره 0 چیست؟", calls[1]["user"])
             finally:
                 await bot.shutdown()
 

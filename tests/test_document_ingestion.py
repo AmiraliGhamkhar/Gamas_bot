@@ -210,8 +210,8 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(event)
             generator.assert_awaited_once()
         # The prompt names the chunk locator, so the model can anchor items.
-        system = generator.await_args.kwargs["system"]
-        self.assertIn("صفحهٔ", system)
+        user_prompt = generator.await_args.kwargs["user"]
+        self.assertIn("صفحهٔ", user_prompt)
         await self.bot._handle_callback(self.press(b"fc:cur:save"))
         decks = await self.db.decks_list(OWNER)
         self.assertEqual(len(decks), 1)
@@ -432,7 +432,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         user_prompt = generator.await_args.kwargs["user"]
         self.assertIn("تنفس سلولی", user_prompt)
         self.assertIn("چرخهٔ کربس", user_prompt)
-        self.assertIn("بخش «تنفس سلولی»", generator.await_args.kwargs["system"])
+        self.assertIn("بخش «تنفس سلولی»", generator.await_args.kwargs["user"])
 
     async def test_forwarding_the_original_document_shows_a_bar(self):
         """Re-sending an original file is work; the panel must show it."""
@@ -582,7 +582,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         chunks = [DocChunk(i, f"صفحهٔ {i}", (f"صفحهٔ {i}",), f"متن یکتا {i}") for i in range(12)]
         source = {"item_id": item, "doc_id": None, "title": "سند", "chunks": chunks}
         async def provider(*args, **kwargs):
-            chunk = next(chunk for chunk in chunks if chunk.text == kwargs["user"])
+            chunk = next(chunk for chunk in chunks if kwargs["user"].endswith(chunk.text))
             return {"cards": [{"front": f"پرسش {chunk.index} مورد {i}", "back": "پاسخ", "source": chunk.locator} for i in range(5)]}
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER, kind="deck",
