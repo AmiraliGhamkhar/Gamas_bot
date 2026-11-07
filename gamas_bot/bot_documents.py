@@ -749,7 +749,10 @@ class DocumentOfficeWorkflowMixin:
                 None,
                 title=title[:200],
             )
-            await self.db.library_prune(user_id, self.settings.library_max_items)
+            await self.db.library_prune(
+                user_id, self.settings.library_max_items,
+                protected_item_ids=self._protected_curation_items(user_id),
+            )
         except Exception as exc:
             logger.warning("could not index Office file error=%s", type(exc).__name__)
 

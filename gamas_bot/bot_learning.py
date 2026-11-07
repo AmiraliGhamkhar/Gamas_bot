@@ -14,6 +14,7 @@ import logging
 import math
 from pathlib import Path
 import secrets
+import sqlite3
 import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any
@@ -888,6 +889,23 @@ class LearningWorkflowMixin:
             [[Button.inline("📚 کتابخانه من", b"library")]],
         )
 
+    def _protected_curation_items(self, user_id: int) -> tuple[int, ...]:
+        state = self._curation.get(user_id)
+        if not state:
+            return ()
+        return (int(state["item_id"]),)
+
+    async def _curation_source_missing(self, event: Any, user_id: int, state: dict[str, Any]) -> None:
+        METRICS.record_curation_source_missing()
+        await self._release_curation(user_id, state)
+        if not state.get("refund_ok", True):
+            message = LEARNING_REFUND_PENDING_NOTICE
+        elif state.get("charged"):
+            message = texts.CURATION_SOURCE_REMOVED
+        else:
+            message = texts.CURATION_SOURCE_REMOVED_FREE
+        await self._edit(event, message, [[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]])
+
     async def _save_curation(self, event: Any, user_id: int) -> None:
         state = self._curation.get(user_id)
         if self._curation_stale(state):
@@ -904,6 +922,9 @@ class LearningWorkflowMixin:
                 f"برای ذخیره حداقل {to_persian_digits(minimum)} مورد لازم است.",
                 alert=True,
             )
+            return
+        if await self.db.library_item(user_id, int(state["item_id"])) is None:
+            await self._curation_source_missing(event, user_id, state)
             return
         try:
             if state["kind"] == "deck":
@@ -932,6 +953,10 @@ class LearningWorkflowMixin:
                     ),
                 )
         except BaseException as exc:
+            if (isinstance(exc, sqlite3.IntegrityError)
+                    and await self.db.library_item(user_id, int(state["item_id"])) is None):
+                await self._curation_source_missing(event, user_id, state)
+                return
             await self._release_curation(user_id, state)
             if isinstance(
                 exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)

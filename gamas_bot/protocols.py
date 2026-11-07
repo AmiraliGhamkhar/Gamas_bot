@@ -16,7 +16,7 @@ Why this module exists:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Iterable
+from collections.abc import Awaitable, Collection, Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -266,7 +266,9 @@ class LibraryStoreProtocol(Protocol):
         self, user_id: int, item_id: int
     ) -> dict[str, Any] | None: ...
 
-    async def library_prune(self, user_id: int, keep: int) -> int: ...
+    async def library_prune(
+        self, user_id: int, keep: int, *, protected_item_ids: Collection[int] = ()
+    ) -> int: ...
 
 
 @runtime_checkable

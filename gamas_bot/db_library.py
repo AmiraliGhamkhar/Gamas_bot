@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import timedelta
 from typing import Any
 
@@ -249,8 +250,15 @@ class LibraryRepositoryMixin(DatabaseCore):
             (int(item_id),),
         )
 
-    async def library_prune(self, user_id: int, keep: int) -> int:
+    async def library_prune(
+        self, user_id: int, keep: int, *, protected_item_ids: Collection[int] = ()
+    ) -> int:
         keep = max(0, int(keep))
+        protected = tuple(int(item_id) for item_id in protected_item_ids)
+        exclusion = (
+            " AND item_id NOT IN (" + ",".join("?" for _ in protected) + ")"
+            if protected else ""
+        )
         async with self._transaction():
             cursor = await self.db.execute(
                 "DELETE FROM library_items WHERE user_id = ? AND item_id NOT IN ("
@@ -258,8 +266,8 @@ class LibraryRepositoryMixin(DatabaseCore):
                 "ORDER BY item_id DESC LIMIT ?) "
                 "AND NOT EXISTS (SELECT 1 FROM quiz_sessions q "
                 "WHERE q.user_id = library_items.user_id AND q.item_id = library_items.item_id "
-                "AND q.status = 'active')",
-                (int(user_id), int(user_id), keep),
+                "AND q.status = 'active')" + exclusion,
+                (int(user_id), int(user_id), keep, *protected),
             )
             return max(0, int(cursor.rowcount))
 

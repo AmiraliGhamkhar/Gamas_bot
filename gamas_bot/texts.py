@@ -506,3 +506,6 @@ PROGRESS_WORK_FAIL: Final = "❌ انجام نشد."
 
 CURATION_DELIVERY_RETRY: Final = "پیش‌نمایش ارسال نشد؛ با /start دوباره تلاش کنید."
 CURATION_RESUME_BUTTON: Final = "🧐 ادامهٔ بررسی"
+
+CURATION_SOURCE_REMOVED: Final = "منبع این پیش‌نمایش حذف شده بود؛ مبلغ بازگشت داده شد."
+CURATION_SOURCE_REMOVED_FREE: Final = "منبع این پیش‌نمایش حذف شده بود؛ هزینه‌ای کسر نشد."

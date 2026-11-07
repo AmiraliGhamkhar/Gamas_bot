@@ -192,6 +192,7 @@ class MetricsCollector:
             self._deduplicated_updates = 0
             self._db_errors = 0
             self._curation_delivery_errors = 0
+            self._curation_source_missing = 0
             self._outcomes: dict[str, int] = dict.fromkeys(TERMINAL_OUTCOMES, 0)
             self._stage_active: dict[str, int] = dict.fromkeys(PIPELINE_STAGES, 0)
             self._stage_latency: dict[str, _Series] = {
@@ -234,6 +235,10 @@ class MetricsCollector:
     def record_curation_delivery_error(self) -> None:
         with self._lock:
             self._curation_delivery_errors += 1
+
+    def record_curation_source_missing(self) -> None:
+        with self._lock:
+            self._curation_source_missing += 1
 
     def record_job_started(self, *, queue_wait_seconds: float, queued_now: int) -> None:
         with self._lock:
@@ -360,6 +365,7 @@ class MetricsCollector:
                 "deduplicated_updates": self._deduplicated_updates,
                 "db_errors": self._db_errors,
                 "curation_delivery_errors": self._curation_delivery_errors,
+                "curation_source_missing": self._curation_source_missing,
                 "outcomes": dict(self._outcomes),
                 "stage_active": dict(self._stage_active),
                 "queue_wait": self._queue_wait.summary(),

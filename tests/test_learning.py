@@ -624,6 +624,27 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(card["source"] == "بخش ۱" for card in cards))
         self.assertNotIn("صفحهٔ ۹۹", " ".join(card["source"] for card in cards))
 
+    async def test_pending_curation_source_is_protected_from_prune(self):
+        await self.spend_free_try("deck")
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
+        await self.db.library_prune(OWNER, 0, protected_item_ids=self.bot._protected_curation_items(OWNER))
+        self.assertIsNotNone(await self.db.library_item(OWNER, self.item_id))
+        await self.save_curation()
+        self.assertEqual(await self.db.deck_count(OWNER), 1)
+
+    async def test_missing_curation_source_refunds_cleanly(self):
+        await self.spend_free_try("deck")
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
+        await self.db.library_prune(OWNER, 0)
+        event = self._event(b"fc:cur:save")
+        await self.bot._handle_callback(event)
+        self.assertTrue(any("منبع این پیش‌نمایش حذف شده بود؛ مبلغ بازگشت داده شد" in edit["text"]
+                            for edit in event.edits))
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+
     async def test_preview_edit_failure_uses_new_message_and_finalizes(self):
         await self.spend_free_try("deck")
         original_edit = FakeSentMessage.edit
