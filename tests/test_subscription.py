@@ -441,6 +441,23 @@ class InflightSharingTests(SubscriptionTestCase):
 
 
 class CallbackHandlerTests(SubscriptionTestCase):
+    async def test_successful_explicit_check_populates_cache(self):
+        self.bot.subscription.settings = replace(
+            self.bot.subscription.settings, subscription_cache_seconds=300.0
+        )
+        calls = []
+
+        async def resolver(user_id):
+            calls.append(user_id)
+            return "member"
+
+        self.bot.subscription._resolver = resolver
+        event = CallbackEvent(USER_ID, b"sub:check")
+        await self.bot.subscription.handle_callback(event, USER_ID, SUBSCRIPTION_PREFIX + "check")
+        result = await self.bot.subscription.check_membership(USER_ID)
+        self.assertEqual(result.state, STATE_MEMBER)
+        self.assertEqual(calls, [USER_ID])
+
     async def test_check_callback_for_non_member_prompts(self):
         await self.use_resolver("left")
         event = CallbackEvent(USER_ID, b"sub:check")

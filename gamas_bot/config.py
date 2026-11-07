@@ -706,7 +706,7 @@ class Settings:
     #: Short-lived cache for a *confirmed* membership, in seconds. ``0``
     #: re-checks on every interaction — the strict, fail-safe default, because
     #: a leaver must be restricted on their very next interaction.
-    subscription_cache_seconds: float = 0.0
+    subscription_cache_seconds: float = 300.0
     #: Per-request timeout of one ``getChatMember`` call, in seconds.
     subscription_timeout_seconds: float = 20.0
     #: Bot API base URL (overridable for a mirror or an offline test).
@@ -1482,7 +1482,7 @@ def from_env(env_file: str | None = None) -> Settings:
         subscription_channel=_env("SUBSCRIPTION_CHANNEL", "@gamas_AI").strip(),
         subscription_required=_env_bool("SUBSCRIPTION_REQUIRED", True),
         subscription_cache_seconds=_env_float(
-            "SUBSCRIPTION_CACHE_SECONDS", 0.0, minimum=0.0, maximum=3600.0
+            "SUBSCRIPTION_CACHE_SECONDS", 300.0, minimum=0.0, maximum=3600.0
         ),
         subscription_timeout_seconds=_env_float(
             "SUBSCRIPTION_TIMEOUT_SECONDS", 20.0, minimum=1.0, maximum=120.0

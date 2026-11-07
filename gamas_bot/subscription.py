@@ -309,7 +309,7 @@ class SubscriptionService:
         finally:
             self._inflight.pop(user_id, None)
 
-        if allow_cache and not force:
+        if allow_cache:
             if result.state == STATE_MEMBER and result.status:
                 self._cache[user_id] = (result.status, time.monotonic())
             else:
@@ -479,7 +479,7 @@ class SubscriptionService:
 
     async def handle_check(self, event, user_id: int) -> None:
         """Fresh membership check triggered by the user."""
-        result = await self.check_membership(user_id, force=True, allow_cache=False)
+        result = await self.check_membership(user_id, force=True)
         if result.is_member:
             await self._record(user_id, result)
             await self.bot._ack(event)
