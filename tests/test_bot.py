@@ -1330,6 +1330,41 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         run = await self.db.broadcast_get_run(run[0])
         self.assertEqual((run["status"], run["sent"]), ("done", 5))
 
+    async def test_broadcast_resumes_after_second_keyset_batch(self):
+        await self.db.ensure_user(self.admin_id)
+        async with self.db._transaction():
+            await self.db.db.executemany(
+                "INSERT INTO users(telegram_id,joined_at) VALUES (?,?)",
+                ((uid, "2026-01-01") for uid in range(10000, 11005)),
+            )
+        event = FakeMessageEvent(self.admin_id, "")
+        self.bot.client = event.client
+        delivered = []
+        class SimulatedCrash(BaseException):
+            pass
+        async def send(user, _text):
+            if len(delivered) == 1000:
+                raise SimulatedCrash()
+            delivered.append(user)
+            return "success"
+        with mock.patch.object(self.bot, "_send_broadcast_page", side_effect=send), \
+             mock.patch.object(self.bot, "_check_admin_cooldown", new=mock.AsyncMock(return_value=True)):
+            with self.assertRaises(SimulatedCrash):
+                await self.bot._broadcast(event, "announcement")
+            run = (await self.db.db.execute_fetchall("SELECT id,last_telegram_id,sent FROM broadcast_runs"))[0]
+            self.assertEqual((run[1], run[2]), (10999, 1000))
+            # A real abrupt process exit leaves the durable run in running state.
+            await self.db._write("UPDATE broadcast_runs SET status='running' WHERE id=?", (run[0],))
+            recovered = await self.db.broadcast_recover_runs()
+            self.assertEqual(recovered[0]["last_telegram_id"], 10999)
+            async def finish(user, _text):
+                delivered.append(user)
+                return "success"
+            with mock.patch.object(self.bot, "_send_broadcast_page", side_effect=finish):
+                await self.bot._broadcast(event, "announcement", resume_id=run[0])
+        self.assertEqual(delivered, list(range(10000, 11005)))
+        self.assertEqual((await self.db.broadcast_get_run(run[0]))["status"], "done")
+
     async def test_permanent_failures_are_filtered_after_three_runs(self):
         await self.db.ensure_user(self.admin_id)
         await self.db.ensure_user(self.user_id)
