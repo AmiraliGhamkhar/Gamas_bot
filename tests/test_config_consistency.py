@@ -118,6 +118,7 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("FLASHCARD_AI_COST_SECONDS", "flashcard_ai_cost_seconds", "int"),
     ("FLASHCARD_AI_DECK_SIZE", "flashcard_ai_deck_size", "int"),
     ("FLASHCARD_MAX_DECKS_PER_USER", "flashcard_max_decks_per_user", "int"),
+    ("FLASHCARD_MAX_CARDS_PER_DECK", "flashcard_max_cards_per_deck", "int"),
     ("LEARNING_CHUNK_CONCURRENCY", "learning_chunk_concurrency", "int"),
     ("OFFICE_ENABLED", "office_enabled", "bool"),
     ("OFFICE_MAX_INPUT_BYTES", "office_max_input_bytes", "int"),

@@ -48,6 +48,7 @@ from .bot_ui import (
     TELEGRAM_CAPTION_LIMIT,
 )
 from .db import InsufficientBalanceError
+from .db_learning import FlashcardLimitError
 from .doc_extract import (
     DocChunk,
     chunk_text,
@@ -391,13 +392,7 @@ class LearningWorkflowMixin:
                     anchored = anchor_items(
                         parsed, allowed, fallback_locator, target_chunk.text
                     )
-                    if len(anchored) < len(parsed):
-                        logger.debug(
-                            "dropped %s malformed %s item(s) chunk=%s",
-                            len(parsed) - len(anchored),
-                            kind,
-                            chunk_idx,
-                        )
+                    # Anchoring assigns a fallback locator; it never drops items.
                     prev_count = len(items)
                     merged = dedupe([*items, *anchored])
                     if len(merged) > prev_count:
@@ -1832,9 +1827,15 @@ class LearningWorkflowMixin:
             self._pending_flashcard[user_id] = (deck_id, "front")
             await event.reply(FLASHCARD_ASK_FRONT, buttons=end_button)
             return
-        count = await self.db.deck_add_card(
-            deck_id, front, text[:MAX_MANUAL_BACK_CHARS]
-        )
+        try:
+            count = await self.db.deck_add_card(
+                deck_id, front, text[:MAX_MANUAL_BACK_CHARS],
+                max_cards=self.settings.flashcard_max_cards_per_deck,
+            )
+        except FlashcardLimitError:
+            self._pending_flashcard.pop(user_id, None)
+            await event.reply(texts.FLASHCARD_CARD_LIMIT)
+            return
         self._pending_flashcard[user_id] = (deck_id, "front")
         await event.reply(
             f"کارت اضافه شد ({to_persian_digits(count)} کارت). "

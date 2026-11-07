@@ -13,6 +13,10 @@ from .db_users import UsersRepositoryMixin
 from .metrics import METRICS
 
 
+class FlashcardLimitError(ValueError):
+    """A deck has reached its configured card ceiling."""
+
+
 class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
     """Single-responsibility persistence slice for quizzes, decks, and leaderboards."""
 
@@ -63,6 +67,16 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
     ) -> int:
         if not questions:
             raise ValueError("quiz session needs at least one question")
+        for question in questions:
+            if (not isinstance(question, dict) or not isinstance(question.get("question"), str)
+                    or not isinstance(question.get("options"), list)
+                    or len(question["options"]) != 4
+                    or not all(isinstance(option, str) for option in question["options"])
+                    or isinstance(question.get("correct_index"), bool)
+                    or not isinstance(question.get("correct_index"), int)
+                    or not 0 <= question["correct_index"] < 4):
+                METRICS.record_learning_validation_failure()
+                raise ValueError("invalid quiz question shape")
         now = iso(self._now())
         async with self._transaction():
             cursor = await self.db.execute(
@@ -303,6 +317,11 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
     ) -> int:
         if not cards:
             raise ValueError("a deck needs at least one card")
+        for card in cards:
+            if (not isinstance(card, dict) or not isinstance(card.get("front"), str)
+                    or not isinstance(card.get("back"), str)):
+                METRICS.record_learning_validation_failure()
+                raise ValueError("invalid flashcard shape")
         now = iso(self._now())
         async with self._transaction():
             cursor = await self.db.execute(
@@ -333,7 +352,7 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
             user_id, None, "فلش‌کارت‌های دستی من", "manual"
         )
 
-    async def deck_add_card(self, deck_id: int, front: str, back: str) -> int:
+    async def deck_add_card(self, deck_id: int, front: str, back: str, *, max_cards: int = 200) -> int:
         async with self._transaction():
             count_rows = await _rows(
                 self.db,
@@ -341,6 +360,9 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 (int(deck_id),),
             )
             idx = int(count_rows[0][0]) if count_rows else 0
+            if idx >= max(1, int(max_cards)):
+                METRICS.record_learning_validation_failure()
+                raise FlashcardLimitError("deck card limit reached")
             await self.db.executemany(
                 "INSERT INTO flashcards(deck_id, idx, front, back) "
                 "VALUES (?, ?, ?, ?)",

@@ -87,3 +87,5 @@ defaults to 600; set it to 0 to disable the creation cooldown. Both limits
 are enforced atomically when a ticket is created.
 
 `DOC_UNPACKED_MAX_BYTES` limits the cumulative expanded Office archive size (default 104857600 bytes).
+
+Manual flashcard decks are limited by `FLASHCARD_MAX_CARDS_PER_DECK` (default 200).

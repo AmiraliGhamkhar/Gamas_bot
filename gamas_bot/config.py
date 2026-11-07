@@ -731,6 +731,8 @@ class Settings:
     flashcard_ai_deck_size: int = 10
     #: Per-user cap on stored flashcard decks (AI and manual counted together).
     flashcard_max_decks_per_user: int = 30
+    #: Upper bound on cards added to a manual deck.
+    flashcard_max_cards_per_deck: int = 200
     #: Parallel per-chunk model calls used by one generation (3–5 is the useful
     #: range; higher starts tripping provider per-minute limits).
     learning_chunk_concurrency: int = 4
@@ -1519,6 +1521,9 @@ def from_env(env_file: str | None = None) -> Settings:
         ),
         flashcard_max_decks_per_user=_env_int(
             "FLASHCARD_MAX_DECKS_PER_USER", 30, minimum=1, maximum=500
+        ),
+        flashcard_max_cards_per_deck=_env_int(
+            "FLASHCARD_MAX_CARDS_PER_DECK", 200, minimum=1, maximum=5000
         ),
         learning_chunk_concurrency=_env_int(
             "LEARNING_CHUNK_CONCURRENCY", 4, minimum=1, maximum=8

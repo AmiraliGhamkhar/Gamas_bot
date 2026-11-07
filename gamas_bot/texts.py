@@ -516,3 +516,5 @@ CURATION_SOURCE_REMOVED: Final = "منبع این پیش‌نمایش حذف ش�
 CURATION_SOURCE_REMOVED_FREE: Final = "منبع این پیش‌نمایش حذف شده بود؛ هزینه‌ای کسر نشد."
 LEARNING_PRORATA_REFUND: Final = "اعتبار بازگشتی: {duration}"
 PAYMENT_HISTORY_CANCELLED: Final = "لغوشده"
+
+FLASHCARD_CARD_LIMIT: Final = "این مجموعه به حداکثر تعداد کارت رسیده است."

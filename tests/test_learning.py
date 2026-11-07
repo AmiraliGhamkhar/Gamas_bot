@@ -225,7 +225,7 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         questions = [{"question": f"q {i}", "options": ["a", "b", "c", "d"],
                       "correct_index": 0} for i in range(500)]
         questions[250] = {"question": "missing options"}
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ValueError):
             await self.db.quiz_create_session(OWNER, self.item_id, questions)
         for table in ("quiz_sessions", "quiz_questions"):
             self.assertEqual((await self.db.db.execute_fetchall(f"SELECT COUNT(*) FROM {table}"))[0][0], 0)
@@ -506,13 +506,24 @@ class FlashcardDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def test_batched_cards_preserve_order_and_roll_back_on_bad_item(self):
         cards = [{"front": f"front {i}", "back": f"back {i}"} for i in range(500)]
         broken = cards[:250] + [{"front": "missing back"}] + cards[251:]
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ValueError):
             await self.db.deck_create_with_cards(OWNER, self.item_id, "broken", broken)
         self.assertEqual(await self.db.deck_count(OWNER), 0)
         self.assertEqual((await self.db.db.execute_fetchall("SELECT COUNT(*) FROM flashcards"))[0][0], 0)
         deck_id = await self.db.deck_create_with_cards(OWNER, self.item_id, "complete", cards)
         rows = await self.db.deck_cards(deck_id)
         self.assertEqual([row["front"] for row in rows], [card["front"] for card in cards])
+
+    async def test_manual_card_limit_is_atomic(self):
+        from gamas_bot.db_learning import FlashcardLimitError
+        deck = await self.db.manual_deck_get_or_create(OWNER)
+        results = await asyncio.gather(
+            self.db.deck_add_card(deck, "a", "a", max_cards=1),
+            self.db.deck_add_card(deck, "b", "b", max_cards=1),
+            return_exceptions=True,
+        )
+        self.assertEqual(sum(isinstance(result, FlashcardLimitError) for result in results), 1)
+        self.assertEqual(len(await self.db.deck_cards(deck)), 1)
 
     async def test_deck_lifecycle_and_cascade(self):
         deck_id = await self.db.deck_create(OWNER, self.item_id, "دسته", "ai")
@@ -702,6 +713,17 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(peak_edits, 1)
         self.assertEqual(edits[0], (0, 0))
         self.assertEqual(edits[-1][0], 4)
+
+    async def test_manual_card_ceiling_shows_persian_notice(self):
+        self.bot.settings = replace(self.bot.settings, flashcard_max_cards_per_deck=1)
+        deck = await self.db.manual_deck_get_or_create(OWNER)
+        await self.db.deck_add_card(deck, "first", "answer", max_cards=1)
+        self.bot._pending_flashcard[OWNER] = (deck, "back")
+        self.bot._pending_flashcard_front[OWNER] = "second"
+        event = FakeMessageEvent(OWNER, "answer")
+        await self.bot._handle_flashcard_text(event, OWNER, "answer")
+        self.assertTrue(any("حداکثر تعداد کارت" in reply for reply in event.replies))
+        self.assertEqual(len(await self.db.deck_cards(deck)), 1)
 
     async def test_paid_curation_refunds_pro_rata_when_items_removed(self):
         from gamas_bot.doc_extract import DocChunk

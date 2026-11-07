@@ -72,7 +72,7 @@ class LearningChargeRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_artifact_and_paid_finalization_commit_or_rollback_together(self):
         await self.db.spend_seconds(OWNER, 300, "fc-pending:1", operation_id="deck")
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ValueError):
             await self.db.deck_create_with_cards(
                 OWNER, self.item_id, "بدون پاسخ", [{"front": "پرسش"}], paid_charge_id="deck"
             )
