@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 import os
+import random
 from pathlib import Path
 import re
 import sqlite3
@@ -72,8 +73,20 @@ async def _rows(
     sql: str,
     parameters: Iterable[Any] | None = None,
 ) -> list[sqlite3.Row]:
-    """Fetch every row of ``sql`` as a materialized list."""
-    return list(await connection.execute_fetchall(sql, parameters))
+    """Fetch rows, retrying transient SQLite read contention twice."""
+    params = tuple(parameters) if parameters is not None else None
+    for attempt in range(3):
+        try:
+            return list(await connection.execute_fetchall(sql, params))
+        except sqlite3.Error as exc:
+            METRICS.record_db_error()
+            if (not isinstance(exc, sqlite3.OperationalError)
+                    or not any(word in str(exc).lower() for word in ("locked", "busy"))
+                    or attempt == 2):
+                raise
+            delay = (0.05, 0.15)[attempt] * random.uniform(0.9, 1.1)
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def utc_now() -> datetime:

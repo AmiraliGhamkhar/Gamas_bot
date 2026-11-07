@@ -9,6 +9,7 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 import sys
+import sqlite3
 import tempfile
 import time
 from types import SimpleNamespace
@@ -555,6 +556,18 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
         stt.reset_cooldowns()
         llm.reset_cooldowns()
         self._tmp.cleanup()
+
+    async def test_read_retries_locked_error(self):
+        from gamas_bot.db_core import _rows
+
+        connection = mock.Mock()
+        connection.execute_fetchall = mock.AsyncMock(
+            side_effect=[sqlite3.OperationalError("database is locked"), [(1,)]]
+        )
+        with mock.patch.object(METRICS, "record_db_error") as record:
+            self.assertEqual(await _rows(connection, "SELECT 1"), [(1,)])
+        record.assert_called_once_with()
+        self.assertEqual(connection.execute_fetchall.await_count, 2)
 
     async def test_connection_memory_pragmas(self):
         for connection, settings in (
