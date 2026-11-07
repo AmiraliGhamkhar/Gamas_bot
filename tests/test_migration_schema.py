@@ -36,6 +36,23 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(expected, "no v3 migrations were found")
         self.assertEqual(applied, expected)
 
+    async def test_performance_indexes_and_lot_query_plan(self):
+        await self.db.ensure_user(123)
+        await self.db.add_credit(123, 3600, note="test", validity_days=30)
+        rows = await self.db.db.execute_fetchall(
+            "EXPLAIN QUERY PLAN SELECT id FROM ledger WHERE user_id=? AND kind='credit' "
+            "AND julianday(created_at) <= julianday(?) "
+            "AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))",
+            (123, "2026-01-01", "2026-01-01"),
+        )
+        self.assertTrue(any("idx_ledger_user_kind" in str(row[3]) for row in rows))
+        indexes = await self.db.db.execute_fetchall(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+        )
+        self.assertTrue({"idx_users_quiz_points", "idx_users_banned_seen", "idx_users_seen_active",
+                         "idx_transcriptions_created", "idx_documents_library_item"}
+                        <= {row[0] for row in indexes})
+
     async def test_application_tables_are_exactly_the_declared_set(self):
         rows = await self.db.db.execute_fetchall(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
