@@ -192,6 +192,21 @@ class PaymentsRepositoryMixin(DatabaseCore):
         )
         return dict(rows[0]) if rows else None
 
+    async def open_payment_for_user(self, user_id: int) -> dict[str, Any] | None:
+        """Find an open order regardless of newer terminal history."""
+        rows = await _rows(
+            self.read_db,
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments "
+            "WHERE user_id = ? AND status IN ('awaiting_payment', 'pending', 'pending_review') "
+            "ORDER BY payment_id DESC LIMIT 1",
+            (int(user_id),),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def count_user_payments(self, user_id: int) -> int:
+        rows = await _rows(self.read_db, "SELECT COUNT(*) FROM payments WHERE user_id = ?", (int(user_id),))
+        return int(rows[0][0])
+
     async def pending_payments(self) -> list[dict[str, Any]]:
         rows = await _rows(
             self.read_db,

@@ -245,6 +245,19 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         admin_history = await self.press(ADMIN, "adm:ph:0")
         self.assertIn("تأیید شده", admin_history.edits[-1][0])
 
+    async def test_wallet_finds_older_open_order_and_clamps_history(self):
+        open_id = await self.new_order()
+        await self.db._write(
+            "INSERT INTO payments(user_id,plan_code,status,created_at) VALUES (?, ?, 'cancelled', ?)",
+            (USER, PLAN, "2026-01-01T00:00:00+00:00"),
+        )
+        wallet = await self.press(USER, "walletp:9999")
+        text, buttons = wallet.edits[-1]
+        self.assertIn(f"payopen:{open_id}".encode(), self.payloads(buttons))
+        self.assertIn(f"payc:{open_id}".encode(), self.payloads(buttons))
+        self.assertIn(f"#{to_persian_digits(open_id)}", text)
+        self.assertNotIn(b"walletp:9998", self.payloads(buttons))
+
     async def test_wallet_keeps_recent_payments_on_the_account_screen_with_pagination(self):
         payment_ids = []
         for _ in range(7):

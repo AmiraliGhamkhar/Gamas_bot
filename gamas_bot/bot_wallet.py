@@ -68,16 +68,15 @@ class WalletWorkflowMixin:
         ]
         buttons: list[list] = []
 
-        latest = await self.db.payment_history_paginated(user_id, limit=1)
-        if latest and is_open_payment(latest[0]["status"]):
-            payment = latest[0]
+        payment = await self.db.open_payment_for_user(user_id)
+        if payment is not None:
             order_buttons = [
                 Button.inline(
                     texts.BTN_TRACK_OPEN_ORDER,
                     f"payopen:{payment['payment_id']}".encode("ascii"),
                 )
             ]
-            if not payment["receipt_path"]:
+            if payment["status"] in ("awaiting_payment", "pending") and not payment["receipt_path"]:
                 order_buttons.append(
                     Button.inline(
                         texts.BTN_CANCEL_ORDER,
@@ -128,6 +127,8 @@ class WalletWorkflowMixin:
                 texts.WALLET_RECENT_PAYMENTS,
             ]
         )
+        count = await self.db.count_user_payments(user_id)
+        payments_page = min(payments_page, max(0, (count - 1) // page_size))
         payments = await self.db.payment_history_paginated(
             user_id, limit=page_size + 1, offset=payments_page * page_size
         )

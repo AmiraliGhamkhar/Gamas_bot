@@ -190,6 +190,9 @@ class PaymentStoreProtocol(Protocol):
         self, user_id: int
     ) -> dict[str, Any] | None: ...
 
+    async def open_payment_for_user(self, user_id: int) -> dict[str, Any] | None: ...
+    async def count_user_payments(self, user_id: int) -> int: ...
+
     async def review_payment(
         self,
         payment_id: int,
