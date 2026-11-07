@@ -245,6 +245,13 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         admin_history = await self.press(ADMIN, "adm:ph:0")
         self.assertIn("تأیید شده", admin_history.edits[-1][0])
 
+    async def test_open_order_edits_wallet_screen_in_place(self):
+        payment_id = await self.new_order()
+        event = await self.press(USER, f"payopen:{payment_id}")
+        self.assertTrue(event.edits)
+        self.assertEqual(event.responses, [])
+        self.assertIn(to_persian_digits(payment_id), event.edits[-1][0])
+
     async def test_wallet_finds_older_open_order_and_clamps_history(self):
         open_id = await self.new_order()
         await self.db._write(

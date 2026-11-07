@@ -1075,7 +1075,7 @@ class GamasBot(
         if data.startswith("payc:"):
             await self._cancel_payment(event, payment_id)
         elif data.startswith("payopen:"):
-            await self._show_payment(event, payment_id)
+            await self._show_payment(event, payment_id, edit_in_place=True)
         else:
             await self._await_receipt(event, payment_id)
 

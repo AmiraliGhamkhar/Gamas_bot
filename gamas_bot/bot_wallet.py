@@ -194,7 +194,7 @@ class WalletWorkflowMixin:
             return
         await self._show_payment(event, payment_id)
 
-    async def _show_payment(self, event: Any, payment_id: int) -> None:
+    async def _show_payment(self, event: Any, payment_id: int, *, edit_in_place: bool = False) -> None:
         payment = await self.db.payment(payment_id)
         if (
             payment is None
@@ -249,7 +249,10 @@ class WalletWorkflowMixin:
                 [Button.inline(texts.BTN_CANCEL_ORDER, f"payc:{payment_id}".encode())],
             ]
         buttons.append([Button.inline(texts.BTN_WALLET, b"wallet")])
-        await event.respond(text, buttons=buttons)
+        if edit_in_place:
+            await self._edit_or_reply(event, text, buttons)
+        else:
+            await event.respond(text, buttons=buttons)
 
     async def _cancel_payment(self, event: Any, payment_id: int) -> None:
         changed = await self.db.cancel_payment(payment_id, event.sender_id)
