@@ -926,6 +926,10 @@ class LearningWorkflowMixin:
         if await self.db.library_item(user_id, int(state["item_id"])) is None:
             await self._curation_source_missing(event, user_id, state)
             return
+        requested = int(state["requested"])
+        cost = int(state["cost"])
+        refund = ((cost * (requested - len(items)) + requested - 1) // requested
+                  if state.get("charged") and len(items) < requested else 0)
         try:
             if state["kind"] == "deck":
                 artifact_id = await self.db.deck_create_with_cards(
@@ -939,6 +943,7 @@ class LearningWorkflowMixin:
                     paid_charge_id=(
                         state.get("claim_id") if state.get("charged") else None
                     ),
+                    refund_seconds_value=refund,
                 )
             else:
                 artifact_id = await self.db.quiz_create_session(
@@ -951,6 +956,7 @@ class LearningWorkflowMixin:
                     paid_charge_id=(
                         state.get("claim_id") if state.get("charged") else None
                     ),
+                    refund_seconds_value=refund,
                 )
         except BaseException as exc:
             if (isinstance(exc, sqlite3.IntegrityError)
@@ -982,9 +988,12 @@ class LearningWorkflowMixin:
         timer = self._curation_tasks.pop(user_id, None)
         if timer is not None:
             timer.cancel()
+        refund_notice = ("\n" + texts.LEARNING_PRORATA_REFUND.format(
+            duration=format_duration(refund)
+        )) if refund else ""
         if state["kind"] == "deck":
             deck = await self.db.deck_get(artifact_id, user_id)
-            await self._ack(event, "✅ مجموعه ذخیره شد.")  # type: ignore[attr-defined]
+            await self._ack(event, "✅ مجموعه ذخیره شد." + refund_notice)  # type: ignore[attr-defined]
             if deck is None:
                 await self._edit(  # type: ignore[attr-defined]
                     event,
@@ -998,7 +1007,7 @@ class LearningWorkflowMixin:
                     self._deck_keyboard(artifact_id, bool(items)),
                 )
         else:
-            await self._ack(event, "✅ آزمون آماده است.")  # type: ignore[attr-defined]
+            await self._ack(event, "✅ آزمون آماده است." + refund_notice)  # type: ignore[attr-defined]
             await self._render_question_message(event, user_id, artifact_id)
 
     async def _handle_curation_callback(

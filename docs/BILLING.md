@@ -13,7 +13,8 @@ to repair balances; use audited credit operations.
   startup recovery releases interrupted holds.
 - PowerPoint charges source narration, not inserted silence. No narration means free.
 - Lots expire independently; holds preserve allocations. Refunds create new
-  non-expiring lots, never delete old debits.
+  lots that inherit the earliest expiry of the original contributing lots;
+  they never delete old debits.
 
 ## Quizzes and AI flashcards
 
@@ -34,7 +35,9 @@ unfinished charges at most once. A failed preview edit is retried as a new messa
 if delivery still fails, the preview remains pending until its normal expiry and
 can be resumed through /start. Failed refund writes remain recoverable; never
 claim success before commit. Valid results need at least 3 questions or 5 cards.
-Count/coverage shortfalls are reported; review the preview before saving.
+Count/coverage shortfalls are reported; review the preview before saving. Paid
+previews saved with fewer items than requested receive an integer-second
+pro-rata refund, rounded up, in the same transaction as the artifact.
 
 Admission is checked before debit: one generation per user, 1 active quiz, 3 new
 sessions per rolling hour and 30 stored decks by default. Inactive quizzes lazily

@@ -10,6 +10,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-SUP-3: confirm user ticket closures before closing or notifying staff.
 - WO-SUP-2: retain full support openers while deriving a bounded first-line subject.
 - WO-PAY-1: preserve stored receipt bytes and modification time when viewed.
+- WO-LRN-6: refund paid learning shortfalls pro rata in the artifact transaction.
 - WO-LRN-8: protect live curation sources from library pruning and refund missing sources cleanly.
 - WO-LRN-4: retain source locators when splitting overflowed learning chunks.
 - WO-LRN-1: retain undelivered paid previews until their normal expiry and offer resume.

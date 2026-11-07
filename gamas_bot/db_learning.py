@@ -57,6 +57,7 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
         *,
         free_claim_id: str | None = None,
         paid_charge_id: str | None = None,
+        refund_seconds_value: int = 0,
     ) -> int:
         if not questions:
             raise ValueError("quiz session needs at least one question")
@@ -86,7 +87,7 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                     ),
                 )
             await self._finalize_free_use_locked(user_id, "quiz", free_claim_id)
-            await self._finalize_learning_charge_locked(user_id, paid_charge_id)
+            await self._finalize_learning_charge_locked(user_id, paid_charge_id, refund_seconds_value)
             return session_id
 
     async def quiz_get_session(
@@ -296,6 +297,7 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
         *,
         free_claim_id: str | None = None,
         paid_charge_id: str | None = None,
+        refund_seconds_value: int = 0,
     ) -> int:
         if not cards:
             raise ValueError("a deck needs at least one card")
@@ -320,7 +322,7 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                     ),
                 )
             await self._finalize_free_use_locked(user_id, "deck", free_claim_id)
-            await self._finalize_learning_charge_locked(user_id, paid_charge_id)
+            await self._finalize_learning_charge_locked(user_id, paid_charge_id, refund_seconds_value)
             return deck_id
 
     async def manual_deck_get_or_create(self, user_id: int) -> int:

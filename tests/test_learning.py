@@ -624,6 +624,31 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(card["source"] == "بخش ۱" for card in cards))
         self.assertNotIn("صفحهٔ ۹۹", " ".join(card["source"] for card in cards))
 
+    async def test_paid_curation_refunds_pro_rata_when_items_removed(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        await self.spend_free_try("deck")
+        source = {"item_id": self.item_id, "doc_id": None, "title": "test", "chunks": [
+            DocChunk(0, "بخش ۱", ("بخش ۱",), "متن درس")
+        ]}
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(20))):
+            await self.bot._generate_learning(self._event(b"fc:hub"), user_id=OWNER, kind="deck",
+                                               source=source, wanted=20, cost=401, note="test", title="test")
+        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 20)
+        for _ in range(15):
+            await self.bot._handle_callback(self._event(b"fc:cur:del:0"))
+        event = self._event(b"fc:cur:save")
+        await self.bot._handle_callback(event)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600 - 401 + 301)
+        self.assertEqual((await self.db.db.execute_fetchall("SELECT status FROM learning_charges"))[0][0], "finalized")
+        refund = (await self.db.db.execute_fetchall(
+            "SELECT seconds, expires_at, note FROM ledger WHERE note LIKE 'refund: pro-rata%'"
+        ))[0]
+        self.assertEqual(refund[0], 301)
+        self.assertIsNotNone(refund[1])
+        self.assertTrue(any("اعتبار بازگشتی" in (answer or "") for answer, _ in event.answers))
+        self.assertEqual(len(await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])), 5)
+
     async def test_pending_curation_source_is_protected_from_prune(self):
         await self.spend_free_try("deck")
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):

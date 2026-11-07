@@ -345,10 +345,26 @@ class BillingRepositoryMixin(DatabaseCore):
             return True
 
     async def _finalize_learning_charge_locked(
-        self, user_id: int, operation_id: str | None
+        self, user_id: int, operation_id: str | None, refund_seconds_value: int = 0
     ) -> None:
         if operation_id is None:
+            if refund_seconds_value:
+                raise ValueError("refund requires a paid learning charge")
             return
+        if refund_seconds_value:
+            rows = await _rows(
+                self.db,
+                "SELECT debit_id, seconds FROM learning_charges "
+                "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
+                (operation_id, int(user_id)),
+            )
+            if not rows or not 0 < refund_seconds_value <= int(rows[0][1]):
+                METRICS.record_db_error()
+                raise ValueError("invalid pro-rata learning refund")
+            await self._refund_debit_locked(
+                user_id, int(rows[0][0]), refund_seconds_value,
+                "pro-rata learning refund", iso(self._now()),
+            )
         cursor = await self.db.execute(
             "UPDATE learning_charges SET status = 'finalized', updated_at = ? "
             "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
