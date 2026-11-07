@@ -52,7 +52,7 @@ class UsersRepositoryMixin(DatabaseCore):
             last_name=last_name,
         )
         row = await _rows(
-            self.db,
+            self.read_db,
             "SELECT telegram_id, joined_at, banned, first_name, username "
             "FROM users WHERE telegram_id = ?",
             (telegram_id,),

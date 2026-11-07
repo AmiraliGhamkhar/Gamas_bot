@@ -54,7 +54,7 @@ class PaymentsRepositoryMixin(DatabaseCore):
 
     async def plans(self) -> list[dict[str, Any]]:
         rows = await _rows(
-            self.db,
+            self.read_db,
             "SELECT code, hours, price, validity_days, is_custom, active FROM plans "
             "WHERE active = 1 ORDER BY price",
         )
@@ -62,7 +62,7 @@ class PaymentsRepositoryMixin(DatabaseCore):
 
     async def plan(self, code: str) -> dict[str, Any] | None:
         rows = await _rows(
-            self.db,
+            self.read_db,
             "SELECT code, hours, price, validity_days, is_custom, active FROM plans "
             "WHERE code = ? AND active = 1",
             (code,),

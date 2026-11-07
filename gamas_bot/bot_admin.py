@@ -762,7 +762,7 @@ class AdminWorkflowMixin:
                 f"{format_duration(seconds)} ({to_persian_digits(seconds)} ثانیه)"
             )
         order_rows = list(
-            await self.db.db.execute_fetchall(
+            await self.db.read_db.execute_fetchall(
                 "SELECT COUNT(*) FROM payments WHERE user_id = ?", (int(target_id),)
             )
         )

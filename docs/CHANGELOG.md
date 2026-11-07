@@ -9,6 +9,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-LRN-11: reject invalid flashcard presets rather than silently charging the base cost.
 - WO-LRN-3: bound learning calls for small presets on many chunks.
 - WO-LRN-5: preserve manual-card state through the finish callback.
+- WO-DB-3: route plan, user, transcription-retention and admin count reads to the read connection.
 - WO-DB-10: retry transient SQLite read contention and count read errors.
 - WO-DB-8: bound SQLite caches, mapping and journal size for shared hosting.
 - WO-DB-4: report discarded stray transactions in logs and metrics.

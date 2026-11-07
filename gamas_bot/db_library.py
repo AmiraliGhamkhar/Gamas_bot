@@ -103,7 +103,7 @@ class LibraryRepositoryMixin(DatabaseCore):
             return 0
         cutoff = iso(self._now() - timedelta(days=older_than_days))
         rows = await _rows(
-            self.db,
+            self.read_db,
             "SELECT t.submission_id FROM transcriptions t "
             "JOIN submissions s ON s.submission_id = t.submission_id "
             "WHERE t.created_at < ? AND s.status IN "
