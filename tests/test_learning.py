@@ -123,6 +123,15 @@ class LearningHelperTests(unittest.TestCase):
         self.assertEqual(question["options"][question["correct_index"]], "سه")
         self.assertEqual(len(question["options"]), 4)
 
+    def test_three_option_numeric_keys_are_dropped_with_debug_log(self):
+        payload = {"questions": [
+            {"question": f"question {i}", "options": ["one", "two", "three"],
+             "correct": i, "explain": "reason"} for i in (1, 2, 3)
+        ]}
+        with self.assertLogs("gamas_bot.learning", level="DEBUG") as logs:
+            self.assertEqual(parse_quiz_payload(payload, 3), [])
+        self.assertEqual(len(logs.output), 3)
+
     def test_quiz_payload_respects_requested_count(self):
         parsed = parse_quiz_payload(quiz_payload(10), 3, rng=random.Random(1))
         self.assertEqual(len(parsed), 3)

@@ -12,6 +12,7 @@ the billing-then-generation discipline in ``bot.py`` easy to follow.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 import unicodedata
@@ -20,6 +21,8 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from .progress import to_persian_digits
+
+logger = logging.getLogger("gamas_bot.learning")
 
 #: Generated booklet mirrors retain a bounded preview in the legacy library.
 #: Uploaded documents retain their full extracted text and chunk cache instead.
@@ -689,7 +692,12 @@ def parse_quiz_payload(
             MAX_EXPLAIN_CHARS,
         )
         options = _extract_options(entry)
-        if not question or not explain or options is None:
+        if options is None:
+            # The quiz schema requires four options. In particular, a three-option
+            # numeric key is ambiguous and must never be silently mis-graded.
+            logger.debug("dropped quiz item with invalid option shape")
+            continue
+        if not question or not explain:
             continue
         if len(options) != 4 or any(not option for option in options):
             continue
