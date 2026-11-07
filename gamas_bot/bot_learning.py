@@ -262,18 +262,18 @@ class LearningWorkflowMixin:
     async def _progress_edit(
         self,
         placeholder: Any,
-        done: int,
+        done: float,
         total: int,
         *,
         stage: str,
         headline: str = WORK_PROGRESS_HEADLINE,
     ) -> None:
-        done = max(0, int(done))
+        done = max(0.0, float(done))
         total = max(1, int(total))
         percent = self.CHUNK_PROGRESS_START + round(
             (self.CHUNK_PROGRESS_END - self.CHUNK_PROGRESS_START) * done / total
         )
-        detail = f"بخش {to_persian_digits(done)} از {to_persian_digits(total)}"
+        detail = f"بخش {to_persian_digits(int(done))} از {to_persian_digits(total)}"
         try:
             if callable(getattr(placeholder, "update", None)):
                 await placeholder.update(percent, stage, detail)
@@ -299,13 +299,17 @@ class LearningWorkflowMixin:
         active = [index for index, count in enumerate(counts) if count > 0]
         total = len(active)
         state = {"done": 0, "failed": 0}
+        fractions = {index: 0.0 for index in active}
+        progress_changed = asyncio.Event()
+        finished = False
         session = self._http_session()  # type: ignore[attr-defined]
-        progress_task: asyncio.Task[None] | None = None
         edit_timeout = self.deps.learning_progress_edit_timeout_seconds
 
         async def report_progress() -> None:
             while True:
-                done = state["done"]
+                # Clear before rendering so completions during an edit are not lost.
+                progress_changed.clear()
+                done = state["done"] + sum(fractions.values())
                 try:
                     await asyncio.wait_for(
                         self._progress_edit(placeholder, done, total, stage=stage),
@@ -315,8 +319,9 @@ class LearningWorkflowMixin:
                     logger.debug("learning progress edit timed out")
                 except Exception:
                     logger.debug("learning progress edit failed", exc_info=True)
-                if done == state["done"]:
+                if finished and not progress_changed.is_set():
                     return
+                await progress_changed.wait()
 
         max_input_chars = self._learning_max_chars()
         dedupe = dedupe_cards if kind == "deck" else dedupe_questions
@@ -455,38 +460,44 @@ class LearningWorkflowMixin:
                         attempt + 1,
                         exc_info=True,
                     )
+                finally:
+                    # Report attempt completion even when the chunk needs a retry.
+                    fractions[chunk_idx] = max(
+                        fractions[chunk_idx], min(0.9, (attempt + 1) / (max_attempts + 1))
+                    )
+                    progress_changed.set()
             return items
 
         async def one(index: int) -> list[dict[str, Any]]:
-            nonlocal progress_task
             chunk = chunks[index]
             count = counts[index]
             items = await _generate_piece(chunk, count, chunk_idx=index)
             if len(items) < count:
                 state["failed"] += 1
+            fractions[index] = 0.0
             state["done"] += 1
-            if progress_task is None or progress_task.done():
-                progress_task = asyncio.create_task(report_progress())
+            progress_changed.set()
             return items
 
+        # One reporter owns the placeholder throughout the whole generation.
+        progress_task = asyncio.create_task(report_progress())
         tasks = [asyncio.create_task(one(index)) for index in active]
         try:
             results = await asyncio.gather(*tasks)
-            if progress_task is not None:
-                try:
-                    await asyncio.wait_for(
-                        progress_task,
-                        timeout=self.deps.learning_progress_edit_timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    logger.debug("final learning progress edit timed out")
+            finished = True
+            progress_changed.set()
+            try:
+                await asyncio.wait_for(progress_task, timeout=edit_timeout * 2)
+            except asyncio.TimeoutError:
+                logger.debug("final learning progress edit timed out")
         except BaseException:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            if progress_task is not None:
-                progress_task.cancel()
-                await asyncio.gather(progress_task, return_exceptions=True)
+            finished = True
+            progress_changed.set()
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
             raise
         return [item for group in results for item in group], state["failed"]
 

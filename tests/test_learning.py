@@ -671,6 +671,38 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(card["source"] == "بخش ۱" for card in cards))
         self.assertNotIn("صفحهٔ ۹۹", " ".join(card["source"] for card in cards))
 
+    async def test_chunk_progress_has_one_reporter_and_starts_before_completion(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        chunks = [DocChunk(i, f"بخش {i}", (f"بخش {i}",), f"متن {i}") for i in range(4)]
+        edits = []
+        active_edits = 0
+        peak_edits = 0
+        completed = 0
+
+        async def edit(_placeholder, done, _total, *, stage):
+            nonlocal active_edits, peak_edits
+            active_edits += 1
+            peak_edits = max(peak_edits, active_edits)
+            edits.append((done, completed))
+            await asyncio.sleep(0.005)
+            active_edits -= 1
+
+        async def provider(*_args, **_kwargs):
+            nonlocal completed
+            await asyncio.sleep(0.02 + completed * 0.002)
+            completed += 1
+            return self._cards_payload(1)
+
+        with mock.patch.object(self.bot, "_progress_edit", side_effect=edit), \
+             mock.patch("gamas_bot.bot.complete_json", side_effect=provider):
+            await self.bot._generate_chunks(
+                kind="deck", chunks=chunks, counts=[1] * 4, placeholder=object(), stage="test"
+            )
+        self.assertEqual(peak_edits, 1)
+        self.assertEqual(edits[0], (0, 0))
+        self.assertEqual(edits[-1][0], 4)
+
     async def test_paid_curation_refunds_pro_rata_when_items_removed(self):
         from gamas_bot.doc_extract import DocChunk
 

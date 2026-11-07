@@ -17,6 +17,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-SUP-3: confirm user ticket closures before closing or notifying staff.
 - WO-SUP-2: retain full support openers while deriving a bounded first-line subject.
 - WO-PAY-1: preserve stored receipt bytes and modification time when viewed.
+- WO-LRN-9: run one progress reporter from dispatch and update it on attempts.
 - WO-LRN-7: log and reject malformed three-option questions rather than mis-grade them.
 - WO-LRN-15: use bounded document metadata and previews for screens.
 - WO-LRN-12 (partial): index quiz admission and answers; retention remains unimplemented.
