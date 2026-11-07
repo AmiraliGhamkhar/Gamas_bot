@@ -532,3 +532,6 @@ FLASHCARD_CARD_LIMIT: Final = "این مجموعه به حداکثر تعداد 
 
 DOCUMENT_EXTRACTED_COUNT: Final = "متن استخراج‌شده: {count} نویسه"
 DOCUMENT_TEXT_PREVIEW: Final = "پیش‌نمایش متن:"
+
+LEARNING_CHUNK_PROGRESS: Final = "بخش {done} از {total}"
+LEARNING_PRODUCING: Final = "در حال تولید {label}"

@@ -276,7 +276,7 @@ class LearningWorkflowMixin:
         percent = self.CHUNK_PROGRESS_START + round(
             (self.CHUNK_PROGRESS_END - self.CHUNK_PROGRESS_START) * done / total
         )
-        detail = f"بخش {to_persian_digits(int(done))} از {to_persian_digits(total)}"
+        detail = texts.LEARNING_CHUNK_PROGRESS.format(done=to_persian_digits(int(done)), total=to_persian_digits(total))
         try:
             if callable(getattr(placeholder, "update", None)):
                 await placeholder.update(percent, stage, detail)
@@ -594,7 +594,7 @@ class LearningWorkflowMixin:
                     chunks=chunks,
                     counts=counts,
                     placeholder=progress,
-                    stage=f"در حال تولید {label}",
+                    stage=texts.LEARNING_PRODUCING.format(label=label),
                 )
             items = await run_file_io(dedupe_cards if kind == "deck" else dedupe_questions, items)
             await progress.update(
