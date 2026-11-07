@@ -412,7 +412,7 @@ SUPPORT_LIST_TITLE_TEMPLATE: Final = "📋 درخواست‌های شما — ص
 SUPPORT_TICKET_NOT_FOUND: Final = "این درخواست پیدا نشد."
 SUPPORT_BAD_CATEGORY: Final = "این دسته معتبر نیست."
 SUPPORT_SUBJECT_PROMPT: Final = (
-    "موضوع یا شرح کوتاه مشکل را در یک پیام بفرستید (حداکثر ۴۰۰ نویسه).\n"
+    "شرح مشکل را در یک پیام بفرستید (حداکثر ۴۰۰۰ نویسه). خط اول موضوع خواهد بود.\n"
     "برای لغو، /cancel بفرستید."
 )
 SUPPORT_INVALID_REQUEST: Final = "درخواست نامعتبر است."

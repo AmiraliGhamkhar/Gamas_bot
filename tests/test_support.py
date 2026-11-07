@@ -287,6 +287,14 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
             self.payloads(new_queue.edits[-1][1]),
         )
 
+    async def test_long_opener_is_stored_in_full_with_short_subject(self):
+        opener = ("عنوان درخواست\n" + "متن طولانی " * 110).strip()
+        await self.open_ticket(subject=opener)
+        ticket = await self.latest_ticket()
+        self.assertEqual(ticket["subject"], "عنوان درخواست")
+        self.assertLessEqual(len(ticket["subject"]), 400)
+        self.assertEqual((await self.db.ticket_messages(ticket["id"]))[0]["message_text"], opener)
+
     async def test_subject_prompt_requires_text_and_cancel_clears_it(self):
         await self.press(USER_A, "sup:cat:technical")
         event = await self.say(USER_A, "")  # photo without text

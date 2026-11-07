@@ -6,6 +6,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 
 - WO-SUB-2: record sweep membership and check timestamp in one update.
 - WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
+- WO-SUP-2: retain full support openers while deriving a bounded first-line subject.
 - WO-PAY-1: preserve stored receipt bytes and modification time when viewed.
 - WO-LRN-8: protect live curation sources from library pruning and refund missing sources cleanly.
 - WO-LRN-4: retain source locators when splitting overflowed learning chunks.

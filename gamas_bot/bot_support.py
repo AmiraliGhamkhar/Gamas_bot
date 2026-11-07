@@ -318,11 +318,15 @@ class SupportWorkflowMixin:
             await event.reply(texts.SUPPORT_TEXT_ONLY)
             return
         if kind == "new":
+            if len(text) > self.db.SUPPORT_MESSAGE_MAX:
+                await event.reply(texts.SUPPORT_MESSAGE_TOO_LONG)
+                return
+            subject = " ".join(text.splitlines()[0].split())[:self.db.SUPPORT_SUBJECT_MAX]
             try:
                 ticket = await self.db.create_ticket(
                     user_id,
                     value,
-                    text,
+                    subject,
                     initial_message=text,
                     telegram_message_id=getattr(event.message, "id", None),
                 )
