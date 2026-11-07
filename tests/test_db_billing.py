@@ -77,6 +77,18 @@ class LedgerTests(DatabaseTestCase):
         )
         self.assertEqual(refund[0][0], "2099-01-01T00:30:00+02:00")
 
+    async def test_settlement_allocates_earliest_expiry_with_imported_offsets(self):
+        await self.grant(100, 100, days=30)
+        await self.grant(100, 100, days=30)
+        credits = await self.db.db.execute_fetchall("SELECT id FROM ledger WHERE kind='credit' ORDER BY id")
+        await self.db._write("UPDATE ledger SET expires_at=? WHERE id=?", ("2099-01-01T00:30:00+02:00", credits[0][0]))
+        await self.db._write("UPDATE ledger SET expires_at=? WHERE id=?", ("2098-12-31T23:00:00+00:00", credits[1][0]))
+        submission = await self.db.create_submission(100, "audio", "sample")
+        await self.db.reserve(100, submission, 200)
+        await self.db.settle_hold(submission, 100)
+        allocations = await self.db.db.execute_fetchall("SELECT credit_id,seconds FROM debit_allocations")
+        self.assertEqual([tuple(row) for row in allocations], [(credits[0][0], 100)])
+
     async def test_invalid_source_expiry_aborts_refund(self):
         await self.grant(100, 100, days=30)
         await self.db.spend_seconds(100, 100, "learning", operation_id="bad-expiry")

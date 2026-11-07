@@ -315,7 +315,7 @@ class BillingRepositoryMixin(DatabaseCore):
                     self.db,
                     "SELECT a.credit_id, a.seconds FROM hold_allocations a "
                     "JOIN ledger l ON l.id = a.credit_id WHERE a.submission_id = ? "
-                    "ORDER BY l.expires_at IS NULL, l.expires_at, l.id",
+                    "ORDER BY l.expires_at IS NULL, julianday(l.expires_at), l.id",
                     (submission_id,),
                 )
                 charge = max(0, min(int(measured_seconds), reserved))

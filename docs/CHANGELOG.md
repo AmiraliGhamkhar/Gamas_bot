@@ -32,7 +32,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-LRN-8: protect live curation sources from library pruning and refund missing sources cleanly.
 - WO-LRN-4: retain source locators when splitting overflowed learning chunks.
 - WO-LRN-1: retain undelivered paid previews until their normal expiry and offer resume.
-- WO-LRN-2: compare imported lot expiries as instants; reject invalid expiries.
+- WO-LRN-2: compare imported lot expiries as instants for refunds and settlements; reject invalid expiries.
 - WO-LRN-2: preserve originating credit expiry and lot IDs on learning refunds and recovery.
 - WO-LRN-10: gate flashcard DOCX delivery while keeping paid quiz answers accessible.
 - WO-LRN-11: reject invalid flashcard presets rather than silently charging the base cost.
