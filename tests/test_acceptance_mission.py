@@ -299,6 +299,8 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         await self.say(USER, "مشکل در مشاهدهٔ جزوه")
         ticket = (await self.db.list_user_tickets(USER, limit=1))[0]
         await self.press(USER, f"sup:c:{ticket['id']}")
+        self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "awaiting_admin")
+        await self.press(USER, f"sup:cy:{ticket['id']}")
         self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "closed")
         await self.press(USER, f"sup:o:{ticket['id']}")
         self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "open")
