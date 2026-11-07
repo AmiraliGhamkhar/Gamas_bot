@@ -71,22 +71,16 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 (int(user_id), int(item_id), len(questions), now, now),
             )
             session_id = int(cursor.lastrowid or 0)
-            for idx, question in enumerate(questions):
-                await self.db.execute(
-                    "INSERT INTO quiz_questions(session_id, idx, question, "
-                    "options_json, correct_index, explanation, source, difficulty) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        session_id,
-                        idx,
-                        str(question["question"]),
-                        json.dumps(question["options"], ensure_ascii=False),
-                        int(question["correct_index"]),
-                        str(question.get("explanation", "")),
-                        str(question.get("source", ""))[:120],
-                        str(question.get("difficulty", ""))[:20],
-                    ),
-                )
+            await self.db.executemany(
+                "INSERT INTO quiz_questions(session_id, idx, question, "
+                "options_json, correct_index, explanation, source, difficulty) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ((session_id, idx, str(question["question"]),
+                  json.dumps(question["options"], ensure_ascii=False),
+                  int(question["correct_index"]), str(question.get("explanation", "")),
+                  str(question.get("source", ""))[:120], str(question.get("difficulty", ""))[:20])
+                 for idx, question in enumerate(questions)),
+            )
             await self._finalize_free_use_locked(user_id, "quiz", free_claim_id)
             await self._finalize_learning_charge_locked(user_id, paid_charge_id, refund_seconds_value)
             return session_id
@@ -310,18 +304,11 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 (int(user_id), int(item_id), str(title), now),
             )
             deck_id = int(cursor.lastrowid or 0)
-            for idx, card in enumerate(cards):
-                await self.db.execute(
-                    "INSERT INTO flashcards(deck_id, idx, front, back, source) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        deck_id,
-                        idx,
-                        str(card["front"]),
-                        str(card["back"]),
-                        str(card.get("source", ""))[:120],
-                    ),
-                )
+            await self.db.executemany(
+                "INSERT INTO flashcards(deck_id, idx, front, back, source) VALUES (?, ?, ?, ?, ?)",
+                ((deck_id, idx, str(card["front"]), str(card["back"]),
+                  str(card.get("source", ""))[:120]) for idx, card in enumerate(cards)),
+            )
             await self._finalize_free_use_locked(user_id, "deck", free_claim_id)
             await self._finalize_learning_charge_locked(user_id, paid_charge_id, refund_seconds_value)
             return deck_id
@@ -347,10 +334,10 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 (int(deck_id),),
             )
             idx = int(count_rows[0][0]) if count_rows else 0
-            await self.db.execute(
+            await self.db.executemany(
                 "INSERT INTO flashcards(deck_id, idx, front, back) "
                 "VALUES (?, ?, ?, ?)",
-                (int(deck_id), idx, str(front), str(back)),
+                [(int(deck_id), idx, str(front), str(back))],
             )
             return idx + 1
 

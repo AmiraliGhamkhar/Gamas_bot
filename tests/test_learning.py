@@ -783,6 +783,16 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
             generator.assert_not_called()
         self.assertIn(LEARNING_NO_CREDIT, self.client.texts[-1]["text"])
 
+    async def test_batch_insert_500_questions_preserves_order(self):
+        questions = [{"question": f"Question {i}", "options": ["a", "b", "c", "d"],
+                      "correct_index": 0, "explanation": ""} for i in range(500)]
+        session = await self.db.quiz_create_session(OWNER, self.item_id, questions)
+        rows = await self.db.db.execute_fetchall(
+            "SELECT idx, question FROM quiz_questions WHERE session_id=? ORDER BY idx", (session,)
+        )
+        self.assertEqual([(row[0], row[1]) for row in rows],
+                         [(i, f"Question {i}") for i in range(500)])
+
     async def test_invalid_flashcard_preset_is_rejected_before_generation(self):
         event = self._event(b"fc:go:1:bogus")
         before = await self.db.available_seconds(OWNER)

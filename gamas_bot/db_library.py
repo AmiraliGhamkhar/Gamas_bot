@@ -110,18 +110,21 @@ class LibraryRepositoryMixin(DatabaseCore):
             "WHERE t.created_at < ? AND s.status IN "
             "('done', 'partial', 'failed', 'rejected') "
             "ORDER BY t.created_at LIMIT ?",
-            (cutoff, max(1, batch)),
+            (cutoff, min(500, max(1, batch))),
         )
         ids = [row[0] for row in rows]
         if not ids:
             return 0
-        await self._write_many(
-            [
-                ("DELETE FROM transcriptions WHERE submission_id = ?", (submission_id,))
-                for submission_id in ids
-            ]
-        )
-        return len(ids)
+        async with self._transaction():
+            placeholders = ",".join("?" for _ in ids)
+            cursor = await self.db.execute(
+                f"DELETE FROM transcriptions WHERE submission_id IN ({placeholders}) "
+                "AND created_at < ? AND EXISTS (SELECT 1 FROM submissions s "
+                "WHERE s.submission_id = transcriptions.submission_id "
+                "AND s.status IN ('done', 'partial', 'failed', 'rejected'))",
+                (*ids, cutoff),
+            )
+            return max(0, cursor.rowcount)
 
     async def transcription(self, submission_id: int) -> dict[str, Any] | None:
         rows = await _rows(
