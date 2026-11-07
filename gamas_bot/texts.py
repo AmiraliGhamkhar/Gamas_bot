@@ -145,6 +145,7 @@ RESTARTING_JOB_CANCELLED: Final = (
 )
 ACCESS_BANNED: Final = "⛔ دسترسی شما به ربات مسدود شده است."
 ADMIN_ONLY: Final = "دسترسی به این بخش فقط برای مدیران مجاز است."
+INVALID_LEARNING_SIZE: Final = "اندازهٔ انتخاب‌شده نامعتبر است."
 INVALID_REQUEST: Final = "درخواست نامعتبر است."
 INVALID_PERIOD: Final = "بازهٔ زمانی نامعتبر است."
 INVALID_REPORT: Final = "بخش گزارش نامعتبر است."

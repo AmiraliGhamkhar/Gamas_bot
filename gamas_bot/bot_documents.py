@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from telethon import Button
 from telethon.tl.custom import Message
 
+from . import texts
 from .billing import format_duration
 from .bot_ui import (
     DEFAULT_INTAKE_SUFFIX,
@@ -1623,7 +1624,7 @@ class DocumentOfficeWorkflowMixin:
         if kind == "deck":
             if choice and preset_cards(choice) is None:
                 await self._ack(  # type: ignore[attr-defined]
-                    event, "اندازهٔ انتخاب‌شده نامعتبر است.", alert=True
+                    event, texts.INVALID_LEARNING_SIZE, alert=True
                 )
                 return
             if (

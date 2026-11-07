@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Any
 from telethon import Button
 from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
 
+from . import texts
 from .billing import format_duration
 from .bot_ui import (
     CURATION_GUIDANCE,
@@ -1597,11 +1598,11 @@ class LearningWorkflowMixin:
     def _deck_size_and_cost(self, preset: str | None) -> tuple[int, int]:
         base_size = int(self.settings.flashcard_ai_deck_size)
         base_cost = int(self.settings.flashcard_ai_cost_seconds)
-        if not preset:
+        if preset is None:
             return base_size, base_cost
         cards = preset_cards(str(preset))
         if cards is None:
-            return base_size, base_cost
+            raise ValueError("invalid flashcard preset")
         return cards, self._preset_cost(base_cost, cards, base_size)
 
     async def _flashcard_generate_locked(
@@ -2029,6 +2030,9 @@ class LearningWorkflowMixin:
                 await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
                 return
             preset = parts[3] if len(parts) == 4 else None
+            if preset is not None and preset_cards(preset) is None:
+                await self._ack(event, texts.INVALID_LEARNING_SIZE, alert=True)
+                return
             if not await self._require_membership(
                 event, user_id, kind="callback", callback_data=data
             ):

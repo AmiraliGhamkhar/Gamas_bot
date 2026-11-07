@@ -686,6 +686,15 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
             generator.assert_not_called()
         self.assertIn(LEARNING_NO_CREDIT, self.client.texts[-1]["text"])
 
+    async def test_invalid_flashcard_preset_is_rejected_before_generation(self):
+        event = self._event(b"fc:go:1:bogus")
+        before = await self.db.available_seconds(OWNER)
+        await self.bot._handle_callback(event)
+        self.assertTrue(any(alert and "نامعتبر" in (message or "")
+                            for message, alert in event.answers))
+        self.assertEqual(await self.db.available_seconds(OWNER), before)
+        self.assertEqual(await self.db.decks_list(OWNER), [])
+
     async def test_hub_empty_state_and_manual_guided_flow_with_disarm(self):
         hub = self._event(b"fc:hub")
         await self.bot._handle_callback(hub)
