@@ -905,6 +905,48 @@ class TranscriptRetentionTests(unittest.IsolatedAsyncioTestCase):
             any(row["action"] == "transcript_expired" for row in audit), audit
         )
 
+    async def test_optional_retention_preserves_live_data_and_points(self):
+        old = iso(utc_now() - timedelta(days=40))
+        item = await self.db.library_add(self.user_id, "booklet", 1, 2, None, title="source")
+        async def document(digest, library_item_id):
+            doc, _ = await self.db.document_add(
+                self.user_id, file_msg_ref="1:1", title="doc", source_type="pdf",
+                page_count=1, sha256=digest, text="text", chunks_json="[]",
+                library_item_id=library_item_id,
+            )
+            await self.db._write("UPDATE documents SET created_at=? WHERE id=?", (old, doc))
+            return doc
+        orphan = await document("orphan", None)
+        live = await document("live", item)
+        question = [{"question": "q", "options": ["a", "b", "c", "d"], "correct_index": 0}]
+        terminal = await self.db.quiz_create_session(self.user_id, item, question)
+        active = await self.db.quiz_create_session(self.user_id, item, question)
+        current = await self.db.quiz_current_question(terminal)
+        await self.db.quiz_record_answer(terminal, current["question_id"], 0)
+        await self.db._write("UPDATE quiz_sessions SET updated_at=? WHERE session_id IN (?,?)", (old, terminal, active))
+        await self.db.add_credit(self.user_id, 1000, note="grant")
+        done = await self.db.create_submission(self.user_id, "audio", "a")
+        running = await self.db.create_submission(self.user_id, "audio", "b")
+        await self.db.reserve(self.user_id, done, 100)
+        await self.db.release_hold(done, "test")
+        await self.db.reserve(self.user_id, running, 100)
+        await self.db._write("UPDATE holds SET released_at=? WHERE submission_id=?", (old, done))
+        await self.db.audit(0, "old", "metadata")
+        await self.db._write("UPDATE audit SET created_at=? WHERE action='old'", (old,))
+        before = await self.bot._cleanup_retained_data()
+        self.assertEqual(before, {"documents": 0, "learning": 0, "audit": 0, "holds": 0})
+        for kind in ("documents", "learning", "audit", "holds"):
+            self.assertEqual(await self.db.expire_retained_data(kind, 30), 1)
+        self.assertIsNone(await self.db.document_get(self.user_id, orphan))
+        self.assertIsNotNone(await self.db.document_get(self.user_id, live))
+        self.assertIsNone(await self.db.quiz_get_session(terminal, self.user_id))
+        self.assertIsNotNone(await self.db.quiz_get_session(active, self.user_id))
+        self.assertEqual((await self.db.leaderboard_rank(self.user_id))["points"], 10)
+        self.assertEqual((await self.db.db.execute_fetchall("SELECT submission_id FROM holds"))[0][0], running)
+        self.assertEqual(await self.db.available_seconds(self.user_id), 900)
+        self.assertEqual((await self.db.db.execute_fetchall("SELECT COUNT(*) FROM hold_allocations WHERE submission_id=?", (done,)))[0][0], 0)
+        await self.db.maintenance(optimize=True)
+
     async def test_retention_deletes_only_one_bounded_batch(self):
         ids = [await self.transcript(status="done", age_days=40) for _ in range(5)]
         in_flight = await self.transcript(status="processing", age_days=40)

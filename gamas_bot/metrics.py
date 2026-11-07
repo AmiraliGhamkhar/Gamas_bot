@@ -196,6 +196,8 @@ class MetricsCollector:
             self._support_ticket_denials = 0
             self._support_reply_failures = 0
             self._learning_validation_failures = 0
+            self._retention_deletions = {"documents": 0, "learning": 0, "audit": 0, "holds": 0}
+            self._retention_errors = 0
             self._document_unpack_rejections = 0
             self._receipt_hash_errors = 0
             self._outcomes: dict[str, int] = dict.fromkeys(TERMINAL_OUTCOMES, 0)
@@ -244,6 +246,15 @@ class MetricsCollector:
     def record_curation_source_missing(self) -> None:
         with self._lock:
             self._curation_source_missing += 1
+
+    def record_retention_deleted(self, kind: str, count: int) -> None:
+        with self._lock:
+            if kind in self._retention_deletions:
+                self._retention_deletions[kind] += max(0, int(count))
+
+    def record_retention_error(self) -> None:
+        with self._lock:
+            self._retention_errors += 1
 
     def record_learning_validation_failure(self) -> None:
         with self._lock:
@@ -394,6 +405,8 @@ class MetricsCollector:
                 "support_ticket_denials": self._support_ticket_denials,
                 "support_reply_failures": self._support_reply_failures,
                 "learning_validation_failures": self._learning_validation_failures,
+                "retention_deletions": dict(self._retention_deletions),
+                "retention_errors": self._retention_errors,
                 "document_unpack_rejections": self._document_unpack_rejections,
                 "receipt_hash_errors": self._receipt_hash_errors,
                 "outcomes": dict(self._outcomes),

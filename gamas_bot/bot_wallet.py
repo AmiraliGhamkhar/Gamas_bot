@@ -657,14 +657,42 @@ class WalletWorkflowMixin:
 
     async def _receipt_cleanup_loop(self) -> None:
         """Delete reviewed receipts after the retention window."""
+        last_optimize = None
         while True:
             try:
                 await self._cleanup_expired_receipts()
+                await self._cleanup_retained_data()
+                now = self.deps.monotonic()
+                optimize = last_optimize is None or now - last_optimize >= 7 * 86400
+                await self.db.maintenance(optimize=optimize)
+                if optimize:
+                    last_optimize = now
                 await asyncio.sleep(24 * 3600)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.warning("receipt cleanup failed", exc_info=True)
+
+    async def _cleanup_retained_data(self) -> dict[str, int]:
+        totals = {}
+        for kind, days in (("documents", self.settings.document_retention_days),
+                           ("learning", self.settings.learning_retention_days),
+                           ("audit", self.settings.audit_retention_days),
+                           ("holds", self.settings.holds_retention_days)):
+            total = 0
+            if days > 0:
+                for _ in range(10):
+                    try:
+                        count = await self.db.expire_retained_data(kind, days, batch=500)
+                    except sqlite3.Error:
+                        METRICS.record_retention_error()
+                        logger.warning("retention sweep failed kind=%s", kind)
+                        break
+                    total += count
+                    if count < 500:
+                        break
+            totals[kind] = total
+        return totals
 
     async def _transcript_cleanup_loop(self) -> None:
         """Delete finished transcripts after the retention window (audit F-10)."""

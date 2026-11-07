@@ -145,6 +145,11 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("RECEIPT_RETENTION_DAYS", "receipt_retention_days", "int"),
     ("MAX_PAYMENT_RECEIPT_BYTES", "max_payment_receipt_bytes", "int"),
     ("TRANSCRIPT_RETENTION_DAYS", "transcript_retention_days", "int"),
+    ("DOCUMENT_RETENTION_DAYS", "document_retention_days", "int"),
+    ("LEARNING_RETENTION_DAYS", "learning_retention_days", "int"),
+    ("AUDIT_RETENTION_DAYS", "audit_retention_days", "int"),
+    ("HOLDS_RETENTION_DAYS", "holds_retention_days", "int"),
+
     ("SUBSCRIPTION_CHANNEL", "subscription_channel", "str"),
     ("SUBSCRIPTION_REQUIRED", "subscription_required", "bool"),
     ("SUBSCRIPTION_CACHE_SECONDS", "subscription_cache_seconds", "float"),

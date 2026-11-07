@@ -738,6 +738,10 @@ class Settings:
     learning_chunk_concurrency: int = 4
     learning_global_concurrency: int = 2
     learning_max_output_tokens: int = 4096
+    document_retention_days: int = 0
+    learning_retention_days: int = 0
+    audit_retention_days: int = 0
+    holds_retention_days: int = 0
 
     # --- Derived --------------------------------------------------------------
     plan_values: dict[str, int] = field(default_factory=dict, compare=False)
@@ -1530,6 +1534,10 @@ def from_env(env_file: str | None = None) -> Settings:
         learning_chunk_concurrency=_env_int(
             "LEARNING_CHUNK_CONCURRENCY", 4, minimum=1, maximum=8
         ),
+        document_retention_days=_env_int("DOCUMENT_RETENTION_DAYS", 0, minimum=0, maximum=3650),
+        learning_retention_days=_env_int("LEARNING_RETENTION_DAYS", 0, minimum=0, maximum=3650),
+        audit_retention_days=_env_int("AUDIT_RETENTION_DAYS", 0, minimum=0, maximum=3650),
+        holds_retention_days=_env_int("HOLDS_RETENTION_DAYS", 0, minimum=0, maximum=3650),
         learning_global_concurrency=_env_int(
             "LEARNING_GLOBAL_CONCURRENCY", 2, minimum=1, maximum=8
         ),
