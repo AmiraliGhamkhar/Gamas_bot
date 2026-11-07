@@ -117,3 +117,7 @@ text (verified by SHA-256). Cursors are checkpointed per batch, so an abrupt
 process crash can cause delivery to be repeated within the last uncheckpointed
 batch; Telegram has no transactional exactly-once send. The text itself is not
 stored in the database.
+
+Released-hold retention removes detailed allocations but retains a compact
+submission tombstone. This prevents the same submission from being reserved
+again and preserves settlement/delivery idempotency after cleanup.

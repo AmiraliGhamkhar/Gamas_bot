@@ -43,6 +43,7 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
         ("hold_allocations", "submission_id", "holds", "submission_id"),
         ("hold_allocations", "credit_id", "ledger", "id"),
         ("holds", "submission_id", "submissions", "submission_id"),
+        ("retired_holds", "submission_id", "submissions", "submission_id"),
         ("library_items", "submission_id", "submissions", "submission_id"),
         ("ledger", "submission_id", "submissions", "submission_id"),
         ("ledger", "payment_id", "payments", "payment_id"),
@@ -72,6 +73,12 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
                 return 0
             placeholders = ",".join("?" for _ in ids)
             if kind == "holds":
+                # Preserve the idempotency marker and delivery semantics after details expire.
+                await self.db.execute(
+                    f"INSERT OR IGNORE INTO retired_holds(submission_id, release_reason, settled) "
+                    f"SELECT submission_id, release_reason, settled FROM holds WHERE submission_id IN ({placeholders})",
+                    ids,
+                )
                 await self.db.execute(f"DELETE FROM hold_allocations WHERE submission_id IN ({placeholders})", ids)
             cursor = await self.db.execute(f"DELETE FROM {table} WHERE {key} IN ({placeholders})", ids)
             count = max(0, cursor.rowcount)

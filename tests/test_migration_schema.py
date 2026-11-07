@@ -244,7 +244,7 @@ class HardeningUpgradeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(await db.available_seconds(123), 700)
                 self.assertEqual((await db.db.execute_fetchall("SELECT seconds,note FROM ledger"))[0][:], (700, "original"))
                 migrations = [row[0] for row in await db.db.execute_fetchall("SELECT name FROM schema_migrations ORDER BY name")]
-                self.assertTrue(all(any(name.startswith(prefix) for name in migrations) for prefix in ("020_", "021_", "022_", "023_", "024_")))
+                self.assertTrue(all(any(name.startswith(prefix) for name in migrations) for prefix in ("020_", "021_", "022_", "023_", "024_", "025_")))
                 if applied is not None:
                     self.assertEqual(migrations, applied)
                 applied = migrations

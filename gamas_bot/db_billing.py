@@ -258,6 +258,8 @@ class BillingRepositoryMixin(DatabaseCore):
             )
             if not owner:
                 raise ValueError("submission does not belong to user")
+            if await _rows(self.db, "SELECT 1 FROM retired_holds WHERE submission_id = ?", (submission_id,)):
+                raise ValueError("submission already has a retired hold")
             if rows and rows[0][0]:
                 return
             available = await self._available_seconds_locked(user_id)
@@ -305,8 +307,10 @@ class BillingRepositoryMixin(DatabaseCore):
                     "UPDATE submissions SET delivered_at = COALESCE(delivered_at, ?) "
                     "WHERE submission_id = ? AND NOT EXISTS "
                     "(SELECT 1 FROM holds WHERE submission_id = ? "
+                    "AND COALESCE(release_reason, '') != 'unlimited user') "
+                    "AND NOT EXISTS (SELECT 1 FROM retired_holds WHERE submission_id = ? "
                     "AND COALESCE(release_reason, '') != 'unlimited user')",
-                    (now, submission_id, submission_id),
+                    (now, submission_id, submission_id, submission_id),
                 )
                 return
             user_id, reserved, unlimited = rows[0]

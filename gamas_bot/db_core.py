@@ -38,6 +38,7 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "payments",
         "ledger",
         "holds",
+        "retired_holds",
         "audit",
         "debit_allocations",
         "hold_allocations",

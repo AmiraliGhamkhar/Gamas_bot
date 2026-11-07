@@ -77,6 +77,21 @@ class LedgerTests(DatabaseTestCase):
         )
         self.assertEqual(refund[0][0], "2099-01-01T00:30:00+02:00")
 
+    async def test_hold_retention_preserves_idempotency_and_delivery_state(self):
+        await self.grant(100, 100)
+        submission = await self.db.create_submission(100, "audio", "sample")
+        await self.db.reserve(100, submission, 50)
+        await self.db.release_hold(submission, "failed")
+        await self.db._write("UPDATE holds SET released_at='2000-01-01' WHERE submission_id=?", (submission,))
+        self.assertEqual(await self.db.expire_retained_data("holds", 30), 1)
+        await self.db.settle_hold(submission, 50)
+        row = (await self.db.db.execute_fetchall("SELECT delivered_at FROM submissions WHERE submission_id=?", (submission,)))[0]
+        self.assertIsNone(row[0])
+        with self.assertRaises(ValueError):
+            await self.db.reserve(100, submission, 50)
+        self.assertEqual(await self.db.available_seconds(100), 100)
+        self.assertEqual(await self.db.db.execute_fetchall("PRAGMA foreign_key_check"), [])
+
     async def test_settlement_allocates_earliest_expiry_with_imported_offsets(self):
         await self.grant(100, 100, days=30)
         await self.grant(100, 100, days=30)
