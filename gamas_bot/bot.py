@@ -245,6 +245,9 @@ class GamasBot(
         self._shutting_down = False
         self._admin_action_times: dict[tuple[int, str], float] = {}
         self._broadcast_running: set[int] = set()
+        self._broadcast_previews: dict[int, tuple[str, int | None]] = {}
+        self._broadcast_resume: dict[int, int] = {}
+        self._broadcast_stop = asyncio.Event()
         self._ocr_client: I2OCRClient | None = None
         self._started_at = time.time()
 
@@ -313,6 +316,7 @@ class GamasBot(
                 "TELEGRAM_BOT_TOKEN is not set; refusing interactive Telethon login."
             )
         await self.client.start(bot_token=self.settings.bot_token)
+        await self._recover_broadcasts()
         logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
         await self.subscription.startup_self_check()
         if self.subscription.required and self.subscription.configured:
@@ -988,6 +992,10 @@ class GamasBot(
         r.register_exact("adm:users", lambda e, _u, _d: self._show_admin_users(e))
         r.register_exact("adm:pay", lambda e, _u, _d: self._show_admin_payments(e, 0))
         r.register_exact("adm:bcast", self._cb_admin_broadcast)
+        r.register_exact("adm:bcgo", self._cb_broadcast_go)
+        r.register_exact("adm:bcstop", self._cb_broadcast_stop)
+        r.register_exact("adm:bccancel", self._cb_broadcast_cancel)
+        r.register_prefix("adm:bcresume:", self._cb_broadcast_resume)
         r.register_exact("adm:audit", lambda e, _u, _d: self._show_admin_audit(e, 0))
         r.register_exact("adm:board", lambda e, _u, _d: self._admin_board(e))
         r.register_exact("ref:home", lambda e, u, _d: self._show_referrals(e, u))
@@ -1124,11 +1132,50 @@ class GamasBot(
         await self._show_admin_payment_detail(event, detail_payment_id)
 
     async def _cb_admin_broadcast(self, event, user_id: int, _data: str) -> None:
+        if self._broadcast_running:
+            await self._ack(event, texts.BROADCAST_RUNNING, alert=True)
+            return
+        self._broadcast_previews.pop(user_id, None)
+        self._broadcast_resume.pop(user_id, None)
         self._pending_broadcast.add(user_id)
         await event.respond(
             texts.BROADCAST_PROMPT,
             buttons=[[Button.inline(texts.BTN_CANCEL, b"adm:home")]],
         )
+
+    async def _cb_broadcast_go(self, event, user_id: int, _data: str) -> None:
+        preview = self._broadcast_previews.pop(user_id, None)
+        if preview is None:
+            await self._ack(event, texts.INVALID_REQUEST, alert=True)
+            return
+        await self._ack(event)
+        await self._broadcast(event, preview[0], resume_id=preview[1])
+
+    async def _cb_broadcast_stop(self, event, user_id: int, _data: str) -> None:
+        if user_id in self._broadcast_running:
+            self._broadcast_stop.set()
+            await self._ack(event, texts.BROADCAST_STOPPED)
+        else:
+            await self._ack(event, texts.INVALID_REQUEST, alert=True)
+
+    async def _cb_broadcast_cancel(self, event, user_id: int, _data: str) -> None:
+        self._broadcast_previews.pop(user_id, None)
+        self._broadcast_resume.pop(user_id, None)
+        self._pending_broadcast.discard(user_id)
+        await self._edit_or_reply(event, texts.BROADCAST_CANCELLED, self._admin_menu())
+
+    async def _cb_broadcast_resume(self, event, user_id: int, data: str) -> None:
+        run_id = _to_int(data.rsplit(":", 1)[-1])
+        run = await self.db.broadcast_get_run(run_id) if run_id is not None else None
+        if not run or run["admin_id"] != user_id or run["status"] != "stopped":
+            await self._ack(event, texts.INVALID_REQUEST, alert=True)
+            return
+        if self._broadcast_running:
+            await self._ack(event, texts.BROADCAST_RUNNING, alert=True)
+            return
+        self._broadcast_resume[user_id] = int(run_id)
+        self._pending_broadcast.add(user_id)
+        await event.respond(texts.BROADCAST_RESUME_PROMPT)
 
     async def _cb_admin_audit_page(self, event, _user_id: int, data: str) -> None:
         page = _to_int(data.rsplit(":", 1)[-1])
@@ -1191,6 +1238,8 @@ class GamasBot(
             return
 
         self.conversations.on_callback_navigation(user_id, data)
+        if data.startswith("adm:") and data not in ("adm:bcgo", "adm:bcstop"):
+            self._broadcast_previews.pop(user_id, None)
 
         if not await self.callback_router.dispatch(event, user_id, data):
             await self._ack(event)
@@ -1221,6 +1270,8 @@ class GamasBot(
         text = (event.message.message or "").strip()
         command = _command_name(text)
         if command == "/start":
+            self._broadcast_previews.pop(user_id, None)
+            self._broadcast_resume.pop(user_id, None)
             self.conversations.reset_on_start(user_id)
             self._office_sessions.pop(user_id, None)
             if not existed:
@@ -1259,6 +1310,8 @@ class GamasBot(
                 return
         if self._is_admin(user_id) and user_id in self._pending_broadcast:
             if command == "/cancel":
+                self._broadcast_previews.pop(user_id, None)
+                self._broadcast_resume.pop(user_id, None)
                 self._pending_broadcast.discard(user_id)
                 await event.reply(texts.BROADCAST_CANCELLED)
                 return
@@ -1270,8 +1323,7 @@ class GamasBot(
             if text.startswith("/"):
                 await event.reply(texts.INVALID_COMMAND_TEXT)
                 return
-            self._pending_broadcast.discard(user_id)
-            await self._broadcast(event, text)
+            await self._prepare_broadcast(event, user_id, text)
             return
         if self._is_admin(user_id) and user_id in self._support_admin_states and not command:
             ticket_id, _armed_at = self._support_admin_states[user_id]
@@ -1309,6 +1361,8 @@ class GamasBot(
             return
 
         if command == "/cancel":
+            self._broadcast_previews.pop(user_id, None)
+            self._broadcast_resume.pop(user_id, None)
             self.conversations.reset_on_cancel(user_id)
             self._office_sessions.pop(user_id, None)
             await event.reply(texts.ORDER_CANCELLED)

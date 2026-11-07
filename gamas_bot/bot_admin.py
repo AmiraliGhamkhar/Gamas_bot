@@ -8,6 +8,7 @@ flood-wait-aware broadcasts.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from datetime import datetime, timedelta
 import logging
 import math
@@ -31,6 +32,7 @@ from .intake import (
     _to_int,
     is_pending_payment_review,
 )
+from .metrics import METRICS
 from .progress import to_persian_digits
 from .telegram_text import button_label, split_message
 
@@ -116,9 +118,9 @@ class AdminWorkflowMixin:
 
     ADMIN_COMMAND_COOLDOWN_SECONDS = 30.0
     BROADCAST_COOLDOWN_SECONDS = 60.0
-    MAX_BROADCAST_CHARS = 20_000
-    BROADCAST_THROTTLE_SECONDS = 0.05
-    BROADCAST_BATCH_PROGRESS_EVERY = 100
+    MAX_BROADCAST_CHARS = 4096
+    BROADCAST_THROTTLE_SECONDS = 0.12
+    BROADCAST_BATCH_PROGRESS_EVERY = 25
     BROADCAST_MAX_FLOOD_WAIT_RETRIES = 3
 
     def _admin_period_start(self, period: str) -> str | None:
@@ -1390,7 +1392,8 @@ class AdminWorkflowMixin:
         if previous is not None:
             remaining = cooldown_seconds - (now - previous)
             if remaining > 0:
-                await event.reply(
+                reply = event.respond if hasattr(event, "respond") else event.reply
+                await reply(
                     f"این دستور موقتاً محدود شده است؛ {math.ceil(remaining)} ثانیه دیگر تلاش کنید.",
                     buttons=self._admin_menu(),  # type: ignore[attr-defined]
                 )
@@ -1553,107 +1556,164 @@ class AdminWorkflowMixin:
             message = f"وضعیت ویژهٔ کاربر {owner} لغو شد؛ از این پس استفاده از ربات به اعتبار او وابسته است."
         await event.reply(message, buttons=self._admin_menu())  # type: ignore[attr-defined]
 
-    async def _send_broadcast_page(self, user_id: int, page: str) -> bool:
+    async def _recover_broadcasts(self) -> None:
+        runs = await self.db.broadcast_recover_runs()
+        for run in runs:
+            try:
+                await self.client.send_message(
+                    run["admin_id"],
+                    texts.BROADCAST_RECOVERED.format(
+                        run=to_persian_digits(run["id"]),
+                        cursor=to_persian_digits(run["last_telegram_id"]),
+                    ),
+                    buttons=[[Button.inline(texts.BTN_BROADCAST_RESUME,
+                                            f"adm:bcresume:{run['id']}".encode("ascii"))]],
+                    parse_mode=None,
+                )
+            except Exception:
+                METRICS.record_broadcast_failure()
+                logger.warning("broadcast recovery notice failed run=%s", run["id"])
+
+    async def _prepare_broadcast(self, event: Any, admin_id: int, text: str) -> None:
+        text = text.strip()
+        if len(text) > self.MAX_BROADCAST_CHARS:
+            await event.reply(texts.BROADCAST_TOO_LONG)
+            return
+        if self._broadcast_running:
+            await event.reply(texts.BROADCAST_RUNNING)
+            return
+        resume_id = self._broadcast_resume.pop(admin_id, None)
+        cursor = 0
+        if resume_id is not None:
+            run = await self.db.broadcast_get_run(resume_id)
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if not run or run["admin_id"] != admin_id or run["status"] != "stopped" or run["text_hash"] != digest:
+                resume_id = None
+            else:
+                cursor = int(run["last_telegram_id"])
+        count = await self.db.count_broadcast_targets(admin_id, after_id=cursor)
+        self._pending_broadcast.discard(admin_id)
+        self._broadcast_previews[admin_id] = (text, resume_id)
+        # Send the complete literal text separately so a 4096-character preview fits.
+        await event.reply(text, parse_mode=None)
+        await event.reply(
+            texts.BROADCAST_PREVIEW.format(text="", count=to_persian_digits(count)),
+            buttons=[[Button.inline(texts.BTN_BROADCAST_SEND, b"adm:bcgo"),
+                      Button.inline(texts.BTN_CANCEL, b"adm:bccancel")]],
+        )
+
+    async def _send_broadcast_page(self, user_id: int, page: str) -> str:
         flood_err = self.deps.flood_wait_error
-        for retry in range(self.BROADCAST_MAX_FLOOD_WAIT_RETRIES + 1):
+        retries = 0
+        hard_errors = {"UserIsBlockedError", "ChatWriteForbiddenError", "PeerIdInvalidError",
+                       "InputUserDeactivatedError", "UserDeactivatedError", "ChatIdInvalidError"}
+        while True:
             try:
                 await self.client.send_message(user_id, page, parse_mode=None)
             except flood_err as exc:
-                seconds = float(getattr(exc, "seconds", 0.0) or 0.0)
-                if retry >= self.BROADCAST_MAX_FLOOD_WAIT_RETRIES:
-                    logger.warning(
-                        "broadcast flood wait retries exhausted after=%d",
-                        self.BROADCAST_MAX_FLOOD_WAIT_RETRIES,
-                    )
-                    return False
-                wait_seconds = max(0.0, seconds)
-                logger.warning(
-                    "broadcast flood wait seconds=%s retry=%d/%d",
-                    seconds,
-                    retry + 1,
-                    self.BROADCAST_MAX_FLOOD_WAIT_RETRIES,
-                )
-                await asyncio.sleep(wait_seconds + 1.0)
+                seconds = max(0.0, float(getattr(exc, "seconds", 0.0) or 0.0))
+                if seconds <= 60:
+                    if retries >= self.BROADCAST_MAX_FLOOD_WAIT_RETRIES:
+                        METRICS.record_broadcast_failure()
+                        return "failed"
+                    retries += 1
+                logger.warning("broadcast flood wait seconds=%s", seconds)
+                await asyncio.sleep(seconds + 1.0)
                 continue
             except Exception as exc:
+                METRICS.record_broadcast_failure()
                 logger.warning("broadcast delivery failed error=%s", type(exc).__name__)
-                return False
+                return "hard" if type(exc).__name__ in hard_errors else "failed"
             await asyncio.sleep(self.BROADCAST_THROTTLE_SECONDS)
-            return True
-        return False
+            return "success"
 
-    async def _broadcast(self, event: Any, text: str) -> None:
+    async def _broadcast(self, event: Any, text: str, *, resume_id: int | None = None) -> None:
         text = text.strip()
+        reply = event.respond if hasattr(event, "respond") else event.reply
         if not text:
-            await event.reply(
-                "پیام همگانی خالی است؛ متن را بفرستید.",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
-            )
+            await reply(texts.BROADCAST_NEEDS_TEXT)
             return
         if len(text) > self.MAX_BROADCAST_CHARS:
-            await event.reply(
-                f"پیام همگانی بیش از حد طولانی است (حداکثر {self.MAX_BROADCAST_CHARS} نویسه).",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
-            )
+            await reply(texts.BROADCAST_TOO_LONG)
             return
         admin_id = event.sender_id
         if admin_id is None:
             return
-        if admin_id in self._broadcast_running:
-            await event.reply(
-                "ارسال پیام همگانی دیگری در حال انجام است؛ کمی صبر کنید.",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
-            )
+        if self._broadcast_running:
+            await reply(texts.BROADCAST_RUNNING)
             return
-        if not await self._check_admin_cooldown(
-            event, "broadcast", self.BROADCAST_COOLDOWN_SECONDS
-        ):
-            return
+        # Reserve before the first await so competing admins cannot start a run.
         self._broadcast_running.add(admin_id)
+        self._broadcast_stop.clear()
+        run_id = None
+        cursor = sent = failed = 0
+        outcomes: list[tuple[int, str]] = []
+        status = "stopped"
+        total = 0
         try:
-            user_ids = await self.db.user_ids()
-            pages = split_message(text)
-            sent = 0
-            failed = 0
-            for idx, user_id in enumerate(user_ids, 1):
-                delivered = True
-                for page in pages:
-                    if not await self._send_broadcast_page(user_id, page):
-                        delivered = False
-                        break
-                if delivered:
-                    sent += 1
-                else:
-                    failed += 1
-                if idx % self.BROADCAST_BATCH_PROGRESS_EVERY == 0:
-                    logger.info(
-                        "broadcast progress sent=%d failed=%d total=%d",
-                        sent,
-                        failed,
-                        len(user_ids),
-                    )
-            await self.db.audit(
-                admin_id,
-                "broadcast",
-                f"text:{len(text)} delivered:{sent} failed:{failed} targets:{len(user_ids)}",
-            )
-            if user_ids:
-                summary = (
-                    f"📣 پیام به {to_persian_digits(sent)} نفر از "
-                    f"{to_persian_digits(len(user_ids))} کاربر ارسال شد."
-                )
-                if failed:
-                    summary += (
-                        "\n⚠️ ارسال برای "
-                        f"{to_persian_digits(failed)} کاربر ناموفق بود؛ "
-                        "ممکن است ربات را مسدود کرده باشند."
-                    )
+            if not await self._check_admin_cooldown(event, "broadcast", self.BROADCAST_COOLDOWN_SECONDS):
+                return
+            digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+            if resume_id is not None and await self.db.broadcast_resume_run(resume_id, admin_id, digest):
+                run_id = resume_id
+                run = await self.db.broadcast_get_run(run_id)
+                cursor, sent, failed = int(run["last_telegram_id"]), int(run["sent"]), int(run["failed"])
             else:
-                summary = "📣 هنوز کاربری در فهرست ربات ثبت نشده است؛ پیامی ارسال نشد."
-            await event.reply(summary, buttons=self._admin_menu())  # type: ignore[attr-defined]
+                run_id = await self.db.broadcast_create_run(admin_id, digest)
+            total = sent + failed + await self.db.count_broadcast_targets(admin_id, after_id=cursor)
+            progress = await self.client.send_message(
+                admin_id, texts.BROADCAST_PROGRESS.format(sent=to_persian_digits(sent),
+                    failed=to_persian_digits(failed), total=to_persian_digits(total)),
+                buttons=[[Button.inline(texts.BTN_BROADCAST_STOP, b"adm:bcstop")]], parse_mode=None,
+            )
+            while not self._broadcast_stop.is_set():
+                users = await self.db.user_ids_after(cursor, 500)
+                if not users:
+                    status = "done"
+                    break
+                for user_id in users:
+                    if self._broadcast_stop.is_set():
+                        break
+                    if user_id == admin_id:
+                        cursor = user_id
+                        continue
+                    outcome = await self._send_broadcast_page(user_id, text)
+                    cursor = user_id
+                    outcomes.append((user_id, outcome))
+                    sent += outcome == "success"
+                    failed += outcome != "success"
+                    if (sent + failed) % self.BROADCAST_BATCH_PROGRESS_EVERY == 0:
+                        try:
+                            await progress.edit(
+                                texts.BROADCAST_PROGRESS.format(sent=to_persian_digits(sent),
+                                    failed=to_persian_digits(failed), total=to_persian_digits(total)),
+                                buttons=[[Button.inline(texts.BTN_BROADCAST_STOP, b"adm:bcstop")]],
+                            )
+                        except Exception:
+                            METRICS.record_broadcast_failure()
+                            logger.warning("broadcast progress edit failed run=%s", run_id)
+                await self.db.broadcast_checkpoint(run_id, cursor, sent, failed, outcomes)
+                outcomes.clear()
+            await self.db.broadcast_checkpoint(run_id, cursor, sent, failed, outcomes, status=status)
+            outcomes.clear()
+            await self.db.audit(admin_id, "broadcast", f"run:{run_id} delivered:{sent} failed:{failed} targets:{total} stopped:{int(status == 'stopped')}")
+            await reply(texts.BROADCAST_SUMMARY.format(sent=to_persian_digits(sent),
+                        failed=to_persian_digits(failed), total=to_persian_digits(total)),
+                        buttons=self._admin_menu())
+        except BaseException as exc:
+            if not isinstance(exc, asyncio.CancelledError):
+                METRICS.record_broadcast_failure()
+            if run_id is not None:
+                try:
+                    await self.db.broadcast_checkpoint(run_id, cursor, sent, failed, outcomes, status="stopped")
+                except Exception:
+                    METRICS.record_broadcast_failure()
+                    logger.warning("broadcast checkpoint failed run=%s", run_id)
+            raise
         finally:
             self._broadcast_running.discard(admin_id)
-            self._admin_action_times[(admin_id, "broadcast")] = self.deps.monotonic()
+            if run_id is not None:
+                self._admin_action_times[(admin_id, "broadcast")] = self.deps.monotonic()
 
     async def _route_admin_hub(self, event: Any, admin_id: int, data: str) -> None:
         """Dispatch ``adm:hub:<hub>[:action[:arg]]`` to the merged screens."""

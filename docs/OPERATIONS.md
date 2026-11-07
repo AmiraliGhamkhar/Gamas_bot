@@ -106,3 +106,14 @@ passive WAL checkpoint runs daily and SQLite optimize weekly.
 
 The learning retention default is 0 rather than 90: WO-DB-7 explicitly requires
 all retention knobs to default off, preserving deployed data.
+
+### Broadcasts
+
+Broadcasts require an administrator preview and confirmation and run one at a
+time. They exclude banned users and recipients with three permanent Telegram
+delivery failures; a successful send resets the failure counter. A stopped or
+interrupted run can be resumed by its administrator after re-entering the same
+text (verified by SHA-256). Cursors are checkpointed per batch, so an abrupt
+process crash can cause delivery to be repeated within the last uncheckpointed
+batch; Telegram has no transactional exactly-once send. The text itself is not
+stored in the database.

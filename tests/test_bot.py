@@ -1207,7 +1207,8 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
             item for item in event.client.texts
             if item["text"] == "<b>literal & text</b>"
         ]
-        self.assertEqual(len(delivered), 2)
+        self.assertEqual(len(delivered), 1)  # broadcasting admin is excluded
+        self.assertEqual(delivered[0]["entity"], self.user_id)
         self.assertTrue(all(item["parse_mode"] is None for item in delivered))
 
         next_event = FakeMessageEvent(self.admin_id, "")
@@ -1252,12 +1253,125 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
             item["entity"] for item in event.client.texts
             if item["text"] == "announcement"
         ]
-        self.assertEqual(set(delivered), {self.admin_id, self.user_id})
+        self.assertEqual(set(delivered), {self.user_id})
         self.assertEqual(attempts[self.user_id], 2)
         sleep.assert_any_await(3.0)  # flood wait plus the boundary safety second
         summary = event.client.texts[-1]["text"]
-        self.assertIn("۲ نفر از ۳ کاربر", summary)
+        self.assertIn("۱ نفر از ۲ کاربر", summary)
         self.assertIn("۱ کاربر ناموفق", summary)
+
+    async def test_broadcast_requires_confirmation_and_excludes_banned_users(self):
+        await self.db.ensure_user(self.admin_id)
+        await self.db.ensure_user(self.user_id)
+        await self.db.ensure_user(777)
+        await self.db._write("UPDATE users SET banned=1 WHERE telegram_id=777")
+        event = FakeMessageEvent(self.admin_id, "announcement")
+        self.bot.client = event.client
+        await self.bot._prepare_broadcast(event, self.admin_id, "announcement")
+        self.assertFalse(any(row["entity"] == self.user_id for row in event.client.texts))
+        confirm = FakeCallbackEvent(self.admin_id, b"adm:bcgo")
+        with mock.patch("gamas_bot.bot.asyncio.sleep", new_callable=mock.AsyncMock):
+            await self.bot._handle_callback(confirm)
+        self.assertTrue(any(row["entity"] == self.user_id and row["text"] == "announcement" for row in event.client.texts))
+        self.assertFalse(any(row["entity"] == 777 for row in event.client.texts))
+        self.assertTrue(confirm.answers)
+
+    async def test_single_flight_stop_progress_and_audit(self):
+        await self.db.ensure_user(self.admin_id)
+        for uid in range(100, 132):
+            await self.db.ensure_user(uid)
+        event = FakeMessageEvent(self.admin_id, "")
+        self.bot.client = event.client
+        entered, release = asyncio.Event(), asyncio.Event()
+        count = 0
+        async def send(_user, _text):
+            nonlocal count
+            count += 1
+            if count == 1:
+                entered.set()
+                await release.wait()
+            if count == 27:
+                self.bot._broadcast_stop.set()
+            return "success"
+        with mock.patch.object(self.bot, "_send_broadcast_page", side_effect=send):
+            task = asyncio.create_task(self.bot._broadcast(event, "announcement"))
+            await entered.wait()
+            other = FakeMessageEvent(self.admin_id + 1, "")
+            await self.bot._broadcast(other, "other")
+            self.assertTrue(any("در حال اجراست" in text for text in other.replies))
+            release.set()
+            await task
+        self.assertEqual(count, 27)
+        self.assertTrue(event.record.edits)
+        run = (await self.db.db.execute_fetchall("SELECT status,sent FROM broadcast_runs"))[0]
+        self.assertEqual(tuple(run), ("stopped", 27))
+        audit = await self.db.recent_audit(limit=10)
+        self.assertTrue(any(row["action"] == "broadcast" and "stopped:1" in row["detail"] for row in audit))
+
+    async def test_stopped_broadcast_resumes_after_cursor(self):
+        await self.db.ensure_user(self.admin_id)
+        for uid in (100, 101, 102, 103, 104):
+            await self.db.ensure_user(uid)
+        event = FakeMessageEvent(self.admin_id, "")
+        self.bot.client = event.client
+        delivered = []
+        async def first(user, _text):
+            delivered.append(user)
+            if len(delivered) == 2:
+                self.bot._broadcast_stop.set()
+            return "success"
+        with mock.patch.object(self.bot, "_send_broadcast_page", side_effect=first), \
+             mock.patch.object(self.bot, "_check_admin_cooldown", new=mock.AsyncMock(return_value=True)):
+            await self.bot._broadcast(event, "announcement")
+            run = (await self.db.db.execute_fetchall("SELECT id,last_telegram_id,status FROM broadcast_runs"))[0]
+            self.assertEqual((run[1], run[2]), (101, "stopped"))
+            await self.bot._broadcast(event, "announcement", resume_id=run[0])
+        self.assertEqual(delivered, [100, 101, 102, 103, 104])
+        run = await self.db.broadcast_get_run(run[0])
+        self.assertEqual((run["status"], run["sent"]), ("done", 5))
+
+    async def test_permanent_failures_are_filtered_after_three_runs(self):
+        await self.db.ensure_user(self.admin_id)
+        await self.db.ensure_user(self.user_id)
+        event = FakeMessageEvent(self.admin_id, "")
+        self.bot.client = event.client
+        class UserIsBlockedError(Exception):
+            pass
+        async def send(entity, message, **kwargs):
+            if entity == self.user_id:
+                raise UserIsBlockedError()
+            return await original(entity, message, **kwargs)
+        original = event.client.send_message
+        with mock.patch.object(event.client, "send_message", side_effect=send), \
+             mock.patch.object(self.bot, "_check_admin_cooldown", new=mock.AsyncMock(return_value=True)), \
+             mock.patch("gamas_bot.bot.asyncio.sleep", new_callable=mock.AsyncMock):
+            for _ in range(3):
+                await self.bot._broadcast(event, "announcement")
+        self.assertNotIn(self.user_id, await self.db.user_ids_after(0))
+        rows = await self.db.db.execute_fetchall("SELECT broadcast_hard_fails FROM users WHERE telegram_id=?", (self.user_id,))
+        self.assertEqual(rows[0][0], 3)
+
+    async def test_long_flood_wait_does_not_consume_short_retry_budget(self):
+        class FakeFloodWaitError(Exception):
+            def __init__(self, seconds):
+                self.seconds = seconds
+        event = FakeMessageEvent(self.admin_id, "")
+        self.bot.client = event.client
+        original = event.client.send_message
+        attempts = 0
+        async def sender(entity, message, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise FakeFloodWaitError(61)
+            return await original(entity, message, **kwargs)
+        with mock.patch.object(event.client, "send_message", side_effect=sender), \
+             mock.patch("gamas_bot.bot.FloodWaitError", FakeFloodWaitError), \
+             mock.patch("gamas_bot.bot.asyncio.sleep", new_callable=mock.AsyncMock) as sleep:
+            outcome = await self.bot._send_broadcast_page(self.user_id, "announcement")
+        self.assertEqual(outcome, "success")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(sum(call.args == (62.0,) for call in sleep.await_args_list), 1)
 
     async def test_oversized_broadcast_is_rejected(self):
         event = FakeMessageEvent(self.admin_id, "")

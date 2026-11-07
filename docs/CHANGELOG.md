@@ -4,7 +4,9 @@ Concise history; detailed patches and earlier notes remain in Git history.
 
 ## Unreleased — hardening
 
-- WO-BC-2/3 (partial): add durable broadcast cursors and recipient failure tracking.
+- WO-BC-1: confirm broadcasts, serialize runs, show progress, and support graceful stop.
+- WO-BC-2: resume hashed-text broadcasts with filtered keyset checkpoints and bounded flood handling.
+- WO-BC-3: track permanent recipient failures and skip repeatedly unreachable users.
 - WO-SUB-2: record sweep membership and check timestamp in one update.
 - WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
 - WO-PAY-2: fingerprint normalized receipts and warn admins about reuse.
