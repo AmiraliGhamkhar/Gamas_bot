@@ -9,6 +9,7 @@ from typing import Any
 
 import aiosqlite
 
+from .metrics import METRICS
 from .db_core import (
     DatabaseCore,
     InsufficientBalanceError,
@@ -356,27 +357,43 @@ class BillingRepositoryMixin(DatabaseCore):
         if cursor.rowcount != 1:
             raise ValueError("learning charge is not pending for this user")
 
+    async def _refund_debit_locked(
+        self, user_id: int, debit_id: int, seconds: int, note: str, now: str
+    ) -> None:
+        """Mint a refund using the original debit's allocations, inside a transaction."""
+        rows = await _rows(
+            self.db,
+            "SELECT l.id, l.expires_at, a.seconds FROM debit_allocations a "
+            "JOIN ledger l ON l.id = a.credit_id "
+            "JOIN ledger d ON d.id = a.debit_id "
+            "WHERE d.id = ? AND d.user_id = ? AND d.kind = 'debit' "
+            "AND l.user_id = d.user_id ORDER BY l.id",
+            (int(debit_id), int(user_id)),
+        )
+        if not rows or sum(int(row[2]) for row in rows) < seconds:
+            METRICS.record_db_error()
+            raise ValueError("refund requires sufficient original debit allocations")
+        expiries = [str(row[1]) for row in rows if row[1] is not None]
+        lot_ids = ",".join(str(row[0]) for row in rows)
+        await self.db.execute(
+            "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
+            "VALUES (?, ?, 'credit', ?, ?, ?)",
+            (int(user_id), int(seconds), "refund: " + note[:180] + " lots:" + lot_ids,
+             min(expiries) if expiries else None, now),
+        )
+
     async def refund_learning_charge(self, user_id: int, operation_id: str) -> bool:
         async with self._transaction():
             rows = await _rows(
                 self.db,
-                "SELECT seconds, note FROM learning_charges "
+                "SELECT seconds, note, debit_id FROM learning_charges "
                 "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
                 (operation_id, int(user_id)),
             )
             if not rows:
                 return False
             now = iso(self._now())
-            await self.db.execute(
-                "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
-                "VALUES (?, ?, 'credit', ?, ?)",
-                (
-                    int(user_id),
-                    int(rows[0][0]),
-                    "refund: " + str(rows[0][1])[:180],
-                    now,
-                ),
-            )
+            await self._refund_debit_locked(user_id, int(rows[0][2]), int(rows[0][0]), str(rows[0][1]), now)
             await self.db.execute(
                 "UPDATE learning_charges SET status = 'refunded', updated_at = ? "
                 "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
@@ -387,28 +404,31 @@ class BillingRepositoryMixin(DatabaseCore):
     async def recover_pending_learning_charges(self) -> int:
         async with self._transaction():
             now = iso(self._now())
-            cursor = await self.db.execute(
-                "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
-                "SELECT user_id, seconds, 'credit', 'refund: ' || substr(note, 1, 180), ? "
-                "FROM learning_charges WHERE status = 'pending'",
-                (now,),
-            )
-            recovered = max(0, cursor.rowcount)
-            await self.db.execute(
-                "UPDATE learning_charges SET status = 'refunded', updated_at = ? "
-                "WHERE status = 'pending'",
-                (now,),
-            )
-            return recovered
+            recovered = 0
+            while True:
+                rows = await _rows(
+                    self.db,
+                    "SELECT operation_id, user_id, debit_id, seconds, note "
+                    "FROM learning_charges WHERE status = 'pending' LIMIT 500",
+                )
+                if not rows:
+                    return recovered
+                for row in rows:
+                    await self._refund_debit_locked(int(row[1]), int(row[2]), int(row[3]), str(row[4]), now)
+                    await self.db.execute(
+                        "UPDATE learning_charges SET status = 'refunded', updated_at = ? "
+                        "WHERE operation_id = ? AND status = 'pending'",
+                        (now, row[0]),
+                    )
+                    recovered += 1
 
     async def refund_seconds(
-        self, user_id: int, seconds: int, note: str
+        self, user_id: int, seconds: int, note: str, *, debit_id: int | None = None
     ) -> Any:
         if seconds <= 0:
             return
-        await self.add_credit(
-            user_id,
-            int(seconds),
-            note="refund: " + note[:180],
-            validity_days=None,
-        )
+        if debit_id is None:
+            METRICS.record_db_error()
+            raise ValueError("refund requires the original debit_id")
+        async with self._transaction():
+            await self._refund_debit_locked(user_id, debit_id, int(seconds), note, iso(self._now()))

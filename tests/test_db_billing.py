@@ -38,6 +38,38 @@ class DatabaseTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class LedgerTests(DatabaseTestCase):
+    async def test_learning_refund_and_recovery_inherit_contributing_expiry(self):
+        await self.grant(100, 7200, days=30)
+        original = (await self.db.db.execute_fetchall(
+            "SELECT id, expires_at FROM ledger WHERE user_id=100 AND kind='credit'"
+        ))[0]
+        await self.db.spend_seconds(100, 3600, "learning", operation_id="first")
+        self.assertTrue(await self.db.refund_learning_charge(100, "first"))
+        refund = (await self.db.db.execute_fetchall(
+            "SELECT seconds, expires_at, note FROM ledger WHERE note LIKE 'refund:%'"
+        ))[0]
+        self.assertEqual((refund[0], refund[1]), (3600, original[1]))
+        self.assertIn("lots:" + str(original[0]), refund[2])
+        self.assertEqual(await self.db.available_seconds(100), 7200)
+        await self.db.spend_seconds(100, 3600, "learning", operation_id="second")
+        self.assertEqual(await self.db.recover_pending_learning_charges(), 1)
+        recovered = (await self.db.db.execute_fetchall(
+            "SELECT expires_at FROM ledger WHERE note LIKE 'refund:%' ORDER BY id DESC LIMIT 1"
+        ))[0]
+        self.assertEqual(recovered[0], original[1])
+        self.assertEqual(await self.db.available_seconds(100), 7200)
+
+    async def test_generic_refund_requires_original_debit_and_inherits_expiry(self):
+        await self.grant(100, 3600, days=30)
+        await self.db.spend_seconds(100, 3600, "test")
+        debit = (await self.db.db.execute_fetchall("SELECT id FROM ledger WHERE kind='debit'"))[0][0]
+        with self.assertRaises(ValueError):
+            await self.db.refund_seconds(100, 3600, "test")
+        await self.db.refund_seconds(100, 3600, "test", debit_id=debit)
+        rows = await self.db.db.execute_fetchall("SELECT expires_at FROM ledger WHERE kind='credit' ORDER BY id")
+        self.assertEqual(rows[0][0], rows[1][0])
+        self.assertEqual(await self.db.available_seconds(100), 3600)
+
     async def test_free_plan_granted_once(self):
         self.assertTrue(await self.db.grant_free_plan_once(100, 3600))
         self.assertFalse(await self.db.grant_free_plan_once(100, 3600))

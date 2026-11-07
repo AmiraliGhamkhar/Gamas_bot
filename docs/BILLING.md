@@ -75,3 +75,8 @@ credit only. See [Admin](ADMIN.md).
 Back up before updates. Migrations run at startup; never downgrade against the
 migrated database. Legacy v2 import is exceptional: inspect
 `scripts/import_v2.py --help` and test on copies, never live data.
+
+Refund credit inherits the earliest non-null expiry of the original debit's
+contributing lots (including startup recovery); it is non-expiring only if all
+contributing lots were non-expiring. Refund notes record contributing lot IDs.
+Generic refunds require the original debit ID; an untraceable refund is rejected.
