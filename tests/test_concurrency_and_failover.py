@@ -556,6 +556,13 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
         llm.reset_cooldowns()
         self._tmp.cleanup()
 
+    async def test_stray_transaction_rollback_is_reported(self):
+        await self.db.db.execute("BEGIN")
+        with self.assertLogs("gamas_bot.db.core", level="WARNING") as logs:
+            async with self.db._transaction():
+                pass
+        self.assertIn("discarded uncommitted transaction", logs.output[0])
+
     async def test_pending_gate_action_is_taken_once_concurrently(self):
         await self.db.ensure_user(1234)
         await self.db.save_pending_gate_action(

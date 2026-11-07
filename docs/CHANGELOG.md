@@ -4,6 +4,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 
 ## Unreleased — hardening
 
+- WO-DB-4: report discarded stray transactions in logs and metrics.
 - WO-DB-1: consume pending membership-gate actions atomically.
 
 ## Unreleased — one static booklet prompt and the AvalAI route (2026-11-06)

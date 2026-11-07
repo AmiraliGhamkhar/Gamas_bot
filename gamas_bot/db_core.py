@@ -298,6 +298,8 @@ class DatabaseCore:
         async with self._write_lock:
             if self.db.in_transaction:
                 await self.db.rollback()
+                logger.warning("discarded uncommitted transaction before BEGIN IMMEDIATE")
+                METRICS.record_db_error()
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
                 yield
