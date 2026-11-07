@@ -1676,6 +1676,108 @@ class SkeletonPromptTests(unittest.TestCase):
         self.assertIn("sections", COMPILE_SYSTEM_PROMPT)
         self.assertIn("حذف نکنید", COMPILE_SYSTEM_PROMPT)
 
+    def test_prompt_mandates_comparison_tables_callouts_and_tips(self):
+        """The booklet contract explicitly triggers tables, callouts and tips."""
+        prompt = build_system_prompt("full")
+        for phrase in (
+            "جدول مقایسه‌ای (tables)",
+            "جعبه‌های راهنما (callouts)",
+            "نکته‌های کاربردی (practical_tips)",
+            "فارسی معیار دانشگاهی",
+            "tables، callouts و practical_tipsِ همین بخش را کامل استخراج کنید",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, prompt)
+        for edit_phrase in (
+            "جدول‌های مقایسه‌ای را در tables",
+            "callouts",
+            "practical_tips",
+            "«کاربردی»، «آزمونی» یا «هشدار»",
+        ):
+            with self.subTest(edit_phrase=edit_phrase):
+                self.assertIn(edit_phrase, COMPILE_SYSTEM_PROMPT)
+
+    def test_compile_gate_and_body_chars_protect_tables_callouts_and_tips(self):
+        """_notes_body_chars counts tips once and compile_accepts protects callouts/tips."""
+        from gamas_bot.notes import (
+            NoteCallout,
+            PracticalTip,
+            _notes_body_chars,
+            _notes_structured_item_count,
+            assess_completeness,
+            compile_accepts,
+        )
+
+        tip = PracticalTip(
+            text="در مسمومیت حاد حتماً پادزهر تزریق شود.",
+            basis="در مسمومیت حاد حتماً پادزهر تزریق شود و تأخیر مجاز نیست.",
+            kind="هشدار",
+        )
+        sec1 = NoteSection(
+            heading="بخش اول",
+            paragraphs=("توضیح کامل بخش اول دربارهٔ مکانیزم اثر دارو و گیرنده‌ها.",),
+            callouts=(
+                NoteCallout(kind="نکته", text="نکتهٔ مفهومی اول."),
+                NoteCallout(kind="هشدار", text="هشدار مهم امتحانی اول."),
+            ),
+            table=NoteTable(
+                headers=["دارو", "دوز"],
+                rows=[["آسپیرین", "100 mg"], ["ایبوپروفن", "400 mg"]],
+                caption="مقایسهٔ دوز داروهای ضدالتهاب",
+            ),
+        )
+        sec2 = NoteSection(
+            heading="بخش دوم",
+            paragraphs=("توضیح کامل بخش دوم دربارهٔ متابولیسم کبدی و دفع کلیوی.",),
+            callouts=(
+                NoteCallout(kind="یادآوری", text="یادآوری پیش‌نیاز فیزیولوژی."),
+            ),
+        )
+        one_sec_notes = StructuredNotes(
+            title="جزوهٔ فارماکولوژی",
+            summary="خلاصهٔ درس",
+            sections=(sec1,),
+            practical_tips=(tip,),
+        )
+        two_sec_notes = StructuredNotes(
+            title="جزوهٔ فارماکولوژی",
+            summary="خلاصهٔ درس",
+            sections=(sec1, sec2),
+            practical_tips=(tip,),
+        )
+        sec2_only_chars = _notes_body_chars(StructuredNotes(sections=(sec2,)))
+        self.assertEqual(
+            _notes_body_chars(two_sec_notes) - _notes_body_chars(one_sec_notes),
+            sec2_only_chars,
+        )
+        # 1 table + 3 callouts + 1 practical tip = 5 structured items
+        self.assertEqual(_notes_structured_item_count(two_sec_notes), 5)
+
+        # A compile candidate that drops all callouts, tables, and tips is rejected
+        gutted = StructuredNotes(
+            title="جزوهٔ فارماکولوژی",
+            summary="خلاصهٔ درس",
+            sections=(
+                NoteSection(
+                    heading="بخش اول",
+                    paragraphs=sec1.paragraphs,
+                ),
+                NoteSection(
+                    heading="بخش دوم",
+                    paragraphs=sec2.paragraphs,
+                ),
+            ),
+        )
+        self.assertFalse(compile_accepts(gutted, two_sec_notes))
+
+        # Completeness assessment counts table captions and practical tips as drafted text
+        source = (
+            "مقایسهٔ دوز داروهای ضدالتهاب در جدول آمده است. "
+            "در مسمومیت حاد حتماً پادزهر تزریق شود و تأخیر مجاز نیست."
+        )
+        completeness = assess_completeness(source, two_sec_notes)
+        self.assertEqual(completeness.covered_units, completeness.total_units)
+
 
 class CoverageFillTests(unittest.IsolatedAsyncioTestCase):
     """The fill pass is opt-in, bounded, grounded and non-fatal."""
