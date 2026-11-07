@@ -544,12 +544,12 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         source = {"item_id": item, "doc_id": None, "title": "سند", "chunks": chunks}
         async def provider(*args, **kwargs):
             chunk = next(chunk for chunk in chunks if chunk.text == kwargs["user"])
-            return {"cards": [{"front": f"پرسش {chunk.index}", "back": "پاسخ", "source": chunk.locator}]}
+            return {"cards": [{"front": f"پرسش {chunk.index} مورد {i}", "back": "پاسخ", "source": chunk.locator} for i in range(5)]}
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER, kind="deck",
                                                source=source, wanted=5, cost=0, note="test", title="سند")
-        self.assertEqual(self.bot._curation[OWNER]["skipped"], 7)
-        self.assertIn("۷ بخش", self.client.texts[-1]["text"])
+        self.assertEqual(self.bot._curation[OWNER]["skipped"], 10)
+        self.assertIn("۱۰ بخش", self.client.texts[-1]["text"])
         self.assertIn("بررسی نشد", self.client.texts[-1]["text"])
 
 
