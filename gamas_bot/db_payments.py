@@ -32,7 +32,7 @@ class PaymentsRepositoryMixin(DatabaseCore):
     _PAYMENT_COLUMNS = (
         "payment_id, user_id, plan_code, status, receipt_path, created_at, "
         "reviewed_at, reviewed_by, purchased_seconds, purchased_price, "
-        "purchased_validity_days, review_reason, "
+        "purchased_validity_days, review_reason, receipt_hash, "
         "(SELECT l.id FROM ledger l WHERE l.payment_id = payments.payment_id "
         "AND l.kind = 'credit') AS credit_ledger_id"
     )
@@ -54,7 +54,7 @@ class PaymentsRepositoryMixin(DatabaseCore):
 
     async def plans(self) -> list[dict[str, Any]]:
         rows = await _rows(
-            self.db,
+            self.read_db,
             "SELECT code, hours, price, validity_days, is_custom, active FROM plans "
             "WHERE active = 1 ORDER BY price",
         )
@@ -62,7 +62,7 @@ class PaymentsRepositoryMixin(DatabaseCore):
 
     async def plan(self, code: str) -> dict[str, Any] | None:
         rows = await _rows(
-            self.db,
+            self.read_db,
             "SELECT code, hours, price, validity_days, is_custom, active FROM plans "
             "WHERE code = ? AND active = 1",
             (code,),
@@ -116,11 +116,11 @@ class PaymentsRepositoryMixin(DatabaseCore):
     async def cancel_payment(self, payment_id: int, user_id: int) -> bool:
         async with self._transaction():
             cursor = await self.db.execute(
-                "UPDATE payments SET status = 'cancelled', reviewed_at = ?, "
+                "UPDATE payments SET status = 'cancelled', reviewed_at = ?, reviewed_by = ?, "
                 "review_reason = 'cancelled by owner before receipt' "
                 "WHERE payment_id = ? AND user_id = ? AND status IN ('pending','awaiting_payment') "
                 "AND receipt_path IS NULL",
-                (iso(self._now()), payment_id, user_id),
+                (iso(self._now()), user_id, payment_id, user_id),
             )
             changed = bool(cursor.rowcount)
         if changed:
@@ -131,15 +131,16 @@ class PaymentsRepositoryMixin(DatabaseCore):
         return changed
 
     async def set_payment_receipt(
-        self, payment_id: int, receipt_path: str, user_id: int | None = None
+        self, payment_id: int, receipt_path: str, user_id: int | None = None,
+        *, receipt_hash: str | None = None,
     ) -> bool:
         async with self._transaction():
             ownership = "AND user_id = ? " if user_id is not None else ""
-            params: tuple[Any, ...] = (receipt_path, payment_id)
+            params: tuple[Any, ...] = (receipt_path, receipt_hash, payment_id)
             if user_id is not None:
                 params += (int(user_id),)
             cursor = await self.db.execute(
-                "UPDATE payments SET receipt_path = ?, status = 'pending_review' "
+                "UPDATE payments SET receipt_path = ?, receipt_hash = ?, status = 'pending_review' "
                 f"WHERE payment_id = ? {ownership}"
                 "AND status IN ('pending','awaiting_payment')",
                 params,
@@ -151,6 +152,15 @@ class PaymentsRepositoryMixin(DatabaseCore):
                 payment_id,
             )
         return changed
+
+    async def other_payment_with_receipt_hash(self, payment_id: int, receipt_hash: str) -> int | None:
+        rows = await _rows(
+            self.read_db,
+            "SELECT payment_id FROM payments WHERE receipt_hash = ? AND payment_id != ? "
+            "AND status != 'cancelled' ORDER BY payment_id LIMIT 1",
+            (receipt_hash, int(payment_id)),
+        )
+        return int(rows[0][0]) if rows else None
 
     async def forget_receipts(self, paths: tuple[str, ...] | list[str]) -> int:
         cleaned = tuple(dict.fromkeys(path for path in paths if path))
@@ -191,6 +201,21 @@ class PaymentsRepositoryMixin(DatabaseCore):
             (user_id,),
         )
         return dict(rows[0]) if rows else None
+
+    async def open_payment_for_user(self, user_id: int) -> dict[str, Any] | None:
+        """Find an open order regardless of newer terminal history."""
+        rows = await _rows(
+            self.read_db,
+            f"SELECT {self._PAYMENT_COLUMNS} FROM payments "
+            "WHERE user_id = ? AND status IN ('awaiting_payment', 'pending', 'pending_review') "
+            "ORDER BY payment_id DESC LIMIT 1",
+            (int(user_id),),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def count_user_payments(self, user_id: int) -> int:
+        rows = await _rows(self.read_db, "SELECT COUNT(*) FROM payments WHERE user_id = ?", (int(user_id),))
+        return int(rows[0][0])
 
     async def pending_payments(self) -> list[dict[str, Any]]:
         rows = await _rows(

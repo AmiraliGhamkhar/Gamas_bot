@@ -14,13 +14,15 @@ import logging
 import math
 from pathlib import Path
 import secrets
+import sqlite3
 import shutil
 import tempfile
 from typing import TYPE_CHECKING, Any
 
 from telethon import Button
-from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 
+from . import texts
 from .billing import format_duration
 from .bot_ui import (
     CURATION_GUIDANCE,
@@ -46,6 +48,7 @@ from .bot_ui import (
     TELEGRAM_CAPTION_LIMIT,
 )
 from .db import InsufficientBalanceError
+from .db_learning import FlashcardLimitError
 from .doc_extract import (
     DocChunk,
     chunk_text,
@@ -71,12 +74,15 @@ from .learning import (
     dedupe_questions,
     distribute_counts,
     flashcard_system_prompt,
+    learning_user_prompt,
+    source_key,
     parse_flashcard_payload,
     parse_quiz_payload,
     preset_cards,
     quiz_system_prompt,
 )
 from .llm import LLMContextOverflowError, LLMOutputBudgetError
+from .metrics import METRICS
 from .progress import (
     WORK_PROGRESS_HEADLINE,
     WorkProgress,
@@ -143,13 +149,16 @@ class LearningWorkflowMixin:
 
     def _preset_cost(self, base_cost: int, cards: int, base_size: int) -> int:
         base_size = max(1, int(base_size))
-        return max(1, int(round(int(base_cost) * int(cards) / base_size)))
+        quotient, remainder = divmod(int(base_cost) * int(cards), base_size)
+        # Match round-to-even without converting integer seconds to float.
+        rounded = quotient + int(2 * remainder > base_size or (2 * remainder == base_size and quotient % 2 == 1))
+        return max(1, rounded)
 
     MAX_ITEMS_PER_CALL = 20
 
     def _learning_max_chars(self) -> int:
         context_tokens = int(getattr(self.settings, "note_context_tokens", 131_072) or 131_072)
-        output_tokens = int(getattr(self.settings, "note_max_output_tokens", 16_384) or 16_384)
+        output_tokens = int(getattr(self.settings, "learning_max_output_tokens", 4096) or 4096)
         reserved_output = min(output_tokens, context_tokens // 2)
         available_tokens = max(1_000, context_tokens - reserved_output - 2_000)
         return min(MAX_MODEL_INPUT_CHARS, max(2_000, int(available_tokens * 2.0)))
@@ -173,7 +182,7 @@ class LearningWorkflowMixin:
             "title": short_title(
                 self._item_display_title(item), fallback=FALLBACK_BOOKLET
             ),
-            "chunks": self._learning_chunks(str(item["content_text"])),
+            "chunks": await run_file_io(self._learning_chunks, str(item["content_text"])),
         }
 
     async def _source_from_document(
@@ -259,18 +268,18 @@ class LearningWorkflowMixin:
     async def _progress_edit(
         self,
         placeholder: Any,
-        done: int,
+        done: float,
         total: int,
         *,
         stage: str,
         headline: str = WORK_PROGRESS_HEADLINE,
     ) -> None:
-        done = max(0, int(done))
+        done = max(0.0, float(done))
         total = max(1, int(total))
         percent = self.CHUNK_PROGRESS_START + round(
             (self.CHUNK_PROGRESS_END - self.CHUNK_PROGRESS_START) * done / total
         )
-        detail = f"بخش {to_persian_digits(done)} از {to_persian_digits(total)}"
+        detail = texts.LEARNING_CHUNK_PROGRESS.format(done=to_persian_digits(int(done)), total=to_persian_digits(total))
         try:
             if callable(getattr(placeholder, "update", None)):
                 await placeholder.update(percent, stage, detail)
@@ -292,17 +301,20 @@ class LearningWorkflowMixin:
     ) -> tuple[list[dict[str, Any]], int]:
         schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
         concurrency = min(8, max(1, int(self.settings.learning_chunk_concurrency)))
-        semaphore = asyncio.Semaphore(concurrency)
         active = [index for index, count in enumerate(counts) if count > 0]
         total = len(active)
         state = {"done": 0, "failed": 0}
+        fractions = {index: 0.0 for index in active}
+        progress_changed = asyncio.Event()
+        finished = False
         session = self._http_session()  # type: ignore[attr-defined]
-        progress_task: asyncio.Task[None] | None = None
         edit_timeout = self.deps.learning_progress_edit_timeout_seconds
 
         async def report_progress() -> None:
             while True:
-                done = state["done"]
+                # Clear before rendering so completions during an edit are not lost.
+                progress_changed.clear()
+                done = state["done"] + sum(fractions.values())
                 try:
                     await asyncio.wait_for(
                         self._progress_edit(placeholder, done, total, stage=stage),
@@ -312,8 +324,9 @@ class LearningWorkflowMixin:
                     logger.debug("learning progress edit timed out")
                 except Exception:
                     logger.debug("learning progress edit failed", exc_info=True)
-                if done == state["done"]:
+                if finished and not progress_changed.is_set():
                     return
+                await progress_changed.wait()
 
         max_input_chars = self._learning_max_chars()
         dedupe = dedupe_cards if kind == "deck" else dedupe_questions
@@ -334,6 +347,7 @@ class LearningWorkflowMixin:
                 )
             )
             fallback_locator = allowed[0] if allowed else ""
+            text_key = await run_file_io(source_key, target_chunk.text)
             items: list[dict[str, Any]] = []
             max_attempts = max(2, math.ceil(int(target_count) / self.MAX_ITEMS_PER_CALL) + 1)
             use_schema = True
@@ -349,8 +363,9 @@ class LearningWorkflowMixin:
                     if kind == "deck"
                     else quiz_system_prompt(batch, sources=allowed)
                 )
+                user_prompt = learning_user_prompt(kind, batch, allowed, target_chunk.text[:max_input_chars])
                 if had_shortfall:
-                    system += (
+                    user_prompt += (
                         "\nخروجی قبلی نامعتبر، ناقص یا بدون منبع مجاز بود؛ "
                         "همهٔ فیلدهای لازم و یک منبع دقیق از فهرست را وارد کن."
                     )
@@ -361,37 +376,33 @@ class LearningWorkflowMixin:
                         if str(it.get(stem_key) or "").strip()
                     ]
                     if prior_stems:
-                        system += (
+                        user_prompt += (
                             "\nموردهای زیر قبلاً ساخته شده‌اند؛ هیچ‌کدام را تکرار یا بازنویسی نکن:\n- "
                             + "\n- ".join(prior_stems)
                         )
                 try:
-                    async with semaphore:
-                        payload = await self.deps.complete_json(
-                            session,
-                            self.settings,
-                            system=system,
-                            user=target_chunk.text[:max_input_chars],
-                            schema=schema if use_schema else None,
-                        )
-                    if kind == "deck":
-                        parsed = parse_flashcard_payload(payload, batch)
-                    else:
-                        parsed = parse_quiz_payload(
-                            payload, batch, require_difficulty=False
-                        )
-                    anchored = anchor_items(
-                        parsed, allowed, fallback_locator, target_chunk.text
+                    payload = await self.deps.complete_json(
+                        session,
+                        self.settings,
+                        system=system,
+                        user=user_prompt,
+                        schema=schema if use_schema else None,
+                        max_output_tokens=self.settings.learning_max_output_tokens,
+                        # Never wait for a provider slot while holding the generation slot.
+                        wait_for_capacity=False,
                     )
-                    if len(anchored) < len(parsed):
-                        logger.debug(
-                            "dropped %s malformed %s item(s) chunk=%s",
-                            len(parsed) - len(anchored),
-                            kind,
-                            chunk_idx,
+                    def validate_and_merge() -> list[dict[str, Any]]:
+                        if kind == "deck":
+                            parsed = parse_flashcard_payload(payload, batch)
+                        else:
+                            parsed = parse_quiz_payload(payload, batch, require_difficulty=False)
+                        anchored = anchor_items(
+                            parsed, allowed, fallback_locator, target_chunk.text, text_key=text_key
                         )
+                        return dedupe([*items, *anchored])
+
                     prev_count = len(items)
-                    merged = dedupe([*items, *anchored])
+                    merged = await run_file_io(validate_and_merge)
                     if len(merged) > prev_count:
                         items = merged[: int(target_count)]
                     if len(items) >= target_count:
@@ -404,9 +415,10 @@ class LearningWorkflowMixin:
                     raise
                 except (LLMContextOverflowError, LLMOutputBudgetError):
                     if split_depth < 2 and len(target_chunk.text) >= 1_600:
-                        sub_raw = chunk_text(
-                            target_chunk.text,
+                        sub_raw = await run_file_io(
+                            chunk_text, target_chunk.text,
                             max_chars=max(800, len(target_chunk.text) // 2),
+                            label_prefix=target_chunk.locator or fallback_locator,
                         )
                         if len(sub_raw) >= 2:
                             sub_chunks = [
@@ -430,7 +442,7 @@ class LearningWorkflowMixin:
                                     chunk_idx=chunk_idx,
                                     split_depth=split_depth + 1,
                                 )
-                                items = dedupe([*items, *sub_items])[: int(target_count)]
+                                items = (await run_file_io(dedupe, [*items, *sub_items]))[: int(target_count)]
                             break
                     had_shortfall = True
                     use_schema = False
@@ -451,38 +463,52 @@ class LearningWorkflowMixin:
                         attempt + 1,
                         exc_info=True,
                     )
+                finally:
+                    # Report attempt completion even when the chunk needs a retry.
+                    fractions[chunk_idx] = max(
+                        fractions[chunk_idx], min(0.9, (attempt + 1) / (max_attempts + 1))
+                    )
+                    progress_changed.set()
             return items
 
         async def one(index: int) -> list[dict[str, Any]]:
-            nonlocal progress_task
             chunk = chunks[index]
             count = counts[index]
             items = await _generate_piece(chunk, count, chunk_idx=index)
             if len(items) < count:
                 state["failed"] += 1
+            fractions[index] = 0.0
             state["done"] += 1
-            if progress_task is None or progress_task.done():
-                progress_task = asyncio.create_task(report_progress())
+            progress_changed.set()
             return items
 
-        tasks = [asyncio.create_task(one(index)) for index in active]
+        # One reporter owns the placeholder throughout the whole generation.
+        progress_task = asyncio.create_task(report_progress())
+        results: list[list[dict[str, Any]]] = [[] for _ in active]
+        next_index = iter(enumerate(active))
+
+        async def worker() -> None:
+            for position, index in next_index:
+                results[position] = await one(index)
+
+        # A fixed worker count bounds chunk calls without nesting semaphores.
+        tasks = [asyncio.create_task(worker()) for _ in range(min(concurrency, total))]
         try:
-            results = await asyncio.gather(*tasks)
-            if progress_task is not None:
-                try:
-                    await asyncio.wait_for(
-                        progress_task,
-                        timeout=self.deps.learning_progress_edit_timeout_seconds,
-                    )
-                except asyncio.TimeoutError:
-                    logger.debug("final learning progress edit timed out")
+            await asyncio.gather(*tasks)
+            finished = True
+            progress_changed.set()
+            try:
+                await asyncio.wait_for(progress_task, timeout=edit_timeout * 2)
+            except asyncio.TimeoutError:
+                logger.debug("final learning progress edit timed out")
         except BaseException:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            if progress_task is not None:
-                progress_task.cancel()
-                await asyncio.gather(progress_task, return_exceptions=True)
+            finished = True
+            progress_changed.set()
+            progress_task.cancel()
+            await asyncio.gather(progress_task, return_exceptions=True)
             raise
         return [item for group in results for item in group], state["failed"]
 
@@ -567,14 +593,15 @@ class LearningWorkflowMixin:
                 ),
             )
             placeholder = progress
-            items, failures = await self._generate_chunks(
-                kind=kind,
-                chunks=chunks,
-                counts=counts,
-                placeholder=progress,
-                stage=f"در حال تولید {label}",
-            )
-            items = dedupe_cards(items) if kind == "deck" else dedupe_questions(items)
+            async with self._learning_global_semaphore:
+                items, failures = await self._generate_chunks(
+                    kind=kind,
+                    chunks=chunks,
+                    counts=counts,
+                    placeholder=progress,
+                    stage=texts.LEARNING_PRODUCING.format(label=label),
+                )
+            items = await run_file_io(dedupe_cards if kind == "deck" else dedupe_questions, items)
             await progress.update(
                 94,
                 "اعتبارسنجی و آماده‌سازی پیش‌نمایش",
@@ -608,9 +635,21 @@ class LearningWorkflowMixin:
                 "created_at": self.deps.monotonic(),
             }
             self._curation[user_id] = state
-            if not await self._render_curation(progress.message, user_id):
-                raise RuntimeError("curation preview was not delivered")
+            delivered = await self._render_curation(progress.message, user_id)
             self._schedule_curation_expiry(user_id, state)
+            if not delivered:
+                state["delivery_failed"] = True
+                try:
+                    await event.respond(
+                        texts.CURATION_DELIVERY_RETRY,
+                        buttons=[[Button.inline(
+                            texts.CURATION_RESUME_BUTTON,
+                            f"{self._curation_prefix(kind)}:cur:resume".encode("ascii"),
+                        )]],
+                    )
+                except Exception:
+                    METRICS.record_curation_delivery_error()
+                    logger.warning("could not send curation retry notice user=%s", user_id)
         except BaseException as exc:
             if state is not None and self._curation.get(user_id) is state:
                 self._curation.pop(user_id, None)
@@ -814,8 +853,10 @@ class LearningWorkflowMixin:
         keyboard = self._curation_keyboard(state, page)
         try:
             await message.edit(rendered_text, buttons=keyboard)
+            state["delivery_failed"] = False
             return True
         except MessageNotModifiedError:
+            state["delivery_failed"] = False
             return True
         except FloodWaitError as exc:
             wait_seconds = float(getattr(exc, "seconds", 0) or 0)
@@ -823,24 +864,33 @@ class LearningWorkflowMixin:
                 await asyncio.sleep(wait_seconds)
                 try:
                     await message.edit(rendered_text, buttons=keyboard)
+                    state["delivery_failed"] = False
                     return True
                 except MessageNotModifiedError:
+                    state["delivery_failed"] = False
                     return True
                 except Exception:
-                    logger.warning("could not render curation preview after flood wait", exc_info=True)
-                    return False
-            logger.warning("curation preview rate-limited seconds=%s", wait_seconds)
-            return False
-        except MessageIdInvalidError:
+                    METRICS.record_curation_delivery_error()
+            else:
+                METRICS.record_curation_delivery_error()
+        except Exception:
+            METRICS.record_curation_delivery_error()
+        # A bad edit must not destroy a paid generation; send a fresh message.
+        for attempt in range(2):
             try:
-                await self.client.send_message(user_id, rendered_text, buttons=keyboard)
+                respond = getattr(message, "respond", None)
+                if callable(respond):
+                    await respond(rendered_text, buttons=keyboard)
+                else:
+                    await self.client.send_message(user_id, rendered_text, buttons=keyboard)
+                state["delivery_failed"] = False
                 return True
             except Exception:
-                logger.warning("could not send fallback curation preview", exc_info=True)
-                return False
-        except Exception:
-            logger.warning("could not render curation preview", exc_info=True)
-            return False
+                METRICS.record_curation_delivery_error()
+                if attempt == 0:
+                    await asyncio.sleep(1)
+        logger.warning("could not deliver curation preview user=%s", user_id)
+        return False
 
     async def _cancel_curation(self, event: Any, user_id: int) -> None:
         state = self._curation.get(user_id)
@@ -862,6 +912,23 @@ class LearningWorkflowMixin:
             [[Button.inline("📚 کتابخانه من", b"library")]],
         )
 
+    def _protected_curation_items(self, user_id: int) -> tuple[int, ...]:
+        state = self._curation.get(user_id)
+        if not state:
+            return ()
+        return (int(state["item_id"]),)
+
+    async def _curation_source_missing(self, event: Any, user_id: int, state: dict[str, Any]) -> None:
+        METRICS.record_curation_source_missing()
+        await self._release_curation(user_id, state)
+        if not state.get("refund_ok", True):
+            message = LEARNING_REFUND_PENDING_NOTICE
+        elif state.get("charged"):
+            message = texts.CURATION_SOURCE_REMOVED
+        else:
+            message = texts.CURATION_SOURCE_REMOVED_FREE
+        await self._edit(event, message, [[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]])
+
     async def _save_curation(self, event: Any, user_id: int) -> None:
         state = self._curation.get(user_id)
         if self._curation_stale(state):
@@ -879,6 +946,13 @@ class LearningWorkflowMixin:
                 alert=True,
             )
             return
+        if await self.db.library_item(user_id, int(state["item_id"])) is None:
+            await self._curation_source_missing(event, user_id, state)
+            return
+        requested = int(state["requested"])
+        cost = int(state["cost"])
+        refund = ((cost * (requested - len(items)) + requested - 1) // requested
+                  if state.get("charged") and len(items) < requested else 0)
         try:
             if state["kind"] == "deck":
                 artifact_id = await self.db.deck_create_with_cards(
@@ -892,6 +966,7 @@ class LearningWorkflowMixin:
                     paid_charge_id=(
                         state.get("claim_id") if state.get("charged") else None
                     ),
+                    refund_seconds_value=refund,
                 )
             else:
                 artifact_id = await self.db.quiz_create_session(
@@ -904,8 +979,13 @@ class LearningWorkflowMixin:
                     paid_charge_id=(
                         state.get("claim_id") if state.get("charged") else None
                     ),
+                    refund_seconds_value=refund,
                 )
         except BaseException as exc:
+            if (isinstance(exc, sqlite3.IntegrityError)
+                    and await self.db.library_item(user_id, int(state["item_id"])) is None):
+                await self._curation_source_missing(event, user_id, state)
+                return
             await self._release_curation(user_id, state)
             if isinstance(
                 exc, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
@@ -931,9 +1011,12 @@ class LearningWorkflowMixin:
         timer = self._curation_tasks.pop(user_id, None)
         if timer is not None:
             timer.cancel()
+        refund_notice = ("\n" + texts.LEARNING_PRORATA_REFUND.format(
+            duration=format_duration(refund)
+        )) if refund else ""
         if state["kind"] == "deck":
             deck = await self.db.deck_get(artifact_id, user_id)
-            await self._ack(event, "✅ مجموعه ذخیره شد.")  # type: ignore[attr-defined]
+            await self._ack(event, texts.LEARNING_DECK_SAVED + refund_notice)  # type: ignore[attr-defined]
             if deck is None:
                 await self._edit(  # type: ignore[attr-defined]
                     event,
@@ -947,7 +1030,7 @@ class LearningWorkflowMixin:
                     self._deck_keyboard(artifact_id, bool(items)),
                 )
         else:
-            await self._ack(event, "✅ آزمون آماده است.")  # type: ignore[attr-defined]
+            await self._ack(event, texts.LEARNING_QUIZ_READY + refund_notice)  # type: ignore[attr-defined]
             await self._render_question_message(event, user_id, artifact_id)
 
     async def _handle_curation_callback(
@@ -1128,7 +1211,7 @@ class LearningWorkflowMixin:
                 "item_id": int(item_id),
                 "doc_id": None,
                 "title": self._item_display_title(item),
-                "chunks": self._learning_chunks(content),
+                "chunks": await run_file_io(self._learning_chunks, content),
             },
             wanted=int(count),
             cost=int(count) * self.settings.quiz_cost_seconds_per_question,
@@ -1597,11 +1680,11 @@ class LearningWorkflowMixin:
     def _deck_size_and_cost(self, preset: str | None) -> tuple[int, int]:
         base_size = int(self.settings.flashcard_ai_deck_size)
         base_cost = int(self.settings.flashcard_ai_cost_seconds)
-        if not preset:
+        if preset is None:
             return base_size, base_cost
         cards = preset_cards(str(preset))
         if cards is None:
-            return base_size, base_cost
+            raise ValueError("invalid flashcard preset")
         return cards, self._preset_cost(base_cost, cards, base_size)
 
     async def _flashcard_generate_locked(
@@ -1622,7 +1705,7 @@ class LearningWorkflowMixin:
                 "item_id": int(item_id),
                 "doc_id": None,
                 "title": item_title,
-                "chunks": self._learning_chunks(content),
+                "chunks": await run_file_io(self._learning_chunks, content),
             },
             wanted=size,
             cost=cost,
@@ -1761,9 +1844,15 @@ class LearningWorkflowMixin:
             self._pending_flashcard[user_id] = (deck_id, "front")
             await event.reply(FLASHCARD_ASK_FRONT, buttons=end_button)
             return
-        count = await self.db.deck_add_card(
-            deck_id, front, text[:MAX_MANUAL_BACK_CHARS]
-        )
+        try:
+            count = await self.db.deck_add_card(
+                deck_id, front, text[:MAX_MANUAL_BACK_CHARS],
+                max_cards=self.settings.flashcard_max_cards_per_deck,
+            )
+        except FlashcardLimitError:
+            self._pending_flashcard.pop(user_id, None)
+            await event.reply(texts.FLASHCARD_CARD_LIMIT)
+            return
         self._pending_flashcard[user_id] = (deck_id, "front")
         await event.reply(
             f"کارت اضافه شد ({to_persian_digits(count)} کارت). "
@@ -2029,6 +2118,9 @@ class LearningWorkflowMixin:
                 await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
                 return
             preset = parts[3] if len(parts) == 4 else None
+            if preset is not None and preset_cards(preset) is None:
+                await self._ack(event, texts.INVALID_LEARNING_SIZE, alert=True)
+                return
             if not await self._require_membership(
                 event, user_id, kind="callback", callback_data=data
             ):
@@ -2058,6 +2150,10 @@ class LearningWorkflowMixin:
             elif action == "study":
                 await self._study_front(event, user_id, deck_id)
             elif action == "exp":
+                if not await self._require_membership(
+                    event, user_id, kind="callback", callback_data=data
+                ):
+                    return
                 await self._export_deck_docx(event, user_id, deck_id)
             elif action == "del":
                 deck = await self.db.deck_get(deck_id, user_id)

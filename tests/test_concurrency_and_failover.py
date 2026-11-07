@@ -9,6 +9,7 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 import sys
+import sqlite3
 import tempfile
 import time
 from types import SimpleNamespace
@@ -555,6 +556,58 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
         stt.reset_cooldowns()
         llm.reset_cooldowns()
         self._tmp.cleanup()
+
+    async def test_read_retries_locked_error(self):
+        from gamas_bot.db_core import _rows
+
+        connection = mock.Mock()
+        connection.execute_fetchall = mock.AsyncMock(
+            side_effect=[sqlite3.OperationalError("database is locked"), [(1,)]]
+        )
+        with mock.patch.object(METRICS, "record_db_error") as record:
+            self.assertEqual(await _rows(connection, "SELECT 1"), [(1,)])
+        record.assert_called_once_with()
+        self.assertEqual(connection.execute_fetchall.await_count, 2)
+
+    async def test_connection_memory_pragmas(self):
+        for connection, settings in (
+            (self.db.db, {"cache_size": -8000, "journal_size_limit": 33554432}),
+            (self.db.read_db, {"cache_size": -16000, "mmap_size": 134217728,
+                               "journal_size_limit": 33554432}),
+        ):
+            for name, expected in settings.items():
+                rows = await connection.execute_fetchall(f"PRAGMA {name}")
+                self.assertEqual(rows[0][0], expected)
+
+    async def test_shutdown_queued_notification_references_original_message(self):
+        await self.db.ensure_user(1234)
+        submission = await self.db.create_submission(1234, "audio", "x.mp3")
+        event = FakeJobEvent(chat_id=1234)
+        self.bot.client = event.client
+        message_id = event.message.id
+        self.bot.queue.submit(Job(submission, 1234, "audio", "x.mp3", message=event.message))
+        await self.bot.shutdown()
+        from gamas_bot.progress import to_persian_digits
+        self.assertTrue(any(to_persian_digits(message_id) in text for text in event.replies))
+
+    async def test_stray_transaction_rollback_is_reported(self):
+        await self.db.db.execute("BEGIN")
+        with self.assertLogs("gamas_bot.db.core", level="WARNING") as logs:
+            async with self.db._transaction():
+                pass
+        self.assertIn("discarded uncommitted transaction", logs.output[0])
+
+    async def test_pending_gate_action_is_taken_once_concurrently(self):
+        await self.db.ensure_user(1234)
+        await self.db.save_pending_gate_action(
+            1234, chat_id=1234, message_id=7, kind="callback", callback_data="quiz:go"
+        )
+        results = await asyncio.gather(
+            self.db.take_pending_gate_action(1234),
+            self.db.take_pending_gate_action(1234),
+        )
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertEqual(next(result for result in results if result)["message_id"], 7)
 
     async def test_multiple_users_run_concurrently_with_complete_output_isolation(self):
         users = [1001, 1002, 1003, 1004]

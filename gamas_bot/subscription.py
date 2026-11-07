@@ -309,7 +309,7 @@ class SubscriptionService:
         finally:
             self._inflight.pop(user_id, None)
 
-        if allow_cache and not force:
+        if allow_cache:
             if result.state == STATE_MEMBER and result.status:
                 self._cache[user_id] = (result.status, time.monotonic())
             else:
@@ -372,11 +372,15 @@ class SubscriptionService:
         )
         return MembershipResult(STATE_UNKNOWN, None, detail or last_error or "unavailable")
 
-    async def record_result(self, user_id: int, result: MembershipResult) -> None:
+    async def record_result(
+        self, user_id: int, result: MembershipResult, *, touch_checked_at: bool = False
+    ) -> None:
         """Persist one observed membership result (used by the sweep too)."""
-        await self._record(user_id, result)
+        await self._record(user_id, result, touch_checked_at=touch_checked_at)
 
-    async def _record(self, user_id: int, result: MembershipResult) -> None:
+    async def _record(
+        self, user_id: int, result: MembershipResult, *, touch_checked_at: bool = False
+    ) -> None:
         if result.state == STATE_MEMBER:
             status = "member"
             verified_at = iso(utc_now())
@@ -384,7 +388,10 @@ class SubscriptionService:
             status = result.status or result.state
             verified_at = None
         try:
-            await self.db.set_subscription_state(user_id, status, verified_at=verified_at)
+            await self.db.set_subscription_state(
+                user_id, status, verified_at=verified_at,
+                checked_at=iso(utc_now()) if touch_checked_at else None,
+            )
         except Exception:  # noqa: BLE001 - observability must never break a request
             logger.debug("could not record subscription state user=%s", user_id, exc_info=True)
 
@@ -479,7 +486,7 @@ class SubscriptionService:
 
     async def handle_check(self, event, user_id: int) -> None:
         """Fresh membership check triggered by the user."""
-        result = await self.check_membership(user_id, force=True, allow_cache=False)
+        result = await self.check_membership(user_id, force=True)
         if result.is_member:
             await self._record(user_id, result)
             await self.bot._ack(event)

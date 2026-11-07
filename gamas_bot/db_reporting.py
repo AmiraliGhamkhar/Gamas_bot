@@ -10,6 +10,7 @@ from typing import Any
 
 from .db_core import _rows, iso
 from .db_users import UsersRepositoryMixin
+from .metrics import METRICS
 
 logger = logging.getLogger("gamas_bot.db.reporting")
 
@@ -42,10 +43,61 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
         ("hold_allocations", "submission_id", "holds", "submission_id"),
         ("hold_allocations", "credit_id", "ledger", "id"),
         ("holds", "submission_id", "submissions", "submission_id"),
+        ("retired_holds", "submission_id", "submissions", "submission_id"),
+        ("library_items", "submission_id", "submissions", "submission_id"),
+        ("ledger", "submission_id", "submissions", "submission_id"),
         ("ledger", "payment_id", "payments", "payment_id"),
         ("documents", "library_item_id", "library_items", "item_id"),
         ("learning_charges", "debit_id", "ledger", "id"),
     )
+
+    async def expire_retained_data(self, kind: str, days: int, *, batch: int = 500) -> int:
+        """Delete one bounded batch; active artifacts and live document mirrors survive."""
+        if days <= 0:
+            return 0
+        predicates = {
+            "documents": ("documents", "id", "created_at < ? AND library_item_id IS NULL"),
+            "learning": ("quiz_sessions", "session_id", "updated_at < ? AND status IN ('done','quit','expired')"),
+            "audit": ("audit", "id", "created_at < ?"),
+            "holds": ("holds", "submission_id", "released_at IS NOT NULL AND released_at < ?"),
+        }
+        if kind not in predicates:
+            raise ValueError("unknown retention kind")
+        table, key, predicate = predicates[kind]
+        cutoff = iso(self._now() - timedelta(days=int(days)))
+        limit = min(500, max(1, int(batch)))
+        async with self._transaction():
+            rows = await _rows(self.db, f"SELECT {key} FROM {table} WHERE {predicate} ORDER BY {key} LIMIT ?", (cutoff, limit))
+            ids = [row[0] for row in rows]
+            if not ids:
+                return 0
+            placeholders = ",".join("?" for _ in ids)
+            if kind == "holds":
+                # Preserve the idempotency marker and delivery semantics after details expire.
+                await self.db.execute(
+                    f"INSERT OR IGNORE INTO retired_holds(submission_id, release_reason, settled) "
+                    f"SELECT submission_id, release_reason, settled FROM holds WHERE submission_id IN ({placeholders})",
+                    ids,
+                )
+                await self.db.execute(f"DELETE FROM hold_allocations WHERE submission_id IN ({placeholders})", ids)
+            cursor = await self.db.execute(f"DELETE FROM {table} WHERE {key} IN ({placeholders})", ids)
+            count = max(0, cursor.rowcount)
+        METRICS.record_retention_deleted(kind, count)
+        return count
+
+    async def maintenance(self, *, optimize: bool = False) -> None:
+        """Checkpoint/optimize under the writer lock (SQLite forbids checkpoint in a transaction)."""
+        if str(self.path) == ":memory:":
+            return
+        async with self._write_lock:
+            try:
+                await self.db.execute_fetchall("PRAGMA wal_checkpoint(PASSIVE)")
+                if optimize:
+                    await self.db.execute("PRAGMA analysis_limit=400")
+                    await self.db.execute("PRAGMA optimize")
+            except sqlite3.Error:
+                METRICS.record_retention_error()
+                raise
 
     DELIVERED_STATUSES = ("done", "partial")
     UNDELIVERED_STATUSES = ("failed", "rejected")
@@ -102,7 +154,10 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
                 problems.append(f"missing INTEGER column: {table}.{column}")
                 continue
             fks = await _rows(self.read_db, f"PRAGMA foreign_key_list({table})")
-            if not any(
+            # Legacy library items have a logical submission link but no
+            # declared FK; inspect orphans without rebuilding applied schema.
+            logical_only = (table, column) == ("library_items", "submission_id")
+            if not logical_only and not any(
                 row[2] == parent and row[3] == column and row[4] == parent_column
                 for row in fks
             ):

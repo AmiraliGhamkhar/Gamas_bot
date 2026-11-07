@@ -15,6 +15,7 @@ import os
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -171,6 +172,16 @@ class ReceiptBookkeepingTests(_BotHarness):
         self.assertIsNone(payment["receipt_path"])
         actions = [row["action"] for row in await self.db.recent_audit(10)]
         self.assertIn("receipt_expired", actions)
+
+    async def test_receipt_cleanup_uses_utc_timestamps(self):
+        path = self.settings.receipt_dir / "receipt-utc-old.jpg"
+        path.write_bytes(b"jpeg")
+        os.utime(path, (1, 1))
+        with mock.patch("gamas_bot.bot_wallet.datetime", wraps=datetime) as clock:
+            await self.bot._cleanup_expired_receipts()
+        clock.now.assert_called_once_with(timezone.utc)
+        clock.fromtimestamp.assert_called_once_with(1.0, timezone.utc)
+        self.assertFalse(path.exists())
 
     async def test_retention_never_deletes_a_receipt_still_awaiting_review(self):
         await self.db.sync_plans([

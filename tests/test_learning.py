@@ -13,6 +13,7 @@ import random
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -37,6 +38,7 @@ from gamas_bot.llm import LLMError
 from tests.support import (
     FakeCallbackEvent,
     FakeTelegramClient,
+    FakeSentMessage,
     docx_text,
     make_settings,
 )
@@ -120,6 +122,15 @@ class LearningHelperTests(unittest.TestCase):
         # The correct *text* must follow the shuffle, whatever its new index.
         self.assertEqual(question["options"][question["correct_index"]], "سه")
         self.assertEqual(len(question["options"]), 4)
+
+    def test_three_option_numeric_keys_are_dropped_with_debug_log(self):
+        payload = {"questions": [
+            {"question": f"question {i}", "options": ["one", "two", "three"],
+             "correct": i, "explain": "reason"} for i in (1, 2, 3)
+        ]}
+        with self.assertLogs("gamas_bot.learning", level="DEBUG") as logs:
+            self.assertEqual(parse_quiz_payload(payload, 3), [])
+        self.assertEqual(len(logs.output), 3)
 
     def test_quiz_payload_respects_requested_count(self):
         parsed = parse_quiz_payload(quiz_payload(10), 3, rng=random.Random(1))
@@ -210,6 +221,15 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         ]
         return await self.db.quiz_create_session(OWNER, self.item_id, questions)
 
+    async def test_batched_questions_roll_back_on_bad_item(self):
+        questions = [{"question": f"q {i}", "options": ["a", "b", "c", "d"],
+                      "correct_index": 0} for i in range(500)]
+        questions[250] = {"question": "missing options"}
+        with self.assertRaises(ValueError):
+            await self.db.quiz_create_session(OWNER, self.item_id, questions)
+        for table in ("quiz_sessions", "quiz_questions"):
+            self.assertEqual((await self.db.db.execute_fetchall(f"SELECT COUNT(*) FROM {table}"))[0][0], 0)
+
     async def test_full_answer_flow_scores_points_and_ranks(self):
         session_id = await self._create_session()
         first = await self.db.quiz_current_question(session_id)
@@ -243,6 +263,24 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
             "SELECT COUNT(*) FROM quiz_answers WHERE session_id = ?", (session_id,)
         )
         self.assertEqual(rows[0][0], 3)
+
+    async def test_answer_insert_integrity_error_rolls_back(self):
+        session_id = await self._create_session()
+        question = await self.db.quiz_current_question(session_id)
+        execute = self.db.db.execute
+
+        async def fail_insert(sql, *args):
+            if sql.startswith("INSERT INTO quiz_answers"):
+                raise sqlite3.IntegrityError("duplicate")
+            return await execute(sql, *args)
+
+        with mock.patch.object(self.db.db, "execute", side_effect=fail_insert), \
+             mock.patch.object(self.db.db, "rollback", wraps=self.db.db.rollback) as rollback:
+            result = await self.db.quiz_record_answer(session_id, question["question_id"], 0)
+        self.assertEqual(result["status"], "already")
+        rollback.assert_awaited_once()
+        self.assertEqual((await self.db.quiz_get_session(session_id, OWNER))["current_index"], 0)
+        self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 0)
 
     async def test_double_answer_is_rejected_once_and_never_double_scores(self):
         session_id = await self._create_session()
@@ -465,6 +503,28 @@ class FlashcardDatabaseTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self._tmp.cleanup()
 
+    async def test_batched_cards_preserve_order_and_roll_back_on_bad_item(self):
+        cards = [{"front": f"front {i}", "back": f"back {i}"} for i in range(500)]
+        broken = cards[:250] + [{"front": "missing back"}] + cards[251:]
+        with self.assertRaises(ValueError):
+            await self.db.deck_create_with_cards(OWNER, self.item_id, "broken", broken)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertEqual((await self.db.db.execute_fetchall("SELECT COUNT(*) FROM flashcards"))[0][0], 0)
+        deck_id = await self.db.deck_create_with_cards(OWNER, self.item_id, "complete", cards)
+        rows = await self.db.deck_cards(deck_id)
+        self.assertEqual([row["front"] for row in rows], [card["front"] for card in cards])
+
+    async def test_manual_card_limit_is_atomic(self):
+        from gamas_bot.db_learning import FlashcardLimitError
+        deck = await self.db.manual_deck_get_or_create(OWNER)
+        results = await asyncio.gather(
+            self.db.deck_add_card(deck, "a", "a", max_cards=1),
+            self.db.deck_add_card(deck, "b", "b", max_cards=1),
+            return_exceptions=True,
+        )
+        self.assertEqual(sum(isinstance(result, FlashcardLimitError) for result in results), 1)
+        self.assertEqual(len(await self.db.deck_cards(deck)), 1)
+
     async def test_deck_lifecycle_and_cascade(self):
         deck_id = await self.db.deck_create(OWNER, self.item_id, "دسته", "ai")
         for index in range(3):
@@ -622,6 +682,175 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(card["source"] == "بخش ۱" for card in cards))
         self.assertNotIn("صفحهٔ ۹۹", " ".join(card["source"] for card in cards))
 
+    async def test_chunk_progress_has_one_reporter_and_starts_before_completion(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        chunks = [DocChunk(i, f"بخش {i}", (f"بخش {i}",), f"متن {i}") for i in range(4)]
+        edits = []
+        active_edits = 0
+        peak_edits = 0
+        completed = 0
+
+        async def edit(_placeholder, done, _total, *, stage):
+            nonlocal active_edits, peak_edits
+            active_edits += 1
+            peak_edits = max(peak_edits, active_edits)
+            edits.append((done, completed))
+            await asyncio.sleep(0.005)
+            active_edits -= 1
+
+        async def provider(*_args, **_kwargs):
+            nonlocal completed
+            await asyncio.sleep(0.02 + completed * 0.002)
+            completed += 1
+            return self._cards_payload(1)
+
+        with mock.patch.object(self.bot, "_progress_edit", side_effect=edit), \
+             mock.patch("gamas_bot.bot.complete_json", side_effect=provider):
+            await self.bot._generate_chunks(
+                kind="deck", chunks=chunks, counts=[1] * 4, placeholder=object(), stage="test"
+            )
+        self.assertEqual(peak_edits, 1)
+        self.assertEqual(edits[0], (0, 0))
+        self.assertEqual(edits[-1][0], 4)
+
+    async def test_manual_card_ceiling_shows_persian_notice(self):
+        self.bot.settings = replace(self.bot.settings, flashcard_max_cards_per_deck=1)
+        deck = await self.db.manual_deck_get_or_create(OWNER)
+        await self.db.deck_add_card(deck, "first", "answer", max_cards=1)
+        self.bot._pending_flashcard[OWNER] = (deck, "back")
+        self.bot._pending_flashcard_front[OWNER] = "second"
+        event = FakeMessageEvent(OWNER, "answer")
+        await self.bot._handle_flashcard_text(event, OWNER, "answer")
+        self.assertTrue(any("حداکثر تعداد کارت" in reply for reply in event.replies))
+        self.assertEqual(len(await self.db.deck_cards(deck)), 1)
+
+    def test_preset_cost_uses_exact_integer_rounding(self):
+        self.assertEqual(self.bot._preset_cost(5, 1, 2), 2)
+        self.assertEqual(self.bot._preset_cost(7, 1, 2), 4)
+        self.assertEqual(self.bot._preset_cost(10**20 + 1, 2, 2), 10**20 + 1)
+
+    async def test_global_learning_generation_concurrency_is_bounded(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        active = 0
+        peak = 0
+        cards = [{"front": f"question {i}", "back": "answer", "source": "بخش ۱"} for i in range(5)]
+
+        async def generate(**_kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.03)
+            active -= 1
+            return cards, 0
+
+        source = {"item_id": self.item_id, "doc_id": None, "title": "test", "chunks": [
+            DocChunk(0, "بخش ۱", ("بخش ۱",), "text")
+        ]}
+        with mock.patch.object(self.bot, "_claim_generation_budget", new=mock.AsyncMock(return_value=(False, False, None))), \
+             mock.patch.object(self.bot, "_generate_chunks", side_effect=generate):
+            await asyncio.gather(*(self.bot._generate_learning(
+                self._event(b"fc:hub", user_id=uid), user_id=uid, kind="deck",
+                source=source, wanted=5, cost=0, note="test", title="test"
+            ) for uid in (OWNER, OTHER, 777)))
+        self.assertEqual(peak, 2)
+
+    async def test_paid_curation_refunds_pro_rata_when_items_removed(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        await self.spend_free_try("deck")
+        source = {"item_id": self.item_id, "doc_id": None, "title": "test", "chunks": [
+            DocChunk(0, "بخش ۱", ("بخش ۱",), "متن درس")
+        ]}
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(20))):
+            await self.bot._generate_learning(self._event(b"fc:hub"), user_id=OWNER, kind="deck",
+                                               source=source, wanted=20, cost=401, note="test", title="test")
+        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 20)
+        for _ in range(15):
+            await self.bot._handle_callback(self._event(b"fc:cur:del:0"))
+        event = self._event(b"fc:cur:save")
+        await self.bot._handle_callback(event)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600 - 401 + 301)
+        self.assertEqual((await self.db.db.execute_fetchall("SELECT status FROM learning_charges"))[0][0], "finalized")
+        refund = (await self.db.db.execute_fetchall(
+            "SELECT seconds, expires_at, note FROM ledger WHERE note LIKE 'refund: pro-rata%'"
+        ))[0]
+        self.assertEqual(refund[0], 301)
+        self.assertIsNotNone(refund[1])
+        self.assertTrue(any("اعتبار بازگشتی" in (answer or "") for answer, _ in event.answers))
+        self.assertEqual(len(await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])), 5)
+
+    async def test_pending_curation_source_is_protected_from_prune(self):
+        await self.spend_free_try("deck")
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
+        await self.db.library_prune(OWNER, 0, protected_item_ids=self.bot._protected_curation_items(OWNER))
+        self.assertIsNotNone(await self.db.library_item(OWNER, self.item_id))
+        await self.save_curation()
+        self.assertEqual(await self.db.deck_count(OWNER), 1)
+
+    async def test_missing_curation_source_refunds_cleanly(self):
+        await self.spend_free_try("deck")
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
+        await self.db.library_prune(OWNER, 0)
+        event = self._event(b"fc:cur:save")
+        await self.bot._handle_callback(event)
+        self.assertTrue(any("منبع این پیش‌نمایش حذف شده بود؛ مبلغ بازگشت داده شد" in edit["text"]
+                            for edit in event.edits))
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+
+    async def test_preview_edit_failure_uses_new_message_and_finalizes(self):
+        await self.spend_free_try("deck")
+        original_edit = FakeSentMessage.edit
+
+        async def fail_preview(message, text="", buttons=None):
+            if text.startswith("🧐 پیش‌نمایش"):
+                raise RuntimeError("edit unavailable")
+            return await original_edit(message, text, buttons=buttons)
+
+        with mock.patch.object(FakeSentMessage, "edit", new=fail_preview), mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))
+        ):
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
+        self.assertTrue(any("پیش‌نمایش" in str(row["text"]) for row in self.client.texts))
+        await self.save_curation()
+        charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
+        self.assertEqual(charges[0][0], "finalized")
+        self.assertEqual(await self.db.available_seconds(OWNER), 3300)
+
+    async def test_undelivered_preview_stays_pending_until_expiry(self):
+        await self.spend_free_try("deck")
+        self.bot.CURATION_TTL_SECONDS = 0.05
+        original_edit = FakeSentMessage.edit
+        original_send = self.client.send_message
+
+        async def fail_preview_edit(message, text="", buttons=None):
+            if text.startswith("🧐 پیش‌نمایش"):
+                raise RuntimeError("edit unavailable")
+            return await original_edit(message, text, buttons=buttons)
+
+        async def fail_preview_send(*args, **kwargs):
+            if len(args) > 1 and str(args[1]).startswith("🧐 پیش‌نمایش"):
+                raise RuntimeError("send unavailable")
+            return await original_send(*args, **kwargs)
+
+        with mock.patch.object(FakeSentMessage, "edit", new=fail_preview_edit), mock.patch.object(
+            self.client, "send_message", new=fail_preview_send
+        ), mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
+            self.assertIn(OWNER, self.bot._curation)
+            charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
+            self.assertEqual(charges[0][0], "pending")
+            self.assertEqual(await self.db.available_seconds(OWNER), 3300)
+            self.assertTrue(any("پیش‌نمایش ارسال نشد" in str(row["text"]) for row in self.client.texts))
+            await self.bot._curation_tasks[OWNER]
+        charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
+        self.assertEqual(charges[0][0], "refunded")
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
+
     async def test_ai_generation_debits_and_builds_deck(self):
         # The paid path: the free first try is already spent, so this deck is
         # charged, previewed, and only written after «✅ ذخیره» (R5.1 curation).
@@ -686,6 +915,25 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
             generator.assert_not_called()
         self.assertIn(LEARNING_NO_CREDIT, self.client.texts[-1]["text"])
 
+    async def test_batch_insert_500_questions_preserves_order(self):
+        questions = [{"question": f"Question {i}", "options": ["a", "b", "c", "d"],
+                      "correct_index": 0, "explanation": ""} for i in range(500)]
+        session = await self.db.quiz_create_session(OWNER, self.item_id, questions)
+        rows = await self.db.db.execute_fetchall(
+            "SELECT idx, question FROM quiz_questions WHERE session_id=? ORDER BY idx", (session,)
+        )
+        self.assertEqual([(row[0], row[1]) for row in rows],
+                         [(i, f"Question {i}") for i in range(500)])
+
+    async def test_invalid_flashcard_preset_is_rejected_before_generation(self):
+        event = self._event(b"fc:go:1:bogus")
+        before = await self.db.available_seconds(OWNER)
+        await self.bot._handle_callback(event)
+        self.assertTrue(any(alert and "نامعتبر" in (message or "")
+                            for message, alert in event.answers))
+        self.assertEqual(await self.db.available_seconds(OWNER), before)
+        self.assertEqual(await self.db.decks_list(OWNER), [])
+
     async def test_hub_empty_state_and_manual_guided_flow_with_disarm(self):
         hub = self._event(b"fc:hub")
         await self.bot._handle_callback(hub)
@@ -705,6 +953,8 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         done = self._event(b"fc:man:done")
         await self.bot._handle_callback(done)
         self.assertNotIn(OWNER, self.bot._pending_flashcard)
+        self.assertTrue(any("ساخت کارت پایان یافت" in str(reply) for reply in done.client.texts))
+        self.assertTrue(done.edits)
         cards = await self.db.deck_cards(deck_id)
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0]["front"], "پرسش دستی یکم؟")
@@ -755,6 +1005,19 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         restart = self._event(f"fc:restart:{deck_id}".encode())
         await self.bot._handle_callback(restart)
         self.assertEqual((await self.db.deck_get(deck_id, OWNER))["study_cursor"], 0)
+
+    async def test_flashcard_export_requires_membership(self):
+        self.bot.subscription.settings = replace(self.bot.subscription.settings, subscription_required=True)
+        self.bot.subscription.db = self.db
+        async def nonmember(_user_id):
+            return "left"
+        self.bot.subscription._resolver = nonmember
+        deck_id = await self.db.deck_create(OWNER, None, "deck", "manual")
+        await self.db.deck_add_card(deck_id, "front", "back")
+        export = self._event(f"fc:exp:{deck_id}".encode())
+        await self.bot._handle_callback(export)
+        self.assertFalse(self.client.deliveries)
+        self.assertTrue(any("عضویت" in edit["text"] for edit in export.edits))
 
     async def test_word_export_delivers_rtl_docx_and_removes_the_temp_file(self):
         deck_id = await self.db.deck_create(OWNER, None, "دسته آزمون", "manual")
@@ -865,6 +1128,30 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
     @staticmethod
     def _labels(buttons) -> list[str]:
         return [button.text for row in buttons for button in row]
+
+    async def test_paid_quiz_generation_shortfall_refunds_on_save(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        await self.spend_free_try()
+        source = {"item_id": self.item_id, "doc_id": None, "title": "test", "chunks": [
+            DocChunk(0, "بخش ۱", ("بخش ۱",), "متن درس")
+        ]}
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
+            await self.bot._generate_learning(
+                self._event(b"quiz:hub"), user_id=OWNER, kind="quiz", source=source,
+                wanted=10, cost=401, note="test", title="test",
+            )
+        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 5)
+        event = self._event(b"quiz:cur:save")
+        await self.bot._handle_callback(event)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600 - 401 + 201)
+        self.assertEqual((await self.db.db.execute_fetchall(
+            "SELECT status FROM learning_charges"
+        ))[0][0], "finalized")
+        self.assertEqual((await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM quiz_questions"
+        ))[0][0], 5)
+        self.assertTrue(any("اعتبار بازگشتی" in (answer or "") for answer, _ in event.answers))
 
     async def test_quiz_start_screen_shows_three_costs(self):
         event = self._event(f"quiz:new:{self.item_id}".encode())
@@ -1034,7 +1321,8 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
         self.assertEqual(len(calls), 2)
         # The repair prompt asks for the missing two, not for five again.
-        self.assertIn("۲ سؤال", calls[1]["system"])
+        self.assertIn("۲ سؤال", calls[1]["user"])
+        self.assertEqual(calls[0]["system"], calls[1]["system"])
         state = self.bot._curation[OWNER]
         self.assertEqual(len(state["items"]), 5)
         self.assertEqual(state["failures"], 0)
@@ -1486,8 +1774,10 @@ class QuizDifficultyPromptTests(unittest.TestCase):
         self.assertIn("۶۰٪", prompt)
         self.assertIn("سخت", prompt)
         # 40% of 10 = 4 medium, 6 hard (Persian digits).
-        self.assertIn("۴ متوسط", prompt)
-        self.assertIn("۶ سخت", prompt)
+        from gamas_bot.learning import learning_user_prompt
+        dynamic = learning_user_prompt("quiz", 10, (), "text")
+        self.assertIn("۴ متوسط", dynamic)
+        self.assertIn("۶ سخت", dynamic)
 
     def test_prompt_mixes_recall_comprehension_and_application(self):
         prompt = quiz_system_prompt(5)
@@ -1524,8 +1814,10 @@ class QuizDifficultyPromptTests(unittest.TestCase):
 
     def test_prompt_is_deterministic_and_count_aware(self):
         self.assertEqual(quiz_system_prompt(5), quiz_system_prompt(5))
-        self.assertIn("۵ سؤال", quiz_system_prompt(5))
-        self.assertIn("۱۵ سؤال", quiz_system_prompt(15))
+        from gamas_bot.learning import learning_user_prompt
+        self.assertEqual(quiz_system_prompt(5), quiz_system_prompt(15, sources=("other",)))
+        self.assertIn("۵ سؤال", learning_user_prompt("quiz", 5, (), ""))
+        self.assertIn("۱۵ سؤال", learning_user_prompt("quiz", 15, (), ""))
 
 
 class QuizDifficultyParserTests(unittest.TestCase):
@@ -1711,8 +2003,9 @@ class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
         # 1) The harder prompt and the real fixture booklet reach the model.
         call = generator.await_args
         self.assertIn("متوسط تا سخت", call.kwargs["system"])
-        self.assertIn("۴ متوسط", call.kwargs["system"])
-        self.assertIn("۶ سخت", call.kwargs["system"])
+        self.assertIn("۴ متوسط", call.kwargs["user"])
+        self.assertIn("۶ سخت", call.kwargs["user"])
+        self.assertEqual(call.kwargs["max_output_tokens"], 4096)
         self.assertIn("سناریو", call.kwargs["system"])
         self.assertIn("همهٔ موارد فوق", call.kwargs["system"])
         self.assertIn("difficulty", call.kwargs["schema"]["properties"]
@@ -1762,8 +2055,16 @@ class AnchoredQualityTests(unittest.TestCase):
         self.assertGreater(counts[-1], counts[0])
         counts = distribute_counts(5, [1] * 20)
         self.assertEqual(sum(counts), 5)
-        self.assertEqual(sum(count == 0 for count in counts), 15)
-        self.assertGreater(max(i for i, count in enumerate(counts) if count), 15)
+        self.assertLessEqual(sum(count > 0 for count in counts), 2)
+        counts = distribute_counts(40, [56000] * 90)
+        self.assertEqual(sum(counts), 40)
+        self.assertLessEqual(sum(count > 0 for count in counts), 8)
+        for total in range(100):
+            for weights in ([1] * 90, [1, 1, 10000], []):
+                counts = distribute_counts(total, weights)
+                self.assertLessEqual(sum(counts), total)
+                if weights:
+                    self.assertEqual(sum(counts), total)
 
     def test_normalized_near_duplicates_drop_but_distinct_numbers_survive(self):
         from gamas_bot.learning import dedupe_cards, dedupe_questions
@@ -1788,15 +2089,16 @@ class AnchoredQualityTests(unittest.TestCase):
         legacy["questions"][0]["difficulty"] = "hard"
         self.assertEqual(len(parse_quiz_payload(legacy, 1, require_difficulty=True, require_source=True)), 1)
 
-    def test_json_examples_use_only_the_allowed_source(self):
-        from gamas_bot.learning import flashcard_system_prompt
+    def test_static_json_examples_and_dynamic_allowed_sources(self):
+        from gamas_bot.learning import flashcard_system_prompt, learning_user_prompt
 
-        for key, prompt in (
-            ("cards", flashcard_system_prompt(10, sources=("اسلاید ۲",))),
-            ("questions", quiz_system_prompt(5, sources=("بخش «مبحث»",))),
+        for key, prompt, locator in (
+            ("cards", flashcard_system_prompt(10, sources=("اسلاید ۲",)), "اسلاید ۲"),
+            ("questions", quiz_system_prompt(5, sources=("بخش «مبحث»",)), "بخش «مبحث»"),
         ):
             example = json.loads(prompt[prompt.rindex('{"' + key + '"'):])
-            self.assertEqual(example[key][0]["source"], "اسلاید ۲" if key == "cards" else "بخش «مبحث»")
+            self.assertEqual(example[key][0]["source"], "نشانگر منبع")
+            self.assertIn(locator, learning_user_prompt("deck" if key == "cards" else "quiz", 5, (locator,), "text"))
 
     def test_difficulty_is_recorded_but_never_causes_rejection(self):
         """S5: the tag is metadata. A Persian label is mapped, an unknown one ignored."""

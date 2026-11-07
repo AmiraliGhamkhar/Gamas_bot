@@ -2,6 +2,54 @@
 
 Concise history; detailed patches and earlier notes remain in Git history.
 
+## Unreleased — hardening
+
+- WO-BC-1: confirm broadcasts, serialize runs, show progress, and support graceful stop.
+- WO-BC-2: resume hashed-text broadcasts with filtered keyset checkpoints and bounded flood handling.
+- WO-BC-3: track permanent recipient failures and skip repeatedly unreachable users.
+- WO-SUB-2: record sweep membership and check timestamp in one update.
+- WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
+- WO-PAY-2: fingerprint normalized receipts and warn admins about reuse.
+- WO-PAY-6: document environment-only plan editing and legacy custom-plan protection.
+- WO-PAY-5: edit the wallet screen in place when opening an existing order.
+- WO-PAY-3: surface older open orders and clamp wallet history pages.
+- WO-PAY-4: record cancellation actors, expose cancelled orders and use UTC receipt retention.
+- WO-CAP-2: document a conservative 2 GB cPanel profile.
+- WO-CAP-3: include the original Telegram message ID in queued-job restart notices.
+- WO-CAP-1: lower document upload and cumulative Office expansion defaults.
+- WO-SUP-4: expire abandoned support prompts and handle admin reply permission errors.
+- WO-SUP-1: atomically limit open support tickets and enforce a creation cooldown.
+- WO-SUP-3: confirm user ticket closures before closing or notifying staff.
+- WO-SUP-2: retain full support openers while deriving a bounded first-line subject.
+- WO-PAY-1: preserve stored receipt bytes and modification time when viewed.
+- WO-LRN-14: bound generation/output resources, share provider limits without nested slot waits, offload CPU work, and keep system prompts cache-stable.
+- WO-LRN-13: bound manual decks and validate repository item shapes.
+- WO-LRN-9: run one progress reporter from dispatch and update it on attempts.
+- WO-LRN-7: log and reject malformed three-option questions rather than mis-grade them.
+- WO-LRN-15: use bounded document metadata and previews for screens.
+- WO-LRN-12: index quiz admission and answers; terminal-session retention defaults off per WO-DB-7.
+- WO-LRN-6: use integer preset pricing and refund paid learning shortfalls pro rata in the artifact transaction; test quiz shortfalls and atomic rollback for both artifact types.
+- WO-LRN-8: protect live curation sources from library pruning and refund missing sources cleanly.
+- WO-LRN-4: retain source locators when splitting overflowed learning chunks.
+- WO-LRN-1: retain undelivered paid previews until their normal expiry and offer resume.
+- WO-LRN-2: compare imported lot expiries as instants for refunds and settlements; reject invalid expiries.
+- WO-LRN-2: preserve originating credit expiry and lot IDs on learning refunds and recovery.
+- WO-LRN-10: gate flashcard DOCX delivery while keeping paid quiz answers accessible.
+- WO-LRN-11: reject invalid flashcard presets rather than silently charging the base cost.
+- WO-LRN-3: bound learning calls for small presets on many chunks.
+- WO-LRN-5: preserve manual-card state through the finish callback.
+- WO-DB-6: materialize FIFO balances with transactional dirty tracking and expiry-aware refresh.
+- WO-DB-7: add opt-in bounded retention and SQLite maintenance; preserve retired-hold idempotency tombstones.
+- WO-DB-9: check submission links and explicitly roll back duplicate quiz inserts.
+- WO-DB-5: batch learning inserts and transcription-retention deletes, with rollback and bounded-batch coverage.
+- WO-DB-2 (partial): add performance indexes; expiry predicates retain legacy timezone correctness.
+- WO-DB-3: use retry-aware repository reads for admin payment counts.
+- WO-DB-3: route plan, user, transcription-retention and admin count reads to the read connection.
+- WO-DB-10: retry transient SQLite read contention and count read errors.
+- WO-DB-8: bound SQLite caches, mapping and journal size for shared hosting.
+- WO-DB-4: report discarded stray transactions in logs and metrics.
+- WO-DB-1: consume pending membership-gate actions atomically.
+
 ## Unreleased — one static booklet prompt and the AvalAI route (2026-11-06)
 
 - Replaced the assembled per-mode note prompt with one static agent contract

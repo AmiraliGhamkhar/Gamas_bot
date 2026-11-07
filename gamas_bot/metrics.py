@@ -191,6 +191,18 @@ class MetricsCollector:
             self._submitted_jobs = 0
             self._deduplicated_updates = 0
             self._db_errors = 0
+            self._curation_delivery_errors = 0
+            self._curation_source_missing = 0
+            self._support_ticket_denials = 0
+            self._support_reply_failures = 0
+            self._learning_validation_failures = 0
+            self._retention_deletions = {"documents": 0, "learning": 0, "audit": 0, "holds": 0}
+            self._retention_errors = 0
+            self._broadcast_failures = 0
+            self._balance_repairs = 0
+            self._learning_capacity_denials = 0
+            self._document_unpack_rejections = 0
+            self._receipt_hash_errors = 0
             self._outcomes: dict[str, int] = dict.fromkeys(TERMINAL_OUTCOMES, 0)
             self._stage_active: dict[str, int] = dict.fromkeys(PIPELINE_STAGES, 0)
             self._stage_latency: dict[str, _Series] = {
@@ -229,6 +241,55 @@ class MetricsCollector:
         """Count one failed SQLite transaction (admin health panel)."""
         with self._lock:
             self._db_errors += 1
+
+    def record_curation_delivery_error(self) -> None:
+        with self._lock:
+            self._curation_delivery_errors += 1
+
+    def record_curation_source_missing(self) -> None:
+        with self._lock:
+            self._curation_source_missing += 1
+
+    def record_learning_capacity_denial(self) -> None:
+        with self._lock:
+            self._learning_capacity_denials += 1
+
+    def record_balance_repair(self) -> None:
+        with self._lock:
+            self._balance_repairs += 1
+
+    def record_broadcast_failure(self) -> None:
+        with self._lock:
+            self._broadcast_failures += 1
+
+    def record_retention_deleted(self, kind: str, count: int) -> None:
+        with self._lock:
+            if kind in self._retention_deletions:
+                self._retention_deletions[kind] += max(0, int(count))
+
+    def record_retention_error(self) -> None:
+        with self._lock:
+            self._retention_errors += 1
+
+    def record_learning_validation_failure(self) -> None:
+        with self._lock:
+            self._learning_validation_failures += 1
+
+    def record_support_reply_failure(self) -> None:
+        with self._lock:
+            self._support_reply_failures += 1
+
+    def record_support_ticket_denial(self) -> None:
+        with self._lock:
+            self._support_ticket_denials += 1
+
+    def record_document_unpack_rejection(self) -> None:
+        with self._lock:
+            self._document_unpack_rejections += 1
+
+    def record_receipt_hash_error(self) -> None:
+        with self._lock:
+            self._receipt_hash_errors += 1
 
     def record_job_started(self, *, queue_wait_seconds: float, queued_now: int) -> None:
         with self._lock:
@@ -354,6 +415,18 @@ class MetricsCollector:
                 "submitted_jobs": self._submitted_jobs,
                 "deduplicated_updates": self._deduplicated_updates,
                 "db_errors": self._db_errors,
+                "curation_delivery_errors": self._curation_delivery_errors,
+                "curation_source_missing": self._curation_source_missing,
+                "support_ticket_denials": self._support_ticket_denials,
+                "support_reply_failures": self._support_reply_failures,
+                "learning_validation_failures": self._learning_validation_failures,
+                "retention_deletions": dict(self._retention_deletions),
+                "retention_errors": self._retention_errors,
+                "broadcast_failures": self._broadcast_failures,
+                "balance_repairs": self._balance_repairs,
+                "learning_capacity_denials": self._learning_capacity_denials,
+                "document_unpack_rejections": self._document_unpack_rejections,
+                "receipt_hash_errors": self._receipt_hash_errors,
                 "outcomes": dict(self._outcomes),
                 "stage_active": dict(self._stage_active),
                 "queue_wait": self._queue_wait.summary(),

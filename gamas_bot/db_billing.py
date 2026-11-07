@@ -9,6 +9,7 @@ from typing import Any
 
 import aiosqlite
 
+from .metrics import METRICS
 from .db_core import (
     DatabaseCore,
     InsufficientBalanceError,
@@ -110,16 +111,95 @@ class BillingRepositoryMixin(DatabaseCore):
                 "INSERT INTO billing_migrations(name) VALUES ('credit_lots_v1')"
             )
 
+    async def _refresh_balance_locked(self, user_id: int) -> int:
+        """Recompute the cache from authoritative allocations inside the current write."""
+        now = iso(self._now())
+        exists = await _rows(self.db, "SELECT 1 FROM users WHERE telegram_id=?", (int(user_id),))
+        if not exists:
+            await self.db.execute("DELETE FROM balance_dirty WHERE user_id=?", (int(user_id),))
+            return 0
+        balance = await self._available_seconds_locked(int(user_id))
+        # Credits can begin in the future or expire without a database write.
+        transitions = await _rows(
+            self.db,
+            "SELECT moment FROM (SELECT created_at AS moment FROM ledger WHERE user_id=? AND kind='credit' "
+            "UNION ALL SELECT expires_at AS moment FROM ledger WHERE user_id=? AND kind='credit' AND expires_at IS NOT NULL) "
+            "WHERE julianday(moment) > julianday(?) ORDER BY julianday(moment) LIMIT 1",
+            (int(user_id), int(user_id), now),
+        )
+        next_transition = transitions[0][0] if transitions else None
+        await self.db.execute(
+            "INSERT INTO user_balances(user_id,available_seconds,updated_at,next_transition) VALUES(?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET available_seconds=excluded.available_seconds, "
+            "updated_at=excluded.updated_at,next_transition=excluded.next_transition",
+            (int(user_id), balance, now, next_transition),
+        )
+        await self.db.execute("DELETE FROM balance_dirty WHERE user_id=?", (int(user_id),))
+        return balance
+
+    async def _flush_balance_dirty_locked(self, limit: int | None = None) -> int:
+        sql = "SELECT user_id FROM balance_dirty ORDER BY user_id"
+        params = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (int(limit),)
+        rows = await _rows(self.db, sql, params)
+        for row in rows:
+            await self._refresh_balance_locked(int(row[0]))
+        return len(rows)
+
+    async def _backfill_user_balances(self) -> None:
+        """Resume a chunked, idempotent migration before serving balance reads."""
+        while True:
+            async with self._transaction():
+                state = (await _rows(self.db, "SELECT last_user_id,done FROM balance_backfill_state WHERE id=1"))[0]
+                if state[1]:
+                    break
+                if state[0] is None:
+                    rows = await _rows(self.db, "SELECT telegram_id FROM users ORDER BY telegram_id LIMIT 500")
+                else:
+                    rows = await _rows(self.db, "SELECT telegram_id FROM users WHERE telegram_id > ? ORDER BY telegram_id LIMIT 500", (state[0],))
+                for row in rows:
+                    await self._refresh_balance_locked(int(row[0]))
+                last_id = int(rows[-1][0]) if rows else state[0]
+                await self.db.execute("UPDATE balance_backfill_state SET last_user_id=?, done=? WHERE id=1", (last_id, int(len(rows) < 500)))
+        # An offline importer or interrupted migration can leave dirty markers.
+        while True:
+            async with self._transaction():
+                count = await self._flush_balance_dirty_locked(500)
+            if count < 500:
+                break
+
+    async def _check_user_balances(self) -> None:
+        async with self._transaction():
+            rows = await _rows(self.db, "SELECT telegram_id FROM users ORDER BY telegram_id LIMIT 20")
+            for row in rows:
+                user_id = int(row[0])
+                cached = await _rows(self.db, "SELECT available_seconds FROM user_balances WHERE user_id=?", (user_id,))
+                actual = await self._available_seconds_locked(user_id)
+                if not cached or int(cached[0][0]) != actual:
+                    logger.warning("balance cache mismatch user=%s", user_id)
+                    METRICS.record_balance_repair()
+                    await self._refresh_balance_locked(user_id)
+
     async def available_seconds(self, user_id: int) -> int:
-        if self._read_db is not None:
-            return sum(
-                max(0, int(row[1]))
-                for row in await self._credit_lots(
-                    user_id, iso(self._now()), conn=self._read_db
-                )
-            )
-        async with self._write_lock:
-            return await self._available_seconds_locked(user_id)
+        if not self._balances_ready:
+            if self._read_db is not None:
+                return sum(max(0, int(row[1])) for row in await self._credit_lots(user_id, iso(self._now()), conn=self._read_db))
+            async with self._write_lock:
+                return await self._available_seconds_locked(user_id)
+        rows = await _rows(
+            self.read_db,
+            "SELECT available_seconds FROM user_balances b WHERE b.user_id=? "
+            "AND julianday(b.updated_at) <= julianday(?) "
+            "AND (b.next_transition IS NULL OR julianday(b.next_transition) > julianday(?)) "
+            "AND NOT EXISTS (SELECT 1 FROM balance_dirty d WHERE d.user_id=b.user_id)",
+            (int(user_id), iso(self._now()), iso(self._now())),
+        )
+        if rows:
+            return int(rows[0][0])
+        async with self._transaction():
+            return await self._refresh_balance_locked(int(user_id))
 
     async def grant_free_plan_once(self, user_id: int, seconds: int) -> bool:
         async with self._transaction():
@@ -178,6 +258,8 @@ class BillingRepositoryMixin(DatabaseCore):
             )
             if not owner:
                 raise ValueError("submission does not belong to user")
+            if await _rows(self.db, "SELECT 1 FROM retired_holds WHERE submission_id = ?", (submission_id,)):
+                raise ValueError("submission already has a retired hold")
             if rows and rows[0][0]:
                 return
             available = await self._available_seconds_locked(user_id)
@@ -225,8 +307,10 @@ class BillingRepositoryMixin(DatabaseCore):
                     "UPDATE submissions SET delivered_at = COALESCE(delivered_at, ?) "
                     "WHERE submission_id = ? AND NOT EXISTS "
                     "(SELECT 1 FROM holds WHERE submission_id = ? "
+                    "AND COALESCE(release_reason, '') != 'unlimited user') "
+                    "AND NOT EXISTS (SELECT 1 FROM retired_holds WHERE submission_id = ? "
                     "AND COALESCE(release_reason, '') != 'unlimited user')",
-                    (now, submission_id, submission_id),
+                    (now, submission_id, submission_id, submission_id),
                 )
                 return
             user_id, reserved, unlimited = rows[0]
@@ -235,7 +319,7 @@ class BillingRepositoryMixin(DatabaseCore):
                     self.db,
                     "SELECT a.credit_id, a.seconds FROM hold_allocations a "
                     "JOIN ledger l ON l.id = a.credit_id WHERE a.submission_id = ? "
-                    "ORDER BY l.expires_at IS NULL, l.expires_at, l.id",
+                    "ORDER BY l.expires_at IS NULL, julianday(l.expires_at), l.id",
                     (submission_id,),
                 )
                 charge = max(0, min(int(measured_seconds), reserved))
@@ -344,10 +428,26 @@ class BillingRepositoryMixin(DatabaseCore):
             return True
 
     async def _finalize_learning_charge_locked(
-        self, user_id: int, operation_id: str | None
+        self, user_id: int, operation_id: str | None, refund_seconds_value: int = 0
     ) -> None:
         if operation_id is None:
+            if refund_seconds_value:
+                raise ValueError("refund requires a paid learning charge")
             return
+        if refund_seconds_value:
+            rows = await _rows(
+                self.db,
+                "SELECT debit_id, seconds FROM learning_charges "
+                "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
+                (operation_id, int(user_id)),
+            )
+            if not rows or not 0 < refund_seconds_value <= int(rows[0][1]):
+                METRICS.record_db_error()
+                raise ValueError("invalid pro-rata learning refund")
+            await self._refund_debit_locked(
+                user_id, int(rows[0][0]), refund_seconds_value,
+                "pro-rata learning refund", iso(self._now()),
+            )
         cursor = await self.db.execute(
             "UPDATE learning_charges SET status = 'finalized', updated_at = ? "
             "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
@@ -356,27 +456,50 @@ class BillingRepositoryMixin(DatabaseCore):
         if cursor.rowcount != 1:
             raise ValueError("learning charge is not pending for this user")
 
+    async def _refund_debit_locked(
+        self, user_id: int, debit_id: int, seconds: int, note: str, now: str
+    ) -> None:
+        """Mint a refund using the original debit's allocations, inside a transaction."""
+        rows = await _rows(
+            self.db,
+            "SELECT l.id, l.expires_at, a.seconds, julianday(l.expires_at) FROM debit_allocations a "
+            "JOIN ledger l ON l.id = a.credit_id "
+            "JOIN ledger d ON d.id = a.debit_id "
+            "WHERE d.id = ? AND d.user_id = ? AND d.kind = 'debit' "
+            "AND l.user_id = d.user_id ORDER BY l.id",
+            (int(debit_id), int(user_id)),
+        )
+        if not rows or sum(int(row[2]) for row in rows) < seconds:
+            METRICS.record_db_error()
+            raise ValueError("refund requires sufficient original debit allocations")
+        expiring = [row for row in rows if row[1] is not None]
+        if any(row[3] is None for row in expiring):
+            METRICS.record_db_error()
+            logger.warning("refund rejected for invalid credit expiry debit_id=%s", debit_id)
+            raise ValueError("invalid source credit expiry")
+        # Use the same SQLite timestamp semantics as balance calculation, not
+        # lexical order: imported values may have offsets or mixed formats.
+        earliest = min(expiring, key=lambda row: row[3])[1] if expiring else None
+        lot_ids = ",".join(str(row[0]) for row in rows)
+        await self.db.execute(
+            "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
+            "VALUES (?, ?, 'credit', ?, ?, ?)",
+            (int(user_id), int(seconds), "refund: " + note[:180] + " lots:" + lot_ids,
+             earliest, now),
+        )
+
     async def refund_learning_charge(self, user_id: int, operation_id: str) -> bool:
         async with self._transaction():
             rows = await _rows(
                 self.db,
-                "SELECT seconds, note FROM learning_charges "
+                "SELECT seconds, note, debit_id FROM learning_charges "
                 "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
                 (operation_id, int(user_id)),
             )
             if not rows:
                 return False
             now = iso(self._now())
-            await self.db.execute(
-                "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
-                "VALUES (?, ?, 'credit', ?, ?)",
-                (
-                    int(user_id),
-                    int(rows[0][0]),
-                    "refund: " + str(rows[0][1])[:180],
-                    now,
-                ),
-            )
+            await self._refund_debit_locked(user_id, int(rows[0][2]), int(rows[0][0]), str(rows[0][1]), now)
             await self.db.execute(
                 "UPDATE learning_charges SET status = 'refunded', updated_at = ? "
                 "WHERE operation_id = ? AND user_id = ? AND status = 'pending'",
@@ -387,28 +510,32 @@ class BillingRepositoryMixin(DatabaseCore):
     async def recover_pending_learning_charges(self) -> int:
         async with self._transaction():
             now = iso(self._now())
-            cursor = await self.db.execute(
-                "INSERT INTO ledger(user_id, seconds, kind, note, created_at) "
-                "SELECT user_id, seconds, 'credit', 'refund: ' || substr(note, 1, 180), ? "
-                "FROM learning_charges WHERE status = 'pending'",
-                (now,),
-            )
-            recovered = max(0, cursor.rowcount)
-            await self.db.execute(
-                "UPDATE learning_charges SET status = 'refunded', updated_at = ? "
-                "WHERE status = 'pending'",
-                (now,),
-            )
-            return recovered
+            recovered = 0
+            while True:
+                rows = await _rows(
+                    self.db,
+                    "SELECT operation_id, user_id, debit_id, seconds, note "
+                    "FROM learning_charges WHERE status = 'pending' LIMIT 500",
+                )
+                if not rows:
+                    return recovered
+                for row in rows:
+                    await self._refund_debit_locked(int(row[1]), int(row[2]), int(row[3]), str(row[4]), now)
+                    await self.db.execute(
+                        "UPDATE learning_charges SET status = 'refunded', updated_at = ? "
+                        "WHERE operation_id = ? AND status = 'pending'",
+                        (now, row[0]),
+                    )
+                    recovered += 1
 
     async def refund_seconds(
-        self, user_id: int, seconds: int, note: str
+        self, user_id: int, seconds: int, note: str, *, debit_id: int | None = None
     ) -> Any:
         if seconds <= 0:
+            logger.warning("refund ignored user=%s seconds=%s", user_id, seconds)
             return
-        await self.add_credit(
-            user_id,
-            int(seconds),
-            note="refund: " + note[:180],
-            validity_days=None,
-        )
+        if debit_id is None:
+            METRICS.record_db_error()
+            raise ValueError("refund requires the original debit_id")
+        async with self._transaction():
+            await self._refund_debit_locked(user_id, debit_id, int(seconds), note, iso(self._now()))

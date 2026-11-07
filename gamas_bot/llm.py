@@ -22,6 +22,7 @@ while :class:`LLMOutputBudgetError` (the *answer* was cut off by
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import logging
 import re
@@ -2151,9 +2152,11 @@ async def _dispatch_across_routes(
     call_route: Callable[[NoteRoute, bool], Awaitable[_T]],
     *,
     hedge_route: Callable[[NoteRoute, bool], Awaitable[_T]] | None = None,
+    pool_owner: object | None = None,
+    wait_for_capacity: bool = True,
 ) -> _T:
     """Execute *call_route* across *routes* with non-blocking capacity reservation."""
-    pool = pool_for("llm", settings)
+    pool = pool_for("llm", pool_owner if pool_owner is not None else settings)
     failures: list[LLMError] = []
     descriptions: list[str] = []
     indexed_routes: list[tuple[int, NoteRoute]] = list(enumerate(routes))
@@ -2180,9 +2183,11 @@ async def _dispatch_across_routes(
                 backup_limit = route_max_in_flight(1, settings)
                 acquired_b = await pool.acquire_any(
                     [(routes[1].slug, backup_limit)],
-                    timeout=getattr(settings, "llm_slot_wait_timeout", 30.0),
+                    timeout=getattr(settings, "llm_slot_wait_timeout", 30.0) if wait_for_capacity else 0.0,
                 )
                 if acquired_b is None:
+                    if not wait_for_capacity:
+                        METRICS.record_learning_capacity_denial()
                     raise LLMTransientError(
                         "ظرفیت هم‌زمان سرویس پشتیبان تولید جزوه تکمیل است."
                     )
@@ -2215,7 +2220,7 @@ async def _dispatch_across_routes(
                 indexed_routes = indexed_routes[2:]
 
     previous_failed_slug: str | None = routes[0].slug if failures else None
-    wait_timeout = float(getattr(settings, "llm_slot_wait_timeout", 30.0))
+    wait_timeout = float(getattr(settings, "llm_slot_wait_timeout", 30.0)) if wait_for_capacity else 0.0
 
     while indexed_routes:
         # Uncooled routes lead; cooled routes stay as last-resort fallbacks so
@@ -2241,6 +2246,8 @@ async def _dispatch_across_routes(
             raise LLMTransientError(str(exc)) from exc
 
         if acquired is None:
+            if not wait_for_capacity:
+                METRICS.record_learning_capacity_denial()
             raise LLMTransientError(
                 "ظرفیت هم‌زمان سرویس تولید جزوه تکمیل است؛ لطفاً چند لحظه بعد دوباره تلاش کنید."
             )
@@ -2500,6 +2507,8 @@ async def complete_json(
     user: str,
     schema: dict | None = None,
     prefer_provider: str = "",
+    max_output_tokens: int | None = None,
+    wait_for_capacity: bool = True,
 ) -> dict:
     """A completion parsed as strict JSON, with bounded per-provider recovery.
 
@@ -2511,6 +2520,11 @@ async def complete_json(
     already holds. A rejected request (4xx) is permanent for that provider and is
     never re-sent to it with the same content.
     """
+    pool_owner = settings
+    if max_output_tokens is not None:
+        if max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be positive")
+        settings = replace(settings, note_max_output_tokens=int(max_output_tokens))
     routes = _ordered_routes(note_routes(settings), prefer_provider)
     if not routes:
         raise LLMAuthError(
@@ -2531,5 +2545,6 @@ async def complete_json(
         )
 
     return await _dispatch_across_routes(
-        routes, session, settings, _call_json, hedge_route=_call_json
+        routes, session, settings, _call_json, hedge_route=_call_json,
+        pool_owner=pool_owner, wait_for_capacity=wait_for_capacity
     )

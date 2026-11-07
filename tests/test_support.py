@@ -5,12 +5,15 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database, MIGRATIONS_DIR
 from gamas_bot.db import TicketStateError
+from gamas_bot.db_support import TicketLimitError
 from tests.support import FakeTelegramClient, make_settings
 from tests.test_bot import FakeCallbackEvent, FakeMessageEvent
 from tests.test_db_billing import DatabaseTestCase
@@ -27,10 +30,27 @@ class SupportDatabaseTests(DatabaseTestCase):
         await self.db.ensure_user(USER_B)
 
     async def ticket(self, user=USER_A, category="technical", subject="مشکل ورود"):
-        return await self.db.create_ticket(user, category, subject)
+        return await self.db.create_ticket(user, category, subject, max_open_tickets=100, cooldown_seconds=0)
 
     async def status(self, ticket_id):
         return (await self.db.get_ticket(ticket_id))["status"]
+
+    async def test_ticket_creation_cooldown_and_open_cap(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.db._clock = lambda: now
+        await self.db.create_ticket(USER_A, "other", "first")
+        with self.assertRaises(TicketLimitError) as denied:
+            await self.db.create_ticket(USER_A, "other", "second")
+        self.assertEqual(denied.exception.reason, "cooldown")
+        now += timedelta(seconds=600)
+        await self.db.create_ticket(USER_A, "other", "second")
+        now += timedelta(seconds=600)
+        await self.db.create_ticket(USER_A, "other", "third")
+        now += timedelta(seconds=600)
+        with self.assertRaises(TicketLimitError) as denied:
+            await self.db.create_ticket(USER_A, "other", "fourth")
+        self.assertEqual(denied.exception.reason, "open")
+        self.assertEqual(len(await self.db.list_user_tickets(USER_A)), 3)
 
     async def test_ids_are_unique_and_human_readable(self):
         first = await self.ticket()
@@ -287,6 +307,20 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
             self.payloads(new_queue.edits[-1][1]),
         )
 
+    async def test_creation_cooldown_is_reported_to_user(self):
+        await self.open_ticket()
+        event = await self.open_ticket(subject="درخواست دوم")
+        self.assertTrue(any("کمی بعد" in text for text in event.replies))
+        self.assertEqual(len(await self.db.list_user_tickets(USER_A)), 1)
+
+    async def test_long_opener_is_stored_in_full_with_short_subject(self):
+        opener = ("عنوان درخواست\n" + "متن طولانی " * 110).strip()
+        await self.open_ticket(subject=opener)
+        ticket = await self.latest_ticket()
+        self.assertEqual(ticket["subject"], "عنوان درخواست")
+        self.assertLessEqual(len(ticket["subject"]), 400)
+        self.assertEqual((await self.db.ticket_messages(ticket["id"]))[0]["message_text"], opener)
+
     async def test_subject_prompt_requires_text_and_cancel_clears_it(self):
         await self.press(USER_A, "sup:cat:technical")
         event = await self.say(USER_A, "")  # photo without text
@@ -325,6 +359,32 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.answers[-1][1])
         self.assertNotIn(USER_B, self.bot._support_states)
         await self.say(USER_B, "نفوذ")
+        self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 1)
+
+    async def test_abandoned_support_prompts_expire(self):
+        await self.open_ticket()
+        ticket = await self.latest_ticket()
+        await self.press(USER_A, f"sup:r:{ticket['id']}")
+        await self.press(ADMIN, f"adm:sr:{ticket['id']}")
+        state = self.bot._support_states[USER_A]
+        admin_state = self.bot._support_admin_states[ADMIN]
+        self.bot._support_states[USER_A] = (state[0], state[1], 100.0)
+        self.bot._support_admin_states[ADMIN] = (admin_state[0], 101.0)
+        self.bot.conversations.sweep_support_states(1899.0)
+        self.assertIn(USER_A, self.bot._support_states)
+        self.assertIn(ADMIN, self.bot._support_admin_states)
+        self.bot.conversations.sweep_support_states(1901.0)
+        self.assertNotIn(USER_A, self.bot._support_states)
+        self.assertNotIn(ADMIN, self.bot._support_admin_states)
+
+    async def test_admin_reply_permission_error_is_handled(self):
+        await self.open_ticket()
+        ticket = await self.latest_ticket()
+        await self.press(ADMIN, f"adm:sr:{ticket['id']}")
+        with mock.patch.object(self.db, "add_ticket_message", side_effect=PermissionError):
+            event = await self.say(ADMIN, "reply")
+        self.assertNotIn(ADMIN, self.bot._support_admin_states)
+        self.assertTrue(event.replies)
         self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 1)
 
     async def test_admin_reply_routes_to_selected_ticket_and_notifies_user(self):
@@ -406,8 +466,14 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_close_and_reopen_keep_history(self):
         await self.open_ticket()
         ticket = await self.latest_ticket()
-        await self.press(USER_A, f"sup:c:{ticket['id']}")
+        confirmation = await self.press(USER_A, f"sup:c:{ticket['id']}")
+        self.assertIn("آیا بستن تیکت", confirmation.edits[-1][0])
+        self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "awaiting_admin")
+        before = len(self.bot.client.texts)
+        await self.press(USER_A, f"sup:cy:{ticket['id']}")
         self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "closed")
+        await self.press(USER_A, f"sup:cy:{ticket['id']}")
+        self.assertEqual(len(self.bot.client.texts), before + 1)
         await self.press(USER_A, f"sup:o:{ticket['id']}")
         self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "open")
         self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 1)
@@ -436,6 +502,8 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 2)
 
     async def test_admin_list_filters_and_pagination_render(self):
+        self.bot.settings = replace(self.bot.settings, support_max_open_tickets=100,
+                                    support_ticket_cooldown_seconds=0)
         for index in range(9):
             await self.open_ticket(USER_A, subject=f"موضوع {index}")
         first = await self.press(ADMIN, "adm:sl:active:all:0")
@@ -497,6 +565,8 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(view.responses[-1][1])
 
     async def test_all_categories_open_filter_and_notification_outage_resilience(self):
+        self.bot.settings = replace(self.bot.settings, support_max_open_tickets=100,
+                                    support_ticket_cooldown_seconds=0)
         seen_ids: set[str] = set()
         payment_ticket_id: int | None = None
         for category in ("payment", "technical", "subscription", "other"):
@@ -512,6 +582,7 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
 
         assert payment_ticket_id is not None
         await self.press(USER_A, f"sup:c:{payment_ticket_id}")
+        await self.press(USER_A, f"sup:cy:{payment_ticket_id}")
         self.assertEqual((await self.db.get_ticket(payment_ticket_id))["status"], "closed")
         await self.press(USER_A, f"sup:o:{payment_ticket_id}")
         self.assertEqual((await self.db.get_ticket(payment_ticket_id))["status"], "open")

@@ -96,8 +96,8 @@ SCANNED_CHARS_PER_PAGE = 10
 PREVIEW_CHARS = 300
 
 #: Office files are ZIP containers. Bound expansion before python-docx/pptx
-#: opens them, independently of the 50 MB compressed-upload limit.
-OFFICE_UNPACKED_MAX_BYTES = 200 * 1024 * 1024
+#: opens them, independently of the compressed-upload limit.
+OFFICE_UNPACKED_MAX_BYTES = 100 * 1024 * 1024
 #: Bound stored text and generated chunk metadata for highly compressed files.
 MAX_EXTRACTED_DOCUMENT_CHARS = 5_000_000
 
@@ -290,7 +290,7 @@ def _pdf_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
     return _pdf_sections_from_pages(texts), len(texts)
 
 
-def _check_office_package(path: Path) -> None:
+def _check_office_package(path: Path, *, max_unpacked_bytes: int = OFFICE_UNPACKED_MAX_BYTES) -> None:
     """Reject malformed or excessively expanded OOXML before parsing it."""
     import zipfile
 
@@ -308,7 +308,9 @@ def _check_office_package(path: Path) -> None:
                 if info.flag_bits & 1 or info.file_size < 0:
                     raise DocExtractError("فایل Office رمزدار یا آسیب‌دیده است.")
                 total += info.file_size
-                if total > OFFICE_UNPACKED_MAX_BYTES:
+                if total > max_unpacked_bytes:
+                    from .metrics import METRICS
+                    METRICS.record_document_unpack_rejection()
                     raise DocExtractError("حجم بازشدهٔ فایل Office بیش از حد مجاز است.")
     except DocExtractError:
         raise
@@ -316,8 +318,8 @@ def _check_office_package(path: Path) -> None:
         raise DocExtractError("ساختار فایل Office قابل‌خواندن نیست.") from exc
 
 
-def _docx_sections(path: Path) -> tuple[tuple[DocSection, ...], int]:
-    _check_office_package(path)
+def _docx_sections(path: Path, *, max_unpacked_bytes: int = OFFICE_UNPACKED_MAX_BYTES) -> tuple[tuple[DocSection, ...], int]:
+    _check_office_package(path, max_unpacked_bytes=max_unpacked_bytes)
     try:
         import docx
     except ImportError as exc:  # pragma: no cover - declared dependency
@@ -457,7 +459,7 @@ def sections_from_slides(
     return tuple(sections)
 
 
-def _pptx_sections(path: Path, *, max_chars: int) -> tuple[tuple[DocSection, ...], int]:
+def _pptx_sections(path: Path, *, max_chars: int, max_unpacked_bytes: int = OFFICE_UNPACKED_MAX_BYTES) -> tuple[tuple[DocSection, ...], int]:
     # The PowerPoint reader is shared with the lecture pipeline: one deck must
     # parse the same way whether it arrived as a lecture or as a document.
     import zipfile
@@ -469,7 +471,7 @@ def _pptx_sections(path: Path, *, max_chars: int) -> tuple[tuple[DocSection, ...
             "این فایل یک ارائهٔ معتبر PowerPoint نیست یا آسیب دیده است."
         )
     try:
-        _check_office_package(path)
+        _check_office_package(path, max_unpacked_bytes=max_unpacked_bytes)
         slides = presentations._extract_slide_text(path)
     except DocExtractError:
         raise
@@ -578,6 +580,7 @@ def extract_document(
     max_chars: int = MAX_MODEL_INPUT_CHARS,
     ocr: OcrPages | None = None,
     ocr_max_pages: int = 0,
+    max_unpacked_bytes: int = OFFICE_UNPACKED_MAX_BYTES,
 ) -> ExtractedDoc:
     """Extract a PDF/DOCX/PPTX/photo into locator-tagged sections (blocking).
 
@@ -600,9 +603,9 @@ def extract_document(
             raise DocExtractError("خواندن تصویری این فایل در این نسخه فعال نیست.")
         sections, page_count = _image_sections(path, ocr)
     elif source_type == "docx":
-        sections, page_count = _docx_sections(path)
+        sections, page_count = _docx_sections(path, max_unpacked_bytes=max_unpacked_bytes)
     elif source_type == "pptx":
-        sections, page_count = _pptx_sections(path, max_chars=max_chars)
+        sections, page_count = _pptx_sections(path, max_chars=max_chars, max_unpacked_bytes=max_unpacked_bytes)
     else:  # pragma: no cover - guarded by classify_document
         raise DocExtractError("این نوع سند پشتیبانی نمی‌شود.")
     # Account for heading rendering and separators as well as raw section text;
@@ -715,16 +718,33 @@ def chunk_sections(
 
 
 def chunk_text(
-    text: str, *, max_chars: int = MAX_MODEL_INPUT_CHARS, label: str = "بخش"
+    text: str, *, max_chars: int = MAX_MODEL_INPUT_CHARS, label: str = "بخش",
+    label_prefix: str | None = None,
 ) -> list[DocChunk]:
-    """Chunk a flat text (a booklet without page numbers) into labelled parts."""
+    """Chunk flat text; optionally retain a parent locator on overflow splits."""
     content = str(text or "").strip()
     if not content:
         return []
-    return chunk_sections(
-        [DocSection(f"{label} {to_persian_digits(1)}", "", content)],
-        max_chars=max_chars,
+    section_label = label_prefix if label_prefix is not None else f"{label} {to_persian_digits(1)}"
+    # Leave room for the replacement header even when a long parent locator
+    # is truncated by chunk_sections or part numbers grow.
+    budget = int(max_chars)
+    if label_prefix is not None:
+        budget -= max(0, len(label_prefix) - min(100, budget // 3)) + 24
+    chunks = chunk_sections(
+        [DocSection(section_label, "", content)], max_chars=budget,
     )
+    if label_prefix is None:
+        return chunks
+    result = []
+    for index, chunk in enumerate(chunks):
+        locator = label_prefix
+        if len(chunks) > 1:
+            locator += f" — قسمت {to_persian_digits(index + 1)}"
+        # Replace only the synthetic outer header, not source text inside it.
+        _, separator, body = chunk.text.partition("\n")
+        result.append(DocChunk(index, locator, (locator,), f"[{locator}]{separator}{body}"))
+    return result
 
 
 def _chunk_locator(sources: tuple[str, ...]) -> str:

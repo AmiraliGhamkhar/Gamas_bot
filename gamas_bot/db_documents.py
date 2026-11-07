@@ -67,6 +67,18 @@ class DocumentsRepositoryMixin(DatabaseCore):
         )
         return dict(rows[0]) if rows else None
 
+    async def document_meta(self, user_id: int, document_id: int) -> dict[str, Any] | None:
+        """Return bounded screen metadata without materializing document bodies."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT id, user_id, file_msg_ref, title, source_type, page_count, "
+            "sha256, library_item_id, created_at, length(text) AS text_chars, "
+            "substr(text, 1, 1024) AS text_preview FROM documents "
+            "WHERE id = ? AND user_id = ?",
+            (int(document_id), int(user_id)),
+        )
+        return dict(rows[0]) if rows else None
+
     async def document_get(
         self, user_id: int, document_id: int
     ) -> dict[str, Any] | None:

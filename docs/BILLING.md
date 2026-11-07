@@ -13,7 +13,8 @@ to repair balances; use audited credit operations.
   startup recovery releases interrupted holds.
 - PowerPoint charges source narration, not inserted silence. No narration means free.
 - Lots expire independently; holds preserve allocations. Refunds create new
-  non-expiring lots, never delete old debits.
+  lots that inherit the earliest expiry of the original contributing lots;
+  they never delete old debits.
 
 ## Quizzes and AI flashcards
 
@@ -30,9 +31,13 @@ from free-plan credit. Unlimited users spend neither credit nor gifts.
 
 Paid learning debits happen before generation with durable pending charges.
 Saving finalizes; failure/cancel/30-minute preview expiry/startup recovery refunds
-unfinished charges at most once. Failed refund writes remain recoverable; never
+unfinished charges at most once. A failed preview edit is retried as a new message;
+if delivery still fails, the preview remains pending until its normal expiry and
+can be resumed through /start. Failed refund writes remain recoverable; never
 claim success before commit. Valid results need at least 3 questions or 5 cards.
-Count/coverage shortfalls are reported; review the preview before saving.
+Count/coverage shortfalls are reported; review the preview before saving. Paid
+previews saved with fewer items than requested receive an integer-second
+pro-rata refund, rounded up, in the same transaction as the artifact.
 
 Admission is checked before debit: one generation per user, 1 active quiz, 3 new
 sessions per rolling hour and 30 stored decks by default. Inactive quizzes lazily
@@ -42,13 +47,20 @@ be reconstructed as unfinished operations.
 ## Manual purchases
 
 Set `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME`. Configure
-plans with `FREE_PLAN_HOURS` and `PLAN_*` in `.env`.
+plans with `FREE_PLAN_HOURS` and `PLAN_*` in `.env`. In v4, plan editing is
+environment-only; there is no in-bot plan editor. Existing `is_custom` data
+protection is retained for legacy records.
 
 1. Selecting a plan freezes the order's price, duration and validity.
 2. A validated receipt moves `awaiting_payment` to `pending_review`; it adds no credit.
 3. An admin verifies the transfer, then approves or rejects with a reason.
 4. Approval, credit and audit commit together. Failure rolls back; notification
    failures never repeat activation. Final decisions are immutable.
+
+Administrators view stored receipt bytes as-is; viewing does not re-encode the
+image or refresh its retention timestamp. A SHA-256 fingerprint of the normalized
+image flags reuse by a non-cancelled order in the administrator alert; it does
+not block upload or grant credit.
 
 Users may cancel before receipt upload; one open order per user. Payment history
 remains. Reviewed receipt images expire after 90 days by default; pending-review
@@ -75,3 +87,20 @@ credit only. See [Admin](ADMIN.md).
 Back up before updates. Migrations run at startup; never downgrade against the
 migrated database. Legacy v2 import is exceptional: inspect
 `scripts/import_v2.py --help` and test on copies, never live data.
+
+Refund credit inherits the earliest non-null expiry of the original debit's
+contributing lots (including startup recovery), compared as UTC instants even for
+legacy offset timestamps; invalid source expiries cause the refund to fail closed.
+It is non-expiring only if all
+contributing lots were non-expiring. Refund notes record contributing lot IDs.
+Generic refunds require the original debit ID; an untraceable refund is rejected.
+
+### Materialized balance cache
+
+`user_balances` is a cache of FIFO ledger truth. SQLite triggers mark affected
+users dirty, and the writer refreshes those rows before committing the same
+transaction, including payment/referral rewards and hold recovery. Startup
+backfills in batches and repairs a sample; offline import dirty rows are
+recomputed before serving traffic. The cache records the next credit start or
+expiry and is refreshed on read after that instant, or after a clock rollback.
+Ledger rows and allocation records remain authoritative.

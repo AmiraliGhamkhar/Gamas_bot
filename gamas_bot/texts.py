@@ -143,8 +143,10 @@ RESTARTING: Final = "ربات در حال راه‌اندازی مجدد است�
 RESTARTING_JOB_CANCELLED: Final = (
     "⏸ ربات در حال راه‌اندازی مجدد است؛ کار شما لغو شد. لطفاً دوباره بفرستید."
 )
+RESTARTING_JOB_MESSAGE_REFERENCE: Final = "شناسهٔ پیام اصلی: {message_id}"
 ACCESS_BANNED: Final = "⛔ دسترسی شما به ربات مسدود شده است."
 ADMIN_ONLY: Final = "دسترسی به این بخش فقط برای مدیران مجاز است."
+INVALID_LEARNING_SIZE: Final = "اندازهٔ انتخاب‌شده نامعتبر است."
 INVALID_REQUEST: Final = "درخواست نامعتبر است."
 INVALID_PERIOD: Final = "بازهٔ زمانی نامعتبر است."
 INVALID_REPORT: Final = "بخش گزارش نامعتبر است."
@@ -163,6 +165,17 @@ BROADCAST_PROMPT: Final = (
     "کاربرانی که ربات را مسدود کرده‌اند ممکن است پیام را دریافت نکنند.\n"
     "برای لغو، /cancel بفرستید یا دکمهٔ زیر را انتخاب کنید."
 )
+BROADCAST_RUNNING: Final = "یک ارسال همگانی در حال اجراست."
+BROADCAST_PREVIEW: Final = "📣 پیش‌نمایش پیام همگانی\n\n{text}\n\nتعداد گیرندگان: {count}"
+BROADCAST_TOO_LONG: Final = "پیام همگانی بیش از حد طولانی است (حداکثر ۴۰۹۶ نویسه)."
+BROADCAST_PROGRESS: Final = "📣 ارسال همگانی: ارسال‌شده {sent}، ناموفق {failed}، کل {total}"
+BROADCAST_SUMMARY: Final = "📣 پیام به {sent} نفر از {total} کاربر ارسال شد.\n⚠️ ارسال برای {failed} کاربر ناموفق بود."
+BROADCAST_STOPPED: Final = "ارسال همگانی متوقف شد."
+BROADCAST_RESUME_PROMPT: Final = "متن همان پیام همگانی را دوباره بفرستید؛ در صورت تفاوت، ارسال تازه آغاز می‌شود."
+BROADCAST_RECOVERED: Final = "ارسال همگانی ناتمام #{run} متوقف شد. آخرین شناسه: {cursor}. برای ادامه متن را دوباره وارد کنید."
+BTN_BROADCAST_SEND: Final = "✅ تأیید و ارسال"
+BTN_BROADCAST_STOP: Final = "⏹ توقف ارسال"
+BTN_BROADCAST_RESUME: Final = "▶️ ادامهٔ ارسال"
 BROADCAST_CANCELLED: Final = "پیام همگانی لغو شد."
 BROADCAST_NEEDS_TEXT: Final = "پیام همگانی باید متن داشته باشد؛ متن را بفرستید یا /cancel بزنید."
 REJECT_CANCELLED: Final = "رد پرداخت لغو شد."
@@ -325,6 +338,7 @@ ADMIN_RECEIPT_HEADER_TEMPLATE: Final = (
     "بسته: {plan}\n"
     "مبلغ: {price}"
 )
+ADMIN_RECEIPT_DUPLICATE: Final = "⚠️ تصویر رسید قبلاً در سفارش دیگر ثبت شده است (#{payment_id})"
 ADMIN_RECEIPT_MISSING_IMAGE: Final = "\n⚠️ رسید تصویری ارسال نشد؛ آن را از جزئیات سفارش ببینید."
 ADMIN_RECEIPT_MISSING_FILE: Final = "\n⚠️ فایل رسید در دسترس نیست."
 PAYMENT_INVALID_ID: Final = "شناسه سفارش نامعتبر است."
@@ -405,13 +419,16 @@ BTN_ALL_CATEGORIES: Final = "📂 همه دسته‌ها"
 BTN_BACK_SUPPORT: Final = "↩️ درخواست‌های من"
 BTN_BACK_ADMIN: Final = "↩️ پنل مدیریت"
 BTN_BACK_ADMIN_SUPPORT: Final = "↩️ فهرست پشتیبانی"
+SUPPORT_OPEN_LIMIT: Final = "شما {count} تیکت باز دارید؛ ابتدا یکی را ببندید."
+SUPPORT_COOLDOWN: Final = "لطفاً کمی بعد دوباره تلاش کنید."
+SUPPORT_CONFIRM_CLOSE: Final = "آیا بستن تیکت را تأیید می‌کنید؟"
 SUPPORT_CHOOSE_CATEGORY: Final = "دسته‌بندی درخواست را انتخاب کنید:"
 SUPPORT_NO_TICKETS: Final = "شما هنوز درخواستی ثبت نکرده‌اید."
 SUPPORT_LIST_TITLE_TEMPLATE: Final = "📋 درخواست‌های شما — صفحهٔ {page}"
 SUPPORT_TICKET_NOT_FOUND: Final = "این درخواست پیدا نشد."
 SUPPORT_BAD_CATEGORY: Final = "این دسته معتبر نیست."
 SUPPORT_SUBJECT_PROMPT: Final = (
-    "موضوع یا شرح کوتاه مشکل را در یک پیام بفرستید (حداکثر ۴۰۰ نویسه).\n"
+    "شرح مشکل را در یک پیام بفرستید (حداکثر ۴۰۰۰ نویسه). خط اول موضوع خواهد بود.\n"
     "برای لغو، /cancel بفرستید."
 )
 SUPPORT_INVALID_REQUEST: Final = "درخواست نامعتبر است."
@@ -502,3 +519,22 @@ PROGRESS_DEFAULT_DONE: Final = "✅ پردازش تکمیل شد"
 PROGRESS_WORK_DONE: Final = "✅ آماده شد"
 PROGRESS_DEFAULT_FAIL: Final = "❌ پردازش تکمیل نشد."
 PROGRESS_WORK_FAIL: Final = "❌ انجام نشد."
+
+CURATION_DELIVERY_RETRY: Final = "پیش‌نمایش ارسال نشد؛ با /start دوباره تلاش کنید."
+CURATION_RESUME_BUTTON: Final = "🧐 ادامهٔ بررسی"
+
+CURATION_SOURCE_REMOVED: Final = "منبع این پیش‌نمایش حذف شده بود؛ مبلغ بازگشت داده شد."
+CURATION_SOURCE_REMOVED_FREE: Final = "منبع این پیش‌نمایش حذف شده بود؛ هزینه‌ای کسر نشد."
+LEARNING_PRORATA_REFUND: Final = "اعتبار بازگشتی: {duration}"
+PAYMENT_HISTORY_CANCELLED: Final = "لغوشده"
+
+FLASHCARD_CARD_LIMIT: Final = "این مجموعه به حداکثر تعداد کارت رسیده است."
+
+DOCUMENT_EXTRACTED_COUNT: Final = "متن استخراج‌شده: {count} نویسه"
+DOCUMENT_TEXT_PREVIEW: Final = "پیش‌نمایش متن:"
+
+LEARNING_CHUNK_PROGRESS: Final = "بخش {done} از {total}"
+LEARNING_PRODUCING: Final = "در حال تولید {label}"
+
+LEARNING_DECK_SAVED: Final = "✅ مجموعه ذخیره شد."
+LEARNING_QUIZ_READY: Final = "✅ آزمون آماده است."

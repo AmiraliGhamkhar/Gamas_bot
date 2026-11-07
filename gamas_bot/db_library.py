@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from datetime import timedelta
 from typing import Any
 
@@ -103,24 +104,27 @@ class LibraryRepositoryMixin(DatabaseCore):
             return 0
         cutoff = iso(self._now() - timedelta(days=older_than_days))
         rows = await _rows(
-            self.db,
+            self.read_db,
             "SELECT t.submission_id FROM transcriptions t "
             "JOIN submissions s ON s.submission_id = t.submission_id "
             "WHERE t.created_at < ? AND s.status IN "
             "('done', 'partial', 'failed', 'rejected') "
             "ORDER BY t.created_at LIMIT ?",
-            (cutoff, max(1, batch)),
+            (cutoff, min(500, max(1, batch))),
         )
         ids = [row[0] for row in rows]
         if not ids:
             return 0
-        await self._write_many(
-            [
-                ("DELETE FROM transcriptions WHERE submission_id = ?", (submission_id,))
-                for submission_id in ids
-            ]
-        )
-        return len(ids)
+        async with self._transaction():
+            placeholders = ",".join("?" for _ in ids)
+            cursor = await self.db.execute(
+                f"DELETE FROM transcriptions WHERE submission_id IN ({placeholders}) "
+                "AND created_at < ? AND EXISTS (SELECT 1 FROM submissions s "
+                "WHERE s.submission_id = transcriptions.submission_id "
+                "AND s.status IN ('done', 'partial', 'failed', 'rejected'))",
+                (*ids, cutoff),
+            )
+            return max(0, cursor.rowcount)
 
     async def transcription(self, submission_id: int) -> dict[str, Any] | None:
         rows = await _rows(
@@ -249,8 +253,15 @@ class LibraryRepositoryMixin(DatabaseCore):
             (int(item_id),),
         )
 
-    async def library_prune(self, user_id: int, keep: int) -> int:
+    async def library_prune(
+        self, user_id: int, keep: int, *, protected_item_ids: Collection[int] = ()
+    ) -> int:
         keep = max(0, int(keep))
+        protected = tuple(int(item_id) for item_id in protected_item_ids)
+        exclusion = (
+            " AND item_id NOT IN (" + ",".join("?" for _ in protected) + ")"
+            if protected else ""
+        )
         async with self._transaction():
             cursor = await self.db.execute(
                 "DELETE FROM library_items WHERE user_id = ? AND item_id NOT IN ("
@@ -258,8 +269,8 @@ class LibraryRepositoryMixin(DatabaseCore):
                 "ORDER BY item_id DESC LIMIT ?) "
                 "AND NOT EXISTS (SELECT 1 FROM quiz_sessions q "
                 "WHERE q.user_id = library_items.user_id AND q.item_id = library_items.item_id "
-                "AND q.status = 'active')",
-                (int(user_id), int(user_id), keep),
+                "AND q.status = 'active')" + exclusion,
+                (int(user_id), int(user_id), keep, *protected),
             )
             return max(0, int(cursor.rowcount))
 

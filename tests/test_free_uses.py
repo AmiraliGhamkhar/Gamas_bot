@@ -158,7 +158,7 @@ class FreeUseDatabaseTests(unittest.IsolatedAsyncioTestCase):
         claim = "pending-token"
         self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=claim))
         item = await self.db.library_add(OWNER, "booklet", 1, 2, None, title="سند")
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ValueError):
             await self.db.deck_create_with_cards(
                 OWNER, item, "ناقص", [{"front": "بدون پاسخ"}], free_claim_id=claim
             )
@@ -436,12 +436,16 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(self.press(b"fc:cur:cancel"))
         self.assertEqual(await self.db.available_seconds(OWNER), 600)
 
-    async def test_undeliverable_preview_refunds_the_gift(self):
+    async def test_preview_edit_failure_keeps_gift_pending_until_expiry(self):
         from tests.support import FakeSentMessage
 
+        self.bot.CURATION_TTL_SECONDS = 0.05
         with mock.patch.object(FakeSentMessage, "edit", new=mock.AsyncMock(side_effect=RuntimeError("blocked"))), \
              mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=cards_payload(6))):
             await self.bot._handle_callback(self.press(f"fc:go:{self.item_id}".encode()))
+        self.assertFalse((await self.db.free_use_state(OWNER))["deck"])
+        self.assertIn(OWNER, self.bot._curation)
+        await asyncio.wait_for(self.bot._curation_tasks[OWNER], 2)
         self.assertTrue((await self.db.free_use_state(OWNER))["deck"])
         self.assertNotIn(OWNER, self.bot._curation)
         self.assertEqual(await self.db.deck_count(OWNER), 0)

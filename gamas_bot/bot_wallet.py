@@ -8,7 +8,7 @@ retention sweeps.
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 from pathlib import Path
 import secrets
@@ -18,6 +18,8 @@ from typing import Any
 from telethon import Button
 
 from . import texts
+from .doc_extract import sha256_file
+from .metrics import METRICS
 from .billing import format_duration, format_toman, format_validity
 from .bot_ui import TELEGRAM_CAPTION_LIMIT
 from .config import format_payment_card
@@ -68,16 +70,15 @@ class WalletWorkflowMixin:
         ]
         buttons: list[list] = []
 
-        latest = await self.db.payment_history_paginated(user_id, limit=1)
-        if latest and is_open_payment(latest[0]["status"]):
-            payment = latest[0]
+        payment = await self.db.open_payment_for_user(user_id)
+        if payment is not None:
             order_buttons = [
                 Button.inline(
                     texts.BTN_TRACK_OPEN_ORDER,
                     f"payopen:{payment['payment_id']}".encode("ascii"),
                 )
             ]
-            if not payment["receipt_path"]:
+            if payment["status"] in ("awaiting_payment", "pending") and not payment["receipt_path"]:
                 order_buttons.append(
                     Button.inline(
                         texts.BTN_CANCEL_ORDER,
@@ -128,6 +129,8 @@ class WalletWorkflowMixin:
                 texts.WALLET_RECENT_PAYMENTS,
             ]
         )
+        count = await self.db.count_user_payments(user_id)
+        payments_page = min(payments_page, max(0, (count - 1) // page_size))
         payments = await self.db.payment_history_paginated(
             user_id, limit=page_size + 1, offset=payments_page * page_size
         )
@@ -193,7 +196,7 @@ class WalletWorkflowMixin:
             return
         await self._show_payment(event, payment_id)
 
-    async def _show_payment(self, event: Any, payment_id: int) -> None:
+    async def _show_payment(self, event: Any, payment_id: int, *, edit_in_place: bool = False) -> None:
         payment = await self.db.payment(payment_id)
         if (
             payment is None
@@ -248,7 +251,10 @@ class WalletWorkflowMixin:
                 [Button.inline(texts.BTN_CANCEL_ORDER, f"payc:{payment_id}".encode())],
             ]
         buttons.append([Button.inline(texts.BTN_WALLET, b"wallet")])
-        await event.respond(text, buttons=buttons)
+        if edit_in_place:
+            await self._edit_or_reply(event, text, buttons)
+        else:
+            await event.respond(text, buttons=buttons)
 
     async def _cancel_payment(self, event: Any, payment_id: int) -> None:
         changed = await self.db.cancel_payment(payment_id, event.sender_id)
@@ -346,6 +352,7 @@ class WalletWorkflowMixin:
                     self._pending_payments[user_id] = payment_id
                     return
                 await run_file_io(receipt_path.chmod, 0o600)
+                receipt_hash = await run_file_io(sha256_file, receipt_path)
             except OSError:
                 await run_file_io(receipt_path.unlink, missing_ok=True)
                 self._pending_payments[user_id] = payment_id
@@ -354,7 +361,7 @@ class WalletWorkflowMixin:
             try:
                 attach = asyncio.create_task(
                     self.db.set_payment_receipt(
-                        payment_id, str(receipt_path), user_id=user_id
+                        payment_id, str(receipt_path), user_id=user_id, receipt_hash=receipt_hash
                     )
                 )
                 try:
@@ -409,6 +416,17 @@ class WalletWorkflowMixin:
             plan=format_duration(seconds) if seconds else payment["plan_code"],
             price=format_toman(int(price)) if price is not None else texts.UNKNOWN_AMOUNT,
         )
+        if payment.get("receipt_hash"):
+            try:
+                other_id = await self.db.other_payment_with_receipt_hash(payment_id, payment["receipt_hash"])
+            except sqlite3.Error:
+                METRICS.record_receipt_hash_error()
+                logger.warning("receipt duplicate lookup failed payment_id=%s", payment_id)
+                other_id = None
+            if other_id is not None:
+                text += "\n" + texts.ADMIN_RECEIPT_DUPLICATE.format(
+                    payment_id=to_persian_digits(other_id)
+                )
         buttons = [
             [Button.inline(texts.BTN_ORDER_DETAILS, f"adm:pd:{payment_id}".encode())]
         ]
@@ -639,14 +657,43 @@ class WalletWorkflowMixin:
 
     async def _receipt_cleanup_loop(self) -> None:
         """Delete reviewed receipts after the retention window."""
+        last_optimize = None
         while True:
             try:
                 await self._cleanup_expired_receipts()
-                await asyncio.sleep(24 * 3600)
+                await self._cleanup_retained_data()
+                now = self.deps.monotonic()
+                optimize = last_optimize is None or now - last_optimize >= 7 * 86400
+                await self.db.maintenance(optimize=optimize)
+                if optimize:
+                    last_optimize = now
             except asyncio.CancelledError:
                 raise
             except Exception:
-                logger.warning("receipt cleanup failed", exc_info=True)
+                METRICS.record_retention_error()
+                logger.warning("receipt cleanup or maintenance failed", exc_info=True)
+            await asyncio.sleep(24 * 3600)
+
+    async def _cleanup_retained_data(self) -> dict[str, int]:
+        totals = {}
+        for kind, days in (("documents", self.settings.document_retention_days),
+                           ("learning", self.settings.learning_retention_days),
+                           ("audit", self.settings.audit_retention_days),
+                           ("holds", self.settings.holds_retention_days)):
+            total = 0
+            if days > 0:
+                for _ in range(10):
+                    try:
+                        count = await self.db.expire_retained_data(kind, days, batch=500)
+                    except sqlite3.Error:
+                        METRICS.record_retention_error()
+                        logger.warning("retention sweep failed kind=%s", kind)
+                        break
+                    total += count
+                    if count < 500:
+                        break
+            totals[kind] = total
+        return totals
 
     async def _transcript_cleanup_loop(self) -> None:
         """Delete finished transcripts after the retention window (audit F-10)."""
@@ -684,7 +731,7 @@ class WalletWorkflowMixin:
     async def _cleanup_expired_receipts(self) -> None:
         if not await run_file_io(self.settings.receipt_dir.is_dir):
             return
-        cutoff = datetime.now() - timedelta(days=self.settings.receipt_retention_days)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=self.settings.receipt_retention_days)
         protected = {
             payment["receipt_path"]
             for payment in await self.db.pending_payments()
@@ -706,7 +753,7 @@ class WalletWorkflowMixin:
                     )
                     continue
                 if (
-                    datetime.fromtimestamp((await run_file_io(path.stat)).st_mtime)
+                    datetime.fromtimestamp((await run_file_io(path.stat)).st_mtime, timezone.utc)
                     < cutoff
                 ):
                     await run_file_io(path.unlink, missing_ok=True)

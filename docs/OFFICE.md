@@ -26,7 +26,7 @@ select its explicit audio/narration action.
 
 | Input or output | Default / fixed limit |
 | --- | --- |
-| Study document | `DOC_MAX_BYTES=52428800` (50 MiB) |
+| Study document | `DOC_MAX_BYTES=20971520` (20 MiB) |
 | Extracted text | 5000000 characters |
 | Document note/export source | 250000 characters |
 | Office text file / draft | 1000000 bytes / 100000 characters |

@@ -237,6 +237,7 @@ class GamasBot(
             weakref.WeakValueDictionary()
         )
         self._learning_in_flight: set[int] = set()
+        self._learning_global_semaphore = asyncio.Semaphore(settings.learning_global_concurrency)
         self._curation_tasks: dict[int, asyncio.Task[Any]] = {}
         self._learning_tasks: dict[int, asyncio.Task[Any]] = {}
         self._admission_tasks: set[asyncio.Task[Any]] = set()
@@ -244,6 +245,9 @@ class GamasBot(
         self._shutting_down = False
         self._admin_action_times: dict[tuple[int, str], float] = {}
         self._broadcast_running: set[int] = set()
+        self._broadcast_previews: dict[int, tuple[str, int | None]] = {}
+        self._broadcast_resume: dict[int, int] = {}
+        self._broadcast_stop = asyncio.Event()
         self._ocr_client: I2OCRClient | None = None
         self._started_at = time.time()
 
@@ -303,15 +307,16 @@ class GamasBot(
         self.queue.ensure_workers()
         self._receipt_cleanup_task = asyncio.create_task(self._receipt_cleanup_loop())
         self._transcript_cleanup_task = asyncio.create_task(self._transcript_cleanup_loop())
-        if self.settings.office_enabled:
-            self._office_session_cleanup_task = asyncio.create_task(
-                self._office_session_cleanup_loop()
-            )
+        # Support prompts share this bounded periodic sweep even when Office is disabled.
+        self._office_session_cleanup_task = asyncio.create_task(
+            self._office_session_cleanup_loop()
+        )
         if not self.settings.bot_token:
             raise RuntimeError(
                 "TELEGRAM_BOT_TOKEN is not set; refusing interactive Telethon login."
             )
         await self.client.start(bot_token=self.settings.bot_token)
+        await self._recover_broadcasts()
         logger.info("Gamas Bot v3 started admins=%d", len(self.settings.admin_ids))
         await self.subscription.startup_self_check()
         if self.subscription.required and self.subscription.configured:
@@ -421,10 +426,14 @@ class GamasBot(
                 )
                 if job.message is not None:
                     try:
+                        message_id = getattr(job.message, "id", None)
+                        notification = texts.RESTARTING_JOB_CANCELLED
+                        if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0:
+                            notification += "\n" + texts.RESTARTING_JOB_MESSAGE_REFERENCE.format(
+                                message_id=to_persian_digits(message_id)
+                            )
                         await asyncio.wait_for(
-                            job.message.reply(
-                                texts.RESTARTING_JOB_CANCELLED
-                            ),
+                            job.message.reply(notification),
                             timeout=2.0,
                         )
                     except Exception:
@@ -749,14 +758,7 @@ class GamasBot(
             result = await self.subscription.check_membership(
                 user_id, force=True, allow_cache=False
             )
-            checked_at = iso(datetime.now(timezone.utc))
-            await self.subscription.record_result(user_id, result)
-            await self.db.set_subscription_state(
-                user_id,
-                result.status or result.state,
-                verified_at=checked_at if result.is_member else None,
-                checked_at=checked_at,
-            )
+            await self.subscription.record_result(user_id, result, touch_checked_at=True)
             checked += 1
             if result.is_unknown:
                 logger.warning("membership sweep paused on an inconclusive check")
@@ -990,6 +992,10 @@ class GamasBot(
         r.register_exact("adm:users", lambda e, _u, _d: self._show_admin_users(e))
         r.register_exact("adm:pay", lambda e, _u, _d: self._show_admin_payments(e, 0))
         r.register_exact("adm:bcast", self._cb_admin_broadcast)
+        r.register_exact("adm:bcgo", self._cb_broadcast_go)
+        r.register_exact("adm:bcstop", self._cb_broadcast_stop)
+        r.register_exact("adm:bccancel", self._cb_broadcast_cancel)
+        r.register_prefix("adm:bcresume:", self._cb_broadcast_resume)
         r.register_exact("adm:audit", lambda e, _u, _d: self._show_admin_audit(e, 0))
         r.register_exact("adm:board", lambda e, _u, _d: self._admin_board(e))
         r.register_exact("ref:home", lambda e, u, _d: self._show_referrals(e, u))
@@ -1082,7 +1088,7 @@ class GamasBot(
         if data.startswith("payc:"):
             await self._cancel_payment(event, payment_id)
         elif data.startswith("payopen:"):
-            await self._show_payment(event, payment_id)
+            await self._show_payment(event, payment_id, edit_in_place=True)
         else:
             await self._await_receipt(event, payment_id)
 
@@ -1126,11 +1132,50 @@ class GamasBot(
         await self._show_admin_payment_detail(event, detail_payment_id)
 
     async def _cb_admin_broadcast(self, event, user_id: int, _data: str) -> None:
+        if self._broadcast_running:
+            await self._ack(event, texts.BROADCAST_RUNNING, alert=True)
+            return
+        self._broadcast_previews.pop(user_id, None)
+        self._broadcast_resume.pop(user_id, None)
         self._pending_broadcast.add(user_id)
         await event.respond(
             texts.BROADCAST_PROMPT,
             buttons=[[Button.inline(texts.BTN_CANCEL, b"adm:home")]],
         )
+
+    async def _cb_broadcast_go(self, event, user_id: int, _data: str) -> None:
+        preview = self._broadcast_previews.pop(user_id, None)
+        if preview is None:
+            await self._ack(event, texts.INVALID_REQUEST, alert=True)
+            return
+        await self._ack(event)
+        await self._broadcast(event, preview[0], resume_id=preview[1])
+
+    async def _cb_broadcast_stop(self, event, user_id: int, _data: str) -> None:
+        if user_id in self._broadcast_running:
+            self._broadcast_stop.set()
+            await self._ack(event, texts.BROADCAST_STOPPED)
+        else:
+            await self._ack(event, texts.INVALID_REQUEST, alert=True)
+
+    async def _cb_broadcast_cancel(self, event, user_id: int, _data: str) -> None:
+        self._broadcast_previews.pop(user_id, None)
+        self._broadcast_resume.pop(user_id, None)
+        self._pending_broadcast.discard(user_id)
+        await self._edit_or_reply(event, texts.BROADCAST_CANCELLED, self._admin_menu())
+
+    async def _cb_broadcast_resume(self, event, user_id: int, data: str) -> None:
+        run_id = _to_int(data.rsplit(":", 1)[-1])
+        run = await self.db.broadcast_get_run(run_id) if run_id is not None else None
+        if not run or run["admin_id"] != user_id or run["status"] != "stopped":
+            await self._ack(event, texts.INVALID_REQUEST, alert=True)
+            return
+        if self._broadcast_running:
+            await self._ack(event, texts.BROADCAST_RUNNING, alert=True)
+            return
+        self._broadcast_resume[user_id] = int(run_id)
+        self._pending_broadcast.add(user_id)
+        await event.respond(texts.BROADCAST_RESUME_PROMPT)
 
     async def _cb_admin_audit_page(self, event, _user_id: int, data: str) -> None:
         page = _to_int(data.rsplit(":", 1)[-1])
@@ -1193,6 +1238,8 @@ class GamasBot(
             return
 
         self.conversations.on_callback_navigation(user_id, data)
+        if data.startswith("adm:") and data not in ("adm:bcgo", "adm:bcstop"):
+            self._broadcast_previews.pop(user_id, None)
 
         if not await self.callback_router.dispatch(event, user_id, data):
             await self._ack(event)
@@ -1207,6 +1254,7 @@ class GamasBot(
         user_id = event.sender_id
         if user_id is None:
             return
+        self.conversations.sweep_support_states(self.deps.monotonic())
         sender = getattr(event, "sender", None)
         existed = await self.db.user_exists(user_id)
         user = await self.db.ensure_user(
@@ -1222,6 +1270,8 @@ class GamasBot(
         text = (event.message.message or "").strip()
         command = _command_name(text)
         if command == "/start":
+            self._broadcast_previews.pop(user_id, None)
+            self._broadcast_resume.pop(user_id, None)
             self.conversations.reset_on_start(user_id)
             self._office_sessions.pop(user_id, None)
             if not existed:
@@ -1230,6 +1280,14 @@ class GamasBot(
                 if payload.lower().startswith("ref_"):
                     await self._apply_referral(event, user_id, payload[4:])
             await self._show_main(event, first_start=True)
+            pending = self._curation.get(user_id)
+            if pending and pending.get("delivery_failed") and not self._curation_stale(pending):
+                prefix = self._curation_prefix(str(pending["kind"]))
+                await event.respond(
+                    texts.CURATION_DELIVERY_RETRY,
+                    buttons=[[Button.inline(texts.CURATION_RESUME_BUTTON,
+                                            f"{prefix}:cur:resume".encode("ascii"))]],
+                )
             return
 
         # Admin conversational states.
@@ -1252,6 +1310,8 @@ class GamasBot(
                 return
         if self._is_admin(user_id) and user_id in self._pending_broadcast:
             if command == "/cancel":
+                self._broadcast_previews.pop(user_id, None)
+                self._broadcast_resume.pop(user_id, None)
                 self._pending_broadcast.discard(user_id)
                 await event.reply(texts.BROADCAST_CANCELLED)
                 return
@@ -1263,11 +1323,10 @@ class GamasBot(
             if text.startswith("/"):
                 await event.reply(texts.INVALID_COMMAND_TEXT)
                 return
-            self._pending_broadcast.discard(user_id)
-            await self._broadcast(event, text)
+            await self._prepare_broadcast(event, user_id, text)
             return
         if self._is_admin(user_id) and user_id in self._support_admin_states and not command:
-            ticket_id = self._support_admin_states[user_id]
+            ticket_id, _armed_at = self._support_admin_states[user_id]
             await self._handle_admin_support_text(event, user_id, ticket_id, text)
             return
         if self._is_admin(user_id) and command:
@@ -1302,6 +1361,8 @@ class GamasBot(
             return
 
         if command == "/cancel":
+            self._broadcast_previews.pop(user_id, None)
+            self._broadcast_resume.pop(user_id, None)
             self.conversations.reset_on_cancel(user_id)
             self._office_sessions.pop(user_id, None)
             await event.reply(texts.ORDER_CANCELLED)

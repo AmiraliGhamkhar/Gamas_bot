@@ -10,6 +10,11 @@ from typing import Any
 from .db_billing import BillingRepositoryMixin
 from .db_core import _rows, iso
 from .db_users import UsersRepositoryMixin
+from .metrics import METRICS
+
+
+class FlashcardLimitError(ValueError):
+    """A deck has reached its configured card ceiling."""
 
 
 class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
@@ -39,10 +44,11 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
             )
             if active:
                 return "active"
+            # Quiz sessions are written with iso(), a fixed UTC ISO timestamp.
             recent = await _rows(
                 self.db,
                 "SELECT COUNT(*) FROM quiz_sessions WHERE user_id = ? "
-                "AND julianday(created_at) >= julianday(?)",
+                "AND created_at >= ?",
                 (int(user_id), hour_ago),
             )
             if recent and int(recent[0][0]) >= int(max_sessions_per_hour):
@@ -57,9 +63,20 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
         *,
         free_claim_id: str | None = None,
         paid_charge_id: str | None = None,
+        refund_seconds_value: int = 0,
     ) -> int:
         if not questions:
             raise ValueError("quiz session needs at least one question")
+        for question in questions:
+            if (not isinstance(question, dict) or not isinstance(question.get("question"), str)
+                    or not isinstance(question.get("options"), list)
+                    or len(question["options"]) != 4
+                    or not all(isinstance(option, str) for option in question["options"])
+                    or isinstance(question.get("correct_index"), bool)
+                    or not isinstance(question.get("correct_index"), int)
+                    or not 0 <= question["correct_index"] < 4):
+                METRICS.record_learning_validation_failure()
+                raise ValueError("invalid quiz question shape")
         now = iso(self._now())
         async with self._transaction():
             cursor = await self.db.execute(
@@ -69,24 +86,18 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 (int(user_id), int(item_id), len(questions), now, now),
             )
             session_id = int(cursor.lastrowid or 0)
-            for idx, question in enumerate(questions):
-                await self.db.execute(
-                    "INSERT INTO quiz_questions(session_id, idx, question, "
-                    "options_json, correct_index, explanation, source, difficulty) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        session_id,
-                        idx,
-                        str(question["question"]),
-                        json.dumps(question["options"], ensure_ascii=False),
-                        int(question["correct_index"]),
-                        str(question.get("explanation", "")),
-                        str(question.get("source", ""))[:120],
-                        str(question.get("difficulty", ""))[:20],
-                    ),
-                )
+            await self.db.executemany(
+                "INSERT INTO quiz_questions(session_id, idx, question, "
+                "options_json, correct_index, explanation, source, difficulty) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ((session_id, idx, str(question["question"]),
+                  json.dumps(question["options"], ensure_ascii=False),
+                  int(question["correct_index"]), str(question.get("explanation", "")),
+                  str(question.get("source", ""))[:120], str(question.get("difficulty", ""))[:20])
+                 for idx, question in enumerate(questions)),
+            )
             await self._finalize_free_use_locked(user_id, "quiz", free_claim_id)
-            await self._finalize_learning_charge_locked(user_id, paid_charge_id)
+            await self._finalize_learning_charge_locked(user_id, paid_charge_id, refund_seconds_value)
             return session_id
 
     async def quiz_get_session(
@@ -165,14 +176,18 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                     ),
                 )
             except sqlite3.IntegrityError:
+                METRICS.record_db_error()
+                await self.db.rollback()
                 return {"status": "already"}
             if is_correct:
-                await self.db.execute(
+                updated = await self.db.execute(
                     "UPDATE quiz_sessions SET score = score + 10, "
                     "current_index = current_index + 1, updated_at = ? "
-                    "WHERE session_id = ?",
-                    (now, int(session_id)),
+                    "WHERE session_id = ? AND current_index = ?",
+                    (now, int(session_id), current_index),
                 )
+                if updated.rowcount != 1:
+                    raise sqlite3.IntegrityError("quiz cursor changed during answer")
                 await self.db.execute(
                     "UPDATE users SET quiz_points = quiz_points + 10 "
                     "WHERE telegram_id = (SELECT user_id FROM quiz_sessions "
@@ -180,11 +195,13 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                     (int(session_id),),
                 )
             else:
-                await self.db.execute(
+                updated = await self.db.execute(
                     "UPDATE quiz_sessions SET current_index = current_index + 1, "
-                    "updated_at = ? WHERE session_id = ?",
-                    (now, int(session_id)),
+                    "updated_at = ? WHERE session_id = ? AND current_index = ?",
+                    (now, int(session_id), current_index),
                 )
+                if updated.rowcount != 1:
+                    raise sqlite3.IntegrityError("quiz cursor changed during answer")
             finished = current_index + 1 >= question_count
             if finished:
                 await self.db.execute(
@@ -296,9 +313,15 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
         *,
         free_claim_id: str | None = None,
         paid_charge_id: str | None = None,
+        refund_seconds_value: int = 0,
     ) -> int:
         if not cards:
             raise ValueError("a deck needs at least one card")
+        for card in cards:
+            if (not isinstance(card, dict) or not isinstance(card.get("front"), str)
+                    or not isinstance(card.get("back"), str)):
+                METRICS.record_learning_validation_failure()
+                raise ValueError("invalid flashcard shape")
         now = iso(self._now())
         async with self._transaction():
             cursor = await self.db.execute(
@@ -307,20 +330,13 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 (int(user_id), int(item_id), str(title), now),
             )
             deck_id = int(cursor.lastrowid or 0)
-            for idx, card in enumerate(cards):
-                await self.db.execute(
-                    "INSERT INTO flashcards(deck_id, idx, front, back, source) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        deck_id,
-                        idx,
-                        str(card["front"]),
-                        str(card["back"]),
-                        str(card.get("source", ""))[:120],
-                    ),
-                )
+            await self.db.executemany(
+                "INSERT INTO flashcards(deck_id, idx, front, back, source) VALUES (?, ?, ?, ?, ?)",
+                ((deck_id, idx, str(card["front"]), str(card["back"]),
+                  str(card.get("source", ""))[:120]) for idx, card in enumerate(cards)),
+            )
             await self._finalize_free_use_locked(user_id, "deck", free_claim_id)
-            await self._finalize_learning_charge_locked(user_id, paid_charge_id)
+            await self._finalize_learning_charge_locked(user_id, paid_charge_id, refund_seconds_value)
             return deck_id
 
     async def manual_deck_get_or_create(self, user_id: int) -> int:
@@ -336,7 +352,7 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
             user_id, None, "فلش‌کارت‌های دستی من", "manual"
         )
 
-    async def deck_add_card(self, deck_id: int, front: str, back: str) -> int:
+    async def deck_add_card(self, deck_id: int, front: str, back: str, *, max_cards: int = 200) -> int:
         async with self._transaction():
             count_rows = await _rows(
                 self.db,
@@ -344,10 +360,13 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                 (int(deck_id),),
             )
             idx = int(count_rows[0][0]) if count_rows else 0
-            await self.db.execute(
+            if idx >= max(1, int(max_cards)):
+                METRICS.record_learning_validation_failure()
+                raise FlashcardLimitError("deck card limit reached")
+            await self.db.executemany(
                 "INSERT INTO flashcards(deck_id, idx, front, back) "
                 "VALUES (?, ?, ?, ?)",
-                (int(deck_id), idx, str(front), str(back)),
+                [(int(deck_id), idx, str(front), str(back))],
             )
             return idx + 1
 

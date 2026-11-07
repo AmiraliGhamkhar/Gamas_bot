@@ -129,7 +129,19 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         sent = "\n".join(item["text"] for item in self.client.texts)
         self.assertIn("OCR پشتیبانی نمی‌شود", sent)
 
+    async def test_document_screen_metadata_excludes_full_text_and_chunks(self):
+        _, documents = await self.ingest("first.pdf", make_pdf_bytes(), mime="application/pdf")
+        document = documents[0]
+        metadata = await self.db.document_meta(OWNER, document["id"])
+        self.assertNotIn("text", metadata)
+        self.assertNotIn("chunks_json", metadata)
+        self.assertGreater(metadata["text_chars"], 0)
+        with mock.patch.object(self.db, "document_get", side_effect=AssertionError("large read")):
+            await self.bot._show_document_generate_screen(self.press(b"menu:main"), OWNER, document["id"], "deck")
+            await self.bot._show_document_card(self.press(b"menu:main"), OWNER, document["id"])
+
     async def test_oversized_document_is_rejected_before_download(self):
+        self.assertEqual(self.settings.doc_max_bytes, 20 * 1024 * 1024)
         event = self.upload(
             "huge.pdf",
             make_pdf_bytes(),
@@ -198,8 +210,8 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(event)
             generator.assert_awaited_once()
         # The prompt names the chunk locator, so the model can anchor items.
-        system = generator.await_args.kwargs["system"]
-        self.assertIn("صفحهٔ", system)
+        user_prompt = generator.await_args.kwargs["user"]
+        self.assertIn("صفحهٔ", user_prompt)
         await self.bot._handle_callback(self.press(b"fc:cur:save"))
         decks = await self.db.decks_list(OWNER)
         self.assertEqual(len(decks), 1)
@@ -225,6 +237,33 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(rows), 5)
         self.assertTrue(all(row[1] for row in rows))
+
+    async def test_overflow_split_persists_real_parent_locator(self):
+        from gamas_bot.doc_extract import DocChunk
+        from gamas_bot.llm import LLMContextOverflowError
+
+        item = await self.db.library_add(OWNER, "booklet", 1, 2, None, title="سند")
+        source = {"item_id": item, "doc_id": None, "title": "سند", "chunks": [
+            DocChunk(0, "صفحه ۳", ("صفحه ۳",), "متن درس " * 500)
+        ]}
+        calls = 0
+        async def provider(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise LLMContextOverflowError("overflow")
+            return {"cards": [
+                {"front": f"پرسش شماره {calls * 100 + i}", "back": "پاسخ", "source": "fabricated"}
+                for i in range(10)
+            ]}
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
+            await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER, kind="deck",
+                                               source=source, wanted=10, cost=0, note="test", title="سند")
+        await self.bot._handle_callback(self.press(b"fc:cur:save"))
+        rows = await self.db.db.execute_fetchall("SELECT source FROM flashcards")
+        self.assertGreaterEqual(len(rows), 5)
+        self.assertTrue(all(row[0].startswith("صفحه ۳") for row in rows))
+        self.assertTrue(all(row[0] != "بخش ۱" for row in rows))
 
     async def test_generation_reports_partial_chunk_failures(self):
         """One uncovered chunk must not fail the whole generation."""
@@ -393,7 +432,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         user_prompt = generator.await_args.kwargs["user"]
         self.assertIn("تنفس سلولی", user_prompt)
         self.assertIn("چرخهٔ کربس", user_prompt)
-        self.assertIn("بخش «تنفس سلولی»", generator.await_args.kwargs["system"])
+        self.assertIn("بخش «تنفس سلولی»", generator.await_args.kwargs["user"])
 
     async def test_forwarding_the_original_document_shows_a_bar(self):
         """Re-sending an original file is work; the panel must show it."""
@@ -543,13 +582,13 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         chunks = [DocChunk(i, f"صفحهٔ {i}", (f"صفحهٔ {i}",), f"متن یکتا {i}") for i in range(12)]
         source = {"item_id": item, "doc_id": None, "title": "سند", "chunks": chunks}
         async def provider(*args, **kwargs):
-            chunk = next(chunk for chunk in chunks if chunk.text == kwargs["user"])
-            return {"cards": [{"front": f"پرسش {chunk.index}", "back": "پاسخ", "source": chunk.locator}]}
+            chunk = next(chunk for chunk in chunks if kwargs["user"].endswith(chunk.text))
+            return {"cards": [{"front": f"پرسش {chunk.index} مورد {i}", "back": "پاسخ", "source": chunk.locator} for i in range(5)]}
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER, kind="deck",
                                                source=source, wanted=5, cost=0, note="test", title="سند")
-        self.assertEqual(self.bot._curation[OWNER]["skipped"], 7)
-        self.assertIn("۷ بخش", self.client.texts[-1]["text"])
+        self.assertEqual(self.bot._curation[OWNER]["skipped"], 10)
+        self.assertIn("۱۰ بخش", self.client.texts[-1]["text"])
         self.assertIn("بررسی نشد", self.client.texts[-1]["text"])
 
 

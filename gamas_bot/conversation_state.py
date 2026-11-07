@@ -21,8 +21,8 @@ class ConversationStateStore:
 
     pending_payments: dict[int, int] = field(default_factory=dict)
     pending_broadcast: set[int] = field(default_factory=set)
-    support_states: dict[int, tuple[str, object]] = field(default_factory=dict)
-    support_admin_states: dict[int, int] = field(default_factory=dict)
+    support_states: dict[int, tuple[str, object, float]] = field(default_factory=dict)
+    support_admin_states: dict[int, tuple[int, float]] = field(default_factory=dict)
     pending_reject_reason: dict[int, int] = field(default_factory=dict)
     pending_flashcard: dict[int, tuple[int, str]] = field(default_factory=dict)
     pending_flashcard_front: dict[int, str] = field(default_factory=dict)
@@ -30,6 +30,15 @@ class ConversationStateStore:
     pending_user_search: set[int] = field(default_factory=set)
     pending_free_reset: dict[int, int] = field(default_factory=dict)
     office_sessions: dict[int, OfficeSession] = field(default_factory=dict)
+
+    def sweep_support_states(self, now: float) -> None:
+        """Expire abandoned support prompts without retaining a separate timer per user."""
+        for user_id, state in list(self.support_states.items()):
+            if now - state[2] >= 1800:
+                self.support_states.pop(user_id, None)
+        for admin_id, state in list(self.support_admin_states.items()):
+            if now - state[1] >= 1800:
+                self.support_admin_states.pop(admin_id, None)
 
     def reset_on_start(self, user_id: int) -> None:
         """``/start`` is a hard reset boundary for every armed prompt."""
@@ -90,8 +99,9 @@ class ConversationStateStore:
         if not data.startswith("adm:sr:"):
             self.support_admin_states.pop(user_id, None)
 
-        self.pending_flashcard.pop(user_id, None)
-        self.pending_flashcard_front.pop(user_id, None)
+        if not data.startswith("fc:man:"):
+            self.pending_flashcard.pop(user_id, None)
+            self.pending_flashcard_front.pop(user_id, None)
 
         if not data.startswith("office:"):
             self.office_sessions.pop(user_id, None)

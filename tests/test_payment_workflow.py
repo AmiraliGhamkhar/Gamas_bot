@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +97,29 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         event.message.file.mime_type = "image/png"
         event.message.file.size = source.stat().st_size
         return event
+
+    async def test_cancelled_payment_history_filter(self):
+        cancelled = await self.new_order()
+        await self.db.cancel_payment(cancelled, USER)
+        pending = await self.new_order()
+        view = await self.press(ADMIN, "adm:hub:pay:hist:cancelled")
+        rendered = " ".join(text for text, _ in view.edits)
+        self.assertIn(to_persian_digits(cancelled), rendered)
+        self.assertNotIn("#" + to_persian_digits(pending), rendered)
+        self.assertEqual([row["payment_id"] for row in await self.db.all_payments(status="cancelled")], [cancelled])
+
+    async def test_viewing_receipt_preserves_bytes_and_mtime(self):
+        payment_id = await self.new_order()
+        await self.submit_receipt(payment_id)
+        path = Path((await self.db.payment(payment_id))["receipt_path"])
+        before_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        before_mtime = path.stat().st_mtime_ns
+        before_count = len(self.bot.client.deliveries)
+        await self.press(ADMIN, f"adm:rcpt:{payment_id}")
+        await self.press(ADMIN, f"adm:rcpt:{payment_id}")
+        self.assertEqual(len(self.bot.client.deliveries), before_count + 2)
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before_hash)
+        self.assertEqual(path.stat().st_mtime_ns, before_mtime)
 
     async def test_cancelled_receipt_download_removes_partial_file(self):
         payment_id = await self.new_order()
@@ -220,6 +244,72 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("تأیید شده", history.edits[-1][0])
         admin_history = await self.press(ADMIN, "adm:ph:0")
         self.assertIn("تأیید شده", admin_history.edits[-1][0])
+
+    async def test_duplicate_receipt_warns_but_different_image_does_not(self):
+        async def attach(user_id, color):
+            payment_id = await self.new_order(user_id)
+            source = self.root / f"image-{user_id}.png"
+            Image.new("RGB", (24, 24), color).save(source)
+            event = FakeJobEvent(source=source, chat_id=user_id)
+            event.message.photo = object()
+            event.message.file.mime_type = "image/png"
+            event.message.file.size = source.stat().st_size
+            await self.bot._handle_receipt_upload(event, user_id, payment_id=payment_id)
+            return payment_id, self.bot.client.deliveries[-1]["caption"]
+
+        first, _ = await attach(USER, "white")
+        second, caption = await attach(OTHER_USER, "white")
+        self.assertIn("تصویر رسید قبلاً", caption)
+        self.assertIn(to_persian_digits(first), caption)
+        self.assertEqual((await self.db.payment(first))["receipt_hash"],
+                         (await self.db.payment(second))["receipt_hash"])
+        third_user = 557
+        await self.db.ensure_user(third_user)
+        _, caption = await attach(third_user, "black")
+        self.assertNotIn("تصویر رسید قبلاً", caption)
+
+    async def test_cancelled_order_hash_does_not_trigger_duplicate_warning(self):
+        import hashlib
+        from gamas_bot.doc_extract import sha256_file
+
+        old = await self.new_order()
+        await self.db.cancel_payment(old, USER)
+        source = self.root / "same.png"
+        Image.new("RGB", (24, 24), "white").save(source)
+        from gamas_bot.intake import _normalize_receipt_image
+        normalized = self.root / "normalized.jpg"
+        normalized.write_bytes(source.read_bytes())
+        self.assertTrue(_normalize_receipt_image(normalized, max_bytes=100000))
+        digest = sha256_file(normalized)
+        self.assertEqual(len(bytes.fromhex(digest)), hashlib.sha256().digest_size)
+        await self.db._write("UPDATE payments SET receipt_hash=? WHERE payment_id=?", (digest, old))
+        new = await self.new_order(OTHER_USER)
+        event = FakeJobEvent(source=source, chat_id=OTHER_USER)
+        event.message.photo = object()
+        event.message.file.mime_type = "image/png"
+        event.message.file.size = source.stat().st_size
+        await self.bot._handle_receipt_upload(event, OTHER_USER, payment_id=new)
+        self.assertNotIn("تصویر رسید قبلاً", self.bot.client.deliveries[-1]["caption"])
+
+    async def test_open_order_edits_wallet_screen_in_place(self):
+        payment_id = await self.new_order()
+        event = await self.press(USER, f"payopen:{payment_id}")
+        self.assertTrue(event.edits)
+        self.assertEqual(event.responses, [])
+        self.assertIn(to_persian_digits(payment_id), event.edits[-1][0])
+
+    async def test_wallet_finds_older_open_order_and_clamps_history(self):
+        open_id = await self.new_order()
+        await self.db._write(
+            "INSERT INTO payments(user_id,plan_code,status,created_at) VALUES (?, ?, 'cancelled', ?)",
+            (USER, PLAN, "2026-01-01T00:00:00+00:00"),
+        )
+        wallet = await self.press(USER, "walletp:9999")
+        text, buttons = wallet.edits[-1]
+        self.assertIn(f"payopen:{open_id}".encode(), self.payloads(buttons))
+        self.assertIn(f"payc:{open_id}".encode(), self.payloads(buttons))
+        self.assertIn(f"#{to_persian_digits(open_id)}", text)
+        self.assertNotIn(b"walletp:9998", self.payloads(buttons))
 
     async def test_wallet_keeps_recent_payments_on_the_account_screen_with_pagination(self):
         payment_ids = []

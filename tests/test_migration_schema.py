@@ -36,6 +36,51 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(expected, "no v3 migrations were found")
         self.assertEqual(applied, expected)
 
+    async def test_submission_links_report_non_null_orphans(self):
+        await self.db.ensure_user(123)
+        await self.db.library_add(123, "booklet", 1, 2, None, title="no submission")
+        self.assertFalse(any("submission_id" in x for x in await self.db.user_reference_integrity()))
+        await self.db.library_add(123, "booklet", 1, 3, 987654, title="orphan")
+        legacy = sqlite3.connect(self.db.path)
+        try:
+            legacy.execute("INSERT INTO ledger(user_id,seconds,kind,note,created_at,submission_id) "
+                           "VALUES (123,1,'debit','legacy','2026-01-01',987655)")
+            legacy.commit()
+        finally:
+            legacy.close()
+        problems = await self.db.user_reference_integrity()
+        self.assertIn("orphan rows: library_items.submission_id = 1", problems)
+        self.assertIn("orphan rows: ledger.submission_id = 1", problems)
+        # Integrity inspection is report-only and preserves the legacy row.
+        rows = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM library_items WHERE submission_id=987654")
+        self.assertEqual(rows[0][0], 1)
+
+    async def test_quiz_admission_query_uses_user_created_index(self):
+        rows = await self.db.db.execute_fetchall(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM quiz_sessions "
+            "WHERE user_id = ? AND created_at >= ?", (123, "2026-01-01T00:00:00+00:00")
+        )
+        self.assertTrue(any("idx_quiz_sessions_user_created" in str(row[3]) for row in rows))
+        rows = await self.db.db.execute_fetchall("PRAGMA index_list(quiz_answers)")
+        self.assertIn("idx_quiz_answers_session", {row[1] for row in rows})
+
+    async def test_performance_indexes_and_lot_query_plan(self):
+        await self.db.ensure_user(123)
+        await self.db.add_credit(123, 3600, note="test", validity_days=30)
+        rows = await self.db.db.execute_fetchall(
+            "EXPLAIN QUERY PLAN SELECT id FROM ledger WHERE user_id=? AND kind='credit' "
+            "AND julianday(created_at) <= julianday(?) "
+            "AND (expires_at IS NULL OR julianday(expires_at) > julianday(?))",
+            (123, "2026-01-01", "2026-01-01"),
+        )
+        self.assertTrue(any("idx_ledger_user_kind" in str(row[3]) for row in rows))
+        indexes = await self.db.db.execute_fetchall(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'"
+        )
+        self.assertTrue({"idx_users_quiz_points", "idx_users_banned_seen", "idx_users_seen_active",
+                         "idx_transcriptions_created", "idx_documents_library_item"}
+                        <= {row[0] for row in indexes})
+
     async def test_application_tables_are_exactly_the_declared_set(self):
         rows = await self.db.db.execute_fetchall(
             "SELECT name FROM sqlite_master WHERE type = 'table' "
@@ -175,6 +220,36 @@ class PopulatedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             self.assertGreater(new_id, 101)
             await db.assert_user_reference_integrity()
             await db.close()
+
+
+class HardeningUpgradeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_populated_019_upgrade_and_reopen_are_replay_safe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "before-020.sqlite"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name >= "020_":
+                    break
+                conn.executescript(migration.read_text(encoding="utf-8"))
+                conn.execute("INSERT INTO schema_migrations VALUES (?, '2026-01-01')", (migration.name,))
+            conn.execute("INSERT INTO users(telegram_id,joined_at) VALUES (123,'2026-01-01')")
+            conn.execute("INSERT INTO ledger(user_id,seconds,kind,note,created_at) VALUES (123,700,'credit','original','2026-01-01')")
+            conn.commit()
+            conn.close()
+            applied = None
+            for _ in range(2):
+                db = Database(path)
+                await db.connect()
+                self.assertEqual(await db.available_seconds(123), 700)
+                self.assertEqual((await db.db.execute_fetchall("SELECT seconds,note FROM ledger"))[0][:], (700, "original"))
+                migrations = [row[0] for row in await db.db.execute_fetchall("SELECT name FROM schema_migrations ORDER BY name")]
+                self.assertTrue(all(any(name.startswith(prefix) for name in migrations) for prefix in ("020_", "021_", "022_", "023_", "024_", "025_")))
+                if applied is not None:
+                    self.assertEqual(migrations, applied)
+                applied = migrations
+                self.assertEqual((await db.db.execute_fetchall("PRAGMA foreign_keys"))[0][0], 1)
+                await db.close()
 
 
 class OfficeLibraryUpgradeTests(unittest.IsolatedAsyncioTestCase):

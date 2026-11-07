@@ -28,8 +28,9 @@ all eligible routes are full/cooling down.
 5. Change hosting if the account kills permitted work; cron cannot bypass quotas.
 
 Document parsing uses threads, not a separate CPU/memory sandbox. Pathological
-files may still consume substantial resources. The document cache has no automatic
-retention cap; monitor it separately from library references.
+files may still consume substantial resources. Document-cache retention defaults
+to off; optionally enable `DOCUMENT_RETENTION_DAYS` for old unlinked caches, and
+monitor live library references separately.
 
 ## Measure offline
 
@@ -48,3 +49,17 @@ python -m scripts.perf_bench --help
 Other tools: `scripts.admin_report_bench`, `scripts.document_chunk_bench`.
 Simulated latencies/429s are test inputs, not live measurements. Record settings,
 Python version, workload and host quotas with results; do not promise fixed throughput.
+
+Document uploads default to 20 MiB (`DOC_MAX_BYTES`); Office archive entries
+are also limited to 100 MiB in total (`DOC_UNPACKED_MAX_BYTES`). Operators may
+raise these limits, but doing so increases peak memory on the 2 GiB host.
+
+Learning generations are limited by `LEARNING_GLOBAL_CONCURRENCY` (default 2),
+with `LEARNING_CHUNK_CONCURRENCY` workers per generation and a separate
+`LEARNING_MAX_OUTPUT_TOKENS` budget (default 4096). Static system prompts improve
+prefix caching; source data and retry instructions are sent in the user prompt.
+
+A learning generation holds its global admission permit while running; provider
+capacity is checked without waiting, so it never waits for a second slot while
+holding that permit. If all routes are saturated, the normal learning retry and
+refund path applies rather than queueing behind a provider slot.

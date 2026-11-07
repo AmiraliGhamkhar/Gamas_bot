@@ -1246,7 +1246,8 @@ class JobPipelineMixin:
             if content_text:
                 await self.db.library_set_content(item_id, content_text)
             await self.db.library_prune(
-                job.user_id, self.settings.library_max_items
+                job.user_id, self.settings.library_max_items,
+                protected_item_ids=self._protected_curation_items(job.user_id),
             )
         except Exception:
             logger.warning(

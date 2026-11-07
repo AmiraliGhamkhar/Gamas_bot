@@ -6,7 +6,8 @@ separate from credit, bans and admin authorization.
 The gate is **deferred**, not global: `/start`, help, wallet, purchases, support,
 library browsing and receipt upload stay available, so a non-member can pay and
 ask for help. File submissions, booklet generation, quizzes and flashcards are
-gated at the moment work would begin. A blocked file is remembered for up to
+gated at the moment work would begin; flashcard DOCX export is also gated.
+Answering an already-paid quiz session remains ungated. A blocked file is remembered for up to
 seven days and resumes automatically after **✅ بررسی عضویت** succeeds; the user
 does not send the file again.
 
@@ -18,7 +19,7 @@ does not send the file again.
 ```dotenv
 SUBSCRIPTION_CHANNEL=@gamas_AI
 SUBSCRIPTION_REQUIRED=true
-SUBSCRIPTION_CACHE_SECONDS=0
+SUBSCRIPTION_CACHE_SECONDS=300
 SUBSCRIPTION_TIMEOUT_SECONDS=20
 TELEGRAM_API_BASE_URL=https://api.telegram.org
 ```
@@ -28,7 +29,7 @@ TELEGRAM_API_BASE_URL=https://api.telegram.org
 4. Inspect subscription self-check logs. With a **non-admin** test account:
    leave the channel → sending a file shows the join prompt; join → **✅ بررسی
    عضویت** → the original file resumes; leave again → the next submission is
-   blocked. Help, wallet and support must still open while not a member.
+   blocked within five minutes (or immediately with cache 0). Help, wallet and support must still open while not a member.
 
 Use a resolvable public username or numeric channel ID. For a private channel,
 verify the user join-link workflow manually. `SUBSCRIPTION_REQUIRED=false` disables
@@ -40,7 +41,7 @@ migration command is needed.
 - `creator`, `administrator`, `member`, `restricted` count as members. Confirmed
   `left`/`kicked` or not-participant responses block access.
 - `ADMIN_IDS` are exempt; do not use admin accounts to test enforcement.
-- Cache `0` checks every gated action. Positive values cache confirmed members;
+- Cache `0` checks every gated action. The default 300 seconds caches confirmed members;
   concurrent checks for one user share a request.
 - A bounded sweep re-checks about 20 recently active users every six hours,
   one request at a time, oldest check first. It resumes after restarts through

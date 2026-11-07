@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 from telethon import Button
 from telethon.tl.custom import Message
 
+from . import texts
 from .billing import format_duration
 from .bot_ui import (
     DEFAULT_INTAKE_SUFFIX,
@@ -246,6 +247,7 @@ class DocumentOfficeWorkflowMixin:
                     source_type,
                     ocr=self._ocr_extractor(),
                     ocr_max_pages=int(self.settings.ocr_max_pages),
+                    max_unpacked_bytes=int(self.settings.doc_unpacked_max_bytes),
                 )
             text = await run_file_io(lambda: extracted.text)
             if not text.strip():
@@ -293,7 +295,7 @@ class DocumentOfficeWorkflowMixin:
         lines = [
             f"📄 {document.get('title') or 'سند'}",
             f"نوع: {label} | {to_persian_digits(int(document.get('page_count') or 0))} {unit}",
-            f"متن استخراج‌شده: {to_persian_digits(len(str(document.get('text') or '')))} نویسه",
+            texts.DOCUMENT_EXTRACTED_COUNT.format(count=to_persian_digits(int(document.get('text_chars', len(str(document.get('text') or '')))))),
         ]
         if self.settings.office_enabled:
             lines.append(
@@ -303,7 +305,7 @@ class DocumentOfficeWorkflowMixin:
             lines.append(
                 "پردازش صدای ارائه عملیات جداگانه‌ای است و فقط با انتخاب دکمهٔ صوت آغاز می‌شود."
             )
-        lines.extend(("", "پیش‌نمایش متن:", preview_text(str(document.get("text") or ""))))
+        lines.extend(("", texts.DOCUMENT_TEXT_PREVIEW, preview_text(str(document.get("text_preview", document.get("text")) or ""))))
         return "\n".join(lines)
 
     def _document_buttons(self, document_id: int, source_type: str = "") -> list[list]:
@@ -374,6 +376,7 @@ class DocumentOfficeWorkflowMixin:
         while True:
             await asyncio.sleep(30)
             self._office_sweep_sessions()
+            self.conversations.sweep_support_states(self.deps.monotonic())
 
     def _office_new_session(
         self, user_id: int, message: Any = None
@@ -748,7 +751,10 @@ class DocumentOfficeWorkflowMixin:
                 None,
                 title=title[:200],
             )
-            await self.db.library_prune(user_id, self.settings.library_max_items)
+            await self.db.library_prune(
+                user_id, self.settings.library_max_items,
+                protected_item_ids=self._protected_curation_items(user_id),
+            )
         except Exception as exc:
             logger.warning("could not index Office file error=%s", type(exc).__name__)
 
@@ -976,7 +982,7 @@ class DocumentOfficeWorkflowMixin:
                 event, "آفیس رایگان در تنظیمات سرور غیرفعال است.", alert=True
             )
             return
-        document = await self.db.document_get(user_id, document_id)
+        document = await self.db.document_meta(user_id, document_id)
         if document is None:
             await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
             return
@@ -1408,7 +1414,7 @@ class DocumentOfficeWorkflowMixin:
     async def _forward_document(
         self, event: Any, user_id: int, document_id: int
     ) -> None:
-        document = await self.db.document_get(user_id, document_id)
+        document = await self.db.document_meta(user_id, document_id)
         if document is None or not document.get("file_msg_ref"):
             await self._ack(  # type: ignore[attr-defined]
                 event, "این فایل دیگر در دسترس نیست.", alert=True
@@ -1445,7 +1451,7 @@ class DocumentOfficeWorkflowMixin:
     async def _start_document_presentation(
         self, event: Any, user_id: int, document_id: int
     ) -> None:
-        document = await self.db.document_get(user_id, document_id)
+        document = await self.db.document_meta(user_id, document_id)
         if not document or document["source_type"] != "pptx":
             await event.respond("این ارائه در دسترس نیست.")
             return
@@ -1541,7 +1547,7 @@ class DocumentOfficeWorkflowMixin:
     async def _show_document_card(
         self, event: Any, user_id: int, document_id: int
     ) -> None:
-        document = await self.db.document_get(user_id, document_id)
+        document = await self.db.document_meta(user_id, document_id)
         if document is None:
             await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
             await self._show_documents(event)
@@ -1555,7 +1561,7 @@ class DocumentOfficeWorkflowMixin:
     async def _show_document_generate_screen(
         self, event: Any, user_id: int, document_id: int, kind: str
     ) -> None:
-        document = await self.db.document_get(user_id, document_id)
+        document = await self.db.document_meta(user_id, document_id)
         if document is None:
             await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
             return
@@ -1623,7 +1629,7 @@ class DocumentOfficeWorkflowMixin:
         if kind == "deck":
             if choice and preset_cards(choice) is None:
                 await self._ack(  # type: ignore[attr-defined]
-                    event, "اندازهٔ انتخاب‌شده نامعتبر است.", alert=True
+                    event, texts.INVALID_LEARNING_SIZE, alert=True
                 )
                 return
             if (

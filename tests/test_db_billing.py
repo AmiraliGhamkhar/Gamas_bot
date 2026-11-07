@@ -38,6 +38,102 @@ class DatabaseTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class LedgerTests(DatabaseTestCase):
+    async def test_learning_refund_and_recovery_inherit_contributing_expiry(self):
+        await self.grant(100, 7200, days=30)
+        original = (await self.db.db.execute_fetchall(
+            "SELECT id, expires_at FROM ledger WHERE user_id=100 AND kind='credit'"
+        ))[0]
+        await self.db.spend_seconds(100, 3600, "learning", operation_id="first")
+        self.assertTrue(await self.db.refund_learning_charge(100, "first"))
+        refund = (await self.db.db.execute_fetchall(
+            "SELECT seconds, expires_at, note FROM ledger WHERE note LIKE 'refund:%'"
+        ))[0]
+        self.assertEqual((refund[0], refund[1]), (3600, original[1]))
+        self.assertIn("lots:" + str(original[0]), refund[2])
+        self.assertEqual(await self.db.available_seconds(100), 7200)
+        await self.db.spend_seconds(100, 3600, "learning", operation_id="second")
+        self.assertEqual(await self.db.recover_pending_learning_charges(), 1)
+        recovered = (await self.db.db.execute_fetchall(
+            "SELECT expires_at FROM ledger WHERE note LIKE 'refund:%' ORDER BY id DESC LIMIT 1"
+        ))[0]
+        self.assertEqual(recovered[0], original[1])
+        self.assertEqual(await self.db.available_seconds(100), 7200)
+
+    async def test_refund_compares_imported_expiries_as_instants(self):
+        await self.grant(100, 100, days=30)
+        await self.grant(100, 100, days=30)
+        credits = await self.db.db.execute_fetchall(
+            "SELECT id FROM ledger WHERE user_id=100 AND kind='credit' ORDER BY id"
+        )
+        # The lexically later timestamp is earlier in UTC.
+        await self.db._write("UPDATE ledger SET expires_at=? WHERE id=?",
+                             ("2099-01-01T00:30:00+02:00", credits[0][0]))
+        await self.db._write("UPDATE ledger SET expires_at=? WHERE id=?",
+                             ("2098-12-31T23:00:00+00:00", credits[1][0]))
+        await self.db.spend_seconds(100, 200, "learning", operation_id="mixed-offset")
+        await self.db.refund_learning_charge(100, "mixed-offset")
+        refund = await self.db.db.execute_fetchall(
+            "SELECT expires_at FROM ledger WHERE note LIKE 'refund:%'"
+        )
+        self.assertEqual(refund[0][0], "2099-01-01T00:30:00+02:00")
+
+    async def test_hold_retention_preserves_idempotency_and_delivery_state(self):
+        await self.grant(100, 100)
+        submission = await self.db.create_submission(100, "audio", "sample")
+        await self.db.reserve(100, submission, 50)
+        await self.db.release_hold(submission, "failed")
+        await self.db._write("UPDATE holds SET released_at='2000-01-01' WHERE submission_id=?", (submission,))
+        self.assertEqual(await self.db.expire_retained_data("holds", 30), 1)
+        await self.db.settle_hold(submission, 50)
+        row = (await self.db.db.execute_fetchall("SELECT delivered_at FROM submissions WHERE submission_id=?", (submission,)))[0]
+        self.assertIsNone(row[0])
+        with self.assertRaises(ValueError):
+            await self.db.reserve(100, submission, 50)
+        self.assertEqual(await self.db.available_seconds(100), 100)
+        self.assertEqual(await self.db.db.execute_fetchall("PRAGMA foreign_key_check"), [])
+
+    async def test_settlement_allocates_earliest_expiry_with_imported_offsets(self):
+        await self.grant(100, 100, days=30)
+        await self.grant(100, 100, days=30)
+        credits = await self.db.db.execute_fetchall("SELECT id FROM ledger WHERE kind='credit' ORDER BY id")
+        await self.db._write("UPDATE ledger SET expires_at=? WHERE id=?", ("2099-01-01T00:30:00+02:00", credits[0][0]))
+        await self.db._write("UPDATE ledger SET expires_at=? WHERE id=?", ("2098-12-31T23:00:00+00:00", credits[1][0]))
+        submission = await self.db.create_submission(100, "audio", "sample")
+        await self.db.reserve(100, submission, 200)
+        await self.db.settle_hold(submission, 100)
+        allocations = await self.db.db.execute_fetchall("SELECT credit_id,seconds FROM debit_allocations")
+        self.assertEqual([tuple(row) for row in allocations], [(credits[0][0], 100)])
+
+    async def test_invalid_source_expiry_aborts_refund(self):
+        await self.grant(100, 100, days=30)
+        await self.db.spend_seconds(100, 100, "learning", operation_id="bad-expiry")
+        await self.db._write("UPDATE ledger SET expires_at='invalid' WHERE kind='credit'")
+        with self.assertRaisesRegex(ValueError, "invalid source credit expiry"):
+            await self.db.refund_learning_charge(100, "bad-expiry")
+        rows = await self.db.db.execute_fetchall(
+            "SELECT status FROM learning_charges WHERE operation_id='bad-expiry'"
+        )
+        self.assertEqual(rows[0][0], "pending")
+        self.assertEqual((await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE note LIKE 'refund:%'"
+        ))[0][0], 0)
+
+    async def test_generic_refund_requires_original_debit_and_inherits_expiry(self):
+        await self.grant(100, 3600, days=30)
+        await self.db.spend_seconds(100, 3600, "test")
+        debit = (await self.db.db.execute_fetchall("SELECT id FROM ledger WHERE kind='debit'"))[0][0]
+        with self.assertRaises(ValueError):
+            await self.db.refund_seconds(100, 3600, "test")
+        await self.db.refund_seconds(100, 3600, "test", debit_id=debit)
+        rows = await self.db.db.execute_fetchall("SELECT expires_at FROM ledger WHERE kind='credit' ORDER BY id")
+        self.assertEqual(rows[0][0], rows[1][0])
+        self.assertEqual(await self.db.available_seconds(100), 3600)
+
+    async def test_nonpositive_refund_is_logged(self):
+        with self.assertLogs("gamas_bot.db.billing", level="WARNING") as logs:
+            await self.db.refund_seconds(100, 0, "test")
+        self.assertIn("user=100 seconds=0", logs.output[0])
+
     async def test_free_plan_granted_once(self):
         self.assertTrue(await self.db.grant_free_plan_once(100, 3600))
         self.assertFalse(await self.db.grant_free_plan_once(100, 3600))

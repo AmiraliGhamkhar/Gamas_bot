@@ -12,6 +12,7 @@ the billing-then-generation discipline in ``bot.py`` easy to follow.
 from __future__ import annotations
 
 import json
+import logging
 import random
 import re
 import unicodedata
@@ -20,6 +21,8 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from .progress import to_persian_digits
+
+logger = logging.getLogger("gamas_bot.learning")
 
 #: Generated booklet mirrors retain a bounded preview in the legacy library.
 #: Uploaded documents retain their full extracted text and chunk cache instead.
@@ -74,36 +77,25 @@ def preset_cards(code: str) -> int | None:
 def distribute_counts(total: int, weights: list[int]) -> list[int]:
     """Split ``total`` items across chunks proportionally to their ``weights``.
 
-    Every chunk gets at least one item while the budget allows, and the result
-    always sums to ``total`` — so a 40-card deck is 40 cards no matter how the
-    document was chunked. When there are more chunks than items, the extra
-    chunks get zero and the caller simply skips them.
+    The result always sums to ``total``. Small presets are concentrated on
+    the longest chunks, bounding the number of calls for large documents.
     """
     total = max(0, int(total))
     if not weights:
         return []
+    if total == 0:
+        return [0] * len(weights)
     if total <= len(weights):
-        # Spread a small preset across the whole document rather than silently
-        # taking only its first pages. Select weighted midpoint quantiles.
-        clean = [max(1, int(weight)) for weight in weights]
-        pool = sum(clean)
-        counts = [0] * len(clean)
-        cumulative = 0
-        index = 0
-        for slot in range(total):
-            target = (slot + 0.5) * pool / total
-            while index < len(clean) - 1 and cumulative + clean[index] < target:
-                cumulative += clean[index]
-                index += 1
-            # One item per selected chunk when there are more chunks than
-            # items; choose the nearest remaining position for heavy pages.
-            candidate = index
-            if counts[candidate]:
-                candidate = min(
-                    (i for i, value in enumerate(counts) if not value),
-                    key=lambda i: (abs(i - index), i),
-                )
-            counts[candidate] = 1
+        # Concentrate small presets on the longest chunks to bound LLM calls.
+        selected_count = min(len(weights), total, max(2, total // 5))
+        selected = sorted(range(len(weights)), key=lambda i: (-weights[i], i))[:selected_count]
+        if selected_count == total:
+            allocated = [1] * selected_count
+        else:
+            allocated = distribute_counts(total, [weights[i] for i in selected])
+        counts = [0] * len(weights)
+        for index, count in zip(selected, allocated):
+            counts[index] = count
         return counts
     clean = [max(1, int(weight)) for weight in weights]
     pool = sum(clean)
@@ -247,31 +239,39 @@ def quiz_system_prompt(
     count: int, *, source: str | None = None, sources: tuple[str, ...] | None = None
 ) -> str:
     """Persian four-option, source-anchored MCQs across cognitive levels."""
-    total = int(count)
-    medium = max(1, round(total * 0.4))
-    hard = max(0, total - medium)
-    example_source = json.dumps((sources or (source or "صفحهٔ ۳",))[0], ensure_ascii=False)
+    # Counts and locators belong to the user prompt so the system prefix caches.
+    example_source = json.dumps("نشانگر منبع", ensure_ascii=False)
     return (
         "تو طراح سؤال‌های چهارگزینه‌ای فارسی در سطح متوسط تا سخت هستی. فقط بر پایهٔ متن داده‌شده "
         "سؤال بساز؛ اطلاعات بیرونی یا ادعاهای بدون پشتوانه اضافه نکن.\n"
-        f"دقیقاً {to_persian_digits(total)} سؤال بنویس.\n\n"
         "ترکیب آموزشی:\n"
         "- ترکیبی متعادل از یادآوری، درک مفهوم و به‌کاربستن بساز. "
         "برای به‌کاربستن، تحلیل و ارزیابی از سناریو کوتاه و «کدام گزینه» استفاده کن.\n"
-        f"- حدود ۴۰٪ سؤال‌ها متوسط و ۶۰٪ سخت باشند؛ تقریباً {to_persian_digits(medium)} متوسط "
-        f"و {to_persian_digits(hard)} سخت.\n"
+        "- حدود ۴۰٪ سؤال‌ها متوسط و ۶۰٪ سخت باشند.\n"
         "- دشواری هر سؤال را در difficulty با medium یا hard مشخص کن.\n"
         "- هر سؤال دقیقاً ۴ گزینه دارد و فقط یک گزینه کاملاً درست است.\n"
         "- سه گزینهٔ نادرست باید باورپذیر، هم‌موضوع و بر پایهٔ بدفهمی‌های رایج باشند.\n"
         "- گزینه‌ها هم‌سبک و تقریباً هم‌طول باشند و پاسخ درست با نشانهٔ ظاهری لو نرود.\n"
         "- از «همهٔ موارد فوق»، مطلق‌نماها و گزینه‌های گمراه‌کنندهٔ بی‌ارتباط پرهیز کن.\n"
         "- برای هر پاسخ یک توضیح کوتاه و مستند به متن بنویس.\n\n"
-        + _source_rule(source, sources)
+        + "منبع هر مورد را دقیقاً از نشانگرهای مشخص‌شده در پیام کاربر انتخاب کن.\n\n"
         + "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
         '{"questions":[{"question":"متن سؤال", "options":["الف", "ب", "ج", "د"], '
         '"correct":0, "explain":"توضیح کوتاه", "difficulty":"hard", '
         '"source":' + example_source + '}]}'
     )
+
+
+def learning_user_prompt(kind: str, count: int, sources: tuple[str, ...], text: str) -> str:
+    """Per-call instructions, deliberately separate from the cached system prompt."""
+    count = int(count)
+    label = "کارت" if kind == "deck" else "سؤال"
+    detail = f"دقیقاً {to_persian_digits(count)} {label} بساز.\n"
+    if kind != "deck":
+        medium = max(1, round(count * 0.4))
+        detail += (f"تقریباً {to_persian_digits(medium)} متوسط و "
+                   f"{to_persian_digits(max(0, count-medium))} سخت.\n")
+    return detail + _source_rule(None, sources) + "متن منبع:\n" + text
 
 
 def _clean_str(value: Any, limit: int) -> str:
@@ -387,7 +387,7 @@ def source_matches(source: Any, allowed: Iterable[str]) -> bool:
     return False
 
 
-def source_grounded_in(source: Any, text: str) -> bool:
+def source_grounded_in(source: Any, text: str, *, text_key: str | None = None) -> bool:
     """True when the cited locator literally occurs in the chunk that was read.
 
     A booklet keeps its own page/slide markers inside the archived text
@@ -400,11 +400,11 @@ def source_grounded_in(source: Any, text: str) -> bool:
     key = source_key(source)
     if not key or len(key.split()) < 2:
         return False
-    return f" {key} " in f" {source_key(text)} "
+    return f" {key} " in f" {text_key if text_key is not None else source_key(text)} "
 
 
 def verified_source(
-    source: Any, allowed: Iterable[str], text: str = ""
+    source: Any, allowed: Iterable[str], text: str = "", *, text_key: str | None = None
 ) -> str | None:
     """The locator to store for one item, or ``None`` when it is unverifiable.
 
@@ -426,7 +426,7 @@ def verified_source(
     for candidate in allowed:
         if candidate and source_matches(source, (candidate,)):
             return " ".join(str(candidate).split())[:MAX_SOURCE_CHARS]
-    if text and source_grounded_in(source, text):
+    if text and source_grounded_in(source, text, text_key=text_key):
         return _clean_source(source)
     return None
 
@@ -436,6 +436,7 @@ def anchor_items(
     allowed: Iterable[str],
     fallback: str,
     text: str = "",
+    *, text_key: str | None = None,
 ) -> list[dict[str, Any]]:
     """Attach a *verified* source to each generated item.
 
@@ -457,7 +458,7 @@ def anchor_items(
     for item in items:
         if not isinstance(item, dict):
             continue
-        locator = verified_source(item.get("source"), choices, text) or fallback
+        locator = verified_source(item.get("source"), choices, text, text_key=text_key) or fallback
         if not locator:
             locator = _clean_source(item.get("source"))
         record = dict(item)
@@ -700,7 +701,12 @@ def parse_quiz_payload(
             MAX_EXPLAIN_CHARS,
         )
         options = _extract_options(entry)
-        if not question or not explain or options is None:
+        if options is None:
+            # The quiz schema requires four options. In particular, a three-option
+            # numeric key is ambiguous and must never be silently mis-graded.
+            logger.debug("dropped quiz item with invalid option shape")
+            continue
+        if not question or not explain:
             continue
         if len(options) != 4 or any(not option for option in options):
             continue
@@ -777,12 +783,10 @@ def flashcard_system_prompt(
     count: int, *, source: str | None = None, sources: tuple[str, ...] | None = None
 ) -> str:
     """Persian minimum-information, cloze-first and source-anchored cards."""
-    total = int(count)
-    example_source = json.dumps((sources or (source or "صفحهٔ ۳",))[0], ensure_ascii=False)
+    example_source = json.dumps("نشانگر منبع", ensure_ascii=False)
     return (
         "تو طراح فلش‌کارت آموزشی فارسی هستی. فقط از متن داده‌شده کارت بساز؛ "
         "اطلاعات بیرونی یا ادعاهای بدون پشتوانه اضافه نکن.\n"
-        f"دقیقاً {to_persian_digits(total)} کارت بساز.\n\n"
         "قانون کمینه‌سازی اطلاعات:\n"
         "- هر کارت فقط یک واقعیت را بپرسد؛ پاسخ چندنکته‌ای را به چند کارت جدا بشکن.\n"
         "- فهرست‌های بیش از ۵ مورد را به کارت‌های شمارشی جداگانه تقسیم کن.\n"
@@ -790,7 +794,7 @@ def flashcard_system_prompt(
         "- هر روی کارت حداکثر ۱۶۰ نویسه باشد و پاسخ بلند را خلاصه کن.\n"
         "- برای اصطلاح، تعریف و فرمول ابتدا از قالب جای‌خالی استفاده کن؛ "
         "برای مفهوم و رابطهٔ علت و معلول از پرسش‌وپاسخ کوتاه.\n\n"
-        + _source_rule(source, sources)
+        + "منبع هر مورد را دقیقاً از نشانگرهای مشخص‌شده در پیام کاربر انتخاب کن.\n\n"
         + "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
         '{"cards":[{"front":"پرسش کوتاه", "back":"پاسخ یک‌خطی", "source":' + example_source + '}]}'
     )

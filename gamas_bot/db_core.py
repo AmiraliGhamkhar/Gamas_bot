@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 import os
+import random
 from pathlib import Path
 import re
 import sqlite3
@@ -37,6 +38,7 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "payments",
         "ledger",
         "holds",
+        "retired_holds",
         "audit",
         "debit_allocations",
         "hold_allocations",
@@ -56,6 +58,10 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "pending_gate_actions",
         "referrals",
         "referral_rewards",
+        "broadcast_runs",
+        "user_balances",
+        "balance_dirty",
+        "balance_backfill_state",
     }
 )
 
@@ -72,8 +78,20 @@ async def _rows(
     sql: str,
     parameters: Iterable[Any] | None = None,
 ) -> list[sqlite3.Row]:
-    """Fetch every row of ``sql`` as a materialized list."""
-    return list(await connection.execute_fetchall(sql, parameters))
+    """Fetch rows, retrying transient SQLite read contention twice."""
+    params = tuple(parameters) if parameters is not None else None
+    for attempt in range(3):
+        try:
+            return list(await connection.execute_fetchall(sql, params))
+        except sqlite3.Error as exc:
+            METRICS.record_db_error()
+            if (not isinstance(exc, sqlite3.OperationalError)
+                    or not any(word in str(exc).lower() for word in ("locked", "busy"))
+                    or attempt == 2):
+                raise
+            delay = (0.05, 0.15)[attempt] * random.uniform(0.9, 1.1)
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
 
 
 def utc_now() -> datetime:
@@ -167,6 +185,7 @@ class DatabaseCore:
         self._db: aiosqlite.Connection | None = None
         self._read_db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        self._balances_ready = False
         self._clock = clock
 
     def _now(self) -> datetime:
@@ -207,6 +226,15 @@ class DatabaseCore:
     async def _backfill_allocations(self) -> None:
         return None
 
+    async def _backfill_user_balances(self) -> None:
+        return None
+
+    async def _check_user_balances(self) -> None:
+        return None
+
+    async def _flush_balance_dirty_locked(self, limit: int | None = None) -> int:
+        return 0
+
     async def connect(self) -> None:
         await asyncio.to_thread(
             self.path.parent.mkdir, parents=True, exist_ok=True
@@ -218,6 +246,9 @@ class DatabaseCore:
         await self._db.execute("PRAGMA temp_store=MEMORY")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.execute("PRAGMA busy_timeout=5000")
+        # Bound the writer cache and retained WAL on the 2 GB host.
+        await self._db.execute("PRAGMA cache_size=-8000")
+        await self._db.execute("PRAGMA journal_size_limit=33554432")
         await self._apply_migrations()
         await self._db.commit()
         await self._db.execute("PRAGMA foreign_keys=ON")
@@ -225,12 +256,19 @@ class DatabaseCore:
         if problems:
             logger.warning("SQLite reference integrity: %s", "; ".join(problems[:20]))
         await self._backfill_allocations()
+        await self._backfill_user_balances()
+        self._balances_ready = True
+        await self._check_user_balances()
         if str(self.path) != ":memory:":
             self._read_db = await aiosqlite.connect(self.path)
             self._read_db.row_factory = aiosqlite.Row
             await self._read_db.execute("PRAGMA query_only=ON")
             await self._read_db.execute("PRAGMA temp_store=MEMORY")
             await self._read_db.execute("PRAGMA busy_timeout=5000")
+            # Bound the read cache and mapping on the 2 GB host.
+            await self._read_db.execute("PRAGMA cache_size=-16000")
+            await self._read_db.execute("PRAGMA mmap_size=134217728")
+            await self._read_db.execute("PRAGMA journal_size_limit=33554432")
         self._secure_file_permissions()
 
     def _secure_file_permissions(self) -> None:
@@ -244,6 +282,7 @@ class DatabaseCore:
                 logger.warning("could not restrict permissions on %s", candidate)
 
     async def close(self) -> None:
+        self._balances_ready = False
         if self._read_db is not None:
             await self._read_db.close()
             self._read_db = None
@@ -298,9 +337,14 @@ class DatabaseCore:
         async with self._write_lock:
             if self.db.in_transaction:
                 await self.db.rollback()
+                logger.warning("discarded uncommitted transaction before BEGIN IMMEDIATE")
+                METRICS.record_db_error()
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
                 yield
+                if self._balances_ready and self.db.in_transaction:
+                    while await self._flush_balance_dirty_locked(500) == 500:
+                        pass
                 await self.db.commit()
             except BaseException as exc:
                 await self.db.rollback()

@@ -16,7 +16,7 @@ Why this module exists:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Iterable
+from collections.abc import Awaitable, Collection, Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
@@ -183,12 +183,17 @@ class PaymentStoreProtocol(Protocol):
         payment_id: int,
         receipt_path: str,
         user_id: int | None = None,
+        *, receipt_hash: str | None = None,
     ) -> bool: ...
 
+    async def other_payment_with_receipt_hash(self, payment_id: int, receipt_hash: str) -> int | None: ...
     async def payment(self, payment_id: int) -> dict[str, Any] | None: ...
     async def open_awaiting_payment_for_user(
         self, user_id: int
     ) -> dict[str, Any] | None: ...
+
+    async def open_payment_for_user(self, user_id: int) -> dict[str, Any] | None: ...
+    async def count_user_payments(self, user_id: int) -> int: ...
 
     async def review_payment(
         self,
@@ -212,6 +217,8 @@ class SupportStoreProtocol(Protocol):
         *,
         initial_message: str | None = None,
         telegram_message_id: int | None = None,
+        max_open_tickets: int = 3,
+        cooldown_seconds: int = 600,
     ) -> dict[str, Any]: ...
 
     async def get_ticket(self, ticket_id: int) -> dict[str, Any] | None: ...
@@ -266,7 +273,9 @@ class LibraryStoreProtocol(Protocol):
         self, user_id: int, item_id: int
     ) -> dict[str, Any] | None: ...
 
-    async def library_prune(self, user_id: int, keep: int) -> int: ...
+    async def library_prune(
+        self, user_id: int, keep: int, *, protected_item_ids: Collection[int] = ()
+    ) -> int: ...
 
 
 @runtime_checkable
@@ -278,6 +287,10 @@ class DocumentStoreProtocol(Protocol):
     ) -> dict[str, Any] | None: ...
 
     async def document_get(
+        self, user_id: int, document_id: int
+    ) -> dict[str, Any] | None: ...
+
+    async def document_meta(
         self, user_id: int, document_id: int
     ) -> dict[str, Any] | None: ...
 

@@ -684,7 +684,8 @@ class Settings:
     #: Ceiling for an ingested study document (PDF/DOCX/PPTX), in bytes. Kept
     #: separate from ``max_file_size`` because a document is parsed into memory
     #: instead of streamed through the media worker.
-    doc_max_bytes: int = 50 * 1024 * 1024
+    doc_max_bytes: int = 20 * 1024 * 1024
+    doc_unpacked_max_bytes: int = 100 * 1024 * 1024
     #: OCR (third-party, opt-in). A text-poor PDF page, or an uploaded photo,
     #: is sent to i2ocr.com and read there. Off by default: the document leaves
     #: the host, so the deployment owner has to accept that trade-off.
@@ -696,6 +697,10 @@ class Settings:
     #: Wall-clock budget for one document's OCR run, in seconds.
     ocr_timeout_seconds: float = 600.0
 
+    #: Per-user support ticket admission limits.
+    support_max_open_tickets: int = 3
+    support_ticket_cooldown_seconds: int = 600
+
     # --- Mandatory channel subscription --------------------------------------
     #: Telegram channel (``@username`` or ``-100...``) whose current members
     #: gate every user-facing feature. Defaults to the official @gamas_AI.
@@ -706,7 +711,7 @@ class Settings:
     #: Short-lived cache for a *confirmed* membership, in seconds. ``0``
     #: re-checks on every interaction — the strict, fail-safe default, because
     #: a leaver must be restricted on their very next interaction.
-    subscription_cache_seconds: float = 0.0
+    subscription_cache_seconds: float = 300.0
     #: Per-request timeout of one ``getChatMember`` call, in seconds.
     subscription_timeout_seconds: float = 20.0
     #: Bot API base URL (overridable for a mirror or an offline test).
@@ -726,9 +731,17 @@ class Settings:
     flashcard_ai_deck_size: int = 10
     #: Per-user cap on stored flashcard decks (AI and manual counted together).
     flashcard_max_decks_per_user: int = 30
+    #: Upper bound on cards added to a manual deck.
+    flashcard_max_cards_per_deck: int = 200
     #: Parallel per-chunk model calls used by one generation (3–5 is the useful
     #: range; higher starts tripping provider per-minute limits).
     learning_chunk_concurrency: int = 4
+    learning_global_concurrency: int = 2
+    learning_max_output_tokens: int = 4096
+    document_retention_days: int = 0
+    learning_retention_days: int = 0
+    audit_retention_days: int = 0
+    holds_retention_days: int = 0
 
     # --- Derived --------------------------------------------------------------
     plan_values: dict[str, int] = field(default_factory=dict, compare=False)
@@ -1168,7 +1181,10 @@ def from_env(env_file: str | None = None) -> Settings:
             "MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE_BYTES, minimum=1024
         ),
         doc_max_bytes=_env_int(
-            "DOC_MAX_BYTES", 50 * 1024 * 1024, minimum=1024, maximum=1024**3
+            "DOC_MAX_BYTES", 20 * 1024 * 1024, minimum=1024, maximum=1024**3
+        ),
+        doc_unpacked_max_bytes=_env_int(
+            "DOC_UNPACKED_MAX_BYTES", 100 * 1024 * 1024, minimum=1024, maximum=1024**3
         ),
         max_media_duration_seconds=_env_float(
             "MAX_MEDIA_DURATION_SECONDS",
@@ -1479,10 +1495,14 @@ def from_env(env_file: str | None = None) -> Settings:
             maximum=8,
         ),
         library_max_items=_env_int("LIBRARY_MAX_ITEMS", 50, minimum=1, maximum=10_000),
+        support_max_open_tickets=_env_int("SUPPORT_MAX_OPEN_TICKETS", 3, minimum=1, maximum=1000),
+        support_ticket_cooldown_seconds=_env_int(
+            "SUPPORT_TICKET_COOLDOWN_SECONDS", 600, minimum=0, maximum=86400
+        ),
         subscription_channel=_env("SUBSCRIPTION_CHANNEL", "@gamas_AI").strip(),
         subscription_required=_env_bool("SUBSCRIPTION_REQUIRED", True),
         subscription_cache_seconds=_env_float(
-            "SUBSCRIPTION_CACHE_SECONDS", 0.0, minimum=0.0, maximum=3600.0
+            "SUBSCRIPTION_CACHE_SECONDS", 300.0, minimum=0.0, maximum=3600.0
         ),
         subscription_timeout_seconds=_env_float(
             "SUBSCRIPTION_TIMEOUT_SECONDS", 20.0, minimum=1.0, maximum=120.0
@@ -1508,8 +1528,21 @@ def from_env(env_file: str | None = None) -> Settings:
         flashcard_max_decks_per_user=_env_int(
             "FLASHCARD_MAX_DECKS_PER_USER", 30, minimum=1, maximum=500
         ),
+        flashcard_max_cards_per_deck=_env_int(
+            "FLASHCARD_MAX_CARDS_PER_DECK", 200, minimum=1, maximum=5000
+        ),
         learning_chunk_concurrency=_env_int(
             "LEARNING_CHUNK_CONCURRENCY", 4, minimum=1, maximum=8
+        ),
+        document_retention_days=_env_int("DOCUMENT_RETENTION_DAYS", 0, minimum=0, maximum=3650),
+        learning_retention_days=_env_int("LEARNING_RETENTION_DAYS", 0, minimum=0, maximum=3650),
+        audit_retention_days=_env_int("AUDIT_RETENTION_DAYS", 0, minimum=0, maximum=3650),
+        holds_retention_days=_env_int("HOLDS_RETENTION_DAYS", 0, minimum=0, maximum=3650),
+        learning_global_concurrency=_env_int(
+            "LEARNING_GLOBAL_CONCURRENCY", 2, minimum=1, maximum=8
+        ),
+        learning_max_output_tokens=_env_int(
+            "LEARNING_MAX_OUTPUT_TOKENS", 4096, minimum=256, maximum=32768
         ),
         dedup_window_seconds=_env_float(
             "DEDUP_WINDOW_SECONDS",
