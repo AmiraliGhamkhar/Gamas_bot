@@ -414,8 +414,14 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
     async def test_user_close_and_reopen_keep_history(self):
         await self.open_ticket()
         ticket = await self.latest_ticket()
-        await self.press(USER_A, f"sup:c:{ticket['id']}")
+        confirmation = await self.press(USER_A, f"sup:c:{ticket['id']}")
+        self.assertIn("آیا بستن تیکت", confirmation.edits[-1][0])
+        self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "awaiting_admin")
+        before = len(self.bot.client.texts)
+        await self.press(USER_A, f"sup:cy:{ticket['id']}")
         self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "closed")
+        await self.press(USER_A, f"sup:cy:{ticket['id']}")
+        self.assertEqual(len(self.bot.client.texts), before + 1)
         await self.press(USER_A, f"sup:o:{ticket['id']}")
         self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "open")
         self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 1)
@@ -520,6 +526,7 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
 
         assert payment_ticket_id is not None
         await self.press(USER_A, f"sup:c:{payment_ticket_id}")
+        await self.press(USER_A, f"sup:cy:{payment_ticket_id}")
         self.assertEqual((await self.db.get_ticket(payment_ticket_id))["status"], "closed")
         await self.press(USER_A, f"sup:o:{payment_ticket_id}")
         self.assertEqual((await self.db.get_ticket(payment_ticket_id))["status"], "open")

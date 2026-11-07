@@ -275,6 +275,19 @@ class SupportWorkflowMixin:
             if ticket is None:
                 await self._ack(event, texts.SUPPORT_TICKET_NOT_FOUND, alert=True)  # type: ignore[attr-defined]
                 return
+            if ticket["status"] == "closed":
+                await self._show_user_ticket(event, user_id, ticket_id)
+                return
+            await self._edit_or_reply(
+                event, texts.SUPPORT_CONFIRM_CLOSE,
+                [[Button.inline(texts.BTN_CONFIRM_APPROVE, f"sup:cy:{ticket_id}".encode())],
+                 [Button.inline(texts.BTN_BACK, f"sup:v:{ticket_id}".encode())]],
+            )
+        elif parts[1] == "cy":
+            ticket = await self._owned_ticket(user_id, ticket_id)
+            if ticket is None:
+                await self._ack(event, texts.SUPPORT_TICKET_NOT_FOUND, alert=True)  # type: ignore[attr-defined]
+                return
             try:
                 closed = await self.db.close_ticket(ticket_id, user_id, admin=False)
             except (ValueError, PermissionError, TicketStateError):
