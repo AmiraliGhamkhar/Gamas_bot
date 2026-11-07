@@ -39,10 +39,11 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
             )
             if active:
                 return "active"
+            # Quiz sessions are written with iso(), a fixed UTC ISO timestamp.
             recent = await _rows(
                 self.db,
                 "SELECT COUNT(*) FROM quiz_sessions WHERE user_id = ? "
-                "AND julianday(created_at) >= julianday(?)",
+                "AND created_at >= ?",
                 (int(user_id), hour_ago),
             )
             if recent and int(recent[0][0]) >= int(max_sessions_per_hour):

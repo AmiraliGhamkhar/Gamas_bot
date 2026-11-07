@@ -36,6 +36,15 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(expected, "no v3 migrations were found")
         self.assertEqual(applied, expected)
 
+    async def test_quiz_admission_query_uses_user_created_index(self):
+        rows = await self.db.db.execute_fetchall(
+            "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM quiz_sessions "
+            "WHERE user_id = ? AND created_at >= ?", (123, "2026-01-01T00:00:00+00:00")
+        )
+        self.assertTrue(any("idx_quiz_sessions_user_created" in str(row[3]) for row in rows))
+        rows = await self.db.db.execute_fetchall("PRAGMA index_list(quiz_answers)")
+        self.assertIn("idx_quiz_answers_session", {row[1] for row in rows})
+
     async def test_performance_indexes_and_lot_query_plan(self):
         await self.db.ensure_user(123)
         await self.db.add_credit(123, 3600, note="test", validity_days=30)
