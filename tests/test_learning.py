@@ -1764,8 +1764,16 @@ class AnchoredQualityTests(unittest.TestCase):
         self.assertGreater(counts[-1], counts[0])
         counts = distribute_counts(5, [1] * 20)
         self.assertEqual(sum(counts), 5)
-        self.assertEqual(sum(count == 0 for count in counts), 15)
-        self.assertGreater(max(i for i, count in enumerate(counts) if count), 15)
+        self.assertLessEqual(sum(count > 0 for count in counts), 2)
+        counts = distribute_counts(40, [56000] * 90)
+        self.assertEqual(sum(counts), 40)
+        self.assertLessEqual(sum(count > 0 for count in counts), 8)
+        for total in range(100):
+            for weights in ([1] * 90, [1, 1, 10000], []):
+                counts = distribute_counts(total, weights)
+                self.assertLessEqual(sum(counts), total)
+                if weights:
+                    self.assertEqual(sum(counts), total)
 
     def test_normalized_near_duplicates_drop_but_distinct_numbers_survive(self):
         from gamas_bot.learning import dedupe_cards, dedupe_questions

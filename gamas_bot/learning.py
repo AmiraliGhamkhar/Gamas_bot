@@ -74,36 +74,25 @@ def preset_cards(code: str) -> int | None:
 def distribute_counts(total: int, weights: list[int]) -> list[int]:
     """Split ``total`` items across chunks proportionally to their ``weights``.
 
-    Every chunk gets at least one item while the budget allows, and the result
-    always sums to ``total`` — so a 40-card deck is 40 cards no matter how the
-    document was chunked. When there are more chunks than items, the extra
-    chunks get zero and the caller simply skips them.
+    The result always sums to ``total``. Small presets are concentrated on
+    the longest chunks, bounding the number of calls for large documents.
     """
     total = max(0, int(total))
     if not weights:
         return []
+    if total == 0:
+        return [0] * len(weights)
     if total <= len(weights):
-        # Spread a small preset across the whole document rather than silently
-        # taking only its first pages. Select weighted midpoint quantiles.
-        clean = [max(1, int(weight)) for weight in weights]
-        pool = sum(clean)
-        counts = [0] * len(clean)
-        cumulative = 0
-        index = 0
-        for slot in range(total):
-            target = (slot + 0.5) * pool / total
-            while index < len(clean) - 1 and cumulative + clean[index] < target:
-                cumulative += clean[index]
-                index += 1
-            # One item per selected chunk when there are more chunks than
-            # items; choose the nearest remaining position for heavy pages.
-            candidate = index
-            if counts[candidate]:
-                candidate = min(
-                    (i for i, value in enumerate(counts) if not value),
-                    key=lambda i: (abs(i - index), i),
-                )
-            counts[candidate] = 1
+        # Concentrate small presets on the longest chunks to bound LLM calls.
+        selected_count = min(len(weights), total, max(2, total // 5))
+        selected = sorted(range(len(weights)), key=lambda i: (-weights[i], i))[:selected_count]
+        if selected_count == total:
+            allocated = [1] * selected_count
+        else:
+            allocated = distribute_counts(total, [weights[i] for i in selected])
+        counts = [0] * len(weights)
+        for index, count in zip(selected, allocated):
+            counts[index] = count
         return counts
     clean = [max(1, int(weight)) for weight in weights]
     pool = sum(clean)

@@ -4,6 +4,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 
 ## Unreleased — hardening
 
+- WO-LRN-3: bound learning calls for small presets on many chunks.
 - WO-LRN-5: preserve manual-card state through the finish callback.
 - WO-DB-4: report discarded stray transactions in logs and metrics.
 - WO-DB-1: consume pending membership-gate actions atomically.
