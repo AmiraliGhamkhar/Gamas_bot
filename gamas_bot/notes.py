@@ -1422,6 +1422,7 @@ def _drafted_text(notes: StructuredNotes) -> str:
     parts.extend(notes.learning_objectives)
     parts.extend(notes.key_points)
     parts.extend(notes.review_questions)
+    parts.extend(f"{tip.text} {tip.basis}" for tip in notes.practical_tips)
     parts.extend(f"{entry.term} {entry.definition}" for entry in notes.glossary)
     parts.extend(section_plain_text(section) for section in notes.sections)
     return "\n".join(part for part in parts if part)
@@ -1647,6 +1648,8 @@ def section_plain_text(section: NoteSection) -> str:
     parts.extend(section.formulas)
     parts.extend(section.key_points)
     for table in section.all_tables:
+        if table.caption:
+            parts.append(table.caption)
         parts.append(" ".join(table.headers))
         parts.extend(" ".join(row) for row in table.rows)
     parts.extend(callout.text for callout in section.callouts)
@@ -1714,13 +1717,17 @@ def _notes_draft_json(notes: StructuredNotes) -> str:
 
 
 def _notes_structured_item_count(notes: StructuredNotes) -> int:
-    return sum(
-        len(section.definitions)
-        + len(section.formulas)
-        + len(section.steps)
-        + len(section.examples)
-        + len(section.all_tables)
-        for section in notes.sections
+    return (
+        sum(
+            len(section.definitions)
+            + len(section.formulas)
+            + len(section.steps)
+            + len(section.examples)
+            + len(section.all_tables)
+            + len(section.callouts)
+            for section in notes.sections
+        )
+        + len(notes.practical_tips)
     )
 
 
@@ -1738,7 +1745,7 @@ def _notes_body_chars(notes: StructuredNotes) -> int:
         for table in section.all_tables:
             total += sum(len(h) for h in table.headers)
             total += sum(len(cell) for row in table.rows for cell in row)
-        total += sum(len(tip.text) + len(tip.basis) for tip in notes.practical_tips)
+    total += sum(len(tip.text) + len(tip.basis) for tip in notes.practical_tips)
     return total
 
 
