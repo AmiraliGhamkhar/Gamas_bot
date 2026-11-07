@@ -1223,6 +1223,14 @@ class GamasBot(
                 if payload.lower().startswith("ref_"):
                     await self._apply_referral(event, user_id, payload[4:])
             await self._show_main(event, first_start=True)
+            pending = self._curation.get(user_id)
+            if pending and pending.get("delivery_failed") and not self._curation_stale(pending):
+                prefix = self._curation_prefix(str(pending["kind"]))
+                await event.respond(
+                    texts.CURATION_DELIVERY_RETRY,
+                    buttons=[[Button.inline(texts.CURATION_RESUME_BUTTON,
+                                            f"{prefix}:cur:resume".encode("ascii"))]],
+                )
             return
 
         # Admin conversational states.

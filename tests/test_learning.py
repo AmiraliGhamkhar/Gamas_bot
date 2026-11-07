@@ -38,6 +38,7 @@ from gamas_bot.llm import LLMError
 from tests.support import (
     FakeCallbackEvent,
     FakeTelegramClient,
+    FakeSentMessage,
     docx_text,
     make_settings,
 )
@@ -622,6 +623,55 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
         self.assertTrue(all(card["source"] == "بخش ۱" for card in cards))
         self.assertNotIn("صفحهٔ ۹۹", " ".join(card["source"] for card in cards))
+
+    async def test_preview_edit_failure_uses_new_message_and_finalizes(self):
+        await self.spend_free_try("deck")
+        original_edit = FakeSentMessage.edit
+
+        async def fail_preview(message, text="", buttons=None):
+            if text.startswith("🧐 پیش‌نمایش"):
+                raise RuntimeError("edit unavailable")
+            return await original_edit(message, text, buttons=buttons)
+
+        with mock.patch.object(FakeSentMessage, "edit", new=fail_preview), mock.patch(
+            "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))
+        ):
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
+        self.assertTrue(any("پیش‌نمایش" in str(row["text"]) for row in self.client.texts))
+        await self.save_curation()
+        charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
+        self.assertEqual(charges[0][0], "finalized")
+        self.assertEqual(await self.db.available_seconds(OWNER), 3300)
+
+    async def test_undelivered_preview_stays_pending_until_expiry(self):
+        await self.spend_free_try("deck")
+        self.bot.CURATION_TTL_SECONDS = 0.05
+        original_edit = FakeSentMessage.edit
+        original_send = self.client.send_message
+
+        async def fail_preview_edit(message, text="", buttons=None):
+            if text.startswith("🧐 پیش‌نمایش"):
+                raise RuntimeError("edit unavailable")
+            return await original_edit(message, text, buttons=buttons)
+
+        async def fail_preview_send(*args, **kwargs):
+            if len(args) > 1 and str(args[1]).startswith("🧐 پیش‌نمایش"):
+                raise RuntimeError("send unavailable")
+            return await original_send(*args, **kwargs)
+
+        with mock.patch.object(FakeSentMessage, "edit", new=fail_preview_edit), mock.patch.object(
+            self.client, "send_message", new=fail_preview_send
+        ), mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=self._cards_payload(6))):
+            await self.bot._handle_callback(self._event(f"fc:go:{self.item_id}".encode()))
+            self.assertIn(OWNER, self.bot._curation)
+            charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
+            self.assertEqual(charges[0][0], "pending")
+            self.assertEqual(await self.db.available_seconds(OWNER), 3300)
+            self.assertTrue(any("پیش‌نمایش ارسال نشد" in str(row["text"]) for row in self.client.texts))
+            await self.bot._curation_tasks[OWNER]
+        charges = await self.db.db.execute_fetchall("SELECT status FROM learning_charges")
+        self.assertEqual(charges[0][0], "refunded")
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
 
     async def test_ai_generation_debits_and_builds_deck(self):
         # The paid path: the free first try is already spent, so this deck is

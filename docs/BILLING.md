@@ -30,7 +30,9 @@ from free-plan credit. Unlimited users spend neither credit nor gifts.
 
 Paid learning debits happen before generation with durable pending charges.
 Saving finalizes; failure/cancel/30-minute preview expiry/startup recovery refunds
-unfinished charges at most once. Failed refund writes remain recoverable; never
+unfinished charges at most once. A failed preview edit is retried as a new message;
+if delivery still fails, the preview remains pending until its normal expiry and
+can be resumed through /start. Failed refund writes remain recoverable; never
 claim success before commit. Valid results need at least 3 questions or 5 cards.
 Count/coverage shortfalls are reported; review the preview before saving.
 

@@ -19,7 +19,7 @@ import tempfile
 from typing import TYPE_CHECKING, Any
 
 from telethon import Button
-from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
+from telethon.errors import FloodWaitError, MessageNotModifiedError
 
 from . import texts
 from .billing import format_duration
@@ -78,6 +78,7 @@ from .learning import (
     quiz_system_prompt,
 )
 from .llm import LLMContextOverflowError, LLMOutputBudgetError
+from .metrics import METRICS
 from .progress import (
     WORK_PROGRESS_HEADLINE,
     WorkProgress,
@@ -609,9 +610,21 @@ class LearningWorkflowMixin:
                 "created_at": self.deps.monotonic(),
             }
             self._curation[user_id] = state
-            if not await self._render_curation(progress.message, user_id):
-                raise RuntimeError("curation preview was not delivered")
+            delivered = await self._render_curation(progress.message, user_id)
             self._schedule_curation_expiry(user_id, state)
+            if not delivered:
+                state["delivery_failed"] = True
+                try:
+                    await event.respond(
+                        texts.CURATION_DELIVERY_RETRY,
+                        buttons=[[Button.inline(
+                            texts.CURATION_RESUME_BUTTON,
+                            f"{self._curation_prefix(kind)}:cur:resume".encode("ascii"),
+                        )]],
+                    )
+                except Exception:
+                    METRICS.record_curation_delivery_error()
+                    logger.warning("could not send curation retry notice user=%s", user_id)
         except BaseException as exc:
             if state is not None and self._curation.get(user_id) is state:
                 self._curation.pop(user_id, None)
@@ -815,8 +828,10 @@ class LearningWorkflowMixin:
         keyboard = self._curation_keyboard(state, page)
         try:
             await message.edit(rendered_text, buttons=keyboard)
+            state["delivery_failed"] = False
             return True
         except MessageNotModifiedError:
+            state["delivery_failed"] = False
             return True
         except FloodWaitError as exc:
             wait_seconds = float(getattr(exc, "seconds", 0) or 0)
@@ -824,24 +839,33 @@ class LearningWorkflowMixin:
                 await asyncio.sleep(wait_seconds)
                 try:
                     await message.edit(rendered_text, buttons=keyboard)
+                    state["delivery_failed"] = False
                     return True
                 except MessageNotModifiedError:
+                    state["delivery_failed"] = False
                     return True
                 except Exception:
-                    logger.warning("could not render curation preview after flood wait", exc_info=True)
-                    return False
-            logger.warning("curation preview rate-limited seconds=%s", wait_seconds)
-            return False
-        except MessageIdInvalidError:
+                    METRICS.record_curation_delivery_error()
+            else:
+                METRICS.record_curation_delivery_error()
+        except Exception:
+            METRICS.record_curation_delivery_error()
+        # A bad edit must not destroy a paid generation; send a fresh message.
+        for attempt in range(2):
             try:
-                await self.client.send_message(user_id, rendered_text, buttons=keyboard)
+                respond = getattr(message, "respond", None)
+                if callable(respond):
+                    await respond(rendered_text, buttons=keyboard)
+                else:
+                    await self.client.send_message(user_id, rendered_text, buttons=keyboard)
+                state["delivery_failed"] = False
                 return True
             except Exception:
-                logger.warning("could not send fallback curation preview", exc_info=True)
-                return False
-        except Exception:
-            logger.warning("could not render curation preview", exc_info=True)
-            return False
+                METRICS.record_curation_delivery_error()
+                if attempt == 0:
+                    await asyncio.sleep(1)
+        logger.warning("could not deliver curation preview user=%s", user_id)
+        return False
 
     async def _cancel_curation(self, event: Any, user_id: int) -> None:
         state = self._curation.get(user_id)

@@ -503,3 +503,6 @@ PROGRESS_DEFAULT_DONE: Final = "✅ پردازش تکمیل شد"
 PROGRESS_WORK_DONE: Final = "✅ آماده شد"
 PROGRESS_DEFAULT_FAIL: Final = "❌ پردازش تکمیل نشد."
 PROGRESS_WORK_FAIL: Final = "❌ انجام نشد."
+
+CURATION_DELIVERY_RETRY: Final = "پیش‌نمایش ارسال نشد؛ با /start دوباره تلاش کنید."
+CURATION_RESUME_BUTTON: Final = "🧐 ادامهٔ بررسی"
