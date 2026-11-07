@@ -705,6 +705,8 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         done = self._event(b"fc:man:done")
         await self.bot._handle_callback(done)
         self.assertNotIn(OWNER, self.bot._pending_flashcard)
+        self.assertTrue(any("ساخت کارت پایان یافت" in str(reply) for reply in done.client.texts))
+        self.assertTrue(done.edits)
         cards = await self.db.deck_cards(deck_id)
         self.assertEqual(len(cards), 1)
         self.assertEqual(cards[0]["front"], "پرسش دستی یکم؟")

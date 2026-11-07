@@ -90,8 +90,9 @@ class ConversationStateStore:
         if not data.startswith("adm:sr:"):
             self.support_admin_states.pop(user_id, None)
 
-        self.pending_flashcard.pop(user_id, None)
-        self.pending_flashcard_front.pop(user_id, None)
+        if not data.startswith("fc:man:"):
+            self.pending_flashcard.pop(user_id, None)
+            self.pending_flashcard_front.pop(user_id, None)
 
         if not data.startswith("office:"):
             self.office_sessions.pop(user_id, None)
