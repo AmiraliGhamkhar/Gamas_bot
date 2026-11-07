@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from gamas_bot.bot import GamasBot
@@ -174,7 +175,9 @@ class UserIdentityTests(unittest.IsolatedAsyncioTestCase):
             self.client, data=f"adm:hub:usr:card:{HUGE_ID}".encode(), chat_id=ADMIN_ID
         )
         event.client = self.client
-        await self.bot._handle_callback(event)
+        with mock.patch.object(self.db, "count_user_payments", wraps=self.db.count_user_payments) as count:
+            await self.bot._handle_callback(event)
+        count.assert_awaited_once_with(HUGE_ID)
         text = event.edits[-1]["text"]
         self.assertIn("@ali_user", text)
         self.assertIn(f"شناسه: {HUGE_ID}", text)

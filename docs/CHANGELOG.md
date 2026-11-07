@@ -33,6 +33,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-DB-9: check submission links and explicitly roll back duplicate quiz inserts.
 - WO-DB-5: batch learning inserts and transcription-retention deletes.
 - WO-DB-2 (partial): add performance indexes; expiry predicates retain legacy timezone correctness.
+- WO-DB-3: use retry-aware repository reads for admin payment counts.
 - WO-DB-3: route plan, user, transcription-retention and admin count reads to the read connection.
 - WO-DB-10: retry transient SQLite read contention and count read errors.
 - WO-DB-8: bound SQLite caches, mapping and journal size for shared hosting.

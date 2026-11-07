@@ -763,12 +763,7 @@ class AdminWorkflowMixin:
             balance = (
                 f"{format_duration(seconds)} ({to_persian_digits(seconds)} ثانیه)"
             )
-        order_rows = list(
-            await self.db.read_db.execute_fetchall(
-                "SELECT COUNT(*) FROM payments WHERE user_id = ?", (int(target_id),)
-            )
-        )
-        orders = int(order_rows[0][0]) if order_rows else 0
+        orders = await self.db.count_user_payments(int(target_id))
         decks = await self.db.deck_count(int(target_id))
         free = identity.get("free_uses", {"deck": True, "quiz": True})
         status = (
