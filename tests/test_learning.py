@@ -255,6 +255,24 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(rows[0][0], 3)
 
+    async def test_answer_insert_integrity_error_rolls_back(self):
+        session_id = await self._create_session()
+        question = await self.db.quiz_current_question(session_id)
+        execute = self.db.db.execute
+
+        async def fail_insert(sql, *args):
+            if sql.startswith("INSERT INTO quiz_answers"):
+                raise sqlite3.IntegrityError("duplicate")
+            return await execute(sql, *args)
+
+        with mock.patch.object(self.db.db, "execute", side_effect=fail_insert), \
+             mock.patch.object(self.db.db, "rollback", wraps=self.db.db.rollback) as rollback:
+            result = await self.db.quiz_record_answer(session_id, question["question_id"], 0)
+        self.assertEqual(result["status"], "already")
+        rollback.assert_awaited_once()
+        self.assertEqual((await self.db.quiz_get_session(session_id, OWNER))["current_index"], 0)
+        self.assertEqual((await self.db.leaderboard_rank(OWNER))["points"], 0)
+
     async def test_double_answer_is_rejected_once_and_never_double_scores(self):
         session_id = await self._create_session()
         question = await self.db.quiz_current_question(session_id)

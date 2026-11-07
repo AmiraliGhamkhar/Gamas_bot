@@ -10,6 +10,7 @@ from typing import Any
 from .db_billing import BillingRepositoryMixin
 from .db_core import _rows, iso
 from .db_users import UsersRepositoryMixin
+from .metrics import METRICS
 
 
 class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
@@ -161,14 +162,18 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                     ),
                 )
             except sqlite3.IntegrityError:
+                METRICS.record_db_error()
+                await self.db.rollback()
                 return {"status": "already"}
             if is_correct:
-                await self.db.execute(
+                updated = await self.db.execute(
                     "UPDATE quiz_sessions SET score = score + 10, "
                     "current_index = current_index + 1, updated_at = ? "
-                    "WHERE session_id = ?",
-                    (now, int(session_id)),
+                    "WHERE session_id = ? AND current_index = ?",
+                    (now, int(session_id), current_index),
                 )
+                if updated.rowcount != 1:
+                    raise sqlite3.IntegrityError("quiz cursor changed during answer")
                 await self.db.execute(
                     "UPDATE users SET quiz_points = quiz_points + 10 "
                     "WHERE telegram_id = (SELECT user_id FROM quiz_sessions "
@@ -176,11 +181,13 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                     (int(session_id),),
                 )
             else:
-                await self.db.execute(
+                updated = await self.db.execute(
                     "UPDATE quiz_sessions SET current_index = current_index + 1, "
-                    "updated_at = ? WHERE session_id = ?",
-                    (now, int(session_id)),
+                    "updated_at = ? WHERE session_id = ? AND current_index = ?",
+                    (now, int(session_id), current_index),
                 )
+                if updated.rowcount != 1:
+                    raise sqlite3.IntegrityError("quiz cursor changed during answer")
             finished = current_index + 1 >= question_count
             if finished:
                 await self.db.execute(

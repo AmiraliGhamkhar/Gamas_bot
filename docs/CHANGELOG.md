@@ -24,6 +24,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-LRN-11: reject invalid flashcard presets rather than silently charging the base cost.
 - WO-LRN-3: bound learning calls for small presets on many chunks.
 - WO-LRN-5: preserve manual-card state through the finish callback.
+- WO-DB-9: check submission links and explicitly roll back duplicate quiz inserts.
 - WO-DB-5: batch learning inserts and transcription-retention deletes.
 - WO-DB-2 (partial): add performance indexes; expiry predicates retain legacy timezone correctness.
 - WO-DB-3: route plan, user, transcription-retention and admin count reads to the read connection.

@@ -36,6 +36,25 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(expected, "no v3 migrations were found")
         self.assertEqual(applied, expected)
 
+    async def test_submission_links_report_non_null_orphans(self):
+        await self.db.ensure_user(123)
+        await self.db.library_add(123, "booklet", 1, 2, None, title="no submission")
+        self.assertFalse(any("submission_id" in x for x in await self.db.user_reference_integrity()))
+        await self.db.library_add(123, "booklet", 1, 3, 987654, title="orphan")
+        legacy = sqlite3.connect(self.db.path)
+        try:
+            legacy.execute("INSERT INTO ledger(user_id,seconds,kind,note,created_at,submission_id) "
+                           "VALUES (123,1,'debit','legacy','2026-01-01',987655)")
+            legacy.commit()
+        finally:
+            legacy.close()
+        problems = await self.db.user_reference_integrity()
+        self.assertIn("orphan rows: library_items.submission_id = 1", problems)
+        self.assertIn("orphan rows: ledger.submission_id = 1", problems)
+        # Integrity inspection is report-only and preserves the legacy row.
+        rows = await self.db.db.execute_fetchall("SELECT COUNT(*) FROM library_items WHERE submission_id=987654")
+        self.assertEqual(rows[0][0], 1)
+
     async def test_quiz_admission_query_uses_user_created_index(self):
         rows = await self.db.db.execute_fetchall(
             "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM quiz_sessions "

@@ -42,6 +42,8 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
         ("hold_allocations", "submission_id", "holds", "submission_id"),
         ("hold_allocations", "credit_id", "ledger", "id"),
         ("holds", "submission_id", "submissions", "submission_id"),
+        ("library_items", "submission_id", "submissions", "submission_id"),
+        ("ledger", "submission_id", "submissions", "submission_id"),
         ("ledger", "payment_id", "payments", "payment_id"),
         ("documents", "library_item_id", "library_items", "item_id"),
         ("learning_charges", "debit_id", "ledger", "id"),
@@ -102,7 +104,10 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
                 problems.append(f"missing INTEGER column: {table}.{column}")
                 continue
             fks = await _rows(self.read_db, f"PRAGMA foreign_key_list({table})")
-            if not any(
+            # Legacy library items have a logical submission link but no
+            # declared FK; inspect orphans without rebuilding applied schema.
+            logical_only = (table, column) == ("library_items", "submission_id")
+            if not logical_only and not any(
                 row[2] == parent and row[3] == column and row[4] == parent_column
                 for row in fks
             ):
