@@ -242,23 +242,28 @@ def _parse_telegram_user_id(raw: str) -> int | None:
 MAX_RECEIPT_IMAGE_PIXELS = 12_000_000
 
 
-def _normalize_receipt_image(path: Path, *, max_bytes: int) -> bool:
-    """Validate and re-encode a JPEG/PNG/WebP receipt as a clean JPEG."""
-    temp_path: Path | None = None
+def _receipt_image_signature(path: Path, *, max_bytes: int) -> bool:
+    """Check a stored receipt's size and image signature without modifying it."""
     try:
         size = path.stat().st_size
         if size < 8 or size > max_bytes:
             return False
         with path.open("rb") as source:
             header = source.read(16)
-        is_jpeg = header.startswith(b"\xff\xd8\xff")
-        is_png = header.startswith(b"\x89PNG\r\n\x1a\n")
-        is_webp = (
-            header.startswith(b"RIFF")
-            and len(header) >= 12
-            and header[8:12] == b"WEBP"
+        return (
+            header.startswith(b"\xff\xd8\xff")
+            or header.startswith(b"\x89PNG\r\n\x1a\n")
+            or (header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WEBP")
         )
-        if not (is_jpeg or is_png or is_webp):
+    except OSError:
+        return False
+
+
+def _normalize_receipt_image(path: Path, *, max_bytes: int) -> bool:
+    """Validate and re-encode a JPEG/PNG/WebP receipt as a clean JPEG."""
+    temp_path: Path | None = None
+    try:
+        if not _receipt_image_signature(path, max_bytes=max_bytes):
             return False
 
         from PIL import Image

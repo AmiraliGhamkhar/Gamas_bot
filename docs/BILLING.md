@@ -52,6 +52,9 @@ plans with `FREE_PLAN_HOURS` and `PLAN_*` in `.env`.
 4. Approval, credit and audit commit together. Failure rolls back; notification
    failures never repeat activation. Final decisions are immutable.
 
+Administrators view stored receipt bytes as-is; viewing does not re-encode the
+image or refresh its retention timestamp.
+
 Users may cancel before receipt upload; one open order per user. Payment history
 remains. Reviewed receipt images expire after 90 days by default; pending-review
 receipts are not automatically deleted.

@@ -25,7 +25,7 @@ from .intake import (
     FAILURE_KIND_LABELS_FA,
     _command_name,
     _is_safe_receipt_path,
-    _normalize_receipt_image,
+    _receipt_image_signature,
     _parse_telegram_user_id,
     _to_int,
     is_pending_payment_review,
@@ -1284,7 +1284,7 @@ class AdminWorkflowMixin:
                 _is_safe_receipt_path, self.settings.receipt_dir, path
             )
             or not await run_file_io(
-                _normalize_receipt_image,
+                _receipt_image_signature,
                 Path(str(path)),
                 max_bytes=self.settings.max_payment_receipt_bytes,
             )

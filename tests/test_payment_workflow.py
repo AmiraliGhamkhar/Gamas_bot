@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -96,6 +97,19 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         event.message.file.mime_type = "image/png"
         event.message.file.size = source.stat().st_size
         return event
+
+    async def test_viewing_receipt_preserves_bytes_and_mtime(self):
+        payment_id = await self.new_order()
+        await self.submit_receipt(payment_id)
+        path = Path((await self.db.payment(payment_id))["receipt_path"])
+        before_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        before_mtime = path.stat().st_mtime_ns
+        before_count = len(self.bot.client.deliveries)
+        await self.press(ADMIN, f"adm:rcpt:{payment_id}")
+        await self.press(ADMIN, f"adm:rcpt:{payment_id}")
+        self.assertEqual(len(self.bot.client.deliveries), before_count + 2)
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before_hash)
+        self.assertEqual(path.stat().st_mtime_ns, before_mtime)
 
     async def test_cancelled_receipt_download_removes_partial_file(self):
         payment_id = await self.new_order()
