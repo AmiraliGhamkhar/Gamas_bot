@@ -43,6 +43,13 @@ tail -n 80 data/logs/launcher.err
 ```
 
 Use the `GMS-#####` job reference. Share only redacted metadata, never private content.
+`LLM request sending ... requested_output_tokens=<n>` records the output budget
+actually sent by that request; `note provider usage ... output_tokens=<n>` is the
+provider's real completion usage. `note provider failed; trying the next one`
+records failover with the safe provider detail (request IDs included, keys
+redacted). Environment changes apply only after a restart: stop with
+`python scripts/ensure_running.py stop`, confirm `status`, then start with
+`--force`; a running process keeps the previous provider order and budget.
 
 ## Backups and restore
 

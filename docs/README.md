@@ -29,6 +29,10 @@ interpreter shown by cPanel.
 | [Performance](PERFORMANCE.md) / [Architecture](ARCHITECTURE.md) | Resources and code map |
 | [Changelog](CHANGELOG.md) | Concise change history |
 
+For credential-free inspection of the effective note-provider order and token
+budgets, run `python -m scripts.probe_note_providers --show-config` (offline) or
+`python -m gamas_bot --check`; see [Note providers](PROVIDERS.md).
+
 Maintainers: read [AGENTS.md](../AGENTS.md). Settings are defined in
 [`config.py`](../gamas_bot/config.py) and listed in [`.env.example`](../.env.example).
 Revision-specific audit reports and the duplicate Persian deployment guide were

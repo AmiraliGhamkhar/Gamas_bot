@@ -31,6 +31,12 @@ python scripts/ensure_running.py status
 | Permission/location failure | Keep private paths outside web roots; on cPanel use `chmod 600 .env` and `chmod 700 data`. |
 | Transcript but no booklet | Check note-provider keys and quality/provider errors. Delivered transcription remains charged. |
 | Provider 401/403/402/429 | Check key, entitlement, balance and quota; configure fallback rather than blindly raising limits. |
+| Gemini HTTP 400 `INVALID_ARGUMENT` with structured output | The 2026-11-07 test succeeded only with `NOTE_STRUCTURED_OUTPUT=0`; the exact rejected field was not isolated. Set that value and `NOTE_GEMINI_THINKING_BUDGET=-1`, restart, then re-run the generation probe. The client also has one bounded schema-dropping retry for this error class. [Providers](PROVIDERS.md) |
+| `finish_reason=length` / `MAX_TOKENS`, empty or cut-off booklet | The answer hit the output budget and is deliberately rejected, not delivered as a partial note. Check `requested_output_tokens` in the log, confirm `NOTE_MAX_OUTPUT_TOKENS`, and restart after any change before assuming truncation. |
+| Old process sends 16,384 tokens although `.env` says 32,768 | Settings load only at startup; a stale process or a `.env` that was never reloaded is a plausible cause, not a proven one. Compare the log's `requested_output_tokens` with `--show-config`, then stop/start with `scripts/ensure_running.py`. |
+| NaraRouter HTTP 502 on generation (including with structured output and reasoning off) | Observed for `laguna-s-2.1` on 2026-11-07: three attempts plus a second test failed. Entitlement/metadata PASS is not a generation guarantee. Remove `nara` from `NOTE_PROVIDERS` until a real generation probe succeeds; keep the `NARA_*` settings for later. Include the safe `request_id` in a support report. |
+| Metadata probe passes but generation fails | These are different checks. Only `--generate` verifies generation; see [Providers](PROVIDERS.md#how-to-test-a-provider-independently). |
+| Provider order/keys look wrong after editing `.env` | Run `python -m gamas_bot --check` or `python -m scripts.probe_note_providers --show-config` (both credential-free). Leave `NOTE_API_KEY`/`NOTE_BASE_URL` blank to avoid an extra legacy `openai_compatible` leg, and restart the bot. |
 | Persian Deepgram error | Use `STT_LANGUAGE=fa` with `DEEPGRAM_MODEL=nova-3`. |
 | Scan/photo refused | OCR is off by default. Read [OCR](OCR.md) before enabling remote uploads. |
 | Word layout/font issue | Install bundled Vazirmatn on the viewing PC; check in Microsoft Word. |

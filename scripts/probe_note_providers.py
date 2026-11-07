@@ -1,35 +1,43 @@
 """Operator probe for the note-generation providers (never run by the bot).
 
-Two stages, both explicit — this script is the Phase 0/1 verification tool for
-the matched default model pair (``docs/PROVIDERS.md``):
+Three explicitly separate stages (``docs/PROVIDERS.md``):
 
-Read-only stage (default)::
+Offline configuration inspection (no network, no provider quota)::
+
+    python -m scripts.probe_note_providers --show-config
+
+    Prints the effective provider order and the non-secret note settings the
+    *next* bot start will use, plus each route's effective outgoing output
+    budget. No API key or URL credential is ever printed. This is also the
+    first step of every other stage.
+
+Metadata stage (default, read-only, no generation quota)::
 
     python -m scripts.probe_note_providers
 
-    Prints the eligible note routes from the current ``.env``, then asks each
-    gateway only metadata questions: NaraRouter's authenticated ``/v1/models``
-    (is the configured model entitled, and what limits does the gateway
-    publish for it?), OpenRouter's ``/api/v1/key`` plus the configured
+    Asks each gateway only metadata questions: NaraRouter's authenticated
+    ``/v1/models`` (is the configured model entitled, and what limits does the
+    gateway publish for it?), OpenRouter's ``/api/v1/key`` plus the configured
     model's ``/endpoints`` record (served context, completion cap, uptime,
     and the free-tier daily request counter), and Google AI Studio Gemini's
     ``/v1beta/models/{model}`` resource (input/output token limits, thinking
-    support, and ``generateContent`` capability). No generation call is made
-    and no secret is printed.
+    support, and ``generateContent`` capability). A metadata PASS proves
+    authentication/entitlement only — it does NOT prove text generation works.
 
-Generation stage (opt-in, consumes provider quota)::
+Generation stage (opt-in, CONSUMES PROVIDER QUOTA)::
 
     python -m scripts.probe_note_providers --generate lecture.txt
 
     Sends one real map-style note request per eligible route — the bot's own
     system prompt plus the first chunk-sized excerpt of the given transcript,
     built and parsed with the bot's own request/JSON code — and reports
-    per-route success, elapsed time and section count, so the chunk/output
-    settings can be validated before they are rolled out. Use a real,
-    anonymised lecture transcript; expect exactly one generation request per
-    route (plus the pipeline's bounded retries, if any).
+    per-route success, elapsed time and section count. Only this stage can
+    verify that a model actually generates valid Persian study notes. Use a
+    non-sensitive test transcript; expect one generation request per route
+    (plus the pipeline's bounded retries, if any).
 
-Exit code is 1 when any check or generation probe fails.
+Automated CI and the standard test suite never call ``--generate`` and need no
+live keys. Exit code is 1 when any check or generation probe fails.
 """
 
 from __future__ import annotations
@@ -42,18 +50,64 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from gamas_bot.config import from_env, note_routes  # noqa: E402
+from gamas_bot.config import from_env, note_route_summary, note_routes  # noqa: E402
 from gamas_bot.llm import (  # noqa: E402
     _build_get_request_for,
+    _build_request_for,
     _clean_api_key,
     _endpoint,
     _openrouter_model_path,
     _redact_secrets,
+    request_payload_output_tokens,
 )
+
+
+def _safe_base_url(base_url: str) -> str:
+    """A printable base URL without userinfo, query string or fragment.
+
+    An operator can paste a URL carrying ``?key=...`` or ``user:pass@``; those
+    parts are credentials and must never reach a terminal, log or ticket.
+    """
+    parsed = urlsplit(base_url or "")
+    if not parsed.scheme or not parsed.netloc:
+        return base_url or "(not configured)"
+    netloc = parsed.netloc.rsplit("@", 1)[-1]
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
+
+
+def _effective_output_tokens(route, settings) -> int | None:
+    """The output budget the bot's own request builder will really send."""
+    try:
+        _url, _headers, payload = _build_request_for(route, settings, "", "")
+    except Exception:  # noqa: BLE001 - a diagnostic must never abort the probe
+        return None
+    return request_payload_output_tokens(payload)
+
+
+def _print_config(settings, routes) -> None:
+    for line in note_route_summary(settings):
+        print(line)
+    print(
+        f"NOTE_CONTEXT_TOKENS={settings.note_context_tokens} "
+        f"NOTE_CHUNK_CHARS={settings.note_chunk_chars} "
+        f"NOTE_REQUEST_TIMEOUT_SECONDS={settings.note_request_timeout:.0f} "
+        f"NOTE_JSON_MODE={int(settings.note_json_mode)}"
+    )
+    print("Effective outgoing output budgets (from the built request payload):")
+    if not routes:
+        print("  (no eligible route)")
+    for route in routes:
+        budget = _effective_output_tokens(route, settings)
+        print(
+            f"  - {route.slug}: requested_output_tokens="
+            f"{budget if budget is not None else '-'} "
+            f"base={_safe_base_url(route.base_url)}"
+        )
 
 
 def _get_json(
@@ -278,6 +332,13 @@ async def _generate(route, settings, text: str) -> bool:
 
     system = build_system_prompt(settings.note_mode)
     schema = _response_schema(settings)
+    budget = _effective_output_tokens(route, settings)
+    print(
+        f"[INFO] {route.slug}: sending ONE real generation request "
+        f"(requested_output_tokens={budget if budget is not None else '-'}, "
+        f"structured_output={int(settings.note_structured_output)}, "
+        f"reasoning_effort={settings.note_reasoning_effort or '(provider default)'})"
+    )
     started = time.monotonic()
     try:
         excerpt = text[: effective_chunk_chars(settings, system_prompt=system)]
@@ -311,26 +372,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--generate",
         metavar="TRANSCRIPT_FILE",
-        help="also send one real note request per provider over this text file",
+        help="OPT-IN, CONSUMES PROVIDER QUOTA: send one real note request per "
+             "route over this text file (never used by CI or the test suite)",
+    )
+    parser.add_argument(
+        "--show-config",
+        action="store_true",
+        help="offline only: print effective routing and non-secret settings, "
+             "then exit without any network call or quota use",
     )
     args = parser.parse_args(argv)
 
     settings = from_env()
     routes = note_routes(settings)
+    _print_config(settings, routes)
+    if args.show_config:
+        print("Offline inspection complete: no network request was made.")
+        return 0 if routes else 1
     if not routes:
         print("[FAIL] no note provider is configured (see docs/PROVIDERS.md)")
         return 1
-    print("Eligible note routes (in failover order):")
-    for route in routes:
-        print(f"  - {route.slug}: {route.label} model={route.model} base={route.base_url}")
-    print(
-        f"Sizing: NOTE_CONTEXT_TOKENS={settings.note_context_tokens} "
-        f"NOTE_CHUNK_CHARS={settings.note_chunk_chars} "
-        f"NOTE_MAX_OUTPUT_TOKENS={settings.note_max_output_tokens} "
-        f"NOTE_COMPILE_MAX_CHARS={settings.note_compile_max_chars} (0 = automatic) "
-        f"NOTE_REASONING_EFFORT={settings.note_reasoning_effort or '(provider default)'}"
-    )
 
+    print(
+        "\nStage 1/2 — METADATA ONLY: authentication, model entitlement and "
+        "published limits. No generation quota is used."
+    )
+    print(
+        "A metadata PASS does NOT prove that text generation works. "
+        "Run the opt-in --generate stage to verify that."
+    )
     ok = True
     for route in routes:
         if route.slug == "nara":
@@ -345,13 +415,27 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[WARN] {route.slug}: no metadata probe; generation stage still applies")
 
     if args.generate:
-        text = Path(args.generate).read_text(encoding="utf-8")
+        try:
+            text = Path(args.generate).read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"[FAIL] cannot read transcript file {args.generate!r}: {exc}")
+            return 1
+        if not text.strip():
+            print(f"[FAIL] transcript file {args.generate!r} is empty")
+            return 1
         print(
-            f"\nGeneration probe over the first chunk-sized excerpt of "
-            f"{len(text)} chars (one request per route; consumes provider quota):"
+            "\nStage 2/2 — REAL GENERATION: CONSUMES PROVIDER QUOTA. "
+            f"One map-style note request per route over {len(text)} chars of "
+            "non-sensitive test text (plus the pipeline's bounded retries)."
         )
         for route in routes:
             ok = asyncio.run(_generate(route, settings, text)) and ok
+    else:
+        print(
+            "\nMetadata stage complete. Generation was NOT tested; run "
+            "`python -m scripts.probe_note_providers --generate TRANSCRIPT_FILE` "
+            "before promoting a route to production (this consumes quota)."
+        )
     return 0 if ok else 1
 
 

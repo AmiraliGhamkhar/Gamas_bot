@@ -2,7 +2,12 @@
 
 Use a development checkout with **no production `.env`, database or session**.
 Tests use fake providers and synthetic fixtures: no live keys or billable calls.
-CI targets Python 3.11–3.13.
+CI targets Python 3.11–3.13. Provider probes are operator tools, not tests:
+`--show-config` is offline, the default probe makes metadata-only network calls,
+and only `python -m scripts.probe_note_providers --generate TRANSCRIPT_FILE`
+sends real generation requests (quota). Never add a generation probe to CI or
+the standard test suite. The provider-compatibility regressions in
+`tests/test_note_provider_compatibility.py` are fully deterministic.
 
 ## Windows PowerShell
 

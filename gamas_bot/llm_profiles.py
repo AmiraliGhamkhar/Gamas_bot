@@ -281,6 +281,10 @@ class ProviderCapabilityProfile:
     documented_stream_options: bool = True
     documented_reasoning_effort: bool = False
     parsed_reasoning_for_json: bool = False
+    #: Optional documented provider cap. All currently registered routes leave
+    #: it ``None``: no lower cap than the operator's ``NOTE_MAX_OUTPUT_TOKENS``
+    #: is documented for them, so the configured budget (16,384 by default,
+    #: 32,768 in the tested deployment profile) reaches the wire unchanged.
     max_output_tokens_cap: int | None = None
 
     def supports_response_format(self, route: NoteRoute) -> bool:

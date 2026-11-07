@@ -94,3 +94,98 @@ code against a migrated database.
 
 If PyAV/lxml wheels fail on old Linux, request CloudLinux/AlmaLinux 8+ and supported
 Python. Cron cannot bypass CPU/RAM/process limits; change hosting if needed.
+
+## 6. Apply the tested note-provider profile (optional)
+
+Use this on a cPanel deployment that wants the 2026-11-07 Gemini → OpenRouter
+profile. It keeps the existing cron watchdog / launcher architecture: there is
+no second process manager. Pause cron and Passenger triggers before maintenance,
+as in step 5, and restore them afterwards. Never put credentials in Git, logs or
+support tickets; do not replace an existing `.env` wholesale.
+
+1. **Configure the required API credentials securely.** In `.env`, set
+   `GEMINI_API_KEY` and `OPENROUTER_API_KEY` with the real values and keep
+   `chmod 600 .env`. Leave `NOTE_API_KEY` and `NOTE_BASE_URL` unset/blank unless
+   this deployment deliberately uses the legacy single slot: a configured legacy
+   base URL appends an extra `openai_compatible` route. Never change Telegram
+   tokens/IDs or STT credentials as part of this rollout.
+2. **Apply the recommended environment profile** (deployment-specific values,
+   not shipped defaults) by adding or editing these lines only:
+
+   ```dotenv
+   NOTE_PROVIDERS=gemini,openrouter
+   NOTE_STRUCTURED_OUTPUT=0
+   NOTE_REASONING_EFFORT=none
+   NOTE_MAX_OUTPUT_TOKENS=32768
+   NOTE_GEMINI_THINKING_BUDGET=-1
+   GEMINI_MODEL=gemini-3.5-flash-lite
+   OPENROUTER_MODEL=nvidia/nemotron-3.5-super-vl:free
+   ```
+
+   NaraRouter stays installed and configurable but is deliberately absent:
+   `laguna-s-2.1` failed real generation with HTTP 502. Keep a copy of the
+   previous `.env` for rollback.
+3. **Run the configuration inspection** (offline; no provider quota):
+
+   ```bash
+   python -m gamas_bot --check
+   python -m scripts.probe_note_providers --show-config
+   python -m scripts.cpanel_preflight
+   ```
+
+   `--check` and `--show-config` print the effective provider order and the
+   non-secret settings; fix `FAIL` and review `WARN` (a 32,768-token budget can
+   produce a conservative timeout advisory at the shipped 900 s deadline).
+4. **Run provider metadata checks** (network, still no generation quota):
+
+   ```bash
+   python -m scripts.probe_note_providers
+   ```
+
+   Metadata PASS proves authentication and model entitlement only. It does
+   **not** prove generation works — Nara's test is the counterexample.
+5. **Run controlled real-generation probes** with a short, non-sensitive
+   transcript. This consumes provider quota; do not automate it in CI:
+
+   ```bash
+   python -m scripts.probe_note_providers --generate /home/USER/short_lecture.txt
+   ```
+
+   Expect one real request per route plus bounded retries, and check the
+   reported title, section count and elapsed time. If a route fails, remove it
+   from `NOTE_PROVIDERS` before starting the bot.
+6. **Restart the bot after changes.** Environment values are read only at
+   startup, so a running process keeps the previous budget/order:
+
+   ```bash
+   python scripts/ensure_running.py stop
+   python scripts/ensure_running.py status   # must report stopped
+   python scripts/ensure_running.py --force
+   python scripts/ensure_running.py status
+   ```
+
+   Restore cron/Passenger triggers only after status and logs look healthy.
+7. **Confirm the actual runtime provider order** from the restarted process:
+
+   ```bash
+   python -m scripts.probe_note_providers --show-config
+   grep -n "LLM request sending" data/logs/bot.log | tail -n 20
+   ```
+
+   The first field after `provider=` must be `gemini`; `openrouter` appears only
+   after an eligible Gemini failure. No `nara` or `openai_compatible` route
+   should appear with this profile.
+8. **Inspect logs for real request token limits and provider usage:**
+
+   ```bash
+   grep -n "LLM request sending" data/logs/bot.log | tail -n 20
+   grep -n "note provider usage" data/logs/bot.log | tail -n 20
+   ```
+
+   `requested_output_tokens=` is the effective budget actually sent (expect
+   32768); `output_tokens=` on usage lines is the provider's real completion
+   usage. A `finish_reason=length`/`MAX_TOKENS` answer is rejected as
+   incomplete, not delivered as a partial booklet.
+
+The full variable reference is in [Configuration](CONFIGURATION.md); provider
+behaviour and test results are in [Note-generation providers](PROVIDERS.md).

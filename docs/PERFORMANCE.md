@@ -18,6 +18,17 @@ Independent stages overlap network work without running many heavy media jobs.
 Available fallback capacity receives overflow immediately; waiting is bounded when
 all eligible routes are full/cooling down.
 
+`NOTE_MAX_OUTPUT_TOKENS` (16,384 by default; 32,768 in the 2026-11-07 tested
+deployment profile) is a per-request output budget, not an in-memory size or a
+quota multiplier: it reaches the wire as `max_tokens` / `maxOutputTokens` and is
+logged as `requested_output_tokens`. A larger budget gives a slow gateway more
+time to answer, so the offline check may warn that 32,768 tokens could exceed
+the 900 s `NOTE_REQUEST_TIMEOUT_SECONDS` at its conservative 20 tokens/s
+estimate. Measure real latency before changing the deadline; do not raise the
+budget above 32,768 without evidence. `NOTE_HEDGE_AFTER_SECONDS=60` and the
+per-route retry ladder can add requests, so account for that on free tiers. See
+[Note-generation providers](PROVIDERS.md).
+
 ## If the host overloads
 
 1. Inspect cPanel CPU, RAM, processes, disk/I/O quotas and bot logs.
