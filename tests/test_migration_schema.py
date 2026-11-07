@@ -222,6 +222,36 @@ class PopulatedUpgradeTests(unittest.IsolatedAsyncioTestCase):
             await db.close()
 
 
+class HardeningUpgradeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_populated_019_upgrade_and_reopen_are_replay_safe(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "before-020.sqlite"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE schema_migrations(name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name >= "020_":
+                    break
+                conn.executescript(migration.read_text(encoding="utf-8"))
+                conn.execute("INSERT INTO schema_migrations VALUES (?, '2026-01-01')", (migration.name,))
+            conn.execute("INSERT INTO users(telegram_id,joined_at) VALUES (123,'2026-01-01')")
+            conn.execute("INSERT INTO ledger(user_id,seconds,kind,note,created_at) VALUES (123,700,'credit','original','2026-01-01')")
+            conn.commit()
+            conn.close()
+            applied = None
+            for _ in range(2):
+                db = Database(path)
+                await db.connect()
+                self.assertEqual(await db.available_seconds(123), 700)
+                self.assertEqual((await db.db.execute_fetchall("SELECT seconds,note FROM ledger"))[0][:], (700, "original"))
+                migrations = [row[0] for row in await db.db.execute_fetchall("SELECT name FROM schema_migrations ORDER BY name")]
+                self.assertTrue(all(any(name.startswith(prefix) for name in migrations) for prefix in ("020_", "021_", "022_", "023_", "024_")))
+                if applied is not None:
+                    self.assertEqual(migrations, applied)
+                applied = migrations
+                self.assertEqual((await db.db.execute_fetchall("PRAGMA foreign_keys"))[0][0], 1)
+                await db.close()
+
+
 class OfficeLibraryUpgradeTests(unittest.IsolatedAsyncioTestCase):
     async def test_populated_015_library_survives_office_kind_migration_and_replay(self):
         with tempfile.TemporaryDirectory() as temp:
