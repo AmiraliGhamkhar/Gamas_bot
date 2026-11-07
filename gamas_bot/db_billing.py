@@ -111,16 +111,95 @@ class BillingRepositoryMixin(DatabaseCore):
                 "INSERT INTO billing_migrations(name) VALUES ('credit_lots_v1')"
             )
 
+    async def _refresh_balance_locked(self, user_id: int) -> int:
+        """Recompute the cache from authoritative allocations inside the current write."""
+        now = iso(self._now())
+        exists = await _rows(self.db, "SELECT 1 FROM users WHERE telegram_id=?", (int(user_id),))
+        if not exists:
+            await self.db.execute("DELETE FROM balance_dirty WHERE user_id=?", (int(user_id),))
+            return 0
+        balance = await self._available_seconds_locked(int(user_id))
+        # Credits can begin in the future or expire without a database write.
+        transitions = await _rows(
+            self.db,
+            "SELECT moment FROM (SELECT created_at AS moment FROM ledger WHERE user_id=? AND kind='credit' "
+            "UNION ALL SELECT expires_at AS moment FROM ledger WHERE user_id=? AND kind='credit' AND expires_at IS NOT NULL) "
+            "WHERE julianday(moment) > julianday(?) ORDER BY julianday(moment) LIMIT 1",
+            (int(user_id), int(user_id), now),
+        )
+        next_transition = transitions[0][0] if transitions else None
+        await self.db.execute(
+            "INSERT INTO user_balances(user_id,available_seconds,updated_at,next_transition) VALUES(?,?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET available_seconds=excluded.available_seconds, "
+            "updated_at=excluded.updated_at,next_transition=excluded.next_transition",
+            (int(user_id), balance, now, next_transition),
+        )
+        await self.db.execute("DELETE FROM balance_dirty WHERE user_id=?", (int(user_id),))
+        return balance
+
+    async def _flush_balance_dirty_locked(self, limit: int | None = None) -> int:
+        sql = "SELECT user_id FROM balance_dirty ORDER BY user_id"
+        params = ()
+        if limit is not None:
+            sql += " LIMIT ?"
+            params = (int(limit),)
+        rows = await _rows(self.db, sql, params)
+        for row in rows:
+            await self._refresh_balance_locked(int(row[0]))
+        return len(rows)
+
+    async def _backfill_user_balances(self) -> None:
+        """Resume a chunked, idempotent migration before serving balance reads."""
+        while True:
+            async with self._transaction():
+                state = (await _rows(self.db, "SELECT last_user_id,done FROM balance_backfill_state WHERE id=1"))[0]
+                if state[1]:
+                    break
+                if state[0] is None:
+                    rows = await _rows(self.db, "SELECT telegram_id FROM users ORDER BY telegram_id LIMIT 500")
+                else:
+                    rows = await _rows(self.db, "SELECT telegram_id FROM users WHERE telegram_id > ? ORDER BY telegram_id LIMIT 500", (state[0],))
+                for row in rows:
+                    await self._refresh_balance_locked(int(row[0]))
+                last_id = int(rows[-1][0]) if rows else state[0]
+                await self.db.execute("UPDATE balance_backfill_state SET last_user_id=?, done=? WHERE id=1", (last_id, int(len(rows) < 500)))
+        # An offline importer or interrupted migration can leave dirty markers.
+        while True:
+            async with self._transaction():
+                count = await self._flush_balance_dirty_locked(500)
+            if count < 500:
+                break
+
+    async def _check_user_balances(self) -> None:
+        async with self._transaction():
+            rows = await _rows(self.db, "SELECT telegram_id FROM users ORDER BY telegram_id LIMIT 20")
+            for row in rows:
+                user_id = int(row[0])
+                cached = await _rows(self.db, "SELECT available_seconds FROM user_balances WHERE user_id=?", (user_id,))
+                actual = await self._available_seconds_locked(user_id)
+                if not cached or int(cached[0][0]) != actual:
+                    logger.warning("balance cache mismatch user=%s", user_id)
+                    METRICS.record_balance_repair()
+                    await self._refresh_balance_locked(user_id)
+
     async def available_seconds(self, user_id: int) -> int:
-        if self._read_db is not None:
-            return sum(
-                max(0, int(row[1]))
-                for row in await self._credit_lots(
-                    user_id, iso(self._now()), conn=self._read_db
-                )
-            )
-        async with self._write_lock:
-            return await self._available_seconds_locked(user_id)
+        if not self._balances_ready:
+            if self._read_db is not None:
+                return sum(max(0, int(row[1])) for row in await self._credit_lots(user_id, iso(self._now()), conn=self._read_db))
+            async with self._write_lock:
+                return await self._available_seconds_locked(user_id)
+        rows = await _rows(
+            self.read_db,
+            "SELECT available_seconds FROM user_balances b WHERE b.user_id=? "
+            "AND julianday(b.updated_at) <= julianday(?) "
+            "AND (b.next_transition IS NULL OR julianday(b.next_transition) > julianday(?)) "
+            "AND NOT EXISTS (SELECT 1 FROM balance_dirty d WHERE d.user_id=b.user_id)",
+            (int(user_id), iso(self._now()), iso(self._now())),
+        )
+        if rows:
+            return int(rows[0][0])
+        async with self._transaction():
+            return await self._refresh_balance_locked(int(user_id))
 
     async def grant_free_plan_once(self, user_id: int, seconds: int) -> bool:
         async with self._transaction():

@@ -94,3 +94,13 @@ legacy offset timestamps; invalid source expiries cause the refund to fail close
 It is non-expiring only if all
 contributing lots were non-expiring. Refund notes record contributing lot IDs.
 Generic refunds require the original debit ID; an untraceable refund is rejected.
+
+### Materialized balance cache
+
+`user_balances` is a cache of FIFO ledger truth. SQLite triggers mark affected
+users dirty, and the writer refreshes those rows before committing the same
+transaction, including payment/referral rewards and hold recovery. Startup
+backfills in batches and repairs a sample; offline import dirty rows are
+recomputed before serving traffic. The cache records the next credit start or
+expiry and is refreshed on read after that instant, or after a clock rollback.
+Ledger rows and allocation records remain authoritative.

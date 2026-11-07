@@ -58,6 +58,9 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "referrals",
         "referral_rewards",
         "broadcast_runs",
+        "user_balances",
+        "balance_dirty",
+        "balance_backfill_state",
     }
 )
 
@@ -181,6 +184,7 @@ class DatabaseCore:
         self._db: aiosqlite.Connection | None = None
         self._read_db: aiosqlite.Connection | None = None
         self._write_lock = asyncio.Lock()
+        self._balances_ready = False
         self._clock = clock
 
     def _now(self) -> datetime:
@@ -221,6 +225,15 @@ class DatabaseCore:
     async def _backfill_allocations(self) -> None:
         return None
 
+    async def _backfill_user_balances(self) -> None:
+        return None
+
+    async def _check_user_balances(self) -> None:
+        return None
+
+    async def _flush_balance_dirty_locked(self, limit: int | None = None) -> int:
+        return 0
+
     async def connect(self) -> None:
         await asyncio.to_thread(
             self.path.parent.mkdir, parents=True, exist_ok=True
@@ -242,6 +255,9 @@ class DatabaseCore:
         if problems:
             logger.warning("SQLite reference integrity: %s", "; ".join(problems[:20]))
         await self._backfill_allocations()
+        await self._backfill_user_balances()
+        self._balances_ready = True
+        await self._check_user_balances()
         if str(self.path) != ":memory:":
             self._read_db = await aiosqlite.connect(self.path)
             self._read_db.row_factory = aiosqlite.Row
@@ -265,6 +281,7 @@ class DatabaseCore:
                 logger.warning("could not restrict permissions on %s", candidate)
 
     async def close(self) -> None:
+        self._balances_ready = False
         if self._read_db is not None:
             await self._read_db.close()
             self._read_db = None
@@ -324,6 +341,9 @@ class DatabaseCore:
             try:
                 await self.db.execute("BEGIN IMMEDIATE")
                 yield
+                if self._balances_ready and self.db.in_transaction:
+                    while await self._flush_balance_dirty_locked(500) == 500:
+                        pass
                 await self.db.commit()
             except BaseException as exc:
                 await self.db.rollback()

@@ -297,28 +297,32 @@ class UsersRepositoryMixin(DatabaseCore):
 
     async def list_users(self, limit: int = 200, offset: int = 0) -> list[dict[str, Any]]:
         now = iso(self._now())
+        # Repair only stale/missing rows on this page before the indexed join.
+        stale = await _rows(
+            self.read_db,
+            "SELECT page.telegram_id FROM (SELECT telegram_id FROM users "
+            "ORDER BY joined_at DESC LIMIT ? OFFSET ?) page "
+            "LEFT JOIN user_balances b ON b.user_id=page.telegram_id "
+            "LEFT JOIN balance_dirty d ON d.user_id=page.telegram_id "
+            "WHERE b.user_id IS NULL OR d.user_id IS NOT NULL "
+            "OR julianday(b.updated_at) > julianday(?) "
+            "OR (b.next_transition IS NOT NULL AND julianday(b.next_transition) <= julianday(?))",
+            (limit, offset, now, now),
+        )
+        if stale:
+            async with self._transaction():
+                for row in stale:
+                    await self._refresh_balance_locked(int(row[0]))
         rows = await _rows(
             self.read_db,
             "SELECT u.telegram_id, u.joined_at, u.banned, u.is_unlimited, "
             "COALESCE(u.username, '') AS username, "
             "COALESCE(u.first_name, '') AS first_name, "
             "COALESCE(u.last_name, '') AS last_name, "
-            "COALESCE(("
-            "  SELECT SUM(MAX(0, l.seconds "
-            "    - COALESCE((SELECT SUM(a.seconds) FROM debit_allocations a "
-            "                WHERE a.credit_id = l.id), 0) "
-            "    - COALESCE((SELECT SUM(a.seconds) FROM hold_allocations a "
-            "                JOIN holds h ON h.submission_id = a.submission_id "
-            "                WHERE a.credit_id = l.id AND h.released_at IS NULL), 0)"
-            "  )) "
-            "  FROM ledger l "
-            "  WHERE l.user_id = u.telegram_id AND l.kind = 'credit' "
-            "    AND julianday(l.created_at) <= julianday(?) "
-            "    AND (l.expires_at IS NULL OR julianday(l.expires_at) > julianday(?))"
-            "), 0) AS available_seconds "
-            "FROM users u "
+            "COALESCE(b.available_seconds, 0) AS available_seconds "
+            "FROM users u LEFT JOIN user_balances b ON b.user_id=u.telegram_id "
             "ORDER BY u.joined_at DESC LIMIT ? OFFSET ?",
-            (now, now, limit, offset),
+            (limit, offset),
         )
         return [
             {
