@@ -194,6 +194,7 @@ class MetricsCollector:
             self._curation_delivery_errors = 0
             self._curation_source_missing = 0
             self._support_ticket_denials = 0
+            self._document_unpack_rejections = 0
             self._outcomes: dict[str, int] = dict.fromkeys(TERMINAL_OUTCOMES, 0)
             self._stage_active: dict[str, int] = dict.fromkeys(PIPELINE_STAGES, 0)
             self._stage_latency: dict[str, _Series] = {
@@ -244,6 +245,10 @@ class MetricsCollector:
     def record_support_ticket_denial(self) -> None:
         with self._lock:
             self._support_ticket_denials += 1
+
+    def record_document_unpack_rejection(self) -> None:
+        with self._lock:
+            self._document_unpack_rejections += 1
 
     def record_job_started(self, *, queue_wait_seconds: float, queued_now: int) -> None:
         with self._lock:
@@ -372,6 +377,7 @@ class MetricsCollector:
                 "curation_delivery_errors": self._curation_delivery_errors,
                 "curation_source_missing": self._curation_source_missing,
                 "support_ticket_denials": self._support_ticket_denials,
+                "document_unpack_rejections": self._document_unpack_rejections,
                 "outcomes": dict(self._outcomes),
                 "stage_active": dict(self._stage_active),
                 "queue_wait": self._queue_wait.summary(),

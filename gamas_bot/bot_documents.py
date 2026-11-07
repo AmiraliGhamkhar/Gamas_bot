@@ -247,6 +247,7 @@ class DocumentOfficeWorkflowMixin:
                     source_type,
                     ocr=self._ocr_extractor(),
                     ocr_max_pages=int(self.settings.ocr_max_pages),
+                    max_unpacked_bytes=int(self.settings.doc_unpacked_max_bytes),
                 )
             text = await run_file_io(lambda: extracted.text)
             if not text.strip():

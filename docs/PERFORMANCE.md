@@ -48,3 +48,7 @@ python -m scripts.perf_bench --help
 Other tools: `scripts.admin_report_bench`, `scripts.document_chunk_bench`.
 Simulated latencies/429s are test inputs, not live measurements. Record settings,
 Python version, workload and host quotas with results; do not promise fixed throughput.
+
+Document uploads default to 20 MiB (`DOC_MAX_BYTES`); Office archive entries
+are also limited to 100 MiB in total (`DOC_UNPACKED_MAX_BYTES`). Operators may
+raise these limits, but doing so increases peak memory on the 2 GiB host.

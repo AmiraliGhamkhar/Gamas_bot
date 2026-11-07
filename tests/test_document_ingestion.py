@@ -130,6 +130,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("OCR پشتیبانی نمی‌شود", sent)
 
     async def test_oversized_document_is_rejected_before_download(self):
+        self.assertEqual(self.settings.doc_max_bytes, 20 * 1024 * 1024)
         event = self.upload(
             "huge.pdf",
             make_pdf_bytes(),

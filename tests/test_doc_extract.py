@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from gamas_bot.doc_extract import (
@@ -182,6 +183,15 @@ class PdfExtractionTests(TempFileMixin):
 
 
 class DocxExtractionTests(TempFileMixin):
+    def test_cumulative_office_expansion_is_bounded(self):
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("one.xml", b"x" * 600)
+            archive.writestr("two.xml", b"y" * 600)
+        path = self.write("expanded.docx", out.getvalue())
+        with self.assertRaises(DocExtractError):
+            extract_document(path, "docx", max_unpacked_bytes=1000)
+
     def test_headings_become_locators(self):
         path = self.write("notes.docx", make_docx_bytes())
         extracted = extract_document(path, "docx")

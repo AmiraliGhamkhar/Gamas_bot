@@ -35,7 +35,7 @@ Keep shipped defaults unless measurements justify changes.
 | `MAX_ACTIVE_JOBS`, `MAX_QUEUED_JOBS`, `MAX_ACTIVE_JOBS_PER_USER` | 3 / 8 / 2 |
 | `MAX_CONCURRENT_DOWNLOADS`, `MEDIA_WORKER_CONCURRENCY`, `MAX_CONCURRENT_UPLOADS` | 2 / 1 / 2 |
 | `MAX_FILE_SIZE`, `MAX_MEDIA_DURATION_SECONDS` | 134217728 bytes (128 MiB) / 7200 seconds |
-| `DOC_MAX_BYTES`, `TEMP_MIN_FREE_BYTES` | 52428800 bytes (50 MiB) / 67108864 bytes (64 MiB) |
+| `DOC_MAX_BYTES`, `TEMP_MIN_FREE_BYTES` | 20971520 bytes (20 MiB) / 67108864 bytes (64 MiB) |
 | `SPEECHMATICS_MAX_IN_FLIGHT`, `DEEPGRAM_MAX_IN_FLIGHT`, `STT_OPENAI_MAX_IN_FLIGHT` | 2 / 4 / 2 |
 | `STT_PROVIDER_TIMEOUT_SECONDS`, `STT_SLOT_WAIT_TIMEOUT_SECONDS` | 1800 / 600 seconds |
 | `LLM_PRIMARY_MAX_IN_FLIGHT`, `LLM_FALLBACK_MAX_IN_FLIGHT` | 4 / 4 slots |
@@ -85,3 +85,5 @@ or reachability. Preflight also probes the host/network and creates temporary ch
 `SUPPORT_MAX_OPEN_TICKETS` defaults to 3. `SUPPORT_TICKET_COOLDOWN_SECONDS`
 defaults to 600; set it to 0 to disable the creation cooldown. Both limits
 are enforced atomically when a ticket is created.
+
+`DOC_UNPACKED_MAX_BYTES` limits the cumulative expanded Office archive size (default 104857600 bytes).

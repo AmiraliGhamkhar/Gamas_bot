@@ -684,7 +684,8 @@ class Settings:
     #: Ceiling for an ingested study document (PDF/DOCX/PPTX), in bytes. Kept
     #: separate from ``max_file_size`` because a document is parsed into memory
     #: instead of streamed through the media worker.
-    doc_max_bytes: int = 50 * 1024 * 1024
+    doc_max_bytes: int = 20 * 1024 * 1024
+    doc_unpacked_max_bytes: int = 100 * 1024 * 1024
     #: OCR (third-party, opt-in). A text-poor PDF page, or an uploaded photo,
     #: is sent to i2ocr.com and read there. Off by default: the document leaves
     #: the host, so the deployment owner has to accept that trade-off.
@@ -1172,7 +1173,10 @@ def from_env(env_file: str | None = None) -> Settings:
             "MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE_BYTES, minimum=1024
         ),
         doc_max_bytes=_env_int(
-            "DOC_MAX_BYTES", 50 * 1024 * 1024, minimum=1024, maximum=1024**3
+            "DOC_MAX_BYTES", 20 * 1024 * 1024, minimum=1024, maximum=1024**3
+        ),
+        doc_unpacked_max_bytes=_env_int(
+            "DOC_UNPACKED_MAX_BYTES", 100 * 1024 * 1024, minimum=1024, maximum=1024**3
         ),
         max_media_duration_seconds=_env_float(
             "MAX_MEDIA_DURATION_SECONDS",
