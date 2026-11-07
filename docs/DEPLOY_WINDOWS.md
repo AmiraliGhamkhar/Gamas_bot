@@ -31,6 +31,15 @@ Fix every `FAIL`; review each `WARN`. The check is offline and does not verify k
 with Telegram/providers. Send `/start` and short audio; confirm the transcript
 arrives before any booklet. Stop with **Ctrl+C** and wait for shutdown.
 
+Note-provider keys and models are optional and configured in `.env`; the shipped
+defaults are not a deployment recommendation. See
+[Configuration](CONFIGURATION.md#note-provider-configuration) and
+[Note-generation providers](PROVIDERS.md) for the tested two-route profile. To
+inspect the effective order and non-secret settings offline, run
+`.\.venv\Scripts\python.exe -m scripts.probe_note_providers --show-config`.
+Settings are read only at startup, so stop and restart the bot after any `.env`
+change; a real generation probe is opt-in (`--generate`) and consumes quota.
+
 Keep the console open and prevent sleep while testing. Do not run this copy while
 the same token/session is active on cPanel.
 

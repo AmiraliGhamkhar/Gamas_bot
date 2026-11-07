@@ -2,6 +2,41 @@
 
 Concise history; detailed patches and earlier notes remain in Git history.
 
+## Unreleased — note-provider compatibility and tested deployment profile (2026-11-07)
+
+- Audited the real configuration/routing/request path. Shipped project defaults
+  are deliberately unchanged (`NOTE_PROVIDERS=gemini,nara,openrouter,deepseek,avalai`,
+  `NOTE_MAX_OUTPUT_TOKENS=16384`, structured output on, Gemini 2.5 flash-lite and
+  the pinned Gemma OpenRouter model). The verified two-route profile is documented
+  as a deployment-specific `.env` override in `README.md`, `.env.example`,
+  `docs/CONFIGURATION.md`, `docs/PROVIDERS.md` and `docs/DEPLOY_CPANEL.md`.
+- Added one bounded Gemini-only compatibility retry for HTTP 400
+  `INVALID_ARGUMENT` when the original request actually contained
+  `generationConfig.responseSchema`: it drops only that field, keeps the JSON
+  mime type and the strict parser/domain validation. Auth/quota/permission and
+  unrelated errors are untouched. The exact cause of the observed Gemini 400 is
+  explicitly **not** claimed as root-caused (the failing payload was not captured).
+- Bounded the total number of request-parameter compatibility adjustments so a
+  gateway alternating two parameter spellings cannot retry forever.
+- Token logs now separate the effective outgoing budget
+  (`requested_output_tokens`, read from the built payload) from the provider's
+  actual completion usage (`output_tokens`). Verified that a 32,768 configured
+  budget reaches both the Gemini and OpenRouter payloads; no database or admin
+  layer overrides note budgets, and settings load only at startup.
+- `note_route_summary()` prints the effective provider order and non-secret
+  settings from `python -m gamas_bot --check`; the provider probe gained an
+  offline `--show-config` stage, explicit metadata-vs-generation separation,
+  quota warnings, credential-safe base URLs and per-route effective budgets.
+  `--generate` remains opt-in and is never used by CI.
+- Documented NaraRouter's observed HTTP 502 generation failures for
+  `laguna-s-2.1` without deleting the integration or advertising it as a
+  verified fallback; documented the 16,384 vs 32,768 discrepancy as an
+  unresolved, evidence-based stale-startup-process/stale-env hypothesis.
+- `tests/test_note_provider_compatibility.py` adds 26 deterministic offline
+  regressions for configuration, Gemini payload/fallback/validation, OpenRouter
+  budget/reasoning/truncation, and Gemini → OpenRouter failover. No database
+  schema, migration, admin setting, STT, Telegram or media behaviour changed.
+
 ## Unreleased — hardening
 
 - WO-BC-1: confirm broadcasts, serialize runs, show progress, and support graceful stop.

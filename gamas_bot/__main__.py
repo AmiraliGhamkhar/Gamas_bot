@@ -27,7 +27,7 @@ import signal
 import sys
 
 from . import __version__
-from .config import Settings, check, is_advisory
+from .config import Settings, check, is_advisory, note_route_summary
 from .instance_lock import AlreadyRunningError, InstanceLock, is_locked
 from .logging_config import configure_logging, install_asyncio_exception_handler
 
@@ -71,6 +71,11 @@ async def run_self_check() -> int:
     if fatal:
         return 2
     print("PASS configuration: telegram, provider and admin settings are valid")
+    # Offline and credential-free: the operator can confirm which providers the
+    # *next* start will attempt without printing a key or contacting a gateway.
+    print("Effective note routing (no secrets):")
+    for line in note_route_summary(settings):
+        print(f"  {line}")
 
     missing = [
         name

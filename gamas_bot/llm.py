@@ -1,8 +1,9 @@
 """The single LLM client for note generation: ordered providers, bounded retries.
 
 ``NOTE_PROVIDERS`` *is* the failover policy (``gemini,nara,openrouter,deepseek,
-avalai`` by default — Gemini flash-lite first, then each further provider only
-when it is listed *and* has its own credential). For every route the
+avalai`` is the shipped project default — Gemini flash-lite first, then each
+further provider only when it is listed *and* has its own credential; a
+deployment can narrow it, e.g. ``gemini,openrouter``). For every route the
 client builds that provider's own request
 (base URL, authentication, model, supported parameters), parses its own response
 shape, retries only transient failures — a bounded budget per provider — and
@@ -135,6 +136,13 @@ LLM_REQUEST_TIMEOUT_SECONDS = 300.0
 
 #: Bounded retries for transient LLM failures (5xx, 429, network).
 MAX_TRANSIENT_RETRIES = 2
+
+#: Maximum number of request-parameter compatibility adjustments per attempt
+#: (Gemini ``responseSchema``/``thinkingConfig`` removal, ``response_format``
+#: downgrades, ``max_completion_tokens`` renames, …). Each adjustment costs one
+#: extra real request, so the count is bounded even if a gateway keeps
+#: rejecting a field — or rejects two spellings alternately.
+MAX_COMPATIBILITY_ADJUSTMENTS = 4
 
 _T = TypeVar("_T")
 
@@ -1184,22 +1192,52 @@ def _usage_summary(payload: dict, style: str) -> tuple[str, int | None, int | No
     return get_dialect(style).extract_usage(payload)
 
 
+def request_payload_output_tokens(payload: dict) -> int | None:
+    """The output budget this *request* actually sends, after provider clamping.
+
+    Read from the built payload rather than ``Settings`` so logs and operator
+    probes report the effective value (including per-request overrides and any
+    provider-specific cap), not merely what the environment declared.
+    """
+    for key in ("max_tokens", "max_completion_tokens"):
+        value = payload.get(key)
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    generation_config = payload.get("generationConfig")
+    if isinstance(generation_config, dict):
+        value = generation_config.get("maxOutputTokens")
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+    return None
+
+
 def _log_usage(
-    route: NoteRoute, payload: dict, *, ttfb_ms: float = 0.0, elapsed_ms: float = 0.0
+    route: NoteRoute,
+    payload: dict,
+    *,
+    ttfb_ms: float = 0.0,
+    elapsed_ms: float = 0.0,
+    requested_output_tokens: int | None = None,
 ) -> None:
-    """Log one completed request's token usage (never its content or key)."""
+    """Log one completed request's token usage (never its content or key).
+
+    ``output_tokens`` is the provider's *actual* completion usage; the optional
+    ``requested_output_tokens`` is the budget we sent. Keeping them separate is
+    what makes a truncated answer diagnosable without guessing from ``.env``.
+    """
     model, input_tokens, output_tokens, total_tokens = _usage_summary(payload, route.style)
 
     def shown(value: int | None) -> str:
         return str(value) if value is not None else "-"
 
     logger.info(
-        "note provider usage provider=%s model=%s input_tokens=%s "
-        "output_tokens=%s total_tokens=%s ttfb_ms=%.0f elapsed_ms=%.0f",
+        "note provider usage provider=%s model=%s requested_output_tokens=%s "
+        "input_tokens=%s output_tokens=%s total_tokens=%s ttfb_ms=%.0f elapsed_ms=%.0f",
         route.slug,
         # The served-model string is provider-controlled: collapse any
         # whitespace (including newlines) so it can never forge a log line.
         _sanitize_error_text(model or route.model, limit=80),
+        shown(requested_output_tokens),
         shown(input_tokens),
         shown(output_tokens),
         shown(total_tokens),
@@ -1216,13 +1254,36 @@ _OUTPUT_CAP_ERROR_RE = re.compile(
 )
 
 
+def _is_gemini_invalid_argument(error_text: str) -> bool:
+    """Gemini's canonical HTTP 400 ``INVALID_ARGUMENT`` request rejection.
+
+    Auth/quota/permission failures are classified as :class:`LLMAuthError` and
+    never reach this path; 429/5xx are transient and context/budget failures
+    have their own classes. What remains is a 400-level request rejection, and
+    only Google's ``INVALID_ARGUMENT`` marker is considered a possible
+    structured-output incompatibility.
+    """
+    lower = error_text.lower()
+    return "http 400" in lower and (
+        "invalid_argument" in lower or "invalid argument" in lower
+    )
+
+
 def _adjust_rejected_request_param(
     payload: dict,
     error_text: str,
     *,
     allow_json_object_fallback: bool = True,
+    provider_slug: str = "",
 ) -> str | None:
-    """Adjust a request field after an explicit 400/404/422 parameter rejection."""
+    """Adjust a request field after an explicit 400/404/422 parameter rejection.
+
+    ``provider_slug`` is used only for one narrow Gemini compatibility case: a
+    structured request that gets a 400 ``INVALID_ARGUMENT`` drops *only*
+    ``generationConfig.responseSchema`` and is retried once. The JSON mime type
+    and every other field stay, so the answer still goes through the existing
+    strict JSON parser and note validation.
+    """
     lower = error_text.lower()
     rejected_markers = (
         "unsupported parameter",
@@ -1331,6 +1392,19 @@ def _adjust_rejected_request_param(
 
     generation_config = payload.get("generationConfig")
     if isinstance(generation_config, dict):
+        # The 2026-11-07 Gemini test failed with HTTP 400 INVALID_ARGUMENT when
+        # structured output was enabled and succeeded with it disabled. The
+        # exact rejected field was never isolated from the failing payload, so
+        # this is a deliberately narrow, single-shot compatibility retry: it is
+        # Gemini-only, needs a 400 INVALID_ARGUMENT, needs the original request
+        # to actually contain responseSchema, and removes only that field.
+        if (
+            provider_slug == "gemini"
+            and "responseSchema" in generation_config
+            and _is_gemini_invalid_argument(error_text)
+        ):
+            generation_config.pop("responseSchema", None)
+            return "generationConfig.responseSchema_invalid_argument"
         if (
             "responseSchema" in generation_config
             and any(
@@ -1559,6 +1633,7 @@ async def _complete_streaming_on_route(
         if use_stream_opts:
             stream_payload["stream_options"] = {"include_usage": True}
 
+    requested_output_tokens = request_payload_output_tokens(stream_payload)
     started = time.perf_counter()
     ttfb_ms = 0.0
     text_parts: list[str] = []
@@ -1797,7 +1872,10 @@ async def _complete_streaming_on_route(
         try:
             fallback_dict = _loads(fallback_bytes)
             if isinstance(fallback_dict, dict):
-                _log_usage(route, fallback_dict, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms)
+                _log_usage(
+                    route, fallback_dict, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
+                    requested_output_tokens=requested_output_tokens,
+                )
                 _raise_if_in_body_error(route.label, fallback_dict, resp_headers, route.api_key or None)
                 return _parse_response(fallback_dict, route.style)
         except (ValueError, TypeError):
@@ -1850,7 +1928,10 @@ async def _complete_streaming_on_route(
         }
         if served_model:
             assembled["model"] = served_model
-    _log_usage(route, assembled, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms)
+    _log_usage(
+        route, assembled, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
+        requested_output_tokens=requested_output_tokens,
+    )
     _raise_if_in_body_error(route.label, assembled, resp_headers, route.api_key or None)
     return _parse_response(assembled, route.style)
 
@@ -1884,18 +1965,22 @@ async def _complete_on_route(
     )
     attempt = 0
     request_number = 0
+    compatibility_adjustments = 0
     while True:
         request_number += 1
+        # Read the budget from the payload: this is the value that really goes
+        # on the wire after provider-specific clamping and per-call overrides.
+        requested_output_tokens = request_payload_output_tokens(payload)
         logger.info(
             "LLM request sending provider=%s model=%s style=%s attempt=%d system_chars=%d "
-            "user_chars=%d output_tokens=%d fields=%s",
+            "user_chars=%d requested_output_tokens=%s fields=%s",
             route.slug,
             route.model,
             route.style,
             request_number,
             len(system),
             len(user),
-            settings.note_max_output_tokens,
+            requested_output_tokens if requested_output_tokens is not None else "-",
             ",".join(sorted(payload)),
         )
         started = time.perf_counter()
@@ -1937,7 +2022,10 @@ async def _complete_on_route(
             # Usage is logged even for an answer the parser then rejects or
             # reports as truncated: those are exactly the requests whose real
             # token counts calibrate the chunk budget.
-            _log_usage(route, result, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms)
+            _log_usage(
+                route, result, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
+                requested_output_tokens=requested_output_tokens,
+            )
             _raise_if_in_body_error(
                 route.label, result, resp_headers, route.api_key or None
             )
@@ -1969,19 +2057,31 @@ async def _complete_on_route(
                         route.slug,
                     )
                     continue
-                adjustment = _adjust_rejected_request_param(
-                    payload,
-                    str(exc),
-                    allow_json_object_fallback=profile.supports_response_format(route),
-                )
+                adjustment = None
+                if compatibility_adjustments < MAX_COMPATIBILITY_ADJUSTMENTS:
+                    adjustment = _adjust_rejected_request_param(
+                        payload,
+                        str(exc),
+                        allow_json_object_fallback=profile.supports_response_format(route),
+                        provider_slug=route.slug,
+                    )
                 if adjustment is not None:
+                    compatibility_adjustments += 1
                     logger.info(
                         "Adjusting rejected request parameter and retrying "
-                        "provider=%s adjustment=%s",
+                        "provider=%s adjustment=%s (%d/%d)",
                         route.slug,
                         adjustment,
+                        compatibility_adjustments,
+                        MAX_COMPATIBILITY_ADJUSTMENTS,
                     )
                     continue
+                if compatibility_adjustments >= MAX_COMPATIBILITY_ADJUSTMENTS:
+                    logger.warning(
+                        "Compatibility adjustment budget exhausted provider=%s; "
+                        "not retrying this request again",
+                        route.slug,
+                    )
             raise
         except LLMAuthError as exc:
             event = "quota_exhausted" if "HTTP 402" in str(exc) else "auth_error"

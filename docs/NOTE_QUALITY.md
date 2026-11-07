@@ -16,6 +16,11 @@ preserve source names, numbers, terms and units rather than invent facts.
   Oversized sections may stay uncompiled.
 - Failed map chunks do not produce partial booklets. The user keeps the delivered
   transcript; transcription billing is unchanged.
+- `NOTE_STRUCTURED_OUTPUT=0` (the 2026-11-07 tested deployment profile) removes
+  `responseSchema`/`response_format` from requests. Strict JSON parsing, the
+  note-domain shape check and all grounding/completeness gates still run, so a
+  malformed, empty or truncated answer is refused rather than delivered. See
+  [Note-generation providers](PROVIDERS.md).
 - One static prompt covers every pass: `gamas_bot/_prompt_block.py` holds the
   booklet-agent contract (the eight principles, the JSON shape and the booklet
   skeleton the exporter renders). It is byte-identical for every chunk, source

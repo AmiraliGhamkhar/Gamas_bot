@@ -153,6 +153,11 @@ NOTE_BASE_URL_DEFAULTS = {
 #: every existing deployment — an operator who never sets ``AVALAI_API_KEY``
 #: gets exactly the previous chain. The order in ``NOTE_PROVIDERS`` *is* the
 #: failover policy, exactly like ``STT_PROVIDERS``.
+#:
+#: This is a *project-wide* default, not a deployment recommendation: a
+#: deployment can set ``NOTE_PROVIDERS=gemini,openrouter`` (the profile
+#: verified on 2026-11-07, see ``docs/PROVIDERS.md``) without changing what
+#: other deployments get out of the box.
 DEFAULT_NOTE_PROVIDERS = "gemini,nara,openrouter,deepseek,avalai"
 
 DEFAULT_NOTE_MODELS = {
@@ -176,10 +181,13 @@ DEFAULT_NOTE_CONTEXT_TOKENS = 131072
 #: Per-chunk character ceiling of one note request (an upper bound that the
 #: token budget in ``notes.effective_chunk_chars`` may still shrink).
 DEFAULT_NOTE_CHUNK_CHARS = 64000
-#: Output-token budget sent as ``max_tokens`` on every note request. It stays
-#: at half (or less) of the default models' documented completion caps
-#: (32,768 on the pinned OpenRouter endpoint, 65.5K for Agnes 2.5 Flash), so
-#: the budget itself never exceeds what a default model may emit.
+#: Output-token budget sent as ``max_tokens`` / ``maxOutputTokens`` on every
+#: note request. It stays at half (or less) of the default models' documented
+#: completion caps (32,768 on the pinned OpenRouter endpoint, 65.5K for Agnes
+#: 2.5 Flash), so the budget itself never exceeds what a default model may
+#: emit. A deployment whose model publishes a larger completion cap can raise
+#: it with ``NOTE_MAX_OUTPUT_TOKENS`` (32,768 in the 2026-11-07 tested
+#: profile); the old 16,384 value is this shipped default, not a cap.
 DEFAULT_NOTE_MAX_OUTPUT_TOKENS = 16384
 #: Wall-clock deadline of one note request, in seconds. A hung provider must
 #: not inherit the STT job's multi-hour read timeout — but the deadline must
@@ -1086,6 +1094,41 @@ def note_route_diagnostics(settings: Settings) -> list[str]:
                 "provider (a credential is configured but no model name is)."
             )
     return problems
+
+
+def note_route_summary(settings: Settings) -> list[str]:
+    """Credential-free lines describing the *effective* note configuration.
+
+    ``Settings`` is built once at process start, so this is what the running
+    bot will actually attempt. Only slugs, labels, model ids and non-secret
+    numeric/boolean settings are included: no API keys, base URLs (which can
+    carry a key in their query string), prompts or transcript content. Safe to
+    print from ``--check`` or an operator probe.
+    """
+    routes = note_routes(settings)
+    thinking = settings.gemini_thinking_budget
+    if thinking < 0:
+        thinking_text = "disabled (no thinkingConfig)"
+    elif thinking == 0:
+        thinking_text = "off (thinkingBudget=0)"
+    else:
+        thinking_text = f"capped at {thinking}"
+    lines = [
+        f"Provider order: {', '.join(route.slug for route in routes) or '(none)'}",
+        f"Declared NOTE_PROVIDERS: {', '.join(settings.note_providers) or '(none)'}",
+        "Legacy NOTE_PROVIDER slot: "
+        + (settings.note_provider if _legacy_note_configured(settings) else "(not configured)"),
+        f"Structured output: {'enabled' if settings.note_structured_output else 'disabled'}",
+        f"Reasoning effort: {settings.note_reasoning_effort or '(provider default)'}",
+        f"Maximum output tokens: {settings.note_max_output_tokens}",
+        f"Gemini thinking budget: {thinking_text}",
+        "Active providers:",
+    ]
+    if not routes:
+        lines.append("  (none; raw transcript only)")
+    for route in routes:
+        lines.append(f"  - {route.slug}: {route.label} model={route.model}")
+    return lines
 
 
 def _parse_admin_ids(raw: str) -> frozenset[int]:

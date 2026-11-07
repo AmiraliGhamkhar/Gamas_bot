@@ -27,7 +27,21 @@ Modules are under `gamas_bot/`.
 | Queue/transfers | `jobs`, `capacity`, `progress`, `telegram_transfer`, `telegram_text` |
 | Media/providers | `media`, `media_worker`, `presentations`, `stt`, `llm`, `http_util` |
 | Notes/documents | `transcript`, `notes`, `notes_evidence`, `doc_extract`, `ocr`, `office*`, `docx_export`, `pdf_export` |
+| Note-provider layer | `config` (routes), `llm_profiles` (capabilities), `llm` (wire dialects, bounded retries/failover), `notes` (strict JSON + domain validation) |
 | Storage/billing | `db` facade, `db_*` facets, `billing`, `subscription`, `learning` |
+
+## Note-provider layer
+
+`config.from_env()` reads `.env` once at startup; `note_routes()` turns the
+ordered `NOTE_PROVIDERS` chain into eligible routes, each with its own key, base
+URL and model. `llm.py` builds provider-specific requests (Gemini native or
+OpenAI-compatible), applies profile capabilities from `llm_profiles.py`, retries
+only bounded transient/parameter-compatibility failures and fails over to the
+next route. `notes.py` parses strict JSON and validates the booklet shape and
+grounding before any export. Truncated completions are refused. Provider
+settings are environment-only: the v3 database holds no AI-provider preferences,
+so no migration or admin change is needed to switch routes. See
+[Note-generation providers](PROVIDERS.md).
 
 ## Boundaries
 

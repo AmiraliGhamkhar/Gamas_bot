@@ -32,6 +32,43 @@ PowerPoint narration starts only from its audio button. Scans/photos need
 use deterministic fallbacks; audio delivers only the transcript. Office/document
 notes spend no user credit or learning gifts, but AI calls may cost the operator.
 
+## AI note generation
+
+`config.from_env()` reads `.env` **once at startup** into one frozen settings
+object. `note_routes()` turns `NOTE_PROVIDERS` into the ordered failover chain;
+each route keeps its own key, API base and model, and an uncredentialed route is
+skipped. `llm.py` builds the provider-specific request (native Gemini
+`generateContent` or OpenAI-compatible chat completions), retries only bounded
+transient failures, and moves to the next route on a recoverable provider error.
+`notes.py` then parses strict JSON, validates the booklet shape and runs the
+grounding/quality gates before rendering the RTL Word booklet. A truncated
+completion is refused, never delivered as a partial note. Logs contain metadata
+and token counts only — never keys, prompts or transcript text.
+
+Shipped **project defaults** are `NOTE_PROVIDERS=gemini,nara,openrouter,deepseek,avalai`,
+`GEMINI_MODEL=gemini-2.5-flash-lite`, `OPENROUTER_MODEL=google/gemma-4-31b-it:free`,
+`NOTE_MAX_OUTPUT_TOKENS=16384` and structured output enabled. They are not a
+deployment recommendation. The profile below was verified by real metadata and
+generation tests at one deployment on 2026-11-07 (see
+[provider documentation](docs/PROVIDERS.md)); keys always stay in `.env`:
+
+```dotenv
+NOTE_PROVIDERS=gemini,openrouter
+NOTE_STRUCTURED_OUTPUT=0
+NOTE_REASONING_EFFORT=none
+NOTE_MAX_OUTPUT_TOKENS=32768
+NOTE_GEMINI_THINKING_BUDGET=-1
+GEMINI_MODEL=gemini-3.5-flash-lite
+OPENROUTER_MODEL=nvidia/nemotron-3.5-super-vl:free
+```
+
+NaraRouter remains fully configurable in the codebase but is excluded from this
+chain: its `laguna-s-2.1` generation test failed with HTTP 502. Model
+entitlement alone never proves that generation works. Provider settings are read
+only at startup, so **restart the bot after editing `.env`**. Verify with
+`python -m scripts.probe_note_providers --show-config` (offline), then the
+metadata probe, then the opt-in `--generate` probe (consumes quota).
+
 ## Before production
 
 - Keep the project, `.env` and private data outside all web roots, including `public_html`.
@@ -42,7 +79,8 @@ notes spend no user credit or learning gifts, but AI calls may cost the operator
 - A receipt does not add credit until a human administrator approves it.
 
 [Documentation](docs/README.md) · [Configuration](docs/CONFIGURATION.md) ·
-[Operations](docs/OPERATIONS.md) · [Troubleshooting](docs/TROUBLESHOOTING.md)
+[Note providers](docs/PROVIDERS.md) · [Operations](docs/OPERATIONS.md) ·
+[Troubleshooting](docs/TROUBLESHOOTING.md)
 
 ## License
 
