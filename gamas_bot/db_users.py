@@ -191,18 +191,19 @@ class UsersRepositoryMixin(DatabaseCore):
 
     async def take_pending_gate_action(self, user_id: int) -> dict[str, Any] | None:
         """Return and remove the user's pending blocked request, if any."""
-        rows = await _rows(
-            self.read_db,
-            "SELECT user_id, chat_id, message_id, kind, callback_data, created_at "
-            "FROM pending_gate_actions WHERE user_id = ?",
-            (user_id,),
-        )
-        if not rows:
-            return None
-        row = rows[0]
-        await self._write(
-            "DELETE FROM pending_gate_actions WHERE user_id = ?", (user_id,)
-        )
+        async with self._transaction():
+            rows = await _rows(
+                self.db,
+                "SELECT user_id, chat_id, message_id, kind, callback_data, created_at "
+                "FROM pending_gate_actions WHERE user_id = ?",
+                (user_id,),
+            )
+            if not rows:
+                return None
+            row = rows[0]
+            await self.db.execute(
+                "DELETE FROM pending_gate_actions WHERE user_id = ?", (user_id,)
+            )
         return {
             "user_id": int(row[0]),
             "chat_id": int(row[1]),

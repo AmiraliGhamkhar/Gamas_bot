@@ -556,6 +556,18 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
         llm.reset_cooldowns()
         self._tmp.cleanup()
 
+    async def test_pending_gate_action_is_taken_once_concurrently(self):
+        await self.db.ensure_user(1234)
+        await self.db.save_pending_gate_action(
+            1234, chat_id=1234, message_id=7, kind="callback", callback_data="quiz:go"
+        )
+        results = await asyncio.gather(
+            self.db.take_pending_gate_action(1234),
+            self.db.take_pending_gate_action(1234),
+        )
+        self.assertEqual(sum(result is not None for result in results), 1)
+        self.assertEqual(next(result for result in results if result)["message_id"], 7)
+
     async def test_multiple_users_run_concurrently_with_complete_output_isolation(self):
         users = [1001, 1002, 1003, 1004]
         events: dict[int, FakeJobEvent] = {}
