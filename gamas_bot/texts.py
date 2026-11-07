@@ -143,6 +143,7 @@ RESTARTING: Final = "ربات در حال راه‌اندازی مجدد است�
 RESTARTING_JOB_CANCELLED: Final = (
     "⏸ ربات در حال راه‌اندازی مجدد است؛ کار شما لغو شد. لطفاً دوباره بفرستید."
 )
+RESTARTING_JOB_MESSAGE_REFERENCE: Final = "شناسهٔ پیام اصلی: {message_id}"
 ACCESS_BANNED: Final = "⛔ دسترسی شما به ربات مسدود شده است."
 ADMIN_ONLY: Final = "دسترسی به این بخش فقط برای مدیران مجاز است."
 INVALID_LEARNING_SIZE: Final = "اندازهٔ انتخاب‌شده نامعتبر است."

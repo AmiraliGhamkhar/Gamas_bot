@@ -579,6 +579,17 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
                 rows = await connection.execute_fetchall(f"PRAGMA {name}")
                 self.assertEqual(rows[0][0], expected)
 
+    async def test_shutdown_queued_notification_references_original_message(self):
+        await self.db.ensure_user(1234)
+        submission = await self.db.create_submission(1234, "audio", "x.mp3")
+        event = FakeJobEvent(chat_id=1234)
+        self.bot.client = event.client
+        message_id = event.message.id
+        self.bot.queue.submit(Job(submission, 1234, "audio", "x.mp3", message=event.message))
+        await self.bot.shutdown()
+        from gamas_bot.progress import to_persian_digits
+        self.assertTrue(any(to_persian_digits(message_id) in text for text in event.replies))
+
     async def test_stray_transaction_rollback_is_reported(self):
         await self.db.db.execute("BEGIN")
         with self.assertLogs("gamas_bot.db.core", level="WARNING") as logs:

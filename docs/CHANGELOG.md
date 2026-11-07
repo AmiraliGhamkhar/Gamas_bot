@@ -10,6 +10,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-PAY-5: edit the wallet screen in place when opening an existing order.
 - WO-PAY-3: surface older open orders and clamp wallet history pages.
 - WO-PAY-4: record cancellation actors, expose cancelled orders and use UTC receipt retention.
+- WO-CAP-3: include the original Telegram message ID in queued-job restart notices.
 - WO-CAP-1: lower document upload and cumulative Office expansion defaults.
 - WO-SUP-1: atomically limit open support tickets and enforce a creation cooldown.
 - WO-SUP-3: confirm user ticket closures before closing or notifying staff.

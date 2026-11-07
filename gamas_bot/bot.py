@@ -421,10 +421,14 @@ class GamasBot(
                 )
                 if job.message is not None:
                     try:
+                        message_id = getattr(job.message, "id", None)
+                        notification = texts.RESTARTING_JOB_CANCELLED
+                        if isinstance(message_id, int) and not isinstance(message_id, bool) and message_id > 0:
+                            notification += "\n" + texts.RESTARTING_JOB_MESSAGE_REFERENCE.format(
+                                message_id=to_persian_digits(message_id)
+                            )
                         await asyncio.wait_for(
-                            job.message.reply(
-                                texts.RESTARTING_JOB_CANCELLED
-                            ),
+                            job.message.reply(notification),
                             timeout=2.0,
                         )
                     except Exception:
