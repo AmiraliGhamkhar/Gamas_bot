@@ -556,6 +556,16 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
         llm.reset_cooldowns()
         self._tmp.cleanup()
 
+    async def test_connection_memory_pragmas(self):
+        for connection, settings in (
+            (self.db.db, {"cache_size": -8000, "journal_size_limit": 33554432}),
+            (self.db.read_db, {"cache_size": -16000, "mmap_size": 134217728,
+                               "journal_size_limit": 33554432}),
+        ):
+            for name, expected in settings.items():
+                rows = await connection.execute_fetchall(f"PRAGMA {name}")
+                self.assertEqual(rows[0][0], expected)
+
     async def test_stray_transaction_rollback_is_reported(self):
         await self.db.db.execute("BEGIN")
         with self.assertLogs("gamas_bot.db.core", level="WARNING") as logs:

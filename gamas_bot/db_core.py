@@ -218,6 +218,9 @@ class DatabaseCore:
         await self._db.execute("PRAGMA temp_store=MEMORY")
         await self._db.execute("PRAGMA foreign_keys=ON")
         await self._db.execute("PRAGMA busy_timeout=5000")
+        # Bound the writer cache and retained WAL on the 2 GB host.
+        await self._db.execute("PRAGMA cache_size=-8000")
+        await self._db.execute("PRAGMA journal_size_limit=33554432")
         await self._apply_migrations()
         await self._db.commit()
         await self._db.execute("PRAGMA foreign_keys=ON")
@@ -231,6 +234,10 @@ class DatabaseCore:
             await self._read_db.execute("PRAGMA query_only=ON")
             await self._read_db.execute("PRAGMA temp_store=MEMORY")
             await self._read_db.execute("PRAGMA busy_timeout=5000")
+            # Bound the read cache and mapping on the 2 GB host.
+            await self._read_db.execute("PRAGMA cache_size=-16000")
+            await self._read_db.execute("PRAGMA mmap_size=134217728")
+            await self._read_db.execute("PRAGMA journal_size_limit=33554432")
         self._secure_file_permissions()
 
     def _secure_file_permissions(self) -> None:
