@@ -562,7 +562,7 @@ class LearningProgressTests(CurationFixture):
                 peak = max(peak, active)
                 try:
                     await asyncio.sleep(0.01)
-                    chunk = next(item for item in chunks if item.text == kwargs["user"])
+                    chunk = next(item for item in chunks if kwargs["user"].endswith(item.text))
                     return {"cards": [{"front": f"پرسش {chunk.index}", "back": "پاسخ", "source": chunk.locator}]}
                 finally:
                     active -= 1
@@ -593,7 +593,7 @@ class LearningProgressTests(CurationFixture):
 
         async def provider(*args, **kwargs):
             await asyncio.sleep(0.01)
-            chunk = next(item for item in chunks if item.text == kwargs["user"])
+            chunk = next(item for item in chunks if kwargs["user"].endswith(item.text))
             calls.append(chunk.index)
             return {"cards": [{"front": f"پرسش {chunk.index}", "back": "پاسخ", "source": chunk.locator}]}
 
