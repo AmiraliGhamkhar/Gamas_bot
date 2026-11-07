@@ -749,14 +749,7 @@ class GamasBot(
             result = await self.subscription.check_membership(
                 user_id, force=True, allow_cache=False
             )
-            checked_at = iso(datetime.now(timezone.utc))
-            await self.subscription.record_result(user_id, result)
-            await self.db.set_subscription_state(
-                user_id,
-                result.status or result.state,
-                verified_at=checked_at if result.is_member else None,
-                checked_at=checked_at,
-            )
+            await self.subscription.record_result(user_id, result, touch_checked_at=True)
             checked += 1
             if result.is_unknown:
                 logger.warning("membership sweep paused on an inconclusive check")

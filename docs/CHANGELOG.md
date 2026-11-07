@@ -4,6 +4,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 
 ## Unreleased — hardening
 
+- WO-SUB-2: record sweep membership and check timestamp in one update.
 - WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
 - WO-LRN-10: gate flashcard DOCX delivery while keeping paid quiz answers accessible.
 - WO-LRN-11: reject invalid flashcard presets rather than silently charging the base cost.

@@ -548,6 +548,15 @@ class PendingResumeTests(SubscriptionTestCase):
         self.bot.client.get_messages = AsyncMock(return_value=None)
         self.assertFalse(await self.bot._resume_pending_gate_action(USER_ID))
 
+    async def test_sweep_records_each_user_once(self):
+        await self.db.ensure_user(USER_ID)
+        await self.use_resolver("member")
+        with mock.patch.object(self.db, "set_subscription_state", wraps=self.db.set_subscription_state) as update:
+            with mock.patch("gamas_bot.bot.SWEEP_PAUSE_SECONDS", 0):
+                self.assertEqual(await self.bot._membership_sweep_batch(), 1)
+        self.assertEqual(update.await_count, 1)
+        self.assertIsNotNone(update.await_args.kwargs["checked_at"])
+
     async def test_sweep_selection_skips_banned_and_starts_with_oldest_check(self):
         await self.db.ensure_user(1)
         await self.db.ensure_user(2)
