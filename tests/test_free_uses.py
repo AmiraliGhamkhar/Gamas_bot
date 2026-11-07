@@ -158,7 +158,7 @@ class FreeUseDatabaseTests(unittest.IsolatedAsyncioTestCase):
         claim = "pending-token"
         self.assertTrue(await self.db.consume_free_use(OWNER, "deck", claim_id=claim))
         item = await self.db.library_add(OWNER, "booklet", 1, 2, None, title="سند")
-        with self.assertRaises(KeyError):
+        with self.assertRaises(ValueError):
             await self.db.deck_create_with_cards(
                 OWNER, item, "ناقص", [{"front": "بدون پاسخ"}], free_claim_id=claim
             )
