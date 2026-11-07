@@ -707,6 +707,26 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_json_can_refuse_to_wait_for_provider_capacity(self):
+        from gamas_bot import llm
+        settings = make_settings(note_hedge_after=0)
+        pool = mock.Mock()
+        pool.acquire_any = mock.AsyncMock(return_value=None)
+        with mock.patch.object(llm, "pool_for", return_value=pool):
+            with self.assertRaises(llm.LLMTransientError):
+                await complete_json(FakeSession([]), settings, system="S", user="U", wait_for_capacity=False)
+        self.assertEqual(pool.acquire_any.await_args.kwargs["timeout"], 0.0)
+
+    async def test_per_call_output_limit_shares_original_capacity_pool(self):
+        from gamas_bot import llm
+        session = FakeSession([FakeResponse(200, {
+            "choices": [{"message": {"content": '{"ok": true}'}}]
+        })])
+        settings = make_settings(note_max_output_tokens=8192)
+        with mock.patch.object(llm, "pool_for", wraps=llm.pool_for) as pool:
+            await complete_json(session, settings, system="S", user="U", max_output_tokens=1024)
+        self.assertIs(pool.call_args.args[1], settings)
+
     async def test_per_call_output_limit_does_not_mutate_settings(self):
         session = FakeSession([FakeResponse(200, {
             "choices": [{"message": {"content": '{"ok": true}'}}]

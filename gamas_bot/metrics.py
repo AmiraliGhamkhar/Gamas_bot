@@ -200,6 +200,7 @@ class MetricsCollector:
             self._retention_errors = 0
             self._broadcast_failures = 0
             self._balance_repairs = 0
+            self._learning_capacity_denials = 0
             self._document_unpack_rejections = 0
             self._receipt_hash_errors = 0
             self._outcomes: dict[str, int] = dict.fromkeys(TERMINAL_OUTCOMES, 0)
@@ -248,6 +249,10 @@ class MetricsCollector:
     def record_curation_source_missing(self) -> None:
         with self._lock:
             self._curation_source_missing += 1
+
+    def record_learning_capacity_denial(self) -> None:
+        with self._lock:
+            self._learning_capacity_denials += 1
 
     def record_balance_repair(self) -> None:
         with self._lock:
@@ -419,6 +424,7 @@ class MetricsCollector:
                 "retention_errors": self._retention_errors,
                 "broadcast_failures": self._broadcast_failures,
                 "balance_repairs": self._balance_repairs,
+                "learning_capacity_denials": self._learning_capacity_denials,
                 "document_unpack_rejections": self._document_unpack_rejections,
                 "receipt_hash_errors": self._receipt_hash_errors,
                 "outcomes": dict(self._outcomes),

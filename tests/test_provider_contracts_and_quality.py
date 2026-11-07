@@ -563,7 +563,7 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(bot._learning_max_chars(), 56_000)
                 calls: list[dict] = []
 
-                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None):
+                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None, wait_for_capacity=True):
                     batch_no = len(calls)
                     calls.append({"system": system, "user": user, "schema": schema})
                     start = batch_no * 20

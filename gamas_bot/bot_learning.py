@@ -388,6 +388,8 @@ class LearningWorkflowMixin:
                         user=user_prompt,
                         schema=schema if use_schema else None,
                         max_output_tokens=self.settings.learning_max_output_tokens,
+                        # Never wait for a provider slot while holding the generation slot.
+                        wait_for_capacity=False,
                     )
                     def validate_and_merge() -> list[dict[str, Any]]:
                         if kind == "deck":

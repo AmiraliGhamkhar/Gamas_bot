@@ -22,7 +22,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 - WO-SUP-3: confirm user ticket closures before closing or notifying staff.
 - WO-SUP-2: retain full support openers while deriving a bounded first-line subject.
 - WO-PAY-1: preserve stored receipt bytes and modification time when viewed.
-- WO-LRN-14: bound generation/output resources, offload learning CPU work, and keep system prompts cache-stable.
+- WO-LRN-14: bound generation/output resources, share provider limits without nested slot waits, offload CPU work, and keep system prompts cache-stable.
 - WO-LRN-13: bound manual decks and validate repository item shapes.
 - WO-LRN-9: run one progress reporter from dispatch and update it on attempts.
 - WO-LRN-7: log and reject malformed three-option questions rather than mis-grade them.

@@ -57,3 +57,8 @@ Learning generations are limited by `LEARNING_GLOBAL_CONCURRENCY` (default 2),
 with `LEARNING_CHUNK_CONCURRENCY` workers per generation and a separate
 `LEARNING_MAX_OUTPUT_TOKENS` budget (default 4096). Static system prompts improve
 prefix caching; source data and retry instructions are sent in the user prompt.
+
+A learning generation holds its global admission permit while running; provider
+capacity is checked without waiting, so it never waits for a second slot while
+holding that permit. If all routes are saturated, the normal learning retry and
+refund path applies rather than queueing behind a provider slot.
