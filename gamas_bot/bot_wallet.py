@@ -18,6 +18,8 @@ from typing import Any
 from telethon import Button
 
 from . import texts
+from .doc_extract import sha256_file
+from .metrics import METRICS
 from .billing import format_duration, format_toman, format_validity
 from .bot_ui import TELEGRAM_CAPTION_LIMIT
 from .config import format_payment_card
@@ -350,6 +352,7 @@ class WalletWorkflowMixin:
                     self._pending_payments[user_id] = payment_id
                     return
                 await run_file_io(receipt_path.chmod, 0o600)
+                receipt_hash = await run_file_io(sha256_file, receipt_path)
             except OSError:
                 await run_file_io(receipt_path.unlink, missing_ok=True)
                 self._pending_payments[user_id] = payment_id
@@ -358,7 +361,7 @@ class WalletWorkflowMixin:
             try:
                 attach = asyncio.create_task(
                     self.db.set_payment_receipt(
-                        payment_id, str(receipt_path), user_id=user_id
+                        payment_id, str(receipt_path), user_id=user_id, receipt_hash=receipt_hash
                     )
                 )
                 try:
@@ -413,6 +416,17 @@ class WalletWorkflowMixin:
             plan=format_duration(seconds) if seconds else payment["plan_code"],
             price=format_toman(int(price)) if price is not None else texts.UNKNOWN_AMOUNT,
         )
+        if payment.get("receipt_hash"):
+            try:
+                other_id = await self.db.other_payment_with_receipt_hash(payment_id, payment["receipt_hash"])
+            except sqlite3.Error:
+                METRICS.record_receipt_hash_error()
+                logger.warning("receipt duplicate lookup failed payment_id=%s", payment_id)
+                other_id = None
+            if other_id is not None:
+                text += "\n" + texts.ADMIN_RECEIPT_DUPLICATE.format(
+                    payment_id=to_persian_digits(other_id)
+                )
         buttons = [
             [Button.inline(texts.BTN_ORDER_DETAILS, f"adm:pd:{payment_id}".encode())]
         ]

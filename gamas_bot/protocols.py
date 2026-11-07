@@ -183,8 +183,10 @@ class PaymentStoreProtocol(Protocol):
         payment_id: int,
         receipt_path: str,
         user_id: int | None = None,
+        *, receipt_hash: str | None = None,
     ) -> bool: ...
 
+    async def other_payment_with_receipt_hash(self, payment_id: int, receipt_hash: str) -> int | None: ...
     async def payment(self, payment_id: int) -> dict[str, Any] | None: ...
     async def open_awaiting_payment_for_user(
         self, user_id: int

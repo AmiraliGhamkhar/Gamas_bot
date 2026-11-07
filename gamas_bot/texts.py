@@ -327,6 +327,7 @@ ADMIN_RECEIPT_HEADER_TEMPLATE: Final = (
     "بسته: {plan}\n"
     "مبلغ: {price}"
 )
+ADMIN_RECEIPT_DUPLICATE: Final = "⚠️ تصویر رسید قبلاً در سفارش دیگر ثبت شده است (#{payment_id})"
 ADMIN_RECEIPT_MISSING_IMAGE: Final = "\n⚠️ رسید تصویری ارسال نشد؛ آن را از جزئیات سفارش ببینید."
 ADMIN_RECEIPT_MISSING_FILE: Final = "\n⚠️ فایل رسید در دسترس نیست."
 PAYMENT_INVALID_ID: Final = "شناسه سفارش نامعتبر است."

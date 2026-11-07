@@ -58,7 +58,9 @@ protection is retained for legacy records.
    failures never repeat activation. Final decisions are immutable.
 
 Administrators view stored receipt bytes as-is; viewing does not re-encode the
-image or refresh its retention timestamp.
+image or refresh its retention timestamp. A SHA-256 fingerprint of the normalized
+image flags reuse by a non-cancelled order in the administrator alert; it does
+not block upload or grant credit.
 
 Users may cancel before receipt upload; one open order per user. Payment history
 remains. Reviewed receipt images expire after 90 days by default; pending-review

@@ -245,6 +245,52 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         admin_history = await self.press(ADMIN, "adm:ph:0")
         self.assertIn("تأیید شده", admin_history.edits[-1][0])
 
+    async def test_duplicate_receipt_warns_but_different_image_does_not(self):
+        async def attach(user_id, color):
+            payment_id = await self.new_order(user_id)
+            source = self.root / f"image-{user_id}.png"
+            Image.new("RGB", (24, 24), color).save(source)
+            event = FakeJobEvent(source=source, chat_id=user_id)
+            event.message.photo = object()
+            event.message.file.mime_type = "image/png"
+            event.message.file.size = source.stat().st_size
+            await self.bot._handle_receipt_upload(event, user_id, payment_id=payment_id)
+            return payment_id, self.bot.client.deliveries[-1]["caption"]
+
+        first, _ = await attach(USER, "white")
+        second, caption = await attach(OTHER_USER, "white")
+        self.assertIn("تصویر رسید قبلاً", caption)
+        self.assertIn(to_persian_digits(first), caption)
+        self.assertEqual((await self.db.payment(first))["receipt_hash"],
+                         (await self.db.payment(second))["receipt_hash"])
+        third_user = 557
+        await self.db.ensure_user(third_user)
+        _, caption = await attach(third_user, "black")
+        self.assertNotIn("تصویر رسید قبلاً", caption)
+
+    async def test_cancelled_order_hash_does_not_trigger_duplicate_warning(self):
+        import hashlib
+        from gamas_bot.doc_extract import sha256_file
+
+        old = await self.new_order()
+        await self.db.cancel_payment(old, USER)
+        source = self.root / "same.png"
+        Image.new("RGB", (24, 24), "white").save(source)
+        from gamas_bot.intake import _normalize_receipt_image
+        normalized = self.root / "normalized.jpg"
+        normalized.write_bytes(source.read_bytes())
+        self.assertTrue(_normalize_receipt_image(normalized, max_bytes=100000))
+        digest = sha256_file(normalized)
+        self.assertEqual(len(bytes.fromhex(digest)), hashlib.sha256().digest_size)
+        await self.db._write("UPDATE payments SET receipt_hash=? WHERE payment_id=?", (digest, old))
+        new = await self.new_order(OTHER_USER)
+        event = FakeJobEvent(source=source, chat_id=OTHER_USER)
+        event.message.photo = object()
+        event.message.file.mime_type = "image/png"
+        event.message.file.size = source.stat().st_size
+        await self.bot._handle_receipt_upload(event, OTHER_USER, payment_id=new)
+        self.assertNotIn("تصویر رسید قبلاً", self.bot.client.deliveries[-1]["caption"])
+
     async def test_open_order_edits_wallet_screen_in_place(self):
         payment_id = await self.new_order()
         event = await self.press(USER, f"payopen:{payment_id}")
