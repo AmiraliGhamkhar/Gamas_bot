@@ -1011,7 +1011,7 @@ class LearningWorkflowMixin:
         )) if refund else ""
         if state["kind"] == "deck":
             deck = await self.db.deck_get(artifact_id, user_id)
-            await self._ack(event, "✅ مجموعه ذخیره شد." + refund_notice)  # type: ignore[attr-defined]
+            await self._ack(event, texts.LEARNING_DECK_SAVED + refund_notice)  # type: ignore[attr-defined]
             if deck is None:
                 await self._edit(  # type: ignore[attr-defined]
                     event,
@@ -1025,7 +1025,7 @@ class LearningWorkflowMixin:
                     self._deck_keyboard(artifact_id, bool(items)),
                 )
         else:
-            await self._ack(event, "✅ آزمون آماده است." + refund_notice)  # type: ignore[attr-defined]
+            await self._ack(event, texts.LEARNING_QUIZ_READY + refund_notice)  # type: ignore[attr-defined]
             await self._render_question_message(event, user_id, artifact_id)
 
     async def _handle_curation_callback(

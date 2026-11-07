@@ -535,3 +535,6 @@ DOCUMENT_TEXT_PREVIEW: Final = "پیش‌نمایش متن:"
 
 LEARNING_CHUNK_PROGRESS: Final = "بخش {done} از {total}"
 LEARNING_PRODUCING: Final = "در حال تولید {label}"
+
+LEARNING_DECK_SAVED: Final = "✅ مجموعه ذخیره شد."
+LEARNING_QUIZ_READY: Final = "✅ آزمون آماده است."
