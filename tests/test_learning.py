@@ -1024,6 +1024,30 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
     def _labels(buttons) -> list[str]:
         return [button.text for row in buttons for button in row]
 
+    async def test_paid_quiz_generation_shortfall_refunds_on_save(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        await self.spend_free_try()
+        source = {"item_id": self.item_id, "doc_id": None, "title": "test", "chunks": [
+            DocChunk(0, "بخش ۱", ("بخش ۱",), "متن درس")
+        ]}
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=quiz_payload(5))):
+            await self.bot._generate_learning(
+                self._event(b"quiz:hub"), user_id=OWNER, kind="quiz", source=source,
+                wanted=10, cost=401, note="test", title="test",
+            )
+        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 5)
+        event = self._event(b"quiz:cur:save")
+        await self.bot._handle_callback(event)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600 - 401 + 201)
+        self.assertEqual((await self.db.db.execute_fetchall(
+            "SELECT status FROM learning_charges"
+        ))[0][0], "finalized")
+        self.assertEqual((await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM quiz_questions"
+        ))[0][0], 5)
+        self.assertTrue(any("اعتبار بازگشتی" in (answer or "") for answer, _ in event.answers))
+
     async def test_quiz_start_screen_shows_three_costs(self):
         event = self._event(f"quiz:new:{self.item_id}".encode())
         await self.bot._handle_callback(event)

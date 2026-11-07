@@ -86,6 +86,45 @@ class LearningChargeRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.deck_count(OWNER), 0)
         self.assertEqual(await self.db.available_seconds(OWNER), 2_000)
 
+    async def test_prorata_refund_failure_rolls_back_artifact_and_credit(self):
+        for kind in ("deck", "quiz"):
+            with self.subTest(kind=kind):
+                prior_refunds = (await self.db.db.execute_fetchall(
+                    "SELECT COUNT(*) FROM ledger WHERE note LIKE 'refund:%'"
+                ))[0][0]
+                await self.db.spend_seconds(OWNER, 300, kind, operation_id=kind)
+                refund = self.db._refund_debit_locked
+
+                async def fail_after_credit(*args, **kwargs):
+                    await refund(*args, **kwargs)
+                    raise sqlite3.OperationalError("simulated failure after credit")
+
+                with mock.patch.object(self.db, "_refund_debit_locked", side_effect=fail_after_credit):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        if kind == "deck":
+                            await self.db.deck_create_with_cards(
+                                OWNER, self.item_id, "deck", [{"front": "q", "back": "a"}],
+                                paid_charge_id=kind, refund_seconds_value=100,
+                            )
+                        else:
+                            await self.db.quiz_create_session(
+                                OWNER, self.item_id,
+                                [{"question": "q", "options": ["a", "b", "c", "d"],
+                                  "correct_index": 0}],
+                                paid_charge_id=kind, refund_seconds_value=100,
+                            )
+                for table in ("flashcard_decks", "flashcards", "quiz_sessions", "quiz_questions"):
+                    rows = await self.db.db.execute_fetchall(f"SELECT COUNT(*) FROM {table}")
+                    self.assertEqual(rows[0][0], 0)
+                self.assertEqual((await self.db.db.execute_fetchall(
+                    "SELECT COUNT(*) FROM ledger WHERE note LIKE 'refund:%'"
+                ))[0][0], prior_refunds)
+                self.assertEqual((await self.db.db.execute_fetchall(
+                    "SELECT status FROM learning_charges WHERE operation_id=?", (kind,)
+                ))[0][0], "pending")
+                self.assertTrue(await self.db.refund_learning_charge(OWNER, kind))
+                self.assertEqual(await self.db.available_seconds(OWNER), 2000)
+
     async def test_duplicate_operation_id_never_creates_a_second_debit(self):
         await self.db.spend_seconds(OWNER, 300, "first", operation_id="same")
         with self.assertRaises(sqlite3.IntegrityError):
