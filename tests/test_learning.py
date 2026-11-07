@@ -221,6 +221,15 @@ class QuizDatabaseTests(unittest.IsolatedAsyncioTestCase):
         ]
         return await self.db.quiz_create_session(OWNER, self.item_id, questions)
 
+    async def test_batched_questions_roll_back_on_bad_item(self):
+        questions = [{"question": f"q {i}", "options": ["a", "b", "c", "d"],
+                      "correct_index": 0} for i in range(500)]
+        questions[250] = {"question": "missing options"}
+        with self.assertRaises(KeyError):
+            await self.db.quiz_create_session(OWNER, self.item_id, questions)
+        for table in ("quiz_sessions", "quiz_questions"):
+            self.assertEqual((await self.db.db.execute_fetchall(f"SELECT COUNT(*) FROM {table}"))[0][0], 0)
+
     async def test_full_answer_flow_scores_points_and_ranks(self):
         session_id = await self._create_session()
         first = await self.db.quiz_current_question(session_id)
@@ -493,6 +502,17 @@ class FlashcardDatabaseTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.db.close()
         self._tmp.cleanup()
+
+    async def test_batched_cards_preserve_order_and_roll_back_on_bad_item(self):
+        cards = [{"front": f"front {i}", "back": f"back {i}"} for i in range(500)]
+        broken = cards[:250] + [{"front": "missing back"}] + cards[251:]
+        with self.assertRaises(KeyError):
+            await self.db.deck_create_with_cards(OWNER, self.item_id, "broken", broken)
+        self.assertEqual(await self.db.deck_count(OWNER), 0)
+        self.assertEqual((await self.db.db.execute_fetchall("SELECT COUNT(*) FROM flashcards"))[0][0], 0)
+        deck_id = await self.db.deck_create_with_cards(OWNER, self.item_id, "complete", cards)
+        rows = await self.db.deck_cards(deck_id)
+        self.assertEqual([row["front"] for row in rows], [card["front"] for card in cards])
 
     async def test_deck_lifecycle_and_cascade(self):
         deck_id = await self.db.deck_create(OWNER, self.item_id, "دسته", "ai")

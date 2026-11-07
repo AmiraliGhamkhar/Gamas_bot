@@ -905,6 +905,17 @@ class TranscriptRetentionTests(unittest.IsolatedAsyncioTestCase):
             any(row["action"] == "transcript_expired" for row in audit), audit
         )
 
+    async def test_retention_deletes_only_one_bounded_batch(self):
+        ids = [await self.transcript(status="done", age_days=40) for _ in range(5)]
+        in_flight = await self.transcript(status="processing", age_days=40)
+        self.assertEqual(await self.db.expire_transcriptions(older_than_days=30, batch=2), 2)
+        remaining = [sid for sid in ids if await self.db.transcription(sid) is not None]
+        self.assertEqual(len(remaining), 3)
+        self.assertIsNotNone(await self.db.transcription(in_flight))
+        self.assertEqual(await self.db.expire_transcriptions(older_than_days=30, batch=2), 2)
+        self.assertEqual(await self.db.expire_transcriptions(older_than_days=30, batch=2), 1)
+        self.assertEqual(await self.db.expire_transcriptions(older_than_days=30, batch=2), 0)
+
     async def test_retention_off_keeps_every_row(self):
         self.bot.settings = make_settings(
             db_path=self.settings.db_path,
