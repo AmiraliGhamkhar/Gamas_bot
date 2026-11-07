@@ -2,12 +2,23 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 import logging
 from typing import Any
 
 from .db_core import DatabaseCore, TicketStateError, _rows, iso
+from .metrics import METRICS
 
 logger = logging.getLogger("gamas_bot.db.support")
+
+
+class TicketLimitError(RuntimeError):
+    """A support admission limit was reached."""
+
+    def __init__(self, reason: str, limit: int):
+        self.reason = reason
+        self.limit = limit
+        super().__init__(reason)
 
 
 class SupportRepositoryMixin(DatabaseCore):
@@ -66,6 +77,8 @@ class SupportRepositoryMixin(DatabaseCore):
         *,
         initial_message: str | None = None,
         telegram_message_id: int | None = None,
+        max_open_tickets: int = 3,
+        cooldown_seconds: int = 600,
     ) -> dict[str, Any]:
         if category not in self.SUPPORT_CATEGORIES:
             raise ValueError(f"invalid category {category}")
@@ -76,9 +89,29 @@ class SupportRepositoryMixin(DatabaseCore):
             initial_message = initial_message.strip()
             if not 1 <= len(initial_message) <= self.SUPPORT_MESSAGE_MAX:
                 raise ValueError("message length out of range")
-        now = iso(self._now())
         status = self._transition("create", None)
         async with self._transaction():
+            now_dt = self._now()
+            now = iso(now_dt)
+            rows = await _rows(
+                self.db,
+                "SELECT COUNT(*) FROM support_tickets WHERE user_id = ? "
+                "AND status IN ('open', 'awaiting_admin', 'awaiting_user')",
+                (user_id,),
+            )
+            if int(rows[0][0]) >= max(1, int(max_open_tickets)):
+                METRICS.record_support_ticket_denial()
+                raise TicketLimitError("open", max(1, int(max_open_tickets)))
+            if cooldown_seconds > 0:
+                cutoff = iso(now_dt - timedelta(seconds=cooldown_seconds))
+                recent = await _rows(
+                    self.db,
+                    "SELECT 1 FROM support_tickets WHERE user_id = ? AND created_at > ? LIMIT 1",
+                    (user_id, cutoff),
+                )
+                if recent:
+                    METRICS.record_support_ticket_denial()
+                    raise TicketLimitError("cooldown", int(cooldown_seconds))
             cursor = await self.db.execute(
                 "INSERT INTO support_ticket_seq DEFAULT VALUES"
             )

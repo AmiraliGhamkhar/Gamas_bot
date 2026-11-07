@@ -19,6 +19,7 @@ from .bot_ui import (
     VIEW_LABELS,
 )
 from .db import TicketStateError
+from .db_support import TicketLimitError
 from .intake import _to_int
 from .progress import to_persian_digits
 from .telegram_text import split_message
@@ -342,7 +343,15 @@ class SupportWorkflowMixin:
                     subject,
                     initial_message=text,
                     telegram_message_id=getattr(event.message, "id", None),
+                    max_open_tickets=self.settings.support_max_open_tickets,
+                    cooldown_seconds=self.settings.support_ticket_cooldown_seconds,
                 )
+            except TicketLimitError as exc:
+                if exc.reason == "open":
+                    await event.reply(texts.SUPPORT_OPEN_LIMIT.format(count=to_persian_digits(exc.limit)))
+                else:
+                    await event.reply(texts.SUPPORT_COOLDOWN)
+                return
             except ValueError:
                 await event.reply(texts.SUPPORT_SUBJECT_LENGTH)
                 return

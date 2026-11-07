@@ -6,11 +6,13 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database, MIGRATIONS_DIR
 from gamas_bot.db import TicketStateError
+from gamas_bot.db_support import TicketLimitError
 from tests.support import FakeTelegramClient, make_settings
 from tests.test_bot import FakeCallbackEvent, FakeMessageEvent
 from tests.test_db_billing import DatabaseTestCase
@@ -27,10 +29,27 @@ class SupportDatabaseTests(DatabaseTestCase):
         await self.db.ensure_user(USER_B)
 
     async def ticket(self, user=USER_A, category="technical", subject="مشکل ورود"):
-        return await self.db.create_ticket(user, category, subject)
+        return await self.db.create_ticket(user, category, subject, max_open_tickets=100, cooldown_seconds=0)
 
     async def status(self, ticket_id):
         return (await self.db.get_ticket(ticket_id))["status"]
+
+    async def test_ticket_creation_cooldown_and_open_cap(self):
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        self.db._clock = lambda: now
+        await self.db.create_ticket(USER_A, "other", "first")
+        with self.assertRaises(TicketLimitError) as denied:
+            await self.db.create_ticket(USER_A, "other", "second")
+        self.assertEqual(denied.exception.reason, "cooldown")
+        now += timedelta(seconds=600)
+        await self.db.create_ticket(USER_A, "other", "second")
+        now += timedelta(seconds=600)
+        await self.db.create_ticket(USER_A, "other", "third")
+        now += timedelta(seconds=600)
+        with self.assertRaises(TicketLimitError) as denied:
+            await self.db.create_ticket(USER_A, "other", "fourth")
+        self.assertEqual(denied.exception.reason, "open")
+        self.assertEqual(len(await self.db.list_user_tickets(USER_A)), 3)
 
     async def test_ids_are_unique_and_human_readable(self):
         first = await self.ticket()
@@ -287,6 +306,12 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
             self.payloads(new_queue.edits[-1][1]),
         )
 
+    async def test_creation_cooldown_is_reported_to_user(self):
+        await self.open_ticket()
+        event = await self.open_ticket(subject="درخواست دوم")
+        self.assertTrue(any("کمی بعد" in text for text in event.replies))
+        self.assertEqual(len(await self.db.list_user_tickets(USER_A)), 1)
+
     async def test_long_opener_is_stored_in_full_with_short_subject(self):
         opener = ("عنوان درخواست\n" + "متن طولانی " * 110).strip()
         await self.open_ticket(subject=opener)
@@ -450,6 +475,8 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 2)
 
     async def test_admin_list_filters_and_pagination_render(self):
+        self.bot.settings = replace(self.bot.settings, support_max_open_tickets=100,
+                                    support_ticket_cooldown_seconds=0)
         for index in range(9):
             await self.open_ticket(USER_A, subject=f"موضوع {index}")
         first = await self.press(ADMIN, "adm:sl:active:all:0")
@@ -511,6 +538,8 @@ class SupportBotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(view.responses[-1][1])
 
     async def test_all_categories_open_filter_and_notification_outage_resilience(self):
+        self.bot.settings = replace(self.bot.settings, support_max_open_tickets=100,
+                                    support_ticket_cooldown_seconds=0)
         seen_ids: set[str] = set()
         payment_ticket_id: int | None = None
         for category in ("payment", "technical", "subscription", "other"):

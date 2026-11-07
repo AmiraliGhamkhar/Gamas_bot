@@ -212,6 +212,8 @@ class SupportStoreProtocol(Protocol):
         *,
         initial_message: str | None = None,
         telegram_message_id: int | None = None,
+        max_open_tickets: int = 3,
+        cooldown_seconds: int = 600,
     ) -> dict[str, Any]: ...
 
     async def get_ticket(self, ticket_id: int) -> dict[str, Any] | None: ...

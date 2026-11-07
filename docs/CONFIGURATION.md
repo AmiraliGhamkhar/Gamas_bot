@@ -79,3 +79,9 @@ python -m scripts.cpanel_preflight
 
 Fix `FAIL`; review `WARN`. The offline check does not prove live keys, model access
 or reachability. Preflight also probes the host/network and creates temporary checks.
+
+### Support ticket admission
+
+`SUPPORT_MAX_OPEN_TICKETS` defaults to 3. `SUPPORT_TICKET_COOLDOWN_SECONDS`
+defaults to 600; set it to 0 to disable the creation cooldown. Both limits
+are enforced atomically when a ticket is created.

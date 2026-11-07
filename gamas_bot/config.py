@@ -696,6 +696,10 @@ class Settings:
     #: Wall-clock budget for one document's OCR run, in seconds.
     ocr_timeout_seconds: float = 600.0
 
+    #: Per-user support ticket admission limits.
+    support_max_open_tickets: int = 3
+    support_ticket_cooldown_seconds: int = 600
+
     # --- Mandatory channel subscription --------------------------------------
     #: Telegram channel (``@username`` or ``-100...``) whose current members
     #: gate every user-facing feature. Defaults to the official @gamas_AI.
@@ -1479,6 +1483,10 @@ def from_env(env_file: str | None = None) -> Settings:
             maximum=8,
         ),
         library_max_items=_env_int("LIBRARY_MAX_ITEMS", 50, minimum=1, maximum=10_000),
+        support_max_open_tickets=_env_int("SUPPORT_MAX_OPEN_TICKETS", 3, minimum=1, maximum=1000),
+        support_ticket_cooldown_seconds=_env_int(
+            "SUPPORT_TICKET_COOLDOWN_SECONDS", 600, minimum=0, maximum=86400
+        ),
         subscription_channel=_env("SUBSCRIPTION_CHANNEL", "@gamas_AI").strip(),
         subscription_required=_env_bool("SUBSCRIPTION_REQUIRED", True),
         subscription_cache_seconds=_env_float(
