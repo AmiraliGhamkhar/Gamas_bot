@@ -89,3 +89,5 @@ are enforced atomically when a ticket is created.
 `DOC_UNPACKED_MAX_BYTES` limits the cumulative expanded Office archive size (default 104857600 bytes).
 
 Manual flashcard decks are limited by `FLASHCARD_MAX_CARDS_PER_DECK` (default 200).
+
+`LEARNING_GLOBAL_CONCURRENCY` (default 2) bounds concurrent generation phases; `LEARNING_MAX_OUTPUT_TOKENS` (default 4096) limits each learning completion.

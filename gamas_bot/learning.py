@@ -239,31 +239,39 @@ def quiz_system_prompt(
     count: int, *, source: str | None = None, sources: tuple[str, ...] | None = None
 ) -> str:
     """Persian four-option, source-anchored MCQs across cognitive levels."""
-    total = int(count)
-    medium = max(1, round(total * 0.4))
-    hard = max(0, total - medium)
-    example_source = json.dumps((sources or (source or "صفحهٔ ۳",))[0], ensure_ascii=False)
+    # Counts and locators belong to the user prompt so the system prefix caches.
+    example_source = json.dumps("نشانگر منبع", ensure_ascii=False)
     return (
         "تو طراح سؤال‌های چهارگزینه‌ای فارسی در سطح متوسط تا سخت هستی. فقط بر پایهٔ متن داده‌شده "
         "سؤال بساز؛ اطلاعات بیرونی یا ادعاهای بدون پشتوانه اضافه نکن.\n"
-        f"دقیقاً {to_persian_digits(total)} سؤال بنویس.\n\n"
         "ترکیب آموزشی:\n"
         "- ترکیبی متعادل از یادآوری، درک مفهوم و به‌کاربستن بساز. "
         "برای به‌کاربستن، تحلیل و ارزیابی از سناریو کوتاه و «کدام گزینه» استفاده کن.\n"
-        f"- حدود ۴۰٪ سؤال‌ها متوسط و ۶۰٪ سخت باشند؛ تقریباً {to_persian_digits(medium)} متوسط "
-        f"و {to_persian_digits(hard)} سخت.\n"
+        "- حدود ۴۰٪ سؤال‌ها متوسط و ۶۰٪ سخت باشند.\n"
         "- دشواری هر سؤال را در difficulty با medium یا hard مشخص کن.\n"
         "- هر سؤال دقیقاً ۴ گزینه دارد و فقط یک گزینه کاملاً درست است.\n"
         "- سه گزینهٔ نادرست باید باورپذیر، هم‌موضوع و بر پایهٔ بدفهمی‌های رایج باشند.\n"
         "- گزینه‌ها هم‌سبک و تقریباً هم‌طول باشند و پاسخ درست با نشانهٔ ظاهری لو نرود.\n"
         "- از «همهٔ موارد فوق»، مطلق‌نماها و گزینه‌های گمراه‌کنندهٔ بی‌ارتباط پرهیز کن.\n"
         "- برای هر پاسخ یک توضیح کوتاه و مستند به متن بنویس.\n\n"
-        + _source_rule(source, sources)
+        + "منبع هر مورد را دقیقاً از نشانگرهای مشخص‌شده در پیام کاربر انتخاب کن.\n\n"
         + "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
         '{"questions":[{"question":"متن سؤال", "options":["الف", "ب", "ج", "د"], '
         '"correct":0, "explain":"توضیح کوتاه", "difficulty":"hard", '
         '"source":' + example_source + '}]}'
     )
+
+
+def learning_user_prompt(kind: str, count: int, sources: tuple[str, ...], text: str) -> str:
+    """Per-call instructions, deliberately separate from the cached system prompt."""
+    count = int(count)
+    label = "کارت" if kind == "deck" else "سؤال"
+    detail = f"دقیقاً {to_persian_digits(count)} {label} بساز.\n"
+    if kind != "deck":
+        medium = max(1, round(count * 0.4))
+        detail += (f"تقریباً {to_persian_digits(medium)} متوسط و "
+                   f"{to_persian_digits(max(0, count-medium))} سخت.\n")
+    return detail + _source_rule(None, sources) + "متن منبع:\n" + text
 
 
 def _clean_str(value: Any, limit: int) -> str:
@@ -379,7 +387,7 @@ def source_matches(source: Any, allowed: Iterable[str]) -> bool:
     return False
 
 
-def source_grounded_in(source: Any, text: str) -> bool:
+def source_grounded_in(source: Any, text: str, *, text_key: str | None = None) -> bool:
     """True when the cited locator literally occurs in the chunk that was read.
 
     A booklet keeps its own page/slide markers inside the archived text
@@ -392,11 +400,11 @@ def source_grounded_in(source: Any, text: str) -> bool:
     key = source_key(source)
     if not key or len(key.split()) < 2:
         return False
-    return f" {key} " in f" {source_key(text)} "
+    return f" {key} " in f" {text_key if text_key is not None else source_key(text)} "
 
 
 def verified_source(
-    source: Any, allowed: Iterable[str], text: str = ""
+    source: Any, allowed: Iterable[str], text: str = "", *, text_key: str | None = None
 ) -> str | None:
     """The locator to store for one item, or ``None`` when it is unverifiable.
 
@@ -418,7 +426,7 @@ def verified_source(
     for candidate in allowed:
         if candidate and source_matches(source, (candidate,)):
             return " ".join(str(candidate).split())[:MAX_SOURCE_CHARS]
-    if text and source_grounded_in(source, text):
+    if text and source_grounded_in(source, text, text_key=text_key):
         return _clean_source(source)
     return None
 
@@ -428,6 +436,7 @@ def anchor_items(
     allowed: Iterable[str],
     fallback: str,
     text: str = "",
+    *, text_key: str | None = None,
 ) -> list[dict[str, Any]]:
     """Attach a *verified* source to each generated item.
 
@@ -449,7 +458,7 @@ def anchor_items(
     for item in items:
         if not isinstance(item, dict):
             continue
-        locator = verified_source(item.get("source"), choices, text) or fallback
+        locator = verified_source(item.get("source"), choices, text, text_key=text_key) or fallback
         if not locator:
             locator = _clean_source(item.get("source"))
         record = dict(item)
@@ -774,12 +783,10 @@ def flashcard_system_prompt(
     count: int, *, source: str | None = None, sources: tuple[str, ...] | None = None
 ) -> str:
     """Persian minimum-information, cloze-first and source-anchored cards."""
-    total = int(count)
-    example_source = json.dumps((sources or (source or "صفحهٔ ۳",))[0], ensure_ascii=False)
+    example_source = json.dumps("نشانگر منبع", ensure_ascii=False)
     return (
         "تو طراح فلش‌کارت آموزشی فارسی هستی. فقط از متن داده‌شده کارت بساز؛ "
         "اطلاعات بیرونی یا ادعاهای بدون پشتوانه اضافه نکن.\n"
-        f"دقیقاً {to_persian_digits(total)} کارت بساز.\n\n"
         "قانون کمینه‌سازی اطلاعات:\n"
         "- هر کارت فقط یک واقعیت را بپرسد؛ پاسخ چندنکته‌ای را به چند کارت جدا بشکن.\n"
         "- فهرست‌های بیش از ۵ مورد را به کارت‌های شمارشی جداگانه تقسیم کن.\n"
@@ -787,7 +794,7 @@ def flashcard_system_prompt(
         "- هر روی کارت حداکثر ۱۶۰ نویسه باشد و پاسخ بلند را خلاصه کن.\n"
         "- برای اصطلاح، تعریف و فرمول ابتدا از قالب جای‌خالی استفاده کن؛ "
         "برای مفهوم و رابطهٔ علت و معلول از پرسش‌وپاسخ کوتاه.\n\n"
-        + _source_rule(source, sources)
+        + "منبع هر مورد را دقیقاً از نشانگرهای مشخص‌شده در پیام کاربر انتخاب کن.\n\n"
         + "خروجی فقط JSON معتبر با این ساختار باشد و هیچ متن اضافه‌ای ننویس:\n"
         '{"cards":[{"front":"پرسش کوتاه", "back":"پاسخ یک‌خطی", "source":' + example_source + '}]}'
     )

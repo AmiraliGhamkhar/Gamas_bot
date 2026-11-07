@@ -22,6 +22,7 @@ while :class:`LLMOutputBudgetError` (the *answer* was cut off by
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import json
 import logging
 import re
@@ -2500,6 +2501,7 @@ async def complete_json(
     user: str,
     schema: dict | None = None,
     prefer_provider: str = "",
+    max_output_tokens: int | None = None,
 ) -> dict:
     """A completion parsed as strict JSON, with bounded per-provider recovery.
 
@@ -2511,6 +2513,10 @@ async def complete_json(
     already holds. A rejected request (4xx) is permanent for that provider and is
     never re-sent to it with the same content.
     """
+    if max_output_tokens is not None:
+        if max_output_tokens <= 0:
+            raise ValueError("max_output_tokens must be positive")
+        settings = replace(settings, note_max_output_tokens=int(max_output_tokens))
     routes = _ordered_routes(note_routes(settings), prefer_provider)
     if not routes:
         raise LLMAuthError(

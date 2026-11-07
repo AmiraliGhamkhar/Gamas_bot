@@ -74,6 +74,8 @@ from .learning import (
     dedupe_questions,
     distribute_counts,
     flashcard_system_prompt,
+    learning_user_prompt,
+    source_key,
     parse_flashcard_payload,
     parse_quiz_payload,
     preset_cards,
@@ -153,7 +155,7 @@ class LearningWorkflowMixin:
 
     def _learning_max_chars(self) -> int:
         context_tokens = int(getattr(self.settings, "note_context_tokens", 131_072) or 131_072)
-        output_tokens = int(getattr(self.settings, "note_max_output_tokens", 16_384) or 16_384)
+        output_tokens = int(getattr(self.settings, "learning_max_output_tokens", 4096) or 4096)
         reserved_output = min(output_tokens, context_tokens // 2)
         available_tokens = max(1_000, context_tokens - reserved_output - 2_000)
         return min(MAX_MODEL_INPUT_CHARS, max(2_000, int(available_tokens * 2.0)))
@@ -177,7 +179,7 @@ class LearningWorkflowMixin:
             "title": short_title(
                 self._item_display_title(item), fallback=FALLBACK_BOOKLET
             ),
-            "chunks": self._learning_chunks(str(item["content_text"])),
+            "chunks": await run_file_io(self._learning_chunks, str(item["content_text"])),
         }
 
     async def _source_from_document(
@@ -296,7 +298,6 @@ class LearningWorkflowMixin:
     ) -> tuple[list[dict[str, Any]], int]:
         schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
         concurrency = min(8, max(1, int(self.settings.learning_chunk_concurrency)))
-        semaphore = asyncio.Semaphore(concurrency)
         active = [index for index, count in enumerate(counts) if count > 0]
         total = len(active)
         state = {"done": 0, "failed": 0}
@@ -343,6 +344,7 @@ class LearningWorkflowMixin:
                 )
             )
             fallback_locator = allowed[0] if allowed else ""
+            text_key = await run_file_io(source_key, target_chunk.text)
             items: list[dict[str, Any]] = []
             max_attempts = max(2, math.ceil(int(target_count) / self.MAX_ITEMS_PER_CALL) + 1)
             use_schema = True
@@ -358,8 +360,9 @@ class LearningWorkflowMixin:
                     if kind == "deck"
                     else quiz_system_prompt(batch, sources=allowed)
                 )
+                user_prompt = learning_user_prompt(kind, batch, allowed, target_chunk.text[:max_input_chars])
                 if had_shortfall:
-                    system += (
+                    user_prompt += (
                         "\nخروجی قبلی نامعتبر، ناقص یا بدون منبع مجاز بود؛ "
                         "همهٔ فیلدهای لازم و یک منبع دقیق از فهرست را وارد کن."
                     )
@@ -370,31 +373,31 @@ class LearningWorkflowMixin:
                         if str(it.get(stem_key) or "").strip()
                     ]
                     if prior_stems:
-                        system += (
+                        user_prompt += (
                             "\nموردهای زیر قبلاً ساخته شده‌اند؛ هیچ‌کدام را تکرار یا بازنویسی نکن:\n- "
                             + "\n- ".join(prior_stems)
                         )
                 try:
-                    async with semaphore:
-                        payload = await self.deps.complete_json(
-                            session,
-                            self.settings,
-                            system=system,
-                            user=target_chunk.text[:max_input_chars],
-                            schema=schema if use_schema else None,
-                        )
-                    if kind == "deck":
-                        parsed = parse_flashcard_payload(payload, batch)
-                    else:
-                        parsed = parse_quiz_payload(
-                            payload, batch, require_difficulty=False
-                        )
-                    anchored = anchor_items(
-                        parsed, allowed, fallback_locator, target_chunk.text
+                    payload = await self.deps.complete_json(
+                        session,
+                        self.settings,
+                        system=system,
+                        user=user_prompt,
+                        schema=schema if use_schema else None,
+                        max_output_tokens=self.settings.learning_max_output_tokens,
                     )
-                    # Anchoring assigns a fallback locator; it never drops items.
+                    def validate_and_merge() -> list[dict[str, Any]]:
+                        if kind == "deck":
+                            parsed = parse_flashcard_payload(payload, batch)
+                        else:
+                            parsed = parse_quiz_payload(payload, batch, require_difficulty=False)
+                        anchored = anchor_items(
+                            parsed, allowed, fallback_locator, target_chunk.text, text_key=text_key
+                        )
+                        return dedupe([*items, *anchored])
+
                     prev_count = len(items)
-                    merged = dedupe([*items, *anchored])
+                    merged = await run_file_io(validate_and_merge)
                     if len(merged) > prev_count:
                         items = merged[: int(target_count)]
                     if len(items) >= target_count:
@@ -407,8 +410,8 @@ class LearningWorkflowMixin:
                     raise
                 except (LLMContextOverflowError, LLMOutputBudgetError):
                     if split_depth < 2 and len(target_chunk.text) >= 1_600:
-                        sub_raw = chunk_text(
-                            target_chunk.text,
+                        sub_raw = await run_file_io(
+                            chunk_text, target_chunk.text,
                             max_chars=max(800, len(target_chunk.text) // 2),
                             label_prefix=target_chunk.locator or fallback_locator,
                         )
@@ -434,7 +437,7 @@ class LearningWorkflowMixin:
                                     chunk_idx=chunk_idx,
                                     split_depth=split_depth + 1,
                                 )
-                                items = dedupe([*items, *sub_items])[: int(target_count)]
+                                items = (await run_file_io(dedupe, [*items, *sub_items]))[: int(target_count)]
                             break
                     had_shortfall = True
                     use_schema = False
@@ -476,9 +479,17 @@ class LearningWorkflowMixin:
 
         # One reporter owns the placeholder throughout the whole generation.
         progress_task = asyncio.create_task(report_progress())
-        tasks = [asyncio.create_task(one(index)) for index in active]
+        results: list[list[dict[str, Any]]] = [[] for _ in active]
+        next_index = iter(enumerate(active))
+
+        async def worker() -> None:
+            for position, index in next_index:
+                results[position] = await one(index)
+
+        # A fixed worker count bounds chunk calls without nesting semaphores.
+        tasks = [asyncio.create_task(worker()) for _ in range(min(concurrency, total))]
         try:
-            results = await asyncio.gather(*tasks)
+            await asyncio.gather(*tasks)
             finished = True
             progress_changed.set()
             try:
@@ -577,14 +588,15 @@ class LearningWorkflowMixin:
                 ),
             )
             placeholder = progress
-            items, failures = await self._generate_chunks(
-                kind=kind,
-                chunks=chunks,
-                counts=counts,
-                placeholder=progress,
-                stage=f"در حال تولید {label}",
-            )
-            items = dedupe_cards(items) if kind == "deck" else dedupe_questions(items)
+            async with self._learning_global_semaphore:
+                items, failures = await self._generate_chunks(
+                    kind=kind,
+                    chunks=chunks,
+                    counts=counts,
+                    placeholder=progress,
+                    stage=f"در حال تولید {label}",
+                )
+            items = await run_file_io(dedupe_cards if kind == "deck" else dedupe_questions, items)
             await progress.update(
                 94,
                 "اعتبارسنجی و آماده‌سازی پیش‌نمایش",
@@ -1194,7 +1206,7 @@ class LearningWorkflowMixin:
                 "item_id": int(item_id),
                 "doc_id": None,
                 "title": self._item_display_title(item),
-                "chunks": self._learning_chunks(content),
+                "chunks": await run_file_io(self._learning_chunks, content),
             },
             wanted=int(count),
             cost=int(count) * self.settings.quiz_cost_seconds_per_question,
@@ -1688,7 +1700,7 @@ class LearningWorkflowMixin:
                 "item_id": int(item_id),
                 "doc_id": None,
                 "title": item_title,
-                "chunks": self._learning_chunks(content),
+                "chunks": await run_file_io(self._learning_chunks, content),
             },
             wanted=size,
             cost=cost,

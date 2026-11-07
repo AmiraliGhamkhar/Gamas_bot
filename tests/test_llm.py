@@ -707,6 +707,15 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
+    async def test_per_call_output_limit_does_not_mutate_settings(self):
+        session = FakeSession([FakeResponse(200, {
+            "choices": [{"message": {"content": '{"ok": true}'}}]
+        })])
+        settings = make_settings(note_max_output_tokens=8192)
+        await complete_json(session, settings, system="S", user="U", max_output_tokens=1024)
+        self.assertEqual(session.calls[0]["json"]["max_tokens"], 1024)
+        self.assertEqual(settings.note_max_output_tokens, 8192)
+
     async def test_valid_json_first_try(self):
         session = FakeSession([FakeResponse(200, {
             "choices": [{"message": {"content": '{"title": "جزوه"}'}}]

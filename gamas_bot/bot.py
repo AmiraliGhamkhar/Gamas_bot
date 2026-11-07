@@ -237,6 +237,7 @@ class GamasBot(
             weakref.WeakValueDictionary()
         )
         self._learning_in_flight: set[int] = set()
+        self._learning_global_semaphore = asyncio.Semaphore(settings.learning_global_concurrency)
         self._curation_tasks: dict[int, asyncio.Task[Any]] = {}
         self._learning_tasks: dict[int, asyncio.Task[Any]] = {}
         self._admission_tasks: set[asyncio.Task[Any]] = set()

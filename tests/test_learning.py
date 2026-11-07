@@ -725,6 +725,32 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("حداکثر تعداد کارت" in reply for reply in event.replies))
         self.assertEqual(len(await self.db.deck_cards(deck)), 1)
 
+    async def test_global_learning_generation_concurrency_is_bounded(self):
+        from gamas_bot.doc_extract import DocChunk
+
+        active = 0
+        peak = 0
+        cards = [{"front": f"question {i}", "back": "answer", "source": "بخش ۱"} for i in range(5)]
+
+        async def generate(**_kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.03)
+            active -= 1
+            return cards, 0
+
+        source = {"item_id": self.item_id, "doc_id": None, "title": "test", "chunks": [
+            DocChunk(0, "بخش ۱", ("بخش ۱",), "text")
+        ]}
+        with mock.patch.object(self.bot, "_claim_generation_budget", new=mock.AsyncMock(return_value=(False, False, None))), \
+             mock.patch.object(self.bot, "_generate_chunks", side_effect=generate):
+            await asyncio.gather(*(self.bot._generate_learning(
+                self._event(b"fc:hub", user_id=uid), user_id=uid, kind="deck",
+                source=source, wanted=5, cost=0, note="test", title="test"
+            ) for uid in (OWNER, OTHER, 777)))
+        self.assertEqual(peak, 2)
+
     async def test_paid_curation_refunds_pro_rata_when_items_removed(self):
         from gamas_bot.doc_extract import DocChunk
 
@@ -1290,7 +1316,8 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
         self.assertEqual(len(calls), 2)
         # The repair prompt asks for the missing two, not for five again.
-        self.assertIn("۲ سؤال", calls[1]["system"])
+        self.assertIn("۲ سؤال", calls[1]["user"])
+        self.assertEqual(calls[0]["system"], calls[1]["system"])
         state = self.bot._curation[OWNER]
         self.assertEqual(len(state["items"]), 5)
         self.assertEqual(state["failures"], 0)
@@ -1742,8 +1769,10 @@ class QuizDifficultyPromptTests(unittest.TestCase):
         self.assertIn("۶۰٪", prompt)
         self.assertIn("سخت", prompt)
         # 40% of 10 = 4 medium, 6 hard (Persian digits).
-        self.assertIn("۴ متوسط", prompt)
-        self.assertIn("۶ سخت", prompt)
+        from gamas_bot.learning import learning_user_prompt
+        dynamic = learning_user_prompt("quiz", 10, (), "text")
+        self.assertIn("۴ متوسط", dynamic)
+        self.assertIn("۶ سخت", dynamic)
 
     def test_prompt_mixes_recall_comprehension_and_application(self):
         prompt = quiz_system_prompt(5)
@@ -1780,8 +1809,10 @@ class QuizDifficultyPromptTests(unittest.TestCase):
 
     def test_prompt_is_deterministic_and_count_aware(self):
         self.assertEqual(quiz_system_prompt(5), quiz_system_prompt(5))
-        self.assertIn("۵ سؤال", quiz_system_prompt(5))
-        self.assertIn("۱۵ سؤال", quiz_system_prompt(15))
+        from gamas_bot.learning import learning_user_prompt
+        self.assertEqual(quiz_system_prompt(5), quiz_system_prompt(15, sources=("other",)))
+        self.assertIn("۵ سؤال", learning_user_prompt("quiz", 5, (), ""))
+        self.assertIn("۱۵ سؤال", learning_user_prompt("quiz", 15, (), ""))
 
 
 class QuizDifficultyParserTests(unittest.TestCase):
@@ -1967,8 +1998,9 @@ class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
         # 1) The harder prompt and the real fixture booklet reach the model.
         call = generator.await_args
         self.assertIn("متوسط تا سخت", call.kwargs["system"])
-        self.assertIn("۴ متوسط", call.kwargs["system"])
-        self.assertIn("۶ سخت", call.kwargs["system"])
+        self.assertIn("۴ متوسط", call.kwargs["user"])
+        self.assertIn("۶ سخت", call.kwargs["user"])
+        self.assertEqual(call.kwargs["max_output_tokens"], 4096)
         self.assertIn("سناریو", call.kwargs["system"])
         self.assertIn("همهٔ موارد فوق", call.kwargs["system"])
         self.assertIn("difficulty", call.kwargs["schema"]["properties"]
@@ -2052,15 +2084,16 @@ class AnchoredQualityTests(unittest.TestCase):
         legacy["questions"][0]["difficulty"] = "hard"
         self.assertEqual(len(parse_quiz_payload(legacy, 1, require_difficulty=True, require_source=True)), 1)
 
-    def test_json_examples_use_only_the_allowed_source(self):
-        from gamas_bot.learning import flashcard_system_prompt
+    def test_static_json_examples_and_dynamic_allowed_sources(self):
+        from gamas_bot.learning import flashcard_system_prompt, learning_user_prompt
 
-        for key, prompt in (
-            ("cards", flashcard_system_prompt(10, sources=("اسلاید ۲",))),
-            ("questions", quiz_system_prompt(5, sources=("بخش «مبحث»",))),
+        for key, prompt, locator in (
+            ("cards", flashcard_system_prompt(10, sources=("اسلاید ۲",)), "اسلاید ۲"),
+            ("questions", quiz_system_prompt(5, sources=("بخش «مبحث»",)), "بخش «مبحث»"),
         ):
             example = json.loads(prompt[prompt.rindex('{"' + key + '"'):])
-            self.assertEqual(example[key][0]["source"], "اسلاید ۲" if key == "cards" else "بخش «مبحث»")
+            self.assertEqual(example[key][0]["source"], "نشانگر منبع")
+            self.assertIn(locator, learning_user_prompt("deck" if key == "cards" else "quiz", 5, (locator,), "text"))
 
     def test_difficulty_is_recorded_but_never_causes_rejection(self):
         """S5: the tag is metadata. A Persian label is mapped, an unknown one ignored."""

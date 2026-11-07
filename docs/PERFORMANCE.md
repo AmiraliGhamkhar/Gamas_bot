@@ -52,3 +52,8 @@ Python version, workload and host quotas with results; do not promise fixed thro
 Document uploads default to 20 MiB (`DOC_MAX_BYTES`); Office archive entries
 are also limited to 100 MiB in total (`DOC_UNPACKED_MAX_BYTES`). Operators may
 raise these limits, but doing so increases peak memory on the 2 GiB host.
+
+Learning generations are limited by `LEARNING_GLOBAL_CONCURRENCY` (default 2),
+with `LEARNING_CHUNK_CONCURRENCY` workers per generation and a separate
+`LEARNING_MAX_OUTPUT_TOKENS` budget (default 4096). Static system prompts improve
+prefix caching; source data and retry instructions are sent in the user prompt.

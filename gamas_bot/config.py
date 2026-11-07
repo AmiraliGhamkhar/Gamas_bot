@@ -736,6 +736,8 @@ class Settings:
     #: Parallel per-chunk model calls used by one generation (3–5 is the useful
     #: range; higher starts tripping provider per-minute limits).
     learning_chunk_concurrency: int = 4
+    learning_global_concurrency: int = 2
+    learning_max_output_tokens: int = 4096
 
     # --- Derived --------------------------------------------------------------
     plan_values: dict[str, int] = field(default_factory=dict, compare=False)
@@ -1527,6 +1529,12 @@ def from_env(env_file: str | None = None) -> Settings:
         ),
         learning_chunk_concurrency=_env_int(
             "LEARNING_CHUNK_CONCURRENCY", 4, minimum=1, maximum=8
+        ),
+        learning_global_concurrency=_env_int(
+            "LEARNING_GLOBAL_CONCURRENCY", 2, minimum=1, maximum=8
+        ),
+        learning_max_output_tokens=_env_int(
+            "LEARNING_MAX_OUTPUT_TOKENS", 4096, minimum=256, maximum=32768
         ),
         dedup_window_seconds=_env_float(
             "DEDUP_WINDOW_SECONDS",
