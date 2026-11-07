@@ -11,6 +11,7 @@ from __future__ import annotations
 import re
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -242,6 +243,8 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
 
     # -------------------------------------------------------------- support
     async def test_two_way_ticket_conversation_with_the_expected_copy(self):
+        self.bot.settings = replace(self.bot.settings, support_max_open_tickets=4,
+                                    support_ticket_cooldown_seconds=0)
         public_ids: list[str] = []
         for category in ("payment", "technical", "subscription", "other"):
             await self.press(USER, "sup:new")
@@ -290,6 +293,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("پیام جدیدی" in text for text in self.texts_to(ADMIN)))
 
     async def test_close_reopen_keeps_history_and_new_tickets_stay_separate(self):
+        self.bot.settings = replace(self.bot.settings, support_ticket_cooldown_seconds=0)
         await self.press(USER, "sup:new")
         await self.press(USER, "sup:cat:technical")
         await self.say(USER, "مشکل در مشاهدهٔ جزوه")
