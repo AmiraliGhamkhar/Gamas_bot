@@ -529,3 +529,6 @@ LEARNING_PRORATA_REFUND: Final = "اعتبار بازگشتی: {duration}"
 PAYMENT_HISTORY_CANCELLED: Final = "لغوشده"
 
 FLASHCARD_CARD_LIMIT: Final = "این مجموعه به حداکثر تعداد کارت رسیده است."
+
+DOCUMENT_EXTRACTED_COUNT: Final = "متن استخراج‌شده: {count} نویسه"
+DOCUMENT_TEXT_PREVIEW: Final = "پیش‌نمایش متن:"

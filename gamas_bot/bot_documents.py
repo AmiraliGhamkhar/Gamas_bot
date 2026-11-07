@@ -295,7 +295,7 @@ class DocumentOfficeWorkflowMixin:
         lines = [
             f"📄 {document.get('title') or 'سند'}",
             f"نوع: {label} | {to_persian_digits(int(document.get('page_count') or 0))} {unit}",
-            f"متن استخراج‌شده: {to_persian_digits(int(document.get('text_chars', len(str(document.get('text') or '')))))} نویسه",
+            texts.DOCUMENT_EXTRACTED_COUNT.format(count=to_persian_digits(int(document.get('text_chars', len(str(document.get('text') or '')))))),
         ]
         if self.settings.office_enabled:
             lines.append(
@@ -305,7 +305,7 @@ class DocumentOfficeWorkflowMixin:
             lines.append(
                 "پردازش صدای ارائه عملیات جداگانه‌ای است و فقط با انتخاب دکمهٔ صوت آغاز می‌شود."
             )
-        lines.extend(("", "پیش‌نمایش متن:", preview_text(str(document.get("text_preview", document.get("text")) or ""))))
+        lines.extend(("", texts.DOCUMENT_TEXT_PREVIEW, preview_text(str(document.get("text_preview", document.get("text")) or ""))))
         return "\n".join(lines)
 
     def _document_buttons(self, document_id: int, source_type: str = "") -> list[list]:
