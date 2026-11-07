@@ -379,7 +379,7 @@ class BillingRepositoryMixin(DatabaseCore):
         """Mint a refund using the original debit's allocations, inside a transaction."""
         rows = await _rows(
             self.db,
-            "SELECT l.id, l.expires_at, a.seconds FROM debit_allocations a "
+            "SELECT l.id, l.expires_at, a.seconds, julianday(l.expires_at) FROM debit_allocations a "
             "JOIN ledger l ON l.id = a.credit_id "
             "JOIN ledger d ON d.id = a.debit_id "
             "WHERE d.id = ? AND d.user_id = ? AND d.kind = 'debit' "
@@ -389,13 +389,20 @@ class BillingRepositoryMixin(DatabaseCore):
         if not rows or sum(int(row[2]) for row in rows) < seconds:
             METRICS.record_db_error()
             raise ValueError("refund requires sufficient original debit allocations")
-        expiries = [str(row[1]) for row in rows if row[1] is not None]
+        expiring = [row for row in rows if row[1] is not None]
+        if any(row[3] is None for row in expiring):
+            METRICS.record_db_error()
+            logger.warning("refund rejected for invalid credit expiry debit_id=%s", debit_id)
+            raise ValueError("invalid source credit expiry")
+        # Use the same SQLite timestamp semantics as balance calculation, not
+        # lexical order: imported values may have offsets or mixed formats.
+        earliest = min(expiring, key=lambda row: row[3])[1] if expiring else None
         lot_ids = ",".join(str(row[0]) for row in rows)
         await self.db.execute(
             "INSERT INTO ledger(user_id, seconds, kind, note, expires_at, created_at) "
             "VALUES (?, ?, 'credit', ?, ?, ?)",
             (int(user_id), int(seconds), "refund: " + note[:180] + " lots:" + lot_ids,
-             min(expiries) if expiries else None, now),
+             earliest, now),
         )
 
     async def refund_learning_charge(self, user_id: int, operation_id: str) -> bool:

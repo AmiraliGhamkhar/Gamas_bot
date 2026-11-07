@@ -59,6 +59,38 @@ class LedgerTests(DatabaseTestCase):
         self.assertEqual(recovered[0], original[1])
         self.assertEqual(await self.db.available_seconds(100), 7200)
 
+    async def test_refund_compares_imported_expiries_as_instants(self):
+        await self.grant(100, 100, days=30)
+        await self.grant(100, 100, days=30)
+        credits = await self.db.db.execute_fetchall(
+            "SELECT id FROM ledger WHERE user_id=100 AND kind='credit' ORDER BY id"
+        )
+        # The lexically later timestamp is earlier in UTC.
+        await self.db._write("UPDATE ledger SET expires_at=? WHERE id=?",
+                             ("2099-01-01T00:30:00+02:00", credits[0][0]))
+        await self.db._write("UPDATE ledger SET expires_at=? WHERE id=?",
+                             ("2098-12-31T23:00:00+00:00", credits[1][0]))
+        await self.db.spend_seconds(100, 200, "learning", operation_id="mixed-offset")
+        await self.db.refund_learning_charge(100, "mixed-offset")
+        refund = await self.db.db.execute_fetchall(
+            "SELECT expires_at FROM ledger WHERE note LIKE 'refund:%'"
+        )
+        self.assertEqual(refund[0][0], "2099-01-01T00:30:00+02:00")
+
+    async def test_invalid_source_expiry_aborts_refund(self):
+        await self.grant(100, 100, days=30)
+        await self.db.spend_seconds(100, 100, "learning", operation_id="bad-expiry")
+        await self.db._write("UPDATE ledger SET expires_at='invalid' WHERE kind='credit'")
+        with self.assertRaisesRegex(ValueError, "invalid source credit expiry"):
+            await self.db.refund_learning_charge(100, "bad-expiry")
+        rows = await self.db.db.execute_fetchall(
+            "SELECT status FROM learning_charges WHERE operation_id='bad-expiry'"
+        )
+        self.assertEqual(rows[0][0], "pending")
+        self.assertEqual((await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE note LIKE 'refund:%'"
+        ))[0][0], 0)
+
     async def test_generic_refund_requires_original_debit_and_inherits_expiry(self):
         await self.grant(100, 3600, days=30)
         await self.db.spend_seconds(100, 3600, "test")
