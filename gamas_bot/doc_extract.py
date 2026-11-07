@@ -715,16 +715,33 @@ def chunk_sections(
 
 
 def chunk_text(
-    text: str, *, max_chars: int = MAX_MODEL_INPUT_CHARS, label: str = "بخش"
+    text: str, *, max_chars: int = MAX_MODEL_INPUT_CHARS, label: str = "بخش",
+    label_prefix: str | None = None,
 ) -> list[DocChunk]:
-    """Chunk a flat text (a booklet without page numbers) into labelled parts."""
+    """Chunk flat text; optionally retain a parent locator on overflow splits."""
     content = str(text or "").strip()
     if not content:
         return []
-    return chunk_sections(
-        [DocSection(f"{label} {to_persian_digits(1)}", "", content)],
-        max_chars=max_chars,
+    section_label = label_prefix if label_prefix is not None else f"{label} {to_persian_digits(1)}"
+    # Leave room for the replacement header even when a long parent locator
+    # is truncated by chunk_sections or part numbers grow.
+    budget = int(max_chars)
+    if label_prefix is not None:
+        budget -= max(0, len(label_prefix) - min(100, budget // 3)) + 24
+    chunks = chunk_sections(
+        [DocSection(section_label, "", content)], max_chars=budget,
     )
+    if label_prefix is None:
+        return chunks
+    result = []
+    for index, chunk in enumerate(chunks):
+        locator = label_prefix
+        if len(chunks) > 1:
+            locator += f" — قسمت {to_persian_digits(index + 1)}"
+        # Replace only the synthetic outer header, not source text inside it.
+        _, separator, body = chunk.text.partition("\n")
+        result.append(DocChunk(index, locator, (locator,), f"[{locator}]{separator}{body}"))
+    return result
 
 
 def _chunk_locator(sources: tuple[str, ...]) -> str:

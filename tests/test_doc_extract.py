@@ -297,6 +297,15 @@ class ChunkingTests(unittest.TestCase):
         self.assertGreaterEqual(len(chunks), 1)
         self.assertTrue(all("بخش" in chunk.locator for chunk in chunks))
 
+    def test_flat_text_split_retains_parent_locator(self):
+        chunks = chunk_text("متن " * 1000, max_chars=300, label_prefix="صفحه ۳")
+        self.assertGreater(len(chunks), 1)
+        for index, chunk in enumerate(chunks, 1):
+            self.assertEqual(chunk.locator, f"صفحه ۳ — قسمت {to_persian_digits(index)}")
+            self.assertEqual(chunk.sources, (chunk.locator,))
+            self.assertTrue(chunk.text.startswith(f"[{chunk.locator}]"))
+            self.assertLessEqual(len(chunk.text), 300)
+
     def test_long_section_has_no_silent_tail_loss_and_exact_budget(self):
         text = "BEGINMARK " + ("بخش‌متنی " * 14000) + " MIDDLETOKEN " + ("ادامه " * 9000) + " ENDMARK"
         chunks = chunk_sections([DocSection("صفحهٔ ۱۲", "عنوان", text)], max_chars=4096)

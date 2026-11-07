@@ -226,6 +226,33 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rows), 5)
         self.assertTrue(all(row[1] for row in rows))
 
+    async def test_overflow_split_persists_real_parent_locator(self):
+        from gamas_bot.doc_extract import DocChunk
+        from gamas_bot.llm import LLMContextOverflowError
+
+        item = await self.db.library_add(OWNER, "booklet", 1, 2, None, title="سند")
+        source = {"item_id": item, "doc_id": None, "title": "سند", "chunks": [
+            DocChunk(0, "صفحه ۳", ("صفحه ۳",), "متن درس " * 500)
+        ]}
+        calls = 0
+        async def provider(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise LLMContextOverflowError("overflow")
+            return {"cards": [
+                {"front": f"پرسش شماره {calls * 100 + i}", "back": "پاسخ", "source": "fabricated"}
+                for i in range(10)
+            ]}
+        with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
+            await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER, kind="deck",
+                                               source=source, wanted=10, cost=0, note="test", title="سند")
+        await self.bot._handle_callback(self.press(b"fc:cur:save"))
+        rows = await self.db.db.execute_fetchall("SELECT source FROM flashcards")
+        self.assertGreaterEqual(len(rows), 5)
+        self.assertTrue(all(row[0].startswith("صفحه ۳") for row in rows))
+        self.assertTrue(all(row[0] != "بخش ۱" for row in rows))
+
     async def test_generation_reports_partial_chunk_failures(self):
         """One uncovered chunk must not fail the whole generation."""
         from gamas_bot.doc_extract import DocChunk

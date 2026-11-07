@@ -409,6 +409,7 @@ class LearningWorkflowMixin:
                         sub_raw = chunk_text(
                             target_chunk.text,
                             max_chars=max(800, len(target_chunk.text) // 2),
+                            label_prefix=target_chunk.locator or fallback_locator,
                         )
                         if len(sub_raw) >= 2:
                             sub_chunks = [

@@ -6,6 +6,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 
 - WO-SUB-2: record sweep membership and check timestamp in one update.
 - WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
+- WO-LRN-4: retain source locators when splitting overflowed learning chunks.
 - WO-LRN-1: retain undelivered paid previews until their normal expiry and offer resume.
 - WO-LRN-2: preserve originating credit expiry and lot IDs on learning refunds and recovery.
 - WO-LRN-10: gate flashcard DOCX delivery while keeping paid quiz answers accessible.
