@@ -227,6 +227,68 @@ class UsersRepositoryMixin(DatabaseCore):
             )
         return count
 
+    async def user_ids_after(self, last_id: int, limit: int = 500) -> list[int]:
+        rows = await _rows(
+            self.read_db,
+            "SELECT telegram_id FROM users WHERE banned = 0 AND broadcast_hard_fails < 3 "
+            "AND telegram_id > ? ORDER BY telegram_id LIMIT ?",
+            (int(last_id), min(500, max(1, int(limit)))),
+        )
+        return [int(row[0]) for row in rows]
+
+    async def count_broadcast_targets(self, admin_id: int, *, after_id: int = 0) -> int:
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM users WHERE banned=0 AND broadcast_hard_fails < 3 "
+            "AND telegram_id > ? AND telegram_id != ?",
+            (int(after_id), int(admin_id)),
+        )
+        return int(rows[0][0])
+
+    async def broadcast_create_run(self, admin_id: int, text_hash: str) -> int:
+        now = iso(self._now())
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "INSERT INTO broadcast_runs(admin_id,text_hash,pages,created_at,updated_at) "
+                "VALUES(?,?,1,?,?)", (int(admin_id), text_hash, now, now),
+            )
+            return int(cursor.lastrowid)
+
+    async def broadcast_get_run(self, run_id: int) -> dict[str, Any] | None:
+        rows = await _rows(self.read_db, "SELECT * FROM broadcast_runs WHERE id=?", (int(run_id),))
+        return dict(rows[0]) if rows else None
+
+    async def broadcast_checkpoint(self, run_id: int, last_id: int, sent: int, failed: int,
+                                   outcomes: list[tuple[int, str]], status: str = "running") -> None:
+        if status not in ("running", "done", "stopped"):
+            raise ValueError("invalid broadcast status")
+        async with self._transaction():
+            for user_id, outcome in outcomes:
+                if outcome == "success":
+                    await self.db.execute("UPDATE users SET broadcast_hard_fails=0 WHERE telegram_id=?", (int(user_id),))
+                elif outcome == "hard":
+                    await self.db.execute("UPDATE users SET broadcast_hard_fails=broadcast_hard_fails+1 WHERE telegram_id=?", (int(user_id),))
+            await self.db.execute(
+                "UPDATE broadcast_runs SET last_telegram_id=?, sent=?, failed=?, status=?, updated_at=? WHERE id=?",
+                (int(last_id), int(sent), int(failed), status, iso(self._now()), int(run_id)),
+            )
+
+    async def broadcast_recover_runs(self) -> list[dict[str, Any]]:
+        async with self._transaction():
+            rows = await _rows(self.db, "SELECT * FROM broadcast_runs WHERE status='running' ORDER BY id")
+            if rows:
+                await self.db.execute("UPDATE broadcast_runs SET status='stopped', updated_at=? WHERE status='running'", (iso(self._now()),))
+            return [dict(row) for row in rows]
+
+    async def broadcast_resume_run(self, run_id: int, admin_id: int, text_hash: str) -> bool:
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "UPDATE broadcast_runs SET status='running', updated_at=? "
+                "WHERE id=? AND admin_id=? AND text_hash=? AND status='stopped'",
+                (iso(self._now()), int(run_id), int(admin_id), text_hash),
+            )
+            return bool(cursor.rowcount)
+
     async def user_ids(self) -> list[int]:
         rows = await _rows(
             self.read_db, "SELECT telegram_id FROM users ORDER BY telegram_id"

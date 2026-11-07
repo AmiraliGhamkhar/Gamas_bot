@@ -57,6 +57,7 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "pending_gate_actions",
         "referrals",
         "referral_rewards",
+        "broadcast_runs",
     }
 )
 

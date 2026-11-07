@@ -4,6 +4,7 @@ Concise history; detailed patches and earlier notes remain in Git history.
 
 ## Unreleased — hardening
 
+- WO-BC-2/3 (partial): add durable broadcast cursors and recipient failure tracking.
 - WO-SUB-2: record sweep membership and check timestamp in one update.
 - WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
 - WO-PAY-2: fingerprint normalized receipts and warn admins about reuse.

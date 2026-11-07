@@ -152,6 +152,24 @@ class UserIdentityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.user_reference_integrity(), [])
         await self.db.assert_user_reference_integrity()
 
+    async def test_broadcast_cursor_recovery_and_failure_filter(self):
+        for uid in (10, 20, 30, 40):
+            await self.db.ensure_user(uid)
+        await self.db._write("UPDATE users SET banned=1 WHERE telegram_id=20")
+        run = await self.db.broadcast_create_run(10, "digest")
+        self.assertEqual(await self.db.user_ids_after(0), [10, 30, 40])
+        await self.db.broadcast_checkpoint(run, 30, 1, 1, [(30, "hard")])
+        self.assertEqual(await self.db.user_ids_after(30), [40])
+        recovered = await self.db.broadcast_recover_runs()
+        self.assertEqual(recovered[0]["last_telegram_id"], 30)
+        self.assertFalse(await self.db.broadcast_resume_run(run, 10, "wrong"))
+        self.assertTrue(await self.db.broadcast_resume_run(run, 10, "digest"))
+        await self.db.broadcast_checkpoint(run, 30, 1, 1, [(30, "hard")])
+        await self.db.broadcast_checkpoint(run, 30, 1, 1, [(30, "hard")])
+        self.assertNotIn(30, await self.db.user_ids_after(0))
+        await self.db.broadcast_checkpoint(run, 40, 2, 1, [(30, "success")], status="done")
+        self.assertIn(30, await self.db.user_ids_after(0))
+
     async def test_integrity_check_detects_an_orphan(self):
         # Foreign keys are ON, so create the orphan with them off to prove the
         # check itself is not merely echoing SQLite's enforcement.
