@@ -624,7 +624,8 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 gone_msg.edit = mock.AsyncMock(side_effect=MessageIdInvalidError(request=None))
                 ok_fallback = await bot._render_curation(gone_msg, 77)
                 self.assertTrue(ok_fallback)
-                self.assertTrue(any("پیش‌نمایش فلش‌کارت" in t["text"] for t in client.texts))
+                gone_msg.respond.assert_awaited_once()
+                self.assertIn("پیش‌نمایش فلش‌کارت", gone_msg.respond.await_args.args[0])
             finally:
                 await bot.shutdown()
 
