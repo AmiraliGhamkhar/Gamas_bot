@@ -216,21 +216,24 @@ MIN_NOTE_PROMPT_TOKENS = 4096
 #: attribute spelling matches the dataclass field exactly.
 PLAN_ENV_FIELDS = (
     ("FREE_PLAN_HOURS", "free_plan_hours", 1),
-    ("PLAN_5_HOURS", "plan_5_hours", 5),
-    ("PLAN_5_PRICE_TOMAN", "plan_5_price_toman", 50_000),
-    ("PLAN_5_VALIDITY_DAYS", "plan_5_validity_days", 30),
-    ("PLAN_10_HOURS", "plan_10_hours", 10),
-    ("PLAN_10_PRICE_TOMAN", "plan_10_price_toman", 75_000),
-    ("PLAN_10_VALIDITY_DAYS", "plan_10_validity_days", 30),
-    ("PLAN_20_HOURS", "plan_20_hours", 20),
-    ("PLAN_20_PRICE_TOMAN", "plan_20_price_toman", 130_000),
-    ("PLAN_20_VALIDITY_DAYS", "plan_20_validity_days", 30),
-    ("PLAN_25_HOURS", "plan_25_hours", 25),
-    ("PLAN_25_PRICE_TOMAN", "plan_25_price_toman", 150_000),
-    ("PLAN_25_VALIDITY_DAYS", "plan_25_validity_days", 30),
-    ("PLAN_50_HOURS", "plan_50_hours", 50),
-    ("PLAN_50_PRICE_TOMAN", "plan_50_price_toman", 250_000),
-    ("PLAN_50_VALIDITY_DAYS", "plan_50_validity_days", 30),
+    ("PLAN_3_HOURS", "plan_3_hours", 3),
+    ("PLAN_3_PRICE_TOMAN", "plan_3_price_toman", 60_000),
+    ("PLAN_3_VALIDITY_DAYS", "plan_3_validity_days", 30),
+    ("PLAN_9_HOURS", "plan_9_hours", 9),
+    ("PLAN_9_PRICE_TOMAN", "plan_9_price_toman", 180_000),
+    ("PLAN_9_VALIDITY_DAYS", "plan_9_validity_days", 30),
+    ("PLAN_12_HOURS", "plan_12_hours", 12),
+    ("PLAN_12_PRICE_TOMAN", "plan_12_price_toman", 240_000),
+    ("PLAN_12_VALIDITY_DAYS", "plan_12_validity_days", 30),
+    ("PLAN_24_HOURS", "plan_24_hours", 24),
+    ("PLAN_24_PRICE_TOMAN", "plan_24_price_toman", 480_000),
+    ("PLAN_24_VALIDITY_DAYS", "plan_24_validity_days", 30),
+    ("PLAN_36_HOURS", "plan_36_hours", 36),
+    ("PLAN_36_PRICE_TOMAN", "plan_36_price_toman", 720_000),
+    ("PLAN_36_VALIDITY_DAYS", "plan_36_validity_days", 30),
+    ("PLAN_60_HOURS", "plan_60_hours", 60),
+    ("PLAN_60_PRICE_TOMAN", "plan_60_price_toman", 1_200_000),
+    ("PLAN_60_VALIDITY_DAYS", "plan_60_validity_days", 30),
 )
 
 #: Default failover order for speech-to-text. Only configured providers are
@@ -654,21 +657,24 @@ class Settings:
     #: deletes its text. 0 disables the sweep (rows are kept forever).
     transcript_retention_days: int
     free_plan_hours: int
-    plan_5_hours: int
-    plan_5_price_toman: int
-    plan_5_validity_days: int
-    plan_10_hours: int
-    plan_10_price_toman: int
-    plan_10_validity_days: int
-    plan_20_hours: int
-    plan_20_price_toman: int
-    plan_20_validity_days: int
-    plan_25_hours: int
-    plan_25_price_toman: int
-    plan_25_validity_days: int
-    plan_50_hours: int
-    plan_50_price_toman: int
-    plan_50_validity_days: int
+    plan_3_hours: int
+    plan_3_price_toman: int
+    plan_3_validity_days: int
+    plan_9_hours: int
+    plan_9_price_toman: int
+    plan_9_validity_days: int
+    plan_12_hours: int
+    plan_12_price_toman: int
+    plan_12_validity_days: int
+    plan_24_hours: int
+    plan_24_price_toman: int
+    plan_24_validity_days: int
+    plan_36_hours: int
+    plan_36_price_toman: int
+    plan_36_validity_days: int
+    plan_60_hours: int
+    plan_60_price_toman: int
+    plan_60_validity_days: int
 
     # --- Stage concurrency, non-blocking provider capacity & deduplication ---
     max_concurrent_downloads: int = DEFAULT_MAX_CONCURRENT_DOWNLOADS
@@ -1458,6 +1464,7 @@ def from_env(env_file: str | None = None) -> Settings:
             "OFFICE_AI_CONCURRENCY", 3, minimum=1, maximum=16
         ),
         plan_values=plan_values,
+        **plan_values,
         max_concurrent_downloads=_env_int(
             "MAX_CONCURRENT_DOWNLOADS",
             DEFAULT_MAX_CONCURRENT_DOWNLOADS,
@@ -1593,7 +1600,6 @@ def from_env(env_file: str | None = None) -> Settings:
             minimum=0.0,
             maximum=3600.0,
         ),
-        **plan_values,
     )
 
 

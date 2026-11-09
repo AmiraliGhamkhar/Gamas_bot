@@ -23,7 +23,7 @@ from telethon import Button
 from telethon.tl.custom import Message
 
 from . import texts
-from .billing import format_duration
+from .billing import format_seconds_as_credits
 from .bot_ui import (
     DEFAULT_INTAKE_SUFFIX,
     DOC_EXTRACTION_STOPPED,
@@ -1578,7 +1578,7 @@ class DocumentOfficeWorkflowMixin:
                         Button.inline(
                             button_label(
                                 f"{label} — {to_persian_digits(cards)} کارت — "
-                                f"{format_duration(self._preset_cost(base_cost, cards, base_size))} اعتبار"  # type: ignore[attr-defined]
+                                f"{format_seconds_as_credits(self._preset_cost(base_cost, cards, base_size))}"  # type: ignore[attr-defined]
                             ),
                             f"doc:gen:fc:{document_id}:{code}".encode("ascii"),
                         )
@@ -1592,7 +1592,7 @@ class DocumentOfficeWorkflowMixin:
                         Button.inline(
                             button_label(
                                 f"{label} — {to_persian_digits(questions)} سؤال — "
-                                f"{format_duration(questions * per_question)} اعتبار"
+                                f"{format_seconds_as_credits(questions * per_question)}"
                             ),
                             f"doc:gen:quiz:{document_id}:{questions}".encode("ascii"),
                         )

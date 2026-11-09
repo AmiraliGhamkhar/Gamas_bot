@@ -279,10 +279,10 @@ class DocxRobustnessTests(unittest.TestCase):
 
 class TariffOverrideTests(unittest.TestCase):
     def test_an_ignored_override_is_reported_at_startup(self):
-        with mock.patch.dict(os.environ, {"PLAN_5_PRICE_TOMAN": "0"}, clear=False):
+        with mock.patch.dict(os.environ, {"PLAN_3_PRICE_TOMAN": "0"}, clear=False):
             settings = config.from_env(env_file="/nonexistent")
         problems = "\n".join(config.check(settings))
-        self.assertIn("PLAN_5_PRICE_TOMAN=0", problems)
+        self.assertIn("PLAN_3_PRICE_TOMAN=0", problems)
 
 
 class ChunkCapTests(unittest.IsolatedAsyncioTestCase):

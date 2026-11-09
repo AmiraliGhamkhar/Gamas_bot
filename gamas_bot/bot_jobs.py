@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from telethon.tl.custom import Message
 
-from .billing import format_duration
+from .billing import format_credit_duration, format_seconds_as_credits
 from .bot_deps import deps_for
 from .bot_ui import (
     ACTIVE_LIMIT_MESSAGE,
@@ -280,14 +280,16 @@ class JobPipelineMixin:
         needed = self._reserve_estimate(duration)
         unlimited = await self.db.is_unlimited(user_id)
         if not unlimited and available < needed:
+            has_duration = duration is not None and duration > 0
             measured = (
-                f"مدت فایل: {format_duration(duration)}"
-                if duration is not None and duration > 0
+                "مدت فایل: " + format_credit_duration(duration)  # type: ignore[arg-type]
+                if has_duration
                 else "مدت فایل نامشخص است"
             )
             await event.reply(
                 f"💳 اعتبار شما کافی نیست.\n"
-                f"{measured} | لازم: {format_duration(needed)} | شما: {format_duration(available)}\n"
+                f"{measured} | لازم: {format_seconds_as_credits(needed)} "
+                f"| شما: {format_seconds_as_credits(available)}\n"
                 "از «🛒 خرید اشتراک» اعتبار بگیرید."
             )
             return
@@ -355,7 +357,8 @@ class JobPipelineMixin:
             if available < needed:
                 await event.reply(
                     f"💳 اعتبار شما کافی نیست.\n"
-                    f"لازم: {format_duration(needed)} | شما: {format_duration(available)}\n"
+                    f"لازم: {format_seconds_as_credits(needed)} "
+                    f"| شما: {format_seconds_as_credits(available)}\n"
                     "از «🛒 خرید اشتراک» اعتبار بگیرید."
                 )
                 return
@@ -508,7 +511,8 @@ class JobPipelineMixin:
                 job,
                 (
                     f"💳 اعتبار شما کافی نیست.\n"
-                    f"لازم: {format_duration(exc.required_seconds)} | شما: {format_duration(exc.available_seconds)}\n"
+                    f"لازم: {format_seconds_as_credits(exc.required_seconds)} "
+                    f"| شما: {format_seconds_as_credits(exc.available_seconds)}\n"
                     "از «🛒 خرید اشتراک» اعتبار بگیرید."
                 ),
             )

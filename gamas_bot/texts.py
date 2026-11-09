@@ -106,7 +106,8 @@ def help_screen(*, office_enabled: bool) -> str:
         [
             "🛒 خرید اشتراک و 🎧 پشتیبانی از منوی اصلی در دسترس است.",
             "",
-            "💳 اعتبار بر حسب ثانیه و پس از ارسال متن خام محاسبه می‌شود.",
+            "💳 هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس.",
+            "اعتبار بر حسب ثانیه و پس از ارسال متن خام محاسبه می‌شود؛ "
             "اگر متن خام نرسد، اعتباری کم نمی‌شود.",
             "ساخت آزمون و فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق باشد، کامل برمی‌گردد.",
             "خطای ساخت جزوه پس از دریافت متن خام، اعتبار را برنمی‌گرداند.",
@@ -241,8 +242,8 @@ BTN_SHARE_INVITE: Final = "📤 اشتراک لینک دعوت"
 REFERRALS_TITLE: Final = "🤝 دعوت دوستان"
 REFERRALS_RULES: Final = (
     "با هر دعوت موفق اعتبار هدیه بگیرید:\n"
-    "• ورود دوست با لینک شما: ۲۰ دقیقه اعتبار\n"
-    "• اولین خرید تأییدشدهٔ او: ۱ ساعت اعتبار"
+    "• ورود دوست با لینک شما: {signup_credits} اعتبار\n"
+    "• اولین خرید تأییدشدهٔ او: {purchase_credits} اعتبار"
 )
 REFERRALS_LINK_TEMPLATE: Final = "لینک اختصاصی شما:\n{link}"
 REFERRALS_CODE_TEMPLATE: Final = "کد دعوت شما: {code}"
@@ -275,10 +276,22 @@ TRACKING_CODE_TEMPLATE: Final = "کد پیگیری: {reference}"
 WALLET_TITLE: Final = "🛒 خرید اشتراک"
 WALLET_NO_PLANS: Final = "فعلاً بسته‌ای برای خرید موجود نیست."
 WALLET_CHOOSE_PLAN: Final = "بسته را انتخاب کنید؛ اعتبار خرید به موجودی شما اضافه می‌شود."
-WALLET_PLAN_ROW_TEMPLATE: Final = "• {duration}\n  اعتبار: {validity} | مبلغ: {price}"
-WALLET_PLAN_BUTTON_TEMPLATE: Final = "{hours} ساعت — {price}"
+WALLET_PLAN_ROW_TEMPLATE: Final = "• {credits}\n  اعتبار: {validity} | مبلغ: {price}"
+WALLET_PLAN_BUTTON_TEMPLATE: Final = "{credits} — {price}"
+#: The credit amount as it appears inside a plan button.
+WALLET_PLAN_BUTTON_CREDITS: Final = "{credits} اعتبار"
+#: How the balance line names the unit it is showing.
+WALLET_BALANCE_UNIT: Final = "اعتبار"
+
+#: How a charge is described everywhere (intake, job failure, learning).
+#: ``{credits}`` is already grouped and in Persian digits; the hours it covers
+#: follow in parentheses so the tariff is never a mystery.
+CREDIT_COST_TEMPLATE: Final = "{credits} ({hours} ساعت)"
+#: Intake: the file's own length, in both currencies.
+CREDIT_MEASURE_TEMPLATE: Final = "مدت فایل: {duration} ≈ {credits}"
 WALLET_CARD_DISABLED: Final = "🛒 پرداخت کارت‌به‌کارت فعلاً غیرفعال است."
 WALLET_BALANCE_TEMPLATE: Final = "💳 اعتبار باقی‌مانده: {balance}"
+WALLET_UNIT_HINT: Final = "📐 هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس"
 WALLET_RECENT_PAYMENTS: Final = "🧾 پرداخت‌های اخیر"
 WALLET_NO_PAYMENTS: Final = "پرداختی ثبت نشده است."
 WALLET_NO_MORE_PAYMENTS: Final = "مورد دیگری وجود ندارد."

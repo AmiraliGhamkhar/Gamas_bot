@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, Any
 from telethon import Button
 
 from . import texts
-from .billing import format_duration, format_toman, format_validity
+from .billing import (
+    format_duration,
+    format_seconds_as_credits,
+    format_toman,
+    format_validity,
+)
 from .bot_ui import TELEGRAM_CAPTION_LIMIT
 from .db import utc_now
 from .docx_export import jalali_date
@@ -161,7 +166,7 @@ class AdminWorkflowMixin:
     def _duration_text(seconds: float | None) -> str:
         if seconds is None:
             return "—"
-        return format_duration(int(round(seconds)))
+        return format_seconds_as_credits(int(round(seconds)))
 
     def _timing_line(self, label: str, summary: dict) -> str:
         count = int(summary.get("count") or 0)
@@ -245,7 +250,7 @@ class AdminWorkflowMixin:
             items.append(
                 f"⏳ {to_persian_digits(expiring['count'])} بستهٔ اعتبار تا "
                 f"{to_persian_digits(expiring['within_days'])} روز آینده منقضی می‌شود "
-                f"({format_duration(expiring['seconds'])})"
+                f"({format_seconds_as_credits(expiring['seconds'])})"
             )
         db_errors = int(runtime.get("db_errors", 0) or 0)
         if db_errors:
@@ -518,7 +523,7 @@ class AdminWorkflowMixin:
         lines.append(
             f"• اعتبار در حال انقضا (تا {to_persian_digits(expiring['within_days'])} روز آینده): "
             f"{to_persian_digits(expiring['count'])} بسته"
-            f" — {format_duration(expiring['seconds'])}"
+            f" — {format_seconds_as_credits(expiring['seconds'])}"
         )
         open_statuses = {
             status: entry
@@ -692,7 +697,7 @@ class AdminWorkflowMixin:
             balance = (
                 "نامحدود"
                 if user["is_unlimited"]
-                else format_duration(user["available_seconds"])
+                else format_seconds_as_credits(user["available_seconds"])
             )
             joined = (user["joined_at"] or "")[:10] or "—"
             identity = self._identity_line(
@@ -1074,7 +1079,7 @@ class AdminWorkflowMixin:
             seconds = payment.get("purchased_seconds")
             price = payment.get("purchased_price")
             package = (
-                format_duration(int(seconds))
+                format_seconds_as_credits(int(seconds))
                 if seconds is not None
                 else payment["plan_code"]
             )
@@ -1231,7 +1236,7 @@ class AdminWorkflowMixin:
             f"شناسه سفارش: #{to_persian_digits(payment_id)}",
             f"کاربر: {owner_line}",
             f"طرح: {payment['plan_code']}",
-            f"بسته: {format_duration(int(seconds)) if seconds is not None else payment['plan_code']}",
+            f"بسته: {format_seconds_as_credits(int(seconds)) if seconds is not None else payment['plan_code']}",
             f"مدت اعتبار: {format_validity(validity_days)}",
             f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}",
             f"وضعیت: {self._payment_status_label(payment['status'])}",  # type: ignore[attr-defined]
@@ -1454,7 +1459,7 @@ class AdminWorkflowMixin:
         )
         owner = await self._identity_for_id(target)
         await event.reply(
-            f"✅ {format_duration(hours * 3600)} اعتبار به حساب کاربر {owner} اضافه شد.",
+            f"✅ {format_seconds_as_credits(hours * 3600)} به حساب کاربر {owner} اضافه شد.",
             buttons=self._admin_menu(),  # type: ignore[attr-defined]
         )
 

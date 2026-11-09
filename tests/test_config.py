@@ -144,12 +144,12 @@ class FromEnvTests(unittest.TestCase):
         self.assertEqual(settings.presentation_silence_seconds, 60.0)
 
     def test_plan_overrides(self):
-        values = {"PLAN_5_HOURS": "7", "PLAN_5_PRICE_TOMAN": "99000"}
+        values = {"PLAN_3_HOURS": "7", "PLAN_3_PRICE_TOMAN": "99000"}
         with mock.patch.dict(os.environ, env(**values), clear=False):
             settings = from_env(env_file="/nonexistent")
-        self.assertEqual(settings.plan_5_hours, 7)
-        self.assertEqual(settings.plan_5_price_toman, 99000)
-        self.assertEqual(settings.plan_values["plan_5_hours"], 7)
+        self.assertEqual(settings.plan_3_hours, 7)
+        self.assertEqual(settings.plan_3_price_toman, 99000)
+        self.assertEqual(settings.plan_values["plan_3_hours"], 7)
 
     def test_tariff_values_cover_every_plan_field(self):
         # Every plan field on the dataclass appears in tariff_values().

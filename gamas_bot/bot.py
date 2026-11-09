@@ -40,7 +40,7 @@ import aiohttp
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
 
-from .billing import format_duration, plan_catalog
+from .billing import format_seconds_as_credits, plan_catalog
 from .bot_admin import AdminWorkflowMixin
 from .bot_deps import DEFAULT_BOT_DEPS, BotDependencies, deps_for
 from .bot_documents import DocumentOfficeWorkflowMixin
@@ -803,7 +803,7 @@ class GamasBot(
         """The balance as users see it: a special user has no limit to show."""
         if await self.db.is_unlimited(user_id):
             return texts.UNLIMITED_BALANCE
-        return format_duration(await self.db.available_seconds(user_id))
+        return format_seconds_as_credits(await self.db.available_seconds(user_id))
 
     def _free_plan_seconds(self) -> int:
         for plan in plan_catalog(self.settings.tariff_values()):

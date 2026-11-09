@@ -23,7 +23,7 @@ from telethon import Button
 from telethon.errors import FloodWaitError, MessageNotModifiedError
 
 from . import texts
-from .billing import format_duration
+from .billing import format_seconds_as_credits
 from .bot_ui import (
     CURATION_GUIDANCE,
     CURATION_STALE_ALERT,
@@ -1012,7 +1012,7 @@ class LearningWorkflowMixin:
         if timer is not None:
             timer.cancel()
         refund_notice = ("\n" + texts.LEARNING_PRORATA_REFUND.format(
-            duration=format_duration(refund)
+            duration=format_seconds_as_credits(refund)
         )) if refund else ""
         if state["kind"] == "deck":
             deck = await self.db.deck_get(artifact_id, user_id)
@@ -1111,7 +1111,7 @@ class LearningWorkflowMixin:
                     Button.inline(
                         button_label(
                             f"{label} — {to_persian_digits(questions)} سؤال — "
-                            f"{format_duration(questions * per_question)} اعتبار"
+                            f"{format_seconds_as_credits(questions * per_question)}"
                         ),
                         f"quiz:go:{item_id}:{questions}".encode("ascii"),
                     )
@@ -1463,7 +1463,8 @@ class LearningWorkflowMixin:
                 [
                     Button.inline(
                         button_label(
-                            f"{hours_text} ساعت — {format_duration(int(round(hours * 3600)))}"
+                            f"{hours_text} ساعت — "
+                            f"{format_seconds_as_credits(int(round(hours * 3600)))}"
                         ),
                         f"adm:bg:{target_id}:{plan['code']}".encode("utf-8"),
                     )
@@ -1482,7 +1483,10 @@ class LearningWorkflowMixin:
             return
         name = await self._identity_for_id(target_id)  # type: ignore[attr-defined]
         seconds = int(round(float(plan["hours"]) * 3600))
-        text = f"هدیه به {name} با اعتبار {format_duration(seconds)} ثبت شود؟"
+        text = (
+            f"هدیه به {name} با اعتبار {format_seconds_as_credits(seconds)} "
+            "ثبت شود؟"
+        )
         await self._edit(  # type: ignore[attr-defined]
             event,
             text,
@@ -1532,7 +1536,7 @@ class LearningWorkflowMixin:
         )
         message = (
             "🎁 تبریک! شما جزو ۵ کاربر برتر گاماس هستید و "
-            f"{format_duration(seconds)} اعتبار رایگان به حساب شما اضافه شد."
+            f"{format_seconds_as_credits(seconds)} رایگان به حساب شما اضافه شد."
         )
         try:
             await self.client.send_message(target_id, message)
@@ -1589,7 +1593,7 @@ class LearningWorkflowMixin:
         text = (
             "ساخت فلش‌کارت با هوش مصنوعی از این جزوه. مجموعه‌ای از "
             f"{to_persian_digits(size)} پرسش و پاسخ ساخته می‌شود.\n"
-            f"هزینه: {format_duration(cost)} اعتبار"
+            f"هزینه: {format_seconds_as_credits(cost)}"
         )
         badge = ""
         if await self._free_try_available(user_id, "deck"):
@@ -1606,7 +1610,7 @@ class LearningWorkflowMixin:
                     Button.inline(
                         button_label(
                             f"{label} — {to_persian_digits(cards)} کارت — "
-                            f"{format_duration(self._preset_cost(cost, cards, size))} اعتبار"
+                            f"{format_seconds_as_credits(self._preset_cost(cost, cards, size))}"
                         ),
                         f"fc:go:{item_id}:{code}".encode("ascii"),
                     )
