@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import unittest
-from dataclasses import replace
 
 from gamas_bot.billing import (
     CREDITS_PER_HOUR,

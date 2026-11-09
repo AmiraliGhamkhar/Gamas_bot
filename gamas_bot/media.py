@@ -541,15 +541,25 @@ def build_extract_command(
     output: Path,
     *,
     output_format: str = "wav",
+    preprocess: bool = False,
 ) -> list[str]:
-    """Build the worker call that takes the first audio track to mono PCM/Opus."""
-    return worker_command(
+    """Build the worker call that takes the first audio track to mono PCM/Opus.
+
+    ``preprocess`` adds the worker's speech-cleanup chain (rumble, hiss, near/far
+    level swings). It is part of the *extraction* call on purpose: the STT
+    provider must receive the cleaned file, so cleaning after extraction would
+    mean transcribing an intermediate file, and the delivered duration — which
+    billing is derived from — would no longer be the one that was uploaded.
+    """
+    command = worker_command(
         "extract",
         "--output", str(output),
         "--format", output_format,
-        "--",
-        str(source),
     )
+    if preprocess:
+        command.append("--preprocess")
+    command.extend(["--", str(source)])
+    return command
 
 
 async def extract_audio_track(
@@ -582,7 +592,12 @@ async def extract_audio_track(
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / merge_output_name(stem, output_format)
-    command = build_extract_command(source, output, output_format=output_format)
+    command = build_extract_command(
+        source,
+        output,
+        output_format=output_format,
+        preprocess=settings.stt_preprocess,
+    )
     code, _, stderr = await run_command(
         command,
         settings.media_timeout,

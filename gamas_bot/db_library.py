@@ -294,3 +294,4 @@ class LibraryRepositoryMixin(DatabaseCore):
             (int(user_id), str(kind)),
         )
         return int(rows[0][0]) if rows else 0
+

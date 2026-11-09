@@ -40,6 +40,11 @@ import aiohttp
 from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
 
+from .artifacts import (
+    KIND_KEYPOINTS,
+    KIND_TRANSCRIPT,
+    delivery_markup,
+)
 from .billing import format_seconds_as_credits, plan_catalog
 from .bot_admin import AdminWorkflowMixin
 from .bot_deps import DEFAULT_BOT_DEPS, BotDependencies, deps_for
@@ -573,6 +578,39 @@ class GamasBot(
                 logger.warning("callback screen could not be delivered", exc_info=True)
 
     # ----------------------------------------------------------------- menus
+    def _reply_keyboard(self, *, is_admin: bool) -> Any:
+        """The persistent bottom keyboard attached to the menu message.
+
+        ``resize_keyboard`` keeps it one line tall; ``is_persistent`` asks
+        Telegram to keep showing it once the user starts typing instead of
+        hiding it behind the keyboard toggle, which is what makes it a real
+        navigation bar rather than a one-off prompt.
+        """
+        from telethon.tl.types import (
+            ButtonTypeDefault,
+            KeyboardButton,
+            KeyboardButtonRow,
+            ReplyKeyboardMarkup,
+        )
+
+        rows = [
+            KeyboardButtonRow(
+                buttons=[
+                    KeyboardButton(text=label, type=ButtonTypeDefault())
+                    for label in row
+                ]
+            )
+            for row in texts.reply_menu_rows(
+                is_admin=is_admin, office_enabled=self.settings.office_enabled
+            )
+        ]
+        return ReplyKeyboardMarkup(
+            rows=rows,
+            resize=True,
+            persistent=True,
+            placeholder=texts.REPLY_KEYBOARD_PLACEHOLDER,
+        )
+
     def _user_menu(self, *, is_admin: bool = False) -> list:
         """The user panel: library, wallet, optional free Office, support and help."""
         rows = [
@@ -633,7 +671,19 @@ class GamasBot(
             office_enabled=self.settings.office_enabled,
             notes_configured=self.settings.note_configured,
         )
-        await self._edit_or_reply(event, text, self._user_menu(is_admin=self._is_admin(user_id)))
+        await self._edit_or_reply(
+            event,
+            text,
+            self._user_menu(is_admin=self._is_admin(user_id)),
+            # A reply keyboard is set once and stays: attaching it again on every
+            # screen would turn every menu tap into a new message (Telegram
+            # cannot add a keyboard by editing), which is exactly the clutter the
+            # one-message results screen removes. It rides on the /start message
+            # and is re-attached whenever the user sends text.
+            reply_markup=None
+            if hasattr(event, "data")
+            else self._reply_keyboard(is_admin=self._is_admin(user_id)),
+        )
 
     # -------------------------------------------------------- membership gate
     async def _require_membership(
@@ -766,8 +816,20 @@ class GamasBot(
             await asyncio.sleep(SWEEP_PAUSE_SECONDS)
         return checked
 
-    async def _edit_or_reply(self, event, text: str, buttons=None) -> None:
-        """Render a screen: edit when triggered by a button, reply when by a message."""
+    async def _edit_or_reply(
+        self, event, text: str, buttons=None, *, reply_markup: Any = None
+    ) -> None:
+        """Render a screen: edit when triggered by a button, reply when by a message.
+
+        ``reply_markup`` is the *bottom* keyboard. Telethon delivers either an
+        inline keyboard or a reply keyboard through the same ``buttons``
+        argument, and Telegram cannot attach a reply keyboard by editing — so a
+        request for one always sends a fresh message, while an ordinary edit
+        keeps editing in place (the client already shows the keyboard).
+        """
+        if reply_markup is not None:
+            await event.reply(text, buttons=reply_markup)
+            return
         if hasattr(event, "data"):
             await self._edit(event, text, buttons)
             return
@@ -984,6 +1046,7 @@ class GamasBot(
         r.register_exact("help", self._cb_help)
         r.register_exact("menu:main", lambda e, _u, _d: self._show_main(e))
         r.register_exact("library", lambda e, _u, _d: self._show_library(e))
+        r.register_prefix("res:", self._cb_result_set)
         r.register_exact("library:fc", lambda e, _u, _d: self._show_flashcard_hub(e))
         r.register_exact("board", lambda e, _u, _d: self._show_leaderboard(e))
         r.register_exact("wallet", lambda e, _u, _d: self._show_wallet(e))
@@ -1027,8 +1090,111 @@ class GamasBot(
         for adm_sup_prefix in ("adm:sl:", "adm:sv:", "adm:sr:", "adm:sc:", "adm:so:"):
             r.register_prefix(adm_sup_prefix, self._handle_admin_support_callback)
         r.register_prefix("sup:", self._handle_support_callback)
+        r.register_prefix("art:", self._route_artifact_callback)
         r.register_prefix("quiz:", self._route_quiz_callback)
         r.register_prefix("fc:", self._route_flashcard_callback)
+
+    async def _route_reply_menu(self, event, user_id: int, text: str) -> bool:
+        """Run the screen behind a bottom-keyboard label; ``False`` if not one."""
+        label = text.strip()
+        routes = {
+            texts.BTN_START_HERE: self._show_main,
+            texts.BTN_MY_RESULTS: self._show_results_hub,
+            texts.BTN_LIBRARY: lambda e: self._show_library(e),
+            texts.BTN_UPGRADE: lambda e: self._show_wallet(e),
+            texts.BTN_LEADERBOARD: lambda e: self._show_leaderboard(e),
+            texts.BTN_OFFICE: lambda e: self._route_office_callback(e, user_id, "office:start"),
+            texts.BTN_SUPPORT: lambda e: self._show_support_home(e),
+            texts.BTN_REFERRALS: lambda e: self._show_referrals(e, user_id),
+        }
+        if label == texts.BTN_HELP or label == texts.BTN_MENU_GUIDE:
+            await self._cb_help(event, user_id, "")
+            return True
+        if label == texts.BTN_ADMIN and self._is_admin(user_id):
+            await self._show_admin(event)
+            return True
+        handler = routes.get(label)
+        if handler is None:
+            return False
+        await handler(event)
+        return True
+
+    async def _show_results_hub(self, event) -> None:
+        """The user's recent submissions, one button per artifact set.
+
+        This is the screen the bottom keyboard's results button opens: a long job
+        finishes while the user is away, and the results message scrolls out of
+        reach, so the same buttons stay reachable from here at any time.
+        """
+        user_id = event.sender_id
+        rows = await self.db.user_submissions(user_id, limit=8)
+        if not rows:
+            await self._edit_or_reply(
+                event,
+                texts.RESULTS_HUB_EMPTY,
+                [[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]],
+            )
+            return
+        buttons: list[list[Any]] = []
+        for row in rows:
+            reference = f"GMS-{row['submission_id']}"
+            label = texts.RESULTS_HUB_ROW_TEMPLATE.format(
+                reference=reference,
+                status=texts.RESULTS_STATUS.get(str(row["status"]), str(row["status"])),
+            )
+            buttons.append(
+                [Button.inline(label, f"res:{row['submission_id']}".encode("ascii"))]
+            )
+        buttons.append([Button.inline(texts.BTN_BACK_MAIN, b"menu:main")])
+        await self._edit_or_reply(event, texts.RESULTS_HUB_TITLE, buttons)
+
+    async def _cb_result_set(self, event, user_id: int, data: str) -> None:
+        raw = data.split(":", 1)[-1].strip()
+        if not raw.isdigit():
+            await self._ack(event)
+            return
+        await self._show_result_set(event, user_id, int(raw))
+
+    async def _show_result_set(self, event, user_id: int, submission_id: int) -> None:
+        """One submission's artifacts, for a user coming back later."""
+        row = await self.db.submission(submission_id)
+        if row is None or int(row.user_id) != int(user_id):
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            return
+        reference = f"GMS-{submission_id}"
+        books = await self.db.library_list_kind(user_id, "booklet", limit=50)
+        has_booklet = any(
+            int(item.get("submission_id") or 0) == submission_id and not item.get("unavailable")
+            for item in books
+        )
+        transcript = await self.db.transcription(submission_id)
+        has_keypoints = bool(
+            transcript and transcript.get("notes_json")
+        )
+        buttons = delivery_markup(
+            reference=reference,
+            speakers=0,
+            has_booklet=has_booklet,
+            kinds={KIND_TRANSCRIPT} | ({KIND_KEYPOINTS} if has_keypoints else set()),
+        )
+        await self._edit(
+            event,
+            texts.delivery_screen(
+                reference=reference,
+                speakers=0,
+                has_booklet=has_booklet,
+                has_keypoints=has_keypoints,
+            ),
+            buttons,
+        )
+
+    async def _route_artifact_callback(self, event, user_id: int, data: str) -> None:
+        """One results button: hand the user the artifact they asked for."""
+        if not await self._require_membership(
+            event, user_id, kind="artifact", callback_data=data
+        ):
+            return
+        await self._fetch_artifact(event, user_id, data)
 
     async def _cb_help(self, event, _user_id: int, _data: str) -> None:
         await event.respond(
@@ -1366,6 +1532,14 @@ class GamasBot(
             self.conversations.reset_on_cancel(user_id)
             self._office_sessions.pop(user_id, None)
             await event.reply(texts.ORDER_CANCELLED)
+            return
+
+        # The bottom keyboard sends its label as plain text, so the menu is one
+        # table of (label → screen) instead of a second set of callbacks. It is
+        # checked before the conversational states below: a user pressing
+        # «کتابخانه من» while half-way through a support ticket means the menu,
+        # not another line of the ticket.
+        if not command and await self._route_reply_menu(event, user_id, text):
             return
 
         if user_id in self._pending_flashcard:

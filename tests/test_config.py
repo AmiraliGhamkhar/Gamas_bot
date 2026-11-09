@@ -847,3 +847,36 @@ class SettingsSurfaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiarizationAndPreprocessSettingsTests(unittest.TestCase):
+    """The two STT quality switches: on by default, off by explicit choice."""
+
+    def test_preprocess_is_on_by_default(self):
+        with mock.patch.dict(os.environ, env(), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertTrue(settings.stt_preprocess)
+
+    def test_preprocess_can_be_switched_off(self):
+        with mock.patch.dict(os.environ, env(STT_PREPROCESS="0"), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertFalse(settings.stt_preprocess)
+
+    def test_diarization_is_on_by_default(self):
+        with mock.patch.dict(os.environ, env(), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertTrue(settings.stt_diarize)
+        self.assertEqual(settings.stt_speaker_sensitivity, 0.5)
+
+    def test_diarization_can_be_switched_off(self):
+        with mock.patch.dict(os.environ, env(STT_DIARIZE="0"), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertFalse(settings.stt_diarize)
+
+    def test_speaker_sensitivity_is_clamped(self):
+        for raw, expected in (("9", 1.0), ("-3", 0.0), ("maybe", 0.5), ("0.8", 0.8)):
+            with mock.patch.dict(
+                os.environ, env(STT_SPEAKER_SENSITIVITY=raw), clear=False
+            ):
+                settings = from_env(env_file="/nonexistent")
+            self.assertEqual(settings.stt_speaker_sensitivity, expected, raw)

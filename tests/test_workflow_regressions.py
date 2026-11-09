@@ -366,15 +366,23 @@ class WorkflowBotTests(BotPipelineTestCase):
         for action in ("payopen", "payc", "payr"):
             await self.bot._handle_callback(FakeCallbackEvent(USER_ID, f"{action}:invalid".encode()))
 
-    async def test_truncated_raw_fallback_does_not_charge(self):
+    async def test_a_failed_booklet_upload_does_not_recharge_or_refund(self):
+        """Delivery and billing are two different concerns now.
+
+        The old contract charged only after a push succeeded, which meant a
+        Telegram hiccup could throw away a finished transcription. The transcript
+        is persisted instead, so the delivery attempt neither repeats the charge
+        nor rolls back work the user already paid for — they can fetch it by
+        button as soon as the chat accepts messages again.
+        """
         event = self.media_event()
         event.client.fail_file_delivery = True
-        with mock.patch("gamas_bot.bot.render_pages", return_value=["page one", "page two"]), \
-                mock.patch("gamas_bot.bot.RAW_FALLBACK_MAX_PAGES", 1):
-            sid = await self.run_media_job(event, transcribe=self._raw())
-        self.assertEqual((await self.db.submission(sid)).status, "failed")
-        self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
-        self.assertEqual((await self.db.stats())["seconds_transcribed"], 0)
+        sid = await self.run_media_job(event, transcribe=self._raw())
+        self.assertEqual((await self.db.submission(sid)).status, "done")
+        self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
+        self.assertEqual((await self.db.stats())["seconds_transcribed"], 100)
+        transcript = await self.db.transcription(sid)
+        self.assertIn("سلام دوستان", transcript["text"])
 
     async def test_cancel_button_available_without_payment_card(self):
         pid = await self.db.create_payment(USER_ID, "paid_5h_30d")

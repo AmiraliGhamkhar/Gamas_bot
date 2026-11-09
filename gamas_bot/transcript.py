@@ -68,38 +68,65 @@ TOPIC_BREAK_MIN_FILL = 0.6
 # ---------------------------------------------------------------------------
 
 
+#: A diarization label as the provider reported it (``S1``, ``0``, ``UU`` …).
+#: ``""`` means "this engine does not diarize"; ``UU``/``unknown`` mean the
+#: engine diarizes but could not attribute this token.
+SPEAKER_UNKNOWN = "UU"
+_UNKNOWN_SPEAKER_LABELS = frozenset({"", "uu", "unknown", "none", "null", "-"})
+
+
 @dataclass(frozen=True, slots=True)
 class Word:
     """One spoken token with its timing, punctuation already attached.
 
     ``start``/``end`` are seconds from the beginning of the audio, when the
-    engine supplies them.
+    engine supplies them. ``speaker`` is the provider's diarization label; it
+    is raw on purpose, because a provider may rename speakers between calls.
     """
 
     text: str
     start: float | None = None
     end: float | None = None
+    speaker: str = ""
 
 
 @dataclass(slots=True)
 class RawTranscript:
-    """What a speech engine returns: timed words when available, text always."""
+    """What a speech engine returns: timed words when available, text always.
+
+    ``speakers`` is the number of voices the engine resolved *after* merging
+    its raw labels; ``0`` means the engine does not diarize or could not. The
+    count is part of the artifact (the user is told how many people spoke), not
+    a statistic computed later from the paragraphs.
+    """
 
     words: list[Word]
     text: str
     confidence: float | None = None
     engine: str = ""
+    speakers: int = 0
 
     @classmethod
     def from_text(cls, text: str, confidence: float | None = None, engine: str = "") -> "RawTranscript":
         return cls(words=[], text=text, confidence=confidence, engine=engine)
 
+    @property
+    def is_diarized(self) -> bool:
+        return self.speakers > 0
+
 
 @dataclass(frozen=True, slots=True)
 class Paragraph:
+    """One paragraph of the delivered transcript.
+
+    ``speaker`` is the stable, user-facing name (``گویندهٔ ۱``) after label
+    normalisation; ``None`` when the engine did not diarize.
+    """
+
     text: str
     start: float | None = None
     end: float | None = None
+    speaker: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,31 +135,218 @@ class TranscriptDocument:
 
     paragraphs: tuple[Paragraph, ...]
     confidence: float | None = None
+    speakers: int = 0
+    #: True when the engine diarized but the labels could not be resolved into
+    #: trustworthy turns (too few words, one dominant voice). The transcript is
+    #: still delivered; it is simply not split by speaker.
+    diarization_attempted: bool = False
 
     @property
     def text(self) -> str:
         return self.plain()
 
+    def _speaker_heading(self, paragraph: Paragraph, previous: Paragraph | None) -> str:
+        """The turn header, only where the speaker changes."""
+        name = speaker_name_from_label(paragraph.speaker)
+        if name is None:
+            return paragraph.text
+        if previous is not None and previous.speaker == paragraph.speaker:
+            return paragraph.text
+        return f"{name}: {paragraph.text}"
+
     def plain(self) -> str:
-        return "\n\n".join(paragraph.text for paragraph in self.paragraphs if paragraph.text)
+        """Paragraphs; a diarized document names the speaker at each new turn.
+
+        The names are inlined rather than set on their own line so the text still
+        reads as a transcript when pasted somewhere that collapses blank lines,
+        and so the note model sees who said what without extra structure.
+        """
+        lines: list[str] = []
+        previous: Paragraph | None = None
+        for paragraph in self.paragraphs:
+            if not paragraph.text:
+                continue
+            lines.append(self._speaker_heading(paragraph, previous))
+            previous = paragraph
+        return "\n\n".join(lines)
 
     def timestamped(self) -> str:
         """``[mm:ss]`` (Persian digits) at each paragraph that has a timing."""
         lines: list[str] = []
+        previous: Paragraph | None = None
         for paragraph in self.paragraphs:
             if not paragraph.text:
                 continue
+            body = self._speaker_heading(paragraph, previous)
             if paragraph.start is not None:
                 minutes, seconds = divmod(int(paragraph.start), 60)
                 stamp = to_persian_digits(f"{minutes:02d}:{seconds:02d}")
-                lines.append(f"[{stamp}] {paragraph.text}")
+                lines.append(f"[{stamp}] {body}")
             else:
-                lines.append(paragraph.text)
+                lines.append(body)
+            previous = paragraph
         return "\n\n".join(lines)
 
     def llm_document(self) -> str:
         """The text passed to the note model: clean paragraphs, no timestamps."""
         return self.plain()
+
+
+
+# ---------------------------------------------------------------------------
+# Speaker turns
+# ---------------------------------------------------------------------------
+
+
+#: Minimum share of *attributed* words one raw label must hold before it is
+#: believed. Diarizers sprinkle tiny clusters on laughter, coughs and a chair
+#: scraping; treating those as separate speakers inflates the count.
+MIN_SPEAKER_SHARE = 0.04
+#: Absolute floor of attributed words for a label to count as a speaker.
+MIN_SPEAKER_WORDS = 12
+#: Upper bound on reported speakers. Beyond this the labels are noise, and a
+#: "class with 40 speakers" claim would be worse than no claim at all.
+MAX_SPEAKERS = 12
+#: Two adjacent paragraphs of the same speaker are merged when the pause
+#: between them is shorter than this (seconds); a longer pause is a real break.
+SPEAKER_MERGE_GAP_SECONDS = 2.5
+
+
+def _speaker_key(label: str) -> str:
+    """Normalise a provider label for comparison (``S1``/``s1``/``1`` agree)."""
+    text = label.strip()
+    if text[:1] in {"S", "s"} and text[1:].isdigit():
+        text = text[1:]
+    return text.lower()
+
+
+def resolve_speakers(words: list[Word]) -> tuple[list[Word], int]:
+    """Fold a provider's raw labels into a stable, believable set of voices.
+
+    Returns the words with the tiny clusters relabelled ``SPEAKER_UNKNOWN`` and
+    the number of speakers that survived. A one-voice recording resolves to one
+    speaker, which is the honest answer for a solo lecture.
+
+    The thresholds are deliberately conservative: over-reporting speakers is a
+    visible lie ("۳ نفر صحبت کردند" for a solo class), while under-reporting
+    degrades to the ordinary transcript the user would have received anyway.
+    """
+    attributed = [word for word in words if _speaker_key(word.speaker) not in _UNKNOWN_SPEAKER_LABELS]
+    if not attributed:
+        return words, 0
+
+    counts: dict[str, int] = {}
+    for word in attributed:
+        counts[_speaker_key(word.speaker)] = counts.get(_speaker_key(word.speaker), 0) + 1
+    total = len(attributed)
+    floor = max(MIN_SPEAKER_WORDS, int(total * MIN_SPEAKER_SHARE))
+    kept = {key for key, count in counts.items() if count >= floor}
+    if not kept:
+        kept = {max(counts, key=lambda key: counts[key])}
+
+    # Rank by how much each voice actually said: the first label the user sees
+    # should be the lecturer, not whoever happened to speak first for one word.
+    ranked = sorted(kept, key=lambda key: (-counts[key], key))
+    ordered = {key: index for index, key in enumerate(ranked[:MAX_SPEAKERS])}
+
+    resolved: list[Word] = []
+    for word in words:
+        key = _speaker_key(word.speaker)
+        if key in ordered:
+            resolved.append(replace(word, speaker=str(ordered[key])))
+        else:
+            resolved.append(replace(word, speaker=SPEAKER_UNKNOWN))
+    return resolved, min(len(ordered), MAX_SPEAKERS)
+
+
+def speaker_name(index: int) -> str:
+    """The label shown to the user for a stable speaker id."""
+    return f"گویندهٔ {to_persian_digits(index + 1)}"
+
+
+def speaker_name_from_label(label: str | None) -> str | None:
+    """Turn a stable id (``0``, ``1`` …) into its displayed name."""
+    if label is None or not label.isdigit():
+        return None
+    return speaker_name(int(label))
+
+
+def paragraphs_from_words_by_speaker(
+    words: list[Word],
+    *,
+    paragraph_gap: float = PARAGRAPH_GAP_SECONDS,
+    soft_cap: int = PARAGRAPH_SOFT_CAP_CHARS,
+    merge_gap: float = SPEAKER_MERGE_GAP_SECONDS,
+) -> list[Paragraph]:
+    """Group words into one paragraph per contiguous speaker turn.
+
+    A turn is closed by a change of speaker, by a pause longer than
+    ``merge_gap`` inside the same speaker (a question, an aside) or by the soft
+    cap. Timings survive, so the ``[mm:ss]`` profile still works.
+
+    Unknown attribution inside a turn inherits the surrounding speaker, because
+    a single word a diarizer could not place does not make a new voice; an
+    unknown run between two speakers stays unknown.
+    """
+    if not words:
+        return []
+
+    # Carry the previous attribution across short unknown runs.
+    carried: list[Word] = []
+    pending_unknown: list[Word] = []
+    last_known = SPEAKER_UNKNOWN
+    for word in words:
+        if word.speaker in _UNKNOWN_SPEAKER_LABELS or word.speaker == SPEAKER_UNKNOWN:
+            pending_unknown.append(word)
+            continue
+        if pending_unknown:
+            for held in pending_unknown:
+                carried.append(replace(held, speaker=last_known))
+            pending_unknown.clear()
+        carried.append(word)
+        last_known = word.speaker
+    carried.extend(pending_unknown)  # trailing unknown words stay unknown
+
+    paragraphs: list[Paragraph] = []
+    current: list[Word] = []
+    current_len = 0
+
+    def flush() -> None:
+        nonlocal current, current_len
+        if not current:
+            return
+        text = " ".join(word.text for word in current if word.text).strip()
+        if text:
+            label = current[0].speaker
+            paragraphs.append(
+                Paragraph(
+                    text=text,
+                    start=current[0].start,
+                    end=current[-1].end,
+                    speaker=None if label == SPEAKER_UNKNOWN else label,
+                )
+            )
+        current, current_len = [], 0
+
+    for index, word in enumerate(carried):
+        previous = carried[index - 1] if index else None
+        same = bool(current) and current[0].speaker == word.speaker
+        if same:
+            gap = _gap_seconds(previous, word) if previous is not None else None
+            if gap is not None and gap > merge_gap:
+                flush()
+            elif current_len >= soft_cap and _ends_sentence(current[-1].text):
+                flush()
+        elif current:
+            flush()
+        current.append(word)
+        current_len += len(word.text) + 1
+    flush()
+    return paragraphs
+
+
+#: Header the transcript carries when the class had more than one voice.
+DIARIZATION_HEADER_TEMPLATE = "🎙 تعداد گویندگان شناسایی‌شده: {count}"
 
 
 # ---------------------------------------------------------------------------
@@ -395,16 +609,34 @@ def build_document(raw: RawTranscript) -> TranscriptDocument:
     The timed-words path is preferred; the plain-text path is the fallback for
     engines that return no timings. Every paragraph text passes through the
     fidelity-gated typographic cleanup.
+
+    When the engine diarized, paragraphs follow speaker turns instead of pauses,
+    and the resolved speaker count travels with the document. A diarized run
+    that resolves to a single voice is *not* labelled: headings on every
+    paragraph of a solo lecture are noise, so the document keeps pause-based
+    paragraphs and simply records that only one speaker was found.
     """
     if raw.words:
-        paragraphs = paragraphs_from_words(raw.words)
+        words = raw.words
+        speakers = 0
+        if any(word.speaker for word in words):
+            words, speakers = resolve_speakers(words)
+        if speakers > 1:
+            paragraphs = paragraphs_from_words_by_speaker(words)
+        else:
+            paragraphs = paragraphs_from_words(words)
         cleaned: list[Paragraph] = []
         for paragraph in paragraphs:
             text = guarded(paragraph.text, clean_typography, name="typography")
             if text:
                 cleaned.append(replace(paragraph, text=text))
         if cleaned:
-            return TranscriptDocument(tuple(cleaned), raw.confidence)
+            return TranscriptDocument(
+                tuple(cleaned),
+                raw.confidence,
+                speakers=max(speakers, raw.speakers, 0),
+                diarization_attempted=bool(raw.speakers),
+            )
         logger.warning("timed-words paragraphing produced nothing; falling back to text")
 
     text = guarded(raw.text, clean_typography, name="typography")

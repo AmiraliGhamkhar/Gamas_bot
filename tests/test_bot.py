@@ -33,6 +33,7 @@ from gamas_bot.presentations import PreparedAudio, PresentationContent, SlideTex
 from gamas_bot.progress import JobProgress
 from gamas_bot.stt import STTError
 from gamas_bot.telegram_text import TELEGRAM_TEXT_LIMIT
+from gamas_bot import texts
 from gamas_bot.transcript import RawTranscript, Word
 from tests.support import (
     build_deck,
@@ -80,6 +81,9 @@ class BotPipelineTestCase(unittest.IsolatedAsyncioTestCase):
         await self.bot.shutdown()
         await self.db.close()
         self._tmp.cleanup()
+
+    async def fetch_transcript(self, submission: int, *, user_id: int = USER_ID) -> str:
+        return await fetch_transcript_text(self.bot, submission, user_id=user_id)
 
     def wire(self, event: FakeJobEvent) -> FakeJobEvent:
         """Point the bot at the event's signature-enforcing Telegram client.
@@ -153,15 +157,33 @@ class BotPipelineTestCase(unittest.IsolatedAsyncioTestCase):
         return RawTranscript(words=words, text="سلام دوستان . امروز", engine="speechmatics")
 
 
+async def fetch_transcript_text(bot, submission: int, *, user_id: int = USER_ID) -> str:
+    """Press the transcript button and return what the bot sent back.
+
+    The transcript is no longer pushed, so every test that asserts on the
+    delivered text goes through the same path a user does: the results screen's
+    ``art:GMS-<id>:transcript`` callback.
+    """
+    client = bot.client
+    before = len(client.texts)
+    event = FakeCallbackEvent(
+        client, data=f"art:GMS-{submission}:transcript".encode("ascii")
+    )
+    await bot._fetch_artifact(event, user_id, event.data.decode("ascii"))
+    return "\n".join(str(record["text"]) for record in client.texts[before:])
+
+
 class HappyPathTests(BotPipelineTestCase):
     async def test_raw_only_delivery_and_ledger_settlement_without_note_provider(self):
         event = self.media_event()
         submission = await self.run_media_job(event, transcribe=self._raw())
 
-        raw_text = event.file_bytes(".txt").decode("utf-8")
+        # Nothing is pushed: the job ends with a results message whose buttons
+        # fetch the transcript and the key points on demand.
+        self.assertFalse(event.file_paths)
+        self.assertTrue(any("پردازش تمام شد" in r for r in event.replies))
+        raw_text = await self.fetch_transcript(submission)
         self.assertIn("سلام دوستان. امروز", raw_text)
-        self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
-        self.assertTrue(any("پیش‌نمایش" in r for r in event.replies))
 
         row = await self.db.submission(submission)
         assert row is not None
@@ -170,8 +192,9 @@ class HappyPathTests(BotPipelineTestCase):
         assert transcript is not None
         self.assertEqual(transcript["engine"], "speechmatics")
         self.assertIn("سلام دوستان. امروز", transcript["text"])
-        self.assertEqual(await self.db.library_count(USER_ID), 1)
-        self.assertEqual((await self.db.library_list(USER_ID))[0]["kind"], "transcript")
+        # Nothing was filed in the library: the transcript is not a delivered
+        # artifact any more, so there is no second copy of it to prune later.
+        self.assertEqual(await self.db.library_count(USER_ID), 0)
         # The measured duration (100s) is what got charged.
         self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
 
@@ -278,6 +301,47 @@ class HappyPathTests(BotPipelineTestCase):
     # ------------------------------------------------------------- helpers
 
 
+class PreprocessingWiringTests(BotPipelineTestCase):
+    """The pipeline must ask the worker to clean the audio it is about to send."""
+
+    async def test_a_video_job_extracts_with_preprocessing(self):
+        seen: dict[str, object] = {}
+
+        async def extract(
+            source: Path, workdir: Path, settings, **_kwargs: object
+        ) -> Path:
+            seen["preprocess"] = settings.stt_preprocess
+            target = Path(workdir) / "audio.wav"
+            target.write_bytes(Path(source).read_bytes())
+            return target
+
+        event = self.wire(FakeJobEvent(source=Path(self._tmp.name) / "clip.mp4"))
+        (Path(self._tmp.name) / "clip.mp4").write_bytes(wav_bytes(duration=0.2))
+        await self.db.add_credit(USER_ID, 3600, note="test")
+        submission = await self.db.create_submission(USER_ID, "video", "clip.mp4")
+        progress = await JobProgress.create(event, submission_id=submission)
+        job = Job(
+            submission_id=submission,
+            user_id=USER_ID,
+            kind="video",
+            filename="clip.mp4",
+            message=event.message,
+            is_admin=False,
+            duration_hint=100.0,
+            meta={"progress": progress},
+        )
+        with mock.patch(
+            "gamas_bot.bot.probe_media",
+            new=mock.AsyncMock(
+                return_value=MediaInfo(duration=100.0, has_audio=True, audio_codec="aac")
+            ),
+        ), mock.patch("gamas_bot.bot.extract_audio_track", new=extract), mock.patch(
+            "gamas_bot.bot.transcribe", new=mock.AsyncMock(return_value=self._raw())
+        ):
+            await self.bot._run_job(job)
+        self.assertIs(seen.get("preprocess"), True)
+
+
 class RealSttStackTests(BotPipelineTestCase):
     """The job pipeline with the real ``stt.transcribe`` driver (fake HTTP)."""
 
@@ -308,7 +372,7 @@ class RealSttStackTests(BotPipelineTestCase):
         ):
             await self.bot._run_job(job)
 
-        raw_text = event.file_bytes(".txt").decode("utf-8")
+        raw_text = await self.fetch_transcript(submission)
         self.assertIn("سلام دوستان. امروز درس شبکه است.", raw_text)
         self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
         row = await self.db.submission(submission)
@@ -442,16 +506,11 @@ class FileDeliveryTests(BotPipelineTestCase):
         ):
             submission = await self.run_media_job(event, transcribe=self._raw())
 
-        # ``Message.reply`` has no ``caption`` parameter — only
-        # ``TelegramClient.send_file`` accepts a captioned document. The double
-        # in tests/support.py binds every call against the real signature, so a
-        # regression to the old call fails here instead of in production.
-        raw = event.delivery(".txt")
-        self.assertTrue(raw["force_document"])
-        self.assertEqual(raw["entity"], event.message.chat_id)
-        self.assertEqual(raw["reply_to"], event.message.id)
-        self.assertIn("متن خام", raw["caption"])
-
+        # Only the booklet is a file. ``Message.reply`` has no ``caption``
+        # parameter — only ``TelegramClient.send_file`` accepts a captioned
+        # document — and the double binds every call against the real signature,
+        # so a regression to the old call fails here, not in production.
+        self.assertEqual([path.split(".")[-1] for _c, path in event.files], ["docx"])
         docx = event.delivery(".docx")
         self.assertTrue(docx["force_document"])
         self.assertEqual(docx["reply_to"], event.message.id)
@@ -473,7 +532,13 @@ class FileDeliveryTests(BotPipelineTestCase):
             await event.message.reply(file="x.txt", caption="hi", force_document=True)
         self.assertIn("caption", str(caught.exception))
 
-    async def test_file_failure_falls_back_to_text_and_still_settles(self):
+    async def test_file_failure_still_settles_and_leaves_the_transcript_fetchable(self):
+        """A failed booklet upload must not cost the user their transcript.
+
+        Nothing is pushed any more, so the delivery contract is: the transcript
+        stays persisted and fetchable, and the charge happens exactly once for
+        the work that was done.
+        """
         event = self.media_event()
         event.client.fail_file_delivery = True
         submission = await self.run_media_job(event, transcribe=self._raw())
@@ -481,37 +546,45 @@ class FileDeliveryTests(BotPipelineTestCase):
         row = await self.db.submission(submission)
         assert row is not None
         self.assertEqual(row.status, "done")
-        # No file was delivered, but the transcript reached the chat as text.
+        # No file could be delivered, and no unusable duplicate was pushed.
         self.assertEqual(event.files, [])
-        fallback = [text for text in event.replies if "سلام دوستان" in text]
-        self.assertTrue(fallback, event.replies)
-        # Every fallback page respects Telegram's real message limit, measured
-        # the way Telegram counts an HTML message (tags excluded, entities
-        # decoded, astral characters twice).
-        for page in fallback:
+        raw_text = await self.fetch_transcript(submission)
+        self.assertIn("سلام دوستان", raw_text)
+        # Every page respects Telegram's real message limit, measured the way
+        # Telegram counts an HTML message (tags excluded, entities decoded,
+        # astral characters twice).
+        for page in event.replies:
             visible = html.unescape(re.sub(r"<[^>]+>", "", page))
             self.assertLessEqual(len(visible.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT)
         # The work was delivered, so the measured duration was charged once.
         self.assertEqual(await self.debit_count(USER_ID), 1)
         self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
 
-    async def test_total_delivery_failure_refunds_and_keeps_the_transcript(self):
+    async def test_unreachable_chat_still_charges_once_and_keeps_the_transcript(self):
+        """A chat that refuses messages cannot make the work disappear.
+
+        Settlement no longer depends on a push succeeding: the transcript is
+        produced and stored (that is what the user paid for), and every artifact
+        is fetched later from that row for free. So an unreachable chat fails
+        nothing and refunds nothing — it only means the results message has to be
+        read when the chat works again.
+        """
         event = self.media_event()
-        event.client.fail_file_delivery = True
 
         async def refuse(*_args, **_kwargs):
             raise RuntimeError("Telegram is unavailable (simulated)")
 
         event.client.send_message = refuse
+        event.client.send_file = refuse
         submission = await self.run_media_job(event, transcribe=self._raw())
 
         row = await self.db.submission(submission)
         assert row is not None
-        self.assertEqual(row.status, "failed")
-        # Nothing was delivered, so nothing is charged.
-        self.assertEqual(await self.db.available_seconds(USER_ID), 3600)
-        self.assertEqual(await self.debit_count(USER_ID), 0)
-        # The finished transcription is not lost with the delivery attempt.
+        self.assertEqual(row.status, "done")
+        self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
+        self.assertEqual(await self.debit_count(USER_ID), 1)
+        # The finished transcription survives the failed delivery attempt and is
+        # still what the transcript button will render.
         transcript = await self.db.transcription(submission)
         assert transcript is not None
         self.assertIn("سلام دوستان. امروز", transcript["text"])
@@ -558,9 +631,17 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
         ):
             await self.bot._run_job(job)
 
-        # The raw transcript went out first, the structured booklet after it.
-        self.assertTrue(event.file_bytes(".txt"))
+        # The structured booklet is the only pushed file; the transcript is
+        # fetched through its button.
+        self.assertFalse(any(path.endswith(".txt") for path in event.file_paths))
         self.assertIn("جزوهٔ آزمون", docx_text(event.file_bytes(".docx")))
+        # The transcript button replays the recognised speech, and the key-point
+        # button reads the persisted notes — no model call for either.
+        self.assertIn(
+            "سلام دوستان. امروز درس شبکه است.", await self.fetch_transcript(submission)
+        )
+        keypoints = await self.bot.db.transcription(submission)
+        self.assertIn("نکتهٔ کلیدی کل", str((keypoints or {}).get("notes_json")))
         self.assertTrue(any("/chat/completions" in call["url"] for call in session.llm_calls))
 
         row = await self.db.submission(submission)
@@ -609,7 +690,7 @@ class PresentationNotesDeliveryTests(BotPipelineTestCase):
         with mock.patch("gamas_bot.bot.load_presentation", new=load_slides):
             await self.bot._run_job(job)
 
-        raw_text = event.file_bytes(".txt").decode("utf-8")
+        raw_text = await self.fetch_transcript(submission)
         self.assertIn("موضوع ارائه", raw_text)
         self.assertIn("توضیح تکمیلی گوینده", raw_text)
         self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
@@ -794,7 +875,14 @@ def _button_data(button) -> bytes | None:
     return data
 
 
+def reply_labels(markup) -> list[str]:
+    """Labels of a Telethon reply keyboard, flattened row by row."""
+    return [button.text for row in (getattr(markup, "rows", ()) or ()) for button in row.buttons]
+
+
 def menu_payloads(menu) -> set[bytes]:
+    if isinstance(menu, tuple):
+        return set(menu[0] or ())
     return {
         data
         for row in (menu or [])
@@ -819,8 +907,8 @@ class UnlimitedUserBotTests(BotPipelineTestCase):
         submission = await self.run_media_job(
             event, duration=7200.0, credit=0, transcribe=self._raw()
         )
-        self.assertTrue(event.file_bytes(".txt"))
-        self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
+        self.assertFalse(event.file_paths)
+        self.assertIn("سلام دوستان", await self.fetch_transcript(submission))
         row = await self.db.submission(submission)
         assert row is not None
         self.assertEqual(row.status, "done")
@@ -891,6 +979,10 @@ class FakeMessageEvent:
 
     async def reply(self, text: str = "", **kwargs):
         return await self.message.reply(text, **kwargs)
+
+    async def respond(self, text: str = "", **kwargs):
+        """Screens reached from a message answer with ``respond``, like Telethon."""
+        return await self.message.respond(text, **kwargs)
 
 
 class UnlimitedCommandTests(unittest.IsolatedAsyncioTestCase):
@@ -1820,21 +1912,36 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self._tmp.cleanup()
 
-    async def test_start_and_every_menu_use_the_five_button_layout(self):
+    async def test_start_attaches_the_bottom_keyboard_and_the_inline_menu(self):
+        """/start is the one screen that carries the persistent reply keyboard.
+
+        A reply keyboard can only be attached by sending a message, so it rides
+        on the welcome screen and then stays put; every later menu is edited in
+        place and keeps the same buttons. That is what makes the menu a real
+        navigation bar instead of a screen you have to scroll back to.
+        """
         start = FakeMessageEvent(501, "/start")
         await self.bot._handle_message(start)
         self.assertTrue(start.replies[0].startswith(
             "🎓 به گاماس خوش آمدید\n\n"
             "📤 فایل درس را همین‌جا بفرستید:"
         ))
-        start_payloads = menu_payloads(start.client.texts[0].get("buttons"))
+        keyboard = start.client.texts[0].get("buttons")
         self.assertEqual(
-            start_payloads,
-            {
-                b"library", b"wallet", b"support", b"help", b"board",
-                b"office:start", b"ref:home",
-            },
+            reply_labels(keyboard),
+            [
+                "🎓 شروع", "📦 خروجی‌های من",
+                "📚 کتابخانه من", "🛒 افزایش اعتبار",
+                "🗂 آفیس رایگان", "🏆 لیدربورد",
+                "🎧 پشتیبانی", "ℹ️ راهنما",
+                "🤝 دعوت دوستان",
+            ],
         )
+        # Nothing in the bottom keyboard is inline glass: every button is a
+        # plain text button that sends its own label.
+        for row in keyboard.rows:
+            for button in row.buttons:
+                self.assertEqual(type(button.type).__name__, "ButtonTypeDefault")
 
         menu = FakeCallbackEvent(501, b"menu:main")
         await self.bot._handle_callback(menu)
@@ -1893,20 +2000,20 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._run_job(job)
 
         generate.assert_awaited_once()
-        self.assertTrue(event.file_bytes(".txt"))
+        self.assertFalse(any(path.endswith(".txt") for path in event.file_paths))
         self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
         captions = [caption for caption, _path in event.files]
-        self.assertIn("متن خام", captions[0])
+        self.assertEqual(len(captions), 1)
         # The booklet caption carries the booklet's own 2–4-word title (the
         # library row uses the same name), not a generic «جزوهٔ Word» label.
-        self.assertIn("جزوهٔ خودکار", captions[1])
-        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", captions[1])
+        self.assertIn("جزوهٔ خودکار", captions[0])
+        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", captions[0])
         # «عنوان جزوه» is the same 2–4-word name by default: the cover of the
         # Word file carries it, so the booklet a user opens is the one the list
         # named.
         self.assertIn("جزوهٔ خودکار", docx_text(event.file_bytes(".docx")))
         items = await self.db.library_list(user_id, limit=6)
-        self.assertEqual([item["kind"] for item in items], ["booklet", "transcript"])
+        self.assertEqual([item["kind"] for item in items], ["booklet"])
         row = await self.db.submission(job.submission_id)
         self.assertIsNotNone(row)
         self.assertEqual(row.status, "done")
@@ -1945,11 +2052,158 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._run_job(job)
 
         generate.assert_not_awaited()
-        self.assertTrue(event.file_bytes(".txt"))
-        self.assertFalse(any(path.endswith(".docx") for _caption, path in event.files))
-        self.assertEqual(await self.db.library_count(user_id), 1)
-        self.assertEqual((await self.db.library_list(user_id))[0]["kind"], "transcript")
+        self.assertFalse(event.file_paths)
+        self.assertIn(
+            "متن گفتار",
+            await fetch_transcript_text(
+                self.bot, job.submission_id, user_id=user_id
+            ),
+        )
+        self.assertEqual(await self.db.library_count(user_id), 0)
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ArtifactDeliveryTests(BotPipelineTestCase):
+    """The results screen: nothing pushed, everything fetchable, infinitely."""
+
+    async def _finished_job(self, notes_json: str | None = None) -> tuple[FakeJobEvent, int]:
+        event = self.media_event()
+        submission = await self.run_media_job(event, transcribe=self._raw())
+        if notes_json is not None:
+            await self.db.save_transcription(
+                submission, engine="speechmatics", text="متن", notes_json=notes_json
+            )
+        return event, submission
+
+    async def test_the_job_ends_with_one_message_and_three_targets(self):
+        event, _submission = await self._finished_job()
+        results = [text for text in event.replies if "پردازش تمام شد" in text]
+        self.assertEqual(len(results), 1)
+        self.assertIn(texts.DELIVERY_ROW_TRANSCRIPT, results[0])
+        # No note provider configured in this fixture: no booklet row, and no
+        # key-point row that would open an empty message.
+        self.assertNotIn(texts.DELIVERY_ROW_BOOKLET, results[0])
+        self.assertNotIn(texts.DELIVERY_ROW_KEYPOINTS, results[0])
+
+    async def test_the_transcript_can_be_fetched_again_and_is_identical(self):
+        event, submission = await self._finished_job()
+        first = await self.fetch_transcript(submission)
+        second = await self.fetch_transcript(submission)
+        self.assertTrue(first)
+        self.assertEqual(first, second)
+        # Two fetches, one charge: the button costs nothing.
+        rows = await self.db.db.execute_fetchall(
+            "SELECT COUNT(*) FROM ledger WHERE user_id = ? AND kind = 'debit'", (USER_ID,)
+        )
+        self.assertEqual(int(rows[0][0]), 1)
+
+    async def test_key_points_come_from_the_stored_notes(self):
+        import json as _json
+
+        _event, submission = await self._finished_job(
+            notes_json=_json.dumps({"key_points": ["نکتهٔ یک", "نکتهٔ دو"]})
+        )
+        client = self.bot.client
+        before = len(client.texts)
+        await self.bot._fetch_artifact(
+            FakeCallbackEvent(self.bot.client, data=f"art:GMS-{submission}:keypoints".encode("ascii")),
+            USER_ID,
+            f"art:GMS-{submission}:keypoints",
+        )
+        sent = "\\n".join(str(record["text"]) for record in client.texts[before:])
+        self.assertIn("نکتهٔ یک", sent)
+        self.assertIn("نکتهٔ دو", sent)
+
+    async def test_an_unknown_reference_reports_that_nothing_exists(self):
+        event = FakeCallbackEvent(self.bot.client, data=b"art:GMS-999:transcript")
+        await self.bot._fetch_artifact(event, USER_ID, "art:GMS-999:transcript")
+        self.assertTrue(event.answers)
+        self.assertEqual(event.answers[-1][0], texts.DELIVERY_ARTIFACT_GONE)
+
+    async def test_another_users_artifact_is_never_served(self):
+        _event, submission = await self._finished_job()
+        stranger = FakeCallbackEvent(999_001, b"")
+        await self.bot._fetch_booklet(stranger, 999_001, submission)
+        self.assertEqual(stranger.answers[-1][0], texts.DELIVERY_ARTIFACT_GONE)
+
+
+class ResultsHubTests(BotPipelineTestCase):
+    def wire_bot(self, event):
+        self.bot.client = event.client
+        return event
+
+    async def test_the_hub_lists_previous_jobs(self):
+        event = self.media_event()
+        submission = await self.run_media_job(event, transcribe=self._raw())
+        hub = FakeMessageEvent(USER_ID, texts.BTN_MY_RESULTS)
+        self.bot.client = hub.client
+        await self.bot._handle_message(hub)
+        self.assertTrue(hub.replies)
+        # The reference lives on the row's button, not in the prose.
+        labels = [
+            button.text
+            for row in hub.client.texts[0]["buttons"]
+            for button in row
+        ]
+        self.assertTrue(any(f"GMS-{submission}" in label for label in labels), labels)
+
+    async def test_an_empty_hub_says_so(self):
+        hub = FakeMessageEvent(USER_ID, texts.BTN_MY_RESULTS)
+        self.bot.client = hub.client
+        await self.bot._handle_message(hub)
+        self.assertEqual(hub.replies[0], texts.RESULTS_HUB_EMPTY)
+
+    async def test_a_hub_row_opens_the_same_buttons(self):
+        event = self.media_event()
+        submission = await self.run_media_job(event, transcribe=self._raw())
+        callback = FakeCallbackEvent(self.bot.client, data=f"res:{submission}".encode("ascii"))
+        await self.bot._show_result_set(callback, USER_ID, submission)
+        text, buttons = callback.edits[-1]
+        self.assertIn(f"GMS-{submission}", text)
+        self.assertIn(
+            f"art:GMS-{submission}:transcript".encode("ascii"), menu_payloads(buttons)
+        )
+
+    async def test_a_stranger_cannot_open_someone_elses_result_set(self):
+        event = self.media_event()
+        submission = await self.run_media_job(event, transcribe=self._raw())
+        callback = FakeCallbackEvent(999_002, b"")
+        await self.bot._show_result_set(callback, 999_002, submission)
+        self.assertEqual(callback.answers[-1][0], texts.DELIVERY_ARTIFACT_GONE)
+
+
+class ReplyKeyboardRoutingTests(BotPipelineTestCase):
+    """Every bottom-keyboard label must lead somewhere, exactly once."""
+
+    async def test_each_label_opens_its_screen(self):
+        expectations = {
+            texts.BTN_START_HERE: "منوی اصلی",
+            texts.BTN_HELP: "راهنمای گاماس",
+            texts.BTN_UPGRADE: "بسته را انتخاب کنید",
+            texts.BTN_LEADERBOARD: "لیدربورد",
+        }
+        for label, marker in expectations.items():
+            event = FakeMessageEvent(USER_ID, label)
+            self.bot.client = event.client
+            await self.bot._handle_message(event)
+            self.assertTrue(event.replies, label)
+            self.assertTrue(
+                any(marker in reply for reply in event.replies),
+                f"{label} → {event.replies[:1]}",
+            )
+
+    async def test_a_menu_label_is_not_treated_as_a_file_caption(self):
+        event = FakeMessageEvent(USER_ID, texts.BTN_MY_RESULTS)
+        self.bot.client = event.client
+        await self.bot._handle_message(event)
+        self.assertEqual(len(event.replies), 1)
+        self.assertNotIn("همین‌جا فایل", event.replies[0])
+
+    async def test_admin_label_only_works_for_admins(self):
+        event = FakeMessageEvent(USER_ID, texts.BTN_ADMIN)
+        self.bot.client = event.client
+        await self.bot._handle_message(event)
+        self.assertFalse(any("پنل مدیریت" in reply for reply in event.replies))

@@ -367,7 +367,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.available_seconds(USER), 60 * 3600)
 
     # ------------------------------------------------------------ main menu
-    async def test_upload_without_mode_button_runs_full_pipeline_and_saves_both_artifacts(self):
+    async def test_upload_without_mode_button_runs_the_pipeline_and_offers_every_artifact(self):
         await self.say(USER, "/start")
         source = self.root / "lecture.ogg"
         source.write_bytes(wav_bytes(0.2))
@@ -397,13 +397,18 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
             await self.bot._run_job(job)
 
         generate_notes.assert_awaited_once()
-        self.assertTrue(event.file_bytes(".txt"))
         self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
-        self.assertIn("متن خام", event.files[0][0])
-        self.assertIn("جزوهٔ خودکار", event.files[1][0])
-        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", event.files[1][0])
+        # Only the booklet is pushed; the transcript and the key points are one
+        # tap away on the results screen.
+        self.assertEqual(len(event.files), 1)
+        self.assertIn("جزوهٔ خودکار", event.files[0][0])
+        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", event.files[0][0])
+        stored = await self.db.transcription(job.submission_id)
+        self.assertIn("متن کامل جلسه", str(stored["text"]))
         items = await self.db.library_list(USER, limit=6)
-        self.assertEqual([item["kind"] for item in items], ["booklet", "transcript"])
+        self.assertEqual([item["kind"] for item in items], ["booklet"])
+        results = [reply for reply in event.replies if "پردازش تمام شد" in reply]
+        self.assertEqual(len(results), 1)
         self.assertEqual((await self.db.submission(job.submission_id)).status, "done")
 
     async def test_main_menu_matches_the_mission_buttons(self):

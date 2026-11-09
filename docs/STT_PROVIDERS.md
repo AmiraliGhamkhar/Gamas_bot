@@ -20,6 +20,44 @@ Keyless routes are skipped. Override endpoints with `SPEECHMATICS_BASE_URL`,
 `STT_OPENAI_MAX_UPLOAD_BYTES` (25000000 by default). Persian Deepgram needs
 Nova-3, not Nova-2.
 
+## Audio preprocessing (mandatory by default)
+
+Every upload is cleaned before it is sent to an engine: `STT_PREPROCESS=true`
+(the default) makes the media worker run
+
+| Stage | Why |
+| --- | --- |
+| `highpass=f=70:poles=2` | room rumble, desk thumps, air-conditioning below speech |
+| `afftdn=nr=12:nf=-35:tn=1` | steady projector/fan hiss and tape noise |
+| `dynaudnorm=f=250:g=11:p=0.85:m=4` | the lecturer near the mic and a student at the back |
+| `alimiter=limit=0.95:level=false` | brick-wall guard, so normalisation cannot clip |
+
+The chain runs inside the extraction call, after the mono/16 kHz resample, and is
+**sample-exact**: the output has exactly as many samples as the input, so the
+duration the user is charged for is the duration the engine heard. A stage the
+local FFmpeg build does not provide is skipped (and reported) rather than failing
+the job. Set `STT_PREPROCESS=false` only to compare raw recognition quality.
+
+## Speaker diarization
+
+`STT_DIARIZE=true` (default) asks the engine who spoke and the transcript is
+split by conversation turns:
+
+| Route | Request | Reading |
+| --- | --- | --- |
+| `speechmatics` | `transcription_config.diarization="speaker"` plus `speaker_diarization_config.speaker_sensitivity` | per-word `speaker` (`S1`, `S2`, `UU`) |
+| `deepgram` | `diarize=true` | per-word `speaker` index |
+| `openai_compatible` | pass-through | per-segment `speaker`, when the gateway provides one |
+
+Labels are counted per file and never stored as an identity: providers renumber
+speakers between calls, so `S1` in one lecture is not `S1` in the next.
+
+The count shown to the user is deliberately conservative. A raw label must hold
+at least 4% of attributed words (and 12 words) to be reported, the maximum is 12
+speakers, and unknown (`UU`) words inherit the surrounding turn. A run that
+resolves to a single voice is delivered **without** speaker labels — a heading on
+every paragraph of a solo lecture is noise — and reported as «یک گوینده».
+
 ## Routing and limits
 
 - Use the first eligible route with capacity. Full primary slots overflow to

@@ -554,6 +554,14 @@ class Settings:
     speechmatics_api_key: str
     speechmatics_base_url: str
     speechmatics_model: str
+    #: Ask the engine to label who spoke. Engines that cannot diarize ignore
+    #: it, and a run that resolves to one voice is delivered without labels.
+    stt_diarize: bool
+    #: Clean the extracted audio before it is uploaded to the STT engine.
+    stt_preprocess: bool
+    #: Longest pause that still counts as one continuous turn of speech when
+    #: paragraphs are built from speaker changes.
+    stt_speaker_sensitivity: float
     deepgram_api_key: str
     deepgram_base_url: str
     deepgram_model: str
@@ -1310,6 +1318,11 @@ def from_env(env_file: str | None = None) -> Settings:
             "SPEECHMATICS_BASE_URL", "https://asr.api.speechmatics.com/v2"
         ).rstrip("/"),
         speechmatics_model=_env("SPEECHMATICS_MODEL", "enhanced"),
+        stt_diarize=_env_bool("STT_DIARIZE", True),
+        stt_preprocess=_env_bool("STT_PREPROCESS", True),
+        stt_speaker_sensitivity=_env_float(
+            "STT_SPEAKER_SENSITIVITY", 0.5, minimum=0.0, maximum=1.0
+        ),
         deepgram_api_key=_env("DEEPGRAM_API_KEY"),
         deepgram_base_url=_env("DEEPGRAM_BASE_URL", "https://api.deepgram.com/v1").rstrip("/"),
         deepgram_model=_env("DEEPGRAM_MODEL", DEFAULT_DEEPGRAM_MODEL),

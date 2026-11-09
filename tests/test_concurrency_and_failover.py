@@ -680,13 +680,19 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
                 await asyncio.sleep(0.02)
 
         self.assertGreaterEqual(peak_concurrent, 2)
-        # Verify zero cross-talk: every user received ONLY their own transcript!
+        # Verify zero cross-talk: every user can fetch ONLY their own transcript.
         for uid in users:
-            delivered_txt = events[uid].file_bytes(".txt").decode("utf-8")
-            self.assertIn(f"محتوای_اختصاصی_{uid}", delivered_txt)
+            rows = await self.db.db.execute_fetchall(
+                "SELECT text FROM transcriptions t JOIN submissions s "
+                "ON s.submission_id = t.submission_id WHERE s.user_id = ?",
+                (uid,),
+            )
+            self.assertEqual(len(rows), 1, uid)
+            stored_text = str(rows[0][0])
+            self.assertIn(f"محتوای_اختصاصی_{uid}", stored_text)
             for other in users:
                 if other != uid:
-                    self.assertNotIn(f"محتوای_اختصاصی_{other}", delivered_txt)
+                    self.assertNotIn(f"محتوای_اختصاصی_{other}", stored_text)
         # Verify temp dir has zero leftover submission-* directories!
         leftovers = list(self.settings.temp_dir.glob("submission-*"))
         self.assertEqual(leftovers, [])
