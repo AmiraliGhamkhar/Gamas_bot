@@ -1,0 +1,89 @@
+"""WSGI entry point for the Mini App (cPanel Passenger / Cloudflare proxy).
+
+Two deployment routes are supported, and both use this file:
+
+* **cPanel Passenger** — add this file as the application's WSGI entry point
+  (``mini_app_wsgi.py`` / ``application``) in "Setup Python App". The bot keeps
+  running from cron (``scripts/ensure_running.py``); this worker only serves the
+  Mini App.
+* **Cloudflare** — run the same app behind a WSGI server (gunicorn, uWSGI, or
+  ``wsgiref`` for a smoke test) on a port Cloudflare proxies to. Nothing here
+  needs websockets, so a proxied HTTPS hostname is enough.
+
+Configuration comes from the same ``.env`` the bot uses; only ``TELEGRAM_BOT_TOKEN``
+and ``DB_PATH`` are required. ``MINI_APP_STATIC_DIR`` points at the built bundle
+(``mini_app/`` by default) and ``MINI_APP_AUTH_MAX_AGE_SECONDS`` tunes the
+``initData`` freshness window.
+
+The bot token is read per request, not at import time, because Passenger imports
+the module before it has loaded ``.env``.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from gamas_bot.config import from_env  # noqa: E402
+from gamas_bot.mini_app import create_app  # noqa: E402
+from gamas_bot.mini_app_store import MiniAppStore  # noqa: E402
+
+logger = logging.getLogger("gamas_bot.mini_app")
+
+_cached_settings = None
+
+
+def _settings():
+    """Load the environment once, but tolerate a slow or absent ``.env``."""
+    global _cached_settings
+    if _cached_settings is None:
+        _cached_settings = from_env()
+    return _cached_settings
+
+
+def _data():
+    settings = _settings()
+    return MiniAppStore(settings.db_path)
+
+
+def _token() -> str:
+    return _settings().bot_token
+
+
+def _static_dir() -> str:
+    """Where the built bundle lives (``MINI_APP_STATIC_DIR``, default ``./mini_app``)."""
+    configured = os.environ.get("MINI_APP_STATIC_DIR", "").strip()
+    return str(Path(configured).resolve()) if configured else str(ROOT / "mini_app")
+
+
+def _health():
+    settings = _settings()
+    return {
+        "service": "gamas-mini-app",
+        "ok": True,
+        "database": Path(settings.db_path).exists(),
+    }
+
+
+def _max_age() -> int:
+    raw = os.environ.get("MINI_APP_AUTH_MAX_AGE_SECONDS", "300").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 300
+    return max(30, min(3600, value))
+
+
+application = create_app(
+    data=_data,
+    bot_token=_token,
+    max_age_seconds=_max_age(),
+    health=_health,
+    static_dir=_static_dir(),
+)

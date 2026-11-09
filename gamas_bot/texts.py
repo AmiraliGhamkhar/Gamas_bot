@@ -22,7 +22,7 @@ Rules followed here:
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Final
+from typing import Any, Final
 
 # --------------------------------------------------------------------- buttons
 BTN_LIBRARY: Final = "📚 کتابخانه من"
@@ -48,6 +48,8 @@ BTN_SHOW_RESULTS: Final = "📦 دریافت خروجی‌ها"
 BTN_MY_RESULTS: Final = "📦 خروجی‌های من"
 BTN_START_HERE: Final = "🎓 شروع"
 BTN_UPGRADE: Final = "🛒 افزایش اعتبار"
+BTN_OPEN_APP: Final = "🗂 باشگاه مطالعه (رنک‌بندی و ویرایش جزوه)"
+BTN_EDIT_IN_APP: Final = "✏️ ویرایش جزوه در باشگاه مطالعه"
 BTN_QUIZ_FROM_BOOKLET: Final = "🧪 آزمون از این جزوه"
 BTN_CARDS_FROM_BOOKLET: Final = "🃏 فلش‌کارت از این جزوه"
 
@@ -94,6 +96,22 @@ def main_screen(
         )
     lines.extend(["", f"💳 اعتبار باقی‌مانده: {balance}", "", "از دکمه‌های زیر شروع کنید."])
     return "\n".join(lines)
+
+
+def mini_app_button(label: str, url: str) -> Any:
+    """A Telegram button that opens a Mini App (WebView) instead of a URL.
+
+    ``InlineButtonTypeWebView`` is what makes Telegram treat the target as a Mini
+    App: it opens inside the client, exposes ``Telegram.WebApp.initData`` to the
+    page and lets the page close itself. A plain URL button would open a browser
+    tab with no signed session, which the app correctly refuses.
+    """
+    from telethon.tl.types import (
+        InlineButtonTypeWebView,
+        KeyboardInlineButton,
+    )
+
+    return KeyboardInlineButton(text=label, type=InlineButtonTypeWebView(url))
 
 
 # ---------------------------------------------------------------------------

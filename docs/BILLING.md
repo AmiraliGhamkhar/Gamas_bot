@@ -3,18 +3,68 @@
 Credit is an append-only ledger of **integer seconds**. Never edit ledger history
 to repair balances; use audited credit operations.
 
+## The credit unit («اعتبار»)
+
+Students buy in whole **credit** packages; the ledger keeps seconds. The exchange
+rate is fixed in `gamas_bot/billing.py` and is the single definition used by every
+screen, plan and receipt:
+
+| | Value |
+| --- | --- |
+| Package | **100 000 اعتبار** |
+| Package duration | **3 ساعت** = 10 800 seconds |
+| Package price | **60 000 تومان** → 20 000 T/hour |
+| Credits per hour | 33 334 (rounded up) |
+| Credits per second | ≈ 9.26 |
+
+`seconds_to_credits()` rounds **up** and `credits_to_seconds()` rounds **down**, so
+a balance shown to the user is never overstated.
+
+| Plan code | Duration | Credit | Toman |
+| --- | --- | --- | --- |
+| `free_1h` | 1 h | 33 334 (grant) | 0 |
+| `paid_3h_30d` | 3 h | 100 000 | 60 000 |
+| `paid_9h_30d` | 9 h | 300 000 | 180 000 |
+| `paid_12h_30d` | 12 h | 400 000 | 240 000 |
+| `paid_24h_30d` | 24 h | 800 000 | 480 000 |
+| `paid_36h_30d` | 36 h | 1 200 000 | 720 000 |
+| `paid_60h_30d` | 60 h | 2 000 000 | 1 200 000 |
+
+Every paid plan is a whole number of packages with 30-day validity, so the price
+per hour is identical everywhere. Plans are configured by `PLAN_*` in `.env`
+(`config.PLAN_ENV_FIELDS`); a non-positive override falls back to the default and
+`config.check()` reports it.
+
 ## Transcription
 
 - Reserve measured source-audio duration before STT; refuse unmeasurable duration.
   An intake estimate is not permission to charge an unmeasured file.
-- Charge only after the **complete transcript is delivered**. A later booklet
-  failure leaves a partial job and the transcription charge stands.
+- Charge once the transcript has been **produced and stored**. Delivery is
+  button-driven (see below), so a chat that refuses a message is no longer a
+  reason to discard a finished transcription — nor a reason to charge twice. A
+  later booklet failure leaves a partial job and the transcription charge stands.
 - Pre-delivery failure/cancel releases the hold. Incomplete delivery is not billable;
   startup recovery releases interrupted holds.
 - PowerPoint charges source narration, not inserted silence. No narration means free.
 - Lots expire independently; holds preserve allocations. Refunds create new
   lots that inherit the earliest expiry of the original contributing lots;
   they never delete old debits.
+
+## Delivery and billing are separate
+
+A finished job ends with **one** message — what was produced, how many speakers
+were found — plus a button per artifact. Nothing is pushed unasked, and every
+fetch afterwards is free:
+
+| Artifact | Where the bytes come from | Cost |
+| --- | --- | --- |
+| 📖 Booklet (`.docx`) | forwarded from the user's library row | none |
+| 📝 Raw transcript | rebuilt from the stored transcription row | none |
+| ⭐ Key points | read from the stored `notes_json` | none |
+
+Because fetching is a pure function of persisted data, the same request may be
+pressed any number of times and the tenth answer is byte-identical to the first.
+Nothing about a fetch can create, move or refund a ledger entry.
 
 ## Quizzes and AI flashcards
 

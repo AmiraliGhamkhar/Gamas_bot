@@ -703,6 +703,12 @@ class Settings:
     office_job_concurrency: int = DEFAULT_OFFICE_JOB_CONCURRENCY
     #: Maximum number of delivered transcript/booklet references retained per user.
     library_max_items: int = 50
+    #: Public HTTPS URL of the Mini App (the ranking + booklet editor). Empty
+    #: hides the entry button, so a deployment without the app never shows a
+    #: button that cannot open.
+    mini_app_url: str = ""
+    #: How long a signed ``initData`` payload stays acceptable, in seconds.
+    mini_app_auth_max_age: int = 300
     #: Ceiling for an ingested study document (PDF/DOCX/PPTX), in bytes. Kept
     #: separate from ``max_file_size`` because a document is parsed into memory
     #: instead of streamed through the media worker.
@@ -1558,6 +1564,10 @@ def from_env(env_file: str | None = None) -> Settings:
             maximum=8,
         ),
         library_max_items=_env_int("LIBRARY_MAX_ITEMS", 50, minimum=1, maximum=10_000),
+        mini_app_url=_env("MINI_APP_URL", "").strip(),
+        mini_app_auth_max_age=_env_int(
+            "MINI_APP_AUTH_MAX_AGE_SECONDS", 300, minimum=30, maximum=3600
+        ),
         support_max_open_tickets=_env_int("SUPPORT_MAX_OPEN_TICKETS", 3, minimum=1, maximum=1000),
         support_ticket_cooldown_seconds=_env_int(
             "SUPPORT_TICKET_COOLDOWN_SECONDS", 600, minimum=0, maximum=86400
