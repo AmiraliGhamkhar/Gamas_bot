@@ -75,26 +75,43 @@ def main_screen(
     balance: str,
     office_enabled: bool,
     notes_configured: bool,
+    streak_days: int = 0,
 ) -> str:
-    """The start message and the return-to-menu screen."""
-    greeting = "🎓 به گاماس خوش آمدید" if first_start else "منوی اصلی"
-    lines = [
-        greeting,
-        "",
-        "📤 فایل درس را همین‌جا بفرستید:",
-        "🎧 صوت یا ویدیو",
-        "📄 PDF، Word یا PowerPoint",
-        "",
-    ]
-    if notes_configured:
-        lines.append("📚 متن گفتار و جزوه در «📚 کتابخانه من» ذخیره می‌شود.")
+    """The start message and the return-to-menu screen.
+
+    One action, one number, one reason to come back. The old screen listed five
+    capabilities and three ways to start, so the only thing a newcomer could do
+    was read it. Here the file request *is* the screen: a single sentence, then
+    the balance, then a streak line that turns "come back tomorrow" into
+    something the bot measures instead of merely suggesting.
+    """
+    if first_start:
+        lines = [
+            "🎓 به گاماس خوش آمدید",
+            "",
+            "یک فایل درس بفرستید؛ جزوه، فلش‌کارت و آزمونش را می‌سازم.",
+            "",
+            "📤 صوت، ویدیو، PDF، Word یا PowerPoint",
+        ]
     else:
-        lines.append("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.")
-    if office_enabled:
-        lines.append(
-            "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ بدون کسر اعتبار."
-        )
-    lines.extend(["", f"💳 اعتبار باقی‌مانده: {balance}", "", "از دکمه‌های زیر شروع کنید."])
+        lines = [
+            "منوی اصلی",
+            "",
+            "📤 فایل درس بعدی را بفرستید تا جزوه‌اش را بسازم.",
+        ]
+    if streak_days >= 2:
+        from .progress import to_persian_digits
+
+        lines.extend(["", f"🔥 {to_persian_digits(streak_days)} روز پشت‌سرهم برگشتید."])
+    lines.extend(["", f"💳 اعتبار باقی‌مانده: {balance}"])
+    if first_start:
+        if notes_configured:
+            lines.append("📚 متن گفتار و جزوه در «📚 کتابخانه من» ذخیره می‌شود.")
+        else:
+            lines.append("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.")
+        if office_enabled:
+            lines.append("🗂 تبدیل متن به Word، Excel، PowerPoint و PDF رایگان است.")
+        lines.extend(["", "از دکمه‌های زیر شروع کنید."])
     return "\n".join(lines)
 
 

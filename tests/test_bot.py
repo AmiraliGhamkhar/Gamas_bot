@@ -1217,20 +1217,18 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"office:start", payloads)
         self.assertEqual(len(payloads), 8)
 
-    async def test_main_panel_copy_explains_free_office_and_wallet_balance(self):
+    async def test_main_panel_asks_for_the_next_file_and_shows_the_balance(self):
+        """One action, one number: the returning screen is not a brochure."""
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
 
-        self.assertTrue(text.startswith(
+        self.assertEqual(
+            text,
             "منوی اصلی\n\n"
-            "📤 فایل درس را همین‌جا بفرستید:\n"
-            "🎧 صوت یا ویدیو\n"
-            "📄 PDF، Word یا PowerPoint\n\n"
-            "📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.\n"
-            "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ بدون کسر اعتبار."
-        ))
-        self.assertIn("💳 اعتبار باقی‌مانده", text)
+            "📤 فایل درس بعدی را بفرستید تا جزوه‌اش را بسازم.\n\n"
+            f"💳 اعتبار باقی‌مانده: {await self.bot._balance_text(self.user_id)}",
+        )
 
     async def test_help_copy_is_the_one_tap_guide_followed_by_billing_contract(self):
         event = FakeCallbackEvent(self.user_id, b"help")
@@ -1265,9 +1263,15 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         event = FakeCallbackEvent(self.user_id, b"menu:main")
         await self.bot._handle_callback(event)
         text, _buttons = event.edits[-1]
-        self.assertIn("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.", text)
-        self.assertIn("بدون کسر اعتبار", text)
-        self.assertNotIn("متن گفتار و جزوه در", text)
+        # The returning screen no longer carries the offers at all; the promise
+        # about the library lives on the welcome screen and must not name a
+        # booklet the bot could not produce with this configuration.
+        self.assertIn("📤 فایل درس بعدی را بفرستید", text)
+        start = FakeMessageEvent(self.user_id, "/start")
+        await self.bot._handle_message(start)
+        welcome = start.replies[0]
+        self.assertIn("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.", welcome)
+        self.assertNotIn("متن گفتار و جزوه در", welcome)
 
     async def test_admin_guides_explain_user_actions_and_empty_states(self):
         users = FakeCallbackEvent(self.admin_id, b"adm:users")
@@ -1924,7 +1928,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(start)
         self.assertTrue(start.replies[0].startswith(
             "🎓 به گاماس خوش آمدید\n\n"
-            "📤 فایل درس را همین‌جا بفرستید:"
+            "یک فایل درس بفرستید؛ جزوه، فلش‌کارت و آزمونش را می‌سازم."
         ))
         keyboard = start.client.texts[0].get("buttons")
         self.assertEqual(

@@ -670,6 +670,7 @@ class GamasBot(
             balance=await self._balance_text(user_id),
             office_enabled=self.settings.office_enabled,
             notes_configured=self.settings.note_configured,
+            streak_days=await self.db.activity_streak(user_id),
         )
         await self._edit_or_reply(
             event,

@@ -262,3 +262,40 @@ class UserIdentityTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActivityStreakTests(unittest.IsolatedAsyncioTestCase):
+    """The home screen's streak is derived from ``last_seen_at``, never stored."""
+
+    async def asyncSetUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db = Database(Path(self._tmp.name) / "streak.db")
+        await self.db.connect()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        self._tmp.cleanup()
+
+    async def test_an_active_user_counts_as_a_live_streak(self):
+        await self.db.ensure_user(1, "سارا")
+        self.assertEqual(await self.db.activity_streak(1), 1)
+
+    async def test_a_user_seen_long_ago_has_no_streak(self):
+        await self.db.ensure_user(2, "رضا")
+        # Same code path the sweeps use: an old visit is simply an old timestamp.
+        await self.db._write(
+            "UPDATE users SET last_seen_at = ? WHERE telegram_id = ?",
+            ("2000-01-01T00:00:00+00:00", 2),
+        )
+        self.assertEqual(await self.db.activity_streak(2), 0)
+
+    async def test_an_unknown_user_has_no_streak(self):
+        self.assertEqual(await self.db.activity_streak(424242), 0)
+
+    async def test_a_corrupt_timestamp_does_not_break_the_home_screen(self):
+        await self.db.ensure_user(3, "مینا")
+        await self.db._write(
+            "UPDATE users SET last_seen_at = ? WHERE telegram_id = ?",
+            ("not-a-date", 3),
+        )
+        self.assertEqual(await self.db.activity_streak(3), 0)

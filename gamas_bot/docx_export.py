@@ -45,7 +45,6 @@ import io
 import itertools
 import logging
 import re
-import unicodedata
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime

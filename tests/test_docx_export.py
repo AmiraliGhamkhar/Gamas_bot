@@ -734,11 +734,11 @@ class NoDuplicateRecapTests(unittest.TestCase):
     def _notes(self, **kwargs):
         from gamas_bot.notes import NoteSection
 
-        base = dict(
-            title="درس",
-            summary="خلاصهٔ کوتاه درس.",
-            sections=(NoteSection(heading="بخش", paragraphs=["متن بخش."]),),
-        )
+        base = {
+            "title": "درس",
+            "summary": "خلاصهٔ کوتاه درس.",
+            "sections": (NoteSection(heading="بخش", paragraphs=["متن بخش."]),),
+        }
         base.update(kwargs)
         return StructuredNotes(**base)
 

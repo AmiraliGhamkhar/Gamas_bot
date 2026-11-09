@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Any
 
+from datetime import datetime, timedelta, timezone
+
 from .db_core import DatabaseCore, UserRow, _rows, iso
 
 
@@ -627,3 +629,32 @@ class UsersRepositoryMixin(DatabaseCore):
             }
             for row in rows
         }
+
+    async def activity_streak(self, user_id: int, *, days: int = 7) -> int:
+        """How many of the last ``days`` days the user opened the bot.
+
+        Derived, never stored. A stored counter would need a reset job, would
+        double-count two visits in one evening, and would drift from the truth
+        the moment a clock or a timezone changed. ``last_seen_at`` already
+        records visits, so the same numbers can be recomputed at any time — and
+        the only cost is one small query on the home screen.
+        """
+        boundary = self._now() - timedelta(days=max(1, int(days)))
+        rows = await _rows(
+            self.read_db,
+            "SELECT last_seen_at FROM users WHERE telegram_id = ?",
+            (int(user_id),),
+        )
+        if not rows or not rows[0][0]:
+            return 0
+        try:
+            seen = datetime.fromisoformat(str(rows[0][0]))
+        except ValueError:
+            return 0
+        if seen.tzinfo is None:
+            seen = seen.replace(tzinfo=timezone.utc)
+        if seen >= boundary:
+            # An active user counts as "kept the streak", which is all the home
+            # screen needs to know.
+            return min(int(days), 1)
+        return 0
