@@ -290,6 +290,7 @@ class PrepareAudioRoutingTests(MediaTempCase):
         async def fake_extract(
             source, _workdir, _settings, *, total_duration=None,
             max_output_bytes=None, egress_bytes_per_second=None, stem="audio",
+            channels=None,
         ):
             captured["total_duration"] = total_duration
             captured["max_output_bytes"] = max_output_bytes
@@ -318,14 +319,17 @@ class PrepareAudioRoutingTests(MediaTempCase):
         self.assertEqual(captured["egress_bytes_per_second"], 2_000_000.0)
         self.assertEqual(result, Path("v.mp4"))
 
-    async def test_passthrough_audio_is_not_transcoded(self):
+    async def test_passthrough_audio_is_kept_when_preprocessing_is_opted_out(self):
+        """Gamas 2.0 preprocessing is mandatory; the opt-out keeps the old path."""
+        from dataclasses import replace
+
         async def fake_probe(_path, _settings):
             return MediaInfo(True, 10.0, "mp3")
 
         async def fail_extract(*_args, **_kwargs):  # pragma: no cover - must not run
             raise AssertionError("passthrough audio must not be extracted")
 
-        stub = _AudioPipelineStub(self.settings)
+        stub = _AudioPipelineStub(replace(self.settings, stt_preprocess=False))
         source = self.write("a.mp3", _mp3(0.5))
         with mock.patch("gamas_bot.bot.probe_media", new=fake_probe), mock.patch(
             "gamas_bot.bot.extract_audio_track", new=fail_extract
@@ -334,6 +338,30 @@ class PrepareAudioRoutingTests(MediaTempCase):
                 stub, source, self.tmp, "a.mp3", "audio"
             )
         self.assertEqual(result, source)
+
+    async def test_mandatory_preprocessing_reencodes_a_valid_mp3(self):
+        """An uploadable audio file still goes through the adaptive PyAV chain."""
+        from gamas_bot.media import MediaInfo
+
+        async def fake_probe(_path, _settings):
+            return MediaInfo(True, 10.0, "mp3")
+
+        captured: dict[str, object] = {}
+
+        async def fake_extract(path, workdir, settings, **kwargs):
+            captured.update(kwargs)
+            return path
+
+        stub = _AudioPipelineStub(self.settings)
+        source = self.write("a.mp3", _mp3(0.5))
+        with mock.patch("gamas_bot.bot.probe_media", new=fake_probe), mock.patch(
+            "gamas_bot.bot.extract_audio_track", new=fake_extract
+        ):
+            result = await GamasBot._prepare_audio(
+                stub, source, self.tmp, "a.mp3", "audio"
+            )
+        self.assertEqual(result, source)
+        self.assertIn("max_output_bytes", captured)
 
 
 class PresentationTests(MediaTempCase):

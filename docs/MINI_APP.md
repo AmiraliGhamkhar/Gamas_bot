@@ -115,3 +115,28 @@ connection; a Passenger worker cannot borrow it. Both open the same file instead
 * a connection is opened per request, so no worker holds a snapshot open and the
   `-wal` file cannot grow without bound on a shared host;
 * the app never migrates the schema — that stays the bot's job.
+
+
+---
+
+## Gamas Studio 2.0
+
+The app is now three tabs: **Home** (credits, points, counts, two working
+shortcuts), **Leaderboard** (all-time / weekly / monthly) and **Booklet Studio**
+(edit, revision history, one-click restore and a fresh DOCX export). The editor
+no longer describes the Word file as immutable: the export is rendered from the
+*current* text with the same `build_plain_docx` RTL engine the bot uses.
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/home` | POST | the caller's own, non-private summary |
+| `/api/leaderboard` | POST | `window` = `all` / `weekly` / `monthly` |
+| `/api/booklets`, `/api/booklet` | POST / PUT | list, read, save (appends a revision) |
+| `/api/booklet/export` | POST | DOCX bytes from the current text |
+| `/api/revisions`, `/api/revision` | POST / PUT | history and restore |
+| `/api/speakers` | POST / PUT | anonymous turns and owner-chosen names |
+
+Every endpoint re-verifies raw `initData` with the bot token. Weekly/monthly
+boards read the append-only `quiz_point_events` table; all-time still reads the
+authoritative `users.quiz_points`. `scripts/mini_app_wsgi.py` builds the full
+`MiniAppData` facade per request — see `docs/GAMAS2.md` for deployment order.

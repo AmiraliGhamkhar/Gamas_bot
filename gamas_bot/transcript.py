@@ -82,12 +82,33 @@ class Word:
     ``start``/``end`` are seconds from the beginning of the audio, when the
     engine supplies them. ``speaker`` is the provider's diarization label; it
     is raw on purpose, because a provider may rename speakers between calls.
+    ``confidence`` is the provider's word confidence (0..1) when it supplies
+    one; ``None`` means the engine does not report it. ``overlaps`` marks a
+    token whose time range overlaps another token's (simultaneous speech);
+    it is derived from timings by :func:`mark_overlaps`, never invented.
     """
 
     text: str
     start: float | None = None
     end: float | None = None
     speaker: str = ""
+    confidence: float | None = None
+    overlaps: bool = False
+
+    @property
+    def speaker_id(self) -> str:
+        """Stable anonymous id (``speaker_0``) for this token's voice.
+
+        Providers renumber speakers between calls, so this id is only
+        meaningful inside one transcript. Unknown attribution stays
+        ``speaker_unknown`` — never a fabricated identity.
+        """
+        label = (self.speaker or "").strip()
+        if _speaker_key(label) in _UNKNOWN_SPEAKER_LABELS:
+            return "speaker_unknown"
+        if label.isdigit():
+            return f"speaker_{label}"
+        return f"speaker_{_speaker_key(label)}"
 
 
 @dataclass(slots=True)
@@ -130,6 +151,78 @@ class Paragraph:
 
 
 @dataclass(frozen=True, slots=True)
+class SpeakerTurn:
+    """One contiguous run of speech by one anonymous voice.
+
+    ``speaker_id`` is the stable anonymous id (``speaker_0``); ``speaker_label``
+    is the resolved label (``0``) or ``None`` for unknown attribution.
+    ``display_name`` is the user-facing name (custom name when the user renamed
+    the speaker, otherwise the Persian default ``گویندهٔ ۱``); ``None`` means
+    explicitly unknown — never a fabricated identity. ``confidence`` is the
+    mean word confidence of the turn when the engine reports it. ``overlaps``
+    is true when any word in the turn overlaps another voice in time
+    (simultaneous speech), so the transcript can flag it instead of silently
+    assigning it to one speaker.
+    """
+
+    speaker_id: str
+    start: float | None
+    end: float | None
+    text: str
+    confidence: float | None = None
+    speaker_label: str | None = None
+    display_name: str | None = None
+    overlaps: bool = False
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "speaker_id": self.speaker_id,
+            "speaker_label": self.speaker_label,
+            "display_name": self.display_name,
+            "start": self.start,
+            "end": self.end,
+            "text": self.text,
+            "confidence": self.confidence,
+            "overlaps": self.overlaps,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> "SpeakerTurn | None":
+        if not isinstance(payload, dict):
+            return None
+        text = str(payload.get("text") or "").strip()
+        if not text:
+            return None
+        speaker_id = str(payload.get("speaker_id") or "speaker_unknown").strip()
+        label = payload.get("speaker_label")
+        label_text = str(label).strip() if label is not None else None
+        if label_text in (None, "", "None"):
+            label_text = None
+        display = payload.get("display_name")
+        display_text = str(display).strip() if display is not None else None
+        if display_text in (None, "", "None"):
+            display_text = None
+
+        def _num(value: object) -> float | None:
+            if isinstance(value, bool):
+                return None
+            if isinstance(value, (int, float)):
+                return float(value)
+            return None
+
+        return cls(
+            speaker_id=speaker_id or "speaker_unknown",
+            start=_num(payload.get("start")),
+            end=_num(payload.get("end")),
+            text=text,
+            confidence=_num(payload.get("confidence")),
+            speaker_label=label_text,
+            display_name=display_text,
+            overlaps=bool(payload.get("overlaps", False)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class TranscriptDocument:
     """The cleaned, paragraphed transcript — the LLM input and the .txt body."""
 
@@ -140,6 +233,16 @@ class TranscriptDocument:
     #: trustworthy turns (too few words, one dominant voice). The transcript is
     #: still delivered; it is simply not split by speaker.
     diarization_attempted: bool = False
+    #: User-renamed speaker labels as ``(stable_label, custom_name)`` pairs,
+    #: e.g. ``(("0", "استاد"), ("1", "دانشجو"))``. Empty means defaults.
+    speaker_names: tuple[tuple[str, str], ...] = ()
+    #: Number of distinct time spans where two voices spoke simultaneously.
+    #: Reported honestly (never smoothed away) so overlapping speech is visible.
+    overlap_count: int = 0
+
+    @property
+    def speaker_names_map(self) -> dict[str, str]:
+        return dict(self.speaker_names)
 
     @property
     def text(self) -> str:
@@ -147,12 +250,84 @@ class TranscriptDocument:
 
     def _speaker_heading(self, paragraph: Paragraph, previous: Paragraph | None) -> str:
         """The turn header, only where the speaker changes."""
-        name = speaker_name_from_label(paragraph.speaker)
+        name = speaker_name_from_label(
+            paragraph.speaker, self.speaker_names_map or None
+        )
         if name is None:
             return paragraph.text
         if previous is not None and previous.speaker == paragraph.speaker:
             return paragraph.text
         return f"{name}: {paragraph.text}"
+
+    def speaker_turns(self) -> list[SpeakerTurn]:
+        """Chronological speaker turns derived from the paragraphs.
+
+        Each paragraph is already one turn (see
+        :func:`paragraphs_from_words_by_speaker`), so this is a faithful
+        projection: order, timings and text are preserved, and unknown
+        attribution stays explicitly unknown. Word-level confidence is not
+        stored in the document, so turn confidence is ``None`` here; use
+        :func:`build_speaker_turns` on words when confidences are needed.
+        """
+        custom = self.speaker_names_map
+        turns: list[SpeakerTurn] = []
+        for paragraph in self.paragraphs:
+            if not paragraph.text:
+                continue
+            label = paragraph.speaker
+            if label is None or label == SPEAKER_UNKNOWN:
+                turns.append(
+                    SpeakerTurn(
+                        speaker_id="speaker_unknown",
+                        start=paragraph.start,
+                        end=paragraph.end,
+                        text=paragraph.text,
+                        speaker_label=None,
+                        display_name=None,
+                    )
+                )
+            else:
+                display = custom.get(label) or speaker_name_from_label(label)
+                turns.append(
+                    SpeakerTurn(
+                        speaker_id=f"speaker_{label}",
+                        start=paragraph.start,
+                        end=paragraph.end,
+                        text=paragraph.text,
+                        speaker_label=label,
+                        display_name=display,
+                    )
+                )
+        return turns
+
+    def turns_to_json(self) -> str:
+        """Serialize the speaker turns for durable storage (``transcriptions``)."""
+        import json as _json
+
+        return _json.dumps(
+            [turn.to_dict() for turn in self.speaker_turns()],
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def turns_from_json(payload: str | None) -> list[SpeakerTurn]:
+        """Parse stored turns; corrupt data yields no turns, never an error."""
+        if not payload:
+            return []
+        import json as _json
+
+        try:
+            raw = _json.loads(payload)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(raw, list):
+            return []
+        turns: list[SpeakerTurn] = []
+        for item in raw:
+            turn = SpeakerTurn.from_dict(item)
+            if turn is not None:
+                turns.append(turn)
+        return turns
 
     def plain(self) -> str:
         """Paragraphs; a diarized document names the speaker at each new turn.
@@ -264,11 +439,188 @@ def speaker_name(index: int) -> str:
     return f"گویندهٔ {to_persian_digits(index + 1)}"
 
 
-def speaker_name_from_label(label: str | None) -> str | None:
-    """Turn a stable id (``0``, ``1`` …) into its displayed name."""
-    if label is None or not label.isdigit():
+def speaker_name_from_label(
+    label: str | None, custom: dict[str, str] | None = None
+) -> str | None:
+    """Turn a stable id (``0``, ``1`` …) into its displayed name.
+
+    ``custom`` maps stable labels to user-chosen names (``استاد``,
+    ``دانشجو`` …); a custom name always wins over the Persian default.
+    Unknown attribution returns ``None`` — explicitly unknown, never a
+    fabricated identity.
+    """
+    if label is None:
+        return None
+    if custom and label in custom:
+        name = str(custom[label]).strip()
+        if name:
+            return name
+    if not label.isdigit():
         return None
     return speaker_name(int(label))
+
+
+def mark_overlaps(words: list[Word]) -> list[Word]:
+    """Flag words whose time range overlaps another word's (simultaneous speech).
+
+    Overlap is derived from timings only: two words overlap when one's
+    ``[start, end)`` intersects the other's. Words without timings are never
+    flagged. The input order is preserved; the returned list is new.
+    """
+    timed = sorted(
+        (
+            (float(word.start), float(word.end), index)
+            for index, word in enumerate(words)
+            if word.start is not None and word.end is not None and word.end > word.start
+        ),
+        key=lambda item: (item[0], item[1]),
+    )
+    if len(timed) < 2:
+        return list(words)
+    flagged: set[int] = set()
+    # Sorted by start, so only the words starting before this one ends can
+    # overlap. The inner loop stops at the first non-overlapping start: a full
+    # 90-minute lecture stays linear in the number of words, not quadratic.
+    for position, (_start, end, index) in enumerate(timed):
+        cursor = position + 1
+        while cursor < len(timed) and timed[cursor][0] < end:
+            other_start, _other_end, other_index = timed[cursor]
+            if other_start < end:
+                flagged.add(index)
+                flagged.add(other_index)
+            cursor += 1
+    if not flagged:
+        return list(words)
+    return [
+        replace(word, overlaps=True) if index in flagged else word
+        for index, word in enumerate(words)
+    ]
+
+
+def overlap_spans(words: list[Word]) -> list[tuple[float, float]]:
+    """Time spans where two or more timed words overlap (chronological)."""
+    spans: list[tuple[float, float]] = []
+    timed = sorted(
+        (word.start, word.end)
+        for word in words
+        if word.start is not None and word.end is not None and word.end > word.start
+    )
+    for index in range(len(timed)):
+        start, end = timed[index]
+        for other_start, other_end in timed[index + 1 :]:
+            if other_start >= end:
+                break
+            overlap_start = max(start, other_start)
+            overlap_end = min(end, other_end)
+            if overlap_end > overlap_start:
+                spans.append((overlap_start, overlap_end))
+    spans.sort()
+    merged: list[tuple[float, float]] = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def build_speaker_turns(
+    words: list[Word],
+    *,
+    custom_names: dict[str, str] | None = None,
+    merge_gap: float = SPEAKER_MERGE_GAP_SECONDS,
+    soft_cap: int = PARAGRAPH_SOFT_CAP_CHARS,
+) -> list[SpeakerTurn]:
+    """Group resolved words into chronological :class:`SpeakerTurn` objects.
+
+    Mirrors :func:`paragraphs_from_words_by_speaker` (same turn boundaries,
+    same unknown-inheritance) but keeps word confidences and overlap flags,
+    so evaluation and storage can use the turns directly. ``words`` must
+    already be resolved by :func:`resolve_speakers`.
+    """
+    if not words:
+        return []
+    marked = mark_overlaps(words)
+    carried: list[Word] = []
+    pending_unknown: list[Word] = []
+    last_known = SPEAKER_UNKNOWN
+    for word in marked:
+        if word.speaker in _UNKNOWN_SPEAKER_LABELS or word.speaker == SPEAKER_UNKNOWN:
+            pending_unknown.append(word)
+            continue
+        if pending_unknown:
+            for held in pending_unknown:
+                carried.append(replace(held, speaker=last_known))
+            pending_unknown.clear()
+        carried.append(word)
+        last_known = word.speaker
+    carried.extend(pending_unknown)
+
+    turns: list[SpeakerTurn] = []
+    current: list[Word] = []
+    current_len = 0
+
+    def flush() -> None:
+        nonlocal current, current_len
+        if not current:
+            return
+        text = " ".join(word.text for word in current if word.text).strip()
+        if text:
+            label = current[0].speaker
+            confidences = [
+                word.confidence
+                for word in current
+                if word.confidence is not None
+            ]
+            mean_confidence = (
+                sum(confidences) / len(confidences) if confidences else None
+            )
+            if label == SPEAKER_UNKNOWN:
+                turns.append(
+                    SpeakerTurn(
+                        speaker_id="speaker_unknown",
+                        start=current[0].start,
+                        end=current[-1].end,
+                        text=text,
+                        confidence=mean_confidence,
+                        speaker_label=None,
+                        display_name=None,
+                        overlaps=any(word.overlaps for word in current),
+                    )
+                )
+            else:
+                display = (custom_names or {}).get(label) or speaker_name_from_label(
+                    label
+                )
+                turns.append(
+                    SpeakerTurn(
+                        speaker_id=f"speaker_{label}",
+                        start=current[0].start,
+                        end=current[-1].end,
+                        text=text,
+                        confidence=mean_confidence,
+                        speaker_label=label,
+                        display_name=display,
+                        overlaps=any(word.overlaps for word in current),
+                    )
+                )
+        current, current_len = [], 0
+
+    for index, word in enumerate(carried):
+        previous = carried[index - 1] if index else None
+        same = bool(current) and current[0].speaker == word.speaker
+        if same:
+            gap = _gap_seconds(previous, word) if previous is not None else None
+            if gap is not None and gap > merge_gap:
+                flush()
+            elif current_len >= soft_cap and _ends_sentence(current[-1].text):
+                flush()
+        elif current:
+            flush()
+        current.append(word)
+        current_len += len(word.text) + 1
+    flush()
+    return turns
 
 
 def paragraphs_from_words_by_speaker(
@@ -636,6 +988,7 @@ def build_document(raw: RawTranscript) -> TranscriptDocument:
                 raw.confidence,
                 speakers=max(speakers, raw.speakers, 0),
                 diarization_attempted=bool(raw.speakers),
+                overlap_count=len(overlap_spans(words)),
             )
         logger.warning("timed-words paragraphing produced nothing; falling back to text")
 

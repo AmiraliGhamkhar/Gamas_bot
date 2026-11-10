@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
+from fractions import Fraction
 
 from .progress import to_persian_digits
 
@@ -58,6 +59,10 @@ SECONDS_PER_HOUR = 3_600
 
 #: Minimum purchase unit, and the unit the tariff is quoted in.
 CREDIT_PACKAGE_SIZE = 100_000
+#: Canonical credit unit: ``CREDITS_PER_UNIT`` credits are ``SECONDS_PER_UNIT``
+#: seconds of audio. The pair is the single definition every screen shares.
+CREDITS_PER_UNIT = 100_000
+SECONDS_PER_UNIT = 10_800
 #: Hours of audio one purchase unit pays for.
 HOURS_PER_PACKAGE = 3
 #: Canonical selling price of one purchase unit, in toman
@@ -68,38 +73,118 @@ CREDITS_PER_SECOND = CREDIT_PACKAGE_SIZE / (HOURS_PER_PACKAGE * SECONDS_PER_HOUR
 #: Credits per hour of processed audio (100 000 / 3 = 33 333.33).
 CREDITS_PER_HOUR = CREDIT_PACKAGE_SIZE / HOURS_PER_PACKAGE
 
+#: Proposed (NOT activated) tariff from the Gamas 2.0 brief: 65 toman per
+#: 100 000 credits, taken literally. It is ~923x cheaper than the live
+#: catalogue and must never be applied silently. See
+#: :func:`price_change_preview` and ``scripts/credit_price_preview.py``.
+PROPOSED_PRICE_TOMAN_PER_PACKAGE = 65
+
+
+def _ceil_div(numerator: int, denominator: int) -> int:
+    """Integer ceiling division for non-negative integers."""
+    return -(-numerator // denominator)
+
+
+def _seconds_fraction(seconds: int | float) -> Fraction:
+    """Exact rational for a seconds value (int stays int, float via str)."""
+    if isinstance(seconds, bool):
+        return Fraction(0)
+    if isinstance(seconds, int):
+        return Fraction(seconds)
+    return Fraction(str(seconds))
+
 
 def seconds_to_credits(seconds: int | float | None) -> int:
-    """Convert ledger seconds to credits, rounding up.
+    """Convert ledger seconds to credits, rounding up (integer arithmetic).
 
-    Rounding up keeps a fractional credit from ever becoming free audio: the
-    rate is 100/3 credits per second, so most measurements are fractional.
+    ``credits = ceil(seconds * CREDITS_PER_UNIT / SECONDS_PER_UNIT)`` computed
+    with exact rationals, never floats: exactly 10 800 s is exactly 100 000
+    credits, and one second is never charged as zero credits. Rounding up
+    keeps a fractional credit from ever becoming free audio.
     """
     if seconds is None:
         return 0
-    value = float(seconds)
+    if isinstance(seconds, bool):
+        return 0
+    try:
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return 0
     if not math.isfinite(value):
         return 0
-    return max(0, math.ceil(value * CREDITS_PER_SECOND))
+    if value <= 0:
+        return 0
+    fraction = _seconds_fraction(seconds)
+    numerator = fraction.numerator * CREDITS_PER_UNIT
+    denominator = fraction.denominator * SECONDS_PER_UNIT
+    return max(0, _ceil_div(int(numerator), int(denominator)))
 
 
 def credits_to_seconds(credits: int | float | None) -> int:
-    """Convert credits to whole ledger seconds, rounding down.
+    """Convert credits to whole ledger seconds, rounding down (integer math).
 
     The inverse of :func:`seconds_to_credits` for every amount a plan can sell:
     the pair is explicit about its rounding so a balance is never overstated.
     """
     if credits is None:
         return 0
-    value = float(credits)
+    if isinstance(credits, bool):
+        return 0
+    try:
+        value = float(credits)
+    except (TypeError, ValueError):
+        return 0
     if not math.isfinite(value):
         return 0
-    return max(0, math.floor(value / CREDITS_PER_SECOND))
+    if value <= 0:
+        return 0
+    whole = int(value) if float(value).is_integer() else int(math.floor(value))
+    if whole <= 0:
+        return 0
+    return max(0, (whole * SECONDS_PER_UNIT) // CREDITS_PER_UNIT)
 
 
 def credits_per_hour(hours: int | float) -> int:
     """Credits covering ``hours`` of audio, rounded up to the whole credit."""
-    return int(math.ceil(float(hours) * CREDITS_PER_HOUR))
+    if isinstance(hours, bool):
+        return 0
+    try:
+        value = float(hours)
+    except (TypeError, ValueError):
+        return 0
+    if not math.isfinite(value) or value <= 0:
+        return 0
+    fraction = _seconds_fraction(hours)
+    numerator = fraction.numerator * CREDITS_PER_UNIT
+    denominator = fraction.denominator * HOURS_PER_PACKAGE
+    return max(0, _ceil_div(int(numerator), int(denominator)))
+
+
+def price_change_preview(
+    proposed_price_toman: int = PROPOSED_PRICE_TOMAN_PER_PACKAGE,
+) -> dict[str, object]:
+    """Compare the live catalogue with a proposed per-package price.
+
+    Pure and side-effect free: it never changes a plan. The preview exists so
+    an operator sees the discrepancy (live 60 000 T vs proposed 65 T) before
+    any explicit configuration change, per the commercial safeguard.
+    """
+    live = PRICE_TOMAN_PER_PACKAGE
+    proposed = int(proposed_price_toman)
+    ratio = (live / proposed) if proposed > 0 else float("inf")
+    return {
+        "live_price_toman_per_package": live,
+        "proposed_price_toman_per_package": proposed,
+        "live_per_hour_toman": live // HOURS_PER_PACKAGE,
+        "proposed_per_hour_toman": proposed / HOURS_PER_PACKAGE,
+        "ratio_live_over_proposed": ratio,
+        "major_discrepancy": ratio > 10 or ratio < 0.1,
+        "activated": False,
+        "note": (
+            "Proposed price is NOT activated. Live plans keep their frozen "
+            "snapshots; activation requires an explicit PLAN_* change."
+        ),
+    }
 
 
 def seconds_per_package(credits: int) -> int:

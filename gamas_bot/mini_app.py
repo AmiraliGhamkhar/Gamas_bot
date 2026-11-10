@@ -167,7 +167,9 @@ class MiniAppData:
 
     The concrete implementation is in :mod:`gamas_bot.mini_app_store`; keeping it
     behind a protocol-shaped class is what lets the HTTP layer be tested without
-    a database, and what keeps ``sqlite3`` out of a request handler.
+    a database, and what keeps ``sqlite3`` out of a request handler. The Gamas
+    2.0 additions have defaults so an older deployment (or a test double) keeps
+    the same API without losing the Home or revision endpoints entirely.
     """
 
     leaderboard: Callable[[int], list[dict[str, Any]]]
@@ -178,13 +180,49 @@ class MiniAppData:
     profile: Callable[[int], dict[str, Any]] = field(
         default=lambda _user_id: {}
     )
+    leaderboard_window: Callable[[int, str], list[dict[str, Any]]] | None = None
+    rank_window: Callable[[int, str], dict[str, int]] | None = None
+    revisions: Callable[[int, int, int], list[dict[str, Any]]] = field(
+        default=lambda _user_id, _item_id, _limit: []
+    )
+    restore_revision: Callable[[int, int, int], bool] = field(
+        default=lambda _user_id, _item_id, _revision_id: False
+    )
+    speaker_turns: Callable[[int, int], list[dict[str, Any]]] = field(
+        default=lambda _user_id, _submission_id: []
+    )
+    rename_speaker: Callable[[int, int, str, str], bool] = field(
+        default=lambda _user_id, _submission_id, _label, _name: False
+    )
 
 
-def leaderboard_payload(data: MiniAppData, user_id: int, limit: int = 20) -> dict:
+LEADERBOARD_WINDOWS = ("all", "weekly", "monthly")
+
+
+def resolve_leaderboard_window(value: object) -> str:
+    """Only the three documented windows; anything else is all-time."""
+    text = str(value or "all").strip().lower()
+    return text if text in LEADERBOARD_WINDOWS else "all"
+
+
+def leaderboard_payload(
+    data: MiniAppData, user_id: int, limit: int = 20, window: str = "all"
+) -> dict:
     """The ranking screen: the top rows plus where *this* user stands."""
-    rows = data.leaderboard(max(1, min(50, limit)))
-    mine = data.rank(user_id)
+    window = resolve_leaderboard_window(window)
+    bounded = max(1, min(50, limit))
+    if window in ("weekly", "monthly") and data.leaderboard_window is not None:
+        rows = data.leaderboard_window(bounded, window)
+        mine = (
+            data.rank_window(user_id, window)
+            if data.rank_window is not None
+            else {"rank": 0, "points": 0}
+        )
+    else:
+        rows = data.leaderboard(bounded)
+        mine = data.rank(user_id)
     return {
+        "window": window,
         "rows": [
             {
                 "rank": index + 1,
@@ -195,6 +233,79 @@ def leaderboard_payload(data: MiniAppData, user_id: int, limit: int = 20) -> dic
         ],
         "me": {"rank": int(mine.get("rank") or 0), "points": int(mine.get("points") or 0)},
     }
+
+
+def home_payload(data: MiniAppData, user_id: int) -> dict:
+    """The Home tab: the caller's own, non-private summary.
+
+    No other user's data, no phone numbers, no file contents. It is intentionally
+    small: one number (credits), one progress signal (points) and the two things
+    a student can do next.
+    """
+    profile = data.profile(user_id) or {}
+    return {
+        "first_name": str(profile.get("first_name") or ""),
+        "credits": int(profile.get("credits") or 0),
+        "unlimited": bool(profile.get("unlimited", False)),
+        "quiz_points": int(profile.get("quiz_points") or 0),
+        "library_count": int(profile.get("library_count") or 0),
+        "submission_count": int(profile.get("submission_count") or 0),
+        "artifact_count": int(profile.get("artifact_count") or 0),
+        "tabs": ["home", "leaderboard", "studio"],
+    }
+
+
+def revisions_payload(
+    data: MiniAppData, user_id: int, item_id: int, limit: int = 20
+) -> dict:
+    """Revision history of one booklet the caller owns."""
+    return {
+        "items": data.revisions(user_id, item_id, max(1, min(50, limit))),
+    }
+
+
+def speakers_payload(data: MiniAppData, user_id: int, submission_id: int) -> dict:
+    """Anonymous speaker turns of one submission (no identity is inferred)."""
+    if submission_id <= 0:
+        raise AppError(400, "submission id is required")
+    turns = data.speaker_turns(user_id, submission_id)
+    labels = sorted(
+        {str(turn["speaker_label"]) for turn in turns if turn.get("speaker_label")}
+    )
+    return {
+        "submission_id": submission_id,
+        "labels": labels,
+        "turns": turns,
+        "unknown_attribution": any(not turn.get("speaker_label") for turn in turns),
+    }
+
+
+def rename_speaker_payload(
+    data: MiniAppData,
+    user_id: int,
+    submission_id: int,
+    label: str,
+    name: str,
+) -> dict:
+    """Persist a user-chosen name for one anonymous label."""
+    if submission_id <= 0 or not label or not name:
+        raise AppError(400, "submission id, label and name are required")
+    clean_name = " ".join(str(name).split())[:64]
+    if not clean_name:
+        raise AppError(400, "name is empty")
+    if not data.rename_speaker(user_id, submission_id, str(label), clean_name):
+        raise AppError(404, "speaker not found")
+    return {"ok": True, "label": str(label), "name": clean_name}
+
+
+def restore_revision_payload(
+    data: MiniAppData, user_id: int, item_id: int, revision_id: int
+) -> dict:
+    if revision_id <= 0:
+        raise AppError(400, "revision id is required")
+    if not data.restore_revision(user_id, item_id, revision_id):
+        raise AppError(404, "revision not found")
+    return {"ok": True}
 
 
 def booklets_payload(data: MiniAppData, user_id: int, limit: int = 30) -> dict:
@@ -263,6 +374,55 @@ def _json_response(
     return [body]
 
 
+def booklet_docx_bytes(data: MiniAppData, user_id: int, item_id: int) -> bytes:
+    """Render the *current* booklet text to a professional RTL Word file.
+
+    This is a fresh export of the edited text, never the original Telegram
+    attachment: after an edit in the Studio the DOCX must match what the user
+    sees. The renderer is the same ``build_plain_docx`` the bot uses, so fonts,
+    RTL direction, cover and page frame are identical. Bounded by
+    ``MAX_BOOKLET_CHARS`` and by the WSGI worker's own request budget.
+    """
+    from datetime import datetime, timezone
+
+    from .docx_export import DocumentMeta, build_plain_docx
+
+    record = data.booklet(user_id, item_id)
+    if record is None:
+        raise AppError(404, "booklet not found")
+    title = str(record.get("title") or "جزوهٔ گاماس").strip() or "جزوهٔ گاماس"
+    text = str(record.get("content_text") or record.get("text") or "")
+    if len(text) > MAX_BOOKLET_CHARS:
+        raise AppError(413, "booklet is too large to export")
+    meta = DocumentMeta(
+        reference=f"GMS-APP-{int(item_id)}",
+        created_at=datetime.now(timezone.utc),
+    )
+    try:
+        return build_plain_docx(title, text, meta=meta)
+    except Exception as exc:  # noqa: BLE001 - a renderer failure is a 500, not a crash
+        logger.exception("mini app DOCX export failed item=%s", item_id)
+        raise AppError(500, "export failed") from exc
+
+
+def _binary_response(
+    start_response: Callable[..., Any], body: bytes, filename: str
+) -> list[bytes]:
+    """Stream one DOCX with no caching: it may contain the user's own text."""
+    start_response(
+        "200 OK",
+        [
+            ("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            ("Content-Length", str(len(body))),
+            ("Content-Disposition", f'attachment; filename="{filename}"'),
+            ("Cache-Control", "no-store"),
+            ("X-Content-Type-Options", "nosniff"),
+            ("Referrer-Policy", "no-referrer"),
+        ],
+    )
+    return [body]
+
+
 def _read_body(environ: Mapping[str, Any]) -> bytes:
     try:
         length = int(environ.get("CONTENT_LENGTH") or 0)
@@ -325,14 +485,24 @@ def create_app(
                     raise AppError(405, "method not allowed")
                 status = dict(health() if health is not None else {"ok": True})
                 return _json_response(start_response, 200, status)
+            if path == "/api/home":
+                if method != "POST":
+                    raise AppError(405, "method not allowed")
+                body = _json_body_cached(environ)
+                user = _authenticate_with(body, _resolve_token(), max_age_seconds, clock)
+                return _json_response(
+                    start_response, 200, home_payload(_resolve_data(), user.user_id)
+                )
             if path == "/api/leaderboard":
                 if method != "POST":
                     raise AppError(405, "method not allowed")
                 body = _json_body_cached(environ)
                 user = _authenticate_with(body, _resolve_token(), max_age_seconds, clock)
                 limit = _int_field(body, "limit", 20)
+                window = resolve_leaderboard_window(body.get("window"))
                 return _json_response(
-                    start_response, 200, leaderboard_payload(_resolve_data(), user.user_id, limit)
+                    start_response, 200,
+                    leaderboard_payload(_resolve_data(), user.user_id, limit, window),
                 )
             if path == "/api/booklets":
                 if method != "POST":
@@ -358,6 +528,71 @@ def create_app(
                     )
                 return _json_response(
                     start_response, 200, booklet_payload(_resolve_data(), user.user_id, item_id)
+                )
+            if path == "/api/booklet/export":
+                # POST carries the signed initData in a JSON body; the response
+                # is a DOCX, not JSON. A browser cannot attach Telegram's
+                # signature to a plain link, so the frontend fetches and saves
+                # the blob itself.
+                if method != "POST":
+                    raise AppError(405, "method not allowed")
+                body = _json_body_cached(environ)
+                user = _authenticate_with(body, _resolve_token(), max_age_seconds, clock)
+                item_id = _int_field(body, "id", 0)
+                if item_id <= 0:
+                    raise AppError(400, "id is required")
+                document = booklet_docx_bytes(_resolve_data(), user.user_id, item_id)
+                return _binary_response(
+                    start_response, document, f"gamas-booklet-{item_id}.docx"
+                )
+            if path == "/api/revisions":
+                if method != "POST":
+                    raise AppError(405, "method not allowed")
+                body = _json_body_cached(environ)
+                user = _authenticate_with(body, _resolve_token(), max_age_seconds, clock)
+                item_id = _int_field(body, "id", 0)
+                if item_id <= 0:
+                    raise AppError(400, "id is required")
+                return _json_response(
+                    start_response, 200,
+                    revisions_payload(
+                        _resolve_data(), user.user_id, item_id,
+                        _int_field(body, "limit", 20),
+                    ),
+                )
+            if path == "/api/revision":
+                if method != "PUT":
+                    raise AppError(405, "method not allowed")
+                body = _json_body(environ)
+                user = _authenticate_with(body, _resolve_token(), max_age_seconds, clock)
+                item_id = _int_field(body, "id", 0)
+                if item_id <= 0:
+                    raise AppError(400, "id is required")
+                return _json_response(
+                    start_response, 200,
+                    restore_revision_payload(
+                        _resolve_data(), user.user_id, item_id,
+                        _int_field(body, "revision_id", 0),
+                    ),
+                )
+            if path == "/api/speakers":
+                if method not in {"POST", "PUT"}:
+                    raise AppError(405, "method not allowed")
+                body = _json_body(environ)
+                user = _authenticate_with(body, _resolve_token(), max_age_seconds, clock)
+                submission_id = _int_field(body, "submission_id", 0)
+                if method == "PUT":
+                    return _json_response(
+                        start_response, 200,
+                        rename_speaker_payload(
+                            _resolve_data(), user.user_id, submission_id,
+                            str(body.get("label") or ""),
+                            str(body.get("name") or ""),
+                        ),
+                    )
+                return _json_response(
+                    start_response, 200,
+                    speakers_payload(_resolve_data(), user.user_id, submission_id),
                 )
             if path in {"/", "/index.html"}:
                 if method not in {"GET", "HEAD"}:
@@ -480,10 +715,17 @@ __all__ = [
     "MAX_BOOKLET_CHARS",
     "MiniAppData",
     "MiniAppUser",
+    "booklet_docx_bytes",
     "booklet_payload",
     "booklets_payload",
     "create_app",
+    "home_payload",
     "leaderboard_payload",
+    "rename_speaker_payload",
+    "resolve_leaderboard_window",
+    "restore_revision_payload",
+    "speakers_payload",
+    "revisions_payload",
     "save_booklet_payload",
     "verify_init_data",
 ]

@@ -31,7 +31,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from gamas_bot.config import from_env  # noqa: E402
-from gamas_bot.mini_app import create_app  # noqa: E402
+from gamas_bot.mini_app import MiniAppData, create_app  # noqa: E402
 from gamas_bot.mini_app_store import MiniAppStore  # noqa: E402
 
 logger = logging.getLogger("gamas_bot.mini_app")
@@ -48,8 +48,29 @@ def _settings():
 
 
 def _data():
-    settings = _settings()
-    return MiniAppStore(settings.db_path)
+    """Resolve the full Gamas 2.0 data facade per request.
+
+    ``MiniAppStore`` duck-types the original four-call surface, but the Studio
+    also needs Home, weekly/monthly boards, revision history, DOCX export and
+    speaker names. Building the facade explicitly keeps every call bound to the
+    one connection-per-request store and makes a missing method an import-time
+    error rather than a 500 in production.
+    """
+    store = MiniAppStore(_settings().db_path)
+    return MiniAppData(
+        leaderboard=store.leaderboard,
+        rank=store.rank,
+        booklets=store.booklets,
+        booklet=store.booklet,
+        save_booklet=store.save_booklet,
+        profile=store.profile,
+        leaderboard_window=store.leaderboard_window,
+        rank_window=store.rank_window,
+        revisions=store.revisions,
+        restore_revision=store.restore_revision,
+        speaker_turns=store.speaker_turns,
+        rename_speaker=store.rename_speaker,
+    )
 
 
 def _token() -> str:

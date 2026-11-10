@@ -45,10 +45,102 @@ html, body {
 
 .tabs {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(3, 1fr);
   gap: 8px;
   margin-bottom: 16px;
 }
+
+.tab { font-size: 0.92rem; }
+
+@media (max-width: 380px) {
+  .tabs { grid-template-columns: 1fr 1fr 1fr; gap: 5px; }
+  .tab { padding: 9px 6px; font-size: 0.82rem; }
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+/* Home ------------------------------------------------------------------ */
+.hero { display: flex; flex-direction: column; gap: 4px; margin-bottom: var(--gap); }
+.hero-label { color: var(--hint); font-size: 0.9rem; }
+.hero-value { font-size: 1.9rem; font-variant-numeric: tabular-nums; }
+.badge { color: var(--accent); font-size: 0.85rem; }
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: var(--gap);
+}
+.stat { display: flex; flex-direction: column; gap: 2px; }
+.stat span { color: var(--hint); font-size: 0.82rem; }
+.stat strong { font-size: 1.25rem; font-variant-numeric: tabular-nums; }
+.actions .action-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+button.secondary {
+  font: inherit;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  padding: 10px 14px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+/* Leaderboard windows ---------------------------------------------------- */
+.segmented {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-bottom: var(--gap);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 4px;
+}
+.segmented button {
+  font: inherit;
+  background: transparent;
+  color: var(--hint);
+  border: 0;
+  border-radius: 10px;
+  padding: 8px 4px;
+  cursor: pointer;
+}
+.segmented button.is-active {
+  background: var(--accent);
+  color: var(--accent-text);
+  font-weight: 600;
+}
+
+/* Revision history ------------------------------------------------------- */
+.revisions { margin-top: 22px; }
+.revisions h3 { font-size: 1rem; margin: 0 0 8px; }
+.revision-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.revision-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 12px;
+  font-size: 0.85rem;
+}
+.revision-list button { font: inherit; padding: 6px 10px; border-radius: 10px; }
 
 .tab, .back, button.primary {
   font: inherit;

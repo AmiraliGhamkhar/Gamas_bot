@@ -556,6 +556,7 @@ class Settings:
     speechmatics_model: str
     #: Ask the engine to label who spoke. Engines that cannot diarize ignore
     #: it, and a run that resolves to one voice is delivered without labels.
+    #: ``DIARIZATION_ENABLED`` is an alias that wins when set.
     stt_diarize: bool
     #: Clean the extracted audio before it is uploaded to the STT engine.
     stt_preprocess: bool
@@ -788,6 +789,16 @@ class Settings:
     #: production by default; tests use the dataclass default (``False``) so
     #: offline fixtures keep a fixed request count.
     note_completeness_fill: bool = False
+    #: Keep stereo when the source has useful channel separation (diarization).
+    #: Default ``False`` preserves the mono 16 kHz STT upload.
+    stt_preserve_stereo: bool = False
+    #: Deepgram diarizer version (``latest``/``v1``/``v2``). Empty keeps the
+    #: legacy ``diarize=true`` (v1). See docs/STT_PROVIDERS.md.
+    deepgram_diarize_model: str = ""
+    #: Gamas 2.0 tariff safeguard. The proposed per-100k-credit price is *not*
+    #: applied to live plans unless ``V2_TARIFF_ACTIVATED`` is explicitly on.
+    credit_price_per_100k_toman: int = 60_000
+    v2_tariff_activated: bool = False
 
     # ------------------------------------------------------------------ views
     @property
@@ -1192,6 +1203,14 @@ def from_env(env_file: str | None = None) -> Settings:
 
     raw_providers = _env("STT_PROVIDERS", DEFAULT_STT_PROVIDERS)
     raw_note_providers = _env("NOTE_PROVIDERS", DEFAULT_NOTE_PROVIDERS)
+    # ``DIARIZATION_ENABLED`` is the Gamas 2.0 alias for ``STT_DIARIZE``; when
+    # set it wins, so either spelling turns diarization on or off.
+    _diarization_alias = _env("DIARIZATION_ENABLED", "")
+    _stt_diarize = (
+        _diarization_alias.strip().lower() in TRUTHY
+        if _diarization_alias
+        else _env_bool("STT_DIARIZE", True)
+    )
     explicit_note_provider = _env("NOTE_PROVIDER").lower()
     note_api_base_url = _env("NOTE_BASE_URL").rstrip("/")
     # The v2-era single slot (``NOTE_PROVIDER``/``NOTE_API_KEY``/``NOTE_BASE_URL``)
@@ -1324,8 +1343,14 @@ def from_env(env_file: str | None = None) -> Settings:
             "SPEECHMATICS_BASE_URL", "https://asr.api.speechmatics.com/v2"
         ).rstrip("/"),
         speechmatics_model=_env("SPEECHMATICS_MODEL", "enhanced"),
-        stt_diarize=_env_bool("STT_DIARIZE", True),
+        stt_diarize=_stt_diarize,
         stt_preprocess=_env_bool("STT_PREPROCESS", True),
+        stt_preserve_stereo=_env_bool("STT_PRESERVE_STEREO", False),
+        deepgram_diarize_model=_env("DEEPGRAM_DIARIZE_MODEL", ""),
+        credit_price_per_100k_toman=_env_int(
+            "CREDIT_PRICE_PER_100K_TOMAN", 60_000, minimum=1
+        ),
+        v2_tariff_activated=_env_bool("V2_TARIFF_ACTIVATED", False),
         stt_speaker_sensitivity=_env_float(
             "STT_SPEAKER_SENSITIVITY", 0.5, minimum=0.0, maximum=1.0
         ),
@@ -1406,7 +1431,7 @@ def from_env(env_file: str | None = None) -> Settings:
         note_quality_gate=resolve_note_quality_gate(_env("NOTE_QUALITY_GATE")),
         note_openrouter_throughput=_env_bool("NOTE_OPENROUTER_THROUGHPUT", True),
         note_structured_output=_env_bool("NOTE_STRUCTURED_OUTPUT", True),
-        note_progressive_booklet=_env_bool("NOTE_PROGRESSIVE_BOOKLET", True),
+        note_progressive_booklet=_env_bool("NOTE_PROGRESSIVE_BOOKLET", False),
         note_completeness_fill=_env_bool("NOTE_COMPLETENESS_FILL", True),
         note_compile_provider=normalize_note_compile_provider(
             _env("NOTE_COMPILE_PROVIDER")
@@ -1912,6 +1937,40 @@ def _check_admin_and_subscription(settings: Settings) -> list[ConfigDiagnostic]:
     return items
 
 
+def _check_v2_tariff_activation(settings: Settings) -> list[ConfigDiagnostic]:
+    """Guard the Gamas 2.0 tariff safeguard at startup.
+
+    The brief quotes ``CREDIT_PRICE_PER_100K_TOMAN=65`` while the live
+    catalogue sells 100 000 credits for 60 000 toman. Neither number is
+    silently reinterpreted: the proposed price stays a preview unless an
+    operator explicitly sets ``V2_TARIFF_ACTIVATED=1``, and a ~900x discrepancy
+    is reported loudly either way.
+    """
+    from .billing import PRICE_TOMAN_PER_PACKAGE, price_change_preview
+
+    preview = price_change_preview(settings.credit_price_per_100k_toman)
+    items: list[ConfigDiagnostic] = []
+    price = int(settings.credit_price_per_100k_toman)
+    if price != PRICE_TOMAN_PER_PACKAGE and not settings.v2_tariff_activated:
+        items.append(
+            ConfigDiagnostic(
+                f"CREDIT_PRICE_PER_100K_TOMAN={price} differs from the live tariff "
+                f"{PRICE_TOMAN_PER_PACKAGE} but V2_TARIFF_ACTIVATED is off; "
+                "existing plan prices are unchanged. Run "
+                "scripts/credit_price_preview.py before activating."
+            )
+        )
+    if settings.v2_tariff_activated and bool(preview["major_discrepancy"]):
+        items.append(
+            ConfigDiagnostic(
+                f"V2_TARIFF_ACTIVATED is on with a {preview['ratio_live_over_proposed']:.0f}x "
+                "price difference; verify the migration preview and payment "
+                "snapshots before deploying."
+            )
+        )
+    return items
+
+
 def _check_tariff_overrides(settings: Settings) -> list[ConfigDiagnostic]:
     if not settings.plan_values:
         return []
@@ -1938,6 +1997,7 @@ CONFIG_CHECK_RULES: tuple[ConfigCheckRule, ...] = (
     _check_media_deadlines,
     _check_admin_and_subscription,
     _check_tariff_overrides,
+    _check_v2_tariff_activation,
 )
 
 

@@ -154,3 +154,23 @@ backfills in batches and repairs a sample; offline import dirty rows are
 recomputed before serving traffic. The cache records the next credit start or
 expiry and is refreshed on read after that instant, or after a clock rollback.
 Ledger rows and allocation records remain authoritative.
+
+
+---
+
+## Integer credit arithmetic and the 2.0 price safeguard
+
+`seconds_to_credits()` and `credits_to_seconds()` now use exact `Fraction`
+arithmetic over `CREDITS_PER_UNIT = 100 000` and `SECONDS_PER_UNIT = 10 800`;
+no float ever crosses a billing boundary. 10 800 s is exactly 100 000 credits,
+1 s is 10 credits (ceiling), and the inverse floors so a balance is never
+overstated. The append-only integer-second ledger, FIFO lots, holds, refunds and
+entitlements are unchanged.
+
+The 2.0 brief quotes 75 in a heading but writes `CREDIT_PRICE_PER_100K_TOMAN=65`.
+The live price is 60 000 تومان per 100 000 credits. The literal 65 is preserved
+as `PROPOSED_PRICE_TOMAN_PER_PACKAGE` and exposed only through the read-only
+`price_change_preview()` / `scripts/credit_price_preview.py`. Activation needs
+`V2_TARIFF_ACTIVATED=1` plus a reviewed plan migration; `config.check()` warns
+on the discrepancy. No script writes to the database and no payment snapshot is
+rewritten. Full procedure and rollback SQL: `docs/GAMAS2.md`.

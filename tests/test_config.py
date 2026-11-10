@@ -794,7 +794,9 @@ class ShippedDefaultTests(unittest.TestCase):
         self.assertEqual(self.settings.note_hedge_after, 60.0)
         self.assertEqual(self.settings.note_concurrency, 3)
         self.assertTrue(self.settings.note_structured_output)
-        self.assertTrue(self.settings.note_progressive_booklet)
+        # Gamas 2.0 sends one completion message with independent downloads;
+        # intermediate draft booklets are never auto-pushed.
+        self.assertFalse(self.settings.note_progressive_booklet)
         self.assertTrue(self.settings.note_openrouter_throughput)
 
     def test_zero_still_turns_the_guards_off(self):

@@ -406,6 +406,13 @@ class StructuredNotes:
     review_questions: tuple[str, ...] = ()
     #: The lecturer's own practical advice, surfaced with its source basis.
     practical_tips: tuple[PracticalTip, ...] = ()
+    #: Anonymous speaker labels actually resolved for this class (Persian
+    #: defaults or the owner's chosen names). Never inferred from the model:
+    #: the pipeline fills this from the stored speaker turns.
+    speakers: tuple[str, ...] = ()
+    #: Timestamped chapter markers derived from paragraph timings, e.g.
+    #: «[۰۲:۳۰] مقدمهٔ درس». Purely source-derived, never generated.
+    timeline: tuple[str, ...] = ()
 
     @property
     def display_title(self) -> str:
@@ -474,6 +481,8 @@ class StructuredNotes:
                 {"term": entry.term, "definition": entry.definition}
                 for entry in self.glossary
             ],
+            "speakers": list(self.speakers),
+            "timeline": list(self.timeline),
         }
 
     def to_json(self) -> str:
@@ -543,8 +552,12 @@ class StructuredNotes:
                 for index, question in enumerate(self.review_questions, start=1)
             )
         if self.glossary:
-            parts.append("## واژه‌نامه")
+            parts.append("## واژه\u200cنامه")
             parts.extend(f"- **{entry.term}:** {entry.definition}" for entry in self.glossary)
+        if self.speakers or self.timeline:
+            parts.append("## گویندگان و زمان\u200cبندی")
+            parts.extend(f"- {line}" for line in self.speakers)
+            parts.extend(f"- {line}" for line in self.timeline)
         return "\n\n".join(parts)
 
     @classmethod
@@ -596,6 +609,8 @@ class StructuredNotes:
             learning_objectives=tuple(_string_list(payload.get("learning_objectives"))),
             review_questions=tuple(_string_list(payload.get("review_questions"))),
             practical_tips=practical_tips,
+            speakers=tuple(_string_list(payload.get("speakers")))[:12],
+            timeline=tuple(_string_list(payload.get("timeline")))[:40],
         )
         if not notes.has_content:
             raise StructuringError("ساختار جزوهٔ دریافتی خالی بود.")

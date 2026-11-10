@@ -665,8 +665,12 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
             )
 
         self.bot.queue.ensure_workers()
+        async def fake_extract(source: Path, _workdir, _settings, **_kwargs) -> Path:
+            return source
+
         with mock.patch("gamas_bot.bot.probe_media", new=fake_probe), \
              mock.patch("gamas_bot.bot.needs_transcode", return_value=False), \
+             mock.patch("gamas_bot.bot.extract_audio_track", new=fake_extract), \
              mock.patch("gamas_bot.bot.transcribe", new=fake_transcribe):
             for uid in users:
                 await self.bot._accept_media(
@@ -755,6 +759,10 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
             "gamas_bot.bot.probe_media",
             return_value=media.MediaInfo(has_audio=True, duration=120.0, audio_codec="opus"),
         ), mock.patch("gamas_bot.bot.needs_transcode", return_value=False), \
+             mock.patch(
+                 "gamas_bot.bot.extract_audio_track",
+                 new=mock.AsyncMock(return_value=src),
+             ), \
              mock.patch("gamas_bot.bot.transcribe", new=slow_stt):
             run_task = asyncio.create_task(self.bot._run_job(job))
             # The STT stub only starts when the download gate passes; on a host

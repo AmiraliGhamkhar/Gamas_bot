@@ -194,6 +194,14 @@ class LearningRepositoryMixin(UsersRepositoryMixin, BillingRepositoryMixin):
                     "WHERE session_id = ?)",
                     (int(session_id),),
                 )
+                # Weekly/monthly boards read only this append-only event table.
+                # users.quiz_points stays the all-time authority, so the ledger
+                # of points is never derived from a mutable total.
+                await self.db.execute(
+                    "INSERT INTO quiz_point_events(user_id, points, session_id, created_at) "
+                    "SELECT user_id, 10, ?, ? FROM quiz_sessions WHERE session_id = ?",
+                    (int(session_id), now, int(session_id)),
+                )
             else:
                 updated = await self.db.execute(
                     "UPDATE quiz_sessions SET current_index = current_index + 1, "

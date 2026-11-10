@@ -4,33 +4,64 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark light">
-<title>گاماس — باشگاه مطالعه</title>
+<title>گاماس استودیو</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
 <main id="app" aria-live="polite">
   <header class="topbar">
-    <h1>گاماس</h1>
-    <span class="tag">باشگاه مطالعه</span>
+    <h1>گاماس استودیو</h1>
+    <span class="tag">خانهٔ مطالعه</span>
   </header>
 
   <nav class="tabs" role="tablist">
-    <button class="tab is-active" data-view="rank" role="tab" aria-selected="true">🏆 رنک‌بندی</button>
-    <button class="tab" data-view="booklets" role="tab" aria-selected="false">📖 جزوه‌های من</button>
+    <button class="tab is-active" data-view="home" role="tab" aria-selected="true">🏠 خانه</button>
+    <button class="tab" data-view="leaderboard" role="tab" aria-selected="false">🏆 رنکینگ</button>
+    <button class="tab" data-view="studio" role="tab" aria-selected="false">📖 استودیو جزوه</button>
   </nav>
 
-  <section id="view-rank" class="view is-active" aria-labelledby="rank-title">
+  <section id="view-home" class="view is-active" aria-labelledby="home-title">
+    <h2 id="home-title" class="sr-only">خانه</h2>
+    <div class="card hero">
+      <span class="hero-label">اعتبار باقی‌مانده</span>
+      <strong id="home-credits" class="hero-value">—</strong>
+      <span id="home-unlimited" class="badge" hidden>کاربر ویژه · نامحدود ⭐</span>
+      <span class="hint">هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس</span>
+    </div>
+    <div class="stat-grid">
+      <div class="card stat"><span>امتیاز آزمون‌ها</span><strong id="home-points">—</strong></div>
+      <div class="card stat"><span>گفتارهای پردازش‌شده</span><strong id="home-submissions">—</strong></div>
+      <div class="card stat"><span>خروجی‌های آماده</span><strong id="home-artifacts">—</strong></div>
+      <div class="card stat"><span>کتابخانه</span><strong id="home-library">—</strong></div>
+    </div>
+    <div class="card actions">
+      <p class="hint">جزوه، متن خام، نکات کلیدی، آزمون و فلش‌کارت هر گفتار، پس از اتمام پردازش در پیام پایانی بات به صورت دکمه‌های جداگانه در دسترس است.</p>
+      <div class="action-row">
+        <button id="home-go-leaderboard" class="secondary">🏆 دیدن رنکینگ</button>
+        <button id="home-go-studio" class="secondary">📖 باز کردن استودیو</button>
+      </div>
+    </div>
+  </section>
+
+  <section id="view-leaderboard" class="view" aria-labelledby="leaderboard-title" hidden>
+    <h2 id="leaderboard-title" class="sr-only">رنکینگ</h2>
+    <div class="segmented" role="group" aria-label="بازهٔ رنکینگ">
+      <button data-window="all" class="is-active">همه</button>
+      <button data-window="weekly">هفتگی</button>
+      <button data-window="monthly">ماهانه</button>
+    </div>
     <div class="card me" id="me-card" hidden>
       <span class="me-label">جایگاه شما</span>
       <strong id="me-rank">—</strong>
       <span id="me-points">—</span>
     </div>
     <ol id="rank-list" class="rank-list"></ol>
-    <p id="rank-empty" class="empty" hidden>هنوز امتیازی ثبت نشده. با آزمون و فلش‌کارت شروع کنید.</p>
+    <p id="rank-empty" class="empty" hidden>در این بازه هنوز امتیازی ثبت نشده. با آزمون و فلش‌کارت شروع کنید.</p>
   </section>
 
-  <section id="view-booklets" class="view" aria-labelledby="booklets-title" hidden>
+  <section id="view-studio" class="view" aria-labelledby="studio-title" hidden>
+    <h2 id="studio-title" class="sr-only">استودیو جزوه</h2>
     <ul id="booklet-list" class="booklet-list"></ul>
     <p id="booklets-empty" class="empty" hidden>هنوز جزوه‌ای نساخته‌اید.</p>
   </section>
@@ -45,8 +76,14 @@
     <div class="editor-bar">
       <span id="editor-count" class="hint">۰</span>
       <button id="editor-save" class="primary">ذخیره</button>
+      <button id="editor-export" class="secondary">📄 خروجی Word</button>
     </div>
-    <p class="hint">این متن منبع آزمون و فلش‌کارت‌های بعدی شماست. فایل Wordی که قبلاً گرفته‌اید تغییر نمی‌کند.</p>
+    <p class="hint">این متن منبع آزمون و فلش‌کارت‌های بعدی شماست. خروجی Word تازه از همین متن ساخته می‌شود.</p>
+    <div class="revisions">
+      <h3>نسخه‌های پیشین</h3>
+      <ul id="revision-list" class="revision-list"></ul>
+      <p id="revisions-empty" class="empty" hidden>نسخهٔ پیشینی ثبت نشده است.</p>
+    </div>
   </section>
 
   <div id="toast" class="toast" role="status" hidden></div>

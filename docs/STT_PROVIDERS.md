@@ -75,3 +75,29 @@ every paragraph of a solo lecture is noise — and reported as «یک گویند
 Run the [offline check](CONFIGURATION.md#validate). cPanel preflight also probes
 connectivity but does not verify transcription quality or account entitlement.
 Test short, non-sensitive audio before accepting real work.
+
+
+---
+
+## Diarization routing (2.0)
+
+`ProviderSpec.supports_diarization` marks Speechmatics and Deepgram as native
+diarizers; an OpenAI-compatible gateway is pass-through (it may surface segment
+labels, but Whisper itself does not diarize). When `STT_DIARIZE` (or its alias
+`DIARIZATION_ENABLED`) is on, `order_specs_for_diarization()` stable-sorts the
+*configured* chain so a diarizing engine is tried first. The capacity pool still
+overflows immediately rather than waiting for a busy provider, and when no
+diarizing provider is configured the order is unchanged and the transcript simply
+carries no speaker labels.
+
+* Speechmatics: `diarization=speaker` with `speaker_sensitivity` (0–1, default
+  0.5). Documented at docs.speechmatics.com; adds 10–50 % latency.
+* Deepgram: leave `DEEPGRAM_DIARIZE_MODEL` empty for the legacy `diarize=true`
+  (v1). `latest` / `v1` / `v2` send the documented `diarize_model` parameter;
+  `latest` maps to the v2 batch diarizer for pre-recorded audio. See
+  developers.deepgram.com/docs/diarization.
+* Word confidences are kept on `Word.confidence`; overlapping words are derived
+  from timings only, never from a provider claim.
+
+Labels are resolved conservatively (`MIN_SPEAKER_SHARE`, `MIN_SPEAKER_WORDS`,
+`MAX_SPEAKERS`): a one-voice class is reported as one speaker, not as a panel.

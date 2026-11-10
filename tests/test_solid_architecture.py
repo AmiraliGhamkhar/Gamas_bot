@@ -237,9 +237,19 @@ class BotDependencyInjectionTests(unittest.IsolatedAsyncioTestCase):
                 probed_paths.append(path)
                 return MediaInfo(has_audio=True, duration=15.0, audio_codec="mp3")
 
+            prepared: list[Path] = []
+
+            async def fake_extract(source: Path, _workdir, _settings, **_kwargs) -> Path:
+                # Gamas 2.0 preprocessing is mandatory, so a valid MP3 is
+                # re-encoded through the injected media worker instead of
+                # being uploaded as-is.
+                prepared.append(source)
+                return source
+
             deps = BotDependencies(
                 probe_media_fn=fake_probe,
                 needs_transcode_fn=lambda _name, _info: False,
+                extract_audio_track_fn=fake_extract,
             )
             settings = make_settings(
                 session_path=root / "gamas",
@@ -254,6 +264,7 @@ class BotDependencyInjectionTests(unittest.IsolatedAsyncioTestCase):
             result = await bot._prepare_audio(audio, root, "clip.mp3", "audio")
             self.assertEqual(result, audio)
             self.assertEqual(probed_paths, [audio])
+            self.assertEqual(prepared, [audio])
             self.assertIs(bot.db, db)
             self.assertIs(bot.client, client)
             self.assertIs(bot.deps, deps)
