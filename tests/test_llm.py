@@ -923,11 +923,11 @@ class NaraRouterContractTests(unittest.IsolatedAsyncioTestCase):
             _parse_response(payload, "openai")
 
     def test_truncation_is_detected_in_every_request_style(self):
-        self.assertTrue(llm._output_truncated({"choices": [{"finish_reason": "length"}]}, "openai"))
-        self.assertTrue(llm._output_truncated({"candidates": [{"finishReason": "MAX_TOKENS"}]}, "gemini"))
-        self.assertTrue(llm._output_truncated({"stop_reason": "max_tokens"}, "anthropic"))
-        self.assertFalse(llm._output_truncated({"choices": [{"finish_reason": "stop"}]}, "openai"))
-        self.assertFalse(llm._output_truncated({}, "openai"))
+        self.assertTrue(llm.get_dialect("openai").is_output_truncated({"choices": [{"finish_reason": "length"}]}))
+        self.assertTrue(llm.get_dialect("gemini").is_output_truncated({"candidates": [{"finishReason": "MAX_TOKENS"}]}))
+        self.assertTrue(llm.get_dialect("anthropic").is_output_truncated({"stop_reason": "max_tokens"}))
+        self.assertFalse(llm.get_dialect("openai").is_output_truncated({"choices": [{"finish_reason": "stop"}]}))
+        self.assertFalse(llm.get_dialect("openai").is_output_truncated({}))
 
     async def test_a_truncated_answer_is_not_retried_as_bad_json(self):
         """The JSON-reminder retry cannot fix a budget cut, so it is not sent."""

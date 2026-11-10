@@ -65,7 +65,7 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
             title=title,
         )
 
-    async def test_transcript_and_persisted_booklet_are_indexed_for_the_owner(self):
+    async def test_persisted_booklet_and_results_are_available_for_the_owner(self):
         """Booklet bytes are durable DB artifacts; no completion file is pushed."""
         event = FakeJobEvent(chat_id=OWNER)
         # Record the delivered bytes so the booklet's own cover can be read.
@@ -79,10 +79,6 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
             message=event.message,
             is_admin=False,
         )
-        raw_path = self.root / "raw.txt"
-        raw_path.write_text("متن درس", encoding="utf-8")
-
-        await self.bot._deliver_raw(job, "متن درس", raw_path, "GMS-1")
         # A model-written lesson title is a full sentence; the artifact is named
         # with the 2–4-word contract instead, and that one name is the cover.
         lesson_title = "جزوهٔ جامع فیزیولوژی قلب و عروق برای آزمون پایان ترم"
@@ -103,17 +99,24 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         )
 
         items = await self.db.library_list(OWNER, limit=10)
-        self.assertEqual([item["kind"] for item in items], ["booklet", "transcript"])
+        self.assertEqual([item["kind"] for item in items], ["booklet"])
         # The virtual booklet row intentionally has no Telegram message: its
         # primary PDF and editable DOCX are persisted artifacts instead.
         self.assertEqual(items[0]["chat_id"], 0)
         self.assertEqual(items[0]["message_id"], 0)
-        self.assertEqual(items[1]["chat_id"], OWNER)
         self.assertEqual(items[0]["title"], "جامع فیزیولوژی قلب")
         self.assertIn(len(items[0]["title"].split()), (2, 3, 4))
         self.assertFalse(
             any(str(delivery["path"]).endswith((".pdf", ".docx")) for delivery in self.client.deliveries)
         )
+        with mock.patch.object(self.bot, "_reply", new_callable=mock.AsyncMock) as reply:
+            await self.bot._deliver_results(
+                job, None, "GMS-1", has_booklet=True, has_keypoints=False, has_docx=True
+            )
+        buttons = reply.await_args.kwargs["buttons"]
+        payloads = menu_payloads(buttons)
+        self.assertTrue(any(b"booklet" in payload for payload in payloads))
+        self.assertTrue(any(b"transcript" in payload for payload in payloads))
         pdf = await self.db.binary_artifact(submission_id, OWNER, "booklet")
         docx = await self.db.binary_artifact(submission_id, OWNER, "docx")
         assert pdf is not None and docx is not None
@@ -232,53 +235,6 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse((await self.db.library_item(OWNER, item_id))["unavailable"])
         self.assertIsNone(await self.db.library_item(OTHER, item_id))
 
-    async def test_delivery_prunes_to_library_max_items_and_text_fallback_is_not_saved(self):
-        for index in range(5):
-            event = FakeJobEvent(chat_id=OWNER, message_id=70 + index)
-            submission_id = await self.db.create_submission(OWNER, "audio", f"{index}.ogg")
-            job = Job(
-                submission_id=submission_id,
-                user_id=OWNER,
-                kind="audio",
-                filename=f"{index}.ogg",
-                message=event.message,
-                is_admin=False,
-            )
-            raw_path = self.root / f"{index}.txt"
-            raw_path.write_text(f"متن {index}", encoding="utf-8")
-            self.bot.client = event.client
-            await self.bot._deliver_raw(job, f"متن {index}", raw_path, f"GMS-{index}")
-
-        items = await self.db.library_list(OWNER, limit=10)
-        self.assertEqual(await self.db.library_count(OWNER), 3)
-        # A row is a name, not the Telegram caption: the icon, the em dash and
-        # the reference code never reach the library (2–4-word title contract).
-        from gamas_bot.titles import word_count
-
-        self.assertEqual([item["title"] for item in items], ["متن خام"] * 3)
-        for item in items:
-            self.assertNotIn("GMS-", item["title"])
-            self.assertGreaterEqual(word_count(item["title"]), 2)
-            self.assertLessEqual(word_count(item["title"]), 4)
-
-        failed_client = FakeTelegramClient(fail_file_delivery=True)
-        fallback_event = FakeJobEvent(chat_id=OWNER, message_id=99)
-        fallback_event.client = failed_client
-        submission_id = await self.db.create_submission(OWNER, "audio", "fallback.ogg")
-        fallback_job = Job(
-            submission_id=submission_id,
-            user_id=OWNER,
-            kind="audio",
-            filename="fallback.ogg",
-            message=fallback_event.message,
-            is_admin=False,
-        )
-        fallback_path = self.root / "fallback.txt"
-        fallback_path.write_text("متن جایگزین", encoding="utf-8")
-        self.bot.client = failed_client
-        await self.bot._deliver_raw(fallback_job, "متن جایگزین", fallback_path, "GMS-fallback")
-        self.assertEqual(await self.db.library_count(OWNER), 3)
-
     async def test_migration_010_applies_to_a_populated_pre_library_database(self):
         path = self.root / "pre-library.db"
         connection = sqlite3.connect(path)
@@ -316,28 +272,6 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(table), 1)
         finally:
             await upgraded.close()
-
-    async def test_library_write_failure_never_fails_successful_delivery(self):
-        event = FakeJobEvent(chat_id=OWNER)
-        submission_id = await self.db.create_submission(OWNER, "audio", "safe.ogg")
-        job = Job(
-            submission_id=submission_id,
-            user_id=OWNER,
-            kind="audio",
-            filename="safe.ogg",
-            message=event.message,
-            is_admin=False,
-        )
-        path = self.root / "safe.txt"
-        path.write_text("متن تحویل‌شده", encoding="utf-8")
-        self.bot.client = event.client
-        with mock.patch.object(
-            self.db, "library_add", new=mock.AsyncMock(side_effect=OSError("disk unavailable"))
-        ):
-            await self.bot._deliver_raw(job, "متن تحویل‌شده", path, "GMS-safe")
-
-        self.assertEqual(len(event.files), 1)
-        self.assertEqual(await self.db.library_count(OWNER), 0)
 
     async def test_prune_and_unavailable_accessors_are_user_scoped(self):
         first = await self._add_item(OWNER, "قدیمی", message_id=10)

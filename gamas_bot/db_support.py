@@ -25,7 +25,6 @@ class SupportRepositoryMixin(DatabaseCore):
     """Single-responsibility persistence slice for user/admin support tickets."""
 
     SUPPORT_CATEGORIES = ("payment", "technical", "subscription", "other")
-    SUPPORT_STATUSES = ("open", "awaiting_admin", "awaiting_user", "closed")
     SUPPORT_SUBJECT_MAX = 400
     SUPPORT_MESSAGE_MAX = 4000
 
@@ -159,16 +158,6 @@ class SupportRepositoryMixin(DatabaseCore):
             self.read_db,
             "SELECT * FROM support_tickets WHERE id = ?",
             (ticket_id,),
-        )
-        return dict(rows[0]) if rows else None
-
-    async def get_ticket_by_public_id(
-        self, public_id: str
-    ) -> dict[str, Any] | None:
-        rows = await _rows(
-            self.read_db,
-            "SELECT * FROM support_tickets WHERE public_ticket_id = ?",
-            (public_id,),
         )
         return dict(rows[0]) if rows else None
 

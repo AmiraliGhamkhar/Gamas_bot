@@ -63,7 +63,6 @@ BUSY_TIMEOUT_SECONDS = 3.0
 
 #: Kinds of library row the editor may change. Office exports and transcripts are
 #: intentionally excluded: their text is generated from a file, not authored.
-EDITABLE_KINDS = ("booklet",)
 
 
 class MiniAppStore:

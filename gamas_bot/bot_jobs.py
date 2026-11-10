@@ -2,7 +2,7 @@
 
 Encapsulates upload deduplication, submission admission, worker execution,
 audio/video & PowerPoint pipelines, progressive booklet generation, raw
-transcript fallback delivery, and library indexing.  External collaborators are
+artifact delivery, and library indexing.  External collaborators are
 invoked via :attr:`deps` (:class:`~gamas_bot.bot_deps.BotDependencies`).
 """
 
@@ -27,8 +27,6 @@ from .billing import format_credit_duration, format_seconds_as_credits
 from .bot_deps import deps_for
 from .bot_ui import (
     ACTIVE_LIMIT_MESSAGE,
-    MAX_RAW_PREVIEW_LINES,
-    RAW_PREVIEW_CHARS,
     TELEGRAM_CAPTION_LIMIT,
 )
 from .db import InsufficientBalanceError, TooManyActiveJobsError
@@ -46,7 +44,6 @@ from .intake import (
     _safe_user_error_text,
     _sanitize_log_value,
     classify_failure,
-    raw_parts,
 )
 from .jobs import Job, QueueFullError
 from .learning import bound_content_text
@@ -67,8 +64,7 @@ from .progress import JobProgress, to_persian_digits
 from .stt import STTError, largest_configured_upload
 from .telegram_text import render_pages
 from .telegram_transfer import UploadTooLargeError, _reported_upload_bytes
-from .textnorm import normalize_display
-from .titles import FALLBACK_BOOKLET, FALLBACK_TRANSCRIPT, short_title
+from .titles import FALLBACK_BOOKLET, short_title
 from .transcript import build_document
 
 if TYPE_CHECKING:
@@ -1273,46 +1269,6 @@ class JobPipelineMixin:
             finally:
                 await stream.aclose()
 
-    async def _save_library_item(
-        self,
-        job: Job,
-        kind: str,
-        message: Message,
-        title: str,
-        *,
-        content_text: str | None = None,
-    ) -> None:
-        chat_id = getattr(message, "chat_id", None)
-        message_id = getattr(message, "id", None)
-        if not isinstance(chat_id, int) or not isinstance(message_id, int):
-            logger.warning(
-                "delivered library item has no Telegram message reference submission=%s",
-                job.submission_id,
-            )
-            return
-        try:
-            item_id = await self.db.library_add(
-                job.user_id,
-                kind,
-                chat_id,
-                message_id,
-                job.submission_id,
-                title=title,
-            )
-            if content_text:
-                await self.db.library_set_content(item_id, content_text)
-            await self.db.library_prune(
-                job.user_id, self.settings.library_max_items,
-                protected_item_ids=self._protected_curation_items(job.user_id),
-            )
-        except Exception:
-            logger.warning(
-                "could not save delivered artifact to the library submission=%s kind=%s",
-                job.submission_id,
-                kind,
-                exc_info=True,
-            )
-
     async def _send_file(
         self, job: Job, path: Path, *, caption: str = ""
     ) -> Message | None:
@@ -1692,128 +1648,3 @@ class JobPipelineMixin:
             return
         await self._ack(event)
 
-    async def _deliver_raw(
-        self, job: Job, raw_text: str, raw_path: Path, reference: str
-    ) -> None:
-        try:
-            caption = f"📝 متن خام — {reference}"
-            message = await self._send_file(job, raw_path, caption=caption)
-            if message is not None:
-                await self._save_library_item(
-                    job,
-                    "transcript",
-                    message,
-                    short_title(caption, fallback=FALLBACK_TRANSCRIPT),
-                    content_text=bound_content_text(raw_text) or None,
-                )
-            return
-        except Exception:
-            logger.exception(
-                "raw .txt delivery failed; falling back to text submission=%s",
-                job.submission_id,
-            )
-        if job.message is None:
-            raise RuntimeError("ارسال فایل متن خام ناموفق بود.")
-        parts = raw_parts(
-            raw_text,
-            max_chars=self.settings.raw_fallback_file_chars,
-            max_parts=self.settings.raw_fallback_max_files,
-        )
-        if len(parts) > 1:
-            await self._deliver_raw_parts(job, parts, raw_path, reference)
-            return
-        if not parts:
-            raise RuntimeError(
-                "متن خام برای ارسال در چند قطعه بیش از حد بزرگ است؛ اعتبار مصرف نشد."
-            )
-        deps = deps_for(self)
-        max_pages = deps.raw_fallback_max_pages
-        rendered = deps.render_pages(raw_text)
-        pages = [page for page in rendered[:max_pages] if page.strip()]
-        truncated = len(rendered) > max_pages
-        if not pages:
-            raise RuntimeError("ارسال فایل متن خام ناموفق بود.")
-        delivered = 0
-        for page in pages:
-            try:
-                await self.client.send_message(
-                    await job.message.get_input_chat(),
-                    page,
-                    parse_mode="html",
-                    reply_to=job.message.id,
-                )
-            except Exception:
-                logger.warning(
-                    "raw text fallback page %d/%d failed submission=%s",
-                    delivered + 1,
-                    len(pages),
-                    job.submission_id,
-                    exc_info=True,
-                )
-                break
-            delivered += 1
-        if not delivered or delivered != len(pages) or truncated:
-            raise RuntimeError("ارسال کامل متن خام ناموفق بود؛ اعتبار مصرف نشد.")
-        logger.info(
-            "delivered raw transcript as %d text message(s) submission=%s",
-            delivered,
-            job.submission_id,
-        )
-
-    async def _deliver_raw_parts(
-        self, job: Job, parts: list[str], raw_path: Path, reference: str
-    ) -> None:
-        if job.message is None:
-            raise RuntimeError("پیام کاربر برای ارسال فایل در دسترس نیست.")
-        delivered = 0
-        for index, part in enumerate(parts, start=1):
-            part_path = raw_path.with_name(f"{raw_path.stem}.{index}{raw_path.suffix}")
-            try:
-                await run_file_io(
-                    part_path.write_text, part, encoding="utf-8", newline="\n"
-                )
-                await self._send_file(
-                    job,
-                    part_path,
-                    caption=(f"📝 متن خام ({index}/{len(parts)}) — {reference}"),
-                )
-            except Exception:
-                logger.warning(
-                    "raw text fallback part %d/%d failed submission=%s",
-                    index,
-                    len(parts),
-                    job.submission_id,
-                    exc_info=True,
-                )
-                break
-            finally:
-                await run_file_io(part_path.unlink, missing_ok=True)
-            delivered += 1
-        if delivered != len(parts):
-            raise RuntimeError("ارسال کامل متن خام ناموفق بود؛ اعتبار مصرف نشد.")
-        logger.info(
-            "delivered raw transcript as %d file part(s) submission=%s",
-            delivered,
-            job.submission_id,
-        )
-
-    async def _send_preview(self, job: Job, raw_text: str) -> None:
-        text = normalize_display(raw_text)
-        lines: list[str] = []
-        used = 0
-        for line in text.splitlines():
-            if (
-                used + len(line) + 1 > RAW_PREVIEW_CHARS
-                or len(lines) >= MAX_RAW_PREVIEW_LINES
-            ):
-                lines.append("…")
-                break
-            lines.append(line)
-            used += len(line) + 1
-        preview = "\n".join(lines).strip()
-        if not preview:
-            return
-        try:
-            await self._reply(job, f"👀 پیش‌نمایش متن خام:\n\n{preview}")
-        except Exception:
-            logger.debug("preview send failed", exc_info=True)

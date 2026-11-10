@@ -57,15 +57,8 @@ FORMAT_LABELS = {"word": "Word", "excel": "Excel", "ppt": "PowerPoint", "pdf": "
 FORMAT_EXTENSIONS = {"word": ".docx", "excel": ".xlsx", "ppt": ".pptx", "pdf": ".pdf"}
 
 #: The emoji shown on the menu button of each format.
-FORMAT_EMOJI = {"word": "📝", "excel": "📊", "ppt": "📖", "pdf": "📕"}
 
 #: The label printed on the cover of a Free Office Word document.
-OFFICE_MODE_LABELS = {
-    "word": "سند آزاد — Word",
-    "excel": "سند آزاد — Excel",
-    "ppt": "سند آزاد — PowerPoint",
-    "pdf": "سند آزاد — PDF",
-}
 
 #: Uploads the section accepts as *content* (a document, not a lecture).
 TEXT_FILE_EXTENSIONS = frozenset({".txt", ".md", ".markdown", ".csv", ".tsv"})

@@ -1145,11 +1145,6 @@ def _build_get_request_for(
     return get_dialect(route.style).build_get_request(route, target)
 
 
-def _output_truncated(payload: dict, provider: str) -> bool:
-    """True when the provider says the answer hit its output budget."""
-    return get_dialect(provider).is_output_truncated(payload)
-
-
 def _parse_response(payload: dict, provider: str) -> str:
     """Normalize a provider response to plain text."""
     dialect = get_dialect(provider)

@@ -227,12 +227,6 @@ class MetricsCollector:
             if self._queued_jobs > self._peak_queued_jobs:
                 self._peak_queued_jobs = self._queued_jobs
 
-    def update_queue_depth(self, queued_now: int) -> None:
-        with self._lock:
-            self._queued_jobs = max(0, queued_now)
-            if self._queued_jobs > self._peak_queued_jobs:
-                self._peak_queued_jobs = self._queued_jobs
-
     def record_deduplicated(self) -> None:
         with self._lock:
             self._deduplicated_updates += 1

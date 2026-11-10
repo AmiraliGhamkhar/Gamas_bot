@@ -113,14 +113,6 @@ class DocumentsRepositoryMixin(DatabaseCore):
         )
         return [dict(row) for row in rows]
 
-    async def document_set_library_item(
-        self, document_id: int, library_item_id: int
-    ) -> None:
-        await self._write(
-            "UPDATE documents SET library_item_id = ? WHERE id = ?",
-            (int(library_item_id), int(document_id)),
-        )
-
     async def document_update_reference(
         self, user_id: int, document_id: int, ref: str
     ) -> None:

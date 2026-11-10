@@ -26,8 +26,6 @@ class PaymentsRepositoryMixin(DatabaseCore):
 
     """Single-responsibility persistence slice for plans and manual payments."""
 
-    PAYMENT_OPEN_STATUSES = ("awaiting_payment", "pending_review", "pending")
-    PAYMENT_PENDING_REVIEW_STATUSES = ("pending_review", "pending")
 
     _PAYMENT_COLUMNS = (
         "payment_id, user_id, plan_code, status, receipt_path, created_at, "
@@ -283,12 +281,6 @@ class PaymentsRepositoryMixin(DatabaseCore):
             (user_id, limit, offset),
         )
         return [dict(row) for row in rows]
-
-    async def count_payments_by_status(self) -> dict[str, int]:
-        rows = await _rows(
-            self.read_db, "SELECT status, COUNT(*) FROM payments GROUP BY status"
-        )
-        return {row[0]: int(row[1]) for row in rows}
 
     async def review_payment(
         self,

@@ -23,7 +23,6 @@ from gamas_bot import config, llm, stt
 from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database, TooManyActiveJobsError
 from gamas_bot.docx_export import DocumentMeta, build_notes_docx
-from gamas_bot.jobs import Job
 from gamas_bot.notes import (
     MAX_PRACTICAL_TIPS,
     NoteSection,
@@ -68,55 +67,9 @@ class _BotHarness(unittest.IsolatedAsyncioTestCase):
         self.bot.client = event.client
         return event
 
-    async def delivery_job(self, event, reference: str = "GMS-1") -> Job:
-        submission = await self.db.create_submission(self.user_id, "audio", "a.wav")
-        raw = Path(self._tmp.name) / "raw.txt"
-        raw.write_text("متن", encoding="utf-8")
-        job = Job(
-            submission_id=submission,
-            user_id=self.user_id,
-            kind="audio",
-            filename="a.wav",
-            message=event.message,
-            is_admin=False,
-        )
-        job.meta["raw_path"] = raw
-        return job
-
-
 # ---------------------------------------------------------------------------
 # Delivery
 # ---------------------------------------------------------------------------
-
-
-class RawFallbackTests(_BotHarness):
-    async def test_blank_rendered_pages_do_not_fail_a_complete_delivery(self):
-        """A whitespace-only page is filtered, not evidence of a lost page."""
-        event = self.wire(fail_file_delivery=True)
-        job = await self.delivery_job(event)
-        with mock.patch(
-            "gamas_bot.bot.render_pages",
-            return_value=["صفحهٔ یک", "   ", "صفحهٔ دو"],
-        ):
-            await GamasBot._deliver_raw(
-                self.bot, job, "متن", job.meta["raw_path"], "GMS-1"
-            )
-        self.assertEqual(
-            [record["text"] for record in event.client.texts],
-            ["صفحهٔ یک", "صفحهٔ دو"],
-        )
-
-    async def test_a_page_past_the_cap_is_still_a_failed_delivery(self):
-        event = self.wire(fail_file_delivery=True)
-        job = await self.delivery_job(event, reference="GMS-2")
-        with mock.patch(
-            "gamas_bot.bot.render_pages",
-            return_value=["صفحهٔ یک", "صفحهٔ دو"],
-        ), mock.patch("gamas_bot.bot.RAW_FALLBACK_MAX_PAGES", 1):
-            with self.assertRaises(RuntimeError):
-                await GamasBot._deliver_raw(
-                    self.bot, job, "متن", job.meta["raw_path"], "GMS-2"
-                )
 
 
 # ---------------------------------------------------------------------------
