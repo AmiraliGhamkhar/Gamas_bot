@@ -284,6 +284,23 @@ class LibraryRepositoryMixin(DatabaseCore):
             (str(content_text), int(item_id)),
         )
 
+    async def library_set_structured(self, item_id: int, structured_json: str) -> None:
+        """Store the canonical structured payload of one booklet item.
+
+        Written once by the pipeline next to the text cache, so Gamas Studio
+        can edit the real structure. The submission's ``transcriptions.notes_json``
+        stays the immutable original; this column is the editable copy. The
+        028 column is optional at runtime: a bot binary may run against a
+        database whose migration has not been applied yet.
+        """
+        schema = await _rows(self.read_db, "PRAGMA table_info(library_items)")
+        if not any(str(row[1]) == "structured_json" for row in schema):
+            return
+        await self._write(
+            "UPDATE library_items SET structured_json = ? WHERE item_id = ?",
+            (str(structured_json), int(item_id)),
+        )
+
     async def library_count(self, user_id: int) -> int:
         rows = await _rows(
             self.read_db,
@@ -401,6 +418,7 @@ class LibraryRepositoryMixin(DatabaseCore):
         filename: str,
         content_type: str,
         content: bytes,
+        revision_id: int | None = None,
     ) -> None:
         """Persist a generated PDF/DOCX so callbacks never render it again.
 
@@ -408,6 +426,8 @@ class LibraryRepositoryMixin(DatabaseCore):
         SQLite BLOBs keep the deliverable private, durable across workdir cleanup,
         and atomically tied to the submission.  The digest gives operators a
         direct integrity check without retaining a second file copy.
+        ``revision_id`` (migration 028, optional) records which Studio revision
+        the bytes were rendered from; the pipeline leaves it ``NULL``.
         """
         if kind not in {"booklet", "docx"}:
             raise ValueError(f"unsupported binary artifact kind: {kind!r}")
@@ -416,6 +436,27 @@ class LibraryRepositoryMixin(DatabaseCore):
             raise ValueError("binary artifact content must not be empty")
         digest = hashlib.sha256(payload).hexdigest()
         now = iso(self._now())
+        schema = await _rows(
+            self.read_db, "PRAGMA table_info(submission_binary_artifacts)"
+        )
+        if revision_id is not None and any(
+            str(row[1]) == "revision_id" for row in schema
+        ):
+            await self._write(
+                "INSERT INTO submission_binary_artifacts("
+                "submission_id, user_id, kind, filename, content_type, content, sha256, "
+                "created_at, updated_at, revision_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(submission_id, kind) DO UPDATE SET "
+                "user_id = excluded.user_id, filename = excluded.filename, "
+                "content_type = excluded.content_type, content = excluded.content, "
+                "sha256 = excluded.sha256, updated_at = excluded.updated_at, "
+                "revision_id = excluded.revision_id",
+                (
+                    int(submission_id), int(user_id), str(kind), str(filename),
+                    str(content_type), payload, digest, now, now, int(revision_id),
+                ),
+            )
+            return
         await self._write(
             "INSERT INTO submission_binary_artifacts("
             "submission_id, user_id, kind, filename, content_type, content, sha256, "
@@ -434,11 +475,19 @@ class LibraryRepositoryMixin(DatabaseCore):
         self, submission_id: int, user_id: int, kind: str
     ) -> dict[str, Any] | None:
         """Return one owner's persisted booklet artifact, never another user's."""
+        schema = await _rows(
+            self.read_db, "PRAGMA table_info(submission_binary_artifacts)"
+        )
+        has_revision = any(str(row[1]) == "revision_id" for row in schema)
+        columns = (
+            "kind, filename, content_type, content, sha256, created_at, updated_at, revision_id"
+            if has_revision
+            else "kind, filename, content_type, content, sha256, created_at, updated_at"
+        )
         rows = await _rows(
             self.read_db,
-            "SELECT kind, filename, content_type, content, sha256, created_at, updated_at "
-            "FROM submission_binary_artifacts WHERE submission_id = ? "
-            "AND user_id = ? AND kind = ?",
+            f"SELECT {columns} FROM submission_binary_artifacts "
+            "WHERE submission_id = ? AND user_id = ? AND kind = ?",
             (int(submission_id), int(user_id), str(kind)),
         )
         return dict(rows[0]) if rows else None
@@ -485,17 +534,36 @@ class LibraryRepositoryMixin(DatabaseCore):
 
     # -- Gamas 2.0: anonymous speaker renames ------------------------------
     async def set_speaker_name(
-        self, submission_id: int, speaker_label: str, custom_name: str
+        self,
+        submission_id: int,
+        speaker_label: str,
+        custom_name: str,
+        *,
+        role: str | None = None,
     ) -> None:
-        """Map one stable speaker label to the name its owner chose."""
+        """Map one stable speaker label to the name (and role) its owner chose."""
         name = str(custom_name).strip()[:64]
         if not name:
+            return
+        schema = await _rows(self.read_db, "PRAGMA table_info(speaker_names)")
+        has_role = any(str(row[1]) == "role" for row in schema)
+        now = iso(self._now())
+        if role is not None and has_role:
+            clean_role = " ".join(str(role).split())[:64]
+            await self._write(
+                "INSERT INTO speaker_names(submission_id, speaker_label, custom_name, "
+                "role, named_at) VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(submission_id, speaker_label) DO UPDATE SET "
+                "custom_name = excluded.custom_name, role = excluded.role, "
+                "named_at = excluded.named_at",
+                (int(submission_id), str(speaker_label), name, clean_role, now),
+            )
             return
         await self._write(
             "INSERT INTO speaker_names(submission_id, speaker_label, custom_name, named_at) "
             "VALUES (?, ?, ?, ?) ON CONFLICT(submission_id, speaker_label) "
             "DO UPDATE SET custom_name = excluded.custom_name, named_at = excluded.named_at",
-            (int(submission_id), str(speaker_label), name, iso(self._now())),
+            (int(submission_id), str(speaker_label), name, now),
         )
 
     async def speaker_names(self, submission_id: int) -> dict[str, str]:

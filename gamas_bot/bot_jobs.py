@@ -1203,10 +1203,16 @@ class JobPipelineMixin:
                     existing = await self.db.library_list_kind(
                         job.user_id, "booklet", limit=50
                     )
-                    if not any(
-                        int(row.get("submission_id") or 0) == job.submission_id
-                        for row in existing
-                    ):
+                    match = next(
+                        (
+                            row
+                            for row in existing
+                            if int(row.get("submission_id") or 0) == job.submission_id
+                            and not row.get("unavailable")
+                        ),
+                        None,
+                    )
+                    if match is None:
                         item_id = await self.db.library_add(
                             job.user_id,
                             "booklet",
@@ -1217,6 +1223,14 @@ class JobPipelineMixin:
                         )
                         if learning_text:
                             await self.db.library_set_content(item_id, learning_text)
+                    else:
+                        item_id = int(match["item_id"])
+                    # The structured model the renderers used, stored next to
+                    # the text cache so Gamas Studio can edit the real
+                    # structure (the submission's notes_json stays the
+                    # immutable original). Refreshed on every delivery so a
+                    # re-processed submission never serves a stale structure.
+                    await self.db.library_set_structured(item_id, notes.to_json())
                 except Exception:
                     logger.warning(
                         "could not create virtual booklet library record submission=%s",

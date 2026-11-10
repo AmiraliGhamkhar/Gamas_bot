@@ -13,6 +13,8 @@ PDF/DOCX/PPTX → owner-scoped extraction → SQLite text cache → notes/export
              → narration only on explicit action
 Text/CSV/Markdown → private Office draft → bounded build → Word/Excel/PPT/PDF
 Wallet → order + receipt → admin review → transactional credit
+Studio edit → validated StructuredNotes → revision → PDF + DOCX artifacts
+           → stored bytes served to Studio and Telegram (never a re-render)
 ```
 
 ## Code map
@@ -26,8 +28,9 @@ Modules are under `gamas_bot/`.
 | Contracts/routing | `protocols`, `bot_deps`, `routing`, `conversation_state`, `intake` |
 | Queue/transfers | `jobs`, `capacity`, `progress`, `telegram_transfer`, `telegram_text` |
 | Media/providers | `media`, `media_worker`, `presentations`, `stt`, `llm`, `http_util` |
-| Notes/documents | `transcript`, `notes`, `notes_evidence`, `doc_extract`, `ocr`, `office*`, `docx_export`, `pdf_export` |
+| Notes/documents | `transcript`, `notes`, `notes_evidence`, `doc_extract`, `ocr`, `office*`, `docx_export`, `notes_pdf` (RTL PDF), `pdf_export` |
 | Note-provider layer | `config` (routes), `llm_profiles` (capabilities), `llm` (wire dialects, bounded retries/failover), `notes` (strict JSON + domain validation) |
+| Mini App / Studio | `mini_app` (WSGI + initData auth), `mini_app_store` (per-request SQLite facade), `mini_app/` static bundle |
 | Storage/billing | `db` facade, `db_*` facets, `billing`, `subscription`, `learning` |
 
 ## Note-provider layer
@@ -52,7 +55,14 @@ so no migration or admin change is needed to switch routes. See
 - Transcript delivery determines transcription billing; learning uses durable
   pending/finalized/refunded recovery. See [Billing](BILLING.md).
 - SQLite holds text/metadata; Telegram holds generated files. Library pruning does
-  not erase the separate document-text cache.
+  not erase the separate document-text cache. The Studio's re-rendered booklet
+  artifacts are stored per revision in SQLite BLOBs (migration 027/028); both
+  Telegram buttons and Studio exports serve those exact bytes.
+- Studio structured editing uses one canonical model end to end:
+  `StructuredNotes → editor → validated StructuredNotes → PDF + DOCX`. There is
+  no structured→plain-text→reconstruct path, editing never overwrites the raw
+  transcript or the original pipeline output, and a failed render aborts the
+  save so a revision never points at missing artifacts.
 - Shutdown stops intake and joins/rejects work before closing SQLite. Startup
   recovery follows the singleton lock.
 - `migrations/v3/` runs at startup. Add numbered migrations; never edit applied SQL.

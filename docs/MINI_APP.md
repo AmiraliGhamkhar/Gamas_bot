@@ -1,7 +1,8 @@
-# Mini App — ranking and booklet editing
+# Mini App — Gamas Studio (ranking and booklet editing)
 
-A small Telegram Mini App that shows the leaderboard and lets a student edit
-their own booklet text. It is a plain WSGI application with no JavaScript build
+A Telegram Mini App — **Gamas Studio** — that shows the leaderboard and lets a
+student edit their own booklet (structured editor) and manage speaker names.
+It is a plain WSGI application with no JavaScript build
 step, so it runs on the same cPanel host as the bot or behind Cloudflare.
 
 | Piece | File |
@@ -88,8 +89,11 @@ else's booklet.
 | `GET` | `/health` | liveness JSON, no credentials |
 | `POST` | `/api/leaderboard` | `{initData, limit}` → top rows + the caller's rank |
 | `POST` | `/api/booklets` | `{initData}` → the caller's booklets |
-| `POST` | `/api/booklet` | `{initData, id}` → one booklet's text |
-| `PUT` | `/api/booklet` | `{initData, id, text}` → save the edited text |
+| `POST` | `/api/booklet` | `{initData, id}` → one booklet (text + structured) |
+| `PUT` | `/api/booklet` | `{initData, id, text}` → save legacy plain text |
+
+(The full Studio surface — structured saves, exports, revisions, speakers — is
+listed under “Gamas Studio 3.0” below.)
 
 Limits: request bodies are capped at 1 MB, edited text at 200 000 characters
 (the same budget the quiz and flashcard builders read), and `limit` is clamped to
@@ -97,11 +101,23 @@ Limits: request bodies are capped at 1 MB, edited text at 200 000 characters
 
 ## What an edit changes, and what it does not
 
-An edit writes `library_items.content_text` — the text cache that the quiz,
-flashcard and booklet-learning paths read. It does **not** re-render the Word
-file that was already delivered to Telegram: that file is a snapshot, and
-re-rendering it would mean loading `python-docx` inside a web worker on every
-save for no benefit. The app says so in the editor.
+There are two editing paths, and both are deliberate:
+
+* **Structured edit (the Studio editor).** Saving validates the document
+  through the canonical `StructuredNotes` model, appends a revision, and
+  re-renders **both** the PDF and the DOCX from that model with the same
+  engines the pipeline uses. The rendered bytes are stored per revision as
+  binary artifacts, so the Exports tab and Telegram download buttons always
+  serve a file that matches a saved revision. The raw transcript and the
+  original pipeline output are never overwritten.
+* **Plain-text edit (the legacy fallback).** Items without structured content
+  (older submissions) still save `library_items.content_text` — the cache the
+  quiz, flashcard and booklet-learning paths read — and append a text
+  revision. The Word file already delivered to Telegram stays a snapshot.
+
+Rendering happens synchronously inside the save transaction boundary on
+purpose: a failed render aborts the save, so a revision can never point at
+missing or half-written artifacts.
 
 ## Why SQLite directly instead of the bot's API
 
@@ -119,22 +135,70 @@ connection; a Passenger worker cannot borrow it. Both open the same file instead
 
 ---
 
-## Gamas Studio 2.0
+## Gamas Studio 3.0 — structured editing, speakers, dual-format exports
 
-The app is now three tabs: **Home** (credits, points, counts, two working
-shortcuts), **Leaderboard** (all-time / weekly / monthly) and **Booklet Studio**
-(edit, revision history, one-click restore and a fresh DOCX export). The editor
-no longer describes the Word file as immutable: the export is rendered from the
-*current* text with the same `build_plain_docx` RTL engine the bot uses.
+The Mini App is now **Gamas Studio**, a Persian-first RTL single-page app with
+five areas: **Home** (credits, points, counts, working shortcuts),
+**Leaderboard** (all-time / weekly / monthly), **Submissions** (per-submission
+detail with speakers and available artifacts), **Booklet Editor** and its
+**Preview**, **Exports**, and **Revision History**.
+
+The booklet editor is **structured**: it edits the canonical `StructuredNotes`
+model (title, summary, sections, paragraphs, lists, definitions, examples, key
+points, callouts, process steps, tables, formulas, glossary) rather than a
+plain-text blob. The data flow is one-directional and never lossy:
+
+```
+StructuredNotes  →  Mini App editor  →  validated StructuredNotes
+                                                 ↓
+                                     PDF renderer + DOCX renderer
+                                                 ↓
+                                   binary artifacts per revision
+```
+
+There is no structured→text→reconstruct round trip anywhere. Editing support is
+add/delete/reorder (move up/down) at the section, subsection and block level;
+tables are editable cell-by-cell with row/column add and remove.
 
 | Endpoint | Method | Purpose |
 | --- | --- | --- |
 | `/api/home` | POST | the caller's own, non-private summary |
 | `/api/leaderboard` | POST | `window` = `all` / `weekly` / `monthly` |
-| `/api/booklets`, `/api/booklet` | POST / PUT | list, read, save (appends a revision) |
-| `/api/booklet/export` | POST | DOCX bytes from the current text |
+| `/api/submissions` | POST | the caller's submissions with artifact availability |
+| `/api/booklets`, `/api/booklet` | POST | list booklets / read one (text **and** structured) |
+| `/api/booklet` | PUT | save — `document` (structured) or `text` (legacy) |
+| `/api/booklet/export` | POST | rendered bytes: `format` = `pdf` / `docx` |
 | `/api/revisions`, `/api/revision` | POST / PUT | history and restore |
-| `/api/speakers` | POST / PUT | anonymous turns and owner-chosen names |
+| `/api/speakers` | POST / PUT | anonymous turns, owner-chosen names and roles |
+
+Save-time validation is the canonical model's, not a hand-rolled copy: block
+types, required fields, table shapes, ordering and per-field size bounds are
+enforced by `StructuredNotes.from_payload`; control characters are stripped
+first (they would make Word refuse the file), and unknown block types are
+**rejected** (backward compatibility is carried by the stored JSON, not by
+accepting arbitrary input). Limits: 1 MB request body, 400 000 serialized
+characters, 200 sections, 200 000 characters of plain text.
+
+Every structured save re-renders both formats and stores them against the new
+revision. Exports are served from the stored artifacts — downloading is free,
+idempotent, and never re-renders on the hot path.
+
+### Speakers
+
+`/api/speakers` groups the stored diarization turns per submission. Labels are
+the stable speaker ids from the pipeline (`SPEAKER_00` style) — never a guessed
+identity. The owner may set a display name and an optional role per label; both
+are stored in `speaker_names` (migration 028) scoped to the submission and user.
+Renaming never touches the audio, timestamps or segments; names and roles are
+refreshed into the saved structured JSON so transcript views show them, and the
+original label is kept whenever no name was confirmed.
+
+### Migration 028
+
+`migrations/v3/028_studio_structured_editing.sql` is additive (new table
+columns and one index). The bot applies it on start; the WSGI worker never
+migrates. Until the bot has run once, structured saves fail with 503 rather
+than half-writing.
 
 Every endpoint re-verifies raw `initData` with the bot token. Weekly/monthly
 boards read the append-only `quiz_point_events` table; all-time still reads the

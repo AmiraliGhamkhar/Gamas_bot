@@ -15,7 +15,7 @@ facing copy stays Persian.
 | Deliverables | `gamas_bot/notes_pdf.py`, `artifacts.py`, `bot_jobs._deliver_results`, `bot._show_result_set` | One completion message with persisted independent buttons: primary Persian PDF, raw transcript (chat), raw TXT download, key points, Studio edit, editable DOCX, quiz and flashcards. No raw transcript, final file, chat preview or intermediate draft is automatically pushed. |
 | Central library | migrations 026/027, `submission_artifacts`, `submission_binary_artifacts` | Text artifacts retain compact source pointers; primary PDF/DOCX bytes are owner-scoped, persisted binary artifacts. A file callback sends the exact stored bytes and never reruns a renderer or model. |
 | RTL booklet | `gamas_bot/notes.py` `speakers`/`timeline`, `docx_export.build_notes_docx` appendix | A source-derived «گویندگان و زمان\u200cبندی» appendix uses real turn labels and real paragraph timings. Nothing is generated or inferred. |
-| Gamas Studio | `gamas_bot/mini_app.py`, `mini_app_store.py`, `mini_app/*` | Home, Leaderboard (all/weekly/monthly), Booklet Studio (edit, revision history, restore, DOCX export), speaker rename API. All endpoints re-verify Telegram `initData`. |
+| Gamas Studio | `gamas_bot/mini_app.py`, `mini_app_store.py`, `mini_app/*` | Home, Leaderboard (all/weekly/monthly), Submissions, **structured booklet editor** (canonical `StructuredNotes` model; add/delete/reorder blocks, table cell/row/column editing; validated server-side), Preview, Exports (PDF + DOCX from stored per-revision artifacts), revision history and restore, speaker names **and optional owner-typed roles**. All endpoints re-verify Telegram `initData`. |
 | Main menu | `bot._reply_keyboard` | Persistent, non-glass `ReplyKeyboardMarkup` with a real WebView button for Studio when `MINI_APP_URL` is set. |
 | Credits | `gamas_bot/billing.py` integer arithmetic, `config` tariff guard, `scripts/credit_price_preview.py` | 100 000 credits = 3 h = 10 800 s, `ceil` on seconds and `floor` on credits, exact `Fraction` math. Minute-based billing copy is gone. |
 | Evaluation | `gamas_bot/diarization_eval.py`, `scripts/evaluate_diarization.py` | Offline DER, JER, WER, CER with greedy label alignment. No network, no model calls. |
@@ -70,9 +70,10 @@ is retained only as a backward-compatible setting; completion delivery never
 posts intermediate drafts.
 
 
-## 4. Migrations 026 and 027
+## 4. Migrations 026, 027 and 028
 
-`migrations/v3/026_gamas2_studio.sql` and `027_persisted_booklet_files.sql` are additive:
+`migrations/v3/026_gamas2_studio.sql`, `027_persisted_booklet_files.sql` and
+`028_studio_structured_editing.sql` are additive:
 
 ```sql
 ALTER TABLE transcriptions ADD COLUMN speaker_turns_json TEXT;
@@ -88,6 +89,11 @@ CREATE TABLE quiz_point_events (...);
 CREATE INDEX idx_quiz_point_events_time ...;
 CREATE TABLE submission_binary_artifacts (...);
 CREATE INDEX idx_submission_binary_artifacts_user ...;
+ALTER TABLE speaker_names ADD COLUMN role TEXT NOT NULL DEFAULT '';
+ALTER TABLE library_items ADD COLUMN structured_json TEXT;
+ALTER TABLE booklet_revisions ADD COLUMN structured_json TEXT;
+ALTER TABLE submission_binary_artifacts ADD COLUMN revision_id INTEGER;
+CREATE INDEX idx_submission_binary_artifacts_revision ...;
 ```
 
 `APPLICATION_TABLES` in `db_core.py` was extended to match; migration tests
@@ -108,10 +114,13 @@ HTTP 500 can occur during a rolling deploy.
    python-docx, aiosqlite and Telethon were already required).
 3. Run `python -m scripts.cpanel_preflight` (or `python -m gamas_bot.config` diagnostics)
    and resolve any `CREDIT_PRICE_PER_100K_TOMAN` diagnostic.
-4. Start the bot once so migration 026 applies; confirm
-   `SELECT name FROM schema_migrations WHERE name='026_gamas2_studio.sql'`.
+4. Start the bot once so migrations 026–028 apply; confirm
+   `SELECT name FROM schema_migrations WHERE name LIKE '02[678]%'` returns all
+   three rows.
 5. Restart the Mini App WSGI worker (Passenger "Restart" or gunicorn restart).
-   The app degrades gracefully if it is deployed *before* the migration.
+   The app degrades gracefully if it is deployed *before* the migration — a
+   structured save answers 503 until migration 028 exists rather than
+   half-writing.
 6. Smoke test: `/health`, then open the app from Telegram and load Home.
 
 ### Rollback
@@ -129,7 +138,7 @@ DROP TABLE IF EXISTS booklet_revisions;
 DROP TABLE IF EXISTS submission_artifacts;
 DROP TABLE IF EXISTS diarization_reference_turns;
 DROP TABLE IF EXISTS speaker_names;
-DELETE FROM schema_migrations WHERE name IN ('026_gamas2_studio.sql', '027_persisted_booklet_files.sql');
+DELETE FROM schema_migrations WHERE name IN ('026_gamas2_studio.sql', '027_persisted_booklet_files.sql', '028_studio_structured_editing.sql');
 ```
 
 `ALTER TABLE ... DROP COLUMN` is unnecessary: SQLite ignores extra columns for
@@ -172,6 +181,14 @@ Reference/hypothesis JSON shape:
   transaction as a correct answer; all-time still uses `users.quiz_points`.
 * An edited booklet has a revision row and its DOCX export matches the edited
   text; a stranger's `initData` cannot read or edit it.
+* A structured edit saves, appends a revision carrying its own
+  `structured_json`, and re-renders both the PDF and the DOCX; the Exports tab
+  and the Telegram buttons serve those exact stored bytes. The raw transcript
+  and the original pipeline output are unchanged. A malformed or oversized
+  document is rejected with 400/413 and writes nothing.
+* Speaker names and optional roles persist per submission, survive reload, and
+  appear in the transcript/booklet views; the original label is kept when no
+  name was confirmed.
 * `seconds_to_credits(10800) == 100000` exactly, and no plan price changed.
 
 ## 6. Security notes

@@ -20,12 +20,18 @@ Telegram/provider connections.
 
 | Input or menu | Result |
 | --- | --- |
-| Audio, video, voice note | Transcript first; RTL Word booklet when a note provider is configured |
+| Audio, video, voice note | Transcript first; RTL Word booklet and Persian PDF when a note provider is configured |
 | PDF, DOCX, PowerPoint | Extracted text, source-based notes and exports |
 | Free Office / آفیس رایگان | Text, TXT, Markdown, CSV or TSV to Word, Excel, PowerPoint or PDF |
+| Gamas Studio (Mini App) | Leaderboards, per-submission speakers (owner-named), **structured booklet editor**, PDF/DOCX exports and revision history |
 | Library | Saved Telegram file references and learning actions |
 | Wallet | Credit, plans and manually reviewed receipts |
 | Support | Persistent support tickets |
+
+The Studio editor works on the same validated `StructuredNotes` model the
+pipeline renders: every save re-renders the polished RTL PDF and the editable
+DOCX from that model and stores them per revision; downloads are free,
+idempotent and never re-render. See [the Mini App docs](docs/MINI_APP.md).
 
 PowerPoint narration starts only from its audio button. Scans/photos need
 [opt-in third-party OCR](docs/OCR.md). Without note keys, document notes and Office
