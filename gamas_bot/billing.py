@@ -172,11 +172,6 @@ def price_change_preview(
     }
 
 
-def seconds_per_package(credits: int) -> int:
-    """Ledger seconds a credit amount pays for, at the canonical rate."""
-    return credits_to_seconds(credits)
-
-
 def plan_seconds(hours: int) -> int:
     """Ledger seconds a plan's hours are worth.
 
@@ -335,28 +330,6 @@ def format_validity(days: int | None) -> str:
     if days is None:
         return "بدون انقضا"
     return to_persian_digits(f"{int(days)} روز")
-
-
-def format_usage(seconds: int | float | None) -> str:
-    """Render a measured duration the way a lecture is described.
-
-    «۱ ساعت و ۳۰ دقیقه» for the wallet and the mini app; a billing screen that
-    states only «۵۴۰۰ اعتبار» leaves the user to do the arithmetic.
-    """
-    return format_duration(seconds)
-
-
-def format_plan_row(plan: Plan) -> str:
-    """One plan line shared by the Telegram screen and the mini app.
-
-    The credit amount leads, because that is what the user spends; the hours it
-    covers follow in parentheses so the tariff stays transparent.
-    """
-    return (
-        f"{format_credits(plan.included_credits)}"
-        f" ({to_persian_digits(plan.included_hours)} ساعت)"
-        f" — {format_toman(plan.price_toman)}"
-    )
 
 
 def format_credit_duration(seconds: int | float | None) -> str:

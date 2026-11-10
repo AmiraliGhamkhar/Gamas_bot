@@ -389,7 +389,7 @@ SUBSCRIPTION_ADMIN_PERMISSION_ALERT: Final = (
     "⚠️ بررسی عضویت کانال گاماس ناموفق است.\n"
     "دلیل: {detail}\n"
     "ربات باید administrator کانال باشد؛ "
-    "راهنمای تنظیم در docs/TELEGRAM_SUBSCRIPTION.md را ببینید."
+    "راهنمای تنظیم در docs/ADMIN.md را ببینید."
 )
 SUBSCRIPTION_NOT_ADMIN_ALERT: Final = (
     "⚠️ ربات در کانال گاماس administrator نیست؛ بررسی عضویت کاربران "

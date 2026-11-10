@@ -182,12 +182,11 @@ REMOVED_V2_SETTINGS = (
 )
 
 STT_DOC_PAGES = (
-    "docs/STT_PROVIDERS.md",
+    "docs/PROVIDERS.md",
     "docs/CONFIGURATION.md",
     "docs/TROUBLESHOOTING.md",
-    "docs/PROVIDERS.md",
-    "docs/DEPLOY_CPANEL.md",
-    "docs/DEPLOY_WINDOWS.md",
+    "docs/CPANEL.md",
+    "docs/WINDOWS.md",
     ".env.example",
 )
 
@@ -317,8 +316,8 @@ class SttDocumentationTests(unittest.TestCase):
                     removed, text, f"{page} still documents the removed setting {removed}"
                 )
 
-    def test_stt_providers_page_documents_the_real_settings(self):
-        text = (REPO_ROOT / "docs/STT_PROVIDERS.md").read_text(encoding="utf-8")
+    def test_providers_page_documents_the_real_stt_settings(self):
+        text = (REPO_ROOT / "docs/PROVIDERS.md").read_text(encoding="utf-8")
         for name in (
             "STT_PROVIDERS",
             "STT_LANGUAGE",
@@ -332,7 +331,7 @@ class SttDocumentationTests(unittest.TestCase):
             "STT_OPENAI_MODEL",
             "STT_OPENAI_MAX_UPLOAD_BYTES",
         ):
-            self.assertIn(name, text, f"docs/STT_PROVIDERS.md does not document {name}")
+            self.assertIn(name, text, f"docs/PROVIDERS.md does not document {name}")
 
 
 class DocumentationNavigationTests(unittest.TestCase):
@@ -354,7 +353,12 @@ class DocumentationNavigationTests(unittest.TestCase):
     def test_setup_guides_are_linked_from_both_indexes(self):
         for index in (REPO_ROOT / "README.md", REPO_ROOT / "docs" / "README.md"):
             text = index.read_text(encoding="utf-8")
-            for guide in ("DEPLOY_WINDOWS.md", "DEPLOY_CPANEL.md"):
+            for guide in (
+                "WINDOWS.md",
+                "CPANEL.md",
+                "MINIAPP_CPANEL.md",
+                "MINIAPP_CLOUDFLARE.md",
+            ):
                 with self.subTest(index=index.name, guide=guide):
                     self.assertIn(guide, text)
 

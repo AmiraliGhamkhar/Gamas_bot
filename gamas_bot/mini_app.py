@@ -909,11 +909,6 @@ def _static(
     return [body]
 
 
-def default_now() -> float:
-    """Indirection so tests can freeze the clock without patching ``time``."""
-    return time.time()
-
-
 __all__ = [
     "AppError",
     "MAX_BOOKLET_CHARS",

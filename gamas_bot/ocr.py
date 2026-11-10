@@ -37,7 +37,7 @@ here and verified against an in-process mock in ``tests/test_ocr.py``)::
     POST /DevSDK/ajax/ocr_backend.php data=<JSON> → HTML holding the OCR text
 
 Defects of the reference client this module fixes (each one has a regression
-test in ``tests/test_ocr.py``; ``docs/OCR.md`` explains them at length):
+test in ``tests/test_ocr.py``; ``docs/FEATURES.md`` explains them):
 
 1. **Mojibake on the fallback path.** ``raw.encode("utf-8").decode("unicode_escape")``
    re-reads UTF-8 bytes as Latin-1, so any page whose text contains a lone
@@ -398,7 +398,7 @@ def _default_session_factory(impersonate: str) -> Any:
     except ImportError as exc:  # pragma: no cover - exercised by the deployment
         raise OcrUnavailableError(
             "OCR needs the optional 'curl-cffi' package: "
-            "pip install 'gamas-bot[ocr]' (see docs/OCR.md)."
+            "pip install 'gamas-bot[ocr]' (see docs/FEATURES.md)."
         ) from exc
     session: Any = curl_requests.Session(impersonate=impersonate)
     session.headers.update(

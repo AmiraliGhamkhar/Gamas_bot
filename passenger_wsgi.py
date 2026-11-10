@@ -8,7 +8,7 @@ only two things:
 
 It never exposes configuration, user data or logs. Point an external monitor
 (for example UptimeRobot) at the app URL every 5 minutes as a second watchdog
-next to the cron job described in docs/DEPLOY_CPANEL.md.
+next to the cron job described in docs/CPANEL.md.
 """
 
 from __future__ import annotations

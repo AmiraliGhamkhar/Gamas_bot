@@ -26,7 +26,7 @@ from unittest import mock
 import arabic_reshaper
 from pypdf import PdfReader
 
-import gamas_bot.pdf_export as pdf_export
+import gamas_bot.pdf_common as pdf_common
 from gamas_bot.docx_export import DocumentMeta
 from gamas_bot.office import OfficeError, build_office_document
 from gamas_bot.pdf_export import build_office_pdf
@@ -153,8 +153,8 @@ class TopicListTests(unittest.TestCase):
 
 class FontErrorTests(unittest.TestCase):
     def test_a_missing_font_is_an_office_error_not_a_crash(self):
-        with mock.patch.object(pdf_export, "_find_font", return_value=None), mock.patch.object(
-            pdf_export, "_font_names", None
+        with mock.patch.object(pdf_common, "find_font", return_value=None), mock.patch.object(
+            pdf_common, "_font_names", None
         ):
             with self.assertRaises(OfficeError):
                 _build()

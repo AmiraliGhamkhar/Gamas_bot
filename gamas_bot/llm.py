@@ -49,7 +49,6 @@ from .http_util import (
 from .llm_profiles import (
     get_provider_profile,
     to_gemini_schema,
-    to_non_strict_openai_json_schema,
 )
 from .metrics import METRICS
 from .protocols import LLMProviderDialect
@@ -644,11 +643,6 @@ def _gemini_schema(node: object) -> object:
     return to_gemini_schema(node)
 
 
-def _openai_json_schema(schema: dict) -> dict:
-    """The portable non-strict OpenAI-compatible ``json_schema`` wrapper."""
-    return to_non_strict_openai_json_schema(schema)
-
-
 #: Gemini FinishReason values that report safety, policy or recitation blocks
 #: (https://ai.google.dev/api/generate-content#FinishReason).
 GEMINI_BLOCKED_FINISH_REASONS = frozenset(
@@ -1154,12 +1148,6 @@ def _build_get_request_for(
 def _output_truncated(payload: dict, provider: str) -> bool:
     """True when the provider says the answer hit its output budget."""
     return get_dialect(provider).is_output_truncated(payload)
-
-
-def _reasoning_exhausted_output(payload: dict, provider: str) -> bool:
-    """True when a thinking/reasoning model spent its output tokens on thoughts
-    and left zero visible answer text."""
-    return get_dialect(provider).is_reasoning_exhausted(payload)
 
 
 def _parse_response(payload: dict, provider: str) -> str:

@@ -30,14 +30,6 @@ if TYPE_CHECKING:
 
 
 @runtime_checkable
-class ClockProtocol(Protocol):
-    """Injectable time source for deterministic workflow and repository logic."""
-
-    def utc_now(self) -> datetime: ...
-    def monotonic(self) -> float: ...
-
-
-@runtime_checkable
 class STTProviderAdapter(Protocol):
     """Uniform contract every speech-to-text backend satisfies (OCP / LSP)."""
 

@@ -891,7 +891,7 @@ async def _deepgram(
         # ``diarize`` puts a speaker index on each word. ``diarize_model``
         # (latest/v1/v2) selects the diarizer build and implies diarization;
         # when it is unset the legacy ``diarize=true`` (v1) is sent, which
-        # keeps older deployments byte-identical. See docs/STT_PROVIDERS.md.
+        # keeps older deployments byte-identical. See docs/PROVIDERS.md.
         diarize_model = (getattr(settings, "deepgram_diarize_model", "") or "").strip()
         if diarize_model in ("latest", "v1", "v2"):
             params["diarize_model"] = diarize_model
@@ -1139,12 +1139,6 @@ PROVIDERS: dict[str, ProviderSpec] = {
 def register_stt_provider(spec: ProviderSpec) -> None:
     """Register or override an STT provider adapter (OCP extension point)."""
     PROVIDERS[spec.slug] = spec
-
-
-def provider_supports_diarization(slug: str) -> bool:
-    """Whether *slug* natively diarizes (per-word speaker labels)."""
-    spec = PROVIDERS.get(slug)
-    return bool(spec.supports_diarization) if spec is not None else False
 
 
 def order_specs_for_diarization(

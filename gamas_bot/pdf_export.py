@@ -34,19 +34,14 @@ from __future__ import annotations
 import io
 import logging
 from datetime import datetime
-from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
 
-import arabic_reshaper
-from bidi.algorithm import get_display
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfgen import canvas as _rl_canvas
 from reportlab.platypus import (
     BaseDocTemplate,
     Flowable,
@@ -60,7 +55,6 @@ from reportlab.platypus import (
 )
 from reportlab.platypus.flowables import HRFlowable
 
-from .config import PROJECT_DIR
 from .docx_export import (
     ACCENT_HEX,
     ACCENT_SOFT_HEX,
@@ -82,6 +76,11 @@ from .docx_export import (
 )
 from .mdblocks import heading_level
 from .office import OfficeDocument, OfficeError
+from .pdf_common import (
+    InvariantCanvas as _InvariantCanvas,
+    register_fonts as _fonts,
+    visual as _visual,
+)
 from .progress import to_persian_digits
 
 logger = logging.getLogger(__name__)
@@ -123,57 +122,9 @@ QUOTE_FRAME = _color(QUOTE_BORDER)
 # The Persian face (Vazirmatn, SIL OFL, bundled in the repository)
 # ---------------------------------------------------------------------------
 
-_REGULAR_NAME = "GamasVazir"
-_BOLD_NAME = "GamasVazirBold"
-_REGULAR_FILE = "Vazirmatn-Regular.ttf"
-_BOLD_FILE = "Vazirmatn-Bold.ttf"
-
-#: Registered once per process (reportlab rejects a second registration).
-_font_names: tuple[str, str] | None = None
-
-
-def _find_font(filename: str) -> Path | None:
-    """The bundled font file, discovered the way the logo is discovered."""
-    for base in (PROJECT_DIR / "assets" / "fonts", Path.cwd() / "assets" / "fonts"):
-        path = base / filename
-        try:
-            if path.is_file():
-                return path
-        except OSError:  # pragma: no cover - defensive
-            continue
-    return None
-
-
-def _fonts() -> tuple[str, str]:
-    """``(regular, bold)`` registered font names, or an ``OfficeError``."""
-    global _font_names
-    if _font_names is not None:
-        return _font_names
-    regular = _find_font(_REGULAR_FILE)
-    if regular is None:
-        raise OfficeError(
-            "فونت فارسی روی سرور پیدا نشد؛ assets/fonts/Vazirmatn-Regular.ttf لازم است."
-        )
-    bold = _find_font(_BOLD_FILE) or regular
-    try:
-        if _REGULAR_NAME not in pdfmetrics.getRegisteredFontNames():
-            pdfmetrics.registerFont(TTFont(_REGULAR_NAME, str(regular)))
-        if _BOLD_NAME not in pdfmetrics.getRegisteredFontNames():
-            pdfmetrics.registerFont(TTFont(_BOLD_NAME, str(bold)))
-    except Exception as exc:
-        raise OfficeError("فونت فارسی خوانده نشد؛ فایل فونت خراب است.") from exc
-    _font_names = (_REGULAR_NAME, _BOLD_NAME)
-    return _font_names
-
-
 # ---------------------------------------------------------------------------
 # Persian text: shaping and logical-order wrapping
 # ---------------------------------------------------------------------------
-
-
-def _visual(text: str) -> str:
-    """One line in storage order: contextual forms, then visual reordering."""
-    return get_display(arabic_reshaper.reshape(text))
 
 
 def _wrap_logical(text: str, font: str, size: float, max_width: float) -> list[str]:
@@ -408,14 +359,6 @@ def _body_flowables(
 # ---------------------------------------------------------------------------
 # Page frame, header, footer
 # ---------------------------------------------------------------------------
-
-
-class _InvariantCanvas(_rl_canvas.Canvas):
-    """A canvas with a fixed ID and timestamps: identical bytes per input."""
-
-    def __init__(self, *args, **kwargs) -> None:
-        kwargs["invariant"] = 1
-        super().__init__(*args, **kwargs)
 
 
 def _page_decorator(title: str, *, with_toc: bool):

@@ -1,49 +1,84 @@
 # Troubleshooting
 
-Use the interpreter that runs the bot. Start with the offline check.
-
-**Windows PowerShell:**
+Always use the interpreter that runs the bot, from the repository root.
 
 ```powershell
 .\.venv\Scripts\python.exe -m gamas_bot --check
 ```
 
-**cPanel Terminal** (virtualenv active):
-
 ```bash
 python -m gamas_bot --check
 python -m scripts.cpanel_preflight
 python scripts/ensure_running.py status
+tail -n 80 data/logs/launcher.err
 ```
 
-| Problem | Action |
-| --- | --- |
-| Python/`py` not found | Install Python 3.11–3.13 and reopen PowerShell; on cPanel use the host's interpreter path. |
-| PowerShell blocks activation | Call `.\.venv\Scripts\python.exe` directly; no execution-policy change needed. |
-| Missing packages | Install `requirements.txt` with the same interpreter used to run the bot. |
-| PyAV/lxml wheel fails | Use supported Python/OS; old cPanel Linux may need CloudLinux/AlmaLinux 8+. |
-| Configuration `FAIL` | Fill Telegram credentials, numeric `ADMIN_IDS` and at least one STT key. |
-| No response | Check token, network, logs and status; stop any competing instance. |
-| Duplicate instance / exit 3 | Stop the other copy; do not remove its active lock. |
-| Process disappears without traceback | Check hosting limits; lower concurrency/file limits or change hosting. |
-| Cron fails | Use absolute interpreter/script paths and once-per-minute scheduling; read `data/logs/launcher.err`. |
-| Bot restarts during maintenance | Pause cron and Passenger/uptime-monitor triggers. |
-| Permission/location failure | Keep private paths outside web roots; on cPanel use `chmod 600 .env` and `chmod 700 data`. |
-| Transcript but no booklet | Check note-provider keys and quality/provider errors. Delivered transcription remains charged. |
-| Provider 401/403/402/429 | Check key, entitlement, balance and quota; configure fallback rather than blindly raising limits. |
-| Gemini HTTP 400 `INVALID_ARGUMENT` with structured output | The 2026-11-07 test succeeded only with `NOTE_STRUCTURED_OUTPUT=0`; the exact rejected field was not isolated. Set that value and `NOTE_GEMINI_THINKING_BUDGET=-1`, restart, then re-run the generation probe. The client also has one bounded schema-dropping retry for this error class. [Providers](PROVIDERS.md) |
-| `finish_reason=length` / `MAX_TOKENS`, empty or cut-off booklet | The answer hit the output budget and is deliberately rejected, not delivered as a partial note. Check `requested_output_tokens` in the log, confirm `NOTE_MAX_OUTPUT_TOKENS`, and restart after any change before assuming truncation. |
-| Old process sends 16,384 tokens although `.env` says 32,768 | Settings load only at startup; a stale process or a `.env` that was never reloaded is a plausible cause, not a proven one. Compare the log's `requested_output_tokens` with `--show-config`, then stop/start with `scripts/ensure_running.py`. |
-| NaraRouter HTTP 502 on generation (including with structured output and reasoning off) | Observed for `laguna-s-2.1` on 2026-11-07: three attempts plus a second test failed. Entitlement/metadata PASS is not a generation guarantee. Remove `nara` from `NOTE_PROVIDERS` until a real generation probe succeeds; keep the `NARA_*` settings for later. Include the safe `request_id` in a support report. |
-| Metadata probe passes but generation fails | These are different checks. Only `--generate` verifies generation; see [Providers](PROVIDERS.md#how-to-test-a-provider-independently). |
-| Provider order/keys look wrong after editing `.env` | Run `python -m gamas_bot --check` or `python -m scripts.probe_note_providers --show-config` (both credential-free). Leave `NOTE_API_KEY`/`NOTE_BASE_URL` blank to avoid an extra legacy `openai_compatible` leg, and restart the bot. |
-| Persian Deepgram error | Use `STT_LANGUAGE=fa` with `DEEPGRAM_MODEL=nova-3`. |
-| Scan/photo refused | OCR is off by default. Read [OCR](OCR.md) before enabling remote uploads. |
-| Word layout/font issue | Install bundled Vazirmatn on the viewing PC; check in Microsoft Word. |
-| Receipt but no credit | A human admin must approve the order. Check Wallet history. |
-| Membership behaves unexpectedly | Check channel reference, bot admin role and settings. Infrastructure errors deliberately fail open. |
-| Large document/export refused | Split the source; limits refuse overflow instead of truncating. |
+## Startup and host
 
-For help, collect the failing command, Python version, redacted error, job reference
-and timestamp. Never send `.env`, sessions, receipts or private text.
-[Logs/backups](OPERATIONS.md) · [Configuration](CONFIGURATION.md)
+| Symptom | Fix |
+| --- | --- |
+| `py`/`python` not found | Install Python 3.11–3.13, reopen the shell; on cPanel use the host's interpreter path |
+| PowerShell blocks activation | Call `.\\.venv\\Scripts\\python.exe` directly — no policy change needed |
+| Missing packages | Reinstall `requirements.txt` with the **same** interpreter |
+| `pip install` fails on `av`/`lxml` | 64-bit Python 3.11–3.13; old cPanel Linux needs CloudLinux/AlmaLinux 8+ |
+| `--check` prints `FAIL` | Fill Telegram credentials, numeric `ADMIN_IDS`, one STT key |
+| `misconfigured` from the launcher | The same failures as `--check`; read `data/logs/launcher.err` |
+| `throttled` | A failed start happened < 45 s ago; fix the cause, then `--force` |
+| Exit code `3` / duplicate instance | Another copy holds the session lock; stop it, never delete the lock |
+| Process vanishes without traceback | Host CPU/RAM/process limit; lower jobs/media/note concurrency or change hosting |
+| Cron does nothing | Absolute interpreter and script paths; check `launcher.err` |
+| Bot restarts during maintenance | Cron / scheduled task / uptime monitor still enabled — pause them |
+| Permission or path failure | Private paths outside web roots; `chmod 600 .env`, `chmod 700 data` |
+
+## Telegram and delivery
+
+| Symptom | Fix |
+| --- | --- |
+| No response to `/start` | Wrong token, no network, competing instance, or membership gate — check the log |
+| Membership prompt loops | Bot must be a channel **admin**; verify a non-admin account; `SUBSCRIPTION_CHANNEL` must resolve |
+| Members blocked wrongly | Infrastructure errors fail open and alert admins — check those alerts and the bot's admin role |
+| Button opens a blank app | `MINI_APP_URL` not HTTPS, has a path, or the app is down ([cPanel](MINIAPP_CPANEL.md) / [Cloudflare](MINIAPP_CLOUDFLARE.md)) |
+| Upload refused | Over `MAX_FILE_SIZE`/`MAX_MEDIA_DURATION_SECONDS`; unmeasurable audio is refused before charging |
+| Transcript arrives, no booklet | No note provider key, or provider/quality failure — the transcription stays charged by design |
+
+## Providers
+
+| Symptom | Fix |
+| --- | --- |
+| `401`/`403`/`402`/`429` | Key, entitlement, balance or rate limit; configure a fallback instead of raising limits blindly |
+| `finish_reason=length` / empty booklet | Output budget exhausted; the answer is rejected, not delivered. Check `NOTE_MAX_OUTPUT_TOKENS`, restart |
+| Old process sends 16 384 tokens although `.env` says 32 768 | Settings load at startup only; compare the log's `requested_output_tokens` with `--show-config`, then restart |
+| Metadata probe passes, generation fails | Different checks — only `--generate` proves generation, and it costs quota |
+| Gemini HTTP 400 `INVALID_ARGUMENT` with structured output | Set `NOTE_STRUCTURED_OUTPUT=0` (tested profile), restart, re-probe; one bounded schema-dropping retry exists |
+| NaraRouter HTTP 502 | Observed for `laguna-s-2.1`; remove `nara` from `NOTE_PROVIDERS` until a real generation probe passes |
+| Provider order looks wrong after editing `.env` | `--show-config` shows the effective chain; blank `NOTE_API_KEY`/`NOTE_BASE_URL` avoid an extra legacy route |
+| Persian Deepgram error | Use `STT_LANGUAGE=fa` with `DEEPGRAM_MODEL=nova-3` |
+| Long provider timeouts on a slow free tier | Lower `NOTE_MAX_OUTPUT_TOKENS`, set `NOTE_HEDGE_AFTER_SECONDS=0`, raise `NOTE_REQUEST_TIMEOUT_SECONDS` with evidence |
+
+## Documents, Office and OCR
+
+| Symptom | Fix |
+| --- | --- |
+| `.doc` refused | Save as `.docx`; legacy `.ppt`/`.pps`/`.pot` is converted automatically |
+| Large source refused | Split it; limits refuse overflow instead of truncating |
+| Scan or photo refused | OCR is off by default; read [OCR](FEATURES.md#ocr-opt-in-third-party) before enabling uploads |
+| Word layout or font looks wrong | Install Vazirmatn from `assets/fonts/`; check in Microsoft Word |
+| Excel cell shows a formula | Values are literal strings by design; nothing is calculated |
+| Narration never starts | It needs the explicit **🎧 پردازش صدای ارائه** button, not the upload |
+
+## Billing and accounts
+
+| Symptom | Fix |
+| --- | --- |
+| Receipt uploaded, no credit | A human admin must approve the order; see the wallet history |
+| Balance differs from the sum of history | Ledger is authoritative; the cache refreshes on read after the next expiry — report it, do not edit rows |
+| Paid generation failed, no refund | Check the pending charge; refunds are automatic once, recoverable at startup |
+| Quiz/flashcard refused | Admission caps: one active quiz, 3 sessions/hour, 30 decks — or insufficient credit |
+
+## What to include in a support request
+
+Failing command, Python version, redacted error, `GMS-#####` job reference and
+the UTC timestamp. Never send `.env`, sessions, receipts, keys or transcript text.
+
+Logs and backups: [Operations](OPERATIONS.md) · settings:
+[Configuration](CONFIGURATION.md) · providers: [Providers](PROVIDERS.md).

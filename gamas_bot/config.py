@@ -793,7 +793,7 @@ class Settings:
     #: Default ``False`` preserves the mono 16 kHz STT upload.
     stt_preserve_stereo: bool = False
     #: Deepgram diarizer version (``latest``/``v1``/``v2``). Empty keeps the
-    #: legacy ``diarize=true`` (v1). See docs/STT_PROVIDERS.md.
+    #: legacy ``diarize=true`` (v1). See docs/PROVIDERS.md.
     deepgram_diarize_model: str = ""
     #: Confirmed per-100k-credit tariff. Business-confirmed: 65,000 Toman per
     #: 100,000 credits (3 hours). Override via CREDIT_PRICE_PER_100K_TOMAN only
