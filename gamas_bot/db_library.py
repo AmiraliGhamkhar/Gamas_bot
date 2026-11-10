@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Collection
 from datetime import timedelta
 from typing import Any
@@ -382,7 +383,7 @@ class LibraryRepositoryMixin(DatabaseCore):
         )
 
     async def artifact_list(self, submission_id: int) -> list[dict[str, Any]]:
-        """All artifact kinds registered for one submission (central library)."""
+        """All lightweight artifact registrations for one submission."""
         rows = await _rows(
             self.read_db,
             "SELECT artifact_id, kind, reference, payload, available, created_at "
@@ -391,15 +392,85 @@ class LibraryRepositoryMixin(DatabaseCore):
         )
         return [dict(row) for row in rows]
 
+    async def binary_artifact_upsert(
+        self,
+        submission_id: int,
+        user_id: int,
+        kind: str,
+        *,
+        filename: str,
+        content_type: str,
+        content: bytes,
+    ) -> None:
+        """Persist a generated PDF/DOCX so callbacks never render it again.
+
+        File bytes intentionally live outside the compact JSON-pointer registry:
+        SQLite BLOBs keep the deliverable private, durable across workdir cleanup,
+        and atomically tied to the submission.  The digest gives operators a
+        direct integrity check without retaining a second file copy.
+        """
+        if kind not in {"booklet", "docx"}:
+            raise ValueError(f"unsupported binary artifact kind: {kind!r}")
+        payload = bytes(content)
+        if not payload:
+            raise ValueError("binary artifact content must not be empty")
+        digest = hashlib.sha256(payload).hexdigest()
+        now = iso(self._now())
+        await self._write(
+            "INSERT INTO submission_binary_artifacts("
+            "submission_id, user_id, kind, filename, content_type, content, sha256, "
+            "created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(submission_id, kind) DO UPDATE SET "
+            "user_id = excluded.user_id, filename = excluded.filename, "
+            "content_type = excluded.content_type, content = excluded.content, "
+            "sha256 = excluded.sha256, updated_at = excluded.updated_at",
+            (
+                int(submission_id), int(user_id), str(kind), str(filename),
+                str(content_type), payload, digest, now, now,
+            ),
+        )
+
+    async def binary_artifact(
+        self, submission_id: int, user_id: int, kind: str
+    ) -> dict[str, Any] | None:
+        """Return one owner's persisted booklet artifact, never another user's."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT kind, filename, content_type, content, sha256, created_at, updated_at "
+            "FROM submission_binary_artifacts WHERE submission_id = ? "
+            "AND user_id = ? AND kind = ?",
+            (int(submission_id), int(user_id), str(kind)),
+        )
+        return dict(rows[0]) if rows else None
+
+    async def binary_artifact_kinds(self, submission_id: int, user_id: int | None = None) -> set[str]:
+        """Available persisted PDF/DOCX kinds, optionally owner-scoped."""
+        if user_id is None:
+            rows = await _rows(
+                self.read_db,
+                "SELECT kind FROM submission_binary_artifacts WHERE submission_id = ?",
+                (int(submission_id),),
+            )
+        else:
+            rows = await _rows(
+                self.read_db,
+                "SELECT kind FROM submission_binary_artifacts WHERE submission_id = ? "
+                "AND user_id = ?",
+                (int(submission_id), int(user_id)),
+            )
+        return {str(row[0]) for row in rows}
+
     async def artifact_kinds(self, submission_id: int) -> set[str]:
-        """The *available* kinds: only these may appear as download buttons."""
+        """The available kinds across lightweight and persisted file registries."""
         rows = await _rows(
             self.read_db,
             "SELECT kind FROM submission_artifacts "
             "WHERE submission_id = ? AND available = 1",
             (int(submission_id),),
         )
-        return {str(row[0]) for row in rows}
+        kinds = {str(row[0]) for row in rows}
+        kinds.update(await self.binary_artifact_kinds(submission_id))
+        return kinds
 
     async def artifact(
         self, submission_id: int, kind: str

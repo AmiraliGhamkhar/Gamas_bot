@@ -382,6 +382,7 @@ class NoteSection:
 class GlossaryEntry:
     term: str
     definition: str
+    term_en: str = ""
 
     @classmethod
     def from_payload(cls, payload: object) -> "GlossaryEntry | None":
@@ -389,7 +390,9 @@ class GlossaryEntry:
             return None
         term = _bounded_text(payload.get("term"), MAX_TITLE_CHARS)
         definition = _bounded_text(payload.get("definition"))
-        return cls(term, definition) if term and definition else None
+        if not term or not definition:
+            return None
+        return cls(term, definition, _bounded_text(payload.get("term_en"), MAX_TITLE_CHARS))
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,7 +481,7 @@ class StructuredNotes:
             "key_points": list(self.key_points),
             "review_questions": list(self.review_questions),
             "glossary": [
-                {"term": entry.term, "definition": entry.definition}
+                {"term": entry.term, "term_en": entry.term_en, "definition": entry.definition}
                 for entry in self.glossary
             ],
             "speakers": list(self.speakers),
@@ -553,7 +556,12 @@ class StructuredNotes:
             )
         if self.glossary:
             parts.append("## واژه\u200cنامه")
-            parts.extend(f"- **{entry.term}:** {entry.definition}" for entry in self.glossary)
+            parts.extend(
+                f"- **{entry.term}"
+                + (f" ({entry.term_en})" if entry.term_en else "")
+                + f":** {entry.definition}"
+                for entry in self.glossary
+            )
         if self.speakers or self.timeline:
             parts.append("## گویندگان و زمان\u200cبندی")
             parts.extend(f"- {line}" for line in self.speakers)

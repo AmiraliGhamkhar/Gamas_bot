@@ -2,6 +2,21 @@
 
 Concise history; detailed patches and earlier notes remain in Git history.
 
+## Unreleased — reference-grade booklets and confirmed tariff (2026-11-10)
+
+- Added the native `StructuredNotes` PDF renderer with a generated Persian RTL
+  cover/topic map, hierarchy, educational blocks, RTL tables, glossary, running
+  furniture and an explicit auto-generation disclaimer. PDF and DOCX use the
+  same validated note model.
+- Added additive migration 027 for owner-scoped persisted PDF/DOCX bytes. The
+  completion screen sends no files automatically; output buttons retrieve the
+  exact stored file and never render a booklet again. Legacy Telegram-hosted
+  Word booklets remain readable.
+- Confirmed the canonical tariff: 100,000 credits / 3 hours / 10,800 seconds
+  costs 65,000 Toman. All six built-in plan defaults and deployment instructions
+  now use proportional 30-day prices; historical payment snapshots and custom
+  plans remain untouched.
+
 ## Unreleased — note-provider compatibility and tested deployment profile (2026-11-07)
 
 - Audited the real configuration/routing/request path. Shipped project defaults

@@ -18,8 +18,11 @@ because the costs differ:
   later, when a temporary work directory is long gone.
 * **Key points** — read from the stored ``notes_json``. Same argument: the notes
   are already persisted, so the list is free and stable.
-* **Booklet** — forwarded from the user's own library (it was sent exactly once,
-  so it lives in Telegram and is never rebuilt).
+* **Booklet PDF / DOCX** — rendered once from the validated stored-note model
+  at completion and persisted as owner-scoped binary artifacts. Fetch callbacks
+  only send those exact bytes: they never invoke a renderer or a model.
+* **Mini App editor** — links to Gamas Studio; the editor exports the latest
+  saved version.
 
 Everything here is deterministic and side-effect free, which is why it is a
 module instead of another method on the pipeline.
@@ -39,7 +42,8 @@ logger = logging.getLogger(__name__)
 #: The artifacts a finished submission can offer. ``txt`` is the plain-text
 #: *file* download; ``transcript`` is the same text rendered in chat. They are
 #: independent buttons because a student may want to read it now or save it.
-KIND_BOOKLET = "booklet"
+KIND_BOOKLET = "booklet"   # PDF (primary student deliverable)
+KIND_DOCX = "docx"         # editable Word version
 KIND_TRANSCRIPT = "transcript"
 KIND_TXT = "txt"
 KIND_KEYPOINTS = "keypoints"
@@ -47,6 +51,7 @@ KIND_QUIZ = "quiz"
 KIND_FLASHCARDS = "flashcards"
 KINDS = (
     KIND_BOOKLET,
+    KIND_DOCX,
     KIND_TRANSCRIPT,
     KIND_TXT,
     KIND_KEYPOINTS,
@@ -169,19 +174,28 @@ def delivery_markup(
 ):
     """One completion screen, one button per independently available artifact.
 
+    Button contract (per engineering addendum):
+
+    * 📘 دریافت جزوه PDF  — primary booklet (PDF)
+    * 📝 دریافت متن خام
+    * ⭐ دریافت نکات کلیدی
+    * ✏️ ویرایش جزوه در Gamas Studio  (when a Mini App URL is configured)
+    * 📄 دریافت نسخه Word  (when the DOCX artifact is available)
+
     Nothing appears here unless it really exists: ``kinds`` comes from the
-    central submission artifact registry, ``item_id`` is the user's own booklet
-    row (so quiz/flashcards can only be built from their own material), and the
-    Studio button only shows when a Mini App URL is configured. Every button
-    leads to a working handler — there are no placeholders.
+    central submission artifact registry. Every button retrieves a persisted
+    artifact and is free/idempotent — no button triggers transcription or
+    booklet regeneration.
     """
     from telethon import Button
 
     rows: list[list[Any]] = []
+    # PDF is the primary student deliverable; it gets its own row.
     if has_booklet and KIND_BOOKLET in kinds:
         rows.append(
             [Button.inline(texts.BTN_GET_BOOKLET, callback_for(reference, KIND_BOOKLET))]
         )
+    # Second row: transcript, txt, key points
     row: list[Any] = []
     if KIND_TRANSCRIPT in kinds:
         row.append(
@@ -189,20 +203,27 @@ def delivery_markup(
                 texts.BTN_GET_TRANSCRIPT, callback_for(reference, KIND_TRANSCRIPT)
             )
         )
-    if KIND_TXT in kinds:
-        row.append(
-            Button.inline(texts.BTN_DOWNLOAD_TXT, callback_for(reference, KIND_TXT))
-        )
     if KIND_KEYPOINTS in kinds:
         row.append(
             Button.inline(
                 texts.BTN_GET_KEYPOINTS, callback_for(reference, KIND_KEYPOINTS)
             )
         )
+    if KIND_TXT in kinds:
+        row.append(
+            Button.inline(texts.BTN_DOWNLOAD_TXT, callback_for(reference, KIND_TXT))
+        )
     if row:
         rows.append(row)
+    # DOCX is independently persisted and is offered whenever it exists.
+    if KIND_DOCX in kinds:
+        rows.append(
+            [Button.inline(texts.BTN_GET_DOCX, callback_for(reference, KIND_DOCX))]
+        )
+    # Studio button (Web App)
     if mini_app_url and has_booklet:
         rows.append([texts.mini_app_button(texts.BTN_EDIT_IN_APP, mini_app_url)])
+    # Learning buttons (quiz / flashcards)
     learning: list[Any] = []
     if item_id and KIND_QUIZ in kinds:
         learning.append(

@@ -168,6 +168,12 @@ class ModelParsingTests(unittest.TestCase):
         self.assertIn("| a | b |", markdown)
         self.assertIn("**واژه:**", markdown)
 
+    def test_markdown_preserves_an_optional_english_glossary_equivalent(self):
+        notes = notes_from_dict(
+            {"glossary": [{"term": "تعرفه", "term_en": "Tariff", "definition": "قاعده"}]}
+        )
+        self.assertIn("**تعرفه (Tariff):** قاعده", notes.to_markdown())
+
     def test_to_json_round_trip(self):
         notes = notes_from_dict(json.loads(sample_notes_json()))
         restored = notes_from_dict(json.loads(notes.to_json()))

@@ -12,8 +12,8 @@ facing copy stays Persian.
 | Speaker diarization | `gamas_bot/stt.py` `ProviderSpec.supports_diarization`, `order_specs_for_diarization()`, Speechmatics `diarization=speaker` + `speaker_sensitivity`, Deepgram `diarize_model` | A diarizing provider is preferred when `STT_DIARIZE` is on, without waiting for a busy slot. A pass-through Whisper gateway is never preferred for diarization. No provider is called with an undocumented parameter. |
 | Speaker-aware transcript | `gamas_bot/transcript.py` `Word.confidence/overlaps/speaker_id`, `SpeakerTurn`, `build_speaker_turns()`, `mark_overlaps()`, `TranscriptDocument.turns_to_json()` | Anonymous labels only (`گویندهٔ ۱` …). Unknown attribution stays explicitly unknown. Custom names are owner-supplied. Overlap spans and word confidences are preserved. |
 | Audio preprocessing | `gamas_bot/media_worker.py` `adaptive_filters()`, `--adaptive`, `--stereo`; `gamas_bot/media.py` command builders | Mandatory when `STT_PREPROCESS=1`: every upload is cleaned by a bounded PyAV chain. The original file is never modified. Stereo is preserved only with `STT_PRESERVE_STEREO=1` **and** a genuinely 2-channel source; the WAV budget doubles so the file can never exceed a provider ceiling. |
-| Deliverables | `gamas_bot/artifacts.py`, `bot_jobs._deliver_results`, `bot._show_result_set` | One completion message with independent buttons: booklet DOCX, raw transcript (chat), raw TXT download, key points, edit in Studio, quiz, flashcards. No raw transcript push, no chat preview, no intermediate draft booklet (`NOTE_PROGRESSIVE_BOOKLET=0`). |
-| Central library | migration 026 `submission_artifacts`, `db_library.artifact_upsert/artifact_kinds` | One submission, many independent artifacts. Buttons are derived from the registry, so a missing artifact never produces a dead button. |
+| Deliverables | `gamas_bot/notes_pdf.py`, `artifacts.py`, `bot_jobs._deliver_results`, `bot._show_result_set` | One completion message with persisted independent buttons: primary Persian PDF, raw transcript (chat), raw TXT download, key points, Studio edit, editable DOCX, quiz and flashcards. No raw transcript, final file, chat preview or intermediate draft is automatically pushed. |
+| Central library | migrations 026/027, `submission_artifacts`, `submission_binary_artifacts` | Text artifacts retain compact source pointers; primary PDF/DOCX bytes are owner-scoped, persisted binary artifacts. A file callback sends the exact stored bytes and never reruns a renderer or model. |
 | RTL booklet | `gamas_bot/notes.py` `speakers`/`timeline`, `docx_export.build_notes_docx` appendix | A source-derived «گویندگان و زمان\u200cبندی» appendix uses real turn labels and real paragraph timings. Nothing is generated or inferred. |
 | Gamas Studio | `gamas_bot/mini_app.py`, `mini_app_store.py`, `mini_app/*` | Home, Leaderboard (all/weekly/monthly), Booklet Studio (edit, revision history, restore, DOCX export), speaker rename API. All endpoints re-verify Telegram `initData`. |
 | Main menu | `bot._reply_keyboard` | Persistent, non-glass `ReplyKeyboardMarkup` with a real WebView button for Studio when `MINI_APP_URL` is set. |
@@ -25,50 +25,54 @@ facing copy stays Persian.
 The ledger stays **append-only integer seconds**: FIFO lots, holds, expiry,
 refunds, referrals, free/one-shot grants and unlimited entitlements are intact.
 Credits are a *display currency* derived from seconds, never a second ledger.
-Payment snapshots keep their frozen prices. No existing applied migration (001–025)
-was edited; migration 026 is additive.
+Payment snapshots keep their frozen prices. No existing applied migration (001–026)
+was edited; migration 027 is additive.
 
-## 2. Price safeguard (read before touching tariffs)
+## 2. Confirmed tariff
 
-The brief's §9.2 heading says 75, but its literal value is
-`CREDIT_PRICE_PER_100K_TOMAN=65`. The live catalogue sells 100 000 credits for
-**60 000 تومان** (20 000/hour). A ~923× discrepancy would destroy revenue if
-applied silently, so:
+The authoritative paid tariff is **100,000 credits = 3 hours = 10,800 seconds
+= 65,000 Toman**. `65` is not a price and is never interpreted as shorthand for
+65,000. The exact integer/rational conversion lives in `billing.py`; the ledger
+remains append-only integer seconds.
 
-* `65` is preserved **literally** — it is never read as 65 000 or written over
-  production prices;
-* `scripts/credit_price_preview.py` prints the unit, the ratio, the untouched
-  catalogue, read-only live plan rows and a **non-executed** SQL draft;
-* activation requires an explicit `V2_TARIFF_ACTIVATED=1` *and* a reviewed
-  plan migration; `config.check()` emits a diagnostic whenever the candidate
-  differs from the live tariff while activation is off;
-* the script performs **no writes** (`writes_performed: false`).
+The six built-in 30-day plans are 65,000 / 195,000 / 260,000 / 520,000 /
+780,000 / 1,300,000 Toman for 3 / 9 / 12 / 24 / 36 / 60 hours respectively.
+`plan_catalog()` and the database's built-in-plan sync use those values. The
+sync updates only non-custom active catalogue rows; it never changes custom
+plans, historical payment snapshots, subscriptions, wallet transactions, lots,
+holds, refunds or balances.
+
+Use the read-only viewer to confirm the effective tariff before deployment:
 
 ```bash
-python -m scripts.credit_price_preview --candidate 65 --db /path/to/bot.sqlite3
+python -m scripts.credit_price_preview
 ```
+
 
 ## 3. Configuration
 
-New keys (all documented in `.env.example`):
+The production tariff values are environment-only configuration (documented in
+`.env.example`); do not rewrite a production `.env` automatically:
 
 ```dotenv
-DIARIZATION_ENABLED=true            # alias; wins over STT_DIARIZE when set
-STT_PRESERVE_STEREO=false           # opt-in; doubles PCM upload size
-DEEPGRAM_DIARIZE_MODEL=              # latest | v1 | v2; empty = legacy diarize=true
-NOTE_PROGRESSIVE_BOOKLET=0          # 2.0 default: no intermediate booklets
-CREDIT_PRICE_PER_100K_TOMAN=65      # preview only (literal)
-V2_TARIFF_ACTIVATED=0               # explicit activation gate
-MINI_APP_URL=https://…              # shows the Studio button
+CREDIT_PRICE_PER_100K_TOMAN=65000
+PLAN_3_PRICE_TOMAN=65000
+PLAN_9_PRICE_TOMAN=195000
+PLAN_12_PRICE_TOMAN=260000
+PLAN_24_PRICE_TOMAN=520000
+PLAN_36_PRICE_TOMAN=780000
+PLAN_60_PRICE_TOMAN=1300000
 ```
 
-`STT_PREPROCESS` remains `true`. Setting it to `0` is the only A/B escape hatch;
-with it off, the old upload-as-is path returns. `STT_Diarize` alias handling is
-in `config.from_env`.
+`DIARIZATION_ENABLED`, `STT_PRESERVE_STEREO`, `DEEPGRAM_DIARIZE_MODEL` and
+`MINI_APP_URL` remain as documented in `.env.example`. `NOTE_PROGRESSIVE_BOOKLET`
+is retained only as a backward-compatible setting; completion delivery never
+posts intermediate drafts.
 
-## 4. Migration 026
 
-`migrations/v3/026_gamas2_studio.sql` is additive:
+## 4. Migrations 026 and 027
+
+`migrations/v3/026_gamas2_studio.sql` and `027_persisted_booklet_files.sql` are additive:
 
 ```sql
 ALTER TABLE transcriptions ADD COLUMN speaker_turns_json TEXT;
@@ -82,10 +86,12 @@ CREATE TABLE booklet_revisions (...);
 CREATE INDEX idx_booklet_revisions_item ...;
 CREATE TABLE quiz_point_events (...);
 CREATE INDEX idx_quiz_point_events_time ...;
+CREATE TABLE submission_binary_artifacts (...);
+CREATE INDEX idx_submission_binary_artifacts_user ...;
 ```
 
-`APPLICATION_TABLES` in `db_core.py` was extended to match; the migration gate
-test (`tests/test_migration_schema.py`) verifies the exact table set. The bot
+`APPLICATION_TABLES` in `db_core.py` was extended to match; migration tests
+verify the resulting table set. The bot
 applies migrations itself on startup (WAL, `BEGIN IMMEDIATE`, one-record-per-file
 in `schema_migrations`).
 
@@ -117,12 +123,13 @@ Migration 026 adds columns and tables only; it rewrites no row. To roll back:
 3. Optionally drop the new objects (the old code never references them):
 
 ```sql
+DROP TABLE IF EXISTS submission_binary_artifacts;
 DROP TABLE IF EXISTS quiz_point_events;
 DROP TABLE IF EXISTS booklet_revisions;
 DROP TABLE IF EXISTS submission_artifacts;
 DROP TABLE IF EXISTS diarization_reference_turns;
 DROP TABLE IF EXISTS speaker_names;
-DELETE FROM schema_migrations WHERE name='026_gamas2_studio.sql';
+DELETE FROM schema_migrations WHERE name IN ('026_gamas2_studio.sql', '027_persisted_booklet_files.sql');
 ```
 
 `ALTER TABLE ... DROP COLUMN` is unnecessary: SQLite ignores extra columns for
@@ -131,8 +138,8 @@ its columns explicitly. Do **not** roll back by restoring a pre-migration
 backup unless you are willing to lose submissions created after deployment.
 
 Behavioural rollback without SQL: set `STT_PREPROCESS=0`,
-`NOTE_PROGRESSIVE_BOOKLET=1`, `STT_PRESERVE_STEREO=0` and clear `MINI_APP_URL`.
-The old flow then resumes on the same schema.
+`STT_PRESERVE_STEREO=0` and clear `MINI_APP_URL`. Do not re-enable intermediate
+booklet pushes: the completion-button delivery contract remains in force.
 
 ## 5. Verification
 
@@ -157,8 +164,10 @@ Reference/hypothesis JSON shape:
 * A multi-speaker recording produces `گویندهٔ ۱/۲` headings and a speaker
   appendix in the DOCX; a solo lecture produces no invented speakers.
 * A WAV with overlapping voices reports `overlap_count > 0`.
-* A finished job sends exactly one completion message; pressing the TXT button
-  downloads a real `.txt`, and quiz/flashcards buttons lead to working screens.
+* A finished job sends exactly one completion message; primary PDF and editable
+  DOCX bytes are persisted before workdir cleanup, and their buttons send those
+  exact files without invoking a renderer. The TXT button downloads a real
+  `.txt`; quiz/flashcards buttons lead to working screens.
 * Weekly/monthly leaderboards reflect `quiz_point_events` written in the same
   transaction as a correct answer; all-time still uses `users.quiz_points`.
 * An edited booklet has a revision row and its DOCX export matches the edited

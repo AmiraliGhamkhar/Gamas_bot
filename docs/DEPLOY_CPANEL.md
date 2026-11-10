@@ -154,7 +154,23 @@ support tickets; do not replace an existing `.env` wholesale.
    Expect one real request per route plus bounded retries, and check the
    reported title, section count and elapsed time. If a route fails, remove it
    from `NOTE_PROVIDERS` before starting the bot.
-6. **Restart the bot after changes.** Environment values are read only at
+6. **Set the confirmed tariff before restart.** In the application's `.env`
+   (never in a production database), set the exact canonical values:
+
+   ```dotenv
+   PLAN_3_PRICE_TOMAN=65000
+   PLAN_9_PRICE_TOMAN=195000
+   PLAN_12_PRICE_TOMAN=260000
+   PLAN_24_PRICE_TOMAN=520000
+   PLAN_36_PRICE_TOMAN=780000
+   PLAN_60_PRICE_TOMAN=1300000
+   ```
+
+   This is **100,000 credits = 3 hours = 65,000 Toman**, not 65 Toman.
+   Startup only synchronizes the built-in active plan catalogue; it does not
+   rewrite custom plans, historical order snapshots, subscriptions, ledger rows,
+   lots, holds, refunds, or user balances.
+7. **Restart the bot after changes.** Environment values are read only at
    startup, so a running process keeps the previous budget/order:
 
    ```bash
@@ -165,7 +181,7 @@ support tickets; do not replace an existing `.env` wholesale.
    ```
 
    Restore cron/Passenger triggers only after status and logs look healthy.
-7. **Confirm the actual runtime provider order** from the restarted process:
+8. **Confirm the actual runtime provider order** from the restarted process:
 
    ```bash
    python -m scripts.probe_note_providers --show-config
@@ -175,7 +191,7 @@ support tickets; do not replace an existing `.env` wholesale.
    The first field after `provider=` must be `gemini`; `openrouter` appears only
    after an eligible Gemini failure. No `nara` or `openai_compatible` route
    should appear with this profile.
-8. **Inspect logs for real request token limits and provider usage:**
+9. **Inspect logs for real request token limits and provider usage:**
 
    ```bash
    grep -n "LLM request sending" data/logs/bot.log | tail -n 20

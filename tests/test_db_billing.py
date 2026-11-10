@@ -458,11 +458,11 @@ class PlanTests(DatabaseTestCase):
 
         # Re-sync updates the price.
         await self.db.sync_plans([
-            {"code": "paid_3h_30d", "hours": 3, "price": 60000, "validity_days": 30},
+            {"code": "paid_3h_30d", "hours": 3, "price": 65000, "validity_days": 30},
         ])
         plan = await self.db.plan("paid_3h_30d")
         assert plan is not None
-        self.assertEqual(plan["price"], 60000)
+        self.assertEqual(plan["price"], 65000)
 
 
 class SubmissionTests(DatabaseTestCase):

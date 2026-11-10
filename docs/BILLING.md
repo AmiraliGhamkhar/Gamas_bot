@@ -13,27 +13,50 @@ screen, plan and receipt:
 | --- | --- |
 | Package | **100 000 اعتبار** |
 | Package duration | **3 ساعت** = 10 800 seconds |
-| Package price | **60 000 تومان** → 20 000 T/hour |
+| Package price | **65 000 تومان** → ≈21 667 T/hour |
 | Credits per hour | 33 334 (rounded up) |
 | Credits per second | ≈ 9.26 |
 
 `seconds_to_credits()` rounds **up** and `credits_to_seconds()` rounds **down**, so
-a balance shown to the user is never overstated.
+a balance shown to the user is never overstated. All arithmetic uses exact
+`Fraction` values — no float ever crosses a billing boundary.
 
 | Plan code | Duration | Credit | Toman |
 | --- | --- | --- | --- |
 | `free_1h` | 1 h | 33 334 (grant) | 0 |
-| `paid_3h_30d` | 3 h | 100 000 | 60 000 |
-| `paid_9h_30d` | 9 h | 300 000 | 180 000 |
-| `paid_12h_30d` | 12 h | 400 000 | 240 000 |
-| `paid_24h_30d` | 24 h | 800 000 | 480 000 |
-| `paid_36h_30d` | 36 h | 1 200 000 | 720 000 |
-| `paid_60h_30d` | 60 h | 2 000 000 | 1 200 000 |
+| `paid_3h_30d` | 3 h | 100 000 | 65 000 |
+| `paid_9h_30d` | 9 h | 300 000 | 195 000 |
+| `paid_12h_30d` | 12 h | 400 000 | 260 000 |
+| `paid_24h_30d` | 24 h | 800 000 | 520 000 |
+| `paid_36h_30d` | 36 h | 1 200 000 | 780 000 |
+| `paid_60h_30d` | 60 h | 2 000 000 | 1 300 000 |
 
 Every paid plan is a whole number of packages with 30-day validity, so the price
 per hour is identical everywhere. Plans are configured by `PLAN_*` in `.env`
 (`config.PLAN_ENV_FIELDS`); a non-positive override falls back to the default and
 `config.check()` reports it.
+
+## Environment configuration (deployment)
+
+Set these environment values on the deployment host:
+
+```
+PLAN_3_PRICE_TOMAN=65000
+PLAN_9_PRICE_TOMAN=195000
+PLAN_12_PRICE_TOMAN=260000
+PLAN_24_PRICE_TOMAN=520000
+PLAN_36_PRICE_TOMAN=780000
+PLAN_60_PRICE_TOMAN=1300000
+CREDIT_PRICE_PER_100K_TOMAN=65000
+```
+
+After setting these, **restart the bot process**. Built-in plan rows in the
+database are updated automatically at startup via `sync_plans()` (only
+non-custom, active plans are touched; custom plans, existing orders, payment
+snapshots, ledger entries and user balances are never modified).
+
+**Do NOT** set `CREDIT_PRICE_PER_100K_TOMAN=65` — that was a misreading of an
+early draft brief and is ~1000× too cheap. The canonical value is 65000.
 
 ## Transcription
 
@@ -58,9 +81,11 @@ fetch afterwards is free:
 
 | Artifact | Where the bytes come from | Cost |
 | --- | --- | --- |
-| 📖 Booklet (`.docx`) | forwarded from the user's library row | none |
+| 📘 Booklet PDF | built from stored `notes_json`, persisted as an artifact | none |
+| 📄 Booklet Word | built from stored `notes_json`, persisted as an artifact | none |
 | 📝 Raw transcript | rebuilt from the stored transcription row | none |
 | ⭐ Key points | read from the stored `notes_json` | none |
+| ✏️ Edit in Gamas Studio | Mini App editor, exports latest saved version | none |
 
 Because fetching is a pure function of persisted data, the same request may be
 pressed any number of times and the tenth answer is byte-identical to the first.
@@ -76,7 +101,7 @@ from free-plan credit. Unlimited users spend neither credit nor gifts.
 | --- | --- |
 | Quiz: 5 / 10 / 20 questions | 5 / 10 / 20 minutes (`QUIZ_COST_SECONDS_PER_QUESTION=60`) |
 | AI deck: 10 / 20 / 40 cards | 5 / 10 / 20 minutes (`FLASHCARD_AI_COST_SECONDS=300`, base size 10) |
-| Manual decks and Word export | Free |
+| Manual decks and Word/PDF export | Free |
 | Office and document notes/exports | Free to users; operator API costs may apply |
 
 Paid learning debits happen before generation with durable pending charges.
@@ -154,23 +179,3 @@ backfills in batches and repairs a sample; offline import dirty rows are
 recomputed before serving traffic. The cache records the next credit start or
 expiry and is refreshed on read after that instant, or after a clock rollback.
 Ledger rows and allocation records remain authoritative.
-
-
----
-
-## Integer credit arithmetic and the 2.0 price safeguard
-
-`seconds_to_credits()` and `credits_to_seconds()` now use exact `Fraction`
-arithmetic over `CREDITS_PER_UNIT = 100 000` and `SECONDS_PER_UNIT = 10 800`;
-no float ever crosses a billing boundary. 10 800 s is exactly 100 000 credits,
-1 s is 10 credits (ceiling), and the inverse floors so a balance is never
-overstated. The append-only integer-second ledger, FIFO lots, holds, refunds and
-entitlements are unchanged.
-
-The 2.0 brief quotes 75 in a heading but writes `CREDIT_PRICE_PER_100K_TOMAN=65`.
-The live price is 60 000 تومان per 100 000 credits. The literal 65 is preserved
-as `PROPOSED_PRICE_TOMAN_PER_PACKAGE` and exposed only through the read-only
-`price_change_preview()` / `scripts/credit_price_preview.py`. Activation needs
-`V2_TARIFF_ACTIVATED=1` plus a reviewed plan migration; `config.check()` warns
-on the discrepancy. No script writes to the database and no payment snapshot is
-rewritten. Full procedure and rollback SQL: `docs/GAMAS2.md`.

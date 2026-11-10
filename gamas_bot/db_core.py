@@ -66,6 +66,7 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "speaker_names",
         "diarization_reference_turns",
         "submission_artifacts",
+        "submission_binary_artifacts",
         "booklet_revisions",
         "quiz_point_events",
     }

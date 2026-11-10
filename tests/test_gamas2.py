@@ -23,6 +23,7 @@ import av
 from gamas_bot import billing, config
 from gamas_bot.artifacts import (
     KIND_BOOKLET,
+    KIND_DOCX,
     KIND_FLASHCARDS,
     KIND_KEYPOINTS,
     KIND_QUIZ,
@@ -108,7 +109,7 @@ class CreditArithmeticTests(unittest.TestCase):
     def test_price_preview_never_changes_the_catalogue(self):
         before = [(p.code, p.price_toman) for p in billing.plan_catalog()]
         preview = billing.price_change_preview(65)
-        self.assertEqual(preview["live_price_toman_per_package"], 60_000)
+        self.assertEqual(preview["live_price_toman_per_package"], 65_000)
         self.assertEqual(preview["proposed_price_toman_per_package"], 65)
         self.assertTrue(preview["major_discrepancy"])
         self.assertFalse(preview["activated"])
@@ -116,15 +117,15 @@ class CreditArithmeticTests(unittest.TestCase):
             [(p.code, p.price_toman) for p in billing.plan_catalog()], before
         )
 
-    def test_activation_is_off_by_default_and_diagnoses_a_discrepancy(self):
+    def test_confirmed_default_is_active_and_literal_65_is_diagnosed(self):
         settings = make_settings(credit_price_per_100k_toman=65)
-        self.assertFalse(make_settings().v2_tariff_activated)
+        self.assertTrue(make_settings().v2_tariff_activated)
         messages = config.check(settings)
-        self.assertTrue(any("V2_TARIFF_ACTIVATED" in item for item in messages))
-        # Unrelated fixture deadlines still produce their own diagnostics; the
-        # tariff guard must not fire for the shipped default.
+        self.assertTrue(any("CREDIT_PRICE_PER_100K_TOMAN=65" in item for item in messages))
+        # The confirmed 65,000-Toman default must not be treated as a
+        # discrepancy or an unactivated preview tariff.
         self.assertFalse(
-            any("V2_TARIFF_ACTIVATED" in item for item in config.check(make_settings()))
+            any("CREDIT_PRICE_PER_100K_TOMAN" in item for item in config.check(make_settings()))
         )
 
 
@@ -387,12 +388,12 @@ class DeliveryMarkupTests(unittest.TestCase):
     def test_every_artifact_has_an_independent_button(self):
         buttons = delivery_markup(
             reference="GMS-7", speakers=2, has_booklet=True,
-            kinds={KIND_BOOKLET, KIND_TRANSCRIPT, KIND_TXT,
+            kinds={KIND_BOOKLET, KIND_DOCX, KIND_TRANSCRIPT, KIND_TXT,
                    KIND_KEYPOINTS, KIND_QUIZ, KIND_FLASHCARDS},
             item_id=11, mini_app_url="https://example.com/app",
         )
         payloads = self._payloads(buttons)
-        for kind in ("booklet", "transcript", "txt", "keypoints"):
+        for kind in ("booklet", "docx", "transcript", "txt", "keypoints"):
             self.assertIn(f"art:GMS-7:{kind}", payloads)
         self.assertIn("quiz:new:11", payloads)
         self.assertIn("fc:ai:11", payloads)
@@ -578,8 +579,9 @@ class CentralSubmissionTests(unittest.IsolatedAsyncioTestCase):
         )
         names = {str(row[0]) for row in rows}
         self.assertTrue(
-            {"submission_artifacts", "booklet_revisions", "quiz_point_events",
-             "speaker_names", "diarization_reference_turns"} <= names
+            {"submission_artifacts", "submission_binary_artifacts",
+             "booklet_revisions", "quiz_point_events", "speaker_names",
+             "diarization_reference_turns"} <= names
         )
 
     async def test_independent_artifacts_and_speaker_names(self):
@@ -607,6 +609,33 @@ class CentralSubmissionTests(unittest.IsolatedAsyncioTestCase):
 
         await self.db.set_speaker_name(submission, "0", "استاد")
         self.assertEqual(await self.db.speaker_names(submission), {"0": "استاد"})
+
+    async def test_persisted_booklet_bytes_are_owner_scoped_and_idempotent(self):
+        submission = await self.db.create_submission(42, "audio", "a.mp3")
+        await self.db.binary_artifact_upsert(
+            submission,
+            42,
+            "booklet",
+            filename="notes.pdf",
+            content_type="application/pdf",
+            content=b"%PDF-first",
+        )
+        await self.db.binary_artifact_upsert(
+            submission,
+            42,
+            "docx",
+            filename="notes.docx",
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            content=b"PK-second",
+        )
+        pdf = await self.db.binary_artifact(submission, 42, "booklet")
+        assert pdf is not None
+        self.assertEqual(pdf["content"], b"%PDF-first")
+        self.assertEqual(await self.db.binary_artifact(submission, 999, "booklet"), None)
+        self.assertEqual(
+            await self.db.binary_artifact_kinds(submission, 42), {"booklet", "docx"}
+        )
+        self.assertTrue({"booklet", "docx"} <= await self.db.artifact_kinds(submission))
 
     async def test_transcript_rows_degrade_gracefully_before_migration_026(self):
         """A bot binary may run against a schema whose 026 is not applied yet."""

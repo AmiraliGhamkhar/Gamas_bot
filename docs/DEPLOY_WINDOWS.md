@@ -20,7 +20,26 @@ Create `.env` only on first installation; do not overwrite existing configuratio
 Fill [required values](CONFIGURATION.md). Keep the project private, outside shared,
 web-served and cloud-sync folders.
 
-## 2. Check and start
+## 2. Confirm the production tariff
+
+The confirmed paid tariff is **100,000 credits = 3 hours = 65,000 Toman**.
+It is not 65 Toman. For a new deployment, the defaults in `.env.example` already
+match; on an existing deployment set these exact values in `.env`:
+
+```dotenv
+PLAN_3_PRICE_TOMAN=65000
+PLAN_9_PRICE_TOMAN=195000
+PLAN_12_PRICE_TOMAN=260000
+PLAN_24_PRICE_TOMAN=520000
+PLAN_36_PRICE_TOMAN=780000
+PLAN_60_PRICE_TOMAN=1300000
+```
+
+Do not edit historical payments, custom plans, balances, credit lots or refunds.
+At the next startup GAMAS safely synchronizes only its built-in active catalogue;
+existing orders retain their frozen price snapshots.
+
+## 3. Check and start
 
 ```powershell
 .\.venv\Scripts\python.exe -m gamas_bot --check
@@ -43,7 +62,7 @@ change; a real generation probe is opt-in (`--generate`) and consumes quota.
 Keep the console open and prevent sleep while testing. Do not run this copy while
 the same token/session is active on cPanel.
 
-## 3. Update
+## 4. Update
 
 Stop with Ctrl+C and [back up](OPERATIONS.md#backups-and-restore) first. Then:
 
