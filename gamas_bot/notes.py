@@ -570,7 +570,7 @@ class StructuredNotes:
 
     @classmethod
     def from_payload(
-        cls, payload: object, *, default_mode: str = "full"
+        cls, payload: object
     ) -> "StructuredNotes":
         """Validate and normalise a model-supplied JSON payload."""
         if not isinstance(payload, dict):
@@ -1254,7 +1254,7 @@ def merge_structured_notes(notes: list[StructuredNotes]) -> StructuredNotes:
 
 def _load_json_payload(payload: dict, *, mode: str = "full") -> StructuredNotes:
     try:
-        return StructuredNotes.from_payload(payload, default_mode=mode)
+        return StructuredNotes.from_payload(payload)
     except (KeyError, TypeError) as exc:
         raise StructuringError("پاسخ سرویس تولید جزوه ساختار معتبری نداشت.") from exc
 

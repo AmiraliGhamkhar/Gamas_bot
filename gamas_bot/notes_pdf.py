@@ -761,7 +761,6 @@ def _cover_flowables(
 def _section_flowables(
     section: NoteSection,
     styles,
-    h_index: int,
 ) -> list[Flowable]:
     out: list[Flowable] = []
     # H1 with vertical cobalt bar
@@ -865,8 +864,8 @@ def _body_flowables(notes: StructuredNotes, styles) -> list[Flowable]:
         out.append(Spacer(1, 10))
 
     # Sections
-    for i, sec in enumerate(notes.sections, start=1):
-        out.extend(_section_flowables(sec, styles, i))
+    for sec in notes.sections:
+        out.extend(_section_flowables(sec, styles))
 
     # Global key points
     if notes.key_points:

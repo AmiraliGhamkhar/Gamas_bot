@@ -89,3 +89,9 @@ No dependency may require a system binary on shared hosting.
 
 See [Testing](TESTING.md) for the full gate on both shells. Report what actually
 ran; a partial run is not a pass.
+
+## Additional developer CLIs
+
+- `python -m scripts.credit_price_preview` prints the tariff and plan catalogue.
+- `python -m scripts.smoke_avalai` checks AvalAI metadata; generation is opt-in and uses provider quota.
+- `python -m scripts.evaluate_diarization` evaluates diarization and transcription from a reference and hypothesis.

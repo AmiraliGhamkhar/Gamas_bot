@@ -54,3 +54,5 @@ and a cover badge drawn over the topic text — all fixed.
 
 Transcription, RTL Word booklets, PDF export, study documents, Free Office,
 library, wallet, support tickets and referrals on Windows PowerShell and cPanel.
+
+**Migration numbering.** `migrations/v3/` contains two files numbered `016` (`016_office_library_kind.sql` and `016_subscription_enforcement.sql`). This is harmless today: the loader sorts filenames and tracks each by name. New migrations must continue from `029_`.
