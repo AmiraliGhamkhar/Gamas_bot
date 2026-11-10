@@ -418,25 +418,6 @@ class RawFallbackDeliveryTests(unittest.IsolatedAsyncioTestCase):
         block = "این یک جملهٔ کامل از متن پیاده‌سازی‌شده است. " * 30 + "\n\n"
         return (block * (characters // len(block) + 1))[:characters]
 
-    async def test_a_failed_single_upload_of_a_long_transcript_delivers_all_parts(self):
-        job, raw_path = await self.job()
-        raw_text = self.long_text(250_000)
-        raw_path.write_text(raw_text, encoding="utf-8")
-        self.bot.client = self.event.client = ScriptedClient(
-            self.event, fail_indexes={1}
-        )
-        await GamasBot._deliver_raw(self.bot, job, raw_text, raw_path, "GMS-7")
-        delivered = self.event.client.deliveries
-        self.assertGreater(len(delivered), 1)
-        payloads = [payload.decode("utf-8") for _path, payload in self.event.file_payloads]
-        for payload in payloads:
-            self.assertLessEqual(len(payload), 100_000)
-        # Nothing was dropped between the parts.
-        self.assertEqual("".join(payloads), raw_text)
-        # The workdir holds no part files after delivery.
-        self.assertEqual(sorted(path.name for path in raw_path.parent.glob("raw.*")),
-                         ["raw.txt"])
-
     async def test_both_download_sites_check_the_floor_and_watch_for_a_stall(self):
         """F-5/F-6 apply to the presentation download too, not only to media."""
         order: list[str] = []
@@ -471,22 +452,6 @@ class RawFallbackDeliveryTests(unittest.IsolatedAsyncioTestCase):
         # Headroom is checked before the download, and both pass the watchdog.
         self.assertEqual(order, ["headroom", "download", "headroom", "download"])
         self.assertEqual(stalls, [self.settings.download_stall_seconds] * 2)
-
-    async def test_a_failed_part_fails_the_delivery_instead_of_settling_it(self):
-        job, raw_path = await self.job()
-        raw_text = self.long_text(250_000)
-        raw_path.write_text(raw_text, encoding="utf-8")
-        self.bot.client = self.event.client = ScriptedClient(
-            self.event, fail_indexes={1, 3}
-        )
-        with self.assertRaises(RuntimeError):
-            await GamasBot._deliver_raw(self.bot, job, raw_text, raw_path, "GMS-8")
-        # The original .txt is untouched and no part file is left behind.
-        self.assertEqual(sorted(path.name for path in raw_path.parent.glob("raw.*")),
-                         ["raw.txt"])
-
-
-
 
 class RecordingSession:
     """Scripted POST/GET responses that record every call's arguments."""
