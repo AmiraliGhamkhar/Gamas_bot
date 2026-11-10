@@ -70,3 +70,18 @@ money and are separate from offline tests.
 
 Automated tests do not prove provider availability, Persian visual layout or host
 capacity. Review those manually before production.
+
+
+---
+
+## Gamas 2.0 verification
+
+```bash
+python -m pytest -q tests/test_gamas2.py      # credits, turns, media, Studio, eval
+python -m pytest -q                           # full suite
+python -m ruff check . && python -m mypy
+python -m scripts.credit_price_preview --candidate 65
+python -m scripts.evaluate_diarization --reference ref.json --hypothesis hyp.json
+```
+
+`docs/GAMAS2.md` §5 lists the acceptance checks and the migration gate.

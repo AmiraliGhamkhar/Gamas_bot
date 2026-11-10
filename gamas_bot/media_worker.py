@@ -77,6 +77,83 @@ STT_PREPROCESS_FILTERS: tuple[str, ...] = (
 #: that invariant reviewable.
 _FILTER_ALLOWED = set("abcdefghijklmnopqrstuvwxyz0123456789._:,=-")
 
+#: Bounded adaptive analysis: at most this many decoded frames (and this many
+#: seconds of audio) are scanned to decide which cleanup stages a recording
+#: actually needs. A two-hour lecture never costs a two-hour second pass.
+ADAPTIVE_MAX_FRAMES = 600
+ADAPTIVE_MAX_SECONDS = 30.0
+#: Peak-to-sustained loudness ratio below which level evening is unnecessary.
+ADAPTIVE_FLAT_CREST_DB = 12.0
+#: Noise floor (dB below full scale) above which steady hiss is audible enough
+#: to justify spectral denoising.
+ADAPTIVE_NOISE_FLOOR_DBFS = -52.0
+
+
+def _frame_rms(frame) -> float:
+    """RMS of one packed s16 frame, in dBFS (``-inf`` for digital silence)."""
+    import math as _math
+
+    total = 0.0
+    count = 0
+    for plane in frame.planes:
+        view = memoryview(plane)
+        # PyAV exposes s16 planes as a flat byte buffer; interpret as signed
+        # 16-bit little-endian samples without importing numpy.
+        raw = bytes(view)
+        for offset in range(0, len(raw) - 1, 2):
+            sample = int.from_bytes(raw[offset : offset + 2], "little", signed=True)
+            total += sample * sample
+            count += 1
+    if not count:
+        return float("-inf")
+    return 10.0 * _math.log10(max(1.0, total / count) / (32768.0**2))
+
+
+def adaptive_filters(paths: list[Path]) -> list[str]:
+    """Choose the cleanup stages a recording needs from a bounded audio scan.
+
+    The original file is never touched. The chain keeps the two protective
+    stages (rumble highpass, anti-clip limiter) unconditionally, and only adds
+    spectral denoising when the measured noise floor is audible and level
+    evening when the loudness swings are wide. Every stage still comes from
+    :data:`STT_PREPROCESS_FILTERS`, so no undocumented parameters are used.
+    """
+    av = _require_av()
+    levels: list[float] = []
+    scanned_seconds = 0.0
+    for path in paths:
+        if scanned_seconds >= ADAPTIVE_MAX_SECONDS:
+            break
+        try:
+            with av.open(str(path), options=dict(INPUT_PROTOCOL_OPTIONS)) as media:
+                audio = [item for item in media.streams if item.type == "audio"]
+                if not audio:
+                    continue
+                for frame in media.decode(audio[0]):
+                    level = _frame_rms(frame)
+                    if level != float("-inf"):
+                        levels.append(level)
+                    scanned_seconds += float(frame.samples) / max(1, frame.sample_rate or 1)
+                    if len(levels) >= ADAPTIVE_MAX_FRAMES or scanned_seconds >= ADAPTIVE_MAX_SECONDS:
+                        break
+        except Exception:  # noqa: BLE001 - an unscannable input keeps the full chain
+            continue
+    chain = ["highpass=f=70:poles=2"]
+    if len(levels) >= 8:
+        quiet = sorted(levels)[: max(1, len(levels) // 10)]
+        loud = sorted(levels)[-max(1, len(levels) // 10) :]
+        noise_floor = sum(quiet) / len(quiet)
+        peak = sum(loud) / len(loud)
+        if noise_floor > ADAPTIVE_NOISE_FLOOR_DBFS:
+            chain.append("afftdn=nr=12:nf=-35:tn=1")
+        if peak - noise_floor > ADAPTIVE_FLAT_CREST_DB:
+            chain.append("dynaudnorm=f=250:g=11:p=0.85:m=4")
+    else:
+        # No usable measurement: apply the documented full chain.
+        chain.extend(STT_PREPROCESS_FILTERS[1:-1])
+    chain.append("alimiter=limit=0.95:level=false")
+    return chain
+
 LEGACY_EXTENSIONS = {".ppt", ".pps", ".pot"}
 UNSUPPORTED_ODF_EXTENSIONS = {".odp", ".otp"}
 
@@ -115,6 +192,8 @@ def _probe(path: Path) -> dict:
             None,
         )
         codec: str | None = None
+        channels: int | None = None
+        sample_rate: int | None = None
         if audio:
             context = audio[0].codec_context
             try:
@@ -123,10 +202,20 @@ def _probe(path: Path) -> dict:
                 codec = context.codec.canonical_name
             except Exception:  # unreadable codec parameters; treat as unknown
                 codec = None
+            try:
+                channels = int(context.channels) if context.channels else None
+            except Exception:  # noqa: BLE001
+                channels = None
+            try:
+                sample_rate = int(context.sample_rate) if context.sample_rate else None
+            except Exception:  # noqa: BLE001
+                sample_rate = None
         return {
             "has_audio": bool(audio),
             "duration": duration,
             "audio_codec": codec,
+            "channels": channels,
+            "sample_rate": sample_rate,
         }
 
 
@@ -236,8 +325,9 @@ def _transcode(
     bit_rate: int | None = None,
     codec_options: dict | None = None,
     filters: tuple[str, ...] | list[str] = (),
+    layout: str = "mono",
 ) -> dict:
-    """Decode inputs to mono and report sample-accurate clip positions.
+    """Decode inputs and report sample-accurate clip positions.
 
     Each input gets its own resampler because PyAV locks a resampler to the
     format of the first frame it sees, while inputs can differ in rate/layout.
@@ -248,6 +338,11 @@ def _transcode(
     :data:`STT_PREPROCESS_FILTERS`). It runs after the resampler so every stage
     sees the same documented format, and it is rebuilt per input exactly like
     the resampler because a filter graph carries state between frames.
+
+    ``layout`` is ``mono`` (default, the historic STT upload) or ``stereo``
+    (preserves channel separation for diarization when
+    ``STT_PRESERVE_STEREO`` is on). Stereo doubles the WAV payload, so it is
+    opt-in and bounded by the provider upload ceilings in the parent.
     """
     if not math.isfinite(silence_seconds) or not 0 <= silence_seconds <= 60:
         raise WorkerError("silence duration must be between 0 and 60 seconds")
@@ -255,13 +350,14 @@ def _transcode(
     from av.audio.frame import AudioFrame
     from av.audio.resampler import AudioResampler
 
+    resolved_layout = "stereo" if layout == "stereo" else "mono"
     open_kwargs = {"format": container_format} if container_format else {}
     container = av.open(str(output), "w", **open_kwargs)
     summary: dict = {}
     time_base = Fraction(1, rate)
     try:
         stream = container.add_stream(codec, rate=rate)
-        stream.layout = "mono"
+        stream.layout = resolved_layout
         try:
             stream.thread_type = "AUTO"
         except Exception:
@@ -281,7 +377,7 @@ def _transcode(
             silence_samples = int(round(rate * silence_seconds))
             if silence_samples > 0:
                 silence_frame = AudioFrame(
-                    format="s16", layout="mono", samples=silence_samples
+                    format="s16", layout=resolved_layout, samples=silence_samples
                 )
                 silence_frame.sample_rate = rate
                 for plane in silence_frame.planes:
@@ -291,17 +387,31 @@ def _transcode(
         played_filters = _playable_filters(filters)
         filters_applied: list[str] = []
         for index, source in enumerate(inputs):
-            resampler = AudioResampler(format="s16", layout="mono", rate=rate)
+            resampler = AudioResampler(
+                format="s16", layout=resolved_layout, rate=rate
+            )
             graph = None
             source_pad = sink_pad = None
             if played_filters:
                 try:
                     graph = av.filter.Graph()
                     source_pad = graph.add_abuffer(
-                        format="s16", sample_rate=rate, layout="mono",
+                        format="s16", sample_rate=rate, layout=resolved_layout,
                         time_base=time_base,
                     )
                     chain = [_add_filter(graph, stage) for stage in played_filters]
+                    # Some stages (dynaudnorm, alimiter) negotiate a float planar
+                    # format internally. Pin the sink back to the s16 layout the
+                    # encoder and the inter-clip silence frame were set up for,
+                    # otherwise the first silence insert raises
+                    # "Frame does not match AudioResampler setup".
+                    chain.append(
+                        _add_filter(
+                            graph,
+                            "aformat=sample_fmts=s16:"
+                            f"sample_rates={rate}:channel_layouts={resolved_layout}",
+                        )
+                    )
                     sink_pad = graph.add("abuffersink")
                     graph.link_nodes(source_pad, *chain, sink_pad)
                     graph.configure()
@@ -384,6 +494,7 @@ def _transcode(
             "output_samples": next_pts[0],
             "clip_spans": clip_spans,
             "filters": filters_applied,
+            "layout": resolved_layout,
         }
     finally:
         container.close()
@@ -456,8 +567,11 @@ def _build_parser() -> argparse.ArgumentParser:
     extract.add_argument("--format", choices=("wav", "opus"), default="wav")
     # ``--preprocess`` turns on the documented speech-cleanup chain; the
     # parent decides per deployment (STT_PREPROCESS) so the worker stays a
-    # pure, deterministic tool.
+    # pure, deterministic tool. ``--adaptive`` measures a bounded prefix of
+    # the recording first and keeps only the stages it actually needs.
     extract.add_argument("--preprocess", action="store_true")
+    extract.add_argument("--adaptive", action="store_true")
+    extract.add_argument("--stereo", action="store_true")
     extract.add_argument("source")
 
     merge = commands.add_parser("merge", help="concatenate audio tracks")
@@ -465,6 +579,8 @@ def _build_parser() -> argparse.ArgumentParser:
     merge.add_argument("--format", choices=("wav", "opus"), default="wav")
     merge.add_argument("--silence", type=float, default=0.5)
     merge.add_argument("--preprocess", action="store_true")
+    merge.add_argument("--adaptive", action="store_true")
+    merge.add_argument("--stereo", action="store_true")
     merge.add_argument("inputs", nargs="+")
 
     convert = commands.add_parser("convert", help="convert a legacy .ppt deck")
@@ -524,22 +640,36 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(results))
         elif args.command == "extract":
             rate = OPUS_SAMPLE_RATE if args.format == "opus" else WAV_SAMPLE_RATE
-            _transcode(
-                [Path(args.source)],
+            sources = [Path(args.source)]
+            filters: tuple[str, ...] | list[str] = ()
+            if args.adaptive and args.preprocess:
+                filters = adaptive_filters(sources)
+            elif args.preprocess:
+                filters = STT_PREPROCESS_FILTERS
+            summary = _transcode(
+                sources,
                 Path(args.output),
                 rate=rate,
                 codec="libopus" if args.format == "opus" else "pcm_s16le",
                 container_format="ogg" if args.format == "opus" else None,
                 bit_rate=OPUS_BIT_RATE if args.format == "opus" else None,
                 codec_options=OPUS_CODEC_OPTIONS if args.format == "opus" else None,
-                filters=STT_PREPROCESS_FILTERS if args.preprocess else (),
+                filters=filters,
+                layout="stereo" if args.stereo else "mono",
             )
+            print(json.dumps(summary))
         elif args.command == "merge":
             if not args.inputs:
                 raise WorkerError("no input files given for merging")
             rate = OPUS_SAMPLE_RATE if args.format == "opus" else WAV_SAMPLE_RATE
+            sources = [Path(item) for item in args.inputs]
+            filters = ()
+            if args.adaptive and args.preprocess:
+                filters = adaptive_filters(sources)
+            elif args.preprocess:
+                filters = STT_PREPROCESS_FILTERS
             summary = _transcode(
-                [Path(item) for item in args.inputs],
+                sources,
                 Path(args.output),
                 rate=rate,
                 codec="libopus" if args.format == "opus" else "pcm_s16le",
@@ -547,7 +677,8 @@ def main(argv: list[str] | None = None) -> int:
                 silence_seconds=args.silence,
                 bit_rate=OPUS_BIT_RATE if args.format == "opus" else None,
                 codec_options=OPUS_CODEC_OPTIONS if args.format == "opus" else None,
-                filters=STT_PREPROCESS_FILTERS if args.preprocess else (),
+                filters=filters,
+                layout="stereo" if args.stereo else "mono",
             )
             print(json.dumps(summary))
         elif args.command == "convert":

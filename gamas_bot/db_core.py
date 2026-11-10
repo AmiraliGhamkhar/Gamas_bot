@@ -62,6 +62,12 @@ APPLICATION_TABLES: frozenset[str] = frozenset(
         "user_balances",
         "balance_dirty",
         "balance_backfill_state",
+        # Gamas 2.0 (migration 026)
+        "speaker_names",
+        "diarization_reference_turns",
+        "submission_artifacts",
+        "booklet_revisions",
+        "quiz_point_events",
     }
 )
 

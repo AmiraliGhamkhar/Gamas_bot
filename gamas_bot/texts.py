@@ -41,14 +41,16 @@ BTN_FLASHCARDS: Final = "🃏 فلش‌کارت‌ها"
 BTN_PREV: Final = "◀️ قبلی"
 BTN_NEXT: Final = "بعدی ▶️"
 BTN_REDOWNLOAD: Final = "📥 دریافت مجدد"
-BTN_GET_BOOKLET: Final = "📖 جزوه"
+BTN_GET_BOOKLET: Final = "📖 جزوهٔ Word"
 BTN_GET_TRANSCRIPT: Final = "📝 متن خام"
+BTN_DOWNLOAD_TXT: Final = "📥 متن خام TXT"
 BTN_GET_KEYPOINTS: Final = "⭐ نکات کلیدی"
 BTN_SHOW_RESULTS: Final = "📦 دریافت خروجی‌ها"
 BTN_MY_RESULTS: Final = "📦 خروجی‌های من"
 BTN_START_HERE: Final = "🎓 شروع"
 BTN_UPGRADE: Final = "🛒 افزایش اعتبار"
 BTN_OPEN_APP: Final = "🗂 باشگاه مطالعه (رنک‌بندی و ویرایش جزوه)"
+BTN_STUDIO: Final = "🎛 گاماس استودیو"
 BTN_EDIT_IN_APP: Final = "✏️ ویرایش جزوه در باشگاه مطالعه"
 BTN_QUIZ_FROM_BOOKLET: Final = "🧪 آزمون از این جزوه"
 BTN_CARDS_FROM_BOOKLET: Final = "🃏 فلش‌کارت از این جزوه"
@@ -173,8 +175,9 @@ def reply_menu_rows(*, is_admin: bool, office_enabled: bool = True) -> list[list
 DELIVERY_READY_HEADER: Final = "✅ پردازش تمام شد — {reference}"
 DELIVERY_READY_BODY: Final = "خروجی‌ها آماده‌اند. هر کدام را خواستید بردارید:"
 DELIVERY_ROW_BOOKLET: Final = "📖 جزوهٔ ساختارمند: فایل Word"
-DELIVERY_ROW_TRANSCRIPT: Final = "📝 متن خام گفتار: فایل متنی"
+DELIVERY_ROW_TRANSCRIPT: Final = "📝 متن خام گفتار: در گفتگو یا فایل TXT"
 DELIVERY_ROW_KEYPOINTS: Final = "⭐ نکات کلیدی: فهرست کوتاه"
+DELIVERY_ROW_LEARNING: Final = "✏️ ویرایش، 🧪 آزمون و 🃏 فلش‌کارت از همین جزوه"
 DELIVERY_ROW_NOTES_PENDING: Final = "⏳ نکات کلیدی: در حال ساخته‌شدن"
 DELIVERY_SPEAKERS_TEMPLATE: Final = "🎙 گویندگان شناسایی‌شده: {count} نفر"
 DELIVERY_SPEAKERS_ONE: Final = "🎙 یک گوینده شناسایی شد."
@@ -234,6 +237,8 @@ def delivery_screen(
         lines.append(DELIVERY_ROW_NOTES_PENDING)
     elif has_keypoints:
         lines.append(DELIVERY_ROW_KEYPOINTS)
+    if has_booklet:
+        lines.append(DELIVERY_ROW_LEARNING)
     lines.extend(["", DELIVERY_READY_BODY])
     return "\n".join(lines)
 

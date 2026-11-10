@@ -1,37 +1,35 @@
-/* Gamas Mini App — ranking and booklet editing.
+/* Gamas Studio — Home / Leaderboard / Booklet Studio.
  *
- * Design constraints that shaped this file:
- *
- * 1. **No build step.** The app is served by Passenger on a shared cPanel host;
- *    adding npm to that deployment is a bigger risk than adding a query string.
- *    So: plain ES2020, one file, no framework.
- * 2. **No stored credentials.** Telegram hands the app `initData`, which is
- *    signed and expires. It is sent with every request and never written to
- *    localStorage — a shared or lost phone must not carry a reusable token.
- * 3. **Nothing is computed locally.** The leaderboard and the booklet list come
- *    from SQLite; the app only renders them. That keeps the number the user sees
- *    identical to the number the bot shows.
+ * No build step, no framework, no stored credentials. Telegram's signed
+ * `initData` is attached to every request and verified by the WSGI app; the
+ * browser is never trusted for an identity. Every button below performs a real
+ * request: the ranking windows, the booklet editor, revision history, restore
+ * and the DOCX export all have working server endpoints.
  */
 
 (function () {
   "use strict";
 
   const api = {
-    rank: "/api/leaderboard",
+    home: "/api/home",
+    leaderboard: "/api/leaderboard",
     booklets: "/api/booklets",
     booklet: "/api/booklet",
+    export: "/api/booklet/export",
+    revisions: "/api/revisions",
+    revision: "/api/revision",
   };
 
   const state = {
     initData: "",
-    view: "rank",
+    view: "home",
+    window: "all",
     booklets: [],
     editing: null,
     dirty: false,
   };
 
   const el = (id) => document.getElementById(id);
-
   const t = (value) => String(value).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]);
 
   function toast(message) {
@@ -41,14 +39,13 @@
     window.clearTimeout(toast._timer);
     toast._timer = window.setTimeout(() => {
       node.hidden = true;
-    }, 2600);
+    }, 2800);
   }
 
   async function call(url, body, method) {
     const response = await fetch(url, {
       method: method || "POST",
       headers: { "Content-Type": "application/json" },
-      // The session is re-proved on every call; nothing is cached.
       body: JSON.stringify(Object.assign({ initData: state.initData }, body || {})),
       credentials: "omit",
       cache: "no-store",
@@ -72,6 +69,19 @@
   }
 
   /* ------------------------------------------------------------- rendering */
+
+  function renderHome(data) {
+    const name = data.first_name || "";
+    if (name) el("home-title").textContent = "خانهٔ " + name;
+    el("home-credits").textContent = data.unlimited
+      ? "نامحدود ⭐"
+      : t(data.credits || 0) + " اعتبار";
+    el("home-unlimited").hidden = !data.unlimited;
+    el("home-points").textContent = t(data.quiz_points || 0);
+    el("home-submissions").textContent = t(data.submission_count || 0);
+    el("home-artifacts").textContent = t(data.artifact_count || 0);
+    el("home-library").textContent = t(data.library_count || 0);
+  }
 
   function renderRank(data) {
     const list = el("rank-list");
@@ -116,25 +126,40 @@
       title.textContent = item.title || "جزوهٔ بی‌نام";
       const meta = document.createElement("span");
       meta.className = "booklet-meta";
-      meta.textContent = item.chars
-        ? t(item.chars) + " نویسه"
-        : "متن ویرایش‌شده ندارد";
+      meta.textContent = item.chars ? t(item.chars) + " نویسه" : "متن ویرایش‌شده ندارد";
       body.append(title, meta);
       const open = document.createElement("button");
       open.textContent = "✏️ ویرایش";
+      open.disabled = !item.editable;
       open.addEventListener("click", () => openEditor(item.id));
       row.append(body, open);
       list.append(row);
     });
   }
 
+  function renderRevisions(items) {
+    const list = el("revision-list");
+    list.replaceChildren();
+    el("revisions-empty").hidden = items.length > 0;
+    items.forEach((item) => {
+      const row = document.createElement("li");
+      const meta = document.createElement("span");
+      meta.textContent = t(item.created_at || "") + " · " + t(item.chars || 0) + " نویسه";
+      const restore = document.createElement("button");
+      restore.textContent = "↩️ بازگردانی";
+      restore.addEventListener("click", () => restoreRevision(item.id));
+      row.append(meta, restore);
+      list.append(row);
+    });
+  }
+
   function show(view) {
     state.view = view;
-    ["rank", "booklets", "editor"].forEach((name) => {
+    ["home", "leaderboard", "studio", "editor"].forEach((name) => {
       el("view-" + name).hidden = name !== view;
     });
     document.querySelectorAll(".tab").forEach((tab) => {
-      const active = tab.dataset.view === (view === "editor" ? "booklets" : view);
+      const active = tab.dataset.view === (view === "editor" ? "studio" : view);
       tab.classList.toggle("is-active", active);
       tab.setAttribute("aria-selected", active ? "true" : "false");
     });
@@ -147,9 +172,17 @@
 
   /* ---------------------------------------------------------------- actions */
 
+  async function loadHome() {
+    try {
+      renderHome(await call(api.home));
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+
   async function loadRank() {
     try {
-      renderRank(await call(api.rank, { limit: 20 }));
+      renderRank(await call(api.leaderboard, { limit: 20, window: state.window }));
     } catch (error) {
       toast(error.message);
     }
@@ -165,6 +198,16 @@
     }
   }
 
+  async function loadRevisions() {
+    if (!state.editing) return;
+    try {
+      const data = await call(api.revisions, { id: state.editing.id, limit: 20 });
+      renderRevisions(data.items || []);
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+
   async function openEditor(itemId) {
     if (!confirmDiscard()) return;
     try {
@@ -175,9 +218,11 @@
       el("editor-text").value = data.text || "";
       el("editor-text").readOnly = !data.editable;
       el("editor-save").disabled = !data.editable;
+      el("editor-export").disabled = !data.editable;
       updateCount();
       show("editor");
       el("editor-text").focus();
+      loadRevisions();
     } catch (error) {
       toast(error.message);
     }
@@ -201,13 +246,69 @@
       await call(api.booklet, { id: state.editing.id, text }, "PUT");
       state.dirty = false;
       toast("ذخیره شد ✅");
-      await loadBooklets();
-      show("booklets");
+      loadRevisions();
+      loadBooklets();
     } catch (error) {
       toast(error.message);
     } finally {
       button.disabled = false;
     }
+  }
+
+  async function exportDocx() {
+    if (!state.editing) return;
+    const button = el("editor-export");
+    button.disabled = true;
+    try {
+      const response = await fetch(api.export, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ initData: state.initData, id: state.editing.id }),
+        credentials: "omit",
+        cache: "no-store",
+      });
+      if (!response.ok) {
+        throw new Error(response.status === 401 ? "نشست تلگرام منقضی شده؛ برنامه را دوباره باز کنید." : "ساخت فایل Word ناموفق بود.");
+      }
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = "gamas-booklet-" + state.editing.id + ".docx";
+      document.body.append(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      toast("فایل Word آماده شد ✅");
+    } catch (error) {
+      toast(error.message);
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  async function restoreRevision(revisionId) {
+    if (!state.editing) return;
+    if (!window.confirm("این نسخه جایگزین متن فعلی شود؟ نسخهٔ فعلی در تاریخچه می‌ماند.")) return;
+    try {
+      await call(api.revision, { id: state.editing.id, revision_id: revisionId }, "PUT");
+      const fresh = await call(api.booklet, { id: state.editing.id });
+      el("editor-text").value = fresh.text || "";
+      state.dirty = false;
+      updateCount();
+      toast("نسخه بازگردانی شد ✅");
+      loadRevisions();
+    } catch (error) {
+      toast(error.message);
+    }
+  }
+
+  function selectView(view) {
+    if (!confirmDiscard()) return;
+    show(view);
+    if (view === "home") loadHome();
+    else if (view === "leaderboard") loadRank();
+    else loadBooklets();
   }
 
   /* ------------------------------------------------------------------ boot */
@@ -225,27 +326,29 @@
       state.initData = webApp.initData || "";
     }
     if (!state.initData) {
-      // Opened outside Telegram (a bookmark, a preview): the API will refuse,
-      // so say so plainly instead of showing three failed requests.
       toast("این برنامه را از داخل تلگرام باز کنید.");
       return;
     }
 
     document.querySelectorAll(".tab").forEach((tab) => {
       tab.addEventListener("click", () => {
-        if (tab.dataset.view === state.view) return;
-        if (!confirmDiscard()) return;
-        show(tab.dataset.view);
-        if (tab.dataset.view === "rank") loadRank();
-        else loadBooklets();
+        if (tab.dataset.view !== state.view) selectView(tab.dataset.view);
       });
     });
-    el("editor-back").addEventListener("click", () => {
-      if (!confirmDiscard()) return;
-      show("booklets");
-      loadBooklets();
+    document.querySelectorAll(".segmented button").forEach((button) => {
+      button.addEventListener("click", () => {
+        state.window = button.dataset.window;
+        document.querySelectorAll(".segmented button").forEach((other) => {
+          other.classList.toggle("is-active", other === button);
+        });
+        loadRank();
+      });
     });
+    el("home-go-leaderboard").addEventListener("click", () => selectView("leaderboard"));
+    el("home-go-studio").addEventListener("click", () => selectView("studio"));
+    el("editor-back").addEventListener("click", () => selectView("studio"));
     el("editor-save").addEventListener("click", saveEditor);
+    el("editor-export").addEventListener("click", exportDocx);
     el("editor-text").addEventListener("input", () => {
       state.dirty = true;
       updateCount();
@@ -256,6 +359,7 @@
       event.returnValue = "";
     });
 
+    loadHome();
     loadRank();
     loadBooklets();
   }

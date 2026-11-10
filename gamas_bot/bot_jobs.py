@@ -698,11 +698,15 @@ class JobPipelineMixin:
         # The transcript is persisted, not written to the scratch directory and
         # pushed: the results button rebuilds it from this row on demand (see
         # ``artifacts.transcript_artifact``, which re-applies the profile).
+        turns_json, attempted, overlaps = self._speaker_metadata(document)
         await self.db.save_transcription(
             job.submission_id,
             engine=raw.engine,
             text=document.plain(),
             notes_json="",
+            speaker_turns_json=turns_json,
+            diarization_attempted=attempted,
+            overlap_count=overlaps,
         )
         await self._settle(job, duration)
         if not self.settings.note_configured:
@@ -727,6 +731,9 @@ class JobPipelineMixin:
             engine=raw.engine,
             text=document.plain(),
             notes_json=notes.to_json() if notes else "",
+            speaker_turns_json=turns_json,
+            diarization_attempted=attempted,
+            overlap_count=overlaps,
         )
         job.transition_to("uploading")
         await self._deliver_booklet(
@@ -758,7 +765,18 @@ class JobPipelineMixin:
             oversized = (await run_file_io(source_path.stat)).st_size > budget
         except OSError:
             oversized = False
-        if kind == "video" or deps.needs_transcode(filename, info) or oversized:
+        # Preprocessing is mandatory in Gamas 2.0: even a perfectly valid MP3
+        # goes through the bounded PyAV chain, so the engine always hears the
+        # same cleaned signal. ``STT_PREPROCESS=0`` restores the old fast path
+        # for A/B comparisons. A stereo source is preserved only when that is
+        # explicitly enabled for diarization.
+        must_prepare = bool(
+            kind == "video"
+            or deps.needs_transcode(filename, info)
+            or oversized
+            or self.settings.stt_preprocess
+        )
+        if must_prepare:
             return await deps.extract_audio_track(
                 source_path,
                 workdir,
@@ -766,6 +784,7 @@ class JobPipelineMixin:
                 total_duration=info.duration,
                 max_output_bytes=budget,
                 egress_bytes_per_second=egress_bytes_per_second,
+                channels=getattr(info, "channels", None),
             )
         return source_path
 
@@ -1118,7 +1137,10 @@ class JobPipelineMixin:
             fallback=FALLBACK_BOOKLET,
         )
         if notes is not None:
-            notes = replace(notes, title=booklet_title)
+            speakers, timeline = self._booklet_context(document)
+            notes = replace(
+                notes, title=booklet_title, speakers=speakers, timeline=timeline
+            )
         if notes is not None:
             try:
                 docx_bytes = await asyncio.to_thread(
@@ -1287,6 +1309,72 @@ class JobPipelineMixin:
                 raise
         return None
 
+    @staticmethod
+    def _speaker_metadata(document: Any) -> tuple[str | None, bool, int]:
+        """Durable, anonymous speaker turns for a submission, when available.
+
+        Only facts the engine actually produced are stored: a turn with unknown
+        attribution keeps ``speaker_label=None``, and a recording without
+        diarization yields no turns at all. No name or count is inferred here.
+        """
+        if not hasattr(document, "turns_to_json"):
+            return None, False, 0
+        try:
+            turns = document.turns_to_json()
+        except Exception:  # pragma: no cover - a malformed document is not fatal
+            logger.warning("speaker turns could not be serialized", exc_info=True)
+            return None, False, 0
+        return (
+            turns,
+            bool(getattr(document, "diarization_attempted", False)),
+            max(0, int(getattr(document, "overlap_count", 0) or 0)),
+        )
+
+    @staticmethod
+    def _booklet_context(document: Any) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Source-derived speaker list and chapter stamps for the booklet.
+
+        Only real turns and real paragraph timings are used. An unknown
+        attribution is skipped rather than given a plausible-sounding name,
+        and a document without timings gets no invented timeline.
+        """
+        if not hasattr(document, "speaker_turns"):
+            return (), ()
+        try:
+            turns = document.speaker_turns()
+        except Exception:  # pragma: no cover - a malformed document is not fatal
+            return (), ()
+        words_by_speaker: dict[str, int] = {}
+        for turn in turns:
+            if not turn.display_name:
+                continue
+            key = str(turn.display_name).strip()
+            words_by_speaker[key] = words_by_speaker.get(key, 0) + len(turn.text.split())
+        speakers = tuple(
+            f"{name} — {to_persian_digits(count)} واژه"
+            for name, count in sorted(
+                words_by_speaker.items(), key=lambda pair: (-pair[1], pair[0])
+            )[:12]
+        )
+        timeline: list[str] = []
+        seen_minutes: set[int] = set()
+        for paragraph in getattr(document, "paragraphs", ()) or ():
+            start = getattr(paragraph, "start", None)
+            text = str(getattr(paragraph, "text", "") or "").strip()
+            if start is None or not text:
+                continue
+            minute = int(float(start)) // 60
+            if minute in seen_minutes:
+                continue
+            seen_minutes.add(minute)
+            minutes, seconds = divmod(int(float(start)), 60)
+            stamp = to_persian_digits(f"{minutes:02d}:{seconds:02d}")
+            snippet = " ".join(text.split())[:70]
+            timeline.append(f"[{stamp}] {snippet}")
+            if len(timeline) >= 40:
+                break
+        return speakers, tuple(timeline)
+
     # ----------------------------------------------------- button-driven delivery
     async def _deliver_results(
         self,
@@ -1305,21 +1393,63 @@ class JobPipelineMixin:
         every button below is free and may be pressed any number of times.
         """
         from .artifacts import (
+            KIND_BOOKLET,
+            KIND_FLASHCARDS,
             KIND_KEYPOINTS,
+            KIND_QUIZ,
             KIND_TRANSCRIPT,
+            KIND_TXT,
             delivery_markup,
             reference_for,
         )
 
         speakers = int(getattr(document, "speakers", 0) or 0)
-        kinds = {KIND_TRANSCRIPT}
+        kinds = {KIND_TRANSCRIPT, KIND_TXT}
         if has_keypoints:
             kinds.add(KIND_KEYPOINTS)
+        if has_booklet:
+            kinds.update({KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS})
+
+        # The library is one central submission with independent artifacts:
+        # register exactly what exists, so the buttons and the results hub can
+        # never advertise a download that was not produced.
+        ref = reference_for(job.submission_id)
+        for kind in kinds:
+            try:
+                await self.db.artifact_upsert(
+                    job.submission_id, job.user_id, kind, reference=ref
+                )
+            except Exception:
+                logger.warning(
+                    "artifact registry write failed submission=%s kind=%s",
+                    job.submission_id, kind, exc_info=True,
+                )
+        item_id: int | None = None
+        if has_booklet:
+            try:
+                books = await self.db.library_list_kind(
+                    job.user_id, "booklet", limit=50
+                )
+                match = next(
+                    (
+                        row
+                        for row in books
+                        if int(row.get("submission_id") or 0) == job.submission_id
+                        and not row.get("unavailable")
+                    ),
+                    None,
+                )
+                if match is not None:
+                    item_id = int(match["item_id"])
+            except Exception:
+                logger.warning("booklet lookup failed for delivery buttons", exc_info=True)
         buttons = delivery_markup(
-            reference=reference_for(job.submission_id),
+            reference=ref,
             speakers=speakers,
             has_booklet=has_booklet,
             kinds=kinds,
+            item_id=item_id,
+            mini_app_url=self.settings.mini_app_url,
         )
         body = texts.delivery_screen(
             reference=reference,
@@ -1350,6 +1480,7 @@ class JobPipelineMixin:
         """
         from .artifacts import (
             KIND_TRANSCRIPT,
+            KIND_TXT,
             keypoints_artifact,
             parse_callback,
             submission_from_callback,
@@ -1367,6 +1498,37 @@ class JobPipelineMixin:
             return
 
         chat = await event.get_input_chat()
+        if kind == KIND_TXT:
+            # A real, independent .txt download — rebuilt from the stored
+            # transcription, so it works months later and costs no credits.
+            import io
+
+            from telethon.tl.types import DocumentAttributeFilename
+
+            body = await transcript_artifact(
+                self.db, submission_id, self.settings.raw_text_profile
+            )
+            if not body:
+                await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+                return
+            filename = f"{parsed[0]}-transcript.txt"
+            try:
+                await self.client.send_file(
+                    chat,
+                    io.BytesIO(body.encode("utf-8")),
+                    caption=texts.DELIVERY_TRANSCRIPT_READY.format(reference=parsed[0]),
+                    force_document=True,
+                    attributes=[DocumentAttributeFilename(filename)],
+                )
+            except Exception:
+                logger.warning(
+                    "txt artifact delivery failed submission=%s", submission_id,
+                    exc_info=True,
+                )
+                await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+                return
+            await self._ack(event)
+            return
         if kind == KIND_TRANSCRIPT:
             body = await transcript_artifact(
                 self.db, submission_id, self.settings.raw_text_profile

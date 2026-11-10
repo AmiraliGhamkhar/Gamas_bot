@@ -417,6 +417,12 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
                 quiz_points INTEGER NOT NULL DEFAULT 0,
                 banned INTEGER NOT NULL DEFAULT 0
             );
+            CREATE TABLE quiz_point_events (
+                event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                points INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE library_items (
                 item_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
@@ -435,6 +441,11 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO users(telegram_id, first_name, quiz_points, banned) "
             "VALUES (?, ?, ?, ?)",
             [(1, "یک", 90, 0), (2, "دو", 50, 0), (3, "سه", 0, 0), (4, "چهار", 999, 1)],
+        )
+        connection.executemany(
+            "INSERT INTO quiz_point_events(user_id, points, created_at) "
+            "VALUES (?, ?, datetime('now'))",
+            [(1, 90), (2, 50), (4, 999)],  # user 4 is banned
         )
         connection.executemany(
             "INSERT INTO library_items(user_id, kind, chat_id, message_id, title, "
@@ -463,6 +474,14 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.rank(3)["rank"], 3)
         self.assertEqual(self.store.rank(4)["rank"], 1)  # banned: 0 points
         self.assertEqual(self.store.rank(999)["points"], 0)
+
+    def test_windowed_boards_and_ranks_ignore_banned_users(self):
+        weekly = self.store.leaderboard_window(10, "weekly")
+        self.assertEqual([row["first_name"] for row in weekly], ["یک", "دو"])
+        self.assertEqual(self.store.rank_window(2, "weekly")["rank"], 2)
+        self.assertEqual(self.store.rank_window(2, "weekly")["points"], 50)
+        # A banned scorer with 999 weekly points must not push user 3 down.
+        self.assertEqual(self.store.rank_window(3, "weekly")["rank"], 3)
 
     def test_only_editable_rows_are_listed(self):
         items = self.store.booklets(1, 10)

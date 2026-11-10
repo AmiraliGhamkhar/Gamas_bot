@@ -78,17 +78,52 @@ class LibraryRepositoryMixin(DatabaseCore):
         )
 
     async def save_transcription(
-        self, submission_id: int, engine: str, text: str, notes_json: str
+        self,
+        submission_id: int,
+        engine: str,
+        text: str,
+        notes_json: str,
+        *,
+        speaker_turns_json: str | None = None,
+        diarization_attempted: bool = False,
+        overlap_count: int = 0,
     ) -> None:
+        """Persist the transcript and, when available, its anonymous turns.
+
+        ``speaker_turns_json`` is a JSON array produced by
+        :meth:`gamas_bot.transcript.TranscriptDocument.turns_to_json`. The
+        three 026 columns are included only when present in this database, so a
+        bot binary still works against a schema whose migration has not been
+        applied yet. The column list is read once per call from SQLite; it is
+        never interpolated from caller input.
+        """
+        schema = await _rows(self.read_db, "PRAGMA table_info(transcriptions)")
+        existing = {str(row[1]) for row in schema}
+        extra_values: dict[str, Any] = {
+            "speaker_turns_json": speaker_turns_json,
+            "diarization_attempted": int(bool(diarization_attempted)),
+            "overlap_count": max(0, int(overlap_count)),
+        }
+        extra = [name for name in extra_values if name in existing]
+        columns = ("submission_id", "engine", "text", "notes_json", *extra, "created_at")
+        values = (
+            submission_id,
+            engine,
+            text,
+            notes_json,
+            *(extra_values[name] for name in extra),
+            iso(self._now()),
+        )
+        insert_sql = (
+            f"INSERT INTO transcriptions({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)}) "
+            "ON CONFLICT(submission_id) DO UPDATE SET engine = excluded.engine, "
+            "text = excluded.text, notes_json = excluded.notes_json"
+            + "".join(f", {name} = excluded.{name}" for name in extra)
+        )
         await self._write_many(
             [
-                (
-                    "INSERT INTO transcriptions(submission_id, engine, text, notes_json, created_at) "
-                    "VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(submission_id) DO UPDATE SET engine = excluded.engine, "
-                    "text = excluded.text, notes_json = excluded.notes_json",
-                    (submission_id, engine, text, notes_json, iso(self._now())),
-                ),
+                (insert_sql, values),
                 (
                     "UPDATE submissions SET stt_engine = COALESCE(?, stt_engine) "
                     "WHERE submission_id = ?",
@@ -127,16 +162,33 @@ class LibraryRepositoryMixin(DatabaseCore):
             return max(0, cursor.rowcount)
 
     async def transcription(self, submission_id: int) -> dict[str, Any] | None:
+        # Reads stay compatible with a schema before migration 026: the three
+        # speaker columns are selected only when they actually exist.
+        schema = await _rows(self.read_db, "PRAGMA table_info(transcriptions)")
+        existing = {str(row[1]) for row in schema}
+        optional = tuple(
+            name
+            for name in ("speaker_turns_json", "diarization_attempted", "overlap_count")
+            if name in existing
+        )
+        columns = ("engine", "text", "notes_json", *optional)
         rows = await _rows(
             self.read_db,
-            "SELECT engine, text, notes_json FROM transcriptions "
+            f"SELECT {', '.join(columns)} FROM transcriptions "
             "WHERE submission_id = ?",
             (submission_id,),
         )
         if not rows:
             return None
-        engine, text, notes_json = rows[0]
-        return {"engine": engine, "text": text, "notes_json": notes_json}
+        record = dict(zip(columns, rows[0], strict=True))
+        return {
+            "engine": record.get("engine"),
+            "text": record.get("text"),
+            "notes_json": record.get("notes_json"),
+            "speaker_turns_json": record.get("speaker_turns_json"),
+            "diarization_attempted": bool(record.get("diarization_attempted")),
+            "overlap_count": int(record.get("overlap_count") or 0),
+        }
 
     async def submission(self, submission_id: int) -> SubmissionRow | None:
         rows = await _rows(
@@ -294,4 +346,92 @@ class LibraryRepositoryMixin(DatabaseCore):
             (int(user_id), str(kind)),
         )
         return int(rows[0][0]) if rows else 0
+
+    # -- Gamas 2.0: central submission artifacts ---------------------------
+    async def artifact_upsert(
+        self,
+        submission_id: int,
+        user_id: int,
+        kind: str,
+        *,
+        reference: str = "",
+        payload: str | None = None,
+        available: bool = True,
+    ) -> None:
+        """Register one independently downloadable artifact of a submission.
+
+        Each ``(submission_id, kind)`` is stored once and updated in place: the
+        completion message can therefore show exactly the buttons that exist,
+        and no artifact depends on another one having been generated.
+        """
+        await self._write(
+            "INSERT INTO submission_artifacts(submission_id, user_id, kind, reference, "
+            "payload, available, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(submission_id, kind) DO UPDATE SET "
+            "reference = excluded.reference, payload = excluded.payload, "
+            "available = excluded.available",
+            (
+                int(submission_id),
+                int(user_id),
+                str(kind),
+                str(reference),
+                payload,
+                int(bool(available)),
+                iso(self._now()),
+            ),
+        )
+
+    async def artifact_list(self, submission_id: int) -> list[dict[str, Any]]:
+        """All artifact kinds registered for one submission (central library)."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT artifact_id, kind, reference, payload, available, created_at "
+            "FROM submission_artifacts WHERE submission_id = ? ORDER BY artifact_id",
+            (int(submission_id),),
+        )
+        return [dict(row) for row in rows]
+
+    async def artifact_kinds(self, submission_id: int) -> set[str]:
+        """The *available* kinds: only these may appear as download buttons."""
+        rows = await _rows(
+            self.read_db,
+            "SELECT kind FROM submission_artifacts "
+            "WHERE submission_id = ? AND available = 1",
+            (int(submission_id),),
+        )
+        return {str(row[0]) for row in rows}
+
+    async def artifact(
+        self, submission_id: int, kind: str
+    ) -> dict[str, Any] | None:
+        rows = await _rows(
+            self.read_db,
+            "SELECT artifact_id, kind, reference, payload, available "
+            "FROM submission_artifacts WHERE submission_id = ? AND kind = ?",
+            (int(submission_id), str(kind)),
+        )
+        return dict(rows[0]) if rows else None
+
+    # -- Gamas 2.0: anonymous speaker renames ------------------------------
+    async def set_speaker_name(
+        self, submission_id: int, speaker_label: str, custom_name: str
+    ) -> None:
+        """Map one stable speaker label to the name its owner chose."""
+        name = str(custom_name).strip()[:64]
+        if not name:
+            return
+        await self._write(
+            "INSERT INTO speaker_names(submission_id, speaker_label, custom_name, named_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(submission_id, speaker_label) "
+            "DO UPDATE SET custom_name = excluded.custom_name, named_at = excluded.named_at",
+            (int(submission_id), str(speaker_label), name, iso(self._now())),
+        )
+
+    async def speaker_names(self, submission_id: int) -> dict[str, str]:
+        rows = await _rows(
+            self.read_db,
+            "SELECT speaker_label, custom_name FROM speaker_names WHERE submission_id = ?",
+            (int(submission_id),),
+        )
+        return {str(row[0]): str(row[1]) for row in rows}
 

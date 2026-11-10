@@ -169,6 +169,9 @@ files = [
     "gamas_bot/subscription.py",
     "gamas_bot/titles.py",
     "gamas_bot/transcript.py",
+    "gamas_bot/diarization_eval.py",
+    "gamas_bot/mini_app.py",
+    "gamas_bot/mini_app_store.py",
 ]
 ignore_missing_imports = true
 warn_unused_ignores = true

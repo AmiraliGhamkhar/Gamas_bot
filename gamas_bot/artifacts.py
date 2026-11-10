@@ -36,11 +36,23 @@ from . import texts
 
 logger = logging.getLogger(__name__)
 
-#: The three things a results message can offer.
+#: The artifacts a finished submission can offer. ``txt`` is the plain-text
+#: *file* download; ``transcript`` is the same text rendered in chat. They are
+#: independent buttons because a student may want to read it now or save it.
 KIND_BOOKLET = "booklet"
 KIND_TRANSCRIPT = "transcript"
+KIND_TXT = "txt"
 KIND_KEYPOINTS = "keypoints"
-KINDS = (KIND_BOOKLET, KIND_TRANSCRIPT, KIND_KEYPOINTS)
+KIND_QUIZ = "quiz"
+KIND_FLASHCARDS = "flashcards"
+KINDS = (
+    KIND_BOOKLET,
+    KIND_TRANSCRIPT,
+    KIND_TXT,
+    KIND_KEYPOINTS,
+    KIND_QUIZ,
+    KIND_FLASHCARDS,
+)
 
 #: Prefix of a fetch callback (``art:GMS-12:transcript``).
 CALLBACK_PREFIX = "art:"
@@ -146,8 +158,23 @@ async def keypoints_artifact(db: Any, submission_id: int) -> str | None:
     )
 
 
-def delivery_markup(*, reference: str, speakers: int, has_booklet: bool, kinds: set[str]):
-    """The buttons a results message carries, given what actually exists."""
+def delivery_markup(
+    *,
+    reference: str,
+    speakers: int,
+    has_booklet: bool,
+    kinds: set[str],
+    item_id: int | None = None,
+    mini_app_url: str = "",
+):
+    """One completion screen, one button per independently available artifact.
+
+    Nothing appears here unless it really exists: ``kinds`` comes from the
+    central submission artifact registry, ``item_id`` is the user's own booklet
+    row (so quiz/flashcards can only be built from their own material), and the
+    Studio button only shows when a Mini App URL is configured. Every button
+    leads to a working handler — there are no placeholders.
+    """
     from telethon import Button
 
     rows: list[list[Any]] = []
@@ -155,12 +182,16 @@ def delivery_markup(*, reference: str, speakers: int, has_booklet: bool, kinds: 
         rows.append(
             [Button.inline(texts.BTN_GET_BOOKLET, callback_for(reference, KIND_BOOKLET))]
         )
-    row = []
+    row: list[Any] = []
     if KIND_TRANSCRIPT in kinds:
         row.append(
             Button.inline(
                 texts.BTN_GET_TRANSCRIPT, callback_for(reference, KIND_TRANSCRIPT)
             )
+        )
+    if KIND_TXT in kinds:
+        row.append(
+            Button.inline(texts.BTN_DOWNLOAD_TXT, callback_for(reference, KIND_TXT))
         )
     if KIND_KEYPOINTS in kinds:
         row.append(
@@ -170,5 +201,24 @@ def delivery_markup(*, reference: str, speakers: int, has_booklet: bool, kinds: 
         )
     if row:
         rows.append(row)
+    if mini_app_url and has_booklet:
+        rows.append([texts.mini_app_button(texts.BTN_EDIT_IN_APP, mini_app_url)])
+    learning: list[Any] = []
+    if item_id and KIND_QUIZ in kinds:
+        learning.append(
+            Button.inline(
+                texts.BTN_QUIZ_FROM_BOOKLET,
+                f"quiz:new:{int(item_id)}".encode("ascii"),
+            )
+        )
+    if item_id and KIND_FLASHCARDS in kinds:
+        learning.append(
+            Button.inline(
+                texts.BTN_CARDS_FROM_BOOKLET,
+                f"fc:ai:{int(item_id)}".encode("ascii"),
+            )
+        )
+    if learning:
+        rows.append(learning)
     rows.append([Button.inline(texts.BTN_BACK_MAIN, b"menu:main")])
     return rows

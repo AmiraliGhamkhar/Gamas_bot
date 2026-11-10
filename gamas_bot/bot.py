@@ -41,9 +41,14 @@ from telethon import Button, TelegramClient, events
 from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotModifiedError
 
 from .artifacts import (
+    KIND_BOOKLET,
+    KIND_FLASHCARDS,
     KIND_KEYPOINTS,
+    KIND_QUIZ,
     KIND_TRANSCRIPT,
+    KIND_TXT,
     delivery_markup,
+    key_points_of,
 )
 from .billing import format_seconds_as_credits, plan_catalog
 from .bot_admin import AdminWorkflowMixin
@@ -588,6 +593,7 @@ class GamasBot(
         """
         from telethon.tl.types import (
             ButtonTypeDefault,
+            ButtonTypeSimpleWebView,
             KeyboardButton,
             KeyboardButtonRow,
             ReplyKeyboardMarkup,
@@ -604,6 +610,20 @@ class GamasBot(
                 is_admin=is_admin, office_enabled=self.settings.office_enabled
             )
         ]
+        # A reply-keyboard WebView button opens Gamas Studio inside Telegram.
+        # It is added only when the app is configured, so a deployment without
+        # a Mini App never shows a button that cannot open (no dead buttons).
+        if self.settings.mini_app_url:
+            rows.append(
+                KeyboardButtonRow(
+                    buttons=[
+                        KeyboardButton(
+                            text=texts.BTN_STUDIO,
+                            type=ButtonTypeSimpleWebView(self.settings.mini_app_url),
+                        )
+                    ]
+                )
+            )
         return ReplyKeyboardMarkup(
             rows=rows,
             resize=True,
@@ -1171,14 +1191,59 @@ class GamasBot(
             for item in books
         )
         transcript = await self.db.transcription(submission_id)
+        has_text = bool(transcript and str(transcript.get("text") or "").strip())
         has_keypoints = bool(
-            transcript and transcript.get("notes_json")
+            transcript and key_points_of(transcript.get("notes_json"))
         )
+        # The central registry is the first source of truth, but it is
+        # reconciled with the rows the buttons actually read. A partial
+        # registry write (or a pre-026 deployment) must not hide a real
+        # download, and a stale registration must not advertise a dead one.
+        try:
+            kinds = set(await self.db.artifact_kinds(submission_id))
+        except Exception:
+            logger.warning(
+                "artifact registry read failed submission=%s", submission_id,
+                exc_info=True,
+            )
+            kinds = set()
+        if has_text:
+            kinds.update({KIND_TRANSCRIPT, KIND_TXT})
+        else:
+            kinds.difference_update({KIND_TRANSCRIPT, KIND_TXT})
+        if has_keypoints:
+            kinds.add(KIND_KEYPOINTS)
+        else:
+            kinds.discard(KIND_KEYPOINTS)
+        item_id: int | None = None
+        if has_booklet:
+            match = next(
+                (
+                    item
+                    for item in books
+                    if int(item.get("submission_id") or 0) == submission_id
+                    and not item.get("unavailable")
+                ),
+                None,
+            )
+            if match is not None:
+                item_id = int(match["item_id"])
+            # The booklet is forwardable even if the optional library lookup
+            # for learning buttons failed; only quiz/flashcards need item_id.
+            kinds.add(KIND_BOOKLET)
+            if item_id is not None:
+                kinds.update({KIND_QUIZ, KIND_FLASHCARDS})
+            else:
+                kinds.difference_update({KIND_QUIZ, KIND_FLASHCARDS})
+        else:
+            kinds.difference_update({KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS})
         buttons = delivery_markup(
             reference=reference,
             speakers=0,
             has_booklet=has_booklet,
-            kinds={KIND_TRANSCRIPT} | ({KIND_KEYPOINTS} if has_keypoints else set()),
+            kinds=kinds,
+            item_id=item_id,
+            mini_app_url=self.settings.mini_app_url,
         )
         await self._edit(
             event,

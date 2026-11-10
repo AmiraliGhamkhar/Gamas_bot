@@ -56,6 +56,8 @@ class MediaInfo:
     has_audio: bool
     duration: float | None
     audio_codec: str | None = None
+    #: Number of channels in the first audio stream, when the probe reports it.
+    channels: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,7 +226,12 @@ def parse_probe_output(payload: str) -> MediaInfo:
             duration = value
     raw_codec = data.get("audio_codec")
     codec = raw_codec if isinstance(raw_codec, str) and raw_codec else None
-    return MediaInfo(has_audio, duration, codec)
+    channels: int | None = None
+    raw_channels = data.get("channels")
+    if isinstance(raw_channels, int) and not isinstance(raw_channels, bool):
+        if 0 < raw_channels <= 16:
+            channels = raw_channels
+    return MediaInfo(has_audio, duration, codec, channels)
 
 
 def parse_probe_list_output(payload: str, paths: list[Path]) -> dict[str, MediaInfo]:
@@ -377,6 +384,7 @@ def choose_merge_format(
     *,
     max_output_bytes: int | None = None,
     egress_bytes_per_second: float | None = None,
+    stereo: bool = False,
 ) -> str:
     """Pick WAV or Opus from the budget *and*, when known, the transfer cost.
 
@@ -404,7 +412,8 @@ def choose_merge_format(
         total_duration = settings.presentation_max_total_duration
     if not math.isfinite(total_duration) or total_duration < 0:
         raise MediaToolError("مدت صدای ادغام‌شده معتبر نیست.")
-    estimated_wav = total_duration * WAV_BYTES_PER_SECOND + 44
+    wav_bytes_per_second = WAV_BYTES_PER_SECOND * (2 if stereo else 1)
+    estimated_wav = total_duration * wav_bytes_per_second + 44
     output_budget = settings.max_file_size
     if max_output_bytes is not None:
         output_budget = min(output_budget, max_output_bytes)
@@ -444,6 +453,9 @@ def build_merge_command(
     *,
     output_format: str = "wav",
     silence_seconds: float = 0.5,
+    preprocess: bool = False,
+    adaptive: bool = False,
+    stereo: bool = False,
 ) -> list[str]:
     """Build the worker call that concatenates the audio tracks of every input.
 
@@ -460,8 +472,14 @@ def build_merge_command(
         "--output", str(output),
         "--format", output_format,
         "--silence", f"{silence_seconds:g}",
-        "--",
     )
+    if preprocess:
+        command.append("--preprocess")
+    if adaptive and preprocess:
+        command.append("--adaptive")
+    if stereo:
+        command.append("--stereo")
+    command.append("--")
     command.extend(str(item) for item in inputs)
     return command
 
@@ -492,6 +510,9 @@ async def merge_audio_tracks(
         output,
         output_format=output_format,
         silence_seconds=settings.presentation_silence_seconds,
+        preprocess=settings.stt_preprocess,
+        adaptive=settings.stt_preprocess,
+        stereo=bool(getattr(settings, "stt_preserve_stereo", False)),
     )
     code, stdout, stderr = await run_command(
         command,
@@ -542,6 +563,8 @@ def build_extract_command(
     *,
     output_format: str = "wav",
     preprocess: bool = False,
+    adaptive: bool = False,
+    stereo: bool = False,
 ) -> list[str]:
     """Build the worker call that takes the first audio track to mono PCM/Opus.
 
@@ -558,6 +581,10 @@ def build_extract_command(
     )
     if preprocess:
         command.append("--preprocess")
+    if adaptive and preprocess:
+        command.append("--adaptive")
+    if stereo:
+        command.append("--stereo")
     command.extend(["--", str(source)])
     return command
 
@@ -571,17 +598,26 @@ async def extract_audio_track(
     max_output_bytes: int | None = None,
     egress_bytes_per_second: float | None = None,
     stem: str = "audio",
+    channels: int | None = None,
 ) -> Path:
-    """Pull a single mono audio track out of any media file PyAV can read.
+    """Pull a cleaned audio track out of any media file PyAV can read.
 
     ``max_output_bytes`` is the size the result must not exceed: the caller
     passes the smallest of the temp budget, ``MAX_FILE_SIZE`` and the largest
     ceiling of the *configured* STT providers, so the format is chosen once,
-    up front, instead of producing a WAV no provider will accept.
+    up front, instead of producing a WAV no provider will accept. The original
+    file is never modified: the worker writes a separate output. When
+    ``STT_PRESERVE_STEREO`` is on and the source has more than one channel,
+    the output stays stereo (see :func:`_probe_channels`); the WAV budget is
+    doubled accordingly.
     """
     # A budget is always passed: with an unknown duration the selector must not
     # default to an unbounded PCM WAV that fills the temp partition before the
     # post-hoc size check can reject it (audit F-22).
+    stereo = bool(
+        getattr(settings, "stt_preserve_stereo", False)
+        and (channels or 0) >= 2
+    )
     output_format = choose_merge_format(
         total_duration,
         settings,
@@ -589,6 +625,7 @@ async def extract_audio_track(
             settings.max_file_size if max_output_bytes is None else max_output_bytes
         ),
         egress_bytes_per_second=egress_bytes_per_second,
+        stereo=stereo,
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     output = output_dir / merge_output_name(stem, output_format)
@@ -597,6 +634,8 @@ async def extract_audio_track(
         output,
         output_format=output_format,
         preprocess=settings.stt_preprocess,
+        adaptive=settings.stt_preprocess,
+        stereo=stereo,
     )
     code, _, stderr = await run_command(
         command,

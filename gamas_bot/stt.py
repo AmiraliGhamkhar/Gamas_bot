@@ -862,7 +862,9 @@ def _deepgram_transcript(payload: object) -> RawTranscript:
                 if isinstance(speaker, (int, float)) and not isinstance(speaker, bool)
                 else str(speaker or "").strip()
             )
-            words.append(Word(token, start, end, label))
+            words.append(
+                Word(token, start, end, label, _optional_float(item.get("confidence")))
+            )
     if not text:
         text = " ".join(word.text for word in words).strip()
     if not _has_meaningful_text(text):
@@ -886,10 +888,15 @@ async def _deepgram(
         "punctuate": "true",
     }
     if settings.stt_diarize:
-        # ``diarize`` puts a speaker index on each word; ``utterances`` groups
-        # them into turns. Both together keep the word timings (needed for the
-        # chapter stamps) while still telling us who spoke.
-        params["diarize"] = "true"
+        # ``diarize`` puts a speaker index on each word. ``diarize_model``
+        # (latest/v1/v2) selects the diarizer build and implies diarization;
+        # when it is unset the legacy ``diarize=true`` (v1) is sent, which
+        # keeps older deployments byte-identical. See docs/STT_PROVIDERS.md.
+        diarize_model = (getattr(settings, "deepgram_diarize_model", "") or "").strip()
+        if diarize_model in ("latest", "v1", "v2"):
+            params["diarize_model"] = diarize_model
+        else:
+            params["diarize"] = "true"
     if language == _AUTO_LANGUAGE:
         # Deepgram detects the dominant language with its own parameter; the
         # docs state that it also picks the best model available for it.
@@ -1068,6 +1075,11 @@ class ProviderSpec:
     base_url_getter: Callable[[Settings], str] = lambda _s: ""
     upload_limit_getter: Callable[[Settings], int] | None = None
     max_in_flight_getter: Callable[[Settings], int] = lambda _s: 1
+    #: Whether this provider natively diarizes (per-word speaker labels).
+    #: ``openai_compatible`` is pass-through: a gateway *may* return segment
+    #: speakers, but Whisper itself does not diarize, so it is never preferred
+    #: when diarization is requested.
+    supports_diarization: bool = False
 
     def is_configured(self, settings: Settings) -> bool:
         return self.configured(settings)
@@ -1097,6 +1109,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         model_getter=lambda s: s.speechmatics_model,
         base_url_getter=lambda s: s.speechmatics_base_url,
         max_in_flight_getter=lambda s: s.speechmatics_max_in_flight,
+        supports_diarization=True,
     ),
     "deepgram": ProviderSpec(
         slug="deepgram",
@@ -1107,6 +1120,7 @@ PROVIDERS: dict[str, ProviderSpec] = {
         model_getter=lambda s: s.deepgram_model,
         base_url_getter=lambda s: s.deepgram_base_url,
         max_in_flight_getter=lambda s: s.deepgram_max_in_flight,
+        supports_diarization=True,
     ),
     "openai_compatible": ProviderSpec(
         slug="openai_compatible",
@@ -1125,6 +1139,33 @@ PROVIDERS: dict[str, ProviderSpec] = {
 def register_stt_provider(spec: ProviderSpec) -> None:
     """Register or override an STT provider adapter (OCP extension point)."""
     PROVIDERS[spec.slug] = spec
+
+
+def provider_supports_diarization(slug: str) -> bool:
+    """Whether *slug* natively diarizes (per-word speaker labels)."""
+    spec = PROVIDERS.get(slug)
+    return bool(spec.supports_diarization) if spec is not None else False
+
+
+def order_specs_for_diarization(
+    specs: list[ProviderSpec], *, diarization_enabled: bool
+) -> list[ProviderSpec]:
+    """Stable-sort *specs* so diarizing providers come first when requested.
+
+    The configured ``STT_PROVIDERS`` order is the failover policy and is
+    otherwise untouched: this only prefers a diarizing engine over a
+    pass-through gateway when diarization is on, without waiting for a busy
+    provider (the capacity pool still overflows immediately). When no
+    diarizing provider is configured the order is returned unchanged and the
+    transcript simply carries no speaker labels.
+    """
+    if not diarization_enabled:
+        return list(specs)
+    diarizing = [spec for spec in specs if spec.supports_diarization]
+    if not diarizing or len(diarizing) == len(specs):
+        return list(specs)
+    rest = [spec for spec in specs if not spec.supports_diarization]
+    return diarizing + rest
 
 
 def provider_upload_limit(slug: str, settings: Settings) -> int:
@@ -1279,6 +1320,21 @@ async def transcribe(
                 "هیچ سرویس تبدیل گفتاری پیکربندی نشده است "
                 "(SPEECHMATICS_API_KEY، DEEPGRAM_API_KEY یا STT_OPENAI_BASE_URL+STT_OPENAI_API_KEY)."
             )
+        if settings.stt_diarize:
+            ordered = order_specs_for_diarization(
+                configured_specs, diarization_enabled=True
+            )
+            if ordered != configured_specs:
+                logger.info(
+                    "STT diarization preferred order=%s",
+                    ",".join(spec.slug for spec in ordered),
+                )
+            configured_specs = ordered
+            if not any(spec.supports_diarization for spec in configured_specs):
+                logger.warning(
+                    "STT diarization requested but no configured provider diarizes; "
+                    "transcript will carry no speaker labels"
+                )
 
         def _eligible_specs() -> tuple[
             list[ProviderSpec], list[str], tuple[str, float] | None

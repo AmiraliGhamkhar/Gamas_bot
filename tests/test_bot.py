@@ -140,7 +140,9 @@ class BotPipelineTestCase(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _fake_extract(audio: Path):
-        async def extract(source: Path, workdir: Path, _settings) -> Path:
+        async def extract(source: Path, workdir: Path, _settings, **_kwargs) -> Path:
+            # Gamas 2.0 preprocessing is mandatory, so extraction also receives
+            # the measured duration, byte budget, egress rate and channel count.
             target = Path(workdir) / "audio.wav"
             target.write_bytes(Path(source).read_bytes())
             return target
@@ -1995,6 +1997,10 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
                 )),
             ),
             mock.patch("gamas_bot.bot.needs_transcode", return_value=False),
+            mock.patch(
+                "gamas_bot.bot.extract_audio_track",
+                new=mock.AsyncMock(side_effect=lambda source, *a, **k: source),
+            ),
             mock.patch("gamas_bot.bot.transcribe", new=mock.AsyncMock(return_value=raw)),
             mock.patch("gamas_bot.bot.structure_transcript", new=mock.AsyncMock(return_value=notes)) as generate,
             mock.patch.object(self.bot, "_http_session", return_value=None),
@@ -2048,6 +2054,10 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
                 )),
             ),
             mock.patch("gamas_bot.bot.needs_transcode", return_value=False),
+            mock.patch(
+                "gamas_bot.bot.extract_audio_track",
+                new=mock.AsyncMock(side_effect=lambda source, *a, **k: source),
+            ),
             mock.patch("gamas_bot.bot.transcribe", new=mock.AsyncMock(return_value=raw)),
             mock.patch("gamas_bot.bot.structure_transcript", new=mock.AsyncMock()) as generate,
         ):
@@ -2177,6 +2187,35 @@ class ResultsHubTests(BotPipelineTestCase):
         callback = FakeCallbackEvent(999_002, b"")
         await self.bot._show_result_set(callback, 999_002, submission)
         self.assertEqual(callback.answers[-1][0], texts.DELIVERY_ARTIFACT_GONE)
+
+    async def test_a_booklet_button_survives_a_consumed_library_snapshot(self):
+        """has_booklet is enough for a forward; learning buttons need item_id."""
+        event = self.media_event()
+        submission = await self.run_media_job(event, transcribe=self._raw())
+        book = {
+            "submission_id": submission,
+            "item_id": 77,
+            "unavailable": False,
+        }
+        # A one-shot iterator is consumed by the `any()` check, so the later
+        # `next()` lookup finds no match. The registry write may also be absent
+        # on a pre-026 deployment. Neither may hide the real booklet download.
+        snapshot = iter([book])
+        with mock.patch.object(
+            self.bot.db, "library_list_kind",
+            new=mock.AsyncMock(return_value=snapshot),
+        ), mock.patch.object(
+            self.bot.db, "artifact_kinds",
+            new=mock.AsyncMock(return_value=set()),
+        ):
+            callback = FakeCallbackEvent(
+                self.bot.client, data=f"res:{submission}".encode("ascii")
+            )
+            await self.bot._show_result_set(callback, USER_ID, submission)
+        _text, buttons = callback.edits[-1]
+        payloads = menu_payloads(buttons)
+        self.assertIn(f"art:GMS-{submission}:booklet".encode("ascii"), payloads)
+        self.assertNotIn(b"quiz:new:77", payloads)
 
 
 class ReplyKeyboardRoutingTests(BotPipelineTestCase):
