@@ -25,7 +25,6 @@ class SupportRepositoryMixin(DatabaseCore):
     """Single-responsibility persistence slice for user/admin support tickets."""
 
     SUPPORT_CATEGORIES = ("payment", "technical", "subscription", "other")
-    SUPPORT_STATUSES = ("open", "awaiting_admin", "awaiting_user", "closed")
     SUPPORT_SUBJECT_MAX = 400
     SUPPORT_MESSAGE_MAX = 4000
 

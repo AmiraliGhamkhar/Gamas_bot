@@ -26,8 +26,6 @@ class PaymentsRepositoryMixin(DatabaseCore):
 
     """Single-responsibility persistence slice for plans and manual payments."""
 
-    PAYMENT_OPEN_STATUSES = ("awaiting_payment", "pending_review", "pending")
-    PAYMENT_PENDING_REVIEW_STATUSES = ("pending_review", "pending")
 
     _PAYMENT_COLUMNS = (
         "payment_id, user_id, plan_code, status, receipt_path, created_at, "

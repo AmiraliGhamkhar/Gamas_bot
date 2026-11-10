@@ -52,7 +52,6 @@ MIN_VALID_CARDS = 5
 #: owns the provider failover). Four is the sweet spot measured against the
 #: provider rate limits already configured for note generation: fewer makes a
 #: long document slow, more starts tripping per-minute quotas.
-CHUNK_CONCURRENCY = 4
 
 #: Longest a generated item may cite: a page/slide locator plus a heading.
 MAX_SOURCE_CHARS = 120
@@ -64,7 +63,6 @@ SIZE_PRESETS: tuple[tuple[str, str, int, int], ...] = (
     ("standard", "⭐ استاندارد", 20, 10),
     ("full", "🎯 کامل", 40, 20),
 )
-SIZE_PRESET_CODES = tuple(preset[0] for preset in SIZE_PRESETS)
 
 
 def preset_cards(code: str) -> int | None:

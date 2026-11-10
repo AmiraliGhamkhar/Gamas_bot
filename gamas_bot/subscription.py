@@ -155,7 +155,6 @@ class SubscriptionService:
         self._cache: dict[int, tuple[str, float]] = {}
         #: user_id -> future, so concurrent checks share one request.
         self._inflight: dict[int, asyncio.Future[MembershipResult]] = {}
-        self._channel_resolved = False
         #: Monotonic timestamp of the last administrator alert, or ``None``
         #: when none has been sent yet. ``time.monotonic()`` has an arbitrary
         #: epoch (system uptime), so ``0.0`` cannot mean "never": on a freshly

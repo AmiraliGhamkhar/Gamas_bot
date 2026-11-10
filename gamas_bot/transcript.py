@@ -698,7 +698,6 @@ def paragraphs_from_words_by_speaker(
 
 
 #: Header the transcript carries when the class had more than one voice.
-DIARIZATION_HEADER_TEMPLATE = "🎙 تعداد گویندگان شناسایی‌شده: {count}"
 
 
 # ---------------------------------------------------------------------------

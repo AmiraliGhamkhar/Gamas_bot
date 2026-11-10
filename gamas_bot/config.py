@@ -40,7 +40,6 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent
 #: The tuple is kept (with a single value) because the note model still
 #: normalises the stored ``note_mode`` field through it for backward
 #: compatibility with previously archived booklets.
-NOTE_MODES = ("full",)
 RAW_TEXT_PROFILES = ("plain", "timestamped")
 
 STT_PROVIDER_ORDER = ("speechmatics", "deepgram", "openai_compatible")

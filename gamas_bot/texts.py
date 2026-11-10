@@ -46,11 +46,9 @@ BTN_GET_DOCX: Final = "📄 دریافت نسخه Word"
 BTN_GET_TRANSCRIPT: Final = "📝 دریافت متن خام"
 BTN_DOWNLOAD_TXT: Final = "📥 دریافت فایل TXT"
 BTN_GET_KEYPOINTS: Final = "⭐ دریافت نکات کلیدی"
-BTN_SHOW_RESULTS: Final = "📦 دریافت خروجی‌ها"
 BTN_MY_RESULTS: Final = "📦 خروجی‌های من"
 BTN_START_HERE: Final = "🎓 شروع"
 BTN_UPGRADE: Final = "🛒 افزایش اعتبار"
-BTN_OPEN_APP: Final = "🗂 باشگاه مطالعه (رنک‌بندی و ویرایش جزوه)"
 BTN_STUDIO: Final = "🎛 گاماس استودیو"
 BTN_EDIT_IN_APP: Final = "✏️ ویرایش جزوه در Gamas Studio"
 BTN_QUIZ_FROM_BOOKLET: Final = "🧪 آزمون از این جزوه"
@@ -187,12 +185,9 @@ DELIVERY_SPEAKERS_NONE: Final = (
 )
 DELIVERY_TRANSCRIPT_READY: Final = "📝 متن خام — {reference}"
 DELIVERY_KEYPOINTS_READY: Final = "⭐ نکات کلیدی — {reference}"
-DELIVERY_BOOKLET_READY: Final = "📖 {title} — {reference}"
 DELIVERY_ARTIFACT_GONE: Final = (
     "این خروجی دیگر در دسترس نیست؛ دوباره فایل را بفرستید تا از نو ساخته شود."
 )
-DELIVERY_NO_ARTIFACTS: Final = "برای این گفتگو خروجی‌ای ثبت نشده است."
-DELIVERY_GET_ALL: Final = "📦 هر سه خروجی را بفرست"
 DELIVERY_KEYPOINTS_CHAT_HEADER: Final = "⭐ نکات کلیدی — {reference}"
 DELIVERY_KEYPOINTS_EMPTY: Final = "برای این فایل نکتهٔ کلیدی ثبت نشد."
 RESULTS_HUB_TITLE: Final = "📦 خروجی‌های من\n\nهر ردیف یک گفتگو؛ خروجی‌هایش را از همان‌جا بردارید."
@@ -322,7 +317,6 @@ INVALID_ORDER_ID: Final = "شناسهٔ سفارش نامعتبر است."
 INVALID_GIFT: Final = "درخواست هدیه نامعتبر است."
 INVALID_PAYMENTS_PAGE: Final = "صفحهٔ پرداخت‌ها نامعتبر است."
 INVALID_REPORT_PAGE: Final = "صفحهٔ گزارش نامعتبر است."
-INVALID_COMMAND_CANCEL: Final = "دستور نامعتبر است؛ برای لغو /cancel بفرستید."
 INVALID_COMMAND_TEXT: Final = "دستور نامعتبر است؛ متن پیام را بفرستید یا /cancel بزنید."
 
 # -------------------------------------------------------------------- broadcast
@@ -416,14 +410,8 @@ REFERRALS_CODE_TEMPLATE: Final = "کد دعوت شما: {code}"
 REFERRALS_STATS_TEMPLATE: Final = "دعوت‌شده‌ها: {invited} | اعتبار هدیه: {seconds}"
 REFERRALS_SELF: Final = "نمی‌توانید با لینک خودتان دعوت شوید."
 REFERRALS_DUPLICATE: Final = "این دعوت قبلاً ثبت شده است."
-REFERRALS_UNAVAILABLE: Final = (
-    "ساخت لینک دعوت موقتاً در دسترس نیست؛ کمی بعد دوباره تلاش کنید."
-)
 REFERRAL_JOIN_REWARD_TEMPLATE: Final = (
     "🎁 هدیهٔ دعوت ثبت شد: {seconds} اعتبار به دوست شما اضافه شد."
-)
-REFERRAL_REFERRER_NOTICE_TEMPLATE: Final = (
-    "🎉 یک دوست با لینک شما به گاماس پیوست؛ {seconds} اعتبار هدیه گرفتید."
 )
 ADMIN_REFERRALS_HEADER: Final = "🤝 آمار دعوت"
 ADMIN_REFERRALS_TOTALS_TEMPLATE: Final = (
@@ -447,14 +435,11 @@ WALLET_PLAN_BUTTON_TEMPLATE: Final = "{credits} — {price}"
 #: The credit amount as it appears inside a plan button.
 WALLET_PLAN_BUTTON_CREDITS: Final = "{credits} اعتبار"
 #: How the balance line names the unit it is showing.
-WALLET_BALANCE_UNIT: Final = "اعتبار"
 
 #: How a charge is described everywhere (intake, job failure, learning).
 #: ``{credits}`` is already grouped and in Persian digits; the hours it covers
 #: follow in parentheses so the tariff is never a mystery.
-CREDIT_COST_TEMPLATE: Final = "{credits} ({hours} ساعت)"
 #: Intake: the file's own length, in both currencies.
-CREDIT_MEASURE_TEMPLATE: Final = "مدت فایل: {duration} ≈ {credits}"
 WALLET_CARD_DISABLED: Final = "🛒 پرداخت کارت‌به‌کارت فعلاً غیرفعال است."
 WALLET_BALANCE_TEMPLATE: Final = "💳 اعتبار باقی‌مانده: {balance}"
 WALLET_UNIT_HINT: Final = "📐 هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس"
