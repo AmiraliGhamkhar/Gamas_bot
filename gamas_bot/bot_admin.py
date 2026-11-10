@@ -18,7 +18,12 @@ from typing import TYPE_CHECKING, Any
 from telethon import Button
 
 from . import texts
-from .billing import format_duration, format_toman, format_validity
+from .billing import (
+    format_duration,
+    format_seconds_as_credits,
+    format_toman,
+    format_validity,
+)
 from .bot_ui import TELEGRAM_CAPTION_LIMIT
 from .db import utc_now
 from .docx_export import jalali_date
@@ -34,7 +39,7 @@ from .intake import (
 )
 from .metrics import METRICS
 from .progress import to_persian_digits
-from .telegram_text import button_label, split_message
+from .telegram_text import button_label
 
 if TYPE_CHECKING:
     from .bot_deps import BotDependencies
@@ -55,6 +60,12 @@ class AdminWorkflowMixin:
     _pending_free_reset: dict[int, int]
     _admin_action_times: dict[tuple[int, str], float]
     _broadcast_running: set[int]
+    # Supplied by the composed bot.
+    _broadcast_stop: Any
+    _broadcast_resume: Any
+    _pending_broadcast: Any
+    _broadcast_previews: Any
+    _admin_menu: Any
 
     ADMIN_PERIODS: tuple[tuple[str, str], ...] = (
         ("today", "امروز"),
@@ -161,7 +172,7 @@ class AdminWorkflowMixin:
     def _duration_text(seconds: float | None) -> str:
         if seconds is None:
             return "—"
-        return format_duration(int(round(seconds)))
+        return format_seconds_as_credits(int(round(seconds)))
 
     def _timing_line(self, label: str, summary: dict) -> str:
         count = int(summary.get("count") or 0)
@@ -245,7 +256,7 @@ class AdminWorkflowMixin:
             items.append(
                 f"⏳ {to_persian_digits(expiring['count'])} بستهٔ اعتبار تا "
                 f"{to_persian_digits(expiring['within_days'])} روز آینده منقضی می‌شود "
-                f"({format_duration(expiring['seconds'])})"
+                f"({format_seconds_as_credits(expiring['seconds'])})"
             )
         db_errors = int(runtime.get("db_errors", 0) or 0)
         if db_errors:
@@ -313,7 +324,7 @@ class AdminWorkflowMixin:
             for item in self._admin_attention_lines(report, self.runtime_metrics())  # type: ignore[attr-defined]
         )
         buttons = [self._admin_period_row("adm:ov", period)]
-        buttons.extend(self._admin_menu())  # type: ignore[attr-defined]
+        buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     def _admin_status_label(self, status: str) -> str:
@@ -380,7 +391,7 @@ class AdminWorkflowMixin:
             [Button.inline("👥 کاربران", b"adm:hub:usr")],
             [Button.inline("↩️ نمای کلی", b"adm:home")],
         ]
-        buttons.extend(self._admin_menu())  # type: ignore[attr-defined]
+        buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     async def _show_admin_processing_report(
@@ -486,7 +497,7 @@ class AdminWorkflowMixin:
             [Button.inline("🩺 وضعیت اکنون", b"adm:hub:sys")],
             [Button.inline("↩️ نمای کلی", b"adm:home")],
         ]
-        buttons.extend(self._admin_menu())  # type: ignore[attr-defined]
+        buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     async def _show_admin_payments_report(self, event: Any, period: str = "7d") -> None:
@@ -518,7 +529,7 @@ class AdminWorkflowMixin:
         lines.append(
             f"• اعتبار در حال انقضا (تا {to_persian_digits(expiring['within_days'])} روز آینده): "
             f"{to_persian_digits(expiring['count'])} بسته"
-            f" — {format_duration(expiring['seconds'])}"
+            f" — {format_seconds_as_credits(expiring['seconds'])}"
         )
         open_statuses = {
             status: entry
@@ -550,7 +561,7 @@ class AdminWorkflowMixin:
             ],
             [Button.inline("↩️ نمای کلی", b"adm:home")],
         ]
-        buttons.extend(self._admin_menu())  # type: ignore[attr-defined]
+        buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     async def _show_admin_system_report(self, event: Any, period: str = "7d") -> None:
@@ -629,7 +640,7 @@ class AdminWorkflowMixin:
             ],
             [Button.inline("↩️ نمای کلی", b"adm:home")],
         ]
-        buttons.extend(self._admin_menu())  # type: ignore[attr-defined]
+        buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     @staticmethod
@@ -692,7 +703,7 @@ class AdminWorkflowMixin:
             balance = (
                 "نامحدود"
                 if user["is_unlimited"]
-                else format_duration(user["available_seconds"])
+                else format_seconds_as_credits(user["available_seconds"])
             )
             joined = (user["joined_at"] or "")[:10] or "—"
             identity = self._identity_line(
@@ -746,7 +757,7 @@ class AdminWorkflowMixin:
             ]
         )
         buttons.append([Button.inline("🚫 مسدودشده‌ها", b"adm:hub:usr:banned")])
-        buttons.extend(self._admin_menu())  # type: ignore[attr-defined]
+        buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     async def _show_admin_user_card(self, event: Any, target_id: int) -> None:
@@ -755,7 +766,7 @@ class AdminWorkflowMixin:
             await self._edit(  # type: ignore[attr-defined]
                 event,
                 "کاربری با این شناسه ثبت نشده است.",
-                self._hub_back_row("usr") + self._admin_menu(),  # type: ignore[attr-defined]
+                self._hub_back_row("usr") + self._admin_menu(),
             )
             return
         if identity["is_unlimited"]:
@@ -837,7 +848,7 @@ class AdminWorkflowMixin:
                 ]
             )
         buttons.append(self._hub_back_row("usr"))
-        buttons.extend(self._admin_menu())  # type: ignore[attr-defined]
+        buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     async def _show_admin_pending_receipt_users(self, event: Any) -> None:
@@ -873,7 +884,7 @@ class AdminWorkflowMixin:
             )
         buttons.append([Button.inline("💳 صف پرداخت‌ها", b"adm:hub:pay")])
         buttons.append(self._hub_back_row("usr"))
-        buttons.extend(self._admin_menu())  # type: ignore[attr-defined]
+        buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     async def _show_admin_blocked_users(self, event: Any, page: int = 0) -> None:
@@ -922,7 +933,7 @@ class AdminWorkflowMixin:
         if nav:
             buttons.append(nav)
         buttons.append(self._hub_back_row("usr"))
-        buttons.extend(self._admin_menu())  # type: ignore[attr-defined]
+        buttons.extend(self._admin_menu())
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     async def _show_admin_free_reset_confirm(
@@ -1074,7 +1085,7 @@ class AdminWorkflowMixin:
             seconds = payment.get("purchased_seconds")
             price = payment.get("purchased_price")
             package = (
-                format_duration(int(seconds))
+                format_seconds_as_credits(int(seconds))
                 if seconds is not None
                 else payment["plan_code"]
             )
@@ -1231,7 +1242,7 @@ class AdminWorkflowMixin:
             f"شناسه سفارش: #{to_persian_digits(payment_id)}",
             f"کاربر: {owner_line}",
             f"طرح: {payment['plan_code']}",
-            f"بسته: {format_duration(int(seconds)) if seconds is not None else payment['plan_code']}",
+            f"بسته: {format_seconds_as_credits(int(seconds)) if seconds is not None else payment['plan_code']}",
             f"مدت اعتبار: {format_validity(validity_days)}",
             f"مبلغ: {format_toman(int(price)) if price is not None else 'نامشخص'}",
             f"وضعیت: {self._payment_status_label(payment['status'])}",  # type: ignore[attr-defined]
@@ -1377,7 +1388,7 @@ class AdminWorkflowMixin:
             nav.append(
                 Button.inline("بعدی ▶️", f"adm:audit:{page + 1}".encode("ascii"))
             )
-        buttons = ([nav] if nav else []) + self._admin_menu()  # type: ignore[attr-defined]
+        buttons = ([nav] if nav else []) + self._admin_menu()
         await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
 
     async def _check_admin_cooldown(
@@ -1395,7 +1406,7 @@ class AdminWorkflowMixin:
                 reply = event.respond if hasattr(event, "respond") else event.reply
                 await reply(
                     f"این دستور موقتاً محدود شده است؛ {math.ceil(remaining)} ثانیه دیگر تلاش کنید.",
-                    buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                    buttons=self._admin_menu(),
                 )
                 return False
         self._admin_action_times[key] = now
@@ -1415,7 +1426,7 @@ class AdminWorkflowMixin:
                 "قالب درست برای افزودن اعتبار:\n"
                 "/grant <شناسه کاربر> <ساعت>\n"
                 "مثال: /grant 123456789 2",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         target = _parse_telegram_user_id(parts[1])
@@ -1425,19 +1436,19 @@ class AdminWorkflowMixin:
                 "قالب درست برای افزودن اعتبار:\n"
                 "/grant <شناسه کاربر> <ساعت>\n"
                 "مثال: /grant 123456789 2",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         if self._is_admin(target):  # type: ignore[attr-defined]
             await event.reply(
                 "برای حفظ تفکیک دسترسی‌ها، امکان افزودن اعتبار به حساب مدیر دیگر وجود ندارد.",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         if not (0 < hours <= 10_000):
             await event.reply(
                 "تعداد ساعت باید بین ۱ و ۱۰٬۰۰۰ باشد.",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         if not await self._check_admin_cooldown(
@@ -1454,8 +1465,8 @@ class AdminWorkflowMixin:
         )
         owner = await self._identity_for_id(target)
         await event.reply(
-            f"✅ {format_duration(hours * 3600)} اعتبار به حساب کاربر {owner} اضافه شد.",
-            buttons=self._admin_menu(),  # type: ignore[attr-defined]
+            f"✅ {format_seconds_as_credits(hours * 3600)} به حساب کاربر {owner} اضافه شد.",
+            buttons=self._admin_menu(),
         )
 
     async def _admin_ban(self, event: Any, text: str) -> None:
@@ -1465,7 +1476,7 @@ class AdminWorkflowMixin:
                 "قالب درست:\n"
                 "مسدودکردن: /ban <شناسه کاربر>\n"
                 "رفع مسدودی: /unban <شناسه کاربر>",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         target = _parse_telegram_user_id(parts[1])
@@ -1474,14 +1485,14 @@ class AdminWorkflowMixin:
                 "قالب درست:\n"
                 "مسدودکردن: /ban <شناسه کاربر>\n"
                 "رفع مسدودی: /unban <شناسه کاربر>",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         banning = _command_name(text) == "/ban"
         if self._is_admin(target):  # type: ignore[attr-defined]
             await event.reply(
                 "حساب مدیران را نمی‌توان مسدود کرد.",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         action = "ban" if banning else "unban"
@@ -1497,7 +1508,7 @@ class AdminWorkflowMixin:
             f"🚫 حساب کاربر {owner} مسدود شد."
             if banning
             else f"✅ مسدودی حساب کاربر {owner} برداشته شد.",
-            buttons=self._admin_menu(),  # type: ignore[attr-defined]
+            buttons=self._admin_menu(),
         )
 
     async def _admin_unlimited(self, event: Any, text: str) -> None:
@@ -1512,7 +1523,7 @@ class AdminWorkflowMixin:
                 "فعال‌سازی: /unlimited <شناسه کاربر> on <دلیل>\n"
                 "غیرفعال‌سازی: /unlimited <شناسه کاربر> off\n"
                 "برای فعال‌سازی، دلیل را هم وارد کنید.",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         target = _parse_telegram_user_id(parts[1])
@@ -1522,7 +1533,7 @@ class AdminWorkflowMixin:
                 "فعال‌سازی: /unlimited <شناسه کاربر> on <دلیل>\n"
                 "غیرفعال‌سازی: /unlimited <شناسه کاربر> off\n"
                 "برای فعال‌سازی، دلیل را هم وارد کنید.",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         enable = parts[2].lower() == "on"
@@ -1530,13 +1541,13 @@ class AdminWorkflowMixin:
         if enable and not reason:
             await event.reply(
                 "برای فعال‌کردن وضعیت کاربر ویژه، واردکردن دلیل الزامی است.",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         if self._is_admin(target):  # type: ignore[attr-defined]
             await event.reply(
                 "فعال‌کردن وضعیت کاربر ویژه برای حساب مدیران مجاز نیست.",
-                buttons=self._admin_menu(),  # type: ignore[attr-defined]
+                buttons=self._admin_menu(),
             )
             return
         action = "unlimited_on" if enable else "unlimited_off"
@@ -1554,7 +1565,7 @@ class AdminWorkflowMixin:
             message = f"⭐ کاربر {owner} به فهرست کاربران ویژه افزوده شد؛ اعتبار او نامحدود است."
         else:
             message = f"وضعیت ویژهٔ کاربر {owner} لغو شد؛ از این پس استفاده از ربات به اعتبار او وابسته است."
-        await event.reply(message, buttons=self._admin_menu())  # type: ignore[attr-defined]
+        await event.reply(message, buttons=self._admin_menu())
 
     async def _recover_broadcasts(self) -> None:
         runs = await self.db.broadcast_recover_runs()

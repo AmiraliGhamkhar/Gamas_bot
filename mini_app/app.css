@@ -1,0 +1,171 @@
+/* Gamas Mini App — one stylesheet, no framework, no build step.
+   Persian-first: RTL layout, Vazirmatn-like stack, generous line height so a
+   long booklet is actually readable on a phone at arm's length. */
+
+:root {
+  --bg: var(--tg-theme-bg-color, #0f1218);
+  --surface: var(--tg-theme-secondary-bg-color, #171c25);
+  --text: var(--tg-theme-text-color, #eef2f8);
+  --hint: var(--tg-theme-hint-color, #8b95a7);
+  --accent: var(--tg-theme-button-color, #3d7dff);
+  --accent-text: var(--tg-theme-button-text-color, #ffffff);
+  --line: color-mix(in srgb, var(--hint) 30%, transparent);
+  --radius: 14px;
+  --gap: 12px;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Vazirmatn, "Segoe UI", Tahoma, system-ui, sans-serif;
+  font-size: 16px;
+  line-height: 1.7;
+  -webkit-text-size-adjust: 100%;
+}
+
+#app {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 16px 14px calc(24px + env(safe-area-inset-bottom));
+}
+
+.topbar {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.topbar h1 { font-size: 1.4rem; margin: 0; }
+.tag { color: var(--hint); font-size: 0.85rem; }
+
+.tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.tab, .back, button.primary {
+  font: inherit;
+  border-radius: var(--radius);
+  border: 1px solid var(--line);
+  padding: 10px 14px;
+  background: var(--surface);
+  color: var(--text);
+  cursor: pointer;
+}
+
+.tab.is-active {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: transparent;
+  font-weight: 600;
+}
+
+.view[hidden], [hidden] { display: none !important; }
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.me {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: var(--gap);
+}
+
+.me-label { color: var(--hint); }
+.me strong { font-size: 1.3rem; }
+
+.rank-list, .booklet-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rank-list li, .booklet-list li {
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 10px;
+  align-items: center;
+}
+
+.rank-list li.is-me { border-color: var(--accent); }
+.rank-list .medal { font-size: 1.1rem; }
+.rank-list .points { color: var(--hint); font-variant-numeric: tabular-nums; }
+
+.booklet-list li { grid-template-columns: 1fr auto; }
+.booklet-list button { font: inherit; }
+
+.booklet-title { display: block; font-weight: 600; }
+.booklet-meta { color: var(--hint); font-size: 0.85rem; }
+
+.field { display: block; margin-bottom: var(--gap); }
+.field > span { display: block; margin-bottom: 6px; color: var(--hint); }
+
+textarea {
+  width: 100%;
+  min-height: 46vh;
+  resize: vertical;
+  font: inherit;
+  line-height: 1.9;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+
+.editor-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--gap);
+}
+
+button.primary {
+  background: var(--accent);
+  color: var(--accent-text);
+  border-color: transparent;
+  font-weight: 600;
+  min-width: 120px;
+}
+
+button:disabled { opacity: 0.55; cursor: progress; }
+
+.hint { color: var(--hint); font-size: 0.85rem; }
+.empty { color: var(--hint); text-align: center; padding: 28px 0; }
+
+.toast {
+  position: fixed;
+  inset-inline: 16px;
+  bottom: calc(18px + env(safe-area-inset-bottom));
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  text-align: center;
+  box-shadow: 0 10px 30px rgb(0 0 0 / 35%);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .view { animation: fade 120ms ease-out; }
+  @keyframes fade { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; } }
+}

@@ -21,7 +21,9 @@ class ConversationStateStore:
 
     pending_payments: dict[int, int] = field(default_factory=dict)
     pending_broadcast: set[int] = field(default_factory=set)
-    support_states: dict[int, tuple[str, object, float]] = field(default_factory=dict)
+    # (prompt kind, payload, armed-at): the payload is a ticket id, a payment
+    # id or a dict depending on the kind, so it is deliberately heterogeneous.
+    support_states: dict[int, tuple[str, Any, float]] = field(default_factory=dict)
     support_admin_states: dict[int, tuple[int, float]] = field(default_factory=dict)
     pending_reject_reason: dict[int, int] = field(default_factory=dict)
     pending_flashcard: dict[int, tuple[int, str]] = field(default_factory=dict)
@@ -33,11 +35,13 @@ class ConversationStateStore:
 
     def sweep_support_states(self, now: float) -> None:
         """Expire abandoned support prompts without retaining a separate timer per user."""
-        for user_id, state in list(self.support_states.items()):
-            if now - state[2] >= 1800:
+        for user_id, prompt in list(self.support_states.items()):
+            if now - prompt[2] >= 1800:
                 self.support_states.pop(user_id, None)
-        for admin_id, state in list(self.support_admin_states.items()):
-            if now - state[1] >= 1800:
+        # A separately named variable: the two state maps hold different tuple
+        # shapes, and reusing one name makes a checker infer the wrong type.
+        for admin_id, reply in list(self.support_admin_states.items()):
+            if now - reply[1] >= 1800:
                 self.support_admin_states.pop(admin_id, None)
 
     def reset_on_start(self, user_id: int) -> None:

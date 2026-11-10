@@ -21,7 +21,8 @@ Rules followed here:
 
 from __future__ import annotations
 
-from typing import Final
+from collections.abc import Sequence
+from typing import Any, Final
 
 # --------------------------------------------------------------------- buttons
 BTN_LIBRARY: Final = "📚 کتابخانه من"
@@ -40,6 +41,15 @@ BTN_FLASHCARDS: Final = "🃏 فلش‌کارت‌ها"
 BTN_PREV: Final = "◀️ قبلی"
 BTN_NEXT: Final = "بعدی ▶️"
 BTN_REDOWNLOAD: Final = "📥 دریافت مجدد"
+BTN_GET_BOOKLET: Final = "📖 جزوه"
+BTN_GET_TRANSCRIPT: Final = "📝 متن خام"
+BTN_GET_KEYPOINTS: Final = "⭐ نکات کلیدی"
+BTN_SHOW_RESULTS: Final = "📦 دریافت خروجی‌ها"
+BTN_MY_RESULTS: Final = "📦 خروجی‌های من"
+BTN_START_HERE: Final = "🎓 شروع"
+BTN_UPGRADE: Final = "🛒 افزایش اعتبار"
+BTN_OPEN_APP: Final = "🗂 باشگاه مطالعه (رنک‌بندی و ویرایش جزوه)"
+BTN_EDIT_IN_APP: Final = "✏️ ویرایش جزوه در باشگاه مطالعه"
 BTN_QUIZ_FROM_BOOKLET: Final = "🧪 آزمون از این جزوه"
 BTN_CARDS_FROM_BOOKLET: Final = "🃏 فلش‌کارت از این جزوه"
 
@@ -65,27 +75,177 @@ def main_screen(
     balance: str,
     office_enabled: bool,
     notes_configured: bool,
+    streak_days: int = 0,
 ) -> str:
-    """The start message and the return-to-menu screen."""
-    greeting = "🎓 به گاماس خوش آمدید" if first_start else "منوی اصلی"
-    lines = [
-        greeting,
-        "",
-        "📤 فایل درس را همین‌جا بفرستید:",
-        "🎧 صوت یا ویدیو",
-        "📄 PDF، Word یا PowerPoint",
-        "",
-    ]
-    if notes_configured:
-        lines.append("📚 متن گفتار و جزوه در «📚 کتابخانه من» ذخیره می‌شود.")
+    """The start message and the return-to-menu screen.
+
+    One action, one number, one reason to come back. The old screen listed five
+    capabilities and three ways to start, so the only thing a newcomer could do
+    was read it. Here the file request *is* the screen: a single sentence, then
+    the balance, then a streak line that turns "come back tomorrow" into
+    something the bot measures instead of merely suggesting.
+    """
+    if first_start:
+        lines = [
+            "🎓 به گاماس خوش آمدید",
+            "",
+            "یک فایل درس بفرستید؛ جزوه، فلش‌کارت و آزمونش را می‌سازم.",
+            "",
+            "📤 صوت، ویدیو، PDF، Word یا PowerPoint",
+        ]
     else:
-        lines.append("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.")
-    if office_enabled:
-        lines.append(
-            "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ بدون کسر اعتبار."
-        )
-    lines.extend(["", f"💳 اعتبار باقی‌مانده: {balance}", "", "از دکمه‌های زیر شروع کنید."])
+        lines = [
+            "منوی اصلی",
+            "",
+            "📤 فایل درس بعدی را بفرستید تا جزوه‌اش را بسازم.",
+        ]
+    if streak_days >= 2:
+        from .progress import to_persian_digits
+
+        lines.extend(["", f"🔥 {to_persian_digits(streak_days)} روز پشت‌سرهم برگشتید."])
+    lines.extend(["", f"💳 اعتبار باقی‌مانده: {balance}"])
+    if first_start:
+        if notes_configured:
+            lines.append("📚 متن گفتار و جزوه در «📚 کتابخانه من» ذخیره می‌شود.")
+        else:
+            lines.append("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.")
+        if office_enabled:
+            lines.append("🗂 تبدیل متن به Word، Excel، PowerPoint و PDF رایگان است.")
+        lines.extend(["", "از دکمه‌های زیر شروع کنید."])
     return "\n".join(lines)
+
+
+def mini_app_button(label: str, url: str) -> Any:
+    """A Telegram button that opens a Mini App (WebView) instead of a URL.
+
+    ``InlineButtonTypeWebView`` is what makes Telegram treat the target as a Mini
+    App: it opens inside the client, exposes ``Telegram.WebApp.initData`` to the
+    page and lets the page close itself. A plain URL button would open a browser
+    tab with no signed session, which the app correctly refuses.
+    """
+    from telethon.tl.types import (
+        InlineButtonTypeWebView,
+        KeyboardInlineButton,
+    )
+
+    return KeyboardInlineButton(text=label, type=InlineButtonTypeWebView(url))
+
+
+# ---------------------------------------------------------------------------
+# The always-visible menu keyboard (Telegram reply keyboard, not inline glass)
+# ---------------------------------------------------------------------------
+
+#: Placeholder shown inside the message box while the keyboard is attached.
+REPLY_KEYBOARD_PLACEHOLDER: Final = "یک گزینه را انتخاب کنید یا فایل بفرستید…"
+#: Button of the bottom keyboard that re-opens the guide.
+BTN_MENU_GUIDE: Final = "ℹ️ راهنما"
+
+
+def reply_menu_rows(*, is_admin: bool, office_enabled: bool = True) -> list[list[str]]:
+    """Rows of the persistent bottom keyboard.
+
+    Inline buttons stay for the screens that need state (filters, pages,
+    payment steps), but the four things a student does most often deserve a
+    target that never scrolls away: start, library, results and credits. The
+    keyboard is a reply keyboard, so pressing a button simply sends its label as
+    text and the same dispatcher runs — no callback data to keep alive, and the
+    menu keeps working while a long job is processing.
+    """
+    rows = [
+        [BTN_START_HERE, BTN_MY_RESULTS],
+        [BTN_LIBRARY, BTN_UPGRADE],
+    ]
+    if office_enabled:
+        rows.append([BTN_OFFICE, BTN_LEADERBOARD])
+    else:
+        rows.append([BTN_LEADERBOARD, BTN_SUPPORT])
+    rows.append([BTN_SUPPORT, BTN_HELP] if office_enabled else [BTN_HELP, BTN_REFERRALS])
+    rows.append([BTN_REFERRALS] if office_enabled else [BTN_MENU_GUIDE])
+    if is_admin:
+        rows.append([BTN_ADMIN])
+    return rows
+
+
+# ---------------------------------------------------------------------------
+# Delivery — the results screen and the three fetch buttons
+# ---------------------------------------------------------------------------
+
+DELIVERY_READY_HEADER: Final = "✅ پردازش تمام شد — {reference}"
+DELIVERY_READY_BODY: Final = "خروجی‌ها آماده‌اند. هر کدام را خواستید بردارید:"
+DELIVERY_ROW_BOOKLET: Final = "📖 جزوهٔ ساختارمند: فایل Word"
+DELIVERY_ROW_TRANSCRIPT: Final = "📝 متن خام گفتار: فایل متنی"
+DELIVERY_ROW_KEYPOINTS: Final = "⭐ نکات کلیدی: فهرست کوتاه"
+DELIVERY_ROW_NOTES_PENDING: Final = "⏳ نکات کلیدی: در حال ساخته‌شدن"
+DELIVERY_SPEAKERS_TEMPLATE: Final = "🎙 گویندگان شناسایی‌شده: {count} نفر"
+DELIVERY_SPEAKERS_ONE: Final = "🎙 یک گوینده شناسایی شد."
+DELIVERY_SPEAKERS_NONE: Final = (
+    "🎙 تفکیک گویندگان برای این فایل ممکن نشد؛ متن یک‌دست ارسال می‌شود."
+)
+DELIVERY_TRANSCRIPT_READY: Final = "📝 متن خام — {reference}"
+DELIVERY_KEYPOINTS_READY: Final = "⭐ نکات کلیدی — {reference}"
+DELIVERY_BOOKLET_READY: Final = "📖 {title} — {reference}"
+DELIVERY_ARTIFACT_GONE: Final = (
+    "این خروجی دیگر در دسترس نیست؛ دوباره فایل را بفرستید تا از نو ساخته شود."
+)
+DELIVERY_NO_ARTIFACTS: Final = "برای این گفتگو خروجی‌ای ثبت نشده است."
+DELIVERY_GET_ALL: Final = "📦 هر سه خروجی را بفرست"
+DELIVERY_KEYPOINTS_CHAT_HEADER: Final = "⭐ نکات کلیدی — {reference}"
+DELIVERY_KEYPOINTS_EMPTY: Final = "برای این فایل نکتهٔ کلیدی ثبت نشد."
+RESULTS_HUB_TITLE: Final = "📦 خروجی‌های من\n\nهر ردیف یک گفتگو؛ خروجی‌هایش را از همان‌جا بردارید."
+RESULTS_HUB_EMPTY: Final = (
+    "📦 هنوز خروجی‌ای ندارید.\n\nیک فایل درس بفرستید تا جزوه، متن خام و نکات کلیدی ساخته شود."
+)
+RESULTS_HUB_ROW_TEMPLATE: Final = "{reference} — {status}"
+RESULTS_STATUS: Final = {
+    "pending": "در انتظار",
+    "processing": "در حال پردازش",
+    "done": "آماده",
+    "partial": "آماده (با هشدار)",
+    "failed": "ناموفق",
+    "rejected": "رد‌شده",
+}
+
+
+def delivery_screen(
+    *,
+    reference: str,
+    speakers: int,
+    has_booklet: bool,
+    has_keypoints: bool = True,
+    notes_pending: bool = False,
+) -> str:
+    """The one message the pipeline ends with, before any file is pushed."""
+    # ``progress`` imports this module for its own copy, so the digit helper is
+    # imported at call time to keep the import graph acyclic.
+    from .progress import to_persian_digits
+
+    lines = [DELIVERY_READY_HEADER.format(reference=reference), ""]
+    if speakers > 1:
+        lines.append(DELIVERY_SPEAKERS_TEMPLATE.format(count=to_persian_digits(speakers)))
+    elif speakers == 1:
+        lines.append(DELIVERY_SPEAKERS_ONE)
+    else:
+        lines.append(DELIVERY_SPEAKERS_NONE)
+    lines.append("")
+    if has_booklet:
+        lines.append(DELIVERY_ROW_BOOKLET)
+    lines.append(DELIVERY_ROW_TRANSCRIPT)
+    if notes_pending:
+        lines.append(DELIVERY_ROW_NOTES_PENDING)
+    elif has_keypoints:
+        lines.append(DELIVERY_ROW_KEYPOINTS)
+    lines.extend(["", DELIVERY_READY_BODY])
+    return "\n".join(lines)
+
+
+def keypoints_text(*, reference: str, points: Sequence[str], limit: int = 12) -> str:
+    """The key-points artifact as chat text (no file for a dozen lines)."""
+    body = [f"• {point}" for point in points[:limit] if str(point).strip()]
+    if not body:
+        body = [DELIVERY_KEYPOINTS_EMPTY]
+    return "\n".join(
+        [DELIVERY_KEYPOINTS_CHAT_HEADER.format(reference=reference), "", *body]
+    )
 
 
 def help_screen(*, office_enabled: bool) -> str:
@@ -106,7 +266,8 @@ def help_screen(*, office_enabled: bool) -> str:
         [
             "🛒 خرید اشتراک و 🎧 پشتیبانی از منوی اصلی در دسترس است.",
             "",
-            "💳 اعتبار بر حسب ثانیه و پس از ارسال متن خام محاسبه می‌شود.",
+            "💳 هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس.",
+            "اعتبار بر حسب ثانیه و پس از ارسال متن خام محاسبه می‌شود؛ "
             "اگر متن خام نرسد، اعتباری کم نمی‌شود.",
             "ساخت آزمون و فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق باشد، کامل برمی‌گردد.",
             "خطای ساخت جزوه پس از دریافت متن خام، اعتبار را برنمی‌گرداند.",
@@ -241,8 +402,8 @@ BTN_SHARE_INVITE: Final = "📤 اشتراک لینک دعوت"
 REFERRALS_TITLE: Final = "🤝 دعوت دوستان"
 REFERRALS_RULES: Final = (
     "با هر دعوت موفق اعتبار هدیه بگیرید:\n"
-    "• ورود دوست با لینک شما: ۲۰ دقیقه اعتبار\n"
-    "• اولین خرید تأییدشدهٔ او: ۱ ساعت اعتبار"
+    "• ورود دوست با لینک شما: {signup_credits} اعتبار\n"
+    "• اولین خرید تأییدشدهٔ او: {purchase_credits} اعتبار"
 )
 REFERRALS_LINK_TEMPLATE: Final = "لینک اختصاصی شما:\n{link}"
 REFERRALS_CODE_TEMPLATE: Final = "کد دعوت شما: {code}"
@@ -275,10 +436,22 @@ TRACKING_CODE_TEMPLATE: Final = "کد پیگیری: {reference}"
 WALLET_TITLE: Final = "🛒 خرید اشتراک"
 WALLET_NO_PLANS: Final = "فعلاً بسته‌ای برای خرید موجود نیست."
 WALLET_CHOOSE_PLAN: Final = "بسته را انتخاب کنید؛ اعتبار خرید به موجودی شما اضافه می‌شود."
-WALLET_PLAN_ROW_TEMPLATE: Final = "• {duration}\n  اعتبار: {validity} | مبلغ: {price}"
-WALLET_PLAN_BUTTON_TEMPLATE: Final = "{hours} ساعت — {price}"
+WALLET_PLAN_ROW_TEMPLATE: Final = "• {credits}\n  اعتبار: {validity} | مبلغ: {price}"
+WALLET_PLAN_BUTTON_TEMPLATE: Final = "{credits} — {price}"
+#: The credit amount as it appears inside a plan button.
+WALLET_PLAN_BUTTON_CREDITS: Final = "{credits} اعتبار"
+#: How the balance line names the unit it is showing.
+WALLET_BALANCE_UNIT: Final = "اعتبار"
+
+#: How a charge is described everywhere (intake, job failure, learning).
+#: ``{credits}`` is already grouped and in Persian digits; the hours it covers
+#: follow in parentheses so the tariff is never a mystery.
+CREDIT_COST_TEMPLATE: Final = "{credits} ({hours} ساعت)"
+#: Intake: the file's own length, in both currencies.
+CREDIT_MEASURE_TEMPLATE: Final = "مدت فایل: {duration} ≈ {credits}"
 WALLET_CARD_DISABLED: Final = "🛒 پرداخت کارت‌به‌کارت فعلاً غیرفعال است."
 WALLET_BALANCE_TEMPLATE: Final = "💳 اعتبار باقی‌مانده: {balance}"
+WALLET_UNIT_HINT: Final = "📐 هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس"
 WALLET_RECENT_PAYMENTS: Final = "🧾 پرداخت‌های اخیر"
 WALLET_NO_PAYMENTS: Final = "پرداختی ثبت نشده است."
 WALLET_NO_MORE_PAYMENTS: Final = "مورد دیگری وجود ندارد."

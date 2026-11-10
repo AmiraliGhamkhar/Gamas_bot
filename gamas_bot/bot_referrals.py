@@ -8,7 +8,8 @@ from typing import Any
 from telethon import Button
 
 from . import texts
-from .billing import format_duration
+from .db_referrals import REFERRAL_JOIN_SECONDS, REFERRAL_PAYMENT_SECONDS
+from .billing import format_seconds_as_credits
 
 logger = logging.getLogger("gamas_bot.bot.referrals")
 
@@ -31,7 +32,7 @@ class ReferralWorkflowMixin:
         if status == "rewarded" and seconds:
             await event.reply(
                 texts.REFERRAL_JOIN_REWARD_TEMPLATE.format(
-                    seconds=format_duration(seconds)
+                    seconds=format_seconds_as_credits(seconds)
                 )
             )
         elif status == "self":
@@ -49,7 +50,15 @@ class ReferralWorkflowMixin:
             link = self._invite_link(getattr(me, "username", None), code)
         except Exception:  # noqa: BLE001 - a missing username only hides the link
             logger.debug("could not read the bot username", exc_info=True)
-        lines = [texts.REFERRALS_TITLE, "", texts.REFERRALS_RULES, ""]
+        lines = [
+            texts.REFERRALS_TITLE,
+            "",
+            texts.REFERRALS_RULES.format(
+                signup_credits=format_seconds_as_credits(REFERRAL_JOIN_SECONDS),
+                purchase_credits=format_seconds_as_credits(REFERRAL_PAYMENT_SECONDS),
+            ),
+            "",
+        ]
         if link:
             lines.append(texts.REFERRALS_LINK_TEMPLATE.format(link=link))
         else:
@@ -59,7 +68,7 @@ class ReferralWorkflowMixin:
                 "",
                 texts.REFERRALS_STATS_TEMPLATE.format(
                     invited=summary["invited"],
-                    seconds=format_duration(summary["seconds"]),
+                    seconds=format_seconds_as_credits(summary["seconds"]),
                 ),
             ]
         )
@@ -85,7 +94,7 @@ class ReferralWorkflowMixin:
             "",
             texts.ADMIN_REFERRALS_TOTALS_TEMPLATE.format(
                 rewards=totals["rewards"],
-                seconds=format_duration(totals["seconds"]),
+                seconds=format_seconds_as_credits(totals["seconds"]),
             ),
             "",
         ]
@@ -98,7 +107,7 @@ class ReferralWorkflowMixin:
                     rank=rank,
                     who=who,
                     invited=row["invited"],
-                    seconds=format_duration(row["seconds"]),
+                    seconds=format_seconds_as_credits(row["seconds"]),
                 )
             )
         await self._edit_or_reply(  # type: ignore[attr-defined]

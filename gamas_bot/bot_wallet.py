@@ -20,7 +20,14 @@ from telethon import Button
 from . import texts
 from .doc_extract import sha256_file
 from .metrics import METRICS
-from .billing import format_duration, format_toman, format_validity
+from .billing import (
+    format_credits_number,
+    format_credits_with_hours,
+    format_seconds_as_credits,
+    format_toman,
+    format_validity,
+    seconds_to_credits,
+)
 from .bot_ui import TELEGRAM_CAPTION_LIMIT
 from .config import format_payment_card
 from .db import OpenPaymentError, PaymentSnapshotError
@@ -49,6 +56,9 @@ class WalletWorkflowMixin:
     client: Any
     _pending_payments: dict[int, int]
     _pending_reject_reason: dict[int, int]
+    # Supplied by the composed bot.
+    deps: Any
+    _edit_or_reply: Any
 
     REJECTION_REASON_PRESETS: dict[str, str] = texts.RECEIPT_REJECT_REASONS
     TRANSCRIPT_CLEANUP_BATCHES = 25
@@ -94,15 +104,12 @@ class WalletWorkflowMixin:
             lines.append(texts.WALLET_CHOOSE_PLAN)
             for plan in plans:
                 hours = float(plan["hours"])
-                hours_text = to_persian_digits(
-                    int(hours) if hours.is_integer() else str(hours)
-                )
-                duration = format_duration(int(round(hours * 3600)))
+                credits = seconds_to_credits(hours * 3600)
                 validity = format_validity(plan["validity_days"])
                 lines.append(
                     "\n"
                     + texts.WALLET_PLAN_ROW_TEMPLATE.format(
-                        duration=duration,
+                        credits=format_credits_with_hours(credits, hours),
                         validity=validity,
                         price=format_toman(plan["price"]),
                     )
@@ -110,7 +117,10 @@ class WalletWorkflowMixin:
                 if self.settings.payment_card_number:
                     label = button_label(
                         texts.WALLET_PLAN_BUTTON_TEMPLATE.format(
-                            hours=hours_text, price=format_toman(plan["price"])
+                            credits=texts.WALLET_PLAN_BUTTON_CREDITS.format(
+                                credits=format_credits_number(credits)
+                            ),
+                            price=format_toman(plan["price"]),
                         )
                     )
                     buttons.append(
@@ -125,6 +135,7 @@ class WalletWorkflowMixin:
                 texts.WALLET_BALANCE_TEMPLATE.format(
                     balance=await self._balance_text(user_id)  # type: ignore[attr-defined]
                 ),
+                texts.WALLET_UNIT_HINT,
                 "",
                 texts.WALLET_RECENT_PAYMENTS,
             ]
@@ -144,7 +155,9 @@ class WalletWorkflowMixin:
             )
         for item in payments:
             seconds = item.get("purchased_seconds")
-            plan_text = format_duration(int(seconds)) if seconds else item["plan_code"]
+            plan_text = (
+                format_seconds_as_credits(int(seconds)) if seconds else item["plan_code"]
+            )
             price = item.get("purchased_price")
             amount = (
                 format_toman(int(price)) if price is not None else texts.UNKNOWN_AMOUNT
@@ -175,7 +188,7 @@ class WalletWorkflowMixin:
                 [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
             ]
         )
-        await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _start_payment(self, event: Any, plan_code: str) -> None:
         if not self.settings.payment_card_number:
@@ -413,7 +426,7 @@ class WalletWorkflowMixin:
         text = texts.ADMIN_RECEIPT_HEADER_TEMPLATE.format(
             payment_id=to_persian_digits(payment_id),
             owner=owner,
-            plan=format_duration(seconds) if seconds else payment["plan_code"],
+            plan=format_seconds_as_credits(seconds) if seconds else payment["plan_code"],
             price=format_toman(int(price)) if price is not None else texts.UNKNOWN_AMOUNT,
         )
         if payment.get("receipt_hash"):
@@ -545,12 +558,12 @@ class WalletWorkflowMixin:
             seconds = int(payment.get("purchased_seconds") or 0)
             price = payment.get("purchased_price")
             owner = await self._identity_for_id(int(payment["user_id"]))  # type: ignore[attr-defined]
-            await self._edit_or_reply(  # type: ignore[attr-defined]
+            await self._edit_or_reply(
                 event,
                 texts.APPROVE_CONFIRM_TEMPLATE.format(
                     payment_id=to_persian_digits(payment_id),
                     owner=owner,
-                    seconds=format_duration(seconds),
+                    seconds=format_seconds_as_credits(seconds),
                     price=(
                         format_toman(int(price))
                         if price is not None
@@ -601,7 +614,7 @@ class WalletWorkflowMixin:
                 await self.client.send_message(
                     payment["user_id"],
                     texts.PAYMENT_APPROVED_USER_TEMPLATE.format(
-                        seconds=format_duration(seconds)
+                        seconds=format_seconds_as_credits(seconds)
                     ),
                     buttons=[[Button.inline(texts.BTN_WALLET, b"wallet")]],
                 )

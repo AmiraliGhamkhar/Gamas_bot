@@ -426,17 +426,34 @@ def _provider_model(slug: str, settings: Settings) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _count_speakers(words: list[Word]) -> int:
+    """Distinct labels the engine reported, before any filtering.
+
+    This is the engine's own claim and only a hint for the transcript builder,
+    which re-derives a believable count (see ``transcript.resolve_speakers``).
+    Deepgram numbers speakers per response, so distinct labels are counted
+    within this transcript and never persisted as an identity.
+    """
+    labels = {word.speaker for word in words if word.speaker.strip()}
+    return len(labels)
+
+
 def _speechmatics_words(results: object) -> tuple[str, list[Word]]:
     """Join a json-v2 ``results`` array into text plus timed word tokens.
 
     Punctuation carries an ``attaches_to`` marker (``previous``/``next``/
     ``both``); honouring it is what keeps ``«سلام .`` from appearing in RTL
     text. Tokens join with a single ASCII space; nothing else is inserted.
+
+    When diarization is on, every word carries ``speaker`` (``S1``/``S2``); it
+    travels on the token unchanged. Punctuation has no speaker of its own, so it
+    inherits the token it attaches to.
     """
     if not isinstance(results, (list, tuple)):
         return "", []
-    # Stage mutable [text, start, end] entries so attaching punctuation mutates
-    # in place rather than discarding and reallocating frozen Word dataclasses.
+    # Stage mutable [text, start, end, speaker] entries so attaching punctuation
+    # mutates in place rather than discarding and reallocating frozen Word
+    # dataclasses.
     staged: list[list[object]] = []
     # The bool marks punctuation already attached to the previous token (for
     # attaches_to="both") but still needed as a prefix on the next token.
@@ -477,7 +494,8 @@ def _speechmatics_words(results: object) -> tuple[str, list[Word]]:
         start_value = _optional_float(start)
         end_value = _optional_float(end)
         prefix = "".join(part for part, _already_attached in pending) if pending else ""
-        staged.append([prefix + content, start_value, end_value])
+        speaker = str(item.get("speaker") or alternative.get("speaker") or "").strip()
+        staged.append([prefix + content, start_value, end_value, speaker])
         if pending:
             pending.clear()
     if pending and staged:
@@ -488,9 +506,9 @@ def _speechmatics_words(results: object) -> tuple[str, list[Word]]:
         if suffix:
             staged[-1][0] = str(staged[-1][0]) + suffix
     elif pending:
-        staged.append(["".join(content for content, _already_attached in pending), None, None])
+        staged.append(["".join(content for content, _already_attached in pending), None, None, ""])
     tokens = [
-        Word(str(entry[0]), entry[1], entry[2])  # type: ignore[arg-type]
+        Word(str(entry[0]), entry[1], entry[2], str(entry[3]))  # type: ignore[arg-type]
         for entry in staged
     ]
     text = " ".join(token.text for token in tokens if token.text).strip()
@@ -562,7 +580,11 @@ def _speechmatics_result(result: dict, job_id: str) -> RawTranscript:
             "Speechmatics transcript ready job_id=%s words=%s duration=%.1fs",
             job_id, len(words), float(duration),
         )
-    return RawTranscript(words=words, text=text, confidence=None, engine="speechmatics")
+    speakers = _count_speakers(words)
+    return RawTranscript(
+        words=words, text=text, confidence=None, engine="speechmatics",
+        speakers=speakers,
+    )
 
 
 async def _speechmatics(
@@ -571,13 +593,20 @@ async def _speechmatics(
     language = _normalize_language(
         "speechmatics", settings.stt_language, model=settings.speechmatics_model
     )
-    config = {
-        "type": "transcription",
-        "transcription_config": {
-            "language": language,
-            "model": settings.speechmatics_model,
-        },
+    transcription_config: dict[str, object] = {
+        "language": language,
+        "model": settings.speechmatics_model,
     }
+    if settings.stt_diarize:
+        # "speaker" labels every word with S1/S2 …; the alternative, "channel",
+        # only separates the two sides of a phone call and is useless here.
+        transcription_config["diarization"] = "speaker"
+        transcription_config["speaker_diarization_config"] = {
+            # Lower sensitivity merges acoustically similar voices, which is
+            # what a classroom needs: two lecturers should not become four.
+            "speaker_sensitivity": round(settings.stt_speaker_sensitivity, 2),
+        }
+    config = {"type": "transcription", "transcription_config": transcription_config}
     form = aiohttp.FormData()
     form.add_field("config", _json_dumps_str(config), content_type="application/json")
     audio_payload = await AsyncFilePayload.from_path(
@@ -827,13 +856,22 @@ def _deepgram_transcript(payload: object) -> RawTranscript:
                 continue
             start = _optional_float(item.get("start"))
             end = _optional_float(item.get("end"))
-            words.append(Word(token, start, end))
+            speaker = item.get("speaker")
+            label = (
+                str(int(speaker))
+                if isinstance(speaker, (int, float)) and not isinstance(speaker, bool)
+                else str(speaker or "").strip()
+            )
+            words.append(Word(token, start, end, label))
     if not text:
         text = " ".join(word.text for word in words).strip()
     if not _has_meaningful_text(text):
         raise STTError("Deepgram متن قابل‌استفاده‌ای تولید نکرد.")
     confidence_value = _optional_float(alternative.get("confidence"))
-    return RawTranscript(words=words, text=text, confidence=confidence_value, engine="deepgram")
+    return RawTranscript(
+        words=words, text=text, confidence=confidence_value, engine="deepgram",
+        speakers=_count_speakers(words),
+    )
 
 
 async def _deepgram(
@@ -847,6 +885,11 @@ async def _deepgram(
         "smart_format": "true",
         "punctuate": "true",
     }
+    if settings.stt_diarize:
+        # ``diarize`` puts a speaker index on each word; ``utterances`` groups
+        # them into turns. Both together keep the word timings (needed for the
+        # chapter stamps) while still telling us who spoke.
+        params["diarize"] = "true"
     if language == _AUTO_LANGUAGE:
         # Deepgram detects the dominant language with its own parameter; the
         # docs state that it also picks the best model available for it.
@@ -903,13 +946,19 @@ def _openai_transcript(payload: object) -> RawTranscript:
                 continue
             start = _optional_float(segment.get("start"))
             end = _optional_float(segment.get("end"))
-            words.append(Word(text, start, end))
+            # Gateways in front of diarizing engines (whisper.cpp forks, Groq
+            # x, Azure batches) surface the label on the segment.
+            speaker = str(segment.get("speaker") or "").strip()
+            words.append(Word(text, start, end, speaker))
         text = " ".join(word.text for word in words).strip()
     else:
         text = str(payload.get("text", "")).strip()
     if not _has_meaningful_text(text):
         raise STTError("سرویس تبدیل گفتار سازگار با OpenAI متن قابل‌استفاده‌ای تولید نکرد.")
-    return RawTranscript(words=words, text=text, confidence=None, engine="openai_compatible")
+    return RawTranscript(
+        words=words, text=text, confidence=None, engine="openai_compatible",
+        speakers=_count_speakers(words),
+    )
 
 
 def _rejects_verbose_json(body: bytes) -> bool:

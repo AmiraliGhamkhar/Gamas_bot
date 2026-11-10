@@ -17,7 +17,7 @@ from unittest import mock
 
 from PIL import Image
 
-from gamas_bot.billing import PLAN_25_CODE, PLAN_50_CODE, plan_catalog
+from gamas_bot.billing import PLAN_36_CODE, PLAN_60_CODE, plan_catalog
 from gamas_bot.bot import GamasBot, SUPPORT_CATEGORY_BUTTONS
 from gamas_bot.db import Database
 from gamas_bot.media import MediaInfo
@@ -78,7 +78,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         return event
 
     async def new_order(self) -> int:
-        return await self.db.create_payment(USER, PLAN_25_CODE)
+        return await self.db.create_payment(USER, PLAN_36_CODE)
 
     async def upload_receipt_photo(self, payment_id: int):
         source = self.root / f"receipt-{payment_id}.png"
@@ -107,12 +107,13 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
     async def test_approval_flow_activates_once_with_the_expected_copy(self):
         buy = await self.press(USER, "wallet")
         screen = buy.edits[-1][0]
-        self.assertIn("۲۵ ساعت", screen)
-        self.assertIn("۱۵۰٬۰۰۰ تومان", screen)
-        self.assertIn("۵۰ ساعت", screen)
-        self.assertIn("۲۵۰٬۰۰۰ تومان", screen)
+        self.assertIn("۱۰۰٬۰۰۰ اعتبار (۳ ساعت)", screen)
+        self.assertIn("۶۰٬۰۰۰ تومان", screen)
+        self.assertIn("۲٬۰۰۰٬۰۰۰ اعتبار (۶۰ ساعت)", screen)
+        self.assertIn("۱٬۲۰۰٬۰۰۰ تومان", screen)
+        self.assertIn("هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت", screen)
 
-        plan_tap = await self.press(USER, f"plan:{PLAN_25_CODE}")
+        plan_tap = await self.press(USER, f"plan:{PLAN_36_CODE}")
         order_id = (await self.db.pending_payments())[0]["payment_id"]
         self.assertEqual((await self.db.payment(order_id))["status"], "awaiting_payment")
         order_screen = plan_tap.responses[-1][0]
@@ -141,7 +142,10 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(len(admin_deliveries), 1)
         caption = admin_deliveries[0]["caption"]
-        for expected in (to_persian_digits(order_id), str(USER), "۲۵ ساعت", "۱۵۰٬۰۰۰ تومان"):
+        for expected in (
+            to_persian_digits(order_id), str(USER),
+            "۱٬۲۰۰٬۰۰۰ اعتبار", "۷۲۰٬۰۰۰ تومان",
+        ):
             self.assertIn(expected, caption)
 
         detail = await self.press(ADMIN, f"adm:pd:{order_id}")
@@ -162,7 +166,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(approved["status"], "approved")
         self.assertEqual(approved["reviewed_by"], ADMIN)
         self.assertIsNotNone(approved["reviewed_at"])
-        self.assertEqual(await self.db.available_seconds(USER), 25 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 36 * 3600)
         self.assertTrue(any(
             text.startswith("✅ پرداخت شما تأیید شد. اشتراک شما فعال است.")
             for text in self.texts_to(USER)
@@ -170,7 +174,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
 
         # A repeated approval (stale keyboard / retry) never credits twice.
         await self.press(ADMIN, f"payv:{order_id}:a:yes")
-        self.assertEqual(await self.db.available_seconds(USER), 25 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 36 * 3600)
         rows = await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM ledger WHERE payment_id = ? AND kind = 'credit'",
             (order_id,),
@@ -228,13 +232,13 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_catalogue_units_and_free_plan_invariants(self):
         catalogue = {plan.code: plan for plan in plan_catalog(self.settings.tariff_values())}
-        standard = catalogue[PLAN_25_CODE]
-        plus = catalogue[PLAN_50_CODE]
+        standard = catalogue[PLAN_36_CODE]
+        plus = catalogue[PLAN_60_CODE]
         free = catalogue["free_1h"]
         self.assertEqual((standard.included_seconds, standard.price_toman, standard.validity_days),
-                         (25 * 3600, 150_000, 30))
+                         (36 * 3600, 720_000, 30))
         self.assertEqual((plus.included_seconds, plus.price_toman, plus.validity_days),
-                         (50 * 3600, 250_000, 30))
+                         (60 * 3600, 1_200_000, 30))
         self.assertEqual((free.included_seconds, free.price_toman), (3600, 0))
 
         self.assertTrue(await self.db.grant_free_plan_once(USER, 3600))
@@ -353,17 +357,17 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.count_ticket_messages(ticket["id"]), 2)
         self.assertEqual((await self.db.get_ticket(ticket["id"]))["status"], "awaiting_user")
 
-        await self.press(USER, f"plan:{PLAN_50_CODE}")
+        await self.press(USER, f"plan:{PLAN_60_CODE}")
         payment_id = (await self.db.pending_payments())[0]["payment_id"]
         await self.db.set_payment_receipt(payment_id, "receipt.jpg", user_id=USER)
         await self.press(ADMIN, f"payv:{payment_id}:a:yes")
         self.assertEqual((await self.db.payment(payment_id))["status"], "approved")
-        self.assertEqual(await self.db.available_seconds(USER), 50 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 60 * 3600)
         await self.press(ADMIN, f"payv:{payment_id}:a:yes")
-        self.assertEqual(await self.db.available_seconds(USER), 50 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 60 * 3600)
 
     # ------------------------------------------------------------ main menu
-    async def test_upload_without_mode_button_runs_full_pipeline_and_saves_both_artifacts(self):
+    async def test_upload_without_mode_button_runs_the_pipeline_and_offers_every_artifact(self):
         await self.say(USER, "/start")
         source = self.root / "lecture.ogg"
         source.write_bytes(wav_bytes(0.2))
@@ -393,13 +397,18 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
             await self.bot._run_job(job)
 
         generate_notes.assert_awaited_once()
-        self.assertTrue(event.file_bytes(".txt"))
         self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
-        self.assertIn("متن خام", event.files[0][0])
-        self.assertIn("جزوهٔ خودکار", event.files[1][0])
-        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", event.files[1][0])
+        # Only the booklet is pushed; the transcript and the key points are one
+        # tap away on the results screen.
+        self.assertEqual(len(event.files), 1)
+        self.assertIn("جزوهٔ خودکار", event.files[0][0])
+        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", event.files[0][0])
+        stored = await self.db.transcription(job.submission_id)
+        self.assertIn("متن کامل جلسه", str(stored["text"]))
         items = await self.db.library_list(USER, limit=6)
-        self.assertEqual([item["kind"] for item in items], ["booklet", "transcript"])
+        self.assertEqual([item["kind"] for item in items], ["booklet"])
+        results = [reply for reply in event.replies if "پردازش تمام شد" in reply]
+        self.assertEqual(len(results), 1)
         self.assertEqual((await self.db.submission(job.submission_id)).status, "done")
 
     async def test_main_menu_matches_the_mission_buttons(self):

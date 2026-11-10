@@ -22,7 +22,8 @@ from typing import TYPE_CHECKING, Any
 
 from telethon.tl.custom import Message
 
-from .billing import format_duration
+from . import texts
+from .billing import format_credit_duration, format_seconds_as_credits
 from .bot_deps import deps_for
 from .bot_ui import (
     ACTIVE_LIMIT_MESSAGE,
@@ -38,7 +39,6 @@ from .docx_export import (
     build_plain_docx,
     notes_docx_filename,
     plain_docx_filename,
-    raw_text_filename,
     resolve_design,
     resolve_fonts,
 )
@@ -67,16 +67,16 @@ from .presentations import (
 )
 from .progress import JobProgress, to_persian_digits
 from .stt import STTError, largest_configured_upload
+from .telegram_text import render_pages
 from .telegram_transfer import UploadTooLargeError, _reported_upload_bytes
 from .textnorm import normalize_display
 from .titles import FALLBACK_BOOKLET, FALLBACK_TRANSCRIPT, short_title
-from .transcript import build_document, render as render_transcript
+from .transcript import build_document
 
 if TYPE_CHECKING:
     from .bot_deps import BotDependencies
 
 logger = logging.getLogger("gamas_bot.bot.jobs")
-
 
 class JobPipelineMixin:
     """Queued media/presentation processing and progressive Telegram delivery."""
@@ -91,6 +91,8 @@ class JobPipelineMixin:
     _active_upload_keys: dict[tuple[int, str], str]
     _seen_messages: dict[tuple[int, int], float]
     _media_semaphore: asyncio.Semaphore
+    _protected_curation_items: Any
+    _ack: Any
 
     async def _require_membership(
         self, event: Any, user_id: int, *, kind: str, callback_data: str = ""
@@ -280,14 +282,16 @@ class JobPipelineMixin:
         needed = self._reserve_estimate(duration)
         unlimited = await self.db.is_unlimited(user_id)
         if not unlimited and available < needed:
+            has_duration = duration is not None and duration > 0
             measured = (
-                f"مدت فایل: {format_duration(duration)}"
-                if duration is not None and duration > 0
+                "مدت فایل: " + format_credit_duration(duration)
+                if has_duration
                 else "مدت فایل نامشخص است"
             )
             await event.reply(
                 f"💳 اعتبار شما کافی نیست.\n"
-                f"{measured} | لازم: {format_duration(needed)} | شما: {format_duration(available)}\n"
+                f"{measured} | لازم: {format_seconds_as_credits(needed)} "
+                f"| شما: {format_seconds_as_credits(available)}\n"
                 "از «🛒 خرید اشتراک» اعتبار بگیرید."
             )
             return
@@ -355,7 +359,8 @@ class JobPipelineMixin:
             if available < needed:
                 await event.reply(
                     f"💳 اعتبار شما کافی نیست.\n"
-                    f"لازم: {format_duration(needed)} | شما: {format_duration(available)}\n"
+                    f"لازم: {format_seconds_as_credits(needed)} "
+                    f"| شما: {format_seconds_as_credits(available)}\n"
                     "از «🛒 خرید اشتراک» اعتبار بگیرید."
                 )
                 return
@@ -508,7 +513,8 @@ class JobPipelineMixin:
                 job,
                 (
                     f"💳 اعتبار شما کافی نیست.\n"
-                    f"لازم: {format_duration(exc.required_seconds)} | شما: {format_duration(exc.available_seconds)}\n"
+                    f"لازم: {format_seconds_as_credits(exc.required_seconds)} "
+                    f"| شما: {format_seconds_as_credits(exc.available_seconds)}\n"
                     "از «🛒 خرید اشتراک» اعتبار بگیرید."
                 ),
             )
@@ -582,11 +588,11 @@ class JobPipelineMixin:
     async def _release(self, job: Job, reason: str) -> bool:
         return await self.db.release_hold(job.submission_id, reason)
 
-    async def _reply(self, job: Job, text: str) -> None:
+    async def _reply(self, job: Job, text: str, *, buttons: Any = None) -> None:
         if job.message is None:
             return
         try:
-            await job.message.reply(text)
+            await job.message.reply(text, buttons=buttons)
         except Exception:
             logger.warning("could not reply to user submission=%s", job.submission_id)
 
@@ -689,27 +695,21 @@ class JobPipelineMixin:
             source_name=job.filename,
             created_at=datetime.now(),
         )
-        raw_text = render_transcript(document, self.settings.raw_text_profile)
-        raw_path = workdir / raw_text_filename(reference)
-        await asyncio.gather(
-            self.db.save_transcription(
-                job.submission_id,
-                engine=raw.engine,
-                text=document.plain(),
-                notes_json="",
-            ),
-            run_file_io(
-                raw_path.write_text, raw_text, encoding="utf-8", newline="\n"
-            ),
+        # The transcript is persisted, not written to the scratch directory and
+        # pushed: the results button rebuilds it from this row on demand (see
+        # ``artifacts.transcript_artifact``, which re-applies the profile).
+        await self.db.save_transcription(
+            job.submission_id,
+            engine=raw.engine,
+            text=document.plain(),
+            notes_json="",
         )
-        await self._deliver_raw(job, raw_text, raw_path, reference)
-        await asyncio.gather(
-            self._send_preview(job, raw_text),
-            self._settle(job, duration),
-        )
+        await self._settle(job, duration)
         if not self.settings.note_configured:
             await self.db.set_submission_status(job.submission_id, "done")
-            await progress.complete("متن کامل گفتار ارسال شد.")
+            await self._deliver_results(
+                job, document, reference, has_booklet=False, has_keypoints=False
+            )
             return
         job.transition_to("generating_notes")
         await progress.update(85, "تولید جزوهٔ ساختارمند")
@@ -956,28 +956,20 @@ class JobPipelineMixin:
                 + "\n".join(f"• {reason}" for reason in skipped)
             )
         engine_label = raw_engine or ("slides" if prepared is None else "stt")
-        raw_path = workdir / raw_text_filename(reference)
-        await asyncio.gather(
-            self.db.save_transcription(
-                job.submission_id,
-                engine=engine_label,
-                text=raw_text,
-                notes_json="",
-            ),
-            run_file_io(
-                raw_path.write_text, raw_text, encoding="utf-8", newline="\n"
-            ),
+        await self.db.save_transcription(
+            job.submission_id,
+            engine=engine_label,
+            text=raw_text,
+            notes_json="",
         )
-        await self._deliver_raw(job, raw_text, raw_path, reference)
 
         settled_duration = prepared.source_duration if prepared is not None else 0
-        await asyncio.gather(
-            self._send_preview(job, raw_text),
-            self._settle(job, settled_duration),
-        )
+        await self._settle(job, settled_duration)
         if not self.settings.note_configured:
             await self.db.set_submission_status(job.submission_id, "done")
-            await progress.complete("متن کامل ارائه ارسال شد.")
+            await self._deliver_results(
+                job, document, reference, has_booklet=False, has_keypoints=False
+            )
             return
         job.transition_to("generating_notes")
         await progress.update(85, "تولید جزوهٔ ساختارمند")
@@ -1196,9 +1188,18 @@ class JobPipelineMixin:
         )
         if notice:
             job.meta["outcome"] = "partial"
-            await progress.complete("متن خام ارسال شد. " + notice.strip())
-        else:
-            await progress.complete()
+        # The booklet is the last thing built, so this is where the job ends: one
+        # message that lists what exists and lets the user take any of it. The
+        # progress message already carries the outcome, so it is completed here
+        # rather than by ``_deliver_results``.
+        await progress.complete()
+        await self._deliver_results(
+            job,
+            document,
+            reference,
+            has_booklet=docx_path is not None,
+            has_keypoints=bool(getattr(notes, "key_points", ()) or ()),
+        )
 
     async def _send_telegram_file(
         self, entity: Any, path: Path, **kwargs: Any
@@ -1285,6 +1286,143 @@ class JobPipelineMixin:
                     continue
                 raise
         return None
+
+    # ----------------------------------------------------- button-driven delivery
+    async def _deliver_results(
+        self,
+        job: Job,
+        document: Any,
+        reference: str,
+        *,
+        has_booklet: bool,
+        has_keypoints: bool,
+        progress: Any | None = None,
+    ) -> None:
+        """End the job with one message and a button per artifact.
+
+        This replaces the old two-push ending (transcript file, a chat preview,
+        then the booklet). Settlement already happened by the time this runs, so
+        every button below is free and may be pressed any number of times.
+        """
+        from .artifacts import (
+            KIND_KEYPOINTS,
+            KIND_TRANSCRIPT,
+            delivery_markup,
+            reference_for,
+        )
+
+        speakers = int(getattr(document, "speakers", 0) or 0)
+        kinds = {KIND_TRANSCRIPT}
+        if has_keypoints:
+            kinds.add(KIND_KEYPOINTS)
+        buttons = delivery_markup(
+            reference=reference_for(job.submission_id),
+            speakers=speakers,
+            has_booklet=has_booklet,
+            kinds=kinds,
+        )
+        body = texts.delivery_screen(
+            reference=reference,
+            speakers=speakers,
+            has_booklet=has_booklet,
+            has_keypoints=has_keypoints,
+        )
+        try:
+            await self._reply(job, body, buttons=buttons)
+        except Exception:
+            logger.warning(
+                "results message could not be delivered submission=%s",
+                job.submission_id,
+                exc_info=True,
+            )
+        if progress is not None:
+            await progress.complete(
+                texts.DELIVERY_READY_HEADER.format(reference=reference)
+            )
+
+    async def _fetch_artifact(self, event: Any, user_id: int, data: str) -> None:
+        """Send one artifact back to the user who asked for it.
+
+        The transcript and the key points are rebuilt from the stored
+        transcription (no model call, no credits, byte-stable); the booklet is
+        forwarded from the library row that already holds it. A submission
+        Telegram has aged out is reported as gone instead of silently failing.
+        """
+        from .artifacts import (
+            KIND_TRANSCRIPT,
+            keypoints_artifact,
+            parse_callback,
+            submission_from_callback,
+            transcript_artifact,
+        )
+
+        parsed = parse_callback(data)
+        submission_id = submission_from_callback(data)
+        if parsed is None or submission_id is None:
+            await self._ack(event)
+            return
+        kind = parsed[1]
+        if kind == "booklet":
+            await self._fetch_booklet(event, user_id, submission_id)
+            return
+
+        chat = await event.get_input_chat()
+        if kind == KIND_TRANSCRIPT:
+            body = await transcript_artifact(
+                self.db, submission_id, self.settings.raw_text_profile
+            )
+            heading = texts.DELIVERY_TRANSCRIPT_READY.format(reference=parsed[0])
+        else:
+            body = await keypoints_artifact(self.db, submission_id)
+            heading = texts.DELIVERY_KEYPOINTS_READY.format(reference=parsed[0])
+        if not body:
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            return
+        body = f"{heading}\n\n{body}"
+        try:
+            for page in render_pages(body):
+                if not page.strip():
+                    continue
+                await self.client.send_message(chat, page, parse_mode="html")
+        except Exception:
+            logger.warning(
+                "could not deliver %s artifact submission=%s",
+                kind,
+                submission_id,
+                exc_info=True,
+            )
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            return
+        await self._ack(event)
+
+    async def _fetch_booklet(self, event: Any, user_id: int, submission_id: int) -> None:
+        """Forward the booklet's Word file from the user's own library."""
+        rows = await self.db.library_list_kind(user_id, "booklet", limit=50)
+        match = next(
+            (
+                row
+                for row in rows
+                if int(row.get("submission_id") or 0) == submission_id
+            ),
+            None,
+        )
+        if match is None or match.get("unavailable"):
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            return
+        try:
+            await self.client.forward_messages(
+                await event.get_input_chat(),
+                [int(match["message_id"])],
+                from_peer=int(match["chat_id"]),
+            )
+        except Exception:
+            logger.warning(
+                "could not forward booklet submission=%s", submission_id, exc_info=True
+            )
+            await self.db.library_mark_unavailable(int(match["item_id"]))
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            return
+        await self._ack(event)
 
     async def _deliver_raw(
         self, job: Job, raw_text: str, raw_path: Path, reference: str

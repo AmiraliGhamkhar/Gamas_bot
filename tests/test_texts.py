@@ -48,6 +48,8 @@ class MainAndHelpCopyTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(first.startswith("🎓 به گاماس خوش آمدید\n\n"))
         self.assertIn("💳 اعتبار باقی‌مانده: ۲۵ ساعت", first)
+        # One invitation, stated in one sentence.
+        self.assertIn("یک فایل درس بفرستید", first)
         self.assertLessEqual(len(first.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT)
 
     def test_returning_screen_uses_the_main_menu_heading(self):
@@ -58,8 +60,23 @@ class MainAndHelpCopyTests(unittest.TestCase):
             notes_configured=False,
         )
         self.assertTrue(text.startswith("منوی اصلی\n\n"))
-        self.assertNotIn("آفیس رایگان", text)
-        self.assertIn("متن گفتار و سند", text)
+        self.assertNotIn("آفیس", text)
+        self.assertNotIn("کتابخانه", text)
+        # The returning screen is shorter than the welcome screen: the pitch has
+        # already been made, so all that is left is the next file and the balance.
+        self.assertLess(len(text), 200)
+
+    def test_a_streak_is_shown_only_when_it_is_a_streak(self):
+        one = texts.main_screen(
+            first_start=False, balance="۱ ساعت", office_enabled=False,
+            notes_configured=False, streak_days=1,
+        )
+        self.assertNotIn("🔥", one)
+        two = texts.main_screen(
+            first_start=False, balance="۱ ساعت", office_enabled=False,
+            notes_configured=False, streak_days=2,
+        )
+        self.assertIn("🔥 ۲ روز پشت‌سرهم برگشتید.", two)
 
     def test_help_is_one_short_screen_and_keeps_the_billing_contract(self):
         text = texts.help_screen(office_enabled=True)

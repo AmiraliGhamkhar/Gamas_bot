@@ -20,7 +20,7 @@ from tests.test_bot import FakeCallbackEvent, FakeMessageEvent
 ADMIN = 1
 USER = 555
 OTHER_USER = 556
-PLAN = "paid_25h_30d"
+PLAN = "paid_36h_30d"
 
 
 class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
@@ -42,8 +42,8 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         for user_id in (ADMIN, USER, OTHER_USER):
             await self.db.ensure_user(user_id)
         await self.db.sync_plans([
-            {"code": PLAN, "hours": 25, "price": 150_000, "validity_days": 30},
-            {"code": "paid_50h_30d", "hours": 50, "price": 250_000, "validity_days": 30},
+            {"code": PLAN, "hours": 36, "price": 720_000, "validity_days": 30},
+            {"code": "paid_60h_30d", "hours": 60, "price": 1_200_000, "validity_days": 30},
         ])
 
     async def asyncTearDown(self):
@@ -176,8 +176,8 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_complete_photo_receipt_confirmation_and_duplicate_protection(self):
         plans = await self.press(USER, "wallet")
-        self.assertIn("۲۵ ساعت", plans.edits[-1][0])
-        self.assertIn("۱۵۰٬۰۰۰ تومان", plans.edits[-1][0])
+        self.assertIn("۱٬۲۰۰٬۰۰۰ اعتبار (۳۶ ساعت)", plans.edits[-1][0])
+        self.assertIn("۷۲۰٬۰۰۰ تومان", plans.edits[-1][0])
         await self.press(USER, f"plan:{PLAN}")
         payment_id = (await self.db.pending_payments())[0]["payment_id"]
         self.assertEqual((await self.db.payment(payment_id))["status"], "awaiting_payment")
@@ -201,8 +201,8 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(admin_receipts), 1)
         caption = admin_receipts[0]["caption"]
         self.assertIn(str(USER), caption)
-        self.assertIn("۲۵ ساعت", caption)
-        self.assertIn("۱۵۰٬۰۰۰ تومان", caption)
+        self.assertIn("۱٬۲۰۰٬۰۰۰ اعتبار", caption)
+        self.assertIn("۷۲۰٬۰۰۰ تومان", caption)
         self.assertIn(to_persian_digits(payment_id), caption)
 
         # A forged user callback and an invalid verdict never change the order.
@@ -225,7 +225,7 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(approved["status"], "approved")
         self.assertEqual(approved["reviewed_by"], ADMIN)
         self.assertIsNotNone(approved["credit_ledger_id"])
-        self.assertEqual(await self.db.available_seconds(USER), 25 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 36 * 3600)
         self.assertTrue(any(
             item["entity"] == USER and "پرداخت شما تأیید شد" in item["text"]
             for item in self.bot.client.texts
@@ -233,7 +233,7 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
 
         # Stale keyboards and retries cannot add a second ledger lot.
         await self.press(ADMIN, f"payv:{payment_id}:a:yes")
-        self.assertEqual(await self.db.available_seconds(USER), 25 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 36 * 3600)
         rows = await self.db.db.execute_fetchall(
             "SELECT COUNT(*) FROM ledger WHERE payment_id = ? AND kind = 'credit'",
             (payment_id,),
@@ -326,7 +326,7 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         # CR-1: plans lead the screen; balance and history stay on it too.
         self.assertLess(text.index("بسته را انتخاب کنید"),
                         text.index("اعتبار باقی‌مانده"))
-        self.assertIn("۲۵ ساعت", text)
+        self.assertIn("۱٬۲۰۰٬۰۰۰ اعتبار", text)
         self.assertIn(f"#{to_persian_digits(payment_ids[-1])}", text)
         self.assertNotIn(f"#{to_persian_digits(payment_ids[0])}", text)
         self.assertIn(b"walletp:1", self.payloads(buttons))
@@ -387,9 +387,9 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         self.bot.client.send_message = blocked
         await self.press(ADMIN, f"payv:{payment_id}:a:yes")
         self.assertEqual((await self.db.payment(payment_id))["status"], "approved")
-        self.assertEqual(await self.db.available_seconds(USER), 25 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 36 * 3600)
         await self.press(ADMIN, f"payv:{payment_id}:a:yes")
-        self.assertEqual(await self.db.available_seconds(USER), 25 * 3600)
+        self.assertEqual(await self.db.available_seconds(USER), 36 * 3600)
 
     async def test_receipt_upload_enforces_ownership_in_database(self):
         payment_id = await self.new_order()

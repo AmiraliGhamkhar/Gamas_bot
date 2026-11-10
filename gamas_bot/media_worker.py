@@ -51,6 +51,32 @@ OPUS_BIT_RATE = 32000
 # docs/PERFORMANCE.md.
 OPUS_CODEC_OPTIONS = {"application": "audio", "compression_level": "0"}
 
+#: The STT preprocessing chain, in the order it is applied. Every stage is a
+#: well-documented, measurement-friendly step and every one of them can be
+#: switched off per deployment (``STT_PREPROCESS=0`` restores the plain
+#: resample this worker did before).
+#:
+#: ``highpass``  removes room rumble, desk thumps and handling noise below the
+#:               fundamental of adult speech; keeping DC/very-low energy out of
+#:               the recogniser is what stops a "hum" being decoded as speech.
+#: ``afftdn``    spectral denoise (FFmpeg's FFT denoiser) for steady
+#:               air-conditioner/projector hiss recorded in a lecture hall.
+#: ``dynaudnorm`` evens out the near/far swings of a classroom: the lecturer at
+#:               the board versus a student at the back. It is dynamic (per
+#:               window) rather than a single gain, so it does not make the
+#:               noise floor loud during silence.
+#: ``alimiter``  a final brick-wall guard so the chain cannot clip.
+STT_PREPROCESS_FILTERS: tuple[str, ...] = (
+    "highpass=f=70:poles=2",
+    "afftdn=nr=12:nf=-35:tn=1",
+    "dynaudnorm=f=250:g=11:p=0.85:m=4",
+    "alimiter=limit=0.95:level=false",
+)
+#: Filter arguments accept only digits, ``.``, ``,``, ``=`` and letters from a
+#: fixed vocabulary; they are never built from user input, but the check keeps
+#: that invariant reviewable.
+_FILTER_ALLOWED = set("abcdefghijklmnopqrstuvwxyz0123456789._:,=-")
+
 LEGACY_EXTENSIONS = {".ppt", ".pps", ".pot"}
 UNSUPPORTED_ODF_EXTENSIONS = {".odp", ".otp"}
 
@@ -121,6 +147,84 @@ def _emit(
         container.mux(packet)
 
 
+def _playable_filters(chain: tuple[str, ...] | list[str]) -> list[str]:
+    """Validate a filter chain and drop the stages PyAV cannot build.
+
+    A build of PyAV can be compiled without one of the optional FFmpeg filters
+    (``afftdn`` needs ``--enable-avfilter`` extras, for example). A missing
+    stage must degrade to "less processing", never to a failed transcription,
+    so each name is probed in isolation and unsupported stages are skipped.
+    """
+    import av
+
+    playable: list[str] = []
+    for item in chain:
+        text = str(item).strip()
+        if not text or not set(text) <= _FILTER_ALLOWED:
+            continue
+        try:
+            av.filter.Filter(text.split("=", 1)[0])
+        except Exception:  # noqa: BLE001 - an unsupported stage is not fatal
+            continue
+        playable.append(text)
+    return playable
+
+
+def _add_filter(graph, specification: str):
+    """Add one ``name=key=value:...`` stage to a graph.
+
+    PyAV takes the name and its arguments separately (``add("highpass",
+    "f=70")``), so the documented single-string form is split here once.
+    """
+    name, _, arguments = specification.partition("=")
+    if arguments:
+        return graph.add(name, arguments)
+    return graph.add(name)
+
+
+def _graph_pull(graph, sink_pad) -> list:
+    """Drain every frame the sink currently holds, tolerating EAGAIN/EAGAIN-EOF."""
+    import av
+
+    frames: list = []
+    if graph is None or sink_pad is None:
+        return frames
+    while True:
+        try:
+            frames.append(sink_pad.pull())
+        except (av.error.BlockingIOError, av.error.EOFError):
+            break
+        except Exception:  # noqa: BLE001 - any other error ends this pull
+            break
+    return frames
+
+
+def _through_filters(graph, source_pad, sink_pad, frame) -> list:
+    """Push one resampled frame through the chain, returning what came out.
+
+    ``dynaudnorm`` buffers a window, so a push can legitimately yield no frame;
+    the caller keeps encoding whatever is produced and flushes at the end.
+    """
+    if graph is None or source_pad is None:
+        return [frame]
+    try:
+        source_pad.push(frame)
+    except Exception:  # noqa: BLE001 - never lose audio to a filter defect
+        return [frame]
+    return _graph_pull(graph, sink_pad)
+
+
+def _drain_filters(graph, source_pad, sink_pad) -> list:
+    """Flush the chain after the last input frame."""
+    if graph is None or source_pad is None:
+        return []
+    try:
+        source_pad.push(None)
+    except Exception:  # noqa: BLE001
+        return _graph_pull(graph, sink_pad)
+    return _graph_pull(graph, sink_pad)
+
+
 def _transcode(
     inputs: list[Path],
     output: Path,
@@ -131,6 +235,7 @@ def _transcode(
     silence_seconds: float = 0.0,
     bit_rate: int | None = None,
     codec_options: dict | None = None,
+    filters: tuple[str, ...] | list[str] = (),
 ) -> dict:
     """Decode inputs to mono and report sample-accurate clip positions.
 
@@ -138,6 +243,11 @@ def _transcode(
     format of the first frame it sees, while inputs can differ in rate/layout.
     The source sample count excludes synthetic inter-clip silence; clip spans
     are measured on the exact output sample clock used by the STT file.
+
+    ``filters`` is a per-input speech-cleanup chain (see
+    :data:`STT_PREPROCESS_FILTERS`). It runs after the resampler so every stage
+    sees the same documented format, and it is rebuilt per input exactly like
+    the resampler because a filter graph carries state between frames.
     """
     if not math.isfinite(silence_seconds) or not 0 <= silence_seconds <= 60:
         raise WorkerError("silence duration must be between 0 and 60 seconds")
@@ -178,8 +288,27 @@ def _transcode(
                     view = memoryview(plane)
                     view[: len(view)] = b"\0" * len(view)
 
+        played_filters = _playable_filters(filters)
+        filters_applied: list[str] = []
         for index, source in enumerate(inputs):
             resampler = AudioResampler(format="s16", layout="mono", rate=rate)
+            graph = None
+            source_pad = sink_pad = None
+            if played_filters:
+                try:
+                    graph = av.filter.Graph()
+                    source_pad = graph.add_abuffer(
+                        format="s16", sample_rate=rate, layout="mono",
+                        time_base=time_base,
+                    )
+                    chain = [_add_filter(graph, stage) for stage in played_filters]
+                    sink_pad = graph.add("abuffersink")
+                    graph.link_nodes(source_pad, *chain, sink_pad)
+                    graph.configure()
+                except Exception:  # noqa: BLE001 - degrade to no filtering
+                    graph = None
+            if graph is not None and not filters_applied:
+                filters_applied = list(played_filters)
             clip_start = next_pts[0]
             clip_samples = 0
             with av.open(str(source), options=dict(INPUT_PROTOCOL_OPTIONS)) as media:
@@ -197,12 +326,15 @@ def _transcode(
                 try:
                     for frame in media.decode(audio_stream):
                         for converted in resampler.resample(frame):
-                            _emit(
-                                container, stream, converted, rate, next_pts,
-                                time_base=time_base,
-                            )
-                            clip_samples += converted.samples
-                            source_samples += converted.samples
+                            for final in _through_filters(
+                                graph, source_pad, sink_pad, converted
+                            ):
+                                _emit(
+                                    container, stream, final, rate, next_pts,
+                                    time_base=time_base,
+                                )
+                                clip_samples += final.samples
+                                source_samples += final.samples
                     decoded_to_eof = True
                 finally:
                     if not decoded_to_eof:
@@ -213,12 +345,22 @@ def _transcode(
                         except Exception:
                             pass
             for converted in resampler.resample(None):  # flush per-input state
+                for final in _through_filters(
+                    graph, source_pad, sink_pad, converted
+                ):
+                    _emit(
+                        container, stream, final, rate, next_pts,
+                        time_base=time_base,
+                    )
+                    clip_samples += final.samples
+                    source_samples += final.samples
+            for final in _drain_filters(graph, source_pad, sink_pad):
                 _emit(
-                    container, stream, converted, rate, next_pts,
+                    container, stream, final, rate, next_pts,
                     time_base=time_base,
                 )
-                clip_samples += converted.samples
-                source_samples += converted.samples
+                clip_samples += final.samples
+                source_samples += final.samples
             if clip_samples <= 0:
                 raise WorkerError(f"no decodable audio samples in '{source.name}'")
             clip_spans.append({
@@ -241,6 +383,7 @@ def _transcode(
             "source_samples": source_samples,
             "output_samples": next_pts[0],
             "clip_spans": clip_spans,
+            "filters": filters_applied,
         }
     finally:
         container.close()
@@ -311,12 +454,17 @@ def _build_parser() -> argparse.ArgumentParser:
     extract = commands.add_parser("extract", help="extract one audio track")
     extract.add_argument("--output", required=True)
     extract.add_argument("--format", choices=("wav", "opus"), default="wav")
+    # ``--preprocess`` turns on the documented speech-cleanup chain; the
+    # parent decides per deployment (STT_PREPROCESS) so the worker stays a
+    # pure, deterministic tool.
+    extract.add_argument("--preprocess", action="store_true")
     extract.add_argument("source")
 
     merge = commands.add_parser("merge", help="concatenate audio tracks")
     merge.add_argument("--output", required=True)
     merge.add_argument("--format", choices=("wav", "opus"), default="wav")
     merge.add_argument("--silence", type=float, default=0.5)
+    merge.add_argument("--preprocess", action="store_true")
     merge.add_argument("inputs", nargs="+")
 
     convert = commands.add_parser("convert", help="convert a legacy .ppt deck")
@@ -384,6 +532,7 @@ def main(argv: list[str] | None = None) -> int:
                 container_format="ogg" if args.format == "opus" else None,
                 bit_rate=OPUS_BIT_RATE if args.format == "opus" else None,
                 codec_options=OPUS_CODEC_OPTIONS if args.format == "opus" else None,
+                filters=STT_PREPROCESS_FILTERS if args.preprocess else (),
             )
         elif args.command == "merge":
             if not args.inputs:
@@ -398,6 +547,7 @@ def main(argv: list[str] | None = None) -> int:
                 silence_seconds=args.silence,
                 bit_rate=OPUS_BIT_RATE if args.format == "opus" else None,
                 codec_options=OPUS_CODEC_OPTIONS if args.format == "opus" else None,
+                filters=STT_PREPROCESS_FILTERS if args.preprocess else (),
             )
             print(json.dumps(summary))
         elif args.command == "convert":

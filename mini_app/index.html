@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>گاماس — باشگاه مطالعه</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<main id="app" aria-live="polite">
+  <header class="topbar">
+    <h1>گاماس</h1>
+    <span class="tag">باشگاه مطالعه</span>
+  </header>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab is-active" data-view="rank" role="tab" aria-selected="true">🏆 رنک‌بندی</button>
+    <button class="tab" data-view="booklets" role="tab" aria-selected="false">📖 جزوه‌های من</button>
+  </nav>
+
+  <section id="view-rank" class="view is-active" aria-labelledby="rank-title">
+    <div class="card me" id="me-card" hidden>
+      <span class="me-label">جایگاه شما</span>
+      <strong id="me-rank">—</strong>
+      <span id="me-points">—</span>
+    </div>
+    <ol id="rank-list" class="rank-list"></ol>
+    <p id="rank-empty" class="empty" hidden>هنوز امتیازی ثبت نشده. با آزمون و فلش‌کارت شروع کنید.</p>
+  </section>
+
+  <section id="view-booklets" class="view" aria-labelledby="booklets-title" hidden>
+    <ul id="booklet-list" class="booklet-list"></ul>
+    <p id="booklets-empty" class="empty" hidden>هنوز جزوه‌ای نساخته‌اید.</p>
+  </section>
+
+  <section id="view-editor" class="view" hidden aria-labelledby="editor-title">
+    <button class="back" id="editor-back">↩️ بازگشت به فهرست</button>
+    <h2 id="editor-title">ویرایش جزوه</h2>
+    <label class="field">
+      <span>متن جزوه</span>
+      <textarea id="editor-text" spellcheck="false" dir="auto"></textarea>
+    </label>
+    <div class="editor-bar">
+      <span id="editor-count" class="hint">۰</span>
+      <button id="editor-save" class="primary">ذخیره</button>
+    </div>
+    <p class="hint">این متن منبع آزمون و فلش‌کارت‌های بعدی شماست. فایل Wordی که قبلاً گرفته‌اید تغییر نمی‌کند.</p>
+  </section>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

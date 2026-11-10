@@ -452,15 +452,15 @@ class PlanTests(DatabaseTestCase):
         await self.db.sync_plans(catalog)
         plans = await self.db.plans()
         codes = {plan["code"] for plan in plans}
-        self.assertIn("paid_5h_30d", codes)
-        self.assertIn("paid_50h_30d", codes)
+        self.assertIn("paid_3h_30d", codes)
+        self.assertIn("paid_60h_30d", codes)
         self.assertNotIn("free_1h", codes)  # the free plan is granted, not sold
 
         # Re-sync updates the price.
         await self.db.sync_plans([
-            {"code": "paid_5h_30d", "hours": 5, "price": 60000, "validity_days": 30},
+            {"code": "paid_3h_30d", "hours": 3, "price": 60000, "validity_days": 30},
         ])
-        plan = await self.db.plan("paid_5h_30d")
+        plan = await self.db.plan("paid_3h_30d")
         assert plan is not None
         self.assertEqual(plan["price"], 60000)
 

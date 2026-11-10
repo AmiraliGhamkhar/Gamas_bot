@@ -216,21 +216,24 @@ MIN_NOTE_PROMPT_TOKENS = 4096
 #: attribute spelling matches the dataclass field exactly.
 PLAN_ENV_FIELDS = (
     ("FREE_PLAN_HOURS", "free_plan_hours", 1),
-    ("PLAN_5_HOURS", "plan_5_hours", 5),
-    ("PLAN_5_PRICE_TOMAN", "plan_5_price_toman", 50_000),
-    ("PLAN_5_VALIDITY_DAYS", "plan_5_validity_days", 30),
-    ("PLAN_10_HOURS", "plan_10_hours", 10),
-    ("PLAN_10_PRICE_TOMAN", "plan_10_price_toman", 75_000),
-    ("PLAN_10_VALIDITY_DAYS", "plan_10_validity_days", 30),
-    ("PLAN_20_HOURS", "plan_20_hours", 20),
-    ("PLAN_20_PRICE_TOMAN", "plan_20_price_toman", 130_000),
-    ("PLAN_20_VALIDITY_DAYS", "plan_20_validity_days", 30),
-    ("PLAN_25_HOURS", "plan_25_hours", 25),
-    ("PLAN_25_PRICE_TOMAN", "plan_25_price_toman", 150_000),
-    ("PLAN_25_VALIDITY_DAYS", "plan_25_validity_days", 30),
-    ("PLAN_50_HOURS", "plan_50_hours", 50),
-    ("PLAN_50_PRICE_TOMAN", "plan_50_price_toman", 250_000),
-    ("PLAN_50_VALIDITY_DAYS", "plan_50_validity_days", 30),
+    ("PLAN_3_HOURS", "plan_3_hours", 3),
+    ("PLAN_3_PRICE_TOMAN", "plan_3_price_toman", 60_000),
+    ("PLAN_3_VALIDITY_DAYS", "plan_3_validity_days", 30),
+    ("PLAN_9_HOURS", "plan_9_hours", 9),
+    ("PLAN_9_PRICE_TOMAN", "plan_9_price_toman", 180_000),
+    ("PLAN_9_VALIDITY_DAYS", "plan_9_validity_days", 30),
+    ("PLAN_12_HOURS", "plan_12_hours", 12),
+    ("PLAN_12_PRICE_TOMAN", "plan_12_price_toman", 240_000),
+    ("PLAN_12_VALIDITY_DAYS", "plan_12_validity_days", 30),
+    ("PLAN_24_HOURS", "plan_24_hours", 24),
+    ("PLAN_24_PRICE_TOMAN", "plan_24_price_toman", 480_000),
+    ("PLAN_24_VALIDITY_DAYS", "plan_24_validity_days", 30),
+    ("PLAN_36_HOURS", "plan_36_hours", 36),
+    ("PLAN_36_PRICE_TOMAN", "plan_36_price_toman", 720_000),
+    ("PLAN_36_VALIDITY_DAYS", "plan_36_validity_days", 30),
+    ("PLAN_60_HOURS", "plan_60_hours", 60),
+    ("PLAN_60_PRICE_TOMAN", "plan_60_price_toman", 1_200_000),
+    ("PLAN_60_VALIDITY_DAYS", "plan_60_validity_days", 30),
 )
 
 #: Default failover order for speech-to-text. Only configured providers are
@@ -551,6 +554,14 @@ class Settings:
     speechmatics_api_key: str
     speechmatics_base_url: str
     speechmatics_model: str
+    #: Ask the engine to label who spoke. Engines that cannot diarize ignore
+    #: it, and a run that resolves to one voice is delivered without labels.
+    stt_diarize: bool
+    #: Clean the extracted audio before it is uploaded to the STT engine.
+    stt_preprocess: bool
+    #: Longest pause that still counts as one continuous turn of speech when
+    #: paragraphs are built from speaker changes.
+    stt_speaker_sensitivity: float
     deepgram_api_key: str
     deepgram_base_url: str
     deepgram_model: str
@@ -654,21 +665,24 @@ class Settings:
     #: deletes its text. 0 disables the sweep (rows are kept forever).
     transcript_retention_days: int
     free_plan_hours: int
-    plan_5_hours: int
-    plan_5_price_toman: int
-    plan_5_validity_days: int
-    plan_10_hours: int
-    plan_10_price_toman: int
-    plan_10_validity_days: int
-    plan_20_hours: int
-    plan_20_price_toman: int
-    plan_20_validity_days: int
-    plan_25_hours: int
-    plan_25_price_toman: int
-    plan_25_validity_days: int
-    plan_50_hours: int
-    plan_50_price_toman: int
-    plan_50_validity_days: int
+    plan_3_hours: int
+    plan_3_price_toman: int
+    plan_3_validity_days: int
+    plan_9_hours: int
+    plan_9_price_toman: int
+    plan_9_validity_days: int
+    plan_12_hours: int
+    plan_12_price_toman: int
+    plan_12_validity_days: int
+    plan_24_hours: int
+    plan_24_price_toman: int
+    plan_24_validity_days: int
+    plan_36_hours: int
+    plan_36_price_toman: int
+    plan_36_validity_days: int
+    plan_60_hours: int
+    plan_60_price_toman: int
+    plan_60_validity_days: int
 
     # --- Stage concurrency, non-blocking provider capacity & deduplication ---
     max_concurrent_downloads: int = DEFAULT_MAX_CONCURRENT_DOWNLOADS
@@ -689,6 +703,12 @@ class Settings:
     office_job_concurrency: int = DEFAULT_OFFICE_JOB_CONCURRENCY
     #: Maximum number of delivered transcript/booklet references retained per user.
     library_max_items: int = 50
+    #: Public HTTPS URL of the Mini App (the ranking + booklet editor). Empty
+    #: hides the entry button, so a deployment without the app never shows a
+    #: button that cannot open.
+    mini_app_url: str = ""
+    #: How long a signed ``initData`` payload stays acceptable, in seconds.
+    mini_app_auth_max_age: int = 300
     #: Ceiling for an ingested study document (PDF/DOCX/PPTX), in bytes. Kept
     #: separate from ``max_file_size`` because a document is parsed into memory
     #: instead of streamed through the media worker.
@@ -1304,6 +1324,11 @@ def from_env(env_file: str | None = None) -> Settings:
             "SPEECHMATICS_BASE_URL", "https://asr.api.speechmatics.com/v2"
         ).rstrip("/"),
         speechmatics_model=_env("SPEECHMATICS_MODEL", "enhanced"),
+        stt_diarize=_env_bool("STT_DIARIZE", True),
+        stt_preprocess=_env_bool("STT_PREPROCESS", True),
+        stt_speaker_sensitivity=_env_float(
+            "STT_SPEAKER_SENSITIVITY", 0.5, minimum=0.0, maximum=1.0
+        ),
         deepgram_api_key=_env("DEEPGRAM_API_KEY"),
         deepgram_base_url=_env("DEEPGRAM_BASE_URL", "https://api.deepgram.com/v1").rstrip("/"),
         deepgram_model=_env("DEEPGRAM_MODEL", DEFAULT_DEEPGRAM_MODEL),
@@ -1458,6 +1483,7 @@ def from_env(env_file: str | None = None) -> Settings:
             "OFFICE_AI_CONCURRENCY", 3, minimum=1, maximum=16
         ),
         plan_values=plan_values,
+        **plan_values,
         max_concurrent_downloads=_env_int(
             "MAX_CONCURRENT_DOWNLOADS",
             DEFAULT_MAX_CONCURRENT_DOWNLOADS,
@@ -1538,6 +1564,10 @@ def from_env(env_file: str | None = None) -> Settings:
             maximum=8,
         ),
         library_max_items=_env_int("LIBRARY_MAX_ITEMS", 50, minimum=1, maximum=10_000),
+        mini_app_url=_env("MINI_APP_URL", "").strip(),
+        mini_app_auth_max_age=_env_int(
+            "MINI_APP_AUTH_MAX_AGE_SECONDS", 300, minimum=30, maximum=3600
+        ),
         support_max_open_tickets=_env_int("SUPPORT_MAX_OPEN_TICKETS", 3, minimum=1, maximum=1000),
         support_ticket_cooldown_seconds=_env_int(
             "SUPPORT_TICKET_COOLDOWN_SECONDS", 600, minimum=0, maximum=86400
@@ -1593,7 +1623,6 @@ def from_env(env_file: str | None = None) -> Settings:
             minimum=0.0,
             maximum=3600.0,
         ),
-        **plan_values,
     )
 
 

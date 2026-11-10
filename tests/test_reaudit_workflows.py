@@ -95,8 +95,10 @@ class LearningChargeRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 await self.db.spend_seconds(OWNER, 300, kind, operation_id=kind)
                 refund = self.db._refund_debit_locked
 
-                async def fail_after_credit(*args, **kwargs):
-                    await refund(*args, **kwargs)
+                # ``_refund`` binds the real method now, without consuming the
+                # first positional argument the mock forwards to us.
+                async def fail_after_credit(*args, _refund=refund, **kwargs):
+                    await _refund(*args, **kwargs)
                     raise sqlite3.OperationalError("simulated failure after credit")
 
                 with mock.patch.object(self.db, "_refund_debit_locked", side_effect=fail_after_credit):

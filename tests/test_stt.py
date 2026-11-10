@@ -129,6 +129,27 @@ class SpeechmaticsParsingTests(unittest.TestCase):
     def test_empty_results(self):
         self.assertEqual(_speechmatics_words([]), ("", []))
 
+    def test_a_diarized_word_carries_its_speaker(self):
+        results = [
+            {"type": "word", "start_time": 0.0, "end_time": 0.4,
+             "speaker": "S1", "alternatives": [{"content": "سلام"}]},
+            {"type": "punctuation", "alternatives": [{"content": ".", "attaches_to": "previous"}]},
+            {"type": "word", "start_time": 1.0, "end_time": 1.4,
+             "speaker": "S2", "alternatives": [{"content": "بله"}]},
+        ]
+        _text, words = _speechmatics_words(results)
+        self.assertEqual([word.speaker for word in words], ["S1", "S2"])
+        # Punctuation has no speaker of its own; it rides on its word.
+        self.assertEqual(words[0].text, "سلام.")
+
+    def test_an_undiarized_word_has_an_empty_speaker(self):
+        results = [
+            {"type": "word", "start_time": 0.0, "end_time": 0.4,
+             "alternatives": [{"content": "سلام"}]},
+        ]
+        _text, words = _speechmatics_words(results)
+        self.assertEqual(words[0].speaker, "")
+
     def test_trailing_both_punctuation_is_not_duplicated(self):
         results = [
             {"type": "word", "alternatives": [{"content": "واژه"}]},
@@ -158,6 +179,42 @@ class SpeechmaticsFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raw.words[0].start, 0.0)
         # The transcript request asked for json-v2 (the timed format).
         self.assertEqual(session.get_kwargs.get("params"), {"format": "json-v2"})
+
+    async def test_the_request_asks_who_spoke(self):
+        """Diarization is a request parameter, not a post-processing guess."""
+        settings = make_settings(stt_providers=("speechmatics",))
+        session = speechmatics_flow([
+            {"type": "word", "alternatives": [{"content": "درس"}], "speaker": "S1"},
+        ])
+        await stt._speechmatics(session, audio_file(), settings)
+        config = json.loads(session.post_kwargs[0]["data"]._fields[0][2])
+        self.assertEqual(
+            config["transcription_config"]["diarization"], "speaker"
+        )
+        # Sensitivity is clamped into the provider's documented range.
+        sensitivity = config["transcription_config"]["speaker_diarization_config"][
+            "speaker_sensitivity"
+        ]
+        self.assertGreaterEqual(sensitivity, 0.0)
+        self.assertLessEqual(sensitivity, 1.0)
+
+    async def test_diarization_can_be_switched_off(self):
+        settings = make_settings(stt_providers=("speechmatics",), stt_diarize=False)
+        session = speechmatics_flow([
+            {"type": "word", "alternatives": [{"content": "درس"}]},
+        ])
+        await stt._speechmatics(session, audio_file(), settings)
+        config = json.loads(session.post_kwargs[0]["data"]._fields[0][2])
+        self.assertNotIn("diarization", config["transcription_config"])
+
+    async def test_the_speaker_count_reaches_the_transcript(self):
+        settings = make_settings(stt_providers=("speechmatics",))
+        session = speechmatics_flow([
+            {"type": "word", "alternatives": [{"content": "سلام"}], "speaker": "S1"},
+            {"type": "word", "alternatives": [{"content": "بله"}], "speaker": "S2"},
+        ])
+        raw = await stt._speechmatics(session, audio_file(), settings)
+        self.assertEqual(raw.speakers, 2)
 
     async def test_multilingual_model_requests_multilingual_detection(self):
         settings = make_settings(
@@ -241,6 +298,37 @@ class DeepgramParsingTests(unittest.TestCase):
         self.assertEqual(len(raw.words), 3)
         self.assertEqual(raw.words[1].text, "دوستان.")
         self.assertEqual(raw.words[2].start, 3.0)
+
+    def test_diarized_words_carry_their_speaker_and_a_count(self):
+        payload = {
+            "results": {"channels": [{"alternatives": [{
+                "transcript": "سلام بله ممنون",
+                "words": [
+                    {"word": "سلام", "punctuated_word": "سلام", "start": 0.0,
+                     "end": 0.4, "speaker": 0},
+                    {"word": "بله", "punctuated_word": "بله", "start": 1.0,
+                     "end": 1.3, "speaker": 1},
+                    {"word": "ممنون", "punctuated_word": "ممنون", "start": 2.0,
+                     "end": 2.3, "speaker": 0.0},
+                ],
+            }]}]}
+        }
+        raw = _deepgram_transcript(payload)
+        self.assertEqual([word.speaker for word in raw.words], ["0", "1", "0"])
+        # Numeric and integral-float indices name the same speaker.
+        self.assertEqual(raw.speakers, 2)
+        self.assertTrue(raw.is_diarized)
+
+    def test_an_undiarized_payload_reports_no_speakers(self):
+        raw = _deepgram_transcript({
+            "results": {"channels": [{"alternatives": [{
+                "transcript": "سلام",
+                "words": [{"word": "سلام", "start": 0.0, "end": 0.4}],
+            }]}]}
+        })
+        self.assertEqual(raw.speakers, 0)
+        self.assertFalse(raw.is_diarized)
+        self.assertEqual(raw.words[0].speaker, "")
 
     def test_malformed_payload_is_contract_error(self):
         with self.assertRaises(stt.STTError):

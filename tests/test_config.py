@@ -144,12 +144,12 @@ class FromEnvTests(unittest.TestCase):
         self.assertEqual(settings.presentation_silence_seconds, 60.0)
 
     def test_plan_overrides(self):
-        values = {"PLAN_5_HOURS": "7", "PLAN_5_PRICE_TOMAN": "99000"}
+        values = {"PLAN_3_HOURS": "7", "PLAN_3_PRICE_TOMAN": "99000"}
         with mock.patch.dict(os.environ, env(**values), clear=False):
             settings = from_env(env_file="/nonexistent")
-        self.assertEqual(settings.plan_5_hours, 7)
-        self.assertEqual(settings.plan_5_price_toman, 99000)
-        self.assertEqual(settings.plan_values["plan_5_hours"], 7)
+        self.assertEqual(settings.plan_3_hours, 7)
+        self.assertEqual(settings.plan_3_price_toman, 99000)
+        self.assertEqual(settings.plan_values["plan_3_hours"], 7)
 
     def test_tariff_values_cover_every_plan_field(self):
         # Every plan field on the dataclass appears in tariff_values().
@@ -847,3 +847,36 @@ class SettingsSurfaceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DiarizationAndPreprocessSettingsTests(unittest.TestCase):
+    """The two STT quality switches: on by default, off by explicit choice."""
+
+    def test_preprocess_is_on_by_default(self):
+        with mock.patch.dict(os.environ, env(), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertTrue(settings.stt_preprocess)
+
+    def test_preprocess_can_be_switched_off(self):
+        with mock.patch.dict(os.environ, env(STT_PREPROCESS="0"), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertFalse(settings.stt_preprocess)
+
+    def test_diarization_is_on_by_default(self):
+        with mock.patch.dict(os.environ, env(), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertTrue(settings.stt_diarize)
+        self.assertEqual(settings.stt_speaker_sensitivity, 0.5)
+
+    def test_diarization_can_be_switched_off(self):
+        with mock.patch.dict(os.environ, env(STT_DIARIZE="0"), clear=False):
+            settings = from_env(env_file="/nonexistent")
+        self.assertFalse(settings.stt_diarize)
+
+    def test_speaker_sensitivity_is_clamped(self):
+        for raw, expected in (("9", 1.0), ("-3", 0.0), ("maybe", 0.5), ("0.8", 0.8)):
+            with mock.patch.dict(
+                os.environ, env(STT_SPEAKER_SENSITIVITY=raw), clear=False
+            ):
+                settings = from_env(env_file="/nonexistent")
+            self.assertEqual(settings.stt_speaker_sensitivity, expected, raw)

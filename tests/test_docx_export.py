@@ -680,13 +680,13 @@ class BookletPaletteTests(unittest.TestCase):
 
 
 class BookletSkeletonDocxTests(unittest.TestCase):
-    """CR-4: the exporter appends a final «جمع‌بندی» and a glossary section."""
+    """The glossary closes every complete booklet (the recap lives in the body)."""
 
-    def test_end_summary_and_glossary_are_rendered(self):
+    def test_the_glossary_is_rendered_and_closes_the_booklet(self):
         text = docx_text(build_notes_docx(full_notes(), meta=META))
-        self.assertIn("جمع‌بندی", text)
         self.assertIn("واژه‌نامه", text)
         self.assertIn("HbA1c", text)
+        self.assertGreater(text.index("واژه‌نامه"), text.index("نکته‌های کلیدی"))
 
     def test_glossary_is_derived_from_definitions_when_absent(self):
         notes = StructuredNotes.from_payload(json.loads(
@@ -698,7 +698,9 @@ class BookletSkeletonDocxTests(unittest.TestCase):
         self.assertIn("واژه‌نامه", text)
         self.assertIn("Enzyme", text)          # derived from the section definition
         self.assertIn("کاتالیزگر زیستی", text)
-        self.assertIn("جمع‌بندی", text)       # end recap from summary
+        # No key points were supplied, so the closing recap stays absent rather
+        # than restating the summary it already printed above.
+        self.assertNotIn("آنچه باید از این جزوه در ذهن بماند", text)
 
     def test_toc_is_generated_for_a_multi_section_booklet(self):
         notes = full_notes()
@@ -719,3 +721,53 @@ class BookletSkeletonDocxTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoDuplicateRecapTests(unittest.TestCase):
+    """The booklet must not say the same thing three times.
+
+    The model writes the closing recap into its own ``summary`` and
+    ``key_points``; a separate «جمع‌بندی» appendix in the exporter printed both a
+    second time. These tests pin the tidier contract.
+    """
+
+    def _notes(self, **kwargs):
+        from gamas_bot.notes import NoteSection
+
+        base = {
+            "title": "درس",
+            "summary": "خلاصهٔ کوتاه درس.",
+            "sections": (NoteSection(heading="بخش", paragraphs=["متن بخش."]),),
+        }
+        base.update(kwargs)
+        return StructuredNotes(**base)
+
+    def test_there_is_no_separate_end_recap_block(self):
+        notes = self._notes(key_points=["نکتهٔ یک", "نکتهٔ دو"])
+        text = docx_text(build_notes_docx(notes, meta=META))
+        self.assertNotIn("آنچه باید از این جزوه در ذهن بماند", text)
+        self.assertNotIn("جمع‌بندی", text)
+
+    def test_the_summary_appears_exactly_once(self):
+        summary = "این جملهٔ خلاصهٔ یکتاست."
+        text = docx_text(build_notes_docx(self._notes(summary=summary), meta=META))
+        self.assertEqual(text.count(summary), 1)
+
+    def test_key_points_appear_in_one_place_only(self):
+        points = ["نکتهٔ الف", "نکتهٔ ب", "نکتهٔ ج"]
+        text = docx_text(build_notes_docx(self._notes(key_points=points), meta=META))
+        for point in points:
+            self.assertEqual(text.count(point), 1, point)
+
+    def test_the_glossary_still_closes_the_document(self):
+        notes = StructuredNotes.from_payload(json.loads(
+            '{"title": "درس", "summary": "خلاصه", "sections": [{"heading": "بخش", '
+            '"paragraphs": ["متن"], "definitions": [{"term": "آنزیم", '
+            '"term_en": "Enzyme", "definition": "کاتالیزگر زیستی"}]}]}'
+        ))
+        text = docx_text(build_notes_docx(notes, meta=META))
+        self.assertIn("واژه‌نامهٔ اصطلاح‌ها", text)
+        # The glossary is the last block, so nothing follows it but the TOC pass.
+        self.assertLess(text.index("خلاصه"), text.index("واژه‌نامهٔ اصطلاح‌ها"))
+
+

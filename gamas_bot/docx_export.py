@@ -2785,18 +2785,13 @@ def build_notes_docx(
         _add_heading(document, "پرسش‌های مرور", fonts=resolved, level=1)
         _add_numbered_steps(document, notes.review_questions, fonts=resolved)
 
-    # CR-4: an explicit, one-page end-of-booklet «جمع‌بندی». It is a grounded
-    # recap of the source summary/key points — never an invented conclusion.
-    recap = notes.summary.strip()
-    if recap or notes.key_points:
-        _add_heading(document, "جمع‌بندی", fonts=resolved, level=1, space_before=6)
-        if recap:
-            para = _add_rtl_paragraph(document, recap, fonts=resolved, size=11.5, space_after=8)
-            _shade_paragraph(para, SUMMARY_SHADE)
-            _paragraph_borders(para, SUMMARY_BORDER)
-        if notes.key_points:
-            _add_bullets(document, notes.key_points, fonts=resolved)
-
+    # No end-of-booklet recap block. The notes model already writes the recap
+    # into the document's own `summary` and `key_points` (the prompt asks for
+    # exactly that, see ``_prompt_block``), so re-printing them under a «جمع‌بندی»
+    # heading was the booklet saying the same thing twice — the same sentences
+    # first as a summary, then as key points, then once more at the end. The one
+    # place a closing recap belongs is inside the body the model authored, in its
+    # own words and order, and that is where it now lives.
     # CR-4: the glossary is derived from section definitions when the model did
     # not supply one, so a complete booklet always carries this final section.
     glossary_rows = _glossary_rows(notes)
