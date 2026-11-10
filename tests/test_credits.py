@@ -35,9 +35,9 @@ class CurrencyTests(unittest.TestCase):
         self.assertEqual(credits_per_hour(9), 300_000)
 
     def test_price_per_package_matches_the_agreed_tariff(self):
-        # 100,000 credits cost 60,000 toman, i.e. 20,000 toman per hour.
-        self.assertEqual(PRICE_TOMAN_PER_PACKAGE, 60_000)
-        self.assertEqual(PRICE_TOMAN_PER_PACKAGE / HOURS_PER_PACKAGE, 20_000)
+        # 100,000 credits cost 65,000 toman, i.e. 65,000 / 3 toman per hour.
+        self.assertEqual(PRICE_TOMAN_PER_PACKAGE, 65_000)
+        self.assertEqual(PRICE_TOMAN_PER_PACKAGE / HOURS_PER_PACKAGE, 65_000 / 3)
 
     def test_seconds_and_credits_round_in_the_safe_direction(self):
         self.assertEqual(seconds_to_credits(3600), 33_334)
@@ -101,7 +101,7 @@ class CatalogueTests(unittest.TestCase):
     def test_the_three_hour_plan_is_the_tariff_anchor(self):
         plan = next(p for p in plan_catalog() if p.code == "paid_3h_30d")
         self.assertEqual(plan.included_credits, 100_000)
-        self.assertEqual(plan.price_toman, 60_000)
+        self.assertEqual(plan.price_toman, 65_000)
         self.assertEqual(plan.included_seconds, 3 * SECONDS_PER_HOUR)
 
     def test_a_tariff_override_reaches_the_catalogue(self):

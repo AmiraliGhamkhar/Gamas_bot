@@ -217,22 +217,22 @@ MIN_NOTE_PROMPT_TOKENS = 4096
 PLAN_ENV_FIELDS = (
     ("FREE_PLAN_HOURS", "free_plan_hours", 1),
     ("PLAN_3_HOURS", "plan_3_hours", 3),
-    ("PLAN_3_PRICE_TOMAN", "plan_3_price_toman", 60_000),
+    ("PLAN_3_PRICE_TOMAN", "plan_3_price_toman", 65_000),
     ("PLAN_3_VALIDITY_DAYS", "plan_3_validity_days", 30),
     ("PLAN_9_HOURS", "plan_9_hours", 9),
-    ("PLAN_9_PRICE_TOMAN", "plan_9_price_toman", 180_000),
+    ("PLAN_9_PRICE_TOMAN", "plan_9_price_toman", 195_000),
     ("PLAN_9_VALIDITY_DAYS", "plan_9_validity_days", 30),
     ("PLAN_12_HOURS", "plan_12_hours", 12),
-    ("PLAN_12_PRICE_TOMAN", "plan_12_price_toman", 240_000),
+    ("PLAN_12_PRICE_TOMAN", "plan_12_price_toman", 260_000),
     ("PLAN_12_VALIDITY_DAYS", "plan_12_validity_days", 30),
     ("PLAN_24_HOURS", "plan_24_hours", 24),
-    ("PLAN_24_PRICE_TOMAN", "plan_24_price_toman", 480_000),
+    ("PLAN_24_PRICE_TOMAN", "plan_24_price_toman", 520_000),
     ("PLAN_24_VALIDITY_DAYS", "plan_24_validity_days", 30),
     ("PLAN_36_HOURS", "plan_36_hours", 36),
-    ("PLAN_36_PRICE_TOMAN", "plan_36_price_toman", 720_000),
+    ("PLAN_36_PRICE_TOMAN", "plan_36_price_toman", 780_000),
     ("PLAN_36_VALIDITY_DAYS", "plan_36_validity_days", 30),
     ("PLAN_60_HOURS", "plan_60_hours", 60),
-    ("PLAN_60_PRICE_TOMAN", "plan_60_price_toman", 1_200_000),
+    ("PLAN_60_PRICE_TOMAN", "plan_60_price_toman", 1_300_000),
     ("PLAN_60_VALIDITY_DAYS", "plan_60_validity_days", 30),
 )
 
@@ -795,10 +795,12 @@ class Settings:
     #: Deepgram diarizer version (``latest``/``v1``/``v2``). Empty keeps the
     #: legacy ``diarize=true`` (v1). See docs/STT_PROVIDERS.md.
     deepgram_diarize_model: str = ""
-    #: Gamas 2.0 tariff safeguard. The proposed per-100k-credit price is *not*
-    #: applied to live plans unless ``V2_TARIFF_ACTIVATED`` is explicitly on.
-    credit_price_per_100k_toman: int = 60_000
-    v2_tariff_activated: bool = False
+    #: Confirmed per-100k-credit tariff. Business-confirmed: 65,000 Toman per
+    #: 100,000 credits (3 hours). Override via CREDIT_PRICE_PER_100K_TOMAN only
+    #: with operator approval; changes trigger a startup diagnostic.
+    credit_price_per_100k_toman: int = 65_000
+    #: Deprecated compatibility flag; the confirmed tariff is always live.
+    v2_tariff_activated: bool = True
 
     # ------------------------------------------------------------------ views
     @property
@@ -1348,9 +1350,9 @@ def from_env(env_file: str | None = None) -> Settings:
         stt_preserve_stereo=_env_bool("STT_PRESERVE_STEREO", False),
         deepgram_diarize_model=_env("DEEPGRAM_DIARIZE_MODEL", ""),
         credit_price_per_100k_toman=_env_int(
-            "CREDIT_PRICE_PER_100K_TOMAN", 60_000, minimum=1
+            "CREDIT_PRICE_PER_100K_TOMAN", 65_000, minimum=1
         ),
-        v2_tariff_activated=_env_bool("V2_TARIFF_ACTIVATED", False),
+        v2_tariff_activated=_env_bool("V2_TARIFF_ACTIVATED", True),
         stt_speaker_sensitivity=_env_float(
             "STT_SPEAKER_SENSITIVITY", 0.5, minimum=0.0, maximum=1.0
         ),
@@ -1938,34 +1940,24 @@ def _check_admin_and_subscription(settings: Settings) -> list[ConfigDiagnostic]:
 
 
 def _check_v2_tariff_activation(settings: Settings) -> list[ConfigDiagnostic]:
-    """Guard the Gamas 2.0 tariff safeguard at startup.
+    """Guard the tariff configuration at startup.
 
-    The brief quotes ``CREDIT_PRICE_PER_100K_TOMAN=65`` while the live
-    catalogue sells 100 000 credits for 60 000 toman. Neither number is
-    silently reinterpreted: the proposed price stays a preview unless an
-    operator explicitly sets ``V2_TARIFF_ACTIVATED=1``, and a ~900x discrepancy
-    is reported loudly either way.
+    The business-confirmed tariff is 65,000 Toman per 100,000 credits
+    (3 hours). A CREDIT_PRICE_PER_100K_TOMAN that differs materially
+    (e.g. the obsolete literal ``65`` value from the early brief) is reported
+    loudly so a misconfiguration never silently applies a 1000x wrong price.
     """
     from .billing import PRICE_TOMAN_PER_PACKAGE, price_change_preview
 
     preview = price_change_preview(settings.credit_price_per_100k_toman)
     items: list[ConfigDiagnostic] = []
     price = int(settings.credit_price_per_100k_toman)
-    if price != PRICE_TOMAN_PER_PACKAGE and not settings.v2_tariff_activated:
+    if bool(preview["major_discrepancy"]):
         items.append(
             ConfigDiagnostic(
-                f"CREDIT_PRICE_PER_100K_TOMAN={price} differs from the live tariff "
-                f"{PRICE_TOMAN_PER_PACKAGE} but V2_TARIFF_ACTIVATED is off; "
-                "existing plan prices are unchanged. Run "
-                "scripts/credit_price_preview.py before activating."
-            )
-        )
-    if settings.v2_tariff_activated and bool(preview["major_discrepancy"]):
-        items.append(
-            ConfigDiagnostic(
-                f"V2_TARIFF_ACTIVATED is on with a {preview['ratio_live_over_proposed']:.0f}x "
-                "price difference; verify the migration preview and payment "
-                "snapshots before deploying."
+                f"CREDIT_PRICE_PER_100K_TOMAN={price} differs from the confirmed "
+                f"tariff {PRICE_TOMAN_PER_PACKAGE} by more than 10x. Verify the "
+                "value (canonical is 65000, not 65)."
             )
         )
     return items

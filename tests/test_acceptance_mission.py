@@ -108,9 +108,9 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         buy = await self.press(USER, "wallet")
         screen = buy.edits[-1][0]
         self.assertIn("۱۰۰٬۰۰۰ اعتبار (۳ ساعت)", screen)
-        self.assertIn("۶۰٬۰۰۰ تومان", screen)
+        self.assertIn("۶۵٬۰۰۰ تومان", screen)
         self.assertIn("۲٬۰۰۰٬۰۰۰ اعتبار (۶۰ ساعت)", screen)
-        self.assertIn("۱٬۲۰۰٬۰۰۰ تومان", screen)
+        self.assertIn("۱٬۳۰۰٬۰۰۰ تومان", screen)
         self.assertIn("هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت", screen)
 
         plan_tap = await self.press(USER, f"plan:{PLAN_36_CODE}")
@@ -144,7 +144,7 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         caption = admin_deliveries[0]["caption"]
         for expected in (
             to_persian_digits(order_id), str(USER),
-            "۱٬۲۰۰٬۰۰۰ اعتبار", "۷۲۰٬۰۰۰ تومان",
+            "۱٬۲۰۰٬۰۰۰ اعتبار", "۷۸۰٬۰۰۰ تومان",
         ):
             self.assertIn(expected, caption)
 
@@ -236,9 +236,9 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         plus = catalogue[PLAN_60_CODE]
         free = catalogue["free_1h"]
         self.assertEqual((standard.included_seconds, standard.price_toman, standard.validity_days),
-                         (36 * 3600, 720_000, 30))
+                         (36 * 3600, 780_000, 30))
         self.assertEqual((plus.included_seconds, plus.price_toman, plus.validity_days),
-                         (60 * 3600, 1_200_000, 30))
+                         (60 * 3600, 1_300_000, 30))
         self.assertEqual((free.included_seconds, free.price_toman), (3600, 0))
 
         self.assertTrue(await self.db.grant_free_plan_once(USER, 3600))
@@ -397,12 +397,14 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
             await self.bot._run_job(job)
 
         generate_notes.assert_awaited_once()
-        self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
-        # Only the booklet is pushed; the transcript and the key points are one
-        # tap away on the results screen.
-        self.assertEqual(len(event.files), 1)
-        self.assertIn("جزوهٔ خودکار", event.files[0][0])
-        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", event.files[0][0])
+        # Completion is one concise results message; final files are persisted
+        # and fetched with their buttons instead of being automatically pushed.
+        self.assertEqual(event.files, [])
+        pdf = await self.db.binary_artifact(job.submission_id, USER, "booklet")
+        docx = await self.db.binary_artifact(job.submission_id, USER, "docx")
+        assert pdf is not None and docx is not None
+        self.assertTrue(bytes(pdf["content"]).startswith(b"%PDF-"))
+        self.assertTrue(bytes(docx["content"]).startswith(b"PK"))
         stored = await self.db.transcription(job.submission_id)
         self.assertIn("متن کامل جلسه", str(stored["text"]))
         items = await self.db.library_list(USER, limit=6)

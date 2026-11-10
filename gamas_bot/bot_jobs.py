@@ -27,7 +27,6 @@ from .billing import format_credit_duration, format_seconds_as_credits
 from .bot_deps import deps_for
 from .bot_ui import (
     ACTIVE_LIMIT_MESSAGE,
-    LEARNING_DELIVERY_CTA,
     MAX_RAW_PREVIEW_LINES,
     RAW_PREVIEW_CHARS,
     TELEGRAM_CAPTION_LIMIT,
@@ -36,12 +35,11 @@ from .db import InsufficientBalanceError, TooManyActiveJobsError
 from .docx_export import (
     DocumentMeta,
     build_notes_docx,
-    build_plain_docx,
     notes_docx_filename,
-    plain_docx_filename,
     resolve_design,
     resolve_fonts,
 )
+from .notes_pdf import build_notes_pdf, notes_pdf_filename
 from .fileio import AsyncFileReader, run_file_io, run_file_io_resource
 from .intake import (
     USER_VISIBLE_ERRORS,
@@ -725,6 +723,11 @@ class JobPipelineMixin:
             reference=reference,
             meta=meta,
         )
+        if notes is not None:
+            speakers, timeline = self._booklet_context(document)
+            notes = replace(
+                notes, speakers=speakers, timeline=timeline
+            )
 
         await self.db.save_transcription(
             job.submission_id,
@@ -997,6 +1000,11 @@ class JobPipelineMixin:
         notes = await self._generate_presentation_notes(
             outline, transcript_text, job, progress, document=presentation_text
         )
+        if notes is not None:
+            speakers, timeline = self._booklet_context(document)
+            notes = replace(
+                notes, speakers=speakers, timeline=timeline
+            )
         await self.db.save_transcription(
             job.submission_id,
             engine=engine_label,
@@ -1016,37 +1024,6 @@ class JobPipelineMixin:
             plain_text=presentation_text,
         )
 
-    def _progressive_booklet_sender(
-        self,
-        job: Job,
-        workdir: Path,
-        reference: str,
-        meta: DocumentMeta,
-    ) -> Any:
-        async def send(merged: StructuredNotes) -> None:
-            try:
-                docx_bytes = await asyncio.to_thread(
-                    build_notes_docx,
-                    merged,
-                    fonts=resolve_fonts(),
-                    design=resolve_design(),
-                    meta=meta,
-                )
-                path = workdir / f"{reference}-draft.docx"
-                await run_file_io(path.write_bytes, docx_bytes)
-                await self._send_file(
-                    job, path, caption=f"📄 نسخهٔ نخست جزوه — {reference}"
-                )
-                logger.info("progressive booklet delivered reference=%s", reference)
-            except Exception:
-                logger.warning(
-                    "progressive booklet delivery failed reference=%s",
-                    reference,
-                    exc_info=True,
-                )
-
-        return send
-
     async def _generate_notes(
         self,
         document_text: str,
@@ -1060,27 +1037,23 @@ class JobPipelineMixin:
         if not self.settings.note_configured:
             logger.info("note provider not configured; delivering raw only")
             return None
-        on_merged = None
-        if (
-            self.settings.note_progressive_booklet
-            and workdir is not None
-            and reference
-            and meta is not None
-        ):
-            on_merged = self._progressive_booklet_sender(job, workdir, reference, meta)
+        # A single completion screen is the delivery contract.  In particular,
+        # do not push an intermediate Word draft while a later editorial pass
+        # may still change the same StructuredNotes model.
+        del workdir, reference, meta
         try:
             return await self.deps.structure_transcript(
                 document_text,
                 self.settings,
                 self._http_session(),  # type: ignore[attr-defined]
                 mode=self.settings.note_mode,
-                on_merged=on_merged,
+                on_merged=None,
             )
         except Exception as exc:
-            logger.warning("note generation failed; raw already delivered: %s", exc)
+            logger.warning("note generation failed; raw transcript remains available: %s", exc)
             await self._reply(
                 job,
-                "ℹ️ تولید جزوهٔ ساختارمند انجام نشد؛ فایل سادهٔ Word و متن خام ارسال می‌شود.",
+                "ℹ️ تولید جزوهٔ ساختارمند انجام نشد؛ متن خام از دکمهٔ خروجی‌ها در دسترس است.",
             )
             return None
 
@@ -1127,22 +1100,51 @@ class JobPipelineMixin:
         plain_title: str = "جزوهٔ کلاس",
         plain_text: str | None = None,
     ) -> None:
-        await progress.update(94, "آماده‌سازی فایل Word")
-        notice = ""
-        notice_kind = ""
-        docx_path: Path | None = None
+        """Persist the final booklet files, then show one results message.
+
+        PDF and DOCX are rendered exactly once from the same validated
+        ``StructuredNotes`` object.  Their bytes are kept in the database before
+        the job work directory is removed, so every later button press merely
+        sends a stored file and can never spend credits or invoke a renderer.
+        ``plain_*`` remains in this signature for source compatibility with the
+        presentation pipeline; an unstructured fallback is deliberately not
+        advertised as a polished booklet.
+        """
+        del workdir, plain_title, plain_text  # legacy call compatibility only
         booklet_title = short_title(
             getattr(notes, "title", "") if notes is not None else "",
-            plain_title,
             fallback=FALLBACK_BOOKLET,
         )
-        if notes is not None:
-            speakers, timeline = self._booklet_context(document)
-            notes = replace(
-                notes, title=booklet_title, speakers=speakers, timeline=timeline
+        pdf_ready = False
+        docx_ready = False
+        notice = ""
+        notice_kind = ""
+
+        if notes is None or not notes.has_content:
+            notice = "\n\nنکته: جزوهٔ ساختارمند برای این فایل ساخته نشد؛ متن خام در دسترس است."
+            notice_kind = "notes"
+        else:
+            duration_seconds = (
+                int(job.duration_hint)
+                if job.duration_hint is not None and job.duration_hint > 0
+                else None
             )
-        if notes is not None:
+            pdf_bytes: bytes | None = None
+            docx_bytes: bytes | None = None
             try:
+                await progress.update(93, "آماده‌سازی جزوه PDF")
+                pdf_bytes = await asyncio.to_thread(
+                    build_notes_pdf,
+                    notes,
+                    meta=meta,
+                    duration_seconds=duration_seconds,
+                )
+            except Exception:
+                logger.exception("structured PDF generation failed submission=%s", job.submission_id)
+                notice = "\n\nنکته: فایل PDF جزوه ساخته نشد؛ نسخه‌های دیگر در دسترس‌اند."
+                notice_kind = "pdf"
+            try:
+                await progress.update(94, "آماده‌سازی فایل Word")
                 docx_bytes = await asyncio.to_thread(
                     build_notes_docx,
                     notes,
@@ -1150,57 +1152,77 @@ class JobPipelineMixin:
                     design=resolve_design(),
                     meta=meta,
                 )
-                docx_path = workdir / notes_docx_filename(notes, reference)
-                await run_file_io(docx_path.write_bytes, docx_bytes)
             except Exception:
-                logger.exception("docx generation failed; falling back to chat message")
-                docx_path = None
-        if docx_path is None:
-            fallback_text = plain_text
-            if fallback_text is None:
-                fallback_text = document.llm_document() if document is not None else ""
-            try:
-                docx_bytes = await asyncio.to_thread(
-                    build_plain_docx,
-                    booklet_title,
-                    fallback_text,
-                    fonts=resolve_fonts(),
-                    design=resolve_design(),
-                    meta=meta,
-                )
-                docx_path = workdir / plain_docx_filename(booklet_title, reference)
-                await run_file_io(docx_path.write_bytes, docx_bytes)
-            except Exception:
-                logger.exception("plain docx generation failed too")
-                notice = "\n\nنکته: فایل Word ساخته نشد؛ متن خام ارسال شد."
-                notice_kind = "notes"
+                logger.exception("structured DOCX generation failed submission=%s", job.submission_id)
+                if not notice:
+                    notice = "\n\nنکته: فایل Word جزوه ساخته نشد؛ نسخه‌های دیگر در دسترس‌اند."
+                    notice_kind = "docx"
 
-        if docx_path is not None:
-            title = booklet_title
-            caption = (
-                f"📖 {booklet_title} — {reference}"
-                "\n📚 در کتابخانهٔ شما ذخیره شد" + LEARNING_DELIVERY_CTA
-            )
-            learning_source = (
-                plain_text
-                if plain_text is not None
-                else (document.llm_document() if document is not None else "")
-            )
-            learning_text = bound_content_text(learning_source)
-            try:
-                message = await self._send_file(job, docx_path, caption=caption)
-                if message is not None:
-                    await self._save_library_item(
-                        job,
+            if pdf_bytes is not None:
+                try:
+                    await self.db.binary_artifact_upsert(
+                        job.submission_id,
+                        job.user_id,
                         "booklet",
-                        message,
-                        title,
-                        content_text=learning_text or None,
+                        filename=notes_pdf_filename(notes, reference),
+                        content_type="application/pdf",
+                        content=pdf_bytes,
                     )
-            except Exception:
-                logger.exception("docx delivery failed")
-                notice = "\n\nنکته: ارسال فایل Word ناموفق بود؛ متن خام ارسال شد."
-                notice_kind = "delivery"
+                    pdf_ready = True
+                except Exception:
+                    logger.exception("could not persist PDF booklet submission=%s", job.submission_id)
+                    notice = "\n\nنکته: فایل PDF جزوه ذخیره نشد؛ لطفاً بعداً دوباره تلاش کنید."
+                    notice_kind = "pdf_storage"
+            if docx_bytes is not None:
+                try:
+                    await self.db.binary_artifact_upsert(
+                        job.submission_id,
+                        job.user_id,
+                        "docx",
+                        filename=notes_docx_filename(notes, reference),
+                        content_type=(
+                            "application/vnd.openxmlformats-officedocument."
+                            "wordprocessingml.document"
+                        ),
+                        content=docx_bytes,
+                    )
+                    docx_ready = True
+                except Exception:
+                    logger.exception("could not persist DOCX booklet submission=%s", job.submission_id)
+                    if not notice:
+                        notice = "\n\nنکته: فایل Word جزوه ذخیره نشد؛ لطفاً بعداً دوباره تلاش کنید."
+                        notice_kind = "docx_storage"
+
+            # The Library retains the editable source text and learning entry
+            # points.  It is a virtual record (no automatic Telegram upload);
+            # re-download routes use the persisted PDF rather than message ids.
+            if pdf_ready or docx_ready:
+                learning_source = document.llm_document() if document is not None else ""
+                learning_text = bound_content_text(learning_source)
+                try:
+                    existing = await self.db.library_list_kind(
+                        job.user_id, "booklet", limit=50
+                    )
+                    if not any(
+                        int(row.get("submission_id") or 0) == job.submission_id
+                        for row in existing
+                    ):
+                        item_id = await self.db.library_add(
+                            job.user_id,
+                            "booklet",
+                            0,
+                            0,
+                            job.submission_id,
+                            title=booklet_title,
+                        )
+                        if learning_text:
+                            await self.db.library_set_content(item_id, learning_text)
+                except Exception:
+                    logger.warning(
+                        "could not create virtual booklet library record submission=%s",
+                        job.submission_id,
+                        exc_info=True,
+                    )
 
         await self.db.set_submission_status(
             job.submission_id,
@@ -1210,16 +1232,13 @@ class JobPipelineMixin:
         )
         if notice:
             job.meta["outcome"] = "partial"
-        # The booklet is the last thing built, so this is where the job ends: one
-        # message that lists what exists and lets the user take any of it. The
-        # progress message already carries the outcome, so it is completed here
-        # rather than by ``_deliver_results``.
         await progress.complete()
         await self._deliver_results(
             job,
             document,
             reference,
-            has_booklet=docx_path is not None,
+            has_booklet=pdf_ready,
+            has_docx=docx_ready,
             has_keypoints=bool(getattr(notes, "key_points", ()) or ()),
         )
 
@@ -1384,6 +1403,7 @@ class JobPipelineMixin:
         *,
         has_booklet: bool,
         has_keypoints: bool,
+        has_docx: bool = False,
         progress: Any | None = None,
     ) -> None:
         """End the job with one message and a button per artifact.
@@ -1394,6 +1414,7 @@ class JobPipelineMixin:
         """
         from .artifacts import (
             KIND_BOOKLET,
+            KIND_DOCX,
             KIND_FLASHCARDS,
             KIND_KEYPOINTS,
             KIND_QUIZ,
@@ -1409,12 +1430,18 @@ class JobPipelineMixin:
             kinds.add(KIND_KEYPOINTS)
         if has_booklet:
             kinds.update({KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS})
+        if has_docx:
+            kinds.add(KIND_DOCX)
 
         # The library is one central submission with independent artifacts:
         # register exactly what exists, so the buttons and the results hub can
         # never advertise a download that was not produced.
         ref = reference_for(job.submission_id)
-        for kind in kinds:
+        # Migration 026's compact registry predates DOCX and has a CHECK
+        # constraint for its original kinds. PDF/DOCX availability is recorded
+        # in the additive binary-artifact table instead, so never attempt to
+        # insert ``docx`` into the legacy registry.
+        for kind in kinds - {KIND_DOCX}:
             try:
                 await self.db.artifact_upsert(
                     job.submission_id, job.user_id, kind, reference=ref
@@ -1471,14 +1498,15 @@ class JobPipelineMixin:
             )
 
     async def _fetch_artifact(self, event: Any, user_id: int, data: str) -> None:
-        """Send one artifact back to the user who asked for it.
+        """Send one owner-scoped artifact without regenerating a booklet.
 
-        The transcript and the key points are rebuilt from the stored
-        transcription (no model call, no credits, byte-stable); the booklet is
-        forwarded from the library row that already holds it. A submission
-        Telegram has aged out is reported as gone instead of silently failing.
+        Transcript/key-point views are deterministic projections of their stored
+        source rows. PDF and DOCX final bytes were saved at completion, so this
+        method only retrieves and sends them.
         """
         from .artifacts import (
+            KIND_BOOKLET,
+            KIND_DOCX,
             KIND_TRANSCRIPT,
             KIND_TXT,
             keypoints_artifact,
@@ -1492,15 +1520,27 @@ class JobPipelineMixin:
         if parsed is None or submission_id is None:
             await self._ack(event)
             return
-        kind = parsed[1]
-        if kind == "booklet":
-            await self._fetch_booklet(event, user_id, submission_id)
+        submission = await self.db.submission(submission_id)
+        if submission is None or int(submission.user_id) != int(user_id):
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            return
+        reference, kind = parsed
+        if kind in {KIND_BOOKLET, KIND_DOCX}:
+            if await self._fetch_persisted_booklet(
+                event, user_id, submission_id, kind, reference
+            ):
+                return
+            # Existing installations may contain pre-persistence Word library
+            # rows. They remain readable as a legacy booklet, but no new file
+            # is generated or mislabelled as a PDF.
+            if kind == KIND_BOOKLET:
+                await self._fetch_booklet(event, user_id, submission_id)
+                return
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
             return
 
         chat = await event.get_input_chat()
         if kind == KIND_TXT:
-            # A real, independent .txt download — rebuilt from the stored
-            # transcription, so it works months later and costs no credits.
             import io
 
             from telethon.tl.types import DocumentAttributeFilename
@@ -1511,12 +1551,12 @@ class JobPipelineMixin:
             if not body:
                 await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
                 return
-            filename = f"{parsed[0]}-transcript.txt"
+            filename = f"{reference}-transcript.txt"
             try:
                 await self.client.send_file(
                     chat,
                     io.BytesIO(body.encode("utf-8")),
-                    caption=texts.DELIVERY_TRANSCRIPT_READY.format(reference=parsed[0]),
+                    caption=texts.DELIVERY_TRANSCRIPT_READY.format(reference=reference),
                     force_document=True,
                     attributes=[DocumentAttributeFilename(filename)],
                 )
@@ -1533,10 +1573,10 @@ class JobPipelineMixin:
             body = await transcript_artifact(
                 self.db, submission_id, self.settings.raw_text_profile
             )
-            heading = texts.DELIVERY_TRANSCRIPT_READY.format(reference=parsed[0])
+            heading = texts.DELIVERY_TRANSCRIPT_READY.format(reference=reference)
         else:
             body = await keypoints_artifact(self.db, submission_id)
-            heading = texts.DELIVERY_KEYPOINTS_READY.format(reference=parsed[0])
+            heading = texts.DELIVERY_KEYPOINTS_READY.format(reference=reference)
         if not body:
             await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
             return
@@ -1557,18 +1597,69 @@ class JobPipelineMixin:
             return
         await self._ack(event)
 
+    async def _fetch_persisted_booklet(
+        self,
+        event: Any,
+        user_id: int,
+        submission_id: int,
+        kind: str,
+        reference: str,
+    ) -> bool:
+        """Send one exact PDF/DOCX blob; return whether an artifact existed."""
+        artifact = await self.db.binary_artifact(submission_id, user_id, kind)
+        if artifact is None:
+            return False
+        import io
+
+        from telethon.tl.types import DocumentAttributeFilename
+
+        raw_content = artifact.get("content")
+        content = bytes(raw_content) if raw_content is not None else b""
+        filename = Path(str(artifact.get("filename") or "")).name
+        if not content or not filename:
+            logger.warning(
+                "stored %s artifact is malformed submission=%s", kind, submission_id
+            )
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            return True
+        label = "📘 جزوه PDF" if kind == "booklet" else "📄 نسخه Word"
+        try:
+            await self.client.send_file(
+                await event.get_input_chat(),
+                io.BytesIO(content),
+                caption=f"{label} — {reference}",
+                force_document=True,
+                attributes=[DocumentAttributeFilename(filename)],
+            )
+        except Exception:
+            logger.warning(
+                "stored %s delivery failed submission=%s", kind, submission_id,
+                exc_info=True,
+            )
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            return True
+        await self._ack(event)
+        return True
+
     async def _fetch_booklet(self, event: Any, user_id: int, submission_id: int) -> None:
-        """Forward the booklet's Word file from the user's own library."""
+        """Forward a legacy pre-persistence Word booklet for its owner only."""
+        submission = await self.db.submission(submission_id)
+        if submission is None or int(submission.user_id) != int(user_id):
+            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            return
         rows = await self.db.library_list_kind(user_id, "booklet", limit=50)
         match = next(
             (
                 row
                 for row in rows
                 if int(row.get("submission_id") or 0) == submission_id
+                and int(row.get("chat_id") or 0)
+                and int(row.get("message_id") or 0)
+                and not row.get("unavailable")
             ),
             None,
         )
-        if match is None or match.get("unavailable"):
+        if match is None:
             await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
             return
         try:
@@ -1579,7 +1670,8 @@ class JobPipelineMixin:
             )
         except Exception:
             logger.warning(
-                "could not forward booklet submission=%s", submission_id, exc_info=True
+                "could not forward legacy booklet submission=%s", submission_id,
+                exc_info=True,
             )
             await self.db.library_mark_unavailable(int(match["item_id"]))
             await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)

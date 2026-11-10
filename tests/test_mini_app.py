@@ -547,7 +547,7 @@ class MiniAppEntryButtonTests(unittest.TestCase):
         rows = self.build("https://example.com/miniapp")
         self.assertEqual(len(rows), 1)
         button = rows[0][0]
-        self.assertEqual(button.text, "✏️ ویرایش جزوه در باشگاه مطالعه")
+        self.assertEqual(button.text, "✏️ ویرایش جزوه در Gamas Studio")
         # A WebView button is what gives the page a signed initData session; a
         # plain URL button would open a browser tab the app must refuse.
         self.assertEqual(type(button.type).__name__, "InlineButtonTypeWebView")

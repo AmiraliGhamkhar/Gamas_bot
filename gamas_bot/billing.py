@@ -23,7 +23,6 @@ marked ``is_custom`` there and are deliberately outside this catalogue.
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from dataclasses import dataclass
 from fractions import Fraction
@@ -65,19 +64,14 @@ CREDITS_PER_UNIT = 100_000
 SECONDS_PER_UNIT = 10_800
 #: Hours of audio one purchase unit pays for.
 HOURS_PER_PACKAGE = 3
-#: Canonical selling price of one purchase unit, in toman
-#: (100 000 credits = 3 hours = 60 000 T, i.e. 20 000 T per hour).
-PRICE_TOMAN_PER_PACKAGE = 60_000
+#: Canonical selling price of one purchase unit, in toman.
+#: Business-confirmed tariff: 100 000 credits = 3 hours = 65 000 Toman.
+PRICE_TOMAN_PER_PACKAGE = 65_000
 #: Credits per second of processed audio (100 000 / 10 800 s).
-CREDITS_PER_SECOND = CREDIT_PACKAGE_SIZE / (HOURS_PER_PACKAGE * SECONDS_PER_HOUR)
-#: Credits per hour of processed audio (100 000 / 3 = 33 333.33).
-CREDITS_PER_HOUR = CREDIT_PACKAGE_SIZE / HOURS_PER_PACKAGE
-
-#: Proposed (NOT activated) tariff from the Gamas 2.0 brief: 65 toman per
-#: 100 000 credits, taken literally. It is ~923x cheaper than the live
-#: catalogue and must never be applied silently. See
-#: :func:`price_change_preview` and ``scripts/credit_price_preview.py``.
-PROPOSED_PRICE_TOMAN_PER_PACKAGE = 65
+CREDITS_PER_SECOND = Fraction(CREDIT_PACKAGE_SIZE, SECONDS_PER_UNIT)
+#: Exact rational credits per hour (100 000 / 3). Never use this as a float
+#: in accounting; conversion helpers below round with integer arithmetic.
+CREDITS_PER_HOUR = Fraction(CREDIT_PACKAGE_SIZE, HOURS_PER_PACKAGE)
 
 
 def _ceil_div(numerator: int, denominator: int) -> int:
@@ -85,104 +79,95 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return -(-numerator // denominator)
 
 
-def _seconds_fraction(seconds: int | float) -> Fraction:
-    """Exact rational for a seconds value (int stays int, float via str)."""
-    if isinstance(seconds, bool):
-        return Fraction(0)
-    if isinstance(seconds, int):
-        return Fraction(seconds)
-    return Fraction(str(seconds))
+def _positive_fraction(value: object) -> Fraction | None:
+    """Return an exact positive rational without first coercing to ``float``.
+
+    Durations usually arrive as integer seconds, but media probes and public
+    helpers may carry decimal strings or Python floats.  ``str(float)`` retains
+    the caller-visible decimal value rather than importing the binary floating
+    point approximation into an accounting calculation.  Non-finite floats and
+    malformed values are rejected before any arithmetic happens.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, float):
+        # ``nan`` / infinities have no meaningful rational representation.
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+    try:
+        fraction = Fraction(value) if isinstance(value, int) else Fraction(str(value))
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    return fraction if fraction > 0 else None
 
 
 def seconds_to_credits(seconds: int | float | None) -> int:
-    """Convert ledger seconds to credits, rounding up (integer arithmetic).
+    """Convert ledger seconds to credits, rounding up with exact arithmetic.
 
-    ``credits = ceil(seconds * CREDITS_PER_UNIT / SECONDS_PER_UNIT)`` computed
-    with exact rationals, never floats: exactly 10 800 s is exactly 100 000
-    credits, and one second is never charged as zero credits. Rounding up
-    keeps a fractional credit from ever becoming free audio.
+    ``credits = ceil(seconds * CREDITS_PER_UNIT / SECONDS_PER_UNIT)``.  No
+    floating-point value participates in the multiplication or rounding.
     """
-    if seconds is None:
+    fraction = _positive_fraction(seconds)
+    if fraction is None:
         return 0
-    if isinstance(seconds, bool):
-        return 0
-    try:
-        value = float(seconds)
-    except (TypeError, ValueError):
-        return 0
-    if not math.isfinite(value):
-        return 0
-    if value <= 0:
-        return 0
-    fraction = _seconds_fraction(seconds)
     numerator = fraction.numerator * CREDITS_PER_UNIT
     denominator = fraction.denominator * SECONDS_PER_UNIT
-    return max(0, _ceil_div(int(numerator), int(denominator)))
+    return _ceil_div(numerator, denominator)
 
 
 def credits_to_seconds(credits: int | float | None) -> int:
-    """Convert credits to whole ledger seconds, rounding down (integer math).
-
-    The inverse of :func:`seconds_to_credits` for every amount a plan can sell:
-    the pair is explicit about its rounding so a balance is never overstated.
-    """
-    if credits is None:
+    """Convert credits to whole ledger seconds, rounding down exactly."""
+    fraction = _positive_fraction(credits)
+    if fraction is None:
         return 0
-    if isinstance(credits, bool):
-        return 0
-    try:
-        value = float(credits)
-    except (TypeError, ValueError):
-        return 0
-    if not math.isfinite(value):
-        return 0
-    if value <= 0:
-        return 0
-    whole = int(value) if float(value).is_integer() else int(math.floor(value))
-    if whole <= 0:
-        return 0
-    return max(0, (whole * SECONDS_PER_UNIT) // CREDITS_PER_UNIT)
+    # A fractional input can only arise at an API boundary; floor it before the
+    # integer ledger conversion so a user is never promised extra audio.
+    whole_credits = fraction.numerator // fraction.denominator
+    return (whole_credits * SECONDS_PER_UNIT) // CREDITS_PER_UNIT
 
 
 def credits_per_hour(hours: int | float) -> int:
-    """Credits covering ``hours`` of audio, rounded up to the whole credit."""
-    if isinstance(hours, bool):
+    """Credits covering ``hours`` of audio, rounded up with exact rationals."""
+    fraction = _positive_fraction(hours)
+    if fraction is None:
         return 0
-    try:
-        value = float(hours)
-    except (TypeError, ValueError):
-        return 0
-    if not math.isfinite(value) or value <= 0:
-        return 0
-    fraction = _seconds_fraction(hours)
     numerator = fraction.numerator * CREDITS_PER_UNIT
     denominator = fraction.denominator * HOURS_PER_PACKAGE
-    return max(0, _ceil_div(int(numerator), int(denominator)))
+    return _ceil_div(numerator, denominator)
 
 
 def price_change_preview(
-    proposed_price_toman: int = PROPOSED_PRICE_TOMAN_PER_PACKAGE,
+    proposed_price_toman: int | None = None,
 ) -> dict[str, object]:
     """Compare the live catalogue with a proposed per-package price.
 
-    Pure and side-effect free: it never changes a plan. The preview exists so
-    an operator sees the discrepancy (live 60 000 T vs proposed 65 T) before
-    any explicit configuration change, per the commercial safeguard.
+    Pure and side-effect free: it never changes a plan. With no argument it
+    reports the canonical confirmed tariff (65 000 T per 3-hour package).
+    A proposed override is shown side-by-side so an operator can verify a
+    configuration change before deploying it.
     """
     live = PRICE_TOMAN_PER_PACKAGE
-    proposed = int(proposed_price_toman)
+    if proposed_price_toman is None:
+        proposed = live
+    else:
+        proposed = int(proposed_price_toman)
     ratio = (live / proposed) if proposed > 0 else float("inf")
+    is_override = proposed != live
     return {
         "live_price_toman_per_package": live,
         "proposed_price_toman_per_package": proposed,
         "live_per_hour_toman": live // HOURS_PER_PACKAGE,
-        "proposed_per_hour_toman": proposed / HOURS_PER_PACKAGE,
+        "proposed_per_hour_toman": proposed / HOURS_PER_PACKAGE if proposed else 0,
         "ratio_live_over_proposed": ratio,
-        "major_discrepancy": ratio > 10 or ratio < 0.1,
-        "activated": False,
+        "major_discrepancy": is_override and (ratio > 10 or ratio < 0.1),
+        "activated": not is_override,
         "note": (
-            "Proposed price is NOT activated. Live plans keep their frozen "
-            "snapshots; activation requires an explicit PLAN_* change."
+            "Canonical confirmed tariff: 100,000 credits = 3 hours = 65,000 Toman."
+            if not is_override
+            else (
+                "Proposed price is NOT activated. Live plans keep their frozen "
+                "snapshots; activation requires an explicit PLAN_* change."
+            )
         ),
     }
 
@@ -242,15 +227,15 @@ class PlanSpec:
 #: The purchasable catalogue, cheapest first. The free plan is not listed: it
 #: is granted by the database, never sold, and therefore has no price keys.
 #: Prices are proportional to the credited hours at the canonical
-#: :data:`PRICE_TOMAN_PER_PACKAGE` rate (20 000 T per hour), so a longer plan is
-#: a convenience bundle and never a hidden discount or surcharge.
+#: :data:`PRICE_TOMAN_PER_PACKAGE` rate (65 000 T for 3 hours), so a longer
+#: plan is a convenience bundle and never a hidden discount or surcharge.
 PAID_PLAN_SPECS: tuple[PlanSpec, ...] = (
-    PlanSpec(PLAN_3_CODE, "plan_3", 3, 60_000, 30, 1),
-    PlanSpec(PLAN_9_CODE, "plan_9", 9, 180_000, 30, 2),
-    PlanSpec(PLAN_12_CODE, "plan_12", 12, 240_000, 30, 3),
-    PlanSpec(PLAN_24_CODE, "plan_24", 24, 480_000, 30, 4),
-    PlanSpec(PLAN_36_CODE, "plan_36", 36, 720_000, 30, 5),
-    PlanSpec(PLAN_60_CODE, "plan_60", 60, 1_200_000, 30, 6),
+    PlanSpec(PLAN_3_CODE, "plan_3", 3, 65_000, 30, 1),
+    PlanSpec(PLAN_9_CODE, "plan_9", 9, 195_000, 30, 2),
+    PlanSpec(PLAN_12_CODE, "plan_12", 12, 260_000, 30, 3),
+    PlanSpec(PLAN_24_CODE, "plan_24", 24, 520_000, 30, 4),
+    PlanSpec(PLAN_36_CODE, "plan_36", 36, 780_000, 30, 5),
+    PlanSpec(PLAN_60_CODE, "plan_60", 60, 1_300_000, 30, 6),
 )
 
 

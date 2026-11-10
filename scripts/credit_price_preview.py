@@ -1,18 +1,20 @@
-"""Read-only preview of the Gamas 2.0 tariff change.
+"""Show the confirmed Gamas tariff and plan catalogue.
 
-The brief quotes 75 in a heading but writes ``CREDIT_PRICE_PER_100K_TOMAN=65``
-literally. The live catalogue sells 100,000 credits (3 h = 10,800 s) for
-60,000 toman. This script never writes to the database and never reinterprets
-65 as 65,000: it shows both numbers, the ratio, the plan rows that *would*
-change and the SQL an operator would have to run by hand after review.
+The confirmed commercial tariff is:
+
+    100,000 credits = 3 hours (10,800 seconds) = 65,000 Toman.
+
+This script is read-only: it prints the canonical constants, the full plan
+catalogue, and (optionally) the existing plan rows from a read-only database
+so an operator can verify that prices match before/after deployment.
 
 Usage::
 
     python -m scripts.credit_price_preview
-    python -m scripts.credit_price_preview --candidate 65
+    python -m scripts.credit_price_preview --candidate 65000
     python -m scripts.credit_price_preview --db /path/to/bot.sqlite3
 
-Exit status is always 0 for a preview; a bad candidate exits 2.
+Exit status 0 for a valid price; 2 for a nonsensical candidate (e.g. 65).
 """
 
 from __future__ import annotations
@@ -25,13 +27,16 @@ from pathlib import Path
 
 from gamas_bot.billing import (
     CREDITS_PER_UNIT,
+    HOURS_PER_PACKAGE,
     PRICE_TOMAN_PER_PACKAGE,
-    PROPOSED_PRICE_TOMAN_PER_PACKAGE,
     SECONDS_PER_UNIT,
     plan_catalog,
     price_change_preview,
     seconds_to_credits,
 )
+
+#: Confirmed canonical price (3 h = 65,000 T).
+CONFIRMED_PRICE = PRICE_TOMAN_PER_PACKAGE
 
 
 def live_plans(db_path: str | None) -> list[dict[str, object]] | None:
@@ -65,8 +70,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--candidate",
         type=int,
-        default=PROPOSED_PRICE_TOMAN_PER_PACKAGE,
-        help="proposed price per 100,000 credits in toman (literal, default 65)",
+        default=CONFIRMED_PRICE,
+        help="price per 100,000 credits in toman to preview (default 65000)",
     )
     parser.add_argument(
         "--db", default="", help="optional read-only database to show live plan prices"
@@ -75,46 +80,55 @@ def main(argv: list[str] | None = None) -> int:
     if args.candidate <= 0:
         print("candidate price must be positive", file=sys.stderr)
         return 2
+
     preview = price_change_preview(args.candidate)
     unit = {
         "credits_per_unit": CREDITS_PER_UNIT,
         "seconds_per_unit": SECONDS_PER_UNIT,
-        "hours_per_unit": SECONDS_PER_UNIT / 3600,
+        "hours_per_package": HOURS_PER_PACKAGE,
+        "confirmed_price_toman_per_package": CONFIRMED_PRICE,
+        "confirmed_price_toman_per_hour": CONFIRMED_PRICE // HOURS_PER_PACKAGE,
         "ceiling_check": {
             "1_second": seconds_to_credits(1),
             "10_800_seconds": seconds_to_credits(10_800),
             "10_801_seconds": seconds_to_credits(10_801),
         },
-        "live_price_toman_per_100k": PRICE_TOMAN_PER_PACKAGE,
     }
     catalogue = [
         {
             "code": plan.code,
+            "name": plan.name,
             "hours": plan.included_hours,
             "credits": plan.included_credits,
-            "live_price_toman": plan.price_toman,
+            "price_toman": plan.price_toman,
+            "validity_days": plan.validity_days,
+            "is_free": plan.is_free,
         }
         for plan in plan_catalog()
     ]
     output: dict[str, object] = {
+        "confirmed_tariff": {
+            "credits_per_package": CREDITS_PER_UNIT,
+            "hours_per_package": HOURS_PER_PACKAGE,
+            "price_toman_per_package": CONFIRMED_PRICE,
+        },
         "unit": unit,
         "preview": preview,
-        "catalogue_unchanged": catalogue,
+        "catalogue": catalogue,
         "live_plans": live_plans(args.db),
-        "activation_flag": "V2_TARIFF_ACTIVATED",
-        "activation_default": False,
         "writes_performed": False,
     }
     print(json.dumps(output, ensure_ascii=False, indent=2))
-    print("\n-- Dry-run migration SQL (NOT executed; review before any activation) --")
-    print("BEGIN IMMEDIATE;")
-    print("-- Keep historical payment snapshots untouched: they are frozen prices.")
-    print("-- Only *new* plan rows may use the candidate tariff after approval:")
-    print(f"-- UPDATE plans SET price = {args.candidate} * hours / 3 WHERE is_custom = 0;")
-    print("-- ROLLBACK;  -- preview only; COMMIT only after an explicit operator decision")
-    ratio = preview.get("ratio_live_over_proposed")
-    print("\nWARNING: the candidate is ~%.0fx away from the live tariff."
-          % (float(ratio) if isinstance(ratio, (int, float)) else 0.0))
+
+    # Sanity check: the literal "65" (from an early brief misreading) is
+    # roughly 1000x too cheap. Surface it clearly so nobody ships it by accident.
+    if args.candidate < 1000:
+        print(
+            f"\nWARNING: candidate price {args.candidate} is implausibly low "
+            f"(canonical is {CONFIRMED_PRICE}). Did you mean {args.candidate * 1000}?",
+            file=sys.stderr,
+        )
+        return 2
     return 0
 
 

@@ -9,7 +9,6 @@ import os
 import re
 import tempfile
 import unittest
-from datetime import datetime
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,7 +24,6 @@ from gamas_bot.bot import (
     _parse_telegram_user_id,
 )
 from gamas_bot.db import Database
-from gamas_bot.docx_export import DocumentMeta
 from gamas_bot.notes import StructuredNotes
 from gamas_bot.jobs import Job
 from gamas_bot.media import MediaInfo, MediaToolError
@@ -492,7 +490,7 @@ class _FakeAsyncContext:
 class FileDeliveryTests(BotPipelineTestCase):
     """File delivery through the supported Telethon API (production incident)."""
 
-    async def test_raw_and_docx_use_send_file_with_caption_and_reply(self):
+    async def test_booklet_files_are_persisted_without_an_automatic_upload(self):
         event = self.media_event()
         self.bot.settings = replace(
             self.settings,
@@ -508,15 +506,14 @@ class FileDeliveryTests(BotPipelineTestCase):
         ):
             submission = await self.run_media_job(event, transcribe=self._raw())
 
-        # Only the booklet is a file. ``Message.reply`` has no ``caption``
-        # parameter — only ``TelegramClient.send_file`` accepts a captioned
-        # document — and the double binds every call against the real signature,
-        # so a regression to the old call fails here, not in production.
-        self.assertEqual([path.split(".")[-1] for _c, path in event.files], ["docx"])
-        docx = event.delivery(".docx")
-        self.assertTrue(docx["force_document"])
-        self.assertEqual(docx["reply_to"], event.message.id)
-        self.assertIn("جزوه", docx["caption"])
+        # Completion sends only one results screen. PDF/DOCX are durable
+        # owner-scoped bytes, retrieved later by their output buttons.
+        self.assertEqual(event.files, [])
+        pdf = await self.db.binary_artifact(submission, USER_ID, "booklet")
+        docx = await self.db.binary_artifact(submission, USER_ID, "docx")
+        assert pdf is not None and docx is not None
+        self.assertTrue(bytes(pdf["content"]).startswith(b"%PDF-"))
+        self.assertTrue(bytes(docx["content"]).startswith(b"PK"))
 
         row = await self.db.submission(submission)
         assert row is not None
@@ -604,7 +601,7 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
     def settings_overrides(self) -> dict:
         return {"note_api_base_url": "https://note.example/v1", "note_api_key": "note-key"}
 
-    async def test_notes_reach_the_word_booklet_and_usage_is_settled_once(self):
+    async def test_notes_reach_persisted_pdf_and_docx_and_usage_is_settled_once(self):
         event = self.media_event()
         session = _SttAndLlmSession(
             {"choices": [{"message": {"content": sample_notes_json("جزوهٔ آزمون")}}]}
@@ -633,10 +630,14 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
         ):
             await self.bot._run_job(job)
 
-        # The structured booklet is the only pushed file; the transcript is
-        # fetched through its button.
-        self.assertFalse(any(path.endswith(".txt") for path in event.file_paths))
-        self.assertIn("جزوهٔ آزمون", docx_text(event.file_bytes(".docx")))
+        # Completion pushes no file. Both final bytes are persisted from the
+        # same structured notes model; transcript remains a free fetch button.
+        self.assertEqual(event.files, [])
+        pdf = await self.db.binary_artifact(submission, USER_ID, "booklet")
+        docx = await self.db.binary_artifact(submission, USER_ID, "docx")
+        assert pdf is not None and docx is not None
+        self.assertTrue(bytes(pdf["content"]).startswith(b"%PDF-"))
+        self.assertIn("جزوهٔ آزمون", docx_text(bytes(docx["content"])))
         # The transcript button replays the recognised speech, and the key-point
         # button reads the persisted notes — no model call for either.
         self.assertIn(
@@ -1615,60 +1616,12 @@ class IntakeLimitTests(BotPipelineTestCase):
 
 
 class ProgressiveBookletTests(BotPipelineTestCase):
-    """Phase 4: the merge is delivered while the compile is still running."""
+    """No intermediate booklet drafts may be pushed before completion."""
 
     def settings_overrides(self) -> dict:
         return {"note_progressive_booklet": True, "note_api_key": "note-key"}
 
-    async def test_the_draft_is_a_real_word_file_with_its_own_caption(self):
-        workdir = Path(self._tmp.name) / "work"
-        workdir.mkdir()
-        event = self.media_event()
-        submission = await self.db.create_submission(USER_ID, "audio", "a.wav")
-        job = Job(
-            submission_id=submission,
-            user_id=USER_ID,
-            kind="audio",
-            filename="a.wav",
-            message=event.message,
-            is_admin=False,
-            duration_hint=100.0,
-        )
-        notes = StructuredNotes.from_payload(json.loads(sample_notes_json()))
-        meta = DocumentMeta(reference="GMS-1", source_name="a.wav", created_at=datetime.now())
-        sender = self.bot._progressive_booklet_sender(job, workdir, "GMS-1", meta)
-        await sender(notes)
-
-        draft = workdir / "GMS-1-draft.docx"
-        self.assertTrue(draft.is_file())
-        sent = event.client.deliveries
-        self.assertEqual(len(sent), 1)
-        self.assertIn("نسخهٔ نخست", sent[0]["caption"])
-        # The draft is a genuine booklet, not the raw transcript.
-        self.assertIn("جزوه", docx_text(draft.read_bytes()))
-
-    async def test_a_failure_to_deliver_the_draft_is_swallowed(self):
-        workdir = Path(self._tmp.name) / "work2"
-        workdir.mkdir()
-        event = self.media_event()
-        submission = await self.db.create_submission(USER_ID, "audio", "a.wav")
-        job = Job(
-            submission_id=submission,
-            user_id=USER_ID,
-            kind="audio",
-            filename="a.wav",
-            message=event.message,
-            is_admin=False,
-            duration_hint=100.0,
-        )
-        sender = self.bot._progressive_booklet_sender(
-            job, workdir, "GMS-2", mock.Mock()
-        )
-        # A broken meta must not raise into the note pipeline.
-        await sender(StructuredNotes.from_payload(json.loads(sample_notes_json())))
-        self.assertFalse((workdir / "GMS-2-draft.docx").exists())
-
-    async def test_the_callback_is_only_installed_when_the_setting_is_on(self):
+    async def test_the_callback_is_never_installed_even_for_legacy_setting(self):
         captured: dict = {}
 
         async def fake_structure(_text, _settings, _session, *, mode, on_merged=None):
@@ -1684,19 +1637,8 @@ class ProgressiveBookletTests(BotPipelineTestCase):
                 reference="GMS-3",
                 meta=mock.Mock(),
             )
-        self.assertIsNotNone(captured["on_merged"])
-
-        self.bot.settings = replace(self.settings, note_progressive_booklet=False)
-        with mock.patch("gamas_bot.bot.structure_transcript", new=fake_structure):
-            await self.bot._generate_notes(
-                "متن",
-                mock.Mock(submission_id=1, message=None),
-                None,
-                workdir=Path(self._tmp.name),
-                reference="GMS-3",
-                meta=mock.Mock(),
-            )
         self.assertIsNone(captured["on_merged"])
+
 
 
 class _RangedClient:
@@ -1974,8 +1916,8 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
-    async def test_media_upload_without_a_mode_tap_runs_transcript_then_booklet(self):
-        """The file alone starts the complete pipeline; transcript remains first."""
+    async def test_media_upload_without_a_mode_tap_persists_booklet_outputs(self):
+        """The file alone starts the pipeline and records both final formats."""
         from gamas_bot.stt import RawTranscript as STTRawTranscript
 
         user_id = 501
@@ -2010,18 +1952,12 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._run_job(job)
 
         generate.assert_awaited_once()
-        self.assertFalse(any(path.endswith(".txt") for path in event.file_paths))
-        self.assertTrue(event.file_bytes(".docx").startswith(b"PK"))
-        captions = [caption for caption, _path in event.files]
-        self.assertEqual(len(captions), 1)
-        # The booklet caption carries the booklet's own 2–4-word title (the
-        # library row uses the same name), not a generic «جزوهٔ Word» label.
-        self.assertIn("جزوهٔ خودکار", captions[0])
-        self.assertIn("📚 در کتابخانهٔ شما ذخیره شد", captions[0])
-        # «عنوان جزوه» is the same 2–4-word name by default: the cover of the
-        # Word file carries it, so the booklet a user opens is the one the list
-        # named.
-        self.assertIn("جزوهٔ خودکار", docx_text(event.file_bytes(".docx")))
+        self.assertEqual(event.files, [])
+        pdf = await self.db.binary_artifact(job.submission_id, user_id, "booklet")
+        docx = await self.db.binary_artifact(job.submission_id, user_id, "docx")
+        assert pdf is not None and docx is not None
+        self.assertTrue(bytes(pdf["content"]).startswith(b"%PDF-"))
+        self.assertIn("جزوهٔ خودکار", docx_text(bytes(docx["content"])))
         items = await self.db.library_list(user_id, limit=6)
         self.assertEqual([item["kind"] for item in items], ["booklet"])
         row = await self.db.submission(job.submission_id)
@@ -2137,6 +2073,39 @@ class ArtifactDeliveryTests(BotPipelineTestCase):
         self.assertTrue(event.answers)
         self.assertEqual(event.answers[-1][0], texts.DELIVERY_ARTIFACT_GONE)
 
+    async def test_persisted_pdf_and_docx_are_sent_without_regeneration(self):
+        _event, submission = await self._finished_job()
+        await self.db.binary_artifact_upsert(
+            submission,
+            USER_ID,
+            "booklet",
+            filename="GMS.pdf",
+            content_type="application/pdf",
+            content=b"%PDF-stored",
+        )
+        await self.db.binary_artifact_upsert(
+            submission,
+            USER_ID,
+            "docx",
+            filename="GMS.docx",
+            content_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            content=b"PK-stored",
+        )
+        client = self.bot.client
+        before = len(client.deliveries)
+        for kind in ("booklet", "docx"):
+            callback = FakeCallbackEvent(
+                client, data=f"art:GMS-{submission}:{kind}".encode("ascii")
+            )
+            await self.bot._fetch_artifact(
+                callback, USER_ID, f"art:GMS-{submission}:{kind}"
+            )
+            self.assertFalse(callback.answers[-1][1])
+        sent = client.deliveries[before:]
+        self.assertEqual(len(sent), 2)
+        self.assertIn("PDF", str(sent[0]["caption"]))
+        self.assertIn("Word", str(sent[1]["caption"]))
+
     async def test_another_users_artifact_is_never_served(self):
         _event, submission = await self._finished_job()
         stranger = FakeCallbackEvent(999_001, b"")
@@ -2197,16 +2166,16 @@ class ResultsHubTests(BotPipelineTestCase):
             "item_id": 77,
             "unavailable": False,
         }
-        # A one-shot iterator is consumed by the `any()` check, so the later
-        # `next()` lookup finds no match. The registry write may also be absent
-        # on a pre-026 deployment. Neither may hide the real booklet download.
+        # A one-shot iterator is consumed by the later optional library lookup.
+        # The persisted artifact registry remains the authority for the PDF
+        # button; learning actions merely need the library item id.
         snapshot = iter([book])
         with mock.patch.object(
             self.bot.db, "library_list_kind",
             new=mock.AsyncMock(return_value=snapshot),
         ), mock.patch.object(
             self.bot.db, "artifact_kinds",
-            new=mock.AsyncMock(return_value=set()),
+            new=mock.AsyncMock(return_value={"booklet"}),
         ):
             callback = FakeCallbackEvent(
                 self.bot.client, data=f"res:{submission}".encode("ascii")
@@ -2215,7 +2184,7 @@ class ResultsHubTests(BotPipelineTestCase):
         _text, buttons = callback.edits[-1]
         payloads = menu_payloads(buttons)
         self.assertIn(f"art:GMS-{submission}:booklet".encode("ascii"), payloads)
-        self.assertNotIn(b"quiz:new:77", payloads)
+        self.assertIn(b"quiz:new:77", payloads)
 
 
 class ReplyKeyboardRoutingTests(BotPipelineTestCase):

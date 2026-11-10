@@ -42,6 +42,7 @@ from telethon.errors import FloodWaitError, MessageIdInvalidError, MessageNotMod
 
 from .artifacts import (
     KIND_BOOKLET,
+    KIND_DOCX,
     KIND_FLASHCARDS,
     KIND_KEYPOINTS,
     KIND_QUIZ,
@@ -1012,6 +1013,18 @@ class GamasBot(
         if item is None:
             await self._ack(event, texts.ITEM_UNAVAILABLE, alert=True)
             return
+        # New booklets are persisted byte artifacts, not automatically posted
+        # Telegram files.  Library re-download therefore sends the stored PDF
+        # directly; legacy rows continue through the forward path below.
+        submission_id = int(item.get("submission_id") or 0)
+        if item.get("kind") == "booklet" and submission_id:
+            binary_kinds = await self.db.binary_artifact_kinds(submission_id, user_id)
+            kind = KIND_BOOKLET if KIND_BOOKLET in binary_kinds else KIND_DOCX
+            if kind in binary_kinds:
+                if await self._fetch_persisted_booklet(
+                    event, user_id, submission_id, kind, f"GMS-{submission_id}"
+                ):
+                    return
         back = [[Button.inline(texts.BTN_BACK, f"lib:it:{item_id}".encode("ascii"))]]
         progress = WorkProgress.for_editor(
             lambda text: self._edit(event, text, back),
@@ -1186,10 +1199,6 @@ class GamasBot(
             return
         reference = f"GMS-{submission_id}"
         books = await self.db.library_list_kind(user_id, "booklet", limit=50)
-        has_booklet = any(
-            int(item.get("submission_id") or 0) == submission_id and not item.get("unavailable")
-            for item in books
-        )
         transcript = await self.db.transcription(submission_id)
         has_text = bool(transcript and str(transcript.get("text") or "").strip())
         has_keypoints = bool(
@@ -1207,6 +1216,19 @@ class GamasBot(
                 exc_info=True,
             )
             kinds = set()
+        has_booklet = KIND_BOOKLET in kinds
+        if not has_booklet:
+            # Pre-027 Word booklets are Telegram-hosted library rows. Keep the
+            # old file reachable, while new PDFs always come from stored bytes.
+            has_booklet = any(
+                int(item.get("submission_id") or 0) == submission_id
+                and int(item.get("chat_id") or 0)
+                and int(item.get("message_id") or 0)
+                and not item.get("unavailable")
+                for item in books
+            )
+            if has_booklet:
+                kinds.add(KIND_BOOKLET)
         if has_text:
             kinds.update({KIND_TRANSCRIPT, KIND_TXT})
         else:

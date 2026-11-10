@@ -42,8 +42,8 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         for user_id in (ADMIN, USER, OTHER_USER):
             await self.db.ensure_user(user_id)
         await self.db.sync_plans([
-            {"code": PLAN, "hours": 36, "price": 720_000, "validity_days": 30},
-            {"code": "paid_60h_30d", "hours": 60, "price": 1_200_000, "validity_days": 30},
+            {"code": PLAN, "hours": 36, "price": 780_000, "validity_days": 30},
+            {"code": "paid_60h_30d", "hours": 60, "price": 1_300_000, "validity_days": 30},
         ])
 
     async def asyncTearDown(self):
@@ -177,7 +177,7 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
     async def test_complete_photo_receipt_confirmation_and_duplicate_protection(self):
         plans = await self.press(USER, "wallet")
         self.assertIn("۱٬۲۰۰٬۰۰۰ اعتبار (۳۶ ساعت)", plans.edits[-1][0])
-        self.assertIn("۷۲۰٬۰۰۰ تومان", plans.edits[-1][0])
+        self.assertIn("۷۸۰٬۰۰۰ تومان", plans.edits[-1][0])
         await self.press(USER, f"plan:{PLAN}")
         payment_id = (await self.db.pending_payments())[0]["payment_id"]
         self.assertEqual((await self.db.payment(payment_id))["status"], "awaiting_payment")
@@ -202,7 +202,7 @@ class PaymentWorkflowTests(unittest.IsolatedAsyncioTestCase):
         caption = admin_receipts[0]["caption"]
         self.assertIn(str(USER), caption)
         self.assertIn("۱٬۲۰۰٬۰۰۰ اعتبار", caption)
-        self.assertIn("۷۲۰٬۰۰۰ تومان", caption)
+        self.assertIn("۷۸۰٬۰۰۰ تومان", caption)
         self.assertIn(to_persian_digits(payment_id), caption)
 
         # A forged user callback and an invalid verdict never change the order.
