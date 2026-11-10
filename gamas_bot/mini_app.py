@@ -44,6 +44,14 @@ DEFAULT_MAX_AUTH_AGE_SECONDS = 300
 #: library text budget so an edit can never grow past what the quiz builder reads.
 MAX_BOOKLET_CHARS = 200_000
 
+#: Longest serialized structured document the editor may save. Larger than the
+#: text budget because the JSON envelope repeats field names per block; the
+#: canonical model itself still bounds every text field.
+MAX_STRUCTURED_JSON_CHARS = 400_000
+
+#: Most sections one edited document may carry (the compile bound for chunks).
+MAX_EDIT_SECTIONS = 200
+
 #: Longest request body accepted by the WSGI app.
 MAX_REQUEST_BYTES = 1_000_000
 
@@ -191,8 +199,19 @@ class MiniAppData:
     speaker_turns: Callable[[int, int], list[dict[str, Any]]] = field(
         default=lambda _user_id, _submission_id: []
     )
-    rename_speaker: Callable[[int, int, str, str], bool] = field(
+    rename_speaker: Callable[..., bool] = field(
         default=lambda _user_id, _submission_id, _label, _name: False
+    )
+    #: Gamas 3.0 additions. Defaults keep an older deployment (or a test
+    #: double) on the legacy text-only path instead of losing the endpoints.
+    submissions: Callable[[int, int], list[dict[str, Any]]] = field(
+        default=lambda _user_id, _limit: []
+    )
+    save_structured: Callable[..., dict[str, Any] | None] = field(
+        default=lambda _user_id, _item_id, _notes: None
+    )
+    export_bytes: Callable[[int, int, str], tuple[bytes, str, str] | None] = field(
+        default=lambda _user_id, _item_id, _kind: None
     )
 
 
@@ -264,6 +283,11 @@ def revisions_payload(
     }
 
 
+def submissions_payload(data: MiniAppData, user_id: int, limit: int = 30) -> dict:
+    """The Studio overview: the caller's submissions and what each offers."""
+    return {"items": data.submissions(user_id, max(1, min(100, limit)))}
+
+
 def speakers_payload(data: MiniAppData, user_id: int, submission_id: int) -> dict:
     """Anonymous speaker turns of one submission (no identity is inferred)."""
     if submission_id <= 0:
@@ -272,9 +296,31 @@ def speakers_payload(data: MiniAppData, user_id: int, submission_id: int) -> dic
     labels = sorted(
         {str(turn["speaker_label"]) for turn in turns if turn.get("speaker_label")}
     )
+    speakers: list[dict[str, Any]] = []
+    for label in labels:
+        own = [turn for turn in turns if str(turn.get("speaker_label")) == label]
+        starts = [
+            float(turn["start"]) for turn in own if turn.get("start") is not None
+        ]
+        ends = [float(turn["end"]) for turn in own if turn.get("end") is not None]
+        speakers.append(
+            {
+                "label": label,
+                "speaker_id": str(own[0].get("speaker_id") or f"speaker_{label}"),
+                "default_name": str(
+                    own[0].get("default_name") or own[0].get("display_name") or label
+                ),
+                "custom_name": own[0].get("custom_name") or None,
+                "role": str(own[0].get("role") or ""),
+                "segments": len(own),
+                "first_start": min(starts) if starts else None,
+                "last_end": max(ends) if ends else None,
+            }
+        )
     return {
         "submission_id": submission_id,
         "labels": labels,
+        "speakers": speakers,
         "turns": turns,
         "unknown_attribution": any(not turn.get("speaker_label") for turn in turns),
     }
@@ -286,16 +332,33 @@ def rename_speaker_payload(
     submission_id: int,
     label: str,
     name: str,
+    role: object = None,
 ) -> dict:
-    """Persist a user-chosen name for one anonymous label."""
+    """Persist a user-chosen name (and optional role) for one anonymous label."""
     if submission_id <= 0 or not label or not name:
         raise AppError(400, "submission id, label and name are required")
     clean_name = " ".join(str(name).split())[:64]
     if not clean_name:
         raise AppError(400, "name is empty")
-    if not data.rename_speaker(user_id, submission_id, str(label), clean_name):
+    clean_role: str | None = None
+    if role is not None and not isinstance(role, str):
+        raise AppError(400, "role must be text")
+    if isinstance(role, str):
+        clean_role = " ".join(role.split())[:64]
+    # The four-argument call is kept for callers (and older test doubles) that
+    # predate the optional role; only an explicit role reaches the new path.
+    if clean_role is None:
+        renamed = data.rename_speaker(user_id, submission_id, str(label), clean_name)
+    else:
+        renamed = data.rename_speaker(
+            user_id, submission_id, str(label), clean_name, role=clean_role
+        )
+    if not renamed:
         raise AppError(404, "speaker not found")
-    return {"ok": True, "label": str(label), "name": clean_name}
+    result: dict[str, Any] = {"ok": True, "label": str(label), "name": clean_name}
+    if clean_role is not None:
+        result["role"] = clean_role
+    return result
 
 
 def restore_revision_payload(
@@ -316,12 +379,91 @@ def booklet_payload(data: MiniAppData, user_id: int, item_id: int) -> dict:
     record = data.booklet(user_id, item_id)
     if record is None:
         raise AppError(404, "booklet not found")
+    structured: dict[str, Any] | None = None
+    raw = record.get("structured_json")
+    if raw:
+        try:
+            parsed = json.loads(str(raw))
+        except (TypeError, ValueError):
+            parsed = None
+        if isinstance(parsed, dict):
+            structured = parsed
     return {
         "id": int(item_id),
         "title": str(record.get("title") or ""),
         "text": str(record.get("content_text") or ""),
+        "structured": structured,
         "editable": bool(record.get("editable", True)),
         "max_chars": MAX_BOOKLET_CHARS,
+        "submission_id": record.get("submission_id"),
+        "available": list(record.get("available") or []),
+    }
+
+
+def _sanitize_document_strings(value: object) -> object:
+    """Strip characters that are invalid in XML/PDF text from every string.
+
+    The renderers escape markup, but a raw control character (``\\x00`` …)
+    would produce a Word file Office refuses to open. Everything outside
+    tab/newline/carriage-return/form-feed below 0x20, plus DEL, is removed
+    recursively; the structure is left untouched for validation.
+    """
+    if isinstance(value, str):
+        return "".join(
+            ch for ch in value if ch >= " " or ch in "\t\n\r\f"
+        ).replace("\x7f", "")
+    if isinstance(value, dict):
+        return {str(key): _sanitize_document_strings(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_sanitize_document_strings(item) for item in value]
+    return value
+
+
+def save_structured_booklet_payload(
+    data: MiniAppData, user_id: int, item_id: int, body: Mapping[str, Any]
+) -> dict:
+    """Validate and persist a structured booklet edit, then re-render files.
+
+    The canonical model — the same one the pipeline renders — validates the
+    payload: block types, required fields, table shapes and per-field size
+    bounds are enforced by :meth:`StructuredNotes.from_payload` before anything
+    is written. Ownership is resolved from the signed user id inside the store,
+    never from the payload.
+    """
+    from .notes import StructuredNotes, StructuringError
+
+    document = body.get("document")
+    if not isinstance(document, dict):
+        raise AppError(400, "document is required")
+    sanitized = _sanitize_document_strings(document)
+    if not isinstance(sanitized, dict):  # pragma: no cover - dict in, dict out
+        raise AppError(400, "document is required")
+    try:
+        notes = StructuredNotes.from_payload(sanitized)
+    except StructuringError as exc:
+        raise AppError(400, str(exc) or "ساختار جزوهٔ ارسالی معتبر نیست.") from None
+    if len(notes.sections) > MAX_EDIT_SECTIONS:
+        raise AppError(400, "تعداد بخش‌های جزوه بیش از حد مجاز است.")
+    serialized = notes.to_json()
+    if len(serialized) > MAX_STRUCTURED_JSON_CHARS:
+        raise AppError(413, "ساختار جزوه بیش از حد بزرگ است.")
+    result = data.save_structured(user_id, item_id, notes)
+    if result is None:
+        raise AppError(404, "booklet not found")
+    if not result.get("ok"):
+        reason = str(result.get("reason") or "")
+        if reason == "migration":
+            raise AppError(
+                503, "ویرایش ساختاری تا اعمال مهاجرت ۰۲۸ توسط بات فعال نیست."
+            )
+        if reason == "too_large":
+            raise AppError(413, "ساختار جزوه بیش از حد بزرگ است.")
+        raise AppError(400, "ذخیرهٔ جزوه ممکن نشد.")
+    return {
+        "ok": True,
+        "revision_id": int(result.get("revision_id") or 0),
+        "rendered": list(result.get("rendered") or []),
+        "chars": len(notes.to_markdown()),
     }
 
 
@@ -377,10 +519,11 @@ def _json_response(
 def booklet_docx_bytes(data: MiniAppData, user_id: int, item_id: int) -> bytes:
     """Render the *current* booklet text to a professional RTL Word file.
 
-    This is a fresh export of the edited text, never the original Telegram
-    attachment: after an edit in the Studio the DOCX must match what the user
-    sees. The renderer is the same ``build_plain_docx`` the bot uses, so fonts,
-    RTL direction, cover and page frame are identical. Bounded by
+    This is the legacy path for booklets that have no structured model (created
+    before structured editing, or authored as plain text): the export is a fresh
+    render of the edited text, never the original Telegram attachment. The
+    renderer is the same ``build_plain_docx`` the bot uses, so fonts, RTL
+    direction, cover and page frame are identical. Bounded by
     ``MAX_BOOKLET_CHARS`` and by the WSGI worker's own request budget.
     """
     from datetime import datetime, timezone
@@ -405,14 +548,51 @@ def booklet_docx_bytes(data: MiniAppData, user_id: int, item_id: int) -> bytes:
         raise AppError(500, "export failed") from exc
 
 
+def booklet_export_payload(
+    data: MiniAppData, user_id: int, item_id: int, fmt: str
+) -> tuple[bytes, str, str]:
+    """The booklet's current PDF or DOCX: ``(body, filename, content_type)``.
+
+    Order of preference, per the delivery contract:
+
+    1. the facade's persisted artifact — the exact bytes the latest save (or
+       the pipeline) rendered, served without re-rendering so repeated
+       downloads are free and idempotent;
+    2. for a booklet without a structured model, the legacy plain-text DOCX
+       render (there is no PDF without structure to render);
+    3. anything else is a 404, never a silently different document.
+    """
+    if fmt not in {"pdf", "docx"}:
+        raise AppError(400, "format must be pdf or docx")
+    stored = data.export_bytes(user_id, item_id, fmt)
+    if stored is not None:
+        return stored
+    record = data.booklet(user_id, item_id)
+    if record is None:
+        raise AppError(404, "booklet not found")
+    if fmt == "docx":
+        body = booklet_docx_bytes(data, user_id, item_id)
+        return (
+            body,
+            f"gamas-booklet-{int(item_id)}.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    raise AppError(
+        404, "این جزوه نسخهٔ ساختارمند ندارد؛ خروجی PDF برای آن موجود نیست."
+    )
+
+
 def _binary_response(
-    start_response: Callable[..., Any], body: bytes, filename: str
+    start_response: Callable[..., Any],
+    body: bytes,
+    filename: str,
+    content_type: str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
 ) -> list[bytes]:
-    """Stream one DOCX with no caching: it may contain the user's own text."""
+    """Stream one exported file with no caching: it holds the user's own text."""
     start_response(
         "200 OK",
         [
-            ("Content-Type", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            ("Content-Type", content_type),
             ("Content-Length", str(len(body))),
             ("Content-Disposition", f'attachment; filename="{filename}"'),
             ("Cache-Control", "no-store"),
@@ -512,6 +692,18 @@ def create_app(
                 return _json_response(
                     start_response, 200, booklets_payload(_resolve_data(), user.user_id)
                 )
+            if path == "/api/submissions":
+                if method != "POST":
+                    raise AppError(405, "method not allowed")
+                body = _json_body_cached(environ)
+                user = _authenticate_with(body, _resolve_token(), max_age_seconds, clock)
+                return _json_response(
+                    start_response,
+                    200,
+                    submissions_payload(
+                        _resolve_data(), user.user_id, _int_field(body, "limit", 30)
+                    ),
+                )
             if path == "/api/booklet":
                 if method not in {"POST", "PUT"}:
                     raise AppError(405, "method not allowed")
@@ -521,6 +713,14 @@ def create_app(
                 if item_id <= 0:
                     raise AppError(400, "id is required")
                 if method == "PUT":
+                    if isinstance(body.get("document"), dict):
+                        return _json_response(
+                            start_response,
+                            200,
+                            save_structured_booklet_payload(
+                                _resolve_data(), user.user_id, item_id, body
+                            ),
+                        )
                     return _json_response(
                         start_response,
                         200,
@@ -531,9 +731,9 @@ def create_app(
                 )
             if path == "/api/booklet/export":
                 # POST carries the signed initData in a JSON body; the response
-                # is a DOCX, not JSON. A browser cannot attach Telegram's
-                # signature to a plain link, so the frontend fetches and saves
-                # the blob itself.
+                # is a binary file, not JSON. A browser cannot attach
+                # Telegram's signature to a plain link, so the frontend fetches
+                # and saves the blob itself.
                 if method != "POST":
                     raise AppError(405, "method not allowed")
                 body = _json_body_cached(environ)
@@ -541,9 +741,12 @@ def create_app(
                 item_id = _int_field(body, "id", 0)
                 if item_id <= 0:
                     raise AppError(400, "id is required")
-                document = booklet_docx_bytes(_resolve_data(), user.user_id, item_id)
+                fmt = str(body.get("format") or "docx").strip().lower()
+                document, filename, content_type = booklet_export_payload(
+                    _resolve_data(), user.user_id, item_id, fmt
+                )
                 return _binary_response(
-                    start_response, document, f"gamas-booklet-{item_id}.docx"
+                    start_response, document, filename, content_type
                 )
             if path == "/api/revisions":
                 if method != "POST":
@@ -588,6 +791,7 @@ def create_app(
                             _resolve_data(), user.user_id, submission_id,
                             str(body.get("label") or ""),
                             str(body.get("name") or ""),
+                            body.get("role"),
                         ),
                     )
                 return _json_response(
@@ -713,9 +917,12 @@ def default_now() -> float:
 __all__ = [
     "AppError",
     "MAX_BOOKLET_CHARS",
+    "MAX_EDIT_SECTIONS",
+    "MAX_STRUCTURED_JSON_CHARS",
     "MiniAppData",
     "MiniAppUser",
     "booklet_docx_bytes",
+    "booklet_export_payload",
     "booklet_payload",
     "booklets_payload",
     "create_app",
@@ -724,8 +931,10 @@ __all__ = [
     "rename_speaker_payload",
     "resolve_leaderboard_window",
     "restore_revision_payload",
+    "save_booklet_payload",
+    "save_structured_booklet_payload",
     "speakers_payload",
     "revisions_payload",
-    "save_booklet_payload",
+    "submissions_payload",
     "verify_init_data",
 ]

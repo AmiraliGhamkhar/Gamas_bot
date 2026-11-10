@@ -186,3 +186,32 @@ Known, deliberate limitations:
 | New tests | `tests/test_gamas2.py` (plus targeted updates in 6 existing test modules) |
 | Mini App frontend | `mini_app/index.html`, `app.js`, `app.css` |
 | Mini App backend | `gamas_bot/mini_app.py`, `mini_app_store.py`, `scripts/mini_app_wsgi.py` |
+
+---
+
+## Addendum — Gamas Studio 3.0 (same repository, follow-up change set, 2026-11-10)
+
+This report documents the 2.0 release as shipped on its branch. A follow-up
+change set (branch `arena/60695bec-gamas-bot`) extended the Studio without
+altering anything claimed above:
+
+* **Structured booklet editing** on the canonical `StructuredNotes` model
+  (add/delete/reorder sections, subsections and blocks; table cell/row/column
+  editing), validated server-side by the model itself. Every save appends a
+  revision and re-renders **both** the PDF and the DOCX; the rendered bytes
+  are stored per revision and served to Studio and Telegram without
+  re-rendering. The plain-text editor remains only as the legacy fallback.
+* **Speaker management UI**: per-submission speakers with stable labels,
+  segments and counts; owner-provided display names and optional roles
+  (migration 028, additive). No identity is ever inferred from voice.
+* **PDF/DOCX visual QA suite** (`tests/test_pdf_visual_qa.py`), which found and
+  fixed three real renderer defects: missing-glyph step connectors (↓) and
+  callout icons (⚠🔔💡) not present in Vazirmatn, and the cover topic-map
+  number badge drawn over the topic text.
+* New tests `tests/test_studio_structured.py` (35) and the extended
+  `tests/test_mini_app.py` (57); full suite on that branch:
+  **1753 passed, 279 subtests**.
+
+The 2.0 invariants above are unchanged: the ledger, tariff, migration history
+(001–027 untouched), delivery contract and `initData` authentication all hold;
+migration 028 is additive in the same style as 026/027.

@@ -193,6 +193,227 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(len(payload["items"]), 1)
 
 
+class StructuredPayloadTests(unittest.TestCase):
+    """The Gamas 3.0 structured endpoints against in-memory doubles."""
+
+    def setUp(self):
+        from gamas_bot.notes import (
+            NoteSection,
+            StructuredNotes,
+        )
+
+        self.notes = StructuredNotes(
+            title="جزوهٔ ساختارمند",
+            summary="خلاصه",
+            sections=(NoteSection(heading="بخش", paragraphs=("متن",)),),
+        )
+        self.saved: list[tuple] = []
+        self.exports: list[tuple] = []
+
+        def save_structured(user_id, item_id, notes):
+            if item_id != 1:
+                return None
+            self.saved.append((user_id, item_id, notes))
+            return {"ok": True, "revision_id": 7, "rendered": ["booklet", "docx"]}
+
+        def export_bytes(user_id, item_id, kind):
+            self.exports.append((user_id, item_id, kind))
+            if item_id != 1 or kind not in {"pdf", "booklet", "docx"}:
+                return None
+            return (b"BYTES", "file.bin", "application/octet-stream")
+
+        self.data = MiniAppData(
+            leaderboard=lambda limit: [],
+            rank=lambda _user_id: {"rank": 0, "points": 0},
+            booklets=lambda _user_id, limit: [],
+            booklet=lambda _user_id, item_id: (
+                {
+                    "id": item_id,
+                    "title": "جزوهٔ یک",
+                    "content_text": "متن",
+                    "structured_json": self.notes.to_json(),
+                    "editable": True,
+                    "submission_id": 5,
+                    "available": ["booklet"],
+                }
+                if item_id == 1
+                else None
+            ),
+            save_booklet=lambda *_args: True,
+            submissions=lambda _user_id, limit: [
+                {"id": 5, "title": "گفتار", "status": "done", "has_pdf": True}
+            ],
+            save_structured=save_structured,
+            export_bytes=export_bytes,
+        )
+
+    def test_the_booklet_payload_exposes_the_structured_model(self):
+        from gamas_bot.mini_app import booklet_payload
+
+        payload = booklet_payload(self.data, 42, 1)
+        self.assertEqual(payload["structured"]["title"], "جزوهٔ ساختارمند")
+        self.assertEqual(payload["submission_id"], 5)
+        self.assertEqual(payload["available"], ["booklet"])
+
+    def test_a_structured_save_validates_before_the_store(self):
+        from gamas_bot.mini_app import save_structured_booklet_payload
+
+        payload = save_structured_booklet_payload(
+            self.data, 42, 1, {"document": self.notes.to_payload()}
+        )
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["revision_id"], 7)
+        self.assertEqual(self.saved[0][0], 42)
+        self.assertEqual(self.saved[0][1], 1)
+
+    def test_an_invalid_document_never_reaches_the_store(self):
+        from gamas_bot.mini_app import save_structured_booklet_payload
+
+        for bad in ({"document": None}, {"document": "text"}, {}, {"document": {"x": 1}}):
+            with self.assertRaises(AppError) as caught:
+                save_structured_booklet_payload(self.data, 42, 1, bad)
+            self.assertEqual(caught.exception.status, 400, bad)
+        self.assertEqual(self.saved, [])
+
+    def test_a_missing_booklet_is_reported_by_the_payload(self):
+        from gamas_bot.mini_app import save_structured_booklet_payload
+
+        with self.assertRaises(AppError) as caught:
+            save_structured_booklet_payload(
+                self.data, 42, 999, {"document": self.notes.to_payload()}
+            )
+        self.assertEqual(caught.exception.status, 404)
+
+    def test_a_migration_gap_is_a_503_not_a_500(self):
+        from gamas_bot.mini_app import save_structured_booklet_payload
+
+        self.data.save_structured = lambda *_args: {"ok": False, "reason": "migration"}
+        with self.assertRaises(AppError) as caught:
+            save_structured_booklet_payload(
+                self.data, 42, 1, {"document": self.notes.to_payload()}
+            )
+        self.assertEqual(caught.exception.status, 503)
+
+    def test_exports_serve_the_stored_bytes_first(self):
+        from gamas_bot.mini_app import booklet_export_payload
+
+        body, filename, content_type = booklet_export_payload(self.data, 42, 1, "pdf")
+        self.assertEqual(body, b"BYTES")
+        self.assertEqual(filename, "file.bin")
+        self.assertEqual(self.exports, [(42, 1, "pdf")])
+
+    def test_an_unknown_export_format_is_refused(self):
+        from gamas_bot.mini_app import booklet_export_payload
+
+        with self.assertRaises(AppError) as caught:
+            booklet_export_payload(self.data, 42, 1, "rtf")
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_submissions_come_from_the_store(self):
+        from gamas_bot.mini_app import submissions_payload
+
+        payload = submissions_payload(self.data, 42)
+        self.assertEqual(payload["items"][0]["id"], 5)
+
+    def test_speakers_are_grouped_with_defaults_names_and_roles(self):
+        from gamas_bot.mini_app import speakers_payload
+
+        self.data.speaker_turns = lambda _user_id, _submission_id: [
+            {
+                "speaker_id": "speaker_0",
+                "speaker_label": "0",
+                "display_name": "استاد",
+                "default_name": "گویندهٔ ۱",
+                "custom_name": "استاد",
+                "role": "مدرس",
+                "start": 0.0,
+                "end": 10.0,
+                "text": "سلام",
+                "overlaps": False,
+            },
+            {
+                "speaker_id": "speaker_1",
+                "speaker_label": "1",
+                "display_name": "گویندهٔ ۲",
+                "default_name": "گویندهٔ ۲",
+                "custom_name": None,
+                "role": "",
+                "start": 12.0,
+                "end": 20.0,
+                "text": "ممنون",
+                "overlaps": False,
+            },
+            {
+                "speaker_id": "speaker_unknown",
+                "speaker_label": None,
+                "display_name": None,
+                "default_name": None,
+                "custom_name": None,
+                "role": "",
+                "start": 21.0,
+                "end": 22.0,
+                "text": "ناشناس",
+                "overlaps": True,
+            },
+        ]
+        payload = speakers_payload(self.data, 42, 5)
+        self.assertEqual(len(payload["speakers"]), 2)
+        first = payload["speakers"][0]
+        self.assertEqual(first["default_name"], "گویندهٔ ۱")
+        self.assertEqual(first["custom_name"], "استاد")
+        self.assertEqual(first["role"], "مدرس")
+        self.assertEqual(first["segments"], 1)
+        self.assertEqual(first["first_start"], 0.0)
+        self.assertEqual(first["last_end"], 10.0)
+        self.assertTrue(payload["unknown_attribution"])
+        self.assertEqual(payload["labels"], ["0", "1"])
+
+    def test_a_rename_with_a_role_reaches_the_store(self):
+        from gamas_bot.mini_app import rename_speaker_payload
+
+        calls: list[tuple] = []
+
+        def rename(user_id, submission_id, label, name, role=None):
+            calls.append((user_id, submission_id, label, name, role))
+            return True
+
+        self.data.rename_speaker = rename
+        payload = rename_speaker_payload(self.data, 42, 5, "0", "استاد", "مدرس")
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["role"], "مدرس")
+        self.assertEqual(calls, [(42, 5, "0", "استاد", "مدرس")])
+
+    def test_a_rename_without_a_role_uses_the_legacy_signature(self):
+        from gamas_bot.mini_app import rename_speaker_payload
+
+        calls: list[tuple] = []
+
+        def rename(user_id, submission_id, label, name):
+            calls.append((user_id, submission_id, label, name))
+            return True
+
+        self.data.rename_speaker = rename
+        payload = rename_speaker_payload(self.data, 42, 5, "0", "استاد", None)
+        self.assertTrue(payload["ok"])
+        self.assertNotIn("role", payload)
+        self.assertEqual(calls, [(42, 5, "0", "استاد")])
+
+    def test_a_non_text_role_is_refused(self):
+        from gamas_bot.mini_app import rename_speaker_payload
+
+        with self.assertRaises(AppError) as caught:
+            rename_speaker_payload(self.data, 42, 5, "0", "استاد", 12)
+        self.assertEqual(caught.exception.status, 400)
+
+    def test_an_unknown_speaker_rename_is_a_404(self):
+        from gamas_bot.mini_app import rename_speaker_payload
+
+        self.data.rename_speaker = lambda *_args, **_kwargs: False
+        with self.assertRaises(AppError) as caught:
+            rename_speaker_payload(self.data, 42, 5, "0", "استاد")
+        self.assertEqual(caught.exception.status, 404)
+
+
 class WsgiTests(unittest.TestCase):
     def setUp(self):
         self.fake = FakeData()

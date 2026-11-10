@@ -18,7 +18,7 @@
   <nav class="tabs" role="tablist">
     <button class="tab is-active" data-view="home" role="tab" aria-selected="true">🏠 خانه</button>
     <button class="tab" data-view="leaderboard" role="tab" aria-selected="false">🏆 رنکینگ</button>
-    <button class="tab" data-view="studio" role="tab" aria-selected="false">📖 استودیو جزوه</button>
+    <button class="tab" data-view="studio" role="tab" aria-selected="false">📚 استودیو</button>
   </nav>
 
   <section id="view-home" class="view is-active" aria-labelledby="home-title">
@@ -39,7 +39,7 @@
       <p class="hint">جزوه، متن خام، نکات کلیدی، آزمون و فلش‌کارت هر گفتار، پس از اتمام پردازش در پیام پایانی بات به صورت دکمه‌های جداگانه در دسترس است.</p>
       <div class="action-row">
         <button id="home-go-leaderboard" class="secondary">🏆 دیدن رنکینگ</button>
-        <button id="home-go-studio" class="secondary">📖 باز کردن استودیو</button>
+        <button id="home-go-studio" class="secondary">📚 باز کردن استودیو</button>
       </div>
     </div>
   </section>
@@ -61,26 +61,47 @@
   </section>
 
   <section id="view-studio" class="view" aria-labelledby="studio-title" hidden>
-    <h2 id="studio-title" class="sr-only">استودیو جزوه</h2>
-    <ul id="booklet-list" class="booklet-list"></ul>
-    <p id="booklets-empty" class="empty" hidden>هنوز جزوه‌ای نساخته‌اید.</p>
+    <h2 id="studio-title" class="sr-only">استودیو</h2>
+    <p class="hint">هر گفتار شما یک کارت است: وضعیت، گوینده‌ها، ویرایش ساختاری جزوه و خروجی‌ها.</p>
+    <ul id="submission-list" class="submission-list"></ul>
+    <p id="submissions-empty" class="empty" hidden>هنوز گفتاری ثبت نشده است. اولین فایل صوتی یا ویدیویی خود را برای بات بفرستید.</p>
   </section>
 
-  <section id="view-editor" class="view" hidden aria-labelledby="editor-title">
-    <button class="back" id="editor-back">↩️ بازگشت به فهرست</button>
-    <h2 id="editor-title">ویرایش جزوه</h2>
-    <label class="field">
-      <span>متن جزوه</span>
-      <textarea id="editor-text" spellcheck="false" dir="auto"></textarea>
-    </label>
-    <div class="editor-bar">
-      <span id="editor-count" class="hint">۰</span>
-      <button id="editor-save" class="primary">ذخیره</button>
-      <button id="editor-export" class="secondary">📄 خروجی Word</button>
+  <section id="view-speakers" class="view" aria-labelledby="speakers-title" hidden>
+    <button class="back" id="speakers-back">↩️ بازگشت به فهرست</button>
+    <h2 id="speakers-title">مدیریت گوینده‌ها</h2>
+    <p class="hint">نام‌ها و نقش‌ها را خودتان وارد کنید؛ گاماس هویت هیچ‌کس را از صدا حدس نمی‌زند. تغییر نام، زمان‌بندی و مالکیت گفتارها را دستکاری نمی‌کند.</p>
+    <div id="speakers-summary" class="card" hidden></div>
+    <ul id="speaker-list" class="speaker-list"></ul>
+    <p id="speakers-empty" class="empty" hidden>برای این گفتار گوینده‌ای تشخیص داده نشد.</p>
+    <div class="editor-bar sticky">
+      <span id="speakers-dirty" class="badge warn" hidden>تغییرات ذخیره‌نشده</span>
+      <button id="speakers-save" class="primary">ذخیرهٔ نام‌ها</button>
     </div>
-    <p class="hint">این متن منبع آزمون و فلش‌کارت‌های بعدی شماست. خروجی Word تازه از همین متن ساخته می‌شود.</p>
+    <details id="turns-box" class="card turns" open>
+      <summary>متن گفتار به تفکیک گوینده</summary>
+      <div id="turns-view" class="turns-view"></div>
+    </details>
+  </section>
+
+  <section id="view-editor" class="view" aria-labelledby="editor-heading" hidden>
+    <button class="back" id="editor-back">↩️ بازگشت به فهرست</button>
+    <div class="editor-head">
+      <h2 id="editor-heading">ویرایش جزوه</h2>
+      <span id="editor-dirty" class="badge warn" hidden>ذخیره نشده</span>
+    </div>
+    <div class="editor-bar sticky">
+      <button id="editor-preview" class="secondary" aria-pressed="false">👁 پیش‌نمایش</button>
+      <button id="editor-export-pdf" class="secondary">📘 PDF</button>
+      <button id="editor-export-docx" class="secondary">📄 Word</button>
+      <span class="spacer"></span>
+      <button id="editor-save" class="primary">ذخیرهٔ نسخهٔ جدید</button>
+    </div>
+    <div id="editor-status" class="hint" hidden></div>
+    <div id="editor-body"></div>
     <div class="revisions">
-      <h3>نسخه‌های پیشین</h3>
+      <h3>تاریخچهٔ نسخه‌ها</h3>
+      <p class="hint">هر ذخیره یک نسخهٔ جدید می‌سازد؛ نسخه‌های قبلی حذف نمی‌شوند و می‌توانید آن‌ها را بازگردانی کنید.</p>
       <ul id="revision-list" class="revision-list"></ul>
       <p id="revisions-empty" class="empty" hidden>نسخهٔ پیشینی ثبت نشده است.</p>
     </div>

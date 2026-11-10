@@ -48,13 +48,14 @@ def _settings():
 
 
 def _data():
-    """Resolve the full Gamas 2.0 data facade per request.
+    """Resolve the full Gamas 3.0 data facade per request.
 
     ``MiniAppStore`` duck-types the original four-call surface, but the Studio
-    also needs Home, weekly/monthly boards, revision history, DOCX export and
-    speaker names. Building the facade explicitly keeps every call bound to the
-    one connection-per-request store and makes a missing method an import-time
-    error rather than a 500 in production.
+    also needs Home, weekly/monthly boards, revision history, exports, speaker
+    names, the submissions overview and the structured editor. Building the
+    facade explicitly keeps every call bound to the one connection-per-request
+    store and makes a missing method an import-time error rather than a 500 in
+    production.
     """
     store = MiniAppStore(_settings().db_path)
     return MiniAppData(
@@ -70,6 +71,9 @@ def _data():
         restore_revision=store.restore_revision,
         speaker_turns=store.speaker_turns,
         rename_speaker=store.rename_speaker,
+        submissions=store.submissions,
+        save_structured=store.save_structured,
+        export_bytes=store.export_bytes,
     )
 
 

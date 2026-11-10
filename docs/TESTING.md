@@ -69,7 +69,53 @@ money and are separate from offline tests.
 8. Check orderly shutdown, restart recovery and logs. Test [OCR](OCR.md) only if enabled.
 
 Automated tests do not prove provider availability, Persian visual layout or host
-capacity. Review those manually before production.
+capacity. Review those manually before production. For the generated booklet
+documents, `tests/test_pdf_visual_qa.py` narrows the visual gap automatically:
+see “Gamas 3.0 verification” below.
+
+
+---
+
+## Gamas 3.0 verification (Studio structured editing)
+
+```bash
+python -m pytest -q tests/test_studio_structured.py   # store + WSGI + bot-side DB
+python -m pytest -q tests/test_mini_app.py            # HTTP layer incl. new payloads
+python -m pytest -q tests/test_pdf_visual_qa.py       # rendered PDF/DOCX visual QA
+python -m pytest -q                                   # full suite
+python -m ruff check . && python -m mypy
+```
+
+Counts from the full-suite run in this working session
+(2026-11-10, Python 3.11): **1753 passed, 279 subtests, 152.62 s** — including
+`tests/test_studio_structured.py` (35 tests: store round-trips over a fully
+migrated database, malformed/oversized payloads, exports, speakers with roles,
+bot-side persistence), the extended `tests/test_mini_app.py` (57 tests: payload
+builders, validation, 404/400/413/503 paths, cross-user isolation) and
+`tests/test_pdf_visual_qa.py` (9 tests / 35 subtests).
+
+### Visual QA of generated documents
+
+`tests/test_pdf_visual_qa.py` renders the curated note-quality fixtures
+(`tests/fixtures/notes/references/`) plus a synthetic stress document and
+checks what a student actually sees:
+
+* **structural (pypdf, always on)** — page count and A4 geometry, non-empty
+  content streams, embedded subset Vazirmatn TrueType fonts, expected headings
+  in extracted text (NFKC-normalized: the renderer pre-shapes Persian into
+  presentation forms), no replacement glyphs, no missing-glyph NULs, vector
+  step-connector arrows present;
+* **rasterized (PyMuPDF, dev-only)** — every page rasterized with a minimum ink
+  ratio (no blank pages), text inside the side margins and the decorative
+  border frame with the running header/footer accounted for, and no two text
+  spans colliding (ink-tight boxes, so Vazirmatn's tall line metrics do not
+  false-positive on normal leading);
+* **DOCX** — valid OOXML package, `<w:bidi>`/`<w:rtl>` flags, Vazirmatn theme
+  font, headings present in concatenated run text, glossary table, and the
+  edited title winning over a stale one.
+
+The rasterized checks skip cleanly when `pymupdf` is not installed; it is a
+dev-only tool and not added to the runtime requirements.
 
 
 ---

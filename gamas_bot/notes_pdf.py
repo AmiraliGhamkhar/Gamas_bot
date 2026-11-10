@@ -343,6 +343,40 @@ class _CircleBadge(Flowable):
         c.drawCentredString(r, r - 3.5, _visual_line(label))
 
 
+class _ArrowDown(Flowable):
+    """The connector between step cards, drawn as a vector.
+
+    Vazirmatn has no U+2193 (↓) glyph, so a text arrow rendered as an empty
+    .notdef box — the gap visual QA caught between step cards. Canvas
+    primitives need no font coverage and stay crisp at every size.
+    """
+
+    def __init__(self, height: float = 12, color: colors.Color = STEP_BORDER):
+        super().__init__()
+        self.height = height
+        self.color = color
+        self._cx = 0.0
+
+    def wrap(self, availW, availH):
+        self._cx = availW / 2.0
+        return availW, self.height
+
+    def draw(self):
+        c = self.canv
+        c.setStrokeColor(self.color)
+        c.setFillColor(self.color)
+        c.setLineWidth(1.4)
+        c.setLineCap(1)
+        top = self.height - 1.0
+        c.line(self._cx, top, self._cx, 5.0)
+        head = c.beginPath()
+        head.moveTo(self._cx - 3.4, 6.4)
+        head.lineTo(self._cx + 3.4, 6.4)
+        head.lineTo(self._cx, 1.4)
+        head.close()
+        c.drawPath(head, fill=1, stroke=0)
+
+
 class _TopicMap(Flowable):
     """The cover topic map: central vertical connector + alternating cards."""
 
@@ -394,16 +428,10 @@ class _TopicMap(Flowable):
                 dot_x = cx
                 conn_end_x = center_x + 6
             cy = row_y
-            # Draw connecting line from card to central axis
+            # Draw connecting line from card edge to central axis
             c.setStrokeColor(STEEL)
             c.setLineWidth(0.8)
             c.line(dot_x, cy + self.card_h / 2, conn_end_x, cy + self.card_h / 2)
-
-            # Connection dot on card
-            c.setFillColor(color)
-            c.setStrokeColor(NAVY)
-            c.setLineWidth(0.6)
-            c.circle(dot_x, cy + self.card_h / 2, 3.5, fill=1, stroke=1)
 
             # Card background (rounded rectangle)
             c.setFillColor(color)
@@ -411,38 +439,33 @@ class _TopicMap(Flowable):
             c.setLineWidth(0.7)
             c.roundRect(cx, cy, self.card_w, self.card_h, 4 * mm, fill=1, stroke=1)
 
-            # Number badge (circle in top-left of card for RTL, i.e. left side visually)
-            badge_r = 7 * mm / 2
-            if is_left:
-                badge_cx = cx + self.card_w - 5 * mm - badge_r
-            else:
-                badge_cx = cx + 5 * mm + badge_r
-            badge_cy = cy + self.card_h - 5 * mm - badge_r
+            # Number badge on the connector node at the card edge. It used to
+            # sit inside the card corner, right where the right-aligned RTL
+            # text begins — visual QA caught the circle printed over the first
+            # word. On the edge (replacing the old connection dot) it can
+            # never collide with the text.
+            badge_r = 3 * mm
+            badge_cx = dot_x
+            badge_cy = cy + self.card_h / 2
             c.setFillColor(NAVY)
-            c.setStrokeColor(NAVY)
-            c.circle(badge_cx, badge_cy, badge_r, fill=1, stroke=0)
+            c.setStrokeColor(colors.white)
+            c.setLineWidth(1.2)
+            c.circle(badge_cx, badge_cy, badge_r, fill=1, stroke=1)
             # Number text
             c.setFillColor(colors.white)
             c.setFont(_BOLD_NAME, 9)
             nlabel = to_persian_digits(str(idx + 1))
             c.drawCentredString(badge_cx, badge_cy - 3, _visual_line(nlabel))
 
-            # Topic text (wrapped)
-            label_w = self.card_w - 14 * mm
-            # Actually place text with proper RTL awareness: we draw it at
-            # the right side (left side visually) for Persian.
-            # For left cards (visually right), text is near right side;
-            # for right cards (visually left), text is near the left (RTL means
-            # text starts at right).
+            # Topic text (wrapped), right-aligned like any RTL line, with
+            # margins that clear the edge badge.
+            label_w = self.card_w - 10 * mm
             # Since we are drawing at canvas level, do our own wrap & draw.
             lines = _wrap_words(topic, _REGULAR_NAME, 10, label_w)
             text_y = cy + self.card_h / 2 + (len(lines) - 1) * 6
             c.setFillColor(NAVY)
             c.setFont(_BOLD_NAME, 10)
             for line in lines[:2]:
-                # For left cards (visually right side), align right;
-                # For right cards (visually left side), align right too (RTL).
-                # Compute width to right-align at card's right margin.
                 lw = pdfmetrics.stringWidth(line, _BOLD_NAME, 10)
                 tx = cx + self.card_w - 5 * mm - lw
                 c.drawString(tx, text_y, _visual_line(line))
@@ -556,12 +579,7 @@ def _steps_flowables(steps: list[str], styles, width: float) -> list[Flowable]:
     for idx, step in enumerate(steps, start=1):
         badge = _CircleBadge(idx, size=22)
         text_p = _rtl_paragraph(step, styles["step_body"], width - 36)
-        arrow_p = None
-        if idx < len(steps):
-            arrow_p = Paragraph(_xml_escape(_visual_line("↓")), ParagraphStyle(
-                "arr", fontName=_BOLD_NAME, fontSize=10, textColor=STEP_BORDER,
-                alignment=TA_CENTER,
-            ))
+        arrow_p = _ArrowDown() if idx < len(steps) else None
         row = Table([[text_p, badge]], colWidths=[width - 28, 26])
         row.setStyle(TableStyle([
             ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
@@ -586,8 +604,11 @@ def _callout_block(kind: str, text: str, styles, width: float) -> Flowable:
     from .docx_export import CALLOUT_BORDERS, CALLOUT_SHADES
     fill = colors.HexColor("#" + CALLOUT_SHADES.get(kind, CALLOUT_SHADES["نکته"]))
     border = colors.HexColor("#" + CALLOUT_BORDERS.get(kind, CALLOUT_BORDERS["نکته"]))
-    emoji = {"هشدار": "⚠", "یادآوری": "🔔", "نکته": "💡"}.get(kind, "")
-    label = f"{emoji} {kind}" if emoji else kind
+    # No emoji prefix here: Vazirmatn carries none of the dingbats (⚠ 🔔 💡),
+    # so they would draw as empty .notdef boxes. The tinted background, the
+    # colored border and the colored label already carry the tone; the DOCX
+    # keeps its emoji because Word resolves fallback fonts at view time.
+    label = kind
     p_label = Paragraph(_xml_escape(_visual_line(label)), styles["key_label"])
     p_label.textColor = border
     p_body = _rtl_paragraph(text, styles["def_body"], width - 16)

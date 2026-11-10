@@ -2,6 +2,44 @@
 
 Concise history; detailed patches and earlier notes remain in Git history.
 
+## Unreleased — Gamas Studio: structured editing, speakers, dual-format exports (2026-11-10)
+
+- The Mini App is now **Gamas Studio**: Home, Leaderboard, Submissions,
+  Booklet Editor (structured), Preview, Exports and Revision History —
+  Persian-first RTL, mobile-responsive, real loading/empty/error states, no
+  build step. The plain-text editor remains only as the fallback for items
+  without structured content.
+- Structured booklet editing on the canonical `StructuredNotes` model:
+  add/delete/reorder sections, subsections and blocks (paragraphs, lists,
+  definitions, examples, key points, callouts, process steps, tables with
+  cell/row/column editing, formulas, glossary). Validation is the model's own
+  (`from_payload`): block types, required fields, table shapes, ordering and
+  size bounds; control characters stripped; unknown blocks rejected. Limits:
+  1 MB body, 400k serialized chars, 200 sections.
+- Every structured save re-renders **both** the polished Persian RTL PDF and
+  the editable structured DOCX from the same model and stores them against the
+  new revision as binary artifacts; exports serve stored bytes (free,
+  idempotent, no hot-path rendering). A failed render aborts the save.
+  The `build_plain_docx` edited-export path is replaced.
+- Speaker management: per-submission speaker list with stable labels, segments
+  and counts; owner-provided display names and optional roles (migration 028,
+  additive). Renaming never touches audio/timestamps/segments and never infers
+  identity; names/roles are refreshed into the saved structured JSON.
+- PDF visual QA suite (`tests/test_pdf_visual_qa.py`): structural checks with
+  pypdf (always on), rasterized ink/frame/collision checks with dev-only
+  PyMuPDF, and DOCX package checks — run over the note-quality fixtures and a
+  synthetic stress document.
+- Fixed three real rendering defects found by that suite: the step-connector
+  ↓ and the callout icons (⚠🔔💡) are not in Vazirmatn and drew as missing
+  glyphs (the connector is now a canvas-drawn vector arrow; callouts carry
+  their tone by color and label), and the cover topic-map number badge was
+  drawn over the first word of the topic text (the badge now sits on the
+  connector node at the card edge).
+- New tests: `tests/test_studio_structured.py` (35) and the extended
+  `tests/test_mini_app.py` (57) — store/WSGI round-trips, malformed and
+  oversized payloads, exports, speakers, bot-side persistence, cross-user
+  isolation. Full suite: 1753 passed, 279 subtests.
+
 ## Unreleased — reference-grade booklets and confirmed tariff (2026-11-10)
 
 - Added the native `StructuredNotes` PDF renderer with a generated Persian RTL
