@@ -682,6 +682,14 @@ class MultiUserPipelineIsolationAndCleanupTests(unittest.IsolatedAsyncioTestCase
                 if stats["submissions_done"] == len(users):
                     break
                 await asyncio.sleep(0.02)
+            # ``done`` is committed before ``_run_job``'s finally block removes
+            # the scratch directory. Wait for that cleanup instead of asserting
+            # against a scheduling race on slower CI workers.
+            cleanup_deadline = time.monotonic() + 5.0
+            while time.monotonic() < cleanup_deadline:
+                if not list(self.settings.temp_dir.glob("submission-*")):
+                    break
+                await asyncio.sleep(0.02)
 
         self.assertGreaterEqual(peak_concurrent, 2)
         # Verify zero cross-talk: every user can fetch ONLY their own transcript.
