@@ -44,10 +44,6 @@ class SlotLease:
     def released(self) -> bool:
         return self._released
 
-    @property
-    def held_seconds(self) -> float:
-        return max(0.0, time.monotonic() - self.acquired_at)
-
     def release(self) -> float:
         if self._released:
             return 0.0

@@ -284,12 +284,6 @@ class PaymentsRepositoryMixin(DatabaseCore):
         )
         return [dict(row) for row in rows]
 
-    async def count_payments_by_status(self) -> dict[str, int]:
-        rows = await _rows(
-            self.read_db, "SELECT status, COUNT(*) FROM payments GROUP BY status"
-        )
-        return {row[0]: int(row[1]) for row in rows}
-
     async def review_payment(
         self,
         payment_id: int,

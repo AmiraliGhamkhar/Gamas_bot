@@ -74,10 +74,6 @@ class ConversationStateStore:
         self.pending_flashcard.pop(admin_id, None)
         self.pending_flashcard_front.pop(admin_id, None)
 
-    def disarm_manual_flashcard(self, user_id: int) -> None:
-        self.pending_flashcard.pop(user_id, None)
-        self.pending_flashcard_front.pop(user_id, None)
-
     def on_callback_navigation(self, user_id: int, data: str) -> None:
         """Apply navigation-boundary disarm rules when callback *data* fires."""
         if data.startswith("adm:") and data != "adm:bcast":

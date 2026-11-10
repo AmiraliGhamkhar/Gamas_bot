@@ -162,16 +162,6 @@ class SupportRepositoryMixin(DatabaseCore):
         )
         return dict(rows[0]) if rows else None
 
-    async def get_ticket_by_public_id(
-        self, public_id: str
-    ) -> dict[str, Any] | None:
-        rows = await _rows(
-            self.read_db,
-            "SELECT * FROM support_tickets WHERE public_ticket_id = ?",
-            (public_id,),
-        )
-        return dict(rows[0]) if rows else None
-
     async def list_user_tickets(
         self, user_id: int, limit: int = 10, offset: int = 0
     ) -> list[dict[str, Any]]:

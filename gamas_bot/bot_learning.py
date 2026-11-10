@@ -169,25 +169,6 @@ class LearningWorkflowMixin:
     def _learning_chunks(self, content: str) -> list[DocChunk]:
         return chunk_text(content, max_chars=self._learning_max_chars())
 
-    async def _source_from_item(
-        self, user_id: int, item_id: int
-    ) -> dict[str, Any] | None:
-        item = await self.db.library_item_detail(user_id, item_id)
-        if (
-            item is None
-            or item.get("kind") != "booklet"
-            or not item.get("content_text")
-        ):
-            return None
-        return {
-            "item_id": int(item["item_id"]),
-            "doc_id": None,
-            "title": short_title(
-                self._item_display_title(item), fallback=FALLBACK_BOOKLET
-            ),
-            "chunks": await run_file_io(self._learning_chunks, str(item["content_text"])),
-        }
-
     async def _source_from_document(
         self, user_id: int, document_id: int
     ) -> dict[str, Any] | None:
