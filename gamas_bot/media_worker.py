@@ -48,7 +48,7 @@ OPUS_BIT_RATE = 32000
 #   trade because the encoder runs on the same 2 vCPUs that serve the bot.
 #
 # Measured with ``python -m scripts.perf_bench audio``; see
-# docs/PERFORMANCE.md.
+# docs/OPERATIONS.md.
 OPUS_CODEC_OPTIONS = {"application": "audio", "compression_level": "0"}
 
 #: The STT preprocessing chain, in the order it is applied. Every stage is a

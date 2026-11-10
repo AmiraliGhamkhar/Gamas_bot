@@ -1,25 +1,15 @@
 # Billing and payments
 
-Credit is an append-only ledger of **integer seconds**. Never edit ledger history
-to repair balances; use audited credit operations.
+Credit («اعتبار») is the user-facing unit. The ledger itself stores **integer
+seconds** and is append-only: never edit history to repair a balance, use the
+audited operations instead.
 
-## The credit unit («اعتبار»)
+## The unit
 
-Students buy in whole **credit** packages; the ledger keeps seconds. The exchange
-rate is fixed in `gamas_bot/billing.py` and is the single definition used by every
-screen, plan and receipt:
-
-| | Value |
-| --- | --- |
-| Package | **100 000 اعتبار** |
-| Package duration | **3 ساعت** = 10 800 seconds |
-| Package price | **65 000 تومان** → ≈21 667 T/hour |
-| Credits per hour | 33 334 (rounded up) |
-| Credits per second | ≈ 9.26 |
-
-`seconds_to_credits()` rounds **up** and `credits_to_seconds()` rounds **down**, so
-a balance shown to the user is never overstated. All arithmetic uses exact
-`Fraction` values — no float ever crosses a billing boundary.
+**100 000 credits = 3 hours = 10 800 seconds = 65 000 Toman** (≈ 21 667 T/hour).
+`seconds_to_credits()` rounds up, `credits_to_seconds()` rounds down, so a shown
+balance is never overstated. The arithmetic uses exact fractions — no float
+crosses a billing boundary.
 
 | Plan code | Duration | Credit | Toman |
 | --- | --- | --- | --- |
@@ -31,151 +21,84 @@ a balance shown to the user is never overstated. All arithmetic uses exact
 | `paid_36h_30d` | 36 h | 1 200 000 | 780 000 |
 | `paid_60h_30d` | 60 h | 2 000 000 | 1 300 000 |
 
-Every paid plan is a whole number of packages with 30-day validity, so the price
-per hour is identical everywhere. Plans are configured by `PLAN_*` in `.env`
-(`config.PLAN_ENV_FIELDS`); a non-positive override falls back to the default and
-`config.check()` reports it.
+Every paid plan is a whole number of 3-hour packages with 30-day validity, so the
+hourly price is identical everywhere. Plans come from `PLAN_*` values in `.env`
+(see [Configuration](CONFIGURATION.md#tariff)); a non-positive override falls
+back to the default and `--check` reports it. Startup synchronizes only the
+built-in active catalogue — orders, snapshots, custom plans and balances are
+never rewritten.
 
-## Environment configuration (deployment)
+## Transcription charges
 
-Set these environment values on the deployment host:
+- The measured **source duration** is held before STT. An unmeasurable file is
+  refused rather than estimated.
+- The charge is committed once the transcript has been produced and stored, so a
+  chat that refuses a message does not cost the user twice or erase a finished
+  transcript.
+- Pre-delivery failure or cancel releases the hold; startup recovery releases
+  interrupted holds.
+- A later booklet failure leaves a `partial` job: the transcription charge stands,
+  the booklet is simply not billed (it never is).
+- PowerPoint charges the source narration, not inserted silence. A deck without
+  narration is free.
 
-```
-PLAN_3_PRICE_TOMAN=65000
-PLAN_9_PRICE_TOMAN=195000
-PLAN_12_PRICE_TOMAN=260000
-PLAN_24_PRICE_TOMAN=520000
-PLAN_36_PRICE_TOMAN=780000
-PLAN_60_PRICE_TOMAN=1300000
-CREDIT_PRICE_PER_100K_TOMAN=65000
-```
+## Learning charges
 
-After setting these, **restart the bot process**. Built-in plan rows in the
-database are updated automatically at startup via `sync_plans()` (only
-non-custom, active plans are touched; custom plans, existing orders, payment
-snapshots, ledger entries and user balances are never modified).
-
-**Do NOT** set `CREDIT_PRICE_PER_100K_TOMAN=65` — that was a misreading of an
-early draft brief and is ~1000× too cheap. The canonical value is 65000.
-
-## Transcription
-
-- Reserve measured source-audio duration before STT; refuse unmeasurable duration.
-  An intake estimate is not permission to charge an unmeasured file.
-- Charge once the transcript has been **produced and stored**. Delivery is
-  button-driven (see below), so a chat that refuses a message is no longer a
-  reason to discard a finished transcription — nor a reason to charge twice. A
-  later booklet failure leaves a partial job and the transcription charge stands.
-- Pre-delivery failure/cancel releases the hold. Incomplete delivery is not billable;
-  startup recovery releases interrupted holds.
-- PowerPoint charges source narration, not inserted silence. No narration means free.
-- Lots expire independently; holds preserve allocations. Refunds create new
-  lots that inherit the earliest expiry of the original contributing lots;
-  they never delete old debits.
-
-## Delivery and billing are separate
-
-A finished job ends with **one** message — what was produced, how many speakers
-were found — plus a button per artifact. Nothing is pushed unasked, and every
-fetch afterwards is free:
-
-| Artifact | Where the bytes come from | Cost |
-| --- | --- | --- |
-| 📘 Booklet PDF | built from stored `notes_json`, persisted as an artifact | none |
-| 📄 Booklet Word | built from stored `notes_json`, persisted as an artifact | none |
-| 📝 Raw transcript | rebuilt from the stored transcription row | none |
-| ⭐ Key points | read from the stored `notes_json` | none |
-| ✏️ Edit in Gamas Studio | Mini App editor, exports latest saved version | none |
-
-Because fetching is a pure function of persisted data, the same request may be
-pressed any number of times and the tenth answer is byte-identical to the first.
-Nothing about a fetch can create, move or refund a ledger entry.
-
-## Quizzes and AI flashcards
-
-One free quiz and one independent free AI deck per user. Failed, cancelled,
-undeliverable or expired previews restore the matching gift. These are separate
-from free-plan credit. Unlimited users spend neither credit nor gifts.
-
-| Paid action | Default charge |
+| Action | Default cost |
 | --- | --- |
-| Quiz: 5 / 10 / 20 questions | 5 / 10 / 20 minutes (`QUIZ_COST_SECONDS_PER_QUESTION=60`) |
-| AI deck: 10 / 20 / 40 cards | 5 / 10 / 20 minutes (`FLASHCARD_AI_COST_SECONDS=300`, base size 10) |
-| Manual decks and Word/PDF export | Free |
-| Office and document notes/exports | Free to users; operator API costs may apply |
+| Quiz, 5 / 10 / 20 questions | 5 / 10 / 20 minutes (`QUIZ_COST_SECONDS_PER_QUESTION=60`) |
+| AI deck, 10 / 20 / 40 cards | 5 / 10 / 20 minutes (`FLASHCARD_AI_COST_SECONDS=300`, base size 10) |
+| Manual decks, Word/PDF export, re-download | free |
+| Office and document notes/exports | free to users; provider calls cost the operator |
 
-Paid learning debits happen before generation with durable pending charges.
-Saving finalizes; failure/cancel/30-minute preview expiry/startup recovery refunds
-unfinished charges at most once. A failed preview edit is retried as a new message;
-if delivery still fails, the preview remains pending until its normal expiry and
-can be resumed through /start. Failed refund writes remain recoverable; never
-claim success before commit. Valid results need at least 3 questions or 5 cards.
-Count/coverage shortfalls are reported; review the preview before saving. Paid
-previews saved with fewer items than requested receive an integer-second
-pro-rata refund, rounded up, in the same transaction as the artifact.
+A paid generation debits before the provider call with a durable pending record.
+Saving finalizes; failure, cancel, 30-minute preview expiry or startup recovery
+refunds once. If fewer items are produced than requested, the shortfall is
+refunded pro rata in the same transaction that stores the artifact. At least 3
+questions or 5 cards are required for a valid result.
 
-Admission is checked before debit: one generation per user, 1 active quiz, 3 new
-sessions per rolling hour and 30 stored decks by default. Inactive quizzes lazily
-expire after 6 hours. Historical debits predating durable recovery cannot reliably
-be reconstructed as unfinished operations.
+Admission is checked before the debit: one generation per user at a time, one
+active quiz, 3 new sessions per rolling hour, 30 stored decks. Each user keeps
+one free quiz and one free AI deck; unlimited users spend neither gifts nor
+credit.
 
-## Manual purchases
+## Purchases (card to card, manual review)
 
-Set `PAYMENT_CARD_NUMBER`, `PAYMENT_CARD_HOLDER`, `PAYMENT_BANK_NAME`. Configure
-plans with `FREE_PLAN_HOURS` and `PLAN_*` in `.env`. In v4, plan editing is
-environment-only; there is no in-bot plan editor. Existing `is_custom` data
-protection is retained for legacy records.
+```dotenv
+PAYMENT_CARD_NUMBER=...
+PAYMENT_CARD_HOLDER=...
+PAYMENT_BANK_NAME=...
+```
 
-1. Selecting a plan freezes the order's price, duration and validity.
-2. A validated receipt moves `awaiting_payment` to `pending_review`; it adds no credit.
-3. An admin verifies the transfer, then approves or rejects with a reason.
-4. Approval, credit and audit commit together. Failure rolls back; notification
-   failures never repeat activation. Final decisions are immutable.
+1. Choosing a plan freezes price, duration and validity on the order.
+2. A validated receipt moves `awaiting_payment → pending_review`; no credit yet.
+3. An admin verifies the transfer and approves or rejects with a reason.
+4. Approval, credit and audit commit together; notifications never repeat it.
 
-Administrators view stored receipt bytes as-is; viewing does not re-encode the
-image or refresh its retention timestamp. A SHA-256 fingerprint of the normalized
-image flags reuse by a non-cancelled order in the administrator alert; it does
-not block upload or grant credit.
+One open order per user; cancelling before the receipt is allowed and payment
+history stays. Admin procedure: [Admin](ADMIN.md#payments-review).
 
-Users may cancel before receipt upload; one open order per user. Payment history
-remains. Reviewed receipt images expire after 90 days by default; pending-review
-receipts are not automatically deleted.
+## Refunds
 
-## Referral rewards
+A refund creates a **new non-expiring lot only if every contributing lot was
+non-expiring**; otherwise it inherits the earliest expiry of the contributing
+lots, compared as UTC instants. Refunds require the original debit — an
+untraceable refund is refused, and a failed refund stays recoverable rather than
+being reported as success.
 
-A first-ever `/start ref_<code>` attributes the invite once. The referrer earns
-20 minutes when the invite is attributed and 1 hour when the invited user's first
-payment is approved. Both are ordinary non-expiring ledger credits; the reward
-table's unique key makes replayed starts and approvals idempotent, and the payment
-reward commits inside the approval transaction. Receipt upload alone pays nothing.
-Banned referrers are recorded but not paid. The invite screen and the admin
-referral report show attributed users and reward seconds; no wallet operation or
-learning gift is involved.
+## Referrals
 
-## Admin and upgrades
+`/start ref_<code>` attributes a first-ever invite once. The referrer earns 20
+minutes on attribution and 1 hour when the invited user's first payment is
+approved. Both are ordinary ledger credits; the payment reward commits inside the
+approval transaction, so a replayed approval cannot pay twice. Bans are recorded
+but not paid. Receipt upload alone pays nothing.
 
-Grants, unlimited status, bans and gift resets are audited/cooldown-limited.
-Protected actions cannot target self/peer admins. Unlimited releases holds; bans
-block new/queued work without killing running jobs. Leaderboard gifts use paid-plan
-credit only. See [Admin](ADMIN.md).
+## Balance cache
 
-Back up before updates. Migrations run at startup; never downgrade against the
-migrated database. Legacy v2 import is exceptional: inspect
-`scripts/import_v2.py --help` and test on copies, never live data.
+`user_balances` is a cache of the FIFO ledger, refreshed inside the same
+transaction as every write and on read after the next expiry instant. The ledger
+rows and allocations remain the source of truth; never "fix" the cache by hand.
 
-Refund credit inherits the earliest non-null expiry of the original debit's
-contributing lots (including startup recovery), compared as UTC instants even for
-legacy offset timestamps; invalid source expiries cause the refund to fail closed.
-It is non-expiring only if all
-contributing lots were non-expiring. Refund notes record contributing lot IDs.
-Generic refunds require the original debit ID; an untraceable refund is rejected.
-
-### Materialized balance cache
-
-`user_balances` is a cache of FIFO ledger truth. SQLite triggers mark affected
-users dirty, and the writer refreshes those rows before committing the same
-transaction, including payment/referral rewards and hold recovery. Startup
-backfills in batches and repairs a sample; offline import dirty rows are
-recomputed before serving traffic. The cache records the next credit start or
-expiry and is refreshed on read after that instant, or after a clock rollback.
-Ledger rows and allocation records remain authoritative.
+Back up before updates. Migrations run at startup; never run older code against a
+newer database.

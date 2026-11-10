@@ -37,16 +37,12 @@ import logging
 from datetime import datetime
 from xml.sax.saxutils import escape as _xml_escape
 
-import arabic_reshaper
-from bidi.algorithm import get_display
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import cm, mm
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfgen import canvas as _rl_canvas
 from reportlab.platypus import (
     BaseDocTemplate,
     Flowable,
@@ -61,9 +57,15 @@ from reportlab.platypus import (
 )
 from reportlab.platypus.flowables import HRFlowable
 
-from .config import PROJECT_DIR
 from .docx_export import DocumentMeta, PAGE_HEADER_TEXT, jalali_date
 from .notes import GlossaryEntry, NoteSection, NoteTable, StructuredNotes
+from .pdf_common import (
+    BOLD_NAME,
+    REGULAR_NAME,
+    InvariantCanvas as _InvariantCanvas,
+    register_fonts,
+    visual,
+)
 from .progress import to_persian_digits
 
 logger = logging.getLogger(__name__)
@@ -118,63 +120,9 @@ GLOSSARY_HEADER_FILL = NAVY
 # Fonts (Vazirmatn, SIL OFL, bundled in the repository)
 # ---------------------------------------------------------------------------
 
-_REGULAR_NAME = "GamasVazir"
-_BOLD_NAME = "GamasVazirBold"
-_REGULAR_FILE = "Vazirmatn-Regular.ttf"
-_BOLD_FILE = "Vazirmatn-Bold.ttf"
-
-_font_names: tuple[str, str] | None = None
-
-
-def _find_font(filename: str):
-    from pathlib import Path as _Path
-    for base in (PROJECT_DIR / "assets" / "fonts", _Path.cwd() / "assets" / "fonts"):
-        p = base / filename
-        try:
-            if p.is_file():
-                return p
-        except OSError:
-            continue
-    return None
-
-
-def _fonts() -> tuple[str, str]:
-    global _font_names
-    if _font_names is not None:
-        return _font_names
-    regular = _find_font(_REGULAR_FILE)
-    bold_path = _find_font(_BOLD_FILE)
-    if regular is None:
-        from .office import OfficeError
-        raise OfficeError(
-            "فونت فارسی برای PDF جزوه پیدا نشد؛ assets/fonts/Vazirmatn-Regular.ttf لازم است."
-        )
-    bold = bold_path or regular
-    if _REGULAR_NAME not in pdfmetrics.getRegisteredFontNames():
-        pdfmetrics.registerFont(TTFont(_REGULAR_NAME, str(regular)))
-    if _BOLD_NAME not in pdfmetrics.getRegisteredFontNames():
-        pdfmetrics.registerFont(TTFont(_BOLD_NAME, str(bold)))
-    _font_names = (_REGULAR_NAME, _BOLD_NAME)
-    return _font_names
-
-
 # ---------------------------------------------------------------------------
 # Persian text shaping: logical wrap, then reshape/bidi per line.
 # ---------------------------------------------------------------------------
-
-
-def _has_strong_rtl(text: str) -> bool:
-    for ch in text:
-        if "\u0600" <= ch <= "\u06FF" or "\uFB50" <= ch <= "\uFEFC" or "\u0750" <= ch <= "\u077F":
-            return True
-    return False
-
-
-def _visual_line(text: str) -> str:
-    """Apply arabic_reshaper then bidi for display order."""
-    if not text:
-        return text
-    return get_display(arabic_reshaper.reshape(text))
 
 
 def _wrap_words(text: str, font: str, size: float, max_width: float) -> list[str]:
@@ -218,20 +166,21 @@ def _rtl_paragraph(
     lines = _wrap_words(text or "", style.fontName, style.fontSize, width)
     shaped_lines: list[str] = []
     for line in lines:
-        visual = _xml_escape(_visual_line(line))
+        # ``shaped`` holds display-order markup; ``visual`` stays the helper.
+        shaped = _xml_escape(visual(line))
         if highlight_terms:
             for term in highlight_terms:
                 if not term:
                     continue
                 # We highlight at the visual level for simple terms: this is
                 # a controlled approach — only known terms get yellow.
-                vterm = _visual_line(term)
-                if vterm and vterm in visual:
-                    visual = visual.replace(
+                vterm = visual(term)
+                if vterm and vterm in shaped:
+                    shaped = shaped.replace(
                         vterm,
                         f'<back color="{HL_YELLOW.hexval()[2:]}">{vterm}</back>',
                     )
-        shaped_lines.append(visual)
+        shaped_lines.append(shaped)
     body = "<br/>".join(shaped_lines) if shaped_lines else " "
     return Paragraph(body, style)
 
@@ -242,7 +191,7 @@ def _rtl_paragraph(
 
 
 def _styles() -> dict[str, ParagraphStyle]:
-    regular, bold = _fonts()
+    regular, bold = register_fonts()
 
     def s(name, font, size, leading, color, align, **kw):
         return ParagraphStyle(
@@ -338,9 +287,9 @@ class _CircleBadge(Flowable):
         c.setFillColor(self.bg)
         c.circle(r, r, r, fill=1, stroke=0)
         c.setFillColor(self.fg)
-        c.setFont(_BOLD_NAME, 10.5)
+        c.setFont(BOLD_NAME, 10.5)
         label = to_persian_digits(str(self.number))
-        c.drawCentredString(r, r - 3.5, _visual_line(label))
+        c.drawCentredString(r, r - 3.5, visual(label))
 
 
 class _ArrowDown(Flowable):
@@ -453,22 +402,22 @@ class _TopicMap(Flowable):
             c.circle(badge_cx, badge_cy, badge_r, fill=1, stroke=1)
             # Number text
             c.setFillColor(colors.white)
-            c.setFont(_BOLD_NAME, 9)
+            c.setFont(BOLD_NAME, 9)
             nlabel = to_persian_digits(str(idx + 1))
-            c.drawCentredString(badge_cx, badge_cy - 3, _visual_line(nlabel))
+            c.drawCentredString(badge_cx, badge_cy - 3, visual(nlabel))
 
             # Topic text (wrapped), right-aligned like any RTL line, with
             # margins that clear the edge badge.
             label_w = self.card_w - 10 * mm
             # Since we are drawing at canvas level, do our own wrap & draw.
-            lines = _wrap_words(topic, _REGULAR_NAME, 10, label_w)
+            lines = _wrap_words(topic, REGULAR_NAME, 10, label_w)
             text_y = cy + self.card_h / 2 + (len(lines) - 1) * 6
             c.setFillColor(NAVY)
-            c.setFont(_BOLD_NAME, 10)
+            c.setFont(BOLD_NAME, 10)
             for line in lines[:2]:
-                lw = pdfmetrics.stringWidth(line, _BOLD_NAME, 10)
+                lw = pdfmetrics.stringWidth(line, BOLD_NAME, 10)
                 tx = cx + self.card_w - 5 * mm - lw
-                c.drawString(tx, text_y, _visual_line(line))
+                c.drawString(tx, text_y, visual(line))
                 text_y -= 12
 
 
@@ -500,12 +449,12 @@ def _h1_with_bar(text: str, styles) -> list[Flowable]:
 def _definition_block(term: str, term_en: str, definition: str, styles,
                       width: float) -> Flowable:
     parts = [
-        Paragraph(_xml_escape(_visual_line("تعریف")), styles["def_label"]),
+        Paragraph(_xml_escape(visual("تعریف")), styles["def_label"]),
     ]
     label = term
     if term_en:
         label = f"{term} ({term_en})"
-    parts.append(Paragraph(_xml_escape(_visual_line(label)), styles["def_term"]))
+    parts.append(Paragraph(_xml_escape(visual(label)), styles["def_term"]))
     parts.append(_rtl_paragraph(definition, styles["def_body"], width - 16))
     inner = Table([[p] for p in parts], colWidths=[width - 16])
     inner.setStyle(TableStyle([
@@ -528,7 +477,7 @@ def _definition_block(term: str, term_en: str, definition: str, styles,
 
 def _example_block(example: str, styles, width: float) -> Flowable:
     parts = [
-        Paragraph(_xml_escape(_visual_line("مثال")), styles["ex_label"]),
+        Paragraph(_xml_escape(visual("مثال")), styles["ex_label"]),
         _rtl_paragraph(example, styles["ex_body"], width - 16),
     ]
     inner = Table([[p] for p in parts], colWidths=[width - 16])
@@ -551,7 +500,7 @@ def _example_block(example: str, styles, width: float) -> Flowable:
 
 
 def _keypoints_block(label: str, points: list[str], styles, width: float) -> Flowable:
-    parts = [Paragraph(_xml_escape(_visual_line(label)), styles["key_label"])]
+    parts = [Paragraph(_xml_escape(visual(label)), styles["key_label"])]
     bullet_style = styles["key_item"]
     for pt in points:
         parts.append(_rtl_paragraph(f"• {pt}", bullet_style, width - 20))
@@ -609,7 +558,7 @@ def _callout_block(kind: str, text: str, styles, width: float) -> Flowable:
     # colored border and the colored label already carry the tone; the DOCX
     # keeps its emoji because Word resolves fallback fonts at view time.
     label = kind
-    p_label = Paragraph(_xml_escape(_visual_line(label)), styles["key_label"])
+    p_label = Paragraph(_xml_escape(visual(label)), styles["key_label"])
     p_label.textColor = border
     p_body = _rtl_paragraph(text, styles["def_body"], width - 16)
     inner = Table([[p_label], [p_body]], colWidths=[width - 16])
@@ -655,7 +604,7 @@ def _table_flowable(table: NoteTable, styles, width: float) -> Flowable:
     data: list = []
     # Header row
     data.append([
-        Paragraph(_xml_escape(_visual_line(headers[i] or " ")), styles["cell_head"])
+        Paragraph(_xml_escape(visual(headers[i] or " ")), styles["cell_head"])
         for i in order
     ])
     for r in rows:
@@ -691,11 +640,11 @@ def _glossary_table(entries: list[GlossaryEntry], styles, width: float) -> Flowa
     order = [2, 1, 0]
     headers = ["اصطلاح", "معادل", "تعریف"]
     data = [[
-        Paragraph(_xml_escape(_visual_line(headers[i])), styles["glos_head"])
+        Paragraph(_xml_escape(visual(headers[i])), styles["glos_head"])
         for i in order
     ]]
     for e in entries:
-        term_p = Paragraph(_xml_escape(_visual_line(e.term)), styles["glos_term"])
+        term_p = Paragraph(_xml_escape(visual(e.term)), styles["glos_term"])
         en_p = Paragraph(_xml_escape(e.term_en or "—"), styles["glos_en"])
         def_p = _rtl_paragraph(e.definition, styles["glos_def"], col_widths[2] - 12)
         # Logical term/equivalent/definition order becomes visual
@@ -735,8 +684,8 @@ def _cover_flowables(
     out: list[Flowable] = []
 
     # "In the name of God" line
-    out.append(Paragraph(_xml_escape(_visual_line("به نام خدا")),
-                         ParagraphStyle("cover_god", fontName=_REGULAR_NAME,
+    out.append(Paragraph(_xml_escape(visual("به نام خدا")),
+                         ParagraphStyle("cover_god", fontName=REGULAR_NAME,
                                         fontSize=11, leading=14, textColor=MUTED,
                                         alignment=TA_CENTER, spaceAfter=10)))
 
@@ -761,9 +710,9 @@ def _cover_flowables(
         else:
             meta_lines.append(f"مدت: {to_persian_digits(minutes)} دقیقه")
 
-    label_p = Paragraph(_xml_escape(_visual_line(mode_label)), styles["cover_label"])
-    title_p = Paragraph(_xml_escape(_visual_line(title)), styles["cover_title"])
-    meta_ps = [Paragraph(_xml_escape(_visual_line(line)), styles["cover_meta"]) for line in meta_lines]
+    label_p = Paragraph(_xml_escape(visual(mode_label)), styles["cover_label"])
+    title_p = Paragraph(_xml_escape(visual(title)), styles["cover_title"])
+    meta_ps = [Paragraph(_xml_escape(visual(line)), styles["cover_meta"]) for line in meta_lines]
 
     panel_inner: list = [label_p, Spacer(1, 4), title_p, Spacer(1, 6)]
     panel_inner.extend(meta_ps)
@@ -799,7 +748,7 @@ def _cover_flowables(
     out.append(Spacer(1, 12))
     out.append(HRFlowable(width="40%", thickness=0.6, color=RULE,
                           hAlign="CENTER", spaceAfter=6))
-    out.append(Paragraph(_xml_escape(_visual_line("Gamas — جزوه‌ساز هوشمند گاماس")),
+    out.append(Paragraph(_xml_escape(visual("Gamas — جزوه‌ساز هوشمند گاماس")),
                          styles["cover_brand"]))
     return out
 
@@ -861,7 +810,7 @@ def _section_flowables(
     for tbl in section.all_tables:
         if tbl.caption:
             cap_p = _rtl_paragraph(tbl.caption, ParagraphStyle(
-                "tcap", fontName=_BOLD_NAME, fontSize=10, leading=13,
+                "tcap", fontName=BOLD_NAME, fontSize=10, leading=13,
                 textColor=MUTED, alignment=TA_CENTER, spaceAfter=4,
             ), _FRAME_W)
             out.append(cap_p)
@@ -878,8 +827,8 @@ def _body_flowables(notes: StructuredNotes, styles) -> list[Flowable]:
     out: list[Flowable] = []
 
     # Document title (repeated on body start in smaller form)
-    title_p = Paragraph(_xml_escape(_visual_line(notes.display_title)),
-                        ParagraphStyle("bdytitle", fontName=_BOLD_NAME,
+    title_p = Paragraph(_xml_escape(visual(notes.display_title)),
+                        ParagraphStyle("bdytitle", fontName=BOLD_NAME,
                                        fontSize=18, leading=24, textColor=NAVY,
                                        alignment=TA_CENTER, spaceAfter=10))
     out.append(title_p)
@@ -893,8 +842,8 @@ def _body_flowables(notes: StructuredNotes, styles) -> list[Flowable]:
 
     # Summary
     if notes.summary:
-        summ_label = Paragraph(_xml_escape(_visual_line("خلاصه")),
-                               ParagraphStyle("sumlab", fontName=_BOLD_NAME, fontSize=11,
+        summ_label = Paragraph(_xml_escape(visual("خلاصه")),
+                               ParagraphStyle("sumlab", fontName=BOLD_NAME, fontSize=11,
                                               leading=14, textColor=NAVY,
                                               alignment=TA_RIGHT, spaceAfter=4))
         summ_body = _rtl_paragraph(notes.summary, styles["summary"], _FRAME_W - 16)
@@ -955,13 +904,13 @@ def _final_page_flowables(notes: StructuredNotes, meta: DocumentMeta, styles) ->
     out.append(HRFlowable(width="100%", thickness=0.4, color=RULE, spaceAfter=8))
     # Attribution
     out.append(Paragraph(
-        _xml_escape(_visual_line(
+        _xml_escape(visual(
             "این جزوه به‌صورت خودکار توسط Gamas تهیه شده است."
         )),
         styles["attribution"],
     ))
     out.append(Paragraph(
-        _xml_escape(_visual_line(f"تاریخ تولید: {jalali_date(created)}")),
+        _xml_escape(visual(f"تاریخ تولید: {jalali_date(created)}")),
         styles["attribution"],
     ))
     # Disclaimer
@@ -980,14 +929,8 @@ def _final_page_flowables(notes: StructuredNotes, meta: DocumentMeta, styles) ->
 # ---------------------------------------------------------------------------
 
 
-class _InvariantCanvas(_rl_canvas.Canvas):
-    def __init__(self, *args, **kwargs):
-        kwargs["invariant"] = 1
-        super().__init__(*args, **kwargs)
-
-
 def _make_on_page(title: str):
-    regular, _bold = _fonts()
+    regular, _bold = register_fonts()
 
     def on_page(canv, doc):
         page = canv.getPageNumber()
@@ -1004,7 +947,7 @@ def _make_on_page(title: str):
             canv.setFont(regular, 8.5)
             canv.setFillColor(MUTED)
             header = f"{title} | {PAGE_HEADER_TEXT}"
-            canv.drawCentredString(_PAGE_W / 2, _PAGE_H - 1.1 * cm, _visual_line(header))
+            canv.drawCentredString(_PAGE_W / 2, _PAGE_H - 1.1 * cm, visual(header))
             canv.setStrokeColor(STEEL)
             canv.setLineWidth(0.4)
             canv.line(_MARGIN_LR, _PAGE_H - 1.15 * cm, _PAGE_W - _MARGIN_LR, _PAGE_H - 1.15 * cm)
@@ -1013,7 +956,7 @@ def _make_on_page(title: str):
             canv.setFillColor(MUTED)
             canv.drawCentredString(
                 _PAGE_W / 2, 1.1 * cm,
-                _visual_line(f"Gamas — صفحهٔ {to_persian_digits(page - 1)}"),
+                visual(f"Gamas — صفحهٔ {to_persian_digits(page - 1)}"),
             )
         canv.restoreState()
     return on_page
@@ -1038,7 +981,7 @@ def build_notes_pdf(
     """
     styles = _styles()
     title = notes.display_title or "جزوهٔ کلاس"
-    regular, _bold = _fonts()
+    regular, _bold = register_fonts()
 
     story: list[Flowable] = []
 

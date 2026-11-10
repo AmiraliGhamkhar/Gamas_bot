@@ -1,227 +1,56 @@
 # Changelog
 
-Concise history; detailed patches and earlier notes remain in Git history.
+Short, operator-relevant history. Detailed patches remain in Git history.
 
-## Unreleased — Gamas Studio: structured editing, speakers, dual-format exports (2026-11-10)
+## 3.0 — Gamas Studio, reference-grade booklets, confirmed tariff
 
-- The Mini App is now **Gamas Studio**: Home, Leaderboard, Submissions,
-  Booklet Editor (structured), Preview, Exports and Revision History —
-  Persian-first RTL, mobile-responsive, real loading/empty/error states, no
-  build step. The plain-text editor remains only as the fallback for items
-  without structured content.
-- Structured booklet editing on the canonical `StructuredNotes` model:
-  add/delete/reorder sections, subsections and blocks (paragraphs, lists,
-  definitions, examples, key points, callouts, process steps, tables with
-  cell/row/column editing, formulas, glossary). Validation is the model's own
-  (`from_payload`): block types, required fields, table shapes, ordering and
-  size bounds; control characters stripped; unknown blocks rejected. Limits:
-  1 MB body, 400k serialized chars, 200 sections.
-- Every structured save re-renders **both** the polished Persian RTL PDF and
-  the editable structured DOCX from the same model and stores them against the
-  new revision as binary artifacts; exports serve stored bytes (free,
-  idempotent, no hot-path rendering). A failed render aborts the save.
-  The `build_plain_docx` edited-export path is replaced.
-- Speaker management: per-submission speaker list with stable labels, segments
-  and counts; owner-provided display names and optional roles (migration 028,
-  additive). Renaming never touches audio/timestamps/segments and never infers
-  identity; names/roles are refreshed into the saved structured JSON.
-- PDF visual QA suite (`tests/test_pdf_visual_qa.py`): structural checks with
-  pypdf (always on), rasterized ink/frame/collision checks with dev-only
-  PyMuPDF, and DOCX package checks — run over the note-quality fixtures and a
-  synthetic stress document.
-- Fixed three real rendering defects found by that suite: the step-connector
-  ↓ and the callout icons (⚠🔔💡) are not in Vazirmatn and drew as missing
-  glyphs (the connector is now a canvas-drawn vector arrow; callouts carry
-  their tone by color and label), and the cover topic-map number badge was
-  drawn over the first word of the topic text (the badge now sits on the
-  connector node at the card edge).
-- New tests: `tests/test_studio_structured.py` (35) and the extended
-  `tests/test_mini_app.py` (57) — store/WSGI round-trips, malformed and
-  oversized payloads, exports, speakers, bot-side persistence, cross-user
-  isolation. Full suite: 1753 passed, 279 subtests.
+**Mini App (Gamas Studio).** Persian-first RTL single page with Home,
+Leaderboard (all-time / weekly / monthly), Submissions, structured Booklet
+Editor, Preview, Exports and Revision History — no build step. Deploy:
+[cPanel](MINIAPP_CPANEL.md) or [Cloudflare](MINIAPP_CLOUDFLARE.md).
 
-## Unreleased — reference-grade booklets and confirmed tariff (2026-11-10)
+**Structured editing.** The editor works on the canonical `StructuredNotes`
+model: sections, subsections and blocks (paragraphs, lists, definitions,
+examples, key points, callouts, process steps, tables, formulas, glossary) with
+add/delete/reorder and cell-level table editing. Validation is the model's own
+(`from_payload`); unknown blocks are rejected. Every save re-renders both the
+Persian RTL PDF and the editable DOCX and stores the bytes against the new
+revision — exports serve stored bytes and never re-render.
 
-- Added the native `StructuredNotes` PDF renderer with a generated Persian RTL
-  cover/topic map, hierarchy, educational blocks, RTL tables, glossary, running
-  furniture and an explicit auto-generation disclaimer. PDF and DOCX use the
-  same validated note model.
-- Added additive migration 027 for owner-scoped persisted PDF/DOCX bytes. The
-  completion screen sends no files automatically; output buttons retrieve the
-  exact stored file and never render a booklet again. Legacy Telegram-hosted
-  Word booklets remain readable.
-- Confirmed the canonical tariff: 100,000 credits / 3 hours / 10,800 seconds
-  costs 65,000 Toman. All six built-in plan defaults and deployment instructions
-  now use proportional 30-day prices; historical payment snapshots and custom
-  plans remain untouched.
+**Speakers.** Per-submission speaker list with stable engine labels and
+owner-chosen display names and roles (migration 028, additive). Renaming never
+touches audio, timestamps or segments and never infers identity.
 
-## Unreleased — note-provider compatibility and tested deployment profile (2026-11-07)
+**Booklets.** Native `StructuredNotes` PDF renderer: generated Persian cover and
+topic map, hierarchy, educational blocks, RTL tables, glossary, running
+furniture and an explicit auto-generation disclaimer. Additive migration 027
+persists owner-scoped PDF/DOCX bytes; the completion screen sends nothing
+automatically and each output button returns the exact stored file.
 
-- Audited the real configuration/routing/request path. Shipped project defaults
-  are deliberately unchanged (`NOTE_PROVIDERS=gemini,nara,openrouter,deepseek,avalai`,
-  `NOTE_MAX_OUTPUT_TOKENS=16384`, structured output on, Gemini 2.5 flash-lite and
-  the pinned Gemma OpenRouter model). The verified two-route profile is documented
-  as a deployment-specific `.env` override in `README.md`, `.env.example`,
-  `docs/CONFIGURATION.md`, `docs/PROVIDERS.md` and `docs/DEPLOY_CPANEL.md`.
-- Added one bounded Gemini-only compatibility retry for HTTP 400
-  `INVALID_ARGUMENT` when the original request actually contained
-  `generationConfig.responseSchema`: it drops only that field, keeps the JSON
-  mime type and the strict parser/domain validation. Auth/quota/permission and
-  unrelated errors are untouched. The exact cause of the observed Gemini 400 is
-  explicitly **not** claimed as root-caused (the failing payload was not captured).
-- Bounded the total number of request-parameter compatibility adjustments so a
-  gateway alternating two parameter spellings cannot retry forever.
-- Token logs now separate the effective outgoing budget
-  (`requested_output_tokens`, read from the built payload) from the provider's
-  actual completion usage (`output_tokens`). Verified that a 32,768 configured
-  budget reaches both the Gemini and OpenRouter payloads; no database or admin
-  layer overrides note budgets, and settings load only at startup.
-- `note_route_summary()` prints the effective provider order and non-secret
-  settings from `python -m gamas_bot --check`; the provider probe gained an
-  offline `--show-config` stage, explicit metadata-vs-generation separation,
-  quota warnings, credential-safe base URLs and per-route effective budgets.
-  `--generate` remains opt-in and is never used by CI.
-- Documented NaraRouter's observed HTTP 502 generation failures for
-  `laguna-s-2.1` without deleting the integration or advertising it as a
-  verified fallback; documented the 16,384 vs 32,768 discrepancy as an
-  unresolved, evidence-based stale-startup-process/stale-env hypothesis.
-- `tests/test_note_provider_compatibility.py` adds 26 deterministic offline
-  regressions for configuration, Gemini payload/fallback/validation, OpenRouter
-  budget/reasoning/truncation, and Gemini → OpenRouter failover. No database
-  schema, migration, admin setting, STT, Telegram or media behaviour changed.
+**Tariff.** Confirmed: 100 000 credits = 3 hours = 10 800 seconds = 65 000 Toman.
+All six built-in plans use proportional 30-day prices; historical snapshots and
+custom plans are untouched.
 
-## Unreleased — hardening
+**Quality.** PDF visual QA (`tests/test_pdf_visual_qa.py`) checks geometry,
+fonts, ink coverage and text collisions, and found three real glyph/layout
+defects — a missing step-connector arrow, callout icons missing from Vazirmatn,
+and a cover badge drawn over the topic text — all fixed.
 
-- WO-BC-1: confirm broadcasts, serialize runs, show progress, and support graceful stop.
-- WO-BC-2: resume hashed-text broadcasts with filtered keyset checkpoints and bounded flood handling.
-- WO-BC-3: track permanent recipient failures and skip repeatedly unreachable users.
-- WO-SUB-2: record sweep membership and check timestamp in one update.
-- WO-SUB-1: cache confirmed membership for five minutes by default, including explicit checks.
-- WO-PAY-2: fingerprint normalized receipts and warn admins about reuse.
-- WO-PAY-6: document environment-only plan editing and legacy custom-plan protection.
-- WO-PAY-5: edit the wallet screen in place when opening an existing order.
-- WO-PAY-3: surface older open orders and clamp wallet history pages.
-- WO-PAY-4: record cancellation actors, expose cancelled orders and use UTC receipt retention.
-- WO-CAP-2: document a conservative 2 GB cPanel profile.
-- WO-CAP-3: include the original Telegram message ID in queued-job restart notices.
-- WO-CAP-1: lower document upload and cumulative Office expansion defaults.
-- WO-SUP-4: expire abandoned support prompts and handle admin reply permission errors.
-- WO-SUP-1: atomically limit open support tickets and enforce a creation cooldown.
-- WO-SUP-3: confirm user ticket closures before closing or notifying staff.
-- WO-SUP-2: retain full support openers while deriving a bounded first-line subject.
-- WO-PAY-1: preserve stored receipt bytes and modification time when viewed.
-- WO-LRN-14: bound generation/output resources, share provider limits without nested slot waits, offload CPU work, and keep system prompts cache-stable.
-- WO-LRN-13: bound manual decks and validate repository item shapes.
-- WO-LRN-9: run one progress reporter from dispatch and update it on attempts.
-- WO-LRN-7: log and reject malformed three-option questions rather than mis-grade them.
-- WO-LRN-15: use bounded document metadata and previews for screens.
-- WO-LRN-12: index quiz admission and answers; terminal-session retention defaults off per WO-DB-7.
-- WO-LRN-6: use integer preset pricing and refund paid learning shortfalls pro rata in the artifact transaction; test quiz shortfalls and atomic rollback for both artifact types.
-- WO-LRN-8: protect live curation sources from library pruning and refund missing sources cleanly.
-- WO-LRN-4: retain source locators when splitting overflowed learning chunks.
-- WO-LRN-1: retain undelivered paid previews until their normal expiry and offer resume.
-- WO-LRN-2: compare imported lot expiries as instants for refunds and settlements; reject invalid expiries.
-- WO-LRN-2: preserve originating credit expiry and lot IDs on learning refunds and recovery.
-- WO-LRN-10: gate flashcard DOCX delivery while keeping paid quiz answers accessible.
-- WO-LRN-11: reject invalid flashcard presets rather than silently charging the base cost.
-- WO-LRN-3: bound learning calls for small presets on many chunks.
-- WO-LRN-5: preserve manual-card state through the finish callback.
-- WO-DB-6: materialize FIFO balances with transactional dirty tracking and expiry-aware refresh.
-- WO-DB-7: add opt-in bounded retention and SQLite maintenance; preserve retired-hold idempotency tombstones.
-- WO-DB-9: check submission links and explicitly roll back duplicate quiz inserts.
-- WO-DB-5: batch learning inserts and transcription-retention deletes, with rollback and bounded-batch coverage.
-- WO-DB-2 (partial): add performance indexes; expiry predicates retain legacy timezone correctness.
-- WO-DB-3: use retry-aware repository reads for admin payment counts.
-- WO-DB-3: route plan, user, transcription-retention and admin count reads to the read connection.
-- WO-DB-10: retry transient SQLite read contention and count read errors.
-- WO-DB-8: bound SQLite caches, mapping and journal size for shared hosting.
-- WO-DB-4: report discarded stray transactions in logs and metrics.
-- WO-DB-1: consume pending membership-gate actions atomically.
+## 2.x — providers, hardening, billing recovery
 
-## Unreleased — one static booklet prompt and the AvalAI route (2026-11-06)
+- Note-provider failover with per-provider keys/models, bounded retries,
+  structured-output compatibility ladder and a tested Gemini → OpenRouter
+  profile; NaraRouter documented as generation-unverified (HTTP 502).
+- Cache-stable static note prompt for provider prefix caching.
+- Durable payment/learning recovery: pending charges, one-time refunds,
+  forward-only payment states, receipt fingerprinting, append-only lot ledger
+  with a materialized balance cache.
+- Broadcast runs with resume checkpoints and permanent-failure tracking;
+  channel-membership gate with cached confirmations and a bounded sweep.
+- Bounded everything: jobs, queues, uploads, document expansion, Office drafts,
+  provider bodies and outputs.
 
-- Replaced the assembled per-mode note prompt with one static agent contract
-  (`gamas_bot/_prompt_block.py`, 8 principles, byte-identical for every request)
-  and moved every per-job datum into the user message. The system prompt is now
-  the same string for every chunk, source kind, mode and job, so a provider with
-  implicit prefix caching bills it once; `PromptTests` asserts the bytes and the
-  absence of per-job data instead of the old per-mode phrasing.
-- The documented per-request templates are now the real ones: chunk requests are
-  `متن پیاده‌سازی‌شدهٔ خام (بخش i از n)` + text + `موضوع همین بخش`, the single-part
-  path says `(درس تک‌بخشی)`, and the editorial compile is `متن منبع کامل` + digest
-  then `پیش‌نویس جزوه` + draft. Overflow recovery re-renders both halves from the
-  raw text instead of cutting a rendered message, and the repair/compile passes
-  share one message shape.
-- The prompt carries the full booklet skeleton the exporter already renders
-  (cover/title, contents from headings, objectives, per-section definitions,
-  examples, steps, formulas, tables, callouts and key points, a one-page summary
-  and an English-term glossary) plus the no-drop coverage rule.
-- Added AvalAI as a note route: `AVALAI_API_KEY`, `AVALAI_BASE_URL`
-  (default `https://api.avalai.ir/v1`) and `AVALAI_MODEL` (default
-  `deepseek-v4.1-flash`), last in the default chain so an unconfigured key
-  changes nothing. It sends the documented `json_schema` envelope and keeps the
-  `json_object` → drop degradation ladder.
-- `.env.example` now documents the `DEEPSEEK_*` and `AVALAI_*` keys, lists the
-  real `NOTE_PROVIDERS` default and no longer advertises the removed Groq and
-  Cerebras settings.
+## 1.x — the bot
 
-## Unreleased — providers, membership and referrals (2026-11-02)
-
-- Removed the Groq and Cerebras note integrations from every registry, request
-  profile, config diagnostic and provider test. A legacy `NOTE_PROVIDERS` value
-  naming them is skipped with one explicit startup warning; startup continues.
-- Added DeepSeek V4.1 Flash as `deepseek` (`deepseek-flash` at
-  `https://api.deepseek.com`) with JSON Output only, no undocumented strict
-  schema, and bounded retries through the existing failover chain.
-- Deferred the channel gate from every interaction to value delivery. Blocked
-  files are stored in `pending_gate_actions` (migration 018) and resume after a
-  successful check without resubmission; a bounded, resumable sweep re-checks
-  active users oldest-first and stops on an inconclusive result.
-- Added first-start referral attribution and idempotent 20-minute/1-hour ledger
-  rewards (migration 019), an invite screen, and an admin referral report. The
-  payment reward commits with approval; receipt upload pays nothing.
-- `.env.example` still needs an operator edit because the workspace file guard
-  blocks env-family files: set `NOTE_PROVIDERS` without the removed providers and
-  document the `DEEPSEEK_*` keys.
-
-## Unreleased — centralized Persian UX copy (2026-11-02)
-
-- Added `gamas_bot/texts.py` as the single source for start/help screens,
-  library states, wallet and receipt copy, support tickets, the channel gate,
-  progress headlines and shared delivery errors.
-- Rewrote the start and help screens as short, sectioned, Persian-first guides;
-  button labels, gate wording and progress headlines now follow one glossary.
-- Added copy-contract tests and a guard that prevents Persian string literals
-  from returning to the migrated handler modules.
-- No billing, schema, provider or gate behavior changed.
-
-## Unreleased — documentation refresh (2026-11-01)
-
-- Short, practical guides for cPanel Terminal and Windows PowerShell; dedicated
-  Windows setup page and consolidated update/backup/restore instructions.
-- Removed revision-specific `AUDIT_REPORT.md`, `PRODUCTION_AUDIT.md` and duplicate
-  `DEPLOY_FA.md`; current feature/deployment guides replace them.
-- Removed invalid migration steps; migrations run at startup.
-- Clarified cron command fields, Passenger maintenance triggers, provider costs,
-  OCR privacy, offline checks and document-cache retention limits.
-- Updated documentation test coverage for both setup guides and local links.
-- No runtime, schema, dependency or billing behavior changed.
-
-## Existing unreleased work — summary
-
-- Payment/support/admin reads use query-only storage; subscription responses are
-  bounded and alerts name the configured channel.
-- Broadcast flood waits retry the same recipient; the console entry point works.
-- Optional remote OCR supports scans/photos with bounded requests; off by default.
-- Learning is source-anchored with bounded top-ups, preview curation, independent
-  gifts and durable paid recovery.
-- Office/document workflows support notes and exports, literal Excel values,
-  bounded drafts and no user wallet/free-use charge.
-- Admin hubs, identity lookup, progress displays and short library titles improve
-  operation. Reporting and pipeline concurrency stay bounded.
-- Payment transitions, receipt checks, ownership and shutdown/recovery were hardened.
-
-## 3.0.0 — 2026-10-11
-
-SQLite v3 credit ledger, manual receipt review and shared-hosting deployment.
-Use current guides for supported behavior, not historical migration walkthroughs.
+Transcription, RTL Word booklets, PDF export, study documents, Free Office,
+library, wallet, support tickets and referrals on Windows PowerShell and cPanel.

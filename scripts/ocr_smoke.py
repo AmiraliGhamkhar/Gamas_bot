@@ -83,7 +83,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     if not curl_cffi_available():
         print(
-            "curl-cffi is missing: pip install 'gamas-bot[ocr]' (see docs/OCR.md)",
+            "curl-cffi is missing: pip install 'gamas-bot[ocr]' (see docs/FEATURES.md)",
             file=sys.stderr,
         )
         return 1

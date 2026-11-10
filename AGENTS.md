@@ -1,104 +1,93 @@
 # Maintainer guide
 
-Gamas Bot is a Persian Telegram study assistant. Read the relevant
-[guide](docs/README.md) and implementation before editing. Code is the source of
-truth; report documentation mismatches. Keep changes small and practical.
+Gamas Bot is a Persian Telegram study assistant for Windows (PowerShell) and
+shared Linux hosting (cPanel). Read the relevant [guide](docs/README.md) and the
+code before editing. **Code is the source of truth**; fix docs that disagree.
+Keep changes small and practical.
 
-## Platform and scope
+## Platform
 
-- Support Python 3.11–3.13, Windows PowerShell and Linux cPanel shared hosting.
-- Keep Telethon, bounded asyncio work, SQLite WAL and PyAV. No system binaries,
-  local OCR engines, brokers, external databases, web frameworks or payment gateways.
+- Python 3.11–3.13, PowerShell on Windows, cPanel shared hosting, one process per
+  bot token.
+- Telethon, bounded asyncio work, SQLite WAL, PyAV. No system binaries, brokers,
+  external databases, web frameworks or payment gateways.
+- Telegram and the Mini App are separate processes sharing the SQLite file; the
+  Mini App never migrates.
 - Do not modify production `.env`, `data/`, sessions, receipts or backups.
   `migrations/v2/` is read-only legacy material.
-- Code/comments/logs/docs use English; user messages and LLM prompts use Persian.
-  Store UTC timestamps; use monotonic clocks for elapsed durations.
+- Code, comments, logs and docs in English; user messages and LLM prompts in
+  Persian. Store UTC; use monotonic clocks for elapsed time.
 
-## Runtime and security invariants
+## Runtime
 
-- One instance per token/session; preserve locking and exit codes.
-- Jobs have isolated IDs/state, explicit lifecycle transitions and bounded failure
-  categories. Admission caps and submission inserts are atomic; queue overflow refuses
-  work with a clear Persian explanation.
-- Preserve independent stage/provider caps. Never hold one stage slot while waiting
-  on another. Available fallback capacity receives overflow immediately; all-full
-  waits are bounded. Release leases in `finally` and keep release idempotent.
-- Never block the event loop with file/image/document work. Use `fileio.run_file_io`
-  or bounded threads; media uses bounded child processes, fixed argv, no shell and
-  no network media protocols. Validate ZIP names, entries, symlinks and expanded sizes.
-- Bound uploads, source text, drafts, response bodies, timeouts and outputs. Refuse
-  overflow; never silently truncate. See [limits](docs/CONFIGURATION.md).
-- Serialize `BEGIN IMMEDIATE` writes. Reports use the query-only read connection,
-  never mutate state or take the write lock. Keep foreign keys enabled and IDs exact int64.
-- Shutdown: stop intake, reject queued jobs, join active delivery/document/receipt/
-  Office/learning work, then close SQLite. Recovery follows the instance lock:
-  fail interrupted work, release holds, restore gifts/refund pending learning once,
-  clean stale temporary work. Clean temporary artifacts in `finally`.
-- Keep private paths outside web roots, owner-only on cPanel. Validate receipt paths,
-  image signatures/pixel bounds and re-encode before storage.
-- Secrets come only from env/`.env`. Redact errors; logs contain references/metadata,
-  never transcript/document/receipt contents. No user input reaches a shell.
-- Admin authorization fails closed; private callbacks check owner ID. Audit and
-  cooldown-limit changes, protecting self/peer admins. Only channel-membership
-  infrastructure errors fail open; confirmed non-membership blocks.
-- Respect Telegram UTF-16 message/button limits. Render tables before pagination.
-  Keep text helpers deterministic and idempotent.
+- Preserve single-instance locking, exit codes (`2` misconfigured, `3` already
+  running) and orderly shutdown (stop intake → reject queued → join active →
+  close SQLite).
+- Jobs have isolated state and explicit lifecycle. Admission and submission
+  inserts are atomic; overflow is refused with a clear Persian explanation.
+- Keep stage/provider caps independent; release slots in `finally` and keep the
+  release idempotent. Never hold one slot while waiting for another.
+- Never block the event loop: `fileio.run_file_io` or bounded threads for files,
+  bounded child processes with fixed argv and no shell for media.
+- Bound uploads, source text, drafts, bodies, timeouts and outputs. Refuse
+  overflow; never silently truncate.
+- Serialize `BEGIN IMMEDIATE` writes; reporting uses the query-only connection.
+  Foreign keys on, IDs exact int64.
+- Startup recovery follows the instance lock: fail interrupted work, release
+  holds, restore gifts, refund pending learning once, clean stale temp files.
 
-## Billing invariants
+## Security
 
-- Credit is an append-only integer-second, lot-aware ledger. Never rewrite history;
-  preserve earliest-expiry allocations and held lots. Refunds create non-expiring lots.
-- Reserve measured source audio before STT; refuse unmeasurable duration. Charge
-  only after complete transcript delivery. Pre-delivery failure releases holds;
-  later booklet failure is partial and leaves the transcription charge intact.
-- PowerPoint inserted silence is free; narration-free decks remain free with delivery recorded.
-- Paid learning debit, allocations and pending charge commit atomically. Saving
-  finalizes with the artifact; failure/cancel/preview expiry/recovery refunds once.
-  Failed refunds remain recoverable; never report success before commit.
-- Preserve one independent free quiz and AI deck per user, atomically claimed with
-  owned tokens. Older jobs cannot undo newer claims/admin resets. Unlimited uses
-  neither gifts nor credit. Check admission before debit; one generation per user.
-- Preserve minimum valid counts (3 questions/5 cards), quiz/deck admission caps and
-  disclosed coverage/count shortfalls. Keep paid/free previews recoverable.
-- Receipt upload never grants credit. Preserve forward-only states, frozen plan
-  snapshots, receipt/reviewer/reason checks and unique payment-linked credit.
-  Approval/status/audit commit together; notifications never repeat credit.
-- Office/document-note/export actions never debit wallet or learning gifts.
-  Separate narration/learning keeps its billing; operator provider costs may apply.
-- Unlimited releases holds; bans reject new/queued work, not running jobs.
-  Leaderboard gifts use paid plans only. Pending-review receipts never auto-expire.
+- Secrets only from env/`.env`; redact errors. Logs carry references, ids, counts
+  and durations — never keys, prompts, transcript/document text or receipts.
+- Private paths stay outside web roots; `600`/`700` on cPanel; validated receipt
+  paths and image signatures before storage.
+- Admin authorization fails closed; private callbacks check ownership; audited,
+  cooldown-limited changes never target self or peer admins.
+- Only channel-membership **infrastructure** errors fail open. Confirmed
+  non-membership blocks.
+- Mini App: verify `initData` HMAC (constant-time) with `auth_date` freshness on
+  every request, scope every query to the signed user id.
 
-## Source, Persian text and documents
+## Billing (append-only)
 
-- Deliver the complete raw transcript before notes. Failed map chunks must not
-  produce partial booklets. Validate untrusted provider output; preserve bounded
-  grounding/completeness/repair/compile checks, source order and facts.
-- Preserve source numbers/units and Persian ZWNJ. Display normalization is
-  idempotent; lossy comparison normalization is not for displayed/stored content.
-- Store logical Unicode order, never reversed BiDi. Keep mixed RTL/LTR Word runs,
-  selectable PDF text, source-only locators and grounded learning questions.
-- Use shared `mdblocks` parsing; normalize invalid controls consistently across
-  Office formats. Excel values are literal strings, never executable formulas.
-- Extraction dedup/cache and callbacks stay owner-scoped. Preserve page/section/
-  slide locators and originals in Telegram. Narration starts only explicitly.
-- Office drafts remain bounded, private and TTL-limited. Text-to-PowerPoint creates
-  a new deck, not a visual conversion; incomplete AI plans fall back safely.
-- OCR stays opt-in and remote; disabled means no page uploads. Do not promise
-  document-cache deletion through library pruning or third-party retention guarantees.
+- Credit is an integer-second, lot-aware ledger. Never rewrite history; preserve
+  earliest-expiry allocations and held lots; refunds create non-expiring lots only
+  when all contributing lots were non-expiring.
+- Reserve measured audio before STT; charge only after the transcript is stored
+  and delivered; pre-delivery failure releases the hold.
+- Learning debits commit with a durable pending charge; save finalizes; failure,
+  cancel, preview expiry and recovery refund at most once.
+- Office, document notes and exports never spend credit or gifts, though they may
+  cost the operator provider money.
+- Receipts never grant credit; approval, credit and audit commit together.
 
-## Implementation and verification
+## Documents and Persian text
 
-- Use typed Python, domain helpers and existing exception patterns. Never reformat
-  unrelated code or run a repository-wide formatter.
-- Declare bounded dependencies in `pyproject.toml`; generate `requirements.txt`
-  with `python -m scripts.sync_requirements`, never hand-edit it. Justify additions.
-- New settings flow through config and are documented in `.env.example` and
-  `docs/CONFIGURATION.md`. `--check` stays offline and side-effect-free.
-- Add numbered migrations in `migrations/v3/`; never edit applied SQL. Test fresh
-  databases, populated upgrades, foreign keys and replay safety.
-- Add regression/failure/race tests for behavior changes. Use no live keys or
-  production data. See [Testing](docs/TESTING.md) for both shell variants.
-- Full gate: Ruff, mypy, pytest, unittest discovery, requirement sync, compileall
-  and media-worker check. Report actual results/limits; partial runs are not full passes.
-- Update affected docs and `docs/CHANGELOG.md`. Report changes, verification and
-  unresolved risks. Do not commit generated artifacts, secrets or private fixtures.
+- Deliver the full raw transcript before notes. Failed chunks never produce a
+  partial booklet; truncated completions are refused.
+- Keep grounding/completeness/repair gates and source order. Preserve source
+  numbers, units and ZWNJ; display normalization must stay idempotent.
+- Store logical Unicode order — never reversed BiDi. PDF and DOCX render from the
+  same validated `StructuredNotes` model.
+- Excel values are literal strings, never executable formulas.
+- OCR stays opt-in and remote; disabled means no page uploads.
+
+## Verification
+
+- Typed Python, domain helpers, existing exception patterns. Never reformat
+  unrelated code.
+- Declare dependencies in `pyproject.toml`; regenerate `requirements.txt` with
+  `python -m scripts.sync_requirements`. Justify additions.
+- New settings flow through `config.py`, `.env.example` and
+  `docs/CONFIGURATION.md`; `--check` stays offline and side-effect free.
+- Add numbered migrations in `migrations/v3/`; never edit applied SQL. Test
+  fresh, populated and replay paths.
+- Add regression/failure/race tests. Full gate in [Testing](docs/TESTING.md):
+  Ruff, mypy, pytest, unittest discovery, requirement sync, compileall and the
+  media-worker check. Report what actually ran; partial runs are not passes.
+- Keep the doc set short: update the affected guide, this file only if a rule
+  changed, and `docs/CHANGELOG.md` for behaviour. Keep
+  `tests/test_config_consistency.py` green — it checks local links and that the
+  docs do not advertise removed settings.
+- Do not commit generated artifacts, secrets or private fixtures.

@@ -1,40 +1,38 @@
 # Operations
 
-Run one instance per token/session. Paths below assume the default configuration;
-include custom paths in backups and log commands.
+One instance per token/session. Paths below are defaults; add your own paths to
+the backup commands if you changed them.
 
 ## Start and stop
 
-**Windows PowerShell:**
+**Windows PowerShell**
 
 ```powershell
-.\.venv\Scripts\python.exe -m gamas_bot --check
-.\.venv\Scripts\python.exe -m gamas_bot
+.\.venv\Scripts\python.exe scripts\ensure_running.py start
+.\.venv\Scripts\python.exe scripts\ensure_running.py status
+.\.venv\Scripts\python.exe scripts\ensure_running.py stop
 ```
 
-Stop with **Ctrl+C** and wait for shutdown. Keep the foreground console open.
-
-**cPanel Terminal** (virtualenv active):
+**cPanel**
 
 ```bash
+python scripts/ensure_running.py start
 python scripts/ensure_running.py status
 python scripts/ensure_running.py stop
-python scripts/ensure_running.py restart
 ```
 
-Pause cron and Passenger/monitor triggers before maintenance, or they can restart
-the bot. Stop must report `stopped` before copying data. After fixing a startup
-error, `python scripts/ensure_running.py --force` bypasses the spawn throttle.
-Never delete an active lock or use broad process-kill commands.
+Foreground mode (`python -m gamas_bot`) stops with **Ctrl+C**; wait for the
+shutdown to finish. Before maintenance, disable the cron job / scheduled task
+(and any uptime monitor pointing at `passenger_wsgi.py`), otherwise the watchdog
+restarts the bot within a minute. After fixing a startup error,
+`ensure_running.py --force` bypasses the 45-second spawn throttle. Never delete
+an active lock file and never kill processes by name on shared hosting.
 
 ## Logs
 
-Foreground uses stdout unless `LOG_FILE` is set. The background launcher defaults
-to `data/logs/bot.log`; startup diagnostics go to `data/logs/launcher.err`.
-`LOG_MAX_BYTES` defaults to 5 MiB, `LOG_BACKUP_COUNT` to 5 rotating backups.
-
 ```powershell
 Get-Content .\data\logs\bot.log -Tail 80 -Wait
+Get-Content .\data\logs\launcher.err -Tail 40
 ```
 
 ```bash
@@ -42,35 +40,34 @@ tail -n 80 data/logs/bot.log
 tail -n 80 data/logs/launcher.err
 ```
 
-Use the `GMS-#####` job reference. Share only redacted metadata, never private content.
-`LLM request sending ... requested_output_tokens=<n>` records the output budget
-actually sent by that request; `note provider usage ... output_tokens=<n>` is the
-provider's real completion usage. `note provider failed; trying the next one`
-records failover with the safe provider detail (request IDs included, keys
-redacted). Environment changes apply only after a restart: stop with
-`python scripts/ensure_running.py stop`, confirm `status`, then start with
-`--force`; a running process keeps the previous provider order and budget.
+Foreground runs log to the console; the launcher's child always writes
+`data/logs/bot.log`. Rotation: `LOG_MAX_BYTES=5242880` × `LOG_BACKUP_COUNT=5`.
+Useful lines:
 
-## Backups and restore
+- `GMS-#####` — job reference to quote in support.
+- `LLM request sending … requested_output_tokens=<n>` — the budget actually sent.
+- `note provider usage … output_tokens=<n>` — what the provider billed.
+- `note provider failed; trying the next one` — failover with a safe reason.
 
-Disable start triggers, stop the bot and verify shutdown first. Store backups
-encrypted, outside web roots and Git. Never share a session file.
+Logs never contain keys, prompts or transcript text. Environment changes need a
+restart.
 
-Back up `.env` and the entire private `data/` directory: database, any SQLite
-sidecars, Telegram session and receipts. Include configured paths outside `data/`.
-Copying a live SQLite file alone can lose WAL transactions. Live backups need
-SQLite's backup API plus coordinated session/receipt handling.
+## Backup and restore
 
-**Windows PowerShell** (bot stopped):
+Stop triggers and the bot, confirm `status` is `stopped`, then copy `.env` and the
+**whole** `data/` directory (database, `-wal`/`-shm` sidecars, session, receipts,
+logs). Copying only the `.db` file while it is live can lose WAL transactions.
+
+**Windows PowerShell**
 
 ```powershell
-$Backup = Join-Path $HOME ("Gamas-backups/" + (Get-Date -Format "yyyyMMdd-HHmmss"))
+$Backup = Join-Path $HOME ("Gamas-backups\" + (Get-Date -Format "yyyyMMdd-HHmmss"))
 New-Item -ItemType Directory -Path $Backup -Force | Out-Null
 Copy-Item .env -Destination $Backup
 Copy-Item data -Destination $Backup -Recurse
 ```
 
-**cPanel Terminal** (bot stopped):
+**cPanel**
 
 ```bash
 umask 077
@@ -80,51 +77,103 @@ cp -p .env "$BACKUP/"
 cp -a data "$BACKUP/"
 ```
 
-Verify the copy succeeded; restrict Windows backup access to the operator account.
-Record `git rev-parse HEAD` and the Python version alongside the backup.
+Keep backups encrypted and outside web roots, Cloud-sync folders and Git. Record
+`git rev-parse HEAD` and the Python version with each backup.
 
-To restore: stop triggers and the bot, preserve current files separately, restore
-matching code, `.env` and the **complete** data set, reinstall dependencies, run
-`--check`, start and inspect logs. Never mix a restored DB with stale WAL/SHM files
-or run older code against a newer schema. Test recovery on an isolated copy;
-never connect two copies of the same Telegram session.
+**Restore:** stop triggers and the bot, move the current files aside, restore
+matching code + `.env` + the complete data set, reinstall dependencies, run
+`--check`, start, and read the log. Never mix a restored database with stale
+`-wal`/`-shm` files, never run older code against a newer schema, and never
+connect two copies of one Telegram session.
 
-## Updates and retention
+## Updates
 
-Use [Windows update steps](DEPLOY_WINDOWS.md#3-update) or
-[cPanel update steps](DEPLOY_CPANEL.md#5-update-safely). Migrations run at startup.
+Follow [Windows step 7](WINDOWS.md#7-update) or
+[cPanel step 6](CPANEL.md#6-update-safely). Migrations run at startup; there is no
+separate migration command. Update code and data together — a downgrade needs
+both.
 
-- Reviewed receipt images expire after 90 days by default; pending-review receipts,
-  payment rows and ledger history remain.
-- `TRANSCRIPT_RETENTION_DAYS=0` keeps transcript text forever. A positive value
-  removes old finished-job text in bounded batches, not active work.
-- Job temporary files are cleaned after work; startup sweeps stale work directories.
-- Uploaded-document text has no automatic retention policy. Library pruning does
-  not delete this cache. Monitor disk use and plan a privacy policy.
+Legacy v2 data import is exceptional: read
+`python scripts/import_v2.py --help`, test on copies, never on live data.
 
-### Optional database retention and maintenance
+## Retention
 
-`DOCUMENT_RETENTION_DAYS`, `LEARNING_RETENTION_DAYS`, `AUDIT_RETENTION_DAYS`,
-and `HOLDS_RETENTION_DAYS` default to 0 (off). The daily sweep removes old
-unlinked document caches, terminal quiz sessions, audit records, and released
-holds respectively, in batches of at most 500. Live library-linked documents,
-active quizzes, outstanding holds, and leaderboard points remain intact. A
-passive WAL checkpoint runs daily and SQLite optimize weekly.
+| Data | Default |
+| --- | --- |
+| Reviewed receipt images | 90 days (`RECEIPT_RETENTION_DAYS`) |
+| Pending-review receipts, payments, ledger | kept |
+| Transcript text | kept (`TRANSCRIPT_RETENTION_DAYS=0`) |
+| Job temporary files | cleaned after each job, stale work swept at startup |
+| Uploaded-document text cache | kept (`DOCUMENT_RETENTION_DAYS=0`) |
+| Quizzes, audits, released holds | kept within their retention settings |
 
-The learning retention default is 0 rather than 90: WO-DB-7 explicitly requires
-all retention knobs to default off, preserving deployed data.
+Setting `DOCUMENT_RETENTION_DAYS`, `LEARNING_RETENTION_DAYS`,
+`AUDIT_RETENTION_DAYS` or `HOLDS_RETENTION_DAYS` to a positive number enables a
+daily batched sweep (500 rows per run) of unlinked/terminal rows only. Library
+pruning does **not** erase the document text cache — plan a privacy policy for
+it deliberately.
 
-### Broadcasts
+The database is also housekept automatically: a passive WAL checkpoint daily and
+`PRAGMA optimize` weekly.
 
-Broadcasts require an administrator preview and confirmation and run one at a
-time. They exclude banned users and recipients with three permanent Telegram
-delivery failures; a successful send resets the failure counter. A stopped or
-interrupted run can be resumed by its administrator after re-entering the same
-text (verified by SHA-256). Cursors are checkpointed per batch, so an abrupt
-process crash can cause delivery to be repeated within the last uncheckpointed
-batch; Telegram has no transactional exactly-once send. The text itself is not
-stored in the database.
+## Host sizing
 
-Released-hold retention removes detailed allocations but retains a compact
-submission tombstone. This prevents the same submission from being reserved
-again and preserves settlement/delivery idempotency after cleanup.
+| Resource | Default |
+| --- | --- |
+| Active / queued / per-user jobs | 3 / 8 / 2 |
+| Downloads / media workers / uploads | 2 / 1 / 2 |
+| STT slots (Speechmatics / Deepgram / OpenAI-compatible) | 2 / 4 / 2 |
+| Note-map concurrency / primary / fallback LLM slots | 3 / 4 / 4 |
+| Media upload / duration | 128 MiB / 2 h |
+| Temporary reserve | 64 MiB plus working copies |
+| Office builds | 2 |
+
+Independent stages overlap network waits, so a single media worker is fine.
+`NOTE_MAX_OUTPUT_TOKENS` is a per-request budget, not RAM: 32 768 tokens at a
+conservative 20 tokens/s can exceed the 900 s request deadline, which `--check`
+warns about. `NOTE_HEDGE_AFTER_SECONDS` and the retry ladder add requests — count
+them on free tiers.
+
+Recommended 2 GB cPanel profile (`.env`):
+
+```dotenv
+MAX_ACTIVE_JOBS=3
+MAX_QUEUED_JOBS=6
+MEDIA_WORKER_CONCURRENCY=1
+MAX_CONCURRENT_DOWNLOADS=2
+TELEGRAM_DOWNLOAD_CONNECTIONS=1
+NOTE_CONCURRENCY=3
+LEARNING_CHUNK_CONCURRENCY=2
+LEARNING_GLOBAL_CONCURRENCY=2
+NOTE_HEDGE_AFTER_SECONDS=60
+DOC_MAX_BYTES=20971520
+```
+
+If the account gets throttled: check CPU/RAM/process/disk quotas first, then
+lower jobs, media and note concurrency, then file limits. Cron cannot bypass host
+quotas — move to a VPS if the host kills permitted background work. Document
+parsing uses bounded threads, not a memory sandbox: pathological files still cost
+CPU.
+
+## Monitoring
+
+- `python -m gamas_bot --check` — offline, safe to run while the bot serves.
+- `python scripts/ensure_running.py status` — process state and PID.
+- `GET /health` on the optional Passenger app — `running`/`starting`/`error`.
+- `GET /health` on the Mini App — JSON with `database: true/false`.
+
+An uptime monitor should poll at 5-minute intervals and only pages you, not
+restart the bot.
+
+## Benchmarks (isolated checkout only)
+
+```bash
+python -m scripts.concurrency_bench --help
+python -m scripts.perf_bench --help
+python -m scripts.admin_report_bench --help
+python -m scripts.document_chunk_bench --help
+```
+
+Simulated latencies and 429s are inputs, not live measurements. Record settings,
+Python version, workload and host quota with any number you publish; never promise
+fixed throughput.
