@@ -91,6 +91,8 @@ class JobPipelineMixin:
     _active_upload_keys: dict[tuple[int, str], str]
     _seen_messages: dict[tuple[int, int], float]
     _media_semaphore: asyncio.Semaphore
+    _protected_curation_items: Any
+    _ack: Any
 
     async def _require_membership(
         self, event: Any, user_id: int, *, kind: str, callback_data: str = ""
@@ -282,7 +284,7 @@ class JobPipelineMixin:
         if not unlimited and available < needed:
             has_duration = duration is not None and duration > 0
             measured = (
-                "مدت فایل: " + format_credit_duration(duration)  # type: ignore[arg-type]
+                "مدت فایل: " + format_credit_duration(duration)
                 if has_duration
                 else "مدت فایل نامشخص است"
             )

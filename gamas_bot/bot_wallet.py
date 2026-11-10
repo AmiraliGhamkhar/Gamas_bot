@@ -56,6 +56,9 @@ class WalletWorkflowMixin:
     client: Any
     _pending_payments: dict[int, int]
     _pending_reject_reason: dict[int, int]
+    # Supplied by the composed bot.
+    deps: Any
+    _edit_or_reply: Any
 
     REJECTION_REASON_PRESETS: dict[str, str] = texts.RECEIPT_REJECT_REASONS
     TRANSCRIPT_CLEANUP_BATCHES = 25
@@ -185,7 +188,7 @@ class WalletWorkflowMixin:
                 [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
             ]
         )
-        await self._edit_or_reply(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
+        await self._edit_or_reply(event, "\n".join(lines), buttons)
 
     async def _start_payment(self, event: Any, plan_code: str) -> None:
         if not self.settings.payment_card_number:
@@ -555,7 +558,7 @@ class WalletWorkflowMixin:
             seconds = int(payment.get("purchased_seconds") or 0)
             price = payment.get("purchased_price")
             owner = await self._identity_for_id(int(payment["user_id"]))  # type: ignore[attr-defined]
-            await self._edit_or_reply(  # type: ignore[attr-defined]
+            await self._edit_or_reply(
                 event,
                 texts.APPROVE_CONFIRM_TEMPLATE.format(
                     payment_id=to_persian_digits(payment_id),

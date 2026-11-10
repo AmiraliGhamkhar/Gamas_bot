@@ -114,6 +114,9 @@ class LearningWorkflowMixin:
     deps: BotDependencies
     _shutting_down: bool
     _learning_locks: MutableMapping[int, asyncio.Lock]
+    _learning_global_semaphore: Any
+    _edit: Any
+    _ack: Any
 
     async def _require_membership(
         self, event: Any, user_id: int, *, kind: str, callback_data: str = ""
@@ -304,7 +307,7 @@ class LearningWorkflowMixin:
         active = [index for index, count in enumerate(counts) if count > 0]
         total = len(active)
         state = {"done": 0, "failed": 0}
-        fractions = {index: 0.0 for index in active}
+        fractions = dict.fromkeys(active, 0.0)
         progress_changed = asyncio.Event()
         finished = False
         session = self._http_session()  # type: ignore[attr-defined]
@@ -391,7 +394,17 @@ class LearningWorkflowMixin:
                         # Never wait for a provider slot while holding the generation slot.
                         wait_for_capacity=False,
                     )
-                    def validate_and_merge() -> list[dict[str, Any]]:
+                    def validate_and_merge(
+                        payload: dict[str, Any] = payload,
+                        batch: int = batch,
+                        items: list[dict[str, Any]] = items,
+                    ) -> list[dict[str, Any]]:
+                        """Parse and anchor one batch, off the event loop.
+
+                        The defaults bind this iteration's values. Reading the
+                        enclosing loop variables instead would be a late-binding
+                        bug the moment the call stopped being awaited in place.
+                        """
                         if kind == "deck":
                             parsed = parse_flashcard_payload(payload, batch)
                         else:
@@ -546,7 +559,7 @@ class LearningWorkflowMixin:
         if not chunks:
             await event.respond("متنی برای ساخت محتوا پیدا نشد. فایل دیگری بفرستید.")
             return
-        await self._ack(event)  # type: ignore[attr-defined]
+        await self._ack(event)
         budget_task = asyncio.create_task(
             self._claim_generation_budget(event, user_id, kind, cost, note)
         )
@@ -895,9 +908,9 @@ class LearningWorkflowMixin:
     async def _cancel_curation(self, event: Any, user_id: int) -> None:
         state = self._curation.get(user_id)
         if state is None or not await self._release_curation(user_id, state):
-            await self._ack(event, CURATION_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, CURATION_STALE_ALERT, alert=True)
             return
-        await self._ack(event, "لغو شد.")  # type: ignore[attr-defined]
+        await self._ack(event, "لغو شد.")
         if not state.get("refund_ok", True):
             result = LEARNING_REFUND_PENDING_NOTICE
         elif state.get("charged"):
@@ -906,7 +919,7 @@ class LearningWorkflowMixin:
             result = "هدیهٔ رایگان شما حفظ شد."
         else:
             result = "هزینه‌ای کسر نشده است."
-        await self._edit(  # type: ignore[attr-defined]
+        await self._edit(
             event,
             "❌ ساخت لغو شد؛ " + result,
             [[Button.inline("📚 کتابخانه من", b"library")]],
@@ -934,13 +947,13 @@ class LearningWorkflowMixin:
         if self._curation_stale(state):
             if state is not None:
                 await self._release_curation(user_id, state)
-            await self._ack(event, CURATION_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, CURATION_STALE_ALERT, alert=True)
             return
         assert state is not None
         items = state["items"]
         minimum = MIN_VALID_CARDS if state["kind"] == "deck" else MIN_VALID_QUESTIONS
         if len(items) < minimum:
-            await self._ack(  # type: ignore[attr-defined]
+            await self._ack(
                 event,
                 f"برای ذخیره حداقل {to_persian_digits(minimum)} مورد لازم است.",
                 alert=True,
@@ -1001,7 +1014,7 @@ class LearningWorkflowMixin:
                 if state.get("free")
                 else ""
             )
-            await self._edit(  # type: ignore[attr-defined]
+            await self._edit(
                 event,
                 LEARNING_GENERATION_FAILED + (f"\n{notice}" if notice else ""),
                 [[Button.inline("📚 کتابخانه من", b"library")]],
@@ -1016,21 +1029,21 @@ class LearningWorkflowMixin:
         )) if refund else ""
         if state["kind"] == "deck":
             deck = await self.db.deck_get(artifact_id, user_id)
-            await self._ack(event, texts.LEARNING_DECK_SAVED + refund_notice)  # type: ignore[attr-defined]
+            await self._ack(event, texts.LEARNING_DECK_SAVED + refund_notice)
             if deck is None:
-                await self._edit(  # type: ignore[attr-defined]
+                await self._edit(
                     event,
                     "✅ مجموعه ذخیره شد؛ از «کتابخانه من» بازش کنید.",
                     [[Button.inline("↩️ فلش‌کارت‌ها", b"fc:hub")]],
                 )
             else:
-                await self._edit(  # type: ignore[attr-defined]
+                await self._edit(
                     event,
                     self._deck_screen_text(deck, len(items)),
                     self._deck_keyboard(artifact_id, bool(items)),
                 )
         else:
-            await self._ack(event, texts.LEARNING_QUIZ_READY + refund_notice)  # type: ignore[attr-defined]
+            await self._ack(event, texts.LEARNING_QUIZ_READY + refund_notice)
             await self._render_question_message(event, user_id, artifact_id)
 
     async def _handle_curation_callback(
@@ -1042,11 +1055,11 @@ class LearningWorkflowMixin:
         async with self._learning_lock(user_id):
             state = self._curation.get(user_id)
             if state is None or state["kind"] != kind:
-                await self._ack(event, CURATION_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, CURATION_STALE_ALERT, alert=True)
                 return
             if self._curation_stale(state):
                 await self._release_curation(user_id, state)
-                await self._ack(event, CURATION_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, CURATION_STALE_ALERT, alert=True)
                 return
             if action == "save":
                 await self._save_curation(event, user_id)
@@ -1060,13 +1073,13 @@ class LearningWorkflowMixin:
             if action == "del":
                 index = _to_int(parts[3]) if len(parts) > 3 else None
                 if index is None or not 0 <= index < len(state["items"]):
-                    await self._ack(event, CURATION_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+                    await self._ack(event, CURATION_STALE_ALERT, alert=True)
                     return
                 state["items"].pop(index)
                 if not state["items"]:
                     await self._cancel_curation(event, user_id)
                     return
-                await self._ack(  # type: ignore[attr-defined]
+                await self._ack(
                     event,
                     f"حذف شد؛ {to_persian_digits(len(state['items']))} مورد ماند.",
                 )
@@ -1075,20 +1088,20 @@ class LearningWorkflowMixin:
             if action in ("p", "page"):
                 page = _to_int(parts[3]) if len(parts) > 3 else None
                 if page is None:
-                    await self._ack(event, CURATION_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+                    await self._ack(event, CURATION_STALE_ALERT, alert=True)
                     return
                 state["page"] = max(0, page)
-                await self._ack(event)  # type: ignore[attr-defined]
+                await self._ack(event)
                 await self._render_curation(event, user_id)
                 return
-            await self._ack(event, CURATION_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, CURATION_STALE_ALERT, alert=True)
 
     async def _quiz_start_screen(
         self, event: Any, user_id: int, item_id: int
     ) -> None:
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None or item.get("kind") != "booklet":
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
         document = await self.db.document_by_library_item(user_id, item_id)
         if document:
@@ -1097,7 +1110,7 @@ class LearningWorkflowMixin:
             )
             return
         if not item.get("content_text"):
-            await self._edit(  # type: ignore[attr-defined]
+            await self._edit(
                 event,
                 "🧪 آزمون از جزوه\n\n" + LEARNING_LEGACY_NOTICE,
                 [[Button.inline("↩️ بازگشت", b"library")]],
@@ -1121,7 +1134,7 @@ class LearningWorkflowMixin:
         badge = ""
         if await self._free_try_available(user_id, "quiz"):
             badge = f"\n\n{FREE_TRY_BADGE} — اولین آزمون شما بدون کسر اعتبار ساخته می‌شود."
-        await self._edit(  # type: ignore[attr-defined]
+        await self._edit(
             event,
             "🧪 آزمون از جزوه\n\n" + QUIZ_START_GUIDANCE + badge,
             buttons,
@@ -1131,7 +1144,7 @@ class LearningWorkflowMixin:
         self, event: Any, user_id: int, item_id: int, count: int
     ) -> None:
         if count not in QUIZ_COUNTS:
-            await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, "تعداد سؤال نامعتبر است.", alert=True)
             return
         document = await self.db.document_by_library_item(user_id, item_id)
         if document:
@@ -1141,20 +1154,20 @@ class LearningWorkflowMixin:
             return
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None or item.get("kind") != "booklet":
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
         content = item.get("content_text")
         if not content:
-            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
             return
         if not self.settings.note_configured:
             await event.respond("سرویس ساخت آزمون در حال حاضر فعال نیست.")
             return
         if user_id in self._learning_in_flight:
-            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
             return
         if self._shutting_down:
-            await self._ack(  # type: ignore[attr-defined]
+            await self._ack(
                 event,
                 "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.",
                 alert=True,
@@ -1201,7 +1214,7 @@ class LearningWorkflowMixin:
             return
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None:
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
         await self._generate_learning(
             event,
@@ -1304,14 +1317,14 @@ class LearningWorkflowMixin:
     ) -> None:
         session = await self.db.quiz_get_session(session_id, user_id)
         if session is None:
-            await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
             return
         result = await self.db.quiz_record_answer(session_id, question_id, option)
         if result["status"] == "stale":
-            await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
             return
         if result["status"] == "already":
-            await self._ack(event, "پاسخ شما ثبت شده بود.")  # type: ignore[attr-defined]
+            await self._ack(event, "پاسخ شما ثبت شده بود.")
             return
         correct_text = result["options"][result["correct_index"]]
         if result["correct"]:
@@ -1324,7 +1337,7 @@ class LearningWorkflowMixin:
         if result["explanation"]:
             lines.append(f"💡 {result['explanation']}")
         next_label = "مشاهدهٔ نتیجه ➡️" if result["finished"] else "سؤال بعدی ➡️"
-        await self._edit(  # type: ignore[attr-defined]
+        await self._edit(
             event,
             "\n".join(lines),
             [[Button.inline(next_label, f"quiz:next:{session_id}".encode("ascii"))]],
@@ -1333,7 +1346,7 @@ class LearningWorkflowMixin:
     async def _quiz_next(self, event: Any, user_id: int, session_id: int) -> None:
         session = await self.db.quiz_get_session(session_id, user_id)
         if session is None:
-            await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
             return
         if session["status"] == "done":
             await self._show_finish_screen(event, user_id, session)
@@ -1346,7 +1359,7 @@ class LearningWorkflowMixin:
     async def _quiz_quit(self, event: Any, user_id: int, session_id: int) -> None:
         session = await self.db.quiz_get_session(session_id, user_id)
         if session is None:
-            await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, LEARNING_STALE_ALERT, alert=True)
             return
         if session["status"] == "active":
             await self.db.quiz_finish(session_id, "quit")
@@ -1366,7 +1379,7 @@ class LearningWorkflowMixin:
             f"امتیاز کسب‌شده: {to_persian_digits(session['score'])}\n"
             f"رتبهٔ شما در لیدربورد: {to_persian_digits(rank['rank'])}"
         )
-        await self._edit(event, text, self._learning_done_buttons())  # type: ignore[attr-defined]
+        await self._edit(event, text, self._learning_done_buttons())
 
     async def _show_leaderboard(self, event: Any) -> None:
         user_id = event.sender_id
@@ -1453,12 +1466,12 @@ class LearningWorkflowMixin:
         if notice:
             lines.extend(["", notice])
         buttons.append([Button.inline("↩️ بازگشت", b"adm:home")])
-        await self._edit(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
+        await self._edit(event, "\n".join(lines), buttons)
 
     async def _admin_gift_pick(self, event: Any, target_id: int) -> None:
         identity = await self.db.user_identity(target_id)
         if identity is None or identity["banned"]:
-            await self._ack(event, "این کاربر در دسترس نیست.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, "این کاربر در دسترس نیست.", alert=True)
             return
         plans = [plan for plan in await self.db.plans() if plan["price"] > 0]
         lines = [
@@ -1485,7 +1498,7 @@ class LearningWorkflowMixin:
                 ]
             )
         buttons.append([Button.inline("↩️ بازگشت", b"adm:board")])
-        await self._edit(event, "\n".join(lines), buttons)  # type: ignore[attr-defined]
+        await self._edit(event, "\n".join(lines), buttons)
 
     async def _admin_gift_confirm(
         self, event: Any, target_id: int, plan_code: str
@@ -1493,7 +1506,7 @@ class LearningWorkflowMixin:
         plan = await self._gift_plan(target_id, plan_code)
         identity = await self.db.user_identity(target_id)
         if plan is None or identity is None or identity["banned"]:
-            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
             return
         name = await self._identity_for_id(target_id)  # type: ignore[attr-defined]
         seconds = int(round(float(plan["hours"]) * 3600))
@@ -1501,7 +1514,7 @@ class LearningWorkflowMixin:
             f"هدیه به {name} با اعتبار {format_seconds_as_credits(seconds)} "
             "ثبت شود؟"
         )
-        await self._edit(  # type: ignore[attr-defined]
+        await self._edit(
             event,
             text,
             [
@@ -1533,7 +1546,7 @@ class LearningWorkflowMixin:
             return
         plan = await self._gift_plan(target_id, plan_code)
         if plan is None:
-            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, "این هدیه دیگر معتبر نیست.", alert=True)
             return
         if self._is_admin(target_id):  # type: ignore[attr-defined]
             await event.respond(
@@ -1587,7 +1600,7 @@ class LearningWorkflowMixin:
     ) -> None:
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None or item.get("kind") != "booklet":
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
         document = await self.db.document_by_library_item(user_id, item_id)
         if document:
@@ -1596,7 +1609,7 @@ class LearningWorkflowMixin:
             )
             return
         if not item.get("content_text"):
-            await self._edit(  # type: ignore[attr-defined]
+            await self._edit(
                 event,
                 "🃏 فلش‌کارت\n\n" + LEARNING_LEGACY_NOTICE,
                 [[Button.inline("↩️ بازگشت", b"library")]],
@@ -1631,7 +1644,7 @@ class LearningWorkflowMixin:
                 ]
             )
         buttons.append([self._learning_back_button(item_id)])
-        await self._edit(  # type: ignore[attr-defined]
+        await self._edit(
             event,
             text + badge + "\n\nاندازهٔ مجموعه را انتخاب کنید:",
             buttons,
@@ -1648,11 +1661,11 @@ class LearningWorkflowMixin:
             return
         item = await self.db.library_item_detail(user_id, item_id)
         if item is None or item.get("kind") != "booklet":
-            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, "این فایل دیگر در دسترس نیست.", alert=True)
             return
         content = item.get("content_text")
         if not content:
-            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
             return
         if not self.settings.note_configured:
             await event.respond("سرویس ساخت فلش‌کارت در حال حاضر فعال نیست.")
@@ -1667,10 +1680,10 @@ class LearningWorkflowMixin:
             )
             return
         if user_id in self._learning_in_flight:
-            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
             return
         if self._shutting_down:
-            await self._ack(  # type: ignore[attr-defined]
+            await self._ack(
                 event,
                 "ربات در حال راه‌اندازی مجدد است؛ دوباره تلاش کنید.",
                 alert=True,
@@ -1819,7 +1832,7 @@ class LearningWorkflowMixin:
             if nav:
                 buttons.append(nav)
         buttons.append([Button.inline("↩️ بازگشت", b"fc:hub")])
-        await self._edit(event, text, buttons)  # type: ignore[attr-defined]
+        await self._edit(event, text, buttons)
 
     async def _start_manual_deck(self, event: Any, user_id: int) -> None:
         if (
@@ -1908,10 +1921,10 @@ class LearningWorkflowMixin:
     ) -> None:
         deck = await self.db.deck_get(deck_id, user_id)
         if deck is None:
-            await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, self._deck_stale_alert(), alert=True)
             return
         cards = await self.db.deck_cards(deck_id)
-        await self._edit(  # type: ignore[attr-defined]
+        await self._edit(
             event,
             self._deck_screen_text(deck, len(cards)),
             self._deck_keyboard(deck_id, bool(cards)),
@@ -1922,11 +1935,11 @@ class LearningWorkflowMixin:
     ) -> None:
         deck = await self.db.deck_get(deck_id, user_id)
         if deck is None:
-            await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, self._deck_stale_alert(), alert=True)
             return
         cards = await self.db.deck_cards(deck_id)
         if not cards:
-            await self._ack(  # type: ignore[attr-defined]
+            await self._ack(
                 event, "این مجموعه هنوز کارتی ندارد.", alert=True
             )
             return
@@ -1935,7 +1948,7 @@ class LearningWorkflowMixin:
             await self.db.deck_set_cursor(deck_id, 0)
         card = cards[cursor]
         source = f"\n\n📍 منبع: {card['source']}" if card.get("source") else ""
-        await self._edit(  # type: ignore[attr-defined]
+        await self._edit(
             event,
             "پرسش:\n\n" + card["front"] + source,
             [
@@ -1958,14 +1971,14 @@ class LearningWorkflowMixin:
     ) -> None:
         deck = await self.db.deck_get(deck_id, user_id)
         if deck is None:
-            await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, self._deck_stale_alert(), alert=True)
             return
         card = await self.db.deck_card(deck_id, card_id)
         if card is None:
-            await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, self._deck_stale_alert(), alert=True)
             return
         source = f"\n\n📍 منبع: {card['source']}" if card.get("source") else ""
-        await self._edit(  # type: ignore[attr-defined]
+        await self._edit(
             event,
             "پاسخ:\n\n" + card["back"] + source,
             [
@@ -1987,18 +2000,18 @@ class LearningWorkflowMixin:
     ) -> None:
         deck = await self.db.deck_get(deck_id, user_id)
         if deck is None:
-            await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, self._deck_stale_alert(), alert=True)
             return
         total = len(await self.db.deck_cards(deck_id))
         if total == 0:
-            await self._ack(  # type: ignore[attr-defined]
+            await self._ack(
                 event, "این مجموعه هنوز کارتی ندارد.", alert=True
             )
             return
         new_cursor = int(deck["study_cursor"]) + 1
         await self.db.deck_set_cursor(deck_id, new_cursor)
         if new_cursor >= total:
-            await self._edit(  # type: ignore[attr-defined]
+            await self._edit(
                 event,
                 ("مرور تمام شد — " f"{to_persian_digits(total)} کارت مرور شد."),
                 [
@@ -2018,16 +2031,16 @@ class LearningWorkflowMixin:
     ) -> None:
         deck = await self.db.deck_get(deck_id, user_id)
         if deck is None:
-            await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+            await self._ack(event, self._deck_stale_alert(), alert=True)
             return
         cards = await self.db.deck_cards(deck_id)
         if not cards:
-            await self._ack(  # type: ignore[attr-defined]
+            await self._ack(
                 event, "این مجموعه هنوز کارتی ندارد.", alert=True
             )
             return
         progress = WorkProgress.for_editor(
-            lambda text: self._edit(event, text, []),  # type: ignore[attr-defined]
+            lambda text: self._edit(event, text, []),
             headline="🃏 خروجی فلش‌کارت",
             done_headline="✅ فایل آماده شد",
         )
@@ -2074,7 +2087,7 @@ class LearningWorkflowMixin:
                 force_document=True,
             )
         except Exception:
-            await self._edit(  # type: ignore[attr-defined]
+            await self._edit(
                 event,
                 failed_progress_text(
                     progress.percent,
@@ -2086,7 +2099,7 @@ class LearningWorkflowMixin:
             raise
         finally:
             await run_file_io(shutil.rmtree, workdir, ignore_errors=True)
-        await self._edit(  # type: ignore[attr-defined]
+        await self._edit(
             event,
             completed_progress_text(
                 f"✅ فایل Word شامل {to_persian_digits(len(cards))} کارت ارسال شد.",
@@ -2126,14 +2139,14 @@ class LearningWorkflowMixin:
         if action == "ai" and len(parts) == 3:
             item_id = _to_int(parts[2])
             if item_id is None:
-                await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, self._deck_stale_alert(), alert=True)
                 return
             await self._flashcard_start_screen(event, user_id, item_id)
             return
         if action == "go" and len(parts) in (3, 4):
             item_id = _to_int(parts[2])
             if item_id is None:
-                await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, self._deck_stale_alert(), alert=True)
                 return
             preset = parts[3] if len(parts) == 4 else None
             if preset is not None and preset_cards(preset) is None:
@@ -2161,7 +2174,7 @@ class LearningWorkflowMixin:
         ):
             deck_id = _to_int(parts[2])
             if deck_id is None:
-                await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, self._deck_stale_alert(), alert=True)
                 return
             if action == "deck":
                 await self._show_deck_screen(event, user_id, deck_id)
@@ -2176,9 +2189,9 @@ class LearningWorkflowMixin:
             elif action == "del":
                 deck = await self.db.deck_get(deck_id, user_id)
                 if deck is None:
-                    await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+                    await self._ack(event, self._deck_stale_alert(), alert=True)
                     return
-                await self._edit(  # type: ignore[attr-defined]
+                await self._edit(
                     event,
                     "آیا مطمئنید؟",
                     [
@@ -2198,7 +2211,7 @@ class LearningWorkflowMixin:
             elif action == "delok":
                 deleted = await self.db.deck_delete(deck_id, user_id)
                 if not deleted:
-                    await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+                    await self._ack(event, self._deck_stale_alert(), alert=True)
                 else:
                     await self._show_flashcard_hub(event)
             elif action == "done":
@@ -2212,11 +2225,11 @@ class LearningWorkflowMixin:
             deck_id = _to_int(parts[2])
             card_id = _to_int(parts[3])
             if deck_id is None or card_id is None:
-                await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, self._deck_stale_alert(), alert=True)
                 return
             await self._flip_card(event, user_id, deck_id, card_id)
             return
-        await self._ack(event, self._deck_stale_alert(), alert=True)  # type: ignore[attr-defined]
+        await self._ack(event, self._deck_stale_alert(), alert=True)
 
     async def _route_quiz_callback(
         self, event: Any, user_id: int, data: str
@@ -2229,7 +2242,7 @@ class LearningWorkflowMixin:
         if action == "new" and len(parts) == 3:
             item_id = _to_int(parts[2])
             if item_id is None:
-                await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
                 return
             await self._quiz_start_screen(event, user_id, item_id)
             return
@@ -2237,7 +2250,7 @@ class LearningWorkflowMixin:
             item_id = _to_int(parts[2])
             count = _to_int(parts[3])
             if item_id is None or count is None:
-                await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
                 return
             if not await self._require_membership(
                 event, user_id, kind="callback", callback_data=data
@@ -2250,7 +2263,7 @@ class LearningWorkflowMixin:
             question_id = _to_int(parts[3])
             option = _to_int(parts[4])
             if session_id is None or question_id is None or option is None:
-                await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
                 return
             await self._quiz_answer(
                 event, user_id, session_id, question_id, option
@@ -2259,11 +2272,11 @@ class LearningWorkflowMixin:
         if action in ("next", "quit") and len(parts) == 3:
             session_id = _to_int(parts[2])
             if session_id is None:
-                await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+                await self._ack(event, LEARNING_STALE_ALERT, alert=True)
                 return
             if action == "next":
                 await self._quiz_next(event, user_id, session_id)
             else:
                 await self._quiz_quit(event, user_id, session_id)
             return
-        await self._ack(event, LEARNING_STALE_ALERT, alert=True)  # type: ignore[attr-defined]
+        await self._ack(event, LEARNING_STALE_ALERT, alert=True)

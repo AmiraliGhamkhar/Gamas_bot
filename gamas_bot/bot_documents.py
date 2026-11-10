@@ -112,6 +112,9 @@ class DocumentOfficeWorkflowMixin:
     _ocr_client: I2OCRClient | None
     _document_locks: MutableMapping[tuple[int, str], asyncio.Lock]
     _document_semaphore: asyncio.Semaphore
+    # Supplied by the composed bot.
+    conversations: Any
+    _protected_curation_items: Any
 
     async def _require_membership(
         self, event: Any, user_id: int, *, kind: str, callback_data: str = ""

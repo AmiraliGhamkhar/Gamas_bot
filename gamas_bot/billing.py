@@ -314,5 +314,7 @@ def format_credits_number(credits: int | float | None) -> str:
 
 def format_credits_with_hours(credits: int, hours: int | float) -> str:
     """«۱٬۰۸۰٬۰۰۰ اعتبار (۳ ساعت)» — what a plan promises, in both units."""
-    whole = int(hours) if float(hours).is_integer() else hours
-    return f"{format_credits(credits)} ({to_persian_digits(whole)} ساعت)"
+    # Always an int: a plan of "۲٫۵ ساعت" does not exist, and the credit table
+    # is expressed in whole hours (3, 9, 12, 24, 36, 60).
+    whole_hours = int(round(float(hours)))
+    return f"{format_credits(credits)} ({to_persian_digits(whole_hours)} ساعت)"

@@ -94,7 +94,7 @@ def distribute_counts(total: int, weights: list[int]) -> list[int]:
         else:
             allocated = distribute_counts(total, [weights[i] for i in selected])
         counts = [0] * len(weights)
-        for index, count in zip(selected, allocated):
+        for index, count in zip(selected, allocated, strict=True):
             counts[index] = count
         return counts
     clean = [max(1, int(weight)) for weight in weights]

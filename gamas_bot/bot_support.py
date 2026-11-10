@@ -34,8 +34,11 @@ class SupportWorkflowMixin:
     db: Any
     settings: Any
     client: Any
-    _support_states: dict[int, tuple[str, object, float]]
+    _support_states: dict[int, tuple[str, Any, float]]
     _support_admin_states: dict[int, tuple[int, float]]
+    # Supplied by the composed bot.
+    deps: Any
+    _edit_or_reply: Any
 
     SUPPORT_PAGE_SIZE = 8
     SUPPORT_HISTORY_PAGE = 6
@@ -79,7 +82,7 @@ class SupportWorkflowMixin:
     async def _show_ticket_screen(self, event: Any, text: str, buttons: Any) -> None:
         """Send every character of a history without exceeding Telegram limits."""
         pages = split_message(text)
-        await self._edit_or_reply(  # type: ignore[attr-defined]
+        await self._edit_or_reply(
             event, pages[0], buttons if len(pages) == 1 else None
         )
         for index, page in enumerate(pages[1:], start=1):
@@ -110,7 +113,7 @@ class SupportWorkflowMixin:
             [Button.inline(texts.BTN_MY_TICKETS, b"sup:list")],
             [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
         ]
-        await self._edit_or_reply(event, text, buttons)  # type: ignore[attr-defined]
+        await self._edit_or_reply(event, text, buttons)
 
     async def _show_support_categories(self, event: Any) -> None:
         buttons = [
@@ -118,7 +121,7 @@ class SupportWorkflowMixin:
             for key, label in SUPPORT_CATEGORY_BUTTONS.items()
         ]
         buttons.append([Button.inline(texts.BTN_BACK, b"support")])
-        await self._edit_or_reply(  # type: ignore[attr-defined]
+        await self._edit_or_reply(
             event, texts.SUPPORT_CHOOSE_CATEGORY, buttons
         )
 
@@ -157,7 +160,7 @@ class SupportWorkflowMixin:
             buttons.append(nav)
         buttons.append([Button.inline(texts.BTN_NEW_TICKET, b"sup:new")])
         buttons.append([Button.inline(texts.BTN_BACK, b"support")])
-        await self._edit_or_reply(event, text, buttons)  # type: ignore[attr-defined]
+        await self._edit_or_reply(event, text, buttons)
 
     async def _owned_ticket(self, user_id: int, ticket_id: int) -> dict | None:
         """The ticket only when the signed-in user owns it (never by id alone)."""
@@ -567,7 +570,7 @@ class SupportWorkflowMixin:
         if not rows:
             text += texts.SUPPORT_EMPTY_LIST
         buttons.append([Button.inline(texts.BTN_BACK_ADMIN, b"adm:home")])
-        await self._edit_or_reply(event, text, buttons)  # type: ignore[attr-defined]
+        await self._edit_or_reply(event, text, buttons)
 
     async def _show_admin_ticket(
         self, event: Any, ticket_id: int, page: int = 0

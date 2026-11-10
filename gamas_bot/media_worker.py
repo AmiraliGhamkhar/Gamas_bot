@@ -186,7 +186,7 @@ def _graph_pull(graph, sink_pad) -> list:
     """Drain every frame the sink currently holds, tolerating EAGAIN/EAGAIN-EOF."""
     import av
 
-    frames = []
+    frames: list = []
     if graph is None or sink_pad is None:
         return frames
     while True:

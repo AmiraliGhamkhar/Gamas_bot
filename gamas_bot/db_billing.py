@@ -139,7 +139,7 @@ class BillingRepositoryMixin(DatabaseCore):
 
     async def _flush_balance_dirty_locked(self, limit: int | None = None) -> int:
         sql = "SELECT user_id FROM balance_dirty ORDER BY user_id"
-        params = ()
+        params: tuple[Any, ...] = ()
         if limit is not None:
             sql += " LIMIT ?"
             params = (int(limit),)

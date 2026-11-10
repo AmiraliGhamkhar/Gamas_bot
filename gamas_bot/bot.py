@@ -1112,7 +1112,9 @@ class GamasBot(
             await self._cb_help(event, user_id, "")
             return True
         if label == texts.BTN_ADMIN and self._is_admin(user_id):
-            await self._show_admin(event)
+            # The same screen the inline "adm:home" route renders: one admin
+            # panel, reached by two paths, with no second implementation to drift.
+            await self._show_admin_overview(event)
             return True
         handler = routes.get(label)
         if handler is None:
@@ -1332,15 +1334,20 @@ class GamasBot(
         await self._edit_or_reply(event, texts.BROADCAST_CANCELLED, self._admin_menu())
 
     async def _cb_broadcast_resume(self, event, user_id: int, data: str) -> None:
-        run_id = _to_int(data.rsplit(":", 1)[-1])
-        run = await self.db.broadcast_get_run(run_id) if run_id is not None else None
+        # `or None` keeps the "not an integer" and "0" cases identical: neither
+        # is a real run id, and passing None skips the query entirely.
+        found = _to_int(data.rsplit(":", 1)[-1]) or None
+        if found is None:
+            await self._ack(event, texts.INVALID_REQUEST, alert=True)
+            return
+        run = await self.db.broadcast_get_run(found)
         if not run or run["admin_id"] != user_id or run["status"] != "stopped":
             await self._ack(event, texts.INVALID_REQUEST, alert=True)
             return
         if self._broadcast_running:
             await self._ack(event, texts.BROADCAST_RUNNING, alert=True)
             return
-        self._broadcast_resume[user_id] = int(run_id)
+        self._broadcast_resume[user_id] = found
         self._pending_broadcast.add(user_id)
         await event.respond(texts.BROADCAST_RESUME_PROMPT)
 

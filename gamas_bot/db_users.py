@@ -13,6 +13,9 @@ from .db_core import DatabaseCore, UserRow, _rows, iso
 class UsersRepositoryMixin(DatabaseCore):
     """Single-responsibility persistence slice for user accounts and free tries."""
 
+    # Provided by ``BillingRepositoryMixin``. Declared as an annotation only:
+    # assigning a body here would shadow the real method through the MRO.
+    _refresh_balance_locked: Any
     FREE_USE_COLUMNS: dict[str, str] = {
         "deck": "free_deck_used",
         "quiz": "free_quiz_used",
@@ -254,6 +257,8 @@ class UsersRepositoryMixin(DatabaseCore):
                 "INSERT INTO broadcast_runs(admin_id,text_hash,pages,created_at,updated_at) "
                 "VALUES(?,?,1,?,?)", (int(admin_id), text_hash, now, now),
             )
+            # A successful INSERT always populates lastrowid.
+            assert cursor.lastrowid is not None
             return int(cursor.lastrowid)
 
     async def broadcast_get_run(self, run_id: int) -> dict[str, Any] | None:
