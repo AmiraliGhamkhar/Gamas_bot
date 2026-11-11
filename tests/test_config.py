@@ -69,6 +69,11 @@ class FromEnvTests(unittest.TestCase):
         self.assertTrue(settings.note_configured)
         self.assertEqual(settings.note_model, "gpt-4o-mini")
         self.assertEqual(settings.stt_openai_max_upload, 25_000_000)
+        self.assertEqual(settings.max_file_size, 1024**3)
+        self.assertEqual(settings.doc_max_bytes, 1024**3)
+        self.assertEqual(settings.doc_unpacked_max_bytes, 1024**3)
+        self.assertEqual(settings.presentation_max_unpacked_bytes, 1024**3)
+        self.assertEqual(settings.presentation_max_temp_bytes, 2 * 1024**3)
         self.assertEqual(settings.stt_providers, tuple(DEFAULT_STT_PROVIDERS.split(",")))
         # No *fatal* problems: a Speechmatics-only env legitimately earns
         # the capacity-coherence advisory (2 slots < 3 active jobs).

@@ -107,9 +107,9 @@ Empty `MINI_APP_URL` hides every app button. Deployment:
 | --- | --- |
 | Jobs | `MAX_ACTIVE_JOBS=3`, `MAX_QUEUED_JOBS=8`, `MAX_ACTIVE_JOBS_PER_USER=2` |
 | Transfers | `MAX_CONCURRENT_DOWNLOADS=2`, `MAX_CONCURRENT_UPLOADS=2`, `TELEGRAM_DOWNLOAD_CONNECTIONS=1` |
-| Media | `MAX_FILE_SIZE=134217728` (128 MiB), `MAX_MEDIA_DURATION_SECONDS=7200`, `MEDIA_WORKER_CONCURRENCY=1` |
-| Documents | `DOC_MAX_BYTES=20971520` (20 MiB), `DOC_UNPACKED_MAX_BYTES=104857600` |
-| PowerPoint narration | `PRESENTATION_MAX_CLIPS=50`, `PRESENTATION_MAX_TOTAL_DURATION=7200`, `PRESENTATION_MAX_UNPACKED_BYTES=134217728` |
+| Media | `MAX_FILE_SIZE=1073741824` (1 GiB), `MAX_MEDIA_DURATION_SECONDS=7200`, `MEDIA_WORKER_CONCURRENCY=1` |
+| Documents | `DOC_MAX_BYTES=1073741824` (1 GiB), `DOC_UNPACKED_MAX_BYTES=1073741824` |
+| PowerPoint narration | `PRESENTATION_MAX_CLIPS=50`, `PRESENTATION_MAX_TOTAL_DURATION=7200`, `PRESENTATION_MAX_UNPACKED_BYTES=1073741824` |
 | Office | `OFFICE_MAX_CHARS=100000`, `OFFICE_MAX_INPUT_BYTES=1000000`, `OFFICE_MAX_SLIDES=30`, `OFFICE_SESSION_TTL_MINUTES=30`, `OFFICE_JOB_CONCURRENCY=2` |
 | STT slots | `SPEECHMATICS_MAX_IN_FLIGHT=2`, `DEEPGRAM_MAX_IN_FLIGHT=4`, `STT_OPENAI_MAX_IN_FLIGHT=2`, `STT_PROVIDER_TIMEOUT_SECONDS=1800` |
 | Note slots | `NOTE_CONCURRENCY=3`, `LLM_PRIMARY_MAX_IN_FLIGHT=4`, `LLM_FALLBACK_MAX_IN_FLIGHT=4`, `NOTE_REQUEST_TIMEOUT_SECONDS=900` |
@@ -136,3 +136,5 @@ python -m scripts.probe_note_providers --show-config
 Fix every `FAIL`, review every `WARN`. Both commands are offline and
 credential-free; they do not prove that a live key, model or network path works.
 Provider probes are described in [Providers](PROVIDERS.md).
+
+A 1 GiB acceptance cap is not a guarantee that every deployment can process such a file. Ensure the temp filesystem has capacity for the source plus extracted/converted data (the default presentation workspace cap is 2 GiB), and that the Telegram client/API and host quotas permit the transfer. Files beyond the configured cap are rejected.

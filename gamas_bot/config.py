@@ -244,15 +244,15 @@ PLAN_ENV_FIELDS = (
 #: reaches ``SPEECHMATICS_MAX_IN_FLIGHT`` or returns a recoverable error.
 DEFAULT_STT_PROVIDERS = "speechmatics,deepgram,openai_compatible"
 
-#: Conservative disk and media ceilings for a small shared-hosting account.
-#: Operators can raise them after checking their actual disk quota and CPU plan.
-DEFAULT_MAX_FILE_SIZE_BYTES = 128 * 1024**2
+#: Upload ceilings default to 1 GiB. Operators must provision adequate disk and
+#: processing capacity before enabling these limits on constrained hosts.
+DEFAULT_MAX_FILE_SIZE_BYTES = 1024**3
 DEFAULT_TEMP_MIN_FREE_BYTES = 64 * 1024**2
 DEFAULT_MAX_MEDIA_DURATION_SECONDS = 2 * 60 * 60
 DEFAULT_PRESENTATION_MAX_CLIPS = 50
 DEFAULT_PRESENTATION_MAX_DURATION_SECONDS = 2 * 60 * 60
-DEFAULT_PRESENTATION_MAX_UNPACKED_BYTES = 128 * 1024**2
-DEFAULT_PRESENTATION_MAX_TEMP_BYTES = 256 * 1024**2
+DEFAULT_PRESENTATION_MAX_UNPACKED_BYTES = 1024**3
+DEFAULT_PRESENTATION_MAX_TEMP_BYTES = 2 * 1024**3
 
 #: Default stage and provider concurrency controls tuned conservatively for
 #: shared cPanel hosting (1 GB RAM, limited CPU, disk I/O and process slots).
@@ -712,8 +712,8 @@ class Settings:
     #: Ceiling for an ingested study document (PDF/DOCX/PPTX), in bytes. Kept
     #: separate from ``max_file_size`` because a document is parsed into memory
     #: instead of streamed through the media worker.
-    doc_max_bytes: int = 20 * 1024 * 1024
-    doc_unpacked_max_bytes: int = 100 * 1024 * 1024
+    doc_max_bytes: int = 1024**3
+    doc_unpacked_max_bytes: int = 1024**3
     #: OCR (third-party, opt-in). A text-poor PDF page, or an uploaded photo,
     #: is sent to i2ocr.com and read there. Off by default: the document leaves
     #: the host, so the deployment owner has to accept that trade-off.
@@ -1264,10 +1264,10 @@ def from_env(env_file: str | None = None) -> Settings:
             "MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE_BYTES, minimum=1024
         ),
         doc_max_bytes=_env_int(
-            "DOC_MAX_BYTES", 20 * 1024 * 1024, minimum=1024, maximum=1024**3
+            "DOC_MAX_BYTES", DEFAULT_MAX_FILE_SIZE_BYTES, minimum=1024, maximum=1024**3
         ),
         doc_unpacked_max_bytes=_env_int(
-            "DOC_UNPACKED_MAX_BYTES", 100 * 1024 * 1024, minimum=1024, maximum=1024**3
+            "DOC_UNPACKED_MAX_BYTES", DEFAULT_MAX_FILE_SIZE_BYTES, minimum=1024, maximum=1024**3
         ),
         max_media_duration_seconds=_env_float(
             "MAX_MEDIA_DURATION_SECONDS",

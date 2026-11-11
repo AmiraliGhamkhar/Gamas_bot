@@ -11,7 +11,7 @@ Send audio, video or a Telegram voice/video note.
 - The **raw transcript is always delivered first** as a `.txt` file (fallback:
   up to 8 files of 100 000 characters each). Booklet generation happens after it
   and can fail without losing the transcript.
-- Upload cap `MAX_FILE_SIZE=134217728` (128 MiB), duration
+- Upload cap `MAX_FILE_SIZE=1073741824` (1 GiB), duration
   `MAX_MEDIA_DURATION_SECONDS=7200` (2 hours). Unmeasurable duration is refused
   before any credit is held.
 - PyAV carries its own FFmpeg libraries, so no system `ffmpeg`/`ffprobe` is
@@ -63,7 +63,7 @@ converted in-process; `.doc` is not supported — save as `.docx` first.
   exports, the original download and learning actions. Page/section/slide
   locators stay attached.
 - Identical uploads reuse the same user's extraction; caches are owner-scoped.
-- Limits: `DOC_MAX_BYTES=20971520` (20 MiB), `DOC_UNPACKED_MAX_BYTES=104857600`
+- Limits: `DOC_MAX_BYTES=1073741824` (1 GiB), `DOC_UNPACKED_MAX_BYTES=1073741824`
   expanded archive, 5 000 000 extracted characters, 250 000 characters per
   note/export source.
 - PowerPoint audio is **not** processed on upload. The deck's source card has

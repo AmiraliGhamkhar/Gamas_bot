@@ -124,7 +124,7 @@ The database is also housekept automatically: a passive WAL checkpoint daily and
 | Downloads / media workers / uploads | 2 / 1 / 2 |
 | STT slots (Speechmatics / Deepgram / OpenAI-compatible) | 2 / 4 / 2 |
 | Note-map concurrency / primary / fallback LLM slots | 3 / 4 / 4 |
-| Media upload / duration | 128 MiB / 2 h |
+| Media upload / duration | 1 GiB / 2 h |
 | Temporary reserve | 64 MiB plus working copies |
 | Office builds | 2 |
 
@@ -146,7 +146,7 @@ NOTE_CONCURRENCY=3
 LEARNING_CHUNK_CONCURRENCY=2
 LEARNING_GLOBAL_CONCURRENCY=2
 NOTE_HEDGE_AFTER_SECONDS=60
-DOC_MAX_BYTES=20971520
+DOC_MAX_BYTES=1073741824
 ```
 
 If the account gets throttled: check CPU/RAM/process/disk quotas first, then
