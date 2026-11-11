@@ -2,6 +2,10 @@
 
 Short, operator-relevant history. Detailed patches remain in Git history.
 
+## Unreleased
+
+**Large uploads.** Default video/audio and PowerPoint/document upload ceilings are now 1 GiB; presentation extraction permits up to 1 GiB unpacked with a 2 GiB workspace budget. Operators must provision adequate temporary disk and verify Telegram/host transfer limits.
+
 ## 3.0 — Gamas Studio, reference-grade booklets, confirmed tariff
 
 **Mini App (Gamas Studio).** Persian-first RTL single page with Home,

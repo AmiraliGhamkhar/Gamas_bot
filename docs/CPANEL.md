@@ -49,7 +49,7 @@ web-root placement, the instance lock and Telegram reachability, and prints
 `FAIL`. Then send `/start` and a short voice note, stop with **Ctrl+C**, and wait
 for `stopped` before enabling cron.
 
-Start with the shipped limits (3 active jobs, 8 queued, 1 media worker, 128 MiB
+Start with the shipped limits (3 active jobs, 8 queued, 1 media worker, 1 GiB
 uploads). They are ceilings, not a RAM guarantee — see [host sizing](OPERATIONS.md#host-sizing).
 
 ## 3. Cron watchdog (once per minute)
