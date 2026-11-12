@@ -891,7 +891,8 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         event = self._event(f"fc:ai:{self.item_id}".encode())
         await self.bot._handle_callback(event)
         text = event.edits[-1]["text"]
-        self.assertIn("هزینه: ۲٬۷۷۸ اعتبار", text)
+        self.assertIn("هزینهٔ معمول: ۲٬۷۷۸ اعتبار", text)
+        self.assertIn("نخستین مجموعه رایگان است", text)
         self.assertIn("۶ پرسش و پاسخ", text)
 
     async def test_failure_refunds_and_short_output_refunds(self):

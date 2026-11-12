@@ -46,10 +46,10 @@ class MainAndHelpCopyTests(unittest.TestCase):
             notes_configured=True,
         )
         self.assertEqual(first, second)
-        self.assertTrue(first.startswith("🎓 به گاماس خوش آمدید\n\n"))
-        self.assertIn("💳 اعتبار باقی‌مانده: ۲۵ ساعت", first)
+        self.assertTrue(first.startswith("به گاماس خوش آمدید\n\n"))
+        self.assertIn("اعتبار: ۲۵ ساعت", first)
         # One invitation, stated in one sentence.
-        self.assertIn("یک فایل درس بفرستید", first)
+        self.assertIn("فایل درس را همین‌جا بفرستید", first)
         self.assertLessEqual(len(first.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT)
 
     def test_returning_screen_uses_the_main_menu_heading(self):
@@ -59,11 +59,10 @@ class MainAndHelpCopyTests(unittest.TestCase):
             office_enabled=False,
             notes_configured=False,
         )
-        self.assertTrue(text.startswith("منوی اصلی\n\n"))
+        self.assertTrue(text.startswith("فایل درس بعدی را همین‌جا بفرستید."))
         self.assertNotIn("آفیس", text)
         self.assertNotIn("کتابخانه", text)
-        self.assertIn("صوتی، ویدیویی یا سند", text)
-        self.assertNotIn("جزوه‌اش را بسازم", text)
+        self.assertIn("اعتبار: ۱ ساعت", text)
         # The returning screen is shorter than the welcome screen: the pitch has
         # already been made, so all that is left is the next file and the balance.
         self.assertLess(len(text), 200)
@@ -75,20 +74,20 @@ class MainAndHelpCopyTests(unittest.TestCase):
             office_enabled=False,
             notes_configured=False,
         )
-        self.assertIn("متن گفتار یا سندش", text)
-        self.assertNotIn("فلش‌کارت و آزمونش را می‌سازم", text)
+        self.assertIn("متن استخراج‌شده در کتابخانه می‌ماند", text)
+        self.assertNotIn("جزوه و تمرین آماده می‌شوند", text)
 
-    def test_a_streak_is_shown_only_when_it_is_a_streak(self):
+    def test_home_screen_does_not_use_streaks_to_pressure_return_visits(self):
         one = texts.main_screen(
             first_start=False, balance="۱ ساعت", office_enabled=False,
             notes_configured=False, streak_days=1,
         )
-        self.assertNotIn("🔥", one)
         two = texts.main_screen(
             first_start=False, balance="۱ ساعت", office_enabled=False,
-            notes_configured=False, streak_days=2,
+            notes_configured=False, streak_days=20,
         )
-        self.assertIn("🔥 ۲ روز پشت‌سرهم برگشتید.", two)
+        self.assertNotIn("🔥", one)
+        self.assertNotIn("پشت‌سرهم", two)
 
     def test_help_is_one_short_screen_and_keeps_the_billing_contract(self):
         text = texts.help_screen(office_enabled=True, notes_configured=True)

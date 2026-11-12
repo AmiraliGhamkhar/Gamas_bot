@@ -269,17 +269,17 @@ class ResultsScreenTests(unittest.TestCase):
 
 
 class ReplyKeyboardTests(unittest.TestCase):
-    def test_the_keyboard_always_offers_start_and_results(self):
-        for is_admin in (False, True):
-            labels = [
-                label
-                for row in texts.reply_menu_rows(is_admin=is_admin)
-                for label in row
-            ]
-            self.assertIn(texts.BTN_START_HERE, labels)
-            self.assertIn(texts.BTN_MY_RESULTS, labels)
-            self.assertIn(texts.BTN_LIBRARY, labels)
-            self.assertIn(texts.BTN_UPGRADE, labels)
+    def test_global_keyboard_is_compact_and_more_contains_secondary_destinations(self):
+        labels = [
+            label
+            for row in texts.reply_menu_rows(is_admin=False)
+            for label in row
+        ]
+        self.assertEqual(labels, [
+            texts.BTN_LIBRARY, texts.BTN_WALLET, texts.BTN_MORE, texts.BTN_SUPPORT
+        ])
+        self.assertNotIn(texts.BTN_START_HERE, labels)
+        self.assertNotIn(texts.BTN_HISTORY, labels)
 
     def test_the_admin_button_is_only_for_admins(self):
         user = [label for row in texts.reply_menu_rows(is_admin=False) for label in row]
@@ -287,19 +287,17 @@ class ReplyKeyboardTests(unittest.TestCase):
         self.assertNotIn(texts.BTN_ADMIN, user)
         self.assertIn(texts.BTN_ADMIN, admin)
 
-    def test_the_office_button_follows_the_setting(self):
-        on = [
-            label
-            for row in texts.reply_menu_rows(is_admin=False, office_enabled=True)
-            for label in row
-        ]
-        off = [
-            label
-            for row in texts.reply_menu_rows(is_admin=False, office_enabled=False)
-            for label in row
-        ]
-        self.assertIn(texts.BTN_OFFICE, on)
-        self.assertNotIn(texts.BTN_OFFICE, off)
+    def test_conditional_features_are_disclosed_in_secondary_navigation(self):
+        for office_enabled in (True, False):
+            labels = [
+                label
+                for row in texts.reply_menu_rows(
+                    is_admin=False, office_enabled=office_enabled
+                )
+                for label in row
+            ]
+            # Secondary actions do not crowd the always-visible keyboard.
+            self.assertNotIn(texts.BTN_OFFICE, labels)
 
     def test_every_label_fits_a_telegram_button(self):
         """Telegram rejects a keyboard button longer than a short label."""

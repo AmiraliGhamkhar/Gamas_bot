@@ -633,32 +633,45 @@ class GamasBot(
         )
 
     def _user_menu(self, *, is_admin: bool = False) -> list:
-        """The user panel: library, wallet, optional free Office, support and help."""
+        """Compact global navigation; less-used destinations live under More."""
         rows = [
             [
                 Button.inline(texts.BTN_LIBRARY, b"library"),
                 Button.inline(texts.BTN_WALLET, b"wallet"),
             ],
-        ]
-        if self.settings.office_enabled:
-            rows.append(
-                [
-                    Button.inline(texts.BTN_OFFICE, b"office:start"),
-                    Button.inline(texts.BTN_LEADERBOARD, b"board"),
-                ]
-            )
-        else:
-            rows.append([Button.inline(texts.BTN_LEADERBOARD, b"board")])
-        rows.append(
             [
+                Button.inline(texts.BTN_MORE, b"menu:more"),
                 Button.inline(texts.BTN_SUPPORT, b"support"),
-                Button.inline(texts.BTN_HELP, b"help"),
-            ]
-        )
-        rows.append([Button.inline(texts.BTN_REFERRALS, b"ref:home")])
+            ],
+        ]
         if is_admin:
             rows.append([Button.inline(texts.BTN_ADMIN, b"adm:home")])
         return rows
+
+    def _more_menu(self) -> list:
+        """Secondary destinations, shown only when their feature is available."""
+        rows = [
+            [
+                Button.inline(texts.BTN_START_HERE, b"menu:main"),
+                Button.inline(texts.BTN_HISTORY, b"results"),
+            ],
+        ]
+        if self.settings.office_enabled:
+            rows.append([Button.inline(texts.BTN_OFFICE, b"office:start")])
+        rows.extend(
+            [
+                [Button.inline(texts.BTN_LEADERBOARD, b"board")],
+                [Button.inline(texts.BTN_HELP, b"help"),
+                 Button.inline(texts.BTN_REFERRALS, b"ref:home")],
+                [Button.inline(texts.BTN_BACK_MAIN, b"menu:main")],
+            ]
+        )
+        return rows
+
+    async def _show_more(self, event) -> None:
+        await self._edit_or_reply(
+            event, texts.MORE_MENU_TITLE, self._more_menu()
+        )
 
     def _admin_menu(self) -> list:
         """The admin panel: three hubs, unrelated sections, and the way back."""
@@ -691,7 +704,6 @@ class GamasBot(
             balance=await self._balance_text(user_id),
             office_enabled=self.settings.office_enabled,
             notes_configured=self.settings.note_configured,
-            streak_days=await self.db.activity_streak(user_id),
         )
         await self._edit_or_reply(
             event,
@@ -1081,6 +1093,8 @@ class GamasBot(
 
         r.register_exact("help", self._cb_help)
         r.register_exact("menu:main", lambda e, _u, _d: self._show_main(e))
+        r.register_exact("menu:more", lambda e, _u, _d: self._show_more(e))
+        r.register_exact("results", lambda e, _u, _d: self._show_results_hub(e))
         r.register_exact("library", lambda e, _u, _d: self._show_library(e))
         r.register_prefix("res:", self._cb_result_set)
         r.register_exact("library:fc", lambda e, _u, _d: self._show_flashcard_hub(e))
@@ -1136,14 +1150,22 @@ class GamasBot(
         routes = {
             texts.BTN_START_HERE: self._show_main,
             texts.BTN_MY_RESULTS: self._show_results_hub,
+            texts.BTN_HISTORY: self._show_results_hub,
             texts.BTN_LIBRARY: lambda e: self._show_library(e),
-            texts.BTN_UPGRADE: lambda e: self._show_wallet(e),
+            texts.BTN_LIBRARY_LEGACY: lambda e: self._show_library(e),
+            texts.BTN_WALLET: lambda e: self._show_wallet(e),
+            texts.BTN_WALLET_LEGACY: lambda e: self._show_wallet(e),
+            texts.BTN_WALLET_UPGRADE_LEGACY: lambda e: self._show_wallet(e),
             texts.BTN_LEADERBOARD: lambda e: self._show_leaderboard(e),
+            texts.BTN_LEADERBOARD_LEGACY: lambda e: self._show_leaderboard(e),
             texts.BTN_OFFICE: lambda e: self._route_office_callback(e, user_id, "office:start"),
+            texts.BTN_OFFICE_LEGACY: lambda e: self._route_office_callback(e, user_id, "office:start"),
             texts.BTN_SUPPORT: lambda e: self._show_support_home(e),
+            texts.BTN_SUPPORT_LEGACY: lambda e: self._show_support_home(e),
             texts.BTN_REFERRALS: lambda e: self._show_referrals(e, user_id),
+            texts.BTN_MORE: self._show_more,
         }
-        if label == texts.BTN_HELP or label == texts.BTN_MENU_GUIDE:
+        if label in {texts.BTN_HELP, texts.BTN_HELP_LEGACY, texts.BTN_MENU_GUIDE}:
             await self._cb_help(event, user_id, "")
             return True
         if label == texts.BTN_ADMIN and self._is_admin(user_id):
@@ -1306,10 +1328,15 @@ class GamasBot(
             event,
             texts.delivery_screen(
                 reference=reference,
-                speakers=0,
+                speakers=None,
                 has_booklet=has_booklet,
                 has_keypoints=has_keypoints,
                 learning_available=self.settings.note_configured,
+                has_transcript=KIND_TRANSCRIPT in kinds,
+                has_txt=KIND_TXT in kinds,
+                has_docx=KIND_DOCX in kinds,
+                has_studio=bool(self.settings.mini_app_url and has_booklet),
+                has_learning_item=item_id is not None,
             ),
             buttons,
         )
@@ -1599,7 +1626,8 @@ class GamasBot(
             self.conversations.reset_on_reply_navigation(
                 user_id,
                 preserve_office_session=(
-                    text == texts.BTN_OFFICE and self.settings.office_enabled
+                    text in {texts.BTN_OFFICE, texts.BTN_OFFICE_LEGACY}
+                    and self.settings.office_enabled
                 ),
             )
             self._broadcast_previews.pop(user_id, None)
