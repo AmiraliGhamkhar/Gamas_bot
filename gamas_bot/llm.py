@@ -337,6 +337,81 @@ def _redact_secrets(text: str, api_key: str | None) -> str:
     return _SECRET_TOKEN_RE.sub("***", text)
 
 
+#: Correlation headers emitted by the gateways we support. AvalAI's exact
+#: ``avalai-request-id`` is needed when an operator reconciles one completion's
+#: cost in its User API; ``x-request-id`` remains the portable fallback used by
+#: other OpenAI-compatible providers.
+_REQUEST_ID_HEADERS = ("avalai-request-id", "x-request-id")
+
+
+def _header_value(headers: Any, *names: str) -> str:
+    """Get a non-blank HTTP header from real or tiny-test-double mappings.
+
+    ``aiohttp.CIMultiDictProxy`` is case-insensitive, while the deliberately
+    simple dictionaries in offline tests are not. Scan their items only after
+    direct lookups so production stays on the efficient normal path.
+    """
+    if not headers:
+        return ""
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        for name in names:
+            for spelling in (name, name.title(), name.upper()):
+                try:
+                    value = getter(spelling)
+                except (AttributeError, TypeError):
+                    value = None
+                if isinstance(value, str) and value.strip():
+                    return value
+    items = getattr(headers, "items", None)
+    if callable(items):
+        wanted = {name.lower() for name in names}
+        try:
+            for key, value in items():
+                if str(key).lower() in wanted and isinstance(value, str) and value.strip():
+                    return value
+        except (AttributeError, TypeError, ValueError):
+            # Header diagnostics must never hide the response's real error.
+            pass
+    return ""
+
+
+def _payload_request_id(payload: object) -> str:
+    """Read the conventional request id in a gateway JSON envelope."""
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error")
+    if isinstance(error, dict):
+        candidate = error.get("request_id")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+    candidate = payload.get("request_id")
+    return candidate if isinstance(candidate, str) and candidate.strip() else ""
+
+
+def _response_request_id(
+    headers: Any,
+    *,
+    payload: object = None,
+    api_key: str | None = None,
+) -> str:
+    """Return a safe provider correlation id, preferring AvalAI's cost id.
+
+    AvalAI documents ``avalai-request-id`` on every response and accepts that
+    exact value for precise cost lookup. Prefer it even if an upstream model
+    also puts its own id in the JSON body; otherwise retain the established
+    body-id then ``x-request-id`` fallback for generic gateways.
+    """
+    request_id = _header_value(headers, _REQUEST_ID_HEADERS[0])
+    if not request_id:
+        request_id = _payload_request_id(payload)
+    if not request_id:
+        request_id = _header_value(headers, _REQUEST_ID_HEADERS[1])
+    if not request_id:
+        return ""
+    return _redact_secrets(_sanitize_error_text(request_id, limit=80), api_key)
+
+
 def _extract_raw_upstream_message(raw_value: object) -> str | None:
     """Extract a human-readable message from OpenRouter's ``error.metadata.raw``."""
     if isinstance(raw_value, dict):
@@ -368,12 +443,13 @@ def _error_from_payload(
     detail: str | None = None
     # The provider's own correlation key. NaraRouter's error envelope carries
     # ``request_id`` precisely so a failure can be matched against its logs
-    # (https://router.bynara.id/docs, "Errors"), so it belongs in our message.
-    request_id = ""
+    # (https://router.bynara.id/docs, "Errors"). AvalAI's documented
+    # ``avalai-request-id`` header takes precedence, because it is the id its
+    # User API uses for exact cost reconciliation.
+    request_id = _response_request_id(headers, payload=payload, api_key=api_key)
     error_markers: list[str] = []
     if isinstance(payload, dict):
         error = payload.get("error")
-        candidate = None
         if isinstance(error, dict):
             message = error.get("message")
             if isinstance(message, str) and message.strip():
@@ -382,7 +458,6 @@ def _error_from_payload(
                 value = error.get(field)
                 if isinstance(value, (str, int)) and not isinstance(value, bool):
                     error_markers.append(str(value).upper())
-            candidate = error.get("request_id")
             metadata = error.get("metadata")
             if isinstance(metadata, dict):
                 for meta_field in ("error_type", "reason", "limit_source"):
@@ -412,14 +487,6 @@ def _error_from_payload(
                         detail = _sanitize_error_text(item["message"])
         elif isinstance(error, str) and error.strip():
             detail = _sanitize_error_text(error)
-        if not candidate:
-            candidate = payload.get("request_id")
-        if isinstance(candidate, str) and candidate.strip():
-            request_id = _sanitize_error_text(candidate, limit=80)
-    if not request_id and headers:
-        header_req_id = headers.get("x-request-id") or headers.get("X-Request-Id")
-        if isinstance(header_req_id, str) and header_req_id.strip():
-            request_id = _sanitize_error_text(header_req_id, limit=80)
     codes = ""
     if error_markers:
         codes = _sanitize_error_text(", ".join(dict.fromkeys(error_markers)), limit=80)
@@ -1198,25 +1265,31 @@ def _log_usage(
     route: NoteRoute,
     payload: dict,
     *,
+    headers: Any = None,
     ttfb_ms: float = 0.0,
     elapsed_ms: float = 0.0,
     requested_output_tokens: int | None = None,
 ) -> None:
-    """Log one completed request's token usage (never its content or key).
+    """Log one completed request's token usage and safe correlation id.
 
     ``output_tokens`` is the provider's *actual* completion usage; the optional
     ``requested_output_tokens`` is the budget we sent. Keeping them separate is
     what makes a truncated answer diagnosable without guessing from ``.env``.
+    AvalAI's ``avalai-request-id`` response header is logged as ``request_id``
+    so the operator can ask its User API for that request's exact cost. Neither
+    the completion content nor a credential is logged.
     """
     model, input_tokens, output_tokens, total_tokens = _usage_summary(payload, route.style)
+    request_id = _response_request_id(headers, payload=payload, api_key=route.api_key)
 
     def shown(value: int | None) -> str:
         return str(value) if value is not None else "-"
 
     logger.info(
-        "note provider usage provider=%s model=%s requested_output_tokens=%s "
+        "note provider usage provider=%s request_id=%s model=%s requested_output_tokens=%s "
         "input_tokens=%s output_tokens=%s total_tokens=%s ttfb_ms=%.0f elapsed_ms=%.0f",
         route.slug,
+        request_id or "-",
         # The served-model string is provider-controlled: collapse any
         # whitespace (including newlines) so it can never forge a log line.
         _sanitize_error_text(model or route.model, limit=80),
@@ -1856,7 +1929,8 @@ async def _complete_streaming_on_route(
             fallback_dict = _loads(fallback_bytes)
             if isinstance(fallback_dict, dict):
                 _log_usage(
-                    route, fallback_dict, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
+                    route, fallback_dict, headers=resp_headers,
+                    ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
                     requested_output_tokens=requested_output_tokens,
                 )
                 _raise_if_in_body_error(route.label, fallback_dict, resp_headers, route.api_key or None)
@@ -1912,7 +1986,8 @@ async def _complete_streaming_on_route(
         if served_model:
             assembled["model"] = served_model
     _log_usage(
-        route, assembled, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
+        route, assembled, headers=resp_headers,
+        ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
         requested_output_tokens=requested_output_tokens,
     )
     _raise_if_in_body_error(route.label, assembled, resp_headers, route.api_key or None)
@@ -2006,7 +2081,8 @@ async def _complete_on_route(
             # reports as truncated: those are exactly the requests whose real
             # token counts calibrate the chunk budget.
             _log_usage(
-                route, result, ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
+                route, result, headers=resp_headers,
+                ttfb_ms=ttfb_ms, elapsed_ms=elapsed_ms,
                 requested_output_tokens=requested_output_tokens,
             )
             _raise_if_in_body_error(

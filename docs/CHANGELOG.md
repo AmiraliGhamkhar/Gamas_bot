@@ -4,6 +4,14 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**AvalAI hardening.** The OpenAI-compatible note route now captures AvalAI's
+`avalai-request-id` for every successful normal or streaming completion and
+logs it with token usage, so exact User API cost reconciliation has a durable
+correlation id. Error messages prefer the same id and redact secrets. `--check`
+rejects accidentally configured AvalAI User API or Google-native API bases, and
+the standalone AvalAI smoke script no longer prints URL credentials, queries or
+fragments.
+
 **Large uploads.** Default video/audio and PowerPoint/document upload ceilings are now 1 GiB; presentation extraction permits up to 1 GiB unpacked with a 2 GiB workspace budget. Operators must provision adequate temporary disk and verify Telegram/host transfer limits.
 
 ## 3.0 — Gamas Studio, reference-grade booklets, confirmed tariff

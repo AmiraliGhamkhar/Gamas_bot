@@ -338,6 +338,33 @@ class StreamingAndExtractionTests(unittest.IsolatedAsyncioTestCase):
         # Nara must not receive stream_options.
         self.assertNotIn("stream_options", session.calls[0]["json"])
 
+    async def test_avalai_stream_logs_its_request_id_for_cost_reconciliation(self) -> None:
+        settings = make_settings(
+            note_providers=("avalai",),
+            avalai_api_key="av-test",
+            note_ttfb_timeout=10.0,
+        )
+        route = note_routes(settings)[0]
+        events = [
+            b'data: {"model":"deepseek-v4.1-flash","choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":12,"completion_tokens":3,"total_tokens":15}}\n\n',
+            b"data: [DONE]\n\n",
+        ]
+        session = _FakeHTTPSession([
+            _FakeHTTPResponse(
+                200,
+                chunks=events,
+                headers={"AvalAI-Request-Id": "avalai_stream_123"},
+            )
+        ])
+        with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
+            result = await llm._complete_on_route(
+                route, session, settings, system="S", user="U"
+            )
+        self.assertEqual(result, "answer")
+        usage_lines = [line for line in logs.output if "note provider usage" in line]
+        self.assertEqual(len(usage_lines), 1, logs.output)
+        self.assertIn("request_id=avalai_stream_123", usage_lines[0])
+
     async def test_anthropic_sse_streaming_assembles_text_and_usage(self) -> None:
         route = NoteRoute(
             slug="anthropic",
