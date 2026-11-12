@@ -218,10 +218,24 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         flash = self.press(f"fc:ai:{self.item_id}".encode())
         await self.bot._handle_callback(flash)
         self.assertIn(FREE_TRY_BADGE, self.last_text(flash))
+        flash_labels = [
+            button.text
+            for row in flash.edits[-1]["buttons"]
+            for button in row
+            if getattr(button, "text", None)
+        ]
+        self.assertTrue(any("رایگان در اولین استفاده" in label for label in flash_labels))
 
         quiz = self.press(f"quiz:new:{self.item_id}".encode())
         await self.bot._handle_callback(quiz)
         self.assertIn(FREE_TRY_BADGE, self.last_text(quiz))
+        quiz_labels = [
+            button.text
+            for row in quiz.edits[-1]["buttons"]
+            for button in row
+            if getattr(button, "text", None)
+        ]
+        self.assertTrue(any("رایگان در اولین استفاده" in label for label in quiz_labels))
 
     async def test_badge_disappears_once_the_gift_is_used(self):
         await self.db.consume_free_use(OWNER, "deck")

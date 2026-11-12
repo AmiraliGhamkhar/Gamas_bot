@@ -1593,7 +1593,13 @@ class DocumentOfficeWorkflowMixin:
                         Button.inline(
                             button_label(
                                 f"{label} — {to_persian_digits(cards)} کارت — "
-                                f"{format_seconds_as_credits(self._preset_cost(base_cost, cards, base_size))}"  # type: ignore[attr-defined]
+                                + (
+                                    texts.LEARNING_FREE_CHOICE_LABEL
+                                    if free
+                                    else format_seconds_as_credits(
+                                        self._preset_cost(base_cost, cards, base_size)  # type: ignore[attr-defined]
+                                    )
+                                )
                             ),
                             f"doc:gen:fc:{document_id}:{code}".encode("ascii"),
                         )
@@ -1607,7 +1613,11 @@ class DocumentOfficeWorkflowMixin:
                         Button.inline(
                             button_label(
                                 f"{label} — {to_persian_digits(questions)} سؤال — "
-                                f"{format_seconds_as_credits(questions * per_question)}"
+                                + (
+                                    texts.LEARNING_FREE_CHOICE_LABEL
+                                    if free
+                                    else format_seconds_as_credits(questions * per_question)
+                                )
                             ),
                             f"doc:gen:quiz:{document_id}:{questions}".encode("ascii"),
                         )

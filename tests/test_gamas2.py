@@ -427,10 +427,33 @@ class DeliveryMarkupTests(unittest.TestCase):
         from gamas_bot import texts
 
         body = texts.delivery_screen(
-            reference="GMS-7", speakers=2, has_booklet=True, has_keypoints=True
+            reference="GMS-7", speakers=2, has_booklet=True, has_keypoints=True,
+            has_studio=True,
         )
         self.assertIn("ویرایش", body)
         self.assertIn("آزمون", body)
+
+    def test_delivery_copy_only_names_artifacts_that_have_buttons(self):
+        from gamas_bot import texts
+
+        body = texts.delivery_screen(
+            reference="GMS-9",
+            speakers=None,
+            has_booklet=False,
+            has_keypoints=False,
+            has_transcript=False,
+            has_txt=True,
+            has_docx=False,
+            has_studio=False,
+            has_learning_item=False,
+        )
+        self.assertIn(texts.DELIVERY_ROW_TXT, body)
+        self.assertNotIn(texts.DELIVERY_ROW_TRANSCRIPT, body)
+        self.assertNotIn(texts.DELIVERY_ROW_BOOKLET, body)
+        self.assertNotIn(texts.DELIVERY_ROW_DOCX, body)
+        self.assertNotIn(texts.DELIVERY_ROW_STUDIO, body)
+        self.assertNotIn(texts.DELIVERY_ROW_LEARNING, body)
+        self.assertNotIn(texts.DELIVERY_SPEAKERS_NONE, body)
 
     def test_delivery_screen_explains_unavailable_learning_without_offering_it(self):
         from gamas_bot import texts

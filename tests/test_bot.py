@@ -1177,25 +1177,18 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         await self.db.close()
         self._tmp.cleanup()
 
-    def test_user_menu_includes_optional_free_office_for_everyone(self):
+    def test_user_menu_is_compact_and_more_menu_discloses_optional_destinations(self):
         user_menu = menu_payloads(self.bot._user_menu(is_admin=False))
         admin_menu = menu_payloads(self.bot._user_menu(is_admin=True))
-        self.assertEqual(
-            user_menu,
-            {
-                b"library", b"wallet", b"support", b"help", b"board",
-                b"office:start", b"ref:home",
-            },
-        )
-        self.assertEqual(
-            admin_menu,
-            {
-                b"library", b"wallet", b"support", b"help", b"board",
-                b"office:start", b"ref:home", b"adm:home",
-            },
-        )
+        self.assertEqual(user_menu, {b"library", b"wallet", b"menu:more", b"support"})
+        self.assertEqual(admin_menu, user_menu | {b"adm:home"})
+        more_menu = menu_payloads(self.bot._more_menu())
+        self.assertIn(b"results", more_menu)
+        self.assertIn(b"board", more_menu)
+        self.assertIn(b"office:start", more_menu)
+        self.assertIn(b"ref:home", more_menu)
         self.bot.settings = replace(self.settings, office_enabled=False)
-        self.assertNotIn(b"office:start", menu_payloads(self.bot._user_menu()))
+        self.assertNotIn(b"office:start", menu_payloads(self.bot._more_menu()))
 
     def test_admin_menu_is_its_own_panel_with_way_back(self):
         payloads = menu_payloads(self.bot._admin_menu())
@@ -1218,12 +1211,12 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.edits, "menu:main must render a screen")
         text, buttons = event.edits[-1]
         payloads = menu_payloads(buttons)
-        self.assertIn("منوی اصلی", text)
+        self.assertIn("فایل درس بعدی", text)
         self.assertIn(b"library", payloads)
         self.assertIn(b"wallet", payloads)
         self.assertIn(b"adm:home", payloads)
-        self.assertIn(b"office:start", payloads)
-        self.assertEqual(len(payloads), 8)
+        self.assertIn(b"menu:more", payloads)
+        self.assertEqual(payloads, {b"library", b"wallet", b"menu:more", b"support", b"adm:home"})
 
     async def test_raw_only_learning_screens_do_not_offer_ai_generation(self):
         await self.db.ensure_user(self.user_id)
@@ -1264,9 +1257,8 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             text,
-            "منوی اصلی\n\n"
-            "📤 فایل صوتی، ویدیویی یا سند درسی بعدی را بفرستید.\n\n"
-            f"💳 اعتبار باقی‌مانده: {await self.bot._balance_text(self.user_id)}",
+            "فایل درس بعدی را همین‌جا بفرستید.\n\n"
+            f"اعتبار: {await self.bot._balance_text(self.user_id)}",
         )
 
     async def test_help_copy_is_the_one_tap_guide_followed_by_billing_contract(self):
@@ -1299,12 +1291,12 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         # The returning screen no longer carries the offers at all; the promise
         # about the library lives on the welcome screen and must not name a
         # booklet the bot could not produce with this configuration.
-        self.assertIn("📤 فایل صوتی، ویدیویی یا سند درسی بعدی را بفرستید.", text)
+        self.assertEqual(text.splitlines()[0], "فایل درس بعدی را همین‌جا بفرستید.")
         start = FakeMessageEvent(self.user_id, "/start")
         await self.bot._handle_message(start)
         welcome = start.replies[0]
-        self.assertIn("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.", welcome)
-        self.assertNotIn("متن گفتار و جزوه در", welcome)
+        self.assertIn("متن استخراج‌شده در کتابخانه می‌ماند.", welcome)
+        self.assertNotIn("جزوه و تمرین آماده می‌شوند", welcome)
 
     async def test_admin_guides_explain_user_actions_and_empty_states(self):
         users = FakeCallbackEvent(self.admin_id, b"adm:users")
@@ -1901,19 +1893,14 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         start = FakeMessageEvent(501, "/start")
         await self.bot._handle_message(start)
         self.assertTrue(start.replies[0].startswith(
-            "🎓 به گاماس خوش آمدید\n\n"
-            "یک فایل درس بفرستید؛ جزوه، فلش‌کارت و آزمونش را می‌سازم."
+            "به گاماس خوش آمدید\n\n"
+            "فایل درس را همین‌جا بفرستید؛ متن و جزوه در کتابخانه می‌مانند، "
+            "بعد می‌توانید از جزوه آزمون یا فلش‌کارت بسازید."
         ))
         keyboard = start.client.texts[0].get("buttons")
         self.assertEqual(
             reply_labels(keyboard),
-            [
-                "🎓 شروع", "📦 خروجی‌های من",
-                "📚 کتابخانه من", "🛒 افزایش اعتبار",
-                "🗂 آفیس رایگان", "🏆 لیدربورد",
-                "🎧 پشتیبانی", "ℹ️ راهنما",
-                "🤝 دعوت دوستان",
-            ],
+            ["کتابخانه", "اعتبار", "بیشتر", "پشتیبانی"],
         )
         # Nothing in the bottom keyboard is inline glass: every button is a
         # plain text button that sends its own label.
@@ -1925,10 +1912,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(menu)
         self.assertEqual(
             menu_payloads(menu.edits[-1][1]),
-            {
-                b"library", b"wallet", b"support", b"help", b"board",
-                b"office:start", b"ref:home",
-            },
+            {b"library", b"wallet", b"menu:more", b"support"},
         )
 
     async def test_bare_text_retriggers_file_upload_with_the_main_menu(self):
@@ -1940,10 +1924,7 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             menu_payloads(self.bot._user_menu()),
-            {
-                b"library", b"wallet", b"support", b"help", b"board",
-                b"office:start", b"ref:home",
-            },
+            {b"library", b"wallet", b"menu:more", b"support"},
         )
 
     async def test_media_upload_without_a_mode_tap_persists_booklet_outputs(self):
@@ -2270,10 +2251,14 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
 
     async def test_each_label_opens_its_screen(self):
         expectations = {
-            texts.BTN_START_HERE: "منوی اصلی",
+            texts.BTN_START_HERE: "فایل درس بعدی",
             texts.BTN_HELP: "راهنمای گاماس",
             texts.BTN_UPGRADE: "بسته را انتخاب کنید",
             texts.BTN_LEADERBOARD: "لیدربورد",
+            texts.BTN_LIBRARY: "کتابخانه",
+            texts.BTN_WALLET: "اعتبار",
+            texts.BTN_MORE: "بخش‌های دیگر",
+            texts.BTN_HISTORY: "هنوز پردازشی",
         }
         for label, marker in expectations.items():
             event = FakeMessageEvent(USER_ID, label)
@@ -2284,6 +2269,34 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
                 any(marker in reply for reply in event.replies),
                 f"{label} → {event.replies[:1]}",
             )
+
+    async def test_retired_reply_keyboard_labels_remain_routable(self):
+        for old_label, handler_name in (
+            (texts.BTN_LIBRARY_LEGACY, "_show_library"),
+            (texts.BTN_WALLET_LEGACY, "_show_wallet"),
+            (texts.BTN_WALLET_UPGRADE_LEGACY, "_show_wallet"),
+            (texts.BTN_OFFICE_LEGACY, "_route_office_callback"),
+            (texts.BTN_LEADERBOARD_LEGACY, "_show_leaderboard"),
+            (texts.BTN_SUPPORT_LEGACY, "_show_support_home"),
+        ):
+            event = FakeMessageEvent(USER_ID, old_label)
+            with mock.patch.object(
+                self.bot, handler_name, new=mock.AsyncMock()
+            ) as handler:
+                self.assertTrue(
+                    await self.bot._route_reply_menu(event, USER_ID, old_label),
+                    old_label,
+                )
+                handler.assert_awaited_once()
+
+        old_help = FakeMessageEvent(USER_ID, texts.BTN_HELP_LEGACY)
+        with mock.patch.object(self.bot, "_cb_help", new=mock.AsyncMock()) as help_handler:
+            self.assertTrue(
+                await self.bot._route_reply_menu(
+                    old_help, USER_ID, texts.BTN_HELP_LEGACY
+                )
+            )
+            help_handler.assert_awaited_once()
 
     async def test_reply_menu_navigation_disarms_a_user_support_prompt(self):
         self.bot._support_states[USER_ID] = (

@@ -25,38 +25,54 @@ from collections.abc import Sequence
 from typing import Any, Final
 
 # --------------------------------------------------------------------- buttons
-BTN_LIBRARY: Final = "📚 کتابخانه من"
-BTN_WALLET: Final = "🛒 خرید اشتراک"
-BTN_OFFICE: Final = "🗂 آفیس رایگان"
-BTN_LEADERBOARD: Final = "🏆 لیدربورد"
-BTN_SUPPORT: Final = "🎧 پشتیبانی"
-BTN_HELP: Final = "ℹ️ راهنما"
+BTN_LIBRARY: Final = "کتابخانه"
+BTN_WALLET: Final = "اعتبار"
+#: Legacy reply-keyboard labels accepted during the navigation transition.
+BTN_LIBRARY_LEGACY: Final = "📚 کتابخانه من"
+BTN_WALLET_LEGACY: Final = "🛒 خرید اشتراک"
+BTN_WALLET_UPGRADE_LEGACY: Final = "🛒 افزایش اعتبار"
+BTN_OFFICE: Final = "آفیس رایگان"
+BTN_OFFICE_LEGACY: Final = "🗂 آفیس رایگان"
+BTN_LEADERBOARD: Final = "لیدربورد"
+BTN_LEADERBOARD_LEGACY: Final = "🏆 لیدربورد"
+BTN_SUPPORT: Final = "پشتیبانی"
+BTN_SUPPORT_LEGACY: Final = "🎧 پشتیبانی"
+BTN_HELP: Final = "راهنما"
+BTN_HELP_LEGACY: Final = "ℹ️ راهنما"
 BTN_ADMIN: Final = "🛠 پنل مدیریت"
+BTN_MORE: Final = "بیشتر"
+MORE_MENU_TITLE: Final = "بخش‌های دیگر"
 BTN_BACK_MAIN: Final = "↩️ منوی اصلی"
 BTN_BACK: Final = "↩️ بازگشت"
-BTN_CANCEL: Final = "↩️ لغو"
-BTN_BOOKLETS: Final = "📖 جزوه‌ها"
-BTN_DOCUMENTS: Final = "📄 اسناد"
-BTN_FLASHCARDS: Final = "🃏 فلش‌کارت‌ها"
+BTN_CANCEL: Final = "لغو"
+BTN_BOOKLETS: Final = "همهٔ موارد"
+BTN_DOCUMENTS: Final = "اسناد"
+BTN_FLASHCARDS: Final = "فلش‌کارت‌ها"
+BTN_HISTORY: Final = "نتایج پردازش"
 BTN_PREV: Final = "◀️ قبلی"
 BTN_NEXT: Final = "بعدی ▶️"
-BTN_REDOWNLOAD: Final = "📥 دریافت مجدد"
-BTN_GET_BOOKLET: Final = "📘 دریافت جزوه PDF"
-BTN_GET_DOCX: Final = "📄 دریافت نسخه Word"
-BTN_GET_TRANSCRIPT: Final = "📝 دریافت متن خام"
-BTN_DOWNLOAD_TXT: Final = "📥 دریافت فایل TXT"
-BTN_GET_KEYPOINTS: Final = "⭐ دریافت نکات کلیدی"
+BTN_REDOWNLOAD: Final = "دریافت مجدد"
+BTN_GET_BOOKLET: Final = "دریافت جزوه PDF"
+BTN_GET_DOCX: Final = "دریافت نسخه Word"
+BTN_GET_TRANSCRIPT: Final = "خواندن متن خام در گفتگو"
+BTN_DOWNLOAD_TXT: Final = "دانلود متن خام (TXT)"
+BTN_GET_KEYPOINTS: Final = "دریافت نکات کلیدی"
 BTN_MY_RESULTS: Final = "📦 خروجی‌های من"
 BTN_START_HERE: Final = "🎓 شروع"
 BTN_UPGRADE: Final = "🛒 افزایش اعتبار"
-BTN_STUDIO: Final = "🎛 گاماس استودیو"
-BTN_EDIT_IN_APP: Final = "✏️ ویرایش جزوه در Gamas Studio"
-BTN_QUIZ_FROM_BOOKLET: Final = "🧪 آزمون از این جزوه"
-BTN_CARDS_FROM_BOOKLET: Final = "🃏 فلش‌کارت از این جزوه"
+BTN_STUDIO: Final = "گاماس استودیو"
+BTN_EDIT_IN_APP: Final = "ویرایش جزوه در گاماس استودیو"
+BTN_QUIZ_FROM_BOOKLET: Final = "آزمون از این جزوه"
+BTN_CARDS_FROM_BOOKLET: Final = "فلش‌کارت از این جزوه"
 OFFICE_CREDIT_NOTICE: Final = (
     "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ "
     "بدون کسر اعتبار، با سقف ورودی و محدودیت ظرفیت."
 )
+CREDIT_ESTIMATE_NOTE: Final = (
+    "اعتبار لازم برآورد اولیه است؛ کسر نهایی پس از پردازش بر اساس مدت واقعی انجام می‌شود. "
+    "اگر متن خام آماده نشود، اعتباری کم نمی‌شود."
+)
+LEARNING_FREE_CHOICE_LABEL: Final = "رایگان در اولین استفاده"
 PRESENTATION_PROCESSING_NOTICE: Final = (
     "متن اسلایدها استخراج می‌شود؛ صدای ارائه خودکار پردازش نمی‌شود و فقط با دکمهٔ "
     "«🎧 پردازش صدای ارائه» آغاز می‌شود. فقط صدای ضبط‌شده اعتبار مصرف می‌کند؛ "
@@ -122,47 +138,31 @@ def main_screen(
     notes_configured: bool,
     streak_days: int = 0,
 ) -> str:
-    """The start message and the return-to-menu screen.
-
-    One action, one number, one reason to come back. The old screen listed five
-    capabilities and three ways to start, so the only thing a newcomer could do
-    was read it. Here the file request *is* the screen: a single sentence, then
-    the balance, then a streak line that turns "come back tomorrow" into
-    something the bot measures instead of merely suggesting.
-    """
+    """Action-first start/home copy, tailored to the configured pipeline."""
+    del streak_days  # Do not use streaks to pressure return visits.
     if first_start:
-        invitation = (
-            "یک فایل درس بفرستید؛ جزوه، فلش‌کارت و آزمونش را می‌سازم."
-            if notes_configured
-            else "یک فایل درس بفرستید؛ متن گفتار یا سندش در کتابخانه می‌ماند."
-        )
+        if notes_configured and office_enabled:
+            invitation = (
+                "فایل درس را همین‌جا بفرستید؛ متن و جزوه در کتابخانه می‌مانند، "
+                "بعد می‌توانید از جزوه آزمون یا فلش‌کارت بسازید."
+            )
+        elif notes_configured:
+            invitation = (
+                "فایل صوتی یا ویدیویی بفرستید تا جزوه بسازیم؛ "
+                "از متن سند هم می‌توانید تمرین بسازید."
+            )
+        else:
+            invitation = "فایل درس را همین‌جا بفرستید؛ متن استخراج‌شده در کتابخانه می‌ماند."
         lines = [
-            "🎓 به گاماس خوش آمدید",
+            "به گاماس خوش آمدید",
             "",
             invitation,
             "",
-            "📤 صوت، ویدیو، PDF، Word یا PowerPoint",
+            "صوت، ویدیو، PDF، Word یا PowerPoint",
         ]
     else:
-        next_step = (
-            "📤 فایل درس بعدی را بفرستید تا جزوه‌اش را بسازم."
-            if notes_configured
-            else "📤 فایل صوتی، ویدیویی یا سند درسی بعدی را بفرستید."
-        )
-        lines = ["منوی اصلی", "", next_step]
-    if streak_days >= 2:
-        from .progress import to_persian_digits
-
-        lines.extend(["", f"🔥 {to_persian_digits(streak_days)} روز پشت‌سرهم برگشتید."])
-    lines.extend(["", f"💳 اعتبار باقی‌مانده: {balance}"])
-    if first_start:
-        if notes_configured:
-            lines.append("📚 متن گفتار و جزوه در «📚 کتابخانه من» ذخیره می‌شود.")
-        else:
-            lines.append("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.")
-        if office_enabled:
-            lines.append(OFFICE_CREDIT_NOTICE)
-        lines.extend(["", "از دکمه‌های زیر شروع کنید."])
+        lines = ["فایل درس بعدی را همین‌جا بفرستید."]
+    lines.extend(["", f"اعتبار: {balance}"])
     return "\n".join(lines)
 
 
@@ -187,31 +187,18 @@ def mini_app_button(label: str, url: str) -> Any:
 # ---------------------------------------------------------------------------
 
 #: Placeholder shown inside the message box while the keyboard is attached.
-REPLY_KEYBOARD_PLACEHOLDER: Final = "یک گزینه را انتخاب کنید یا فایل بفرستید…"
-#: Button of the bottom keyboard that re-opens the guide.
+REPLY_KEYBOARD_PLACEHOLDER: Final = "فایل درس را بفرستید یا یک گزینه را انتخاب کنید"
+#: Old label accepted by the message router for already displayed keyboards.
 BTN_MENU_GUIDE: Final = "ℹ️ راهنما"
 
 
 def reply_menu_rows(*, is_admin: bool, office_enabled: bool = True) -> list[list[str]]:
-    """Rows of the persistent bottom keyboard.
-
-    Inline buttons stay for the screens that need state (filters, pages,
-    payment steps), but the four things a student does most often deserve a
-    target that never scrolls away: start, library, results and credits. The
-    keyboard is a reply keyboard, so pressing a button simply sends its label as
-    text and the same dispatcher runs — no callback data to keep alive, and the
-    menu keeps working while a long job is processing.
-    """
+    """The single, compact global navigation; feature actions stay contextual."""
+    del office_enabled  # Conditional features live in the secondary menu.
     rows = [
-        [BTN_START_HERE, BTN_MY_RESULTS],
-        [BTN_LIBRARY, BTN_UPGRADE],
+        [BTN_LIBRARY, BTN_WALLET],
+        [BTN_MORE, BTN_SUPPORT],
     ]
-    if office_enabled:
-        rows.append([BTN_OFFICE, BTN_LEADERBOARD])
-    else:
-        rows.append([BTN_LEADERBOARD, BTN_SUPPORT])
-    rows.append([BTN_SUPPORT, BTN_HELP] if office_enabled else [BTN_HELP, BTN_REFERRALS])
-    rows.append([BTN_REFERRALS] if office_enabled else [BTN_MENU_GUIDE])
     if is_admin:
         rows.append([BTN_ADMIN])
     return rows
@@ -221,34 +208,36 @@ def reply_menu_rows(*, is_admin: bool, office_enabled: bool = True) -> list[list
 # Delivery — the results screen and the three fetch buttons
 # ---------------------------------------------------------------------------
 
-DELIVERY_READY_HEADER: Final = "✅ پردازش تمام شد — {reference}"
-DELIVERY_READY_BODY: Final = "خروجی‌ها آماده‌اند. هر کدام را خواستید بردارید:"
-DELIVERY_ROW_BOOKLET: Final = "📘 جزوهٔ ساختارمند: فایل PDF"
-DELIVERY_ROW_TRANSCRIPT: Final = "📝 متن خام گفتار: در گفتگو یا فایل TXT"
-DELIVERY_ROW_KEYPOINTS: Final = "⭐ نکات کلیدی: فهرست کوتاه"
-DELIVERY_ROW_LEARNING: Final = "✏️ ویرایش، 🧪 آزمون و 🃏 فلش‌کارت از همین جزوه"
-DELIVERY_ROW_NOTES_PENDING: Final = "⏳ نکات کلیدی: در حال ساخته‌شدن"
-DELIVERY_SPEAKERS_TEMPLATE: Final = "🎙 گویندگان شناسایی‌شده: {count} نفر"
-DELIVERY_SPEAKERS_ONE: Final = "🎙 یک گوینده شناسایی شد."
-DELIVERY_SPEAKERS_NONE: Final = (
-    "🎙 تفکیک گویندگان برای این فایل ممکن نشد؛ متن یک‌دست ارسال می‌شود."
-)
-DELIVERY_TRANSCRIPT_READY: Final = "📝 متن خام — {reference}"
-DELIVERY_KEYPOINTS_READY: Final = "⭐ نکات کلیدی — {reference}"
+DELIVERY_READY_HEADER: Final = "پردازش تمام شد — {reference}"
+DELIVERY_READY_BODY: Final = "دکمه‌های خروجی‌های آماده در همین پیام هستند."
+DELIVERY_ROW_BOOKLET: Final = "جزوهٔ PDF آماده است."
+DELIVERY_ROW_TRANSCRIPT: Final = "متن خام گفتار را می‌توانید در گفتگو بخوانید."
+DELIVERY_ROW_TXT: Final = "متن خام گفتار به‌صورت فایل TXT آماده است."
+DELIVERY_ROW_KEYPOINTS: Final = "نکات کلیدی آماده است."
+DELIVERY_ROW_DOCX: Final = "نسخهٔ Word آماده است."
+DELIVERY_ROW_STUDIO: Final = "جزوه را می‌توانید در گاماس استودیو ویرایش کنید."
+DELIVERY_ROW_LEARNING: Final = "از جزوه می‌توانید آزمون یا فلش‌کارت بسازید."
+DELIVERY_ROW_NOTES_PENDING: Final = "نکات کلیدی در حال آماده‌شدن است."
+DELIVERY_SPEAKERS_TEMPLATE: Final = "گویندگان شناسایی‌شده: {count} نفر"
+DELIVERY_SPEAKERS_ONE: Final = "یک گوینده شناسایی شد."
+DELIVERY_SPEAKERS_NONE: Final = "گویندهٔ جداگانه‌ای شناسایی نشد."
+DELIVERY_TRANSCRIPT_READY: Final = "متن خام — {reference}"
+DELIVERY_KEYPOINTS_READY: Final = "نکات کلیدی — {reference}"
 DELIVERY_ARTIFACT_GONE: Final = (
     "این خروجی دیگر در دسترس نیست؛ دوباره فایل را بفرستید تا از نو ساخته شود."
 )
 DELIVERY_KEYPOINTS_CHAT_HEADER: Final = "⭐ نکات کلیدی — {reference}"
 DELIVERY_KEYPOINTS_EMPTY: Final = "برای این فایل نکتهٔ کلیدی ثبت نشد."
-RESULTS_HUB_TITLE: Final = "📦 خروجی‌های من\n\nهر ردیف یک گفتگو؛ خروجی‌هایش را از همان‌جا بردارید."
+DELIVERY_NO_OUTPUT: Final = "برای این پردازش هنوز خروجی‌ای در دسترس نیست."
+RESULTS_HUB_TITLE: Final = "نتایج پردازش\n\nوضعیت فایل‌ها و خروجی‌های آماده را از اینجا ببینید."
 RESULTS_HUB_PAGE_TEMPLATE: Final = "صفحهٔ {page} از {pages}"
 RESULTS_HUB_EMPTY: Final = (
-    "📦 هنوز خروجی‌ای ندارید.\n\nیک فایل درس بفرستید تا جزوه، متن خام و نکات کلیدی ساخته شود."
+    "هنوز پردازشی ندارید.\n\nیک فایل درس بفرستید تا وضعیت و خروجی‌های آماده در نتایج پردازش نمایش داده شوند."
 )
 RESULTS_HUB_EMPTY_RAW_ONLY: Final = (
-    "📦 هنوز خروجی‌ای ندارید.\n\n"
-    "یک فایل صوتی یا ویدیویی بفرستید تا متن گفتار ذخیره شود؛ "
-    "سندهای درسی هم در کتابخانه در دسترس‌اند."
+    "هنوز پردازشی ندارید.\n\n"
+    "فایل صوتی یا ویدیویی بفرستید تا متن گفتار ذخیره شود؛ "
+    "سندهای درسی را از کتابخانه ببینید."
 )
 
 
@@ -271,36 +260,62 @@ RESULTS_STATUS: Final = {
 def delivery_screen(
     *,
     reference: str,
-    speakers: int,
+    speakers: int | None,
     has_booklet: bool,
     has_keypoints: bool = True,
     notes_pending: bool = False,
     learning_available: bool = True,
+    has_transcript: bool = True,
+    has_txt: bool = False,
+    has_docx: bool = False,
+    has_studio: bool = False,
+    has_learning_item: bool = True,
 ) -> str:
-    """The one message the pipeline ends with, before any file is pushed."""
-    # ``progress`` imports this module for its own copy, so the digit helper is
-    # imported at call time to keep the import graph acyclic.
+    """Describe only the artifacts and actions exposed by this message."""
     from .progress import to_persian_digits
 
     lines = [DELIVERY_READY_HEADER.format(reference=reference), ""]
-    if speakers > 1:
-        lines.append(DELIVERY_SPEAKERS_TEMPLATE.format(count=to_persian_digits(speakers)))
-    elif speakers == 1:
-        lines.append(DELIVERY_SPEAKERS_ONE)
-    else:
-        lines.append(DELIVERY_SPEAKERS_NONE)
-    lines.append("")
+    if speakers is not None:
+        if speakers > 1:
+            lines.append(
+                DELIVERY_SPEAKERS_TEMPLATE.format(count=to_persian_digits(speakers))
+            )
+        elif speakers == 1:
+            lines.append(DELIVERY_SPEAKERS_ONE)
+        else:
+            lines.append(DELIVERY_SPEAKERS_NONE)
+        lines.append("")
     if has_booklet:
         lines.append(DELIVERY_ROW_BOOKLET)
-    lines.append(DELIVERY_ROW_TRANSCRIPT)
+    if has_transcript:
+        lines.append(DELIVERY_ROW_TRANSCRIPT)
+    if has_txt:
+        lines.append(DELIVERY_ROW_TXT)
     if notes_pending:
         lines.append(DELIVERY_ROW_NOTES_PENDING)
     elif has_keypoints:
         lines.append(DELIVERY_ROW_KEYPOINTS)
-    if has_booklet and learning_available:
+    if has_docx:
+        lines.append(DELIVERY_ROW_DOCX)
+    if has_studio:
+        lines.append(DELIVERY_ROW_STUDIO)
+    if has_booklet and has_learning_item and learning_available:
         lines.append(DELIVERY_ROW_LEARNING)
-    elif has_booklet:
+    elif has_booklet and not learning_available:
         lines.append(LEARNING_GENERATION_UNAVAILABLE)
+    has_any_output = any(
+        (
+            has_booklet,
+            has_transcript,
+            has_txt,
+            has_keypoints,
+            notes_pending,
+            has_docx,
+            has_studio,
+        )
+    )
+    if not has_any_output:
+        lines.append(DELIVERY_NO_OUTPUT)
     lines.extend(["", DELIVERY_READY_BODY])
     return "\n".join(lines)
 
@@ -330,15 +345,15 @@ def help_screen(
     if notes_configured:
         lines.extend(
             [
-                "📚 متن خام و جزوه در «📚 کتابخانه من» ذخیره می‌شود.",
-                "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.",
+                "متن خام و جزوه در «کتابخانه» ذخیره می‌شود.",
+                "از متن ذخیره‌شده می‌توانید 🧪 آزمون و 🃏 فلش‌کارت بسازید؛ هر پاسخ درست ۱۰ امتیاز.",
                 "🎁 نخستین آزمون و نخستین مجموعهٔ فلش‌کارت جداگانه رایگان‌اند.",
             ]
         )
     else:
         lines.extend(
             [
-                "📚 متن خام گفتار و متن استخراج‌شدهٔ سند در «📚 کتابخانه من» ذخیره می‌شود.",
+                "متن خام گفتار و متن استخراج‌شدهٔ سند در «کتابخانه» ذخیره می‌شود.",
                 "⚠️ ساخت خودکار جزوه از صوت/ویدیو و ساخت آزمون یا فلش‌کارت هوشمند فعلاً فعال نیست.",
             ]
         )
@@ -353,7 +368,7 @@ def help_screen(
     lines.append(DOCUMENT_EMBEDDED_IMAGES_NOTICE)
     lines.extend(
         [
-            "🛒 خرید اشتراک و 🎧 پشتیبانی از منوی اصلی در دسترس است.",
+            "اعتبار و پشتیبانی از منوی اصلی در دسترس است.",
             "",
             "💳 هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس.",
             "اعتبار بر حسب ثانیه و پس از ارسال متن خام محاسبه می‌شود؛ "
@@ -478,7 +493,7 @@ UNSUPPORTED_FILE: Final = (
     "سند PDF/Word بفرستید."
 )
 UPLOAD_HINT: Final = "همین‌جا فایل 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت درس را بفرستید."
-ORDER_CANCELLED: Final = "ارسال لغو شد. لغو سفارش از «🛒 خرید اشتراک»."
+ORDER_CANCELLED: Final = "ارسال لغو شد. لغو سفارش از بخش «اعتبار» انجام می‌شود."
 
 # -------------------------------------------------------------------- learning
 LEARNING_GENERATION_UNAVAILABLE: Final = (
@@ -583,7 +598,7 @@ DELIVERY_DONE_DETAIL: Final = "متن گفتار و فایل خروجی ارسا
 TRACKING_CODE_TEMPLATE: Final = "کد پیگیری: {reference}"
 
 # ----------------------------------------------------------------------- wallet
-WALLET_TITLE: Final = "🛒 خرید اشتراک"
+WALLET_TITLE: Final = "💳 اعتبار و خرید بسته"
 WALLET_NO_PLANS: Final = "فعلاً بسته‌ای برای خرید موجود نیست."
 WALLET_CHOOSE_PLAN: Final = "بسته را انتخاب کنید؛ اعتبار خرید به موجودی شما اضافه می‌شود."
 WALLET_PLAN_ROW_TEMPLATE: Final = "• {credits}\n  اعتبار: {validity} | مبلغ: {price}"

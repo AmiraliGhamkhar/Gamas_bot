@@ -284,9 +284,10 @@ class JobPipelineMixin:
             )
             await event.reply(
                 f"💳 اعتبار شما کافی نیست.\n"
-                f"{measured} | لازم: {format_seconds_as_credits(needed)} "
-                f"| شما: {format_seconds_as_credits(available)}\n"
-                "از «🛒 خرید اشتراک» اعتبار بگیرید."
+                f"{measured} | اعتبار لازم (برآورد): {format_seconds_as_credits(needed)} "
+                f"| موجود: {format_seconds_as_credits(available)}\n"
+                f"{texts.CREDIT_ESTIMATE_NOTE}\n"
+                "برای افزایش موجودی، منوی «اعتبار» را باز کنید."
             )
             return
         try:
@@ -353,9 +354,10 @@ class JobPipelineMixin:
             if available < needed:
                 await event.reply(
                     f"💳 اعتبار شما کافی نیست.\n"
-                    f"لازم: {format_seconds_as_credits(needed)} "
-                    f"| شما: {format_seconds_as_credits(available)}\n"
-                    "از «🛒 خرید اشتراک» اعتبار بگیرید."
+                    f"اعتبار لازم (برآورد): {format_seconds_as_credits(needed)} "
+                    f"| موجود: {format_seconds_as_credits(available)}\n"
+                    f"{texts.CREDIT_ESTIMATE_NOTE}\n"
+                    "برای افزایش موجودی، منوی «اعتبار» را باز کنید."
                 )
                 return
         try:
@@ -507,9 +509,9 @@ class JobPipelineMixin:
                 job,
                 (
                     f"💳 اعتبار شما کافی نیست.\n"
-                    f"لازم: {format_seconds_as_credits(exc.required_seconds)} "
-                    f"| شما: {format_seconds_as_credits(exc.available_seconds)}\n"
-                    "از «🛒 خرید اشتراک» اعتبار بگیرید."
+                    f"اعتبار لازم: {format_seconds_as_credits(exc.required_seconds)} "
+                    f"| موجود: {format_seconds_as_credits(exc.available_seconds)}\n"
+                    "برای افزایش موجودی، منوی «اعتبار» را باز کنید."
                 ),
             )
         except USER_VISIBLE_ERRORS as exc:
@@ -1465,6 +1467,11 @@ class JobPipelineMixin:
             has_booklet=has_booklet,
             has_keypoints=has_keypoints,
             learning_available=self.settings.note_configured,
+            has_transcript=KIND_TRANSCRIPT in kinds,
+            has_txt=KIND_TXT in kinds,
+            has_docx=KIND_DOCX in kinds,
+            has_studio=bool(self.settings.mini_app_url and has_booklet),
+            has_learning_item=item_id is not None,
         )
         try:
             await self._reply(job, body, buttons=buttons)

@@ -1103,14 +1103,19 @@ class LearningWorkflowMixin:
             )
             return
         per_question = self.settings.quiz_cost_seconds_per_question
+        free = await self._free_try_available(user_id, "quiz")
         buttons: list[list] = []
         for _code, label, _cards, questions in SIZE_PRESETS:
+            cost_label = (
+                texts.LEARNING_FREE_CHOICE_LABEL
+                if free
+                else format_seconds_as_credits(questions * per_question)
+            )
             buttons.append(
                 [
                     Button.inline(
                         button_label(
-                            f"{label} — {to_persian_digits(questions)} سؤال — "
-                            f"{format_seconds_as_credits(questions * per_question)}"
+                            f"{label} — {to_persian_digits(questions)} سؤال — {cost_label}"
                         ),
                         f"quiz:go:{item_id}:{questions}".encode("ascii"),
                     )
@@ -1118,8 +1123,8 @@ class LearningWorkflowMixin:
             )
         buttons.append([self._learning_back_button(item_id)])
         badge = ""
-        if await self._free_try_available(user_id, "quiz"):
-            badge = f"\n\n{FREE_TRY_BADGE} — اولین آزمون شما بدون کسر اعتبار ساخته می‌شود."
+        if free:
+            badge = f"\n\n{FREE_TRY_BADGE} — نخستین آزمون رایگان است؛ اندازه را انتخاب کنید."
         await self._edit(
             event,
             "🧪 آزمون از جزوه\n\n" + QUIZ_START_GUIDANCE + badge,
@@ -1612,17 +1617,20 @@ class LearningWorkflowMixin:
             return
         size = self.settings.flashcard_ai_deck_size
         cost = self.settings.flashcard_ai_cost_seconds
+        free = await self._free_try_available(user_id, "deck")
+        regular_cost = format_seconds_as_credits(cost)
         text = (
             "ساخت فلش‌کارت با هوش مصنوعی از این جزوه. مجموعه‌ای از "
             f"{to_persian_digits(size)} پرسش و پاسخ ساخته می‌شود.\n"
-            f"هزینه: {format_seconds_as_credits(cost)}"
+            + (
+                f"هزینهٔ معمول: {regular_cost}؛ نخستین مجموعه رایگان است."
+                if free
+                else f"هزینه: {regular_cost}"
+            )
         )
         badge = ""
-        if await self._free_try_available(user_id, "deck"):
-            badge = (
-                f"\n\n{FREE_TRY_BADGE} — اولین مجموعهٔ فلش‌کارت شما بدون کسر "
-                "اعتبار ساخته می‌شود."
-            )
+        if free:
+            badge = f"\n\n{FREE_TRY_BADGE} — این بار بدون کسر اعتبار ساخته می‌شود."
         buttons: list[list] = [
             [Button.inline("🤖 ساخت فلش‌کارت", f"fc:go:{item_id}".encode("ascii"))]
         ]
@@ -1632,7 +1640,13 @@ class LearningWorkflowMixin:
                     Button.inline(
                         button_label(
                             f"{label} — {to_persian_digits(cards)} کارت — "
-                            f"{format_seconds_as_credits(self._preset_cost(cost, cards, size))}"
+                            + (
+                                texts.LEARNING_FREE_CHOICE_LABEL
+                                if free
+                                else format_seconds_as_credits(
+                                    self._preset_cost(cost, cards, size)
+                                )
+                            )
                         ),
                         f"fc:go:{item_id}:{code}".encode("ascii"),
                     )

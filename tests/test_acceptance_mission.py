@@ -419,25 +419,16 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
         menu = self.bot._user_menu()
         payloads = menu_payloads(menu)
         flat_labels = [button.text for row in menu for button in row]
-        self.assertEqual(
-            flat_labels,
-            [
-                "📚 کتابخانه من",
-                "🛒 خرید اشتراک",
-                "🗂 آفیس رایگان",
-                "🏆 لیدربورد",
-                "🎧 پشتیبانی",
-                "ℹ️ راهنما",
-                "🤝 دعوت دوستان",
-            ],
-        )
+        self.assertEqual(flat_labels, ["کتابخانه", "اعتبار", "بیشتر", "پشتیبانی"])
         self.assertEqual(
             payloads,
-            {
-                b"library", b"wallet", b"support", b"help", b"board",
-                b"office:start", b"ref:home",
-            },
+            {b"library", b"wallet", b"menu:more", b"support"},
         )
+        more_payloads = menu_payloads(self.bot._more_menu())
+        self.assertIn(b"office:start", more_payloads)
+        self.assertIn(b"board", more_payloads)
+        self.assertIn(b"results", more_payloads)
+        self.assertIn(b"ref:home", more_payloads)
 
         admin_labels = [button.text for row in self.bot._admin_menu() for button in row]
         # R1: the nine payment/user/health buttons are three hubs now.
