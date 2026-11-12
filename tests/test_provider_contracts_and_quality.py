@@ -91,8 +91,24 @@ class _FakeHTTPSession:
         self._responses = list(responses)
         self.calls: list[dict] = []
 
-    def post(self, url: str, *, headers: dict, json: dict, timeout=None):
-        self.calls.append({"url": url, "headers": dict(headers), "json": json})
+    def post(
+        self,
+        url: str,
+        *,
+        headers: dict,
+        json: dict,
+        timeout=None,
+        allow_redirects=None,
+    ):
+        self.calls.append(
+            {
+                "url": url,
+                "headers": dict(headers),
+                "json": json,
+                "timeout": timeout,
+                "allow_redirects": allow_redirects,
+            }
+        )
         if not self._responses:
             raise AssertionError("unexpected HTTP post call")
         return self._responses.pop(0)
@@ -364,6 +380,11 @@ class StreamingAndExtractionTests(unittest.IsolatedAsyncioTestCase):
         usage_lines = [line for line in logs.output if "note provider usage" in line]
         self.assertEqual(len(usage_lines), 1, logs.output)
         self.assertIn("request_id=avalai_stream_123", usage_lines[0])
+        self.assertFalse(session.calls[0]["allow_redirects"])
+        self.assertEqual(
+            session.calls[0]["timeout"].sock_connect,
+            llm.LLM_CONNECT_TIMEOUT_SECONDS,
+        )
 
     async def test_anthropic_sse_streaming_assembles_text_and_usage(self) -> None:
         route = NoteRoute(

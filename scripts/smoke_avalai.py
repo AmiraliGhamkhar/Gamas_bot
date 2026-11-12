@@ -51,6 +51,11 @@ from gamas_bot.config import (  # noqa: E402
     note_routes,
 )
 
+#: Metadata should be quick and must never borrow a full note-generation
+#: deadline. Both limits bound an operator-run probe as well as the live client.
+METADATA_REQUEST_TIMEOUT_SECONDS = 30.0
+METADATA_CONNECT_TIMEOUT_SECONDS = 10.0
+
 #: The snippet used when ``--generate`` gets no file. It is deliberately small:
 #: the smoke test proves the request shape, not the model's taste.
 DEFAULT_SNIPPET = (
@@ -122,16 +127,29 @@ async def _check_metadata(route, settings) -> bool:
     """``GET /models`` with the real key: is the model entitled, and how big is it?"""
     import aiohttp
 
-    from gamas_bot.llm import _clean_api_key, _endpoint, _redact_secrets
+    from gamas_bot.llm import (
+        _clean_api_key,
+        _endpoint,
+        _read_json_body,
+        _redact_secrets,
+    )
 
     url = _endpoint(route.base_url, "models")
     headers = {"Authorization": f"Bearer {_clean_api_key(route.api_key)}"}
     started = time.monotonic()
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
+        timeout = aiohttp.ClientTimeout(
+            total=METADATA_REQUEST_TIMEOUT_SECONDS,
+            sock_connect=METADATA_CONNECT_TIMEOUT_SECONDS,
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url,
+                headers=headers,
+                allow_redirects=False,
+            ) as response:
                 status = response.status
-                payload = await response.json(content_type=None)
+                payload = await _read_json_body(response)
     except Exception as exc:  # noqa: BLE001 - report any transport failure verbatim
         detail = _redact_secrets(str(exc), route.api_key)
         print(f"[FAIL] metadata GET {_safe_base_url(url)}: {type(exc).__name__}: {detail}")

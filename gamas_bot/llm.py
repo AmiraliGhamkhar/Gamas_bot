@@ -26,6 +26,7 @@ import asyncio
 from dataclasses import replace
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -135,6 +136,17 @@ LLM_REQUEST_TIMEOUT_SECONDS = 300.0
 
 #: Bounded retries for transient LLM failures (5xx, 429, network).
 MAX_TRANSIENT_RETRIES = 2
+
+#: A provider can return an arbitrary ``Retry-After`` (including an HTTP-date
+#: days ahead). Never let that remote hint keep a scarce note-provider lease
+#: occupied indefinitely; the chain either retries within this cap or fails
+#: over. This mirrors the bounded STT retry policy.
+MAX_LLM_RETRY_AFTER_SECONDS = 60.0
+
+#: Connection establishment has a much shorter budget than a valid long-form
+#: completion. A dead route must not consume the whole note request deadline
+#: before the provider chain can try its next eligible leg.
+LLM_CONNECT_TIMEOUT_SECONDS = 10.0
 
 #: Maximum number of request-parameter compatibility adjustments per attempt
 #: (Gemini ``responseSchema``/``thinkingConfig`` removal, ``response_format``
@@ -1261,6 +1273,26 @@ def request_payload_output_tokens(payload: dict) -> int | None:
     return None
 
 
+def _retry_delay_seconds(retry_after: float | None, attempt: int) -> float:
+    """Return a finite, bounded delay for one transient LLM retry.
+
+    The HTTP utility already parses recognised headers, but this final guard
+    also protects direct test doubles and future provider adapters from a NaN,
+    a negative value, or a very large retry hint. A missing/invalid hint uses
+    capped exponential backoff.
+    """
+    fallback = min(2.0**attempt, MAX_LLM_RETRY_AFTER_SECONDS)
+    if retry_after is None:
+        return fallback
+    try:
+        candidate = float(retry_after)
+    except (TypeError, ValueError):
+        return fallback
+    if not math.isfinite(candidate):
+        return fallback
+    return min(MAX_LLM_RETRY_AFTER_SECONDS, max(0.0, candidate))
+
+
 def _log_usage(
     route: NoteRoute,
     payload: dict,
@@ -1713,7 +1745,11 @@ async def _complete_streaming_on_route(
         stream_url,
         headers=headers,
         json=stream_payload,
-        timeout=aiohttp.ClientTimeout(total=timeout_seconds, sock_connect=10),
+        timeout=aiohttp.ClientTimeout(
+            total=timeout_seconds,
+            sock_connect=LLM_CONNECT_TIMEOUT_SECONDS,
+        ),
+        allow_redirects=False,
     ) as response:
         if response.status != 200:
             raise await _error_from_response(route.label, response, route.api_key or None)
@@ -2060,7 +2096,11 @@ async def _complete_on_route(
                 url,
                 headers=headers,
                 json=payload,
-                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                timeout=aiohttp.ClientTimeout(
+                    total=timeout_seconds,
+                    sock_connect=LLM_CONNECT_TIMEOUT_SECONDS,
+                ),
+                allow_redirects=False,
             ) as response:
                 ttfb_ms = (time.perf_counter() - started) * 1000.0
                 if response.status != 200:
@@ -2207,7 +2247,7 @@ async def _complete_on_route(
                 ) from exc
             attempt += 1
             METRICS.record_provider_event("llm", route.slug, "retry")
-            delay = retry_after if retry_after is not None else min(2.0**attempt, 15.0)
+            delay = _retry_delay_seconds(retry_after, attempt)
             logger.warning(
                 "LLM transient failure provider=%s (attempt %d/%d; %s); retrying in %.1fs",
                 route.slug, attempt, MAX_TRANSIENT_RETRIES + 1,
@@ -2237,7 +2277,11 @@ async def get_json(
             async with session.get(
                 url,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                timeout=aiohttp.ClientTimeout(
+                    total=timeout_seconds,
+                    sock_connect=LLM_CONNECT_TIMEOUT_SECONDS,
+                ),
+                allow_redirects=False,
             ) as response:
                 ttfb_ms = (time.perf_counter() - started) * 1000.0
                 if response.status != 200:
@@ -2273,7 +2317,7 @@ async def get_json(
             retry_after = (
                 exc.retry_after_seconds if isinstance(exc, LLMTransientError) else None
             )
-            delay = retry_after if retry_after is not None else min(2.0**attempt, 15.0)
+            delay = _retry_delay_seconds(retry_after, attempt)
             logger.warning(
                 "LLM GET transient failure provider=%s target=%s (attempt %d/%d; %s); retrying in %.1fs",
                 route.slug, target, attempt, MAX_TRANSIENT_RETRIES + 1,

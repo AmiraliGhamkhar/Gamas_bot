@@ -6,8 +6,10 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 **AvalAI hardening.** The OpenAI-compatible note route now captures AvalAI's
 `avalai-request-id` for every successful normal or streaming completion and
-logs it with token usage, so exact User API cost reconciliation has a durable
-correlation id. Error messages prefer the same id and redact secrets. `--check`
+logs it with token usage, so exact User API cost reconciliation has a
+correlation id. Error messages prefer the same id and redact secrets. The LLM
+transport has a short connect timeout, refuses redirects that could forward a
+bearer key, and caps provider `Retry-After` delays at 60 seconds. `--check`
 rejects accidentally configured AvalAI User API or Google-native API bases, and
 the standalone AvalAI smoke script no longer prints URL credentials, queries or
 fragments.

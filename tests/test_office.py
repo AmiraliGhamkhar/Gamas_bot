@@ -499,8 +499,17 @@ class _FakeLLMSession:
         self.payload = payload
         self.requests: list[dict] = []
 
-    def post(self, url, headers=None, json=None, timeout=None):  # noqa: A002
-        self.requests.append({"url": url, "json": json})
+    def post(
+        self,
+        url,
+        headers=None,
+        json=None,
+        timeout=None,
+        allow_redirects=None,
+    ):  # noqa: A002
+        self.requests.append(
+            {"url": url, "json": json, "allow_redirects": allow_redirects}
+        )
         return _FakeResponse(
             {"choices": [{"message": {"content": json_lib.dumps(self.payload)}}]}
         )
