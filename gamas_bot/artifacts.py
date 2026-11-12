@@ -171,6 +171,7 @@ def delivery_markup(
     kinds: set[str],
     item_id: int | None = None,
     mini_app_url: str = "",
+    learning_available: bool = True,
 ):
     """One completion screen, one button per independently available artifact.
 
@@ -225,14 +226,14 @@ def delivery_markup(
         rows.append([texts.mini_app_button(texts.BTN_EDIT_IN_APP, mini_app_url)])
     # Learning buttons (quiz / flashcards)
     learning: list[Any] = []
-    if item_id and KIND_QUIZ in kinds:
+    if learning_available and item_id and KIND_QUIZ in kinds:
         learning.append(
             Button.inline(
                 texts.BTN_QUIZ_FROM_BOOKLET,
                 f"quiz:new:{int(item_id)}".encode("ascii"),
             )
         )
-    if item_id and KIND_FLASHCARDS in kinds:
+    if learning_available and item_id and KIND_FLASHCARDS in kinds:
         learning.append(
             Button.inline(
                 texts.BTN_CARDS_FROM_BOOKLET,

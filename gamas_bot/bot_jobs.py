@@ -706,7 +706,12 @@ class JobPipelineMixin:
         if not self.settings.note_configured:
             await self.db.set_submission_status(job.submission_id, "done")
             await self._deliver_results(
-                job, document, reference, has_booklet=False, has_keypoints=False
+                job,
+                document,
+                reference,
+                has_booklet=False,
+                has_keypoints=False,
+                progress=progress,
             )
             return
         job.transition_to("generating_notes")
@@ -986,7 +991,12 @@ class JobPipelineMixin:
         if not self.settings.note_configured:
             await self.db.set_submission_status(job.submission_id, "done")
             await self._deliver_results(
-                job, document, reference, has_booklet=False, has_keypoints=False
+                job,
+                document,
+                reference,
+                has_booklet=False,
+                has_keypoints=False,
+                progress=progress,
             )
             return
         job.transition_to("generating_notes")
@@ -1447,12 +1457,14 @@ class JobPipelineMixin:
             kinds=kinds,
             item_id=item_id,
             mini_app_url=self.settings.mini_app_url,
+            learning_available=self.settings.note_configured,
         )
         body = texts.delivery_screen(
             reference=reference,
             speakers=speakers,
             has_booklet=has_booklet,
             has_keypoints=has_keypoints,
+            learning_available=self.settings.note_configured,
         )
         try:
             await self._reply(job, body, buttons=buttons)

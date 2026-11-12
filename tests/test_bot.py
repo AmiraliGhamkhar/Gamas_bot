@@ -700,6 +700,11 @@ class PresentationNotesDeliveryTests(BotPipelineTestCase):
         row = await self.db.submission(submission)
         assert row is not None
         self.assertEqual(row.status, "done")
+        self.assertIn("۱۰۰٪", event.edits[-1])
+        self.assertIn(
+            texts.DELIVERY_READY_HEADER.format(reference=f"GMS-{submission}"),
+            event.edits[-1],
+        )
 
 
 class PresentationPromptTests(BotPipelineTestCase):
@@ -1220,6 +1225,37 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(b"office:start", payloads)
         self.assertEqual(len(payloads), 8)
 
+    async def test_raw_only_learning_screens_do_not_offer_ai_generation(self):
+        await self.db.ensure_user(self.user_id)
+        item_id = await self.db.library_add(
+            self.user_id,
+            "booklet",
+            self.user_id,
+            123,
+            None,
+            title="جزوهٔ آزمایشی",
+        )
+        await self.db.library_set_content(item_id, "متن ذخیره‌شده برای آزمون")
+        detail = FakeCallbackEvent(self.user_id, f"lib:it:{item_id}".encode())
+        await self.bot._handle_callback(detail)
+        detail_text, detail_buttons = detail.edits[-1]
+        self.assertIn(texts.LEARNING_GENERATION_UNAVAILABLE, detail_text)
+        self.assertFalse(
+            any(data.startswith((b"quiz:", b"fc:ai:")) for data in menu_payloads(detail_buttons))
+        )
+
+        cards = FakeCallbackEvent(self.user_id, b"library:fc")
+        await self.bot._handle_callback(cards)
+        cards_text, cards_buttons = cards.edits[-1]
+        self.assertIn("کارت‌های دستی", cards_text)
+        self.assertNotIn(b"fc:pick:0", menu_payloads(cards_buttons))
+        self.assertIn(b"fc:man", menu_payloads(cards_buttons))
+
+        board = FakeCallbackEvent(self.user_id, b"board")
+        await self.bot._handle_callback(board)
+        self.assertIn("فعلاً فعال نیست", board.edits[-1][0])
+        self.assertNotIn("اولین آزمون", board.edits[-1][0])
+
     async def test_main_panel_asks_for_the_next_file_and_shows_the_balance(self):
         """One action, one number: the returning screen is not a brochure."""
         event = FakeCallbackEvent(self.user_id, b"menu:main")
@@ -1229,7 +1265,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             text,
             "منوی اصلی\n\n"
-            "📤 فایل درس بعدی را بفرستید تا جزوه‌اش را بسازم.\n\n"
+            "📤 فایل صوتی، ویدیویی یا سند درسی بعدی را بفرستید.\n\n"
             f"💳 اعتبار باقی‌مانده: {await self.bot._balance_text(self.user_id)}",
         )
 
@@ -1238,21 +1274,15 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(event)
         text, _buttons = event.responses[-1]
 
-        expected = (
-            "ℹ️ راهنمای گاماس\n\n"
-            "📤 فایل درس: صوت، ویدیو، PDF، Word یا PowerPoint را همین‌جا بفرستید.\n"
-            "📚 متن خام و جزوه در «📚 کتابخانه من» ذخیره می‌شود.\n"
-            "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.\n"
-            "🎁 نخستین آزمون و نخستین مجموعهٔ فلش‌کارت جداگانه رایگان‌اند.\n"
-            "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ بدون کسر اعتبار.\n"
-            "🛒 خرید اشتراک و 🎧 پشتیبانی از منوی اصلی در دسترس است.\n\n"
-            "💳 هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس.\n"
-            "اعتبار بر حسب ثانیه و پس از ارسال متن خام محاسبه می‌شود؛ "
-            "اگر متن خام نرسد، اعتباری کم نمی‌شود.\n"
-            "ساخت آزمون و فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق باشد، کامل برمی‌گردد.\n"
-            "خطای ساخت جزوه پس از دریافت متن خام، اعتبار را برنمی‌گرداند."
+        expected = texts.help_screen(
+            office_enabled=self.bot.settings.office_enabled,
+            notes_configured=self.bot.settings.note_configured,
+            ocr_enabled=self.bot.settings.ocr_enabled,
         )
         self.assertEqual(text, expected)
+        self.assertIn(texts.OFFICE_CREDIT_NOTICE, text)
+        self.assertIn(texts.DOCUMENT_OCR_OFF_NOTICE, text)
+        self.assertIn("صدای PowerPoint خودکار پردازش نمی‌شود", text)
 
     async def test_main_panel_is_clear_when_word_generation_is_not_configured(self):
         self.bot.settings = replace(
@@ -1269,7 +1299,7 @@ class PanelSeparationTests(unittest.IsolatedAsyncioTestCase):
         # The returning screen no longer carries the offers at all; the promise
         # about the library lives on the welcome screen and must not name a
         # booklet the bot could not produce with this configuration.
-        self.assertIn("📤 فایل درس بعدی را بفرستید", text)
+        self.assertIn("📤 فایل صوتی، ویدیویی یا سند درسی بعدی را بفرستید.", text)
         start = FakeMessageEvent(self.user_id, "/start")
         await self.bot._handle_message(start)
         welcome = start.replies[0]
@@ -2010,6 +2040,11 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.assertEqual(await self.db.library_count(user_id), 0)
+        self.assertIn("۱۰۰٪", event.edits[-1])
+        self.assertIn(
+            texts.DELIVERY_READY_HEADER.format(reference=f"GMS-{job.submission_id}"),
+            event.edits[-1],
+        )
 
 
 if __name__ == "__main__":
@@ -2133,11 +2168,48 @@ class ResultsHubTests(BotPipelineTestCase):
         ]
         self.assertTrue(any(f"GMS-{submission}" in label for label in labels), labels)
 
+    async def test_results_hub_pages_past_the_latest_eight(self):
+        submission_ids = [
+            await self.db.create_submission(USER_ID, "audio", f"lecture-{index}.ogg")
+            for index in range(10)
+        ]
+        hub = FakeMessageEvent(USER_ID, texts.BTN_MY_RESULTS)
+        self.bot.client = hub.client
+        await self.bot._handle_message(hub)
+
+        first_page = hub.client.texts[-1]
+        first_labels = [
+            button.text
+            for row in first_page["buttons"]
+            for button in row
+        ]
+        self.assertTrue(any(f"GMS-{submission_ids[-1]}" in label for label in first_labels))
+        self.assertIn(b"res:page:1", menu_payloads(first_page["buttons"]))
+        self.assertNotIn(
+            f"res:{submission_ids[0]}".encode(),
+            menu_payloads(first_page["buttons"]),
+        )
+
+        callback = FakeCallbackEvent(USER_ID, b"res:page:1")
+        await self.bot._handle_callback(callback)
+        page_two_text, page_two_buttons = callback.edits[-1]
+        self.assertIn("صفحهٔ ۲ از ۲", page_two_text)
+        page_two_labels = [
+            button.text
+            for row in page_two_buttons
+            for button in row
+        ]
+        self.assertTrue(any(f"GMS-{submission_ids[0]}" in label for label in page_two_labels))
+        self.assertIn(b"res:page:0", menu_payloads(page_two_buttons))
+
     async def test_an_empty_hub_says_so(self):
         hub = FakeMessageEvent(USER_ID, texts.BTN_MY_RESULTS)
         self.bot.client = hub.client
         await self.bot._handle_message(hub)
-        self.assertEqual(hub.replies[0], texts.RESULTS_HUB_EMPTY)
+        self.assertEqual(
+            hub.replies[0],
+            texts.results_hub_empty(notes_configured=self.bot.settings.note_configured),
+        )
 
     async def test_a_hub_row_opens_the_same_buttons(self):
         event = self.media_event()
@@ -2159,6 +2231,12 @@ class ResultsHubTests(BotPipelineTestCase):
 
     async def test_a_booklet_button_survives_a_consumed_library_snapshot(self):
         """has_booklet is enough for a forward; learning buttons need item_id."""
+        self.bot.settings = replace(
+            self.bot.settings,
+            note_api_key="note-key",
+            note_api_base_url="https://note.example/v1",
+            note_providers=("openai_compatible",),
+        )
         event = self.media_event()
         submission = await self.run_media_job(event, transcribe=self._raw())
         book = {
@@ -2206,6 +2284,73 @@ class ReplyKeyboardRoutingTests(BotPipelineTestCase):
                 any(marker in reply for reply in event.replies),
                 f"{label} → {event.replies[:1]}",
             )
+
+    async def test_reply_menu_navigation_disarms_a_user_support_prompt(self):
+        self.bot._support_states[USER_ID] = (
+            "new", "technical", self.bot.deps.monotonic()
+        )
+        event = FakeMessageEvent(USER_ID, texts.BTN_LIBRARY)
+        self.bot.client = event.client
+        with mock.patch.object(
+            self.bot, "_show_library", new=mock.AsyncMock()
+        ) as show_library:
+            await self.bot._handle_message(event)
+        show_library.assert_awaited_once_with(event)
+        self.assertNotIn(USER_ID, self.bot._support_states)
+
+    async def test_navigating_to_office_preserves_its_draft_but_clears_other_prompts(self):
+        from gamas_bot.office import OfficeSession
+
+        office = OfficeSession(
+            parts=["پیش‌نویس آفیس"], updated_at=self.bot.deps.monotonic()
+        )
+        self.bot._office_sessions[USER_ID] = office
+        self.bot._support_states[USER_ID] = (
+            "new", "technical", self.bot.deps.monotonic()
+        )
+        self.bot._pending_flashcard[USER_ID] = (77, "front")
+        event = FakeMessageEvent(USER_ID, texts.BTN_OFFICE)
+        self.bot.client = event.client
+
+        await self.bot._handle_message(event)
+
+        self.assertIs(self.bot._office_sessions[USER_ID], office)
+        self.assertNotIn(USER_ID, self.bot._support_states)
+        self.assertNotIn(USER_ID, self.bot._pending_flashcard)
+        self.assertTrue(any("آفیس رایگان" in reply for reply in event.replies))
+
+    async def test_reply_menu_navigation_cannot_reject_upload_or_continue_a_broadcast(self):
+        admin_id = next(iter(self.settings.admin_ids))
+        await self.db.ensure_user(admin_id)
+        self.bot._pending_reject_reason[admin_id] = 42
+        self.bot._pending_payments[admin_id] = 43
+        self.bot._pending_broadcast.add(admin_id)
+        self.bot._broadcast_previews[admin_id] = ("draft", None)
+        self.bot._broadcast_resume[admin_id] = 44
+        event = FakeMessageEvent(admin_id, texts.BTN_LIBRARY)
+        self.bot.client = event.client
+        with (
+            mock.patch.object(self.bot, "_show_library", new=mock.AsyncMock()) as library,
+            mock.patch.object(
+                self.bot, "_reject_payment_with_reason", new=mock.AsyncMock()
+            ) as reject,
+            mock.patch.object(
+                self.bot, "_handle_receipt_upload", new=mock.AsyncMock()
+            ) as receipt,
+            mock.patch.object(
+                self.bot, "_prepare_broadcast", new=mock.AsyncMock()
+            ) as broadcast,
+        ):
+            await self.bot._handle_message(event)
+        library.assert_awaited_once_with(event)
+        reject.assert_not_awaited()
+        receipt.assert_not_awaited()
+        broadcast.assert_not_awaited()
+        self.assertNotIn(admin_id, self.bot._pending_reject_reason)
+        self.assertNotIn(admin_id, self.bot._pending_payments)
+        self.assertNotIn(admin_id, self.bot._pending_broadcast)
+        self.assertNotIn(admin_id, self.bot._broadcast_previews)
+        self.assertNotIn(admin_id, self.bot._broadcast_resume)
 
     async def test_a_menu_label_is_not_treated_as_a_file_caption(self):
         event = FakeMessageEvent(USER_ID, texts.BTN_MY_RESULTS)

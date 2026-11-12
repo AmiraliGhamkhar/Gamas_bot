@@ -594,6 +594,17 @@ class CallbackGateIntegrationTests(SubscriptionTestCase):
         await self.bot._dispatch_callback(event)
         self.assertTrue(any(JOIN_PROMPT_MARKER in text for text, _ in event.edits))
 
+    async def test_document_generation_callback_is_gated(self):
+        await self.use_resolver("left")
+        event = CallbackEvent(USER_ID, b"doc:gen:fc:123:standard")
+        event.message_id = 321
+        await self.bot._dispatch_callback(event)
+        self.assertTrue(any(JOIN_PROMPT_MARKER in text for text, _ in event.edits))
+        pending = await self.db.take_pending_gate_action(USER_ID)
+        self.assertIsNotNone(pending)
+        self.assertEqual(pending["kind"], "callback")
+        self.assertEqual(pending["callback_data"], "doc:gen:fc:123:standard")
+
 
 class MigrationTests(SubscriptionTestCase):
     async def test_set_subscription_state_round_trip(self):

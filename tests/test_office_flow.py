@@ -125,6 +125,14 @@ class OfficeFlowTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(self.callback("office:start"))
         self.assertIn(self.user_id, self.bot._office_sessions)
 
+    async def test_office_entry_explains_credit_and_capacity_limits(self):
+        callback = self.callback("office:start")
+        await self.bot._handle_callback(callback)
+
+        text = callback.edits[-1]["text"]
+        self.assertIn("از اعتبار حساب شما کم نمی‌شود", text)
+        self.assertIn("سقف ورودی و ظرفیت پردازش", text)
+
     async def test_pasted_messages_make_real_word_excel_powerpoint_and_selectable_pdf_without_billing(self):
         before = await self.billing_snapshot()
         await self.enter_office()

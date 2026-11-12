@@ -254,9 +254,7 @@ class DocumentOfficeWorkflowMixin:
                 )
             text = await run_file_io(lambda: extracted.text)
             if not text.strip():
-                raise DocExtractError(
-                    "متنی از این سند استخراج نشد؛ OCR پشتیبانی نمی‌شود."
-                )
+                raise DocExtractError(texts.DOCUMENT_EXTRACTION_EMPTY)
             chunks = await run_file_io(
                 chunk_sections, extracted.sections, max_chars=MAX_MODEL_INPUT_CHARS
             )
@@ -301,13 +299,20 @@ class DocumentOfficeWorkflowMixin:
             texts.DOCUMENT_EXTRACTED_COUNT.format(count=to_persian_digits(int(document.get('text_chars', len(str(document.get('text') or '')))))),
         ]
         if self.settings.office_enabled:
+            lines.append(texts.DOCUMENT_FREE_NOTICE)
+        if not self.settings.note_configured:
+            lines.append(texts.LEARNING_GENERATION_UNAVAILABLE)
+        source_type = str(document.get("source_type") or "")
+        if source_type in {"pdf", "image"}:
             lines.append(
-                "جزوه، مرور سریع و خروجی‌های Office رایگان‌اند و از اعتبار کم نمی‌کنند."
+                texts.DOCUMENT_OCR_ON_NOTICE
+                if self.settings.ocr_enabled
+                else texts.DOCUMENT_OCR_OFF_NOTICE
             )
-        if document.get("source_type") == "pptx":
-            lines.append(
-                "پردازش صدای ارائه عملیات جداگانه‌ای است و فقط با انتخاب دکمهٔ صوت آغاز می‌شود."
-            )
+        if source_type in {"docx", "pptx"}:
+            lines.append(texts.DOCUMENT_EMBEDDED_IMAGES_NOTICE)
+        if source_type == "pptx":
+            lines.append(texts.PRESENTATION_PROCESSING_NOTICE)
         lines.extend(("", texts.DOCUMENT_TEXT_PREVIEW, preview_text(str(document.get("text_preview", document.get("text")) or ""))))
         return "\n".join(lines)
 
@@ -334,8 +339,8 @@ class DocumentOfficeWorkflowMixin:
                     ],
                 ]
             )
-        buttons.extend(
-            [
+        if self.settings.note_configured:
+            buttons.append(
                 [
                     Button.inline(
                         DOC_GENERATE_CARDS, f"doc:fc:{document_id}".encode("ascii")
@@ -344,12 +349,13 @@ class DocumentOfficeWorkflowMixin:
                         DOC_GENERATE_QUESTIONS,
                         f"doc:quiz:{document_id}".encode("ascii"),
                     ),
-                ],
-                [
-                    Button.inline(
-                        "📥 دریافت فایل اصلی", f"doc:f:{document_id}".encode("ascii")
-                    )
-                ],
+                ]
+            )
+        buttons.append(
+            [
+                Button.inline(
+                    "📥 دریافت فایل اصلی", f"doc:f:{document_id}".encode("ascii")
+                )
             ]
         )
         if source_type == "pptx":
@@ -466,7 +472,7 @@ class DocumentOfficeWorkflowMixin:
             "متن را اینجا بچسبانید یا چند پیام بفرستید؛ فایل‌های .txt، .md، .markdown، .csv و .tsv هم پذیرفته می‌شوند.\n"
             f"سقف هر سند {to_persian_digits(self.settings.office_max_chars)} نویسه است.\n"
             "پس از پایان، قالب Word، Excel، PowerPoint یا PDF را انتخاب کنید. "
-            "هر خروجی جداگانه قابل ساخت است و از اعتبار یا سهمیهٔ رایگان کم نمی‌کند.",
+            "هر خروجی جداگانه قابل ساخت است؛ از اعتبار حساب شما کم نمی‌شود، اما سقف ورودی و ظرفیت پردازش اعمال می‌شود.",
             self._office_session_keyboard(),
         )
 
@@ -1514,10 +1520,9 @@ class DocumentOfficeWorkflowMixin:
         if count == 0:
             await self._edit(  # type: ignore[attr-defined]
                 event,
-                "📄 اسناد\n\n"
-                "هنوز سندی ذخیره نکرده‌اید.\n"
-                "فایل PDF، Word یا PowerPoint را همین‌جا بفرستید تا متنش استخراج و "
-                "از آن فلش‌کارت و سؤال ساخته شود.",
+                texts.documents_empty(
+                    notes_configured=self.settings.note_configured
+                ),
                 [[Button.inline("↩️ کتابخانه", b"library")]],
             )
             return
@@ -1567,6 +1572,13 @@ class DocumentOfficeWorkflowMixin:
         document = await self.db.document_meta(user_id, document_id)
         if document is None:
             await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
+            return
+        if not self.settings.note_configured:
+            await self._edit(  # type: ignore[attr-defined]
+                event,
+                texts.LEARNING_GENERATION_UNAVAILABLE,
+                [[Button.inline("↩️ سند", f"doc:show:{document_id}".encode("ascii"))]],
+            )
             return
         deck_label = "مجموعهٔ فلش‌کارت" if kind == "deck" else "آزمون"
         buttons: list[list] = []
@@ -1623,7 +1635,7 @@ class DocumentOfficeWorkflowMixin:
         choice: str,
     ) -> None:
         if not self.settings.note_configured:
-            await event.respond("سرویس تولید محتوا در حال حاضر فعال نیست.")
+            await event.respond(texts.LEARNING_GENERATION_UNAVAILABLE)
             return
         source = await self._source_from_document(user_id, document_id)  # type: ignore[attr-defined]
         if source is None:
@@ -1871,6 +1883,10 @@ class DocumentOfficeWorkflowMixin:
             document_id = _to_int(parts[3])
             if document_id is None:
                 await self._ack(event, "این سند پیدا نشد.", alert=True)  # type: ignore[attr-defined]
+                return
+            if not await self._require_membership(
+                event, user_id, kind="callback", callback_data=data
+            ):
                 return
             await self._generate_from_document(
                 event, user_id, document_id, kind, parts[4]

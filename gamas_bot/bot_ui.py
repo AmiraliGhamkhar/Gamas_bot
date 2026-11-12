@@ -6,6 +6,8 @@ Centralizing domain copy constants prevents circular imports between
 
 from __future__ import annotations
 
+from . import texts
+
 RAW_PREVIEW_CHARS = 800
 MAX_RAW_PREVIEW_LINES = 12
 TELEGRAM_CAPTION_LIMIT = 1024
@@ -81,14 +83,8 @@ LEARNING_PROGRESS_EDIT_TIMEOUT_SECONDS = 1.0
 DOC_UNSUPPORTED_HINT = (
     "⚠️ فقط PDF، Word (docx) یا PowerPoint (pptx) به‌عنوان سند پذیرفته می‌شود."
 )
-DOC_PHOTO_HINT = (
-    "📷 عکس سند به‌تنهایی خوانده نمی‌شود (OCR پشتیبانی نمی‌شود).\n"
-    "لطفاً فایل را با گزینهٔ «ارسال به‌صورت فایل» و در قالب PDF/DOCX/PPTX بفرستید."
-)
-DOC_OCR_FAILED = (
-    "⚠️ خواندن تصویری سند ناموفق بود (سرویس OCR در دسترس نیست یا پاسخ نداد).\n"
-    "کمی بعد دوباره تلاش کنید یا نسخهٔ متنی/Word فایل را بفرستید."
-)
+DOC_PHOTO_HINT = texts.DOCUMENT_PHOTO_OCR_OFF
+DOC_OCR_FAILED = texts.DOCUMENT_OCR_FAILED
 DEFAULT_INTAKE_SUFFIX: dict[str, str] = {"image": ".jpg"}
 DOC_GENERATE_CARDS = "🃏 ساخت فلش‌کارت"
 DOC_GENERATE_QUESTIONS = "❓ ساخت سؤالات"

@@ -906,7 +906,7 @@ class GamasBot(
         page = min(max(0, int(page)), max(0, (count - 1) // page_size))
         items = await self.db.library_list(user_id, limit=page_size, offset=page * page_size)
         if count == 0:
-            text = texts.LIBRARY_EMPTY
+            text = texts.library_empty(notes_configured=self.settings.note_configured)
             await self._edit_or_reply(
                 event,
                 text,
@@ -985,7 +985,7 @@ class GamasBot(
             [Button.inline(texts.BTN_REDOWNLOAD, f"lib:f:{item_id}".encode("ascii"))],
         ]
         if item["kind"] == "booklet":
-            if item.get("content_text"):
+            if item.get("content_text") and self.settings.note_configured:
                 buttons.append(
                     [
                         Button.inline(
@@ -1002,6 +1002,8 @@ class GamasBot(
                         )
                     ]
                 )
+            elif item.get("content_text"):
+                header += "\n\n" + texts.LEARNING_GENERATION_UNAVAILABLE
             else:
                 header += "\n\n" + LEARNING_LEGACY_NOTICE
         buttons.append([Button.inline(texts.BTN_BACK, b"lib:0")])
@@ -1155,22 +1157,27 @@ class GamasBot(
         await handler(event)
         return True
 
-    async def _show_results_hub(self, event) -> None:
-        """The user's recent submissions, one button per artifact set.
-
-        This is the screen the bottom keyboard's results button opens: a long job
-        finishes while the user is away, and the results message scrolls out of
-        reach, so the same buttons stay reachable from here at any time.
-        """
+    async def _show_results_hub(self, event, *, page: int = 0) -> None:
+        """Page through the user's submission history and artifact sets."""
         user_id = event.sender_id
-        rows = await self.db.user_submissions(user_id, limit=8)
-        if not rows:
+        if user_id is None:
+            return
+        page_size = 8
+        count = await self.db.user_submission_count(user_id)
+        if not count:
             await self._edit_or_reply(
                 event,
-                texts.RESULTS_HUB_EMPTY,
+                texts.results_hub_empty(
+                    notes_configured=self.settings.note_configured
+                ),
                 [[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]],
             )
             return
+        total_pages = (count + page_size - 1) // page_size
+        page = min(max(0, int(page)), total_pages - 1)
+        rows = await self.db.user_submissions(
+            user_id, limit=page_size, offset=page * page_size
+        )
         buttons: list[list[Any]] = []
         for row in rows:
             reference = f"GMS-{row['submission_id']}"
@@ -1181,11 +1188,38 @@ class GamasBot(
             buttons.append(
                 [Button.inline(label, f"res:{row['submission_id']}".encode("ascii"))]
             )
+        navigation = []
+        if page > 0:
+            navigation.append(
+                Button.inline(texts.BTN_PREV, f"res:page:{page - 1}".encode("ascii"))
+            )
+        if page + 1 < total_pages:
+            navigation.append(
+                Button.inline(texts.BTN_NEXT, f"res:page:{page + 1}".encode("ascii"))
+            )
+        if navigation:
+            buttons.append(navigation)
         buttons.append([Button.inline(texts.BTN_BACK_MAIN, b"menu:main")])
-        await self._edit_or_reply(event, texts.RESULTS_HUB_TITLE, buttons)
+        title = (
+            texts.RESULTS_HUB_TITLE
+            + "\n\n"
+            + texts.RESULTS_HUB_PAGE_TEMPLATE.format(
+                page=to_persian_digits(page + 1),
+                pages=to_persian_digits(total_pages),
+            )
+        )
+        await self._edit_or_reply(event, title, buttons)
 
     async def _cb_result_set(self, event, user_id: int, data: str) -> None:
-        raw = data.split(":", 1)[-1].strip()
+        parts = data.split(":")
+        if len(parts) == 3 and parts[1] == "page":
+            page = _to_int(parts[2])
+            if page is None or page < 0:
+                await self._ack(event, texts.INVALID_REQUEST, alert=True)
+                return
+            await self._show_results_hub(event, page=page)
+            return
+        raw = parts[1].strip() if len(parts) == 2 else ""
         if not raw.isdigit():
             await self._ack(event)
             return
@@ -1266,6 +1300,7 @@ class GamasBot(
             kinds=kinds,
             item_id=item_id,
             mini_app_url=self.settings.mini_app_url,
+            learning_available=self.settings.note_configured,
         )
         await self._edit(
             event,
@@ -1274,6 +1309,7 @@ class GamasBot(
                 speakers=0,
                 has_booklet=has_booklet,
                 has_keypoints=has_keypoints,
+                learning_available=self.settings.note_configured,
             ),
             buttons,
         )
@@ -1288,7 +1324,11 @@ class GamasBot(
 
     async def _cb_help(self, event, _user_id: int, _data: str) -> None:
         await event.respond(
-            texts.help_screen(office_enabled=self.settings.office_enabled),
+            texts.help_screen(
+                office_enabled=self.settings.office_enabled,
+                notes_configured=self.settings.note_configured,
+                ocr_enabled=self.settings.ocr_enabled,
+            ),
             buttons=[[Button.inline(texts.BTN_BACK_MAIN, b"menu:main")]],
         )
 
@@ -1499,8 +1539,9 @@ class GamasBot(
             return
 
         self.conversations.on_callback_navigation(user_id, data)
-        if data.startswith("adm:") and data not in ("adm:bcgo", "adm:bcstop"):
+        if data not in ("adm:bcgo", "adm:bcstop"):
             self._broadcast_previews.pop(user_id, None)
+            self._broadcast_resume.pop(user_id, None)
 
         if not await self.callback_router.dispatch(event, user_id, data):
             await self._ack(event)
@@ -1549,6 +1590,20 @@ class GamasBot(
                     buttons=[[Button.inline(texts.CURATION_RESUME_BUTTON,
                                             f"{prefix}:cur:resume".encode("ascii"))]],
                 )
+            return
+
+        # Reply-keyboard labels are navigation even while a text prompt is armed.
+        # Clear the abandoned prompt after routing; keep an Office draft only when
+        # the selected destination is Office itself.
+        if not command and await self._route_reply_menu(event, user_id, text):
+            self.conversations.reset_on_reply_navigation(
+                user_id,
+                preserve_office_session=(
+                    text == texts.BTN_OFFICE and self.settings.office_enabled
+                ),
+            )
+            self._broadcast_previews.pop(user_id, None)
+            self._broadcast_resume.pop(user_id, None)
             return
 
         # Admin conversational states.
@@ -1627,14 +1682,6 @@ class GamasBot(
             self.conversations.reset_on_cancel(user_id)
             self._office_sessions.pop(user_id, None)
             await event.reply(texts.ORDER_CANCELLED)
-            return
-
-        # The bottom keyboard sends its label as plain text, so the menu is one
-        # table of (label → screen) instead of a second set of callbacks. It is
-        # checked before the conversational states below: a user pressing
-        # «کتابخانه من» while half-way through a support ticket means the menu,
-        # not another line of the ticket.
-        if not command and await self._route_reply_menu(event, user_id, text):
             return
 
         if user_id in self._pending_flashcard:

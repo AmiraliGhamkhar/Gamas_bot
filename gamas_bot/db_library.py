@@ -206,15 +206,23 @@ class LibraryRepositoryMixin(DatabaseCore):
             row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7], row[8]
         )
 
+    async def user_submission_count(self, user_id: int) -> int:
+        rows = await _rows(
+            self.read_db,
+            "SELECT COUNT(*) FROM submissions WHERE user_id = ?",
+            (int(user_id),),
+        )
+        return int(rows[0][0]) if rows else 0
+
     async def user_submissions(
-        self, user_id: int, limit: int = 20
+        self, user_id: int, limit: int = 20, offset: int = 0
     ) -> list[dict[str, Any]]:
         rows = await _rows(
             self.read_db,
             "SELECT submission_id, kind, filename, status, duration_seconds, created_at, "
             "finished_at FROM submissions WHERE user_id = ? "
-            "ORDER BY submission_id DESC LIMIT ?",
-            (user_id, limit),
+            "ORDER BY submission_id DESC LIMIT ? OFFSET ?",
+            (int(user_id), max(0, int(limit)), max(0, int(offset))),
         )
         return [dict(row) for row in rows]
 

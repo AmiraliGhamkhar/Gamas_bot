@@ -29,10 +29,8 @@ from .bot_ui import (
     CURATION_STALE_ALERT,
     FLASHCARD_ASK_BACK,
     FLASHCARD_ASK_FRONT,
-    FLASHCARD_EMPTY,
     FREE_TRY_BADGE,
     FREE_TRY_RESTORED,
-    LEADERBOARD_EMPTY,
     LEADERBOARD_FALLBACK_NAME,
     LEARNING_BUSY_ALERT,
     LEARNING_CREDIT_RESTORED,
@@ -1097,6 +1095,13 @@ class LearningWorkflowMixin:
                 [[Button.inline("↩️ بازگشت", b"library")]],
             )
             return
+        if not self.settings.note_configured:
+            await self._edit(
+                event,
+                texts.LEARNING_GENERATION_UNAVAILABLE,
+                [[self._learning_back_button(item_id)]],
+            )
+            return
         per_question = self.settings.quiz_cost_seconds_per_question
         buttons: list[list] = []
         for _code, label, _cards, questions in SIZE_PRESETS:
@@ -1142,7 +1147,7 @@ class LearningWorkflowMixin:
             await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
             return
         if not self.settings.note_configured:
-            await event.respond("سرویس ساخت آزمون در حال حاضر فعال نیست.")
+            await event.respond(texts.LEARNING_GENERATION_UNAVAILABLE)
             return
         if user_id in self._learning_in_flight:
             await self._ack(event, LEARNING_BUSY_ALERT, alert=True)
@@ -1370,7 +1375,9 @@ class LearningWorkflowMixin:
         if not rows:
             await self._edit_or_reply(  # type: ignore[attr-defined]
                 event,
-                LEADERBOARD_EMPTY,
+                texts.leaderboard_empty(
+                    notes_configured=self.settings.note_configured
+                ),
                 [[Button.inline("↩️ منوی اصلی", b"menu:main")]],
             )
             return
@@ -1596,6 +1603,13 @@ class LearningWorkflowMixin:
                 [[Button.inline("↩️ بازگشت", b"library")]],
             )
             return
+        if not self.settings.note_configured:
+            await self._edit(
+                event,
+                texts.LEARNING_GENERATION_UNAVAILABLE,
+                [[self._learning_back_button(item_id)]],
+            )
+            return
         size = self.settings.flashcard_ai_deck_size
         cost = self.settings.flashcard_ai_cost_seconds
         text = (
@@ -1649,7 +1663,7 @@ class LearningWorkflowMixin:
             await self._ack(event, LEARNING_LEGACY_NOTICE, alert=True)
             return
         if not self.settings.note_configured:
-            await event.respond("سرویس ساخت فلش‌کارت در حال حاضر فعال نیست.")
+            await event.respond(texts.LEARNING_GENERATION_UNAVAILABLE)
             return
         if (
             await self.db.deck_count(user_id)
@@ -1736,7 +1750,9 @@ class LearningWorkflowMixin:
             user_id, limit=page_size, offset=page * page_size
         )
         if count == 0:
-            text = FLASHCARD_EMPTY
+            text = texts.flashcard_empty(
+                notes_configured=self.settings.note_configured
+            )
             buttons: list[list] = []
         else:
             text = (
@@ -1761,14 +1777,13 @@ class LearningWorkflowMixin:
                 )
             if nav:
                 buttons.append(nav)
-        buttons.extend(
+        buttons.append([Button.inline("✍️ ساخت دستی", b"fc:man")])
+        if self.settings.note_configured:
+            buttons.append([Button.inline("🤖 از یک جزوه بساز", b"fc:pick:0")])
+        buttons.append(
             [
-                [Button.inline("✍️ ساخت دستی", b"fc:man")],
-                [Button.inline("🤖 از یک جزوه بساز", b"fc:pick:0")],
-                [
-                    Button.inline("📖 جزوه‌ها", b"library"),
-                    Button.inline("↩️ منوی اصلی", b"menu:main"),
-                ],
+                Button.inline("📖 جزوه‌ها", b"library"),
+                Button.inline("↩️ منوی اصلی", b"menu:main"),
             ]
         )
         await self._edit_or_reply(event, text, buttons)  # type: ignore[attr-defined]
@@ -1776,6 +1791,13 @@ class LearningWorkflowMixin:
     async def _show_booklet_picker(self, event: Any, *, page: int = 0) -> None:
         user_id = event.sender_id
         if user_id is None:
+            return
+        if not self.settings.note_configured:
+            await self._edit(
+                event,
+                texts.LEARNING_GENERATION_UNAVAILABLE,
+                [[Button.inline("↩️ بازگشت", b"fc:hub")]],
+            )
             return
         page_size = 6
         count = await self.db.library_count_kind(user_id, "booklet")
