@@ -4,6 +4,17 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Reporting, booklet delivery and auditability.** Admin completion rates now
+separate fully completed work from partial transcript delivery; PDF booklet
+success is counted only from persisted PDF bytes. PDF button send attempts are
+tracked in bounded SQLite counters so user retries remain distinct from logical
+submissions. Invalid renderer output is not persisted as a final artifact.
+Referral payment rewards are limited to the referred user's first approved
+payment, with a banned-referrer decision recorded transactionally, and the
+leaderboard aggregates reward rows before joining invite counts. The v2 importer
+keeps source payment IDs and links eligible paid credit lots to imported payment
+history while validating balances and foreign keys.
+
 **AvalAI hardening.** The OpenAI-compatible note route now captures AvalAI's
 `avalai-request-id` for every successful normal or streaming completion and
 logs it with token usage, so exact User API cost reconciliation has a
@@ -69,4 +80,4 @@ and a cover badge drawn over the topic text — all fixed.
 Transcription, RTL Word booklets, PDF export, study documents, Free Office,
 library, wallet, support tickets and referrals on Windows PowerShell and cPanel.
 
-**Migration numbering.** `migrations/v3/` contains two files numbered `016` (`016_office_library_kind.sql` and `016_subscription_enforcement.sql`). This is harmless today: the loader sorts filenames and tracks each by name. New migrations must continue from `029_`.
+**Migration numbering.** `migrations/v3/` contains two files numbered `016` (`016_office_library_kind.sql` and `016_subscription_enforcement.sql`). This is harmless today: the loader sorts filenames and tracks each by name. New migrations must continue from `032_`.

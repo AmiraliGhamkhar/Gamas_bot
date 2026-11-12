@@ -238,6 +238,7 @@ class AdminWorkflowMixin:
     def _admin_attention_lines(self, report: dict, runtime: dict) -> list[str]:
         payments = report["payments"]
         processing = report["processing"]
+        artifacts = report["artifacts"]
         items: list[str] = []
         if payments["pending_review"]:
             items.append(
@@ -250,6 +251,10 @@ class AdminWorkflowMixin:
             )
             items.append(
                 f"❌ {to_persian_digits(processing['undelivered'])} درخواست ناموفق در این بازه{suffix}"
+            )
+        if artifacts["booklet_failures"]:
+            items.append(
+                f"📘 {to_persian_digits(artifacts['booklet_failures'])} جزوه بدون فایل PDF نهایی"
             )
         expiring = payments["expiring"]
         if expiring["count"]:
@@ -288,6 +293,7 @@ class AdminWorkflowMixin:
         processing = report["processing"]
         users = report["users"]
         payments = report["payments"]
+        artifacts = report["artifacts"]
         approved = payments["by_status"].get("approved", {"count": 0, "toman": 0})
         rejected = payments["by_status"].get("rejected", {"count": 0, "toman": 0})
         total_jobs = sum(processing["by_status"].values())
@@ -304,9 +310,12 @@ class AdminWorkflowMixin:
             "",
             "⚙️ پردازش",
             f"• درخواست در بازه: {to_persian_digits(total_jobs)}"
-            f" | تحویل‌شده: {to_persian_digits(processing['delivered'])}"
-            f" | ناموفق: {to_persian_digits(processing['undelivered'])}"
-            f" | نرخ موفقیت: {self._rate_text(processing['success_rate'])}",
+            f" | خروجی پایه تحویل‌شده: {to_persian_digits(processing['delivered'])}"
+            f" | تکمیل کامل: {to_persian_digits(processing['completed'])}"
+            f" | ناموفق/ردشده: {to_persian_digits(processing['undelivered'])}"
+            f" | نرخ تکمیل کامل: {self._rate_text(processing['success_rate'])}",
+            f"• جزوه PDF ذخیره‌شده: {to_persian_digits(artifacts['booklets_ready'])}"
+            f" | شکست نهایی بدون PDF: {to_persian_digits(artifacts['booklet_failures'])}",
             "• " + self._timing_line("زمان پاسخ", processing["end_to_end"]),
             f"• اکنون: {to_persian_digits(active_now)} فعال"
             f" | {to_persian_digits(queued_now)} در صف",
@@ -353,8 +362,9 @@ class AdminWorkflowMixin:
             lines.append(
                 f"{self._day_label(row['day'])} {self._series_bar(int(row['jobs']), maximum)} "
                 f"درخواست {to_persian_digits(int(row['jobs']))} "
-                f"(✅ {to_persian_digits(int(row['delivered']))} / "
-                f"❌ {to_persian_digits(int(row['undelivered']))}) "
+                f"(✅ کامل {to_persian_digits(int(row['completed']))} / "
+                f"⚠ ناقص {to_persian_digits(int(row['partial']))} / "
+                f"❌ ناموفق {to_persian_digits(int(row['undelivered']))}) "
                 f"| کاربر جدید {to_persian_digits(int(row['new_users']))}"
             )
         return lines
@@ -402,6 +412,7 @@ class AdminWorkflowMixin:
         report = await self.db.admin_report(period_start=period_start)
         engines = await self.db.admin_stt_engines(period_start=period_start)
         processing = report["processing"]
+        artifacts = report["artifacts"]
         runtime = self.runtime_metrics()  # type: ignore[attr-defined]
         lines = self._admin_screen_header("⚙️ پردازش — جزئیات", period, report)
 
@@ -410,9 +421,17 @@ class AdminWorkflowMixin:
             [
                 "📦 حجم",
                 f"• کل در بازه: {to_persian_digits(total_jobs)}"
-                f" | تحویل‌شده: {to_persian_digits(processing['delivered'])}"
+                f" | خروجی پایه تحویل‌شده: {to_persian_digits(processing['delivered'])}"
+                f" | تکمیل کامل: {to_persian_digits(processing['completed'])}"
+                f" | ناقص: {to_persian_digits(processing['partial'])}"
                 f" | ناموفق/ردشده: {to_persian_digits(processing['undelivered'])}"
-                f" | نرخ موفقیت: {self._rate_text(processing['success_rate'])}",
+                f" | نرخ تکمیل کامل: {self._rate_text(processing['success_rate'])}",
+                f"📘 PDF جزوه ذخیره‌شده: {to_persian_digits(artifacts['booklets_ready'])}"
+                f" | شکست نهایی بدون PDF: {to_persian_digits(artifacts['booklet_failures'])}",
+                f"• تلاش دریافت PDF: {to_persian_digits(artifacts['booklet_delivery']['attempts'])}"
+                f" | ارسال بی‌خطا: {to_persian_digits(artifacts['booklet_delivery']['send_successes'])}"
+                f" | ناموفق: {to_persian_digits(artifacts['booklet_delivery']['send_failures'])}"
+                f" | نامشخص: {to_persian_digits(artifacts['booklet_delivery']['unresolved'])}",
             ]
         )
         if processing["by_status"]:

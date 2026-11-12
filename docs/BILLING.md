@@ -37,8 +37,11 @@ never rewritten.
   transcript.
 - Pre-delivery failure or cancel releases the hold; startup recovery releases
   interrupted holds.
-- A later booklet failure leaves a `partial` job: the transcription charge stands,
-  the booklet is simply not billed (it never is).
+- A later booklet failure leaves a `partial` job when the base transcript was
+  retained. The measured transcription charge stands even if no PDF booklet was
+  persisted: booklet generation is optional and has no separate user charge.
+  Only a persisted PDF artifact counts as a booklet-ready result; a DOCX alone
+  does not count as the PDF booklet.
 - PowerPoint charges the source narration, not inserted silence. A deck without
   narration is free.
 
@@ -89,10 +92,51 @@ being reported as success.
 ## Referrals
 
 `/start ref_<code>` attributes a first-ever invite once. The referrer earns 20
-minutes on attribution and 1 hour when the invited user's first payment is
-approved. Both are ordinary ledger credits; the payment reward commits inside the
-approval transaction, so a replayed approval cannot pay twice. Bans are recorded
-but not paid. Receipt upload alone pays nothing.
+minutes on attribution and at most one 1-hour reward for the invited user's first
+approved payment. Both are ordinary ledger credits; the payment reward and its
+first-payment decision commit inside the approval transaction. Receipt upload
+alone pays nothing. If the referrer is banned when that first payment is
+approved, the payment reward is permanently forfeited; a later purchase or
+unban cannot reopen qualification. Existing reward rows are not reversed or
+rewritten.
+
+## Legacy v2 credit import
+
+Run the one-shot importer with a separate fresh v3 target:
+
+```bash
+python scripts/import_v2.py --from data/gamas_v2.db --into data/gamas.db
+```
+
+The source is opened read-only; the target refuses an existing user population,
+and the data import commits or rolls back as one transaction. v2 and v3 both
+store balances in integer seconds, so eligible balances convert at **1 second to
+1 second** (the user-facing credit tariff is not applied during migration).
+Each active, unexpired entitlement becomes a v3 credit for `granted_seconds`
+and, if any seconds were consumed, an allocated debit for `granted_seconds -
+remaining_seconds`; the credit expiry and start timestamp are preserved, so a
+future-start entitlement is not available early. Malformed active entitlement
+timestamps abort the transaction rather than becoming non-expiring credit. The
+importer verifies every non-unlimited user's total and currently available
+balance against eligible v2 entitlements, checks payment ownership/linkage,
+SQLite foreign keys and database integrity, then commits.
+
+Expired or revoked entitlements are not reactivated or imported into the v3
+balance. The original v2 `usage_ledger`, `admin_audit_log`, and audio
+submission/transcription rows remain untouched in the source database as the
+historical archive; those event/content histories are not copied into v3 by this
+credit importer. Imported payment rows retain their original v2 request ID as a cross-reference,
+and active paid entitlement credit rows point at the corresponding v3 payment.
+The v3 ledger still records migrated consumption as an allocated debit; this is
+not a new charge. The importer command is not an in-place repair or merge tool.
+
+Known limitation: v2 payment requests store their actual `amount_toman`, and
+linked entitlements preserve seconds actually granted, but orders do not freeze
+validity days (or seconds for orders with no entitlement). The importer preserves
+the order amount and uses the entitlement grant when present; missing historical
+plan terms fall back to the source catalogue's current values. The source v2
+database remains the authority for any purchase terms not represented in those
+rows.
 
 ## Balance cache
 

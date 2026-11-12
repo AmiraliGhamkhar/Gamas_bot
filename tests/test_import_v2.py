@@ -80,6 +80,7 @@ class ImportV2TestCase(unittest.TestCase):
             updated_at="2025-02-02", reviewed_at="2025-02-03",
             reviewer_telegram_id=999, rejection_reason=None,
         )
+        self.v2_payment_id = payment_id
         # 333 has a receipt awaiting review (must survive as pending).
         insert(
             source, "payment_requests",
@@ -115,6 +116,12 @@ class ImportV2TestCase(unittest.TestCase):
             expires_at=None, status="revoked", source="admin_credit",
             granted_by_admin_id=None, reason="gone",
             created_at="2025-03-02", updated_at="2025-03-02",
+        )
+        # The live catalogue changed after the order. Its amount_toman and
+        # linked entitlement still identify what was actually bought/granted.
+        source.execute(
+            "UPDATE plans SET included_seconds=21600, price_toman=70000 WHERE id=?",
+            (plan_paid,),
         )
         source.commit()
         source.close()
@@ -191,8 +198,13 @@ class ImportV2TestCase(unittest.TestCase):
             plan = conn.execute(
                 "SELECT hours, price FROM plans WHERE code = 'paid_5h_30d'"
             ).fetchone()
-            self.assertEqual(plan["hours"], 5.0)
-            self.assertEqual(plan["price"], 50000)
+            self.assertEqual(plan["hours"], 6.0)  # current v2 catalogue value
+            self.assertEqual(plan["price"], 70000)
+            purchase = conn.execute(
+                "SELECT purchased_seconds, purchased_price, purchased_validity_days "
+                "FROM payments WHERE user_id=222"
+            ).fetchone()
+            self.assertEqual(tuple(purchase), (18000, 50000, 30))
             # The free plan is granted, not sold.
             self.assertIsNone(
                 conn.execute("SELECT 1 FROM plans WHERE code = 'free_1h'").fetchone()
@@ -204,6 +216,16 @@ class ImportV2TestCase(unittest.TestCase):
                 for row in conn.execute("SELECT user_id, status FROM payments")
             }
             self.assertEqual(payments, {222: "approved", 333: "pending"})
+            imported_payment = conn.execute(
+                "SELECT payment_id, v2_payment_request_id FROM payments WHERE user_id=222"
+            ).fetchone()
+            self.assertEqual(
+                imported_payment["v2_payment_request_id"], self.v2_payment_id
+            )
+            migrated_credit = conn.execute(
+                "SELECT payment_id FROM ledger WHERE user_id=222 AND kind='credit'"
+            ).fetchone()
+            self.assertEqual(migrated_credit["payment_id"], imported_payment["payment_id"])
 
             # Expiry dates survive the replay.
             self.assertEqual(
@@ -268,6 +290,67 @@ class ImportV2TestCase(unittest.TestCase):
                 ).fetchone()[0],
                 99 * 365 * 24 * 3600,
             )
+        finally:
+            conn.close()
+
+    def test_future_entitlement_is_migrated_but_not_yet_available(self):
+        source = sqlite3.connect(self.source_path)
+        source.row_factory = sqlite3.Row
+        user_id = source.execute(
+            "SELECT id FROM users WHERE telegram_id=111"
+        ).fetchone()[0]
+        plan_id = source.execute(
+            "SELECT id FROM plans WHERE code='paid_5h_30d'"
+        ).fetchone()[0]
+        insert(
+            source, "entitlements", user_id=user_id, plan_id=plan_id,
+            payment_id=None, granted_seconds=600, remaining_seconds=600,
+            starts_at="2999-01-01T00:00:00+00:00", expires_at=None,
+            status="active", source="admin_credit", granted_by_admin_id=None,
+            reason="scheduled", created_at="2999-01-01T00:00:00+00:00",
+            updated_at="2999-01-01T00:00:00+00:00",
+        )
+        source.commit()
+        source.close()
+        result = self.run_import()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        import asyncio
+        from gamas_bot.db import Database
+
+        async def check_available():
+            db = Database(self.target_path)
+            await db.connect()
+            try:
+                self.assertEqual(await db.available_seconds(111), 3600)
+            finally:
+                await db.close()
+
+        asyncio.run(check_available())
+        conn = self.target()
+        try:
+            raw_balance = conn.execute(
+                "SELECT SUM(CASE kind WHEN 'credit' THEN seconds ELSE -seconds END) "
+                "FROM ledger WHERE user_id=111"
+            ).fetchone()[0]
+            self.assertEqual(raw_balance, 4200)
+        finally:
+            conn.close()
+
+    def test_invalid_active_entitlement_timestamp_aborts_import(self):
+        source = sqlite3.connect(self.source_path)
+        source.execute(
+            "UPDATE entitlements SET expires_at='not-a-time' "
+            "WHERE source='free_lifetime'"
+        )
+        source.commit()
+        source.close()
+        result = self.run_import()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("invalid v2 entitlement timestamp", result.stderr)
+        conn = self.target()
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM users").fetchone()[0], 0)
         finally:
             conn.close()
 

@@ -519,6 +519,41 @@ class FileDeliveryTests(BotPipelineTestCase):
         assert row is not None
         self.assertEqual(row.status, "done")
 
+    async def test_invalid_pdf_bytes_are_not_persisted_as_a_successful_booklet(self):
+        event = self.media_event()
+        self.bot.settings = replace(
+            self.settings,
+            note_api_key="note-key",
+            note_api_base_url="https://note.example/v1",
+        )
+        self.bot._http_session = lambda: None  # type: ignore[method-assign]
+        with (
+            mock.patch(
+                "gamas_bot.bot.structure_transcript",
+                new=mock.AsyncMock(return_value=StructuredNotes(
+                    title="جزوه", summary="خلاصه"
+                )),
+            ),
+            mock.patch(
+                "gamas_bot.bot_jobs.build_notes_pdf",
+                return_value=b"%PDF-1.7\nnot a valid PDF\n%%EOF",
+            ),
+        ):
+            submission = await self.run_media_job(event, transcribe=self._raw())
+
+        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
+        self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "partial")
+        error_rows = await self.db.read_db.execute_fetchall(
+            "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
+        )
+        self.assertEqual(error_rows[0][0], "pdf")
+        artifacts = (await self.db.admin_report(period_start=None))["artifacts"]
+        self.assertEqual(artifacts["booklets_ready"], 0)
+        self.assertEqual(artifacts["booklet_failures"], 1)
+
     async def test_caption_on_message_reply_fails_like_the_real_client(self):
         """The old call is rejected by the double, exactly like Telethon.
 
@@ -2121,6 +2156,35 @@ class ArtifactDeliveryTests(BotPipelineTestCase):
         self.assertEqual(len(sent), 2)
         self.assertIn("PDF", str(sent[0]["caption"]))
         self.assertIn("Word", str(sent[1]["caption"]))
+
+    async def test_failed_persisted_pdf_send_can_be_retried_and_is_counted(self):
+        _event, submission = await self._finished_job()
+        await self.db.binary_artifact_upsert(
+            submission, USER_ID, "booklet", filename="GMS.pdf",
+            content_type="application/pdf", content=b"%PDF-stored",
+        )
+        client = self.bot.client
+        client.fail_file_delivery = True
+        first = FakeCallbackEvent(
+            client, data=f"art:GMS-{submission}:booklet".encode("ascii")
+        )
+        await self.bot._fetch_artifact(first, USER_ID, f"art:GMS-{submission}:booklet")
+        self.assertEqual(first.answers[-1][0], texts.DELIVERY_ARTIFACT_RETRY)
+        self.assertTrue(first.answers[-1][1])
+
+        client.fail_file_delivery = False
+        retry = FakeCallbackEvent(
+            client, data=f"art:GMS-{submission}:booklet".encode("ascii")
+        )
+        await self.bot._fetch_artifact(retry, USER_ID, f"art:GMS-{submission}:booklet")
+        self.assertFalse(retry.answers[-1][1])
+        stored = await self.db.binary_artifact(submission, USER_ID, "booklet")
+        assert stored is not None
+        self.assertEqual(stored["delivery_attempts"], 2)
+        self.assertEqual(stored["delivery_successes"], 1)
+        self.assertEqual(stored["delivery_failures"], 1)
+        report = await self.db.admin_report(period_start=None)
+        self.assertEqual(report["artifacts"]["booklet_delivery"]["attempts"], 2)
 
     async def test_another_users_artifact_is_never_served(self):
         _event, submission = await self._finished_job()

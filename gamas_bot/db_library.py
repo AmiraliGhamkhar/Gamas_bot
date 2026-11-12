@@ -486,19 +486,68 @@ class LibraryRepositoryMixin(DatabaseCore):
         schema = await _rows(
             self.read_db, "PRAGMA table_info(submission_binary_artifacts)"
         )
-        has_revision = any(str(row[1]) == "revision_id" for row in schema)
-        columns = (
-            "kind, filename, content_type, content, sha256, created_at, updated_at, revision_id"
-            if has_revision
-            else "kind, filename, content_type, content, sha256, created_at, updated_at"
-        )
+        existing = {str(row[1]) for row in schema}
+        columns = [
+            "kind", "filename", "content_type", "content", "sha256",
+            "created_at", "updated_at",
+        ]
+        if "revision_id" in existing:
+            columns.append("revision_id")
+        if "delivery_attempts" in existing:
+            columns.extend((
+                "delivery_attempts", "delivery_successes", "delivery_failures",
+                "last_delivery_attempt_at", "last_delivery_error",
+            ))
+        selected_columns = ", ".join(columns)
         rows = await _rows(
             self.read_db,
-            f"SELECT {columns} FROM submission_binary_artifacts "
+            f"SELECT {selected_columns} FROM submission_binary_artifacts "
             "WHERE submission_id = ? AND user_id = ? AND kind = ?",
             (int(submission_id), int(user_id), str(kind)),
         )
         return dict(rows[0]) if rows else None
+
+    async def binary_artifact_delivery_started(
+        self, submission_id: int, user_id: int, kind: str
+    ) -> bool:
+        """Durably record a user-initiated attempt to fetch a stored file."""
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "UPDATE submission_binary_artifacts "
+                "SET delivery_attempts = delivery_attempts + 1, "
+                "last_delivery_attempt_at = ?, last_delivery_error = NULL "
+                "WHERE submission_id = ? AND user_id = ? AND kind = ?",
+                (
+                    iso(self._now()), int(submission_id), int(user_id), str(kind),
+                ),
+            )
+            return cursor.rowcount == 1
+
+    async def binary_artifact_delivery_finished(
+        self,
+        submission_id: int,
+        user_id: int,
+        kind: str,
+        *,
+        succeeded: bool,
+        error_kind: str | None = None,
+    ) -> bool:
+        """Finish one outstanding attempt; a crash leaves it visibly unresolved."""
+        async with self._transaction():
+            cursor = await self.db.execute(
+                "UPDATE submission_binary_artifacts SET "
+                "delivery_successes = delivery_successes + ?, "
+                "delivery_failures = delivery_failures + ?, "
+                "last_delivery_error = CASE WHEN ? = 1 THEN NULL ELSE ? END "
+                "WHERE submission_id = ? AND user_id = ? AND kind = ? "
+                "AND delivery_attempts > delivery_successes + delivery_failures",
+                (
+                    int(bool(succeeded)), int(not succeeded), int(bool(succeeded)),
+                    (str(error_kind or "send_failed")[:100] if not succeeded else None),
+                    int(submission_id), int(user_id), str(kind),
+                ),
+            )
+            return cursor.rowcount == 1
 
     async def binary_artifact_kinds(self, submission_id: int, user_id: int | None = None) -> set[str]:
         """Available persisted PDF/DOCX kinds, optionally owner-scoped."""

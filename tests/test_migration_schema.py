@@ -36,6 +36,25 @@ class MigrationSchemaTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(expected, "no v3 migrations were found")
         self.assertEqual(applied, expected)
 
+    async def test_referral_artifact_and_import_linkage_columns_are_additive(self):
+        columns = {}
+        for table in ("referrals", "submission_binary_artifacts", "payments"):
+            rows = await self.db.db.execute_fetchall(f"PRAGMA table_info({table})")
+            columns[table] = {str(row[1]) for row in rows}
+        self.assertTrue(
+            {"first_approved_payment_id", "payment_reward_status"} <= columns["referrals"]
+        )
+        self.assertTrue(
+            {
+                "delivery_attempts", "delivery_successes", "delivery_failures",
+                "last_delivery_attempt_at", "last_delivery_error",
+            } <= columns["submission_binary_artifacts"]
+        )
+        self.assertIn("v2_payment_request_id", columns["payments"])
+        self.assertEqual(
+            await self.db.db.execute_fetchall("PRAGMA foreign_key_check"), []
+        )
+
     async def test_submission_links_report_non_null_orphans(self):
         await self.db.ensure_user(123)
         await self.db.library_add(123, "booklet", 1, 2, None, title="no submission")

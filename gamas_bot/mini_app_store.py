@@ -867,6 +867,7 @@ class MiniAppStore:
         import hashlib
         from datetime import datetime, timezone
 
+        from .artifact_validation import validate_docx_artifact, validate_pdf_artifact
         from .docx_export import (
             DocumentMeta,
             build_notes_docx,
@@ -883,23 +884,24 @@ class MiniAppStore:
         )
         outputs: list[tuple[str, bytes, str, str]] = []
         try:
+            pdf_bytes = build_notes_pdf(notes, meta=meta)
+            validate_pdf_artifact(pdf_bytes)
             outputs.append(
                 (
-                    "booklet",
-                    build_notes_pdf(notes, meta=meta),
-                    "application/pdf",
+                    "booklet", pdf_bytes, "application/pdf",
                     notes_pdf_filename(notes, reference),
                 )
             )
         except Exception:  # noqa: BLE001 - one format failing must not kill the save
             logger.exception("studio PDF render failed item=%s", item_id)
         try:
+            docx_bytes = build_notes_docx(
+                notes, fonts=resolve_fonts(), design=resolve_design(), meta=meta
+            )
+            validate_docx_artifact(docx_bytes)
             outputs.append(
                 (
-                    "docx",
-                    build_notes_docx(
-                        notes, fonts=resolve_fonts(), design=resolve_design(), meta=meta
-                    ),
+                    "docx", docx_bytes,
                     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                     notes_docx_filename(notes, reference),
                 )

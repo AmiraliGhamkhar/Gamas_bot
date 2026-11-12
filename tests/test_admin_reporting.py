@@ -151,10 +151,64 @@ class ProcessingReportTests(ReportingTestCase):
 
         report = await self.report(None)
         processing = report["processing"]
-        self.assertEqual(processing["delivered"], 2)
+        self.assertEqual(processing["delivered"], 2)  # transcript/output base exists
+        self.assertEqual(processing["completed"], 1)
+        self.assertEqual(processing["partial"], 1)
         self.assertEqual(processing["undelivered"], 2)
         self.assertEqual(processing["terminal"], 4)
-        self.assertAlmostEqual(processing["success_rate"], 0.5)
+        self.assertAlmostEqual(processing["success_rate"], 0.25)
+
+    async def test_booklet_metrics_use_persisted_pdf_and_track_button_retries(self):
+        ready = await self.add_submission(status="partial", error_kind="docx")
+        missing = await self.add_submission(
+            status="partial", error="PDF render failed", error_kind="pdf"
+        )
+        await self.db.binary_artifact_upsert(
+            ready, USER_ID, "booklet", filename="notes.pdf",
+            content_type="application/pdf", content=b"%PDF-1.7\n%%EOF",
+        )
+
+        # One failed user-initiated download followed by two successful taps.
+        for succeeded in (False, True, True):
+            self.assertTrue(
+                await self.db.binary_artifact_delivery_started(ready, USER_ID, "booklet")
+            )
+            self.assertTrue(
+                await self.db.binary_artifact_delivery_finished(
+                    ready, USER_ID, "booklet", succeeded=succeeded,
+                    error_kind="telegram_send" if not succeeded else None,
+                )
+            )
+
+        # A crash after the attempt was recorded leaves one explicit unresolved
+        # attempt, not an invented success or a duplicate job count.
+        self.assertTrue(
+            await self.db.binary_artifact_delivery_started(ready, USER_ID, "booklet")
+        )
+        report = await self.report(None)
+        artifacts = report["artifacts"]
+        self.assertEqual(artifacts["booklets_ready"], 1)
+        self.assertEqual(artifacts["booklet_failures"], 1)
+        self.assertEqual(
+            artifacts["booklet_delivery"],
+            {"attempts": 4, "send_successes": 2, "send_failures": 1, "unresolved": 1},
+        )
+        self.assertEqual((await self.db.submission(missing)).status, "partial")
+
+    async def test_summary_stats_do_not_classify_partial_as_failed(self):
+        await self.add_submission(status="done")
+        partial = await self.add_submission(status="partial")
+        await self.add_submission(status="failed")
+        await self.add_submission(status="rejected")
+        await self.db._write(
+            "UPDATE submissions SET delivered_at=? WHERE submission_id=?",
+            (iso_at(timedelta(minutes=-20)), partial),
+        )
+        stats = await self.db.stats()
+        self.assertEqual(stats["submissions_done"], 1)
+        self.assertEqual(stats["submissions_partial"], 1)
+        self.assertEqual(stats["submissions_failed"], 2)
+        self.assertEqual(stats["seconds_transcribed"], 1200)
 
     async def test_pending_work_is_counted_but_not_judged(self):
         await self.add_submission(status="processing", finished=None)
