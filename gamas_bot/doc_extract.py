@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
+from . import texts
 from .learning import MAX_MODEL_INPUT_CHARS
 from .progress import to_persian_digits
 
@@ -395,9 +396,7 @@ def _docx_sections(path: Path, *, max_unpacked_bytes: int = OFFICE_UNPACKED_MAX_
     flush()
 
     if not sections:
-        raise DocExtractError(
-            "این سند متنی ندارد (احتمالاً فقط تصویر است)؛ OCR پشتیبانی نمی‌شود."
-        )
+        raise DocExtractError(texts.DOCUMENT_WORD_NO_TEXT)
     # Word has no reliable page count without rendering; heading/paragraph
     # blocks are the navigable unit, so that is what we report.
     return tuple(sections), len(sections)
@@ -479,17 +478,12 @@ def _pptx_sections(path: Path, *, max_chars: int, max_unpacked_bytes: int = OFFI
         raise DocExtractError("خواندن متن اسلایدهای این ارائه ناموفق بود.") from exc
     sections = list(sections_from_slides(slides, max_chars=max_chars))
     if not sections:
-        raise EmptyPresentationTextError(
-            "این ارائه متن قابل‌استفاده‌ای ندارد؛ OCR پشتیبانی نمی‌شود."
-        )
+        raise EmptyPresentationTextError(texts.DOCUMENT_PRESENTATION_NO_TEXT)
     return tuple(sections), len(slides)
 
 
-#: The message used when a scan is refused because OCR is switched off.
-SCANNED_PDF_MESSAGE = (
-    "این PDF لایهٔ متنی ندارد (ظاهراً اسکن‌شده است)؛ OCR پشتیبانی "
-    "نمی‌شود. لطفاً نسخهٔ متنی یا Word فایل را بفرستید."
-)
+#: The message used when a scan is refused because optional OCR is switched off.
+SCANNED_PDF_MESSAGE = texts.DOCUMENT_OCR_OFF_NOTICE
 #: The message used when OCR ran but found nothing readable on the page(s).
 SCANNED_PDF_OCR_EMPTY_MESSAGE = (
     "این PDF لایهٔ متنی ندارد و خواندن تصویری آن هم متنی پیدا نکرد؛ "
@@ -591,16 +585,16 @@ def extract_document(
     """
     source_type = (source_type or "").strip().lower()
     if source_type == "pdf":
-        texts = _read_pdf_pages(path)
-        sections = _pdf_sections_from_pages(texts)
-        page_count = len(texts)
+        page_texts = _read_pdf_pages(path)
+        sections = _pdf_sections_from_pages(page_texts)
+        page_count = len(page_texts)
         if looks_scanned(sections, page_count):
             if ocr is None:
                 raise ScannedPdfError(SCANNED_PDF_MESSAGE)
-            sections = _ocr_pdf_pages(path, texts, ocr, ocr_max_pages)
+            sections = _ocr_pdf_pages(path, page_texts, ocr, ocr_max_pages)
     elif source_type == "image":
         if ocr is None:
-            raise DocExtractError("خواندن تصویری این فایل در این نسخه فعال نیست.")
+            raise DocExtractError(texts.DOCUMENT_IMAGE_OCR_OFF)
         sections, page_count = _image_sections(path, ocr)
     elif source_type == "docx":
         sections, page_count = _docx_sections(path, max_unpacked_bytes=max_unpacked_bytes)

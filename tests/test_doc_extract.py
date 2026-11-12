@@ -167,7 +167,7 @@ class PdfExtractionTests(TempFileMixin):
         path = self.write("scan.pdf", make_blank_pdf_bytes())
         with self.assertRaises(ScannedPdfError) as caught:
             extract_document(path, "pdf")
-        self.assertIn("OCR پشتیبانی نمی‌شود", str(caught.exception))
+        self.assertIn("OCR اختیاری فعلاً خاموش", str(caught.exception))
 
     def test_password_protected_pdf_is_refused(self):
         path = self.write("locked.pdf", make_encrypted_pdf_bytes())

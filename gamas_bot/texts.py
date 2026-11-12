@@ -6,8 +6,8 @@ routing; this module owns wording, emoji and the glossary (جزوه، فلش‌�
 آزمون، اشتراک، کیف پول، رسید). Keeping copy out of handlers makes it reviewable
 as one document and lets tests assert screens instead of scattered literals.
 
-The administrator report tables and the document/Office/learning workflow copy
-are not migrated yet; they are tracked as the remaining part of the same work.
+Administrator report tables and some workflow prompts remain in their owning
+modules; document/OCR/Office and learning availability copy is centralized here.
 
 Rules followed here:
 
@@ -53,6 +53,50 @@ BTN_STUDIO: Final = "🎛 گاماس استودیو"
 BTN_EDIT_IN_APP: Final = "✏️ ویرایش جزوه در Gamas Studio"
 BTN_QUIZ_FROM_BOOKLET: Final = "🧪 آزمون از این جزوه"
 BTN_CARDS_FROM_BOOKLET: Final = "🃏 فلش‌کارت از این جزوه"
+OFFICE_CREDIT_NOTICE: Final = (
+    "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ "
+    "بدون کسر اعتبار، با سقف ورودی و محدودیت ظرفیت."
+)
+PRESENTATION_PROCESSING_NOTICE: Final = (
+    "متن اسلایدها استخراج می‌شود؛ صدای ارائه خودکار پردازش نمی‌شود و فقط با دکمهٔ "
+    "«🎧 پردازش صدای ارائه» آغاز می‌شود. فقط صدای ضبط‌شده اعتبار مصرف می‌کند؛ "
+    "ارائهٔ بی‌صدا رایگان است."
+)
+DOCUMENT_OCR_OFF_NOTICE: Final = (
+    "PDF اسکن‌شده یا عکس سند بدون OCR قابل‌خواندن نیست؛ OCR اختیاری فعلاً خاموش است."
+)
+DOCUMENT_OCR_ON_NOTICE: Final = (
+    "PDF اسکن‌شده و عکس سند با OCR خوانده می‌شوند؛ تصویر صفحه به سرویس بیرونی ارسال می‌شود."
+)
+DOCUMENT_PHOTO_OCR_OFF: Final = (
+    "📷 عکس سند نیازمند OCR اختیاری است که فعلاً در ربات خاموش است.\n"
+    "PDF متنی یا فایل Word دارای متن بفرستید؛ عکس‌های داخل Word/PowerPoint خوانده نمی‌شوند."
+)
+DOCUMENT_OCR_FAILED: Final = (
+    "⚠️ خواندن این اسکن با OCR موفق نشد؛ سرویس بیرونی در دسترس نبود یا متنی تشخیص نداد.\n"
+    "کمی بعد دوباره تلاش کنید یا نسخهٔ متنی/Word فایل را بفرستید."
+)
+DOCUMENT_EMBEDDED_IMAGES_NOTICE: Final = (
+    "تصویرهای داخل Word یا PowerPoint استخراج یا با OCR خوانده نمی‌شوند."
+)
+DOCUMENT_WORD_NO_TEXT: Final = (
+    "متن قابل‌استخراجی در این Word پیدا نشد؛ OCR تصویرهای داخل Word انجام نمی‌شود. "
+    "نسخهٔ دارای متن بفرستید."
+)
+DOCUMENT_PRESENTATION_NO_TEXT: Final = (
+    "متن قابل‌استخراجی در اسلایدها پیدا نشد؛ OCR تصویرهای داخل PowerPoint انجام نمی‌شود."
+)
+DOCUMENT_EXTRACTION_EMPTY: Final = (
+    "متن قابل‌استخراجی از این سند پیدا نشد؛ اگر فایل تصویری یا اسکن‌شده است، "
+    "OCR اختیاری باید برای ربات فعال باشد."
+)
+DOCUMENT_FREE_NOTICE: Final = (
+    "جزوه، مرور سریع و خروجی‌های Office از اعتبار کم نمی‌کنند؛ "
+    "آفیس هم سقف ورودی و محدودیت ظرفیت دارد."
+)
+DOCUMENT_IMAGE_OCR_OFF: Final = (
+    "خواندن تصویر نیازمند OCR اختیاری است؛ این قابلیت فعلاً در ربات فعال نیست."
+)
 
 # Admin menu labels.
 BTN_ADMIN_STATS: Final = "📊 آمار و وضعیت"
@@ -87,19 +131,25 @@ def main_screen(
     something the bot measures instead of merely suggesting.
     """
     if first_start:
+        invitation = (
+            "یک فایل درس بفرستید؛ جزوه، فلش‌کارت و آزمونش را می‌سازم."
+            if notes_configured
+            else "یک فایل درس بفرستید؛ متن گفتار یا سندش در کتابخانه می‌ماند."
+        )
         lines = [
             "🎓 به گاماس خوش آمدید",
             "",
-            "یک فایل درس بفرستید؛ جزوه، فلش‌کارت و آزمونش را می‌سازم.",
+            invitation,
             "",
             "📤 صوت، ویدیو، PDF، Word یا PowerPoint",
         ]
     else:
-        lines = [
-            "منوی اصلی",
-            "",
-            "📤 فایل درس بعدی را بفرستید تا جزوه‌اش را بسازم.",
-        ]
+        next_step = (
+            "📤 فایل درس بعدی را بفرستید تا جزوه‌اش را بسازم."
+            if notes_configured
+            else "📤 فایل صوتی، ویدیویی یا سند درسی بعدی را بفرستید."
+        )
+        lines = ["منوی اصلی", "", next_step]
     if streak_days >= 2:
         from .progress import to_persian_digits
 
@@ -111,7 +161,7 @@ def main_screen(
         else:
             lines.append("📚 متن گفتار و سند در «📚 کتابخانه من» ذخیره می‌شود.")
         if office_enabled:
-            lines.append("🗂 تبدیل متن به Word، Excel، PowerPoint و PDF رایگان است.")
+            lines.append(OFFICE_CREDIT_NOTICE)
         lines.extend(["", "از دکمه‌های زیر شروع کنید."])
     return "\n".join(lines)
 
@@ -191,9 +241,22 @@ DELIVERY_ARTIFACT_GONE: Final = (
 DELIVERY_KEYPOINTS_CHAT_HEADER: Final = "⭐ نکات کلیدی — {reference}"
 DELIVERY_KEYPOINTS_EMPTY: Final = "برای این فایل نکتهٔ کلیدی ثبت نشد."
 RESULTS_HUB_TITLE: Final = "📦 خروجی‌های من\n\nهر ردیف یک گفتگو؛ خروجی‌هایش را از همان‌جا بردارید."
+RESULTS_HUB_PAGE_TEMPLATE: Final = "صفحهٔ {page} از {pages}"
 RESULTS_HUB_EMPTY: Final = (
     "📦 هنوز خروجی‌ای ندارید.\n\nیک فایل درس بفرستید تا جزوه، متن خام و نکات کلیدی ساخته شود."
 )
+RESULTS_HUB_EMPTY_RAW_ONLY: Final = (
+    "📦 هنوز خروجی‌ای ندارید.\n\n"
+    "یک فایل صوتی یا ویدیویی بفرستید تا متن گفتار ذخیره شود؛ "
+    "سندهای درسی هم در کتابخانه در دسترس‌اند."
+)
+
+
+def results_hub_empty(*, notes_configured: bool) -> str:
+    """Return an empty-state promise that matches the configured job pipeline."""
+    return RESULTS_HUB_EMPTY if notes_configured else RESULTS_HUB_EMPTY_RAW_ONLY
+
+
 RESULTS_HUB_ROW_TEMPLATE: Final = "{reference} — {status}"
 RESULTS_STATUS: Final = {
     "pending": "در انتظار",
@@ -212,6 +275,7 @@ def delivery_screen(
     has_booklet: bool,
     has_keypoints: bool = True,
     notes_pending: bool = False,
+    learning_available: bool = True,
 ) -> str:
     """The one message the pipeline ends with, before any file is pushed."""
     # ``progress`` imports this module for its own copy, so the digit helper is
@@ -233,8 +297,10 @@ def delivery_screen(
         lines.append(DELIVERY_ROW_NOTES_PENDING)
     elif has_keypoints:
         lines.append(DELIVERY_ROW_KEYPOINTS)
-    if has_booklet:
+    if has_booklet and learning_available:
         lines.append(DELIVERY_ROW_LEARNING)
+    elif has_booklet:
+        lines.append(LEARNING_GENERATION_UNAVAILABLE)
     lines.extend(["", DELIVERY_READY_BODY])
     return "\n".join(lines)
 
@@ -249,20 +315,42 @@ def keypoints_text(*, reference: str, points: Sequence[str], limit: int = 12) ->
     )
 
 
-def help_screen(*, office_enabled: bool) -> str:
+def help_screen(
+    *,
+    office_enabled: bool,
+    notes_configured: bool = True,
+    ocr_enabled: bool = False,
+) -> str:
     """The one-screen guide followed by the billing contract."""
     lines = [
         "ℹ️ راهنمای گاماس",
         "",
         "📤 فایل درس: صوت، ویدیو، PDF، Word یا PowerPoint را همین‌جا بفرستید.",
-        "📚 متن خام و جزوه در «📚 کتابخانه من» ذخیره می‌شود.",
-        "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.",
-        "🎁 نخستین آزمون و نخستین مجموعهٔ فلش‌کارت جداگانه رایگان‌اند.",
     ]
-    if office_enabled:
-        lines.append(
-            "🗂 آفیس رایگان: تبدیل متن به Word، Excel، PowerPoint یا PDF؛ بدون کسر اعتبار."
+    if notes_configured:
+        lines.extend(
+            [
+                "📚 متن خام و جزوه در «📚 کتابخانه من» ذخیره می‌شود.",
+                "🧪 آزمون و 🃏 فلش‌کارت از متن ذخیره‌شده ساخته می‌شود؛ هر پاسخ درست ۱۰ امتیاز.",
+                "🎁 نخستین آزمون و نخستین مجموعهٔ فلش‌کارت جداگانه رایگان‌اند.",
+            ]
         )
+    else:
+        lines.extend(
+            [
+                "📚 متن خام گفتار و متن استخراج‌شدهٔ سند در «📚 کتابخانه من» ذخیره می‌شود.",
+                "⚠️ ساخت خودکار جزوه از صوت/ویدیو و ساخت آزمون یا فلش‌کارت هوشمند فعلاً فعال نیست.",
+            ]
+        )
+    if office_enabled:
+        lines.append(OFFICE_CREDIT_NOTICE)
+    lines.append(
+        "🎧 صدای PowerPoint خودکار پردازش نمی‌شود؛ از کارت سند، دکمهٔ پردازش صدا را بزنید."
+    )
+    lines.append(
+        DOCUMENT_OCR_ON_NOTICE if ocr_enabled else DOCUMENT_OCR_OFF_NOTICE
+    )
+    lines.append(DOCUMENT_EMBEDDED_IMAGES_NOTICE)
     lines.extend(
         [
             "🛒 خرید اشتراک و 🎧 پشتیبانی از منوی اصلی در دسترس است.",
@@ -270,10 +358,15 @@ def help_screen(*, office_enabled: bool) -> str:
             "💳 هر ۱۰۰٬۰۰۰ اعتبار = ۳ ساعت صوت کلاس.",
             "اعتبار بر حسب ثانیه و پس از ارسال متن خام محاسبه می‌شود؛ "
             "اگر متن خام نرسد، اعتباری کم نمی‌شود.",
-            "ساخت آزمون و فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق باشد، کامل برمی‌گردد.",
-            "خطای ساخت جزوه پس از دریافت متن خام، اعتبار را برنمی‌گرداند.",
         ]
     )
+    if notes_configured:
+        lines.extend(
+            [
+                "ساخت آزمون و فلش‌کارت هوش مصنوعی اعتبار کم می‌کند؛ اگر ناموفق باشد، کامل برمی‌گردد.",
+                "خطای ساخت جزوه پس از دریافت متن خام، اعتبار را برنمی‌گرداند.",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -285,6 +378,18 @@ LIBRARY_EMPTY: Final = (
     "کتابخانهٔ شما خالی است.\n"
     "اولین فایل درس را بفرستید؛ متن و جزوه به‌صورت خودکار این‌جا ذخیره می‌شوند."
 )
+LIBRARY_EMPTY_RAW_ONLY: Final = (
+    "📚 کتابخانه من\n\n"
+    "کتابخانهٔ شما خالی است.\n"
+    "فایل صوتی/ویدیویی بفرستید تا متن گفتار ذخیره شود؛ متن سند هم پس از استخراج این‌جا می‌ماند."
+)
+
+
+def library_empty(*, notes_configured: bool) -> str:
+    """Return the library empty state without promising unavailable notes."""
+    return LIBRARY_EMPTY if notes_configured else LIBRARY_EMPTY_RAW_ONLY
+
+
 LIBRARY_COUNT_TEMPLATE: Final = "تعداد موارد: {count}"
 ITEM_UNAVAILABLE: Final = "این فایل دیگر در دسترس نیست."
 ITEM_UNAVAILABLE_FAILED: Final = "❌ دریافت فایل ناموفق بود."
@@ -297,6 +402,21 @@ ITEM_FORWARDING_DETAIL: Final = "فایل از تلگرام دوباره ارس�
 LIBRARY_INVALID_PAGE: Final = "صفحهٔ کتابخانه نامعتبر است."
 DOCS_INVALID_PAGE: Final = "صفحهٔ اسناد نامعتبر است."
 DOCUMENT_NOT_FOUND: Final = "این سند پیدا نشد."
+DOCUMENTS_EMPTY: Final = (
+    "📄 اسناد\n\n"
+    "هنوز سندی ذخیره نکرده‌اید. فایل PDF، Word یا PowerPoint را بفرستید تا متنش استخراج شود؛ "
+    "بعد می‌توانید از آن سؤال و فلش‌کارت بسازید."
+)
+DOCUMENTS_EMPTY_RAW_ONLY: Final = (
+    "📄 اسناد\n\n"
+    "هنوز سندی ذخیره نکرده‌اید. فایل متنی PDF، Word یا PowerPoint را بفرستید تا متنش استخراج و ذخیره شود.\n"
+    "ساخت آزمون و فلش‌کارت هوشمند فعلاً فعال نیست."
+)
+
+
+def documents_empty(*, notes_configured: bool) -> str:
+    """Return a document-library empty state that matches learning availability."""
+    return DOCUMENTS_EMPTY if notes_configured else DOCUMENTS_EMPTY_RAW_ONLY
 
 # ------------------------------------------------------------------ acknowledgements
 CALLBACK_FAILED: Final = "خطایی رخ داد؛ دوباره امتحان کنید."
@@ -360,6 +480,41 @@ UNSUPPORTED_FILE: Final = (
 UPLOAD_HINT: Final = "همین‌جا فایل 🎧 صوت/ویدیو یا 📄 PDF، Word و پاورپوینت درس را بفرستید."
 ORDER_CANCELLED: Final = "ارسال لغو شد. لغو سفارش از «🛒 خرید اشتراک»."
 
+# -------------------------------------------------------------------- learning
+LEARNING_GENERATION_UNAVAILABLE: Final = (
+    "ساخت خودکار آزمون و فلش‌کارت هوشمند فعلاً فعال نیست."
+)
+FLASHCARD_EMPTY_RAW_ONLY: Final = (
+    "🃏 فلش‌کارت‌ها\n\n"
+    "هنوز مجموعه‌ای نساخته‌اید. می‌توانید کارت‌های دستی خودتان را اضافه کنید؛ "
+    "ساخت خودکار از جزوه فعلاً فعال نیست."
+)
+LEADERBOARD_EMPTY_RAW_ONLY: Final = (
+    "🏆 لیدربورد\n\n"
+    "هنوز امتیازی ثبت نشده است. ساخت خودکار آزمون، راه کسب امتیاز، فعلاً فعال نیست."
+)
+
+
+def flashcard_empty(*, notes_configured: bool) -> str:
+    """Return a flashcard empty state consistent with AI-generation availability."""
+    if notes_configured:
+        return (
+            "🃏 فلش‌کارت‌ها\n\n"
+            "هنوز مجموعه‌ای نساخته‌اید. از یک جزوه بسازید یا کارت‌های دستی خودتان را اضافه کنید."
+        )
+    return FLASHCARD_EMPTY_RAW_ONLY
+
+
+def leaderboard_empty(*, notes_configured: bool) -> str:
+    """Avoid suggesting a quiz when the configured note/learning provider is absent."""
+    if notes_configured:
+        return (
+            "🏆 لیدربورد\n\n"
+            "هنوز امتیازی ثبت نشده است.\n"
+            "اولین آزمون خود را از «📚 کتابخانه من» شروع کنید."
+        )
+    return LEADERBOARD_EMPTY_RAW_ONLY
+
 # ------------------------------------------------------------------ membership
 SUBSCRIPTION_REQUIRED_TEMPLATE: Final = (
     "🔒 استفاده از ربات گاماس فقط برای اعضای کانال رسمی آن مجاز است.\n\n"
@@ -402,8 +557,9 @@ BTN_SHARE_INVITE: Final = "📤 اشتراک لینک دعوت"
 REFERRALS_TITLE: Final = "🤝 دعوت دوستان"
 REFERRALS_RULES: Final = (
     "با هر دعوت موفق اعتبار هدیه بگیرید:\n"
-    "• ورود دوست با لینک شما: {signup_credits} اعتبار\n"
-    "• اولین خرید تأییدشدهٔ او: {purchase_credits} اعتبار"
+    "• ورود دوست جدید با لینک شما: {signup_credits} اعتبار\n"
+    "• اولین خرید تأییدشدهٔ او: {purchase_credits} اعتبار\n"
+    "کد دعوت فقط هنگام نخستین ورود دوست به ربات ثبت می‌شود."
 )
 REFERRALS_LINK_TEMPLATE: Final = "لینک اختصاصی شما:\n{link}"
 REFERRALS_CODE_TEMPLATE: Final = "کد دعوت شما: {code}"

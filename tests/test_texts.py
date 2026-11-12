@@ -62,9 +62,21 @@ class MainAndHelpCopyTests(unittest.TestCase):
         self.assertTrue(text.startswith("منوی اصلی\n\n"))
         self.assertNotIn("آفیس", text)
         self.assertNotIn("کتابخانه", text)
+        self.assertIn("صوتی، ویدیویی یا سند", text)
+        self.assertNotIn("جزوه‌اش را بسازم", text)
         # The returning screen is shorter than the welcome screen: the pitch has
         # already been made, so all that is left is the next file and the balance.
         self.assertLess(len(text), 200)
+
+    def test_raw_only_welcome_does_not_promise_generated_learning_outputs(self):
+        text = texts.main_screen(
+            first_start=True,
+            balance="۱ ساعت",
+            office_enabled=False,
+            notes_configured=False,
+        )
+        self.assertIn("متن گفتار یا سندش", text)
+        self.assertNotIn("فلش‌کارت و آزمونش را می‌سازم", text)
 
     def test_a_streak_is_shown_only_when_it_is_a_streak(self):
         one = texts.main_screen(
@@ -79,13 +91,56 @@ class MainAndHelpCopyTests(unittest.TestCase):
         self.assertIn("🔥 ۲ روز پشت‌سرهم برگشتید.", two)
 
     def test_help_is_one_short_screen_and_keeps_the_billing_contract(self):
-        text = texts.help_screen(office_enabled=True)
+        text = texts.help_screen(office_enabled=True, notes_configured=True)
         lines = [line for line in text.splitlines() if line.strip()]
         self.assertTrue(text.startswith("ℹ️ راهنمای گاماس\n\n"))
         self.assertLessEqual(len(lines), 15)
         self.assertIn("اعتباری کم نمی‌شود", text)
         self.assertIn("خطای ساخت جزوه", text)
+        self.assertIn(texts.OFFICE_CREDIT_NOTICE, text)
+        self.assertIn("سقف ورودی و محدودیت ظرفیت", text)
+        self.assertIn("صدای PowerPoint خودکار پردازش نمی‌شود", text)
+        self.assertIn(texts.DOCUMENT_OCR_OFF_NOTICE, text)
         self.assertLessEqual(len(text.encode("utf-16-le")) // 2, TELEGRAM_TEXT_LIMIT)
+
+    def test_help_availability_copy_matches_raw_only_deployment(self):
+        text = texts.help_screen(office_enabled=False, notes_configured=False)
+        self.assertIn("ساخت خودکار جزوه", text)
+        self.assertIn("فعلاً فعال نیست", text)
+        self.assertNotIn("نخستین آزمون", text)
+        self.assertNotIn("ساخت آزمون و فلش‌کارت هوش مصنوعی اعتبار کم می‌کند", text)
+        self.assertIn("اعتباری کم نمی‌شود", text)
+
+    def test_results_empty_copy_reflects_raw_only_deployment(self):
+        text = texts.results_hub_empty(notes_configured=False)
+        self.assertIn("متن گفتار ذخیره شود", text)
+        self.assertNotIn("جزوه، متن خام و نکات کلیدی", text)
+        self.assertEqual(
+            texts.results_hub_empty(notes_configured=True), texts.RESULTS_HUB_EMPTY
+        )
+
+    def test_help_explains_optional_third_party_ocr_when_enabled(self):
+        text = texts.help_screen(
+            office_enabled=False,
+            notes_configured=False,
+            ocr_enabled=True,
+        )
+        self.assertIn(texts.DOCUMENT_OCR_ON_NOTICE, text)
+        self.assertIn("سرویس بیرونی", text)
+        self.assertIn(texts.DOCUMENT_EMBEDDED_IMAGES_NOTICE, text)
+        self.assertNotIn(texts.DOCUMENT_OCR_OFF_NOTICE, text)
+
+    def test_empty_states_and_learning_copy_match_feature_availability(self):
+        self.assertNotIn("جزوه به‌صورت خودکار", texts.library_empty(notes_configured=False))
+        self.assertIn("متن گفتار ذخیره شود", texts.results_hub_empty(notes_configured=False))
+        self.assertIn("فعلاً فعال نیست", texts.documents_empty(notes_configured=False))
+        self.assertIn("کارت‌های دستی", texts.flashcard_empty(notes_configured=False))
+        self.assertNotIn("از یک جزوه بسازید", texts.flashcard_empty(notes_configured=False))
+        self.assertIn("فعلاً فعال نیست", texts.leaderboard_empty(notes_configured=False))
+        self.assertIn("اولین آزمون", texts.leaderboard_empty(notes_configured=True))
+
+    def test_referral_rules_explain_first_start_eligibility(self):
+        self.assertIn("نخستین ورود دوست", texts.REFERRALS_RULES)
 
 
 class GateAndProgressCopyTests(unittest.TestCase):

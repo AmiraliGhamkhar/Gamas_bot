@@ -10,9 +10,11 @@ from __future__ import annotations
 import asyncio
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from gamas_bot import texts
 from gamas_bot.bot import GamasBot
 from gamas_bot.db import Database
 from tests.support import (
@@ -127,7 +129,41 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_message(event)
         self.assertEqual(await self.db.document_count(OWNER), 0)
         sent = "\n".join(item["text"] for item in self.client.texts)
-        self.assertIn("OCR پشتیبانی نمی‌شود", sent)
+        self.assertIn("OCR اختیاری فعلاً خاموش", sent)
+
+    async def test_document_card_hides_unavailable_learning_and_explains_ocr(self):
+        _, documents = await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
+        self.bot.settings = replace(
+            self.bot.settings,
+            note_api_key="",
+            note_api_base_url="",
+            note_providers=(),
+            ocr_enabled=False,
+        )
+        card = self.press(f"doc:show:{documents[0]['id']}".encode())
+
+        await self.bot._handle_callback(card)
+
+        text, buttons = card.edits[-1]["text"], card.edits[-1]["buttons"]
+        self.assertIn(texts.LEARNING_GENERATION_UNAVAILABLE, text)
+        self.assertIn(texts.DOCUMENT_OCR_OFF_NOTICE, text)
+        payloads = self.button_payloads([{"buttons": buttons}])
+        self.assertFalse(any(data.startswith((b"doc:quiz:", b"doc:fc:")) for data in payloads))
+
+    async def test_empty_document_state_does_not_promise_learning_when_unavailable(self):
+        self.bot.settings = replace(
+            self.bot.settings,
+            note_api_key="",
+            note_api_base_url="",
+            note_providers=(),
+        )
+        screen = self.press(b"lib:docs:0")
+
+        await self.bot._handle_callback(screen)
+
+        text = screen.edits[-1]["text"]
+        self.assertIn("آزمون و فلش‌کارت هوشمند فعلاً فعال نیست", text)
+        self.assertNotIn("از آن فلش‌کارت و سؤال ساخته شود", text)
 
     async def test_document_screen_metadata_excludes_full_text_and_chunks(self):
         _, documents = await self.ingest("first.pdf", make_pdf_bytes(), mime="application/pdf")
@@ -141,7 +177,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
             await self.bot._show_document_card(self.press(b"menu:main"), OWNER, document["id"])
 
     async def test_oversized_document_is_rejected_before_download(self):
-        self.assertEqual(self.settings.doc_max_bytes, 20 * 1024 * 1024)
+        self.assertEqual(self.settings.doc_max_bytes, 1024**3)
         event = self.upload(
             "huge.pdf",
             make_pdf_bytes(),
@@ -171,7 +207,7 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         event.message.file.mime_type = "image/jpeg"
         await self.bot._handle_message(event)
         sent = "\n".join(item["text"] for item in self.client.texts)
-        self.assertIn("ارسال به‌صورت فایل", sent)
+        self.assertIn(texts.DOCUMENT_PHOTO_OCR_OFF, sent)
 
     # --------------------------------------------------------------- library
     async def test_library_documents_section_lists_and_opens_the_document(self):

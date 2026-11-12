@@ -260,7 +260,7 @@ class BotOcrFlowTests(unittest.IsolatedAsyncioTestCase):
         event = self.upload("scan.pdf", make_blank_pdf_bytes(), mime="application/pdf")
         await self.bot._handle_message(event)
         self.assertEqual(await self.db.document_count(OWNER), 0)
-        self.assertIn("OCR پشتیبانی نمی‌شود", self.sent_text())
+        self.assertIn("OCR اختیاری فعلاً خاموش", self.sent_text())
 
     async def test_photo_becomes_an_image_document(self):
         self.bot.settings = make_settings(

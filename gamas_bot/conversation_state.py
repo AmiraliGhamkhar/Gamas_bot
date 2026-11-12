@@ -68,6 +68,22 @@ class ConversationStateStore:
         self.pending_user_search.discard(user_id)
         self.pending_free_reset.pop(user_id, None)
 
+    def reset_on_reply_navigation(
+        self, user_id: int, *, preserve_office_session: bool = False
+    ) -> None:
+        """A reply-keyboard label is navigation, not input to an armed prompt."""
+        self.pending_reject_reason.pop(user_id, None)
+        self.pending_broadcast.discard(user_id)
+        self.pending_payments.pop(user_id, None)
+        self.support_states.pop(user_id, None)
+        self.support_admin_states.pop(user_id, None)
+        self.pending_flashcard.pop(user_id, None)
+        self.pending_flashcard_front.pop(user_id, None)
+        self.pending_user_search.discard(user_id)
+        self.pending_free_reset.pop(user_id, None)
+        if not preserve_office_session:
+            self.office_sessions.pop(user_id, None)
+
     def disarm_admin_command_prompts(self, admin_id: int) -> None:
         """Any slash-command from an admin exits support-reply and manual-card flows."""
         self.support_admin_states.pop(admin_id, None)
@@ -76,9 +92,12 @@ class ConversationStateStore:
 
     def on_callback_navigation(self, user_id: int, data: str) -> None:
         """Apply navigation-boundary disarm rules when callback *data* fires."""
-        if data.startswith("adm:") and data != "adm:bcast":
+        # A callback navigation leaves any free-text rejection prompt behind.
+        # A new broadcast callback is the only navigation that arms its own text
+        # prompt, so clear older broadcast input for every other callback.
+        self.pending_reject_reason.pop(user_id, None)
+        if data != "adm:bcast":
             self.pending_broadcast.discard(user_id)
-            self.pending_reject_reason.pop(user_id, None)
 
         if not data.startswith("adm:hub:usr"):
             self.pending_user_search.discard(user_id)

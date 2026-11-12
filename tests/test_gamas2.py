@@ -399,6 +399,19 @@ class DeliveryMarkupTests(unittest.TestCase):
         self.assertIn("fc:ai:11", payloads)
         self.assertTrue(any("ویرایش" in str(p) for p in payloads))
 
+    def test_learning_buttons_are_hidden_when_generation_is_not_configured(self):
+        buttons = delivery_markup(
+            reference="GMS-7",
+            speakers=0,
+            has_booklet=True,
+            kinds={KIND_BOOKLET, KIND_QUIZ, KIND_FLASHCARDS},
+            item_id=11,
+            learning_available=False,
+        )
+        payloads = self._payloads(buttons)
+        self.assertNotIn("quiz:new:11", payloads)
+        self.assertNotIn("fc:ai:11", payloads)
+
     def test_no_dead_buttons_when_an_artifact_is_missing(self):
         buttons = delivery_markup(
             reference="GMS-7", speakers=1, has_booklet=False,
@@ -418,6 +431,18 @@ class DeliveryMarkupTests(unittest.TestCase):
         )
         self.assertIn("ویرایش", body)
         self.assertIn("آزمون", body)
+
+    def test_delivery_screen_explains_unavailable_learning_without_offering_it(self):
+        from gamas_bot import texts
+
+        body = texts.delivery_screen(
+            reference="GMS-7",
+            speakers=0,
+            has_booklet=True,
+            learning_available=False,
+        )
+        self.assertNotIn(texts.DELIVERY_ROW_LEARNING, body)
+        self.assertIn(texts.LEARNING_GENERATION_UNAVAILABLE, body)
 
     def test_booklet_appendix_is_source_derived(self):
         notes = StructuredNotes(
