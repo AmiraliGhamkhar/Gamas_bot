@@ -110,8 +110,21 @@ is not stored.
 ## Reading reports
 
 - Windows use **UTC**, not your local timezone.
-- "Delivered" = `done` + `partial`. Partial means a transcript was delivered but
-  the booklet was not; it is not a pre-delivery failure.
+- Each request is one `submissions` row; internal/network retry attempts do not
+  inflate request counts. "Base output delivered" = `done` + `partial`, while
+  "full completion" = `done` only. A `partial` row means the transcript/base
+  output was retained but finalization or an optional final output did not
+  complete cleanly.
+- The PDF booklet-ready count comes only from persisted
+  `submission_binary_artifacts(kind='booklet')` rows. A transcript or DOCX alone
+  is not a successful PDF booklet. A partial audio, video or presentation
+  submission (or a failed one whose base output was already delivered) with no
+  persisted PDF counts as a booklet-finalization failure.
+- PDF download attempts count user button requests, including retries. Send
+  successes mean Telegram's send call returned without raising, not proof that
+  the recipient opened or received the file. Attempts left unresolved by a crash
+  are shown separately. Retrying the same button re-sends stored bytes and does
+  not re-render or charge credit.
 - Request windows use submission time; `started_at` is worker pickup.
 - Missing samples mean "no data", not "zero failures".
 - Reports are read-only and must never mutate billing state.

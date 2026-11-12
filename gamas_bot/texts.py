@@ -226,6 +226,9 @@ DELIVERY_KEYPOINTS_READY: Final = "نکات کلیدی — {reference}"
 DELIVERY_ARTIFACT_GONE: Final = (
     "این خروجی دیگر در دسترس نیست؛ دوباره فایل را بفرستید تا از نو ساخته شود."
 )
+DELIVERY_ARTIFACT_RETRY: Final = (
+    "ارسال این فایل موقتاً انجام نشد؛ کمی بعد همان دکمه را دوباره بزنید."
+)
 DELIVERY_KEYPOINTS_CHAT_HEADER: Final = "⭐ نکات کلیدی — {reference}"
 DELIVERY_KEYPOINTS_EMPTY: Final = "برای این فایل نکتهٔ کلیدی ثبت نشد."
 DELIVERY_NO_OUTPUT: Final = "برای این پردازش هنوز خروجی‌ای در دسترس نیست."

@@ -48,8 +48,11 @@ Studio edit → validated StructuredNotes → revision → PDF + DOCX bytes
 - **Persian text stays in logical Unicode order.** Preserve numbers, units and
   ZWNJ; display normalization is idempotent and never applied to stored content.
 - **Documents come from validated models.** `StructuredNotes.from_payload`
-  validates every save; PDF and DOCX render from that one model, and a failed
-  render aborts the save.
+  rejects empty/invalid structure before booklet rendering. Final PDF bytes are
+  parsed in strict mode and must contain at least one page; DOCX must be a valid
+  ZIP package with its required document parts. Only validated bytes are
+  persisted/advertised. Format failures are recorded as partial output and do
+  not erase the retained transcript or a successful alternate format.
 
 ## Dependencies
 

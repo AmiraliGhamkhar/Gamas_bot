@@ -125,7 +125,7 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
             "users": users,
             "submissions_done": by_status.get("done", 0),
             "submissions_failed": by_status.get("failed", 0)
-            + by_status.get("partial", 0),
+            + by_status.get("rejected", 0),
             "submissions_partial": by_status.get("partial", 0),
             "submissions_active": by_status.get("processing", 0)
             + by_status.get("pending", 0),
@@ -326,10 +326,38 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
             period_params,
         )
 
+        artifact_scope = "s.created_at >= ?" if period_start else "1 = 1"
+        artifact_params: tuple[Any, ...] = (period_start,) if period_start else ()
+        artifact_rows = await _rows(
+            self.read_db,
+            "SELECT "
+            "(SELECT COUNT(*) FROM submissions s "
+            f" WHERE {artifact_scope} AND EXISTS (SELECT 1 FROM submission_binary_artifacts b "
+            "  WHERE b.submission_id = s.submission_id AND b.kind = 'booklet')) AS booklet_ready, "
+            "(SELECT COUNT(*) FROM submissions s "
+            f" WHERE {artifact_scope} AND s.kind IN ('audio','video','presentation') "
+            " AND (s.status = 'partial' OR "
+            "      (s.status = 'failed' AND s.delivered_at IS NOT NULL)) "
+            " AND NOT EXISTS (SELECT 1 FROM submission_binary_artifacts b "
+            "  WHERE b.submission_id = s.submission_id AND b.kind = 'booklet')) AS booklet_failures, "
+            "(SELECT COALESCE(SUM(b.delivery_attempts), 0) "
+            " FROM submission_binary_artifacts b JOIN submissions s "
+            f" ON s.submission_id = b.submission_id WHERE {artifact_scope} AND b.kind = 'booklet') AS attempts, "
+            "(SELECT COALESCE(SUM(b.delivery_successes), 0) "
+            " FROM submission_binary_artifacts b JOIN submissions s "
+            f" ON s.submission_id = b.submission_id WHERE {artifact_scope} AND b.kind = 'booklet') AS send_successes, "
+            "(SELECT COALESCE(SUM(b.delivery_failures), 0) "
+            " FROM submission_binary_artifacts b JOIN submissions s "
+            f" ON s.submission_id = b.submission_id WHERE {artifact_scope} AND b.kind = 'booklet') AS send_failures",
+            (*artifact_params, *artifact_params, *artifact_params, *artifact_params, *artifact_params),
+        )
+        artifact_values = artifact_rows[0] if artifact_rows else (0, 0, 0, 0, 0)
+
         day_rows = await _rows(
             self.read_db,
             "SELECT substr(created_at, 1, 10) AS day, COUNT(*), "
-            "SUM(CASE WHEN status IN ('done','partial') THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END), "
+            "SUM(CASE WHEN status = 'partial' THEN 1 ELSE 0 END), "
             "SUM(CASE WHEN status IN ('failed','rejected') THEN 1 ELSE 0 END) "
             f"FROM submissions WHERE created_at >= ? AND {where} "
             "GROUP BY day ORDER BY day DESC LIMIT ?",
@@ -344,16 +372,20 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
         )
         new_by_day = {str(row[0]): int(row[1]) for row in new_user_rows}
         job_by_day = {
-            str(row[0]): (int(row[1]), int(row[2] or 0), int(row[3] or 0))
+            str(row[0]): (
+                int(row[1]), int(row[2] or 0), int(row[3] or 0), int(row[4] or 0)
+            )
             for row in day_rows
         }
         series = [
             {
                 "day": day,
                 "new_users": new_by_day.get(day, 0),
-                "jobs": job_by_day.get(day, (0, 0, 0))[0],
-                "delivered": job_by_day.get(day, (0, 0, 0))[1],
-                "undelivered": job_by_day.get(day, (0, 0, 0))[2],
+                "jobs": job_by_day.get(day, (0, 0, 0, 0))[0],
+                "completed": job_by_day.get(day, (0, 0, 0, 0))[1],
+                "partial": job_by_day.get(day, (0, 0, 0, 0))[2],
+                "delivered": sum(job_by_day.get(day, (0, 0, 0, 0))[1:3]),
+                "undelivered": job_by_day.get(day, (0, 0, 0, 0))[3],
             }
             for day in sorted(set(new_by_day) | set(job_by_day))
         ]
@@ -420,9 +452,13 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
                 "by_status": by_status,
                 "by_kind": by_kind,
                 "delivered": delivered,
+                "completed": by_status.get("done", 0),
+                "partial": by_status.get("partial", 0),
                 "undelivered": undelivered,
                 "terminal": terminal,
-                "success_rate": (delivered / terminal) if terminal else None,
+                "success_rate": (
+                    by_status.get("done", 0) / terminal if terminal else None
+                ),
                 "errors": [
                     {"kind": str(row[0]), "count": int(row[1])}
                     for row in error_rows
@@ -431,6 +467,21 @@ class ReportingRepositoryMixin(UsersRepositoryMixin):
                 "processing_time": processing_time,
                 "end_to_end": end_to_end,
                 "series": series,
+            },
+            "artifacts": {
+                "booklets_ready": int(artifact_values[0] or 0),
+                "booklet_failures": int(artifact_values[1] or 0),
+                "booklet_delivery": {
+                    "attempts": int(artifact_values[2] or 0),
+                    "send_successes": int(artifact_values[3] or 0),
+                    "send_failures": int(artifact_values[4] or 0),
+                    "unresolved": max(
+                        0,
+                        int(artifact_values[2] or 0)
+                        - int(artifact_values[3] or 0)
+                        - int(artifact_values[4] or 0),
+                    ),
+                },
             },
             "payments": {
                 "by_status": payments_by_status,

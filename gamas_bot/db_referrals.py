@@ -143,23 +143,82 @@ class ReferralsRepositoryMixin(DatabaseCore):
     async def _credit_referral_for_payment(
         self, referred_user_id: int, payment_id: int
     ) -> bool:
-        """Pay the referrer once, inside the caller's approval transaction."""
+        """Apply the one first-approved-payment decision in the caller's txn.
+
+        ``review_payment`` has already changed this payment to approved. The
+        surrounding BEGIN IMMEDIATE serializes approvals, so the first approval
+        consumes qualification exactly once. If the referrer is banned then,
+        the reward is forfeited, not deferred to a later purchase. Existing
+        reward rows (including any historical duplicates) suppress new credits.
+        """
         rows = await _rows(
             self.db,
-            "SELECT r.referrer_id FROM referrals r "
+            "SELECT r.referrer_id, u.banned, r.first_approved_payment_id, "
+            "r.payment_reward_status FROM referrals r "
             "JOIN users u ON u.telegram_id = r.referrer_id "
-            "WHERE r.referred_user_id = ? AND u.banned = 0",
+            "WHERE r.referred_user_id = ?",
             (referred_user_id,),
         )
         if not rows:
             return False
-        return await self._grant_referral(
-            int(rows[0][0]),
-            referred_user_id,
-            kind="payment",
-            payment_id=payment_id,
-            seconds=REFERRAL_PAYMENT_SECONDS,
+        referrer_id = int(rows[0][0])
+        if rows[0][2] is not None or rows[0][3] is not None:
+            return False
+
+        # No retroactive reward: if any legacy payment reward exists, it is the
+        # authoritative record that this invite has already been paid.
+        existing = await _rows(
+            self.db,
+            "SELECT payment_id FROM referral_rewards "
+            "WHERE referred_user_id = ? AND kind = 'payment' "
+            "ORDER BY created_at, id LIMIT 1",
+            (referred_user_id,),
         )
+        if existing:
+            await self.db.execute(
+                "UPDATE referrals SET first_approved_payment_id = ?, "
+                "payment_reward_status = 'rewarded' WHERE referred_user_id = ? "
+                "AND first_approved_payment_id IS NULL AND payment_reward_status IS NULL",
+                (int(existing[0][0]), referred_user_id),
+            )
+            return False
+
+        prior_approval = await _rows(
+            self.db,
+            "SELECT payment_id FROM payments "
+            "WHERE user_id = ? AND status = 'approved' AND payment_id != ? "
+            "ORDER BY COALESCE(reviewed_at, created_at), payment_id LIMIT 1",
+            (referred_user_id, int(payment_id)),
+        )
+        # The current approval is already visible in this transaction. The
+        # immediate writer lock means any other approved row is older in the
+        # decision lifecycle, even if second-resolution timestamps tie.
+        first_payment_id = (
+            int(prior_approval[0][0]) if prior_approval else int(payment_id)
+        )
+        if prior_approval:
+            status = "forfeited_prior_approval"
+        elif bool(rows[0][1]):
+            status = "forfeited_banned"
+        else:
+            paid = await self._grant_referral(
+                referrer_id,
+                referred_user_id,
+                kind="payment",
+                payment_id=payment_id,
+                seconds=REFERRAL_PAYMENT_SECONDS,
+            )
+            status = "rewarded" if paid else None
+            if not paid:
+                return False
+
+        await self.db.execute(
+            "UPDATE referrals SET first_approved_payment_id = ?, "
+            "payment_reward_status = ? WHERE referred_user_id = ? "
+            "AND first_approved_payment_id IS NULL AND payment_reward_status IS NULL",
+            (first_payment_id, status, referred_user_id),
+        )
+        return status == "rewarded"
 
     async def referral_summary(self, user_id: int) -> dict[str, int]:
         """Invited users and reward seconds for one referrer."""
@@ -194,12 +253,16 @@ class ReferralsRepositoryMixin(DatabaseCore):
         """Read-only leaderboard for the administrator referral report."""
         rows = await _rows(
             self.read_db,
-            "SELECT r.referrer_id, COUNT(DISTINCT r.referred_user_id) AS invited, "
-            "COALESCE(SUM(w.seconds), 0) AS seconds "
-            "FROM referrals r "
-            "LEFT JOIN referral_rewards w ON w.referrer_id = r.referrer_id "
-            "GROUP BY r.referrer_id "
-            "ORDER BY invited DESC, seconds DESC, r.referrer_id ASC LIMIT ?",
+            "WITH invite_counts AS ("
+            "  SELECT referrer_id, COUNT(*) AS invited FROM referrals GROUP BY referrer_id"
+            "), reward_totals AS ("
+            "  SELECT referrer_id, SUM(seconds) AS seconds FROM referral_rewards "
+            "  GROUP BY referrer_id"
+            ") "
+            "SELECT i.referrer_id, i.invited, COALESCE(w.seconds, 0) AS seconds "
+            "FROM invite_counts i LEFT JOIN reward_totals w "
+            "ON w.referrer_id = i.referrer_id "
+            "ORDER BY i.invited DESC, seconds DESC, i.referrer_id ASC LIMIT ?",
             (max(1, int(limit)),),
         )
         return [

@@ -9,10 +9,10 @@ invoked via :attr:`deps` (:class:`~gamas_bot.bot_deps.BotDependencies`).
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
-from datetime import datetime
 import logging
 import math
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 import re
 import secrets
@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Any
 from telethon.tl.custom import Message
 
 from . import texts
+from .artifact_validation import validate_docx_artifact, validate_pdf_artifact
 from .billing import format_credit_duration, format_seconds_as_credits
 from .bot_deps import deps_for
 from .bot_ui import (
@@ -71,6 +72,7 @@ if TYPE_CHECKING:
     from .bot_deps import BotDependencies
 
 logger = logging.getLogger("gamas_bot.bot.jobs")
+
 
 class JobPipelineMixin:
     """Queued media/presentation processing and progressive Telegram delivery."""
@@ -1147,7 +1149,9 @@ class JobPipelineMixin:
                     meta=meta,
                     duration_seconds=duration_seconds,
                 )
+                await asyncio.to_thread(validate_pdf_artifact, pdf_bytes)
             except Exception:
+                pdf_bytes = None
                 logger.exception("structured PDF generation failed submission=%s", job.submission_id)
                 notice = "\n\nنکته: فایل PDF جزوه ساخته نشد؛ نسخه‌های دیگر در دسترس‌اند."
                 notice_kind = "pdf"
@@ -1160,7 +1164,9 @@ class JobPipelineMixin:
                     design=resolve_design(),
                     meta=meta,
                 )
+                await asyncio.to_thread(validate_docx_artifact, docx_bytes)
             except Exception:
+                docx_bytes = None
                 logger.exception("structured DOCX generation failed submission=%s", job.submission_id)
                 if not notice:
                     notice = "\n\nنکته: فایل Word جزوه ساخته نشد؛ نسخه‌های دیگر در دسترس‌اند."
@@ -1602,6 +1608,34 @@ class JobPipelineMixin:
 
         from telethon.tl.types import DocumentAttributeFilename
 
+        tracking_started = False
+        try:
+            tracking_started = await self.db.binary_artifact_delivery_started(
+                submission_id, user_id, kind
+            )
+        except Exception:
+            logger.warning(
+                "could not start artifact delivery tracking submission=%s kind=%s",
+                submission_id, kind, exc_info=True,
+            )
+
+        async def finish_tracking(*, succeeded: bool, error_kind: str | None = None) -> None:
+            if not tracking_started:
+                return
+            try:
+                await self.db.binary_artifact_delivery_finished(
+                    submission_id,
+                    user_id,
+                    kind,
+                    succeeded=succeeded,
+                    error_kind=error_kind,
+                )
+            except Exception:
+                logger.warning(
+                    "could not finish artifact delivery tracking submission=%s kind=%s",
+                    submission_id, kind, exc_info=True,
+                )
+
         raw_content = artifact.get("content")
         content = bytes(raw_content) if raw_content is not None else b""
         filename = Path(str(artifact.get("filename") or "")).name
@@ -1609,6 +1643,7 @@ class JobPipelineMixin:
             logger.warning(
                 "stored %s artifact is malformed submission=%s", kind, submission_id
             )
+            await finish_tracking(succeeded=False, error_kind="artifact_malformed")
             await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
             return True
         label = "📘 جزوه PDF" if kind == "booklet" else "📄 نسخه Word"
@@ -1625,8 +1660,10 @@ class JobPipelineMixin:
                 "stored %s delivery failed submission=%s", kind, submission_id,
                 exc_info=True,
             )
-            await self._ack(event, texts.DELIVERY_ARTIFACT_GONE, alert=True)
+            await finish_tracking(succeeded=False, error_kind="telegram_send")
+            await self._ack(event, texts.DELIVERY_ARTIFACT_RETRY, alert=True)
             return True
+        await finish_tracking(succeeded=True)
         await self._ack(event)
         return True
 
