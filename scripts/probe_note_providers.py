@@ -67,6 +67,19 @@ from gamas_bot.llm import (  # noqa: E402
 )
 
 
+#: Metadata endpoints are untrusted network inputs too. ``/models`` can be
+#: large, but 16 MiB is far beyond normal provider listings while still keeping
+#: this operator CLI bounded like the production LLM client.
+MAX_PROBE_RESPONSE_BYTES = 16 * 1024 * 1024
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Turn redirects into HTTP errors instead of forwarding bearer headers."""
+
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
 def _safe_base_url(base_url: str) -> str:
     """A printable base URL without userinfo, query string or fragment.
 
@@ -128,15 +141,24 @@ def _get_json(
     elif clean_key:
         req_headers["Authorization"] = f"Bearer {clean_key}"
     request = urllib.request.Request(url, headers=req_headers, method="GET")
+    # Do not follow a provider-supplied redirect: urllib would otherwise carry
+    # the request headers to a different origin. API endpoints should answer
+    # directly, and a 3xx result is a useful probe failure.
+    opener = urllib.request.build_opener(_NoRedirectHandler())
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", "replace")
+        with opener.open(request, timeout=timeout) as response:
+            raw_body = response.read(MAX_PROBE_RESPONSE_BYTES + 1)
             status = response.status
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", "replace")
+        raw_body = exc.read(MAX_PROBE_RESPONSE_BYTES + 1)
         status = exc.code
     except (urllib.error.URLError, OSError) as exc:
         return 0, _redact_secrets(f"unreachable: {exc}", clean_key)
+    if len(raw_body) > MAX_PROBE_RESPONSE_BYTES:
+        return status, (
+            f"response body exceeded {MAX_PROBE_RESPONSE_BYTES} byte safety limit"
+        )
+    body = raw_body.decode("utf-8", "replace")
     try:
         return status, json.loads(body)
     except ValueError:

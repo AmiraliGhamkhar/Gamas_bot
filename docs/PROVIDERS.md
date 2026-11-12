@@ -93,6 +93,39 @@ passed. Entitlement is not a generation guarantee.
 A truncated answer (`finish_reason=length`) is refused, never delivered as a
 partial booklet: raise the budget with evidence, do not retry blindly.
 
+### AvalAI API safety and cost reconciliation
+
+The `avalai` route uses the OpenAI-compatible **Chat Completions** API at
+`https://api.avalai.ir/v1` with `Authorization: Bearer <AVALAI_API_KEY>`. It
+intentionally does not send note prompts to AvalAI's separate User API base
+(`https://api.avalai.ir/user/v1`) or its Google-native `/v1beta` API. Keep the
+key in `AVALAI_API_KEY`, never in `AVALAI_BASE_URL`; `--check` rejects the
+wrong official API family and credential/query-bearing official URLs.
+
+AvalAI returns `avalai-request-id` on responses. The LLM layer captures it for
+both normal and streaming completions and writes the safe value beside each
+successful usage record, for example:
+
+```text
+note provider usage provider=avalai request_id=... input_tokens=... output_tokens=...
+```
+
+Use that exact request id with AvalAI's [User API reference](https://docs.avalai.ir/en/api-reference/user)
+to reconcile a completion's precise provider cost. Failure messages prefer the
+same header when present, while keys and control characters are redacted. Model
+availability changes independently of the bot release: run the metadata stage
+before choosing or promoting an `AVALAI_MODEL`.
+
+For an AvalAI-only check that never creates Telegram/SQLite state:
+
+```bash
+python -m scripts.smoke_avalai             # metadata only
+python -m scripts.smoke_avalai --snippet   # one billable, small generation
+```
+
+The smoke command hides credentials, query strings and fragments when it prints
+a base URL. Do not run its generation modes from CI or cron.
+
 ## Probe a deployment (three stages, keep them separate)
 
 ```powershell

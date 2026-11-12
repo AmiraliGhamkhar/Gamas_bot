@@ -650,6 +650,20 @@ class AvalaiRouteTests(unittest.TestCase):
             "avalai",
         )
 
+    def test_check_rejects_avalai_api_families_other_than_chat_completions(self):
+        for base, expected in (
+            ("https://api.avalai.ir/user/v1", "User API"),
+            ("https://api.avalai.ir/v1beta", "Google-native"),
+            ("http://api.avalai.ir/v1", "must use HTTPS"),
+            ("https://api.avalai.ir/v1?key=not-in-url", "must not contain credentials"),
+        ):
+            with self.subTest(base=base):
+                settings = self.settings(AVALAI_API_KEY="av-key", AVALAI_BASE_URL=base)
+                self.assertTrue(
+                    any(expected in problem for problem in check(settings)),
+                    check(settings),
+                )
+
 
 class CheckTests(unittest.TestCase):
     def make(self, **overrides):

@@ -516,6 +516,39 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), 1)
         timeout = session.calls[0]["timeout"]
         self.assertEqual(timeout.total, settings.note_request_timeout)
+        self.assertEqual(timeout.sock_connect, llm.LLM_CONNECT_TIMEOUT_SECONDS)
+        self.assertFalse(session.calls[0]["allow_redirects"])
+
+    async def test_avalai_success_logs_its_cost_reconciliation_request_id(self):
+        """AvalAI's documented response header survives normal JSON completion."""
+        session = FakeSession([FakeResponse(200, {
+            "model": "deepseek-v4.1-flash",
+            "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15},
+        }, headers={"AvalAI-Request-Id": "avalai_req_123\nforged"})])
+        settings = make_settings(
+            note_providers=("avalai",),
+            avalai_api_key="av-secret",
+            note_ttfb_timeout=0.0,
+        )
+        with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
+            result = await complete(session, settings, system="S", user="U")
+        self.assertEqual(result, "answer")
+        usage_lines = [line for line in logs.output if "note provider usage" in line]
+        self.assertEqual(len(usage_lines), 1, logs.output)
+        self.assertIn("provider=avalai", usage_lines[0])
+        self.assertIn("request_id=avalai_req_123 forged", usage_lines[0])
+        self.assertFalse(any("\n" in line for line in usage_lines), usage_lines)
+
+    async def test_avalai_error_prefers_its_header_request_id_and_redacts_a_key(self):
+        response = FakeResponse(429, {
+            "error": {"message": "slow down", "request_id": "upstream-request-id"}
+        }, headers={"avalai-request-id": "av-secret\nprecise-cost-id"})
+        error = await llm._error_from_response("AvalAI", response, "av-secret")
+        self.assertIsInstance(error, LLMTransientError)
+        self.assertIn("request_id=*** precise-cost-id", str(error))
+        self.assertNotIn("upstream-request-id", str(error))
+        self.assertNotIn("av-secret", str(error))
 
     async def test_served_model_cannot_forge_a_log_line(self):
         """The served-model string is provider-controlled; it is sanitised."""
@@ -688,6 +721,21 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             result = await complete(session, make_settings(), system="S", user="U")
         self.assertEqual(result, "ok")
         self.assertEqual(delays, [0.0])
+
+    async def test_provider_retry_after_is_capped_before_holding_a_route_lease(self):
+        delays = []
+
+        async def record_sleep(delay):
+            delays.append(delay)
+
+        session = FakeSession([
+            FakeResponse(429, {}, headers={"Retry-After": "86400"}),
+            FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]}),
+        ])
+        with mock.patch("asyncio.sleep", new=record_sleep):
+            result = await complete(session, make_settings(), system="S", user="U")
+        self.assertEqual(result, "ok")
+        self.assertEqual(delays, [llm.MAX_LLM_RETRY_AFTER_SECONDS])
 
     async def test_auth_error_no_retry(self):
         session = FakeSession([FakeResponse(401, {"error": {"message": "bad"}})])
@@ -1171,6 +1219,28 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), 2)
         self.assertEqual(session.calls[0]["method"], "GET")
         self.assertEqual(session.calls[0]["url"], "https://router.bynara.id/v1/models")
+        self.assertEqual(
+            session.calls[0]["timeout"].sock_connect,
+            llm.LLM_CONNECT_TIMEOUT_SECONDS,
+        )
+        self.assertFalse(session.calls[0]["allow_redirects"])
+
+    async def test_get_json_caps_a_hostile_retry_after(self):
+        delays = []
+
+        async def record_sleep(delay):
+            delays.append(delay)
+
+        settings = routed_settings()
+        nara = note_routes(settings)[0]
+        session = FakeSession([
+            FakeResponse(503, {"error": {"message": "busy"}}, headers={"Retry-After": "3600"}),
+            FakeResponse(200, {"data": [{"id": "agnes-2.5-flash"}]}),
+        ])
+        with mock.patch("asyncio.sleep", new=record_sleep):
+            payload = await llm.get_json(session, nara, "models")
+        self.assertEqual(payload["data"][0]["id"], "agnes-2.5-flash")
+        self.assertEqual(delays, [llm.MAX_LLM_RETRY_AFTER_SECONDS])
 
     async def test_openrouter_http_200_top_level_in_body_error_is_classified(self):
         """OpenRouter can send 200 OK headers then return a top-level error object."""
@@ -1452,6 +1522,18 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
         metadata.assert_not_called()
         self.assertIsNone(smoke_avalai._print_config(settings))
 
+    def test_smoke_avalai_refuses_a_non_chat_api_base_without_network(self):
+        from scripts import smoke_avalai
+
+        settings = make_settings(
+            note_providers=("avalai",),
+            avalai_api_key="av-secret",
+            avalai_base_url="https://api.avalai.ir/user/v1",
+        )
+        with mock.patch.object(smoke_avalai, "_check_metadata") as metadata:
+            self.assertIsNone(smoke_avalai._print_config(settings))
+        metadata.assert_not_called()
+
     def test_smoke_avalai_names_the_route_it_would_use(self):
         from scripts import smoke_avalai
 
@@ -1466,6 +1548,12 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route.slug, "avalai")
         self.assertEqual(route.base_url, "https://api.avalai.ir/v1")
         self.assertEqual(route.model, "deepseek-v4.1-flash")
+        self.assertEqual(
+            smoke_avalai._safe_base_url(
+                "https://user:password@api.avalai.ir/v1?key=query-secret#fragment"
+            ),
+            "https://api.avalai.ir/v1",
+        )
 
     async def test_smoke_avalai_metadata_check_reads_the_models_listing(self):
         from scripts import smoke_avalai
@@ -1485,10 +1573,63 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
                 }))
 
         session = ModelsSession([])
-        with mock.patch.object(aiohttp, "ClientSession", return_value=_AsyncCM(session)):
+        with mock.patch.object(
+            aiohttp, "ClientSession", return_value=_AsyncCM(session)
+        ) as client_session:
             self.assertTrue(await smoke_avalai._check_metadata(route, settings))
         self.assertEqual(session.calls[0]["url"], "https://api.avalai.ir/v1/models")
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "Bearer av-secret")
+        self.assertFalse(session.calls[0]["allow_redirects"])
+        timeout = client_session.call_args.kwargs["timeout"]
+        self.assertEqual(timeout.total, smoke_avalai.METADATA_REQUEST_TIMEOUT_SECONDS)
+        self.assertEqual(timeout.sock_connect, smoke_avalai.METADATA_CONNECT_TIMEOUT_SECONDS)
+
+    def test_probe_metadata_response_is_bounded_and_does_not_follow_redirects(self):
+        from scripts import probe_note_providers as probe
+
+        class Response:
+            status = 200
+
+            def __init__(self):
+                self.read_limit = None
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+            def read(self, limit):
+                self.read_limit = limit
+                return b"x" * limit
+
+        class Opener:
+            def __init__(self, response):
+                self.response = response
+                self.request = None
+                self.timeout = None
+
+            def open(self, request, *, timeout):
+                self.request = request
+                self.timeout = timeout
+                return self.response
+
+        response = Response()
+        opener = Opener(response)
+        with mock.patch.object(probe, "MAX_PROBE_RESPONSE_BYTES", 8), mock.patch.object(
+            probe.urllib.request, "build_opener", return_value=opener
+        ) as build_opener:
+            status, payload = probe._get_json(
+                "https://api.example/v1/models",
+                "probe-key",
+                timeout=3.0,
+            )
+        self.assertEqual(status, 200)
+        self.assertIn("exceeded 8 byte safety limit", payload)
+        self.assertEqual(response.read_limit, 9)
+        self.assertEqual(opener.timeout, 3.0)
+        self.assertEqual(opener.request.headers["Authorization"], "Bearer probe-key")
+        self.assertIsInstance(build_opener.call_args.args[0], probe._NoRedirectHandler)
 
     async def test_probe_reports_an_unusable_context_budget_as_a_failure(self):
         from scripts import probe_note_providers as probe

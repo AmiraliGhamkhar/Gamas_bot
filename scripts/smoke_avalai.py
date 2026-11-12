@@ -38,6 +38,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -45,9 +46,15 @@ sys.path.insert(0, str(ROOT))
 from gamas_bot.config import (  # noqa: E402
     DEFAULT_AVALAI_BASE_URL,
     DEFAULT_AVALAI_MODEL,
+    avalai_main_api_problem,
     from_env,
     note_routes,
 )
+
+#: Metadata should be quick and must never borrow a full note-generation
+#: deadline. Both limits bound an operator-run probe as well as the live client.
+METADATA_REQUEST_TIMEOUT_SECONDS = 30.0
+METADATA_CONNECT_TIMEOUT_SECONDS = 10.0
 
 #: The snippet used when ``--generate`` gets no file. It is deliberately small:
 #: the smoke test proves the request shape, not the model's taste.
@@ -58,13 +65,31 @@ DEFAULT_SNIPPET = (
 )
 
 
+def _safe_base_url(value: str) -> str:
+    """Render a configured API base without accidentally printing URL secrets."""
+    parsed = urlsplit(value)
+    host = parsed.hostname or ""
+    try:
+        port = parsed.port
+    except ValueError:
+        port = None
+    if host and port is not None:
+        host = f"{host}:{port}"
+    if host:
+        return urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    # A malformed base will be reported by the metadata request; never echo a
+    # possible query-string key while doing so.
+    return urlunsplit((parsed.scheme, "", parsed.path, "", ""))
+
+
 def _print_config(settings) -> object | None:
     """Report the configured route; return it, or ``None`` when unusable."""
     routes = note_routes(settings)
     avalai = [route for route in routes if route.slug == "avalai"]
+    configured_base = settings.avalai_base_url or DEFAULT_AVALAI_BASE_URL
     print("AvalAI route as this deployment would build it:")
     print(f"  AVALAI_API_KEY   {'set' if settings.avalai_api_key else 'MISSING'}")
-    print(f"  AVALAI_BASE_URL  {settings.avalai_base_url or DEFAULT_AVALAI_BASE_URL}")
+    print(f"  AVALAI_BASE_URL  {_safe_base_url(configured_base)}")
     print(f"  AVALAI_MODEL     {settings.avalai_model or DEFAULT_AVALAI_MODEL}")
     print(
         "  sizing           "
@@ -78,6 +103,10 @@ def _print_config(settings) -> object | None:
         f"NOTE_COMPLETENESS_FILL={int(settings.note_completeness_fill)} "
         f"NOTE_QUALITY_GATE={settings.note_quality_gate}"
     )
+    base_problem = avalai_main_api_problem(configured_base)
+    if base_problem:
+        print(f"[FAIL] {base_problem}")
+        return None
     if not avalai:
         reason = (
             "AVALAI_API_KEY is empty"
@@ -87,7 +116,10 @@ def _print_config(settings) -> object | None:
         print(f"[FAIL] no AvalAI route is eligible ({reason}); see docs/PROVIDERS.md")
         return None
     route = avalai[0]
-    print(f"[PASS] route is eligible: {route.label} model={route.model} base={route.base_url}")
+    print(
+        f"[PASS] route is eligible: {route.label} model={route.model} "
+        f"base={_safe_base_url(route.base_url)}"
+    )
     return route
 
 
@@ -95,23 +127,38 @@ async def _check_metadata(route, settings) -> bool:
     """``GET /models`` with the real key: is the model entitled, and how big is it?"""
     import aiohttp
 
-    from gamas_bot.llm import _clean_api_key, _endpoint
+    from gamas_bot.llm import (
+        _clean_api_key,
+        _endpoint,
+        _read_json_body,
+        _redact_secrets,
+    )
 
     url = _endpoint(route.base_url, "models")
     headers = {"Authorization": f"Bearer {_clean_api_key(route.api_key)}"}
     started = time.monotonic()
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as response:
+        timeout = aiohttp.ClientTimeout(
+            total=METADATA_REQUEST_TIMEOUT_SECONDS,
+            sock_connect=METADATA_CONNECT_TIMEOUT_SECONDS,
+        )
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                url,
+                headers=headers,
+                allow_redirects=False,
+            ) as response:
                 status = response.status
-                payload = await response.json(content_type=None)
+                payload = await _read_json_body(response)
     except Exception as exc:  # noqa: BLE001 - report any transport failure verbatim
-        print(f"[FAIL] metadata GET {url}: {type(exc).__name__}: {exc}")
+        detail = _redact_secrets(str(exc), route.api_key)
+        print(f"[FAIL] metadata GET {_safe_base_url(url)}: {type(exc).__name__}: {detail}")
         return False
     elapsed = time.monotonic() - started
     if status != 200 or not isinstance(payload, dict):
         detail = json.dumps(payload, ensure_ascii=False)[:200] if payload else ""
-        print(f"[FAIL] metadata GET {url}: HTTP {status} {detail}")
+        detail = _redact_secrets(detail, route.api_key)
+        print(f"[FAIL] metadata GET {_safe_base_url(url)}: HTTP {status} {detail}")
         return False
     entries = payload.get("data")
     if not isinstance(entries, list):

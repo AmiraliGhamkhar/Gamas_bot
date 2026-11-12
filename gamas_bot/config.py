@@ -1107,6 +1107,45 @@ def note_routes(settings: Settings) -> tuple[NoteRoute, ...]:
     return tuple(routes)
 
 
+def avalai_main_api_problem(base_url: str) -> str | None:
+    """Return a safe diagnostic for an AvalAI URL unsuitable for this route.
+
+    The ``avalai`` note provider deliberately speaks only AvalAI's documented
+    OpenAI-compatible main API (``https://api.avalai.ir/v1``). The User API
+    (``/user/v1``) and Google-native ``/v1beta`` use different endpoint
+    families and must never receive a chat-completions payload or this route's
+    bearer credential by mistake.
+    """
+    parsed = urlsplit(base_url)
+    host = (parsed.hostname or "").lower()
+    if host != "api.avalai.ir":
+        # A deliberate private proxy remains supported; only validate the
+        # official host whose documented endpoint families are unambiguous.
+        return None
+    if parsed.scheme.lower() != "https":
+        return (
+            "AVALAI_BASE_URL must use HTTPS for api.avalai.ir; use "
+            "https://api.avalai.ir/v1."
+        )
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return (
+            "AVALAI_BASE_URL must not contain credentials, a query string, or a fragment; "
+            "put the key only in AVALAI_API_KEY."
+        )
+    path = parsed.path.rstrip("/") or "/"
+    if path == "/user/v1" or path.startswith("/user/v1/"):
+        return (
+            "AVALAI_BASE_URL points at AvalAI's User API (/user/v1), not its "
+            "OpenAI-compatible Chat Completions API; use https://api.avalai.ir/v1."
+        )
+    if path == "/v1beta" or path.startswith("/v1beta/"):
+        return (
+            "AVALAI_BASE_URL points at AvalAI's Google-native /v1beta API, which is not "
+            "compatible with this chat-completions route; use https://api.avalai.ir/v1."
+        )
+    return None
+
+
 def note_route_diagnostics(settings: Settings) -> list[str]:
     """Problems in *partly* configured note providers.
 
@@ -1846,6 +1885,12 @@ def _check_note_settings(settings: Settings) -> list[ConfigDiagnostic]:
         items.append(ConfigDiagnostic(diag))
 
     configured_routes = note_routes(settings)
+    for route in configured_routes:
+        if route.slug != "avalai":
+            continue
+        avalai_problem = avalai_main_api_problem(route.base_url)
+        if avalai_problem:
+            items.append(ConfigDiagnostic(avalai_problem))
     if configured_routes:
         llm_capacity = settings.llm_primary_max_in_flight + (
             settings.llm_fallback_max_in_flight * (len(configured_routes) - 1)
