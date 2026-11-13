@@ -156,7 +156,10 @@ class CurationFixture(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         root = Path(self.temp.name)
         self.settings = make_settings(
-            db_path=root / "bot.sqlite3", temp_dir=root / "tmp", flashcard_ai_deck_size=6
+            db_path=root / "bot.sqlite3", temp_dir=root / "tmp", flashcard_ai_deck_size=6,
+            # Generation flows run against a scripted complete_json behind a
+            # fake avalai route (see other workflow fixtures).
+            avalai_api_key="avalai-test-key",
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.settings.db_path)
@@ -549,6 +552,13 @@ class UploadAdmissionTests(unittest.IsolatedAsyncioTestCase):
 
 class LearningProgressTests(CurationFixture):
     async def test_learning_chunk_concurrency_honors_the_configured_range(self):
+        """Quizzes run ``learning_chunk_concurrency`` chunks at a time.
+
+        Decks deliberately serialize chunk calls (one provider request at a
+        time) so their peak is honest about that; the same provider must still
+        answer from the chunk whose text appears in the prompt, because the
+        dedupe boundary appends prior stems.
+        """
         from dataclasses import replace
 
         from gamas_bot.doc_extract import DocChunk
@@ -564,19 +574,51 @@ class LearningProgressTests(CurationFixture):
                 peak = max(peak, active)
                 try:
                     await asyncio.sleep(0.01)
-                    chunk = next(item for item in chunks if kwargs["user"].endswith(item.text))
-                    return {"cards": [{"front": f"پرسش {chunk.index}", "back": "پاسخ", "source": chunk.locator}]}
+                    chunk = next(item for item in chunks if item.text in kwargs["user"])
+                    return {"questions": [
+                        {"question": f"پرسش {chunk.index} مورد {n}", "options": ["الف", "ب", "ج", "د"],
+                         "correct": 0, "explain": "چرا", "difficulty": "medium", "source": chunk.locator}
+                        for n in range(3)
+                    ]}
                 finally:
                     active -= 1
 
             with mock.patch.object(self.bot, "_progress_edit", new=mock.AsyncMock()), \
                  mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
                 items, failed = await self.bot._generate_chunks(
-                    kind="deck", chunks=chunks, counts=[1] * 8, placeholder=object()
+                    kind="quiz", chunks=chunks, counts=[3] * 8, placeholder=object()
                 )
-            self.assertEqual(len(items), 8)
+            self.assertEqual(len(items), 24)
             self.assertEqual(failed, 0)
             self.assertEqual(peak, limit)
+
+    async def test_deck_chunk_calls_are_serialized(self):
+        """Decks never run two provider chunk calls at once — the design goal
+        of ``concurrency = 1 for kind == "deck"`` is one request in flight."""
+        from gamas_bot.doc_extract import DocChunk
+
+        chunks = [DocChunk(i, f"صفحه {i}", (f"صفحه {i}",), f"بخش {i}") for i in range(8)]
+        active = peak = 0
+
+        async def provider(*args, **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.01)
+                chunk = next(item for item in chunks if item.text in kwargs["user"])
+                return {"cards": [{"front": f"پرسش {chunk.index}", "back": "پاسخ", "source": chunk.locator}]}
+            finally:
+                active -= 1
+
+        with mock.patch.object(self.bot, "_progress_edit", new=mock.AsyncMock()), \
+             mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
+            items, failed = await self.bot._generate_chunks(
+                kind="deck", chunks=chunks, counts=[1] * 8, placeholder=object()
+            )
+        self.assertEqual(len(items), 8)
+        self.assertEqual(failed, 0)
+        self.assertEqual(peak, 1)
 
     async def test_stalled_telegram_progress_does_not_hold_model_slots(self):
         from gamas_bot.doc_extract import DocChunk
@@ -595,7 +637,7 @@ class LearningProgressTests(CurationFixture):
 
         async def provider(*args, **kwargs):
             await asyncio.sleep(0.01)
-            chunk = next(item for item in chunks if kwargs["user"].endswith(item.text))
+            chunk = next(item for item in chunks if item.text in kwargs["user"])
             calls.append(chunk.index)
             return {"cards": [{"front": f"پرسش {chunk.index}", "back": "پاسخ", "source": chunk.locator}]}
 

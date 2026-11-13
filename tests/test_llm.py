@@ -11,7 +11,7 @@ import aiohttp
 
 
 from gamas_bot import llm
-from gamas_bot.config import DEFAULT_GEMINI_MODEL, DEFAULT_NARA_MODEL, note_routes
+from gamas_bot.config import DEFAULT_AVALAI_MODEL, DEFAULT_GEMINI_MODEL, note_routes
 from gamas_bot.llm import (
     LLMAuthError,
     LLMContextOverflowError,
@@ -62,7 +62,7 @@ class StructuredOutputAndRoutingTests(unittest.TestCase):
     }
 
     def test_no_schema_is_sent_unless_a_caller_asks(self):
-        settings = make_settings()
+        settings = make_settings(avalai_api_key="avalai-test-key")
         route = note_routes(settings)[0]
         _url, _headers, payload = llm._build_request_for(route, settings, "S", "U")
         self.assertNotIn("response_format", payload)
@@ -89,7 +89,9 @@ class StructuredOutputAndRoutingTests(unittest.TestCase):
         self.assertNotIn("additionalProperties", section["items"])
 
     def test_openai_style_uses_json_schema_not_strict_mode(self):
-        settings = make_settings(note_structured_output=True)
+        settings = make_settings(
+            avalai_api_key="avalai-test-key", note_structured_output=True
+        )
         route = note_routes(settings)[0]
         _url, _headers, payload = llm._build_request_for(
             route, settings, "S", "U", schema=self.schema
@@ -132,40 +134,47 @@ class StructuredOutputAndRoutingTests(unittest.TestCase):
         _url, _headers, payload = llm._build_request_for(route, on, "S", "U")
         self.assertEqual(payload["provider"], {"sort": "throughput"})
 
-        # A generic OpenAI-compatible gateway never receives an OpenRouter field.
-        generic = make_settings(note_openrouter_throughput=True)
+        # Another OpenAI-compatible provider never receives an OpenRouter field.
+        generic = make_settings(avalai_api_key="avalai-test-key", note_openrouter_throughput=True)
         route = note_routes(generic)[0]
         _url, _headers, payload = llm._build_request_for(route, generic, "S", "U")
         self.assertNotIn("provider", payload)
 
     def test_the_compile_provider_moves_to_the_front_without_dropping_backups(self):
         settings = make_settings(
-            note_providers=("openai_compatible", "nara"),
-            nara_api_key="nara-key",
-            note_compile_provider="nara",
+            note_providers=("avalai", "gemini", "openrouter"),
+            avalai_api_key="avalai-key",
+            gemini_api_key="g-key",
+            openrouter_api_key="or-key",
+            note_compile_provider="avalai",
         )
         routes = note_routes(settings)
-        ordered = llm._ordered_routes(routes, "nara")
-        self.assertEqual([route.slug for route in ordered], ["nara", "openai_compatible"])
-        # An unknown or empty slug changes nothing.
+        ordered = llm._ordered_routes(routes, "avalai")
+        self.assertEqual([route.slug for route in ordered], [
+            "avalai", "gemini", "openrouter"
+        ])
+        # An unknown or empty slug changes nothing (and OpenRouter stays last
+        # even if it were named as the preferred compile provider).
         self.assertEqual(llm._ordered_routes(routes, ""), routes)
-        self.assertEqual(llm._ordered_routes(routes, "gemini"), routes)
+        self.assertEqual(llm._ordered_routes(routes, "openrouter"), routes)
 
 
 class RequestBuildingTests(unittest.TestCase):
-    def test_openai_compatible(self):
-        settings = make_settings()
+    def test_avalai_openai_compatible_request(self):
+        settings = make_settings(avalai_api_key="avalai-test-key")
         url, headers, payload = _build_request(settings, "SYS", "USER")
-        self.assertEqual(url, "https://note.example/v1/chat/completions")
-        self.assertEqual(headers["Authorization"], "Bearer note-key")
-        self.assertEqual(payload["model"], "test-model")
+        self.assertEqual(url, "https://api.avalai.ir/v1/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer avalai-test-key")
+        self.assertEqual(payload["model"], "deepseek-v4.1-flash")
         self.assertEqual(payload["messages"][0]["role"], "system")
         self.assertEqual(payload["messages"][1]["content"], "USER")
         self.assertNotIn("response_format", payload)  # opt-in only
         self.assertNotIn("reasoning_effort", payload)  # provider default unless set
 
     def test_openai_compatible_uses_the_configured_output_budget(self):
-        settings = make_settings(note_max_output_tokens=2048)
+        settings = make_settings(
+            avalai_api_key="avalai-test-key", note_max_output_tokens=2048
+        )
         _url, _headers, payload = _build_request(settings, "SYS", "USER")
         self.assertEqual(payload["max_tokens"], 2048)
         self.assertEqual(payload["temperature"], llm.NOTE_TEMPERATURE)
@@ -173,31 +182,43 @@ class RequestBuildingTests(unittest.TestCase):
 
     def test_reasoning_effort_sent_on_verified_gateways(self):
         settings = routed_settings(note_reasoning_effort="low")
-        nara, openrouter = note_routes(settings)
-        for route in (nara, openrouter):
-            _url, _headers, payload = _build_request(settings, "S", "U", route=route)
-            self.assertEqual(payload["reasoning_effort"], "low")
+        avalai_route, openrouter = note_routes(settings)
+        # Only OpenRouter's profile documents the field; every other approved
+        # route builds the identical request without it.
+        avalai_payload = _build_request(settings, "S", "U", route=avalai_route)[2]
+        self.assertNotIn("reasoning_effort", avalai_payload)
+        or_payload = _build_request(settings, "S", "U", route=openrouter)[2]
+        self.assertEqual(or_payload["reasoning_effort"], "low")
 
     def test_reasoning_effort_never_sent_to_a_generic_gateway(self):
         """A generic gateway's model may reject the parameter outright."""
-        settings = make_settings(note_reasoning_effort="low")
+        settings = make_settings(
+            avalai_api_key="avalai-test-key", note_reasoning_effort="low"
+        )
         _url, _headers, payload = _build_request(settings, "S", "U")
         self.assertNotIn("reasoning_effort", payload)
 
     def test_reasoning_effort_sent_on_a_documented_route(self):
-        """NaraRouter documents ``reasoning_effort`` for its hosted models."""
+        """OpenRouter documents ``reasoning_effort``; AvalAI does not (and its
+        hosted models' contract deliberately omits it)."""
         settings = routed_settings(
-            note_providers=("nara",),
-            nara_api_key="nara-key",
-            openrouter_api_key="",
+            note_providers=("avalai", "openrouter"),
+            avalai_api_key="avalai-key",
+            openrouter_api_key="or-key",
             note_reasoning_effort="low",
         )
-        route = note_routes(settings)[0]
-        url, headers, payload = _build_request(settings, "S", "U", route=route)
-        self.assertEqual(payload["reasoning_effort"], "low")
-        self.assertEqual(payload["model"], route.model)
-        self.assertTrue(url.endswith("/chat/completions"))
-        self.assertEqual(headers["Authorization"], f"Bearer {route.api_key}")
+        avalai_route, openrouter_route = note_routes(settings)
+        avalai_url, avalai_headers, avalai_payload = _build_request(
+            settings, "S", "U", route=avalai_route
+        )
+        self.assertNotIn("reasoning_effort", avalai_payload)
+        _or_url, _or_headers, or_payload = _build_request(
+            settings, "S", "U", route=openrouter_route
+        )
+        self.assertEqual(or_payload["reasoning_effort"], "low")
+        self.assertEqual(avalai_payload["model"], avalai_route.model)
+        self.assertTrue(avalai_url.endswith("/chat/completions"))
+        self.assertEqual(avalai_headers["Authorization"], f"Bearer {avalai_route.api_key}")
 
     def test_gemini_thinking_budget_is_zero_by_default(self):
         settings = make_settings(
@@ -267,13 +288,16 @@ class RequestBuildingTests(unittest.TestCase):
         self.assertNotIn("reasoning_effort", payload["generationConfig"])
 
     def test_openai_json_mode_opt_in(self):
-        settings = make_settings(note_json_mode=True)
+        settings = make_settings(
+            avalai_api_key="avalai-test-key", note_json_mode=True
+        )
         _url, _headers, payload = _build_request(settings, "S", "U")
         self.assertEqual(payload["response_format"], {"type": "json_object"})
 
     def test_gemini_native_json_and_key_header(self):
         settings = make_settings(
-            note_provider="gemini", note_api_key="g-key", note_api_base_url=""
+            note_provider="gemini", note_api_key="g-key", note_api_base_url="",
+            gemini_model="test-model",
         )
         url, headers, payload = _build_request(settings, "SYS", "USER")
         self.assertIn(":generateContent", url)
@@ -296,15 +320,14 @@ class RequestBuildingTests(unittest.TestCase):
         url, _headers, _payload = _build_request(settings, "S", "U")
         self.assertNotIn("models/models", url)
 
-    def test_anthropic_headers_and_system(self):
-        settings = make_settings(note_provider="anthropic", note_api_key="a-key")
-        url, headers, payload = _build_request(settings, "SYS", "USER")
-        self.assertTrue(url.endswith("/messages"))
-        self.assertEqual(headers["x-api-key"], "a-key")
-        self.assertEqual(headers["anthropic-version"], "2023-06-01")
-        self.assertEqual(payload["system"], "SYS")
-        self.assertEqual(payload["max_tokens"], settings.note_max_output_tokens)
-        self.assertEqual(payload["temperature"], llm.NOTE_TEMPERATURE)
+    def test_removed_anthropic_provider_cannot_build_a_request(self):
+        """Anthropic was removed from the allowlist: no dialect, no request."""
+        with self.assertRaises(ValueError):
+            from gamas_bot.llm_profiles import get_provider_profile
+            get_provider_profile("anthropic")
+        self.assertNotIn("anthropic", llm.DIALECTS)
+        # The active dialects are exactly the two styles the approved providers use.
+        self.assertEqual(set(llm.DIALECTS), {"openai", "gemini"})
 
     def test_missing_key_is_auth_error(self):
         settings = make_settings(note_provider="gemini", note_api_key="")
@@ -330,9 +353,12 @@ class ResponseParsingTests(unittest.TestCase):
         with self.assertRaises(LLMResponseError):
             _parse_response(payload, "gemini")
 
-    def test_anthropic_text_parts(self):
-        payload = {"content": [{"type": "text", "text": "one"}, {"type": "tool_use"}]}
-        self.assertEqual(_parse_response(payload, "anthropic"), "one")
+    def test_removed_anthropic_style_is_no_longer_a_dialect(self):
+        """Anthropic was removed from the allowlist: it is not registered.
+        ``get_dialect`` deliberately defaults unknown styles to the OpenAI
+        dialect (which is why there is no anthropic dialect object any more)."""
+        self.assertNotIn("anthropic", llm.DIALECTS)
+        self.assertIs(llm.get_dialect("anthropic"), llm.DIALECTS["openai"])
 
     def test_malformed_is_response_error(self):
         with self.assertRaises(LLMResponseError):
@@ -369,9 +395,15 @@ class UsageSummaryTests(unittest.TestCase):
         }
         self.assertEqual(_usage_summary(payload, "gemini"), ("gemini-2.5-flash", 10, 4, 14))
 
-    def test_anthropic_total_is_derived(self):
-        payload = {"model": "claude-x", "usage": {"input_tokens": 7, "output_tokens": 3}}
-        self.assertEqual(_usage_summary(payload, "anthropic"), ("claude-x", 7, 3, 10))
+    def test_gemini_total_is_derived_from_usage_metadata(self):
+        # The Gemini `usageMetadata` totals from the shipped production dialect.
+        payload = {
+            "modelVersion": "gemini-3.5-flash-lite",
+            "usageMetadata": {"promptTokenCount": 7, "candidatesTokenCount": 3},
+        }
+        self.assertEqual(
+            _usage_summary(payload, "gemini"), ("gemini-3.5-flash-lite", 7, 3, 10)
+        )
 
     def test_missing_or_bool_counts_stay_unknown(self):
         payload = {"usage": {"prompt_tokens": True, "completion_tokens": "9"}}
@@ -405,17 +437,17 @@ class ExtractJsonTests(unittest.TestCase):
 
 
 def routed_settings(**overrides):
-    """Settings whose only eligible note providers are Nara and OpenRouter.
+    """Settings whose only eligible note providers are AvalAI and OpenRouter.
 
     The default order and both providers' documented API shapes come from
     ``gamas_bot.config``; nothing here is inferred from a provider name.
     """
     base = {
-        "note_providers": ("nara", "openrouter"),
+        "note_providers": ("avalai", "openrouter"),
         "note_provider": "",
         "note_api_key": "",
         "note_api_base_url": "",
-        "nara_api_key": "nara-key",
+        "avalai_api_key": "avalai-key",
         "openrouter_api_key": "or-key",
     }
     base.update(overrides)
@@ -503,7 +535,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             "choices": [{"message": {"content": "answer"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 120, "completion_tokens": 30, "total_tokens": 150},
         })])
-        settings = make_settings()
+        settings = make_settings(avalai_api_key="avalai-test-key")
         with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
             result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "answer")
@@ -558,7 +590,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
         })])
         with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
-            result = await complete(session, make_settings(), system="S", user="U")
+            result = await complete(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(result, "answer")
         self.assertFalse(any("\n" in line for line in logs.output), logs.output)
         self.assertTrue(any("model=evil" in line for line in logs.output), logs.output)
@@ -568,7 +600,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             aiohttp.ClientConnectionError("connection reset"),
             FakeResponse(200, {"choices": [{"message": {"content": "recovered"}}]}),
         ])
-        settings = make_settings()
+        settings = make_settings(avalai_api_key="avalai-test-key")
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
             result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "recovered")
@@ -580,7 +612,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         }})
         session = FakeSession([rejected, chat_answer("recovered")])
         with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
-            result = await complete(session, make_settings(), system="S", user="U")
+            result = await complete(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(result, "recovered")
         self.assertEqual(len(session.calls), 2)
         request_logs = [line for line in logs.output if "LLM request sending" in line]
@@ -595,7 +627,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             "message": "Unsupported parameter: 'temperature' is not supported with this model."
         }})
         session = FakeSession([rejected, chat_answer("recovered")])
-        result = await complete(session, make_settings(), system="S", user="U")
+        result = await complete(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(result, "recovered")
         self.assertEqual(len(session.calls), 2)
         retried_payload = session.calls[-1]["json"]
@@ -684,14 +716,14 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
     async def test_bad_success_body_is_response_error(self):
         session = FakeSession([InvalidJsonResponse(200)])
         with self.assertRaises(LLMResponseError):
-            await complete(session, make_settings(), system="S", user="U")
+            await complete(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
 
     async def test_transient_retry_then_success(self):
         session = FakeSession([
             FakeResponse(503, {}),
             FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]}),
         ])
-        settings = make_settings()
+        settings = make_settings(avalai_api_key="avalai-test-key")
         with mock.patch("gamas_bot.llm.MAX_TRANSIENT_RETRIES", 2), \
              mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
             result = await complete(session, settings, system="S", user="U")
@@ -703,7 +735,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]}),
         ])
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
-            result = await complete(session, make_settings(), system="S", user="U")
+            result = await complete(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(result, "ok")
         self.assertEqual(len(session.calls), 2)
 
@@ -718,7 +750,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]}),
         ])
         with mock.patch("asyncio.sleep", new=record_sleep):
-            result = await complete(session, make_settings(), system="S", user="U")
+            result = await complete(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(result, "ok")
         self.assertEqual(delays, [0.0])
 
@@ -733,13 +765,15 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
             FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]}),
         ])
         with mock.patch("asyncio.sleep", new=record_sleep):
-            result = await complete(session, make_settings(), system="S", user="U")
+            result = await complete(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(result, "ok")
+        # The provider-supplied Retry-After is honored but capped at the local
+        # maximum — a hostile "wait 24h" answer never parks the caller.
         self.assertEqual(delays, [llm.MAX_LLM_RETRY_AFTER_SECONDS])
 
     async def test_auth_error_no_retry(self):
         session = FakeSession([FakeResponse(401, {"error": {"message": "bad"}})])
-        settings = make_settings()
+        settings = make_settings(avalai_api_key="avalai-test-key")
         with self.assertRaises(LLMAuthError):
             await complete(session, settings, system="S", user="U")
         self.assertEqual(len(session.calls), 1)
@@ -748,7 +782,7 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([
             FakeResponse(400, {"error": {"message": "key note-key rejected"}})
         ])
-        settings = make_settings()
+        settings = make_settings(avalai_api_key="avalai-test-key")
         with self.assertRaises(LLMResponseError) as ctx:
             await complete(session, settings, system="S", user="U")
         self.assertNotIn("note-key", str(ctx.exception))
@@ -757,12 +791,20 @@ class CompleteTests(unittest.IsolatedAsyncioTestCase):
 class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
     async def test_json_can_refuse_to_wait_for_provider_capacity(self):
         from gamas_bot import llm
-        settings = make_settings(note_hedge_after=0)
+        settings = make_settings(
+            avalai_api_key="avalai-test-key", note_hedge_after=0
+        )
         pool = mock.Mock()
         pool.acquire_any = mock.AsyncMock(return_value=None)
-        with mock.patch.object(llm, "pool_for", return_value=pool):
+
+        # A fully-saturated pool rejects the request; it does not linger.
+        orig = llm.pool_for
+        try:
+            llm.pool_for = lambda *a, **k: pool
             with self.assertRaises(llm.LLMTransientError):
                 await complete_json(FakeSession([]), settings, system="S", user="U", wait_for_capacity=False)
+        finally:
+            llm.pool_for = orig
         self.assertEqual(pool.acquire_any.await_args.kwargs["timeout"], 0.0)
 
     async def test_per_call_output_limit_shares_original_capacity_pool(self):
@@ -770,7 +812,9 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([FakeResponse(200, {
             "choices": [{"message": {"content": '{"ok": true}'}}]
         })])
-        settings = make_settings(note_max_output_tokens=8192)
+        settings = make_settings(
+            avalai_api_key="avalai-test-key", note_max_output_tokens=8192
+        )
         with mock.patch.object(llm, "pool_for", wraps=llm.pool_for) as pool:
             await complete_json(session, settings, system="S", user="U", max_output_tokens=1024)
         self.assertIs(pool.call_args.args[1], settings)
@@ -779,7 +823,9 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([FakeResponse(200, {
             "choices": [{"message": {"content": '{"ok": true}'}}]
         })])
-        settings = make_settings(note_max_output_tokens=8192)
+        settings = make_settings(
+            avalai_api_key="avalai-test-key", note_max_output_tokens=8192
+        )
         await complete_json(session, settings, system="S", user="U", max_output_tokens=1024)
         self.assertEqual(session.calls[0]["json"]["max_tokens"], 1024)
         self.assertEqual(settings.note_max_output_tokens, 8192)
@@ -788,7 +834,7 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([FakeResponse(200, {
             "choices": [{"message": {"content": '{"title": "جزوه"}'}}]
         })])
-        settings = make_settings()
+        settings = make_settings(avalai_api_key="avalai-test-key")
         payload = await complete_json(session, settings, system="S", user="U")
         self.assertEqual(payload["title"], "جزوه")
 
@@ -797,7 +843,7 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
             FakeResponse(200, {"choices": [{"message": {"content": "not json"}}]}),
             FakeResponse(200, {"choices": [{"message": {"content": '{"ok": true}'}}]}),
         ])
-        settings = make_settings()
+        settings = make_settings(avalai_api_key="avalai-test-key")
         with self.assertRaises(LLMResponseError):
             await complete_json(session, settings, system="S", user="U")
         self.assertEqual(len(session.calls), 1)
@@ -807,7 +853,7 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
             FakeResponse(200, {"choices": [{"message": {"content": "nope"}}]}),
             FakeResponse(200, {"choices": [{"message": {"content": "still nope"}}]}),
         ])
-        settings = make_settings()
+        settings = make_settings(avalai_api_key="avalai-test-key")
         with self.assertRaises(LLMResponseError):
             await complete_json(session, settings, system="S", user="U")
 
@@ -817,7 +863,7 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
             FakeResponse(200, {"choices": [{"message": {"content": '{"ok": true}'}}]}),
         ])
         with self.assertRaises(LLMResponseError):
-            await complete_json(session, make_settings(), system="S", user="U")
+            await complete_json(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(len(session.calls), 1)
 
     async def test_non_json_nan_is_not_retried_on_same_route(self):
@@ -826,24 +872,24 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
             FakeResponse(200, {"choices": [{"message": {"content": '{"ok": true}'}}]}),
         ])
         with self.assertRaises(LLMResponseError):
-            await complete_json(session, make_settings(), system="S", user="U")
+            await complete_json(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(len(session.calls), 1)
 
     async def test_provider_400_does_not_trigger_json_retry(self):
         session = FakeSession([FakeResponse(400, {"error": {"message": "bad request"}})])
         with self.assertRaises(LLMResponseError):
-            await complete_json(session, make_settings(), system="S", user="U")
+            await complete_json(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(len(session.calls), 1)
 
 
-def nara_error(
+def avalai_error(
     status: int, error_type: str, message: str, request_id: str = "req_1"
 ) -> "FakeResponse":
-    """NaraRouter's single documented error envelope.
+    """The AvalAI error envelope, with its documented request-id correlation.
 
-    ``{"error": {"type", "message", "request_id"}}`` — see
-    https://router.bynara.id/docs ("Errors"). The gateway has no ``code`` and
-    no ``status`` field, so ``type`` is the only machine-readable signal.
+    ``{"error": {"type", "message", "request_id"}}`` — the request-id is the
+    one value its User API uses for exact reconciliation, and the redaction
+    contract says it never carries the credential itself.
     """
     return FakeResponse(status, {
         "error": {"type": error_type, "message": message, "request_id": request_id}
@@ -857,47 +903,54 @@ def truncated_answer(text: str = "") -> "FakeResponse":
     })
 
 
-class NaraRouterContractTests(unittest.IsolatedAsyncioTestCase):
-    """The documented NaraRouter chat-completions contract, end to end.
+class AvalaiRouterContractTests(unittest.IsolatedAsyncioTestCase):
+    """The AvalAI chat-completions contract, end to end.
 
-    Every expectation is a documented one (https://router.bynara.id/docs):
+    Every expectation is a documented one (https://docs.avalai.ir/en):
     the endpoint and Bearer key, the request fields, the success shape, the
-    one error envelope, the status-code table, and the reasoning models'
-    output-budget behaviour.
+    one error envelope and its ``avalai-request-id`` correlation, the
+    status-code table, and the reasoning models' output-budget behaviour.
     """
 
     async def test_request_matches_the_documented_shape(self):
         settings = routed_settings()
-        nara = note_routes(settings)[0]
-        url, headers, payload = _build_request(settings, "SYS", "USER", route=nara)
-        self.assertEqual(url, "https://router.bynara.id/v1/chat/completions")
-        self.assertEqual(headers, {"Authorization": "Bearer nara-key"})
+        avalai = note_routes(settings)[0]
+        url, headers, payload = _build_request(settings, "SYS", "USER", route=avalai)
+        self.assertEqual(url, "https://api.avalai.ir/v1/chat/completions")
+        self.assertEqual(headers, {"Authorization": "Bearer avalai-key"})
         # Only fields the gateway documents; anything else risks a 400.
         self.assertEqual(sorted(payload), ["max_tokens", "messages", "model", "temperature"])
-        self.assertEqual(payload["model"], "agnes-2.5-flash")
+        self.assertEqual(payload["model"], "deepseek-v4.1-flash")
 
-    async def test_default_model_is_on_the_published_free_plan(self):
-        # https://router.bynara.id/api/plans lists agnes-2.5-flash on `free`.
-        self.assertEqual(DEFAULT_NARA_MODEL, "agnes-2.5-flash")
+    async def test_default_model_is_the_documented_avalai_model(self):
+        # The shipped default is the documented DeepSeek entry on AvalAI.
+        self.assertEqual(DEFAULT_AVALAI_MODEL, "deepseek-v4.1-flash")
 
-    async def test_response_format_is_never_sent_to_nara(self):
+    async def test_response_format_is_sent_to_avalai_only_with_the_flag(self):
         settings = routed_settings(note_json_mode=True)
-        nara = note_routes(settings)[0]
-        _url, _headers, payload = _build_request(settings, "S", "U", route=nara)
+        avalai_route = note_routes(settings)[0]
+        _url, _headers, payload = _build_request(settings, "S", "U", route=avalai_route)
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+
+        settings = routed_settings(note_json_mode=False)
+        _url, _headers, payload = _build_request(
+            settings, "S", "U", route=note_routes(settings)[0]
+        )
         self.assertNotIn("response_format", payload)
 
-    async def test_reasoning_effort_reaches_nara_only_when_configured(self):
-        """NaraRouter documents ``reasoning_effort``; unset keeps its default."""
+    async def test_reasoning_effort_is_dropped_when_avalai_is_first(self):
+        """AvalAI's profile documents no ``reasoning_effort`` field; the
+        operator setting reaches only OpenRouter, not the first route."""
         settings = routed_settings(note_reasoning_effort="none")
-        nara = note_routes(settings)[0]
-        _url, _headers, payload = _build_request(settings, "S", "U", route=nara)
-        self.assertEqual(payload["reasoning_effort"], "none")
+        avalai_route = note_routes(settings)[0]
+        _url, _headers, payload = _build_request(settings, "S", "U", route=avalai_route)
+        self.assertNotIn("reasoning_effort", payload)
 
     async def test_documented_success_shape_parses(self):
         session = FakeSession([FakeResponse(200, {
             "id": "chatcmpl-1",
             "object": "chat.completion",
-            "model": "agnes-2.5-flash",
+            "model": "deepseek-v4.1-flash",
             "choices": [{
                 "index": 0,
                 "message": {"role": "assistant", "content": "Hello!"},
@@ -921,16 +974,16 @@ class NaraRouterContractTests(unittest.IsolatedAsyncioTestCase):
         }
         for status, klass in expected.items():
             error = await llm._error_from_response(
-                "NaraRouter", nara_error(status, "some_type", "m"), None
+                "AvalAI", avalai_error(status, "some_type", "m"), None
             )
             self.assertIsInstance(error, klass, f"HTTP {status} -> {type(error).__name__}")
             self.assertNotIsInstance(error, LLMContextOverflowError, f"HTTP {status}")
 
     async def test_413_oversized_body_is_a_context_overflow(self):
-        """413 is NaraRouter's documented "the request body or input is too large"."""
+        """Oversize HTTP 413 is a context error, including gateway error envelopes."""
         error = await llm._error_from_response(
-            "NaraRouter",
-            nara_error(413, "bad_request", "The request body or input is too large."),
+            "AvalAI",
+            avalai_error(413, "bad_request", "The request body or input is too large."),
             None,
         )
         self.assertIsInstance(error, LLMContextOverflowError)
@@ -938,23 +991,23 @@ class NaraRouterContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_413_without_context_wording_is_still_an_overflow(self):
         """The status alone classifies it; no message wording is required."""
         error = await llm._error_from_response(
-            "NaraRouter", nara_error(413, "bad_request", "Payload rejected."), None
+            "AvalAI", avalai_error(413, "bad_request", "Payload rejected."), None
         )
         self.assertIsInstance(error, LLMContextOverflowError)
 
     async def test_request_id_reaches_the_operator(self):
         error = await llm._error_from_response(
-            "NaraRouter",
-            nara_error(429, "rate_limited", "Rate limit exceeded.", "req_abc123"),
+            "AvalAI",
+            avalai_error(429, "rate_limited", "Rate limit exceeded.", "req_abc123"),
             None,
         )
         self.assertIn("request_id=req_abc123", str(error))
 
     async def test_request_id_never_carries_the_key(self):
         body = FakeResponse(429, {"error": {
-            "type": "rate_limited", "message": "slow down", "request_id": "nara-key"}})
-        error = await llm._error_from_response("NaraRouter", body, "nara-key")
-        self.assertNotIn("nara-key", str(error))
+            "type": "rate_limited", "message": "slow down", "request_id": "avalai-key"}})
+        error = await llm._error_from_response("AvalAI", body, "avalai-key")
+        self.assertNotIn("avalai-key", str(error))
 
     def test_reasoning_starvation_reports_the_output_budget(self):
         """Empty content + ``finish_reason: length`` is the documented case where
@@ -970,54 +1023,72 @@ class NaraRouterContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LLMOutputBudgetError):
             _parse_response(payload, "openai")
 
-    def test_truncation_is_detected_in_every_request_style(self):
+    def test_truncation_is_detected_in_every_shipped_style(self):
+        """Both shipped styles detect a budget-truncated answer."""
         self.assertTrue(llm.get_dialect("openai").is_output_truncated({"choices": [{"finish_reason": "length"}]}))
         self.assertTrue(llm.get_dialect("gemini").is_output_truncated({"candidates": [{"finishReason": "MAX_TOKENS"}]}))
-        self.assertTrue(llm.get_dialect("anthropic").is_output_truncated({"stop_reason": "max_tokens"}))
+        # Anthropic is not a shipped style anymore.
+        with self.assertRaises(KeyError):
+            llm.DIALECTS["anthropic"]
         self.assertFalse(llm.get_dialect("openai").is_output_truncated({"choices": [{"finish_reason": "stop"}]}))
         self.assertFalse(llm.get_dialect("openai").is_output_truncated({}))
 
-    async def test_a_truncated_answer_is_not_retried_as_bad_json(self):
-        """The JSON-reminder retry cannot fix a budget cut, so it is not sent."""
+    async def test_a_truncated_answer_fails_over_without_repeating_the_route(self):
         session = FakeSession([truncated_answer('{"title": "cu'), chat_answer('{"ok": true}')])
-        payload = await complete_json(session, routed_settings(), system="S", user="U")
-        self.assertEqual(payload, {"ok": True})
-        # One request per provider: Nara is left behind, OpenRouter answers.
-        self.assertEqual(len(session.calls), 2)
-        self.assertEqual(session.calls[0]["url"], "https://router.bynara.id/v1/chat/completions")
-        self.assertEqual(session.calls[1]["url"], "https://openrouter.ai/api/v1/chat/completions")
-
-    async def test_an_empty_answer_without_truncation_is_still_retried(self):
-        """A blank answer with no ``length`` signal keeps its one recovery retry."""
-        session = FakeSession([chat_answer("   "), chat_answer('{"ok": true}')])
-        payload = await complete_json(session, routed_settings(), system="S", user="U")
-        self.assertEqual(payload, {"ok": True})
-        self.assertEqual(len(session.calls), 2)
-        self.assertEqual(
-            [call["url"] for call in session.calls],
-            ["https://router.bynara.id/v1/chat/completions"] * 2,
+        result = await complete_json(
+            session, routed_settings(), system="S", user="Synthetic lesson",
+            data_sensitivity="STANDARD_EDUCATIONAL",
         )
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual([c["url"] for c in session.calls], [
+            "https://api.avalai.ir/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
+        ])
+
+    async def test_truncation_on_every_eligible_route_preserves_output_budget_error(self):
+        session = FakeSession([truncated_answer(), truncated_answer()])
+        with self.assertRaises(LLMOutputBudgetError) as caught:
+            await complete_json(
+                session, routed_settings(), system="S", user="Synthetic lesson",
+                data_sensitivity="STANDARD_EDUCATIONAL",
+            )
+        self.assertEqual(len(session.calls), 2)
+        self.assertIn("AvalAI", str(caught.exception))
+        self.assertIn("OpenRouter", str(caught.exception))
+        self.assertNotIn("avalai-key", str(caught.exception))
+
+    async def test_an_empty_answer_fails_over_without_repeating_the_route(self):
+        session = FakeSession([chat_answer("   "), chat_answer('{"ok": true}')])
+        result = await complete_json(
+            session, routed_settings(), system="S", user="Synthetic lesson",
+            data_sensitivity="STANDARD_EDUCATIONAL",
+        )
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual([c["url"] for c in session.calls], [
+            "https://api.avalai.ir/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
+        ])
 
 
 class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
-    """Nara first, OpenRouter second, bounded retries, no silent retries."""
+    """AvalAI first, OpenRouter second, bounded retries, no silent retries."""
 
-    async def test_nara_answers_first_with_its_own_documented_request(self):
-        session = FakeSession([chat_answer("nara-answer")])
-        result = await complete(session, routed_settings(), system="S", user="U")
-        self.assertEqual(result, "nara-answer")
+    async def test_avalai_answers_first_with_its_own_documented_request(self):
+        session = FakeSession([chat_answer("avalai-answer")])
+        result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        self.assertEqual(result, "avalai-answer")
         self.assertEqual(len(session.calls), 1)
         call = session.calls[0]
-        self.assertEqual(call["url"], "https://router.bynara.id/v1/chat/completions")
-        self.assertEqual(call["headers"]["Authorization"], "Bearer nara-key")
-        self.assertEqual(call["json"]["model"], "agnes-2.5-flash")
+        self.assertEqual(call["url"], "https://api.avalai.ir/v1/chat/completions")
+        self.assertEqual(call["headers"]["Authorization"], "Bearer avalai-key")
+        self.assertEqual(call["json"]["model"], "deepseek-v4.1-flash")
 
     async def test_auth_failure_moves_on_to_openrouter(self):
         session = FakeSession([
             FakeResponse(401, {"error": {"message": "invalid api key"}}),
             chat_answer("openrouter-answer"),
         ])
-        result = await complete(session, routed_settings(), system="S", user="U")
+        result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(result, "openrouter-answer")
         self.assertEqual(len(session.calls), 2)
         self.assertEqual(
@@ -1027,37 +1098,45 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_context_overflow_fails_over_to_the_next_provider(self):
         session = FakeSession([context_overflow(), chat_answer("smaller")])
-        result = await complete(session, routed_settings(), system="S", user="U")
+        result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(result, "smaller")
         self.assertEqual(len(session.calls), 2)
 
     async def test_every_provider_failing_keeps_the_first_error_class(self):
         session = FakeSession([context_overflow(), context_overflow()])
         with self.assertRaises(LLMContextOverflowError) as caught:
-            await complete(session, routed_settings(), system="S", user="U")
+            await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         message = str(caught.exception)
-        self.assertIn("NaraRouter", message)
+        self.assertIn("AvalAI", message)
         self.assertIn("OpenRouter", message)
-        self.assertNotIn("nara-key", message)
+        self.assertNotIn("avalai-key", message)
         # One attempt per provider: nothing is re-sent unchanged.
         self.assertEqual(len(session.calls), 2)
 
     async def test_a_transient_failure_is_retried_on_the_same_provider(self):
         session = FakeSession([FakeResponse(503, {}), chat_answer("recovered")])
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
-            result = await complete(session, routed_settings(), system="S", user="U")
+            result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(result, "recovered")
         self.assertEqual(
             [call["url"] for call in session.calls],
-            ["https://router.bynara.id/v1/chat/completions"] * 2,
+            ["https://api.avalai.ir/v1/chat/completions"] * 2,
         )
 
-    async def test_a_permanent_rejection_is_not_retried_per_provider(self):
+    async def test_a_permanent_rejection_is_not_retried_on_the_same_route(self):
+        """A 400 is permanent for that provider; the next route gets one chance."""
         bad = FakeResponse(400, {"error": {"message": "unsupported parameter"}})
         session = FakeSession([bad, FakeResponse(400, {"error": {"message": "unsupported parameter"}})])
         with self.assertRaises(LLMResponseError):
-            await complete(session, routed_settings(), system="S", user="U")
+            await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(len(session.calls), 2)
+        self.assertEqual(
+            [call["url"] for call in session.calls],
+            [
+                "https://api.avalai.ir/v1/chat/completions",
+                "https://openrouter.ai/api/v1/chat/completions",
+            ],
+        )
 
     async def test_a_timeout_moves_on_instead_of_repeating_the_same_request(self):
         """A provider that missed the deadline is left behind, not asked again.
@@ -1068,12 +1147,12 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
         """
         session = FakeSession([asyncio.TimeoutError(), chat_answer("second-answer")])
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
-            result = await complete(session, routed_settings(), system="S", user="U")
+            result = await complete(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(result, "second-answer")
         self.assertEqual(
             [call["url"] for call in session.calls],
             [
-                "https://router.bynara.id/v1/chat/completions",
+                "https://api.avalai.ir/v1/chat/completions",
                 "https://openrouter.ai/api/v1/chat/completions",
             ],
         )
@@ -1083,36 +1162,37 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
         session = FakeSession([asyncio.TimeoutError(), chat_answer("late-answer")])
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
             result = await complete(
-                session, routed_settings(note_providers=("nara",)), system="S", user="U"
+                session, routed_settings(note_providers=("avalai",)), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL",
             )
         self.assertEqual(result, "late-answer")
         self.assertEqual(len(session.calls), 2)
 
     async def test_a_timeout_reports_the_deadline_and_the_knobs(self):
-        # One provider only: the timeout is retried within the bounded budget
-        # and the final failure names the deadline and both knobs.
-        session = FakeSession([asyncio.TimeoutError()] * 3)
-        settings = routed_settings(
-            note_providers=("nara",), note_request_timeout=120.0
-        )
+        # Inspect the bounded provider attempt; dispatch intentionally exposes
+        # only provider names/error classes in the final joined failure.
+        session = FakeSession([asyncio.TimeoutError()] * 2)
+        settings = routed_settings(note_providers=("avalai",), note_request_timeout=120.0)
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
             with self.assertRaises(LLMTransientError) as caught:
-                await complete(session, settings, system="S", user="U")
+                await llm._complete_on_route(note_routes(settings)[0], session, settings, system="S", user="U")
         message = str(caught.exception)
         self.assertIn("120", message)
         self.assertIn("NOTE_REQUEST_TIMEOUT_SECONDS", message)
         self.assertIn("NOTE_MAX_OUTPUT_TOKENS", message)
+        self.assertNotIn("avalai-key", message)
+        self.assertEqual(len(session.calls), 2)
+        self.assertTrue(all(call["timeout"].total == 120.0 for call in session.calls))
 
     async def test_the_configured_deadline_is_used_for_the_request(self):
         session = FakeSession([chat_answer("answer")])
         settings = routed_settings(note_request_timeout=900.0)
-        await complete(session, settings, system="S", user="U")
+        await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(session.calls[0]["timeout"].total, 900.0)
 
     async def test_a_settings_object_without_a_deadline_uses_the_fallback(self):
         session = FakeSession([chat_answer("answer")])
         settings = routed_settings(note_request_timeout=0.0)
-        await complete(session, settings, system="S", user="U")
+        await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(
             session.calls[0]["timeout"].total, llm.LLM_REQUEST_TIMEOUT_SECONDS
         )
@@ -1120,71 +1200,84 @@ class NoteFailoverTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_timeout_in_json_mode_also_moves_on(self):
         session = FakeSession([asyncio.TimeoutError(), chat_answer('{"ok": true}')])
         payload = await complete_json(
-            session, routed_settings(), system="S", user="U"
+            session, routed_settings(), system="S", user="U",
+            data_sensitivity="STANDARD_EDUCATIONAL",
         )
         self.assertEqual(payload, {"ok": True})
-        self.assertEqual(len(session.calls), 2)
+        self.assertEqual([call["url"] for call in session.calls], [
+            "https://api.avalai.ir/v1/chat/completions",
+            "https://openrouter.ai/api/v1/chat/completions",
+        ])
 
-    async def test_json_mode_is_only_sent_where_it_is_documented(self):
+    async def test_json_mode_is_sent_where_it_is_documented(self):
+        """Both OpenAI-compatible approved routes document JSON-object mode."""
         settings = routed_settings(note_json_mode=True)
-        nara, openrouter = note_routes(settings)
-        _url, _headers, nara_payload = _build_request(settings, "S", "U", route=nara)
-        self.assertNotIn("response_format", nara_payload)
+        avalai_route, openrouter = note_routes(settings)
+        _url, _headers, avalai_payload = _build_request(settings, "S", "U", route=avalai_route)
+        self.assertEqual(avalai_payload["response_format"], {"type": "json_object"})
         _url, _headers, router_payload = _build_request(settings, "S", "U", route=openrouter)
         self.assertEqual(router_payload["response_format"], {"type": "json_object"})
 
-    async def test_malformed_json_fails_over_after_one_retry(self):
+    async def test_malformed_json_exhausts_the_chain_once(self):
+        """Malformed JSON from *every* route surfaces the first error class.
+
+        A caller re-asking an unparsable answer never gets a different answer
+        from the *same* provider under the bounded one-attempt policy: each
+        route answers once, the third scripted response is never used, and the
+        failure carries both provider names — never the credential.
+        """
         session = FakeSession([
             chat_answer("not json"),
             chat_answer("still not json"),
             chat_answer('{"ok": true}'),
         ])
-        payload = await complete_json(session, routed_settings(), system="S", user="U")
-        self.assertEqual(payload, {"ok": True})
-        self.assertEqual(len(session.calls), 3)
+        with self.assertRaises(LLMResponseError) as caught:
+            await complete_json(session, routed_settings(), system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
+        message = str(caught.exception)
+        self.assertIn("AvalAI", message)
+        self.assertIn("OpenRouter", message)
+        self.assertNotIn("avalai-key", message)
+        self.assertEqual(len(session.calls), 2)
 
     async def test_nothing_configured_calls_no_provider(self):
         settings = make_settings(
-            note_providers=("nara", "openrouter"),
+            note_providers=("avalai", "openrouter"),
             note_provider="",
             note_api_key="",
             note_api_base_url="",
         )
         session = FakeSession([])
         with self.assertRaises(LLMAuthError):
-            await complete(session, settings, system="S", user="U")
+            await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(session.calls, [])
 
 
 class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
-    """Hardened GET/POST contracts for NaraRouter, OpenRouter and Gemini."""
+    """Hardened GET/POST contracts for AvalAI, OpenRouter and Gemini."""
 
     def test_get_request_building_across_providers(self):
         settings = make_settings(
-            note_providers=("nara", "openrouter", "gemini"),
+            note_providers=("avalai", "openrouter", "gemini"),
             note_provider="",
             note_api_key="",
             note_api_base_url="",
-            nara_api_key="Bearer sk-nry-123",
+            avalai_api_key="Bearer sk-avalai-123",
             openrouter_api_key="sk-or-v1-456",
             gemini_api_key="AIzaSyGem789",
         )
-        nara, openrouter, gemini = note_routes(settings)
+        by_slug = {route.slug: route for route in note_routes(settings)}
+        avalai_route, openrouter, gemini = (by_slug[slug] for slug in ("avalai", "openrouter", "gemini"))
 
-        # NaraRouter GET /v1/models and public GET /api/plans
-        nara_models_url, nara_headers = llm._build_get_request_for(nara, "models")
-        self.assertEqual(nara_models_url, "https://router.bynara.id/v1/models")
-        self.assertEqual(nara_headers, {"Authorization": "Bearer sk-nry-123"})
-
-        nara_plans_url, nara_plans_headers = llm._build_get_request_for(nara, "plans")
-        self.assertEqual(nara_plans_url, "https://router.bynara.id/api/plans")
-        self.assertEqual(nara_plans_headers, {})
+        # AvalAI's documented main API metadata, with its own credential.
+        avalai_models_url, avalai_headers = llm._build_get_request_for(avalai_route, "models")
+        self.assertEqual(avalai_models_url, "https://api.avalai.ir/v1/models")
+        self.assertEqual(avalai_headers, {"Authorization": "Bearer sk-avalai-123"})
 
         # OpenRouter GET /api/v1/models/<author>/<slug>/endpoints and /api/v1/key
         or_ep_url, or_headers = llm._build_get_request_for(openrouter, "model_endpoints")
         self.assertEqual(
             or_ep_url,
-            "https://openrouter.ai/api/v1/models/google/gemma-4-31b-it:free/endpoints",
+            "https://openrouter.ai/api/v1/models/nvidia/nemotron-3.5-super-vl:free/endpoints",
         )
         self.assertEqual(or_headers, {"Authorization": "Bearer sk-or-v1-456"})
 
@@ -1208,17 +1301,17 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_get_json_retries_transient_failure_and_parses_payload(self):
         settings = routed_settings()
-        nara = note_routes(settings)[0]
+        avalai_route = note_routes(settings)[0]
         session = FakeSession([
             FakeResponse(503, {"error": {"type": "service_unavailable", "message": "busy"}}),
-            FakeResponse(200, {"data": [{"id": "agnes-2.5-flash"}]}),
+            FakeResponse(200, {"data": [{"id": "deepseek-v4.1-flash"}]}),
         ])
         with mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
-            payload = await llm.get_json(session, nara, "models")
-        self.assertEqual(payload["data"][0]["id"], "agnes-2.5-flash")
+            payload = await llm.get_json(session, avalai_route, "models")
+        self.assertEqual(payload["data"][0]["id"], "deepseek-v4.1-flash")
         self.assertEqual(len(session.calls), 2)
         self.assertEqual(session.calls[0]["method"], "GET")
-        self.assertEqual(session.calls[0]["url"], "https://router.bynara.id/v1/models")
+        self.assertEqual(session.calls[0]["url"], "https://api.avalai.ir/v1/models")
         self.assertEqual(
             session.calls[0]["timeout"].sock_connect,
             llm.LLM_CONNECT_TIMEOUT_SECONDS,
@@ -1232,14 +1325,14 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
             delays.append(delay)
 
         settings = routed_settings()
-        nara = note_routes(settings)[0]
+        avalai_route = note_routes(settings)[0]
         session = FakeSession([
             FakeResponse(503, {"error": {"message": "busy"}}, headers={"Retry-After": "3600"}),
-            FakeResponse(200, {"data": [{"id": "agnes-2.5-flash"}]}),
+            FakeResponse(200, {"data": [{"id": "deepseek-v4.1-flash"}]}),
         ])
         with mock.patch("asyncio.sleep", new=record_sleep):
-            payload = await llm.get_json(session, nara, "models")
-        self.assertEqual(payload["data"][0]["id"], "agnes-2.5-flash")
+            payload = await llm.get_json(session, avalai_route, "models")
+        self.assertEqual(payload["data"][0]["id"], "deepseek-v4.1-flash")
         self.assertEqual(delays, [llm.MAX_LLM_RETRY_AFTER_SECONDS])
 
     async def test_openrouter_http_200_top_level_in_body_error_is_classified(self):
@@ -1452,31 +1545,38 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
             }),
             chat_answer('{"ok": true}'),
         ])
-        result = await complete_json(session, settings, system="S", user="U")
+        result = await complete_json(
+            session, settings, system="S", user="U",
+            data_sensitivity="STANDARD_EDUCATIONAL",
+        )
         self.assertEqual(result, {"ok": True})
         self.assertEqual(len(session.calls), 2)
         self.assertNotIn("response_format", session.calls[1]["json"])
 
-    def test_probe_script_checks_nara_openrouter_and_gemini(self):
+    def test_probe_script_checks_avalai_openrouter_and_gemini(self):
         from scripts import probe_note_providers as probe
 
         settings = make_settings(
-            note_providers=("nara", "openrouter", "gemini"),
+            note_providers=("avalai", "openrouter", "gemini"),
             note_provider="",
             note_api_key="",
             note_api_base_url="",
-            nara_api_key="nara-secret",
+            avalai_api_key="avalai-secret",
             openrouter_api_key="or-secret",
             gemini_api_key="gem-secret",
         )
-        nara, openrouter, gemini = note_routes(settings)
+        by_slug = {route.slug: route for route in note_routes(settings)}
+        avalai, openrouter, gemini = (by_slug[s] for s in ("avalai", "openrouter", "gemini"))
 
         with mock.patch.object(
             probe,
             "_get_json",
-            return_value=(200, {"data": [{"id": "agnes-2.5-flash", "reasoning": True}]}),
-        ):
-            self.assertTrue(probe._check_nara(nara))
+            return_value=(200, {"data": [{"id": "deepseek-v4.1-flash", "reasoning": True}]}),
+        ) as metadata:
+            self.assertTrue(probe._check_avalai(avalai))
+        metadata.assert_called_once_with(
+            "https://api.avalai.ir/v1/models", "avalai-secret", headers={"Authorization": "Bearer avalai-secret"}
+        )
 
         with mock.patch.object(
             probe,
@@ -1493,21 +1593,30 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
                     "free_model_daily_requests": {"used": 1, "limit": 50, "remaining": 49},
                 }}),
             ],
-        ):
+        ) as metadata:
             self.assertTrue(probe._check_openrouter(openrouter))
+        self.assertEqual([c.args[0] for c in metadata.call_args_list], [
+            "https://openrouter.ai/api/v1/models/nvidia/nemotron-3.5-super-vl:free/endpoints",
+            "https://openrouter.ai/api/v1/key",
+        ])
+        self.assertTrue(all(c.kwargs["headers"]["Authorization"] == "Bearer or-secret" for c in metadata.call_args_list))
 
         with mock.patch.object(
             probe,
             "_get_json",
             return_value=(200, {
-                "name": "models/gemini-2.5-flash",
+                "name": "models/gemini-3.5-flash-lite",
                 "inputTokenLimit": 1048576,
                 "outputTokenLimit": 65536,
                 "supportedGenerationMethods": ["generateContent", "countTokens"],
                 "thinking": True,
             }),
-        ):
+        ) as metadata:
             self.assertTrue(probe._check_gemini(gemini))
+        metadata.assert_called_once_with(
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite",
+            "gem-secret", headers={"x-goog-api-key": "gem-secret"},
+        )
 
     def test_smoke_avalai_reports_a_missing_key_without_a_network_call(self):
         """The smoke script's first stage is configuration, never a request."""
@@ -1635,7 +1744,7 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
         from scripts import probe_note_providers as probe
 
         settings = make_settings(note_context_tokens=8192, note_max_output_tokens=8192)
-        route = note_routes(make_settings())[0]
+        route = note_routes(make_settings(avalai_api_key="avalai-test-key"))[0]
         self.assertFalse(await probe._generate(route, settings, "متن آزمایشی"))
 
     async def test_null_error_envelope_on_200_does_not_trigger_false_positive(self):
@@ -1645,7 +1754,7 @@ class OpenRouterAndGeminiHardeningTests(unittest.IsolatedAsyncioTestCase):
                 "choices": [{"message": {"content": "clean answer"}, "finish_reason": "stop"}],
             })
         ])
-        result = await complete(session, make_settings(), system="S", user="U")
+        result = await complete(session, make_settings(avalai_api_key="avalai-test-key"), system="S", user="U")
         self.assertEqual(result, "clean answer")
 
     def test_openai_refusal_and_content_filter_without_message_raise_response_error(self):

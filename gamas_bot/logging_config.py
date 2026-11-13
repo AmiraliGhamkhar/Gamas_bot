@@ -98,9 +98,9 @@ def collect_configured_secrets(settings: Settings | None) -> tuple[str, ...]:
                 settings.deepgram_api_key,
                 settings.stt_openai_api_key,
                 settings.note_api_key,
-                settings.nara_api_key,
                 settings.openrouter_api_key,
                 settings.gemini_api_key,
+                settings.avalai_api_key,
             ]
         )
     else:
@@ -111,9 +111,9 @@ def collect_configured_secrets(settings: Settings | None) -> tuple[str, ...]:
             "DEEPGRAM_API_KEY",
             "STT_OPENAI_API_KEY",
             "NOTE_API_KEY",
-            "NARA_API_KEY",
             "OPENROUTER_API_KEY",
             "GEMINI_API_KEY",
+            "AVALAI_API_KEY",
         ):
             raw = os.environ.get(env_key, "").strip()
             if raw:

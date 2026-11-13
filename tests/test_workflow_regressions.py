@@ -317,8 +317,7 @@ class WorkflowBotTests(BotPipelineTestCase):
         event = self.media_event()
         self.bot.settings = replace(
             self.settings,
-            note_api_key="note-key",
-            note_api_base_url="https://note.example/v1",
+            avalai_api_key="note-key",
         )
         with (
             mock.patch.object(self.bot, "_generate_notes", new=mock.AsyncMock(return_value=None)),

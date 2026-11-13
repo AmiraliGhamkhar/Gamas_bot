@@ -148,8 +148,10 @@ class OpenClosedRegistryTests(unittest.IsolatedAsyncioTestCase):
             dialect = _CustomDialect()
             self.assertIsInstance(dialect, LLMProviderDialect)
             llm.register_llm_dialect(dialect)
+            # An approved slug may carry an experimental style for a request
+            # shape experiment; this does not introduce another provider slug.
             route = NoteRoute(
-                slug="custom",
+                slug="avalai",
                 label="Custom",
                 style="custom_wire",
                 base_url="https://llm.example.test/v1",
@@ -305,28 +307,42 @@ class ProviderProfileProtocolTests(unittest.TestCase):
                 self.assertIsInstance(profile, LLMProviderProfileProtocol)
 
     def test_register_provider_profile_extends_registry_without_modifying_dialects(self) -> None:
+        """Registering one *approved* provider's profile never touches dialects."""
         custom = ProviderCapabilityProfile(
-            slug="custom_test_gateway",
+            slug="avalai",
             max_output_tokens_cap=4096,
             documented_stream_options=False,
         )
+        original = PROVIDER_PROFILES.get("avalai")
         try:
             register_provider_profile(custom)
-            self.assertIs(get_provider_profile("custom_test_gateway"), custom)
+            self.assertIs(get_provider_profile("avalai"), custom)
             route = NoteRoute(
-                slug="custom_test_gateway",
-                label="Custom",
-                base_url="https://custom.example/v1",
+                slug="avalai",
+                label="AvalAI",
+                style="openai",
+                base_url="https://api.avalai.ir/v1",
                 api_key="k",
                 model="custom-model",
-                style="openai",
                 json_object_mode=True,
             )
             settings = make_settings(note_max_output_tokens=16384, note_ttfb_timeout=0.0)
             _url, _headers, payload = llm._build_request_for(route, settings, "S", "U")
             self.assertEqual(payload["max_tokens"], 4096)
+            # The dialect registry stays untouched by profile registration.
+            self.assertIn("openai", llm.DIALECTS)
         finally:
-            PROVIDER_PROFILES.pop("custom_test_gateway", None)
+            if original is not None:
+                PROVIDER_PROFILES["avalai"] = original
+            else:
+                PROVIDER_PROFILES.pop("avalai", None)
+
+    def test_unapproved_provider_profiles_fail_closed(self) -> None:
+        """A slug outside the allowlist can never register or resolve a profile."""
+        with self.assertRaises(ValueError):
+            register_provider_profile(ProviderCapabilityProfile(slug="custom_test_gateway"))
+        with self.assertRaises(ValueError):
+            get_provider_profile("nara")
 
 
 if __name__ == "__main__":

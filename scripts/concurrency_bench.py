@@ -186,7 +186,7 @@ class _ClusterSimulator:
                     },
                     ensure_ascii=False,
                 )
-                if "router.bynara.id" in url:
+                if "api.avalai.ir" in url:
                     cluster.counts["llm1_requests"] += 1
                     if cluster.llm1_active >= cluster.llm1_limit:
                         cluster.counts["llm1_429"] += 1
@@ -201,10 +201,15 @@ class _ClusterSimulator:
                         cluster.counts["llm1_ok"] += 1
                     finally:
                         cluster.llm1_active -= 1
-                else:
+                elif "generativelanguage.googleapis.com" in url:
                     cluster.counts["llm2_requests"] += 1
                     await asyncio.sleep(cluster.llm2_latency)
                     cluster.counts["llm2_ok"] += 1
+                    return _UpstreamResponse(200, {
+                        "candidates": [{"content": {"parts": [{"text": notes_body}]}, "finishReason": "STOP"}],
+                    })
+                else:
+                    raise AssertionError("Unexpected provider in offline benchmark")
                 return _UpstreamResponse(
                     200,
                     {
@@ -256,17 +261,20 @@ async def run_full_pipeline_benchmark(
             deepgram_api_key="bench-dg",
             speechmatics_max_in_flight=speechmatics_slots,
             deepgram_max_in_flight=deepgram_slots,
-            note_providers=("nara", "openrouter"),
-            nara_api_key="bench-nara",
-            nara_base_url="https://router.bynara.id/v1",
-            nara_model="openai/gpt-4o-mini",
-            openrouter_api_key="bench-or",
-            openrouter_base_url="https://openrouter.ai/api/v1",
-            openrouter_model="google/gemini-2.5-flash-lite",
+            # UNKNOWN-sensitivity synthetic booklets overflow to Gemini, not
+            # OpenRouter Free. These account caps are simulator inputs only.
+            note_providers=("avalai", "gemini"),
+            avalai_api_key="bench-avalai",
+            avalai_base_url="https://api.avalai.ir/v1",
+            avalai_model="deepseek-v4.1-flash",
+            gemini_api_key="bench-gemini",
+            gemini_model="gemini-3.5-flash-lite",
             note_hedge_after=0.0,
             note_compile=False,
             llm_primary_max_in_flight=llm_primary_slots,
             llm_fallback_max_in_flight=llm_fallback_slots,
+            avalai_max_in_flight=llm_primary_slots,
+            gemini_max_in_flight=llm_fallback_slots,
             max_active_jobs=max_active_jobs,
             max_queued_jobs=max(8, num_jobs),
             max_concurrent_downloads=max_downloads,
@@ -447,22 +455,26 @@ async def run_burst_provider_benchmark(num_jobs: int = 8) -> dict[str, object]:
         audio = Path(tmp) / "burst.wav"
         _write_synthetic_wav(audio, seconds=1.0)
         settings = make_settings(
+            db_path=Path(tmp) / "quota.sqlite3",
             stt_providers=("speechmatics", "deepgram"),
             speechmatics_api_key="bench-sm",
             deepgram_api_key="bench-dg",
             speechmatics_max_in_flight=2,
             deepgram_max_in_flight=6,
-            note_providers=("nara", "openrouter"),
-            nara_api_key="bench-nara",
-            nara_base_url="https://router.bynara.id/v1",
-            nara_model="openai/gpt-4o-mini",
-            openrouter_api_key="bench-or",
-            openrouter_base_url="https://openrouter.ai/api/v1",
-            openrouter_model="google/gemini-2.5-flash-lite",
+            # UNKNOWN-sensitivity synthetic booklets overflow to Gemini, not
+            # OpenRouter Free. These account caps are simulator inputs only.
+            note_providers=("avalai", "gemini"),
+            avalai_api_key="bench-avalai",
+            avalai_base_url="https://api.avalai.ir/v1",
+            avalai_model="deepseek-v4.1-flash",
+            gemini_api_key="bench-gemini",
+            gemini_model="gemini-3.5-flash-lite",
             note_hedge_after=0.0,
             note_compile=False,
             llm_primary_max_in_flight=2,
             llm_fallback_max_in_flight=6,
+            avalai_max_in_flight=2,
+            gemini_max_in_flight=6,
         )
         orig_sm = stt.PROVIDERS["speechmatics"]
         orig_dg = stt.PROVIDERS["deepgram"]
@@ -523,8 +535,8 @@ async def _amain() -> None:
             max_uploads=2,
             speechmatics_slots=2,
             deepgram_slots=4,
-            llm_primary_slots=4,
-            llm_fallback_slots=4,
+            llm_primary_slots=3,
+            llm_fallback_slots=1,
         )
     if args.profile in ("all", "high_concurrency"):
         results["AFTER_STAGE_COORDINATED_MAX_ACTIVE_6"] = await run_full_pipeline_benchmark(

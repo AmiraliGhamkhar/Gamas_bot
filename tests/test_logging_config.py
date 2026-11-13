@@ -10,6 +10,7 @@ from pathlib import Path
 import stat
 import tempfile
 import unittest
+from unittest import mock
 
 from gamas_bot.logging_config import (
      configure_logging,
@@ -139,6 +140,23 @@ class LoggingConfigTests(unittest.TestCase):
             parsed = json.loads(raw.splitlines()[-1])
             self.assertEqual(parsed["level"], "ERROR")
             self.assertEqual(parsed["job_id"], "-")
+
+    def test_all_approved_llm_keys_are_redacted_during_bootstrap_and_runtime(self) -> None:
+        keys = {"AVALAI_API_KEY": "synthetic-avalai-secret", "GEMINI_API_KEY": "synthetic-gemini-secret",
+                "OPENROUTER_API_KEY": "synthetic-openrouter-secret"}
+        for bootstrap in (True, False):
+            with self.subTest(bootstrap=bootstrap), mock.patch.dict(os.environ, keys, clear=True):
+                settings = None if bootstrap else make_settings(
+                    log_file=None, avalai_api_key=keys["AVALAI_API_KEY"],
+                    gemini_api_key=keys["GEMINI_API_KEY"], openrouter_api_key=keys["OPENROUTER_API_KEY"],
+                )
+                buf = io.StringIO()
+                configure_logging(settings, stream=buf)
+                logging.getLogger("gamas_bot.scrub_test").warning("synthetic echo %s", " ".join(keys.values()))
+                output = buf.getvalue()
+                for value in keys.values():
+                    self.assertNotIn(value, output)
+                self.assertIn("[REDACTED]", output)
 
     def test_log_job_id_context_injects_and_restores_tag(self) -> None:
         buf = io.StringIO()

@@ -132,6 +132,7 @@ class _LearningFixture(unittest.IsolatedAsyncioTestCase):
         root = Path(self._tmp.name)
         self.settings = make_settings(
             db_path=root / "learning.db",
+            avalai_api_key="avalai-test-key",  # mocked generation fixture
             temp_dir=root / "tmp",
             flashcard_ai_cost_seconds=300,
             flashcard_ai_deck_size=6,

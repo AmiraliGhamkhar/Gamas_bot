@@ -13,18 +13,13 @@ from gamas_bot.config import (
     DEFAULT_GEMINI_THINKING_BUDGET,
     DEFAULT_NOTE_CHUNK_CHARS,
     DEFAULT_NOTE_CONTEXT_TOKENS,
-    DEFAULT_NOTE_MODELS,
     DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_OPENROUTER_MODEL,
     DEFAULT_STT_PROVIDERS,
-    NOTE_BASE_URL_DEFAULTS,
-    NOTE_HOST_PROVIDERS,
     NOTE_JSON_OBJECT_PROVIDERS,
     NOTE_PROVIDER_LABELS,
-    NOTE_PROVIDER_SLUGS,
     NOTE_REQUEST_STYLE,
     PLAN_ENV_FIELDS,
-    REMOVED_NOTE_PROVIDERS,
     Settings,
     check,
     classify_note_provider,
@@ -95,14 +90,17 @@ class FromEnvTests(unittest.TestCase):
         self.assertEqual(settings.note_api_key, "g-key")
         self.assertEqual(settings.note_model, DEFAULT_GEMINI_MODEL)
 
-    def test_keyless_custom_base_url_is_rejected(self):
+    def test_keyless_custom_base_url_is_ignored_without_lending_gemini_key(self):
         with mock.patch.dict(
             os.environ,
             {"GEMINI_API_KEY": "legacy-key", "NOTE_BASE_URL": "https://local.example/v1"},
             clear=True,
         ):
-            with self.assertRaisesRegex(ValueError, "Unapproved legacy"):
-                from_env(env_file="/nonexistent")
+            settings = from_env(env_file="/nonexistent")
+        self.assertEqual(settings.note_api_key, "")
+        self.assertEqual(settings.note_api_base_url, "")
+        self.assertEqual([r.slug for r in note_routes(settings)], ["gemini"])
+        self.assertEqual(note_routes(settings)[0].api_key, "legacy-key")
 
     def test_default_deepgram_model_can_transcribe_persian(self):
         """Persian is a Nova-3 language; Nova-2 has no Persian pack."""
@@ -213,9 +211,9 @@ def note_env(**values):
     return base
 
 
-@unittest.skip("Legacy provider-order assertions superseded by the approved-provider policy tests")
-class NoteProviderOrderTests(unittest.TestCase):
-    """``NOTE_PROVIDERS`` is the note failover policy, and it is testable."""
+class NoteChainPolicyTests(unittest.TestCase):
+    """``NOTE_PROVIDERS`` is the note failover policy over the approved
+    allowlist, and it is testable from the environment alone."""
 
     def settings(self, **values):
         with mock.patch.dict(os.environ, note_env(**values), clear=True):
@@ -225,28 +223,23 @@ class NoteProviderOrderTests(unittest.TestCase):
     def slugs(settings):
         return [route.slug for route in note_routes(settings)]
 
-    def test_default_order_is_the_fast_preset(self):
-        """Gemini flash-lite first, then Nara and OpenRouter."""
+    def test_default_order_and_per_provider_credentials(self):
+        """AvalAI first, then Gemini, then OpenRouter as the last fallback."""
         settings = self.settings(
+            AVALAI_API_KEY="av",
             GEMINI_API_KEY="g",
-            NARA_API_KEY="nara",
             OPENROUTER_API_KEY="or",
         )
         routes = note_routes(settings)
-        self.assertEqual(
-            self.slugs(settings),
-            ["gemini", "nara", "openrouter"],
-        )
-        self.assertEqual(tuple(settings.note_providers), (
-            "gemini", "nara", "openrouter", "deepseek", "avalai",
-        ))
+        self.assertEqual(self.slugs(settings), ["avalai", "gemini", "openrouter"])
+        self.assertEqual(tuple(settings.note_providers), ("avalai", "gemini", "openrouter"))
         # Each provider keeps its own documented base URL and model.
-        self.assertEqual(routes[0].base_url, "https://generativelanguage.googleapis.com/v1beta")
-        self.assertEqual(routes[0].model, DEFAULT_GEMINI_MODEL)
-        self.assertEqual(routes[1].base_url, "https://router.bynara.id/v1")
-        self.assertEqual(routes[1].model, "agnes-2.5-flash")
+        self.assertEqual(routes[0].base_url, "https://api.avalai.ir/v1")
+        self.assertEqual(routes[0].model, "deepseek-v4.1-flash")
+        self.assertEqual(routes[1].base_url, "https://generativelanguage.googleapis.com/v1beta")
+        self.assertEqual(routes[1].model, DEFAULT_GEMINI_MODEL)
         self.assertEqual(routes[2].base_url, "https://openrouter.ai/api/v1")
-        self.assertEqual(routes[2].model, "google/gemma-4-31b-it:free")
+        self.assertEqual(routes[2].model, DEFAULT_OPENROUTER_MODEL)
         self.assertTrue(settings.note_configured)
         # No *fatal* problems: a Speechmatics-only env legitimately earns
         # the capacity-coherence advisory (2 slots < 3 active jobs).
@@ -255,58 +248,61 @@ class NoteProviderOrderTests(unittest.TestCase):
         )
 
     def test_the_default_chain_degrades_to_the_credentialed_legs(self):
-        """A deployment with only the old keys keeps exactly its old legs."""
-        settings = self.settings(NARA_API_KEY="nara", OPENROUTER_API_KEY="or")
-        self.assertEqual(self.slugs(settings), ["nara", "openrouter"])
+        """Only the credentialed approved legs are ever attempted."""
+        settings = self.settings(AVALAI_API_KEY="av", OPENROUTER_API_KEY="or")
+        self.assertEqual(self.slugs(settings), ["avalai", "openrouter"])
 
     def test_a_missing_key_is_not_a_configured_provider(self):
-        settings = self.settings(NARA_API_KEY="nara")
-        self.assertEqual(self.slugs(settings), ["nara"])
+        settings = self.settings(AVALAI_API_KEY="av")
+        self.assertEqual(self.slugs(settings), ["avalai"])
         self.assertFalse(settings.openrouter_configured)
 
-    def test_the_configured_order_is_the_attempted_order(self):
+    def test_openrouter_stays_last_even_when_listed_first(self):
         settings = self.settings(
-            NOTE_PROVIDERS="openrouter, nara", NARA_API_KEY="n", OPENROUTER_API_KEY="o"
+            NOTE_PROVIDERS="openrouter, avalai",
+            AVALAI_API_KEY="a",
+            OPENROUTER_API_KEY="o",
         )
-        self.assertEqual(self.slugs(settings), ["openrouter", "nara"])
+        self.assertEqual(self.slugs(settings), ["avalai", "openrouter"])
 
     def test_unknown_provider_slugs_are_ignored(self):
-        settings = self.settings(NOTE_PROVIDERS="nara,bogus,openrouter")
-        self.assertEqual(settings.note_providers, ("nara", "openrouter"))
+        settings = self.settings(
+            NOTE_PROVIDERS="avalai,bogus,openrouter",
+            AVALAI_API_KEY="a",
+            OPENROUTER_API_KEY="o",
+        )
+        self.assertEqual(settings.note_providers, ("avalai", "openrouter"))
 
-    def test_a_legacy_nararouter_slot_is_the_nara_leg(self):
-        """The production v2 deployment stays Nara-first, with no duplicate leg."""
+    def test_a_redeployed_note_slot_on_a_removed_host_is_ignored(self):
         settings = self.settings(
             NOTE_API_KEY="legacy-key",
             NOTE_BASE_URL="https://router.bynara.id/v1",
-            OPENROUTER_API_KEY="or",
+            AVALAI_API_KEY="av",
         )
-        self.assertEqual(settings.note_provider, "nara")
-        routes = note_routes(settings)
-        self.assertEqual([route.slug for route in routes], ["nara", "openrouter"])
-        self.assertEqual(routes[0].api_key, "legacy-key")
-        # The model default follows the classified provider, not the generic one.
-        self.assertEqual(routes[0].model, "agnes-2.5-flash")
+        self.assertEqual(self.slugs(settings), ["avalai"])
+        self.assertEqual(note_routes(settings)[0].api_key, "av")
+        self.assertEqual(settings.note_api_key, "")
+        self.assertEqual(settings.note_api_base_url, "")
 
     def test_bearer_prefix_and_endpoint_suffix_are_normalized(self):
         settings = self.settings(
-            NARA_API_KEY="Bearer sk-nry-test",
-            NARA_BASE_URL="https://router.bynara.web.id/v1/chat/completions",
+            AVALAI_API_KEY="Bearer av-test",
+            AVALAI_BASE_URL="https://api.avalai.ir/v1/chat/completions",
             OPENROUTER_API_KEY="bearer sk-or-v1-test",
             OPENROUTER_BASE_URL="https://openrouter.ai",
             GEMINI_API_KEY="Bearer AIzaSyTestKey1234567890",
-            NOTE_PROVIDERS="nara,openrouter,gemini",
+            NOTE_PROVIDERS="avalai,openrouter,gemini",
         )
         routes = note_routes(settings)
-        self.assertEqual([r.slug for r in routes], ["nara", "openrouter", "gemini"])
-        self.assertEqual(routes[0].api_key, "sk-nry-test")
-        self.assertEqual(routes[0].base_url, "https://router.bynara.web.id/v1")
-        self.assertEqual(routes[1].api_key, "sk-or-v1-test")
-        self.assertEqual(routes[1].base_url, "https://openrouter.ai/api/v1")
-        self.assertEqual(routes[2].api_key, "AIzaSyTestKey1234567890")
-        self.assertEqual(routes[2].base_url, "https://generativelanguage.googleapis.com/v1beta")
+        self.assertEqual([r.slug for r in routes], ["avalai", "gemini", "openrouter"])
+        self.assertEqual(routes[0].api_key, "av-test")
+        self.assertEqual(routes[0].base_url, "https://api.avalai.ir/v1")
+        self.assertEqual(routes[1].api_key, "AIzaSyTestKey1234567890")
+        self.assertEqual(routes[1].base_url, "https://generativelanguage.googleapis.com/v1beta")
+        self.assertEqual(routes[2].api_key, "sk-or-v1-test")
+        self.assertEqual(routes[2].base_url, "https://openrouter.ai/api/v1")
 
-    def test_google_ai_studio_native_vs_openai_compat_classification(self):
+    def test_google_ai_studio_native_vs_mem_openai_compat_classification(self):
         native = self.settings(
             NOTE_API_KEY="g-key",
             NOTE_BASE_URL="https://generativelanguage.googleapis.com/v1beta/models",
@@ -314,55 +310,56 @@ class NoteProviderOrderTests(unittest.TestCase):
         self.assertEqual(native.note_provider, "gemini")
         self.assertEqual(native.note_api_base_url, "https://generativelanguage.googleapis.com/v1beta")
 
-        compat = self.settings(
+        # Only Google's native API is an approved note route. A stale
+        # compatibility slot is ignored, never turned into another provider.
+        unsupported = self.settings(
             NOTE_API_KEY="g-key",
             NOTE_BASE_URL="https://generativelanguage.googleapis.com/v1beta/openai",
         )
-        self.assertEqual(compat.note_provider, "openai_compatible")
-        self.assertEqual(
-            compat.note_api_base_url,
-            "https://generativelanguage.googleapis.com/v1beta/openai",
-        )
-
-    def test_an_explicit_gateway_is_tried_after_the_chain(self):
-        settings = self.settings(
-            NARA_API_KEY="n",
-            NOTE_PROVIDER="openai_compatible",
-            NOTE_API_KEY="k",
-            NOTE_BASE_URL="https://local.example/v1",
-        )
-        self.assertEqual(self.slugs(settings), ["nara", "openai_compatible"])
+        self.assertEqual(self.slugs(unsupported), [])
+        self.assertEqual(unsupported.note_api_key, "")
 
     def test_one_credential_never_serves_two_providers(self):
-        settings = self.settings(NOTE_PROVIDERS="nara,openrouter,gemini", NARA_API_KEY="n")
-        self.assertEqual(self.slugs(settings), ["nara"])
+        settings = self.settings(NOTE_PROVIDERS="avalai,openrouter,gemini", AVALAI_API_KEY="a")
+        self.assertEqual(self.slugs(settings), ["avalai"])
 
     def test_gemini_can_be_a_fallback_with_its_own_key(self):
         settings = self.settings(
-            NOTE_PROVIDERS="nara,gemini", NARA_API_KEY="n", GEMINI_API_KEY="g"
+            NOTE_PROVIDERS="avalai,gemini", AVALAI_API_KEY="a", GEMINI_API_KEY="g"
         )
         routes = note_routes(settings)
-        self.assertEqual(self.slugs(settings), ["nara", "gemini"])
+        self.assertEqual(self.slugs(settings), ["avalai", "gemini"])
         self.assertEqual(routes[1].api_key, "g")
         self.assertEqual(routes[1].model, DEFAULT_GEMINI_MODEL)
 
-    def test_a_dedicated_key_does_not_auto_select_gemini_outside_the_chain(self):
-        """Only a listed slug is attempted: an explicit chain stays explicit."""
+    def test_a_dedicated_gemini_key_serves_only_when_listed(self):
+        """A credentialed Gemini joins the chain only when NOTE_PROVIDERS lists it."""
+        for avalai_key, expected in (("a", ["avalai"]), ("", [])):
+            with self.subTest(avalai_configured=bool(avalai_key)):
+                settings = self.settings(
+                    NOTE_PROVIDERS="avalai", GEMINI_API_KEY="g", AVALAI_API_KEY=avalai_key
+                )
+                self.assertEqual(self.slugs(settings), expected)
+
+    def test_openrouter_is_never_promoted_by_ordering_preferences(self):
+        """Even when listed first, OpenRouter stays the emergency fallback."""
         settings = self.settings(
-            NOTE_PROVIDERS="nara", GEMINI_API_KEY="g", NARA_API_KEY="n"
+            NOTE_PROVIDERS="openrouter", OPENROUTER_API_KEY="or", AVALAI_API_KEY="av"
         )
-        self.assertEqual(self.slugs(settings), ["nara"])
+        self.assertEqual(self.slugs(settings), ["openrouter"])
+        settings = self.settings(
+            NOTE_PROVIDERS="openrouter,avalai", OPENROUTER_API_KEY="or", AVALAI_API_KEY="av"
+        )
+        self.assertEqual(self.slugs(settings), ["avalai", "openrouter"])
 
     def test_default_window_chunk_and_models_are_the_matched_pair(self):
-        """The default sizing assumes the matched 262K served windows.
+        """The default sizing assumes the matched served windows.
 
-        Both default models serve 262,144 tokens; the operational assumption
-        is half of that, and the output budget stays within both models'
-        documented completion caps (32,768 OpenRouter / 65.5K Agnes).
+        Reference model capabilities are not operating budgets. The shipped
+        context/chunk/output sizes stay conservative even for larger models.
         """
-        settings = self.settings(NARA_API_KEY="nara", OPENROUTER_API_KEY="or")
+        settings = self.settings(AVALAI_API_KEY="av", OPENROUTER_API_KEY="or")
         self.assertEqual(settings.openrouter_model, DEFAULT_OPENROUTER_MODEL)
-        self.assertEqual(settings.openrouter_model, "google/gemma-4-31b-it:free")
         self.assertEqual(settings.note_context_tokens, DEFAULT_NOTE_CONTEXT_TOKENS)
         self.assertEqual(settings.note_context_tokens, 131072)
         self.assertEqual(settings.note_chunk_chars, DEFAULT_NOTE_CHUNK_CHARS)
@@ -375,19 +372,19 @@ class NoteProviderOrderTests(unittest.TestCase):
 
     def test_compile_cap_and_reasoning_effort_from_env(self):
         settings = self.settings(
-            NARA_API_KEY="n", NOTE_COMPILE_MAX_CHARS="90000", NOTE_REASONING_EFFORT="low"
+            AVALAI_API_KEY="a", NOTE_COMPILE_MAX_CHARS="90000", NOTE_REASONING_EFFORT="low"
         )
         self.assertEqual(settings.note_compile_max_chars, 90000)
         self.assertEqual(settings.note_reasoning_effort, "low")
 
     def test_the_request_deadline_is_configurable(self):
-        settings = self.settings(NARA_API_KEY="n")
+        settings = self.settings(AVALAI_API_KEY="a")
         self.assertEqual(settings.note_request_timeout, 900.0)
         self.assertEqual(settings.note_request_timeout, DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS)
-        settings = self.settings(NARA_API_KEY="n", NOTE_REQUEST_TIMEOUT_SECONDS="600")
+        settings = self.settings(AVALAI_API_KEY="a", NOTE_REQUEST_TIMEOUT_SECONDS="600")
         self.assertEqual(settings.note_request_timeout, 600.0)
         # The deadline is bounded: a note request never runs for hours.
-        settings = self.settings(NARA_API_KEY="n", NOTE_REQUEST_TIMEOUT_SECONDS="99999")
+        settings = self.settings(AVALAI_API_KEY="a", NOTE_REQUEST_TIMEOUT_SECONDS="99999")
         self.assertEqual(settings.note_request_timeout, 3600.0)
 
     def test_an_output_budget_that_cannot_finish_in_time_is_advisory(self):
@@ -395,7 +392,7 @@ class NoteProviderOrderTests(unittest.TestCase):
         whether it finishes: a 16K output budget cannot be produced inside a
         300 s deadline on a slow gateway, and that is worth warning about."""
         settings = self.settings(
-            NARA_API_KEY="n",
+            AVALAI_API_KEY="a",
             NOTE_MAX_OUTPUT_TOKENS="16384",
             NOTE_REQUEST_TIMEOUT_SECONDS="300",
         )
@@ -411,7 +408,7 @@ class NoteProviderOrderTests(unittest.TestCase):
 
     def test_a_generous_deadline_is_not_reported(self):
         settings = self.settings(
-            NARA_API_KEY="n",
+            AVALAI_API_KEY="a",
             NOTE_MAX_OUTPUT_TOKENS="16384",
             NOTE_REQUEST_TIMEOUT_SECONDS="900",
         )
@@ -432,7 +429,7 @@ class NoteProviderOrderTests(unittest.TestCase):
 
     def test_a_tight_context_window_is_reported_as_advisory(self):
         settings = self.settings(
-            NARA_API_KEY="n", NOTE_CONTEXT_TOKENS="8000", NOTE_MAX_OUTPUT_TOKENS="6000"
+            AVALAI_API_KEY="a", NOTE_CONTEXT_TOKENS="8000", NOTE_MAX_OUTPUT_TOKENS="6000"
         )
         problems = check(settings)
         self.assertTrue(
@@ -443,7 +440,7 @@ class NoteProviderOrderTests(unittest.TestCase):
 
     def test_prompt_reserve_is_included_in_the_note_window_check(self):
         settings = self.settings(
-            NARA_API_KEY="n", NOTE_CONTEXT_TOKENS="8192", NOTE_MAX_OUTPUT_TOKENS="4096"
+            AVALAI_API_KEY="a", NOTE_CONTEXT_TOKENS="8192", NOTE_MAX_OUTPUT_TOKENS="4096"
         )
         problems = check(settings)
         self.assertTrue(
@@ -452,160 +449,45 @@ class NoteProviderOrderTests(unittest.TestCase):
             problems,
         )
 
-    def test_a_credential_without_a_model_is_reported(self):
-        settings = self.settings(
-            NOTE_PROVIDER="anthropic", NOTE_API_KEY="k", NOTE_MODEL=""
-        )
-        problems = check(settings)
-        self.assertTrue(any("NOTE_MODEL" in problem for problem in problems), problems)
-        self.assertFalse(settings.note_configured)
+    def test_an_unknown_provider_credential_never_routes(self):
+        """A stale NOTE_PROVIDER does not prevent transcript-only startup."""
+        settings = self.settings(NOTE_PROVIDER="anthropic", NOTE_API_KEY="k")
+        self.assertEqual(self.slugs(settings), [])
+        self.assertEqual(settings.note_api_key, "")
 
 
-@unittest.skip("Legacy unapproved-provider compatibility behavior is intentionally removed")
-class RemovedProviderCompatibilityTests(unittest.TestCase):
-    """Removed providers are gone from every registry but never break startup."""
+class GeminiConfigurationTests(unittest.TestCase):
+    """Keep provider-neutral/default coverage from the removed legacy tests."""
 
     def settings(self, **values):
         with mock.patch.dict(os.environ, note_env(**values), clear=True):
             return from_env(env_file="/nonexistent")
 
-    @staticmethod
-    def slugs(settings):
-        return [route.slug for route in note_routes(settings)]
-
-    def test_removed_slugs_are_absent_from_every_registry(self):
-        for slug in ("groq", "cerebras"):
-            self.assertIn(slug, REMOVED_NOTE_PROVIDERS)
-            self.assertNotIn(slug, NOTE_PROVIDER_SLUGS)
-            self.assertNotIn(slug, NOTE_REQUEST_STYLE)
-            self.assertNotIn(slug, NOTE_PROVIDER_LABELS)
-            self.assertNotIn(slug, NOTE_JSON_OBJECT_PROVIDERS)
-            self.assertNotIn(slug, DEFAULT_NOTE_MODELS)
-            self.assertNotIn(slug, NOTE_BASE_URL_DEFAULTS)
-        hosts = dict(NOTE_HOST_PROVIDERS)
-        self.assertNotIn("groq.com", hosts)
-        self.assertNotIn("cerebras.ai", hosts)
-
-    def test_legacy_chain_skips_removed_providers_and_keeps_known_ones(self):
+    def test_model_and_thinking_settings_remain_configurable(self):
+        default = self.settings(GEMINI_API_KEY="g")
+        self.assertEqual(default.gemini_model, DEFAULT_GEMINI_MODEL)
+        self.assertEqual(default.gemini_thinking_budget, DEFAULT_GEMINI_THINKING_BUDGET)
+        self.assertEqual(DEFAULT_GEMINI_THINKING_BUDGET, 0)
         settings = self.settings(
-            NOTE_PROVIDERS="groq,cerebras,gemini", GEMINI_API_KEY="g"
-        )
-        self.assertEqual(self.slugs(settings), ["gemini"])
-        self.assertEqual(
-            [p for p in check(settings) if not is_advisory(p)], []
-        )
-
-    def test_from_env_parses_the_gemini_variables(self):
-        settings = self.settings(
-            GEMINI_MODEL="gemini-2.5-flash",
+            GEMINI_API_KEY="g", GEMINI_MODEL="synthetic-gemini-model",
             NOTE_GEMINI_THINKING_BUDGET="24576",
         )
-        self.assertEqual(settings.gemini_model, "gemini-2.5-flash")
         self.assertEqual(settings.gemini_thinking_budget, 24576)
+        self.assertEqual(note_slot_credentials(settings, "gemini"), ("g", "", "synthetic-gemini-model"))
 
-    def test_gemini_defaults_are_flash_lite_with_zero_thinking(self):
-        settings = self.settings()
-        self.assertEqual(settings.gemini_model, "gemini-2.5-flash-lite")
-        self.assertEqual(settings.gemini_thinking_budget, 0)
-        self.assertEqual(DEFAULT_GEMINI_THINKING_BUDGET, 0)
+    def test_thinking_budget_accepts_minus_one_and_stays_bounded(self):
+        for raw, expected in (("-1", -1), ("-5", -1), ("999999", 32768)):
+            with self.subTest(raw=raw):
+                self.assertEqual(self.settings(NOTE_GEMINI_THINKING_BUDGET=raw).gemini_thinking_budget, expected)
 
-    def test_thinking_budget_accepts_minus_one_and_is_bounded(self):
-        self.assertEqual(
-            self.settings(NOTE_GEMINI_THINKING_BUDGET="-1").gemini_thinking_budget, -1
-        )
-        self.assertEqual(
-            self.settings(NOTE_GEMINI_THINKING_BUDGET="-5").gemini_thinking_budget, -1
-        )
-        self.assertEqual(
-            self.settings(NOTE_GEMINI_THINKING_BUDGET="999999").gemini_thinking_budget,
-            32768,
-        )
-
-    def test_full_endpoint_urls_are_healed_for_generic_gateways(self):
-        self.assertEqual(
-            normalize_note_base_url("https://api.openai.com/v1/chat/completions"),
-            "https://api.openai.com/v1",
-        )
-        self.assertEqual(
-            normalize_note_base_url("https://openrouter.ai"),
-            "https://openrouter.ai/api/v1",
-        )
-
-    def test_slot_credentials_are_per_provider_and_gemini_uses_its_own_model(self):
-        settings = self.settings(
-            GEMINI_API_KEY="g",
-            GEMINI_MODEL="gemini-2.5-flash-lite",
-        )
-        self.assertEqual(note_slot_credentials(settings, "gemini")[0], "g")
-        self.assertEqual(note_slot_credentials(settings, "gemini")[2], settings.gemini_model)
-
-    def test_a_legacy_slot_on_a_removed_host_is_a_generic_gateway(self):
-        """An old Groq URL is no longer classified as the removed provider."""
-        settings = self.settings(
-            NOTE_PROVIDER="openai_compatible",
-            NOTE_API_KEY="legacy-key",
-            NOTE_BASE_URL="https://api.groq.com",
-        )
-        self.assertEqual(
-            classify_note_provider("openai_compatible", "https://api.groq.com"),
-            "openai_compatible",
-        )
-        routes = note_routes(settings)
-        self.assertEqual([route.slug for route in routes], ["openai_compatible"])
-        self.assertEqual(routes[0].api_key, "legacy-key")
-        self.assertEqual(routes[0].model, "gpt-4o-mini")
-
-    def test_note_not_configured_message_names_the_supported_keys(self):
+    def test_missing_generation_configuration_names_only_supported_credentials(self):
         settings = self.settings()
         problems = [p for p in check(settings) if "raw transcripts only" in p]
-        self.assertTrue(problems, check(settings))
-        for name in (
-            "GEMINI_API_KEY",
-            "NARA_API_KEY",
-            "OPENROUTER_API_KEY",
-            "DEEPSEEK_API_KEY",
-        ):
+        self.assertEqual(len(problems), 1)
+        for name in ("GEMINI_API_KEY", "AVALAI_API_KEY", "OPENROUTER_API_KEY"):
             self.assertIn(name, problems[0])
-        self.assertNotIn("GROQ_API_KEY", problems[0])
-        self.assertNotIn("CEREBRAS_API_KEY", problems[0])
-
-
-@unittest.skip("Direct DeepSeek is no longer an approved route; use AvalAI")
-class DeepSeekRouteTests(unittest.TestCase):
-    """DeepSeek V4.1 Flash uses the documented OpenAI-compatible contract."""
-
-    def settings(self, **values):
-        with mock.patch.dict(os.environ, note_env(**values), clear=True):
-            return from_env(env_file="/nonexistent")
-
-    def test_defaults_match_the_official_model_and_base_url(self):
-        settings = self.settings(DEEPSEEK_API_KEY="ds-key")
-        routes = [route for route in note_routes(settings) if route.slug == "deepseek"]
-        self.assertEqual(len(routes), 1)
-        self.assertEqual(routes[0].base_url, "https://api.deepseek.com")
-        self.assertEqual(routes[0].model, "deepseek-flash")
-        self.assertEqual(routes[0].api_key, "ds-key")
-        self.assertTrue(settings.deepseek_configured)
-        self.assertIn("deepseek", NOTE_JSON_OBJECT_PROVIDERS)
-        self.assertEqual(NOTE_PROVIDER_LABELS["deepseek"], "DeepSeek")
-        self.assertEqual(NOTE_REQUEST_STYLE["deepseek"], "openai")
-
-    def test_env_overrides_are_read_and_a_bare_host_keeps_its_root(self):
-        settings = self.settings(
-            DEEPSEEK_API_KEY="ds-key",
-            DEEPSEEK_BASE_URL="https://api.deepseek.com/",
-            DEEPSEEK_MODEL="deepseek-flash",
-        )
-        self.assertEqual(settings.deepseek_api_key, "ds-key")
-        self.assertEqual(settings.deepseek_base_url, "https://api.deepseek.com")
-        self.assertEqual(settings.deepseek_model, "deepseek-flash")
-
-    def test_remove_or_disable_keeps_the_chain_working(self):
-        settings = self.settings(GEMINI_API_KEY="g", DEEPSEEK_API_KEY="")
-        self.assertFalse(settings.deepseek_configured)
-        self.assertEqual(
-            [route.slug for route in note_routes(settings)], ["gemini"]
-        )
+        for name in ("NARA_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+            self.assertNotIn(name, problems[0])
 
 
 class AvalaiRouteTests(unittest.TestCase):
@@ -635,9 +517,10 @@ class AvalaiRouteTests(unittest.TestCase):
                     normalize_note_base_url(raw, "avalai"), "https://api.avalai.ir/v1"
                 )
 
-    def test_direct_deepseek_credentials_are_rejected(self):
-        with self.assertRaisesRegex(ValueError, "DEEPSEEK_API_KEY"):
-            self.settings(DEEPSEEK_API_KEY="ds", AVALAI_API_KEY="av")
+    def test_direct_deepseek_credentials_do_not_activate_or_block_a_route(self):
+        settings = self.settings(DEEPSEEK_API_KEY="ds", AVALAI_API_KEY="av")
+        self.assertEqual([r.slug for r in note_routes(settings)], ["avalai"])
+        self.assertEqual(note_routes(settings)[0].api_key, "av")
 
     def test_a_legacy_slot_pointing_at_avalai_keeps_its_place(self):
         self.assertEqual(
@@ -695,9 +578,11 @@ class CheckTests(unittest.TestCase):
         problems = check(settings)
         self.assertTrue(any("raw transcripts only" in p for p in problems))
 
-    def test_anthropic_is_rejected_as_unapproved(self):
-        with self.assertRaisesRegex(ValueError, "Unapproved NOTE_PROVIDER"):
-            self.make(NOTE_PROVIDER="anthropic", NOTE_MODEL="")
+    def test_unsupported_note_slot_degrades_to_transcript_only_advisory(self):
+        settings = self.make(NOTE_PROVIDER="anthropic", NOTE_MODEL="")
+        self.assertFalse(settings.note_configured)
+        problems = check(settings)
+        self.assertTrue(any(is_advisory(p) and "raw transcripts only" in p for p in problems))
 
     def test_no_admins_reported(self):
         settings = self.make(ADMIN_IDS="")
@@ -854,7 +739,7 @@ class SettingsSurfaceTests(unittest.TestCase):
         with self.assertRaises(dataclasses.FrozenInstanceError):
             settings.bot_token = "x"  # type: ignore[misc]
 
-    def test_openai_compatible_needs_either_key_or_url(self):
+    def test_shared_note_controls_remain_in_settings(self):
         base = Settings.__dataclass_fields__
         self.assertIn("note_provider", base)
         self.assertIn("raw_text_profile", base)

@@ -1,7 +1,7 @@
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from types import SimpleNamespace
 import asyncio
+import multiprocessing
 import sqlite3
 
 from tests.support import make_settings
@@ -115,3 +115,53 @@ def test_central_dispatch_reserves_budget_and_skips_exhausted_route(tmp_path):
         assert operation["actual_total_tokens"] >= 75
 
     asyncio.run(scenario())
+
+
+def test_daily_allowance_survives_minute_rollover_and_failed_requests(tmp_path, monkeypatch):
+    now = [1_800_000_000.0]
+    monkeypatch.setattr(quota_module.time, "time", lambda: now[0])
+    path = str(tmp_path / "daily.sqlite3")
+    limits = ProviderBudget(rpm=10, rpd=2, max_in_flight=1)
+    held = reserve(path, "openrouter", limits, 50, attempts=2)
+    finish(held, actual_tokens=None, succeeded=False)
+    now[0] += 61  # RPM has cleared; the daily request allowance has not.
+    with pytest.raises(QuotaUnavailable, match="daily request budget"):
+        reserve(path, "openrouter", limits, 50)
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM llm_quota_reservations").fetchone()[0] == 0
+        assert conn.execute("SELECT SUM(tokens) FROM llm_quota_requests").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM llm_quota_requests").fetchone()[0] == 2
+
+
+def test_actual_usage_reconciliation_reopens_tpm_budget(tmp_path):
+    path = str(tmp_path / "reconcile.sqlite3")
+    limits = ProviderBudget(tpm=100, max_in_flight=1)
+    held = reserve(path, "avalai", limits, 90)
+    finish(held, actual_tokens=20, succeeded=True)
+    next_call = reserve(path, "avalai", limits, 70)
+    finish(next_call, actual_tokens=5, succeeded=True)
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("SELECT SUM(tokens) FROM llm_quota_requests").fetchone()[0] == 25
+        assert conn.execute("SELECT COUNT(*) FROM llm_quota_reservations").fetchone()[0] == 0
+
+
+def _try_reserve_in_child(path):
+    try:
+        return reserve(path, "avalai", ProviderBudget(max_in_flight=1), 70)
+    except QuotaUnavailable:
+        return None
+
+
+def test_inflight_budget_is_atomic_across_independent_processes(tmp_path):
+    path = str(tmp_path / "multiprocess.sqlite3")
+    with ProcessPoolExecutor(max_workers=4, mp_context=multiprocessing.get_context("spawn")) as pool:
+        futures = [pool.submit(_try_reserve_in_child, path) for _ in range(4)]
+        held = [result for future in futures if (result := future.result(timeout=20)) is not None]
+    assert len(held) == 1
+    with sqlite3.connect(path) as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("SELECT COUNT(*) FROM llm_quota_reservations").fetchone()[0] == 1
+    finish(held[0], actual_tokens=30, succeeded=True)
+    # The one-slot project is usable immediately after the winner releases it.
+    next_call = reserve(path, "avalai", ProviderBudget(max_in_flight=1), 10)
+    finish(next_call, actual_tokens=None, succeeded=False)

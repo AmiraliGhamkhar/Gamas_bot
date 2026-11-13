@@ -44,76 +44,51 @@ RAW_TEXT_PROFILES = ("plain", "timestamped")
 
 STT_PROVIDER_ORDER = ("speechmatics", "deepgram", "openai_compatible")
 
-#: Every note provider the pipeline knows, with the request style each one
-#: speaks. ``nara``/``openrouter``/``openai_compatible`` are OpenAI-compatible
-#: chat-completions APIs; ``gemini`` and ``anthropic`` have their own contracts.
+#: The three approved LLM providers, with the request style each one speaks.
+#: ``openrouter``/``avalai`` are OpenAI-compatible chat-completions APIs;
+#: ``gemini`` has its own contract. This frozenset is the single authoritative
+#: provider allowlist: nothing outside it can ever route a request, regardless
+#: of which environment variables or settings an operator sets.
 APPROVED_LLM_PROVIDERS = frozenset({"gemini", "avalai", "openrouter"})
 NOTE_PROVIDER_SLUGS = ("gemini", "avalai", "openrouter")
 
-#: Provider slugs that were removed from the integration. They are kept only so
-#: a legacy ``NOTE_PROVIDERS`` value is skipped with one explicit warning instead
-#: of being silently treated as an unknown typo.
-REMOVED_NOTE_PROVIDERS = frozenset({"groq", "cerebras"})
 NOTE_REQUEST_STYLE = {
-    "nara": "openai",
     "openrouter": "openai",
-    "openai_compatible": "openai",
     "gemini": "gemini",
-    "deepseek": "openai",
-    "anthropic": "anthropic",
     "avalai": "openai",
 }
 NOTE_PROVIDER_LABELS = {
-    "nara": "NaraRouter",
     "openrouter": "OpenRouter",
-    "openai_compatible": "OpenAI-compatible",
     "gemini": "Gemini",
-    "deepseek": "DeepSeek",
-    "anthropic": "Anthropic",
     "avalai": "AvalAI",
 }
 #: OpenAI ``response_format`` JSON mode is only sent to providers whose public
-#: API documents it (NaraRouter does not document it, so asking for it there
-#: would be an unsupported parameter).
-NOTE_JSON_OBJECT_PROVIDERS = frozenset(
-    {"openrouter", "openai_compatible", "deepseek", "avalai"}
-)
-#: Provider hostnames, so a deployment that configures one OpenAI-compatible
-#: slot with a ``NOTE_BASE_URL`` pointing at a documented provider keeps that
-#: provider's place in the priority order (and never becomes a duplicate leg).
-#: NaraRouter documents both ``router.bynara.id`` and ``router.bynara.web.id``
-#: (https://router.bynara.id/docs); Google AI Studio's native REST host is
+#: API documents it, so asking for it elsewhere would be an unsupported
+#: parameter.
+NOTE_JSON_OBJECT_PROVIDERS = frozenset({"openrouter", "avalai"})
+#: Provider hostnames, so a deployment that configures the v2-era
+#: ``NOTE_PROVIDER``/``NOTE_BASE_URL`` slot with a documented provider host
+#: keeps that provider's place in the priority order (and never becomes a
+#: duplicate leg). Google AI Studio's native REST host is
 #: ``generativelanguage.googleapis.com``.
 NOTE_HOST_PROVIDERS = (
-    ("bynara.id", "nara"),
-    ("bynara.web.id", "nara"),
     ("openrouter.ai", "openrouter"),
     ("generativelanguage.googleapis.com", "gemini"),
-    ("deepseek.com", "deepseek"),
     ("avalai.ir", "avalai"),
 )
 
-#: Documented API defaults per provider. Nara's free plan currently lists
-#: ``agnes-2.5-flash`` (https://router.bynara.id/api/plans). The OpenRouter
-#: default is one *pinned* free model, ``google/gemma-4-31b-it:free``, not the
-#: ``openrouter/free`` router: the router picks a model per request, so the
-#: window that actually serves a request is unknown when the bot sizes it,
-#: while the pinned model's endpoint serves a documented 262,144-token
-#: context with 32,768 completion tokens (https://openrouter.ai/api/v1/models).
-#: Both are overridable, and no model is called free without this evidence.
-DEFAULT_NARA_BASE_URL = "https://router.bynara.id/v1"
-DEFAULT_NARA_MODEL = "agnes-2.5-flash"
+#: Documented API defaults per provider. The OpenRouter default is one *pinned*
+#: free model, not the ``openrouter/free`` router: the router picks a model per
+#: request, so the window that actually serves a request is unknown when the
+#: bot sizes it, while the pinned model's endpoint serves a documented context
+#: and completion cap (https://openrouter.ai/api/v1/models). Both are
+#: overridable, and no model is called free without this evidence.
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3.5-super-vl:free"
 #: Google AI Studio's default note model. ``flash-lite`` answers note
 #: extraction/organisation requests several times faster than the thinking
 #: models while staying inside the free tier.
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
-#: DeepSeek's OpenAI-compatible API. ``deepseek-flash`` is the documented id
-#: served by DeepSeek-V4.1-Flash-1017; the base URL carries no version prefix
-#: (https://api-docs.deepseek.com/api/list-models/).
-DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
 #: AvalAI is a hosted OpenAI-compatible gateway (documented base URL
 #: ``https://api.avalai.ir/v1``) that re-serves the upstream vendors' models
 #: under its own ids (https://docs.avalai.ir/en/api-reference/chat). Its
@@ -131,56 +106,43 @@ DEFAULT_AVALAI_MODEL = "deepseek-v4.1-flash"
 #: * ``-1`` sends no ``thinkingConfig`` field at all (pre-flag behaviour).
 DEFAULT_GEMINI_THINKING_BUDGET = 0
 NOTE_BASE_URL_DEFAULTS = {
-    "nara": DEFAULT_NARA_BASE_URL,
     "openrouter": DEFAULT_OPENROUTER_BASE_URL,
-    "openai_compatible": "https://api.openai.com/v1",
     "gemini": "https://generativelanguage.googleapis.com/v1beta",
-    "deepseek": DEFAULT_DEEPSEEK_BASE_URL,
-    "anthropic": "https://api.anthropic.com/v1",
     "avalai": DEFAULT_AVALAI_BASE_URL,
 }
 
-#: Default note failover order: Gemini flash-lite first (fastest documented
-#: route), then NaraRouter, OpenRouter, DeepSeek and AvalAI. A slug without its
-#: own credential is skipped silently, so this default degrades safely for
-#: every existing deployment — an operator who never sets ``AVALAI_API_KEY``
-#: gets exactly the previous chain. The order in ``NOTE_PROVIDERS`` *is* the
-#: failover policy, exactly like ``STT_PROVIDERS``.
+#: Default note failover order: AvalAI first, then Gemini, then OpenRouter as
+#: the emergency last fallback. Only approved providers can appear in the
+#: chain and a slug without its own credential is skipped. Task-specific
+#: policy takes priority over the configured order; OpenRouter stays last.
 #:
 #: This is a *project-wide* default, not a deployment recommendation: a
-#: deployment can set ``NOTE_PROVIDERS=gemini,openrouter`` (the profile
-#: verified on 2026-11-07, see ``docs/PROVIDERS.md``) without changing what
-#: other deployments get out of the box.
+#: deployment can narrow it (e.g. ``NOTE_PROVIDERS=gemini,openrouter``, see
+#: ``docs/PROVIDERS.md``) without changing what other deployments get out of
+#: the box.
 DEFAULT_NOTE_PROVIDERS = "avalai,gemini,openrouter"
 
 DEFAULT_NOTE_MODELS = {
-    "openai_compatible": "gpt-4o-mini",
     "gemini": DEFAULT_GEMINI_MODEL,
-    "nara": DEFAULT_NARA_MODEL,
     "openrouter": DEFAULT_OPENROUTER_MODEL,
-    "deepseek": DEFAULT_DEEPSEEK_MODEL,
     "avalai": DEFAULT_AVALAI_MODEL,
 }
 
 #: Context window assumed for one note request when the operator does not say.
 #: It is the *smallest* window among the configured models that matters, because
-#: the chain must fit the tightest provider that may answer. The default pair
-#: is matched on purpose: the pinned OpenRouter endpoint serves a 262,144-token
-#: window and Agnes 2.5 Flash's official reference window is 512K (Nara's own
-#: gateway cap is unpublished), so the operational assumption is half of the
-#: matched served window — headroom for gateway caps and for the deliberately
-#: conservative Persian character-to-token estimate in ``notes.py``.
+#: the chain must fit the tightest provider that may answer. The operational
+#: budget is deliberately below the reference model windows, leaving headroom
+#: for gateway caps and the conservative Persian character-to-token estimate
+#: in ``notes.py``. A large model window does not raise this operating budget.
 DEFAULT_NOTE_CONTEXT_TOKENS = 131072
 #: Per-chunk character ceiling of one note request (an upper bound that the
 #: token budget in ``notes.effective_chunk_chars`` may still shrink).
 DEFAULT_NOTE_CHUNK_CHARS = 64000
 #: Output-token budget sent as ``max_tokens`` / ``maxOutputTokens`` on every
 #: note request. It stays at half (or less) of the default models' documented
-#: completion caps (32,768 on the pinned OpenRouter endpoint, 65.5K for Agnes
-#: 2.5 Flash), so the budget itself never exceeds what a default model may
-#: emit. A deployment whose model publishes a larger completion cap can raise
-#: it with ``NOTE_MAX_OUTPUT_TOKENS`` (32,768 in the 2026-11-07 tested
-#: profile); the old 16,384 value is this shipped default, not a cap.
+#: completion caps, so the budget itself never exceeds what a default model may
+#: emit. Overrides must fit every eligible model's context/output caps and
+#: the request deadline; 16,384 remains the operating default, not a model cap.
 DEFAULT_NOTE_MAX_OUTPUT_TOKENS = 16384
 #: Wall-clock deadline of one note request, in seconds. A hung provider must
 #: not inherit the STT job's multi-hour read timeout — but the deadline must
@@ -196,9 +158,9 @@ DEFAULT_NOTE_REQUEST_TIMEOUT_SECONDS = 900.0
 #: budget cannot be produced inside the request deadline — the warning is
 #: advisory, because a fast or paid gateway easily beats this estimate.
 MIN_NOTE_OUTPUT_TOKENS_PER_SECOND = 20.0
-#: ``reasoning_effort`` levels accepted on the Nara/OpenRouter note routes
-#: (the two gateways verified for the field). ``ultra`` is accepted as the
-#: documented alias of ``max`` (https://router.bynara.id/docs).
+#: ``reasoning_effort`` levels accepted on the OpenAI-compatible note routes
+#: whose gateway documents the field (OpenRouter). ``ultra`` is accepted as a
+#: documented alias of ``max``.
 NOTE_REASONING_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 #: A request needs at least this much room for the transcript itself.
 MIN_NOTE_INPUT_TOKENS = 4096
@@ -289,9 +251,9 @@ DEFAULT_OFFICE_JOB_CONCURRENCY = 2
 #:   are chunks (capped at 8); 3 keeps per-job request bursts modest on shared hosts.
 #: * ``NOTE_TTFB_TIMEOUT_SECONDS`` — a route that has not produced a first byte
 #:   within 25 s is treated as hung and the chain fails over, instead of waiting
-#:   out the whole request timeout. Below the hedge delay on purpose.
-#: * ``NOTE_HEDGE_AFTER_SECONDS`` — if the first provider has not finished in
-#:   60 s, the second starts in parallel; at most one extra in-flight POST.
+#:   out the whole request timeout.
+#: * ``NOTE_HEDGE_AFTER_SECONDS`` — compatibility knob only. Dispatch never
+#:   hedges, even when a stale deployment sets it nonzero, to avoid duplicates.
 DEFAULT_NOTE_CONCURRENCY = 3
 DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS = 25.0
 DEFAULT_NOTE_HEDGE_AFTER_SECONDS = 0.0
@@ -582,17 +544,11 @@ class Settings:
     note_api_key: str
     note_api_base_url: str
     note_model: str
-    nara_api_key: str
-    nara_base_url: str
-    nara_model: str
     openrouter_api_key: str
     openrouter_base_url: str
     openrouter_model: str
     gemini_api_key: str
     gemini_model: str
-    deepseek_api_key: str
-    deepseek_base_url: str
-    deepseek_model: str
     avalai_api_key: str
     avalai_base_url: str
     avalai_model: str
@@ -839,10 +795,6 @@ class Settings:
         return bool(self.openrouter_api_key)
 
     @property
-    def deepseek_configured(self) -> bool:
-        return bool(self.deepseek_api_key)
-
-    @property
     def avalai_configured(self) -> bool:
         return bool(self.avalai_api_key)
 
@@ -889,7 +841,7 @@ def _normalize_api_key(value: str | None) -> str:
 
     Operators sometimes copy ``Bearer sk-...`` directly from curl snippets into
     ``.env``; stripping the scheme prevents ``Authorization: Bearer Bearer ...``
-    on NaraRouter/OpenRouter and ``x-goog-api-key: Bearer ...`` on Gemini.
+    on AvalAI/OpenRouter and ``x-goog-api-key: Bearer ...`` on Gemini.
     """
     raw = (value or "").strip()
     if not raw:
@@ -901,10 +853,10 @@ def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
     """Normalize a note provider base URL without losing explicit paths/queries.
 
     Heals common operator copy-paste mistakes:
-    * Pasting a full endpoint URL (``.../chat/completions``, ``.../messages``,
+    * Pasting a full endpoint URL (``.../chat/completions``,
       ``.../models/<id>:generateContent``, or ``.../v1beta/models``).
     * Pasting a bare origin without the documented API version prefix
-      (``https://router.bynara.id`` -> ``/v1``, ``https://openrouter.ai`` ->
+      (``https://api.avalai.ir`` -> ``/v1``, ``https://openrouter.ai`` ->
       ``/api/v1``,
       ``https://generativelanguage.googleapis.com`` -> ``/v1beta``).
     """
@@ -930,15 +882,6 @@ def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
         if path.endswith(suffix):
             path = path[: -len(suffix)].rstrip("/")
 
-    if slug == "anthropic" and path.endswith("/messages"):
-        path = path[: -len("/messages")].rstrip("/")
-
-    is_nara_host = (
-        host == "bynara.id"
-        or host.endswith(".bynara.id")
-        or host == "bynara.web.id"
-        or host.endswith(".bynara.web.id")
-    )
     is_openrouter_host = host == "openrouter.ai" or host.endswith(".openrouter.ai")
     is_gemini_host = host == "generativelanguage.googleapis.com"
     is_avalai_host = host == "avalai.ir" or host.endswith(".avalai.ir")
@@ -947,9 +890,7 @@ def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
         path = path[: -len("/models")].rstrip("/")
 
     if path == "":
-        if slug == "nara" or is_nara_host:
-            path = "/v1"
-        elif slug == "openrouter" or is_openrouter_host:
+        if slug == "openrouter" or is_openrouter_host:
             path = "/api/v1"
         elif slug == "gemini" or is_gemini_host:
             path = "/v1beta"
@@ -964,13 +905,15 @@ def normalize_note_base_url(base_url: str | None, slug: str = "") -> str:
 def classify_note_provider(slug: str, base_url: str) -> str:
     """The provider a configured slot really points at.
 
-    A v2-era deployment configures a single OpenAI-compatible slot through
+    A v2-era deployment configures a single slot through
     ``NOTE_PROVIDER``/``NOTE_BASE_URL``; recognising a documented provider host
-    keeps that deployment in its priority place (a NaraRouter base URL stays the
-    Nara leg of the chain) instead of turning it into a generic gateway that
-    would be tried last — or twice. Google AI Studio's OpenAI compatibility
-    layer (``/v1beta/openai``) stays ``openai_compatible`` while its native
-    ``/v1beta`` endpoint is classified as ``gemini``.
+    keeps that deployment in its priority place (an AvalAI base URL stays the
+    AvalAI leg of the chain) instead of turning it into an unknown gateway that
+    would be rejected — or tried twice. Google AI Studio's OpenAI compatibility
+    layer (``/v1beta/openai``) is *not* an eligible route, so it keeps the
+    deliberately unapproved ``openai_compatible`` marker (ignored by
+    ``from_env``) while its native ``/v1beta`` endpoint is classified
+    as ``gemini``.
     """
     parsed = urlsplit(base_url)
     host = (parsed.hostname or "").lower()
@@ -988,17 +931,23 @@ def classify_note_provider(slug: str, base_url: str) -> str:
 
 
 def _parse_note_providers(raw: str) -> tuple[str, ...]:
-    """Parse the note failover order: known slugs, de-duplicated, order kept."""
+    """Parse the note failover order: approved slugs, de-duplicated, order kept.
+
+    A legacy or unknown slug is dropped (degradation), never admitted: routing
+    never attempts it, and startup must not crash on a stale ``NOTE_PROVIDERS``
+    value. A warning names the setting, never its untrusted value.
+    """
     order: list[str] = []
     for part in re.split(r"[,\s]+", raw):
         slug = part.strip().lower()
         if not slug:
             continue
-        if slug not in NOTE_PROVIDER_SLUGS:
-            raise ValueError(
-                f"Unapproved LLM provider {slug!r}; approved providers: "
-                + ", ".join(NOTE_PROVIDER_SLUGS)
+        if slug not in APPROVED_LLM_PROVIDERS:
+            logger.warning(
+                "Legacy/unknown LLM provider in NOTE_PROVIDERS ignored; approved providers: %s",
+                ",".join(NOTE_PROVIDER_SLUGS),
             )
+            continue
         if slug not in order:
             order.append(slug)
     return tuple(order)
@@ -1010,34 +959,28 @@ def _legacy_note_configured(settings: Settings) -> bool:
 
 
 def note_slot_credentials(settings: Settings, slug: str) -> tuple[str, str, str]:
-    """``(api_key, base_url, model)`` configured for one provider slot.
+    """``(api_key, base_url, model)`` configured for one approved provider slot.
 
-    A credential belongs to exactly one provider: ``NARA_API_KEY``,
-    ``OPENROUTER_API_KEY``, ``GEMINI_API_KEY`` and ``DEEPSEEK_API_KEY`` to
-    theirs, and the
-    v2-era ``NOTE_API_KEY``/``NOTE_BASE_URL``/``NOTE_MODEL`` trio to the slot
+    A credential belongs to exactly one provider: ``OPENROUTER_API_KEY``,
+    ``GEMINI_API_KEY`` and ``AVALAI_API_KEY`` to theirs, and the v2-era
+    ``NOTE_API_KEY``/``NOTE_BASE_URL``/``NOTE_MODEL`` trio to the slot
     ``NOTE_PROVIDER`` names (a ``NOTE_BASE_URL`` pointing at a documented
     provider host is classified as that provider, see
     :func:`classify_note_provider`). Sharing one key between two providers would
     send it to a service that never issued it, so a slot with no credential of
     its own is simply not attempted.
     """
-    if slug == "nara":
-        key, base, model = settings.nara_api_key, settings.nara_base_url, settings.nara_model
-    elif slug == "openrouter":
+    if slug == "openrouter":
         key = settings.openrouter_api_key
         base, model = settings.openrouter_base_url, settings.openrouter_model
     elif slug == "gemini":
         key = settings.gemini_api_key
         base, model = "", settings.gemini_model
-    elif slug == "deepseek":
-        key = settings.deepseek_api_key
-        base, model = settings.deepseek_base_url, settings.deepseek_model
     elif slug == "avalai":
         key = settings.avalai_api_key
         base, model = settings.avalai_base_url, settings.avalai_model
-    else:  # openai_compatible / anthropic: configured through the v2-era slot
-        key, base, model = "", "", ""
+    else:  # not an approved provider: no credential can ever be resolved
+        return "", "", ""
     if slug == settings.note_provider and _legacy_note_configured(settings):
         key = settings.note_api_key or key
         base = settings.note_api_base_url or base
@@ -1046,46 +989,43 @@ def note_slot_credentials(settings: Settings, slug: str) -> tuple[str, str, str]
 
 
 def note_route_order(settings: Settings) -> tuple[str, ...]:
-    """The explicit provider order: the declared chain, then the v2-era slot.
+    """The configured eligible order, with OpenRouter always last.
 
-    ``NOTE_PROVIDERS`` is the policy (default
-    ``gemini,nara,openrouter,deepseek,avalai``; uncredentialed slugs are
-    skipped).
-    A configured
-    ``NOTE_PROVIDER`` slot (the v2 spelling, still honoured) keeps its place when
-    it is already a member of that chain — a NaraRouter deployment is the Nara
-    leg — and is otherwise appended as one further explicitly configured
-    provider. Nothing is inferred at runtime, so the order survives restarts and
-    is testable from the environment alone.
+    ``NOTE_PROVIDERS`` is the policy (default ``avalai,gemini,openrouter``;
+    uncredentialed slugs are skipped). A configured ``NOTE_PROVIDER`` slot (the
+    v2 spelling, still honoured) keeps its place when it is already a member of
+    that chain and is otherwise appended as one further explicitly configured
+    provider — but only when it is an approved provider: the allowlist filters
+    everything. Nothing is inferred at runtime, so the order survives restarts
+    and is testable from the environment alone.
     """
-    order = list(settings.note_providers)
+    order = list(dict.fromkeys(
+        slug for slug in settings.note_providers if slug in APPROVED_LLM_PROVIDERS
+    ))
     legacy = settings.note_provider if _legacy_note_configured(settings) else ""
     if legacy and legacy not in order and legacy in APPROVED_LLM_PROVIDERS:
         order.append(legacy)
-    return tuple(slug for slug in order if slug in APPROVED_LLM_PROVIDERS)
+    return tuple(slug for slug in order if slug != "openrouter") + (
+        ("openrouter",) if "openrouter" in order else ()
+    )
 
 
 def _note_route(settings: Settings, slug: str) -> NoteRoute | None:
     """Build one provider's route, or ``None`` when its slot is not configured.
 
-    Eligibility is configuration, never assumption: a hosted provider needs its
-    own credential (a missing key is not a configured provider), the
-    OpenAI-compatible slot is also usable as a keyless local gateway when its
-    base URL is explicit, and a provider without a model can never build a
-    request.
+    Eligibility is configuration, never assumption: only an approved provider
+    slug can produce a route, a hosted provider needs its own credential (a
+    missing key is not a configured provider), and a provider without a model
+    can never build a request.
     """
     style = NOTE_REQUEST_STYLE.get(slug)
     if slug not in APPROVED_LLM_PROVIDERS or style is None:
         return None
     key, base, model = note_slot_credentials(settings, slug)
-    # A provider that has a documented default model uses it; ``anthropic`` has
-    # none, so it stays unusable until an operator names one (and says so in
-    # check()).
+    # Every approved provider has a documented default model used when the
+    # operator does not name one.
     model = model or DEFAULT_NOTE_MODELS.get(slug, "")
-    if slug == "openai_compatible":
-        if not (key or base):
-            return None
-    elif not key:
+    if not key:
         return None
     if not model:
         return None
@@ -1160,9 +1100,8 @@ def note_route_diagnostics(settings: Settings) -> list[str]:
     for slug in note_route_order(settings):
         if NOTE_REQUEST_STYLE.get(slug) is None or _note_route(settings, slug) is not None:
             continue
-        key, base, model = note_slot_credentials(settings, slug)
-        has_credential = bool(key or base) if slug == "openai_compatible" else bool(key)
-        if has_credential and not model:
+        key, _base, model = note_slot_credentials(settings, slug)
+        if key and not model:
             problems.append(
                 f"NOTE_MODEL must be set for the {NOTE_PROVIDER_LABELS[slug]} note "
                 "provider (a credential is configured but no model name is)."
@@ -1234,8 +1173,24 @@ def _parse_provider_order(raw: str) -> tuple[str, ...]:
     return tuple(order)
 
 
+# Deprecation diagnostics only: none of these names is read into Settings.
+_LEGACY_LLM_ENV_VARS = (
+    "NARA_API_KEY", "NARA_BASE_URL", "NARA_MODEL",
+    "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL",
+    "GROQ_API_KEY", "GROQ_BASE_URL", "GROQ_MODEL",
+    "CEREBRAS_API_KEY", "CEREBRAS_BASE_URL", "CEREBRAS_MODEL",
+    "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+    "OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL",
+)
+
+
 def from_env(env_file: str | None = None) -> Settings:
-    """Build the settings from the process environment (and ``.env``)."""
+    """Read configuration; stale LLM settings never activate a removed route.
+
+    Process variables override .env as usual. Removed-provider variables are
+    ignored from either source, with names-only deprecation warnings so a
+    preserved deployment environment cannot brick startup or expose secrets.
+    """
     if env_file is not None:
         load_dotenv(env_file, override=False)
     else:
@@ -1243,6 +1198,12 @@ def from_env(env_file: str | None = None) -> Settings:
             if candidate.is_file():
                 load_dotenv(candidate, override=False)
                 break
+    ignored = [name for name in _LEGACY_LLM_ENV_VARS if _env(name)]
+    if ignored:
+        logger.warning(
+            "Removed LLM settings ignored: %s; configure only Gemini, AvalAI or OpenRouter",
+            ", ".join(ignored),
+        )
 
     raw_providers = _env("STT_PROVIDERS", DEFAULT_STT_PROVIDERS)
     raw_note_providers = _env("NOTE_PROVIDERS", DEFAULT_NOTE_PROVIDERS)
@@ -1255,48 +1216,44 @@ def from_env(env_file: str | None = None) -> Settings:
         else _env_bool("STT_DIARIZE", True)
     )
     explicit_note_provider = _env("NOTE_PROVIDER").lower()
-    legacy_unapproved_keys = (
-        "NARA_API_KEY", "DEEPSEEK_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
-        "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
-    )
-    active_legacy_keys = [name for name in legacy_unapproved_keys if _env(name)]
-    if active_legacy_keys:
-        raise ValueError(
-            "Unapproved LLM credential configuration is set: "
-            + ", ".join(active_legacy_keys)
-            + ". Configure only GEMINI_API_KEY, AVALAI_API_KEY, or OPENROUTER_API_KEY."
-        )
     note_api_base_url = _env("NOTE_BASE_URL").rstrip("/")
     # The v2-era single slot (``NOTE_PROVIDER``/``NOTE_API_KEY``/``NOTE_BASE_URL``)
     # is still honoured, and it is classified by host: a deployment that points
     # that slot at a documented provider keeps that provider's place in the
     # priority order instead of becoming a generic gateway. A Gemini-only
     # environment still selects Gemini, exactly as before.
-    # A Gemini-only environment (no NOTE_* slot and no dedicated provider key)
-    # still selects Gemini; once a dedicated provider key exists, the declared
-    # chain decides and Gemini is only used when it is listed and configured.
+    # Preserve the old Gemini-only alias only when no explicit chain or other
+    # provider key exists. Never infer a legacy slot outside NOTE_PROVIDERS.
     gemini_only = bool(
         _env("GEMINI_API_KEY")
+        and "NOTE_PROVIDERS" not in os.environ
+        and not _env("AVALAI_API_KEY")
         and not _env("NOTE_API_KEY")
         and not note_api_base_url
-        and not _env("NARA_API_KEY")
         and not _env("OPENROUTER_API_KEY")
     )
     legacy_slug = explicit_note_provider or (
         "gemini" if gemini_only else "openai_compatible"
     )
     note_provider = classify_note_provider(legacy_slug, note_api_base_url)
-    if (explicit_note_provider or note_api_base_url or _env("NOTE_API_KEY")) and note_provider not in APPROVED_LLM_PROVIDERS:
-        if explicit_note_provider:
-            message = f"Unapproved NOTE_PROVIDER {explicit_note_provider!r}"
-        else:
-            message = "Unapproved legacy NOTE_BASE_URL/NOTE_API_KEY provider configuration"
-        raise ValueError(message + "; approved providers: " + ", ".join(NOTE_PROVIDER_SLUGS))
     note_api_key = _normalize_api_key(
         _env("NOTE_API_KEY") or (_env("GEMINI_API_KEY") if legacy_slug == "gemini" else "")
     )
-    note_api_base_url = normalize_note_base_url(note_api_base_url, note_provider)
-    note_model = _env("NOTE_MODEL", DEFAULT_NOTE_MODELS.get(note_provider, ""))
+    note_model = ""
+    if note_provider not in APPROVED_LLM_PROVIDERS:
+        if explicit_note_provider or note_api_base_url or note_api_key:
+            logger.warning(
+                "Unsupported NOTE_PROVIDER/NOTE_BASE_URL/NOTE_API_KEY configuration ignored; "
+                "configure only Gemini, AvalAI or OpenRouter"
+            )
+        # Never retain an unapproved legacy credential/base, nor lend it to an
+        # approved provider. Dedicated provider keys remain independent.
+        note_provider, note_api_key, note_api_base_url, note_model = "", "", "", ""
+    else:
+        note_api_base_url = normalize_note_base_url(note_api_base_url, note_provider)
+        note_model = _env(
+            "NOTE_MODEL", _env(f"{note_provider.upper()}_MODEL", DEFAULT_NOTE_MODELS[note_provider])
+        )
     plan_values = {
         attribute: _plan_value(name, default)
         for name, attribute, default in PLAN_ENV_FIELDS
@@ -1434,11 +1391,6 @@ def from_env(env_file: str | None = None) -> Settings:
         note_api_key=note_api_key,
         note_api_base_url=note_api_base_url,
         note_model=note_model,
-        nara_api_key=_normalize_api_key(_env("NARA_API_KEY")),
-        nara_base_url=normalize_note_base_url(
-            _env("NARA_BASE_URL", DEFAULT_NARA_BASE_URL), "nara"
-        ),
-        nara_model=_env("NARA_MODEL", DEFAULT_NARA_MODEL),
         openrouter_api_key=_normalize_api_key(_env("OPENROUTER_API_KEY")),
         openrouter_base_url=normalize_note_base_url(
             _env("OPENROUTER_BASE_URL", DEFAULT_OPENROUTER_BASE_URL), "openrouter"
@@ -1446,11 +1398,6 @@ def from_env(env_file: str | None = None) -> Settings:
         openrouter_model=_env("OPENROUTER_MODEL", DEFAULT_OPENROUTER_MODEL),
         gemini_api_key=_normalize_api_key(_env("GEMINI_API_KEY")),
         gemini_model=_env("GEMINI_MODEL", DEFAULT_GEMINI_MODEL),
-        deepseek_api_key=_normalize_api_key(_env("DEEPSEEK_API_KEY")),
-        deepseek_base_url=normalize_note_base_url(
-            _env("DEEPSEEK_BASE_URL", DEFAULT_DEEPSEEK_BASE_URL), "deepseek"
-        ),
-        deepseek_model=_env("DEEPSEEK_MODEL", DEFAULT_DEEPSEEK_MODEL),
         avalai_api_key=_normalize_api_key(_env("AVALAI_API_KEY")),
         avalai_base_url=normalize_note_base_url(
             _env("AVALAI_BASE_URL", DEFAULT_AVALAI_BASE_URL), "avalai"
@@ -1913,8 +1860,7 @@ def _check_note_settings(settings: Settings) -> list[ConfigDiagnostic]:
         items.append(
             ConfigDiagnostic(
                 "Note generation is not configured (NOTE_PROVIDERS / NOTE_API_KEY / "
-                "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / "
-                "DEEPSEEK_API_KEY / AVALAI_API_KEY); "
+                "GEMINI_API_KEY / AVALAI_API_KEY / OPENROUTER_API_KEY); "
                 "the bot will deliver raw transcripts only.",
                 advisory=True,
             )

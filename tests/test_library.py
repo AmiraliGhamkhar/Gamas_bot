@@ -39,6 +39,7 @@ class LibraryTests(unittest.IsolatedAsyncioTestCase):
             db_path=self.root / "library.db",
             temp_dir=self.root / "tmp",
             library_max_items=3,
+            avalai_api_key="avalai-test-key",  # configured learning-action UI; no model I/O
         )
         self.db = Database(self.settings.db_path)
         await self.db.connect()

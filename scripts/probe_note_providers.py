@@ -15,7 +15,7 @@ Metadata stage (default, read-only, no generation quota)::
 
     python -m scripts.probe_note_providers
 
-    Asks each gateway only metadata questions: NaraRouter's authenticated
+    Asks each gateway only metadata questions: AvalAI's authenticated
     ``/v1/models`` (is the configured model entitled, and what limits does the
     gateway publish for it?), OpenRouter's ``/api/v1/key`` plus the configured
     model's ``/endpoints`` record (served context, completion cap, uptime,
@@ -165,42 +165,9 @@ def _get_json(
         return status, _redact_secrets(body[:400], clean_key)
 
 
-def _check_nara(route) -> bool:
-    """NaraRouter: the configured model must be entitled on this key's plan."""
-    url, headers = _build_get_request_for(route, "models")
-    status, payload = _get_json(url, route.api_key, headers=headers)
-    if status != 200 or not isinstance(payload, dict):
-        detail = _redact_secrets(str(payload)[:200], route.api_key)
-        print(f"[FAIL] nara /v1/models: HTTP {status}: {detail}")
-        return False
-    entries = payload.get("data")
-    if not isinstance(entries, list):
-        print("[FAIL] nara /v1/models: unexpected response shape (no data list)")
-        return False
-    ids = [entry.get("id") for entry in entries if isinstance(entry, dict)]
-    if route.model.startswith("combo/") and ids:
-        print(
-            f"[PASS] nara combo model {route.model!r} is routable "
-            f"({len(ids)} underlying model(s) on this plan)"
-        )
-        return True
-    entitled = route.model in ids
-    print(
-        f"[{'PASS' if entitled else 'FAIL'}] nara model {route.model!r} "
-        f"{'is' if entitled else 'is NOT'} entitled ({len(ids)} model(s) on this plan)"
-    )
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get("id") == route.model:
-            limits = {
-                key: entry[key]
-                for key in ("context_length", "max_completion_tokens", "max_tokens", "reasoning")
-                if key in entry
-            }
-            if limits:
-                print(f"       published metadata: {limits}")
-            else:
-                print("       gateway publishes no context/completion limits for it")
-    return entitled
+def _check_avalai(route) -> bool:
+    """AvalAI: the configured model must be entitled on this key's plan."""
+    return _check_openai_models(route)
 
 
 def _check_openrouter(route) -> bool:
@@ -299,7 +266,7 @@ def _check_gemini(route) -> bool:
 
 
 def _check_openai_models(route) -> bool:
-    """OpenAI-compatible ``/models`` check for gateway routes (AvalAI, DeepSeek, …)."""
+    """Shared OpenAI-compatible ``/models`` metadata check (used by AvalAI)."""
     url, headers = _build_get_request_for(route, "models")
     status, payload = _get_json(url, route.api_key, headers=headers)
     if status != 200 or not isinstance(payload, dict):
@@ -377,14 +344,14 @@ async def _generate(route, settings, text: str) -> bool:
                 schema=schema,
             )
         notes = _load_json_payload(_parse_json_object(raw))
-    except Exception as exc:  # noqa: BLE001 - report any provider failure verbatim
+    except Exception as exc:  # report the category, never a body or echoed source
         elapsed = time.monotonic() - started
-        print(f"[FAIL] {route.slug} generation ({elapsed:.1f}s): {type(exc).__name__}: {exc}")
+        print(f"[FAIL] {route.slug} generation ({elapsed:.1f}s): {type(exc).__name__}")
         return False
     elapsed = time.monotonic() - started
     print(
         f"[PASS] {route.slug} generation ({elapsed:.1f}s, {len(excerpt)} chars): "
-        f"title={notes.display_title!r} sections={len(notes.sections)}"
+        f"sections={len(notes.sections)}"
     )
     return True
 
@@ -425,16 +392,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     ok = True
     for route in routes:
-        if route.slug == "nara":
-            ok = _check_nara(route) and ok
+        if route.slug == "avalai":
+            ok = _check_avalai(route) and ok
         elif route.slug == "openrouter":
             ok = _check_openrouter(route) and ok
         elif route.slug == "gemini":
             ok = _check_gemini(route) and ok
-        elif route.slug in ("avalai", "deepseek", "openai_compatible"):
-            ok = _check_openai_models(route) and ok
-        else:
-            print(f"[WARN] {route.slug}: no metadata probe; generation stage still applies")
 
     if args.generate:
         try:

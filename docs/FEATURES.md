@@ -38,12 +38,12 @@ python -m gamas_bot.media_worker check
 
 With a note provider configured, a finished transcript also produces a Persian
 RTL booklet. Booklets, AI quizzes and AI flashcards use the same note-provider
-chain; the code default starts with Gemini `gemini-2.5-flash-lite`, followed by
-Nara, OpenRouter, DeepSeek and AvalAI when their credentials are configured.
-The operator reports the current deployment model IDs as Nara
-`laguna-s-2.1`, OpenRouter `nvidia/nemotron-3.5-super-vl:free`, and Gemini
-`gemini-3.5-flash-lite`; this checkout has no live `.env` to verify their active
-order. See [Providers](PROVIDERS.md) for defaults and overrides.
+allowlist: AvalAI, Gemini and OpenRouter. The default chain is
+`avalai,gemini,openrouter`; task-specific priorities and sensitivity policy
+apply before dispatch, and OpenRouter is always a fallback. The optional
+editorial compile pass is off by default; bounded chunking, deterministic
+merge, split/repair and grounding gates remain enabled as configured. See
+[Providers](PROVIDERS.md) for models, quotas and safe probes.
 
 - Word (`.docx`) with mixed Persian/English runs, heading styles, tables,
   «خلاصه», key points and a glossary. Fonts are **referenced**, not embedded —

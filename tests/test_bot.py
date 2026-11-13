@@ -494,8 +494,9 @@ class FileDeliveryTests(BotPipelineTestCase):
         event = self.media_event()
         self.bot.settings = replace(
             self.settings,
-            note_api_key="note-key",
-            note_api_base_url="https://note.example/v1",
+            # An unknown v2-era NOTE_BASE_URL host is ignored as unapproved;
+            # AvalAI is how an OpenAI-compatible route is really configured.
+            avalai_api_key="note-key",
         )
         self.bot._http_session = lambda: None  # type: ignore[method-assign]
         with mock.patch(
@@ -523,8 +524,7 @@ class FileDeliveryTests(BotPipelineTestCase):
         event = self.media_event()
         self.bot.settings = replace(
             self.settings,
-            note_api_key="note-key",
-            note_api_base_url="https://note.example/v1",
+            avalai_api_key="note-key",
         )
         self.bot._http_session = lambda: None  # type: ignore[method-assign]
         with (
@@ -634,7 +634,9 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
     """Upload → STT → raw delivery → notes → Word, with a scripted provider."""
 
     def settings_overrides(self) -> dict:
-        return {"note_api_base_url": "https://note.example/v1", "note_api_key": "note-key"}
+        # AvalAI is the OpenAI-compatible route a real deployment configures;
+        # an unknown v2-era NOTE_BASE_URL host would be ignored as unapproved.
+        return {"avalai_api_key": "note-key"}
 
     async def test_notes_reach_persisted_pdf_and_docx_and_usage_is_settled_once(self):
         event = self.media_event()
@@ -746,7 +748,7 @@ class PresentationPromptTests(BotPipelineTestCase):
     """The deck's own text must be part of the note request, not only the audio."""
 
     def settings_overrides(self) -> dict:
-        return {"note_api_base_url": "https://note.example/v1", "note_api_key": "note-key"}
+        return {"avalai_api_key": "note-key"}
 
     async def test_slide_text_notes_and_narration_all_reach_the_note_model(self):
         deck = build_deck(
@@ -1676,7 +1678,7 @@ class ProgressiveBookletTests(BotPipelineTestCase):
     """No intermediate booklet drafts may be pushed before completion."""
 
     def settings_overrides(self) -> dict:
-        return {"note_progressive_booklet": True, "note_api_key": "note-key"}
+        return {"note_progressive_booklet": True, "avalai_api_key": "note-key"}
 
     async def test_the_callback_is_never_installed_even_for_legacy_setting(self):
         captured: dict = {}
@@ -1904,6 +1906,10 @@ class OneTapFlowTests(unittest.IsolatedAsyncioTestCase):
         self.settings = make_settings(
             db_path=root / "bot.db",
             temp_dir=root / "tmp",
+            # Booklet flows run the note pipeline: give the bot a fake avalai
+            # route so the welcome/delivery copy is the notes-configured copy,
+            # without every unrelated suite gaining one by the offline default.
+            avalai_api_key="avalai-test-key",
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.settings.db_path)
@@ -2278,9 +2284,8 @@ class ResultsHubTests(BotPipelineTestCase):
         """has_booklet is enough for a forward; learning buttons need item_id."""
         self.bot.settings = replace(
             self.bot.settings,
-            note_api_key="note-key",
-            note_api_base_url="https://note.example/v1",
-            note_providers=("openai_compatible",),
+            avalai_api_key="note-key",
+            note_providers=("avalai",),
         )
         event = self.media_event()
         submission = await self.run_media_job(event, transcribe=self._raw())

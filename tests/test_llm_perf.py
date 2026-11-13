@@ -1,4 +1,4 @@
-"""Phase 2/3 performance-layer tests: transport, streaming, hedging, office.
+"""Offline performance/reliability tests: transport, streaming, no-hedging, office.
 
 No network: every provider is a fake session/response double.
 """
@@ -8,6 +8,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
+import sqlite3
+import tempfile
 import unittest
 from unittest import mock
 
@@ -24,7 +27,7 @@ from gamas_bot.llm import (
     complete_json,
 )
 from tests.support import make_settings
-from tests.test_llm import FakeResponse, routed_settings
+from tests.test_llm import routed_settings
 
 
 async def _noop(*_a, **_k):
@@ -122,7 +125,9 @@ class DispatchSession:
 
 class StreamingTests(unittest.IsolatedAsyncioTestCase):
     def settings(self, **kw):
-        return make_settings(note_ttfb_timeout=0.5, **kw)
+        return make_settings(
+            avalai_api_key="avalai-test-key", note_ttfb_timeout=0.5, **kw
+        )
 
     async def test_multi_delta_reassembly_and_usage_logged(self):
         lines = [
@@ -133,7 +138,7 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
                  "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}),
             b"data: [DONE]",
         ]
-        session = DispatchSession([("note.example", StreamingResponse(lines))])
+        session = DispatchSession([("api.avalai.ir", StreamingResponse(lines))])
         with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
             result = await complete(session, self.settings(), system="S", user="U")
         self.assertEqual(result, "Hello")
@@ -151,14 +156,14 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
             sse(delta("first")),
             sse(delta("never read")),
         ])
-        session = DispatchSession([("router.bynara.id", response)])
+        session = DispatchSession([("api.avalai.ir", response)])
         with mock.patch.object(llm, "MAX_LLM_RESPONSE_BYTES", 4):
             with self.assertRaises(LLMResponseError):
                 await llm._complete_streaming_on_route(
                     route,
                     session,
                     settings,
-                    url="https://router.bynara.id/v1/chat/completions",
+                    url="https://api.avalai.ir/v1/chat/completions",
                     headers={},
                     payload={},
                     timeout_seconds=10.0,
@@ -169,13 +174,13 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         settings = routed_settings(note_ttfb_timeout=0.0, note_hedge_after=0.0)
         route = note_routes(settings)[0]
         session = DispatchSession([
-            ("router.bynara.id", StreamingResponse([sse(delta("fast")), b"data: [DONE]"]))
+            ("api.avalai.ir", StreamingResponse([sse(delta("fast")), b"data: [DONE]"]))
         ])
         result = await llm._complete_streaming_on_route(
             route,
             session,
             settings,
-            url="https://router.bynara.id/v1/chat/completions",
+            url="https://api.avalai.ir/v1/chat/completions",
             headers={},
             payload={},
             timeout_seconds=10.0,
@@ -201,7 +206,7 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         """
         expected = {"sections": [{"heading": "مقدمه"}]}
         lines = [sse(delta(json.dumps(expected, ensure_ascii=False))), b"data: [DONE]"]
-        session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
+        session = DispatchSession([("api.avalai.ir", lambda: StreamingResponse(lines))])
         schema = {
             "type": "object",
             "properties": {
@@ -224,14 +229,14 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_length_finish_reason_is_output_budget_error(self):
         lines = [sse(delta("partial", finish="length")), b"data: [DONE]"]
-        session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
+        session = DispatchSession([("api.avalai.ir", lambda: StreamingResponse(lines))])
         with self.assertRaises(LLMOutputBudgetError):
             await complete(session, self.settings(), system="S", user="U")
         self.assertEqual(len(session.calls), 1)  # never resent unchanged
 
     async def test_streamed_error_object_maps_to_transient(self):
         lines = [sse({"error": {"code": 429, "message": "slow down"}})]
-        session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
+        session = DispatchSession([("api.avalai.ir", lambda: StreamingResponse(lines))])
         settings = self.settings()
         route = note_routes(settings)[0]
         with mock.patch("asyncio.sleep", new=_noop):
@@ -244,13 +249,16 @@ class StreamingTests(unittest.IsolatedAsyncioTestCase):
         settings = routed_settings(note_ttfb_timeout=0.05)
         backup_lines = [sse(delta("backup", finish="stop"))]
         session = DispatchSession([
-            ("bynara", lambda: StreamingResponse([], hang_first=True)),
+            ("avalai", lambda: StreamingResponse([], hang_first=True)),
             ("openrouter", lambda: StreamingResponse(list(backup_lines))),
         ])
-        result = await complete(session, settings, system="S", user="U")
+        result = await complete(
+            session, settings, system="S", user="U",
+            data_sensitivity="STANDARD_EDUCATIONAL",
+        )
         self.assertEqual(result, "backup")
-        nara_calls = [c for c in session.calls if "bynara" in c["url"]]
-        self.assertEqual(len(nara_calls), 1)
+        avalai_calls = [c for c in session.calls if "api.avalai.ir" in c["url"]]
+        self.assertEqual(len(avalai_calls), 1)
 
 
 class ShippedDefaultWiringTests(unittest.IsolatedAsyncioTestCase):
@@ -264,12 +272,10 @@ class ShippedDefaultWiringTests(unittest.IsolatedAsyncioTestCase):
 
     def settings(self, **extra):
         environment = {
-            "NOTE_PROVIDERS": "openai_compatible,nara",
-            "NOTE_API_KEY": "note-key",
-            "NOTE_BASE_URL": "https://note.example/v1",
-            "NOTE_MODEL": "test-model",
-            "NARA_API_KEY": "nara-key",
-            **extra,
+            # Fresh-install surface: AvalAI primary + OpenRouter fallback.
+            "NOTE_PROVIDERS": "avalai,openrouter",
+            "AVALAI_API_KEY": "avalai-key",
+            "OPENROUTER_API_KEY": "or-key",
         }
         with mock.patch.dict(os.environ, environment, clear=True):
             return from_env(env_file="/nonexistent")
@@ -279,7 +285,7 @@ class ShippedDefaultWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(settings.note_ttfb_timeout, 25.0)
         expected = {"sections": [{"heading": "مقدمه"}]}
         lines = [sse(delta(json.dumps(expected, ensure_ascii=False))), b"data: [DONE]"]
-        session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
+        session = DispatchSession([("api.avalai.ir", lambda: StreamingResponse(lines))])
         result = await complete_json(
             session,
             settings,
@@ -292,95 +298,156 @@ class ShippedDefaultWiringTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(sent["stream"])
         self.assertEqual(sent["response_format"]["type"], "json_schema")
 
-    async def test_the_default_hedge_does_not_double_a_healthy_request(self):
-        """Hedging exists for tail latency, not for every call."""
+    async def test_the_default_install_never_hedges_a_healthy_request(self):
+        """Hedging is disabled at the shipped default (NOTE_HEDGE_AFTER_SECONDS=0):
+        a cheap first provider answers alone and the fallback is never consulted."""
         settings = self.settings()
-        self.assertEqual(settings.note_hedge_after, 60.0)
+        self.assertEqual(settings.note_hedge_after, 0.0)
         self.assertEqual(settings.note_concurrency, 3)
         lines = [sse(delta("fast", finish="stop")), b"data: [DONE]"]
-        session = DispatchSession([("note.example", lambda: StreamingResponse(lines))])
+        session = DispatchSession([("api.avalai.ir", lambda: StreamingResponse(lines))])
         result = await complete(session, settings, system="S", user="U")
         self.assertEqual(result, "fast")
         self.assertEqual(len(session.calls), 1)
 
 
-class HedgeResponse(FakeResponse):
-    def __init__(self, text, delay, cancelled: list):
-        super().__init__(200, {"choices": [{"message": {"content": text}}]})
-        self._delay = delay
-        self._cancelled = cancelled
+class NoHedgingTests(unittest.IsolatedAsyncioTestCase):
+    """Healthy calls never race a backup, even with a stale nonzero hedge knob.
 
-    async def read(self):
-        try:
-            await asyncio.sleep(self._delay)
-        except asyncio.CancelledError:
-            self._cancelled.append(True)
-            raise
-        return json.dumps(self._payload).encode()
+    Patch only the provider I/O boundary: public dispatch, local capacity and
+    the real temporary SQLite quota ledger all run normally.
+    """
 
+    async def asyncSetUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
 
-class HedgingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_slow_primary_fast_backup_wins_and_primary_cancelled(self):
-        cancelled: list = []
-        session = DispatchSession([
-            ("bynara", lambda: HedgeResponse("primary", 5.0, cancelled)),
-            ("openrouter", lambda: HedgeResponse("backup", 0.01, cancelled)),
-        ])
-        settings = routed_settings(note_hedge_after=0.05)
-        result = await complete(session, settings, system="S", user="U")
-        self.assertEqual(result, "backup")
-        self.assertEqual(cancelled, [True])
-
-    async def test_fast_primary_failure_stays_sequential(self):
-        cancelled: list = []
-        session = DispatchSession([
-            ("bynara", FakeResponse(401, {"error": {"message": "bad key"}})),
-            ("openrouter", lambda: HedgeResponse("backup", 0.0, cancelled)),
-        ])
-        settings = routed_settings(note_hedge_after=5.0)
-        result = await complete(session, settings, system="S", user="U")
-        self.assertEqual(result, "backup")
-        self.assertEqual(len(session.calls), 2)  # one per provider, no race
-
-    async def test_outer_cancellation_cancels_both_hedged_requests_and_releases_slots(self):
-        started = {"nara": asyncio.Event(), "openrouter": asyncio.Event()}
-        cancelled: list[str] = []
-
-        class BlockingResponse(FakeResponse):
-            def __init__(self, provider: str):
-                super().__init__(200, {"choices": [{"message": {"content": "unused"}}]})
-                self.provider = provider
-
-            async def read(self):
-                started[self.provider].set()
-                try:
-                    await asyncio.Event().wait()
-                except asyncio.CancelledError:
-                    cancelled.append(self.provider)
-                    raise
-
-        session = DispatchSession([
-            ("bynara", lambda: BlockingResponse("nara")),
-            ("openrouter", lambda: BlockingResponse("openrouter")),
-        ])
-        settings = routed_settings(
-            note_hedge_after=0.01,
-            note_ttfb_timeout=0.0,
-            note_request_timeout=30.0,
+    def settings(self, name, *, hedge_after=0.001):
+        return routed_settings(
+            db_path=self.root / f"{name}.sqlite3",
+            note_hedge_after=hedge_after,
+            llm_primary_max_in_flight=1,
+            llm_fallback_max_in_flight=1,
         )
+
+    def assert_released(self, settings):
         pool = pool_for("llm", settings)
-        task = asyncio.create_task(complete(session, settings, system="S", user="U"))
-        await asyncio.wait_for(
-            asyncio.gather(started["nara"].wait(), started["openrouter"].wait()),
-            timeout=2.0,
-        )
-        task.cancel()
-        with self.assertRaises(asyncio.CancelledError):
-            await task
-        self.assertCountEqual(cancelled, ["nara", "openrouter"])
-        self.assertEqual(pool.in_flight("nara"), 0)
+        self.assertEqual(pool.in_flight("avalai"), 0)
         self.assertEqual(pool.in_flight("openrouter"), 0)
-        self.assertEqual(pool.waiters, 0)
+        with sqlite3.connect(settings.db_path) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM llm_quota_reservations").fetchone()[0], 0)
+
+    @staticmethod
+    def invoke(entry, settings):
+        return getattr(llm, entry)(
+            object(), settings, system="Synthetic instruction", user="Synthetic lesson",
+            data_sensitivity="STANDARD_EDUCATIONAL",
+        )
+
+    async def test_slow_healthy_primary_is_not_hedged_with_default_or_stale_knob(self):
+        for entry, seam in (("complete", "_complete_on_route"), ("complete_json", "_complete_json_on_route")):
+            for delay in (0.0, 0.001):
+                with self.subTest(entry=entry, hedge_after=delay):
+                    settings = self.settings(f"{entry}-{delay}", hedge_after=delay)
+                    entered, release = asyncio.Event(), asyncio.Event()
+                    calls = []
+                    expected = {"ok": True} if entry == "complete_json" else "primary answer"
+
+                    async def provider(route, *_args, calls=calls, entered=entered, release=release, expected=expected, **_kwargs):
+                        calls.append(route.slug)
+                        if route.slug == "avalai":
+                            entered.set()
+                            await release.wait()
+                        return expected
+
+                    with mock.patch.object(llm, seam, side_effect=provider):
+                        job = asyncio.create_task(self.invoke(entry, settings))
+                        try:
+                            await asyncio.wait_for(entered.wait(), timeout=2.0)
+                            # Let several stale hedge deadlines elapse while
+                            # the first provider still owns its slot.
+                            await asyncio.sleep(0.03)
+                            self.assertEqual(calls, ["avalai"])
+                            self.assertFalse(job.done())
+                            self.assertEqual(pool_for("llm", settings).in_flight("openrouter"), 0)
+                            release.set()
+                            self.assertEqual(await asyncio.wait_for(job, timeout=2.0), expected)
+                        finally:
+                            release.set()
+                            if not job.done():
+                                job.cancel()
+                            await asyncio.gather(job, return_exceptions=True)
+                    self.assertEqual(calls, ["avalai"])
+                    self.assert_released(settings)
+
+    async def test_backup_starts_only_after_primary_failure_and_slot_release(self):
+        for entry, seam in (("complete", "_complete_on_route"), ("complete_json", "_complete_json_on_route")):
+            with self.subTest(entry=entry):
+                settings = self.settings(entry)
+                entered, release = asyncio.Event(), asyncio.Event()
+                events = []
+                expected = {"ok": True} if entry == "complete_json" else "backup answer"
+
+                async def provider(route, *_args, events=events, entered=entered, release=release, settings=settings, expected=expected, **_kwargs):
+                    events.append(f"{route.slug}:start")
+                    try:
+                        if route.slug == "avalai":
+                            entered.set()
+                            await release.wait()
+                            raise LLMResponseError("synthetic primary failure")
+                        self.assertEqual(pool_for("llm", settings).in_flight("avalai"), 0)
+                        return expected
+                    finally:
+                        events.append(f"{route.slug}:stop")
+
+                with mock.patch.object(llm, seam, side_effect=provider):
+                    job = asyncio.create_task(self.invoke(entry, settings))
+                    try:
+                        await asyncio.wait_for(entered.wait(), timeout=2.0)
+                        await asyncio.sleep(0.03)
+                        self.assertEqual(events, ["avalai:start"])
+                        release.set()
+                        self.assertEqual(await asyncio.wait_for(job, timeout=2.0), expected)
+                    finally:
+                        release.set()
+                        if not job.done():
+                            job.cancel()
+                        await asyncio.gather(job, return_exceptions=True)
+                self.assertEqual(events, ["avalai:start", "avalai:stop", "openrouter:start", "openrouter:stop"])
+                self.assert_released(settings)
+
+    async def test_cancelled_primary_releases_local_and_sqlite_slots_without_starting_backup(self):
+        for entry, seam in (("complete", "_complete_on_route"), ("complete_json", "_complete_json_on_route")):
+            with self.subTest(entry=entry):
+                settings = self.settings(entry)
+                entered = asyncio.Event()
+                calls = []
+                expected = {"ok": True} if entry == "complete_json" else "next answer"
+
+                async def provider(route, *_args, calls=calls, entered=entered, expected=expected, **_kwargs):
+                    calls.append(route.slug)
+                    if len(calls) == 1:
+                        entered.set()
+                        await asyncio.Event().wait()
+                    return expected
+
+                with mock.patch.object(llm, seam, side_effect=provider):
+                    job = asyncio.create_task(self.invoke(entry, settings))
+                    try:
+                        await asyncio.wait_for(entered.wait(), timeout=2.0)
+                        job.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await asyncio.wait_for(job, timeout=2.0)
+                    finally:
+                        if not job.done():
+                            job.cancel()
+                        await asyncio.gather(job, return_exceptions=True)
+                    self.assertEqual(calls, ["avalai"])
+                    self.assert_released(settings)
+                    self.assertEqual(await asyncio.wait_for(self.invoke(entry, settings), timeout=2.0), expected)
+                self.assertEqual(calls, ["avalai", "avalai"])
+                self.assert_released(settings)
 
 
 class TransportTests(unittest.TestCase):
@@ -417,7 +484,7 @@ class PlanDeckConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         active = 0
         max_active = 0
 
-        async def fake_complete_json(session, settings, *, system, user):
+        async def fake_complete_json(session, settings, *, system, user, **_kwargs):
             nonlocal active, max_active
             active += 1
             max_active = max(max_active, active)
@@ -428,17 +495,25 @@ class PlanDeckConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             return {"sections": [{"title": f"بخش {index}", "lines": [f"سطر شماره {index}"]}]}
 
         with mock.patch.object(office_ai, "complete_json", fake_complete_json):
-            slides = await plan_deck(self.TEXT, settings=make_settings(), session=object())
+            slides = await plan_deck(
+                self.TEXT,
+                settings=make_settings(avalai_api_key="avalai-test-key"),
+                session=object(),
+            )
         assert slides is not None
         self.assertGreater(max_active, 1)
         self.assertEqual([s.title for s in slides], ["بخش 1", "بخش 2", "بخش 3", "بخش 4"])
 
     async def test_dropped_lines_failure_still_triggers(self):
-        async def fake_complete_json(session, settings, *, system, user):
+        async def fake_complete_json(session, settings, *, system, user, **_kwargs):
             return {"sections": [{"title": "بخش", "lines": ["یک", "دو", "سه", "چهار"]}]}
 
         with mock.patch.object(office_ai, "complete_json", fake_complete_json):
-            slides = await plan_deck(self.TEXT, settings=make_settings(), session=object())
+            slides = await plan_deck(
+                self.TEXT,
+                settings=make_settings(avalai_api_key="avalai-test-key"),
+                session=object(),
+            )
         self.assertIsNone(slides)
 
 

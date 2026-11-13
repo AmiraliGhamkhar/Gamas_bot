@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import random
 import re
 import unicodedata
@@ -302,6 +303,8 @@ def _clean_source(value: Any) -> str:
     """
     if isinstance(value, bool) or value is None:
         return ""
+    if isinstance(value, float) and not math.isfinite(value):
+        return ""
     if isinstance(value, (int, float)):
         return _clean_str(str(value), MAX_SOURCE_CHARS)
     return _clean_str(value, MAX_SOURCE_CHARS)
@@ -309,8 +312,10 @@ def _clean_source(value: Any) -> str:
 
 #: Persian/English spellings of the two allowed difficulty tags. The schema asks
 #: for ``medium``/``hard``, but a route without structured-output enforcement
-#: answers in the language of the prompt; an unrecognized label used to reject
-#: the whole question (S5: the tag is metadata and never causes rejection).
+#: answers in the language of the prompt, so both spellings map to the same tag.
+#: An unrecognized label is invalid: the generation boundary requires a valid
+#: tag on every question (the quiz schema lists ``difficulty`` as required), so
+#: a model that cannot follow the tag contract loses the item, not the user.
 _DIFFICULTY_ALIASES: dict[str, str] = {
     "medium": "medium",
     "med": "medium",
@@ -341,6 +346,8 @@ def parse_difficulty(value: Any) -> str | None:
     ``normalize_front`` drops ZWNJ and punctuation and case-folds, so «سخت‌تر»,
     «HARD.» and «hard» all reach the same alias entry.
     """
+    if not isinstance(value, str):
+        return None
     return _DIFFICULTY_ALIASES.get(normalize_front(value)) or None
 
 
@@ -683,8 +690,8 @@ def parse_quiz_payload(
     count: int,
     *,
     rng: random.Random | None = None,
-    require_source: bool = False,
-    require_difficulty: bool = False,
+    require_source: bool = True,
+    require_difficulty: bool = True,
 ) -> list[dict[str, Any]]:
     """Validate/clamp a model answer and return at most ``count`` questions.
 
@@ -692,8 +699,10 @@ def parse_quiz_payload(
     Surviving options are shuffled and ``correct`` is remapped, so a model that
     favours option 0 cannot create a predictable answer key.
 
-    Generation from either documents or booklets requires source and difficulty;
-    the optional flags let legacy callers parse pre-existing untagged content.
+    The generation boundary contract (``bot_learning``) requires a nonempty
+    source locator and a valid ``medium``/``hard`` difficulty tag on every
+    question, so both requirements are the default here — the flags only exist
+    for explicitly permissive callers parsing pre-existing untagged content.
     """
     raw_questions = _list_from_payload(payload, _QUIZ_LIST_KEYS)
     if not isinstance(raw_questions, list):
@@ -738,8 +747,9 @@ def parse_quiz_payload(
         else:
             rng.shuffle(order)
         shuffled = [options[index] for index in order]
-        # Legacy callers may read older items without difficulty, whereas the
-        # generation boundary explicitly requires a valid tag and source.
+        # The generation boundary requires a valid difficulty tag and a
+        # nonempty source locator on every question; explicitly permissive
+        # callers may still read older untagged content with the flags off.
         record: dict[str, Any] = {
             "question": question,
             "options": shuffled,
@@ -752,8 +762,8 @@ def parse_quiz_payload(
         if difficulty is not None:
             record["difficulty"] = difficulty
         elif require_difficulty:
-            # Legacy strictness only: generation records the tag when present
-            # and never rejects a question over it (S5).
+            # Invalid tag (missing, wrong type, or an unrecognized label): the
+            # schema lists difficulty as required, so the item is inadmissible.
             continue
         source = _clean_source(_source_field(entry))
         if source:
@@ -814,12 +824,14 @@ def flashcard_system_prompt(
 
 
 def parse_flashcard_payload(
-    payload: dict[str, Any], count: int, *, require_source: bool = False
+    payload: dict[str, Any], count: int, *, require_source: bool = True
 ) -> list[dict[str, str]]:
     """Validate/clamp a model answer into at most ``count`` Q/A cards.
 
-    ``source`` is required for newly generated document and booklet cards;
-    legacy callers may still parse older untagged items. A yes/no front is dropped.
+    ``source`` is the grounding contract of every newly generated document and
+    booklet card, so it is required by default (matching the generation
+    boundary in ``bot_learning``); explicitly permissive callers may still
+    parse older untagged items. A yes/no front is dropped.
     """
     raw_cards = _list_from_payload(payload, _CARD_LIST_KEYS)
     if not isinstance(raw_cards, list):

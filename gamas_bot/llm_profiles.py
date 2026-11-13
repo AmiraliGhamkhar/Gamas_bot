@@ -27,7 +27,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
 
 from .config import APPROVED_LLM_PROVIDERS, NOTE_JSON_OBJECT_PROVIDERS
 
@@ -89,9 +88,6 @@ _REASONING_FORMAT_MODEL_MARKERS = (
     "deepseek-r1",
 )
 
-#: Native OpenAI reasoning model prefixes that require ``max_completion_tokens``
-#: and reject non-default ``temperature`` on ``api.openai.com``.
-_OPENAI_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5")
 
 
 def to_gemini_schema(node: object) -> object:
@@ -242,19 +238,6 @@ def to_non_strict_openai_json_schema(
     return {"name": name, "schema": schema}
 
 
-def _is_openai_official_host(base_url: str) -> bool:
-    host = (urlsplit(base_url).hostname or "").lower()
-    return host == "api.openai.com" or host.endswith(".openai.com")
-
-
-def _is_openai_reasoning_model(model: str) -> bool:
-    bare = model.strip().lower().rsplit("/", 1)[-1]
-    return any(
-        bare == prefix or bare.startswith(prefix + "-")
-        for prefix in _OPENAI_REASONING_PREFIXES
-    )
-
-
 def _needs_parsed_reasoning_format(model: str) -> bool:
     lower = model.strip().lower()
     return any(marker in lower for marker in _REASONING_FORMAT_MODEL_MARKERS)
@@ -276,10 +259,9 @@ class ProviderCapabilityProfile:
     documented_stream_options: bool = True
     documented_reasoning_effort: bool = False
     parsed_reasoning_for_json: bool = False
-    #: Optional documented provider cap. All currently registered routes leave
-    #: it ``None``: no lower cap than the operator's ``NOTE_MAX_OUTPUT_TOKENS``
-    #: is documented for them, so the configured budget (16,384 by default,
-    #: 32,768 in the tested deployment profile) reaches the wire unchanged.
+    #: Reference completion cap, separate from the configured operational
+    #: output budget (16,384 by default). Clamp only when that budget exceeds
+    #: the provider/model cap; never expand it to match the reference window.
     max_output_tokens_cap: int | None = None
     # Reference capability metadata, deliberately separate from the application's
     # configured operational budgets (which are not provider guarantees).
@@ -314,8 +296,8 @@ class ProviderCapabilityProfile:
         )
         if use_schema and schema is not None:
             if not self.documented_json_schema:
-                # DeepSeek documents JSON Output but not strict ``json_schema``;
-                # Nara and Anthropic document neither, so they get no field.
+                # A model without schema support can still use documented
+                # JSON-object mode; all responses remain locally validated.
                 if (
                     self.documented_json_object
                     and route.slug in NOTE_JSON_OBJECT_PROVIDERS
@@ -326,13 +308,6 @@ class ProviderCapabilityProfile:
                 return None
             if self.slug == "openrouter" and _openrouter_prefers_json_object(route.model):
                 return {"type": "json_object"}
-            if self.slug == "openai_compatible" and _is_openai_official_host(
-                route.base_url
-            ):
-                return {
-                    "type": "json_schema",
-                    "json_schema": to_strict_openai_json_schema(schema),
-                }
             return {
                 "type": "json_schema",
                 "json_schema": to_non_strict_openai_json_schema(schema),
@@ -349,15 +324,6 @@ class ProviderCapabilityProfile:
     ) -> None:
         """Attach provider-specific OpenAI-compatible extensions safely."""
         if (
-            self.slug == "openai_compatible"
-            and _is_openai_official_host(route.base_url)
-            and _is_openai_reasoning_model(route.model)
-        ):
-            if "max_tokens" in payload:
-                payload["max_completion_tokens"] = payload.pop("max_tokens")
-            payload.pop("temperature", None)
-
-        if (
             self.parsed_reasoning_for_json
             and "response_format" in payload
             and _needs_parsed_reasoning_format(route.model)
@@ -373,15 +339,6 @@ class ProviderCapabilityProfile:
         if settings.note_reasoning_effort and self.documented_reasoning_effort:
             payload["reasoning_effort"] = settings.note_reasoning_effort
 
-
-_DEFAULT_PROFILE = ProviderCapabilityProfile(
-    slug="openai_compatible",
-    documented_json_object=True,
-    documented_json_schema=True,
-    supports_streaming_with_json_schema=True,
-    documented_stream_options=True,
-    documented_reasoning_effort=False,
-)
 
 PROVIDER_PROFILES: dict[str, ProviderCapabilityProfile] = {
     "openrouter": ProviderCapabilityProfile(

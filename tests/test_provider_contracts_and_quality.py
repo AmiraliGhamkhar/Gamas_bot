@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import random
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.parse import urlsplit
 from unittest import mock
 
 from telethon.errors import FloodWaitError, MessageIdInvalidError
@@ -22,13 +24,8 @@ from gamas_bot.learning import (
     parse_flashcard_payload,
     parse_quiz_payload,
 )
-from gamas_bot.llm import (
-    LLMContextOverflowError,
-    LLMOutputBudgetError,
-    LLMRequestError,
-    extract_json_object,
-)
-from gamas_bot.llm_profiles import to_gemini_schema
+from gamas_bot.llm import extract_json_object
+from gamas_bot.llm_profiles import to_gemini_schema, to_strict_openai_json_schema
 from gamas_bot.notes import (
     COVERAGE_FILL_SYSTEM_PROMPT,
     NoteSection,
@@ -114,8 +111,129 @@ class _FakeHTTPSession:
         return self._responses.pop(0)
 
 
+class ApprovedRoutingEntryPointTests(unittest.IsolatedAsyncioTestCase):
+    """Exercise real dispatch and request building, not just ordering helpers."""
+
+    HOSTS = {
+        "api.avalai.ir": "avalai", "generativelanguage.googleapis.com": "gemini",
+        "openrouter.ai": "openrouter",
+    }
+
+    async def asyncSetUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.case_index = 0
+
+    def settings(self, **overrides):
+        self.case_index += 1
+        values = {
+            "db_path": self.root / f"route-{self.case_index}.sqlite3",
+            "note_providers": ("openrouter", "gemini", "nara", "avalai", "deepseek"),
+            "note_provider": "anthropic",
+            "note_api_key": "obsolete-slot-key",
+            "note_api_base_url": "https://obsolete.example.test/v1",
+            "avalai_api_key": "av-test", "gemini_api_key": "g-test", "openrouter_api_key": "or-test",
+        }
+        values.update(overrides)
+        return make_settings(**values)
+
+    async def assert_route_order(self, entry, expected, *, task="", prefer="", sensitivity="STANDARD_EDUCATIONAL", **overrides):
+        settings = self.settings(**overrides)
+        text = '{"ok": true}'
+        if expected[-1] == "gemini":
+            answer = {"candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}]}
+        else:
+            answer = {"choices": [{"message": {"content": text}, "finish_reason": "stop"}]}
+        responses = [
+            _FakeHTTPResponse(400, json_body={"error": {"message": "synthetic input rejected"}})
+            for _ in expected[:-1]
+        ] + [_FakeHTTPResponse(200, json_body=answer)]
+        session = _FakeHTTPSession(responses)
+        kwargs = {"system": "Synthetic instruction", "user": "Synthetic lesson", "task": task, "data_sensitivity": sensitivity}
+        if entry == "complete_json":
+            kwargs["prefer_provider"] = prefer
+        result = await getattr(llm, entry)(session, settings, **kwargs)
+        self.assertEqual(result, {"ok": True} if entry == "complete_json" else text)
+        self.assertEqual([self.HOSTS[urlsplit(c["url"]).hostname] for c in session.calls], list(expected))
+        # Each endpoint gets only its own credential; the removed slot's key
+        # cannot leak through either preference or classification.
+        for call in session.calls:
+            slug = self.HOSTS[urlsplit(call["url"]).hostname]
+            headers = call["headers"]
+            self.assertNotIn("obsolete-slot-key", str(headers))
+            if slug == "gemini":
+                self.assertEqual(headers["x-goog-api-key"], "g-test")
+            else:
+                self.assertEqual(headers["Authorization"], f"Bearer {'av-test' if slug == 'avalai' else 'or-test'}")
+
+    async def test_task_priorities_override_reversed_chain_and_primary_preferences(self):
+        families = (
+            (("BOOKLET_GENERATION", "BOOKLET_REPAIR", "BOOKLET_COMPILE", "QUIZ_20", "QUIZ_DIFFICULT"),
+             ("avalai", "gemini", "openrouter"), "gemini"),
+            (("KEY_POINTS", "COMPACT_NOTES", "QUIZ_GENERATION", "FLASHCARD_GENERATION", "OFFICE_TABLE_GENERATION",
+              "OFFICE_SLIDE_PLANNING", "OFFICE_DOCUMENT_GENERATION"),
+             ("gemini", "avalai", "openrouter"), "avalai"),
+        )
+        for tasks, expected, contrary_preference in families:
+            for task in tasks:
+                with self.subTest(entry="complete", task=task):
+                    await self.assert_route_order("complete", expected, task=task)
+                for preference in ("openrouter", contrary_preference):
+                    with self.subTest(entry="complete_json", task=task, preference=preference):
+                        await self.assert_route_order("complete_json", expected, task=task, prefer=preference)
+
+    async def test_unknown_task_and_removed_preferences_never_promote_openrouter_or_add_routes(self):
+        for preference in ("", "openrouter", "nara", "deepseek", "groq", "cerebras", "anthropic", "openai_compatible"):
+            with self.subTest(preference=preference):
+                await self.assert_route_order(
+                    "complete_json", ("gemini", "avalai", "openrouter"), task="custom_task", prefer=preference,
+                )
+        await self.assert_route_order("complete_json", ("avalai", "gemini", "openrouter"), prefer="avalai")
+        await self.assert_route_order("complete", ("gemini", "avalai", "openrouter"))
+
+    async def test_unknown_content_never_uses_openrouter_even_with_sensitive_opt_in(self):
+        for entry in ("complete", "complete_json"):
+            for label in ("UNKNOWN", "unrecognized-label"):
+                with self.subTest(entry=entry, sensitivity=label):
+                    await self.assert_route_order(
+                        entry, ("gemini", "avalai"), sensitivity=label, prefer="openrouter",
+                        openrouter_free_allow_sensitive_data=True,
+                    )
+
+    async def test_sensitive_content_requires_individual_provider_approval(self):
+        flags = {"avalai": "avalai_allow_sensitive_data", "gemini": "gemini_free_allow_sensitive_data",
+                 "openrouter": "openrouter_free_allow_sensitive_data"}
+        for entry in ("complete", "complete_json"):
+            for label in ("INTERNAL", "SENSITIVE", "PHI_OR_PII"):
+                session = _FakeHTTPSession([])
+                with self.subTest(entry=entry, label=label, approved="none"), self.assertRaises(llm.LLMAuthError):
+                    await getattr(llm, entry)(session, self.settings(), system="S", user="Synthetic lesson", data_sensitivity=label)
+                self.assertEqual(session.calls, [])
+                for provider, flag in flags.items():
+                    with self.subTest(entry=entry, label=label, approved=provider):
+                        await self.assert_route_order(entry, (provider,), sensitivity=label, **{flag: True})
+
+    async def test_removed_programmatic_slots_cannot_build_or_send_requests(self):
+        for slug in ("nara", "deepseek", "groq", "cerebras", "anthropic", "openai_compatible"):
+            settings = self.settings(
+                note_provider=slug, note_providers=(slug,),
+                avalai_api_key="", gemini_api_key="", openrouter_api_key="",
+            )
+            for entry in ("complete", "complete_json"):
+                session = _FakeHTTPSession([])
+                kwargs = {"prefer_provider": slug} if entry == "complete_json" else {}
+                with self.subTest(slug=slug, entry=entry), self.assertRaises(llm.LLMAuthError):
+                    await getattr(llm, entry)(session, settings, system="S", user="Synthetic lesson", **kwargs)
+                self.assertEqual(session.calls, [])
+            route = NoteRoute(slug=slug, label="Removed", style="openai", base_url="https://obsolete.example.test/v1",
+                              api_key="obsolete-slot-key", model="synthetic", json_object_mode=True)
+            with self.subTest(slug=slug, entry="request builder"), self.assertRaisesRegex(ValueError, "Unapproved"):
+                llm._build_request_for(route, settings, "S", "Synthetic lesson")
+
+
 class ProviderDialectContractTests(unittest.TestCase):
-    """Official 2026 provider dialect contracts across Gemini, OpenRouter, Nara, OpenAI, Anthropic."""
+    """Approved Gemini, AvalAI and OpenRouter contracts; all HTTP is scripted."""
 
     def test_gemini_schema_preserves_required_strips_additional_properties_and_handles_nullable(self) -> None:
         raw = {
@@ -142,6 +260,18 @@ class ProviderDialectContractTests(unittest.TestCase):
         self.assertNotIn("minItems", converted["properties"]["items"])
         self.assertNotIn("maxItems", converted["properties"]["items"])
 
+    def test_shared_schema_transform_keeps_required_tags_and_does_not_mutate_input(self) -> None:
+        for schema in (QUIZ_SCHEMA, FLASHCARD_SCHEMA):
+            original = copy.deepcopy(schema)
+            transformed = to_strict_openai_json_schema(schema)["schema"]
+            key = "questions" if schema is QUIZ_SCHEMA else "cards"
+            item = transformed["properties"][key]["items"]
+            self.assertIn("source", item["required"])
+            if key == "questions":
+                self.assertIn("difficulty", item["required"])
+            self.assertFalse(item["additionalProperties"])
+            self.assertEqual(schema, original)
+
     def test_gemini_omits_response_schema_when_structured_output_setting_is_disabled(self) -> None:
         settings = make_settings(
             note_providers=("gemini",),
@@ -154,24 +284,6 @@ class ProviderDialectContractTests(unittest.TestCase):
         )
         self.assertNotIn("responseSchema", payload["generationConfig"])
         self.assertEqual(payload["generationConfig"]["responseMimeType"], "application/json")
-
-    def test_deepseek_uses_documented_json_object_and_never_strict_schema(self) -> None:
-        settings = make_settings(
-            note_providers=("deepseek",),
-            deepseek_api_key="ds-test",
-            deepseek_model="deepseek-flash",
-            note_structured_output=True,
-        )
-        route = note_routes(settings)[0]
-        url, headers, payload = llm._build_request_for(
-            route, settings, "S", "U", schema=COMPACT_NOTE_SCHEMA
-        )
-        self.assertEqual(url, "https://api.deepseek.com/chat/completions")
-        self.assertEqual(headers["Authorization"], "Bearer ds-test")
-        self.assertEqual(payload["model"], "deepseek-flash")
-        self.assertEqual(payload["response_format"], {"type": "json_object"})
-        self.assertNotIn("json_schema", json.dumps(payload["response_format"]))
-        self.assertNotIn("stream_options", payload)
 
     def test_avalai_sends_documented_json_schema_with_a_json_object_fallback(self) -> None:
         """AvalAI documents ``json_schema``; a refusal degrades, never fails.
@@ -249,61 +361,6 @@ class ProviderDialectContractTests(unittest.TestCase):
         self.assertEqual(adj1, "response_format.json_schema_to_json_object")
         self.assertEqual(paid_payload["response_format"], {"type": "json_object"})
 
-    def test_nara_suppresses_undocumented_response_format_and_stream_options(self) -> None:
-        settings = make_settings(
-            note_providers=("nara",),
-            nara_api_key="nara-key",
-            note_structured_output=True,
-        )
-        route = note_routes(settings)[0]
-        _u, _h, payload = llm._build_request_for(
-            route, settings, "S", "U", schema=QUIZ_SCHEMA
-        )
-        self.assertNotIn("response_format", payload)
-
-    def test_direct_openai_reasoning_model_uses_max_completion_tokens_and_omits_temperature(self) -> None:
-        route = NoteRoute(
-            slug="openai_compatible",
-            label="OpenAI",
-            base_url="https://api.openai.com/v1",
-            api_key="sk-test",
-            model="o3-mini",
-            style="openai",
-            json_object_mode=True,
-        )
-        settings = make_settings(note_structured_output=True)
-        _u, _h, payload = llm._build_request_for(
-            route, settings, "S", "U", schema=FLASHCARD_SCHEMA
-        )
-        self.assertIn("max_completion_tokens", payload)
-        self.assertNotIn("max_tokens", payload)
-        self.assertNotIn("temperature", payload)
-        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
-
-    def test_anthropic_stop_reasons_and_thinking_exhaustion(self) -> None:
-        dialect = llm.DIALECTS["anthropic"]
-        thinking_payload = {
-            "content": [{"type": "thinking", "thinking": "long reasoning..."}],
-            "stop_reason": "max_tokens",
-        }
-        self.assertTrue(dialect.is_reasoning_exhausted(thinking_payload))
-        with self.assertRaises(LLMOutputBudgetError):
-            dialect.parse_response(thinking_payload)
-
-        overflow_payload = {
-            "content": [{"type": "text", "text": "partial"}],
-            "stop_reason": "model_context_window_exceeded",
-        }
-        with self.assertRaises(LLMContextOverflowError):
-            dialect.parse_response(overflow_payload)
-
-        refusal_payload = {
-            "content": [{"type": "text", "text": ""}],
-            "stop_reason": "refusal",
-        }
-        with self.assertRaises(LLMRequestError):
-            dialect.parse_response(refusal_payload)
-
     def test_explicit_numeric_output_cap_error_clamps_budget(self) -> None:
         payload = {"model": "x", "max_tokens": 16_384}
         adj = llm._adjust_rejected_request_param(
@@ -316,7 +373,7 @@ class ProviderDialectContractTests(unittest.TestCase):
 
 class StreamingAndExtractionTests(unittest.IsolatedAsyncioTestCase):
     async def test_sse_stream_handles_single_line_over_64kib_without_chunk_too_big(self) -> None:
-        settings = make_settings(note_ttfb_timeout=10.0)
+        settings = make_settings(avalai_api_key="avalai-test-key", note_ttfb_timeout=10.0)
         route = note_routes(settings)[0]
         big_text = "الف" * 40_000  # >80 KiB UTF-8 in one single SSE data line
         sse_line = (
@@ -337,8 +394,8 @@ class StreamingAndExtractionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_sse_stream_falls_back_when_gateway_returns_plain_json_body(self) -> None:
         settings = make_settings(
-            note_providers=("nara",),
-            nara_api_key="nara-key",
+            note_providers=("avalai",),
+            avalai_api_key="avalai-test-key",
             note_ttfb_timeout=10.0,
         )
         route = note_routes(settings)[0]
@@ -351,7 +408,7 @@ class StreamingAndExtractionTests(unittest.IsolatedAsyncioTestCase):
             route, session, settings, system="S", user="U"
         )
         self.assertEqual(result, '{"ok": true}')
-        # Nara must not receive stream_options.
+        # AvalAI never receives stream_options when its profile documents none.
         self.assertNotIn("stream_options", session.calls[0]["json"])
 
     async def test_avalai_stream_logs_its_request_id_for_cost_reconciliation(self) -> None:
@@ -386,33 +443,18 @@ class StreamingAndExtractionTests(unittest.IsolatedAsyncioTestCase):
             llm.LLM_CONNECT_TIMEOUT_SECONDS,
         )
 
-    async def test_anthropic_sse_streaming_assembles_text_and_usage(self) -> None:
-        route = NoteRoute(
-            slug="anthropic",
-            label="Anthropic",
-            base_url="https://api.anthropic.com",
-            api_key="sk-ant-test",
-            model="claude-sonnet-4-5",
-            style="anthropic",
-            json_object_mode=False,
-        )
-        settings = make_settings(note_ttfb_timeout=10.0)
-        events = [
-            b'event: message_start\ndata: {"type":"message_start","message":{"model":"claude-sonnet-4-5","usage":{"input_tokens":25}}}\n\n',
-            b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"{\\"sections\\": "}}\n\n',
-            b'event: content_block_delta\ndata: {"type":"content_block_delta","delta":{"type":"text_delta","text":"[]}"}}\n\n',
-            b'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}\n\n',
-        ]
-        session = _FakeHTTPSession([_FakeHTTPResponse(200, chunks=events)])
-        result = await llm._complete_on_route(
-            route, session, settings, system="S", user="U"
-        )
-        self.assertEqual(result, '{"sections": []}')
-        self.assertTrue(session.calls[0]["json"]["stream"])
-        self.assertNotIn("stream_options", session.calls[0]["json"])
-
     async def test_rejected_stream_options_retries_without_stream_options(self) -> None:
-        settings = make_settings(note_ttfb_timeout=10.0)
+        """A gateway that rejects ``stream_options`` gets one bounded retry.
+
+        OpenRouter is the shipped provider whose profile documents
+        ``stream_options``; AvalAI's profile does not, so this retry ladder is
+        exercised on the route that sends the field.
+        """
+        settings = make_settings(
+            openrouter_api_key="or-test-key",
+            note_providers=("openrouter",),
+            note_ttfb_timeout=10.0,
+        )
         route = note_routes(settings)[0]
         err_resp = _FakeHTTPResponse(
             400,
