@@ -1286,8 +1286,8 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.available_seconds(OWNER), 3600)
         self._assert_failure_frame(self.client.texts[-1]["text"])
 
-    async def test_a_quiz_without_any_source_is_anchored_not_failed(self):
-        """A model that omits `source` no longer zeroes out a paid quiz."""
+    async def test_a_quiz_without_source_is_rejected_and_refunded(self):
+        """Missing source metadata cannot be silently filled in at generation."""
         payload = quiz_payload(5)
         for question in payload["questions"]:
             question.pop("source")
@@ -1295,13 +1295,10 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             "gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)
         ) as generator:
             await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
-        self.assertEqual(generator.await_count, 1)
-        state = self.bot._curation[OWNER]
-        self.assertEqual(len(state["items"]), 5)
-        self.assertEqual({item["source"] for item in state["items"]}, {"بخش ۱"})
-        await self.save_curation("quiz")
-        saved = await self.db.db.execute_fetchall("SELECT source FROM quiz_questions")
-        self.assertTrue(all(row[0] == "بخش ۱" for row in saved))
+        self.assertGreaterEqual(generator.await_count, 1)
+        self.assertNotIn(OWNER, self.bot._curation)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
+        self._assert_failure_frame(self.client.texts[-1]["text"])
 
     async def test_a_short_answer_is_topped_up_instead_of_failing(self):
         """3 of 5 questions: the retry asks only for the 2 still missing."""
@@ -1328,13 +1325,8 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(state["items"]), 5)
         self.assertEqual(state["failures"], 0)
 
-    async def test_a_provider_that_rejects_structured_output_still_answers(self):
-        """The repair attempt drops the schema instead of repeating a rejection.
-
-        A route that refuses ``response_format``/``responseSchema`` used to fail
-        every quiz/flashcard call while note generation (which honours
-        NOTE_STRUCTURED_OUTPUT) kept working.
-        """
+    async def test_a_provider_that_rejects_structured_output_does_not_drop_schema(self):
+        """Unsupported structured output fails safely instead of weakening validation."""
         payload = quiz_payload(5)
         seen: list[object] = []
 
@@ -1348,9 +1340,10 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
             "gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)
         ):
             await self.bot._handle_callback(self._event(f"quiz:go:{self.item_id}:5".encode()))
-        self.assertIsNotNone(seen[0])
-        self.assertIsNone(seen[1])
-        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 5)
+        self.assertTrue(seen)
+        self.assertTrue(all(schema is not None for schema in seen))
+        self.assertNotIn(OWNER, self.bot._curation)
+        self.assertEqual(await self.db.available_seconds(OWNER), 3600)
 
     async def test_a_zero_result_failure_says_why(self):
         """«ناموفق» alone is not diagnosable; the frame names the reason."""
@@ -2006,7 +1999,7 @@ class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("متوسط تا سخت", call.kwargs["system"])
         self.assertIn("۴ متوسط", call.kwargs["user"])
         self.assertIn("۶ سخت", call.kwargs["user"])
-        self.assertEqual(call.kwargs["max_output_tokens"], 4096)
+        self.assertEqual(call.kwargs["max_output_tokens"], 5000)
         self.assertIn("سناریو", call.kwargs["system"])
         self.assertIn("همهٔ موارد فوق", call.kwargs["system"])
         self.assertIn("difficulty", call.kwargs["schema"]["properties"]
@@ -2066,6 +2059,14 @@ class AnchoredQualityTests(unittest.TestCase):
                 self.assertLessEqual(sum(counts), total)
                 if weights:
                     self.assertEqual(sum(counts), total)
+
+    def test_topic_signals_raise_importance_without_raw_length_dominating(self):
+        from gamas_bot.learning import topic_importance_weight
+
+        short = "تعریف: آستانهٔ تشخیصی 120 mmhg"
+        long_plain = "شرح کلی و تکراری. " * 300
+        self.assertGreater(topic_importance_weight(short), topic_importance_weight("متن عادی کوتاه"))
+        self.assertLess(topic_importance_weight(long_plain), topic_importance_weight(short))
 
     def test_normalized_near_duplicates_drop_but_distinct_numbers_survive(self):
         from gamas_bot.learning import dedupe_cards, dedupe_questions

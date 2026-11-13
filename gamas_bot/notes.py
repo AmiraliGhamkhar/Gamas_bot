@@ -1534,14 +1534,26 @@ def meets_completeness_threshold(
 #: the cached prefix of every other note request.
 COVERAGE_FILL_SYSTEM_PROMPT = notes_system_prompt() + COVERAGE_FILL_RULES
 
-def build_fill_document(gaps, notes: StructuredNotes) -> str:
-    """Targeted, source-only fill request for the given missing units."""
+def build_fill_document(gaps, notes: StructuredNotes, source: str = "") -> str:
+    """Targeted repair request with only source excerpts relevant to the gaps."""
+    selected_gaps = list(gaps)[:MAX_COVERAGE_GAPS]
     units = "\n".join(
-        "- " + str(gap)[:COVERAGE_GAP_CHARS] for gap in list(gaps)[:MAX_COVERAGE_GAPS]
+        "- " + str(gap)[:COVERAGE_GAP_CHARS] for gap in selected_gaps
     )
+    excerpts: list[str] = []
+    for gap in selected_gaps:
+        words = [word for word in re.findall(r"[\w-]{4,}", str(gap)) if word]
+        match_at = next((source.casefold().find(word.casefold()) for word in words
+                         if source.casefold().find(word.casefold()) >= 0), -1)
+        if match_at >= 0:
+            excerpt = source[max(0, match_at - 250):match_at + 650].strip()
+            if excerpt and excerpt not in excerpts:
+                excerpts.append(excerpt)
+    source_excerpt = "\n\n".join(excerpts[:MAX_COVERAGE_GAPS])[:8_000]
     headings = "، ".join(s.heading for s in notes.sections if s.heading.strip())[:600]
     return (
-        "### واحد آموزشی جاافتاده (عیناً از متن منبع)\n" + units + "\n\n"
+        "### واحد آموزشی جاافتاده\n" + units + "\n\n"
+        "### گزیده‌های مرتبط از متن اصلی\n" + (source_excerpt or "(برای این شکاف گزیدهٔ متنی پیدا نشد)") + "\n\n"
         "### عنوان بخش‌های فعلی جزوه\n" + (headings or "(هنوز بخشی نیست)") + "\n\n"
         "### دستور\n"
         "فقط همین واحد را — همان‌گونه که در متن منبع آمده — در قالب JSON جزوه برگردان تا به "
@@ -1557,11 +1569,10 @@ async def fill_coverage_gaps(
     *,
     semaphore: asyncio.Semaphore | None = None,
 ) -> StructuredNotes:
-    """Fill detected coverage gaps with grounded LLM calls; re-validate after.
+    """Fill all detected coverage gaps in one grounded, bounded request.
 
-    One bounded request per gap. Failures are non-fatal: the audited draft is
-    kept (the same degrade-instead-of-discard rule as the editorial compile), so
-    a transport error never turns a good booklet into a refunded failure.
+    Failure is non-fatal: retain the audited draft and never spin up one request
+    per missing fact. The repaired payload is locally grounded before merging.
     """
     report = assess_completeness(source, notes)
     if report.meets_threshold:
@@ -1572,49 +1583,44 @@ async def fill_coverage_gaps(
         # the grounded draft; never fabricate a glossary/summary to pass a gate.
         logger.info("note completeness %s (skeleton-only shortfall; no fill)", report.summary())
         return notes
-    merged = notes
-    for gap in gaps:
-        message = build_fill_document([gap], merged)
-        try:
-            if semaphore is not None:
-                async with semaphore:
-                    payload = await complete_json(
-                        session, settings,
-                        system=COVERAGE_FILL_SYSTEM_PROMPT,
-                        user=message,
-                        schema=_response_schema(settings),
-                    )
-            else:
+    message = build_fill_document(gaps, notes, source)
+    try:
+        if semaphore is not None:
+            async with semaphore:
                 payload = await complete_json(
                     session, settings,
                     system=COVERAGE_FILL_SYSTEM_PROMPT,
                     user=message,
                     schema=_response_schema(settings),
+                    task="BOOKLET_REPAIR",
                 )
-            filled = _load_json_payload(payload)
-        except Exception as exc:  # noqa: BLE001 - a fill failure never fails the job
-            logger.warning("coverage fill request failed: %s", exc)
-            break
-        if not filled.has_content:
-            continue
-        if getattr(settings, "note_strict_grounding", False):
+        else:
+            payload = await complete_json(
+                session, settings,
+                system=COVERAGE_FILL_SYSTEM_PROMPT,
+                user=message,
+                schema=_response_schema(settings),
+                task="BOOKLET_REPAIR",
+            )
+        filled = _load_json_payload(payload)
+    except Exception as exc:  # noqa: BLE001 - preserve the audited draft
+        logger.warning("coverage fill request failed: %s", type(exc).__name__)
+        return notes
+    if not filled.has_content:
+        return notes
+    if getattr(settings, "note_strict_grounding", False):
+        filled, filled_report = gate_notes(
+            filled, source, strict=True, mode=settings.note_mode
+        )
+        if filled_report.audit.fabricated:
+            filled, _ = scrub_fabricated_numbers(filled, filled_report.audit)
             filled, filled_report = gate_notes(
                 filled, source, strict=True, mode=settings.note_mode
             )
-            if filled_report.audit.fabricated:
-                filled, _ = scrub_fabricated_numbers(filled, filled_report.audit)
-                filled, filled_report = gate_notes(
-                    filled, source, strict=True, mode=settings.note_mode
-                )
-            if not filled.has_content or filled_report.audit.fabricated:
-                logger.warning(
-                    "coverage fill piece rejected by grounding gate: %s",
-                    filled_report.summary(),
-                )
-                continue
-        merged = merge_structured_notes([merged, filled])
-        if meets_completeness_threshold(assess_completeness(source, merged)):
-            break
+        if not filled.has_content or filled_report.audit.fabricated:
+            logger.warning("coverage fill rejected by grounding gate")
+            return notes
+    merged = merge_structured_notes([notes, filled])
     logger.info("note completeness after fill: %s", assess_completeness(source, merged).summary())
     return merged
 
@@ -2328,6 +2334,7 @@ async def _structure_piece(
                 system=system_prompt,
                 user=render(document),
                 schema=_response_schema(settings),
+                task="BOOKLET_GENERATION",
             )
         return _load_json_payload(payload, mode=mode)
     except (LLMContextOverflowError, LLMOutputBudgetError) as exc:
@@ -2536,10 +2543,11 @@ async def _repair_once(
                 system=system_prompt,
                 user=repair_document,
                 schema=_response_schema(settings),
+                task="BOOKLET_REPAIR",
             )
         candidate = _load_json_payload(payload, mode=mode)
     except (LLMError, StructuringError) as exc:
-        logger.warning("repair pass failed (%s); keeping the audited notes", exc)
+        logger.warning("repair pass failed (%s); keeping the audited notes", type(exc).__name__)
         return notes, report
     if targeted:
         candidate, unplaced = merge_repaired_sections(notes, candidate.sections)
@@ -2591,11 +2599,12 @@ async def _compile_once(
             system=edit_system_prompt(),
             user=document,
             schema=_response_schema(settings),
+            task="BOOKLET_COMPILE",
             prefer_provider=getattr(settings, "note_compile_provider", ""),
         )
         compiled = _load_json_payload(payload, mode=mode)
     except (LLMError, StructuringError) as exc:
-        logger.warning("compile pass failed (%s); delivering deterministic merge", exc)
+        logger.warning("compile pass failed (%s); delivering deterministic merge", type(exc).__name__)
         return None
     if not compile_accepts(compiled, notes):
         return None
@@ -2921,7 +2930,7 @@ async def structure_document(
 
     async def finalize(result: StructuredNotes) -> StructuredNotes:
         """CR-4: optionally run the bounded coverage-gap fill pass."""
-        if getattr(settings, "note_completeness_fill", False):
+        if getattr(settings, "note_completeness_fill", False) and not settings.note_strict_grounding:
             return await fill_coverage_gaps(
                 session, settings, document, result, semaphore=semaphore
             )

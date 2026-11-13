@@ -32,7 +32,9 @@ logger = logging.getLogger(__name__)
 
 #: Source material sent to the compact-only prompt in one request. The bound
 #: keeps the prompt small even when an extracted file contains many pages.
-MAX_COMPACT_INPUT_CHARS = 6_000
+# Keep compact-note requests large enough to avoid many tiny calls while staying
+# well inside the configured context budget and cPanel memory ceiling.
+MAX_COMPACT_INPUT_CHARS = 20_000
 MAX_COMPACT_POINTS_PER_CHUNK = 32
 MAX_COMPACT_POINT_CHARS = 6_000
 #: Refuse note generation above this complete-source ceiling. The original
@@ -593,6 +595,7 @@ async def generate_compact_notes(
                         system=COMPACT_NOTE_SYSTEM_PROMPT,
                         user=_compact_prompt(source, title, index),
                         schema=compact_notes_response_schema(),
+                        task="COMPACT_NOTES",
                     )
                 except LLMError as exc:
                     logger.warning(

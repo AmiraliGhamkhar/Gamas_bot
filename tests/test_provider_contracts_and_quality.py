@@ -611,10 +611,10 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(bot._learning_max_chars(), 56_000)
                 calls: list[dict] = []
 
-                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None, wait_for_capacity=True):
+                async def fake_complete_json(_session, _settings, *, system, user, schema=None, max_output_tokens=None, wait_for_capacity=True, task=""):
                     batch_no = len(calls)
-                    calls.append({"system": system, "user": user, "schema": schema})
-                    start = batch_no * 20
+                    calls.append({"system": system, "user": user, "schema": schema, "task": task})
+                    start = batch_no * 10
                     return {
                         "cards": [
                             {
@@ -622,7 +622,7 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                                 "back": f"توضیح مفهوم {i}",
                                 "source": "صفحهٔ ۱",
                             }
-                            for i in range(start, start + 20)
+                            for i in range(start, start + 10)
                         ]
                     }
 
@@ -636,10 +636,10 @@ class LearningRobustnessTests(unittest.IsolatedAsyncioTestCase):
                 )
                 self.assertEqual(failed, 0)
                 self.assertEqual(len(items), 40)
-                self.assertEqual(len(calls), 2)
-                self.assertIsNotNone(calls[0]["schema"])
-                self.assertIsNotNone(calls[1]["schema"])
-                self.assertEqual(calls[0]["system"], calls[1]["system"])
+                self.assertEqual(len(calls), 4)
+                self.assertTrue(all(call["schema"] is not None for call in calls))
+                self.assertTrue(all(call["task"] == "FLASHCARD_GENERATION" for call in calls))
+                self.assertEqual(len({call["system"] for call in calls}), 1)
                 self.assertIn("مفهوم شماره 0 چیست؟", calls[1]["user"])
             finally:
                 await bot.shutdown()

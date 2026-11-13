@@ -342,21 +342,14 @@ async def plan_deck(
             f"حداکثر {max_sections} بخش."
         )
         try:
-            if getattr(settings, "note_structured_output", False):
-                payload = await complete_json(
-                    session,
-                    settings,
-                    system=DECK_SYSTEM_PROMPT,
-                    user=user_prompt,
-                    schema=DECK_SCHEMA,
-                )
-            else:
-                payload = await complete_json(
-                    session,
-                    settings,
-                    system=DECK_SYSTEM_PROMPT,
-                    user=user_prompt,
-                )
+            payload = await complete_json(
+                session,
+                settings,
+                system=DECK_SYSTEM_PROMPT,
+                user=user_prompt,
+                schema=DECK_SCHEMA,
+                task="OFFICE_SLIDE_PLANNING",
+            )
         except Exception as exc:
             logger.warning(
                 "office deck planning chunk failed; skipping chunk error=%s",
@@ -458,21 +451,14 @@ async def infer_table(
         "هر سطر داده باید عیناً از متن کاربر باشد."
     )
     try:
-        if getattr(settings, "note_structured_output", False):
-            payload = await complete_json(
-                session,
-                settings,
-                system=TABLE_SYSTEM_PROMPT,
-                user=user_prompt,
-                schema=TABLE_SCHEMA,
-            )
-        else:
-            payload = await complete_json(
-                session,
-                settings,
-                system=TABLE_SYSTEM_PROMPT,
-                user=user_prompt,
-            )
+        payload = await complete_json(
+            session,
+            settings,
+            system=TABLE_SYSTEM_PROMPT,
+            user=user_prompt,
+            schema=TABLE_SCHEMA,
+            task="OFFICE_TABLE_GENERATION",
+        )
     except Exception as exc:
         logger.warning(
             "office table inference failed; using the plain sheet error=%s",

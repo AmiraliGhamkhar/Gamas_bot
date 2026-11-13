@@ -47,15 +47,9 @@ STT_PROVIDER_ORDER = ("speechmatics", "deepgram", "openai_compatible")
 #: Every note provider the pipeline knows, with the request style each one
 #: speaks. ``nara``/``openrouter``/``openai_compatible`` are OpenAI-compatible
 #: chat-completions APIs; ``gemini`` and ``anthropic`` have their own contracts.
-NOTE_PROVIDER_SLUGS = (
-    "nara",
-    "openrouter",
-    "openai_compatible",
-    "gemini",
-    "deepseek",
-    "anthropic",
-    "avalai",
-)
+APPROVED_LLM_PROVIDERS = frozenset({"gemini", "avalai", "openrouter"})
+NOTE_PROVIDER_SLUGS = ("gemini", "avalai", "openrouter")
+
 #: Provider slugs that were removed from the integration. They are kept only so
 #: a legacy ``NOTE_PROVIDERS`` value is skipped with one explicit warning instead
 #: of being silently treated as an unknown typo.
@@ -110,11 +104,11 @@ NOTE_HOST_PROVIDERS = (
 DEFAULT_NARA_BASE_URL = "https://router.bynara.id/v1"
 DEFAULT_NARA_MODEL = "agnes-2.5-flash"
 DEFAULT_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_OPENROUTER_MODEL = "google/gemma-4-31b-it:free"
+DEFAULT_OPENROUTER_MODEL = "nvidia/nemotron-3.5-super-vl:free"
 #: Google AI Studio's default note model. ``flash-lite`` answers note
 #: extraction/organisation requests several times faster than the thinking
 #: models while staying inside the free tier.
-DEFAULT_GEMINI_MODEL = "gemini-2.5-flash-lite"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 #: DeepSeek's OpenAI-compatible API. ``deepseek-flash`` is the documented id
 #: served by DeepSeek-V4.1-Flash-1017; the base URL carries no version prefix
 #: (https://api-docs.deepseek.com/api/list-models/).
@@ -157,7 +151,7 @@ NOTE_BASE_URL_DEFAULTS = {
 #: deployment can set ``NOTE_PROVIDERS=gemini,openrouter`` (the profile
 #: verified on 2026-11-07, see ``docs/PROVIDERS.md``) without changing what
 #: other deployments get out of the box.
-DEFAULT_NOTE_PROVIDERS = "gemini,nara,openrouter,deepseek,avalai"
+DEFAULT_NOTE_PROVIDERS = "avalai,gemini,openrouter"
 
 DEFAULT_NOTE_MODELS = {
     "openai_compatible": "gpt-4o-mini",
@@ -274,8 +268,8 @@ DEFAULT_STT_PROVIDER_TIMEOUT_SECONDS = 1800.0
 #: the ordinary "one of the running transcriptions finishes soon" case.
 #: Lower it for deliberate fail-fast behaviour.
 DEFAULT_STT_SLOT_WAIT_TIMEOUT_SECONDS = 600.0
-DEFAULT_LLM_PRIMARY_MAX_IN_FLIGHT = 4
-DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT = 4
+DEFAULT_LLM_PRIMARY_MAX_IN_FLIGHT = 3
+DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT = 1
 #: Same reasoning as the STT slot wait, against note requests that may
 #: legitimately run for minutes (``NOTE_REQUEST_TIMEOUT_SECONDS`` allows
 #: 900 s): a 30 s bound made excess chunk requests fail whenever a single
@@ -300,7 +294,7 @@ DEFAULT_OFFICE_JOB_CONCURRENCY = 2
 #:   60 s, the second starts in parallel; at most one extra in-flight POST.
 DEFAULT_NOTE_CONCURRENCY = 3
 DEFAULT_NOTE_TTFB_TIMEOUT_SECONDS = 25.0
-DEFAULT_NOTE_HEDGE_AFTER_SECONDS = 60.0
+DEFAULT_NOTE_HEDGE_AFTER_SECONDS = 0.0
 
 #: Per-provider direct-upload ceilings (bytes). A file larger than a
 #: provider's ceiling is routed to the next configured provider instead of
@@ -698,6 +692,22 @@ class Settings:
     llm_primary_max_in_flight: int = DEFAULT_LLM_PRIMARY_MAX_IN_FLIGHT
     llm_fallback_max_in_flight: int = DEFAULT_LLM_FALLBACK_MAX_IN_FLIGHT
     llm_slot_wait_timeout: float = DEFAULT_LLM_SLOT_WAIT_TIMEOUT_SECONDS
+    avalai_allow_sensitive_data: bool = False
+    gemini_free_allow_sensitive_data: bool = False
+    openrouter_free_allow_sensitive_data: bool = False
+    avalai_rpm_limit: int = 35
+    avalai_tpm_limit: int = 750_000
+    avalai_rpd_limit: int = 0
+    avalai_max_in_flight: int = 3
+    gemini_rpm_limit: int = 0
+    gemini_tpm_limit: int = 0
+    gemini_rpd_limit: int = 0
+    gemini_max_in_flight: int = 1
+    openrouter_rpm_limit: int = 10
+    openrouter_tpm_limit: int = 0
+    openrouter_rpd_limit: int = 15
+    openrouter_max_in_flight: int = 1
+    llm_token_estimation_chars_per_token: float = 1.5
     dedup_window_seconds: float = DEFAULT_DEDUP_WINDOW_SECONDS
     #: Maximum concurrently active free Office build/note/delivery operations.
     office_job_concurrency: int = DEFAULT_OFFICE_JOB_CONCURRENCY
@@ -763,9 +773,9 @@ class Settings:
     flashcard_max_cards_per_deck: int = 200
     #: Parallel per-chunk model calls used by one generation (3–5 is the useful
     #: range; higher starts tripping provider per-minute limits).
-    learning_chunk_concurrency: int = 4
+    learning_chunk_concurrency: int = 1
     learning_global_concurrency: int = 2
-    learning_max_output_tokens: int = 4096
+    learning_max_output_tokens: int = 8192
     document_retention_days: int = 0
     learning_retention_days: int = 0
     audit_retention_days: int = 0
@@ -984,18 +994,11 @@ def _parse_note_providers(raw: str) -> tuple[str, ...]:
         slug = part.strip().lower()
         if not slug:
             continue
-        if slug in REMOVED_NOTE_PROVIDERS:
-            logger.warning(
-                "Ignoring removed note provider %r; supported providers: %s",
-                slug, ", ".join(NOTE_PROVIDER_SLUGS),
-            )
-            continue
         if slug not in NOTE_PROVIDER_SLUGS:
-            logger.warning(
-                "Ignoring unknown note provider %r (known: %s)",
-                slug, ", ".join(NOTE_PROVIDER_SLUGS),
+            raise ValueError(
+                f"Unapproved LLM provider {slug!r}; approved providers: "
+                + ", ".join(NOTE_PROVIDER_SLUGS)
             )
-            continue
         if slug not in order:
             order.append(slug)
     return tuple(order)
@@ -1057,9 +1060,9 @@ def note_route_order(settings: Settings) -> tuple[str, ...]:
     """
     order = list(settings.note_providers)
     legacy = settings.note_provider if _legacy_note_configured(settings) else ""
-    if legacy and legacy not in order:
+    if legacy and legacy not in order and legacy in APPROVED_LLM_PROVIDERS:
         order.append(legacy)
-    return tuple(order)
+    return tuple(slug for slug in order if slug in APPROVED_LLM_PROVIDERS)
 
 
 def _note_route(settings: Settings, slug: str) -> NoteRoute | None:
@@ -1072,7 +1075,7 @@ def _note_route(settings: Settings, slug: str) -> NoteRoute | None:
     request.
     """
     style = NOTE_REQUEST_STYLE.get(slug)
-    if style is None:
+    if slug not in APPROVED_LLM_PROVIDERS or style is None:
         return None
     key, base, model = note_slot_credentials(settings, slug)
     # A provider that has a documented default model uses it; ``anthropic`` has
@@ -1252,6 +1255,17 @@ def from_env(env_file: str | None = None) -> Settings:
         else _env_bool("STT_DIARIZE", True)
     )
     explicit_note_provider = _env("NOTE_PROVIDER").lower()
+    legacy_unapproved_keys = (
+        "NARA_API_KEY", "DEEPSEEK_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
+        "ANTHROPIC_API_KEY", "OPENAI_API_KEY",
+    )
+    active_legacy_keys = [name for name in legacy_unapproved_keys if _env(name)]
+    if active_legacy_keys:
+        raise ValueError(
+            "Unapproved LLM credential configuration is set: "
+            + ", ".join(active_legacy_keys)
+            + ". Configure only GEMINI_API_KEY, AVALAI_API_KEY, or OPENROUTER_API_KEY."
+        )
     note_api_base_url = _env("NOTE_BASE_URL").rstrip("/")
     # The v2-era single slot (``NOTE_PROVIDER``/``NOTE_API_KEY``/``NOTE_BASE_URL``)
     # is still honoured, and it is classified by host: a deployment that points
@@ -1272,6 +1286,12 @@ def from_env(env_file: str | None = None) -> Settings:
         "gemini" if gemini_only else "openai_compatible"
     )
     note_provider = classify_note_provider(legacy_slug, note_api_base_url)
+    if (explicit_note_provider or note_api_base_url or _env("NOTE_API_KEY")) and note_provider not in APPROVED_LLM_PROVIDERS:
+        if explicit_note_provider:
+            message = f"Unapproved NOTE_PROVIDER {explicit_note_provider!r}"
+        else:
+            message = "Unapproved legacy NOTE_BASE_URL/NOTE_API_KEY provider configuration"
+        raise ValueError(message + "; approved providers: " + ", ".join(NOTE_PROVIDER_SLUGS))
     note_api_key = _normalize_api_key(
         _env("NOTE_API_KEY") or (_env("GEMINI_API_KEY") if legacy_slug == "gemini" else "")
     )
@@ -1462,7 +1482,7 @@ def from_env(env_file: str | None = None) -> Settings:
         note_concurrency=_env_int(
             "NOTE_CONCURRENCY", DEFAULT_NOTE_CONCURRENCY, minimum=1, maximum=8
         ),
-        note_compile=_env_bool("NOTE_COMPILE", True),
+        note_compile=_env_bool("NOTE_COMPILE", False),
         note_compile_max_chars=_env_int(
             "NOTE_COMPILE_MAX_CHARS", 0, minimum=0, maximum=2_000_000
         ),
@@ -1472,7 +1492,7 @@ def from_env(env_file: str | None = None) -> Settings:
         note_openrouter_throughput=_env_bool("NOTE_OPENROUTER_THROUGHPUT", True),
         note_structured_output=_env_bool("NOTE_STRUCTURED_OUTPUT", True),
         note_progressive_booklet=_env_bool("NOTE_PROGRESSIVE_BOOKLET", False),
-        note_completeness_fill=_env_bool("NOTE_COMPLETENESS_FILL", True),
+        note_completeness_fill=_env_bool("NOTE_COMPLETENESS_FILL", False),
         note_compile_provider=normalize_note_compile_provider(
             _env("NOTE_COMPILE_PROVIDER")
         ),
@@ -1622,6 +1642,24 @@ def from_env(env_file: str | None = None) -> Settings:
             minimum=0.0,
             maximum=1800.0,
         ),
+        avalai_allow_sensitive_data=_env_bool("AVALAI_ALLOW_SENSITIVE_DATA", False),
+        gemini_free_allow_sensitive_data=_env_bool("GEMINI_FREE_ALLOW_SENSITIVE_DATA", False),
+        openrouter_free_allow_sensitive_data=_env_bool("OPENROUTER_FREE_ALLOW_SENSITIVE_DATA", False),
+        avalai_rpm_limit=_env_int("AVALAI_RPM_LIMIT", 35, minimum=0, maximum=10000),
+        avalai_tpm_limit=_env_int("AVALAI_TPM_LIMIT", 750000, minimum=0, maximum=100000000),
+        avalai_rpd_limit=_env_int("AVALAI_RPD_LIMIT", 0, minimum=0, maximum=1000000),
+        avalai_max_in_flight=_env_int("AVALAI_MAX_IN_FLIGHT", 3, minimum=1, maximum=64),
+        gemini_rpm_limit=_env_int("GEMINI_RPM_LIMIT", 0, minimum=0, maximum=10000),
+        gemini_tpm_limit=_env_int("GEMINI_TPM_LIMIT", 0, minimum=0, maximum=100000000),
+        gemini_rpd_limit=_env_int("GEMINI_RPD_LIMIT", 0, minimum=0, maximum=1000000),
+        gemini_max_in_flight=_env_int("GEMINI_MAX_IN_FLIGHT", 1, minimum=1, maximum=64),
+        openrouter_rpm_limit=_env_int("OPENROUTER_RPM_LIMIT", 10, minimum=0, maximum=10000),
+        openrouter_tpm_limit=_env_int("OPENROUTER_TPM_LIMIT", 0, minimum=0, maximum=100000000),
+        openrouter_rpd_limit=_env_int("OPENROUTER_RPD_LIMIT", 15, minimum=0, maximum=1000000),
+        openrouter_max_in_flight=_env_int("OPENROUTER_MAX_IN_FLIGHT", 1, minimum=1, maximum=64),
+        llm_token_estimation_chars_per_token=_env_float(
+            "LLM_TOKEN_ESTIMATION_CHARS_PER_TOKEN", 1.5, minimum=0.5, maximum=8.0
+        ),
         office_job_concurrency=_env_int(
             "OFFICE_JOB_CONCURRENCY",
             DEFAULT_OFFICE_JOB_CONCURRENCY,
@@ -1670,7 +1708,7 @@ def from_env(env_file: str | None = None) -> Settings:
             "FLASHCARD_MAX_CARDS_PER_DECK", 200, minimum=1, maximum=5000
         ),
         learning_chunk_concurrency=_env_int(
-            "LEARNING_CHUNK_CONCURRENCY", 4, minimum=1, maximum=8
+            "LEARNING_CHUNK_CONCURRENCY", 1, minimum=1, maximum=8
         ),
         document_retention_days=_env_int("DOCUMENT_RETENTION_DAYS", 0, minimum=0, maximum=3650),
         learning_retention_days=_env_int("LEARNING_RETENTION_DAYS", 0, minimum=0, maximum=3650),
@@ -1680,7 +1718,7 @@ def from_env(env_file: str | None = None) -> Settings:
             "LEARNING_GLOBAL_CONCURRENCY", 2, minimum=1, maximum=8
         ),
         learning_max_output_tokens=_env_int(
-            "LEARNING_MAX_OUTPUT_TOKENS", 4096, minimum=256, maximum=32768
+            "LEARNING_MAX_OUTPUT_TOKENS", 8192, minimum=256, maximum=32768
         ),
         dedup_window_seconds=_env_float(
             "DEDUP_WINDOW_SECONDS",

@@ -792,15 +792,15 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
         payload = await complete_json(session, settings, system="S", user="U")
         self.assertEqual(payload["title"], "جزوه")
 
-    async def test_one_retry_on_bad_json(self):
+    async def test_bad_json_does_not_repeat_the_same_provider_request(self):
         session = FakeSession([
             FakeResponse(200, {"choices": [{"message": {"content": "not json"}}]}),
             FakeResponse(200, {"choices": [{"message": {"content": '{"ok": true}'}}]}),
         ])
         settings = make_settings()
-        payload = await complete_json(session, settings, system="S", user="U")
-        self.assertEqual(payload, {"ok": True})
-        self.assertEqual(len(session.calls), 2)
+        with self.assertRaises(LLMResponseError):
+            await complete_json(session, settings, system="S", user="U")
+        self.assertEqual(len(session.calls), 1)
 
     async def test_second_failure_raises(self):
         session = FakeSession([
@@ -811,23 +811,23 @@ class CompleteJsonTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(LLMResponseError):
             await complete_json(session, settings, system="S", user="U")
 
-    async def test_empty_model_answer_is_retried(self):
+    async def test_empty_model_answer_is_not_retried_on_same_route(self):
         session = FakeSession([
             FakeResponse(200, {"choices": [{"message": {"content": "   "}}]}),
             FakeResponse(200, {"choices": [{"message": {"content": '{"ok": true}'}}]}),
         ])
-        result = await complete_json(session, make_settings(), system="S", user="U")
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(len(session.calls), 2)
+        with self.assertRaises(LLMResponseError):
+            await complete_json(session, make_settings(), system="S", user="U")
+        self.assertEqual(len(session.calls), 1)
 
-    async def test_non_json_nan_is_retried(self):
+    async def test_non_json_nan_is_not_retried_on_same_route(self):
         session = FakeSession([
             FakeResponse(200, {"choices": [{"message": {"content": '{"value": NaN}'}}]}),
             FakeResponse(200, {"choices": [{"message": {"content": '{"ok": true}'}}]}),
         ])
-        result = await complete_json(session, make_settings(), system="S", user="U")
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(len(session.calls), 2)
+        with self.assertRaises(LLMResponseError):
+            await complete_json(session, make_settings(), system="S", user="U")
+        self.assertEqual(len(session.calls), 1)
 
     async def test_provider_400_does_not_trigger_json_retry(self):
         session = FakeSession([FakeResponse(400, {"error": {"message": "bad request"}})])

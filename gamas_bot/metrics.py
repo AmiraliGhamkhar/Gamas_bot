@@ -211,6 +211,7 @@ class MetricsCollector:
             self._queue_wait = _Series()
             self._end_to_end = _Series()
             self._providers: dict[tuple[str, str], _ProviderStats] = {}
+            self._llm_operations: dict[tuple[str, str, str], dict[str, Any]] = {}
 
     def _provider(self, layer: str, slug: str) -> _ProviderStats:
         key = (layer, slug)
@@ -391,6 +392,47 @@ class MetricsCollector:
             elif event == "overflow_skip":
                 stats.overflow_skips += 1
 
+    def record_llm_operation(
+        self,
+        *,
+        task: str,
+        provider: str,
+        model: str,
+        success: bool,
+        failure_category: str = "",
+        estimated_input_tokens: int = 0,
+        reserved_output_tokens: int = 0,
+        actual_total_tokens: int | None = None,
+        duration_seconds: float = 0.0,
+    ) -> None:
+        """Aggregate privacy-safe operation counts by task/provider/model."""
+        key = (
+            (task or "UNSPECIFIED")[:48],
+            (provider or "unknown")[:24],
+            (model or "unknown")[:100],
+        )
+        with self._lock:
+            # Keep the collector bounded even if a deployment rotates model ids.
+            if key not in self._llm_operations and len(self._llm_operations) >= 128:
+                self._llm_operations.pop(next(iter(self._llm_operations)))
+            row = self._llm_operations.setdefault(key, {
+                "requests": 0, "successes": 0, "failures": 0,
+                "estimated_input_tokens": 0, "reserved_output_tokens": 0,
+                "actual_total_tokens": 0, "actual_usage_count": 0,
+                "failure_categories": {}, "latency": _Series(),
+            })
+            row["requests"] += 1
+            row["successes" if success else "failures"] += 1
+            row["estimated_input_tokens"] += max(0, int(estimated_input_tokens))
+            row["reserved_output_tokens"] += max(0, int(reserved_output_tokens))
+            if actual_total_tokens is not None:
+                row["actual_total_tokens"] += max(0, int(actual_total_tokens))
+                row["actual_usage_count"] += 1
+            if failure_category:
+                categories = row["failure_categories"]
+                categories[failure_category[:64]] = categories.get(failure_category[:64], 0) + 1
+            row["latency"].observe(duration_seconds)
+
     def record_failover(self, layer: str, from_slug: str, to_slug: str) -> None:
         with self._lock:
             self._provider(layer, from_slug).failovers_out += 1
@@ -401,7 +443,15 @@ class MetricsCollector:
             providers_by_layer: dict[str, dict[str, Any]] = {}
             for (layer, slug), stats in sorted(self._providers.items()):
                 providers_by_layer.setdefault(layer, {})[slug] = stats.summary()
+            llm_operations = {
+                "|".join(key): {
+                    **{name: value for name, value in row.items() if name != "latency"},
+                    "latency": row["latency"].summary(),
+                }
+                for key, row in self._llm_operations.items()
+            }
             return {
+                "llm_operations": llm_operations,
                 "active_jobs": self._active_jobs,
                 "peak_active_jobs": self._peak_active_jobs,
                 "queued_jobs": self._queued_jobs,
