@@ -81,13 +81,19 @@ it is a recommendation, not a guarantee for your account.
 ## Mini App
 
 ```dotenv
-MINI_APP_URL=https://studio.example.com     # https, no path, no trailing slash
-MINI_APP_AUTH_MAX_AGE_SECONDS=300           # 30..3600
-MINI_APP_STATIC_DIR=                        # empty → ./mini_app
+MINI_APP_URL=https://gamasrobot.ir          # reported production root URL; verify before setting
+MINI_APP_AUTH_MAX_AGE_SECONDS=300           # 30..3600; do not relax without a security review
+MINI_APP_STATIC_DIR=                        # empty → <project>/mini_app
 ```
 
-Empty `MINI_APP_URL` hides every app button. Deployment:
-[cPanel](MINIAPP_CPANEL.md) · [Cloudflare](MINIAPP_CLOUDFLARE.md).
+`MINI_APP_URL` is optional and empty hides bot-generated app buttons. The
+reported BotFather Menu Button is `گاماس استودیو` → `https://gamasrobot.ir`;
+verify the live BotFather setting rather than changing it during deployment.
+The root domain is intentional; do not follow older instructions to create a
+Studio subdomain. cPanel/Passenger details:
+[Mini App deployment guide](MINIAPP_CPANEL.md). The optional Cloudflare tunnel
+guide is for a separately operated host and is not the reported production
+configuration: [Cloudflare tunnel](MINIAPP_CLOUDFLARE.md).
 
 ## Paths
 

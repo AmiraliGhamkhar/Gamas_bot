@@ -63,19 +63,24 @@ PowerPoint narration starts only from its audio button. Scans and photos need
 [features](docs/FEATURES.md) · [note providers](docs/PROVIDERS.md) ·
 [billing](docs/BILLING.md).
 
-## Deploy the Mini App
+## Gamas Studio Mini App
 
-The Mini App is plain WSGI with no build step and is deployed separately from
-the bot. Pick one route:
+Gamas Studio is a Persian RTL Telegram Mini App served by the lightweight WSGI
+application in `scripts/mini_app_wsgi.py`. It shares the bot's SQLite file but
+runs as a separate Passenger web worker; it does not start the bot or apply
+migrations. The reported production URL is the **root domain**
+[`https://gamasrobot.ir`](https://gamasrobot.ir); do not create a Studio
+subdomain as part of a routine deployment. Verify the live cPanel settings and
+BotFather Menu Button before changing production.
 
-| Route | Guide |
-| --- | --- |
-| cPanel "Setup Python App" (Passenger) | [docs/MINIAPP_CPANEL.md](docs/MINIAPP_CPANEL.md) |
-| Cloudflare Tunnel in front of a local WSGI server | [docs/MINIAPP_CLOUDFLARE.md](docs/MINIAPP_CLOUDFLARE.md) |
+- [cPanel / Passenger deployment, diagnostics, release and rollback](docs/MINIAPP_CPANEL.md)
+- [Repository audit and known limitations](docs/MINIAPP_AUDIT.md)
+- [Optional Cloudflare Tunnel alternative](docs/MINIAPP_CLOUDFLARE.md) (not the reported production deployment)
 
-Both need HTTPS, the same `.env`/SQLite database as the bot, and a bot that has
-started at least once so migrations exist. Without `MINI_APP_URL` the bot simply
-draws no app button.
+The bot's `MINI_APP_URL` is optional; empty means no bot-generated Mini App
+button. The BotFather Menu Button is configured separately. The Mini App uses
+the raw signed Telegram `initData` on each API request; it does not accept an
+ordinary browser session as authentication.
 
 ## Before production
 

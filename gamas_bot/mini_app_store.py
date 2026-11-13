@@ -456,43 +456,87 @@ class MiniAppStore:
             connection.close()
 
     def profile(self, user_id: int) -> dict[str, Any]:
-        """The Home screen: only the caller's own, non-private summary."""
+        """The Home screen: one read-only connection and one summary query.
+
+        The correlated counts keep the initial summary small while avoiding the
+        five independent SQLite connections the previous implementation opened.
+        Optional tables/columns are detected for compatibility with databases
+        that have not yet received a newer additive migration.
+        """
         from gamas_bot.billing import seconds_to_credits
 
-        rows = self._read_optional(
-            "SELECT first_name, quiz_points FROM users WHERE telegram_id = ?",
-            (int(user_id),),
-        )
-        if not rows:
+        connection = self._connect()
+        try:
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('users', 'user_balances', 'library_items', "
+                    "'submissions', 'submission_artifacts')"
+                ).fetchall()
+            }
+
+            def columns(table: str) -> set[str]:
+                return {
+                    str(row[1])
+                    for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+
+            user_columns = columns("users")
+            balance_columns = columns("user_balances") if "user_balances" in tables else set()
+            library_columns = columns("library_items") if "library_items" in tables else set()
+            submission_columns = columns("submissions") if "submissions" in tables else set()
+            artifact_columns = (
+                columns("submission_artifacts") if "submission_artifacts" in tables else set()
+            )
+            unlimited_expr = "COALESCE(u.is_unlimited, 0)" if "is_unlimited" in user_columns else "0"
+            balance_expr = (
+                "COALESCE((SELECT available_seconds FROM user_balances "
+                "WHERE user_id = u.telegram_id), 0)"
+                if {"user_id", "available_seconds"}.issubset(balance_columns)
+                else "0"
+            )
+            library_expr = (
+                "(SELECT COUNT(*) FROM library_items WHERE user_id = u.telegram_id)"
+                if "user_id" in library_columns
+                else "0"
+            )
+            submission_expr = (
+                "(SELECT COUNT(*) FROM submissions WHERE user_id = u.telegram_id)"
+                if "user_id" in submission_columns
+                else "0"
+            )
+            artifact_expr = (
+                "(SELECT COUNT(*) FROM submission_artifacts "
+                "WHERE user_id = u.telegram_id AND available = 1)"
+                if {"user_id", "available"}.issubset(artifact_columns)
+                else "0"
+            )
+            row = connection.execute(
+                "SELECT u.first_name, u.quiz_points, "
+                f"{unlimited_expr} AS is_unlimited, {balance_expr} AS available_seconds, "
+                f"{library_expr} AS library_count, {submission_expr} AS submission_count, "
+                f"{artifact_expr} AS artifact_count "
+                "FROM users u WHERE u.telegram_id = ?",
+                (int(user_id),),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "no such table" in message or "no such column" in message:
+                return {}
+            raise
+        finally:
+            connection.close()
+        if row is None:
             return {}
-        row = rows[0]
-        entitlement = self._read_optional(
-            "SELECT is_unlimited FROM users WHERE telegram_id = ?",
-            (int(user_id),),
-        )
-        unlimited = bool(entitlement[0][0]) if entitlement else False
-        balance = self._read_optional(
-            "SELECT available_seconds FROM user_balances WHERE user_id = ?",
-            (int(user_id),),
-        )
-        seconds = int(balance[0][0]) if balance else 0
-        counts = self._read_optional(
-            "SELECT (SELECT COUNT(*) FROM library_items WHERE user_id = ?), "
-            "(SELECT COUNT(*) FROM submissions WHERE user_id = ?)",
-            (int(user_id), int(user_id)),
-        )
-        artifacts = self._read_optional(
-            "SELECT COUNT(*) AS n FROM submission_artifacts WHERE user_id = ? AND available = 1",
-            (int(user_id),),
-        )
         return {
             "first_name": str(row["first_name"] or ""),
-            "credits": seconds_to_credits(seconds),
-            "unlimited": unlimited,
+            "credits": seconds_to_credits(int(row["available_seconds"] or 0)),
+            "unlimited": bool(row["is_unlimited"]),
             "quiz_points": int(row["quiz_points"] or 0),
-            "library_count": int(counts[0][0]) if counts else 0,
-            "submission_count": int(counts[0][1]) if counts else 0,
-            "artifact_count": int(artifacts[0]["n"]) if artifacts else 0,
+            "library_count": int(row["library_count"] or 0),
+            "submission_count": int(row["submission_count"] or 0),
+            "artifact_count": int(row["artifact_count"] or 0),
         }
 
     def revisions(self, user_id: int, item_id: int, limit: int = 20) -> list[dict[str, Any]]:
@@ -628,7 +672,7 @@ class MiniAppStore:
         finally:
             connection.close()
         if updated:
-            logger.info("mini app edited booklet item=%s user=%s", item_id, user_id)
+            logger.info("mini app edited booklet")
         return updated
 
     # -- structured booklet editing ----------------------------------------
@@ -834,8 +878,8 @@ class MiniAppStore:
             user_id, item_id, submission_id, notes, new_revision_id
         )
         logger.info(
-            "mini app structured edit item=%s user=%s revision=%s rendered=%s",
-            item_id, user_id, new_revision_id, ",".join(sorted(rendered)) or "none",
+            "mini app structured edit rendered=%s",
+            ",".join(sorted(rendered)) or "none",
         )
         return {
             "ok": True,
@@ -893,7 +937,7 @@ class MiniAppStore:
                 )
             )
         except Exception:  # noqa: BLE001 - one format failing must not kill the save
-            logger.exception("studio PDF render failed item=%s", item_id)
+            logger.exception("studio PDF render failed")
         try:
             docx_bytes = build_notes_docx(
                 notes, fonts=resolve_fonts(), design=resolve_design(), meta=meta
@@ -907,7 +951,7 @@ class MiniAppStore:
                 )
             )
         except Exception:  # noqa: BLE001
-            logger.exception("studio DOCX render failed item=%s", item_id)
+            logger.exception("studio DOCX render failed")
 
         connection = self._connect(write=True)
         try:
@@ -956,10 +1000,7 @@ class MiniAppStore:
                 connection.execute("ROLLBACK")
             except sqlite3.Error:  # pragma: no cover
                 pass
-            logger.exception(
-                "studio artifact persistence failed item=%s submission=%s",
-                item_id, submission_id,
-            )
+            logger.exception("studio artifact persistence failed")
         finally:
             connection.close()
         return rendered

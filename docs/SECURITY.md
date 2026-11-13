@@ -45,11 +45,40 @@ confidentiality guarantee is made by this project.
 
 ## Mini App specifics
 
-- Serve it over HTTPS only (Telegram requirement) and keep the origin bound to
-  loopback behind Cloudflare, or terminate TLS at the web server on cPanel.
-- The bundle is served by the app itself with CSP, `nosniff` and `no-referrer`.
-- Request bodies are capped at 1 MB and rendered exports are served from stored
-  bytes, never re-rendered on demand.
+- The reported production URL is `https://gamasrobot.ir/` on the root domain;
+  verify it in cPanel and BotFather before changing the menu URL. HTTPS is
+  required. The cPanel WSGI/Passenger route is the production target; the
+  Cloudflare Tunnel guide is a separate optional deployment.
+- Authentication sends raw `Telegram.WebApp.initData` in the JSON request body.
+  The WSGI app parses Telegram's signed fields, excludes `hash` (and Telegram's
+  newer non-HMAC `signature` field), computes
+  `HMAC-SHA256(HMAC-SHA256("WebAppData", bot_token), data_check_string)`, uses
+  constant-time comparison, and enforces the configured freshness window
+  (300 seconds by default, bounded by configuration) and a future-date limit.
+  The user id comes only from the verified signed `user` payload. Never use
+  `initDataUnsafe` for server identity, log the raw string, persist it in browser
+  storage, or relax freshness as a troubleshooting shortcut.
+- Store operations scope each user-specific read/write to the authenticated
+  Telegram id. Reads use SQLite `query_only`; writes use short explicit
+  transactions. The Passenger process shares the bot's SQLite WAL database but
+  does not run migrations. Keep the bot as schema owner and never point either
+  process at a copied/secondary database.
+- The WSGI static responder applies the existing restrictive CSP, `nosniff` and
+  `no-referrer`; it allows same-origin assets plus the Telegram SDK origin and
+  Telegram WebApp frame ancestors. The SDK is an external runtime dependency;
+  its failure is surfaced without weakening the CSP or bypassing authentication.
+- Request bodies are capped at 1 MB and structured/text booklet inputs have
+  explicit bounds. PDF/DOCX downloads are owner-scoped and served as binary
+  responses with `no-store`; stored artifact bytes are returned as-is.
+- Request logs contain only a correlation id, method, route, HTTP status and
+  elapsed WSGI time. Never log tokens, full initData, request bodies, private
+  transcript/booklet content or unnecessary user identifiers. Opt-in client
+  diagnostics show SDK state and request metadata only; see
+  [Mini App operations](MINIAPP_CPANEL.md#8-diagnostics-and-troubleshooting).
+- `/health` checks that the configured database file exists; it is a liveness
+  check, not proof of SQL readiness or authenticated functionality. `/ready`
+  performs a read-only `SELECT 1` and core schema-table check and does not
+  migrate or mutate the database.
 
 ## Reporting
 

@@ -4,6 +4,26 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Gamas Studio mobile reliability and startup.** The Telegram SDK is loaded
+asynchronously; SDK/initData failures have an explicit retry/explanation state.
+Home is the only startup API request; leaderboard and Studio data are loaded on
+first use and cached only in page memory. Read requests coalesce while in flight,
+use bounded timeouts, and expose persistent manual retry; mutations are not
+automatically retried. Telegram theme/viewport and BackButton are feature
+detected. The Persian RTL UI has responsive light/dark tokens, touch targets,
+safe-area padding and mobile editor controls while preserving all Studio
+features.
+
+**Mini App WSGI and SQLite.** Home summary work is now one read-only connection
+and one query instead of five connection/read operations. `/ready` is a
+read-only SQL/schema probe distinct from the existing `/health` file-exists
+check. Static responses now support ETag/Last-Modified validation and correct
+HEAD/304 behavior; request IDs and WSGI timing are recorded without request
+bodies or signed credentials. No schema migration, index, Passenger directive,
+bot process or live database was changed. cPanel documentation now targets the
+reported root-domain setup and requires live verification; production and
+physical-device results remain outstanding.
+
 **Reporting, booklet delivery and auditability.** Admin completion rates now
 separate fully completed work from partial transcript delivery; PDF booklet
 success is counted only from persisted PDF bytes. PDF button send attempts are
