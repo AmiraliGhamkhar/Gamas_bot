@@ -15,17 +15,12 @@ Verified provider rules:
 * **Gemini** (``generativelanguage.googleapis.com/v1beta``): OpenAPI 3.0
   ``Schema`` uses upper-case ``type`` names, honours ``required`` (without it,
   every property is optional), and rejects ``additionalProperties``.
-* **NaraRouter** (``agnes-2.5-flash``): documents standard ``chat/completions``
-  fields (``model``, ``messages``, ``temperature``, ``max_tokens``, ``stream``,
-  ``reasoning_effort``) and does not document ``response_format`` or
-  ``stream_options``.
+* **AvalAI** uses an OpenAI-compatible chat-completions dialect and has
+  model-dependent JSON Schema support.
 * **OpenRouter**: treats ``response_format: {"type": "json_schema"}`` as an
   endpoint capability filter (returning HTTP 404 when no upstream endpoint for
   a ``:free`` model advertises ``structured_outputs``); ``json_object`` avoids
   filtering out free-pool endpoints.
-* **OpenAI** (``api.openai.com``): ``strict: true`` requires
-  ``additionalProperties: false`` and all properties in ``required``; ``o1``/
-  ``o3``/``o4``/``gpt-5`` reasoning families require ``max_completion_tokens``.
 """
 
 from __future__ import annotations
@@ -34,7 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
-from .config import NOTE_JSON_OBJECT_PROVIDERS
+from .config import APPROVED_LLM_PROVIDERS, NOTE_JSON_OBJECT_PROVIDERS
 
 if TYPE_CHECKING:
     from .config import NoteRoute, Settings
@@ -286,6 +281,10 @@ class ProviderCapabilityProfile:
     #: is documented for them, so the configured budget (16,384 by default,
     #: 32,768 in the tested deployment profile) reaches the wire unchanged.
     max_output_tokens_cap: int | None = None
+    # Reference capability metadata, deliberately separate from the application's
+    # configured operational budgets (which are not provider guarantees).
+    context_window_tokens: int | None = None
+    max_input_tokens: int | None = None
 
     def supports_response_format(self, route: NoteRoute) -> bool:
         return bool(route.json_object_mode) or (
@@ -385,14 +384,6 @@ _DEFAULT_PROFILE = ProviderCapabilityProfile(
 )
 
 PROVIDER_PROFILES: dict[str, ProviderCapabilityProfile] = {
-    "nara": ProviderCapabilityProfile(
-        slug="nara",
-        documented_json_object=False,
-        documented_json_schema=False,
-        supports_streaming_with_json_schema=False,
-        documented_stream_options=False,
-        documented_reasoning_effort=True,
-    ),
     "openrouter": ProviderCapabilityProfile(
         slug="openrouter",
         documented_json_object=True,
@@ -400,8 +391,10 @@ PROVIDER_PROFILES: dict[str, ProviderCapabilityProfile] = {
         supports_streaming_with_json_schema=True,
         documented_stream_options=True,
         documented_reasoning_effort=True,
+        context_window_tokens=1_000_000,
+        max_input_tokens=1_000_000,
+        max_output_tokens_cap=131_072,
     ),
-    "openai_compatible": _DEFAULT_PROFILE,
     "gemini": ProviderCapabilityProfile(
         slug="gemini",
         documented_json_object=True,
@@ -409,45 +402,33 @@ PROVIDER_PROFILES: dict[str, ProviderCapabilityProfile] = {
         supports_streaming_with_json_schema=True,
         documented_stream_options=False,
         documented_reasoning_effort=False,
-    ),
-    "deepseek": ProviderCapabilityProfile(
-        slug="deepseek",
-        documented_json_object=True,
-        # Only JSON Output is documented; strict json_schema is not.
-        documented_json_schema=False,
-        supports_streaming_with_json_schema=False,
-        documented_stream_options=False,
-        documented_reasoning_effort=True,
+        context_window_tokens=1_048_576,
+        max_input_tokens=1_048_576,
+        max_output_tokens_cap=65_536,
     ),
     "avalai": ProviderCapabilityProfile(
         slug="avalai",
-        # AvalAI documents JSON mode and ``json_schema`` structured output on
-        # its chat-completions route (https://docs.avalai.ir/en/guides/
-        # structured-outputs), but warns that support is per-model — the
-        # request builder already downgrades a rejected ``json_schema`` to
-        # ``json_object`` and then drops it (llm.py::_adjust_rejected_request_param).
         documented_json_object=True,
         documented_json_schema=True,
         supports_streaming_with_json_schema=True,
         documented_stream_options=False,
         documented_reasoning_effort=False,
-    ),
-    "anthropic": ProviderCapabilityProfile(
-        slug="anthropic",
-        documented_json_object=False,
-        documented_json_schema=False,
-        supports_streaming_with_json_schema=False,
-        documented_stream_options=False,
-        documented_reasoning_effort=False,
+        context_window_tokens=1_000_000,
+        max_input_tokens=1_000_000,
+        max_output_tokens_cap=393_216,
     ),
 }
 
 
 def register_provider_profile(profile: ProviderCapabilityProfile) -> None:
-    """Register or override a provider capability profile (OCP extension point)."""
+    """Register an approved provider profile; transport extensibility is allowlisted."""
+    if profile.slug not in APPROVED_LLM_PROVIDERS:
+        raise ValueError(f"Unapproved LLM provider profile: {profile.slug}")
     PROVIDER_PROFILES[profile.slug] = profile
 
 
 def get_provider_profile(slug: str) -> ProviderCapabilityProfile:
-    """Return the capability profile for *slug* (defaults to generic OpenAI)."""
-    return PROVIDER_PROFILES.get(slug, _DEFAULT_PROFILE)
+    """Return an approved provider profile or fail closed for unknown providers."""
+    if slug not in APPROVED_LLM_PROVIDERS:
+        raise ValueError(f"Unapproved LLM provider profile: {slug}")
+    return PROVIDER_PROFILES[slug]

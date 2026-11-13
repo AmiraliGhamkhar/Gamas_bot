@@ -71,6 +71,7 @@ from .learning import (
     dedupe_cards,
     dedupe_questions,
     distribute_counts,
+    topic_importance_weight,
     flashcard_system_prompt,
     learning_user_prompt,
     source_key,
@@ -282,7 +283,11 @@ class LearningWorkflowMixin:
         stage: str = "در حال تولید محتوا",
     ) -> tuple[list[dict[str, Any]], int]:
         schema = FLASHCARD_SCHEMA if kind == "deck" else QUIZ_SCHEMA
-        concurrency = min(8, max(1, int(self.settings.learning_chunk_concurrency)))
+        concurrency = (
+            1 if kind == "deck"
+            else min(8, max(1, int(self.settings.learning_chunk_concurrency)))
+        )
+        prior_job_items: list[dict[str, Any]] = []
         active = [index for index, count in enumerate(counts) if count > 0]
         total = len(active)
         state = {"done": 0, "failed": 0}
@@ -320,6 +325,7 @@ class LearningWorkflowMixin:
             *,
             chunk_idx: int,
             split_depth: int = 0,
+            prior_items: list[dict[str, Any]] | None = None,
         ) -> list[dict[str, Any]]:
             allowed = tuple(
                 dict.fromkeys(
@@ -331,15 +337,22 @@ class LearningWorkflowMixin:
             fallback_locator = allowed[0] if allowed else ""
             text_key = await run_file_io(source_key, target_chunk.text)
             items: list[dict[str, Any]] = []
-            max_attempts = max(2, math.ceil(int(target_count) / self.MAX_ITEMS_PER_CALL) + 1)
-            use_schema = True
+            # Fixed number of schema-preserving batches; never drop JSON Schema to
+            # coerce an incomplete response. Each batch is bounded by the configured
+            # per-call cap, with at most one refill of a short final batch.
+            batch_cap = (
+                10 if kind == "deck" and int(target_count) >= 40
+                else self.MAX_ITEMS_PER_CALL
+            )
+            planned_batches = max(1, math.ceil(int(target_count) / batch_cap))
+            max_attempts = planned_batches + 1
             had_shortfall = False
 
             for attempt in range(max_attempts):
                 missing = int(target_count) - len(items)
                 if missing <= 0:
                     break
-                batch = min(missing, self.MAX_ITEMS_PER_CALL)
+                batch = min(missing, batch_cap)
                 system = (
                     flashcard_system_prompt(batch, sources=allowed)
                     if kind == "deck"
@@ -351,10 +364,11 @@ class LearningWorkflowMixin:
                         "\nخروجی قبلی نامعتبر، ناقص یا بدون منبع مجاز بود؛ "
                         "همهٔ فیلدهای لازم و یک منبع دقیق از فهرست را وارد کن."
                     )
-                if items:
+                previous = [*(prior_items or [])[-25:], *items[-25:]]
+                if previous:
                     prior_stems = [
                         str(it.get(stem_key) or "").strip()[:90]
-                        for it in items[-25:]
+                        for it in previous
                         if str(it.get(stem_key) or "").strip()
                     ]
                     if prior_stems:
@@ -368,8 +382,16 @@ class LearningWorkflowMixin:
                         self.settings,
                         system=system,
                         user=user_prompt,
-                        schema=schema if use_schema else None,
-                        max_output_tokens=self.settings.learning_max_output_tokens,
+                        schema=schema,
+                        task=(
+                            "FLASHCARD_GENERATION" if kind == "deck" else
+                            ("QUIZ_20" if int(target_count) >= 20 else "QUIZ_GENERATION")
+                        ),
+                        max_output_tokens=min(
+                            int(self.settings.learning_max_output_tokens),
+                            (2000 if batch <= 10 else 4000) if kind == "deck" else
+                            (2500 if batch <= 5 else 5000 if batch <= 10 else 10000),
+                        ),
                         # Never wait for a provider slot while holding the generation slot.
                         wait_for_capacity=False,
                     )
@@ -385,9 +407,11 @@ class LearningWorkflowMixin:
                         bug the moment the call stopped being awaited in place.
                         """
                         if kind == "deck":
-                            parsed = parse_flashcard_payload(payload, batch)
+                            parsed = parse_flashcard_payload(payload, batch, require_source=True)
                         else:
-                            parsed = parse_quiz_payload(payload, batch, require_difficulty=False)
+                            parsed = parse_quiz_payload(
+                                payload, batch, require_difficulty=True, require_source=True
+                            )
                         anchored = anchor_items(
                             parsed, allowed, fallback_locator, target_chunk.text, text_key=text_key
                         )
@@ -401,8 +425,6 @@ class LearningWorkflowMixin:
                         break
                     if len(items) - prev_count < batch:
                         had_shortfall = True
-                        if int(target_count) <= self.MAX_ITEMS_PER_CALL:
-                            use_schema = False
                 except asyncio.CancelledError:
                     raise
                 except (LLMContextOverflowError, LLMOutputBudgetError):
@@ -423,7 +445,7 @@ class LearningWorkflowMixin:
                                 for idx, sc in enumerate(sub_raw)
                             ]
                             sub_counts = distribute_counts(
-                                missing, [len(sc.text) for sc in sub_chunks]
+                                missing, [topic_importance_weight(sc.text) for sc in sub_chunks]
                             )
                             for sc, sc_count in zip(sub_chunks, sub_counts, strict=True):
                                 if sc_count <= 0:
@@ -433,11 +455,11 @@ class LearningWorkflowMixin:
                                     sc_count,
                                     chunk_idx=chunk_idx,
                                     split_depth=split_depth + 1,
+                                    prior_items=prior_items,
                                 )
                                 items = (await run_file_io(dedupe, [*items, *sub_items]))[: int(target_count)]
                             break
                     had_shortfall = True
-                    use_schema = False
                     logger.warning(
                         "chunk budget exceeded kind=%s chunk=%s attempt=%s",
                         kind,
@@ -447,7 +469,6 @@ class LearningWorkflowMixin:
                     )
                 except Exception:
                     had_shortfall = True
-                    use_schema = False
                     logger.warning(
                         "chunk generation failed kind=%s chunk=%s attempt=%s",
                         kind,
@@ -466,7 +487,14 @@ class LearningWorkflowMixin:
         async def one(index: int) -> list[dict[str, Any]]:
             chunk = chunks[index]
             count = counts[index]
-            items = await _generate_piece(chunk, count, chunk_idx=index)
+            items = await _generate_piece(
+                chunk,
+                count,
+                chunk_idx=index,
+                prior_items=prior_job_items if kind == "deck" else None,
+            )
+            if kind == "deck":
+                prior_job_items.extend(items)
             if len(items) < count:
                 state["failed"] += 1
             fractions[index] = 0.0
@@ -572,7 +600,9 @@ class LearningWorkflowMixin:
         stage = f"آماده‌سازی {label}"
         try:
             wanted = max(1, int(wanted))
-            counts = distribute_counts(wanted, [len(chunk.text) for chunk in chunks])
+            counts = distribute_counts(
+                wanted, [topic_importance_weight(chunk.text) for chunk in chunks]
+            )
             progress = await WorkProgress.start(
                 event,
                 headline="🧠 در حال ساخت محتوا",

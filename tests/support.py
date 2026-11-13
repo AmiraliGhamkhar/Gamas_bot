@@ -12,6 +12,7 @@ import io
 import tempfile
 import wave
 import zipfile
+import uuid
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -427,7 +428,7 @@ def make_settings(**overrides) -> Settings:
         api_hash="hash",
         admin_ids=frozenset({1}),
         session_path=Path("session"),
-        db_path=Path("db.sqlite3"),
+        db_path=Path(tempfile.gettempdir()) / f"gamas-test-{uuid.uuid4().hex}.sqlite3",
         temp_dir=Path("tmp"),
         log_file=None,
         log_level="INFO",
@@ -476,11 +477,11 @@ def make_settings(**overrides) -> Settings:
         stt_transfer_timeout=600.0,
         max_stt_response_bytes=64 * 1024 * 1024,
         stt_status_long_poll=25.0,
-        note_providers=("openai_compatible", "nara", "openrouter"),
-        note_provider="openai_compatible",
-        note_api_key="note-key",
-        note_api_base_url="https://note.example/v1",
-        note_model="test-model",
+        note_providers=("avalai", "gemini", "openrouter"),
+        note_provider="",
+        note_api_key="",
+        note_api_base_url="",
+        note_model="",
         nara_api_key="",
         nara_base_url="https://router.bynara.id/v1",
         nara_model="agnes-2.5-flash",
@@ -492,9 +493,20 @@ def make_settings(**overrides) -> Settings:
         deepseek_api_key="",
         deepseek_base_url=DEFAULT_DEEPSEEK_BASE_URL,
         deepseek_model=DEFAULT_DEEPSEEK_MODEL,
-        avalai_api_key="",
+        avalai_api_key="avalai-test-key",
         avalai_base_url=DEFAULT_AVALAI_BASE_URL,
         avalai_model=DEFAULT_AVALAI_MODEL,
+        # Keep mock-driven tests isolated from provider quota policy; dedicated
+        # ledger tests exercise production-style finite limits.
+        avalai_rpm_limit=0,
+        avalai_tpm_limit=0,
+        avalai_rpd_limit=0,
+        gemini_rpm_limit=0,
+        gemini_tpm_limit=0,
+        gemini_rpd_limit=0,
+        openrouter_rpm_limit=0,
+        openrouter_tpm_limit=0,
+        openrouter_rpd_limit=0,
         # Zero by default, matching the shipped configuration: note requests
         # must never wait on hidden reasoning tokens.
         gemini_thinking_budget=DEFAULT_GEMINI_THINKING_BUDGET,

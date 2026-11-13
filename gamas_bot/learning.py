@@ -72,6 +72,21 @@ def preset_cards(code: str) -> int | None:
     return None
 
 
+_TOPIC_SIGNAL_RE = re.compile(
+    r"(?im)(?:^#{1,6}\s|^\s*(?:تعریف|نکته|طبقه.?بندی|مراحل|فرایند|انواع|تفاوت|علت|عوارض|درمان|تشخیص)\s*[:：]|\b\d+(?:[.,]\d+)?\s*(?:%|mg|ml|mmhg|°c|سال|ماه))"
+)
+
+
+def topic_importance_weight(text: str) -> int:
+    """Cheap deterministic estimate that rewards concise, high-value topics."""
+    content = str(text or "")
+    signal_count = len(_TOPIC_SIGNAL_RE.findall(content))
+    # Length remains useful for coverage, but its square-root contribution
+    # prevents a single long chunk from monopolizing item allocation.
+    length_component = int((len(content) + 1) ** 0.5 * 10)
+    return max(1, length_component + min(signal_count, 20) * 500)
+
+
 def distribute_counts(total: int, weights: list[int]) -> list[int]:
     """Split ``total`` items across chunks proportionally to their ``weights``.
 

@@ -23,6 +23,7 @@ while :class:`LLMOutputBudgetError` (the *answer* was cut off by
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from dataclasses import replace
 import json
 import logging
@@ -52,6 +53,7 @@ from .llm_profiles import (
     to_gemini_schema,
 )
 from .metrics import METRICS
+from .llm_quota import ProviderBudget, QuotaUnavailable, finish as finish_quota, reserve as reserve_quota, estimate_tokens
 from .protocols import LLMProviderDialect
 
 try:
@@ -135,7 +137,7 @@ NOTE_TEMPERATURE = 0.2
 LLM_REQUEST_TIMEOUT_SECONDS = 300.0
 
 #: Bounded retries for transient LLM failures (5xx, 429, network).
-MAX_TRANSIENT_RETRIES = 2
+MAX_TRANSIENT_RETRIES = 1
 
 #: A provider can return an arbitrary ``Retry-After`` (including an HTTP-date
 #: days ahead). Never let that remote hint keep a scarce note-provider lease
@@ -156,6 +158,9 @@ LLM_CONNECT_TIMEOUT_SECONDS = 10.0
 MAX_COMPATIBILITY_ADJUSTMENTS = 4
 
 _T = TypeVar("_T")
+_ACTUAL_USAGE_TOKENS: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "gamas_llm_actual_usage_tokens", default=None
+)
 
 #: Loop- and session-scoped route cooldown map so concurrent requests sharing
 #: a client session immediately bypass a rate-limited/depleted primary without
@@ -1312,6 +1317,7 @@ def _log_usage(
     the completion content nor a credential is logged.
     """
     model, input_tokens, output_tokens, total_tokens = _usage_summary(payload, route.style)
+    _ACTUAL_USAGE_TOKENS.set(total_tokens)
     request_id = _response_request_id(headers, payload=payload, api_key=route.api_key)
 
     def shown(value: int | None) -> str:
@@ -2348,6 +2354,19 @@ async def _run_with_lease(
         )
 
 
+def _provider_budget(settings: Settings, route: NoteRoute, route_index: int = 0) -> ProviderBudget:
+    slug = route.slug
+    provider_concurrency = max(
+        1, int(getattr(settings, f"{slug}_max_in_flight", route_max_in_flight(route_index, settings)) or 1)
+    )
+    return ProviderBudget(
+        rpm=max(0, int(getattr(settings, f"{slug}_rpm_limit", 0) or 0)),
+        tpm=max(0, int(getattr(settings, f"{slug}_tpm_limit", 0) or 0)),
+        rpd=max(0, int(getattr(settings, f"{slug}_rpd_limit", 0) or 0)),
+        max_in_flight=min(provider_concurrency, route_max_in_flight(route_index, settings)),
+    )
+
+
 async def _dispatch_across_routes(
     routes: tuple[NoteRoute, ...],
     session: object,
@@ -2357,13 +2376,19 @@ async def _dispatch_across_routes(
     hedge_route: Callable[[NoteRoute, bool], Awaitable[_T]] | None = None,
     pool_owner: object | None = None,
     wait_for_capacity: bool = True,
+    reservation_tokens: int = 0,
+    task: str = "",
+    estimated_input_tokens: int = 0,
+    reserved_output_tokens: int = 0,
 ) -> _T:
     """Execute *call_route* across *routes* with non-blocking capacity reservation."""
     pool = pool_for("llm", pool_owner if pool_owner is not None else settings)
     failures: list[LLMError] = []
     descriptions: list[str] = []
     indexed_routes: list[tuple[int, NoteRoute]] = list(enumerate(routes))
-    hedge_after = float(getattr(settings, "note_hedge_after", 0.0) or 0.0)
+    # Duplicate hedged completions spend scarce provider quota; disabled for the
+    # approved routes even if a stale deployment sets the legacy knob nonzero.
+    hedge_after = 0.0
 
     if (
         hedge_after > 0
@@ -2406,19 +2431,19 @@ async def _dispatch_across_routes(
                 return await _hedge_two(_make_primary, _run_backup, hedge_after)
             except _PrimaryEarlyFailure as early:
                 failures.append(early.exc)
-                descriptions.append(f"{routes[0].label}: {early.exc}")
+                descriptions.append(f"{routes[0].label}: {type(early.exc).__name__}")
                 logger.warning(
-                    "note provider failed; trying the next one provider=%s error=%s detail=%s",
-                    routes[0].slug, type(early.exc).__name__, early.exc,
+                    "note provider failed; trying the next one provider=%s error=%s",
+                    routes[0].slug, type(early.exc).__name__,
                 )
                 indexed_routes = indexed_routes[1:]
             except _HedgedFailures as both:
                 for route, exc in ((routes[0], both.first), (routes[1], both.second)):
                     failures.append(exc)
-                    descriptions.append(f"{route.label}: {exc}")
+                    descriptions.append(f"{route.label}: {type(exc).__name__}")
                     logger.warning(
-                        "note provider failed; trying the next one provider=%s error=%s detail=%s",
-                        route.slug, type(exc).__name__, exc,
+                        "note provider failed; trying the next one provider=%s error=%s",
+                        route.slug, type(exc).__name__,
                     )
                 indexed_routes = indexed_routes[2:]
 
@@ -2480,18 +2505,71 @@ async def _dispatch_across_routes(
 
         is_last_route = len(indexed_routes) == 0
         try:
-            result = await _run_with_lease(
-                route,
-                lease,
-                lambda r=route, last=is_last_route: call_route(r, last),  # type: ignore[misc]
+            reservation = await asyncio.to_thread(
+                reserve_quota,
+                str(settings.db_path),
+                route.slug,
+                _provider_budget(settings, route, orig_idx),
+                max(1, int(reservation_tokens)),
+                2,  # reserve one bounded retry as well as the initial dispatch
             )
+        except QuotaUnavailable as exc:
+            lease.release()
+            quota_error = LLMTransientError(
+                "پیکربندی سهمیهٔ سرویس تکمیل است؛ مسیر پشتیبان بررسی می‌شود."
+            )
+            failures.append(quota_error)
+            descriptions.append(f"{route.label}: quota unavailable")
+            METRICS.record_provider_event("llm", route.slug, "quota_exhausted")
+            logger.info("LLM quota denied provider=%s category=%s", route.slug, str(exc).split()[1] if len(str(exc).split()) > 1 else "budget")
+            previous_failed_slug = route.slug
+            continue
+        except Exception as exc:
+            lease.release()
+            raise LLMTransientError("امکان رزرو امن سهمیهٔ LLM وجود نداشت.") from exc
+
+        async def _reserved_call(r=route, last=is_last_route, hold=reservation):
+            succeeded = False
+            failure_category = ""
+            circuit_failure: bool | None = None
+            started = time.perf_counter()
+            usage_token = _ACTUAL_USAGE_TOKENS.set(None)
+            try:
+                result = await call_route(r, last)
+                succeeded = True
+                return result
+            except BaseException as exc:
+                failure_category = type(exc).__name__
+                circuit_failure = isinstance(exc, (LLMTransientError, LLMAuthError))
+                raise
+            finally:
+                actual_tokens = _ACTUAL_USAGE_TOKENS.get()
+                _ACTUAL_USAGE_TOKENS.reset(usage_token)
+                await asyncio.to_thread(
+                    finish_quota, hold, actual_tokens=actual_tokens, succeeded=succeeded,
+                    circuit_failure=circuit_failure,
+                )
+                METRICS.record_llm_operation(
+                    task=task,
+                    provider=r.slug,
+                    model=r.model,
+                    success=succeeded,
+                    failure_category=failure_category,
+                    estimated_input_tokens=estimated_input_tokens,
+                    reserved_output_tokens=reserved_output_tokens,
+                    actual_total_tokens=actual_tokens,
+                    duration_seconds=time.perf_counter() - started,
+                )
+
+        try:
+            result = await _run_with_lease(route, lease, _reserved_call)
         except LLMError as exc:
             previous_failed_slug = route.slug
             failures.append(exc)
-            descriptions.append(f"{route.label}: {exc}")
+            descriptions.append(f"{route.label}: {type(exc).__name__}")
             logger.warning(
-                "note provider failed; trying the next one provider=%s error=%s detail=%s",
-                route.slug, type(exc).__name__, exc,
+                "note provider failed; trying the next one provider=%s error=%s",
+                route.slug, type(exc).__name__,
             )
             continue
         if failures:
@@ -2512,15 +2590,21 @@ async def complete(
     *,
     system: str,
     user: str,
+    task: str = "",
+    data_sensitivity: str = "UNKNOWN",
 ) -> str:
-    """One completion from the first eligible provider with capacity that answers."""
-    routes = note_routes(settings)
+    """Text completion through the same allowlist, task policy and quota ledger."""
+    configured_routes = note_routes(settings)
+    routes = _task_ordered_routes(
+        _sensitivity_eligible_routes(configured_routes, settings, data_sensitivity), task
+    )
     if not routes:
-        raise LLMAuthError(
-            "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
-            "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY / "
-            "AVALAI_API_KEY)."
+        reason = (
+            "هیچ ارائه‌دهندهٔ پیکربندی‌شده‌ای برای سطح حساسیت این داده مجاز نیست."
+            if configured_routes else
+            "هیچ ارائه‌دهندهٔ مجاز و دارای کلید پیکربندی نشده است."
         )
+        raise LLMAuthError(reason)
 
     async def _call(route: NoteRoute, is_last: bool) -> str:
         return await _complete_on_route(
@@ -2532,8 +2616,16 @@ async def complete(
             retry_on_timeout=is_last,
         )
 
+    estimated_input = estimate_tokens(
+        system + "\\n" + user,
+        chars_per_token=getattr(settings, "llm_token_estimation_chars_per_token", 2.0),
+    )
     return await _dispatch_across_routes(
-        routes, session, settings, _call, hedge_route=_call
+        routes, session, settings, _call, hedge_route=_call,
+        reservation_tokens=estimated_input + max(1, int(settings.note_max_output_tokens)),
+        task=task,
+        estimated_input_tokens=estimated_input,
+        reserved_output_tokens=max(1, int(settings.note_max_output_tokens)),
     )
 
 
@@ -2674,7 +2766,9 @@ async def _complete_json_on_route(
 ) -> dict:
     """One provider's two-attempt JSON turn (used by the hedged path)."""
     last_exc: LLMError | None = None
-    for attempt, prompt in enumerate((user, JSON_ONLY_REMINDER + user)):
+    # Prefer failover over a second near-identical full-prompt request. The
+    # schema remains on the request; another provider gets the recovery attempt.
+    for attempt, prompt in enumerate((user,)):
         try:
             raw = await _complete_on_route(
                 route, session, settings, system=system, user=prompt,
@@ -2691,6 +2785,61 @@ async def _complete_json_on_route(
     raise last_exc
 
 
+TASK_PROVIDER_ORDER = {
+    "BOOKLET_GENERATION": ("avalai", "gemini", "openrouter"),
+    "BOOKLET_REPAIR": ("avalai", "gemini", "openrouter"),
+    "BOOKLET_COMPILE": ("avalai", "gemini", "openrouter"),
+    "KEY_POINTS": ("gemini", "avalai", "openrouter"),
+    "COMPACT_NOTES": ("gemini", "avalai", "openrouter"),
+    "QUIZ_GENERATION": ("gemini", "avalai", "openrouter"),
+    "QUIZ_20": ("avalai", "gemini", "openrouter"),
+    "QUIZ_DIFFICULT": ("avalai", "gemini", "openrouter"),
+    "FLASHCARD_GENERATION": ("gemini", "avalai", "openrouter"),
+    "OFFICE_TABLE_GENERATION": ("gemini", "avalai", "openrouter"),
+    "OFFICE_SLIDE_PLANNING": ("gemini", "avalai", "openrouter"),
+    "OFFICE_DOCUMENT_GENERATION": ("gemini", "avalai", "openrouter"),
+}
+
+
+def _sensitivity_eligible_routes(
+    routes: tuple[NoteRoute, ...], settings: Settings, sensitivity: str
+) -> tuple[NoteRoute, ...]:
+    """Apply a fail-closed provider policy for explicitly sensitive material.
+
+    Unclassified data is never sent to OpenRouter Free. Gemini/AvalAI remain
+    available for ordinary educational jobs; sensitive classes require explicit
+    operator approval for each provider.
+    """
+    label = (sensitivity or "UNKNOWN").strip().upper()
+    if label not in {"STANDARD_EDUCATIONAL", "INTERNAL", "SENSITIVE", "PHI_OR_PII"}:
+        label = "UNKNOWN"
+    eligible: list[NoteRoute] = []
+    for route in routes:
+        if label == "STANDARD_EDUCATIONAL":
+            eligible.append(route)
+        elif label == "UNKNOWN":
+            if route.slug != "openrouter":
+                eligible.append(route)
+        elif route.slug == "openrouter":
+            if getattr(settings, "openrouter_free_allow_sensitive_data", False):
+                eligible.append(route)
+        elif route.slug == "gemini":
+            if getattr(settings, "gemini_free_allow_sensitive_data", False):
+                eligible.append(route)
+        elif route.slug == "avalai":
+            if getattr(settings, "avalai_allow_sensitive_data", False):
+                eligible.append(route)
+    return tuple(eligible)
+
+
+def _task_ordered_routes(routes: tuple[NoteRoute, ...], task: str) -> tuple[NoteRoute, ...]:
+    order = TASK_PROVIDER_ORDER.get((task or "").strip().upper())
+    if not order:
+        return routes
+    by_slug = {route.slug: route for route in routes}
+    return tuple(by_slug[slug] for slug in order if slug in by_slug)
+
+
 def _ordered_routes(routes: tuple[NoteRoute, ...], prefer: str) -> tuple[NoteRoute, ...]:
     """Move ``prefer`` to the front, keeping every other route as a fallback."""
     slug = (prefer or "").strip().lower()
@@ -2698,6 +2847,9 @@ def _ordered_routes(routes: tuple[NoteRoute, ...], prefer: str) -> tuple[NoteRou
         return routes
     preferred = tuple(route for route in routes if route.slug == slug)
     if not preferred:
+        return routes
+    # OpenRouter is an emergency last fallback, never an overrideable primary.
+    if slug == "openrouter" and len(routes) > 1:
         return routes
     return preferred + tuple(route for route in routes if route.slug != slug)
 
@@ -2712,6 +2864,8 @@ async def complete_json(
     prefer_provider: str = "",
     max_output_tokens: int | None = None,
     wait_for_capacity: bool = True,
+    task: str = "",
+    data_sensitivity: str = "UNKNOWN",
 ) -> dict:
     """A completion parsed as strict JSON, with bounded per-provider recovery.
 
@@ -2728,12 +2882,25 @@ async def complete_json(
         if max_output_tokens <= 0:
             raise ValueError("max_output_tokens must be positive")
         settings = replace(settings, note_max_output_tokens=int(max_output_tokens))
-    routes = _ordered_routes(note_routes(settings), prefer_provider)
+    configured_routes = note_routes(settings)
+    eligible_routes = _sensitivity_eligible_routes(
+        configured_routes, settings, data_sensitivity
+    )
+    routes = _ordered_routes(
+        _task_ordered_routes(eligible_routes, task), prefer_provider
+    )
     if not routes:
+        if configured_routes:
+            raise LLMAuthError(
+                "هیچ ارائه‌دهندهٔ پیکربندی‌شده‌ای برای سطح حساسیت این داده مجاز نیست."
+            )
+        if (data_sensitivity or "UNKNOWN").strip().upper() in {"INTERNAL", "SENSITIVE", "PHI_OR_PII"}:
+            raise LLMAuthError(
+                "هیچ ارائه‌دهندهٔ مجازی برای سطح حساسیت این داده تأیید نشده است."
+            )
         raise LLMAuthError(
-            "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
-            "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY / "
-            "AVALAI_API_KEY)."
+            "هیچ ارائه‌دهندهٔ مجاز و دارای کلید پیکربندی نشده است "
+            "(GEMINI_API_KEY / AVALAI_API_KEY / OPENROUTER_API_KEY)."
         )
 
     async def _call_json(route: NoteRoute, is_last: bool) -> dict:
@@ -2747,7 +2914,19 @@ async def complete_json(
             schema=schema,
         )
 
+    estimated_input = estimate_tokens(
+        system + "\\n" + user,
+        chars_per_token=getattr(settings, "llm_token_estimation_chars_per_token", 2.0),
+    )
+    output_reserve = min(
+        int(settings.note_max_output_tokens),
+        max(1, int(getattr(settings, "note_context_tokens", settings.note_max_output_tokens))),
+    )
     return await _dispatch_across_routes(
         routes, session, settings, _call_json, hedge_route=_call_json,
-        pool_owner=pool_owner, wait_for_capacity=wait_for_capacity
+        pool_owner=pool_owner, wait_for_capacity=wait_for_capacity,
+        reservation_tokens=estimated_input + output_reserve,
+        task=task or "UNSPECIFIED",
+        estimated_input_tokens=estimated_input,
+        reserved_output_tokens=output_reserve,
     )
