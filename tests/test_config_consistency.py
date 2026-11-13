@@ -84,15 +84,10 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_PROVIDERS", "note_providers", "csv"),
     ("NOTE_PROVIDER", "note_provider", "str"),
     ("NOTE_MODEL", "note_model", "str"),
-    ("NARA_API_KEY", "nara_api_key", "str"),
-    ("NARA_BASE_URL", "nara_base_url", "str"),
-    ("NARA_MODEL", "nara_model", "str"),
     ("OPENROUTER_API_KEY", "openrouter_api_key", "str"),
     ("OPENROUTER_BASE_URL", "openrouter_base_url", "str"),
     ("OPENROUTER_MODEL", "openrouter_model", "str"),
     ("GEMINI_MODEL", "gemini_model", "str"),
-    ("DEEPSEEK_BASE_URL", "deepseek_base_url", "str"),
-    ("DEEPSEEK_MODEL", "deepseek_model", "str"),
     ("AVALAI_BASE_URL", "avalai_base_url", "str"),
     ("AVALAI_MODEL", "avalai_model", "str"),
     ("NOTE_GEMINI_THINKING_BUDGET", "gemini_thinking_budget", "int"),
@@ -109,6 +104,10 @@ DOCUMENTED_DEFAULTS: tuple[tuple[str, str, str], ...] = (
     ("NOTE_STRUCTURED_OUTPUT", "note_structured_output", "bool"),
     ("NOTE_PROGRESSIVE_BOOKLET", "note_progressive_booklet", "bool"),
     ("NOTE_COMPLETENESS_FILL", "note_completeness_fill", "bool"),
+    ("NOTE_COMPILE", "note_compile", "bool"),
+    ("NOTE_STRICT_GROUNDING", "note_strict_grounding", "bool"),
+    ("NOTE_QUALITY_GATE", "note_quality_gate", "str"),
+    ("NOTE_HEDGE_AFTER_SECONDS", "note_hedge_after", "float"),
     ("NOTE_COMPILE_PROVIDER", "note_compile_provider", "str"),
     ("NOTE_COMPILE_MAX_CHARS", "note_compile_max_chars", "int"),
     ("NOTE_REASONING_EFFORT", "note_reasoning_effort", "str"),
@@ -225,6 +224,28 @@ class EnvExampleCoverageTests(unittest.TestCase):
 
 
 class DocumentedDefaultsTests(unittest.TestCase):
+    def test_examples_preserve_conservative_llm_budgets_and_provider_caps(self):
+        # A parsable override is not necessarily the shipped default. Pin both
+        # so a duplicate example cannot quietly recommend larger budgets.
+        documented = example_values()
+        defaults = default_settings()
+        attrs = {
+            "NOTE_CONTEXT_TOKENS": "note_context_tokens", "NOTE_CHUNK_CHARS": "note_chunk_chars",
+            "NOTE_MAX_OUTPUT_TOKENS": "note_max_output_tokens",
+            "LLM_PRIMARY_MAX_IN_FLIGHT": "llm_primary_max_in_flight",
+            "LLM_FALLBACK_MAX_IN_FLIGHT": "llm_fallback_max_in_flight",
+            "AVALAI_RPM_LIMIT": "avalai_rpm_limit", "AVALAI_TPM_LIMIT": "avalai_tpm_limit",
+            "AVALAI_MAX_IN_FLIGHT": "avalai_max_in_flight", "GEMINI_MAX_IN_FLIGHT": "gemini_max_in_flight",
+            "GEMINI_RPM_LIMIT": "gemini_rpm_limit", "GEMINI_TPM_LIMIT": "gemini_tpm_limit",
+            "GEMINI_RPD_LIMIT": "gemini_rpd_limit", "OPENROUTER_RPM_LIMIT": "openrouter_rpm_limit",
+            "OPENROUTER_RPD_LIMIT": "openrouter_rpd_limit", "OPENROUTER_MAX_IN_FLIGHT": "openrouter_max_in_flight",
+        }
+        for name, attribute in attrs.items():
+            with self.subTest(setting=name):
+                self.assertEqual(int(documented[name]), getattr(defaults, attribute))
+        self.assertEqual(documented["NOTE_COMPILE"].lower(), "false")
+        self.assertEqual(float(documented["NOTE_HEDGE_AFTER_SECONDS"]), 0.0)
+
     def test_documented_defaults_are_what_the_code_produces(self):
         """Setting a variable to the documented value must give that value.
 
@@ -327,11 +348,17 @@ class ProviderDefaultsDocumentationTests(unittest.TestCase):
         for model in config.DEFAULT_NOTE_MODELS.values():
             self.assertIn(f"`{model}`", text)
 
-    def test_operator_reported_current_models_are_consistent(self):
+    def test_documented_default_models_match_the_code(self):
+        """Docs must not lag the shipped default models.
+
+        The previous hardcoded tuple named models the code no longer ships;
+        the consistency property that matters is: every operator page names
+        exactly the models ``config.py`` ships as per-provider defaults.
+        """
         expected = (
-            "laguna-s-2.1",
-            "nvidia/nemotron-3.5-super-vl:free",
-            "gemini-3.5-flash-lite",
+            config.DEFAULT_AVALAI_MODEL,
+            config.DEFAULT_OPENROUTER_MODEL,
+            config.DEFAULT_GEMINI_MODEL,
         )
         pages = (
             REPO_ROOT / ".env.example",

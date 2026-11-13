@@ -60,6 +60,10 @@ VALID_NOTES_JSON = json.dumps(
 )
 
 
+async def _noop(*_args, **_kwargs):
+    return None
+
+
 def deployment_env(**overrides):
     """The exact tested profile, plus the credentials a route needs."""
     base = {
@@ -207,36 +211,35 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(routes[1].api_key, "o-key-not-a-secret")
         self.assertNotIn("nara", [r.slug for r in routes])
         self.assertNotIn("openai_compatible", [r.slug for r in routes])
-        # The shipped, project-wide default is deliberately unchanged.
-        self.assertEqual(DEFAULT_NOTE_PROVIDERS, "gemini,nara,openrouter,deepseek,avalai")
+        # The shipped, project-wide default is the three-provider chain.
+        self.assertEqual(DEFAULT_NOTE_PROVIDERS, "avalai,gemini,openrouter")
         self.assertEqual(DEFAULT_NOTE_MAX_OUTPUT_TOKENS, 16384)
 
     def test_no_legacy_openai_compatible_route_without_legacy_credentials(self):
-        settings = settings_from_env(
-            NOTE_PROVIDER="openai_compatible", NOTE_BASE_URL=None, NOTE_API_KEY=None
-        )
+        settings = settings_from_env(NOTE_PROVIDER="openai_compatible")
         self.assertEqual(tuple(r.slug for r in note_routes(settings)), ("gemini", "openrouter"))
+        self.assertEqual(settings.note_api_key, "")
         settings = settings_from_env(NOTE_PROVIDER="gemini")
         self.assertEqual(tuple(r.slug for r in note_routes(settings)), ("gemini", "openrouter"))
 
-    def test_legacy_slot_still_works_and_is_never_duplicated(self):
-        explicit = settings_from_env(
-            NOTE_PROVIDER="openai_compatible",
+    def test_legacy_slot_on_an_approved_host_is_never_duplicated(self):
+        """A preserved v2-era ``NOTE_BASE_URL`` pointing at an approved host is
+        admitted as that provider; a removed or unknown host is ignored."""
+        avalai = settings_from_env(
             NOTE_API_KEY="legacy-key",
-            NOTE_BASE_URL="https://local.example/v1",
+            NOTE_BASE_URL="https://api.avalai.ir/v1",
         )
-        routes = note_routes(explicit)
+        # The legacy slot is classified as the avalai leg and appended to the
+        # declared chain, never duplicated.
         self.assertEqual(
-            tuple(r.slug for r in routes), ("gemini", "openrouter", "openai_compatible")
+            tuple(r.slug for r in note_routes(avalai)),
+            ("gemini", "avalai", "openrouter"),
         )
-        self.assertEqual(routes[2].api_key, "legacy-key")
+        self.assertEqual(note_routes(avalai)[1].api_key, "legacy-key")
         # An explicitly declared legacy slug is the same leg, not a second one.
-        inline = settings_from_env(NOTE_PROVIDERS="gemini,openai_compatible,openrouter")
-        self.assertEqual(
-            inline.note_providers,
-            ("gemini", "openai_compatible", "openrouter"),
-        )
-        # A duplicate legacy declaration cannot produce a second Gemini leg.
+        inline = settings_from_env(NOTE_PROVIDERS="gemini,avalai,openrouter")
+        self.assertEqual(inline.note_providers, ("gemini", "avalai", "openrouter"))
+        # A duplicate declaration cannot produce a second leg.
         duplicated = settings_from_env(NOTE_PROVIDERS="gemini,openrouter,gemini")
         self.assertEqual(tuple(r.slug for r in note_routes(duplicated)), ("gemini", "openrouter"))
 
@@ -261,21 +264,15 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertEqual(payload["reasoning_effort"], "none")
 
     def test_reasoning_none_is_sent_only_where_it_is_supported(self):
+        """Among the approved providers, only OpenRouter documents the field."""
         settings = deployed_settings(
-            note_providers=("nara", "openrouter", "deepseek", "openai_compatible", "gemini"),
-            nara_api_key="nara-key",
-            deepseek_api_key="deepseek-key",
-            note_api_key="legacy-key",
-            note_provider="openai_compatible",
-            note_api_base_url="https://local.example/v1",
+            note_providers=("avalai", "openrouter", "gemini"),
+            avalai_api_key="avalai-key",
         )
         by_slug = {route.slug: route for route in note_routes(settings)}
-        for slug in ("nara", "openrouter", "deepseek"):
-            _url, _headers, payload = _build_request_for(
-                by_slug[slug], settings, "S", "U", schema=SCHEMA
-            )
-            self.assertEqual(payload["reasoning_effort"], "none", slug)
-        for slug in ("openai_compatible", "gemini"):
+        payload = _build_request_for(by_slug["openrouter"], settings, "S", "U", schema=SCHEMA)[2]
+        self.assertEqual(payload["reasoning_effort"], "none")
+        for slug in ("avalai", "gemini"):
             _url, _headers, payload = _build_request_for(
                 by_slug[slug], settings, "S", "U", schema=SCHEMA
             )
@@ -413,7 +410,10 @@ class GeminiCompatibilityTests(unittest.IsolatedAsyncioTestCase):
 
         session = _Session([rejection() for _ in range(12)])
         with self.assertRaises(LLMRequestError):
-            await complete(session, settings, system="S", user="U")
+            await complete(
+                session, settings, system="S", user="U",
+                data_sensitivity="STANDARD_EDUCATIONAL",
+            )
         self.assertEqual(len(session.calls), llm.MAX_COMPATIBILITY_ADJUSTMENTS + 1)
 
 
@@ -434,7 +434,7 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_json_is_accepted_without_a_response_schema(self):
         settings = deployed_settings(note_providers=("openrouter",))
         session = _Session([openai_answer(VALID_NOTES_JSON)])
-        payload = await complete_json(session, settings, system="S", user="U", schema=SCHEMA)
+        payload = await complete_json(session, settings, system="S", user="U", schema=SCHEMA, data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(len(_load_json_payload(payload).sections), 4)
         self.assertNotIn("response_format", session.calls[0]["json"])
 
@@ -447,7 +447,7 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
             '{"title": "فیزیولوژی کلیه", "sections": [', finish_reason="length"
         )
         session = _Session([gemini_truncated, openai_answer(VALID_NOTES_JSON)])
-        payload = await complete_json(session, settings, system="S", user="U")
+        payload = await complete_json(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(payload["title"], "فیزیولوژی کلیه")
         # Gemini was abandoned after one truncated reply, not retried as bad
         # JSON; OpenRouter served the complete answer.
@@ -462,7 +462,7 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
         settings = deployed_settings(note_providers=("openrouter",))
         session = _Session([openai_answer("ok")])
         with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
-            await complete(session, settings, system="S", user="U")
+            await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         usage_lines = [line for line in logs.output if "note provider usage" in line]
         self.assertTrue(usage_lines)
         self.assertIn("requested_output_tokens=32768", usage_lines[0])
@@ -471,36 +471,42 @@ class OpenRouterTests(unittest.IsolatedAsyncioTestCase):
 
 
 class FailoverRoutingTests(unittest.IsolatedAsyncioTestCase):
-    """Gemini first, OpenRouter second, Nara only when explicitly listed."""
+    """Gemini first, OpenRouter second; removed providers never reappear
+    and a permanent/transient first-path failure routes to the next one."""
 
-    def test_nara_is_not_attempted_when_it_is_not_in_the_chain(self):
-        settings = deployed_settings(nara_api_key="nara-key", note_providers=("gemini", "openrouter"))
+    def test_removed_providers_are_not_built_as_routes(self):
+        """A removed provider's slot never resolves to a route."""
+        settings = deployed_settings(note_providers=("gemini", "openrouter"))
         self.assertEqual(tuple(r.slug for r in note_routes(settings)), ("gemini", "openrouter"))
+        for slug in ("nara", "deepseek", "anthropic", "openai_compatible"):
+            self.assertNotIn(slug, [r.slug for r in note_routes(settings)])
 
     async def test_gemini_is_attempted_before_openrouter(self):
         settings = deployed_settings()
         session = _Session([gemini_answer("gemini-answer")])
-        result = await complete(session, settings, system="S", user="U")
+        result = await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(result, "gemini-answer")
         self.assertEqual(len(session.calls), 1)
         self.assertIn("/models/", session.calls[0]["url"])
 
     async def test_openrouter_is_attempted_after_an_eligible_gemini_failure(self):
+        """A transient Gemini failure exhausts the bounded retry then fails over."""
         settings = deployed_settings()
         rejection = _Response(503, {"error": {"message": "temporarily unavailable"}})
-        session = _Session([rejection, openai_answer("openrouter-answer")])
-        with mock.patch.object(llm, "MAX_TRANSIENT_RETRIES", 0):
-            result = await complete(session, settings, system="S", user="U")
+        session = _Session([rejection, rejection, openai_answer("openrouter-answer")])
+        with mock.patch("gamas_bot.llm.asyncio.sleep", new=_noop):
+            result = await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(result, "openrouter-answer")
-        self.assertEqual(len(session.calls), 2)
-        self.assertIn("/chat/completions", session.calls[1]["url"])
-        self.assertEqual(session.calls[1]["headers"]["Authorization"], "Bearer o-key")
+        self.assertEqual(len(session.calls), llm.MAX_TRANSIENT_RETRIES + 2)
+        self.assertTrue(all("generativelanguage.googleapis.com" in c["url"] for c in session.calls[:-1]))
+        self.assertIn("openrouter.ai/api/v1/chat/completions", session.calls[-1]["url"])
+        self.assertEqual(session.calls[-1]["headers"]["Authorization"], "Bearer o-key")
 
     async def test_permanent_400_is_not_retried_on_the_same_provider(self):
         settings = deployed_settings()
         rejection = _Response(400, {"error": {"message": "Bad request"}})
         session = _Session([rejection, openai_answer("openrouter-answer")])
-        result = await complete(session, settings, system="S", user="U")
+        result = await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(result, "openrouter-answer")
         self.assertEqual(len(session.calls), 2)
 
@@ -511,5 +517,5 @@ class FailoverRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         session = _Session([rejection(), rejection()])
         with self.assertRaises(LLMRequestError):
-            await complete(session, settings, system="S", user="U")
+            await complete(session, settings, system="S", user="U", data_sensitivity="STANDARD_EDUCATIONAL")
         self.assertEqual(len(session.calls), 2)

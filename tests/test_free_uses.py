@@ -181,7 +181,8 @@ class FreeFirstTryBotTests(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
         self.settings = make_settings(
-            db_path=root / "freebot.db", temp_dir=root / "tmp", flashcard_ai_deck_size=6
+            db_path=root / "freebot.db", temp_dir=root / "tmp", flashcard_ai_deck_size=6,
+            avalai_api_key="avalai-test-key",  # mocked generation fixture
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.settings.db_path)

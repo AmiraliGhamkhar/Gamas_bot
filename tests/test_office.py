@@ -551,7 +551,9 @@ class ModelValidationTests(unittest.IsolatedAsyncioTestCase):
     """A model may *arrange* the user's text; it may never rewrite it."""
 
     def settings(self):
-        return make_settings()
+        # The planner is exercised against the allowed avalai route; the
+        # mock replaces its I/O, so only the routing seam is being tested.
+        return make_settings(avalai_api_key="avalai-test-key")
 
     async def test_a_complete_grounded_plan_is_accepted(self):
         session = _FakeLLMSession(
@@ -673,7 +675,7 @@ class ModelValidationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_without_a_provider_the_planner_is_skipped(self):
         settings = make_settings(
-            note_api_key="", note_api_base_url="", nara_api_key="", openrouter_api_key=""
+            note_api_key="", note_api_base_url="", openrouter_api_key=""
         )
         session = _FakeLLMSession({})
         self.assertIsNone(await plan_deck(SAMPLE, settings=settings, session=session))

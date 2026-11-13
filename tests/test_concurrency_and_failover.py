@@ -127,11 +127,12 @@ def _chat_completion_json(content: str, *, delay: float = 0.0) -> _FakeHTTPRespo
 
 
 def _dual_llm_settings(**overrides):
+    """Two scripted approved routes: avalai primary + openrouter fallback."""
     base: dict[str, object] = {
-        "note_providers": ("nara", "openrouter"),
-        "nara_api_key": "nara-secret-key",
-        "nara_base_url": "https://router.bynara.id/v1",
-        "nara_model": "openai/gpt-4o-mini",
+        "note_providers": ("avalai", "openrouter"),
+        "avalai_api_key": "avalai-secret-key",
+        "avalai_base_url": "https://api.avalai.ir/v1",
+        "avalai_model": "openai/gpt-4o-mini",
         "openrouter_api_key": "or-secret-key",
         "openrouter_base_url": "https://openrouter.ai/api/v1",
         "openrouter_model": "google/gemini-2.5-flash-lite",
@@ -444,10 +445,10 @@ class LLMCapacityAndFailoverTests(unittest.IsolatedAsyncioTestCase):
 
         session = _RoutingLLMSession(
             {
-                "router.bynara.id": lambda _u: GateResponse(
+                "api.avalai.ir": lambda _u: GateResponse(
                     200,
                     {
-                        "id": "nara-1",
+                        "id": "avalai-1",
                         "choices": [
                             {
                                 "index": 0,
@@ -460,40 +461,64 @@ class LLMCapacityAndFailoverTests(unittest.IsolatedAsyncioTestCase):
                         ],
                     },
                 ),
-                "openrouter.ai": lambda _u: _chat_completion_json(
-                    _sample_notes_json("جزوهٔ مسیر پشتیبان")
+                "generativelanguage.googleapis.com": lambda _u: _FakeHTTPResponse(
+                    200,
+                    {
+                        "candidates": [{
+                            "content": {
+                                "parts": [
+                                    {"text": _sample_notes_json("جزوهٔ مسیر پشتیبان")}
+                                ],
+                                "role": "model",
+                            },
+                            "finishReason": "STOP",
+                        }],
+                        "usageMetadata": {"promptTokenCount": 10, "candidatesTokenCount": 5},
+                    },
                 ),
             }
         )
+        # Unclassified booklet content is UNKNOWN sensitivity: the fail-closed
+        # policy excludes OpenRouter Free from it. Overflow must therefore pick
+        # the *next eligible* provider — Gemini on the default chain
+        # (avalai/gemini/openrouter).
         settings = _dual_llm_settings(
+            note_providers=("avalai", "gemini", "openrouter"),
+            gemini_api_key="g-key",
+            # This test project explicitly has two Gemini slots. Production's
+            # Gemini cap stays configurable (one by default); OpenRouter stays
+            # at its one-slot cap and is excluded for UNKNOWN content.
+            gemini_max_in_flight=2,
             llm_primary_max_in_flight=1,
-            llm_fallback_max_in_flight=3,
+            llm_fallback_max_in_flight=2,
             note_compile=False,
         )
         t_primary = asyncio.create_task(
             structure_transcript("متن جلسهٔ اول با نکات علمی.", settings, session)
         )
-        await primary_entered.wait()
+        try:
+            await asyncio.wait_for(primary_entered.wait(), timeout=2.0)
 
-        # Primary (1/1) is busy; two concurrent note requests MUST overflow immediately
-        # to OpenRouter with zero wait while primary is still blocked!
-        t0 = time.monotonic()
-        n2, n3 = await asyncio.gather(
-            structure_transcript("متن جلسهٔ دوم با نکات علمی.", settings, session),
-            structure_transcript("متن جلسهٔ سوم با نکات علمی.", settings, session),
-        )
-        elapsed = time.monotonic() - t0
-        self.assertLess(elapsed, 0.25)
-        self.assertEqual(n2.title, "جزوهٔ مسیر پشتیبان")
-        self.assertEqual(n3.title, "جزوهٔ مسیر پشتیبان")
-
-        release_primary.set()
-        n1 = await t_primary
+            # Primary (1/1) is busy; two requests must overflow immediately to
+            # the eligible Gemini route, while the primary is still blocked.
+            t0 = time.monotonic()
+            n2, n3 = await asyncio.wait_for(asyncio.gather(
+                structure_transcript("متن جلسهٔ دوم با نکات علمی.", settings, session),
+                structure_transcript("متن جلسهٔ سوم با نکات علمی.", settings, session),
+            ), timeout=2.0)
+            self.assertLess(time.monotonic() - t0, 0.25)
+            self.assertEqual(n2.title, "جزوهٔ مسیر پشتیبان")
+            self.assertEqual(n3.title, "جزوهٔ مسیر پشتیبان")
+            self.assertFalse(release_primary.is_set())
+        finally:
+            release_primary.set()
+            n1 = await asyncio.wait_for(t_primary, timeout=2.0)
         self.assertEqual(n1.title, "جزوهٔ مسیر اول")
 
         llm_metrics = METRICS.snapshot()["providers"]["llm"]
-        self.assertGreaterEqual(llm_metrics["nara"]["overflow_skips"], 2)
-        self.assertGreaterEqual(llm_metrics["openrouter"]["failovers_in"], 2)
+        self.assertGreaterEqual(llm_metrics["avalai"]["overflow_skips"], 2)
+        self.assertGreaterEqual(llm_metrics["gemini"]["failovers_in"], 2)
+        self.assertFalse(any("openrouter.ai" in url for url in session.calls))
 
     async def test_primary_llm_http_429_fails_over_without_sleeping_retry_after(self):
         slept: list[float] = []
@@ -503,7 +528,7 @@ class LLMCapacityAndFailoverTests(unittest.IsolatedAsyncioTestCase):
 
         session = _RoutingLLMSession(
             {
-                "router.bynara.id": lambda _u: _FakeHTTPResponse(
+                "api.avalai.ir": lambda _u: _FakeHTTPResponse(
                     429,
                     {"error": {"message": "Rate limit exceeded"}},
                     headers={"Retry-After": "45"},
@@ -513,7 +538,10 @@ class LLMCapacityAndFailoverTests(unittest.IsolatedAsyncioTestCase):
         )
         settings = _dual_llm_settings()
         with mock.patch("asyncio.sleep", new=record_sleep):
-            answer = await llm.complete(session, settings, system="S", user="U")
+            answer = await llm.complete(
+                session, settings, system="S", user="U",
+                data_sensitivity="STANDARD_EDUCATIONAL",
+            )
         self.assertEqual(answer, "پاسخ فوری پشتیبان")
         # Zero local sleep despite Retry-After: 45 header because fallback route existed!
         self.assertEqual(slept, [])
@@ -961,8 +989,19 @@ class SlotWaitCooldownRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue([p for p in check_config(no_fallback) if marker in p])
 
     def test_config_check_flags_llm_capacity_below_note_concurrency(self):
+        """The advisory fires only when a note route is actually configured."""
         marker = "will wait for a note-provider slot"
-        cramped = make_settings(llm_primary_max_in_flight=1, note_concurrency=2)
+        # No provider at all: no routing capacity exists, so no advisory —
+        # "notes not configured" is the right diagnostic for this state.
+        no_routes = make_settings(llm_primary_max_in_flight=1, note_concurrency=2)
+        self.assertFalse([p for p in check_config(no_routes) if marker in p])
+        # With one route configured and only one slot, the capacity-vs-chunk
+        # warning surfaces exactly once.
+        cramped = make_settings(
+            avalai_api_key="avalai-test-key",
+            llm_primary_max_in_flight=1, llm_fallback_max_in_flight=1,
+            note_concurrency=2,
+        )
         flagged = [p for p in check_config(cramped) if marker in p]
         self.assertEqual(len(flagged), 1)
         self.assertTrue(is_advisory(flagged[0]))

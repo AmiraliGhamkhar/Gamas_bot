@@ -94,7 +94,10 @@ class EchoSession:
     """
 
     def __init__(self, map_answers, *, edit=None):
-        self.map_answers = list(map_answers)
+        # Concurrent maps may arrive in a different order after SQLite quota
+        # acquisition. Bind each answer to the requested part, not arrival
+        # order, so compile/no-compile runs receive the same synthetic content.
+        self.map_answers = dict(enumerate(map_answers, start=1))
         self.calls: list[str] = []
         self.edit = edit
 
@@ -103,7 +106,9 @@ class EchoSession:
         self.calls.append(user)
         match = _BOOKLET_RE.search(user)
         if match is None:
-            content = self.map_answers.pop(0)
+            position = re.search(r"\(بخش (\d+) از \d+\):", user)
+            index = int(position.group(1)) if position else 1
+            content = self.map_answers.pop(index)
         else:
             payload = json.loads(match.group(1))
             if self.edit is not None:
@@ -149,18 +154,18 @@ def long_lecture_document(topics: int) -> str:
 class GroupedCompileTests(unittest.IsolatedAsyncioTestCase):
     """F-1a: a merged booklet over the compile budget is compiled in groups."""
 
-    async def merged_sections(self, document: str, chunks: int) -> int:
-        """The deterministic merge's section count (no compile pass)."""
-        settings = make_settings(note_chunk_chars=400, note_compile=False)
+    async def merged_sections(self, document: str, chunks: int) -> tuple[NoteSection, ...]:
+        """The deterministic merge's complete section content (no compile pass)."""
+        settings = make_settings(avalai_api_key="avalai-test-key", note_chunk_chars=400, note_compile=False)
         session = EchoSession([big_notes_json(f"جزوهٔ {i}") for i in range(chunks)])
         baseline = await structure_transcript(document, settings, session)
         self.assertEqual(compile_calls(session), [])
-        return len(baseline.sections)
+        return baseline.sections
 
     async def test_a_booklet_above_the_budget_is_compiled_in_whole_section_groups(self):
         from gamas_bot.transcript import split_transcript
 
-        settings = make_settings(note_chunk_chars=400, note_compile=True)
+        settings = make_settings(avalai_api_key="avalai-test-key", note_chunk_chars=400, note_compile=True)
         document = long_lecture_document(6)
         chunks = split_transcript(document, 400)
         self.assertGreater(len(chunks), 1)
@@ -183,12 +188,13 @@ class GroupedCompileTests(unittest.IsolatedAsyncioTestCase):
             any("compile pass grouped" in line for line in logs.output), logs.output
         )
         # Every merged section survives: grouping never drops or splits one.
-        self.assertEqual(len(notes.sections), expected)
+        self.assertEqual(len(notes.sections), len(expected))
+        self.assertEqual(notes.sections, expected)
 
     async def test_a_section_that_cannot_fit_alone_is_delivered_verbatim_with_a_warning(self):
         from gamas_bot.transcript import split_transcript
 
-        settings = make_settings(note_chunk_chars=400, note_compile=True)
+        settings = make_settings(avalai_api_key="avalai-test-key", note_chunk_chars=400, note_compile=True)
         document = long_lecture_document(4)
         chunks = split_transcript(document, 400)
         expected = await self.merged_sections(document, len(chunks))
@@ -200,7 +206,8 @@ class GroupedCompileTests(unittest.IsolatedAsyncioTestCase):
                 notes = await structure_transcript(document, settings, session)
 
         self.assertEqual(compile_calls(session), [])
-        self.assertEqual(len(notes.sections), expected)
+        self.assertEqual(len(notes.sections), len(expected))
+        self.assertEqual(notes.sections, expected)
         self.assertTrue(
             any("compile" in line and "skipped" in line for line in logs.output),
             logs.output,
@@ -263,7 +270,7 @@ class TargetedRepairTests(unittest.IsolatedAsyncioTestCase):
                 gated,
                 report,
                 REPAIR_SOURCE,
-                make_settings(note_strict_grounding=True),
+                make_settings(avalai_api_key="avalai-test-key", note_strict_grounding=True),
                 session,
                 mode="full",
                 presentation=False,
@@ -305,7 +312,7 @@ class TargetedRepairTests(unittest.IsolatedAsyncioTestCase):
             return payload
 
         session = EchoSession([], edit=edit)
-        settings = make_settings(note_strict_grounding=True)
+        settings = make_settings(avalai_api_key="avalai-test-key", note_strict_grounding=True)
         base = len(build_compile_document(LectureContext(), StructuredNotes()))
         with mock.patch.object(notes_module, "COMPILE_HARD_MAX_CHARS", base + 2200):
             repaired, _ = await _repair_once(

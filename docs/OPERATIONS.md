@@ -128,7 +128,7 @@ The database is also housekept automatically: a passive WAL checkpoint daily and
 | Active / queued / per-user jobs | 3 / 8 / 2 |
 | Downloads / media workers / uploads | 2 / 1 / 2 |
 | STT slots (Speechmatics / Deepgram / OpenAI-compatible) | 2 / 4 / 2 |
-| Note-map concurrency / primary / fallback LLM slots | 3 / 4 / 4 |
+| Note-map concurrency / primary / fallback LLM slots | 3 / 3 / 1 |
 | Media upload / duration | 1 GiB / 2 h |
 | Temporary reserve | 64 MiB plus working copies |
 | Office builds | 2 |
@@ -136,8 +136,12 @@ The database is also housekept automatically: a passive WAL checkpoint daily and
 Independent stages overlap network waits, so a single media worker is fine.
 `NOTE_MAX_OUTPUT_TOKENS` is a per-request budget, not RAM: 32 768 tokens at a
 conservative 20 tokens/s can exceed the 900 s request deadline, which `--check`
-warns about. `NOTE_HEDGE_AFTER_SECONDS` and the retry ladder add requests — count
-them on free tiers.
+warns about. The shipped output budget is 16,384, with a 131,072-token context
+and 64,000-character chunk ceiling; editorial compilation is off. Dispatch
+never hedges, including with a stale nonzero `NOTE_HEDGE_AFTER_SECONDS`; bounded
+transport retries and schema compatibility adjustments still cost requests.
+Provider-specific caps and the shared quota ledger also apply (see
+[Providers](PROVIDERS.md)).
 
 Recommended 2 GB cPanel profile (`.env`):
 
@@ -150,7 +154,7 @@ TELEGRAM_DOWNLOAD_CONNECTIONS=1
 NOTE_CONCURRENCY=3
 LEARNING_CHUNK_CONCURRENCY=2
 LEARNING_GLOBAL_CONCURRENCY=2
-NOTE_HEDGE_AFTER_SECONDS=60
+NOTE_HEDGE_AFTER_SECONDS=0
 DOC_MAX_BYTES=1073741824
 ```
 

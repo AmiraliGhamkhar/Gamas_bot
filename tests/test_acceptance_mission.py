@@ -368,6 +368,9 @@ class MissionAcceptanceCase(unittest.IsolatedAsyncioTestCase):
 
     # ------------------------------------------------------------ main menu
     async def test_upload_without_mode_button_runs_the_pipeline_and_offers_every_artifact(self):
+        # The structure_transcript collaborator below is mocked; opt in to the
+        # configured-note path instead of enabling a route in every fixture.
+        self.bot.settings = replace(self.settings, avalai_api_key="avalai-test-key")
         await self.say(USER, "/start")
         source = self.root / "lecture.ogg"
         source.write_bytes(wav_bytes(0.2))

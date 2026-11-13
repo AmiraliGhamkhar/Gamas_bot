@@ -49,17 +49,21 @@ change — settings are read once at startup.
 ### AI provider defaults
 
 Audio transcription defaults to Speechmatics (`enhanced`), then Deepgram
-(`nova-3`), then an OpenAI-compatible transcription API (`whisper-1`). Note
-creation, AI quizzes and AI flashcards share a separate default chain: Gemini
-(`gemini-2.5-flash-lite`), Nara (`agnes-2.5-flash`), OpenRouter
-(`google/gemma-4-31b-it:free`), DeepSeek (`deepseek-flash`) and AvalAI
-(`deepseek-v4.1-flash`). These are code defaults, not confirmation of a live
-server's settings: provider order and model IDs can be overridden, and
-unconfigured hosted routes are skipped. The operator reports that the current
-deployment uses Nara `laguna-s-2.1`, OpenRouter
-`nvidia/nemotron-3.5-super-vl:free`, and Gemini `gemini-3.5-flash-lite`; the
-failover order was not supplied and cannot be checked from this checkout. See
-[Providers](docs/PROVIDERS.md) for configuration and safe checks.
+(`nova-3`), then an OpenAI-compatible transcription API (`whisper-1`). Text
+generation is restricted to **AvalAI** (`deepseek-v4.1-flash`), **Gemini**
+(`gemini-3.5-flash-lite`) and **OpenRouter**
+(`nvidia/nemotron-3.5-super-vl:free`). The default available chain is
+`avalai,gemini,openrouter`; booklet work and large/difficult quizzes prefer
+AvalAI, while smaller learning and Office tasks prefer Gemini. OpenRouter is
+always the last fallback, never promoted by preferences, and is excluded for
+unclassified (`UNKNOWN`) content. Missing credentials skip a route; stale
+removed-provider settings are ignored safely without logging their values.
+
+Operating defaults remain 131,072 context tokens, 64,000 characters per chunk
+and 16,384 output tokens, with `NOTE_COMPILE=false` and no hedged requests.
+These are application budgets, not model/account guarantees. No live provider
+or deployment compatibility is implied by offline tests. See
+[Providers](docs/PROVIDERS.md) for task policy, quota budgets and safe probes.
 
 ## Features
 

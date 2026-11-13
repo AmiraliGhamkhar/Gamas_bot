@@ -1,9 +1,71 @@
 # Configuration
 
-Copy `.env.example` to `.env`; do not commit credentials. LLM text generation is allowlisted to Gemini, AvalAI, and OpenRouter only. The legacy generic `NOTE_PROVIDER` configuration cannot extend that set.
+Copy [`.env.example`](../.env.example) to `.env`; never commit credentials.
+Process variables override the file. Restart after edits: settings load at
+startup. Use `python -m gamas_bot --check` for offline configuration diagnostics.
+See [Providers](PROVIDERS.md) for routing and [Operations](OPERATIONS.md) for
+paths, retention and host sizing.
 
-Required for an LLM route: the corresponding provider API key. Models and endpoints may be overridden with `GEMINI_MODEL`, `AVALAI_BASE_URL`, `AVALAI_MODEL`, `OPENROUTER_BASE_URL`, and `OPENROUTER_MODEL`. `NOTE_PROVIDERS` narrows provider availability; task-specific order is enforced by the router.
+## Text-generation credentials
 
-Operational defaults: AvalAI 35 RPM / 750,000 TPM / 3 in flight; OpenRouter 10 RPM / 15 RPD / 1 in flight; Gemini maximum in flight 1. Gemini RPM/TPM/RPD default to unset (zero disables those configured caps) and must be explicitly set from the current AI Studio project. The shared SQLite/WAL ledger reserves estimated input tokens plus the full output budget. `LLM_TOKEN_ESTIMATION_CHARS_PER_TOKEN` tunes this conservative estimate. `LLM_PRIMARY_MAX_IN_FLIGHT=3`, `LLM_FALLBACK_MAX_IN_FLIGHT=1`, `NOTE_HEDGE_AFTER_SECONDS=0`, `NOTE_STRUCTURED_OUTPUT=1`, `NOTE_STRICT_GROUNDING=true`, `NOTE_QUALITY_GATE=repair`, `NOTE_COMPILE=false`, and `NOTE_PROGRESSIVE_BOOKLET=false` are recommended defaults. Compilation may be explicitly enabled for deployments that require a multi-chunk editorial pass. These settings do not constitute provider guarantees.
+Only **Gemini**, **AvalAI** and **OpenRouter** are routable. Each needs its own
+key (`GEMINI_API_KEY`, `AVALAI_API_KEY`, `OPENROUTER_API_KEY`); a missing key
+skips that route. The models shipped with the code are Gemini
+`gemini-3.5-flash-lite`, AvalAI `deepseek-v4.1-flash` and OpenRouter
+`nvidia/nemotron-3.5-super-vl:free`. Override them with `GEMINI_MODEL`,
+`AVALAI_MODEL` or `OPENROUTER_MODEL`; the two gateway bases are configurable too.
+These defaults do not establish live availability or account entitlement.
 
-The router accepts explicit sensitivity metadata; unclassified calls default to `UNKNOWN` and cannot use OpenRouter. `INTERNAL`, `SENSITIVE`, and `PHI_OR_PII` are denied to all providers unless the corresponding `AVALAI_ALLOW_SENSITIVE_DATA`, `GEMINI_FREE_ALLOW_SENSITIVE_DATA`, or `OPENROUTER_FREE_ALLOW_SENSITIVE_DATA` setting is enabled (all default false). Only mark data `STANDARD_EDUCATIONAL` when job metadata warrants it. Set a provider key blank or remove it from `NOTE_PROVIDERS` to disable that route safely. Do not configure arbitrary OpenAI-compatible endpoints.
+`NOTE_PROVIDERS=avalai,gemini,openrouter` controls available providers, not an
+escape from task policy: known tasks have fixed priorities and OpenRouter is
+always last. `prefer_provider`/`NOTE_COMPILE_PROVIDER` cannot override them.
+The v2 `NOTE_PROVIDER`/`NOTE_API_KEY`/`NOTE_BASE_URL`/`NOTE_MODEL` slot remains
+compatible only as an approved provider. A recognized provider host is
+classified as that provider, never duplicated; an explicit valid legacy slot
+can append a provider omitted from `NOTE_PROVIDERS`. Clear that slot as well
+when disabling a provider. Arbitrary generic text providers are not supported.
+Removed credentials and unsupported slots are ignored from **both** `.env`
+and the process environment, with names-only warnings rather than startup
+failure. Their keys are never lent to an approved provider.
+
+## Conservative operational defaults
+
+| Setting | Default |
+| --- | --- |
+| `NOTE_CONTEXT_TOKENS` / `NOTE_CHUNK_CHARS` / `NOTE_MAX_OUTPUT_TOKENS` | 131072 / 64000 / 16384 |
+| `NOTE_REQUEST_TIMEOUT_SECONDS` / `NOTE_TTFB_TIMEOUT_SECONDS` | 900 / 25 |
+| `NOTE_CONCURRENCY` | 3 |
+| `LLM_PRIMARY_MAX_IN_FLIGHT` / `LLM_FALLBACK_MAX_IN_FLIGHT` | 3 / 1 |
+| `AVALAI_RPM_LIMIT` / `AVALAI_TPM_LIMIT` / `AVALAI_MAX_IN_FLIGHT` | 35 / 750000 / 3 |
+| `OPENROUTER_RPM_LIMIT` / `OPENROUTER_RPD_LIMIT` / `OPENROUTER_MAX_IN_FLIGHT` | 10 / 15 / 1 |
+| `GEMINI_RPM_LIMIT` / `GEMINI_TPM_LIMIT` / `GEMINI_RPD_LIMIT` / `GEMINI_MAX_IN_FLIGHT` | 0 / 0 / 0 / 1 |
+| `NOTE_STRUCTURED_OUTPUT` / `NOTE_STRICT_GROUNDING` / `NOTE_QUALITY_GATE` | 1 / true / repair |
+| `NOTE_COMPILE` / `NOTE_PROGRESSIVE_BOOKLET` | false / false |
+| `NOTE_HEDGE_AFTER_SECONDS` | 0 (legacy knob; dispatch never hedges even if nonzero) |
+
+Zero quota values mean no configured application cap, **not** unlimited
+provider capacity. Set Gemini limits from the actual AI Studio project before
+deployment. The effective concurrent limit is the smaller of the provider and
+primary/fallback-role caps. `LLM_TOKEN_ESTIMATION_CHARS_PER_TOKEN=1.5` controls
+conservative input estimation; the full requested output budget is reserved
+as well. Do not inflate operating budgets to match reference model windows.
+Compilation is optional and off by default; bounded map/merge, split/repair and
+grounding checks are retained.
+
+## Sensitivity and validation
+
+Unclassified calls default to `UNKNOWN` and cannot use OpenRouter. `INTERNAL`,
+`SENSITIVE` and `PHI_OR_PII` require the corresponding
+`AVALAI_ALLOW_SENSITIVE_DATA`, `GEMINI_FREE_ALLOW_SENSITIVE_DATA` or
+`OPENROUTER_FREE_ALLOW_SENSITIVE_DATA` setting (all false by default). An
+OpenRouter opt-in still does not admit `UNKNOWN`. Only mark reviewed, synthetic
+or otherwise justified material `STANDARD_EDUCATIONAL`; the task name alone
+never supplies that assertion.
+
+Generated quizzes require a nonempty source and valid `medium`/`hard`
+difficulty by default, matching `QUIZ_SCHEMA` and the strict learning caller.
+Persian/English aliases are normalized; wrong types, empty/missing tags and
+unrecognized difficulty labels are rejected. Flashcards require a source too.
+Explicit `require_source=False`/`require_difficulty=False` are legacy-reader
+options, not production generation defaults; they do not relax question/option
+validation. Finite numeric locators remain compatible; NaN/Infinity do not.

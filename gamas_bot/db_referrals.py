@@ -197,7 +197,7 @@ class ReferralsRepositoryMixin(DatabaseCore):
             int(prior_approval[0][0]) if prior_approval else int(payment_id)
         )
         if prior_approval:
-            status = "forfeited_prior_approval"
+            status: str | None = "forfeited_prior_approval"
         elif bool(rows[0][1]):
             status = "forfeited_banned"
         else:

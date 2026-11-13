@@ -13,7 +13,6 @@ from gamas_bot.notes import (
     MODE_RULES,
     MAX_PRACTICAL_TIPS,
     COMPLETENESS_THRESHOLD,
-    MAX_COVERAGE_GAPS,
     REQUIRED_SKELETON_BLOCKS,
     COVERAGE_FILL_SYSTEM_PROMPT,
     COMPILE_SYSTEM_PROMPT,
@@ -64,7 +63,19 @@ from gamas_bot.notes import (
     structure_presentation,
     structure_transcript,
 )
-from tests.support import make_settings, sample_notes_json
+from tests.support import make_settings as _make_settings, sample_notes_json
+
+
+def make_settings(**overrides):
+    """Offline test settings with a fake avalai route wired in.
+
+    ``tests.support.make_settings`` now defaults to *no* provider credential
+    (see the offline-default rationale there); these exercises never perform
+    I/O, and a scoped synthetic key keeps every mocked-session assertion a
+    pure offline check.
+    """
+    overrides.setdefault("avalai_api_key", "avalai-test-key")
+    return _make_settings(**overrides)
 
 
 def _recovered_body(call: dict) -> str:

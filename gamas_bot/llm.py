@@ -1,9 +1,9 @@
 """The single LLM client for note generation: ordered providers, bounded retries.
 
-``NOTE_PROVIDERS`` *is* the failover policy (``gemini,nara,openrouter,deepseek,
-avalai`` is the shipped project default — Gemini flash-lite first, then each
-further provider only when it is listed *and* has its own credential; a
-deployment can narrow it, e.g. ``gemini,openrouter``). For every route the
+``NOTE_PROVIDERS`` *is* the failover policy (``avalai,gemini,openrouter`` is
+the shipped project default — AvalAI first, then each further approved
+provider only when it is listed *and* has its own credential; a deployment can
+narrow it, e.g. ``gemini,openrouter``). For every route the
 client builds that provider's own request
 (base URL, authentication, model, supported parameters), parses its own response
 shape, retries only transient failures — a bounded budget per provider — and
@@ -42,7 +42,7 @@ from .capacity import (
     pool_for,
     reset_pools,
 )
-from .config import NoteRoute, Settings, note_routes
+from .config import APPROVED_LLM_PROVIDERS, NoteRoute, Settings, note_routes
 from .http_util import (
     read_error_body,
     retry_after_seconds as _retry_after_seconds,
@@ -235,10 +235,9 @@ class LLMContextOverflowError(LLMRequestError):
 class LLMOutputBudgetError(LLMRequestError):
     """The answer was cut off by the *output* budget, not by a broken model.
 
-    NaraRouter documents this for reasoning models: thinking tokens are spent
-    out of the same ``max_tokens`` budget, so a small budget can return an
-    empty or half-finished answer (https://router.bynara.id/docs, "Output
-    budget"). Re-sending the same request with the same budget produces the
+    Reasoning models spend thinking tokens out of the same ``max_tokens``
+    budget, so a small budget can return an empty or half-finished answer.
+    Re-sending the same request with the same budget produces the
     same truncation, so this is treated as permanent for the provider — the
     fix is a larger ``NOTE_MAX_OUTPUT_TOKENS``, or the next provider in the
     chain, never another identical attempt.
@@ -246,8 +245,8 @@ class LLMOutputBudgetError(LLMRequestError):
 
 
 #: Structured error codes/types that providers use to report an input/context
-#: token limit failure (OpenRouter ``error.metadata.error_type``, OpenAI/Nara
-#: ``error.code``/``error.type``).
+#: token limit failure (OpenRouter ``error.metadata.error_type``,
+#: OpenAI-compatible gateways' ``error.code``/``error.type``).
 CONTEXT_OVERFLOW_CODES = frozenset(
     {
         "CONTEXT_LENGTH_EXCEEDED",
@@ -309,9 +308,8 @@ CONTEXT_OVERFLOW_MARKERS = (
     "request too large",
     "context overflow",
     "context limit",
-    # NaraRouter answers an oversized body with HTTP 413 / ``bad_request`` and
-    # the generic wording "The request body or input is too large."
-    # (https://router.bynara.id/docs, "Status codes").
+    # Gateways may answer an oversized body with HTTP 413 and the generic
+    # wording "The request body or input is too large."
     "is too large",
     "input too large",
     "payload too large",
@@ -458,11 +456,10 @@ def _error_from_payload(
     api_key: str | None,
 ) -> LLMError:
     detail: str | None = None
-    # The provider's own correlation key. NaraRouter's error envelope carries
-    # ``request_id`` precisely so a failure can be matched against its logs
-    # (https://router.bynara.id/docs, "Errors"). AvalAI's documented
+    # The provider's own correlation key. AvalAI's documented
     # ``avalai-request-id`` header takes precedence, because it is the id its
-    # User API uses for exact cost reconciliation.
+    # User API uses for exact cost reconciliation; a generic ``request_id``
+    # field in an error envelope is used otherwise.
     request_id = _response_request_id(headers, payload=payload, api_key=api_key)
     error_markers: list[str] = []
     if isinstance(payload, dict):
@@ -560,9 +557,9 @@ def _error_from_payload(
     )
     if auth_error:
         return LLMAuthError(f"{label} اعتبارنامه را نپذیرفت (HTTP {status}){suffix}")
-    # NaraRouter reserves 413 for an oversized body ("The request body or input
-    # is too large"), and OpenRouter/OpenAI report typed context/token limit
-    # codes in error.metadata.error_type / error.code.
+    # HTTP 413 is an oversized body ("The request body or input is too large")
+    # on every gateway, and OpenRouter/OpenAI-compatible gateways report typed
+    # context/token limit codes in error.metadata.error_type / error.code.
     if (
         status == 413
         or bool(marker_set & CONTEXT_OVERFLOW_CODES)
@@ -781,7 +778,7 @@ def _usage_count(value: object) -> int | None:
 
 
 class OpenAIDialect:
-    """OpenAI-compatible wire-format dialect (OpenRouter, NaraRouter, generic)."""
+    """OpenAI-compatible wire-format dialect (AvalAI, OpenRouter, generic)."""
 
     style = "openai"
 
@@ -824,9 +821,6 @@ class OpenAIDialect:
     ) -> tuple[str, dict[str, str]]:
         key = _clean_api_key(route.api_key)
         clean_target = target.strip().strip("/")
-        if clean_target in ("plans", "api/plans"):
-            parsed = urlsplit(route.base_url)
-            return urlunsplit((parsed.scheme, parsed.netloc, "/api/plans", "", "")), {}
         headers = {"Authorization": f"Bearer {key}"} if key else {}
         if clean_target == "model_endpoints":
             model_path = _openrouter_model_path(route.model)
@@ -1079,106 +1073,14 @@ class GeminiDialect:
         return str(model), input_tokens, output_tokens, total_tokens
 
 
-class AnthropicDialect:
-    """Anthropic Messages API wire-format dialect."""
-
-    style = "anthropic"
-
-    def build_post_request(
-        self,
-        route: NoteRoute,
-        settings: Settings,
-        system: str,
-        user: str,
-        *,
-        schema: dict[str, Any] | None = None,
-    ) -> tuple[str, dict[str, str], dict[str, Any]]:
-        _ = schema
-        key = _clean_api_key(route.api_key)
-        if not key:
-            raise LLMAuthError("برای Anthropic باید NOTE_API_KEY تنظیم شود.")
-        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
-        payload: dict[str, Any] = {
-            "model": route.model.strip(),
-            "max_tokens": settings.note_max_output_tokens,
-            "system": system,
-            "messages": [{"role": "user", "content": user}],
-            "temperature": NOTE_TEMPERATURE,
-        }
-        return _endpoint(route.base_url, "messages"), headers, payload
-
-    def build_get_request(
-        self,
-        route: NoteRoute,
-        target: str = "models",
-    ) -> tuple[str, dict[str, str]]:
-        key = _clean_api_key(route.api_key)
-        if not key:
-            raise LLMAuthError("برای Anthropic باید NOTE_API_KEY تنظیم شود.")
-        clean_target = target.strip().strip("/")
-        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
-        return _endpoint(route.base_url, clean_target or "models"), headers
-
-    def is_output_truncated(self, payload: dict[str, Any]) -> bool:
-        try:
-            return payload.get("stop_reason") == "max_tokens"
-        except (AttributeError, KeyError, IndexError, TypeError):
-            return False
-
-    def is_reasoning_exhausted(self, payload: dict[str, Any]) -> bool:
-        content = payload.get("content")
-        if isinstance(content, list):
-            return any(
-                isinstance(part, dict)
-                and part.get("type") in ("thinking", "redacted_thinking")
-                for part in content
-            )
-        return False
-
-    def parse_response(self, payload: dict[str, Any]) -> str:
-        stop_reason = str(payload.get("stop_reason") or "").strip().lower()
-        if stop_reason == "model_context_window_exceeded":
-            raise LLMContextOverflowError(
-                "پنجرهٔ زمینهٔ مدل برای این درخواست کافی نبود "
-                "(model_context_window_exceeded)."
-            )
-        if stop_reason == "refusal":
-            raise LLMRequestError("پاسخ سرویس تولید جزوه مسدود شد (refusal).")
-        content = payload["content"]
-        if not isinstance(content, list):
-            raise TypeError("Anthropic content is not a list")
-        text = "".join(
-            str(part.get("text", ""))
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "text"
-        )
-        if not text.strip() and self.is_reasoning_exhausted(payload):
-            raise LLMOutputBudgetError(
-                "پاسخ سرویس تولید جزوه پیش از پایان به سقف توکن خروجی رسید "
-                "(NOTE_MAX_OUTPUT_TOKENS را افزایش دهید)."
-            )
-        return text
-
-    def extract_usage(
-        self, payload: dict[str, Any]
-    ) -> tuple[str, int | None, int | None, int | None]:
-        model = payload.get("model") or payload.get("modelVersion") or ""
-        input_tokens = output_tokens = total_tokens = None
-        usage = payload.get("usage")
-        if isinstance(usage, dict):
-            input_tokens = _usage_count(usage.get("input_tokens"))
-            output_tokens = _usage_count(usage.get("output_tokens"))
-        if input_tokens is not None and output_tokens is not None:
-            total_tokens = input_tokens + output_tokens
-        return str(model), input_tokens, output_tokens, total_tokens
-
-
 _DEFAULT_DIALECT: LLMProviderDialect = OpenAIDialect()
 
+#: Wire-format dialects by request style. The approved providers map to these
+#: styles in ``config.NOTE_REQUEST_STYLE`` (``avalai``/``openrouter`` ->
+#: ``openai``, ``gemini`` -> ``gemini``).
 DIALECTS: dict[str, LLMProviderDialect] = {
     "openai": _DEFAULT_DIALECT,
     "gemini": GeminiDialect(),
-    "anthropic": AnthropicDialect(),
 }
 
 
@@ -1215,8 +1117,7 @@ def _build_request(
         if not routes:
             raise LLMAuthError(
                 "هیچ سرویس تولید جزوه‌ای پیکربندی نشده است (NOTE_PROVIDERS / NOTE_API_KEY / "
-                "NARA_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / DEEPSEEK_API_KEY / "
-                "AVALAI_API_KEY)."
+                "GEMINI_API_KEY / AVALAI_API_KEY / OPENROUTER_API_KEY)."
             )
         route = routes[0]
     return _build_request_for(route, settings, system, user)
@@ -1701,14 +1602,9 @@ async def _complete_streaming_on_route(
     ttfb_timeout = float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0)
     profile = get_provider_profile(route.slug)
     is_gemini = route.style == "gemini"
-    is_anthropic = route.style == "anthropic"
     if is_gemini:
         stream_url = _gemini_sse_url(url)
         stream_payload = payload
-    elif is_anthropic:
-        stream_url = url
-        stream_payload = dict(payload)
-        stream_payload["stream"] = True
     else:
         stream_url = url
         stream_payload = dict(payload)
@@ -1818,39 +1714,6 @@ async def _complete_streaming_on_route(
                                 continue
                             if "text" in part and part.get("text") is not None:
                                 text_parts.append(str(part.get("text", "")))
-                return
-
-            if is_anthropic:
-                ev_type = str(chunk.get("type") or "")
-                if ev_type == "message_start":
-                    msg_obj = chunk.get("message")
-                    if isinstance(msg_obj, dict):
-                        if isinstance(msg_obj.get("model"), str):
-                            served_model = msg_obj["model"]
-                        if isinstance(msg_obj.get("usage"), dict):
-                            usage.update(msg_obj["usage"])
-                elif ev_type == "content_block_start":
-                    cb = chunk.get("content_block")
-                    if isinstance(cb, dict):
-                        cb_type = cb.get("type")
-                        if cb_type in ("thinking", "redacted_thinking"):
-                            saw_thought = True
-                        elif cb_type == "text" and cb.get("text"):
-                            text_parts.append(str(cb["text"]))
-                elif ev_type == "content_block_delta":
-                    delta = chunk.get("delta")
-                    if isinstance(delta, dict):
-                        d_type = delta.get("type")
-                        if d_type == "text_delta" and delta.get("text"):
-                            text_parts.append(str(delta["text"]))
-                        elif d_type in ("thinking_delta", "signature_delta"):
-                            saw_thought = True
-                elif ev_type == "message_delta":
-                    delta = chunk.get("delta")
-                    if isinstance(delta, dict) and delta.get("stop_reason"):
-                        finish_reason = str(delta["stop_reason"])
-                    if isinstance(chunk.get("usage"), dict):
-                        usage.update(chunk["usage"])
                 return
 
             if isinstance(chunk.get("model"), str) and chunk["model"]:
@@ -1996,17 +1859,6 @@ async def _complete_streaming_on_route(
             assembled["promptFeedback"] = prompt_feedback
         if model_version:
             assembled["modelVersion"] = model_version
-    elif is_anthropic:
-        anth_blocks: list[dict[str, object]] = []
-        if saw_thought:
-            anth_blocks.append({"type": "thinking", "thinking": "[present]"})
-        if text_parts:
-            anth_blocks.append({"type": "text", "text": "".join(text_parts)})
-        assembled = {
-            "content": anth_blocks,
-            "stop_reason": finish_reason or "end_turn",
-            "usage": usage,
-        }
         if served_model:
             assembled["model"] = served_model
     else:
@@ -2089,7 +1941,7 @@ async def _complete_on_route(
         streaming_active = (
             allow_streaming
             and float(getattr(settings, "note_ttfb_timeout", 0.0) or 0.0) > 0
-            and route.style in ("openai", "gemini", "anthropic")
+            and route.style in ("openai", "gemini")
         )
         try:
             if streaming_active:
@@ -2599,6 +2451,12 @@ async def complete(
         _sensitivity_eligible_routes(configured_routes, settings, data_sensitivity), task
     )
     if not routes:
+        if configured_routes and (data_sensitivity or "UNKNOWN").strip().upper() in {
+            "INTERNAL", "SENSITIVE", "PHI_OR_PII",
+        }:
+            raise LLMAuthError(
+                "هیچ ارائه‌دهندهٔ مجازی برای سطح حساسیت این داده تأیید نشده است."
+            )
         reason = (
             "هیچ ارائه‌دهندهٔ پیکربندی‌شده‌ای برای سطح حساسیت این داده مجاز نیست."
             if configured_routes else
@@ -2815,6 +2673,8 @@ def _sensitivity_eligible_routes(
         label = "UNKNOWN"
     eligible: list[NoteRoute] = []
     for route in routes:
+        if route.slug not in APPROVED_LLM_PROVIDERS:
+            continue
         if label == "STANDARD_EDUCATIONAL":
             eligible.append(route)
         elif label == "UNKNOWN":
@@ -2833,25 +2693,29 @@ def _sensitivity_eligible_routes(
 
 
 def _task_ordered_routes(routes: tuple[NoteRoute, ...], task: str) -> tuple[NoteRoute, ...]:
+    """Enforce the allowlist and task priorities; OpenRouter is always last."""
+    by_slug = {route.slug: route for route in routes if route.slug in APPROVED_LLM_PROVIDERS}
     order = TASK_PROVIDER_ORDER.get((task or "").strip().upper())
-    if not order:
+    if order:
+        return tuple(by_slug[slug] for slug in order if slug in by_slug)
+    return tuple(route for slug, route in by_slug.items() if slug != "openrouter") + (
+        (by_slug["openrouter"],) if "openrouter" in by_slug else ()
+    )
+
+
+def _ordered_routes(
+    routes: tuple[NoteRoute, ...], prefer: str, *, task: str = ""
+) -> tuple[NoteRoute, ...]:
+    """A preference may reorder ordinary primaries, never task policy/fallback."""
+    routes = _task_ordered_routes(routes, task)
+    if (task or "").strip().upper() in TASK_PROVIDER_ORDER:
         return routes
-    by_slug = {route.slug: route for route in routes}
-    return tuple(by_slug[slug] for slug in order if slug in by_slug)
-
-
-def _ordered_routes(routes: tuple[NoteRoute, ...], prefer: str) -> tuple[NoteRoute, ...]:
-    """Move ``prefer`` to the front, keeping every other route as a fallback."""
     slug = (prefer or "").strip().lower()
-    if not slug:
+    if slug not in APPROVED_LLM_PROVIDERS or slug == "openrouter":
         return routes
-    preferred = tuple(route for route in routes if route.slug == slug)
-    if not preferred:
-        return routes
-    # OpenRouter is an emergency last fallback, never an overrideable primary.
-    if slug == "openrouter" and len(routes) > 1:
-        return routes
-    return preferred + tuple(route for route in routes if route.slug != slug)
+    return tuple(route for route in routes if route.slug == slug) + tuple(
+        route for route in routes if route.slug != slug
+    )
 
 
 async def complete_json(
@@ -2869,13 +2733,11 @@ async def complete_json(
 ) -> dict:
     """A completion parsed as strict JSON, with bounded per-provider recovery.
 
-    Each provider gets at most two requests: the original one and a single retry
-    whose prompt is a minimal "valid JSON only" reminder. A provider that still
-    cannot produce JSON is left behind for the next provider in the chain — its
-    answer is a fresh chance rather than a repeat of the same request — and when
-    the chain runs out the caller degrades to the raw transcript, which the user
-    already holds. A rejected request (4xx) is permanent for that provider and is
-    never re-sent to it with the same content.
+    Each route gets one JSON attempt; malformed/truncated output moves to the
+    next eligible provider instead of repeating a costly generation. Transport
+    retries and request-parameter compatibility adjustments remain bounded.
+    Task policy overrides preferences, and OpenRouter is always the last route.
+    Callers decide how to degrade after the eligible chain is exhausted.
     """
     pool_owner = settings
     if max_output_tokens is not None:
@@ -2886,9 +2748,7 @@ async def complete_json(
     eligible_routes = _sensitivity_eligible_routes(
         configured_routes, settings, data_sensitivity
     )
-    routes = _ordered_routes(
-        _task_ordered_routes(eligible_routes, task), prefer_provider
-    )
+    routes = _ordered_routes(eligible_routes, prefer_provider, task=task)
     if not routes:
         if configured_routes:
             raise LLMAuthError(

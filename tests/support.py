@@ -22,10 +22,9 @@ from telethon import TelegramClient
 from gamas_bot.config import (
     DEFAULT_AVALAI_BASE_URL,
     DEFAULT_AVALAI_MODEL,
-    DEFAULT_DEEPSEEK_BASE_URL,
-    DEFAULT_DEEPSEEK_MODEL,
     DEFAULT_GEMINI_MODEL,
     DEFAULT_GEMINI_THINKING_BUDGET,
+    DEFAULT_OPENROUTER_MODEL,
     Settings,
 )
 
@@ -482,18 +481,16 @@ def make_settings(**overrides) -> Settings:
         note_api_key="",
         note_api_base_url="",
         note_model="",
-        nara_api_key="",
-        nara_base_url="https://router.bynara.id/v1",
-        nara_model="agnes-2.5-flash",
         openrouter_api_key="",
         openrouter_base_url="https://openrouter.ai/api/v1",
-        openrouter_model="google/gemma-4-31b-it:free",
+        openrouter_model=DEFAULT_OPENROUTER_MODEL,
         gemini_api_key="",
         gemini_model=DEFAULT_GEMINI_MODEL,
-        deepseek_api_key="",
-        deepseek_base_url=DEFAULT_DEEPSEEK_BASE_URL,
-        deepseek_model=DEFAULT_DEEPSEEK_MODEL,
-        avalai_api_key="avalai-test-key",
+        # Offline default: a scoped key would silently turn every mocked-suite
+        # job into a live network attempt to AvalAI instead of failing fast
+        # with "no provider route". Tests that build a fake avalai route opt
+        # in by passing ``avalai_api_key=...`` themselves.
+        avalai_api_key="",
         avalai_base_url=DEFAULT_AVALAI_BASE_URL,
         avalai_model=DEFAULT_AVALAI_MODEL,
         # Keep mock-driven tests isolated from provider quota policy; dedicated

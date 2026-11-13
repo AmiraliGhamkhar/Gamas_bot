@@ -27,7 +27,6 @@ from gamas_bot.db import Database
 from gamas_bot.learning import (
     MAX_CONTENT_CHARS,
     MAX_QUESTION_CHARS,
-    MIN_VALID_QUESTIONS,
     QUIZ_SCHEMA,
     bound_content_text,
     parse_flashcard_payload,
@@ -116,6 +115,10 @@ class LearningHelperTests(unittest.TestCase):
             ]
         }
         rng = random.Random(2026)
+        # Supply valid generation tags to every candidate so the original
+        # malformed-body/shuffle regression is not masked by missing tags.
+        for entry in payload["questions"]:
+            entry.update(source="بخش ۱", difficulty="medium")
         parsed = parse_quiz_payload(payload, 5, rng=rng)
         self.assertEqual(len(parsed), 1)
         question = parsed[0]
@@ -126,7 +129,8 @@ class LearningHelperTests(unittest.TestCase):
     def test_three_option_numeric_keys_are_dropped_with_debug_log(self):
         payload = {"questions": [
             {"question": f"question {i}", "options": ["one", "two", "three"],
-             "correct": i, "explain": "reason"} for i in (1, 2, 3)
+             "correct": i, "explain": "reason", "source": "بخش ۱", "difficulty": "medium"}
+            for i in (1, 2, 3)
         ]}
         with self.assertLogs("gamas_bot.learning", level="DEBUG") as logs:
             self.assertEqual(parse_quiz_payload(payload, 3), [])
@@ -144,7 +148,7 @@ class LearningHelperTests(unittest.TestCase):
                 {"front": "پرسش دو", "back": "پاسخ دو"},
             ]
         }
-        cards = parse_flashcard_payload(payload, 10)
+        cards = parse_flashcard_payload(payload, 10, require_source=False)
         self.assertEqual(cards, [
             {"front": "پرسش یک", "back": "پاسخ یک"},
             {"front": "پرسش دو", "back": "پاسخ دو"},
@@ -576,6 +580,10 @@ class FlashcardFlowTests(unittest.IsolatedAsyncioTestCase):
         self.settings = make_settings(
             db_path=root / "fc.db",
             temp_dir=root / "tmp",
+            # Generation flow tests build a fake avalai route: the mocked
+            # complete_json never performs any I/O, and an unconfigured route
+            # would short-circuit the flow before the assertions run.
+            avalai_api_key="avalai-test-key",
             flashcard_ai_cost_seconds=300,
             flashcard_ai_deck_size=6,
             flashcard_max_decks_per_user=2,
@@ -1083,6 +1091,9 @@ class QuizFlowTests(unittest.IsolatedAsyncioTestCase):
         self.settings = make_settings(
             db_path=root / "flow.db",
             temp_dir=root / "tmp",
+            # Generation flow tests build a fake avalai route behind the mocked
+            # complete_json (see FlashcardFlowTests).
+            avalai_api_key="avalai-test-key",
             quiz_cost_seconds_per_question=60,
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -1821,17 +1832,19 @@ class QuizDifficultyParserTests(unittest.TestCase):
         payload = {"questions": [
             {"question": "اگر X رخ دهد کدام گزینه درست است؟",
              "options": ["الف", "ب", "ج", "د"],
-             "correct": 0, "explain": "چرا", "difficulty": "hard"},
+             "correct": 0, "explain": "چرا", "difficulty": "hard", "source": "بخش ۱"},
             {"question": "در شرایط Y کدام گزینه درست است؟",
              "options": ["الف", "ب", "ج", "د"],
-             "correct": 1, "explain": "چرا", "difficulty": "medium"},
+             "correct": 1, "explain": "چرا", "difficulty": "medium", "source": "بخش ۱"},
         ]}
         parsed = parse_quiz_payload(payload, 2, rng=random.Random(7))
         self.assertEqual([q["difficulty"] for q in parsed], ["hard", "medium"])
 
-    def test_missing_or_invalid_difficulty_never_drops_a_question(self):
+    def test_missing_or_invalid_difficulty_drops_at_the_strict_boundary(self):
+        """The quiz schema requires a medium/hard tag: an invalid one is dropped."""
         base = {"question": "سناریو: کدام گزینه درست است؟",
-                "options": ["الف", "ب", "ج", "د"], "correct": 0, "explain": "چرا"}
+                "options": ["الف", "ب", "ج", "د"], "correct": 0, "explain": "چرا",
+                "source": "بخش ۱"}
         payload = {"questions": [
             dict(base),                                   # no difficulty at all
             {**base, "difficulty": "easy"},               # invalid enum
@@ -1839,17 +1852,22 @@ class QuizDifficultyParserTests(unittest.TestCase):
             {**base, "difficulty": "hard"},               # valid
         ]}
         parsed = parse_quiz_payload(payload, 4, rng=random.Random(3))
-        self.assertEqual(len(parsed), 4)  # nothing dropped
-        self.assertEqual([q.get("difficulty") for q in parsed],
+        self.assertEqual(len(parsed), 1)
+        self.assertEqual(parsed[0]["difficulty"], "hard")
+        # The permissive reader still accepts the same untagged legacy content.
+        relaxed = parse_quiz_payload(
+            payload, 4, rng=random.Random(3),
+            require_source=False, require_difficulty=False,
+        )
+        self.assertEqual(len(relaxed), 4)
+        self.assertEqual([q.get("difficulty") for q in relaxed],
                          [None, None, None, "hard"])
-        # MIN_VALID_QUESTIONS path still holds: all four survive.
-        self.assertGreaterEqual(len(parsed), MIN_VALID_QUESTIONS)
 
     def test_option_shuffle_is_unchanged(self):
         payload = {"questions": [
             {"question": "سناریو: کدام گزینه درست است؟",
              "options": ["درست", "غلط۱", "غلط۲", "غلط۳"],
-             "correct": 0, "explain": "چرا", "difficulty": "hard"},
+             "correct": 0, "explain": "چرا", "difficulty": "hard", "source": "بخش ۱"},
         ]}
         parsed = parse_quiz_payload(payload, 1, rng=random.Random(1))
         self.assertEqual(len(parsed), 1)
@@ -1860,7 +1878,7 @@ class QuizDifficultyParserTests(unittest.TestCase):
         stem = "اگر بیماری با شرایط خاص مراجعه کند " * 12
         payload = {"questions": [
             {"question": stem, "options": ["الف", "ب", "ج", "د"],
-             "correct": 0, "explain": "چرا", "difficulty": "hard"},
+             "correct": 0, "explain": "چرا", "difficulty": "hard", "source": "بخش ۱"},
         ]}
         parsed = parse_quiz_payload(payload, 1, rng=random.Random(0))
         self.assertEqual(len(parsed), 1)
@@ -1935,6 +1953,9 @@ class QuizDifficultyGenerationSmokeTests(unittest.IsolatedAsyncioTestCase):
         self.settings = make_settings(
             db_path=root / "smoke.db",
             temp_dir=root / "tmp",
+            # Generation flow tests build a fake avalai route behind the mocked
+            # complete_json (see FlashcardFlowTests).
+            avalai_api_key="avalai-test-key",
             quiz_cost_seconds_per_question=60,
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -2091,6 +2112,86 @@ class AnchoredQualityTests(unittest.TestCase):
         legacy["questions"][0]["difficulty"] = "hard"
         self.assertEqual(len(parse_quiz_payload(legacy, 1, require_difficulty=True, require_source=True)), 1)
 
+    def test_generation_defaults_match_the_schema_required_contract(self):
+        """The parser defaults ARE the generation boundary contract.
+
+        ``QUIZ_SCHEMA`` lists ``difficulty`` and ``source`` as required and the
+        only caller (``bot_learning``) passes ``require_source=True /
+        require_difficulty=True``, so a caller that forgets the flags must get
+        the strict behaviour, never the permissive legacy reader.
+        """
+        base = {"question": "سناریو: کدام گزینه درست است؟",
+                "options": ["الف", "ب", "ج", "د"], "correct": 0, "explain": "چرا"}
+
+        # Missing source / missing difficulty / invalid difficulty: each drops
+        # the question under the defaults.
+        self.assertEqual(parse_quiz_payload({"questions": [
+            {**base, "difficulty": "medium"},
+        ]}, 1, rng=random.Random(1)), [])
+        self.assertEqual(parse_quiz_payload({"questions": [
+            {**base, "source": "بخش ۱"},
+        ]}, 1, rng=random.Random(1)), [])
+        for invalid in (None, "", "   ", "easy", "نامشخص", 42, True, [], {}, ["hard"]):
+            self.assertEqual(parse_quiz_payload({"questions": [
+                {**base, "source": "بخش ۱", "difficulty": invalid},
+            ]}, 1, rng=random.Random(1)), [], invalid)
+
+        # Invalid locators are rejected, not stringified into apparent sources.
+        for empty in (None, "", "   ", False, True, [], {}, ["بخش ۱"], float("nan"), float("inf")):
+            self.assertEqual(parse_quiz_payload({"questions": [
+                {**base, "source": empty, "difficulty": "medium"},
+            ]}, 1, rng=random.Random(1)), [], empty)
+
+        # A fully tagged valid question survives; the permissive flags keep
+        # pre-existing untagged content readable.
+        valid = {"questions": [{**base, "source": "بخش ۱", "difficulty": "hard"}]}
+        self.assertEqual(len(parse_quiz_payload(valid, 1, rng=random.Random(2))), 1)
+        untagged = {"questions": [dict(base)]}
+        self.assertEqual(parse_quiz_payload(untagged, 1, rng=random.Random(3)), [])
+        self.assertEqual(len(parse_quiz_payload(
+            untagged, 1, rng=random.Random(3),
+            require_source=False, require_difficulty=False,
+        )), 1)
+
+    def test_optional_legacy_flags_are_independent_and_do_not_relax_item_validation(self):
+        tagged = quiz_payload(1)["questions"][0]
+        source_only = {k: v for k, v in tagged.items() if k != "difficulty"}
+        difficulty_only = {k: v for k, v in tagged.items() if k != "source"}
+        for entry, kwargs in (
+            (source_only, {"require_difficulty": False}),
+            (difficulty_only, {"require_source": False}),
+        ):
+            with self.subTest(optional=kwargs):
+                self.assertEqual(parse_quiz_payload({"questions": [entry]}, 1), [])
+                self.assertEqual(len(parse_quiz_payload({"questions": [entry]}, 1, **kwargs)), 1)
+                malformed = {**entry, "options": ["الف", "ب", "ج"]}
+                self.assertEqual(parse_quiz_payload({"questions": [malformed]}, 1, **kwargs), [])
+        # Numeric source aliases remain an explicit compatibility normalization;
+        # they are not a reason to relax the difficulty requirement.
+        numeric = {**tagged, "source": 3}
+        self.assertEqual(parse_quiz_payload({"questions": [numeric]}, 1)[0]["source"], "3")
+
+    def test_flashcard_source_is_required_by_default(self):
+        """Cards follow the same generation contract: no source, no card."""
+        card = {"cards": [{"front": "یک پرسش", "back": "یک پاسخ"}]}
+        self.assertEqual(parse_flashcard_payload(card, 1), [])
+        self.assertEqual(parse_flashcard_payload(card, 1, require_source=True), [])
+        self.assertEqual(
+            parse_flashcard_payload(card, 1, require_source=False),
+            [{"front": "یک پرسش", "back": "یک پاسخ"}],
+        )
+        anchored = {"cards": [{"front": "یک پرسش", "back": "یک پاسخ", "source": "بخش ۱"}]}
+        self.assertEqual(parse_flashcard_payload(anchored, 1)[0]["source"], "بخش ۱")
+
+    def test_malformed_quiz_payload_shape_never_creates_questions(self):
+        """Wrong container shapes and empty batches all parse to nothing."""
+        for bad in ({}, {"questions": None}, {"questions": "x"}, {"questions": {}},
+                    {"questions": [None, "x", 42]}, []):
+            self.assertEqual(parse_quiz_payload(bad, 3), [])
+            if bad == []:
+                continue
+            self.assertEqual(parse_flashcard_payload(bad, 3), [])
+
     def test_static_json_examples_and_dynamic_allowed_sources(self):
         from gamas_bot.learning import flashcard_system_prompt, learning_user_prompt
 
@@ -2102,8 +2203,8 @@ class AnchoredQualityTests(unittest.TestCase):
             self.assertEqual(example[key][0]["source"], "نشانگر منبع")
             self.assertIn(locator, learning_user_prompt("deck" if key == "cards" else "quiz", 5, (locator,), "text"))
 
-    def test_difficulty_is_recorded_but_never_causes_rejection(self):
-        """S5: the tag is metadata. A Persian label is mapped, an unknown one ignored."""
+    def test_difficulty_is_mapped_and_an_unknown_tag_drops_the_item(self):
+        """A Persian label maps to its tag; an unrecognized tag is invalid."""
         from gamas_bot.learning import parse_difficulty
 
         self.assertEqual(parse_difficulty("hard"), "hard")
@@ -2118,12 +2219,10 @@ class AnchoredQualityTests(unittest.TestCase):
         self.assertEqual(parsed[0]["difficulty"], "hard")
 
         payload["questions"][0]["difficulty"] = "نامشخص"
-        parsed = parse_quiz_payload(payload, 1, require_source=True)
-        self.assertEqual(len(parsed), 1)
-        self.assertNotIn("difficulty", parsed[0])
+        self.assertEqual(parse_quiz_payload(payload, 1, require_source=True), [])
 
         payload["questions"][0].pop("difficulty")
-        self.assertEqual(len(parse_quiz_payload(payload, 1, require_source=True)), 1)
+        self.assertEqual(parse_quiz_payload(payload, 1, require_source=True), [])
 
     def test_a_retyped_locator_still_names_its_own_section(self):
         """Digit shape, brackets and spacing are cosmetic — not a new place."""
@@ -2206,6 +2305,7 @@ class AnchoredQualityTests(unittest.TestCase):
                 "correct": correct,
                 "explain": "چون متن همین را می‌گوید.",
                 "source": "بخش ۱",
+                "difficulty": "medium",
             }
 
         by_letter = {"questions": [question("ب"), question("الف")]}
@@ -2241,6 +2341,7 @@ class AnchoredQualityTests(unittest.TestCase):
             "correct": 1,
             "explanation": "توضیح کوتاه.",
             "source": "بخش ۱",
+            "difficulty": "medium",
         }]}
         parsed = parse_quiz_payload(quiz, 1, rng=random.Random(7))
         self.assertEqual(len(parsed), 1)

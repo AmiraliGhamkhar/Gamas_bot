@@ -43,7 +43,10 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self._tmp = tempfile.TemporaryDirectory()
         root = Path(self._tmp.name)
         self.settings = make_settings(
-            db_path=root / "docs.db", temp_dir=root / "tmp", flashcard_ai_deck_size=6
+            db_path=root / "docs.db", temp_dir=root / "tmp", flashcard_ai_deck_size=6,
+            # Document generation flow tests build a fake avalai route behind
+            # the mocked complete_json (tests must never perform live I/O).
+            avalai_api_key="avalai-test-key",
         )
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         self.db = Database(self.settings.db_path)
@@ -522,18 +525,21 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         cards = await self.db.deck_cards((await self.db.decks_list(OWNER))[0]["deck_id"])
         self.assertTrue(all(card["source"] and "ساختگی" not in card["source"] for card in cards))
 
-    async def test_missing_quiz_difficulty_never_rejects_a_valid_question(self):
-        """S5: the difficulty tag is metadata, not an admission requirement.
+    async def test_persian_difficulty_labels_are_mapped_and_stored(self):
+        """A Persian «سخت»/«متوسط» answer is mapped to the required tag.
 
-        It used to be enforced at the generation boundary, so a route that
-        answers «سخت»/«متوسط» in Persian (or omits the tag entirely) produced
-        zero valid questions and the user paid for a failed generation.
+        The quiz schema requires a ``medium``/``hard`` difficulty on every
+        generated question; a route that answers in Persian keeps its questions
+        because the label maps onto a valid tag, while a genuinely missing or
+        unrecognized tag is inadmissible (the question is dropped and the
+        shortfall retried once rather than silently misfilled).
         """
         await self.ingest("notes.pdf", make_pdf_bytes(), mime="application/pdf")
         doc_id = (await self.db.documents_list(OWNER))[0]["id"]
         payload = quiz_payload(5, source="صفحهٔ ۱")
-        for question in payload["questions"]:
-            question.pop("difficulty")
+        for index, question in enumerate(payload["questions"]):
+            question["difficulty"] = "سخت" if index % 2 else "متوسط"
+        expected = ["hard" if index % 2 else "medium" for index in range(5)]
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(return_value=payload)) as generator:
             await self.bot._handle_callback(self.press(f"doc:gen:quiz:{doc_id}:5".encode()))
         self.assertEqual(generator.await_count, 1)
@@ -541,7 +547,8 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         await self.bot._handle_callback(self.press(b"quiz:cur:save"))
         rows = await self.db.db.execute_fetchall("SELECT difficulty,source FROM quiz_questions")
         self.assertEqual(len(rows), 5)
-        self.assertTrue(all(row[0] == "" and row[1] == "صفحهٔ ۱" for row in rows))
+        self.assertTrue(all(row[1] == "صفحهٔ ۱" for row in rows))
+        self.assertEqual(sorted(row[0] for row in rows), sorted(expected))
 
     async def test_persian_difficulty_and_retyped_locator_still_produce_a_preview(self):
         """A re-typed locator («صفحه 1» vs «صفحهٔ ۱») cites the same page.
@@ -566,33 +573,57 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(item["source"] == "صفحهٔ ۱" for item in state["items"]))
 
     async def test_parallel_chunk_calls_are_bounded_and_report_progress(self):
+        """Concurrent chunk calls are bounded by the quiz scheduling window.
+
+        Decks deliberately serialize chunk calls (one provider request at a
+        time); quizzes use ``learning_chunk_concurrency``. The barrier matches
+        the boundary's dedupe-feedback preamble on `user`, not a raw endswith,
+        so a prompt that already carries prior stems still matches its chunk.
+        """
         from gamas_bot.doc_extract import DocChunk
 
         chunks = [DocChunk(i, f"صفحهٔ {i}", (f"صفحهٔ {i}",), f"متن یکتا {i}") for i in range(8)]
         active = peak = 0
         barrier = asyncio.Event()
+
+        def worker_source(user: str) -> str:
+            # The boundary may append prior stems after the chunk text, so a
+            # raw endswith would miss: match the chunk that appears at all.
+            return next(chunk.sources[0] for chunk in chunks if chunk.text in user)
+
         async def provider(*args, **kwargs):
             nonlocal active, peak
             active += 1
             peak = max(peak, active)
             if active >= 3:
                 barrier.set()
-            await asyncio.wait_for(barrier.wait(), 2)
-            await asyncio.sleep(0.01)
-            source = next(chunk.sources[0] for chunk in chunks if chunk.text in kwargs["user"])
-            active -= 1
-            return {"cards": [{"front": f"پرسش {source} {n}", "back": f"پاسخ {n}", "source": source}
-                              for n in range(2)]}
+            try:
+                await asyncio.wait_for(barrier.wait(), 2)
+                await asyncio.sleep(0.01)
+                source = worker_source(kwargs["user"])
+                return {"questions": [
+                    {"question": f"پرسش {source} {n}", "options": ["الف", "ب", "ج", "د"],
+                     "correct": 0, "explain": "چرا", "difficulty": "medium", "source": source}
+                    # At least the quiz batch minimum (3) survives validation.
+                    for n in range(3)
+                ]}
+            finally:
+                active -= 1
+
+        # Explicitly model a five-slot quiz window; the production default of
+        # one would never reach this fixture's three-request barrier.
+        self.bot.settings = replace(self.bot.settings, learning_chunk_concurrency=5)
         placeholder = await self.press(b"menu:main").respond("در حال ساخت")
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             items, failures = await self.bot._generate_chunks(
-                kind="deck", chunks=chunks, counts=[2] * len(chunks), placeholder=placeholder
+                kind="quiz", chunks=chunks, counts=[3] * len(chunks), placeholder=placeholder
             )
         self.assertGreaterEqual(peak, 3)
         self.assertLessEqual(peak, 5)
-        self.assertEqual(len(items), 16)
+        self.assertEqual(len(items), 24)
         self.assertEqual(failures, 0)
         self.assertIn("۸", placeholder.record["text"])
+
 
 
     async def test_partial_output_is_retried_and_shortfall_is_visible(self):
@@ -617,12 +648,16 @@ class DocumentIngestionTests(unittest.IsolatedAsyncioTestCase):
         item = await self.db.library_add(OWNER, "booklet", 1, 2, None, title="سند")
         chunks = [DocChunk(i, f"صفحهٔ {i}", (f"صفحهٔ {i}",), f"متن یکتا {i}") for i in range(12)]
         source = {"item_id": item, "doc_id": None, "title": "سند", "chunks": chunks}
+
         async def provider(*args, **kwargs):
-            chunk = next(chunk for chunk in chunks if kwargs["user"].endswith(chunk.text))
+            # Read the source line, not a substring of a prior stem or page 10.
+            source_line = kwargs["user"].split("متن منبع:\n", 1)[1].split("\n", 1)[0]
+            chunk = next(c for c in chunks if c.text == source_line)
             return {"cards": [{"front": f"پرسش {chunk.index} مورد {i}", "back": "پاسخ", "source": chunk.locator} for i in range(5)]}
         with mock.patch("gamas_bot.bot.complete_json", new=mock.AsyncMock(side_effect=provider)):
             await self.bot._generate_learning(self.press(b"menu:main"), user_id=OWNER, kind="deck",
                                                source=source, wanted=5, cost=0, note="test", title="سند")
+        self.assertEqual(len(self.bot._curation[OWNER]["items"]), 5)
         self.assertEqual(self.bot._curation[OWNER]["skipped"], 10)
         self.assertIn("۱۰ بخش", self.client.texts[-1]["text"])
         self.assertIn("بررسی نشد", self.client.texts[-1]["text"])

@@ -4,11 +4,25 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
-**Provider model documentation.** Distinguish the repository's code defaults
-from the operator-reported current deployment models (Nara `laguna-s-2.1`,
-OpenRouter `nvidia/nemotron-3.5-super-vl:free`, Gemini
-`gemini-3.5-flash-lite`). The checkout has no live `.env`, so the reported
-failover order and credentials remain unverified.
+**Provider/validator remediation.** Text generation now exposes only Gemini,
+AvalAI and OpenRouter; removed settings, profiles, dialects and probes cannot
+activate legacy routes. Stale credentials/slots from either the environment or
+`.env` are ignored with names-only warnings, not startup errors. Task priority
+wins over list order/preferences and OpenRouter stays the last fallback;
+`UNKNOWN` content is still excluded from it. Gemini-only deployments respect
+`GEMINI_MODEL` and explicit provider-chain restrictions. Shared OpenAI-compatible
+transport/schema code for approved gateways and STT remains available.
+
+Quiz parsing now requires a nonempty source and valid difficulty by default,
+matching the schema and generation caller; flashcards require a source too.
+Explicit legacy parsing flags remain available. Non-string difficulty tags
+and non-finite numeric locators are rejected, with Persian/English difficulty
+aliases and finite numeric locators still supported. Offline fixtures opt into
+fake approved credentials only where generation is mocked; routing, no-hedging,
+quota, cancellation and strict/permissive validator regressions are exercised
+behaviorally. Lint cleanup and an annotation-only mypy fix do not change
+billing behavior. Conservative context/chunk/output budgets and `NOTE_COMPILE=false`
+are unchanged; no production environment, database, migration or deploy was changed.
 
 **Gamas Studio mobile reliability and startup.** The Telegram SDK is loaded
 asynchronously; SDK/initData failures have an explicit retry/explanation state.

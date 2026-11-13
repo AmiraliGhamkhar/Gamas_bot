@@ -73,7 +73,7 @@ class LLMProviderProfileProtocol(Protocol):
 
 @runtime_checkable
 class LLMProviderDialect(Protocol):
-    """Wire-format strategy for one LLM provider family (OpenAI, Gemini, Anthropic)."""
+    """Wire-format strategy for an approved provider wire format (OpenAI-compatible or Gemini)."""
 
     @property
     def style(self) -> str: ...
