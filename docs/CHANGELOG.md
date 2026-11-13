@@ -4,6 +4,12 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Provider model documentation.** Distinguish the repository's code defaults
+from the operator-reported current deployment models (Nara `laguna-s-2.1`,
+OpenRouter `nvidia/nemotron-3.5-super-vl:free`, Gemini
+`gemini-3.5-flash-lite`). The checkout has no live `.env`, so the reported
+failover order and credentials remain unverified.
+
 **Gamas Studio mobile reliability and startup.** The Telegram SDK is loaded
 asynchronously; SDK/initData failures have an explicit retry/explanation state.
 Home is the only startup API request; leaderboard and Studio data are loaded on
@@ -84,8 +90,10 @@ and a cover badge drawn over the topic text — all fixed.
 ## 2.x — providers, hardening, billing recovery
 
 - Note-provider failover with per-provider keys/models, bounded retries,
-  structured-output compatibility ladder and a tested Gemini → OpenRouter
-  profile; NaraRouter documented as generation-unverified (HTTP 502).
+  structured-output compatibility ladder and a deployment-specific tested
+  Gemini → OpenRouter profile. The recorded NaraRouter HTTP 502s were for the
+  specific `laguna-s-2.1` model; they do not establish a failure of the shipped
+  `agnes-2.5-flash` default.
 - Cache-stable static note prompt for provider prefix caching.
 - Durable payment/learning recovery: pending charges, one-time refunds,
   forward-only payment states, receipt fingerprinting, append-only lot ledger

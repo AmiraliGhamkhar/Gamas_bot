@@ -307,6 +307,45 @@ class DocumentedDefaultsTests(unittest.TestCase):
         )
 
 
+class ProviderDefaultsDocumentationTests(unittest.TestCase):
+    """Keep the documented model inventory aligned with code defaults."""
+
+    def test_stt_default_chain_and_models_are_documented(self):
+        text = (REPO_ROOT / "docs/PROVIDERS.md").read_text(encoding="utf-8")
+        settings = default_settings()
+        self.assertIn(config.DEFAULT_STT_PROVIDERS, text)
+        for model in (
+            settings.speechmatics_model,
+            settings.deepgram_model,
+            settings.stt_openai_model,
+        ):
+            self.assertIn(f"`{model}`", text)
+
+    def test_note_default_chain_and_models_are_documented(self):
+        text = (REPO_ROOT / "docs/PROVIDERS.md").read_text(encoding="utf-8")
+        self.assertIn(config.DEFAULT_NOTE_PROVIDERS, text)
+        for model in config.DEFAULT_NOTE_MODELS.values():
+            self.assertIn(f"`{model}`", text)
+
+    def test_operator_reported_current_models_are_consistent(self):
+        expected = (
+            "laguna-s-2.1",
+            "nvidia/nemotron-3.5-super-vl:free",
+            "gemini-3.5-flash-lite",
+        )
+        pages = (
+            REPO_ROOT / ".env.example",
+            REPO_ROOT / "README.md",
+            REPO_ROOT / "docs" / "PROVIDERS.md",
+            REPO_ROOT / "docs" / "CONFIGURATION.md",
+        )
+        for page in pages:
+            text = page.read_text(encoding="utf-8")
+            for model in expected:
+                with self.subTest(page=page.name, model=model):
+                    self.assertIn(model, text)
+
+
 class SttDocumentationTests(unittest.TestCase):
     def test_stt_pages_do_not_advertise_removed_settings(self):
         for page in STT_DOC_PAGES:

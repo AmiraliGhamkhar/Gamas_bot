@@ -94,9 +94,10 @@ for same-environment code comparisons, not a substitute for live measurements.
 subset, headings, no replacement glyphs, ink coverage and text collisions.
 Rasterized checks skip cleanly when the dev-only `pymupdf` is not installed.
 
-`tests/test_config_consistency.py` also verifies that every local Markdown link
-resolves and that the docs never advertise removed settings — keep it green when
-renaming a guide.
+`tests/test_config_consistency.py` verifies `.env.example` coverage and defaults
+against code, the documented STT/LLM model chains against their code defaults,
+local Markdown links, and that docs never advertise removed settings — keep it
+green when changing configuration or renaming a guide.
 
 ## Provider probes are not tests
 

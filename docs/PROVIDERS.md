@@ -1,18 +1,44 @@
 # Providers
 
-Two independent chains: **speech-to-text** (required) and **note generation**
-(optional). Keys go in `.env` only, and the process reads them once at startup.
+The bot has two separate AI pipelines: **speech-to-text (STT)** for uploaded
+audio and **LLM generation** for booklets, AI quizzes and AI flashcards. Keys
+belong in the private `.env` (or the process environment); settings are read at
+startup. STT and note-generation routes have independent credentials and
+failover orders.
+
+## What is the live server using?
+
+The model table below records the **code defaults**. Separately, the operator
+reports that the current deployment uses Nara `laguna-s-2.1`, OpenRouter
+`nvidia/nemotron-3.5-super-vl:free`, and Gemini `gemini-3.5-flash-lite` (update
+2026-11-13). This is user-provided information, not independently verified:
+this checkout contains `.env.example` only, no live `.env`. The deployment's
+failover order was not specified, and must be read from its actual `NOTE_PROVIDERS`.
+
+| Operator-reported current route | Model ID | Setting |
+| --- | --- | --- |
+| NaraRouter | `laguna-s-2.1` | `NARA_MODEL` |
+| OpenRouter | `nvidia/nemotron-3.5-super-vl:free` | `OPENROUTER_MODEL` |
+| Gemini | `gemini-3.5-flash-lite` | `GEMINI_MODEL` |
+
+On the target host, inspect the private `.env` and service-level environment
+overrides. To print the effective note-generation chain without keys or network
+calls, run `python -m scripts.probe_note_providers --show-config` from the
+project virtualenv. It uses the same configuration as the bot. Never paste or
+commit secret values.
 
 ## Speech-to-text
 
-At least one key is required. `STT_PROVIDERS` is the failover order; a provider
-without its own key is skipped.
+At least one STT key is required. The default `STT_PROVIDERS` order is
+`speechmatics,deepgram,openai_compatible`. A provider without its own key is
+skipped; set `STT_PROVIDERS` to choose a different order. Model IDs can also
+be overridden independently.
 
-| Provider | Keys | Persian notes |
-| --- | --- | --- |
-| Speechmatics | `SPEECHMATICS_API_KEY`, `SPEECHMATICS_MODEL=enhanced`, `SPEECHMATICS_MAX_IN_FLIGHT=2` | long-poll job API |
-| Deepgram | `DEEPGRAM_API_KEY`, `DEEPGRAM_BASE_URL=https://api.deepgram.com/v1`, `DEEPGRAM_MODEL=nova-3`, `DEEPGRAM_MAX_IN_FLIGHT=4` | `nova-3` is required for `fa`; `nova-2` has no Persian pack |
-| OpenAI-compatible | `STT_OPENAI_BASE_URL`, `STT_OPENAI_API_KEY`, `STT_OPENAI_MODEL=whisper-1`, `STT_OPENAI_MAX_UPLOAD_BYTES=25000000`, `STT_OPENAI_MAX_IN_FLIGHT=2` | any endpoint that accepts `audio/…` uploads |
+| Provider | Default model | Configuration | Persian notes |
+| --- | --- | --- | --- |
+| Speechmatics | `enhanced` | `SPEECHMATICS_API_KEY`, `SPEECHMATICS_MODEL`, `SPEECHMATICS_MAX_IN_FLIGHT=2` | long-poll job API |
+| Deepgram | `nova-3` | `DEEPGRAM_API_KEY`, `DEEPGRAM_BASE_URL=https://api.deepgram.com/v1`, `DEEPGRAM_MODEL`, `DEEPGRAM_MAX_IN_FLIGHT=4` | `nova-3` supports `fa`; `nova-2` does not |
+| OpenAI-compatible | `whisper-1` | `STT_OPENAI_BASE_URL`, `STT_OPENAI_API_KEY`, `STT_OPENAI_MODEL`, `STT_OPENAI_MAX_UPLOAD_BYTES=25000000`, `STT_OPENAI_MAX_IN_FLIGHT=2` | endpoint must accept audio transcription uploads |
 
 ```dotenv
 STT_PROVIDERS=speechmatics,deepgram,openai_compatible
@@ -23,43 +49,54 @@ STT_DIARIZE=true
 STT_SPEAKER_SENSITIVITY=0.5
 ```
 
-- `STT_LANGUAGE=fa` is the Persian-first default; switching language without a
-  provider that supports it returns provider errors, not empty text.
+- `STT_LANGUAGE=fa` is the Persian-first default; a selected model/provider
+  must support the requested language.
 - `STT_PREPROCESS=true` re-encodes every upload with a bounded PyAV filter chain
   (rumble, hiss, level, limiter). The charged duration is still the uploaded one.
-  Set `false` only for A/B quality comparisons.
 - `STT_DIARIZE=true` asks the engine who spoke; providers that cannot diarize
   ignore it. `DIARIZATION_ENABLED` is the legacy alias and wins when set.
-  `STT_PRESERVE_STEREO=true` keeps two channels (doubles the upload size).
-- Each provider has its own in-flight slot pool; a full primary overflows into
-  available fallback capacity instead of waiting.
+  `STT_PRESERVE_STEREO=true` keeps both channels (and doubles PCM upload size).
+- Each provider has its own in-flight slot pool; configured fallback capacity
+  can take work when a primary is saturated or returns a recoverable error.
 - Offline sanity check (no network): `python -m gamas_bot --check`.
 
 ## Note generation (optional)
 
-Without a note provider, audio still delivers the **full transcript**; document
-notes and Office exports use deterministic local fallbacks. AI quizzes and
-flashcards need a working route.
+The default note chain is `gemini,nara,openrouter,deepseek,avalai`; the model
+for each route defaults as follows. `NOTE_PROVIDERS` controls the order, while
+`GEMINI_MODEL`, `NARA_MODEL`, `OPENROUTER_MODEL`, `DEEPSEEK_MODEL` and
+`AVALAI_MODEL` override the corresponding IDs. Hosted routes without their own
+credentials are skipped. The same note-generation client is used for booklet
+creation and AI quiz/flashcard generation. Without a note route, audio still
+delivers the full transcript and document/Office work uses deterministic local
+fallbacks; AI quizzes and flashcards require a working note route.
 
-| Route | Key | Shipped model |
+| Route | Key | Shipped default model |
 | --- | --- | --- |
 | `gemini` | `GEMINI_API_KEY` | `gemini-2.5-flash-lite` |
 | `nara` | `NARA_API_KEY` | `agnes-2.5-flash` |
 | `openrouter` | `OPENROUTER_API_KEY` | `google/gemma-4-31b-it:free` |
 | `deepseek` | `DEEPSEEK_API_KEY` | `deepseek-flash` |
 | `avalai` | `AVALAI_API_KEY` | `deepseek-v4.1-flash` |
-| `openai_compatible` | `NOTE_API_KEY` + `NOTE_BASE_URL` | `gpt-4o-mini` (legacy slot) |
 
-`NOTE_PROVIDERS` is the policy: unknown slugs are warned and skipped, duplicates
-removed, keyless routes never attempted. A credential is never shared between
-providers. Leave the legacy `NOTE_PROVIDER`/`NOTE_API_KEY`/`NOTE_BASE_URL` blank
-unless you deliberately want that extra route — a set base URL *adds* an
-`openai_compatible` leg.
+Optional legacy single-provider slots are not part of that default chain:
 
-### Tested profile
+| Route | Configuration | Default model |
+| --- | --- | --- |
+| OpenAI-compatible | `NOTE_PROVIDER=openai_compatible`, `NOTE_API_KEY` and/or `NOTE_BASE_URL` | `gpt-4o-mini` |
+| Anthropic | `NOTE_PROVIDER=anthropic`, `NOTE_API_KEY`, `NOTE_MODEL` | none; set `NOTE_MODEL` explicitly |
 
-Verified with real generation at one deployment on 2026-11-07. It is a starting
-point for your own probes, not a shipped default:
+A configured legacy slot is appended to the declared chain if not already in it;
+a `NOTE_BASE_URL` on a recognized provider host is classified as that provider.
+A set base URL can therefore add a route. Credentials are never shared between
+providers. Unknown slugs are warned and skipped, duplicates are removed, and
+keyless hosted routes are never attempted.
+
+### Earlier tested profile (2026-11-07)
+
+This Gemini + OpenRouter configuration passed metadata and generation tests at
+one deployment. It is historical evidence, not the shipped default and not a
+verification of today's production settings:
 
 ```dotenv
 NOTE_PROVIDERS=gemini,openrouter
@@ -73,9 +110,11 @@ GEMINI_API_KEY=...
 OPENROUTER_API_KEY=...
 ```
 
-NaraRouter stays configurable but is excluded from this chain: `laguna-s-2.1`
-failed three real generation attempts with HTTP 502 while its metadata check
-passed. Entitlement is not a generation guarantee.
+NaraRouter was excluded from that earlier test profile. Three generation
+attempts for `laguna-s-2.1` returned HTTP 502 even though metadata checks passed.
+The operator now reports this model in current use; the earlier failures are
+historical and do not establish its current availability. Entitlement is not a
+generation guarantee.
 
 ### Key settings
 

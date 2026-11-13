@@ -15,12 +15,18 @@
 
 | Data | Where |
 | --- | --- |
-| Audio/video | your STT provider (Speechmatics / Deepgram / OpenAI-compatible) |
-| Transcript text for notes | your note provider (Gemini / OpenRouter / …) |
+| Audio/video | The configured STT chain (Speechmatics, Deepgram and/or an OpenAI-compatible transcription API) |
+| Transcript text for booklets, AI quizzes and AI flashcards | The configured note-generation chain (Gemini, NaraRouter, OpenRouter, DeepSeek, AvalAI, or an explicitly configured OpenAI-compatible / Anthropic route) |
 | Scan and photo images | i2ocr.com — only when `OCR_ENABLED=true` |
 | Transcripts, notes, billing, tickets | local SQLite (`data/gamas_v3.db`) |
 | Generated files | Telegram; the library stores message references |
 | Mini App requests | your host; signed `initData` is verified on every call |
+
+Which third-party service receives a request depends on the deployment's
+private `.env` and process environment. A recoverable provider failure can send
+the same audio or text to the next configured route. Model IDs and the code-
+default chains are listed in [Providers](PROVIDERS.md); they do not identify a
+live server's actual configuration.
 
 Review each provider's current terms and get the consent your jurisdiction
 requires before processing sensitive material. No third-party deletion or

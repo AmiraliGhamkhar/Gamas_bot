@@ -63,9 +63,38 @@ At startup the bot synchronizes only its built-in active plan catalogue; existin
 orders, payment snapshots, custom plans and balances are never rewritten. See
 [Billing](BILLING.md).
 
-## Note generation (optional)
+## Speech-to-text models
 
-`NOTE_PROVIDERS` is the failover order; a provider without its own key is skipped.
+The code default order is `STT_PROVIDERS=speechmatics,deepgram,openai_compatible`;
+providers without their own keys are skipped. Default model IDs are Speechmatics
+`enhanced`, Deepgram `nova-3` and OpenAI-compatible `whisper-1`. The model can
+be changed with `SPEECHMATICS_MODEL`, `DEEPGRAM_MODEL` or `STT_OPENAI_MODEL`.
+Persian is the default language (`STT_LANGUAGE=fa`); Deepgram requires a Persian-
+capable model such as `nova-3`.
+
+## Note generation and learning models (optional)
+
+`NOTE_PROVIDERS` is the LLM failover order for booklet generation and AI quiz /
+flashcard generation. The code default is `gemini,nara,openrouter,deepseek,avalai`;
+hosted routes without their own credentials are skipped. An explicitly
+configured OpenAI-compatible local gateway may use a base URL without a key.
+The default routes' model IDs are:
+
+| Route | Default model | Override |
+| --- | --- | --- |
+| Gemini | `gemini-2.5-flash-lite` | `GEMINI_MODEL` |
+| NaraRouter | `agnes-2.5-flash` | `NARA_MODEL` |
+| OpenRouter | `google/gemma-4-31b-it:free` | `OPENROUTER_MODEL` |
+| DeepSeek | `deepseek-flash` | `DEEPSEEK_MODEL` |
+| AvalAI | `deepseek-v4.1-flash` | `AVALAI_MODEL` |
+
+Separately, the operator reports that the current deployment uses Nara
+`laguna-s-2.1`, OpenRouter `nvidia/nemotron-3.5-super-vl:free`, and Gemini
+`gemini-3.5-flash-lite`. These are reported deployment values, not values read
+from this checkout: no live `.env` is present here. The model list does not
+specify fallback priority; set `NOTE_PROVIDERS` to match the actual deployment.
+
+Example overriding the chain to just Gemini and OpenRouter:
 
 ```dotenv
 NOTE_PROVIDERS=gemini,openrouter
@@ -73,10 +102,11 @@ GEMINI_API_KEY=...
 OPENROUTER_API_KEY=...
 ```
 
-Shipped defaults are `gemini,nara,openrouter,deepseek,avalai` with
-`NOTE_MAX_OUTPUT_TOKENS=16384` and structured output on. A verified deployment
-profile (2026-11-07) is documented in [Providers](PROVIDERS.md#tested-profile) —
-it is a recommendation, not a guarantee for your account.
+The shipped note defaults also include `NOTE_MAX_OUTPUT_TOKENS=16384` and
+structured output enabled. The tested deployment profile (2026-11-07) is
+specific to one deployment, not a shipped default or guarantee for your account;
+see [Providers](PROVIDERS.md#tested-profile). A checked-in `.env.example` is a
+template, not evidence of a server's live `.env` or process environment.
 
 ## Mini App
 
