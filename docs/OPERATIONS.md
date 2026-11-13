@@ -49,6 +49,11 @@ Useful lines:
 - `note provider usage … output_tokens=<n>` — what the provider billed.
 - `note provider failed; trying the next one` — failover with a safe reason.
 
+To print the effective note-generation providers and model IDs without keys or
+network calls, run `python -m scripts.probe_note_providers --show-config` in the
+project virtualenv. This reflects the environment visible to that command; for a
+managed service, compare its environment overrides with the private `.env`.
+Review `STT_PROVIDERS` and its model settings separately for transcription.
 Logs never contain keys, prompts or transcript text. Environment changes need a
 restart.
 

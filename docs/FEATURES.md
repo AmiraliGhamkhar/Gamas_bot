@@ -19,6 +19,9 @@ Send audio, video or a Telegram voice/video note.
   on shared hosting, keep it).
 - `AUDIO_FORMAT_POLICY=auto` picks WAV or Opus from size and provider limits;
   change it only after measuring.
+- The code-default transcription failover order is Speechmatics (`enhanced`),
+  Deepgram (`nova-3`), then an OpenAI-compatible API (`whisper-1`). Keyless
+  routes are skipped; see [Providers](PROVIDERS.md) for overrides and limits.
 - A 64 MiB free-space reserve (`TEMP_MIN_FREE_BYTES`) is kept for temporary work.
 
 Check the media stack without touching a provider:
@@ -34,7 +37,13 @@ python -m gamas_bot.media_worker check
 ## Booklets (Word and PDF)
 
 With a note provider configured, a finished transcript also produces a Persian
-RTL booklet:
+RTL booklet. Booklets, AI quizzes and AI flashcards use the same note-provider
+chain; the code default starts with Gemini `gemini-2.5-flash-lite`, followed by
+Nara, OpenRouter, DeepSeek and AvalAI when their credentials are configured.
+The operator reports the current deployment model IDs as Nara
+`laguna-s-2.1`, OpenRouter `nvidia/nemotron-3.5-super-vl:free`, and Gemini
+`gemini-3.5-flash-lite`; this checkout has no live `.env` to verify their active
+order. See [Providers](PROVIDERS.md) for defaults and overrides.
 
 - Word (`.docx`) with mixed Persian/English runs, heading styles, tables,
   «خلاصه», key points and a glossary. Fonts are **referenced**, not embedded —

@@ -46,6 +46,21 @@ Note-generation keys are optional: without them audio still delivers a
 transcript and documents/Office use local fallbacks. Restart after any `.env`
 change — settings are read once at startup.
 
+### AI provider defaults
+
+Audio transcription defaults to Speechmatics (`enhanced`), then Deepgram
+(`nova-3`), then an OpenAI-compatible transcription API (`whisper-1`). Note
+creation, AI quizzes and AI flashcards share a separate default chain: Gemini
+(`gemini-2.5-flash-lite`), Nara (`agnes-2.5-flash`), OpenRouter
+(`google/gemma-4-31b-it:free`), DeepSeek (`deepseek-flash`) and AvalAI
+(`deepseek-v4.1-flash`). These are code defaults, not confirmation of a live
+server's settings: provider order and model IDs can be overridden, and
+unconfigured hosted routes are skipped. The operator reports that the current
+deployment uses Nara `laguna-s-2.1`, OpenRouter
+`nvidia/nemotron-3.5-super-vl:free`, and Gemini `gemini-3.5-flash-lite`; the
+failover order was not supplied and cannot be checked from this checkout. See
+[Providers](docs/PROVIDERS.md) for configuration and safe checks.
+
 ## Features
 
 | Input or menu | Result |

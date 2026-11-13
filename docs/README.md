@@ -19,7 +19,7 @@ examples assume you activated the virtualenv (`source .venv/bin/activate`).
 | Guide | Use it for |
 | --- | --- |
 | [Configuration](CONFIGURATION.md) | Required values, keys, limits, paths and validation |
-| [Providers](PROVIDERS.md) | Speech-to-text and note-generation keys, models and probes |
+| [Providers](PROVIDERS.md) | Code defaults, operator-reported current models, failover configuration and probes |
 | [Operations](OPERATIONS.md) | Start/stop, logs, backup, restore, retention, host sizing |
 | [Troubleshooting](TROUBLESHOOTING.md) | Symptom → fix table |
 | [Security](SECURITY.md) | Secrets, permissions, data flow, privacy |

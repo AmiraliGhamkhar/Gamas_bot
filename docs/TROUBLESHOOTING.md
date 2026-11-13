@@ -71,7 +71,7 @@ include the full signed payload, secrets or private user content.
 | Old process sends 16 384 tokens although `.env` says 32 768 | Settings load at startup only; compare the log's `requested_output_tokens` with `--show-config`, then restart |
 | Metadata probe passes, generation fails | Different checks — only `--generate` proves generation, and it costs quota |
 | Gemini HTTP 400 `INVALID_ARGUMENT` with structured output | Set `NOTE_STRUCTURED_OUTPUT=0` (tested profile), restart, re-probe; one bounded schema-dropping retry exists |
-| NaraRouter HTTP 502 | Observed for `laguna-s-2.1`; remove `nara` from `NOTE_PROVIDERS` until a real generation probe passes |
+| NaraRouter HTTP 502 | The operator reports `laguna-s-2.1` in current use; three older generation attempts returned 502 on 2026-11-07. Check the live `.env`, current logs and `--show-config`; treat the older result as historical, and verify the next configured fallback is available |
 | Provider order looks wrong after editing `.env` | `--show-config` shows the effective chain; blank `NOTE_API_KEY`/`NOTE_BASE_URL` avoid an extra legacy route |
 | Persian Deepgram error | Use `STT_LANGUAGE=fa` with `DEEPGRAM_MODEL=nova-3` |
 | Long provider timeouts on a slow free tier | Lower `NOTE_MAX_OUTPUT_TOKENS`, set `NOTE_HEDGE_AFTER_SECONDS=0`, raise `NOTE_REQUEST_TIMEOUT_SECONDS` with evidence |
