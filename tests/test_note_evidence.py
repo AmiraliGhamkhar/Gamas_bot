@@ -28,6 +28,7 @@ from gamas_bot.notes_evidence import (
     UNIT_ALIASES,
     audit_notes,
     advice_sentences,
+    prose_claim_evidence,
     coverage_thresholds,
     evidence_windows,
     extract_signals,
@@ -528,3 +529,57 @@ class PersianEvidenceFidelityTests(unittest.TestCase):
         )
         invented = audit_notes(source, self.payload("از الگوریتم quicksort استفاده شد."))
         self.assertIn("quicksort", {signal.value for signal in invented.fabricated})
+
+
+class ProseClaimEvidenceTests(unittest.TestCase):
+    """Claim-level prose evidence: no source vocabulary, no support.
+
+    This is deliberately lexical. It does not grade paraphrase; it refuses a
+    sentence that shares *nothing* with the lecture it claims to summarise, which
+    is exactly the Persian-only invention the signal audit cannot see.
+    """
+
+    SOURCE = (
+        "در این جلسه دربارهٔ فیزیولوژی کلیه صحبت کردیم. "
+        "نفرون واحد عملکردی کلیه است و آب و نمک خون را تنظیم می‌کند. "
+        "هر کلیه حدود یک میلیون نفرون دارد."
+    )
+
+    @staticmethod
+    def payload(*paragraphs: str) -> dict:
+        return {"sections": [{"heading": "کلیه", "paragraphs": list(paragraphs)}]}
+
+    def test_an_invented_persian_sentence_has_no_supporting_span(self):
+        claims = prose_claim_evidence(
+            self.SOURCE,
+            self.payload(
+                "نفرون واحد عملکردی کلیه است و آب خون را تنظیم می‌کند.",
+                "کلیه‌ها با ترشح هورمون اریتروپویتین تولید گلبول قرمز را افزایش می‌دهند.",
+            ),
+        )
+        self.assertEqual(len(claims), 1)
+        self.assertLess(claims[0].shared_ratio, 0.2)
+        start, end = claims[0].span
+        self.assertGreaterEqual(start, 0)
+        self.assertLessEqual(end, len(self.SOURCE))
+
+    def test_a_paraphrase_that_keeps_the_terms_is_supported(self):
+        claims = prose_claim_evidence(
+            self.SOURCE,
+            self.payload("تنظیم آب و نمک خون کار نفرون کلیه است."),
+        )
+        self.assertEqual(claims, ())
+
+    def test_document_meta_sentences_are_not_claims(self):
+        claims = prose_claim_evidence(
+            self.SOURCE,
+            self.payload("در ادامه به بررسی این موضوع می‌پردازیم."),
+        )
+        self.assertEqual(claims, ())
+
+    def test_a_short_label_is_not_a_claim(self):
+        claims = prose_claim_evidence(
+            self.SOURCE,
+            self.payload("جمع‌بندی نهایی"),
+        )
+        self.assertEqual(claims, ())

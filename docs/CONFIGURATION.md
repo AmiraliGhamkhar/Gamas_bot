@@ -56,15 +56,19 @@ grounding checks are retained.
 ## Sensitivity and validation
 
 `NOTE_DATA_SENSITIVITY` decides who may see a booklet's source. `auto` (the
-default) classifies each submission once, before any provider call, and
-**fails closed to `UNKNOWN`**: a source naming a patient/file number, national
-ID, mobile number or e-mail is treated as unknown rather than assumed safe.
+default) classifies each submission once, before any provider call, and is an
+identifier heuristic rather than de-identification: a source naming a
+patient/file number, national ID, mobile number or e-mail, or reading like a
+case narrative (`شرح حال`, `بستری شد`, `case report`), is treated as `UNKNOWN`
+rather than assumed safe, and a named person after an honorific becomes
+`SENSITIVE`, which no provider may receive without its approval flag.
 `standard_educational`, `internal`, `sensitive` and `phi_or_pii` are explicit
 operator declarations for material that was reviewed; an unusable value falls
 back to `auto` instead of failing startup. The resolved label is
-passed to booklet generation, repair, coverage fill and compilation, so one
-booklet never mixes policies, and it is logged once per request. Restart after
-changing it — settings are read at startup.
+passed to booklet generation, repair, coverage fill and **every** compile
+request (single, grouped and the second-level merge), so one booklet never mixes
+policies, and it is logged once per request. Restart after changing it —
+settings are read at startup.
 
 Unclassified calls default to `UNKNOWN` and cannot use OpenRouter. `INTERNAL`,
 `SENSITIVE` and `PHI_OR_PII` require the corresponding

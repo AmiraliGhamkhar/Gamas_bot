@@ -4,6 +4,26 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Follow-up: compile policy, prose claims, incompleteness.** The editorial pass
+received the booklet's label but did not forward it to `_compile_once`, so
+`NOTE_COMPILE=true` silently dropped OpenRouter from the compile only; the
+label now reaches the single, grouped and second-level compile requests.
+`auto` classification gained case-narrative markers (`UNKNOWN`) and honorific
+names (`SENSITIVE`), with the explicit caveat that it is an identifier
+heuristic, not de-identification.
+
+The final gate now also verifies prose: a section sentence that shares less
+than 20 % of its content words with any source sentence is reported as
+`unsupported_claims` and rejects the booklet, while a sentence with source
+vocabulary but no shared signal still passes. Persistent omissions are no
+longer silently presented as verified: an accepted booklet that still omits
+source numbers or terms is delivered as `partial` with
+`error_kind=notes_incomplete` and an explicit notice. `compiling_notes` is only
+reported when the compile will run, the presentation failure notice no longer
+promises a Word file that this path does not produce, and log details are
+reduced to printable ASCII so an echoed lecture sentence cannot reach `bot.log`.
+No database, migration or note-budget change.
+
 **Booklet acceptance, sensitivity propagation and diagnostics.** Booklet
 generation, repair, coverage fill and compilation now share one data-sensitivity
 label, resolved once per submission by the new `NOTE_DATA_SENSITIVITY`

@@ -352,16 +352,26 @@ def _redact_secrets(text: str, api_key: str | None) -> str:
     return _SECRET_TOKEN_RE.sub("***", text)
 
 
-def _failure_detail(exc: BaseException, *, limit: int = 200) -> str:
-    """A sanitized, bounded provider failure description for logs and errors.
+#: Everything outside printable ASCII. A provider body is untrusted input: it
+#: may echo the request, which here means a sentence of the lecture.
+_NON_ASCII_RUN = re.compile(r"[^\x20-\x7e]+")
 
-    The messages built by :func:`_error_from_payload` already carry the provider
-    label, HTTP status, structured error codes and request id, with secrets
-    redacted. Only that text is kept — never the request, the prompt or the
-    completion — so a log line can diagnose a real failure without exposing
-    user content.
+
+def _failure_detail(exc: BaseException, *, limit: int = 200) -> str:
+    """A sanitized, bounded provider failure description for logs.
+
+    The messages built by :func:`_error_from_payload` already carry HTTP status,
+    structured error codes and the provider request id, with secrets redacted.
+    Only that text is kept — never the request, the prompt or the completion.
+
+    Length limits alone do not prove a provider error body is free of user
+    content: a gateway can echo the sentence it rejected. The detail is therefore
+    reduced to printable ASCII, which keeps every diagnostic field (status,
+    ``type``/``code``, request id) and drops anything that could be lecture text.
     """
-    return _sanitize_error_text(str(exc), limit=limit) or type(exc).__name__
+    text = _sanitize_error_text(str(exc), limit=limit) or type(exc).__name__
+    text = _sanitize_error_text(_NON_ASCII_RUN.sub(" ", text), limit=limit)
+    return text or type(exc).__name__
 
 
 #: Correlation headers emitted by the gateways we support. AvalAI's exact

@@ -53,8 +53,13 @@ Useful lines:
   whole eligible chain failed; `categories` are exception classes.
 - `LLM route policy task=… sensitivity=… routes=…` — why each configured
   provider was eligible, blocked by policy or skipped.
-- `note acceptance rejected stage=… reason=unsupported_facts fabricated=<n>` —
-  the final booklet gate refused delivery; the transcript stays available.
+- `note acceptance rejected stage=… reason=unsupported_facts|unsupported_claims
+  fabricated=<n>` — the final booklet gate refused delivery; the transcript
+  stays available.
+- `note delivered incomplete reason=missing_numbers|missing_terms …` — the
+  booklet was accepted and delivered, but the job is reported `partial`.
+- `note data sensitivity=… declared=… chars=<n>` — the one label every request
+  of this booklet carries.
 - `note repair left unresolved after N attempt(s) …` — bounded repair reached
   its limit without removing every unsupported signal.
 - `STT provider … failing over provider=… category=… detail=…` — transcription
@@ -68,8 +73,10 @@ managed service, compare its environment overrides with the private `.env`.
 Review `STT_PROVIDERS` and its model settings separately for transcription.
 Logs never contain keys, prompts or transcript text. A job's live state moves
 through media, transcription, note generation, `validating_notes`,
-`compiling_notes` and delivery; a partial result is reported as `partial` with
-an `error_kind` (`notes_quality`, `notes`, `pdf`, …) on the submission.
+`compiling_notes` and delivery; the compile stage is only reported when the
+editorial pass really runs. A partial result is reported as `partial` with an
+`error_kind` (`notes_quality`, `notes_incomplete`, `notes`, `pdf`, …) on the
+submission.
 Environment changes need a restart.
 
 ## Backup and restore

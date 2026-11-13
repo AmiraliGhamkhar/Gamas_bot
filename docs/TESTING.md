@@ -44,11 +44,14 @@ python -m pytest tests/test_llm_quota.py tests/test_concurrency_and_failover.py 
 ```
 
 `tests/test_note_sensitivity_and_acceptance.py` covers sensitivity
-classification and propagation, route-policy and failure logging, the bounded
-repair loop, the final acceptance gate (including `warn` mode) and the new job
-stages; `RejectedBookletTests` in `tests/test_bot.py` drives a real submission
-through a rejected booklet and asserts the transcript, status, `error_kind` and
-the single charge.
+classification and propagation (including every compile path: single, grouped
+and second-level), case-narrative and named-person classification, route-policy
+and failure logging, provider-text redaction, the bounded repair loop, the final
+acceptance gate (fact, prose claim and `warn` mode), incomplete delivery and the
+new job stages; `tests/test_note_evidence.py` pins claim-level prose evidence;
+and `RejectedBookletTests` / `IncompleteBookletDeliveryTests` /
+`PresentationFailureMessageTests` in `tests/test_bot.py` drive real submissions
+through rejection, incomplete delivery and the presentation notice.
 
 Provider HTTP is mocked. The default test settings have **no LLM credential**;
 generation fixtures opt into scoped fake approved keys only when their I/O is

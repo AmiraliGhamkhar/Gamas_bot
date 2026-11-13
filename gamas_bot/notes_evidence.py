@@ -12,7 +12,9 @@ model, a network call or a new dependency:
 * :func:`validate_table` checks every proposed table cell against the source;
 * :func:`validate_tip` requires a verbatim source basis for every practical
   tip;
-* :func:`sentence_coverage` is a cheap sentence-level completeness proxy.
+* :func:`sentence_coverage` is a cheap sentence-level completeness proxy;
+* :func:`prose_claim_evidence` verifies individual prose claims against source
+  sentences and reports the unsupported ones with their best source span.
 
 Why sets and not counts
 -----------------------
@@ -860,6 +862,144 @@ def sentence_coverage(
 
 
 # ===========================================================================
+# Claim-level evidence
+# ===========================================================================
+
+#: A claim with fewer content words than this is a label, not an assertion.
+MIN_CLAIM_WORDS = 6
+#: A claim whose best source sentence shares less than this share of its content
+#: words has no evidence at all. Deliberately low: this is not a similarity
+#: score used to grade paraphrase, it is the floor below which nothing in the
+#: source supports the sentence. Numeric and term grounding stay strict and
+#: independent (`audit_notes`).
+MIN_CLAIM_SUPPORT = 0.2
+
+#: Sentences that talk about the document rather than about the subject. They
+#: carry no claim to verify, so they must never be reported as unsupported.
+_META_SENTENCE_MARKERS = (
+    "در ادامه",
+    "در این بخش",
+    "این بخش",
+    "به بررسی",
+    "بررسی می‌کنیم",
+    "بررسی میکنیم",
+    "خواهیم دید",
+    "مشاهده می‌کنیم",
+    "مشاهده میکنیم",
+    "در این درس",
+    "در این جلسه",
+    "خلاصهٔ",
+    "خلاصه ی",
+    "فهرست",
+    "این مطلب",
+    "همان‌طور که",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimEvidence:
+    """One prose claim with no supporting source sentence.
+
+    Only offsets and a ratio are kept: the report is logged, and a log line must
+    never quote the lecture or the booklet. ``span`` points at the sentence in
+    the source that came closest, so an operator can inspect it in Gamas Studio
+    or the stored transcript.
+    """
+
+    span: tuple[int, int]
+    shared_ratio: float
+
+
+def _claim_sentences(notes: object) -> Iterator[str]:
+    """The assertive prose of a booklet: section paragraphs and bullets only."""
+    payload = _payload_of(notes)
+    if not isinstance(payload, dict):
+        return
+    for section in payload.get("sections") or ():
+        if not isinstance(section, dict):
+            continue
+        for field_name in ("paragraphs", "bullets"):
+            for item in section.get(field_name) or ():
+                for sentence in split_sentences(str(item or "")):
+                    yield sentence
+
+
+def _is_meta_sentence(sentence: str) -> bool:
+    folded = normalize_for_compare(sentence)
+    return any(
+        marker and marker in folded
+        for marker in (normalize_for_compare(item) for item in _META_SENTENCE_MARKERS)
+    )
+
+
+def _source_sentence_spans(source: str) -> tuple[tuple[str, tuple[int, int]], ...]:
+    """Each source sentence with its character span, in document order."""
+    spans: list[tuple[str, tuple[int, int]]] = []
+    cursor = 0
+    for sentence in split_sentences(source):
+        position = source.find(sentence, cursor)
+        if position < 0:
+            continue
+        spans.append((sentence, (position, position + len(sentence))))
+        cursor = position + len(sentence)
+    return tuple(spans)
+
+
+def prose_claim_evidence(
+    source: str,
+    notes: object,
+    *,
+    minimum_ratio: float = MIN_CLAIM_SUPPORT,
+    source_index: SourceEvidenceIndex | None = None,
+) -> tuple[ClaimEvidence, ...]:
+    """Prose claims the source does not support, with their closest span.
+
+    This is the prose counterpart of :func:`audit_notes`: the signal audit can
+    only see numbers, dates, Latin terms and URLs, so an invented Persian-only
+    statement used to pass it untouched. Every assertive sentence is compared
+    with the source sentences and must share at least ``minimum_ratio`` of its
+    content words with one of them. The rule is lexical on purpose — it never
+    claims semantic entailment, it only refuses a sentence that has *no*
+    vocabulary in common with the lecture it is supposed to summarise.
+
+    Returns only unsupported claims; an empty tuple means every checked
+    sentence found source vocabulary.
+    """
+    if not source:
+        return ()
+    _ = source_index  # the span needs the raw text, not the folded index
+    claims = tuple(_claim_sentences(notes))
+    if not claims:
+        return ()
+    spans = _source_sentence_spans(source)
+    if not spans:
+        return ()
+    prepared = [
+        (content_words(sentence), span) for sentence, span in spans
+    ]
+    prepared = [(words, span) for words, span in prepared if words]
+    if not prepared:
+        return ()
+    unsupported: list[ClaimEvidence] = []
+    for claim in claims:
+        words = content_words(claim)
+        if len(words) < MIN_CLAIM_WORDS or _is_meta_sentence(claim):
+            continue
+        best_ratio = 0.0
+        best_span = (0, 0)
+        for source_words, span in prepared:
+            ratio = len(words & source_words) / len(words)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_span = span
+                if best_ratio >= minimum_ratio:
+                    break
+        if best_ratio < minimum_ratio:
+            unsupported.append(ClaimEvidence(span=best_span, shared_ratio=best_ratio))
+    return tuple(unsupported)
+
+
+# ===========================================================================
 # Tables
 # ===========================================================================
 
@@ -1055,10 +1195,13 @@ class NoteQualityReport:
     objectives_dropped: int = 0
     review_questions_dropped: int = 0
     dropped_cells: tuple[str, ...] = field(default_factory=tuple)
+    #: Prose claims with no supporting source sentence (see
+    #: :func:`prose_claim_evidence`). Offsets only, never the text.
+    unsupported_claims: tuple[ClaimEvidence, ...] = field(default_factory=tuple)
 
     @property
     def passes(self) -> bool:
-        return self.audit.grounded
+        return self.audit.grounded and not self.unsupported_claims
 
     def summary(self) -> str:
         return (
@@ -1068,4 +1211,5 @@ class NoteQualityReport:
             + f" tips={self.tips_accepted}/{self.tips_seen}"
             + f" objectives_dropped={self.objectives_dropped}"
             + f" review_questions_dropped={self.review_questions_dropped}"
+            + f" unsupported_claims={len(self.unsupported_claims)}"
         )

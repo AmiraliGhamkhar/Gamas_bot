@@ -1055,6 +1055,14 @@ class JobPipelineMixin:
 
         return stage
 
+    def _note_incomplete_callback(self, job: Job) -> Any:
+        """Record that an accepted booklet still omits source facts."""
+
+        async def incomplete(reason: str) -> None:
+            job.meta["note_incomplete"] = reason
+
+        return incomplete
+
     async def _generate_notes(
         self,
         document_text: str,
@@ -1080,6 +1088,7 @@ class JobPipelineMixin:
                 mode=self.settings.note_mode,
                 on_merged=None,
                 on_stage=self._note_stage_callback(job, progress),
+                on_incomplete=self._note_incomplete_callback(job),
             )
         except NoteQualityError as exc:
             job.meta["note_failure"] = "quality"
@@ -1129,6 +1138,7 @@ class JobPipelineMixin:
                 mode=self.settings.note_mode,
                 document=document,
                 on_stage=self._note_stage_callback(job, progress),
+                on_incomplete=self._note_incomplete_callback(job),
             )
         except NoteQualityError as exc:
             job.meta["note_failure"] = "quality"
@@ -1142,7 +1152,7 @@ class JobPipelineMixin:
             await self._reply(
                 job,
                 "ℹ️ جزوهٔ ارائه به‌دلیل نبود پشتوانهٔ کافی در متن، تأیید نشد؛ "
-                "متن خام و فایل سادهٔ Word ارسال می‌شود.",
+                "متن خام ارائه در دسترس است.",
             )
             return None
         except Exception as exc:
@@ -1152,7 +1162,7 @@ class JobPipelineMixin:
             )
             await self._reply(
                 job,
-                "ℹ️ تولید جزوهٔ ساختارمند انجام نشد؛ فایل سادهٔ Word و متن خام ارسال می‌شود.",
+                "ℹ️ تولید جزوهٔ ساختارمند انجام نشد؛ متن خام ارائه در دسترس است.",
             )
             return None
 
@@ -1203,6 +1213,14 @@ class JobPipelineMixin:
                 )
                 notice_kind = "notes"
         else:
+            # Accepted, but still missing source facts the bounded repair could
+            # not restore: deliver it and say so, instead of calling it verified.
+            if job.meta.get("note_incomplete"):
+                notice = (
+                    "\n\nنکته: بخشی از داده‌های عددی یا اصطلاحات متن درس در جزوه "
+                    "نیامده است؛ برای اطمینان، متن خام را هم بررسی کنید."
+                )
+                notice_kind = "notes_incomplete"
             duration_seconds = (
                 int(job.duration_hint)
                 if job.duration_hint is not None and job.duration_hint > 0

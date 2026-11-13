@@ -24,7 +24,7 @@ from gamas_bot.bot import (
     _parse_telegram_user_id,
 )
 from gamas_bot.db import Database
-from gamas_bot.notes import StructuredNotes
+from gamas_bot.notes import NoteQualityError, StructuredNotes
 from gamas_bot.jobs import Job
 from gamas_bot.media import MediaInfo, MediaToolError
 from gamas_bot.presentations import PreparedAudio, PresentationContent, SlideText
@@ -753,6 +753,94 @@ class RejectedBookletTests(BotPipelineTestCase):
         )
         self.assertEqual((int(debits[0][0]), int(debits[0][1])), (100, 1))
         self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
+
+
+class IncompleteBookletDeliveryTests(BotPipelineTestCase):
+    """An accepted booklet that lost source facts is delivered as partial."""
+
+    def settings_overrides(self) -> dict:
+        return {
+            "avalai_api_key": "note-key",
+            "note_strict_grounding": True,
+            "note_quality_gate": "repair",
+        }
+
+    async def test_missing_numbers_produce_a_partial_incomplete_result(self):
+        event = self.media_event()
+        answer = json.dumps(
+            {
+                "title": "دوز",
+                "summary": "خلاصه",
+                "sections": [
+                    {"heading": "دوز", "paragraphs": ["دوز دارو بررسی شد."]}
+                ],
+            },
+            ensure_ascii=False,
+        )
+        session = _SttAndLlmSession({"choices": [{"message": {"content": answer}}]})
+        self.bot._http_session = lambda: session  # type: ignore[method-assign]
+        raw = RawTranscript(
+            words=[
+                Word(text="امروز", start=0.0, end=0.5),
+                Word(text="دوز", start=0.6, end=0.9),
+                Word(text="۵۰۰", start=1.0, end=1.2),
+                Word(text="میلی‌گرم", start=1.3, end=1.7),
+                Word(text="بررسی", start=1.8, end=2.1),
+                Word(text="کردیم", start=2.2, end=2.5),
+                Word(text=".", start=2.5, end=2.5),
+            ],
+            text="امروز دوز ۵۰۰ میلی‌گرم بررسی کردیم.",
+            engine="speechmatics",
+        )
+        submission = await self.run_media_job(event, transcribe=raw)
+
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "partial")
+        kinds = await self.db.read_db.execute_fetchall(
+            "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
+        )
+        self.assertEqual(kinds[0][0], "notes_incomplete")
+        # The accepted booklet is still delivered; only the claim of a complete,
+        # verified booklet is withdrawn.
+        self.assertIsNotNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
+        self.assertTrue(
+            any("متن خام" in text for text in event.edits + event.replies),
+            "the user must be told the booklet is incomplete",
+        )
+
+
+class PresentationFailureMessageTests(BotPipelineTestCase):
+    """The failure notice must not promise a Word file nobody produces."""
+
+    def settings_overrides(self) -> dict:
+        return {"avalai_api_key": "note-key"}
+
+    async def test_rejection_promises_only_the_transcript(self):
+        event = self.media_event()
+        job = Job(
+            submission_id=1,
+            user_id=USER_ID,
+            kind="presentation",
+            filename="deck.pptx",
+            message=event.message,
+            meta={},
+        )
+        rejection = NoteQualityError(
+            "rejected", reason="unsupported_facts", fabricated=2
+        )
+        with mock.patch(
+            "gamas_bot.bot_jobs.structure_presentation",
+            new=mock.AsyncMock(side_effect=rejection),
+        ):
+            result = await self.bot._generate_presentation_notes(
+                "### اسلاید ۱", "متن ارائه", job, None
+            )
+        self.assertIsNone(result)
+        said = " ".join(event.replies + event.edits)
+        self.assertNotIn("Word", said)
+        self.assertIn("متن خام", said)
+        self.assertEqual(job.meta.get("note_failure"), "quality")
 
 
 class PresentationNotesDeliveryTests(BotPipelineTestCase):
@@ -1744,7 +1832,8 @@ class ProgressiveBookletTests(BotPipelineTestCase):
         captured: dict = {}
 
         async def fake_structure(
-            _text, _settings, _session, *, mode, on_merged=None, on_stage=None
+            _text, _settings, _session, *, mode, on_merged=None, on_stage=None,
+            on_incomplete=None,
         ):
             captured["on_merged"] = on_merged
             return StructuredNotes.from_payload(json.loads(sample_notes_json()))

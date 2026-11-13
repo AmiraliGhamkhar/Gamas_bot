@@ -85,6 +85,7 @@ from .notes_evidence import (
     coverage_thresholds,
     evidence_windows,
     extract_signals,
+    prose_claim_evidence,
     sentence_coverage,
     split_sentences,
     validate_table,
@@ -230,6 +231,47 @@ _PATIENT_IDENTIFIER_MARKERS = (
 _NORMALIZED_IDENTIFIER_MARKERS = tuple(
     normalize_for_compare(marker) for marker in _PATIENT_IDENTIFIER_MARKERS
 )
+#: A named person in the material. ``آقای رضایی`` or ``Ms. Ahmadi`` in a
+#: lecture is not a teaching example: it is somebody's record, and no provider
+#: may receive it without an explicit approval flag for sensitive data. Only an
+#: explicit honorific counts: ``بیمار با نارسایی کلیوی`` is ordinary teaching,
+#: and guessing names from bare Persian words would block half the curriculum.
+_PERSON_NAME_PATTERNS = (
+    # An honorific is always followed by the person it names.
+    re.compile(
+        r"(?:آقای|خانم|سرکار|جناب|دکتر)\s+[\u0600-\u06FF]{2,}(?:\s+[\u0600-\u06FF]{2,})?"
+    ),
+    re.compile(r"\b(?:Mr|Mrs|Ms|Miss|Dr|Prof)\.?\s+[A-Z][a-z]{2,}"),
+)
+#: Wording that marks a *case narrative* rather than general teaching: a
+#: complaint, an admission, an examination, a history. Such material may carry
+#: unmarked personal information, so ``auto`` classifies it as ``UNKNOWN``
+#: rather than asserting that it is safe to share. This is a conservative
+#: heuristic, not de-identification; see ``docs/PROVIDERS.md``.
+_CASE_NARRATIVE_MARKERS = (
+    "شرح حال",
+    "سابقهٔ بیماری",
+    "سابقه بیماری",
+    "سابقهٔ پزشکی",
+    "سابقه پزشکی",
+    "بستری شد",
+    "بستری بود",
+    "مراجعه کرد",
+    "مراجعه کرده",
+    "معاینه شد",
+    "معاینه کرد",
+    "تاریخ پذیرش",
+    "case report",
+    "case presentation",
+    "chief complaint",
+    "past medical history",
+    "was admitted",
+    "presented with",
+    "patient presented",
+)
+_NORMALIZED_CASE_MARKERS = tuple(
+    normalize_for_compare(marker) for marker in _CASE_NARRATIVE_MARKERS
+)
 _EMAIL_SIGNAL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 #: An 11-digit Iranian mobile number, or a 10-digit national id, in either digit
 #: shape (``normalize_digits`` folds them first). A dosage, a year or a quiz
@@ -250,16 +292,28 @@ def classify_note_sensitivity(text: str) -> str:
     """Classify lecture material for provider routing, failing closed.
 
     ``STANDARD_EDUCATIONAL`` is returned only when nothing looks
-    patient-identifiable: no e-mail address, no 10/11-digit identifier run and
-    none of the explicit identifier markers. Everything else — including empty
-    material — is ``UNKNOWN``, which the router treats as ineligible for the
-    community OpenRouter route. An unusual lecture therefore loses its last
-    fallback instead of leaking identifiable material to a third party.
+    patient-identifiable: no e-mail address, no 10/11-digit identifier run, none
+    of the explicit identifier markers and no case narrative. Everything else is
+    conservative:
+
+    * a named person (``بیمار آقای رضایی``, ``Ms. Ahmadi``) is ``SENSITIVE``, so
+      no route is eligible without its explicit sensitive-data approval;
+    * any other identifier or a case-narrative marker (``شرح حال``, ``بستری
+      شد``, ``case report``) is ``UNKNOWN``, which the router treats as
+      ineligible for the community OpenRouter route;
+    * empty material is ``UNKNOWN``.
+
+    This is an **identifier heuristic, not de-identification**: it cannot prove
+    that a narrative carries no personal information. Case material should be
+    declared explicitly (``NOTE_DATA_SENSITIVITY=sensitive|phi_or_pii``) after
+    review; ``auto`` only refuses to call it safe by default.
     """
     folded = normalize_digits(text or "")
     lowered = normalize_for_compare(folded)
     if not lowered.strip():
         return SENSITIVITY_UNKNOWN
+    if any(pattern.search(folded) for pattern in _PERSON_NAME_PATTERNS):
+        return "SENSITIVE"
     if any(marker and marker in lowered for marker in _NORMALIZED_IDENTIFIER_MARKERS):
         return SENSITIVITY_UNKNOWN
     if (
@@ -267,6 +321,8 @@ def classify_note_sensitivity(text: str) -> str:
         or _MOBILE_SIGNAL.search(folded)
         or _NATIONAL_ID_SIGNAL.search(folded)
     ):
+        return SENSITIVITY_UNKNOWN
+    if any(marker and marker in lowered for marker in _NORMALIZED_CASE_MARKERS):
         return SENSITIVITY_UNKNOWN
     return SENSITIVITY_STANDARD_EDUCATIONAL
 
@@ -2068,6 +2124,11 @@ def gate_notes(
         objectives_dropped=len(notes.learning_objectives) - len(objectives),
         review_questions_dropped=len(notes.review_questions) - len(review_questions),
         dropped_cells=tuple(dict.fromkeys(dropped_cells)),
+        # The signal audit only sees numbers, dates, Latin terms and URLs; this
+        # is what an invented Persian-only sentence has to pass as well.
+        unsupported_claims=prose_claim_evidence(
+            source, gated, source_index=source_index
+        ),
     )
     logger.info("note quality %s mode=%s", report.summary(), resolved_mode)
     return gated, report
@@ -2085,6 +2146,7 @@ def notes_need_repair(report: NoteQualityReport, *, mode: str = "full") -> bool:
     audit = report.audit
     return bool(
         audit.fabricated
+        or report.unsupported_claims
         or audit.number_coverage < number_floor
         or audit.term_coverage < term_floor
         or report.coverage.ratio < 0.75
@@ -2095,13 +2157,44 @@ def acceptance_failure(report: NoteQualityReport) -> str | None:
     """The hard acceptance rule for a finished booklet, or ``None``.
 
     Acceptance is about *faithfulness*, not recall: a booklet may be delivered
-    with a diagnosed omission (the audit reports it as missing) but never with a
-    number, unit or term the source does not contain. Recall floors and
-    sentence coverage stay repair signals, because a legitimate paraphrase is
-    not disproof and must not reject an otherwise grounded booklet.
+    with a diagnosed omission (see :func:`completeness_failure`, which turns it
+    into a partial result) but never with a claim the source does not support.
+
+    Two faithfulness failures reject a booklet:
+
+    * ``unsupported_facts`` — a number, date, unit or term absent from the
+      source (the strict signal audit);
+    * ``unsupported_claims`` — a prose sentence that shares no vocabulary with
+      any source sentence (see :func:`gamas_bot.notes_evidence.prose_claim_evidence`).
+
+    Recall floors and sentence coverage stay repair signals, because a
+    legitimate paraphrase is not disproof and must not reject an otherwise
+    grounded booklet.
     """
     if report.audit.fabricated:
         return "unsupported_facts"
+    if report.unsupported_claims:
+        return "unsupported_claims"
+    return None
+
+
+def completeness_failure(report: NoteQualityReport, *, mode: str = "full") -> str | None:
+    """Why an accepted booklet is incomplete, or ``None`` when it is not.
+
+    Faithfulness and completeness are different questions, so they produce
+    different outcomes: an unsupported claim rejects the booklet, while a
+    diagnosed omission that survived the bounded repair cannot be repaired any
+    further. It is delivered — the transcript is the user's source of truth —
+    but never as a *fully verified* booklet: the caller is told, the job ends
+    ``partial`` and the notice names the gap.
+    """
+    number_floor, term_floor = coverage_thresholds(resolve_note_mode(mode))
+    audit = report.audit
+    missing_numbers = [signal for signal in audit.missing if signal.kind == "number"]
+    if missing_numbers:
+        return "missing_numbers"
+    if audit.number_coverage < number_floor or audit.term_coverage < term_floor:
+        return "missing_terms"
     return None
 
 
@@ -3057,6 +3150,7 @@ async def _compile_pass(
             session, settings, context, merged,
             mode=mode, presentation=presentation, budget=budget,
             source_locators=source_locators,
+            data_sensitivity=data_sensitivity,
         )
         accepted = _gate_compiled(
             compiled, merged, merged_report, document, settings, mode=mode
@@ -3068,6 +3162,7 @@ async def _compile_pass(
         mode=mode, presentation=presentation, budget=budget,
         semaphore=semaphore,
         source_locators=source_locators,
+        data_sensitivity=data_sensitivity,
     )
     accepted = _gate_compiled(
         assembled if assembled is not merged else None,
@@ -3089,6 +3184,7 @@ async def _compile_pass(
             session, settings, context, accepted,
             mode=mode, presentation=presentation, budget=budget,
             source_locators=source_locators,
+            data_sensitivity=data_sensitivity,
         )
         merged_final = _gate_compiled(
             final, merged, merged_report, document, settings, mode=mode
@@ -3108,8 +3204,13 @@ MergedCallback = Callable[["StructuredNotes"], Awaitable[None]]
 #: callback is logged and never fails the booklet.
 StageCallback = Callable[[str], Awaitable[None]]
 
+#: Called with ``"missing_numbers"`` or ``"missing_terms"`` when a booklet is
+#: accepted but still omits source facts, so the job reports a partial result
+#: instead of claiming a complete, verified booklet.
+IncompleteCallback = Callable[[str], Awaitable[None]]
 
-async def structure_document(
+
+async def _structure_booklet(
     document: str,
     settings: Settings,
     session: aiohttp.ClientSession,
@@ -3309,7 +3410,10 @@ async def structure_document(
         except Exception:  # noqa: BLE001 - delivery is never a note failure
             logger.warning("progressive booklet delivery failed", exc_info=True)
 
-    await notify("compiling")
+    if compile_will_run(
+        merged, settings, mode=resolved_mode, presentation=presentation
+    ):
+        await notify("compiling")
     compiled = await _compile_pass(
         merged, merged_report, document, context, settings, session,
         mode=resolved_mode, presentation=presentation, semaphore=semaphore,
@@ -3332,6 +3436,48 @@ async def structure_document(
     return enforce_final_acceptance(
         compiled, final_report, mode=resolved_mode, stage="post_compile"
     )
+
+
+async def structure_document(
+    document: str,
+    settings: Settings,
+    session: aiohttp.ClientSession,
+    *,
+    mode: str = "full",
+    presentation: bool = False,
+    on_merged: MergedCallback | None = None,
+    source_locators: bool = False,
+    on_stage: StageCallback | None = None,
+    on_incomplete: IncompleteCallback | None = None,
+) -> StructuredNotes:
+    """Produce a booklet, then report whether it is complete.
+
+    The pipeline itself is :func:`_structure_booklet`: it maps, repairs and
+    compiles, and it rejects a booklet that asserts unsupported facts. This
+    wrapper adds the second, separate outcome: an *accepted* booklet may still
+    omit source facts that the bounded repair could not restore. That is not a
+    faithfulness failure, so it is delivered — and ``on_incomplete`` is called
+    with the reason so the job can say "incomplete" instead of "verified".
+    """
+    notes = await _structure_booklet(
+        document, settings, session,
+        mode=mode, presentation=presentation, on_merged=on_merged,
+        source_locators=source_locators, on_stage=on_stage,
+    )
+    if on_incomplete is None or not settings.note_strict_grounding:
+        return notes
+    _, report = gate_notes(notes, document.strip(), strict=False, mode=mode)
+    reason = completeness_failure(report, mode=mode)
+    if reason is None:
+        return notes
+    logger.warning(
+        "note delivered incomplete reason=%s %s", reason, report.summary()
+    )
+    try:
+        await on_incomplete(reason)
+    except Exception:  # noqa: BLE001 - reporting is never a note failure
+        logger.warning("note incomplete callback failed reason=%s", reason, exc_info=True)
+    return notes
 
 
 _SLIDE_NUMBER_CHARS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
@@ -3533,11 +3679,12 @@ async def structure_transcript(
     mode: str = "full",
     on_merged: MergedCallback | None = None,
     on_stage: StageCallback | None = None,
+    on_incomplete: IncompleteCallback | None = None,
 ) -> StructuredNotes:
     """Transcript text (the cleaned LLM document) → structured notes."""
     return await structure_document(
         text, settings, session, mode=mode, presentation=False,
-        on_merged=on_merged, on_stage=on_stage,
+        on_merged=on_merged, on_stage=on_stage, on_incomplete=on_incomplete,
     )
 
 
@@ -3551,6 +3698,7 @@ async def structure_presentation(
     document: str | None = None,
     on_merged: MergedCallback | None = None,
     on_stage: StageCallback | None = None,
+    on_incomplete: IncompleteCallback | None = None,
 ) -> StructuredNotes:
     """Slide outline + narration transcript → structured notes."""
     resolved_document = (
@@ -3566,4 +3714,5 @@ async def structure_presentation(
         presentation=True,
         on_merged=on_merged,
         on_stage=on_stage,
+        on_incomplete=on_incomplete,
     )

@@ -15,12 +15,16 @@ from gamas_bot import llm
 from gamas_bot.bot_jobs import JobPipelineMixin
 from gamas_bot.config import from_env
 from gamas_bot.jobs import Job
+from gamas_bot import notes as notes_mod
 from gamas_bot.notes import (
     MAX_NOTE_REPAIR_ATTEMPTS,
     SENSITIVITY_STANDARD_EDUCATIONAL,
     SENSITIVITY_UNKNOWN,
     NoteQualityError,
     StructuringError,
+    LectureContext,
+    NoteSection,
+    StructuredNotes,
     classify_note_sensitivity,
     resolve_note_sensitivity,
     structure_document,
@@ -54,6 +58,8 @@ class SensitivityClassifierTests(unittest.TestCase):
             "کد ملی ۰۰۱۲۳۴۵۶۷۸ را وارد کنید.",
             "تماس با بیمار: 09121234567",
             "ایمیل بیمار ali@example.com است.",
+            "بیمار ۵۴ ساله با شرح حال درد قفسه سینه بستری شد.",
+            "The case report describes a patient presented with chest pain.",
             "Patient ID 1234567890 was recorded.",
             "",
         ):
@@ -64,6 +70,17 @@ class SensitivityClassifierTests(unittest.TestCase):
         # Arabic YEH and KAF in the same wording must fold to the Persian marker.
         arabic = "شماره پروندهٔ بيمار ۴۵۶ ثبت شد."
         self.assertEqual(classify_note_sensitivity(arabic), SENSITIVITY_UNKNOWN)
+
+    def test_a_named_person_requires_an_explicit_sensitive_approval(self):
+        # A name is not an identifier the model should route at all: SENSITIVE
+        # means no provider is eligible until its own approval flag is set.
+        for material in (
+            "بیمار آقای رضایی با درد قفسه سینه مراجعه کرد.",
+            "خانم احمدی سابقهٔ دیابت دارد.",
+            "Ms. Ahmadi presented with chest pain.",
+        ):
+            with self.subTest(material=material):
+                self.assertEqual(classify_note_sensitivity(material), "SENSITIVE")
 
     def test_declared_policy_overrides_the_classifier(self):
         document = "شمارهٔ پرونده ۴۵۶ ثبت شد."
@@ -384,6 +401,186 @@ class ProviderDiagnosticsTests(unittest.IsolatedAsyncioTestCase):
                 )
         attempted = [self.HOSTS[urlsplit(call["url"]).hostname] for call in session.calls]
         self.assertEqual(attempted, ["avalai", "gemini", "openrouter"])
+
+
+class CompileSensitivityTests(unittest.IsolatedAsyncioTestCase):
+    """The editorial pass is the fourth caller, and it used to lose the label.
+
+    ``_compile_pass`` took ``data_sensitivity`` but did not forward it, so with
+    ``NOTE_COMPILE=true`` a STANDARD_EDUCATIONAL booklet lost OpenRouter for the
+    compile only — a silent difference between the draft and the final booklet.
+    """
+
+    @staticmethod
+    def merged() -> StructuredNotes:
+        body = "نفرون واحد عملکردی کلیه است و آب و نمک خون را تنظیم می‌کند. " * 30
+        return StructuredNotes(
+            title="کلیه", sections=(NoteSection(heading="فیزیولوژی", paragraphs=(body,)),)
+        )
+
+    @staticmethod
+    async def _capture(captured: list, *, return_value=None):
+        async def fake_once(
+            _session, _settings, _context, _notes, *, mode, presentation, budget,
+            source_locators=False, data_sensitivity=None,
+        ):
+            captured.append(data_sensitivity)
+            return return_value
+
+        return fake_once
+
+    async def test_single_request_compile_carries_the_label(self):
+        captured: list = []
+        settings = make_settings(note_compile=True)
+        with mock.patch.object(
+            notes_mod, "_compile_once", await self._capture(captured)
+        ):
+            await notes_mod._compile_pass(
+                self.merged(), None, "متن", LectureContext(), settings, object(),
+                mode="full", presentation=False,
+                data_sensitivity=SENSITIVITY_STANDARD_EDUCATIONAL,
+            )
+        self.assertEqual(captured, [SENSITIVITY_STANDARD_EDUCATIONAL])
+
+    async def test_grouped_and_second_level_compiles_carry_the_label(self):
+        captured: list = []
+        small = StructuredNotes(
+            title="کلیه",
+            sections=(NoteSection(heading="فیزیولوژی", paragraphs=("نفرون کلیه",)),),
+        )
+
+        async def fake_groups(*_args, **kwargs):
+            captured.append(kwargs.get("data_sensitivity"))
+            return small
+
+        settings = make_settings(note_compile=True, note_strict_grounding=False)
+        with (
+            mock.patch.object(
+                notes_mod, "effective_compile_max_chars", return_value=200
+            ),
+            mock.patch.object(notes_mod, "_compile_in_groups", fake_groups),
+            mock.patch.object(
+                notes_mod, "_compile_once", await self._capture(captured)
+            ),
+        ):
+            await notes_mod._compile_pass(
+                self.merged(), None, "متن", LectureContext(), settings, object(),
+                mode="full", presentation=False,
+                data_sensitivity="PHI_OR_PII",
+            )
+        self.assertEqual(captured, ["PHI_OR_PII", "PHI_OR_PII"])
+
+
+class ProseClaimGateTests(unittest.IsolatedAsyncioTestCase):
+    SOURCE = (
+        "در این جلسه دربارهٔ فیزیولوژی کلیه صحبت کردیم. "
+        "نفرون واحد عملکردی کلیه است و آب و نمک خون را تنظیم می‌کند."
+    )
+
+    async def test_an_invented_persian_claim_rejects_the_booklet(self):
+        payload = {
+            "title": "کلیه",
+            "sections": [
+                {
+                    "heading": "فیزیولوژی",
+                    "paragraphs": [
+                        "نفرون واحد عملکردی کلیه است و آب خون را تنظیم می‌کند.",
+                        "کلیه‌ها با ترشح هورمون اریتروپویتین تولید گلبول قرمز را "
+                        "افزایش می‌دهند.",
+                    ],
+                }
+            ],
+        }
+
+        async def fake_complete_json(_session, _settings, **_kwargs):
+            return payload
+
+        settings = make_settings(
+            note_strict_grounding=True, note_quality_gate="repair", note_compile=False
+        )
+        with mock.patch("gamas_bot.notes.complete_json", new=fake_complete_json):
+            with self.assertRaises(NoteQualityError) as ctx:
+                await structure_document(self.SOURCE, settings, object())
+        self.assertEqual(ctx.exception.reason, "unsupported_claims")
+
+
+class IncompleteBookletTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_lost_number_makes_the_result_partial_not_verified(self):
+        source = "دوز ۵۰۰ میلی‌گرم است و نسبت ۸.۵ درصد گزارش شد."
+        payload = {
+            "title": "دوز",
+            "sections": [{"heading": "دوز", "paragraphs": ["دوز دارو بررسی شد."]}],
+        }
+
+        async def fake_complete_json(_session, _settings, **_kwargs):
+            return payload
+
+        reasons: list[str] = []
+
+        async def on_incomplete(reason: str) -> None:
+            reasons.append(reason)
+
+        settings = make_settings(
+            note_strict_grounding=True, note_quality_gate="repair", note_compile=False
+        )
+        with mock.patch("gamas_bot.notes.complete_json", new=fake_complete_json):
+            notes = await structure_document(
+                source, settings, object(), on_incomplete=on_incomplete
+            )
+        self.assertTrue(notes.has_content)
+        self.assertEqual(reasons, ["missing_numbers"])
+
+
+class CompileStageNotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_disabled_compile_is_not_reported_as_a_running_stage(self):
+        stages: list[str] = []
+
+        async def on_stage(name: str) -> None:
+            stages.append(name)
+
+        async def fake_complete_json(_session, _settings, **_kwargs):
+            return note_payload(CLEAN_LECTURE)
+
+        # Two chunks so the code actually reaches the compile decision.
+        settings = make_settings(
+            note_strict_grounding=False,
+            note_compile=False,
+            note_chunk_chars=300,
+        )
+        source = (CLEAN_LECTURE + " ") * 12
+        with mock.patch("gamas_bot.notes.complete_json", new=fake_complete_json):
+            await structure_document(source, settings, object(), on_stage=on_stage)
+        self.assertNotIn("compiling", stages)
+
+
+class ProviderEchoRedactionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_provider_body_that_echoes_the_lecture_is_not_logged(self):
+        rejection = _Response(
+            400, {"error": {"message": "invalid request: نفرون واحد عملکردی کلیه"}}
+        )
+        answer = _Response(
+            200,
+            {
+                "candidates": [
+                    {"content": {"parts": [{"text": "ok"}]}, "finishReason": "STOP"}
+                ]
+            },
+        )
+        settings = make_settings(
+            note_providers=("avalai", "gemini"),
+            avalai_api_key="av-test",
+            gemini_api_key="g-test",
+        )
+        session = _Session([rejection, answer])
+        with self.assertLogs("gamas_bot.llm", level="INFO") as logs:
+            result = await llm.complete(
+                session, settings, system="S", user="نفرون واحد عملکردی کلیه",
+                task="BOOKLET_GENERATION", data_sensitivity=SENSITIVITY_UNKNOWN,
+            )
+        self.assertEqual(result, "ok")
+        captured = "\n".join(logs.output)
+        self.assertIn("HTTP 400", captured)
+        self.assertNotRegex(captured, r"[\u0600-\u06FF]")
 
 
 if __name__ == "__main__":

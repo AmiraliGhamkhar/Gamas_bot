@@ -95,8 +95,45 @@ Both `complete()` and `complete_json()` accept explicit `data_sensitivity`.
   individual approval flag. All three flags default to false; AvalAI is not
   presumed approved for patient or personal data.
 
+With `NOTE_DATA_SENSITIVITY=auto` the classifier is an **identifier heuristic,
+not de-identification**. It recognises e-mail addresses, Iranian mobile and
+national-id numbers, explicit record markers (`شمارهٔ پرونده`, `patient id`,
+`date of birth`, …), case-narrative wording (`شرح حال`, `بستری شد`,
+`case report`, `presented with`, …) and a named person after an honorific
+(`آقای رضایی`, `Dr. Ahmadi`):
+
+| Match | Label | Effect |
+| --- | --- | --- |
+| named person | `SENSITIVE` | no route without that provider's approval flag |
+| record marker, id number, e-mail, case narrative | `UNKNOWN` | OpenRouter ineligible; AvalAI/Gemini keep their own flags |
+| nothing of the above | `STANDARD_EDUCATIONAL` | approved routes, task order unchanged |
+
+It cannot prove that a narrative carries no personal information, so case
+material must be declared explicitly after review. A lecture that discusses a
+patient in general terms (`بیمار با نارسایی کلیوی …`) is not a case narrative
+and stays `STANDARD_EDUCATIONAL`; a bare surname after `بیمار` is not detected
+without an honorific.
+
 Task selection is not automatic de-identification/classification. Never use
 real patient data in fixtures or smoke tests. See [Security](SECURITY.md).
+
+### Booklet acceptance
+
+A booklet is delivered only when it is **faithful**; it is announced as
+*complete* only when it is also **complete**:
+
+| Outcome | Rule | Result |
+| --- | --- | --- |
+| Rejected — `unsupported_facts` | a number, date, unit or Latin term the source does not contain survives the bounded repair and the numeric scrub | transcript kept, `partial`, `error_kind=notes_quality` |
+| Rejected — `unsupported_claims` | a section sentence shares less than 20 % of its content words with any source sentence (claim-level prose evidence; see below) | transcript kept, `partial`, `error_kind=notes_quality` |
+| Delivered, incomplete | an accepted booklet still omits source numbers or technical terms after two repair attempts | booklet delivered, `partial`, `error_kind=notes_incomplete`, notice names the gap |
+| Delivered, complete | no fabricated signal, no unsupported claim, and no omitted number/term above the mode's floors | `done` |
+
+The prose check is deliberately lexical: it refuses a sentence with *no*
+vocabulary in common with the lecture, and never claims semantic entailment.
+Paraphrase, reordering and standard equivalents pass; an invented Persian-only
+statement does not. Offsets of the closest source sentence are kept on the
+report (`ClaimEvidence.span`) and only counts are logged — never the text.
 
 The booklet pipeline classifies its source once (`NOTE_DATA_SENSITIVITY`,
 `auto` by default) and reuses that one label for generation, repair, coverage
@@ -120,6 +157,9 @@ one `every configured note provider failed task=… categories=… detail=…` l
 lists the whole chain. The message shown to the user names only the classes
 (`AvalAI: LLMAuthError؛ Gemini: LLMResponseError`), because a provider may echo
 credential-like text in its error body; the sanitized details stay in the log.
+A log detail is reduced to printable ASCII, so HTTP status, error code and
+request id survive while any echoed lecture text (or credential-shaped string)
+cannot reach `bot.log`.
 Truncated (`finish_reason=length`), empty and malformed answers raise
 `LLMResponseError` and fall through to the next eligible route instead of
 producing a partial booklet.
