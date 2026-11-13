@@ -679,6 +679,31 @@ class FailoverTests(unittest.IsolatedAsyncioTestCase):
         # the auth failure put speechmatics on cooldown
         self.assertGreater(stt._cooldown_remaining("speechmatics"), 0)
 
+    async def test_failure_log_names_provider_and_category(self):
+        settings = make_settings(stt_providers=("speechmatics", "deepgram"))
+
+        async def denied(_session, _path, _settings):
+            raise STTAuthenticationError("account access denied (HTTP 403)")
+
+        async def working_run(_session, _path, _settings):
+            return stt.RawTranscript.from_text("از دیپ‌گرم", engine="deepgram")
+
+        with mock.patch.dict(
+            stt.PROVIDERS,
+            {
+                "speechmatics": self.provider_with_run("speechmatics", denied),
+                "deepgram": self.provider_with_run("deepgram", working_run),
+            },
+        ), self.assertLogs("gamas_bot.stt", level="WARNING") as logs:
+            raw = await transcribe(audio_file(), settings, session=object())
+        self.assertEqual(raw.engine, "deepgram")
+        line = next(
+            entry for entry in logs.output
+            if "failing over" in entry and "speechmatics" in entry
+        )
+        self.assertIn("provider=speechmatics", line)
+        self.assertIn("category=authorization", line)
+
     async def test_unusable_provider_response_fails_over(self):
         settings = make_settings(stt_providers=("speechmatics", "deepgram"))
         calls = []
@@ -1137,6 +1162,25 @@ class ErrorMappingTests(unittest.IsolatedAsyncioTestCase):
         response = FakeResponse(503, {})
         error = await stt._error_from_response("Test", response)
         self.assertIsInstance(error, STTTransientError)
+
+    async def test_speechmatics_account_access_403_is_not_a_bad_key(self):
+        # A 403 that names account access is a subscription/permission problem;
+        # it must not read as "the credential was rejected", which sends the
+        # operator looking for the wrong fix.
+        response = FakeResponse(
+            403, {"error": {"message": "Your account is not authorized for this feature"}}
+        )
+        error = await stt._error_from_response("Speechmatics", response)
+        self.assertIsInstance(error, STTAuthenticationError)
+        self.assertIn("دسترسی حساب", str(error))
+        self.assertNotIn("اعتبارنامه", str(error))
+
+    async def test_a_plain_403_still_reads_as_a_rejected_credential(self):
+        response = FakeResponse(403, {"error": {"message": "invalid token"}})
+        error = await stt._error_from_response("Test", response)
+        self.assertIsInstance(error, STTAuthenticationError)
+        self.assertIn("HTTP 403", str(error))
+        self.assertIn("اعتبارنامه", str(error))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,33 @@ Short, operator-relevant history. Detailed patches remain in Git history.
 
 ## Unreleased
 
+**Booklet acceptance, sensitivity propagation and diagnostics.** Booklet
+generation, repair, coverage fill and compilation now share one data-sensitivity
+label, resolved once per submission by the new `NOTE_DATA_SENSITIVITY`
+(`auto` classifies the source and fails closed to `UNKNOWN`; an explicit
+`standard_educational`/`internal`/`sensitive`/`phi_or_pii` declaration overrides
+it). OpenRouter stays ineligible for `UNKNOWN` material at every stage, and each
+request logs a `LLM route policy` line naming eligible and blocked routes.
+
+Repair is now a bounded loop (`MAX_NOTE_REPAIR_ATTEMPTS = 2`) that re-audits the
+whole booklet after each attempt, stops early when an attempt is not accepted,
+scrubs unsupported numbers and logs fixed/unresolved signals. A new final gate
+(`enforce_final_acceptance`) rejects a booklet that still asserts an unsupported
+number or term: the job keeps the transcript, ends `partial` with
+`error_kind=notes_quality`, and tells the user the booklet was not verified, not
+that it was made. `NOTE_QUALITY_GATE=warn` observes without rejecting.
+
+Evidence matching gained canonical date signals, so `۱۴۰۲/۵/۱۲` and
+`1402-05-12` are one fact while a different day is still fabricated; Persian
+digits, Arabic letter variants, half-spaces and the approved equivalent term
+list continue to be normalized, and a nearby number never grounds a different
+one. Provider failures now log the HTTP status and a sanitized provider message
+(`detail=`) while user-facing errors keep class names only, and Speechmatics
+403s distinguish account access from a rejected key. Job states add
+`validating_notes` and `compiling_notes` (runtime states over the existing TEXT
+column; no migration). `NOTE_STRICT_GROUNDING` and the output/context budgets
+were not changed.
+
 **Provider/validator remediation.** Text generation now exposes only Gemini,
 AvalAI and OpenRouter; removed settings, profiles, dialects and probes cannot
 activate legacy routes. Stale credentials/slots from either the environment or

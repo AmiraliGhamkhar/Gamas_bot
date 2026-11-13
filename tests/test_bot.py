@@ -695,6 +695,66 @@ class NoteGenerationDeliveryTests(BotPipelineTestCase):
         self.assertEqual((int(rows[0][0]), int(rows[0][1])), (100, 1))
 
 
+class RejectedBookletTests(BotPipelineTestCase):
+    """A booklet that fails the evidence gate is never reported as delivered."""
+
+    def settings_overrides(self) -> dict:
+        return {
+            "avalai_api_key": "note-key",
+            "note_strict_grounding": True,
+            "note_quality_gate": "repair",
+        }
+
+    async def test_rejected_booklet_keeps_transcript_and_settles_once(self):
+        event = self.media_event()
+        # The source is two words; everything else in this answer is invention.
+        answer = json.dumps(
+            {
+                "title": "درس شبکه",
+                "summary": "خلاصه",
+                "sections": [
+                    {
+                        "heading": "امروز",
+                        "paragraphs": [
+                            "امروز درس شبکه با پروتکل TCP و مدل OSI برگزار شد."
+                        ],
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        session = _SttAndLlmSession(
+            {"choices": [{"message": {"content": answer}}]}
+        )
+        self.bot._http_session = lambda: session  # type: ignore[method-assign]
+        submission = await self.run_media_job(event, transcribe=self._raw())
+
+        row = await self.db.submission(submission)
+        assert row is not None
+        self.assertEqual(row.status, "partial")
+        kinds = await self.db.read_db.execute_fetchall(
+            "SELECT error_kind FROM submissions WHERE submission_id=?", (submission,)
+        )
+        self.assertEqual(kinds[0][0], "notes_quality")
+        # No unusable booklet is stored, and the transcript it came from stays
+        # fetchable exactly as recognised.
+        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "booklet"))
+        self.assertIsNone(await self.db.binary_artifact(submission, USER_ID, "docx"))
+        self.assertIn("سلام دوستان", await self.fetch_transcript(submission))
+        self.assertTrue(
+            any("تأیید نشد" in text for text in event.edits + event.replies),
+            "the user must be told the booklet was rejected, not that it was made",
+        )
+        # One charge for the work that was actually done, never a duplicate.
+        debits = await self.db.db.execute_fetchall(
+            "SELECT COALESCE(SUM(seconds), 0), COUNT(*) FROM ledger "
+            "WHERE user_id = ? AND kind = 'debit'",
+            (USER_ID,),
+        )
+        self.assertEqual((int(debits[0][0]), int(debits[0][1])), (100, 1))
+        self.assertEqual(await self.db.available_seconds(USER_ID), 3600 - 100)
+
+
 class PresentationNotesDeliveryTests(BotPipelineTestCase):
     async def test_slide_only_deck_delivers_transcript_without_note_provider(self):
         source = Path(self._tmp.name) / "slides.pptx"
@@ -1683,7 +1743,9 @@ class ProgressiveBookletTests(BotPipelineTestCase):
     async def test_the_callback_is_never_installed_even_for_legacy_setting(self):
         captured: dict = {}
 
-        async def fake_structure(_text, _settings, _session, *, mode, on_merged=None):
+        async def fake_structure(
+            _text, _settings, _session, *, mode, on_merged=None, on_stage=None
+        ):
             captured["on_merged"] = on_merged
             return StructuredNotes.from_payload(json.loads(sample_notes_json()))
 

@@ -5,7 +5,14 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from gamas_bot.jobs import Job, JobQueue, QueueFullError
+from gamas_bot.jobs import (
+    ACTIVE_STAGE_STATES,
+    JOB_STATE_LABELS_FA,
+    JOB_STATES,
+    Job,
+    JobQueue,
+    QueueFullError,
+)
 
 
 def make_job(submission_id: int, user_id: int = 1) -> Job:
@@ -232,3 +239,20 @@ async def _drain(queue: JobQueue, idle_checks: int = 8, delay: float = 0.02) -> 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NoteStageStateTests(unittest.TestCase):
+    """The note pipeline's own stages are first-class, recoverable job states."""
+
+    def test_validation_and_compilation_states_exist_and_are_active(self):
+        for state in ("validating_notes", "compiling_notes"):
+            self.assertIn(state, JOB_STATES)
+            self.assertIn(state, ACTIVE_STAGE_STATES)
+            self.assertTrue(JOB_STATE_LABELS_FA[state])
+
+    def test_a_job_can_be_recovered_in_those_states(self):
+        job = make_job(9)
+        job.transition_to("generating_notes")
+        job.transition_to("validating_notes")
+        job.transition_to("compiling_notes")
+        self.assertEqual(job.state, "compiling_notes")

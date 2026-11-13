@@ -58,6 +58,11 @@ AvalAI, while smaller learning and Office tasks prefer Gemini. OpenRouter is
 always the last fallback, never promoted by preferences, and is excluded for
 unclassified (`UNKNOWN`) content. Missing credentials skip a route; stale
 removed-provider settings are ignored safely without logging their values.
+Each booklet's source is classified once (`NOTE_DATA_SENSITIVITY`, `auto` by
+default and failing closed to `UNKNOWN`) and that label is reused for repair and
+compilation. A booklet that still contains numbers or terms the transcript never
+said is rejected by a deterministic final gate: the user keeps the transcript
+and the submission is reported as `partial`, never as a delivered booklet.
 
 Operating defaults remain 131,072 context tokens, 64,000 characters per chunk
 and 16,384 output tokens, with `NOTE_COMPILE=false` and no hedged requests.

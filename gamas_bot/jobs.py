@@ -5,8 +5,10 @@ stage telemetry:
 
 * every job receives a unique ``job_id`` and isolated per-job state/timing;
 * explicit lifecycle states: ``queued``, ``downloading``, ``extracting``,
-  ``transcribing``, ``generating_notes``, ``uploading``, ``completed``,
-  ``failed``, ``cancelled``;
+  ``transcribing``, ``generating_notes``, ``validating_notes``,
+  ``compiling_notes``, ``uploading``, ``completed``, ``failed``, ``cancelled``;
+  the two note states are reported by the note pipeline itself, so a validated
+  booklet is distinguishable from a generated one;
 * bounded pending capacity — a full queue is rejected with an explicit
   back-pressure message instead of growing an unbounded in-memory backlog;
 * a second semaphore bound on *active* jobs, so a job started outside the
@@ -39,6 +41,8 @@ JOB_STATES = (
     "extracting",
     "transcribing",
     "generating_notes",
+    "validating_notes",
+    "compiling_notes",
     "uploading",
     "completed",
     "failed",
@@ -48,7 +52,16 @@ JOB_STATES = (
 TERMINAL_JOB_STATES = frozenset({"completed", "failed", "cancelled"})
 
 ACTIVE_STAGE_STATES = frozenset(
-    {"queued", "downloading", "extracting", "transcribing", "generating_notes", "uploading"}
+    {
+        "queued",
+        "downloading",
+        "extracting",
+        "transcribing",
+        "generating_notes",
+        "validating_notes",
+        "compiling_notes",
+        "uploading",
+    }
 )
 
 JOB_STATE_LABELS_FA: dict[str, str] = {
@@ -57,6 +70,8 @@ JOB_STATE_LABELS_FA: dict[str, str] = {
     "extracting": "استخراج و بهینه‌سازی صدا",
     "transcribing": "تبدیل گفتار به متن",
     "generating_notes": "نگارش هوشمند جزوه",
+    "validating_notes": "اعتبارسنجی جزوه با متن درس",
+    "compiling_notes": "ویرایش نهایی جزوه",
     "uploading": "ساخت فایل نهایی و ارسال",
     "completed": "تکمیل شد",
     "failed": "ناموفق",

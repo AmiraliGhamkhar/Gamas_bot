@@ -352,6 +352,18 @@ def _redact_secrets(text: str, api_key: str | None) -> str:
     return _SECRET_TOKEN_RE.sub("***", text)
 
 
+def _failure_detail(exc: BaseException, *, limit: int = 200) -> str:
+    """A sanitized, bounded provider failure description for logs and errors.
+
+    The messages built by :func:`_error_from_payload` already carry the provider
+    label, HTTP status, structured error codes and request id, with secrets
+    redacted. Only that text is kept — never the request, the prompt or the
+    completion — so a log line can diagnose a real failure without exposing
+    user content.
+    """
+    return _sanitize_error_text(str(exc), limit=limit) or type(exc).__name__
+
+
 #: Correlation headers emitted by the gateways we support. AvalAI's exact
 #: ``avalai-request-id`` is needed when an operator reconciles one completion's
 #: cost in its User API; ``x-request-id`` remains the portable fallback used by
@@ -2285,8 +2297,9 @@ async def _dispatch_across_routes(
                 failures.append(early.exc)
                 descriptions.append(f"{routes[0].label}: {type(early.exc).__name__}")
                 logger.warning(
-                    "note provider failed; trying the next one provider=%s error=%s",
-                    routes[0].slug, type(early.exc).__name__,
+                    "note provider failed; trying the next one provider=%s error=%s "
+                    "detail=%s",
+                    routes[0].slug, type(early.exc).__name__, _failure_detail(early.exc),
                 )
                 indexed_routes = indexed_routes[1:]
             except _HedgedFailures as both:
@@ -2294,8 +2307,9 @@ async def _dispatch_across_routes(
                     failures.append(exc)
                     descriptions.append(f"{route.label}: {type(exc).__name__}")
                     logger.warning(
-                        "note provider failed; trying the next one provider=%s error=%s",
-                        route.slug, type(exc).__name__,
+                        "note provider failed; trying the next one provider=%s error=%s "
+                        "detail=%s",
+                        route.slug, type(exc).__name__, _failure_detail(exc),
                     )
                 indexed_routes = indexed_routes[2:]
 
@@ -2420,8 +2434,9 @@ async def _dispatch_across_routes(
             failures.append(exc)
             descriptions.append(f"{route.label}: {type(exc).__name__}")
             logger.warning(
-                "note provider failed; trying the next one provider=%s error=%s",
-                route.slug, type(exc).__name__,
+                "note provider failed; trying the next one provider=%s error=%s "
+                "detail=%s",
+                route.slug, type(exc).__name__, _failure_detail(exc),
             )
             continue
         if failures:
@@ -2432,7 +2447,13 @@ async def _dispatch_across_routes(
         return result
 
     if len(descriptions) > 1:
-        logger.error("every configured note provider failed: %s", " | ".join(descriptions))
+        logger.error(
+            "every configured note provider failed task=%s categories=%s: %s | detail=%s",
+            (task or "UNSPECIFIED").strip().upper(),
+            ",".join(type(failure).__name__ for failure in failures),
+            " | ".join(descriptions),
+            " | ".join(_failure_detail(failure) for failure in failures),
+        )
     raise type(failures[0])("؛ ".join(descriptions))
 
 
@@ -2447,9 +2468,11 @@ async def complete(
 ) -> str:
     """Text completion through the same allowlist, task policy and quota ledger."""
     configured_routes = note_routes(settings)
-    routes = _task_ordered_routes(
-        _sensitivity_eligible_routes(configured_routes, settings, data_sensitivity), task
+    eligible_routes = _sensitivity_eligible_routes(
+        configured_routes, settings, data_sensitivity
     )
+    _log_route_policy(configured_routes, eligible_routes, data_sensitivity, task)
+    routes = _task_ordered_routes(eligible_routes, task)
     if not routes:
         if configured_routes and (data_sensitivity or "UNKNOWN").strip().upper() in {
             "INTERNAL", "SENSITIVE", "PHI_OR_PII",
@@ -2703,6 +2726,37 @@ def _task_ordered_routes(routes: tuple[NoteRoute, ...], task: str) -> tuple[Note
     )
 
 
+def _log_route_policy(
+    configured: tuple[NoteRoute, ...],
+    eligible: tuple[NoteRoute, ...],
+    sensitivity: str,
+    task: str,
+) -> None:
+    """Log why each configured route is or is not part of this request.
+
+    Slugs and reasons only: no prompt, transcript or credential reaches this
+    function. ``sensitivity`` is the label the caller classified the material
+    with; a route excluded because of it is reported as such instead of
+    disappearing silently from the chain.
+    """
+    label = (sensitivity or "UNKNOWN").strip().upper()
+    allowed = {route.slug for route in eligible}
+    reasons: list[str] = []
+    for route in configured:
+        if route.slug in allowed:
+            reasons.append(f"{route.slug}:eligible")
+        elif route.slug not in APPROVED_LLM_PROVIDERS:
+            reasons.append(f"{route.slug}:unapproved")
+        else:
+            reasons.append(f"{route.slug}:blocked_by_{label.lower() or 'unknown'}")
+    logger.info(
+        "LLM route policy task=%s sensitivity=%s routes=%s",
+        (task or "UNSPECIFIED").strip().upper() or "UNSPECIFIED",
+        label,
+        ", ".join(reasons) or "none",
+    )
+
+
 def _ordered_routes(
     routes: tuple[NoteRoute, ...], prefer: str, *, task: str = ""
 ) -> tuple[NoteRoute, ...]:
@@ -2748,6 +2802,7 @@ async def complete_json(
     eligible_routes = _sensitivity_eligible_routes(
         configured_routes, settings, data_sensitivity
     )
+    _log_route_policy(configured_routes, eligible_routes, data_sensitivity, task)
     routes = _ordered_routes(eligible_routes, prefer_provider, task=task)
     if not routes:
         if configured_routes:

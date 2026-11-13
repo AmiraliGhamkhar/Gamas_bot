@@ -471,3 +471,60 @@ class BookletCompletenessCorpusTests(unittest.TestCase):
                 for block in ("cover_title", "objectives", "toc", "sections",
                               "key_points", "end_summary", "glossary"):
                     self.assertTrue(skeleton[block], f"{entry['id']}: missing {block}")
+
+
+class PersianEvidenceFidelityTests(unittest.TestCase):
+    """Persian/Arabic orthography must not turn a real fact into a fabrication.
+
+    These are the lecture-shaped cases the v3 audit used to get wrong: Arabic
+    YEH/KAF, half-spaces, Persian numerals with a Latin-looking unit, and mixed
+    Persian-English terminology. Each case is a faithful note that must pass,
+    paired with a near-miss that must still fail.
+    """
+
+    @staticmethod
+    def payload(*paragraphs: str) -> dict:
+        return {
+            "sections": [{"heading": "درس", "paragraphs": list(paragraphs)}],
+        }
+
+    def test_arabic_letters_and_half_space_still_ground_the_measurement(self):
+        source = "دوز ۵۰۰ ميلي‌گرم بود."
+        faithful = self.payload("دوز ۵۰۰ میلی‌گرم بود.")
+        self.assertEqual(audit_notes(source, faithful).fabricated, ())
+
+    def test_persian_numerals_and_latin_units_are_the_same_fact(self):
+        source = "کاهش ۵۰٪ در فشار خون دیده شد."
+        self.assertEqual(
+            audit_notes(source, self.payload("کاهش 50% در فشار خون دیده شد.")).fabricated,
+            (),
+        )
+        mismatch = audit_notes(source, self.payload("کاهش 60% در فشار خون دیده شد."))
+        self.assertIn("60", {signal.value for signal in mismatch.fabricated})
+
+    def test_a_date_keeps_its_components_across_separators(self):
+        source = "جلسه در ۱۴۰۲/۰۵/۱۲ برگزار شد."
+        self.assertEqual(
+            audit_notes(
+                source, self.payload("جلسه در 1402-05-12 برگزار شد.")
+            ).fabricated,
+            (),
+        )
+        shifted = audit_notes(source, self.payload("جلسه در 1402-05-13 برگزار شد."))
+        self.assertIn("1402-05-13", {signal.value for signal in shifted.fabricated})
+
+    def test_a_nearby_number_never_grounds_a_different_dose(self):
+        source = "در مطالعهٔ اول ۱۳۰ میلی‌گرم و در مطالعهٔ دوم ۴۰ میلی‌گرم استفاده شد."
+        audit = audit_notes(source, self.payload("دوز 310 mg بود."))
+        self.assertIn("310", {signal.value for signal in audit.fabricated})
+
+    def test_approved_technical_equivalents_are_translations_not_new_facts(self):
+        source = "الگوریتم مرتب‌سازی را با هم بررسی کردیم."
+        self.assertEqual(
+            audit_notes(
+                source, self.payload("الگوریتم مرتب‌سازی (sorting algorithm) بررسی شد.")
+            ).fabricated,
+            (),
+        )
+        invented = audit_notes(source, self.payload("از الگوریتم quicksort استفاده شد."))
+        self.assertIn("quicksort", {signal.value for signal in invented.fabricated})

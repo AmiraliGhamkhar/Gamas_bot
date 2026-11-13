@@ -98,6 +98,32 @@ Both `complete()` and `complete_json()` accept explicit `data_sensitivity`.
 Task selection is not automatic de-identification/classification. Never use
 real patient data in fixtures or smoke tests. See [Security](SECURITY.md).
 
+The booklet pipeline classifies its source once (`NOTE_DATA_SENSITIVITY`,
+`auto` by default) and reuses that one label for generation, repair, coverage
+fill and compilation; `auto` fails closed to `UNKNOWN`. Every request therefore
+logs one policy line, and no stage can widen the policy for a later stage:
+
+```
+LLM route policy task=BOOKLET_GENERATION sensitivity=UNKNOWN routes=avalai:eligible, gemini:eligible, openrouter:blocked_by_unknown
+```
+
+`eligible`, `blocked_by_unknown` and `blocked_by_sensitivity` explain exactly
+why a configured provider was or was not attempted, without transcript text or
+credentials.
+
+### Request diagnostics
+
+A failed route logs `note provider failed; trying the next one provider=<slug>
+error=<ExceptionClass> detail=<sanitized>`, where the detail carries the HTTP
+status and the provider's own bounded message. When every eligible route fails,
+one `every configured note provider failed task=… categories=… detail=…` line
+lists the whole chain. The message shown to the user names only the classes
+(`AvalAI: LLMAuthError؛ Gemini: LLMResponseError`), because a provider may echo
+credential-like text in its error body; the sanitized details stay in the log.
+Truncated (`finish_reason=length`), empty and malformed answers raise
+`LLMResponseError` and fall through to the next eligible route instead of
+producing a partial booklet.
+
 ### Safe probes
 
 ```bash

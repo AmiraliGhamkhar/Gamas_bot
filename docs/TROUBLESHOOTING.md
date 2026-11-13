@@ -74,6 +74,12 @@ include the full signed payload, secrets or private user content.
 | Legacy provider settings warning | Removed-provider keys/slots are ignored from both environment and `.env`; configure only Gemini, AvalAI or OpenRouter. Never paste keys into diagnostics |
 | Provider order looks wrong after editing `.env` | `--show-config` shows eligible configuration; task policy may reorder primaries, OpenRouter stays last, and sensitivity may exclude it. Clear the legacy `NOTE_*` slot if it is no longer wanted |
 | Persian Deepgram error | Use `STT_LANGUAGE=fa` with `DEEPGRAM_MODEL=nova-3` |
+| Booklet refused: `error_kind=notes_quality`, user told «تأیید نشد» | The final evidence gate found numbers or terms the source does not contain. The transcript was kept and the submission is `partial`. Read `note acceptance rejected … fabricated=<n>` and the provider's `detail=` lines; never disable `NOTE_STRICT_GROUNDING` to raise the success count |
+| Booklet succeeds but a number is missing | Recall is a repair signal, not an acceptance rule: a diagnosed omission is delivered, an unsupported claim is not. Check `note repair left unresolved …` in the log |
+| A configured provider was never called | Search `LLM route policy`; `openrouter:blocked_by_unknown` means the source was not classified as shareable, and `blocked_by_sensitivity` means its opt-in flag is false |
+| Provider error has no useful reason | Each failure line ends with `detail=`, which already includes the HTTP status and a sanitized provider message. The user-facing text intentionally keeps class names only |
+| Job appears stuck in `validating_notes` / `compiling_notes` | Those are real stages, not queue stalls: the note pipeline reports them while it audits evidence and runs the editorial compile. Repair is bounded to two attempts, then the gate decides |
+| Speechmatics 403 | Two different causes now read differently: «دسترسی حساب … مجاز نیست» means subscription/permission, «اعتبارنامه را نپذیرفت» means the key itself. Both put the provider on cooldown and fail over to the next `STT_PROVIDERS` entry |
 | Long provider timeouts on a slow free tier | Keep the conservative output budget; adjust `NOTE_REQUEST_TIMEOUT_SECONDS` only with evidence. Dispatch never hedges, even with a stale nonzero hedge setting |
 
 ## Documents, Office and OCR

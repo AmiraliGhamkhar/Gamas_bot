@@ -47,15 +47,30 @@ Useful lines:
 - `GMS-#####` — job reference to quote in support.
 - `LLM request sending … requested_output_tokens=<n>` — the budget actually sent.
 - `note provider usage … output_tokens=<n>` — what the provider billed.
-- `note provider failed; trying the next one` — failover with a safe reason.
+- `note provider failed; trying the next one provider=… error=… detail=…` —
+  failover with the HTTP status and a sanitized provider message.
+- `every configured note provider failed task=… categories=… detail=…` — the
+  whole eligible chain failed; `categories` are exception classes.
+- `LLM route policy task=… sensitivity=… routes=…` — why each configured
+  provider was eligible, blocked by policy or skipped.
+- `note acceptance rejected stage=… reason=unsupported_facts fabricated=<n>` —
+  the final booklet gate refused delivery; the transcript stays available.
+- `note repair left unresolved after N attempt(s) …` — bounded repair reached
+  its limit without removing every unsupported signal.
+- `STT provider … failing over provider=… category=… detail=…` — transcription
+  failover with its category (`authorization`, `quota`, `request`,
+  `transient`, `response`).
 
 To print the effective note-generation providers and model IDs without keys or
 network calls, run `python -m scripts.probe_note_providers --show-config` in the
 project virtualenv. This reflects the environment visible to that command; for a
 managed service, compare its environment overrides with the private `.env`.
 Review `STT_PROVIDERS` and its model settings separately for transcription.
-Logs never contain keys, prompts or transcript text. Environment changes need a
-restart.
+Logs never contain keys, prompts or transcript text. A job's live state moves
+through media, transcription, note generation, `validating_notes`,
+`compiling_notes` and delivery; a partial result is reported as `partial` with
+an `error_kind` (`notes_quality`, `notes`, `pdf`, …) on the submission.
+Environment changes need a restart.
 
 ## Backup and restore
 

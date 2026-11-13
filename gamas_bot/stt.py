@@ -153,6 +153,26 @@ _QUOTA_MARKERS = (
     "billing hard limit",
 )
 
+#: 403 wording that describes *account access* (a plan that does not include
+#: this endpoint, an unverified account, a disabled key) rather than an expired
+#: credential. Both fail over the same way, but the diagnosis differs and an
+#: operator reading the log needs to know which one to fix.
+_ACCOUNT_ACCESS_MARKERS = (
+    "not authorized",
+    "unauthorized",
+    "not permitted",
+    "permission denied",
+    "access denied",
+    "forbidden",
+    "subscription",
+    "plan does not",
+    "account is not",
+    "verify your account",
+    "verification",
+    "disabled",
+    "suspended",
+)
+
 _PERMANENT_BAD_AUDIO_MARKERS = (
     "invalid audio",
     "corrupt",
@@ -220,6 +240,12 @@ async def _error_from_response(
     ):
         return STTQuotaError(
             f"سهمیه یا اعتبار {label} به پایان رسیده است (HTTP {response.status}){suffix}"
+        )
+    if response.status == 403 and _contains_any(detail, _ACCOUNT_ACCESS_MARKERS):
+        # Account access, not a bad key: the same cooldown/failover applies, but
+        # the message says what to fix instead of implying an invalid credential.
+        return STTAuthenticationError(
+            f"دسترسی حساب به {label} برای این سرویس مجاز نیست (HTTP 403){suffix}"
         )
     if response.status in (401, 403):
         return STTAuthenticationError(f"{label} اعتبارنامه را نپذیرفت (HTTP {response.status}){suffix}")
@@ -1493,30 +1519,37 @@ async def transcribe(
             except STTAuthenticationError as exc:
                 previous_failed_slug = chosen_slug
                 logger.warning(
-                    "STT provider %s auth/quota failure after %.1fs: %s",
-                    chosen_slug, time.monotonic() - started, exc,
+                    "STT provider %s auth/quota failure after %.1fs; failing over "
+                    "provider=%s category=%s detail=%s",
+                    chosen_slug,
+                    time.monotonic() - started,
+                    chosen_slug,
+                    "quota" if isinstance(exc, STTQuotaError) else "authorization",
+                    exc,
                 )
                 failures.append(str(exc))
             except STTRequestError as exc:
                 previous_failed_slug = chosen_slug
                 logger.warning(
-                    "STT provider %s rejected the request after %.1fs: %s",
-                    chosen_slug, time.monotonic() - started, exc,
+                    "STT provider %s rejected the request after %.1fs; failing over "
+                    "provider=%s category=request detail=%s",
+                    chosen_slug, time.monotonic() - started, chosen_slug, exc,
                 )
                 failures.append(str(exc))
             except STTTransientError as exc:
                 previous_failed_slug = chosen_slug
                 logger.warning(
                     "STT provider %s transient failure after %.1fs; failing over "
-                    "without re-uploading: %s",
-                    chosen_slug, time.monotonic() - started, exc,
+                    "without re-uploading provider=%s category=%s detail=%s",
+                    chosen_slug, time.monotonic() - started, chosen_slug, exc.kind, exc,
                 )
                 failures.append(str(exc))
             except STTError as exc:
                 previous_failed_slug = chosen_slug
                 logger.warning(
-                    "STT provider %s returned an unusable response after %.1fs: %s",
-                    chosen_slug, time.monotonic() - started, exc,
+                    "STT provider %s returned an unusable response after %.1fs; "
+                    "failing over provider=%s category=response detail=%s",
+                    chosen_slug, time.monotonic() - started, chosen_slug, exc,
                 )
                 failures.append(str(exc))
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:

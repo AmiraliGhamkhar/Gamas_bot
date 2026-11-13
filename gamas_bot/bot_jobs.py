@@ -52,6 +52,7 @@ from .logging_config import log_job_id
 from .media import MediaInfo, convert_to_pptx
 from .metrics import METRICS
 from .notes import (
+    NoteQualityError,
     StructuredNotes,
     build_presentation_document,
     structure_presentation,
@@ -1034,6 +1035,26 @@ class JobPipelineMixin:
             plain_text=presentation_text,
         )
 
+    def _note_stage_callback(self, job: Job, progress: Any) -> Any:
+        """Map the note pipeline's own stages onto real job states.
+
+        The note pipeline calls this when it enters the deterministic evidence
+        gate and the editorial compile, so the reported state is produced by the
+        work that is actually running instead of one opaque generating window.
+        """
+
+        async def stage(name: str) -> None:
+            if name == "validating":
+                job.transition_to("validating_notes")
+                if progress is not None:
+                    await progress.update(88, "اعتبارسنجی جزوه با متن درس")
+            elif name == "compiling":
+                job.transition_to("compiling_notes")
+                if progress is not None:
+                    await progress.update(91, "ویرایش نهایی جزوه")
+
+        return stage
+
     async def _generate_notes(
         self,
         document_text: str,
@@ -1058,9 +1079,28 @@ class JobPipelineMixin:
                 self._http_session(),  # type: ignore[attr-defined]
                 mode=self.settings.note_mode,
                 on_merged=None,
+                on_stage=self._note_stage_callback(job, progress),
             )
+        except NoteQualityError as exc:
+            job.meta["note_failure"] = "quality"
+            logger.warning(
+                "note quality gate rejected the booklet submission=%s reason=%s fabricated=%d",
+                job.submission_id,
+                getattr(exc, "reason", "unsupported_facts"),
+                getattr(exc, "fabricated", 0),
+            )
+            await self._reply(
+                job,
+                "ℹ️ جزوهٔ ساختارمند به‌دلیل نبود پشتوانهٔ کافی در متن درس تأیید نشد؛ "
+                "متن خام از دکمهٔ خروجی‌ها در دسترس است.",
+            )
+            return None
         except Exception as exc:
-            logger.warning("note generation failed; raw transcript remains available: %s", exc)
+            job.meta["note_failure"] = "provider"
+            logger.warning(
+                "note generation failed; raw transcript remains available: %s",
+                type(exc).__name__,
+            )
             await self._reply(
                 job,
                 "ℹ️ تولید جزوهٔ ساختارمند انجام نشد؛ متن خام از دکمهٔ خروجی‌ها در دسترس است.",
@@ -1088,9 +1128,28 @@ class JobPipelineMixin:
                 self._http_session(),  # type: ignore[attr-defined]
                 mode=self.settings.note_mode,
                 document=document,
+                on_stage=self._note_stage_callback(job, progress),
             )
+        except NoteQualityError as exc:
+            job.meta["note_failure"] = "quality"
+            logger.warning(
+                "presentation note quality gate rejected the booklet submission=%s "
+                "reason=%s fabricated=%d",
+                job.submission_id,
+                getattr(exc, "reason", "unsupported_facts"),
+                getattr(exc, "fabricated", 0),
+            )
+            await self._reply(
+                job,
+                "ℹ️ جزوهٔ ارائه به‌دلیل نبود پشتوانهٔ کافی در متن، تأیید نشد؛ "
+                "متن خام و فایل سادهٔ Word ارسال می‌شود.",
+            )
+            return None
         except Exception as exc:
-            logger.warning("presentation note generation failed: %s", exc)
+            job.meta["note_failure"] = "provider"
+            logger.warning(
+                "presentation note generation failed: %s", type(exc).__name__
+            )
             await self._reply(
                 job,
                 "ℹ️ تولید جزوهٔ ساختارمند انجام نشد؛ فایل سادهٔ Word و متن خام ارسال می‌شود.",
@@ -1131,8 +1190,18 @@ class JobPipelineMixin:
         notice_kind = ""
 
         if notes is None or not notes.has_content:
-            notice = "\n\nنکته: جزوهٔ ساختارمند برای این فایل ساخته نشد؛ متن خام در دسترس است."
-            notice_kind = "notes"
+            if job.meta.get("note_failure") == "quality":
+                notice = (
+                    "\n\nنکته: جزوهٔ ساختارمند به‌دلیل نبود پشتوانهٔ کافی در متن درس "
+                    "تأیید نشد؛ متن خام در دسترس است."
+                )
+                notice_kind = "notes_quality"
+            else:
+                notice = (
+                    "\n\nنکته: جزوهٔ ساختارمند برای این فایل ساخته نشد؛ "
+                    "متن خام در دسترس است."
+                )
+                notice_kind = "notes"
         else:
             duration_seconds = (
                 int(job.duration_hint)

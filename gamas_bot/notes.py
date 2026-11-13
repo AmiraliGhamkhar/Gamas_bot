@@ -10,9 +10,11 @@ lines) with one module and a fixed call budget:
   notes into a coherent booklet. A booklet too large for one request is
   compiled in groups of whole sections (bounded levels); if the pass fails, the
   deterministic merge is delivered instead;
-* **at most one bounded repair pass**, only when the evidence gate asks for it
-  (see ``NOTE_QUALITY_GATE``); an oversized repair request carries only the
-  sections that hold the lost facts;
+* **at most two bounded repair attempts**, only when the evidence gate asks
+  for it (see ``NOTE_QUALITY_GATE``); an oversized repair request carries
+  only the sections that hold the lost facts, and the complete booklet is
+  re-audited after each attempt; a booklet that still asserts an unsupported
+  fact is rejected rather than delivered (see :func:`acceptance_failure`);
 * **no QA-driven re-asks and no truncation re-sends.** A bad answer degrades to
   the raw transcript — which the user already holds, because the transcript is
   delivered before note generation starts.
@@ -89,7 +91,7 @@ from .notes_evidence import (
     validate_tip,
 )
 from .progress import to_persian_digits
-from .textnorm import normalize_for_compare
+from .textnorm import normalize_digits, normalize_for_compare
 from .transcript import split_transcript
 
 logger = logging.getLogger(__name__)
@@ -162,10 +164,129 @@ MAX_REPAIR_SECTIONS = 6
 MAX_REPAIR_SIGNALS = 40
 #: Source characters of context handed to the repair pass per missing signal.
 REPAIR_WINDOW_CHARS = 160
+#: Bounded repair attempts for one booklet. The second attempt exists because the
+#: first can remove an invented value yet still leave a missing one; a third
+#: would re-send near-identical material for a diminishing chance of improvement
+#: at the full provider cost.
+MAX_NOTE_REPAIR_ATTEMPTS = 2
 
 
 class StructuringError(RuntimeError):
     """Note generation failed; the caller degrades to the raw transcript."""
+
+
+class NoteQualityError(StructuringError):
+    """The finished booklet still fails a hard evidence requirement.
+
+    Raised after the bounded repair and scrub passes, so the caller keeps the
+    transcript, reports a partial result and never presents an unsupported
+    number or term as a delivered booklet.
+    """
+
+    def __init__(self, message: str, *, reason: str, fabricated: int = 0) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.fabricated = fabricated
+
+
+# ===========================================================================
+# Data sensitivity
+# ===========================================================================
+
+#: Labels the LLM router understands (see ``llm._sensitivity_eligible_routes``).
+SENSITIVITY_STANDARD_EDUCATIONAL = "STANDARD_EDUCATIONAL"
+SENSITIVITY_UNKNOWN = "UNKNOWN"
+
+#: Wording that makes lecture material *identifiable* rather than merely
+#: medical. Plain teaching about a patient is ordinary educational content; a
+#: record that carries a national id, a contact detail or a file number is not,
+#: and the router must not send it to the community OpenRouter route.
+_PATIENT_IDENTIFIER_MARKERS = (
+    "کد ملی",
+    "شماره ملی",
+    "شماره پرونده",
+    "شمارهٔ پرونده",
+    "پرونده بیمار",
+    "پروندهٔ بیمار",
+    "شماره بیمه",
+    "تاریخ تولد",
+    "شماره تماس",
+    "شمارهٔ تماس",
+    "شماره همراه",
+    "شمارهٔ همراه",
+    "آدرس بیمار",
+    "نام بیمار",
+    "medical record",
+    "patient id",
+    "patient name",
+    "date of birth",
+    "national id",
+    "insurance number",
+    "phone number",
+    "home address",
+)
+#: Folded with the same comparison form used on the material, so letter and
+#: ZWNJ variants cannot hide a marker.
+_NORMALIZED_IDENTIFIER_MARKERS = tuple(
+    normalize_for_compare(marker) for marker in _PATIENT_IDENTIFIER_MARKERS
+)
+_EMAIL_SIGNAL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+#: An 11-digit Iranian mobile number, or a 10-digit national id, in either digit
+#: shape (``normalize_digits`` folds them first). A dosage, a year or a quiz
+#: number cannot match: both patterns require at least ten consecutive digits.
+_MOBILE_SIGNAL = re.compile(r"(?<!\d)09\d{9}(?!\d)")
+_NATIONAL_ID_SIGNAL = re.compile(r"(?<!\d)\d{10}(?!\d)")
+
+#: ``NOTE_DATA_SENSITIVITY`` -> router label. ``auto`` runs the classifier.
+_SETTING_SENSITIVITY_LABELS = {
+    "standard_educational": SENSITIVITY_STANDARD_EDUCATIONAL,
+    "internal": "INTERNAL",
+    "sensitive": "SENSITIVE",
+    "phi_or_pii": "PHI_OR_PII",
+}
+
+
+def classify_note_sensitivity(text: str) -> str:
+    """Classify lecture material for provider routing, failing closed.
+
+    ``STANDARD_EDUCATIONAL`` is returned only when nothing looks
+    patient-identifiable: no e-mail address, no 10/11-digit identifier run and
+    none of the explicit identifier markers. Everything else — including empty
+    material — is ``UNKNOWN``, which the router treats as ineligible for the
+    community OpenRouter route. An unusual lecture therefore loses its last
+    fallback instead of leaking identifiable material to a third party.
+    """
+    folded = normalize_digits(text or "")
+    lowered = normalize_for_compare(folded)
+    if not lowered.strip():
+        return SENSITIVITY_UNKNOWN
+    if any(marker and marker in lowered for marker in _NORMALIZED_IDENTIFIER_MARKERS):
+        return SENSITIVITY_UNKNOWN
+    if (
+        _EMAIL_SIGNAL.search(folded)
+        or _MOBILE_SIGNAL.search(folded)
+        or _NATIONAL_ID_SIGNAL.search(folded)
+    ):
+        return SENSITIVITY_UNKNOWN
+    return SENSITIVITY_STANDARD_EDUCATIONAL
+
+
+def resolve_note_sensitivity(settings: Settings, document: str) -> str:
+    """The sensitivity label carried by every request of one booklet.
+
+    ``NOTE_DATA_SENSITIVITY=auto`` (the default) classifies the material with
+    :func:`classify_note_sensitivity`; an explicit value declares the
+    deployment's own policy and is used verbatim. Resolution happens once, in
+    :func:`structure_document`, and the label travels through generation, repair
+    and compile so no stage can reach a provider another stage rejects.
+    """
+    declared = (
+        getattr(settings, "note_data_sensitivity", "auto") or "auto"
+    ).strip().lower()
+    declared_label = _SETTING_SENSITIVITY_LABELS.get(declared)
+    if declared_label is not None:
+        return declared_label
+    return classify_note_sensitivity(document)
 
 
 # ===========================================================================
@@ -1568,6 +1689,7 @@ async def fill_coverage_gaps(
     notes: StructuredNotes,
     *,
     semaphore: asyncio.Semaphore | None = None,
+    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes:
     """Fill all detected coverage gaps in one grounded, bounded request.
 
@@ -1593,6 +1715,7 @@ async def fill_coverage_gaps(
                     user=message,
                     schema=_response_schema(settings),
                     task="BOOKLET_REPAIR",
+                    data_sensitivity=data_sensitivity,
                 )
         else:
             payload = await complete_json(
@@ -1601,6 +1724,7 @@ async def fill_coverage_gaps(
                 user=message,
                 schema=_response_schema(settings),
                 task="BOOKLET_REPAIR",
+                data_sensitivity=data_sensitivity,
             )
         filled = _load_json_payload(payload)
     except Exception as exc:  # noqa: BLE001 - preserve the audited draft
@@ -1967,6 +2091,52 @@ def notes_need_repair(report: NoteQualityReport, *, mode: str = "full") -> bool:
     )
 
 
+def acceptance_failure(report: NoteQualityReport) -> str | None:
+    """The hard acceptance rule for a finished booklet, or ``None``.
+
+    Acceptance is about *faithfulness*, not recall: a booklet may be delivered
+    with a diagnosed omission (the audit reports it as missing) but never with a
+    number, unit or term the source does not contain. Recall floors and
+    sentence coverage stay repair signals, because a legitimate paraphrase is
+    not disproof and must not reject an otherwise grounded booklet.
+    """
+    if report.audit.fabricated:
+        return "unsupported_facts"
+    return None
+
+
+def enforce_final_acceptance(
+    notes: StructuredNotes,
+    report: NoteQualityReport,
+    *,
+    mode: str = "full",
+    stage: str = "final",
+) -> StructuredNotes:
+    """Return *notes*, or raise :class:`NoteQualityError`.
+
+    This is the single final gate: every path that could deliver a structured
+    booklet (single chunk, merged chunks, and a compiled booklet) ends here.
+    ``stage`` is diagnostic only and appears in the log line.
+    """
+    reason = acceptance_failure(report)
+    if reason is None:
+        return notes
+    logger.warning(
+        "note acceptance rejected stage=%s reason=%s fabricated=%d missing=%d mode=%s",
+        stage,
+        reason,
+        len(report.audit.fabricated),
+        len(report.audit.missing),
+        resolve_note_mode(mode),
+    )
+    raise NoteQualityError(
+        "جزوهٔ ساخته‌شده با متن منبع راستی‌آزمایی نشد؛ تحویل داده نمی‌شود و "
+        "متن خام درس در دسترس است.",
+        reason=reason,
+        fabricated=len(report.audit.fabricated),
+    )
+
+
 def repair_target_indexes(
     notes: StructuredNotes,
     report: NoteQualityReport,
@@ -2312,6 +2482,7 @@ async def _structure_piece(
     depth: int = 0,
     presentation: bool = False,
     render: Callable[[str], str],
+    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes:
     """One note request, with bounded recovery from an oversized or dense input.
 
@@ -2335,6 +2506,7 @@ async def _structure_piece(
                 user=render(document),
                 schema=_response_schema(settings),
                 task="BOOKLET_GENERATION",
+                data_sensitivity=data_sensitivity,
             )
         return _load_json_payload(payload, mode=mode)
     except (LLMContextOverflowError, LLMOutputBudgetError) as exc:
@@ -2365,6 +2537,7 @@ async def _structure_piece(
                     system_prompt=system_prompt, mode=mode,
                     semaphore=semaphore, depth=depth + 1,
                     presentation=presentation, render=render,
+                    data_sensitivity=data_sensitivity,
                 )
             )
             for piece in pieces
@@ -2393,17 +2566,22 @@ async def _audit_and_repair(
     presentation: bool,
     semaphore: asyncio.Semaphore,
     source_locators: bool = False,
+    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> tuple[StructuredNotes, NoteQualityReport]:
-    """Gate the notes, then make at most one bounded repair request.
+    """Gate the notes, repair what failed (bounded), then accept or reject.
 
-    The gate is deterministic and free. The repair is one request that carries
-    only the missing facts and their source windows; it is skipped when the
-    request would not fit the configured budget, when the operator chose
-    ``warn`` mode, or when nothing is actually wrong.
+    The gate is deterministic and free. Each repair attempt carries only the
+    missing facts and their source windows, is re-audited on the complete
+    booklet, and is accepted only when it is grounded and loses no ground. At
+    most :data:`MAX_NOTE_REPAIR_ATTEMPTS` attempts are made; an attempt that
+    changes nothing ends the loop, because repeating an identical request cannot
+    produce a different answer.
 
-    In ``warn`` mode the notes are returned **unchanged**: the audit still runs
-    and is logged, so the operator can read what the gate would have dropped on
-    real lectures before it is allowed to drop anything.
+    After the last attempt any sentence stating a number the source does not
+    contain is removed, the booklet is re-audited, and the hard acceptance rule
+    (:func:`acceptance_failure`) decides whether the result may be delivered.
+    ``warn`` mode returns the notes unchanged: the audit is logged, nothing is
+    dropped and nothing is rejected, which is what makes it an observation mode.
     """
     if not settings.note_strict_grounding:
         # Defensive: every caller already skips this step when grounding is off.
@@ -2417,17 +2595,48 @@ async def _audit_and_repair(
         )
         return observed, report
     gated, report = gate_notes(notes, source, strict=True, mode=mode)
-    if notes_need_repair(report, mode=mode):
-        gated, report = await _repair_once(
+    attempts = 0
+    while attempts < MAX_NOTE_REPAIR_ATTEMPTS and notes_need_repair(report, mode=mode):
+        attempts += 1
+        before = report
+        candidate, candidate_report = await _repair_once(
             gated, report, source, settings, session,
             mode=mode, presentation=presentation, semaphore=semaphore,
             source_locators=source_locators,
+            data_sensitivity=data_sensitivity,
+        )
+        if candidate is gated and candidate_report is report:
+            logger.info(
+                "repair attempt %d/%d made no accepted change; stopping",
+                attempts, MAX_NOTE_REPAIR_ATTEMPTS,
+            )
+            break
+        gated, report = candidate, candidate_report
+        resolved = (
+            len(before.audit.missing)
+            + len(before.audit.fabricated)
+            - len(report.audit.missing)
+            - len(report.audit.fabricated)
+        )
+        logger.info(
+            "repair attempt %d/%d applied fixed=%d unresolved_missing=%d "
+            "unresolved_fabricated=%d",
+            attempts,
+            MAX_NOTE_REPAIR_ATTEMPTS,
+            max(0, resolved),
+            len(report.audit.missing),
+            len(report.audit.fabricated),
         )
     if report.audit.fabricated:
         scrubbed, removed = scrub_fabricated_numbers(gated, report.audit)
         if removed:
             gated, report = gate_notes(scrubbed, source, strict=True, mode=mode)
-    return gated, report
+    if notes_need_repair(report, mode=mode):
+        logger.warning(
+            "note repair left unresolved signals after %d attempt(s): %s",
+            attempts, report.summary(),
+        )
+    return enforce_final_acceptance(gated, report, mode=mode, stage="audit"), report
 
 
 def repair_request_document(
@@ -2525,6 +2734,7 @@ async def _repair_once(
     presentation: bool,
     semaphore: asyncio.Semaphore,
     source_locators: bool = False,
+    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> tuple[StructuredNotes, NoteQualityReport]:
     """One bounded repair request; the caller keeps its state on any failure."""
     budget = effective_compile_max_chars(settings, mode=mode, presentation=presentation)
@@ -2544,6 +2754,7 @@ async def _repair_once(
                 user=repair_document,
                 schema=_response_schema(settings),
                 task="BOOKLET_REPAIR",
+                data_sensitivity=data_sensitivity,
             )
         candidate = _load_json_payload(payload, mode=mode)
     except (LLMError, StructuringError) as exc:
@@ -2574,6 +2785,7 @@ async def _compile_once(
     presentation: bool,
     budget: int,
     source_locators: bool = False,
+    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes | None:
     """One editorial compile request, or ``None`` when it cannot be sent.
 
@@ -2601,6 +2813,7 @@ async def _compile_once(
             schema=_response_schema(settings),
             task="BOOKLET_COMPILE",
             prefer_provider=getattr(settings, "note_compile_provider", ""),
+            data_sensitivity=data_sensitivity,
         )
         compiled = _load_json_payload(payload, mode=mode)
     except (LLMError, StructuringError) as exc:
@@ -2692,6 +2905,7 @@ async def _compile_in_groups(
     budget: int,
     semaphore: asyncio.Semaphore | None = None,
     source_locators: bool = False,
+    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes:
     """Level 1: compile whole-section groups concurrently; keep any group that fails."""
     groups = compile_groups(merged, context, budget=budget)
@@ -2709,6 +2923,7 @@ async def _compile_in_groups(
                 session, settings, context, group,
                 mode=mode, presentation=presentation, budget=budget,
                 source_locators=source_locators,
+                data_sensitivity=data_sensitivity,
             )
 
     tasks = [asyncio.create_task(compile_group(group)) for group in groups]
@@ -2801,6 +3016,7 @@ async def _compile_pass(
     presentation: bool,
     semaphore: asyncio.Semaphore | None = None,
     source_locators: bool = False,
+    data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> StructuredNotes:
     """The editorial pass: one request when it fits, whole-section groups when not.
 
@@ -2886,6 +3102,12 @@ async def _compile_pass(
 #: the caller can deliver it while the compile is still in flight.
 MergedCallback = Callable[["StructuredNotes"], Awaitable[None]]
 
+#: Called with ``"validating"`` and ``"compiling"`` when the pipeline enters the
+#: evidence gate and the editorial pass. It lets the job layer report a real
+#: stage instead of one opaque "generating notes" window; a failure inside the
+#: callback is logged and never fails the booklet.
+StageCallback = Callable[[str], Awaitable[None]]
+
 
 async def structure_document(
     document: str,
@@ -2896,6 +3118,7 @@ async def structure_document(
     presentation: bool = False,
     on_merged: MergedCallback | None = None,
     source_locators: bool = False,
+    on_stage: StageCallback | None = None,
 ) -> StructuredNotes:
     """Map-reduce a prepared LLM document into one structured booklet.
 
@@ -2916,6 +3139,26 @@ async def structure_document(
     if not document:
         raise StructuringError("متن ورودی خالی بود.")
     resolved_mode = resolve_note_mode(mode)
+    # Resolved once for the whole booklet: generation, repair and compile then
+    # send the same label, so no later stage can reach a provider the first
+    # stage's policy rejected.
+    data_sensitivity = resolve_note_sensitivity(settings, document)
+    logger.info(
+        "note data sensitivity=%s declared=%s chars=%d",
+        data_sensitivity,
+        getattr(settings, "note_data_sensitivity", "auto"),
+        len(document),
+    )
+
+    async def notify(stage: str) -> None:
+        """Report a pipeline stage without ever failing the booklet."""
+        if on_stage is None:
+            return
+        try:
+            await on_stage(stage)
+        except Exception:  # noqa: BLE001 - reporting is never a note failure
+            logger.warning("note stage callback failed stage=%s", stage, exc_info=True)
+
     # One static prompt for every source kind: the source kind and the source
     # locators are carried by the user message, never by this string. A prompt
     # that changed with the source kind could not be prefix-cached, and a job
@@ -2932,7 +3175,8 @@ async def structure_document(
         """CR-4: optionally run the bounded coverage-gap fill pass."""
         if getattr(settings, "note_completeness_fill", False) and not settings.note_strict_grounding:
             return await fill_coverage_gaps(
-                session, settings, document, result, semaphore=semaphore
+                session, settings, document, result, semaphore=semaphore,
+                data_sensitivity=data_sensitivity,
             )
         return result
 
@@ -2962,14 +3206,17 @@ async def structure_document(
             chunks[0],
             system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation, render=single_render,
+            data_sensitivity=data_sensitivity,
         )
         if not settings.note_strict_grounding:
             return single
+        await notify("validating")
         return (
             await _audit_and_repair(
                 single, document, settings, session,
                 mode=resolved_mode, presentation=presentation, semaphore=semaphore,
                 source_locators=source_locators,
+                data_sensitivity=data_sensitivity,
             )
         )[0]
 
@@ -3023,6 +3270,7 @@ async def structure_document(
             session, settings, chunk,
             system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
             presentation=presentation, render=render,
+            data_sensitivity=data_sensitivity,
         )
 
     # Cancel the siblings when one chunk fails: ``gather`` propagates the first
@@ -3042,10 +3290,12 @@ async def structure_document(
     merged = merge_structured_notes(list(chunk_notes))
     merged_report: NoteQualityReport | None = None
     if settings.note_strict_grounding:
+        await notify("validating")
         merged, merged_report = await _audit_and_repair(
             merged, document, settings, session,
             mode=resolved_mode, presentation=presentation, semaphore=semaphore,
             source_locators=source_locators,
+            data_sensitivity=data_sensitivity,
         )
     if on_merged is not None and compile_will_run(
         merged, settings, mode=resolved_mode, presentation=presentation
@@ -3059,11 +3309,29 @@ async def structure_document(
         except Exception:  # noqa: BLE001 - delivery is never a note failure
             logger.warning("progressive booklet delivery failed", exc_info=True)
 
-    return await finalize(await _compile_pass(
+    await notify("compiling")
+    compiled = await _compile_pass(
         merged, merged_report, document, context, settings, session,
         mode=resolved_mode, presentation=presentation, semaphore=semaphore,
         source_locators=source_locators,
-    ))
+        data_sensitivity=data_sensitivity,
+    )
+    compiled = await finalize(compiled)
+    if (
+        compiled is merged
+        or not settings.note_strict_grounding
+        or settings.note_quality_gate != "repair"
+    ):
+        return compiled
+    # The editorial pass replaced sections, so the complete output is audited
+    # again instead of trusting the per-group checks: acceptance is a property
+    # of the booklet that is about to be delivered.
+    _, final_report = gate_notes(
+        compiled, document, strict=True, mode=resolved_mode
+    )
+    return enforce_final_acceptance(
+        compiled, final_report, mode=resolved_mode, stage="post_compile"
+    )
 
 
 _SLIDE_NUMBER_CHARS = "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩"
@@ -3264,10 +3532,12 @@ async def structure_transcript(
     *,
     mode: str = "full",
     on_merged: MergedCallback | None = None,
+    on_stage: StageCallback | None = None,
 ) -> StructuredNotes:
     """Transcript text (the cleaned LLM document) → structured notes."""
     return await structure_document(
-        text, settings, session, mode=mode, presentation=False, on_merged=on_merged
+        text, settings, session, mode=mode, presentation=False,
+        on_merged=on_merged, on_stage=on_stage,
     )
 
 
@@ -3280,6 +3550,7 @@ async def structure_presentation(
     mode: str = "full",
     document: str | None = None,
     on_merged: MergedCallback | None = None,
+    on_stage: StageCallback | None = None,
 ) -> StructuredNotes:
     """Slide outline + narration transcript → structured notes."""
     resolved_document = (
@@ -3294,4 +3565,5 @@ async def structure_presentation(
         mode=mode,
         presentation=True,
         on_merged=on_merged,
+        on_stage=on_stage,
     )

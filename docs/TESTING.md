@@ -37,10 +37,18 @@ network-dependent advisory; never label it PASS without running it.
 ## Focused regressions
 
 ```bash
-python -m pytest tests/test_provider_allowlist.py tests/test_llm_task_routing.py tests/test_provider_contracts_and_quality.py tests/test_note_provider_compatibility.py -q
+python -m pytest tests/test_provider_allowlist.py tests/test_llm_task_routing.py tests/test_provider_contracts_and_quality.py tests/test_note_provider_compatibility.py tests/test_note_sensitivity_and_acceptance.py -q
+python -m pytest tests/test_notes.py tests/test_note_evidence.py tests/test_bot.py -q
 python -m pytest tests/test_learning.py tests/test_document_ingestion.py -q
 python -m pytest tests/test_llm_quota.py tests/test_concurrency_and_failover.py -q
 ```
+
+`tests/test_note_sensitivity_and_acceptance.py` covers sensitivity
+classification and propagation, route-policy and failure logging, the bounded
+repair loop, the final acceptance gate (including `warn` mode) and the new job
+stages; `RejectedBookletTests` in `tests/test_bot.py` drives a real submission
+through a rejected booklet and asserts the transcript, status, `error_kind` and
+the single charge.
 
 Provider HTTP is mocked. The default test settings have **no LLM credential**;
 generation fixtures opt into scoped fake approved keys only when their I/O is

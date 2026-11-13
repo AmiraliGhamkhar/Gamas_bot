@@ -365,6 +365,25 @@ def resolve_note_quality_gate(value: str | None) -> str:
     return resolved if resolved in NOTE_QUALITY_GATES else "repair"
 
 
+#: How note material is classified before it is routed. ``auto`` runs the
+#: deterministic classifier in ``notes.py``; every other value declares the
+#: deployment's own policy and is used verbatim. The label decides whether the
+#: community OpenRouter route may receive the material.
+NOTE_DATA_SENSITIVITIES = (
+    "auto",
+    "standard_educational",
+    "internal",
+    "sensitive",
+    "phi_or_pii",
+)
+
+
+def resolve_note_data_sensitivity(value: str | None) -> str:
+    """Resolve ``NOTE_DATA_SENSITIVITY``; an unknown value means ``auto``."""
+    resolved = (value or "").strip().lower()
+    return resolved if resolved in NOTE_DATA_SENSITIVITIES else "auto"
+
+
 #: Container policies for the prepared STT audio. ``auto`` weighs encoder CPU
 #: against transfer time; the others force one container.
 AUDIO_FORMAT_POLICIES = ("auto", "wav", "opus")
@@ -651,6 +670,10 @@ class Settings:
     avalai_allow_sensitive_data: bool = False
     gemini_free_allow_sensitive_data: bool = False
     openrouter_free_allow_sensitive_data: bool = False
+    #: ``auto`` (default) classifies each lecture; an explicit value declares
+    #: the deployment's policy for every booklet (see
+    #: ``resolve_note_data_sensitivity``).
+    note_data_sensitivity: str = "auto"
     avalai_rpm_limit: int = 35
     avalai_tpm_limit: int = 750_000
     avalai_rpd_limit: int = 0
@@ -1436,6 +1459,9 @@ def from_env(env_file: str | None = None) -> Settings:
         note_reasoning_effort=resolve_note_reasoning_effort(_env("NOTE_REASONING_EFFORT")),
         note_strict_grounding=_env_bool("NOTE_STRICT_GROUNDING", True),
         note_quality_gate=resolve_note_quality_gate(_env("NOTE_QUALITY_GATE")),
+        note_data_sensitivity=resolve_note_data_sensitivity(
+            _env("NOTE_DATA_SENSITIVITY")
+        ),
         note_openrouter_throughput=_env_bool("NOTE_OPENROUTER_THROUGHPUT", True),
         note_structured_output=_env_bool("NOTE_STRUCTURED_OUTPUT", True),
         note_progressive_booklet=_env_bool("NOTE_PROGRESSIVE_BOOKLET", False),

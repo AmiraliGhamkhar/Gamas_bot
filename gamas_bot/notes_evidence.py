@@ -5,7 +5,8 @@ removing content. This module is what makes that contract checkable without a
 model, a network call or a new dependency:
 
 * :func:`extract_signals` turns a text into the finite set of hard facts a note
-  may not invent or lose — numbers with their unit, Latin terms, URLs;
+  may not invent or lose — numbers with their unit, full dates, Latin terms,
+  URLs;
 * :func:`audit_notes` compares the generated notes against the source and
   reports *omissions* and *fabrications* separately (recall and precision);
 * :func:`validate_table` checks every proposed table cell against the source;
@@ -145,6 +146,14 @@ _STRUCTURAL_NUMBER = re.compile(
     r"(?:\s*\(\s*[0-9۰-۹٠-٩]+\s*/\s*[0-9۰-۹٠-٩]+\s*\))?"
 )
 _CHUNK_MARKER = re.compile(r"\[[^\]\n]{0,120}?(?:بخش|part)[^\]\n]{0,120}\]", re.IGNORECASE)
+#: A full date is one fact. Its separators carry no meaning (``۱۴۰۲/۰۵/۱۲`` and
+#: ``1402-05-12`` are the same day), while the components do: a changed month or
+#: year is still an unsupported claim.
+_DATE = re.compile(
+    r"(?<![A-Za-z0-9])"
+    r"(?P<date>\d{4}[/-]\d{1,2}[/-]\d{1,2}|\d{1,2}[/-]\d{1,2}[/-]\d{4})"
+    r"(?![A-Za-z0-9])"
+)
 _MARKDOWN_HEADING = re.compile(r"^#{1,6}\s*", re.MULTILINE)
 _LIST_ORDINAL = re.compile(r"^\s*(?:\d+[.)]|[-*•])\s+", re.MULTILINE)
 
@@ -356,6 +365,12 @@ def _canonical_value(raw: str) -> str:
     return value
 
 
+def _canonical_date(raw: str) -> str:
+    """One canonical date value: ``۱۴۰۲/۵/۱۲`` -> ``1402-05-12``."""
+    parts = [part for part in re.split(r"[/-]", raw) if part]
+    return "-".join(part.zfill(2) if len(part) <= 2 else part for part in parts)
+
+
 def _canonical_unit(raw: str) -> str:
     if not raw:
         return ""
@@ -425,9 +440,16 @@ def extract_signals(text: str, *, mask: bool = True) -> frozenset[Signal]:
         url_spans.append((start, end))
     without_urls = _blanked(working, url_spans)
 
-    # 2. Latin terms, including the ones that carry a digit.
+    # 2. Dates, before the number scanner can split them into components.
+    date_spans: list[tuple[int, int]] = []
+    for match in _DATE.finditer(without_urls):
+        signals.add(Signal("number", _canonical_date(match.group("date"))))
+        date_spans.append((match.start(), match.end()))
+    without_dates = _blanked(without_urls, date_spans)
+
+    # 3. Latin terms, including the ones that carry a digit.
     term_spans: list[tuple[int, int]] = []
-    for match in _LATIN_TOKEN.finditer(without_urls):
+    for match in _LATIN_TOKEN.finditer(without_dates):
         token = match.group(0).strip(".-+")
         if not token:
             continue
@@ -438,9 +460,9 @@ def extract_signals(text: str, *, mask: bool = True) -> frozenset[Signal]:
             continue
         signals.add(Signal("term", folded))
         term_spans.append((match.start(), match.start() + len(token)))
-    without_terms = _blanked(without_urls, term_spans)
+    without_terms = _blanked(without_dates, term_spans)
 
-    # 3. Numbers with their optional unit.
+    # 4. Numbers with their optional unit.
     for match in _NUMBER_UNIT.finditer(without_terms):
         value = _canonical_value(normalize_digits(match.group("num")))
         if not value:

@@ -40,6 +40,7 @@ failure. Their keys are never lent to an approved provider.
 | `OPENROUTER_RPM_LIMIT` / `OPENROUTER_RPD_LIMIT` / `OPENROUTER_MAX_IN_FLIGHT` | 10 / 15 / 1 |
 | `GEMINI_RPM_LIMIT` / `GEMINI_TPM_LIMIT` / `GEMINI_RPD_LIMIT` / `GEMINI_MAX_IN_FLIGHT` | 0 / 0 / 0 / 1 |
 | `NOTE_STRUCTURED_OUTPUT` / `NOTE_STRICT_GROUNDING` / `NOTE_QUALITY_GATE` | 1 / true / repair |
+| `NOTE_DATA_SENSITIVITY` | auto |
 | `NOTE_COMPILE` / `NOTE_PROGRESSIVE_BOOKLET` | false / false |
 | `NOTE_HEDGE_AFTER_SECONDS` | 0 (legacy knob; dispatch never hedges even if nonzero) |
 
@@ -53,6 +54,17 @@ Compilation is optional and off by default; bounded map/merge, split/repair and
 grounding checks are retained.
 
 ## Sensitivity and validation
+
+`NOTE_DATA_SENSITIVITY` decides who may see a booklet's source. `auto` (the
+default) classifies each submission once, before any provider call, and
+**fails closed to `UNKNOWN`**: a source naming a patient/file number, national
+ID, mobile number or e-mail is treated as unknown rather than assumed safe.
+`standard_educational`, `internal`, `sensitive` and `phi_or_pii` are explicit
+operator declarations for material that was reviewed; an unusable value falls
+back to `auto` instead of failing startup. The resolved label is
+passed to booklet generation, repair, coverage fill and compilation, so one
+booklet never mixes policies, and it is logged once per request. Restart after
+changing it — settings are read at startup.
 
 Unclassified calls default to `UNKNOWN` and cannot use OpenRouter. `INTERNAL`,
 `SENSITIVE` and `PHI_OR_PII` require the corresponding
