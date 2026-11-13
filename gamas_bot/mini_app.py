@@ -27,7 +27,9 @@ import hashlib
 import hmac
 import json
 import logging
+import secrets
 import time
+from email.utils import formatdate, parsedate_to_datetime
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -496,7 +498,7 @@ def save_booklet_payload(
 
 
 def _json_response(
-    start_response: Callable[..., Any], status: int, payload: Any
+    start_response: Callable[..., Any], status: int, payload: Any, *, head: bool = False
 ) -> list[bytes]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     reasons = {
@@ -513,7 +515,7 @@ def _json_response(
         f"{status} {reasons.get(status, 'Error')}",
         [*JSON_HEADERS, ("Content-Length", str(len(body))), ("Cache-Control", "no-store")],
     )
-    return [body]
+    return [b"" if head else body]
 
 
 def booklet_docx_bytes(data: MiniAppData, user_id: int, item_id: int) -> bytes:
@@ -544,7 +546,7 @@ def booklet_docx_bytes(data: MiniAppData, user_id: int, item_id: int) -> bytes:
     try:
         return build_plain_docx(title, text, meta=meta)
     except Exception as exc:  # noqa: BLE001 - a renderer failure is a 500, not a crash
-        logger.exception("mini app DOCX export failed item=%s", item_id)
+        logger.exception("mini app DOCX export failed")
         raise AppError(500, "export failed") from exc
 
 
@@ -641,6 +643,7 @@ def create_app(
     max_age_seconds: int = DEFAULT_MAX_AUTH_AGE_SECONDS,
     now: Callable[[], float] | None = None,
     health: Callable[[], Mapping[str, Any]] | None = None,
+    readiness: Callable[[], Mapping[str, Any]] | None = None,
     static_dir: str | None = None,
 ) -> Callable[..., Iterable[bytes]]:
     """Build the WSGI callable.
@@ -659,12 +662,50 @@ def create_app(
     def app(environ: Mapping[str, Any], start_response: Callable[..., Any]):
         path = str(environ.get("PATH_INFO") or "/").rstrip("/") or "/"
         method = str(environ.get("REQUEST_METHOD") or "GET").upper()
+        started_at = time.perf_counter()
+        request_id = secrets.token_hex(8)
+        original_start_response = start_response
+
+        def instrumented_start_response(status, headers, exc_info=None):
+            elapsed_ms = (time.perf_counter() - started_at) * 1000
+            safe_headers = [
+                (name, value)
+                for name, value in headers
+                if name.lower() not in {"x-request-id", "server-timing"}
+            ]
+            safe_headers.extend(
+                [
+                    ("X-Request-ID", request_id),
+                    ("Server-Timing", f"app;dur={elapsed_ms:.1f}"),
+                ]
+            )
+            logger.info(
+                "mini app request id=%s method=%s path=%s status=%s duration_ms=%.1f",
+                request_id,
+                method,
+                path,
+                status.split(" ", 1)[0],
+                elapsed_ms,
+            )
+            if exc_info is None:
+                return original_start_response(status, safe_headers)
+            return original_start_response(status, safe_headers, exc_info)
+
+        start_response = instrumented_start_response
         try:
             if path == "/health":
                 if method not in {"GET", "HEAD"}:
                     raise AppError(405, "method not allowed")
                 status = dict(health() if health is not None else {"ok": True})
-                return _json_response(start_response, 200, status)
+                return _json_response(start_response, 200, status, head=method == "HEAD")
+            if path == "/ready":
+                if method not in {"GET", "HEAD"}:
+                    raise AppError(405, "method not allowed")
+                status = dict(readiness() if readiness is not None else {"ok": True})
+                http_status = 200 if status.get("ok", False) else 503
+                return _json_response(
+                    start_response, http_status, status, head=method == "HEAD"
+                )
             if path == "/api/home":
                 if method != "POST":
                     raise AppError(405, "method not allowed")
@@ -885,28 +926,45 @@ def _static(
     if not candidate.is_file():
         raise AppError(404, "not found")
     body = candidate.read_bytes()
+    stat = candidate.stat()
+    etag = '"' + hashlib.sha256(body).hexdigest() + '"'
+    last_modified = formatdate(stat.st_mtime, usegmt=True)
     content_type = _STATIC_TYPES.get(candidate.suffix.lower(), "application/octet-stream")
-    start_response(
-        "200 OK",
-        [
-            ("Content-Type", content_type),
-            ("Content-Length", str(len(body))),
-            # The Mini App shell is versioned with the deployment; a short cache
-            # keeps a redeploy visible without hammering the Passenger worker.
-            ("Cache-Control", "public, max-age=300"),
-            ("X-Content-Type-Options", "nosniff"),
-            ("Referrer-Policy", "no-referrer"),
-            (
-                "Content-Security-Policy",
-                "default-src 'self'; img-src 'self' data:; "
-                "style-src 'self' 'unsafe-inline'; script-src 'self' "
-                "https://telegram.org; frame-ancestors https://web.telegram.org "
-                "https://*.telegram.org",
-            ),
-        ],
+    cache_control = (
+        "no-cache" if candidate.name == "index.html" else "public, max-age=300, must-revalidate"
     )
-    del environ, method  # documented parameters, unused by the file server
-    return [body]
+    headers = [
+        ("Content-Type", content_type),
+        ("ETag", etag),
+        ("Last-Modified", last_modified),
+        ("Cache-Control", cache_control),
+        ("X-Content-Type-Options", "nosniff"),
+        ("Referrer-Policy", "no-referrer"),
+        (
+            "Content-Security-Policy",
+            "default-src 'self'; img-src 'self' data:; "
+            "style-src 'self' 'unsafe-inline'; script-src 'self' "
+            "https://telegram.org; frame-ancestors https://web.telegram.org "
+            "https://*.telegram.org",
+        ),
+    ]
+    request_etags = str(environ.get("HTTP_IF_NONE_MATCH") or "")
+    if request_etags:
+        matches = any(value.strip() in {etag, "*"} for value in request_etags.split(","))
+    else:
+        request_modified_since = str(environ.get("HTTP_IF_MODIFIED_SINCE") or "")
+        try:
+            since = parsedate_to_datetime(request_modified_since).timestamp()
+            matches = stat.st_mtime <= since + 1
+        except (TypeError, ValueError, OverflowError):
+            matches = False
+    if matches:
+        start_response("304 Not Modified", headers)
+        return [b""]
+
+    headers.append(("Content-Length", str(len(body))))
+    start_response("200 OK", headers)
+    return [b"" if method == "HEAD" else body]
 
 
 __all__ = [

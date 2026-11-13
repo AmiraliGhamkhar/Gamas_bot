@@ -41,6 +41,27 @@ tail -n 80 data/logs/launcher.err
 | Upload refused | Over `MAX_FILE_SIZE`/`MAX_MEDIA_DURATION_SECONDS`; unmeasurable audio is refused before charging |
 | Transcript arrives, no booklet | No note provider key, or provider/quality failure — the transcription stays charged by design |
 
+## Gamas Studio Mini App
+
+For root-domain cPanel/Passenger checks and copy-paste tests, see
+[Mini App operations](MINIAPP_CPANEL.md). Start by distinguishing the static
+shell, Telegram SDK, authenticated API, and database readiness:
+
+| Symptom | Diagnostic action |
+| --- | --- |
+| Slow/blank launch | On the same phone/network measure `/`, `/static/app.css`, `/static/app.js`, `/health`, and `/ready`; inspect console and Network status/bytes. Compare Wi-Fi with mobile data. |
+| Telegram SDK unavailable | Visit `https://telegram.org/js/telegram-web-app.js` independently on the affected network, retry in the app, and compare other networks. SDK reachability is not proven by a desktop result. |
+| SDK loads but says open from Telegram | Use the BotFather Menu Button or a Web App button. A normal browser has no signed `initData` and must not be authenticated. |
+| Auth/API error | Reopen to refresh the signed payload; check 401 vs network/5xx and note the displayed request ID. Never copy or log `initData`. |
+| API slow or times out | Use `?diagnostics=1`, compare browser timing with WSGI request ID/duration logs, and inspect `/ready`. A healthy `/health` alone only confirms the DB file exists. |
+| JavaScript static reset | Repeat full GETs and compare exact response sizes/status on the same route. HEAD does not test the JS body; Range responses of 200 are full responses, not range support. |
+| Passenger 500/502/503 | Confirm Setup Python App startup file/callable, Python 3.12 environment, cPanel error log, DB path and read permission. Restart only the existing Mini App via its cPanel control; do not start/stop the bot. |
+| Studio empty or save says migration gap | Confirm same DB as the bot and read-only migration markers 027/028. Do not run SQL manually or replace the live database. |
+| Export fails | Check owner-scoped API response and available persisted artifact; do not blindly retry a save/restore. Use the response request ID in logs. |
+
+Diagnostics display only SDK capabilities and API metadata. Logs must never
+include the full signed payload, secrets or private user content.
+
 ## Providers
 
 | Symptom | Fix |

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -88,11 +89,44 @@ def _static_dir() -> str:
 
 
 def _health():
+    """Liveness only: report whether the configured database path exists."""
     settings = _settings()
     return {
         "service": "gamas-mini-app",
         "ok": True,
-        "database": Path(settings.db_path).exists(),
+        "database": Path(settings.db_path).is_file(),
+    }
+
+
+def _readiness():
+    """Read-only SQLite and schema probe; never migrates or mutates the DB."""
+    settings = _settings()
+    path = Path(settings.db_path)
+    if not path.is_file():
+        return {"service": "gamas-mini-app", "ok": False, "database": False, "schema": False}
+    try:
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+        try:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("SELECT 1").fetchone()
+            rows = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' "
+                    "AND name IN ('users', 'schema_migrations')"
+                ).fetchall()
+            }
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        logger.warning("mini app readiness database probe failed")
+        return {"service": "gamas-mini-app", "ok": False, "database": False, "schema": False}
+    schema_ok = rows == {"users", "schema_migrations"}
+    return {
+        "service": "gamas-mini-app",
+        "ok": schema_ok,
+        "database": True,
+        "schema": schema_ok,
     }
 
 
@@ -110,5 +144,6 @@ application = create_app(
     bot_token=_token,
     max_age_seconds=_max_age(),
     health=_health,
+    readiness=_readiness,
     static_dir=_static_dir(),
 )

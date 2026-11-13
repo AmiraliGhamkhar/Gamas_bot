@@ -86,9 +86,12 @@ otherwise it restarts the bot within a minute. After fixing a startup error use
 `--force` to bypass the spawn throttle. Never delete `data/gamas.lock` while a
 process is alive and never use `pkill python` on shared hosting.
 
-## 5. Optional: Passenger health endpoint
+## 5. Optional: bot-launcher health endpoint (not Gamas Studio)
 
-You do not need Passenger to run the bot. If you want an uptime monitor, create a
+This optional root-level `passenger_wsgi.py` exposes the bot watchdog status; it
+is not the Studio's `scripts/mini_app_wsgi.py` app. Do not point the root-domain
+Gamas Studio application at this file. You do not need Passenger to run the bot.
+If you want an uptime monitor for the bot-launcher endpoint, create a separate
 Python app whose startup file is `passenger_wsgi.py` and entry point
 `application`. `GET /` and `GET /health` answer
 `{"service":"gamas-bot","status":"running"}` (or `starting`/`error`); they never

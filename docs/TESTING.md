@@ -65,11 +65,30 @@ What the extra checks cover:
 ## Focused runs
 
 ```bash
-python -m pytest -q tests/test_mini_app.py tests/test_studio_structured.py
+python -m pytest -q tests/test_mini_app.py tests/test_mini_app_wsgi.py tests/test_mini_app_frontend.py tests/test_studio_structured.py
+node tests/mini_app_frontend_smoke.cjs              # Node built-in VM smoke tests; no npm dependency
 python -m pytest -q tests/test_pdf_visual_qa.py      # rendered PDF/DOCX QA
 python -m pytest -q tests/test_config_consistency.py # docs/env consistency
 python -m pytest -q tests/test_note_provider_compatibility.py
 ```
+
+The frontend smoke harness exercises SDK-unavailable and missing-initData
+states, raw `initData` transport, one-request Home bootstrap, lazy Studio load,
+manual retry, Telegram theme/viewport updates, and BackButton behavior using a
+small fake DOM. Python invokes Node when available and skips that one test when
+Node is absent. It is not a layout engine or a replacement for real Telegram
+WebView testing. The HTML/CSS still require Android, iOS and desktop device QA.
+
+For repeatable local WSGI/SQLite p50/p95 measurements with synthetic data (no
+production `.env` required), run:
+
+```bash
+python scripts/mini_app_bench.py --iterations 500
+```
+
+Record the revision and machine with the output. This bypasses TCP, TLS,
+Apache/Passenger, real DB scale, Telegram SDK and browser rendering; it is only
+for same-environment code comparisons, not a substitute for live measurements.
 
 `tests/test_pdf_visual_qa.py` checks real output: A4 geometry, embedded Vazirmatn
 subset, headings, no replacement glyphs, ink coverage and text collisions.
@@ -107,3 +126,21 @@ Use a test bot and non-sensitive files. This proves more than the suite can:
 
 Automated tests cannot prove provider availability, Persian visual layout on the
 student's device, or host capacity. Check those manually before a release.
+
+### Mini App device/network acceptance (manual)
+
+Record date, app/client versions, device, OS and network for each run. Do not
+mark cases passed unless they were actually exercised:
+
+| Client | Narrow viewport | Light + dark theme | Slow/intermittent network | Home → Studio → edit/export/back |
+| --- | --- | --- | --- | --- |
+| Android Telegram WebView | Required | Required | Wi-Fi and mobile data | Required |
+| iOS Telegram WebView | Required | Required | Wi-Fi and mobile data | Required |
+| Telegram Desktop | Where available | Required | Controlled slow network if available | Required |
+| Android Chrome control | Required | Required | Optional | SDK-missing explanation |
+| iOS Safari control | Required | Required | Optional | SDK-missing explanation |
+
+For each network run, check HTML, CSS, JS full-body status/bytes and the SDK
+resource separately; capture API request IDs/status/timing. A desktop success does
+not establish mobile reachability, and a HEAD or full-body 200 from one request
+does not rule out intermittent resets.

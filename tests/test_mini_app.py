@@ -445,11 +445,40 @@ class WsgiTests(unittest.TestCase):
         chunks = self.app(environ, start_response)
         return captured, json.loads(b"".join(chunks) or b"{}")
 
-    def test_health_needs_no_credentials(self):
-        for method in ("GET", "HEAD"):
-            status, body = self.request("/health", method=method)
-            self.assertTrue(status["status"].startswith("200"))
-            self.assertTrue(body["ok"])
+    def test_health_needs_no_credentials_and_head_has_no_body(self):
+        status, body = self.request("/health", method="GET")
+        self.assertTrue(status["status"].startswith("200"))
+        self.assertTrue(body["ok"])
+
+        captured = {}
+
+        def start_response(head_status, headers):
+            captured["status"] = head_status
+            captured["headers"] = dict(headers)
+
+        env = {"PATH_INFO": "/health", "REQUEST_METHOD": "HEAD", "wsgi.input": io.BytesIO(b"")}
+        self.assertEqual(b"".join(self.app(env, start_response)), b"")
+        self.assertTrue(captured["status"].startswith("200"))
+        self.assertEqual(captured["headers"]["Content-Length"], str(len(json.dumps({"ok": True}).encode())))
+
+    def test_readiness_can_report_a_database_failure(self):
+        app = create_app(
+            data=self.fake.as_facade(),
+            bot_token=BOT_TOKEN,
+            readiness=lambda: {"service": "gamas-mini-app", "ok": False, "database": False},
+        )
+        captured = {}
+
+        def start_response(status, headers):
+            captured["status"] = status
+            captured["headers"] = dict(headers)
+
+        env = {"PATH_INFO": "/ready", "REQUEST_METHOD": "GET", "wsgi.input": io.BytesIO(b"")}
+        payload = json.loads(b"".join(app(env, start_response)))
+        self.assertTrue(captured["status"].startswith("503"))
+        self.assertFalse(payload["ok"])
+        self.assertIn("X-Request-ID", captured["headers"])
+        self.assertIn("Server-Timing", captured["headers"])
 
     def test_the_leaderboard_refuses_an_anonymous_caller(self):
         status, body = self.request("/api/leaderboard", body={})
@@ -576,6 +605,46 @@ class WsgiTests(unittest.TestCase):
 
 
 class StaticBundleTests(unittest.TestCase):
+    def _static_request(self, method="GET", headers=None):
+        app = create_app(
+            data=FakeData().as_facade(),
+            bot_token=BOT_TOKEN,
+            static_dir=str(Path(__file__).resolve().parent.parent / "mini_app"),
+        )
+        environ = {
+            "PATH_INFO": "/static/app.js",
+            "REQUEST_METHOD": method,
+            "CONTENT_LENGTH": "0",
+            "wsgi.input": io.BytesIO(b""),
+            **(headers or {}),
+        }
+        captured = {}
+
+        def start_response(status, response_headers):
+            captured["status"] = status
+            captured["headers"] = dict(response_headers)
+
+        body = b"".join(app(environ, start_response))
+        return captured, body
+
+    def test_head_reports_asset_length_without_returning_the_asset(self):
+        captured, body = self._static_request("HEAD")
+        asset_size = (Path(__file__).resolve().parent.parent / "mini_app" / "app.js").stat().st_size
+        self.assertTrue(captured["status"].startswith("200"))
+        self.assertEqual(body, b"")
+        self.assertEqual(captured["headers"]["Content-Length"], str(asset_size))
+        self.assertEqual(captured["headers"]["Content-Type"], "application/javascript; charset=utf-8")
+
+    def test_etag_revalidation_returns_a_bodyless_304(self):
+        first, body = self._static_request()
+        self.assertTrue(first["status"].startswith("200"))
+        self.assertEqual(int(first["headers"]["Content-Length"]), len(body))
+        second, not_modified = self._static_request(
+            headers={"HTTP_IF_NONE_MATCH": first["headers"]["ETag"]}
+        )
+        self.assertTrue(second["status"].startswith("304"))
+        self.assertEqual(not_modified, b"")
+
     def test_the_bundle_is_served_with_a_hardened_policy(self):
         app = create_app(
             data=FakeData().as_facade(),
@@ -732,6 +801,35 @@ class StoreTests(unittest.IsolatedAsyncioTestCase):
         connection.close()
         self.assertFalse(self.store.save_booklet(1, 1, "x"))
         self.assertFalse(self.store.booklet(1, 1)["editable"])
+
+    def test_home_profile_uses_one_read_connection_and_tolerates_older_schema(self):
+        opened = []
+        connect = self.store._connect
+
+        def counted_connect(*, write=False):
+            opened.append(write)
+            return connect(write=write)
+
+        self.store._connect = counted_connect
+        profile = self.store.profile(1)
+        self.assertEqual(opened, [False])
+        self.assertEqual(profile["first_name"], "یک")
+        self.assertEqual(profile["quiz_points"], 90)
+        self.assertEqual(profile["library_count"], 3)
+        self.assertEqual(profile["submission_count"], 0)
+        self.assertFalse(profile["unlimited"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_path = Path(directory) / "legacy.sqlite"
+            with sqlite3.connect(legacy_path) as connection:
+                connection.execute(
+                    "CREATE TABLE users (telegram_id INTEGER PRIMARY KEY, first_name TEXT, quiz_points INTEGER)"
+                )
+                connection.execute("INSERT INTO users VALUES (1, 'قدیمی', 8)")
+            legacy = MiniAppStore(legacy_path).profile(1)
+        self.assertEqual(legacy["credits"], 0)
+        self.assertFalse(legacy["unlimited"])
+        self.assertEqual(legacy["artifact_count"], 0)
 
     def test_the_facade_listeners_match_the_protocol(self):
         data = MiniAppData(

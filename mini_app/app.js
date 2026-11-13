@@ -24,9 +24,15 @@
 
   const state = {
     initData: "",
+    webApp: null,
+    webAppReady: false,
+    booted: false,
     view: "home",
+    history: [],
     window: "all",
     submissions: [],
+    loaded: { home: false, leaderboard: {}, submissions: false },
+    diagnostics: false,
     speakers: { submissionId: 0, data: null, dirty: false },
     editor: {
       itemId: 0,
@@ -41,8 +47,24 @@
     },
   };
 
+  const inflightReads = new Map();
   const el = (id) => document.getElementById(id);
   const t = (value) => String(value).replace(/\d/g, (d) => "۰۱۲۳۴۵۶۷۸۹"[Number(d)]);
+
+  function diagnostic(message) {
+    if (!state.diagnostics) return;
+    const list = el("diagnostics-list");
+    if (!list) return;
+    list.append(h("li", { text: message }));
+  }
+
+  function updateInitAlert(title, message, visible) {
+    const alert = el("init-alert");
+    if (!alert) return;
+    el("init-title").textContent = title;
+    el("init-message").textContent = message;
+    alert.hidden = !visible;
+  }
 
   const STATUS_LABELS = {
     pending: ["در صف", "wait"],
@@ -73,30 +95,148 @@
     }, 3200);
   }
 
-  async function call(url, body, method) {
-    const response = await fetch(url, {
-      method: method || "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(Object.assign({ initData: state.initData }, body || {})),
-      credentials: "omit",
-      cache: "no-store",
+  async function call(url, body, method, options) {
+    const settings = options || {};
+    const requestMethod = method || "POST";
+    const requestBody = Object.assign({ initData: state.initData }, body || {});
+    const readKey = url + "|" + JSON.stringify(body || {});
+    if (settings.readOnly && inflightReads.has(readKey)) {
+      return inflightReads.get(readKey);
+    }
+
+    const task = (async () => {
+      const controller = typeof AbortController === "function" ? new AbortController() : null;
+      const started = window.performance && window.performance.now ? window.performance.now() : Date.now();
+      let timedOut = false;
+      let timer;
+      const timeout = new Promise((resolve, reject) => {
+        timer = window.setTimeout(() => {
+          timedOut = true;
+          if (controller) controller.abort();
+          reject(new Error("request timed out"));
+        }, settings.timeout || 15000);
+      });
+      try {
+        const operation = (async () => {
+          const response = await fetch(url, {
+            method: requestMethod,
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody),
+            credentials: "omit",
+            cache: "no-store",
+            signal: controller ? controller.signal : undefined,
+          });
+          const requestId = response.headers.get("X-Request-ID") || "";
+          diagnostic(
+            "API " + url + " → " + response.status + " · " +
+              Math.round((window.performance && window.performance.now ? window.performance.now() : Date.now()) - started) + "ms" +
+              (requestId ? " · " + requestId : "")
+          );
+          const payload = await response.json();
+          if (!response.ok) {
+            const message = response.status === 401
+              ? "نشست تلگرام منقضی شده؛ برنامه را دوباره باز کنید."
+              : (payload && payload.error) || "خطای سرور";
+            const failure = new Error(message);
+            failure.status = response.status;
+            failure.requestId = requestId;
+            throw failure;
+          }
+          return payload || {};
+        })();
+        return await Promise.race([operation, timeout]);
+      } catch (error) {
+        if (error && error.status) throw error;
+        const failure = new Error(
+          timedOut
+            ? "پاسخی از سرور دریافت نشد. اتصال را بررسی کنید و دوباره تلاش کنید."
+            : "ارتباط با سرور برقرار نشد. اینترنت خود را بررسی کنید و دوباره تلاش کنید."
+        );
+        failure.network = true;
+        failure.timeout = timedOut;
+        throw failure;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    })();
+
+    if (settings.readOnly) {
+      inflightReads.set(readKey, task);
+      task.then(
+        () => inflightReads.delete(readKey),
+        () => inflightReads.delete(readKey)
+      );
+    }
+    return task;
+  }
+
+  async function callBinary(url, body, timeoutMs) {
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
+    let timedOut = false;
+    const started = window.performance && window.performance.now ? window.performance.now() : Date.now();
+    let timer;
+    const timeout = new Promise((resolve, reject) => {
+      timer = window.setTimeout(() => {
+        timedOut = true;
+        if (controller) controller.abort();
+        reject(new Error("file request timed out"));
+      }, timeoutMs || 60000);
     });
-    let payload = null;
     try {
-      payload = await response.json();
+      const operation = (async () => {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(Object.assign({ initData: state.initData }, body || {})),
+          credentials: "omit",
+          cache: "no-store",
+          signal: controller ? controller.signal : undefined,
+        });
+        const requestId = response.headers.get("X-Request-ID") || "";
+        diagnostic(
+          "API " + url + " → " + response.status + " · " +
+            Math.round((window.performance && window.performance.now ? window.performance.now() : Date.now()) - started) + "ms" +
+            (requestId ? " · " + requestId : "")
+        );
+        if (!response.ok) {
+          let payload = null;
+          try { payload = await response.json(); } catch (error) { payload = null; }
+          const failure = new Error(
+            response.status === 401
+              ? "نشست تلگرام منقضی شده؛ برنامه را دوباره باز کنید."
+              : (payload && payload.error) || "ساخت فایل ناموفق بود."
+          );
+          failure.status = response.status;
+          failure.requestId = requestId;
+          throw failure;
+        }
+        return await response.blob();
+      })();
+      return await Promise.race([operation, timeout]);
     } catch (error) {
-      payload = null;
-    }
-    if (!response.ok) {
-      const message =
-        response.status === 401
-          ? "نشست تلگرام منقضی شده؛ برنامه را دوباره باز کنید."
-          : (payload && payload.error) || "خطای سرور";
-      const failure = new Error(message);
-      failure.status = response.status;
+      if (error && error.status) throw error;
+      const failure = new Error(
+        timedOut
+          ? "پاسخی برای دریافت فایل نرسید؛ دوباره تلاش کنید."
+          : "ارتباط برای دریافت فایل برقرار نشد؛ اینترنت را بررسی کنید."
+      );
+      failure.timeout = timedOut;
       throw failure;
+    } finally {
+      window.clearTimeout(timer);
     }
-    return payload || {};
+  }
+
+  function setLoadState(prefix, message, error) {
+    const box = el(prefix + "-state");
+    if (!box) return;
+    el(prefix + "-state-message").textContent = message;
+    const retry = el(prefix + "-retry");
+    if (retry) retry.hidden = !error;
+    box.classList.toggle("has-error", Boolean(error));
+    box.hidden = !message;
+    const view = el("view-" + prefix);
+    if (view) view.setAttribute("aria-busy", message && !error ? "true" : "false");
   }
 
   function faDate(iso) {
@@ -155,7 +295,19 @@
     return h("span", { class: "chip chip-" + pair[1], text: pair[0] });
   }
 
-  function show(view) {
+  function syncBackButton() {
+    const backButton = state.webApp && state.webApp.BackButton;
+    if (!backButton) return;
+    try {
+      if (state.view === "home" || !state.history.length) backButton.hide();
+      else backButton.show();
+    } catch (error) {
+      diagnostic("Telegram BackButton unavailable");
+    }
+  }
+
+  function show(view, remember) {
+    if (view !== state.view && remember !== false) state.history.push(state.view);
     state.view = view;
     ["home", "leaderboard", "studio", "speakers", "editor"].forEach((name) => {
       const node = el("view-" + name);
@@ -168,7 +320,51 @@
       tab.classList.toggle("is-active", active);
       tab.setAttribute("aria-selected", active ? "true" : "false");
     });
-    window.scrollTo({ top: 0 });
+    syncBackButton();
+    window.scrollTo({ top: 0, behavior: "auto" });
+  }
+
+  function applyTelegramTheme() {
+    const webApp = state.webApp;
+    const root = document.documentElement;
+    const scheme = webApp && webApp.colorScheme;
+    root.dataset.theme = scheme === "dark" ? "dark" : "light";
+    const theme = webApp && webApp.themeParams;
+    const themeVariables = {
+      bg_color: "--tg-theme-bg-color",
+      secondary_bg_color: "--tg-theme-secondary-bg-color",
+      text_color: "--tg-theme-text-color",
+      hint_color: "--tg-theme-hint-color",
+      button_color: "--tg-theme-button-color",
+      button_text_color: "--tg-theme-button-text-color",
+      link_color: "--tg-theme-link-color",
+      destructive_text_color: "--tg-theme-destructive-text-color",
+    };
+    if (theme) {
+      Object.keys(themeVariables).forEach((name) => {
+        const value = theme[name];
+        if (typeof value === "string" && /^#[0-9a-fA-F]{3,8}$/.test(value)) {
+          root.style.setProperty(themeVariables[name], value);
+        }
+      });
+    }
+    applyTelegramViewport();
+  }
+
+  function applyTelegramViewport() {
+    const webApp = state.webApp;
+    const stable = Number(webApp && webApp.viewportStableHeight) || 0;
+    const current = Number(webApp && webApp.viewportHeight) || 0;
+    if (current > 0) {
+      document.documentElement.style.setProperty("--tg-viewport-height", current + "px");
+    }
+    if (stable > 0) {
+      document.documentElement.style.setProperty("--tg-viewport-stable-height", stable + "px");
+    }
+    diagnostic(
+      "Viewport updated · current " + Math.round(current || window.innerHeight || 0) +
+        "px / stable " + Math.round(stable || current || window.innerHeight || 0) + "px"
+    );
   }
 
   function confirmDiscard() {
@@ -405,13 +601,26 @@
 
   async function openSpeakers(submissionId) {
     state.speakers = { submissionId: Number(submissionId), data: null, dirty: false };
+    el("speaker-list").replaceChildren();
+    el("turns-view").replaceChildren();
+    el("speakers-summary").hidden = true;
+    el("speakers-save").disabled = true;
+    setLoadState("speakers", "در حال دریافت گویندگان و متن گفتار…", false);
     show("speakers");
     try {
-      const data = await call(api.speakers, { submission_id: Number(submissionId) });
+      const data = await call(
+        api.speakers,
+        { submission_id: Number(submissionId) },
+        "POST",
+        { readOnly: true, timeout: 30000 }
+      );
       state.speakers.data = data;
       renderSpeakers();
+      el("speakers-save").disabled = false;
+      setLoadState("speakers", "", false);
     } catch (error) {
-      toast(error.message);
+      setLoadState("speakers", error.message || "دریافت گویندگان ناموفق بود.", true);
+      diagnostic("Speaker request failed" + (error.status ? " · HTTP " + error.status : ""));
     }
   }
 
@@ -450,9 +659,12 @@
       el("speakers-dirty").hidden = true;
       if (saved > 0) {
         toast("نام گوینده‌ها ذخیره شد ✅");
-        const fresh = await call(api.speakers, {
-          submission_id: state.speakers.submissionId,
-        });
+        const fresh = await call(
+          api.speakers,
+          { submission_id: state.speakers.submissionId },
+          "POST",
+          { readOnly: true }
+        );
         state.speakers.data = fresh;
         renderSpeakers();
       } else {
@@ -1238,11 +1450,15 @@
     };
     el("editor-dirty").hidden = true;
     el("editor-heading").textContent = "ویرایش جزوه";
-    el("editor-export-pdf").disabled = false;
-    el("editor-export-docx").disabled = false;
+    el("editor-body").replaceChildren();
+    el("revision-list").replaceChildren();
+    el("editor-save").disabled = true;
+    el("editor-export-pdf").disabled = true;
+    el("editor-export-docx").disabled = true;
+    setLoadState("editor", "در حال بارگذاری جزوه…", false);
     show("editor");
     try {
-      const data = await call(api.booklet, { id: Number(itemId) });
+      const data = await call(api.booklet, { id: Number(itemId) }, "POST", { readOnly: true });
       state.editor.structured = !!data.structured;
       state.editor.meta = {
         submission_id: data.submission_id,
@@ -1277,9 +1493,11 @@
       el("editor-export-docx").disabled = !data.editable;
       renderEditor();
       updatePreviewButton();
+      setLoadState("editor", "", false);
       loadRevisions();
     } catch (error) {
-      toast(error.message);
+      setLoadState("editor", error.message || "بارگذاری جزوه ناموفق بود.", true);
+      diagnostic("Booklet request failed" + (error.status ? " · HTTP " + error.status : ""));
     }
   }
 
@@ -1301,17 +1519,24 @@
     try {
       let response;
       if (state.editor.structured) {
-        response = await call(api.booklet, {
-          id: state.editor.itemId,
-          document: assembleDocument(),
-        }, "PUT");
+        response = await call(
+          api.booklet,
+          { id: state.editor.itemId, document: assembleDocument() },
+          "PUT",
+          { timeout: 60000 }
+        );
       } else {
         const text = state.editor.legacyText.trim();
         if (!text) {
           toast("متن خالی را نمی‌توان ذخیره کرد.");
           return;
         }
-        response = await call(api.booklet, { id: state.editor.itemId, text: text }, "PUT");
+        response = await call(
+          api.booklet,
+          { id: state.editor.itemId, text: text },
+          "PUT",
+          { timeout: 30000 }
+        );
       }
       state.editor.dirty = false;
       el("editor-dirty").hidden = true;
@@ -1341,31 +1566,11 @@
     const button = el(format === "pdf" ? "editor-export-pdf" : "editor-export-docx");
     button.disabled = true;
     try {
-      const response = await fetch(api.export, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          initData: state.initData,
-          id: state.editor.itemId,
-          format: format,
-        }),
-        credentials: "omit",
-        cache: "no-store",
-      });
-      if (!response.ok) {
-        let message = "ساخت فایل ناموفق بود.";
-        try {
-          const payload = await response.json();
-          if (payload && payload.error) message = payload.error;
-        } catch (error) {
-          /* binary error path */
-        }
-        if (response.status === 401) {
-          message = "نشست تلگرام منقضی شده؛ برنامه را دوباره باز کنید.";
-        }
-        throw new Error(message);
-      }
-      const blob = await response.blob();
+      const blob = await callBinary(
+        api.export,
+        { id: state.editor.itemId, format: format },
+        60000
+      );
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -1385,15 +1590,11 @@
 
   async function downloadExport(itemId, format) {
     try {
-      const response = await fetch(api.export, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ initData: state.initData, id: Number(itemId), format: format }),
-        credentials: "omit",
-        cache: "no-store",
-      });
-      if (!response.ok) throw new Error("دریافت فایل ناموفق بود.");
-      const blob = await response.blob();
+      const blob = await callBinary(
+        api.export,
+        { id: Number(itemId), format: format },
+        60000
+      );
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
@@ -1452,11 +1653,19 @@
 
   async function loadRevisions() {
     if (!state.editor.itemId) return;
+    setLoadState("revision", "در حال دریافت تاریخچه…", false);
     try {
-      const data = await call(api.revisions, { id: state.editor.itemId, limit: 20 });
+      const data = await call(
+        api.revisions,
+        { id: state.editor.itemId, limit: 20 },
+        "POST",
+        { readOnly: true, timeout: 20000 }
+      );
       renderRevisions(data.items || []);
+      setLoadState("revision", "", false);
     } catch (error) {
-      toast(error.message);
+      setLoadState("revision", error.message || "دریافت تاریخچه ناموفق بود.", true);
+      diagnostic("Revision request failed" + (error.status ? " · HTTP " + error.status : ""));
     }
   }
 
@@ -1470,7 +1679,12 @@
       return;
     }
     try {
-      await call(api.revision, { id: state.editor.itemId, revision_id: revisionId }, "PUT");
+      await call(
+        api.revision,
+        { id: state.editor.itemId, revision_id: revisionId },
+        "PUT",
+        { timeout: 60000 }
+      );
       toast("نسخه بازگردانی شد ✅");
       await openEditor(state.editor.itemId);
     } catch (error) {
@@ -1480,43 +1694,85 @@
 
   /* --------------------------------------------------------------- loading */
 
-  async function loadHome() {
+  async function loadHome(force) {
+    if (state.loaded.home && !force) return;
+    setLoadState("home", "در حال دریافت خلاصهٔ حساب…", false);
     try {
-      renderHome(await call(api.home));
+      renderHome(await call(api.home, null, "POST", { readOnly: true }));
+      state.loaded.home = true;
+      setLoadState("home", "", false);
     } catch (error) {
-      toast(error.message);
+      setLoadState("home", error.message || "دریافت خلاصه ناموفق بود.", true);
+      if (error.status === 401) {
+        updateInitAlert("نشست تلگرام نیاز به تازه‌سازی دارد", error.message, true);
+      }
+      diagnostic("Home request failed" + (error.status ? " · HTTP " + error.status : ""));
     }
   }
 
-  async function loadRank() {
+  async function loadRank(force) {
+    const key = state.window;
+    if (state.loaded.leaderboard[key] && !force) return;
+    setLoadState("rank", "در حال دریافت رنکینگ…", false);
     try {
-      renderRank(await call(api.leaderboard, { limit: 20, window: state.window }));
+      const data = await call(
+        api.leaderboard,
+        { limit: 20, window: key },
+        "POST",
+        { readOnly: true }
+      );
+      renderRank(data);
+      state.loaded.leaderboard[key] = true;
+      setLoadState("rank", "", false);
     } catch (error) {
-      toast(error.message);
+      setLoadState("rank", error.message || "دریافت رنکینگ ناموفق بود.", true);
+      if (error.status === 401) updateInitAlert("نشست تلگرام نیاز به تازه‌سازی دارد", error.message, true);
+      diagnostic("Leaderboard request failed" + (error.status ? " · HTTP " + error.status : ""));
     }
   }
 
-  async function loadSubmissions() {
+  async function loadSubmissions(force) {
+    if (state.loaded.submissions && !force) return;
+    setLoadState("studio", "در حال دریافت فهرست استودیو…", false);
     try {
-      const data = await call(api.submissions, { limit: 50 });
+      const data = await call(api.submissions, { limit: 50 }, "POST", { readOnly: true });
       state.submissions = data.items || [];
       renderSubmissions(state.submissions);
+      state.loaded.submissions = true;
+      setLoadState("studio", "", false);
     } catch (error) {
-      toast(error.message);
+      setLoadState("studio", error.message || "دریافت فهرست ناموفق بود.", true);
+      if (error.status === 401) updateInitAlert("نشست تلگرام نیاز به تازه‌سازی دارد", error.message, true);
+      diagnostic("Studio request failed" + (error.status ? " · HTTP " + error.status : ""));
     }
+  }
+
+  function loadViewData(view, force) {
+    if (view === "home") loadHome(force);
+    else if (view === "leaderboard") loadRank(force);
+    else if (view === "studio") loadSubmissions(force);
   }
 
   function selectView(view) {
     if (!confirmDiscard()) return;
     show(view);
-    if (view === "home") loadHome();
-    else if (view === "leaderboard") loadRank();
-    else if (view === "studio") loadSubmissions();
+    loadViewData(view);
+  }
+
+  function navigateBack() {
+    if (!confirmDiscard()) return;
+    const previous = state.history.pop() || "home";
+    show(previous, false);
+    loadViewData(previous);
   }
 
   /* ------------------------------------------------------------------ boot */
 
   function bind() {
+    const backButton = state.webApp && state.webApp.BackButton;
+    if (backButton && typeof backButton.onClick === "function") {
+      backButton.onClick(navigateBack);
+    }
     document.querySelectorAll(".tab").forEach((tab) => {
       tab.addEventListener("click", () => {
         if (tab.dataset.view !== state.view) selectView(tab.dataset.view);
@@ -1533,7 +1789,11 @@
     });
     el("home-go-leaderboard").addEventListener("click", () => selectView("leaderboard"));
     el("home-go-studio").addEventListener("click", () => selectView("studio"));
-    el("speakers-back").addEventListener("click", () => selectView("studio"));
+    el("home-retry").addEventListener("click", () => loadHome(true));
+    el("rank-retry").addEventListener("click", () => loadRank(true));
+    el("studio-retry").addEventListener("click", () => loadSubmissions(true));
+    el("speakers-back").addEventListener("click", navigateBack);
+    el("speakers-retry").addEventListener("click", () => openSpeakers(state.speakers.submissionId));
     el("speakers-save").addEventListener("click", saveSpeakers);
     el("speaker-list").addEventListener("input", markDirty);
     el("submission-list").addEventListener("click", (event) => {
@@ -1545,11 +1805,17 @@
       else if (role === "preview") openEditor(id, { preview: true });
       else if (role === "speakers") openSpeakers(id);
       else if (role === "exports") {
-        if (button.dataset.pdf) downloadExport(id, "pdf");
-        else if (button.dataset.docx) downloadExport(id, "docx");
+        const format = button.dataset.pdf ? "pdf" : button.dataset.docx ? "docx" : "";
+        if (!format || button.disabled) return;
+        button.disabled = true;
+        downloadExport(id, format).finally(() => { button.disabled = false; });
       }
     });
-    el("editor-back").addEventListener("click", () => selectView("studio"));
+    el("editor-back").addEventListener("click", navigateBack);
+    el("editor-retry").addEventListener("click", () =>
+      openEditor(state.editor.itemId, { preview: state.editor.preview })
+    );
+    el("revision-retry").addEventListener("click", loadRevisions);
     el("editor-save").addEventListener("click", saveEditor);
     el("editor-preview").addEventListener("click", () => {
       state.editor.preview = !state.editor.preview;
@@ -1569,32 +1835,129 @@
     });
   }
 
-  function boot() {
+  function installTelegramEvents() {
+    const webApp = state.webApp;
+    if (webApp && typeof webApp.onEvent === "function") {
+      try {
+        webApp.onEvent("themeChanged", applyTelegramTheme);
+        webApp.onEvent("viewportChanged", applyTelegramViewport);
+      } catch (error) {
+        diagnostic("Optional Telegram events unavailable");
+      }
+    }
+  }
+
+  function retryTelegramInitialization() {
     const webApp = window.Telegram && window.Telegram.WebApp;
     if (webApp) {
-      webApp.ready();
-      webApp.expand();
-      try {
-        webApp.setHeaderColor("secondary_bg_color");
-      } catch (error) {
-        /* older clients lack the method; the theme vars still apply */
-      }
-      state.initData = webApp.initData || "";
+      boot();
+      return;
     }
-    if (!state.initData) {
-      toast("این برنامه را از داخل تلگرام باز کنید.");
+    updateInitAlert("در حال تلاش برای اتصال به تلگرام", "دریافت SDK تلگرام دوباره آغاز شد…", true);
+    const script = el("telegram-sdk");
+    if (!script) return;
+    const base = script.src.split("?")[0];
+    script.src = base + "?retry=" + Date.now();
+    window.setTimeout(() => {
+      if (!state.booted && !(window.Telegram && window.Telegram.WebApp)) {
+        updateInitAlert(
+          "اتصال به تلگرام برقرار نشد",
+          "دسترسی شبکه به telegram.org را بررسی کنید و دوباره تلاش کنید.",
+          true
+        );
+      }
+    }, 10000);
+  }
+
+  function boot() {
+    if (state.booted) return;
+    const webApp = window.Telegram && window.Telegram.WebApp;
+    if (!webApp) {
+      setLoadState("home", "", false);
+      diagnostic("Telegram SDK unavailable");
+      window.setTimeout(() => {
+        if (!state.booted && !(window.Telegram && window.Telegram.WebApp)) {
+          updateInitAlert(
+            "اتصال به تلگرام برقرار نشد",
+            "SDK تلگرام در دسترس نیست. اتصال اینترنت یا دسترسی به telegram.org را بررسی کنید.",
+            true
+          );
+        }
+      }, 2200);
       return;
     }
 
+    state.webApp = webApp;
+    if (!state.webAppReady && typeof webApp.ready === "function") {
+      try {
+        webApp.ready();
+        state.webAppReady = true;
+      } catch (error) {
+        diagnostic("Telegram ready() call failed");
+      }
+    }
+    if (typeof webApp.expand === "function") {
+      try { webApp.expand(); } catch (error) { diagnostic("Telegram expand() unavailable"); }
+    }
+    if (typeof webApp.setHeaderColor === "function") {
+      try { webApp.setHeaderColor("secondary_bg_color"); } catch (error) { /* optional */ }
+    }
+    state.initData = typeof webApp.initData === "string" ? webApp.initData : "";
+    applyTelegramTheme();
+    diagnostic("Telegram SDK available · v" + (webApp.version || "unknown") + " · " + (webApp.platform || "unknown"));
+    diagnostic("Signed initData present · " + (state.initData ? "yes" : "no"));
+    if (!state.initData) {
+      setLoadState("home", "", false);
+      updateInitAlert(
+        "این صفحه از داخل تلگرام باز نشده است",
+        "برای احراز هویت امن، برنامه را از منوی بات گاماس باز کنید؛ ورود در مرورگر عادی پشتیبانی نمی‌شود.",
+        true
+      );
+      return;
+    }
+
+    state.booted = true;
+    updateInitAlert("", "", false);
     bind();
+    installTelegramEvents();
+    syncBackButton();
+    diagnostic("DOM ready · Home bootstrap started");
     loadHome();
-    loadRank();
-    loadSubmissions();
+  }
+
+  function initialize() {
+    const params = new URLSearchParams(window.location.search || "");
+    state.diagnostics = params.get("diagnostics") === "1";
+    if (state.diagnostics) el("diagnostics").hidden = false;
+    el("init-retry").addEventListener("click", retryTelegramInitialization);
+    const sdk = el("telegram-sdk");
+    if (sdk) {
+      sdk.addEventListener("load", () => {
+        diagnostic("Telegram SDK script loaded");
+        boot();
+      });
+      sdk.addEventListener("error", () => {
+        diagnostic("Telegram SDK script failed");
+        updateInitAlert(
+          "اتصال به تلگرام برقرار نشد",
+          "فایل SDK از telegram.org بارگیری نشد. اتصال شبکه را بررسی کرده و تلاش دوباره را بزنید.",
+          true
+        );
+      });
+    }
+    window.addEventListener("error", (event) => {
+      diagnostic("JavaScript exception" + (event && event.lineno ? " · line " + event.lineno : ""));
+    });
+    window.addEventListener("unhandledrejection", () => {
+      diagnostic("Unhandled JavaScript promise rejection");
+    });
+    diagnostic("DOM ready");
+    boot();
   }
 
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", boot);
+    document.addEventListener("DOMContentLoaded", initialize);
   } else {
-    boot();
+    initialize();
   }
 })();
