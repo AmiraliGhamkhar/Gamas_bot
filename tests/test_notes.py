@@ -7,7 +7,6 @@ import math
 import unittest
 from unittest import mock
 
-from gamas_bot.llm import LLMContextOverflowError, LLMError
 from gamas_bot.notes import (
     COMPILE_HARD_MAX_CHARS,
     MODE_RULES,
@@ -609,13 +608,14 @@ class ContextOverflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any("نیمهٔ نخست" in heading for heading in headings))
         self.assertTrue(any("نیمهٔ دوم" in heading for heading in headings))
 
-    async def test_an_unchanged_oversized_request_is_never_retried_forever(self):
+    async def test_an_unchanged_oversized_request_recovers_with_bounded_source_fallback(self):
         settings = make_settings(note_chunk_chars=100_000)
         session = FakeSession([context_overflow_response() for _ in range(64)])
-        with self.assertRaises(LLMContextOverflowError):
-            await structure_transcript(self.document(), settings, session)
-        # Every context split is bounded; failed structured JSON isn't retried
-        # with an identical full prompt before splitting or failing over.
+        notes = await structure_transcript(self.document(), settings, session)
+        # Every context split is bounded; the exhausted provider chain yields a
+        # renderer-safe source-preserving booklet rather than an unsafe retry.
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertTrue(notes.sections)
         self.assertGreater(len(session.calls), 1)
         self.assertLessEqual(len(session.calls), 1 + 2 ** 1 + 2 ** MAX_CONTEXT_SPLITS)
 
@@ -1011,15 +1011,15 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         # Map calls only: the compile request was never built.
         self.assertEqual(len(session.calls), len(chunks))
 
-    async def test_provider_failure_propagates(self):
-        """A failed chunk fails the step; the caller delivers the raw text."""
+    async def test_provider_failure_uses_source_preserving_fallback(self):
         settings = make_settings(note_chunk_chars=100000)
         session = FakeSession([])
         session.post = lambda *a, **k: _AsyncCM(_FakeResponse(500, {}))
         with mock.patch("gamas_bot.llm.MAX_TRANSIENT_RETRIES", 0), \
              mock.patch("asyncio.sleep", new=lambda *_a, **_k: _noop()):
-            with self.assertRaises(LLMError):
-                await structure_transcript("متن کوتاه.", settings, session)
+            notes = await structure_transcript("متن کوتاه.", settings, session)
+        self.assertEqual(notes.quality_state, "RECOVERED")
+        self.assertIn("متن کوتاه", notes.sections[0].paragraphs[0])
 
 
 async def _noop():
@@ -1526,8 +1526,8 @@ class StrictPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.calls), 1)
         self.assertEqual(len(notes.sections), 1)
 
-    async def test_warn_mode_changes_nothing_but_still_audits(self):
-        """``warn`` is observation: not even a provably false table is dropped."""
+    async def test_warn_mode_suppresses_llm_repair_but_never_delivers_known_bad_content(self):
+        """Observation mode does not override the strict delivery safety rule."""
         answer = {
             "title": "جزوه",
             "sections": [
@@ -1549,12 +1549,12 @@ class StrictPipelineTests(unittest.IsolatedAsyncioTestCase):
         }
         settings = make_settings(note_strict_grounding=True, note_quality_gate="warn")
         session = FakeSession([json.dumps(answer, ensure_ascii=False)])
-        with self.assertLogs("gamas_bot.notes", level="INFO") as logs:
+        with self.assertLogs("gamas_bot.notes", level="INFO"):
             notes = await structure_transcript(self.SOURCE, settings, session)
         self.assertEqual(len(session.calls), 1)
-        self.assertEqual(len(notes.practical_tips), 1)
-        self.assertEqual(len(notes.sections[0].all_tables), 1)
-        self.assertTrue(any("gate=warn" in line for line in logs.output))
+        self.assertEqual(len(notes.practical_tips), 0)
+        self.assertEqual(len(notes.sections[0].all_tables), 0)
+        self.assertNotIn("1000", json.dumps(notes.to_payload(), ensure_ascii=False))
 
     async def test_a_fabricated_number_is_scrubbed_when_repair_keeps_it(self):
         fabricated = {

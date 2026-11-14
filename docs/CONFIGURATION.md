@@ -64,6 +64,7 @@ failure. Their keys are never lent to an approved provider.
 | `GEMINI_RPM_LIMIT` / `GEMINI_TPM_LIMIT` / `GEMINI_RPD_LIMIT` / `GEMINI_MAX_IN_FLIGHT` | 0 / 0 / 0 / 1 |
 | `NOTE_STRUCTURED_OUTPUT` / `NOTE_STRICT_GROUNDING` / `NOTE_QUALITY_GATE` | 1 / true / repair |
 | `NOTE_DATA_SENSITIVITY` | auto |
+| `NOTE_MAX_REPAIR_ATTEMPTS` / `NOTE_ENABLE_DETERMINISTIC_FALLBACK` | 2 / true |
 | `NOTE_COMPILE` / `NOTE_PROGRESSIVE_BOOKLET` | false / false |
 | `NOTE_HEDGE_AFTER_SECONDS` | 0 (legacy knob; dispatch never hedges even if nonzero) |
 
@@ -74,7 +75,12 @@ primary/fallback-role caps. `LLM_TOKEN_ESTIMATION_CHARS_PER_TOKEN=1.5` controls
 conservative input estimation; the full requested output budget is reserved
 as well. Do not inflate operating budgets to match reference model windows.
 Compilation is optional and off by default; bounded map/merge, split/repair and
-grounding checks are retained.
+grounding checks are retained. `NOTE_MAX_REPAIR_ATTEMPTS` caps the ordered
+claim-faithfulness, coverage, and structural repair passes (they stop early).
+When `NOTE_ENABLE_DETERMINISTIC_FALLBACK=true`, an exhausted eligible provider
+chain yields a local source-preserving booklet rather than discarding successful
+chunks. `NOTE_COMPLETENESS_FILL` remains strictly source-grounded and may run
+while `NOTE_STRICT_GROUNDING=true`.
 
 ## Sensitivity and validation
 

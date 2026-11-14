@@ -10,14 +10,14 @@ lines) with one module and a fixed call budget:
   notes into a coherent booklet. A booklet too large for one request is
   compiled in groups of whole sections (bounded levels); if the pass fails, the
   deterministic merge is delivered instead;
-* **at most two bounded repair attempts**, only when the evidence gate asks
-  for it (see ``NOTE_QUALITY_GATE``); an oversized repair request carries
-  only the sections that hold the lost facts, and the complete booklet is
-  re-audited after each attempt; a booklet that still asserts an unsupported
-  fact is rejected rather than delivered (see :func:`acceptance_failure`);
-* **no QA-driven re-asks and no truncation re-sends.** A bad answer degrades to
-  the raw transcript — which the user already holds, because the transcript is
-  delivered before note generation starts.
+* **bounded command-driven repair**, ordered by critical faithfulness,
+  coverage, and structural cleanup (the conservative default is two calls;
+  ``NOTE_MAX_REPAIR_ATTEMPTS`` may permit the third structural pass). Oversized
+  requests carry only affected sections and source evidence; an unsupported
+  span that cannot be repaired is deterministically removed and re-audited;
+* **isolated map outcomes and deterministic recovery.** A failed provider or
+  malformed chunk never discards successful chunks; an exhausted chain yields
+  a source-preserving ``StructuredNotes`` fallback whenever source exists.
 
 The note dataclasses, the Persian prompts and the conservative deterministic
 merge are ported from v2 nearly verbatim: they encode the content-preservation
@@ -32,6 +32,7 @@ import json
 import logging
 import math
 import re
+import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, replace
 
@@ -165,11 +166,77 @@ MAX_REPAIR_SECTIONS = 6
 MAX_REPAIR_SIGNALS = 40
 #: Source characters of context handed to the repair pass per missing signal.
 REPAIR_WINDOW_CHARS = 160
-#: Bounded repair attempts for one booklet. The second attempt exists because the
-#: first can remove an invented value yet still leave a missing one; a third
-#: would re-send near-identical material for a diminishing chance of improvement
-#: at the full provider cost.
-MAX_NOTE_REPAIR_ATTEMPTS = 2
+#: Absolute hard cap for ordered repair passes. Deployments retain the
+#: conservative two-call default through ``NOTE_MAX_REPAIR_ATTEMPTS``; the third
+#: slot is available only for the structural cleanup pass when explicitly
+#: enabled, and no loop may exceed this ceiling.
+MAX_NOTE_REPAIR_ATTEMPTS = 3
+
+# Normalized, command-driven repair codes. They deliberately describe an
+# operation rather than a generic "repair the booklet" request, which makes a
+# bounded edit auditable and lets the repair prompt carry only the affected
+# sections and source windows.
+REPAIR_UNSUPPORTED_CLAIM = "REPAIR_UNSUPPORTED_CLAIM"
+REPAIR_MISSING_NUMBER = "REPAIR_MISSING_NUMBER"
+REPAIR_MISSING_TERM = "REPAIR_MISSING_TERM"
+REPAIR_MISSING_CONTENT = "REPAIR_MISSING_CONTENT"
+REPAIR_WRONG_NUMBER = "REPAIR_WRONG_NUMBER"
+REPAIR_WRONG_TERM = "REPAIR_WRONG_TERM"
+REPAIR_STRUCTURE = "REPAIR_STRUCTURE"
+REPAIR_DUPLICATE = "REPAIR_DUPLICATE"
+REPAIR_TABLE = "REPAIR_TABLE"
+REPAIR_LOCATOR = "REPAIR_LOCATOR"
+REPAIR_COVERAGE = "REPAIR_COVERAGE"
+REPAIR_FORMAT = "REPAIR_FORMAT"
+
+REPAIR_CRITICAL_CODES = frozenset(
+    {REPAIR_UNSUPPORTED_CLAIM, REPAIR_WRONG_NUMBER, REPAIR_WRONG_TERM}
+)
+REPAIR_COVERAGE_CODES = frozenset(
+    {REPAIR_MISSING_NUMBER, REPAIR_MISSING_TERM, REPAIR_MISSING_CONTENT, REPAIR_COVERAGE}
+)
+REPAIR_STRUCTURAL_CODES = frozenset(
+    {REPAIR_STRUCTURE, REPAIR_DUPLICATE, REPAIR_TABLE, REPAIR_LOCATOR, REPAIR_FORMAT}
+)
+
+QUALITY_VERIFIED = "VERIFIED"
+QUALITY_REPAIRED = "REPAIRED"
+QUALITY_DEGRADED = "DEGRADED"
+QUALITY_RECOVERED = "RECOVERED"
+QUALITY_FAILED = "FAILED"
+
+
+@dataclass(frozen=True, slots=True)
+class RepairIssue:
+    """One source-grounded, minimal edit command for a booklet artifact.
+
+    Values are carried to the repair provider but never logged verbatim. The
+    metadata is a normalized tuple so instances remain immutable and safe to
+    pass through the bounded repair pipeline.
+    """
+
+    code: str
+    severity: str
+    section_id: str = ""
+    field: str = ""
+    current_text: str = ""
+    source_evidence: str = ""
+    action: str = ""
+    source_signal_metadata: tuple[tuple[str, str], ...] = ()
+
+    def to_payload(self) -> dict[str, object]:
+        payload: dict[str, object] = {
+            "code": self.code,
+            "severity": self.severity,
+            "section_id": self.section_id,
+            "field": self.field,
+            "current_text": self.current_text,
+            "source_evidence": self.source_evidence,
+            "action": self.action,
+        }
+        if self.source_signal_metadata:
+            payload["source_signal_metadata"] = dict(self.source_signal_metadata)
+        return payload
 
 
 class StructuringError(RuntimeError):
@@ -593,6 +660,9 @@ class StructuredNotes:
     #: Timestamped chapter markers derived from paragraph timings, e.g.
     #: «[۰۲:۳۰] مقدمهٔ درس». Purely source-derived, never generated.
     timeline: tuple[str, ...] = ()
+    #: Internal outcome only. It intentionally is not serialized into the
+    #: established StructuredNotes JSON contract or renderer input.
+    quality_state: str = QUALITY_VERIFIED
 
     @property
     def display_title(self) -> str:
@@ -1772,6 +1842,7 @@ async def fill_coverage_gaps(
                     schema=_response_schema(settings),
                     task="BOOKLET_REPAIR",
                     data_sensitivity=data_sensitivity,
+                    sampling_temperature=0.0,
                 )
         else:
             payload = await complete_json(
@@ -1781,6 +1852,7 @@ async def fill_coverage_gaps(
                 schema=_response_schema(settings),
                 task="BOOKLET_REPAIR",
                 data_sensitivity=data_sensitivity,
+                sampling_temperature=0.0,
             )
         filled = _load_json_payload(payload)
     except Exception as exc:  # noqa: BLE001 - preserve the audited draft
@@ -1792,15 +1864,17 @@ async def fill_coverage_gaps(
         filled, filled_report = gate_notes(
             filled, source, strict=True, mode=settings.note_mode
         )
-        if filled_report.audit.fabricated:
-            filled, _ = scrub_fabricated_numbers(filled, filled_report.audit)
+        if acceptance_failure(filled_report) is not None:
+            filled, _ = scrub_unsupported_content(filled, filled_report)
             filled, filled_report = gate_notes(
                 filled, source, strict=True, mode=settings.note_mode
             )
-        if not filled.has_content or filled_report.audit.fabricated:
+        if not filled.has_content or acceptance_failure(filled_report) is not None:
             logger.warning("coverage fill rejected by grounding gate")
             return notes
     merged = merge_structured_notes([notes, filled])
+    if merged.quality_state == QUALITY_VERIFIED:
+        merged = replace(merged, quality_state=QUALITY_REPAIRED)
     logger.info("note completeness after fill: %s", assess_completeness(source, merged).summary())
     return merged
 
@@ -2045,6 +2119,7 @@ def gate_notes(
     source_index = build_source_index(source)
     source_words = source_index.masked_words
     tables_seen = tables_accepted = tips_seen = tips_accepted = 0
+    locators_rejected = 0
     dropped_cells: list[str] = []
     sections: list[NoteSection] = []
     for section in notes.sections:
@@ -2065,10 +2140,16 @@ def gate_notes(
             else:
                 tables_accepted += 1
             accepted_tables.append(table)
+        locators = tuple(
+            locator for locator in section.source_locators
+            if normalize_for_compare(locator) in source_index.compare_source
+        )
+        locators_rejected += len(section.source_locators) - len(locators)
         cleaned_section = replace(
             section,
             table=accepted_tables[0] if accepted_tables else None,
             tables=tuple(accepted_tables[1:]),
+            source_locators=locators if strict else section.source_locators,
         )
         if cleaned_section.has_content:
             sections.append(cleaned_section)
@@ -2123,6 +2204,7 @@ def gate_notes(
         tips_rejected=tips_seen - tips_accepted,
         objectives_dropped=len(notes.learning_objectives) - len(objectives),
         review_questions_dropped=len(notes.review_questions) - len(review_questions),
+        locators_rejected=locators_rejected,
         dropped_cells=tuple(dict.fromkeys(dropped_cells)),
         # The signal audit only sees numbers, dates, Latin terms and URLs; this
         # is what an invented Persian-only sentence has to pass as well.
@@ -2230,6 +2312,192 @@ def enforce_final_acceptance(
     )
 
 
+def _iter_section_text_fields(section: NoteSection, section_index: int):
+    """Yield displayable section fields with stable paths for issue reports."""
+    yield section_index, f"sections[{section_index}].heading", section.heading
+    for field_name in (
+        "paragraphs", "bullets", "examples", "steps", "formulas", "key_points",
+        "source_locators",
+    ):
+        for item_index, value in enumerate(getattr(section, field_name)):
+            yield section_index, f"sections[{section_index}].{field_name}[{item_index}]", value
+    for item_index, definition in enumerate(section.definitions):
+        yield section_index, f"sections[{section_index}].definitions[{item_index}].term", definition.term
+        yield section_index, f"sections[{section_index}].definitions[{item_index}].definition", definition.definition
+    for table_index, table in enumerate(section.all_tables):
+        for header_index, value in enumerate(table.headers):
+            yield section_index, f"sections[{section_index}].tables[{table_index}].headers[{header_index}]", value
+        for row_index, row in enumerate(table.rows):
+            for cell_index, value in enumerate(row):
+                yield section_index, f"sections[{section_index}].tables[{table_index}].rows[{row_index}][{cell_index}]", value
+    for item_index, callout in enumerate(section.callouts):
+        yield section_index, f"sections[{section_index}].callouts[{item_index}].text", callout.text
+
+
+def _signal_matches(candidate: object, expected: object) -> bool:
+    return (
+        getattr(candidate, "kind", "") == getattr(expected, "kind", "")
+        and getattr(candidate, "value", "") == getattr(expected, "value", "")
+        and (
+            not getattr(candidate, "unit", "")
+            or not getattr(expected, "unit", "")
+            or getattr(candidate, "unit", "") == getattr(expected, "unit", "")
+        )
+    )
+
+
+def _signal_occurrence(notes: StructuredNotes, signal: object) -> tuple[int, str, str]:
+    """Locate the first artifact field that asserts *signal*, if any."""
+    for section_index, field, text in (
+        item
+        for index, section in enumerate(notes.sections)
+        for item in _iter_section_text_fields(section, index)
+    ):
+        if any(_signal_matches(found, signal) for found in extract_signals(text, mask=False)):
+            return section_index, field, text[:1_000]
+    return -1, "", ""
+
+
+def _section_for_evidence(notes: StructuredNotes, evidence: str) -> int:
+    """Choose the least-surprising section for a source-only addition."""
+    words = content_words(evidence)
+    if not words or not notes.sections:
+        return -1
+    scores = [len(words & content_words(section_plain_text(section))) for section in notes.sections]
+    best = max(scores, default=0)
+    return scores.index(best) if best else -1
+
+
+def build_repair_issues(
+    notes: StructuredNotes,
+    report: NoteQualityReport,
+    source: str,
+    *,
+    limit: int = MAX_REPAIR_SIGNALS,
+) -> tuple[RepairIssue, ...]:
+    """Normalize evidence findings into minimal, issue-specific repair commands.
+
+    The returned data intentionally includes the offending span and its source
+    window. It is used for provider input only; logs report codes and counts,
+    never source or artifact text.
+    """
+    issues: list[RepairIssue] = []
+    audit = report.audit
+    evidence_by_signal = {
+        (signal.kind, signal.value, signal.unit): window
+        for signal, window in evidence_windows(
+            source, [*audit.missing, *audit.fabricated], radius=REPAIR_WINDOW_CHARS
+        )
+    }
+    for signal in audit.fabricated:
+        section_index, field, current = _signal_occurrence(notes, signal)
+        code = REPAIR_WRONG_NUMBER if signal.kind == "number" else REPAIR_WRONG_TERM
+        issues.append(
+            RepairIssue(
+                code=code,
+                severity="critical",
+                section_id=f"s{section_index + 1}" if section_index >= 0 else "",
+                field=field,
+                current_text=current or signal.label,
+                source_evidence=evidence_by_signal.get((signal.kind, signal.value, signal.unit), ""),
+                action="REMOVE_OR_REWRITE_FROM_SOURCE",
+                source_signal_metadata=(
+                    ("kind", signal.kind), ("label", signal.label),
+                    ("value", signal.value), ("unit", signal.unit),
+                ),
+            )
+        )
+    for claim in report.unsupported_claims:
+        source_evidence = source[claim.span[0]:claim.span[1]].strip() if claim.span[1] else ""
+        issues.append(
+            RepairIssue(
+                code=REPAIR_UNSUPPORTED_CLAIM,
+                severity="critical",
+                section_id=f"s{claim.section_index + 1}" if claim.section_index >= 0 else "",
+                field=claim.field,
+                current_text=claim.claim[:1_000],
+                source_evidence=source_evidence[:1_000],
+                action="REMOVE_OR_REWRITE_FROM_SOURCE",
+                source_signal_metadata=(("shared_ratio", f"{claim.shared_ratio:.3f}"),),
+            )
+        )
+    for signal in audit.missing:
+        code = REPAIR_MISSING_NUMBER if signal.kind == "number" else REPAIR_MISSING_TERM
+        evidence = evidence_by_signal.get((signal.kind, signal.value, signal.unit), "")
+        section_index = _section_for_evidence(notes, evidence)
+        issues.append(
+            RepairIssue(
+                code=code,
+                severity="high",
+                section_id=f"s{section_index + 1}" if section_index >= 0 else "",
+                field="",
+                current_text="",
+                source_evidence=evidence,
+                action="ADD_FROM_SOURCE",
+                source_signal_metadata=(
+                    ("kind", signal.kind), ("label", signal.label),
+                    ("value", signal.value), ("unit", signal.unit),
+                ),
+            )
+        )
+    # Signal coverage has priority. Sentence gaps are supplemental and are
+    # capped so repair never becomes an unbounded source resend.
+    if report.coverage.ratio < 0.75:
+        for gap in find_coverage_gaps(source, notes, max_gaps=3):
+            section_index = _section_for_evidence(notes, gap)
+            issues.append(
+                RepairIssue(
+                    code=REPAIR_MISSING_CONTENT,
+                    severity="medium",
+                    section_id=f"s{section_index + 1}" if section_index >= 0 else "",
+                    field="",
+                    source_evidence=gap[:COVERAGE_GAP_CHARS],
+                    action="ADD_FROM_SOURCE",
+                )
+            )
+    if report.tables_rejected:
+        issues.append(
+            RepairIssue(
+                code=REPAIR_TABLE,
+                severity="medium",
+                current_text="; ".join(report.dropped_cells[:4]),
+                action="KEEP_REMOVED_UNLESS_SOURCE_SUPPORTS_A_VALID_TABLE",
+            )
+        )
+    if report.locators_rejected:
+        issues.append(
+            RepairIssue(
+                code=REPAIR_LOCATOR,
+                severity="low",
+                action="REMOVE_UNSUPPORTED_LOCATORS",
+                source_signal_metadata=(("rejected", str(report.locators_rejected)),),
+            )
+        )
+    # Preserve priority order while collapsing duplicate commands for the same
+    # field/signal. A single command may carry several equivalent detector
+    # observations but should never cause duplicate provider edits.
+    unique: list[RepairIssue] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for issue in issues:
+        key = (issue.code, issue.section_id, issue.field, issue.current_text)
+        if key not in seen:
+            seen.add(key)
+            unique.append(issue)
+        if len(unique) >= max(1, limit):
+            break
+    return tuple(unique)
+
+
+def _repair_issues_for_pass(issues: Sequence[RepairIssue], pass_name: str) -> tuple[RepairIssue, ...]:
+    if pass_name == "claim_repair":
+        allowed = REPAIR_CRITICAL_CODES
+    elif pass_name == "coverage_repair":
+        allowed = REPAIR_COVERAGE_CODES
+    else:
+        allowed = REPAIR_STRUCTURAL_CODES
+    return tuple(issue for issue in issues if issue.code in allowed)
+
+
 def repair_target_indexes(
     notes: StructuredNotes,
     report: NoteQualityReport,
@@ -2286,169 +2554,195 @@ def build_repair_document(
     *,
     mode: str = "full",
     sections: Sequence[NoteSection] | None = None,
+    issues: Sequence[RepairIssue] | None = None,
+    pass_name: str = "claim_repair",
 ) -> str:
-    """The one repair request: the notes, what was lost, and where it came from.
+    """Build a bounded, command-driven edit request, never a generic rewrite.
 
-    Only the *missing* facts and the source windows around them are added to
-    the request — never the whole transcript — so restoring them is copying a
-    sentence the model can see, not recalling one it cannot.
-
-    ``sections`` restricts the request to a bounded subset of the booklet (used
-    when the whole booklet does not fit the repair budget). The answer then
-    carries only those sections and is merged back by heading.
-
-    Unlike the compile request this one does not carry the whole source: only
-    the lost units and the source sentence under each of them travel here, so
-    the request stays inside the repair budget however long the lecture is.
-    The draft is last, immediately before the model's own output.
+    The provider receives only the affected section JSON, normalized issue
+    records, and the sentence/window that supports each requested change. Valid
+    sections and valid spans are explicitly immutable. When no correct source
+    replacement is visible, the command requires removal rather than a guess.
     """
+    selected_issues = tuple(issues or build_repair_issues(notes, report, source))
+    selected_issues = selected_issues[:MAX_REPAIR_SIGNALS]
     targeted = sections is not None
     booklet = _subset_notes(notes, sections) if sections is not None else notes
-    draft = (
-        DRAFT_HEADING + "\n" + json.dumps(compact_notes_payload(booklet), ensure_ascii=False)
+    draft = DRAFT_HEADING + "\n" + json.dumps(compact_notes_payload(booklet), ensure_ascii=False)
+    issue_json = json.dumps(
+        [issue.to_payload() for issue in selected_issues], ensure_ascii=False, separators=(",", ":")
     )
-    parts: list[str] = []
-    audit = report.audit
-    if audit.missing:
-        windows = evidence_windows(
-            source, audit.missing[:MAX_REPAIR_SIGNALS], radius=REPAIR_WINDOW_CHARS
-        )
-        lines = [
-            "### موارد جامانده از جزوه (هر مورد را با جملهٔ زیرش، در جای درست خودش برگردانید)"
-        ]
-        for signal, window in windows:
-            lines.append(f"- «{signal.label}» — جملهٔ منبع: {window}")
-        for signal in audit.missing[:MAX_REPAIR_SIGNALS]:
-            if not any(signal is item for item, _ in windows):
-                lines.append(f"- «{signal.label}» — شمارهٔ منبع پیدا نشد؛ فقط اگر در جزوه هست بازگردانید.")
-        parts.append("\n".join(lines))
-    if audit.fabricated:
-        labels = "، ".join(f"«{signal.label}»" for signal in audit.fabricated[:MAX_REPAIR_SIGNALS])
-        parts.append(
-            "### مواردی که در متن منبع نیست\n"
-            + labels
-            + "\nاین موارد را از جزوه حذف کنید (یا اگر صورت درست‌شان در متن است، با همان صورت بنویسید). "
-            "چیز دیگری اضافه نکنید."
-        )
-    number_floor, term_floor = coverage_thresholds(resolve_note_mode(mode))
     scope = (
-        "فقط همین بخش‌ها را (به همان ترتیب و با همان عنوان) برگردانید؛ "
-        "بخش دیگری از جزوه در این درخواست نیست.\n"
+        "فقط همین بخش‌ها را، به همان ترتیب و با همان عنوان، برگردانید؛ بخش‌های دیگر "
+        "در این درخواست وجود ندارند و نباید ساخته شوند.\n"
         if targeted
         else ""
     )
-    parts.append(
-        "### دستور\n"
-        + scope
-        + "همان جزوه را با همان ساختار JSON برگردانید و فقط این دو کار را بکنید:\n"
-        f"- موارد جامانده را در بخش مناسب برگردانید (پوشش اعداد باید دست‌کم {number_floor:.0%} و "
-        f"پوشش اصطلاح‌ها دست‌کم {term_floor:.0%} باشد).\n"
-        "- مواردی را که در منبع نیست حذف کنید.\n"
-        "هیچ جملهٔ تازه، عدد تازه، تعریف تازه یا نکتهٔ تازه‌ای نسازید؛ هیچ بخشی را حذف نکنید."
+    number_floor, term_floor = coverage_thresholds(resolve_note_mode(mode))
+    issue_labels: list[str] = []
+    if any(issue.code in REPAIR_COVERAGE_CODES for issue in selected_issues):
+        issue_labels.append("### موارد جامانده از جزوه: فقط با شاهد منبعِ همان مسئله برگردانید.")
+    if any(issue.code in REPAIR_CRITICAL_CODES for issue in selected_issues):
+        issue_labels.append("### مواردی که در متن منبع نیست: حذف کنید یا فقط با شاهد درست بازنویسی کنید.")
+    return "\n\n".join(
+        tuple(issue_labels) + (
+            "### فرمان تعمیر\n"
+            f"مرحله: {pass_name}\n"
+            + scope
+            + "شما جزوهٔ تازه تولید نمی‌کنید؛ فقط همین پیش‌نویس را ویرایش می‌کنید. "
+            "کمترین بازهٔ لازم را تغییر دهید، همهٔ بخش‌ها و جمله‌های معتبر را حفظ کنید، "
+            "ترتیب منبع را تغییر ندهید و فقط از شواهد زیر استفاده کنید. اگر جایگزین درست "
+            "از شواهد پیدا نیست، ادعای بی‌پشتوانه را حذف کنید؛ هرگز حدس نزنید.\n"
+            f"پوشش اعداد/اصطلاح‌ها فقط در صورت داشتن شاهد منبع می‌تواند به {number_floor:.0%}/"
+            f"{term_floor:.0%} برسد.",
+            "### مسئله‌های دقیق تعمیر (JSON)\n" + issue_json,
+            "### قرارداد خروجی\n"
+            "فقط یک شیء JSON معتبر با همان schema پیش‌نویس برگردانید. هیچ بخش، عدد، اصطلاح، "
+            "مرجع، دوز، تاریخ یا جملهٔ تازه‌ای که در شواهد نیست اضافه نکنید.",
+            draft,
+        )
     )
-    parts.append(draft)
-    return "\n\n".join(parts)
 
 
 _SCRUB_SENTENCE = re.compile(r"(?<=[.!?؟…])\s+")
 
 
-def _scrub_text(text: str, fabricated_values: frozenset[str]) -> tuple[str, int]:
-    """Drop the sentences that assert a number the source does not contain.
-
-    A fabricated number cannot be "corrected" without inventing the right one,
-    and it cannot be shipped as fact. The smallest honest unit is the sentence:
-    it is removed whole (never truncated), and the rest of the paragraph is
-    kept in order. Removing a sentence can cost a real fact, which the audit
-    then reports as missing — an omission is recoverable and visible, an
-    invented dosage is neither.
-    """
-    if not text or not fabricated_values:
+def _scrub_text(
+    text: str,
+    *,
+    fabricated_numbers: frozenset[str] = frozenset(),
+    fabricated_terms: frozenset[str] = frozenset(),
+    unsupported_claims: frozenset[str] = frozenset(),
+) -> tuple[str, int]:
+    """Remove only source-disproved sentences; retain every other span intact."""
+    if not text or not (fabricated_numbers or fabricated_terms or unsupported_claims):
         return text, 0
     kept: list[str] = []
     removed = 0
     for sentence in _SCRUB_SENTENCE.split(text):
-        if not sentence.strip():
+        stripped = sentence.strip()
+        if not stripped:
             continue
-        numbers = extract_signals(sentence, mask=False)
-        if any(
-            signal.kind == "number" and signal.value in fabricated_values
-            for signal in numbers
-        ):
+        signals = extract_signals(stripped, mask=False)
+        has_fabricated_signal = any(
+            (signal.kind == "number" and signal.value in fabricated_numbers)
+            or (signal.kind in ("term", "url") and signal.value in fabricated_terms)
+            for signal in signals
+        )
+        normalized = normalize_for_compare(stripped)
+        has_unsupported_claim = any(
+            claim and (normalized == claim or claim in normalized)
+            for claim in unsupported_claims
+        )
+        if has_fabricated_signal or has_unsupported_claim:
             removed += 1
             continue
-        kept.append(sentence.strip())
+        kept.append(stripped)
     return " ".join(kept), removed
 
 
-def scrub_fabricated_numbers(
-    notes: StructuredNotes, audit: SignalAudit
+def scrub_unsupported_content(
+    notes: StructuredNotes, report: NoteQualityReport
 ) -> tuple[StructuredNotes, int]:
-    """Remove every sentence that states a number absent from the source."""
-    values = frozenset(
-        signal.value for signal in audit.fabricated if signal.kind == "number"
+    """Deterministically remove source-disproved claims without gutting a draft.
+
+    This is the final safe recovery after a targeted repair fails or cannot
+    establish a replacement. It handles fabricated numbers, invented terms and
+    prose claims, unlike the former number-only scrub.
+    """
+    fabricated_numbers = frozenset(
+        signal.value for signal in report.audit.fabricated if signal.kind == "number"
     )
-    if not values:
+    fabricated_terms = frozenset(
+        signal.value for signal in report.audit.fabricated if signal.kind in ("term", "url")
+    )
+    unsupported_claims = frozenset(
+        normalize_for_compare(claim.claim)
+        for claim in report.unsupported_claims
+        if claim.claim.strip()
+    )
+    if not (fabricated_numbers or fabricated_terms or unsupported_claims):
         return notes, 0
     removed = 0
 
     def scrub(value: str) -> str:
         nonlocal removed
-        cleaned, count = _scrub_text(value, values)
+        cleaned, count = _scrub_text(
+            value,
+            fabricated_numbers=fabricated_numbers,
+            fabricated_terms=fabricated_terms,
+            unsupported_claims=unsupported_claims,
+        )
         removed += count
         return cleaned
 
     def scrub_tuple(values_in: tuple[str, ...]) -> tuple[str, ...]:
-        cleaned = (scrub(item) for item in values_in)
-        return tuple(item for item in cleaned if item.strip())
+        return tuple(value for value in (scrub(item) for item in values_in) if value.strip())
 
     sections: list[NoteSection] = []
-    for section in notes.sections:
-        definitions = []
+    for section_index, section in enumerate(notes.sections, start=1):
+        definitions_list: list[NoteDefinition] = []
         for entry in section.definitions:
-            definition = scrub(entry.definition)
-            if definition.strip():
-                definitions.append(replace(entry, definition=definition))
-        callouts = []
+            cleaned_term = scrub(entry.term)
+            cleaned_definition = scrub(entry.definition)
+            if cleaned_term.strip() and cleaned_definition.strip():
+                definitions_list.append(
+                    replace(entry, term=cleaned_term, definition=cleaned_definition)
+                )
+        definitions = tuple(definitions_list)
+        callouts_list: list[NoteCallout] = []
         for callout in section.callouts:
-            text = scrub(callout.text)
-            if text.strip():
-                callouts.append(replace(callout, text=text))
-        tables = []
+            cleaned_callout = scrub(callout.text)
+            if cleaned_callout.strip():
+                callouts_list.append(replace(callout, text=cleaned_callout))
+        callouts = tuple(callouts_list)
+        tables: list[NoteTable] = []
         for table in section.all_tables:
-            rows = []
-            for row in table.rows:
-                cells = [scrub(cell) for cell in row]
-                if any(cell.strip() for cell in cells):
-                    rows.append(cells)
+            headers = [scrub(header) for header in table.headers]
+            if not all(header.strip() for header in headers):
+                continue
+            rows = [
+                [scrub(cell) for cell in row]
+                for row in table.rows
+            ]
+            rows = [row for row in rows if any(cell.strip() for cell in row)]
             if rows:
-                tables.append(replace(table, rows=rows))
+                tables.append(replace(table, headers=headers, rows=rows))
         cleaned = replace(
             section,
-            heading=scrub(section.heading),
+            heading=scrub(section.heading) or f"بخش {to_persian_digits(section_index)}",
             paragraphs=scrub_tuple(section.paragraphs),
             bullets=scrub_tuple(section.bullets),
-            definitions=tuple(definitions),
+            definitions=definitions,
             examples=scrub_tuple(section.examples),
             steps=scrub_tuple(section.steps),
             formulas=scrub_tuple(section.formulas),
             key_points=scrub_tuple(section.key_points),
-            callouts=tuple(callouts),
+            callouts=callouts,
             table=tables[0] if tables else None,
             tables=tuple(tables[1:]),
         )
         if cleaned.has_content:
             sections.append(cleaned)
-    tips = []
+    tips_list: list[PracticalTip] = []
     for tip in notes.practical_tips:
-        text = scrub(tip.text)
-        if text.strip():
-            tips.append(replace(tip, text=text))
-    glossary = []
+        cleaned_tip = scrub(tip.text)
+        if cleaned_tip.strip():
+            tips_list.append(replace(tip, text=cleaned_tip))
+    tips = tuple(tips_list)
+    glossary_list: list[GlossaryEntry] = []
     for glossary_entry in notes.glossary:
-        definition = scrub(glossary_entry.definition)
-        if definition.strip():
-            glossary.append(replace(glossary_entry, definition=definition))
+        cleaned_glossary_term = scrub(glossary_entry.term)
+        cleaned_glossary = scrub(glossary_entry.definition)
+        if cleaned_glossary_term.strip() and cleaned_glossary.strip():
+            glossary_list.append(
+                replace(
+                    glossary_entry,
+                    term=cleaned_glossary_term,
+                    definition=cleaned_glossary,
+                )
+            )
+    glossary = tuple(glossary_list)
     scrubbed = replace(
         notes,
         title=scrub(notes.title),
@@ -2457,25 +2751,170 @@ def scrub_fabricated_numbers(
         key_points=scrub_tuple(notes.key_points),
         learning_objectives=scrub_tuple(notes.learning_objectives),
         review_questions=scrub_tuple(notes.review_questions),
-        practical_tips=tuple(tips),
-        glossary=tuple(glossary),
+        practical_tips=tips,
+        glossary=glossary,
+        quality_state=QUALITY_DEGRADED,
     )
     if removed:
-        logger.warning("note scrub removed %d sentence(s) with an unsupported number", removed)
+        logger.warning("note deterministic scrub removed=%d source-disproved span(s)", removed)
     return scrubbed, removed
 
 
+def scrub_fabricated_numbers(
+    notes: StructuredNotes, audit: SignalAudit
+) -> tuple[StructuredNotes, int]:
+    """Backward-compatible number-only scrub used by older call sites/tests."""
+    report = NoteQualityReport(audit=audit, coverage=sentence_coverage("", notes))
+    return scrub_unsupported_content(notes, report)
+
+def _critical_issue_count(report: NoteQualityReport) -> int:
+    return len(report.audit.fabricated) + len(report.unsupported_claims)
+
+
+def _repair_priority(report: NoteQualityReport) -> tuple[int, int, int, int, int, int]:
+    """Lexicographic quality: faithfulness dominates recall and presentation."""
+    return (
+        -_critical_issue_count(report),
+        -len(report.audit.fabricated),
+        -len(report.unsupported_claims),
+        -len(report.audit.missing),
+        int(round(report.audit.number_coverage * 10_000)),
+        int(round(report.audit.term_coverage * 10_000)),
+    )
+
+
 def repair_improves(candidate: NoteQualityReport, current: NoteQualityReport) -> bool:
-    """A repair is accepted only if it is grounded and loses no ground."""
-    if candidate.audit.fabricated:
+    """Accept a safer artifact even when raw coverage does not rise.
+
+    A repair that removes an invented dose or unsupported sentence is strictly
+    better than its predecessor at unchanged coverage. Conversely, a candidate
+    that creates any *new* critical issue is never accepted. Small recall loss
+    is tolerated only when it buys a higher-priority faithfulness correction;
+    the final bounded fill pass may restore source-backed omissions later.
+    """
+    current_critical = _critical_issue_count(current)
+    candidate_critical = _critical_issue_count(candidate)
+    if candidate_critical > current_critical:
         return False
-    if candidate.audit.number_coverage < current.audit.number_coverage:
+    if candidate_critical < current_critical:
+        return True
+    if candidate.audit.fabricated or candidate.unsupported_claims:
+        # No priority win, and a hard failure remains: do not swap a known bad
+        # artifact for a differently bad one.
         return False
-    if candidate.audit.term_coverage < current.audit.term_coverage - 0.05:
+    if candidate.audit.number_coverage + 1e-9 < current.audit.number_coverage:
         return False
-    if candidate.coverage.ratio < current.coverage.ratio - 0.05:
+    if candidate.audit.term_coverage + 1e-9 < current.audit.term_coverage - 0.05:
         return False
-    return candidate.audit.coverage > current.audit.coverage or candidate.coverage.ratio > current.coverage.ratio
+    if candidate.coverage.ratio + 0.05 < current.coverage.ratio:
+        return False
+    return _repair_priority(candidate) > _repair_priority(current) or (
+        candidate.coverage.ratio > current.coverage.ratio + 1e-9
+    )
+
+
+_FALLBACK_LOCATOR = re.compile(r"\[([^\]\n]{1,120})\]")
+_FALLBACK_HEADING = re.compile(r"^\s*#{1,6}\s+([^\n]{1,200})", re.MULTILINE)
+
+
+def _fallback_piece_boundaries(text: str, *, maximum: int = MAX_TEXT_CHARS) -> list[str]:
+    """Split only at source whitespace/sentence boundaries without dropping text."""
+    source = text.strip()
+    if not source:
+        return []
+    pieces: list[str] = []
+    cursor = 0
+    while cursor < len(source):
+        end = min(len(source), cursor + maximum)
+        if end < len(source):
+            boundary = max(
+                source.rfind("\n\n", cursor + maximum // 2, end),
+                source.rfind("\n", cursor + maximum // 2, end),
+                source.rfind(". ", cursor + maximum // 2, end),
+                source.rfind("؟", cursor + maximum // 2, end),
+                source.rfind("!", cursor + maximum // 2, end),
+                source.rfind(" ", cursor + maximum // 2, end),
+            )
+            if boundary > cursor:
+                end = boundary + (1 if source[boundary:boundary + 2] == ". " else 0)
+        part = source[cursor:end].strip()
+        if part:
+            pieces.append(part)
+        cursor = end
+        while cursor < len(source) and source[cursor].isspace():
+            cursor += 1
+    return pieces
+
+
+def deterministic_fallback_notes(
+    source: str,
+    *,
+    title: str = "",
+    section_offset: int = 0,
+) -> StructuredNotes:
+    """Build a renderer-safe, source-preserving booklet with no LLM inference.
+
+    This is deliberately *not* a summary: every non-empty source paragraph is
+    retained in source order. Existing source headings are reused; otherwise a
+    neutral Persian ``بخش N`` heading is created. Exact bracket locators remain
+    both in the content and section metadata, so the fallback never invents a
+    citation while still being usable in the DOCX/PDF renderers.
+    """
+    raw = (source or "").strip()
+    if not raw:
+        raise StructuringError("متن ورودی خالی بود.")
+    paragraphs: list[str] = []
+    for block in re.split(r"\n\s*\n+", raw):
+        paragraphs.extend(_fallback_piece_boundaries(block))
+    if not paragraphs:
+        raise StructuringError("متن ورودی قابل‌استفاده نبود.")
+    sections: list[NoteSection] = []
+    pending: list[str] = []
+    pending_chars = 0
+    current_heading = ""
+
+    def flush() -> None:
+        nonlocal pending, pending_chars, current_heading
+        if not pending:
+            return
+        number = section_offset + len(sections) + 1
+        heading = current_heading or f"بخش {to_persian_digits(number)}"
+        locators = tuple(
+            dict.fromkeys(
+                " ".join(match.group(1).split())
+                for paragraph in pending
+                for match in _FALLBACK_LOCATOR.finditer(paragraph)
+            )
+        )[:MAX_SOURCE_LOCATORS_PER_SECTION]
+        sections.append(
+            NoteSection(heading=heading, paragraphs=tuple(pending), source_locators=locators)
+        )
+        pending = []
+        pending_chars = 0
+        current_heading = ""
+
+    for paragraph in paragraphs:
+        match = _FALLBACK_HEADING.match(paragraph)
+        paragraph_heading = match.group(1).strip() if match else ""
+        # Keep a real Markdown heading as both a deterministic heading and in
+        # the source text when it has no following content.
+        if paragraph_heading and pending:
+            flush()
+        if paragraph_heading:
+            current_heading = paragraph_heading
+        if pending and pending_chars + len(paragraph) + 2 > MAX_TEXT_CHARS:
+            flush()
+        pending.append(paragraph)
+        pending_chars += len(paragraph) + 2
+    flush()
+    if not sections:
+        raise StructuringError("متن ورودی قابل‌استفاده نبود.")
+    return StructuredNotes(
+        title=title.strip() or "جزوهٔ منبع",
+        sections=tuple(sections),
+        quality_state=QUALITY_RECOVERED,
+    )
+
 
 
 # ===========================================================================
@@ -2661,76 +3100,84 @@ async def _audit_and_repair(
     source_locators: bool = False,
     data_sensitivity: str = SENSITIVITY_UNKNOWN,
 ) -> tuple[StructuredNotes, NoteQualityReport]:
-    """Gate the notes, repair what failed (bounded), then accept or reject.
-
-    The gate is deterministic and free. Each repair attempt carries only the
-    missing facts and their source windows, is re-audited on the complete
-    booklet, and is accepted only when it is grounded and loses no ground. At
-    most :data:`MAX_NOTE_REPAIR_ATTEMPTS` attempts are made; an attempt that
-    changes nothing ends the loop, because repeating an identical request cannot
-    produce a different answer.
-
-    After the last attempt any sentence stating a number the source does not
-    contain is removed, the booklet is re-audited, and the hard acceptance rule
-    (:func:`acceptance_failure`) decides whether the result may be delivered.
-    ``warn`` mode returns the notes unchanged: the audit is logged, nothing is
-    dropped and nothing is rejected, which is what makes it an observation mode.
-    """
+    """Run ordered, bounded repairs and preserve the best known-safe artifact."""
     if not settings.note_strict_grounding:
-        # Defensive: every caller already skips this step when grounding is off.
         return notes, gate_notes(notes, source, strict=False, mode=mode)[1]
-    if settings.note_quality_gate != "repair":
-        observed, report = gate_notes(notes, source, strict=False, mode=mode)
-        # ``warn`` ships exactly what the gate would have removed, so the log
-        # line is the only trace of a real fidelity problem: it is a warning.
-        logger.warning(
-            "note quality gate=warn: nothing changed; %s", report.summary()
-        )
-        return observed, report
+
+    # ``warn`` no longer permits known fabricated facts to reach final delivery.
+    # It suppresses provider edits, while deterministic removal still protects
+    # the user from a source-disproved assertion.
+    strict = settings.note_quality_gate == "repair"
+    # Validation/removal is always strict once strict grounding is enabled;
+    # ``warn`` only suppresses LLM repair calls, never delivery safety.
     gated, report = gate_notes(notes, source, strict=True, mode=mode)
     attempts = 0
-    while attempts < MAX_NOTE_REPAIR_ATTEMPTS and notes_need_repair(report, mode=mode):
-        attempts += 1
-        before = report
-        candidate, candidate_report = await _repair_once(
-            gated, report, source, settings, session,
-            mode=mode, presentation=presentation, semaphore=semaphore,
-            source_locators=source_locators,
-            data_sensitivity=data_sensitivity,
-        )
-        if candidate is gated and candidate_report is report:
-            logger.info(
-                "repair attempt %d/%d made no accepted change; stopping",
-                attempts, MAX_NOTE_REPAIR_ATTEMPTS,
-            )
-            break
-        gated, report = candidate, candidate_report
-        resolved = (
-            len(before.audit.missing)
-            + len(before.audit.fabricated)
-            - len(report.audit.missing)
-            - len(report.audit.fabricated)
-        )
-        logger.info(
-            "repair attempt %d/%d applied fixed=%d unresolved_missing=%d "
-            "unresolved_fabricated=%d",
-            attempts,
-            MAX_NOTE_REPAIR_ATTEMPTS,
-            max(0, resolved),
-            len(report.audit.missing),
-            len(report.audit.fabricated),
-        )
-    if report.audit.fabricated:
-        scrubbed, removed = scrub_fabricated_numbers(gated, report.audit)
-        if removed:
+    max_attempts = min(
+        MAX_NOTE_REPAIR_ATTEMPTS,
+        max(0, int(getattr(settings, "note_max_repair_attempts", MAX_NOTE_REPAIR_ATTEMPTS))),
+    )
+    if strict:
+        for pass_name in ("claim_repair", "coverage_repair", "structural_cleanup"):
+            # Critical and structural commands get one minimal edit attempt.
+            # Coverage may need the bounded remaining call budget because one
+            # response can safely restore only part of a large set of signals.
+            repeat_coverage = pass_name == "coverage_repair"
+            while attempts < max_attempts:
+                issues = _repair_issues_for_pass(
+                    build_repair_issues(gated, report, source), pass_name
+                )
+                if not issues:
+                    break
+                before = report
+                attempts += 1
+                candidate, candidate_report = await _repair_once(
+                    gated, report, source, settings, session,
+                    mode=mode, presentation=presentation, semaphore=semaphore,
+                    source_locators=source_locators, data_sensitivity=data_sensitivity,
+                    issues=issues, pass_name=pass_name,
+                )
+                if candidate is gated and candidate_report is report:
+                    logger.info(
+                        "note repair stage=%s attempt=%d/%d result=no_change issues=%d",
+                        pass_name, attempts, max_attempts, len(issues),
+                    )
+                    break
+                gated, report = candidate, candidate_report
+                logger.info(
+                    "note repair stage=%s attempt=%d/%d issues=%d repaired=%d unresolved=%d quality=%s",
+                    pass_name,
+                    attempts,
+                    max_attempts,
+                    len(issues),
+                    max(0, _critical_issue_count(before) - _critical_issue_count(report)),
+                    len(build_repair_issues(gated, report, source)),
+                    gated.quality_state,
+                )
+                if not repeat_coverage or not notes_need_repair(report, mode=mode):
+                    break
+
+    # A failed semantic repair is not a failed booklet. Remove only the exact
+    # source-disproved spans and re-audit the surviving valid content.
+    if acceptance_failure(report) is not None:
+        scrubbed, removed = scrub_unsupported_content(gated, report)
+        if removed and scrubbed.has_content:
             gated, report = gate_notes(scrubbed, source, strict=True, mode=mode)
+            gated = replace(gated, quality_state=QUALITY_DEGRADED)
+            # A sentence-level removal can leave only metadata even when the
+            # source has plenty of usable material. Do not deliver an empty
+            # shell or destroy valid source facts: recover locally instead.
+            if not gated.sections and getattr(settings, "note_enable_deterministic_fallback", True):
+                gated = deterministic_fallback_notes(source)
+                gated, report = gate_notes(gated, source, strict=True, mode=mode)
     if notes_need_repair(report, mode=mode):
         logger.warning(
-            "note repair left unresolved signals after %d attempt(s): %s",
-            attempts, report.summary(),
+            "note repair complete attempts=%d unresolved=%d critical=%d quality=%s",
+            attempts,
+            len(build_repair_issues(gated, report, source)),
+            _critical_issue_count(report),
+            gated.quality_state,
         )
     return enforce_final_acceptance(gated, report, mode=mode, stage="audit"), report
-
 
 def repair_request_document(
     notes: StructuredNotes,
@@ -2739,40 +3186,53 @@ def repair_request_document(
     *,
     budget: int,
     mode: str = "full",
+    issues: Sequence[RepairIssue] | None = None,
+    pass_name: str = "claim_repair",
 ) -> tuple[str, Sequence[NoteSection]] | None:
-    """The repair request, whole if it fits, otherwise targeted at sections.
-
-    Returns ``(document, sections)`` where ``sections`` is the repaired subset
-    (the whole booklet in the fitting case), or ``None`` when not even one
-    section fits the budget — a request that cannot fit is never sent.
-
-    A booklet above the budget used to skip the repair pass *silently*, so a
-    multi-hour lecture shipped with whatever the first pass produced. Only the
-    sections that hold the lost facts are re-sent now, and the answer is merged
-    back by heading: the rest of the booklet is delivered exactly as audited.
-    """
+    """Return the smallest command-driven repair request that fits *budget*."""
     if budget <= 0:
         return None
-    whole = build_repair_document(notes, report, source, mode=mode)
+    selected_issues = tuple(issues or build_repair_issues(notes, report, source))
+    if not selected_issues:
+        return None
+    whole = build_repair_document(
+        notes, report, source, mode=mode, issues=selected_issues, pass_name=pass_name
+    )
     if len(whole) <= budget:
         return whole, notes.sections
     chosen = repair_target_indexes(notes, report, source)
+    # Direct claim/path identity outranks relevance scoring: a source window
+    # may share no vocabulary with an invented sentence, but its section still
+    # must be present in the command.
+    direct = {
+        int(issue.section_id[1:]) - 1
+        for issue in selected_issues
+        if issue.section_id.startswith("s") and issue.section_id[1:].isdigit()
+        and 0 <= int(issue.section_id[1:]) - 1 < len(notes.sections)
+    }
+    chosen = list(dict.fromkeys([*sorted(direct), *chosen]))[:MAX_REPAIR_SECTIONS]
     while chosen:
         sections = [notes.sections[index] for index in sorted(chosen)]
         document = build_repair_document(
-            notes, report, source, mode=mode, sections=sections
+            notes, report, source, mode=mode, sections=sections,
+            issues=selected_issues, pass_name=pass_name,
         )
         if len(document) <= budget:
             logger.info(
-                "repair pass targeted: whole_chars=%d request_chars=%d budget=%d sections=%d/%d",
-                len(whole), len(document), budget, len(sections), len(notes.sections),
+                "note repair stage=%s request_chars=%d budget=%d sections=%d/%d issues=%d",
+                pass_name, len(document), budget, len(sections), len(notes.sections), len(selected_issues),
             )
             return document, sections
-        # Drop the least relevant section and try again: a section is never
-        # split, and a request over the budget would be rejected anyway.
-        chosen.pop()
+        # Never drop a directly implicated section before lower-priority
+        # relevance choices. A request that cannot even carry one direct target
+        # is not sent; the deterministic scrub/fallback remains safer.
+        removable = [index for index in reversed(chosen) if index not in direct]
+        if not removable:
+            break
+        chosen.remove(removable[0])
     logger.warning(
-        "repair skipped: request_chars=%d budget=%d", len(whole), budget
+        "note repair skipped stage=%s request_chars=%d budget=%d issues=%d",
+        pass_name, len(whole), budget, len(selected_issues),
     )
     return None
 
@@ -2828,10 +3288,16 @@ async def _repair_once(
     semaphore: asyncio.Semaphore,
     source_locators: bool = False,
     data_sensitivity: str = SENSITIVITY_UNKNOWN,
+    issues: Sequence[RepairIssue] | None = None,
+    pass_name: str = "claim_repair",
 ) -> tuple[StructuredNotes, NoteQualityReport]:
     """One bounded repair request; the caller keeps its state on any failure."""
     budget = effective_compile_max_chars(settings, mode=mode, presentation=presentation)
-    request = repair_request_document(notes, report, source, budget=budget, mode=mode)
+    selected_issues = tuple(issues or build_repair_issues(notes, report, source))
+    request = repair_request_document(
+        notes, report, source, budget=budget, mode=mode,
+        issues=selected_issues, pass_name=pass_name,
+    )
     if request is None:
         return notes, report
     repair_document, repaired_sections = request
@@ -2848,10 +3314,17 @@ async def _repair_once(
                 schema=_response_schema(settings),
                 task="BOOKLET_REPAIR",
                 data_sensitivity=data_sensitivity,
+                sampling_temperature=0.0,
             )
         candidate = _load_json_payload(payload, mode=mode)
     except (LLMError, StructuringError) as exc:
-        logger.warning("repair pass failed (%s); keeping the audited notes", type(exc).__name__)
+        logger.warning(
+            "note repair stage=%s command=%s issues=%d result=failed error=%s",
+            pass_name,
+            ",".join(sorted({issue.code for issue in selected_issues})),
+            len(selected_issues),
+            type(exc).__name__,
+        )
         return notes, report
     if targeted:
         candidate, unplaced = merge_repaired_sections(notes, candidate.sections)
@@ -2862,9 +3335,24 @@ async def _repair_once(
             )
     candidate, candidate_report = gate_notes(candidate, source, strict=True, mode=mode)
     if repair_improves(candidate_report, report):
-        logger.info("repair accepted %s", candidate_report.summary())
-        return candidate, candidate_report
-    logger.info("repair rejected %s", candidate_report.summary())
+        fixed = max(0, _critical_issue_count(report) - _critical_issue_count(candidate_report))
+        logger.info(
+            "note repair stage=%s command=%s issues=%d fixed=%d unresolved=%d quality=%s",
+            pass_name,
+            ",".join(sorted({issue.code for issue in selected_issues})),
+            len(selected_issues),
+            fixed,
+            len(build_repair_issues(candidate, candidate_report, source)),
+            QUALITY_REPAIRED,
+        )
+        return replace(candidate, quality_state=QUALITY_REPAIRED), candidate_report
+    logger.info(
+        "note repair stage=%s command=%s issues=%d result=rejected unresolved=%d",
+        pass_name,
+        ",".join(sorted({issue.code for issue in selected_issues})),
+        len(selected_issues),
+        len(build_repair_issues(candidate, candidate_report, source)),
+    )
     return notes, report
 
 
@@ -2907,6 +3395,7 @@ async def _compile_once(
             task="BOOKLET_COMPILE",
             prefer_provider=getattr(settings, "note_compile_provider", ""),
             data_sensitivity=data_sensitivity,
+            sampling_temperature=0.1,
         )
         compiled = _load_json_payload(payload, mode=mode)
     except (LLMError, StructuringError) as exc:
@@ -2968,8 +3457,8 @@ def _gate_compiled(
         _, baseline = gate_notes(baseline_notes, document, strict=True, mode=mode)
     # An answer that invents a fact, or that covers less of the source than the
     # text it replaced, is rejected even if its shape looks better.
-    if compiled_report.audit.fabricated:
-        logger.warning("compiled notes rejected: they assert facts absent from the source")
+    if compiled_report.audit.fabricated or compiled_report.unsupported_claims:
+        logger.warning("compiled notes rejected: they assert source-unsupported content")
         return None
     if compiled_report.audit.coverage + 0.02 < baseline.audit.coverage:
         logger.warning(
@@ -2983,6 +3472,8 @@ def _gate_compiled(
             compiled_report.coverage.ratio, baseline.coverage.ratio,
         )
         return None
+    if baseline_notes.quality_state != QUALITY_VERIFIED:
+        return replace(compiled, quality_state=baseline_notes.quality_state)
     return compiled
 
 
@@ -3036,9 +3527,9 @@ async def _compile_in_groups(
             continue
         if settings.note_strict_grounding:
             _, group_report = gate_notes(compiled, document, strict=True, mode=mode)
-            if group_report.audit.fabricated:
+            if group_report.audit.fabricated or group_report.unsupported_claims:
                 logger.warning(
-                    "compiled group rejected: it asserts facts absent from the source"
+                    "compiled group rejected: it asserts source-unsupported content"
                 )
                 sections.extend(group.sections)
                 continue
@@ -3053,6 +3544,8 @@ async def _compile_in_groups(
         "compile pass grouped: compiled=%d/%d sections=%d",
         compiled_groups, len(groups), len(assembled.sections),
     )
+    if compiled_groups < len(groups):
+        assembled = replace(assembled, quality_state=QUALITY_RECOVERED)
     return assembled
 
 
@@ -3155,7 +3648,10 @@ async def _compile_pass(
         accepted = _gate_compiled(
             compiled, merged, merged_report, document, settings, mode=mode
         )
-        return accepted if accepted is not None else merged
+        if accepted is not None:
+            return accepted
+        logger.info("note compile outcome=RECOVERED baseline=deterministic_merge")
+        return replace(merged, quality_state=QUALITY_RECOVERED)
 
     assembled = await _compile_in_groups(
         merged, context, document, settings, session,
@@ -3169,7 +3665,8 @@ async def _compile_pass(
         merged, merged_report, document, settings, mode=mode,
     )
     if accepted is None:
-        return merged
+        logger.info("note compile outcome=RECOVERED baseline=deterministic_merge")
+        return replace(merged, quality_state=QUALITY_RECOVERED)
     # Level 2 (the last one): a final merge of the compiled groups, only when
     # the compile shortened the booklet enough that it now fits one request.
     if MAX_COMPILE_LEVELS >= 2:
@@ -3208,6 +3705,16 @@ StageCallback = Callable[[str], Awaitable[None]]
 #: accepted but still omits source facts, so the job reports a partial result
 #: instead of claiming a complete, verified booklet.
 IncompleteCallback = Callable[[str], Awaitable[None]]
+
+
+@dataclass(frozen=True, slots=True)
+class ChunkOutcome:
+    """Isolated map-stage result; one failed chunk never cancels siblings."""
+
+    index: int
+    status: str  # SUCCESS | REPAIRED | FALLBACK | FAILED
+    notes: StructuredNotes | None = None
+    error_type: str = ""
 
 
 async def _structure_booklet(
@@ -3274,7 +3781,7 @@ async def _structure_booklet(
 
     async def finalize(result: StructuredNotes) -> StructuredNotes:
         """CR-4: optionally run the bounded coverage-gap fill pass."""
-        if getattr(settings, "note_completeness_fill", False) and not settings.note_strict_grounding:
+        if getattr(settings, "note_completeness_fill", False):
             return await fill_coverage_gaps(
                 session, settings, document, result, semaphore=semaphore,
                 data_sensitivity=data_sensitivity,
@@ -3302,24 +3809,39 @@ async def _structure_booklet(
             len(document),
             chars_used,
         )
-        single = await _structure_piece(
-            session, settings,
-            chunks[0],
-            system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
-            presentation=presentation, render=single_render,
-            data_sensitivity=data_sensitivity,
-        )
+        try:
+            single = await _structure_piece(
+                session, settings,
+                chunks[0],
+                system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
+                presentation=presentation, render=single_render,
+                data_sensitivity=data_sensitivity,
+            )
+        except (LLMError, StructuringError) as exc:
+            if not getattr(settings, "note_enable_deterministic_fallback", True):
+                raise
+            logger.warning(
+                "note map stage=chunk job=unknown chunk=1 outcome=FALLBACK error=%s",
+                type(exc).__name__,
+            )
+            single = deterministic_fallback_notes(document)
         if not settings.note_strict_grounding:
             return single
         await notify("validating")
-        return (
-            await _audit_and_repair(
-                single, document, settings, session,
-                mode=resolved_mode, presentation=presentation, semaphore=semaphore,
-                source_locators=source_locators,
-                data_sensitivity=data_sensitivity,
-            )
-        )[0]
+        try:
+            return (
+                await _audit_and_repair(
+                    single, document, settings, session,
+                    mode=resolved_mode, presentation=presentation, semaphore=semaphore,
+                    source_locators=source_locators,
+                    data_sensitivity=data_sensitivity,
+                )
+            )[0]
+        except NoteQualityError:
+            if not getattr(settings, "note_enable_deterministic_fallback", True):
+                raise
+            logger.warning("note audit outcome=RECOVERED baseline=source_preserving_fallback")
+            return deterministic_fallback_notes(document)
 
     if len(chunks) == 1:
         return await finalize(await finish_single(chunk_chars))
@@ -3355,49 +3877,114 @@ async def _structure_booklet(
         include_context,
     )
 
-    async def map_chunk(index: int, chunk: str) -> StructuredNotes:
+    async def map_chunk(index: int, chunk: str) -> ChunkOutcome:
+        started = time.perf_counter()
         block = context_block_for(context, chunks, index) if include_context else ""
         topic = context.topic_for(index, len(chunks)) if include_context else ""
-        # ``base_system`` is byte-identical for every chunk, pass and job, so
-        # the provider can serve it from its prefix cache; only the user
-        # message differs. See ``build_chunk_message``.
+
         def render(text: str) -> str:
             return build_chunk_message(
                 text, index=index, total=len(chunks), topic=topic,
                 context_block=block, header=source_header,
             )
 
-        return await _structure_piece(
-            session, settings, chunk,
-            system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
-            presentation=presentation, render=render,
-            data_sensitivity=data_sensitivity,
+        try:
+            result = await _structure_piece(
+                session, settings, chunk,
+                system_prompt=base_system, mode=resolved_mode, semaphore=semaphore,
+                presentation=presentation, render=render,
+                data_sensitivity=data_sensitivity,
+            )
+        except (LLMError, StructuringError) as exc:
+            if getattr(settings, "note_enable_deterministic_fallback", True):
+                try:
+                    fallback = deterministic_fallback_notes(chunk, section_offset=index - 1)
+                except StructuringError:
+                    fallback = None
+                if fallback is not None:
+                    logger.warning(
+                        "note map stage=chunk job=unknown chunk=%d outcome=FALLBACK error=%s latency_ms=%.0f",
+                        index, type(exc).__name__, (time.perf_counter() - started) * 1000,
+                    )
+                    return ChunkOutcome(index, "FALLBACK", fallback, type(exc).__name__)
+            logger.warning(
+                "note map stage=chunk job=unknown chunk=%d outcome=FAILED error=%s latency_ms=%.0f",
+                index, type(exc).__name__, (time.perf_counter() - started) * 1000,
+            )
+            return ChunkOutcome(index, "FAILED", None, type(exc).__name__)
+        outcome_status = "SUCCESS"
+        # Apply local, non-generative gate cleanup at the chunk boundary. This
+        # removes invalid table/tip/locator shapes before reduce without
+        # spending another provider call; prose claims remain for the one
+        # booklet-level, evidence-commanded repair pass where cross-chunk
+        # context is available. A fully safe changed chunk is observable as a
+        # REPAIRED outcome rather than being indistinguishable from a raw
+        # provider success.
+        if settings.note_strict_grounding:
+            gated_result, chunk_report = gate_notes(
+                result, chunk, strict=True, mode=resolved_mode
+            )
+            if gated_result != result:
+                result = gated_result
+                if acceptance_failure(chunk_report) is None:
+                    result = replace(result, quality_state=QUALITY_REPAIRED)
+                    outcome_status = "REPAIRED"
+        logger.info(
+            "note map stage=chunk job=unknown chunk=%d outcome=%s latency_ms=%.0f",
+            index, outcome_status, (time.perf_counter() - started) * 1000,
         )
+        return ChunkOutcome(index, outcome_status, result)
 
-    # Cancel the siblings when one chunk fails: ``gather`` propagates the first
-    # error but leaves the other provider requests running against a job that
-    # has already been failed and released (audit F-17).
+    # ``return_exceptions=True`` deliberately preserves every completed map
+    # result. Cancellation is only propagated for a caller cancellation, never
+    # because one provider/chunk happened to fail.
     tasks = [
         asyncio.create_task(map_chunk(index, chunk))
         for index, chunk in enumerate(chunks, start=1)
     ]
-    try:
-        chunk_notes = await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-    merged = merge_structured_notes(list(chunk_notes))
+    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    chunk_outcomes: list[ChunkOutcome] = []
+    for index, outcome in enumerate(outcomes, start=1):
+        if isinstance(outcome, asyncio.CancelledError):
+            raise outcome
+        if isinstance(outcome, BaseException):
+            logger.warning(
+                "note map stage=chunk job=unknown chunk=%d outcome=FAILED error=%s",
+                index, type(outcome).__name__,
+            )
+            chunk_outcomes.append(ChunkOutcome(index, "FAILED", None, type(outcome).__name__))
+        else:
+            chunk_outcomes.append(outcome)
+    chunk_notes = [outcome.notes for outcome in chunk_outcomes if outcome.notes is not None]
+    if not chunk_notes:
+        # The full source still exists, so one final local artifact is safer
+        # than turning an all-provider outage into a raw-text-only result.
+        if getattr(settings, "note_enable_deterministic_fallback", True):
+            merged = deterministic_fallback_notes(document)
+        else:
+            raise StructuringError("هیچ بخش قابل‌استفاده‌ای از جزوه ساخته نشد.")
+    else:
+        merged = merge_structured_notes(list(chunk_notes))
+        if any(outcome.status == "FALLBACK" for outcome in chunk_outcomes):
+            merged = replace(merged, quality_state=QUALITY_RECOVERED)
+        elif any(outcome.status == "REPAIRED" for outcome in chunk_outcomes):
+            merged = replace(merged, quality_state=QUALITY_REPAIRED)
     merged_report: NoteQualityReport | None = None
     if settings.note_strict_grounding:
         await notify("validating")
-        merged, merged_report = await _audit_and_repair(
-            merged, document, settings, session,
-            mode=resolved_mode, presentation=presentation, semaphore=semaphore,
-            source_locators=source_locators,
-            data_sensitivity=data_sensitivity,
-        )
+        try:
+            merged, merged_report = await _audit_and_repair(
+                merged, document, settings, session,
+                mode=resolved_mode, presentation=presentation, semaphore=semaphore,
+                source_locators=source_locators,
+                data_sensitivity=data_sensitivity,
+            )
+        except NoteQualityError:
+            if not getattr(settings, "note_enable_deterministic_fallback", True):
+                raise
+            logger.warning("note audit outcome=RECOVERED baseline=source_preserving_fallback")
+            merged = deterministic_fallback_notes(document)
+            _, merged_report = gate_notes(merged, document, strict=True, mode=resolved_mode)
     if on_merged is not None and compile_will_run(
         merged, settings, mode=resolved_mode, presentation=presentation
     ):
@@ -3433,9 +4020,15 @@ async def _structure_booklet(
     _, final_report = gate_notes(
         compiled, document, strict=True, mode=resolved_mode
     )
-    return enforce_final_acceptance(
-        compiled, final_report, mode=resolved_mode, stage="post_compile"
-    )
+    try:
+        return enforce_final_acceptance(
+            compiled, final_report, mode=resolved_mode, stage="post_compile"
+        )
+    except NoteQualityError:
+        if not getattr(settings, "note_enable_deterministic_fallback", True):
+            raise
+        logger.warning("note post_compile outcome=RECOVERED baseline=source_preserving_fallback")
+        return deterministic_fallback_notes(document)
 
 
 async def structure_document(
@@ -3470,6 +4063,8 @@ async def structure_document(
     reason = completeness_failure(report, mode=mode)
     if reason is None:
         return notes
+    if notes.quality_state == QUALITY_VERIFIED:
+        notes = replace(notes, quality_state=QUALITY_DEGRADED)
     logger.warning(
         "note delivered incomplete reason=%s %s", reason, report.summary()
     )

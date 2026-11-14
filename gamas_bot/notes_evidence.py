@@ -908,20 +908,83 @@ class ClaimEvidence:
 
     span: tuple[int, int]
     shared_ratio: float
+    #: The exact asserted sentence and artifact path are retained for a
+    #: targeted repair request. They are never written to logs.
+    claim: str = ""
+    section_index: int = -1
+    field: str = ""
 
 
-def _claim_sentences(notes: object) -> Iterator[str]:
-    """The assertive prose of a booklet: section paragraphs and bullets only."""
+def _claim_sentences(notes: object) -> Iterator[tuple[str, int, str]]:
+    """Assertive prose plus exact artifact paths for claim-level repair.
+
+    Short headings and locator labels remain labels, not factual claims. Long
+    prose-bearing labels are still inspected along with their displayed fields:
+    an invented warning, definition, table caption/cell, tip or global summary
+    must not evade the final acceptance gate merely by living outside
+    ``paragraphs``.
+    """
     payload = _payload_of(notes)
     if not isinstance(payload, dict):
         return
-    for section in payload.get("sections") or ():
+
+    def sentences(value: object, section_index: int, field: str):
+        for sentence in split_sentences(str(value or "")):
+            yield sentence, section_index, field
+
+    for field_name in ("title", "summary"):
+        yield from sentences(payload.get(field_name), -1, field_name)
+    for field_name in ("key_points", "learning_objectives", "review_questions"):
+        for item_index, item in enumerate(payload.get(field_name) or ()):
+            yield from sentences(item, -1, f"{field_name}[{item_index}]")
+    for item_index, item in enumerate(payload.get("glossary") or ()):
+        if isinstance(item, dict):
+            yield from sentences(item.get("definition"), -1, f"glossary[{item_index}].definition")
+    for item_index, item in enumerate(payload.get("practical_tips") or ()):
+        if isinstance(item, dict):
+            yield from sentences(item.get("text"), -1, f"practical_tips[{item_index}].text")
+    for section_index, section in enumerate(payload.get("sections") or ()):
         if not isinstance(section, dict):
             continue
-        for field_name in ("paragraphs", "bullets"):
-            for item in section.get(field_name) or ():
-                for sentence in split_sentences(str(item or "")):
-                    yield sentence
+        yield from sentences(section.get("heading"), section_index, f"sections[{section_index}].heading")
+        for field_name in ("paragraphs", "bullets", "examples", "steps", "formulas", "key_points"):
+            for item_index, item in enumerate(section.get(field_name) or ()):
+                yield from sentences(item, section_index, f"sections[{section_index}].{field_name}[{item_index}]")
+        for item_index, item in enumerate(section.get("definitions") or ()):
+            if isinstance(item, dict):
+                yield from sentences(
+                    item.get("term"), section_index,
+                    f"sections[{section_index}].definitions[{item_index}].term",
+                )
+                yield from sentences(
+                    item.get("definition"), section_index,
+                    f"sections[{section_index}].definitions[{item_index}].definition",
+                )
+        for item_index, item in enumerate(section.get("callouts") or ()):
+            if isinstance(item, dict):
+                yield from sentences(
+                    item.get("text"), section_index,
+                    f"sections[{section_index}].callouts[{item_index}].text",
+                )
+        for table_index, table in enumerate(section.get("tables") or ()):
+            if not isinstance(table, dict):
+                continue
+            yield from sentences(
+                table.get("caption"), section_index,
+                f"sections[{section_index}].tables[{table_index}].caption",
+            )
+            for header_index, header in enumerate(table.get("headers") or ()):
+                yield from sentences(
+                    header, section_index,
+                    f"sections[{section_index}].tables[{table_index}].headers[{header_index}]",
+                )
+            for row_index, row in enumerate(table.get("rows") or ()):
+                if isinstance(row, (list, tuple)):
+                    for cell_index, cell in enumerate(row):
+                        yield from sentences(
+                            cell, section_index,
+                            f"sections[{section_index}].tables[{table_index}].rows[{row_index}][{cell_index}]",
+                        )
 
 
 def _is_meta_sentence(sentence: str) -> bool:
@@ -981,7 +1044,7 @@ def prose_claim_evidence(
     if not prepared:
         return ()
     unsupported: list[ClaimEvidence] = []
-    for claim in claims:
+    for claim, section_index, field_path in claims:
         words = content_words(claim)
         if len(words) < MIN_CLAIM_WORDS or _is_meta_sentence(claim):
             continue
@@ -995,7 +1058,15 @@ def prose_claim_evidence(
                 if best_ratio >= minimum_ratio:
                     break
         if best_ratio < minimum_ratio:
-            unsupported.append(ClaimEvidence(span=best_span, shared_ratio=best_ratio))
+            unsupported.append(
+                ClaimEvidence(
+                    span=best_span,
+                    shared_ratio=best_ratio,
+                    claim=claim,
+                    section_index=section_index,
+                    field=field_path,
+                )
+            )
     return tuple(unsupported)
 
 
@@ -1194,9 +1265,12 @@ class NoteQualityReport:
     tips_rejected: int = 0
     objectives_dropped: int = 0
     review_questions_dropped: int = 0
+    #: Locators absent from the source were removed by the strict gate.
+    locators_rejected: int = 0
     dropped_cells: tuple[str, ...] = field(default_factory=tuple)
     #: Prose claims with no supporting source sentence (see
-    #: :func:`prose_claim_evidence`). Offsets only, never the text.
+    #: :func:`prose_claim_evidence`). Values stay in memory solely to build a
+    #: bounded repair command and are never emitted in logs.
     unsupported_claims: tuple[ClaimEvidence, ...] = field(default_factory=tuple)
 
     @property
@@ -1211,5 +1285,6 @@ class NoteQualityReport:
             + f" tips={self.tips_accepted}/{self.tips_seen}"
             + f" objectives_dropped={self.objectives_dropped}"
             + f" review_questions_dropped={self.review_questions_dropped}"
+            + f" locators_rejected={self.locators_rejected}"
             + f" unsupported_claims={len(self.unsupported_claims)}"
         )
